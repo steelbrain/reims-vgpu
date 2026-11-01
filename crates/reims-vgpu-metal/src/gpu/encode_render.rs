@@ -1023,12 +1023,19 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
 #[cfg(test)]
 mod tests {
 
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLClearColor, MTLDevice as _, MTLOrigin, MTLPixelFormat, MTLRegion,
+        MTLRenderPipelineDescriptor, MTLSize, MTLStorageMode, MTLTexture as _,
+    };
     use reims_vgpu_core::platform::blit::ResourceRef;
     use reims_vgpu_core::platform::command::CommandBuffer as _;
     use reims_vgpu_core::platform::render::*;
+    use reims_vgpu_core::platform::resource::Buffer as _;
     use reims_vgpu_core::platform::types::*;
 
     use super::*;
+    use crate::gpu::resource::MetalRenderPipeline;
     use crate::gpu::resource::testkit::*;
 
     /// Every RenderEncoder method, pipeline first, endEncoding last; the SPI the host lacks raises
@@ -1833,6 +1840,195 @@ mod tests {
         )
         .unwrap();
         x.encode(OnFault::Return, RenderCmd::EndEncoding).unwrap();
+    }
+
+    /// The widths [`line_widths_draw_as_metal`] draws at, one picture each, left to right.
+    const LINE_WIDTHS: [f32; 6] = [0.0, 0.5, 1.0, 2.0, 3.5, 8.0];
+
+    /// What Metal draws of a list of two lines, from (1, 3) to (15, 3), along a pixel edge, and
+    /// from (1, 8) to (15, 15), at each of [`LINE_WIDTHS`] on a 16x16 target, `#` for a pixel drawn
+    /// (measured on the M3 Max at macOS 27.0.1 by a program of its own that sends Metal's
+    /// encoder `setLineWidth:`)
+    const LINES_DRAWN: &str = "
+................ ................ ................ ................ ................ .##############.
+................ ................ ................ ................ .##############. .##############.
+................ ................ .##############. .##############. .##############. .##############.
+................ ................ ................ .##############. .##############. .##############.
+................ ................ ................ ................ .##############. .##############.
+................ ................ ................ ................ ................ .##############.
+................ ................ ................ ................ ................ .##############.
+................ ................ ................ .#.............. .##............. .#######........
+................ .#.............. .##............. .###............ .####........... .#########......
+................ ...#............ ...##........... ..####.......... .######......... .###########....
+................ .....#.......... .....##......... ....####........ ..#######....... .#############..
+................ .......#........ .......##....... ......####...... ....#######..... .##############.
+................ .........#...... .........##..... ........####.... ......#######... ..#############.
+................ ...........#.... ...........##... ..........####.. ........#######. ....###########.
+................ .............#.. .............##. ............###. ..........#####. ......#########.
+................ ................ ................ ..............#. ............###. ........#######.
+";
+
+    /// What Metal draws of a strip of three vertices, (3.5, 1), (3.5, 9.5) and (13.5, 14.5), the
+    /// second segment through pixel centres, as [`LINES_DRAWN`]
+    const LINE_STRIP_DRAWN: &str = "
+................ ................ ...#............ ................ ................ ................
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #######.........
+...#............ ...#............ ...#............ ..##............ ..###........... #########.......
+...#............ ...#............ ...#............ ...##........... ...####......... ...########.....
+.....#.......... .....#.......... ....##.......... ...####......... ...######....... ...##########...
+.......#........ .......#........ ......##........ .....####....... ....#######..... ...##########...
+.........#...... .........#...... ........##...... .......####..... ......#######... ...##########...
+...........#.... ...........#.... ..........##.... .........####... ........#####... ...##########...
+................ ................ ............#... ...........##... ..........###... .....########...
+................ ................ ................ ................ ............#... .......######...
+";
+
+    /// A line is drawn as wide as `setLineWidth:` sets, pixel for pixel as Metal draws it at that
+    /// width: by the diamond-exit rule at 1, and otherwise as a band that many pixels across the
+    /// line's minor axis whose pixel centres are drawn (nothing at 0 or 0.5 along a pixel edge,
+    /// 4 rows at 3.5), the centres on the line itself at 0; each segment of a strip for itself
+    #[test]
+    fn line_widths_draw_as_metal() {
+        const MSL: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+struct V { float4 p [[position]]; };
+vertex V lv(uint i [[vertex_id]], const device float2 *q [[buffer(0)]]) {
+    V o; o.p = float4(q[i].x / 8 - 1, 1 - q[i].y / 8, 0, 1); return o;
+}
+fragment float4 f() { return float4(1); }
+";
+        let k = kit();
+        let d = k.device.get();
+        let lib = Obj::from_retained(
+            d.newLibraryWithSource_options_error(&NSString::from_str(MSL), None)
+                .unwrap(),
+        );
+        let rd = MTLRenderPipelineDescriptor::new();
+        rd.setVertexFunction(Some(&function(&lib, "lv")));
+        rd.setFragmentFunction(Some(&function(&lib, "f")));
+        // SAFETY: index 0 of the colour attachments.
+        let ca = unsafe { rd.colorAttachments().objectAtIndexedSubscript(0) };
+        ca.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        let pipeline: MetalRenderPipeline =
+            Obj::from_retained(d.newRenderPipelineStateWithDescriptor_error(&rd).unwrap());
+        let lines = [[1.0, 3.0], [15.0, 3.0], [1.0, 8.0], [15.0, 15.0]];
+        let strip = [[3.5, 1.0], [3.5, 9.5], [13.5, 14.5]];
+        for (primitive_type, points, drawn) in [
+            (MTLPrimitiveType::Line, &lines[..], LINES_DRAWN),
+            (MTLPrimitiveType::LineStrip, &strip[..], LINE_STRIP_DRAWN),
+        ] {
+            let pictures: Vec<Vec<String>> = LINE_WIDTHS
+                .iter()
+                .map(|&width| draw_lines(&k, &pipeline, primitive_type, points, width))
+                .collect();
+            let rows: Vec<String> = (0..16)
+                .map(|y| {
+                    let row: Vec<&str> = pictures.iter().map(|p| p[y].as_str()).collect();
+                    row.join(" ")
+                })
+                .collect();
+            assert_eq!(
+                rows.join("\n"),
+                drawn.trim(),
+                "{primitive_type:?} at {LINE_WIDTHS:?}"
+            );
+        }
+    }
+
+    /// Draws `points` as `primitive_type` lines `width` wide through the platform's encoder, in
+    /// `pipeline` (`lv`: pixel coordinates on a 16x16 target), onto a 16x16 BGRA8 target cleared
+    /// to 0, and answers its rows, `#` for a pixel drawn in white, `.` for one left clear, and `?`
+    /// for any other
+    fn draw_lines(
+        k: &Kit,
+        pipeline: &MetalRenderPipeline,
+        primitive_type: MTLPrimitiveType,
+        points: &[[f32; 2]],
+        width: f32,
+    ) -> Vec<String> {
+        let vertices = buffer(&k.device, 4096);
+        let bytes = std::mem::size_of_val(points);
+        // SAFETY: a 4096-byte `Shared` buffer, which holds the points, written before any
+        // command buffer reads it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                points.as_ptr().cast::<u8>(),
+                vertices.contents().as_ptr::<u8>(),
+                bytes,
+            );
+        }
+        let target = texture(&k.device, MTLStorageMode::Shared);
+        let rp = render_pass(&target);
+        // SAFETY: index 0 of the colour attachments.
+        let ca = unsafe { rp.colorAttachments().objectAtIndexedSubscript(0) };
+        ca.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        });
+        let pass = Obj::from_retained(rp);
+        let cb = command_buffer(&k.queue);
+        let x = cb.render_encoder(OnFault::Return, &pass).unwrap().unwrap();
+        let cmds = [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(pipeline),
+            },
+            RenderCmd::SetLineWidth { line_width: width },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(&vertices),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: primitive_type.0.to_u64(),
+                vertex_start: 0,
+                vertex_count: points.len().to_u64(),
+            },
+            RenderCmd::EndEncoding,
+        ];
+        for cmd in cmds {
+            x.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
+        let mut px = [0u32; 16 * 16];
+        // SAFETY: the whole of a 16x16 target of 4 bytes a pixel, into as many bytes, after its
+        // command buffer completed.
+        unsafe {
+            target.get().getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::new(px.as_mut_ptr().cast()).unwrap(),
+                16 * 4,
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: 16,
+                        height: 16,
+                        depth: 1,
+                    },
+                },
+                0,
+            );
+        }
+        px.chunks(16)
+            .map(|row| {
+                row.iter()
+                    .map(|&p| match p {
+                        0 => '.',
+                        u32::MAX => '#',
+                        _ => '?',
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// A pass that clears its target and draws nothing leaves the clear colour (the encoder core

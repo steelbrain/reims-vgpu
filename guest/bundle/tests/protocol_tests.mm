@@ -723,8 +723,9 @@ void test_framework_members()
 			[renc setFragmentTexture:image atIndex:3];
 			[renc setFragmentSamplerState:nil atIndex:5];
 		}
-		// A line 1 wide is what the host draws; any other width is logged.
+		// Every line width is posted, as its bits.
 		((void (*)(id, SEL, float))objc_msgSend)(renc, @selector(setLineWidth:), 1.0f);
+		((void (*)(id, SEL, float))objc_msgSend)(renc, @selector(setLineWidth:), 3.5f);
 		CHECK(!RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class], @selector(setLineWidth:)));
 		((void (*)(id, SEL, id))objc_msgSend)(renc, @selector(useResidencySet:), nil);
 		CHECK(!RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class],
@@ -741,6 +742,16 @@ void test_framework_members()
 		CHECK(a != nullptr && b != nullptr && a->body == b->body);
 	}
 	CHECK(findOp(together, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE)->as<RgfxOpSetFragmentTexture>().index == 3);
+	const float widths[] = {1.0f, 3.5f};
+	for (size_t n = 0; n < 2; n++) {
+		const Op *w = findOp(together, RGFX_OP_RENDER_SET_LINE_WIDTH, n);
+		CHECK(w != nullptr && w->body.size() == sizeof(RgfxOpSetLineWidth));
+		RgfxOpSetLineWidth b = w->as<RgfxOpSetLineWidth>();
+		uint32_t bits;
+		std::memcpy(&bits, &widths[n], sizeof(bits));
+		CHECK(b.line_width_bits == bits && b.reserved_04 == 0);
+	}
+	CHECK(findOp(together, RGFX_OP_RENDER_SET_LINE_WIDTH, 2) == nullptr);
 
 	// The command buffer: its dictionary, its agent-masked signal, statistics, validate.
 	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
@@ -756,8 +767,6 @@ void test_framework_members()
 	((void (*)(id, SEL, NSUInteger))objc_msgSend)(cb, @selector(setStatOptions:), 1);
 	CHECK(cb.status == MTLCommandBufferStatusNotEnqueued);
 	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
-	((void (*)(id, SEL, float))objc_msgSend)(renc, @selector(setLineWidth:), 2.0f);
-	CHECK(RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class], @selector(setLineWidth:)));
 	((void (*)(id, SEL, MTLSize, MTLRegion))objc_msgSend)(
 	    renc, @selector(dispatchThreadsPerTile:inRegion:), MTLSizeMake(8, 8, 1),
 	    MTLRegionMake2D(0, 0, 16, 16));

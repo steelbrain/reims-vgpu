@@ -2655,12 +2655,12 @@ RGFX_LOG_UNRECOGNIZED
 	[self setFragmentSamplerState:sampler atIndex:samplerIndex];
 }
 
-// Metal draws a line `width` pixels wide (measured: 1, 2, 4 and 9 rows; none at 0.5). The wire
-// carries no width, so the host draws every line 1 wide.
+// The width of the lines drawn from here on, which the host's encoder sets. Metal draws a line
+// whose width is not 1 as a band that many pixels wide along its minor axis (measured on the
+// M3 Max: nothing at 0.5 along a pixel edge, 4 rows at 3.5).
 - (void)setLineWidth:(float)width
 {
-	if (width != 1.0f)
-		RGFX_UNSUPPORTED("line widths other than 1 (none on the wire)");
+	_enc->renderSetLineWidth(width);
 }
 
 // A tile dispatch over part of the tiles: none on the wire (nor any tile pipeline to run).
