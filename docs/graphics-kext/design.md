@@ -460,6 +460,12 @@ enabled, the host sends `VBLANK` at each refresh of the window's screen.
 **Boot display.** The device's option ROM gives firmware a GOP framebuffer in
 BAR2, and the kext takes the display over when it starts.
 
+**QEMU's console.** `reims-graphics-pci`'s QEMU console carries input only: its
+display callbacks are empty, so QEMU's own displays show nothing of the device,
+and a QMP `screendump` of it is always an empty 640x480 image, whatever the
+guest shows. The display shows only in the library's window. A check of what
+the guest shows reads the scanout where `SET_SCANOUT` put it in the region.
+
 ## Stage 3 wire protocol: the Metal-call stream
 
 Stage 3 keeps the stage-2 transport unchanged — the registers, the region, the
@@ -887,5 +893,8 @@ builds a pipe), and refuses the rest.
   handle and no guest pages; and which surfaces the guest CPU touches
   (probe on the Apple lane: KVM's dirty bits per mapped surface).
 - **The PCI vendor:device ID** the device ships with (owner call).
+- **QEMU's console shows nothing of the display** (above, "QEMU's console"):
+  it could show the scanout, so QEMU's displays and `screendump` see what the
+  guest shows.
 - **Owner calls**, each with a recommendation once the evidence is in:
   - whether host device addresses are ever exposed.
