@@ -673,7 +673,8 @@ void test_heap_routing_and_suballoc()
 	CHECK([heap size] == 0x100000);
 	CHECK([heap type] == MTLHeapTypePlacement);
 	CHECK([heap storageMode] == MTLStorageModePrivate);
-	CHECK([heap resourceOptions] == hd.resourceOptions);
+	// Its options as Metal answers them: a Default hazard tracking mode is Untracked for a heap.
+	CHECK([heap resourceOptions] == (hd.resourceOptions | MTLResourceHazardTrackingModeUntracked));
 
 	auto hm = expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
 	CHECK(hm.obj_id == heap.rgfxObjId && hm.gpu_address != 0);
@@ -5421,6 +5422,7 @@ void test_reply_reader_close()
 
 void rgfxProtocolTests();
 void rgfxArchiveTests();
+void rgfxResourceTests();
 
 int main()
 {
@@ -5492,6 +5494,7 @@ int main()
 		test_no_copy_buffers();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
+		rgfxResourceTests(); // tests/resource_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

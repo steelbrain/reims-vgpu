@@ -6,9 +6,11 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxInterop.h"
+#import "RgfxMetalPrivate.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 
@@ -42,11 +44,14 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	return {static_cast<NSUInteger>(sa.size), static_cast<NSUInteger>(sa.align)};
 }
 
-@interface RgfxHeap ()
-// Returned retained, as the new… members that return it are, so no autorelease pool holds it.
+@interface RgfxHeap () <RgfxMetalHeapInternals>
+// Returned retained, as the new… members that return them are, so no autorelease pool holds them.
 - (nullable RgfxBuffer *)rgfxBufferAt:(uint64_t)offset
                                length:(NSUInteger)length
                               options:(MTLResourceOptions)options NS_RETURNS_RETAINED;
+- (nullable RgfxBuffer *)rgfxPlaceBufferOfLength:(NSUInteger)length
+                                         options:(MTLResourceOptions)options
+                                       alignment:(uint64_t)alignment NS_RETURNS_RETAINED;
 @end
 
 @implementation RgfxHeap {
@@ -168,9 +173,25 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	return _type;
 }
 
+// The heap's options, its hazard tracking resolved as Metal's are: a Default mode is Untracked, as
+// Metal documents and answers (measured on the M3 Max under macOS 27: 0x120 for a Private heap of
+// either type, 0x100 for a Shared one, 0x200 for a Shared one made Tracked). Its unfiltered options
+// are the same.
 - (MTLResourceOptions)resourceOptions
 {
-	return _options;
+	return RgfxResolveHazardTracking(_options, MTLResourceHazardTrackingModeUntracked);
+}
+
+- (MTLResourceOptions)unfilteredResourceOptions
+{
+	return self.resourceOptions;
+}
+
+// The heap's base: a resource placed at offset 0 lies there, as in Metal's (measured on the M3 Max
+// under macOS 27, a Placement and an Automatic heap alike).
+- (uint64_t)gpuAddress
+{
+	return _gpuAddress;
 }
 
 - (MTLStorageMode)storageMode
@@ -187,7 +208,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 
 - (MTLHazardTrackingMode)hazardTrackingMode
 {
-	return static_cast<MTLHazardTrackingMode>((_options & MTLResourceHazardTrackingModeMask) >>
+	return static_cast<MTLHazardTrackingMode>((self.resourceOptions &
+	                                           MTLResourceHazardTrackingModeMask) >>
 	                                          MTLResourceHazardTrackingModeShift);
 }
 
@@ -235,13 +257,6 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	}
 	std::lock_guard<std::mutex> hold(_rangesLock);
 	return _ranges->take(size, align, offset);
-}
-
-- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
-{
-	// No host purgeability wire yet; the heap is always resident.
-	(void)state;
-	return MTLPurgeableStateNonVolatile;
 }
 
 // --- sub-allocation (Placement: the guest names the offset) -------------------
@@ -323,11 +338,53 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
+	return [self rgfxPlaceBufferOfLength:length options:options alignment:1];
+}
+
+// A buffer of the descriptor's length, placed as newBufferWithLength:options: places one, at the
+// descriptor's alignment where it is larger than the device's, with the heap's options whatever
+// the descriptor's, as Metal's (measured on the M3 Max under macOS 27: an Automatic heap places a
+// buffer of a 64 KiB alignment at the next 64 KiB and one of the default alignment of 1 at the
+// device's 256 bytes, and answers a Private heap's options for one of Shared options). A Placement
+// heap, which places nothing itself, answers nil, and so does a length of 0 or no descriptor. One
+// over memory of its own (contents, an IOSurface, no-copy, address ranges, a pinned or parent
+// address, sparse pages) the device does not make: nil, logged.
+- (id<MTLBuffer>)newBufferWithDescriptor:(id)descriptor
+{
+	id<RgfxMetalBufferDescriptor> d = descriptor;
+	if (d == nil || _ranges == nullptr || ![d respondsToSelector:@selector(length)] ||
+	    d.length == 0) {
+		return nil;
+	}
+	const bool ownMemory =
+	    ([d respondsToSelector:@selector(contents)] && d.contents != nullptr) ||
+	    ([d respondsToSelector:@selector(iosurface)] && d.iosurface != nullptr) ||
+	    ([d respondsToSelector:@selector(noCopy)] && d.noCopy) ||
+	    ([d respondsToSelector:@selector(addressRanges)] && d.addressRanges != nil) ||
+	    ([d respondsToSelector:@selector(pinnedGPUAddress)] && d.pinnedGPUAddress != 0) ||
+	    ([d respondsToSelector:@selector(parentGPUAddress)] && d.parentGPUAddress != 0) ||
+	    ([d respondsToSelector:@selector(placementSparsePageSize)] &&
+	     d.placementSparsePageSize != 0);
+	if (ownMemory) {
+		RGFX_UNSUPPORTED("buffers over memory of their own");
+		return nil;
+	}
+	const uint64_t alignment = [d respondsToSelector:@selector(alignment)] ? d.alignment : 1;
+	return [self rgfxPlaceBufferOfLength:d.length options:_options alignment:alignment];
+}
+
+// An Automatic heap's buffer of `length` bytes and `options`, at the device's heap buffer
+// alignment or `alignment`, whichever is larger; nil where no free run holds it.
+- (RgfxBuffer *)rgfxPlaceBufferOfLength:(NSUInteger)length
+                                options:(MTLResourceOptions)options
+                              alignment:(uint64_t)alignment
+{
 	// The device's heap buffer alignment (the host's, in its device info), else Metal's.
 	id<MTLDevice> device = self.device;
 	const uint64_t hostAlign =
 	    device != nil ? [device heapBufferSizeAndAlignWithLength:length options:options].align : 0;
-	const uint64_t align = hostAlign != 0 ? hostAlign : kRgfxHeapBufferAlign;
+	const uint64_t align =
+	    std::max<uint64_t>(hostAlign != 0 ? hostAlign : kRgfxHeapBufferAlign, alignment);
 	uint64_t offset = 0;
 	if ([self serializer] == nullptr || ![self rgfxTakeRange:length align:align offset:&offset]) {
 		return nil;
@@ -399,6 +456,13 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 - (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:
                                     (MTLAccelerationStructureDescriptor *)descriptor
                                                                 offset:(NSUInteger)offset
+{
+	RGFX_UNSUPPORTED("ray tracing");
+	return nil;
+}
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size
+                                                   resourceIndex:(NSUInteger)index
 {
 	RGFX_UNSUPPORTED("ray tracing");
 	return nil;

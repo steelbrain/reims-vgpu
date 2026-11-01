@@ -116,6 +116,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 @end
 
+/// The options Metal answers for an object made with `options`: a Default hazard tracking mode is
+/// `fallback`, as Metal resolves it as it makes the object (Untracked for a heap, Tracked for a
+/// resource in no heap; measured on the M3 Max under macOS 27).
+static inline MTLResourceOptions RgfxResolveHazardTracking(MTLResourceOptions options,
+                                                           MTLResourceOptions fallback)
+{
+	return (options & MTLResourceHazardTrackingModeMask) != 0 ? options : (options | fallback);
+}
+
 NS_ASSUME_NONNULL_END
 
 #endif // RGFX_RESOURCE_H_

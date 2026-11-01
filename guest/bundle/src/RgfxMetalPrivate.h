@@ -134,4 +134,41 @@ NS_ASSUME_NONNULL_END
 - (uint64_t)protectionOptions;
 @end
 
+// measured: macOS 27 Metal.framework, on the M3 Max: members Metal's own heap, buffer, texture
+// and sampler classes answer, which MPS, Core Image, QuartzCore and SkyLight call and no protocol
+// of the SDK declares for that kind, with their type encodings. Each wrapper adopts its protocol
+// in its own file.
+NS_ASSUME_NONNULL_BEGIN
+@protocol RgfxMetalHeapInternals
+// `Q16@0:8`: the heap's base address, where a resource at offset 0 lies.
+- (uint64_t)gpuAddress;
+// `Q16@0:8`: the options the heap was made with, as resourceOptions answers them.
+- (MTLResourceOptions)unfilteredResourceOptions;
+// `@24@0:8@16`: a buffer the heap places, of a buffer descriptor's length (MTLBufferDescriptor,
+// below).
+- (nullable id<MTLBuffer>)newBufferWithDescriptor:(nullable id)descriptor;
+// `@32@0:8Q16Q24`: an acceleration structure of `size` bytes in the heap.
+- (nullable id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size
+                                                            resourceIndex:(NSUInteger)index;
+@end
+
+// measured: macOS 27 Metal.framework: the members of MTLBufferDescriptor (an NSObject) that
+// newBufferWithDescriptor: reads here, with their type encodings: `length`, `alignment`,
+// `pinnedGPUAddress` and `parentGPUAddress` `Q16@0:8`, `placementSparsePageSize` `q16@0:8`,
+// `contents` `^v16@0:8`, `noCopy` `B16@0:8`, `iosurface` `^{__IOSurface=}16@0:8` and
+// `addressRanges` `@16@0:8`. A new descriptor's alignment is 1, and every other member is 0, NO
+// or nil.
+@protocol RgfxMetalBufferDescriptor <NSObject>
+- (NSUInteger)length;
+- (NSUInteger)alignment;
+- (uint64_t)pinnedGPUAddress;
+- (uint64_t)parentGPUAddress;
+- (NSInteger)placementSparsePageSize;
+- (nullable void *)contents;
+- (BOOL)noCopy;
+- (nullable IOSurfaceRef)iosurface;
+- (nullable id)addressRanges;
+@end
+NS_ASSUME_NONNULL_END
+
 #endif // RGFX_METAL_PRIVATE_H_

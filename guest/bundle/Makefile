@@ -137,7 +137,8 @@ $(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp $(HEADERS) $(TESTHEA
 # --- the Metal-shell wrapper/routing check (native arch) ---------------------
 # The NSObject wrappers + serialiser core + the routing test; no device shell.
 
-SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_tests.mm
+SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_tests.mm \
+	tests/resource_tests.mm
 
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)
