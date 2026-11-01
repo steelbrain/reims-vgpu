@@ -387,6 +387,30 @@ RgfxCreated RgfxSerializer::createTextureFromBuffer(RgfxObjId buffer, uint64_t o
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createLinearTextureFromBuffer(RgfxObjId buffer, uint64_t offset,
+                                                          uint64_t bytes_per_row,
+                                                          uint64_t bytes_per_image,
+                                                          const RgfxTextureDescriptor &desc)
+{
+	RgfxCreated out = {};
+	out.resource_id = m_ids.allocResourceId();
+	if (out.resource_id == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxLinearTextureFromBuffer msg = {};
+	msg.obj_id = out.obj_id;
+	msg.resource_id = out.resource_id;
+	msg.buffer_obj_id = buffer;
+	msg.offset = offset;
+	msg.bytes_per_row = bytes_per_row;
+	msg.bytes_per_image = bytes_per_image;
+	msg.desc = desc;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createTextureView(const RgfxTextureView &view)
 {
 	RgfxCreated out = {};

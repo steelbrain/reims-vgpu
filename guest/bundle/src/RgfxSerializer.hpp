@@ -274,6 +274,13 @@ public:
 	RgfxCreated createTextureFromBuffer(RgfxObjId buffer, uint64_t offset, uint64_t bytes_per_row,
 	                                    const RgfxTextureDescriptor &desc);
 
+	/// As createTextureFromBuffer, by newLinearTextureWithDescriptor:offset:bytesPerRow:
+	/// bytesPerImage:'s form (RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER), which takes a 2D array, with
+	/// the bytes between its slices the guest asked, `bytes_per_image`.
+	RgfxCreated createLinearTextureFromBuffer(RgfxObjId buffer, uint64_t offset,
+	                                          uint64_t bytes_per_row, uint64_t bytes_per_image,
+	                                          const RgfxTextureDescriptor &desc);
+
 	/// A texture of shape `desc` over plane `plane` of the IOSurface `iosurface_id`,
 	/// lying over the buffer `buffer` (this process's copy of the plane) from
 	/// `offset`, each row `bytes_per_row` apart, the copy's writers (RgfxSurfaceWriters)

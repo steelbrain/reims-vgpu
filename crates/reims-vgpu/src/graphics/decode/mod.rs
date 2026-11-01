@@ -44,11 +44,12 @@ use reims_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
     RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
     RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_LIBRARY_CREATE,
-    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
-    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE,
+    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
     RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
     RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
@@ -62,12 +63,12 @@ use reims_graphics::wire::{
     RGFX_SURFACE_NO_WRITERS, RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory,
     RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
     RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxHeapTextureSizeAndAlign, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate,
-    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceWriter,
-    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
-    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader,
+    RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
+    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
+    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
+    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -973,6 +974,34 @@ impl<P: Platform> GraphicsDecoder<P> {
                         return Ok(Err(DecodeError::BadReference));
                     };
                     buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
+                };
+                let span = self.span_of(m.buffer_obj_id);
+                match made {
+                    Some(texture) => self.insert_over(m.obj_id, ObjHandle::Texture(texture), span),
+                    None => Ok(Err(DecodeError::Refused)),
+                }
+            }
+            RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER => {
+                let Some(m) = read::<RgfxLinearTextureFromBuffer>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                if !self.holds_resource_id(m.obj_id, m.resource_id) {
+                    return Ok(Err(DecodeError::BadResourceId));
+                }
+                let desc = texture_desc(&m.desc, m.resource_id);
+                let descriptor = self.platform.texture_descriptor(&desc);
+                // As TEXTURE_FROM_BUFFER's, by the platform's linear form, which takes a 2D
+                // array and the bytes between its slices.
+                let made = {
+                    let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
+                        return Ok(Err(DecodeError::BadReference));
+                    };
+                    buffer.new_linear_texture(
+                        &descriptor,
+                        m.offset,
+                        m.bytes_per_row,
+                        m.bytes_per_image,
+                    )?
                 };
                 let span = self.span_of(m.buffer_obj_id);
                 match made {

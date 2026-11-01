@@ -12,6 +12,7 @@
 #import <objc/message.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 #include <IOSurface/IOSurface.h>
@@ -316,8 +317,10 @@ void test_heap_buffers_answer_their_heap()
 	drainRing(fx.ring);
 }
 
-// A linear texture is made as newTextureWithDescriptor:offset:bytesPerRow: makes one, its bytes per
-// image unread; a 2D array, whose slices the wire does not space, is nil, logged, posting nothing.
+// A linear texture is made by Metal's linear form on the host (LINEAR_TEXTURE_FROM_BUFFER), its
+// bytes per image carried as asked, a 2D array's and a texture buffer's among them, and answers
+// its buffer, offset and rows as a texture over a buffer does; a type Metal's validation ends the
+// process at, or more than one level, is nil, logged, posting nothing.
 void test_buffer_linear_textures()
 {
 	Fixture fx;
@@ -332,23 +335,46 @@ void test_buffer_linear_textures()
 		                                                       width:16
 		                                                      height:16
 		                                                   mipmapped:NO];
-		id<MTLTexture> t = [internals(buffer) newLinearTextureWithDescriptor:td
-		                                                              offset:0x1000
-		                                                         bytesPerRow:256
-		                                                       bytesPerImage:99999];
-		auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
-		CHECK(m.buffer_obj_id == buffer.rgfxObjId && m.offset == 0x1000 && m.bytes_per_row == 256);
+		auto linear = [&](MTLTextureDescriptor *d, uint64_t offset, uint64_t bpr, uint64_t bpi) {
+			return [internals(buffer) newLinearTextureWithDescriptor:d
+			                                                  offset:offset
+			                                             bytesPerRow:bpr
+			                                           bytesPerImage:bpi];
+		};
+		auto posted = [&](uint64_t offset, uint64_t bpr, uint64_t bpi, MTLTextureType type) {
+			auto m = expectMessage<RgfxLinearTextureFromBuffer>(fx.ring,
+			                                                    RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER);
+			CHECK(m.buffer_obj_id == buffer.rgfxObjId && m.offset == offset);
+			CHECK(m.bytes_per_row == bpr && m.bytes_per_image == bpi);
+			CHECK(m.desc.texture_type == static_cast<uint32_t>(type) && m.resource_id != 0);
+		};
+		id<MTLTexture> t = linear(td, 0x1000, 256, 99999);
+		posted(0x1000, 256, 99999, MTLTextureType2D);
 		CHECK(t != nil && t.buffer == buffer && t.bufferOffset == 0x1000);
 		CHECK(t.bufferBytesPerRow == 256 && t.textureType == MTLTextureType2D);
 		td.textureType = MTLTextureType2DArray;
 		td.arrayLength = 3;
-		CHECK([internals(buffer) newLinearTextureWithDescriptor:td
-		                                                 offset:0
-		                                            bytesPerRow:256
-		                                          bytesPerImage:0x1000] == nil);
-		CHECK(RgfxUnsupportedWasLogged(
-		    [RgfxBuffer class],
-		    @selector(newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:)));
+		id<MTLTexture> array = linear(td, 0x2000, 256, 0x1000);
+		posted(0x2000, 256, 0x1000, MTLTextureType2DArray);
+		CHECK(array != nil && array.arrayLength == 3 && array.buffer == buffer);
+		MTLTextureDescriptor *tb =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                           width:64
+		                                                 resourceOptions:0
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> texels = linear(tb, 0, 256, 0);
+		posted(0, 256, 0, MTLTextureTypeTextureBuffer);
+		CHECK(texels != nil && texels.textureType == MTLTextureTypeTextureBuffer);
+
+		td.arrayLength = 1;
+		for (MTLTextureType type : {MTLTextureType3D, MTLTextureType1D, MTLTextureType1DArray,
+		                            MTLTextureTypeCube, MTLTextureType2DMultisample}) {
+			td.textureType = type;
+			CHECK(linear(td, 0, 256, 0x1000) == nil);
+		}
+		td.textureType = MTLTextureType2D;
+		td.mipmapLevelCount = 2;
+		CHECK(linear(td, 0, 256, 0) == nil);
 		CHECK(ringEmpty(fx.ring));
 	}
 	drainRing(fx.ring);

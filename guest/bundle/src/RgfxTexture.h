@@ -70,6 +70,17 @@ NS_ASSUME_NONNULL_BEGIN
                                         device:(nullable id<MTLDevice>)device
                                     serializer:(nullable RgfxSerializer *)serializer;
 
+/// As textureWithDescriptor:buffer:offset:bytesPerRow:device:serializer:, by Metal's linear form
+/// (newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:), which takes a 2D array:
+/// serialises an `RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER` carrying `bytesPerImage`.
++ (nullable instancetype)linearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                              buffer:(RgfxResource<MTLBuffer> *)buffer
+                                              offset:(uint64_t)offset
+                                         bytesPerRow:(uint64_t)bytesPerRow
+                                       bytesPerImage:(uint64_t)bytesPerImage
+                                              device:(nullable id<MTLDevice>)device
+                                          serializer:(nullable RgfxSerializer *)serializer;
+
 #ifdef __cplusplus
 /// Creates a Managed texture of shape `descriptor` whose CPU copy is a block of `region`, in the
 /// layout RgfxManagedLayout.hpp gives, which the guest maps: `replaceRegion:` writes it and tells

@@ -316,6 +316,11 @@ pub const RGFX_CMD_ARGUMENT_LAYOUT: u32 = 0x219;
 /// Command `SHARED_EVENT_SET_VALUE` ([`RgfxSharedEventSetValue`]): the CPU sets a shared event's
 /// value (`setSignaledValue:`), which only rises, as Metal's does. Not answered.
 pub const RGFX_CMD_SHARED_EVENT_SET_VALUE: u32 = 0x21a;
+/// Command `LINEAR_TEXTURE_FROM_BUFFER` ([`RgfxLinearTextureFromBuffer`]): a texture over a
+/// buffer as `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` makes one, a 2D
+/// array's among them, which `TEXTURE_FROM_BUFFER`'s form does not make. Not answered; a texture
+/// the platform refuses, as Metal refuses it, makes nothing.
+pub const RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER: u32 = 0x21b;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1436,6 +1441,36 @@ pub struct RgfxTextureFromBuffer {
     pub desc: RgfxTextureDescriptor,
 }
 
+/// `LINEAR_TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
+/// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
+/// guest-picked `resource_id`, made by the platform's
+/// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` with
+/// `bytes_per_image`. Metal's spaces a 2D array's slices `bytes_per_row` times
+/// the height apart whatever `bytes_per_image` (measured on the M3 Max under
+/// macOS 27); the message carries it as the guest asked it.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxLinearTextureFromBuffer {
+    /// [`RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER`].
+    pub header: RgfxMsgHeader,
+    /// The new texture's guest-picked id.
+    pub obj_id: u64,
+    /// The new texture's guest-picked resource id.
+    pub resource_id: u64,
+    /// The buffer the texture reads.
+    pub buffer_obj_id: u64,
+    /// The texture's first byte in the buffer.
+    pub offset: u64,
+    /// Bytes from one row's start to the next's.
+    pub bytes_per_row: u64,
+    /// The bytes between a 2D array's slices the guest asked for.
+    pub bytes_per_image: u64,
+    /// The texture's shape.
+    pub desc: RgfxTextureDescriptor,
+}
+
 /// `TEXTURE_FROM_IOSURFACE`: a texture of shape `desc` over plane `plane` of
 /// the IOSurface `iosurface_id` (its global `IOSurfaceID`). The texture lies
 /// over the guest process's copy of that plane, the buffer `buffer_obj_id` from
@@ -2230,6 +2265,7 @@ const _: () = {
     assert!(size_of::<RgfxTextureDescriptor>() == 48);
     assert!(size_of::<RgfxTextureCreate>() == 104);
     assert!(size_of::<RgfxTextureFromBuffer>() == 104);
+    assert!(size_of::<RgfxLinearTextureFromBuffer>() == 112);
     assert!(size_of::<RgfxTextureFromIOSurface>() == 120);
     assert!(size_of::<RgfxSurfaceWriters>() == 64);
     assert!(size_of::<RgfxSamplerCreate>() == 72);

@@ -123,6 +123,7 @@ include = [
     "RgfxLibraryCreate",
     "RgfxLibraryFromRegion",
     "RgfxLibraryLookup",
+    "RgfxLinearTextureFromBuffer",
     "RgfxLinkedFunction",
     "RgfxManagedTextureCreate",
     "RgfxModeEntry",

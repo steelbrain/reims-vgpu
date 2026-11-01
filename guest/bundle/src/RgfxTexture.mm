@@ -484,12 +484,52 @@ enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, k
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer
 {
+	return [self rgfxTextureWithDescriptor:descriptor
+	                                buffer:buffer
+	                                offset:offset
+	                           bytesPerRow:bytesPerRow
+	                                linear:NO
+	                         bytesPerImage:0
+	                                device:device
+	                            serializer:serializer];
+}
+
++ (instancetype)linearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                     buffer:(RgfxResource<MTLBuffer> *)buffer
+                                     offset:(uint64_t)offset
+                                bytesPerRow:(uint64_t)bytesPerRow
+                              bytesPerImage:(uint64_t)bytesPerImage
+                                     device:(id<MTLDevice>)device
+                                 serializer:(RgfxSerializer *)serializer
+{
+	return [self rgfxTextureWithDescriptor:descriptor
+	                                buffer:buffer
+	                                offset:offset
+	                           bytesPerRow:bytesPerRow
+	                                linear:YES
+	                         bytesPerImage:bytesPerImage
+	                                device:device
+	                            serializer:serializer];
+}
+
+// A texture over `buffer`, made by the linear form's message where `linear` says so.
++ (instancetype)rgfxTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                   buffer:(RgfxResource<MTLBuffer> *)buffer
+                                   offset:(uint64_t)offset
+                              bytesPerRow:(uint64_t)bytesPerRow
+                                   linear:(BOOL)linear
+                            bytesPerImage:(uint64_t)bytesPerImage
+                                   device:(id<MTLDevice>)device
+                               serializer:(RgfxSerializer *)serializer
+{
 	if (serializer == nullptr || descriptor == nil || buffer == nil) {
 		return nil;
 	}
 	RgfxTextureDescriptor desc = rgfxTextureDescriptorFromMTL(descriptor);
 	RgfxCreated created =
-	    serializer->createTextureFromBuffer([buffer rgfxObjId], offset, bytesPerRow, desc);
+	    linear ? serializer->createLinearTextureFromBuffer([buffer rgfxObjId], offset, bytesPerRow,
+	                                                       bytesPerImage, desc)
+	           : serializer->createTextureFromBuffer([buffer rgfxObjId], offset, bytesPerRow, desc);
 	if (created.resource_id == 0) {
 		return nil;
 	}

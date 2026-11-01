@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -384,21 +385,43 @@ RGFX_RESOURCE_SPI
 	                               serializer:[self serializer]];
 }
 
-// A texture over the buffer's bytes as newTextureWithDescriptor:offset:bytesPerRow: makes one,
-// which Metal's is (measured on the M3 Max under macOS 27: the same buffer, offset and bytes per
-// row, at the buffer's address plus the offset, a 2D texture whatever its bytes per image). Metal's
-// takes a 2D array too, its slices `bytesPerImage` apart, which the wire's texture over a buffer
-// does not carry: that one is answered nil, logged.
+// A texture over the buffer's bytes as Metal's linear form makes one, which the host's platform
+// makes by the same form (LINEAR_TEXTURE_FROM_BUFFER), carrying `bytesPerImage` as asked. Metal's
+// (measured on the M3 Max under macOS 27) is a texture of the buffer's bytes from the offset, rows
+// `bytesPerRow` apart, as newTextureWithDescriptor:offset:bytesPerRow: makes one, and takes a 2D
+// array too, its slices `bytesPerRow` times its height apart whatever `bytesPerImage`; it ends the
+// process, at its validation's failed assertion, for a texture of another type than 2D, 2D array
+// and texture buffer, or of more than one level, which the bundle answers nil, logged, as it
+// answers a view Metal ends the process at. One past the buffer's bytes Metal answers nil, and the
+// host refuses.
 - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                           offset:(NSUInteger)offset
                                      bytesPerRow:(NSUInteger)bytesPerRow
                                    bytesPerImage:(NSUInteger)bytesPerImage
 {
-	if (descriptor != nil && descriptor.textureType == MTLTextureType2DArray) {
-		RGFX_UNSUPPORTED("2D array textures over a buffer (the wire carries no bytes per image)");
+	if (descriptor == nil) {
 		return nil;
 	}
-	return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
+	const MTLTextureType type = descriptor.textureType;
+	if ((type != MTLTextureType2D && type != MTLTextureType2DArray &&
+	     type != MTLTextureTypeTextureBuffer) ||
+	    descriptor.mipmapLevelCount != 1) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a linear texture over buffer 0x%llx of type %lu and %lu levels, which "
+			      @"Metal's validation ends the process at: answered nil",
+			      (unsigned long long)[self rgfxObjId], (unsigned long)type,
+			      (unsigned long)descriptor.mipmapLevelCount);
+		}
+		return nil;
+	}
+	return [RgfxTexture linearTextureWithDescriptor:descriptor
+	                                         buffer:self
+	                                         offset:offset
+	                                    bytesPerRow:bytesPerRow
+	                                  bytesPerImage:bytesPerImage
+	                                         device:self.device
+	                                     serializer:[self serializer]];
 }
 
 // The size of the allocation the buffer lies in: its heap's, or its own, as Metal's (measured on

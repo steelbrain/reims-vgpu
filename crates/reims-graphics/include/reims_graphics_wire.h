@@ -954,6 +954,12 @@
 // value (`setSignaledValue:`), which only rises, as Metal's does. Not answered.
 #define RGFX_CMD_SHARED_EVENT_SET_VALUE 538
 
+// Command `LINEAR_TEXTURE_FROM_BUFFER` ([`RgfxLinearTextureFromBuffer`]): a texture over a
+// buffer as `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` makes one, a 2D
+// array's among them, which `TEXTURE_FROM_BUFFER`'s form does not make. Not answered; a texture
+// the platform refuses, as Metal refuses it, makes nothing.
+#define RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER 539
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -2760,6 +2766,32 @@ typedef struct {
   // The bytes' content key.
   uint8_t key[32];
 } RgfxLibraryLookup;
+
+// `LINEAR_TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
+// `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
+// guest-picked `resource_id`, made by the platform's
+// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` with
+// `bytes_per_image`. Metal's spaces a 2D array's slices `bytes_per_row` times
+// the height apart whatever `bytes_per_image` (measured on the M3 Max under
+// macOS 27); the message carries it as the guest asked it.
+typedef struct {
+  // [`RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER`].
+  RgfxMsgHeader header;
+  // The new texture's guest-picked id.
+  uint64_t obj_id;
+  // The new texture's guest-picked resource id.
+  uint64_t resource_id;
+  // The buffer the texture reads.
+  uint64_t buffer_obj_id;
+  // The texture's first byte in the buffer.
+  uint64_t offset;
+  // Bytes from one row's start to the next's.
+  uint64_t bytes_per_row;
+  // The bytes between a 2D array's slices the guest asked for.
+  uint64_t bytes_per_image;
+  // The texture's shape.
+  RgfxTextureDescriptor desc;
+} RgfxLinearTextureFromBuffer;
 
 // One function a pipeline stage links (`MTLLinkedFunctions`), named as a stage's
 // function is: a library `obj_id`, an entry-point name in the message tail and a run

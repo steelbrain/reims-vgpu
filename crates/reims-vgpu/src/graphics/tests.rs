@@ -1837,6 +1837,65 @@ fn texture_from_buffer(obj_id: u64, resource_id: u64, buffer: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// A `LINEAR_TEXTURE_FROM_BUFFER` of a 2D array is made over its buffer by the platform's linear
+/// form, with the offset, the bytes per row and the bytes per image the guest asked, and lies in
+/// the buffer's block as a texture over a buffer does
+#[test]
+fn a_linear_texture_is_made_by_the_platform_s_linear_form() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    guest.send(&device, resource_id_chunk(1, 0));
+    guest.send(&device, buffer_over_host_memory(obj(1, 1), BLOCK, 0x8000));
+    let (create, _) = RgfxTextureCreate::read_from_prefix(&texture_create(0, 0)).unwrap();
+    let linear = RgfxLinearTextureFromBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 2),
+        resource_id: 1,
+        buffer_obj_id: obj(1, 1),
+        offset: 0x1000,
+        bytes_per_row: 256,
+        bytes_per_image: 0x4000,
+        desc: RgfxTextureDescriptor {
+            texture_type: 3,
+            width: 16,
+            height: 16,
+            array_length: 3,
+            ..create.desc
+        },
+    };
+    guest.send(&device, linear.as_bytes().to_vec());
+    // The block holds the texture until it goes.
+    let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
+    assert_eq!(
+        status, RGFX_STATUS_REFUSED,
+        "the buffer and its texture lie in it"
+    );
+    assert_eq!(device.decoder_object_count(), 2);
+    let calls = platform
+        .call_log()
+        .calls_to("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].args[1..],
+        [Arg::U64(0x1000), Arg::U64(256), Arg::U64(0x4000)]
+    );
+    assert!(
+        platform
+            .call_log()
+            .calls_to("newTextureWithDescriptor:offset:bytesPerRow:")
+            .is_empty()
+    );
+}
+
 /// Whether ring 0's completion ring stays without a new event for about 100 ms.
 fn quiet(guest: &Guest) -> bool {
     std::thread::sleep(Duration::from_millis(100));
