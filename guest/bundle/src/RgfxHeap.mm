@@ -11,11 +11,13 @@
 #import "RgfxUnsupported.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
 #include "RgfxHeapRanges.hpp"
 #include "RgfxHeapSizes.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer
 
 /// Metal's page, which a heap's size is rounded up to.
@@ -112,6 +114,39 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	if (heap)
 		heap->_traceId = RgfxNextTraceObjectId();
 	[heap rgfxTakeDescriptor:descriptor gpuAddress:created.gpu_address];
+	return heap;
+}
+
++ (instancetype)heapForDeviceWithDescriptor:(MTLHeapDescriptor *)descriptor
+                                  maxLength:(NSUInteger)maxLength
+                                     region:(RgfxRegion *)region
+                                     device:(id<MTLDevice>)device
+                                 serializer:(RgfxSerializer *)serializer
+{
+	if (descriptor == nil || descriptor.size == 0 ||
+	    (maxLength != 0 && descriptor.size > maxLength))
+		return nil;
+	if (descriptor.storageMode != MTLStorageModeShared)
+		return [RgfxHeap heapWithDescriptor:descriptor device:device serializer:serializer];
+	if (region == nullptr || serializer == nullptr)
+		return nil;
+	// The heap's memory is the block, on the host too, whole pages of Metal's 16 KiB.
+	const uint64_t size = static_cast<uint64_t>(descriptor.size);
+	RgfxRegion::Block block = region->allocate((size + kHeapPage - 1) & ~(kHeapPage - 1), kHeapPage);
+	if (!block.ok)
+		return nil;
+	uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+	std::memset(bytes, 0, block.size);
+	// The block goes back to the region once the host has dropped the heap.
+	const uint64_t offset = block.offset;
+	RgfxHeap *heap = [RgfxHeap heapOverHostMemoryWithDescriptor:descriptor
+	                                              regionOffset:offset
+	                                                  contents:bytes
+	                                               deallocator:^{ region->release(offset); }
+	                                                    device:device
+	                                                serializer:serializer];
+	if (heap == nil)
+		region->release(offset); // no heap lies over the block
 	return heap;
 }
 

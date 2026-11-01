@@ -295,6 +295,72 @@ void test_device_buffers_answer_as_metal()
 	}
 }
 
+// The device's heaps answer as Metal's (measured on the M3 Max, macOS 27.0.1, plain and under
+// MTL_DEBUG_LAYER: every mode and type made at maxBufferLength, nil a 16 KiB page past it): a
+// Shared one lies over a zeroed block of the region in Metal's 16 KiB pages, its buffers the
+// block's bytes, and a Private one is the host's heap. None of 0 bytes (plain Metal's nil; its
+// validation stops one) or past maxBufferLength, in any mode or type; none where the region has
+// no room for a Shared one, or there is no region, as Metal makes no Shared heap without its
+// memory (no device heap whose buffers the host would never see). A refusal posts nothing.
+void test_device_heaps_answer_as_metal()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x20000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	auto make = [&](uint64_t size, MTLStorageMode mode, MTLHeapType type, NSUInteger maxLength,
+	                RgfxRegion *in) {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = size;
+		d.storageMode = mode;
+		d.type = type;
+		return [RgfxHeap heapForDeviceWithDescriptor:d
+		                                   maxLength:maxLength
+		                                      region:in
+		                                      device:nil
+		                                  serializer:&fx.ser];
+	};
+	@autoreleasepool {
+		RgfxHeap *shared =
+		    make(0x1000, MTLStorageModeShared, MTLHeapTypePlacement, 0x10000, &region);
+		CHECK(shared != nil);
+		auto over = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		uint8_t *bytes = static_cast<uint8_t *>(shared.rgfxContents);
+		CHECK(bytes >= mem.data() + RGFX_ALLOCATIONS_OFFSET &&
+		      bytes + 0x4000 <= mem.data() + mem.size());
+		CHECK(over.obj_id == shared.rgfxObjId &&
+		      over.region_offset == static_cast<uint64_t>(bytes - mem.data()));
+		CHECK(bytes[0] == 0 && bytes[0x3fff] == 0);
+		id<MTLBuffer> placed = [shared newBufferWithLength:0x100
+		                                           options:MTLResourceStorageModeShared
+		                                            offset:0x800];
+		CHECK(placed != nil && [placed contents] == bytes + 0x800);
+		(void)expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+
+		RgfxHeap *priv = make(0x1000, MTLStorageModePrivate, MTLHeapTypeAutomatic, 0x10000, &region);
+		CHECK(priv != nil && priv.rgfxContents == nullptr);
+		(void)expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
+		// No limit known: none held back.
+		RgfxHeap *unlimited = make(0x20000, MTLStorageModePrivate, MTLHeapTypePlacement, 0, &region);
+		CHECK(unlimited != nil);
+		(void)expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
+		CHECK(ringEmpty(fx.ring));
+
+		const MTLStorageMode modes[] = { MTLStorageModeShared, MTLStorageModePrivate };
+		const MTLHeapType types[] = { MTLHeapTypeAutomatic, MTLHeapTypePlacement };
+		for (MTLStorageMode mode : modes) {
+			for (MTLHeapType type : types) {
+				CHECK(make(0, mode, type, 0x10000, &region) == nil);
+				CHECK(make(0x10001, mode, type, 0x10000, &region) == nil);
+			}
+		}
+		// A Shared heap with no region, or too large for what it has left.
+		CHECK(make(0x1000, MTLStorageModeShared, MTLHeapTypePlacement, 0x10000, nullptr) == nil);
+		CHECK(make(0x40000, MTLStorageModeShared, MTLHeapTypeAutomatic, 0, &region) == nil);
+		CHECK(ringEmpty(fx.ring));
+	} // the heaps go while the region lives
+	drainRing(fx.ring);
+}
+
 // The id space is monotonic across wrappers: a second buffer gets the next objId
 // and a disjoint, higher GPU address, and its own BUFFER_CREATE.
 void test_second_buffer_is_monotonic()
@@ -5852,6 +5918,7 @@ int main()
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
 		test_device_buffers_answer_as_metal();
+		test_device_heaps_answer_as_metal();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
 		test_event_routing();

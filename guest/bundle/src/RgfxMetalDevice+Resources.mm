@@ -13,21 +13,9 @@
 #import "RgfxSampler.h"
 #import "RgfxTexture.h"
 
-#include <cstring>
-
 #include "RgfxObjectModel.hpp" // RGFX_OBJ_NONE
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
-
-namespace {
-/// Whether `options` names Shared storage (the storage mode the host sees in place over
-/// a region block). MTLResourceStorageModeShared is 0 at the storage-mode shift.
-bool rgfxIsSharedStorage(MTLResourceOptions options)
-{
-	return ((options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift) ==
-	       MTLStorageModeShared;
-}
-} // namespace
 
 @implementation RgfxMetalDevice (Resources)
 
@@ -140,35 +128,13 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
 
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)descriptor
 {
-	// A Shared heap lives in the device region so the host sees its sub-resources in
-	// place; any other storage mode is a device heap (createHeap).
-	RgfxRegion *region = [self region];
-	if (descriptor != nil && rgfxIsSharedStorage(descriptor.resourceOptions) &&
-	    region != nullptr) {
-		// The heap's memory is the block, on the host too, whole pages of Metal's 16 KiB.
-		const uint64_t page = 0x4000;
-		const uint64_t size = descriptor.size == 0 ? 1 : static_cast<uint64_t>(descriptor.size);
-		RgfxRegion::Block block = region->allocate((size + page - 1) & ~(page - 1), page);
-		if (block.ok) {
-			uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
-			std::memset(bytes, 0, block.size);
-			// The block goes back to the region once the host has dropped the heap.
-			uint64_t offset = block.offset;
-			id<MTLHeap> shared = [RgfxHeap heapOverHostMemoryWithDescriptor:descriptor
-			                                                  regionOffset:offset
-			                                                      contents:bytes
-			                                                   deallocator:^{ region->release(offset); }
-			                                                        device:self
-			                                                    serializer:[self serializer]];
-			if (shared != nil) {
-				return shared;
-			}
-			region->release(offset); // no heap lies over the block
-		}
-	}
-	return [RgfxHeap heapWithDescriptor:descriptor
-	                             device:self
-	                         serializer:[self serializer]];
+	// A Shared heap lives in the device region so the host sees its sub-resources in place, or
+	// is nil; any other storage mode is a device heap (createHeap).
+	return [RgfxHeap heapForDeviceWithDescriptor:descriptor
+	                                   maxLength:[self maxBufferLength]
+	                                      region:[self region]
+	                                      device:self
+	                                  serializer:[self serializer]];
 }
 
 @end

@@ -40,6 +40,7 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+class RgfxRegion;
 class RgfxSerializer;
 #endif
 
@@ -54,6 +55,23 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable instancetype)heapWithDescriptor:(MTLHeapDescriptor *)descriptor
                                      device:(nullable id<MTLDevice>)device
                                  serializer:(nullable RgfxSerializer *)serializer;
+
+#ifdef __cplusplus
+/// The heap `newHeapWithDescriptor:` makes: a Shared one over a zeroed block of `region` in
+/// Metal's 16 KiB pages (heapOverHostMemoryWithDescriptor:), which the host sees in place, and
+/// a heap of any other mode the host's own (heapWithDescriptor:).
+///
+/// Nil where Metal makes none (measured on the M3 Max, macOS 27.0.1, plain and under
+/// MTL_DEBUG_LAYER, Shared and Private, Automatic and Placement): for a size of 0, and for one
+/// past `maxLength` (the device's maxBufferLength, at which Metal makes one; 0 holds none
+/// back). Nil too where there is no `region`, or it has no room for a Shared one, as Metal
+/// makes no Shared heap without its memory, never one whose buffers the GPU does not see.
++ (nullable instancetype)heapForDeviceWithDescriptor:(nullable MTLHeapDescriptor *)descriptor
+                                           maxLength:(NSUInteger)maxLength
+                                              region:(nullable RgfxRegion *)region
+                                              device:(nullable id<MTLDevice>)device
+                                          serializer:(nullable RgfxSerializer *)serializer;
+#endif
 
 /// Creates a Shared heap over a block of the device region at `regionOffset`, whose bytes
 /// are at `contents` here, serialising an `RGFX_CMD_HEAP_OVER_HOST_MEMORY` through
