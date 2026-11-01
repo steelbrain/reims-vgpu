@@ -131,15 +131,14 @@ void RgfxAccelerator::free()
 IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                         OSDictionary *properties, IOUserClient **handler)
 {
-	// The types callers open, measured: IOAccel surfaces (0), the display pipe (4), the one the
-	// IOGPUMetalDevice base builds its device over (5), and ours. Any other is refused, logged
-	// once per type.
+	// The types served: the display pipe (4), the one the IOGPUMetalDevice base builds its
+	// device over (5), and ours. Any other is refused, logged once per type. IOAccel surfaces
+	// (0) are among them: CoreDisplay opens them at display start for its display surface, and
+	// maps the framebuffer's memory for it when they are refused.
 	RgfxCaller caller;
 	IOLog("RGFX: newUserClient type=%u from %s[%d]\n", type, caller.name, caller.pid);
 	if (type == kRgfxDisplayPipeUserClientType)
 		return newDisplayPipe(owningTask, securityID, type, properties, handler);
-	if (type == kRgfxSurfaceUserClientType)
-		return newSurface(owningTask, securityID, type, properties, handler);
 	if (type != kRgfxAccelUserClientType && type != kRgfxIOGPUDeviceUserClientType) {
 		static char site;
 		if (rgfxFirstCalls(&site, type, 1))
