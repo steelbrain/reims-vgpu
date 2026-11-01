@@ -281,6 +281,11 @@ public:
 	                             UInt32 surfaceId, Scanout *scanout);
 	void revokeGrants(const void *client);
 	bool grantedRange(const void *client, UInt64 offset, UInt64 length);
+	// The scanout's owner moved to `owner` (a new server connection, ReimsGraphics): every other
+	// task's grant of the scanout goes, its span out of the client's window, and so does every
+	// other task's lock mapping of it (RgfxScanoutOwner.hpp, rgfxKeepsScanout). Called with no
+	// lock of the framebuffer's held.
+	void scanoutOwnerMoved(task_t owner);
 
 #if RGFX_FB_TRACE
 	// A trace build logs the properties processes read of the accelerator.

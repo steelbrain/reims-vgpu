@@ -575,7 +575,11 @@ opens it for one task at a time, and the task that holds it maps the scanout
 through it already (the system aperture), so the rule gives no process what
 IOFramebuffer does not. An open in flight counts too, since IOFramebuffer sets
 the display up inside it. A new connection's task replaces the last one, and
-what the last one mapped stays in it until its surface goes or it locks again.
+every other task's hold of the scanout is taken back then: each grant, its
+span mapped back out of the context's window, and each lock's mapping,
+unmapped from the task. What IOFramebuffer itself mapped for a task (the VRAM
+range on its connections) is IOFramebuffer's, and goes only with its
+connection.
 
 Command buffers do not pass through the kext, so the host checks each
 object a message names: it must be

@@ -4,6 +4,7 @@
  */
 
 #include "ReimsGraphics.hpp"
+#include "RgfxAccelerator.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOUserClient.h>
@@ -775,6 +776,27 @@ bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowByt
 // IOFramebuffer makes the connection; a server connection's task is the scanout's owner from
 // then on, in place of the one before it, and while the open is in flight
 // (RgfxScanoutOwner.hpp).
+void ReimsGraphics::scanoutOwnerMoved(task_t owner)
+{
+	if (!pci)
+		return;
+	RgfxAccelerator *accelerator = nullptr;
+	if (OSIterator *clients = pci->getClientIterator()) {
+		while (OSObject *o = clients->getNextObject()) {
+			accelerator = OSDynamicCast(RgfxAccelerator, o);
+			if (accelerator) {
+				accelerator->retain();
+				break;
+			}
+		}
+		clients->release();
+	}
+	if (!accelerator)
+		return;
+	accelerator->scanoutOwnerMoved(owner);
+	accelerator->release();
+}
+
 IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                       IOUserClient **clientH)
 {
@@ -802,6 +824,9 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 		task_deallocate(static_cast<task_t>(const_cast<void *>(oldTask)));
 	if (oldClient)
 		static_cast<const IOUserClient *>(oldClient)->release();
+	// The owner moved: every other task's hold of the scanout is taken back.
+	if (made)
+		scanoutOwnerMoved(owningTask);
 	RgfxCaller caller;
 	if (made)
 		IOLog("ReimsGraphics: the scanout's owner is %s[%d], which holds the server connection\n",

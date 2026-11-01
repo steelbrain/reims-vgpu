@@ -19,7 +19,8 @@
  * goes or moves (the surface goes, or a mode change moves the scanout).
  *
  * Only the scanout's owner, the task that holds the framebuffer's server connection, is granted
- * it (RgfxScanoutOwner.hpp); any other task's ask is refused, whatever surface it made.
+ * it (RgfxScanoutOwner.hpp); any other task's ask is refused, whatever surface it made. When the
+ * owner moves to a new connection's task, every other task's grant goes (scanoutOwnerMoved).
  *
  * Our own code; it names only SDK-public IOKit calls.
  */
@@ -28,6 +29,7 @@
 #include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxSurfaceUserClient.hpp"
 #include "ReimsGraphics.hpp"
+#include "RgfxScanoutOwner.hpp"
 #include "RgfxTrace.hpp"
 
 #include <IOKit/IOLib.h>
@@ -42,6 +44,8 @@ struct Grant {
 	UInt32 surfaceId;
 	UInt64 offset;
 	UInt64 length;
+	// The task the grant was made for, the scanout's owner then.
+	const void *task;
 };
 
 // Under lock: the surfaces (each retained) and their ids, and the grants. One initialised
@@ -217,7 +221,7 @@ IOReturn RgfxAccelerator::grantSurfaceScanout(RgfxAcceleratorUserClient *client,
 				dropGrant(g);
 			r = client->mapSpan(scanout->offset, scanout->length);
 			if (r == kIOReturnSuccess)
-				g = {client, surfaceId, scanout->offset, scanout->length};
+				g = {client, surfaceId, scanout->offset, scanout->length, task};
 			else if (g.client)
 				dropGrant(g);
 			else
@@ -251,6 +255,47 @@ void RgfxAccelerator::revokeGrants(const void *client)
 			dropGrant(surfaceState.grants[i]);
 	}
 	IOLockUnlock(lock);
+}
+
+void RgfxAccelerator::scanoutOwnerMoved(task_t owner)
+{
+	UInt32 grants = 0, maps = 0;
+	if (IOLock *lock = __atomic_load_n(&surfaceState.lock, __ATOMIC_ACQUIRE)) {
+		IOLockLock(lock);
+		for (UInt32 i = 0; i < kMaxGrants; i++) {
+			Grant &g = surfaceState.grants[i];
+			if (g.client && !rgfxKeepsScanout(g.task, owner)) {
+				dropGrant(g);
+				grants++;
+			}
+		}
+		IOLockUnlock(lock);
+	}
+	// Every surface client, those with no id among them, attaches to the accelerator: the other
+	// tasks' are gathered (retained) first, so none is dropped while the clients are walked.
+	OSArray *others = OSArray::withCapacity(8);
+	OSIterator *clients = others ? getClientIterator() : nullptr;
+	if (clients) {
+		do {
+			clients->reset();
+			others->flushCollection();
+			while (OSObject *o = clients->getNextObject()) {
+				RgfxSurfaceUserClient *surface = OSDynamicCast(RgfxSurfaceUserClient, o);
+				if (surface && !rgfxKeepsScanout(surface->owningTask(), owner))
+					others->setObject(surface);
+			}
+		} while (!clients->isValid());
+		clients->release();
+	}
+	for (unsigned i = 0; others && i < others->getCount(); i++) {
+		if (static_cast<RgfxSurfaceUserClient *>(others->getObject(i))->dropScanoutMap())
+			maps++;
+	}
+	OSSafeReleaseNULL(others);
+	if (grants || maps)
+		IOLog("RGFX surface: the scanout's owner moved: %u grants and %u mappings of the scanout "
+		      "in other tasks were taken back\n",
+		      grants, maps);
 }
 
 bool RgfxAccelerator::grantedRange(const void *client, UInt64 offset, UInt64 length)

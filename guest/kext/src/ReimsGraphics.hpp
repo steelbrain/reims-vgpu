@@ -147,6 +147,9 @@ public:
 	// Whether `task` owns the scanout: it holds the framebuffer's server connection, or its open
 	// of one is in flight (RgfxScanoutOwner.hpp). Only the owner reaches the display's pixels.
 	bool ownsScanout(task_t task);
+	// The scanout's owner moved to `owner`: the accelerator takes every other task's hold of the
+	// scanout back (RgfxAccelerator::scanoutOwnerMoved). With no lock held.
+	void scanoutOwnerMoved(task_t owner);
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);

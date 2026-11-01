@@ -16,6 +16,11 @@
 //          range does not map on the framebuffer's shared connection.
 //     Prints "WINDOW OK" when every step holds, else "WINDOW FAIL: why".
 //   window_probe scanout   step 5 alone, in a process of its own.
+//   window_probe former-owner   as root, with no WindowServer holding the framebuffer's server
+//     connection: this process owns the scanout through that connection, locks a surface over
+//     it and is granted it, closes the connection, and once another process's connection makes
+//     that process the owner, its lock mapping faults and its window no longer holds the
+//     scanout's span. Prints "FORMER OK", "FORMER FAIL: why" or "FORMER SETUP: why".
 //   window_probe bench [N]  N (2000 by default) allocs and frees of a 64 KiB block, one after
 //     the other: the microseconds a pair takes from this process, the kext's window work
 //     included (which the kext logs at the close).
@@ -135,6 +140,23 @@ static int writeFaults(volatile uint8_t *p)
 	int faulted = 0;
 	if (sigsetjmp(gFault, 1) == 0)
 		*p = 0x5a;
+	else
+		faulted = 1;
+	sigaction(SIGSEGV, &oldSegv, NULL);
+	sigaction(SIGBUS, &oldBus, NULL);
+	return faulted;
+}
+
+// Whether a read of one byte at `p` faults.
+static int readFaults(volatile const uint8_t *p)
+{
+	struct sigaction sa = {}, oldSegv, oldBus;
+	sa.sa_handler = onFault;
+	sigaction(SIGSEGV, &sa, &oldSegv);
+	sigaction(SIGBUS, &sa, &oldBus);
+	int faulted = 0;
+	if (sigsetjmp(gFault, 1) == 0)
+		(void)*p;
 	else
 		faulted = 1;
 	sigaction(SIGSEGV, &oldSegv, NULL);
@@ -384,6 +406,105 @@ static int peerScanout(void)
 	return failed;
 }
 
+// The framebuffer's server connection (kIOFBServerConnectType), which makes this task the
+// scanout's owner; IO_OBJECT_NULL where it is not made (WindowServer holds it), its answer in
+// `*kr`.
+static io_connect_t openServer(kern_return_t *kr)
+{
+	io_service_t fb =
+	    IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("ReimsGraphics"));
+	io_connect_t server = IO_OBJECT_NULL;
+	*kr = fb ? IOServiceOpen(fb, mach_task_self(), kIOFBServerConnectType, &server)
+	         : KERN_FAILURE;
+	if (fb)
+		IOObjectRelease(fb);
+	return *kr == KERN_SUCCESS ? server : IO_OBJECT_NULL;
+}
+
+// peer-owner: opens the framebuffer's server connection, so the scanout's owner moves to this
+// task, and closes it.
+static int peerOwner(void)
+{
+	kern_return_t kr;
+	io_connect_t server = openServer(&kr);
+	printf("  former: the next owner's server connection: 0x%x\n", kr);
+	if (server == IO_OBJECT_NULL)
+		return 1;
+	usleep(200000);
+	IOServiceClose(server);
+	return 0;
+}
+
+// former-owner: with no WindowServer holding the framebuffer's server connection (stopped, and
+// this run as root), this task takes the connection, locks a surface over the scanout and is
+// granted the scanout, then closes the connection: its holds stay while no task owns the
+// scanout. Once another task's connection makes that task the owner, this task's lock mapping
+// faults and its window reads zeros at the scanout's span, where a write faults.
+static int formerOwner(const char *self)
+{
+	kern_return_t kr;
+	io_connect_t server = openServer(&kr);
+	if (server == IO_OBJECT_NULL) {
+		printf("FORMER SETUP: the server connection 0x%x (does WindowServer hold it?)\n", kr);
+		return 2;
+	}
+	struct Conn c;
+	uint32_t sid = 0x46000000u | ((uint32_t)getpid() & 0xffffffu);
+	io_connect_t s = IO_OBJECT_NULL;
+	if (openConn(&c) != 0 || !c.base || (s = openSurface(sid)) == IO_OBJECT_NULL) {
+		printf("FORMER SETUP: no context or surface\n");
+		IOServiceClose(server);
+		return 2;
+	}
+	IOAccelSurfaceInformation info;
+	kern_return_t locked = lockShape(s, 16, 16, &info);
+	int w = locked == KERN_SUCCESS ? largest(s, 16384, 1) : 0;
+	int h = locked == KERN_SUCCESS ? largest(s, 16384, 0) : 0;
+	locked = lockShape(s, w ? w : 16, h ? h : 16, &info);
+	volatile const uint8_t *px = (volatile const uint8_t *)(uintptr_t)info.address[0];
+	uint64_t in[2] = {sid, 0};
+	uint64_t out[5] = {};
+	uint32_t n = 5;
+	kern_return_t granted = IOConnectCallScalarMethod(c.conn, kSurfaceScanout, in, 2, out, &n);
+	uint64_t at = out[0], length = out[1];
+	printf("  former: as the owner: the lock of %dx%d 0x%x at 0x%llx, the grant 0x%x (span "
+	       "0x%llx, 0x%llx bytes)\n",
+	       w, h, locked, (unsigned long long)info.address[0], granted, (unsigned long long)at,
+	       (unsigned long long)length);
+	if (locked != KERN_SUCCESS || !px || granted != KERN_SUCCESS || at >= c.size ||
+	    length > c.size - at) {
+		printf("FORMER SETUP: the owner was not given the scanout\n");
+		IOServiceClose(server);
+		return 2;
+	}
+	IOServiceClose(server);
+	usleep(200000);
+	int before = readFaults(px);
+	size_t windowBefore = notAll(c.base + at, 4096, 0);
+	printf("  former: the connection closed, no owner: the lock mapping %s, the window holds %zu "
+	       "nonzero bytes of the span's first page\n",
+	       before ? "faults" : "reads", windowBefore);
+	char *next[] = {(char *)self, "peer-owner", NULL};
+	if (spawnWait(next) != 0) {
+		printf("FORMER SETUP: the next owner's connection was not made\n");
+		return 2;
+	}
+	int after = readFaults(px);
+	size_t windowAfter = notAll(c.base + at, length, 0);
+	int writeFault = writeFaults(c.base + at);
+	printf("  former: after the owner moved: the lock mapping %s, the window holds %zu nonzero "
+	       "bytes of the span, a write there %s\n",
+	       after ? "faults" : "reads", windowAfter, writeFault ? "faults" : "lands");
+	IOServiceClose(s);
+	IOServiceClose(c.conn);
+	if (!after || windowAfter != 0 || !writeFault) {
+		printf("FORMER FAIL: the former owner keeps the scanout\n");
+		return 1;
+	}
+	printf("FORMER OK\n");
+	return 0;
+}
+
 static int check(const char *self)
 {
 	struct Conn c;
@@ -550,6 +671,10 @@ int main(int argc, char **argv)
 			printf(r == 0 ? "SCANOUT OK\n" : "SCANOUT FAIL\n");
 			return r != 0;
 		}
+		if (argc >= 2 && strcmp(argv[1], "peer-owner") == 0)
+			return peerOwner();
+		if (argc >= 2 && strcmp(argv[1], "former-owner") == 0)
+			return formerOwner(argv[0]);
 		if (argc >= 2 && strcmp(argv[1], "bench") == 0)
 			return bench(argc >= 3 ? strtol(argv[2], NULL, 0) : 2000);
 		return check(argv[0]);

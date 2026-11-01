@@ -66,6 +66,9 @@ public:
 	// Whether the surface's memory is the framebuffer's scanout of `width` x `height`: on
 	// framebuffer 0, no backing of the client's, its shape the whole `width` x `height`.
 	bool isScanout(UInt32 width, UInt32 height);
+	// The scanout's mapping in the task, which a lock made, goes (the scanout's owner moved to
+	// another task, RgfxAccelerator::scanoutOwnerMoved): true where there was one.
+	bool dropScanoutMap();
 
 private:
 	IOReturn setIDMode(IOExternalMethodArguments *a);

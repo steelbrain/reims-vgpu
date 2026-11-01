@@ -28,9 +28,10 @@
 // the connection exists. An open while a connection is held fails, so it marks nothing.
 //
 // One task owns the scanout at a time: a new server connection's task replaces the one before
-// it. What the old one mapped of the scanout stays in its task until its surface goes or it
-// locks again; it is a process that held the display, and in practice the WindowServer that
-// died, whose connection went with it.
+// it, and every other task's hold of the scanout is taken back then (rgfxKeepsScanout): each
+// grant of it, its span mapped back out of the context's window, and each lock's mapping of it,
+// unmapped from the task. What IOFramebuffer itself mapped for a task, the VRAM range on its
+// connections, is IOFramebuffer's, and goes only with its connection.
 //
 // Our own code.
 #ifndef RGFX_SCANOUT_OWNER_HPP_
@@ -105,6 +106,13 @@ struct RgfxScanoutOwner {
 		task = client = opening = nullptr;
 	}
 };
+
+// Whether a grant or a lock's mapping of the scanout that `holder` (its task) holds stays when
+// the scanout's owner moves to `owner`: only the owner's own.
+inline bool rgfxKeepsScanout(const void *holder, const void *owner)
+{
+	return holder && holder == owner;
+}
 
 // Whether `who` may be given the framebuffer's VRAM range: the kernel (IOFramebuffer's own setup
 // and power work) and the scanout's owner.

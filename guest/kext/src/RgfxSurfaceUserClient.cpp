@@ -123,6 +123,19 @@ void RgfxSurfaceUserClient::dropSurface()
 	OSSafeReleaseNULL(map);
 }
 
+bool RgfxSurfaceUserClient::dropScanoutMap()
+{
+	if (!stateLock)
+		return false;
+	IOLockLock(stateLock);
+	IOMemoryMap *map = scanoutMap;
+	scanoutMap = nullptr;
+	IOLockUnlock(stateLock);
+	bool had = map != nullptr;
+	OSSafeReleaseNULL(map);
+	return had;
+}
+
 // MARK: - The methods
 
 IOReturn RgfxSurfaceUserClient::externalMethod(uint32_t selector,

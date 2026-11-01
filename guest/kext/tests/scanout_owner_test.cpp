@@ -1,7 +1,8 @@
 // The native test of RgfxScanoutOwner.hpp: only the task that holds the framebuffer's server
 // connection (or whose open of one is in flight) owns the scanout, a new connection's task
-// replaces the old one, a closed connection owns nothing, the VRAM range goes to the kernel and
-// the owner alone, and the scanout's room never reaches the accelerator's blocks.
+// replaces the old one and takes every other task's hold of the scanout back, a closed connection
+// owns nothing, the VRAM range goes to the kernel and the owner alone, and the scanout's room
+// never reaches the accelerator's blocks.
 #include "RgfxScanoutOwner.hpp"
 
 #include <cstdio>
@@ -88,6 +89,13 @@ int main()
 	o.clear(&oldTask, &oldClient);
 	check(oldTask == ws2 && oldClient == &nextConnection, "the record's end hands back its own");
 	check(!o.owns(ws2, true), "and owns nothing after");
+
+	// The owner moves to the next WindowServer: the former owner's grants and mappings of the
+	// scanout go, and the new owner's stay, as does the same task's where it opens again.
+	check(!rgfxKeepsScanout(ws, ws2), "the former owner's hold goes when the owner moves");
+	check(!rgfxKeepsScanout(other, ws2), "another task's hold goes");
+	check(rgfxKeepsScanout(ws2, ws2), "the new owner's hold stays");
+	check(!rgfxKeepsScanout(nullptr, ws2), "a hold of no task goes");
 
 	// The VRAM range: the kernel and the owner.
 	check(rgfxMayMapVram(k, k, false), "the kernel maps the VRAM range");
