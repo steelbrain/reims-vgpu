@@ -11,6 +11,7 @@
 #include "RgfxSurfaceUserClient.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 
 #include "RgfxTrace.hpp"
 
@@ -82,6 +83,9 @@ bool RgfxAccelerator::start(IOService *provider)
 	// notification see it.
 	if (!super::start(provider))
 		goto fail;
+	// The accelerator's index, the one the framebuffer names it by (ReimsGraphics' IOAccelIndex):
+	// IOPresentment reads it here, before registerService, to match the display to this GPU.
+	setProperty(kIOAccelIndexKey, 0ull, 32);
 	// Name this accelerator on the framebuffer, if it has started already (else the display
 	// pipe's first association does).
 	OSSafeReleaseNULL(fb);
