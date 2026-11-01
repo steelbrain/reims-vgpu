@@ -13,6 +13,7 @@
 #import "RgfxBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxTexture.h"
+#import "RgfxUnsupported.h"
 
 // RGFX DIAG (Wall-2 trace; remove before merge): the guest's logd is broken, so
 // write diagnostics to a file any process (platform or not) can read.
@@ -298,6 +299,7 @@ RGFX_LOG_UNRECOGNIZED
 	std::unique_ptr<RgfxRingWriter> _controlRing; // the lifecycle, forwarded to the kext
 	mach_vm_address_t _mapBase;  // the window's base in this process (0 until the context opens)
 	mach_vm_size_t _mapSize;     // the window's size, the region's
+	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 }
 
 // RGFX DIAG (Wall-2 trace; remove before merge): fires when the bundle is loaded
@@ -894,6 +896,195 @@ RGFX_LOG_UNRECOGNIZED
 - (BOOL)supportsPrimitiveType:(NSUInteger)primitiveType
 {
 	return _caps.valid() && _caps.supportsPrimitiveType(static_cast<uint32_t>(primitiveType));
+}
+
+// --- what Apple's frameworks send the device beyond MTLDevice (RgfxInterop.h) --------
+// SkyLight, Core Image and MPS send these; each answers what Metal's device answers, measured
+// on the M3 Max (macOS 27), unless it says otherwise.
+
+// As supportsTextureSampleCount: (the same for each count from 1 to 16).
+- (BOOL)supportsSampleCount:(NSUInteger)sampleCount
+{
+	return [self supportsTextureSampleCount:sampleCount];
+}
+
+// NO until set, then what was set.
+- (BOOL)metalAssertionsEnabled
+{
+	return _metalAssertions.load(std::memory_order_relaxed);
+}
+
+- (void)setMetalAssertionsEnabled:(BOOL)enabled
+{
+	_metalAssertions.store(enabled, std::memory_order_relaxed);
+}
+
+// A resource type's patching kind: Metal's answers for types 0 to 11, and 0 from 14 on. Types
+// 12 and 13 answer values that look read from past the table; 0 here.
+- (NSUInteger)resourcePatchingTypeForResourceType:(NSUInteger)resourceType
+{
+	static const uint8_t kPatching[] = {1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0};
+	return resourceType < sizeof(kPatching) ? kPatching[resourceType] : 0;
+}
+
+// Metal's writes nothing to `indices` (types 0, 1 and 2 tried), and neither does this.
+- (void)reserveResourceIndicesForResourceType:(NSUInteger)resourceType
+                                      indices:(uint64_t *)indices
+                                   indexCount:(NSUInteger)indexCount
+{
+	(void)resourceType;
+	(void)indices;
+	(void)indexCount;
+}
+
+// As the public query, whose page size this takes first.
+- (MTLSize)tileSizeWithSparsePageSize:(MTLSparsePageSize)sparsePageSize
+                          textureType:(MTLTextureType)textureType
+                          pixelFormat:(MTLPixelFormat)pixelFormat
+                          sampleCount:(NSUInteger)sampleCount
+{
+	return [self sparseTileSizeWithTextureType:textureType
+	                               pixelFormat:pixelFormat
+	                               sampleCount:sampleCount
+	                            sparsePageSize:sparsePageSize];
+}
+
+// Metal answers, for a texture descriptor, the IOSurface properties a surface backing it needs
+// in its own layout (its allocation size and compression mode); this device has no such
+// layout size to give.
+- (NSDictionary *)copyIOSurfaceSharedTextureProperties:(MTLTextureDescriptor *)descriptor
+{
+	(void)descriptor;
+	RGFX_UNSUPPORTED("IOSurface properties for a texture (no layout size on the wire)");
+	return nil;
+}
+
+// A buffer over an IOSurface would need the surface's GPU copy (RgfxIOSurface.h) in the
+// surface's own layout, so that it aliases the surface's textures; none is made.
+- (id<MTLBuffer>)newBufferWithIOSurface:(IOSurfaceRef)surface
+{
+	(void)surface;
+	RGFX_UNSUPPORTED("buffers over IOSurfaces");
+	return nil;
+}
+
+// A buffer of the descriptor's length and options, its bytes copied from `contents` where it
+// names some. What the device's buffers cannot be (a pinned or parent GPU address, address
+// ranges, a pointer tag, sparse placement, an alignment past the GPU addresses' 32 KiB, an
+// IOSurface, or no-copy contents, whose deallocator the descriptor does not answer) is refused.
+- (id<MTLBuffer>)newBufferWithDescriptor:(id)descriptor
+{
+	id<RgfxBufferDescriptorFields> d = descriptor;
+	if (d == nil)
+		return nil;
+	if (d.pinnedGPUAddress != 0 || d.parentGPUAddress != 0 || d.parentGPUSize != 0 ||
+	    d.pointerTag != 0 || d.addressRanges != nil || d.placementSparsePageSize != 0) {
+		RGFX_UNSUPPORTED("buffer descriptors placing a buffer at a GPU address");
+		return nil;
+	}
+	if (d.alignment > 0x8000 || d.iosurface != nullptr || (d.contents != nullptr && d.noCopy)) {
+		RGFX_UNSUPPORTED("buffer descriptors with an alignment past 32 KiB, an IOSurface or "
+		                 "no-copy contents");
+		return nil;
+	}
+	if (d.contents != nullptr)
+		return [self newBufferWithBytes:d.contents length:d.length options:d.resourceOptions];
+	return [self newBufferWithLength:d.length options:d.resourceOptions];
+}
+
+// As the public create, with the index range Metal's takes nothing from.
+- (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:
+                                    (MTLIndirectCommandBufferDescriptor *)descriptor
+                                                              maxCount:(NSUInteger)maxCount
+                                                               options:(MTLResourceOptions)options
+{
+	return [self newIndirectCommandBufferWithDescriptor:descriptor
+	                                    maxCommandCount:maxCount
+	                                            options:options];
+}
+
+// Nil, as Metal's answers.
+- (id)newIndirectComputeCommandEncoderWithBuffer:(id<MTLBuffer>)buffer
+{
+	(void)buffer;
+	RGFX_UNSUPPORTED("indirect command encoders (none on the wire)");
+	return nil;
+}
+
+- (id)newIndirectRenderCommandEncoderWithBuffer:(id<MTLBuffer>)buffer
+{
+	(void)buffer;
+	RGFX_UNSUPPORTED("indirect command encoders (none on the wire)");
+	return nil;
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	(void)descriptor;
+	RGFX_UNSUPPORTED("visible function tables (function pointers)");
+	return nil;
+}
+
+// As the public creates, with no options.
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithTileDescriptor:
+                                  (MTLTileRenderPipelineDescriptor *)descriptor
+                                                                 error:(NSError **)error
+{
+	return [self newRenderPipelineStateWithTileDescriptor:descriptor
+	                                              options:MTLPipelineOptionNone
+	                                           reflection:nil
+	                                                error:error];
+}
+
+- (void)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)descriptor
+                               completionHandler:
+                                   (MTLNewRenderPipelineStateCompletionHandler)completionHandler
+{
+	[self newRenderPipelineStateWithTileDescriptor:descriptor
+	                                       options:MTLPipelineOptionNone
+	                             completionHandler:^(id<MTLRenderPipelineState> state,
+	                                                 MTLRenderPipelineReflection *reflection,
+	                                                 NSError *error) {
+		  (void)reflection;
+		  if (completionHandler)
+			  completionHandler(state, error);
+	  }];
+}
+
+// Metal answers objects of its GPU driver's own classes, which the device has no counterpart of.
+- (id)newResourceGroupFromResources:(const id<MTLResource> _Nonnull *)resources
+                              count:(NSUInteger)count
+{
+	(void)resources;
+	(void)count;
+	RGFX_UNSUPPORTED("resource groups");
+	return nil;
+}
+
+- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)descriptor
+                isHeapOrBufferBacked:(BOOL)isHeapOrBufferBacked
+{
+	(void)descriptor;
+	(void)isHeapOrBufferBacked;
+	RGFX_UNSUPPORTED("texture layouts");
+	return nil;
+}
+
+// Shader profiling's sample buffers: none.
+- (BOOL)mapShaderSampleBufferWithBuffer:(void *)buffer
+                               capacity:(NSUInteger)capacity
+                                   size:(NSUInteger)size
+{
+	(void)buffer;
+	(void)capacity;
+	(void)size;
+	RGFX_UNSUPPORTED("shader sample buffers (shader profiling)");
+	return NO;
+}
+
+- (void)unmapShaderSampleBuffer
+{
 }
 
 @end

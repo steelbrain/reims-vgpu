@@ -22,6 +22,7 @@
 #define RGFX_INTEROP_H_
 
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
 
 #include <stdint.h>
@@ -45,6 +46,28 @@ BOOL RgfxUnrecognizedWasLogged(Class cls, SEL sel);
 #ifdef __cplusplus
 }
 #endif
+
+/// The members of Metal's buffer descriptor (MTLBufferDescriptor, which MTLDeviceSPI's and
+/// MTLHeap's newBufferWithDescriptor: take) the bundle reads. measured: macOS 27 Metal.framework,
+/// the class's own getters and their type encodings (`length`, `resourceOptions`, `alignment`,
+/// `pinnedGPUAddress`, `parentGPUAddress`, `parentGPUSize`, `pointerTag` `Q16@0:8`; `contents`
+/// `^v16@0:8`; `noCopy` `B16@0:8`; `iosurface` `^{__IOSurface=}16@0:8`; `addressRanges` `@16@0:8`;
+/// `placementSparsePageSize` `q16@0:8`). A new descriptor answers length 0, alignment 1 and
+/// options 0. Its deallocator has a setter and no getter.
+@protocol RgfxBufferDescriptorFields <NSObject>
+@property(readonly) NSUInteger length;
+@property(readonly) MTLResourceOptions resourceOptions;
+@property(readonly) NSUInteger alignment;
+@property(readonly) uint64_t pinnedGPUAddress;
+@property(readonly) uint64_t parentGPUAddress;
+@property(readonly) uint64_t parentGPUSize;
+@property(readonly) uint64_t pointerTag;
+@property(readonly, nullable) void *contents;
+@property(readonly) BOOL noCopy;
+@property(readonly, nullable) IOSurfaceRef iosurface;
+@property(readonly, nullable) id addressRanges;
+@property(readonly) NSInteger placementSparsePageSize;
+@end
 
 NS_ASSUME_NONNULL_END
 

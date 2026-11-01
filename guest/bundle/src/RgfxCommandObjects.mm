@@ -755,6 +755,39 @@ struct RgfxBarrierSlot {
 	return _backgroundGpuPriority;
 }
 
+// --- what Core Image sends a queue beyond MTLCommandQueue (RgfxInterop.h) -------------
+// Each as Metal's queue answers it, measured on the M3 Max (macOS 27).
+
+// Metal's never called the handler after a command buffer completed; nor does this.
+- (void)addPerfSampleHandler:(void (^)(id))handler
+{
+	(void)handler;
+}
+
+// -1 for every list tried (nil, empty, one counter).
+- (int)requestCounters:(NSArray *)counters withIndex:(NSUInteger)index
+{
+	(void)counters;
+	(void)index;
+	return -1;
+}
+
+// Statistics: Metal takes the settings and answers nothing back; on is logged here, as its
+// statistics, whatever they are, are not gathered.
+- (void)setStatEnabled:(BOOL)enabled
+{
+	if (enabled)
+		RGFX_UNSUPPORTED("command statistics");
+}
+- (void)setStatLocations:(NSUInteger)locations
+{
+	(void)locations;
+}
+- (void)setStatOptions:(NSUInteger)options
+{
+	(void)options;
+}
+
 @end
 
 // =============================================================================
@@ -829,6 +862,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// Written by the thread that delivers the completion, read by any: atomic.
 	std::atomic<MTLCommandBufferStatus> _status;
 	NSString *_cbLabel;
+	NSMutableDictionary *_userDictionary; // userDictionary, made when first asked
 	// What the client asked of the buffer's content protection (setProtectionOptions:).
 	uint64_t _protectionOptions;
 	// The error options its descriptor asked for (commandBufferWithDescriptor:).
@@ -1446,6 +1480,47 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+}
+
+// --- what Core Image and MPS send a command buffer beyond MTLCommandBuffer ------------
+// Each as Metal's command buffer answers it, measured on the M3 Max (macOS 27).
+
+// A mutable dictionary of the caller's, the same one each time.
+- (NSMutableDictionary *)userDictionary
+{
+	@synchronized(self) {
+		if (_userDictionary == nil)
+			_userDictionary = [NSMutableDictionary dictionary];
+		return _userDictionary;
+	}
+}
+
+// Metal signals the event for every agent mask tried (0, 1, 2, all ones): as
+// encodeSignalEvent:value:.
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value agentMask:(uint64_t)agentMask
+{
+	(void)agentMask;
+	[self encodeSignalEvent:event value:value];
+}
+
+// Statistics, as the queue's.
+- (void)setStatEnabled:(BOOL)enabled
+{
+	if (enabled)
+		RGFX_UNSUPPORTED("command statistics");
+}
+- (void)setStatLocations:(NSUInteger)locations
+{
+	(void)locations;
+}
+- (void)setStatOptions:(NSUInteger)options
+{
+	(void)options;
+}
+
+// Returns with nothing changed, before commit and after completion.
+- (void)validate
+{
 }
 
 @end
@@ -2559,6 +2634,48 @@ RGFX_LOG_UNRECOGNIZED
 		RGFX_UNSUPPORTED("function pointers");
 }
 
+// --- what QuartzCore, SkyLight and MPS send a render encoder beyond its protocol -----
+
+// A fragment texture and its sampler, set together.
+- (void)setFragmentTexture:(id<MTLTexture>)texture
+            atTextureIndex:(NSUInteger)textureIndex
+              samplerState:(id<MTLSamplerState>)sampler
+            atSamplerIndex:(NSUInteger)samplerIndex
+{
+	[self setFragmentTexture:texture atIndex:textureIndex];
+	[self setFragmentSamplerState:sampler atIndex:samplerIndex];
+}
+
+// Metal draws a line `width` pixels wide (measured: 1, 2, 4 and 9 rows; none at 0.5). The wire
+// carries no width, so the host draws every line 1 wide.
+- (void)setLineWidth:(float)width
+{
+	if (width != 1.0f)
+		RGFX_UNSUPPORTED("line widths other than 1 (none on the wire)");
+}
+
+// A tile dispatch over part of the tiles: none on the wire (nor any tile pipeline to run).
+- (void)dispatchThreadsPerTile:(MTLSize)threadsPerTile inRegion:(MTLRegion)region
+{
+	(void)threadsPerTile;
+	(void)region;
+	RGFX_UNSUPPORTED("tile dispatches over a region");
+}
+
+// Metal takes nil and its own sets; the device makes no residency set
+// (newResidencySetWithDescriptor:error:), so nil is the only one this can be sent.
+- (void)useResidencySet:(id<MTLResidencySet>)residencySet
+{
+	if (residencySet != nil)
+		RGFX_UNSUPPORTED("residency sets");
+}
+- (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                   count:(NSUInteger)count
+{
+	if (count != 0)
+		RGFX_UNSUPPORTED("residency sets");
+}
+
 @end
 
 // =============================================================================
@@ -2952,6 +3069,43 @@ RGFX_LOG_UNRECOGNIZED
 		return;
 	_barrierWaited = YES;
 	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) { _enc->computeWaitForFence(fence); });
+}
+
+// --- what MPS sends a compute encoder beyond its protocol ----------------------------
+
+// Metal takes nil (and its own sets); the device makes no residency set, as the render
+// encoder's.
+- (void)useResidencySet:(id<MTLResidencySet>)residencySet
+{
+	if (residencySet != nil)
+		RGFX_UNSUPPORTED("residency sets");
+}
+- (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                   count:(NSUInteger)count
+{
+	if (count != 0)
+		RGFX_UNSUPPORTED("residency sets");
+}
+
+// A loop the GPU runs while a value in `buffer` compares true: none on the wire, so it is
+// refused, and the encoder's work after it runs once.
+- (void)encodeStartWhile:(id<MTLBuffer>)buffer
+                  offset:(NSUInteger)offset
+              comparison:(MTLCompareFunction)comparison
+          referenceValue:(uint32_t)referenceValue
+{
+	(void)buffer;
+	(void)offset;
+	(void)comparison;
+	(void)referenceValue;
+	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+}
+
+// Metal answers YES closing a loop encodeStartWhile: opened, and NO with none open; no loop is
+// ever open here.
+- (BOOL)encodeEndWhile
+{
+	return NO;
 }
 
 @end

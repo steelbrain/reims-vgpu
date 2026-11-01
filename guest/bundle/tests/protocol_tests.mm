@@ -634,6 +634,116 @@ void test_unrecognized_selectors_logged()
 	fx.complete(cb, seqno);
 }
 
+// The members Apple's frameworks send queues, command buffers and encoders beyond their
+// protocols (selector-sweep), each as Metal's answers it.
+void test_framework_members()
+{
+	QueueFixture fx;
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO],
+	    0x42);
+	RgfxTexture *image = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:16
+	                                                      height:16
+	                                                   mipmapped:NO],
+	    0x43);
+	id queue = fx.queue;
+	// The queue: no perf samples, no counters, statistics taken.
+	__block int perfCalls = 0;
+	((void (*)(id, SEL, void (^)(id)))objc_msgSend)(queue, @selector(addPerfSampleHandler:),
+	                                                ^(id sample) {
+		                                                (void)sample;
+		                                                perfCalls++;
+	                                                });
+	auto counters = [queue](NSArray *list) {
+		return ((int (*)(id, SEL, NSArray *, NSUInteger))objc_msgSend)(
+		    queue, @selector(requestCounters:withIndex:), list, 0);
+	};
+	CHECK(counters(nil) == -1 && counters(@[]) == -1 && counters(@[ @0 ]) == -1);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(queue, @selector(setStatEnabled:), NO);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(queue, @selector(setStatLocations:), 1);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(queue, @selector(setStatOptions:), 1);
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCommandQueue class], @selector(setStatEnabled:)));
+	((void (*)(id, SEL, BOOL))objc_msgSend)(queue, @selector(setStatEnabled:), YES);
+	CHECK(RgfxUnsupportedWasLogged([RgfxCommandQueue class], @selector(setStatEnabled:)));
+
+	// A fragment texture and its sampler set together are the two sets.
+	std::vector<Op> together, apart;
+	for (int k = 0; k < 2; k++) {
+		id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+		id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+		if (k == 0) {
+			((void (*)(id, SEL, id, NSUInteger, id, NSUInteger))objc_msgSend)(
+			    renc, @selector(setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:),
+			    image, 3, nil, 5);
+		} else {
+			[renc setFragmentTexture:image atIndex:3];
+			[renc setFragmentSamplerState:nil atIndex:5];
+		}
+		// A line 1 wide is what the host draws; any other width is logged.
+		((void (*)(id, SEL, float))objc_msgSend)(renc, @selector(setLineWidth:), 1.0f);
+		CHECK(!RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class], @selector(setLineWidth:)));
+		((void (*)(id, SEL, id))objc_msgSend)(renc, @selector(useResidencySet:), nil);
+		CHECK(!RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class],
+		                                @selector(useResidencySet:)));
+		[renc endEncoding];
+		[cb commit];
+		uint64_t seqno = 0;
+		(k == 0 ? together : apart) = fx.nextOps(&seqno);
+		fx.complete(cb, seqno);
+	}
+	for (uint16_t tag : {RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES}) {
+		const Op *a = findOp(together, tag);
+		const Op *b = findOp(apart, tag);
+		CHECK(a != nullptr && b != nullptr && a->body == b->body);
+	}
+	CHECK(findOp(together, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE)->as<RgfxOpSetFragmentTexture>().index == 3);
+
+	// The command buffer: its dictionary, its agent-masked signal, statistics, validate.
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	auto userDictionary = [cb] {
+		return ((NSMutableDictionary * (*)(id, SEL)) objc_msgSend)(cb, @selector(userDictionary));
+	};
+	NSMutableDictionary *dict = userDictionary();
+	CHECK([dict isKindOfClass:[NSMutableDictionary class]] && userDictionary() == dict);
+	dict[@"key"] = @1;
+	CHECK([userDictionary()[@"key"] isEqual:@1]);
+	((void (*)(id, SEL))objc_msgSend)(cb, @selector(validate));
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(cb, @selector(setStatLocations:), 1);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(cb, @selector(setStatOptions:), 1);
+	CHECK(cb.status == MTLCommandBufferStatusNotEnqueued);
+	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+	((void (*)(id, SEL, float))objc_msgSend)(renc, @selector(setLineWidth:), 2.0f);
+	CHECK(RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class], @selector(setLineWidth:)));
+	((void (*)(id, SEL, MTLSize, MTLRegion))objc_msgSend)(
+	    renc, @selector(dispatchThreadsPerTile:inRegion:), MTLSizeMake(8, 8, 1),
+	    MTLRegionMake2D(0, 0, 16, 16));
+	CHECK(RgfxUnsupportedWasLogged([RgfxRenderCommandEncoder class],
+	                               @selector(dispatchThreadsPerTile:inRegion:)));
+	[renc endEncoding];
+	// The compute encoder: no loop is ever open.
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	CHECK(((BOOL (*)(id, SEL))objc_msgSend)(cenc, @selector(encodeEndWhile)) == NO);
+	((void (*)(id, SEL, id, NSUInteger, MTLCompareFunction, uint32_t))objc_msgSend)(
+	    cenc, @selector(encodeStartWhile:offset:comparison:referenceValue:), nil, 0,
+	    MTLCompareFunctionNever, 0);
+	CHECK(RgfxUnsupportedWasLogged([RgfxComputeCommandEncoder class],
+	                               @selector(encodeStartWhile:offset:comparison:referenceValue:)));
+	CHECK(((BOOL (*)(id, SEL))objc_msgSend)(cenc, @selector(encodeEndWhile)) == NO);
+	((void (*)(id, SEL, id))objc_msgSend)(cenc, @selector(useResidencySet:), nil);
+	CHECK(!RgfxUnsupportedWasLogged([RgfxComputeCommandEncoder class], @selector(useResidencySet:)));
+	[cenc endEncoding];
+	[cb commit];
+	uint64_t seqno = 0;
+	(void)fx.nextOps(&seqno);
+	fx.complete(cb, seqno);
+	CHECK(perfCalls == 0);
+}
+
 // --- programmable sample positions ---------------------------------------------------
 
 } // namespace
@@ -1732,6 +1842,7 @@ void rgfxProtocolTests()
 	test_render_tile_size();
 	test_trace_ids();
 	test_unrecognized_selectors_logged();
+	test_framework_members();
 	test_sample_positions();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();
