@@ -101,14 +101,18 @@ struct QueueFixture {
 	{
 		control.setConsumerIdle(1);
 		submit.setConsumerIdle(1);
-		queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
-		                                 submitOffset:0
-		                               completeOffset:0
-		                             completeDataSize:0
-		                                          ids:&ids
-		                                     maxCount:0
-		                                       device:device
-		                                   serializer:&ser];
+		// The factory's autoreleased reference drains here, so the fixture's own is the queue's
+		// last one, let go before its serialiser.
+		@autoreleasepool {
+			queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+			                                 submitOffset:0
+			                               completeOffset:0
+			                             completeDataSize:0
+			                                          ids:&ids
+			                                     maxCount:0
+			                                       device:device
+			                                   serializer:&ser];
+		}
 		CHECK(queue != nil);
 		queue.replyReader = &reader;
 		queue.region = &region;
@@ -210,6 +214,9 @@ RgfxTexture *shapeTexture(MTLTextureDescriptor *d, uint64_t objId)
 void test_inline_bytes()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:64
@@ -326,6 +333,7 @@ void test_inline_bytes()
 	CHECK(std::memcmp(fx.regionAt(chunk4.region_offset, 0), big.data(), big.size()) == 0);
 	fx.complete(cb2, seqno2);
 	fx.complete(cb3, seqno3);
+	} // @autoreleasepool
 }
 
 // Without a region the bytes have nowhere to go: no binding is made (and it is logged), and the
@@ -333,6 +341,9 @@ void test_inline_bytes()
 void test_inline_bytes_without_region()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	fx.queue.region = nullptr;
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -353,6 +364,7 @@ void test_inline_bytes_without_region()
 	fx.complete(cb, seqno, MTLCommandBufferStatusError);
 	CHECK(cb.error != nil && [cb.error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
 	      cb.error.code == MTLCommandBufferErrorOutOfMemory);
+	} // @autoreleasepool
 }
 
 // The render barriers: the scope barrier as given; a resource barrier as the scope of the
@@ -360,6 +372,9 @@ void test_inline_bytes_without_region()
 void test_render_barriers()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:8
@@ -410,6 +425,7 @@ void test_render_barriers()
 	      b3.before == MTLRenderStageFragment);
 	CHECK(findOp(ops, RGFX_OP_RENDER_MEMORY_BARRIER_WITH_SCOPE, 4) == nullptr);
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // A compute pass opened with a dispatch type carries it, and the encoder answers it; one
@@ -417,6 +433,9 @@ void test_render_barriers()
 void test_compute_dispatch_type()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
 	id<MTLComputeCommandEncoder> serial = [cb computeCommandEncoder];
 	CHECK(serial.dispatchType == MTLDispatchTypeSerial);
@@ -438,6 +457,7 @@ void test_compute_dispatch_type()
 	auto p2 = findOp(ops, RGFX_OP_ENCODER_BEGIN_COMPUTE, 2)->as<RgfxComputePassDesc>();
 	CHECK(p2.dispatch_type == MTLDispatchTypeConcurrent);
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // copyFromTexture:toTexture: copies as many whole surfaces as both have: lined up at the
@@ -446,6 +466,9 @@ void test_compute_dispatch_type()
 void test_blit_copy_texture_to_texture()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	MTLTextureDescriptor *big =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
 	                                                       width:64
@@ -492,6 +515,7 @@ void test_blit_copy_texture_to_texture()
 	CHECK(c2.slice_count == 6 && c2.level_count == 1);
 	CHECK(findOp(ops, RGFX_OP_BLIT_COPY_TEXTURE_SLICES, 3) == nullptr);
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // The tile size an encoder answers: its pass descriptor's; the device's own choice, which is
@@ -499,6 +523,9 @@ void test_blit_copy_texture_to_texture()
 void test_render_tile_size()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:64
@@ -524,6 +551,7 @@ void test_render_tile_size()
 	uint64_t seqno = 0;
 	(void)fx.nextOps(&seqno);
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // --- trace ids, encoders' command buffers, unrecognised selectors ----------------------
@@ -535,6 +563,9 @@ void test_render_tile_size()
 void test_trace_ids()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:64
@@ -600,6 +631,7 @@ void test_trace_ids()
 	uint64_t seqno = 0;
 	(void)fx.nextOps(&seqno);
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // A selector a class does not answer is logged with the class, once, and then raises as
@@ -607,6 +639,9 @@ void test_trace_ids()
 void test_unrecognized_selectors_logged()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
 	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
 	SEL missing = NSSelectorFromString(@"rgfxNoSuchMember");
@@ -632,6 +667,7 @@ void test_unrecognized_selectors_logged()
 	uint64_t seqno = 0;
 	(void)fx.nextOps(&seqno);
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // The members Apple's frameworks send queues, command buffers and encoders beyond their
@@ -639,6 +675,9 @@ void test_unrecognized_selectors_logged()
 void test_framework_members()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:64
@@ -742,6 +781,7 @@ void test_framework_members()
 	(void)fx.nextOps(&seqno);
 	fx.complete(cb, seqno);
 	CHECK(perfCalls == 0);
+	} // @autoreleasepool
 }
 
 // --- programmable sample positions ---------------------------------------------------
@@ -794,6 +834,9 @@ void test_sample_positions()
 {
 	RgfxSampleCountDevice *device = [RgfxSampleCountDevice new];
 	QueueFixture fx((id<MTLDevice>)device);
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	MTLTextureDescriptor *td =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:8
@@ -859,6 +902,7 @@ void test_sample_positions()
 		      MTLStoreActionOptionNone);
 	}
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // The members of features the device answers NO for do nothing on the wire: a nil or default
@@ -866,6 +910,9 @@ void test_sample_positions()
 void test_encoders_unsupported()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:8
@@ -912,6 +959,7 @@ void test_encoders_unsupported()
 		      op.tag == RGFX_OP_ENCODER_END);
 	}
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 // --- queue barriers -----------------------------------------------------------------
@@ -955,6 +1003,9 @@ std::vector<std::pair<uint16_t, uint64_t>> encoderFences(const std::vector<Op> &
 void test_queue_barriers()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	RgfxTexture *target = shapeTexture(
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                                       width:8
@@ -1019,6 +1070,7 @@ void test_queue_barriers()
 	}
 	CHECK(e8[8].first == RGFX_OP_RENDER_UPDATE_FENCE && e8[8].second == f0);
 	fx.complete(cb2, seqno);
+	} // @autoreleasepool
 }
 
 
@@ -1029,6 +1081,9 @@ void test_queue_barriers()
 void test_command_buffer_and_queue_members()
 {
 	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
 	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
 	CHECK([cb accelerationStructureCommandEncoder] == nil);
 	CHECK([cb accelerationStructureCommandEncoderWithDescriptor:
@@ -1059,6 +1114,7 @@ void test_command_buffer_and_queue_members()
 	std::vector<Op> ops = fx.nextOps(&seqno);
 	CHECK(ops.empty());
 	fx.complete(cb, seqno);
+	} // @autoreleasepool
 }
 
 
@@ -1076,6 +1132,8 @@ void test_texture_members()
 	RgfxIdSpace ids;
 	RgfxSerializer ser(writer, ids);
 
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	MTLTextureDescriptor *d =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
 	                                                       width:32
@@ -1111,6 +1169,7 @@ void test_texture_members()
 	Class c = [RgfxTexture class];
 	CHECK([t newSharedTextureHandle] == nil);
 	CHECK(RgfxUnsupportedWasLogged(c, @selector(newSharedTextureHandle)));
+	} // @autoreleasepool
 }
 
 
@@ -1127,6 +1186,8 @@ void test_buffer_members()
 	                      TestRing::doorbell, nullptr);
 	RgfxIdSpace ids;
 	RgfxSerializer ser(writer, ids);
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	RgfxBuffer *b = [RgfxBuffer bufferWithLength:256
 	                                     options:MTLResourceStorageModeShared
 	                                      device:nil
@@ -1166,6 +1227,7 @@ void test_buffer_members()
 	CHECK(m.buffer_obj_id == b.rgfxObjId && m.offset == 64 && m.bytes_per_row == 64);
 	CHECK(m.desc.width == 4 && m.desc.height == 2);
 	CHECK(t.buffer == b && t.bufferOffset == 64 && t.bufferBytesPerRow == 64);
+	} // @autoreleasepool
 }
 
 // A heap's allocated size is its size; acceleration structures are nil, logged; a Placement
@@ -1178,6 +1240,8 @@ void test_heap_members()
 	                      TestRing::doorbell, nullptr);
 	RgfxIdSpace ids;
 	RgfxSerializer ser(writer, ids);
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
 	hd.size = 0x100000;
 	hd.type = MTLHeapTypePlacement;
@@ -1197,6 +1261,7 @@ void test_heap_members()
 	                                                                     height:4
 	                                                                  mipmapped:NO]] == nil);
 	CHECK(!RgfxUnsupportedWasLogged([RgfxHeap class], @selector(newBufferWithLength:options:)));
+	} // @autoreleasepool
 }
 
 
@@ -1215,6 +1280,8 @@ void test_pipeline_state_members()
 	                      TestRing::doorbell, nullptr);
 	RgfxIdSpace ids;
 	RgfxSerializer ser(writer, ids);
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	const uint8_t libBytes[] = {9, 9, 9};
 	uint32_t libStatus = 0;
 	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
@@ -1322,6 +1389,7 @@ void test_pipeline_state_members()
 	                                                serializer:&ser];
 	CHECK(ds.gpuResourceID._impl == 0);
 	CHECK(RgfxUnsupportedWasLogged([RgfxDepthStencilState class], @selector(gpuResourceID)));
+	} // @autoreleasepool
 }
 
 
@@ -1408,6 +1476,8 @@ void test_sampler_resource_ids()
 	SamplerAsker asker;
 	asker.id = 7;
 	ser.setAsker(&SamplerAsker::ask, &asker);
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
 	d.minFilter = MTLSamplerMinMagFilterLinear;
 	d.supportArgumentBuffers = YES;
@@ -1438,6 +1508,7 @@ void test_sampler_resource_ids()
 	RgfxSampler *plain = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	CHECK(plain != nil && plain.gpuResourceID._impl == 0);
 	(void)expectMessage<RgfxSamplerCreate>(control, RGFX_CMD_SAMPLER_CREATE);
+	} // @autoreleasepool
 }
 
 // The word at `offset` of `buffer`'s contents.
@@ -1462,6 +1533,8 @@ void test_argument_encoder_members()
 	                      TestRing::doorbell, nullptr);
 	RgfxIdSpace ids;
 	RgfxSerializer ser(writer, ids);
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	Class c = [RgfxArgumentEncoder class];
 	auto probe = probeReply().bytes();
 	RgfxArgumentEncoder *enc =
@@ -1611,6 +1684,7 @@ void test_argument_encoder_members()
 	std::memset(args.contents, 0xaa, 16);
 	[ranged setTextures:textures withRange:NSMakeRange(0, 2)];
 	CHECK(wordAt(args, 0) == 0x1234 && wordAt(args, 8) == 0);
+	} // @autoreleasepool
 }
 
 // A fake device's argument layouts, written into the region's block the query names: the
@@ -1689,6 +1763,8 @@ void test_argument_encoder_query()
 	asker.reply = probeReply().bytes();
 	ser.setAsker(&RegionAsker::ask, &asker);
 
+	// Drained while the transport lives: what the test lets go posts its destroy through ser.
+	@autoreleasepool {
 	MTLArgumentDescriptor *t = [MTLArgumentDescriptor argumentDescriptor];
 	t.dataType = MTLDataTypeTexture;
 	t.index = 0;
@@ -1764,6 +1840,7 @@ void test_argument_encoder_query()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!control.next(&h, &bytes)); // queries go through the asker, never the ring
+	} // @autoreleasepool
 }
 
 // waitUntilSignaledValue:timeoutMS: answers YES at once for a value reached, NO once the
