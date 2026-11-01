@@ -60,6 +60,25 @@ NS_ASSUME_NONNULL_BEGIN
                                                serializer:(nullable RgfxSerializer *)serializer;
 
 #ifdef __cplusplus
+/// The buffer `newBufferWithLength:options:` (`bytes` null) and
+/// `newBufferWithBytes:length:options:` make: a Shared one over a block of `region`, which the
+/// host sees in place, a Managed one with its CPU copy there, and a Private one the GPU's alone,
+/// its contents NULL. A block's bytes are `length` bytes from `bytes`, or zeros.
+///
+/// Nil where Metal makes none (measured on the M3 Max, macOS 27, in every storage mode, with
+/// bytes and without): for a length of 0 and for one past `maxLength` (the device's
+/// maxBufferLength; 0 holds none back). Nil too where `region` has no room for a Shared or
+/// Managed one, as Metal answers a buffer it cannot place, never memory the GPU does not see;
+/// and for bytes with a mode whose contents the CPU never reaches (Private), which Metal's
+/// validation refuses.
++ (nullable instancetype)bufferForDeviceWithLength:(NSUInteger)length
+                                           options:(MTLResourceOptions)options
+                                             bytes:(nullable const void *)bytes
+                                         maxLength:(NSUInteger)maxLength
+                                            region:(nullable RgfxRegion *)region
+                                            device:(nullable id<MTLDevice>)device
+                                        serializer:(nullable RgfxSerializer *)serializer;
+
 /// The buffer `newBufferWithBytesNoCopy:length:options:deallocator:` makes over the caller's
 /// `length` bytes at `pointer`, whose `contents` is `pointer`, with `deallocator` (may be nil)
 /// called with them once the buffer is gone from the host. Bytes in `region` (a block of the

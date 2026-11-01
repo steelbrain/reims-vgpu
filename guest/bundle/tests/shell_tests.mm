@@ -219,6 +219,81 @@ void test_private_buffer_has_no_contents()
 	}
 }
 
+// The device's buffers answer as Metal's (measured on the M3 Max, macOS 27): a Shared one lies
+// over a block of the region with the bytes given (or zeros), a Managed one's CPU copy too, and
+// a Private one has no contents. None of 0 bytes or past maxBufferLength, in any mode; none
+// where the region has no room for a Shared or Managed one (no device buffer the host would
+// never see); none for bytes with a Private one. A refusal posts nothing.
+void test_device_buffers_answer_as_metal()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x10000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	auto make = [&](NSUInteger length, MTLResourceOptions options, const void *bytes,
+	                NSUInteger maxLength, RgfxRegion *in) {
+		return [RgfxBuffer bufferForDeviceWithLength:length
+		                                     options:options
+		                                       bytes:bytes
+		                                   maxLength:maxLength
+		                                      region:in
+		                                      device:nil
+		                                  serializer:&fx.ser];
+	};
+	auto nothingPosted = [&]() {
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		return !fx.ring.next(&h, &bytes);
+	};
+	@autoreleasepool {
+		uint8_t pattern[0x100];
+		for (size_t i = 0; i < sizeof(pattern); i++)
+			pattern[i] = static_cast<uint8_t>(i * 3 + 1);
+		RgfxBuffer *shared = make(sizeof(pattern), MTLResourceStorageModeShared, pattern, 0x2000,
+		                          &region);
+		CHECK(shared != nil && shared.length == sizeof(pattern));
+		uint8_t *at = static_cast<uint8_t *>([shared contents]);
+		CHECK(at >= mem.data() + RGFX_ALLOCATIONS_OFFSET && at < mem.data() + mem.size());
+		CHECK(std::memcmp(at, pattern, sizeof(pattern)) == 0);
+		auto over = expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(over.obj_id == shared.rgfxObjId && over.length == sizeof(pattern));
+		CHECK(over.region_offset == static_cast<uint64_t>(at - mem.data()));
+
+		RgfxBuffer *managed = make(0x1000, MTLResourceStorageModeManaged, nullptr, 0x2000, &region);
+		CHECK(managed != nil && managed.storageMode == MTLStorageModeManaged);
+		CHECK(static_cast<uint8_t *>([managed contents])[0] == 0 &&
+		      static_cast<uint8_t *>([managed contents])[0xfff] == 0);
+		(void)expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+
+		RgfxBuffer *priv = make(0x1000, MTLResourceStorageModePrivate, nullptr, 0x2000, &region);
+		CHECK(priv != nil && [priv contents] == nullptr);
+		(void)expectMessage<RgfxBufferCreate>(fx.ring, RGFX_CMD_BUFFER_CREATE);
+		// No limit known: none held back.
+		RgfxBuffer *unlimited = make(0x3000, MTLResourceStorageModePrivate, nullptr, 0, &region);
+		CHECK(unlimited != nil);
+		(void)expectMessage<RgfxBufferCreate>(fx.ring, RGFX_CMD_BUFFER_CREATE);
+		CHECK(nothingPosted());
+
+		const MTLResourceOptions modes[] = { MTLResourceStorageModeShared,
+			                                 MTLResourceStorageModeManaged,
+			                                 MTLResourceStorageModePrivate };
+		for (MTLResourceOptions mode : modes) {
+			CHECK(make(0, mode, nullptr, 0x2000, &region) == nil);
+			CHECK(make(0x2001, mode, nullptr, 0x2000, &region) == nil);
+		}
+		// Bytes for a Private buffer; a Shared or Managed one with no region, or too large for
+		// what it has left.
+		CHECK(make(0x100, MTLResourceStorageModePrivate, pattern, 0x2000, &region) == nil);
+		CHECK(make(0x100, MTLResourceStorageModeShared, nullptr, 0x2000, nullptr) == nil);
+		CHECK(make(0x20000, MTLResourceStorageModeShared, nullptr, 0, &region) == nil);
+		CHECK(make(0x20000, MTLResourceStorageModeManaged, pattern, 0, &region) == nil);
+		CHECK(nothingPosted());
+	} // the buffers go while the region lives
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // The id space is monotonic across wrappers: a second buffer gets the next objId
 // and a disjoint, higher GPU address, and its own BUFFER_CREATE.
 void test_second_buffer_is_monotonic()
@@ -5430,6 +5505,7 @@ int main()
 	@autoreleasepool {
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
+		test_device_buffers_answer_as_metal();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
 		test_event_routing();

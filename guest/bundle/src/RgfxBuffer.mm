@@ -138,6 +138,46 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	return buffer;
 }
 
++ (instancetype)bufferForDeviceWithLength:(NSUInteger)length
+                                  options:(MTLResourceOptions)options
+                                    bytes:(const void *)bytes
+                                maxLength:(NSUInteger)maxLength
+                                   region:(RgfxRegion *)region
+                                   device:(id<MTLDevice>)device
+                               serializer:(RgfxSerializer *)serializer
+{
+	if (length == 0 || (maxLength != 0 && length > maxLength))
+		return nil;
+	if (!rgfxCpuStorage(options)) {
+		// The GPU's alone: no bytes reach it from here.
+		if (bytes != nullptr)
+			return nil;
+		return [RgfxBuffer bufferWithLength:length options:options device:device serializer:serializer];
+	}
+	if (region == nullptr || serializer == nullptr)
+		return nil;
+	RgfxRegion::Block block = region->allocate(length);
+	if (!block.ok)
+		return nil;
+	void *contents = const_cast<uint8_t *>(block.ptr);
+	if (bytes != nullptr)
+		std::memcpy(contents, bytes, length);
+	else
+		std::memset(contents, 0, length);
+	// The block goes back to the region once the host has dropped the buffer.
+	const uint64_t offset = block.offset;
+	RgfxBuffer *buffer = [RgfxBuffer bufferOverHostMemoryWithContents:contents
+	                                                     regionOffset:offset
+	                                                           length:length
+	                                                          options:options
+	                                                      deallocator:^{ region->release(offset); }
+	                                                           device:device
+	                                                       serializer:serializer];
+	if (buffer == nil)
+		region->release(offset); // no buffer lies over the block
+	return buffer;
+}
+
 + (instancetype)bufferWithBytesNoCopy:(void *)pointer
                                length:(NSUInteger)length
                               options:(MTLResourceOptions)options

@@ -27,109 +27,42 @@ bool rgfxIsSharedStorage(MTLResourceOptions options)
 	return ((options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift) ==
 	       MTLStorageModeShared;
 }
-
-/// Whether `options` names Managed storage, whose CPU copy is a region block the host copies
-/// to and from the GPU's (RgfxTexture's managedTextureWithDescriptor, RgfxBuffer's
-/// didModifyRange:).
-bool rgfxIsManagedStorage(MTLResourceOptions options)
-{
-	return ((options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift) ==
-	       MTLStorageModeManaged;
-}
 } // namespace
 
 @implementation RgfxMetalDevice (Resources)
 
 // --- buffers -----------------------------------------------------------------
 
-// A Shared or Managed buffer backed by a region block (the host sees a Shared one in place,
-// and a Managed one's CPU copy there), or nil when the region had no room. `initialBytes`
-// (may be null) seeds the block.
-- (nullable id<MTLBuffer>)rgfxSharedBufferOfLength:(NSUInteger)length
-                                          options:(MTLResourceOptions)options
-                                      initialBytes:(nullable const void *)initialBytes
-{
-	RgfxRegion *region = [self region];
-	if (region == nullptr) {
-		return nil;
-	}
-	RgfxRegion::Block block = region->allocate(length == 0 ? 1 : length);
-	if (!block.ok) {
-		return nil;
-	}
-	void *contents = const_cast<uint8_t *>(block.ptr);
-	if (length > 0) {
-		if (initialBytes != nullptr) {
-			std::memcpy(contents, initialBytes, length);
-		} else {
-			std::memset(contents, 0, length);
-		}
-	}
-	// The block goes back to the region once the host has dropped the buffer.
-	uint64_t offset = block.offset;
-	id<MTLBuffer> buffer = [RgfxBuffer bufferOverHostMemoryWithContents:contents
-	                                                      regionOffset:offset
-	                                                            length:length
-	                                                           options:options
-	                                                       deallocator:^{ region->release(offset); }
-	                                                            device:self
-	                                                        serializer:[self serializer]];
-	if (buffer == nil)
-		region->release(offset); // no buffer lies over the block
-	return buffer;
-}
-
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
-	// A Shared buffer lives in the device region so the host sees it in place, and a Managed
-	// one's CPU copy does, which the host copies to the GPU's; any other storage mode is a
-	// device buffer (createBuffer), whose bytes are the GPU's alone (`contents` answers NULL).
-	if ((rgfxIsSharedStorage(options) || rgfxIsManagedStorage(options)) &&
-	    [self region] != nullptr) {
-		id<MTLBuffer> shared = [self rgfxSharedBufferOfLength:length
-		                                             options:options
-		                                        initialBytes:nullptr];
-		if (shared != nil) {
-			return shared;
-		}
-	}
-	// A Managed buffer without a block would be bytes the GPU never sees: none, as Metal
-	// answers a buffer it has no memory for.
-	if (rgfxIsManagedStorage(options)) {
-		return nil;
-	}
-	return [RgfxBuffer bufferWithLength:length
-	                           options:options
-	                            device:self
-	                        serializer:[self serializer]];
+	// A Shared buffer over a block of the device region, which the host sees in place, a Managed
+	// one with its CPU copy there, a Private one the GPU's alone; none where Metal makes none, nor
+	// where the region has no room (RgfxBuffer.h).
+	return [RgfxBuffer bufferForDeviceWithLength:length
+	                                     options:options
+	                                       bytes:nullptr
+	                                   maxLength:[self maxBufferLength]
+	                                      region:[self region]
+	                                      device:self
+	                                  serializer:[self serializer]];
 }
 
 - (id<MTLBuffer>)newBufferWithBytes:(const void *)pointer
                              length:(NSUInteger)length
                             options:(MTLResourceOptions)options
 {
-	if ((rgfxIsSharedStorage(options) || rgfxIsManagedStorage(options)) &&
-	    [self region] != nullptr) {
-		id<MTLBuffer> shared = [self rgfxSharedBufferOfLength:length
-		                                             options:options
-		                                        initialBytes:pointer];
-		if (shared != nil) {
-			return shared;
-		}
-	}
-	// A Managed buffer without a block, and one of a mode whose contents the CPU never reaches
-	// (Private): none, as Metal's validation refuses bytes for a Private buffer.
-	if (!rgfxIsSharedStorage(options)) {
+	// As newBufferWithLength:options:, its block seeded with the bytes; none for a Private one,
+	// whose bytes Metal's validation refuses, nor for no bytes at all, which Metal's validation
+	// refuses too and its copy faults at (measured on the M3 Max).
+	if (pointer == nullptr)
 		return nil;
-	}
-	RgfxBuffer *buf = [RgfxBuffer bufferWithLength:length
-	                                       options:options
-	                                        device:self
-	                                    serializer:[self serializer]];
-	if (buf && pointer && length > 0 && [buf contents] != nullptr) {
-		std::memcpy([buf contents], pointer, length);
-	}
-	return buf;
+	return [RgfxBuffer bufferForDeviceWithLength:length
+	                                     options:options
+	                                       bytes:pointer
+	                                   maxLength:[self maxBufferLength]
+	                                      region:[self region]
+	                                      device:self
+	                                  serializer:[self serializer]];
 }
 
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer
