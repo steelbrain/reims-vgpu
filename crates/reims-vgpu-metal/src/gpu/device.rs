@@ -931,15 +931,9 @@ fn gpu_core_count(d: &ProtocolObject<dyn MTLDevice>) -> Option<u64> {
     Some(u64::from(n))
 }
 
-/// An `MTLDeviceSPI` getter answering `Q@:`, sent as `get` where the device responds to `sel`;
-/// `None` where it does not, and then only `respondsToSelector:` is called.
-fn spi_size(
-    d: &ProtocolObject<dyn MTLDevice>,
-    sel: Sel,
-    name: &'static str,
-    get: impl FnOnce() -> u64,
-) -> Option<u64> {
-    msg::get("respondsToSelector:", || d.respondsToSelector(sel)).then(|| msg::get(name, get))
+/// Whether the device responds to `sel`, an `MTLDeviceSPI` getter sent only where it does.
+fn responds(d: &ProtocolObject<dyn MTLDevice>, sel: Sel) -> bool {
+    msg::get("respondsToSelector:", || d.respondsToSelector(sel))
 }
 
 /// `heapBufferSizeAndAlignWithLength:options:`.
@@ -1195,16 +1189,16 @@ fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
                     d.supportsRasterizationRateMapWithLayerCount(count)
                 })
             })),
-            feature_profile: spi_size(d, sel!(featureProfile), "featureProfile", || {
-                d.featureProfile()
-            }),
-            half_fp_config: spi_size(d, sel!(halfFPConfig), "halfFPConfig", || d.halfFPConfig()),
-            single_fp_config: spi_size(d, sel!(singleFPConfig), "singleFPConfig", || {
-                d.singleFPConfig()
-            }),
-            double_fp_config: spi_size(d, sel!(doubleFPConfig), "doubleFPConfig", || {
-                d.doubleFPConfig()
-            }),
+            // `Q@:` getters, `None` where the device does not respond to one, and then only
+            // `respondsToSelector:` is sent.
+            feature_profile: responds(d, sel!(featureProfile))
+                .then(|| msg::get("featureProfile", || d.featureProfile())),
+            half_fp_config: responds(d, sel!(halfFPConfig))
+                .then(|| msg::get("halfFPConfig", || d.halfFPConfig())),
+            single_fp_config: responds(d, sel!(singleFPConfig))
+                .then(|| msg::get("singleFPConfig", || d.singleFPConfig())),
+            double_fp_config: responds(d, sel!(doubleFPConfig))
+                .then(|| msg::get("doubleFPConfig", || d.doubleFPConfig())),
         },
         flags: IdentityFlags {
             is_low_power: Some(get!(isLowPower)),
