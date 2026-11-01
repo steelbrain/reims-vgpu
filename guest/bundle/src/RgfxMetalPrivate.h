@@ -124,6 +124,31 @@ NS_ASSUME_NONNULL_END
 - (BOOL)commitAndWaitUntilSubmitted;
 @end
 
+// measured: macOS 27 Metal.framework — the initialisers of Metal's own IO command queue
+// (`_MTLIOCommandQueue`, `initWithDevice:descriptor:`, `@32@0:8@16@24`) and of its raw and
+// compressed file handles (`_MTLIOHandleRaw`, `initWithDevice:path:error:uncached:`,
+// `@44@0:8@16r*24^@32B40`; `_MTLIOHandleCompressed`,
+// `initWithDevice:path:compressionType:error:uncached:`, `@52@0:8@16r*24q32^@40B48`). Each works
+// over the device it is given, through that device's public command queue, shared event and
+// buffer members: Metal's queue over Metal's device loads buffers, process memory and textures
+// as the device's own queue does (measured on the M3 Max). The device's IO creators make them
+// (RgfxMetalDevice+Unsupported.mm); the classes are looked up at run time.
+NS_ASSUME_NONNULL_BEGIN
+@interface NSObject (RgfxMetalIO)
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                             descriptor:(MTLIOCommandQueueDescriptor *)descriptor;
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                                   path:(const char *)path
+                                  error:(NSError *_Nullable *_Nullable)error
+                               uncached:(BOOL)uncached;
+- (nullable instancetype)initWithDevice:(id<MTLDevice>)device
+                                   path:(const char *)path
+                        compressionType:(NSInteger)compressionType
+                                  error:(NSError *_Nullable *_Nullable)error
+                               uncached:(BOOL)uncached;
+@end
+NS_ASSUME_NONNULL_END
+
 // measured: macOS 26 Metal.framework — the private resource SPI our resources answer, with the
 // selectors they override (RgfxResource).
 @protocol MTLResourceSPI <MTLResource>

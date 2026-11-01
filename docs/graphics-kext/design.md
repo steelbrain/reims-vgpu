@@ -165,12 +165,13 @@ Stages:
      the platform claims it too; the iOS feature sets of a family not
      claimed answer no with it (2026-10-31). Apple1 answers as Apple2, as
      Metal does: the tables' first Apple column is Apple2. Today the lane
-     carries no Apple family: Apple2's rows need argument encoders, placement
-     in `Automatic` heaps with the heap texture size, programmable sample
-     positions, texture views and Metal IO queues, and it carries all but
-     the IO queues. Each family's pieces are
-     listed in `device_info.rs` (`APPLE_PIECES`), and the claim rises as each
-     piece lands.
+     carries Apple1 and Apple2: Apple2's rows need argument encoders,
+     placement in `Automatic` heaps with the heap texture size, programmable
+     sample positions, texture views and Metal IO queues, and it carries
+     them all; the IO queues are Metal's own over the bundle's device, with
+     nothing on the wire. Apple3 waits on indirect command buffers. Each
+     family's pieces are listed in `device_info.rs` (`APPLE_PIECES`), and the
+     claim rises as each piece lands.
    - Mac1, Mac2, Common1 to Common3 and Metal3 keep the platform's answer for
      now, though their rows need some of the same pieces: argument encoders
      for Mac1, Mac2 and Metal3, and the heaps, sample positions and IO

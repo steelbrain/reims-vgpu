@@ -209,8 +209,9 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// sampler ids `SAMPLER_STATE` answers), texture views (`TEXTURE_VIEW`), placement in an Automatic
 /// heap with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), a pass's sample positions
 /// (after its colour records, `RGFX_PASS_FLAG_SAMPLE_POSITIONS`) with
-/// `SET_DEPTH_STORE_ACTION_OPTIONS`, and binary archives, which the bundle keeps in the guest
-/// (`RgfxBinaryArchive`: no compiled code crosses, so no wire message).
+/// `SET_DEPTH_STORE_ACTION_OPTIONS`, and two the bundle does in the guest with no wire message:
+/// binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues (Metal's own IO
+/// queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it.
 const WIRED: &[Piece] = &[
@@ -219,6 +220,7 @@ const WIRED: &[Piece] = &[
     Piece::SamplePositions,
     Piece::TextureViews,
     Piece::BinaryArchives,
+    Piece::IoCommandQueues,
 ];
 
 /// `identity` with each Apple family answered yes only where the platform answers yes and `wired`
@@ -521,8 +523,8 @@ mod tests {
 
     /// Every family of the SDK and -1009 is answered, each the platform's (the fake answers as
     /// an M3 Max: Apple1 to Apple9, Mac1 and Mac2, the Common families and Metal3), but the
-    /// Apple families, which need pieces the lane lacks, and Metal4; a value that names no family
-    /// is listed nowhere
+    /// Apple families past Apple2, which need pieces the lane lacks, and Metal4; a value that
+    /// names no family is listed nowhere
     #[test]
     fn every_family_is_the_platforms_or_the_lanes() {
         let p = Arc::new(FakePlatform::new());
@@ -530,12 +532,11 @@ mod tests {
         caps.families[6] = Ok(false);
         let info = device_info(&caps, p.device().identity_caps(), 4);
         assert_eq!(info.family_count, 21);
-        for yes in [2001, 2002, 3001, 3002, 3003, 5001] {
+        for yes in [1001, 1002, 2001, 2002, 3001, 3002, 3003, 5001] {
             assert_eq!(family(&info, yes), Some(1), "family {yes}");
         }
         for no in [
-            1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 4001, 4002, 5002,
-            -1009,
+            1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 4001, 4002, 5002, -1009,
         ] {
             assert_eq!(family(&info, no), Some(0), "family {no}");
         }
@@ -543,17 +544,19 @@ mod tests {
     }
 
     /// Every feature set is answered as the platform answers it, the fake's (an M3 Max's) every
-    /// iOS one and macOS' but 10002 and no tvOS one, but the iOS sets, whose Apple families the
-    /// lane answers no
+    /// iOS one and macOS' but 10002 and no tvOS one, but the iOS sets of Apple3 and later, whose
+    /// families the lane answers no: iOS_GPUFamily1 and 2's stand with Apple1 and Apple2
     #[test]
     fn every_feature_set_is_the_platforms_or_its_familys() {
         let p = Arc::new(FakePlatform::new());
         let info = device_info(&p.device().caps(), p.device().identity_caps(), 4);
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
-        for set in [10000, 10001, 10003, 10004, 10005] {
+        for set in [
+            0, 1, 2, 3, 5, 6, 8, 9, 12, 13, 10000, 10001, 10003, 10004, 10005,
+        ] {
             assert_eq!(feature_set(&info, set), Some(1), "feature set {set}");
         }
-        for set in (0..=16).chain([10002, 30000, 30005]) {
+        for set in [4, 7, 10, 11, 14, 15, 16, 10002, 30000, 30005] {
             assert_eq!(feature_set(&info, set), Some(0), "feature set {set}");
         }
     }
@@ -562,9 +565,9 @@ mod tests {
     /// rows and the rows before it: with every piece the fake's Apple1 to Apple9 and their iOS
     /// sets stand; without imageblocks, an Apple4 piece, Apple4 and later answer no and so do
     /// iOS_GPUFamily4 and 5, while Apple1 to Apple3, their sets and Mac1 stand; without argument
-    /// encoders, texture views or Automatic heaps, no Apple family does, nor with the lane's
-    /// pieces alone; with Apple1 to Apple3's pieces Apple3 stands, and without binary archives it
-    /// does not
+    /// encoders, texture views or Automatic heaps, no Apple family does; with the lane's pieces
+    /// Apple1 and Apple2 stand, and without any one of them none; with Apple1 to Apple3's pieces
+    /// Apple3 stands, and without binary archives it does not
     #[test]
     fn an_apple_family_drops_where_the_lane_lacks_a_piece() {
         let p = Arc::new(FakePlatform::new());
@@ -610,44 +613,46 @@ mod tests {
         assert_eq!(set(&no_imageblocks, 16), Some(false));
         assert_eq!(set(&no_imageblocks, 10000), Some(true));
 
-        // The lane's own pieces: argument encoders, texture views, Automatic heaps and sample
-        // positions, but not Apple2's IO queues, so no Apple family stands, and none would
-        // without any one of them.
+        // The lane's own pieces: argument encoders, texture views, Automatic heaps, sample
+        // positions and IO queues, Apple2's (and so Apple1's), so Apple1 and Apple2 stand and
+        // Apple3, which needs indirect command buffers, does not; neither would stand without any
+        // one of them, and with each lowered falls each iOS feature set of its family.
         assert!(WIRED.contains(&Piece::ArgumentEncoders));
         assert!(WIRED.contains(&Piece::TextureViews));
         assert!(WIRED.contains(&Piece::AutomaticHeaps));
         assert!(WIRED.contains(&Piece::SamplePositions));
-        assert!(!WIRED.contains(&Piece::IoCommandQueues));
+        assert!(WIRED.contains(&Piece::IoCommandQueues));
         let mut lane = platform.clone();
         cap_apple_families(&mut lane, WIRED);
-        let no_views = without(Piece::TextureViews);
-        let no_automatic_heaps = without(Piece::AutomaticHeaps);
-        let no_sample_positions = without(Piece::SamplePositions);
-        for family in 1001..=1011 {
+        assert_eq!(answer(&lane, 1001), Some(true));
+        assert_eq!(answer(&lane, 1002), Some(true));
+        for family in 1003..=1011 {
             assert_eq!(answer(&lane, family), Some(false), "family {family}");
-            assert_eq!(answer(&no_views, family), Some(false), "family {family}");
-            assert_eq!(
-                answer(&no_automatic_heaps, family),
-                Some(false),
-                "family {family}"
-            );
-            assert_eq!(
-                answer(&no_sample_positions, family),
-                Some(false),
-                "family {family}"
-            );
         }
         assert_eq!(answer(&lane, 2002), Some(true));
-        // With IO queues carried too, Apple1 and Apple2 stand.
-        let to_apple2: Vec<Piece> = WIRED
-            .iter()
-            .copied()
-            .chain([Piece::IoCommandQueues])
-            .collect();
-        let mut apple2_lane = platform.clone();
-        cap_apple_families(&mut apple2_lane, &to_apple2);
-        assert_eq!(answer(&apple2_lane, 1002), Some(true));
-        assert_eq!(answer(&apple2_lane, 1003), Some(false));
+        let lane_only = |missing: Piece| -> IdentityCaps {
+            let wired: Vec<Piece> = WIRED.iter().copied().filter(|&p| p != missing).collect();
+            let mut identity = platform.clone();
+            cap_apple_families(&mut identity, &wired);
+            identity
+        };
+        for piece in [
+            Piece::ArgumentEncoders,
+            Piece::TextureViews,
+            Piece::AutomaticHeaps,
+            Piece::SamplePositions,
+            Piece::IoCommandQueues,
+        ] {
+            let short = lane_only(piece);
+            for family in 1001..=1011 {
+                assert_eq!(
+                    answer(&short, family),
+                    Some(false),
+                    "{piece:?} family {family}"
+                );
+            }
+            assert_eq!(answer(&short, 2002), Some(true), "{piece:?}");
+        }
 
         let no_encoders = without(Piece::ArgumentEncoders);
         for family in 1001..=1011 {

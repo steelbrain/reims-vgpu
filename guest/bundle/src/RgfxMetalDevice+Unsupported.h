@@ -8,8 +8,8 @@
  * What each waits on is listed in the effort's protocol-gaps-wire.md. Ray tracing, function
  * pointers, dynamic libraries, Metal 4, placement sparse, counters and rasterization rate maps
  * are what the device answers no for (RgfxCaps); indirect command buffers, argument encoders,
- * binary archives, mesh and tile pipelines, residency sets, shared textures, IO queues, log
- * states and tensors are what the wire does not carry yet.
+ * binary archives, mesh and tile pipelines, residency sets, shared textures, log states and
+ * tensors are what the wire does not carry yet.
  *
  * Without these the IOGPU base's own creators answer, which build on IOGPU objects the device
  * does not have. Like the rest of the device it is compiled into the bundle but not linked

@@ -10,7 +10,6 @@ namespace {
 constexpr const char *kRayTracing = "ray tracing";
 constexpr const char *kFunctionPointers = "function pointers";
 constexpr const char *kMetal4 = "the Metal 4 API";
-constexpr const char *kIO = "Metal IO command queues";
 } // namespace
 
 @implementation RgfxMetalDevice (Unsupported)
@@ -196,43 +195,6 @@ constexpr const char *kIO = "Metal IO command queues";
 {
 	RGFX_UNSUPPORTED_ERROR_IN(error, "shader log states (none on the wire)",
 	                          MTLLogStateErrorDomain, MTLLogStateErrorInvalid);
-	return nil;
-}
-
-// --- Metal IO --------------------------------------------------------------------------
-
-- (id<MTLIOCommandQueue>)newIOCommandQueueWithDescriptor:(MTLIOCommandQueueDescriptor *)descriptor
-                                                   error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
-	return nil;
-}
-
-- (id<MTLIOFileHandle>)newIOFileHandleWithURL:(NSURL *)url error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
-	return nil;
-}
-
-- (id<MTLIOFileHandle>)newIOFileHandleWithURL:(NSURL *)url
-                            compressionMethod:(MTLIOCompressionMethod)compressionMethod
-                                        error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
-	return nil;
-}
-
-- (id<MTLIOFileHandle>)newIOHandleWithURL:(NSURL *)url error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
-	return nil;
-}
-
-- (id<MTLIOFileHandle>)newIOHandleWithURL:(NSURL *)url
-                        compressionMethod:(MTLIOCompressionMethod)compressionMethod
-                                    error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
 	return nil;
 }
 
