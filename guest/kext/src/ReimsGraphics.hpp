@@ -32,6 +32,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+#include "RgfxDisplayModes.hpp"
 #include "RgfxPipeClients.hpp"
 #include "RgfxScanoutOwner.hpp"
 #include "reims_graphics_wire.h"
@@ -186,13 +187,10 @@ private:
 
 	// The display's modes. IDs stay with a mode (its size and rate) for the
 	// driver's life, as IOFramebuffer asks, and are never reused.
-	struct Mode {
-		IODisplayModeID id;
-		UInt32 width;
-		UInt32 height;
-		UInt32 refreshMhz;
-	};
+	// (RgfxDisplayModes.hpp: the list IOFramebuffer sees, the mode set and the startup mode.)
+	using Mode = RgfxMode;
 	static constexpr UInt32 kMaxModes = 64;
+	using Modes = RgfxDisplayModes<IODetailedTimingInformationV2, kMaxModes>;
 	// The most display pipe clients served at once (RgfxPipeClients.hpp).
 	static constexpr UInt32 kMaxPipeClients = 8;
 
@@ -226,19 +224,7 @@ private:
 	void initPower();
 	IOReturn setPower(UInt32 state);
 
-	// A timing the OS programmed: its mode, under the ID the OS gave it, and the timing.
-	struct Programmed {
-		Mode mode;
-		IODetailedTimingInformationV2 timing;
-	};
-	// Whether the device lists a mode of this size and rate (within half a hertz), and which.
-	bool deviceMode(UInt32 width, UInt32 height, UInt32 refreshMhz, Mode *mode) const;
 	static UInt32 refreshMhzOf(const IODetailedTimingInformationV2 &timing);
-	const Programmed *programmedFor(IODisplayModeID id) const;
-	bool isPreferred(const Mode &mode) const;
-	// The modes IOFramebuffer sees, into `ids` (kMaxModes of room) when not null: the
-	// programmed timings the device lists, or, while there are none, the device's own.
-	UInt32 listModes(IODisplayModeID *ids) const;
 	// The physical size of a mode's display, in millimetres, as the EDID gives it.
 	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
 
@@ -298,7 +284,6 @@ private:
 	void teardown();
 
 	// Modes and scanout.
-	bool modeFor(IODisplayModeID id, Mode *mode) const;
 	static UInt32 strideFor(UInt32 width);
 	UInt64 scanoutLimit() const;
 	IOReturn setScanout(const Mode &mode);
@@ -340,22 +325,16 @@ private:
 	bool haveDisplay;
 	UInt32 displayId;
 	bool connected;
-	Mode modes[kMaxModes];
-	UInt32 modeCount;
+	Modes modeSet;
+	RgfxModeConfig modeConfig;
 	UInt32 reportedCount;
-	IODisplayModeID preferredId;
-	IODisplayModeID nextModeId;
-	bool haveCurrent;
-	Mode current;
-	IODisplayModeID startupId;
-	Programmed programmed[kMaxModes];
-	UInt32 programmedCount;
 
-	// Under interruptLock: IOFramebuffer's registrations, and whether it
-	// wants VBLANK events.
+	// Under interruptLock: IOFramebuffer's registrations, whether it wants
+	// VBLANK events, and a display change waiting for its connect interrupt.
 	IOSimpleLock *interruptLock;
 	Interrupt vblank;
 	Interrupt connect;
+	RgfxConnectChange connectChange;
 	bool vblankWanted;
 	// The display pipe's clients (each retained), which want VBLANK, and the surface shown; the
 	// hooks every client takes.

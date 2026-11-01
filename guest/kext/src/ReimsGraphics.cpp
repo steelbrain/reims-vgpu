@@ -365,8 +365,13 @@ void ReimsGraphics::service()
 	}
 
 	IOSimpleLockLock(interruptLock);
+	Interrupt late = {};
+	if (connectChange.armed(connect.enabled && connect.proc))
+		late = connect;
 	bool want = vblankWanted || pipes.anyVblank();
 	IOSimpleLockUnlock(interruptLock);
+	if (late.proc)
+		late.proc(late.target, late.ref);
 	if (want != vblankSent) {
 		RgfxSetVblank v = {};
 		v.display = displayId;
@@ -453,10 +458,12 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		if (seqno != refreshSeqno)
 			return;
 		// The refresh a DISPLAY_CHANGED asked for: now IOFramebuffer
-		// senses the connection again.
+		// senses the connection again, or once it has its connect interrupt
+		// registered and on (RgfxDisplayModes.hpp, RgfxConnectChange).
 		refreshSeqno = 0;
 		IOSimpleLockLock(interruptLock);
-		fire = connect;
+		if (connectChange.changed(connect.enabled && connect.proc))
+			fire = connect;
 		IOSimpleLockUnlock(interruptLock);
 		break;
 	}
@@ -535,7 +542,9 @@ void ReimsGraphics::answer(UInt64 seqno, UInt32 status)
 // Takes the display's modes from a DISPLAYS answer. The driver's display is
 // the first listed when it starts, and the display of that id after; a list
 // without it leaves the display disconnected with its modes. Modes the
-// scanout space cannot hold are left out. Returns the answer's status.
+// scanout space cannot hold are left out. A list that changes the modes makes
+// the next server connection drop the mode configuration the last one left
+// (newUserClient). Returns the answer's status.
 UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 {
 	if (size < sizeof(uint32_t))
@@ -576,8 +585,7 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 	}
 
 	Mode fresh[kMaxModes];
-	UInt32 freshCount = 0;
-	IODisplayModeID freshPreferred = 0;
+	UInt32 freshCount = 0, freshPreferred = kMaxModes;
 	UInt64 limit = scanoutLimit();
 	for (UInt32 j = 0; j < listed && freshCount < kMaxModes; j++) {
 		UInt32 at = listAt + j * sizeof(RgfxModeEntry);
@@ -588,66 +596,20 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 			      id, m.width, m.height);
 			continue;
 		}
-		for (UInt32 k = 0; k < modeCount && !m.id; k++) {
-			if (modes[k].width == m.width && modes[k].height == m.height &&
-			    modes[k].refreshMhz == m.refreshMhz)
-				m.id = modes[k].id;
-		}
-		if (!m.id && haveCurrent && current.width == m.width && current.height == m.height &&
-		    current.refreshMhz == m.refreshMhz)
-			m.id = current.id;
-		if (!m.id)
-			m.id = nextModeId++;
-		fresh[freshCount++] = m;
 		if (j == preferred)
-			freshPreferred = m.id;
+			freshPreferred = freshCount;
+		fresh[freshCount++] = m;
 	}
 	haveDisplay = true;
 	displayId = id;
 	connected = isConnected != 0;
-	memcpy(modes, fresh, freshCount * sizeof(Mode));
-	modeCount = freshCount;
-	preferredId = freshPreferred ? freshPreferred : (freshCount ? fresh[0].id : 0);
+	if (modeSet.take(fresh, freshCount, freshPreferred))
+		modeConfig.listChanged();
 	IOLockUnlock(stateLock);
 	return 0;
 }
 
 // MARK: - Modes and scanout
-
-// The mode of an ID: one listed, or the mode set, which the list may have
-// dropped. Call with stateLock held.
-bool ReimsGraphics::modeFor(IODisplayModeID id, Mode *mode) const
-{
-	for (UInt32 i = 0; i < modeCount; i++) {
-		if (modes[i].id == id) {
-			*mode = modes[i];
-			return true;
-		}
-	}
-	if (const Programmed *p = programmedFor(id)) {
-		*mode = p->mode;
-		return true;
-	}
-	if (haveCurrent && current.id == id) {
-		*mode = current;
-		return true;
-	}
-	return false;
-}
-
-bool ReimsGraphics::deviceMode(UInt32 width, UInt32 height, UInt32 refreshMhz, Mode *mode) const
-{
-	for (UInt32 i = 0; i < modeCount; i++) {
-		const Mode &m = modes[i];
-		UInt32 diff = m.refreshMhz > refreshMhz ? m.refreshMhz - refreshMhz : refreshMhz - m.refreshMhz;
-		if (m.width == width && m.height == height && diff <= 500) {
-			if (mode)
-				*mode = m;
-			return true;
-		}
-	}
-	return false;
-}
 
 UInt32 ReimsGraphics::refreshMhzOf(const IODetailedTimingInformationV2 &t)
 {
@@ -656,51 +618,13 @@ UInt32 ReimsGraphics::refreshMhzOf(const IODetailedTimingInformationV2 &t)
 	return total ? static_cast<UInt32>((t.pixelClock * 1000 + total / 2) / total) : 0;
 }
 
-const ReimsGraphics::Programmed *ReimsGraphics::programmedFor(IODisplayModeID id) const
-{
-	for (UInt32 i = 0; i < programmedCount; i++) {
-		if (programmed[i].mode.id == id)
-			return &programmed[i];
-	}
-	return nullptr;
-}
-
-bool ReimsGraphics::isPreferred(const Mode &m) const
-{
-	if (m.id == preferredId)
-		return true;
-	Mode host;
-	return programmedFor(m.id) && deviceMode(m.width, m.height, m.refreshMhz, &host) &&
-	       host.id == preferredId;
-}
-
-UInt32 ReimsGraphics::listModes(IODisplayModeID *ids) const
-{
-	UInt32 n = 0;
-	for (UInt32 i = 0; i < programmedCount; i++) {
-		const Mode &m = programmed[i].mode;
-		if (!deviceMode(m.width, m.height, m.refreshMhz, nullptr))
-			continue;
-		if (ids)
-			ids[n] = m.id;
-		n++;
-	}
-	if (n)
-		return n;
-	for (UInt32 i = 0; i < modeCount; i++) {
-		if (ids)
-			ids[i] = modes[i].id;
-	}
-	return modeCount;
-}
-
 void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
 {
 	// The EDID's size, from the preferred mode.
 	Mode native = m;
-	for (UInt32 i = 0; i < modeCount; i++) {
-		if (modes[i].id == preferredId)
-			native = modes[i];
+	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
+		if (modeSet.modes[i].id == modeSet.preferredId)
+			native = modeSet.modes[i];
 	}
 	UInt32 ppi = native.width >= 2880 ? 220 : 110;
 	*width = static_cast<UInt16>((native.width * 254 + ppi * 5) / (ppi * 10));
@@ -734,8 +658,7 @@ IOReturn ReimsGraphics::setScanout(const Mode &mode)
 	if (r != kIOReturnSuccess)
 		return r;
 	IOLockLock(stateLock);
-	current = mode;
-	haveCurrent = true;
+	modeSet.set(mode);
 	IOLockUnlock(stateLock);
 	IOLog("ReimsGraphics: display %u: scanout %ux%u at %u.%03u Hz, stride %u\n", displayId,
 	      mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000, stride);
@@ -759,8 +682,8 @@ bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowByt
 	if (!stateLock)
 		return false;
 	IOLockLock(stateLock);
-	bool have = haveCurrent;
-	Mode m = current;
+	bool have = modeSet.haveCurrent;
+	Mode m = modeSet.current;
 	IOLockUnlock(stateLock);
 	if (!have)
 		return false;
@@ -808,7 +731,14 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 	IOLockLock(stateLock);
 	const IOUserClient *held = static_cast<const IOUserClient *>(scanoutOwner.client);
 	bool marked = scanoutOwner.beginOpen(owningTask, held && !held->isInactive());
+	bool stale = modeConfig.serverOpens();
 	IOLockUnlock(stateLock);
+	if (stale && getProperty(kIOFBConfigKey)) {
+		// Made from a list the device has changed since (RgfxDisplayModes.hpp).
+		removeProperty(kIOFBConfigKey);
+		IOLog("ReimsGraphics: the display's modes changed since the last server connection: "
+		      "its mode configuration is dropped\n");
+	}
 	IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
 	FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);
 	IOUserClient *made = r == kIOReturnSuccess && clientH ? *clientH : nullptr;
@@ -849,7 +779,7 @@ bool ReimsGraphics::start(IOService *provider)
 	if (!submitLock || !interruptLock || !stateLock)
 		return false;
 	nextSeqno = 1;
-	nextModeId = 1;
+	modeSet.reset();
 
 	pci->setMemoryEnable(true);
 	pci->setBusLeadEnable(true);
@@ -934,8 +864,7 @@ bool ReimsGraphics::start(IOService *provider)
 
 	r = command(RGFX_CMD_GET_DISPLAYS, &getDisplays, sizeof(getDisplays));
 	IOLockLock(stateLock);
-	startupId = preferredId;
-	count = haveDisplay ? modeCount : 0;
+	count = haveDisplay ? modeSet.modeCount : 0;
 	IOLockUnlock(stateLock);
 	if (r != kIOReturnSuccess || !count) {
 		IOLog("ReimsGraphics: the device lists no usable display\n");
@@ -1095,10 +1024,11 @@ IOReturn ReimsGraphics::enableController()
 	initPower();
 	Mode m;
 	IOLockLock(stateLock);
-	bool ok = modeFor(startupId, &m);
+	IODisplayModeID startup = modeSet.startupId;
+	bool ok = modeSet.modeFor(startup, &m);
 	IOLockUnlock(stateLock);
 	IOReturn r = ok ? setScanout(m) : kIOReturnNotReady;
-	FBTRACE(8, "enableController: startup mode %d -> 0x%x", static_cast<int>(startupId), r);
+	FBTRACE(8, "enableController: startup mode %d -> 0x%x", static_cast<int>(startup), r);
 	return r;
 }
 
@@ -1108,7 +1038,8 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 		return nullptr;
 	Mode m;
 	IOLockLock(stateLock);
-	bool ok = haveCurrent ? (m = current, true) : modeFor(startupId, &m);
+	bool ok = modeSet.haveCurrent ? (m = modeSet.current, true)
+	                              : modeSet.modeFor(modeSet.startupId, &m);
 	IOLockUnlock(stateLock);
 	if (!ok)
 		return nullptr;
@@ -1148,22 +1079,19 @@ const char *ReimsGraphics::getPixelFormats()
 IOItemCount ReimsGraphics::getDisplayModeCount()
 {
 	IOLockLock(stateLock);
-	reportedCount = listModes(nullptr);
+	reportedCount = modeSet.list(nullptr);
 	IOLockUnlock(stateLock);
 	FBTRACE(16, "getDisplayModeCount -> %u", reportedCount);
 	return reportedCount;
 }
 
 // The caller's array holds the count last reported. A DISPLAYS answer may
-// change the list in between: then the array is filled with the preferred
-// mode, and the connect interrupt that follows has IOFramebuffer ask again.
+// change the list in between: then the array still names the mode set, and the
+// connect interrupt that follows has IOFramebuffer ask again (Modes::fill).
 IOReturn ReimsGraphics::getDisplayModes(IODisplayModeID *allDisplayModes)
 {
-	IODisplayModeID ids[kMaxModes];
 	IOLockLock(stateLock);
-	UInt32 n = listModes(ids);
-	for (UInt32 i = 0; i < reportedCount; i++)
-		allDisplayModes[i] = i < n ? ids[i] : (n ? ids[0] : preferredId);
+	modeSet.fill(allDisplayModes, reportedCount);
 	FBTRACE(16, "getDisplayModes: %u modes, first %d", reportedCount,
 	        reportedCount ? static_cast<int>(allDisplayModes[0]) : -1);
 	IOLockUnlock(stateLock);
@@ -1175,8 +1103,8 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 {
 	Mode m;
 	IOLockLock(stateLock);
-	bool ok = modeFor(displayMode, &m);
-	bool preferred = ok && isPreferred(m);
+	bool ok = modeSet.modeFor(displayMode, &m);
+	bool preferred = ok && modeSet.isPreferred(m);
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
 		imageSize(m, &mmWide, &mmHigh);
@@ -1210,7 +1138,7 @@ IOReturn ReimsGraphics::getPixelInformation(IODisplayModeID displayMode, IOIndex
 		return kIOReturnUnsupportedMode;
 	Mode m;
 	IOLockLock(stateLock);
-	bool ok = modeFor(displayMode, &m);
+	bool ok = modeSet.modeFor(displayMode, &m);
 	IOLockUnlock(stateLock);
 	if (!ok)
 		return kIOReturnBadArgument;
@@ -1233,7 +1161,7 @@ IOReturn ReimsGraphics::getPixelInformation(IODisplayModeID displayMode, IOIndex
 IOReturn ReimsGraphics::getCurrentDisplayMode(IODisplayModeID *displayMode, IOIndex *depth)
 {
 	IOLockLock(stateLock);
-	IODisplayModeID id = haveCurrent ? current.id : startupId;
+	IODisplayModeID id = modeSet.haveCurrent ? modeSet.current.id : modeSet.startupId;
 	IOLockUnlock(stateLock);
 	FBTRACE(32, "getCurrentDisplayMode -> %d", static_cast<int>(id));
 	if (displayMode)
@@ -1250,7 +1178,7 @@ IOReturn ReimsGraphics::setDisplayMode(IODisplayModeID displayMode, IOIndex dept
 		return kIOReturnUnsupportedMode;
 	Mode m;
 	IOLockLock(stateLock);
-	bool ok = modeFor(displayMode, &m);
+	bool ok = modeSet.modeFor(displayMode, &m);
 	IOLockUnlock(stateLock);
 	return ok ? setScanout(m) : kIOReturnBadArgument;
 }
@@ -1258,7 +1186,7 @@ IOReturn ReimsGraphics::setDisplayMode(IODisplayModeID displayMode, IOIndex dept
 IOReturn ReimsGraphics::getStartupDisplayMode(IODisplayModeID *displayMode, IOIndex *depth)
 {
 	IOLockLock(stateLock);
-	IODisplayModeID id = startupId;
+	IODisplayModeID id = modeSet.startupId;
 	IOLockUnlock(stateLock);
 	FBTRACE(16, "getStartupDisplayMode -> %d", static_cast<int>(id));
 	if (displayMode)
@@ -1276,9 +1204,9 @@ IOReturn ReimsGraphics::setStartupDisplayMode(IODisplayModeID displayMode, IOInd
 		return kIOReturnUnsupportedMode;
 	Mode m;
 	IOLockLock(stateLock);
-	bool ok = modeFor(displayMode, &m);
+	bool ok = modeSet.modeFor(displayMode, &m);
 	if (ok)
-		startupId = displayMode;
+		modeSet.startupId = displayMode;
 	IOLockUnlock(stateLock);
 	return ok ? kIOReturnSuccess : kIOReturnBadArgument;
 }
@@ -1290,8 +1218,8 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	Mode m;
 	IODetailedTimingInformationV2 given;
 	IOLockLock(stateLock);
-	bool ok = modeFor(displayMode, &m);
-	const Programmed *p = programmedFor(displayMode);
+	bool ok = modeSet.modeFor(displayMode, &m);
+	const Modes::Programmed *p = modeSet.programmedFor(displayMode);
 	if (p)
 		given = p->timing;
 	IOLockUnlock(stateLock);
@@ -1353,8 +1281,8 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 	Mode host;
 	IOLockLock(stateLock);
 	bool ok = !scaled && !(t->signalConfig & kIOInterlacedCEATiming) &&
-	          deviceMode(t->horizontalActive, t->verticalActive, refresh, &host);
-	bool preferred = ok && host.id == preferredId;
+	          modeSet.deviceMode(t->horizontalActive, t->verticalActive, refresh, &host);
+	bool preferred = ok && host.id == modeSet.preferredId;
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
 		imageSize(host, &mmWide, &mmHigh);
@@ -1385,37 +1313,24 @@ IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
 {
 	UInt32 taken = 0;
 	IOLockLock(stateLock);
-	programmedCount = 0;
-	for (UInt32 i = 0; array && i < array->getCount() && programmedCount < kMaxModes; i++) {
+	modeSet.clearProgrammed();
+	for (UInt32 i = 0; array && i < array->getCount(); i++) {
 		OSData *data = OSDynamicCast(OSData, array->getObject(i));
 		if (!data || data->getLength() < sizeof(IODetailedTimingInformationV2))
 			continue;
 		IODetailedTimingInformationV2 t;
 		memcpy(&t, data->getBytesNoCopy(), sizeof(t));
 		IODisplayModeID id = static_cast<IODisplayModeID>(t.__reservedA[0]);
-		if (static_cast<UInt32>(id) < static_cast<UInt32>(kIODisplayModeIDReservedBase) ||
-		    !t.horizontalActive || !t.verticalActive || t.horizontalActive > kMaxDimension ||
-		    t.verticalActive > kMaxDimension || programmedFor(id))
+		if (!t.horizontalActive || !t.verticalActive || t.horizontalActive > kMaxDimension ||
+		    t.verticalActive > kMaxDimension)
 			continue;
-		Programmed &p = programmed[programmedCount++];
-		p.mode = {id, t.horizontalActive, t.verticalActive, refreshMhzOf(t)};
-		p.timing = t;
-		if (deviceMode(p.mode.width, p.mode.height, p.mode.refreshMhz, nullptr))
+		Mode m = {id, t.horizontalActive, t.verticalActive, refreshMhzOf(t)};
+		if (modeSet.addProgrammed(id, m, t, kIODisplayModeIDReservedBase) &&
+		    modeSet.deviceMode(m.width, m.height, m.refreshMhz, nullptr))
 			taken++;
 	}
-	if (haveCurrent && !programmedFor(current.id)) {
-		for (UInt32 i = 0; i < programmedCount; i++) {
-			const Mode &m = programmed[i].mode;
-			UInt32 diff = m.refreshMhz > current.refreshMhz ? m.refreshMhz - current.refreshMhz
-			                                                : current.refreshMhz - m.refreshMhz;
-			if (m.width == current.width && m.height == current.height && diff <= 500 &&
-			    deviceMode(m.width, m.height, m.refreshMhz, nullptr)) {
-				current.id = m.id;
-				break;
-			}
-		}
-	}
-	UInt32 count = programmedCount;
+	modeSet.followProgrammed();
+	UInt32 count = modeSet.programmedCount;
 	IOLockUnlock(stateLock);
 	if (array)
 		setProperty(kIOFBDetailedTimingsKey, array);
@@ -1556,7 +1471,7 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 
 UInt32 ReimsGraphics::edidExtensionCount() const
 {
-	UInt32 n = (modeCount + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
+	UInt32 n = (modeSet.modeCount + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
 	return n ? n : 1;
 }
 
@@ -1609,13 +1524,13 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 	// The modes, the preferred one first.
 	Mode order[kMaxModes];
 	UInt32 n = 0;
-	for (UInt32 i = 0; i < modeCount; i++) {
-		if (modes[i].id == preferredId)
-			order[n++] = modes[i];
+	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
+		if (modeSet.modes[i].id == modeSet.preferredId)
+			order[n++] = modeSet.modes[i];
 	}
-	for (UInt32 i = 0; i < modeCount; i++) {
-		if (modes[i].id != preferredId)
-			order[n++] = modes[i];
+	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
+		if (modeSet.modes[i].id != modeSet.preferredId)
+			order[n++] = modeSet.modes[i];
 	}
 
 	if (index > 0) {
@@ -1678,7 +1593,7 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 		if (i == 0)
 			break;
 	}
-	const Mode &native = n ? order[0] : current;
+	const Mode &native = n ? order[0] : modeSet.current;
 
 	static const UInt8 header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
 	memcpy(b, header, sizeof(header));
