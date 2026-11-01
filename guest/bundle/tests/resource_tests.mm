@@ -12,6 +12,7 @@
 #import <objc/message.h>
 
 #include <cstdint>
+#include <vector>
 
 #import "RgfxBuffer.h"
 #import "RgfxHeap.h"
@@ -177,10 +178,184 @@ void test_heap_buffer_descriptors()
 	drainRing(fx.ring);
 }
 
+// A buffer's members past MTLBuffer.
+id<RgfxMetalBufferInternals> internals(id<MTLBuffer> buffer)
+{
+	return (id<RgfxMetalBufferInternals>)buffer;
+}
+
+BOOL alias(id<MTLBuffer> a, id<MTLResource> b)
+{
+	return [internals(a) doesAliasResource:b];
+}
+
+// A buffer in no heap answers its options resolved and as asked, an allocation of its own of its
+// own size, its contents as its CPU address, NULL for a Private one, no IOSurface, its purgeable
+// state, that it is complete, and that it aliases nothing.
+void test_buffer_answers()
+{
+	Fixture fx;
+	@autoreleasepool {
+		auto make = [&](MTLResourceOptions options) {
+			return [RgfxBuffer bufferWithLength:0x1000 options:options device:nil serializer:&fx.ser];
+		};
+		RgfxBuffer *plain = make(0);
+		RgfxBuffer *untracked = make(MTLResourceHazardTrackingModeUntracked);
+		RgfxBuffer *priv = make(MTLResourceStorageModePrivate);
+		RgfxBuffer *combined = make(MTLResourceCPUCacheModeWriteCombined);
+		const struct {
+			RgfxBuffer *buffer;
+			MTLResourceOptions asked, answered;
+		} cases[] = {{plain, 0, 0x200}, {untracked, 0x100, 0x100}, {priv, 0x20, 0x220},
+		             {combined, 0x1, 0x201}};
+		for (const auto &c : cases) {
+			CHECK(c.buffer.resourceOptions == c.answered);
+			CHECK([internals(c.buffer) unfilteredResourceOptions] == c.asked);
+		}
+		CHECK(plain.hazardTrackingMode == MTLHazardTrackingModeTracked);
+		CHECK(untracked.hazardTrackingMode == MTLHazardTrackingModeUntracked);
+		CHECK(priv.storageMode == MTLStorageModePrivate &&
+		      combined.cpuCacheMode == MTLCPUCacheModeWriteCombined);
+
+		const uint64_t id0 = [internals(plain) allocationID], id1 = [internals(priv) allocationID];
+		CHECK(id0 != 0 && id1 != 0 && id0 != id1);
+		CHECK([internals(plain) resourceSize] == 0x1000 && [internals(plain) iosurface] == nullptr);
+		CHECK(plain.contents != nullptr && [internals(plain) virtualAddress] == plain.contents);
+		CHECK([internals(priv) virtualAddress] == nullptr);
+
+		CHECK([internals(plain) isComplete] && [internals(plain) isWriteComplete]);
+		[internals(plain) waitUntilComplete];
+		CHECK(![internals(plain) isPurgeable]);
+		[plain setPurgeableState:MTLPurgeableStateVolatile];
+		CHECK([internals(plain) isPurgeable]);
+		[plain setPurgeableState:MTLPurgeableStateEmpty];
+		CHECK([internals(plain) isPurgeable]);
+		[plain setPurgeableState:MTLPurgeableStateNonVolatile];
+		CHECK(![internals(plain) isPurgeable]);
+
+		CHECK(!alias(plain, plain) && !alias(plain, priv) && !alias(plain, nil));
+		__unsafe_unretained id<MTLResource> list[] = {plain};
+		CHECK([internals(plain) doesAliasAllResources:list count:0]);
+		CHECK(![internals(plain) doesAliasAnyResources:list count:0]);
+		CHECK(![internals(plain) doesAliasAllResources:list count:1]);
+	}
+	drainRing(fx.ring);
+}
+
+// A heap's buffers answer the heap's options, allocation and size, the heap's CPU address plus
+// their offset (the offset itself in a Private heap), alias where their bytes meet in one heap, and
+// stay NonVolatile.
+void test_heap_buffers_answer_their_heap()
+{
+	Fixture fx;
+	std::vector<uint8_t> bytes(0x100000);
+	@autoreleasepool {
+		MTLHeapDescriptor *pd = heapDescriptor(MTLStorageModePrivate, MTLHeapTypePlacement);
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:pd device:nil serializer:&fx.ser];
+		RgfxHeap *other = [RgfxHeap heapWithDescriptor:pd device:nil serializer:&fx.ser];
+		const MTLResourceOptions o = MTLResourceStorageModePrivate;
+		id<MTLBuffer> b0 = [heap newBufferWithLength:0x1000 options:o offset:0];
+		id<MTLBuffer> b1 = [heap newBufferWithLength:0x1000 options:o offset:0x800];
+		id<MTLBuffer> b2 = [heap newBufferWithLength:0x1000 options:o offset:0x2000];
+		id<MTLBuffer> b3 = [heap newBufferWithLength:0x1000
+		                                     options:o | MTLResourceHazardTrackingModeTracked
+		                                      offset:0x1000];
+		id<MTLBuffer> o0 = [other newBufferWithLength:0x1000 options:o offset:0];
+		CHECK(b3.resourceOptions == 0x120 && [internals(b3) unfilteredResourceOptions] == 0x120);
+		CHECK(b3.hazardTrackingMode == MTLHazardTrackingModeUntracked);
+		CHECK([internals(b0) allocationID] == [internals(b2) allocationID]);
+		CHECK([internals(b0) allocationID] != [internals(o0) allocationID]);
+		CHECK([internals(b2) resourceSize] == heap.size);
+		CHECK([internals(b0) virtualAddress] == nullptr);
+		CHECK([internals(b1) virtualAddress] == reinterpret_cast<void *>(0x800));
+		CHECK([internals(b2) virtualAddress] == reinterpret_cast<void *>(0x2000));
+
+		// Bytes that meet alias, and bytes that only touch do not.
+		CHECK(alias(b0, b1) && alias(b1, b0) && alias(b0, b0));
+		CHECK(!alias(b0, b2) && !alias(b1, b2) && !alias(b0, b3) && !alias(b0, o0));
+		__unsafe_unretained id<MTLResource> apart[] = {b1, b2};
+		__unsafe_unretained id<MTLResource> over[] = {b1, b0};
+		CHECK(![internals(b0) doesAliasAllResources:apart count:2]);
+		CHECK([internals(b0) doesAliasAnyResources:apart count:2]);
+		CHECK([internals(b0) doesAliasAllResources:over count:2]);
+
+		CHECK([b0 setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+		CHECK(![internals(b0) isPurgeable]);
+		CHECK([b0 setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+
+		// An Automatic heap's buffers meet only once one is made aliasable and its bytes taken again.
+		RgfxHeap *automatic = [RgfxHeap
+		    heapWithDescriptor:heapDescriptor(MTLStorageModePrivate, MTLHeapTypeAutomatic)
+		                device:nil
+		            serializer:&fx.ser];
+		id<MTLBuffer> a0 = [automatic newBufferWithLength:0x2000 options:o];
+		id<MTLBuffer> a1 = [automatic newBufferWithLength:0x2000 options:o];
+		CHECK(!alias(a0, a1) && [internals(a1) virtualAddress] == reinterpret_cast<void *>(0x2000));
+		[a0 makeAliasable];
+		id<MTLBuffer> a2 = [automatic newBufferWithLength:0x2000 options:o];
+		CHECK(a2.gpuAddress == a0.gpuAddress && alias(a0, a2) && alias(a2, a0) && !alias(a1, a2));
+
+		// A Shared heap's buffer lies at the heap's bytes plus its offset.
+		RgfxHeap *shared = [RgfxHeap
+		    heapOverHostMemoryWithDescriptor:heapDescriptor(MTLStorageModeShared,
+		                                                    MTLHeapTypePlacement)
+		                        regionOffset:0
+		                            contents:bytes.data()
+		                         deallocator:nil
+		                              device:nil
+		                          serializer:&fx.ser];
+		id<MTLBuffer> s0 = [shared newBufferWithLength:0x1000 options:0 offset:0x4000];
+		CHECK(s0.contents == bytes.data() + 0x4000 && [internals(s0) virtualAddress] == s0.contents);
+		CHECK(s0.resourceOptions == 0x100 && [internals(s0) unfilteredResourceOptions] == 0x100);
+	}
+	drainRing(fx.ring);
+}
+
+// A linear texture is made as newTextureWithDescriptor:offset:bytesPerRow: makes one, its bytes per
+// image unread; a 2D array, whose slices the wire does not space, is nil, logged, posting nothing.
+void test_buffer_linear_textures()
+{
+	Fixture fx;
+	@autoreleasepool {
+		RgfxBuffer *buffer = [RgfxBuffer bufferWithLength:0x10000
+		                                          options:0
+		                                           device:nil
+		                                       serializer:&fx.ser];
+		drainRing(fx.ring);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		id<MTLTexture> t = [internals(buffer) newLinearTextureWithDescriptor:td
+		                                                              offset:0x1000
+		                                                         bytesPerRow:256
+		                                                       bytesPerImage:99999];
+		auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+		CHECK(m.buffer_obj_id == buffer.rgfxObjId && m.offset == 0x1000 && m.bytes_per_row == 256);
+		CHECK(t != nil && t.buffer == buffer && t.bufferOffset == 0x1000);
+		CHECK(t.bufferBytesPerRow == 256 && t.textureType == MTLTextureType2D);
+		td.textureType = MTLTextureType2DArray;
+		td.arrayLength = 3;
+		CHECK([internals(buffer) newLinearTextureWithDescriptor:td
+		                                                 offset:0
+		                                            bytesPerRow:256
+		                                          bytesPerImage:0x1000] == nil);
+		CHECK(RgfxUnsupportedWasLogged(
+		    [RgfxBuffer class],
+		    @selector(newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:)));
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
 } // namespace
 
 void rgfxResourceTests()
 {
 	test_heap_answers();
 	test_heap_buffer_descriptors();
+	test_buffer_answers();
+	test_heap_buffers_answer_their_heap();
+	test_buffer_linear_textures();
 }

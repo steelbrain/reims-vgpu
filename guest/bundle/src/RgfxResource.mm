@@ -15,6 +15,22 @@
 
 #include "RgfxSerializer.hpp"
 
+namespace {
+// The last allocation id taken (rgfxAllocationId): every object takes the next as it is made.
+std::atomic<uint64_t> g_lastAllocationId{0};
+} // namespace
+
+BOOL RgfxResourcesAlias(RgfxResource *a, id b)
+{
+	if (![b isKindOfClass:[RgfxResource class]]) {
+		return NO;
+	}
+	uint64_t aOffset = 0, aSize = 0, bOffset = 0, bSize = 0;
+	id<MTLHeap> aHeap = [a rgfxSpanOffset:&aOffset size:&aSize];
+	id<MTLHeap> bHeap = [static_cast<RgfxResource *>(b) rgfxSpanOffset:&bOffset size:&bSize];
+	return aHeap != nil && aHeap == bHeap && aOffset < bOffset + bSize && bOffset < aOffset + aSize;
+}
+
 @implementation RgfxResource {
 	__weak id<MTLDevice> _device;
 	id<MTLHeap> _heap; // the heap the resource lies in, kept alive
@@ -31,6 +47,7 @@
 	uint64_t _rangeOffset;
 	uint64_t _rangeSize;
 	std::atomic<bool> _rangeHeld;
+	uint64_t _allocationId; // taken as it was made (rgfxAllocationId)
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -44,6 +61,7 @@
 		_serializer = serializer;
 		_responsibleProcess = getpid();
 		_purgeableState.store(MTLPurgeableStateNonVolatile);
+		_allocationId = g_lastAllocationId.fetch_add(1) + 1;
 	}
 	return self;
 }
@@ -104,6 +122,40 @@ RGFX_LOG_UNRECOGNIZED
 - (uint64_t)rgfxHeapRangeSize
 {
 	return _rangeSize;
+}
+
+- (uint64_t)rgfxHeapPlacement
+{
+	return _rangeSize != 0 ? _rangeOffset : _heapOffset;
+}
+
+// --- the resource SPI's shared answers (RGFX_RESOURCE_SPI) --------------------------
+
+// A heap's resources lie in the heap's allocation, and share its id as Metal's do (measured on the
+// M3 Max under macOS 27); any other is an allocation of its own. Metal suballocates small buffers
+// from pools whose buffers share an id too, and the device makes no pools.
+- (uint64_t)rgfxAllocationId
+{
+	RgfxResource *heap = [_heap isKindOfClass:[RgfxResource class]] ? (RgfxResource *)_heap : nil;
+	return heap != nil ? heap->_allocationId : _allocationId;
+}
+
+// Its bytes in its heap, from where the heap placed it, as many as it takes there.
+- (id<MTLHeap>)rgfxSpanOffset:(uint64_t *)offset size:(uint64_t *)size
+{
+	id<MTLHeap> heap = self.heap;
+	if (heap == nil || ![self respondsToSelector:@selector(allocatedSize)]) {
+		return nil;
+	}
+	*offset = self.rgfxHeapPlacement;
+	*size = [(id<MTLResource>)self allocatedSize];
+	return heap;
+}
+
+- (BOOL)rgfxIsPurgeable
+{
+	const MTLPurgeableState state = _purgeableState.load();
+	return state == MTLPurgeableStateVolatile || state == MTLPurgeableStateEmpty;
 }
 
 // The resource SPI WindowServer calls as it prepares a window's surface for its compositor:
@@ -170,9 +222,14 @@ RGFX_LOG_UNRECOGNIZED
 
 // The state is kept as told and the previous one answered (KeepCurrent only answers it). The
 // device never purges a resource, so a Volatile one keeps its contents and stays Volatile, and
-// an Empty one keeps them too, which no client may read.
+// an Empty one keeps them too, which no client may read. A heap's resource stays NonVolatile,
+// whatever it is told, as Metal's does (measured on the M3 Max under macOS 27: it answers
+// NonVolatile to Volatile and then to KeepCurrent, and isPurgeable NO, whatever the heap's state).
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
 {
+	if (_heap != nil) {
+		return MTLPurgeableStateNonVolatile;
+	}
 	if (state == MTLPurgeableStateKeepCurrent) {
 		return _purgeableState.load();
 	}

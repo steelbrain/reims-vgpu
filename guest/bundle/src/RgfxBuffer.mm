@@ -3,6 +3,7 @@
  */
 
 #import "RgfxBuffer.h"
+#import "RgfxMetalPrivate.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -55,6 +56,9 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	return mode == MTLStorageModeShared || mode == MTLStorageModeManaged;
 }
 } // namespace
+
+@interface RgfxBuffer () <RgfxMetalBufferInternals>
+@end
 
 @implementation RgfxBuffer {
 	uint64_t _gpuAddress;
@@ -294,29 +298,58 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	return _gpuAddress;
 }
 
+// The buffer's options as Metal answers them (measured on the M3 Max under macOS 27): those it was
+// made with, a Default hazard tracking mode resolved to Tracked (0x200 for options of 0, 0x220 for
+// Private, 0x201 for WriteCombined, and Untracked kept); a heap's buffer answers the heap's,
+// whatever it was asked (0x120 in a Private heap, for a buffer asked to be Tracked too).
 - (MTLResourceOptions)resourceOptions
 {
-	return _options;
+	id<MTLHeap> heap = self.heap;
+	return heap != nil ? heap.resourceOptions
+	                   : RgfxResolveHazardTracking(_options, MTLResourceHazardTrackingModeTracked);
+}
+
+// The options it was made with, as asked; a heap's buffer answers the heap's, as resourceOptions.
+- (MTLResourceOptions)unfilteredResourceOptions
+{
+	id<MTLHeap> heap = self.heap;
+	return heap != nil ? heap.resourceOptions : _options;
 }
 
 // The modes `resourceOptions` holds: an app reads `storageMode` to tell a Managed buffer, whose
 // writes it names with didModifyRange:.
 - (MTLStorageMode)storageMode
 {
-	return static_cast<MTLStorageMode>((_options & MTLResourceStorageModeMask) >>
+	return static_cast<MTLStorageMode>((self.resourceOptions & MTLResourceStorageModeMask) >>
 	                                   MTLResourceStorageModeShift);
 }
 
 - (MTLCPUCacheMode)cpuCacheMode
 {
-	return static_cast<MTLCPUCacheMode>((_options & MTLResourceCPUCacheModeMask) >>
+	return static_cast<MTLCPUCacheMode>((self.resourceOptions & MTLResourceCPUCacheModeMask) >>
 	                                    MTLResourceCPUCacheModeShift);
 }
 
 - (MTLHazardTrackingMode)hazardTrackingMode
 {
-	return static_cast<MTLHazardTrackingMode>((_options & MTLResourceHazardTrackingModeMask) >>
+	return static_cast<MTLHazardTrackingMode>((self.resourceOptions &
+	                                           MTLResourceHazardTrackingModeMask) >>
 	                                          MTLResourceHazardTrackingModeShift);
+}
+
+// --- the resource SPI (RgfxMetalPrivate.h) ---------------------------------------------
+
+RGFX_RESOURCE_SPI
+
+// The CPU's address of the buffer's memory, its contents, as Metal's (measured on the M3 Max under
+// macOS 27): NULL for a Private buffer. A heap's buffer lies at the heap's CPU address plus its
+// offset there, which for a Private heap, at NULL, is the offset itself.
+- (void *)virtualAddress
+{
+	if (_contents == nullptr && self.heap != nil) {
+		return reinterpret_cast<void *>(static_cast<uintptr_t>(self.rgfxHeapPlacement));
+	}
+	return _contents;
 }
 
 - (void)didModifyRange:(NSRange)range
@@ -349,6 +382,40 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	                              bytesPerRow:bytesPerRow
 	                                   device:self.device
 	                               serializer:[self serializer]];
+}
+
+// A texture over the buffer's bytes as newTextureWithDescriptor:offset:bytesPerRow: makes one,
+// which Metal's is (measured on the M3 Max under macOS 27: the same buffer, offset and bytes per
+// row, at the buffer's address plus the offset, a 2D texture whatever its bytes per image). Metal's
+// takes a 2D array too, its slices `bytesPerImage` apart, which the wire's texture over a buffer
+// does not carry: that one is answered nil, logged.
+- (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                          offset:(NSUInteger)offset
+                                     bytesPerRow:(NSUInteger)bytesPerRow
+                                   bytesPerImage:(NSUInteger)bytesPerImage
+{
+	if (descriptor != nil && descriptor.textureType == MTLTextureType2DArray) {
+		RGFX_UNSUPPORTED("2D array textures over a buffer (the wire carries no bytes per image)");
+		return nil;
+	}
+	return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
+}
+
+// The size of the allocation the buffer lies in: its heap's, or its own, as Metal's (measured on
+// the M3 Max under macOS 27: a 1 MiB buffer answers its size, one in a heap the heap's; Metal
+// suballocates small buffers from 128 KiB pools, which answer the pool's size, and the device
+// makes no pools).
+- (uint64_t)resourceSize
+{
+	id<MTLHeap> heap = self.heap;
+	return heap != nil ? heap.size : self.allocatedSize;
+}
+
+// The device makes no buffer over an IOSurface, so the buffer lies in none, as a buffer made from
+// a length or bytes answers none (measured on the M3 Max under macOS 27).
+- (IOSurfaceRef)iosurface
+{
+	return nullptr;
 }
 
 - (MTLBufferSparseTier)sparseBufferTier

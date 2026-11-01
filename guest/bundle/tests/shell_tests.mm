@@ -132,7 +132,8 @@ void test_buffer_routing()
 	CHECK([buf gpuAddress] != 0);      // a GPU address was picked
 	CHECK(([buf gpuAddress] % RgfxSerializer::kDefaultAddressAlign) == 0);
 	CHECK([buf gpuAddress] >= RgfxIdSpace::kDefaultAddressBase);
-	CHECK([buf resourceOptions] == options);
+	// Its options as Metal answers them: a Default hazard tracking mode is Tracked.
+	CHECK([buf resourceOptions] == (options | MTLResourceHazardTrackingModeTracked));
 	CHECK(buf.device == nil);          // no device in this test
 	CHECK([buf serializer] == &fx.ser); // borrowed route is wired
 
@@ -439,7 +440,7 @@ void test_texture_cpu_copies()
 	// none, and cannot be made aliasable.
 	CHECK(buf.storageMode == MTLStorageModeShared && tex.storageMode == MTLStorageModeShared);
 	CHECK(buf.cpuCacheMode == MTLCPUCacheModeDefaultCache);
-	CHECK(buf.hazardTrackingMode == MTLHazardTrackingModeDefault);
+	CHECK(buf.hazardTrackingMode == MTLHazardTrackingModeTracked);
 	CHECK(buf.heap == nil && buf.heapOffset == 0 && tex.heap == nil);
 	[buf makeAliasable];
 	CHECK(!buf.isAliasable);
@@ -3640,7 +3641,7 @@ void test_managed_buffer_range()
 	CHECK(buf != nil && [buf contents] == block.ptr);
 	CHECK([buf storageMode] == MTLStorageModeManaged &&
 	      [buf cpuCacheMode] == MTLCPUCacheModeDefaultCache &&
-	      [buf hazardTrackingMode] == MTLHazardTrackingModeDefault);
+	      [buf hazardTrackingMode] == MTLHazardTrackingModeTracked);
 	auto create =
 	    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
 	CHECK(create.options == static_cast<uint32_t>(managed));

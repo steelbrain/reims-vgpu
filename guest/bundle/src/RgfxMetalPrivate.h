@@ -139,6 +139,42 @@ NS_ASSUME_NONNULL_END
 // of the SDK declares for that kind, with their type encodings. Each wrapper adopts its protocol
 // in its own file.
 NS_ASSUME_NONNULL_BEGIN
+// The resource SPI's members (MTLResourceSPI) and two more, which Metal's buffer and texture
+// classes answer alike.
+@protocol RgfxMetalResourceInternals
+// `Q16@0:8`: the id of the allocation the resource lies in.
+- (uint64_t)allocationID;
+// `B24@0:8@16`, and `B32@0:8r^@16Q24` for the two lists: whether the resource's memory meets
+// another's.
+- (BOOL)doesAliasResource:(nullable id<MTLResource>)resource;
+- (BOOL)doesAliasAllResources:(const id<MTLResource> _Nonnull[_Nullable])resources
+                        count:(NSUInteger)count;
+- (BOOL)doesAliasAnyResources:(const id<MTLResource> _Nonnull[_Nullable])resources
+                        count:(NSUInteger)count;
+// `B16@0:8` each, and `v16@0:8` for the wait.
+- (BOOL)isComplete;
+- (BOOL)isWriteComplete;
+- (BOOL)isPurgeable;
+- (void)waitUntilComplete;
+// `Q16@0:8`: the options the resource was made with.
+- (MTLResourceOptions)unfilteredResourceOptions;
+// `Q16@0:8`: the size of the allocation the resource lies in.
+- (uint64_t)resourceSize;
+// `^v16@0:8`: the CPU's address of the resource's memory.
+- (nullable void *)virtualAddress;
+@end
+
+@protocol RgfxMetalBufferInternals <RgfxMetalResourceInternals>
+// `^{__IOSurface=}16@0:8`: the surface a buffer made over one lies in.
+- (nullable IOSurfaceRef)iosurface;
+// `@48@0:8@16Q24Q32Q40`: a texture over the buffer's bytes, as newTextureWithDescriptor:offset:
+// bytesPerRow: makes one, which takes a 2D array too, its slices `bytesPerImage` apart.
+- (nullable id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                                  offset:(NSUInteger)offset
+                                             bytesPerRow:(NSUInteger)bytesPerRow
+                                           bytesPerImage:(NSUInteger)bytesPerImage;
+@end
+
 @protocol RgfxMetalHeapInternals
 // `Q16@0:8`: the heap's base address, where a resource at offset 0 lies.
 - (uint64_t)gpuAddress;

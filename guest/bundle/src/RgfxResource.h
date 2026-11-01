@@ -93,6 +93,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// The bytes rgfxHoldHeapRange: held, given back or not; 0 for a resource it never held.
 @property(nonatomic, readonly) uint64_t rgfxHeapRangeSize;
+/// Where in its heap the resource lies: the offset its Automatic heap placed it at, else its
+/// heapOffset. 0 for a resource in no heap.
+@property(nonatomic, readonly) uint64_t rgfxHeapPlacement;
 
 #ifdef __cplusplus
 /// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY), then runs `after`
@@ -114,7 +117,72 @@ NS_ASSUME_NONNULL_BEGIN
 /// The resource SPI's content protection (RgfxMetalPrivate.h): none.
 - (uint64_t)protectionOptions;
 
+/// What the resource SPI members a buffer and a texture share answer (RGFX_RESOURCE_SPI):
+/// the id of the allocation the resource lies in, its heap's, else one of its own;
+@property(nonatomic, readonly) uint64_t rgfxAllocationId;
+/// the heap its memory lies in, with the offset and the bytes it takes there, nil for none;
+- (nullable id<MTLHeap>)rgfxSpanOffset:(uint64_t *)offset size:(uint64_t *)size;
+/// and whether the purgeable state it keeps is Volatile or Empty.
+@property(nonatomic, readonly) BOOL rgfxIsPurgeable;
 @end
+
+#ifdef __cplusplus
+/// Whether `a`'s memory meets `b`'s: both lie in one heap over byte ranges that meet.
+BOOL RgfxResourcesAlias(RgfxResource *a, id _Nullable b);
+#endif
+
+/// The resource SPI members (RgfxMetalPrivate.h) a buffer and a texture answer alike, as Metal's
+/// (measured on the M3 Max under macOS 27):
+///  - allocationID: the id of the allocation it lies in, which a heap's resources share;
+///  - doesAliasResource: YES only where both lie in one heap over byte ranges that meet, so a
+///    resource in no heap aliases nothing, itself included; doesAliasAllResources:count: and
+///    doesAliasAnyResources:count: ask it of each of a list (YES and NO for an empty one);
+///  - isComplete and isWriteComplete YES, even while a command buffer that writes it is in
+///    flight, and waitUntilComplete returns at once;
+///  - isPurgeable YES once made Volatile or Empty, NO before and once NonVolatile again.
+/// The macro goes in the class's @implementation.
+#define RGFX_RESOURCE_SPI                                                                          \
+	-(uint64_t)allocationID                                                                        \
+	{                                                                                              \
+		return self.rgfxAllocationId;                                                              \
+	}                                                                                              \
+	-(BOOL)doesAliasResource : (id<MTLResource>)resource                                           \
+	{                                                                                              \
+		return RgfxResourcesAlias(self, resource);                                                 \
+	}                                                                                              \
+	-(BOOL)doesAliasAllResources : (const id<MTLResource> _Nonnull[_Nullable])resources count      \
+	    : (NSUInteger)count                                                                        \
+	{                                                                                              \
+		for (NSUInteger i = 0; i < count; i++) {                                                   \
+			if (!RgfxResourcesAlias(self, resources[i]))                                           \
+				return NO;                                                                         \
+		}                                                                                          \
+		return YES;                                                                                \
+	}                                                                                              \
+	-(BOOL)doesAliasAnyResources : (const id<MTLResource> _Nonnull[_Nullable])resources count      \
+	    : (NSUInteger)count                                                                        \
+	{                                                                                              \
+		for (NSUInteger i = 0; i < count; i++) {                                                   \
+			if (RgfxResourcesAlias(self, resources[i]))                                            \
+				return YES;                                                                        \
+		}                                                                                          \
+		return NO;                                                                                 \
+	}                                                                                              \
+	-(BOOL)isComplete                                                                              \
+	{                                                                                              \
+		return YES;                                                                                \
+	}                                                                                              \
+	-(BOOL)isWriteComplete                                                                         \
+	{                                                                                              \
+		return YES;                                                                                \
+	}                                                                                              \
+	-(void)waitUntilComplete                                                                       \
+	{                                                                                              \
+	}                                                                                              \
+	-(BOOL)isPurgeable                                                                             \
+	{                                                                                              \
+		return self.rgfxIsPurgeable;                                                               \
+	}
 
 /// The options Metal answers for an object made with `options`: a Default hazard tracking mode is
 /// `fallback`, as Metal resolves it as it makes the object (Untracked for a heap, Tracked for a
