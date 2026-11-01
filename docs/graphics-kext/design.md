@@ -491,7 +491,16 @@ is refused at its op, and nothing of it is made. A create the guest waits on (a
 pipeline's reflection, a library create or lookup, a queue's create, a
 context's close) is answered at that op: a refused `PIPELINE_REFLECTION`, or a
 `COMPLETE` with the refusal's status, so no guest thread waits out the kext's
-timeout. A refused command buffer completes with an error status. Nothing in
+timeout. A refused command buffer completes with an error status, as a buffer
+Metal could not run does: a stand-in on its queue, holding the buffer's event
+waits and signals alone, finishes in the queue's order, and its completion
+posts the values the buffer signalled its shared events to, then the buffer's
+internal-error `CB_COMPLETE`. So a buffer that names a pipeline the host
+refused, or anything else it does not hold, fails after the buffers committed
+before it, and nothing waiting for one of its events, a later buffer on the
+GPU or a guest thread, waits for good. Where there is no stand-in (a message
+too short to name its queue, a queue the process does not hold, a context
+whose work is refused), the error status is posted at once. Nothing in
 this lane ends the offending context or its process on malformed input. The
 host runs each op in a refusal scope (`reims_vgpu_core::raise::refusals`): a
 death at a platform call, where the platform refuses a create or an encode and

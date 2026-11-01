@@ -26,7 +26,9 @@
 //! open encoder, a reference to an object the host does not hold — faults the exec
 //! ([`op_fault`], [`bad_reference`](super)), since the stream is already running on
 //! the GPU's queue; the ring loop's handler turns the fault into a command-buffer
-//! error.
+//! error. Either way the buffer is stood in for on its queue by its event ops alone
+//! ([`GraphicsDecoder::stand_in_for_failed`]), whose completion posts the buffer's
+//! failure in the queue's order, with the shared event values it signals ahead of it.
 
 use std::sync::Arc;
 
@@ -45,7 +47,9 @@ use reims_graphics::wire::{RGFX_EVT_EVENT_SIGNALLED, RgfxEventSignalled, RgfxMsg
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
+use reims_vgpu_core::platform::command::{
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo,
+};
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -58,7 +62,7 @@ use reims_vgpu_core::platform::values::{
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
-use super::super::completion::cb_complete;
+use super::super::completion::{cb_complete, cb_failed};
 use super::{
     DecodeError, Drain, GraphicsDecoder, ObjHandle, blit, compute, op_fault, read, refusing, render,
 };
@@ -75,6 +79,26 @@ struct EventOps {
     signals: Vec<(u64, u64)>,
     /// Each (event, value) the buffer waits for, in stream order.
     waits: Vec<(u64, u64)>,
+}
+
+/// The event ops of the op stream `ops`, in stream order: whether each signals (else it waits),
+/// and its body. The scan stops at an op it cannot step past, as the walk does.
+fn event_ops(mut ops: &[u8]) -> Vec<(bool, RgfxOpEvent)> {
+    let mut out = Vec::new();
+    while let Some(h) = read::<RgfxOpHeader>(ops) {
+        let len = h.len as usize;
+        if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
+            break;
+        }
+        if matches!(h.tag, RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT)
+            && let Ok((op, _)) =
+                RgfxOpEvent::read_from_prefix(&ops[RGFX_OP_BODY_OFFSET as usize..len])
+        {
+            out.push((h.tag == RGFX_OP_SIGNAL_EVENT, op));
+        }
+        ops = &ops[len..];
+    }
+    out
 }
 
 /// The encoder the walk currently holds open, one at a time, between an
@@ -151,52 +175,119 @@ impl<P: Platform> GraphicsDecoder<P> {
         // Register the completion path and commit. The GPU start and end times are
         // 0 here; the ring loop fills them when it posts the record on the queue's
         // completion ring in a later increment.
-        let cb_obj_id = m.cb_obj_id;
-        let seqno = m.header.seqno;
+        let handler = self.completed_handler(m.cb_obj_id, m.header.seqno, events, drain, false);
+        cb.add_completed_handler(ON, handler)?;
+        cb.commit(ON)?;
+        Ok(Ok(()))
+    }
+
+    /// Stands in for the `COMMAND_BUFFER` `message` the decoder could not carry out (refused, or
+    /// faulted at an op: a draw with a pipeline the host refused among them), as a buffer Metal
+    /// could not run still finishes: a command buffer on its queue holding the buffer's event ops
+    /// alone, each wait and signal of an event its process holds, in stream order. Its completion
+    /// posts the shared event values signalled and then the buffer's failure ([`cb_failed`]), so
+    /// the failure comes in its queue's order, once the buffers committed before it finish, and
+    /// nothing waiting for one of its values, on the GPU or in the guest, waits for good.
+    /// `Ok(false)` where there is none, and the caller posts the failure at once: a message too
+    /// short to name its queue, a queue the process does not hold or that makes no command
+    /// buffer, and a context whose work is refused ([`Self::context_failed`]).
+    pub(crate) fn stand_in_for_failed(&mut self, message: &[u8]) -> RaiseResult<bool> {
+        let Some(m) = read::<RgfxCommandBuffer>(message) else {
+            return Ok(false);
+        };
+        if self.context_failed() {
+            return Ok(false);
+        }
+        // The buffer's context's drain, held until the stand-in's completion handler has run.
+        let drain =
+            (self.context).map(|context| Arc::clone(self.drains.entry(context).or_default()));
+        let Some(ObjHandle::CommandQueue(queue)) = self.named(m.queue_obj_id) else {
+            return Ok(false);
+        };
+        let Some(cb) = queue.command_buffer(ON)? else {
+            return Ok(false);
+        };
+        let start = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
+        let ops = message.get(start..).unwrap_or_default();
+        let ops = &ops[..usize::try_from(m.op_bytes).map_or(ops.len(), |n| n.min(ops.len()))];
+        let mut events = EventOps::default();
+        for (signal, op) in event_ops(ops) {
+            let (event, shared) = match self.named(op.event_obj_id) {
+                Some(ObjHandle::Event(e)) => (EventRef::Event(e), false),
+                Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), true),
+                _ => continue,
+            };
+            if signal {
+                cb.encode_signal(Some(event), op.value)?;
+                if shared {
+                    events.signals.push((op.event_obj_id, op.value));
+                }
+            } else {
+                cb.encode_wait(Some(event), op.value)?;
+                events.waits.push((op.event_obj_id, op.value));
+            }
+        }
+        let handler = self.completed_handler(m.cb_obj_id, m.header.seqno, events, drain, true);
+        cb.add_completed_handler(ON, handler)?;
+        cb.commit(ON)?;
+        Ok(true)
+    }
+
+    /// The completion handler of command buffer `cb_obj_id`, at `seqno`, whose op stream did
+    /// `events`: it posts the values the buffer signalled its shared events to, then its
+    /// completion, which for a `stand_in` ([`Self::stand_in_for_failed`]) is its failure whatever
+    /// the stand-in's outcome, and lets `drain` (its context's) go.
+    fn completed_handler(
+        &self,
+        cb_obj_id: u64,
+        seqno: u64,
+        events: EventOps,
+        drain: Option<Arc<Drain>>,
+        stand_in: bool,
+    ) -> CompletedHandler {
         let sink = self.completion_sink.clone();
         let signal_sink = self.signal_sink.clone();
         let (failed, context) = (Arc::clone(&self.failed), self.context);
         let signals = events.signals;
         let watched = (!events.waits.is_empty())
             .then(|| self.waits.watch(cb_obj_id, seqno, context, events.waits));
-        cb.add_completed_handler(
-            ON,
-            Box::new(move |info: CompletedInfo| {
-                // The platform refused the buffer's completion on its own thread (a death in its
-                // read, in the scope this decode carried there): the buffer fails, and so does its
-                // context, whose later work is refused until its close.
-                if info.is_refused()
-                    && let Some(context) = context
-                    && failed.fail(context)
-                {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "context {context}'s command buffer {cb_obj_id:#x} (seqno {seqno}) failed \
-                         off its op's thread: the context's later work is refused until its close"
-                    );
+        Box::new(move |info: CompletedInfo| {
+            // The platform refused the buffer's completion on its own thread (a death in its
+            // read, in the scope this decode carried there): the buffer fails, and so does its
+            // context, whose later work is refused until its close.
+            if info.is_refused()
+                && let Some(context) = context
+                && failed.fail(context)
+            {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "context {context}'s command buffer {cb_obj_id:#x} (seqno {seqno}) failed \
+                     off its op's thread: the context's later work is refused until its close"
+                );
+            }
+            if let Some(waiting) = &watched {
+                waiting.finished();
+            }
+            // The shared events the buffer signalled, ahead of its completion, so the guest
+            // has each value before the buffer's handlers run. A buffer that failed may have
+            // signalled them before its fault, and a guest waiting for one would wait for
+            // good: each is posted whatever the outcome.
+            if let Some(signal_sink) = &signal_sink {
+                for &(obj_id, value) in &signals {
+                    signal_sink(event_signalled(obj_id, value));
                 }
-                if let Some(waiting) = &watched {
-                    waiting.finished();
-                }
-                // The shared events the buffer signalled, ahead of its completion, so the guest
-                // has each value before the buffer's handlers run. A buffer that failed may have
-                // signalled them before its fault, and a guest waiting for one would wait for
-                // good: each is posted whatever the outcome.
-                if let Some(signal_sink) = &signal_sink {
-                    for &(obj_id, value) in &signals {
-                        signal_sink(event_signalled(obj_id, value));
-                    }
-                }
-                let record = cb_complete(cb_obj_id, seqno, 0, 0, info.error.as_ref());
-                if let Some(sink) = &sink {
-                    sink(record);
-                }
-                // The buffer's work and its completion are done: a drain of its context may end.
-                drop(drain);
-            }),
-        )?;
-        cb.commit(ON)?;
-        Ok(Ok(()))
+            }
+            let record = if stand_in {
+                cb_failed(cb_obj_id, seqno)
+            } else {
+                cb_complete(cb_obj_id, seqno, 0, 0, info.error.as_ref())
+            };
+            if let Some(sink) = &sink {
+                sink(record);
+            }
+            // The buffer's work and its completion are done: a drain of its context may end.
+            drop(drain);
+        })
     }
 
     /// Walks the op stream `ops` on the command buffer `cb`. `Ok(Err(..))` for a
@@ -1073,6 +1164,86 @@ mod tests {
                 (RGFX_EVT_CB_COMPLETE, 110, 0)
             ]
         );
+    }
+
+    /// A buffer that faults at an op is stood in for on its queue by one of its event ops alone,
+    /// the waits and signals of the events the decoder holds, in stream order: its completion
+    /// posts the shared event's value, then the buffer's failure. A buffer naming no queue the
+    /// decoder holds has no stand-in.
+    #[test]
+    fn a_faulted_command_buffer_is_stood_in_for_by_its_event_ops() {
+        use reims_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
+        };
+        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        let (p, mut dec) = setup();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            signals.lock().push((m.header.r#type, m.obj_id, m.value));
+        }));
+        let completions = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, u64::from(m.status)));
+        }));
+
+        let mut ops = event_op(RGFX_OP_WAIT_EVENT, 6, 1);
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 9));
+        ops.extend(op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        ));
+        // Pipeline 99 is nothing the decoder holds: the walk faults here.
+        ops.extend(op(
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState {
+                pipeline_obj_id: 99,
+            }
+            .as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 99, 3));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 10));
+        let message = command_buffer_message(120, 60, &ops);
+        assert!(dec.decode(&device, &message).is_err());
+        assert!(posted.lock().is_empty());
+
+        let mark = p.call_log().mark();
+        assert!(dec.stand_in_for_failed(&message).unwrap());
+        let want = [
+            "commandBuffer",
+            "encodeWaitForEvent:value:",
+            "encodeSignalEvent:value:",
+            "encodeSignalEvent:value:",
+            "addCompletedHandler:",
+            "commit",
+        ];
+        let got: Vec<&str> = p
+            .call_log()
+            .sels_since(mark)
+            .into_iter()
+            .filter(|s| want.contains(s) || s.contains("Encoder"))
+            .collect();
+        assert_eq!(got, want);
+        assert!(posted.lock().is_empty());
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 9),
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 10),
+                (RGFX_EVT_CB_COMPLETE, 120, u64::from(RGFX_CB_INTERNAL)),
+            ]
+        );
+
+        let mut elsewhere = command_buffer_message(121, 61, &ops);
+        let queue = std::mem::offset_of!(RgfxCommandBuffer, queue_obj_id);
+        elsewhere[queue..queue + 8].copy_from_slice(&99u64.to_le_bytes());
+        assert!(!dec.stand_in_for_failed(&elsewhere).unwrap());
     }
 
     /// An event op with an encoder open faults the exec, as does one naming no event.

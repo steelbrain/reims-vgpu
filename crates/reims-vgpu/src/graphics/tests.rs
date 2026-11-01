@@ -2486,6 +2486,177 @@ fn an_encode_the_platform_refuses_fails_its_command_buffer() {
     assert_eq!(done.status, RGFX_CB_OK);
 }
 
+/// A `SHARED_EVENT_CREATE` of shared event `obj_id`, at `initial_value`.
+fn shared_event_create(obj_id: u64, initial_value: u64) -> Vec<u8> {
+    RgfxSharedEventCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+            size: size_of::<RgfxSharedEventCreate>() as u32,
+            seqno: 0,
+        },
+        obj_id,
+        initial_value,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` that signals shared event `event` to 4,
+/// draws with render pipeline `pipeline` in a pass of no attachments, and signals `event` to 5.
+fn render_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64, event: u64) -> Vec<u8> {
+    use reims_graphics::ops::render::{
+        RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+        RgfxOpDrawPrimitives, RgfxOpSetRenderPipelineState,
+    };
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SIGNAL_EVENT,
+        RGFX_PASS_FLAG_RT_SIZE, RgfxOpEvent, RgfxOpHeader, RgfxRenderPassDesc,
+    };
+    let op = |tag: u16, body: &[u8]| {
+        let mut bytes = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: (8 + body.len()) as u32,
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let signal = |value: u64| {
+        op(
+            RGFX_OP_SIGNAL_EVENT,
+            RgfxOpEvent {
+                event_obj_id: event,
+                value,
+            }
+            .as_bytes(),
+        )
+    };
+    let mut ops = signal(4);
+    ops.extend(op(
+        RGFX_OP_ENCODER_BEGIN_RENDER,
+        RgfxRenderPassDesc {
+            flags: RGFX_PASS_FLAG_RT_SIZE,
+            render_target_width: 64,
+            render_target_height: 64,
+            ..RgfxRenderPassDesc::default()
+        }
+        .as_bytes(),
+    ));
+    ops.extend(op(
+        RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+        RgfxOpSetRenderPipelineState {
+            pipeline_obj_id: pipeline,
+        }
+        .as_bytes(),
+    ));
+    ops.extend(op(
+        RGFX_OP_RENDER_DRAW_PRIMITIVES,
+        RgfxOpDrawPrimitives {
+            primitive_type: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+        }
+        .as_bytes(),
+    ));
+    ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+    ops.extend(signal(5));
+    let mut bytes = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        queue_obj_id,
+        cb_obj_id,
+        op_bytes: ops.len() as u64,
+    }
+    .as_bytes()
+    .to_vec();
+    bytes.extend(ops);
+    bytes
+}
+
+/// A command buffer the host cannot carry out, one whose draw sets a render pipeline the host
+/// refused, fails as a buffer Metal could not run does: in its queue's order, once the buffers
+/// committed before it have finished, and with the shared event values it signals posted ahead
+/// of its failure, so nothing waiting for one of them waits for good. The buffer after it runs
+#[test]
+fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_events() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, shared_event_create(obj(3, 20), 0));
+    make_library(&device, &mut guest, obj(3, 10));
+    platform.faults().at(
+        "MTLDevice",
+        "newRenderPipelineStateWithDescriptor:error:",
+        0,
+        Fault::Crash,
+    );
+    guest.send(&device, render_pipeline_create(obj(3, 11), obj(3, 10)));
+    expect_reflection(&mut guest, obj(3, 11), RGFX_PIPELINE_REFUSED);
+
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(3, 1), 100));
+    ring.send(
+        &device,
+        render_command_buffer(obj(3, 1), 101, obj(3, 11), obj(3, 20)),
+    );
+    ring.send(&device, command_buffer(obj(3, 1), 102));
+    // Three buffers wait on the GPU, the refused one's stand-in among them, and nothing is
+    // answered before the first finishes.
+    committed(&platform, 3);
+    assert!(
+        !ring.has_event(),
+        "a buffer was answered before the one before it finished"
+    );
+
+    platform.world().complete_all(CompleteOn::Caller);
+    let mut got = Vec::new();
+    for _ in 0..5 {
+        let bytes = ring
+            .event()
+            .expect("an event on the queue's completion ring");
+        let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
+        got.push(match header.r#type {
+            RGFX_EVT_CB_COMPLETE => {
+                let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
+                (header.r#type, done.cb_obj_id, u64::from(done.status))
+            }
+            RGFX_EVT_EVENT_SIGNALLED => {
+                let signalled = RgfxEventSignalled::read_from_bytes(&bytes).unwrap();
+                (header.r#type, signalled.obj_id, signalled.value)
+            }
+            other => panic!("event {other:#x} on the queue's completion ring"),
+        });
+    }
+    assert_eq!(
+        got,
+        [
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(3, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(3, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_INTERNAL)),
+            (RGFX_EVT_CB_COMPLETE, 102, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert!(!ring.has_event());
+}
+
 /// A `TEXTURE_FROM_IOSURFACE`: a BGRA8 texture `width` pixels square at resource id
 /// `resource_id`, over the start of `buffer`, naming plane 0 of IOSurface `iosurface`, its copy's
 /// writers `writers_offset` bytes into the buffer.

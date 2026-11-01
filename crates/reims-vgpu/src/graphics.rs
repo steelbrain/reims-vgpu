@@ -477,8 +477,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ring's completion ring (through `poster`) for the decode, so a buffer's completion handler,
     /// running on a GPU thread, posts its `CB_COMPLETE` on its queue's ring, and a pipeline
     /// create's reflection lands on ring 0's, each raising its ring's MSI-X vector. A command
-    /// buffer the host could not carry out owes the guest a completion that no handler will post,
-    /// so the host posts an internal-error one onto the queue's ring here.
+    /// buffer the host could not carry out owes the guest a completion that no handler will post:
+    /// a stand-in on its queue posts an internal-error one in the queue's order, with the values
+    /// the buffer signalled its shared events to ahead of it
+    /// ([`GraphicsDecoder::stand_in_for_failed`]), else the host posts it onto the queue's ring
+    /// here, at once.
     ///
     /// A pipeline or library create is made on the compile pool instead
     /// ([`Self::start_pipeline`], [`Self::start_library`]), and a command buffer that names a
@@ -545,12 +548,22 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     // A queue's destroy: nothing more of it finishes for a present to wait for.
                     self.presents.queue_gone(obj_id);
                 }
-                if foreign_queue(poster, message) {
+                let foreign = foreign_queue(poster, message);
+                let outcome = if foreign {
                     Ok(Err(DecodeError::BadReference))
                 } else {
                     refusing(|| decoder.decode(&self.device, message))
-                }
+                };
+                // A command buffer of the process's own queue that was not carried out is stood
+                // in for on that queue, which posts its failure in the queue's order, its shared
+                // event values ahead of it; else its failure is posted below, at once.
+                let stood_in = !matches!(outcome, Ok(Ok(())))
+                    && r#type == RGFX_CMD_COMMAND_BUFFER
+                    && !foreign
+                    && matches!(refusing(|| decoder.stand_in_for_failed(message)), Ok(true));
+                (outcome, stood_in)
             };
+            let (outcome, stood_in) = outcome;
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -560,7 +573,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                         "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                          carried out: {e:?}"
                     );
-                    self.fail_queue_command_buffer(poster, message);
+                    if !stood_in {
+                        self.fail_queue_command_buffer(poster, message);
+                    }
                 }
                 Err(raise) => {
                     let (ty, seqno, obj_id) = message_identity(message);
@@ -569,7 +584,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                         "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
                          {raise}"
                     );
-                    self.fail_queue_command_buffer(poster, message);
+                    if !stood_in {
+                        self.fail_queue_command_buffer(poster, message);
+                    }
                 }
             }
         });
