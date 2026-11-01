@@ -974,7 +974,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
+                    let made = buffer.new_texture(
+                        OnFault::Return,
+                        &descriptor,
+                        m.offset,
+                        m.bytes_per_row,
+                    )?;
+                    if made.is_none() {
+                        log_refused_texture(&TextureOverBuffer {
+                            obj_id: m.obj_id,
+                            buffer_obj_id: m.buffer_obj_id,
+                            buffer_length: buffer.length(),
+                            desc: &m.desc,
+                            offset: m.offset,
+                            bytes_per_row: m.bytes_per_row,
+                            bytes_per_image: None,
+                            surface: None,
+                        });
+                    }
+                    made
                 };
                 let span = self.span_of(m.buffer_obj_id);
                 match made {
@@ -997,12 +1015,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    buffer.new_linear_texture(
+                    let made = buffer.new_linear_texture(
                         &descriptor,
                         m.offset,
                         m.bytes_per_row,
                         m.bytes_per_image,
-                    )?
+                    )?;
+                    if made.is_none() {
+                        log_refused_texture(&TextureOverBuffer {
+                            obj_id: m.obj_id,
+                            buffer_obj_id: m.buffer_obj_id,
+                            buffer_length: buffer.length(),
+                            desc: &m.desc,
+                            offset: m.offset,
+                            bytes_per_row: m.bytes_per_row,
+                            bytes_per_image: Some(m.bytes_per_image),
+                            surface: None,
+                        });
+                    }
+                    made
                 };
                 let span = self.span_of(m.buffer_obj_id);
                 match made {
@@ -1047,7 +1078,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    buffer.new_texture(OnFault::Return, &descriptor, m.offset, m.bytes_per_row)?
+                    let made = buffer.new_texture(
+                        OnFault::Return,
+                        &descriptor,
+                        m.offset,
+                        m.bytes_per_row,
+                    )?;
+                    if made.is_none() {
+                        log_refused_texture(&TextureOverBuffer {
+                            obj_id: m.obj_id,
+                            buffer_obj_id: m.buffer_obj_id,
+                            buffer_length: buffer.length(),
+                            desc: &m.desc,
+                            offset: m.offset,
+                            bytes_per_row: m.bytes_per_row,
+                            bytes_per_image: None,
+                            surface: Some((m.iosurface_id, m.plane)),
+                        });
+                    }
+                    made
                 };
                 match made {
                     Some(texture) => {
@@ -2194,6 +2243,58 @@ fn texture_desc(d: &RgfxTextureDescriptor, resource_id: u64) -> TextureDesc {
     }
 }
 
+/// A texture over a buffer as its create asked for it (`TEXTURE_FROM_BUFFER`,
+/// `LINEAR_TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`), for the line that logs its refusal
+/// ([`log_refused_texture`]).
+struct TextureOverBuffer<'a> {
+    obj_id: u64,
+    buffer_obj_id: u64,
+    /// The buffer's length.
+    buffer_length: u64,
+    desc: &'a RgfxTextureDescriptor,
+    offset: u64,
+    bytes_per_row: u64,
+    /// A linear texture's bytes between its slices.
+    bytes_per_image: Option<u64>,
+    /// An IOSurface texture's surface id and plane.
+    surface: Option<(u32, u32)>,
+}
+
+/// Logs a texture over a buffer the platform made none of: it names no reason (Metal answers nil
+/// with none), so the line holds every argument the create gave it, from which its rules decide
+/// the refusal.
+fn log_refused_texture(t: &TextureOverBuffer<'_>) {
+    let d = t.desc;
+    let image = t
+        .bytes_per_image
+        .map_or_else(String::new, |bytes| format!(", {bytes} bytes an image"));
+    let surface = t.surface.map_or_else(String::new, |(id, plane)| {
+        format!(", IOSurface {id:#x} plane {plane}")
+    });
+    log::warn!(
+        target: "reims_vgpu::graphics",
+        "a texture (object {:#x}) over buffer {:#x} of {} bytes was refused: pixel format {}, \
+         type {}, {} x {} x {}, {} levels, array length {}, {} samples, usage {:#x}, resource \
+         options {:#x}, swizzle {:#010x}, at offset {}, {} bytes a row{image}{surface}",
+        t.obj_id,
+        t.buffer_obj_id,
+        t.buffer_length,
+        d.pixel_format,
+        d.texture_type,
+        d.width,
+        d.height,
+        d.depth,
+        d.mipmap_level_count,
+        d.array_length,
+        d.sample_count,
+        d.usage,
+        d.options,
+        d.swizzle,
+        t.offset,
+        t.bytes_per_row,
+    );
+}
+
 /// The core stencil descriptor for one face from its wire record.
 fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
     StencilDesc {
@@ -3295,6 +3396,166 @@ mod tests {
         assert_eq!(dec.decode(&device, grant(3, 0).as_bytes()).unwrap(), Ok(()));
         assert_eq!(made(&mut dec, obj(3, 1), 5), Ok(()));
         assert_eq!(made(&mut dec, obj(2, 7), 16319), Ok(()));
+    }
+
+    /// A texture over a buffer the platform makes none of (Metal's nil, which names no reason) is
+    /// refused with a warning naming every argument of its create: the descriptor, the offset and
+    /// rows, the buffer and its length, a linear texture's bytes between slices and an IOSurface
+    /// texture's surface and plane. A texture made logs nothing.
+    #[test]
+    fn a_refused_texture_over_a_buffer_logs_its_arguments() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(Region::new(0x10000).unwrap()),
+        );
+        let obj = |n: u64| (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let grant = RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context: 1,
+            chunk: 0,
+        };
+        assert_eq!(dec.decode(&device, grant.as_bytes()).unwrap(), Ok(()));
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(10),
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        let desc = RgfxTextureDescriptor {
+            pixel_format: 80,
+            texture_type: 2,
+            width: 64,
+            height: 48,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            usage: 5,
+            options: 0x10,
+            swizzle: 0x0504_0302,
+            ..RgfxTextureDescriptor::default()
+        };
+        let from_buffer = RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(11),
+            resource_id: 1,
+            buffer_obj_id: obj(10),
+            offset: 256,
+            bytes_per_row: 512,
+            desc,
+        };
+        let linear = RgfxLinearTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxLinearTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(12),
+            resource_id: 2,
+            buffer_obj_id: obj(10),
+            offset: 0,
+            bytes_per_row: 256,
+            bytes_per_image: 12288,
+            desc,
+        };
+        let from_surface = RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: size_of::<RgfxTextureFromIOSurface>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(13),
+            resource_id: 3,
+            buffer_obj_id: obj(10),
+            offset: 0,
+            bytes_per_row: 256,
+            iosurface_id: 0x2b,
+            plane: 1,
+            desc,
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
+        };
+        let logs = reims_vgpu_core::testkit::logs::capture();
+        let script = p.script();
+        script.push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
+        script.push(
+            "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:",
+            Step::Nil,
+        );
+        script.push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
+        for message in [
+            from_buffer.as_bytes(),
+            linear.as_bytes(),
+            from_surface.as_bytes(),
+        ] {
+            assert_eq!(
+                dec.decode(&device, message).unwrap(),
+                Err(DecodeError::Refused)
+            );
+        }
+        assert!(dec.surface_texture(0x2b).is_none());
+        let shape = "pixel format 80, type 2, 64 x 48 x 1, 1 levels, array length 1, 1 samples, \
+                     usage 0x5, resource options 0x10, swizzle 0x05040302";
+        let warned = |object: u64, rest: &str| {
+            (
+                log::Level::Warn,
+                "reims_vgpu::graphics".to_owned(),
+                format!(
+                    "a texture (object {:#x}) over buffer {:#x} of 65536 bytes was refused: \
+                     {shape}, {rest}",
+                    obj(object),
+                    obj(10)
+                ),
+            )
+        };
+        let lines: Vec<_> = logs
+            .take()
+            .into_iter()
+            .filter(|(level, ..)| *level == log::Level::Warn)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                warned(11, "at offset 256, 512 bytes a row"),
+                warned(12, "at offset 0, 256 bytes a row, 12288 bytes an image"),
+                warned(13, "at offset 0, 256 bytes a row, IOSurface 0x2b plane 1"),
+            ]
+        );
+
+        // Made, each logs nothing.
+        for message in [
+            RgfxTextureFromBuffer {
+                obj_id: obj(14),
+                ..from_buffer
+            }
+            .as_bytes(),
+            RgfxTextureFromIOSurface {
+                obj_id: obj(15),
+                ..from_surface
+            }
+            .as_bytes(),
+        ] {
+            assert_eq!(dec.decode(&device, message).unwrap(), Ok(()));
+        }
+        assert!(
+            logs.take()
+                .iter()
+                .all(|(level, ..)| *level != log::Level::Warn)
+        );
     }
 
     /// A decoder of a fake platform, its reflection replies, and library 1 made.
