@@ -58,6 +58,13 @@
 // A pass's `default_raster_sample_count` is set.
 #define RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT (1 << 2)
 
+// A pass's sample positions (`setSamplePositions:count:`) follow its colour attachment records,
+// as one [`RgfxRenderPassSamplePositions`].
+#define RGFX_PASS_FLAG_SAMPLE_POSITIONS (1 << 3)
+
+// The most sample positions a pass holds: Metal's largest sample count.
+#define RGFX_PASS_MAX_SAMPLE_POSITIONS 16
+
 // Where the colour attachment array starts in an `ENCODER_BEGIN_RENDER` op's
 // body: right after the fixed [`RgfxRenderPassDesc`].
 #define RGFX_RENDER_PASS_COLOR_OFFSET 152
@@ -601,6 +608,10 @@
 // Op `USE_RESOURCES_STAGES` ([`RgfxOpUseResourcesStages`]):
 // `useResources:count:usage:stages:`.
 #define RGFX_OP_RENDER_USE_RESOURCES_STAGES 4174
+
+// Op `SET_DEPTH_STORE_ACTION_OPTIONS` ([`RgfxOpSetDepthStoreActionOptions`]):
+// `setDepthStoreActionOptions:`.
+#define RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS 4175
 
 // The device's PCI vendor ID: a placeholder until the owner picks the device's own.
 #define RGFX_PCI_VENDOR_ID 4660
@@ -3248,6 +3259,12 @@ typedef struct {
   uint64_t store_action;
 } RgfxOpSetDepthStoreAction;
 
+// `setDepthStoreActionOptions:`.
+typedef struct {
+  // `MTLStoreActionOptions`.
+  uint64_t store_action_options;
+} RgfxOpSetDepthStoreActionOptions;
+
 // `setFragmentBuffer:offset:atIndex:`. The buffer may be nil (`0`).
 typedef struct {
   // The buffer, or 0 for nil.
@@ -3864,6 +3881,18 @@ typedef struct {
   // The stencil attachment (absent when its `texture_obj_id` is 0).
   RgfxRenderPassStencilAttachment stencil;
 } RgfxRenderPassDesc;
+
+// A pass's sample positions, after its colour attachment records where the pass's flags hold
+// [`RGFX_PASS_FLAG_SAMPLE_POSITIONS`]: the `count` positions the pass descriptor holds
+// (`getSamplePositions:count:`), each coordinate as the bits of its `f32`; the rest 0.
+typedef struct {
+  // The positions set, at most [`RGFX_PASS_MAX_SAMPLE_POSITIONS`].
+  uint32_t count;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+  // Each position's `x` then `y`, as `f32` bits.
+  uint32_t position_bits[RGFX_PASS_MAX_SAMPLE_POSITIONS][2];
+} RgfxRenderPassSamplePositions;
 
 // `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor, answered by
 // [`RgfxPipelineReflection`] on the queue's completion ring with this create's

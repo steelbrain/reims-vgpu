@@ -215,6 +215,9 @@ impl RenderEncoder<FakePlatform> for Fk<kind::RenderEncoder> {
             RenderCmd::SetDepthStoreAction { store_action } => {
         self.act(Policy::Caught, sel, vec![Arg::U64(store_action)])
     }
+            RenderCmd::SetDepthStoreActionOptions { store_action_options } => {
+        self.act(Policy::Caught, sel, vec![Arg::U64(store_action_options)])
+    }
             RenderCmd::SetFragmentBuffer { buffer, offset, index } => {
         self.act(Policy::Fatal,
             sel,

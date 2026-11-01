@@ -2948,6 +2948,14 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     e.set_stencil_store_action_options(options)
                 })
             }
+            RenderCmd::SetDepthStoreActionOptions {
+                store_action_options: raw,
+            } => {
+                let options = store_action_options(sel, raw);
+                self.late_options(sel, Attachment::Depth, options, &mut |e| {
+                    e.set_depth_store_action_options(options)
+                })
+            }
             RenderCmd::SetTessellationFactorBuffer {
                 buffer,
                 offset,

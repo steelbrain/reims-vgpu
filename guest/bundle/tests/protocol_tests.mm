@@ -86,7 +86,7 @@ struct QueueFixture {
 	RgfxRegion region;
 	RgfxCommandQueue *queue;
 
-	QueueFixture()
+	explicit QueueFixture(id<MTLDevice> device = nil)
 	    : control(0x8000),
 	      controlWriter(control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
 	                    nullptr),
@@ -103,7 +103,7 @@ struct QueueFixture {
 		                             completeDataSize:0
 		                                          ids:&ids
 		                                     maxCount:0
-		                                       device:nil
+		                                       device:device
 		                                   serializer:&ser];
 		CHECK(queue != nil);
 		queue.replyReader = &reader;
@@ -522,6 +522,123 @@ void test_render_tile_size()
 	fx.complete(cb, seqno);
 }
 
+// --- programmable sample positions ---------------------------------------------------
+
+} // namespace
+
+// A device that answers only which texture sample counts it makes: 1, 2 and 4, as the M3 Max's.
+@interface RgfxSampleCountDevice : NSObject
+- (BOOL)supportsTextureSampleCount:(NSUInteger)sampleCount;
+@end
+@implementation RgfxSampleCountDevice
+- (BOOL)supportsTextureSampleCount:(NSUInteger)sampleCount
+{
+	return sampleCount == 1 || sampleCount == 2 || sampleCount == 4;
+}
+@end
+
+namespace {
+
+// The sample positions record after the pass's colour records in a BEGIN_RENDER body; its count
+// is 0 where the pass flag is clear.
+RgfxRenderPassSamplePositions passPositions(const Op &begin)
+{
+	RgfxRenderPassSamplePositions p = {};
+	const RgfxRenderPassDesc d = begin.as<RgfxRenderPassDesc>();
+	const size_t at = RGFX_RENDER_PASS_COLOR_OFFSET +
+	                  static_cast<size_t>(d.color_count) * sizeof(RgfxRenderPassColorAttachment);
+	if ((d.flags & RGFX_PASS_FLAG_SAMPLE_POSITIONS) == 0) {
+		CHECK(begin.body.size() == at);
+		return p;
+	}
+	CHECK(begin.body.size() == at + sizeof(p));
+	if (begin.body.size() >= at + sizeof(p))
+		std::memcpy(&p, begin.body.data() + at, sizeof(p));
+	return p;
+}
+
+bool positionIs(const RgfxRenderPassSamplePositions &p, uint32_t i, float x, float y)
+{
+	float gx, gy;
+	std::memcpy(&gx, &p.position_bits[i][0], sizeof(gx));
+	std::memcpy(&gy, &p.position_bits[i][1], sizeof(gy));
+	return gx == x && gy == y;
+}
+
+// A pass's sample positions travel after its colour records, in render and parallel passes; a
+// pass without them carries none, and a count the device makes no texture of answers no encoder
+// and sends nothing, as Metal's validation stops it. setDepthStoreActionOptions: is its op.
+void test_sample_positions()
+{
+	RgfxSampleCountDevice *device = [RgfxSampleCountDevice new];
+	QueueFixture fx((id<MTLDevice>)device);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO];
+	td.textureType = MTLTextureType2DMultisample;
+	td.sampleCount = 4;
+	RgfxTexture *target = shapeTexture(td, 0x42);
+	const MTLSamplePosition four[4] = {
+	    MTLSamplePositionMake(0.125f, 0.375f), MTLSamplePositionMake(0.625f, 0.125f),
+	    MTLSamplePositionMake(0.375f, 0.875f), MTLSamplePositionMake(0.875f, 0.625f)};
+	const MTLSamplePosition two[2] = {MTLSamplePositionMake(0.25f, 0.25f),
+	                                  MTLSamplePositionMake(0.75f, 0.75f)};
+	MTLSamplePosition eight[8];
+	for (int i = 0; i < 8; i++)
+		eight[i] = MTLSamplePositionMake((i + 0.5f) / 8.0f, (7 - i + 0.5f) / 8.0f);
+
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	MTLRenderPassDescriptor *rp = onePass(target);
+	[rp setSamplePositions:four count:4];
+	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:rp];
+	CHECK(renc != nil);
+	[renc setDepthStoreActionOptions:MTLStoreActionOptionCustomSamplePositions];
+	[renc endEncoding];
+	[rp setSamplePositions:two count:2];
+	id<MTLParallelRenderCommandEncoder> par = [cb parallelRenderCommandEncoderWithDescriptor:rp];
+	CHECK(par != nil);
+	[par setDepthStoreActionOptions:MTLStoreActionOptionNone];
+	[par endEncoding];
+	id<MTLRenderCommandEncoder> plain = [cb renderCommandEncoderWithDescriptor:onePass(target)];
+	[plain endEncoding];
+	[rp setSamplePositions:eight count:8];
+	CHECK([cb renderCommandEncoderWithDescriptor:rp] == nil);
+	CHECK([cb parallelRenderCommandEncoderWithDescriptor:rp] == nil);
+	[cb commit];
+
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	const Op *b0 = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 0);
+	const Op *b1 = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 1);
+	const Op *b2 = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 2);
+	CHECK(b0 != nullptr && b1 != nullptr && b2 != nullptr);
+	CHECK(findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 3) == nullptr); // the 8-sample passes
+	if (b0 != nullptr && b1 != nullptr && b2 != nullptr) {
+		const RgfxRenderPassSamplePositions p0 = passPositions(*b0);
+		CHECK(p0.count == 4);
+		CHECK(positionIs(p0, 0, 0.125f, 0.375f) && positionIs(p0, 1, 0.625f, 0.125f));
+		CHECK(positionIs(p0, 2, 0.375f, 0.875f) && positionIs(p0, 3, 0.875f, 0.625f));
+		CHECK(p0.position_bits[4][0] == 0 && p0.position_bits[15][1] == 0);
+		const RgfxRenderPassSamplePositions p1 = passPositions(*b1);
+		CHECK(p1.count == 2);
+		CHECK(positionIs(p1, 0, 0.25f, 0.25f) && positionIs(p1, 1, 0.75f, 0.75f));
+		CHECK(passPositions(*b2).count == 0);
+	}
+	const Op *o0 = findOp(ops, RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS, 0);
+	const Op *o1 = findOp(ops, RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS, 1);
+	CHECK(o0 != nullptr && o1 != nullptr);
+	if (o0 != nullptr && o1 != nullptr) {
+		CHECK(o0->body.size() == sizeof(RgfxOpSetDepthStoreActionOptions));
+		CHECK(o0->as<RgfxOpSetDepthStoreActionOptions>().store_action_options ==
+		      MTLStoreActionOptionCustomSamplePositions);
+		CHECK(o1->as<RgfxOpSetDepthStoreActionOptions>().store_action_options ==
+		      MTLStoreActionOptionNone);
+	}
+	fx.complete(cb, seqno);
+}
+
 // The members of features the device answers NO for do nothing on the wire: a nil or default
 // argument is exact and not logged; any other use is logged once.
 void test_encoders_unsupported()
@@ -541,16 +658,11 @@ void test_encoders_unsupported()
 	[renc setObjectBuffer:nil offset:0 atIndex:0];
 	[renc setDepthTestMinBound:0.0f maxBound:1.0f];
 	[renc setColorAttachmentMap:nil];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-	[renc setDepthStoreActionOptions:MTLStoreActionOptionNone];
-#pragma clang diagnostic pop
 	CHECK(!RgfxUnsupportedWasLogged(r, @selector(setVertexAccelerationStructure:atBufferIndex:)));
 	CHECK(!RgfxUnsupportedWasLogged(r, @selector(setFragmentVisibleFunctionTable:atBufferIndex:)));
 	CHECK(!RgfxUnsupportedWasLogged(r, @selector(setObjectBuffer:offset:atIndex:)));
 	CHECK(!RgfxUnsupportedWasLogged(r, @selector(setDepthTestMinBound:maxBound:)));
 	CHECK(!RgfxUnsupportedWasLogged(r, @selector(setColorAttachmentMap:)));
-	CHECK(!RgfxUnsupportedWasLogged(r, @selector(setDepthStoreActionOptions:)));
 	[renc setDepthTestMinBound:0.25f maxBound:0.5f];
 	[renc drawMeshThreads:MTLSizeMake(1, 1, 1)
 	    threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1)
@@ -1506,6 +1618,7 @@ void rgfxProtocolTests()
 	test_compute_dispatch_type();
 	test_blit_copy_texture_to_texture();
 	test_render_tile_size();
+	test_sample_positions();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();
 	test_texture_members();

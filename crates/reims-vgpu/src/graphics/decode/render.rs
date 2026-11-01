@@ -654,6 +654,15 @@ pub(crate) fn decode_op<P: Platform>(
                 },
             )?;
         }
+        RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS => {
+            let m: RgfxOpSetDepthStoreActionOptions = body(tag, payload)?;
+            enc.encode(
+                on,
+                RenderCmd::SetDepthStoreActionOptions {
+                    store_action_options: m.store_action_options,
+                },
+            )?;
+        }
         RGFX_OP_RENDER_SET_COLOR_STORE_ACTION => {
             let m: RgfxOpSetColorStoreAction = body(tag, payload)?;
             enc.encode(
@@ -1852,6 +1861,15 @@ mod tests {
                 "setStencilStoreActionOptions:",
             ),
             (
+                RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS,
+                RgfxOpSetDepthStoreActionOptions {
+                    store_action_options: 1,
+                }
+                .as_bytes()
+                .to_vec(),
+                "setDepthStoreActionOptions:",
+            ),
+            (
                 RGFX_OP_RENDER_SET_COLOR_STORE_ACTION,
                 RgfxOpSetColorStoreAction {
                     store_action: 1,
@@ -2388,7 +2406,7 @@ mod tests {
         let got = p.call_log().sels_since(mark);
         assert_eq!(got, expected);
         // The whole remaining set was exercised.
-        assert_eq!(expected.len(), 71);
+        assert_eq!(expected.len(), 72);
     }
 
     /// An array-tailed op resolves each element and passes the slices through: the

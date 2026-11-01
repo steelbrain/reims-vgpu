@@ -247,6 +247,8 @@ pub enum RenderCmd<'a, P: Platform> {
     },
     /// `setDepthStoreAction:`
     SetDepthStoreAction { store_action: u64 },
+    /// `setDepthStoreActionOptions:`
+    SetDepthStoreActionOptions { store_action_options: u64 },
     /// `setFragmentBuffer:offset:atIndex:`
     SetFragmentBuffer {
         buffer: Option<&'a P::Buffer>,
@@ -537,6 +539,7 @@ impl<P: Platform> RenderCmd<'_, P> {
             }
             Self::SetDepthStencilState { .. } => "setDepthStencilState:",
             Self::SetDepthStoreAction { .. } => "setDepthStoreAction:",
+            Self::SetDepthStoreActionOptions { .. } => "setDepthStoreActionOptions:",
             Self::SetFragmentBuffer { .. } => "setFragmentBuffer:offset:atIndex:",
             Self::SetFragmentBufferOffset { .. } => "setFragmentBufferOffset:atIndex:",
             Self::SetFragmentBuffers { .. } => "setFragmentBuffers:offsets:withRange:",

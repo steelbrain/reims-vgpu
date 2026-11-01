@@ -289,6 +289,44 @@ void noteRenderPassWrites(RgfxEncoder *enc, MTLRenderPassDescriptor *d)
 	note(d.stencilAttachment.resolveTexture);
 }
 
+/// The sample positions `d` holds (setSamplePositions:count:), as the pass's record carries them;
+/// false where it holds none, so the pass keeps the device's default positions. Metal's descriptor
+/// takes only counts of 2, 4 or 8 (measured on the M3 Max, macOS 27: any other count asserts in
+/// setSamplePositions:count:), all within the record's sixteen.
+bool fillSamplePositions(MTLRenderPassDescriptor *d, RgfxRenderPassSamplePositions *out)
+{
+	*out = {};
+	const NSUInteger n = [d getSamplePositions:NULL count:0];
+	if (n == 0 || n > RGFX_PASS_MAX_SAMPLE_POSITIONS)
+		return false;
+	MTLSamplePosition positions[RGFX_PASS_MAX_SAMPLE_POSITIONS];
+	[d getSamplePositions:positions count:n];
+	out->count = static_cast<uint32_t>(n);
+	for (NSUInteger i = 0; i < n; i++) {
+		std::memcpy(&out->position_bits[i][0], &positions[i].x, sizeof(uint32_t));
+		std::memcpy(&out->position_bits[i][1], &positions[i].y, sizeof(uint32_t));
+	}
+	return true;
+}
+
+/// Whether `device` takes the sample positions `p` of a pass. Metal's render pass validation fails
+/// an assertion at a count the device makes no texture of ("Custom sample positions were specified,
+/// but the device does not support the number of samples supplied": measured on the M3 Max, macOS
+/// 27, at 8), and takes any count it makes, whatever the attachments' sample count (4 positions on
+/// a 2-sample pass, 2 on a 4-sample or a 1-sample one). The bundle answers no encoder for the pass
+/// it refuses, sending nothing, and logs the first.
+bool rgfxTakesSamplePositions(id<MTLDevice> device, const RgfxRenderPassSamplePositions &p)
+{
+	if ([device supportsTextureSampleCount:p.count])
+		return true;
+	static std::atomic<bool> logged{false};
+	if (!logged.exchange(true))
+		NSLog(@"RGFX: a render pass of %u sample positions, a sample count the device does not "
+		      @"make: answered no encoder",
+		      p.count);
+	return false;
+}
+
 uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
                         std::vector<RgfxRenderPassColorAttachment> *colors)
 {
@@ -876,8 +914,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	RgfxRenderPassDesc desc = {};
 	std::vector<RgfxRenderPassColorAttachment> colors;
 	uint32_t count = fillRenderPass(renderPassDescriptor, &desc, &colors);
+	RgfxRenderPassSamplePositions positions;
+	const bool programmed = fillSamplePositions(renderPassDescriptor, &positions);
+	if (programmed && !rgfxTakesSamplePositions(self.device, positions))
+		return nil;
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
-	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count);
+	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
+	                          programmed ? &positions : nullptr);
 	RgfxRenderCommandEncoder *enc = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                          emitEnd:YES
 	                                                                           device:self.device];
@@ -939,8 +982,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	RgfxRenderPassDesc desc = {};
 	std::vector<RgfxRenderPassColorAttachment> colors;
 	uint32_t count = fillRenderPass(renderPassDescriptor, &desc, &colors);
+	RgfxRenderPassSamplePositions positions;
+	const bool programmed = fillSamplePositions(renderPassDescriptor, &positions);
+	if (programmed && !rgfxTakesSamplePositions(self.device, positions))
+		return nil;
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
-	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count);
+	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
+	                          programmed ? &positions : nullptr);
 	RgfxParallelRenderCommandEncoder *enc =
 	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
 	[enc rgfxSetUploads:_uploads];
@@ -1566,6 +1614,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	_enc->renderSetStencilStoreActionOptions(static_cast<uint64_t>(storeActionOptions));
 }
+- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)storeActionOptions
+{
+	_enc->renderSetDepthStoreActionOptions(static_cast<uint64_t>(storeActionOptions));
+}
 
 // --- vertex bindings ---------------------------------------------------------
 
@@ -2182,11 +2234,6 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 // --- unsupported: the device answers NO for these features -----------------------
 // A nil or default argument asks for nothing, so it is exact; any other is logged and dropped.
 
-- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)storeActionOptions
-{
-	if (storeActionOptions != MTLStoreActionOptionNone)
-		RGFX_UNSUPPORTED("depth store action options (no op on the wire)");
-}
 - (void)setDepthTestMinBound:(float)minBound maxBound:(float)maxBound
 {
 	if (minBound != 0.0f || maxBound != 1.0f)
@@ -3245,8 +3292,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 }
 - (void)setDepthStoreActionOptions:(MTLStoreActionOptions)storeActionOptions
 {
-	if (storeActionOptions != MTLStoreActionOptionNone)
-		RGFX_UNSUPPORTED("depth store action options (no op on the wire)");
+	_enc->renderSetDepthStoreActionOptions(static_cast<uint64_t>(storeActionOptions));
 }
 // Waits for every encoder made before this pass on the queue (QUEUE BARRIERS).
 - (void)barrierAfterQueueStages:(MTLStages)afterQueueStages beforeStages:(MTLStages)beforeStages

@@ -850,6 +850,75 @@ void test_ring_post_waits_for_room()
 	CHECK(ring.producer() == full + sizeof(msg));
 }
 
+// A pass's sample positions follow its colour records, and its flag says so; a pass without
+// them carries none, whatever flag its description held. The depth store action options are
+// one op.
+void test_render_pass_sample_positions()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+	RgfxRenderPassDesc pass = {};
+	RgfxRenderPassColorAttachment colors[2] = {};
+	colors[0].texture_obj_id = 4;
+	colors[1].texture_obj_id = 5;
+	RgfxRenderPassSamplePositions positions = {};
+	positions.count = 2;
+	const float xy[4] = {0.25f, 0.75f, 0.5625f, 0.125f};
+	std::memcpy(&positions.position_bits[0][0], &xy[0], 4);
+	std::memcpy(&positions.position_bits[0][1], &xy[1], 4);
+	std::memcpy(&positions.position_bits[1][0], &xy[2], 4);
+	std::memcpy(&positions.position_bits[1][1], &xy[3], 4);
+	enc.beginRenderPass(pass, colors, 2, &positions);
+	enc.renderSetDepthStoreActionOptions(1);
+	enc.endEncoder();
+	pass.flags = RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_RT_SIZE;
+	enc.beginRenderPass(pass, colors, 1);
+	enc.endEncoder();
+	uint64_t seqno = 0;
+	CHECK(enc.finish(&seqno));
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	RgfxCommandBuffer cb = {};
+	std::memcpy(&cb, bytes.data(), sizeof(cb));
+	OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes);
+	uint16_t tag = 0, flags = 0;
+	uint32_t len = 0;
+	const uint8_t *body = nullptr;
+	size_t body_len = 0;
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_ENCODER_BEGIN_RENDER);
+	const size_t colorEnd = RGFX_RENDER_PASS_COLOR_OFFSET + 2 * sizeof(RgfxRenderPassColorAttachment);
+	CHECK(body_len == colorEnd + sizeof(RgfxRenderPassSamplePositions));
+	RgfxRenderPassDesc got = {};
+	std::memcpy(&got, body, sizeof(got));
+	CHECK(got.flags == RGFX_PASS_FLAG_SAMPLE_POSITIONS && got.color_count == 2);
+	RgfxRenderPassSamplePositions gotPositions = {};
+	std::memcpy(&gotPositions, body + colorEnd, sizeof(gotPositions));
+	CHECK(std::memcmp(&gotPositions, &positions, sizeof(positions)) == 0);
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS);
+	CHECK(body_len == sizeof(RgfxOpSetDepthStoreActionOptions));
+	RgfxOpSetDepthStoreActionOptions options = {};
+	std::memcpy(&options, body, sizeof(options));
+	CHECK(options.store_action_options == 1);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_END);
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_ENCODER_BEGIN_RENDER);
+	CHECK(body_len == RGFX_RENDER_PASS_COLOR_OFFSET + sizeof(RgfxRenderPassColorAttachment));
+	std::memcpy(&got, body, sizeof(got));
+	CHECK(got.flags == RGFX_PASS_FLAG_RT_SIZE && got.color_count == 1);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_END);
+	CHECK(walk.done());
+}
+
 void test_command_buffer_encoder()
 {
 	TestRing ring(0x8000);
@@ -1686,6 +1755,7 @@ int main()
 	test_ring_wrap_and_no_room();
 	test_ring_post_waits_for_room();
 	test_command_buffer_encoder();
+	test_render_pass_sample_positions();
 	test_forwarded_lifecycle();
 	test_library_key();
 	test_keyed_library_messages();

@@ -131,11 +131,27 @@ bool RgfxEncoder::finishInRegion(volatile uint8_t *block, uint64_t region_offset
 // --- framing ----------------------------------------------------------------
 
 void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
-                                  const RgfxRenderPassColorAttachment *colors, uint32_t color_count)
+                                  const RgfxRenderPassColorAttachment *colors, uint32_t color_count,
+                                  const RgfxRenderPassSamplePositions *positions)
 {
 	desc.color_count = color_count;
-	appendArrayOp(RGFX_OP_ENCODER_BEGIN_RENDER, &desc, sizeof(desc), colors, color_count,
-	              sizeof(RgfxRenderPassColorAttachment));
+	if (positions == nullptr) {
+		desc.flags &= ~RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+		appendArrayOp(RGFX_OP_ENCODER_BEGIN_RENDER, &desc, sizeof(desc), colors, color_count,
+		              sizeof(RgfxRenderPassColorAttachment));
+		return;
+	}
+	desc.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+	const size_t colorBytes = static_cast<size_t>(color_count) * sizeof(RgfxRenderPassColorAttachment);
+	RgfxOpHeader h = {};
+	h.tag = RGFX_OP_ENCODER_BEGIN_RENDER;
+	h.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes +
+	                              sizeof(*positions));
+	appendBytes(&h, sizeof(h));
+	appendBytes(&desc, sizeof(desc));
+	if (colorBytes)
+		appendBytes(colors, colorBytes);
+	appendBytes(positions, sizeof(*positions));
 }
 
 void RgfxEncoder::beginComputePass()
@@ -543,6 +559,13 @@ void RgfxEncoder::renderSetStencilStoreActionOptions(uint64_t store_action_optio
 	RgfxOpSetStencilStoreActionOptions b = {};
 	b.store_action_options = store_action_options;
 	appendOp(RGFX_OP_RENDER_SET_STENCIL_STORE_ACTION_OPTIONS, &b, sizeof(b));
+}
+
+void RgfxEncoder::renderSetDepthStoreActionOptions(uint64_t store_action_options)
+{
+	RgfxOpSetDepthStoreActionOptions b = {};
+	b.store_action_options = store_action_options;
+	appendOp(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS, &b, sizeof(b));
 }
 
 void RgfxEncoder::renderSetColorStoreAction(uint64_t store_action, uint64_t color_attachment_index)

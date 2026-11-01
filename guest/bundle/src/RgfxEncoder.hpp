@@ -60,10 +60,12 @@ public:
 	// --- framing --------------------------------------------------------------
 
 	/// Opens a render encoder for `desc` and its `color_count`
-	/// [`RgfxRenderPassColorAttachment`] records. `desc.color_count` is set from
-	/// `color_count`, so the two always agree on the wire.
+	/// [`RgfxRenderPassColorAttachment`] records, then the pass's sample positions where
+	/// `positions` is not null. `desc.color_count` is set from `color_count`, and
+	/// `RGFX_PASS_FLAG_SAMPLE_POSITIONS` from `positions`, so each always agrees with what follows.
 	void beginRenderPass(RgfxRenderPassDesc desc, const RgfxRenderPassColorAttachment *colors,
-	                     uint32_t color_count);
+	                     uint32_t color_count,
+	                     const RgfxRenderPassSamplePositions *positions = nullptr);
 	/// Opens a compute encoder for Metal's default pass (empty body).
 	void beginComputePass();
 	/// Opens a compute encoder whose pass sets `MTLDispatchType` `dispatch_type`.
@@ -152,6 +154,7 @@ public:
 	void renderSetDepthStoreAction(uint64_t store_action);
 	void renderSetStencilStoreAction(uint64_t store_action);
 	void renderSetStencilStoreActionOptions(uint64_t store_action_options);
+	void renderSetDepthStoreActionOptions(uint64_t store_action_options);
 	void renderSetColorStoreAction(uint64_t store_action, uint64_t color_attachment_index);
 	void renderSetColorStoreActionOptions(uint64_t store_action_options,
 	                                      uint64_t color_attachment_index);

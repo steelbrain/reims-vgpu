@@ -241,6 +241,9 @@ pub const RGFX_OP_RENDER_USE_RESOURCES: u16 = 0x104d;
 /// Op `USE_RESOURCES_STAGES` ([`RgfxOpUseResourcesStages`]):
 /// `useResources:count:usage:stages:`.
 pub const RGFX_OP_RENDER_USE_RESOURCES_STAGES: u16 = 0x104e;
+/// Op `SET_DEPTH_STORE_ACTION_OPTIONS` ([`RgfxOpSetDepthStoreActionOptions`]):
+/// `setDepthStoreActionOptions:`.
+pub const RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS: u16 = 0x104f;
 
 // The resource-kind tags are shared across the encoder groups (defined once in the parent
 // module) so the guest-facing ABI has a single numbering.
@@ -802,6 +805,16 @@ pub struct RgfxOpSetStencilStoreAction {
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
 pub struct RgfxOpSetStencilStoreActionOptions {
+    /// `MTLStoreActionOptions`.
+    pub store_action_options: u64,
+}
+
+/// `setDepthStoreActionOptions:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetDepthStoreActionOptions {
     /// `MTLStoreActionOptions`.
     pub store_action_options: u64,
 }
@@ -1587,6 +1600,7 @@ const _: () = {
     assert!(size_of::<RgfxOpSetDepthStoreAction>() == 8);
     assert!(size_of::<RgfxOpSetStencilStoreAction>() == 8);
     assert!(size_of::<RgfxOpSetStencilStoreActionOptions>() == 8);
+    assert!(size_of::<RgfxOpSetDepthStoreActionOptions>() == 8);
     assert!(size_of::<RgfxOpSetColorStoreAction>() == 16);
     assert!(size_of::<RgfxOpSetColorStoreActionOptions>() == 16);
     assert!(size_of::<RgfxOpSetVisibilityResultMode>() == 16);
@@ -1644,8 +1658,10 @@ const _: () = {
     assert!(size_of::<RgfxOpUseResources>() == 16);
     assert!(size_of::<RgfxOpUseResourcesStages>() == 24);
     // Every new render tag stays in the render group and is unique within it.
-    assert!(super::op_group(RGFX_OP_RENDER_USE_RESOURCES_STAGES) == super::RGFX_OP_GROUP_RENDER);
-    assert!(RGFX_OP_RENDER_USE_RESOURCES_STAGES == 0x104e);
+    assert!(
+        super::op_group(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS) == super::RGFX_OP_GROUP_RENDER
+    );
+    assert!(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS == 0x104f);
 };
 
 #[cfg(test)]

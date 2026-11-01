@@ -702,6 +702,14 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                     e.setStencilStoreActionOptions(options)
                 })
             }
+            RenderCmd::SetDepthStoreActionOptions {
+                store_action_options,
+            } => {
+                let options = MTLStoreActionOptions(store_action_options.to_usize());
+                msg::send("setDepthStoreActionOptions:", Policy::Caught, || {
+                    e.setDepthStoreActionOptions(options)
+                })
+            }
             RenderCmd::SetTessellationFactorBuffer {
                 buffer,
                 offset,
@@ -1398,6 +1406,13 @@ mod tests {
             },
         );
         assert!(r.is_ok(), "set_stencil_store_action_options: {r:?}");
+        let r = x.encode(
+            OnFault::Return,
+            RenderCmd::SetDepthStoreActionOptions {
+                store_action_options: 0,
+            },
+        );
+        assert!(r.is_ok(), "set_depth_store_action_options: {r:?}");
         let r = x.encode(
             OnFault::Return,
             RenderCmd::SetTessellationFactorBuffer {

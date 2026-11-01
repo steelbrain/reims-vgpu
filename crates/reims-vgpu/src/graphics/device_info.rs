@@ -207,13 +207,16 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 
 /// The pieces the lane carries: argument encoders (the host's layout, `ARGUMENT_LAYOUT`, and the
 /// sampler ids `SAMPLER_STATE` answers), texture views (`TEXTURE_VIEW`), placement in an Automatic
-/// heap with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), and binary archives, which the
-/// bundle keeps in the guest (`RgfxBinaryArchive`: no compiled code crosses, so no wire message).
+/// heap with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), a pass's sample positions
+/// (after its colour records, `RGFX_PASS_FLAG_SAMPLE_POSITIONS`) with
+/// `SET_DEPTH_STORE_ACTION_OPTIONS`, and binary archives, which the bundle keeps in the guest
+/// (`RgfxBinaryArchive`: no compiled code crosses, so no wire message).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it.
 const WIRED: &[Piece] = &[
     Piece::ArgumentEncoders,
     Piece::AutomaticHeaps,
+    Piece::SamplePositions,
     Piece::TextureViews,
     Piece::BinaryArchives,
 ];
@@ -603,15 +606,19 @@ mod tests {
         assert_eq!(set(&no_imageblocks, 16), Some(false));
         assert_eq!(set(&no_imageblocks, 10000), Some(true));
 
-        // The lane's own pieces: argument encoders, texture views and Automatic heaps, but not
-        // Apple2's others, so no Apple family stands, and none would without any one of them.
+        // The lane's own pieces: argument encoders, texture views, Automatic heaps and sample
+        // positions, but not Apple2's IO queues, so no Apple family stands, and none would
+        // without any one of them.
         assert!(WIRED.contains(&Piece::ArgumentEncoders));
         assert!(WIRED.contains(&Piece::TextureViews));
         assert!(WIRED.contains(&Piece::AutomaticHeaps));
+        assert!(WIRED.contains(&Piece::SamplePositions));
+        assert!(!WIRED.contains(&Piece::IoCommandQueues));
         let mut lane = platform.clone();
         cap_apple_families(&mut lane, WIRED);
         let no_views = without(Piece::TextureViews);
         let no_automatic_heaps = without(Piece::AutomaticHeaps);
+        let no_sample_positions = without(Piece::SamplePositions);
         for family in 1001..=1011 {
             assert_eq!(answer(&lane, family), Some(false), "family {family}");
             assert_eq!(answer(&no_views, family), Some(false), "family {family}");
@@ -620,13 +627,18 @@ mod tests {
                 Some(false),
                 "family {family}"
             );
+            assert_eq!(
+                answer(&no_sample_positions, family),
+                Some(false),
+                "family {family}"
+            );
         }
         assert_eq!(answer(&lane, 2002), Some(true));
-        // With the rest of Apple2's pieces carried too, Apple1 and Apple2 stand.
+        // With IO queues carried too, Apple1 and Apple2 stand.
         let to_apple2: Vec<Piece> = WIRED
             .iter()
             .copied()
-            .chain([Piece::SamplePositions, Piece::IoCommandQueues])
+            .chain([Piece::IoCommandQueues])
             .collect();
         let mut apple2_lane = platform.clone();
         cap_apple_families(&mut apple2_lane, &to_apple2);

@@ -130,6 +130,11 @@ pub const RGFX_PASS_FLAG_RT_ARRAY_LENGTH: u32 = 1 << 0;
 pub const RGFX_PASS_FLAG_RT_SIZE: u32 = 1 << 1;
 /// A pass's `default_raster_sample_count` is set.
 pub const RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1 << 2;
+/// A pass's sample positions (`setSamplePositions:count:`) follow its colour attachment records,
+/// as one [`RgfxRenderPassSamplePositions`].
+pub const RGFX_PASS_FLAG_SAMPLE_POSITIONS: u32 = 1 << 3;
+/// The most sample positions a pass holds: Metal's largest sample count.
+pub const RGFX_PASS_MAX_SAMPLE_POSITIONS: u32 = 16;
 
 /// One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 /// nothing) when `texture_obj_id` is 0.
@@ -270,6 +275,22 @@ pub struct RgfxRenderPassDesc {
 /// body: right after the fixed [`RgfxRenderPassDesc`].
 pub const RGFX_RENDER_PASS_COLOR_OFFSET: u32 = 152;
 
+/// A pass's sample positions, after its colour attachment records where the pass's flags hold
+/// [`RGFX_PASS_FLAG_SAMPLE_POSITIONS`]: the `count` positions the pass descriptor holds
+/// (`getSamplePositions:count:`), each coordinate as the bits of its `f32`; the rest 0.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassSamplePositions {
+    /// The positions set, at most [`RGFX_PASS_MAX_SAMPLE_POSITIONS`].
+    pub count: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_04: u32,
+    /// Each position's `x` then `y`, as `f32` bits.
+    pub position_bits: [[u32; 2]; RGFX_PASS_MAX_SAMPLE_POSITIONS as usize],
+}
+
 /// The body of an `ENCODER_BEGIN_COMPUTE` op: the compute pass's properties.
 #[repr(C)]
 #[derive(
@@ -310,6 +331,7 @@ const _: () = {
     assert!(size_of::<RgfxRenderPassStencilAttachment>() == 64);
     assert!(size_of::<RgfxRenderPassDesc>() == 152);
     assert!(RGFX_RENDER_PASS_COLOR_OFFSET as usize == size_of::<RgfxRenderPassDesc>());
+    assert!(size_of::<RgfxRenderPassSamplePositions>() == 136);
     assert!(size_of::<RgfxComputePassDesc>() == 8);
     // Each group's tag range maps to its own `op_group`.
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_RENDER) == RGFX_OP_GROUP_FRAMING);

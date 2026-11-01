@@ -28,17 +28,20 @@ use reims_graphics::ops::{
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
     RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING,
     RGFX_OP_GROUP_RENDER, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
-    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_RENDER_PASS_COLOR_OFFSET,
-    RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpHeader, RgfxRenderPassColorAttachment,
-    RgfxRenderPassDesc, op_group,
+    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
+    RGFX_PASS_MAX_SAMPLE_POSITIONS, RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer,
+    RgfxComputePassDesc, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+    RgfxRenderPassSamplePositions, op_group,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
+use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
-use reims_vgpu_core::platform::types::ClearColor;
+use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
     ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
@@ -60,6 +63,31 @@ enum OpenEncoder<P: Platform> {
     Render(P::RenderEncoder),
     Compute(P::ComputeEncoder),
     Blit(P::BlitEncoder),
+}
+
+/// Whether Metal takes `positions` as a pass's sample positions, where `makes` answers whether
+/// the device makes textures of a sample count. Metal's `setSamplePositions:count:` fails an
+/// assertion at a count other than 2, 4 or 8 and at a coordinate outside [0, 1), and its render
+/// pass validation at a count the device makes no texture of (measured on the M3 Max, macOS 27:
+/// 8 there, whatever the attachments' sample count). Either ends the host's process, on the
+/// Vulkan platform at the encoder's creation; the bundle sends none of them (its device answers
+/// the host's sample counts, and the guest's own descriptor asserts at the rest), so a pass that
+/// holds one faults.
+fn sample_positions_taken(positions: &[MtlSamplePosition], makes: impl Fn(u32) -> bool) -> bool {
+    let count = positions.len();
+    matches!(count, 2 | 4 | 8)
+        && makes(count as u32)
+        && positions
+            .iter()
+            .all(|p| (0.0..1.0).contains(&p.x) && (0.0..1.0).contains(&p.y))
+}
+
+/// Whether a device of `caps` makes textures of `count` samples (`supportsTextureSampleCount:`).
+fn makes_sample_count(caps: &DeviceCaps, count: u32) -> bool {
+    SAMPLE_COUNTS
+        .iter()
+        .zip(&caps.sample_counts)
+        .any(|(&n, makes)| n == u64::from(count) && matches!(makes, Ok(true)))
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
@@ -214,7 +242,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         match tag {
             RGFX_OP_ENCODER_BEGIN_RENDER => {
                 already_open(encoder, "ENCODER_BEGIN_RENDER")?;
-                let pass = self.build_render_pass(body)?;
+                let pass = self.build_render_pass(body, |count| {
+                    cb.device()
+                        .is_some_and(|d| makes_sample_count(&d.caps(), count))
+                })?;
                 let enc = cb
                     .render_encoder(ON, &pass)?
                     .ok_or_else(|| op_fault("the render encoder was nil"))?;
@@ -248,10 +279,16 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Builds a `P::RenderPassDescriptor` from an `ENCODER_BEGIN_RENDER` op's body
     /// (an [`RgfxRenderPassDesc`] then its `color_count`
-    /// [`RgfxRenderPassColorAttachment`] records). A body too short faults; a
-    /// reference to a texture the host does not hold faults through the resolution
-    /// API.
-    fn build_render_pass(&self, body: &[u8]) -> RaiseResult<P::RenderPassDescriptor> {
+    /// [`RgfxRenderPassColorAttachment`] records, and its sample positions where its flag says
+    /// so). A body too short faults; a reference to a texture the host does not hold faults
+    /// through the resolution API; and so do sample positions Metal does not take
+    /// ([`sample_positions_taken`]), of which `makes` answers whether the device makes textures
+    /// of their count.
+    fn build_render_pass(
+        &self,
+        body: &[u8],
+        makes: impl Fn(u32) -> bool,
+    ) -> RaiseResult<P::RenderPassDescriptor> {
         let (desc, _) = RgfxRenderPassDesc::read_from_prefix(body).map_err(|_| {
             op_fault("ENCODER_BEGIN_RENDER: body too short for the pass descriptor")
         })?;
@@ -300,6 +337,31 @@ impl<P: Platform> GraphicsDecoder<P> {
                 clear_color: Some(clear_color(a.clear_color_bits)),
             };
             pass.set_color_attachment(ON, i as u64, &aset)?;
+        }
+
+        // The pass's sample positions, after the colour records.
+        if desc.flags & RGFX_PASS_FLAG_SAMPLE_POSITIONS != 0 {
+            let off = color_start + desc.color_count as usize * stride;
+            let p = body
+                .get(off..off + size_of::<RgfxRenderPassSamplePositions>())
+                .and_then(|s| RgfxRenderPassSamplePositions::read_from_bytes(s).ok())
+                .filter(|p| p.count <= RGFX_PASS_MAX_SAMPLE_POSITIONS)
+                .ok_or_else(|| {
+                    op_fault("ENCODER_BEGIN_RENDER: no whole sample positions after the colours")
+                })?;
+            let positions: Vec<MtlSamplePosition> = p.position_bits[..p.count as usize]
+                .iter()
+                .map(|&[x, y]| MtlSamplePosition {
+                    x: f32::from_bits(x),
+                    y: f32::from_bits(y),
+                })
+                .collect();
+            if !sample_positions_taken(&positions, &makes) {
+                return Err(op_fault(
+                    "ENCODER_BEGIN_RENDER: sample positions Metal does not take",
+                ));
+            }
+            pass.set_sample_positions(&positions)?;
         }
 
         if desc.depth.texture_obj_id != 0 {
@@ -673,7 +735,9 @@ mod tests {
     #[test]
     fn a_render_pass_is_built_from_the_wire_schema() {
         let (_p, dec) = setup();
-        let pass = dec.build_render_pass(&begin_render_body()).unwrap();
+        let pass = dec
+            .build_render_pass(&begin_render_body(), |_| true)
+            .unwrap();
         assert_eq!(
             pass.color_attachment_state(0).unwrap(),
             AttachmentState {
@@ -681,6 +745,80 @@ mod tests {
                 store_action: 1,
             }
         );
+    }
+
+    /// A pass's sample positions, after its colour records, are set on the platform's pass as
+    /// the guest's descriptor holds them; a pass whose flag says so but carries none whole, or
+    /// more than Metal's sixteen, faults, and so does one Metal does not take: a count other than
+    /// 2, 4 or 8, one the device makes no texture of, or a coordinate outside [0, 1). One without
+    /// the flag sets none.
+    #[test]
+    fn a_render_pass_takes_its_sample_positions() {
+        use reims_vgpu_core::testkit::impls::descriptor::PassModel;
+        let (p, dec) = setup();
+        let mut caps = (*p.device().caps()).clone();
+        caps.sample_counts = [Ok(true), Ok(true), Ok(true), Ok(false)];
+        assert!(makes_sample_count(&caps, 4));
+        assert!(!makes_sample_count(&caps, 8));
+        assert!(!makes_sample_count(&caps, 3));
+        let mut head = RgfxRenderPassDesc::read_from_prefix(&begin_render_body())
+            .unwrap()
+            .0;
+        head.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+        let mut positions = RgfxRenderPassSamplePositions {
+            count: 2,
+            ..RgfxRenderPassSamplePositions::default()
+        };
+        positions.position_bits[0] = [0.25f32.to_bits(), 0.75f32.to_bits()];
+        positions.position_bits[1] = [0.5625f32.to_bits(), 0.125f32.to_bits()];
+        let with = |p: &RgfxRenderPassSamplePositions| {
+            let mut body = head.as_bytes().to_vec();
+            body.extend_from_slice(&begin_render_body()[RGFX_RENDER_PASS_COLOR_OFFSET as usize..]);
+            body.extend_from_slice(p.as_bytes());
+            body
+        };
+        let pass = dec.build_render_pass(&with(&positions), |_| true).unwrap();
+        let set = pass.with_model(|m: &PassModel| m.sample_positions.clone());
+        assert_eq!(
+            set,
+            Some(vec![
+                MtlSamplePosition { x: 0.25, y: 0.75 },
+                MtlSamplePosition {
+                    x: 0.5625,
+                    y: 0.125
+                },
+            ])
+        );
+        let plain = dec
+            .build_render_pass(&begin_render_body(), |_| true)
+            .unwrap();
+        assert_eq!(
+            plain.with_model(|m: &PassModel| m.sample_positions.clone()),
+            None
+        );
+        let short = with(&positions);
+        assert!(
+            dec.build_render_pass(&short[..short.len() - 8], |_| true)
+                .is_err()
+        );
+        assert!(
+            dec.build_render_pass(&with(&positions), |n| n != 2)
+                .is_err()
+        );
+        for bad in [1.0f32, -0.25, f32::NAN] {
+            let mut p = positions;
+            p.position_bits[1][0] = bad.to_bits();
+            assert!(dec.build_render_pass(&with(&p), |_| true).is_err(), "{bad}");
+        }
+        for count in [1, 3, 16] {
+            positions.count = count;
+            assert!(
+                dec.build_render_pass(&with(&positions), |_| true).is_err(),
+                "{count}"
+            );
+        }
+        positions.count = RGFX_PASS_MAX_SAMPLE_POSITIONS + 1;
+        assert!(dec.build_render_pass(&with(&positions), |_| true).is_err());
     }
 
     /// An unknown op in the stream faults the exec (a raise), after the encoder has
