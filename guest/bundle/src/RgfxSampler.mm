@@ -4,6 +4,8 @@
 
 #import "RgfxSampler.h"
 
+#import "RgfxMetalPrivate.h"
+
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxSamplerParams
 
 namespace {
@@ -31,6 +33,9 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 }
 
 } // namespace
+
+@interface RgfxSampler () <RgfxMetalSamplerInternals>
+@end
 
 @implementation RgfxSampler {
 	uint64_t _resourceId; // the host's answer; 0 where none came (a create on a test's ring)
@@ -75,6 +80,27 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	MTLResourceID rid;
 	rid._impl = _resourceId;
 	return rid;
+}
+
+// --- what Metal's sampler answers past its protocol (RgfxMetalPrivate.h) ----------------
+// Each as Metal's (measured on the M3 Max under macOS 27): no GPU address and no pixel format,
+// whatever the descriptor, one that supports argument buffers among them; and an identifier that
+// is its gpuResourceID's value, so the samplers of equal descriptors, which the host answers with
+// one id, answer one.
+
+- (uint64_t)gpuAddress
+{
+	return 0;
+}
+
+- (MTLPixelFormat)pixelFormat
+{
+	return MTLPixelFormatInvalid;
+}
+
+- (uint64_t)uniqueIdentifier
+{
+	return _resourceId;
 }
 
 @end

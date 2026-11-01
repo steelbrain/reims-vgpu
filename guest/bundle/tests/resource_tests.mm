@@ -12,6 +12,7 @@
 #import <objc/message.h>
 
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxSampler.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -770,6 +772,57 @@ void test_texture_answers()
 	drainRing(fx.ring);
 }
 
+// A fake device that answers each sampler create SAMPLER_STATE with the id it is given, the way
+// the host answers equal descriptors with one id.
+struct SamplerAnswer {
+	uint64_t id = 0;
+
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		RgfxSamplerState answer = {};
+		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 0};
+		answer.status = RGFX_STATUS_OK;
+		answer.gpu_resource_id = static_cast<SamplerAnswer *>(context)->id;
+		CHECK(size == sizeof(RgfxSamplerCreate) && message != nullptr);
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A sampler answers no GPU address and no pixel format, and its gpuResourceID's value as its
+// identifier, as Metal's: samplers the host answers with one id answer one identifier.
+void test_sampler_answers()
+{
+	Fixture fx;
+	SamplerAnswer answer;
+	fx.ser.setAsker(&SamplerAnswer::ask, &answer);
+	@autoreleasepool {
+		MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+		answer.id = 2;
+		RgfxSampler *a = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&fx.ser];
+		RgfxSampler *b = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&fx.ser];
+		d.minFilter = MTLSamplerMinMagFilterLinear;
+		d.supportArgumentBuffers = YES;
+		answer.id = 3;
+		RgfxSampler *c = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&fx.ser];
+		CHECK(a != nil && b != nil && c != nil);
+		id<RgfxMetalSamplerInternals> ai = (id<RgfxMetalSamplerInternals>)a;
+		id<RgfxMetalSamplerInternals> bi = (id<RgfxMetalSamplerInternals>)b;
+		id<RgfxMetalSamplerInternals> ci = (id<RgfxMetalSamplerInternals>)c;
+		CHECK([ai uniqueIdentifier] == 2 && [bi uniqueIdentifier] == 2 && [ci uniqueIdentifier] == 3);
+		CHECK([ai uniqueIdentifier] == a.gpuResourceID._impl &&
+		      [ci uniqueIdentifier] == c.gpuResourceID._impl);
+		CHECK([ai gpuAddress] == 0 && [ci gpuAddress] == 0);
+		CHECK([ai pixelFormat] == MTLPixelFormatInvalid && [ci pixelFormat] == MTLPixelFormatInvalid);
+		CHECK(ringEmpty(fx.ring)); // asked, and the members post nothing
+	}
+	fx.ser.setAsker(nullptr, nullptr);
+	drainRing(fx.ring);
+}
+
 } // namespace
 
 void rgfxResourceTests()
@@ -781,4 +834,5 @@ void rgfxResourceTests()
 	test_buffer_linear_textures();
 	test_texture_compression();
 	test_texture_answers();
+	test_sampler_answers();
 }

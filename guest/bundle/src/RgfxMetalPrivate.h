@@ -190,6 +190,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)didModifyData;
 @end
 
+@protocol RgfxMetalSamplerInternals
+// `Q16@0:8` each: the sampler's GPU address, its pixel format and its identifier.
+- (uint64_t)gpuAddress;
+- (MTLPixelFormat)pixelFormat;
+- (uint64_t)uniqueIdentifier;
+@end
+
 @protocol RgfxMetalHeapInternals
 // `Q16@0:8`: the heap's base address, where a resource at offset 0 lies.
 - (uint64_t)gpuAddress;
