@@ -1443,6 +1443,61 @@ void test_stitched_library_over_shadows()
 	}
 }
 
+// A stitched library of a DAG (newLibraryWithDAG:functions:error:, SkyLight's and MPS's) is
+// Metal's own over the functions' shadows too: its text is Metal's to read, and its answer, here
+// Metal's parser's error, is the guest's, with nothing sent to the host.
+void test_stitched_dag_over_shadows()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	id<MTLFunction> add = [lib newFunctionWithName:@"stitch_add"];
+	id<MTLFunction> mul = [lib newFunctionWithName:@"stitch_mul"];
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+	__block NSArray<id<MTLFunction>> *given = nil;
+	__block NSError *metals = nil;
+	NSError *err = nil;
+	id<MTLLibrary> ours = RgfxLinkOverShadows(
+	    @[ add, mul ],
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError **e) {
+		    given = shadows;
+		    id<MTLLibrary> made = [(IOGPUMetalDevice *)metal newLibraryWithDAG:@"fused" functions:shadows error:e];
+		    metals = *e;
+		    return made;
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t, NSError **) {
+		    CHECK(false); // nothing to make of no library
+		    return nil;
+	    },
+	    &err);
+	CHECK(ours == nil && metals != nil && err == metals);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorCompileFailure);
+	CHECK([err.localizedDescription hasPrefix:@"error while parsing script: "]);
+	CHECK(given.count == 2 && given[0] == [(RgfxFunction *)add rgfxShadow] &&
+	      given[1] == [(RgfxFunction *)mul rgfxShadow] && given[0] != nil);
+	CHECK(!fx.ring.next(&h, &drain));
+}
+
 // A function answers Metal's private members from its shadow, Metal's own function of the same
 // entry point, made of its library's on first use: a stitchable function's bindings and return
 // type, a kernel's nils, and each one's AIR. One made with constant values has no shadow: it
@@ -5529,6 +5584,7 @@ int main()
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
+		test_stitched_dag_over_shadows();
 		test_function_members_from_shadow();
 		test_library_members_as_metal();
 		test_command_graph();

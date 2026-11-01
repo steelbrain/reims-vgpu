@@ -234,13 +234,41 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	    error);
 }
 
-// A stitched library (measured: the base device class's own on macOS 27 and 26.6.1, which on
-// macOS 27 stitches on the CPU, reading each function's name and bitcode hash): Metal's own over
-// the functions' shadows, made ours (RgfxStitchOverShadows), so its functions are named on the
-// host like any library's.
+// A stitched library, by each of Metal's entry points for one (measured: the base device class's
+// on macOS 27; macOS 26.6.1's has them all): the public one and its completion-handler form; the
+// SPI form SkyLight calls, which runs the destination form on the device; the destination form,
+// which also keeps the library in an archive, and through which Metal's archive adds one; and the
+// DAG form SkyLight and MPS call. Each is Metal's own stitch over the functions' shadows, made ours
+// (RgfxStitchOverShadows), so Metal's base path never reads our functions, which it cannot
+// (-[RgfxFunction libraryData]).
 - (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
                                              error:(__autoreleasing NSError **)error
 {
+	return [self newLibraryWithStitchedDescriptor:descriptor destinationBinaryArchive:nil error:error];
+}
+
+- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                       completionHandler:(MTLNewLibraryCompletionHandler)completionHandler
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
+	if (completionHandler)
+		completionHandler(lib, error);
+}
+
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptorSPI:(MTLStitchedLibraryDescriptor *)descriptor
+                                                error:(__autoreleasing NSError **)error
+{
+	return [self newLibraryWithStitchedDescriptor:descriptor destinationBinaryArchive:nil error:error];
+}
+
+// Our archives hold no stitched library yet (their addLibraryWithDescriptor: answers unsupported),
+// so `archive` keeps none.
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                          destinationBinaryArchive:(id<MTLBinaryArchive>)archive
+                                             error:(__autoreleasing NSError **)error
+{
+	(void)archive;
 	return RgfxStitchOverShadows(
 	    descriptor,
 	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError *__autoreleasing *e) {
@@ -252,13 +280,20 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	    error);
 }
 
-- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
-                       completionHandler:(MTLNewLibraryCompletionHandler)completionHandler
+// The DAG's text is Metal's to read (its parser answers its errors, MTLLibraryErrorDomain 3).
+- (id<MTLLibrary>)newLibraryWithDAG:(id)dag
+                          functions:(NSArray<id<MTLFunction>> *)functions
+                              error:(__autoreleasing NSError **)error
 {
-	NSError *error = nil;
-	id<MTLLibrary> lib = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
-	if (completionHandler)
-		completionHandler(lib, error);
+	return RgfxLinkOverShadows(
+	    functions,
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
+		    return [self rgfxMetalStitchDAG:dag functions:shadows error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    error);
 }
 
 // The base class's links, which a block cannot reach through `super`.
@@ -280,6 +315,13 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
                             error:(__autoreleasing NSError **)error
 {
 	return [super newLibraryWithStitchedDescriptor:descriptor error:error];
+}
+
+- (id<MTLLibrary>)rgfxMetalStitchDAG:(id)dag
+                           functions:(NSArray<id<MTLFunction>> *)shadows
+                               error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithDAG:dag functions:shadows error:error];
 }
 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error

@@ -71,6 +71,11 @@ NS_ASSUME_NONNULL_BEGIN
 // stitches on the CPU, reading each function's name and bitcode hash.
 - (nullable id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
                                                       error:(NSError *_Nullable *_Nullable)error;
+// measured: macOS 27 and 26.6.1, `@40@0:8@16@24^@32`, _MTLDevice's: a stitched library of a DAG's
+// text (Metal's parser reads it) over `functions`, which may not be empty (Metal asserts).
+- (nullable id<MTLLibrary>)newLibraryWithDAG:(id)dag
+                                   functions:(NSArray<id<MTLFunction>> *)functions
+                                       error:(NSError *_Nullable *_Nullable)error;
 @end
 
 // measured: macOS 27 and 26.6.1 Metal.framework — the private selectors of Metal's own library
