@@ -1669,6 +1669,82 @@ void test_core_image_extern_functions()
 	}
 }
 
+// A pipeline links a function of another library made with constant values under a specialized
+// name, as RenderBox's custom effects link theirs to the `custom_fn` their fragment calls (Metal
+// refuses one linked under its own name, "unresolved visible function reference: custom_fn";
+// measured: macOS 27): the create carries the fragment's constants, and for the linked function
+// its library, list, specialized name and constant values, all the host makes it of.
+void test_linked_function_specialised_on_the_wire()
+{
+	Fixture fx;
+	auto make = [&](const std::vector<uint8_t> &bytes) {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+		                                        length:bytes.size()
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		CHECK(lib != nil);
+		(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+		return lib;
+	};
+	RgfxLibrary *effects = make(metallibOf({
+	    { "effect_vertex", 0, {} },
+	    { "effect_fragment", 1, { { "state", 36, 0, true } } },
+	}));
+	// An entry the table reads as a visible function.
+	RgfxLibrary *gradients = make(metallibOf({ { "gradient_v1", 3, { { "variant", 33, 1, true } } } }));
+	static const uint32_t state[4] = { 0x465, 0x82, 0x1145e, 0xc };
+	static const uint32_t variant = 7;
+	MTLFunctionConstantValues *fragmentValues = [MTLFunctionConstantValues new];
+	[fragmentValues setConstantValue:state type:MTLDataTypeUInt4 atIndex:0];
+	NSError *err = nil;
+	id<MTLFunction> fragment = [effects newFunctionWithName:@"effect_fragment"
+	                                         constantValues:fragmentValues
+	                                                  error:&err];
+	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+	fd.name = @"gradient_v1";
+	fd.specializedName = @"custom_fn";
+	fd.constantValues = [MTLFunctionConstantValues new];
+	[fd.constantValues setConstantValue:&variant type:MTLDataTypeUInt withName:@"variant"];
+	id<MTLFunction> linked = [gradients newFunctionWithDescriptor:fd error:&err];
+	CHECK(fragment != nil && linked != nil && err == nil);
+	CHECK([linked.name isEqualToString:@"custom_fn"]);
+
+	MTLRenderPipelineDescriptor *desc = [MTLRenderPipelineDescriptor new];
+	desc.vertexFunction = [effects newFunctionWithName:@"effect_vertex"];
+	desc.fragmentFunction = fragment;
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	desc.fragmentLinkedFunctions.functions = @[ linked ];
+	RgfxRenderPipelineState *ps = [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+	                                                                                 device:nil
+	                                                                             serializer:&fx.ser
+	                                                                                  error:&err];
+	CHECK(ps != nil && err == nil);
+	auto bytes = nextMessage(fx.ring, RGFX_CMD_RENDER_PIPELINE_CREATE);
+	RgfxRenderPipelineCreate head;
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(head.fragment_library_obj_id == effects.rgfxObjId && head.fragment_constant_count == 1);
+	RgfxFunctionConstant fc;
+	std::memcpy(&fc, bytes.data() + head.fragment_constants_offset, sizeof(fc));
+	CHECK(fc.index == 0 && fc.data_type == static_cast<uint32_t>(MTLDataTypeUInt4));
+	CHECK(std::memcmp(fc.value, state, sizeof(state)) == 0);
+	CHECK(head.vertex_linked_count == 0 && head.fragment_linked_count == 1);
+	RgfxLinkedFunction r;
+	std::memcpy(&r, bytes.data() + head.fragment_linked_offset, sizeof(r));
+	CHECK(r.library_obj_id == gradients.rgfxObjId && r.library_obj_id != effects.rgfxObjId);
+	CHECK(r.list == RGFX_LINKED_FUNCTIONS && r.options == 0 && r.group_len == 0);
+	CHECK(r.name_len == 11 && std::memcmp(bytes.data() + r.name_offset, "gradient_v1", 11) == 0);
+	CHECK(r.specialized_name_len == 9 &&
+	      std::memcmp(bytes.data() + r.specialized_name_offset, "custom_fn", 9) == 0);
+	CHECK(r.constant_count == 1);
+	RgfxFunctionConstant lc;
+	std::memcpy(&lc, bytes.data() + r.constants_offset, sizeof(lc));
+	CHECK(lc.index == 1 && lc.data_type == static_cast<uint32_t>(MTLDataTypeUInt));
+	CHECK(std::memcmp(lc.value, &variant, sizeof(variant)) == 0);
+}
+
 // A library's functions are specialised as Metal specialises them: a value set by name or by
 // range reaches its constant's index, an indexed value wins over a named one, values for
 // constants the function does not declare are ignored, a required constant left unset reads 0
@@ -5261,6 +5337,7 @@ int main()
 		test_render_pipeline_routing();
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
+		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
 		test_function_members_from_shadow();
