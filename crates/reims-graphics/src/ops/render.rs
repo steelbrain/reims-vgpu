@@ -1659,7 +1659,8 @@ const _: () = {
     assert!(size_of::<RgfxOpUseResourcesStages>() == 24);
     // Every new render tag stays in the render group and is unique within it.
     assert!(
-        super::op_group(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS) == super::RGFX_OP_GROUP_RENDER
+        super::op_group(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS)
+            == super::RGFX_OP_GROUP_RENDER
     );
     assert!(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS == 0x104f);
 };
