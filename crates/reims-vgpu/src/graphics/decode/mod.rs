@@ -3993,6 +3993,96 @@ mod tests {
         );
     }
 
+    /// On Metal, from the wire: a kernel that calls `linked_add_one`, which its library only
+    /// declares, is made with the callee library's `linked_add_two` linked as a private function
+    /// made with the specialized name `linked_add_one`, and with `linked_add_one` itself; it is
+    /// refused with `linked_add_two` linked under its own name, and with `linked_add_one` made
+    /// under another
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_linked_function_s_specialized_name_resolves_its_call() {
+        use crate::platform::ApiPlatform as _;
+        use reims_vgpu_metal::MetalPlatform;
+        let platform = MetalPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<MetalPlatform>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r: RgfxPipelineReflection| {
+            sink_replies.lock().push((r.obj_id, r.status));
+        }));
+        let caller =
+            include_bytes!("../../../../reims-vgpu-vulkan/metallibs/linked_caller.metallib");
+        let callee =
+            include_bytes!("../../../../reims-vgpu-vulkan/metallibs/linked_callee.metallib");
+        for (obj_id, bytes) in [(1, caller.as_slice()), (2, callee.as_slice())] {
+            let mut m = RgfxLibraryCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_LIBRARY_CREATE,
+                    size: (RGFX_LIBRARY_BYTES_OFFSET as usize + bytes.len()).next_multiple_of(8)
+                        as u32,
+                    seqno: obj_id,
+                },
+                obj_id,
+                byte_length: bytes.len() as u64,
+                ..RgfxLibraryCreate::default()
+            }
+            .as_bytes()
+            .to_vec();
+            m.extend_from_slice(bytes);
+            m.resize(m.len().next_multiple_of(8), 0);
+            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        }
+        let create = |obj_id: u64, linked: &str, specialized: &str| {
+            let mut bytes = compute_create(obj_id);
+            let name = b"linked_kernel";
+            let at = bytes.len() as u32;
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+            let tail = append_linked(
+                &mut bytes,
+                2,
+                &[(
+                    linked,
+                    RGFX_LINKED_PRIVATE_FUNCTIONS,
+                    0,
+                    "",
+                    &[],
+                    specialized,
+                )],
+            );
+            edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+                (m.name_offset, m.name_len) = (at, name.len() as u32);
+                (m.linked_offset, m.linked_count) = tail;
+            });
+            bytes
+        };
+        let cases = [
+            (100, "linked_add_two", "linked_add_one", RGFX_PIPELINE_OK),
+            (101, "linked_add_one", "", RGFX_PIPELINE_OK),
+            (102, "linked_add_two", "", RGFX_PIPELINE_REFUSED),
+            (103, "linked_add_one", "custom_fn", RGFX_PIPELINE_REFUSED),
+        ];
+        for (obj_id, linked, specialized, _) in cases {
+            let made = dec
+                .decode(&device, &create(obj_id, linked, specialized))
+                .unwrap();
+            assert!(
+                made == Ok(()) || made == Err(DecodeError::Refused),
+                "{linked} as {specialized:?}: {made:?}"
+            );
+        }
+        let got: Vec<_> = replies.lock().clone();
+        let want: Vec<_> = cases
+            .iter()
+            .map(|&(obj_id, _, _, status)| (obj_id, status))
+            .collect();
+        assert_eq!(got, want);
+    }
+
     /// A render and a compute pipeline create each resolve their functions from a
     /// library, call the right platform creator, store the handle and emit a
     /// reflection reply keyed to the create's seqno; a pipeline that names a
