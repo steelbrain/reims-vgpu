@@ -1460,7 +1460,6 @@ IOReturn ReimsGraphics::connectionAttribute(IOIndex connectIndex, IOSelect attri
 		IOLockUnlock(stateLock);
 		return kIOReturnSuccess;
 	case kConnectionFlags:
-	case kConnectionDisplayParameterCount:
 		if (!value)
 			return kIOReturnBadArgument;
 		*value = 0;
@@ -1473,6 +1472,10 @@ IOReturn ReimsGraphics::connectionAttribute(IOIndex connectIndex, IOSelect attri
 		// No I2C lines and no sense lines.
 		return kIOReturnUnsupported;
 	default:
+		// IOFramebuffer answers the rest, the display's parameters among them
+		// (kConnectionDisplayParameterCount and kConnectionDisplayParameters: its red, green and
+		// blue gamma scales and its VBL multiplier), which IODisplay publishes as
+		// IODisplayParameters.
 		return super::getAttributeForConnection(connectIndex, attribute, value);
 	}
 }
