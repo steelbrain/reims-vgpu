@@ -42,6 +42,9 @@ enum RgfxArchiveKind : uint8_t {
 	kRgfxArchiveMesh = 6,
 	/// `addFunctionWithDescriptor:library:error:`: a function, which keys no pipeline.
 	kRgfxArchiveFunction = 7,
+	/// A stitched library (`addLibraryWithDescriptor:error:`), which the archive keeps in memory
+	/// only: Metal's archive lists none in its keys and writes none to a file (measured).
+	kRgfxArchiveStitched = 8,
 };
 
 /// One entry: its kind and the 32-byte key.

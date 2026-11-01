@@ -27,6 +27,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// (the M3 Max answers AGXMetalG15X_M1, its driver bundle's).
 extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
 
+/// The device an archive stitches the libraries added to it on, as Metal's archive does: Metal's
+/// stitched-library entry point that also stores the library in `archive` (measured: macOS 27).
+@protocol RgfxStitchingDevice <NSObject>
+- (nullable id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                                   destinationBinaryArchive:(nullable id<MTLBinaryArchive>)archive
+                                                      error:(NSError *_Nullable __autoreleasing *_Nullable)error;
+@end
+
 @interface RgfxBinaryArchive : NSObject <MTLBinaryArchive>
 
 /// The archive `descriptor` names on `device`, whose `architecture.name` is `architecture`: empty
@@ -49,6 +57,14 @@ extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
 /// as Metal's archive answers them.
 - (NSArray<id<NSCopying>> *)keys;
 - (NSUInteger)options;
+
+/// Keeps the stitched library of `descriptor` (one the device stitched with this archive as its
+/// destination), in memory only, as Metal's archive keeps one: in no key and in no file.
+- (void)rgfxAddStitched:(MTLStitchedLibraryDescriptor *)descriptor;
+
+/// Whether one of `archives` holds the stitched library of `descriptor`, found as Metal's archive
+/// finds one (RgfxStitchedKey).
++ (BOOL)rgfxStitched:(MTLStitchedLibraryDescriptor *)descriptor heldBy:(nullable NSArray *)archives;
 
 /// Metal's miss of a render pipeline of `descriptor` created with
 /// MTLPipelineOptionFailOnBinaryArchiveMiss: nil where its `binaryArchives` hold the key of each

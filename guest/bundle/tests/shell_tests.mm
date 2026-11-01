@@ -34,6 +34,7 @@
 #import "RgfxSampler.h"
 #import "RgfxTexture.h"
 #import "RgfxArgumentEncoder.h"
+#import "RgfxBinaryArchive.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxFunction.h"
 #import "RgfxLibrary.h"
@@ -1413,7 +1414,7 @@ void test_stitched_library_over_shadows()
 	__block id<MTLLibrary> stitched = nil;
 	NSError *err = nil;
 	id<MTLLibrary> ours = RgfxStitchOverShadows(
-	    d,
+	    d, nil,
 	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError **e) {
 		    given = shadowed;
 		    stitched = [metal newLibraryWithStitchedDescriptor:shadowed error:e];
@@ -1496,6 +1497,186 @@ void test_stitched_dag_over_shadows()
 	CHECK(given.count == 2 && given[0] == [(RgfxFunction *)add rgfxShadow] &&
 	      given[1] == [(RgfxFunction *)mul rgfxShadow] && given[0] != nil);
 	CHECK(!fx.ring.next(&h, &drain));
+}
+
+} // namespace
+
+// A device that stitches as ours does (RgfxStitchOverShadows), on Metal's own stitch, making its
+// libraries with `make`: what an archive adds a stitched library through.
+@interface StitchingDevice : NSObject <RgfxStitchingDevice>
+@property(nonatomic, strong) id<MTLDevice> metal;
+@property(nonatomic, copy) RgfxLibraryMaker make;
+@property(nonatomic) int stitches;
+@end
+
+@implementation StitchingDevice
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                          destinationBinaryArchive:(id<MTLBinaryArchive>)archive
+                                             error:(NSError **)error
+{
+	return RgfxStitchOverShadows(
+	    descriptor, archive,
+	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError **e) {
+		    self.stitches++;
+		    return [self.metal newLibraryWithStitchedDescriptor:shadowed error:e];
+	    },
+	    self.make, error);
+}
+@end
+
+namespace {
+
+// A stitched library kept in a binary archive is found as Metal's archive finds one (measured:
+// macOS 27, M3 Max): a create that fails on a miss is made where an archive of the descriptor
+// holds the same graphs over the same functions, in any order and of any library over the same
+// bytes, and otherwise answers Metal's error with nothing stitched; another graph name, swapped
+// arguments or another attribute miss. The archive holds it in no key and writes it to no file. An
+// archive adds one by stitching it on its device into itself, answering Metal's error for a graph
+// Metal cannot stitch, and for a descriptor that fails on a miss and that no archive holds.
+void test_stitched_libraries_in_archives()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&](const void *p, size_t n) {
+		uint32_t status = 0;
+		return [RgfxLibrary libraryWithData:p
+		                             length:n
+		                                key:nullptr
+		                             device:nil
+		                         serializer:&fx.ser
+		                             status:&status];
+	};
+	auto drain = [&] {
+		std::vector<uint8_t> b;
+		RgfxMsgHeader h;
+		while (fx.ring.next(&h, &b)) {
+		}
+	};
+	auto source = [&](RgfxLibrary *lib) {
+		[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			     (void)bytes;
+		     })
+		       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+			       return [metal newLibraryWithData:d error:nil];
+		       }];
+		return lib;
+	};
+	RgfxLibrary *lib = source(make(bytes.bytes, bytes.length));
+	RgfxLibrary *again = source(make(bytes.bytes, bytes.length));
+	drain();
+	auto graph = [](NSString *name, bool swapped, NSArray *attributes) {
+		MTLFunctionStitchingInputNode *a = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:0];
+		MTLFunctionStitchingInputNode *b = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:1];
+		MTLFunctionStitchingInputNode *c = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:2];
+		MTLFunctionStitchingFunctionNode *sum =
+		    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"stitch_add"
+		                                                 arguments:@[ a, b ]
+		                                       controlDependencies:@[]];
+		NSArray *last = swapped ? @[ c, sum ] : @[ sum, c ];
+		MTLFunctionStitchingFunctionNode *product =
+		    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"stitch_mul"
+		                                                 arguments:last
+		                                       controlDependencies:@[]];
+		return [[MTLFunctionStitchingGraph alloc] initWithFunctionName:name
+		                                                         nodes:@[ sum ]
+		                                                    outputNode:product
+		                                                    attributes:attributes];
+	};
+	auto descriptor = [&](RgfxLibrary *from, MTLFunctionStitchingGraph *g, NSArray *archives, bool reversed) {
+		MTLStitchedLibraryDescriptor *d = [[MTLStitchedLibraryDescriptor alloc] init];
+		id<MTLFunction> add = [from newFunctionWithName:@"stitch_add"];
+		id<MTLFunction> mul = [from newFunctionWithName:@"stitch_mul"];
+		d.functions = reversed ? @[ mul, add ] : @[ add, mul ];
+		d.functionGraphs = @[ g ];
+		d.binaryArchives = archives;
+		d.options = MTLStitchedLibraryOptionFailOnBinaryArchiveMiss;
+		return d;
+	};
+	StitchingDevice *device = [StitchingDevice new];
+	device.metal = metal;
+	device.make = ^id<MTLLibrary>(dispatch_data_t data, NSError **e) {
+		const void *p = nullptr;
+		size_t n = 0;
+		dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
+		(void)map;
+		return make(p, n);
+	};
+	NSError *err = nil;
+	RgfxBinaryArchive *archive = [RgfxBinaryArchive archiveWithDescriptor:[MTLBinaryArchiveDescriptor new]
+	                                                                device:(id<MTLDevice>)device
+	                                                          architecture:@"arch_a"
+	                                                                 error:&err];
+	CHECK(archive != nil);
+	auto create = [&](MTLStitchedLibraryDescriptor *d, NSError **e) {
+		return [device newLibraryWithStitchedDescriptor:d destinationBinaryArchive:nil error:e];
+	};
+	auto missed = [&](MTLStitchedLibraryDescriptor *d) {
+		NSError *e = nil;
+		const int before = device.stitches;
+		id<MTLLibrary> made = create(d, &e);
+		return made == nil && device.stitches == before && [e.domain isEqualToString:MTLLibraryErrorDomain] &&
+		       e.code == MTLLibraryErrorCompileFailure &&
+		       [e.localizedDescription isEqualToString:@"Failed to find library in binary archive."];
+	};
+	MTLFunctionStitchingGraph *fused = graph(@"fused", false, @[]);
+	CHECK(missed(descriptor(lib, fused, @[], false)));
+	CHECK(missed(descriptor(lib, fused, nil, false)));
+	CHECK(missed(descriptor(lib, fused, @[ archive ], false)));
+
+	// An add that fails on a miss misses too, and keeps nothing.
+	err = nil;
+	CHECK(![archive addLibraryWithDescriptor:descriptor(lib, fused, @[ archive ], false) error:&err]);
+	CHECK([err.localizedDescription isEqualToString:@"Failed to find library in binary archive."]);
+	CHECK(device.stitches == 0 && missed(descriptor(lib, fused, @[ archive ], false)));
+
+	// Added: stitched on the device into the archive, then found.
+	MTLStitchedLibraryDescriptor *plain = descriptor(lib, fused, @[], false);
+	plain.options = 0;
+	CHECK([archive addLibraryWithDescriptor:plain error:&err] && err == nil && device.stitches == 1);
+	drain();
+	id<MTLLibrary> found = create(descriptor(lib, fused, @[ archive ], false), &err);
+	CHECK([(id)found isKindOfClass:[RgfxLibrary class]] && [[found functionNames] isEqualToArray:@[ @"fused" ]]);
+	CHECK(device.stitches == 2);
+	drain();
+	CHECK(create(descriptor(lib, fused, @[ archive ], true), &err) != nil);
+	CHECK(create(descriptor(again, fused, @[ archive ], false), &err) != nil);
+	drain();
+	CHECK(missed(descriptor(lib, graph(@"other", false, @[]), @[ archive ], false)));
+	CHECK(missed(descriptor(lib, graph(@"fused", true, @[]), @[ archive ], false)));
+	CHECK(missed(descriptor(lib, graph(@"fused", false, @[ [MTLFunctionStitchingAttributeAlwaysInline new] ]),
+	                        @[ archive ], false)));
+	// Kept in no key and in no file.
+	CHECK(archive.keys.count == 0);
+	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
+	                                        stringByAppendingPathComponent:@"rgfx-stitched-archive.bin"]];
+	CHECK(![archive serializeToURL:url error:&err]);
+	CHECK([err.localizedDescription isEqualToString:@"Nothing to serialize"]);
+
+	// A graph Metal cannot stitch is not added, with Metal's error.
+	MTLFunctionStitchingFunctionNode *missing =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"nope" arguments:@[] controlDependencies:@[]];
+	MTLStitchedLibraryDescriptor *bad = descriptor(lib, fused, @[], false);
+	bad.options = 0;
+	bad.functionGraphs = @[ [[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"bad"
+	                                                                          nodes:@[]
+	                                                                     outputNode:missing
+	                                                                     attributes:@[]] ];
+	err = nil;
+	CHECK(![archive addLibraryWithDescriptor:bad error:&err]);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorCompileFailure &&
+	      [err.localizedDescription containsString:@"missing function 'nope' required by DAG 'bad'"]);
+	// An archive with no device to stitch on adds none.
+	RgfxBinaryArchive *alone = [RgfxBinaryArchive archiveWithDescriptor:[MTLBinaryArchiveDescriptor new]
+	                                                              device:nil
+	                                                        architecture:@"arch_a"
+	                                                               error:&err];
+	CHECK(![alone addLibraryWithDescriptor:plain error:&err] && err != nil);
+	drain();
 }
 
 // A function answers Metal's private members from its shadow, Metal's own function of the same
@@ -5585,6 +5766,7 @@ int main()
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
 		test_stitched_dag_over_shadows();
+		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
 		test_library_members_as_metal();
 		test_command_graph();

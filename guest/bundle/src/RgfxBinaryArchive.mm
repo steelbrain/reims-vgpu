@@ -21,10 +21,12 @@
 #import "RgfxBinaryArchive.h"
 
 #import <objc/message.h>
+#import <objc/runtime.h>
 
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #import "RgfxFunction.h"
@@ -205,6 +207,65 @@ RgfxArchiveEntry fragmentKey(MTLRenderPipelineDescriptor *d)
 	return k.finish();
 }
 
+// A stitching graph's node, as a stitched library's key holds it: an input node's argument index,
+// or a function node's name, arguments and control dependencies, each in turn. A graph deeper
+// than any a framework builds keys only its first levels.
+void addStitchingNode(RgfxArchiveKey &k, id node, int depth)
+{
+	if ([node isKindOfClass:[MTLFunctionStitchingInputNode class]]) {
+		k.u32(1);
+		k.u64(((MTLFunctionStitchingInputNode *)node).argumentIndex);
+		return;
+	}
+	if (![node isKindOfClass:[MTLFunctionStitchingFunctionNode class]] || depth > 64) {
+		k.u32(0);
+		return;
+	}
+	MTLFunctionStitchingFunctionNode *f = node;
+	k.u32(2);
+	k.text(f.name.UTF8String);
+	k.u32(static_cast<uint32_t>(f.arguments.count));
+	for (id a in f.arguments)
+		addStitchingNode(k, a, depth + 1);
+	k.u32(static_cast<uint32_t>(f.controlDependencies.count));
+	for (id c in f.controlDependencies)
+		addStitchingNode(k, c, depth + 1);
+}
+
+// What Metal's archive finds a stitched library by (measured: macOS 27, M3 Max): each graph's
+// function name, nodes and attributes, and the functions it is made of, in any order and from any
+// library over the same bytes; not its options. False where a function is not one of this
+// device's, which no archive of it holds.
+bool RgfxStitchedKey(MTLStitchedLibraryDescriptor *descriptor, RgfxArchiveEntry &out)
+{
+	std::vector<RgfxArchiveEntry> functions;
+	for (id<MTLFunction> fn in descriptor.functions) {
+		if (![(id)fn isKindOfClass:[RgfxFunction class]])
+			return false;
+		RgfxArchiveKey f(kRgfxArchiveFunction);
+		addFunction(f, (RgfxFunction *)fn);
+		functions.push_back(f.finish());
+	}
+	std::sort(functions.begin(), functions.end());
+	RgfxArchiveKey k(kRgfxArchiveStitched);
+	k.u32(static_cast<uint32_t>(functions.size()));
+	for (const RgfxArchiveEntry &f : functions)
+		k.bytes(f.key, sizeof(f.key));
+	k.u32(static_cast<uint32_t>(descriptor.functionGraphs.count));
+	for (MTLFunctionStitchingGraph *g in descriptor.functionGraphs) {
+		k.text(g.functionName.UTF8String);
+		k.u32(static_cast<uint32_t>(g.attributes.count));
+		for (id attribute in g.attributes)
+			k.text(class_getName([attribute class]));
+		k.u32(static_cast<uint32_t>(g.nodes.count));
+		for (MTLFunctionStitchingFunctionNode *n in g.nodes)
+			addStitchingNode(k, n, 0);
+		addStitchingNode(k, g.outputNode, 0);
+	}
+	out = k.finish();
+	return true;
+}
+
 // A function no pipeline create looks up (a tile, object or mesh function, or one added alone):
 // its identity, and the formats and sample count it draws at, which tell entries apart.
 RgfxArchiveEntry recordedKey(uint8_t kind, RgfxFunction *fn, const std::vector<uint64_t> &formats,
@@ -320,6 +381,7 @@ NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &
 	std::vector<RgfxArchiveSection> _sections;
 	std::mutex _lock;
 	NSUInteger _options; // the descriptor's, as Metal's archive answers them (optionsOf)
+	std::set<RgfxArchiveEntry> _stitched; // stitched libraries, in memory only (kRgfxArchiveStitched)
 }
 
 @synthesize label = _label;
@@ -530,12 +592,48 @@ RGFX_LOG_UNRECOGNIZED
 	return YES;
 }
 
+// Metal's archive adds a stitched library by stitching it on its device into the archive
+// (newLibraryWithStitchedDescriptor:destinationBinaryArchive:error:, measured: macOS 27), so it
+// answers what that stitch answers: NO and Metal's error for a graph Metal cannot stitch, YES for
+// one it stitched, which a create that fails on a miss then finds.
 - (BOOL)addLibraryWithDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
                            error:(__autoreleasing NSError **)error
 {
-	(void)descriptor;
-	RGFX_UNSUPPORTED_ERROR(error, "stitched libraries (function pointers; the device answers "
-	                              "supportsFunctionPointers NO)");
+	if (![(id)_device conformsToProtocol:@protocol(RgfxStitchingDevice)]) {
+		RGFX_UNSUPPORTED_ERROR(error, "stitched libraries with no device to stitch them");
+		return NO;
+	}
+	NSError *err = nil;
+	id<MTLLibrary> lib = [(id<RgfxStitchingDevice>)_device newLibraryWithStitchedDescriptor:descriptor
+	                                                                 destinationBinaryArchive:self
+	                                                                                    error:&err];
+	if (error)
+		*error = lib != nil ? nil : err;
+	return lib != nil;
+}
+
+- (void)rgfxAddStitched:(MTLStitchedLibraryDescriptor *)descriptor
+{
+	RgfxArchiveEntry key;
+	if (!RgfxStitchedKey(descriptor, key))
+		return;
+	std::lock_guard<std::mutex> hold(_lock);
+	_stitched.insert(key);
+}
+
++ (BOOL)rgfxStitched:(MTLStitchedLibraryDescriptor *)descriptor heldBy:(NSArray *)archives
+{
+	RgfxArchiveEntry key;
+	if (!RgfxStitchedKey(descriptor, key))
+		return NO;
+	for (id a in archives) {
+		if (![a isKindOfClass:[RgfxBinaryArchive class]])
+			continue;
+		RgfxBinaryArchive *archive = a;
+		std::lock_guard<std::mutex> hold(archive->_lock);
+		if (archive->_stitched.count(key) != 0)
+			return YES;
+	}
 	return NO;
 }
 

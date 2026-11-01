@@ -10,6 +10,7 @@
 
 #import <objc/message.h>
 
+#import "RgfxBinaryArchive.h"
 #import "RgfxFunction.h"
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
@@ -808,16 +809,31 @@ id<MTLLibrary> RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions, RgfxLink
 	return lib;
 }
 
-id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, RgfxStitchBlock stitch,
-                                     RgfxLibraryMaker makeLibrary, NSError **error)
+id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, id<MTLBinaryArchive> destination,
+                                     RgfxStitchBlock stitch, RgfxLibraryMaker makeLibrary, NSError **error)
 {
+	if ((descriptor.options & MTLStitchedLibraryOptionFailOnBinaryArchiveMiss) != 0 &&
+	    ![RgfxBinaryArchive rgfxStitched:descriptor heldBy:descriptor.binaryArchives]) {
+		if (error)
+			*error = [NSError errorWithDomain:MTLLibraryErrorDomain
+			                             code:MTLLibraryErrorCompileFailure
+			                         userInfo:@{
+				                         NSLocalizedDescriptionKey : @"Failed to find library in binary archive."
+			                         }];
+		return nil;
+	}
 	MTLStitchedLibraryDescriptor *copy = [descriptor copy];
+	// Metal would read our archives as its own, and finds nothing where it fails on a miss with none.
 	copy.binaryArchives = @[];
-	return RgfxLinkOverShadows(
+	copy.options &= ~MTLStitchedLibraryOptionFailOnBinaryArchiveMiss;
+	id<MTLLibrary> lib = RgfxLinkOverShadows(
 	    descriptor.functions,
 	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
 		    copy.functions = shadows;
 		    return stitch(copy, e);
 	    },
 	    makeLibrary, error);
+	if (lib != nil && [(id)destination isKindOfClass:[RgfxBinaryArchive class]])
+		[(RgfxBinaryArchive *)destination rgfxAddStitched:descriptor];
+	return lib;
 }

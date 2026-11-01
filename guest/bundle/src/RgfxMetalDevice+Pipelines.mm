@@ -262,15 +262,12 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	return [self newLibraryWithStitchedDescriptor:descriptor destinationBinaryArchive:nil error:error];
 }
 
-// Our archives hold no stitched library yet (their addLibraryWithDescriptor: answers unsupported),
-// so `archive` keeps none.
 - (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
                           destinationBinaryArchive:(id<MTLBinaryArchive>)archive
                                              error:(__autoreleasing NSError **)error
 {
-	(void)archive;
 	return RgfxStitchOverShadows(
-	    descriptor,
+	    descriptor, archive,
 	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError *__autoreleasing *e) {
 		    return [self rgfxMetalStitch:shadowed error:e];
 	    },

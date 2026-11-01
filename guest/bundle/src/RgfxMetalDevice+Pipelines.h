@@ -21,11 +21,12 @@
 #ifndef RGFX_METAL_DEVICE_PIPELINES_H_
 #define RGFX_METAL_DEVICE_PIPELINES_H_
 
+#import "RgfxBinaryArchive.h"
 #import "RgfxMetalDevice.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface RgfxMetalDevice (Pipelines)
+@interface RgfxMetalDevice (Pipelines) <RgfxStitchingDevice>
 
 // Libraries.
 - (nullable id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data

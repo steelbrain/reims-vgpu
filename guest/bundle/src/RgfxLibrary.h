@@ -131,11 +131,16 @@ id<MTLLibrary> _Nullable RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions
 
 /// A stitched library of a descriptor (`newLibraryWithStitchedDescriptor:` and Metal's other
 /// descriptor entry points), by `stitch`, Metal's own, over a copy of `descriptor` whose functions
-/// are their shadows and which names no binary archive (Metal would read ours as its own), made
-/// ours as `RgfxLinkOverShadows` makes it.
+/// are their shadows and which names no binary archive (Metal would read ours as its own) nor fails
+/// on a miss, made ours as `RgfxLinkOverShadows` makes it, and kept in `destination` where that is
+/// one of ours. Where the descriptor fails on a binary-archive miss, its archives are looked up
+/// first (RgfxBinaryArchive), and where none holds it, none named included, it answers nil and
+/// Metal's error, MTLLibraryErrorDomain 3 "Failed to find library in binary archive." (measured:
+/// macOS 27).
 typedef id<MTLLibrary> _Nullable (^RgfxStitchBlock)(MTLStitchedLibraryDescriptor *descriptor,
                                                     NSError *__autoreleasing _Nullable *_Nullable error);
-id<MTLLibrary> _Nullable RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, RgfxStitchBlock stitch,
+id<MTLLibrary> _Nullable RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor,
+                                               id<MTLBinaryArchive> _Nullable destination, RgfxStitchBlock stitch,
                                                RgfxLibraryMaker makeLibrary,
                                                NSError *__autoreleasing _Nullable *_Nullable error);
 
