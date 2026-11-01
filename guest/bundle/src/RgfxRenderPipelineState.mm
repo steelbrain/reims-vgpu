@@ -337,6 +337,33 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	return nil;
 }
 
+// --- Metal's private members, as its pipelines answer them (measured: macOS 27, M3 Max) ---
+
+// 0 for every pipeline, one that supports indirect command buffers too.
+- (uint64_t)gpuAddress
+{
+	return 0;
+}
+
+// Unique and stable for the object while it lives: Metal's is an address inside its pipeline
+// object, ours the object's address.
+- (uint64_t)uniqueIdentifier
+{
+	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)self));
+}
+
+// Metal answers {0, 0, 0} and 0 for a vertex and fragment pipeline, the only kind the device
+// makes.
+- (MTLSize)requiredThreadsPerThreadgroup
+{
+	return MTLSizeMake(0, 0, 0);
+}
+
+- (NSUInteger)staticThreadgroupMemoryLength
+{
+	return 0;
+}
+
 // --- the mesh, object and tile stages a vertex/fragment pipeline has none of ------------
 // The device makes no mesh or tile pipeline (newRenderPipelineStateWithMeshDescriptor: and
 // ...TileDescriptor: answer nil), and Metal answers 0 for a pipeline without the stage.

@@ -1267,6 +1267,14 @@ void test_pipeline_state_members()
 	CHECK(plain.supportIndirectCommandBuffers == NO);
 	MTLSize none = plain.requiredThreadsPerThreadgroup;
 	CHECK(none.width == 0 && none.height == 0 && none.depth == 0);
+	// Metal's private members: no GPU address, and an identifier unique to the object.
+	auto u64 = [](id object, NSString *name) {
+		return ((uint64_t(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	CHECK(u64(cs, @"gpuAddress") == 0 && u64(plain, @"gpuAddress") == 0);
+	CHECK(u64(cs, @"uniqueIdentifier") == reinterpret_cast<uintptr_t>((__bridge void *)cs));
+	CHECK(u64(cs, @"uniqueIdentifier") == u64(cs, @"uniqueIdentifier"));
+	CHECK(u64(cs, @"uniqueIdentifier") != u64(plain, @"uniqueIdentifier"));
 
 	// --- render ---
 	MTLRenderPipelineDescriptor *rd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1289,6 +1297,13 @@ void test_pipeline_state_members()
 	CHECK(rs.requiredThreadsPerTileThreadgroup.width == 0);
 	CHECK(rs.requiredThreadsPerObjectThreadgroup.width == 0);
 	CHECK(rs.requiredThreadsPerMeshThreadgroup.width == 0);
+	CHECK(u64(rs, @"gpuAddress") == 0);
+	CHECK(u64(rs, @"uniqueIdentifier") == reinterpret_cast<uintptr_t>((__bridge void *)rs));
+	// The two members a compute pipeline declares, which Metal's render pipelines answer too.
+	id<MTLComputePipelineState> asCompute = (id<MTLComputePipelineState>)rs;
+	MTLSize rsRequired = asCompute.requiredThreadsPerThreadgroup;
+	CHECK(rsRequired.width == 0 && rsRequired.height == 0 && rsRequired.depth == 0);
+	CHECK(asCompute.staticThreadgroupMemoryLength == 0);
 	CHECK(rs.allocatedSize == 0);
 	CHECK([rs functionHandleWithFunction:vfn stage:MTLRenderStageVertex] == nil);
 	CHECK([rs newRenderPipelineDescriptorForSpecialization] == nil);

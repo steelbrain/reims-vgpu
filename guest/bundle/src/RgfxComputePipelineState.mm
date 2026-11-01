@@ -322,6 +322,21 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	return nil;
 }
 
+// --- Metal's private members, as its pipelines answer them (measured: macOS 27, M3 Max) ---
+
+// 0 for every pipeline, one that supports indirect command buffers too.
+- (uint64_t)gpuAddress
+{
+	return 0;
+}
+
+// Unique and stable for the object while it lives: Metal's is an address inside its pipeline
+// object, ours the object's address.
+- (uint64_t)uniqueIdentifier
+{
+	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)self));
+}
+
 // --- not on the wire ------------------------------------------------------------------
 // The host answers no pipeline's memory, imageblock or persistent-threadgroup queries yet
 // (RgfxPipelineReflection carries none): 0, logged.
