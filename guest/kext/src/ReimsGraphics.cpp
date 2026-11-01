@@ -913,6 +913,13 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	setProperty("IOAccelIndex", 0ull, 32);
 
+	// The framebuffer is its own controller's one dependent (index 0), named by its own registry
+	// ID. IOFramebuffer finishes a framebuffer's open (postOpen, in IOGraphics' open source) only
+	// for one with a dependent ID: there it publishes kIOFBNeedsRefreshKey, initialises the
+	// scanout (initFB) and tests the hardware cursor, which publishes kIOFBCursorInfoKey.
+	setProperty(kIOFBDependentIDKey, getRegistryEntryID(), 64);
+	setProperty(kIOFBDependentIndexKey, 0ull, 32);
+
 	// The timings the OS may program (validateDetailedTiming takes only the device's modes
 	// among them). The scanout has no signal of its own, so any sync and level goes, and
 	// nothing optional (interlace, DSC: a version 1 range); no link limits are given, as no
