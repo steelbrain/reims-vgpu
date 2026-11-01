@@ -360,6 +360,33 @@ uint64_t resourceId(MTLResourceID id)
 		[self setVisibleFunctionTable:visibleFunctionTables[i] atIndex:range.location + i];
 }
 
+// Metal's encoder answers these names too, and writes with them the bytes its atIndex: and
+// withRange: names write (measured: macOS 27, M3 Max).
+- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                       atBufferIndex:(NSUInteger)index
+{
+	[self setIntersectionFunctionTable:intersectionFunctionTable atIndex:index];
+}
+
+- (void)setIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                      withBufferRange:(NSRange)range
+{
+	[self setIntersectionFunctionTables:intersectionFunctionTables withRange:range];
+}
+
+- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)visibleFunctionTable
+                  atBufferIndex:(NSUInteger)index
+{
+	[self setVisibleFunctionTable:visibleFunctionTable atIndex:index];
+}
+
+- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])visibleFunctionTables
+                 withBufferRange:(NSRange)range
+{
+	[self setVisibleFunctionTables:visibleFunctionTables withRange:range];
+}
+
 // --- constants and nested argument buffers --------------------------------------------
 
 - (void *)constantDataAtIndex:(NSUInteger)index

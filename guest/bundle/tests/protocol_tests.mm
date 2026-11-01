@@ -1568,6 +1568,24 @@ void test_argument_encoder_members()
 	[enc setAccelerationStructure:nil atIndex:0];
 	[enc setVisibleFunctionTable:nil atIndex:0];
 	CHECK(wordAt(args, 0) == 0);
+	// The atBufferIndex: and withBufferRange: names write as atIndex: and withRange:.
+	auto tableAt = [&](const char *name) {
+		std::memset(args.contents, 0x5c, 16);
+		((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(enc, sel_registerName(name), nil, 1);
+		return wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull && wordAt(args, 8) == 0;
+	};
+	CHECK(tableAt("setVisibleFunctionTable:atBufferIndex:"));
+	CHECK(tableAt("setIntersectionFunctionTable:atBufferIndex:"));
+	auto tablesIn = [&](const char *name) {
+		std::memset(args.contents, 0x5c, 24);
+		const id none[2] = {nil, nil};
+		((void (*)(id, SEL, const id *, NSRange))objc_msgSend)(enc, sel_registerName(name), none,
+		                                                         NSMakeRange(1, 2));
+		return wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull && wordAt(args, 8) == 0 &&
+		       wordAt(args, 16) == 0;
+	};
+	CHECK(tablesIn("setVisibleFunctionTables:withBufferRange:"));
+	CHECK(tablesIn("setIntersectionFunctionTables:withBufferRange:"));
 
 	// A range writes each word in turn: the descriptors' layout of a texture, four pointers,
 	// a float4 and a float (measured: M3 Max, macOS 27).
