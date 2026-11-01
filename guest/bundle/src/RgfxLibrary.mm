@@ -691,9 +691,14 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 		completionHandler(fn, err);
 }
 
-// A function's reflection needs the host's per-argument bindings, which no reply carries.
+// A function's reflection: the shadow's, Metal's own of the same function, where the library
+// keeps its source (Core Image reflects its kernels so; measured: macOS 26.6.1). With no shadow it
+// would need the host's per-argument bindings, which no reply carries.
 - (MTLFunctionReflection *)reflectionForFunctionWithName:(NSString *)functionName
 {
+	id<MTLLibrary> shadow = [self rgfxShadow];
+	if ([shadow respondsToSelector:@selector(reflectionForFunctionWithName:)])
+		return [shadow reflectionForFunctionWithName:functionName];
 	RGFX_UNSUPPORTED("function reflection (the host sends no argument bindings)");
 	return nil;
 }

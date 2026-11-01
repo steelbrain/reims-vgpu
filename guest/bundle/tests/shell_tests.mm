@@ -1300,6 +1300,16 @@ void test_stitched_library_over_shadows()
 	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
 		       return [metal newLibraryWithData:d error:nil];
 	       }];
+	// A function's reflection is the shadow's, Metal's own answer (for this library, none), with
+	// no unsupported use; a library with no shadow answers none, as unsupported.
+	SEL reflect = @selector(reflectionForFunctionWithName:);
+	MTLFunctionReflection *reflected = [lib reflectionForFunctionWithName:@"stitch_caller"];
+	MTLFunctionReflection *metals =
+	    [[lib rgfxShadow] reflectionForFunctionWithName:@"stitch_caller"];
+	CHECK((reflected == nil) == (metals == nil) && reflected.bindings.count == metals.bindings.count);
+	CHECK(!RgfxUnsupportedWasLogged([RgfxLibrary class], reflect));
+	CHECK([make(bytes.bytes, bytes.length) reflectionForFunctionWithName:@"stitch_caller"] == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxLibrary class], reflect));
 	id<MTLFunction> add = [lib newFunctionWithName:@"stitch_add"];
 	id<MTLFunction> mul = [lib newFunctionWithName:@"stitch_mul"];
 	CHECK([(id)add isKindOfClass:[RgfxFunction class]] && [(RgfxFunction *)add rgfxShadow] == nil);
