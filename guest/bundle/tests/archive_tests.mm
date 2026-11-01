@@ -10,6 +10,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 
 #include <cstdint>
 #include <cstring>
@@ -307,6 +308,53 @@ void test_archive_files()
 	CHECK(e.code == MTLBinaryArchiveErrorInvalidFile);
 }
 
+// Its keys, one per entry of this architecture, and its options, the descriptor's as Metal's archive
+// answers them (measured: macOS 27, M3 Max).
+void test_archive_keys_and_options()
+{
+	NSError *e = nil;
+	RgfxBinaryArchive *a = archive(nil, @"arch_a", &e);
+	CHECK(a.keys.count == 0);
+	CHECK(a.options == 10); // the descriptor's default, 2
+	CHECK([a addComputePipelineFunctionsWithDescriptor:compute(function(@"a"), nil) error:&e]);
+	CHECK(a.keys.count == 1);
+	CHECK([a addComputePipelineFunctionsWithDescriptor:compute(function(@"a"), nil) error:&e]);
+	CHECK(a.keys.count == 1);
+	CHECK([a addRenderPipelineFunctionsWithDescriptor:render(nil) error:&e]);
+	CHECK(a.keys.count == 3);
+	MTLRenderPipelineDescriptor *r = render(nil);
+	r.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float; // a fragment function's key
+	CHECK([a addRenderPipelineFunctionsWithDescriptor:r error:&e]);
+	CHECK(a.keys.count == 4);
+	NSArray *keys = a.keys, *again = a.keys;
+	CHECK(keys != again && [keys isEqualToArray:again]);
+	CHECK([keys[0] hash] == [again[0] hash] && ![keys[0] isEqual:keys[1]]);
+	id copied = [(id<NSCopying>)keys[0] copyWithZone:nil];
+	CHECK(copied != keys[0] && [copied isEqual:keys[0]] && [copied hash] == [keys[0] hash]);
+	CHECK([[copied description] containsString:@" Key: "]);
+	CHECK([[NSSet setWithArray:keys] count] == 4);
+
+	// Loaded back, it answers the same keys; another architecture's archive answers none of them.
+	CHECK([a serializeToURL:at(@"keys.bin") error:&e]);
+	RgfxBinaryArchive *loaded = archive(at(@"keys.bin"), @"arch_a", &e);
+	CHECK([[NSSet setWithArray:loaded.keys] isEqualToSet:[NSSet setWithArray:keys]]);
+	CHECK(loaded.options == 10);
+	CHECK(archive(at(@"keys.bin"), @"arch_b", &e).keys.count == 0);
+
+	// The descriptor's options, with 8 added where it has any.
+	SEL setOptions = NSSelectorFromString(@"setOptions:");
+	MTLBinaryArchiveDescriptor *d = [MTLBinaryArchiveDescriptor new];
+	CHECK([d respondsToSelector:setOptions]);
+	for (NSUInteger o : {0ul, 1ul, 2ul, 5ul, 0x10ul, 0xfful}) {
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(d, setOptions, o);
+		RgfxBinaryArchive *b = [RgfxBinaryArchive archiveWithDescriptor:d
+		                                                         device:nil
+		                                                   architecture:@"arch_a"
+		                                                          error:&e];
+		CHECK(b.options == (o == 0 ? 0 : (o | 8)));
+	}
+}
+
 } // namespace
 
 void rgfxArchiveTests()
@@ -325,5 +373,6 @@ void rgfxArchiveTests()
 	test_archive_adding();
 	test_archive_lookups();
 	test_archive_files();
+	test_archive_keys_and_options();
 	[[NSFileManager defaultManager] removeItemAtPath:g_dir error:nil];
 }

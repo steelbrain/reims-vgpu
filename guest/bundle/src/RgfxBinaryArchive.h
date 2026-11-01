@@ -43,6 +43,13 @@ extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
 
 - (instancetype)init NS_UNAVAILABLE;
 
+/// The private members SkyLight, MPS and QuartzCore send an archive (measured: macOS 27, M3 Max):
+/// a key for each entry this device's architecture holds, equal to the key of the same entry and
+/// to its copy; and the options of the descriptor it was made of, with 8 added where it has any,
+/// as Metal's archive answers them.
+- (NSArray<id<NSCopying>> *)keys;
+- (NSUInteger)options;
+
 /// Metal's miss of a render pipeline of `descriptor` created with
 /// MTLPipelineOptionFailOnBinaryArchiveMiss: nil where its `binaryArchives` hold the key of each
 /// of its functions' compiles, or where it names no archive, as Metal then compiles it.

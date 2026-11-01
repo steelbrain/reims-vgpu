@@ -1,5 +1,6 @@
 /*
- * RgfxBinaryArchive: see RgfxBinaryArchive.h. Our own ObjC++; no Apple private SPI.
+ * RgfxBinaryArchive: see RgfxBinaryArchive.h. Our own ObjC++; the one Apple private member it
+ * reads is the descriptor's options, where the descriptor answers it.
  *
  * The keys, as Metal's miss and hit answers show what it keys each compile by (measured on the M3
  * Max, macOS 27, archive_probe.m), every function by its bitcode's hash, its name and the values
@@ -19,7 +20,10 @@
 
 #import "RgfxBinaryArchive.h"
 
+#import <objc/message.h>
+
 #include <algorithm>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -56,6 +60,41 @@ NSError *invalidFormat(NSURL *url)
 	return archiveError(
 	    MTLBinaryArchiveErrorInvalidFile,
 	    [NSString stringWithFormat:@"The file %@ has an invalid format.", url.absoluteString]);
+}
+
+// The options an archive of `d` answers: the descriptor's, with 8 added where it has any (Metal's
+// answer, measured on macOS 27, M3 Max: 0 answers 0, the default 2 answers 10, 0x10 answers
+// 0x18, 0xff answers 0xff; what the bit means nothing states). The member is private: 0 where
+// the descriptor does not answer it.
+NSUInteger optionsOf(MTLBinaryArchiveDescriptor *d)
+{
+	SEL options = NSSelectorFromString(@"options");
+	if (![d respondsToSelector:options])
+		return 0;
+	const NSUInteger o = ((NSUInteger (*)(id, SEL))objc_msgSend)(d, options);
+	return o != 0 ? (o | 8) : 0;
+}
+
+const char *kindName(uint8_t kind)
+{
+	switch (kind) {
+	case kRgfxArchiveCompute:
+		return "compute";
+	case kRgfxArchiveVertex:
+		return "vertex";
+	case kRgfxArchiveFragment:
+		return "fragment";
+	case kRgfxArchiveTile:
+		return "tile";
+	case kRgfxArchiveObject:
+		return "object";
+	case kRgfxArchiveMesh:
+		return "mesh";
+	case kRgfxArchiveFunction:
+		return "function";
+	default:
+		return "unknown";
+	}
 }
 
 // The refusal of a function another device's library made, as a pipeline create refuses it.
@@ -224,6 +263,51 @@ NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &
 
 } // namespace
 
+// One entry of an archive, as its keys answer it: equal, with the same hash, to a key of the same
+// entry, and a copy is another object equal to it, as Metal's binary keys are (measured).
+@interface RgfxBinaryKey : NSObject <NSCopying>
+- (instancetype)initWithEntry:(const RgfxArchiveEntry &)entry;
+@end
+
+@implementation RgfxBinaryKey {
+	RgfxArchiveEntry _entry;
+}
+
+- (instancetype)initWithEntry:(const RgfxArchiveEntry &)entry
+{
+	self = [super init];
+	if (self)
+		_entry = entry;
+	return self;
+}
+
+- (BOOL)isEqual:(id)object
+{
+	if (object == self)
+		return YES;
+	return [object isKindOfClass:[RgfxBinaryKey class]] && ((RgfxBinaryKey *)object)->_entry == _entry;
+}
+
+- (NSUInteger)hash
+{
+	NSUInteger h = 0;
+	std::memcpy(&h, _entry.key, sizeof(h));
+	return h ^ _entry.kind;
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+	return [[RgfxBinaryKey allocWithZone:zone] initWithEntry:_entry];
+}
+
+- (NSString *)description
+{
+	return [NSString stringWithFormat:@"<RgfxBinaryKey: %p> Key: \n %@ %s", self, hex(_entry),
+	                                  kindName(_entry.kind)];
+}
+
+@end
+
 @interface RgfxBinaryArchive ()
 - (BOOL)rgfxHolds:(const RgfxArchiveEntry &)entry;
 @end
@@ -235,6 +319,7 @@ NSError *miss(id<MTLFunction> fn, const char *pipeline, const RgfxArchiveEntry &
 	// `_architecture`, made at the first add.
 	std::vector<RgfxArchiveSection> _sections;
 	std::mutex _lock;
+	NSUInteger _options; // the descriptor's, as Metal's archive answers them (optionsOf)
 }
 
 @synthesize label = _label;
@@ -272,6 +357,7 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxBinaryArchive *a = [[RgfxBinaryArchive alloc] initWithDevice:device
 	                                                    architecture:architecture];
 	a->_sections = std::move(sections);
+	a->_options = optionsOf(descriptor);
 	if (error)
 		*error = nil;
 	return a;
@@ -306,6 +392,22 @@ RGFX_LOG_UNRECOGNIZED
 {
 	std::lock_guard<std::mutex> hold(_lock);
 	[self rgfxOwnSection].entries.insert(entry);
+}
+
+- (NSArray<id<NSCopying>> *)keys
+{
+	std::lock_guard<std::mutex> hold(_lock);
+	NSMutableArray<id<NSCopying>> *keys = [NSMutableArray array];
+	for (const RgfxArchiveSection &s : _sections)
+		if (s.architecture == _architecture)
+			for (const RgfxArchiveEntry &e : s.entries)
+				[keys addObject:[[RgfxBinaryKey alloc] initWithEntry:e]];
+	return [keys copy];
+}
+
+- (NSUInteger)options
+{
+	return _options;
 }
 
 - (BOOL)rgfxHolds:(const RgfxArchiveEntry &)entry
