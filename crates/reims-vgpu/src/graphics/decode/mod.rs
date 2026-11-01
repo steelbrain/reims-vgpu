@@ -4165,7 +4165,7 @@ mod tests {
     const STITCHABLE: &str = include_str!("../../../../../guest/bundle/tests/stitchable.metal");
 
     /// `stitch_caller`'s inputs, and what `fused` makes of them.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const STITCH_INPUTS: [f32; 3] = [2.0, 3.0, 4.0];
 
     /// What the guest sends of a stitched library, made on this Mac as the guest's route makes it
@@ -4261,7 +4261,7 @@ mod tests {
 
     /// Where a compute pipeline links `fused` from: one of the lists of `MTLLinkedFunctions`, or
     /// none.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const STITCH_LINKS: [Option<u32>; 3] = [
         Some(RGFX_LINKED_FUNCTIONS),
         Some(RGFX_LINKED_PRIVATE_FUNCTIONS),
@@ -4346,12 +4346,13 @@ mod tests {
     }
 
     /// What the guest's stitched library gets through the decoder on `P`: the two library creates
-    /// the guest sends (the caller's, then the stitched one), then for each of [`STITCH_LINKS`] a
+    /// the guest sends (`caller`'s bytes, then `stitched`'s), then for each of [`STITCH_LINKS`] a
     /// pipeline create of `stitch_caller` linking `fused` from the stitched library, and what each
     /// pipeline made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn stitched_links_through_the_decoder<P: crate::platform::ApiPlatform>(
-        s: &Stitched,
+        caller: &[u8],
+        stitched: &[u8],
     ) -> Vec<Option<f32>> {
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
@@ -4371,7 +4372,7 @@ mod tests {
         dec.set_reflection_sink(Arc::new(move |r: RgfxPipelineReflection| {
             sink_replies.lock().push((r.obj_id, r.status));
         }));
-        for (obj_id, bytes) in [(1, &s.caller_bytes), (2, &s.stitched_bytes)] {
+        for (obj_id, bytes) in [(1, caller), (2, stitched)] {
             let mut m = RgfxLibraryCreate {
                 header: RgfxMsgHeader {
                     r#type: RGFX_CMD_LIBRARY_CREATE,
@@ -4471,19 +4472,52 @@ mod tests {
         made
     }
 
+    /// The Vulkan crate's metallibs of the shell tests' stitchable functions and of the library
+    /// Metal's stitcher makes of them (its build.rs, `stitched`), which a host without Metal takes.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const COMMITTED_STITCHED: [&[u8]; 2] = [
+        include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitchable.metallib"),
+        include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitched.metallib"),
+    ];
+
     /// On Metal, a guest's stitched library is a library like any other: the library Metal's
     /// stitcher made in the guest, sent as its bytes, gives a function `stitch_caller`'s pipeline
     /// links from either list, as Metal's own does, and the pipeline writes what Metal's writes;
-    /// with nothing linked, it is refused, as Metal refuses it
+    /// with nothing linked, it is refused, as Metal refuses it. The Vulkan crate's committed
+    /// stitched metallibs get the same answers
     #[cfg(target_os = "macos")]
     #[test]
     fn on_metal_a_stitched_function_links_and_computes_as_metal_s() {
+        use reims_vgpu_metal::MetalPlatform;
         let s = stitched_on_metal();
         let metal = metal_s_own_stitched_links(&s);
         assert_eq!(metal, [Some(20.0), Some(20.0), None]);
         assert_eq!(
-            stitched_links_through_the_decoder::<reims_vgpu_metal::MetalPlatform>(&s),
+            stitched_links_through_the_decoder::<MetalPlatform>(&s.caller_bytes, &s.stitched_bytes),
             metal
+        );
+        let [caller, stitched] = COMMITTED_STITCHED;
+        assert_eq!(
+            stitched_links_through_the_decoder::<MetalPlatform>(caller, stitched),
+            metal
+        );
+    }
+
+    /// On the Vulkan platform, a guest's stitched library gets Metal's answers
+    /// (`on_metal_a_stitched_function_links_and_computes_as_metal_s`): the runtime links the
+    /// function Metal's stitcher made like any other, from either list, and the pipeline writes
+    /// 20; with nothing linked, it is refused. The one linked signature the runtime still refuses
+    /// (Unsupported, Feature::Linking), a linked-constants signature on a module that still
+    /// declares function constants, is not this library's: it declares none
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_stitched_function_links_and_computes_as_metal_s() {
+        let [caller, stitched] = COMMITTED_STITCHED;
+        assert_eq!(
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
+                caller, stitched
+            ),
+            [Some(20.0), Some(20.0), None]
         );
     }
 

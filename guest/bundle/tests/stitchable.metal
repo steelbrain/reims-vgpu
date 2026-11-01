@@ -1,6 +1,6 @@
-// The shell tests' and ci_probe's stitchable functions (Makefile): a stitched library's graph adds
-// two of its inputs and multiplies the sum by the third, as `fused`, which stitch_caller calls
-// from a library that links it.
+// The shell tests' and ci_probe's stitchable functions (Makefile), and the host tests' (the
+// Vulkan crate's build.rs): a stitched library's graph adds two of its inputs and multiplies the
+// sum by the third, as `fused`, which stitch_caller calls from a library that links it.
 #include <metal_stdlib>
 using namespace metal;
 

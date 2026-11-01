@@ -33,8 +33,11 @@
 //! `$OUT_DIR/tile_edges.metallib`, the tests' Core Image kernel, `src/gpu/ci_kernel.metal`,
 //! compiled as Core Image compiles one (`-fcikernel`, then `metallib -cikernel`) into
 //! `$OUT_DIR/ci_kernel.metallib`, and those that import a symbol from a dynamic library,
-//! `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]): the runtime makes
-//! libraries of metallibs, not of source. The two commands compile with the language Metal 4.0
+//! `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]), and the shell tests'
+//! stitchable functions, `guest/bundle/tests/stitchable.metal`, into
+//! `$OUT_DIR/stitchable.metallib`, with the library Metal's stitcher makes of them into
+//! `$OUT_DIR/stitched.metallib` ([`stitched`]): the runtime makes libraries of metallibs, not of
+//! source. The two commands compile with the language Metal 4.0
 //! and fast math, which are what Metal's own `newLibraryWithSource:options:error:` compiles the
 //! same source with: a new `MTLCompileOptions` reads `languageVersion` Metal 4.0 and `mathMode`
 //! Fast (measured on an M3 Max, macOS 26.7, 25G229). A Mac needs Xcode's Metal toolchain
@@ -77,6 +80,16 @@ const CI_KERNEL: [&str; 6] = ["metal", "-fcikernel", "-x", "metal", "-c", "-"];
 
 /// The commands that make the metallib of a Core Image kernel.
 const CI_KERNEL_LIBRARY: [&str; 2] = ["metallib", "-cikernel"];
+
+/// The commands that build `src/gpu/stitch.m`, the stitcher [`stitched`] runs.
+const STITCH_TOOL: [&str; 6] = [
+    "clang",
+    "-fobjc-arc",
+    "-framework",
+    "Metal",
+    "-framework",
+    "Foundation",
+];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
 const TEST_LIBRARIES: [&str; 22] = [
@@ -159,6 +172,22 @@ fn steps(manifest: &Path) -> Vec<Step> {
         files: vec!["ci_kernel.metallib".to_owned()],
         commands: format!("{} | {}", CI_KERNEL.join(" "), CI_KERNEL_LIBRARY.join(" ")),
         sources: vec![gpu.join("ci_kernel.metal")],
+        portable: true,
+    });
+    steps.push(Step {
+        files: vec![
+            "stitchable.metallib".to_owned(),
+            "stitched.metallib".to_owned(),
+        ],
+        commands: format!(
+            "{} | metallib | {} | stitch",
+            COMPILE.join(" "),
+            STITCH_TOOL.join(" ")
+        ),
+        sources: vec![
+            manifest.join("../../guest/bundle/tests/stitchable.metal"),
+            gpu.join("stitch.m"),
+        ],
         portable: true,
     });
     steps.push(Step {
@@ -261,7 +290,33 @@ fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
     let (air, metallib) = (out.join("ci_kernel.air"), out.join("ci_kernel.metallib"));
     xcrun_stdin(&CI_KERNEL, &source, &air)?;
     xcrun(&CI_KERNEL_LIBRARY, &air, &metallib)?;
+    stitched(manifest, out)?;
     imports(&manifest.join("src/gpu"), out)
+}
+
+/// Compiles the shell tests' stitchable functions into `stitchable.metallib`, and writes into
+/// `stitched.metallib` the library Metal's stitcher makes of its graph `fused` over them, as the
+/// bytes Metal answers for it: what a guest sends of a stitched library, which only Metal's
+/// stitcher makes. `src/gpu/stitch.m` stitches, on the CPU, on the Mac's default device.
+fn stitched(manifest: &Path, out: &Path) -> Result<(), String> {
+    let source = manifest.join("../../guest/bundle/tests/stitchable.metal");
+    let (air, stitchable, stitched) = (
+        out.join("stitchable.air"),
+        out.join("stitchable.metallib"),
+        out.join("stitched.metallib"),
+    );
+    xcrun(&COMPILE, &source, &air)?;
+    xcrun(&["metallib"], &air, &stitchable)?;
+    let tool = out.join("stitch");
+    xcrun(&STITCH_TOOL, &manifest.join("src/gpu/stitch.m"), &tool)?;
+    let mut cmd = Command::new(&tool);
+    cmd.arg(&stitchable).arg(&stitched);
+    let status = cmd.status().map_err(|e| format!("{cmd:?}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{cmd:?}: {status}"))
+    }
 }
 
 /// Copies the metallibs of every portable step from `dir` into `out`, once `dir`'s record names
