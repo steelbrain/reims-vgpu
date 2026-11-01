@@ -4,6 +4,7 @@
 
 #import "RgfxSharedEvent.h"
 #import "RgfxInterop.h"
+#import "RgfxMetalPrivate.h"
 
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
@@ -19,7 +20,7 @@
 RGFX_LOG_UNRECOGNIZED
 @end
 
-@interface RgfxSharedEvent ()
+@interface RgfxSharedEvent () <RgfxMetalSharedEventInternals>
 - (void)rgfxRaiseTo:(uint64_t)value;
 @end
 
@@ -117,6 +118,14 @@ RGFX_LOG_UNRECOGNIZED
 - (uint64_t)globalTraceObjectID
 {
 	return _traceId;
+}
+
+// The event as an IOSurface shared event, which Core Image asks for: the event itself, as Metal's
+// (measured on the M3 Max under macOS 27: the same object, of its own class; a plain MTLEvent
+// answers no such member).
+- (id)IOSurfaceSharedEvent
+{
+	return self;
 }
 
 - (uint64_t)signaledValue

@@ -19,10 +19,12 @@
 #include <IOSurface/IOSurface.h>
 
 #import "RgfxBuffer.h"
+#import "RgfxEvent.h"
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxSampler.h"
+#import "RgfxSharedEvent.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -823,6 +825,25 @@ void test_sampler_answers()
 	drainRing(fx.ring);
 }
 
+// A shared event answers itself as its IOSurface shared event, as Metal's; a plain event answers
+// no such member.
+void test_shared_event_answers()
+{
+	Fixture fx;
+	@autoreleasepool {
+		RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:0
+		                                                             device:nil
+		                                                         serializer:&fx.ser];
+		CHECK(ev != nil);
+		drainRing(fx.ring);
+		CHECK([(id<RgfxMetalSharedEventInternals>)ev IOSurfaceSharedEvent] == ev);
+		CHECK(ringEmpty(fx.ring));
+		RgfxEvent *plain = [RgfxEvent eventWithDevice:nil serializer:&fx.ser];
+		CHECK(plain != nil && ![plain respondsToSelector:@selector(IOSurfaceSharedEvent)]);
+	}
+	drainRing(fx.ring);
+}
+
 } // namespace
 
 void rgfxResourceTests()
@@ -835,4 +856,5 @@ void rgfxResourceTests()
 	test_texture_compression();
 	test_texture_answers();
 	test_sampler_answers();
+	test_shared_event_answers();
 }

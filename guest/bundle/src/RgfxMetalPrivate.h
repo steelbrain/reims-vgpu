@@ -197,6 +197,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (uint64_t)uniqueIdentifier;
 @end
 
+@protocol RgfxMetalSharedEventInternals
+// `@16@0:8`: the event as an IOSurface shared event.
+- (id)IOSurfaceSharedEvent;
+@end
+
 @protocol RgfxMetalHeapInternals
 // `Q16@0:8`: the heap's base address, where a resource at offset 0 lies.
 - (uint64_t)gpuAddress;
