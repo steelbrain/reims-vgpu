@@ -4159,6 +4159,334 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// The shell tests' stitchable functions (guest/bundle/tests/stitchable.metal): `fused`, a
+    /// stitched graph of two of them, is `(a + b) * c`, which `stitch_caller` writes of its inputs.
+    #[cfg(target_os = "macos")]
+    const STITCHABLE: &str = include_str!("../../../../../guest/bundle/tests/stitchable.metal");
+
+    /// `stitch_caller`'s inputs, and what `fused` makes of them.
+    #[cfg(target_os = "macos")]
+    const STITCH_INPUTS: [f32; 3] = [2.0, 3.0, 4.0];
+
+    /// What the guest sends of a stitched library, made on this Mac as the guest's route makes it
+    /// (the bundle's `RgfxStitchOverShadows`): the caller's library, compiled by Metal, and the
+    /// library Metal's stitcher makes of the graph `fused` over that library's functions, each the
+    /// bytes Metal answers for it (`libraryDataContents`); and Metal's own device and libraries.
+    #[cfg(target_os = "macos")]
+    struct Stitched {
+        device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
+        caller: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLLibrary>>,
+        stitched: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLLibrary>>,
+        caller_bytes: Vec<u8>,
+        stitched_bytes: Vec<u8>,
+    }
+
+    /// [`Stitched`], made on this Mac's default device.
+    #[cfg(target_os = "macos")]
+    fn stitched_on_metal() -> Stitched {
+        use objc2::rc::Retained;
+        use objc2::runtime::ProtocolObject;
+        use objc2::{AnyThread as _, msg_send};
+        use objc2_foundation::{NSArray, NSData, NSString};
+        use objc2_metal::{
+            MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice as _,
+            MTLFunctionStitchingAttribute, MTLFunctionStitchingFunctionNode,
+            MTLFunctionStitchingGraph, MTLFunctionStitchingInputNode, MTLFunctionStitchingNode,
+            MTLLibrary, MTLStitchedLibraryDescriptor,
+        };
+        let bytes = |library: &ProtocolObject<dyn MTLLibrary>| {
+            // SAFETY: Metal's library answers its bytes to this selector (measured: macOS 27).
+            let data: Retained<NSData> = unsafe { msg_send![library, libraryDataContents] };
+            data.to_vec()
+        };
+        let device = MTLCreateSystemDefaultDevice().expect("a Metal device");
+        let caller = device
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(STITCHABLE),
+                Some(&MTLCompileOptions::new()),
+            )
+            .unwrap();
+        let input = |index| {
+            let node = MTLFunctionStitchingInputNode::alloc();
+            // SAFETY: an argument index of the graph's three.
+            let node = unsafe { MTLFunctionStitchingInputNode::initWithArgumentIndex(node, index) };
+            ProtocolObject::<dyn MTLFunctionStitchingNode>::from_retained(node)
+        };
+        let call =
+            |name: &str, arguments: &[Retained<ProtocolObject<dyn MTLFunctionStitchingNode>>]| {
+                MTLFunctionStitchingFunctionNode::initWithName_arguments_controlDependencies(
+                    MTLFunctionStitchingFunctionNode::alloc(),
+                    &NSString::from_str(name),
+                    &NSArray::from_retained_slice(arguments),
+                    &NSArray::new(),
+                )
+            };
+        let sum = call("stitch_add", &[input(0), input(1)]);
+        let product = call(
+            "stitch_mul",
+            &[ProtocolObject::from_retained(sum.clone()), input(2)],
+        );
+        let graph = MTLFunctionStitchingGraph::initWithFunctionName_nodes_outputNode_attributes(
+            MTLFunctionStitchingGraph::alloc(),
+            &NSString::from_str("fused"),
+            &NSArray::from_retained_slice(&[sum]),
+            Some(&product),
+            &NSArray::<ProtocolObject<dyn MTLFunctionStitchingAttribute>>::new(),
+        );
+        let function = |name: &str| {
+            caller
+                .newFunctionWithName(&NSString::from_str(name))
+                .unwrap()
+        };
+        let descriptor = MTLStitchedLibraryDescriptor::new();
+        descriptor.setFunctionGraphs(&NSArray::from_retained_slice(&[graph]));
+        // SAFETY: the functions are of a library of this device.
+        unsafe {
+            descriptor.setFunctions(&NSArray::from_retained_slice(&[
+                function("stitch_add"),
+                function("stitch_mul"),
+            ]))
+        };
+        let stitched = device
+            .newLibraryWithStitchedDescriptor_error(&descriptor)
+            .unwrap();
+        Stitched {
+            caller_bytes: bytes(&caller),
+            stitched_bytes: bytes(&stitched),
+            device,
+            caller,
+            stitched,
+        }
+    }
+
+    /// Where a compute pipeline links `fused` from: one of the lists of `MTLLinkedFunctions`, or
+    /// none.
+    #[cfg(target_os = "macos")]
+    const STITCH_LINKS: [Option<u32>; 3] = [
+        Some(RGFX_LINKED_FUNCTIONS),
+        Some(RGFX_LINKED_PRIVATE_FUNCTIONS),
+        None,
+    ];
+
+    /// Metal's own answers: for each of [`STITCH_LINKS`], whether Metal makes `stitch_caller`'s
+    /// pipeline with `fused` linked there, and what the pipeline writes of [`STITCH_INPUTS`].
+    #[cfg(target_os = "macos")]
+    fn metal_s_own_stitched_links(s: &Stitched) -> Vec<Option<f32>> {
+        use objc2_foundation::{NSArray, NSString};
+        use objc2_metal::{
+            MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+            MTLComputeCommandEncoder as _, MTLComputePipelineDescriptor, MTLDevice as _,
+            MTLLibrary as _, MTLLinkedFunctions, MTLPipelineOption, MTLResourceOptions, MTLSize,
+        };
+        let kernel = s
+            .caller
+            .newFunctionWithName(&NSString::from_str("stitch_caller"))
+            .unwrap();
+        let fused = s
+            .stitched
+            .newFunctionWithName(&NSString::from_str("fused"))
+            .unwrap();
+        STITCH_LINKS
+            .iter()
+            .map(|&list| {
+                let d = MTLComputePipelineDescriptor::new();
+                d.setComputeFunction(Some(&kernel));
+                let linked = MTLLinkedFunctions::new();
+                let one = NSArray::from_retained_slice(std::slice::from_ref(&fused));
+                match list {
+                    Some(RGFX_LINKED_FUNCTIONS) => linked.setFunctions(Some(&one)),
+                    Some(_) => linked.setPrivateFunctions(Some(&one)),
+                    None => {}
+                }
+                d.setLinkedFunctions(Some(&linked));
+                let state = s
+                    .device
+                    .newComputePipelineStateWithDescriptor_options_reflection_error(
+                        &d,
+                        MTLPipelineOption::None,
+                        None,
+                    )
+                    .ok()?;
+                let input = STITCH_INPUTS.map(f32::to_le_bytes).concat();
+                // SAFETY: `input` holds the length given.
+                let inputs = unsafe {
+                    s.device.newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(input.as_ptr().cast_mut().cast()).unwrap(),
+                        input.len(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .unwrap();
+                let output = s
+                    .device
+                    .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+                    .unwrap();
+                let queue = s.device.newCommandQueue().unwrap();
+                let cb = queue.commandBuffer().unwrap();
+                let enc = cb.computeCommandEncoder().unwrap();
+                enc.setComputePipelineState(&state);
+                // SAFETY: the kernel's two buffers, at its indices.
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&output), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(&inputs), 0, 1);
+                }
+                let one = MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+                enc.endEncoding();
+                cb.commit();
+                cb.waitUntilCompleted();
+                // SAFETY: the GPU wrote the buffer's 4 bytes, and is done.
+                Some(unsafe { output.contents().cast::<f32>().read() })
+            })
+            .collect()
+    }
+
+    /// What the guest's stitched library gets through the decoder on `P`: the two library creates
+    /// the guest sends (the caller's, then the stitched one), then for each of [`STITCH_LINKS`] a
+    /// pipeline create of `stitch_caller` linking `fused` from the stitched library, and what each
+    /// pipeline made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
+    #[cfg(target_os = "macos")]
+    fn stitched_links_through_the_decoder<P: crate::platform::ApiPlatform>(
+        s: &Stitched,
+    ) -> Vec<Option<f32>> {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_core::platform::values::ComputePassDesc;
+        use reims_vgpu_core::raise::OnFault;
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r: RgfxPipelineReflection| {
+            sink_replies.lock().push((r.obj_id, r.status));
+        }));
+        for (obj_id, bytes) in [(1, &s.caller_bytes), (2, &s.stitched_bytes)] {
+            let mut m = RgfxLibraryCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_LIBRARY_CREATE,
+                    size: (RGFX_LIBRARY_BYTES_OFFSET as usize + bytes.len()).next_multiple_of(8)
+                        as u32,
+                    seqno: obj_id,
+                },
+                obj_id,
+                byte_length: bytes.len() as u64,
+                ..RgfxLibraryCreate::default()
+            }
+            .as_bytes()
+            .to_vec();
+            m.extend_from_slice(bytes);
+            m.resize(m.len().next_multiple_of(8), 0);
+            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        }
+        let mut made = Vec::new();
+        for (n, &list) in STITCH_LINKS.iter().enumerate() {
+            let obj_id = 100 + n as u64;
+            let mut bytes = compute_create(obj_id);
+            let name = b"stitch_caller";
+            let at = bytes.len() as u32;
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+            let specs: Vec<LinkedSpec<'_>> = list
+                .map(|list| ("fused", list, 0, "", &[][..], ""))
+                .into_iter()
+                .collect();
+            let tail = append_linked(&mut bytes, 2, &specs);
+            edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+                (m.name_offset, m.name_len) = (at, name.len() as u32);
+                (m.linked_offset, m.linked_count) = tail;
+            });
+            let decoded = dec.decode(&device, &bytes).unwrap();
+            assert!(
+                decoded == Ok(()) || decoded == Err(DecodeError::Refused),
+                "{list:?}: {decoded:?}"
+            );
+            let status = replies
+                .lock()
+                .pop()
+                .map(|(id, status)| (id == obj_id, status));
+            let Some(ObjHandle::ComputePipeline(pipeline)) = dec.objects.get(&obj_id) else {
+                assert_eq!(status, Some((true, RGFX_PIPELINE_REFUSED)), "{list:?}");
+                made.push(None);
+                continue;
+            };
+            assert_eq!(status, Some((true, RGFX_PIPELINE_OK)), "{list:?}");
+            let buffer = |len| {
+                device
+                    .new_buffer_of_length(OnFault::Return, len, 0)
+                    .unwrap()
+                    .unwrap()
+            };
+            let (output, inputs) = (buffer(4), buffer(12));
+            // SAFETY: the buffer is Shared and holds 12 bytes; the GPU has not started.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    STITCH_INPUTS.as_ptr(),
+                    inputs.contents().as_ptr::<f32>(),
+                    3,
+                )
+            };
+            let queue = device.new_command_queue().unwrap();
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let enc = cb
+                .compute_encoder_for_pass(&ComputePassDesc::default())
+                .unwrap()
+                .unwrap();
+            let one = MtlSize::new(1, 1, 1);
+            for cmd in [
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(pipeline),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&output), Some(&inputs)],
+                    offsets: &[0, 0],
+                    range: NsRange {
+                        location: 0,
+                        length: 2,
+                    },
+                },
+                ComputeCmd::DispatchThreadgroups {
+                    threadgroups_per_grid: one,
+                    threads_per_threadgroup: one,
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                enc.encode(OnFault::Return, cmd).unwrap();
+            }
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            // SAFETY: the GPU wrote the buffer's 4 bytes, and is done.
+            made.push(Some(unsafe { output.contents().as_ptr::<f32>().read() }));
+        }
+        made
+    }
+
+    /// On Metal, a guest's stitched library is a library like any other: the library Metal's
+    /// stitcher made in the guest, sent as its bytes, gives a function `stitch_caller`'s pipeline
+    /// links from either list, as Metal's own does, and the pipeline writes what Metal's writes;
+    /// with nothing linked, it is refused, as Metal refuses it
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_stitched_function_links_and_computes_as_metal_s() {
+        let s = stitched_on_metal();
+        let metal = metal_s_own_stitched_links(&s);
+        assert_eq!(metal, [Some(20.0), Some(20.0), None]);
+        assert_eq!(
+            stitched_links_through_the_decoder::<reims_vgpu_metal::MetalPlatform>(&s),
+            metal
+        );
+    }
+
     /// A render and a compute pipeline create each resolve their functions from a
     /// library, call the right platform creator, store the handle and emit a
     /// reflection reply keyed to the create's seqno; a pipeline that names a
