@@ -204,6 +204,13 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (a->scalarInputCount != 1)
 			return kIOReturnBadArgument;
 		return owner->releaseSurfaceBlock(this, in[0]);
+	case kRgfxAccelMethodSurfaceWrites:
+		return surfaceWritesMethod(a);
+	case kRgfxAccelMethodSurfaceRetire:
+		if (a->scalarInputCount != 2 || !ownsQueue(in[0]))
+			return kIOReturnBadArgument;
+		owner->retireSurfaceWrites(in[0], in[1]);
+		return kIOReturnSuccess;
 	default:
 		return kIOReturnUnsupported;
 	}
@@ -319,6 +326,52 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		memcpy(a->structureOutput, reply, n);
 	a->structureOutputSize = n;
 	return kIOReturnSuccess;
+}
+
+// Whether `queue` is one of the client's open queues.
+bool RgfxAcceleratorUserClient::ownsQueue(UInt64 queue)
+{
+	IOLockLock(queueLock);
+	bool owns = false;
+	for (UInt32 i = 0; i < queueCount && !owns; i++)
+		owns = queues[i] == queue;
+	IOLockUnlock(queueLock);
+	return owns;
+}
+
+// kRgfxAccelMethodSurfaceWrites (RgfxAccelerator.hpp): the surfaces a command buffer of one of the
+// client's queues writes, whose CPU locks wait for it from here.
+IOReturn RgfxAcceleratorUserClient::surfaceWritesMethod(IOExternalMethodArguments *a)
+{
+	if (!hasContext || a->scalarInputCount != 0 || a->scalarOutputCount != 0)
+		return kIOReturnBadArgument;
+	IOMemoryDescriptor *desc = a->structureInputDescriptor;
+	UInt64 size = desc ? desc->getLength() : a->structureInputSize;
+	if (size < 3 * sizeof(UInt64) || size % sizeof(UInt64) || size > kMaxSurfaceWritesBytes)
+		return kIOReturnBadArgument;
+	UInt64 *words = static_cast<UInt64 *>(IOMalloc(size));
+	if (!words)
+		return kIOReturnNoMemory;
+	IOReturn r = kIOReturnSuccess;
+	if (desc) {
+		r = desc->prepare(kIODirectionOut);
+		if (r == kIOReturnSuccess) {
+			if (desc->readBytes(0, words, size) != size)
+				r = kIOReturnBadArgument;
+			desc->complete(kIODirectionOut);
+		}
+	} else {
+		memcpy(words, a->structureInput, size);
+	}
+	const UInt64 count = r == kIOReturnSuccess ? words[2] : 0;
+	if (r == kIOReturnSuccess && (count != (size / sizeof(UInt64) - 3) / 2 ||
+	                              size != (3 + 2 * count) * sizeof(UInt64) || !ownsQueue(words[0])))
+		r = kIOReturnBadArgument;
+	if (r == kIOReturnSuccess)
+		owner->noteSurfaceWrites(this, task, words[0], words[1], words + 3,
+		                         static_cast<UInt32>(count));
+	IOFree(words, size);
+	return r;
 }
 
 // kRgfxAccelMethodWaitCompletions (RgfxAccelerator.hpp): the bundle's completion thread

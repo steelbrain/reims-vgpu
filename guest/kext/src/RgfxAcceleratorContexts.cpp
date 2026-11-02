@@ -58,6 +58,7 @@ constexpr UInt32 kMaxBlocks = 16384;
 constexpr UInt32 kMaxWatched = 2048;
 // A ring header's fields (RgfxRingHeader).
 constexpr UInt32 kRingProducer = 0x00;
+constexpr UInt32 kRingCompletedSeqno = 0x08;
 constexpr UInt32 kRingConsumer = 0x40;
 // How long a QUEUE_CREATE and a CONTEXT_CLOSE wait for their answers: the host takes the
 // control ring in order, behind whatever pipeline compiles were posted before them.
@@ -546,6 +547,8 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
 	if (!release)
 		rgfxBlockKeepAt(blockTable, e.offset);
 	freeRuns(e.runs, e.runCount);
+	// Its surface's locks no longer wait for the writes named of it.
+	rgfxSurfaceLocksForget(e.cache, e.surface);
 	rgfxSurfaceClear(e);
 	return release;
 }
@@ -795,6 +798,34 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 	return gone == kRgfxSurfaceLetGoNotHeld ? kIOReturnBadArgument : kIOReturnSuccess;
 }
 
+bool RgfxAccelerator::surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t task,
+                                         UInt64 offset, uint32_t surfaceId, void **cache,
+                                         OSObject **surface, bool *inPlace)
+{
+	if (!contextLock)
+		return false;
+	RgfxSurfaceTable &table = surfaceTable;
+	IOLockLock(contextLock);
+	int32_t at = table.entries ? rgfxSurfaceAt(table, offset) : -1;
+	RgfxSurfaceEntry *e = at >= 0 ? &table.entries[at] : nullptr;
+	bool ok = e && !e->pending && e->runCount && rgfxSurfaceHeldBy(table, client, offset, 1);
+	if (ok && !e->cache && !e->noCache) {
+		e->noCache = !rgfxSurfaceLocksAttach(this, task, surfaceId, e->runs[0].address,
+		                                     &e->surface, &e->cache);
+		if (!e->noCache)
+			e->surfaceId = surfaceId;
+	}
+	ok = ok && e->cache && e->surfaceId == surfaceId;
+	if (ok) {
+		*cache = e->cache;
+		*surface = static_cast<OSObject *>(e->surface);
+		(*surface)->retain();
+		*inPlace = e->inPlace;
+	}
+	IOLockUnlock(contextLock);
+	return ok;
+}
+
 void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)
 {
 	if (!contextLock)
@@ -888,8 +919,11 @@ void RgfxAccelerator::unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 obj
 		}
 	}
 	IOLockUnlock(watchLock);
-	if (map)
+	if (map) {
+		// The queue's writes go with it: none of its buffers holds a lock any more.
+		forgetQueueWrites(objId);
 		map->release();
+	}
 }
 
 void RgfxAccelerator::unwatchClient(RgfxAcceleratorUserClient *client)
@@ -900,6 +934,7 @@ void RgfxAccelerator::unwatchClient(RgfxAcceleratorUserClient *client)
 	for (UInt32 i = 0; i < watchedCount;) {
 		if (watched[i].client == client) {
 			// Released under the lock: the scan never meets a ring whose map is gone.
+			forgetQueueWrites(watched[i].objId);
 			watched[i].map->release();
 			watched[i] = watched[--watchedCount];
 		} else {
@@ -927,6 +962,24 @@ void RgfxAccelerator::queueInterrupt()
 			w.client->wakeCompletions();
 	}
 	IOLockUnlock(watchLock);
+	// A lock waiting for a surface drawn in place looks at the completions again.
+	rgfxSurfaceLocksWake();
+}
+
+UInt64 RgfxAccelerator::queueCompleted(UInt64 objId)
+{
+	if (!watchLock)
+		return 0;
+	UInt64 completed = 0;
+	IOLockLock(watchLock);
+	for (UInt32 i = 0; i < watchedCount; i++) {
+		if (watched[i].objId == objId) {
+			completed = loadHeader64(watched[i].header, kRingCompletedSeqno);
+			break;
+		}
+	}
+	IOLockUnlock(watchLock);
+	return completed;
 }
 
 // MARK: - The object lifecycle

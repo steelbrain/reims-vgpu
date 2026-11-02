@@ -43,9 +43,18 @@
  *   - before a commit, from the pages, where the surface's seed is not the header's: a CPU
  *     wrote the surface under a lock since any holder synced it;
  *   - when a command buffer that writes the copy completes, before it reports completion,
- *     back to the pages, so a CPU lock in any process reads the GPU's results. A write is a
- *     render attachment, a blit's destination or a compute texture with ShaderWrite usage.
- * The seed after a write-back is the header's, so no holder reads that write back.
+ *     back to the pages, with no lock of the surface. A write is a render attachment, a
+ *     blit's destination or a compute texture with ShaderWrite usage.
+ *
+ * A CPU lock of a surface, in any process, waits for the GPU's pending writes to it, as Metal's
+ * does (the kext's RgfxSurfaceLocks.hpp). A commit of a buffer that writes a surface's shared
+ * block, in place or a copy, names the surface to the kext before the commit returns
+ * (rgfxIOSurfaceWritesPosted), and the kext keeps every lock of it waiting until the write
+ * retires: at the buffer's completion, once a copy is written back (rgfxIOSurfaceRetire), or for
+ * a view in place once the device has completed the buffer. The kext marks each surface named
+ * the GPU's (IOSurface's device cache), which moves its seed once for the buffer as Metal's
+ * submission does, and a copy records that seed in its header, so no holder takes the pages over
+ * the GPU's results at its next commit. The seed after a write-back is that one.
  *
  * After the header lie the view's writers (RgfxSurfaceWriters, reims_graphics_wire.h), which the
  * texture's create names to the host: a present of the surface shows the view once the command
@@ -70,7 +79,7 @@
  * however often the texture is asked for (rgfxIOSurfaceNilLog).
  *
  * Left for later, for a copy: syncing the pages at the CPU's lock instead of at every GPU
- * write's completion (IOSurface's device caches); CPU writes made without a lock. In either
+ * write's completion (the device cache's sync); CPU writes made without a lock. In either
  * mode, a texture's own CPU reads and writes cover one-element-per-pixel formats only.
  *
  * Our own ObjC++.
@@ -124,6 +133,27 @@ void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 /// has ShaderWrite.
 void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 
+/// Where the writes `writes` (taken from a command buffer's encoder) are named to the kext: the
+/// region of their surfaces' shared blocks, null where none is of a shared block. A buffer with
+/// one names them after it is posted (rgfxIOSurfaceWritesPosted), and retires them at its
+/// completion (rgfxIOSurfaceRetire) whether or not the naming came first.
+RgfxRegion *_Nullable rgfxIOSurfaceWritesRegion(const std::vector<std::shared_ptr<void>> &writes);
+
+/// After a command buffer is posted at seqno `seqno` on queue `queueObjId`: names the surfaces
+/// it writes, those with shared blocks in `region`, to the kext once each. A CPU lock of one of
+/// them, in any process, then waits until the buffer's results are in its pages, as Metal's
+/// does once a buffer is submitted. The kext marks each surface the GPU's, which moves its seed,
+/// and each copy records that seed as its own, so no holder takes the pages over the GPU's
+/// results at its next commit.
+void rgfxIOSurfaceWritesPosted(RgfxRegion *_Nonnull region,
+                               const std::vector<std::shared_ptr<void>> &writes,
+                               uint64_t queueObjId, uint64_t seqno);
+
+/// At the completion of queue `queueObjId`'s buffer at `seqno`, once its results are in the
+/// surfaces' pages (after rgfxIOSurfaceWriteBack): its writes, and those of the queue's buffers
+/// before it, retire, and the CPU locks waiting for them go on.
+void rgfxIOSurfaceRetire(RgfxRegion *_Nonnull region, uint64_t queueObjId, uint64_t seqno);
+
 /// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is
 /// `queueObjId`): names it among the writers of each copy in `writes` (taken from its encoder),
 /// once each, so a present of the surface after this waits for it.
@@ -131,7 +161,9 @@ void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes
                                 uint64_t queueObjId, uint64_t seqno);
 
 /// At a command buffer's completion: writes each copy in `writes` (taken from its
-/// encoder) back to its surface's pages, once each (a view in place needs none).
+/// encoder) back to its surface's pages, once each (a view in place needs none). It takes no
+/// lock of the surface: a lock waits for this buffer's writes, which retire only after it, and
+/// a GPU's write leaves the seed where the commit moved it.
 void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes);
 
 /// How many textures over `surface` were answered nil for `cause` ("arguments", "plane",

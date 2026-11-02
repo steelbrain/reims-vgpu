@@ -67,6 +67,14 @@ struct RgfxSurfaceEntry {
 	uint32_t runCount;
 	RgfxSurfaceHold holds[kRgfxSurfaceHolders];
 	uint32_t holdCount;
+	// The surface's IOSurface and its device cache (RgfxAcceleratorLocks.cpp), opaque here, made
+	// at the first write a holder names and kept with the entry (the surface retained); null
+	// before. `surfaceId` is the IOSurfaceID they were made for, and `noCache` says they could
+	// not be, so no later write tries again.
+	void *surface;
+	void *cache;
+	uint32_t surfaceId;
+	bool noCache;
 };
 
 struct RgfxSurfaceTable {

@@ -301,11 +301,34 @@ Stages:
       matrix), which the host's surface creator reads as Metal reads the
       surface. The copy syncs from the pages before
       a commit where the surface's seed moved since any holder synced it, and
-      back to the pages at the completion of each command buffer that writes
-      it, since no lock callback reaches the bundle yet. The block's header
-      holds the seed every holder agrees on (`guest/bundle/src/RgfxIOSurface.h`).
-      Moving the copy's write-back to the CPU's lock, through IOSurface's
-      device caches, is what is left of this item.
+      back to the pages, with no lock of the surface, at the completion of
+      each command buffer that writes it. The block's header holds the seed
+      every holder agrees on (`guest/bundle/src/RgfxIOSurface.h`). Moving the
+      copy's write-back to the CPU's lock (the device cache's op 0) is what is
+      left of this item.
+    - **CPU locks** wait for the GPU's pending writes, as Metal's do on the
+      x86-64 Macs (measured on a MacBook Pro's AMD Radeon Pro 5300M and Intel
+      UHD 630 under macOS 26.7, `guest/bundle/tools/lock_probe.m`): a
+      read-only or read-write lock of a surface, in any process, the
+      committer's included once the buffer is submitted, returns once every
+      buffer that writes the surface has finished and its results are in the
+      pages; a pending buffer that only reads the surface holds no lock (the
+      M3 Max's read-write lock waits for it too). The kext drives IOSurface's
+      device caches as those Macs' drivers do (measured with fbt on the AMD's
+      IOAcceleratorFamily2 and the guest's IOGPU; the kext's
+      `RgfxIOSurfaceKPI.hpp`). At the first write a process names of a
+      surface's shared block, the kext looks the surface up by the
+      IOSurfaceID the process gives and takes it only where its memory holds
+      the block's first page, makes its device cache for the accelerator with
+      the kext's control function, and keeps both with the block. Each write
+      named marks the cache current, which moves the surface's seed once, as
+      Metal's submission does, and has IOSurface call the control function in
+      every CPU lock of the surface: op 2 waits while a write is pending. A
+      write retires at the bundle's retire call after the buffer's completion
+      and write-back, or, for a surface drawn in place, once the queue's
+      completion ring's `completed_seqno` reaches the buffer, whichever comes
+      first. A lock still waiting after 2 s goes on with an "RGFX: WARN" line
+      (`guest/kext/src/RgfxAcceleratorLocks.cpp`).
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
@@ -470,6 +493,7 @@ own 64-byte line:
 | offset | field | written by |
 |---|---|---|
 | 0x00 | `producer`: u64, free-running byte count | producer |
+| 0x08 | `completed_seqno`: u64, on a queue's completion ring the seqno of the last command buffer that finished OK, 0 before one has | host (queue completion rings) |
 | 0x40 | `consumer`: u64, free-running byte count | consumer |
 | 0x80 | `consumer_idle`: u32, 1 while the consumer sleeps | consumer |
 | 0xc0 | `armed`: u32, 1 when the guest wants an interrupt | guest (completion rings) |
@@ -620,6 +644,14 @@ the kext writes their runs into the block, past the part the processes map
 and are granted, and posts `SURFACE_PAGES`; other asks for the surface wait
 for its answer. A refusal frees the block as a share not posted does, and the
 ask answers `kIOReturnUnsupported`, so the process copies the surface.
+A command buffer that writes surfaces' shared blocks is named to the kext
+after it is posted and before its commit returns (selector 0x10c: the queue,
+the buffer's seqno, and a pair of the block's offset and the surface's
+IOSurfaceID for each surface), and its completion retires the queue's writes
+up to it once any copy is written back (selector 0x10d). Only a holder of a
+block names it, only for one of its own queues, and the kext keeps a block's
+surface only where the surface's memory holds the block's pages, so no
+process makes another's locks wait (§14, "CPU locks").
 
 **Processes map only their own.** No process maps the region whole: it holds
 every process's blocks, the control rings and the device page. Each

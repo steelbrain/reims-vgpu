@@ -917,6 +917,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
+	// Where this buffer's writes of IOSurfaces' shared blocks are named to the kext, null where
+	// it has none: its completion retires them there, so a CPU lock of one of the surfaces waits
+	// until then (RgfxIOSurface.h, rgfxIOSurfaceWritesPosted).
+	RgfxRegion *_surfaceWritesRegion;
 	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
@@ -1098,6 +1102,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// completion.
 	rgfxIOSurfaceSyncBeforeCommit();
 	_surfaceWrites = _encoder->takeSurfaceWrites();
+	// The surfaces it writes are named to the kext once it is posted, and retired at its
+	// completion, which may come before the naming: the kext then keeps nothing of them.
+	RgfxRegion *writesRegion = rgfxIOSurfaceWritesRegion(_surfaceWrites);
+	_surfaceWritesRegion = writesRegion;
 	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
 	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
 	// The copies it writes, named among their writers once it is posted: its completion may
@@ -1163,6 +1171,12 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// A present of a surface it writes, made after this commit, waits for it on the host.
 	if (posted && !written.empty())
 		rgfxIOSurfaceNoteCommitted(written, queue, queue.rgfxObjId, _seqno);
+	// A CPU lock of a surface it writes waits for it from here, before the commit returns, as
+	// Metal's does once the buffer is submitted.
+	if (posted && writesRegion != nullptr)
+		rgfxIOSurfaceWritesPosted(writesRegion, written, queue.rgfxObjId, _seqno);
+	if (!posted)
+		_surfaceWritesRegion = nullptr;
 	// The CPU's part ends here, posted or not; the completion may already have come.
 	CFTimeInterval unset = 0;
 	_kernelEnd.compare_exchange_strong(unset, rgfxHostTime());
@@ -1250,6 +1264,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
+	// Its results are in the surfaces' pages: the CPU locks waiting for them go on.
+	if (_surfaceWritesRegion != nullptr) {
+		rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], _seqno);
+		_surfaceWritesRegion = nullptr;
+	}
 	// So does the app memory it may have written under no-copy buffers.
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
 		shadow->writeBack();

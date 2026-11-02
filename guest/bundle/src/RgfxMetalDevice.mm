@@ -78,6 +78,8 @@ enum {
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
 	kRgfxAccelMethodDeviceInfo = 0x10b,
+	kRgfxAccelMethodSurfaceWrites = 0x10c,
+	kRgfxAccelMethodSurfaceRetire = 0x10d,
 };
 
 namespace {
@@ -241,6 +243,30 @@ void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &offset, 1, nullptr,
 	                          nullptr);
+}
+
+// The region's surface write source (RgfxRegion::setSurfaceWriteSource): a command buffer's
+// writes of surfaces' shared blocks to the kext, which keeps a CPU lock of one of them waiting
+// until they retire. A write the kext could not keep is its to log; the buffer runs alike.
+void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const uint64_t *writes,
+                           uint32_t count)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	std::vector<uint64_t> words;
+	words.reserve(3 + 2 * static_cast<size_t>(count));
+	words.push_back(queue);
+	words.push_back(seqno);
+	words.push_back(count);
+	words.insert(words.end(), writes, writes + 2 * static_cast<size_t>(count));
+	IOConnectCallStructMethod(conn, kRgfxAccelMethodSurfaceWrites, words.data(),
+	                          words.size() * sizeof(uint64_t), nullptr, nullptr);
+}
+
+void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	const uint64_t in[2] = {queue, seqno};
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceRetire, in, 2, nullptr, nullptr);
 }
 
 // The serializer's queue closer: the kext stops watching the queue's completion ring and posts
@@ -424,6 +450,7 @@ RGFX_LOG_UNRECOGNIZED
 	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
 	_region->setSurfacePagesSource(&rgfxKextSurfacePages, _caps.linearTextureAlignment(),
 	                               connContext);
+	_region->setSurfaceWriteSource(&rgfxKextSurfaceWrites, &rgfxKextSurfaceRetire, connContext);
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).

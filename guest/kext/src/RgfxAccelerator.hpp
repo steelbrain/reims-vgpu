@@ -154,11 +154,36 @@ enum {
 	// struct out, exactly sizeof(RgfxDeviceInfo) bytes. Its page holds the control completion
 	// ring's tail, so no process maps it; the kext reads it for the process.
 	kRgfxAccelMethodDeviceInfo = 0x10b,
+	// The surfaces a command buffer writes, named after the buffer is posted and before its commit
+	// returns (RgfxAcceleratorLocks.cpp): struct in, words of 64 bits: the client's queue, the
+	// buffer's seqno there, a count n, then n pairs of a shared block's region offset (one the
+	// client holds, kRgfxAccelMethodSurfaceBlock) and its surface's IOSurfaceID. A CPU lock of each
+	// surface, in any process, waits from then until the write retires (below, or the device's
+	// completion of the buffer for a surface drawn in place). No output; a pair the kext cannot
+	// follow is logged and skipped.
+	kRgfxAccelMethodSurfaceWrites = 0x10c,
+	// The client's queue scalarInput[0] has its buffers up to the seqno scalarInput[1] complete,
+	// their copies written back: their writes retire.
+	kRgfxAccelMethodSurfaceRetire = 0x10d,
 };
 
+class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
 class RgfxSurfaceUserClient;
 class ReimsGraphics;
+
+// A surface's shared block goes (RgfxAcceleratorContexts.cpp): its device cache's pending writes
+// go, waking the locks waiting on them, and its IOSurface is released (RgfxAcceleratorLocks.cpp).
+// Either may be null.
+void rgfxSurfaceLocksForget(void *cache, void *surface);
+// Makes the device cache of the surface of ID `surfaceId` that `task` may see, whose memory holds
+// the physical byte `phys` (a shared block's first), with the kext's control function: its
+// IOSurface (retained) and its cache, or false. Under the contexts' lock.
+bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfaceId, UInt64 phys,
+                            void **surface, void **cache);
+// The device raised its vector: the locks waiting for a surface look at the queues' completions
+// again.
+void rgfxSurfaceLocksWake();
 
 // A command queue's completion ring the accelerator watches for its client
 // (RgfxAcceleratorContexts.cpp): the ring's header, mapped into the kernel, and the producer
@@ -267,6 +292,26 @@ public:
 	void unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 objId);
 	void unwatchClient(RgfxAcceleratorUserClient *client);
 	void queueInterrupt();
+	// The seqno the device last completed on queue `objId` (RgfxRingHeader::completed_seqno, 0
+	// where it writes none), read from its watched completion ring; 0 where it is not watched.
+	UInt64 queueCompleted(UInt64 objId);
+
+	// CPU locks of the surfaces the GPU writes (RgfxAcceleratorLocks.cpp, RgfxSurfaceLocks.hpp):
+	// queue `queue`'s buffer at `seqno`, of client `client` (context `context`, in `task`),
+	// writes the surfaces of the `count` pairs (block offset, IOSurfaceID) at `pairs`; the
+	// client's queue `queue` retired its writes up to `seqno`; and a queue gone, its writes with
+	// it.
+	void noteSurfaceWrites(RgfxAcceleratorUserClient *client, task_t task, UInt64 queue,
+	                       UInt64 seqno, const UInt64 *pairs, UInt32 count);
+	// The device cache of the shared block at `offset`, which `client` holds, for the surface of
+	// ID `surfaceId` (RgfxAcceleratorContexts.cpp): made at the first ask and kept with the
+	// block's entry. Its IOSurface comes retained, for the caller to release, and `*inPlace` says
+	// whether the device draws it in place. False where the client holds no such block, the
+	// block's surface is another, or no cache could be made.
+	bool surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t task, UInt64 offset,
+	                        uint32_t surfaceId, void **cache, OSObject **surface, bool *inPlace);
+	void retireSurfaceWrites(UInt64 queue, UInt64 seqno);
+	void forgetQueueWrites(UInt64 queue);
 
 	// The IOAccel surfaces (RgfxAcceleratorSurfaces.cpp). registerSurface names `surface`'s id
 	// (kIOReturnExclusiveAccess where another surface holds it); unregisterSurface drops it and

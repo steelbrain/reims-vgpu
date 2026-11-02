@@ -101,6 +101,30 @@ RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint6
 	return out;
 }
 
+void RgfxRegion::setSurfaceWriteSource(SurfaceWritesFn note, SurfaceRetireFn retire,
+                                       void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_writesNote = note;
+	m_writesRetire = retire;
+	m_writesContext = context;
+}
+
+void RgfxRegion::noteSurfaceWrites(uint64_t queue, uint64_t seqno, const uint64_t *writes,
+                                   uint32_t count)
+{
+	if (m_writesNote != nullptr && count != 0) {
+		m_writesNote(m_writesContext, queue, seqno, writes, count);
+	}
+}
+
+void RgfxRegion::retireSurfaceWrites(uint64_t queue, uint64_t seqno)
+{
+	if (m_writesRetire != nullptr) {
+		m_writesRetire(m_writesContext, queue, seqno);
+	}
+}
+
 void RgfxRegion::releaseSurface(uint64_t offset)
 {
 	if (m_surfaceRelease != nullptr) {

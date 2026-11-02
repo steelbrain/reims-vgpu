@@ -538,16 +538,20 @@ struct RgfxSurfaceShadow {
 		countCopy(gUploads, planeBytes(), start);
 	}
 
-	/// Copy -> pages, under a write lock; records the seed the unlock leaves, so the
-	/// next commit does not read our own write back. Caller holds `lock`. Nothing in place.
-	void writeBack()
+	/// Copy -> pages. A CPU's write (`cpu`) goes under a write lock, and records the seed the
+	/// unlock leaves, so the next commit does not read our own write back. A GPU's, at its
+	/// buffer's completion, takes no lock: a lock would wait for the buffer's own writes, which
+	/// the kext retires only after this, and the seed stays where the buffer's commit moved it,
+	/// which the copy recorded then (rgfxIOSurfaceWritesPosted). Caller holds `lock`. Nothing in
+	/// place.
+	void writeBack(bool cpu)
 	{
 		if (inPlace) {
 			return;
 		}
 		uint32_t s = 0;
 		uint64_t start = nowNs();
-		if (IOSurfaceLock(surface, 0, &s) != kIOReturnSuccess) {
+		if (cpu && IOSurfaceLock(surface, 0, &s) != kIOReturnSuccess) {
 			return;
 		}
 		for (size_t k = 0; k < planes.size(); k++) {
@@ -557,8 +561,10 @@ struct RgfxSurfaceShadow {
 				copyRows(p, dst, p.shape.rowBytes, copy() + p.offset, p.pitch);
 			}
 		}
-		IOSurfaceUnlock(surface, 0, &s);
-		setSynced(s);
+		if (cpu) {
+			IOSurfaceUnlock(surface, 0, &s);
+			setSynced(s);
+		}
 		countCopy(gWriteBacks, planeBytes(), start);
 	}
 
@@ -978,7 +984,7 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 		            static_cast<const uint8_t *>(pixelBytes) + r * bytesPerRow,
 		            region.size.width * bpe);
 	}
-	_shadow->writeBack();
+	_shadow->writeBack(true);
 }
 
 - (void)replaceRegion:(MTLRegion)region
@@ -1029,6 +1035,53 @@ void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, id texture)
 	}
 }
 
+RgfxRegion *rgfxIOSurfaceWritesRegion(const std::vector<std::shared_ptr<void>> &writes)
+{
+	for (const auto &w : writes) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(w.get());
+		if (s->shared && s->region != nullptr && s->region->hasSurfaceWrites()) {
+			return s->region;
+		}
+	}
+	return nullptr;
+}
+
+void rgfxIOSurfaceWritesPosted(RgfxRegion *region, const std::vector<std::shared_ptr<void>> &writes,
+                               uint64_t queueObjId, uint64_t seqno)
+{
+	// Two words a surface: its shared block and its IOSurfaceID. A process's own block names no
+	// surface the kext knows, and no other process reads it.
+	std::vector<RgfxSurfaceShadow *> named;
+	std::vector<uint64_t> words;
+	words.reserve(writes.size() * 2);
+	for (const auto &w : writes) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(w.get());
+		if (!s->shared || s->region != region ||
+		    std::find(named.begin(), named.end(), s) != named.end()) {
+			continue;
+		}
+		named.push_back(s);
+		words.push_back(s->block.offset);
+		words.push_back(s->surfaceId);
+	}
+	region->noteSurfaceWrites(queueObjId, seqno, words.data(),
+	                          static_cast<uint32_t>(words.size() / 2));
+	// The kext moved each surface's seed for the GPU's write, which a copy holds: the copy now
+	// stands for the surface as of that seed.
+	for (RgfxSurfaceShadow *s : named) {
+		if (s->inPlace) {
+			continue;
+		}
+		std::lock_guard<std::mutex> g(s->lock);
+		s->setSynced(IOSurfaceGetSeed(s->surface));
+	}
+}
+
+void rgfxIOSurfaceRetire(RgfxRegion *region, uint64_t queueObjId, uint64_t seqno)
+{
+	region->retireSurfaceWrites(queueObjId, seqno);
+}
+
 void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *enc, id texture)
 {
 	if ([texture isKindOfClass:[RgfxTexture class]] &&
@@ -1074,6 +1127,6 @@ void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes)
 		}
 		done.push_back(s);
 		std::lock_guard<std::mutex> g(s->lock);
-		s->writeBack();
+		s->writeBack(false);
 	}
 }

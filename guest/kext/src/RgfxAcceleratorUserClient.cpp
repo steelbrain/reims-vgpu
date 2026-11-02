@@ -199,7 +199,7 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
 	// client alone.
 	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodOpenContext &&
-	    selector <= kRgfxAccelMethodDeviceInfo)
+	    selector <= kRgfxAccelMethodSurfaceRetire)
 		return contextMethod(selector, arguments);
 
 	// Our own protocol: the doorbell. ONLY on our own user client (type 0). Apple's IOGPU

@@ -98,6 +98,8 @@
 		<string>1.0.0b1</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>2.9</string>
+		<key>com.apple.iokit.IOSurface</key>
+		<string>1.0</string>
 		<key>com.apple.kpi.bsd</key>
 		<string>20.0.0</string>
 		<key>com.apple.kpi.iokit</key>

@@ -85,8 +85,14 @@ private:
 	IOReturn openWindow();
 	void closeWindow();
 	IOReturn deviceInfoMethod(IOExternalMethodArguments *arguments);
+	// The surfaces a command buffer writes (kRgfxAccelMethodSurfaceWrites), and whether a queue is
+	// one of the client's open ones.
+	IOReturn surfaceWritesMethod(IOExternalMethodArguments *arguments);
+	bool ownsQueue(UInt64 queue);
 
 	static const UInt32 kMaxQueues = 256;
+	// The most bytes one kRgfxAccelMethodSurfaceWrites names: 1024 surfaces.
+	static const UInt64 kMaxSurfaceWritesBytes = (3 + 2 * 1024) * sizeof(UInt64);
 	bool hasContext;
 	UInt32 context;
 	UInt32 slot;

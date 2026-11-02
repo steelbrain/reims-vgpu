@@ -6137,6 +6137,152 @@ void test_iosurface_writers()
 	CFRelease(surface);
 }
 
+// The kext learns of a command buffer's writes of surfaces' shared blocks (RgfxIOSurface.h), so
+// a CPU lock of one waits for them: a commit of a buffer that draws a surface's copy names its
+// queue, its seqno and the block and surface once, before the commit returns, and records the
+// surface's seed in the copy's header; a buffer that writes no surface names nothing; the
+// buffer's completion writes the copy back to the pages with no lock of the surface (its seed
+// stays), and then retires the queue's writes up to its seqno.
+void test_iosurface_writes_named()
+{
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	TestRing &completion = *new TestRing(0x8000);
+	RgfxReplyReader &reader = *new RgfxReplyReader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+	struct Named {
+		uint64_t queue, seqno;
+		std::vector<uint64_t> words;
+	};
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		std::vector<Named> named;
+		std::vector<std::pair<uint64_t, uint64_t>> retired;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			*offset = static_cast<Source *>(c)->offset;
+			*serial = 7;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+		static void writes(void *c, uint64_t queue, uint64_t seqno, const uint64_t *words,
+		                   uint32_t count)
+		{
+			static_cast<Source *>(c)->named.push_back(
+			    {queue, seqno, std::vector<uint64_t>(words, words + 2 * count)});
+		}
+		static void retire(void *c, uint64_t queue, uint64_t seqno)
+		{
+			static_cast<Source *>(c)->retired.emplace_back(queue, seqno);
+		}
+	} &src = *new Source();
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfaceWriteSource(&Source::writes, &Source::retire, &src);
+	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
+	CHECK(queue != nil);
+	queue.replyReader = &reader;
+	(void)expectQueueCreate(control);
+	// 16 x 16 BGRA: rows 256 bytes apart, the header at 4096: its serial, then its seed.
+	const uint8_t *header = mem.data() + src.offset + 4096;
+	auto headerSerial = [&]() { return *reinterpret_cast<const uint64_t *>(header); };
+	auto headerSeed = [&]() { return *reinterpret_cast<const uint32_t *>(header + 8); };
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	auto completed = [&](id<MTLCommandBuffer> cb, uint64_t seqno) {
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = seqno;
+		done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		CHECK(reader.pump() == 1);
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	};
+	@autoreleasepool {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                            iosurface:surface
+		                                                                plane:0
+		                                                               region:&region
+		                                                               device:nil
+		                                                           serializer:&ser];
+		CHECK(t != nil);
+		drainRing(control);
+
+		// A buffer that draws the copy twice: named once, before the commit returns.
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		for (int i = 0; i < 2; i++) {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = t;
+			rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		}
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		CHECK(src.named.size() == 1);
+		CHECK(src.named[0].queue == queue.rgfxObjId && src.named[0].seqno == h.seqno);
+		const std::vector<uint64_t> words = {src.offset,
+		                                     static_cast<uint64_t>(IOSurfaceGetID(surface))};
+		CHECK(src.named[0].words == words);
+		uint32_t seed = IOSurfaceGetSeed(surface);
+		CHECK(headerSerial() == 7 && headerSeed() == seed);
+		CHECK(src.retired.empty());
+
+		// Its completion writes the copy back with no lock, then retires the queue's writes.
+		completed(cb, h.seqno);
+		CHECK(IOSurfaceGetSeed(surface) == seed);
+		CHECK(src.retired.size() == 1 && src.retired[0].first == queue.rgfxObjId &&
+		      src.retired[0].second == h.seqno);
+
+		// A buffer that writes no surface: nothing named, nothing retired.
+		id<MTLCommandBuffer> none = [queue commandBuffer];
+		[[none blitCommandEncoder] endEncoding];
+		[none commit];
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		completed(none, h.seqno);
+		CHECK(src.named.size() == 1 && src.retired.size() == 1);
+		drainRing(control);
+	}
+	drainRing(control);
+	CFRelease(surface);
+}
+
 // A surface whose planes the host's textures lie over, where the device uses surfaces in place
 // (RgfxIOSurface.h): its GPU view is its own pages. The kext's block in place is asked for by the
 // surface's base, its whole allocation in whole pages and the part the processes map, one page
@@ -6972,6 +7118,7 @@ int main()
 		test_iosurface_shared_block();
 		test_iosurface_planes();
 		test_iosurface_writers();
+		test_iosurface_writes_named();
 		test_iosurface_in_place();
 		test_iosurface_in_place_fallback();
 		test_iosurface_in_place_core_image_set();

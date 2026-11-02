@@ -144,6 +144,27 @@ public:
 	                                      bool *fresh);
 	void setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignment, void *context);
 
+	/// Where the kext learns of command buffers' writes of surfaces' shared blocks, so a CPU lock
+	/// of a surface waits for them as Metal's does (the kext's RgfxSurfaceLocks.hpp): `note` names
+	/// queue `queue`'s buffer at `seqno` and the `count` blocks it writes, two words each at
+	/// `writes` (the block's region offset and its surface's IOSurfaceID); `retire` says the
+	/// queue's buffers up to `seqno` have their results in the surfaces' pages. Both are called
+	/// with `context`, from any thread.
+	typedef void (*SurfaceWritesFn)(void *context, uint64_t queue, uint64_t seqno,
+	                                const uint64_t *writes, uint32_t count);
+	typedef void (*SurfaceRetireFn)(void *context, uint64_t queue, uint64_t seqno);
+	void setSurfaceWriteSource(SurfaceWritesFn note, SurfaceRetireFn retire, void *context);
+
+	/// Whether a surface write source is set.
+	bool hasSurfaceWrites() const { return m_writesNote != nullptr; }
+
+	/// Names queue `queue`'s buffer at `seqno` and its `count` writes (two words each) to the
+	/// kext, where a surface write source is set.
+	void noteSurfaceWrites(uint64_t queue, uint64_t seqno, const uint64_t *writes, uint32_t count);
+
+	/// Queue `queue`'s buffers up to `seqno` have their results in the surfaces' pages.
+	void retireSurfaceWrites(uint64_t queue, uint64_t seqno);
+
 	/// Whether a surface pages source is set, and the alignment it gave.
 	bool hasSurfacePages() const { return m_pagesAcquire != nullptr; }
 	uint64_t surfacePagesAlignment() const { return m_pagesAlignment; }
@@ -192,6 +213,9 @@ private:
 	SurfacePagesFn m_pagesAcquire = nullptr; // the surface pages source, where set (the kext)
 	uint64_t m_pagesAlignment = 0;
 	void *m_pagesContext = nullptr;
+	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
+	SurfaceRetireFn m_writesRetire = nullptr;
+	void *m_writesContext = nullptr;
 
 	std::mutex m_lock;
 };
