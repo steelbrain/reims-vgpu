@@ -355,7 +355,7 @@ fn the_registers_read_as_the_wire_says() {
     let rig = Rig::new();
     let read = |offset: u32| rig.device.mmio_read(offset.into());
     assert_eq!(read(RGFX_REG_MAGIC), 0x5846_4752);
-    assert_eq!(read(RGFX_REG_VERSION), 1);
+    assert_eq!(read(RGFX_REG_VERSION), 2);
     assert_eq!(read(RGFX_REG_FEATURES_LO), 0);
     assert_eq!(read(RGFX_REG_FEATURES_HI), 0);
     assert_eq!(read(RGFX_REG_STATUS), 0);

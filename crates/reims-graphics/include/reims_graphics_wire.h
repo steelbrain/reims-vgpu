@@ -681,8 +681,10 @@
 // What `MAGIC` reads: "RGFX", little-endian.
 #define RGFX_MAGIC 1481000786
 
-// What `VERSION` reads.
-#define RGFX_VERSION 1
+// What `VERSION` reads: the wire's version, which every change a guest built before it would
+// misread moves on (docs/graphics-kext/design.md, "The wire's version"). The kext and the option
+// ROM leave a device of any other version.
+#define RGFX_VERSION 2
 
 // `STATUS`: the device is reset, and takes no message.
 #define RGFX_STATUS_RESET 0

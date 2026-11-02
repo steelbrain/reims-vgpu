@@ -69,8 +69,10 @@ pub const RGFX_REG_REGION_SIZE_HI: u32 = 0x018;
 pub const RGFX_REG_DOORBELL: u32 = 0x020;
 /// What `MAGIC` reads: "RGFX", little-endian.
 pub const RGFX_MAGIC: u32 = 0x5846_4752;
-/// What `VERSION` reads.
-pub const RGFX_VERSION: u32 = 1;
+/// What `VERSION` reads: the wire's version, which every change a guest built before it would
+/// misread moves on (docs/graphics-kext/design.md, "The wire's version"). The kext and the option
+/// ROM leave a device of any other version.
+pub const RGFX_VERSION: u32 = 2;
 /// `STATUS`: the device is reset, and takes no message.
 pub const RGFX_STATUS_RESET: u32 = 0;
 /// `STATUS`: the guest's driver has read the rings' headers; the device takes its messages.
