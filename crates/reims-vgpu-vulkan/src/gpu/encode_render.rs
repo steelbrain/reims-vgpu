@@ -386,8 +386,9 @@ pub struct RenderEncoderObject {
     /// The runtime's encoder, until it ends: a handle of at most 128 bytes, its lowering boxed by
     /// the runtime, held in place.
     pub encoder: EncoderObject<rt::RenderCommandEncoder>,
-    /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
-    nil_pipeline: Mutex<bool>,
+    /// What Metal's encoder holds of its draws that the runtime's has no form for, behind one
+    /// lock: a draw reads it once, and a command that sets it takes the lock once ([`Drawing`]).
+    drawing: Mutex<Drawing>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
     /// map [`open`] took, without the colour resolves [`untouched_resolves`] dropped and the
     /// unused depth and stencil resolve textures [`without_unused_resolves`] removes. Its
@@ -407,8 +408,6 @@ pub struct RenderEncoderObject {
     /// left `Unknown`, the last one set: whether a late depth or stencil resolve texture beside a
     /// dropped colour resolve may resolve ([`VulkanRenderEncoder::resolves_beside_dropped`]).
     late_stores: Mutex<Vec<(Attachment, rt::StoreAction)>>,
-    /// What Metal's encoder holds of how its draws draw that the runtime's has no form for.
-    marks: Mutex<Marks>,
     /// Whether the pass rasterizes: one of a mutable rate map not yet reset does not, as the
     /// runtime's draws there do not (`tiled`).
     rasterizes: bool,
@@ -422,9 +421,7 @@ pub struct RenderEncoderObject {
     /// ([`crate::gpu::rate_map::no_draw`]): set where the pass's rate map was made of a `Mutable`
     /// descriptor, until a draw of the guest's takes its place ([`VulkanRenderEncoder::drew`]).
     undrawn: Mutex<bool>,
-    /// What its draws may write through what it binds ([`Reach`]).
-    reach: Mutex<Reach>,
-    /// Whether `reach` holds nothing a draw asks of ([`Reach::quiet`]), so a draw, a tile
+    /// Whether the reach of `drawing` holds nothing a draw asks of ([`Reach::quiet`]), so a draw, a tile
     /// dispatch or an execution asks nothing of it ([`VulkanRenderEncoder::issues`]): set at
     /// each bind.
     quiet: AtomicBool,
@@ -490,6 +487,18 @@ enum Attachment {
 fn past_the_eighth(attachment: Attachment) -> bool {
     matches!(attachment, Attachment::Color(i)
         if usize::try_from(i).map_or(true, |i| i >= rt::MAX_COLOR_ATTACHMENTS))
+}
+
+/// What Metal's render encoder holds of its draws that the runtime's has no form for
+/// ([`RenderEncoderObject::drawing`]).
+#[derive(Debug, Default)]
+struct Drawing {
+    /// `setRenderPipelineState:` of nil since the last state set: the next draw dies.
+    nil_pipeline: bool,
+    /// What Metal's encoder holds of how its draws draw ([`Marks`]).
+    marks: Marks,
+    /// What its draws may write through what it binds ([`Reach`]).
+    reach: Reach,
 }
 
 /// What the private setters left of how the encoder's draws draw, and what of the pipeline state
@@ -1220,7 +1229,7 @@ pub(crate) fn open(
         e.undecided_dropped(&sources);
         let visibility = (sources.visibility.as_ref())
             .map_or(Kept::No, |b| crate::gpu::writes::buffer_bound(b).kept);
-        plain(|| e.reach.lock().visibility = visibility);
+        plain(|| e.drawing.lock().reach.visibility = visibility);
     }
     made
 }
@@ -1660,16 +1669,14 @@ fn opened(
     let aborts = metal_aborts_at(&d);
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
-        nil_pipeline: Mutex::new(false),
+        drawing: Mutex::new(Drawing::default()),
         undecided: Mutex::new(undecided(&d)),
         late_stores: Mutex::new(Vec::new()),
-        marks: Mutex::new(Marks::default()),
         no_layers: taken.class == Some(Class::NoLayers),
         dropped,
         rasterizes: taken.class != Some(Class::Unset),
         varying_rates: taken.class == Some(Class::Varying),
         undrawn: Mutex::new(taken.mutable),
-        reach: Mutex::new(Reach::default()),
         quiet: AtomicBool::new(true),
         bfloat_loaded: bfloat_loaded(&d),
         pass: d,
@@ -1879,7 +1886,8 @@ impl VulkanRenderEncoder {
         let buffer = |b: Option<&VulkanBuffer>| b.map(|b| buffer_bind(b)).unwrap_or_default();
         let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bind(t)).unwrap_or_default();
         plain(|| {
-            let mut reach = self.reach.lock();
+            let mut drawing = self.drawing.lock();
+            let reach = &mut drawing.reach;
             match bind {
                 Bind::Buffer(stage, slot, b) => reach.bind_one(stage, true, slot, buffer(b)),
                 Bind::Texture(stage, slot, t) => reach.bind_one(stage, false, slot, texture(t)),
@@ -1921,7 +1929,8 @@ impl VulkanRenderEncoder {
             return;
         }
         let (kept, written) = plain(|| {
-            let reach = self.reach.lock();
+            let drawing = self.drawing.lock();
+            let reach = &drawing.reach;
             let kept = (crate::os::TWINS_READ_ONLY)
                 .then(|| reach.kept(inherits))
                 .flatten();
@@ -2007,8 +2016,10 @@ impl VulkanRenderEncoder {
 
     /// What a draw reads of the encoder's state ([`Held`]).
     fn held(&self) -> Held {
-        let nil_pipeline = *self.nil_pipeline.lock();
-        let marks = *self.marks.lock();
+        let (nil_pipeline, marks) = {
+            let drawing = self.drawing.lock();
+            (drawing.nil_pipeline, drawing.marks)
+        };
         Held {
             nil_pipeline,
             marks,
@@ -2045,7 +2056,7 @@ impl VulkanRenderEncoder {
     fn binds(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
         let (drawn, heard) = crate::answer::hearing(|| self.run(sel, call));
         if heard.contains(&rt::Degradation::HalfOutputPrecision)
-            && let Some(apart) = plain(|| self.marks.lock().half_apart)
+            && let Some(apart) = plain(|| self.drawing.lock().marks.half_apart)
         {
             half_output_apart(sel, apart);
         }
@@ -2071,7 +2082,7 @@ impl VulkanRenderEncoder {
     /// Dies at `sel`, which runs the encoder's pipeline state, after `setRenderPipelineState:`
     /// of nil ([`nil_pipeline_drawn`]).
     fn pipelined(&self, sel: &'static str) {
-        nil_pipeline_drawn(sel, *plain(|| self.nil_pipeline.lock()));
+        nil_pipeline_drawn(sel, plain(|| self.drawing.lock().nil_pipeline));
     }
 
     /// A draw `sel` of primitive type 9 ([`rt::DrawPrimitiveType::Nine`]), which goes to the
@@ -2095,7 +2106,7 @@ impl VulkanRenderEncoder {
         call: Call<'_>,
     ) -> RaiseResult<()> {
         self.pipelined(sel);
-        if !plain(|| self.marks.lock().pipeline) {
+        if !plain(|| self.drawing.lock().marks.pipeline) {
             unrepresentable(
                 sel,
                 "primitive type 9 with no pipeline state set, which nothing measured",
@@ -2139,7 +2150,7 @@ impl VulkanRenderEncoder {
         let inherits_pipeline = icb.inherits.pipeline;
         let execution = if inherits_pipeline {
             self.encodes(sel);
-            let m = *plain(|| self.marks.lock());
+            let m = plain(|| self.drawing.lock().marks);
             Execution {
                 sel,
                 icb: icb.clone_ref(),
@@ -2241,7 +2252,7 @@ impl VulkanRenderEncoder {
     /// Dies at a draw or execution `sel` after `setVertexAmplificationMode:value:` left a count
     /// the runtime does not draw, or one not measured, in either mode ([`Marks`]).
     fn marked(&self, sel: &'static str) {
-        marked_by(sel, *plain(|| self.marks.lock()));
+        marked_by(sel, plain(|| self.drawing.lock().marks));
     }
 }
 
@@ -2839,7 +2850,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             // Metal's indexed strips restart at the index set, until the encoder ends, and
             // nothing else changes (the module docs), as the runtime's do.
             RenderCmd::SetPrimitiveRestartEnabled { enabled, index } => {
-                plain(|| self.marks.lock().restart = Some((enabled, index)));
+                plain(|| self.drawing.lock().marks.restart = Some((enabled, index)));
                 encoded(&mut |e| {
                     e.set_primitive_restart_enabled(enabled, index);
                     Ok(())
@@ -2853,7 +2864,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             RenderCmd::SetRenderPipelineState { pipeline_state } => match pipeline_state {
                 None => {
                     self.encoder.nothing(sel)?;
-                    plain(|| *self.nil_pipeline.lock() = true);
+                    plain(|| self.drawing.lock().nil_pipeline = true);
                     self.encoder.pipeline.store(0, Ordering::Relaxed);
                     self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
                     Ok(())
@@ -2866,9 +2877,10 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         .store(state.unique_identifier(), Ordering::Relaxed);
                     self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
                     plain(|| {
-                        *self.nil_pipeline.lock() = false;
-                        self.reach.lock().set(&state.reflection, f.writes);
-                        let mut m = self.marks.lock();
+                        let mut drawing = self.drawing.lock();
+                        drawing.nil_pipeline = false;
+                        drawing.reach.set(&state.reflection, f.writes);
+                        let m = &mut drawing.marks;
                         m.pipeline = true;
                         m.points_sized = f.points_sized;
                         m.half_apart = f.half_apart;
@@ -3015,7 +3027,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let mappings = (!mappings.is_empty()).then_some(mappings.as_slice());
                 encoded(&mut |e| e.set_vertex_amplification_count(count, mappings))?;
                 plain(|| {
-                    let mut m = self.marks.lock();
+                    let m = &mut self.drawing.lock().marks;
                     m.amplification = Some(count);
                     m.amplified = false;
                 });
@@ -3025,7 +3037,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             // where it equals the runtime's (the module docs).
             RenderCmd::SetVertexAmplificationMode { mode, value } => {
                 plain(|| {
-                    let mut m = self.marks.lock();
+                    let m = &mut self.drawing.lock().marks;
                     let runtime = m.amplification.unwrap_or(1);
                     m.amplified = amplification_count(mode, value) != Some(runtime);
                 });
@@ -3124,7 +3136,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     unrepresentable(sel, &format!("visibility result mode {mode}"))
                 });
                 if mode != rt::VisibilityResultMode::Disabled
-                    && plain(|| self.reach.lock().visibility.holds())
+                    && plain(|| self.drawing.lock().reach.visibility.holds())
                 {
                     crate::gpu::writes::kept_write(
                         sel,
