@@ -9,7 +9,6 @@
 //! reference lists, as NVDEC does.
 
 mod params;
-mod session;
 
 use std::sync::Arc;
 
@@ -23,12 +22,13 @@ use reims_vgpu_video_codec::h264::{
     SliceParams, avcc::DecoderConfiguration, slice::MemoryManagement, slice::SliceType, sps::Sps,
 };
 
-use self::session::{Decode, InMemory, Session, Target};
+use self::params::ParameterSets;
 use crate::device::VideoDevice;
 use crate::error::Error;
-use crate::import::HostImport;
+use crate::import::SampleMemory;
 use crate::picture::{ImageView, Picture};
-use crate::profile::{H264Capabilities, H264Profile, h264_capabilities};
+use crate::profile::{H264Capabilities, H264Profile, VideoProfile, h264_capabilities};
+use crate::session::{BitstreamCounts, CodecInfo, Decode, InMemory, Session, Target};
 use crate::std_types::zeroed;
 use crate::surface::{Landing, Surface, SurfaceSource, SurfaceSpec};
 use crate::timeline::Timeline;
@@ -36,17 +36,6 @@ use crate::timeline::Timeline;
 /// A decoded frame: its picture, which holds the output it landed in, and
 /// what the decoder knows of it.
 pub type Frame<T> = Output<Picture<T>>;
-
-/// A sample's bytes in device memory, which [`H264Decoder::decode_in_place`]
-/// reads in place: host pages the device imported by their pointer, as
-/// metal2vulkan's `Buffer::vk_host_memory` answers for a buffer over them.
-pub struct SampleMemory {
-    /// Where the sample lies: its first byte at the import's offset.
-    pub import: HostImport,
-    /// What keeps the memory alive, held until every decode that reads
-    /// the sample in place is done.
-    pub keep: Arc<dyn Send + Sync>,
-}
 
 /// An H.264 decoder on a [`VideoDevice`], landing its pictures in the
 /// outputs `S` gives.
@@ -156,11 +145,15 @@ impl<S: SurfaceSource> H264Decoder<S> {
     /// The profile the stream's session decodes with, once a picture has
     /// started.
     pub fn profile(&self) -> Option<H264Profile> {
-        self.inner
-            .accelerator()
-            .session
-            .as_ref()
-            .map(|s| s.caps.profile)
+        match self.inner.accelerator().session.as_ref()?.caps.profile {
+            VideoProfile::H264(profile) => Some(profile),
+            VideoProfile::H265(_) => None,
+        }
+    }
+
+    /// How the decodes so far read their slices: in place, or copied.
+    pub fn bitstreams(&self) -> BitstreamCounts {
+        self.inner.accelerator().bitstreams
     }
 }
 
@@ -172,10 +165,12 @@ struct VulkanH264<S: SurfaceSource> {
     source: S,
     /// The stream's session, which holds the timeline itself, and waits
     /// for its decodes as it goes.
-    session: Option<Session>,
+    session: Option<Session<ParameterSets>>,
     /// Where the sample being decoded lies in device memory, while
     /// [`H264Decoder::decode_in_place`] decodes it.
     in_memory: Option<InMemory>,
+    /// How the decodes so far read their slices.
+    bitstreams: BitstreamCounts,
 }
 
 impl<S: SurfaceSource> VulkanH264<S> {
@@ -194,10 +189,11 @@ impl<S: SurfaceSource> VulkanH264<S> {
             source,
             session: None,
             in_memory: None,
+            bitstreams: BitstreamCounts::default(),
         })
     }
 
-    fn session(&self) -> Result<&Session, Error> {
+    fn session(&self) -> Result<&Session<ParameterSets>, Error> {
         self.session
             .as_ref()
             .ok_or_else(|| Error::Unsupported("decoding before an SPS is active".into()))
@@ -207,18 +203,11 @@ impl<S: SurfaceSource> VulkanH264<S> {
 /// The capabilities of the first profile of `sps`'s candidates the device
 /// decodes, where it decodes `sps`'s coded size.
 fn select(capabilities: &[H264Capabilities], sps: &Sps) -> Result<H264Capabilities, Error> {
-    let (width, height) = (sps.coded_width(), sps.coded_height());
     for profile in H264Profile::candidates(sps.profile_idc) {
         let Some(caps) = capabilities.iter().find(|c| c.profile == *profile) else {
             continue;
         };
-        let (min, max) = (caps.min_coded_extent, caps.max_coded_extent);
-        if width > max.width || height > max.height || width < min.width || height < min.height {
-            return Err(Error::Unsupported(format!(
-                "H.264 at {width}x{height}: the device decodes {}x{} to {}x{}",
-                min.width, min.height, max.width, max.height
-            )));
-        }
+        caps.check_extent("H.264", sps.coded_width(), sps.coded_height())?;
         return Ok(*caps);
     }
     Err(Error::Unsupported(format!(
@@ -249,32 +238,30 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
         self.session = Some(Session::new(
             &self.device,
             &self.timeline,
-            caps,
+            caps.video(),
             extent,
-            sps.max_num_ref_frames,
+            u32::from(sps.max_num_ref_frames),
         )?);
         Ok(())
     }
 
     fn new_picture(&mut self) -> Result<Self::Picture, Error> {
-        let spec = {
+        let (spec, extent) = {
             let session = self.session()?;
-            SurfaceSpec {
-                extent: session.extent,
+            let spec = SurfaceSpec {
+                extent: session.image_extent,
                 profile: session.caps.profile,
                 decode_target: session.caps.decodes_into_output,
-            }
+            };
+            (spec, session.extent)
         };
-        let surface = self.source.surface(&spec)?;
-        let view = match surface.landing() {
-            Landing::Image(image) if spec.decode_target => Some(ImageView::for_decode(
-                &self.device,
-                image,
-                vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
-            )?),
-            _ => None,
-        };
-        Ok(Picture::new(&self.timeline, surface, view, spec.extent))
+        new_picture(
+            &self.device,
+            &self.timeline,
+            &mut self.source,
+            &spec,
+            extent,
+        )
     }
 
     /// A stand-in for a lost frame: `from`'s own output and DPB slot,
@@ -297,7 +284,11 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
             .session
             .as_mut()
             .ok_or_else(|| Error::Unsupported("decoding before an SPS is active".into()))?;
-        let parameters = session.parameters(params.sps, params.pps)?;
+        let (sps, pps) = (params.sps, params.pps);
+        let parameters = session.parameters(
+            |sets| sets.holds(sps, pps),
+            |device, handle, old| ParameterSets::new(device, handle, old, sps, pps),
+        )?;
 
         let mut slotted = Vec::with_capacity(params.references.len());
         for reference in &params.references {
@@ -333,6 +324,7 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
         }
 
         let nals: Vec<&[u8]> = slices.iter().map(|s| s.nal).collect();
+        let (reference_slots, reference_infos): (Vec<i32>, Vec<_>) = references.into_iter().unzip();
         let decode = Decode {
             slices: &nals,
             in_memory: self.in_memory.as_ref(),
@@ -342,14 +334,41 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
                 Landing::Buffer(planes) => Target::Buffer(planes, params.sps.crop_rect()),
             },
             setup_slot,
-            setup_info,
-            picture_info,
-            references: &references,
+            reference_slots: &reference_slots,
+            codec: CodecInfo::H264 {
+                picture: &picture_info,
+                setup: &setup_info,
+                references: &reference_infos,
+            },
         };
-        let landed = session.decode(&decode)?;
-        picture.decoded(setup_slot, landed);
+        let submitted = session.decode(&decode)?;
+        self.bitstreams.count(submitted.in_place);
+        picture.decoded(setup_slot, submitted.landed);
         Ok(())
     }
+}
+
+/// A picture of `spec`, decoded at `extent`, landing in an output of
+/// `source`'s, with the decode view a decode that writes an output image
+/// takes.
+pub(crate) fn new_picture<S: SurfaceSource>(
+    device: &Arc<VideoDevice>,
+    timeline: &Arc<Timeline>,
+    source: &mut S,
+    spec: &SurfaceSpec,
+    extent: vk::Extent2D,
+) -> Result<Picture<S::Surface>, Error> {
+    let surface = source.surface(spec)?;
+    let view = match surface.landing() {
+        Landing::Image(image) if spec.decode_target => Some(ImageView::for_decode(
+            device,
+            image,
+            spec.format(),
+            vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
+        )?),
+        _ => None,
+    };
+    Ok(Picture::new(timeline, surface, view, extent, spec.format()))
 }
 
 /// Which references a decode names, by their index in `references`

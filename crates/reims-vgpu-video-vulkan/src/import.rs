@@ -11,8 +11,21 @@ use ash::vk;
 
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
-use crate::profile::H264Profile;
+use crate::profile::VideoProfile;
 use crate::surface::{BufferPlanes, Landing, Surface};
+
+/// A sample's bytes in device memory, which a decoder's `decode_in_place`
+/// ([`crate::H264Decoder::decode_in_place`],
+/// [`crate::H265Decoder::decode_in_place`]) reads in place: host pages the
+/// device imported by their pointer, as metal2vulkan's
+/// `Buffer::vk_host_memory` answers for a buffer over them.
+pub struct SampleMemory {
+    /// Where the sample lies: its first byte at the import's offset.
+    pub import: HostImport,
+    /// What keeps the memory alive, held until every decode that reads
+    /// the sample in place is done.
+    pub keep: Arc<dyn Send + Sync>,
+}
 
 /// Where bytes lie in an import of host pages, as metal2vulkan's
 /// `VkHostMemory` answers.
@@ -40,7 +53,7 @@ pub(crate) struct BufferUse<'a> {
     /// one.
     pub(crate) families: &'a [u32],
     /// The video profile a decode's use of it names, if any.
-    pub(crate) profile: Option<H264Profile>,
+    pub(crate) profile: Option<VideoProfile>,
 }
 
 /// A buffer over `import`'s memory from `from` (an offset in the memory)
@@ -175,7 +188,7 @@ impl Drop for ImportBuffer {
     }
 }
 
-/// NV12 planes in imported host pages, as a picture's output
+/// NV12 or P010 planes in imported host pages, as a picture's output
 /// ([`Landing::Buffer`]): an IOSurface's planes in the guest's memory, where
 /// one GPU copy out of the decoder's picture writes them, cropped.
 pub struct ImportedPlanes {

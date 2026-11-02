@@ -1,9 +1,12 @@
-//! One stream's video session: the `VkVideoSessionKHR` and its memory,
-//! its DPB pictures, its parameters object, and the command buffers and
-//! bitstream buffers its decodes are submitted with, each reused once the
-//! timeline has passed the work that used it.
+//! One stream's video session, of either codec: the `VkVideoSessionKHR`
+//! and its memory, its DPB pictures, its parameters object, and the command
+//! buffers and bitstream buffers its decodes are submitted with, each
+//! reused once the timeline has passed the work that used it. What is the
+//! codec's goes in with each decode ([`CodecInfo`]) and in the parameters
+//! object its accelerator makes ([`SessionParameters`]).
 //!
-//! **DPB pictures.** The session owns one NV12 image a DPB slot, so that a
+//! **DPB pictures.** The session owns one image a DPB slot, in the
+//! profile's format (NV12, or P010 at 10 bits), so that a
 //! reference is never an output: a guest recycles an output once it has
 //! shown it, whether or not the picture is still a reference. Each decode
 //! sets up the least slot no reference holds, and takes its picture from
@@ -27,16 +30,16 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use ash::vk;
-use ash::vk::native::{StdVideoDecodeH264PictureInfo, StdVideoDecodeH264ReferenceInfo};
-use reims_vgpu_video_codec::h264::{pps::Pps, sps::Sps};
+use ash::vk::native::{
+    StdVideoDecodeH264PictureInfo, StdVideoDecodeH264ReferenceInfo, StdVideoDecodeH265PictureInfo,
+    StdVideoDecodeH265ReferenceInfo,
+};
 
-use super::SampleMemory;
-use super::params::ParameterSets;
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
-use crate::import::{BufferUse, ImportBuffer, buffer_over};
+use crate::import::{BufferUse, ImportBuffer, SampleMemory, buffer_over};
 use crate::picture::{ImageView, color_range, plane, planes};
-use crate::profile::{H264Capabilities, PICTURE_FORMAT};
+use crate::profile::{Capabilities, VideoProfile};
 use crate::surface::{BufferPlanes, bind_image_memory};
 use crate::timeline::Timeline;
 
@@ -45,10 +48,11 @@ use crate::timeline::Timeline;
 const MIN_BITSTREAM: u64 = 2 << 20;
 
 /// The start code put before each slice: the Vulkan specification has
-/// `pSliceOffsets` locate each slice in the buffer and says nothing of
-/// start codes; ffmpeg's Vulkan decoder (`vulkan_h264.c`) puts a
-/// three-byte start code at each offset, and the 5080 decodes every
-/// stream of the H.264 check so.
+/// `pSliceOffsets` (H.264) and `pSliceSegmentOffsets` (H.265) locate each
+/// slice in the buffer and says nothing of start codes; ffmpeg's Vulkan
+/// decoders (`vulkan_h264.c`, `vulkan_hevc.c`) put a three-byte start code
+/// at each offset, and the 5080 decodes every stream of the H.264 and
+/// H.265 checks so.
 const START_CODE: [u8; 3] = [0, 0, 1];
 
 /// Where each slice goes in a picture's bitstream, after its start code,
@@ -70,7 +74,8 @@ pub(crate) fn slice_layout(
 }
 
 /// A sample whose bytes lie in device memory too
-/// ([`super::H264Decoder::decode_in_place`]): where its bytes are on the
+/// ([`crate::H264Decoder::decode_in_place`],
+/// [`crate::H265Decoder::decode_in_place`]): where its bytes are on the
 /// host, which its slices lie in.
 pub(crate) struct InMemory {
     /// Its first byte.
@@ -99,22 +104,178 @@ struct InPlace {
 
 /// A decode as [`Session::decode`] records it.
 pub(crate) struct Decode<'a> {
-    /// The picture's slices, each its NAL unit from the header byte on.
+    /// The picture's slices (H.265's slice segments), each its NAL unit
+    /// from the header bytes on.
     pub(crate) slices: &'a [&'a [u8]],
     /// The sample they lie in, where its bytes lie in device memory too.
     pub(crate) in_memory: Option<&'a InMemory>,
-    /// The parameters object holding the picture's SPS and PPS.
+    /// The parameters object holding the picture's parameter sets.
     pub(crate) parameters: vk::VideoSessionParametersKHR,
     /// Where the picture lands.
     pub(crate) output: Target,
     /// The DPB slot the picture is set up in.
     pub(crate) setup_slot: i32,
-    /// The picture as a reference, for its slot.
-    pub(crate) setup_info: StdVideoDecodeH264ReferenceInfo,
-    /// The picture.
-    pub(crate) picture_info: StdVideoDecodeH264PictureInfo,
-    /// Each reference: its slot and its std information.
-    pub(crate) references: &'a [(i32, StdVideoDecodeH264ReferenceInfo)],
+    /// Each reference's slot, in the order of the codec's references.
+    pub(crate) reference_slots: &'a [i32],
+    /// The codec's std information of the picture, of its setup slot and
+    /// of each reference.
+    pub(crate) codec: CodecInfo<'a>,
+}
+
+/// What a decode names of its codec: the std structures Vulkan Video's
+/// codec extension chains to the decode and to its slots, the references'
+/// in the order of [`Decode::reference_slots`].
+#[derive(Clone, Copy)]
+pub(crate) enum CodecInfo<'a> {
+    H264 {
+        picture: &'a StdVideoDecodeH264PictureInfo,
+        setup: &'a StdVideoDecodeH264ReferenceInfo,
+        references: &'a [StdVideoDecodeH264ReferenceInfo],
+    },
+    H265 {
+        picture: &'a StdVideoDecodeH265PictureInfo,
+        setup: &'a StdVideoDecodeH265ReferenceInfo,
+        references: &'a [StdVideoDecodeH265ReferenceInfo],
+    },
+}
+
+/// A DPB slot's codec structure, chained to its slot.
+enum SlotInfo<'a> {
+    H264(vk::VideoDecodeH264DpbSlotInfoKHR<'a>),
+    H265(vk::VideoDecodeH265DpbSlotInfoKHR<'a>),
+}
+
+impl<'a> SlotInfo<'a> {
+    /// `slot` with this chained.
+    fn chain<'b>(
+        &'b mut self,
+        slot: vk::VideoReferenceSlotInfoKHR<'b>,
+    ) -> vk::VideoReferenceSlotInfoKHR<'b>
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::H264(info) => slot.push_next(info),
+            Self::H265(info) => slot.push_next(info),
+        }
+    }
+}
+
+/// A decode's codec structure, chained to its decode info.
+enum PictureChain<'a> {
+    H264(vk::VideoDecodeH264PictureInfoKHR<'a>),
+    H265(vk::VideoDecodeH265PictureInfoKHR<'a>),
+}
+
+impl<'a> PictureChain<'a> {
+    /// `info` with this chained.
+    fn chain<'b>(&'b mut self, info: vk::VideoDecodeInfoKHR<'b>) -> vk::VideoDecodeInfoKHR<'b>
+    where
+        'a: 'b,
+    {
+        match self {
+            Self::H264(picture) => info.push_next(picture),
+            Self::H265(picture) => info.push_next(picture),
+        }
+    }
+}
+
+impl<'a> CodecInfo<'a> {
+    /// The setup slot's codec structure.
+    fn setup(&self) -> SlotInfo<'a> {
+        match *self {
+            Self::H264 { setup, .. } => SlotInfo::H264(
+                vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(setup),
+            ),
+            Self::H265 { setup, .. } => SlotInfo::H265(
+                vk::VideoDecodeH265DpbSlotInfoKHR::default().std_reference_info(setup),
+            ),
+        }
+    }
+
+    /// Each reference's codec structure.
+    fn references(&self) -> Vec<SlotInfo<'a>> {
+        match *self {
+            Self::H264 { references, .. } => references
+                .iter()
+                .map(|info| {
+                    SlotInfo::H264(
+                        vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(info),
+                    )
+                })
+                .collect(),
+            Self::H265 { references, .. } => references
+                .iter()
+                .map(|info| {
+                    SlotInfo::H265(
+                        vk::VideoDecodeH265DpbSlotInfoKHR::default().std_reference_info(info),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The references it names.
+    fn reference_count(&self) -> usize {
+        match self {
+            Self::H264 { references, .. } => references.len(),
+            Self::H265 { references, .. } => references.len(),
+        }
+    }
+
+    /// The picture's codec structure, its slices at `offsets`.
+    fn picture(&self, offsets: &'a [u32]) -> PictureChain<'a> {
+        match *self {
+            Self::H264 { picture, .. } => PictureChain::H264(
+                vk::VideoDecodeH264PictureInfoKHR::default()
+                    .std_picture_info(picture)
+                    .slice_offsets(offsets),
+            ),
+            Self::H265 { picture, .. } => PictureChain::H265(
+                vk::VideoDecodeH265PictureInfoKHR::default()
+                    .std_picture_info(picture)
+                    .slice_segment_offsets(offsets),
+            ),
+        }
+    }
+}
+
+/// A codec's session parameters object, with what it holds, which a
+/// [`Session`] keeps and destroys before itself.
+pub(crate) trait SessionParameters: Send + 'static {
+    /// The object.
+    fn handle(&self) -> vk::VideoSessionParametersKHR;
+}
+
+/// How the slices a decoder's decodes read reached them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BitstreamCounts {
+    /// Pictures whose slices were read in place, where the caller's sample
+    /// lies in device memory ([`crate::H264Decoder::decode_in_place`]).
+    pub in_place: u64,
+    /// Pictures whose slices were copied into a bitstream buffer of the
+    /// decoder's.
+    pub copied: u64,
+}
+
+impl BitstreamCounts {
+    /// Counts one more decode, in place or copied.
+    pub(crate) fn count(&mut self, in_place: bool) {
+        let counter = if in_place {
+            &mut self.in_place
+        } else {
+            &mut self.copied
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
+/// What [`Session::decode`] submitted: the value after which the output
+/// holds the picture, and whether its slices were read in place.
+#[derive(Clone, Copy)]
+pub(crate) struct Submitted {
+    pub(crate) landed: u64,
+    pub(crate) in_place: bool,
 }
 
 /// Where a decode's picture lands.
@@ -128,8 +289,14 @@ pub(crate) enum Target {
 }
 
 /// The copy regions of the crop `(x, y, width, height)` into `planes`:
-/// the luma plane's, then the chroma plane's at half the size.
-fn buffer_regions(planes: &BufferPlanes, crop: (u32, u32, u32, u32)) -> [vk::BufferImageCopy; 2] {
+/// the luma plane's, then the chroma plane's at half the size, of samples
+/// of `sample_bytes` bytes (1 in NV12, 2 in P010).
+fn buffer_regions(
+    planes: &BufferPlanes,
+    crop: (u32, u32, u32, u32),
+    sample_bytes: u32,
+) -> [vk::BufferImageCopy; 2] {
+    let sample_bytes = sample_bytes.max(1);
     let (x, y, width, height) = crop;
     let offset = |x: u32, y: u32| vk::Offset3D {
         x: i32::try_from(x).unwrap_or(i32::MAX),
@@ -138,9 +305,10 @@ fn buffer_regions(planes: &BufferPlanes, crop: (u32, u32, u32, u32)) -> [vk::Buf
     };
     let [luma, chroma] = [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1];
     [
+        // The row lengths count texels: a luma sample, a chroma pair.
         vk::BufferImageCopy::default()
             .buffer_offset(planes.luma.0)
-            .buffer_row_length(planes.luma.1)
+            .buffer_row_length(planes.luma.1 / sample_bytes)
             .image_subresource(plane(luma))
             .image_offset(offset(x, y))
             .image_extent(vk::Extent3D {
@@ -148,10 +316,9 @@ fn buffer_regions(planes: &BufferPlanes, crop: (u32, u32, u32, u32)) -> [vk::Buf
                 height,
                 depth: 1,
             }),
-        // Two bytes a chroma sample pair: the row length counts pairs.
         vk::BufferImageCopy::default()
             .buffer_offset(planes.chroma.0)
-            .buffer_row_length(planes.chroma.1 / 2)
+            .buffer_row_length(planes.chroma.1 / (2 * sample_bytes))
             .image_subresource(plane(chroma))
             .image_offset(offset(x / 2, y / 2))
             .image_extent(vk::Extent3D {
@@ -171,14 +338,17 @@ struct CopySource {
     restore: bool,
 }
 
-/// One stream's session.
-pub(crate) struct Session {
+/// One stream's session, its parameters object a `P`.
+pub(crate) struct Session<P: SessionParameters> {
     device: Arc<VideoDevice>,
     timeline: Arc<Timeline>,
     /// What the device answers for the session's profile.
-    pub(crate) caps: H264Capabilities,
+    pub(crate) caps: Capabilities<VideoProfile>,
     /// The coded extent each picture is decoded at.
     pub(crate) extent: vk::Extent2D,
+    /// The extent of each image a decode writes: the coded extent, rounded
+    /// up to the profile's picture access granularity.
+    pub(crate) image_extent: vk::Extent2D,
     handle: vk::VideoSessionKHR,
     memory: Vec<vk::DeviceMemory>,
     /// One a slot, by its index.
@@ -186,7 +356,7 @@ pub(crate) struct Session {
     /// What a decode writes where the device decodes into outputs and the
     /// picture lands in a buffer, made by the first such decode.
     scratch: Option<SessionImage>,
-    parameters: Option<ParameterSets>,
+    parameters: Option<P>,
     /// Whether a decode has reset the session, which its first does.
     reset: bool,
     pool: vk::CommandPool,
@@ -224,12 +394,12 @@ impl Drop for SessionImage {
 }
 
 impl SessionImage {
-    /// An NV12 image of `extent` for `caps`'s profile, of `usage`, shared
-    /// between the decode and copy families, with a view of the decode
-    /// usages `view_usage`.
+    /// An image of `extent` for `caps`'s profile, in its format, of
+    /// `usage`, shared between the decode and copy families, with a view
+    /// of the decode usages `view_usage`.
     fn new(
         device: &Arc<VideoDevice>,
-        caps: &H264Capabilities,
+        caps: &Capabilities<VideoProfile>,
         extent: vk::Extent2D,
         usage: vk::ImageUsageFlags,
         view_usage: vk::ImageUsageFlags,
@@ -238,7 +408,7 @@ impl SessionImage {
         let image = caps.profile.with_list(|list| {
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(PICTURE_FORMAT)
+                .format(caps.profile.format())
                 .extent(vk::Extent3D {
                     width: extent.width,
                     height: extent.height,
@@ -267,7 +437,12 @@ impl SessionImage {
             view: None,
         };
         made.memory = bind_image_memory(device, image)?;
-        made.view = Some(ImageView::for_decode(device, image, view_usage)?);
+        made.view = Some(ImageView::for_decode(
+            device,
+            image,
+            caps.profile.format(),
+            view_usage,
+        )?);
         Ok(made)
     }
 
@@ -275,7 +450,7 @@ impl SessionImage {
     /// output, copied out of, where the two coincide.
     fn dpb(
         device: &Arc<VideoDevice>,
-        caps: &H264Capabilities,
+        caps: &Capabilities<VideoProfile>,
         extent: vk::Extent2D,
     ) -> Result<Self, Error> {
         let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
@@ -327,19 +502,18 @@ enum After {
     SemaphoreWait,
 }
 
-impl Session {
-    /// A session for frames of `extent` whose stream holds
-    /// `max_num_ref_frames` references, of `caps`'s profile: a DPB slot
-    /// for each reference and one for the picture being decoded.
+impl<P: SessionParameters> Session<P> {
+    /// A session for frames of `extent` whose stream holds `references`
+    /// references at most, of `caps`'s profile: a DPB slot for each
+    /// reference and one for the picture being decoded.
     pub(crate) fn new(
         device: &Arc<VideoDevice>,
         timeline: &Arc<Timeline>,
-        caps: H264Capabilities,
+        caps: Capabilities<VideoProfile>,
         extent: vk::Extent2D,
-        max_num_ref_frames: u8,
+        references: u32,
     ) -> Result<Self, Error> {
-        let references = u32::from(max_num_ref_frames);
-        let slots = references + 1;
+        let slots = references.saturating_add(1);
         if slots > caps.max_dpb_slots || references > caps.max_active_reference_pictures {
             return Err(Error::Unsupported(format!(
                 "{references} references: the device has {} DPB slots and {} active references",
@@ -351,6 +525,7 @@ impl Session {
             timeline: Arc::clone(timeline),
             caps,
             extent,
+            image_extent: granular(extent, caps.picture_access_granularity),
             handle: vk::VideoSessionKHR::null(),
             memory: Vec::new(),
             dpb: Vec::new(),
@@ -369,9 +544,9 @@ impl Session {
             let info = vk::VideoSessionCreateInfoKHR::default()
                 .queue_family_index(device.decode_family())
                 .video_profile(profile)
-                .picture_format(PICTURE_FORMAT)
+                .picture_format(caps.profile.format())
                 .max_coded_extent(extent)
-                .reference_picture_format(PICTURE_FORMAT)
+                .reference_picture_format(caps.profile.format())
                 .max_dpb_slots(slots)
                 .max_active_reference_pictures(references)
                 .std_header_version(&caps.std_header_version);
@@ -388,7 +563,8 @@ impl Session {
         })?;
         session.bind_memory()?;
         for _ in 0..slots {
-            session.dpb.push(SessionImage::dpb(device, &caps, extent)?);
+            let image = SessionImage::dpb(device, &caps, session.image_extent)?;
+            session.dpb.push(image);
         }
         session.pool = command_pool(device, device.decode_family())?;
         if !device.copies_on_decode_queue() {
@@ -468,40 +644,39 @@ impl Session {
         u32::try_from(self.dpb.len()).unwrap_or(u32::MAX)
     }
 
-    /// The parameters object that holds `sps` and `pps`: the one it has,
-    /// or a new one in its place, the old retired once the decodes
-    /// submitted with it are done.
+    /// The parameters object a picture needs: the one the session has,
+    /// where `holds` says it holds the picture's sets, else the one `make`
+    /// makes for the session from the old one, in its place, the old
+    /// retired once the decodes submitted with it are done.
     pub(crate) fn parameters(
         &mut self,
-        sps: &Sps,
-        pps: &Pps,
+        holds: impl FnOnce(&P) -> bool,
+        make: impl FnOnce(&Arc<VideoDevice>, vk::VideoSessionKHR, Option<&P>) -> Result<P, Error>,
     ) -> Result<vk::VideoSessionParametersKHR, Error> {
         if let Some(sets) = &self.parameters
-            && sets.holds(sps, pps)
+            && holds(sets)
         {
             return Ok(sets.handle());
         }
-        let new = ParameterSets::new(
-            &self.device,
-            self.handle,
-            self.parameters.as_ref(),
-            sps,
-            pps,
-        )?;
+        let new = make(&self.device, self.handle, self.parameters.as_ref())?;
         let handle = new.handle();
         if let Some(old) = self.parameters.replace(new) {
-            self.timeline.retire(
-                self.timeline.last_submitted(),
-                Box::new(old.into_parameters()),
-            );
+            self.timeline
+                .retire(self.timeline.last_submitted(), Box::new(old));
         }
         Ok(handle)
     }
 
     /// Records and submits `decode`, and the copy of its picture into its
     /// output where the device decodes into DPB pictures alone. Returns
-    /// the value after which the output holds the picture.
-    pub(crate) fn decode(&mut self, decode: &Decode<'_>) -> Result<u64, Error> {
+    /// the value after which the output holds the picture, and whether its
+    /// slices were read in place.
+    pub(crate) fn decode(&mut self, decode: &Decode<'_>) -> Result<Submitted, Error> {
+        if decode.reference_slots.len() != decode.codec.reference_count() {
+            return Err(Error::Unsupported(
+                "references with no std information of their own".into(),
+            ));
+        }
         let in_place = match decode.in_memory {
             Some(sample) => self.in_place(sample, decode.slices)?,
             None => None,
@@ -521,17 +696,21 @@ impl Session {
             Ok(value) => value,
             Err(_) => self.timeline.last_submitted(),
         };
+        let read_in_place = in_place.is_some();
         if let Some(place) = in_place {
             self.timeline.retire(submission.value, Box::new(place));
         }
         self.busy.push_back(submission);
-        decoded
+        Ok(Submitted {
+            landed: decoded?,
+            in_place: read_in_place,
+        })
     }
 
     /// Where `slices`, which lie in `sample`, are read in place: a buffer
     /// bound over the sample's memory from the first slice's start code,
     /// where the device takes them there (see
-    /// [`super::H264Decoder::decode_in_place`]); `None` where it does not,
+    /// [`crate::H264Decoder::decode_in_place`]); `None` where it does not,
     /// or a slice lies elsewhere.
     fn in_place(&self, sample: &InMemory, slices: &[&[u8]]) -> Result<Option<InPlace>, Error> {
         let import = &sample.memory.import;
@@ -629,7 +808,7 @@ impl Session {
         source: Option<(vk::Buffer, u64)>,
     ) -> Result<u64, Error> {
         if let Target::Buffer(planes, (_, _, width, height)) = decode.output {
-            planes.check(width, height)?;
+            planes.check(width, height, self.caps.profile.sample_bytes())?;
         }
         // Where the device decodes into outputs, a picture that lands in a
         // buffer is decoded into the session's scratch image and copied
@@ -642,7 +821,7 @@ impl Session {
             self.scratch = Some(SessionImage::new(
                 &self.device,
                 &self.caps,
-                self.extent,
+                self.image_extent,
                 usage | vk::ImageUsageFlags::TRANSFER_SRC,
                 usage,
             )?);
@@ -741,28 +920,23 @@ impl Session {
                 .base_array_layer(0)
                 .image_view_binding(view)
         };
-        let mut reference_resources = Vec::with_capacity(decode.references.len());
-        for &(slot, _) in decode.references {
+        let mut reference_resources = Vec::with_capacity(decode.reference_slots.len());
+        for &slot in decode.reference_slots {
             reference_resources.push(resource(self.dpb_picture(slot)?.view()));
         }
-        let mut reference_dpb: Vec<vk::VideoDecodeH264DpbSlotInfoKHR<'_>> = decode
-            .references
-            .iter()
-            .map(|(_, info)| vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(info))
-            .collect();
+        let mut reference_codec = decode.codec.references();
         let setup_resource = resource(setup_view);
         let output_resource = written.map_or(setup_resource, |(_, view)| resource(view));
-        let mut setup_dpb =
-            vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&decode.setup_info);
+        let mut setup_codec = decode.codec.setup();
 
         // The slots bound for the scope: every reference's, and the
         // picture's DPB picture, not yet a slot's (-1), as the decode sets
         // it up.
         let mut bound: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = decode
-            .references
+            .reference_slots
             .iter()
             .zip(&reference_resources)
-            .map(|(&(slot, _), resource)| {
+            .map(|(&slot, resource)| {
                 vk::VideoReferenceSlotInfoKHR::default()
                     .slot_index(slot)
                     .picture_resource(resource)
@@ -787,32 +961,33 @@ impl Session {
             unsafe { (fp.cmd_control_video_coding_khr)(command, &control) };
         }
         let references: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = decode
-            .references
+            .reference_slots
             .iter()
             .zip(&reference_resources)
-            .zip(reference_dpb.iter_mut())
-            .map(|((&(slot, _), resource), dpb)| {
-                vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(slot)
-                    .picture_resource(resource)
-                    .push_next(dpb)
+            .zip(reference_codec.iter_mut())
+            .map(|((&slot, resource), codec)| {
+                codec.chain(
+                    vk::VideoReferenceSlotInfoKHR::default()
+                        .slot_index(slot)
+                        .picture_resource(resource),
+                )
             })
             .collect();
-        let setup_slot = vk::VideoReferenceSlotInfoKHR::default()
-            .slot_index(decode.setup_slot)
-            .picture_resource(&setup_resource)
-            .push_next(&mut setup_dpb);
-        let mut h264 = vk::VideoDecodeH264PictureInfoKHR::default()
-            .std_picture_info(&decode.picture_info)
-            .slice_offsets(offsets);
-        let info = vk::VideoDecodeInfoKHR::default()
-            .src_buffer(src_buffer)
-            .src_buffer_offset(src_offset)
-            .src_buffer_range(range)
-            .dst_picture_resource(output_resource)
-            .setup_reference_slot(&setup_slot)
-            .reference_slots(&references)
-            .push_next(&mut h264);
+        let setup_slot = setup_codec.chain(
+            vk::VideoReferenceSlotInfoKHR::default()
+                .slot_index(decode.setup_slot)
+                .picture_resource(&setup_resource),
+        );
+        let mut picture_codec = decode.codec.picture(offsets);
+        let info = picture_codec.chain(
+            vk::VideoDecodeInfoKHR::default()
+                .src_buffer(src_buffer)
+                .src_buffer_offset(src_offset)
+                .src_buffer_range(range)
+                .dst_picture_resource(output_resource)
+                .setup_reference_slot(&setup_slot)
+                .reference_slots(&references),
+        );
         // SAFETY: as above, inside the coding scope, with every structure
         // the decode reads alive through the call.
         unsafe { (self.device.decode().fp().cmd_decode_video_khr)(command, &info) };
@@ -980,7 +1155,7 @@ impl Session {
                 }
             }
             Target::Buffer(planes, crop) => {
-                let regions = buffer_regions(&planes, crop);
+                let regions = buffer_regions(&planes, crop, self.caps.profile.sample_bytes());
                 // SAFETY: as above; the source holds the crop, in the layout
                 // the barrier left it in, and the planes fit the buffer
                 // (its holder's word) and the copy's rules
@@ -1066,7 +1241,7 @@ impl Session {
     }
 }
 
-impl Drop for Session {
+impl<P: SessionParameters> Drop for Session<P> {
     fn drop(&mut self) {
         // Every work of the session was submitted before the timeline's
         // last value.
@@ -1102,6 +1277,15 @@ impl Drop for Session {
             // SAFETY: the session bound to it is destroyed.
             unsafe { device.free_memory(memory, None) };
         }
+    }
+}
+
+/// `extent` rounded up to whole multiples of `granularity` each way.
+fn granular(extent: vk::Extent2D, granularity: vk::Extent2D) -> vk::Extent2D {
+    let up = |size: u32, step: u32| size.next_multiple_of(step.max(1));
+    vk::Extent2D {
+        width: up(extent.width, granularity.width),
+        height: up(extent.height, granularity.height),
     }
 }
 
@@ -1180,7 +1364,11 @@ fn submit(
 
 impl Bitstream {
     /// A buffer of `size` bytes for `caps`'s profile, mapped.
-    fn new(device: &Arc<VideoDevice>, caps: &H264Capabilities, size: u64) -> Result<Self, Error> {
+    fn new(
+        device: &Arc<VideoDevice>,
+        caps: &Capabilities<VideoProfile>,
+        size: u64,
+    ) -> Result<Self, Error> {
         let vk_device = device.device();
         let buffer = caps.profile.with_list(|list| {
             let info = vk::BufferCreateInfo::default()
@@ -1265,38 +1453,31 @@ mod tests {
 
     #[test]
     fn buffer_planes_take_what_a_transfer_queue_copies() {
-        assert!(
-            planes((256, 1344), (1_000_064, 1344))
-                .check(1280, 720)
-                .is_ok()
-        );
+        let check = |luma, chroma, width| planes(luma, chroma).check(width, 720, 1);
+        assert!(check((256, 1344), (1_000_064, 1344), 1280).is_ok());
         // Offsets a multiple of 4, pitches at least the width, the chroma
         // pitch even.
-        assert!(
-            planes((2, 1344), (1_000_064, 1344))
-                .check(1280, 720)
-                .is_err()
-        );
-        assert!(
-            planes((256, 1344), (1_000_066, 1344))
-                .check(1280, 720)
-                .is_err()
-        );
-        assert!(
-            planes((256, 1279), (1_000_064, 1344))
-                .check(1280, 720)
-                .is_err()
-        );
-        assert!(
-            planes((256, 1281), (1_000_064, 1281))
-                .check(1281, 720)
-                .is_err()
-        );
-        assert!(
-            planes((256, 1281), (1_000_064, 1282))
-                .check(1281, 720)
-                .is_ok()
-        );
+        assert!(check((2, 1344), (1_000_064, 1344), 1280).is_err());
+        assert!(check((256, 1344), (1_000_066, 1344), 1280).is_err());
+        assert!(check((256, 1279), (1_000_064, 1344), 1280).is_err());
+        assert!(check((256, 1281), (1_000_064, 1281), 1281).is_err());
+        assert!(check((256, 1281), (1_000_064, 1282), 1281).is_ok());
+    }
+
+    #[test]
+    fn p010_planes_take_two_bytes_a_sample() {
+        let check = |luma, chroma, width| planes(luma, chroma).check(width, 360, 2);
+        // 640 samples are 1280 bytes a row in either plane.
+        assert!(check((0, 1280), (500_000, 1280), 640).is_ok());
+        assert!(check((0, 1278), (500_000, 1280), 640).is_err());
+        assert!(check((0, 1280), (500_000, 1278), 640).is_err());
+        // A pitch of whole samples, and of whole chroma pairs.
+        assert!(check((0, 1282), (500_000, 1284), 640).is_ok());
+        assert!(check((0, 1281), (500_000, 1284), 640).is_err());
+        assert!(check((0, 1282), (500_000, 1282), 640).is_err());
+        // An odd width rounds its chroma up to a whole pair.
+        assert!(check((0, 1282), (500_000, 1284), 641).is_ok());
+        assert!(check((0, 1282), (500_000, 1282), 641).is_err());
     }
 
     #[test]
@@ -1305,28 +1486,28 @@ mod tests {
         // 359 + 1280 = 1_483_840 bytes in; the luma plane's 720 end before
         // its start.
         let fits = planes((0, 1344), (1_000_064, 1344));
-        assert!(fits.check(1280, 720).is_ok());
+        assert!(fits.check(1280, 720, 1).is_ok());
         let short = BufferPlanes {
             size: 1_483_839,
             ..fits
         };
-        assert!(short.check(1280, 720).is_err());
-        assert!(
-            BufferPlanes {
-                size: 1_483_840,
-                ..fits
-            }
-            .check(1280, 720)
-            .is_ok()
-        );
+        assert!(short.check(1280, 720, 1).is_err());
+        let exact = BufferPlanes {
+            size: 1_483_840,
+            ..fits
+        };
+        assert!(exact.check(1280, 720, 1).is_ok());
         // The luma plane's rows run into the end of a buffer as small.
-        assert!(planes((0, 1344), (0, 1344)).check(1280, 1500).is_err());
+        assert!(planes((0, 1344), (0, 1344)).check(1280, 1500, 1).is_err());
+        // At two bytes a sample, 640 samples fill those 1280 bytes a row.
+        assert!(exact.check(640, 720, 2).is_ok());
+        assert!(exact.check(641, 720, 2).is_err());
     }
 
     #[test]
     fn a_crop_lands_at_each_planes_origin() {
         let [luma, chroma] =
-            buffer_regions(&planes((256, 1344), (968_064, 1344)), (8, 4, 1280, 720));
+            buffer_regions(&planes((256, 1344), (968_064, 1344)), (8, 4, 1280, 720), 1);
         assert_eq!(
             (
                 luma.buffer_offset,
@@ -1358,6 +1539,38 @@ mod tests {
             chroma.image_subresource.aspect_mask.as_raw(),
             vk::ImageAspectFlags::PLANE_1.as_raw()
         );
+    }
+
+    #[test]
+    fn p010_row_lengths_count_samples_and_pairs() {
+        let [luma, chroma] =
+            buffer_regions(&planes((0, 2688), (1_935_360, 2688)), (0, 0, 1280, 720), 2);
+        // 2688 bytes a row: 1344 luma samples, 672 chroma pairs of 4 bytes.
+        assert_eq!(luma.buffer_row_length, 1344);
+        assert_eq!(chroma.buffer_row_length, 672);
+        assert_eq!(
+            (chroma.image_extent.width, chroma.image_extent.height),
+            (640, 360)
+        );
+    }
+
+    #[test]
+    fn images_round_up_to_the_access_granularity() {
+        let rounded = |(width, height), (x, y)| {
+            let out = granular(
+                vk::Extent2D { width, height },
+                vk::Extent2D {
+                    width: x,
+                    height: y,
+                },
+            );
+            (out.width, out.height)
+        };
+        assert_eq!(rounded((1368, 768), (16, 16)), (1376, 768));
+        assert_eq!(rounded((1920, 1080), (16, 16)), (1920, 1088));
+        assert_eq!(rounded((1368, 766), (1, 1)), (1368, 766));
+        // A granularity of 0 is taken as 1.
+        assert_eq!(rounded((8, 8), (0, 0)), (8, 8));
     }
 
     #[test]

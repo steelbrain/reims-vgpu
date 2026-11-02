@@ -21,8 +21,10 @@ use reims_vgpu_video_codec::h264::scaling::ScalingLists;
 use reims_vgpu_video_codec::h264::sps::Sps;
 
 use crate::device::VideoDevice;
-use crate::error::{Error, Named};
+use crate::error::Error;
+use crate::params::Parameters;
 use crate::profile::std_level;
+use crate::session::SessionParameters;
 use crate::std_types::zeroed;
 
 /// An SPS as a std structure, with what it points at.
@@ -184,36 +186,13 @@ pub(crate) struct ParameterSets {
     handle: Parameters,
 }
 
-/// A session parameters object, destroyed as it goes.
-pub(crate) struct Parameters {
-    device: Arc<VideoDevice>,
-    handle: vk::VideoSessionParametersKHR,
-}
-
-impl Drop for Parameters {
-    fn drop(&mut self) {
-        // SAFETY: the object is the device's, and the work that used it is
-        // done: its holder waits for that in the timeline.
-        unsafe {
-            (self
-                .device
-                .video()
-                .fp()
-                .destroy_video_session_parameters_khr)(
-                self.device.device().handle(),
-                self.handle,
-                std::ptr::null(),
-            );
-        }
+impl SessionParameters for ParameterSets {
+    fn handle(&self) -> vk::VideoSessionParametersKHR {
+        self.handle.handle()
     }
 }
 
 impl ParameterSets {
-    /// The object's handle.
-    pub(crate) fn handle(&self) -> vk::VideoSessionParametersKHR {
-        self.handle.handle
-    }
-
     /// Whether it holds `sps` and `pps` as they are.
     pub(crate) fn holds(&self, sps: &Sps, pps: &Pps) -> bool {
         self.sps.iter().any(|s| s == sps) && self.pps.iter().any(|p| p == pps)
@@ -264,31 +243,11 @@ impl ParameterSets {
         let info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(session)
             .push_next(&mut h264);
-        let mut handle = vk::VideoSessionParametersKHR::null();
-        // SAFETY: the session is the device's; `info`, its chain and the
-        // std structures with what they point at live through the call.
-        unsafe {
-            (device.video().fp().create_video_session_parameters_khr)(
-                device.device().handle(),
-                &info,
-                std::ptr::null(),
-                &mut handle,
-            )
-        }
-        .named("vkCreateVideoSessionParametersKHR")?;
         Ok(Self {
             sps: sets_sps,
             pps: sets_pps,
-            handle: Parameters {
-                device: Arc::clone(device),
-                handle,
-            },
+            handle: Parameters::new(device, &info)?,
         })
-    }
-
-    /// The object, to retire.
-    pub(crate) fn into_parameters(self) -> Parameters {
-        self.handle
     }
 }
 

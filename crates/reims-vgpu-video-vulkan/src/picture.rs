@@ -10,7 +10,7 @@ use ash::vk;
 
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
-use crate::profile::PICTURE_FORMAT;
+use crate::profile::P010_FORMAT;
 use crate::surface::{Landing, Surface};
 use crate::timeline::Timeline;
 
@@ -21,7 +21,7 @@ const READ_BACK_WAIT: Duration = Duration::from_secs(10);
 /// value after which the output holds it.
 ///
 /// Its samples as a reference are in the decoder's DPB picture of its
-/// slot. A stand-in for a lost frame shares its source's slot
+/// slot. A stand-in for a lost H.264 frame shares its source's slot
 /// ([`reims_vgpu_video_codec::h264::Accelerator::conceal`]): a DPB picture
 /// is written only by the decode that sets its slot up, which no slot a
 /// reference holds is, so the stand-in holds what its source holds for as
@@ -36,6 +36,8 @@ struct Inner<T: Surface> {
     /// Taken as it goes, to wait for the GPU in the timeline.
     held: ManuallyDrop<Held<T>>,
     extent: vk::Extent2D,
+    /// The format it was decoded in: NV12 or P010.
+    format: vk::Format,
     /// The DPB slot its decode set up, -1 before it.
     slot: AtomicI32,
     /// The value after which the output holds the picture, 0 before its
@@ -57,19 +59,20 @@ pub(crate) struct ImageView {
 }
 
 impl ImageView {
-    /// A view of the whole of `image` for decoding into and predicting
-    /// from, of the decode usages `usage` alone: a sampled view of NV12
-    /// would need a sampler conversion.
+    /// A view of the whole of `image`, of `format`, for decoding into and
+    /// predicting from, of the decode usages `usage` alone: a sampled view
+    /// of a two-plane format would need a sampler conversion.
     pub(crate) fn for_decode(
         device: &Arc<VideoDevice>,
         image: vk::Image,
+        format: vk::Format,
         usage: vk::ImageUsageFlags,
     ) -> Result<Self, Error> {
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(usage);
         let info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(PICTURE_FORMAT)
+            .format(format)
             .subresource_range(color_range())
             .push_next(&mut usage);
         // SAFETY: `info` and its chain live through the call, and the image
@@ -104,17 +107,20 @@ pub(crate) fn color_range() -> vk::ImageSubresourceRange {
 }
 
 impl<T: Surface> Picture<T> {
+    /// A picture of `extent` in `format`, landing in `surface`.
     pub(crate) fn new(
         timeline: &Arc<Timeline>,
         surface: T,
         view: Option<ImageView>,
         extent: vk::Extent2D,
+        format: vk::Format,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 timeline: Arc::clone(timeline),
                 held: ManuallyDrop::new(Held { surface, view }),
                 extent,
+                format,
                 slot: AtomicI32::new(-1),
                 landed: AtomicU64::new(0),
             }),
@@ -144,6 +150,21 @@ impl<T: Surface> Picture<T> {
     /// output's origin.
     pub fn coded_extent(&self) -> vk::Extent2D {
         self.inner.extent
+    }
+
+    /// The format it was decoded in, and its output has:
+    /// [`crate::PICTURE_FORMAT`] (NV12) or [`crate::P010_FORMAT`].
+    pub fn format(&self) -> vk::Format {
+        self.inner.format
+    }
+
+    /// The bytes of one of its samples: 1 in NV12, 2 in P010.
+    pub fn sample_bytes(&self) -> u32 {
+        if self.inner.format == P010_FORMAT {
+            2
+        } else {
+            1
+        }
     }
 
     /// The decoder's timeline semaphore.
@@ -187,8 +208,9 @@ impl<T: Surface> Picture<T> {
     /// buffer landing is refused: the caller reads its own buffer.
     pub fn read_back(&self, device: &Arc<VideoDevice>) -> Result<Nv12, Error> {
         let extent = self.inner.extent;
+        let sample_bytes = self.sample_bytes();
         let (width, height) = (u64::from(extent.width), u64::from(extent.height));
-        let luma = width * height;
+        let luma = width * height * u64::from(sample_bytes);
         let size = luma + luma / 2;
         let Landing::Image(image) = self.surface().landing() else {
             return Err(Error::Unsupported(
@@ -205,6 +227,7 @@ impl<T: Surface> Picture<T> {
         Ok(Nv12 {
             width: extent.width,
             height: extent.height,
+            sample_bytes,
             y: y.to_vec(),
             uv: uv.to_vec(),
         })
@@ -221,20 +244,25 @@ impl<T: Surface> Drop for Inner<T> {
     }
 }
 
-/// A frame's planes in host memory, of the coded extent.
+/// A frame's planes in host memory, of the coded extent: NV12, or P010
+/// where its samples are of 2 bytes, each a little-endian 16-bit value
+/// whose high 10 bits are the sample.
 pub struct Nv12 {
     /// The width in luma samples.
     pub width: u32,
     /// The height in luma samples.
     pub height: u32,
-    /// The luma plane, `width` bytes a row.
+    /// The bytes of a sample: 1 (NV12) or 2 (P010).
+    pub sample_bytes: u32,
+    /// The luma plane, `width * sample_bytes` bytes a row.
     pub y: Vec<u8>,
-    /// The chroma plane, Cb and Cr interleaved, `width` bytes a row and
-    /// half as many rows.
+    /// The chroma plane, Cb and Cr interleaved, `width * sample_bytes`
+    /// bytes a row and half as many rows.
     pub uv: Vec<u8>,
 }
 
-/// An NV12 image's two planes: each one's aspect and extent.
+/// A two-plane 4:2:0 image's planes, NV12's or P010's: each one's aspect
+/// and extent in its own texels.
 pub(crate) fn planes(extent: vk::Extent2D) -> [(vk::ImageAspectFlags, vk::Extent3D); 2] {
     [
         (
@@ -328,7 +356,8 @@ impl<'a> ReadBack<'a> {
     }
 
     /// Records the copy of `image`'s two planes, in `GENERAL` as every
-    /// output is left, into the buffer, the chroma plane at `luma`.
+    /// output is left, into the buffer, tightly packed, the chroma plane
+    /// at `luma`.
     fn record(&self, image: vk::Image, extent: vk::Extent2D, luma: u64) -> Result<(), Error> {
         let vk_device = self.device.device();
         let begin = vk::CommandBufferBeginInfo::default()

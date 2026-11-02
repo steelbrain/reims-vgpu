@@ -44,12 +44,18 @@ impl UnifiedImageLayoutsFeatures {
     }
 }
 
-/// The device extensions an H.264 decode needs.
+/// The device extensions an H.264 decode needs, which a device
+/// [`VideoDevice::create`] makes has.
 const REQUIRED_EXTENSIONS: [&CStr; 3] = [
     ash::khr::video_queue::NAME,
     ash::khr::video_decode_queue::NAME,
     ash::khr::video_decode_h264::NAME,
 ];
+
+/// The device extension an H.265 decode needs besides the first two of
+/// [`REQUIRED_EXTENSIONS`], which [`VideoDevice::create`] enables where the
+/// decode family decodes H.265.
+const H265_EXTENSION: &CStr = ash::khr::video_decode_h265::NAME;
 
 /// Another's device, as [`VideoDevice::from_raw`] takes it.
 pub struct RawDevice {
@@ -64,12 +70,15 @@ pub struct RawDevice {
     /// The device's physical device.
     pub physical_device: vk::PhysicalDevice,
     /// The device, made with `VK_KHR_video_queue`,
-    /// `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264` (and
-    /// `VK_KHR_synchronization2` on an instance below Vulkan 1.3), and the
-    /// `timelineSemaphore` and `synchronization2` features.
+    /// `VK_KHR_video_decode_queue` and the decode extension of each codec
+    /// the decoders on it decode (`VK_KHR_video_decode_h264` for
+    /// [`VideoDevice::from_raw`]; [`VideoDevice::from_raw_with_codecs`]
+    /// names them), and `VK_KHR_synchronization2` on an instance below
+    /// Vulkan 1.3, and the `timelineSemaphore` and `synchronization2`
+    /// features.
     pub device: ash::Device,
     /// A queue family with `VK_QUEUE_VIDEO_DECODE_BIT_KHR` whose video
-    /// codec operations include H.264 decode.
+    /// codec operations include the decode of each of those codecs.
     pub decode_family: u32,
     /// A queue of `decode_family`, which only the decoders on this device
     /// submit to.
@@ -109,6 +118,8 @@ pub struct VideoDevice {
     /// The graphics queue of a device of our own.
     graphics_queue: Option<vk::Queue>,
     unified_layouts: bool,
+    /// The codecs decoders on it decode.
+    codecs: vk::VideoCodecOperationFlagsKHR,
     memory: vk::PhysicalDeviceMemoryProperties,
     video_instance: ash::khr::video_queue::Instance,
     video: ash::khr::video_queue::Device,
@@ -130,6 +141,9 @@ struct Choice {
     family_queues: u32,
     /// Whether the decode family copies.
     decode_family_copies: bool,
+    /// Whether the decode family decodes H.265 and the device has its
+    /// extension.
+    decodes_h265: bool,
     maintenance1: bool,
     unified_layouts: bool,
     /// The kind of device, best first: discrete, integrated, virtual,
@@ -144,7 +158,8 @@ fn copies(flags: vk::QueueFlags) -> bool {
 }
 
 impl VideoDevice {
-    /// Decoders on another's device, which it keeps.
+    /// H.264 decoders on another's device, which it keeps:
+    /// [`Self::from_raw_with_codecs`] of H.264 decode alone.
     ///
     /// # Safety
     ///
@@ -153,14 +168,34 @@ impl VideoDevice {
     /// lives; nothing but the decoders made on it submits to
     /// `raw.decode_queue` and `raw.copy_queue` meanwhile.
     pub unsafe fn from_raw(raw: RawDevice) -> Arc<Self> {
-        Arc::new(Self::assemble(raw, None, false))
+        // SAFETY: as the caller promises, of H.264 decode.
+        unsafe { Self::from_raw_with_codecs(raw, vk::VideoCodecOperationFlagsKHR::DECODE_H264) }
+    }
+
+    /// Decoders of `codecs` (`DECODE_H264`, `DECODE_H265` or both) on
+    /// another's device, which it keeps. A codec left out has no
+    /// capabilities on it ([`crate::h265_capabilities`] answers none), so
+    /// no decoder of it starts.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::from_raw`], `raw.device` having been made with the
+    /// decode extension of each codec of `codecs`
+    /// (`VK_KHR_video_decode_h264`, `VK_KHR_video_decode_h265`), and
+    /// `raw.decode_family` decoding each.
+    pub unsafe fn from_raw_with_codecs(
+        raw: RawDevice,
+        codecs: vk::VideoCodecOperationFlagsKHR,
+    ) -> Arc<Self> {
+        Arc::new(Self::assemble(raw, None, false, codecs))
     }
 
     /// A device of its own, on the first physical device, discrete GPUs
     /// first, that decodes H.264 through Vulkan Video: one graphics queue
-    /// and one video-decode queue, with `VK_KHR_video_maintenance1` and
-    /// `VK_KHR_unified_image_layouts`'s `unifiedImageLayoutsVideo` where
-    /// the device has them. Its copies run on the decode queue where the
+    /// and one video-decode queue, with `VK_KHR_video_decode_h265` where
+    /// the decode family decodes H.265 too, and
+    /// `VK_KHR_video_maintenance1` and `VK_KHR_unified_image_layouts`'s
+    /// `unifiedImageLayoutsVideo` where the device has them. Its copies run on the decode queue where the
     /// decode family copies, else on the graphics queue.
     /// [`Error::NoVideoDecode`] says why each device was passed over where
     /// none decodes H.264.
@@ -203,6 +238,10 @@ impl VideoDevice {
         } else {
             (choice.graphics_family, graphics)
         };
+        let mut codecs = vk::VideoCodecOperationFlagsKHR::DECODE_H264;
+        if choice.decodes_h265 {
+            codecs |= vk::VideoCodecOperationFlagsKHR::DECODE_H265;
+        }
         let raw = RawDevice {
             entry,
             instance,
@@ -216,10 +255,15 @@ impl VideoDevice {
             graphics_family: choice.graphics_family,
             unified_image_layouts_video: choice.unified_layouts,
         };
-        Self::assemble(raw, Some(graphics), true)
+        Self::assemble(raw, Some(graphics), true, codecs)
     }
 
-    fn assemble(raw: RawDevice, graphics_queue: Option<vk::Queue>, owned: bool) -> Self {
+    fn assemble(
+        raw: RawDevice,
+        graphics_queue: Option<vk::Queue>,
+        owned: bool,
+        codecs: vk::VideoCodecOperationFlagsKHR,
+    ) -> Self {
         // SAFETY: the physical device is the instance's.
         let memory = unsafe {
             raw.instance
@@ -243,6 +287,7 @@ impl VideoDevice {
             graphics_family: raw.graphics_family,
             graphics_queue,
             unified_layouts: raw.unified_image_layouts_video,
+            codecs,
             memory,
             video_instance,
             video,
@@ -311,6 +356,12 @@ impl VideoDevice {
     /// then kept in `VK_IMAGE_LAYOUT_GENERAL`.
     pub fn unified_image_layouts(&self) -> bool {
         self.unified_layouts
+    }
+
+    /// The codec operations decoders on it decode: `DECODE_H264`, with
+    /// `DECODE_H265` where the device was made for it.
+    pub fn codecs(&self) -> vk::VideoCodecOperationFlagsKHR {
+        self.codecs
     }
 
     /// The device's name, as the driver gives it.
@@ -560,6 +611,9 @@ fn make_device(instance: &ash::Instance) -> Result<(Choice, ash::Device), Error>
     if choice.unified_layouts {
         extensions.push(UNIFIED_IMAGE_LAYOUTS.as_ptr());
     }
+    if choice.decodes_h265 {
+        extensions.push(H265_EXTENSION.as_ptr());
+    }
     let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
     let mut v13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
     let mut maintenance1 =
@@ -649,6 +703,13 @@ fn examine(
     let decode_family_copies = flags
         .get(usize::try_from(decode_family).unwrap_or(usize::MAX))
         .is_some_and(|&(f, _)| copies(f));
+    let decodes_h265 = has(H265_EXTENSION)
+        && video
+            .get(usize::try_from(decode_family).unwrap_or(usize::MAX))
+            .is_some_and(|v| {
+                v.video_codec_operations
+                    .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
+            });
 
     let maintenance1_listed = has(ash::khr::video_maintenance1::NAME);
     let unified_listed = has(UNIFIED_IMAGE_LAYOUTS);
@@ -686,6 +747,7 @@ fn examine(
         graphics_family,
         family_queues,
         decode_family_copies,
+        decodes_h265,
         maintenance1: maintenance1_listed && maintenance1.video_maintenance1 == vk::TRUE,
         unified_layouts: unified_listed
             && unified.unified_image_layouts == vk::TRUE

@@ -1,8 +1,9 @@
 //! Where a decoder's pictures land: outputs its caller supplies, one a
-//! picture, each an image or two planes in a buffer ([`Landing`]). In the
-//! product an image is the GPU copy of a guest IOSurface, which the
-//! guest's Metal then samples per plane, through R8 and RG8 views, and a
-//! buffer the IOSurface's own bytes in host memory. The decoder's
+//! picture, each an image or two planes in a buffer ([`Landing`]), NV12
+//! at 8 bits and P010 at 10. In the product an image is the GPU copy of a
+//! guest IOSurface, which the guest's Metal then samples per plane,
+//! through R8 and RG8 views (R16 and RG16 for P010), and a buffer the
+//! IOSurface's own bytes in host memory. The decoder's
 //! references are DPB pictures of its own, never an output: a guest
 //! recycles an output once it has shown it, whether or not the picture is
 //! still a reference.
@@ -14,35 +15,43 @@ use ash::vk;
 
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
-use crate::profile::{H264Profile, OUTPUT_FLAGS, OUTPUT_USAGE, PICTURE_FORMAT};
+use crate::profile::{OUTPUT_FLAGS, OUTPUT_USAGE, VideoProfile};
 
 /// How a decoder's output images are made, which it gives its
 /// [`SurfaceSource`] with each request.
 ///
-/// An output image is 2D, one mip level and one layer,
-/// `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`, optimally tiled, at least
-/// `extent`, with [`OUTPUT_FLAGS`] and the usage [`Self::usage`] gives,
-/// shared `CONCURRENT` between the families
+/// An output image is 2D, one mip level and one layer, of the profile's
+/// format ([`Self::format`]: `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM` at 8
+/// bits, `VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` at 10),
+/// optimally tiled, at least `extent`, with [`OUTPUT_FLAGS`] and the usage
+/// [`Self::usage`] gives, shared `CONCURRENT` between the families
 /// [`Self::families`] gives (exclusive where that is one), and bound to
 /// memory. Where `decode_target` is set, a decode writes it, and its
 /// create info chains a `VkVideoProfileListInfoKHR` of `profile` alone
-/// ([`H264Profile::with_list`]); else a copy does, and it has none.
-/// [`Self::with_create_info`] builds that create info.
+/// ([`VideoProfile::with_list`]); else a copy does, and it has none.
+/// [`Self::with_create_info`] builds that create info. Planes in a buffer
+/// are of the same format, a sample [`VideoProfile::sample_bytes`] bytes.
 ///
 /// **Layouts.** Each picture takes its output from `UNDEFINED`, dropping
 /// what it held, and leaves it in `VK_IMAGE_LAYOUT_GENERAL`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceSpec {
-    /// The coded extent each picture is decoded at.
+    /// The extent of an output image: the coded extent each picture is
+    /// decoded at, rounded up to the profile's picture access granularity.
     pub extent: vk::Extent2D,
     /// The stream's profile.
-    pub profile: H264Profile,
+    pub profile: VideoProfile,
     /// Whether a decode writes the output itself
     /// (`DPB_AND_OUTPUT_DISTINCT`), rather than a copy out of the DPB.
     pub decode_target: bool,
 }
 
 impl SurfaceSpec {
+    /// The output's format: NV12, or P010 at 10 bits.
+    pub fn format(&self) -> vk::Format {
+        self.profile.format()
+    }
+
     /// The output's usage: [`OUTPUT_USAGE`], with `VIDEO_DECODE_DST`
     /// where a decode writes it.
     pub fn usage(&self) -> vk::ImageUsageFlags {
@@ -70,7 +79,7 @@ impl SurfaceSpec {
         let info = vk::ImageCreateInfo::default()
             .flags(OUTPUT_FLAGS)
             .image_type(vk::ImageType::TYPE_2D)
-            .format(PICTURE_FORMAT)
+            .format(self.format())
             .extent(vk::Extent3D {
                 width: self.extent.width,
                 height: self.extent.height,
@@ -113,19 +122,21 @@ pub enum Landing {
     Buffer(BufferPlanes),
 }
 
-/// NV12 planes in a buffer: the luma plane's rows of the crop's width,
-/// then the interleaved chroma plane's half as many rows of the same
-/// width in bytes, each plane from its first byte, one row each pitch
-/// after the last.
+/// NV12 or P010 planes in a buffer: the luma plane's rows of the crop's
+/// width, then the interleaved chroma plane's half as many rows of the
+/// same width in bytes, each plane from its first byte, one row each pitch
+/// after the last. A sample is a byte in NV12, and two in P010, each a
+/// little-endian 16-bit value whose high 10 bits are the sample.
 ///
 /// The buffer has `TRANSFER_DST` usage and is bound to memory; it is
 /// shared `CONCURRENT` between the families [`SurfaceSpec::families`]
 /// gives where they are more than one, as an output image is. Each
-/// offset is a multiple of 4, and each pitch at least the crop's width,
-/// the chroma pitch an even number, as Vulkan's copies take them where
-/// the queue that copies neither draws nor computes; and each plane's
-/// rows of the crop lie in the buffer's `size` bytes, which a picture
-/// whose crop does not fit is refused for.
+/// offset is a multiple of 4, and each pitch at least the crop's row in
+/// bytes and a whole number of the plane's texels (a sample of luma, a
+/// pair of chroma), as Vulkan's copies take them where the queue that
+/// copies neither draws nor computes; and each plane's rows of the crop
+/// lie in the buffer's `size` bytes, which a picture whose crop does not
+/// fit is refused for.
 ///
 /// The copy makes its writes available to the host before the picture's
 /// value is signalled, so that a host that has waited for it reads them
@@ -145,9 +156,10 @@ pub struct BufferPlanes {
 }
 
 impl BufferPlanes {
-    /// Whether planes cropped to `width` by `height` fit as Vulkan copies
-    /// them, and in the buffer, or why not.
-    pub(crate) fn check(&self, width: u32, height: u32) -> Result<(), Error> {
+    /// Whether planes cropped to `width` by `height`, of samples of
+    /// `sample_bytes` bytes, fit as Vulkan copies them, and in the buffer,
+    /// or why not.
+    pub(crate) fn check(&self, width: u32, height: u32, sample_bytes: u32) -> Result<(), Error> {
         let (luma, chroma) = (self.luma, self.chroma);
         if luma.0 % 4 != 0 || chroma.0 % 4 != 0 {
             return Err(Error::Unsupported(format!(
@@ -155,11 +167,23 @@ impl BufferPlanes {
                 luma.0, chroma.0
             )));
         }
-        let chroma_width = width.div_ceil(2) * 2;
-        if luma.1 < width || chroma.1 < chroma_width || chroma.1 % 2 != 0 {
+        let sample = sample_bytes.max(1);
+        let pair = 2 * sample;
+        // A row of the crop in bytes, chroma a whole number of pairs.
+        let (Some(luma_width), Some(chroma_width)) = (
+            width.checked_mul(sample),
+            width.div_ceil(2).checked_mul(pair),
+        ) else {
+            return Err(Error::Unsupported(format!("a frame {width} wide")));
+        };
+        if luma.1 < luma_width
+            || chroma.1 < chroma_width
+            || luma.1 % sample != 0
+            || chroma.1 % pair != 0
+        {
             return Err(Error::Unsupported(format!(
-                "pitches {} and {} for a frame {width} wide: each at least its width, the \
-                 chroma pitch even",
+                "pitches {} and {} for a frame {width} wide of {sample}-byte samples: each at \
+                 least its row, of whole samples, the chroma pitch of whole pairs",
                 luma.1, chroma.1
             )));
         }
@@ -169,7 +193,7 @@ impl BufferPlanes {
             offset.checked_add(before_last)?.checked_add(u64::from(row))
         };
         let fits = |plane, rows, row| end(plane, rows, row).is_some_and(|end| end <= self.size);
-        if !fits(luma, height, width) || !fits(chroma, height.div_ceil(2), chroma_width) {
+        if !fits(luma, height, luma_width) || !fits(chroma, height.div_ceil(2), chroma_width) {
             return Err(Error::Unsupported(format!(
                 "a frame {width} by {height} at {} and {} past a buffer of {} bytes",
                 luma.0, chroma.0, self.size
@@ -286,8 +310,8 @@ impl Drop for DecodeImage {
 
 /// A [`SurfaceSource`] of host-visible buffers, one a picture, for the
 /// tests and tools: each holds the luma plane at byte 256 and the chroma
-/// plane after it, each row 64 bytes past the coded width rounded up to 64,
-/// so that the planes' offsets and pitches are not the frame's own.
+/// plane after it, each row 64 bytes past the coded row's bytes rounded up
+/// to 64, so that the planes' offsets and pitches are not the frame's own.
 pub struct HostBuffers {
     device: Arc<VideoDevice>,
 }
@@ -305,12 +329,12 @@ impl SurfaceSource for HostBuffers {
     type Surface = HostBuffer;
 
     fn surface(&mut self, spec: &SurfaceSpec) -> Result<HostBuffer, Error> {
-        HostBuffer::new(&self.device, spec.extent)
+        HostBuffer::new(&self.device, spec.extent, spec.profile.sample_bytes())
     }
 }
 
-/// A host-visible, host-coherent buffer of NV12 planes, mapped while it
-/// lives.
+/// A host-visible, host-coherent buffer of NV12 or P010 planes, mapped
+/// while it lives.
 pub struct HostBuffer {
     device: Arc<VideoDevice>,
     buffer: vk::Buffer,
@@ -327,9 +351,14 @@ unsafe impl Send for HostBuffer {}
 unsafe impl Sync for HostBuffer {}
 
 impl HostBuffer {
-    /// Planes for frames of `extent`, cropped or not.
-    pub fn new(device: &Arc<VideoDevice>, extent: vk::Extent2D) -> Result<Self, Error> {
-        let pitch = extent.width.next_multiple_of(64) + 64;
+    /// Planes for frames of `extent`, cropped or not, of samples of
+    /// `sample_bytes` bytes.
+    pub fn new(
+        device: &Arc<VideoDevice>,
+        extent: vk::Extent2D,
+        sample_bytes: u32,
+    ) -> Result<Self, Error> {
+        let pitch = (extent.width * sample_bytes.max(1)).next_multiple_of(64) + 64;
         let rows = u64::from(extent.height);
         let luma = 256u64;
         let chroma = luma + rows * u64::from(pitch) + 128;
