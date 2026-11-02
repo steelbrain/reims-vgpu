@@ -20,6 +20,14 @@
 //! nothing: the host re-protects only watched granules. A watch's range is resolved once, as it
 //! begins; `changed` answers within the live watches only.
 //!
+//! **Resolved once per range.** An import keeps the segments it resolved each range of its bytes
+//! to ([`ImportDirty`]'s `segments`), the latest few ranges, as long as the registry holds what it
+//! held then: the runtime names an import's whole range in each command buffer's reports of the
+//! GPU's writes (three a command buffer), and a view of a surface's scattered pages resolves page
+//! run by page run through the backing table. An import's bytes keep their pages while it lives
+//! (`rt::HostMemory::new`'s contract: mapped, with the same backing, until its last use), so only
+//! a lease made or dropped (the registry's generation) changes what they resolve to.
+//!
 //! **Writers.** The runtime's named writes ([`DirtyLog::wrote_as`]) and questions
 //! ([`DirtyLog::changed_except`]) go to the log, so a shadow's own copy back or merge never comes
 //! back to it as a change, while the guest's and any other writer's do.
@@ -63,6 +71,11 @@ struct Entry {
 
 static REGISTRY: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+/// The registry's changes, counted: a resolution an import keeps holds while this is unchanged.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How many ranges' resolutions an import keeps.
+const KEPT_RESOLUTIONS: usize = 4;
 
 /// The ranges of one device's RAM registered for its log, until it drops.
 #[derive(Debug)]
@@ -89,6 +102,7 @@ pub(crate) fn register(ranges: &[GuestRamFile], log: &Arc<DirtyLog>) -> Register
             id
         })
         .collect();
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     set_resolving(!registry.is_empty());
     Registered { ids }
 }
@@ -97,6 +111,7 @@ impl Drop for Registered {
     fn drop(&mut self) {
         let mut registry = REGISTRY.lock();
         registry.retain(|e| !self.ids.contains(&e.id));
+        GENERATION.fetch_add(1, Ordering::AcqRel);
         set_resolving(!registry.is_empty());
     }
 }
@@ -193,12 +208,22 @@ struct Watched {
     segments: Arc<[Segment]>,
 }
 
+/// One range of an import's bytes as it resolved, under the registry's `generation`.
+#[derive(Debug)]
+struct Resolution {
+    range: Range<u64>,
+    generation: u64,
+    segments: Arc<[Segment]>,
+}
+
 #[derive(Debug)]
 struct Shared {
     log: Arc<DirtyLog>,
     /// The host address of the import's pointer, as the backing table knows it.
     at: u64,
     watches: Mutex<Vec<Watched>>,
+    /// The latest ranges resolved, the latest first (module docs).
+    resolved: Mutex<Vec<Resolution>>,
 }
 
 /// The runtime's questions about one import (module docs), over its device's log.
@@ -235,6 +260,7 @@ impl ImportDirty {
                 log,
                 at,
                 watches: Mutex::new(Vec::new()),
+                resolved: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -250,12 +276,42 @@ impl ImportDirty {
                 log,
                 at: 0,
                 watches: Mutex::new(Vec::new()),
+                resolved: Mutex::new(Vec::new()),
             }),
         })
     }
 
-    /// The import's bytes `range` as segments of the import, in this log's RAM or none.
-    fn segments(&self, range: &Range<u64>) -> Vec<Segment> {
+    /// The import's bytes `range` as segments of the import, in this log's RAM or none: as kept
+    /// where the range resolved under the registry's generation now (module docs).
+    fn segments(&self, range: &Range<u64>) -> Arc<[Segment]> {
+        let generation = GENERATION.load(Ordering::Acquire);
+        {
+            let mut kept = self.shared.resolved.lock();
+            let hit = (kept.iter()).position(|r| r.range == *range && r.generation == generation);
+            if let Some(at) = hit {
+                let resolution = kept.remove(at);
+                let segments = Arc::clone(&resolution.segments);
+                kept.insert(0, resolution);
+                return segments;
+            }
+        }
+        let segments: Arc<[Segment]> = self.resolve(range).into();
+        let mut kept = self.shared.resolved.lock();
+        kept.retain(|r| r.range != *range);
+        kept.insert(
+            0,
+            Resolution {
+                range: range.clone(),
+                generation,
+                segments: Arc::clone(&segments),
+            },
+        );
+        kept.truncate(KEPT_RESOLUTIONS);
+        segments
+    }
+
+    /// [`ImportDirty::segments`], resolved through the backing table and the registry.
+    fn resolve(&self, range: &Range<u64>) -> Vec<Segment> {
         let length = range.end.saturating_sub(range.start);
         let pieces = resolved(self.shared.at.saturating_add(range.start), length);
         if pieces.is_empty() {
@@ -309,8 +365,11 @@ impl ImportDirty {
 
     /// The guest runs of this log behind the import's bytes `range`.
     fn runs(&self, range: &Range<u64>) -> impl Iterator<Item = Range<u64>> {
-        (self.segments(range).into_iter())
-            .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
+        let segments = self.segments(range);
+        (0..segments.len()).filter_map(move |i| {
+            let s = &segments[i];
+            s.guest.map(|g| g..g.saturating_add(s.length))
+        })
     }
 }
 
@@ -319,7 +378,7 @@ impl rt::DirtyPages for ImportDirty {
     type Watch = ImportWatch;
 
     fn watch(&self, range: Range<u64>) -> ImportWatch {
-        let segments: Arc<[Segment]> = self.segments(&range).into();
+        let segments = self.segments(&range);
         let runs: Vec<Range<u64>> = (segments.iter())
             .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
             .collect();
