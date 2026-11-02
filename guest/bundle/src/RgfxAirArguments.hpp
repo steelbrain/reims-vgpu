@@ -58,8 +58,14 @@ struct RgfxAirFunction {
 // False where it is not one the reader can follow; `out` then holds nothing.
 bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out);
 
-// The bitcode of the function `name` in the .metallib at `lib`: false where the bytes are no
-// .metallib, or it has no such function or no bitcode for it.
+// Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
+// 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a
+// universal one with no such slice, are left as they are.
+void rgfxMetallibAirSlice(const uint8_t *&bytes, size_t &size);
+
+// The bitcode of the function `name` in the .metallib at `lib` (one slice, as
+// rgfxMetallibAirSlice gives): false where the bytes are no .metallib, or it has no such function
+// or no bitcode for it.
 bool rgfxMetallibBitcode(const uint8_t *lib, size_t size, const std::string &name,
                          const uint8_t **bitcode, size_t *bitcodeSize);
 

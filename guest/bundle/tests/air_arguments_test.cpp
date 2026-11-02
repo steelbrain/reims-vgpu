@@ -118,6 +118,52 @@ int main()
 	check(!rgfxMetallibBitcode(lib.data(), 0x40, "every_access", &bitcode, &size),
 	      "a cut header is no library");
 
+	// A universal .metallib: its AIR slice is the library, in either header; one with no AIR
+	// slice, and bytes that are no universal one, are left as they are.
+	for (const bool wide : {false, true}) {
+		const size_t entry = wide ? 32 : 20, header = 8 + 2 * entry;
+		const size_t junk = 64, at = (header + junk + 15) & ~size_t(15);
+		std::vector<uint8_t> fat(at + lib.size(), 0xAB);
+		auto be = [&](size_t off, uint64_t v, int bytes) {
+			for (int k = 0; k < bytes; k++)
+				fat[off + k] = static_cast<uint8_t>(v >> (8 * (bytes - 1 - k)));
+		};
+		be(0, wide ? 0xCAFEBABF : 0xCAFEBABE, 4);
+		be(4, 2, 4);
+		const uint64_t cputypes[2] = {0x01000018, 0x01000017};
+		const uint64_t offsets[2] = {header, at}, sizes[2] = {junk, lib.size()};
+		for (int i = 0; i < 2; i++) {
+			const size_t e = 8 + i * entry;
+			be(e, cputypes[i], 4);
+			be(e + 4, 0, 4);
+			if (wide) {
+				be(e + 8, offsets[i], 8);
+				be(e + 16, sizes[i], 8);
+			} else {
+				be(e + 8, offsets[i], 4);
+				be(e + 12, sizes[i], 4);
+			}
+		}
+		std::memcpy(fat.data() + at, lib.data(), lib.size());
+		const uint8_t *slice = fat.data();
+		size_t sliceSize = fat.size();
+		rgfxMetallibAirSlice(slice, sliceSize);
+		check(slice == fat.data() + at && sliceSize == lib.size(),
+		      std::string(wide ? "a 64-bit" : "a 32-bit") + " universal library's AIR slice");
+		check(!rgfxMetallibBitcode(fat.data(), fat.size(), "every_access", &bitcode, &size) &&
+		          rgfxMetallibBitcode(slice, sliceSize, "every_access", &bitcode, &size),
+		      "the bitcode is the slice's, not the universal file's");
+		be(8 + entry, 0x01000018, 4); // no AIR slice now
+		slice = fat.data();
+		sliceSize = fat.size();
+		rgfxMetallibAirSlice(slice, sliceSize);
+		check(slice == fat.data() && sliceSize == fat.size(), "no AIR slice: left as it is");
+	}
+	const uint8_t *plain = lib.data();
+	size_t plainSize = lib.size();
+	rgfxMetallibAirSlice(plain, plainSize);
+	check(plain == lib.data() && plainSize == lib.size(), "a .metallib is left as it is");
+
 	// Bytes that are not such a module: none answers, and none crashes the reader.
 	check(rgfxMetallibBitcode(lib.data(), lib.size(), "every_access", &bitcode, &size),
 	      "every_access's bitcode, to spoil");

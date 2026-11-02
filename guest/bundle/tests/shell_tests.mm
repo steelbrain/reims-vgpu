@@ -1777,13 +1777,43 @@ void test_library_air_arguments()
 	CHECK(vertexOnly != nil && [vertexOnly rgfxFragmentAirFunction] != nullptr &&
 	      [vertexOnly rgfxFragmentAirFunction]->arguments.empty());
 
+	// Made from a universal .metallib's AIR slice, the whole file kept: read from the slice.
+	std::vector<uint8_t> fat(8 + 20 + 16, 0);
+	const uint32_t fatHeader[7] = {0xCAFEBABE, 1, 0x01000017, 0, static_cast<uint32_t>(fat.size()),
+	                               static_cast<uint32_t>(bytes.length), 4};
+	for (int i = 0; i < 7; i++)
+		for (int k = 0; k < 4; k++)
+			fat[4 * i + k] = static_cast<uint8_t>(fatHeader[i] >> (24 - 8 * k));
+	fat.insert(fat.end(), static_cast<const uint8_t *>(bytes.bytes),
+	           static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
+	NSData *fatBytes = [NSData dataWithBytes:fat.data() length:fat.size()];
+	drainRing(fx.ring);
+	RgfxLibrary *sliced = [RgfxLibrary libraryWithData:bytes.bytes
+	                                            length:bytes.length
+	                                               key:nullptr
+	                                            device:nil
+	                                        serializer:&fx.ser
+	                                            status:&status];
+	[sliced rgfxSetSource:dispatch_data_create(fatBytes.bytes, fatBytes.length, nil, ^{
+		        (void)fatBytes;
+	        })
+	          shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		          return nil;
+	          }];
+	CHECK(sliced != nil);
+	std::shared_ptr<const RgfxAirFunction> fromSlice =
+	    [(RgfxFunction *)[sliced newFunctionWithName:@"writes_in_fragment"] rgfxAirFunction];
+	CHECK(fromSlice != nullptr && rgfxAirWritesTexture(*fromSlice, 5));
+
 	// No bytes kept: the arguments are unknown.
+	drainRing(fx.ring);
 	RgfxLibrary *bare = [RgfxLibrary libraryWithData:bytes.bytes
 	                                          length:bytes.length
 	                                             key:nullptr
 	                                          device:nil
 	                                      serializer:&fx.ser
 	                                          status:&status];
+	CHECK(bare != nil);
 	CHECK([(RgfxFunction *)[bare newFunctionWithName:@"every_access"] rgfxAirFunction] == nullptr);
 	drainRing(fx.ring);
 }

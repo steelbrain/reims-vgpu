@@ -737,6 +737,50 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 	return true;
 }
 
+namespace {
+// A universal .metallib's slice of generic AIR bitcode: the cputype its fat_arch entry carries.
+// measured: macOS 26.6.1 x86_64 guest, QuartzCore's default.metallib (19 slices, one of them
+// this, the rest code compiled for particular GPUs).
+constexpr uint32_t kMetallibAirCpuType = 0x0100'0017;
+
+uint32_t be32(const uint8_t *p)
+{
+	return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+}
+
+uint64_t be64(const uint8_t *p)
+{
+	return (uint64_t(be32(p)) << 32) | be32(p + 4);
+}
+} // namespace
+
+void rgfxMetallibAirSlice(const uint8_t *&bytes, size_t &size)
+{
+	const uint8_t *p = bytes;
+	if (p == nullptr || size < 8)
+		return;
+	const uint32_t magic = be32(p);
+	if (magic != 0xCAFE'BABE && magic != 0xCAFE'BABF)
+		return;
+	const bool wide = magic == 0xCAFE'BABF;
+	const uint64_t entrySize = wide ? 32 : 20;
+	const uint32_t count = be32(p + 4);
+	if (count > (size - 8) / entrySize)
+		return;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint8_t *e = p + 8 + i * entrySize;
+		if (be32(e) != kMetallibAirCpuType)
+			continue;
+		const uint64_t offset = wide ? be64(e + 8) : be32(e + 8);
+		const uint64_t length = wide ? be64(e + 16) : be32(e + 12);
+		if (offset > size || length > size - offset || length == 0)
+			return;
+		bytes = p + offset;
+		size = static_cast<size_t>(length);
+		return;
+	}
+}
+
 bool rgfxMetallibBitcode(const uint8_t *p, size_t n, const std::string &name,
                          const uint8_t **bitcode, size_t *bitcodeSize)
 {

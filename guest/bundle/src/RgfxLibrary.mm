@@ -511,27 +511,34 @@ static bool rgfxMade(uint32_t status)
 	}
 	std::shared_ptr<const RgfxAirFunction> air;
 	if (source != nil) {
-		const void *bytes = nullptr;
+		const void *mapped = nullptr;
 		size_t size = 0;
-		dispatch_data_t map = dispatch_data_create_map(source, &bytes, &size);
+		dispatch_data_t map = dispatch_data_create_map(source, &mapped, &size);
+		// The library was made from a universal .metallib's AIR slice; the bytes kept are whole.
+		const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
+		rgfxMetallibAirSlice(bytes, size);
 		const uint8_t *bitcode = nullptr;
 		size_t bitcodeSize = 0;
 		std::vector<RgfxAirFunction> read;
-		if (map != nil &&
-		    rgfxMetallibBitcode(static_cast<const uint8_t *>(bytes), size, name, &bitcode,
-		                        &bitcodeSize) &&
-		    rgfxReadAirFunctions(bitcode, bitcodeSize, read)) {
+		const char *why = nullptr;
+		if (map == nil || !rgfxMetallibBitcode(bytes, size, name, &bitcode, &bitcodeSize))
+			why = "the library holds no bitcode for it";
+		else if (!rgfxReadAirFunctions(bitcode, bitcodeSize, read))
+			why = "its module did not read";
+		else {
 			for (RgfxAirFunction &f : read) {
 				if (f.name == name) {
 					air = std::make_shared<const RgfxAirFunction>(std::move(f));
 					break;
 				}
 			}
+			if (air == nullptr)
+				why = "its module declares no such entry point";
 		}
 		if (air == nullptr)
-			NSLog(@"RGFX: %s: no arguments read from its bitcode: the textures it binds are taken "
-			      @"as written where their usage has ShaderWrite",
-			      name.c_str());
+			NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
+			      @"where their usage has ShaderWrite",
+			      name.c_str(), why);
 	}
 	_air.emplace(name, air);
 	return air;
