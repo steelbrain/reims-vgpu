@@ -1095,6 +1095,19 @@ pub fn create<T>(
 ///   `BGR10_XR`'s and `BGRA10_XR`'s, is Metal's rule in every texel, which announces nothing.
 ///   The runtime's resolve is no device's rounding, so a native device does not relay it either.
 ///   Announced as the pass ends, inside `endEncoding`, which dies at its selector;
+/// - `WordResolve`: a pass's resolve of a multisampled packed 16-bit colour attachment (the formats
+///   the device renders only through the view of its word), which the runtime's own resolve
+///   writes from each field's codes, where Metal averages its tile's values finer than the codes:
+///   Metal's code where a pixel's samples hold one word, and within one code of Metal's in every
+///   channel where they differ (M3 Max, macOS 27.0.1). Such multisampled textures were refused
+///   before the runtime held them in their word's format, so placing it here ends no run that
+///   went on. Announced as the pass ends, inside `endEncoding`, which dies at its selector;
+/// - `AstcStorageNeutral`: a draw or dispatch binding an ASTC texture at a storage slot its function
+///   writes, or reads and writes, which binds the slot's neutral, so its writes leave the blocks
+///   as they were and its reads answer zero, where Metal completes the writes and stores bytes no
+///   format defines into the blocks. Such bindings died before the runtime bound the neutral, so
+///   placing it here ends no run that went on. Announced at the draw or dispatch, inside its call,
+///   which dies at its selector;
 /// - the notes of the device's own answers on a GPU that is not Apple's, which the runtime gives
 ///   in place of Metal's, each recording its bound: the device's maths (`NativeTranscendentals`,
 ///   `NativeDivision`, `NativeFma`, `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`,
@@ -1194,7 +1207,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 137] = [
+pub const DIES: [rt::Degradation; 139] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1307,6 +1320,8 @@ pub const DIES: [rt::Degradation; 137] = [
     rt::Degradation::YCbCrLoadTiles,
     rt::Degradation::YCbCrBlendRounding,
     rt::Degradation::ExtendedRangeResolve,
+    rt::Degradation::WordResolve,
+    rt::Degradation::AstcStorageNeutral,
     rt::Degradation::NativeTranscendentals,
     rt::Degradation::NativeDivision,
     rt::Degradation::NativeFma,
