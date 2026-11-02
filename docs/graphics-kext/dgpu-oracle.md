@@ -280,7 +280,9 @@ encoders run in order, and the bundle has its own fence across every 8 encoders.
 none.** Untracked compute across encoders and command buffers is ordered on every x86 GPU, so
 guests may rely on it; whether the Vulkan platform orders successive command buffers' untracked
 work is worth a check. A tracked resource is ordered across two queues by commit on all three,
-the later buffer committed as soon as the earlier one's `commitAndWaitUntilSubmitted` returns.
+the later buffer committed as soon as the earlier one's `commitAndWaitUntilSubmitted` returns,
+or right after its `commit` *(class 3)*; an untracked one is ordered so on x86 and races on the
+M3 *(class 2)*.
 
 ## Q7: command-buffer timing and handlers
 
@@ -319,14 +321,17 @@ times from the first commit (medians), on the 5300M, the 630 (both macOS 26.7.1)
 | the same: status at the return | Scheduled 18, Committed 2 | Scheduled 18, Committed 2 | Scheduled 20 |
 
 So the call returns once the buffer is submitted, which for a buffer waiting on an event, or
-behind one on its queue, is at the signal; whether the buffer is `Scheduled` by then, and its scheduled handlers have run, is a race
-on all three, and an idle queue returns while it is still `Committed`.
+behind one on its queue, is at the signal *(class 3)*; whether the buffer is `Scheduled` by then,
+and its scheduled handlers have run, is a race on all three *(class 2)*, and an idle queue
+returns while it is still `Committed` *(class 3)*.
 
 The M3 also runs a creator's handler after the creator returns, on the global default-QoS queue
 (`com.apple.root.default-qos`) *(class 3 that it runs after the return; class 2 which queue)*.
 
 Our stack: `commitAndWaitUntilSubmitted` and `waitUntilScheduled` return at submission
 (c95fca750), and handlers run on the process's completion thread in Metal's order. The host
+answers a buffer's ask for its submission (`CB_SUBMITTED`, design.md, "Submitted") at its commit,
+or at the signal for one that waits on an event or is behind one that does. The host
 sends the platform's GPU times, from which the bundle answers `GPUStartTime` and `GPUEndTime`,
 and the async creators run their create and handler on the global default-QoS queue, after the
 creator returns, as the M3 does.
