@@ -98,8 +98,17 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// raises for: the device's control thread (`reims-vgpu.graphics-control`), its refresh thread, a
 /// command queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
-/// scheduled or completed handler. Each is called never inside a call of the host's into the
-/// device, with no lock of the library's held, and they may call at once.
+/// scheduled or completed handler; or the host's own, inside [`GraphicsDevice::mmio_write_taking`].
+/// Each is called never inside another call of the host's into the device, and with no lock held
+/// that a function of the device's waits for, directly or through a thread of the library's, so
+/// they may call it at once. `scanout_written` runs with no lock of the library's held.
+/// `raise_interrupt` may run under these: a command queue's claim on its next message, on the
+/// queue's service thread; the decoder's lock, at a command buffer's `CB_SUBMITTED` posted as the
+/// buffer is taken (on its queue's service thread, or inside `mmio_write_taking`), and, with the
+/// download's answer slot, at a `SURFACE_DOWNLOAD` answered at once; a command buffer's
+/// `CB_SUBMITTED` latch, wherever that is posted; and the presents' queue, at a present answered
+/// at once with no window. No function of the device takes any of them, and `mmio_write_taking`
+/// only tries the claim and the decoder's lock.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.

@@ -46,9 +46,10 @@
 //! **The host's calls.** No call of the host's into the device waits for its threads, and no
 //! callback of the host's runs inside one but [`Device::mmio_write_taking`]'s: each runs on a
 //! thread of the device's, or, for [`Host::raise_interrupt`], on the thread that posts its event,
-//! with no lock of the device's held, so a callback may wait for something the host holds while
-//! it calls the device (QEMU's BQL). [`Device::mmio_write`]'s reset waits only for the message the
-//! control thread is taking, which never waits for the host.
+//! with no lock held that a call of the device's waits for, directly or through a thread of the
+//! device's ([`Host`]), so a callback may call the device at once, and may wait for something the
+//! host holds while it calls the device (QEMU's BQL). [`Device::mmio_write`]'s reset waits only
+//! for the message the control thread is taking, which never waits for the host.
 //!
 //! **A take on the doorbell's thread.** A `DOORBELL` write of a command queue's ring through
 //! [`Device::mmio_write_taking`] offers the queue's next `COMMAND_BUFFER` to the host on the
@@ -131,13 +132,22 @@ const COMPLETE: RingAt = RingAt {
 
 /// What the device asks of the host that runs it (QEMU, through the C API's callbacks). Each is
 /// called on one of the device's threads, or, for [`Host::raise_interrupt`], on the thread that
-/// posts the event it raises for; never inside a call of the host's into the device, and with no
-/// lock of the device's held; they may call at once.
+/// posts the event it raises for; never inside a call of the host's into the device but
+/// [`Device::mmio_write_taking`], which calls [`Host::take_command_buffer`] and may raise there.
+/// Each is called with no lock held that a call of the device's waits for, directly or through a
+/// thread of the device's, so each may call the device at once. Of its own the device holds only
+/// a command queue's claim on its messages, around [`Host::stage3_message`] of the queue's
+/// messages and the raises inside it, and, around [`Host::take_command_buffer`], the claim and
+/// the queue's submission ring; a call of the device's only tries either.
 pub trait Host: Send + Sync + 'static {
     /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
-    /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On the thread that posts it: the control, refresh or
-    /// a queue's service thread, or one of the host's that holds a [`CompletionPoster`] or a
-    /// [`CompleteAnswer`].
+    /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On
+    /// the thread that posts it: the control, refresh or a queue's service thread, the host's
+    /// inside [`Device::mmio_write_taking`], or one of the host's that holds a
+    /// [`CompletionPoster`] or a [`CompleteAnswer`]. Locks may be held around it, none that a call
+    /// of the device's waits for: a queue's claim on its messages, on its service thread, and
+    /// those the host holds while it posts or answers (`reims-vgpu`'s decoder, at a command
+    /// buffer's `CB_SUBMITTED` posted as the buffer is taken).
     fn raise_interrupt(&self, vector: u32);
 
     /// Whether the guest wrote any of the `length` bytes at `offset` in the region since the last

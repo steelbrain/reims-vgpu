@@ -80,12 +80,13 @@ const _: () = {
 /// queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
 /// scheduled or completed handler; or the host's own, inside rvg_graphics_device_mmio_write_taking.
-/// Never inside another call of the host's into the library, and with no lock of the library's
-/// held; they may call at once. It may wait for a lock the host holds while it calls the device
-/// (QEMU's BQL), but not for one the host holds while it calls
-/// rvg_graphics_device_mmio_write_taking. May call: rvg_status_message and the
-/// rvg_graphics_device_* functions, except the release of its own device. Without it the guest
-/// gets no interrupt.
+/// Never inside another call of the host's into the library. The library may hold locks of its
+/// own around it (docs/api.md section 5 names them), but none that a function it may call waits
+/// for, directly or through a thread of the library's, so it may call them at once. It may wait
+/// for a lock the host holds while it calls the device (QEMU's BQL), but not for one the host
+/// holds while it calls rvg_graphics_device_mmio_write_taking. May call: rvg_status_message and
+/// the rvg_graphics_device_* functions, except the release of its own device. Without it the
+/// guest gets no interrupt.
 pub type RvgGraphicsRaiseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, vector: u32)>;
 
 /// `scanout_written(ctx, offset, length)`: whether the guest wrote any of the `length` bytes at
