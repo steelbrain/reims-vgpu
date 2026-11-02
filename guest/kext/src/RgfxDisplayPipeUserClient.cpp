@@ -53,6 +53,8 @@ constexpr UInt64 kAcceleratorId = 1;
 // every 600th transaction.
 constexpr UInt32 kLogFirst = 48;
 constexpr UInt32 kLogEvery = 600;
+// The transactions with no cookie logged, per client.
+constexpr UInt32 kLogUnnotified = 8;
 
 // A frame at 60 Hz in mach_absolute_time units (nanoseconds on x86-64): the VBL's next-tick
 // estimate before two ticks have been seen.
@@ -105,7 +107,8 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	completed = 0;
 	lastVblTime = 0;
 	logged = 0;
-	outstandingCount = 0;
+	unnotifiedLogged = 0;
+	transactions = Transactions();
 	return lock != nullptr;
 }
 
@@ -381,22 +384,28 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 	// Room for one more outstanding transaction, waiting up to five seconds.
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
-	while (self->outstandingCount >= kMaxOutstanding) {
+	while (!self->transactions.hasRoom()) {
 		if (IOLockSleepDeadline(self->lock, &self->completed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
-		    self->outstandingCount >= kMaxOutstanding) {
+		    !self->transactions.hasRoom()) {
 			IOLockUnlock(self->lock);
 			IOLog("RGFX pipe: transaction %u: no room in 5 s, not sent\n", id);
 			return kIOReturnTimeout;
 		}
 	}
+	// Notified at its completion where it carries a cookie (RgfxPipeTransactions.hpp).
+	bool notified = rgfxPipeNotifies(cookie);
+	if (!notified && self->unnotifiedLogged < kLogUnnotified) {
+		self->unnotifiedLogged++;
+		IOLog("RGFX pipe: transaction %u (options 0x%x) carries no cookie: it completes for its "
+		      "waiters, without a notification\n",
+		      id, rd32(t, kTxnOptions));
+	}
 	if (planeType != kPlaneIOSurface || surface == 0) {
 		// Nothing for the host to show: the display keeps its surface, and the transaction is
 		// done with the last one before it (at once where none is outstanding).
-		if (self->outstandingCount == 0)
-			self->completeLocked(id, cookie, mach_absolute_time());
-		else
-			self->outstanding[self->outstandingCount++] = {
-				self->outstanding[self->outstandingCount - 1].seqno, id, cookie};
+		Transactions::Completion now = {};
+		if (self->transactions.nothingToShow(id, cookie, notified, &now))
+			self->completeLocked(now, mach_absolute_time());
 		IOLockUnlock(self->lock);
 		return kIOReturnSuccess;
 	}
@@ -409,7 +418,7 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 		IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
 		return r;
 	}
-	self->outstanding[self->outstandingCount++] = {seqno, id, cookie};
+	self->transactions.sent(seqno, id, cookie, notified);
 	IOLockUnlock(self->lock);
 	return kIOReturnSuccess;
 }
@@ -448,16 +457,16 @@ IOReturn RgfxDisplayPipeUserClient::sWait(OSObject *target, void *, IOExternalMe
 
 // MARK: - Notifications
 
-// Completes transaction `transactionId`: its completion notification, and waiters woken. Called
-// with the lock held.
-void RgfxDisplayPipeUserClient::completeLocked(UInt32 transactionId, UInt64 cookie, UInt64 time)
+// Completes a transaction: waiters woken, and its completion notification where it is notified
+// (RgfxPipeTransactions.hpp) and one is registered. Called with the lock held.
+void RgfxDisplayPipeUserClient::completeLocked(const Transactions::Completion &c, UInt64 time)
 {
-	if (transactionId > completed)
-		completed = transactionId;
-	if (registered[kKindTransaction]) {
+	if (c.id > completed)
+		completed = c.id;
+	if (c.notified && registered[kKindTransaction]) {
 		io_user_reference_t words[kCompletionWords] = {};
-		words[0] = cookie;
-		words[1] = static_cast<io_user_reference_t>(transactionId) << 32;
+		words[0] = c.cookie;
+		words[1] = static_cast<io_user_reference_t>(c.id) << 32;
 		words[3] = time;
 		words[8] = 1;
 		sendAsyncResult64(references[kKindTransaction], kIOReturnSuccess, words, kCompletionWords);
@@ -477,27 +486,20 @@ void RgfxDisplayPipeUserClient::presentHook(OSObject *client, UInt64 seqno, UInt
 void RgfxDisplayPipeUserClient::presented(UInt64 seqno, UInt32 status)
 {
 	IOLockLock(lock);
-	UInt32 match = kMaxOutstanding;
-	for (UInt32 i = 0; i < outstandingCount; i++) {
-		if (outstanding[i].seqno == seqno)
-			match = i;
-	}
-	if (match == kMaxOutstanding) {
+	Transactions::Completion done[kMaxOutstanding];
+	UInt32 n = transactions.answered(seqno, done);
+	if (n == 0) {
 		IOLockUnlock(lock);
 		return;
 	}
 	if (status != 0 && logged < kLogFirst) {
 		logged++;
 		IOLog("RGFX pipe: transaction %u: the host did not show its IOSurface (status %u)\n",
-		      outstanding[match].id, status);
+		      done[n - 1].id, status);
 	}
 	UInt64 now = mach_absolute_time();
-	for (UInt32 i = 0; i <= match; i++)
-		completeLocked(outstanding[i].id, outstanding[i].cookie, now);
-	UInt32 left = outstandingCount - (match + 1);
-	for (UInt32 i = 0; i < left; i++)
-		outstanding[i] = outstanding[match + 1 + i];
-	outstandingCount = left;
+	for (UInt32 i = 0; i < n; i++)
+		completeLocked(done[i], now);
 	IOLockUnlock(lock);
 }
 
