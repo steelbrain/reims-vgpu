@@ -12,7 +12,7 @@ use std::sync::atomic::{Ordering, fence};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::region::Region;
-use crate::wire::{RGFX_MSG_PAD, RgfxMsgHeader};
+use crate::wire::{RGFX_CB_OK, RGFX_EVT_CB_COMPLETE, RGFX_MSG_PAD, RgfxCbComplete, RgfxMsgHeader};
 
 /// Where a ring is in the region: its header, and its byte ring of `data_size` bytes, a power of
 /// two, right after it.
@@ -26,6 +26,7 @@ pub(crate) struct RingAt {
 
 /// The header fields' offsets, from `wire::RgfxRingHeader`.
 const PRODUCER: u64 = 0x00;
+const COMPLETED_SEQNO: u64 = 0x08;
 const CONSUMER: u64 = 0x40;
 const CONSUMER_IDLE: u64 = 0x80;
 const ARMED: u64 = 0xc0;
@@ -75,6 +76,9 @@ impl RingAt {
     pub(crate) fn initialize(&self, region: &Region, consumer_idle: bool) {
         region
             .atomic_u64(self.header + PRODUCER)
+            .store(0, Ordering::Release);
+        region
+            .atomic_u64(self.header + COMPLETED_SEQNO)
             .store(0, Ordering::Release);
         region
             .atomic_u64(self.header + CONSUMER)
@@ -307,6 +311,16 @@ impl Producer {
         }
         region.write(self.at.data_at(self.count), message);
         self.count = self.count.wrapping_add(len);
+        // A command buffer that finished: its seqno is the queue's last completed, before its
+        // record is published (`RgfxRingHeader::completed_seqno`).
+        if let Ok(done) = RgfxCbComplete::read_from_bytes(message)
+            && done.header.r#type == RGFX_EVT_CB_COMPLETE
+            && done.status == RGFX_CB_OK
+        {
+            region
+                .atomic_u64(self.at.header + COMPLETED_SEQNO)
+                .fetch_max(done.header.seqno, Ordering::Release);
+        }
         region
             .atomic_u64(self.at.header + PRODUCER)
             .store(self.count, Ordering::Release);
@@ -505,5 +519,60 @@ mod tests {
             producer.post(&region, &complete(11)),
             Posted::Broken(_)
         ));
+    }
+
+    /// A command buffer that finished with no error moves the completed seqno, before its record
+    /// is published; a failed one, any other event and an earlier seqno leave it, and a reset
+    /// clears it
+    #[test]
+    fn a_finished_command_buffer_moves_the_completed_seqno() {
+        let region = Region::new(4096).unwrap();
+        let mut producer = Producer::new(AT);
+        region
+            .atomic_u64(COMPLETED_SEQNO)
+            .store(77, Ordering::Release);
+        producer.reset(&region);
+        let completed = || region.atomic_u64(COMPLETED_SEQNO).load(Ordering::Acquire);
+        assert_eq!(completed(), 0);
+        let done = |seqno, status| {
+            sized(&RgfxCbComplete {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_EVT_CB_COMPLETE,
+                    size: 0,
+                    seqno,
+                },
+                cb_obj_id: 0x100 + seqno,
+                status,
+                ..Default::default()
+            })
+        };
+        let posted = |producer: &mut Producer, bytes: &[u8]| {
+            assert!(matches!(producer.post(&region, bytes), Posted::Yes { .. }));
+            region.atomic_u64(CONSUMER).store(
+                region.atomic_u64(PRODUCER).load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        };
+        posted(&mut producer, &done(3, RGFX_CB_OK));
+        assert_eq!(completed(), 3);
+        posted(&mut producer, &done(5, crate::wire::RGFX_CB_PAGE_FAULT));
+        assert_eq!(completed(), 3, "a failed buffer leaves it");
+        posted(&mut producer, &done(2, RGFX_CB_OK));
+        assert_eq!(completed(), 3, "an earlier seqno leaves it");
+        let other = sized(&RgfxComplete {
+            header: RgfxMsgHeader {
+                r#type: crate::wire::RGFX_EVT_COMPLETE,
+                size: 0,
+                seqno: 9,
+            },
+            status: 0,
+            reserved_14: 0,
+        });
+        posted(&mut producer, &other);
+        assert_eq!(completed(), 3, "another event leaves it");
+        posted(&mut producer, &done(6, RGFX_CB_OK));
+        assert_eq!(completed(), 6);
+        producer.reset(&region);
+        assert_eq!(completed(), 0);
     }
 }

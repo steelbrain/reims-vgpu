@@ -4184,8 +4184,16 @@ typedef struct {
 typedef struct {
   // The producer's free-running byte count, written by the producer.
   uint64_t producer;
+  // On a queue's completion ring, the seqno of the last command buffer that finished with
+  // [`RGFX_CB_OK`], written by the host before the buffer's [`RgfxCbComplete`] is published:
+  // every buffer of the queue up to it has finished, its writes in the memory it names. A
+  // failed buffer leaves it, since the host may post a failure ahead of the queue's earlier
+  // buffers. 0 until one has finished, and on a host that predates the field. The guest's
+  // kext reads it to let the CPU locks of IOSurfaces drawn in place go on
+  // (docs/graphics-kext/design.md, "Surface locks").
+  uint64_t completed_seqno;
   // The rest of `producer`'s line.
-  uint8_t reserved_08[56];
+  uint8_t reserved_10[48];
   // The consumer's free-running byte count, written by the consumer.
   uint64_t consumer;
   // The rest of `consumer`'s line.

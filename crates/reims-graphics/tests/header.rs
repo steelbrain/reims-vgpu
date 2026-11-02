@@ -19,6 +19,7 @@ const CHECKS: &str = r#"
 #endif
 CHECK(sizeof(RgfxRingHeader) == RGFX_RING_HEADER_SIZE);
 CHECK(offsetof(RgfxRingHeader, producer) == 0x00);
+CHECK(offsetof(RgfxRingHeader, completed_seqno) == 0x08);
 CHECK(offsetof(RgfxRingHeader, consumer) == 0x40);
 CHECK(offsetof(RgfxRingHeader, consumer_idle) == 0x80);
 CHECK(offsetof(RgfxRingHeader, armed) == 0xc0);
