@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-video-vulkan"
-description = "Video decode on Vulkan Video: H.264 into images the caller supplies, on a device it may not own"
+description = "Video decode on Vulkan Video: H.264 and H.265 into outputs the caller supplies, on a device it may not own"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,3 +26,7 @@ reims-vgpu-video-conformance = { path = "../reims-vgpu-video-conformance" }
 [[example]]
 name = "vulkan-h264-framemd5"
 path = "examples/vulkan-h264-framemd5.rs"
+
+[[example]]
+name = "vulkan-h265-framemd5"
+path = "examples/vulkan-h265-framemd5.rs"
