@@ -14,7 +14,8 @@
 # Each stream is decoded by examples/vulkan-h264-framemd5 on the device
 # VideoDevice::create picks, from its MP4 (the avcC record and length-prefixed
 # samples) and from its Annex B form, in display order: every frame's NV12 MD5
-# must equal ffmpeg's. Decode order must give the same frames, as a set. The
+# must equal ffmpeg's. One stream is decoded again with its pictures copied
+# out of the DPB on the graphics queue. Decode order must give the same frames, as a set. The
 # crafted streams (long-term references, memory management operations 2 to 6,
 # frame number gaps, 1- to 3-byte lengths), the SPS switch mid-stream and the
 # lost reference are the VA-API check's, as are their verdicts. A stream whose
@@ -236,6 +237,11 @@ if run "$out/main-720p.mp4" main-720p.len3 --length-size 3; then
 fi
 if run "$out/main-720p.mp4" main-720p.hold --hold 24; then
   check "main-720p (24 frames held by the caller)" "$out/main-720p.ref" "$runs/main-720p.hold.md5"
+fi
+# Pictures copied out of the DPB on a queue of their own, behind a
+# semaphore wait, as on a device whose decode family does not copy.
+if run "$out/high-1080p.mp4" high-1080p.graphics --copy-on-graphics; then
+  check "high-1080p (copied out on the graphics queue)" "$out/high-1080p.ref" "$runs/high-1080p.graphics.md5"
 fi
 
 # A new SPS at an IDR picture, with another size and profile, mid-stream.

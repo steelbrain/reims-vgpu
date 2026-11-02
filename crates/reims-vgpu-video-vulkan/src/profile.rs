@@ -11,18 +11,19 @@ use crate::error::{Error, Named};
 /// The format of every picture: NV12, 8-bit 4:2:0 in two planes.
 pub const PICTURE_FORMAT: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
-/// The usage every decode target has besides decoding: Metal samples it
-/// per plane through views of other formats, and tests copy it out.
-pub const SURFACE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
-    vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR.as_raw()
-        | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR.as_raw()
-        | vk::ImageUsageFlags::SAMPLED.as_raw()
-        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+/// The usage every output has: Metal samples it per plane through views of
+/// other formats, a picture decoded into a DPB picture is copied into it,
+/// and tests copy it out. An output a decode writes has
+/// `VIDEO_DECODE_DST` too ([`crate::SurfaceSpec`]).
+pub const OUTPUT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::SAMPLED.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
 );
 
-/// The flags every decode target is made with: its planes are viewed as
-/// R8 and RG8, with usages NV12 itself may lack.
-pub const SURFACE_FLAGS: vk::ImageCreateFlags = vk::ImageCreateFlags::from_raw(
+/// The flags every output is made with: its planes are viewed as R8 and
+/// RG8, with usages NV12 itself may lack.
+pub const OUTPUT_FLAGS: vk::ImageCreateFlags = vk::ImageCreateFlags::from_raw(
     vk::ImageCreateFlags::MUTABLE_FORMAT.as_raw() | vk::ImageCreateFlags::EXTENDED_USAGE.as_raw(),
 );
 
@@ -100,8 +101,13 @@ pub struct H264Capabilities {
     pub max_active_reference_pictures: u32,
     /// Whether a picture's output may be its DPB picture, in one image.
     pub dpb_and_output_coincide: bool,
-    /// Whether it may be another image (not used by this crate).
+    /// Whether it may be another image.
     pub dpb_and_output_distinct: bool,
+    /// Whether the decoder decodes each picture straight into its output,
+    /// beside its DPB picture (`DPB_AND_OUTPUT_DISTINCT`, where NV12
+    /// outputs may be decode targets); else into its DPB picture, then
+    /// copies that into the output (`DPB_AND_OUTPUT_COINCIDE`).
+    pub decodes_into_output: bool,
     /// `minBitstreamBufferOffsetAlignment`.
     pub min_bitstream_buffer_offset_alignment: u64,
     /// `minBitstreamBufferSizeAlignment`.
@@ -111,9 +117,9 @@ pub struct H264Capabilities {
 }
 
 /// What the device answers for each of Baseline, Main and High, in that
-/// order, for decodes into NV12 targets that are their own DPB pictures
-/// ([`crate::SurfaceImage`]): a profile the device does not decode so, or
-/// whose query fails, is left out. Empty where it decodes no H.264.
+/// order, for decodes of NV12 pictures into NV12 outputs: a profile the
+/// device does not decode so, or whose query fails, is left out. Empty
+/// where it decodes no H.264.
 pub fn h264_capabilities(device: &VideoDevice) -> Vec<H264Capabilities> {
     [H264Profile::BASELINE, H264Profile::MAIN, H264Profile::HIGH]
         .into_iter()
@@ -127,8 +133,8 @@ pub fn h264_capabilities(device: &VideoDevice) -> Vec<H264Capabilities> {
         .collect()
 }
 
-/// `profile`'s capabilities, `None` where its targets cannot be NV12
-/// images that are also its DPB pictures.
+/// `profile`'s capabilities, `None` where it decodes no NV12 picture into
+/// an NV12 output, straight or through a copy.
 fn profile_capabilities(
     device: &VideoDevice,
     profile: H264Profile,
@@ -170,11 +176,12 @@ fn profile_capabilities(
         max_active_reference_pictures: caps.max_active_reference_pictures,
         dpb_and_output_coincide: false,
         dpb_and_output_distinct: false,
+        decodes_into_output: false,
         min_bitstream_buffer_offset_alignment: caps.min_bitstream_buffer_offset_alignment,
         min_bitstream_buffer_size_alignment: caps.min_bitstream_buffer_size_alignment,
         std_header_version: caps.std_header_version,
     };
-    let caps = H264Capabilities {
+    let mut caps = H264Capabilities {
         max_level_idc: level_idc(h264.max_level_idc),
         dpb_and_output_coincide: decode
             .flags
@@ -184,19 +191,43 @@ fn profile_capabilities(
             .contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT),
         ..caps
     };
-    if !caps.dpb_and_output_coincide || !nv12_targets(device, profile)? {
-        return Ok(None);
+    let nv12 = |usage, wanted_usage, wanted_flags| {
+        Ok::<_, Error>(video_formats(device, profile, usage)?.iter().any(|f| {
+            f.format == PICTURE_FORMAT
+                && f.image_tiling == vk::ImageTiling::OPTIMAL
+                && f.image_usage_flags.contains(wanted_usage)
+                && f.image_create_flags.contains(wanted_flags)
+        }))
+    };
+    let dst = vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
+    let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
+    if caps.dpb_and_output_distinct
+        && nv12(dpb, dpb, vk::ImageCreateFlags::empty())?
+        && nv12(dst, dst | OUTPUT_USAGE, OUTPUT_FLAGS)?
+    {
+        caps.decodes_into_output = true;
+        return Ok(Some(caps));
     }
-    Ok(Some(caps))
+    if caps.dpb_and_output_coincide
+        && nv12(
+            dst | dpb,
+            dst | dpb | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageCreateFlags::empty(),
+        )?
+        && plain_outputs(device)
+    {
+        return Ok(Some(caps));
+    }
+    Ok(None)
 }
 
-/// Whether `profile` decodes into optimally tiled NV12 images that are
-/// also its DPB pictures, sampled and copied, with the flags
-/// [`SURFACE_FLAGS`].
-fn nv12_targets(device: &VideoDevice, profile: H264Profile) -> Result<bool, Error> {
+/// The formats `profile` decodes into, or predicts from, for `usage`.
+fn video_formats(
+    device: &VideoDevice,
+    profile: H264Profile,
+    usage: vk::ImageUsageFlags,
+) -> Result<Vec<vk::VideoFormatPropertiesKHR<'static>>, Error> {
     let fp = device.video_instance().fp();
-    let usage =
-        vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
     profile.with_list(|list| {
         let info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
             .image_usage(usage)
@@ -204,15 +235,20 @@ fn nv12_targets(device: &VideoDevice, profile: H264Profile) -> Result<bool, Erro
         let mut count = 0;
         // SAFETY: as in `profile_capabilities`; a null output asks for the
         // count alone.
-        unsafe {
+        let result = unsafe {
             (fp.get_physical_device_video_format_properties_khr)(
                 device.physical_device(),
                 &info,
                 &mut count,
                 std::ptr::null_mut(),
             )
+        };
+        if result == vk::Result::ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR
+            || result == vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+        {
+            return Ok(Vec::new());
         }
-        .named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
+        result.named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
         let mut formats =
             vec![vk::VideoFormatPropertiesKHR::default(); usize::try_from(count).unwrap_or(0)];
         // SAFETY: as above, with an output of `count` elements.
@@ -226,13 +262,32 @@ fn nv12_targets(device: &VideoDevice, profile: H264Profile) -> Result<bool, Erro
         }
         .named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
         formats.truncate(usize::try_from(count).unwrap_or(0));
-        Ok(formats.iter().any(|f| {
-            f.format == PICTURE_FORMAT
-                && f.image_tiling == vk::ImageTiling::OPTIMAL
-                && f.image_usage_flags.contains(SURFACE_USAGE)
-                && f.image_create_flags.contains(SURFACE_FLAGS)
-        }))
+        Ok(formats)
     })
+}
+
+/// Whether NV12 images that no decode writes, copied into, sampled and
+/// copied out, with [`OUTPUT_FLAGS`], are the device's.
+fn plain_outputs(device: &VideoDevice) -> bool {
+    let info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(PICTURE_FORMAT)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(OUTPUT_USAGE)
+        .flags(OUTPUT_FLAGS);
+    let mut properties = vk::ImageFormatProperties2::default();
+    // SAFETY: the physical device is the instance's; `info` and the output
+    // live through the call.
+    unsafe {
+        device
+            .instance()
+            .get_physical_device_image_format_properties2(
+                device.physical_device(),
+                &info,
+                &mut properties,
+            )
+    }
+    .is_ok()
 }
 
 /// `level_idc` as a stream codes it, of a std level: 52 for

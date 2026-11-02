@@ -6,7 +6,7 @@
 //! (tools/h264-check.sh), as for the VA-API backend's h264-framemd5.
 //!
 //! ```sh
-//! vulkan-h264-framemd5 stream.mp4 [--decode-order] [--length-size N] [--hold N]
+//! vulkan-h264-framemd5 stream.mp4 [--decode-order] [--length-size N] [--hold N] [--copy-on-graphics]
 //! vulkan-h264-framemd5 --capabilities
 //! ```
 //!
@@ -18,6 +18,11 @@
 //!   NAL lengths first.
 //! - `--hold N` keeps the last `N` frames alive, as a caller that is slow
 //!   to drop them would.
+//! - `--copy-on-graphics` hands the device to the decoder as another's
+//!   ([`VideoDevice::from_raw`]) with its graphics queue as the copy
+//!   queue, so that pictures decoded into DPB pictures alone are copied
+//!   out on a queue of their own, behind a semaphore wait, as on a device
+//!   whose decode family does not copy.
 //! - `--capabilities` prints what the device answers for each profile.
 //!
 //! Prints `frame <index> id <sample> poc <poc> <md5>` per frame, and the
@@ -32,7 +37,8 @@ use reims_vgpu_video_conformance::mp4;
 use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
 use reims_vgpu_video_vulkan::avcc::DecoderConfiguration;
 use reims_vgpu_video_vulkan::{
-    DecodeImage, DecodeImages, Frame, H264Decoder, OutputOrder, VideoDevice, h264_capabilities, nal,
+    DecodeImage, DecodeImages, Frame, H264Decoder, OutputOrder, RawDevice, VideoDevice,
+    h264_capabilities, nal,
 };
 
 fn main() -> std::process::ExitCode {
@@ -50,6 +56,7 @@ struct Options {
     order: OutputOrder,
     length_size: Option<u8>,
     hold: usize,
+    copy_on_graphics: bool,
     capabilities: bool,
 }
 
@@ -61,6 +68,7 @@ fn options() -> Result<Options, String> {
         order: OutputOrder::Display,
         length_size: None,
         hold: 0,
+        copy_on_graphics: false,
         capabilities: false,
     };
     while let Some(arg) = args.next() {
@@ -81,6 +89,7 @@ fn options() -> Result<Options, String> {
                 );
             }
             "--hold" => options.hold = number("--hold")?,
+            "--copy-on-graphics" => options.copy_on_graphics = true,
             "--capabilities" => options.capabilities = true,
             _ => positional.push(arg),
         }
@@ -152,16 +161,22 @@ impl Reader {
 
 fn print_capabilities(device: &Arc<VideoDevice>) {
     println!(
-        "{}: decode family {}, graphics family {}, unified image layouts {}",
+        "{}: decode family {}, graphics family {}, copies on {}, unified image layouts {}",
         device.name(),
         device.decode_family(),
         device.graphics_family(),
+        if device.copies_on_decode_queue() {
+            "the decode queue".to_string()
+        } else {
+            format!("family {}", device.copy_family())
+        },
         device.unified_image_layouts()
     );
     for caps in h264_capabilities(device) {
         println!(
             "profile {}: level_idc {}, {}x{} to {}x{}, granularity {}x{}, {} DPB slots, {} active \
-             references, coincide {}, distinct {}, bitstream offset {} size {} alignment",
+             references, coincide {}, distinct {}, decodes into outputs {}, bitstream offset {} \
+             size {} alignment",
             caps.profile.profile_idc,
             caps.max_level_idc,
             caps.min_coded_extent.width,
@@ -174,6 +189,7 @@ fn print_capabilities(device: &Arc<VideoDevice>) {
             caps.max_active_reference_pictures,
             caps.dpb_and_output_coincide,
             caps.dpb_and_output_distinct,
+            caps.decodes_into_output,
             caps.min_bitstream_buffer_offset_alignment,
             caps.min_bitstream_buffer_size_alignment,
         );
@@ -185,11 +201,34 @@ fn run() -> Result<(), String> {
         return Err("MD5 fails its own test vectors".into());
     }
     let options = options()?;
-    let device = VideoDevice::create().map_err(|e| e.to_string())?;
+    let owner = VideoDevice::create().map_err(|e| e.to_string())?;
     if options.capabilities {
-        print_capabilities(&device);
+        print_capabilities(&owner);
         return Ok(());
     }
+    let device = if options.copy_on_graphics {
+        let graphics = owner
+            .graphics_queue()
+            .ok_or("a device of our own has a graphics queue")?;
+        let raw = RawDevice {
+            entry: owner.entry().clone(),
+            instance: owner.instance().clone(),
+            physical_device: owner.physical_device(),
+            device: owner.device().clone(),
+            decode_family: owner.decode_family(),
+            decode_queue: owner.decode_queue(),
+            copy_family: owner.graphics_family(),
+            copy_queue: graphics,
+            graphics_family: owner.graphics_family(),
+            unified_image_layouts_video: owner.unified_image_layouts(),
+        };
+        // SAFETY: `owner` made every handle as RawDevice says, and outlives
+        // `device`, which goes before it at the end of this function along
+        // with everything made on it; nothing else submits to the queues.
+        unsafe { VideoDevice::from_raw(raw) }
+    } else {
+        Arc::clone(&owner)
+    };
     let file = std::fs::read(&options.input).map_err(|e| format!("{}: {e}", options.input))?;
     let images = DecodeImages::new(&device);
     let (mut decoder, samples): (H264Decoder<DecodeImages>, Vec<Vec<u8>>) =
@@ -249,7 +288,8 @@ fn run() -> Result<(), String> {
     }
     let total = StdRuntime.elapsed_since(start);
     eprintln!(
-        "{} samples, {} frames, profile {}, {} layouts, {:.3} s, read back {:.3} s, on {}",
+        "{} samples, {} frames, profile {}, {} layouts, copies on {}, {:.3} s, read back {:.3} s, \
+         on {}",
         samples.len(),
         reader.index,
         decoder.profile().map_or(0, |p| p.profile_idc),
@@ -257,6 +297,11 @@ fn run() -> Result<(), String> {
             "unified"
         } else {
             "DPB"
+        },
+        if device.copies_on_decode_queue() {
+            "the decode queue".to_string()
+        } else {
+            format!("family {}", device.copy_family())
         },
         total.as_secs_f64(),
         reader.readback.as_secs_f64(),

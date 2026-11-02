@@ -1,5 +1,5 @@
-//! A decoded picture: its surface, the view decodes bind it through, the
-//! DPB slot it was set up in, and the timeline value of its decode.
+//! A decoded picture: the output it landed in, the DPB slot its decode set
+//! up, and the timeline value after which the output holds it.
 
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
@@ -14,16 +14,18 @@ use crate::profile::PICTURE_FORMAT;
 use crate::surface::SurfaceImage;
 use crate::timeline::Timeline;
 
-/// How long a read back waits for the decodes before it.
+/// How long a read back waits for its picture.
 const READ_BACK_WAIT: Duration = Duration::from_secs(10);
 
-/// A picture a decoder made: the surface it decoded into, and the
-/// timeline value its decode signals.
+/// A picture a decoder made: the output it landed in, and the timeline
+/// value after which the output holds it.
 ///
-/// A stand-in for a lost frame shares its source's surface and DPB slot
-/// ([`reims_vgpu_video_codec::h264::Accelerator::conceal`]): a surface is
-/// decoded into only when it is given, so the stand-in holds what its
-/// source holds for as long as it lives.
+/// Its samples as a reference are in the decoder's DPB picture of its
+/// slot. A stand-in for a lost frame shares its source's slot
+/// ([`reims_vgpu_video_codec::h264::Accelerator::conceal`]): a DPB picture
+/// is written only by the decode that sets its slot up, which no slot a
+/// reference holds is, so the stand-in holds what its source holds for as
+/// long as it is a reference.
 pub struct Picture<T: SurfaceImage> {
     inner: Arc<Inner<T>>,
     stand_in: bool,
@@ -36,16 +38,16 @@ struct Inner<T: SurfaceImage> {
     extent: vk::Extent2D,
     /// The DPB slot its decode set up, -1 before it.
     slot: AtomicI32,
-    /// The value of its decode's submission, 0 before it.
-    decoded: AtomicU64,
-    /// The value of the last submission that reads or writes it.
-    last_use: AtomicU64,
+    /// The value after which the output holds the picture, 0 before its
+    /// decode is submitted.
+    landed: AtomicU64,
 }
 
 /// What a picture holds that GPU work may still use as it goes.
 struct Held<T> {
     surface: T,
-    view: ImageView,
+    /// The output's decode view, where a decode writes it.
+    view: Option<ImageView>,
 }
 
 /// An image view, destroyed as it goes.
@@ -56,12 +58,14 @@ pub(crate) struct ImageView {
 
 impl ImageView {
     /// A view of the whole of `image` for decoding into and predicting
-    /// from: its usage is the decode usages alone, since a sampled view of
-    /// NV12 would need a sampler conversion.
-    pub(crate) fn for_decode(device: &Arc<VideoDevice>, image: vk::Image) -> Result<Self, Error> {
-        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(
-            vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR,
-        );
+    /// from, of the decode usages `usage` alone: a sampled view of NV12
+    /// would need a sampler conversion.
+    pub(crate) fn for_decode(
+        device: &Arc<VideoDevice>,
+        image: vk::Image,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self, Error> {
+        let mut usage = vk::ImageViewUsageCreateInfo::default().usage(usage);
         let info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -69,13 +73,17 @@ impl ImageView {
             .subresource_range(color_range())
             .push_next(&mut usage);
         // SAFETY: `info` and its chain live through the call, and the image
-        // is the device's (the surface's contract).
+        // is the device's.
         let view =
             unsafe { device.device().create_image_view(&info, None) }.named("vkCreateImageView")?;
         Ok(Self {
             device: Arc::clone(device),
             view,
         })
+    }
+
+    pub(crate) fn handle(&self) -> vk::ImageView {
+        self.view
     }
 }
 
@@ -99,7 +107,7 @@ impl<T: SurfaceImage> Picture<T> {
     pub(crate) fn new(
         timeline: &Arc<Timeline>,
         surface: T,
-        view: ImageView,
+        view: Option<ImageView>,
         extent: vk::Extent2D,
     ) -> Self {
         Self {
@@ -108,15 +116,13 @@ impl<T: SurfaceImage> Picture<T> {
                 held: ManuallyDrop::new(Held { surface, view }),
                 extent,
                 slot: AtomicI32::new(-1),
-                decoded: AtomicU64::new(0),
-                last_use: AtomicU64::new(0),
+                landed: AtomicU64::new(0),
             }),
             stand_in: false,
         }
     }
 
-    /// Another picture of this one's surface and slot, standing in for a
-    /// lost frame.
+    /// Another picture of this one's slot, standing in for a lost frame.
     pub(crate) fn stand_in(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -129,13 +135,13 @@ impl<T: SurfaceImage> Picture<T> {
         self.stand_in
     }
 
-    /// The surface it was decoded into.
+    /// The output it landed in.
     pub fn surface(&self) -> &T {
         &self.inner.held.surface
     }
 
     /// The coded extent decoded: the frame before cropping, from the
-    /// surface's origin.
+    /// output's origin.
     pub fn coded_extent(&self) -> vk::Extent2D {
         self.inner.extent
     }
@@ -145,19 +151,20 @@ impl<T: SurfaceImage> Picture<T> {
         self.inner.timeline.semaphore()
     }
 
-    /// The value [`Self::semaphore`] reaches once the decode into the
-    /// surface is done: graphics work that samples it waits for it.
+    /// The value [`Self::semaphore`] reaches once the output holds the
+    /// picture: graphics work that samples it waits for it.
     pub fn value(&self) -> u64 {
-        self.inner.decoded.load(Ordering::Acquire)
+        self.inner.landed.load(Ordering::Acquire)
     }
 
-    /// Blocks until the decode is done, for `timeout` at most.
+    /// Blocks until the output holds the picture, for `timeout` at most.
     pub fn wait(&self, timeout: Duration) -> Result<(), Error> {
         self.inner.timeline.wait(self.value(), timeout)
     }
 
-    pub(crate) fn view(&self) -> vk::ImageView {
-        self.inner.held.view.view
+    /// The output's decode view, where a decode writes it.
+    pub(crate) fn output_view(&self) -> Option<vk::ImageView> {
+        self.inner.held.view.as_ref().map(ImageView::handle)
     }
 
     /// The DPB slot its decode set up, `None` before it.
@@ -166,37 +173,25 @@ impl<T: SurfaceImage> Picture<T> {
         (slot >= 0).then_some(slot)
     }
 
-    /// Records its decode: the slot it set up and its submission's value.
-    pub(crate) fn decoded(&self, slot: i32, value: u64) {
+    /// Records its decode: the slot it set up, and the value after which
+    /// its output holds it.
+    pub(crate) fn decoded(&self, slot: i32, landed: u64) {
         self.inner.slot.store(slot, Ordering::Release);
-        self.inner.decoded.store(value, Ordering::Release);
-        self.used(value);
+        self.inner.landed.store(landed, Ordering::Release);
     }
 
-    /// Records a submission of `value` that reads it.
-    pub(crate) fn used(&self, value: u64) {
-        self.inner.last_use.fetch_max(value, Ordering::AcqRel);
-    }
-
-    /// The decoded planes, copied to host memory (tests and tools): the
+    /// The output's planes, copied to host memory (tests and tools): the
     /// luma plane then the interleaved chroma plane, each of the coded
-    /// extent, tightly packed.
-    ///
-    /// It waits for every decode the decoder has submitted, so that no
-    /// decode reads the image while the copy moves its layout, and blocks
-    /// until the copy is done.
+    /// extent, tightly packed. It blocks until the copy is done, which
+    /// runs on the copy queue once the output holds the picture.
     pub fn read_back(&self, device: &Arc<VideoDevice>) -> Result<Nv12, Error> {
-        let family = device
-            .transfer_family()
-            .ok_or_else(|| Error::Unsupported("no queue of ours copies".into()))?;
-        let timeline = &self.inner.timeline;
         let extent = self.inner.extent;
         let (width, height) = (u64::from(extent.width), u64::from(extent.height));
         let luma = width * height;
         let size = luma + luma / 2;
-        let mut copy = ReadBack::new(device, family, size)?;
+        let mut copy = ReadBack::new(device, size)?;
         copy.record(self.surface().image(), extent, luma)?;
-        copy.submit(timeline, timeline.last_submitted())?;
+        copy.submit(&self.inner.timeline, self.value())?;
         copy.wait()?;
         let bytes = copy.bytes(size)?;
         let luma = usize::try_from(luma).map_err(|_| Error::Unsupported("a huge frame".into()))?;
@@ -214,8 +209,9 @@ impl<T: SurfaceImage> Drop for Inner<T> {
     fn drop(&mut self) {
         // SAFETY: the drop runs once, and nothing reads `held` after it.
         let held = unsafe { ManuallyDrop::take(&mut self.held) };
+        // The output is used by its picture's own work alone.
         self.timeline
-            .retire(self.last_use.load(Ordering::Acquire), Box::new(held));
+            .retire(self.landed.load(Ordering::Acquire), Box::new(held));
     }
 }
 
@@ -232,6 +228,38 @@ pub struct Nv12 {
     pub uv: Vec<u8>,
 }
 
+/// An NV12 image's two planes: each one's aspect and extent.
+pub(crate) fn planes(extent: vk::Extent2D) -> [(vk::ImageAspectFlags, vk::Extent3D); 2] {
+    [
+        (
+            vk::ImageAspectFlags::PLANE_0,
+            vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            },
+        ),
+        (
+            vk::ImageAspectFlags::PLANE_1,
+            vk::Extent3D {
+                width: extent.width / 2,
+                height: extent.height / 2,
+                depth: 1,
+            },
+        ),
+    ]
+}
+
+/// One plane's subresource.
+pub(crate) fn plane(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceLayers {
+    vk::ImageSubresourceLayers {
+        aspect_mask: aspect,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
 /// One read back's objects, destroyed as it goes.
 struct ReadBack<'a> {
     device: &'a Arc<VideoDevice>,
@@ -240,13 +268,12 @@ struct ReadBack<'a> {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     fence: vk::Fence,
-    family: u32,
     /// Whether the copy was submitted, and so signals the fence.
     submitted: bool,
 }
 
 impl<'a> ReadBack<'a> {
-    fn new(device: &'a Arc<VideoDevice>, family: u32, size: u64) -> Result<Self, Error> {
+    fn new(device: &'a Arc<VideoDevice>, size: u64) -> Result<Self, Error> {
         let vk_device = device.device();
         let mut copy = Self {
             device,
@@ -255,12 +282,11 @@ impl<'a> ReadBack<'a> {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             fence: vk::Fence::null(),
-            family,
             submitted: false,
         };
         let info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(family);
+            .queue_family_index(device.copy_family());
         // SAFETY: `info` lives through the call; so for each call below.
         copy.pool =
             unsafe { vk_device.create_command_pool(&info, None) }.named("vkCreateCommandPool")?;
@@ -295,9 +321,8 @@ impl<'a> ReadBack<'a> {
         Ok(copy)
     }
 
-    /// Records the copy of `image`'s two planes into the buffer, the
-    /// chroma plane at `luma`, moving the image out of the DPB layout and
-    /// back where the layouts are not unified.
+    /// Records the copy of `image`'s two planes, in `GENERAL` as every
+    /// output is left, into the buffer, the chroma plane at `luma`.
     fn record(&self, image: vk::Image, extent: vk::Extent2D, luma: u64) -> Result<(), Error> {
         let vk_device = self.device.device();
         let begin = vk::CommandBufferBeginInfo::default()
@@ -305,104 +330,46 @@ impl<'a> ReadBack<'a> {
         // SAFETY: the command buffer is ours and not recording.
         unsafe { vk_device.begin_command_buffer(self.command, &begin) }
             .named("vkBeginCommandBuffer")?;
-        let unified = self.device.unified_image_layouts();
-        let (held, copied) = if unified {
-            (vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL)
-        } else {
-            (
-                vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )
-        };
-        let barrier = |old, new, src_stage, src_access, dst_stage, dst_access| {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(src_stage)
-                .src_access_mask(src_access)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)
-                .old_layout(old)
-                .new_layout(new)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(color_range())
-        };
-        let before = [barrier(
-            held,
-            copied,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::MEMORY_WRITE,
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_READ,
-        )];
-        // SAFETY: recording into our command buffer; the barrier's arrays
-        // live through the call.
-        unsafe {
-            vk_device.cmd_pipeline_barrier2(
-                self.command,
-                &vk::DependencyInfo::default().image_memory_barriers(&before),
-            );
-        }
-        let plane = |aspect, offset, width, height| {
+        let regions = planes(extent).map(|(aspect, size)| {
+            let offset = if aspect == vk::ImageAspectFlags::PLANE_0 {
+                0
+            } else {
+                luma
+            };
             vk::BufferImageCopy::default()
                 .buffer_offset(offset)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: aspect,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })
-        };
-        let regions = [
-            plane(
-                vk::ImageAspectFlags::PLANE_0,
-                0,
-                extent.width,
-                extent.height,
-            ),
-            plane(
-                vk::ImageAspectFlags::PLANE_1,
-                luma,
-                extent.width / 2,
-                extent.height / 2,
-            ),
-        ];
-        // SAFETY: as above; the image is in `copied`, and the buffer holds
-        // both planes.
+                .image_subresource(plane(aspect))
+                .image_extent(size)
+        });
+        // SAFETY: recording into our command buffer; the image is in
+        // `GENERAL`, the semaphore wait orders the copy after the work
+        // that wrote it, and the buffer holds both planes.
         unsafe {
-            vk_device.cmd_copy_image_to_buffer(self.command, image, copied, self.buffer, &regions);
+            vk_device.cmd_copy_image_to_buffer(
+                self.command,
+                image,
+                vk::ImageLayout::GENERAL,
+                self.buffer,
+                &regions,
+            );
         }
-        let after = [barrier(
-            copied,
-            held,
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::NONE,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::NONE,
-        )];
         let to_host = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::HOST)
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
-        let dependency = vk::DependencyInfo::default().memory_barriers(&to_host);
-        let dependency = if unified {
-            dependency
-        } else {
-            dependency.image_memory_barriers(&after)
-        };
-        // SAFETY: as above.
-        unsafe { vk_device.cmd_pipeline_barrier2(self.command, &dependency) };
+        // SAFETY: as above, with the array alive through the call.
+        unsafe {
+            vk_device.cmd_pipeline_barrier2(
+                self.command,
+                &vk::DependencyInfo::default().memory_barriers(&to_host),
+            );
+        }
         // SAFETY: as above.
         unsafe { vk_device.end_command_buffer(self.command) }.named("vkEndCommandBuffer")
     }
 
-    /// Submits the copy, after the decoder's submission of `value`.
+    /// Submits the copy, after the decoder's timeline reaches `value`.
     fn submit(&mut self, timeline: &Timeline, value: u64) -> Result<(), Error> {
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(self.command)];
         let waits = [vk::SemaphoreSubmitInfo::default()
@@ -412,8 +379,7 @@ impl<'a> ReadBack<'a> {
         let submit = [vk::SubmitInfo2::default()
             .command_buffer_infos(&commands)
             .wait_semaphore_infos(&waits)];
-        self.device
-            .submit_transfer(self.family, &submit, self.fence)?;
+        self.device.submit_copy(&submit, self.fence)?;
         self.submitted = true;
         Ok(())
     }

@@ -1,7 +1,7 @@
 //! H.264 decoding on Vulkan Video: the codec crate's decoder over an
 //! accelerator that maps its parameter sets onto a session parameters
-//! object, its DPB onto DPB slots, and decodes each picture into a surface
-//! its caller supplies, which is also that picture's DPB slot.
+//! object and its DPB onto DPB slots, each a DPB picture of the session's,
+//! and lands each picture in an output its caller supplies.
 //!
 //! The hardware reads the slice headers itself: what goes with the slices
 //! is the picture's std information and each reference's (its frame
@@ -29,22 +29,22 @@ use crate::error::Error;
 use crate::picture::{ImageView, Picture};
 use crate::profile::{H264Capabilities, H264Profile, h264_capabilities};
 use crate::std_types::zeroed;
-use crate::surface::{SurfaceImage, SurfaceSource};
+use crate::surface::{SurfaceImage, SurfaceSource, SurfaceSpec};
 use crate::timeline::Timeline;
 
-/// A decoded frame: its picture, which holds the surface it was decoded
-/// into, and what the decoder knows of it.
+/// A decoded frame: its picture, which holds the output it landed in, and
+/// what the decoder knows of it.
 pub type Frame<T> = Output<Picture<T>>;
 
-/// An H.264 decoder on a [`VideoDevice`], decoding into the surfaces `S`
-/// gives.
+/// An H.264 decoder on a [`VideoDevice`], landing its pictures in the
+/// outputs `S` gives.
 ///
 /// Samples are access units: length-prefixed NAL units with the `avcC`
 /// record's length size, as VideoToolbox's samples are, or Annex B for
 /// [`H264Decoder::new_annex_b`]. Frames come out in decode order unless
 /// [`H264Decoder::set_output_order`] asks for display order. Each decode
 /// is submitted and not waited for: a frame's picture names the timeline
-/// value that says it is done.
+/// value after which its output holds it.
 pub struct H264Decoder<S: SurfaceSource> {
     inner: Decoder<VulkanH264<S>>,
 }
@@ -98,7 +98,8 @@ impl<S: SurfaceSource> H264Decoder<S> {
         self.inner.reset();
     }
 
-    /// The timeline semaphore each decode signals.
+    /// The timeline semaphore each decode, and each copy out of the DPB,
+    /// signals.
     pub fn semaphore(&self) -> vk::Semaphore {
         self.inner.accelerator().timeline.semaphore()
     }
@@ -130,7 +131,7 @@ impl<S: SurfaceSource> VulkanH264<S> {
         let capabilities = h264_capabilities(device);
         if capabilities.is_empty() {
             return Err(Error::NoVideoDecode(format!(
-                "{} decodes no H.264 profile into NV12 images that are their own DPB pictures",
+                "{} decodes no H.264 profile into NV12 images it can copy or sample",
                 device.name()
             )));
         }
@@ -181,7 +182,10 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
     type Picture = Picture<S::Surface>;
     type Error = Error;
 
-    fn configure(&mut self, sps: &Sps, dpb_frames: usize) -> Result<(), Error> {
+    /// A session whose DPB holds `sps`'s `max_num_ref_frames` references
+    /// and the picture being decoded: the codec crate's `dpb_frames` also
+    /// counts the frames held for display order, which are no DPB slot's.
+    fn configure(&mut self, sps: &Sps, _dpb_frames: usize) -> Result<(), Error> {
         // The old session goes first: it waits for its decodes.
         self.session = None;
         let caps = select(&self.capabilities, sps)?;
@@ -194,22 +198,34 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
             &self.timeline,
             caps,
             extent,
-            dpb_frames,
+            sps.max_num_ref_frames,
         )?);
         Ok(())
     }
 
     fn new_picture(&mut self) -> Result<Self::Picture, Error> {
-        let (extent, profile) = {
+        let spec = {
             let session = self.session()?;
-            (session.extent, session.caps.profile)
+            SurfaceSpec {
+                extent: session.extent,
+                profile: session.caps.profile,
+                decode_target: session.caps.decodes_into_output,
+            }
         };
-        let surface = self.source.surface(extent, profile)?;
-        let view = ImageView::for_decode(&self.device, surface.image())?;
-        Ok(Picture::new(&self.timeline, surface, view, extent))
+        let surface = self.source.surface(&spec)?;
+        let view = if spec.decode_target {
+            Some(ImageView::for_decode(
+                &self.device,
+                surface.image(),
+                vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
+            )?)
+        } else {
+            None
+        };
+        Ok(Picture::new(&self.timeline, surface, view, spec.extent))
     }
 
-    /// A stand-in for a lost frame: `from`'s own surface and DPB slot,
+    /// A stand-in for a lost frame: `from`'s own output and DPB slot,
     /// under a picture of its own ([`Picture`]), since only a decode
     /// sets a slot up (ours: Apple's AVC decoder conceals some way of its
     /// own). The DPB names it in place of its source where its source is
@@ -240,35 +256,30 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
             slotted.push((slot, reference.picture.is_stand_in()));
         }
         let kept = kept_references(&slotted);
-        let references: Vec<(i32, vk::ImageView, StdVideoDecodeH264ReferenceInfo)> = kept
+        let references: Vec<(i32, StdVideoDecodeH264ReferenceInfo)> = kept
             .iter()
             .filter_map(|&i| {
                 let reference = params.references.get(i)?;
                 let &(slot, _) = slotted.get(i)?;
-                Some((slot, reference.picture.view(), reference_info(reference)))
+                Some((slot, reference_info(reference)))
             })
             .collect();
-        let used: Vec<i32> = references.iter().map(|&(slot, _, _)| slot).collect();
-        let setup_slot = free_slot(&used, session.max_dpb_slots)
+        let used: Vec<i32> = references.iter().map(|&(slot, _)| slot).collect();
+        let setup_slot = free_slot(&used, session.slots())
             .ok_or_else(|| Error::Unsupported("no DPB slot is free".into()))?;
 
         let nals: Vec<&[u8]> = slices.iter().map(|s| s.nal).collect();
         let decode = Decode {
             slices: &nals,
             parameters,
-            target: (picture.surface().image(), picture.view()),
+            output: (picture.surface().image(), picture.output_view()),
             setup_slot,
             setup_info: setup_info(params),
             picture_info: picture_info(params, slices),
             references: &references,
         };
-        let value = session.decode(&decode)?;
-        picture.decoded(setup_slot, value);
-        for &i in &kept {
-            if let Some(reference) = params.references.get(i) {
-                reference.picture.used(value);
-            }
-        }
+        let landed = session.decode(&decode)?;
+        picture.decoded(setup_slot, landed);
         Ok(())
     }
 }
