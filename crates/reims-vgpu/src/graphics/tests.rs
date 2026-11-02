@@ -611,6 +611,8 @@ struct QueueRing {
     data: u64,
     produced: u64,
     consumed: u64,
+    /// The `(seqno, cb_obj_id)` of each `CB_SCHEDULED` taken off the completion ring, in order.
+    scheduled: Vec<(u64, u64)>,
 }
 
 impl QueueRing {
@@ -627,6 +629,7 @@ impl QueueRing {
             data,
             produced: 0,
             consumed: 0,
+            scheduled: Vec::new(),
         }
     }
 
@@ -680,29 +683,49 @@ impl QueueRing {
         device.mmio_write(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
     }
 
-    /// Whether the completion ring has an event the guest has not taken.
-    fn has_event(&self) -> bool {
-        // SAFETY: as the helpers above; `producer` is at the ring's start.
-        unsafe { self.load_u64(self.complete_off as usize) != self.consumed }
+    /// Whether the completion ring has an event the guest has not taken, other than a
+    /// `CB_SCHEDULED`: those at its head are taken into `scheduled`.
+    fn has_event(&mut self) -> bool {
+        let (complete_off, data) = (self.complete_off, self.data);
+        let at = |count: u64| complete_off as usize + 256 + (count % data) as usize;
+        // SAFETY (this block): as the helpers above; `producer` is at the ring's start, and the
+        // host published each message before producer.
+        unsafe {
+            while self.load_u64(self.complete_off as usize) != self.consumed {
+                let header = self.read(at(self.consumed), 8);
+                let r#type = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+                match r#type {
+                    RGFX_MSG_PAD => {}
+                    RGFX_EVT_CB_SCHEDULED => {
+                        let bytes = self.read(at(self.consumed), size);
+                        let scheduled = RgfxCbScheduled::read_from_bytes(&bytes).unwrap();
+                        self.scheduled
+                            .push((scheduled.header.seqno, scheduled.cb_obj_id));
+                    }
+                    _ => return true,
+                }
+                self.consumed += size as u64;
+                self.store_u64(self.complete_off as usize + 0x40, self.consumed);
+            }
+        }
+        false
     }
 
-    /// The next completion-ring event, waiting about 2 s; `None` where none came.
+    /// The next completion-ring event other than a `CB_SCHEDULED` (see `has_event`), waiting
+    /// about 2 s; `None` where none came.
     fn event(&mut self) -> Option<Vec<u8>> {
         let (complete_off, data) = (self.complete_off, self.data);
         let at = |count: u64| complete_off as usize + 256 + (count % data) as usize;
         for _ in 0..2000 {
             if self.has_event() {
-                // SAFETY: as the helpers above; the host published the message before producer.
+                // SAFETY: as the helpers above; `has_event` stopped at a published message.
                 let header = unsafe { self.read(at(self.consumed), 8) };
                 let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-                let r#type = u32::from_le_bytes(header[0..4].try_into().unwrap());
                 let bytes = unsafe { self.read(at(self.consumed), size) };
                 self.consumed += size as u64;
                 // SAFETY: as the helpers above.
                 unsafe { self.store_u64(self.complete_off as usize + 0x40, self.consumed) };
-                if r#type == RGFX_MSG_PAD {
-                    continue;
-                }
                 return Some(bytes);
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -770,6 +793,9 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
     assert_eq!(done.cb_obj_id, 100);
     assert_eq!(done.status, RGFX_CB_OK);
+    // Its scheduled record came ahead of it on the same ring (`event` takes only those at the
+    // ring's head aside).
+    assert_eq!(ring.scheduled, [(done.header.seqno, 100)]);
     // The queue's own vector was raised, not the control vector.
     assert_eq!(*vectors.lock(), vec![1]);
 
@@ -1077,7 +1103,7 @@ fn next_event(guest: &mut Guest, r#type: u32) -> Vec<u8> {
 }
 
 /// Completes the platform's committed command buffers until `ring` has an event, about 3 s.
-fn complete_until_event(platform: &FakePlatform, ring: &QueueRing) -> bool {
+fn complete_until_event(platform: &FakePlatform, ring: &mut QueueRing) -> bool {
     for _ in 0..3000 {
         platform.world().complete_all(CompleteOn::Caller);
         if ring.has_event() {
@@ -1116,7 +1142,7 @@ fn another_context_s_command_buffer_is_not_held_by_a_slow_compile() {
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
     ring.send(&device, command_buffer(obj(2, 1), 100));
     assert!(
-        complete_until_event(&platform, &ring),
+        complete_until_event(&platform, &mut ring),
         "context 2's command buffer was held by context 1's compile"
     );
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
@@ -1200,7 +1226,7 @@ fn a_command_buffer_naming_a_pending_pipeline_waits_for_it() {
 
     device.control.pool.release();
     assert!(
-        complete_until_event(&platform, &ring),
+        complete_until_event(&platform, &mut ring),
         "the command buffer never ran"
     );
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
@@ -1729,7 +1755,7 @@ fn a_command_buffer_names_only_its_own_process_s_objects() {
     ] {
         ring.send(&device, message);
         assert!(
-            complete_until_event(&platform, &ring),
+            complete_until_event(&platform, &mut ring),
             "command buffer {cb} was not answered"
         );
         let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
@@ -1742,14 +1768,14 @@ fn a_command_buffer_names_only_its_own_process_s_objects() {
     ring.send(&device, object_destroy(obj(1, 11)));
     ring.send(&device, library_create(obj(2, 30)));
     ring.send(&device, command_buffer(obj(2, 1), 103));
-    assert!(complete_until_event(&platform, &ring));
+    assert!(complete_until_event(&platform, &mut ring));
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (103, RGFX_CB_OK));
     assert_eq!(library_makes(&platform), 1);
     // Process 1's own buffer on its own queue still runs with its pipeline.
     let mut ring1 = QueueRing::new(&device, SUBMIT_1, COMPLETE_1, u64::from(RING_DATA));
     ring1.send(&device, compute_command_buffer(obj(1, 1), 102, obj(1, 11)));
-    assert!(complete_until_event(&platform, &ring1));
+    assert!(complete_until_event(&platform, &mut ring1));
     let done = RgfxCbComplete::read_from_bytes(&ring1.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (102, RGFX_CB_OK));
 }
@@ -2498,12 +2524,12 @@ fn an_encode_the_platform_refuses_fails_its_command_buffer() {
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
     ring.send(&device, compute_command_buffer(obj(3, 1), 100, obj(3, 11)));
-    assert!(complete_until_event(&platform, &ring), "no completion");
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
     let failed = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
     assert_eq!(failed.cb_obj_id, 100);
     assert_ne!(failed.status, RGFX_CB_OK);
     ring.send(&device, compute_command_buffer(obj(3, 1), 101, obj(3, 11)));
-    assert!(complete_until_event(&platform, &ring), "no completion");
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
     assert_eq!(done.cb_obj_id, 101);
     assert_eq!(done.status, RGFX_CB_OK);
@@ -2677,6 +2703,10 @@ fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_eve
             (RGFX_EVT_CB_COMPLETE, 102, u64::from(RGFX_CB_OK)),
         ]
     );
+    // The two buffers the GPU ran were scheduled; the refused one's stand-in posts only its
+    // completion.
+    let scheduled: Vec<u64> = ring.scheduled.iter().map(|&(_, cb)| cb).collect();
+    assert_eq!(scheduled, [100, 102]);
     assert!(!ring.has_event());
 }
 
@@ -2836,14 +2866,14 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
 
     // Buffer 4 runs and finishes: the present still waits.
     ring.send(&device, command_buffer_at(obj(1, 1), 100, 4));
-    assert!(complete_until_event(&platform, &ring));
+    assert!(complete_until_event(&platform, &mut ring));
     ring.event().expect("buffer 4's CB_COMPLETE");
     presents_waiting(&device, 1);
     assert_eq!(shown_width(&device), None);
 
     // Buffer 5 finishes: the surface shows, and the present is answered.
     ring.send(&device, command_buffer_at(obj(1, 1), 101, 5));
-    assert!(complete_until_event(&platform, &ring));
+    assert!(complete_until_event(&platform, &mut ring));
     let seqno = guest.seqno;
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
     assert_eq!(shown_width(&device), Some(64));
@@ -2994,7 +3024,7 @@ fn a_completion_the_platform_refuses_fails_its_context() {
 
     // Another context's work goes on.
     ring4.send(&device, command_buffer(obj(4, 1), 200));
-    assert!(complete_until_event(&platform, &ring4), "no completion");
+    assert!(complete_until_event(&platform, &mut ring4), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&ring4.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (200, RGFX_CB_OK));
 
@@ -3021,7 +3051,7 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     );
     let mut next = QueueRing::new(&device, SUBMIT_NEXT, COMPLETE_NEXT, u64::from(RING_DATA));
     next.send(&device, command_buffer(obj(3, 2), 300));
-    assert!(complete_until_event(&platform, &next), "no completion");
+    assert!(complete_until_event(&platform, &mut next), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&next.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (300, RGFX_CB_OK));
 }

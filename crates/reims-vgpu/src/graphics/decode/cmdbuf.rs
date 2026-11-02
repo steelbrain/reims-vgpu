@@ -43,12 +43,15 @@ use reims_graphics::ops::{
     RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassSamplePositions,
     op_group,
 };
-use reims_graphics::wire::{RGFX_EVT_EVENT_SIGNALLED, RgfxEventSignalled, RgfxMsgHeader};
+use reims_graphics::wire::{
+    RGFX_EVT_CB_SCHEDULED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled, RgfxEventSignalled,
+    RgfxMsgHeader,
+};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler,
 };
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
@@ -172,9 +175,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
             return Ok(Err(e));
         }
-        // Register the completion path and commit. The GPU start and end times are
-        // 0 here; the ring loop fills them when it posts the record on the queue's
+        // Register the scheduled and completion paths and commit. The GPU start and end times
+        // are 0 here; the ring loop fills them when it posts the record on the queue's
         // completion ring in a later increment.
+        if let Some(handler) = self.scheduled_handler(m.cb_obj_id, m.header.seqno) {
+            cb.add_scheduled_handler(ON, handler)?;
+        }
         let handler = self.completed_handler(m.cb_obj_id, m.header.seqno, events, drain, false);
         cb.add_completed_handler(ON, handler)?;
         cb.commit(ON)?;
@@ -231,6 +237,24 @@ impl<P: Platform> GraphicsDecoder<P> {
         cb.add_completed_handler(ON, handler)?;
         cb.commit(ON)?;
         Ok(true)
+    }
+
+    /// The scheduled handler of command buffer `cb_obj_id`, at `seqno`: it posts the buffer's
+    /// `CB_SCHEDULED` once the platform has scheduled it, so the guest's command buffer becomes
+    /// `Scheduled` and its scheduled handlers and `waitUntilScheduled` go on then, as Metal's do.
+    /// `None` without a sink.
+    fn scheduled_handler(&self, cb_obj_id: u64, seqno: u64) -> Option<ScheduledHandler> {
+        let sink = self.scheduled_sink.clone()?;
+        Some(Box::new(move || {
+            sink(RgfxCbScheduled {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_EVT_CB_SCHEDULED,
+                    size: size_of::<RgfxCbScheduled>() as u32,
+                    seqno,
+                },
+                cb_obj_id,
+            });
+        }))
     }
 
     /// The completion handler of command buffer `cb_obj_id`, at `seqno`, whose op stream did
@@ -902,6 +926,63 @@ mod tests {
         assert_eq!(recs[0].cb_obj_id, 100);
         assert_eq!(recs[0].header.seqno, 55);
         assert_eq!(recs[0].status, RGFX_CB_OK);
+    }
+
+    /// With a scheduled sink, a command buffer gets a scheduled handler before its completed
+    /// handler and its commit; once the platform schedules it, its `CB_SCHEDULED` goes to the
+    /// guest at its seqno, ahead of its completion record. With none, it gets no scheduled
+    /// handler.
+    #[test]
+    fn a_command_buffer_posts_its_scheduled_record_ahead_of_its_completion() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let scheduled = Arc::clone(&posted);
+        dec.set_scheduled_sink(Arc::new(move |m| {
+            assert_eq!(m.header.size as usize, size_of::<RgfxCbScheduled>());
+            scheduled
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, m.header.seqno));
+        }));
+        let completions = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, m.header.seqno));
+        }));
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(130, 61, &render_ops());
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let want = ["addScheduledHandler:", "addCompletedHandler:", "commit"];
+        let got: Vec<&str> = p
+            .call_log()
+            .sels_since(mark)
+            .into_iter()
+            .filter(|s| want.contains(s))
+            .collect();
+        assert_eq!(got, want);
+        // The fake schedules a buffer as it is committed.
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SCHEDULED, 130, 61)]);
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_CB_SCHEDULED, 130, 61),
+                (RGFX_EVT_CB_COMPLETE, 130, 61)
+            ]
+        );
+
+        // No sink: no scheduled handler.
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(131, 62, &render_ops());
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert!(
+            !p.call_log()
+                .sels_since(mark)
+                .contains(&"addScheduledHandler:")
+        );
     }
 
     /// The render-pass descriptor is built from the wire schema: its colour

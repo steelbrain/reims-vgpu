@@ -394,6 +394,10 @@ pub const RGFX_EVT_SIZE_AND_ALIGN: u32 = 0x403;
 /// Event `SAMPLER_STATE` ([`RgfxSamplerState`], on the control completion ring): a
 /// `SAMPLER_CREATE`'s answer.
 pub const RGFX_EVT_SAMPLER_STATE: u32 = 0x404;
+/// Event `CB_SCHEDULED` ([`RgfxCbScheduled`], a per-queue completion ring): a command buffer is
+/// scheduled, as Metal's becomes `Scheduled`: every wait of it is satisfied and the host's
+/// platform has submitted its work. Posted ahead of the buffer's [`RgfxCbComplete`], once.
+pub const RGFX_EVT_CB_SCHEDULED: u32 = 0x405;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -985,6 +989,21 @@ pub struct RgfxCbComplete {
     /// The host's raw `MTLCommandBufferError` code behind `status`, for
     /// diagnostics; 0 on success.
     pub error_code: u32,
+}
+
+/// `CB_SCHEDULED`, on the command buffer's queue's completion ring: the buffer is scheduled (its
+/// platform command buffer's scheduled handler ran), ahead of its [`RgfxCbComplete`]. A buffer the
+/// host could not carry out has none, nor does one of a host that predates the event: its
+/// `CB_COMPLETE` stands for both. The guest reads a record of at least this size.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCbScheduled {
+    /// [`RGFX_EVT_CB_SCHEDULED`], with the command buffer's submission `seqno`.
+    pub header: RgfxMsgHeader,
+    /// The command buffer that is scheduled.
+    pub cb_obj_id: u64,
 }
 
 /// `EVENT_SIGNALLED`, on the completion ring of the queue whose command buffer signalled it, ahead
@@ -2326,6 +2345,7 @@ const _: () = {
     assert!(size_of::<RgfxBufferOverHostMemory>() == 56);
     assert!(size_of::<RgfxBufferAtOffset>() == 56);
     assert!(size_of::<RgfxCbComplete>() == 48);
+    assert!(size_of::<RgfxCbScheduled>() == 24);
     assert!(size_of::<RgfxEventSignalled>() == 32);
     assert!(size_of::<RgfxTextureDescriptor>() == 48);
     assert!(size_of::<RgfxTextureCreate>() == 104);

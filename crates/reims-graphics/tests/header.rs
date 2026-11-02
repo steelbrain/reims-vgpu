@@ -91,6 +91,8 @@ CHECK(RGFX_PASS_FLAG_SAMPLE_POSITIONS == 8);
 CHECK(sizeof(RgfxRenderPassSamplePositions) == 136);
 CHECK(offsetof(RgfxRenderPassSamplePositions, position_bits) == 8);
 CHECK(sizeof(RgfxSamplerState) == 32);
+CHECK(sizeof(RgfxCbScheduled) == 24);
+CHECK(offsetof(RgfxCbScheduled, cb_obj_id) == 16);
 CHECK(offsetof(RgfxSamplerState, status) == 16);
 CHECK(offsetof(RgfxSamplerState, gpu_resource_id) == 24);
 CHECK(RGFX_STATUS_TOO_SMALL == 6);

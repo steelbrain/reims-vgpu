@@ -64,15 +64,15 @@ use reims_graphics::wire::{
     RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
     RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
     RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
-    RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate,
-    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
-    RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection,
-    RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate,
-    RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign,
-    RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfaceWriter, RgfxSurfaceWriters,
-    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
-    RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxCbScheduled, RgfxColorAttachmentDesc,
+    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
+    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
+    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate,
+    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts,
+    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
+    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -127,6 +127,12 @@ pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
 /// goes to the [`CompletionSink`]. The ring loop sets one that writes it to the queue's completion
 /// ring; until it is set, it is built and dropped.
 pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>;
+
+/// A sink the decoder calls with each command buffer's `CB_SCHEDULED` record once the buffer is
+/// scheduled (its platform command buffer's scheduled handler), ahead of its completion record.
+/// The ring loop sets one that writes it to the queue's completion ring; until it is set, a
+/// command buffer gets no scheduled handler.
+pub(crate) type ScheduledSink = Arc<dyn Fn(RgfxCbScheduled) + Send + Sync>;
 
 /// A sink the decoder calls with a pipeline create's reflection reply once the
 /// pipeline is made (or refused). The ring loop sets one that writes the reply to
@@ -262,6 +268,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where the shared events a command buffer signalled go once its work finishes; `None`
     /// builds and drops them (the ring loop sets a sink later).
     signal_sink: Option<SignalSink>,
+    /// Where a command buffer's `CB_SCHEDULED` goes once it is scheduled; `None` registers no
+    /// scheduled handler (the ring loop sets a sink later).
+    scheduled_sink: Option<ScheduledSink>,
     /// The watch over command buffers that wait on events, which logs the ones that wait long
     /// (diagnostics only: [`waits`]).
     waits: waits::WaitWatch<P>,
@@ -308,6 +317,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             id_chunks: vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice(),
             completion_sink: None,
             signal_sink: None,
+            scheduled_sink: None,
             reflection_sink: None,
             context: None,
             spans: HashMap::new(),
@@ -330,6 +340,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// buffer's work finishes (the ring loop's, writing the queue's completion ring).
     pub(crate) fn set_signal_sink(&mut self, sink: SignalSink) {
         self.signal_sink = Some(sink);
+    }
+
+    /// Sets the sink the decoder hands each command buffer's `CB_SCHEDULED` to once the buffer is
+    /// scheduled (the ring loop's, writing the queue's completion ring).
+    pub(crate) fn set_scheduled_sink(&mut self, sink: ScheduledSink) {
+        self.scheduled_sink = Some(sink);
     }
 
     /// Sets the sink the decoder hands each pipeline create's reflection reply to

@@ -37,8 +37,8 @@ use reims_graphics::wire::{
     RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
     RGFX_EVT_SAMPLER_STATE, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease,
-    RgfxCbComplete, RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader, RgfxPipelineReflection,
-    RgfxSamplerState,
+    RgfxCbComplete, RgfxCbScheduled, RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPipelineReflection, RgfxSamplerState,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -64,8 +64,8 @@ use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
     CompletionSink, DecodeError, FailedContexts, GraphicsDecoder, LibraryJob, LibraryStart,
-    MadeLibrary, PipelineJob, ReflectionSink, SignalSink, compile_refusing, complete, make_library,
-    refused_reply, refusing,
+    MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, compile_refusing,
+    complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{PresentAnswers, PresentQueue};
@@ -535,6 +535,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled| {
                 signal_poster.post(record.as_bytes());
             });
+            let scheduled_poster = poster.clone();
+            let scheduled: ScheduledSink = Arc::new(move |record: RgfxCbScheduled| {
+                scheduled_poster.post(record.as_bytes());
+            });
             let reflection_poster = poster.clone();
             let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
                 reflection_poster.post(record.as_bytes());
@@ -543,6 +547,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let mut decoder = self.decoder.lock();
                 decoder.set_completion_sink(sink);
                 decoder.set_signal_sink(signal);
+                decoder.set_scheduled_sink(scheduled);
                 decoder.set_reflection_sink(reflection);
                 decoder.set_context(Some(sender_context(poster, message)));
                 if r#type == RGFX_CMD_OBJECT_DESTROY {

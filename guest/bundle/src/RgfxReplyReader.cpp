@@ -58,6 +58,12 @@ void RgfxReplyReader::expectCompletion(uint64_t seqno, CompletionHandler handler
 	m_completions[seqno] = std::move(handler);
 }
 
+void RgfxReplyReader::expectScheduled(uint64_t seqno, ScheduledHandler handler)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_scheduled[seqno] = std::move(handler);
+}
+
 RgfxReplyReader::RgfxReplyReader()
     : m_header(nullptr), m_data(nullptr), m_dataSize(0), m_mask(0), m_consumed(0), m_nextToken(1)
 {
@@ -177,6 +183,12 @@ bool RgfxReplyReader::awaitingCompletion(uint64_t seqno)
 	return m_completions.find(seqno) != m_completions.end();
 }
 
+bool RgfxReplyReader::awaitingScheduled(uint64_t seqno)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	return m_scheduled.find(seqno) != m_scheduled.end();
+}
+
 bool RgfxReplyReader::awaitingReflection(uint64_t seqno)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
@@ -220,10 +232,25 @@ uint32_t RgfxReplyReader::pump()
 			}
 
 			switch (type) {
+			case RGFX_EVT_CB_SCHEDULED: {
+				RgfxCbScheduled msg = {};
+				if (size >= sizeof(msg)) {
+					readBytes(m_data, offset, &msg, sizeof(msg));
+					auto it = m_scheduled.find(msg.header.seqno);
+					if (it != m_scheduled.end()) {
+						ScheduledHandler handler = std::move(it->second);
+						m_scheduled.erase(it);
+						calls.emplace_back([handler, msg]() { handler(msg); });
+					}
+				}
+				break;
+			}
 			case RGFX_EVT_CB_COMPLETE: {
 				RgfxCbComplete msg = {};
 				if (size >= sizeof(msg)) {
 					readBytes(m_data, offset, &msg, sizeof(msg));
+					// The completion stands for a CB_SCHEDULED the host did not post.
+					m_scheduled.erase(msg.header.seqno);
 					auto it = m_completions.find(msg.header.seqno);
 					if (it != m_completions.end()) {
 						CompletionHandler handler = std::move(it->second);

@@ -795,10 +795,12 @@ struct RgfxBarrierSlot {
 // RgfxCmdBuffer
 // =============================================================================
 
-// The completion-delivery entry the reader's handler calls (defined below); declared
-// here so the lambda in `commit` sees its signature.
+// The delivery entries the reader's handlers call (defined below); declared here so the
+// lambdas in `commit` see their signatures.
 @interface RgfxCmdBuffer ()
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg;
+- (void)rgfxReachScheduled;
+- (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached;
 @end
 
 // The encoders' inline bytes go to their command buffer's upload arena, handed over as the
@@ -889,6 +891,18 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// says it was left, so a buffer whose completion never came leaves it at dealloc.
 	dispatch_group_t _done;
 	std::atomic<bool> _left;
+	// Entered at commit with a reader, as `_done` is: `_submitted` is left once the buffer is
+	// submitted, `_scheduled` once its scheduled handlers have run, which is what
+	// commitAndWaitUntilSubmitted and waitUntilScheduled wait on. The buffer is submitted and
+	// scheduled at its CB_SCHEDULED, or at its completion where none came first
+	// (rgfxReachScheduled). `_scheduledReached` says it got there; each `_*Left` that its group
+	// was left, so one never left is left at dealloc.
+	dispatch_group_t _submitted;
+	dispatch_group_t _scheduled;
+	std::atomic<bool> _scheduledReached;
+	std::atomic<bool> _scheduledRan;
+	std::atomic<bool> _submittedLeft;
+	std::atomic<bool> _scheduledLeft;
 	// The queue's slot this buffer holds (rgfxHoldSlot:), and whether it still does.
 	dispatch_semaphore_t _slots;
 	std::atomic<bool> _slotHeld;
@@ -944,6 +958,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// (its reader went first) is left here.
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
+	if (_submitted != nil && !_submittedLeft.exchange(true))
+		dispatch_group_leave(_submitted);
+	if (_scheduled != nil && !_scheduledLeft.exchange(true))
+		dispatch_group_leave(_scheduled);
 	// A buffer never committed, or whose completion never came, gives its slot back, and lets
 	// what it kept go with it.
 	[self rgfxGiveSlotBack];
@@ -1103,9 +1121,18 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
+		_submitted = dispatch_group_create();
+		dispatch_group_enter(_submitted);
+		_scheduled = dispatch_group_create();
+		dispatch_group_enter(_scheduled);
 		RgfxCmdBuffer *strongSelf = self;
 		RgfxReplyReader *reader = _reader;
 		expect = [reader, strongSelf](uint64_t seqno) {
+			reader->expectScheduled(seqno, [strongSelf](const RgfxCbScheduled &) {
+				@autoreleasepool {
+					[strongSelf rgfxReachScheduled];
+				}
+			});
 			reader->expectCompletion(seqno, [strongSelf](const RgfxCbComplete &m) {
 				@autoreleasepool {
 					[strongSelf rgfxDeliverCompletion:&m];
@@ -1215,6 +1242,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // signal, so the scheduled handlers fire here too (a completed buffer was scheduled).
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg
 {
+	// A completed buffer was scheduled: where its CB_SCHEDULED did not come first (the host
+	// could not carry it out), it is submitted and scheduled here, its scheduled handlers run
+	// before anything of its completion.
+	[self rgfxReachScheduled];
 	t_delivering++;
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
@@ -1252,10 +1283,6 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_cbError = rgfxCommandBufferError(static_cast<NSInteger>(msg->error_code));
 		_status.store(MTLCommandBufferStatusError);
 	}
-	for (MTLCommandBufferHandler block in _scheduledHandlers) {
-		block(self);
-	}
-	[_scheduledHandlers removeAllObjects];
 	for (MTLCommandBufferHandler block in _completedHandlers) {
 		block(self);
 	}
@@ -1266,6 +1293,35 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	t_delivering--;
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
+}
+
+// The buffer is scheduled (its CB_SCHEDULED, or its completion where none came first), once:
+// on the thread that took it off the ring, it is submitted (commitAndWaitUntilSubmitted
+// returns), becomes Scheduled where it was Committed, runs its scheduled handlers in the order
+// added, then lets waitUntilScheduled return. Metal's commitAndWaitUntilSubmitted returns before
+// the scheduled handlers run, and Metal makes the buffer Scheduled only once every wait of it is
+// satisfied, which the host's platform does too before it posts CB_SCHEDULED (measured on the
+// M3 Max, macOS 27: on an idle queue the call returns with the buffer Committed and its
+// scheduled handler about 10 us from running; one behind a long buffer returns in 0.1 ms,
+// Scheduled; waitUntilScheduled behind a long buffer returns in 0.1 ms; a buffer that waits for
+// an event nothing signals is neither submitted nor scheduled until the event is signalled).
+- (void)rgfxReachScheduled
+{
+	if (_scheduledReached.exchange(true))
+		return;
+	if (_submitted != nil && !_submittedLeft.exchange(true))
+		dispatch_group_leave(_submitted);
+	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
+	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
+	t_delivering++;
+	for (MTLCommandBufferHandler block in _scheduledHandlers) {
+		block(self);
+	}
+	[_scheduledHandlers removeAllObjects];
+	t_delivering--;
+	_scheduledRan.store(true);
+	if (_scheduled != nil && !_scheduledLeft.exchange(true))
+		dispatch_group_leave(_scheduled);
 }
 
 // The GPU's times, in the guest's host time. The device's clock is the host's, not the
@@ -1309,47 +1365,55 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	}
 }
 
-// The command-buffer SPI VideoToolbox calls: commits, then waits until the buffer is
-// submitted, which here is once it is scheduled (waitUntilScheduled); YES unless it failed.
+// The command-buffer SPI SkyLight's compositor and VideoToolbox call: commits, then waits until
+// the buffer is submitted (its CB_SCHEDULED, rgfxReachScheduled), not until it runs, as Metal's
+// does; YES unless it failed by then.
 - (BOOL)commitAndWaitUntilSubmitted
 {
 	[self commit];
-	[self waitUntilScheduled];
+	[self rgfxWaitFor:_submitted reached:&_scheduledReached];
 	return self.status != MTLCommandBufferStatusError;
 }
 
 - (void)waitUntilScheduled
 {
-	// We have no separate scheduled signal: a buffer is taken as scheduled once its
-	// completion lands (its scheduled handlers fire there), so this waits as
-	// waitUntilCompleted does.
-	[self waitUntilCompleted];
+	// Blocks until the buffer is scheduled and its scheduled handlers have run
+	// (rgfxReachScheduled), as Metal's does.
+	[self rgfxWaitFor:_scheduled reached:&_scheduledRan];
 }
 
 - (void)waitUntilCompleted
 {
 	// Blocks until this buffer's RGFX_EVT_CB_COMPLETE has been delivered: its status
-	// flipped and its handlers run, as Metal's does. Without a reader (a unit test
-	// without one, or before commit) there is nothing to wait on, so this returns at once.
-	if (_reader == nullptr) {
+	// flipped and its handlers run, as Metal's does.
+	[self rgfxWaitFor:_done reached:nullptr];
+}
+
+// Blocks until `group` is left, which the thread that delivers the buffer's records does once
+// `*reached` holds (the buffer's completion, for a null `reached`). Without a reader (a unit
+// test without one, or before commit) there is nothing to wait on, so this returns at once.
+- (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached
+{
+	if (_reader == nullptr || group == nil) {
 		return;
 	}
+	auto done = [self, reached] { return reached != nullptr ? reached->load() : [self rgfxFinished]; };
 	// Inside a completion's handlers, the delivering thread is this one: the group would
 	// never be left, so the ring is taken here.
 	bool delivering = t_delivering > 0 || RgfxCompletionThread::onCurrentThread();
-	while (![self rgfxFinished]) {
+	while (!done()) {
 		if (_reader->driven() && !delivering) {
 			// The completion thread takes the ring. A thread that ends (the process's
 			// context gone) leaves the reader undriven, so look again each second.
-			if (dispatch_group_wait(_done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
+			if (dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
 				return;
 			continue;
 		}
 		_reader->pump();
 	}
-	// Finished, perhaps on another thread that is still running the handlers.
+	// There, perhaps on another thread that is still running the handlers.
 	if (!delivering)
-		dispatch_group_wait(_done, DISPATCH_TIME_FOREVER);
+		dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 }
 
 // The event of a command buffer's event op, which the buffer keeps while it runs: its id, or 0

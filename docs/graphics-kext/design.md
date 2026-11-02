@@ -787,6 +787,22 @@ command-buffer `ObjId`, status, GPU start/end time, and on error the
 (page fault, hang/timeout, recovery victim, access revoked, invalid resource —
 the map m2v gave). The ring's armed/interrupt handshake is the stage-2 one.
 
+**Scheduled** (per-queue completion ring). A `CB_SCHEDULED` record (the command-buffer
+`ObjId`, at the buffer's seqno; 24 bytes, and the guest reads a record of at least that size)
+goes on the queue's completion ring once the host's platform has scheduled the buffer: the
+buffer's platform scheduled handler posts it, which Metal and metal2vulkan run once every wait
+of the buffer is satisfied and its work is submitted, ahead of its `CB_COMPLETE`. The guest's
+buffer is then submitted (`commitAndWaitUntilSubmitted` returns, before the scheduled handlers
+run), becomes `Scheduled`, runs its scheduled handlers, then lets `waitUntilScheduled` return,
+as Metal's does (measured on the M3 Max, macOS 27: on an idle queue
+`commitAndWaitUntilSubmitted` returns in 0.05-0.1 ms with the buffer `Committed` and its
+scheduled handler about 10 us from running; behind a 120 ms buffer it and `waitUntilScheduled`
+return in 0.1 ms, `Scheduled`; a buffer that waits for an event nothing has signalled is
+neither submitted nor scheduled until the event is signalled, or Metal's timeout fails it after
+5 s). A buffer the host could not
+carry out has no `CB_SCHEDULED`, and its `CB_COMPLETE` stands for both; so does every
+`CB_COMPLETE` from a host that posts none.
+
 **Shared events.** The host's event is the one command buffers wait on and
 signal; the bundle keeps the value as the process knows it. It only rises, as
 Metal's does (measured on the M3 Max: a CPU set or a GPU signal to a lower value
@@ -831,10 +847,12 @@ It sleeps in the kext (user-client selector `0x107`, an interruptible wait on a
 per-client wake count it passes back), and each pass it drains every queue's
 ring, arms it, fences and looks again. A completion posted while it works shows
 in the count or in its last look, so none is missed and nothing polls. The
-thread runs each command buffer's scheduled then completed handlers in ring
-order, whether or not anything waits. `waitUntilCompleted` waits for the
-thread to have run them. It takes the ring itself only inside a handler, or
-once the thread has ended (its context closed).
+thread runs each command buffer's scheduled handlers at its `CB_SCHEDULED`
+(or at its `CB_COMPLETE` where none came first) and its completed handlers at
+its `CB_COMPLETE`, in ring order, whether or not anything waits.
+`commitAndWaitUntilSubmitted`, `waitUntilScheduled` and `waitUntilCompleted`
+wait for the thread to have got that far. It takes the ring itself only inside
+a handler, or once the thread has ended (its context closed).
 
 **Left for later** (extends the same op families, not the transport): enqueue
 ordering held in the decoder; command-buffer/queue descriptors and

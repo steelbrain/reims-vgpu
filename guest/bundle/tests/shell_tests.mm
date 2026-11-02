@@ -3388,6 +3388,16 @@ RgfxCbComplete cbComplete(uint64_t seqno, uint64_t cbObjId)
 	return done;
 }
 
+RgfxCbScheduled cbScheduled(uint64_t seqno, uint64_t cbObjId)
+{
+	RgfxCbScheduled scheduled = {};
+	scheduled.header.type = RGFX_EVT_CB_SCHEDULED;
+	scheduled.header.size = sizeof(scheduled);
+	scheduled.header.seqno = seqno;
+	scheduled.cb_obj_id = cbObjId;
+	return scheduled;
+}
+
 // Waits up to 5 s for `pred`, polling.
 template <typename F> bool eventually(F pred)
 {
@@ -3671,6 +3681,119 @@ void test_wait_with_the_completion_thread()
 	[second waitUntilCompleted];
 	kext->close();
 	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// A buffer's CB_SCHEDULED, ahead of its completion: commitAndWaitUntilSubmitted returns, the
+// buffer is Scheduled, its scheduled handlers run and waitUntilScheduled returns, all before it
+// completes; its CB_COMPLETE then runs its completed handlers alone. A completion with no
+// CB_SCHEDULED before it (a buffer the host could not carry out) runs the scheduled handlers
+// first and lets the submitted and scheduled waiters go, and drops the reader's registration.
+void test_scheduled_before_completion()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+
+	std::mutex lock;
+	std::vector<std::string> order;
+	__block std::mutex *orderLock = &lock;
+	__block std::vector<std::string> *orderLog = &order;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb addScheduledHandler:^(id<MTLCommandBuffer> done) {
+		std::lock_guard<std::mutex> hold(*orderLock);
+		orderLog->push_back(done.status == MTLCommandBufferStatusScheduled ? "s" : "s!");
+	}];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		std::lock_guard<std::mutex> hold(*orderLock);
+		orderLog->push_back(done.status == MTLCommandBufferStatusCompleted ? "c" : "c!");
+	}];
+	uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+	std::atomic<uint64_t> taken{0};
+	std::atomic<uint64_t> *takenp = &taken;
+	QueueFixture *fp = &f;
+	// The host takes the buffer, then posts its CB_SCHEDULED a while later: the call returns
+	// only then.
+	std::thread host([fp, kext, cbObjId, takenp] {
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		for (int i = 0; i < 5000 && !fp->submit.next(&h, &bytes); i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		takenp->store(h.seqno);
+		std::this_thread::sleep_for(std::chrono::milliseconds(30));
+		RgfxCbScheduled scheduled = cbScheduled(h.seqno, cbObjId);
+		hostPost(fp->completion, *kext, &scheduled, sizeof(scheduled));
+	});
+	auto start = std::chrono::steady_clock::now();
+	CHECK([(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted]);
+	CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(25));
+	host.join();
+	uint64_t seqno = taken.load();
+	CHECK(seqno != 0);
+	[cb waitUntilScheduled];
+	CHECK(cb.status == MTLCommandBufferStatusScheduled);
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		CHECK((order == std::vector<std::string>{"s"}));
+	}
+	CHECK(![f.queue sharedReplyReader]->awaitingScheduled(seqno));
+	CHECK([f.queue sharedReplyReader]->awaitingCompletion(seqno));
+	RgfxCbComplete done = cbComplete(seqno, cbObjId);
+	hostPost(f.completion, *kext, &done, sizeof(done));
+	[cb waitUntilCompleted];
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		CHECK((order == std::vector<std::string>{"s", "c"}));
+	}
+
+	// No CB_SCHEDULED: the completion stands for it.
+	id<MTLCommandBuffer> failed = [f.queue commandBuffer];
+	__block int scheduledRuns = 0;
+	[failed addScheduledHandler:^(id<MTLCommandBuffer> b) {
+		(void)b;
+		scheduledRuns++;
+	}];
+	[failed commit];
+	uint64_t s2 = f.nextSeqno();
+	CHECK([f.queue sharedReplyReader]->awaitingScheduled(s2));
+	CHECK(failed.status == MTLCommandBufferStatusCommitted);
+	RgfxCbComplete d2 = cbComplete(s2, ((RgfxResource *)failed).rgfxObjId);
+	d2.status = RGFX_CB_INTERNAL;
+	hostPost(f.completion, *kext, &d2, sizeof(d2));
+	[failed waitUntilScheduled];
+	CHECK(scheduledRuns == 1);
+	[failed waitUntilCompleted];
+	CHECK(failed.status == MTLCommandBufferStatusError);
+	CHECK(![f.queue sharedReplyReader]->awaitingScheduled(s2));
+	CHECK(scheduledRuns == 1);
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// Without a completion thread, waitUntilScheduled takes the ring itself and returns at the
+// buffer's CB_SCHEDULED, before its completion.
+void test_wait_until_scheduled_pumps()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb commit];
+	uint64_t seqno = f.nextSeqno();
+	FakeKext kext;
+	RgfxCbScheduled scheduled = cbScheduled(seqno, ((RgfxResource *)cb).rgfxObjId);
+	hostPost(f.completion, kext, &scheduled, sizeof(scheduled));
+	[cb waitUntilScheduled];
+	CHECK(cb.status == MTLCommandBufferStatusScheduled);
+	CHECK([f.queue sharedReplyReader]->awaitingCompletion(seqno));
+	RgfxCbComplete done = cbComplete(seqno, ((RgfxResource *)cb).rgfxObjId);
+	hostPost(f.completion, kext, &done, sizeof(done));
+	[cb waitUntilCompleted];
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
 	}
 }
 
@@ -6178,6 +6301,8 @@ int main()
 		test_reply_reader_arm();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();
+		test_scheduled_before_completion();
+		test_wait_until_scheduled_pumps();
 		test_completion_thread_stops();
 		test_uncompleted_buffer_releases();
 		test_command_buffer_out_of_line();

@@ -4,6 +4,8 @@
  * crates/reims-graphics/src/device.rs (ControlCompletionPoster). It reads the host's
  * reply messages off the ring and dispatches each to the wrapper that is waiting on
  * it:
+ *   - RGFX_EVT_CB_SCHEDULED (RgfxCbScheduled) -> the command buffer whose submission
+ *     seqno it carries: it is scheduled, its scheduled handlers fire, a waiter wakes;
  *   - RGFX_EVT_CB_COMPLETE (RgfxCbComplete) -> the command buffer whose submission
  *     seqno it carries: its completed handlers fire, its status flips, a waiter wakes;
  *   - RGFX_EVT_PIPELINE_REFLECTION (RgfxPipelineReflection) -> the pipeline-state
@@ -58,6 +60,8 @@ class RgfxReplyReader {
 public:
 	/// A command buffer's completion handler, invoked once with the whole message.
 	typedef std::function<void(const RgfxCbComplete &)> CompletionHandler;
+	/// A command buffer's scheduled handler, invoked once with the whole message.
+	typedef std::function<void(const RgfxCbScheduled &)> ScheduledHandler;
 	/// A pipeline create's reflection handler, invoked once with the whole message.
 	typedef std::function<void(const RgfxPipelineReflection &)> ReflectionHandler;
 	/// A shared event's listener, invoked on every EVENT_SIGNALLED for its obj_id.
@@ -82,6 +86,12 @@ public:
 	/// when its RGFX_EVT_CB_COMPLETE arrives, then removed. A second registration for
 	/// the same seqno replaces the first.
 	void expectCompletion(uint64_t seqno, CompletionHandler handler);
+
+	/// Registers `handler` for the command buffer submitted at `seqno`; fired once, when its
+	/// RGFX_EVT_CB_SCHEDULED arrives, then removed. Its RGFX_EVT_CB_COMPLETE removes it unfired
+	/// (the host posts no CB_SCHEDULED for a buffer it could not carry out): the completion
+	/// stands for both.
+	void expectScheduled(uint64_t seqno, ScheduledHandler handler);
 
 	/// Registers `handler` for the pipeline created at `seqno`; fired once, when its
 	/// RGFX_EVT_PIPELINE_REFLECTION arrives, then removed.
@@ -131,6 +141,7 @@ public:
 
 	/// Whether a completion / reflection is still awaited for `seqno` (tests).
 	bool awaitingCompletion(uint64_t seqno);
+	bool awaitingScheduled(uint64_t seqno);
 	bool awaitingReflection(uint64_t seqno);
 
 private:
@@ -154,6 +165,7 @@ private:
 	std::atomic<bool> m_driven{false};
 
 	std::unordered_map<uint64_t, CompletionHandler> m_completions;
+	std::unordered_map<uint64_t, ScheduledHandler> m_scheduled;
 	std::unordered_map<uint64_t, ReflectionHandler> m_reflections;
 	std::unordered_map<uint64_t, RgfxPipelineReflection> m_earlyReflections;
 	std::unordered_map<uint64_t, EventListener> m_eventListeners;

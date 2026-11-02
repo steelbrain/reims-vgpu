@@ -1042,6 +1042,11 @@
 // `SAMPLER_CREATE`'s answer.
 #define RGFX_EVT_SAMPLER_STATE 1028
 
+// Event `CB_SCHEDULED` ([`RgfxCbScheduled`], a per-queue completion ring): a command buffer is
+// scheduled, as Metal's becomes `Scheduled`: every wait of it is satisfied and the host's
+// platform has submitted its work. Posted ahead of the buffer's [`RgfxCbComplete`], once.
+#define RGFX_EVT_CB_SCHEDULED 1029
+
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
 
@@ -1980,6 +1985,17 @@ typedef struct {
   // diagnostics; 0 on success.
   uint32_t error_code;
 } RgfxCbComplete;
+
+// `CB_SCHEDULED`, on the command buffer's queue's completion ring: the buffer is scheduled (its
+// platform command buffer's scheduled handler ran), ahead of its [`RgfxCbComplete`]. A buffer the
+// host could not carry out has none, nor does one of a host that predates the event: its
+// `CB_COMPLETE` stands for both. The guest reads a record of at least this size.
+typedef struct {
+  // [`RGFX_EVT_CB_SCHEDULED`], with the command buffer's submission `seqno`.
+  RgfxMsgHeader header;
+  // The command buffer that is scheduled.
+  uint64_t cb_obj_id;
+} RgfxCbScheduled;
 
 // One colour attachment of a render pipeline
 // (`MTLRenderPipelineColorAttachmentDescriptor`). Each enum is its Metal raw
