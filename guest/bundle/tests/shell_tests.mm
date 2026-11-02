@@ -2297,6 +2297,60 @@ void test_async_creators_return_before_their_handlers()
 	CHECK(!fx.ring.next(&h, &posted));
 }
 
+// A pending asynchronous create keeps what it uses: a library released right after the call
+// lives until its create ends, then goes, and a descriptor changed after the call is not what
+// the create reads, as Metal copies it at the call. The handler waits for the release, so a
+// create that kept no reference finds the library gone; the change races the create's start,
+// which comes later in practice (about 0.15 ms on the global queue), so a create that copied
+// nothing reads the changed name and fails as a function not found.
+void test_async_creates_keep_what_they_use()
+{
+	Fixture fx;
+	const std::vector<uint8_t> bytes = metallibOf({ { "frg", 1, { { "useRed", 53, 0, true } } } });
+	dispatch_time_t (^after)(int64_t) = ^(int64_t seconds) {
+		return dispatch_time(DISPATCH_TIME_NOW, seconds * static_cast<int64_t>(NSEC_PER_SEC));
+	};
+	dispatch_semaphore_t released = dispatch_semaphore_create(0);
+	__block BOOL alive = NO;
+	__block NSError *handed = nil;
+	__weak RgfxLibrary *weak = nil;
+	@autoreleasepool {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+		                                        length:bytes.size()
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		CHECK(lib != nil);
+		(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+		weak = lib;
+		// A value of another type than its constant's: the create fails, with no message posted.
+		static const float five = 5;
+		MTLFunctionConstantValues *wrong = [MTLFunctionConstantValues new];
+		[wrong setConstantValue:&five type:MTLDataTypeFloat atIndex:0];
+		MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+		fd.name = @"frg";
+		fd.constantValues = wrong;
+		[lib newFunctionWithDescriptor:fd
+		             completionHandler:^(id<MTLFunction> f, NSError *e) {
+			             (void)f;
+			             dispatch_semaphore_wait(released, after(5));
+			             alive = weak != nil;
+			             handed = e;
+		             }];
+		// Changed after the call: a function the library does not hold would fail otherwise.
+		fd.name = @"nosuch";
+		fd.constantValues = nil;
+		lib = nil;
+	}
+	dispatch_semaphore_signal(released);
+	CHECK(RgfxWaitForCreations(after(10)));
+	CHECK(alive);
+	CHECK(handed.code == MTLLibraryErrorCompileFailure);
+	CHECK(weak == nil);
+}
+
 // A library's functions are specialised as Metal specialises them: a value set by name or by
 // range reaches its constant's index, an indexed value wins over a named one, values for
 // constants the function does not declare are ignored, a required constant left unset reads 0
@@ -7132,6 +7186,7 @@ int main()
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
 		test_async_creators_return_before_their_handlers();
+		test_async_creates_keep_what_they_use();
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
