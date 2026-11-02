@@ -328,6 +328,23 @@ fn command_buffer(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// [`command_buffer`] with one op, `SUBMITTED`: a buffer that asks for its `CB_SUBMITTED`, as
+/// `commitAndWaitUntilSubmitted` commits it.
+fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
+    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+
+    let mut message = command_buffer(queue_obj_id, cb_obj_id);
+    let submitted = RgfxOpHeader {
+        tag: RGFX_OP_SUBMITTED,
+        flags: 0,
+        len: 8,
+    };
+    message.extend_from_slice(submitted.as_bytes());
+    message[RGFX_COMMAND_BUFFER_OPS_OFFSET as usize - 8..RGFX_COMMAND_BUFFER_OPS_OFFSET as usize]
+        .copy_from_slice(&8u64.to_le_bytes());
+    message
+}
+
 /// The device-info caps blob is written into the region at [`RGFX_DEVICE_INFO_OFFSET`] at init,
 /// mirroring the GPU device's caps and features the guest bundle reads before it makes any queue;
 /// on the fake (an M3 Max's answers) it answers no Apple family and no iOS feature set, as an
@@ -834,8 +851,6 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 /// left to the queue's thread, and completes as before
 #[test]
 fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
-
     let raised = Arc::new(super::Mutex::new(Vec::<(u32, Option<String>)>::new()));
     let platform = Arc::new(FakePlatform::new());
     let record = Arc::clone(&raised);
@@ -880,16 +895,7 @@ fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
     }
     ring.arm();
 
-    let mut asking = command_buffer(queue, 100);
-    let submitted = RgfxOpHeader {
-        tag: RGFX_OP_SUBMITTED,
-        flags: 0,
-        len: 8,
-    };
-    asking.extend_from_slice(submitted.as_bytes());
-    asking[RGFX_COMMAND_BUFFER_OPS_OFFSET as usize - 8..RGFX_COMMAND_BUFFER_OPS_OFFSET as usize]
-        .copy_from_slice(&8u64.to_le_bytes());
-    ring.publish(asking);
+    ring.publish(asking(queue, 100));
     device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
     assert!(
         ring.has_event(),
@@ -922,6 +928,137 @@ fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
     let done = complete(&mut ring);
     assert_eq!((done.cb_obj_id, done.status), (101, RGFX_CB_OK));
     assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+}
+
+/// The name of the thread each raise that called the device ran on, once its calls returned.
+type Returned = Arc<super::Mutex<Vec<Option<String>>>>;
+
+/// A headless device whose first `raise_interrupt` calls the device at once, as the header lets
+/// it: it reads `STATUS`, rings the queue whose submission ring is at `ring` through
+/// `mmio_write_taking`, and resets the device, then records the thread it ran on.
+fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{OnceLock, Weak};
+
+    let handle = Arc::new(OnceLock::<Weak<GraphicsDevice<FakePlatform>>>::new());
+    let returned = Returned::default();
+    let (from, record, once) = (
+        Arc::clone(&handle),
+        Arc::clone(&returned),
+        AtomicBool::new(false),
+    );
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |_vector| {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let Some(device) = from.get().and_then(Weak::upgrade) else {
+                    return;
+                };
+                device.mmio_read(RGFX_REG_STATUS.into());
+                device.mmio_write_taking(RGFX_REG_DOORBELL.into(), ring as u32);
+                device.reset();
+                drop(device);
+                let name = std::thread::current().name().map(str::to_owned);
+                record.lock().push(name);
+            })),
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let device = Arc::new(device);
+    handle.set(Arc::downgrade(&device)).unwrap();
+    (device, returned)
+}
+
+/// A raise may call the device at once, as the header lets it, wherever it comes from: at a
+/// command buffer's `CB_SUBMITTED` posted on its queue's thread and on a doorbell's thread, under
+/// the decoder's lock, and at a present the host answers at once with no window, under the
+/// presents' queue. Its `STATUS` read, its doorbell through `mmio_write_taking` and its reset each
+/// return, and the device is reset
+#[test]
+fn a_raise_may_call_the_device_at_once() {
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, queue) = (3, obj(3, 1));
+    // A started device with the queue made, its thread asleep with the ring idle, and its
+    // completion ring armed.
+    let started = || {
+        let (device, returned) = calling_back(SUBMIT_OFF);
+        device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+        let mut guest = Guest::new(&device);
+        let create = queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1);
+        assert_eq!(answered(&device, &mut guest, create), RGFX_STATUS_OK);
+        let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+        for _ in 0..2000 {
+            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
+            let idle = unsafe {
+                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
+                    .load(Ordering::SeqCst)
+            };
+            if idle == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ring.arm();
+        (device, returned, guest, ring)
+    };
+    let returned_on = |returned: &Returned| {
+        for _ in 0..3000 {
+            if let Some(name) = returned.lock().first() {
+                return name.clone();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the raise's calls never returned");
+    };
+    let reset = |device: &GraphicsDevice<FakePlatform>| {
+        assert_eq!(device.mmio_read(RGFX_REG_STATUS.into()), RGFX_STATUS_RESET);
+    };
+
+    // On the queue's thread, which the doorbell wakes to take the buffer.
+    let (device, returned, _guest, mut ring) = started();
+    ring.publish(asking(queue, 100));
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    let on = returned_on(&returned);
+    assert!(
+        on.as_deref()
+            .is_some_and(|name| name.starts_with("reims-vgpu.graphics-queue-")),
+        "raised on {on:?}"
+    );
+    reset(&device);
+
+    // On the doorbell's thread, inside the write that takes the buffer.
+    let (device, returned, _guest, mut ring) = started();
+    ring.publish(asking(queue, 100));
+    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    let here = std::thread::current().name().map(str::to_owned);
+    assert_eq!(returned.lock().first(), Some(&here));
+    reset(&device);
+
+    // On the control thread, at a present of the scanout, which the host shows and answers at once.
+    let (device, returned, mut guest, _ring) = started();
+    // SAFETY: as `Guest`'s helpers; `armed` is at 0xc0 of the control completion ring.
+    unsafe {
+        AtomicU32::from_ptr(
+            device
+                .region_base()
+                .add(RGFX_CONTROL_COMPLETE_OFFSET as usize + 0xc0)
+                .cast(),
+        )
+        .store(1, Ordering::SeqCst);
+    }
+    guest.send(&device, present_surface(0));
+    assert_eq!(
+        returned_on(&returned).as_deref(),
+        Some("reims-vgpu.graphics-control")
+    );
+    reset(&device);
 }
 
 /// The window shows the guest's cursor once it has an image and while the guest shows it,
