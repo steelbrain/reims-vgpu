@@ -125,3 +125,13 @@ fragment float4 rog_fs(VOut in [[stage_in]],
 kernel void tile_k(ushort2 tid [[thread_position_in_threadgroup]])
 {
 }
+
+// oracle_ycbcr: the texel read() reads at the middle of each 32 x 32 quadrant of a 64 x 64
+// texture, top left, top right, bottom left and bottom right, into out[0..3].
+kernel void ycbcr_read(texture2d<float, access::read> t [[texture(0)]],
+                       device float4 *out [[buffer(0)]],
+                       uint i [[thread_position_in_grid]])
+{
+	uint2 at = uint2((i & 1) ? 48 : 16, (i & 2) ? 48 : 16);
+	out[i] = t.read(at);
+}

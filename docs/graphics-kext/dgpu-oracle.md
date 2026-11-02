@@ -9,7 +9,7 @@ stricter than the M3's, guests may rely on it.
 
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
-`oracle_errors` and `oracle_source`.
+`oracle_errors`, `oracle_source` and `oracle_ycbcr`.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -481,6 +481,36 @@ process at each of these with the words of the M3's create, sending the host not
 3)*, rather than sending a create the host refuses (`rgfxEndAtInvalidTextureDescriptor`,
 RgfxTexture.h).
 
+## Q13: two-plane Y'CbCr textures
+
+Probe: `oracle_ycbcr DEVICE`. A 64 x 64 CVPixelBuffer over an IOSurface, of OSType 420v (video
+range) or 420f (full range), its `kIOSurfaceYCbCrMatrix` set to ITU_R_709_2 or ITU_R_601_4, by
+CoreVideo's propagated `kCVImageBufferYCbCrMatrixKey` or on the surface itself, or left unset;
+each quadrant holds one patch of known codes. A texture of `MTLPixelFormat` 500 (YCBCR8_420_2P)
+over plane 0, by `newTextureWithDescriptor:iosurface:plane:`, read by `read()` at each
+quadrant's middle. Each case runs in a child process.
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| the texture | the process ends at the create: "MTLTextureDescriptor has invalid pixelFormat (500)." | the same | made |
+| what it reads | | | the codes converted by the surface's range and matrix, within one level on every channel: BT.709 under ITU_R_709_2, BT.601 under ITU_R_601_4 and with no matrix |
+
+The surface reads back the matrix as set, by either route, on all three. *(class 2: the
+two-plane Y'CbCr formats are the M3's alone; a guest that made one on an x86 Mac would end its
+process.)* Our stack makes them as the M3 does (the host's surface creator converts by the
+surface's facts, `RgfxSurfaceFacts`).
+
+Where the guest meets Y'CbCr on the desktop (boot ycc4, 11-02, with the bundle's texture creates
+traced): the default wallpaper is an aerial, a 3840 x 2160 frame of OSType `x420` (10-bit 4:2:0,
+video range) tagged ITU_R_709_2. No process made a two-plane Y'CbCr texture of it. VideoToolbox's
+decoder service made textures of its planes, R16Unorm (20) over plane 0 and RG16Unorm (60) over
+plane 1, and a RGBA16Float (115) one over an `RGhA` surface it writes; WindowServer made the same
+two plane textures and composites the frame from them. The matrix is a constant of Apple's own
+shaders there, read from the surface's tag, and the frame shows by BT.709 on the lane. On the stock
+lane the same frame shows by BT.601: the lane's desktop is the stock's colours re-encoded by
+BT.601 and decoded by BT.709, within 1.1 levels on average (the guests' captures), with no
+parameter fitted. What an x86 Mac's frameworks make of that tag is not measured.
+
 ## The display's colour against the stock lane: a deliberate divergence
 
 Measured on a Linux host, in boots of 11-02: the stock lane's host shot of the desktop beside
@@ -516,4 +546,6 @@ ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside i
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
   except that a read-write lock does not wait for a buffer that only reads the surface).
 - Page faults: no probe made a GPU address fault, on a Mac whose Intel GPU drives the display.
-- Two-plane (YCbCr) surfaces, and surfaces whose rows miss the host's alignment.
+- Surfaces whose rows miss the host's alignment.
+- What an x86 Mac's CoreAnimation and VideoToolbox convert a Y'CbCr surface by: its tag, or BT.601
+  as the stock lane's desktop shows (Q13).
