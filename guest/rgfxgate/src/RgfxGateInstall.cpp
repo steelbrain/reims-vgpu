@@ -22,6 +22,7 @@
 
 #include "RgfxGate.hpp"
 #include "RgfxGatePayload.h"
+#include "RgfxGatePrefs.hpp"
 
 // MacKernelSDK omits the VNOP_MKDIR prototype; it is an exported BSD KPI.
 extern "C" int VNOP_MKDIR(vnode_t, vnode_t *, struct componentname *,
@@ -264,6 +265,8 @@ static void installEntry(void *, wait_result_t) {
 		doInstall();
 	else
 		SYSLOG("rgfxgate", "/Library/GPUBundles never appeared; no install");
+	if (ready)
+		keepVideoPreference();
 	thread_terminate(current_thread());
 }
 

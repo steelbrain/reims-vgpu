@@ -6,7 +6,7 @@
 # never committed.
 #
 #   make BUNDLE_DIR=<signed reims-graphics.bundle dir>   build/RgfxGate.kext
-#   make test                                            native tests of the matching logic
+#   make test                                            native tests of the matching and preference logic
 #   make clean
 #
 # BUNDLE_DIR is the signed bundle to embed; packaging reads its cdhash with
@@ -33,7 +33,7 @@ CXXFLAGS = $(FLAGS) -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
 	-I$(GEN) -Isrc -isystem $(RES) -isystem $(KSDK)/Headers
 
 OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \
-	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/plugin_start.o
+	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/plugin_start.o
 
 .PHONY: all clean test
 all: $(KEXT)
@@ -52,7 +52,11 @@ $(BUILD)/obj/RgfxGateHooks.o: src/RgfxGateHooks.cpp src/RgfxGate.hpp src/rgfx_ma
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/obj/RgfxGateInstall.o: src/RgfxGateInstall.cpp src/RgfxGate.hpp $(PAYLOAD)
+$(BUILD)/obj/RgfxGateInstall.o: src/RgfxGateInstall.cpp src/RgfxGate.hpp src/RgfxGatePrefs.hpp $(PAYLOAD)
+	@mkdir -p $(BUILD)/obj
+	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/obj/RgfxGatePrefs.o: src/RgfxGatePrefs.cpp src/RgfxGatePrefs.hpp src/rgfx_gva_pref.h
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
@@ -73,6 +77,8 @@ test:
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/match_test.cpp -o $(BUILD)/obj/match_test
 	$(BUILD)/obj/match_test
+	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/gva_pref_test.cpp -o $(BUILD)/obj/gva_pref_test
+	$(BUILD)/obj/gva_pref_test
 
 clean:
 	rm -rf $(BUILD)/obj $(BUILD)/gen $(KEXT)

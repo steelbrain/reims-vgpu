@@ -1,0 +1,140 @@
+// RgfxGate's AppleGVA preference. AppleGVA, the framework behind VideoToolbox's
+// hardware sessions, picks a Mac's vendor video driver from its accelerator,
+// and on a Mac with AMD graphics only where its preferences domain has
+// gvaForceAMDKE true; our accelerator answers as AMD's would, so with the key
+// the sessions reach our bundle's video driver. On every normal boot the
+// install thread checks the domain's file and sets the key where it is not
+// true, keeping the file's other keys (rgfx_gva_pref.h): an absent file is
+// made, an XML plist edited in place; a binary or unreadable one is logged and
+// left. The edited text must parse, as the kernel's XML parser reads it, to a
+// dict with the key true and every other key kept, or nothing is written. The
+// write runs in kernel context, as root, through the ordinary VFS path:
+// /Library/Preferences is no SIP-restricted path.
+#include <Headers/kern_file.hpp>
+#include <Headers/kern_util.hpp>
+
+#include <IOKit/IOLib.h>
+#include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSUnserialize.h>
+#include <sys/fcntl.h>
+#include <sys/vnode.h>
+
+#include "RgfxGatePrefs.hpp"
+#include "rgfx_gva_pref.h"
+
+namespace rgfxgate {
+
+static const char kGvaPrefPath[] = "/Library/Preferences/com.apple.AppleGVA.plist";
+static const char kGvaKey[] = "gvaForceAMDKE";
+// A larger file is no preferences file of AppleGVA's: left as it is.
+static constexpr size_t kMaxPrefBytes = 64 * 1024;
+// Room the edit adds at most: a key and its value.
+static constexpr size_t kEditRoom = 512;
+
+// The dict `bytes` holds as an XML plist, retained; nullptr where it holds
+// none.
+static OSDictionary *parseDict(const char *bytes, size_t len) {
+	char *z = static_cast<char *>(IOMalloc(len + 1));
+	if (z == nullptr)
+		return nullptr;
+	memcpy(z, bytes, len);
+	z[len] = '\0';
+	OSObject *obj = OSUnserializeXML(z, len + 1);
+	IOFree(z, len + 1);
+	OSDictionary *dict = OSDynamicCast(OSDictionary, obj);
+	if (dict == nullptr && obj != nullptr)
+		obj->release();
+	return dict;
+}
+
+// Whether `edited` reads as `before` (nullptr: an absent file) with the key
+// true and nothing else changed in its count of keys.
+static bool editKept(OSDictionary *before, const char *edited, size_t len) {
+	OSDictionary *after = parseDict(edited, len);
+	if (after == nullptr)
+		return false;
+	bool hadKey = before != nullptr && before->getObject(kGvaKey) != nullptr;
+	unsigned int expected = (before ? before->getCount() : 0) + (hadKey ? 0 : 1);
+	bool kept = after->getObject(kGvaKey) == kOSBooleanTrue && after->getCount() == expected;
+	after->release();
+	return kept;
+}
+
+void keepVideoPreference() {
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	if (ctx == nullptr)
+		return;
+	vnode_t vp = nullptr;
+	// Installer/Recovery: do nothing.
+	if (vnode_lookup("/System/Installation", 0, &vp, ctx) == 0) {
+		vnode_put(vp);
+		vfs_context_rele(ctx);
+		return;
+	}
+	int found = vnode_lookup(kGvaPrefPath, 0, &vp, ctx);
+	if (found == 0)
+		vnode_put(vp);
+	vfs_context_rele(ctx);
+	if (found != 0 && found != ENOENT) {
+		SYSLOG("rgfxgate", "AppleGVA preferences: lookup failed (%d); left", found);
+		return;
+	}
+
+	uint8_t *file = nullptr;
+	size_t size = 0;
+	if (found == 0) {
+		file = FileIO::readFileToBuffer(kGvaPrefPath, size);
+		if (file == nullptr || size > kMaxPrefBytes) {
+			SYSLOG("rgfxgate", "AppleGVA preferences unreadable (%zu bytes); left", size);
+			if (file != nullptr)
+				Buffer::deleter(file);
+			return;
+		}
+	}
+	const char *in = reinterpret_cast<const char *>(file);
+	OSDictionary *before = nullptr;
+	size_t cap = size + kEditRoom;
+	char *out = static_cast<char *>(IOMalloc(cap));
+	size_t outLen = 0;
+	RgfxGvaPref verdict = kRgfxGvaPrefUnreadable;
+	if (out != nullptr)
+		verdict = rgfx_gva_pref_edit(in, size, out, cap, &outLen);
+	// An XML file the kernel's parser does not read as a dict is left too.
+	if (verdict == kRgfxGvaPrefWrite && in != nullptr) {
+		before = parseDict(in, size);
+		if (before == nullptr)
+			verdict = kRgfxGvaPrefUnreadable;
+	}
+	switch (verdict) {
+	case kRgfxGvaPrefSet:
+		DBGLOG("rgfxgate", "AppleGVA preferences already set");
+		break;
+	case kRgfxGvaPrefBinary:
+		SYSLOG("rgfxgate", "AppleGVA preferences are a binary plist; left");
+		break;
+	case kRgfxGvaPrefUnreadable:
+		SYSLOG("rgfxgate", "AppleGVA preferences are no XML plist with a dict; left");
+		break;
+	case kRgfxGvaPrefWrite:
+		if (!editKept(before, out, outLen)) {
+			SYSLOG("rgfxgate", "AppleGVA preferences edit does not read back; left");
+			break;
+		}
+		{
+			int err = FileIO::writeBufferToFile(kGvaPrefPath, out, outLen,
+			                                    O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, 0644);
+			SYSLOG("rgfxgate", "AppleGVA preferences %s %s (%d)", found == 0 ? "edit" : "create",
+			       err == 0 ? "written" : "FAILED", err);
+		}
+		break;
+	}
+	if (before != nullptr)
+		before->release();
+	if (out != nullptr)
+		IOFree(out, cap);
+	if (file != nullptr)
+		Buffer::deleter(file);
+}
+
+} // namespace rgfxgate
