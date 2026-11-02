@@ -159,6 +159,24 @@ pub trait Host: Send + Sync + 'static {
         answer.answer(RGFX_STATUS_OK);
     }
 
+    /// The device's feature bits, which `FEATURES_LO` and `FEATURES_HI` read: the
+    /// `RGFX_FEATURE_*` the host carries out. The default is none, for a host with no stage-3
+    /// decoder.
+    fn features(&self) -> u64 {
+        0
+    }
+
+    /// `SURFACE_PAGES`: the guest RAM runs of the IOSurface whose shared block `pages` names,
+    /// read out of the block, before its first `BLOCK_SHARE`. The host maps them as one view for
+    /// the block's `BUFFER_OVER_SURFACE_PAGES` buffers, until the block's `BLOCK_RELEASE`, where
+    /// it carries out [`RGFX_FEATURE_SURFACE_PAGES`], and answers [`RGFX_STATUS_OK`]; else
+    /// [`RGFX_STATUS_REFUSED`], with no view. Called on the control thread, in ring order. The
+    /// default maps nothing.
+    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>) -> u32 {
+        let _ = (pages, runs);
+        RGFX_STATUS_REFUSED
+    }
+
     /// Hands a stage-3 message to the host's decoder: from ring 0, on the control thread, an
     /// object-lifecycle create or destroy; from a command queue's own submission ring, on its
     /// service thread, a `COMMAND_BUFFER` (after the queue's `QUEUE_CREATE`, which the device
@@ -420,6 +438,8 @@ impl Device {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_MAGIC => RGFX_MAGIC,
             RGFX_REG_VERSION => RGFX_VERSION,
+            RGFX_REG_FEATURES_LO => (self.shared.host.features() & 0xffff_ffff) as u32,
+            RGFX_REG_FEATURES_HI => (self.shared.host.features() >> 32) as u32,
             RGFX_REG_STATUS => self.shared.status.load(Ordering::Acquire),
             RGFX_REG_REGION_SIZE_LO => (size & 0xffff_ffff) as u32,
             RGFX_REG_REGION_SIZE_HI => (size >> 32) as u32,
@@ -790,6 +810,44 @@ impl Shared {
         } else {
             self.region.unshare(share.context, share.offset, share.size);
         }
+    }
+
+    /// `SURFACE_PAGES`: its runs read out of its block for the host ([`Host::surface_pages`]),
+    /// whose answer it is, where the block lies in the processes' blocks and its runs, whole, in
+    /// the block; else logged and [`RGFX_STATUS_INVALID_ARGUMENT`], with no view.
+    pub(crate) fn surface_pages(&self, pages: &RgfxSurfacePages) -> u32 {
+        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
+        let block_end = pages.block_offset.checked_add(pages.block_size);
+        let runs_bytes = u64::from(pages.run_count) * size_of::<RgfxPageRun>() as u64;
+        let runs_end = pages.runs_offset.checked_add(runs_bytes);
+        let fits = pages.block_offset >= RGFX_CONTEXT_ALLOCATIONS_OFFSET
+            && block_end.is_some_and(|e| e <= end)
+            && pages.runs_offset >= pages.block_offset
+            && pages.runs_offset.is_multiple_of(8)
+            && runs_end.zip(block_end).is_some_and(|(r, b)| r <= b);
+        let runs = if fits {
+            usize::try_from(runs_bytes)
+                .ok()
+                .and_then(|len| self.region.read(pages.runs_offset, len))
+        } else {
+            None
+        };
+        let Some(bytes) = runs else {
+            log::warn!(
+                target: "reims_graphics",
+                "a SURFACE_PAGES of {} runs at {:#x} for the block of {:#x} bytes at {:#x} lies \
+                 outside it: the block gets no view of its surface's pages",
+                pages.run_count, pages.runs_offset, pages.block_size, pages.block_offset
+            );
+            return RGFX_STATUS_INVALID_ARGUMENT;
+        };
+        let runs = bytes
+            .as_chunks::<{ size_of::<RgfxPageRun>() }>()
+            .0
+            .iter()
+            .filter_map(|run| RgfxPageRun::read_from_bytes(run).ok())
+            .collect();
+        self.host.surface_pages(pages, runs)
     }
 
     /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`

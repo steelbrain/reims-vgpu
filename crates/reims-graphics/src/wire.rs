@@ -50,10 +50,14 @@ pub const RGFX_MSIX_VECTORS: u32 = 1;
 pub const RGFX_REG_MAGIC: u32 = 0x000;
 /// `VERSION`, RO: [`RGFX_VERSION`].
 pub const RGFX_REG_VERSION: u32 = 0x004;
-/// `FEATURES_LO`, RO: feature bits 0 to 31, none of them set yet.
+/// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`].
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
+/// `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
+/// to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
+/// view is a copy of its pages in a block of the region.
+pub const RGFX_FEATURE_SURFACE_PAGES: u32 = 1 << 0;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -321,6 +325,15 @@ pub const RGFX_CMD_SHARED_EVENT_SET_VALUE: u32 = 0x21a;
 /// array's among them, which `TEXTURE_FROM_BUFFER`'s form does not make. Not answered; a texture
 /// the platform refuses, as Metal refuses it, makes nothing.
 pub const RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER: u32 = 0x21b;
+/// Command `BUFFER_OVER_SURFACE_PAGES` ([`RgfxBufferOverSurfacePages`]), where the device has
+/// [`RGFX_FEATURE_SURFACE_PAGES`]: a Shared buffer of `length` bytes over an IOSurface's own guest
+/// pages, from their first byte: those the `SURFACE_PAGES` of the shared block at `block_offset`
+/// named, whose first `block_size` bytes, the part the processes map, the sender's context
+/// holds. The buffer lies over that part as a `BUFFER_OVER_HOST_MEMORY` buffer lies over its
+/// block: a `TEXTURE_FROM_IOSURFACE` over it finds its writers there, and the block's
+/// `BLOCK_RELEASE` is refused while the buffer lives. Not answered; refused, making nothing,
+/// where the block has no view of its pages or `length` passes them.
+pub const RGFX_CMD_BUFFER_OVER_SURFACE_PAGES: u32 = 0x21c;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -366,6 +379,19 @@ pub const RGFX_CMD_BLOCK_SHARE: u32 = 0x2f4;
 /// block's last holder lets it go with a `BLOCK_RELEASE`, which ends every hold of it, and is
 /// refused while an object of any context lies in the block.
 pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
+/// `SURFACE_PAGES` ([`RgfxSurfacePages`]), on ring 0 from the accelerator kext, where the device
+/// has [`RGFX_FEATURE_SURFACE_PAGES`]: the guest RAM an IOSurface's `length` bytes lie in, whose
+/// shared block of `block_size` bytes at `block_offset` the kext made for the GPU to use the
+/// surface's own pages in place: `run_count` [`RgfxPageRun`]s, in the surface's byte order, at
+/// region offset `runs_offset`, inside the block, past the part the processes map. Posted before
+/// the block's first `BLOCK_SHARE`; the kext keeps the pages wired while a process holds the
+/// block. Answered [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`] once the host has mapped the pages
+/// as one view, which `BUFFER_OVER_SURFACE_PAGES` buffers lie over until the block's
+/// `BLOCK_RELEASE`; [`RGFX_STATUS_REFUSED`] where it made none, for a run that is not whole pages
+/// from a page of guest RAM, runs whose lengths do not sum to `length`, or a view the host could
+/// not map, and [`RGFX_STATUS_INVALID_ARGUMENT`] where the runs do not lie in the block. The kext
+/// gives a surface whose pages were refused a block that holds a copy of them instead.
+pub const RGFX_CMD_SURFACE_PAGES: u32 = 0x2f6;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -668,6 +694,9 @@ const _: () = {
     assert!(size_of::<RgfxCommandBufferInRegion>() == 32);
     assert!(size_of::<RgfxBlockRelease>() == 40);
     assert!(size_of::<RgfxBlockGrant>() == 40);
+    assert!(size_of::<RgfxPageRun>() == 16);
+    assert!(size_of::<RgfxSurfacePages>() == 56);
+    assert!(size_of::<RgfxBufferOverSurfacePages>() == 56);
     // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
     // no whole chunk more fits there.
     assert!(RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK < RGFX_RESOURCE_ID_LIMIT);
@@ -831,6 +860,66 @@ pub struct RgfxBlockRelease {
     pub offset: u64,
     /// The block's size in bytes.
     pub size: u64,
+}
+
+/// A run of an IOSurface's guest RAM, which `SURFACE_PAGES` lists: `length` bytes at guest
+/// physical address `address`, both multiples of the guest's 4 KiB page.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPageRun {
+    /// The run's first guest physical address.
+    pub address: u64,
+    /// The run's bytes.
+    pub length: u64,
+}
+
+/// `SURFACE_PAGES`: the guest RAM of the IOSurface whose shared block is the `block_size` bytes
+/// at `block_offset`, made for context `context`: `run_count` [`RgfxPageRun`]s at region offset
+/// `runs_offset`, holding the surface's `length` bytes in order.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfacePages {
+    /// [`RGFX_CMD_SURFACE_PAGES`].
+    pub header: RgfxMsgHeader,
+    /// The context the block was made for, its first holder.
+    pub context: u32,
+    /// How many runs lie at `runs_offset`.
+    pub run_count: u32,
+    /// The shared block's region offset.
+    pub block_offset: u64,
+    /// The shared block's size in bytes, its runs included.
+    pub block_size: u64,
+    /// Where the runs start in the region, inside the block.
+    pub runs_offset: u64,
+    /// The surface's bytes, which the runs hold.
+    pub length: u64,
+}
+
+/// `BUFFER_OVER_SURFACE_PAGES`: a Shared buffer of `length` bytes over the IOSurface pages the
+/// shared block of `block_size` bytes at `block_offset` names.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferOverSurfacePages {
+    /// [`RGFX_CMD_BUFFER_OVER_SURFACE_PAGES`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The shared block's region offset.
+    pub block_offset: u64,
+    /// The shared block's size in bytes, as its holders know it.
+    pub block_size: u64,
+    /// The buffer's length in bytes, from the surface's first byte.
+    pub length: u64,
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_34: u32,
 }
 
 /// `BLOCK_GRANT`: the kext gave context `context` the region block of `size` bytes at `offset`.

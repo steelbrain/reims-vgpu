@@ -1017,6 +1017,16 @@ typedef struct {
   // out of the region into the window's drawables on the GPU, at the screen's rate, where
   // scanout_written says the guest wrote it.
   const RvgWindowConfig *window;
+  // The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, the GPU uses
+  // an IOSurface's own pages in place, through views of them made as a device's memory map
+  // makes its views (RvgDeviceConfig.memory_map); without it each surface's GPU view is a copy
+  // of its pages in the region. The map's pages stay the guest's RAM while the device lives:
+  // a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL.
+  const RvgMemoryMap *memory_map;
+  // With `memory_map`: the files behind its ranges, checked and duplicated as
+  // RvgDeviceConfig.memory_files are, with the same refusals; NULL for none. Files without a
+  // map are refused (RVG_ERR_INVALID_ARGUMENT).
+  const RvgMemoryRangeFile *memory_files;
 } RvgGraphicsDeviceConfig;
 
 // Write the request, which the call rewrote in place, into the element's writable part, with a

@@ -743,7 +743,7 @@ static bool on_graphics_scanout_written(void *ctx, uint64_t offset, uint64_t len
 static void check_graphics(void) {
     RvgGraphicsCallbacks cb = {sizeof cb, &graphics_destroyed, on_graphics_destroy,
                                on_graphics_raise, on_graphics_scanout_written};
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL};
+    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;

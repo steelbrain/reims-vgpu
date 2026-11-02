@@ -25,6 +25,7 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
             scanout_written: None,
         },
         window: None,
+        memory_map: None,
     };
     GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap()
 }
@@ -109,6 +110,7 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
             scanout_written: None,
         },
         window: None,
+        memory_map: None,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -159,6 +161,7 @@ fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
             scanout_written: None,
         },
         window: None,
+        memory_map: None,
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let gpu = platform.metal_device(None).unwrap();
@@ -749,6 +752,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
             scanout_written: None,
         },
         window: None,
+        memory_map: None,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -3251,4 +3255,42 @@ fn a_failed_context_s_queues_and_queries_are_refused() {
     guest.send(&device, layout(obj(4, 9), OTHER_BLOCK));
     let seqno = guest.seqno;
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+}
+
+/// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
+/// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does
+#[test]
+fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
+    use reims_vgpu_core::testkit::GuestRam;
+
+    let platform = Arc::new(FakePlatform::new());
+    let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
+    platform.fake_vm().adopt(&ram);
+    let mut map = crate::MemoryMap::new();
+    for r in ram.ranges() {
+        // SAFETY: the fake RAM stays mapped while the test, which holds it, runs.
+        unsafe {
+            map.push(
+                r.physical_address,
+                r.physical().physical_length,
+                r.host().as_ptr(),
+            );
+        }
+    }
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: Some(map),
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let want = if platform.vm().page_size() == 4096 {
+        RGFX_FEATURE_SURFACE_PAGES
+    } else {
+        0
+    };
+    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_LO.into()), want);
+    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
+
+    let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
+    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_LO.into()), 0);
 }

@@ -654,11 +654,16 @@
 // `VERSION`, RO: [`RGFX_VERSION`].
 #define RGFX_REG_VERSION 4
 
-// `FEATURES_LO`, RO: feature bits 0 to 31, none of them set yet.
+// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`].
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
 #define RGFX_REG_FEATURES_HI 12
+
+// `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
+// to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
+// view is a copy of its pages in a block of the region.
+#define RGFX_FEATURE_SURFACE_PAGES (1 << 0)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -960,6 +965,16 @@
 // the platform refuses, as Metal refuses it, makes nothing.
 #define RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER 539
 
+// Command `BUFFER_OVER_SURFACE_PAGES` ([`RgfxBufferOverSurfacePages`]), where the device has
+// [`RGFX_FEATURE_SURFACE_PAGES`]: a Shared buffer of `length` bytes over an IOSurface's own guest
+// pages, from their first byte: those the `SURFACE_PAGES` of the shared block at `block_offset`
+// named, whose first `block_size` bytes, the part the processes map, the sender's context
+// holds. The buffer lies over that part as a `BUFFER_OVER_HOST_MEMORY` buffer lies over its
+// block: a `TEXTURE_FROM_IOSURFACE` over it finds its writers there, and the block's
+// `BLOCK_RELEASE` is refused while the buffer lives. Not answered; refused, making nothing,
+// where the block has no view of its pages or `length` passes them.
+#define RGFX_CMD_BUFFER_OVER_SURFACE_PAGES 540
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -1009,6 +1024,20 @@
 // block's last holder lets it go with a `BLOCK_RELEASE`, which ends every hold of it, and is
 // refused while an object of any context lies in the block.
 #define RGFX_CMD_BLOCK_UNSHARE 757
+
+// `SURFACE_PAGES` ([`RgfxSurfacePages`]), on ring 0 from the accelerator kext, where the device
+// has [`RGFX_FEATURE_SURFACE_PAGES`]: the guest RAM an IOSurface's `length` bytes lie in, whose
+// shared block of `block_size` bytes at `block_offset` the kext made for the GPU to use the
+// surface's own pages in place: `run_count` [`RgfxPageRun`]s, in the surface's byte order, at
+// region offset `runs_offset`, inside the block, past the part the processes map. Posted before
+// the block's first `BLOCK_SHARE`; the kext keeps the pages wired while a process holds the
+// block. Answered [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`] once the host has mapped the pages
+// as one view, which `BUFFER_OVER_SURFACE_PAGES` buffers lie over until the block's
+// `BLOCK_RELEASE`; [`RGFX_STATUS_REFUSED`] where it made none, for a run that is not whole pages
+// from a page of guest RAM, runs whose lengths do not sum to `length`, or a view the host could
+// not map, and [`RGFX_STATUS_INVALID_ARGUMENT`] where the runs do not lie in the block. The kext
+// gives a surface whose pages were refused a block that holds a copy of them instead.
+#define RGFX_CMD_SURFACE_PAGES 758
 
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -1895,19 +1924,6 @@ typedef struct {
   uint32_t reserved_34;
 } RgfxBufferAtOffset;
 
-// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
-// `obj_id`'s CPU copy, the region block its `BUFFER_OVER_HOST_MEMORY` named.
-typedef struct {
-  // [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`].
-  RgfxMsgHeader header;
-  // The buffer.
-  uint64_t obj_id;
-  // Where the bytes start in the buffer.
-  uint64_t location;
-  // How many.
-  uint64_t length;
-} RgfxBufferDidModifyRange;
-
 // One element of a buffer-binding array ([`RgfxOpSetVertexBuffers`] and the like):
 // a buffer (0 = nil) and its offset.
 typedef struct {
@@ -1934,6 +1950,19 @@ typedef struct {
   uint32_t reserved_2c;
 } RgfxBufferCreate;
 
+// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
+// `obj_id`'s CPU copy, the region block its `BUFFER_OVER_HOST_MEMORY` named.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_DID_MODIFY_RANGE`].
+  RgfxMsgHeader header;
+  // The buffer.
+  uint64_t obj_id;
+  // Where the bytes start in the buffer.
+  uint64_t location;
+  // How many.
+  uint64_t length;
+} RgfxBufferDidModifyRange;
+
 // `BUFFER_OVER_HOST_MEMORY`: a Shared buffer of `length` bytes over the block at
 // `region_offset` in the region, at the guest-picked `gpu_address`. The block is one
 // of the creating process's own, as [`RgfxHeapOverHostMemory`]'s is.
@@ -1953,6 +1982,25 @@ typedef struct {
   // Pads to a multiple of 8; 0.
   uint32_t reserved_34;
 } RgfxBufferOverHostMemory;
+
+// `BUFFER_OVER_SURFACE_PAGES`: a Shared buffer of `length` bytes over the IOSurface pages the
+// shared block of `block_size` bytes at `block_offset` names.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_OVER_SURFACE_PAGES`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The shared block's region offset.
+  uint64_t block_offset;
+  // The shared block's size in bytes, as its holders know it.
+  uint64_t block_size;
+  // The buffer's length in bytes, from the surface's first byte.
+  uint64_t length;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxBufferOverSurfacePages;
 
 // One element of an attribute-stride buffer-binding array
 // ([`RgfxOpSetVertexBuffersAttributeStrides`]): a buffer (0 = nil), its offset and
@@ -2040,6 +2088,20 @@ typedef struct {
   // The bytes of op stream that follow this message.
   uint64_t op_bytes;
 } RgfxCommandBuffer;
+
+// `COMMAND_BUFFER_IN_REGION`: the `COMMAND_BUFFER` message of `byte_length` bytes at region
+// offset `region_offset`. The message there is whole: its header's `type` is
+// `COMMAND_BUFFER` and its `size` is `byte_length`; its `seqno` is this reference's. A span
+// outside the processes' blocks, or a message there that is not such a `COMMAND_BUFFER`, is a
+// guest protocol error, refused as a message the ring may not carry.
+typedef struct {
+  // [`RGFX_CMD_COMMAND_BUFFER_IN_REGION`].
+  RgfxMsgHeader header;
+  // Where the message starts in the device's region: 8-aligned.
+  uint64_t region_offset;
+  // The message's length: a multiple of 8.
+  uint64_t byte_length;
+} RgfxCommandBufferInRegion;
 
 // `COMPLETE`: a command's answer.
 typedef struct {
@@ -2437,6 +2499,16 @@ typedef struct {
   // The texture, or 0 for nil.
   uint64_t texture_obj_id;
 } RgfxComputeTextureBinding;
+
+// `CONTEXT_CLOSE`: context `context`'s process is gone.
+typedef struct {
+  // [`RGFX_CMD_CONTEXT_CLOSE`].
+  RgfxMsgHeader header;
+  // The context.
+  uint32_t context;
+  // Zero.
+  uint32_t reserved_14;
+} RgfxContextClose;
 
 // One face's stencil state, as `MTLStencilDescriptor` gives it.
 typedef struct {
@@ -3786,6 +3858,15 @@ typedef struct {
   uint64_t stages;
 } RgfxOpWaitForFence;
 
+// A run of an IOSurface's guest RAM, which `SURFACE_PAGES` lists: `length` bytes at guest
+// physical address `address`, both multiples of the guest's 4 KiB page.
+typedef struct {
+  // The run's first guest physical address.
+  uint64_t address;
+  // The run's bytes.
+  uint64_t length;
+} RgfxPageRun;
+
 // `PIPELINE_REFLECTION`: a pipeline create's answer, with the pipeline state's
 // own queries (the host platform exposes no per-argument binding reflection, so
 // the argument tables Metal's `MTLRenderPipelineReflection` would carry are not
@@ -3818,6 +3899,25 @@ typedef struct {
   uint32_t flags;
 } RgfxPipelineReflection;
 
+// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
+// display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the
+// scanout again. The host shows the texture the device's decoder made over that surface
+// (`TEXTURE_FROM_IOSURFACE`), and again each time a command buffer completes while it is shown,
+// so the GPU's writes reach the window. Answered [`RGFX_STATUS_INVALID_ARGUMENT`] where the
+// decoder holds no texture over that surface: the display keeps what it showed.
+typedef struct {
+  // [`RGFX_CMD_PRESENT_SURFACE`].
+  RgfxMsgHeader header;
+  // The display's id.
+  uint32_t display;
+  // The IOSurface's global ID; 0 shows the scanout.
+  uint32_t iosurface_id;
+  // The display pipe's transaction ID, for the host's log.
+  uint32_t transaction_id;
+  // Pads the message to a multiple of 8; 0.
+  uint32_t reserved_1c;
+} RgfxPresentSurface;
+
 // `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
 // a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
 // of two) at the given region offset. The completion ring raises `vector`.
@@ -3841,30 +3941,6 @@ typedef struct {
   // The MSI-X vector the completion ring raises.
   uint32_t vector;
 } RgfxQueueCreate;
-
-// `COMMAND_BUFFER_IN_REGION`: the `COMMAND_BUFFER` message of `byte_length` bytes at region
-// offset `region_offset`. The message there is whole: its header's `type` is
-// `COMMAND_BUFFER` and its `size` is `byte_length`; its `seqno` is this reference's. A span
-// outside the processes' blocks, or a message there that is not such a `COMMAND_BUFFER`, is a
-// guest protocol error, refused as a message the ring may not carry.
-typedef struct {
-  // [`RGFX_CMD_COMMAND_BUFFER_IN_REGION`].
-  RgfxMsgHeader header;
-  // Where the message starts in the device's region: 8-aligned.
-  uint64_t region_offset;
-  // The message's length: a multiple of 8.
-  uint64_t byte_length;
-} RgfxCommandBufferInRegion;
-
-// `CONTEXT_CLOSE`: context `context`'s process is gone.
-typedef struct {
-  // [`RGFX_CMD_CONTEXT_CLOSE`].
-  RgfxMsgHeader header;
-  // The context.
-  uint32_t context;
-  // Zero.
-  uint32_t reserved_14;
-} RgfxContextClose;
 
 // One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 // nothing) when `texture_obj_id` is 0.
@@ -4168,6 +4244,18 @@ typedef struct {
   uint32_t flags;
 } RgfxSamplerCreate;
 
+// One element of a sampler-with-LOD-clamps array
+// ([`RgfxOpSetVertexSamplerStatesLodClamps`] and the like): a sampler (0 = nil) and
+// its LOD clamps, which travel as their `f32` bits.
+typedef struct {
+  // The sampler, or 0 for nil.
+  uint64_t sampler_obj_id;
+  // `lodMinClamp` as `f32` bits.
+  uint32_t lod_min_clamp_bits;
+  // `lodMaxClamp` as `f32` bits.
+  uint32_t lod_max_clamp_bits;
+} RgfxSamplerLodBinding;
+
 // `SAMPLER_STATE`: a `SAMPLER_CREATE`'s answer. `status` is [`RGFX_STATUS_OK`] with the sampler's
 // `gpu_resource_id`, or [`RGFX_STATUS_REFUSED`] (the device made none) or
 // [`RGFX_STATUS_INVALID_ARGUMENT`] (the create was short), with 0. The host's device numbers its
@@ -4183,18 +4271,6 @@ typedef struct {
   // `MTLSamplerState.gpuResourceID`: what an argument buffer holds of the sampler.
   uint64_t gpu_resource_id;
 } RgfxSamplerState;
-
-// One element of a sampler-with-LOD-clamps array
-// ([`RgfxOpSetVertexSamplerStatesLodClamps`] and the like): a sampler (0 = nil) and
-// its LOD clamps, which travel as their `f32` bits.
-typedef struct {
-  // The sampler, or 0 for nil.
-  uint64_t sampler_obj_id;
-  // `lodMinClamp` as `f32` bits.
-  uint32_t lod_min_clamp_bits;
-  // `lodMaxClamp` as `f32` bits.
-  uint32_t lod_max_clamp_bits;
-} RgfxSamplerLodBinding;
 
 // One element of a scissor-rect array ([`RgfxOpSetScissorRects`]): an
 // `MTLScissorRect`.
@@ -4249,25 +4325,6 @@ typedef struct {
   uint64_t offset;
 } RgfxSetScanout;
 
-// `PRESENT_SURFACE`: the display shows the IOSurface of global ID `iosurface_id` (plane 0), the
-// display pipe's swap, in place of the scanout, until the next `PRESENT_SURFACE`; 0 shows the
-// scanout again. The host shows the texture the device's decoder made over that surface
-// (`TEXTURE_FROM_IOSURFACE`), and again each time a command buffer completes while it is shown,
-// so the GPU's writes reach the window. Answered [`RGFX_STATUS_INVALID_ARGUMENT`] where the
-// decoder holds no texture over that surface: the display keeps what it showed.
-typedef struct {
-  // [`RGFX_CMD_PRESENT_SURFACE`].
-  RgfxMsgHeader header;
-  // The display's id.
-  uint32_t display;
-  // The IOSurface's global ID; 0 shows the scanout.
-  uint32_t iosurface_id;
-  // The display pipe's transaction ID, for the host's log.
-  uint32_t transaction_id;
-  // Pads the message to a multiple of 8; 0.
-  uint32_t reserved_1c;
-} RgfxPresentSurface;
-
 // `SET_VBLANK`: the device sends `VBLANK` at each refresh of the display's host screen while
 // `enabled` is not 0.
 typedef struct {
@@ -4314,6 +4371,84 @@ typedef struct {
   // `MTLSizeAndAlign.align`.
   uint64_t align;
 } RgfxSizeAndAlign;
+
+// The facts of the surface a `TEXTURE_FROM_IOSURFACE` texture lies over, as
+// the guest's IOSurface API gives them when the texture is made, after the
+// [`RgfxTextureFromIOSurface`] at [`RGFX_SURFACE_FACTS_OFFSET`]: what a texture
+// over a surface reads of the surface besides its plane, as Metal's does (a
+// two-plane YCbCr texture over plane 0 reads plane 1's chroma, converted by
+// the surface's range and matrix). `chroma_offset` and `chroma_bytes_per_row`
+// place plane 1 in the guest's copy of the surface, the message's buffer, as
+// `offset` and `bytes_per_row` place the texture's own plane.
+typedef struct {
+  // `IOSurfaceGetPixelFormat`: the surface's OSType, its four characters
+  // big-endian (`'x420'` is `0x7834_3230`).
+  uint32_t surface_pixel_format;
+  // `IOSurfaceGetPlaneCount`: 0 for a surface without planes.
+  uint32_t plane_count;
+  // `IOSurfaceGetWidth`: the surface's width, its plane 0's.
+  uint32_t width;
+  // `IOSurfaceGetHeight`: the surface's height, its plane 0's.
+  uint32_t height;
+  // Plane 1's first byte in the message's buffer; 0 for a surface of fewer
+  // than two planes.
+  uint64_t chroma_offset;
+  // Bytes from one of plane 1's rows to the next in the message's buffer; 0
+  // for a surface of fewer than two planes.
+  uint64_t chroma_bytes_per_row;
+  // The surface's YCbCr matrix as the texture is made, one of
+  // `RGFX_YCBCR_MATRIX_*`.
+  uint32_t ycbcr_matrix;
+  // Zero.
+  uint32_t reserved_24;
+} RgfxSurfaceFacts;
+
+// `SURFACE_PAGES`: the guest RAM of the IOSurface whose shared block is the `block_size` bytes
+// at `block_offset`, made for context `context`: `run_count` [`RgfxPageRun`]s at region offset
+// `runs_offset`, holding the surface's `length` bytes in order.
+typedef struct {
+  // [`RGFX_CMD_SURFACE_PAGES`].
+  RgfxMsgHeader header;
+  // The context the block was made for, its first holder.
+  uint32_t context;
+  // How many runs lie at `runs_offset`.
+  uint32_t run_count;
+  // The shared block's region offset.
+  uint64_t block_offset;
+  // The shared block's size in bytes, its runs included.
+  uint64_t block_size;
+  // Where the runs start in the region, inside the block.
+  uint64_t runs_offset;
+  // The surface's bytes, which the runs hold.
+  uint64_t length;
+} RgfxSurfacePages;
+
+// One command queue's latest command buffer that writes a surface plane's
+// copy: the queue's id and the buffer's `seqno` on the queue's submission ring.
+// A slot no queue holds has `queue_obj_id` 0.
+typedef struct {
+  // The queue's id; 0 for a free slot.
+  uint64_t queue_obj_id;
+  // The latest `COMMAND_BUFFER` on the queue's ring that writes the copy.
+  uint64_t seqno;
+} RgfxSurfaceWriter;
+
+// The command buffers committed that write a surface plane's copy, one slot
+// per queue, kept by the guest processes that hold the copy, in the copy's
+// block ([`RgfxTextureFromIOSurface::writers_offset`]). Each committing process
+// raises its queue's `seqno` once the buffer is on the queue's ring, before its
+// commit returns, so a present the process (or one it hands the surface to)
+// makes after that finds it; a present of the surface waits for each named
+// buffer's completion before the display reads the copy.
+//
+// The guest writes a slot's `seqno` with 0 before it gives the slot to another
+// queue and the new seqno after, so a reader that reads `queue_obj_id`, then
+// `seqno`, then `queue_obj_id` again, and finds the two ids alike, reads a
+// queue's own seqno (or 0).
+typedef struct {
+  // The slots.
+  RgfxSurfaceWriter writers[RGFX_SURFACE_WRITER_SLOTS];
+} RgfxSurfaceWriters;
 
 // One element of a texture-binding array ([`RgfxOpSetVertexTextures`] and the like):
 // a texture (0 = nil).
@@ -4403,64 +4538,6 @@ typedef struct {
   // [`RGFX_SURFACE_NO_WRITERS`] for none.
   uint64_t writers_offset;
 } RgfxTextureFromIOSurface;
-
-// The facts of the surface a `TEXTURE_FROM_IOSURFACE` texture lies over, as
-// the guest's IOSurface API gives them when the texture is made, after the
-// [`RgfxTextureFromIOSurface`] at [`RGFX_SURFACE_FACTS_OFFSET`]: what a texture
-// over a surface reads of the surface besides its plane, as Metal's does (a
-// two-plane YCbCr texture over plane 0 reads plane 1's chroma, converted by
-// the surface's range and matrix). `chroma_offset` and `chroma_bytes_per_row`
-// place plane 1 in the guest's copy of the surface, the message's buffer, as
-// `offset` and `bytes_per_row` place the texture's own plane.
-typedef struct {
-  // `IOSurfaceGetPixelFormat`: the surface's OSType, its four characters
-  // big-endian (`'x420'` is `0x7834_3230`).
-  uint32_t surface_pixel_format;
-  // `IOSurfaceGetPlaneCount`: 0 for a surface without planes.
-  uint32_t plane_count;
-  // `IOSurfaceGetWidth`: the surface's width, its plane 0's.
-  uint32_t width;
-  // `IOSurfaceGetHeight`: the surface's height, its plane 0's.
-  uint32_t height;
-  // Plane 1's first byte in the message's buffer; 0 for a surface of fewer
-  // than two planes.
-  uint64_t chroma_offset;
-  // Bytes from one of plane 1's rows to the next in the message's buffer; 0
-  // for a surface of fewer than two planes.
-  uint64_t chroma_bytes_per_row;
-  // The surface's YCbCr matrix as the texture is made, one of
-  // `RGFX_YCBCR_MATRIX_*`.
-  uint32_t ycbcr_matrix;
-  // Zero.
-  uint32_t reserved_24;
-} RgfxSurfaceFacts;
-
-// One command queue's latest command buffer that writes a surface plane's
-// copy: the queue's id and the buffer's `seqno` on the queue's submission ring.
-// A slot no queue holds has `queue_obj_id` 0.
-typedef struct {
-  // The queue's id; 0 for a free slot.
-  uint64_t queue_obj_id;
-  // The latest `COMMAND_BUFFER` on the queue's ring that writes the copy.
-  uint64_t seqno;
-} RgfxSurfaceWriter;
-
-// The command buffers committed that write a surface plane's copy, one slot
-// per queue, kept by the guest processes that hold the copy, in the copy's
-// block ([`RgfxTextureFromIOSurface::writers_offset`]). Each committing process
-// raises its queue's `seqno` once the buffer is on the queue's ring, before its
-// commit returns, so a present the process (or one it hands the surface to)
-// makes after that finds it; a present of the surface waits for each named
-// buffer's completion before the display reads the copy.
-//
-// The guest writes a slot's `seqno` with 0 before it gives the slot to another
-// queue and the new seqno after, so a reader that reads `queue_obj_id`, then
-// `seqno`, then `queue_obj_id` again, and finds the two ids alike, reads a
-// queue's own seqno (or 0).
-typedef struct {
-  // The slots.
-  RgfxSurfaceWriter writers[RGFX_SURFACE_WRITER_SLOTS];
-} RgfxSurfaceWriters;
 
 // `TEXTURE_REPLACE_REGION`: the guest wrote the texels of `size` at `origin` of `level` and
 // `slice` of `Managed` texture `obj_id`'s CPU copy, at their places in its layout

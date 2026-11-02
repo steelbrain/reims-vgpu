@@ -64,8 +64,9 @@ pub(crate) fn is_lifecycle(message: &Message) -> bool {
 /// drop its objects, and the host answers it once the context's command buffers have finished; a
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
 /// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
-/// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`). Every other message goes to the host's
-/// decoder.
+/// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`); a `SURFACE_PAGES` hands its block's runs
+/// to the host (`Shared::surface_pages`), answered with whether it mapped them. Every other
+/// message goes to the host's decoder.
 pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     match message.header.r#type {
@@ -104,6 +105,13 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
                 shared.share_block(&share, message.header.r#type == RGFX_CMD_BLOCK_SHARE);
             }
             None
+        }
+        RGFX_CMD_SURFACE_PAGES => {
+            let status = read::<RgfxSurfacePages>(message)
+                .map_or(RGFX_STATUS_INVALID_ARGUMENT, |pages| {
+                    shared.surface_pages(&pages)
+                });
+            Some(complete(seqno, status))
         }
         RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
             // Whatever the answer, the block is no longer its process's to name.

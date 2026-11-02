@@ -35,15 +35,16 @@ use reims_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_SAMPLER_STATE, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease,
-    RgfxCbComplete, RgfxCbScheduled, RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPipelineReflection, RgfxSamplerState,
+    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxEventSignalled, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
     Screen,
 };
+use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
@@ -57,6 +58,7 @@ use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
+use crate::device::{GuestMemoryLease, MemoryMap};
 use crate::display::no_catch;
 use crate::entry;
 use crate::error::Error;
@@ -109,6 +111,12 @@ pub struct GraphicsConfig {
     /// The display's window: its input callbacks and the mode it opens sized for; `None` is no
     /// window. The window keeps its size whatever this says (the module doc).
     pub window: Option<WindowConfig>,
+    /// The guest's RAM, with the files behind it, through which the GPU uses an IOSurface's own
+    /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB);
+    /// `None` keeps each surface's GPU view a copy of its pages in the region. The pages stay the
+    /// guest's RAM while the device lives: a host that discards guest RAM (a balloon, hot-unplug)
+    /// gives none.
+    pub memory_map: Option<MemoryMap>,
 }
 
 /// The mode a display offers before its window has a size, and without a window.
@@ -172,6 +180,19 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
+            // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
+            // made through the map, so it outlives the last of them.
+            if let Some(map) = &config.memory_map {
+                let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map, None));
+                let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
+                    .ok_or(Error::InvalidArgument)?;
+                decoder.set_guest_memory(memory, lease);
+            }
+            let features = if decoder.surface_pages_available() {
+                u64::from(RGFX_FEATURE_SURFACE_PAGES)
+            } else {
+                0
+            };
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),
@@ -184,6 +205,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             });
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
+                features,
                 control: Arc::clone(&control),
             });
             let (window, screen): (Option<WindowLink>, Box<dyn Screen>) = match config.window {
@@ -465,6 +487,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
+        // No buffer lies over the block's surface view any more: it goes with the block.
+        decoder.block_released(release.offset);
         let drain = decoder.drain_context(
             release.context,
             false,
@@ -870,6 +894,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 struct CallbackHost<P: ApiPlatform> {
     /// The host's interrupt and dirty-log callbacks.
     callbacks: GraphicsCallbacks,
+    /// The `RGFX_FEATURE_*` the decoder carries out, fixed at the device's make: the guest reads
+    /// them on a vCPU, which takes no lock of the decoder's.
+    features: u64,
     /// The stage-3 decoder, fed the stage-3 messages of ring 0 and of the queues' rings.
     control: Arc<GraphicsControl<P>>,
 }
@@ -906,6 +933,20 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         self.control.release_block(release, answer);
+    }
+
+    fn features(&self) -> u64 {
+        self.features
+    }
+
+    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>) -> u32 {
+        let control = &self.control;
+        entry::run(|_| {
+            control
+                .decoder
+                .lock()
+                .surface_pages(&control.device, pages, &runs)
+        })
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {

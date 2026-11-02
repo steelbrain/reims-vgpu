@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use reims_vgpu::{GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn};
 
+use crate::device::{RvgMemoryMap, RvgMemoryRangeFile, memory_map};
 use crate::ffi;
 use crate::handle;
 use crate::sized::{self, HostStruct};
@@ -134,10 +135,28 @@ pub struct RvgGraphicsDeviceConfig {
     /// out of the region into the window's drawables on the GPU, at the screen's rate, where
     /// scanout_written says the guest wrote it.
     pub window: *const RvgWindowConfig,
+    /// The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, the GPU uses
+    /// an IOSurface's own pages in place, through views of them made as a device's memory map
+    /// makes its views (RvgDeviceConfig.memory_map); without it each surface's GPU view is a copy
+    /// of its pages in the region. The map's pages stay the guest's RAM while the device lives:
+    /// a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL.
+    pub memory_map: *const RvgMemoryMap,
+    /// With `memory_map`: the files behind its ranges, checked and duplicated as
+    /// RvgDeviceConfig.memory_files are, with the same refusals; NULL for none. Files without a
+    /// map are refused (RVG_ERR_INVALID_ARGUMENT).
+    pub memory_files: *const RvgMemoryRangeFile,
 }
 
 // SAFETY: repr(C), a u32 first; pointers.
-unsafe impl HostStruct for RvgGraphicsDeviceConfig {}
+unsafe impl HostStruct for RvgGraphicsDeviceConfig {
+    /// The first version ends at `window`: a host built against it passes 24, and has no
+    /// `memory_map`.
+    const V1_SIZE: usize = 24;
+}
+
+const _: () = assert!(
+    std::mem::offset_of!(RvgGraphicsDeviceConfig, memory_map) == RvgGraphicsDeviceConfig::V1_SIZE
+);
 
 /// The graphics device.
 pub struct RvgGraphicsDevice {
@@ -230,6 +249,11 @@ unsafe fn create(
     if device.is_null() {
         return refuse(RVG_ERR_INVALID_ARGUMENT);
     }
+    // SAFETY: the config's contract: NULL or a live map, and NULL or its files.
+    let memory_map = match unsafe { memory_map(c.memory_map, c.memory_files) } {
+        Ok(m) => m,
+        Err(s) => return refuse(s),
+    };
     let raise_interrupt = callbacks.raise_interrupt.map(|f| {
         let t = table.clone();
         let raise: GraphicsRaiseFn = Arc::new(move |vector| {
@@ -255,6 +279,7 @@ unsafe fn create(
             (Some((w, wc)), Some(t)) => Some(w.to_config(window_callbacks(t, wc))),
             _ => None,
         },
+        memory_map,
     };
     match GraphicsDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
         Ok(d) => {

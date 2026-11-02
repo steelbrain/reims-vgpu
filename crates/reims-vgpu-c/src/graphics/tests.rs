@@ -26,6 +26,8 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         struct_size: size_of::<RvgGraphicsDeviceConfig>() as u32,
         callbacks,
         window: std::ptr::null(),
+        memory_map: std::ptr::null(),
+        memory_files: std::ptr::null(),
     }
 }
 
@@ -123,6 +125,41 @@ fn refused_graphics_configs() {
             before + 1,
             "no destroy for a size"
         );
+        // Files without a map are refused, after the tables are the library's.
+        let file = RvgMemoryRangeFile {
+            fd: -1,
+            flags: 0,
+            offset: 0,
+        };
+        let mut c = config(&cb);
+        c.memory_files = &file;
+        assert_eq!(
+            rvg_graphics_device_create(&c, &mut device),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            DESTROYS.load(Ordering::SeqCst),
+            before + 2,
+            "a refusal's destroy"
+        );
     }
     assert!(device.is_null());
+}
+
+/// A host built against the first version passes a config that ends at `window`: it makes a
+/// device with no memory map
+#[test]
+fn a_first_version_graphics_config_makes_a_device() {
+    let cb = callbacks();
+    let mut c = config(&cb);
+    c.struct_size = RvgGraphicsDeviceConfig::V1_SIZE as u32;
+    // Past the first version's size, as a host built against it leaves its memory.
+    c.memory_files = std::ptr::dangling();
+    let mut device = std::ptr::null_mut();
+    // SAFETY: a live config and out-pointer; the device is released.
+    unsafe {
+        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        assert!(!device.is_null());
+        rvg_graphics_device_release(device);
+    }
 }

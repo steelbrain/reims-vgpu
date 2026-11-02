@@ -41,10 +41,10 @@ use std::sync::Arc;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
-    RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
-    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
-    RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_LIBRARY_CREATE,
-    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
     RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE,
@@ -68,13 +68,15 @@ use reims_graphics::wire::{
     RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
     RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
     RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate,
-    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts,
-    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
-    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
+    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
+    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
+    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
+    RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
+use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::SharedEvent;
 use reims_vgpu_core::platform::resource::{
@@ -103,6 +105,7 @@ mod compute;
 mod library;
 mod managed;
 mod render;
+mod surface_pages;
 mod view;
 mod waits;
 
@@ -232,6 +235,9 @@ pub enum DecodeError {
     ContextFailed,
 }
 
+/// How many `SURFACE_PAGES` pass between the logs of what the surface views did.
+const VIEWS_LOGGED_EVERY: u64 = 256;
+
 /// The stage-3 decoder for one device: the `obj_id` → handle table and the
 /// dispatch from a wire message to a `Platform` call.
 pub struct GraphicsDecoder<P: Platform> {
@@ -294,6 +300,8 @@ pub struct GraphicsDecoder<P: Platform> {
     managed: HashMap<u64, ManagedCopy<P>>,
     /// Whether a `Managed` resource is one copy, over its block ([`Self::set_unified_memory`]).
     unified_memory: bool,
+    /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
+    surface_views: surface_pages::SurfaceViews<P>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -325,8 +333,78 @@ impl<P: Platform> GraphicsDecoder<P> {
             failed: Arc::default(),
             managed: HashMap::new(),
             unified_memory: false,
+            surface_views: surface_pages::SurfaceViews::new(None),
             region,
         }
+    }
+
+    /// The guest's RAM, through which an IOSurface's own pages are mapped for its GPU view
+    /// ([`surface_pages`]): with it, and a host page of the guest's size, the device carries out
+    /// `SURFACE_PAGES` ([`Self::surface_pages_available`]).
+    /// `lease` is the platform's hold on the guest's RAM, which each view keeps.
+    pub(crate) fn set_guest_memory(
+        &mut self,
+        memory: Arc<MemoryMap<P>>,
+        lease: Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        self.surface_views = surface_pages::SurfaceViews::new(Some((memory, lease)));
+    }
+
+    /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
+    pub(crate) fn surface_pages_available(&self) -> bool {
+        self.surface_views.available(&self.platform)
+    }
+
+    /// `SURFACE_PAGES`: the view of `runs` for the block `pages` names, which its
+    /// `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on `device` that holds
+    /// its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with none, logged as a guest
+    /// error. A summary of what the views did is logged every [`VIEWS_LOGGED_EVERY`].
+    pub(crate) fn surface_pages(
+        &mut self,
+        device: &P::Device,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+    ) -> u32 {
+        let made = self
+            .surface_views
+            .surface_pages(&self.platform, device, pages, runs);
+        let status = match made {
+            Ok(Ok(())) => RGFX_STATUS_OK,
+            Ok(Err(why)) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block of {:#x} bytes at {:#x}: no view of its {:#x} bytes in \
+                     {} runs ({why:?}); the surface takes a copy block",
+                    pages.block_size, pages.block_offset, pages.length, runs.len()
+                );
+                RGFX_STATUS_REFUSED
+            }
+            Err(raise) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block of {:#x} bytes at {:#x}: the platform raised at the \
+                     buffer over its view ({raise:?}); the surface takes a copy block",
+                    pages.block_size, pages.block_offset
+                );
+                RGFX_STATUS_REFUSED
+            }
+        };
+        let c = self.surface_views.counts();
+        if (c.made + c.reused + c.bad_runs + c.not_mapped).is_multiple_of(VIEWS_LOGGED_EVERY) {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "IOSurface pages in place: {} views made, {} taken from the cache; refused: {} \
+                 for bad runs, {} not mapped",
+                c.made, c.reused, c.bad_runs, c.not_mapped
+            );
+        }
+        status
+    }
+
+    /// The block at `offset` was released: its surface view, if any, goes once the buffers over
+    /// it have.
+    pub(crate) fn block_released(&mut self, offset: u64) {
+        self.surface_views.released(offset);
     }
 
     /// Sets the sink the decoder hands each command buffer's completion record to
@@ -850,6 +928,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
+            RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => self.buffer_over_surface_pages(device, message),
             RGFX_CMD_BUFFER_DID_MODIFY_RANGE => self.did_modify_range(message),
             RGFX_CMD_MANAGED_TEXTURE_CREATE => self.managed_texture(device, message),
             RGFX_CMD_TEXTURE_REPLACE_REGION => self.replace_region(message),

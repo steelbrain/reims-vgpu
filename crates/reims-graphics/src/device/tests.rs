@@ -1372,3 +1372,78 @@ fn control_completion_posts_from_several_threads_land_whole() {
     }
     assert_eq!(next, [EACH; THREADS as usize]);
 }
+
+/// The device's feature bits are its host's; a `SURFACE_PAGES` hands the host the runs it lists
+/// in its block, read out of the region, and is answered with the host's answer; one whose runs
+/// lie past the block, or a block outside the processes' blocks, hands nothing and is refused
+#[test]
+fn surface_pages_hand_the_host_their_runs() {
+    type Seen = Arc<Mutex<Vec<(RgfxSurfacePages, Vec<RgfxPageRun>)>>>;
+    struct Pages(Seen);
+    impl Host for Pages {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+            false
+        }
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_SURFACE_PAGES) | (1 << 40)
+        }
+        fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>) -> u32 {
+            self.0.lock().push((*pages, runs));
+            RGFX_STATUS_OK
+        }
+    }
+    let seen: Seen = Arc::default();
+    let mut rig = Rig::with_host(Box::new(Pages(Arc::clone(&seen))));
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_FEATURES_LO.into()),
+        RGFX_FEATURE_SURFACE_PAGES
+    );
+    assert_eq!(rig.device.mmio_read(RGFX_REG_FEATURES_HI.into()), 1 << 8);
+    rig.start();
+
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4000;
+    let runs = [
+        RgfxPageRun {
+            address: 0x9000,
+            length: 0x1000,
+        },
+        RgfxPageRun {
+            address: 0x3000,
+            length: 0x2000,
+        },
+    ];
+    rig.region().write(BLOCK + 0x1000, runs.as_bytes());
+    let pages = |block_offset: u64, runs_offset: u64, run_count: u32| RgfxSurfacePages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_PAGES,
+            ..Default::default()
+        },
+        context: 3,
+        run_count,
+        block_offset,
+        block_size: 0x2000,
+        runs_offset,
+        length: 0x3000,
+    };
+    let seqno = rig.send(pages(BLOCK, BLOCK + 0x1000, 2).as_bytes().to_vec());
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    // Runs past the block, and a block outside the processes' blocks: refused, nothing handed.
+    let seqno = rig.send(pages(BLOCK, BLOCK + 0x1ff0, 2).as_bytes().to_vec());
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    let seqno = rig.send(
+        pages(RGFX_ALLOCATIONS_OFFSET, RGFX_ALLOCATIONS_OFFSET, 0)
+            .as_bytes()
+            .to_vec(),
+    );
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    let seen = seen.lock();
+    assert_eq!(
+        seen.len(),
+        1,
+        "only the SURFACE_PAGES whose runs lie in its block"
+    );
+    assert_eq!(seen[0].0.block_offset, BLOCK);
+    assert_eq!(seen[0].0.context, 3);
+    assert_eq!(seen[0].1, runs);
+}
