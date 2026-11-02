@@ -79,6 +79,11 @@ pub fn run_completed(
 /// handler [`CompletedInfo::refused`], and a death in the handler ends only the handler.
 pub type CompletedHandler = Box<dyn FnOnce(CompletedInfo) + Send>;
 
+/// A scheduled handler (`addScheduledHandler:`'s block): runs once, on a platform thread, once
+/// the command buffer is scheduled (every wait of it satisfied and its work submitted), before
+/// its completed handlers.
+pub type ScheduledHandler = Box<dyn FnOnce() + Send>;
+
 /// `id<MTLCommandQueue>`: the device's `reims-vgpu.blit-up`, `reims-vgpu.blit-down` and
 /// `reims-vgpu.exec`, and the service's queues.
 /// Core never nil-checks one.
@@ -99,6 +104,11 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// (6.2).
     /// Reached both under a handler and with none: `on` says which this call is.
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()>;
+    /// sel: addScheduledHandler:
+    /// The handler runs on a platform thread once the buffer is scheduled, before its
+    /// completed handlers. Reached both under a handler and with none: `on` says which this
+    /// call is.
+    fn add_scheduled_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()>;
     /// sel: blitCommandEncoder — May return nil, which core never
     /// checks (the blit decoder's init); later sends to it are no-ops (`nil_send!`).
     ///

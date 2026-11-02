@@ -8,7 +8,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo};
+use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo, ScheduledHandler};
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
 use reims_vgpu_core::platform::values::ComputePassDesc;
@@ -82,6 +82,24 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
         // SAFETY: a live block; Metal copies it.
         msg::send("addCompletedHandler:", Policy::On(on), || unsafe {
             self.addCompletedHandler(handler)
+        })
+    }
+    /// The block runs `block` once when Metal calls it, on Metal's thread, as the buffer is
+    /// scheduled; `block` is dropped there, when it returns.
+    fn add_scheduled_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        let once = Mutex::new(Some(block));
+        let handler = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // A foreign callout: marked ours, so a panic here aborts before it unwinds into Metal.
+            let _env = reims_vgpu_core::rt::BlockEnv::foreign();
+            // Metal calls a scheduled handler once; a second call would find nothing to run.
+            if let Some(block) = once.lock().take() {
+                block();
+            }
+        });
+        let handler = RcBlock::as_ptr(&handler);
+        // SAFETY: a live block; Metal copies it.
+        msg::send("addScheduledHandler:", Policy::On(on), || unsafe {
+            self.addScheduledHandler(handler)
         })
     }
     /// `blitCommandEncoder`: a `+0` encoder, retained.

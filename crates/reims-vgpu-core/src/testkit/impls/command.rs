@@ -53,6 +53,20 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         Ok(())
     }
 
+    /// Run at commit, on the committing thread, before the buffer can complete
+    /// ([`commit_obj`](super::super::objects::commit_obj)).
+    fn add_scheduled_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addScheduledHandler:",
+            vec![Arg::Block(true)],
+        )?;
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.scheduled.push(block);
+        }
+        Ok(())
+    }
+
     fn blit_encoder(
         &self,
         on: OnFault,

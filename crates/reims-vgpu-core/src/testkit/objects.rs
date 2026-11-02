@@ -47,7 +47,7 @@ use super::script::{Script, Step};
 use super::vm::FakeVm;
 use crate::host::HostPtr;
 use crate::num;
-use crate::platform::command::{CompletedHandler, CompletedInfo};
+use crate::platform::command::{CompletedHandler, CompletedInfo, ScheduledHandler};
 use crate::platform::device::NoCopyDeallocator;
 use crate::platform::os::{Clock, Deadline};
 use crate::platform::types::{
@@ -354,6 +354,8 @@ pub struct CommandBufferModel {
     pub error: Option<NsErrorText>,
     /// The completed handlers, in the order added.
     pub handlers: Vec<CompletedHandler>,
+    /// The scheduled handlers, in the order added: run at commit, on the committing thread.
+    pub scheduled: Vec<ScheduledHandler>,
     /// `encodeSignalEvent:value:`s, applied at completion.
     pub signal_on_complete: Vec<(AnyHandle, u64)>,
     /// `encodeSignalEventScheduled:value:`s, applied at commit.
@@ -370,6 +372,7 @@ impl std::fmt::Debug for CommandBufferModel {
             .field("status", &self.status)
             .field("error", &self.error)
             .field("handlers", &self.handlers.len())
+            .field("scheduled", &self.scheduled.len())
             .finish_non_exhaustive()
     }
 }
@@ -1331,16 +1334,22 @@ pub fn complete_obj(
 /// `commit`'s model: Scheduled at once, the scheduled signals applied, the buffer listed for
 /// completion (or completed at once under auto-complete).
 pub fn commit_obj(cb: &Arc<FakeObj>) {
-    let signals = {
+    let (signals, scheduled) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {
             return;
         };
         m.status = CommandBufferStatus::SCHEDULED;
-        std::mem::take(&mut m.signal_on_schedule)
+        (
+            std::mem::take(&mut m.signal_on_schedule),
+            std::mem::take(&mut m.scheduled),
+        )
     };
     for (ev, v) in &signals {
         signal_event(ev.obj(), *v);
+    }
+    for h in scheduled {
+        h();
     }
     cb.cv.notify_all();
     cb.world.note_committed(cb);

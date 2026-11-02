@@ -197,7 +197,7 @@ use metal2vulkan::metal::DispatchType;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle;
 use reims_vgpu_core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, run_completed,
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler, run_completed,
 };
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
@@ -1255,6 +1255,21 @@ fn completed_handler(
     })
 }
 
+/// The runtime's scheduled handler running `block` once, on the runtime's handler thread, as
+/// the command buffer becomes `Scheduled`.
+fn scheduled_handler(block: ScheduledHandler) -> rt::Handler {
+    #[cfg(test)]
+    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    Box::new(move |_cb: &rt::CommandBuffer| {
+        // A callout on the runtime's thread: marked ours, so a panic here aborts.
+        let _env = BlockEnv::foreign();
+        #[cfg(test)]
+        reims_vgpu_core::testkit::capture::with_slot(slot, block);
+        #[cfg(not(test))]
+        block();
+    })
+}
+
 /// The runtime's form of an event core passes; a nil one dies at `sel`.
 fn event<'a>(sel: &'static str, event: Option<EventRef<'a, VulkanPlatform>>) -> rt::EventRef<'a> {
     match event {
@@ -1274,6 +1289,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         });
         send("addCompletedHandler:", Policy::Dies, || {
             self.raw.add_completed_handler(handler)
+        })
+    }
+
+    /// Refused once the buffer is committed, as Metal's validation refuses it. The runtime runs
+    /// it once every wait of the buffer is satisfied and its last batch is submitted, before its
+    /// completed handlers.
+    fn add_scheduled_handler(&self, _on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        let handler = scheduled_handler(block);
+        send("addScheduledHandler:", Policy::Dies, || {
+            self.raw.add_scheduled_handler(handler)
         })
     }
 
