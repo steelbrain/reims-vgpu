@@ -1465,19 +1465,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 plane
             }
         );
-        // A format of `no_texture` is nil, once Metal's validation passes, before the plane and
-        // the surface are looked at: the runtime's heap size query validates its descriptor as
-        // the runtime's creators do (over a surface's plane too), and answers 0 bytes for it.
-        if fields.no_texture_format.is_some()
-            && let Some(pf) = fields.formatless()
-        {
-            let desc = crate::gpu::no_texture::descriptor(sel, &fields, pf);
-            send(sel, Policy::Dies, || {
-                self.raw.heap_texture_size_and_align(&desc)
-            })?;
+        let Some(mut desc) = surface_plane_descriptor(&self.raw, sel, &fields)? else {
             return Ok(None);
-        }
-        let mut desc = fields.descriptor(sel, Maker::Surface);
+        };
         let usage = match crate::os::gpu_read_only(surface) {
             true => crate::gpu::resource::read_only_usage(&mut desc),
             false => 0,
@@ -1492,12 +1482,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let Some(mut at) = crate::os::plane(surface, plane) else {
             return Ok(None);
         };
-        let facts = if crate::gpu::ycbcr::runtime_makes(desc.pixel_format) {
-            crate::os::ycbcr_facts(surface, plane)
-        } else if two_plane_xr10(desc.pixel_format) {
-            crate::os::plane_facts(surface, plane)
-        } else {
-            None
+        let facts = match plane_facts_taken(desc.pixel_format) {
+            Some(PlaneFacts::YCbCr) => crate::os::ycbcr_facts(surface, plane),
+            Some(PlaneFacts::Planes) => crate::os::plane_facts(surface, plane),
+            None => None,
         };
         if let Some(facts) = facts {
             at = at.with_ycbcr(facts);
@@ -1515,12 +1503,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let Some(buffer) = self.buffer_over_surface(sel, &surface, token)? else {
             return Ok(None);
         };
-        let format = fields.raw_pixel_format();
-        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            (buffer.new_texture_with_iosurface_plane(&desc, plane))
-                .map_err(|e| format_refused(sel, "a texture of", format, e))
-        })?
-        else {
+        let Some(raw) = texture_over_plane(sel, &fields, &buffer, &desc, plane)? else {
             return Ok(None);
         };
         let gpu_read_only = crate::gpu::resource::writes_never_reach(Some(&surface), None);
@@ -2004,6 +1987,72 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             |made| timing::answer(made, |s| timing::state(s.unique_identifier)),
         )
     }
+}
+
+/// The runtime's descriptor of a texture of `fields` over a surface's plane, made by `sel` on
+/// `device`: Metal's `newTextureWithDescriptor:iosurface:plane:` over the surface, or over a
+/// buffer that stands for it ([`crate::gpu::resource`]'s `new_texture_over_surface_plane`).
+/// `None` for a format of [`crate::gpu::no_texture`], nil once Metal's validation passes, before
+/// the plane and the surface are looked at: the runtime's heap size query validates its
+/// descriptor as the runtime's creators do (over a surface's plane too), and answers 0 bytes for
+/// it. Any other format, the two-plane ones among them, is the runtime's to make
+/// ([`Maker::Surface`]).
+pub(crate) fn surface_plane_descriptor(
+    device: &rt::Device,
+    sel: &'static str,
+    fields: &TextureFields,
+) -> RaiseResult<Option<rt::TextureDescriptor>> {
+    if fields.no_texture_format.is_some()
+        && let Some(pf) = fields.formatless()
+    {
+        let desc = crate::gpu::no_texture::descriptor(sel, fields, pf);
+        send(sel, Policy::Dies, || {
+            device.heap_texture_size_and_align(&desc)
+        })?;
+        return Ok(None);
+    }
+    Ok(Some(fields.descriptor(sel, Maker::Surface)))
+}
+
+/// What a texture over a surface's plane reads of the surface besides the plane
+/// ([`plane_facts_taken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaneFacts {
+    /// The surface's YCbCr facts: its OSType, its size, its plane 1, and its YCbCr matrix.
+    YCbCr,
+    /// Its OSType, its size and its plane 1 alone.
+    Planes,
+}
+
+/// The facts of its surface a texture of `pf` over a plane of it takes: the YCbCr facts for a
+/// two-plane YCbCr format the runtime reads ([`crate::gpu::ycbcr::runtime_makes`]), the planes'
+/// for a two-plane XR10 format ([`two_plane_xr10`]), which Metal reads alike ('b3a8'), and none
+/// for any other.
+pub(crate) fn plane_facts_taken(pf: metal2vulkan::metal::PixelFormat) -> Option<PlaneFacts> {
+    if crate::gpu::ycbcr::runtime_makes(pf) {
+        Some(PlaneFacts::YCbCr)
+    } else if two_plane_xr10(pf) {
+        Some(PlaneFacts::Planes)
+    } else {
+        None
+    }
+}
+
+/// The runtime's texture of `desc` (of `fields`) over `plane` of `buffer`, which stands for the
+/// surface (`Buffer::new_texture_with_iosurface_plane`), made by `sel`: what the runtime refuses
+/// dies here, naming the refusal, and its nil is nil.
+pub(crate) fn texture_over_plane(
+    sel: &'static str,
+    fields: &TextureFields,
+    buffer: &rt::Buffer,
+    desc: &rt::TextureDescriptor,
+    plane: rt::IoSurfacePlane,
+) -> RaiseResult<Option<rt::Texture>> {
+    let format = fields.raw_pixel_format();
+    create(sel, Policy::Dies, Nil::Never, || {
+        (buffer.new_texture_with_iosurface_plane(desc, plane))
+            .map_err(|e| format_refused(sel, "a texture of", format, e))
+    })
 }
 
 /// Whether `pf` is a two-plane XR10 format: `RGB10A8_2P_XR10` (550) or its sRGB twin (551),

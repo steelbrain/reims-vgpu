@@ -25,7 +25,7 @@ use reims_vgpu_core::platform::resource::{
     SamplerState, Texture,
 };
 use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
-use reims_vgpu_core::platform::values::SurfacePlane;
+use reims_vgpu_core::platform::values::{SurfaceMatrix, SurfacePlane};
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
@@ -172,6 +172,20 @@ fn texel_bytes(
     };
     let span = (pitch.saturating_mul(slices - 1)).saturating_add(image);
     start.min(length)..offset.saturating_add(span).min(length)
+}
+
+/// The runtime's matrix of a surface's `kIOSurfaceYCbCrMatrix` value, as
+/// `rt::SurfaceYCbCrMatrix::from_attachment` reads the value's string.
+fn ycbcr_matrix(matrix: SurfaceMatrix) -> rt::SurfaceYCbCrMatrix {
+    match matrix {
+        SurfaceMatrix::Itu601 => rt::SurfaceYCbCrMatrix::Itu601,
+        SurfaceMatrix::Itu709 => rt::SurfaceYCbCrMatrix::Itu709,
+        SurfaceMatrix::Itu2020 => rt::SurfaceYCbCrMatrix::Itu2020,
+        SurfaceMatrix::Smpte240M1995 => rt::SurfaceYCbCrMatrix::Smpte240M,
+        SurfaceMatrix::DciP3 => rt::SurfaceYCbCrMatrix::DciP3,
+        SurfaceMatrix::P3D65 => rt::SurfaceYCbCrMatrix::P3D65,
+        SurfaceMatrix::Other => rt::SurfaceYCbCrMatrix::Other,
+    }
 }
 
 impl BufferObject {
@@ -1079,15 +1093,79 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         Ok(Some(self.device.texture_in(raw, under, answered)))
     }
 
-    /// The buffer's own creator's texture ([`Buffer::new_texture`]) at the plane's offset and
-    /// rows, the facts unread.
+    /// A texture of the buffer's bytes as Metal's IOSurface creator makes one over the plane of
+    /// a surface the buffer stands for (`Buffer::new_texture_with_iosurface_plane`), at the
+    /// plane's offset with rows its bytes per row apart: of the descriptor's options, a sampler
+    /// ID of the device taken, as Metal's device takes one, and as the device's
+    /// `new_texture_on_surface` makes one over an `IOSurfaceRef`, minus its reads of the surface,
+    /// which the facts give ([`crate::gpu::device::surface_plane_descriptor`],
+    /// [`crate::gpu::device::texture_over_plane`]). A two-plane YCbCr format the runtime reads
+    /// and a two-plane XR10 one read the facts of a surface of two planes or more
+    /// ([`crate::gpu::device::plane_facts_taken`]): its OSType, which says its range, its size,
+    /// its plane 1 at the facts' offset in the buffer with their rows, and its YCbCr matrix,
+    /// which the XR10 formats do not read; what the runtime refuses of them dies here, naming the
+    /// refusal. A plane past 0 of a surface without planes dies, where Metal asserts, and a plane
+    /// past a planar surface's last is nil, as Metal's. Without facts the buffer stands for no
+    /// surface: the texture is the buffer's own creator's ([`Buffer::new_texture`]), which is
+    /// nil for a two-plane format. The texture may change the bytes of its plane and, of a
+    /// two-plane format over plane 0, of plane 1.
     fn new_texture_over_surface_plane(
         &self,
         on: OnFault,
         descriptor: &VulkanTextureDescriptor,
         plane: SurfacePlane,
     ) -> RaiseResult<Option<VulkanTexture>> {
-        self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row)
+        use crate::gpu::device::{PlaneFacts, plane_facts_taken};
+        let Some(facts) = plane.facts else {
+            return self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row);
+        };
+        let sel = "newTextureWithDescriptor:iosurface:plane:";
+        let fields = descriptor.fields();
+        let device = &self.device.raw;
+        let Some(mut desc) = crate::gpu::device::surface_plane_descriptor(device, sel, &fields)?
+        else {
+            return Ok(None);
+        };
+        let usage = match self.gpu_read_only() {
+            true => read_only_usage(&mut desc),
+            false => 0,
+        };
+        // As over an `IOSurfaceRef` (`textures_over_planes_a_surface_lacks_are_metals`).
+        if plane.plane != 0 && facts.plane_count == 0 {
+            let what = format!("plane {} of a surface without planes", plane.plane);
+            metal_aborts(sel, &what);
+        }
+        if facts.plane_count != 0 && plane.plane >= facts.plane_count {
+            return Ok(None);
+        }
+        let taken = plane_facts_taken(desc.pixel_format).filter(|_| facts.plane_count >= 2);
+        let ycbcr = taken.map(|kind| {
+            let size = [facts.width, facts.height];
+            let (chroma, rows) = (facts.chroma_offset, facts.chroma_bytes_per_row);
+            let read = rt::IoSurfaceYCbCr::new(facts.pixel_format, plane.plane, size, chroma, rows);
+            match (kind, facts.ycbcr_matrix) {
+                (PlaneFacts::YCbCr, Some(matrix)) => read.with_matrix(ycbcr_matrix(matrix)),
+                _ => read,
+            }
+        });
+        let at = rt::IoSurfacePlane::new(plane.offset, plane.bytes_per_row, plane.planar);
+        let at = match ycbcr {
+            Some(ycbcr) => at.with_ycbcr(ycbcr),
+            None => at,
+        };
+        let raw = crate::gpu::device::texture_over_plane(sel, &fields, &self.raw, &desc, at)?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let length = plain(|| self.raw.length());
+        let mut bytes = texel_bytes(&desc, (plane.offset, plane.bytes_per_row), length);
+        if ycbcr.is_some() && plane.plane == 0 {
+            let rows = facts.chroma_bytes_per_row.saturating_mul(facts.height);
+            let end = facts.chroma_offset.saturating_add(rows).min(length);
+            bytes = bytes.start.min(facts.chroma_offset.min(length))..bytes.end.max(end);
+        }
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, usage)))
     }
 
     /// A detached no-copy buffer over an alias of the ranges, which total its length, from now

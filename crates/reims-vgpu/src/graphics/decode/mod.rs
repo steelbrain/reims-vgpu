@@ -5224,6 +5224,698 @@ mod tests {
         );
     }
 
+    /// The Vulkan crate's metallib of the readers of a texture (its `ycbcr_probe.metal`), which a
+    /// host without Metal takes as a Mac does.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const PROBE_LIBRARY: &[u8] =
+        include_bytes!("../../../../reims-vgpu-vulkan/metallibs/ycbcr_probe.metallib");
+
+    /// What `kernel` of [`PROBE_LIBRARY`] reads of `texture` on `P`'s `device`, into floats: a
+    /// texel for each of a grid of `grid`, with the sampler `sampler` and the probe bytes `probe`
+    /// where given.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn kernel_reads<P: Platform>(
+        device: &P::Device,
+        kernel: &str,
+        texture: &P::Texture,
+        grid: (u64, u64),
+        (sampler, probe): (Option<&P::SamplerState>, Option<&[u8]>),
+    ) -> Vec<[f32; 4]> {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let library = device.new_library(PROBE_LIBRARY).unwrap().unwrap().unwrap();
+        let f = library.new_function(OnFault::Die, kernel).unwrap().unwrap();
+        let state = device
+            .new_compute_pipeline_state_for_function(Some(&f))
+            .unwrap()
+            .unwrap();
+        let shared = |length: u64| {
+            device
+                .new_buffer_of_length(OnFault::Die, length, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let length = grid.0 * grid.1 * 16;
+        let out = shared(length);
+        let probe = probe.map(|bytes| {
+            let b = shared(bytes.len() as u64);
+            // SAFETY: a Shared buffer of `bytes.len()` bytes, which no command uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    b.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                )
+            };
+            b
+        });
+        let queue = device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
+        let buffers = [Some(&out), probe.as_ref()];
+        let bound = if probe.is_some() { 2 } else { 1 };
+        let samplers = [sampler];
+        let mut cmds = vec![
+            ComputeCmd::SetComputePipelineState {
+                state: Some(&state),
+            },
+            ComputeCmd::SetTexture {
+                texture: Some(texture),
+                index: 0,
+            },
+            ComputeCmd::SetBuffers {
+                buffers: &buffers[..bound],
+                offsets: &[0, 0][..bound],
+                range: NsRange::new(0, bound as u64),
+            },
+        ];
+        if sampler.is_some() {
+            cmds.push(ComputeCmd::SetSamplerStates {
+                samplers: &samplers,
+                range: NsRange::new(0, 1),
+            });
+        }
+        cmds.push(ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(grid.0, grid.1, 1),
+            threads_per_threadgroup: MtlSize::new(8, 8, 1),
+        });
+        cmds.push(ComputeCmd::EndEncoding);
+        for cmd in cmds {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        // SAFETY: a Shared buffer's bytes, read after the command buffer completed.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length as usize) };
+        bytes
+            .chunks(16)
+            .map(|t| {
+                std::array::from_fn(|i| f32::from_le_bytes(t[i * 4..][..4].try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    /// A decoder on `P`'s process platform, the platform's default device, the guest's texture
+    /// ids kept on it as a graphics device keeps them, and context 1's first chunk of resource ids
+    /// granted. Each test runs in a process of its own, so this is the first use of the device's
+    /// ids.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn surface_decoder<P: crate::platform::ApiPlatform>() -> (GraphicsDecoder<P>, P::Device) {
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(Region::new(0x10000).unwrap()),
+        );
+        let grant = RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context: 1,
+            chunk: 0,
+        };
+        assert_eq!(dec.decode(&device, grant.as_bytes()).unwrap(), Ok(()));
+        (dec, device)
+    }
+
+    /// Context 1's object `n`.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const fn context_obj(n: u64) -> u64 {
+        (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
+    }
+
+    /// A Shared buffer of the decoder's, object `n`, holding `bytes` from its first.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn buffer_holding<P: Platform>(
+        dec: &mut GraphicsDecoder<P>,
+        device: &P::Device,
+        n: u64,
+        bytes: &[u8],
+    ) {
+        let create = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(n),
+            length: (bytes.len() as u64).next_multiple_of(0x4000),
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(device, create.as_bytes()).unwrap(), Ok(()));
+        let Some(ObjHandle::Buffer(b)) = dec.objects.get(&context_obj(n)) else {
+            panic!("no buffer {n}");
+        };
+        // SAFETY: a Shared buffer of at least `bytes.len()` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr::<u8>(), bytes.len())
+        };
+    }
+
+    /// A 2D texture descriptor of the wire: `format`, `size`, one level, usage `ShaderRead`,
+    /// options 0 (Shared), the identity swizzle, as WindowServer asks for its surfaces' textures.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn surface_desc(format: u32, (width, height): (u64, u64)) -> RgfxTextureDescriptor {
+        RgfxTextureDescriptor {
+            pixel_format: format,
+            texture_type: 2,
+            width: width as u32,
+            height: height as u32,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            usage: 1,
+            ..RgfxTextureDescriptor::default()
+        }
+    }
+
+    /// The `TEXTURE_FROM_IOSURFACE` of texture `n` (resource id `n`) over plane 0 of buffer 10,
+    /// at offset 0 with rows `bytes_per_row` apart, of `desc`, carrying `facts`.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn surface_texture_message(
+        n: u64,
+        desc: RgfxTextureDescriptor,
+        bytes_per_row: u64,
+        facts: &reims_graphics::wire::RgfxSurfaceFacts,
+    ) -> Vec<u8> {
+        use reims_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
+        let m = RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: (RGFX_SURFACE_FACTS_OFFSET as usize + size_of::<RgfxSurfaceFacts>()) as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(n),
+            resource_id: n,
+            buffer_obj_id: context_obj(10),
+            offset: 0,
+            bytes_per_row,
+            iosurface_id: 0x40 + n as u32,
+            plane: 0,
+            desc,
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
+        };
+        let mut bytes = m.as_bytes().to_vec();
+        bytes.extend_from_slice(facts.as_bytes());
+        bytes
+    }
+
+    /// What the guest's texture `n` of the decoder answers: its format, type, width, height,
+    /// usage, resource options and storage mode, and the bits of every texel `read()` reads of it
+    /// into floats.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    type TextureAnswer = ([u64; 7], Vec<[u32; 4]>);
+
+    /// [`TextureAnswer`] of `texture`, of `size`, on `device`.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn texture_answer<P: Platform>(
+        device: &P::Device,
+        texture: &P::Texture,
+        size: (u64, u64),
+    ) -> TextureAnswer {
+        use reims_vgpu_core::platform::resource::{GpuResource as _, Texture as _};
+        let t = texture;
+        let getters = [
+            t.pixel_format(),
+            t.texture_type(),
+            t.width(),
+            t.height(),
+            t.usage(),
+            t.resource_options(),
+            t.storage_mode(),
+        ];
+        let read = kernel_reads::<P>(device, "read_texels_float", t, size, (None, None));
+        (getters, read.iter().map(|t| t.map(f32::to_bits)).collect())
+    }
+
+    /// The pin's textures: 16 x 8, of BGRA8 (80) over a 'BGRA' surface and of RGBA16F (115) over
+    /// an 'RGhA' one, with the surfaces' OSTypes and bytes a texel.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const PIN_CASES: [(u32, &[u8; 4], u64); 2] = [(80, b"BGRA", 4), (115, b"RGhA", 8)];
+
+    /// The pin's size, and its rows: the bundle's copy of a surface without planes lays its rows
+    /// 256 bytes apart (`alignUp(IOSurfaceGetBytesPerRow, 256)`).
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const PIN_SIZE: (u64, u64) = (16, 8);
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const PIN_ROW: u64 = 256;
+
+    /// The pin's bytes: each a value of its place, every row whole, so a half's bits are no NaN
+    /// (RGBA16F's exponents stay below 31).
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn pin_bytes() -> Vec<u8> {
+        (0..PIN_ROW * PIN_SIZE.1)
+            .map(|i| ((i * 37 + i / 7) % 0x7b) as u8)
+            .collect()
+    }
+
+    /// What a texture of each of [`PIN_CASES`] over a surface without planes answers through
+    /// the decoder on `P`, both ways over the guest's copy of the surface, at offset 0 with rows
+    /// [`PIN_ROW`] apart, options 0 (Shared): by today's buffer creator (`TEXTURE_FROM_BUFFER`),
+    /// and by the IOSurface creator (`TEXTURE_FROM_IOSURFACE`, its facts saying no planes).
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn surface_textures_without_planes<P: crate::platform::ApiPlatform>() -> Vec<[TextureAnswer; 2]>
+    {
+        use reims_graphics::wire::RgfxSurfaceFacts;
+        let (mut dec, device) = surface_decoder::<P>();
+        buffer_holding(&mut dec, &device, 10, &pin_bytes());
+        let answer = |dec: &GraphicsDecoder<P>, n: u64| {
+            let Some(ObjHandle::Texture(t)) = dec.objects.get(&context_obj(n)) else {
+                panic!("no texture {n}");
+            };
+            texture_answer::<P>(&device, t, PIN_SIZE)
+        };
+        let mut answers = Vec::new();
+        for (k, &(format, ostype, texel)) in PIN_CASES.iter().enumerate() {
+            let (n, desc) = (11 + 2 * k as u64, surface_desc(format, PIN_SIZE));
+            let from_buffer = RgfxTextureFromBuffer {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                    size: size_of::<RgfxTextureFromBuffer>() as u32,
+                    seqno: 0,
+                },
+                obj_id: context_obj(n),
+                resource_id: n,
+                buffer_obj_id: context_obj(10),
+                offset: 0,
+                bytes_per_row: PIN_ROW,
+                desc,
+            };
+            assert_eq!(dec.decode(&device, from_buffer.as_bytes()).unwrap(), Ok(()));
+            let facts = RgfxSurfaceFacts {
+                surface_pixel_format: u32::from_be_bytes(*ostype),
+                plane_count: 0,
+                width: PIN_SIZE.0 as u32,
+                height: PIN_SIZE.1 as u32,
+                ..RgfxSurfaceFacts::default()
+            };
+            assert!(PIN_SIZE.0 * texel <= PIN_ROW);
+            let m = surface_texture_message(n + 1, desc, PIN_ROW, &facts);
+            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()), "{format}");
+            answers.push([answer(&dec, n), answer(&dec, n + 1)]);
+        }
+        answers
+    }
+
+    /// The 505 texture's size (WindowServer's is 3840 x 2160; the layout is the same at any
+    /// size), and the bundle's copy of its 'x420' surface: plane 0 at 0, plane 1 at
+    /// [`YCBCR_CHROMA_AT`], each row `alignUp(IOSurfaceGetBytesPerRowOfPlane(k), 256)` apart, and
+    /// each plane at a multiple of 256.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const YCBCR_SIZE: (u64, u64) = (16, 8);
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const YCBCR_ROW: u64 = 256;
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const YCBCR_CHROMA_AT: u64 = YCBCR_ROW * YCBCR_SIZE.1;
+
+    /// The bundle's copy of the 505 texture's surface: 10-bit luma codes in the top bits of 16-bit
+    /// samples, then interleaved Cb and Cr codes, one pair per 2 x 2 block, of a fixed noise.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn ycbcr_bytes() -> Vec<u8> {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut code = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 20) % 1024) as u16
+        };
+        let (width, height) = YCBCR_SIZE;
+        let mut bytes = vec![0u8; (YCBCR_CHROMA_AT + YCBCR_ROW * height / 2) as usize];
+        let mut put = |at: u64, code: u16| {
+            let at = at as usize;
+            bytes[at..at + 2].copy_from_slice(&(code << 6).to_le_bytes());
+        };
+        for y in 0..height {
+            for x in 0..width {
+                put(y * YCBCR_ROW + x * 2, code());
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let at = YCBCR_CHROMA_AT + y * YCBCR_ROW + x * 4;
+                put(at, code());
+                put(at + 2, code());
+            }
+        }
+        bytes
+    }
+
+    /// The probe WindowServer's composite is like: a linear sample in normalized coordinates of an
+    /// 8 x 5 grid of positions from (0.375, 0.375) texels, 1.875 apart, which meet each weight
+    /// between two texels of a multiple of 1/8 and the edges.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const YCBCR_GRID: (u64, u64) = (8, 5);
+
+    /// [`YCBCR_GRID`]'s bytes (`Probe` in `ycbcr_probe.metal`).
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn ycbcr_probe() -> Vec<u8> {
+        let floats = [0.375f32, 0.375, 1.875, 1.875].map(f32::to_le_bytes);
+        let words = [YCBCR_GRID.0 as u32, YCBCR_GRID.1 as u32, 1, 0].map(u32::to_le_bytes);
+        [floats.concat(), words.concat()].concat()
+    }
+
+    /// The linear, clamp-to-edge sampler of normalized coordinates the probe samples through.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn linear_sampler<P: Platform>(device: &P::Device) -> P::SamplerState {
+        let desc = SamplerDesc {
+            min_filter: Some(1),
+            mag_filter: Some(1),
+            s_address_mode: Some(0),
+            t_address_mode: Some(0),
+            normalized_coordinates: Some(true),
+            ..SamplerDesc::default()
+        };
+        device.new_sampler_state(&desc).unwrap().unwrap()
+    }
+
+    /// What a texture of 505 over the bundle's copy of an 'x420' surface of BT.2020
+    /// ([`ycbcr_bytes`]) samples through the probe ([`ycbcr_probe`]) through the decoder on `P`,
+    /// with the surface's facts in its `TEXTURE_FROM_IOSURFACE`; `None` where the create is
+    /// refused.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn ycbcr_through_the_decoder<P: crate::platform::ApiPlatform>() -> Option<Vec<[f32; 4]>> {
+        use reims_graphics::wire::{RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts};
+        let (mut dec, device) = surface_decoder::<P>();
+        buffer_holding(&mut dec, &device, 10, &ycbcr_bytes());
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*b"x420"),
+            plane_count: 2,
+            width: YCBCR_SIZE.0 as u32,
+            height: YCBCR_SIZE.1 as u32,
+            chroma_offset: YCBCR_CHROMA_AT,
+            chroma_bytes_per_row: YCBCR_ROW,
+            ycbcr_matrix: RGFX_YCBCR_MATRIX_ITU_R_2020,
+            reserved_24: 0,
+        };
+        let m = surface_texture_message(11, surface_desc(505, YCBCR_SIZE), YCBCR_ROW, &facts);
+        match dec.decode(&device, &m).unwrap() {
+            Ok(()) => {}
+            Err(DecodeError::Refused) => return None,
+            Err(e) => panic!("{e:?}"),
+        }
+        let Some(ObjHandle::Texture(t)) = dec.objects.get(&context_obj(11)) else {
+            panic!("no texture");
+        };
+        let sampler = linear_sampler::<P>(&device);
+        let probe = ycbcr_probe();
+        let read = (Some(&sampler), Some(&probe[..]));
+        Some(kernel_reads::<P>(
+            &device,
+            "sample_texels_float",
+            t,
+            YCBCR_GRID,
+            read,
+        ))
+    }
+
+    /// Metal's answer to [`ycbcr_through_the_decoder`]'s probe of the same bytes over a real
+    /// 'x420' surface of BT.2020 (`on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded`,
+    /// an Apple M3 Max under macOS 27.0.1): each sample's red, green and blue, as their bits,
+    /// in the grid's rows; every alpha is 1.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const METAL_505: [[u32; 3]; 40] = [
+        [0x3f800000, 0x3f16c000, 0x00000000],
+        [0x3e1b8000, 0x3f0d0000, 0x3e398000],
+        [0x3e88c000, 0x3eec4000, 0x3db10000],
+        [0x3f800000, 0x3f14e000, 0x3f27e000],
+        [0x3f53e000, 0x3cb80000, 0x3ed20000],
+        [0x3f480000, 0x3dbf0000, 0x3dfb0000],
+        [0x3f65e000, 0x3ef44000, 0x3f0b8000],
+        [0x3f6d6000, 0x3f6c8000, 0x3f130000],
+        [0x3f3ec000, 0x00000000, 0x3e1b8000],
+        [0x3f0e0000, 0x3e8e4000, 0x3ecdc000],
+        [0x3f22a000, 0x3f65a000, 0x3f672000],
+        [0x3e980000, 0x3e320000, 0x3f050000],
+        [0x3f1e4000, 0x3e9b0000, 0x3f0b0000],
+        [0x3f6e6000, 0x3f368000, 0x3f2a2000],
+        [0x3f16c000, 0x3df50000, 0x3e960000],
+        [0x3f452000, 0x3f0c2000, 0x3dc50000],
+        [0x3f788000, 0x3ec14000, 0x3f4b8000],
+        [0x3f7c0000, 0x3e91c000, 0x3f07e000],
+        [0x3ef34000, 0x3ebe0000, 0x3f154000],
+        [0x3f0a8000, 0x3ec24000, 0x3f1fc000],
+        [0x3f104000, 0x3f04e000, 0x3f3e4000],
+        [0x3dc30000, 0x3f274000, 0x3f36a000],
+        [0x3e3e8000, 0x3e960000, 0x3f366000],
+        [0x3f7fa000, 0x3ed68000, 0x3f2fe000],
+        [0x3f6b4000, 0x3e438000, 0x3f31a000],
+        [0x3f498000, 0x3d8b0000, 0x3f17e000],
+        [0x3f460000, 0x3eb3c000, 0x3f5da000],
+        [0x3edb0000, 0x3e938000, 0x3eb60000],
+        [0x3eb48000, 0x3f2e4000, 0x3f208000],
+        [0x3ccc0000, 0x3f08a000, 0x3f58c000],
+        [0x3eaf0000, 0x3f29c000, 0x3f474000],
+        [0x3f000000, 0x3f2f4000, 0x3f236000],
+        [0x3f0d8000, 0x00000000, 0x3f466000],
+        [0x3f444000, 0x3dea0000, 0x3f800000],
+        [0x3f518000, 0x3ea74000, 0x3f800000],
+        [0x3e1f0000, 0x3e6d0000, 0x3eb38000],
+        [0x00000000, 0x3eb90000, 0x3e7f0000],
+        [0x3d3c0000, 0x3e9c0000, 0x3f026000],
+        [0x3e924000, 0x3f036000, 0x3e790000],
+        [0x3e728000, 0x3f800000, 0x3f194000],
+    ];
+
+    /// On Metal, a texture over a surface's plane of BGRA8 or RGBA16F answers alike by the
+    /// buffer's creator over the guest's copy of a surface without planes, and by Metal's own
+    /// IOSurface creator over a real surface of the same bytes and rows, as the Metal platform's
+    /// IOSurface route over the copy (the buffer's creator) does: so its answers stay the
+    /// buffer's on the Vulkan platform too (`on_vulkan_surface_textures_without_planes_are_the_buffer_s`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_surface_textures_without_planes_are_the_buffer_s() {
+        use reims_vgpu_core::platform::os::surface::{Surface as _, SurfaceSpec};
+        use reims_vgpu_metal::MetalPlatform;
+
+        use crate::platform::ApiPlatform as _;
+        let answers = surface_textures_without_planes::<MetalPlatform>();
+        let platform = MetalPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        for (&(format, ostype, texel), [from_buffer, from_surface]) in
+            PIN_CASES.iter().zip(&answers)
+        {
+            assert_eq!(from_buffer, from_surface, "{format}");
+            let spec = SurfaceSpec {
+                pixel_format: u32::from_be_bytes(*ostype),
+                alloc_size: 0x4000,
+                width: PIN_SIZE.0,
+                height: PIN_SIZE.1,
+                bytes_per_element: texel,
+                bytes_per_row: PIN_ROW,
+                element_width: 1,
+                element_height: 1,
+                ..SurfaceSpec::default()
+            };
+            let surface = platform.surfaces().create(&spec).unwrap();
+            assert_eq!(surface.bytes_per_row(), PIN_ROW);
+            let bytes = pin_bytes();
+            // SAFETY: the surface's allocation holds its rows, which no command uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    surface.base_address().as_ptr::<u8>(),
+                    bytes.len(),
+                )
+            };
+            let desc = surface_desc(format, PIN_SIZE);
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                resource_index: None,
+                ..texture_desc(&desc, 0)
+            });
+            let own = device
+                .new_texture_on_surface(&descriptor, Some(&surface), 0)
+                .unwrap()
+                .unwrap();
+            let metal = texture_answer::<MetalPlatform>(&device, &own, PIN_SIZE);
+            assert_eq!(&metal, from_buffer, "{format}");
+        }
+    }
+
+    /// On the Vulkan platform, a texture of BGRA8 or RGBA16F over the guest's copy of a surface
+    /// without planes answers by the runtime's IOSurface creator what it answers by the buffer's
+    /// creator, as Metal's own two creators answer alike
+    /// (`on_metal_surface_textures_without_planes_are_the_buffer_s`)
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_surface_textures_without_planes_are_the_buffer_s() {
+        let answers = surface_textures_without_planes::<reims_vgpu_vulkan::VulkanPlatform>();
+        for (&(format, ..), [from_buffer, from_surface]) in PIN_CASES.iter().zip(&answers) {
+            assert_eq!(from_buffer, from_surface, "{format}");
+        }
+    }
+
+    /// On Metal, a texture of 505 over plane 0 of a real 'x420' surface of BT.2020 holding the
+    /// bundle's copy's bytes, at its planes' offsets and rows, samples through a linear sampler
+    /// as recorded ([`METAL_505`]), every alpha 1. Through the decoder the Metal platform refuses
+    /// the create: Metal makes no texture over a surface's plane from a buffer's bytes, and the
+    /// host holds no surface, only the guest's copy of it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded() {
+        use std::ffi::c_void;
+
+        use reims_vgpu_core::platform::os::surface::{Surface as _, SurfacePlaneSpec, SurfaceSpec};
+        use reims_vgpu_metal::MetalPlatform;
+
+        use crate::platform::ApiPlatform as _;
+        // The guest's route first, which keeps the guest's texture ids on the device before any
+        // texture is made on it.
+        assert_eq!(ycbcr_through_the_decoder::<MetalPlatform>(), None);
+        #[link(name = "IOSurface", kind = "framework")]
+        unsafe extern "C" {
+            fn IOSurfaceSetValue(buffer: *const c_void, key: *const c_void, value: *const c_void);
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFStringCreateWithBytes(
+                alloc: *const c_void,
+                bytes: *const u8,
+                num_bytes: isize,
+                encoding: u32,
+                is_external_representation: u8,
+            ) -> *const c_void;
+            fn CFRelease(cf: *const c_void);
+        }
+        // A UTF-8 CFString of `s`, +1.
+        let cf_string = |s: &str| {
+            // SAFETY: `s`'s bytes, live for the call, which copies them.
+            unsafe {
+                CFStringCreateWithBytes(
+                    std::ptr::null(),
+                    s.as_ptr(),
+                    s.len() as isize,
+                    0x0800_0100,
+                    0,
+                )
+            }
+        };
+        let platform = MetalPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        let (width, height) = YCBCR_SIZE;
+        let plane = |offset, (width, height): (u64, u64), element| SurfacePlaneSpec {
+            base: offset,
+            offset,
+            width,
+            height,
+            size: YCBCR_ROW * height,
+            bytes_per_row: YCBCR_ROW,
+            bytes_per_element: element,
+            element_width: 1,
+            element_height: 1,
+            ..SurfacePlaneSpec::default()
+        };
+        let spec = SurfaceSpec {
+            planes: Some(vec![
+                plane(0, YCBCR_SIZE, 2),
+                plane(YCBCR_CHROMA_AT, (width / 2, height / 2), 4),
+            ]),
+            pixel_format: u32::from_be_bytes(*b"x420"),
+            alloc_size: 0x4000,
+            width,
+            height,
+            bytes_per_element: 2,
+            bytes_per_row: YCBCR_ROW,
+            element_width: 1,
+            element_height: 1,
+            ..SurfaceSpec::default()
+        };
+        let surface = platform.surfaces().create(&spec).unwrap();
+        assert_eq!(surface.plane_count(), 2);
+        let ptr = std::ptr::with_exposed_provenance::<c_void>(surface.id().0 as usize);
+        let (key, value) = (cf_string("IOSurfaceYCbCrMatrix"), cf_string("ITU_R_2020"));
+        // SAFETY: the surface's IOSurfaceRef (its handle's id), live while `surface` is, and two
+        // CFStrings, released after the call, which retains what it keeps.
+        unsafe {
+            IOSurfaceSetValue(ptr, key, value);
+            CFRelease(key);
+            CFRelease(value);
+        }
+        let bytes = ycbcr_bytes();
+        // SAFETY: the surface's allocation holds both planes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                surface.base_address().as_ptr::<u8>(),
+                bytes.len(),
+            )
+        };
+        let desc = surface_desc(505, YCBCR_SIZE);
+        let descriptor = platform.texture_descriptor(&TextureDesc {
+            resource_index: None,
+            ..texture_desc(&desc, 0)
+        });
+        let own = device
+            .new_texture_on_surface(&descriptor, Some(&surface), 0)
+            .unwrap()
+            .unwrap();
+        let sampler = linear_sampler::<MetalPlatform>(&device);
+        let probe = ycbcr_probe();
+        let read = (Some(&sampler), Some(&probe[..]));
+        let metal =
+            kernel_reads::<MetalPlatform>(&device, "sample_texels_float", &own, YCBCR_GRID, read);
+        let bits: Vec<[u32; 3]> = metal
+            .iter()
+            .map(|t| [t[0], t[1], t[2]].map(f32::to_bits))
+            .collect();
+        eprintln!("METAL_505 = {bits:#010x?}");
+        assert!(metal.iter().all(|t| t[3] == 1.0), "{metal:?}");
+        assert_eq!(bits, METAL_505);
+    }
+
+    /// On the Vulkan platform, the 505 texture WindowServer composites the wallpaper's video
+    /// frames through, over the bundle's copy of its 'x420' surface of BT.2020 with the surface's
+    /// facts, is made, and its linear samples lie within 1/2048 (one step of the format's grid)
+    /// of Metal's over the real surface ([`METAL_505`]), every alpha 1. What the runtime announces
+    /// of the sampling is printed: on a native device nothing of [`reims_vgpu_vulkan::answer::DIES`]
+    /// is relayed but what a native device relays (`DeviceSampling` among them); on MoltenVK,
+    /// Metal's own sampler's filter of the converted texels is `YCbCrFilterNotExact`'s, relayed.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_505_texture_over_the_bundle_s_copy_samples_as_metal_s() {
+        use reims_vgpu_vulkan::answer::{self, native};
+        let before = (answer::relayed_counts(), native::counts());
+        let ours = ycbcr_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>()
+            .expect("the 505 texture is made");
+        // The kinds whose count grew from `before` to `after`.
+        fn grew<K: PartialEq + Copy>(after: Vec<(K, u64)>, before: &[(K, u64)]) -> Vec<K> {
+            (after.into_iter())
+                .filter(|(k, n)| before.iter().all(|(b, m)| b != k || m < n))
+                .map(|(k, _)| k)
+                .collect()
+        }
+        let relayed = grew(answer::relayed_counts(), &before.0);
+        let natively = grew(native::counts(), &before.1);
+        let differences: Vec<f32> = (ours.iter().zip(&METAL_505))
+            .flat_map(|(o, m)| (0..3).map(move |c| (o[c] - f32::from_bits(m[c])).abs()))
+            .collect();
+        let worst = differences.iter().copied().fold(0.0_f32, f32::max);
+        let exact = differences.iter().filter(|&&d| d == 0.0).count();
+        eprintln!(
+            "placement {:?}: relayed of DIES {relayed:?}, relayed natively {natively:?}; {exact} \
+             of {} channels Metal's, the farthest {} steps of 1/2048 off",
+            native::placement(),
+            differences.len(),
+            worst * 2048.0
+        );
+        assert!(ours.iter().all(|t| t[3] == 1.0), "{ours:?}");
+        assert!(worst <= 1.0 / 2048.0, "{} steps of 1/2048", worst * 2048.0);
+        match native::placement() {
+            native::Placement::Native => assert!(relayed.is_empty(), "{relayed:?}"),
+            native::Placement::OnMetal => assert!(
+                (relayed.iter()).all(|k| format!("{k:?}") == "YCbCrFilterNotExact"),
+                "{relayed:?}"
+            ),
+        }
+    }
+
     /// A render and a compute pipeline create each resolve their functions from a
     /// library, call the right platform creator, store the handle and emit a
     /// reflection reply keyed to the create's seqno; a pipeline that names a
