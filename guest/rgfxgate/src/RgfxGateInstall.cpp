@@ -243,16 +243,20 @@ static void doInstall() {
 static void installEntry(void *, wait_result_t) {
 	// Wait for the Data volume's /Library/GPUBundles to appear (launchd mounts
 	// it well before WindowServer). Up to ~60 s, then give up for this boot.
+	// Sleep before the first lookup: this thread is entered as a continuation
+	// very early in boot, and IOSleep yields it through the scheduler into a
+	// normal preemptible state before it takes the VFS namecache lock, which a
+	// development kernel otherwise faults on (lock_rw_old.c, preemption check).
 	vfs_context_t ctx = vfs_context_create(nullptr);
 	bool ready = false;
 	for (int i = 0; i < 600; i++) {
+		IOSleep(100);
 		vnode_t vp = nullptr;
 		if (ctx && vnode_lookup("/Library/GPUBundles", 0, &vp, ctx) == 0) {
 			vnode_put(vp);
 			ready = true;
 			break;
 		}
-		IOSleep(100);
 	}
 	if (ctx)
 		vfs_context_rele(ctx);
