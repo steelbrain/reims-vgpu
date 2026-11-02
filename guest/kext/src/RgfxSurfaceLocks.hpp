@@ -228,4 +228,17 @@ inline void rgfxControlAnswer(uint32_t op, uint64_t b)
 		*reinterpret_cast<volatile uint8_t *>(static_cast<uintptr_t>(b)) = 0xff;
 }
 
+// The control function's op 3, which IOSurfaceDeviceCache::accelRelease calls to end each call
+// IOSurface retained the device cache for: a CPU lock's ops 0 and 2, op 6 and op 7
+// (RgfxIOSurfaceKPI.hpp). The reference is the accelerator's to release, as the AMD's driver
+// does at each op 3; one left unreleased keeps the cache, and its surface, from ever being
+// freed. The release comes last, out of every lock: it may free the cache, whose op 4 then
+// comes from inside it.
+constexpr uint32_t kRgfxControlDone = 3;
+
+inline bool rgfxControlReleases(uint32_t op)
+{
+	return op == kRgfxControlDone;
+}
+
 #endif // RGFX_SURFACE_LOCKS_HPP_

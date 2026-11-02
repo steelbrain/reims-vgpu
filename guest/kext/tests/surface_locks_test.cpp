@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 namespace {
 int checks = 0;
@@ -129,6 +130,36 @@ int main()
 	check(bytes[0] == 0x11 && bytes[2] == 0x22, "op 6 writes that byte alone");
 	rgfxControlAnswer(kRgfxControlUnpurge, 0);
 	check(true, "op 6 with no byte writes nothing");
+
+	// Op 3 releases the reference IOSurface took for the call it ends, and no other op releases
+	// one: the cache's count, as the guest's IOSurface moves it, is back to the kext's own after
+	// each lock and each purgeable change, and goes to 0 at the kext's release.
+	int count = 1;
+	auto call = [&count](std::initializer_list<uint32_t> ops, int retained) {
+		count += retained;
+		for (uint32_t op : ops) {
+			if (rgfxControlReleases(op))
+				count--;
+		}
+	};
+	call({0, 2, 3}, 1);
+	check(count == 1, "a CPU lock of a current cache: ops 0, 2 and 3 on one reference");
+	call({2, 3}, 1);
+	check(count == 1, "a read-write lock of a cache not current: ops 2 and 3");
+	call({7, 3}, 1);
+	check(count == 1, "volatile or empty: op 7, then op 3");
+	call({6, 3, 3}, 2);
+	check(count == 1, "nonvolatile again, op 6's byte set: op 6, then op 3 twice, two references");
+	call({6, 3, 6, 3, 5}, 2);
+	check(count == 1, "nonvolatile again, op 6's byte left 0: ops 6 and 3 twice, then op 5");
+	call({5, 4}, 0);
+	check(count == 1, "ops 4 and 5 release nothing");
+	count--;
+	check(count == 0, "the kext's own release frees the cache");
+	check(!rgfxControlReleases(0) && !rgfxControlReleases(2) && !rgfxControlReleases(4) &&
+	          !rgfxControlReleases(5) && !rgfxControlReleases(6) && !rgfxControlReleases(7) &&
+	          rgfxControlReleases(kRgfxControlDone),
+	      "op 3 alone releases");
 
 	std::printf("surface_locks_test: OK (%d checks)\n", checks);
 	return 0;

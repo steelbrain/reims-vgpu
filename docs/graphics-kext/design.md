@@ -342,7 +342,9 @@ Stages:
       the kext's control function, and keeps both with the block. Each write
       named marks the cache current, which moves the surface's seed once, as
       Metal's submission does, and has IOSurface call the control function in
-      every CPU lock of the surface: op 2 waits while a write is pending. A
+      every CPU lock of the surface: op 2 waits while a write is pending, and
+      op 3 releases the reference IOSurface took on the cache for the lock,
+      or for a purgeable change (ops 6 and 7), as the AMD's driver does. A
       write retires at the bundle's retire call after the buffer's completion
       and write-back, or, for a surface drawn in place, once the queue's
       completion ring's `completed_seqno` reaches the buffer, whichever comes

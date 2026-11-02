@@ -37,7 +37,13 @@
 //     function's arguments do not show;
 //   - IOSurface takes nothing from the control function's return: answering op 6 with 0 or 1,
 //     and op 7 with 0 or 0x8000 (what the AMD's resource returns for volatile), left every
-//     answer of IOSurface's as it was (measured in the guest).
+//     answer of IOSurface's as it was (measured in the guest);
+//   - IOSurface retains the cache before each call of a lock's ops 0 and 2, of op 6 and of
+//     op 7, and ends each with IOSurfaceDeviceCache::accelRelease, which calls op 3 once for
+//     each reference it took (a change to nonvolatile by op 6 takes two). The AMD's control
+//     function releases the cache at each op 3 (its stacks). In the guest, a control function
+//     that releases nothing there leaves the cache one reference more for each op 3, and the
+//     cache and its surface are never freed (measured: retain counts at each op).
 // The accelerator ID came from IOSurfaceRoot::generateUniqueAcceleratorID(the accelerator) on
 // both, 1 for IOGPU and 2 for the AMD's (taken before the trace began).
 //
@@ -52,10 +58,11 @@
 struct RgfxDeviceCache;
 
 // The control function a device cache calls: the accelerator its cache was made for, the cache,
-// the op (0 sync, 2 wait, 3 done, 4 freed, 5 purged, 6 made nonvolatile, 7 purgeable), and the
-// op's two arguments (op 2's first: 1 for a read-only lock, 0 for a read-write one; op 7's the new
-// state; op 6's second the address of the byte it answers in; the others measured 0). IOSurface
-// declares it returning nothing (setControlFunc's mangled name) and reads no return.
+// the op (0 sync, 2 wait, 3 done: the function releases the cache, 4 freed, 5 purged, 6 made
+// nonvolatile, 7 purgeable), and the op's two arguments (op 2's first: 1 for a read-only lock, 0
+// for a read-write one; op 7's the new state; op 6's second the address of the byte it answers
+// in; the others measured 0). IOSurface declares it returning nothing (setControlFunc's mangled
+// name) and reads no return.
 typedef void (*RgfxDeviceCacheControl)(void *accelerator, RgfxDeviceCache *cache, uint32_t op,
                                        uint64_t a, uint64_t b);
 
