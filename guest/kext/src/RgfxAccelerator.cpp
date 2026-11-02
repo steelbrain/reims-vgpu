@@ -16,6 +16,7 @@
 #include <kern/thread_call.h>
 #include <sys/vnode.h>
 
+#include "RgfxBundlePaths.hpp"
 #include "RgfxTrace.hpp"
 
 #define super IOAccelerator
@@ -43,6 +44,13 @@ OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
 // Without the bundle by then, the accelerator stays unregistered for the rest of the boot, so
 // WindowServer never sees a GPU appear under it; a bundle installed later is used from the next
 // boot. Neither the check nor its wait runs on the kext's start or the framebuffer's console.
+//
+// The bundle must also be of the kext's wire version (design.md, "The wire's version"): it maps
+// the region and speaks the messages. Its package carries an empty marker named for the version
+// it was built with (RgfxBundlePaths.hpp), and only the executable with the marker of this
+// kext's RGFX_VERSION counts as the bundle on disk. A bundle of another version is left as if
+// there were none, so WindowServer composites in software: a bundle that refused to make a
+// device under a registered accelerator would leave WindowServer aborting, as with no bundle.
 namespace {
 // How often the check repeats until the bundle is found or WindowServer settles it.
 constexpr UInt32 kBundleCheckMs = 100;
@@ -69,11 +77,21 @@ struct BundleWatch {
 	// The repeating check, and under lock whether it is running (stop waits for it to end).
 	thread_call_t call;
 	bool running;
-	// The bundle's executable: /Library/GPUBundles/NAME.bundle/Contents/MacOS/NAME, NAME the
+	// The bundle's executable and its marker for this kext's wire version, NAME the
 	// accelerator's MetalPluginName (the bundle's Makefile names its executable so).
-	char path[256];
+	RgfxBundlePaths paths;
 };
 BundleWatch bundle = {nullptr, kBundleWatching, nullptr, false, {}};
+
+// What the lookups find.
+enum BundleFound : UInt32 {
+	// No executable, or no root file system yet.
+	kBundleAbsent,
+	// The executable, without the marker of this kext's wire version.
+	kBundleOtherVersion,
+	// The executable and the marker: the bundle to register for.
+	kBundleOurs,
+};
 
 UInt32 bundleState()
 {
@@ -99,22 +117,31 @@ bool leaveWatching(UInt32 to)
 	return moved;
 }
 
-// Whether the bundle's executable is on disk; false before the root file system is mounted.
-bool bundleOnDisk()
+// Whether `path` is there.
+bool onDisk(const char *path, vfs_context_t context)
+{
+	vnode_t found = nullptr;
+	errno_t error = vnode_lookup(path, 0, &found, context);
+	if (!error)
+		vnode_put(found);
+	return !error;
+}
+
+// Which bundle is on disk (above); none before the root file system is mounted.
+BundleFound bundleOnDisk()
 {
 	vnode_t root = vfs_rootvnode();
 	if (!root)
-		return false;
+		return kBundleAbsent;
 	vnode_put(root);
 	vfs_context_t context = vfs_context_create(nullptr);
 	if (!context)
-		return false;
-	vnode_t found = nullptr;
-	errno_t error = vnode_lookup(bundle.path, 0, &found, context);
-	if (!error)
-		vnode_put(found);
+		return kBundleAbsent;
+	BundleFound found = kBundleAbsent;
+	if (onDisk(bundle.paths.executable, context))
+		found = onDisk(bundle.paths.marker, context) ? kBundleOurs : kBundleOtherVersion;
 	vfs_context_rele(context);
-	return !error;
+	return found;
 }
 
 void armBundleCheck()
@@ -128,7 +155,7 @@ void armBundleCheck()
 // registerService returns: synchronously, so the matching (and Metal's notification) is done.
 void registerAccelerator(RgfxAccelerator *accelerator, const char *when)
 {
-	IOLog("RgfxAccelerator: the bundle is at %s%s: registered\n", bundle.path, when);
+	IOLog("RgfxAccelerator: the bundle is at %s%s: registered\n", bundle.paths.executable, when);
 	accelerator->registerService(kIOServiceSynchronous);
 	IOLockLock(bundle.lock);
 	bundle.state = kBundleRegistered;
@@ -141,7 +168,7 @@ void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 	IOLockLock(bundle.lock);
 	bundle.running = true;
 	IOLockUnlock(bundle.lock);
-	bool found = bundleOnDisk();
+	bool found = bundleOnDisk() == kBundleOurs;
 	IOLockLock(bundle.lock);
 	bool watching = bundle.state == kBundleWatching;
 	if (watching && found)
@@ -166,9 +193,7 @@ bool RgfxAccelerator::watchBundle()
 		return false;
 	}
 	const char *n = name->getCStringNoCopy();
-	if (static_cast<size_t>(snprintf(bundle.path, sizeof(bundle.path),
-	                                 "/Library/GPUBundles/%s.bundle/Contents/MacOS/%s", n, n)) >=
-	    sizeof(bundle.path)) {
+	if (!rgfxBundlePaths(n, RGFX_VERSION, &bundle.paths)) {
 		IOLog("RgfxAccelerator: MetalPluginName %s is too long: not registered\n", n);
 		return false;
 	}
@@ -193,13 +218,20 @@ bool RgfxAccelerator::watchBundle()
 void RgfxAccelerator::settleBundle()
 {
 	if (bundleState() == kBundleWatching) {
-		if (bundleOnDisk()) {
+		BundleFound found = bundleOnDisk();
+		if (found == kBundleOurs) {
 			if (leaveWatching(kBundleRegistering))
 				registerAccelerator(this, " as WindowServer opens the display");
 		} else if (leaveWatching(kBundleSettled)) {
-			IOLog("RgfxAccelerator: no bundle at %s as WindowServer opens the display: not "
-			      "registered this boot\n",
-			      bundle.path);
+			if (found == kBundleOtherVersion)
+				IOLog("RgfxAccelerator: the bundle at %s is not of wire version %u (no %s) as "
+				      "WindowServer opens the display: not registered this boot. The bundle, the "
+				      "kext and the host must come from one build.\n",
+				      bundle.paths.executable, RGFX_VERSION, bundle.paths.marker);
+			else
+				IOLog("RgfxAccelerator: no bundle at %s as WindowServer opens the display: not "
+				      "registered this boot\n",
+				      bundle.paths.executable);
 		}
 	}
 	// A registration the repeating check began finishes before the connection is made.
@@ -291,8 +323,9 @@ bool RgfxAccelerator::start(IOService *provider)
 	// as without the bundle.
 	if (watchBundle())
 		IOLog("RgfxAccelerator: ready, region 0x%llx bytes, framebuffer %s; registers once %s "
-		      "is on disk\n",
-		      regionSize, fb ? "named" : "not yet started", bundle.path);
+		      "and %s are on disk\n",
+		      regionSize, fb ? "named" : "not yet started", bundle.paths.executable,
+		      bundle.paths.marker);
 	OSSafeReleaseNULL(fb);
 	return true;
 fail:

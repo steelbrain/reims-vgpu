@@ -399,6 +399,17 @@ accept only the version they were built with. They read it right after
 leave the device and say why, naming both versions: the kext in the kernel
 log, the ROM on the firmware's console where it has one.
 
+The bundle maps the region and speaks the messages too, so it must be of the
+kext's version, and it says which it is: its package carries an empty
+`Contents/Resources/wire-version-N`, N the `RGFX_VERSION` it was built with,
+under its signature. The kext registers its accelerator only for a bundle
+carrying the marker of its own version ("Registration waits for the bundle",
+below); for any other it says so in the kernel log and stays unregistered,
+so WindowServer composites in software, as with no bundle. The bundle does
+not check the version itself: a bundle that declined to make a device under
+a registered accelerator would leave WindowServer aborting, as with no
+bundle at all.
+
 Leaving the device means writing nothing to its registers or its region.
 The framebuffer's start resets the device (`STATUS` 0) only once every check
 that needs no command has passed, and resets it again on the way out only if
@@ -1080,8 +1091,11 @@ the framebuffer naming it or not. So the accelerator starts as before but
 registers only once its bundle is on disk:
 - From its start, a thread call checks every 100 ms for the bundle's
   executable, `/Library/GPUBundles/NAME.bundle/Contents/MacOS/NAME`, NAME its
-  `MetalPluginName`: nothing before the root file system is mounted
-  (`vfs_rootvnode`), then a `vnode_lookup`. `/Library/GPUBundles` is on the
+  `MetalPluginName`, and for the marker of the kext's wire version beside it,
+  `Contents/Resources/wire-version-N` ("The wire's version"): nothing before
+  the root file system is mounted (`vfs_rootvnode`), then a `vnode_lookup` of
+  each. An executable without that marker is a bundle of another version, and
+  counts as none. `/Library/GPUBundles` is on the
   data volume, which launchd mounts early in boot, well before it starts
   WindowServer, so with the bundle installed the accelerator is registered
   before WindowServer looks for a GPU.

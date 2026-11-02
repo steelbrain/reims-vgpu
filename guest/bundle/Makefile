@@ -225,18 +225,27 @@ $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) Makefile
 # platform process, whose Library Validation refuses an unsigned bundle (dlopen error 71),
 # whatever amfi_get_out_of_my_way says; an ad-hoc signature it takes. The tarball is the same
 # directory, as the guest install takes it.
+#
+# Contents/Resources/wire-version-N, empty, names the wire's version the bundle speaks
+# (RGFX_VERSION in the wire header): the kext registers its accelerator only for a bundle
+# carrying the marker of its own version (guest/kext/src/RgfxBundlePaths.hpp; design.md, "The
+# wire's version"). It lies under the signature, as every file of the bundle does.
 
 PACKAGE    = $(BUILD)/package/reims-graphics.bundle
 PACKAGETGZ = $(BUILD)/reims-graphics.bundle.tgz
+WIRE_H       = ../../crates/reims-graphics/include/reims_graphics_wire.h
+WIRE_VERSION = $(shell sed -n 's/^\#define RGFX_VERSION \([0-9][0-9]*\)$$/\1/p' $(WIRE_H))
 
 package: $(PACKAGETGZ)
 
-$(PACKAGETGZ): $(BUNDLEBIN) Info.plist Makefile
+$(PACKAGETGZ): $(BUNDLEBIN) Info.plist $(WIRE_H) Makefile
+	@test -n "$(WIRE_VERSION)" || { echo "no RGFX_VERSION in $(WIRE_H)"; exit 1; }
 	rm -rf $(PACKAGE)
-	@mkdir -p $(PACKAGE)/Contents/MacOS
+	@mkdir -p $(PACKAGE)/Contents/MacOS $(PACKAGE)/Contents/Resources
 	plutil -lint Info.plist > /dev/null
 	cp Info.plist $(PACKAGE)/Contents/Info.plist
 	cp $(BUNDLEBIN) $(PACKAGE)/Contents/MacOS/reims-graphics
+	: > $(PACKAGE)/Contents/Resources/wire-version-$(WIRE_VERSION)
 	codesign --force --sign - $(PACKAGE)
 	codesign -v --strict $(PACKAGE)
 	COPYFILE_DISABLE=1 tar -C $(dir $(PACKAGE)) -czf $@ reims-graphics.bundle
