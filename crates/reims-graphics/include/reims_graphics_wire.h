@@ -1132,6 +1132,36 @@
 // [`RgfxArgumentMemberRecord::layout`]: no layout.
 #define RGFX_ARGUMENT_NO_LAYOUT 4294967295
 
+// Where a `TEXTURE_FROM_IOSURFACE` message's [`RgfxSurfaceFacts`] start: right
+// after its [`RgfxTextureFromIOSurface`].
+#define RGFX_SURFACE_FACTS_OFFSET 120
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`] of a surface with no
+// `IOSurfaceYCbCrMatrix` value.
+#define RGFX_YCBCR_MATRIX_NONE 0
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `ITU_R_601_4`.
+#define RGFX_YCBCR_MATRIX_ITU_R_601_4 1
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `ITU_R_709_2`.
+#define RGFX_YCBCR_MATRIX_ITU_R_709_2 2
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `ITU_R_2020`.
+#define RGFX_YCBCR_MATRIX_ITU_R_2020 3
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `SMPTE_240M_1995`.
+#define RGFX_YCBCR_MATRIX_SMPTE_240M_1995 4
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `DCI_P3`.
+#define RGFX_YCBCR_MATRIX_DCI_P3 5
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `P3_D65`.
+#define RGFX_YCBCR_MATRIX_P3_D65 6
+
+// [`RgfxSurfaceFacts::ycbcr_matrix`]: any other value, a string of another
+// text or a value that is no string.
+#define RGFX_YCBCR_MATRIX_OTHER 7
+
 // [`RgfxTextureFromIOSurface::writers_offset`] of a copy with no
 // [`RgfxSurfaceWriters`].
 #define RGFX_SURFACE_NO_WRITERS UINT64_MAX
@@ -4328,6 +4358,12 @@ typedef struct {
 // `writers_offset` is where in the buffer the copy's [`RgfxSurfaceWriters`]
 // lie ([`RGFX_SURFACE_NO_WRITERS`] for none): the command buffers committed
 // that write the copy, which a present of the surface waits for.
+//
+// The surface's facts ([`RgfxSurfaceFacts`]) may follow the struct, at
+// [`RGFX_SURFACE_FACTS_OFFSET`]: a message whose `size` is at least
+// `RGFX_SURFACE_FACTS_OFFSET + size_of::<RgfxSurfaceFacts>()` carries them, one
+// of `RGFX_SURFACE_FACTS_OFFSET` none, and a size between the two is
+// malformed.
 typedef struct {
   // [`RGFX_CMD_TEXTURE_FROM_IOSURFACE`].
   RgfxMsgHeader header;
@@ -4351,6 +4387,37 @@ typedef struct {
   // [`RGFX_SURFACE_NO_WRITERS`] for none.
   uint64_t writers_offset;
 } RgfxTextureFromIOSurface;
+
+// The facts of the surface a `TEXTURE_FROM_IOSURFACE` texture lies over, as
+// the guest's IOSurface API gives them when the texture is made, after the
+// [`RgfxTextureFromIOSurface`] at [`RGFX_SURFACE_FACTS_OFFSET`]: what a texture
+// over a surface reads of the surface besides its plane, as Metal's does (a
+// two-plane YCbCr texture over plane 0 reads plane 1's chroma, converted by
+// the surface's range and matrix). `chroma_offset` and `chroma_bytes_per_row`
+// place plane 1 in the guest's copy of the surface, the message's buffer, as
+// `offset` and `bytes_per_row` place the texture's own plane.
+typedef struct {
+  // `IOSurfaceGetPixelFormat`: the surface's OSType, its four characters
+  // big-endian (`'x420'` is `0x7834_3230`).
+  uint32_t surface_pixel_format;
+  // `IOSurfaceGetPlaneCount`: 0 for a surface without planes.
+  uint32_t plane_count;
+  // `IOSurfaceGetWidth`: the surface's width, its plane 0's.
+  uint32_t width;
+  // `IOSurfaceGetHeight`: the surface's height, its plane 0's.
+  uint32_t height;
+  // Plane 1's first byte in the message's buffer; 0 for a surface of fewer
+  // than two planes.
+  uint64_t chroma_offset;
+  // Bytes from one of plane 1's rows to the next in the message's buffer; 0
+  // for a surface of fewer than two planes.
+  uint64_t chroma_bytes_per_row;
+  // The surface's YCbCr matrix as the texture is made, one of
+  // `RGFX_YCBCR_MATRIX_*`.
+  uint32_t ycbcr_matrix;
+  // Zero.
+  uint32_t reserved_24;
+} RgfxSurfaceFacts;
 
 // One command queue's latest command buffer that writes a surface plane's
 // copy: the queue's id and the buffer's `seqno` on the queue's submission ring.

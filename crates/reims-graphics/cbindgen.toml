@@ -242,6 +242,7 @@ include = [
     "RgfxTextureDescriptor",
     "RgfxTextureFromBuffer",
     "RgfxTextureFromIOSurface",
+    "RgfxSurfaceFacts",
     "RgfxSurfaceWriter",
     "RgfxSurfaceWriters",
     "RgfxTextureReplaceRegion",

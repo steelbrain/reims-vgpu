@@ -60,15 +60,16 @@ use reims_graphics::wire::{
     RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
     RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_SURFACE_NO_WRITERS, RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory,
-    RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
-    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
-    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor,
-    RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout,
+    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RgfxBufferAtOffset, RgfxBufferCreate,
+    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
+    RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate,
+    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
+    RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPipelineReflection,
+    RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate,
+    RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign,
+    RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfaceWriter, RgfxSurfaceWriters,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface,
+    RgfxVertexAttribute, RgfxVertexBufferLayout,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -1045,6 +1046,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let Some(m) = read::<RgfxTextureFromIOSurface>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
+                let facts = match surface_facts(&m, message) {
+                    Ok(facts) => facts,
+                    Err(e) => return Ok(Err(e)),
+                };
                 if !self.holds_resource_id(m.obj_id, m.resource_id) {
                     return Ok(Err(DecodeError::BadResourceId));
                 }
@@ -1093,7 +1098,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                             offset: m.offset,
                             bytes_per_row: m.bytes_per_row,
                             bytes_per_image: None,
-                            surface: Some((m.iosurface_id, m.plane)),
+                            surface: Some((m.iosurface_id, m.plane, facts)),
                         });
                     }
                     made
@@ -2256,8 +2261,9 @@ struct TextureOverBuffer<'a> {
     bytes_per_row: u64,
     /// A linear texture's bytes between its slices.
     bytes_per_image: Option<u64>,
-    /// An IOSurface texture's surface id and plane.
-    surface: Option<(u32, u32)>,
+    /// An IOSurface texture's surface id and plane, and the surface's facts where the create
+    /// carried them.
+    surface: Option<(u32, u32, Option<RgfxSurfaceFacts>)>,
 }
 
 /// Logs a texture over a buffer the platform made none of: it names no reason (Metal answers nil
@@ -2268,8 +2274,21 @@ fn log_refused_texture(t: &TextureOverBuffer<'_>) {
     let image = t
         .bytes_per_image
         .map_or_else(String::new, |bytes| format!(", {bytes} bytes an image"));
-    let surface = t.surface.map_or_else(String::new, |(id, plane)| {
-        format!(", IOSurface {id:#x} plane {plane}")
+    let surface = t.surface.map_or_else(String::new, |(id, plane, facts)| {
+        let facts = facts.map_or_else(String::new, |f| {
+            format!(
+                " (pixel format {}, {} planes, {} x {}, plane 1 at offset {}, {} bytes a row, \
+                 YCbCr matrix {})",
+                four_characters(f.surface_pixel_format),
+                f.plane_count,
+                f.width,
+                f.height,
+                f.chroma_offset,
+                f.chroma_bytes_per_row,
+                f.ycbcr_matrix
+            )
+        });
+        format!(", IOSurface {id:#x} plane {plane}{facts}")
     });
     log::warn!(
         target: "reims_vgpu::graphics",
@@ -2293,6 +2312,42 @@ fn log_refused_texture(t: &TextureOverBuffer<'_>) {
         t.offset,
         t.bytes_per_row,
     );
+}
+
+/// The surface's facts after a `TEXTURE_FROM_IOSURFACE` message's struct `m`, by the message's
+/// size ([`RGFX_SURFACE_FACTS_OFFSET`]): none for a message of the struct alone (or one whose size
+/// says less, as before the facts), the facts for one of the struct and the facts or more; a size
+/// between the two, or a message shorter than the facts, is malformed.
+fn surface_facts(
+    m: &RgfxTextureFromIOSurface,
+    message: &[u8],
+) -> Result<Option<RgfxSurfaceFacts>, DecodeError> {
+    let start = RGFX_SURFACE_FACTS_OFFSET as usize;
+    let end = start + size_of::<RgfxSurfaceFacts>();
+    let size = m.header.size as usize;
+    if size <= start {
+        return Ok(None);
+    }
+    if size < end {
+        return Err(DecodeError::Malformed);
+    }
+    message
+        .get(start..end)
+        .and_then(|bytes| RgfxSurfaceFacts::read_from_bytes(bytes).ok())
+        .map(Some)
+        .ok_or(DecodeError::Malformed)
+}
+
+/// An OSType as its four characters, quoted, where each is printable ASCII; else its value in hex.
+fn four_characters(code: u32) -> String {
+    let bytes = code.to_be_bytes();
+    match bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        true => format!(
+            "'{}'",
+            bytes.iter().map(|&b| char::from(b)).collect::<String>()
+        ),
+        false => format!("{code:#010x}"),
+    }
 }
 
 /// The core stencil descriptor for one face from its wire record.
@@ -3555,6 +3610,141 @@ mod tests {
             logs.take()
                 .iter()
                 .all(|(level, ..)| *level != log::Level::Warn)
+        );
+    }
+
+    /// A `TEXTURE_FROM_IOSURFACE` carries the surface's facts after its struct where its size
+    /// covers them, and none at the struct's size, as before them; a size between the two, or a
+    /// message shorter than its size, is malformed and reaches no platform call. A refused
+    /// texture's warning names the facts it carried.
+    #[test]
+    fn a_surface_texture_reads_its_facts_by_the_message_size() {
+        use reims_graphics::wire::{
+            RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts,
+        };
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(Region::new(0x10000).unwrap()),
+        );
+        let obj = |n: u64| (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let grant = RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context: 1,
+            chunk: 0,
+        };
+        assert_eq!(dec.decode(&device, grant.as_bytes()).unwrap(), Ok(()));
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(10),
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: 0x7834_3230, // 'x420'
+            plane_count: 2,
+            width: 64,
+            height: 48,
+            chroma_offset: 16384,
+            chroma_bytes_per_row: 256,
+            ycbcr_matrix: RGFX_YCBCR_MATRIX_ITU_R_2020,
+            reserved_24: 0,
+        };
+        // A texture over plane 0 of the copy, its message `size` bytes: the struct, then the
+        // facts, cut to `len` bytes.
+        let message = |n: u64, size: usize, len: usize| {
+            let m = RgfxTextureFromIOSurface {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                    size: size as u32,
+                    seqno: 0,
+                },
+                obj_id: obj(n),
+                resource_id: n,
+                buffer_obj_id: obj(10),
+                offset: 0,
+                bytes_per_row: 256,
+                iosurface_id: 0x2c,
+                plane: 0,
+                desc: RgfxTextureDescriptor {
+                    pixel_format: 505,
+                    texture_type: 2,
+                    width: 64,
+                    height: 48,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    array_length: 1,
+                    sample_count: 1,
+                    usage: 1,
+                    ..RgfxTextureDescriptor::default()
+                },
+                writers_offset: RGFX_SURFACE_NO_WRITERS,
+            };
+            let mut bytes = m.as_bytes().to_vec();
+            bytes.extend_from_slice(facts.as_bytes());
+            bytes.truncate(len);
+            bytes
+        };
+        let start = RGFX_SURFACE_FACTS_OFFSET as usize;
+        let whole = start + size_of::<RgfxSurfaceFacts>();
+        let made = || {
+            p.call_log()
+                .calls_to("newTextureWithDescriptor:offset:bytesPerRow:")
+                .len()
+        };
+
+        // With the facts, and without them (the struct's size, its trailing bytes ignored).
+        for (n, size) in [(11, whole), (12, start)] {
+            assert_eq!(
+                dec.decode(&device, &message(n, size, whole)).unwrap(),
+                Ok(()),
+                "size {size}"
+            );
+        }
+        assert_eq!(made(), 2);
+
+        // A size between the two, and a size that covers the facts on a message without them.
+        for (n, size, len) in [(13, start + 8, whole), (14, whole, start)] {
+            assert_eq!(
+                dec.decode(&device, &message(n, size, len)).unwrap(),
+                Err(DecodeError::Malformed),
+                "size {size}, {len} bytes"
+            );
+        }
+        assert_eq!(made(), 2, "no platform call for a malformed message");
+
+        // A refused texture's warning names the facts.
+        let logs = reims_vgpu_core::testkit::logs::capture();
+        p.script()
+            .push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
+        assert_eq!(
+            dec.decode(&device, &message(15, whole, whole)).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        let warned: Vec<_> = logs
+            .take()
+            .into_iter()
+            .filter(|(level, ..)| *level == log::Level::Warn)
+            .map(|(.., line)| line)
+            .collect();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].ends_with(
+                ", at offset 0, 256 bytes a row, IOSurface 0x2c plane 0 (pixel format 'x420', 2 \
+                 planes, 64 x 48, plane 1 at offset 16384, 256 bytes a row, YCbCr matrix 3)"
+            ),
+            "{}",
+            warned[0]
         );
     }
 

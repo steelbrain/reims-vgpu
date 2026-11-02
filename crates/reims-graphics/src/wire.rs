@@ -1484,6 +1484,12 @@ pub struct RgfxLinearTextureFromBuffer {
 /// `writers_offset` is where in the buffer the copy's [`RgfxSurfaceWriters`]
 /// lie ([`RGFX_SURFACE_NO_WRITERS`] for none): the command buffers committed
 /// that write the copy, which a present of the surface waits for.
+///
+/// The surface's facts ([`RgfxSurfaceFacts`]) may follow the struct, at
+/// [`RGFX_SURFACE_FACTS_OFFSET`]: a message whose `size` is at least
+/// `RGFX_SURFACE_FACTS_OFFSET + size_of::<RgfxSurfaceFacts>()` carries them, one
+/// of `RGFX_SURFACE_FACTS_OFFSET` none, and a size between the two is
+/// malformed.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -1511,6 +1517,64 @@ pub struct RgfxTextureFromIOSurface {
     /// [`RGFX_SURFACE_NO_WRITERS`] for none.
     pub writers_offset: u64,
 }
+
+/// Where a `TEXTURE_FROM_IOSURFACE` message's [`RgfxSurfaceFacts`] start: right
+/// after its [`RgfxTextureFromIOSurface`].
+pub const RGFX_SURFACE_FACTS_OFFSET: u32 = 120;
+
+/// The facts of the surface a `TEXTURE_FROM_IOSURFACE` texture lies over, as
+/// the guest's IOSurface API gives them when the texture is made, after the
+/// [`RgfxTextureFromIOSurface`] at [`RGFX_SURFACE_FACTS_OFFSET`]: what a texture
+/// over a surface reads of the surface besides its plane, as Metal's does (a
+/// two-plane YCbCr texture over plane 0 reads plane 1's chroma, converted by
+/// the surface's range and matrix). `chroma_offset` and `chroma_bytes_per_row`
+/// place plane 1 in the guest's copy of the surface, the message's buffer, as
+/// `offset` and `bytes_per_row` place the texture's own plane.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfaceFacts {
+    /// `IOSurfaceGetPixelFormat`: the surface's OSType, its four characters
+    /// big-endian (`'x420'` is `0x7834_3230`).
+    pub surface_pixel_format: u32,
+    /// `IOSurfaceGetPlaneCount`: 0 for a surface without planes.
+    pub plane_count: u32,
+    /// `IOSurfaceGetWidth`: the surface's width, its plane 0's.
+    pub width: u32,
+    /// `IOSurfaceGetHeight`: the surface's height, its plane 0's.
+    pub height: u32,
+    /// Plane 1's first byte in the message's buffer; 0 for a surface of fewer
+    /// than two planes.
+    pub chroma_offset: u64,
+    /// Bytes from one of plane 1's rows to the next in the message's buffer; 0
+    /// for a surface of fewer than two planes.
+    pub chroma_bytes_per_row: u64,
+    /// The surface's YCbCr matrix as the texture is made, one of
+    /// `RGFX_YCBCR_MATRIX_*`.
+    pub ycbcr_matrix: u32,
+    /// Zero.
+    pub reserved_24: u32,
+}
+
+/// [`RgfxSurfaceFacts::ycbcr_matrix`] of a surface with no
+/// `IOSurfaceYCbCrMatrix` value.
+pub const RGFX_YCBCR_MATRIX_NONE: u32 = 0;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `ITU_R_601_4`.
+pub const RGFX_YCBCR_MATRIX_ITU_R_601_4: u32 = 1;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `ITU_R_709_2`.
+pub const RGFX_YCBCR_MATRIX_ITU_R_709_2: u32 = 2;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `ITU_R_2020`.
+pub const RGFX_YCBCR_MATRIX_ITU_R_2020: u32 = 3;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `SMPTE_240M_1995`.
+pub const RGFX_YCBCR_MATRIX_SMPTE_240M_1995: u32 = 4;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `DCI_P3`.
+pub const RGFX_YCBCR_MATRIX_DCI_P3: u32 = 5;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: the value `P3_D65`.
+pub const RGFX_YCBCR_MATRIX_P3_D65: u32 = 6;
+/// [`RgfxSurfaceFacts::ycbcr_matrix`]: any other value, a string of another
+/// text or a value that is no string.
+pub const RGFX_YCBCR_MATRIX_OTHER: u32 = 7;
 
 /// [`RgfxTextureFromIOSurface::writers_offset`] of a copy with no
 /// [`RgfxSurfaceWriters`].
@@ -2268,6 +2332,10 @@ const _: () = {
     assert!(size_of::<RgfxTextureFromBuffer>() == 104);
     assert!(size_of::<RgfxLinearTextureFromBuffer>() == 112);
     assert!(size_of::<RgfxTextureFromIOSurface>() == 120);
+    assert!(RGFX_SURFACE_FACTS_OFFSET as usize == size_of::<RgfxTextureFromIOSurface>());
+    assert!(size_of::<RgfxSurfaceFacts>() == 40);
+    assert!(core::mem::offset_of!(RgfxSurfaceFacts, chroma_offset) == 0x10);
+    assert!(core::mem::offset_of!(RgfxSurfaceFacts, ycbcr_matrix) == 0x20);
     assert!(size_of::<RgfxSurfaceWriters>() == 64);
     assert!(size_of::<RgfxSamplerCreate>() == 72);
     assert!(size_of::<RgfxStencilDescriptor>() == 24);
