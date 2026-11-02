@@ -323,16 +323,17 @@ Stages:
         (`guest/bundle/src/RgfxAirArguments.hpp`), since the host gives no
         binding reflection. Those declared under function constants are the
         function's whatever the constants' values. Where the arguments do
-        not read, a binding of a kind the reader does not know among them, a
-        bound texture with ShaderWrite usage, or an unknown usage, counts as
-        written. A surface used without Write usage counts as written at a
-        draw or dispatch whose function's arguments do not read or whose
-        argument buffer may write a texture: Metal takes useResource's usage
-        for the app's promise, but a discrete Mac's driver lands a write the
-        promise left out. Narrowing may only drop a write the function
-        cannot make. The same rule decides the copy's write-back: a buffer
-        writes a copy back to the pages only where it writes the surface,
-        never for a surface it only reads;
+        not read (a binding of a kind the reader does not know among them),
+        or a written texture's binding index is an expression of function
+        constants, a bound texture counts as written where its usage has
+        ShaderWrite or is unknown. A surface used without Write usage counts
+        as written at a draw or dispatch whose function's arguments do not
+        read or whose argument buffer may write a texture: Metal takes
+        useResource's usage for the app's promise, but a discrete Mac's
+        driver lands a write the promise left out. Narrowing may only drop a
+        write the function cannot make. The same rule decides the copy's
+        write-back: a buffer writes a copy back to the pages only where it
+        writes the surface, never for a surface it only reads;
       - the committer's own lock waits from the buffer's submission on. At
         the commit itself the AMD's returns at once, a race. Loose: ours
         waits from the commit on;

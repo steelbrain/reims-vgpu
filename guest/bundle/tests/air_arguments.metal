@@ -1,7 +1,8 @@
 // The shaders of air_arguments_test.cpp: entry points of every stage the reader answers for,
 // with binding arguments of each kind and access, arrays of them, argument buffers with and
 // without a written texture, a function constant, arguments declared under function constants,
-// a stage input, a function table and an acceleration structure, and a function of no texture.
+// binding indices function constants set, a vertex function's and a kernel's stage input, a
+// function table and an acceleration structure, and a function of no texture.
 // Built into a .metallib by Apple's Metal compiler at test time; never committed.
 #include <metal_raytracing>
 #include <metal_stdlib>
@@ -97,6 +98,31 @@ kernel void conditional_planes(device const uint *rows [[buffer(0)]],
 	}
 }
 
+constant int kPlane [[function_constant(4)]];
+constant int kOut [[function_constant(5)]];
+
+// A plane read and an output written at binding indices function constants set, the plane's
+// under a constant too: either may be at any index.
+kernel void planes_where_constants_say(device const uint *rows [[buffer(0)]],
+                                       texture2d<half, access::read> luma
+                                           [[texture(kPlane), function_constant(kHasLuma)]],
+                                       texture2d<half, access::write> out [[texture(kOut + 1)]],
+                                       uint2 g [[thread_position_in_grid]])
+{
+	half v = half(rows[g.y]);
+	if (kHasLuma)
+		v += luma.read(g).x;
+	out.write(half4(v), g);
+}
+
+// A plane read at an index a function constant sets, its output written at 3.
+kernel void reads_where_constants_say(texture2d<half, access::read> luma [[texture(kPlane)]],
+                                      texture2d<half, access::write> out [[texture(3)]],
+                                      uint2 g [[thread_position_in_grid]])
+{
+	out.write(luma.read(g), g);
+}
+
 [[visible]] float doubled(float x)
 {
 	return x * 2;
@@ -113,6 +139,17 @@ vertex VertexOut reads_attributes(Attributes in [[stage_in]], constant float4 &s
 	VertexOut o;
 	o.p = in.position * scale;
 	return o;
+}
+
+// A kernel's stage input, its attributes fetched from buffers: a binding of no texture.
+kernel void reads_stage_in(Attributes in [[stage_in]], device float4 *out [[buffer(1)]],
+                           texture2d<float, access::write> w
+                               [[texture(0), function_constant(kHasPacked)]],
+                           uint g [[thread_position_in_grid]])
+{
+	out[g] = in.position;
+	if (kHasPacked)
+		w.write(in.position, uint2(g, 0));
 }
 
 kernel void calls_through_table(device float *out [[buffer(0)]],

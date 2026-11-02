@@ -538,6 +538,15 @@ bool writes(RgfxAirAccess a)
 	return a == RgfxAirAccess::Write || a == RgfxAirAccess::ReadWrite;
 }
 
+// Whether metadata `i` is a global variable of the module (one no function is): a binding index
+// function constants set, which the module's initialiser stores there.
+bool mdGlobalVariable(const Module &m, uint64_t i)
+{
+	const Module::Md *d = mdAt(m, i);
+	return d != nullptr && d->kind == Module::Md::kValue && d->value < m.globals.size() &&
+	       !m.globals[static_cast<size_t>(d->value)].function;
+}
+
 // An argument node's binding (`air.location_index`, index, count) and access, from operand
 // `from` on. False where it has no binding the reader can follow.
 bool binding(const Module &m, const Module::Md &node, size_t from, RgfxAirArgument &a)
@@ -549,8 +558,12 @@ bool binding(const Module &m, const Module::Md &node, size_t from, RgfxAirArgume
 			continue;
 		if (*s == "air.location_index" && !haveIndex && i + 2 < node.ops.size()) {
 			int64_t index = 0, count = 0;
-			if (!mdInteger(m, node.ops[i + 1], index) || !mdInteger(m, node.ops[i + 2], count) ||
-			    index < 0 || count < 1 || index > UINT32_MAX || count > UINT32_MAX)
+			if (mdGlobalVariable(m, node.ops[i + 1]))
+				a.anyIndex = true;
+			else if (!mdInteger(m, node.ops[i + 1], index))
+				return false;
+			if (!mdInteger(m, node.ops[i + 2], count) || index < 0 || count < 1 ||
+			    index > UINT32_MAX || count > UINT32_MAX)
 				return false;
 			a.index = static_cast<uint32_t>(index);
 			a.count = static_cast<uint32_t>(count);
@@ -614,12 +627,13 @@ bool indirectWritesTextures(const Module &m, const Module::Md &node)
 }
 
 // The binding kinds besides buffers, argument buffers, textures and samplers that our Metal
-// compiler gives an `air.location_index`, none of them a texture: a vertex function's stage
-// input attribute, and the function tables and acceleration structures, bound among the
-// buffers.
+// compiler gives an `air.location_index`, none of them a texture: a vertex function's and a
+// kernel's stage input attribute (an attribute of the stage input descriptor, fetched from
+// buffers), and the function tables and acceleration structures, bound among the buffers.
 bool bindsNoTexture(const std::string &kind)
 {
-	return kind == "air.vertex_input" || kind == "air.visible_function_table" ||
+	return kind == "air.vertex_input" || kind == "air.stage_in" ||
+	       kind == "air.visible_function_table" ||
 	       kind == "air.intersection_function_table" ||
 	       kind == "air.instance_acceleration_structure" ||
 	       kind == "air.primitive_acceleration_structure";
@@ -872,8 +886,17 @@ bool rgfxMetallibBitcode(const uint8_t *p, size_t n, const std::string &name,
 bool rgfxAirWritesTexture(const RgfxAirFunction &fn, uint32_t index)
 {
 	for (const RgfxAirArgument &a : fn.arguments) {
-		if (a.kind == RgfxAirKind::Texture && index >= a.index && index - a.index < a.count &&
-		    writes(a.access))
+		if (a.kind == RgfxAirKind::Texture && !a.anyIndex && index >= a.index &&
+		    index - a.index < a.count && writes(a.access))
+			return true;
+	}
+	return false;
+}
+
+bool rgfxAirWritesTextureAnywhere(const RgfxAirFunction &fn)
+{
+	for (const RgfxAirArgument &a : fn.arguments) {
+		if (a.kind == RgfxAirKind::Texture && a.anyIndex && writes(a.access))
 			return true;
 	}
 	return false;

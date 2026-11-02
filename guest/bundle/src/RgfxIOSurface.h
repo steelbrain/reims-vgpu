@@ -179,9 +179,10 @@ public:
 	void resident(id _Nullable resource);
 	/// At a draw or dispatch of the function whose arguments are `fn`, records on `enc` as
 	/// written, once each while it stays bound or resident:
-	/// - each bound texture over an IOSurface the function writes (rgfxAirWritesTexture), or,
-	///   where `fn` is null, its arguments unknown, each whose usage has ShaderWrite or is
-	///   MTLTextureUsageUnknown, which allows every use;
+	/// - each bound texture over an IOSurface the function writes (rgfxAirWritesTexture), and,
+	///   where `fn` is null, its arguments unknown, or has a written texture argument at an index
+	///   function constants set (rgfxAirWritesTextureAnywhere), each whose usage has ShaderWrite
+	///   or is MTLTextureUsageUnknown, which allows every use;
 	/// - each resident texture (rgfxIOSurfaceNoteWrite, and its copy of app memory) where `fn` is
 	///   null or one of its argument buffers may write a texture, and each resident buffer over
 	///   app memory where `fn` is null or has an argument buffer. Metal takes the usage

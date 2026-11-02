@@ -20,6 +20,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -495,6 +496,14 @@ static bool rgfxMade(uint32_t status)
 	return fn;
 }
 
+bool rgfxAirUnreadFirstLog(const std::string &name)
+{
+	static std::mutex lock;
+	static std::set<std::string> logged;
+	std::lock_guard<std::mutex> hold(lock);
+	return logged.insert(name).second;
+}
+
 // The arguments of the entry point `name`, read from its bitcode in the bytes the library was
 // made from, once: null where the library kept no bytes (one Metal's link or stitching made), or
 // they do not read, so which textures the function writes is unknown.
@@ -535,9 +544,9 @@ static bool rgfxMade(uint32_t status)
 			if (air == nullptr)
 				why = "its module declares no such entry point";
 		}
-		if (air == nullptr)
+		if (air == nullptr && rgfxAirUnreadFirstLog(name))
 			NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
-			      @"where their usage has ShaderWrite",
+			      @"where their usage has ShaderWrite (logged once a process)",
 			      name.c_str(), why);
 	}
 	_air.emplace(name, air);

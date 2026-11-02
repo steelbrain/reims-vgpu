@@ -131,12 +131,45 @@ int main()
 	          rgfxAirWritesTexture(planes, 2),
 	      "conditional_planes writes texture 2 alone");
 
+	// Binding indices function constants set: arguments at any index, which write no texture at
+	// a given index; a function writing one may write a texture bound at any index.
+	const RgfxAirFunction anywhere = entry(lib, "planes_where_constants_say");
+	check(anywhere.arguments.size() == 3, "planes_where_constants_say: a buffer and two textures");
+	expect(anywhere, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::Read, "a read buffer at 0");
+	int anyRead = 0, anyWritten = 0;
+	for (const RgfxAirArgument &a : anywhere.arguments) {
+		if (a.kind == RgfxAirKind::Texture && a.anyIndex && a.index == 0 && a.count == 1) {
+			anyRead += a.access == RgfxAirAccess::Read;
+			anyWritten += a.access == RgfxAirAccess::Write;
+		}
+	}
+	check(anyRead == 1 && anyWritten == 1,
+	      "planes_where_constants_say: a read texture and a written one, each at any index");
+	bool atNone = true;
+	for (uint32_t i = 0; i < 32; i++)
+		atNone = atNone && !rgfxAirWritesTexture(anywhere, i);
+	check(atNone && rgfxAirWritesTextureAnywhere(anywhere),
+	      "planes_where_constants_say writes a texture at any index, none at a given one");
+	const RgfxAirFunction readsAnywhere = entry(lib, "reads_where_constants_say");
+	check(readsAnywhere.arguments.size() == 2 && !rgfxAirWritesTextureAnywhere(readsAnywhere) &&
+	          rgfxAirWritesTexture(readsAnywhere, 3) && !rgfxAirWritesTexture(readsAnywhere, 0),
+	      "reads_where_constants_say: reads at any index, writes texture 3 alone");
+	check(!rgfxAirWritesTextureAnywhere(planes) && !rgfxAirWritesTextureAnywhere(all),
+	      "functions of fixed indices write nowhere else");
+
 	// A stage input's attribute, a function table and an acceleration structure: bindings of no
 	// texture, beside those the function has.
 	const RgfxAirFunction attributes = entry(lib, "reads_attributes");
 	check(attributes.stage == RgfxAirStage::Vertex && attributes.arguments.size() == 1,
 	      "reads_attributes: its buffer alone, past its stage input");
 	expect(attributes, RgfxAirKind::Buffer, 1, 1, RgfxAirAccess::Read, "a constant at buffer 1");
+	const RgfxAirFunction stageIn = entry(lib, "reads_stage_in");
+	check(stageIn.stage == RgfxAirStage::Kernel && stageIn.arguments.size() == 2,
+	      "reads_stage_in: its buffer and texture alone, past its stage input");
+	expect(stageIn, RgfxAirKind::Buffer, 1, 1, RgfxAirAccess::ReadWrite, "a device buffer at 1");
+	expect(stageIn, RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Write,
+	       "a written texture at 0 under a constant");
+	check(rgfxAirWritesTexture(stageIn, 0), "reads_stage_in writes texture 0");
 	const RgfxAirFunction table = entry(lib, "calls_through_table");
 	check(table.arguments.size() == 2, "calls_through_table: its buffer and texture alone");
 	expect(table, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::ReadWrite, "a device buffer at 0");

@@ -18,6 +18,8 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+#include <string>
+
 class RgfxRegion;
 class RgfxSerializer;
 #endif
@@ -155,6 +157,14 @@ id<MTLLibrary> _Nullable RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *des
                                                id<MTLBinaryArchive> _Nullable destination, RgfxStitchBlock stitch,
                                                RgfxLibraryMaker makeLibrary,
                                                NSError *__autoreleasing _Nullable *_Nullable error);
+
+#ifdef __cplusplus
+/// Whether this process is yet to log that the arguments of the entry point `name` were not read:
+/// true the first time a name is asked, false after. A process can make a library of the same
+/// bytes again and again (measured: macOS 26.6.1's HEIC decode makes one for nearly every
+/// dispatch), and each would log its functions' line once.
+bool rgfxAirUnreadFirstLog(const std::string &name);
+#endif
 
 NS_ASSUME_NONNULL_END
 

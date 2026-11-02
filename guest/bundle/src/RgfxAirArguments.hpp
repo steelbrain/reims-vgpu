@@ -12,11 +12,13 @@
 // `air.location_index` and two integers, the index and the count (an array's length), and its
 // access with one of `air.read`, `air.write`, `air.read_write` and `air.sample`. An argument
 // declared under a function constant puts `air.function_constant` and the constant's node ahead
-// of its kind; it is read as the function's whatever the constant's value. A binding of a kind
-// the reader does not know makes the function's answer unknown; stage input attributes, function
-// tables and acceleration structures are named, as bindings of no texture. Read from modules
-// that Apple's Metal compiler built from our own sources (tests/air_arguments.metal), and as
-// LLVM's text form of the same modules prints them.
+// of its kind; it is read as the function's whatever the constant's value. A binding index that
+// is an expression of function constants is a global variable the module's initialiser sets in
+// place of the integer; the argument is read as one at any index. A binding of a kind the reader
+// does not know makes the function's answer unknown; a vertex function's and a kernel's stage
+// input attributes, function tables and acceleration structures are named, as bindings of no
+// texture. Read from modules that Apple's Metal compiler built from our own sources
+// (tests/air_arguments.metal), and as LLVM's text form of the same modules prints them.
 //
 // The reader is LLVM's bitstream format (its documented container: abbreviations, blocks and
 // records) over the module's blocks that carry the above: the module's global values and its
@@ -49,6 +51,9 @@ struct RgfxAirArgument {
 	// For an argument buffer: whether a texture among its members is written (write or
 	// read_write).
 	bool writesTextures;
+	// Whether its binding index is an expression of function constants (`[[texture(kIndex)]]`),
+	// which the function's specialisation sets: it may be at any index, and `index` is 0.
+	bool anyIndex;
 };
 
 // One entry point: its name, stage and binding arguments, in the module's order.
@@ -75,7 +80,12 @@ bool rgfxMetallibBitcode(const uint8_t *lib, size_t size, const std::string &nam
 
 // What `fn` does with the textures bound at `index` of its stage: true where an argument there
 // may write them (write or read_write), false where its arguments there only read or sample them
-// or none is there.
+// or none is there. An argument at any index (anyIndex) is at none: see
+// rgfxAirWritesTextureAnywhere.
 bool rgfxAirWritesTexture(const RgfxAirFunction &fn, uint32_t index);
+
+// Whether `fn` has a texture argument it may write (write or read_write) whose binding index
+// function constants set (anyIndex): a texture bound at any index of its stage may be it.
+bool rgfxAirWritesTextureAnywhere(const RgfxAirFunction &fn);
 
 #endif // RGFX_AIR_ARGUMENTS_HPP_

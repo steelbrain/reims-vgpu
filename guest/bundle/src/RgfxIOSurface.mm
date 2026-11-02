@@ -1370,14 +1370,13 @@ void RgfxSurfaceBindings::resident(id resource)
 
 void RgfxSurfaceBindings::noteWrites(RgfxEncoder *enc, const RgfxAirFunction *fn)
 {
+	const bool anywhere = fn != nullptr && rgfxAirWritesTextureAnywhere(*fn);
 	for (Bound &b : m_bound) {
 		if (b.noted) {
 			continue;
 		}
-		bool writes;
-		if (fn != nullptr) {
-			writes = rgfxAirWritesTexture(*fn, static_cast<uint32_t>(b.index));
-		} else {
+		bool writes = fn != nullptr && rgfxAirWritesTexture(*fn, static_cast<uint32_t>(b.index));
+		if (!writes && (fn == nullptr || anywhere)) {
 			const MTLTextureUsage usage = [(id<MTLTexture>)b.texture usage];
 			writes = usage == MTLTextureUsageUnknown || (usage & MTLTextureUsageShaderWrite) != 0;
 		}

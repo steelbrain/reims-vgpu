@@ -21,8 +21,10 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <tuple>
 
 #import "RgfxBuffer.h"
 #import "RgfxResource.h"
@@ -2063,6 +2065,41 @@ void test_library_air_arguments()
 	CHECK(bare != nil);
 	CHECK([(RgfxFunction *)[bare newFunctionWithName:@"every_access"] rgfxAirFunction] == nullptr);
 	drainRing(fx.ring);
+
+	// A function whose module does not read (its function table's kind spoilt), in two libraries
+	// of the same bytes: unknown in each, its line logged once a process.
+	std::vector<uint8_t> spoilt(static_cast<const uint8_t *>(bytes.bytes),
+	                            static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
+	const char kind[] = "air.visible_function_table";
+	auto it = std::search(spoilt.begin(), spoilt.end(), kind, kind + sizeof(kind) - 1);
+	CHECK(it != spoilt.end());
+	if (it == spoilt.end())
+		return;
+	*(it + sizeof(kind) - 2) = '_';
+	NSData *spoiltBytes = [NSData dataWithBytes:spoilt.data() length:spoilt.size()];
+	for (int i = 0; i < 2; i++) {
+		RgfxLibrary *again = [RgfxLibrary libraryWithData:spoiltBytes.bytes
+		                                           length:spoiltBytes.length
+		                                              key:nullptr
+		                                           device:nil
+		                                       serializer:&fx.ser
+		                                           status:&status];
+		[again rgfxSetSource:dispatch_data_create(spoiltBytes.bytes, spoiltBytes.length, nil, ^{
+			       (void)spoiltBytes;
+		       })
+		         shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			         return nil;
+		         }];
+		CHECK(again != nil);
+		CHECK([(RgfxFunction *)[again newFunctionWithName:@"calls_through_table"] rgfxAirFunction] ==
+		      nullptr);
+		CHECK([(RgfxFunction *)[again newFunctionWithName:@"conditional_planes"] rgfxAirFunction] !=
+		      nullptr);
+		drainRing(fx.ring);
+	}
+	CHECK(!rgfxAirUnreadFirstLog("calls_through_table"));
+	CHECK(rgfxAirUnreadFirstLog("no_function_of_this_name") &&
+	      !rgfxAirUnreadFirstLog("no_function_of_this_name"));
 }
 
 // A stitched library kept in a binary archive is found as Metal's archive finds one (measured:
@@ -5444,9 +5481,9 @@ void test_binds_note_shadow_writes()
 			return ps;
 		};
 		RgfxComputePipelineState *throughArgs =
-		    kernel({{RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, false}});
+		    kernel({{RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, false, false}});
 		RgfxComputePipelineState *noArgs =
-		    kernel({{RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, false}});
+		    kernel({{RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, false, false}});
 		const MTLSize one = MTLSizeMake(1, 1, 1);
 		CHECK(writtenBack([&](id<MTLComputeCommandEncoder> ce) {
 			[ce useResource:b usage:MTLResourceUsageRead];
@@ -7118,7 +7155,8 @@ void test_iosurface_writes_named()
 
 // A buffer names a surface to the kext only where it writes it (RgfxSurfaceBindings): a texture
 // bound where the draw's or dispatch's function writes, by its AIR arguments, or, where they are
-// unknown, one whose usage has ShaderWrite or is unknown; a resource used with Write usage; and
+// unknown or it writes a texture at an index function constants set, one whose usage has
+// ShaderWrite or is unknown; a resource used with Write usage; and
 // one used to read, where a function after it has an argument buffer that may write a texture,
 // or arguments unknown. A texture a function only samples or reads, one bound with no dispatch
 // after, and one used to read with no such function after, are not named, so no CPU lock waits
@@ -7194,7 +7232,25 @@ void test_iosurface_writes_by_function()
 		air->name = "f";
 		air->stage = stage;
 		for (const auto &[index, access] : textures)
-			air->arguments.push_back({RgfxAirKind::Texture, index, 1, access, false});
+			air->arguments.push_back({RgfxAirKind::Texture, index, 1, access, false, false});
+		[fn rgfxSetAirFunction:air];
+		return fn;
+	};
+	// A kernel of textures at indices function constants set, each of `accesses`, and one written
+	// at texture 1.
+	auto anyIndex = [&](std::vector<RgfxAirAccess> accesses) -> RgfxFunction * {
+		RgfxFunction *fn = [RgfxFunction functionWithLibrary:nil
+		                                                name:@"c"
+		                                           constants:nullptr
+		                                               count:0
+		                                              device:nil
+		                                          serializer:&ser];
+		auto air = std::make_shared<RgfxAirFunction>();
+		air->name = "c";
+		air->stage = RgfxAirStage::Kernel;
+		for (RgfxAirAccess access : accesses)
+			air->arguments.push_back({RgfxAirKind::Texture, 0, 1, access, false, true});
+		air->arguments.push_back({RgfxAirKind::Texture, 1, 1, RgfxAirAccess::Write, false, false});
 		[fn rgfxSetAirFunction:air];
 		return fn;
 	};
@@ -7211,7 +7267,7 @@ void test_iosurface_writes_by_function()
 		air->name = "a";
 		air->stage = stage;
 		air->arguments.push_back(
-		    {RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, writesTextures});
+		    {RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, writesTextures, false});
 		[fn rgfxSetAirFunction:air];
 		return fn;
 	};
@@ -7352,6 +7408,34 @@ void test_iosurface_writes_by_function()
 		[ce dispatchThreads:one threadsPerThreadgroup:one];
 		[ce endEncoding];
 		CHECK(named(cb) == 1);
+
+		// A kernel that writes a texture at an index function constants set: one bound at 0 whose
+		// usage has ShaderWrite is named, one whose usage has not, not; a kernel that only reads
+		// at such an index: not named.
+		td.usage = MTLTextureUsageShaderRead;
+		RgfxIOSurfaceTexture *readOnly = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                                   iosurface:surface
+		                                                                       plane:0
+		                                                                      region:&region
+		                                                                      device:nil
+		                                                                  serializer:&ser];
+		CHECK(readOnly != nil);
+		RgfxComputePipelineState *writesAnywhere =
+		    compute(anyIndex({RgfxAirAccess::Read, RgfxAirAccess::Write}));
+		RgfxComputePipelineState *readsAnywhere = compute(anyIndex({RgfxAirAccess::Read}));
+		drainRing(control);
+		for (const auto &[ps, texture, want] :
+		     {std::tuple<RgfxComputePipelineState *, id<MTLTexture>, int>{writesAnywhere, t, 1},
+		      {writesAnywhere, readOnly, 0},
+		      {readsAnywhere, t, 0}}) {
+			cb = [queue commandBuffer];
+			ce = [cb computeCommandEncoder];
+			[ce setComputePipelineState:ps];
+			[ce setTexture:texture atIndex:0];
+			[ce dispatchThreads:one threadsPerThreadgroup:one];
+			[ce endEncoding];
+			CHECK(named(cb) == want);
+		}
 
 		// Used to read, then a kernel whose argument buffer may write a texture: named, as a
 		// discrete Mac's driver lands the write whatever usage was given; one whose argument
