@@ -1,0 +1,395 @@
+//! H.264 decoding on Vulkan Video: the codec crate's decoder over an
+//! accelerator that maps its parameter sets onto a session parameters
+//! object, its DPB onto DPB slots, and decodes each picture into a surface
+//! its caller supplies, which is also that picture's DPB slot.
+//!
+//! The hardware reads the slice headers itself: what goes with the slices
+//! is the picture's std information and each reference's (its frame
+//! number or long-term index, its order counts), from which it builds the
+//! reference lists, as NVDEC does.
+
+mod params;
+mod session;
+
+use std::sync::Arc;
+
+use ash::vk;
+use ash::vk::native::{
+    StdVideoDecodeH264PictureInfo, StdVideoDecodeH264PictureInfoFlags,
+    StdVideoDecodeH264ReferenceInfo, StdVideoDecodeH264ReferenceInfoFlags,
+};
+use reims_vgpu_video_codec::h264::{
+    self, Accelerator, Decoder, NalFormat, Output, OutputOrder, PictureParams, ReferenceFrame,
+    SliceParams, avcc::DecoderConfiguration, slice::MemoryManagement, slice::SliceType, sps::Sps,
+};
+
+use self::session::{Decode, Session};
+use crate::device::VideoDevice;
+use crate::error::Error;
+use crate::picture::{ImageView, Picture};
+use crate::profile::{H264Capabilities, H264Profile, h264_capabilities};
+use crate::std_types::zeroed;
+use crate::surface::{SurfaceImage, SurfaceSource};
+use crate::timeline::Timeline;
+
+/// A decoded frame: its picture, which holds the surface it was decoded
+/// into, and what the decoder knows of it.
+pub type Frame<T> = Output<Picture<T>>;
+
+/// An H.264 decoder on a [`VideoDevice`], decoding into the surfaces `S`
+/// gives.
+///
+/// Samples are access units: length-prefixed NAL units with the `avcC`
+/// record's length size, as VideoToolbox's samples are, or Annex B for
+/// [`H264Decoder::new_annex_b`]. Frames come out in decode order unless
+/// [`H264Decoder::set_output_order`] asks for display order. Each decode
+/// is submitted and not waited for: a frame's picture names the timeline
+/// value that says it is done.
+pub struct H264Decoder<S: SurfaceSource> {
+    inner: Decoder<VulkanH264<S>>,
+}
+
+impl<S: SurfaceSource> H264Decoder<S> {
+    /// A decoder for samples described by an `avcC` record (ISO/IEC
+    /// 14496-15, 5.3.3.1), whose parameter sets it takes. The record's
+    /// first SPS is checked against what the decoder and the device take,
+    /// so that a stream they cannot decode is refused here.
+    pub fn new(device: &Arc<VideoDevice>, source: S, avcc: &[u8]) -> Result<Self, Error> {
+        let accelerator = VulkanH264::new(device, source)?;
+        let config = DecoderConfiguration::parse(avcc)?;
+        if let Some(&sps) = config.sequence_parameter_sets.first() {
+            let sps = Sps::parse(sps)?;
+            h264::check_supported(&sps)?;
+            select(&accelerator.capabilities, &sps)?;
+        }
+        Ok(Self {
+            inner: Decoder::from_avcc(accelerator, avcc)?,
+        })
+    }
+
+    /// A decoder for Annex B samples, which carry their parameter sets.
+    pub fn new_annex_b(device: &Arc<VideoDevice>, source: S) -> Result<Self, Error> {
+        Ok(Self {
+            inner: Decoder::new(VulkanH264::new(device, source)?, NalFormat::AnnexB),
+        })
+    }
+
+    /// Chooses decode order (the default) or display order.
+    pub fn set_output_order(&mut self, order: OutputOrder) {
+        self.inner.set_output_order(order);
+    }
+
+    /// Decodes one access unit, tagged `id`, and returns the frames that
+    /// come out ([`reims_vgpu_video_codec::h264::Decoder::decode`]). Their
+    /// decodes may still be running: each frame's picture says the value
+    /// its decode signals.
+    pub fn decode(&mut self, sample: &[u8], id: u64) -> Result<Vec<Frame<S::Surface>>, Error> {
+        self.inner.decode(sample, id)
+    }
+
+    /// Emits the frames still waiting for display order. References are
+    /// kept, so decoding can go on.
+    pub fn flush(&mut self) -> Vec<Frame<S::Surface>> {
+        self.inner.flush()
+    }
+
+    /// Forgets every reference, as for a seek.
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// The timeline semaphore each decode signals.
+    pub fn semaphore(&self) -> vk::Semaphore {
+        self.inner.accelerator().timeline.semaphore()
+    }
+
+    /// The profile the stream's session decodes with, once a picture has
+    /// started.
+    pub fn profile(&self) -> Option<H264Profile> {
+        self.inner
+            .accelerator()
+            .session
+            .as_ref()
+            .map(|s| s.caps.profile)
+    }
+}
+
+/// The Vulkan half of the decoder.
+struct VulkanH264<S: SurfaceSource> {
+    device: Arc<VideoDevice>,
+    timeline: Arc<Timeline>,
+    capabilities: Vec<H264Capabilities>,
+    source: S,
+    /// The stream's session, which holds the timeline itself, and waits
+    /// for its decodes as it goes.
+    session: Option<Session>,
+}
+
+impl<S: SurfaceSource> VulkanH264<S> {
+    fn new(device: &Arc<VideoDevice>, source: S) -> Result<Self, Error> {
+        let capabilities = h264_capabilities(device);
+        if capabilities.is_empty() {
+            return Err(Error::NoVideoDecode(format!(
+                "{} decodes no H.264 profile into NV12 images that are their own DPB pictures",
+                device.name()
+            )));
+        }
+        Ok(Self {
+            device: Arc::clone(device),
+            timeline: Timeline::new(device)?,
+            capabilities,
+            source,
+            session: None,
+        })
+    }
+
+    fn session(&self) -> Result<&Session, Error> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("decoding before an SPS is active".into()))
+    }
+}
+
+/// The capabilities of the first profile of `sps`'s candidates the device
+/// decodes, where it decodes `sps`'s coded size.
+fn select(capabilities: &[H264Capabilities], sps: &Sps) -> Result<H264Capabilities, Error> {
+    let (width, height) = (sps.coded_width(), sps.coded_height());
+    for profile in H264Profile::candidates(sps.profile_idc) {
+        let Some(caps) = capabilities.iter().find(|c| c.profile == *profile) else {
+            continue;
+        };
+        let (min, max) = (caps.min_coded_extent, caps.max_coded_extent);
+        if width > max.width || height > max.height || width < min.width || height < min.height {
+            return Err(Error::Unsupported(format!(
+                "H.264 at {width}x{height}: the device decodes {}x{} to {}x{}",
+                min.width, min.height, max.width, max.height
+            )));
+        }
+        return Ok(*caps);
+    }
+    Err(Error::Unsupported(format!(
+        "H.264 profile_idc {}: the device decodes profiles {:?}",
+        sps.profile_idc,
+        capabilities
+            .iter()
+            .map(|c| c.profile.profile_idc)
+            .collect::<Vec<_>>()
+    )))
+}
+
+impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
+    type Picture = Picture<S::Surface>;
+    type Error = Error;
+
+    fn configure(&mut self, sps: &Sps, dpb_frames: usize) -> Result<(), Error> {
+        // The old session goes first: it waits for its decodes.
+        self.session = None;
+        let caps = select(&self.capabilities, sps)?;
+        let extent = vk::Extent2D {
+            width: sps.coded_width(),
+            height: sps.coded_height(),
+        };
+        self.session = Some(Session::new(
+            &self.device,
+            &self.timeline,
+            caps,
+            extent,
+            dpb_frames,
+        )?);
+        Ok(())
+    }
+
+    fn new_picture(&mut self) -> Result<Self::Picture, Error> {
+        let (extent, profile) = {
+            let session = self.session()?;
+            (session.extent, session.caps.profile)
+        };
+        let surface = self.source.surface(extent, profile)?;
+        let view = ImageView::for_decode(&self.device, surface.image())?;
+        Ok(Picture::new(&self.timeline, surface, view, extent))
+    }
+
+    /// A stand-in for a lost frame: `from`'s own surface and DPB slot,
+    /// under a picture of its own ([`Picture`]), since only a decode
+    /// sets a slot up (ours: Apple's AVC decoder conceals some way of its
+    /// own). The DPB names it in place of its source where its source is
+    /// no reference ([`kept_references`]).
+    fn conceal(&mut self, from: &Self::Picture) -> Result<Option<Self::Picture>, Error> {
+        Ok(Some(from.stand_in()))
+    }
+
+    fn decode_picture(
+        &mut self,
+        picture: &Self::Picture,
+        params: &PictureParams<'_, Self::Picture>,
+        slices: &[SliceParams<'_, Self::Picture>],
+    ) -> Result<(), Error> {
+        self.timeline.collect();
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::Unsupported("decoding before an SPS is active".into()))?;
+        let parameters = session.parameters(params.sps, params.pps)?;
+
+        let mut slotted = Vec::with_capacity(params.references.len());
+        for reference in &params.references {
+            let slot = reference
+                .picture
+                .slot()
+                .ok_or_else(|| Error::Unsupported("a reference that was never decoded".into()))?;
+            slotted.push((slot, reference.picture.is_stand_in()));
+        }
+        let kept = kept_references(&slotted);
+        let references: Vec<(i32, vk::ImageView, StdVideoDecodeH264ReferenceInfo)> = kept
+            .iter()
+            .filter_map(|&i| {
+                let reference = params.references.get(i)?;
+                let &(slot, _) = slotted.get(i)?;
+                Some((slot, reference.picture.view(), reference_info(reference)))
+            })
+            .collect();
+        let used: Vec<i32> = references.iter().map(|&(slot, _, _)| slot).collect();
+        let setup_slot = free_slot(&used, session.max_dpb_slots)
+            .ok_or_else(|| Error::Unsupported("no DPB slot is free".into()))?;
+
+        let nals: Vec<&[u8]> = slices.iter().map(|s| s.nal).collect();
+        let decode = Decode {
+            slices: &nals,
+            parameters,
+            target: (picture.surface().image(), picture.view()),
+            setup_slot,
+            setup_info: setup_info(params),
+            picture_info: picture_info(params, slices),
+            references: &references,
+        };
+        let value = session.decode(&decode)?;
+        picture.decoded(setup_slot, value);
+        for &i in &kept {
+            if let Some(reference) = params.references.get(i) {
+                reference.picture.used(value);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which references a decode names, by their index in `references`
+/// (each its slot, and whether it stands in for a lost frame), in their
+/// order: one per slot, since a slot is one reference's. A stand-in
+/// shares its source's slot, and is named only where no picture decoded
+/// into that slot is a reference, as after a lost frame the sliding
+/// window leaves the stand-in alone; where both are, the source stands for
+/// both, its samples being the stand-in's.
+fn kept_references(references: &[(i32, bool)]) -> Vec<usize> {
+    (0..references.len())
+        .filter(|&i| {
+            let Some(&(slot, stand_in)) = references.get(i) else {
+                return false;
+            };
+            let same_slot = |&(s, _): &(i32, bool)| s == slot;
+            let first_decoded = references.iter().position(|r| same_slot(r) && !r.1);
+            match first_decoded {
+                Some(first) => first == i,
+                None => stand_in && references.iter().position(same_slot) == Some(i),
+            }
+        })
+        .collect()
+}
+
+/// The least slot below `max` that no reference holds.
+fn free_slot(used: &[i32], max: u32) -> Option<i32> {
+    let max = i32::try_from(max).unwrap_or(i32::MAX);
+    (0..max).find(|slot| !used.contains(slot))
+}
+
+/// A reference's std information: a frame, short-term with its
+/// `FrameNum` or long-term with its `LongTermFrameIdx`, and its order
+/// counts.
+fn reference_info(reference: &ReferenceFrame<'_, impl Sized>) -> StdVideoDecodeH264ReferenceInfo {
+    let mut flags: StdVideoDecodeH264ReferenceInfoFlags = zeroed();
+    flags.set_used_for_long_term_reference(u32::from(reference.long_term));
+    let mut info: StdVideoDecodeH264ReferenceInfo = zeroed();
+    info.flags = flags;
+    // 16 bits hold both: MaxFrameNum is 2^16 at most, and a long-term
+    // index below 16.
+    info.FrameNum = u16::try_from(reference.frame_idx).unwrap_or(u16::MAX);
+    info.PicOrderCnt = [reference.top_poc, reference.bottom_poc];
+    info
+}
+
+/// The picture's own information as a reference, for the slot its decode
+/// sets up: long-term where its marking makes it so (an IDR picture's
+/// `long_term_reference_flag`, or operation 6).
+fn setup_info(params: &PictureParams<'_, impl Sized>) -> StdVideoDecodeH264ReferenceInfo {
+    let header = params.header;
+    let marking = &header.ref_pic_marking;
+    let long_term = if header.idr && marking.long_term_reference_flag {
+        Some(0)
+    } else {
+        marking.adaptive.iter().flatten().find_map(|op| match op {
+            MemoryManagement::CurrentToLongTerm(idx) => Some(*idx),
+            _ => None,
+        })
+    };
+    let mut flags: StdVideoDecodeH264ReferenceInfoFlags = zeroed();
+    flags.set_used_for_long_term_reference(u32::from(long_term.is_some()));
+    let mut info: StdVideoDecodeH264ReferenceInfo = zeroed();
+    info.flags = flags;
+    info.FrameNum = u16::try_from(long_term.unwrap_or(header.frame_num)).unwrap_or(u16::MAX);
+    info.PicOrderCnt = [params.top_poc, params.bottom_poc];
+    info
+}
+
+/// The picture's std information: a frame, its parameter sets' ids,
+/// `frame_num`, `idr_pic_id` and order counts.
+fn picture_info(
+    params: &PictureParams<'_, impl Sized>,
+    slices: &[SliceParams<'_, impl Sized>],
+) -> StdVideoDecodeH264PictureInfo {
+    let header = params.header;
+    let mut flags: StdVideoDecodeH264PictureInfoFlags = zeroed();
+    flags.set_field_pic_flag(0);
+    flags.set_is_intra(u32::from(
+        slices.iter().all(|s| s.header.slice_type == SliceType::I),
+    ));
+    flags.set_IdrPicFlag(u32::from(header.idr));
+    flags.set_bottom_field_flag(0);
+    flags.set_is_reference(u32::from(header.nal_ref_idc != 0));
+    flags.set_complementary_field_pair(0);
+    let mut info: StdVideoDecodeH264PictureInfo = zeroed();
+    info.flags = flags;
+    info.seq_parameter_set_id = params.sps.seq_parameter_set_id;
+    info.pic_parameter_set_id = params.pps.pic_parameter_set_id;
+    // frame_num is below MaxFrameNum, 2^16 at most; idr_pic_id is 65535 at
+    // most (7.4.3).
+    info.frame_num = u16::try_from(header.frame_num).unwrap_or(u16::MAX);
+    info.idr_pic_id = u16::try_from(header.idr_pic_id).unwrap_or(u16::MAX);
+    info.PicOrderCnt = [params.top_poc, params.bottom_poc];
+    info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_picture_takes_the_least_slot_no_reference_holds() {
+        assert_eq!(free_slot(&[], 17), Some(0));
+        assert_eq!(free_slot(&[0, 1, 3], 17), Some(2));
+        assert_eq!(free_slot(&[0, 1], 2), None);
+    }
+
+    #[test]
+    fn a_stand_in_is_named_only_where_its_source_is_no_reference() {
+        // Its source gone: the stand-in alone holds the slot.
+        assert_eq!(kept_references(&[(4, true)]), [0]);
+        // Its source a reference too: the source stands for both.
+        assert_eq!(
+            kept_references(&[(4, false), (2, false), (4, true)]),
+            [0, 1]
+        );
+        assert_eq!(kept_references(&[(4, true), (4, false)]), [1]);
+        // Two stand-ins of one source: the first.
+        assert_eq!(kept_references(&[(4, true), (4, true), (1, false)]), [0, 2]);
+    }
+}

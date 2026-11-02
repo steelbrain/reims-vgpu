@@ -13,6 +13,7 @@ members = [
     "crates/reims-vgpu-video-vaapi",
     "crates/reims-vgpu-video-nvidia",
     "crates/reims-vgpu-video-videotoolbox",
+    "crates/reims-vgpu-video-vulkan",
     "crates/reims-vgpu-video-conformance",
     "crates/reims-graphics",
     "xtask",

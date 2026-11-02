@@ -1,0 +1,598 @@
+//! The Vulkan device a decoder runs on, which it need not own: the
+//! instance, the device, a queue of a video-decode family, and the
+//! graphics family whose work samples the decoded images.
+//!
+//! [`VideoDevice::from_raw`] takes another's device as it is, as the
+//! product's will be metal2vulkan's. [`VideoDevice::create`] makes one of
+//! its own, with a graphics queue and a video-decode queue, for the tests
+//! and the tools.
+
+use std::ffi::{CStr, c_char, c_void};
+use std::sync::Arc;
+
+use ash::vk;
+use reims_vgpu_video_core::sync::Mutex;
+
+use crate::error::{Error, Named};
+
+/// `VK_KHR_unified_image_layouts`, which ash 0.38's headers predate.
+const UNIFIED_IMAGE_LAYOUTS: &CStr = c"VK_KHR_unified_image_layouts";
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR`
+/// (vulkan_core.h).
+const UNIFIED_IMAGE_LAYOUTS_FEATURES: vk::StructureType =
+    vk::StructureType::from_raw(1_000_527_000);
+
+/// `VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR`, as vulkan_core.h
+/// declares it.
+#[repr(C)]
+struct UnifiedImageLayoutsFeatures {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    unified_image_layouts: vk::Bool32,
+    unified_image_layouts_video: vk::Bool32,
+}
+
+impl UnifiedImageLayoutsFeatures {
+    fn new(enabled: bool) -> Self {
+        Self {
+            s_type: UNIFIED_IMAGE_LAYOUTS_FEATURES,
+            p_next: std::ptr::null_mut(),
+            unified_image_layouts: vk::Bool32::from(enabled),
+            unified_image_layouts_video: vk::Bool32::from(enabled),
+        }
+    }
+}
+
+/// The device extensions an H.264 decode needs.
+const REQUIRED_EXTENSIONS: [&CStr; 3] = [
+    ash::khr::video_queue::NAME,
+    ash::khr::video_decode_queue::NAME,
+    ash::khr::video_decode_h264::NAME,
+];
+
+/// Another's device, as [`VideoDevice::from_raw`] takes it.
+pub struct RawDevice {
+    /// The loader the instance was made through.
+    pub entry: ash::Entry,
+    /// The instance, of Vulkan 1.3 or later.
+    pub instance: ash::Instance,
+    /// The device's physical device.
+    pub physical_device: vk::PhysicalDevice,
+    /// The device, made with `VK_KHR_video_queue`,
+    /// `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`, and the
+    /// `timelineSemaphore` and `synchronization2` features.
+    pub device: ash::Device,
+    /// A queue family with `VK_QUEUE_VIDEO_DECODE_BIT_KHR` whose video
+    /// codec operations include H.264 decode.
+    pub decode_family: u32,
+    /// A queue of `decode_family`, which only the decoders on this device
+    /// submit to.
+    pub decode_queue: vk::Queue,
+    /// The family of the graphics queue whose work samples the decoded
+    /// images, which share them with `decode_family`.
+    pub graphics_family: u32,
+    /// Whether the device was made with `VK_KHR_unified_image_layouts`'s
+    /// `unifiedImageLayoutsVideo` feature enabled.
+    pub unified_image_layouts_video: bool,
+}
+
+/// The Vulkan device decoders run on.
+///
+/// Its decode queue is the decoders' alone: they serialize their
+/// submissions to it. Made by [`VideoDevice::create`], it owns its device
+/// and instance and destroys them as it goes, after every decoder, image
+/// and picture made on it, which each hold it.
+pub struct VideoDevice {
+    entry: ash::Entry,
+    instance: ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: ash::Device,
+    decode_family: u32,
+    decode_queue: Mutex<vk::Queue>,
+    /// Whether the decode family can copy, which tests' read backs need.
+    decode_family_transfers: bool,
+    graphics_family: u32,
+    /// The graphics queue of a device of our own, whose read backs it runs
+    /// where it is not the decode queue.
+    graphics_queue: Option<Mutex<vk::Queue>>,
+    unified_layouts: bool,
+    memory: vk::PhysicalDeviceMemoryProperties,
+    video_instance: ash::khr::video_queue::Instance,
+    video: ash::khr::video_queue::Device,
+    decode: ash::khr::video_decode_queue::Device,
+    /// Whether the device and instance are ours to destroy.
+    owned: bool,
+}
+
+/// What [`VideoDevice::create`] found on one physical device.
+struct Choice {
+    physical_device: vk::PhysicalDevice,
+    decode_family: u32,
+    graphics_family: u32,
+    /// The queues the graphics family has, for a device whose decode and
+    /// graphics family are one.
+    family_queues: u32,
+    decode_family_transfers: bool,
+    maintenance1: bool,
+    unified_layouts: bool,
+    /// The kind of device, best first: discrete, integrated, virtual,
+    /// then any other.
+    rank: u8,
+}
+
+impl VideoDevice {
+    /// Decoders on another's device, which it keeps.
+    ///
+    /// # Safety
+    ///
+    /// Every handle of `raw` is valid and made as its fields say, and
+    /// stays so for as long as the returned device and anything made on it
+    /// lives; nothing but the decoders made on it submits to
+    /// `raw.decode_queue` meanwhile.
+    pub unsafe fn from_raw(raw: RawDevice) -> Arc<Self> {
+        // SAFETY: the caller's handles are valid (the contract).
+        let families = unsafe {
+            raw.instance
+                .get_physical_device_queue_family_properties(raw.physical_device)
+        };
+        let decode_family_transfers = families
+            .get(usize::try_from(raw.decode_family).unwrap_or(usize::MAX))
+            .is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::TRANSFER));
+        Arc::new(Self::assemble(raw, decode_family_transfers, None, false))
+    }
+
+    /// A device of its own, on the first physical device, discrete GPUs
+    /// first, that decodes H.264 through Vulkan Video: one graphics queue
+    /// and one video-decode queue, with `VK_KHR_video_maintenance1` and
+    /// `VK_KHR_unified_image_layouts`'s `unifiedImageLayoutsVideo` where
+    /// the device has them. [`Error::NoVideoDecode`] says why each device
+    /// was passed over where none does.
+    pub fn create() -> Result<Arc<Self>, Error> {
+        // SAFETY: opening the loader runs its initialization; the entry
+        // keeps it open while it lives.
+        let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Loader(e.to_string()))?;
+        let app = vk::ApplicationInfo::default()
+            .application_name(c"reims-vgpu-video-vulkan")
+            .api_version(vk::API_VERSION_1_3);
+        let info = vk::InstanceCreateInfo::default().application_info(&app);
+        // SAFETY: `info` and what it points at live through the call.
+        let instance = unsafe { entry.create_instance(&info, None) }.named("vkCreateInstance")?;
+        match make_device(&instance) {
+            Ok((choice, device)) => Ok(Arc::new(Self::owned(entry, instance, choice, device))),
+            Err(error) => {
+                // SAFETY: nothing made from the instance is left.
+                unsafe { instance.destroy_instance(None) };
+                Err(error)
+            }
+        }
+    }
+
+    fn owned(
+        entry: ash::Entry,
+        instance: ash::Instance,
+        choice: Choice,
+        device: ash::Device,
+    ) -> Self {
+        let (decode_index, graphics_queue) = if choice.decode_family == choice.graphics_family {
+            if choice.family_queues >= 2 {
+                // SAFETY: the device was made with two queues of the family.
+                let graphics = unsafe { device.get_device_queue(choice.graphics_family, 0) };
+                (1, Some(graphics))
+            } else {
+                // One queue, which decodes and reads back.
+                (0, None)
+            }
+        } else {
+            // SAFETY: the device was made with a queue of each family.
+            let graphics = unsafe { device.get_device_queue(choice.graphics_family, 0) };
+            (0, Some(graphics))
+        };
+        // SAFETY: the device was made with this queue.
+        let decode_queue = unsafe { device.get_device_queue(choice.decode_family, decode_index) };
+        let raw = RawDevice {
+            entry,
+            instance,
+            physical_device: choice.physical_device,
+            device,
+            decode_family: choice.decode_family,
+            decode_queue,
+            graphics_family: choice.graphics_family,
+            unified_image_layouts_video: choice.unified_layouts,
+        };
+        Self::assemble(raw, choice.decode_family_transfers, graphics_queue, true)
+    }
+
+    fn assemble(
+        raw: RawDevice,
+        decode_family_transfers: bool,
+        graphics_queue: Option<vk::Queue>,
+        owned: bool,
+    ) -> Self {
+        // SAFETY: the physical device is the instance's.
+        let memory = unsafe {
+            raw.instance
+                .get_physical_device_memory_properties(raw.physical_device)
+        };
+        let video_instance = ash::khr::video_queue::Instance::new(&raw.entry, &raw.instance);
+        let video = ash::khr::video_queue::Device::new(&raw.instance, &raw.device);
+        let decode = ash::khr::video_decode_queue::Device::new(&raw.instance, &raw.device);
+        Self {
+            entry: raw.entry,
+            instance: raw.instance,
+            physical_device: raw.physical_device,
+            device: raw.device,
+            decode_family: raw.decode_family,
+            decode_queue: Mutex::new(raw.decode_queue),
+            decode_family_transfers,
+            graphics_family: raw.graphics_family,
+            graphics_queue: graphics_queue.map(Mutex::new),
+            unified_layouts: raw.unified_image_layouts_video,
+            memory,
+            video_instance,
+            video,
+            decode,
+            owned,
+        }
+    }
+
+    /// The instance.
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
+    }
+
+    /// The device.
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    /// The physical device.
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// The video-decode queue family.
+    pub fn decode_family(&self) -> u32 {
+        self.decode_family
+    }
+
+    /// The graphics queue family the decoded images are shared with.
+    pub fn graphics_family(&self) -> u32 {
+        self.graphics_family
+    }
+
+    /// Whether `unifiedImageLayoutsVideo` is enabled: decoded images are
+    /// then kept in `VK_IMAGE_LAYOUT_GENERAL`.
+    pub fn unified_image_layouts(&self) -> bool {
+        self.unified_layouts
+    }
+
+    /// The device's name, as the driver gives it.
+    pub fn name(&self) -> String {
+        // SAFETY: the physical device is the instance's.
+        let properties = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        properties
+            .device_name_as_c_str()
+            .map_or_else(|_| "?".into(), |n| n.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn video(&self) -> &ash::khr::video_queue::Device {
+        &self.video
+    }
+
+    pub(crate) fn video_instance(&self) -> &ash::khr::video_queue::Instance {
+        &self.video_instance
+    }
+
+    pub(crate) fn decode(&self) -> &ash::khr::video_decode_queue::Device {
+        &self.decode
+    }
+
+    /// The families an image the decoders write and graphics work samples
+    /// is shared between: one where they are one.
+    pub(crate) fn sharing_families(&self) -> Vec<u32> {
+        if self.decode_family == self.graphics_family {
+            vec![self.decode_family]
+        } else {
+            vec![self.graphics_family, self.decode_family]
+        }
+    }
+
+    /// Submits to the decode queue.
+    pub(crate) fn submit_decode(&self, submits: &[vk::SubmitInfo2<'_>]) -> Result<(), Error> {
+        let queue = self.decode_queue.lock();
+        // SAFETY: the queue is the device's and is held for the call; the
+        // submissions' command buffers are recorded and their semaphores
+        // the device's.
+        unsafe {
+            self.device
+                .queue_submit2(*queue, submits, vk::Fence::null())
+        }
+        .named("vkQueueSubmit2")
+    }
+
+    /// Submits a copy with `fence` to the queue that reads back: the
+    /// graphics queue of a device of our own, else the decode queue where
+    /// its family copies; and the family it is of.
+    pub(crate) fn submit_transfer(
+        &self,
+        family: u32,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), Error> {
+        let queue = match &self.graphics_queue {
+            Some(queue) if family == self.graphics_family => queue.lock(),
+            _ => self.decode_queue.lock(),
+        };
+        // SAFETY: as in `submit_decode`, with the fence unsignalled.
+        unsafe { self.device.queue_submit2(*queue, submits, fence) }.named("vkQueueSubmit2")
+    }
+
+    /// The family a read back runs on, as [`Self::submit_transfer`] picks
+    /// its queue; `None` where no queue of ours copies.
+    pub(crate) fn transfer_family(&self) -> Option<u32> {
+        if self.graphics_queue.is_some() {
+            Some(self.graphics_family)
+        } else if self.decode_family_transfers
+            || (self.owned && self.decode_family == self.graphics_family)
+        {
+            Some(self.decode_family)
+        } else {
+            None
+        }
+    }
+
+    /// The first memory type of `bits` with every flag of one of `wanted`,
+    /// tried in their order.
+    pub(crate) fn memory_type(&self, bits: u32, wanted: &[vk::MemoryPropertyFlags]) -> Option<u32> {
+        let count = usize::try_from(self.memory.memory_type_count).unwrap_or(0);
+        let types = self.memory.memory_types.get(..count)?;
+        wanted.iter().find_map(|&flags| {
+            (0u32..)
+                .zip(types)
+                .find(|&(i, t)| bits & (1 << i) != 0 && t.property_flags.contains(flags))
+                .map(|(i, _)| i)
+        })
+    }
+
+    /// Memory for `requirements` of the first kind of `wanted` that holds
+    /// it, dedicated to `image` where one is given.
+    pub(crate) fn allocate(
+        &self,
+        requirements: &vk::MemoryRequirements,
+        wanted: &[vk::MemoryPropertyFlags],
+        image: Option<vk::Image>,
+    ) -> Result<vk::DeviceMemory, Error> {
+        let index = self
+            .memory_type(requirements.memory_type_bits, wanted)
+            .ok_or_else(|| {
+                let wanted: Vec<String> = wanted
+                    .iter()
+                    .map(|f| format!("{:#x}", f.as_raw()))
+                    .collect();
+                Error::Unsupported(format!(
+                    "no memory type of {:#x} has the flags of one of {wanted:?}",
+                    requirements.memory_type_bits
+                ))
+            })?;
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default();
+        let mut info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(index);
+        if let Some(image) = image {
+            dedicated = dedicated.image(image);
+            info = info.push_next(&mut dedicated);
+        }
+        // SAFETY: `info` and its chain live through the call.
+        unsafe { self.device.allocate_memory(&info, None) }.named("vkAllocateMemory")
+    }
+}
+
+impl Drop for VideoDevice {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        // SAFETY: every object made on the device held this one and has
+        // gone; the queues are idle once the wait returns.
+        if let Err(error) = unsafe { self.device.device_wait_idle() } {
+            log::error!("vkDeviceWaitIdle: {error}");
+        }
+        // SAFETY: as above: nothing made on the device is left.
+        unsafe { self.device.destroy_device(None) };
+        // SAFETY: the device made from it is destroyed.
+        unsafe { self.instance.destroy_instance(None) };
+        let _ = &self.entry;
+    }
+}
+
+/// The device [`VideoDevice::create`] makes, on the best physical device
+/// that decodes H.264.
+fn make_device(instance: &ash::Instance) -> Result<(Choice, ash::Device), Error> {
+    // SAFETY: the instance is valid.
+    let physical_devices =
+        unsafe { instance.enumerate_physical_devices() }.named("vkEnumeratePhysicalDevices")?;
+    let mut passed_over = Vec::new();
+    let mut best: Option<Choice> = None;
+    for physical_device in physical_devices {
+        match examine(instance, physical_device) {
+            Ok(choice) => {
+                if best.as_ref().is_none_or(|b| choice.rank < b.rank) {
+                    best = Some(choice);
+                }
+            }
+            Err(why) => passed_over.push(why),
+        }
+    }
+    let Some(choice) = best else {
+        return Err(Error::NoVideoDecode(if passed_over.is_empty() {
+            "the loader lists no device".into()
+        } else {
+            passed_over.join("; ")
+        }));
+    };
+
+    let priorities = [1.0f32; 2];
+    let same = choice.decode_family == choice.graphics_family;
+    let queue_infos: Vec<vk::DeviceQueueCreateInfo<'_>> = if same {
+        let count = choice.family_queues.clamp(1, 2);
+        let count = usize::try_from(count).unwrap_or(1);
+        vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(choice.decode_family)
+                .queue_priorities(priorities.get(..count).unwrap_or(&priorities)),
+        ]
+    } else {
+        vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(choice.graphics_family)
+                .queue_priorities(&priorities[..1]),
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(choice.decode_family)
+                .queue_priorities(&priorities[..1]),
+        ]
+    };
+    let mut extensions: Vec<*const c_char> =
+        REQUIRED_EXTENSIONS.iter().map(|e| e.as_ptr()).collect();
+    if choice.maintenance1 {
+        extensions.push(ash::khr::video_maintenance1::NAME.as_ptr());
+    }
+    if choice.unified_layouts {
+        extensions.push(UNIFIED_IMAGE_LAYOUTS.as_ptr());
+    }
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+    let mut v13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
+    let mut maintenance1 =
+        vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default().video_maintenance1(true);
+    let mut unified = UnifiedImageLayoutsFeatures::new(true);
+    let mut info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_infos)
+        .enabled_extension_names(&extensions)
+        .push_next(&mut v12)
+        .push_next(&mut v13);
+    if choice.maintenance1 {
+        info = info.push_next(&mut maintenance1);
+    }
+    if choice.unified_layouts {
+        unified.p_next = info.p_next.cast_mut();
+        info.p_next = std::ptr::from_mut(&mut unified).cast_const().cast();
+    }
+    // SAFETY: `info` and everything its chain points at live through the
+    // call; each extension and feature asked for is the device's.
+    let device = unsafe { instance.create_device(choice.physical_device, &info, None) }
+        .named("vkCreateDevice")?;
+    Ok((choice, device))
+}
+
+/// Whether `physical_device` decodes H.264 through Vulkan Video, and what
+/// a device of it would be made with; why not where it does not.
+fn examine(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<Choice, String> {
+    // SAFETY: the physical device is the instance's; so for each query.
+    let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+    let name = properties
+        .device_name_as_c_str()
+        .map_or_else(|_| "?".into(), |n| n.to_string_lossy().into_owned());
+    if properties.api_version < vk::API_VERSION_1_3 {
+        return Err(format!("{name}: Vulkan 1.3 is needed"));
+    }
+    // SAFETY: as above.
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .map_err(|e| format!("{name}: vkEnumerateDeviceExtensionProperties: {e}"))?;
+    let has = |wanted: &CStr| {
+        extensions
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(wanted))
+    };
+    if let Some(missing) = REQUIRED_EXTENSIONS.iter().find(|e| !has(e)) {
+        return Err(format!("{name}: no {}", missing.to_string_lossy()));
+    }
+
+    // SAFETY: as above.
+    let count =
+        unsafe { instance.get_physical_device_queue_family_properties2_len(physical_device) };
+    let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); count];
+    let mut families: Vec<vk::QueueFamilyProperties2<'_>> = video
+        .iter_mut()
+        .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
+        .collect();
+    // SAFETY: as above, with an output of the length the call gave.
+    unsafe {
+        instance.get_physical_device_queue_family_properties2(physical_device, &mut families)
+    };
+    let flags: Vec<(vk::QueueFlags, u32)> = families
+        .iter()
+        .map(|f| {
+            (
+                f.queue_family_properties.queue_flags,
+                f.queue_family_properties.queue_count,
+            )
+        })
+        .collect();
+    drop(families);
+    let decode_family = (0u32..)
+        .zip(flags.iter().zip(&video))
+        .find(|(_, ((f, _), v))| {
+            f.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+                && v.video_codec_operations
+                    .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+        })
+        .map(|(i, _)| i)
+        .ok_or_else(|| format!("{name}: no queue family decodes H.264"))?;
+    let (graphics_family, family_queues) = (0u32..)
+        .zip(&flags)
+        .find(|(_, (f, _))| f.contains(vk::QueueFlags::GRAPHICS))
+        .map(|(i, &(_, count))| (i, count))
+        .ok_or_else(|| format!("{name}: no graphics queue family"))?;
+    let decode_family_transfers = flags
+        .get(usize::try_from(decode_family).unwrap_or(usize::MAX))
+        .is_some_and(|(f, _)| f.contains(vk::QueueFlags::TRANSFER));
+
+    let maintenance1_listed = has(ash::khr::video_maintenance1::NAME);
+    let unified_listed = has(UNIFIED_IMAGE_LAYOUTS);
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut maintenance1 = vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default();
+    let mut unified = UnifiedImageLayoutsFeatures::new(false);
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut v12)
+        .push_next(&mut v13);
+    if maintenance1_listed {
+        features = features.push_next(&mut maintenance1);
+    }
+    if unified_listed {
+        unified.p_next = features.p_next;
+        features.p_next = std::ptr::from_mut(&mut unified).cast();
+    }
+    // SAFETY: as above, with every structure of the chain alive and
+    // writable through the call.
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    if v12.timeline_semaphore == vk::FALSE || v13.synchronization2 == vk::FALSE {
+        return Err(format!(
+            "{name}: timeline semaphores and synchronization2 are needed"
+        ));
+    }
+    let rank = match properties.device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        _ => 3,
+    };
+    Ok(Choice {
+        physical_device,
+        decode_family,
+        graphics_family,
+        family_queues,
+        decode_family_transfers,
+        maintenance1: maintenance1_listed && maintenance1.video_maintenance1 == vk::TRUE,
+        unified_layouts: unified_listed
+            && unified.unified_image_layouts == vk::TRUE
+            && unified.unified_image_layouts_video == vk::TRUE,
+        rank,
+    })
+}

@@ -704,6 +704,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reims-vgpu-video-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "log",
+ "reims-vgpu-video-codec",
+ "reims-vgpu-video-conformance",
+ "reims-vgpu-video-core",
+]
+
+[[package]]
 name = "reims-vgpu-vulkan"
 version = "0.1.0"
 dependencies = [
