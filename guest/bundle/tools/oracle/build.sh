@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-/tmp/rgk-oracle/x86}
 arch=${2:-x86_64}
 mkdir -p "$out"
-for p in oracle_iosurface oracle_storage oracle_passes oracle_cmdbuf oracle_caps oracle_errors; do
+for p in oracle_iosurface oracle_storage oracle_passes oracle_cmdbuf oracle_caps oracle_errors oracle_source; do
 	xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall \
 		-framework Metal -framework IOSurface -framework Foundation \
 		"$here/$p.m" -o "$out/$p"

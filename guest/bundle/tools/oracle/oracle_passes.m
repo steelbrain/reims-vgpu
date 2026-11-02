@@ -7,6 +7,7 @@
 //                  row clears it to A and stores, then runs one pass of the row's actions, with or
 //                  without a draw of B over its left half; prints what each half holds after
 //   depth          a Depth32Float attachment cleared to 0.25 and stored or not (DontCare)
+//   stencil        a Depth32Float_Stencil8 attachment's stencil cleared to 0x25 and stored or not
 //   msaa           a 4x RGBA8 attachment cleared to A and resolved, then loaded again by a pass
 //                  that only resolves: whether the samples survived a DontCare store
 //   features       a framebuffer-fetch pipeline, a raster-order-group pipeline, a tile pipeline
@@ -248,6 +249,55 @@ static void case_depth(void)
 	}
 }
 
+static void case_stencil(void)
+{
+	printf("case stencil: Depth32Float_Stencil8 256x256, stencil cleared to 0x25 and stored\n");
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+	                                                       width:W
+	                                                      height:H
+	                                                   mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [D newTextureWithDescriptor:td];
+	id<MTLBuffer> rb = [D newBufferWithLength:W * H options:MTLResourceStorageModeShared];
+	uint32_t clears[3] = {0x25, 0x5a, 0x77};
+	MTLStoreAction stores[3] = {MTLStoreActionStore, MTLStoreActionDontCare, MTLStoreActionDontCare};
+	MTLLoadAction loads[3] = {MTLLoadActionClear, MTLLoadActionClear, MTLLoadActionDontCare};
+	for (int k = 0; k < 3; k++) {
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.depthAttachment.texture = t;
+		rp.depthAttachment.loadAction = MTLLoadActionClear;
+		rp.depthAttachment.storeAction = MTLStoreActionStore;
+		rp.depthAttachment.clearDepth = 0.5;
+		rp.stencilAttachment.texture = t;
+		rp.stencilAttachment.loadAction = loads[k];
+		rp.stencilAttachment.storeAction = stores[k];
+		rp.stencilAttachment.clearStencil = clears[k];
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+		[e copyFromTexture:t
+		         sourceSlice:0
+		         sourceLevel:0
+		        sourceOrigin:MTLOriginMake(0, 0, 0)
+		          sourceSize:MTLSizeMake(W, H, 1)
+		            toBuffer:rb
+		   destinationOffset:0
+		destinationBytesPerRow:W
+		destinationBytesPerImage:W * H
+		             options:MTLBlitOptionStencilFromDepthStencil];
+		[e endEncoding];
+		oracle_commit_wait(cb, NULL, NULL);
+		const uint8_t *s = rb.contents;
+		size_t same = 0;
+		for (size_t i = 0; i < W * H; i++)
+			same += s[i] == s[0];
+		printf("  load %-8s clear 0x%02x store %-8s -> stencil 0x%02x (%zu of %d texels equal it)\n",
+		       load_name(loads[k]), clears[k], store_name(stores[k]), s[0], same, W * H);
+	}
+}
+
 static void case_msaa(void)
 {
 	printf("case msaa: 4x RGBA8 256x256 cleared to A\n");
@@ -356,6 +406,8 @@ static int run_case(int argc, char **argv)
 		case_actions(argc > 1 ? argv[1] : "private");
 	else if (!strcmp(argv[0], "depth"))
 		case_depth();
+	else if (!strcmp(argv[0], "stencil"))
+		case_stencil();
 	else if (!strcmp(argv[0], "msaa"))
 		case_msaa();
 	else if (!strcmp(argv[0], "features"))
@@ -382,7 +434,8 @@ int main(int argc, char **argv)
 	D = nil;
 	static const char *const all[][2] = {
 	    {"actions", "private"}, {"actions", "managed"}, {"actions", "iosurface"},
-	    {"depth", NULL},        {"msaa", NULL},         {"features", NULL},
+	    {"depth", NULL},        {"stencil", NULL},      {"msaa", NULL},
+	    {"features", NULL},
 	};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i][0]))
