@@ -1339,12 +1339,11 @@ mod tests {
     }
 
     /// A kernel that calls a visible function its library does not define is made with the
-    /// function linked by any of the lists the value carries (functions, private functions, a
-    /// group with it in private functions, or binary functions of one made compiled to a binary),
-    /// and is refused with Metal's code with none and with a group alone
-    /// (`metal_tests::unresolved_visible_calls_are_metals`), and not made with a binary function
-    /// not made compiled to a binary, which the runtime refuses as Metal's validation does
-    /// (`BinaryFunctions(NotPrecompiled)`: the creator raises)
+    /// function linked by functions, private functions, or a group with it in private functions,
+    /// and is refused with Metal's code with none, with a group alone, and with binary functions
+    /// alone holding it, made compiled to a binary or not, as a direct call resolves by no binary
+    /// function (`metal_tests::unresolved_visible_calls_are_metals`). The value carries a binary
+    /// function as one made compiled to a binary
     #[test]
     fn a_whole_compute_value_carries_its_linked_functions() {
         let [kernel, _, _, add_one, binary] = linked_functions_of_fixtures();
@@ -1372,7 +1371,6 @@ mod tests {
         for l in [
             linked(one(&add_one), vec![], vec![], vec![]),
             linked(vec![], vec![], vec![], one(&add_one)),
-            linked(vec![], one(&binary), vec![], vec![]),
             linked(
                 vec![],
                 vec![],
@@ -1394,8 +1392,6 @@ mod tests {
         assert_eq!(f.linked.functions.len(), 1);
         assert!(!f.linked.functions[0].precompiled);
         assert!(f.linked.binary_functions[0].precompiled);
-        let unbinary = made(linked(vec![], one(&add_one), vec![], vec![]));
-        assert!(!matches!(unbinary, Ok(Ok(Some(_)))), "{unbinary:?}");
         for refused in [
             LinkedFunctionsDesc::default(),
             linked(
@@ -1404,6 +1400,8 @@ mod tests {
                 vec![("g".to_owned(), one(&add_one))],
                 vec![],
             ),
+            linked(vec![], one(&binary), vec![], vec![]),
+            linked(vec![], one(&add_one), vec![], vec![]),
         ] {
             let shown = format!("{refused:?}");
             let state = made(refused);

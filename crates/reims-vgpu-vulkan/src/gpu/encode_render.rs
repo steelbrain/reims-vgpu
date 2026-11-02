@@ -125,9 +125,13 @@
 //!     whose records the GPU may have written is asked where the runtime reads them, once the
 //!     work before it completed, and its draws of points die there
 //!     ([`crate::gpu::command::executions`]).
-//!   - `setLineWidth:` of anything but 1 (0, 0.5 to 8, -1, NaN) widens line and line-strip
-//!     draws, and triangles filled as lines; points and filled triangles are unchanged. No line
-//!     drawn here is wider than 1, so those draws, and executions, die after another width.
+//!   - `setLineWidth:` goes to the runtime's encoder, which draws every width as Metal does:
+//!     `floor(16 width) / 16` clamped to `[0, 16]`, by the device's own lines or a band of two
+//!     triangles over each segment. What neither draws at the width there (triangles filled as
+//!     lines and mesh draws the device's lines do not draw it at, an execution's lines, lines in
+//!     a pass of a rasterization rate map) it draws by the device's lines at the nearest width
+//!     they draw, 1 pixel on MoltenVK, announcing `lines-at-nearest-width`, which dies in strict
+//!     mode ([`crate::answer::DIES`]).
 //!   - `setProvokingVertexMode:` of 0 takes a primitive's flat inputs, and the layer and the
 //!     viewport its vertex function writes (`[[render_target_array_index]]`,
 //!     `[[viewport_array_index]]`), from its first vertex, Metal's default and Vulkan's; 1 from its
@@ -492,11 +496,6 @@ struct Marks {
     /// encoder takes too: Metal restarts an indexed strip at its index alone after it, but not
     /// the line strip a line loop draws as here ([`VulkanRenderEncoder::primitives`]).
     restart: Option<(bool, u64)>,
-    /// `setLineWidth:` set a width other than 1, which widens lines on Metal and which no line
-    /// drawn here has.
-    wide_lines: bool,
-    /// `setTriangleFillMode:` set `Lines`: a triangle draws its edges, at the line width.
-    line_fill: bool,
     /// A pipeline state was set.
     pipeline: bool,
     /// The pipeline state set sizes its points as Metal does: its vertex function writes
@@ -533,38 +532,6 @@ enum Shape {
     Primitives(rt::DrawPrimitiveType),
     /// Patches, over a control-point index buffer or not.
     Patches,
-    /// An indirect command buffer's draws, whose types its records hold.
-    Execution,
-}
-
-impl Shape {
-    /// Whether it draws lines: a line or line strip, or Metal's line loop.
-    fn lines(self) -> bool {
-        matches!(
-            self,
-            Shape::Primitives(
-                rt::DrawPrimitiveType::Public(PrimitiveType::Line | PrimitiveType::LineStrip)
-                    | rt::DrawPrimitiveType::LineLoop
-            )
-        )
-    }
-
-    /// Whether it draws triangles: a list or strip of them, Metal's fan, quads and quad strip,
-    /// and patches.
-    fn triangles(self) -> bool {
-        match self {
-            Shape::Primitives(t) => matches!(
-                t,
-                rt::DrawPrimitiveType::Public(
-                    PrimitiveType::Triangle | PrimitiveType::TriangleStrip
-                ) | rt::DrawPrimitiveType::TriangleFan
-                    | rt::DrawPrimitiveType::Quads
-                    | rt::DrawPrimitiveType::QuadStrip
-            ),
-            Shape::Patches => true,
-            Shape::Execution => false,
-        }
-    }
 }
 
 /// Whether a store action resolves, or may (`Unknown`, which the encoder decides).
@@ -2009,7 +1976,7 @@ impl VulkanRenderEncoder {
                 self.drawn(sel, shape, empty, &held);
                 if !empty {
                     stop_if_task_ended();
-                    marked_by(sel, shape, held.marks);
+                    marked_by(sel, held.marks);
                 }
                 self.binds(sel, &mut |e| call(e, k))
             }
@@ -2147,7 +2114,7 @@ impl VulkanRenderEncoder {
         if empty {
             return None;
         }
-        self.marked(sel, Shape::Execution);
+        self.marked(sel);
         let inherits_pipeline = icb.inherits.pipeline;
         let execution = if inherits_pipeline {
             self.encodes(sel);
@@ -2250,13 +2217,10 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// Relays at a draw `sel` of `shape`, or dies there in strict mode, what the private setters
-    /// ([`Marks`]) leave it no exact form of ([`crate::answer::inexact`]): at a line width other
-    /// than 1, lines, triangles and patches filled as lines, and an execution, as no line drawn
-    /// here is wider than 1. After `setVertexAmplificationMode:value:` left a count the runtime
-    /// does not draw, or one not measured, every draw and execution dies, in either mode.
-    fn marked(&self, sel: &'static str, shape: Shape) {
-        marked_by(sel, shape, *plain(|| self.marks.lock()));
+    /// Dies at a draw or execution `sel` after `setVertexAmplificationMode:value:` left a count
+    /// the runtime does not draw, or one not measured, in either mode ([`Marks`]).
+    fn marked(&self, sel: &'static str) {
+        marked_by(sel, *plain(|| self.marks.lock()));
     }
 }
 
@@ -2299,19 +2263,13 @@ fn sized(sel: &'static str, shape: Shape, m: Marks) {
 }
 
 /// [`VulkanRenderEncoder::marked`], by the encoder's marks `m`.
-fn marked_by(sel: &'static str, shape: Shape, m: Marks) {
+fn marked_by(sel: &'static str, m: Marks) {
     if m.amplified {
         unrepresentable(
             sel,
             "a draw after setVertexAmplificationMode:value: left an amplification count the \
              runtime does not draw",
         );
-    }
-    let execution = matches!(shape, Shape::Execution);
-    if m.wide_lines && (execution || shape.lines() || (m.line_fill && shape.triangles())) {
-        crate::answer::inexact(sel, crate::answer::Inexact::LineWidth, || {
-            "lines at a line width other than 1, which no line drawn here has".into()
-        });
     }
 }
 
@@ -2850,14 +2808,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     Ok(())
                 })
             }
-            // A width of 1 is every line's here; another is marked, and the draws it widens
-            // relay, or die in strict mode ([`Self::marked`]).
+            // The runtime's encoder draws the width as Metal does (the module docs).
             RenderCmd::SetLineWidth { line_width } => {
-                self.encoder.nothing(sel)?;
-                #[expect(clippy::float_cmp, reason = "Metal's default width, exactly")]
-                let wide = line_width != 1.0;
-                plain(|| self.marks.lock().wide_lines = wide);
-                Ok(())
+                encoded(&mut |e| e.set_line_width(line_width))
             }
             // Metal draws alike at every point size on this host, and a vertex function's
             // `[[point_size]]` decides a point's: it encodes nothing.
@@ -3023,9 +2976,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             }
             RenderCmd::SetTriangleFillMode { fill_mode } => {
                 let mode: TriangleFillMode = metal_value(sel, "triangle fill mode", fill_mode);
-                encoded(&mut |e| e.set_triangle_fill_mode(mode))?;
-                plain(|| self.marks.lock().line_fill = mode == TriangleFillMode::Lines);
-                Ok(())
+                encoded(&mut |e| e.set_triangle_fill_mode(mode))
             }
             RenderCmd::SetVertexAmplificationCount { view_mappings } => {
                 let count = u64::try_from(view_mappings.len()).unwrap_or_else(|_| {
@@ -4896,55 +4847,34 @@ pub(crate) mod tests {
         pass_pixels(p, d, cmds)
     }
 
-    /// `setLineWidth:` of anything but 1 encodes nothing, and after it lines and triangles
-    /// filled as lines die in strict mode, as no line drawn here is wider than 1, and draw 1
-    /// pixel wide by default, relayed; filled triangles and points draw, and a width of 1 again
-    /// draws lines. Where the device's points end below Metal's ([`points_reach_metals`]), its
-    /// lines and triangles are drawn by a state that does not size its points, and no point is
-    /// drawn
+    /// After `setLineWidth:` of any width, lines, line strips, points and filled triangles draw,
+    /// relaxed, as a device's own wide lines may differ from Metal's and say so
+    /// (`device-wide-lines`); a width of 1 again draws as before. What the widths draw is the
+    /// runtime's, as Metal draws them (`metal_tests::lines_draw_at_metals_widths`)
     #[test]
-    fn a_line_width_kills_only_lines() {
+    fn draws_go_on_after_a_line_width() {
         let points = points_reach_metals();
         let (e, indices) = if points {
             drawing_encoder(SIZED.0, SIZED.1)
         } else {
             drawing_encoder("vert:tri_vert", "frag:tri_frag")
         };
-        let draw = "drawPrimitives:vertexStart:vertexCount:";
-        for width in [2.0, 0.0, -1.0, f32::NAN] {
+        for width in [2.0, 0.0, -1.0, f32::NAN, 1.0] {
             send_all(&e, vec![RenderCmd::SetLineWidth { line_width: width }]);
-            send_all(&e, vec![three(3, None), three(STRIP, Some(&indices))]);
+            crate::answer::relaxed(|| {
+                send_all(
+                    &e,
+                    vec![
+                        three(1, None),
+                        three(2, None),
+                        three(3, None),
+                        three(STRIP, Some(&indices)),
+                    ],
+                );
+            });
             if points {
                 send_all(&e, vec![three(0, None)]);
             }
-            for primitive_type in [1, 2, 5] {
-                assert_eq!(dies_at(&e, three(primitive_type, None)), draw, "{width}");
-            }
-        }
-        send_all(&e, vec![RenderCmd::SetTriangleFillMode { fill_mode: 1 }]);
-        assert_eq!(dies_at(&e, three(3, None)), draw);
-        assert_eq!(dies_at(&e, three(6, None)), draw);
-        // By default each draws, 1 pixel wide, relayed and counted.
-        let widths = || relayed_of(crate::answer::Inexact::LineWidth);
-        let before = widths();
-        crate::answer::relaxed(|| send_all(&e, vec![three(1, None), three(3, None)]));
-        assert_eq!(widths(), before + 2);
-        send_all(
-            &e,
-            vec![
-                RenderCmd::SetLineWidth { line_width: 1.0 },
-                three(3, None),
-                three(1, None),
-                RenderCmd::SetLineWidth { line_width: 3.0 },
-                RenderCmd::SetTriangleFillMode { fill_mode: 0 },
-                three(3, None),
-            ],
-        );
-        if points {
-            send_all(
-                &e,
-                vec![RenderCmd::SetPointSize { point_size: 4.0 }, three(0, None)],
-            );
         }
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
@@ -5098,9 +5028,11 @@ pub(crate) mod tests {
     /// A draw of no primitive draws nothing whatever the private setters left, as on Metal: of
     /// too few vertices or indices for one, and an execution of no command, after a restart, a
     /// line width of 2, triangles filled as lines and the last vertex provoking under a state
-    /// that reads a flat input; one of a primitive dies. The runtime announces nothing at such a
-    /// draw, so a draw of lines of one vertex or index goes on in strict mode too, where the
-    /// device lacks the last vertex
+    /// that reads a flat input. The runtime announces nothing at such a draw, so a draw of lines
+    /// of one vertex or index goes on in strict mode too, where the device lacks the last vertex.
+    /// What a draw of a primitive draws after them is the runtime's
+    /// (`metal_tests::lines_draw_at_metals_widths`,
+    /// `metal_tests::lines_take_metals_flat_inputs_at_the_last_vertex`)
     #[test]
     fn empty_draws_go_on_after_the_private_setters() {
         use reims_vgpu_core::platform::values::IcbDesc;
@@ -5152,9 +5084,6 @@ pub(crate) mod tests {
             execution_range: NsRange::new(0, 0),
         });
         send_all(&e, empty);
-        let draw = "drawPrimitives:vertexStart:vertexCount:";
-        assert_eq!(dies_at(&e, drawn(1, 2)), draw);
-        assert_eq!(dies_at(&e, drawn(3, 3)), draw);
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 

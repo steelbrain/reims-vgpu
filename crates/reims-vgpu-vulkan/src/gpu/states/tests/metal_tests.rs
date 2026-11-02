@@ -1526,7 +1526,14 @@ type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::Death
 
 /// What the compute and render creators answer for `linked_caller.metal`'s functions with
 /// `linked_callee.metal`'s `linked_add_one`, which they call, linked by each list a value
-/// carries, each case named.
+/// carries, each case named: the function made by name, then its copy compiled to a binary.
+///
+/// The copy is made after every case of the function made by name: while a copy of a library's
+/// function compiled to a binary lives, Metal's `newFunctionWithName:` for it, and its
+/// `newFunctionWithDescriptor:` for that copy, answer one object, of options 1, even from another
+/// library made of the same bytes, and the copy turns the function made before it into that
+/// object (measured on the M3 Max, macOS 27.0.1). A case after the copy would link the binary
+/// where it names the function made by name.
 fn linked_answers<P: reims_vgpu_core::platform::Platform>(
     d: &P::Device,
 ) -> Vec<(&'static str, LinkedAnswer)> {
@@ -1539,10 +1546,6 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
         named(&caller, "linked_fragment"),
     );
     let add_one = named(&callee, "linked_add_one");
-    let binary = callee
-        .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1, None)
-        .unwrap()
-        .unwrap();
     let one = |f: &P::Function| vec![f.clone_ref()];
     let group = || vec![("g".to_owned(), one(&add_one))];
     let answer = |made: Result<
@@ -1610,7 +1613,7 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
         functions: one(f),
         ..LinkedFunctionsDesc::default()
     };
-    vec![
+    let mut answers = vec![
         ("none", compute(vec![], vec![], vec![], vec![])),
         ("functions", compute(one(&add_one), vec![], vec![], vec![])),
         ("private", compute(vec![], vec![], vec![], one(&add_one))),
@@ -1620,8 +1623,12 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
             compute(vec![], vec![], group(), one(&add_one)),
         ),
         (
-            "binary alone",
-            compute(vec![], one(&binary), vec![], vec![]),
+            "unbinary alone",
+            compute(vec![], one(&add_one), vec![], vec![]),
+        ),
+        (
+            "unbinary in both",
+            compute(one(&add_one), one(&add_one), vec![], vec![]),
         ),
         (
             "render none",
@@ -1638,20 +1645,36 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
             "render fragment",
             render(LinkedFunctionsDesc::default(), functions(&add_one)),
         ),
-    ]
+    ];
+    let binary = callee
+        .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1, None)
+        .unwrap()
+        .unwrap();
+    answers.extend([
+        (
+            "binary alone",
+            compute(vec![], one(&binary), vec![], vec![]),
+        ),
+        (
+            "binary in functions",
+            compute(one(&binary), vec![], vec![], vec![]),
+        ),
+        (
+            "binary in both",
+            compute(one(&binary), one(&binary), vec![], vec![]),
+        ),
+    ]);
+    answers
 }
 
 /// A call through a visible-function reference that nothing the stage links resolves is
 /// refused with Metal's `NSError` code (3, "unresolved visible function reference"), at the
-/// compute and the render creators, and made where Metal makes it: by every list but a group
-/// alone, or a binary function made compiled to a binary with no other list holding it. That
-/// last the runtime makes, where Metal answers code 3: the runtime's to decide (its link resolves
-/// a direct call by a binary function, Metal's does not). Two lists that name one function the
-/// runtime refuses as Metal's validation does (`DuplicateLinkedFunction`, and `NotPrecompiled` for
-/// a binary function not made compiled to a binary), and the creator raises: plain Metal makes
-/// the state with `functions` holding the function and `binaryFunctions` holding it made
-/// compiled to a binary, and answers code 3 with `binaryFunctions` alone holding it not so made
-/// (`a_whole_compute_value_carries_its_linked_functions`).
+/// compute and the render creators, and made where Metal makes it, each answer Metal's
+/// ([`linked_answers`]): made by `functions`, private functions, or a group with the function in
+/// private functions, whether the function was made compiled to a binary or not; code 3 with
+/// none, a group alone, or `binaryFunctions` alone holding it, as a direct call resolves by no
+/// binary function; made with the function in both `functions` and `binaryFunctions` where it
+/// was made compiled to a binary, and code 2 where it was not
 #[test]
 fn unresolved_visible_calls_are_metals() {
     use reims_vgpu_metal::MetalPlatform;
@@ -1660,15 +1683,8 @@ fn unresolved_visible_calls_are_metals() {
     };
     let metals = linked_answers::<MetalPlatform>(&md);
     let ours = linked_answers::<VulkanPlatform>(&dev());
+    assert_eq!(ours.len(), metals.len());
     for ((case, ours), (_, metals)) in ours.into_iter().zip(metals) {
-        if case == "binary alone" {
-            assert_eq!(
-                (ours, metals),
-                (Ok(Ok(())), Ok(Err(METAL_REFUSES))),
-                "{case}"
-            );
-        } else {
-            assert_eq!(ours, metals, "{case}");
-        }
+        assert_eq!(ours, metals, "{case}");
     }
 }

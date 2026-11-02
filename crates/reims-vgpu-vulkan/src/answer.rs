@@ -1128,6 +1128,28 @@ pub fn create<T>(
 ///   a layer or viewport, and mesh draws, not measured there), announces it
 ///   (`ProvokingVertexUnmatched`); the setter announces nothing. Announced at each such draw,
 ///   inside its call, which dies at its selector;
+/// - `DeviceWideLines`: a draw of lines at a width other than 1 (`setLineWidth:`), of a
+///   triangle's edges in fill mode `Lines` or of a mesh draw's lines, that the runtime draws by
+///   the device's own lines where they are not Metal's parallelogram: a strict device's rectangle
+///   with square ends (NVIDIA, lavapipe), lines Vulkan does not state as parallelograms (ANV, and
+///   every width below 1), or a width the device rounds to its `lineWidthGranularity`. They can
+///   cover pixels Metal's parallelogram does not, and miss others, at each end and along each
+///   edge. The runtime's default (`WideLinePolicy::Device`) takes them; `REIMS_VGPU_EXACT`'s
+///   `wide_lines` ([`crate::platform::EXACT_FORMS`]) takes the band instead for lines, two
+///   triangles over Metal's parallelogram, on a device with `tessellationShader`, but not for a
+///   triangle's edges or a mesh draw's lines, which the band does not draw. MoltenVK has no wide
+///   lines, so on the Mac nothing announces it: the band draws lines at every such width.
+///   Announced at each such draw, inside its call, which dies at its selector;
+/// - `LinesAtNearestWidth`: a draw of lines at a width other than 1, of a triangle's edges in
+///   fill mode `Lines` or of a mesh draw's lines, that neither the device's own lines at the width
+///   nor the band draws, drawn by the device's lines at the width nearest it they draw: the width
+///   clamped into `lineWidthRange` where the device has `wideLines`, else 1 pixel. They cover
+///   fewer or more pixels across each line than Metal's. A triangle's edges and a mesh draw's
+///   lines where the device's lines do not draw the width (every such draw on MoltenVK, 1 pixel
+///   wide), a line on a device without `tessellationShader` whose lines do not draw it, a band
+///   under vertex amplification above 1, and every line in a pass of a rasterization rate map or
+///   of an execution's command, whose width Metal's answer is not measured for. Announced at each
+///   such draw, inside its call, which dies at its selector;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -1160,7 +1182,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 133] = [
+pub const DIES: [rt::Degradation; 135] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1288,6 +1310,8 @@ pub const DIES: [rt::Degradation; 133] = [
     rt::Degradation::DeviceAlphaCoverage,
     rt::Degradation::ProvokingVertexLines,
     rt::Degradation::ProvokingVertexUnmatched,
+    rt::Degradation::DeviceWideLines,
+    rt::Degradation::LinesAtNearestWidth,
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
     rt::Degradation::ReadOnlyPagesWritten,
@@ -2125,8 +2149,6 @@ pub enum Inexact {
     /// its device's image, where Metal's are not measured or are its own: a texture is made, and
     /// its size answered, by the runtime's.
     HeapLayout,
-    /// Lines at a line width other than 1: drawn 1 pixel wide.
-    LineWidth,
     /// A draw or tile dispatch in a pass of a rasterization rate map whose rates vary, or a tile
     /// dispatch in one of no layers, which the runtime runs by its own regions and tiles.
     RateMap,
@@ -2175,12 +2197,11 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
         Self::WriteRounding,
         Self::HeapLayout,
-        Self::LineWidth,
         Self::RateMap,
         Self::FillFormat,
         Self::LateResolve,
@@ -2198,7 +2219,6 @@ impl Inexact {
             Self::BfloatLoaded => "inexact-bfloat-loaded",
             Self::WriteRounding => "inexact-write-rounding",
             Self::HeapLayout => "inexact-heap-layout",
-            Self::LineWidth => "inexact-line-width",
             Self::RateMap => "inexact-rate-map",
             Self::FillFormat => "inexact-fill-format",
             Self::LateResolve => "inexact-late-resolve",
@@ -2858,7 +2878,6 @@ mod tests {
                 | Inexact::BfloatLoaded
                 | Inexact::WriteRounding
                 | Inexact::HeapLayout
-                | Inexact::LineWidth
                 | Inexact::RateMap
                 | Inexact::FillFormat
                 | Inexact::LateResolve
@@ -2878,22 +2897,22 @@ mod tests {
     fn an_inexact_value_is_relayed_but_in_strict_mode() {
         let counted = || {
             (inexact_counts().into_iter())
-                .find(|&(k, _)| k == Inexact::LineWidth)
+                .find(|&(k, _)| k == Inexact::HeapLayout)
                 .map_or(0, |(_, n)| n)
         };
         let before = counted();
-        relaxed(|| inexact("sel:", Inexact::LineWidth, || "a value".into()));
-        relaxed(|| inexact("sel:", Inexact::LineWidth, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::HeapLayout, || "a value".into()));
+        relaxed(|| inexact("sel:", Inexact::HeapLayout, || "a value".into()));
         assert_eq!(counted(), before + 2);
         *LAST_LINE.lock() = None;
         let site = reims_vgpu_core::testkit::capture::catch_death(|| {
-            inexact("sel:", Inexact::LineWidth, || "a value".into());
+            inexact("sel:", Inexact::HeapLayout, || "a value".into());
         })
         .unwrap_err();
         assert_eq!(site.file, "sel:");
         let line = LAST_LINE.lock().take().unwrap_or_default();
         assert!(line.contains("cannot hold a value"), "{line}");
-        assert!(line.contains("(inexact-line-width)"), "{line}");
+        assert!(line.contains("(inexact-heap-layout)"), "{line}");
         assert_eq!(counted(), before + 2);
     }
 
@@ -2906,11 +2925,11 @@ mod tests {
             asked.set(asked.get() + 1);
             String::from("a value")
         };
-        relaxed(|| inexact("sel:", Inexact::LineWidth, what));
+        relaxed(|| inexact("sel:", Inexact::HeapLayout, what));
         let first = asked.get();
         assert!(first <= 1, "asked {first} times for one line");
-        relaxed(|| inexact("sel:", Inexact::LineWidth, what));
-        relaxed(|| inexact("sel:", Inexact::LineWidth, what));
+        relaxed(|| inexact("sel:", Inexact::HeapLayout, what));
+        relaxed(|| inexact("sel:", Inexact::HeapLayout, what));
         assert_eq!(asked.get(), first);
     }
 

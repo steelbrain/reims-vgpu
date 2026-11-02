@@ -333,19 +333,23 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// (`host_page_textures`, `HostPageTexturePolicy::Shadow`), and, on a device without
 /// `shaderFloat16`, each `half` addition, subtraction and product of a fast-math chain rounded
 /// where it is computed, where the default rounds the chain where a value leaves it
-/// (`half_chains`, `HalfChainPolicy::EachOperation`), and a command buffer that waits for each
+/// (`half_chains`, `HalfChainPolicy::EachOperation`), a command buffer that waits for each
 /// pipeline the driver is still making until it is made, where the default waits 4.5 s from its
 /// commit and then drops the draws and dispatches whose pipeline is not made (`pipeline_waits`,
-/// `PipelineWaitPolicy::Exact`). [`EXACT_ALL`] names every one. The
+/// `PipelineWaitPolicy::Exact`), and, on a device with `tessellationShader`, a line `setLineWidth:`
+/// widens drawn as Metal's parallelogram, two triangles over each segment, where the default draws
+/// the device's own line at the width wherever it draws it, which can differ from Metal's
+/// (`wide_lines`, `WideLinePolicy::Exact`). [`EXACT_ALL`] names every one. The
 /// policy's `completion` and `heap_compression` are no names of these: every device takes their
 /// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 4] = [
+pub const EXACT_FORMS: [&str; 5] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
     "pipeline_waits",
+    "wide_lines",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -374,13 +378,14 @@ pub const EXACT_ALL: &str = "all";
 /// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
 /// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
-/// each `half` operation on a device without `shaderFloat16`, and `pipeline_waits`' wait for
-/// every pipeline until it is made. A name of neither changes nothing,
+/// each `half` operation on a device without `shaderFloat16`, `pipeline_waits`' wait for every
+/// pipeline until it is made, and `wide_lines`' band variant of each pipeline that draws a line
+/// the device's own lines would draw otherwise than Metal. A name of neither changes nothing,
 /// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy, PipelineWaitPolicy,
+        HostPageTexturePolicy, PipelineWaitPolicy, WideLinePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -392,6 +397,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "host_page_textures" => policy.host_page_textures = HostPageTexturePolicy::Shadow,
             "half_chains" => policy.half_chains = HalfChainPolicy::EachOperation,
             "pipeline_waits" => policy.pipeline_waits = PipelineWaitPolicy::Exact,
+            "wide_lines" => policy.wide_lines = WideLinePolicy::Exact,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -694,7 +700,7 @@ pub(crate) mod tests {
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy,
-            HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
+            HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy, WideLinePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -706,6 +712,7 @@ pub(crate) mod tests {
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
         assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
         assert_eq!(fast.pipeline_waits, PipelineWaitPolicy::Bounded);
+        assert_eq!(fast.wide_lines, WideLinePolicy::Device);
         for unchanged in [
             None,
             Some(""),
@@ -720,7 +727,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 4] = [
+        let alone: [(&str, Set); 5] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -731,6 +738,7 @@ pub(crate) mod tests {
             ("pipeline_waits", |p| {
                 p.pipeline_waits = PipelineWaitPolicy::Exact;
             }),
+            ("wide_lines", |p| p.wide_lines = WideLinePolicy::Exact),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -741,7 +749,7 @@ pub(crate) mod tests {
             assert_eq!(one(name), want, "{name}");
             set(&mut every);
         }
-        let named = " half_chains,pipeline_waits,host_page_textures , batch_order";
+        let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());

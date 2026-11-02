@@ -1326,6 +1326,80 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
     }
 }
 
+/// `setLineWidth:` reaches the runtime's encoder, which draws Metal's widths: lines and line
+/// strips over the flat vertices at widths 1, 3, 2.5 and 0 draw as the Metal platform draws them,
+/// where the runtime draws the width exactly (its band of triangles, or device lines it takes as
+/// exact), at 0 the few pixels Metal lights on the segments (3 of the list's, 5 of the strip's
+/// here, the M3 Max). A device's own lines that differ from Metal's say so (`device-wide-lines`),
+/// relayed by default, and are not compared. A width of 3 lights more pixels than a width of 1.
+/// The first vertex is white: [`vertex_colours`]' first is the clear's black, which would hide
+/// the line it provokes
+#[test]
+fn lines_draw_at_metals_widths() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let kind = rt::Degradation::DeviceWideLines;
+    /// The flat state's draw of `primitive_type` over the first 8 flat vertices at `line_width`,
+    /// the first white.
+    fn lines<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        line_width: f32,
+        primitive_type: u64,
+    ) -> Vec<[u8; 4]> {
+        let state = fixture_state::<P>(d, FLAT.0, FLAT.1);
+        let (pos, _) = flat_vertices::<P>(d, 16);
+        let mut colours = vertex_colours();
+        colours[..4].copy_from_slice(&[1.0; 4]);
+        let length = u64::try_from(colours.len() * 4).unwrap();
+        let colours = buffer::<P>(d, length, 0, &bytes(&colours));
+        pass_pixels(
+            p,
+            d,
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&pos),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&colours),
+                    offset: 0,
+                    index: 1,
+                },
+                RenderCmd::SetLineWidth { line_width },
+                RenderCmd::DrawPrimitivesInstances {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count: 8,
+                    instance_count: 1,
+                },
+            ],
+        )
+    }
+    let lit = |px: &[[u8; 4]]| px.iter().filter(|&&t| t != [0, 0, 0, 0xff]).count();
+    for primitive_type in [1, 2] {
+        let mut lit_at = Vec::new();
+        for w in [1.0, 3.0, 2.5, 0.0] {
+            let before = super::relayed_kind(kind);
+            let ours = crate::answer::relaxed(|| lines(&p, &d, w, primitive_type));
+            let exact = super::relayed_kind(kind) == before;
+            lit_at.push(lit(&ours));
+            if let Some((mp, md)) = &metal
+                && exact
+            {
+                let theirs = lines(mp, md, w, primitive_type);
+                assert!(ours == theirs, "{primitive_type} at {w}");
+            }
+        }
+        assert!(lit_at[1] > lit_at[0], "{primitive_type}: {lit_at:?}");
+    }
+}
+
 /// At `setProvokingVertexMode:` 1, a state whose fragment function reads `[[barycentric_coord]]`
 /// and no flat input draws what Metal draws: a list's weights in mode 0's order and a strip's odd
 /// triangles' moved, over their vertices, over indices, restarting, from indirect arguments, and
