@@ -786,11 +786,12 @@ impl Shared {
     }
 
     /// Takes and answers every message the guest has published, while the device is started and
-    /// the ring is not broken. A display command is taken and done with the ring held, so a reset
-    /// comes before or after it whole; an object-lifecycle message is taken with it held and
-    /// carried out with nothing held, so a reset never waits for the host's decoder. An answer is
-    /// posted with nothing held, so the interrupt is raised with no lock of the device's held, and
-    /// dropped where a reset came between.
+    /// the ring is not broken. A display command but `PRESENT_SURFACE` is taken and done with the
+    /// ring held, so a reset comes before or after it whole. An object-lifecycle message and a
+    /// `PRESENT_SURFACE` are taken with it held and carried out with nothing held, so a reset never
+    /// waits for the host, which may wait for its decoder there, or answer a present at once. An
+    /// answer is posted with nothing of the device's held, so the interrupt is raised with no lock
+    /// of the device's held, and dropped where a reset came after its message was taken.
     fn take_messages(&self) {
         loop {
             let (answer, epoch) = {
@@ -800,10 +801,10 @@ impl Shared {
                 }
                 let epoch = self.epoch.load(Ordering::Acquire);
                 match submit.consumer.next(&self.region) {
-                    Ok(Some(message)) if control::is_lifecycle(&message) => {
+                    Ok(Some(message)) if control::is_unheld(&message) => {
                         let through = submit.consumer.consumed();
                         drop(submit);
-                        let answer = control::lifecycle(self, &message);
+                        let answer = control::unheld(self, &message, epoch);
                         // A reset meanwhile restarted the count; this message's is moot.
                         if self.epoch.load(Ordering::Acquire) == epoch {
                             self.control_done.store(through, Ordering::Release);
@@ -1252,12 +1253,12 @@ impl Shared {
         true
     }
 
-    /// The answer ring-0 command `seqno` owes ([`CompleteAnswer`]).
-    pub(crate) fn complete_answer(&self, seqno: u64) -> CompleteAnswer {
+    /// The answer ring-0 command `seqno`, taken at reset count `epoch`, owes ([`CompleteAnswer`]).
+    pub(crate) fn complete_answer(&self, seqno: u64, epoch: u64) -> CompleteAnswer {
         CompleteAnswer {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch,
         }
     }
 

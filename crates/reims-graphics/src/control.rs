@@ -12,7 +12,8 @@ use crate::display::{CursorImage, Scanout, straight_rgba};
 use crate::ring::{Message, set_size, sized};
 use crate::wire::*;
 
-/// What answers `message`: the bytes of its answer, or `None` for a command that has none.
+/// What answers `message`, a command carried out with the ring held (any but those [`is_unheld`]
+/// names): the bytes of its answer, or `None` for a command that has none.
 pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     let status = match message.header.r#type {
@@ -36,27 +37,30 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
             set_vblank(shared, &command)
         }),
-        RGFX_CMD_PRESENT_SURFACE => match read::<RgfxPresentSurface>(message) {
-            Some(command) if command.display == 0 => {
-                let generation =
-                    read_at::<RgfxPresentSurfaceGen>(message, RGFX_PRESENT_SURFACE_GEN_OFFSET)
-                        .map(|g| g.cpu_gen);
-                present_surface(shared, &command, generation, seqno);
-                return None;
-            }
-            Some(_) => RGFX_STATUS_NO_DISPLAY,
-            None => RGFX_STATUS_INVALID_ARGUMENT,
-        },
         // A command buffer rides a command queue's own ring, never the control ring.
         _ => RGFX_STATUS_UNKNOWN_COMMAND,
     };
     Some(complete(seqno, status))
 }
 
-/// Whether `message` is of the object lifecycle the accelerator kext posts on ring 0 (every
-/// stage-3 type from `QUEUE_CREATE` below `COMMAND_BUFFER`), which [`lifecycle`] carries out.
-pub(crate) fn is_lifecycle(message: &Message) -> bool {
+/// Whether `message` is carried out with no ring held ([`unheld`]): the object lifecycle the
+/// accelerator kext posts on ring 0 (every stage-3 type from `QUEUE_CREATE` below
+/// `COMMAND_BUFFER`), and `PRESENT_SURFACE`, which the host may answer at once, raising the
+/// interrupt, or carry out under locks of its own.
+pub(crate) fn is_unheld(message: &Message) -> bool {
     (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_COMMAND_BUFFER).contains(&message.header.r#type)
+        || message.header.r#type == RGFX_CMD_PRESENT_SURFACE
+}
+
+/// Carries out one message [`is_unheld`] names, with no ring held, taken at reset count `epoch`:
+/// what answers it, or `None` for one the host answers itself or not at all. The answers the host
+/// gives are at `epoch`, so they are dropped where a reset came after the message was taken.
+pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
+    if message.header.r#type == RGFX_CMD_PRESENT_SURFACE {
+        present(shared, message, epoch)
+    } else {
+        lifecycle(shared, message, epoch)
+    }
 }
 
 /// Carries out one object-lifecycle message from ring 0, with no ring held: what answers it, or
@@ -71,7 +75,7 @@ pub(crate) fn is_lifecycle(message: &Message) -> bool {
 /// to the host (`Shared::surface_pages`), answered with whether it mapped them; a
 /// `SURFACE_DOWNLOAD` the host answers once the surface's pages hold its device cache
 /// (`Host::surface_download`). Every other message goes to the host's decoder.
-pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
+fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     match message.header.r#type {
         RGFX_CMD_QUEUE_CREATE => {
@@ -93,7 +97,7 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         }
         RGFX_CMD_CONTEXT_CLOSE => match read::<RgfxContextClose>(message) {
             Some(command) => {
-                shared.close_context(command.context, shared.complete_answer(seqno));
+                shared.close_context(command.context, shared.complete_answer(seqno, epoch));
                 None
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
@@ -123,7 +127,7 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
             Some(download) => {
                 shared
                     .host
-                    .surface_download(download.block_offset, shared.complete_answer(seqno));
+                    .surface_download(download.block_offset, shared.complete_answer(seqno, epoch));
                 None
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
@@ -137,7 +141,7 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
                 } else {
                     shared
                         .host
-                        .block_released(&release, shared.complete_answer(seqno));
+                        .block_released(&release, shared.complete_answer(seqno, epoch));
                     None
                 }
             }
@@ -290,13 +294,32 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
     RGFX_STATUS_OK
 }
 
+/// `PRESENT_SURFACE`, with no ring held, taken at reset count `epoch`: what answers it where it is
+/// refused here, else `None`.
+fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
+    let seqno = message.header.seqno;
+    let status = match read::<RgfxPresentSurface>(message) {
+        Some(command) if command.display == 0 => {
+            let generation =
+                read_at::<RgfxPresentSurfaceGen>(message, RGFX_PRESENT_SURFACE_GEN_OFFSET)
+                    .map(|g| g.cpu_gen);
+            present_surface(shared, &command, generation, seqno, epoch);
+            return None;
+        }
+        Some(_) => RGFX_STATUS_NO_DISPLAY,
+        None => RGFX_STATUS_INVALID_ARGUMENT,
+    };
+    Some(complete(seqno, status))
+}
+
 /// `PRESENT_SURFACE` on display 0: the host answers once it shows the surface, or refuses it
-/// (`Host::present_surface`).
+/// (`Host::present_surface`), at once or from any thread.
 fn present_surface(
     shared: &Shared,
     command: &RgfxPresentSurface,
     generation: Option<u64>,
     seqno: u64,
+    epoch: u64,
 ) {
     log::trace!(
         target: "reims_graphics",
@@ -307,7 +330,7 @@ fn present_surface(
     shared.host.present_surface(
         command.iosurface_id,
         generation,
-        shared.complete_answer(seqno),
+        shared.complete_answer(seqno, epoch),
     );
 }
 

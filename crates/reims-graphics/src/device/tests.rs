@@ -365,6 +365,59 @@ fn present_surface_asks_the_host_and_answers_its_word() {
     );
 }
 
+/// A host whose interrupt resets the device, as a host's `raise_interrupt` may (it may call the
+/// device), and which answers a present at once, inside [`Host::present_surface`].
+struct ResettingHost {
+    shared: Arc<OnceLock<Weak<Shared>>>,
+    resets: Arc<AtomicU32>,
+}
+
+impl Host for ResettingHost {
+    fn raise_interrupt(&self, _vector: u32) {
+        if let Some(shared) = self.shared.get().and_then(Weak::upgrade) {
+            shared.reset();
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+        false
+    }
+    fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+        answer.answer(RGFX_STATUS_OK);
+    }
+}
+
+/// A present the host answers at once raises the interrupt with no lock of the device's held: an
+/// interrupt that resets the device returns
+#[test]
+fn a_present_answered_at_once_raises_with_no_lock_held() {
+    let shared = Arc::new(OnceLock::new());
+    let resets = Arc::new(AtomicU32::new(0));
+    let mut rig = Rig::with_host(Box::new(ResettingHost {
+        shared: Arc::clone(&shared),
+        resets: Arc::clone(&resets),
+    }));
+    shared.set(Arc::downgrade(&rig.device.shared)).unwrap();
+    rig.start();
+    rig.arm();
+    rig.send(present_surface(0, HELD_SURFACE));
+    for _ in 0..2000 {
+        if resets.load(Ordering::SeqCst) != 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "the reset inside the interrupt never returned"
+    );
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_STATUS.into()),
+        RGFX_STATUS_RESET
+    );
+}
+
 /// The registers read as the wire says, and `STATUS` follows the guest's writes
 #[test]
 fn the_registers_read_as_the_wire_says() {
