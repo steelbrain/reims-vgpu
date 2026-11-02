@@ -23,13 +23,13 @@ use reims_vgpu_video_codec::h264::{
     SliceParams, avcc::DecoderConfiguration, slice::MemoryManagement, slice::SliceType, sps::Sps,
 };
 
-use self::session::{Decode, Session};
+use self::session::{Decode, Session, Target};
 use crate::device::VideoDevice;
 use crate::error::Error;
 use crate::picture::{ImageView, Picture};
 use crate::profile::{H264Capabilities, H264Profile, h264_capabilities};
 use crate::std_types::zeroed;
-use crate::surface::{SurfaceImage, SurfaceSource, SurfaceSpec};
+use crate::surface::{Landing, Surface, SurfaceSource, SurfaceSpec};
 use crate::timeline::Timeline;
 
 /// A decoded frame: its picture, which holds the output it landed in, and
@@ -213,14 +213,13 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
             }
         };
         let surface = self.source.surface(&spec)?;
-        let view = if spec.decode_target {
-            Some(ImageView::for_decode(
+        let view = match surface.landing() {
+            Landing::Image(image) if spec.decode_target => Some(ImageView::for_decode(
                 &self.device,
-                surface.image(),
+                image,
                 vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
-            )?)
-        } else {
-            None
+            )?),
+            _ => None,
         };
         Ok(Picture::new(&self.timeline, surface, view, spec.extent))
     }
@@ -284,7 +283,10 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
         let decode = Decode {
             slices: &nals,
             parameters,
-            output: (picture.surface().image(), picture.output_view()),
+            output: match picture.surface().landing() {
+                Landing::Image(image) => Target::Image(image, picture.output_view()),
+                Landing::Buffer(planes) => Target::Buffer(planes, params.sps.crop_rect()),
+            },
             setup_slot,
             setup_info,
             picture_info,

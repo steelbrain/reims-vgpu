@@ -10,16 +10,17 @@
 //! - [`h264_capabilities`] says what the device answers for each H.264
 //!   profile, which the guest's capability answers come from.
 //! - [`H264Decoder`] decodes access units into DPB pictures of its own,
-//!   and lands each picture in a [`SurfaceImage`] its [`SurfaceSource`]
-//!   gives, made as [`SurfaceSpec`] says: the decode writes it where the
-//!   device decodes into an output beside the DPB picture, else one GPU
-//!   copy out of the DPB picture does. In the product each output is the
+//!   and lands each picture in a [`Surface`] its [`SurfaceSource`] gives:
+//!   an image made as [`SurfaceSpec`] says, which the decode writes where
+//!   the device decodes into an output beside the DPB picture, else one
+//!   GPU copy out of the DPB picture does; or two planes in a buffer
+//!   ([`BufferPlanes`]), cropped, which one GPU copy writes. In the product each output is the
 //!   GPU copy of a guest IOSurface, which the guest recycles once shown,
 //!   reference or not. Each picture names the value of the decoder's
 //!   timeline semaphore after which its output holds it
 //!   ([`Picture::value`]), which graphics work and read backs wait on.
-//! - [`DecodeImages`] makes outputs of its own, and
-//!   [`Picture::read_back`] copies one out, for the tests and tools.
+//! - [`DecodeImages`] and [`HostBuffers`] make outputs of their own, and
+//!   [`Picture::read_back`] copies an image out, for the tests and tools.
 //!
 //! Every `unsafe` block holds one operation and says why it is sound, and
 //! every `unsafe fn` its contract (the lints below).
@@ -47,4 +48,7 @@ pub use profile::{
     H264Capabilities, H264Profile, OUTPUT_FLAGS, OUTPUT_USAGE, PICTURE_FORMAT, h264_capabilities,
 };
 pub use reims_vgpu_video_codec::h264::{OutputOrder, avcc, nal};
-pub use surface::{DecodeImage, DecodeImages, SurfaceImage, SurfaceSource, SurfaceSpec};
+pub use surface::{
+    BufferPlanes, DecodeImage, DecodeImages, HostBuffer, HostBuffers, Landing, Surface,
+    SurfaceSource, SurfaceSpec,
+};

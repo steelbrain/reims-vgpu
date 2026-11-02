@@ -15,7 +15,7 @@
 # VideoDevice::create picks, from its MP4 (the avcC record and length-prefixed
 # samples) and from its Annex B form, in display order: every frame's NV12 MD5
 # must equal ffmpeg's. One stream is decoded again with its pictures copied
-# out of the DPB on the graphics queue. Decode order must give the same frames, as a set. The
+# out of the DPB on the graphics queue, and three are landed in buffers. Decode order must give the same frames, as a set. The
 # crafted streams (long-term references, memory management operations 2 to 6,
 # frame number gaps, 1- to 3-byte lengths), the SPS switch mid-stream and the
 # lost reference are the VA-API check's, as are their verdicts. A stream whose
@@ -242,6 +242,16 @@ fi
 # semaphore wait, as on a device whose decode family does not copy.
 if run "$out/high-1080p.mp4" high-1080p.graphics --copy-on-graphics; then
   check "high-1080p (copied out on the graphics queue)" "$out/high-1080p.ref" "$runs/high-1080p.graphics.md5"
+fi
+# Pictures landed in buffers, cropped, at offsets and pitches of their own:
+# a cropped frame, a frame number wrap, an open GOP, and the copy queue.
+for name in high-1080p baseline-720p main-1080p-opengop; do
+  if run "$out/$name.mp4" "$name.buffer" --buffer; then
+    check "$name (landed in buffers)" "$out/$name.ref" "$runs/$name.buffer.md5"
+  fi
+done
+if run "$out/high-1080p.mp4" high-1080p.buffer-graphics --buffer --copy-on-graphics; then
+  check "high-1080p (landed in buffers on the graphics queue)" "$out/high-1080p.ref" "$runs/high-1080p.buffer-graphics.md5"
 fi
 
 # A new SPS at an IDR picture, with another size and profile, mid-stream.

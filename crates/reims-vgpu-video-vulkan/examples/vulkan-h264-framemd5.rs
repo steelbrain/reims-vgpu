@@ -6,7 +6,7 @@
 //! (tools/h264-check.sh), as for the VA-API backend's h264-framemd5.
 //!
 //! ```sh
-//! vulkan-h264-framemd5 stream.mp4 [--decode-order] [--length-size N] [--hold N] [--copy-on-graphics]
+//! vulkan-h264-framemd5 stream.mp4 [--decode-order] [--length-size N] [--hold N] [--copy-on-graphics] [--buffer]
 //! vulkan-h264-framemd5 --capabilities
 //! ```
 //!
@@ -23,6 +23,10 @@
 //!   queue, so that pictures decoded into DPB pictures alone are copied
 //!   out on a queue of their own, behind a semaphore wait, as on a device
 //!   whose decode family does not copy.
+//! - `--buffer` lands each picture in a host-visible buffer
+//!   ([`reims_vgpu_video_vulkan::HostBuffers`]), cropped, at offsets and
+//!   pitches that are not the frame's own, and reads it there, instead of
+//!   in an image read back.
 //! - `--capabilities` prints what the device answers for each profile.
 //!
 //! Prints `frame <index> id <sample> poc <poc> <md5>` per frame, and the
@@ -37,8 +41,8 @@ use reims_vgpu_video_conformance::mp4;
 use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
 use reims_vgpu_video_vulkan::avcc::DecoderConfiguration;
 use reims_vgpu_video_vulkan::{
-    DecodeImage, DecodeImages, Frame, H264Decoder, OutputOrder, RawDevice, VideoDevice,
-    h264_capabilities, nal,
+    DecodeImage, DecodeImages, Frame, H264Decoder, HostBuffer, HostBuffers, OutputOrder, RawDevice,
+    Surface, SurfaceSource, VideoDevice, h264_capabilities, nal,
 };
 
 fn main() -> std::process::ExitCode {
@@ -57,6 +61,7 @@ struct Options {
     length_size: Option<u8>,
     hold: usize,
     copy_on_graphics: bool,
+    buffer: bool,
     capabilities: bool,
 }
 
@@ -69,6 +74,7 @@ fn options() -> Result<Options, String> {
         length_size: None,
         hold: 0,
         copy_on_graphics: false,
+        buffer: false,
         capabilities: false,
     };
     while let Some(arg) = args.next() {
@@ -90,6 +96,7 @@ fn options() -> Result<Options, String> {
             }
             "--hold" => options.hold = number("--hold")?,
             "--copy-on-graphics" => options.copy_on_graphics = true,
+            "--buffer" => options.buffer = true,
             "--capabilities" => options.capabilities = true,
             _ => positional.push(arg),
         }
@@ -122,21 +129,16 @@ fn relength(sample: &[u8], from: u8, to: u8) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-struct Reader {
-    device: Arc<VideoDevice>,
-    index: usize,
-    readback: Duration,
+/// An output whose frame's cropped planes the tool hashes.
+trait Hashed: Surface + Sized {
+    /// The MD5 of the frame's cropped planes, packed: the luma rows, then
+    /// the chroma rows.
+    fn md5(frame: &Frame<Self>, device: &Arc<VideoDevice>) -> Result<String, String>;
 }
 
-impl Reader {
-    /// Prints the MD5 of the frame's cropped planes.
-    fn emit(&mut self, frame: &Frame<DecodeImage>) -> Result<(), String> {
-        let start = StdRuntime.now();
-        let planes = frame
-            .picture
-            .read_back(&self.device)
-            .map_err(|e| e.to_string())?;
-        self.readback += StdRuntime.elapsed_since(start);
+impl Hashed for DecodeImage {
+    fn md5(frame: &Frame<Self>, device: &Arc<VideoDevice>) -> Result<String, String> {
+        let planes = frame.picture.read_back(device).map_err(|e| e.to_string())?;
         let (x, y, w, h) = frame.crop;
         let [x, y, w, h, stride] =
             [x, y, w, h, planes.width].map(|v| usize::try_from(v).unwrap_or(0));
@@ -147,12 +149,48 @@ impl Reader {
         for row in planes.uv.chunks(stride).skip(y / 2).take(h / 2) {
             md5.update(row.get(x..x + w).ok_or("a crop past the frame")?);
         }
+        Ok(md5.hex())
+    }
+}
+
+impl Hashed for HostBuffer {
+    fn md5(frame: &Frame<Self>, _: &Arc<VideoDevice>) -> Result<String, String> {
+        frame
+            .picture
+            .wait(Duration::from_secs(10))
+            .map_err(|e| e.to_string())?;
+        let buffer = frame.picture.surface();
+        let (bytes, planes) = (buffer.bytes(), buffer.planes());
+        let (_, _, w, h) = frame.crop;
+        let [w, h] = [w, h].map(|v| usize::try_from(v).unwrap_or(0));
+        let mut md5 = Md5::new();
+        for ((offset, pitch), rows) in [(planes.luma, h), (planes.chroma, h / 2)] {
+            let [offset, pitch] =
+                [offset, u64::from(pitch)].map(|v| usize::try_from(v).unwrap_or(usize::MAX));
+            for row in 0..rows {
+                let at = offset + row * pitch;
+                md5.update(bytes.get(at..at + w).ok_or("a plane past the buffer")?);
+            }
+        }
+        Ok(md5.hex())
+    }
+}
+
+struct Reader {
+    device: Arc<VideoDevice>,
+    index: usize,
+    readback: Duration,
+}
+
+impl Reader {
+    /// Prints the MD5 of the frame's cropped planes.
+    fn emit<T: Hashed>(&mut self, frame: &Frame<T>) -> Result<(), String> {
+        let start = StdRuntime.now();
+        let md5 = T::md5(frame, &self.device)?;
+        self.readback += StdRuntime.elapsed_since(start);
         println!(
-            "frame {} id {} poc {} {}",
-            self.index,
-            frame.id,
-            frame.poc,
-            md5.hex()
+            "frame {} id {} poc {} {md5}",
+            self.index, frame.id, frame.poc
         );
         self.index += 1;
         Ok(())
@@ -229,47 +267,77 @@ fn run() -> Result<(), String> {
     } else {
         Arc::clone(&owner)
     };
+    let input = read_input(&options)?;
+    if options.buffer {
+        decode_all(&device, HostBuffers::new(&device), &options, &input)
+    } else {
+        decode_all(&device, DecodeImages::new(&device), &options, &input)
+    }
+}
+
+/// A stream's samples, and its `avcC` record where it is an MP4.
+struct Input {
+    avcc: Option<Vec<u8>>,
+    samples: Vec<Vec<u8>>,
+}
+
+fn read_input(options: &Options) -> Result<Input, String> {
     let file = std::fs::read(&options.input).map_err(|e| format!("{}: {e}", options.input))?;
-    let images = DecodeImages::new(&device);
-    let (mut decoder, samples): (H264Decoder<DecodeImages>, Vec<Vec<u8>>) =
-        if options.input.ends_with(".mp4") {
-            let track = mp4::h264_track(&file)?;
-            let mut avcc = track.avcc.clone();
-            let from = DecoderConfiguration::parse(&avcc)
-                .map_err(|e| e.to_string())?
-                .length_size;
-            let mut samples = Vec::with_capacity(track.samples.len());
-            for &(offset, size) in &track.samples {
-                let sample = file
-                    .get(offset..offset + size)
-                    .ok_or("sample past the file's end")?;
-                samples.push(match options.length_size {
-                    Some(to) => relength(sample, from, to)?,
-                    None => sample.to_vec(),
-                });
-            }
-            if let Some(to) = options.length_size {
-                let byte = avcc.get_mut(4).ok_or("an avcC record of 4 bytes")?;
-                *byte = (*byte & !3) | (to - 1);
-            }
-            let decoder = H264Decoder::new(&device, images, &avcc).map_err(|e| e.to_string())?;
-            (decoder, samples)
-        } else {
-            let units = nal::access_units(&file);
-            (
-                H264Decoder::new_annex_b(&device, images).map_err(|e| e.to_string())?,
-                units.into_iter().map(<[u8]>::to_vec).collect(),
-            )
-        };
+    if !options.input.ends_with(".mp4") {
+        let units = nal::access_units(&file);
+        return Ok(Input {
+            avcc: None,
+            samples: units.into_iter().map(<[u8]>::to_vec).collect(),
+        });
+    }
+    let track = mp4::h264_track(&file)?;
+    let mut avcc = track.avcc.clone();
+    let from = DecoderConfiguration::parse(&avcc)
+        .map_err(|e| e.to_string())?
+        .length_size;
+    let mut samples = Vec::with_capacity(track.samples.len());
+    for &(offset, size) in &track.samples {
+        let sample = file
+            .get(offset..offset + size)
+            .ok_or("sample past the file's end")?;
+        samples.push(match options.length_size {
+            Some(to) => relength(sample, from, to)?,
+            None => sample.to_vec(),
+        });
+    }
+    if let Some(to) = options.length_size {
+        let byte = avcc.get_mut(4).ok_or("an avcC record of 4 bytes")?;
+        *byte = (*byte & !3) | (to - 1);
+    }
+    Ok(Input {
+        avcc: Some(avcc),
+        samples,
+    })
+}
+
+fn decode_all<S: SurfaceSource>(
+    device: &Arc<VideoDevice>,
+    source: S,
+    options: &Options,
+    input: &Input,
+) -> Result<(), String>
+where
+    S::Surface: Hashed,
+{
+    let mut decoder = match &input.avcc {
+        Some(avcc) => H264Decoder::new(device, source, avcc),
+        None => H264Decoder::new_annex_b(device, source),
+    }
+    .map_err(|e| e.to_string())?;
     decoder.set_output_order(options.order);
     let mut reader = Reader {
-        device: Arc::clone(&device),
+        device: Arc::clone(device),
         index: 0,
         readback: Duration::ZERO,
     };
     let mut held = VecDeque::new();
     let start = StdRuntime.now();
-    for (id, sample) in (0u64..).zip(&samples) {
+    for (id, sample) in (0u64..).zip(&input.samples) {
         let frames = decoder
             .decode(sample, id)
             .map_err(|e| format!("sample {id}: {e}"))?;
@@ -288,9 +356,9 @@ fn run() -> Result<(), String> {
     }
     let total = StdRuntime.elapsed_since(start);
     eprintln!(
-        "{} samples, {} frames, profile {}, {} layouts, copies on {}, {:.3} s, read back {:.3} s, \
-         on {}",
-        samples.len(),
+        "{} samples, {} frames, profile {}, {} layouts, copies on {}, into {}, {:.3} s, read back \
+         {:.3} s, on {}",
+        input.samples.len(),
         reader.index,
         decoder.profile().map_or(0, |p| p.profile_idc),
         if device.unified_image_layouts() {
@@ -303,6 +371,7 @@ fn run() -> Result<(), String> {
         } else {
             format!("family {}", device.copy_family())
         },
+        if options.buffer { "buffers" } else { "images" },
         total.as_secs_f64(),
         reader.readback.as_secs_f64(),
         device.name(),

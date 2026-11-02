@@ -11,7 +11,7 @@ use ash::vk;
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
 use crate::profile::PICTURE_FORMAT;
-use crate::surface::SurfaceImage;
+use crate::surface::{Landing, Surface};
 use crate::timeline::Timeline;
 
 /// How long a read back waits for its picture.
@@ -26,12 +26,12 @@ const READ_BACK_WAIT: Duration = Duration::from_secs(10);
 /// is written only by the decode that sets its slot up, which no slot a
 /// reference holds is, so the stand-in holds what its source holds for as
 /// long as it is a reference.
-pub struct Picture<T: SurfaceImage> {
+pub struct Picture<T: Surface> {
     inner: Arc<Inner<T>>,
     stand_in: bool,
 }
 
-struct Inner<T: SurfaceImage> {
+struct Inner<T: Surface> {
     timeline: Arc<Timeline>,
     /// Taken as it goes, to wait for the GPU in the timeline.
     held: ManuallyDrop<Held<T>>,
@@ -103,7 +103,7 @@ pub(crate) fn color_range() -> vk::ImageSubresourceRange {
         .layer_count(1)
 }
 
-impl<T: SurfaceImage> Picture<T> {
+impl<T: Surface> Picture<T> {
     pub(crate) fn new(
         timeline: &Arc<Timeline>,
         surface: T,
@@ -180,17 +180,23 @@ impl<T: SurfaceImage> Picture<T> {
         self.inner.landed.store(landed, Ordering::Release);
     }
 
-    /// The output's planes, copied to host memory (tests and tools): the
-    /// luma plane then the interleaved chroma plane, each of the coded
-    /// extent, tightly packed. It blocks until the copy is done, which
-    /// runs on the copy queue once the output holds the picture.
+    /// The output image's planes, copied to host memory (tests and
+    /// tools): the luma plane then the interleaved chroma plane, each of
+    /// the coded extent, tightly packed. It blocks until the copy is done,
+    /// which runs on the copy queue once the output holds the picture. A
+    /// buffer landing is refused: the caller reads its own buffer.
     pub fn read_back(&self, device: &Arc<VideoDevice>) -> Result<Nv12, Error> {
         let extent = self.inner.extent;
         let (width, height) = (u64::from(extent.width), u64::from(extent.height));
         let luma = width * height;
         let size = luma + luma / 2;
+        let Landing::Image(image) = self.surface().landing() else {
+            return Err(Error::Unsupported(
+                "a read back of a picture that landed in a buffer, which holds it".into(),
+            ));
+        };
         let mut copy = ReadBack::new(device, size)?;
-        copy.record(self.surface().image(), extent, luma)?;
+        copy.record(image, extent, luma)?;
         copy.submit(&self.inner.timeline, self.value())?;
         copy.wait()?;
         let bytes = copy.bytes(size)?;
@@ -205,7 +211,7 @@ impl<T: SurfaceImage> Picture<T> {
     }
 }
 
-impl<T: SurfaceImage> Drop for Inner<T> {
+impl<T: Surface> Drop for Inner<T> {
     fn drop(&mut self) {
         // SAFETY: the drop runs once, and nothing reads `held` after it.
         let held = unsafe { ManuallyDrop::take(&mut self.held) };

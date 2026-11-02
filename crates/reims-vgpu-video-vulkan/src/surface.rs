@@ -1,10 +1,13 @@
 //! Where a decoder's pictures land: outputs its caller supplies, one a
-//! picture. In the product each is the GPU copy of a guest IOSurface,
-//! which the guest's Metal then samples per plane, through R8 and RG8
-//! views. The decoder's references are DPB pictures of its own, never an
-//! output: a guest recycles an output once it has shown it, whether or not
-//! the picture is still a reference.
+//! picture, each an image or two planes in a buffer ([`Landing`]). In the
+//! product an image is the GPU copy of a guest IOSurface, which the
+//! guest's Metal then samples per plane, through R8 and RG8 views, and a
+//! buffer the IOSurface's own bytes in host memory. The decoder's
+//! references are DPB pictures of its own, never an output: a guest
+//! recycles an output once it has shown it, whether or not the picture is
+//! still a reference.
 
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use ash::vk;
@@ -13,10 +16,10 @@ use crate::device::VideoDevice;
 use crate::error::{Error, Named};
 use crate::profile::{H264Profile, OUTPUT_FLAGS, OUTPUT_USAGE, PICTURE_FORMAT};
 
-/// How a decoder's outputs are made, which it gives its
+/// How a decoder's output images are made, which it gives its
 /// [`SurfaceSource`] with each request.
 ///
-/// An output is 2D, one mip level and one layer,
+/// An output image is 2D, one mip level and one layer,
 /// `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`, optimally tiled, at least
 /// `extent`, with [`OUTPUT_FLAGS`] and the usage [`Self::usage`] gives,
 /// shared `CONCURRENT` between the families
@@ -93,22 +96,84 @@ impl SurfaceSpec {
     }
 }
 
-/// An output a decoder's picture lands in, made as [`SurfaceSpec`] says.
-pub trait SurfaceImage: Send + Sync + 'static {
-    /// The image.
-    fn image(&self) -> vk::Image;
+/// An output a decoder's picture lands in.
+pub trait Surface: Send + Sync + 'static {
+    /// Where the picture lands.
+    fn landing(&self) -> Landing;
+}
+
+/// Where a picture lands.
+#[derive(Clone, Copy)]
+pub enum Landing {
+    /// An image made as [`SurfaceSpec`] says, which holds the whole coded
+    /// frame from its origin.
+    Image(vk::Image),
+    /// The frame's two planes, cropped to the SPS's rectangle, in a buffer
+    /// of the caller's, written by one GPU copy out of the picture.
+    Buffer(BufferPlanes),
+}
+
+/// NV12 planes in a buffer: the luma plane's rows of the crop's width,
+/// then the interleaved chroma plane's half as many rows of the same
+/// width in bytes, each plane from its first byte, one row each pitch
+/// after the last.
+///
+/// The buffer has `TRANSFER_DST` usage and is bound to memory; it is
+/// shared `CONCURRENT` between the families [`SurfaceSpec::families`]
+/// gives where they are more than one, as an output image is. Each
+/// offset is a multiple of 4, and each pitch at least the crop's width,
+/// the chroma pitch an even number, as Vulkan's copies take them where
+/// the queue that copies neither draws nor computes.
+///
+/// The copy makes its writes available to the host before the picture's
+/// value is signalled, so that a host that has waited for it reads them
+/// from coherent memory.
+#[derive(Clone, Copy)]
+pub struct BufferPlanes {
+    /// The buffer.
+    pub buffer: vk::Buffer,
+    /// The luma plane: its first byte, and the bytes from one row to the
+    /// next.
+    pub luma: (u64, u32),
+    /// The chroma plane: its first byte, and the bytes from one row to the
+    /// next.
+    pub chroma: (u64, u32),
+}
+
+impl BufferPlanes {
+    /// Whether planes cropped to `width` fit as Vulkan copies them, or
+    /// why not.
+    pub(crate) fn check(&self, width: u32) -> Result<(), Error> {
+        let (luma, chroma) = (self.luma, self.chroma);
+        if luma.0 % 4 != 0 || chroma.0 % 4 != 0 {
+            return Err(Error::Unsupported(format!(
+                "planes at {} and {}: each offset is a multiple of 4",
+                luma.0, chroma.0
+            )));
+        }
+        let chroma_width = width.div_ceil(2) * 2;
+        if luma.1 < width || chroma.1 < chroma_width || chroma.1 % 2 != 0 {
+            return Err(Error::Unsupported(format!(
+                "pitches {} and {} for a frame {width} wide: each at least its width, the \
+                 chroma pitch even",
+                luma.1, chroma.1
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Where a decoder's outputs come from: one a picture, as the decoder
 /// starts it.
 ///
 /// An output is written once, by its picture's decode or copy, and read
-/// while that picture lives: a source gives no image a live picture holds.
+/// while that picture lives: a source gives no output a live picture holds.
 pub trait SurfaceSource: Send {
     /// What it gives.
-    type Surface: SurfaceImage;
+    type Surface: Surface;
 
-    /// An output made as `spec` says.
+    /// An output for a picture of `spec`: an image made as it says, or
+    /// planes in a buffer.
     fn surface(&mut self, spec: &SurfaceSpec) -> Result<Self::Surface, Error>;
 }
 
@@ -185,9 +250,9 @@ pub(crate) fn bind_image_memory(
     Ok(memory)
 }
 
-impl SurfaceImage for DecodeImage {
-    fn image(&self) -> vk::Image {
-        self.image
+impl Surface for DecodeImage {
+    fn landing(&self) -> Landing {
+        Landing::Image(self.image)
     }
 }
 
@@ -200,5 +265,136 @@ impl Drop for DecodeImage {
         // SAFETY: its memory, now bound to nothing; a null handle is
         // nothing.
         unsafe { self.device.device().free_memory(self.memory, None) };
+    }
+}
+
+/// A [`SurfaceSource`] of host-visible buffers, one a picture, for the
+/// tests and tools: each holds the luma plane at byte 256 and the chroma
+/// plane after it, each row 64 bytes past the coded width rounded up to 64,
+/// so that the planes' offsets and pitches are not the frame's own.
+pub struct HostBuffers {
+    device: Arc<VideoDevice>,
+}
+
+impl HostBuffers {
+    /// Buffers on `device`.
+    pub fn new(device: &Arc<VideoDevice>) -> Self {
+        Self {
+            device: Arc::clone(device),
+        }
+    }
+}
+
+impl SurfaceSource for HostBuffers {
+    type Surface = HostBuffer;
+
+    fn surface(&mut self, spec: &SurfaceSpec) -> Result<HostBuffer, Error> {
+        HostBuffer::new(&self.device, spec.extent)
+    }
+}
+
+/// A host-visible, host-coherent buffer of NV12 planes, mapped while it
+/// lives.
+pub struct HostBuffer {
+    device: Arc<VideoDevice>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: NonNull<u8>,
+    size: usize,
+    planes: BufferPlanes,
+}
+
+// SAFETY: the mapping is the buffer's memory alone, which GPU work writes
+// once and the holder then reads.
+unsafe impl Send for HostBuffer {}
+// SAFETY: as above; `bytes` reads through `&self` alone.
+unsafe impl Sync for HostBuffer {}
+
+impl HostBuffer {
+    /// Planes for frames of `extent`, cropped or not.
+    pub fn new(device: &Arc<VideoDevice>, extent: vk::Extent2D) -> Result<Self, Error> {
+        let pitch = extent.width.next_multiple_of(64) + 64;
+        let rows = u64::from(extent.height);
+        let luma = 256u64;
+        let chroma = luma + rows * u64::from(pitch) + 128;
+        let size = chroma + rows.div_ceil(2) * u64::from(pitch);
+        let families = SurfaceSpec::families(device);
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST);
+        let info = if families.len() > 1 {
+            info.sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(&families)
+        } else {
+            info.sharing_mode(vk::SharingMode::EXCLUSIVE)
+        };
+        let vk_device = device.device();
+        // SAFETY: `info` lives through the call.
+        let buffer = unsafe { vk_device.create_buffer(&info, None) }.named("vkCreateBuffer")?;
+        let mut made = Self {
+            device: Arc::clone(device),
+            buffer,
+            memory: vk::DeviceMemory::null(),
+            mapped: NonNull::dangling(),
+            size: usize::try_from(size)
+                .map_err(|_| Error::Unsupported("a buffer past the address space".into()))?,
+            planes: BufferPlanes {
+                buffer,
+                luma: (luma, pitch),
+                chroma: (chroma, pitch),
+            },
+        };
+        // SAFETY: the buffer is the device's.
+        let requirements = unsafe { vk_device.get_buffer_memory_requirements(buffer) };
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        made.memory = device.allocate(
+            &requirements,
+            &[host | vk::MemoryPropertyFlags::HOST_CACHED, host],
+            None,
+        )?;
+        // SAFETY: the memory is unbound and of the buffer's requirements.
+        unsafe { vk_device.bind_buffer_memory(buffer, made.memory, 0) }
+            .named("vkBindBufferMemory")?;
+        // SAFETY: the memory is host-visible and unmapped.
+        let mapped = unsafe {
+            vk_device.map_memory(made.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        }
+        .named("vkMapMemory")?;
+        made.mapped = NonNull::new(mapped.cast::<u8>()).ok_or(Error::Vulkan(
+            "vkMapMemory",
+            vk::Result::ERROR_MEMORY_MAP_FAILED,
+        ))?;
+        Ok(made)
+    }
+
+    /// Where the planes are.
+    pub fn planes(&self) -> BufferPlanes {
+        self.planes
+    }
+
+    /// The buffer's bytes: the picture's planes once its value is
+    /// reached ([`crate::Picture::wait`]).
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapping is `size` bytes of host-coherent memory,
+        // which GPU work writes before the picture's value alone.
+        unsafe { std::slice::from_raw_parts(self.mapped.as_ptr(), self.size) }
+    }
+}
+
+impl Surface for HostBuffer {
+    fn landing(&self) -> Landing {
+        Landing::Buffer(self.planes)
+    }
+}
+
+impl Drop for HostBuffer {
+    fn drop(&mut self) {
+        let vk_device = self.device.device();
+        // SAFETY: the buffer is the device's, and no GPU work uses it: a
+        // decoder lets its outputs go only once the work that wrote them
+        // is done. A null handle is nothing.
+        unsafe { vk_device.destroy_buffer(self.buffer, None) };
+        // SAFETY: its memory, unmapped as it is freed.
+        unsafe { vk_device.free_memory(self.memory, None) };
     }
 }

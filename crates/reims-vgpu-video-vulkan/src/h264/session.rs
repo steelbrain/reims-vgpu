@@ -11,13 +11,16 @@
 //! without, in `VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR`.
 //!
 //! **Outputs.** Where the device decodes into an output beside the DPB
-//! picture (`DPB_AND_OUTPUT_DISTINCT`), the decode writes the output. Where
-//! the DPB picture is the decode's output (`DPB_AND_OUTPUT_COINCIDE`, all
-//! the 5080 offers), one GPU copy then takes the picture from it into the
-//! output: in the decode's own command buffer where the decode family
-//! copies, else on the copy queue behind the decode's value, signalling
-//! the next, which the following decode waits for before it sets a slot up
-//! again. Every output is left in `GENERAL`.
+//! picture (`DPB_AND_OUTPUT_DISTINCT`), the decode writes an output image.
+//! Where the DPB picture is the decode's output (`DPB_AND_OUTPUT_COINCIDE`,
+//! all the 5080 offers), one GPU copy then takes the picture from it into
+//! the output. A picture that lands in a buffer is always copied: out of
+//! its DPB picture where the two coincide, else out of the session's
+//! scratch image, which the decode writes. A copy runs in the decode's own
+//! command buffer where the decode family copies, else on the copy queue
+//! behind the decode's value, signalling the next, which the following
+//! decode waits for before it writes an image again. Every output image is
+//! left in `GENERAL`.
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -32,7 +35,7 @@ use crate::device::VideoDevice;
 use crate::error::{Error, Named};
 use crate::picture::{ImageView, color_range, plane, planes};
 use crate::profile::{H264Capabilities, PICTURE_FORMAT};
-use crate::surface::bind_image_memory;
+use crate::surface::{BufferPlanes, bind_image_memory};
 use crate::timeline::Timeline;
 
 /// The least a bitstream buffer holds, so that most streams make one
@@ -70,9 +73,8 @@ pub(crate) struct Decode<'a> {
     pub(crate) slices: &'a [&'a [u8]],
     /// The parameters object holding the picture's SPS and PPS.
     pub(crate) parameters: vk::VideoSessionParametersKHR,
-    /// The output the picture lands in, and its decode view where the
-    /// decode writes it.
-    pub(crate) output: (vk::Image, Option<vk::ImageView>),
+    /// Where the picture lands.
+    pub(crate) output: Target,
     /// The DPB slot the picture is set up in.
     pub(crate) setup_slot: i32,
     /// The picture as a reference, for its slot.
@@ -81,6 +83,60 @@ pub(crate) struct Decode<'a> {
     pub(crate) picture_info: StdVideoDecodeH264PictureInfo,
     /// Each reference: its slot and its std information.
     pub(crate) references: &'a [(i32, StdVideoDecodeH264ReferenceInfo)],
+}
+
+/// Where a decode's picture lands.
+#[derive(Clone, Copy)]
+pub(crate) enum Target {
+    /// An output image, and its decode view where the decode writes it.
+    Image(vk::Image, Option<vk::ImageView>),
+    /// Planes in a buffer, cropped to the rectangle: x, y, width and
+    /// height in luma samples.
+    Buffer(BufferPlanes, (u32, u32, u32, u32)),
+}
+
+/// The copy regions of the crop `(x, y, width, height)` into `planes`:
+/// the luma plane's, then the chroma plane's at half the size.
+fn buffer_regions(planes: &BufferPlanes, crop: (u32, u32, u32, u32)) -> [vk::BufferImageCopy; 2] {
+    let (x, y, width, height) = crop;
+    let offset = |x: u32, y: u32| vk::Offset3D {
+        x: i32::try_from(x).unwrap_or(i32::MAX),
+        y: i32::try_from(y).unwrap_or(i32::MAX),
+        z: 0,
+    };
+    let [luma, chroma] = [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1];
+    [
+        vk::BufferImageCopy::default()
+            .buffer_offset(planes.luma.0)
+            .buffer_row_length(planes.luma.1)
+            .image_subresource(plane(luma))
+            .image_offset(offset(x, y))
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            }),
+        // Two bytes a chroma sample pair: the row length counts pairs.
+        vk::BufferImageCopy::default()
+            .buffer_offset(planes.chroma.0)
+            .buffer_row_length(planes.chroma.1 / 2)
+            .image_subresource(plane(chroma))
+            .image_offset(offset(x / 2, y / 2))
+            .image_extent(vk::Extent3D {
+                width: width.div_ceil(2),
+                height: height.div_ceil(2),
+                depth: 1,
+            }),
+    ]
+}
+
+/// What a copy reads: an image of the session's, in `layout`, which it
+/// returns to where `restore` says.
+#[derive(Clone, Copy)]
+struct CopySource {
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    restore: bool,
 }
 
 /// One stream's session.
@@ -94,7 +150,10 @@ pub(crate) struct Session {
     handle: vk::VideoSessionKHR,
     memory: Vec<vk::DeviceMemory>,
     /// One a slot, by its index.
-    dpb: Vec<DpbPicture>,
+    dpb: Vec<SessionImage>,
+    /// What a decode writes where the device decodes into outputs and the
+    /// picture lands in a buffer, made by the first such decode.
+    scratch: Option<SessionImage>,
     parameters: Option<ParameterSets>,
     /// Whether a decode has reset the session, which its first does.
     reset: bool,
@@ -111,15 +170,16 @@ pub(crate) struct Session {
     free: Vec<Submission>,
 }
 
-/// A DPB picture of the session's, destroyed as it goes.
-struct DpbPicture {
+/// An image of the session's, a DPB picture or the scratch image,
+/// destroyed as it goes.
+struct SessionImage {
     device: Arc<VideoDevice>,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: Option<ImageView>,
 }
 
-impl Drop for DpbPicture {
+impl Drop for SessionImage {
     fn drop(&mut self) {
         // The view goes before its image.
         drop(self.view.take());
@@ -131,24 +191,17 @@ impl Drop for DpbPicture {
     }
 }
 
-impl DpbPicture {
-    /// A DPB picture of `extent` for `caps`'s profile: also the decode's
-    /// output, copied out of, where the two coincide.
+impl SessionImage {
+    /// An NV12 image of `extent` for `caps`'s profile, of `usage`, shared
+    /// between the decode and copy families, with a view of the decode
+    /// usages `view_usage`.
     fn new(
         device: &Arc<VideoDevice>,
         caps: &H264Capabilities,
         extent: vk::Extent2D,
+        usage: vk::ImageUsageFlags,
+        view_usage: vk::ImageUsageFlags,
     ) -> Result<Self, Error> {
-        let view_usage = if caps.decodes_into_output {
-            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
-        } else {
-            vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
-        };
-        let usage = if caps.decodes_into_output {
-            view_usage
-        } else {
-            view_usage | vk::ImageUsageFlags::TRANSFER_SRC
-        };
         let families = device.dpb_families();
         let image = caps.profile.with_list(|list| {
             let info = vk::ImageCreateInfo::default()
@@ -184,6 +237,23 @@ impl DpbPicture {
         made.memory = bind_image_memory(device, image)?;
         made.view = Some(ImageView::for_decode(device, image, view_usage)?);
         Ok(made)
+    }
+
+    /// A DPB picture of `extent` for `caps`'s profile: also the decode's
+    /// output, copied out of, where the two coincide.
+    fn dpb(
+        device: &Arc<VideoDevice>,
+        caps: &H264Capabilities,
+        extent: vk::Extent2D,
+    ) -> Result<Self, Error> {
+        let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
+        if caps.decodes_into_output {
+            Self::new(device, caps, extent, dpb, dpb)
+        } else {
+            let view_usage = dpb | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
+            let usage = view_usage | vk::ImageUsageFlags::TRANSFER_SRC;
+            Self::new(device, caps, extent, usage, view_usage)
+        }
     }
 
     fn view(&self) -> vk::ImageView {
@@ -252,6 +322,7 @@ impl Session {
             handle: vk::VideoSessionKHR::null(),
             memory: Vec::new(),
             dpb: Vec::new(),
+            scratch: None,
             parameters: None,
             reset: false,
             pool: vk::CommandPool::null(),
@@ -285,10 +356,10 @@ impl Session {
         })?;
         session.bind_memory()?;
         for _ in 0..slots {
-            session.dpb.push(DpbPicture::new(device, &caps, extent)?);
+            session.dpb.push(SessionImage::dpb(device, &caps, extent)?);
         }
         session.pool = command_pool(device, device.decode_family())?;
-        if !caps.decodes_into_output && !device.copies_on_decode_queue() {
+        if !device.copies_on_decode_queue() {
             session.copy_pool = command_pool(device, device.copy_family())?;
         }
         Ok(session)
@@ -427,7 +498,7 @@ impl Session {
         }
     }
 
-    fn dpb_picture(&self, slot: i32) -> Result<&DpbPicture, Error> {
+    fn dpb_picture(&self, slot: i32) -> Result<&SessionImage, Error> {
         usize::try_from(slot)
             .ok()
             .and_then(|slot| self.dpb.get(slot))
@@ -441,6 +512,25 @@ impl Session {
         offsets: &[u32],
         range: u64,
     ) -> Result<u64, Error> {
+        if let Target::Buffer(planes, (_, _, width, _)) = decode.output {
+            planes.check(width)?;
+        }
+        // Where the device decodes into outputs, a picture that lands in a
+        // buffer is decoded into the session's scratch image and copied
+        // out of it.
+        if self.caps.decodes_into_output
+            && matches!(decode.output, Target::Buffer(..))
+            && self.scratch.is_none()
+        {
+            let usage = vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
+            self.scratch = Some(SessionImage::new(
+                &self.device,
+                &self.caps,
+                self.extent,
+                usage | vk::ImageUsageFlags::TRANSFER_SRC,
+                usage,
+            )?);
+        }
         submission.bitstream.write(decode.slices, offsets, range);
         let device = self.device.device();
         let command = submission.command;
@@ -451,6 +541,42 @@ impl Session {
             (setup.image, setup.view())
         };
         let dpb_layout = self.dpb_layout();
+        let decode_output_layout = if self.device.unified_image_layouts() {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::VIDEO_DECODE_DST_KHR
+        };
+        // What the decode writes beside the DPB picture, if anything, and
+        // what the picture is then copied out of, if anything.
+        let (written, copy) = match (self.caps.decodes_into_output, decode.output) {
+            (true, Target::Image(image, view)) => {
+                let view = view.ok_or_else(|| {
+                    Error::Unsupported("an output a decode writes, with no view".into())
+                })?;
+                (Some((image, view)), None)
+            }
+            (true, Target::Buffer(..)) => {
+                let scratch = self
+                    .scratch
+                    .as_ref()
+                    .ok_or_else(|| Error::Unsupported("no scratch image".into()))?;
+                let source = CopySource {
+                    image: scratch.image,
+                    layout: decode_output_layout,
+                    restore: false,
+                };
+                (Some((scratch.image, scratch.view())), Some(source))
+            }
+            (false, _) => {
+                let source = CopySource {
+                    image: setup_image,
+                    layout: dpb_layout,
+                    restore: true,
+                };
+                (None, Some(source))
+            }
+        };
+
         let decode_access =
             vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR;
         let fresh = |image, layout| {
@@ -466,24 +592,12 @@ impl Session {
                 .image(image)
                 .subresource_range(color_range())
         };
-        // The DPB picture set up drops what it held; an output the decode
+        // The DPB picture set up drops what it held; an image the decode
         // writes, likewise. The references were written by decodes before
         // this one, on this queue.
-        let output_view = if self.caps.decodes_into_output {
-            Some(decode.output.1.ok_or_else(|| {
-                Error::Unsupported("an output a decode writes, with no view".into())
-            })?)
-        } else {
-            None
-        };
-        let decode_output_layout = if self.device.unified_image_layouts() {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::VIDEO_DECODE_DST_KHR
-        };
         let mut images = vec![fresh(setup_image, dpb_layout)];
-        if output_view.is_some() {
-            images.push(fresh(decode.output.0, decode_output_layout));
+        if let Some((image, _)) = written {
+            images.push(fresh(image, decode_output_layout));
         }
         let references_barrier = [vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
@@ -515,7 +629,7 @@ impl Session {
             .map(|(_, info)| vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(info))
             .collect();
         let setup_resource = resource(setup_view);
-        let output_resource = output_view.map_or(setup_resource, resource);
+        let output_resource = written.map_or(setup_resource, |(_, view)| resource(view));
         let mut setup_dpb =
             vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&decode.setup_info);
 
@@ -584,39 +698,38 @@ impl Session {
         // SAFETY: as above, closing the scope.
         unsafe { (fp.cmd_end_video_coding_khr)(command, &end) };
 
-        let copy_here = !self.caps.decodes_into_output && self.device.copies_on_decode_queue();
-        if self.caps.decodes_into_output && decode_output_layout != vk::ImageLayout::GENERAL {
-            let to_general = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-                .src_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(decode_output_layout)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(decode.output.0)
-                .subresource_range(color_range())];
-            // SAFETY: as above.
-            unsafe {
-                device.cmd_pipeline_barrier2(
-                    command,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_general),
-                );
+        let copy_here = copy.is_some() && self.device.copies_on_decode_queue();
+        match (copy, decode.output) {
+            (None, Target::Image(image, _)) if decode_output_layout != vk::ImageLayout::GENERAL => {
+                let to_general = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+                    .src_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::NONE)
+                    .old_layout(decode_output_layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(color_range())];
+                // SAFETY: as above.
+                unsafe {
+                    device.cmd_pipeline_barrier2(
+                        command,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+                    );
+                }
             }
-        } else if copy_here {
-            self.record_copy(
-                command,
-                setup_image,
-                decode.output.0,
-                After::DecodeOnThisQueue,
-            );
+            (Some(source), output) if copy_here => {
+                self.record_copy(command, &source, &output, After::DecodeOnThisQueue);
+            }
+            _ => {}
         }
         // SAFETY: as above.
         unsafe { device.end_command_buffer(command) }.named("vkEndCommandBuffer")?;
 
-        // A copy on the copy queue may still read a DPB picture this decode
-        // sets up again.
+        // A copy on the copy queue may still read an image this decode
+        // writes again.
         let value = self.timeline.next();
         let waits = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.timeline.semaphore())
@@ -636,14 +749,14 @@ impl Session {
             Queue::Decode,
         )?;
         self.reset = true;
-        if self.caps.decodes_into_output || copy_here {
+        let Some(source) = copy.filter(|_| !copy_here) else {
             return Ok(value);
-        }
+        };
 
         // The copy out, on the copy queue once the decode is done.
         let copy = submission.copy_command;
         begin(device, copy)?;
-        self.record_copy(copy, setup_image, decode.output.0, After::SemaphoreWait);
+        self.record_copy(copy, &source, &decode.output, After::SemaphoreWait);
         // SAFETY: as above, for the copy queue's command buffer.
         unsafe { device.end_command_buffer(copy) }.named("vkEndCommandBuffer")?;
         let landed = self.timeline.next();
@@ -663,18 +776,19 @@ impl Session {
         Ok(landed)
     }
 
-    /// Records the copy of DPB picture `dpb`'s two planes into `output`,
-    /// which it takes from `UNDEFINED` and leaves in `GENERAL`, the DPB
-    /// picture left in the DPB layout.
+    /// Records the copy of `source`'s two planes into `target`: the whole
+    /// coded frame into an output image, which it takes from `UNDEFINED`
+    /// and leaves in `GENERAL`, or the crop into a buffer's planes, made
+    /// available to the host. The source is left as it was where it is to
+    /// be restored.
     fn record_copy(
         &self,
         command: vk::CommandBuffer,
-        dpb: vk::Image,
-        output: vk::Image,
+        source: &CopySource,
+        target: &Target,
         after: After,
     ) {
         let device = self.device.device();
-        let dpb_layout = self.dpb_layout();
         let copy_layout = if self.device.unified_image_layouts() {
             vk::ImageLayout::GENERAL
         } else {
@@ -698,18 +812,22 @@ impl Session {
                 .image(image)
                 .subresource_range(color_range())
         };
-        let before = [
-            barrier(dpb, dpb_layout, copy_layout)
+        let mut before = vec![
+            barrier(source.image, source.layout, copy_layout)
                 .src_stage_mask(src_stage)
                 .src_access_mask(src_access)
                 .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_READ),
-            barrier(output, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL)
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE),
         ];
+        if let &Target::Image(output, _) = target {
+            before.push(
+                barrier(output, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL)
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE),
+            );
+        }
         // SAFETY: recording into a command buffer of the session's, with
         // the array alive through the call; so for each command below.
         unsafe {
@@ -718,26 +836,60 @@ impl Session {
                 &vk::DependencyInfo::default().image_memory_barriers(&before),
             );
         }
-        let regions = planes(self.extent).map(|(aspect, extent)| {
-            vk::ImageCopy::default()
-                .src_subresource(plane(aspect))
-                .dst_subresource(plane(aspect))
-                .extent(extent)
-        });
-        // SAFETY: as above; both images hold the extent, in the layouts
-        // the barrier left them in.
-        unsafe {
-            device.cmd_copy_image(
-                command,
-                dpb,
-                copy_layout,
-                output,
-                vk::ImageLayout::GENERAL,
-                &regions,
-            );
+        match *target {
+            Target::Image(output, _) => {
+                let regions = planes(self.extent).map(|(aspect, extent)| {
+                    vk::ImageCopy::default()
+                        .src_subresource(plane(aspect))
+                        .dst_subresource(plane(aspect))
+                        .extent(extent)
+                });
+                // SAFETY: as above; both images hold the extent, in the
+                // layouts the barrier left them in.
+                unsafe {
+                    device.cmd_copy_image(
+                        command,
+                        source.image,
+                        copy_layout,
+                        output,
+                        vk::ImageLayout::GENERAL,
+                        &regions,
+                    );
+                }
+            }
+            Target::Buffer(planes, crop) => {
+                let regions = buffer_regions(&planes, crop);
+                // SAFETY: as above; the source holds the crop, in the layout
+                // the barrier left it in, and the planes fit the buffer
+                // (its holder's word) and the copy's rules
+                // (`BufferPlanes::check`).
+                unsafe {
+                    device.cmd_copy_image_to_buffer(
+                        command,
+                        source.image,
+                        copy_layout,
+                        planes.buffer,
+                        &regions,
+                    );
+                }
+                let to_host = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
+                    )
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::MEMORY_READ)];
+                // SAFETY: as above.
+                unsafe {
+                    device.cmd_pipeline_barrier2(
+                        command,
+                        &vk::DependencyInfo::default().memory_barriers(&to_host),
+                    );
+                }
+            }
         }
-        if copy_layout != dpb_layout {
-            let back = [barrier(dpb, copy_layout, dpb_layout)
+        if source.restore && copy_layout != source.layout {
+            let back = [barrier(source.image, copy_layout, source.layout)
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)
                 .src_access_mask(vk::AccessFlags2::NONE)
                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -807,6 +959,7 @@ impl Drop for Session {
         self.free.clear();
         drop(self.parameters.take());
         self.dpb.clear();
+        drop(self.scratch.take());
         let device = self.device.device();
         // SAFETY: the pools are the session's, their command buffers idle;
         // they go with them. A null pool is nothing.
@@ -978,6 +1131,63 @@ impl Drop for Bitstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn planes(luma: (u64, u32), chroma: (u64, u32)) -> BufferPlanes {
+        BufferPlanes {
+            buffer: vk::Buffer::null(),
+            luma,
+            chroma,
+        }
+    }
+
+    #[test]
+    fn buffer_planes_take_what_a_transfer_queue_copies() {
+        assert!(planes((256, 1344), (1_000_064, 1344)).check(1280).is_ok());
+        // Offsets a multiple of 4, pitches at least the width, the chroma
+        // pitch even.
+        assert!(planes((2, 1344), (1_000_064, 1344)).check(1280).is_err());
+        assert!(planes((256, 1344), (1_000_066, 1344)).check(1280).is_err());
+        assert!(planes((256, 1279), (1_000_064, 1344)).check(1280).is_err());
+        assert!(planes((256, 1281), (1_000_064, 1281)).check(1281).is_err());
+        assert!(planes((256, 1281), (1_000_064, 1282)).check(1281).is_ok());
+    }
+
+    #[test]
+    fn a_crop_lands_at_each_planes_origin() {
+        let [luma, chroma] =
+            buffer_regions(&planes((256, 1344), (968_064, 1344)), (8, 4, 1280, 720));
+        assert_eq!(
+            (
+                luma.buffer_offset,
+                luma.buffer_row_length,
+                luma.buffer_image_height
+            ),
+            (256, 1344, 0)
+        );
+        assert_eq!((luma.image_offset.x, luma.image_offset.y), (8, 4));
+        assert_eq!(
+            (luma.image_extent.width, luma.image_extent.height),
+            (1280, 720)
+        );
+        assert_eq!(
+            luma.image_subresource.aspect_mask.as_raw(),
+            vk::ImageAspectFlags::PLANE_0.as_raw()
+        );
+        // The chroma plane counts sample pairs.
+        assert_eq!(
+            (chroma.buffer_offset, chroma.buffer_row_length),
+            (968_064, 672)
+        );
+        assert_eq!((chroma.image_offset.x, chroma.image_offset.y), (4, 2));
+        assert_eq!(
+            (chroma.image_extent.width, chroma.image_extent.height),
+            (640, 360)
+        );
+        assert_eq!(
+            chroma.image_subresource.aspect_mask.as_raw(),
+            vk::ImageAspectFlags::PLANE_1.as_raw()
+        );
+    }
 
     #[test]
     fn each_slice_offset_is_its_start_code() {
