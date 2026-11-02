@@ -1957,7 +1957,7 @@ namespace {
 // kept no bytes has none to give, and a render pipeline's stage with no function binds nothing.
 void test_library_air_arguments()
 {
-	Fixture fx(0x20000);
+	Fixture fx(0x40000); // the library's bytes fit
 	const char *path = getenv("RGFX_AIR_ARGUMENTS");
 	CHECK(path != nullptr);
 	if (path == nullptr)
