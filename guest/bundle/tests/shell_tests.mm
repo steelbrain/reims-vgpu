@@ -5263,6 +5263,100 @@ void test_no_copy_buffers()
 }
 
 
+// A no-copy buffer bound to a shader is one the command buffer may write, so its completion
+// writes it back; a texture over it is one only where its usage has ShaderWrite. A bound buffer
+// with no copy of app memory notes nothing beside them.
+void test_binds_note_shadow_writes()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	const MTLResourceOptions shared = MTLResourceStorageModeShared;
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x20000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	std::memset(p, 0x11, 0x20000);
+	auto completeOn = [&](id<MTLCommandBuffer> cb) {
+		RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
+		CHECK(f.completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	};
+	@autoreleasepool {
+		RgfxBuffer *b = [RgfxBuffer bufferWithBytesNoCopy:p
+		                                           length:0x10000
+		                                          options:shared
+		                                      deallocator:nil
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&f.ser];
+		CHECK(b != nil && [b rgfxShadow] != nullptr);
+		auto create =
+		    expectMessage<RgfxBufferOverHostMemory>(f.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		uint8_t *block = mem.data() + create.region_offset;
+		RgfxRegion::Block other = region.allocate(0x1000);
+		RgfxBuffer *plain = [RgfxBuffer bufferOverHostMemoryWithContents:const_cast<uint8_t *>(other.ptr)
+		                                                    regionOffset:other.offset
+		                                                          length:0x1000
+		                                                         options:shared
+		                                                     deallocator:nil
+		                                                          device:nil
+		                                                      serializer:&f.ser];
+		CHECK(plain != nil && [plain rgfxShadow] == nullptr);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModeShared;
+		td.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> reads = [b newTextureWithDescriptor:td offset:0x1000 bytesPerRow:64];
+		td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+		id<MTLTexture> writes = [b newTextureWithDescriptor:td offset:0x2000 bytesPerRow:64];
+		CHECK(reads != nil && writes != nil);
+
+		// Binds `bind`'s objects on a compute encoder, then the host writes `at` meanwhile:
+		// whether the app's bytes there have it after the completion.
+		auto writtenBack = [&](auto bind, size_t at) {
+			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+			id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+			bind(ce);
+			[ce endEncoding];
+			[cb commit];
+			block[at] = 0xe1;
+			completeOn(cb);
+			const bool back = p[at] == 0xe1;
+			block[at] = p[at] = 0x11;
+			return back;
+		};
+		CHECK(writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce setBuffer:b offset:0 atIndex:0];
+		}, 0x20));
+		CHECK(!writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce setBuffer:plain offset:0 atIndex:0];
+			[ce setTexture:reads atIndex:0];
+			[ce setBuffer:plain offset:0 atIndex:1];
+		}, 0x1010));
+		CHECK(writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce setTexture:reads atIndex:0];
+			[ce setTexture:writes atIndex:1];
+		}, 0x2010));
+		id<MTLTexture> both[2] = {reads, nil};
+		CHECK(!writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce setTextures:both withRange:NSMakeRange(0, 2)];
+		}, 0x1020));
+		reads = nil;
+		writes = nil;
+		plain = nil;
+	}
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x20000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 // A Managed texture's CPU copy goes with it: the texture's destroy, then its copy's buffer's,
 // then the copy's block goes back.
 void test_managed_texture_copy_block_after_destroys()
@@ -8273,6 +8367,7 @@ int main(int argc, char **argv)
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
+		test_binds_note_shadow_writes();
 		test_block_call();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm

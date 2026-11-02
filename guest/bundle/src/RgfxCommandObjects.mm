@@ -191,13 +191,17 @@ uint64_t rgfxWrites(RgfxEncoder *enc, id obj)
 }
 
 /// rgfxId of a resource bound to a shader, which may write a buffer, and a texture whose usage
-/// has ShaderWrite.
+/// has ShaderWrite. Its copy of app memory, if any, is looked up first: most bound resources have
+/// none, and one that has is ours, a buffer or a texture over one (rgfxShadowOf), so whether it
+/// may be written is our texture class's answer, with no protocol lookup on the bind's path.
 uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
 {
 	if (enc != nullptr && obj != nil && RgfxMemoryShadow::anyLive()) {
-		const bool writes = ![obj conformsToProtocol:@protocol(MTLTexture)] ||
-		                    ([(id<MTLTexture>)obj usage] & MTLTextureUsageShaderWrite) != 0;
-		rgfxNoteShadowUse(enc, obj, writes);
+		if (std::shared_ptr<RgfxMemoryShadow> shadow = rgfxShadowOf(obj)) {
+			const bool writes = ![obj isKindOfClass:[RgfxTexture class]] ||
+			                    ([(RgfxTexture *)obj usage] & MTLTextureUsageShaderWrite) != 0;
+			enc->noteShadowUse(shadow, writes);
+		}
 	}
 	rgfxIOSurfaceNoteUse(enc, obj);
 	return rgfxNamed(enc, obj);
