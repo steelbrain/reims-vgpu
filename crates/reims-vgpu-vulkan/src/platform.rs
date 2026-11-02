@@ -341,17 +341,22 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// `PipelineWaitPolicy::Exact`), and, on a device with `tessellationShader`, a line `setLineWidth:`
 /// widens drawn as Metal's parallelogram, two triangles over each segment, where the default draws
 /// the device's own line at the width wherever it draws it, which can differ from Metal's
-/// (`wide_lines`, `WideLinePolicy::Exact`). [`EXACT_ALL`] names every one. The
+/// (`wide_lines`, `WideLinePolicy::Exact`), and a blit into or out of a `BGRA10_XR` texture Metal
+/// keeps compressed rewritten to Metal's encoding (each 16-bit word's low 6 bits clear, alpha's
+/// code within 384 to 894) and a fill's texel encoded so, where the default keeps the bytes the
+/// device's copy moves (`extended_range_blits`, `ExtendedRangeBlitPolicy::Canonical`).
+/// [`EXACT_ALL`] names every one. The
 /// policy's `completion` and `heap_compression` are no names of these: every device takes their
 /// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 5] = [
+pub const EXACT_FORMS: [&str; 6] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
     "pipeline_waits",
     "wide_lines",
+    "extended_range_blits",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -381,13 +386,14 @@ pub const EXACT_ALL: &str = "all";
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
 /// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
 /// each `half` operation on a device without `shaderFloat16`, `pipeline_waits`' wait for every
-/// pipeline until it is made, and `wide_lines`' band variant of each pipeline that draws a line
-/// the device's own lines would draw otherwise than Metal. A name of neither changes nothing,
+/// pipeline until it is made, `wide_lines`' band variant of each pipeline that draws a line
+/// the device's own lines would draw otherwise than Metal, and `extended_range_blits`' rewrite of
+/// each extended-range blit to Metal's encoding. A name of neither changes nothing,
 /// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
-        BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy, PipelineWaitPolicy, WideLinePolicy,
+        BatchOrderPolicy, CompletionPolicy, DevicePolicy, ExtendedRangeBlitPolicy, HalfChainPolicy,
+        HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy, WideLinePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -400,6 +406,9 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "half_chains" => policy.half_chains = HalfChainPolicy::EachOperation,
             "pipeline_waits" => policy.pipeline_waits = PipelineWaitPolicy::Exact,
             "wide_lines" => policy.wide_lines = WideLinePolicy::Exact,
+            "extended_range_blits" => {
+                policy.extended_range_blits = ExtendedRangeBlitPolicy::Canonical;
+            }
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -701,8 +710,9 @@ pub(crate) mod tests {
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
-            BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy,
-            HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy, WideLinePolicy,
+            BatchOrderPolicy, CompletionPolicy, DevicePolicy, ExtendedRangeBlitPolicy,
+            HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
+            WideLinePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -715,6 +725,7 @@ pub(crate) mod tests {
         assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
         assert_eq!(fast.pipeline_waits, PipelineWaitPolicy::Bounded);
         assert_eq!(fast.wide_lines, WideLinePolicy::Device);
+        assert_eq!(fast.extended_range_blits, ExtendedRangeBlitPolicy::Kept);
         for unchanged in [
             None,
             Some(""),
@@ -729,7 +740,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 5] = [
+        let alone: [(&str, Set); 6] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -741,6 +752,9 @@ pub(crate) mod tests {
                 p.pipeline_waits = PipelineWaitPolicy::Exact;
             }),
             ("wide_lines", |p| p.wide_lines = WideLinePolicy::Exact),
+            ("extended_range_blits", |p| {
+                p.extended_range_blits = ExtendedRangeBlitPolicy::Canonical;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -751,7 +765,8 @@ pub(crate) mod tests {
             assert_eq!(one(name), want, "{name}");
             set(&mut every);
         }
-        let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order";
+        let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order,\
+                     extended_range_blits";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());
