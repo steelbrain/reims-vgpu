@@ -256,7 +256,7 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
             slotted.push((slot, reference.picture.is_stand_in()));
         }
         let kept = kept_references(&slotted);
-        let references: Vec<(i32, StdVideoDecodeH264ReferenceInfo)> = kept
+        let mut references: Vec<(i32, StdVideoDecodeH264ReferenceInfo)> = kept
             .iter()
             .filter_map(|&i| {
                 let reference = params.references.get(i)?;
@@ -268,14 +268,26 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
         let setup_slot = free_slot(&used, session.slots())
             .ok_or_else(|| Error::Unsupported("no DPB slot is free".into()))?;
 
+        let mut picture_info = picture_info(params, slices);
+        let mut setup_info = setup_info(params);
+        let frame_num = renumber(
+            picture_info.frame_num,
+            params.sps.log2_max_frame_num_minus4 + 4,
+            &mut references,
+        );
+        picture_info.frame_num = frame_num;
+        if setup_info.flags.used_for_long_term_reference() == 0 {
+            setup_info.FrameNum = frame_num;
+        }
+
         let nals: Vec<&[u8]> = slices.iter().map(|s| s.nal).collect();
         let decode = Decode {
             slices: &nals,
             parameters,
             output: (picture.surface().image(), picture.output_view()),
             setup_slot,
-            setup_info: setup_info(params),
-            picture_info: picture_info(params, slices),
+            setup_info,
+            picture_info,
             references: &references,
         };
         let landed = session.decode(&decode)?;
@@ -305,6 +317,55 @@ fn kept_references(references: &[(i32, bool)]) -> Vec<usize> {
             }
         })
         .collect()
+}
+
+/// The frame numbers a decode hands the driver: the picture's `frame_num`,
+/// returned, and each short-term reference's `FrameNum`, in place. Where a
+/// reference's `FrameNum` exceeds `frame_num` (it was decoded before
+/// `frame_num` wrapped), all of them are shifted alike so that the picture
+/// is `MaxFrameNum - 1` and each reference its `FrameNumWrap` (8.2.4.1)
+/// shifted the same: no reference wraps then, and every `PicNum` and
+/// `CurrPicNum` moves by the same amount, so that the initial reference
+/// lists, which order short-term frames by `PicNum`, and each
+/// modification, which counts from `CurrPicNum`, name the same frames.
+/// Elsewhere the numbers are the stream's.
+///
+/// NVIDIA's Vulkan driver (615.71.09 on the RTX 5080, 11-02) builds a P
+/// slice's initial list from `FrameNum` without wrapping it: from the
+/// first P picture after a wrap whose list holds frames from both sides of
+/// it, every such picture predicts from the wrong frames, ffmpeg's Vulkan
+/// decoder's too, while NVDEC through CUDA decodes them right. Its list
+/// modifications do wrap. Shifted, the H.264 check's streams decode right.
+/// Long-term references keep their `LongTermFrameIdx`.
+fn renumber(
+    frame_num: u16,
+    log2_max_frame_num: u8,
+    references: &mut [(i32, StdVideoDecodeH264ReferenceInfo)],
+) -> u16 {
+    let short_term =
+        |info: &StdVideoDecodeH264ReferenceInfo| info.flags.used_for_long_term_reference() == 0;
+    if !references
+        .iter()
+        .any(|(_, info)| short_term(info) && info.FrameNum > frame_num)
+    {
+        return frame_num;
+    }
+    // MaxFrameNum is 2^16 at most (log2_max_frame_num is 16 at most).
+    let max = 1u32 << log2_max_frame_num.min(16);
+    let last = max - 1;
+    let shift = last - u32::from(frame_num).min(last);
+    for (_, info) in references.iter_mut().filter(|(_, info)| short_term(info)) {
+        let number = u32::from(info.FrameNum);
+        // FrameNumWrap + shift: at least 0, as FrameNumWrap is above
+        // frame_num - MaxFrameNum, and at most MaxFrameNum - 1.
+        let shifted = if number > u32::from(frame_num) {
+            (number + shift).saturating_sub(max)
+        } else {
+            number + shift
+        };
+        info.FrameNum = u16::try_from(shifted).unwrap_or(u16::MAX);
+    }
+    u16::try_from(last).unwrap_or(u16::MAX)
 }
 
 /// The least slot below `max` that no reference holds.
@@ -382,6 +443,46 @@ fn picture_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn short_term(frame_num: u16) -> (i32, StdVideoDecodeH264ReferenceInfo) {
+        let mut info: StdVideoDecodeH264ReferenceInfo = zeroed();
+        info.FrameNum = frame_num;
+        (0, info)
+    }
+
+    fn long_term(index: u16) -> (i32, StdVideoDecodeH264ReferenceInfo) {
+        let (slot, mut info) = short_term(index);
+        info.flags.set_used_for_long_term_reference(1);
+        (slot, info)
+    }
+
+    fn numbers(references: &[(i32, StdVideoDecodeH264ReferenceInfo)]) -> Vec<u16> {
+        references.iter().map(|(_, info)| info.FrameNum).collect()
+    }
+
+    #[test]
+    fn frame_numbers_are_the_streams_where_none_wraps() {
+        let mut references = [short_term(4), short_term(3), long_term(0)];
+        assert_eq!(renumber(5, 4, &mut references), 5);
+        assert_eq!(numbers(&references), [4, 3, 0]);
+    }
+
+    #[test]
+    fn frame_numbers_shift_past_a_wrap_keeping_their_order() {
+        // MaxFrameNum 16, frame_num 1: FrameNumWrap 0, -1 and -2, shifted
+        // by 14 so that the picture is 15. The long-term index stays.
+        let mut references = [short_term(15), short_term(0), short_term(14), long_term(1)];
+        assert_eq!(renumber(1, 4, &mut references), 15);
+        assert_eq!(numbers(&references), [13, 14, 12, 1]);
+        // A frame_num of 0, every reference before the wrap.
+        let mut references = [short_term(15), short_term(13)];
+        assert_eq!(renumber(0, 4, &mut references), 15);
+        assert_eq!(numbers(&references), [14, 12]);
+        // MaxFrameNum 2^16.
+        let mut references = [short_term(65535), short_term(2)];
+        assert_eq!(renumber(3, 16, &mut references), 65535);
+        assert_eq!(numbers(&references), [65531, 65534]);
+    }
 
     #[test]
     fn a_picture_takes_the_least_slot_no_reference_holds() {
