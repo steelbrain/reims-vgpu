@@ -93,9 +93,13 @@ pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
 /// ask: the host's dirty log over the scanout, taken and cleared.
 pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
-/// A graphics device's callbacks. Each is called on one of the device's two threads
-/// (`reims-vgpu.graphics-control`, `reims-vgpu.graphics-refresh`), never inside a call of the
-/// host's into the device, with no lock of the library's held; the two may call at once.
+/// A graphics device's callbacks. `scanout_written` is called on the device's refresh thread
+/// (`reims-vgpu.graphics-refresh`), and `raise_interrupt` on the thread that posts the event it
+/// raises for: the device's control thread (`reims-vgpu.graphics-control`), its refresh thread, a
+/// command queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
+/// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
+/// scheduled or completed handler. Each is called never inside a call of the host's into the
+/// device, with no lock of the library's held, and they may call at once.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
