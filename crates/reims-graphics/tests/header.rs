@@ -170,3 +170,54 @@ fn the_wire_header_compiles_as_c11() {
 fn the_wire_header_compiles_as_cxx17() {
     compile("c++", "-std=c++17");
 }
+
+/// Every `#[repr(C)]` record of `wire` and `ops` is in the committed header, but those
+/// `cbindgen.toml` excludes: cbindgen writes a record no function names only where its export list
+/// names it, and the guest's kext and bundle build their messages from the header
+#[test]
+fn every_wire_record_is_in_the_header() {
+    let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+    let header = read(dir.join("include/reims_graphics_wire.h"));
+    let config = read(dir.join("cbindgen.toml"));
+    let excluded: Vec<&str> = config
+        .lines()
+        .find_map(|l| l.strip_prefix("exclude = ["))
+        .unwrap()
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect();
+    let mut sources = vec![dir.join("src/wire.rs"), dir.join("src/ops.rs")];
+    for entry in std::fs::read_dir(dir.join("src/ops")).unwrap() {
+        sources.push(entry.unwrap().path());
+    }
+    let mut missing = Vec::new();
+    let mut records = 0;
+    for source in sources {
+        let text = read(source);
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            let Some(name) = line
+                .strip_prefix("pub struct ")
+                .and_then(|rest| rest.split([' ', '{', '<']).next())
+            else {
+                continue;
+            };
+            // Its attributes: the lines above it back to its doc comment.
+            let attributes = lines[..n]
+                .iter()
+                .rev()
+                .take_while(|l| !l.starts_with("///") && !l.trim().is_empty());
+            if !attributes.into_iter().any(|l| *l == "#[repr(C)]") {
+                continue;
+            }
+            records += 1;
+            if !excluded.contains(&name) && !header.contains(&format!("}} {name};")) {
+                missing.push(name.to_owned());
+            }
+        }
+    }
+    assert!(records > 200, "only {records} records found");
+    assert!(missing.is_empty(), "not in the header: {missing:?}");
+}
