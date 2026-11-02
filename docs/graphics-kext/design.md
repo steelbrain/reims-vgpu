@@ -562,27 +562,35 @@ every process's blocks, the control rings and the device page. Each
 connection has a window, a range of the process the region's size that the
 kext makes at the context's open (selector 0x100 answers its base and size).
 The window is memory of the connection's own, mapped read-only, and holds no
-page until one is read, which then reads zeros. Region offset `o` of what the
-process is given lies at the base plus `o`, so the bundle's pointers stay
-base plus offset. The kext maps in, over the window at the span's own offset,
-only the process's blocks, the shared blocks of the surface planes it holds,
-and the scanout it is granted. It maps a span in before the process learns of
-it. Before the span can go to anyone else, it maps the window's own memory
-back over the span, read-only: before a block's free marks it freed, and when
-a hold ends, a scanout grant goes or a mode change moves the scanout. At the
-close the whole window goes, every span in it, before the context's blocks
-are freed. Each span is whole pages past the region's head, so no mapped page
-holds a byte of anything else. The device info shares its page with the
-control completion ring's tail, so the kext reads it for the process (selector
-0x10b), and the region's own map (`kRgfxAccelMemoryRegion`) is refused. One
-difference from Apple's: a process that touches a block after releasing it
-reads zeros, and faults only on a write, where Apple's faults on both. Only a
-guest that uses memory it released sees it. A mapping that fails fails its
-op; a span that cannot be taken back closes the window, so the process
-reaches nothing of the region from then on. A placed mapping is IOKit's
-overwrite mapping, which IOKit never takes down itself (read from the public
-xnu source, `IOMemoryDescriptor::doUnmap`), so only another mapping over it
-takes a span back; vm_protect is not a KPI a third-party kext may link.
+page until one is read, which then reads zeros. It is purgeable, never made
+volatile, so the process's footprint counts only the pages it reads there: xnu
+charges an IOKit mapping of anonymous memory to the task's footprint at its
+whole size as it is made, but a purgeable object's resident pages to its
+owner, the process that opened the context (read from the public xnu source:
+`vm_map_enter`, `mach_make_memory_entry`). A window of plain pageable memory
+charged every Metal process the region's size at its open, past many
+processes' memory high watermarks. The spans are device memory, which no
+footprint counts. Region offset `o` of what the process is given lies at the
+base plus `o`, so the bundle's pointers stay base plus offset. The kext maps
+in, over the window at the span's own offset, only the process's blocks, the
+shared blocks of the surface planes it holds, and the scanout it is granted.
+It maps a span in before the process learns of it. Before the span can go to
+anyone else, it maps the window's own memory back over the span, read-only:
+before a block's free marks it freed, and when a hold ends, a scanout grant
+goes or a mode change moves the scanout. At the close the whole window goes,
+every span in it, before the context's blocks are freed. Each span is whole
+pages past the region's head, so no mapped page holds a byte of anything else.
+The device info shares its page with the control completion ring's tail, so
+the kext reads it for the process (selector 0x10b), and the region's own map
+(`kRgfxAccelMemoryRegion`) is refused. One difference from Apple's: a process
+that touches a block after releasing it reads zeros, and faults only on a
+write, where Apple's faults on both. Only a guest that uses memory it released
+sees it. A mapping that fails fails its op; a span that cannot be taken back
+closes the window, so the process reaches nothing of the region from then on.
+A placed mapping is IOKit's overwrite mapping, which IOKit never takes down
+itself (read from the public xnu source, `IOMemoryDescriptor::doUnmap`), so
+only another mapping over it takes a span back; vm_protect is not a KPI a
+third-party kext may link.
 
 **The scanout is its owner's.** The scanout holds the display's pixels, so
 only the process that drives the display reaches it: the task that holds the

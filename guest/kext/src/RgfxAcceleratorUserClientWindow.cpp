@@ -4,8 +4,11 @@
  * base plus its region offset, as the bundle reaches it.
  *
  * The window is the region's size, made at the context's open over memory of the client's own:
- * a pageable buffer of no task's, mapped read-only anywhere in the process, which holds no page
- * until the process reads one there and then reads zeros. The process sees the region only
+ * a pageable buffer, mapped read-only anywhere in the process and nowhere else, which holds no
+ * page until the process reads one there and then reads zeros. The buffer is purgeable, and never
+ * made volatile, so the process's footprint grows by the window's pages it reads, and not by the
+ * region's size at the open (RgfxWindowSpans.hpp, kRgfxWindowMemoryOptions, says why); the
+ * region's spans are device memory, which no footprint counts. The process sees the region only
  * where the kext maps it in, over the window at the span's own offset (mapSpan): its blocks, the
  * shared blocks of the surface planes it holds, and the scanout it is granted. The kext maps a
  * span in before the process learns of it, and maps the window's own memory back over it,
@@ -33,6 +36,10 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
 
+static_assert(kRgfxWindowDirectionInOut == kIODirectionInOut, "the window's direction");
+static_assert(kRgfxWindowPageable == kIOMemoryPageable, "the window's pageable bit");
+static_assert(kRgfxWindowPurgeable == kIOMemoryPurgeable, "the window's purgeable bit");
+
 namespace {
 UInt64 nanosecondsSince(UInt64 start)
 {
@@ -52,9 +59,11 @@ IOReturn RgfxAcceleratorUserClient::openWindow()
 		return kIOReturnSuccess;
 	}
 	const UInt64 size = owner->getRegionSize() & ~(kRgfxWindowPage - 1);
+	// Made here, on the process's thread, so the process owns it and its footprint counts the
+	// pages it reads there (RgfxWindowSpans.hpp).
 	IOBufferMemoryDescriptor *memory = size ? IOBufferMemoryDescriptor::inTaskWithOptions(
-	                                              TASK_NULL, kIODirectionInOut | kIOMemoryPageable,
-	                                              size, kRgfxWindowPage)
+	                                              TASK_NULL, kRgfxWindowMemoryOptions, size,
+	                                              kRgfxWindowPage)
 	                                        : nullptr;
 	IOMemoryMap *map =
 	    memory ? memory->createMappingInTask(task, 0, kIOMapAnywhere | kIOMapReadOnly, 0, size)

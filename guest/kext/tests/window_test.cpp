@@ -1,5 +1,5 @@
 // The native test of RgfxWindowSpans.hpp: a window maps in only whole pages past the region's
-// reserved head, inside the window.
+// reserved head, inside the window, and its own memory costs the process only the pages it reads.
 #include "RgfxWindowSpans.hpp"
 
 #include <cstdio>
@@ -37,6 +37,13 @@ int main()
 	check(!rgfxWindowSpan(window, window, 0x1000), "nor one after it");
 	check(!rgfxWindowSpan(window, 0xfffffffffffff000ull, 0x2000), "nor one that wraps");
 	check(!rgfxWindowSpan(0, head, 0x1000), "a closed window maps nothing");
+	// xnu charges a mapping of pageable memory that is not purgeable at its whole size, the
+	// region's, to the process's footprint as the context opens.
+	check((kRgfxWindowMemoryOptions & kRgfxWindowPageable) != 0, "the window's memory is pageable");
+	check((kRgfxWindowMemoryOptions & kRgfxWindowPurgeable) != 0,
+	      "and purgeable, so a process's footprint counts only the pages it reads there");
+	check((kRgfxWindowMemoryOptions & kRgfxWindowDirectionInOut) == kRgfxWindowDirectionInOut,
+	      "and the kernel's to write, which purgeable memory must be");
 	std::printf("window_test: OK (%d checks)\n", checks);
 	return 0;
 }
