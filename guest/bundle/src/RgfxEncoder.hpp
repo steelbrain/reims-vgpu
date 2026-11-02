@@ -77,6 +77,9 @@ public:
 	void beginComputePass(uint32_t dispatch_type);
 	/// Opens a blit encoder (no body).
 	void beginBlitPass();
+	/// Opens a video encoder on the video session `session` (RGFX_OP_ENCODER_BEGIN_VIDEO), the
+	/// command buffer's only encoder.
+	void beginVideoPass(RgfxObjId session);
 	/// Ends the open encoder (`endEncoding`).
 	void endEncoder();
 	/// The buffer signals `event` (an event or a shared event) to `value`
@@ -85,6 +88,13 @@ public:
 	/// The buffer's later work waits until `event` reaches `value`
 	/// (`encodeWaitForEvent:value:`), between encoders.
 	void waitEvent(RgfxObjId event, uint64_t value);
+
+	// --- video ops (RGFX_OP_VIDEO_*, group 4) ----------------------------------
+
+	/// Decodes an H.264 access unit (RGFX_OP_VIDEO_DECODE_H264): `body` then the `size` bytes of
+	/// SPS and PPS NAL units at `parameterSets` (none where `size` is 0), padded to whole words.
+	void videoDecodeH264(const RgfxVideoOpDecodeH264 &body, const uint8_t *parameterSets,
+	                     uint32_t size);
 
 	// --- render ops (RGFX_OP_RENDER_*, group 1) --------------------------------
 

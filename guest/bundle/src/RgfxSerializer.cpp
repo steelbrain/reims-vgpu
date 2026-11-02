@@ -814,6 +814,20 @@ bool RgfxSerializer::setSharedEventValue(RgfxObjId event, uint64_t value)
 	return m_control.tryPost(RGFX_CMD_SHARED_EVENT_SET_VALUE, &msg, sizeof(msg), &seqno);
 }
 
+RgfxCreated RgfxSerializer::createVideoSession(uint32_t codec, uint32_t direction)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxVideoSessionCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.codec = codec;
+	msg.direction = direction;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_VIDEO_SESSION_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 bool RgfxSerializer::destroy(RgfxObjId obj_id)
 {
 	RgfxObjectDestroy msg = {};

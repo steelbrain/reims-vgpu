@@ -156,8 +156,9 @@ enum {
 	// once no process holds it, through its BLOCK_RELEASE.
 	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
 	// The device info the host wrote at RGFX_DEVICE_INFO_OFFSET (RgfxDeviceInfo): no input;
-	// struct out, exactly sizeof(RgfxDeviceInfo) bytes. Its page holds the control completion
-	// ring's tail, so no process maps it; the kext reads it for the process.
+	// struct out, exactly sizeof(RgfxDeviceInfo) bytes, or those and the video caps after them
+	// (RgfxVideoCaps). Its page holds the control completion ring's tail, so no process maps
+	// it; the kext reads it for the process.
 	kRgfxAccelMethodDeviceInfo = 0x10b,
 	// The surfaces a command buffer writes, named after the buffer is posted and before its commit
 	// returns (RgfxAcceleratorLocks.cpp): struct in, words of 64 bits: the client's queue, the

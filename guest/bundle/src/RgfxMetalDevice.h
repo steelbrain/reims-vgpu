@@ -33,6 +33,8 @@
  *                                 the command-buffer and encoder object graph.
  *   RgfxMetalDevice+Sync.mm       slice 4 — newEvent/newFence/newSharedEvent and
  *                                 event wrappers.
+ *   RgfxMetalDevice+Video.mm      the video driver's way to the host (RgfxVideoChannel.hpp):
+ *                                 its sessions, bitstream buffers and decodes.
  *
  * Each category implements its MTLDevice/MTLDeviceSPI selectors using the three
  * accessors below. Each slice adds any private selectors it overrides to the
@@ -81,6 +83,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// The host device's caps (identity, limits, features). Invalid until the device
 /// region's caps blob is read.
 - (const RgfxCaps *)caps;
+
+/// The host's video codecs, as the video caps the host wrote say (RgfxVideoCaps): no codec
+/// where the host wrote none or the kext does not read them.
+- (const RgfxVideoCaps *)videoCaps;
 
 /// The BAR-region allocator (RgfxRegion), from which queue rings and Shared/no-copy
 /// resource blocks are placed. Null until the wire handshake maps the region (a later

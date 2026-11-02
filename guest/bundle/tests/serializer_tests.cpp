@@ -573,6 +573,12 @@ void test_lifecycle_messages()
 	auto sem = expectMessage<RgfxSharedEventCreate>(ring, RGFX_CMD_SHARED_EVENT_CREATE);
 	CHECK(sem.obj_id == se.obj_id && sem.initial_value == 42);
 
+	RgfxCreated vs = ser.createVideoSession(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE);
+	CHECK(vs.posted);
+	auto vsm = expectMessage<RgfxVideoSessionCreate>(ring, RGFX_CMD_VIDEO_SESSION_CREATE);
+	CHECK(vsm.obj_id == vs.obj_id && vsm.codec == RGFX_VIDEO_CODEC_H264 &&
+	      vsm.direction == RGFX_VIDEO_DECODE);
+
 	// Destroy carries the id alone.
 	CHECK(ser.destroy(b.obj_id));
 	auto dm = expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY);
@@ -1180,6 +1186,75 @@ bool forwardTo(void *context, const void *message, uint32_t size, uint64_t *out_
 	return true;
 }
 
+// A video command buffer: the video encoder's begin names its session, and a decode's
+// parameter sets follow its body, padded to whole words.
+void test_video_command_buffer()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 200);
+	enc.beginVideoPass(77);
+	RgfxVideoOpDecodeH264 d = {};
+	d.bitstream_buffer_obj_id = 5;
+	d.bitstream_offset = 0x100;
+	d.bitstream_size = 4321;
+	d.luma_texture_obj_id = 6;
+	d.chroma_texture_obj_id = 7;
+	const uint8_t sets[11] = {0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68};
+	enc.videoDecodeH264(d, sets, sizeof(sets));
+	enc.videoDecodeH264(d, nullptr, 0);
+	enc.endEncoder();
+	uint64_t seqno = 0;
+	CHECK(enc.finish(&seqno));
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
+	RgfxCommandBuffer cb = {};
+	std::memcpy(&cb, bytes.data(), sizeof(cb));
+	CHECK(cb.cb_obj_id == 200 && cb.queue_obj_id == 1);
+	const uint8_t *op = bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET;
+	const uint8_t *end = op + cb.op_bytes;
+	CHECK(end == bytes.data() + bytes.size());
+
+	RgfxOpHeader oh = {};
+	std::memcpy(&oh, op, sizeof(oh));
+	CHECK(oh.tag == RGFX_OP_ENCODER_BEGIN_VIDEO && oh.len == 16);
+	RgfxOpVideoPass pass = {};
+	std::memcpy(&pass, op + RGFX_OP_BODY_OFFSET, sizeof(pass));
+	CHECK(pass.session_obj_id == 77);
+	op += oh.len;
+
+	std::memcpy(&oh, op, sizeof(oh));
+	CHECK(oh.tag == RGFX_OP_VIDEO_DECODE_H264);
+	CHECK(oh.len == RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET + 16);
+	RgfxVideoOpDecodeH264 got = {};
+	std::memcpy(&got, op + RGFX_OP_BODY_OFFSET, sizeof(got));
+	CHECK(got.bitstream_buffer_obj_id == 5 && got.bitstream_offset == 0x100 &&
+	      got.bitstream_size == 4321 && got.luma_texture_obj_id == 6 &&
+	      got.chroma_texture_obj_id == 7 && got.parameter_sets_size == sizeof(sets));
+	const uint8_t *tail = op + RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET;
+	CHECK(std::memcmp(tail, sets, sizeof(sets)) == 0);
+	for (size_t i = sizeof(sets); i < 16; i++)
+		CHECK(tail[i] == 0);
+	op += oh.len;
+
+	std::memcpy(&oh, op, sizeof(oh));
+	CHECK(oh.tag == RGFX_OP_VIDEO_DECODE_H264);
+	CHECK(oh.len == RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET);
+	std::memcpy(&got, op + RGFX_OP_BODY_OFFSET, sizeof(got));
+	CHECK(got.parameter_sets_size == 0);
+	op += oh.len;
+
+	std::memcpy(&oh, op, sizeof(oh));
+	CHECK(oh.tag == RGFX_OP_ENCODER_END && oh.len == 8);
+	op += oh.len;
+	CHECK(op == end);
+}
+
 void test_forwarded_lifecycle()
 {
 	ForwardLog log;
@@ -1762,6 +1837,7 @@ int main()
 	test_ring_wrap_and_no_room();
 	test_ring_post_waits_for_room();
 	test_command_buffer_encoder();
+	test_video_command_buffer();
 	test_render_pass_sample_positions();
 	test_forwarded_lifecycle();
 	test_library_key();

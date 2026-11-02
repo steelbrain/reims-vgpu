@@ -8,15 +8,16 @@
  * AVD_CreateAVDAccelerator for a table of sixteen entry points. It does so in
  * VTDecoderXPCService and VTEncoderXPCService, one of each per client process.
  *
- * This cut answers a whole H.264 decode session and records it. The capability block lists a
- * video engine and a graphics engine, the H.264 decode pipeline (head, decode, frame transfer)
- * and frame processing; the entry points answer AppleGVA's questions (the bitstream alignment,
- * the frames' layout, the capability parameters), hand out bitstream buffers of whole pages,
- * make a context per pipeline function, take each decode command with a token, and answer every
- * token done. Nothing is decoded yet: the frames hold what they held. Every call, what its
- * arguments point at, each decode command's parameters, slices and target surface, and every
- * read AppleGVA makes of the capability block go to rgfx-avd.<pid>.log in the process's
- * temporary directory.
+ * The driver decodes H.264 on the host's hardware, where the host's video caps list it
+ * (RgfxVideoChannel.hpp). The capability block lists a video engine and a graphics engine, the
+ * H.264 decode pipeline (head, decode, frame transfer) and frame processing; the entry points
+ * answer AppleGVA's questions (the bitstream alignment, the frames' layout, the capability
+ * parameters), hand out bitstream buffers of whole pages, open a host session per decode
+ * context, and send each decode command to it as a command buffer of the session's queue, its
+ * access unit copied out of AppleGVA's buffer, with the SPS and PPS written back out of
+ * AppleGVA's records where they changed (RgfxVideoH264.hpp). A command's token is answered done
+ * once its command buffer completed, which is once the picture is in the output surface. The host keeps the decoded
+ * picture buffer itself, from the stream: AppleGVA's commands name no references.
  *
  * AppleGVA hands this driver a session only where it picks the AMD driver for the flow: on a
  * board without an Intel GPU, or with com.apple.AppleGVA's gvaForceAMDKE set.
@@ -25,22 +26,19 @@
  * the calls' use; a field whose meaning nothing states yet is field_xx, xx its byte offset.
  */
 
-#include <dlfcn.h>
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <objc/runtime.h>
 #include <IOSurface/IOSurfaceRef.h>
-#include <pthread.h>
-#include <signal.h>
+#include <os/log.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/ucontext.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <mutex>
+#include <vector>
+
+#include "RgfxVideoChannel.hpp"
+#include "RgfxVideoH264.hpp"
 
 namespace {
 
@@ -61,7 +59,7 @@ static_assert(sizeof(DriverIdentity) == 0x2c + 4, "identity layout");
 
 // The capability block AppleGVA walks: the engines, then the functions (one per codec and
 // direction the driver runs), each a count and an array of record pointers. The records lie in
-// the block too, so the reads of them are recorded with the block's.
+// the block too.
 struct Engine {
 	uint32_t type;
 	char name[0x84];
@@ -163,38 +161,23 @@ void fillCapabilities(CapabilityBlock &b)
 	b.engine_list[1] = &b.engine[1];
 	b.engine_count = 2;
 	b.engines = b.engine_list;
-	// H.264 decode: the pipeline head, the decode, the transfer of its frames.
-	Function &head = addFunction(b, kFunctionPipeline, 1, 'rawb', 'rawb');
-	Function &decode = addFunction(b, kFunctionDecode, kCodecH264, 'rawb', 'NV12');
-	Function &transfer = addFunction(b, kFunctionTransfer, 1, 'NV12', 'NV12');
-	head.next = &decode;
-	decode.next = &transfer;
+	// H.264 decode, where the host's hardware takes it: the pipeline head, the decode, the
+	// transfer of its frames.
+	if (rgfx::video::hostCodec(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE)) {
+		Function &head = addFunction(b, kFunctionPipeline, 1, 'rawb', 'rawb');
+		Function &decode = addFunction(b, kFunctionDecode, kCodecH264, 'rawb', 'NV12');
+		Function &transfer = addFunction(b, kFunctionTransfer, 1, 'NV12', 'NV12');
+		head.next = &decode;
+		decode.next = &transfer;
+	}
 	// Frame processing on the graphics engine.
 	addFunction(b, kFunctionProcess, 0x10, 'NV12', 'NV12', kGraphicsEngine);
 	b.functions = b.function_list;
 }
 
-constexpr size_t kCapabilityBytes = sizeof(CapabilityBlock);
-
-// The sixteen entry points, in table order, by what AppleGVA asks of each.
-constexpr const char *kEntryNames[16] = {
-	"CreateDriver",
-	"DeleteDriver",
-	"CreateContexts",
-	"DeleteContexts",
-	"GetBitstreamBufferInfo",
-	"AllocateBitstreamBufferPool",
-	"FreeBitstreamBufferPool",
-	"GetPixelBufferInfo",
-	"AllocatePixelBufferPool",
-	"FreePixelBufferPool",
-	"ScheduleCommands",
-	"QueryCommandStatus",
-	"SetContextParameter",
-	"GetContextParameter",
-	"SetDriverParameter",
-	"GetDriverParameter",
-};
+// The block AppleGVA reads, filled once, as AVD_CreateAVDAccelerator is first called.
+CapabilityBlock g_block;
+void *g_capabilities;
 
 // The table AVD_CreateAVDAccelerator hands out: a driver pointer, then the entry points.
 struct DriverTable {
@@ -359,301 +342,42 @@ struct FunctionAvailable {
 
 int g_driver; // what the driver pointer AppleGVA passes back points at
 
-// Metal's default device in this process: the bundle's own device where Metal loaded this bundle
-// for the accelerator, whose connection (region, rings, blocks) video work is to share.
-extern "C" void *MTLCreateSystemDefaultDevice(void);
-
-// --- the record ----------------------------------------------------------------------------
-
-std::mutex g_logLock;
-FILE *g_log;
-std::atomic<uint32_t> g_calls{0};
-// Calls of each entry written out in full; later ones are counted only.
-constexpr uint32_t kFullCalls = 40;
-uint32_t g_perEntry[16];
-
-FILE *recordFile()
-{
-	if (g_log)
-		return g_log;
-	char dir[512] = "/tmp/";
-	confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir);
-	char path[640];
-	snprintf(path, sizeof path, "%srgfx-avd.%d.log", dir, getpid());
-	g_log = fopen(path, "w");
-	if (g_log)
-		setvbuf(g_log, nullptr, _IOLBF, 0);
-	return g_log;
-}
-
-// Copies n bytes at a, or answers false where they are not all mapped (an argument that is a
-// number, not a pointer).
-bool readable(uint64_t a, void *out, size_t n)
-{
-	if (a < 0x10000 || a > 0x7fffffffffffULL)
-		return false;
-	mach_vm_size_t got = 0;
-	return mach_vm_read_overwrite(mach_task_self(), a, n, (mach_vm_address_t)out, &got) ==
-		       KERN_SUCCESS &&
-	       got == n;
-}
-
-// Writes n bytes at a as 32-bit words, and, depth levels further, what each pointer-sized
-// value in them points at.
-void dump(FILE *f, const char *tag, uint64_t a, size_t n, int depth)
-{
-	uint8_t bytes[512];
-	if (n > sizeof bytes || !readable(a, bytes, n))
-		return;
-	fprintf(f, "  %s @0x%llx:\n", tag, (unsigned long long)a);
-	for (size_t i = 0; i < n; i += 32) {
-		fprintf(f, "    +%03zx:", i);
-		for (size_t j = 0; j < 32; j += 4) {
-			uint32_t w;
-			memcpy(&w, bytes + i + j, 4);
-			fprintf(f, " %08x", w);
-		}
-		fprintf(f, "\n");
-	}
-	if (depth == 0)
-		return;
-	int shown = 0;
-	for (size_t i = 0; i + 8 <= n && shown < 12; i += 8) {
-		uint64_t p;
-		memcpy(&p, bytes + i, 8);
-		uint8_t probe[8];
-		if (p != a && readable(p, probe, sizeof probe)) {
-			char inner[96];
-			snprintf(inner, sizeof inner, "%s+%zx->", tag, i);
-			dump(f, inner, p, 256, depth - 1);
-			shown++;
-		}
-	}
-}
-
-
-// --- which capability bytes AppleGVA reads -------------------------------------------------
-//
-// The block lies on pages of its own with no access. A read faults; the handler notes the
-// offset and the reading instruction (its image and offset), opens the page, and single-steps
-// that one instruction, after which the trap closes the page again. The notes are written out
-// at the next entry-point call, outside the signal handlers.
-
-struct CapabilityRead {
-	uint32_t offset;
-	uint64_t pc;
-};
-constexpr size_t kReadsKept = 4096;
-CapabilityRead g_reads[kReadsKept];
-std::atomic<uint32_t> g_readCount{0};
-uint32_t g_readsWritten;
-uint8_t *g_capabilities;
-size_t g_capabilityPages;
-uint8_t *g_openPage;
-struct sigaction g_oldSegv, g_oldBus, g_oldTrap;
-
 size_t pageSize() { return (size_t)getpagesize(); }
 
-void onFault(int sig, siginfo_t *info, void *context)
-{
-	uint8_t *at = (uint8_t *)info->si_addr;
-	ucontext_t *uc = (ucontext_t *)context;
-	if (g_capabilities && at >= g_capabilities && at < g_capabilities + g_capabilityPages) {
-		uint32_t n = g_readCount.fetch_add(1);
-		if (n < kReadsKept)
-			g_reads[n] = {(uint32_t)(at - g_capabilities), uc->uc_mcontext->__ss.__rip};
-		uint8_t *page = (uint8_t *)((uintptr_t)at & ~(uintptr_t)(pageSize() - 1));
-		mprotect(page, pageSize(), PROT_READ | PROT_WRITE);
-		g_openPage = page;
-		uc->uc_mcontext->__ss.__rflags |= 0x100; // trap after the instruction
-		return;
-	}
-	// Not ours: the fault the process would have taken.
-	struct sigaction *old = sig == SIGBUS ? &g_oldBus : &g_oldSegv;
-	sigaction(sig, old, nullptr);
-}
-
-void onTrap(int sig, siginfo_t *info, void *context)
-{
-	ucontext_t *uc = (ucontext_t *)context;
-	if (g_openPage) {
-		mprotect(g_openPage, pageSize(), PROT_NONE);
-		g_openPage = nullptr;
-		uc->uc_mcontext->__ss.__rflags &= ~(uint64_t)0x100;
-		return;
-	}
-	sigaction(SIGTRAP, &g_oldTrap, nullptr);
-}
-
-void traceCapabilityReads()
-{
-	g_capabilityPages = (kCapabilityBytes + pageSize() - 1) & ~(pageSize() - 1);
-	void *p = mmap(nullptr, g_capabilityPages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-	if (p == MAP_FAILED)
-		return;
-	g_capabilities = (uint8_t *)p;
-	fillCapabilities(*(CapabilityBlock *)p);
-	struct sigaction sa = {};
-	sa.sa_sigaction = onFault;
-	sa.sa_flags = SA_SIGINFO;
-	sigaction(SIGSEGV, &sa, &g_oldSegv);
-	sigaction(SIGBUS, &sa, &g_oldBus);
-	sa.sa_sigaction = onTrap;
-	sigaction(SIGTRAP, &sa, &g_oldTrap);
-	mprotect(g_capabilities, g_capabilityPages, PROT_NONE);
-}
-
-// Writes the reads noted since the last call, each with the image and offset of its reader.
-void writeReads(FILE *f)
-{
-	uint32_t n = g_readCount.load();
-	if (n > kReadsKept)
-		n = kReadsKept;
-	for (; g_readsWritten < n; g_readsWritten++) {
-		const CapabilityRead &r = g_reads[g_readsWritten];
-		Dl_info di = {};
-		const char *image = "?";
-		uint64_t off = r.pc;
-		if (dladdr((void *)r.pc, &di) && di.dli_fname) {
-			image = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
-			off = r.pc - (uint64_t)di.dli_fbase;
-		}
-		char where[64];
-		const size_t engines = offsetof(CapabilityBlock, engine);
-		const size_t functions = offsetof(CapabilityBlock, function);
-		if (r.offset >= engines && r.offset < engines + sizeof(Engine) * kMaxEngines)
-			snprintf(where, sizeof where, "engine[%zu]+0x%zx", (r.offset - engines) / sizeof(Engine),
-				 (r.offset - engines) % sizeof(Engine));
-		else if (r.offset >= functions && r.offset < functions + sizeof(Function) * kMaxFunctions)
-			snprintf(where, sizeof where, "function[%zu]+0x%zx",
-				 (r.offset - functions) / sizeof(Function), (r.offset - functions) % sizeof(Function));
-		else
-			snprintf(where, sizeof where, "block+0x%x", r.offset);
-		fprintf(f, "CAPREAD %s by %s+0x%llx\n", where, image, (unsigned long long)off);
-	}
-}
-
-void record(int entry, const char *when, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t result)
-{
-	std::lock_guard<std::mutex> hold(g_logLock);
-	FILE *f = recordFile();
-	if (!f)
-		return;
-	writeReads(f);
-	if (g_perEntry[entry] > kFullCalls)
-		return;
-	fprintf(f, "%s #%u %s(%llx, %llx, %llx)", when, g_calls.load(), kEntryNames[entry],
-		(unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2);
-	if (when[0] == 'R')
-		fprintf(f, " -> 0x%llx", (unsigned long long)result);
-	fprintf(f, " tid %p\n", (void *)pthread_self());
-	dump(f, "a1", a1, 512, 1);
-	dump(f, "a2", a2, 256, 1);
-}
-
-// --- the decode commands, recorded ---------------------------------------------------------
-
+// The value at `off` in a record AppleGVA hands the driver.
 uint32_t u32At(const uint8_t *base, size_t off)
 {
-	uint32_t v = 0;
-	readable((uint64_t)(base + off), &v, sizeof v);
+	uint32_t v;
+	memcpy(&v, base + off, sizeof v);
 	return v;
 }
 
 uint64_t u64At(const uint8_t *base, size_t off)
 {
-	uint64_t v = 0;
-	readable((uint64_t)(base + off), &v, sizeof v);
+	uint64_t v;
+	memcpy(&v, base + off, sizeof v);
 	return v;
-}
-
-const uint8_t *bitstreamBuffer(uint32_t pool, uint32_t index);
-
-void recordSurface(FILE *f, IOSurfaceRef surface)
-{
-	if (!surface)
-		return;
-	OSType format = IOSurfaceGetPixelFormat(surface);
-	fprintf(f, "  surface id %u %.4s %zux%zu alloc %zu planes %zu", IOSurfaceGetID(surface),
-		(const char *)&format, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
-		IOSurfaceGetAllocSize(surface), IOSurfaceGetPlaneCount(surface));
-	for (size_t p = 0; p < IOSurfaceGetPlaneCount(surface); p++)
-		fprintf(f, " [p%zu %zux%zu bpr %zu off %zu]", p, IOSurfaceGetWidthOfPlane(surface, p),
-			IOSurfaceGetHeightOfPlane(surface, p), IOSurfaceGetBytesPerRowOfPlane(surface, p),
-			(size_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, p) -
-				 (uint8_t *)IOSurfaceGetBaseAddress(surface)));
-	fprintf(f, "\n");
-}
-
-void recordDecode(FILE *f, const Command *c, int depth)
-{
-	Command cmd = {};
-	if (depth > 3 || !readable((uint64_t)c, &cmd, sizeof cmd))
-		return;
-	fprintf(f, "  command function 0x%x sub 0x%llx context %p parameters %p field_28 %p output %p\n",
-		cmd.function_id, (unsigned long long)cmd.sub_id, cmd.context, (const void *)cmd.parameters,
-		cmd.field_28, (const void *)cmd.output);
-	if (cmd.function_id == kFunctionPipeline) {
-		recordDecode(f, (const Command *)cmd.output, depth + 1);
-		return;
-	}
-	if (cmd.function_id != kFunctionDecode || !cmd.parameters)
-		return;
-	const uint8_t *P = cmd.parameters;
-	dump(f, "picture", (uint64_t)P, 0x200, 0);
-	dump(f, "picture+200", (uint64_t)P + 0x200, 0xc0, 0);
-	const uint8_t *sps = (const uint8_t *)u64At(P, 0x260);
-	const uint8_t *pps = (const uint8_t *)u64At(P, 0x268);
-	if (sps)
-		fprintf(f, "  sps profile %u level %u chroma %u depth %u/%u frame_num_log2-4 %u poc_type %u "
-			   "poc_lsb_log2-4 %u max_refs %u mbs %ux%u frame_mbs_only %u\n",
-			u32At(sps, 0x4), u32At(sps, 0x24), u32At(sps, 0x2c), u32At(sps, 0x34),
-			u32At(sps, 0x38), u32At(sps, 0x404), u32At(sps, 0x408), u32At(sps, 0x40c),
-			u32At(sps, 0x820), u32At(sps, 0x828) + 1, u32At(sps, 0x82c) + 1, u32At(sps, 0x830));
-	if (pps)
-		fprintf(f, "  pps cabac %u refs_l0-1 %u refs_l1-1 %u wp %u/%u qp-26 %d transform8x8 %u\n",
-			u32At(pps, 0xc), u32At(pps, 0x90), u32At(pps, 0x94), u32At(pps, 0x98),
-			u32At(pps, 0x9c), (int32_t)u32At(pps, 0xa0), u32At(pps, 0xb8));
-	uint32_t pool = u32At(P, 0x270), index = u32At(P, 0x274), slices = u32At(P, 0x278);
-	fprintf(f, "  poc %d/%d bitstream pool %u index %u slices %u\n", (int32_t)u32At(P, 0x14),
-		(int32_t)u32At(P, 0x18), pool, index, slices);
-	const uint8_t *entries = (const uint8_t *)u64At(P, 0x290);
-	const uint8_t *headers = (const uint8_t *)u64At(P, 0x288);
-	const uint8_t *buffer = bitstreamBuffer(pool, index);
-	for (uint32_t i = 0; i < slices && i < 8 && entries; i++) {
-		const uint8_t *e = (const uint8_t *)u64At(entries, i * 8);
-		uint32_t size = u32At(e, 0), offset = u32At(e, 4);
-		fprintf(f, "  slice %u size %u offset %u", i, size, offset);
-		uint8_t head[16] = {};
-		if (buffer && readable((uint64_t)(buffer + offset), head, sizeof head)) {
-			fprintf(f, " bytes");
-			for (uint8_t b : head)
-				fprintf(f, " %02x", b);
-		}
-		const uint8_t *h = headers ? (const uint8_t *)u64At(headers, i * 8) : nullptr;
-		if (h)
-			fprintf(f, " header frame_num %u field_pic %u", u32At(h, 0x10), u32At(h, 0x14));
-		fprintf(f, "\n");
-	}
-	if (headers)
-		dump(f, "slice header 0", u64At(headers, 0), 0x100, 0);
-	const uint8_t *out = (const uint8_t *)u64At(cmd.output, 0x20);
-	if (cmd.output)
-		dump(f, "output", (uint64_t)cmd.output, 0x40, 1);
-	if (out)
-		recordSurface(f, (IOSurfaceRef)u64At(out, 0x10));
 }
 
 // --- the answers -----------------------------------------------------------------------------
 
+// A context AppleGVA made for one function of a pipeline; the decode's holds the session on the
+// host and the parameter sets it last sent there.
 struct Context {
 	uint32_t function_id;
 	uint64_t sub_id;
 	uint32_t width;
 	uint32_t height;
+	rgfx::video::Session *session;
+	std::vector<uint8_t> sent;
 };
 
-// Bitstream buffers, by AppleGVA's pool type. Each is whole pages of its own.
+// The live sessions, whose output textures go when AppleGVA frees its frames' pool.
+std::mutex g_sessionLock;
+std::vector<Context *> g_sessions;
+
+// Bitstream buffers, by AppleGVA's pool type: whole pages, which a decode copies its access unit
+// out of (RgfxVideoChannel.hpp).
 struct BitstreamBuffers {
 	uint32_t pool;
 	uint32_t count;
@@ -664,13 +388,17 @@ constexpr size_t kMaxPools = 8;
 std::mutex g_poolLock;
 BitstreamBuffers g_pools[kMaxPools];
 
-const uint8_t *bitstreamBuffer(uint32_t pool, uint32_t index)
+// The buffer AppleGVA names by (pool, index): its bytes and their count; false where none is.
+bool bitstreamBuffer(uint32_t pool, uint32_t index, const uint8_t **bytes, size_t *size)
 {
 	std::lock_guard<std::mutex> hold(g_poolLock);
 	for (const BitstreamBuffers &b : g_pools)
-		if (b.count && b.pool == pool && index < b.count)
-			return b.buffers[index];
-	return nullptr;
+		if (b.count && b.pool == pool && index < b.count) {
+			*bytes = b.buffers[index];
+			*size = b.bytes;
+			return true;
+		}
+	return false;
 }
 
 void freePool(BitstreamBuffers &b)
@@ -680,31 +408,105 @@ void freePool(BitstreamBuffers &b)
 	b = {};
 }
 
-// Tokens of scheduled commands; AppleGVA holds a token only until its command is done.
+// Tokens of scheduled commands; AppleGVA holds a token only until its command is done. Each
+// holds its work on the host, if any, until it is answered done or the slot comes round again.
 struct Token {
 	uint64_t seqno;
+	void *work;
+	bool failed;
 };
 constexpr size_t kTokens = 1024;
+std::mutex g_tokenLock;
+std::mutex g_scheduleLock;
 Token g_tokens[kTokens];
-std::atomic<uint64_t> g_seqno{0};
+uint64_t g_seqno;
 
 constexpr uint32_t kOk = 0, kUnsupported = 1, kUnsupportedFormat = 3, kBadArgument = 5,
 		   kNoMemory = 7;
 
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
+// The decode command of `c`, following a pipeline's head to it; null where there is none.
+const Command *decodeCommand(const Command *c)
+{
+	for (int depth = 0; c && depth < 4; depth++) {
+		if (c->function_id == kFunctionDecode)
+			return c;
+		if (c->function_id != kFunctionPipeline)
+			return nullptr;
+		c = (const Command *)c->output;
+	}
+	return nullptr;
+}
+
+// Logs, once a process, why a picture was not sent.
+void notSent(std::atomic<bool> &said, const char *why)
+{
+	if (!said.exchange(true))
+		os_log_error(OS_LOG_DEFAULT, "RGFX: video: a picture not sent: %{public}s", why);
+}
+
+// Commits the picture `c` decodes on its context's session: its work on the host, or null
+// where it could not be sent.
+void *decodePicture(const Command *c)
+{
+	Context *context = (Context *)c->context;
+	const uint8_t *P = c->parameters;
+	if (!context || !context->session || !P || !c->output)
+		return nullptr;
+	// The access unit: the slices, which lie one after another in one bitstream buffer.
+	const uint8_t *bytes;
+	size_t bufferBytes;
+	const uint32_t pool = u32At(P, 0x270), index = u32At(P, 0x274), slices = u32At(P, 0x278);
+	const uint8_t *entries = (const uint8_t *)u64At(P, 0x290);
+	if (!slices || !entries || !bitstreamBuffer(pool, index, &bytes, &bufferBytes))
+		return nullptr;
+	uint64_t first = UINT64_MAX, end = 0;
+	for (uint32_t i = 0; i < slices; i++) {
+		const uint8_t *e = (const uint8_t *)u64At(entries, i * 8);
+		if (!e)
+			return nullptr;
+		const uint64_t size = u32At(e, 0), offset = u32At(e, 4);
+		first = offset < first ? offset : first;
+		end = offset + size > end ? offset + size : end;
+	}
+	if (end > bufferBytes)
+		return nullptr;
+	// The parameter sets, sent where they differ from the last ones.
+	std::vector<uint8_t> sets;
+	const auto *sps = (const rgfx::video::h264::Sps *)u64At(P, 0x260);
+	const auto *pps = (const rgfx::video::h264::Pps *)u64At(P, 0x268);
+	if (!sps || !pps || !rgfx::video::h264::writeSps(*sps, sets) ||
+	    !rgfx::video::h264::writePps(*pps, *sps, sets)) {
+		static std::atomic<bool> said;
+		notSent(said, "its parameter sets are refused");
+		return nullptr;
+	}
+	const bool changed = sets != context->sent;
+	rgfx::video::DecodeH264 d = {};
+	d.bytes = bytes + first;
+	d.size = end - first;
+	d.parameterSets = changed ? sets.data() : nullptr;
+	d.parameterSetsSize = changed ? (uint32_t)sets.size() : 0;
+	const uint8_t *out = (const uint8_t *)u64At(c->output, 0x20);
+	d.output = out ? (IOSurfaceRef)u64At(out, 0x10) : nullptr;
+	void *work = rgfx::video::decodeH264(context->session, d);
+	if (work && changed)
+		context->sent = std::move(sets);
+	if (!work) {
+		static std::atomic<bool> said;
+		notSent(said, "no texture over its output, or no command buffer");
+	}
+	return work;
+}
+
 uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 {
 	switch (entry) {
 	case 0: { // CreateDriver
-		uint8_t probe[8];
-		if (!readable(a0, probe, sizeof probe))
+		if (!a0)
 			return kBadArgument;
 		*(void **)a0 = &g_driver;
-		void *device = MTLCreateSystemDefaultDevice();
-		std::lock_guard<std::mutex> hold(g_logLock);
-		if (FILE *f = recordFile())
-			fprintf(f, "DEVICE %s\n", device ? object_getClassName((id)device) : "none");
 		return kOk;
 	}
 	case 2: { // CreateContexts
@@ -713,8 +515,25 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			return kBadArgument;
 		for (uint32_t i = 0; i < ci->info->count; i++) {
 			const FunctionInfo *fi = ci->info->functions[i];
-			ci->info->contexts[i] = fi ? new Context{fi->function_id, fi->sub_id, fi->width, fi->height}
-						   : nullptr;
+			Context *context = fi ? new Context{fi->function_id, fi->sub_id, fi->width,
+							    fi->height, nullptr, {}}
+					      : nullptr;
+			if (context && fi->function_id == kFunctionDecode && fi->sub_id == kCodecH264) {
+				context->session =
+				    rgfx::video::openSession(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE);
+				if (!context->session) {
+					for (uint32_t j = 0; j < i; j++) {
+						Context *made = (Context *)ci->info->contexts[j];
+						delete made;
+						ci->info->contexts[j] = nullptr;
+					}
+					delete context;
+					return kUnsupported;
+				}
+				std::lock_guard<std::mutex> hold(g_sessionLock);
+				g_sessions.push_back(context);
+			}
+			ci->info->contexts[i] = context;
 		}
 		ci->capabilities = g_capabilities;
 		return kOk;
@@ -723,8 +542,21 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		const ContextDelete *cd = (const ContextDelete *)a1;
 		if (!cd)
 			return kBadArgument;
-		for (uint32_t i = 0; i < cd->count; i++)
-			delete (Context *)cd->contexts[i];
+		for (uint32_t i = 0; i < cd->count; i++) {
+			Context *context = (Context *)cd->contexts[i];
+			if (context && context->session) {
+				{
+					std::lock_guard<std::mutex> hold(g_sessionLock);
+					for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it)
+						if (*it == context) {
+							g_sessions.erase(it);
+							break;
+						}
+				}
+				rgfx::video::closeSession(context->session);
+			}
+			delete context;
+		}
 		return kOk;
 	}
 	case 4: { // GetBitstreamBufferInfo
@@ -752,13 +584,14 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		slot->pool = p->pool;
 		slot->bytes = (p->size + pageSize() - 1) & ~(pageSize() - 1);
 		for (uint32_t i = 0; i < p->count; i++) {
-			void *m = mmap(nullptr, slot->bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-			if (m == MAP_FAILED) {
+			void *cpu = mmap(nullptr, slot->bytes, PROT_READ | PROT_WRITE,
+					 MAP_ANON | MAP_PRIVATE, -1, 0);
+			if (cpu == MAP_FAILED) {
 				freePool(*slot);
 				return kNoMemory;
 			}
-			slot->buffers[slot->count++] = (uint8_t *)m;
-			p->addresses[i] = (uint64_t)m;
+			slot->buffers[slot->count++] = (uint8_t *)cpu;
+			p->addresses[i] = (uint64_t)cpu;
 		}
 		return kOk;
 	}
@@ -786,22 +619,28 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		}
 		return kOk;
 	}
+	case 9: { // FreePixelBufferPool: the frames go, so do the textures over them
+		std::lock_guard<std::mutex> hold(g_sessionLock);
+		for (Context *context : g_sessions)
+			rgfx::video::forgetOutputs(context->session);
+		return kOk;
+	}
 	case 10: { // ScheduleCommands
 		const CommandList *cl = (const CommandList *)a1;
 		TokenList *tl = (TokenList *)a2;
 		if (!cl || !tl || cl->count != tl->count || !tl->tokens)
 			return kBadArgument;
+		// One list at a time, so pictures reach their sessions in AppleGVA's order.
+		std::lock_guard<std::mutex> hold(g_scheduleLock);
 		for (uint32_t i = 0; i < cl->count; i++) {
-			uint64_t n = g_seqno++;
+			const Command *decode = decodeCommand(cl->commands[i]);
+			void *work = decode ? decodePicture(decode) : nullptr;
+			std::lock_guard<std::mutex> tokens(g_tokenLock);
+			const uint64_t n = g_seqno++;
 			Token *t = &g_tokens[n % kTokens];
-			t->seqno = n;
+			rgfx::video::releaseToken(t->work);
+			*t = {n, work, decode && !work};
 			tl->tokens[i] = t;
-			std::lock_guard<std::mutex> hold(g_logLock);
-			if (FILE *f = recordFile()) {
-				fprintf(f, "DECODE seqno %llu\n", (unsigned long long)n);
-				if (n < kFullCalls)
-					recordDecode(f, cl->commands[i], 0);
-			}
 		}
 		return kOk;
 	}
@@ -810,9 +649,18 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		if (!ql || !ql->queries)
 			return kBadArgument;
 		for (uint32_t i = 0; i < ql->count; i++) {
-			if (!ql->queries[i].token)
+			Token *t = (Token *)ql->queries[i].token;
+			if (!t)
 				return kBadArgument;
-			ql->queries[i].status = 1;
+			std::lock_guard<std::mutex> hold(g_tokenLock);
+			int status = t->work ? rgfx::video::tokenStatus(t->work) : 1;
+			if (status == -1)
+				t->failed = true;
+			if (status != 0) {
+				rgfx::video::releaseToken(t->work);
+				t->work = nullptr;
+			}
+			ql->queries[i].status = status == 0 ? 2 : 1;
 			ql->queries[i].field_14 = 0;
 		}
 		return kOk;
@@ -845,7 +693,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		}
 		return kOk;
 	}
-	default: // DeleteDriver, FreePixelBufferPool, the parameters: recorded, answered success
+	default: // DeleteDriver, the parameters: answered success
 		return kOk;
 	}
 }
@@ -853,15 +701,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 template <int N>
 uint64_t entryPoint(uint64_t a0, uint64_t a1, uint64_t a2)
 {
-	{
-		std::lock_guard<std::mutex> hold(g_logLock);
-		g_perEntry[N]++;
-	}
-	g_calls++;
-	record(N, "CALL", a0, a1, a2, 0);
-	uint64_t result = answer(N, a0, a1, a2);
-	record(N, "RET ", a0, a1, a2, result);
-	return result;
+	return answer(N, a0, a1, a2);
 }
 
 template <int... N>
@@ -878,19 +718,15 @@ AVD_CreateAVDAccelerator(void **out, const void *params, void *identity)
 {
 	if (!out || !params || !identity)
 		return 5;
-	{
-		std::lock_guard<std::mutex> hold(g_logLock);
-		if (FILE *f = recordFile()) {
-			fprintf(f, "CREATE out %p params %p identity %p\n", (void *)out, params, identity);
-			dump(f, "params", (uint64_t)params, 0x40, 1);
-		}
-	}
 	Entries<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>::fill(g_table);
 	g_table.driver = &g_driver;
 	DriverIdentity id = {};
 	id.renderer_id = kRendererID;
-	if (!g_capabilities)
-		traceCapabilityReads();
+	static std::once_flag filled;
+	std::call_once(filled, [] {
+		fillCapabilities(g_block);
+		g_capabilities = &g_block;
+	});
 	id.capabilities = g_capabilities;
 	id.field_10 = 1;
 	memcpy(id.name, "RgfxVideo      ", 16);
@@ -901,13 +737,5 @@ AVD_CreateAVDAccelerator(void **out, const void *params, void *identity)
 
 extern "C" __attribute__((visibility("default"))) int AVD_DestroyAVDAccelerator(void *table)
 {
-	std::lock_guard<std::mutex> hold(g_logLock);
-	if (FILE *f = recordFile()) {
-		writeReads(f);
-		fprintf(f, "DESTROY %p calls %u:", table, g_calls.load());
-		for (int i = 0; i < 16; i++)
-			fprintf(f, " %s=%u", kEntryNames[i], g_perEntry[i]);
-		fprintf(f, "\n");
-	}
 	return 0;
 }

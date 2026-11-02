@@ -380,6 +380,12 @@ public:
 	/// False where the message was not posted.
 	bool setSharedEventValue(RgfxObjId event, uint64_t value);
 
+	// --- video ----------------------------------------------------------------
+
+	/// A video session of codec `codec` (RGFX_VIDEO_CODEC_*) in direction `direction`
+	/// (RGFX_VIDEO_DECODE or RGFX_VIDEO_ENCODE), which video encoders name. Not answered.
+	RgfxCreated createVideoSession(uint32_t codec, uint32_t direction);
+
 	// --- destroy --------------------------------------------------------------
 
 	/// Drops the host handle for `obj_id` (an object of any kind, a queue

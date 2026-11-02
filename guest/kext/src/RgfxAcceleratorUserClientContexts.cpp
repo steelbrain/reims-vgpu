@@ -465,15 +465,19 @@ void RgfxAcceleratorUserClient::releaseContext()
 }
 
 // kRgfxAccelMethodDeviceInfo (RgfxAccelerator.hpp): the device info the host wrote, read from
-// the region for the process, which maps no page of it.
+// the region for the process, which maps no page of it; with the video caps after it
+// (RGFX_VIDEO_CAPS_OFFSET) where the output has room for both.
 IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *a)
 {
 	// Larger than a message's inline bytes, it comes out through a descriptor, which IOKit
 	// sizes apart from the inline output.
 	const UInt64 outSize = a->structureOutputDescriptor ? a->structureOutputDescriptorSize
 	                                                    : a->structureOutputSize;
+	static_assert(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + sizeof(RgfxDeviceInfo),
+	              "the video caps follow the device info");
+	const UInt64 size = sizeof(RgfxDeviceInfo) + sizeof(RgfxVideoCaps);
 	if (a->scalarInputCount != 0 || a->scalarOutputCount != 0 || a->structureInputSize != 0 ||
-	    outSize != sizeof(RgfxDeviceInfo))
+	    (outSize != sizeof(RgfxDeviceInfo) && outSize != size))
 		return kIOReturnBadArgument;
 	IODeviceMemory *region = owner->copyRegion();
 	if (!region)
@@ -481,8 +485,7 @@ IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *
 	// Its pages, mapped into the kernel write-back as the framebuffer maps the rings: the
 	// region is BAR memory, which a physical copy does not read.
 	const UInt64 page = RGFX_DEVICE_INFO_OFFSET & ~0xfffull;
-	const UInt64 length =
-	    ((RGFX_DEVICE_INFO_OFFSET + sizeof(RgfxDeviceInfo) + 0xfffull) & ~0xfffull) - page;
+	const UInt64 length = ((RGFX_DEVICE_INFO_OFFSET + outSize + 0xfffull) & ~0xfffull) - page;
 	IOMemoryMap *map = region->createMappingInTask(
 	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache | kIOMapReadOnly, page, length);
 	region->release();
@@ -495,12 +498,12 @@ IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *
 	if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {
 		r = desc->prepare(kIODirectionIn);
 		if (r == kIOReturnSuccess) {
-			if (desc->writeBytes(0, info, sizeof(RgfxDeviceInfo)) != sizeof(RgfxDeviceInfo))
+			if (desc->writeBytes(0, info, outSize) != outSize)
 				r = kIOReturnBadArgument;
 			desc->complete(kIODirectionIn);
 		}
-	} else if (a->structureOutput && a->structureOutputSize == sizeof(RgfxDeviceInfo)) {
-		memcpy(a->structureOutput, info, sizeof(RgfxDeviceInfo));
+	} else if (a->structureOutput && a->structureOutputSize == outSize) {
+		memcpy(a->structureOutput, info, outSize);
 	} else {
 		r = kIOReturnBadArgument;
 	}

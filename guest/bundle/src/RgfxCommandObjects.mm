@@ -1083,6 +1083,25 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	return enc;
 }
 
+- (void)rgfxEncodeVideoSession:(uint64_t)session
+                    decodeH264:(const RgfxVideoOpDecodeH264 *)body
+                 parameterSets:(const uint8_t *)parameterSets
+                          size:(uint32_t)size
+                     bitstream:(id<MTLBuffer>)bitstream
+                          luma:(id<MTLTexture>)luma
+                        chroma:(id<MTLTexture>)chroma
+{
+	_encoder->beginVideoPass(session);
+	RgfxVideoOpDecodeH264 b = *body;
+	b.bitstream_buffer_obj_id = rgfxReads(_encoder, bitstream);
+	rgfxIOSurfaceNoteWrite(_encoder, luma);
+	rgfxIOSurfaceNoteWrite(_encoder, chroma);
+	b.luma_texture_obj_id = rgfxWrites(_encoder, luma);
+	b.chroma_texture_obj_id = rgfxWrites(_encoder, chroma);
+	_encoder->videoDecodeH264(b, parameterSets, size);
+	_encoder->endEncoder();
+}
+
 - (nullable id<MTLBlitCommandEncoder>)blitCommandEncoder
 {
 	_encoder->beginBlitPass();

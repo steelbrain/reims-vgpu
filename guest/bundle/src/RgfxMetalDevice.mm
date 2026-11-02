@@ -352,6 +352,7 @@ RGFX_LOG_UNRECOGNIZED
 
 @implementation RgfxMetalDevice {
 	RgfxCaps _caps;              // host device caps; invalid until the region is read
+	RgfxVideoCaps _videoCaps;    // the host's video codecs; none until the region is read
 	RgfxIdSpace _ids;            // this device's id/address/resource-id lines
 	RgfxSerializer *_serializer; // the create route; null until the ring transport lands
 	mach_port_t _acceleratorPort;
@@ -427,10 +428,30 @@ RGFX_LOG_UNRECOGNIZED
 
 	// The caps blob the host wrote (read once at init), which the kext reads for us: its page
 	// is no process's to map.
-	RgfxDeviceInfo info = {};
-	size_t infoSize = sizeof(info);
-	kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &info,
+	// The video caps follow it, where the kext reads them too; a kext older than them reads the
+	// device info alone, and the device then has no video codec.
+	struct {
+		RgfxDeviceInfo info;
+		RgfxVideoCaps video;
+	} blob = {};
+	static_assert(offsetof(decltype(blob), video) == sizeof(RgfxDeviceInfo), "no padding");
+	RgfxDeviceInfo &info = blob.info;
+	size_t infoSize = sizeof(blob);
+	kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &blob,
 	                               &infoSize);
+	if (kr != KERN_SUCCESS) {
+		blob = {};
+		infoSize = sizeof(info);
+		kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &info,
+		                               &infoSize);
+	} else if (infoSize == sizeof(blob) && blob.video.version == RGFX_VIDEO_CAPS_VERSION) {
+		_videoCaps = blob.video;
+		if (_videoCaps.codec_count > RGFX_VIDEO_CAPS_CODECS)
+			_videoCaps.codec_count = RGFX_VIDEO_CAPS_CODECS;
+		infoSize = sizeof(info);
+	} else {
+		infoSize = sizeof(info);
+	}
 	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
 		rgfxDiag("RGFX: caps blob not read (kr=0x%x) or invalid; using defaults\n", kr);
 
@@ -496,6 +517,11 @@ RGFX_LOG_UNRECOGNIZED
 - (RgfxIdSpace *)ids
 {
 	return &_ids;
+}
+
+- (const RgfxVideoCaps *)videoCaps
+{
+	return &_videoCaps;
 }
 
 - (const RgfxCaps *)caps

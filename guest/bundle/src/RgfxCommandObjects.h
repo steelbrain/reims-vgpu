@@ -173,6 +173,19 @@ NS_ASSUME_NONNULL_BEGIN
 /// The error options the buffer's descriptor asked for (errorOptions answers them).
 - (void)rgfxSetErrorOptions:(MTLCommandBufferErrorOption)options;
 
+/// Encodes the buffer's one encoder, a video encoder on the session `session` holding one H.264
+/// decode (RGFX_OP_VIDEO_DECODE_H264): `body`'s access unit in `bitstream`, at the offset and
+/// size `body` gives, after the `size` bytes of parameter sets at `parameterSets`, into the
+/// surface `luma` and `chroma` lie over, which the buffer writes. The video driver's
+/// (RgfxVideoChannel.hpp).
+- (void)rgfxEncodeVideoSession:(uint64_t)session
+                    decodeH264:(const RgfxVideoOpDecodeH264 *)body
+                 parameterSets:(nullable const uint8_t *)parameterSets
+                          size:(uint32_t)size
+                     bitstream:(id<MTLBuffer>)bitstream
+                          luma:(id<MTLTexture>)luma
+                        chroma:(id<MTLTexture>)chroma;
+
 @end
 
 // --- the encoders ------------------------------------------------------------

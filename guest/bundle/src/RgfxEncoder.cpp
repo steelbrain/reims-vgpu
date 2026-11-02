@@ -189,6 +189,31 @@ void RgfxEncoder::beginBlitPass()
 	appendOp(RGFX_OP_ENCODER_BEGIN_BLIT);
 }
 
+void RgfxEncoder::beginVideoPass(RgfxObjId session)
+{
+	RgfxOpVideoPass b = {};
+	b.session_obj_id = session;
+	appendOp(RGFX_OP_ENCODER_BEGIN_VIDEO, &b, sizeof(b));
+}
+
+void RgfxEncoder::videoDecodeH264(const RgfxVideoOpDecodeH264 &body, const uint8_t *parameterSets,
+                                  uint32_t size)
+{
+	RgfxVideoOpDecodeH264 b = body;
+	b.parameter_sets_size = size;
+	b.reserved_2c = 0;
+	static const uint8_t zeros[8] = {};
+	const size_t padded = (static_cast<size_t>(size) + 7) & ~static_cast<size_t>(7);
+	RgfxOpHeader h = {};
+	h.tag = RGFX_OP_VIDEO_DECODE_H264;
+	h.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + sizeof(b) + padded);
+	appendBytes(&h, sizeof(h));
+	appendBytes(&b, sizeof(b));
+	if (size != 0)
+		appendBytes(parameterSets, size);
+	appendBytes(zeros, padded - size);
+}
+
 void RgfxEncoder::endEncoder()
 {
 	appendOp(RGFX_OP_ENCODER_END);
