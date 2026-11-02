@@ -117,6 +117,19 @@ int main()
 	check(rgfxLockWaits(t, 0x40) && !rgfxLockWaits(t, 0x10), "only the later write holds a lock");
 	check(rgfxLockRetire(t, kQueue, 9) && t.useCount == 0, "the queue's retire empties the table");
 
+	// Op 6 answers in the byte its second argument names, and no other op writes there.
+	uint8_t bytes[3] = {0x11, 0, 0x22};
+	const uint64_t at = reinterpret_cast<uintptr_t>(&bytes[1]);
+	const uint32_t others[] = {0, 2, 3, 4, 5, 7};
+	for (uint32_t op : others)
+		rgfxControlAnswer(op, at);
+	check(bytes[1] == 0, "no other op writes the byte");
+	rgfxControlAnswer(kRgfxControlUnpurge, at);
+	check(bytes[1] == 0xff, "op 6 sets the byte to 0xff");
+	check(bytes[0] == 0x11 && bytes[2] == 0x22, "op 6 writes that byte alone");
+	rgfxControlAnswer(kRgfxControlUnpurge, 0);
+	check(true, "op 6 with no byte writes nothing");
+
 	std::printf("surface_locks_test: OK (%d checks)\n", checks);
 	return 0;
 }

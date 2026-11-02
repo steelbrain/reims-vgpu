@@ -146,10 +146,12 @@ bool surfaceHolds(OSObject *surface, UInt64 phys)
 void wakeLocked();
 
 // The control function every device cache the kext makes calls (RgfxIOSurfaceKPI.hpp), from
-// inside a CPU lock of its surface: op 2 waits while a write of the surface is pending.
+// inside a CPU lock of its surface: op 2 waits while a write of the surface is pending, and op 6
+// answers in its byte.
 void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint64_t a,
                     uint64_t b)
 {
+	rgfxControlAnswer(op, b);
 	if (op != 2 || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		return;
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);

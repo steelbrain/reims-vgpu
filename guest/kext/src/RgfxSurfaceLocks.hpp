@@ -212,4 +212,19 @@ inline uint32_t rgfxLockPendingQueues(const RgfxLockTable &t, uint64_t key, bool
 	return n;
 }
 
+// The control function's op 6, which IOSurfaceDeviceCache::unpurge calls as a surface turns
+// nonvolatile again (RgfxIOSurfaceKPI.hpp), its second argument `b` the address of a byte. The
+// kext sets the byte to 0xff, as the AMD's driver does both after volatile and after empty, and
+// IOSurface answers the surface's old state from its own record of what was set: volatile after
+// volatile, empty after empty (measured on the AMD Radeon Pro 5300M). Left 0, the byte has
+// IOSurface answer empty after volatile too (measured in the guest). No other op's argument is
+// written.
+constexpr uint32_t kRgfxControlUnpurge = 6;
+
+inline void rgfxControlAnswer(uint32_t op, uint64_t b)
+{
+	if (op == kRgfxControlUnpurge && b)
+		*reinterpret_cast<volatile uint8_t *>(static_cast<uintptr_t>(b)) = 0xff;
+}
+
 #endif // RGFX_SURFACE_LOCKS_HPP_
