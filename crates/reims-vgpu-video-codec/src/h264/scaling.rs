@@ -145,10 +145,10 @@ fn parse_list<const N: usize>(r: &mut BitReader<'_>) -> Result<ListSyntax<N>, Er
 /// Y, Inter Y, then the 4:4:4 chroma lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScalingLists {
-    /// The 4x4 lists.
-    pub(crate) lists_4x4: [[u8; 16]; 6],
-    /// The 8x8 lists.
-    pub(crate) lists_8x8: [[u8; 64]; 6],
+    /// The 4x4 lists, each in zig-zag order, as coded.
+    pub lists_4x4: [[u8; 16]; 6],
+    /// The 8x8 lists, each in zig-zag order, as coded.
+    pub lists_8x8: [[u8; 64]; 6],
 }
 
 impl ScalingLists {

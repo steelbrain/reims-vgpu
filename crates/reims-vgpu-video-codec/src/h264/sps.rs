@@ -14,7 +14,7 @@ pub struct Sps {
     /// `profile_idc`.
     pub profile_idc: u8,
     /// `constraint_set0_flag` to `constraint_set5_flag`, in bits 7 to 2.
-    pub(crate) constraint_flags: u8,
+    pub constraint_flags: u8,
     /// `level_idc`.
     pub level_idc: u8,
     /// `seq_parameter_set_id`.
@@ -31,7 +31,7 @@ pub struct Sps {
     pub qpprime_y_zero_transform_bypass_flag: bool,
     /// The sequence-level scaling lists: flat unless
     /// `seq_scaling_matrix_present_flag`, else resolved by fall-back rule A.
-    pub(crate) scaling_lists: ScalingLists,
+    pub scaling_lists: ScalingLists,
     /// `seq_scaling_matrix_present_flag`.
     pub seq_scaling_matrix_present_flag: bool,
     /// `log2_max_frame_num_minus4`.
@@ -43,19 +43,19 @@ pub struct Sps {
     /// `delta_pic_order_always_zero_flag` (type 1).
     pub delta_pic_order_always_zero_flag: bool,
     /// `offset_for_non_ref_pic` (type 1).
-    pub(crate) offset_for_non_ref_pic: i32,
+    pub offset_for_non_ref_pic: i32,
     /// `offset_for_top_to_bottom_field` (type 1).
-    pub(crate) offset_for_top_to_bottom_field: i32,
+    pub offset_for_top_to_bottom_field: i32,
     /// `offset_for_ref_frame[]` (type 1).
-    pub(crate) offset_for_ref_frame: Vec<i32>,
+    pub offset_for_ref_frame: Vec<i32>,
     /// `max_num_ref_frames`.
     pub max_num_ref_frames: u8,
     /// `gaps_in_frame_num_value_allowed_flag`.
     pub gaps_in_frame_num_value_allowed_flag: bool,
     /// `pic_width_in_mbs_minus1`.
-    pub(crate) pic_width_in_mbs_minus1: u16,
+    pub pic_width_in_mbs_minus1: u16,
     /// `pic_height_in_map_units_minus1`.
-    pub(crate) pic_height_in_map_units_minus1: u16,
+    pub pic_height_in_map_units_minus1: u16,
     /// `frame_mbs_only_flag`.
     pub frame_mbs_only_flag: bool,
     /// `mb_adaptive_frame_field_flag`.
@@ -63,7 +63,7 @@ pub struct Sps {
     /// `direct_8x8_inference_flag`.
     pub direct_8x8_inference_flag: bool,
     /// `frame_crop_{left,right,top,bottom}_offset`, in crop units.
-    pub(crate) frame_crop: [u32; 4],
+    pub frame_crop: [u32; 4],
     /// The VUI, when present and readable.
     pub vui: Option<Vui>,
     /// What the standard derives from the fields above, worked out when

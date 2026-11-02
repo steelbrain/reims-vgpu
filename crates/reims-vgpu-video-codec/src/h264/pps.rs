@@ -126,7 +126,7 @@ impl Pps {
     /// lists, those the PPS leaves out fall back by rule A of Table 7-2
     /// when the SPS has no matrix, and by rule B, to the SPS's lists, when
     /// it has. Where the PPS codes none, the SPS's lists hold.
-    pub(crate) fn scaling_lists(&self, sps: &Sps) -> ScalingLists {
+    pub fn scaling_lists(&self, sps: &Sps) -> ScalingLists {
         match &self.scaling {
             Some(syntax) if sps.seq_scaling_matrix_present_flag => {
                 syntax.resolve(Some(&sps.scaling_lists))

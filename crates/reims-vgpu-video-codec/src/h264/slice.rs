@@ -138,7 +138,7 @@ pub struct SliceHeader {
     /// `bottom_field_flag`.
     pub bottom_field_flag: bool,
     /// `idr_pic_id`.
-    pub(crate) idr_pic_id: u32,
+    pub idr_pic_id: u32,
     /// `pic_order_cnt_lsb`.
     pub(crate) pic_order_cnt_lsb: u32,
     /// `delta_pic_order_cnt_bottom`.
