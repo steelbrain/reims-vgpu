@@ -2,6 +2,8 @@
 // download and goes on once it is answered, other locks waiting for it meanwhile; a write named
 // during a download is copied by the next; a read-write lock moves the CPU generation; a lock
 // waits for the block's release; and a surface that is not cached does nothing past the writes.
+// A block's let-go hands back the device cache's reference at once, but a cached block's being
+// released, which the table holds until the answer.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -87,6 +89,21 @@ int main()
 	check(rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheGoOn,
 	      "answered: the lock goes on, the surface no longer cached");
 	check(t.count == 1 && rgfxCacheFind(t, kOther) != nullptr, "the other surface stays");
+
+	// The device cache's reference: released with the let-go of a block not cached, or of a
+	// cached one not released; held for the answer of a cached one's release.
+	check(rgfxCacheLetGo(t, kNotCached, true, &map) && map == nullptr,
+	      "a surface not cached lets its cache go with its block");
+	check(rgfxCacheReleased(t, kOtherBlock, &map) == 0, "no release asked: nothing answered");
+	check(!rgfxCacheLetGo(t, kOther, true, &map), "a cached block being released keeps it");
+	check(rgfxCacheNext(t, kOther, &offset, &mark) == kRgfxCacheWait, "its locks wait");
+	check(rgfxCacheReleased(t, 0x123000, &map) == 0, "an answer for another block lets none go");
+	check(rgfxCacheReleased(t, kOtherBlock, &map) == kOther && t.count == 0,
+	      "the answer lets it go, the cache's reference with it");
+	check(rgfxCacheReleased(t, kOtherBlock, &map) == 0, "once");
+	check(rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId) != nullptr, "cached again");
+	check(rgfxCacheLetGo(t, kOther, false, &map) && t.count == 0,
+	      "a block let go with no release lets the cache go at once");
 
 	std::printf("surface_caches_test: OK (%d checks)\n", checks);
 	return 0;

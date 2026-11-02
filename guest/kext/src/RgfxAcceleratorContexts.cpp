@@ -761,8 +761,8 @@ bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t su
 	                                    kRgfxSurfaceCpuGenOffset)) {
 		if (header)
 			header->release();
-		// The cache is the surface's, which another block of it may still use: only the
-		// surface's retain goes.
+		// Not cached: the cache's reference and the surface's go.
+		static_cast<OSObject *>(cache)->release();
 		static_cast<OSObject *>(surface)->release();
 		return false;
 	}
@@ -893,6 +893,7 @@ RgfxAccelerator::surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t ta
 		answer = kSurfaceCacheOtherSurface;
 	if (answer == kSurfaceCacheMade) {
 		*cache = e->cache;
+		static_cast<OSObject *>(e->cache)->retain();
 		*surface = static_cast<OSObject *>(e->surface);
 		(*surface)->retain();
 		*inPlace = e->inPlace;

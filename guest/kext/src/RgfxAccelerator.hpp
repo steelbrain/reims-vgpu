@@ -184,9 +184,10 @@ class RgfxSurfaceUserClient;
 class ReimsGraphics;
 
 // A surface's shared block goes (RgfxAcceleratorContexts.cpp): its device cache's pending writes
-// go, waking the locks waiting on them, and its IOSurface is released (RgfxAcceleratorLocks.cpp).
-// Either may be null. A cached block's surface stays cached until its BLOCK_RELEASE is answered
-// where `releasing` (rgfxSurfaceCacheReleased), its locks waiting for the answer; else it goes.
+// go, waking the locks waiting on them, and its device cache and IOSurface are released
+// (RgfxAcceleratorLocks.cpp). Either may be null. A cached block's surface stays cached until its
+// BLOCK_RELEASE is answered where `releasing` (rgfxSurfaceCacheReleased), its locks waiting for
+// the answer and its cache held until then; else it goes.
 void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
 // The surface of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID `surfaceId`, has its
 // block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page mapped at `header`,
@@ -197,14 +198,14 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
 bool rgfxSurfaceCacheAdd(void *cache, UInt64 offset, uint32_t surfaceId, IOMemoryMap *header,
                          UInt32 genOffset);
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
-// cached no more, and its locks go on.
+// cached no more, its locks go on, and its device cache is released.
 void rgfxSurfaceCacheReleased(UInt64 offset);
 // The CPU generation of the cached surface of IOSurfaceID `surfaceId`, for a present of it;
 // false where it is not cached.
 bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen);
 // Makes the device cache of the surface of ID `surfaceId` that `task` may see, whose memory holds
 // the physical byte `phys` (a shared block's first), with the kext's control function: its
-// IOSurface (retained) and its cache, or false. Under the contexts' lock.
+// IOSurface and its cache, each retained, or false. Under the contexts' lock.
 bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfaceId, UInt64 phys,
                             void **surface, void **cache);
 // The device raised its vector: the locks waiting for a surface look at the queues' completions
@@ -338,7 +339,8 @@ public:
 	                       UInt64 seqno, const UInt64 *pairs, UInt32 count);
 	// The device cache of the shared block at `offset`, which `client` holds, for the surface of
 	// ID `surfaceId` (RgfxAcceleratorContexts.cpp): made at the first ask and kept with the
-	// block's entry. Its IOSurface comes retained, for the caller to release, and `*inPlace` says
+	// block's entry. It and its IOSurface come retained, for the caller to release, as the
+	// block's let-go may release the entry's meanwhile, and `*inPlace` says
 	// whether the device draws it in place. Else why there is none: the client holds no such
 	// block, its pages are not yet the device's, its surface is another, or no cache could be made
 	// (logged where it was tried).

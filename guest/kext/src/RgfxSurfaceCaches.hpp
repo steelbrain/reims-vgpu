@@ -15,7 +15,9 @@
 //     cache exists, current or not (RgfxIOSurfaceKPI.hpp), so the count starts with the block.
 //   - The block's last holder letting go posts its BLOCK_RELEASE, which the host answers once
 //     the pages hold the cache: a lock waits for the answer, then the surface is no longer
-//     cached.
+//     cached. The kext holds the surface's device cache until then, so its locks still reach
+//     the kext; a block that is not cached lets its cache go with it (rgfxCacheLetGo,
+//     rgfxCacheReleased).
 // A wait that does not end in kWaitMs goes on, as a lock waiting for a write does.
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
@@ -106,6 +108,38 @@ inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map)
 {
 	*map = c->map;
 	*c = t.entries[--t.count];
+}
+
+// The block of surface `key` goes: a cached one stays, its locks waiting, until the block's
+// release is answered where `releasing`, else it is taken out (its mapping in `*map`, for the
+// caller to let go). True where the caller releases the device cache's reference now; false
+// where the table keeps it for the answer (rgfxCacheReleased).
+inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void **map)
+{
+	*map = nullptr;
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr)
+		return true;
+	if (releasing) {
+		c->releasing = true;
+		return false;
+	}
+	rgfxCacheRemove(t, c, map);
+	return true;
+}
+
+// The BLOCK_RELEASE of the block at `offset` was answered: the cached surface releasing it is
+// taken out (its mapping in `*map`), and its key, the device cache whose reference the caller
+// releases now, returned; 0 where none was releasing it.
+inline uint64_t rgfxCacheReleased(RgfxCacheTable &t, uint64_t offset, void **map)
+{
+	*map = nullptr;
+	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	if (c == nullptr || !c->releasing)
+		return 0;
+	const uint64_t key = c->key;
+	rgfxCacheRemove(t, c, map);
+	return key;
 }
 
 // A GPU write of surface `key` was named. False where it is not cached.

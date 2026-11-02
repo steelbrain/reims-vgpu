@@ -8,8 +8,13 @@
 // under macOS 26.7 (IOAcceleratorFamily2), both with IOSurface 393.5.8:
 //   - a driver gives a surface its device cache with deviceCacheForAccelerator(surface, the
 //     driver's accelerator, the driver's accelerator ID, 0), which makes the cache at its first
-//     call for that accelerator and returns the same one after, and hands IOSurface its control
-//     function with setControlFunc(cache, its context, the function);
+//     call for that accelerator and returns the same one after, retained once a call (the
+//     caller's reference, the only one: a cache just made has a retain count of 1, measured in
+//     the guest), and hands IOSurface its control function with setControlFunc(cache, its
+//     context, the function);
+//   - the caller's release of a cache to a retain count of 0 frees it at once in the guest,
+//     calling the control function with op 4 from the cache's free (measured; the AMD's driver,
+//     whose resource holds the reference, has IOSurface keep its cache past the release);
 //   - at a command buffer's submission it calls setCurrent on the cache of each surface the
 //     buffer writes, none for a surface it only reads; the surface's seed moves once for it;
 //   - a CPU lock of a surface whose cache is current then calls the control function with the
@@ -17,7 +22,9 @@
 //     read-only lock, 0 for a read-write one), then op 3, and returns once the function does;
 //     a read-write lock of a surface with a cache that is not current calls op 2 with 0, then
 //     op 3; a read-only one, none. An AvoidSync lock of a surface whose cache is current answers
-//     kIOReturnCannotLock with no call, until a plain lock has synced it.
+//     kIOReturnCannotLock with no call, until a plain lock has synced it;
+//   - a client of the surface going calls op 5 (IOSurface::purge), and setPurgeable op 7 with
+//     the new state (0 nonvolatile, 1 volatile, 2 empty, 3 to read it).
 // The accelerator ID came from IOSurfaceRoot::generateUniqueAcceleratorID(the accelerator) on
 // both, 1 for IOGPU and 2 for the AMD's (taken before the trace began).
 //
@@ -32,8 +39,9 @@
 struct RgfxDeviceCache;
 
 // The control function a device cache calls: the accelerator its cache was made for, the cache,
-// the op (0 sync, 2 wait, 3 done), and the op's two arguments (op 2's first: 1 for a read-only
-// lock, 0 for a read-write one; the second measured 0).
+// the op (0 sync, 2 wait, 3 done, 4 freed, 5 purged, 7 purgeable), and the op's two arguments
+// (op 2's first: 1 for a read-only lock, 0 for a read-write one; op 7's the new state; the second
+// measured 0).
 typedef void (*RgfxDeviceCacheControl)(void *accelerator, RgfxDeviceCache *cache, uint32_t op,
                                        uint64_t a, uint64_t b);
 

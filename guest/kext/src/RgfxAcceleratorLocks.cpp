@@ -8,10 +8,10 @@
  * the surface up by the IOSurfaceID the process gives, in the process's task, and takes it only
  * where its memory holds the block's first page: a process names only a surface it holds, and
  * only the surface of the block. The kext then makes the surface's device cache for this
- * accelerator, with its own control function, and keeps both with the block's entry, the surface
- * retained, until the block goes. Each write named notes the write in the lock table, then marks
- * the cache current, which has IOSurface call the control function inside every CPU lock of the
- * surface from then on and moves the surface's seed.
+ * accelerator, with its own control function, and keeps both with the block's entry, each
+ * retained, until the block goes, which releases both. Each write named notes the write in the
+ * lock table, then marks the cache current, which has IOSurface call the control function inside
+ * every CPU lock of the surface from then on and moves the surface's seed.
  *
  * The control function waits at op 2 while a write of the surface is pending, whatever the lock's
  * mode (a pending read holds no lock), and does nothing at ops 0 and 3: once a write retires, the
@@ -29,6 +29,8 @@
  * cache into the pages (SURFACE_DOWNLOAD) and waits for the answer; a read-write lock then moves
  * the surface's CPU generation, which the kext writes into the block's header; and a lock waits
  * for the answer to the block's BLOCK_RELEASE, which copies the cache into the pages a last time.
+ * The kext holds such a cache until that answer, so the surface's locks go on calling the
+ * control function until then.
  *
  * Our own code; it names SDK-public IOKit calls and IOSurface's interface (RgfxIOSurfaceKPI.hpp).
  */
@@ -288,24 +290,25 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing)
 {
 	void *map = nullptr;
+	bool kept = false;
 	if (cache && __atomic_load_n(&state.lock, __ATOMIC_ACQUIRE)) {
 		IOLockLock(state.lock);
 		const uint64_t key = reinterpret_cast<uintptr_t>(cache);
 		bool wake = rgfxLockForgetKey(state.table, key);
-		// A cached surface's locks wait for its block's release, or it is cached no more.
-		if (RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
-			if (releasing)
-				c->releasing = true;
-			else
-				rgfxCacheRemove(state.caches, c, &map);
-			wake = true;
-		}
+		// A cached surface's locks wait for its block's release, the cache held until the
+		// answer (rgfxSurfaceCacheReleased), or it is cached no more.
+		wake |= rgfxCacheFind(state.caches, key) != nullptr;
+		kept = !rgfxCacheLetGo(state.caches, key, releasing, &map);
 		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);
 	}
 	if (map)
 		static_cast<IOMemoryMap *>(map)->release();
+	// The reference rgfxSurfaceLocksAttach took, out of every lock: IOSurface frees a cache
+	// released to none (RgfxIOSurfaceKPI.hpp).
+	if (cache && !kept)
+		reinterpret_cast<OSObject *>(cache)->release();
 	if (surface)
 		static_cast<OSObject *>(surface)->release();
 }
@@ -349,13 +352,16 @@ void rgfxSurfaceCacheReleased(UInt64 offset)
 	void *map = nullptr;
 	IOLockLock(state.lock);
 	// One cached surface at most has the block: its offset is reused only past this release.
-	if (RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset); c && c->releasing) {
-		rgfxCacheRemove(state.caches, c, &map);
+	OSObject *cache = reinterpret_cast<OSObject *>(
+	    static_cast<uintptr_t>(rgfxCacheReleased(state.caches, offset, &map)));
+	if (cache)
 		wakeLocked();
-	}
 	IOLockUnlock(state.lock);
 	if (map)
 		static_cast<IOMemoryMap *>(map)->release();
+	// The cache's reference, held for the answer (rgfxSurfaceLocksForget).
+	if (cache)
+		cache->release();
 }
 
 bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen)
@@ -429,6 +435,7 @@ void RgfxAccelerator::noteSurfaceWrites(RgfxAcceleratorUserClient *client, task_
 			      "surfaces past %u writes pending do not wait for them\n",
 			      id, kMaxUses);
 		rgfxDeviceCacheSetCurrent(cache);
+		reinterpret_cast<OSObject *>(cache)->release();
 		surface->release();
 	}
 }
