@@ -116,3 +116,37 @@ BOOL RgfxCallCreationHandler(id handler, id object, NSError *error, SEL cmd)
 	logUncalled(cmd, handler);
 	return NO;
 }
+
+namespace {
+
+// The creations RgfxRunCreation started and that have not ended.
+dispatch_group_t creations()
+{
+	static dispatch_group_t group;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		group = dispatch_group_create();
+	});
+	return group;
+}
+
+} // namespace
+
+void RgfxRunCreation(dispatch_block_t creation)
+{
+	dispatch_group_async(creations(), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+		@autoreleasepool {
+			creation();
+		}
+	});
+}
+
+BOOL RgfxWaitForCreations(dispatch_time_t timeout)
+{
+	return dispatch_group_wait(creations(), timeout) == 0;
+}
+
+id RgfxCopyOf(id object)
+{
+	return [object respondsToSelector:@selector(copyWithZone:)] ? [object copy] : object;
+}

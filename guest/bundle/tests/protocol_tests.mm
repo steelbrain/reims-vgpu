@@ -30,6 +30,7 @@
 #import "RgfxFunction.h"
 #import "RgfxHeap.h"
 #import "RgfxInterop.h"
+#import "RgfxBlockCall.h"
 #import "RgfxLibrary.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxResource.h"
@@ -1438,6 +1439,7 @@ void test_library_members()
 			                         called = fn == nil;
 			                         handlerErr = e;
 		                         }];
+		CHECK(RgfxWaitForCreations(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
 		CHECK(called && handlerErr.code == MTLLibraryErrorUnsupported);
 		CHECK([lib reflectionForFunctionWithName:@"vmain"] == nil);
 		CHECK(RgfxUnsupportedWasLogged([RgfxLibrary class],

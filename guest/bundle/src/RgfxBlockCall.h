@@ -32,6 +32,26 @@ NSArray<NSString *> *_Nullable RgfxBlockArgumentTypes(id _Nullable block);
 BOOL RgfxCallCreationHandler(id _Nullable handler, id _Nullable object, NSError *_Nullable error,
                              SEL cmd);
 
+/// Runs `creation`, an asynchronous creator's create and its call of its completion handler, after
+/// the creator returns: on the global concurrent queue of default QoS, in an autorelease pool of
+/// its own. That is where Metal runs them on an Apple M3 Max (macOS 27.0.1: the creator returns,
+/// and its handler runs about 0.2 ms later on `com.apple.root.default-qos`); an AMD Radeon Pro
+/// 5300M and an Intel UHD 630 (macOS 26.7.1) run theirs on a serial queue of the device's, about
+/// 60 ms after the creator returned (docs/graphics-kext/dgpu-oracle.md, Q7). Never on the
+/// caller's thread, so a handler that waits on the caller's own serial queue goes on. The
+/// creator copies what it hands `creation` that its caller may change once it returns (the
+/// descriptor), and the handler, which may be a block on the caller's stack.
+void RgfxRunCreation(dispatch_block_t creation);
+
+/// `object`'s copy where it can be copied (it answers `copyWithZone:`), else `object` itself:
+/// a creator's descriptor of a type no header names, for RgfxRunCreation.
+id _Nullable RgfxCopyOf(id _Nullable object);
+
+/// Waits until every creation RgfxRunCreation started has ended and its block is released, or
+/// `timeout` passes: for the tests, whose objects must outlive the creations that use them. YES
+/// once none runs.
+BOOL RgfxWaitForCreations(dispatch_time_t timeout);
+
 #ifdef __cplusplus
 }
 #endif

@@ -101,8 +101,11 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 {
 	NSError *error = nil;
 	RGFX_UNSUPPORTED_ERROR(&error, "tile pipelines (no tile pipeline create on the wire)");
-	if (completionHandler)
-		completionHandler(nil, nil, error);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		if (completionHandler)
+			completionHandler(nil, nil, error);
+	});
 }
 
 - (id<MTLRenderPipelineState>)
@@ -125,8 +128,11 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 {
 	NSError *error = nil;
 	RGFX_UNSUPPORTED_ERROR(&error, "mesh pipelines (no mesh pipeline create on the wire)");
-	if (completionHandler)
-		completionHandler(nil, nil, error);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		if (completionHandler)
+			completionHandler(nil, nil, error);
+	});
 }
 
 // --- resources the device does not make -----------------------------------------------
@@ -301,7 +307,10 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 {
 	NSError *error = nil;
 	RGFX_UNSUPPORTED_ERROR(&error, "mesh pipelines (no mesh pipeline create on the wire)");
-	RgfxCallCreationHandler(completionHandler, nil, error, _cmd);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		RgfxCallCreationHandler(completionHandler, nil, error, _cmd);
+	});
 }
 
 // Ray tracing: acceleration structures over a buffer (`@32@0:8@16Q24`, `@40@0:8@16Q24Q32`), of a
@@ -366,7 +375,10 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 {
 	NSError *error = nil;
 	RGFX_UNSUPPORTED_ERROR(&error, kFunctionPointers);
-	RgfxCallCreationHandler(completionHandler, nil, error, _cmd);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		RgfxCallCreationHandler(completionHandler, nil, error, _cmd);
+	});
 }
 
 - (id<MTLFunctionHandle>)functionHandleWithFunction:(id<MTLFunction>)function

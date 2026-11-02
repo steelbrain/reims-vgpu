@@ -6,6 +6,7 @@
  */
 
 #import "RgfxLibrary.h"
+#import "RgfxBlockCall.h"
 #import "RgfxUnsupported.h"
 
 #import <objc/message.h>
@@ -566,10 +567,15 @@ static NSError *rgfxFunctionNotFound(NSString *name)
              constantValues:(MTLFunctionConstantValues *)constantValues
           completionHandler:(void (^)(id<MTLFunction> _Nullable, NSError *_Nullable))completionHandler
 {
-	NSError *err = nil;
-	id<MTLFunction> fn = [self newFunctionWithName:name constantValues:constantValues error:&err];
-	if (completionHandler)
-		completionHandler(fn, err);
+	name = [name copy];
+	constantValues = [constantValues copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLFunction> fn = [self newFunctionWithName:name constantValues:constantValues error:&err];
+		if (completionHandler)
+			completionHandler(fn, err);
+	});
 }
 
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor
@@ -590,10 +596,14 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 - (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor
                 completionHandler:(void (^)(id<MTLFunction> _Nullable, NSError *_Nullable))completionHandler
 {
-	NSError *err = nil;
-	id<MTLFunction> fn = [self newFunctionWithDescriptor:descriptor error:&err];
-	if (completionHandler)
-		completionHandler(fn, err);
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLFunction> fn = [self newFunctionWithDescriptor:descriptor error:&err];
+		if (completionHandler)
+			completionHandler(fn, err);
+	});
 }
 
 - (NSArray<NSString *> *)functionNames
@@ -738,10 +748,14 @@ static NSError *rgfxFunctionNotFound(NSString *name)
                             completionHandler:(void (^)(id<MTLFunction> _Nullable,
                                                         NSError *_Nullable))completionHandler
 {
-	NSError *err = nil;
-	id<MTLFunction> fn = [self newIntersectionFunctionWithDescriptor:descriptor error:&err];
-	if (completionHandler)
-		completionHandler(fn, err);
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLFunction> fn = [self newIntersectionFunctionWithDescriptor:descriptor error:&err];
+		if (completionHandler)
+			completionHandler(fn, err);
+	});
 }
 
 // A function's reflection: the shadow's, Metal's own of the same function, where the library

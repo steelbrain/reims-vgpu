@@ -2233,6 +2233,70 @@ void test_linked_function_specialised_on_the_wire()
 	CHECK(std::memcmp(lc.value, &variant, sizeof(variant)) == 0);
 }
 
+// An asynchronous creator returns before its handler is done, and runs the handler on the global
+// concurrent queue of default QoS, never on the caller's thread, as Metal's do on the M3 Max
+// (macOS 27.0.1, `oracle_cmdbuf Apple timing`: `com.apple.root.default-qos`; the 5300M and the UHD
+// 630 run theirs on a serial queue of the device's, docs/graphics-kext/dgpu-oracle.md, Q7). So a
+// handler that waits for the creator to return goes on, and so does one that runs a block
+// synchronously on the caller's own serial queue, which would deadlock (or end the process, in
+// libdispatch's check) were it called on that queue. Every creation ends, its block released,
+// before the library goes.
+void test_async_creators_return_before_their_handlers()
+{
+	Fixture fx;
+	const std::vector<uint8_t> bytes = metallibOf({ { "frg", 1, { { "useRed", 53, 0, true } } } });
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+	                                        length:bytes.size()
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&status];
+	CHECK(lib != nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	// A value of another type than its constant's: the create fails with no message posted.
+	static const float five = 5;
+	MTLFunctionConstantValues *wrong = [MTLFunctionConstantValues new];
+	[wrong setConstantValue:&five type:MTLDataTypeFloat atIndex:0];
+
+	static char kCaller;
+	dispatch_queue_t caller = dispatch_queue_create("rgfx.test.caller", DISPATCH_QUEUE_SERIAL);
+	dispatch_queue_set_specific(caller, &kCaller, &kCaller, nullptr);
+	dispatch_semaphore_t returned = dispatch_semaphore_create(0);
+	dispatch_semaphore_t handled = dispatch_semaphore_create(0);
+	dispatch_time_t (^after)(int64_t) = ^(int64_t seconds) {
+		return dispatch_time(DISPATCH_TIME_NOW, seconds * static_cast<int64_t>(NSEC_PER_SEC));
+	};
+	__block BOOL afterReturn = NO, onCaller = YES, synced = NO;
+	__block NSString *queue = nil;
+	__block NSError *handed = nil;
+	dispatch_async(caller, ^{
+		[lib newFunctionWithName:@"frg"
+		          constantValues:wrong
+		       completionHandler:^(id<MTLFunction> f, NSError *e) {
+			       (void)f;
+			       handed = e;
+			       afterReturn = dispatch_semaphore_wait(returned, after(5)) == 0;
+			       onCaller = dispatch_get_specific(&kCaller) != nullptr;
+			       queue = @(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL));
+			       if (!onCaller)
+				       dispatch_sync(caller, ^{
+					       synced = YES;
+				       });
+			       dispatch_semaphore_signal(handled);
+		       }];
+		dispatch_semaphore_signal(returned);
+	});
+	CHECK(dispatch_semaphore_wait(handled, after(10)) == 0);
+	CHECK(afterReturn && !onCaller && synced);
+	CHECK([queue isEqualToString:@"com.apple.root.default-qos"]);
+	CHECK(handed.code == MTLLibraryErrorCompileFailure);
+	CHECK(RgfxWaitForCreations(after(10)));
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> posted;
+	CHECK(!fx.ring.next(&h, &posted));
+}
+
 // A library's functions are specialised as Metal specialises them: a value set by name or by
 // range reaches its constant's index, an indexed value wins over a named one, values for
 // constants the function does not declare are ignored, a required constant left unset reads 0
@@ -2346,6 +2410,7 @@ void test_function_constants_resolve_as_metal()
 		       handedFn = f;
 		       handed = e;
 	       }];
+	CHECK(RgfxWaitForCreations(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)));
 	CHECK(handedFn == nil && handed.code == MTLLibraryErrorCompileFailure);
 	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
 	fd.name = @"frg";
@@ -7066,6 +7131,7 @@ int main()
 		test_render_pipeline_routing();
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
+		test_async_creators_return_before_their_handlers();
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();

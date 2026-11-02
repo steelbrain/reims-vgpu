@@ -251,10 +251,14 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 - (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
                        completionHandler:(MTLNewLibraryCompletionHandler)completionHandler
 {
-	NSError *error = nil;
-	id<MTLLibrary> lib = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
-	if (completionHandler)
-		completionHandler(lib, error);
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *error = nil;
+		id<MTLLibrary> lib = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
+		if (completionHandler)
+			completionHandler(lib, error);
+	});
 }
 
 - (id<MTLLibrary>)newLibraryWithStitchedDescriptorSPI:(MTLStitchedLibraryDescriptor *)descriptor
@@ -315,9 +319,13 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 
 - (void)newLibraryWithDescriptor:(id)descriptor completionHandler:(id)completionHandler
 {
-	NSError *error = nil;
-	id<MTLLibrary> lib = [self rgfxLibraryWithDescriptor:descriptor archive:nil error:&error];
-	RgfxCallCreationHandler(completionHandler, lib, error, _cmd);
+	descriptor = RgfxCopyOf(descriptor);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *error = nil;
+		id<MTLLibrary> lib = [self rgfxLibraryWithDescriptor:descriptor archive:nil error:&error];
+		RgfxCallCreationHandler(completionHandler, lib, error, _cmd);
+	});
 }
 
 // The DAG's text is Metal's to read (its parser answers its errors, MTLLibraryErrorDomain 3).
@@ -437,10 +445,15 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
                      options:(MTLCompileOptions *)options
            completionHandler:(MTLNewLibraryCompletionHandler)completionHandler
 {
-	NSError *err = nil;
-	id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&err];
-	if (completionHandler)
-		completionHandler(lib, err);
+	source = [source copy];
+	options = [options copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&err];
+		if (completionHandler)
+			completionHandler(lib, err);
+	});
 }
 
 // The forms with a compiler task (measured: _MTLDevice's on macOS 27's x86-64 slice,
@@ -462,9 +475,14 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
            completionHandler:(id)completionHandler
 {
 	(void)compilerTask;
-	NSError *err = nil;
-	id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&err];
-	RgfxCallCreationHandler(completionHandler, lib, err, _cmd);
+	source = [source copy];
+	options = [options copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&err];
+		RgfxCallCreationHandler(completionHandler, lib, err, _cmd);
+	});
 }
 
 // --- render pipelines --------------------------------------------------------
@@ -533,11 +551,15 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                            completionHandler:
                                (MTLNewRenderPipelineStateCompletionHandler)completionHandler
 {
-	NSError *err = nil;
-	id<MTLRenderPipelineState> state = [self newRenderPipelineStateWithDescriptor:descriptor
-	                                                                       error:&err];
-	if (completionHandler)
-		completionHandler(state, err);
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLRenderPipelineState> state = [self newRenderPipelineStateWithDescriptor:descriptor
+		                                                                       error:&err];
+		if (completionHandler)
+			completionHandler(state, err);
+	});
 }
 
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
@@ -546,12 +568,16 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                (MTLNewRenderPipelineStateWithReflectionCompletionHandler)
                                    completionHandler
 {
-	NSError *err = nil;
-	id<MTLRenderPipelineState> state = [self rgfxRenderPipelineForDescriptor:descriptor
-	                                                                 options:options
-	                                                                   error:&err];
-	if (completionHandler)
-		completionHandler(state, nil, err); // reflection: see the error: variant above
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLRenderPipelineState> state = [self rgfxRenderPipelineForDescriptor:descriptor
+		                                                                 options:options
+		                                                                   error:&err];
+		if (completionHandler)
+			completionHandler(state, nil, err); // reflection: see the error: variant above
+	});
 }
 
 // --- compute pipelines -------------------------------------------------------
@@ -617,11 +643,14 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                           completionHandler:
                               (MTLNewComputePipelineStateCompletionHandler)completionHandler
 {
-	NSError *err = nil;
-	id<MTLComputePipelineState> state = [self newComputePipelineStateWithFunction:computeFunction
-	                                                                       error:&err];
-	if (completionHandler)
-		completionHandler(state, err);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLComputePipelineState> state =
+		    [self newComputePipelineStateWithFunction:computeFunction error:&err];
+		if (completionHandler)
+			completionHandler(state, err);
+	});
 }
 
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)computeFunction
@@ -631,11 +660,14 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                   completionHandler
 {
 	(void)options;
-	NSError *err = nil;
-	id<MTLComputePipelineState> state = [self newComputePipelineStateWithFunction:computeFunction
-	                                                                       error:&err];
-	if (completionHandler)
-		completionHandler(state, nil, err);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLComputePipelineState> state =
+		    [self newComputePipelineStateWithFunction:computeFunction error:&err];
+		if (completionHandler)
+			completionHandler(state, nil, err);
+	});
 }
 
 - (id<MTLComputePipelineState>)
@@ -655,12 +687,16 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                 (MTLNewComputePipelineStateWithReflectionCompletionHandler)
                                     completionHandler
 {
-	NSError *err = nil;
-	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
-	                                                                  options:options
-	                                                                    error:&err];
-	if (completionHandler)
-		completionHandler(state, nil, err);
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
+		                                                                  options:options
+		                                                                    error:&err];
+		if (completionHandler)
+			completionHandler(state, nil, err);
+	});
 }
 
 // The descriptor's forms without options, which the MTLDevice protocol does not declare and
@@ -684,11 +720,16 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                             completionHandler:
                                 (MTLNewComputePipelineStateCompletionHandler)completionHandler
 {
-	NSError *err = nil;
-	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
-	                                                                  options:MTLPipelineOptionNone
-	                                                                    error:&err];
-	RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+	descriptor = [descriptor copy];
+	id handler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLComputePipelineState> state =
+		    [self rgfxComputePipelineForDescriptor:descriptor
+		                                   options:MTLPipelineOptionNone
+		                                     error:&err];
+		RgfxCallCreationHandler(handler, state, err, _cmd);
+	});
 }
 
 // The precompiled forms (measured: _MTLDevice's on macOS 27's x86-64 slice, `v48@0:8@16Q24@32@?40`
@@ -700,13 +741,17 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                        completionHandler:(id)completionHandler
 {
 	(void)pipelineCache;
-	NSError *err = nil;
-	id<MTLComputePipelineState> state = nil;
-	if ([descriptor isKindOfClass:[MTLComputePipelineDescriptor class]])
-		state = [self rgfxComputePipelineForDescriptor:descriptor options:options error:&err];
-	else
-		RGFX_UNSUPPORTED_ERROR(&err, "precompiled compute pipelines of another descriptor");
-	RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+	descriptor = RgfxCopyOf(descriptor);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLComputePipelineState> state = nil;
+		if ([descriptor isKindOfClass:[MTLComputePipelineDescriptor class]])
+			state = [self rgfxComputePipelineForDescriptor:descriptor options:options error:&err];
+		else
+			RGFX_UNSUPPORTED_ERROR(&err, "precompiled compute pipelines of another descriptor");
+		RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+	});
 }
 
 - (void)newPrecompiledRenderPipelineStateWithDescriptor:(id)descriptor
@@ -715,13 +760,17 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                       completionHandler:(id)completionHandler
 {
 	(void)pipelineCache;
-	NSError *err = nil;
-	id<MTLRenderPipelineState> state = nil;
-	if ([descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]])
-		state = [self rgfxRenderPipelineForDescriptor:descriptor options:options error:&err];
-	else
-		RGFX_UNSUPPORTED_ERROR(&err, "precompiled render pipelines of another descriptor");
-	RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+	descriptor = RgfxCopyOf(descriptor);
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLRenderPipelineState> state = nil;
+		if ([descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]])
+			state = [self rgfxRenderPipelineForDescriptor:descriptor options:options error:&err];
+		else
+			RGFX_UNSUPPORTED_ERROR(&err, "precompiled render pipelines of another descriptor");
+		RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+	});
 }
 
 // Core Image's pipeline of a link (measured: _MTLDevice's on macOS 27's x86-64 slice,
