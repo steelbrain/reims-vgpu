@@ -219,15 +219,6 @@ private:
 	UInt32 edidExtensionCount() const;
 	bool makeEdid(UInt32 index, UInt8 *block) const;
 
-	// Power: IOFramebuffer sets kIOPowerAttribute to one of the driver's three power
-	// states (off, doze, on); the driver tells IOFramebuffer as it leaves and reaches on.
-	static constexpr UInt32 kPowerStateOff = 0;
-	static constexpr UInt32 kPowerStateDoze = 1;
-	static constexpr UInt32 kPowerStateOn = 2;
-	static constexpr UInt32 kPowerStateCount = 3;
-	void initPower();
-	IOReturn setPower(UInt32 state);
-
 	static UInt32 refreshMhzOf(const IODetailedTimingInformationV2 &timing);
 	// The physical size of a mode's display, in millimetres, as the EDID gives it.
 	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
@@ -358,10 +349,6 @@ private:
 	bool vblankSent;
 	bool refreshWanted;
 	UInt64 refreshSeqno;
-
-	// IOFramebuffer's thread alone: the power state and whether it is registered.
-	bool powerRegistered;
-	UInt32 powerState;
 
 	bool ready;
 	// start's and stop's alone: whether start reset the device to take it. Only a device taken is
