@@ -7875,6 +7875,9 @@ void test_iosurface_cached()
 		bool answerCached = true;
 		uint32_t surfaceId = 0;
 		bool cacheable = false;
+		// The block the kext revives at the next ask, and the blocks let go.
+		uint64_t revive = 0;
+		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t size,
 		                                     uint32_t surfaceId, bool cacheable, uint64_t *offset,
 		                                     uint64_t *serial, bool *fresh, bool *cached)
@@ -7882,14 +7885,22 @@ void test_iosurface_cached()
 			Source *src = static_cast<Source *>(c);
 			src->surfaceId = surfaceId;
 			src->cacheable = cacheable;
-			*offset = src->next;
-			src->next += size;
+			if (src->revive) {
+				*offset = src->revive;
+				src->revive = 0;
+			} else {
+				*offset = src->next;
+				src->next += size;
+			}
 			*serial = 3;
 			*fresh = true;
 			*cached = src->answerCached;
 			return RgfxRegion::kPagesGiven;
 		}
-		static void release(void *, uint64_t) {}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
 	} &src = *new Source();
 	region.setSurfaceSource(nullptr, &Source::release, &src);
 	region.setSurfacePagesSource(&Source::pages, 16, &src);
@@ -7972,11 +7983,13 @@ void test_iosurface_cached()
 	CVPixelBufferRef bgra = pixelBuffer(kCVPixelFormatType_32BGRA);
 	CVPixelBufferRef yuv = pixelBuffer(kCVPixelFormatType_422YpCbCr8);
 	IOSurfaceRef surface = CVPixelBufferGetIOSurface(bgra);
+	uint64_t dormant = 0;
 	@autoreleasepool {
 		RgfxIOSurfaceTexture *t =
 		    overSurface(surface, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
 		CHECK(t != nil && src.surfaceId == IOSurfaceGetID(surface) && src.cacheable);
 		const uint64_t block = src.next - 0x1000;
+		dormant = block;
 		auto *header = reinterpret_cast<uint64_t *>(mem.data() + block);
 		header[2] = 7; // the kext's CPU generation, at kRgfxSurfaceCpuGenOffset
 		id<MTLTexture> view = [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
@@ -8078,6 +8091,33 @@ void test_iosurface_cached()
 		CHECK(IOSurfaceGetSeed(plain) == plainSeed);
 	}
 	drainRing(control);
+
+	// Its textures gone, the process lets the block go, and the kext keeps it dormant: the next
+	// texture over the surface is given the same block again, fresh and cached. Its writers start
+	// empty, its header's CPU generation is the kext's, untouched, and the next buffer names it.
+	auto letGo = [&] {
+		return std::count(src.released.begin(), src.released.end(), dormant);
+	};
+	CHECK(letGo() == 1);
+	auto *header = reinterpret_cast<uint64_t *>(mem.data() + dormant);
+	header[2] = 9;
+	mem[dormant + kSurfaceHeader] = 0xff;
+	src.revive = dormant;
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t =
+		    overSurface(surface, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+		CHECK(t != nil && src.revive == 0 && src.next - 0x1000 != dormant);
+		CHECK(mem[dormant + kSurfaceHeader] == 0 && header[2] == 9);
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		CHECK(is(uses(cb), dormant, 9, RGFX_SURFACE_USE_WRITES));
+	}
+	drainRing(control);
+	CHECK(letGo() == 2);
 	CVPixelBufferRelease(bgra);
 	CVPixelBufferRelease(yuv);
 }
