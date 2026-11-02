@@ -1018,10 +1018,11 @@ private:
 		return;
 	}
 	_shadow->uploadIfChanged();
-	std::lock_guard<std::mutex> g(_shadow->lock);
 	// A cached surface's GPU writes are in the host's device cache: a read lock has the kext
-	// bring them into the pages first.
+	// bring them into the pages first. Taken before the view's own lock, which a completion
+	// takes while the lock may wait for that completion's writes.
 	CachedLock cpu(*_shadow, kIOSurfaceLockReadOnly);
+	std::lock_guard<std::mutex> g(_shadow->lock);
 	const ShadowPlane &p = _shadow->planes[_plane];
 	uint64_t bpe = p.shape.bytesPerElement;
 	const uint8_t *rows = _shadow->pixels() + p.offset;
@@ -1056,11 +1057,11 @@ private:
 		return;
 	}
 	_shadow->uploadIfChanged();
-	std::lock_guard<std::mutex> g(_shadow->lock);
 	// A cached surface's GPU copy is the host's device cache: a read-write lock brings the
 	// GPU's writes into the pages, and has the next command buffer that uses the surface take
-	// the CPU's.
+	// the CPU's. Taken before the view's own lock, as in getBytes.
 	CachedLock cpu(*_shadow, 0);
+	std::lock_guard<std::mutex> g(_shadow->lock);
 	const ShadowPlane &p = _shadow->planes[_plane];
 	uint64_t bpe = p.shape.bytesPerElement;
 	uint8_t *rows = _shadow->pixels() + p.offset;
