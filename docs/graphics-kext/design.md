@@ -465,6 +465,69 @@ Stages:
     WindowServer composites with Metal through an IOSurface display pipe on
     IOGPU that the driver provides. Our accelerator does the same.
 
+16. **Hardware video is AppleGVA's vendor driver, in our bundle.** On an
+    x86-64 Mac, VideoToolbox's hardware decoders and encoders run in
+    VTDecoderXPCService and VTEncoderXPCService, one of each per client
+    process, through AppleGVA. AppleGVA reads the accelerator's
+    `IOVARendererID` and `IODVDBundleName`, loads
+    `/Library/GPUBundles/<name>.bundle/Contents/MacOS/<name>`, and calls its
+    `AVD_CreateAVDAccelerator` for the driver's identity, its capability block
+    and a table of sixteen entry points (sessions, bitstream and pixel buffer
+    pools, command scheduling and status, parameters). Both services allow
+    the bundle: their library validation is off, and their sandboxes read
+    `/Library/GPUBundles` and open IOAccelerator user clients. A video
+    plug-in of our own in `/Library/Video/Plug-Ins` is no way in: CoreMedia
+    lists only Apple-signed plug-ins.
+    - **Identity:** the accelerator's personality names the bundle,
+      `reims-graphics`, as the video driver, with `IOVARendererID` 0x1020004,
+      the AMD Navi family's, and `IOGVACodec`, which gates the H.264
+      decoder; the bundle exports the two entry points beside its Metal
+      device (`guest/bundle/src/RgfxVideoDriver.cpp`). AppleGVA drives an
+      AMD driver through high-level commands (picture parameters and slice
+      data; rate-control settings), which map onto Vulkan Video.
+    - **Routing:** AppleGVA hands a session to the AMD driver only on the
+      Macs without an Intel GPU, or where `com.apple.AppleGVA`'s
+      `gvaForceAMDKE` is set; elsewhere, an iMac20,1 among them, it looks for
+      an Intel GPU and gives up without one. RgfxGate's install thread keeps
+      the key set in `/Library/Preferences/com.apple.AppleGVA.plist` at every
+      boot, after the bundle step (`guest/rgfxgate/src/RgfxGatePrefs.cpp`): an
+      absent file gets a fresh XML plist, an XML plist gets the key with every
+      other byte kept, and a binary or unreadable one is left and logged.
+      AppleGVA reads it from the next service start (measured on the guest,
+      macOS 26.6.1).
+    - **Capabilities are the host's:** the block lists the engines and, per
+      codec and direction, a function record (its ID, sub-ID, input format
+      `rawb` for a bitstream or `NV12` for frames, and output formats), from
+      what the host's Vulkan Video answers (`RgfxVideoCaps` in the device
+      info). A codec the host lacks is not listed, so VideoToolbox falls back
+      to software, as on a Mac without it.
+    - **The wire:** a video session is an object of the device's
+      (`VIDEO_SESSION_CREATE`), with a command queue of the driver's; each
+      picture is a command buffer of that queue holding one video encoder,
+      whose op (`RGFX_OP_VIDEO_DECODE_H264`, the 0x4xxx group) names the
+      bitstream buffer and range, the SPS and PPS NAL units where they
+      changed, and textures over the output surface's two planes. The host
+      decodes on its Vulkan Video decode queue and has the command buffer wait
+      for the decode on the session's shared event, so the buffer completes,
+      and AppleGVA's token is answered done, once the picture is in the
+      surface. Encode is to take the same path.
+    - **Bitstreams:** AppleGVA asks for one bitstream buffer and writes the
+      next access unit into it as soon as a picture is scheduled, without
+      waiting for the decode that reads it. The driver copies each access
+      unit, from its first 3-byte start code and padded with zeros to the
+      host's `bitstream_alignment`, into the next of its session's eight
+      Shared buffers, which the host's decode reads in place. That copy of
+      the compressed data is the only one.
+    - **Pictures:** AppleGVA's commands name no references, and AppleGVA
+      reuses an output surface whatever the stream still references, so the
+      host keeps the decoded picture buffer in images of its own, from the
+      stream's slice headers. Where the device decodes only into its DPB
+      pictures (`DPB_AND_OUTPUT_COINCIDE`, as the RTX 5080's decoder), each
+      picture then takes one GPU copy from its DPB image into the output
+      surface's planes, on the decode queue. AppleGVA's surfaces lie in place
+      (§14, measured on the guest with the RTX 5080), so that copy writes the
+      surface's pages, and nothing else copies a frame.
+
 ## What metal2vulkan adds in stage 3
 
 - No-copy Managed buffers and heaps over our host blocks, whose VRAM copy
