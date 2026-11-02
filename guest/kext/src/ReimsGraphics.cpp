@@ -795,6 +795,7 @@ bool ReimsGraphics::start(IOService *provider)
 		return false;
 	nextSeqno = 1;
 	modeSet.reset();
+	taken = false;
 
 	pci->setMemoryEnable(true);
 	pci->setBusLeadEnable(true);
@@ -815,7 +816,8 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	// The wire's version names the region's layout and the messages (design.md, "The wire's
-	// version"): a kext of another version misreads them, so it leaves the device.
+	// version"): a kext of another version misreads them, so it leaves the device, writing
+	// nothing to it.
 	if (readRegister(RGFX_REG_VERSION) != RGFX_VERSION) {
 		IOLog("ReimsGraphics: the device speaks wire version %u, this kext version %u: not starting. "
 		      "The kext and the host must come from one build.\n",
@@ -874,7 +876,10 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 
 	// The device from scratch: reset, then take the rings' counters as
-	// they stand and say the driver is ready.
+	// they stand and say the driver is ready. Every refusal above leaves the
+	// device untouched; from here on it is ours, and it is reset again when
+	// the kext lets it go.
+	taken = true;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -1002,10 +1007,14 @@ void ReimsGraphics::quiesce()
 	}
 }
 
+// A start refused before it took the device leaves it unreset: a reset ends the firmware's scanout,
+// and the host's screen would keep the firmware's last frame under the boot framebuffer driver the
+// OS falls back to.
 void ReimsGraphics::teardown()
 {
-	if (registers)
+	if (registers && taken)
 		writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+	taken = false;
 	OSSafeReleaseNULL(msix);
 	OSSafeReleaseNULL(kick);
 	OSSafeReleaseNULL(workLoop);

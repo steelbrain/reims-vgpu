@@ -364,6 +364,9 @@ private:
 	UInt32 powerState;
 
 	bool ready;
+	// start's and stop's alone: whether start reset the device to take it. Only a device taken is
+	// reset when the kext lets it go; one refused before stays as the firmware left it.
+	bool taken;
 };
 
 #endif // REIMS_GRAPHICS_HPP_

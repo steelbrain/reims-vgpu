@@ -390,6 +390,13 @@ accept only the version they were built with. They read it right after
 leave the device and say why, naming both versions: the kext in the kernel
 log, the ROM on the firmware's console where it has one.
 
+Leaving the device means writing nothing to its registers or its region.
+The framebuffer's start resets the device (`STATUS` 0) only once every check
+that needs no command has passed, and resets it again on the way out only if
+it did so: a reset ends the scanout the firmware set up, and with the kext
+refused the OS drives the display through the firmware's framebuffer, which
+the host shows only while that scanout stands.
+
 Every change a guest built before it would misread moves `RGFX_VERSION` on by
 one, in the same commit:
 - a register's offset, width or meaning;
