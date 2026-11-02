@@ -269,6 +269,7 @@ first); a second dispatch copies them. Runs where any copied word is not 7, of 5
 | from an untracked heap, two compute encoders | 0 | 0 | 0 |
 | tracked, two command buffers, two queues, the second committed once the first's `commitAndWaitUntilSubmitted` returns | 0 | 0 | 0 |
 | untracked, the same | 0 | 0 | 5 |
+| tracked, two queues, the second committed right after the first's `commit` | 0 | 0 | 0 |
 
 On AMD a blit runs beside compute work: a tiny blit command buffer committed behind a 200 ms
 compute one ran at once (GPU time 0.38 to 0.39 ms after commit), though its completion was
@@ -314,9 +315,11 @@ times from the first commit (medians), on the 5300M, the 630 (both macOS 26.7.1)
 | `waitUntilScheduled` right after the return, idle queue | blocks 0.12 ms | 0.09 ms | 0.01 ms |
 | waiting on a shared event a second thread signals at 100 ms: the call returns | at the signal (107.1 ms) | the same (105.5 ms) | the same (106.0 ms) |
 | the same: status at the return | Committed 20 | Committed 20 | Committed 20 |
+| behind a buffer of its queue that waits on such an event: the call returns | at the signal (105.2 ms) | the same (109.5 ms) | the same (110.1 ms) |
+| the same: status at the return | Scheduled 18, Committed 2 | Scheduled 18, Committed 2 | Scheduled 20 |
 
-So the call returns once the buffer is submitted, which for a buffer waiting on an event is at the
-signal; whether the buffer is `Scheduled` by then, and its scheduled handlers have run, is a race
+So the call returns once the buffer is submitted, which for a buffer waiting on an event, or
+behind one on its queue, is at the signal; whether the buffer is `Scheduled` by then, and its scheduled handlers have run, is a race
 on all three, and an idle queue returns while it is still `Committed`.
 
 The M3 also runs a creator's handler after the creator returns, on the global default-QoS queue

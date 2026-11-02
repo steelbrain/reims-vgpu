@@ -9,8 +9,9 @@
 //             encoder, one concurrent encoder with and without a barrier, a blit after the
 //             kernel, a second command buffer, a buffer from an untracked heap, and a second
 //             command buffer on a second queue, tracked and untracked, committed once the first's
-//             commitAndWaitUntilSubmitted returns (else its commit). Prints the copied words
-//             that are not 7 (the copy ran before the write), over 5 runs each.
+//             commitAndWaitUntilSubmitted returns (else its commit), and tracked, committed
+//             right after the first's commit. Prints the copied words that are not 7 (the copy
+//             ran before the write), over 5 runs each.
 //   timing    a ~200 ms command buffer and a tiny one behind it: when each is scheduled and
 //             completed, from commit; waitUntilScheduled and commitAndWaitUntilSubmitted
 //             (where the buffer responds to it) of the tiny one; the handlers' threads and
@@ -19,12 +20,13 @@
 //             pipeline creators' handler threads; tiny buffers' commit-to-scheduled and
 //             commit-to-completed latency.
 //   submitted where the buffer responds to commitAndWaitUntilSubmitted, a tiny buffer's call,
-//             20 times each: behind a ~100 ms buffer on the same queue, on an idle queue, and
-//             for a buffer that first waits on an unsignalled shared event, which a second
-//             thread signals 100 ms after the call. For each: when the call returns (ms from
-//             the first commit), the buffer's status then (and the long buffer's), whether its
-//             scheduled handler had run by then, when that handler runs, and how long
-//             waitUntilScheduled blocks right after the call.
+//             20 times each: behind a ~100 ms buffer on the same queue, on an idle queue, for a
+//             buffer that first waits on an unsignalled shared event, which a second thread
+//             signals 100 ms after the call, and behind a buffer of its queue that waits on such
+//             an event. For each: when the call returns (ms from the first commit), the buffer's
+//             status then (and the long buffer's), whether its scheduled handler had run by
+//             then, when that handler runs, and how long waitUntilScheduled blocks right after
+//             the call.
 // Build: see README.md.
 #import "oracle_common.h"
 #include <dispatch/dispatch.h>
@@ -95,6 +97,7 @@ enum Order {
 	kHeap2Enc,
 	kTracked2Queue,
 	kUntracked2Queue,
+	kTracked2QueueAtCommit,
 	kOrderCount
 };
 
@@ -110,13 +113,14 @@ static const char *const kOrderName[] = {
     "from an untracked heap, two compute encoders, no fence",
     "tracked, two command buffers, two queues, the second committed once the first is submitted",
     "untracked, two command buffers, two queues, the second committed once the first is submitted",
+    "tracked, two command buffers, two queues, the second committed right after the first's commit",
 };
 
 static id<MTLCommandQueue> gQ2;
 
 static size_t run_order(enum Order o, id<MTLHeap> heap, double *gpu_ms)
 {
-	int tracked = o == kTracked2Enc || o == kTracked2Queue;
+	int tracked = o == kTracked2Enc || o == kTracked2Queue || o == kTracked2QueueAtCommit;
 	MTLResourceOptions opt = MTLResourceStorageModeShared |
 	                         (tracked ? MTLResourceHazardTrackingModeTracked
 	                                  : MTLResourceHazardTrackingModeUntracked);
@@ -181,7 +185,8 @@ static size_t run_order(enum Order o, id<MTLHeap> heap, double *gpu_ms)
 	}
 	case kUntracked2Cb:
 	case kTracked2Queue:
-	case kUntracked2Queue: {
+	case kUntracked2Queue:
+	case kTracked2QueueAtCommit: {
 		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
 		enc_slow(e, b, gIters);
 		[e endEncoding];
@@ -518,7 +523,7 @@ static void print_ms(const char *what, double *v, int n)
 enum { SUBMITTED_RUNS = 20 };
 
 // One run of each `submitted` scenario: 0 behind a long buffer, 1 on an idle queue, 2 waiting on
-// an unsignalled shared event. Times are ms from the first commit (the long buffer's, else the
+// an unsignalled shared event, 3 behind a buffer of its queue that waits on one. Times are ms from the first commit (the long buffer's, else the
 // call's).
 typedef struct {
 	double returned, scheduled_handler, wait_scheduled;
@@ -530,9 +535,14 @@ static Submitted submitted_run(int scenario, SEL caws, id<MTLBuffer> big, id<MTL
 {
 	Submitted r = {0};
 	id<MTLCommandBuffer> a = scenario == 0 ? long_cb(Q, big, iters) : nil;
-	id<MTLSharedEvent> ev = scenario == 2 ? [D newSharedEvent] : nil;
+	id<MTLSharedEvent> ev = scenario >= 2 ? [D newSharedEvent] : nil;
+	id<MTLCommandBuffer> h = nil;
+	if (scenario == 3) {
+		h = [Q commandBuffer];
+		[h encodeWaitForEvent:ev value:1];
+	}
 	id<MTLCommandBuffer> b = [Q commandBuffer];
-	if (ev)
+	if (scenario == 2)
 		[b encodeWaitForEvent:ev value:1];
 	id<MTLBlitCommandEncoder> e = [b blitCommandEncoder];
 	[e fillBuffer:small range:NSMakeRange(0, 256) value:1];
@@ -545,6 +555,8 @@ static Submitted submitted_run(int scenario, SEL caws, id<MTLBuffer> big, id<MTL
 		               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ ev.signaledValue = 1; });
 	if (a)
 		[a commit];
+	if (h)
+		[h commit];
 	((void (*)(id, SEL))objc_msgSend)((id)b, caws);
 	double t1 = oracle_now_ms();
 	r.status = b.status;
@@ -587,8 +599,9 @@ static void case_submitted(void)
 	    "1. behind a long buffer on the same queue",
 	    "2. on an idle queue",
 	    "3. waiting on a shared event a second thread signals at 100 ms",
+	    "4. behind a buffer of its queue that waits on a shared event a second thread signals at 100 ms",
 	};
-	for (int s = 0; s < 3; s++) {
+	for (int s = 0; s < 4; s++) {
 		printf("  %s, %d runs (ms from the first commit)\n", names[s], SUBMITTED_RUNS);
 		double ret[SUBMITTED_RUNS], sch[SUBMITTED_RUNS], wsch[SUBMITTED_RUNS];
 		int status[6] = {0}, long_status[6] = {0}, before = 0;
