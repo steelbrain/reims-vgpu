@@ -75,6 +75,9 @@ struct RgfxSurfaceEntry {
 	void *cache;
 	uint32_t surfaceId;
 	bool noCache;
+	// The block's GPU copy is the host's device cache (RGFX_SURFACE_PAGES_CACHED): its surface
+	// and cache were made with it (RgfxSurfaceCaches.hpp).
+	bool cached;
 };
 
 struct RgfxSurfaceTable {

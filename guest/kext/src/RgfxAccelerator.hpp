@@ -146,6 +146,11 @@ enum {
 	// uses the surface's own pages, which the kext wires and hands it (SURFACE_PAGES) before the
 	// first hold. The size out is that part's. kIOReturnUnsupported where the device lacks the
 	// feature or refused the pages: the process copies the surface instead.
+	// Six inputs, in place, add the surface's IOSurfaceID and whether the process may have its
+	// GPU copy kept in a device cache (1: one plane, no YCbCr): where the device has
+	// RGFX_FEATURE_SURFACE_CACHE, the block that ask makes is cached (RgfxSurfaceCaches.hpp), and
+	// its header holds the surface's CPU generation at kRgfxSurfaceCpuGenOffset. A fifth output,
+	// where asked, is 1 where the block is cached, else 0.
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
 	// once no process holds it, through its BLOCK_RELEASE.
@@ -167,15 +172,34 @@ enum {
 	kRgfxAccelMethodSurfaceRetire = 0x10d,
 };
 
+// Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext
+// writes at each read-write CPU lock (the bundle's RgfxSurfaceHeader::cpuGen, kept in step by
+// hand).
+constexpr UInt32 kRgfxSurfaceCpuGenOffset = 16;
+
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
+struct RgfxSurfaceEntry;
 class RgfxSurfaceUserClient;
 class ReimsGraphics;
 
 // A surface's shared block goes (RgfxAcceleratorContexts.cpp): its device cache's pending writes
 // go, waking the locks waiting on them, and its IOSurface is released (RgfxAcceleratorLocks.cpp).
-// Either may be null.
-void rgfxSurfaceLocksForget(void *cache, void *surface);
+// Either may be null. A cached block's surface stays cached until its BLOCK_RELEASE is answered
+// where `releasing` (rgfxSurfaceCacheReleased), its locks waiting for the answer; else it goes.
+void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
+// The surface of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID `surfaceId`, has its
+// block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page mapped at `header`,
+// which the kext keeps (and releases once the surface is cached no more) to write its CPU
+// generation at `genOffset`, 0 from here. False, `header` the caller's, where it cannot be.
+bool rgfxSurfaceCacheAdd(void *cache, UInt64 offset, uint32_t surfaceId, IOMemoryMap *header,
+                         UInt32 genOffset);
+// The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
+// cached no more, and its locks go on.
+void rgfxSurfaceCacheReleased(UInt64 offset);
+// The CPU generation of the cached surface of IOSurfaceID `surfaceId`, for a present of it;
+// false where it is not cached.
+bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen);
 // Makes the device cache of the surface of ID `surfaceId` that `task` may see, whose memory holds
 // the physical byte `phys` (a shared block's first), with the kext's control function: its
 // IOSurface (retained) and its cache, or false. Under the contexts' lock.
@@ -264,15 +288,22 @@ public:
 	// answered (`closed`) or not; pinRange pins a span of one the client holds. Each holder has
 	// the block mapped in its window from its first ask until its hold ends, which takes it
 	// back before the block can go to anyone else.
+	// A block in place made for an ask with `surfaceId` and `cacheable` is cached where the
+	// device has RGFX_FEATURE_SURFACE_CACHE (kRgfxAccelMethodSurfaceBlock).
 	struct SurfaceBlock {
 		UInt64 offset;
 		UInt64 size;
 		UInt64 serial;
 		bool fresh;
+		bool cached;
 	};
 	IOReturn acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
 	                             UInt64 address, UInt64 length, UInt64 size, bool inPlace,
-	                             SurfaceBlock *block);
+	                             uint32_t surfaceId, bool cacheable, SurfaceBlock *block);
+	// A CPU lock of the cached surface whose block is at `offset` follows a GPU write: the host
+	// copies its device cache into its pages (SURFACE_DOWNLOAD). True once answered OK, waiting
+	// up to `timeoutMs` (RgfxAcceleratorContexts.cpp).
+	bool downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs);
 	IOReturn releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset);
 	void dropSurfaceBlocks(const void *client, bool closed);
 	// The processes' object lifecycle, on the framebuffer's control ring
@@ -374,9 +405,14 @@ private:
 	bool watchBundle();
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
-	// `offset`, and posted for context `context`; true where the device answered OK.
+	// `offset`, and posted for context `context`, its block cached where `cached`; true where
+	// the device answered OK.
 	bool postSurfacePages(UInt32 context, UInt64 offset, UInt64 total, UInt64 size,
-	                      UInt64 length, const RgfxPageRun *runs, UInt32 count);
+	                      UInt64 length, const RgfxPageRun *runs, UInt32 count, bool cached);
+	// Makes the device cache of the surface of IOSurfaceID `surfaceId` in `task` for the fresh
+	// block in place of entry `e` at `offset`, still pending, and records the block cached
+	// (rgfxSurfaceCacheAdd): false, nothing made, where it cannot be.
+	bool cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId, UInt64 offset);
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;

@@ -23,12 +23,20 @@
  * or a process that locks a surface its own later buffer writes from the thread that would
  * retire it) holds no lock for good.
  *
+ * A surface whose block has a device cache on the host (RgfxSurfaceCaches.hpp) has its cache made
+ * with the block, and the control function does more at op 2, once no write is pending: where
+ * the GPU wrote the surface since the pages last took the cache, it asks the host to copy the
+ * cache into the pages (SURFACE_DOWNLOAD) and waits for the answer; a read-write lock then moves
+ * the surface's CPU generation, which the kext writes into the block's header; and a lock waits
+ * for the answer to the block's BLOCK_RELEASE, which copies the cache into the pages a last time.
+ *
  * Our own code; it names SDK-public IOKit calls and IOSurface's interface (RgfxIOSurfaceKPI.hpp).
  */
 
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
+#include "RgfxSurfaceCaches.hpp"
 #include "RgfxSurfaceLocks.hpp"
 
 #include <IOKit/IOLib.h>
@@ -46,6 +54,11 @@ constexpr UInt32 kWaitMs = 2000;
 constexpr UInt32 kPollUs = 1000;
 // The most queues one surface's lock looks at the completions of.
 constexpr UInt32 kMaxLookedAt = 16;
+// The most cached surfaces at once (every shared block in place may be one), and how long a
+// lock waits for a download's answer: the host copies once the buffers that used the cache
+// before have finished.
+constexpr UInt32 kMaxCached = 1024;
+constexpr UInt32 kDownloadAnswerMs = 2000;
 // How many device caches made are logged, with what IOSurface answered, and how many writes
 // named of surfaces the kext cannot follow.
 constexpr UInt32 kCachesLogged = 4;
@@ -67,9 +80,12 @@ struct LockState {
 	uint32_t waitMs;
 	// Writes named of surfaces the kext cannot follow, logged up to kSkipsLogged.
 	uint32_t skipsLogged;
+	// Under `lock`: the surfaces whose blocks have a device cache on the host. The waiting locks
+	// sleep on `table` for these too.
+	RgfxCacheTable caches;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}};
 
 bool startLocks()
 {
@@ -78,13 +94,17 @@ bool startLocks()
 	IOLock *lock = IOLockAlloc();
 	auto *uses = static_cast<RgfxLockUse *>(IOMalloc(sizeof(RgfxLockUse) * kMaxUses));
 	auto *queues = static_cast<RgfxLockQueue *>(IOMalloc(sizeof(RgfxLockQueue) * kMaxQueues));
+	auto *cached =
+	    static_cast<RgfxCachedSurface *>(IOMalloc(sizeof(RgfxCachedSurface) * kMaxCached));
 	RgfxLockUse *expected = nullptr;
-	if (lock && uses && queues &&
+	if (lock && uses && queues && cached &&
 	    __atomic_compare_exchange_n(&state.table.uses, &expected, uses, false, __ATOMIC_ACQ_REL,
 	                                __ATOMIC_ACQUIRE)) {
 		bzero(uses, sizeof(RgfxLockUse) * kMaxUses);
 		bzero(queues, sizeof(RgfxLockQueue) * kMaxQueues);
+		bzero(cached, sizeof(RgfxCachedSurface) * kMaxCached);
 		state.table.queues = queues;
+		state.caches.entries = cached;
 		__atomic_store_n(&state.lock, lock, __ATOMIC_RELEASE);
 		return true;
 	}
@@ -94,6 +114,8 @@ bool startLocks()
 		IOFree(uses, sizeof(RgfxLockUse) * kMaxUses);
 	if (queues)
 		IOFree(queues, sizeof(RgfxLockQueue) * kMaxQueues);
+	if (cached)
+		IOFree(cached, sizeof(RgfxCachedSurface) * kMaxCached);
 	// Another namer is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		IOSleep(1);
@@ -118,6 +140,8 @@ bool surfaceHolds(OSObject *surface, UInt64 phys)
 	md->complete(kIODirectionOutIn);
 	return found;
 }
+
+void wakeLocked();
 
 // The control function every device cache the kext makes calls (RgfxIOSurfaceKPI.hpp), from
 // inside a CPU lock of its surface: op 2 waits while a write of the surface is pending.
@@ -159,13 +183,50 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 		IOLockSleepDeadline(state.lock, &state.table, tick < deadline ? tick : deadline,
 		                    THREAD_UNINT);
 	}
+	// A cached surface: the pages take what the GPU wrote, one lock asking at a time, and a
+	// read-write lock moves its CPU generation.
+	const char *waitedFor = gaveUp ? "the GPU's writes to it pending" : nullptr;
+	if (const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
+		if (!surfaceId)
+			surfaceId = c->surfaceId;
+	}
+	while (!gaveUp) {
+		uint64_t offset = 0, mark = 0;
+		RgfxCacheStep step = rgfxCacheNext(state.caches, key, &offset, &mark);
+		if (step == kRgfxCacheGoOn)
+			break;
+		if (step == kRgfxCacheDownload) {
+			IOLockUnlock(state.lock);
+			bool ok = accel->downloadSurfaceCache(offset, kDownloadAnswerMs);
+			IOLockLock(state.lock);
+			rgfxCacheDownloaded(state.caches, key, mark, ok);
+			wakeLocked();
+			if (!ok) {
+				waitedFor = "its device cache not copied into its pages";
+				break;
+			}
+			continue;
+		}
+		if (mach_absolute_time() >= deadline) {
+			gaveUp = true;
+			waitedFor = "its device cache's copy or its block's release unanswered";
+			break;
+		}
+		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+	}
+	if (a == 0) {
+		if (RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
+			const uint64_t gen = rgfxCacheReadWriteLock(state.caches, key);
+			if (c->genAt)
+				__atomic_store_n(c->genAt, gen, __ATOMIC_RELEASE);
+		}
+	}
 	IOLockUnlock(state.lock);
-	if (gaveUp) {
+	if (waitedFor) {
 		char name[64] = {};
 		proc_selfname(name, sizeof(name));
-		IOLog("RGFX: WARN: a CPU lock of IOSurface %u by %s[%d] goes on after %u ms with the "
-		      "GPU's writes to it pending\n",
-		      surfaceId, name, proc_selfpid(), state.waitMs);
+		IOLog("RGFX: WARN: a CPU lock of IOSurface %u by %s[%d] goes on after %u ms with %s\n",
+		      surfaceId, name, proc_selfpid(), state.waitMs, waitedFor);
 	}
 }
 
@@ -224,16 +285,79 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 	return true;
 }
 
-void rgfxSurfaceLocksForget(void *cache, void *surface)
+void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing)
 {
+	void *map = nullptr;
 	if (cache && __atomic_load_n(&state.lock, __ATOMIC_ACQUIRE)) {
 		IOLockLock(state.lock);
-		if (rgfxLockForgetKey(state.table, reinterpret_cast<uintptr_t>(cache)))
+		const uint64_t key = reinterpret_cast<uintptr_t>(cache);
+		bool wake = rgfxLockForgetKey(state.table, key);
+		// A cached surface's locks wait for its block's release, or it is cached no more.
+		if (RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
+			if (releasing)
+				c->releasing = true;
+			else
+				rgfxCacheRemove(state.caches, c, &map);
+			wake = true;
+		}
+		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);
 	}
+	if (map)
+		static_cast<IOMemoryMap *>(map)->release();
 	if (surface)
 		static_cast<OSObject *>(surface)->release();
+}
+
+bool rgfxSurfaceCacheAdd(void *cache, UInt64 offset, uint32_t surfaceId, IOMemoryMap *header,
+                         UInt32 genOffset)
+{
+	if (!cache || !header || !startLocks())
+		return false;
+	auto *genAt = reinterpret_cast<volatile uint64_t *>(header->getVirtualAddress() + genOffset);
+	__atomic_store_n(genAt, 0, __ATOMIC_RELEASE);
+	IOLockLock(state.lock);
+	RgfxCachedSurface *c =
+	    rgfxCacheAdd(state.caches, reinterpret_cast<uintptr_t>(cache), offset, surfaceId);
+	if (c) {
+		c->genAt = genAt;
+		c->map = header;
+	}
+	IOLockUnlock(state.lock);
+	if (!c)
+		IOLog("RgfxAccelerator: IOSurface %u: no room for its device cache's state: it is not "
+		      "cached\n",
+		      surfaceId);
+	return c != nullptr;
+}
+
+void rgfxSurfaceCacheReleased(UInt64 offset)
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	void *map = nullptr;
+	IOLockLock(state.lock);
+	// One cached surface at most has the block: its offset is reused only past this release.
+	if (RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset); c && c->releasing) {
+		rgfxCacheRemove(state.caches, c, &map);
+		wakeLocked();
+	}
+	IOLockUnlock(state.lock);
+	if (map)
+		static_cast<IOMemoryMap *>(map)->release();
+}
+
+bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen)
+{
+	if (!surfaceId || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return false;
+	IOLockLock(state.lock);
+	const RgfxCachedSurface *c = rgfxCacheOfSurface(state.caches, surfaceId);
+	if (c)
+		*gen = c->cpuGen;
+	IOLockUnlock(state.lock);
+	return c != nullptr;
 }
 
 void rgfxSurfaceLocksWake()
@@ -286,6 +410,8 @@ void RgfxAccelerator::noteSurfaceWrites(RgfxAcceleratorUserClient *client, task_
 		IOLockLock(state.lock);
 		bool kept = rgfxLockNote(state.table, reinterpret_cast<uintptr_t>(cache), queue, seqno,
 		                         static_cast<uint32_t>(id), inPlace);
+		// A cached surface's pages take the write at the next lock.
+		rgfxCacheNoteWrite(state.caches, reinterpret_cast<uintptr_t>(cache));
 		bool first = !kept && state.dropped++ == 0;
 		IOLockUnlock(state.lock);
 		if (first)

@@ -179,18 +179,27 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return kIOReturnSuccess;
 	}
 	case kRgfxAccelMethodSurfaceBlock: {
-		// Three inputs ask for a copy block; a fourth of 1, for one in place.
-		if (a->scalarInputCount < 3 || a->scalarInputCount > 4 || a->scalarOutputCount != 4)
+		// Three inputs ask for a copy block; a fourth of 1, for one in place; a fifth and a
+		// sixth name the surface and whether it may be cached. A fifth output says whether it
+		// is.
+		const UInt32 inputs = a->scalarInputCount;
+		if ((inputs < 3 || inputs > 6 || inputs == 5) ||
+		    (a->scalarOutputCount != 4 && a->scalarOutputCount != 5))
 			return kIOReturnBadArgument;
-		bool inPlace = a->scalarInputCount == 4 && in[3] != 0;
-		if (a->scalarInputCount == 4 && in[3] > 1)
+		bool inPlace = inputs >= 4 && in[3] != 0;
+		if (inputs >= 4 && in[3] > 1)
 			return kIOReturnBadArgument;
+		if (inputs == 6 && (in[4] > UINT32_MAX || in[5] > 1))
+			return kIOReturnBadArgument;
+		const uint32_t surfaceId = inputs == 6 ? static_cast<uint32_t>(in[4]) : 0;
+		const bool cacheable = inputs == 6 && in[5] != 0;
 		// Under the queue lock, so no hold is made for a context releaseContext has closed:
 		// every hold of the client's goes in its dropSurfaceBlocks.
 		IOLockLock(queueLock);
 		RgfxAccelerator::SurfaceBlock block = {};
 		IOReturn r = hasContext ? owner->acquireSurfaceBlock(this, context, task, in[0], in[1],
-		                                                     in[2], inPlace, &block)
+		                                                     in[2], inPlace, surfaceId,
+		                                                     cacheable, &block)
 		                        : kIOReturnBadArgument;
 		IOLockUnlock(queueLock);
 		if (r != kIOReturnSuccess)
@@ -199,6 +208,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		out[1] = block.size;
 		out[2] = block.serial;
 		out[3] = block.fresh ? 1 : 0;
+		if (a->scalarOutputCount == 5)
+			out[4] = block.cached ? 1 : 0;
 		return kIOReturnSuccess;
 	}
 	case kRgfxAccelMethodSurfaceBlockRelease:

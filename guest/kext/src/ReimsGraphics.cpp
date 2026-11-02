@@ -1918,11 +1918,19 @@ IOReturn ReimsGraphics::setInterruptState(void *interruptRef, UInt32 state)
 
 IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno)
 {
-	RgfxPresentSurface p = {};
-	p.display = displayId;
-	p.iosurface_id = surfaceId;
-	p.transaction_id = transactionId;
-	IOReturn r = post(RGFX_CMD_PRESENT_SURFACE, &p, sizeof(p), seqno);
+	// A surface whose GPU copy is the host's device cache carries its CPU generation, so the
+	// display shows what the CPU wrote under its read-write locks too.
+	struct {
+		RgfxPresentSurface present;
+		RgfxPresentSurfaceGen gen;
+	} p = {};
+	static_assert(sizeof(RgfxPresentSurface) == RGFX_PRESENT_SURFACE_GEN_OFFSET,
+	              "the generation follows the present");
+	p.present.display = displayId;
+	p.present.iosurface_id = surfaceId;
+	p.present.transaction_id = transactionId;
+	const bool cached = rgfxSurfaceCacheGeneration(surfaceId, &p.gen.cpu_gen);
+	IOReturn r = post(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno);
 	if (r == kIOReturnSuccess) {
 		IOSimpleLockLock(interruptLock);
 		pipes.shows(surfaceId);
