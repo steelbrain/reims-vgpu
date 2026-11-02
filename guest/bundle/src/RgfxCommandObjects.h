@@ -105,6 +105,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// one: such a buffer then completes with an out-of-memory error.
 @property(nonatomic, nullable) RgfxRegion *region;
 
+/// Whether a command buffer of it that commitAndWaitUntilSubmitted commits asks the host for its
+/// submission (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then
+/// returns at the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
+@property(nonatomic) BOOL asksSubmitted;
+
 /// The most command buffers of this queue alive and not completed at once:
 /// `maxCommandBufferCount`, 64 where the queue was made with 0, as Metal's default.
 /// -commandBuffer blocks while that many are, as Metal's does, where the queue has a reader

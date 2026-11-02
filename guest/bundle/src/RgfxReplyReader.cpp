@@ -64,6 +64,12 @@ void RgfxReplyReader::expectScheduled(uint64_t seqno, ScheduledHandler handler)
 	m_scheduled[seqno] = std::move(handler);
 }
 
+void RgfxReplyReader::expectSubmitted(uint64_t seqno, SubmittedHandler handler)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_submitted[seqno] = std::move(handler);
+}
+
 RgfxReplyReader::RgfxReplyReader()
     : m_header(nullptr), m_data(nullptr), m_dataSize(0), m_mask(0), m_consumed(0), m_nextToken(1)
 {
@@ -189,6 +195,12 @@ bool RgfxReplyReader::awaitingScheduled(uint64_t seqno)
 	return m_scheduled.find(seqno) != m_scheduled.end();
 }
 
+bool RgfxReplyReader::awaitingSubmitted(uint64_t seqno)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	return m_submitted.find(seqno) != m_submitted.end();
+}
+
 bool RgfxReplyReader::awaitingReflection(uint64_t seqno)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
@@ -232,10 +244,25 @@ uint32_t RgfxReplyReader::pump()
 			}
 
 			switch (type) {
+			case RGFX_EVT_CB_SUBMITTED: {
+				RgfxCbSubmitted msg = {};
+				if (size >= sizeof(msg)) {
+					readBytes(m_data, offset, &msg, sizeof(msg));
+					auto it = m_submitted.find(msg.header.seqno);
+					if (it != m_submitted.end()) {
+						SubmittedHandler handler = std::move(it->second);
+						m_submitted.erase(it);
+						calls.emplace_back([handler, msg]() { handler(msg); });
+					}
+				}
+				break;
+			}
 			case RGFX_EVT_CB_SCHEDULED: {
 				RgfxCbScheduled msg = {};
 				if (size >= sizeof(msg)) {
 					readBytes(m_data, offset, &msg, sizeof(msg));
+					// The scheduling stands for a CB_SUBMITTED the host did not post.
+					m_submitted.erase(msg.header.seqno);
 					auto it = m_scheduled.find(msg.header.seqno);
 					if (it != m_scheduled.end()) {
 						ScheduledHandler handler = std::move(it->second);
@@ -249,7 +276,9 @@ uint32_t RgfxReplyReader::pump()
 				RgfxCbComplete msg = {};
 				if (size >= sizeof(msg)) {
 					readBytes(m_data, offset, &msg, sizeof(msg));
-					// The completion stands for a CB_SCHEDULED the host did not post.
+					// The completion stands for a CB_SUBMITTED and a CB_SCHEDULED the host
+					// did not post.
+					m_submitted.erase(msg.header.seqno);
 					m_scheduled.erase(msg.header.seqno);
 					auto it = m_completions.find(msg.header.seqno);
 					if (it != m_completions.end()) {

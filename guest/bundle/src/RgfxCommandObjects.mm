@@ -809,6 +809,7 @@ struct RgfxBarrierSlot {
 @interface RgfxCmdBuffer ()
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg;
 - (void)rgfxReachScheduled;
+- (void)rgfxReachSubmitted;
 - (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached;
 @end
 
@@ -869,6 +870,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	RgfxEncoder *_encoder; // owned: built incrementally, posted on commit
 	BOOL _retained;
 	BOOL _committed;
+	// Committed by commitAndWaitUntilSubmitted, so it asks for its submission where the host
+	// answers it.
+	BOOL _waitsSubmitted;
 	BOOL _enqueued;
 	uint64_t _seqno;
 	// Written by the thread that delivers the completion, read by any: atomic.
@@ -902,12 +906,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	std::atomic<bool> _left;
 	// Entered at commit with a reader, as `_done` is: `_submitted` is left once the buffer is
 	// submitted, `_scheduled` once its scheduled handlers have run, which is what
-	// commitAndWaitUntilSubmitted and waitUntilScheduled wait on. The buffer is submitted and
-	// scheduled at its CB_SCHEDULED, or at its completion where none came first
-	// (rgfxReachScheduled). `_scheduledReached` says it got there; each `_*Left` that its group
+	// commitAndWaitUntilSubmitted and waitUntilScheduled wait on. The buffer is submitted at its
+	// CB_SUBMITTED where it asked for one (rgfxReachSubmitted), and submitted and scheduled at
+	// its CB_SCHEDULED, or at its completion where none came first (rgfxReachScheduled).
+	// `_submittedReached` and `_scheduledReached` say it got there; each `_*Left` that its group
 	// was left, so one never left is left at dealloc.
 	dispatch_group_t _submitted;
 	dispatch_group_t _scheduled;
+	std::atomic<bool> _submittedReached;
 	std::atomic<bool> _scheduledReached;
 	std::atomic<bool> _scheduledRan;
 	std::atomic<bool> _submittedLeft;
@@ -1148,7 +1154,19 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		dispatch_group_enter(_scheduled);
 		RgfxCmdBuffer *strongSelf = self;
 		RgfxReplyReader *reader = _reader;
-		expect = [reader, strongSelf](uint64_t seqno) {
+		// One commitAndWaitUntilSubmitted commits asks for its submission where the host
+		// answers it: the call then returns at the host's commit of it, or at the signal it or
+		// a buffer before it on its queue waits for, as Metal's does, not at its scheduling.
+		// Nothing else waits for a submission, so no other buffer asks.
+		const bool asks = _waitsSubmitted && queue.asksSubmitted;
+		if (asks)
+			_encoder->appendSubmitted();
+		expect = [reader, strongSelf, asks](uint64_t seqno) {
+			if (asks) {
+				reader->expectSubmitted(seqno, [strongSelf](const RgfxCbSubmitted &) {
+					[strongSelf rgfxReachSubmitted];
+				});
+			}
 			reader->expectScheduled(seqno, [strongSelf](const RgfxCbScheduled &) {
 				@autoreleasepool {
 					[strongSelf rgfxReachScheduled];
@@ -1341,8 +1359,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 {
 	if (_scheduledReached.exchange(true))
 		return;
-	if (_submitted != nil && !_submittedLeft.exchange(true))
-		dispatch_group_leave(_submitted);
+	[self rgfxReachSubmitted];
 	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
 	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
 	t_delivering++;
@@ -1354,6 +1371,17 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	_scheduledRan.store(true);
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
 		dispatch_group_leave(_scheduled);
+}
+
+// The buffer is submitted (its CB_SUBMITTED, or its scheduling where none came first), once:
+// commitAndWaitUntilSubmitted returns. Its status stays Committed until it is scheduled, as
+// Metal's may at that return (measured on the M3 Max, an AMD 5300M and an Intel 630,
+// docs/graphics-kext/dgpu-oracle.md, Q7).
+- (void)rgfxReachSubmitted
+{
+	_submittedReached.store(true);
+	if (_submitted != nil && !_submittedLeft.exchange(true))
+		dispatch_group_leave(_submitted);
 }
 
 // The GPU's times, in the guest's host time. The device's clock is the host's, not the
@@ -1398,13 +1426,16 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 }
 
 // The command-buffer SPI SkyLight's compositor and VideoToolbox call: commits, then waits until
-// the buffer is submitted (its CB_SCHEDULED, rgfxReachScheduled), not until it runs, as Metal's
-// does; YES unless it failed by then. A CPU lock of a surface the buffer writes, in any process,
-// waits for the GPU's writes from the commit on (the kext's surface locks, RgfxIOSurface.h).
+// the buffer is submitted (its CB_SUBMITTED where it asked for one, else its CB_SCHEDULED,
+// rgfxReachSubmitted), not until it runs, as Metal's does; YES unless it failed by then. A CPU
+// lock of a surface the buffer writes, in any process, waits for the GPU's writes from the
+// commit on (the kext's surface locks, RgfxIOSurface.h).
 - (BOOL)commitAndWaitUntilSubmitted
 {
+	if (!_committed)
+		_waitsSubmitted = YES;
 	[self commit];
-	[self rgfxWaitFor:_submitted reached:&_scheduledReached];
+	[self rgfxWaitFor:_submitted reached:&_submittedReached];
 	return self.status != MTLCommandBufferStatusError;
 }
 

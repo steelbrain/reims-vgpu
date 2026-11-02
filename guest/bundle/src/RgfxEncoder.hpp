@@ -424,6 +424,10 @@ public:
 	}
 	/// The uses recorded so far, which the caller now holds.
 	std::vector<std::shared_ptr<void>> takeSurfaceUses() { return std::move(m_surfaceUses); }
+	/// Asks the host for the buffer's submission (`RGFX_OP_SUBMITTED`, where the device has
+	/// RGFX_FEATURE_CB_SUBMITTED): it posts RGFX_EVT_CB_SUBMITTED ahead of the buffer's other
+	/// records.
+	void appendSubmitted() { appendOp(RGFX_OP_SUBMITTED); }
 	/// Puts the `count` `RGFX_OP_SURFACE_USE` ops of bodies `uses` at the op stream's start,
 	/// before its first encoder, where the host reads them before the buffer's work.
 	void prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count);

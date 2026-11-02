@@ -3870,6 +3870,33 @@ RgfxCbComplete cbComplete(uint64_t seqno, uint64_t cbObjId)
 	return done;
 }
 
+RgfxCbSubmitted cbSubmitted(uint64_t seqno, uint64_t cbObjId)
+{
+	RgfxCbSubmitted submitted = {};
+	submitted.header.type = RGFX_EVT_CB_SUBMITTED;
+	submitted.header.size = sizeof(submitted);
+	submitted.header.seqno = seqno;
+	submitted.cb_obj_id = cbObjId;
+	return submitted;
+}
+
+// How many RGFX_OP_SUBMITTED ops the command buffer message `bytes` holds.
+int submittedOps(const std::vector<uint8_t> &bytes)
+{
+	int n = 0;
+	size_t at = RGFX_COMMAND_BUFFER_OPS_OFFSET;
+	while (at + sizeof(RgfxOpHeader) <= bytes.size()) {
+		RgfxOpHeader op = {};
+		std::memcpy(&op, bytes.data() + at, sizeof(op));
+		if (op.len < RGFX_OP_BODY_OFFSET || at + op.len > bytes.size())
+			return -1;
+		if (op.tag == RGFX_OP_SUBMITTED)
+			n += op.len == RGFX_OP_BODY_OFFSET ? 1 : 100;
+		at += op.len;
+	}
+	return n;
+}
+
 RgfxCbScheduled cbScheduled(uint64_t seqno, uint64_t cbObjId)
 {
 	RgfxCbScheduled scheduled = {};
@@ -4254,6 +4281,132 @@ void test_scheduled_before_completion()
 	CHECK(scheduledRuns == 1);
 	kext->close();
 	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// The host's side of a commitAndWaitUntilSubmitted: takes the buffer's message off `ring`,
+// counts its RGFX_OP_SUBMITTED ops into `asked`, and after 30 ms posts `type`'s record for it
+// (CB_SUBMITTED or CB_SCHEDULED) on `completion`. `seqno` gets the buffer's seqno.
+std::thread hostAnswers(TestRing *ring, TestRing *completion, FakeKext *kext, uint64_t cbObjId,
+                        uint32_t type, std::atomic<uint64_t> *seqno, std::atomic<int> *asked)
+{
+	return std::thread([=] {
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		for (int i = 0; i < 5000 && !ring->next(&h, &bytes); i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		seqno->store(h.seqno);
+		asked->store(submittedOps(bytes));
+		std::this_thread::sleep_for(std::chrono::milliseconds(30));
+		if (type == RGFX_EVT_CB_SUBMITTED) {
+			RgfxCbSubmitted submitted = cbSubmitted(h.seqno, cbObjId);
+			hostPost(*completion, *kext, &submitted, sizeof(submitted));
+		} else {
+			RgfxCbScheduled scheduled = cbScheduled(h.seqno, cbObjId);
+			hostPost(*completion, *kext, &scheduled, sizeof(scheduled));
+		}
+	});
+}
+
+// A queue whose device answers CB_SUBMITTED: a buffer commitAndWaitUntilSubmitted commits asks
+// for its submission once, and the call returns at its CB_SUBMITTED, the buffer still Committed
+// and its scheduled handlers not run, which its CB_SCHEDULED then runs. A buffer committed
+// otherwise asks nothing. One the host posts no CB_SUBMITTED for is submitted at its
+// CB_SCHEDULED, which drops the reader's registration. A queue whose device does not answer it
+// asks nothing.
+void test_submitted_before_scheduled()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	f.queue.asksSubmitted = YES;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+
+	std::atomic<int> scheduledRuns{0};
+	std::atomic<int> *runs = &scheduledRuns;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb addScheduledHandler:^(id<MTLCommandBuffer> b) {
+		(void)b;
+		runs->fetch_add(1);
+	}];
+	uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+	std::atomic<uint64_t> taken{0};
+	std::atomic<int> asked{-1};
+	std::thread host =
+	    hostAnswers(&f.submit, &f.completion, kext, cbObjId, RGFX_EVT_CB_SUBMITTED, &taken, &asked);
+	auto start = std::chrono::steady_clock::now();
+	CHECK([(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted]);
+	CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(25));
+	host.join();
+	uint64_t seqno = taken.load();
+	CHECK(seqno != 0);
+	CHECK(asked.load() == 1);
+	CHECK(cb.status == MTLCommandBufferStatusCommitted);
+	CHECK(scheduledRuns.load() == 0);
+	CHECK(![f.queue sharedReplyReader]->awaitingSubmitted(seqno));
+	CHECK([f.queue sharedReplyReader]->awaitingScheduled(seqno));
+	RgfxCbScheduled scheduled = cbScheduled(seqno, cbObjId);
+	hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+	[cb waitUntilScheduled];
+	CHECK(cb.status == MTLCommandBufferStatusScheduled);
+	CHECK(scheduledRuns.load() == 1);
+	RgfxCbComplete done = cbComplete(seqno, cbObjId);
+	hostPost(f.completion, *kext, &done, sizeof(done));
+	[cb waitUntilCompleted];
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+
+	// A plain commit asks nothing, though the device answers it.
+	id<MTLCommandBuffer> plain = [f.queue commandBuffer];
+	[plain commit];
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(f.submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+	CHECK(submittedOps(bytes) == 0);
+	CHECK(![f.queue sharedReplyReader]->awaitingSubmitted(h.seqno));
+	RgfxCbComplete plainDone = cbComplete(h.seqno, ((RgfxResource *)plain).rgfxObjId);
+	hostPost(f.completion, *kext, &plainDone, sizeof(plainDone));
+	[plain waitUntilCompleted];
+
+	// No CB_SUBMITTED: the scheduling stands for it.
+	id<MTLCommandBuffer> second = [f.queue commandBuffer];
+	uint64_t secondId = ((RgfxResource *)second).rgfxObjId;
+	asked.store(-1);
+	host = hostAnswers(&f.submit, &f.completion, kext, secondId, RGFX_EVT_CB_SCHEDULED, &taken,
+	                   &asked);
+	CHECK([(id<MTLCommandBufferSPI>)second commitAndWaitUntilSubmitted]);
+	host.join();
+	uint64_t s2 = taken.load();
+	CHECK(asked.load() == 1);
+	CHECK(second.status == MTLCommandBufferStatusScheduled);
+	CHECK(![f.queue sharedReplyReader]->awaitingSubmitted(s2));
+	RgfxCbComplete d2 = cbComplete(s2, secondId);
+	hostPost(f.completion, *kext, &d2, sizeof(d2));
+	[second waitUntilCompleted];
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+
+	// A queue whose device does not answer it: the call returns at the CB_SCHEDULED, the ring
+	// taken by the waiting thread itself.
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext kext;
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+	std::atomic<uint64_t> taken{0};
+	std::atomic<int> asked{-1};
+	std::thread host =
+	    hostAnswers(&f.submit, &f.completion, &kext, cbObjId, RGFX_EVT_CB_SCHEDULED, &taken, &asked);
+	CHECK([(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted]);
+	host.join();
+	CHECK(asked.load() == 0);
+	CHECK(cb.status == MTLCommandBufferStatusScheduled);
+	CHECK(![f.queue sharedReplyReader]->awaitingSubmitted(taken.load()));
+	RgfxCbComplete done = cbComplete(taken.load(), cbObjId);
+	hostPost(f.completion, kext, &done, sizeof(done));
+	[cb waitUntilCompleted];
 	}
 }
 
@@ -8082,6 +8235,7 @@ int main(int argc, char **argv)
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();
 		test_scheduled_before_completion();
+		test_submitted_before_scheduled();
 		test_wait_until_scheduled_pumps();
 		test_completion_thread_stops();
 		test_uncompleted_buffer_releases();

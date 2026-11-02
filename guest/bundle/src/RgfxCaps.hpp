@@ -190,6 +190,8 @@ public:
 
 	/// `registryID`.
 	uint64_t registryId() const { return m_info.registry_id; }
+	/// FEATURES_LO's low byte (RGFX_FEATURE_*), as the host wrote it; 0 from an older host.
+	uint8_t featuresLo() const { return m_valid ? m_info.features_lo : 0; }
 	/// `gpuCoreCount`, or 0 when the host does not answer it.
 	uint64_t gpuCoreCount() const { return m_info.gpu_core_count; }
 	/// `maxThreadsPerThreadgroup`'s `dim` (0 = width, 1 = height, 2 = depth).

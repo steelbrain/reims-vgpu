@@ -4,6 +4,9 @@
  * crates/reims-graphics/src/device.rs (ControlCompletionPoster). It reads the host's
  * reply messages off the ring and dispatches each to the wrapper that is waiting on
  * it:
+ *   - RGFX_EVT_CB_SUBMITTED (RgfxCbSubmitted) -> the command buffer whose submission
+ *     seqno it carries, which asked for it: it is submitted, and commitAndWaitUntilSubmitted
+ *     returns;
  *   - RGFX_EVT_CB_SCHEDULED (RgfxCbScheduled) -> the command buffer whose submission
  *     seqno it carries: it is scheduled, its scheduled handlers fire, a waiter wakes;
  *   - RGFX_EVT_CB_COMPLETE (RgfxCbComplete) -> the command buffer whose submission
@@ -62,6 +65,8 @@ public:
 	typedef std::function<void(const RgfxCbComplete &)> CompletionHandler;
 	/// A command buffer's scheduled handler, invoked once with the whole message.
 	typedef std::function<void(const RgfxCbScheduled &)> ScheduledHandler;
+	/// A command buffer's submitted handler, invoked once with the whole message.
+	typedef std::function<void(const RgfxCbSubmitted &)> SubmittedHandler;
 	/// A pipeline create's reflection handler, invoked once with the whole message.
 	typedef std::function<void(const RgfxPipelineReflection &)> ReflectionHandler;
 	/// A shared event's listener, invoked on every EVENT_SIGNALLED for its obj_id.
@@ -92,6 +97,12 @@ public:
 	/// (the host posts no CB_SCHEDULED for a buffer it could not carry out): the completion
 	/// stands for both.
 	void expectScheduled(uint64_t seqno, ScheduledHandler handler);
+
+	/// Registers `handler` for the command buffer submitted at `seqno`, which asked for its
+	/// submission (RGFX_OP_SUBMITTED); fired once, when its RGFX_EVT_CB_SUBMITTED arrives, then
+	/// removed. Its RGFX_EVT_CB_SCHEDULED or RGFX_EVT_CB_COMPLETE removes it unfired: the host
+	/// posts CB_SUBMITTED ahead of both, and none for a buffer it could not carry out.
+	void expectSubmitted(uint64_t seqno, SubmittedHandler handler);
 
 	/// Registers `handler` for the pipeline created at `seqno`; fired once, when its
 	/// RGFX_EVT_PIPELINE_REFLECTION arrives, then removed.
@@ -139,9 +150,11 @@ public:
 	/// Whether the reader reads a ring (the device's lifecycle reader reads none).
 	bool hasRing() const { return m_header != nullptr; }
 
-	/// Whether a completion / reflection is still awaited for `seqno` (tests).
+	/// Whether a completion / scheduling / submission / reflection is still awaited for
+	/// `seqno` (tests).
 	bool awaitingCompletion(uint64_t seqno);
 	bool awaitingScheduled(uint64_t seqno);
+	bool awaitingSubmitted(uint64_t seqno);
 	bool awaitingReflection(uint64_t seqno);
 
 private:
@@ -166,6 +179,7 @@ private:
 
 	std::unordered_map<uint64_t, CompletionHandler> m_completions;
 	std::unordered_map<uint64_t, ScheduledHandler> m_scheduled;
+	std::unordered_map<uint64_t, SubmittedHandler> m_submitted;
 	std::unordered_map<uint64_t, ReflectionHandler> m_reflections;
 	std::unordered_map<uint64_t, RgfxPipelineReflection> m_earlyReflections;
 	std::unordered_map<uint64_t, EventListener> m_eventListeners;

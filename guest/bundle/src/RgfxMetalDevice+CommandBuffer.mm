@@ -102,6 +102,10 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	[queue adoptReplyReader:reader];
 	// A command buffer too large for the ring puts its message in a block of the region.
 	queue.region = region;
+	// Its command buffers that commitAndWaitUntilSubmitted commits ask for their submission
+	// where the host answers it.
+	const RgfxCaps *caps = [self caps];
+	queue.asksSubmitted = caps != nullptr && (caps->featuresLo() & RGFX_FEATURE_CB_SUBMITTED) != 0;
 	// The process's completion thread takes the ring's completions from now on, whether or
 	// not anything waits for them.
 	if (RgfxCompletionThread *completions = [self completionThread])
