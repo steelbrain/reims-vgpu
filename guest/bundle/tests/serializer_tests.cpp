@@ -333,6 +333,7 @@ void test_caps()
 	info.primitive_types[3] = 1;
 	info.write_rounding_modes[1] = 1; // mode 2
 	info.limits[kRgfxLimitDeviceLinearTextureAlignmentBytes] = 64;
+	info.limits[kRgfxLimitLinearTextureAlignmentBytes] = 256;
 	info.limits[kRgfxLimitMaxViewportCount] = 16; // last by position
 	info.flags[kRgfxFlagAreRasterOrderGroupsSupported] = 1; // first by position
 	info.flags[kRgfxFlagSupportsTileShaders] = 1;           // last by position
@@ -369,6 +370,10 @@ void test_caps()
 	CHECK(caps.textureBufferAlignment(80) == 16);
 	CHECK(caps.textureBufferAlignment(70) == 0); // listed past the count
 	CHECK(caps.textureBufferAlignment(130) == 0); // not listed
+	// The linear alignment is the one limit for every format with a texture-buffer answer.
+	CHECK(caps.minimumLinearTextureAlignment(80) == 256);
+	CHECK(caps.minimumLinearTextureAlignment(70) == 0);  // listed past the count
+	CHECK(caps.minimumLinearTextureAlignment(130) == 0); // not listed
 	uint64_t tile[3];
 	CHECK(caps.sparseTile(80, 1, 101, tile) && tile[0] == 64 && tile[1] == 64 && tile[2] == 1);
 	CHECK(caps.sparseTile(80, 4, 103, tile) && tile[0] == 128 && tile[2] == 1);

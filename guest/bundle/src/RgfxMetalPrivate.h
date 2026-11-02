@@ -104,6 +104,15 @@ NS_ASSUME_NONNULL_END
 - (NSUInteger)maxComputeTextures;
 - (NSUInteger)maxVertexAmplificationCount;
 - (BOOL)supportsPrimitiveType:(NSUInteger)primitiveType;
+// measured: macOS 27 Metal.framework's x86-64 slice, _MTLDevice's, `Q16@0:8` and `c16@0:8`:
+// the linear texture alignments, and the framebuffer read, tile shader and imageblock answers
+// the host's device-info blob carries.
+- (NSUInteger)linearTextureAlignmentBytes;
+- (NSUInteger)deviceLinearTextureAlignmentBytes;
+- (BOOL)isFramebufferReadSupported;
+- (BOOL)supportsTileShaders;
+- (BOOL)supportsNonSquareTileShaders;
+- (BOOL)supportsImageBlocks;
 // measured: macOS 26 Metal.framework, required, `@32@0:8Q16Q24`: a texture over a legacy
 // IOAccel surface, by its id and buffer (CoreDisplay's display surfaces).
 - (nullable id<MTLTexture>)newTextureWithSurface:(NSUInteger)surfaceId buffer:(NSUInteger)buffer;

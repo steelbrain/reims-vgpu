@@ -161,6 +161,11 @@ public:
 	/// `minimumLinearTextureAlignmentForPixelFormat:`(BGRA8Unorm) and every format's
 	/// texture-buffer alignment, the blob's answers; 0 where it has no linear answer.
 	uint64_t linearTextureAlignment() const;
+	/// `minimumLinearTextureAlignmentForPixelFormat:` of the raw `MTLPixelFormat` `format`: the
+	/// blob's `linearTextureAlignmentBytes` for every format the host makes textures over a
+	/// buffer of (one with a texture-buffer answer), as an Intel, AMD or Apple GPU answers one
+	/// value for every format it makes linear textures of; 0 for any other, which Metal asserts on.
+	uint64_t minimumLinearTextureAlignment(uint64_t format) const;
 	/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of `format` at
 	/// `samples` (1, 2 or 4) in pages of the raw `MTLSparsePageSize` `page` (101, 102 or 103),
 	/// the same for every texture type, into `out` (width, height, depth); false, with `out`

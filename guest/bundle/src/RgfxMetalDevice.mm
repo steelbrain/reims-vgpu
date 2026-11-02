@@ -734,6 +734,21 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.textureBufferAlignment(static_cast<uint64_t>(format));
 }
 
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	return _caps.minimumLinearTextureAlignment(static_cast<uint64_t>(format));
+}
+
+- (NSUInteger)linearTextureAlignmentBytes
+{
+	return _caps.limit(kRgfxLimitLinearTextureAlignmentBytes);
+}
+
+- (NSUInteger)deviceLinearTextureAlignmentBytes
+{
+	return _caps.limit(kRgfxLimitDeviceLinearTextureAlignmentBytes);
+}
+
 - (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType
                              pixelFormat:(MTLPixelFormat)pixelFormat
                              sampleCount:(NSUInteger)sampleCount
@@ -773,6 +788,26 @@ RGFX_LOG_UNRECOGNIZED
 - (BOOL)isDepth24Stencil8PixelFormatSupported
 {
 	return _caps.valid() && _caps.flag(kRgfxFlagIsDepth24Stencil8PixelFormatSupported);
+}
+
+- (BOOL)isFramebufferReadSupported
+{
+	return _caps.valid() && _caps.flag(kRgfxFlagIsFramebufferReadSupported);
+}
+
+- (BOOL)supportsTileShaders
+{
+	return _caps.valid() && _caps.flag(kRgfxFlagSupportsTileShaders);
+}
+
+- (BOOL)supportsNonSquareTileShaders
+{
+	return _caps.valid() && _caps.flag(kRgfxFlagSupportsNonSquareTileShaders);
+}
+
+- (BOOL)supportsImageBlocks
+{
+	return _caps.valid() && _caps.flag(kRgfxFlagSupportsImageBlocks);
 }
 
 - (BOOL)supports32BitFloatFiltering

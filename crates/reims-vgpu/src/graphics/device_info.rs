@@ -20,8 +20,9 @@ use reims_graphics::wire::{
     RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo, RgfxFormatAnswers,
 };
 use reims_vgpu_core::platform::caps::{
-    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, FormatAnswers, IdentityCaps,
-    SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS, feature_set_family,
+    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, FormatAnswers,
+    IdentityCaps, Limits, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
+    feature_set_family,
 };
 use reims_vgpu_core::raise::RaiseResult;
 
@@ -278,6 +279,13 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
 /// | `supportsRasterizationRateMapWithLayerCount:` | no, of every count | rasterization rate maps |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
+/// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
+/// | `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes` | 256 bytes, or the platform's where larger ([`LANE_LINEAR_TEXTURE_ALIGNMENT`]) | nothing: a choice |
+/// | `isFramebufferReadSupported` (SPI) | no ([`lane_flags`]) | nothing: a choice |
+/// | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (SPI) | no ([`lane_flags`]) | tile pipelines, their non-square dispatch and imageblocks, Apple4's and Apple5's pieces |
+///
+/// The rows marked "a choice" are answers real Macs give, picked from those the lane can keep for
+/// what they cost the host (docs/graphics-kext/dgpu-oracle.md, "Reading the oracles").
 ///
 /// `hasUnifiedMemory` is the platform's: the decoder keeps `Managed` resources in one copy or two
 /// by the same answer (docs/graphics-kext/design.md, Decided 4).
@@ -300,7 +308,66 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
     identity.counter_sampling = [Some(false); 5];
     identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
     identity.sizes.maximum_concurrent_compilation_task_count = Some(compile_threads);
+    let z = &mut identity.sizes;
+    z.max_buffer_length =
+        lane_max_buffer_length(z.max_buffer_length, z.recommended_max_working_set_size);
     identity
+}
+
+/// `maxBufferLength`: the platform's, but at most three quarters of `recommended_max_working_set`,
+/// rounded down to 16 KiB; the platform's alone where it gives no working set. That is the rule
+/// both Macs measured with GPU memory of their own answer by: an AMD Radeon Pro 5300M (macOS
+/// 26.7.1) 3208642560 of 4278190080 bytes, three quarters exactly, and an Apple M3 Max (macOS
+/// 27.0.1) 41747087360 of 55662788608, three quarters rounded down to its 16 KiB pages. It keeps the
+/// answer to a buffer the host's memory can hold: the Vulkan platform answers the driver's
+/// `maxBufferSize` (a terabyte on an RTX 5080), which no allocation reaches, and its working set is
+/// the GPU's device-local memory. Never above the platform's answer.
+fn lane_max_buffer_length(platform: Option<u64>, working_set: Option<u64>) -> Option<u64> {
+    const PAGE: u64 = 16 << 10;
+    match (platform, working_set) {
+        (Some(length), Some(set)) => Some(length.min(set / 4 * 3 / PAGE * PAGE)),
+        (length, _) => length,
+    }
+}
+
+/// `minimumLinearTextureAlignmentForPixelFormat:` of every format a buffer can back, and the SPI
+/// `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes`: 256 bytes, as an AMD
+/// Radeon Pro 5300M and an Intel UHD 630 answer (macOS 26.7.1; an Apple M3 Max answers 16), or
+/// the platform's where it needs more. A guest lays a texture's rows out in its buffer at a
+/// multiple of this alignment. The Vulkan platform on RADV takes a texture over a buffer's
+/// dma-buf pages in place only with its rows a multiple of 256 bytes apart (metal2vulkan's
+/// `dma_buf.rs`, measured on Mesa 26.0.8 and 26.2.4), and shadows one at any other pitch; how many
+/// of a guest's textures this moves in place is unmeasured. Any 256-byte layout is one the
+/// platform's 16 takes too.
+pub const LANE_LINEAR_TEXTURE_ALIGNMENT: u64 = 256;
+
+/// The device's `NSUInteger` SPI answers where the lane's differ from the platform's: the linear
+/// texture alignments, at least [`LANE_LINEAR_TEXTURE_ALIGNMENT`].
+fn lane_limits(mut limits: Limits) -> Limits {
+    for align in [
+        &mut limits.linear_texture_alignment_bytes,
+        &mut limits.device_linear_texture_alignment_bytes,
+    ] {
+        *align = (*align).max(LANE_LINEAR_TEXTURE_ALIGNMENT);
+    }
+    limits
+}
+
+/// The device's `BOOL` SPI answers where the lane's differ from the platform's:
+/// - `isFramebufferReadSupported` no, as an AMD Radeon Pro 5300M answers (macOS 26.7.1; an Intel
+///   UHD 630 and an Apple M3 Max answer yes): it steers the guest's frameworks off reading their
+///   attachments in a fragment function, which costs the Vulkan platform most (an input
+///   attachment, or the pixel interlock), onto the paths they take on an AMD Mac;
+/// - `supportsTileShaders`, `supportsNonSquareTileShaders` and `supportsImageBlocks` no, as the
+///   5300M and the UHD 630 answer: the lane carries neither tile pipelines, nor their non-square
+///   dispatch, nor imageblocks ([`Piece::TilePipelines`], [`Piece::NonsquareTileDispatch`],
+///   [`Piece::Imageblocks`]).
+fn lane_flags(mut flags: Flags) -> Flags {
+    flags.is_framebuffer_read_supported = false;
+    flags.supports_tile_shaders = false;
+    flags.supports_non_square_tile_shaders = false;
+    flags.supports_image_blocks = false;
+    flags
 }
 
 /// The device-info caps blob for `caps` and `identity`, of a device that runs `compile_threads`
@@ -332,7 +399,7 @@ pub fn device_info(
     let t = caps.max_threads_per_threadgroup;
     info.max_threads_per_threadgroup = [t.width, t.height, t.depth];
 
-    let l = &caps.limits;
+    let l = &lane_limits(caps.limits);
     // In the host `Limits` field order; the bundle reads them in this order.
     info.limits = [
         l.device_linear_texture_alignment_bytes,
@@ -411,7 +478,7 @@ pub fn device_info(
     info.sample_counts = caps.sample_counts.each_ref().map(bit);
     info.primitive_types = caps.primitive_types.each_ref().map(bit);
     info.write_rounding_modes = caps.write_rounding_modes.each_ref().map(bit);
-    let f = &caps.flags;
+    let f = &lane_flags(caps.flags);
     // In the host `Flags` field order; the bundle reads them in this order.
     info.flags = [
         f.are_raster_order_groups_supported,
@@ -732,6 +799,61 @@ mod tests {
         assert_eq!(at(80).sparse_tiles[0], [64, 64, 1]);
         assert_eq!(at(80).sparse_tiles[8], [128, 128, 1]);
         assert_eq!(at(130).texture_buffer_alignment, 0);
+    }
+
+    /// `maxBufferLength` is three quarters of the working set rounded down to 16 KiB where that is
+    /// below the platform's answer, as the 5300M's and the M3 Max's answers are of theirs, and the
+    /// platform's otherwise; the linear texture alignments are 256 bytes, or the platform's where
+    /// larger; the framebuffer read, tile shader and imageblock answers are no, whatever the
+    /// platform's, and the other SPI flags the platform's.
+    #[test]
+    fn the_lanes_buffer_length_alignments_and_spi_flags() {
+        // An RTX 5080 on the Vulkan platform: a terabyte against 17094934528 bytes of VRAM.
+        assert_eq!(
+            lane_max_buffer_length(Some(1 << 40), Some(17_094_934_528)),
+            Some(12_821_200_896)
+        );
+        // The 5300M's and the M3 Max's own answers, from their working sets.
+        assert_eq!(
+            lane_max_buffer_length(Some(u64::MAX), Some(4_278_190_080)),
+            Some(3_208_642_560)
+        );
+        assert_eq!(
+            lane_max_buffer_length(Some(u64::MAX), Some(55_662_788_608)),
+            Some(41_747_087_360)
+        );
+        // Never above the platform's; the platform's where it gives no working set.
+        assert_eq!(
+            lane_max_buffer_length(Some(4096), Some(1 << 34)),
+            Some(4096)
+        );
+        assert_eq!(lane_max_buffer_length(Some(4096), None), Some(4096));
+        assert_eq!(lane_max_buffer_length(None, Some(1 << 34)), None);
+
+        let p = Arc::new(FakePlatform::new());
+        let mut caps = (*p.device().caps()).clone();
+        let mut identity = p.device().identity_caps();
+        identity.sizes.max_buffer_length = Some(1 << 40);
+        identity.sizes.recommended_max_working_set_size = Some(17_094_934_528);
+        // The fake answers 16 for both alignments, and yes for every SPI flag.
+        let info = device_info(&caps, identity.clone(), 4);
+        assert_eq!(info.sizes[7], 12_821_200_896);
+        // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth.
+        assert_eq!(info.limits[0], 256);
+        assert_eq!(info.limits[3], 256);
+        // is_framebuffer_read_supported (2), supports_image_blocks (14),
+        // supports_non_square_tile_shaders (17) and supports_tile_shaders (24) no; the others
+        // the platform's, all yes on the fake but is_depth24_stencil8_pixel_format_supported (1).
+        for (k, &flag) in info.flags.iter().enumerate() {
+            let want = !matches!(k, 1 | 2 | 14 | 17 | 24);
+            assert_eq!(flag, u8::from(want), "flag {k}");
+        }
+        // A platform that needs more than 256 bytes keeps its own.
+        caps.limits.linear_texture_alignment_bytes = 512;
+        caps.limits.device_linear_texture_alignment_bytes = 1024;
+        let info = device_info(&caps, identity, 4);
+        assert_eq!(info.limits[0], 1024);
+        assert_eq!(info.limits[3], 512);
     }
 
     /// A present no reads 0, a present yes reads 1, and a platform gap (an `Err` or `None`)
