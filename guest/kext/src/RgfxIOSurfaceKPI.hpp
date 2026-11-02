@@ -31,8 +31,13 @@
 //     op 6 instead, from IOSurfaceDeviceCache::unpurge, its second argument the address of a
 //     byte: the AMD's driver sets the byte from 0 to 0xff both after volatile, where IOSurface
 //     then answers the old state volatile, and after empty, where it answers empty and calls
-//     op 5. In the guest a control function that leaves the byte 0 has IOSurface answer empty
-//     after volatile too.
+//     op 5. In the guest, a control function that leaves the byte 0 has IOSurface answer empty
+//     after volatile too, and one that sets it to 0xff has IOSurface answer volatile after
+//     volatile and after empty alike: the AMD's answer of empty comes by a way the control
+//     function's arguments do not show;
+//   - IOSurface takes nothing from the control function's return: answering op 6 with 0 or 1,
+//     and op 7 with 0 or 0x8000 (what the AMD's resource returns for volatile), left every
+//     answer of IOSurface's as it was (measured in the guest).
 // The accelerator ID came from IOSurfaceRoot::generateUniqueAcceleratorID(the accelerator) on
 // both, 1 for IOGPU and 2 for the AMD's (taken before the trace began).
 //
@@ -49,7 +54,8 @@ struct RgfxDeviceCache;
 // The control function a device cache calls: the accelerator its cache was made for, the cache,
 // the op (0 sync, 2 wait, 3 done, 4 freed, 5 purged, 6 made nonvolatile, 7 purgeable), and the
 // op's two arguments (op 2's first: 1 for a read-only lock, 0 for a read-write one; op 7's the new
-// state; op 6's second the address of the byte it answers in; the others measured 0).
+// state; op 6's second the address of the byte it answers in; the others measured 0). IOSurface
+// declares it returning nothing (setControlFunc's mangled name) and reads no return.
 typedef void (*RgfxDeviceCacheControl)(void *accelerator, RgfxDeviceCache *cache, uint32_t op,
                                        uint64_t a, uint64_t b);
 
