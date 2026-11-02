@@ -18,8 +18,9 @@
 //!   generation than the cache's (two queues' buffers committed apart and taken in the other
 //!   order) fills nothing.
 //! - **Download.** The pages are written from the cache only at a `SURFACE_DOWNLOAD` (a CPU lock
-//!   after a GPU write) and at the block's `BLOCK_RELEASE`, and only where a buffer that may write
-//!   the surface was committed since the cache was last copied either way.
+//!   after a GPU write), at the block's `BLOCK_RELEASE` and where the kext names the block's pages
+//!   again (`SURFACE_PAGES`), and only where a buffer that may write the surface was committed
+//!   since the cache was last copied either way.
 //! - **Order.** Fills and downloads run on the host's own transfer queue, in the order they are
 //!   asked, each after every command buffer that used the cache before it: each such buffer
 //!   signals its queue's end event as it ends, and the copy waits for the latest value of each
@@ -197,10 +198,16 @@ impl<P: Platform> SurfaceCaches<P> {
         self.counts
     }
 
-    /// A cache for the block at `block`, whose surface's pages `view` maps, in place of any it
-    /// had: `Ok(false)` where the platform made no buffer for it, and the block keeps its view.
-    /// `host_pages` are the pages' host addresses in the guest's RAM, [`device_writes::sorted`],
-    /// which the host's devices' writes are watched over.
+    /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
+    /// the platform made no buffer for it, and the block keeps its view. `host_pages` are the
+    /// pages' host addresses in the guest's RAM, [`device_writes::sorted`], which the host's
+    /// devices' writes are watched over.
+    ///
+    /// A block that has a cache keeps it where its pages are the same, filled again at its next
+    /// use, as the kext's generations of the surface may count anew; any other goes as at a
+    /// release ([`SurfaceCaches::released`]). Either way what a buffer wrote of the cache is
+    /// copied into the pages first. (The kext names a block's pages once, before any process
+    /// holds it, and a block's offset is given out again only once its release is answered.)
     pub(crate) fn make(
         &mut self,
         device: &P::Device,
@@ -208,9 +215,21 @@ impl<P: Platform> SurfaceCaches<P> {
         view: &Arc<SurfaceView<P>>,
         host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
-        self.by_block.remove(&block);
-        self.watched.0.lock().remove(&block);
         let length = view.length();
+        if let Some(cache) = self.by_block.get(&block) {
+            let same = cache.length == length
+                && (self.watched.0.lock().get(&block)).is_some_and(|p| p.runs == host_pages);
+            if same {
+                if self.written_since_host(block) {
+                    self.write_back(device, block, Box::new(|| {}))?;
+                }
+                if let Some(cache) = self.by_block.get_mut(&block) {
+                    cache.generation = None;
+                }
+                return Ok(true);
+            }
+            self.released(device, block, Box::new(|| {}))?;
+        }
         let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
             return Ok(false);
         };
@@ -808,6 +827,62 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
         assert_eq!(r.dec.surface_caches.counts().downloads, 1);
+    }
+
+    /// A block named again over the same pages keeps its cache, which its next use fills again;
+    /// one named over other pages, or not cached, loses it. What a buffer wrote of the cache goes
+    /// into its pages first each time, and nothing else is copied
+    #[test]
+    fn a_block_named_again_keeps_what_its_cache_holds() {
+        let mut r = cached();
+        let page = r.page;
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        for (round, copied) in [(0, 1), (1, 0)] {
+            let mark = r.p.call_log().mark();
+            assert_eq!(
+                r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+                RGFX_STATUS_OK
+            );
+            let back = copies(&r.p.call_log().since(mark));
+            assert_eq!(back.len(), copied, "round {round}");
+            assert!(
+                back.iter().all(|&(from, _)| from == cache),
+                "out of the cache"
+            );
+            assert_eq!(cache_id(&r), cache, "kept, round {round}");
+        }
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, true)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "filled again, of the generation it held");
+        assert_eq!(filled[0].1, cache);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(3, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        let back = copies(&r.p.call_log().since(mark));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, cache, "the old cache, into its pages");
+        let other = cache_id(&r);
+        assert_ne!(other, cache, "a new cache");
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.pages(BLOCK, &[(5, 1)], page), RGFX_STATUS_OK);
+        let back = copies(&r.p.call_log().since(mark));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, other);
+        assert_eq!(r.dec.surface_caches.len(), 0, "not cached");
+        r.p.world().complete_all(CompleteOn::Caller);
+        let counts = r.dec.surface_caches.counts();
+        assert_eq!((counts.made, counts.downloads), (2, 3));
     }
 
     /// A device of the host's write over a cache's pages has the cache's next use fill it again,

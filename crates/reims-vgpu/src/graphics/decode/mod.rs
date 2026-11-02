@@ -395,6 +395,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_STATUS_OK
             }
             Ok(Err(why)) => {
+                self.uncache_surface(device, pages.block_offset);
                 log::warn!(
                     target: "reims_vgpu::graphics",
                     "the IOSurface block of {:#x} bytes at {:#x}: no view of its {:#x} bytes in \
@@ -404,6 +405,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_STATUS_REFUSED
             }
             Err(raise) => {
+                self.uncache_surface(device, pages.block_offset);
                 log::warn!(
                     target: "reims_vgpu::graphics",
                     "the IOSurface block of {:#x} bytes at {:#x}: the platform raised at the \
@@ -447,6 +449,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         cached: bool,
     ) {
         if !cached || !self.surface_caches.on() {
+            self.uncache_surface(device, block);
             return;
         }
         let Some(view) = self.surface_views.view(block) else {
@@ -466,6 +469,21 @@ impl<P: Platform> GraphicsDecoder<P> {
                 "the IOSurface block at {block:#x}: the platform raised at its device cache \
                  ({raise:?}); its buffers lie over its pages"
             ),
+        }
+    }
+
+    /// The block at `block`, named again without a cache, loses any it had, as at a release: what
+    /// a buffer wrote of it goes into the pages first ([`surface_cache`]).
+    fn uncache_surface(&mut self, device: &P::Device, block: u64) {
+        if !self.surface_caches.has(block) {
+            return;
+        }
+        if let Err(raise) = self.surface_caches.released(device, block, Box::new(|| {})) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: the platform raised at the copy of its device \
+                 cache into its pages ({raise:?})"
+            );
         }
     }
 
