@@ -1,7 +1,8 @@
 // RgfxAirArguments: the arguments of a Metal library's entry points, as the AIR module of each
 // declares them in its own metadata: each binding argument's kind, binding index, count and
 // access. The guest's device learns from it which bindings a function may write, which the host
-// does not tell it (it gives no binding reflection).
+// does not tell it (it gives no binding reflection). It also reads a stitchable function's
+// signature, from which the device builds the reflection Metal answers for the function.
 //
 // A .metallib holds one LLVM bitcode module per function (its function list's OFFT tag places it
 // in the bitcode section, its MDSZ tag gives its size). The module lists its entry points in the
@@ -67,6 +68,92 @@ struct RgfxAirFunction {
 // The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header).
 // False where it is not one the reader can follow; `out` then holds nothing.
 bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out);
+
+// The signatures of a module's visible functions. The module lists them in the named metadata
+// `air.visible`: one node per function, of the function, a node of its outputs and one of its
+// inputs, then, for a stitchable function, a node `air.stitching_info` of its signature. That
+// node's first operand is the return's `air.stitching_type` (none where it returns void), each
+// later one an `air.stitching_argument` of an argument's `air.stitching_type` and its name, in
+// the argument's order. A stitching type's first operand is the type's node: its name
+// (`air.float_type`, `air.struct_type`, ...), its size and alignment, and an address space's
+// node or none, then what the kind adds:
+//   scalars (`air.float_type`, `air.half_type`, `air.int_type`, `air.uint_type`, `air.short_type`,
+//     `air.ushort_type`, `air.char_type`, `air.uchar_type`, `air.bool_type`, `air.long_type`,
+//     `air.ulong_type`): nothing;
+//   `air.vector_type`, `air.packed_vector_type`: the element's node and the component count;
+//   `air.matrix_type`: the element's node, the column count and the row count;
+//   `air.array_type` (an array of C's), `air.array_of_type` (a metal::array): the element's node
+//     and the length;
+//   `air.struct_type`: the struct's name and a node of its fields, each an `air.record_field` of
+//     its offset, a second integer, its type's node and its name;
+//   `air.pointer_type`: the pointee's node;
+//   `air.texture_<shape>_type`, `air.depth_<shape>_type`: the sample type's node and the access
+//     (`sample`, `read`, `write`, `read_write`);
+//   `air.sampler_type`: nothing.
+// Read from modules Apple's Metal compiler built from our own sources (tests/air_arguments.metal),
+// as LLVM's text form of the same modules prints them.
+
+enum class RgfxAirScalar : uint8_t { Float, Half, Int, UInt, Short, UShort, Char, UChar, Bool, Long, ULong };
+
+// A texture's shape, as its type's name gives it (`air.texture_2d_array_type`: T2DArray).
+enum class RgfxAirTextureShape : uint8_t {
+	T1D, T1DArray, T2D, T2DArray, T2DMS, T2DMSArray, Cube, CubeArray, T3D, Buffer1D
+};
+
+struct RgfxAirField;
+
+// One type of a stitchable function's signature.
+struct RgfxAirType {
+	enum class Kind : uint8_t { Scalar, Vector, Matrix, Array, ArrayOf, Struct, Pointer, Texture, Sampler };
+	Kind kind = Kind::Scalar;
+	// Scalar, Vector and Matrix: the elements'; Texture: its samples'.
+	RgfxAirScalar scalar = RgfxAirScalar::Float;
+	// The type's size and alignment, in bytes.
+	uint32_t size = 0, align = 0;
+	// Vector: its components; Matrix: its columns; Array and ArrayOf: its length.
+	uint32_t count = 0;
+	// Matrix: its rows.
+	uint32_t rows = 0;
+	// Vector: whether it is a packed one.
+	bool packed = false;
+	// Texture: its shape, whether it is a depth texture, and its access (Sample, Read, Write or
+	// ReadWrite).
+	RgfxAirTextureShape shape = RgfxAirTextureShape::T2D;
+	bool depth = false;
+	RgfxAirAccess access = RgfxAirAccess::Unknown;
+	// Struct: its name and fields, in their order.
+	std::string name;
+	std::vector<RgfxAirField> fields;
+	// Array, ArrayOf and Pointer: the element's (the pointee's) type, its one entry.
+	std::vector<RgfxAirType> element;
+};
+
+struct RgfxAirField {
+	std::string name;
+	uint32_t offset = 0;
+	RgfxAirType type;
+};
+
+// One visible function: its name and, where the module gives it, its signature.
+struct RgfxAirVisible {
+	enum class Signature : uint8_t {
+		None,    // no `air.stitching_info`: a visible function that is not stitchable
+		Read,    // the signature below
+		Unknown, // a signature with a type the reader does not know
+	};
+	std::string name;
+	Signature signature = Signature::None;
+	// Whether it returns void; else its return type.
+	bool returnsVoid = false;
+	RgfxAirType returnType;
+	// Its arguments' names and types, in their order.
+	std::vector<std::string> argumentNames;
+	std::vector<RgfxAirType> argumentTypes;
+};
+
+// The visible functions of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), in
+// `air.visible`'s order. False where it is not one the reader can follow; `out` then holds nothing.
+bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out);
 
 // Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
 // 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a

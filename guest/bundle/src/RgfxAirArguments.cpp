@@ -757,11 +757,9 @@ uint64_t le64(const uint8_t *p)
 	return v;
 }
 
-} // namespace
-
-bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out)
+// The module at `bitcode`, raw or in LLVM's wrapper header.
+bool readModule(const uint8_t *bitcode, size_t size, Module &m)
 {
-	out.clear();
 	if (bitcode == nullptr || size < 8)
 		return false;
 	// LLVM's wrapper header: magic 0x0B17C0DE, version, then the bitcode's offset and size.
@@ -776,10 +774,258 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 	}
 	if (bitcode[0] != 'B' || bitcode[1] != 'C' || bitcode[2] != 0xC0 || bitcode[3] != 0xDE)
 		return false;
-	Module m;
 	Reader reader(m);
 	Bits b(bitcode + 4, size - 4);
-	if (!reader.block(b, ~0u, 2, {}, 0))
+	return reader.block(b, ~0u, 2, {}, 0);
+}
+
+// An unsigned integer operand of a node.
+bool mdUnsigned(const Module &m, const Module::Md &node, size_t i, uint32_t &v)
+{
+	int64_t x = 0;
+	if (i >= node.ops.size() || !mdInteger(m, node.ops[i], x) || x < 0 || x > INT32_MAX)
+		return false;
+	v = static_cast<uint32_t>(x);
+	return true;
+}
+
+// The node `id`, where it is one.
+const Module::Md *mdNode(const Module &m, uint64_t id)
+{
+	const Module::Md *d = mdAt(m, id);
+	return d != nullptr && d->kind == Module::Md::kNode ? d : nullptr;
+}
+
+bool scalarNamed(const std::string &s, RgfxAirScalar &out)
+{
+	static const struct {
+		const char *name;
+		RgfxAirScalar scalar;
+	} kScalars[] = {
+		{"air.float_type", RgfxAirScalar::Float}, {"air.half_type", RgfxAirScalar::Half},
+		{"air.int_type", RgfxAirScalar::Int},     {"air.uint_type", RgfxAirScalar::UInt},
+		{"air.short_type", RgfxAirScalar::Short}, {"air.ushort_type", RgfxAirScalar::UShort},
+		{"air.char_type", RgfxAirScalar::Char},   {"air.uchar_type", RgfxAirScalar::UChar},
+		{"air.bool_type", RgfxAirScalar::Bool},   {"air.long_type", RgfxAirScalar::Long},
+		{"air.ulong_type", RgfxAirScalar::ULong},
+	};
+	for (const auto &k : kScalars)
+		if (s == k.name) {
+			out = k.scalar;
+			return true;
+		}
+	return false;
+}
+
+bool textureNamed(const std::string &s, RgfxAirTextureShape &shape, bool &depth)
+{
+	static const struct {
+		const char *name;
+		RgfxAirTextureShape shape;
+		bool depth;
+	} kTextures[] = {
+		{"air.texture_1d_type", RgfxAirTextureShape::T1D, false},
+		{"air.texture_1d_array_type", RgfxAirTextureShape::T1DArray, false},
+		{"air.texture_2d_type", RgfxAirTextureShape::T2D, false},
+		{"air.texture_2d_array_type", RgfxAirTextureShape::T2DArray, false},
+		{"air.texture_2d_ms_type", RgfxAirTextureShape::T2DMS, false},
+		{"air.texture_2d_ms_array_type", RgfxAirTextureShape::T2DMSArray, false},
+		{"air.texture_cube_type", RgfxAirTextureShape::Cube, false},
+		{"air.texture_cube_array_type", RgfxAirTextureShape::CubeArray, false},
+		{"air.texture_3d_type", RgfxAirTextureShape::T3D, false},
+		{"air.texture_buffer_1d_type", RgfxAirTextureShape::Buffer1D, false},
+		{"air.depth_2d_type", RgfxAirTextureShape::T2D, true},
+		{"air.depth_2d_array_type", RgfxAirTextureShape::T2DArray, true},
+		{"air.depth_2d_ms_type", RgfxAirTextureShape::T2DMS, true},
+		{"air.depth_2d_ms_array_type", RgfxAirTextureShape::T2DMSArray, true},
+		{"air.depth_cube_type", RgfxAirTextureShape::Cube, true},
+		{"air.depth_cube_array_type", RgfxAirTextureShape::CubeArray, true},
+	};
+	for (const auto &k : kTextures)
+		if (s == k.name) {
+			shape = k.shape;
+			depth = k.depth;
+			return true;
+		}
+	return false;
+}
+
+// The type node `id` (RgfxAirArguments.hpp: its name, size, alignment and address space, then
+// what its kind adds). False for a node of a kind the reader does not know.
+bool airType(const Module &m, uint64_t id, unsigned depth, RgfxAirType &out)
+{
+	const Module::Md *node = mdNode(m, id);
+	if (depth > 16 || node == nullptr || node->ops.size() < 4)
+		return false;
+	const std::string *tag = mdString(m, node->ops[0]);
+	if (tag == nullptr || !mdUnsigned(m, *node, 1, out.size) || !mdUnsigned(m, *node, 2, out.align))
+		return false;
+	const std::string &t = *tag;
+	if (scalarNamed(t, out.scalar)) {
+		out.kind = RgfxAirType::Kind::Scalar;
+		return true;
+	}
+	if (t == "air.vector_type" || t == "air.packed_vector_type") {
+		RgfxAirType element;
+		if (node->ops.size() < 6 || !airType(m, node->ops[4], depth + 1, element) ||
+		    element.kind != RgfxAirType::Kind::Scalar || !mdUnsigned(m, *node, 5, out.count))
+			return false;
+		out.kind = RgfxAirType::Kind::Vector;
+		out.scalar = element.scalar;
+		out.packed = t == "air.packed_vector_type";
+		return true;
+	}
+	if (t == "air.matrix_type") {
+		RgfxAirType element;
+		if (node->ops.size() < 7 || !airType(m, node->ops[4], depth + 1, element) ||
+		    element.kind != RgfxAirType::Kind::Scalar || !mdUnsigned(m, *node, 5, out.count) ||
+		    !mdUnsigned(m, *node, 6, out.rows))
+			return false;
+		out.kind = RgfxAirType::Kind::Matrix;
+		out.scalar = element.scalar;
+		return true;
+	}
+	if (t == "air.array_type" || t == "air.array_of_type") {
+		out.element.resize(1);
+		if (node->ops.size() < 6 || !airType(m, node->ops[4], depth + 1, out.element[0]) ||
+		    !mdUnsigned(m, *node, 5, out.count))
+			return false;
+		out.kind = t == "air.array_type" ? RgfxAirType::Kind::Array : RgfxAirType::Kind::ArrayOf;
+		return true;
+	}
+	if (t == "air.pointer_type") {
+		out.element.resize(1);
+		if (node->ops.size() < 5 || !airType(m, node->ops[4], depth + 1, out.element[0]))
+			return false;
+		out.kind = RgfxAirType::Kind::Pointer;
+		return true;
+	}
+	if (t == "air.struct_type") {
+		const std::string *name = node->ops.size() >= 6 ? mdString(m, node->ops[4]) : nullptr;
+		const Module::Md *fields = node->ops.size() >= 6 ? mdNode(m, node->ops[5]) : nullptr;
+		if (name == nullptr || fields == nullptr)
+			return false;
+		out.kind = RgfxAirType::Kind::Struct;
+		out.name = *name;
+		for (uint64_t f : fields->ops) {
+			const Module::Md *field = mdNode(m, f);
+			const std::string *fieldTag = field != nullptr && field->ops.size() >= 5
+			                                  ? mdString(m, field->ops[0])
+			                                  : nullptr;
+			const std::string *fieldName = fieldTag != nullptr ? mdString(m, field->ops[4]) : nullptr;
+			RgfxAirField rf;
+			if (fieldName == nullptr || *fieldTag != "air.record_field" ||
+			    !mdUnsigned(m, *field, 1, rf.offset) || !airType(m, field->ops[3], depth + 1, rf.type))
+				return false;
+			rf.name = *fieldName;
+			out.fields.push_back(std::move(rf));
+		}
+		return true;
+	}
+	if (textureNamed(t, out.shape, out.depth)) {
+		RgfxAirType sample;
+		const std::string *access = node->ops.size() >= 6 ? mdString(m, node->ops[5]) : nullptr;
+		if (access == nullptr || !airType(m, node->ops[4], depth + 1, sample) ||
+		    sample.kind != RgfxAirType::Kind::Scalar)
+			return false;
+		out.kind = RgfxAirType::Kind::Texture;
+		out.scalar = sample.scalar;
+		out.access = accessOf("air." + *access);
+		return out.access != RgfxAirAccess::Unknown;
+	}
+	if (t == "air.sampler_type") {
+		out.kind = RgfxAirType::Kind::Sampler;
+		return true;
+	}
+	return false;
+}
+
+// An `air.stitching_type` node's type.
+bool stitchingType(const Module &m, uint64_t id, RgfxAirType &out)
+{
+	const Module::Md *node = mdNode(m, id);
+	const std::string *tag = node != nullptr && node->ops.size() >= 2 ? mdString(m, node->ops[0]) : nullptr;
+	return tag != nullptr && *tag == "air.stitching_type" && airType(m, node->ops[1], 0, out);
+}
+
+// One `air.visible` node: the function, its outputs, its inputs and, for a stitchable function,
+// its `air.stitching_info`.
+bool visibleFunction(const Module &m, uint64_t id, RgfxAirVisible &out)
+{
+	const Module::Md *entry = mdNode(m, id);
+	if (entry == nullptr || entry->ops.size() < 3)
+		return false;
+	const Module::Md *fn = mdAt(m, entry->ops[0]);
+	if (fn == nullptr || fn->kind != Module::Md::kValue || fn->value >= m.globals.size() ||
+	    !m.globals[static_cast<size_t>(fn->value)].function)
+		return false;
+	out.name = globalName(m, fn->value);
+	if (out.name.empty())
+		return false;
+	const Module::Md *info = nullptr;
+	for (size_t i = 3; i < entry->ops.size() && info == nullptr; i++) {
+		const Module::Md *n = mdNode(m, entry->ops[i]);
+		const std::string *tag = n != nullptr && !n->ops.empty() ? mdString(m, n->ops[0]) : nullptr;
+		if (tag != nullptr && *tag == "air.stitching_info")
+			info = n;
+	}
+	if (info == nullptr) {
+		out.signature = RgfxAirVisible::Signature::None;
+		return true;
+	}
+	out.signature = RgfxAirVisible::Signature::Unknown;
+	if (info->ops.size() < 2)
+		return true;
+	out.returnsVoid = info->ops[1] == UINT64_MAX;
+	if (!out.returnsVoid && !stitchingType(m, info->ops[1], out.returnType))
+		return true;
+	for (size_t i = 2; i < info->ops.size(); i++) {
+		const Module::Md *arg = mdNode(m, info->ops[i]);
+		const std::string *tag = arg != nullptr && arg->ops.size() >= 3 ? mdString(m, arg->ops[0]) : nullptr;
+		const std::string *name = tag != nullptr ? mdString(m, arg->ops[2]) : nullptr;
+		RgfxAirType type;
+		if (name == nullptr || *tag != "air.stitching_argument" || !stitchingType(m, arg->ops[1], type))
+			return true;
+		out.argumentNames.push_back(*name);
+		out.argumentTypes.push_back(std::move(type));
+	}
+	out.signature = RgfxAirVisible::Signature::Read;
+	return true;
+}
+
+} // namespace
+
+bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out)
+{
+	out.clear();
+	Module m;
+	if (!readModule(bitcode, size, m))
+		return false;
+	auto it = m.named.find("air.visible");
+	if (it == m.named.end())
+		return true;
+	for (uint64_t id : it->second) {
+		RgfxAirVisible v;
+		if (!visibleFunction(m, id, v)) {
+			out.clear();
+			return false;
+		}
+		if (v.signature != RgfxAirVisible::Signature::Read) {
+			v.returnsVoid = false;
+			v.returnType = {};
+			v.argumentNames.clear();
+			v.argumentTypes.clear();
+		}
+		out.push_back(std::move(v));
+	}
+	return true;
+}
+
+bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out)
+{
+	out.clear();
+	Module m;
+	if (!readModule(bitcode, size, m))
 		return false;
 	static const struct {
 		const char *name;

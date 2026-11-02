@@ -2,8 +2,9 @@
 // with binding arguments of each kind and access, arrays of them, argument buffers with and
 // without a written texture, a function constant, arguments declared under function constants,
 // binding indices function constants set, a vertex function's and a kernel's stage input, a
-// function table and an acceleration structure, threadgroup memory, and a function of no texture.
-// Built into a .metallib by Apple's Metal compiler at test time; never committed.
+// function table and an acceleration structure, threadgroup memory, and a function of no texture;
+// and stitchable functions of every kind of type in their signatures. Built into a .metallib by
+// Apple's Metal compiler at test time; never committed.
 #include <metal_raytracing>
 #include <metal_stdlib>
 using namespace metal;
@@ -174,3 +175,86 @@ kernel void calls_through_table(device float *out [[buffer(0)]],
 	out[g] = table[0](out[g]);
 	w.write(float4(out[g]), uint2(g, 0));
 }
+
+// Stitchable functions' signatures (rgfxReadAirVisible), of every kind of type the reader knows:
+// scalars, vectors (packed ones among them) and matrices of each scalar; structs, nested; arrays of
+// C's and metal::arrays, of scalars, vectors, matrices, structs, arrays, pointers, textures and
+// samplers; pointers to scalars, vectors, matrices, structs and arrays, as arguments and as fields;
+// textures of each shape and access, depth ones among them; samplers; a void return and none at
+// all. `doubled` above is visible and not stitchable: it has no signature.
+struct SigPair {
+	float2 xy;
+	float w;
+	int n;
+};
+
+struct SigOuter {
+	SigPair p;
+	half4 h;
+	uint u;
+};
+
+struct SigFields {
+	float a[2];
+	SigPair pairs[2];
+	float grid[2][3];
+	float4 v[2];
+	float2x2 m[2];
+	half hs[3];
+	device float *f;
+	constant SigPair *sp;
+	constant float4x4 *transform;
+	device float2 (*rows)[4];
+	texture2d<float> t;
+	sampler s;
+	array<float, 3> af;
+	texture2d<float> ts[2];
+	sampler ss[2];
+	device float *ps[2];
+	float2 origin;
+};
+
+[[stitchable]] SigPair sig_struct(SigOuter o, int i, uint2 u, half h, bool z)
+{
+	SigPair r;
+	r.xy = o.p.xy + float2(u) + float(h) + float(z);
+	r.w = float(o.u);
+	r.n = i;
+	return r;
+}
+
+[[stitchable]] void sig_void(float a) {}
+
+[[stitchable]] float sig_none() { return 1; }
+
+[[stitchable]] uchar4 sig_scalars(char c, short s, ushort2 us, float4x4 m, packed_float3 pf, long l,
+                                  ulong3 ul, bool2 b, half3x2 hm, float2x3 fm, packed_half2 ph, uint u,
+                                  int4 i4, uchar uc, char3 c3)
+{
+	return uchar4(uchar(c + s + us.x), uchar(m[0][0] + pf.x + float(l) + float(ul.x) + float(b.x)),
+	              uchar(float(hm[0][0]) + fm[0][0] + float(ph.x)), uchar(u + uint(i4.x) + uc + uchar(c3.x)));
+}
+
+[[stitchable]] float sig_pointers(device float *p, constant int4 *q, float a[3], device SigPair *sp,
+                                  constant float4x4 *m, device float2 (*rows)[4], thread half *t)
+{
+	return p[0] + float(q[0].x) + a[0] + sp->w + (*m)[0][0] + rows[0][1].x + float(t[0]);
+}
+
+[[stitchable]] float4 sig_fields(SigFields f, array<float, 3> af, sampler s)
+{
+	return f.t.sample(f.s, f.origin) + f.a[0] + af[1] + f.f[0] + f.sp->w + (*f.transform)[0][0] +
+	       f.ts[1].sample(s, f.origin);
+}
+
+[[stitchable]] float4 sig_textures(texture2d<half, access::read> r, texture2d<float, access::write> w,
+                                   texture2d<float, access::read_write> rw, depth2d<float> d,
+                                   texture3d<float> t3, texturecube_array<float> ca,
+                                   texture1d_array<float> a1, texture_buffer<float> tb,
+                                   texture2d_ms_array<float> msa, depth2d_ms_array<float> dmsa,
+                                   texture2d<int> ti, texture2d<ushort> tu, sampler s)
+{
+	return float4(r.read(uint2(0))) + d.sample(s, float2(0)) + t3.sample(s, float3(0));
+}
+
+[[stitchable]] texture2d<float> sig_returns_texture(texture2d<float> t) { return t; }
