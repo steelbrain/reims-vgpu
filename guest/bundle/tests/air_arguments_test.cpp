@@ -157,6 +157,14 @@ int main()
 	check(!rgfxAirWritesTextureAnywhere(planes) && !rgfxAirWritesTextureAnywhere(all),
 	      "functions of fixed indices write nowhere else");
 
+	// Threadgroup memory is bound by no buffer: the device buffer at its index is read alone.
+	const RgfxAirFunction shares = entry(lib, "shares_threadgroup_memory");
+	check(shares.arguments.size() == 2,
+	      "shares_threadgroup_memory: its two buffers, no threadgroup memory");
+	expect(shares, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::Read,
+	       "a read buffer at 0, the threadgroup memory's index");
+	expect(shares, RgfxAirKind::Buffer, 1, 1, RgfxAirAccess::ReadWrite, "a device buffer at 1");
+
 	// A stage input's attribute, a function table and an acceleration structure: bindings of no
 	// texture, beside those the function has.
 	const RgfxAirFunction attributes = entry(lib, "reads_attributes");

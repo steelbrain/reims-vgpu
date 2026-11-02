@@ -538,6 +538,20 @@ bool writes(RgfxAirAccess a)
 	return a == RgfxAirAccess::Write || a == RgfxAirAccess::ReadWrite;
 }
 
+// Whether an `air.buffer` argument's node is of threadgroup memory (`air.address_space` 3,
+// `[[threadgroup(n)]]`): memory each threadgroup has of its own, sized by the encoder, which no
+// buffer is bound to.
+bool threadgroupMemory(const Module &m, const Module::Md &node)
+{
+	for (size_t i = 0; i + 1 < node.ops.size(); i++) {
+		const std::string *s = mdString(m, node.ops[i]);
+		int64_t space = 0;
+		if (s != nullptr && *s == "air.address_space" && mdInteger(m, node.ops[i + 1], space))
+			return space == 3;
+	}
+	return false;
+}
+
 // Whether metadata `i` is a global variable of the module (one no function is): a binding index
 // function constants set, which the module's initialiser stores there.
 bool mdGlobalVariable(const Module &m, uint64_t i)
@@ -717,6 +731,8 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			continue; // a built-in or a stage input, of no binding
 		if (!binding(m, *arg, kindAt + 1, a))
 			return false;
+		if (a.kind == RgfxAirKind::Buffer && threadgroupMemory(m, *arg))
+			continue; // threadgroup memory: no buffer at its index
 		// A texture of no access the reader knows is one it may write.
 		if (a.kind == RgfxAirKind::Texture && a.access == RgfxAirAccess::Unknown)
 			return false;

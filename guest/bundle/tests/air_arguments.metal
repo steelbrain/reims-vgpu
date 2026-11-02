@@ -2,7 +2,7 @@
 // with binding arguments of each kind and access, arrays of them, argument buffers with and
 // without a written texture, a function constant, arguments declared under function constants,
 // binding indices function constants set, a vertex function's and a kernel's stage input, a
-// function table and an acceleration structure, and a function of no texture.
+// function table and an acceleration structure, threadgroup memory, and a function of no texture.
 // Built into a .metallib by Apple's Metal compiler at test time; never committed.
 #include <metal_raytracing>
 #include <metal_stdlib>
@@ -121,6 +121,18 @@ kernel void reads_where_constants_say(texture2d<half, access::read> luma [[textu
                                       uint2 g [[thread_position_in_grid]])
 {
 	out.write(luma.read(g), g);
+}
+
+// Threadgroup memory at 0 beside a device buffer at 0 the kernel only reads: no buffer is bound
+// at the memory's index.
+kernel void shares_threadgroup_memory(threadgroup float *shared [[threadgroup(0)]],
+                                      device const float *in [[buffer(0)]],
+                                      device float *out [[buffer(1)]],
+                                      uint t [[thread_position_in_threadgroup]])
+{
+	shared[t] = in[t];
+	threadgroup_barrier(mem_flags::mem_threadgroup);
+	out[t] = shared[t ^ 1];
 }
 
 [[visible]] float doubled(float x)

@@ -17,7 +17,8 @@
 // place of the integer; the argument is read as one at any index. A binding of a kind the reader
 // does not know makes the function's answer unknown; a vertex function's and a kernel's stage
 // input attributes, function tables and acceleration structures are named, as bindings of no
-// texture. Read from modules that Apple's Metal compiler built from our own sources
+// texture. Threadgroup memory is an `air.buffer` of `air.address_space` 3, at an index of its own
+// that no buffer is bound to: it is no argument here. Read from modules that Apple's Metal compiler built from our own sources
 // (tests/air_arguments.metal), and as LLVM's text form of the same modules prints them.
 //
 // The reader is LLVM's bitstream format (its documented container: abbreviations, blocks and
