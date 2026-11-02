@@ -400,7 +400,10 @@ Stages:
         format: the windows, layers and drawables the guest's compositors and
         apps draw, which the CPU and the GPU write. Video frames, of two
         planes or YCbCr, stay uncached, sparing the fills a host-side video
-        device's writes would cost. Correctness does not rest on that choice:
+        device's writes would cost, but for the outputs of the bundle's own
+        video driver where the host lands its pictures in the caches
+        (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`, item 16): their textures ask under
+        `RgfxAskCachedScope`. Correctness does not rest on that choice:
         a surface a host-side device writes (the M2 scaler, the VideoToolbox
         decoder) may be cached all the same, and the host invalidates the
         cache of a block whose pages such a device wrote, so the next
@@ -524,9 +527,22 @@ Stages:
       stream's slice headers. Where the device decodes only into its DPB
       pictures (`DPB_AND_OUTPUT_COINCIDE`, as the RTX 5080's decoder), each
       picture then takes one GPU copy from its DPB image into the output
-      surface's planes, on the decode queue. AppleGVA's surfaces lie in place
-      (§14, measured on the guest with the RTX 5080), so that copy writes the
-      surface's pages, and nothing else copies a frame.
+      surface's planes, and nothing else copies a frame on the GPU.
+      AppleGVA's surfaces lie in place (§14, measured on the guest with the
+      RTX 5080). On a GPU of its own memory, the host says
+      `RGFX_VIDEO_CAPS_OUTPUT_CACHED` in the video caps, the driver asks each
+      output surface's block cached (item 14, *Which surfaces are cached*),
+      and the copy writes the surface's device cache, within the GPU's
+      memory, on the VkQueue of a runtime command queue (the graphics
+      family on the RTX 5080), submitted once the host sees the decode
+      done, so no wait of the copy's holds the guest's work on that VkQueue.
+      The guest's GPU work then reads the picture where it landed, and it
+      crosses the bus only at a CPU lock, as the cache's download. Measured
+      on the RTX 5080: a 4K picture lands in 100 us of the GPU, where the
+      copy into the pages took 3.5 ms across a link idled down by a load
+      of decodes alone; a CPU lock downloads it in 1 to 5 ms. Where the GPU
+      shares the CPU's memory, the copy writes the surface's pages, on the
+      decode queue.
 
 ## What metal2vulkan adds in stage 3
 
