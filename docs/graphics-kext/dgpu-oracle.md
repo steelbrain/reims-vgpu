@@ -8,8 +8,8 @@ our stack enforces. Where the x86 contract is looser, the host may do less work;
 stricter than the M3's, guests may rely on it.
 
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
-`oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps` and
-`oracle_errors`.
+`oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
+`oracle_errors` and `oracle_source`.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -21,14 +21,35 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 The two x86 GPUs agree on every coherence question except the ones named, so "x86" below
 means both.
 
+## Reading the oracles
+
+Each answer below is read in one of four classes, and its class decides what the lane does with
+it:
+
+1. **Documented.** Metal's documentation promises the behaviour. The lane keeps it exactly,
+   whatever a Mac measured here does.
+2. **Divergent.** The documentation leaves it open, and the three Macs disagree. Any of their
+   answers is inside the envelope a guest can meet, so the lane takes the one that costs the
+   host least.
+3. **Agreed.** The documentation leaves it open, and all three Macs do the same. Guests may rely
+   on it, so the lane treats it as contract.
+4. **Outside the envelope.** No Mac does what the lane does, or the documentation forbids it.
+   The lane fixes it.
+
+A boot overrides all four: what a guest's frameworks do on the lane decides, whatever the class.
+The tags below, *(class N)*, say which class each answer is read in.
+
 ## Ranked relaxations
 
 | # | relaxation | evidence | what it removes | expected win |
 |---|---|---|---|---|
-| 1 | **An IOSurface's GPU copy is a device cache.** Copy the surface's pages in only at the first GPU use after a CPU read-write unlock, and write the GPU copy back only when a CPU lock follows a GPU write. | Q1: on x86 an unlocked CPU write is never seen by the GPU, and a GPU write is never seen in the pages without a lock, the committing process included. | m2v's whole-surface shadow copy-in before each command buffer, and its merge-back after each writing encoder, of every render-target surface. The copy path's per-command-buffer write-back on the guest CPU. | In WindowServer's steady state nothing CPU-locks the 3840x2400 display surface, so both copies of 36.9 MB per composite go to zero. That is most of the pl1 gap: CLTD 28.2 ms against stock's 0.53. The copies x86 does make cost 5.6 to 7.6 ms each at 4K, paid only at those locks. |
-| 2 | **`commitAndWaitUntilSubmitted` and `waitUntilScheduled` return at submission.** | Q7: x86 returns 0.29 to 0.41 ms after commit, behind a 200 ms command buffer, as the M3 does. | The wait for completion the bundle restored (bbb153d9e), once rgk-lock's lock wait lands. | rgk-perf's fix 1 measured CLTD 19.6 to 6.1 ms. This is the M3's rule too; the oracle confirms x86 has no stricter one. |
-| 3 | **Asynchronous pipeline creators return before the compile.** | Q7: the handler runs about 60 ms later, on Metal's `Device serial queue`. | Our bundle compiles on the caller's thread, inside the call. | Compile time moves off apps' calling threads (launch, first frames). Nothing in WindowServer's steady state. |
-| 4 | **Shared textures' CPU access on a discrete host may use a CPU copy.** | Q3: on AMD, `getBytes:` of a Shared texture never sees GPU writes, and `replaceRegion:` uploads the CPU copy whole. | The waited staging blit of each `getBytes:`/`replaceRegion:` of a Shared texture. | Small: the calls are rare, and Intel and the M3 keep such textures coherent. |
+| 1 | *(class 2)* **An IOSurface's GPU copy is a device cache.** Copy the surface's pages in only at the first GPU use after a CPU read-write unlock, and write the GPU copy back only when a CPU lock follows a GPU write. | Q1: on x86 an unlocked CPU write is never seen by the GPU, and a GPU write is never seen in the pages without a lock, the committing process included. | m2v's whole-surface shadow copy-in before each command buffer, and its merge-back after each writing encoder, of every render-target surface. The copy path's per-command-buffer write-back on the guest CPU. | In WindowServer's steady state nothing CPU-locks the 3840x2400 display surface, so both copies of 36.9 MB per composite go to zero. That is most of the pl1 gap: CLTD 28.2 ms against stock's 0.53. The copies x86 does make cost 5.6 to 7.6 ms each at 4K, paid only at those locks. |
+| 2 | *(class 3; landed, c95fca750)* **`commitAndWaitUntilSubmitted` and `waitUntilScheduled` return at submission.** | Q7: x86 returns 0.29 to 0.41 ms after commit, behind a 200 ms command buffer, as the M3 does. | The wait for completion the bundle restored (bbb153d9e), once rgk-lock's lock wait lands. | rgk-perf's fix 1 measured CLTD 19.6 to 6.1 ms. This is the M3's rule too; the oracle confirms x86 has no stricter one. |
+| 3 | *(class 3; the handler's queue class 2)* **Asynchronous pipeline creators return before the compile.** | Q7: the handler runs about 60 ms later, on Metal's `Device serial queue`. | Our bundle compiles on the caller's thread, inside the call. | Compile time moves off apps' calling threads (launch, first frames). Nothing in WindowServer's steady state. |
+| 4 | *(withdrawn)* **Shared textures' CPU access on a discrete host may use a CPU copy.** | Q3: on AMD, `getBytes:` of a Shared texture never sees GPU writes, and `replaceRegion:` uploads the CPU copy whole. | The waited staging blit of each `getBytes:`/`replaceRegion:` of a Shared texture. | Small: the calls are rare, and Intel and the M3 keep such textures coherent. |
+
+Relaxation 4 is withdrawn: the calls are rare, and Intel and the M3 keep such textures
+coherent, as ours does.
 
 No relaxation was found for Managed storage (Q2: our discrete path already keeps two copies
 synced by `didModifyRange:` and `synchronizeResource:`, as AMD does), Shared buffers (Q3:
@@ -38,19 +59,22 @@ coherent at command-buffer boundaries on x86, and ours are in place), load and s
 
 ## Where x86 is stricter than the M3 rules we copy
 
-Guests may rely on these, since every x86 Mac behaved this way:
-- **DontCare stores keep color.** A pass with store action DontCare writes its draws and
-  clears to memory on both x86 GPUs. On the M3 it drops them, and m2v copies nothing back for a
-  DontCare store (`render/shadows.rs`), as the M3 does (Q4).
-- **Untracked resources are ordered across command buffers.** An untracked buffer written by
-  one command buffer and read by the next on the same queue, with no event, is ordered on both
-  x86 GPUs and races on the M3 (Q6).
-- **A timeout's error is IOAccelerator's.** x86 answers code 2 with "Caused GPU Timeout Error
-  (00000002:kIOAccelCommandBufferCallbackErrorTimeout)" and no underlying error. Our bundle
-  answers code 2 with the M3's "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)"
-  (Q8).
-- **GPU times are real.** `GPUStartTime`/`GPUEndTime` are on the host clock on x86; our host
-  sends 0 for both (Q7).
+Every x86 Mac behaved this way. Where the M3 does otherwise, the answer is divergent, not
+agreed:
+- *(class 2: the lane keeps the M3's, which copies less)* **DontCare stores keep color.** A
+  pass with store action DontCare writes its draws and clears to memory on both x86 GPUs. On the
+  M3 it drops them, and m2v copies nothing back for a DontCare store (`render/shadows.rs`), as
+  the M3 does (Q4).
+- *(class 2: the lane keeps the M3's)* **Untracked resources are ordered across command
+  buffers.** An untracked buffer written by one command buffer and read by the next on the same
+  queue, with no event, is ordered on both x86 GPUs and races on the M3 (Q6).
+- *(class 2)* **A timeout's error is IOAccelerator's.** x86 answers code 2 with "Caused GPU
+  Timeout Error (00000002:kIOAccelCommandBufferCallbackErrorTimeout)" and no underlying error.
+  Our bundle answers code 2 with the M3's "Caused GPU Hang Error
+  (00000003:kIOGPUCommandBufferCallbackErrorHang)" (Q8).
+- *(class 3: the M3's are real too)* **GPU times are real.** `GPUStartTime`/`GPUEndTime` are on
+  the host clock on x86. The host sends the platform's GPU times in each completion, where it
+  sent 0 for both (Q7).
 
 ## Q1: IOSurface-backed textures
 
@@ -182,9 +206,9 @@ Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `spin`.
 
 ## Q4: render-pass load and store actions
 
-Probe: `oracle_passes DEVICE actions private|managed|iosurface`, `depth`, `msaa`. A 256 x 256
-RGBA8 attachment, cleared to A and stored, then one pass of the row's actions with or without a
-draw of B over its left half (Clear rows clear to C).
+Probe: `oracle_passes DEVICE actions private|managed|iosurface`, `depth`, `stencil`, `msaa`. A
+256 x 256 RGBA8 attachment, cleared to A and stored, then one pass of the row's actions with or
+without a draw of B over its left half (Clear rows clear to C).
 
 | load | store | draw | AMD and Intel: left, right | M3: left, right |
 |---|---|---|---|---|
@@ -196,8 +220,11 @@ draw of B over its left half (Clear rows clear to C).
 | Clear | DontCare | - | C, C | A, A |
 
 The same for Private, Managed and IOSurface attachments. Depth32Float cleared with store
-DontCare keeps the clear on AMD and drops it on Intel and the M3. A 4x MSAA attachment resolved
-with its samples DontCare keeps its samples on all three.
+DontCare keeps the clear on AMD and drops it on Intel and the M3. The stencil of a
+Depth32Float_Stencil8 attachment cleared with store DontCare keeps the clear on AMD and Intel,
+and drops it on the M3, which keeps the stencil stored before. A 4x MSAA attachment resolved with
+its samples DontCare keeps its samples on all three. *(class 2: what a DontCare store leaves is
+divergent for color, depth and stencil.)*
 
 Our stack: m2v copies a shadow in for a DontCare load, as for Load, and copies nothing back for
 a DontCare store; a whole-texture Clear copies nothing in. **Relaxation: none**: x86 keeps every
@@ -218,10 +245,11 @@ Probe: `oracle_passes DEVICE features`.
 | raster-order-group pipeline | made (`areRasterOrderGroupsSupported` 1) | made (1) | made (1) |
 | `supportsTileShaders`, `supportsImageBlocks` (SPI) | 0, 0 | 0, 0 | 1, 1 |
 
-Our stack: memoryless textures are made (m2v), and `isFramebufferReadSupported`,
-`supportsTileShaders` and `supportsImageBlocks` are not overridden by the bundle, so the base
-class answers them. **Relaxation: none.** With no Apple family claimed, guests should ask for
-none of these; a guest that makes a memoryless texture ends on x86 and goes on with ours.
+Our stack: memoryless textures are made (m2v). The lane answers `isFramebufferReadSupported`
+no, as AMD does *(class 2: the Vulkan platform's fetch costs most)*, and `supportsTileShaders`
+and `supportsImageBlocks` no, as both x86 GPUs do (4ee4bcaf0). **Relaxation: none.** With no
+Apple family claimed, guests should ask for none of these; a guest that makes a memoryless
+texture ends on x86 and goes on with ours.
 
 ## Q6: hazard tracking
 
@@ -267,10 +295,14 @@ Probe: `oracle_cmdbuf DEVICE timing`. Times are from commit.
 | `kernelStartTime`/`kernelEndTime` | +0.08 / +0.16 ms | +0.06 / +0.09 ms |
 | async compute and render pipeline creators | return with the handler pending; it runs about 60 ms later on `Device serial queue` | the same |
 
-Our stack (HEAD): `commitAndWaitUntilSubmitted` and `waitUntilScheduled` wait for completion
-(bbb153d9e restored it; the host still posts `CB_SCHEDULED`), handlers run on the process's
-completion thread in Metal's order, `GPUStartTime == GPUEndTime` is the delivery time (the host
-sends 0), and the async creators call their handler on the caller's thread before returning.
+The M3 also runs a creator's handler after the creator returns, on the global default-QoS queue
+(`com.apple.root.default-qos`) *(class 3 that it runs after the return; class 2 which queue)*.
+
+Our stack: `commitAndWaitUntilSubmitted` and `waitUntilScheduled` return at submission
+(c95fca750), and handlers run on the process's completion thread in Metal's order. The host
+sends the platform's GPU times, from which the bundle answers `GPUStartTime` and `GPUEndTime`,
+and the async creators run their create and handler on the global default-QoS queue, after the
+creator returns, as the M3 does.
 **Relaxations:** ranked 2 and 3.
 
 ## Q8: errors and refusals
@@ -304,11 +336,11 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 
 | answer | AMD | Intel 630 | M3 | ours (5080) |
 |---|---|---|---|---|
-| `maxBufferLength` | 3208642560 | 2147483648 | 41747087360 | 1099511627776 |
+| `maxBufferLength` | 3208642560 | 2147483648 | 41747087360 | 12821200896 (4ee4bcaf0; 1099511627776 before) |
 | `maxThreadgroupMemoryLength` | 65536 | 65536 | 32768 | 32768 |
 | `maxArgumentBufferSamplerCount` | 2048 | 2048 | 500000 | 0 |
 | `readWriteTextureSupport` | 2 | 1 | 2 | 2 |
-| `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | not overridden |
+| `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | 256 (4a329e614) |
 | `iosurfaceTextureAlignmentBytes` | 16 | 16 | 16 | |
 | `isDepth24Stencil8PixelFormatSupported` | 1 | 0 | 0 | 0 |
 | `supports32BitMSAA`, `supportsPullModelInterpolation` | 1, 1 | 1, 1 | 1, 1 | 0, 0 |
@@ -330,9 +362,11 @@ answers on x86 for every format (the format's bytes per pixel, or a compressed b
 the M3 asserts for compressed and depth ones. Our device makes ASTC and the packed formats (m2v),
 which no x86 Mac does; with no Apple family claimed, frameworks should not ask for them.
 
-**Relaxation: none** for performance. One answer may help placement: both x86 GPUs answer
-`minimumLinearTextureAlignmentForPixelFormat:` 256 where our bundle leaves the base class's
-answer, and a 256-byte row alignment suits the Vulkan hosts' linear images.
+**Relaxation: none** for performance. Two answers help the host, and the lane gives both, as
+choices inside the envelope *(class 2)*: `minimumLinearTextureAlignmentForPixelFormat:` and the
+SPI linear alignments 256 for every format, as both x86 GPUs answer, which suits the Vulkan
+hosts' linear images (4ee4bcaf0, 4a329e614); and `maxBufferLength` at most three quarters of
+`recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
 
 ## Not measured
 
