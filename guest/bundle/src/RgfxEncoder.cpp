@@ -86,6 +86,20 @@ void RgfxEncoder::appendArrayOp(uint16_t tag, const void *head, size_t head_n, c
 		appendBytes(elems, static_cast<size_t>(count) * stride);
 }
 
+void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
+{
+	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse);
+	std::vector<uint8_t> ops(count * len);
+	for (size_t i = 0; i < count; i++) {
+		RgfxOpHeader h = {};
+		h.tag = RGFX_OP_SURFACE_USE;
+		h.len = static_cast<uint32_t>(len);
+		std::memcpy(ops.data() + i * len, &h, sizeof(h));
+		std::memcpy(ops.data() + i * len + RGFX_OP_BODY_OFFSET, &uses[i], sizeof(uses[i]));
+	}
+	m_buf.insert(m_buf.begin() + RGFX_COMMAND_BUFFER_OPS_OFFSET, ops.begin(), ops.end());
+}
+
 uint64_t RgfxEncoder::opBytes() const
 {
 	return m_buf.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET;

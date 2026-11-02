@@ -211,21 +211,25 @@ bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uin
 
 // The kext's shared blocks of surfaces in place, as RgfxRegion's surface pages source: the
 // block every process that holds the surface gets, found by the whole allocation it maps at
-// `base`, the device's GPU using those pages. Unsupported where the device lacks the feature or
-// refused the pages; refused for any other answer, among them a kext that takes three inputs.
+// `base`, the device's GPU using those pages, and cached where the kext made it so (six inputs,
+// the surface's IOSurfaceID and whether it may be cached; a fifth output). Unsupported where the
+// device lacks the feature or refused the pages; refused for any other answer, among them a
+// kext that takes fewer inputs.
 RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
-                                             uint64_t size, uint64_t *offset, uint64_t *serial,
-                                             bool *fresh)
+                                             uint64_t size, uint32_t surfaceId, bool cacheable,
+                                             uint64_t *offset, uint64_t *serial, bool *fresh,
+                                             bool *cached)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
-	uint64_t in[4] = {reinterpret_cast<uintptr_t>(base), length, size, 1};
-	uint64_t out[4] = {};
-	uint32_t outCount = 4;
+	uint64_t in[6] = {reinterpret_cast<uintptr_t>(base), length, size, 1, surfaceId,
+	                  cacheable ? 1u : 0u};
+	uint64_t out[5] = {};
+	uint32_t outCount = 5;
 	kern_return_t kr =
-	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 4, out, &outCount);
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6, out, &outCount);
 	if (kr == kIOReturnUnsupported)
 		return RgfxRegion::kPagesUnsupported;
-	if (kr != KERN_SUCCESS || outCount != 4)
+	if (kr != KERN_SUCCESS || outCount != 5)
 		return RgfxRegion::kPagesRefused;
 	if (out[1] != size) {
 		IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &out[0], 1, nullptr,
@@ -235,6 +239,7 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, ui
 	*offset = out[0];
 	*serial = out[2];
 	*fresh = out[3] != 0;
+	*cached = out[4] != 0;
 	return RgfxRegion::kPagesGiven;
 }
 

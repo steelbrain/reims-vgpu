@@ -26,6 +26,16 @@
  * RgfxCaps::linearTextureAlignment), and every plane lies within the allocation. In place, a
  * surface takes one page of the region however large it is.
  *
+ * In place, a surface of one plane and no YCbCr is asked cached: where the host's GPU has memory
+ * of its own (RGFX_FEATURE_SURFACE_CACHE), the kext makes the block cached, and the host keeps
+ * the surface's GPU copy there, a device cache, apart from its pages (docs/graphics-kext/
+ * design.md, Decided 14, "The device cache"). The pages and the cache meet at IOSurface's locks,
+ * which the kext serves, and at the commit of each command buffer that uses the surface, which
+ * names it before its first encoder with the surface's CPU generation from the block's header
+ * (rgfxIOSurfaceNameUses), so the host fills the cache where the CPU wrote the surface under a
+ * read-write lock since. The texture's own CPU access takes the surface's lock, as a CPU access
+ * does. Whether a block is cached is the kext's answer, the same for every holder.
+ *
  * Where it does not, or the device uses no surface in place (no RGFX_FEATURE_SURFACE_PAGES), or
  * the host or the kext refuses the surface's pages, the view is a copy: the surface's own pages
  * stay its CPU copy, which every process and the CPU agree on, and its GPU view is the shared
@@ -133,6 +143,20 @@ void rgfxIOSurfaceSyncBeforeCommit(void);
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
 /// over an IOSurface or a view of one, through any views (otherwise nothing).
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
+
+/// Records on `enc` that its command buffer uses `resource`, when `resource` is a texture over an
+/// IOSurface whose shared block is cached (a device cache on the host), or a view of one;
+/// otherwise nothing, and nothing at all while no such texture lives in the process.
+void rgfxIOSurfaceNoteUse(RgfxEncoder *_Nullable enc, id _Nullable resource);
+
+/// At a commit, before the command buffer is posted: names in `enc`'s op stream, before its
+/// first encoder, each cached surface the buffer uses (rgfxIOSurfaceNoteUse) or writes (`writes`,
+/// taken from `enc`), once each (RGFX_OP_SURFACE_USE): its block, its CPU generation as the kext
+/// left it at the surface's last read-write lock, and whether the buffer writes it. The host
+/// fills the surface's device cache from its pages before the buffer's work where the cache holds
+/// an older generation.
+void rgfxIOSurfaceNameUses(RgfxEncoder *_Nonnull enc,
+                           const std::vector<std::shared_ptr<void>> &writes);
 
 /// The textures over IOSurfaces, or views of them, bound at the indexes of one stage of an
 /// encoder, so that each draw or dispatch names as written those its function writes there. A

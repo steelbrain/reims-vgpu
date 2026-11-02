@@ -79,14 +79,16 @@ void RgfxRegion::setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignmen
 }
 
 RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint64_t length,
-                                                         uint64_t size, PagesAnswer *answer)
+                                                         uint64_t size, uint32_t surfaceId,
+                                                         bool cacheable, PagesAnswer *answer)
 {
 	SurfaceBlock out = {};
 	uint64_t offset = 0, serial = 0;
-	bool fresh = false;
+	bool fresh = false, cached = false;
 	*answer = m_pagesAcquire == nullptr
 	              ? kPagesUnsupported
-	              : m_pagesAcquire(m_pagesContext, base, length, size, &offset, &serial, &fresh);
+	              : m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable,
+	                               &offset, &serial, &fresh, &cached);
 	if (*answer != kPagesGiven) {
 		return out; // block.ok == false
 	}
@@ -98,6 +100,7 @@ RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint6
 	out.block = {offset, m_base + offset, size, true};
 	out.serial = serial;
 	out.fresh = fresh;
+	out.cached = cached;
 	return out;
 }
 

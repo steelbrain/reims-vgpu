@@ -177,6 +177,7 @@ uint64_t rgfxNamed(RgfxEncoder *enc, id obj)
 uint64_t rgfxReads(RgfxEncoder *enc, id obj)
 {
 	rgfxNoteShadowUse(enc, obj, false);
+	rgfxIOSurfaceNoteUse(enc, obj);
 	return rgfxNamed(enc, obj);
 }
 
@@ -185,6 +186,7 @@ uint64_t rgfxReads(RgfxEncoder *enc, id obj)
 uint64_t rgfxWrites(RgfxEncoder *enc, id obj)
 {
 	rgfxNoteShadowUse(enc, obj, true);
+	rgfxIOSurfaceNoteUse(enc, obj);
 	return rgfxNamed(enc, obj);
 }
 
@@ -197,6 +199,7 @@ uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
 		                    ([(id<MTLTexture>)obj usage] & MTLTextureUsageShaderWrite) != 0;
 		rgfxNoteShadowUse(enc, obj, writes);
 	}
+	rgfxIOSurfaceNoteUse(enc, obj);
 	return rgfxNamed(enc, obj);
 }
 
@@ -208,6 +211,7 @@ uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
 	if (writes)
 		rgfxIOSurfaceNoteWrite(enc, obj);
 	rgfxNoteShadowUse(enc, obj, writes);
+	rgfxIOSurfaceNoteUse(enc, obj);
 	return rgfxNamed(enc, obj);
 }
 
@@ -1107,6 +1111,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// completion.
 	rgfxIOSurfaceSyncBeforeCommit();
 	_surfaceWrites = _encoder->takeSurfaceWrites();
+	// The cached surfaces it uses are named before its first encoder, each with the CPU's
+	// generation of it as of this commit, so the host fills each one's device cache first where
+	// the CPU wrote it since.
+	rgfxIOSurfaceNameUses(_encoder, _surfaceWrites);
 	// The surfaces it writes are named to the kext once it is posted, and retired at its
 	// completion, which may come before the naming: the kext then keeps nothing of them.
 	RgfxRegion *writesRegion = rgfxIOSurfaceWritesRegion(_surfaceWrites);

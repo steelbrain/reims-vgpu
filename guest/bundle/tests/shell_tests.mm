@@ -6070,6 +6070,10 @@ void test_region_memory_given_back_after_destroy()
 	CHECK(ringEmpty(fx.ring));
 }
 
+// The bytes of a surface's shared-block header (RgfxIOSurface.mm's RgfxSurfaceHeader), which
+// the writers follow: a copy's seed and serial, and a cached block's CPU generation at 16.
+constexpr uint64_t kSurfaceHeader = 24;
+
 // An IOSurface texture's copy goes as the texture goes: the texture, then the copy's buffer,
 // from the host, and only then the copy's block back to the region.
 void test_iosurface_copy_block_after_destroys()
@@ -6361,7 +6365,8 @@ void test_iosurface_planes()
 	IOSurfaceUnlock(surface, 0, nullptr);
 	// The copy: plane 0's rows from 0, plane 1's from 12288, 256 bytes apart; the header at
 	// 18432, the writers after it, the block 20480 bytes.
-	const uint64_t kPitch = 256, kChroma = 12288, kWriters = 18432 + 16, kSize = 20480;
+	const uint64_t kPitch = 256, kChroma = 12288, kSize = 20480;
+	const uint64_t kWriters = 18432 + kSurfaceHeader;
 	uint8_t *block = mem.data() + src.offset;
 	auto copied = [&](size_t p, uint64_t at, size_t rows) {
 		for (size_t r = 0; r < rows; r++)
@@ -6516,7 +6521,7 @@ void test_iosurface_writers()
 		return q;
 	};
 	// 16 x 16 BGRA: rows 256 bytes apart, the header at 4096, the writers after it.
-	const uint64_t kWriters = 4096 + 16;
+	const uint64_t kWriters = 4096 + kSurfaceHeader;
 	auto *writers = reinterpret_cast<RgfxSurfaceWriters *>(mem.data() + src.offset + kWriters);
 	// The block held an older one's writers.
 	for (auto &w : writers->writers)
@@ -7017,13 +7022,19 @@ void test_iosurface_in_place()
 		uint64_t copyOffset = RGFX_ALLOCATIONS_OFFSET + 0x60000;
 		const void *base = nullptr;
 		uint64_t length = 0, size = 0;
+		uint32_t surfaceId = 0;
+		bool cacheable = false;
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
-		                                     uint64_t size, uint64_t *offset, uint64_t *serial,
-		                                     bool *fresh)
+		                                     uint64_t size, uint32_t surfaceId, bool cacheable,
+		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
+		                                     bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
+			src->surfaceId = surfaceId;
+			src->cacheable = cacheable;
+			*cached = false;
 			src->base = base;
 			src->length = length;
 			src->size = size;
@@ -7052,7 +7063,7 @@ void test_iosurface_in_place()
 	region.setSurfacePagesSource(&Source::pages, 16, &src);
 	// The block in place: its header first, untouched, then the writers, emptied, and nothing
 	// more of the page written.
-	const uint64_t kWriters = 16;
+	const uint64_t kWriters = kSurfaceHeader;
 	uint8_t *block = mem.data() + src.offset;
 	auto blockLeft = [&]() {
 		for (uint64_t i = 0; i < 0x1000; i++) {
@@ -7099,6 +7110,8 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *t = overPlane(flat, MTLPixelFormatBGRA8Unorm, 16, 16, 0);
 		CHECK(t != nil && src.asked == 1 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == pixels && src.length == allocBytes(flat) && src.size == 0x1000);
+		// One plane, no YCbCr: asked cached, by its IOSurfaceID.
+		CHECK(src.surfaceId == IOSurfaceGetID(flat) && src.cacheable);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.obj_id != 0 && buffer.block_offset == src.offset &&
@@ -7182,6 +7195,8 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *luma = overPlane(surface, MTLPixelFormatR16Unorm, 64, 48, 0);
 		CHECK(luma != nil && src.asked == 2 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == base && src.length == allocBytes(surface) && src.size == 0x1000);
+		// Two planes: not asked cached.
+		CHECK(src.surfaceId == IOSurfaceGetID(surface) && !src.cacheable);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.block_offset == src.offset && buffer.length == allocBytes(surface));
@@ -7221,7 +7236,7 @@ void test_iosurface_in_place()
 		auto made =
 		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
 		CHECK(made.texture.buffer_obj_id == create.obj_id && made.texture.bytes_per_row == 256 &&
-		      made.texture.writers_offset == 4096 + 16);
+		      made.texture.writers_offset == 4096 + kSurfaceHeader);
 		drainRing(fx.ring);
 	}
 	drainRing(fx.ring);
@@ -7247,8 +7262,8 @@ void test_iosurface_in_place_fallback()
 		RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesUnsupported;
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
-		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t,
-		                                     uint64_t *, uint64_t *, bool *)
+		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
+		                                     bool, uint64_t *, uint64_t *, bool *, bool *)
 		{
 			Source *src = static_cast<Source *>(c);
 			src->asked++;
@@ -7320,7 +7335,8 @@ void test_iosurface_in_place_fallback()
 			auto made = expectMessage<RgfxSurfaceTextureMessage>(fx.ring,
 			                                                     RGFX_CMD_TEXTURE_FROM_IOSURFACE);
 			CHECK(made.texture.buffer_obj_id == create.obj_id && made.texture.offset == 0 &&
-			      made.texture.bytes_per_row == kPitch && made.texture.writers_offset == 4096 + 16);
+			      made.texture.bytes_per_row == kPitch &&
+			      made.texture.writers_offset == 4096 + kSurfaceHeader);
 			CHECK(blockIs(0x2468ace0 + answer) && ringEmpty(fx.ring));
 			CHECK([(id<RgfxMetalTextureInternals>)t gpuAddress] != 0 && t.allocatedSize == 8192);
 		}
@@ -7350,13 +7366,19 @@ void test_iosurface_in_place_core_image_set()
 		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x80000;
 		const void *base = nullptr;
 		uint64_t length = 0, size = 0, offset = 0;
+		uint32_t surfaceId = 0;
+		bool cacheable = false;
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
-		                                     uint64_t size, uint64_t *offset, uint64_t *serial,
-		                                     bool *fresh)
+		                                     uint64_t size, uint32_t surfaceId, bool cacheable,
+		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
+		                                     bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
+			src->surfaceId = surfaceId;
+			src->cacheable = cacheable;
+			*cached = false;
 			src->base = base;
 			src->length = length;
 			src->size = size;
@@ -7479,7 +7501,7 @@ void test_iosurface_in_place_core_image_set()
 				CHECK(made.texture.buffer_obj_id == buffer &&
 				      made.texture.offset == static_cast<uint64_t>(rows - base) &&
 				      made.texture.bytes_per_row == rowBytes && made.texture.plane == k &&
-				      made.texture.writers_offset == 16 &&
+				      made.texture.writers_offset == kSurfaceHeader &&
 				      made.texture.iosurface_id == IOSurfaceGetID(s));
 				if (planes == 2) {
 					auto *chroma = static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(s, 1));
@@ -7504,6 +7526,245 @@ void test_iosurface_in_place_core_image_set()
 	CVPixelBufferRelease(pixelBuffer);
 }
 
+// A surface whose block the kext made cached, its GPU copy in a device cache on the host
+// (RgfxIOSurface.h): only surfaces of one plane and no YCbCr are asked cached, and a block is
+// cached as the kext answers, whoever made it. A command buffer names each cached surface it uses
+// before its first encoder, once, with the CPU generation the block's header holds at its commit
+// and whether it writes the surface (RGFX_OP_SURFACE_USE): a bound texture, an attachment, a
+// blit's source or destination, a resource it uses; views name their surface. A buffer that uses
+// none names nothing, and nor does one using a surface not cached. The texture's own CPU access
+// takes the surface's lock, a write a read-write one, which a texture not cached does not.
+void test_iosurface_cached()
+{
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	TestRing &completion = *new TestRing(0x8000);
+	RgfxReplyReader &reader = *new RgfxReplyReader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+	struct Source {
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		bool answerCached = true;
+		uint32_t surfaceId = 0;
+		bool cacheable = false;
+		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t size,
+		                                     uint32_t surfaceId, bool cacheable, uint64_t *offset,
+		                                     uint64_t *serial, bool *fresh, bool *cached)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->surfaceId = surfaceId;
+			src->cacheable = cacheable;
+			*offset = src->next;
+			src->next += size;
+			*serial = 3;
+			*fresh = true;
+			*cached = src->answerCached;
+			return RgfxRegion::kPagesGiven;
+		}
+		static void release(void *, uint64_t) {}
+	} &src = *new Source();
+	region.setSurfaceSource(nullptr, &Source::release, &src);
+	region.setSurfacePagesSource(&Source::pages, 16, &src);
+	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
+	CHECK(queue != nil);
+	queue.replyReader = &reader;
+	(void)expectQueueCreate(control);
+	// Commits `cb`, completes it, and answers its SURFACE_USE ops, which must all come before its
+	// first other op.
+	auto uses = [&](id<MTLCommandBuffer> cb) {
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		std::vector<RgfxOpSurfaceUse> out;
+		bool before = true;
+		size_t at = RGFX_COMMAND_BUFFER_OPS_OFFSET;
+		while (at + sizeof(RgfxOpHeader) <= bytes.size()) {
+			RgfxOpHeader op = {};
+			std::memcpy(&op, bytes.data() + at, sizeof(op));
+			CHECK(op.len >= RGFX_OP_BODY_OFFSET && at + op.len <= bytes.size());
+			if (op.tag == RGFX_OP_SURFACE_USE) {
+				CHECK(before && op.len == RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse));
+				RgfxOpSurfaceUse u = {};
+				std::memcpy(&u, bytes.data() + at + RGFX_OP_BODY_OFFSET, sizeof(u));
+				CHECK(u.reserved_14 == 0);
+				out.push_back(u);
+			} else {
+				before = false;
+			}
+			at += op.len;
+		}
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		CHECK(reader.pump() == 1);
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		drainRing(control);
+		return out;
+	};
+	auto is = [](const std::vector<RgfxOpSurfaceUse> &got, uint64_t offset, uint64_t gen,
+	             uint32_t flags) {
+		return got.size() == 1 && got[0].block_offset == offset && got[0].cpu_gen == gen &&
+		       got[0].flags == flags;
+	};
+	auto overSurface = [&](IOSurfaceRef s, MTLTextureUsage usage) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = usage;
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&ser];
+	};
+	auto pixelBuffer = [](OSType format) {
+		CVPixelBufferRef pb = nullptr;
+		NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+		CHECK(CVPixelBufferCreate(nullptr, 16, 16, format, (__bridge CFDictionaryRef)attrs, &pb) ==
+		          kCVReturnSuccess &&
+		      pb != nullptr && CVPixelBufferGetIOSurface(pb) != nullptr);
+		return pb;
+	};
+	const MTLSize one = MTLSizeMake(1, 1, 1);
+	CVPixelBufferRef bgra = pixelBuffer(kCVPixelFormatType_32BGRA);
+	CVPixelBufferRef yuv = pixelBuffer(kCVPixelFormatType_422YpCbCr8);
+	IOSurfaceRef surface = CVPixelBufferGetIOSurface(bgra);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t =
+		    overSurface(surface, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+		CHECK(t != nil && src.surfaceId == IOSurfaceGetID(surface) && src.cacheable);
+		const uint64_t block = src.next - 0x1000;
+		auto *header = reinterpret_cast<uint64_t *>(mem.data() + block);
+		header[2] = 7; // the kext's CPU generation, at kRgfxSurfaceCpuGenOffset
+		id<MTLTexture> view = [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+		CHECK(view != nil);
+		drainRing(control);
+
+		// A 4:2:2 YCbCr surface of one plane is not asked cached, and one the kext answers not
+		// cached is named by no buffer.
+		src.answerCached = false;
+		RgfxIOSurfaceTexture *video = overSurface(CVPixelBufferGetIOSurface(yuv),
+		                                          MTLTextureUsageShaderRead);
+		CHECK(video != nil && !src.cacheable);
+		src.answerCached = true;
+		drainRing(control);
+
+		// Sampled in a kernel through a view, then bound again: named once, not written.
+		RgfxComputePipelineState *ps = [RgfxComputePipelineState
+		    computePipelineStateWithFunction:[RgfxFunction functionWithLibrary:nil
+		                                                                  name:@"k"
+		                                                             constants:nullptr
+		                                                                 count:0
+		                                                                device:nil
+		                                                            serializer:&ser]
+		                              device:nil
+		                          serializer:&ser
+		                               error:nil];
+		CHECK(ps != nil);
+		drainRing(control);
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:ps];
+		[ce setTexture:view atIndex:0];
+		[ce setTexture:video atIndex:1];
+		[ce dispatchThreadgroups:one threadsPerThreadgroup:one];
+		[ce setTexture:t atIndex:2];
+		[ce dispatchThreadgroups:one threadsPerThreadgroup:one];
+		[ce endEncoding];
+		CHECK(is(uses(cb), block, 7, 0));
+
+		// Its attachment, at the generation the header holds now: written.
+		header[2] = 8;
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		cb = [queue commandBuffer];
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		CHECK(is(uses(cb), block, 8, RGFX_SURFACE_USE_WRITES));
+
+		// A blit's source, and a resource used with Write usage.
+		id<MTLBuffer> buffer = [RgfxBuffer bufferWithLength:16 * 16 * 4
+		                                            options:MTLResourceStorageModeShared
+		                                             device:nil
+		                                         serializer:&ser];
+		CHECK(buffer != nil);
+		drainRing(control);
+		cb = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+		[be copyFromTexture:t
+		             sourceSlice:0
+		             sourceLevel:0
+		            sourceOrigin:MTLOriginMake(0, 0, 0)
+		              sourceSize:MTLSizeMake(16, 16, 1)
+		                toBuffer:buffer
+		       destinationOffset:0
+		  destinationBytesPerRow:64
+		destinationBytesPerImage:64 * 16];
+		[be endEncoding];
+		CHECK(is(uses(cb), block, 8, 0));
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce useResource:view usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+		[ce endEncoding];
+		CHECK(is(uses(cb), block, 8, RGFX_SURFACE_USE_WRITES));
+
+		// A buffer that uses no cached surface names none.
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:ps];
+		[ce setTexture:video atIndex:0];
+		[ce dispatchThreadgroups:one threadsPerThreadgroup:one];
+		[ce endEncoding];
+		CHECK(uses(cb).empty());
+
+		// The texture's CPU access locks the surface: a read leaves its seed, a write moves it,
+		// as a read-write lock's unlock does; one not cached takes no lock.
+		const uint32_t seed = IOSurfaceGetSeed(surface);
+		uint32_t texel = 0;
+		[t getBytes:&texel bytesPerRow:4 fromRegion:MTLRegionMake2D(1, 1, 1, 1) mipmapLevel:0];
+		CHECK(IOSurfaceGetSeed(surface) == seed);
+		[t replaceRegion:MTLRegionMake2D(1, 1, 1, 1) mipmapLevel:0 withBytes:&texel bytesPerRow:4];
+		CHECK(IOSurfaceGetSeed(surface) != seed);
+		IOSurfaceRef plain = CVPixelBufferGetIOSurface(yuv);
+		const uint32_t plainSeed = IOSurfaceGetSeed(plain);
+		[video replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+		         mipmapLevel:0
+		           withBytes:&texel
+		         bytesPerRow:4];
+		CHECK(IOSurfaceGetSeed(plain) == plainSeed);
+	}
+	drainRing(control);
+	CVPixelBufferRelease(bgra);
+	CVPixelBufferRelease(yuv);
+}
+
 // A texture newTextureWithDescriptor:iosurface:plane: cannot make is nil, as Metal answers one,
 // and never silently: each cause logs one "RGFX:" line per surface, however often it is asked.
 // A surface whose view is refused in place and that has no room for a copy names the checks that
@@ -7517,8 +7778,8 @@ void test_iosurface_nil_is_logged()
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
 	RgfxRegion region(mem.data(), mem.size());
 	struct Source {
-		static RgfxRegion::PagesAnswer pages(void *, const void *, uint64_t, uint64_t,
-		                                     uint64_t *, uint64_t *, bool *)
+		static RgfxRegion::PagesAnswer pages(void *, const void *, uint64_t, uint64_t, uint32_t,
+		                                     bool, uint64_t *, uint64_t *, bool *, bool *)
 		{
 			return RgfxRegion::kPagesUnsupported;
 		}
@@ -7554,7 +7815,8 @@ void test_iosurface_nil_is_logged()
 	};
 	// The copy the region has no room for: the rows 256 bytes apart, the header and the writers.
 	uint64_t pitch = (IOSurfaceGetBytesPerRow(s) + 255) & ~uint64_t(255);
-	uint64_t size = (pitch * 1566 + 16 + sizeof(RgfxSurfaceWriters) + 0xfff) & ~uint64_t(0xfff);
+	uint64_t size =
+	    (pitch * 1566 + kSurfaceHeader + sizeof(RgfxSurfaceWriters) + 0xfff) & ~uint64_t(0xfff);
 	auto has = [](const std::string &line, const std::string &part) {
 		return line.find(part) != std::string::npos;
 	};
@@ -7843,6 +8105,7 @@ int main(int argc, char **argv)
 		test_iosurface_in_place();
 		test_iosurface_in_place_fallback();
 		test_iosurface_in_place_core_image_set();
+		test_iosurface_cached();
 		test_iosurface_nil_is_logged();
 		test_queue_ends_after_its_buffers();
 		test_serializer_destroys_queues();

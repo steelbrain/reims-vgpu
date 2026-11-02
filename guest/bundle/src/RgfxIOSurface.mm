@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <map>
@@ -261,6 +262,26 @@ uint32_t ycbcrMatrix(IOSurfaceRef s)
 	return code;
 }
 
+/// Whether `s` holds YCbCr, by IOSurface's description of its pixel format: its chroma is
+/// subsampled, or a component of its plane 0 is luma or chroma. CoreVideo's surfaces carry the
+/// description, and one made without it counts as no YCbCr (measured on the M3 Max under macOS
+/// 27: CoreVideo's 2vuy and yuvs are 4:2:2, its v308 and y416 have a luma component, its BGRA
+/// none; IOSurfaceCreate's 2vuy, with no description, answers neither).
+bool holdsYCbCr(IOSurfaceRef s)
+{
+	const IOSurfaceSubsampling sub = IOSurfaceGetSubsampling(s);
+	if (sub != kIOSurfaceSubsamplingUnknown && sub != kIOSurfaceSubsamplingNone)
+		return true;
+	const size_t n = IOSurfaceGetNumberOfComponentsOfPlane(s, 0);
+	for (size_t c = 0; c < n; c++) {
+		const IOSurfaceComponentName name = IOSurfaceGetNameOfComponentOfPlane(s, 0, c);
+		if (name == kIOSurfaceComponentNameLuma || name == kIOSurfaceComponentNameChromaRed ||
+		    name == kIOSurfaceComponentNameChromaBlue)
+			return true;
+	}
+	return false;
+}
+
 /// The process's copies between surfaces' pages and the GPU's view of them, by direction: a
 /// diagnostic, a line in kCopyLog at most every kCopyReportNs while copies run.
 struct CopyCount {
@@ -274,6 +295,11 @@ CopyCount gWriteBacks; // the GPU's view -> pages
 
 /// The GPU views the process made of surfaces: in place, or copies, by why.
 std::atomic<uint64_t> gInPlace{0};
+std::atomic<uint64_t> gCached{0};            // of them, cached on the host (their blocks')
+
+/// The views alive in the process whose blocks are cached: a command buffer looks for its uses of
+/// cached surfaces only while one lives (rgfxIOSurfaceNoteUse).
+std::atomic<uint64_t> gCachedLive{0};
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
 std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
@@ -292,7 +318,8 @@ void reportCopies(uint64_t now)
 {
 	static std::mutex lock;
 	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, wbCount = 0, wbBytes = 0,
-	                wbNs = 0, inPlace = 0, forAlignment = 0, unsupported = 0, refused = 0;
+	                wbNs = 0, inPlace = 0, cached = 0, forAlignment = 0, unsupported = 0,
+	                refused = 0;
 	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
 	if (!g.owns_lock()) {
 		return;
@@ -306,15 +333,17 @@ void reportCopies(uint64_t now)
 	}
 	uint64_t uc = gUploads.count, ub = gUploads.bytes, un = gUploads.ns;
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
-	uint64_t ip = gInPlace, ca = gCopiedAlignment, cu = gCopiedUnsupported, cr = gCopiedRefused;
+	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
+	         cr = gCopiedRefused;
 	char line[384];
 	int n = snprintf(line, sizeof(line),
 	                 "RGFX: surface copies, pid %d %s, %.1f s: %llu uploads %.1f MiB %.2f ms, "
-	                 "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place, copies "
-	                 "%llu for alignment, %llu unsupported, %llu refused by the kext\n",
+	                 "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu "
+	                 "cached), copies %llu for alignment, %llu unsupported, %llu refused by the "
+	                 "kext\n",
 	                 getpid(), getprogname(), (now - last) / 1e9, uc - upCount,
 	                 (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, wc - wbCount,
-	                 (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6, ip - inPlace,
+	                 (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6, ip - inPlace, cc - cached,
 	                 ca - forAlignment, cu - unsupported, cr - refused);
 	int fd = open(kCopyLog, O_WRONLY | O_CREAT | O_APPEND, 0666);
 	if (fd >= 0 && n > 0) {
@@ -325,7 +354,7 @@ void reportCopies(uint64_t now)
 	}
 	last = now;
 	upCount = uc, upBytes = ub, upNs = un, wbCount = wc, wbBytes = wb, wbNs = wn;
-	inPlace = ip, forAlignment = ca, unsupported = cu, refused = cr;
+	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;
 }
 
 /// Counts a copy of `bytes` that started at `start`.
@@ -348,14 +377,21 @@ void countView(std::atomic<uint64_t> &c)
 } // namespace
 
 /// What every process holding a surface's shared block agrees on, in the block past the planes'
-/// rows, or at its start in place (RgfxSurfaceShadow::header): the surface's seed when the block
-/// last matched the surface's pages, valid where `serial` is the block's own (a block made again
-/// holds an older one's bytes until its first holder writes it).
+/// rows, or at its start in place (RgfxSurfaceShadow::header): for a copy, the surface's seed
+/// when the block last matched the surface's pages, valid where `serial` is the block's own (a
+/// block made again holds an older one's bytes until its first holder writes it); for a cached
+/// block in place, the surface's CPU generation, which the kext writes at each read-write CPU
+/// lock of the surface (its kRgfxSurfaceCpuGenOffset) and each command buffer that uses the
+/// surface names (rgfxIOSurfaceUses).
 struct RgfxSurfaceHeader {
 	uint64_t serial;
 	uint32_t seed;
 	uint32_t reserved;
+	uint64_t cpuGen;
 };
+
+static_assert(offsetof(RgfxSurfaceHeader, cpuGen) == 16,
+              "the kext's kRgfxSurfaceCpuGenOffset (guest/kext/src/RgfxAccelerator.hpp)");
 
 static_assert(sizeof(RgfxSurfaceHeader) % alignof(RgfxSurfaceWriters) == 0,
               "the writers follow the header, aligned");
@@ -379,6 +415,7 @@ struct RgfxSurfaceShadow {
 	std::mutex lock;            // one sync at a time in this process
 	bool shared = false;        // the plane's shared block, else this process's own
 	bool inPlace = false;       // the GPU uses the surface's pages; the block holds no copy
+	bool cached = false;        // in place, and its GPU copy is the host's device cache
 	uint64_t serial = 0;        // the shared block's
 	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the planes' rows of a copy
 	uint32_t seed = 0;          // this process's own block: the seed when it last matched
@@ -618,6 +655,8 @@ RgfxSurfaceShadow::~RgfxSurfaceShadow()
 	// The buffers that wrote the copy hold it until they finish, so none is left to wait for.
 	if (writers != nullptr)
 		emptyWriters();
+	if (cached)
+		gCachedLive.fetch_sub(1, std::memory_order_relaxed);
 	// The buffer gives the block back once the host has dropped it (its deallocator); one
 	// never made leaves the block to give back here.
 	if (buffer != nil)
@@ -687,11 +726,23 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		} else if (!placeInPlace(surface, &own, region->surfacePagesAlignment(), &notInPlace)) {
 			countView(gCopiedAlignment);
 		} else {
+			// The bundle asks a device cache for surfaces of one plane and no YCbCr: those the
+			// guest's compositors and apps draw. Video frames, of two planes or YCbCr, stay
+			// uncached, as host-side video devices may write their pages (design.md, "The
+			// device cache").
+			const bool cacheable = IOSurfaceGetPlaneCount(surface) <= 1 && !holdsYCbCr(surface);
 			RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesRefused;
 			sharedBlock = region->acquireSurfacePages(IOSurfaceGetBaseAddress(surface), ownLength,
-			                                          ownSize, &answer);
+			                                          ownSize, surfaceId, cacheable, &answer);
 			if (sharedBlock.block.ok) {
 				shadow->inPlace = true;
+				// Whoever made the block decided: a block another holder made cached is cached
+				// for this process too.
+				shadow->cached = sharedBlock.cached;
+				if (shadow->cached) {
+					gCachedLive.fetch_add(1, std::memory_order_relaxed);
+					gCached.fetch_add(1, std::memory_order_relaxed);
+				}
 				countView(gInPlace);
 			} else if (answer == RgfxRegion::kPagesUnsupported) {
 				countView(gCopiedUnsupported);
@@ -813,6 +864,33 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	              (static_cast<uint32_t>(sw.blue) << 16) | (static_cast<uint32_t>(sw.alpha) << 24);
 	return out;
 }
+
+/// An IOSurface lock of `options` of a cached view's surface, held for its scope, around the
+/// texture's own CPU access: the kext's control function brings the GPU's writes from the
+/// device cache into the pages, and a read-write lock moves the surface's CPU generation. Nothing
+/// for a view not cached, whose pages are the GPU's.
+class CachedLock {
+public:
+	CachedLock(const RgfxSurfaceShadow &s, IOSurfaceLockOptions options)
+	    : m_surface(s.cached ? s.surface : nullptr), m_options(options)
+	{
+		if (m_surface != nullptr &&
+		    IOSurfaceLock(m_surface, m_options, &m_seed) != kIOReturnSuccess)
+			m_surface = nullptr;
+	}
+	~CachedLock()
+	{
+		if (m_surface != nullptr)
+			IOSurfaceUnlock(m_surface, m_options, &m_seed);
+	}
+	CachedLock(const CachedLock &) = delete;
+	CachedLock &operator=(const CachedLock &) = delete;
+
+private:
+	IOSurfaceRef m_surface;
+	IOSurfaceLockOptions m_options;
+	uint32_t m_seed = 0;
+};
 
 } // namespace
 
@@ -941,6 +1019,9 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	}
 	_shadow->uploadIfChanged();
 	std::lock_guard<std::mutex> g(_shadow->lock);
+	// A cached surface's GPU writes are in the host's device cache: a read lock has the kext
+	// bring them into the pages first.
+	CachedLock cpu(*_shadow, kIOSurfaceLockReadOnly);
 	const ShadowPlane &p = _shadow->planes[_plane];
 	uint64_t bpe = p.shape.bytesPerElement;
 	const uint8_t *rows = _shadow->pixels() + p.offset;
@@ -976,6 +1057,10 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	}
 	_shadow->uploadIfChanged();
 	std::lock_guard<std::mutex> g(_shadow->lock);
+	// A cached surface's GPU copy is the host's device cache: a read-write lock brings the
+	// GPU's writes into the pages, and has the next command buffer that uses the surface take
+	// the CPU's.
+	CachedLock cpu(*_shadow, 0);
 	const ShadowPlane &p = _shadow->planes[_plane];
 	uint64_t bpe = p.shape.bytesPerElement;
 	uint8_t *rows = _shadow->pixels() + p.offset;
@@ -1040,6 +1125,51 @@ void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, id texture)
 	if (enc != nullptr && root != nil) {
 		enc->noteSurfaceWrite([root rgfxShadow]);
 	}
+}
+
+void rgfxIOSurfaceNoteUse(RgfxEncoder *enc, id resource)
+{
+	if (enc == nullptr || resource == nil || gCachedLive.load(std::memory_order_relaxed) == 0)
+		return;
+	RgfxIOSurfaceTexture *root = rgfxSurfaceRoot(resource);
+	if (root == nil)
+		return;
+	std::shared_ptr<RgfxSurfaceShadow> shadow = [root rgfxShadow];
+	if (shadow->cached)
+		enc->noteSurfaceUse(std::move(shadow));
+}
+
+void rgfxIOSurfaceNameUses(RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes)
+{
+	const std::vector<std::shared_ptr<void>> uses = enc->takeSurfaceUses();
+	if (gCachedLive.load(std::memory_order_relaxed) == 0)
+		return;
+	std::vector<RgfxSurfaceShadow *> named;
+	std::vector<RgfxOpSurfaceUse> ops;
+	auto name = [&](const std::shared_ptr<void> &p, bool writes) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(p.get());
+		if (!s->cached)
+			return;
+		auto it = std::find(named.begin(), named.end(), s);
+		if (it != named.end()) {
+			if (writes)
+				ops[it - named.begin()].flags |= RGFX_SURFACE_USE_WRITES;
+			return;
+		}
+		named.push_back(s);
+		RgfxOpSurfaceUse op = {};
+		op.block_offset = s->block.offset;
+		// As the kext left it at the surface's last read-write CPU lock, in any process.
+		op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
+		op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
+		ops.push_back(op);
+	};
+	for (const auto &w : writes)
+		name(w, true);
+	for (const auto &u : uses)
+		name(u, false);
+	if (!ops.empty())
+		enc->prependSurfaceUses(ops.data(), ops.size());
 }
 
 void RgfxSurfaceBindings::bind(NSUInteger index, id texture)

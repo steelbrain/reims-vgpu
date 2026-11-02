@@ -83,6 +83,7 @@ static_assert(RGFX_COMMAND_BUFFER_OPS_OFFSET == sizeof(RgfxCommandBuffer),
               "ops start right after the command-buffer header");
 static_assert(sizeof(RgfxComputePassDesc) == 8, "RgfxComputePassDesc");
 static_assert(sizeof(RgfxOpEvent) == 16, "RgfxOpEvent");
+static_assert(sizeof(RgfxOpSurfaceUse) == 24, "RgfxOpSurfaceUse");
 
 // The render-pass head and its records (ENCODER_BEGIN_RENDER body).
 static_assert(sizeof(RgfxRenderPassDesc) == 152, "RgfxRenderPassDesc");

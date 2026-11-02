@@ -101,11 +101,12 @@ public:
 
 	/// The shared block of an IOSurface plane (acquireSurface): the block, its serial (unique to
 	/// the block's allocation) and whether this ask made it, so its bytes are not yet the
-	/// plane's.
+	/// plane's. A block in place may be `cached` (acquireSurfacePages).
 	struct SurfaceBlock {
 		Block block;
 		uint64_t serial;
 		bool fresh;
+		bool cached;
 	};
 
 	/// Where surface planes' shared blocks come from: `acquire` answers the block of `size`
@@ -134,14 +135,17 @@ public:
 	};
 
 	/// Where surfaces' shared blocks in place come from (RgfxIOSurface.h): `acquire` answers the
-	/// block whose part the processes map is `size` bytes, for the surface whose whole
-	/// allocation, `length` bytes, this process maps at `base`, the device's GPU using those pages
-	/// in place. Its blocks go back through the surface source's release (releaseSurface).
-	/// `alignment` is what the host's textures over the pages ask of each plane's offset and
-	/// rows (0: none known). Called with `context`, from any thread.
+	/// block whose part the processes map is `size` bytes, for the surface of IOSurfaceID
+	/// `surfaceId` whose whole allocation, `length` bytes, this process maps at `base`, the
+	/// device's GPU using those pages in place. Where `cacheable`, the block may be made cached,
+	/// its GPU copy kept in a device cache on the host; `*cached` says whether the block is,
+	/// whoever made it. Its blocks go back through the surface source's release
+	/// (releaseSurface). `alignment` is what the host's textures over the pages ask of each
+	/// plane's offset and rows (0: none known). Called with `context`, from any thread.
 	typedef PagesAnswer (*SurfacePagesFn)(void *context, const void *base, uint64_t length,
-	                                      uint64_t size, uint64_t *offset, uint64_t *serial,
-	                                      bool *fresh);
+	                                      uint64_t size, uint32_t surfaceId, bool cacheable,
+	                                      uint64_t *offset, uint64_t *serial, bool *fresh,
+	                                      bool *cached);
 	void setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignment, void *context);
 
 	/// Where the kext learns of command buffers' writes of surfaces' shared blocks, so a CPU lock
@@ -169,11 +173,12 @@ public:
 	bool hasSurfacePages() const { return m_pagesAcquire != nullptr; }
 	uint64_t surfacePagesAlignment() const { return m_pagesAlignment; }
 
-	/// The shared block in place of `size` bytes for the surface of `length` bytes at `base`,
-	/// the one every process that holds the surface gets; `*answer` says how the ask ended, and
-	/// `block.ok` is true only where it is kPagesGiven.
+	/// The shared block in place of `size` bytes for the surface `surfaceId` of `length` bytes
+	/// at `base`, the one every process that holds the surface gets, asked cached where
+	/// `cacheable` (SurfacePagesFn); `*answer` says how the ask ended, and `block.ok` is true
+	/// only where it is kPagesGiven.
 	SurfaceBlock acquireSurfacePages(const void *base, uint64_t length, uint64_t size,
-	                                 PagesAnswer *answer);
+	                                 uint32_t surfaceId, bool cacheable, PagesAnswer *answer);
 
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).

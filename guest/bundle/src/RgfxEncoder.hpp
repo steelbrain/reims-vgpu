@@ -414,6 +414,19 @@ public:
 	void noteSurfaceWrite(std::shared_ptr<void> shadow) { m_surfaceWrites.push_back(std::move(shadow)); }
 	/// The copies recorded so far, which the caller now holds.
 	std::vector<std::shared_ptr<void>> takeSurfaceWrites() { return std::move(m_surfaceWrites); }
+	/// Records that the command buffer uses the IOSurface view `shadow`, whose block is cached
+	/// on the host (opaque here: the Metal shell's RgfxSurfaceShadow), once for a run of the
+	/// same view. Held until taken.
+	void noteSurfaceUse(std::shared_ptr<void> shadow)
+	{
+		if (m_surfaceUses.empty() || m_surfaceUses.back() != shadow)
+			m_surfaceUses.push_back(std::move(shadow));
+	}
+	/// The uses recorded so far, which the caller now holds.
+	std::vector<std::shared_ptr<void>> takeSurfaceUses() { return std::move(m_surfaceUses); }
+	/// Puts the `count` `RGFX_OP_SURFACE_USE` ops of bodies `uses` at the op stream's start,
+	/// before its first encoder, where the host reads them before the buffer's work.
+	void prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count);
 	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
 	/// with retained references keeps what it encodes: `keep(context, object)` for each one
 	/// (once for a run of the same object), from the encode until the buffer completes or goes.
@@ -461,6 +474,7 @@ private:
 	RgfxCommandBuffer m_head;
 	std::vector<uint8_t> m_buf;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;
+	std::vector<std::shared_ptr<void>> m_surfaceUses;
 	std::vector<RgfxShadowUse> m_shadowUses;
 	void (*m_keep)(void *, const void *) = nullptr;
 	void *m_keepContext = nullptr;
