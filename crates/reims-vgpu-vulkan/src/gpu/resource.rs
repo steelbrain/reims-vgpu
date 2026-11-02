@@ -25,6 +25,7 @@ use reims_vgpu_core::platform::resource::{
     SamplerState, Texture,
 };
 use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use reims_vgpu_core::platform::values::SurfacePlane;
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
@@ -1076,6 +1077,17 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
         let under = Under::Buffer(self.clone_ref(), bytes);
         Ok(Some(self.device.texture_in(raw, under, answered)))
+    }
+
+    /// The buffer's own creator's texture ([`Buffer::new_texture`]) at the plane's offset and
+    /// rows, the facts unread.
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &VulkanTextureDescriptor,
+        plane: SurfacePlane,
+    ) -> RaiseResult<Option<VulkanTexture>> {
+        self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row)
     }
 
     /// A detached no-copy buffer over an alias of the ranges, which total its length, from now

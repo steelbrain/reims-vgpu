@@ -13,6 +13,7 @@ use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::types::*;
+use reims_vgpu_core::platform::values::SurfacePlane;
 use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
@@ -172,6 +173,20 @@ impl reims_vgpu_core::platform::resource::Buffer<MetalPlatform> for MetalBuffer 
             || b.newTextureWithDescriptor_offset_bytesPerRow(descriptor, offset, bytes_per_row),
         )
         .map(created)
+    }
+
+    /// Metal's `newTextureWithDescriptor:offset:bytesPerRow:` at the plane's offset and rows:
+    /// Metal makes a texture over a surface's plane only over an `IOSurfaceRef`, and no public
+    /// call makes one over a buffer's bytes. A format Metal makes no texture of over a buffer (a
+    /// two-plane YCbCr or XR10 one among them) is that creator's nil, whatever the facts; any
+    /// other is made as over the buffer, the facts unread.
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &<MetalPlatform as Platform>::TextureDescriptor,
+        plane: SurfacePlane,
+    ) -> RaiseResult<Option<<MetalPlatform as Platform>::Texture>> {
+        self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row)
     }
 
     fn replace_backing(

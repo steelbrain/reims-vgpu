@@ -12,6 +12,7 @@
 
 use super::host_range::HostRange;
 use super::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use super::values::SurfacePlane;
 use super::{Handle, Platform};
 use crate::host::HostPtr;
 use crate::raise::{OnFault, RaiseResult};
@@ -70,6 +71,20 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
         descriptor: &P::TextureDescriptor,
         offset: u64,
         bytes_per_row: u64,
+    ) -> RaiseResult<Option<P::Texture>>;
+    /// sel: newTextureWithDescriptor:iosurface:plane: over the buffer — Metal's IOSurface
+    /// creator, where the buffer stands for the surface: its first byte is the surface's base
+    /// address, `plane` says where the asked plane lies in it, and the facts, where given, what
+    /// the texture reads of the surface besides (plane 1 of a two-plane YCbCr or XR10 texture,
+    /// the surface's range and matrix). The texture lies over the buffer's bytes, as one of
+    /// `newTextureWithDescriptor:offset:bytesPerRow:` does. A platform that makes no such
+    /// texture over a buffer answers as that creator answers.
+    /// Reached both under a handler and with none: `on` says which this call is.
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &P::TextureDescriptor,
+        plane: SurfacePlane,
     ) -> RaiseResult<Option<P::Texture>>;
     /// sel: replaceBackingWithRanges:readOnly: SPI
     /// `false` makes core throw "Failed to replace buffer backing".

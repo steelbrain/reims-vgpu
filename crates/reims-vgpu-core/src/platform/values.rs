@@ -582,6 +582,75 @@ impl Default for TextureDesc {
     }
 }
 
+/// Where plane `plane` of an IOSurface lies in a buffer that stands for the surface, its first
+/// byte the surface's base address, and what a texture over it reads of the surface besides
+/// ([`crate::platform::resource::Buffer::new_texture_over_surface_plane`], Metal's
+/// `newTextureWithDescriptor:iosurface:plane:` over such a buffer, which reads these from the
+/// `IOSurfaceRef`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfacePlane {
+    /// The plane the texture is asked of (`newTextureWithDescriptor:iosurface:plane:`'s
+    /// `plane`): 0 for a surface without planes.
+    pub plane: u64,
+    /// The plane's first byte in the buffer: `IOSurfaceGetBaseAddressOfPlane` less
+    /// `IOSurfaceGetBaseAddress`, 0 for a surface without planes.
+    pub offset: u64,
+    /// The plane's bytes from one row's start to the next's in the buffer:
+    /// `IOSurfaceGetBytesPerRowOfPlane`, or `IOSurfaceGetBytesPerRow` for a surface without
+    /// planes.
+    pub bytes_per_row: u64,
+    /// Whether the surface has planes: `IOSurfaceGetPlaneCount` above 0.
+    pub planar: bool,
+    /// The surface's facts where the caller has them, `None` where it has none: a platform then
+    /// makes the texture as over a buffer alone.
+    pub facts: Option<SurfaceFacts>,
+}
+
+/// The facts of an IOSurface a texture over one of its planes reads besides the plane, as the
+/// surface held them when the texture was made: a two-plane YCbCr texture over plane 0 reads
+/// plane 1's chroma, converted by the surface's range (its OSType) and matrix, and a two-plane
+/// XR10 texture plane 1's alpha bytes. Plane 1 lies in the buffer that stands for the surface
+/// ([`SurfacePlane`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceFacts {
+    /// `IOSurfaceGetPixelFormat`: the surface's OSType, its four characters big-endian (`'x420'`
+    /// is `0x7834_3230`).
+    pub pixel_format: u32,
+    /// `IOSurfaceGetPlaneCount`: 0 for a surface without planes.
+    pub plane_count: u64,
+    /// `IOSurfaceGetWidth`: its plane 0's width.
+    pub width: u64,
+    /// `IOSurfaceGetHeight`: its plane 0's height.
+    pub height: u64,
+    /// Plane 1's first byte in the buffer; 0 for a surface of fewer than two planes.
+    pub chroma_offset: u64,
+    /// `IOSurfaceGetBytesPerRowOfPlane(surface, 1)`, as the buffer lays plane 1's rows out; 0 for
+    /// a surface of fewer than two planes.
+    pub chroma_bytes_per_row: u64,
+    /// The surface's `kIOSurfaceYCbCrMatrix` value; `None` without one.
+    pub ycbcr_matrix: Option<SurfaceMatrix>,
+}
+
+/// An IOSurface's `kIOSurfaceYCbCrMatrix` value: one of the strings CoreVideo names
+/// (`kCVImageBufferYCbCrMatrix_*`), or any other value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SurfaceMatrix {
+    /// `ITU_R_601_4`.
+    Itu601,
+    /// `ITU_R_709_2`.
+    Itu709,
+    /// `ITU_R_2020`.
+    Itu2020,
+    /// `SMPTE_240M_1995`.
+    Smpte240M1995,
+    /// `DCI_P3`.
+    DciP3,
+    /// `P3_D65`.
+    P3D65,
+    /// Any other value: a string of another text, or a value that is no string.
+    Other,
+}
+
 /// `MTLRasterizationRateMapDescriptor`, as a value, from which the platform makes the descriptor;
 /// its layers are set on the made descriptor. Order: screen size, mutability, min factor.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

@@ -60,7 +60,10 @@ use reims_graphics::wire::{
     RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
     RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RgfxBufferAtOffset, RgfxBufferCreate,
+    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_YCBCR_MATRIX_DCI_P3,
+    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
+    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
+    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
     RgfxBufferOverHostMemory, RgfxCbComplete, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
     RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate,
     RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
@@ -81,7 +84,8 @@ use reims_vgpu_core::platform::types::Swizzle;
 use reims_vgpu_core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
     FullComputePipelineDesc, FullRenderPipelineDesc, HeapDesc, LinkedFunctionsDesc, OptionSet,
-    SamplerDesc, StageInputDesc, StencilDesc, TextureDesc, VertexDesc,
+    SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane,
+    TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -1050,12 +1054,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Ok(facts) => facts,
                     Err(e) => return Ok(Err(e)),
                 };
+                let plane = match surface_plane(&m, facts.as_ref()) {
+                    Ok(plane) => plane,
+                    Err(e) => return Ok(Err(e)),
+                };
                 if !self.holds_resource_id(m.obj_id, m.resource_id) {
                     return Ok(Err(DecodeError::BadResourceId));
                 }
-                // Placed as TEXTURE_FROM_BUFFER places a texture, over the buffer
-                // the guest keeps its copy of the plane in; a buffer the host does
-                // not hold is a guest protocol error.
+                // Made by Metal's IOSurface creator over the buffer the guest keeps its copy
+                // of the surface in, which stands for the surface: the plane lies in it as
+                // TEXTURE_FROM_BUFFER places a texture, and plane 1 where the facts say. A
+                // buffer the host does not hold is a guest protocol error.
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
                 if !matches!(self.named(m.buffer_obj_id), Some(ObjHandle::Buffer(_))) {
@@ -1083,11 +1092,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    let made = buffer.new_texture(
+                    let made = buffer.new_texture_over_surface_plane(
                         OnFault::Return,
                         &descriptor,
-                        m.offset,
-                        m.bytes_per_row,
+                        plane,
                     )?;
                     if made.is_none() {
                         log_refused_texture(&TextureOverBuffer {
@@ -2338,6 +2346,50 @@ fn surface_facts(
         .ok_or(DecodeError::Malformed)
 }
 
+/// Where a `TEXTURE_FROM_IOSURFACE` message's texture lies in its buffer, which stands for the
+/// surface, and the surface's facts as the platform takes them, from the message `m` and its
+/// `facts` ([`surface_facts`]): plane `m.plane` at `m.offset`, rows `m.bytes_per_row` apart, of a
+/// surface with planes where the facts count any; without facts, of none, and the platform makes
+/// the texture as over the buffer alone. A YCbCr matrix the wire names no value for is
+/// malformed.
+fn surface_plane(
+    m: &RgfxTextureFromIOSurface,
+    facts: Option<&RgfxSurfaceFacts>,
+) -> Result<SurfacePlane, DecodeError> {
+    let facts = match facts {
+        Some(f) => {
+            let ycbcr_matrix = match f.ycbcr_matrix {
+                RGFX_YCBCR_MATRIX_NONE => None,
+                RGFX_YCBCR_MATRIX_ITU_R_601_4 => Some(SurfaceMatrix::Itu601),
+                RGFX_YCBCR_MATRIX_ITU_R_709_2 => Some(SurfaceMatrix::Itu709),
+                RGFX_YCBCR_MATRIX_ITU_R_2020 => Some(SurfaceMatrix::Itu2020),
+                RGFX_YCBCR_MATRIX_SMPTE_240M_1995 => Some(SurfaceMatrix::Smpte240M1995),
+                RGFX_YCBCR_MATRIX_DCI_P3 => Some(SurfaceMatrix::DciP3),
+                RGFX_YCBCR_MATRIX_P3_D65 => Some(SurfaceMatrix::P3D65),
+                RGFX_YCBCR_MATRIX_OTHER => Some(SurfaceMatrix::Other),
+                _ => return Err(DecodeError::Malformed),
+            };
+            Some(SurfaceFacts {
+                pixel_format: f.surface_pixel_format,
+                plane_count: u64::from(f.plane_count),
+                width: u64::from(f.width),
+                height: u64::from(f.height),
+                chroma_offset: f.chroma_offset,
+                chroma_bytes_per_row: f.chroma_bytes_per_row,
+                ycbcr_matrix,
+            })
+        }
+        None => None,
+    };
+    Ok(SurfacePlane {
+        plane: u64::from(m.plane),
+        offset: m.offset,
+        bytes_per_row: m.bytes_per_row,
+        planar: facts.is_some_and(|f| f.plane_count > 0),
+        facts,
+    })
+}
+
 /// An OSType as its four characters, quoted, where each is printable ASCII; else its value in hex.
 fn four_characters(code: u32) -> String {
     let bytes = code.to_be_bytes();
@@ -3551,7 +3603,7 @@ mod tests {
             "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:",
             Step::Nil,
         );
-        script.push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
+        script.push("newTextureWithDescriptor:iosurface:plane:", Step::Nil);
         for message in [
             from_buffer.as_bytes(),
             linear.as_bytes(),
@@ -3699,7 +3751,7 @@ mod tests {
         let whole = start + size_of::<RgfxSurfaceFacts>();
         let made = || {
             p.call_log()
-                .calls_to("newTextureWithDescriptor:offset:bytesPerRow:")
+                .calls_to("newTextureWithDescriptor:iosurface:plane:")
                 .len()
         };
 
@@ -3726,7 +3778,7 @@ mod tests {
         // A refused texture's warning names the facts.
         let logs = reims_vgpu_core::testkit::logs::capture();
         p.script()
-            .push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
+            .push("newTextureWithDescriptor:iosurface:plane:", Step::Nil);
         assert_eq!(
             dec.decode(&device, &message(15, whole, whole)).unwrap(),
             Err(DecodeError::Refused)
@@ -3745,6 +3797,194 @@ mod tests {
             ),
             "{}",
             warned[0]
+        );
+    }
+
+    /// Every `TEXTURE_FROM_IOSURFACE` is made by the platform's IOSurface creator over its buffer
+    /// (`newTextureWithDescriptor:iosurface:plane:` on the buffer), never by the buffer's own
+    /// creator: the plane's index, offset and rows, whether the surface has planes, and the facts
+    /// the message carried reach it, each wire matrix as its value. A message of the struct alone
+    /// reaches it as before the facts: of a surface without planes, with no facts. A matrix the
+    /// wire names no value for is malformed, and reaches no platform call.
+    #[test]
+    fn a_surface_texture_s_facts_reach_the_platform() {
+        use reims_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(Region::new(0x10000).unwrap()),
+        );
+        let obj = |n: u64| (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let grant = RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context: 1,
+            chunk: 0,
+        };
+        assert_eq!(dec.decode(&device, grant.as_bytes()).unwrap(), Ok(()));
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: obj(10),
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        // An 'x420' surface of 64 x 48, plane 1 at 16384 with rows of 256 bytes, as the bundle
+        // lays its copy out.
+        let facts = |ycbcr_matrix: u32| RgfxSurfaceFacts {
+            surface_pixel_format: 0x7834_3230,
+            plane_count: 2,
+            width: 64,
+            height: 48,
+            chroma_offset: 16384,
+            chroma_bytes_per_row: 256,
+            ycbcr_matrix,
+            reserved_24: 0,
+        };
+        // A 505 texture over plane `plane` of the copy, at `offset`, carrying `facts` where given.
+        let message = |n: u64, plane: u32, offset: u64, facts: Option<RgfxSurfaceFacts>| {
+            let size = RGFX_SURFACE_FACTS_OFFSET as usize
+                + facts.map_or(0, |_| size_of::<RgfxSurfaceFacts>());
+            let m = RgfxTextureFromIOSurface {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                    size: size as u32,
+                    seqno: 0,
+                },
+                obj_id: obj(n),
+                resource_id: n,
+                buffer_obj_id: obj(10),
+                offset,
+                bytes_per_row: 256,
+                iosurface_id: 0x2d,
+                plane,
+                desc: RgfxTextureDescriptor {
+                    pixel_format: 505,
+                    texture_type: 2,
+                    width: 64,
+                    height: 48,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    array_length: 1,
+                    sample_count: 1,
+                    usage: 1,
+                    ..RgfxTextureDescriptor::default()
+                },
+                writers_offset: RGFX_SURFACE_NO_WRITERS,
+            };
+            let mut bytes = m.as_bytes().to_vec();
+            if let Some(facts) = facts {
+                bytes.extend_from_slice(facts.as_bytes());
+            }
+            bytes
+        };
+        let sel = "newTextureWithDescriptor:iosurface:plane:";
+        // The arguments after the descriptor of the platform's last call of `sel`.
+        let last = || {
+            let calls = p.call_log().calls_to(sel);
+            let call = calls.last().expect("a call");
+            assert_eq!(call.class, "MTLBuffer");
+            call.args[1..].to_vec()
+        };
+        let reached = |plane: u64, offset: u64, planar: bool, facts: Option<SurfaceFacts>| {
+            vec![
+                Arg::U64(plane),
+                Arg::U64(offset),
+                Arg::U64(256),
+                Arg::Bool(planar),
+                Arg::val(&facts),
+            ]
+        };
+        let ours = |ycbcr_matrix| SurfaceFacts {
+            pixel_format: 0x7834_3230,
+            plane_count: 2,
+            width: 64,
+            height: 48,
+            chroma_offset: 16384,
+            chroma_bytes_per_row: 256,
+            ycbcr_matrix,
+        };
+
+        // Each matrix of the wire, over plane 0.
+        for (n, (wire, matrix)) in [
+            (RGFX_YCBCR_MATRIX_NONE, None),
+            (RGFX_YCBCR_MATRIX_ITU_R_601_4, Some(SurfaceMatrix::Itu601)),
+            (RGFX_YCBCR_MATRIX_ITU_R_709_2, Some(SurfaceMatrix::Itu709)),
+            (RGFX_YCBCR_MATRIX_ITU_R_2020, Some(SurfaceMatrix::Itu2020)),
+            (
+                RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
+                Some(SurfaceMatrix::Smpte240M1995),
+            ),
+            (RGFX_YCBCR_MATRIX_DCI_P3, Some(SurfaceMatrix::DciP3)),
+            (RGFX_YCBCR_MATRIX_P3_D65, Some(SurfaceMatrix::P3D65)),
+            (RGFX_YCBCR_MATRIX_OTHER, Some(SurfaceMatrix::Other)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = 11 + n as u64;
+            let m = message(n, 0, 0, Some(facts(wire)));
+            assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()), "matrix {wire}");
+            assert_eq!(last(), reached(0, 0, true, Some(ours(matrix))), "{wire}");
+        }
+        assert!(dec.surface_texture(0x2d).is_some());
+
+        // Plane 1, at its offset in the copy.
+        let m = message(20, 1, 16384, Some(facts(RGFX_YCBCR_MATRIX_ITU_R_709_2)));
+        assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        let facts_709 = Some(ours(Some(SurfaceMatrix::Itu709)));
+        assert_eq!(last(), reached(1, 16384, true, facts_709));
+
+        // Of a surface without planes.
+        let bgra = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*b"BGRA"),
+            plane_count: 0,
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ..facts(RGFX_YCBCR_MATRIX_NONE)
+        };
+        assert_eq!(
+            dec.decode(&device, &message(21, 0, 0, Some(bgra))).unwrap(),
+            Ok(())
+        );
+        let none = SurfaceFacts {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            plane_count: 0,
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ..ours(None)
+        };
+        assert_eq!(last(), reached(0, 0, false, Some(none)));
+
+        // The struct alone: no facts, of a surface without planes.
+        assert_eq!(
+            dec.decode(&device, &message(22, 0, 0, None)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(last(), reached(0, 0, false, None));
+
+        // A matrix past the wire's values.
+        let before = p.call_log().calls_to(sel).len();
+        let m = message(23, 0, 0, Some(facts(RGFX_YCBCR_MATRIX_OTHER + 1)));
+        assert_eq!(
+            dec.decode(&device, &m).unwrap(),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(p.call_log().calls_to(sel).len(), before);
+
+        // The buffer's own creator made none of them.
+        assert!(
+            p.call_log()
+                .calls_to("newTextureWithDescriptor:offset:bytesPerRow:")
+                .is_empty()
         );
     }
 

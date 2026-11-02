@@ -11,6 +11,7 @@ use super::{Backing, new_buffer, new_texture};
 use crate::host::HostPtr;
 use crate::platform::resource::*;
 use crate::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use crate::platform::values::SurfacePlane;
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
 use crate::testkit::script::Policy;
@@ -181,6 +182,31 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
                 Arg::obj(descriptor),
                 Arg::U64(offset),
                 Arg::U64(bytes_per_row),
+            ],
+            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+        )
+    }
+
+    /// Logged with the plane's index, offset and rows, whether the surface has planes, and its
+    /// facts (`Arg::val` of the `Option`); a texture over the buffer, as `new_texture`'s.
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &<FakePlatform as Platform>::TextureDescriptor,
+        plane: SurfacePlane,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Texture>> {
+        let desc = descriptor.desc();
+        let parent = self.erase();
+        self.make(
+            Policy::On(on),
+            "newTextureWithDescriptor:iosurface:plane:",
+            vec![
+                Arg::obj(descriptor),
+                Arg::U64(plane.plane),
+                Arg::U64(plane.offset),
+                Arg::U64(plane.bytes_per_row),
+                Arg::Bool(plane.planar),
+                Arg::val(&plane.facts),
             ],
             |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
         )
