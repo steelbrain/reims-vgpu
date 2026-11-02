@@ -40,6 +40,7 @@ mod error;
 mod h264;
 mod h265;
 mod import;
+mod lent;
 mod params;
 mod picture;
 mod profile;
@@ -53,6 +54,7 @@ pub use error::Error;
 pub use h264::{Frame, H264Decoder};
 pub use h265::{H265Decoder, H265Frame};
 pub use import::{HostImport, ImportedPlanes, SampleMemory};
+pub use lent::LentQueue;
 pub use picture::{Nv12, Picture};
 pub use profile::{
     Capabilities, H264Capabilities, H264Profile, H265Capabilities, H265Profile, OUTPUT_FLAGS,

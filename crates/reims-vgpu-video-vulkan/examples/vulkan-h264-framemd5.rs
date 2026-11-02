@@ -6,7 +6,7 @@
 //! (tools/h264-check.sh), as for the VA-API backend's h264-framemd5.
 //!
 //! ```sh
-//! vulkan-h264-framemd5 stream.mp4 [--decode-order] [--length-size N] [--hold N] [--copy-on-graphics] [--buffer]
+//! vulkan-h264-framemd5 stream.mp4 [--decode-order] [--length-size N] [--hold N] [--copy-on-graphics] [--copy-lent] [--buffer]
 //! vulkan-h264-framemd5 --capabilities
 //! ```
 //!
@@ -23,6 +23,9 @@
 //!   queue, so that pictures decoded into DPB pictures alone are copied
 //!   out on a queue of their own, behind a semaphore wait, as on a device
 //!   whose decode family does not copy.
+//! - `--copy-lent` hands it over as another's that lends its graphics
+//!   queue for the copies ([`VideoDevice::from_raw_copying_on`]), each
+//!   submitted once the host sees its decode done.
 //! - `--buffer` lands each picture in a host-visible buffer
 //!   ([`reims_vgpu_video_vulkan::HostBuffers`]), cropped, at offsets and
 //!   pitches that are not the frame's own, and reads it there, instead of
@@ -39,10 +42,11 @@ use std::time::Duration;
 use reims_vgpu_video_conformance::md5::{Md5, self_test};
 use reims_vgpu_video_conformance::mp4;
 use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
+use reims_vgpu_video_core::sync::Mutex;
 use reims_vgpu_video_vulkan::avcc::DecoderConfiguration;
 use reims_vgpu_video_vulkan::{
-    DecodeImage, DecodeImages, Frame, H264Decoder, HostBuffer, HostBuffers, OutputOrder, RawDevice,
-    Surface, SurfaceSource, VideoDevice, h264_capabilities, nal,
+    DecodeImage, DecodeImages, Frame, H264Decoder, HostBuffer, HostBuffers, LentQueue, OutputOrder,
+    RawDevice, Surface, SurfaceSource, VideoDevice, h264_capabilities, nal,
 };
 
 fn main() -> std::process::ExitCode {
@@ -61,6 +65,7 @@ struct Options {
     length_size: Option<u8>,
     hold: usize,
     copy_on_graphics: bool,
+    copy_lent: bool,
     buffer: bool,
     capabilities: bool,
 }
@@ -74,6 +79,7 @@ fn options() -> Result<Options, String> {
         length_size: None,
         hold: 0,
         copy_on_graphics: false,
+        copy_lent: false,
         buffer: false,
         capabilities: false,
     };
@@ -96,6 +102,7 @@ fn options() -> Result<Options, String> {
             }
             "--hold" => options.hold = number("--hold")?,
             "--copy-on-graphics" => options.copy_on_graphics = true,
+            "--copy-lent" => options.copy_lent = true,
             "--buffer" => options.buffer = true,
             "--capabilities" => options.capabilities = true,
             _ => positional.push(arg),
@@ -234,6 +241,23 @@ fn print_capabilities(device: &Arc<VideoDevice>) {
     }
 }
 
+/// The graphics queue of a device of our own, lent for the copies as
+/// another submitter's queue would be.
+struct LentGraphics {
+    queue: Mutex<ash::vk::Queue>,
+    family: u32,
+}
+
+impl LentQueue for LentGraphics {
+    fn family(&self) -> u32 {
+        self.family
+    }
+
+    fn with_queue(&self, submit: &mut dyn FnMut(ash::vk::Queue)) {
+        submit(*self.queue.lock());
+    }
+}
+
 fn run() -> Result<(), String> {
     if !self_test() {
         return Err("MD5 fails its own test vectors".into());
@@ -244,7 +268,7 @@ fn run() -> Result<(), String> {
         print_capabilities(&owner);
         return Ok(());
     }
-    let device = if options.copy_on_graphics {
+    let device = if options.copy_on_graphics || options.copy_lent {
         let graphics = owner
             .graphics_queue()
             .ok_or("a device of our own has a graphics queue")?;
@@ -261,10 +285,28 @@ fn run() -> Result<(), String> {
             graphics_family: owner.graphics_family(),
             unified_image_layouts_video: owner.unified_image_layouts(),
         };
-        // SAFETY: `owner` made every handle as RawDevice says, and outlives
-        // `device`, which goes before it at the end of this function along
-        // with everything made on it; nothing else submits to the queues.
-        unsafe { VideoDevice::from_raw(raw) }
+        if options.copy_lent {
+            let lent = LentGraphics {
+                queue: Mutex::new(graphics),
+                family: owner.graphics_family(),
+            };
+            // SAFETY: as below; the lent queue is the graphics queue, of
+            // its family.
+            unsafe {
+                VideoDevice::from_raw_copying_on(
+                    raw,
+                    ash::vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+                    Box::new(lent),
+                )
+            }
+            .map_err(|e| e.to_string())?
+        } else {
+            // SAFETY: `owner` made every handle as RawDevice says, and
+            // outlives `device`, which goes before it at the end of this
+            // function along with everything made on it; nothing else
+            // submits to the queues.
+            unsafe { VideoDevice::from_raw(raw) }
+        }
     } else {
         Arc::clone(&owner)
     };

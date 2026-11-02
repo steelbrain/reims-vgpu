@@ -15,7 +15,9 @@
 # VideoDevice::create picks, from its MP4 (the avcC record and length-prefixed
 # samples) and from its Annex B form, in display order: every frame's NV12 MD5
 # must equal ffmpeg's. One stream is decoded again with its pictures copied
-# out of the DPB on the graphics queue, and three are landed in buffers. Decode order must give the same frames, as a set. The
+# out of the DPB on the graphics queue, and again on a lent queue (each copy
+# submitted once the host sees its decode done), and three are landed in
+# buffers. Decode order must give the same frames, as a set. The
 # crafted streams (long-term references, memory management operations 2 to 6,
 # frame number gaps, 1- to 3-byte lengths), the SPS switch mid-stream and the
 # lost reference are the VA-API check's, as are their verdicts. A stream whose
@@ -252,6 +254,14 @@ for name in high-1080p baseline-720p main-1080p-opengop; do
 done
 if run "$out/high-1080p.mp4" high-1080p.buffer-graphics --buffer --copy-on-graphics; then
   check "high-1080p (landed in buffers on the graphics queue)" "$out/high-1080p.ref" "$runs/high-1080p.buffer-graphics.md5"
+fi
+# Pictures copied out on a queue another submitter lends, each submitted
+# once the host sees its decode done, into images and into buffers.
+if run "$out/high-1080p.mp4" high-1080p.lent --copy-lent; then
+  check "high-1080p (copied out on a lent queue)" "$out/high-1080p.ref" "$runs/high-1080p.lent.md5"
+fi
+if run "$out/high-1080p.mp4" high-1080p.buffer-lent --buffer --copy-lent; then
+  check "high-1080p (landed in buffers on a lent queue)" "$out/high-1080p.ref" "$runs/high-1080p.buffer-lent.md5"
 fi
 
 # A new SPS at an IDR picture, with another size and profile, mid-stream.

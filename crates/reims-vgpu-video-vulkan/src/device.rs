@@ -3,9 +3,11 @@
 //! graphics family whose work samples the decoded images.
 //!
 //! [`VideoDevice::from_raw`] takes another's device as it is, as the
-//! product's will be metal2vulkan's. [`VideoDevice::create`] makes one of
-//! its own, with a graphics queue and a video-decode queue, for the tests
-//! and the tools.
+//! product's will be metal2vulkan's, and
+//! [`VideoDevice::from_raw_copying_on`] copies pictures out on a queue of
+//! another submitter's that it lends ([`LentQueue`]).
+//! [`VideoDevice::create`] makes one of its own, with a graphics queue and a
+//! video-decode queue, for the tests and the tools.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use ash::vk;
 use reims_vgpu_video_core::sync::Mutex;
 
 use crate::error::{Error, Named};
+use crate::lent::{LentCopies, LentQueue, Submitter};
 
 /// `VK_KHR_unified_image_layouts`, which ash 0.38's headers predate.
 const UNIFIED_IMAGE_LAYOUTS: &CStr = c"VK_KHR_unified_image_layouts";
@@ -98,12 +101,24 @@ pub struct RawDevice {
     pub unified_image_layouts_video: bool,
 }
 
+/// The queue a device's decoders copy pictures out on.
+enum CopyQueue {
+    /// The decode queue, in the decode's own submission.
+    Decode,
+    /// A queue of the decoders' own.
+    Own(Mutex<vk::Queue>),
+    /// A queue another submitter lends, each copy submitted once the
+    /// host sees its decode done ([`LentCopies`]).
+    Lent(LentCopies),
+}
+
 /// The Vulkan device decoders run on.
 ///
-/// Its decode queue and copy queue are the decoders' alone: they serialize
-/// their submissions to them. Made by [`VideoDevice::create`], it owns its
-/// device and instance and destroys them as it goes, after every decoder,
-/// image and picture made on it, which each hold it.
+/// Its decode queue and copy queue are the decoders' alone, but for a lent
+/// copy queue ([`LentQueue`]): they serialize their submissions to them.
+/// Made by [`VideoDevice::create`], it owns its device and instance and
+/// destroys them as it goes, after every decoder, image and picture made on
+/// it, which each hold it.
 pub struct VideoDevice {
     entry: ash::Entry,
     instance: ash::Instance,
@@ -112,8 +127,7 @@ pub struct VideoDevice {
     decode_family: u32,
     decode_queue: Mutex<vk::Queue>,
     copy_family: u32,
-    /// `None` where the copy queue is the decode queue.
-    copy_queue: Option<Mutex<vk::Queue>>,
+    copy_queue: CopyQueue,
     graphics_family: u32,
     /// The graphics queue of a device of our own.
     graphics_queue: Option<vk::Queue>,
@@ -124,9 +138,9 @@ pub struct VideoDevice {
     video_instance: ash::khr::video_queue::Instance,
     video: ash::khr::video_queue::Device,
     decode: ash::khr::video_decode_queue::Device,
-    /// `VK_KHR_synchronization2`'s commands, on an instance below Vulkan
-    /// 1.3, where the core ones are not there.
-    synchronization2: Option<ash::khr::synchronization2::Device>,
+    /// The device's submit commands: `VK_KHR_synchronization2`'s, on an
+    /// instance below Vulkan 1.3, where the core ones are not there.
+    submitter: Submitter,
     /// Whether the device and instance are ours to destroy.
     owned: bool,
 }
@@ -187,7 +201,50 @@ impl VideoDevice {
         raw: RawDevice,
         codecs: vk::VideoCodecOperationFlagsKHR,
     ) -> Arc<Self> {
-        Arc::new(Self::assemble(raw, None, false, codecs))
+        let copy_queue = if raw.copy_queue == raw.decode_queue {
+            CopyQueue::Decode
+        } else {
+            CopyQueue::Own(Mutex::new(raw.copy_queue))
+        };
+        Arc::new(Self::assemble(raw, copy_queue, None, false, codecs))
+    }
+
+    /// Decoders of `codecs` on another's device, as
+    /// [`Self::from_raw_with_codecs`], that copy each picture out on
+    /// `copies`, a queue of the device's that another submitter lends, in
+    /// place of `raw.copy_queue` and `raw.copy_family`, which it ignores. A
+    /// thread of the device's submits each copy there once the host sees
+    /// its decode done, so the copy never waits on the GPU in the lender's
+    /// queue. Refused where that thread cannot start.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::from_raw_with_codecs`], `raw.copy_queue` aside;
+    /// `copies` lends a queue of `raw.device`, of the family it names.
+    pub unsafe fn from_raw_copying_on(
+        mut raw: RawDevice,
+        codecs: vk::VideoCodecOperationFlagsKHR,
+        copies: Box<dyn LentQueue>,
+    ) -> Result<Arc<Self>, Error> {
+        raw.copy_family = copies.family();
+        let submitter = Self::submitter(&raw);
+        let copies = LentCopies::new(copies, submitter)?;
+        Ok(Arc::new(Self::assemble(
+            raw,
+            CopyQueue::Lent(copies),
+            None,
+            false,
+            codecs,
+        )))
+    }
+
+    /// The submit commands of `raw`'s device.
+    fn submitter(raw: &RawDevice) -> Submitter {
+        Submitter {
+            device: raw.device.clone(),
+            synchronization2: (raw.instance_api_version < vk::API_VERSION_1_3)
+                .then(|| ash::khr::synchronization2::Device::new(&raw.instance, &raw.device)),
+        }
     }
 
     /// A device of its own, on the first physical device, discrete GPUs
@@ -255,11 +312,17 @@ impl VideoDevice {
             graphics_family: choice.graphics_family,
             unified_image_layouts_video: choice.unified_layouts,
         };
-        Self::assemble(raw, Some(graphics), true, codecs)
+        let copy_queue = if copy_queue == decode {
+            CopyQueue::Decode
+        } else {
+            CopyQueue::Own(Mutex::new(copy_queue))
+        };
+        Self::assemble(raw, copy_queue, Some(graphics), true, codecs)
     }
 
     fn assemble(
         raw: RawDevice,
+        copy_queue: CopyQueue,
         graphics_queue: Option<vk::Queue>,
         owned: bool,
         codecs: vk::VideoCodecOperationFlagsKHR,
@@ -272,9 +335,7 @@ impl VideoDevice {
         let video_instance = ash::khr::video_queue::Instance::new(&raw.entry, &raw.instance);
         let video = ash::khr::video_queue::Device::new(&raw.instance, &raw.device);
         let decode = ash::khr::video_decode_queue::Device::new(&raw.instance, &raw.device);
-        let copy_queue = (raw.copy_queue != raw.decode_queue).then(|| Mutex::new(raw.copy_queue));
-        let synchronization2 = (raw.instance_api_version < vk::API_VERSION_1_3)
-            .then(|| ash::khr::synchronization2::Device::new(&raw.instance, &raw.device));
+        let submitter = Self::submitter(&raw);
         Self {
             entry: raw.entry,
             instance: raw.instance,
@@ -292,7 +353,7 @@ impl VideoDevice {
             video_instance,
             video,
             decode,
-            synchronization2,
+            submitter,
             owned,
         }
     }
@@ -337,7 +398,7 @@ impl VideoDevice {
     /// Whether pictures are copied out on the decode queue, in the decode's
     /// own submission.
     pub fn copies_on_decode_queue(&self) -> bool {
-        self.copy_queue.is_none()
+        matches!(self.copy_queue, CopyQueue::Decode)
     }
 
     /// The graphics queue family the outputs are shared with.
@@ -424,7 +485,7 @@ impl VideoDevice {
         command: vk::CommandBuffer,
         dependency: &vk::DependencyInfo<'_>,
     ) {
-        match &self.synchronization2 {
+        match &self.submitter.synchronization2 {
             // SAFETY: as the caller promises.
             Some(khr) => unsafe { khr.cmd_pipeline_barrier2(command, dependency) },
             // SAFETY: as the caller promises.
@@ -446,13 +507,8 @@ impl VideoDevice {
         submits: &[vk::SubmitInfo2<'_>],
         fence: vk::Fence,
     ) -> Result<(), Error> {
-        match &self.synchronization2 {
-            // SAFETY: as the caller promises.
-            Some(khr) => unsafe { khr.queue_submit2(queue, submits, fence) },
-            // SAFETY: as the caller promises.
-            None => unsafe { self.device.queue_submit2(queue, submits, fence) },
-        }
-        .named("vkQueueSubmit2")
+        // SAFETY: as the caller promises.
+        unsafe { self.submitter.queue_submit2(queue, submits, fence) }
     }
 
     /// Submits to the decode queue.
@@ -486,8 +542,13 @@ impl VideoDevice {
         fence: vk::Fence,
     ) -> Result<(), Error> {
         let queue = match &self.copy_queue {
-            Some(queue) => queue.lock(),
-            None => self.decode_queue.lock(),
+            CopyQueue::Decode => self.decode_queue.lock(),
+            CopyQueue::Own(queue) => queue.lock(),
+            // SAFETY: as in `submit_decode`, with the fence unsignalled;
+            // each wait is of a decoder's timeline semaphore, to a value it
+            // submitted, and a decoder's command buffers, semaphores and
+            // fences live until its timeline's last value is reached.
+            CopyQueue::Lent(lent) => return unsafe { lent.submit(submits, fence) },
         };
         // SAFETY: as in `submit_decode`, with the fence unsignalled.
         unsafe { self.queue_submit2(*queue, submits, fence) }
