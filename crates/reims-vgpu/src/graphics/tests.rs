@@ -26,7 +26,6 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
         },
         window: None,
         memory_map: None,
-        dirty_source: None,
     };
     GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap()
 }
@@ -112,7 +111,6 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
         },
         window: None,
         memory_map: None,
-        dirty_source: None,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -164,7 +162,6 @@ fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
         },
         window: None,
         memory_map: None,
-        dirty_source: None,
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let gpu = platform.metal_device(None).unwrap();
@@ -756,7 +753,6 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
         },
         window: None,
         memory_map: None,
-        dirty_source: None,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -3285,7 +3281,6 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: Some(map),
-        dirty_source: None,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let want = if platform.vm().page_size() == 4096 {

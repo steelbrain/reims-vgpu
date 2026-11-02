@@ -124,42 +124,6 @@ fn a_watch_answers_in_the_imports_offsets() {
     assert_eq!(changed(&d, s1), vec![], "no live watch");
 }
 
-/// An import keeps a range's resolution, and resolves it again once a lease is made or dropped:
-/// a dropped lease's RAM answers no guest pages
-#[test]
-fn an_import_keeps_a_ranges_resolution_until_the_registry_changes() {
-    let base = 0x7e28_0000_0000;
-    // The registry holds a lease's log weakly: the test keeps both logs.
-    let (ours, _) = log();
-    let lease = ram(base, Some(Arc::clone(&ours)));
-    let d = ImportDirty::new(base + 0x10_0000 - 2 * P).unwrap();
-    let first = d.segments(&(0..4 * P));
-    assert!(Arc::ptr_eq(&first, &d.segments(&(0..4 * P))), "kept");
-    assert_eq!(
-        first.iter().map(|s| s.guest).collect::<Vec<_>>(),
-        [Some(0x10_0000 - 2 * P), Some(0x1_0000_0000)]
-    );
-    for k in 1..=KEPT_RESOLUTIONS as u64 {
-        d.segments(&(k * P..(k + 1) * P));
-    }
-    assert!(
-        !Arc::ptr_eq(&first, &d.segments(&(0..4 * P))),
-        "the oldest went"
-    );
-    let kept = d.segments(&(0..4 * P));
-    let (other, _) = log();
-    let other_lease = ram(0x7e2c_0000_0000, Some(Arc::clone(&other)));
-    let again = d.segments(&(0..4 * P));
-    assert!(!Arc::ptr_eq(&kept, &again), "a lease made");
-    assert_eq!(*kept, *again);
-    drop(other_lease);
-    drop(lease);
-    assert!(
-        d.segments(&(0..4 * P)).iter().all(|s| s.guest.is_none()),
-        "a lease dropped"
-    );
-}
-
 /// Two watches of one import answer once for the bytes both cover
 #[test]
 fn overlapping_watches_answer_once() {

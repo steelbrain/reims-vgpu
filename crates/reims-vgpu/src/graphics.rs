@@ -21,12 +21,6 @@
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
-//! **Over the guest's RAM** ([`GraphicsConfig::memory_map`]) the GPU uses an IOSurface's own
-//! pages in place, and with the host's dirty source ([`GraphicsConfig::dirty_source`]) the device
-//! keeps core's dirty log of that RAM as a device of `crate::device` does: the Vulkan runtime's
-//! copies of guest pages (a render target's shadow) are copied again only where the guest wrote
-//! them. The log is closed while the host's reset runs ([`GraphicsDevice::reset`]).
-//!
 //! Every public method runs as an entry ([`crate::entry`]).
 
 use std::marker::PhantomData;
@@ -50,7 +44,6 @@ use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
     Screen,
 };
-use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
@@ -65,8 +58,7 @@ use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
-use crate::device::{MemoryMap, lease_guest_memory};
-use crate::dirty::DirtySource;
+use crate::device::{GuestMemoryLease, MemoryMap};
 use crate::display::no_catch;
 use crate::entry;
 use crate::error::Error;
@@ -125,11 +117,6 @@ pub struct GraphicsConfig {
     /// guest's RAM while the device lives: a host that discards guest RAM (a balloon, hot-unplug)
     /// gives none.
     pub memory_map: Option<MemoryMap>,
-    /// With `memory_map`: the host's dirty source, which tells the device which of the guest's
-    /// pages the guest wrote (QEMU under KVM), so that the Vulkan runtime copies again only
-    /// those, as a device's ([`crate::DeviceConfig::dirty_source`]); `None` for none, and
-    /// without a memory map.
-    pub dirty_source: Option<DirtySource>,
 }
 
 /// The mode a display offers before its window has a size, and without a window.
@@ -145,8 +132,6 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     window: Option<WindowLink>,
     /// The device.
     device: reims_graphics::Device,
-    /// The dirty log of a device made over the guest's RAM with a dirty source (the module doc).
-    dirty_log: Option<Arc<DirtyLog>>,
     /// The stage-3 decoder and the device handle it drives, shared with the device's [`Host`],
     /// which feeds it the control ring's stage-3 messages; held here for the tests' look at it.
     #[cfg(any(test, feature = "testkit"))]
@@ -197,14 +182,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             decoder.set_unified_memory(unified_memory);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
             // made through the map, so it outlives the last of them.
-            let mut dirty_log = None;
             if let Some(map) = &config.memory_map {
-                let (lease, log) =
-                    lease_guest_memory(platform.as_ref(), map, config.dirty_source.clone());
+                let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map, None));
                 let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
-                dirty_log = log;
             }
             let features = if decoder.surface_pages_available() {
                 u64::from(RGFX_FEATURE_SURFACE_PAGES)
@@ -239,7 +221,6 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             Ok(GraphicsDevice {
                 window,
                 device,
-                dirty_log,
                 #[cfg(any(test, feature = "testkit"))]
                 control,
                 platform: PhantomData,
@@ -288,19 +269,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| self.device.set_doorbell(fd))
     }
 
-    /// The host's reset of the device (the guest's bus reset), which the host makes under its
-    /// lock: the dirty log is closed while it runs, so a wait of the runtime's for a harvest that
-    /// the reset waits for answers at once (`reims_vgpu_core::memory::dirty`).
+    /// The host's reset of the device (the guest's bus reset).
     pub fn reset(&self) {
-        entry::run(|_| {
-            let Some(log) = &self.dirty_log else {
-                self.device.reset();
-                return;
-            };
-            log.close();
-            self.device.reset();
-            log.reopen();
-        });
+        entry::run(|_| self.device.reset());
     }
 }
 

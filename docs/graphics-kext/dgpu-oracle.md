@@ -131,8 +131,9 @@ use (AMD 5.6 + 5.6 ms at 4K), even when the CPU wrote nothing.
   makes each texture over them. A texture the GPU only samples is a linear image over the
   pages. One the GPU renders to or writes is a shadow image: m2v copies the pages in before the
   first command of each command buffer that uses it, and merges the changed words back at the
-  end of each encoder that wrote it. With no dirty-page log the copy-in is the whole texture.
-  The dirty-page source (525ea4f03, on `steelbrain/rgk-perf`) shrinks it to the changed rows.
+  end of each encoder that wrote it. The copy-in is the whole texture: the graphics device
+  takes no dirty-page source, whose resolution of the surface's pages cost the host more per
+  command buffer than the copies it saved (measured on the 5080).
   Nothing consults the seed or a lock.
 - **The copy:** at each commit the bundle copies every surface of the process whose seed moved
   into its block, and at each completion writes every written surface back under a lock.

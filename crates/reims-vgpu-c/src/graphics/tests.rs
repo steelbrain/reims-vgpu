@@ -1,9 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::device::RvgMemoryRange;
 use crate::status::RVG_ERR_UNSUPPORTED;
-use crate::testkit::{Rec, t_destroy, test_platform};
 
 static DESTROYS: AtomicUsize = AtomicUsize::new(0);
 
@@ -30,7 +28,6 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         window: std::ptr::null(),
         memory_map: std::ptr::null(),
         memory_files: std::ptr::null(),
-        dirty_source: std::ptr::null(),
     }
 }
 
@@ -165,121 +162,4 @@ fn a_first_version_graphics_config_makes_a_device() {
         assert!(!device.is_null());
         rvg_graphics_device_release(device);
     }
-}
-
-unsafe extern "C-unwind" fn t_slots(_ctx: *mut c_void, _slot_ctx: *mut c_void) -> bool {
-    true
-}
-
-/// A dirty source over `rec` with only the functions that make it one.
-fn dirty_table(rec: &Arc<Rec>, fd: i32) -> RvgDirtySource {
-    RvgDirtySource {
-        struct_size: crate::sized::size_u32::<RvgDirtySource>(),
-        kvm_vm_fd: fd,
-        ctx: rec.ctx(),
-        destroy: Some(t_destroy),
-        start: None,
-        flush_vcpus: None,
-        for_each_slot: Some(t_slots),
-        take_host_writes: None,
-    }
-}
-
-/// A graphics device over a memory map keeps its dirty source until its end; one without a map,
-/// a source that is none and a refusal end it before the create returns; a source the create
-/// cannot read is refused, ending no table; a second-version config has no source
-#[test]
-fn a_graphics_dirty_source_lives_with_its_device() {
-    let p = test_platform();
-    let src = Rec::new();
-    let cb = callbacks();
-    let host = reims_vgpu_core::platform::Platform::vm(&*p)
-        .allocate_anywhere(0x10_0000)
-        .unwrap();
-    let range = RvgMemoryRange {
-        physical_address: 0x10_0000,
-        physical_length: 0x10_0000,
-        host_address: host.as_ptr(),
-    };
-    let map = RvgMemoryMap {
-        ranges: &range,
-        range_count: 1,
-    };
-    let d = dirty_table(&src, 9);
-    let mut c = config(&cb);
-    c.memory_map = &map;
-    c.dirty_source = &d;
-    let create = |c: &RvgGraphicsDeviceConfig| {
-        let mut device = std::ptr::null_mut();
-        // SAFETY: a live config and out-pointer.
-        let s = unsafe { rvg_graphics_device_create(c, &mut device) };
-        (s, device)
-    };
-    let (s, dev) = create(&c);
-    assert_eq!(s, RVG_OK);
-    assert!(src.destroys().is_empty());
-    // SAFETY: the device made above, not used again.
-    unsafe { rvg_graphics_device_release(dev) };
-    assert_eq!(src.wait_destroys(1).len(), 1);
-    assert!(src.lines().is_empty(), "no harvest was wanted");
-
-    c.memory_map = std::ptr::null();
-    let (s, dev) = create(&c);
-    assert_eq!(s, RVG_OK);
-    assert_eq!(
-        src.destroys().len(),
-        2,
-        "no map: ended before the create returned"
-    );
-    // SAFETY: the device made above, not used again.
-    unsafe { rvg_graphics_device_release(dev) };
-
-    c.memory_map = &map;
-    let none = RvgDirtySource { kvm_vm_fd: -1, ..d };
-    c.dirty_source = &none;
-    let (s, dev) = create(&c);
-    assert_eq!(s, RVG_OK);
-    assert_eq!(
-        src.destroys().len(),
-        3,
-        "none: ended before the create returned"
-    );
-    // SAFETY: the device made above, not used again.
-    unsafe { rvg_graphics_device_release(dev) };
-
-    // Files without a map are refused after the tables are the library's.
-    let file = RvgMemoryRangeFile {
-        fd: -1,
-        flags: 0,
-        offset: 0,
-    };
-    c.dirty_source = &d;
-    c.memory_map = std::ptr::null();
-    c.memory_files = &file;
-    assert_eq!(create(&c).0, RVG_ERR_INVALID_ARGUMENT);
-    assert_eq!(src.destroys().len(), 4, "a refusal ends it");
-    c.memory_map = &map;
-    c.memory_files = std::ptr::null();
-
-    let small = RvgDirtySource {
-        struct_size: 4,
-        ..d
-    };
-    c.dirty_source = &small;
-    let before = DESTROYS.load(Ordering::SeqCst);
-    assert_eq!(create(&c).0, RVG_ERR_INVALID_ARGUMENT);
-    assert_eq!(src.destroys().len(), 4);
-    assert_eq!(
-        DESTROYS.load(Ordering::SeqCst),
-        before,
-        "no destroy for a size"
-    );
-
-    c.dirty_source = &d;
-    c.struct_size = std::mem::offset_of!(RvgGraphicsDeviceConfig, dirty_source) as u32;
-    let (s, dev) = create(&c);
-    assert_eq!(s, RVG_OK, "a second-version config has no source");
-    assert_eq!(src.destroys().len(), 4);
-    // SAFETY: the device made above, not used again.
-    unsafe { rvg_graphics_device_release(dev) };
 }

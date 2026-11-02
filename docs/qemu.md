@@ -326,10 +326,9 @@ is its transport:
 - **The guest's RAM**: where every range of it is a shared file in pages of
   the host's size (the memfd of `reims-ctl`'s VMs), the library gets the
   RAM's map and the files behind it, and the GPU uses an IOSurface's own
-  pages in place. Under KVM it also gets the dirty source `apple-gfx` gives
-  ("Linux hosts: the dirty source", below), the same four callbacks: the
-  Vulkan runtime's shadow of a render target over a surface's pages is then
-  copied in again only where the guest wrote it.
+  pages in place. The graphics device takes no dirty source: resolving the
+  pages behind each IOSurface's import cost its thread about 5 ms a command
+  buffer on a discrete GPU, more than the whole copies it saved.
 - An interrupt the library raises, on its control or refresh thread, is
   sent by a BH under the BQL.
 - Under `-display none` the library opens a window for the display, unless
@@ -687,8 +686,8 @@ isolated task's CPU, and the Metal lines it logs, are QEMU's.
 Where the Vulkan runtime keeps a copy of guest memory in GPU memory (a
 discrete GPU's texture copies, and the shadows of a GPU whose driver cannot
 use the guest's pages in place), it copies again only the pages written
-since its last copy. Under KVM, `apple-gfx` and `reims-graphics-pci` give
-the device a dirty source (api.md, `RvgDirtySource`): the VM's fd and four callbacks, none of which
+since its last copy. Under KVM, `apple-gfx` gives the device a dirty source
+(api.md, `RvgDirtySource`): the VM's fd and four callbacks, none of which
 takes the BQL. The library's thread `reims-vgpu.dirty` runs each harvest:
 it has every vCPU inside `KVM_RUN` leave it once where `kvm_intel`'s `pml`
 is on (KVM's `KVM_GET_DIRTY_LOG` kicks the vCPUs but does not wait, so a
