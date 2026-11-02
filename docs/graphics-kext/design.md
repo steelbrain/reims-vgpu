@@ -325,7 +325,9 @@ Stages:
         arguments from the AIR metadata of its bitcode in the `.metallib`
         (`guest/bundle/src/RgfxAirArguments.hpp`), since the host gives no
         binding reflection. Where they do not read, a bound texture with
-        ShaderWrite usage counts as written;
+        ShaderWrite usage counts as written. The same rule decides the
+        copy's write-back: a buffer writes a copy back to the pages only
+        where it writes the surface, never for a surface it only reads;
       - the committer's own lock waits from the buffer's submission on. At
         the commit itself the AMD's returns at once, a race. Loose: ours
         waits from the commit on;
