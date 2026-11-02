@@ -1253,6 +1253,45 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   `MTLDevice`) — under `IOMatchCategory IOAccelerator`. So stage 3 needs a
   guest **accelerator kext** that matches our PCI device and publishes those
   two keys; the bundle ships beside it.
+- **Trusted-bundle gate (with SIP on).** Before it loads a GPU bundle from
+  `/Library/GPUBundles`, Metal asks the system whether that path is trusted,
+  and the answer is yes only for a path carrying the particular SIP "rootless"
+  storage class the OS gives the bundles its own kext-staging writes there (or
+  for a path sealed on the system volume). A bundle merely copied onto the data
+  volume does not carry it, so with SIP on Metal declines to load it and
+  WindowServer, finding the accelerator registered, crashes and restarts in a
+  loop.
+  Our install kext (`guest/rgfxgate`, a Lilu plug-in) therefore writes the
+  bundle to the data volume and gives the whole tree that exact storage class
+  and the matching restricted flag from kernel context, below the file-system
+  MAC layer, so only our bundle's own paths are tagged and SIP is relaxed for
+  nothing. The unsigned bundle's executable still has to pass library
+  validation when WindowServer and the Metal helpers map it; the same kext
+  answers the library-validation, mmap and signature MAC checks for our bundle
+  by its code-directory hash alone, leaving every other binary's signing rules
+  untouched. No boot-args and no SIP relaxation are involved — the guest boots
+  with SIP fully enabled (measured on msi, x86-64 macOS 26.6.1: desktop
+  composites on our Metal device and Safari WebGL renders, `csrutil` enabled).
+  `/Library/GPUBundles` itself comes with every install: the data-volume
+  template on the sealed system volume holds it, already restricted and of
+  that storage class (measured: the x86-64 26.6.1 guest and a 27.0.1 host).
+  The install kext waits for the data volume to mount (`/Library/Preferences`
+  appears) and creates the container, with the same class, only where it is
+  missing.
+- **Bundle updates.** The marker beside the executable (below, "Registration
+  waits for the bundle") carries the kext's wire version, and the bundle is the
+  kext's own payload, so a newer kext whose executable or wire version differs
+  replaces the installed bundle in place: it drops the marker first (so a
+  half-written bundle never registers), clears the storage class and restricted
+  flag off the existing tree so the writes land, rewrites the files and the
+  marker last, then re-tags. A bundle that is byte-current but untagged — staged
+  by a tool under relaxed SIP and then first seen on a SIP-on boot — is detected
+  and tagged without a rewrite. The test is the bundle directory's storage
+  class and restricted flag together: a bundle copied into the restricted
+  container is given the flag but not the class, and the class is what Metal
+  reads. Userspace cannot remove the class even with SIP off, so only the kext
+  writes or clears it. A current, tagged bundle is left as it is, and the boot
+  writes nothing.
 - **Device class.** The bundle's device subclasses Apple's private IOAccel
   Metal base class and conforms to `<MTLDevice, MTLDeviceSPI>`; entry
   `-initWithAcceleratorPort:` (may return `nil` to decline). The base fills the
@@ -1289,9 +1328,12 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   through its IOSurface display pipe (type-4 adapter), and we already have the
   framebuffer/display kext; stage 3's display work is making the accelerator and
   the framebuffer agree on the IOSurface scanout (flip, else copy).
-- **Load policy.** Loading an unsigned bundle into WindowServer, the Metal
-  compiler helpers and sandboxed apps needs relaxed library validation — a
-  guest boot-policy step we control (OpenCore/boot-args), not a code concern.
+- **Load policy.** Loading our unsigned bundle into WindowServer, the Metal
+  compiler helpers and sandboxed apps is done with SIP and library validation
+  left on, by the install kext's two gates above — the rootless storage-class
+  tag that makes the path trusted, and the code-directory-hash answer to the
+  library-validation and signature MAC checks. It is a concern of our kext, not
+  a boot-args relaxation.
 
 ## Stage 3 accelerator kext (scaffold)
 
@@ -1380,11 +1422,16 @@ builds a pipe), and refuses the rest.
 
 ## Open
 
-- **Stage 3 bundle placement — RESOLVED in principle:** the bundle sits in
+- **Stage 3 bundle placement — RESOLVED:** the bundle sits in
   `/Library/GPUBundles` and our accelerator kext's personality carries
-  `MetalPluginName`/`MetalPluginClassName`. Open: the exact IOGPU accelerator
-  user-client ABI our kext exposes, and the library-validation boot state —
-  both settled by a guest experiment, not desk work.
+  `MetalPluginName`/`MetalPluginClassName`. The library-validation boot state
+  is settled: the install kext gives the bundle the rootless storage class so
+  Metal trusts its path, and answers the library-validation, mmap and signature
+  MAC checks for it by its code-directory hash, so WindowServer composites on
+  our Metal device and Safari WebGL renders with SIP fully on and no boot-args
+  ("Trusted-bundle gate", above; measured on msi, x86-64 macOS 26.6.1). Open:
+  the exact IOGPU accelerator user-client ABI our kext exposes, settled by a
+  guest experiment.
 - **IOSurface details:** whether the device-cache sync runs on every CPU
   access path and on unlock (window buffers wrapped no-copy are written
   without a lock); whether IOGPU accepts a device cache that holds a host
