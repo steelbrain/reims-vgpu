@@ -57,7 +57,10 @@ class RgfxEncoder {
 public:
 	/// A builder that will post to `ring` (a queue's submission ring) a command
 	/// buffer `cb_obj_id` on the queue `queue_obj_id`. `ring` outlives the builder.
-	RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id);
+	/// The message has room for `reserve` bytes before it grows: its queue's guess
+	/// (RgfxCommandQueue's rgfxMessageReserve), so its ops are not copied as it grows.
+	RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id,
+	            size_t reserve = 0);
 
 	// --- framing --------------------------------------------------------------
 
@@ -388,6 +391,9 @@ public:
 
 	/// The finished message's length: messageSize() bytes go to finishInRegion's block.
 	uint64_t messageSize() const { return m_buf.size(); }
+
+	/// The bytes the message holds before it grows.
+	size_t capacity() const { return m_buf.capacity(); }
 
 	/// Out of line: writes the whole COMMAND_BUFFER message (its header's `type` and `size`
 	/// stamped, `seqno` 0) to `block`, the CPU address of region offset `region_offset`, of at

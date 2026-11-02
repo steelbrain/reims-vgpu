@@ -110,6 +110,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// returns at the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
 @property(nonatomic) BOOL asksSubmitted;
 
+/// The bytes a new command buffer's message has room for before it grows (RgfxEncoder): the
+/// largest of the queue's recent messages, as its command buffers committed them. Each smaller
+/// one takes an eighth off, so one large buffer does not hold it; the queue's submission ring's
+/// size at most. 0 before the first commit.
+@property(nonatomic, readonly) uint32_t rgfxMessageReserve;
+
 /// The most command buffers of this queue alive and not completed at once:
 /// `maxCommandBufferCount`, 64 where the queue was made with 0, as Metal's default.
 /// -commandBuffer blocks while that many are, as Metal's does, where the queue has a reader

@@ -8,6 +8,7 @@
 
 #include "RgfxEncoder.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace {
@@ -36,12 +37,14 @@ size_t roundUp8(size_t n)
 
 } // namespace
 
-RgfxEncoder::RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id)
+RgfxEncoder::RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id,
+                         size_t reserve)
     : m_ring(ring), m_head{}, m_buf()
 {
 	m_head.queue_obj_id = queue_obj_id;
 	m_head.cb_obj_id = cb_obj_id;
 	m_head.op_bytes = 0;
+	m_buf.reserve(std::max<size_t>(reserve, RGFX_COMMAND_BUFFER_OPS_OFFSET));
 	// Reserve the fixed header; its RgfxMsgHeader is stamped by the ring writer on
 	// post, and op_bytes is filled by finish(). The op stream starts right after.
 	m_buf.resize(RGFX_COMMAND_BUFFER_OPS_OFFSET, 0);

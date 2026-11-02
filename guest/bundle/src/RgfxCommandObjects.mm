@@ -440,6 +440,8 @@ struct RgfxBarrierSlot {
 @interface RgfxCommandQueue ()
 - (std::shared_ptr<RgfxUploadPool>)rgfxUploadPool;
 - (std::shared_ptr<RgfxBodyPool>)rgfxBodyPool;
+/// Takes a committed message's `bytes` into rgfxMessageReserve.
+- (void)rgfxNoteMessageBytes:(uint64_t)bytes;
 /// The next encoder's barrier fence, of the fences the queue made with itself.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 @end
@@ -470,6 +472,9 @@ struct RgfxBarrierSlot {
 	NSArray<RgfxFence *> *_barrierFences;
 	uint64_t _encodersMade;
 	uint64_t _traceId; // globalTraceObjectID
+	// rgfxMessageReserve's bytes. Command buffers commit on any thread; a lost update only
+	// sizes one message's first allocation.
+	std::atomic<uint32_t> _messageReserve;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -534,6 +539,19 @@ struct RgfxBarrierSlot {
 - (NSUInteger)maxCommandBufferCount
 {
 	return _maxCount;
+}
+
+- (uint32_t)rgfxMessageReserve
+{
+	return _messageReserve.load(std::memory_order_relaxed);
+}
+
+- (void)rgfxNoteMessageBytes:(uint64_t)bytes
+{
+	const uint32_t was = _messageReserve.load(std::memory_order_relaxed);
+	const uint64_t next = std::max<uint64_t>(bytes, was - was / 8);
+	_messageReserve.store(static_cast<uint32_t>(std::min<uint64_t>(next, _submitRing->dataSize())),
+	                      std::memory_order_relaxed);
 }
 
 // Takes one of the queue's slots, blocking while every one is held, as Metal's -commandBuffer
@@ -966,7 +984,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
-		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId);
+		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, queue.rgfxMessageReserve);
 		// One with unretained references keeps them too, though it answers retainedReferences
 		// NO: the host must not drop an object before a buffer that names it has run.
 		cb->_encoder->setKeeper(&rgfxKeep, &cb->_kept);
@@ -1190,7 +1208,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	}
 
 	// Post the command buffer on the queue's submission ring, waiting for room; one too
-	// large for the ring goes in a block of the process's own, which the ring names.
+	// large for the ring goes in a block of the process's own, which the ring names. Its size
+	// sizes the queue's next messages first.
+	[queue rgfxNoteMessageBytes:_encoder->messageSize()];
 	bool posted = false;
 	if (_encoder->fitsRing()) {
 		posted = _encoder->finish(&_seqno, whileWaiting, expect);

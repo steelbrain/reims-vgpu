@@ -69,6 +69,7 @@
 #include <thread>
 
 #include "RgfxCompletionThread.hpp"
+#include "RgfxEncoder.hpp"
 #include "RgfxFunctionConstants.hpp"
 #include "RgfxManagedLayout.hpp"
 #include "RgfxMemoryShadow.hpp"
@@ -4028,6 +4029,55 @@ void test_command_buffer_event_ops()
 		RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
 		CHECK(f.completion.postFromHost(&done, sizeof(done)));
 		[cb waitUntilCompleted];
+	}
+}
+
+// A queue's command buffers start their messages with room for the largest of its recent ones:
+// a commit's size raises the queue's reserve, each smaller one takes an eighth off it, and its
+// ring's size bounds it. A message made with a reserve has that room before its first op.
+void test_message_reserve()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		CHECK(f.queue.rgfxMessageReserve == 0);
+		RgfxEvent *ev = [RgfxEvent eventWithDevice:nil serializer:&f.ser];
+		// Commits a buffer of `signals` event signals, and completes it where it reached the
+		// ring: its message's size there, 0 where it did not.
+		auto commit = [&](int signals) -> uint32_t {
+			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+			for (int i = 0; i < signals; i++)
+				[cb encodeSignalEvent:ev value:static_cast<uint64_t>(i)];
+			[cb commit];
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			if (!f.submit.next(&h, &bytes)) {
+				[cb waitUntilCompleted];
+				return 0;
+			}
+			CHECK(h.type == RGFX_CMD_COMMAND_BUFFER);
+			RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
+			CHECK(f.completion.postFromHost(&done, sizeof(done)));
+			[cb waitUntilCompleted];
+			return h.size;
+		};
+		const uint32_t large = commit(200);
+		CHECK(large > 0x1000 && f.queue.rgfxMessageReserve == large);
+		const uint32_t small = commit(1);
+		CHECK(small > 0 && small < large - large / 8);
+		const uint32_t once = large - large / 8;
+		CHECK(f.queue.rgfxMessageReserve == once);
+		(void)commit(1);
+		CHECK(f.queue.rgfxMessageReserve == once - once / 8);
+		CHECK(commit(250) > large && f.queue.rgfxMessageReserve > large);
+		// One too large for the ring, here with no region to go to, sizes the next at the
+		// ring's size.
+		CHECK(commit(3000) == 0);
+		CHECK(f.queue.rgfxMessageReserve == f.submitWriter.dataSize());
+
+		RgfxEncoder reserved(f.submitWriter, 1, 2, 0x1800);
+		CHECK(reserved.capacity() >= 0x1800 && reserved.messageSize() == RGFX_COMMAND_BUFFER_OPS_OFFSET);
+		RgfxEncoder unreserved(f.submitWriter, 1, 3);
+		CHECK(unreserved.capacity() >= RGFX_COMMAND_BUFFER_OPS_OFFSET);
 	}
 }
 
@@ -8325,6 +8375,7 @@ int main(int argc, char **argv)
 		test_reply_reader_reflection();
 		test_reply_reader_event();
 		test_command_buffer_event_ops();
+		test_message_reserve();
 		test_reply_reader_arm();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();
