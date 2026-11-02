@@ -358,6 +358,11 @@ static void doInstall() {
 	// untagged bundle.
 	if (ok)
 		tagInstalledTree(ctx);
+	else
+		// The container is the system's, classed on every install: give it its
+		// tags back even when our own tree failed to write, so an update that
+		// unlocked it never leaves it open.
+		tagRootless(kContainerPath, ctx);
 
 	gInstalling = false;
 	gInstallThread = nullptr;
