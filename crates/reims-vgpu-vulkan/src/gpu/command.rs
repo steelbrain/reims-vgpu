@@ -1694,6 +1694,85 @@ mod tests {
         }
     }
 
+    /// A command buffer whose first command waits for an unsignalled shared event is not
+    /// scheduled until the CPU signals it: 100 ms after its commit it still reads committed and
+    /// its scheduled handler has not run, which runs once the event is signalled, before its
+    /// completed handler, the blit behind the wait run. Metal on this host does the same (the
+    /// comparison below), and so does every Mac measured: an AMD Radeon Pro 5300M and an Intel
+    /// UHD 630 under macOS 26.7.1 schedule such a buffer at the signal
+    /// (docs/graphics-kext/dgpu-oracle.md, Q7). The graphics lane posts `CB_SCHEDULED` from that
+    /// handler, so the guest's buffer reads scheduled no earlier
+    #[test]
+    fn a_command_buffer_waiting_for_an_event_is_scheduled_at_its_signal() {
+        use reims_vgpu_core::platform::Platform;
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::types::NsRange;
+
+        /// On `d`: the buffer's status 100 ms after its commit, then the order its scheduled
+        /// and completed handlers ran in around the CPU's signal, and the first byte its blit
+        /// filled.
+        fn held<P: Platform>(d: &P::Device) -> (CommandBufferStatus, Vec<&'static str>, u8) {
+            let q = d.new_command_queue().unwrap();
+            let event = d.new_shared_event().unwrap();
+            let b = d
+                .new_buffer_of_length(OnFault::Return, 16, 0)
+                .unwrap()
+                .unwrap();
+            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+            cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
+            let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for cmd in [
+                BlitCmd::FillBuffer {
+                    buffer: &b,
+                    range: NsRange::new(0, 16),
+                    value: 0x5a,
+                },
+                BlitCmd::EndEncoding,
+            ] {
+                blit.encode(OnFault::Return, cmd).unwrap();
+            }
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let at = Arc::clone(&seen);
+            cb.add_scheduled_handler(
+                OnFault::Return,
+                Box::new(move || at.lock().push("scheduled")),
+            )
+            .unwrap();
+            let (at, (done, completed)) = (Arc::clone(&seen), mpsc::channel());
+            let handler: CompletedHandler = Box::new(move |_| {
+                at.lock().push("completed");
+                done.send(()).unwrap();
+            });
+            cb.add_completed_handler(OnFault::Return, handler).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let status = cb.status();
+            seen.lock().push("signal");
+            event.set_signaled_value(1).unwrap();
+            completed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // SAFETY: a Shared buffer of 16 bytes, read after its command buffer completed.
+            let first = unsafe { *b.contents().as_ptr::<u8>() };
+            let order = seen.lock().clone();
+            (status, order, first)
+        }
+        let vulkan = held::<VulkanPlatform>(&dev());
+        assert_eq!(
+            vulkan,
+            (
+                CommandBufferStatus::COMMITTED,
+                vec!["signal", "scheduled", "completed"],
+                0x5a
+            )
+        );
+        #[cfg(target_os = "macos")]
+        if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
+            assert_eq!(held::<reims_vgpu_metal::MetalPlatform>(&md), vulkan);
+        }
+    }
+
     /// Metal takes its own allocation for a command buffer's first work for its tiler as it
     /// submits that work (`vaprobe rendersubmit`): behind an event wait, once the wait is met,
     /// not at the commit
