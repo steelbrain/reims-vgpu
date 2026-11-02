@@ -162,9 +162,11 @@ public:
 	/// texture-buffer alignment, the blob's answers; 0 where it has no linear answer.
 	uint64_t linearTextureAlignment() const;
 	/// `minimumLinearTextureAlignmentForPixelFormat:` of the raw `MTLPixelFormat` `format`: the
-	/// blob's `linearTextureAlignmentBytes` for every format the host makes textures over a
-	/// buffer of (one with a texture-buffer answer), as an Intel, AMD or Apple GPU answers one
-	/// value for every format it makes linear textures of; 0 for any other, which Metal asserts on.
+	/// blob's `linearTextureAlignmentBytes`, for every format. A Radeon Pro 5300M, a UHD 630 and an
+	/// M3 Max each answer one value for every format they make linear textures of, and end the
+	/// process on any other (Metal's assertion, measured: compressed, depth and stencil formats,
+	/// Invalid, and formats the device lacks), never 0; so a guest reaches no other format on a
+	/// real Mac, and one that does gets no 0 to align up by.
 	uint64_t minimumLinearTextureAlignment(uint64_t format) const;
 	/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of `format` at
 	/// `samples` (1, 2 or 4) in pages of the raw `MTLSparsePageSize` `page` (101, 102 or 103),

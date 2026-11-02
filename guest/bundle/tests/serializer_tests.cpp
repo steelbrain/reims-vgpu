@@ -370,10 +370,12 @@ void test_caps()
 	CHECK(caps.textureBufferAlignment(80) == 16);
 	CHECK(caps.textureBufferAlignment(70) == 0); // listed past the count
 	CHECK(caps.textureBufferAlignment(130) == 0); // not listed
-	// The linear alignment is the one limit for every format with a texture-buffer answer.
+	// The linear alignment is the one limit for every format, never 0: those with a
+	// texture-buffer answer, and those without, where Metal ends the process.
 	CHECK(caps.minimumLinearTextureAlignment(80) == 256);
-	CHECK(caps.minimumLinearTextureAlignment(70) == 0);  // listed past the count
-	CHECK(caps.minimumLinearTextureAlignment(130) == 0); // not listed
+	CHECK(caps.minimumLinearTextureAlignment(70) == 256);  // listed past the count
+	CHECK(caps.minimumLinearTextureAlignment(130) == 256); // not listed (ASTC)
+	CHECK(caps.minimumLinearTextureAlignment(0) == 256);   // Invalid
 	uint64_t tile[3];
 	CHECK(caps.sparseTile(80, 1, 101, tile) && tile[0] == 64 && tile[1] == 64 && tile[2] == 1);
 	CHECK(caps.sparseTile(80, 4, 103, tile) && tile[0] == 128 && tile[2] == 1);

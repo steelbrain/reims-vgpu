@@ -122,7 +122,8 @@ uint64_t RgfxCaps::linearTextureAlignment() const
 
 uint64_t RgfxCaps::minimumLinearTextureAlignment(uint64_t format) const
 {
-	return textureBufferAlignment(format) != 0 ? limit(kRgfxLimitLinearTextureAlignmentBytes) : 0;
+	(void)format;
+	return limit(kRgfxLimitLinearTextureAlignmentBytes);
 }
 
 bool RgfxCaps::sparseTile(uint64_t format, uint64_t samples, int64_t page, uint64_t out[3]) const
