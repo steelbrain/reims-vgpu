@@ -712,25 +712,23 @@ pub fn create<T>(
 ///   covers them all, so it dies. No guest form here links a function: no serialized key
 ///   carries one, and a dynamic library's import is refused. Announced at each draw or dispatch
 ///   that binds the pipeline's variant, inside its call, which dies at its selector;
-/// - the note `PixelSamplerScaling`: a stage that samples through a sampler state bound at a slot
-///   whose coordinates are pixels, or through a constexpr pixel sampler, where none of the
-///   runtime's exact paths reaches and the device filters a coordinate the runtime scaled. On
-///   MoltenVK a nearest or linear 2D sample through either takes an exact path and notes nothing,
-///   Metal's texels in each of the runtime's measured configurations on an M4, so what it notes
-///   is what nothing measured. No recorded VM boot relayed `pixel-sampler-scaling`, and the suite's
-///   one pixel sampler state filters nearest, which notes nothing. Announced at each draw or
-///   dispatch that binds the pipeline's variant (a slot's where the state bound has pixel
-///   coordinates), inside its call, which dies at its selector;
+/// - the note `PixelSamplerScaling`: a stage that samples through a pixel-coordinate sampler where
+///   none of the runtime's exact paths reaches and the device filters a coordinate the runtime
+///   scaled: a linear sample or gather through a sampler state bound at a slot, a linear sample of
+///   an array or 3D texture, a comparison, a level query, or a sample that reads a sparse residency
+///   status. A constexpr pixel sampler's sample or gather of a 1D or 2D texture reads through the
+///   device's own unnormalized-coordinate sampler, and every nearest pixel sample reads at its
+///   texel's centre, so both read Metal's texel and note nothing (the runtime's matrix of texel
+///   edges and centres: no difference from an M3 Max's Metal on an RTX 5080, on MoltenVK or on
+///   lavapipe). Announced at each draw or dispatch that binds the pipeline's variant (a slot's
+///   where the state bound has pixel coordinates), inside its call, which dies at its selector;
 /// - the note `ArgumentPixelSamplerScaling`: a stage that samples through an argument buffer's
 ///   sampler, which may hand the device a coordinate the runtime scaled from pixels, where the
-///   state the buffer names has pixel coordinates and a linear filter or a comparison. On
-///   MoltenVK the runtime notes only a comparison, as every other sample through such a sampler
-///   reads Metal's texels there (60 configurations measured on an M4), and Metal's answer for a
-///   comparison through a pixel sampler is not measured. No recorded VM boot relayed
-///   `pixel-sampler-scaling`, and the suite's one pixel sampler state filters nearest and compares
-///   nothing. Announced at each draw, dispatch, tile dispatch or execution of indirect commands
-///   of the pipeline while the device holds a live sampler state of pixel coordinates with a
-///   linear filter or a comparison, inside its call, which dies at its selector;
+///   state the buffer names has pixel coordinates. A nearest state reads Metal's texel at its
+///   centre, but the runtime announces the note for it too, as the shader cannot tell its states
+///   apart. Announced at each draw, dispatch, tile dispatch or execution of indirect commands of
+///   the pipeline while the device holds a live sampler state of pixel coordinates, inside its
+///   call, which dies at its selector;
 /// - the note `DiscardDropsSimdgroupStores`: on MoltenVK on an Apple GPU, a fragment function
 ///   that samples, and after a discard computes a floating-point value and writes storage,
 ///   where Apple's compiler drops the texture writes of every live thread of a SIMD group holding
@@ -980,7 +978,11 @@ pub fn create<T>(
 ///   and `ceil`, so nothing in the hardware forces the difference, and it dies on MoltenVK; a
 ///   native device relays it, its maths, as the class of a native device's own maths and sampling
 ///   ([`native::NATIVE_RELAYED`]). Not announced where the device answers as Metal's own function
-///   (MoltenVK, under fast math). Announced at each draw or dispatch that binds the pipeline's
+///   (MoltenVK, under fast math). A nearest pixel sample also records it where the runtime floors
+///   its coordinate to the texel's centre (a constexpr sampler with an offset, of an array or
+///   fetching the edge with an offset, and a slot's or an argument buffer's nearest pixel state):
+///   at a negative denormal coordinate Metal reads the texel before 0, where the device's floor
+///   reads texel 0 (M3 Max). Announced at each draw or dispatch that binds the pipeline's
 ///   variant, inside its call, which dies at its selector;
 /// - the note `HalfTexelConversion`: a read, gather or sample with a `half` result of a texture
 ///   bound in a format the translation does not convert as Metal does (an sRGB format otherwise
