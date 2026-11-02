@@ -2163,8 +2163,11 @@ pub struct RgfxDeviceInfo {
     /// `supportsCounterSampling:` of the stage, draw, dispatch, tile and blit
     /// boundaries by position; a gap reads 0.
     pub counter_sampling: [u8; RGFX_DEVICE_INFO_COUNTER_POINTS],
+    /// `FEATURES_LO`'s low byte as the device answers it (`RGFX_FEATURE_*`), for the processes,
+    /// which read no register; 0 from a host older than the field, which wrote it as zero.
+    pub features_lo: u8,
     /// Zero.
-    pub reserved_451: [u8; 7],
+    pub reserved_452: [u8; 6],
     /// The device `name`, UTF-8, `name_len` bytes used, the rest 0.
     pub name: [u8; RGFX_DEVICE_NAME_LEN],
     /// The device's `architecture.name`, UTF-8, `architecture_name_len` bytes

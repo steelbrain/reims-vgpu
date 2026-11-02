@@ -177,8 +177,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.
             let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
-            let info = device_info(&gpu_device.caps(), identity, pool.threads().to_u64());
-            region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
+            let mut info = device_info(&gpu_device.caps(), identity, pool.threads().to_u64());
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
@@ -200,6 +199,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                             | u64::from(RGFX_FEATURE_SURFACE_CACHE)
                     }
                 };
+            // The processes read the features from the device info, as no register is theirs.
+            info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
+            region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),

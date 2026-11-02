@@ -2721,8 +2721,11 @@ typedef struct {
   // `supportsCounterSampling:` of the stage, draw, dispatch, tile and blit
   // boundaries by position; a gap reads 0.
   uint8_t counter_sampling[RGFX_DEVICE_INFO_COUNTER_POINTS];
+  // `FEATURES_LO`'s low byte as the device answers it (`RGFX_FEATURE_*`), for the processes,
+  // which read no register; 0 from a host older than the field, which wrote it as zero.
+  uint8_t features_lo;
   // Zero.
-  uint8_t reserved_451[7];
+  uint8_t reserved_452[6];
   // The device `name`, UTF-8, `name_len` bytes used, the rest 0.
   uint8_t name[RGFX_DEVICE_NAME_LEN];
   // The device's `architecture.name`, UTF-8, `architecture_name_len` bytes

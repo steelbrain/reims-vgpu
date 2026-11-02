@@ -329,9 +329,9 @@ fn command_buffer(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
 }
 
 /// The device-info caps blob is written into the region at [`RGFX_DEVICE_INFO_OFFSET`] at init,
-/// mirroring the GPU device's caps the guest bundle reads before it makes any queue; on the fake
-/// (an M3 Max's answers) it answers no Apple family and no iOS feature set, as an Intel or AMD
-/// Mac's GPU does, and the platform's Mac2 and macOS_GPUFamily2_v1
+/// mirroring the GPU device's caps and features the guest bundle reads before it makes any queue;
+/// on the fake (an M3 Max's answers) it answers no Apple family and no iOS feature set, as an
+/// Intel or AMD Mac's GPU does, and the platform's Mac2 and macOS_GPUFamily2_v1
 #[test]
 fn device_info_is_written_into_the_region_at_init() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -345,6 +345,12 @@ fn device_info_is_written_into_the_region_at_init() {
     let info = RgfxDeviceInfo::read_from_bytes(&bytes).unwrap();
     let caps = platform.device().caps();
     assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
+    assert_eq!(
+        u32::from(info.features_lo),
+        device.mmio_read(RGFX_REG_FEATURES_LO.into()) & 0xff,
+        "the features the processes read"
+    );
+    assert_ne!(info.features_lo, 0);
     assert_eq!(info.registry_id, caps.registry_id);
     assert!(info.name_len > 0);
     assert_eq!(

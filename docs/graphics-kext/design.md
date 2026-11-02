@@ -449,7 +449,7 @@ sit in BAR0 from 0x800.
 |---|---|---|---|
 | 0x000 | `MAGIC` | RO | 0x58464752 ("RGFX") |
 | 0x004 | `VERSION` | RO | the wire's version, `RGFX_VERSION` (below) |
-| 0x008 | `FEATURES_LO` | RO | feature bits 0-31; 0 in stage 2 |
+| 0x008 | `FEATURES_LO` | RO | feature bits 0-31; 0 in stage 2; the device info's `features_lo` holds its low byte for the processes |
 | 0x00c | `FEATURES_HI` | RO | feature bits 32-63 |
 | 0x010 | `STATUS` | RW | writing 0 resets the device; the guest writes 1 (driver ready) once it has read the rings' headers |
 | 0x014 | `REGION_SIZE_LO` | RO | BAR2's size, low 32 bits |
@@ -1038,8 +1038,9 @@ buffer's seqno; 24 bytes) once, ahead of its `CB_SCHEDULED` and `CB_COMPLETE`: a
 host has committed it, where it waits for no event (the host's fills of device caches included)
 and no buffer before it on its queue waits for one and is not yet scheduled; else at its
 scheduling. The call returns there. A guest whose bundle sends no such op never sees the event,
-and a bundle sends it only where the bit is set. What Metal does, on the M3, the 5300M and the
-630 (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7), and the class of each choice:
+and a bundle sends it only where the bit is set, which it reads in the device info's
+`features_lo`. What Metal does, on the M3, the 5300M and the 630
+(docs/graphics-kext/dgpu-oracle.md, Q6 and Q7), and the class of each choice:
 - Contract (all three agree): the call returns once the buffer is submitted, about 0.1 to 0.4 ms
   behind a long buffer, and not before the signal where the buffer, or one before it on its
   queue, waits for an event. A buffer committed on any queue once the call returned is ordered
