@@ -20,6 +20,10 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+#include <memory>
+
+#include "RgfxAirArguments.hpp"
+
 class RgfxSerializer;
 class RgfxReplyReader;
 #endif
@@ -69,6 +73,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// Whether the host answered the create with a refusal (RGFX_PIPELINE_REFUSED): it made no
 /// pipeline, so the device's creators answer nil and an NSError, as Metal's do.
 @property(nonatomic, readonly) BOOL rgfxRefused;
+
+#ifdef __cplusplus
+/// The arguments of the pipeline's function, as its library read them (RgfxFunction's
+/// rgfxAirFunction): which textures a dispatch of it writes. Null where they are unknown.
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunction;
+#endif
 
 @end
 

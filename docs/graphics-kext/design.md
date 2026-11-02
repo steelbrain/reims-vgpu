@@ -318,7 +318,14 @@ Stages:
         contract, kept exactly;
       - a pending buffer that only reads the surface holds no lock. The AMD
         and the Intel agree; the M3 Max's read-write lock waits for it.
-        Divergent, so the cheaper rule, which tracks writes only;
+        Divergent, so the cheaper rule, which tracks writes only. A buffer
+        writes a surface it draws to, a blit writes to, it uses with Write
+        usage, or binds where a draw's or dispatch's function declares a
+        `write` or `read_write` texture: the bundle reads each entry point's
+        arguments from the AIR metadata of its bitcode in the `.metallib`
+        (`guest/bundle/src/RgfxAirArguments.hpp`), since the host gives no
+        binding reflection. Where they do not read, a bound texture with
+        ShaderWrite usage counts as written;
       - the committer's own lock waits from the buffer's submission on. At
         the commit itself the AMD's returns at once, a race. Loose: ours
         waits from the commit on;

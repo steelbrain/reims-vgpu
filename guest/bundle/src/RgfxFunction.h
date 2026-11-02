@@ -22,10 +22,12 @@
 
 #ifdef __cplusplus
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "RgfxSerializer.hpp" // RgfxLinkedFunctionRef
+#include "RgfxAirArguments.hpp" // RgfxAirFunction
+#include "RgfxSerializer.hpp"   // RgfxLinkedFunctionRef
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -117,6 +119,15 @@ typedef struct {
 
 /// The library the function was made from; nil where it was made without one.
 - (nullable RgfxResource *)rgfxLibrary;
+
+#ifdef __cplusplus
+/// Sets the entry point's binding arguments, as its AIR module declares them: the library reads
+/// them from the bitcode its .metallib holds for the entry point (RgfxAirArguments.hpp).
+- (void)rgfxSetAirFunction:(std::shared_ptr<const RgfxAirFunction>)air;
+/// The arguments `rgfxSetAirFunction:` set; null where the library could not read them, so
+/// which textures the function writes is unknown.
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunction;
+#endif
 
 /// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's
 /// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).

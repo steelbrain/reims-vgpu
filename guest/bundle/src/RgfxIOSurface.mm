@@ -1023,15 +1023,57 @@ void rgfxIOSurfaceSyncBeforeCommit(void)
 	}
 }
 
-void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, id texture)
+// The texture over an IOSurface that `texture` is, or views through any views; nil for any other.
+static RgfxIOSurfaceTexture *rgfxSurfaceRoot(id texture)
 {
 	// A view writes the texels of the texture it views, through every view between.
 	id root = texture;
 	while ([root isKindOfClass:[RgfxTexture class]] && [(RgfxTexture *)root parentTexture] != nil) {
 		root = [(RgfxTexture *)root parentTexture];
 	}
-	if (enc != nullptr && [root isKindOfClass:[RgfxIOSurfaceTexture class]]) {
-		enc->noteSurfaceWrite([(RgfxIOSurfaceTexture *)root rgfxShadow]);
+	return [root isKindOfClass:[RgfxIOSurfaceTexture class]] ? (RgfxIOSurfaceTexture *)root : nil;
+}
+
+void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, id texture)
+{
+	RgfxIOSurfaceTexture *root = rgfxSurfaceRoot(texture);
+	if (enc != nullptr && root != nil) {
+		enc->noteSurfaceWrite([root rgfxShadow]);
+	}
+}
+
+void RgfxSurfaceBindings::bind(NSUInteger index, id texture)
+{
+	auto it = std::find_if(m_bound.begin(), m_bound.end(),
+	                       [index](const Bound &b) { return b.index == index; });
+	if (texture == nil || rgfxSurfaceRoot(texture) == nil) {
+		if (it != m_bound.end()) {
+			m_bound.erase(it);
+		}
+		return;
+	}
+	if (it == m_bound.end()) {
+		m_bound.push_back({index, texture, false});
+	} else if (it->texture != texture) {
+		it->texture = texture;
+		it->noted = false;
+	}
+}
+
+void RgfxSurfaceBindings::noteWrites(RgfxEncoder *enc, const RgfxAirFunction *fn)
+{
+	for (Bound &b : m_bound) {
+		if (b.noted) {
+			continue;
+		}
+		const bool writes =
+		    fn != nullptr
+		        ? rgfxAirWritesTexture(*fn, static_cast<uint32_t>(b.index))
+		        : ([(id<MTLTexture>)b.texture usage] & MTLTextureUsageShaderWrite) != 0;
+		if (writes) {
+			rgfxIOSurfaceNoteWrite(enc, b.texture);
+			b.noted = true;
+		}
 	}
 }
 
@@ -1080,14 +1122,6 @@ void rgfxIOSurfaceWritesPosted(RgfxRegion *region, const std::vector<std::shared
 void rgfxIOSurfaceRetire(RgfxRegion *region, uint64_t queueObjId, uint64_t seqno)
 {
 	region->retireSurfaceWrites(queueObjId, seqno);
-}
-
-void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *enc, id texture)
-{
-	if ([texture isKindOfClass:[RgfxTexture class]] &&
-	    ([(id<MTLTexture>)texture usage] & MTLTextureUsageShaderWrite) != 0) {
-		rgfxIOSurfaceNoteWrite(enc, texture);
-	}
 }
 
 void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes, id queue,

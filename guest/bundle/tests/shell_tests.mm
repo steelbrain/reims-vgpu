@@ -1702,6 +1702,92 @@ void test_stitched_dag_over_shadows()
 
 namespace {
 
+// A library keeps each entry point's arguments as its AIR module declares them, read once from the
+// bytes it was made from (RgfxAirArguments.hpp, over the .metallib built from
+// tests/air_arguments.metal), and its functions and their pipelines carry them; a library that
+// kept no bytes has none to give, and a render pipeline's stage with no function binds nothing.
+void test_library_air_arguments()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	RgfxFunction *kernel = (RgfxFunction *)[lib newFunctionWithName:@"every_access"];
+	std::shared_ptr<const RgfxAirFunction> air = [kernel rgfxAirFunction];
+	CHECK(air != nullptr && air->name == "every_access" && air->stage == RgfxAirStage::Kernel &&
+	      air->arguments.size() == 11);
+	CHECK(air != nullptr && rgfxAirWritesTexture(*air, 3) && !rgfxAirWritesTexture(*air, 1));
+	RgfxFunction *again = (RgfxFunction *)[lib newFunctionWithName:@"every_access"];
+	CHECK([again rgfxAirFunction] == air); // read once
+	RgfxFunction *vertex = (RgfxFunction *)[lib newFunctionWithName:@"reads_in_vertex"];
+	RgfxFunction *fragment = (RgfxFunction *)[lib newFunctionWithName:@"writes_in_fragment"];
+	CHECK([vertex rgfxAirFunction] != nullptr &&
+	      [vertex rgfxAirFunction]->stage == RgfxAirStage::Vertex);
+	CHECK([fragment rgfxAirFunction] != nullptr &&
+	      rgfxAirWritesTexture(*[fragment rgfxAirFunction], 5));
+
+	// every_access declares a constant: its pipeline is of the function specialised by a value.
+	MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
+	const bool scale = true;
+	[values setConstantValue:&scale type:MTLDataTypeBool atIndex:0];
+	NSError *err = nil;
+	RgfxFunction *specialised = (RgfxFunction *)[lib newFunctionWithName:@"every_access"
+	                                                      constantValues:values
+	                                                               error:&err];
+	CHECK(specialised != nil && [specialised rgfxAirFunction] == air);
+	RgfxComputePipelineState *cs =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:specialised
+	                                                       device:nil
+	                                                   serializer:&fx.ser
+	                                                        error:&err];
+	CHECK(cs != nil && [cs rgfxAirFunction] == air);
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = vertex;
+	desc.fragmentFunction = fragment;
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	RgfxRenderPipelineState *rs = [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+	                                                                                 device:nil
+	                                                                             serializer:&fx.ser
+	                                                                                  error:&err];
+	CHECK(rs != nil && [rs rgfxVertexAirFunction] == [vertex rgfxAirFunction] &&
+	      [rs rgfxFragmentAirFunction] == [fragment rgfxAirFunction]);
+	desc.fragmentFunction = nil;
+	RgfxRenderPipelineState *vertexOnly =
+	    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+	                                                       device:nil
+	                                                   serializer:&fx.ser
+	                                                        error:&err];
+	CHECK(vertexOnly != nil && [vertexOnly rgfxFragmentAirFunction] != nullptr &&
+	      [vertexOnly rgfxFragmentAirFunction]->arguments.empty());
+
+	// No bytes kept: the arguments are unknown.
+	RgfxLibrary *bare = [RgfxLibrary libraryWithData:bytes.bytes
+	                                          length:bytes.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK([(RgfxFunction *)[bare newFunctionWithName:@"every_access"] rgfxAirFunction] == nullptr);
+	drainRing(fx.ring);
+}
+
 // A stitched library kept in a binary archive is found as Metal's archive finds one (measured:
 // macOS 27, M3 Max): a create that fails on a miss is made where an archive of the descriptor
 // holds the same graphs over the same functions, in any order and of any library over the same
@@ -6388,6 +6474,251 @@ void test_iosurface_writes_named()
 	CFRelease(surface);
 }
 
+// A buffer names a surface to the kext only where it writes it (RgfxSurfaceBindings): a texture
+// bound where the draw's or dispatch's function writes, by its AIR arguments, or, where they are
+// unknown, one whose usage has ShaderWrite; or a resource used with Write usage. A texture a
+// function only samples or reads, one bound with no dispatch after, and one used to read, are not
+// named, so no CPU lock waits for them.
+void test_iosurface_writes_by_function()
+{
+	// Never freed, as Fixture's: the queue and its buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	TestRing &completion = *new TestRing(0x8000);
+	RgfxReplyReader &reader = *new RgfxReplyReader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		int named = 0;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			*offset = static_cast<Source *>(c)->offset;
+			*serial = 7;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+		static void writes(void *c, uint64_t, uint64_t, const uint64_t *, uint32_t count)
+		{
+			static_cast<Source *>(c)->named += static_cast<int>(count);
+		}
+		static void retire(void *, uint64_t, uint64_t) {}
+	} &src = *new Source();
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfaceWriteSource(&Source::writes, &Source::retire, &src);
+	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
+	CHECK(queue != nil);
+	queue.replyReader = &reader;
+	(void)expectQueueCreate(control);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	// A function of `stage` whose arguments are `textures`, each (index, access).
+	auto function = [&](RgfxAirStage stage,
+	                    std::vector<std::pair<uint32_t, RgfxAirAccess>> textures) -> RgfxFunction * {
+		RgfxFunction *fn = [RgfxFunction functionWithLibrary:nil
+		                                                name:@"f"
+		                                           constants:nullptr
+		                                               count:0
+		                                              device:nil
+		                                          serializer:&ser];
+		auto air = std::make_shared<RgfxAirFunction>();
+		air->name = "f";
+		air->stage = stage;
+		for (const auto &[index, access] : textures)
+			air->arguments.push_back({RgfxAirKind::Texture, index, 1, access, false});
+		[fn rgfxSetAirFunction:air];
+		return fn;
+	};
+	auto compute = [&](RgfxFunction *fn) {
+		NSError *err = nil;
+		RgfxComputePipelineState *ps =
+		    [RgfxComputePipelineState computePipelineStateWithFunction:fn
+		                                                       device:nil
+		                                                   serializer:&ser
+		                                                        error:&err];
+		CHECK(ps != nil);
+		return ps;
+	};
+	auto render = [&](RgfxFunction *vertex, RgfxFunction *fragment) {
+		MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+		desc.vertexFunction = vertex;
+		desc.fragmentFunction = fragment;
+		desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		NSError *err = nil;
+		RgfxRenderPipelineState *ps = [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+		                                                                                 device:nil
+		                                                                             serializer:&ser
+		                                                                                  error:&err];
+		CHECK(ps != nil);
+		return ps;
+	};
+	// Commits `cb`, completes it, and answers how many surfaces it named.
+	auto named = [&](id<MTLCommandBuffer> cb) {
+		const int before = src.named;
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		CHECK(reader.pump() == 1);
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		drainRing(control);
+		return src.named - before;
+	};
+	const MTLSize one = MTLSizeMake(1, 1, 1);
+	@autoreleasepool {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                            iosurface:surface
+		                                                                plane:0
+		                                                               region:&region
+		                                                               device:nil
+		                                                           serializer:&ser];
+		CHECK(t != nil);
+		id<MTLTexture> view = [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+		CHECK(view != nil);
+		RgfxComputePipelineState *samples =
+		    compute(function(RgfxAirStage::Kernel, {{0, RgfxAirAccess::Sample}}));
+		RgfxComputePipelineState *writesOne = compute(function(
+		    RgfxAirStage::Kernel, {{0, RgfxAirAccess::Read}, {1, RgfxAirAccess::Write}}));
+		RgfxComputePipelineState *unknown = compute([RgfxFunction functionWithLibrary:nil
+		                                                                         name:@"u"
+		                                                                    constants:nullptr
+		                                                                        count:0
+		                                                                       device:nil
+		                                                                   serializer:&ser]);
+		drainRing(control);
+
+		// A kernel that samples it, or reads it: not named.
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:samples];
+		[ce setTexture:t atIndex:0];
+		[ce dispatchThreadgroups:one threadsPerThreadgroup:one];
+		[ce setComputePipelineState:writesOne];
+		[ce dispatchThreads:one threadsPerThreadgroup:one];
+		[ce endEncoding];
+		CHECK(named(cb) == 0);
+
+		// A kernel that writes it, through a view, after one that reads it: named once.
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:writesOne];
+		[ce setTextures:(const id<MTLTexture>[]){t, view} withRange:NSMakeRange(0, 2)];
+		[ce dispatchThreadgroups:one threadsPerThreadgroup:one];
+		[ce dispatchThreadgroups:one threadsPerThreadgroup:one];
+		[ce endEncoding];
+		CHECK(named(cb) == 1);
+
+		// Bound where the kernel writes, with no dispatch after: not named.
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:writesOne];
+		[ce setTexture:t atIndex:1];
+		[ce endEncoding];
+		CHECK(named(cb) == 0);
+
+		// A kernel whose arguments are unknown: its ShaderWrite usage counts.
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:unknown];
+		[ce setTexture:t atIndex:0];
+		[ce dispatchThreads:one threadsPerThreadgroup:one];
+		[ce endEncoding];
+		CHECK(named(cb) == 1);
+
+		// Used to read: not named; used to write: named.
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce useResource:t usage:MTLResourceUsageRead];
+		[ce endEncoding];
+		CHECK(named(cb) == 0);
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce useResource:view usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+		[ce endEncoding];
+		CHECK(named(cb) == 1);
+
+		// A draw whose functions sample it: not named; one whose fragment function writes it at
+		// the index it is bound: named. A pipeline with no fragment function binds nothing there.
+		RgfxRenderPipelineState *sampling =
+		    render(function(RgfxAirStage::Vertex, {{0, RgfxAirAccess::Sample}}),
+		           function(RgfxAirStage::Fragment, {{0, RgfxAirAccess::Sample}}));
+		RgfxRenderPipelineState *writing =
+		    render(function(RgfxAirStage::Vertex, {}),
+		           function(RgfxAirStage::Fragment,
+		                    {{0, RgfxAirAccess::Sample}, {2, RgfxAirAccess::Write}}));
+		RgfxRenderPipelineState *vertexOnly =
+		    render(function(RgfxAirStage::Vertex, {{0, RgfxAirAccess::Sample}}), nil);
+		drainRing(control);
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.renderTargetWidth = 16;
+		rp.renderTargetHeight = 16;
+		cb = [queue commandBuffer];
+		id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+		[re setRenderPipelineState:sampling];
+		[re setVertexTexture:t atIndex:0];
+		[re setFragmentTexture:view atIndex:0];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[re setRenderPipelineState:vertexOnly];
+		[re setFragmentTexture:t atIndex:2];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[re useResource:t usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+		[re endEncoding];
+		CHECK(named(cb) == 0);
+		cb = [queue commandBuffer];
+		re = [cb renderCommandEncoderWithDescriptor:rp];
+		[re setRenderPipelineState:writing];
+		[re setFragmentTextures:(const id<MTLTexture>[]){view, nil, t} withRange:NSMakeRange(0, 3)];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[re endEncoding];
+		CHECK(named(cb) == 1);
+		cb = [queue commandBuffer];
+		re = [cb renderCommandEncoderWithDescriptor:rp];
+		[re useResource:t usage:MTLResourceUsageWrite];
+		[re endEncoding];
+		CHECK(named(cb) == 1);
+	}
+	drainRing(control);
+	CFRelease(surface);
+}
+
 // A surface whose planes the host's textures lie over, where the device uses surfaces in place
 // (RgfxIOSurface.h): its GPU view is its own pages. The kext's block in place is asked for by the
 // surface's base, its whole allocation in whole pages and the part the processes map, one page
@@ -7191,6 +7522,7 @@ int main()
 		test_core_image_extern_functions();
 		test_stitched_library_over_shadows();
 		test_stitched_dag_over_shadows();
+		test_library_air_arguments();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
 		test_library_members_as_metal();
@@ -7226,6 +7558,7 @@ int main()
 		test_iosurface_planes();
 		test_iosurface_writers();
 		test_iosurface_writes_named();
+		test_iosurface_writes_by_function();
 		test_iosurface_in_place();
 		test_iosurface_in_place_fallback();
 		test_iosurface_in_place_core_image_set();

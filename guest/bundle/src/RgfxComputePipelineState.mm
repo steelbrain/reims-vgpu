@@ -85,6 +85,7 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	// arrives; until then `_haveReflection` is NO and the getters answer placeholders.
 	RgfxPipelineReflection _reflection;
 	BOOL _haveReflection;
+	std::shared_ptr<const RgfxAirFunction> _air; // its function's arguments; null where unknown
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -197,7 +198,14 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	                                             device:device
 	                                         serializer:serializer];
 	[state rgfxTakeDescriptor:descriptor flags:p.flags];
+	if (state != nil)
+		state->_air = [rf rgfxAirFunction];
 	return state;
+}
+
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunction
+{
+	return _air;
 }
 
 - (void)rgfxTakeDescriptor:(MTLComputePipelineDescriptor *)descriptor flags:(uint32_t)flags

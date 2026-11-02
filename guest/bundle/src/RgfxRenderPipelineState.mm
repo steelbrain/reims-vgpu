@@ -51,6 +51,15 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	return true;
 }
 
+/// The arguments of a stage's function `fn`, an RgfxFunction or nil: none for no function, which
+/// binds nothing; null where they are unknown.
+std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
+{
+	if (fn == nil)
+		return std::make_shared<const RgfxAirFunction>();
+	return [(RgfxFunction *)fn rgfxAirFunction];
+}
+
 } // namespace
 
 @implementation RgfxRenderPipelineState {
@@ -62,6 +71,9 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	// getters answer documented placeholders.
 	RgfxPipelineReflection _reflection;
 	BOOL _haveReflection;
+	// Its functions' arguments; null where unknown.
+	std::shared_ptr<const RgfxAirFunction> _vertexAir;
+	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -226,9 +238,22 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	                                                                          label:descriptor.label
 	                                                                         device:device
 	                                                                     serializer:serializer];
-	if (state != nil)
+	if (state != nil) {
 		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+		state->_vertexAir = stageArguments(descriptor.vertexFunction);
+		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
+	}
 	return state;
+}
+
+- (std::shared_ptr<const RgfxAirFunction>)rgfxVertexAirFunction
+{
+	return _vertexAir;
+}
+
+- (std::shared_ptr<const RgfxAirFunction>)rgfxFragmentAirFunction
+{
+	return _fragmentAir;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId

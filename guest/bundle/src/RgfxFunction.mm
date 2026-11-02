@@ -55,6 +55,7 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	BOOL _haveSpecializedName;
 	id<MTLFunction> _shadow;                      // Metal's own, for Core Image's link
 	std::mutex _shadowLock;                       // guards _shadow, set once in use
+	std::shared_ptr<const RgfxAirFunction> _air;  // its arguments, from the library's bitcode
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -360,6 +361,16 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 - (RgfxResource *)rgfxLibrary
 {
 	return _library;
+}
+
+- (void)rgfxSetAirFunction:(std::shared_ptr<const RgfxAirFunction>)air
+{
+	_air = std::move(air);
+}
+
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunction
+{
+	return _air;
 }
 
 // The host lays out the argument buffer the function takes at `bufferIndex` from the library's

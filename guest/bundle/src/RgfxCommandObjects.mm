@@ -41,11 +41,13 @@
 
 #import "RgfxCommandObjects.h"
 #import "RgfxBuffer.h"
+#import "RgfxComputePipelineState.h"
 #import "RgfxEvent.h"
 #import "RgfxFence.h"
 #import "RgfxSharedEvent.h"
 #import "RgfxIOSurface.h"
 #import "RgfxInterop.h"
+#import "RgfxRenderPipelineState.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
 
@@ -199,10 +201,13 @@ uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
 }
 
 /// rgfxId of a resource used with `usage` (useResource:usage:), which writes it where the usage
-/// has Write.
+/// has Write: a texture over an IOSurface, or a view of one, among them.
 uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
 {
-	rgfxNoteShadowUse(enc, obj, (usage & MTLResourceUsageWrite) != 0);
+	const bool writes = (usage & MTLResourceUsageWrite) != 0;
+	if (writes)
+		rgfxIOSurfaceNoteWrite(enc, obj);
+	rgfxNoteShadowUse(enc, obj, writes);
 	return rgfxNamed(enc, obj);
 }
 
@@ -1676,6 +1681,18 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	NSUInteger _tileWidth, _tileHeight;          // the pass descriptor's tile size
 	RgfxBarrierSlot _barrier;                    // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;                         // a barrier has waited for the earlier encoders
+	RgfxSurfaceBindings _vertexSurfaces;         // the textures over IOSurfaces bound, by stage
+	RgfxSurfaceBindings _fragmentSurfaces;
+	// The pipeline's functions' arguments, by stage.
+	std::shared_ptr<const RgfxAirFunction> _vertexAir;
+	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
+}
+
+// At a draw: each stage's bound textures over IOSurfaces its function writes, as written.
+- (void)rgfxNoteDrawWrites
+{
+	_vertexSurfaces.noteWrites(_enc, _vertexAir.get());
+	_fragmentSurfaces.noteWrites(_enc, _fragmentAir.get());
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -1762,12 +1779,21 @@ RGFX_LOG_UNRECOGNIZED
 			_enc->renderUpdateFence(_barrier.fences[_barrier.slot], kRgfxBarrierRenderStages);
 		_enc->endEncoder();
 	}
+	_vertexSurfaces.clear();
+	_fragmentSurfaces.clear();
 }
 
 // --- state -------------------------------------------------------------------
 
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipelineState
 {
+	if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]]) {
+		_vertexAir = [(RgfxRenderPipelineState *)pipelineState rgfxVertexAirFunction];
+		_fragmentAir = [(RgfxRenderPipelineState *)pipelineState rgfxFragmentAirFunction];
+	} else {
+		_vertexAir = nullptr;
+		_fragmentAir = nullptr;
+	}
 	_enc->renderSetRenderPipelineState(rgfxNamed(_enc, pipelineState));
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)depthStencilState
@@ -1941,6 +1967,7 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)setVertexTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
+	_vertexSurfaces.bind(index, texture);
 	RgfxTextureBinding e = {};
 	e.texture_obj_id = rgfxBinds(_enc, texture);
 	_enc->renderSetVertexTextures(index, &e, 1);
@@ -1949,6 +1976,7 @@ RGFX_LOG_UNRECOGNIZED
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
+		_vertexSurfaces.bind(range.location + i, textures[i]);
 		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->renderSetVertexTextures(range.location, t.empty() ? nullptr : t.data(),
@@ -2020,12 +2048,14 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
+	_fragmentSurfaces.bind(index, texture);
 	_enc->renderSetFragmentTexture(rgfxBinds(_enc, texture), index);
 }
 - (void)setFragmentTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
+		_fragmentSurfaces.bind(range.location + i, textures[i]);
 		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->renderSetFragmentTextures(range.location, t.empty() ? nullptr : t.data(),
@@ -2184,6 +2214,7 @@ RGFX_LOG_UNRECOGNIZED
            vertexStart:(NSUInteger)vertexStart
            vertexCount:(NSUInteger)vertexCount
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawPrimitives(static_cast<uint64_t>(primitiveType), vertexStart, vertexCount);
 }
 - (void)drawPrimitives:(MTLPrimitiveType)primitiveType
@@ -2191,6 +2222,7 @@ RGFX_LOG_UNRECOGNIZED
            vertexCount:(NSUInteger)vertexCount
          instanceCount:(NSUInteger)instanceCount
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawPrimitivesInstances(static_cast<uint64_t>(primitiveType), vertexStart,
 	                                    vertexCount, instanceCount);
 }
@@ -2200,6 +2232,7 @@ RGFX_LOG_UNRECOGNIZED
          instanceCount:(NSUInteger)instanceCount
           baseInstance:(NSUInteger)baseInstance
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawPrimitivesBase(static_cast<uint64_t>(primitiveType), vertexStart, vertexCount,
 	                               instanceCount, baseInstance);
 }
@@ -2207,6 +2240,7 @@ RGFX_LOG_UNRECOGNIZED
         indirectBuffer:(id<MTLBuffer>)indirectBuffer
   indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawPrimitivesIndirect(static_cast<uint64_t>(primitiveType),
 	                                   rgfxReads(_enc, indirectBuffer), indirectBufferOffset);
 }
@@ -2216,6 +2250,7 @@ RGFX_LOG_UNRECOGNIZED
                   indexBuffer:(id<MTLBuffer>)indexBuffer
             indexBufferOffset:(NSUInteger)indexBufferOffset
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawIndexedPrimitives(static_cast<uint64_t>(primitiveType), indexCount,
 	                                  static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                  indexBufferOffset);
@@ -2227,6 +2262,7 @@ RGFX_LOG_UNRECOGNIZED
             indexBufferOffset:(NSUInteger)indexBufferOffset
                 instanceCount:(NSUInteger)instanceCount
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawIndexedPrimitivesInstances(static_cast<uint64_t>(primitiveType), indexCount,
 	                                           static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                           indexBufferOffset, instanceCount);
@@ -2240,6 +2276,7 @@ RGFX_LOG_UNRECOGNIZED
                    baseVertex:(NSInteger)baseVertex
                  baseInstance:(NSUInteger)baseInstance
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawIndexedPrimitivesBase(static_cast<uint64_t>(primitiveType), indexCount,
 	                                      static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                      indexBufferOffset, instanceCount,
@@ -2252,6 +2289,7 @@ RGFX_LOG_UNRECOGNIZED
                indirectBuffer:(id<MTLBuffer>)indirectBuffer
          indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawIndexedPrimitivesIndirect(static_cast<uint64_t>(primitiveType),
 	                                          static_cast<uint64_t>(indexType), rgfxReads(_enc, indexBuffer),
 	                                          indexBufferOffset, rgfxReads(_enc, indirectBuffer),
@@ -2268,6 +2306,7 @@ RGFX_LOG_UNRECOGNIZED
              instanceCount:(NSUInteger)instanceCount
               baseInstance:(NSUInteger)baseInstance
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawPatches(numberOfPatchControlPoints, patchStart, patchCount,
 	                        rgfxReads(_enc, patchIndexBuffer), patchIndexBufferOffset, instanceCount,
 	                        baseInstance);
@@ -2278,6 +2317,7 @@ RGFX_LOG_UNRECOGNIZED
             indirectBuffer:(id<MTLBuffer>)indirectBuffer
       indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawPatchesIndirect(numberOfPatchControlPoints, rgfxReads(_enc, patchIndexBuffer),
 	                                patchIndexBufferOffset, rgfxReads(_enc, indirectBuffer),
 	                                indirectBufferOffset);
@@ -2292,6 +2332,7 @@ RGFX_LOG_UNRECOGNIZED
                   instanceCount:(NSUInteger)instanceCount
                    baseInstance:(NSUInteger)baseInstance
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawIndexedPatches(numberOfPatchControlPoints, patchStart, patchCount,
 	                               rgfxReads(_enc, patchIndexBuffer), patchIndexBufferOffset,
 	                               rgfxReads(_enc, controlPointIndexBuffer),
@@ -2305,6 +2346,7 @@ RGFX_LOG_UNRECOGNIZED
                  indirectBuffer:(id<MTLBuffer>)indirectBuffer
            indirectBufferOffset:(NSUInteger)indirectBufferOffset
 {
+	[self rgfxNoteDrawWrites];
 	_enc->renderDrawIndexedPatchesIndirect(numberOfPatchControlPoints, rgfxReads(_enc, patchIndexBuffer),
 	                                       patchIndexBufferOffset, rgfxReads(_enc, controlPointIndexBuffer),
 	                                       controlPointIndexBufferOffset, rgfxReads(_enc, indirectBuffer),
@@ -2828,6 +2870,8 @@ RGFX_LOG_UNRECOGNIZED
 	MTLDispatchType _dispatchType;              // the pass's; Serial, Metal's default, unless set
 	RgfxBarrierSlot _barrier;                   // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;
+	RgfxSurfaceBindings _surfaces;              // the textures over IOSurfaces bound
+	std::shared_ptr<const RgfxAirFunction> _air; // the pipeline's function's arguments
 }
 
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot
@@ -2912,10 +2956,14 @@ RGFX_LOG_UNRECOGNIZED
 	if (_barrier.fences[_barrier.slot] != 0)
 		_enc->computeUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
+	_surfaces.clear();
 }
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state
 {
+	_air = [(id)state isKindOfClass:[RgfxComputePipelineState class]]
+	           ? [(RgfxComputePipelineState *)state rgfxAirFunction]
+	           : nullptr;
 	_enc->computeSetComputePipelineState(rgfxNamed(_enc, state));
 }
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
@@ -2974,14 +3022,14 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	rgfxIOSurfaceNoteShaderWrite(_enc, texture);
+	_surfaces.bind(index, texture);
 	_enc->computeSetTexture(rgfxBinds(_enc, texture), index);
 }
 - (void)setTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxComputeTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		rgfxIOSurfaceNoteShaderWrite(_enc, textures[i]);
+		_surfaces.bind(range.location + i, textures[i]);
 		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
 	}
 	_enc->computeSetTextures(range.location, t.empty() ? nullptr : t.data(),
@@ -3048,6 +3096,7 @@ RGFX_LOG_UNRECOGNIZED
 - (void)dispatchThreadgroups:(MTLSize)threadgroupsPerGrid
        threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
 {
+	_surfaces.noteWrites(_enc, _air.get());
 	_enc->computeDispatchThreadgroups(threadgroupsPerGrid.width, threadgroupsPerGrid.height,
 	                                  threadgroupsPerGrid.depth, threadsPerThreadgroup.width,
 	                                  threadsPerThreadgroup.height, threadsPerThreadgroup.depth);
@@ -3056,6 +3105,7 @@ RGFX_LOG_UNRECOGNIZED
                           indirectBufferOffset:(NSUInteger)indirectBufferOffset
                          threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
 {
+	_surfaces.noteWrites(_enc, _air.get());
 	_enc->computeDispatchThreadgroupsIndirect(rgfxReads(_enc, indirectBuffer), indirectBufferOffset,
 	                                          threadsPerThreadgroup.width,
 	                                          threadsPerThreadgroup.height,
@@ -3063,6 +3113,7 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)dispatchThreads:(MTLSize)threadsPerGrid threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
 {
+	_surfaces.noteWrites(_enc, _air.get());
 	_enc->computeDispatchThreads(threadsPerGrid.width, threadsPerGrid.height, threadsPerGrid.depth,
 	                             threadsPerThreadgroup.width, threadsPerThreadgroup.height,
 	                             threadsPerThreadgroup.depth);

@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
@@ -348,6 +349,10 @@ RGFX_LOG_UNRECOGNIZED
 	id<MTLLibrary> _shadow;                   // Metal's own over _source, made on first use
 	BOOL _shadowTried;
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
+	std::mutex _airLock; // guards _air
+	// Each entry point's arguments read from its bitcode in `_source`, by name, once each: null
+	// where they did not read.
+	std::map<std::string, std::shared_ptr<const RgfxAirFunction>> _air;
 }
 
 // The host drops the library's id as the app lets it go. Its functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
@@ -483,8 +488,53 @@ static bool rgfxMade(uint32_t status)
 		[fn rgfxSetFunctionType:entry->type];
 		if (entry->hasHash)
 			[fn rgfxSetBitCodeHash:entry->hash];
+		if (entry->type == MTLFunctionTypeVertex || entry->type == MTLFunctionTypeFragment ||
+		    entry->type == MTLFunctionTypeKernel)
+			[fn rgfxSetAirFunction:[self rgfxAirFunctionNamed:entry->name]];
 	}
 	return fn;
+}
+
+// The arguments of the entry point `name`, read from its bitcode in the bytes the library was
+// made from, once: null where the library kept no bytes (one Metal's link or stitching made), or
+// they do not read, so which textures the function writes is unknown.
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name
+{
+	std::lock_guard<std::mutex> hold(_airLock);
+	auto known = _air.find(name);
+	if (known != _air.end())
+		return known->second;
+	dispatch_data_t source = nil;
+	{
+		std::lock_guard<std::mutex> shadowHold(_shadowLock);
+		source = _source;
+	}
+	std::shared_ptr<const RgfxAirFunction> air;
+	if (source != nil) {
+		const void *bytes = nullptr;
+		size_t size = 0;
+		dispatch_data_t map = dispatch_data_create_map(source, &bytes, &size);
+		const uint8_t *bitcode = nullptr;
+		size_t bitcodeSize = 0;
+		std::vector<RgfxAirFunction> read;
+		if (map != nil &&
+		    rgfxMetallibBitcode(static_cast<const uint8_t *>(bytes), size, name, &bitcode,
+		                        &bitcodeSize) &&
+		    rgfxReadAirFunctions(bitcode, bitcodeSize, read)) {
+			for (RgfxAirFunction &f : read) {
+				if (f.name == name) {
+					air = std::make_shared<const RgfxAirFunction>(std::move(f));
+					break;
+				}
+			}
+		}
+		if (air == nullptr)
+			NSLog(@"RGFX: %s: no arguments read from its bitcode: the textures it binds are taken "
+			      @"as written where their usage has ShaderWrite",
+			      name.c_str());
+	}
+	_air.emplace(name, air);
+	return air;
 }
 
 // The NSError Metal answers for a name the library does not hold.

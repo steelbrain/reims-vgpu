@@ -44,7 +44,10 @@
  *     wrote the surface under a lock since any holder synced it;
  *   - when a command buffer that writes the copy completes, before it reports completion,
  *     back to the pages, with no lock of the surface. A write is a render attachment, a
- *     blit's destination or a compute texture with ShaderWrite usage.
+ *     blit's destination, a resource used with Write usage, or a texture bound at an index
+ *     where a draw's or dispatch's function writes (RgfxSurfaceBindings): its AIR arguments
+ *     declare a write or read_write texture there, or, where they are unknown, the texture's
+ *     usage has ShaderWrite. A texture a function only reads or samples is no write.
  *
  * A CPU lock of a surface, in any process, waits for the GPU's pending writes to it, as Metal's
  * does (the kext's RgfxSurfaceLocks.hpp). A commit of a buffer that writes a surface's shared
@@ -97,6 +100,8 @@
 #include <string>
 #include <vector>
 
+#include "RgfxAirArguments.hpp"
+
 class RgfxEncoder;
 class RgfxRegion;
 class RgfxSerializer;
@@ -129,9 +134,29 @@ void rgfxIOSurfaceSyncBeforeCommit(void);
 /// over an IOSurface or a view of one, through any views (otherwise nothing).
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
 
-/// As rgfxIOSurfaceNoteWrite, for a texture a shader may write: only when its usage
-/// has ShaderWrite.
-void rgfxIOSurfaceNoteShaderWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
+/// The textures over IOSurfaces, or views of them, bound at the indexes of one stage of an
+/// encoder, so that each draw or dispatch names as written those its function writes there. A
+/// binding of any other texture, or of nil, drops the index's.
+class RgfxSurfaceBindings {
+public:
+	/// `texture` bound at `index`.
+	void bind(NSUInteger index, id _Nullable texture);
+	/// At a draw or dispatch of the function whose arguments are `fn`: records on `enc` as
+	/// written (rgfxIOSurfaceNoteWrite) each bound texture the function writes
+	/// (rgfxAirWritesTexture), once while it stays bound; where `fn` is null, its arguments
+	/// unknown, each whose usage has ShaderWrite.
+	void noteWrites(RgfxEncoder *_Nullable enc, const RgfxAirFunction *_Nullable fn);
+	/// Drops every binding, as the encoder ends.
+	void clear() { m_bound.clear(); }
+
+private:
+	struct Bound {
+		NSUInteger index;
+		id _Nonnull texture;
+		bool noted;
+	};
+	std::vector<Bound> m_bound;
+};
 
 /// Where the writes `writes` (taken from a command buffer's encoder) are named to the kext: the
 /// region of their surfaces' shared blocks, null where none is of a shared block. A buffer with
