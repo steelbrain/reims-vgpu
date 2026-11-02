@@ -15,8 +15,9 @@
 
 #include <stdint.h>
 
-// The framing / command-buffer group (`tag >> 12`): encoder begin and end, and the command
-// buffer's own event signals and waits.
+// The framing / command-buffer group (`tag >> 12`): encoder begin and end, the command
+// buffer's own event signals and waits, and the IOSurfaces it uses whose blocks have a device
+// cache.
 #define RGFX_OP_GROUP_FRAMING 0
 
 // The render-encoder group (`tag >> 12`): [`render`].
@@ -52,6 +53,19 @@
 // Op `WAIT_EVENT` ([`RgfxOpEvent`]): `encodeWaitForEvent:value:`, between encoders: the work
 // after it waits until the event reaches `value`.
 #define RGFX_OP_WAIT_EVENT 6
+
+// Op `SURFACE_USE` ([`RgfxOpSurfaceUse`]): the command buffer uses the IOSurface whose block has a
+// device cache ([`RGFX_SURFACE_PAGES_CACHED`](crate::wire::RGFX_SURFACE_PAGES_CACHED)) through a
+// texture or buffer over it, as the CPU had left it at generation `cpu_gen` when the buffer was
+// committed. One for each such block the buffer uses (an attachment, a bound texture or buffer, a
+// resource it declares it uses, a blit's source or destination), before its first encoder. The
+// host fills the cache from the surface's pages before the buffer's work where the cache holds an
+// older generation, and orders a later copy of the cache after the buffer. An op naming a block
+// with no cache does nothing.
+#define RGFX_OP_SURFACE_USE 7
+
+// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
+#define RGFX_SURFACE_USE_WRITES (1 << 0)
 
 // Where an op's body starts in the op: right after its header.
 #define RGFX_OP_BODY_OFFSET 8
@@ -654,7 +668,8 @@
 // `VERSION`, RO: [`RGFX_VERSION`].
 #define RGFX_REG_VERSION 4
 
-// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`].
+// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`] and
+// [`RGFX_FEATURE_SURFACE_CACHE`].
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -664,6 +679,16 @@
 // to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
 // view is a copy of its pages in a block of the region.
 #define RGFX_FEATURE_SURFACE_PAGES (1 << 0)
+
+// `FEATURES_LO` bit 1, `SURFACE_CACHE`, beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host keeps
+// the GPU's copy of an IOSurface whose block the kext marks cached ([`RGFX_SURFACE_PAGES_CACHED`])
+// in its own GPU's memory, the surface's device cache, as a GPU that does not share the CPU's
+// memory keeps one. The cache is filled from the surface's pages at the first command buffer
+// that uses it after the CPU's generation of the surface moved (`RGFX_OP_SURFACE_USE`), and the
+// pages from the cache only at a [`RGFX_CMD_SURFACE_DOWNLOAD`] and at the block's
+// `BLOCK_RELEASE`. No host sets it yet; the kext alone reads it, and nothing the guest's
+// processes see changes but the time copies take.
+#define RGFX_FEATURE_SURFACE_CACHE (1 << 1)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1038,8 +1063,20 @@
 // `BLOCK_RELEASE`; [`RGFX_STATUS_REFUSED`] where it made none, for a run that is not whole pages
 // from a page of guest RAM, runs whose lengths do not sum to `length`, or a view the host could
 // not map, and [`RGFX_STATUS_INVALID_ARGUMENT`] where the runs do not lie in the block. The kext
-// gives a surface whose pages were refused a block that holds a copy of them instead.
+// gives a surface whose pages were refused a block that holds a copy of them instead. Where the
+// device has [`RGFX_FEATURE_SURFACE_CACHE`], an [`RgfxSurfacePagesCache`] may follow the message
+// at [`RGFX_SURFACE_PAGES_CACHE_OFFSET`], whose [`RGFX_SURFACE_PAGES_CACHED`] gives the block a
+// device cache.
 #define RGFX_CMD_SURFACE_PAGES 758
+
+// `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
+// device has [`RGFX_FEATURE_SURFACE_CACHE`]: a CPU lock of the IOSurface whose cached block is at
+// `block_offset` follows a GPU write of it, and the command buffers that wrote it have finished.
+// The host copies the surface's device cache into its pages once every command buffer that used
+// the cache before this message was taken has finished, and answers [`RGFX_EVT_COMPLETE`] with
+// [`RGFX_STATUS_OK`] once the pages hold it: at once where no command buffer wrote the cache
+// since it was last copied either way, or the block has no cache.
+#define RGFX_CMD_SURFACE_DOWNLOAD 759
 
 // Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 // its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -1098,8 +1135,26 @@
 // A command buffer's status: a resource the work named was invalid.
 #define RGFX_CB_INVALID_RESOURCE 5
 
+// Where a `PRESENT_SURFACE` message's [`RgfxPresentSurfaceGen`] starts: right after its
+// [`RgfxPresentSurface`]. A message whose `size` is at least
+// `RGFX_PRESENT_SURFACE_GEN_OFFSET + size_of::<RgfxPresentSurfaceGen>()` carries it.
+#define RGFX_PRESENT_SURFACE_GEN_OFFSET 32
+
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
+
+// Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesCache`] starts: right after its
+// [`RgfxSurfacePages`]. A message whose `size` is at least
+// `RGFX_SURFACE_PAGES_CACHE_OFFSET + size_of::<RgfxSurfacePagesCache>()` carries it; one of
+// `RGFX_SURFACE_PAGES_CACHE_OFFSET` none, and its block has no device cache.
+#define RGFX_SURFACE_PAGES_CACHE_OFFSET 56
+
+// [`RgfxSurfacePagesCache::flags`]: the block's surface has a device cache, where the device has
+// [`RGFX_FEATURE_SURFACE_CACHE`]: its `BUFFER_OVER_SURFACE_PAGES` buffers lie over the cache, every
+// command buffer that uses the surface names it in an `RGFX_OP_SURFACE_USE` with the CPU's
+// generation of the surface, and the kext asks a [`RGFX_CMD_SURFACE_DOWNLOAD`] before a CPU lock
+// that follows a GPU write. Without the feature the host gives the block none.
+#define RGFX_SURFACE_PAGES_CACHED (1 << 0)
 
 // The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
 // ([`RgfxManagedTextureCreate`]).
@@ -3808,6 +3863,18 @@ typedef struct {
   uint64_t offset;
 } RgfxOpSetVisibilityResultMode;
 
+// The body of [`RGFX_OP_SURFACE_USE`].
+typedef struct {
+  // The surface's shared block's region offset.
+  uint64_t block_offset;
+  // The kext's count of the surface's read-write CPU locks when the buffer was committed.
+  uint64_t cpu_gen;
+  // `RGFX_SURFACE_USE_*`: [`RGFX_SURFACE_USE_WRITES`].
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_14;
+} RgfxOpSurfaceUse;
+
 // `updateFence:afterStages:`. The fence must name an object.
 typedef struct {
   // The fence (must not be nil).
@@ -3919,6 +3986,15 @@ typedef struct {
   // Pads the message to a multiple of 8; 0.
   uint32_t reserved_1c;
 } RgfxPresentSurface;
+
+// The CPU's generation of the presented IOSurface, where its block has a device cache
+// ([`RGFX_SURFACE_PAGES_CACHED`]), after the [`RgfxPresentSurface`] at
+// [`RGFX_PRESENT_SURFACE_GEN_OFFSET`]: as an `RGFX_OP_SURFACE_USE`'s, the display shows the
+// pages as of that generation. A present without it shows the cache as it is.
+typedef struct {
+  // The kext's count of the surface's read-write CPU locks.
+  uint64_t cpu_gen;
+} RgfxPresentSurfaceGen;
 
 // `QUEUE_CREATE`: a command queue and its submission+completion ring pair, each
 // a [`RgfxRingHeader`] followed by a byte ring of the given data size (a power
@@ -4413,6 +4489,15 @@ typedef struct {
   uint32_t reserved_24;
 } RgfxSurfaceFacts;
 
+// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose cached block is at
+// `block_offset`, copied into the surface's pages.
+typedef struct {
+  // [`RGFX_CMD_SURFACE_DOWNLOAD`].
+  RgfxMsgHeader header;
+  // The surface's shared block's region offset.
+  uint64_t block_offset;
+} RgfxSurfaceDownload;
+
 // `SURFACE_PAGES`: the guest RAM of the IOSurface whose shared block is the `block_size` bytes
 // at `block_offset`, made for context `context`: `run_count` [`RgfxPageRun`]s at region offset
 // `runs_offset`, holding the surface's `length` bytes in order.
@@ -4432,6 +4517,15 @@ typedef struct {
   // The surface's bytes, which the runs hold.
   uint64_t length;
 } RgfxSurfacePages;
+
+// What a `SURFACE_PAGES` says of its block's device cache, after the [`RgfxSurfacePages`] at
+// [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
+typedef struct {
+  // `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`].
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_04;
+} RgfxSurfacePagesCache;
 
 // One command queue's latest command buffer that writes a surface plane's
 // copy: the queue's id and the buffer's `seqno` on the queue's submission ring.

@@ -36,12 +36,12 @@ use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
     RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING,
-    RGFX_OP_GROUP_RENDER, RGFX_OP_SIGNAL_EVENT, RGFX_OP_WAIT_EVENT,
+    RGFX_OP_GROUP_RENDER, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
     RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
     RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_MAX_SAMPLE_POSITIONS,
     RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
-    RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassSamplePositions,
-    op_group,
+    RgfxOpHeader, RgfxOpSurfaceUse, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+    RgfxRenderPassSamplePositions, op_group,
 };
 use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled, RgfxEventSignalled,
@@ -104,6 +104,26 @@ fn event_ops(mut ops: &[u8]) -> Vec<(bool, RgfxOpEvent)> {
     out
 }
 
+/// The `SURFACE_USE` ops of the op stream `ops`, in stream order. The scan stops at an op it
+/// cannot step past, as the walk does.
+fn surface_uses(mut ops: &[u8]) -> Vec<RgfxOpSurfaceUse> {
+    let mut out = Vec::new();
+    while let Some(h) = read::<RgfxOpHeader>(ops) {
+        let len = h.len as usize;
+        if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
+            break;
+        }
+        if h.tag == RGFX_OP_SURFACE_USE
+            && let Ok((op, _)) =
+                RgfxOpSurfaceUse::read_from_prefix(&ops[RGFX_OP_BODY_OFFSET as usize..len])
+        {
+            out.push(op);
+        }
+        ops = &ops[len..];
+    }
+    out
+}
+
 /// The encoder the walk currently holds open, one at a time, between an
 /// `ENCODER_BEGIN_*` and the matching `ENCODER_END`.
 enum OpenEncoder<P: Platform> {
@@ -142,8 +162,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// [`RGFX_CMD_COMMAND_BUFFER`](reims_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
     /// arm): opens a command buffer on the named queue, walks the op stream, and
     /// commits with a completion handler, which holds `drain` (its context's) until it has run.
+    /// The IOSurfaces whose device caches it uses (its `SURFACE_USE` ops) are filled first where
+    /// they hold an older generation, and it signals its queue's end event for their later copies
+    /// ([`super::surface_cache`]).
     pub(super) fn decode_command_buffer(
-        &self,
+        &mut self,
+        device: &P::Device,
         message: &[u8],
         drain: Option<Arc<Drain>>,
     ) -> RaiseResult<Result<(), DecodeError>> {
@@ -169,12 +193,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                 None => return Ok(Err(DecodeError::Refused)),
             }
         };
+        let used = self
+            .surface_caches
+            .before(device, &cb, &surface_uses(ops))?;
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
         let mut events = EventOps::default();
         if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
             return Ok(Err(e));
         }
+        self.surface_caches
+            .after(device, m.queue_obj_id, &cb, &used)?;
         // Register the scheduled and completion paths and commit. The GPU start and end times
         // are 0 here; the ring loop fills them when it posts the record on the queue's
         // completion ring in a later increment.
@@ -455,6 +484,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     events.waits.push((op.event_obj_id, op.value));
                 }
             }
+            // Carried out before the walk, wherever it lies (`surface_uses`).
+            RGFX_OP_SURFACE_USE => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())

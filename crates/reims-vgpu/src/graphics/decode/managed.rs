@@ -93,6 +93,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// with no, the two copies, which hold Metal's contract on any GPU.
     pub(crate) fn set_unified_memory(&mut self, unified: bool) {
         self.unified_memory = unified;
+        // A GPU of its own memory keeps IOSurfaces' device caches (`surface_cache`).
+        self.surface_caches = super::surface_cache::SurfaceCaches::new(!unified);
     }
 
     /// The CPU copy of the `Managed` buffer or texture `obj_id` names, where the current context

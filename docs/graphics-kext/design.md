@@ -348,6 +348,36 @@ Stages:
       completion ring's `completed_seqno` reaches the buffer, whichever comes
       first. A lock still waiting after 2 s goes on with an "RGFX: WARN" line
       (`guest/kext/src/RgfxAcceleratorLocks.cpp`).
+    - **The device cache:** where the device has
+      `RGFX_FEATURE_SURFACE_CACHE`, which no host offers yet, a block the
+      kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
+      the host: a Private buffer of the surface's bytes in the pages' layout,
+      which every buffer over the block is, so every texture over the
+      surface, of any shape, plane or format, lies over the same bytes. Each
+      command buffer names the cached surfaces it uses
+      (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
+      read-write locks when it was committed; the host fills the cache from
+      the pages before the first buffer of a newer count, on its own transfer
+      queue, after every buffer that used the cache before. The pages are
+      written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
+      at a CPU lock that follows a GPU write, and at the block's
+      `BLOCK_RELEASE`, and only where a buffer that may write the surface was
+      committed since the last copy (`reims-vgpu`'s
+      `graphics/decode/surface_cache.rs`). Each choice, by what real GPUs
+      show (M3, AMD and Intel Macs):
+      - *Contract, where all agree:* a CPU lock after a GPU write sees it,
+        and a GPU use after a read-write lock sees the CPU's writes; the
+        seed moves at a read-write lock (not at its unlock), not at a
+        read-only one, and by one at a GPU write's commit (the kext's).
+      - *Loose, where they diverge, the cheapest chosen:* a CPU write without
+        a read-write lock reaches the GPU only at the next fill, as on a GPU
+        of its own memory (the M3 sees it at once); a command buffer
+        committed before a CPU write and still running reads what it read,
+        since a fill waits for it; a buffer of an older count taken after a
+        fill of a newer one (two queues' buffers committed apart and taken in
+        the other order) reads the newer bytes; a download of a cache nothing
+        wrote since its last copy copies nothing; and a host whose GPU shares
+        the CPU's memory keeps no cache, its surfaces in place as above.
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
@@ -701,7 +731,11 @@ allocation, which every holder's ask wires. Before its first `BLOCK_SHARE`,
 the kext writes their runs into the block, past the part the processes map
 and are granted, and posts `SURFACE_PAGES`; other asks for the surface wait
 for its answer. A refusal frees the block as a share not posted does, and the
-ask answers `kIOReturnUnsupported`, so the process copies the surface.
+ask answers `kIOReturnUnsupported`, so the process copies the surface. Where
+the device has `RGFX_FEATURE_SURFACE_CACHE`, the kext may mark the block cached
+in its `SURFACE_PAGES`, and then asks `SURFACE_DOWNLOAD` (block offset) at a CPU
+lock that follows a GPU write, answered once the surface's pages hold the
+host's device cache (Decided 14, "The device cache").
 A command buffer that writes surfaces' shared blocks is named to the kext
 after it is posted and before its commit returns (selector 0x10c: the queue,
 the buffer's seqno, and a pair of the block's offset and the surface's
@@ -906,6 +940,11 @@ opens the `Platform` command buffer and walks the ops:
   alike (an event op with an encoder open, or naming no event, faults the
   buffer). The end of the message closes it: the host commits and registers an
   `add_completed_handler` that writes the completion record.
+- `SURFACE_USE` (block offset, the kext's count of the surface's read-write
+  locks, whether the buffer may write it), one for each IOSurface with a device
+  cache the buffer uses, before its first encoder: the host fills the cache
+  before the buffer's work where it holds an older count (Decided 14, "The
+  device cache"). One naming a block with no cache does nothing.
 
 A command buffer too large for half its queue's submission ring goes out of
 line: the bundle writes the whole `COMMAND_BUFFER` message into a block of the

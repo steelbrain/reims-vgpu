@@ -51,8 +51,9 @@ pub const fn op_group(tag: u16) -> u16 {
     tag >> 12
 }
 
-/// The framing / command-buffer group (`tag >> 12`): encoder begin and end, and the command
-/// buffer's own event signals and waits.
+/// The framing / command-buffer group (`tag >> 12`): encoder begin and end, the command
+/// buffer's own event signals and waits, and the IOSurfaces it uses whose blocks have a device
+/// cache.
 pub const RGFX_OP_GROUP_FRAMING: u16 = 0x0;
 /// The render-encoder group (`tag >> 12`): [`render`].
 pub const RGFX_OP_GROUP_RENDER: u16 = 0x1;
@@ -80,6 +81,34 @@ pub const RGFX_OP_SIGNAL_EVENT: u16 = 0x0005;
 /// Op `WAIT_EVENT` ([`RgfxOpEvent`]): `encodeWaitForEvent:value:`, between encoders: the work
 /// after it waits until the event reaches `value`.
 pub const RGFX_OP_WAIT_EVENT: u16 = 0x0006;
+/// Op `SURFACE_USE` ([`RgfxOpSurfaceUse`]): the command buffer uses the IOSurface whose block has a
+/// device cache ([`RGFX_SURFACE_PAGES_CACHED`](crate::wire::RGFX_SURFACE_PAGES_CACHED)) through a
+/// texture or buffer over it, as the CPU had left it at generation `cpu_gen` when the buffer was
+/// committed. One for each such block the buffer uses (an attachment, a bound texture or buffer, a
+/// resource it declares it uses, a blit's source or destination), before its first encoder. The
+/// host fills the cache from the surface's pages before the buffer's work where the cache holds an
+/// older generation, and orders a later copy of the cache after the buffer. An op naming a block
+/// with no cache does nothing.
+pub const RGFX_OP_SURFACE_USE: u16 = 0x0007;
+
+/// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
+pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
+
+/// The body of [`RGFX_OP_SURFACE_USE`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSurfaceUse {
+    /// The surface's shared block's region offset.
+    pub block_offset: u64,
+    /// The kext's count of the surface's read-write CPU locks when the buffer was committed.
+    pub cpu_gen: u64,
+    /// `RGFX_SURFACE_USE_*`: [`RGFX_SURFACE_USE_WRITES`].
+    pub flags: u32,
+    /// Zero.
+    pub reserved_14: u32,
+}
 
 /// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
 #[repr(C)]
@@ -354,6 +383,8 @@ const _: () = {
     assert!(size_of::<RgfxRenderPassSamplePositions>() == 136);
     assert!(size_of::<RgfxComputePassDesc>() == 8);
     assert!(size_of::<RgfxOpEvent>() == 16);
+    assert!(size_of::<RgfxOpSurfaceUse>() == 24);
+    assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);
     // Each group's tag range maps to its own `op_group`.
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_RENDER) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_ENCODER_END) == RGFX_OP_GROUP_FRAMING);

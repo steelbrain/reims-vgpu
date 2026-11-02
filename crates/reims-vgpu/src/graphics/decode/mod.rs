@@ -105,6 +105,7 @@ mod compute;
 mod library;
 mod managed;
 mod render;
+mod surface_cache;
 mod surface_pages;
 mod view;
 mod waits;
@@ -302,6 +303,8 @@ pub struct GraphicsDecoder<P: Platform> {
     unified_memory: bool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: surface_pages::SurfaceViews<P>,
+    /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
+    surface_caches: surface_cache::SurfaceCaches<P>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -334,6 +337,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             managed: HashMap::new(),
             unified_memory: false,
             surface_views: surface_pages::SurfaceViews::new(None),
+            surface_caches: surface_cache::SurfaceCaches::new(true),
             region,
         }
     }
@@ -364,12 +368,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
+        cached: bool,
     ) -> u32 {
         let made = self
             .surface_views
             .surface_pages(&self.platform, device, pages, runs);
         let status = match made {
-            Ok(Ok(())) => RGFX_STATUS_OK,
+            Ok(Ok(())) => {
+                self.cache_surface(device, pages.block_offset, cached);
+                RGFX_STATUS_OK
+            }
             Ok(Err(why)) => {
                 log::warn!(
                     target: "reims_vgpu::graphics",
@@ -397,14 +405,88 @@ impl<P: Platform> GraphicsDecoder<P> {
                  for bad runs, {} not mapped",
                 c.made, c.reused, c.bad_runs, c.not_mapped
             );
+            let d = self.surface_caches.counts();
+            if d.made != 0 {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface device caches: {} made; {} fills of {} MiB, {} downloads of {} MiB, \
+                     {} asked of a cache nothing wrote",
+                    d.made, d.fills, d.filled_bytes >> 20, d.downloads,
+                    d.downloaded_bytes >> 20, d.clean
+                );
+            }
         }
         status
     }
 
+    /// Gives the block at `block`, whose view was just made, a device cache where the kext marked
+    /// it `cached` and the device keeps caches ([`surface_cache`]); else the block keeps its view
+    /// alone, and its buffers lie over the pages.
+    fn cache_surface(&mut self, device: &P::Device, block: u64, cached: bool) {
+        if !cached || !self.surface_caches.on() {
+            return;
+        }
+        let Some(view) = self.surface_views.view(block) else {
+            return;
+        };
+        match self.surface_caches.make(device, block, &view) {
+            Ok(true) => {}
+            Ok(false) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: the platform made no device cache of its {:#x} \
+                 bytes; its buffers lie over its pages",
+                view.length()
+            ),
+            Err(raise) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: the platform raised at its device cache \
+                 ({raise:?}); its buffers lie over its pages"
+            ),
+        }
+    }
+
+    /// `SURFACE_DOWNLOAD` of the block at `block`: its device cache written into the surface's
+    /// pages, after every command buffer that used it ([`surface_cache`]); `done` once the pages
+    /// hold it, at once where the block has no cache or nothing wrote it since its last copy.
+    pub(crate) fn surface_download(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        done: Box<dyn FnOnce() + Send>,
+    ) -> RaiseResult<()> {
+        self.surface_caches.download(device, block, done)
+    }
+
     /// The block at `offset` was released: its surface view, if any, goes once the buffers over
-    /// it have.
-    pub(crate) fn block_released(&mut self, offset: u64) {
+    /// it have, and its device cache once the pages hold what a command buffer wrote of it;
+    /// `done` then ([`surface_cache`]).
+    pub(crate) fn block_released(
+        &mut self,
+        device: &P::Device,
+        offset: u64,
+        done: Box<dyn FnOnce() + Send>,
+    ) -> RaiseResult<()> {
         self.surface_views.released(offset);
+        self.surface_caches.released(device, offset, done)
+    }
+
+    /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
+    /// shows lies in, where it holds an older CPU generation than `generation`, and waits for the
+    /// fill ([`surface_cache`]).
+    pub(crate) fn fill_presented(
+        &mut self,
+        device: &P::Device,
+        iosurface_id: u32,
+        generation: u64,
+    ) -> RaiseResult<()> {
+        let block = (self.surfaces.get(&iosurface_id))
+            .and_then(|textures| textures.last())
+            .and_then(|obj_id| self.spans.get(obj_id))
+            .map(|&(at, _)| at);
+        match block {
+            Some(block) => self.surface_caches.fill_now(device, block, generation),
+            None => Ok(()),
+        }
     }
 
     /// Sets the sink the decoder hands each command buffer's completion record to
@@ -1160,12 +1242,21 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // of the surface in, which stands for the surface: the plane lies in it as
                 // TEXTURE_FROM_BUFFER places a texture, and plane 1 where the facts say. A
                 // buffer the host does not hold is a guest protocol error.
-                let desc = texture_desc(&m.desc, m.resource_id);
-                let descriptor = self.platform.texture_descriptor(&desc);
+                let mut desc = texture_desc(&m.desc, m.resource_id);
                 if !matches!(self.named(m.buffer_obj_id), Some(ObjHandle::Buffer(_))) {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 let span = self.span_of(m.buffer_obj_id);
+                // Over a device cache, a Private buffer, the texture is Private too, as Metal
+                // makes a texture over a buffer in the buffer's storage mode; the guest's own
+                // texture keeps the mode it asked (`surface_cache`).
+                if span.is_some_and(|(at, _)| self.surface_caches.has(at)) {
+                    desc.resource_options = Some(
+                        desc.resource_options.unwrap_or(0) & !surface_cache::STORAGE_MASK
+                            | surface_cache::STORAGE_PRIVATE,
+                    );
+                }
+                let descriptor = self.platform.texture_descriptor(&desc);
                 // The copy's writers lie wholly inside the buffer, in the region.
                 let writers = if m.writers_offset == RGFX_SURFACE_NO_WRITERS {
                     None
@@ -1231,7 +1322,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // The buffer's context's drain, held until its completion handler has run.
                 let drain = (self.context)
                     .map(|context| Arc::clone(self.drains.entry(context).or_default()));
-                self.decode_command_buffer(message, drain)
+                self.decode_command_buffer(device, message, drain)
             }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }

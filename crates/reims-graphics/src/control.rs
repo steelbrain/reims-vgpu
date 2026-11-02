@@ -38,7 +38,10 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         }),
         RGFX_CMD_PRESENT_SURFACE => match read::<RgfxPresentSurface>(message) {
             Some(command) if command.display == 0 => {
-                present_surface(shared, &command, seqno);
+                let generation =
+                    read_at::<RgfxPresentSurfaceGen>(message, RGFX_PRESENT_SURFACE_GEN_OFFSET)
+                        .map(|g| g.cpu_gen);
+                present_surface(shared, &command, generation, seqno);
                 return None;
             }
             Some(_) => RGFX_STATUS_NO_DISPLAY,
@@ -65,8 +68,9 @@ pub(crate) fn is_lifecycle(message: &Message) -> bool {
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
 /// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
 /// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`); a `SURFACE_PAGES` hands its block's runs
-/// to the host (`Shared::surface_pages`), answered with whether it mapped them. Every other
-/// message goes to the host's decoder.
+/// to the host (`Shared::surface_pages`), answered with whether it mapped them; a
+/// `SURFACE_DOWNLOAD` the host answers once the surface's pages hold its device cache
+/// (`Host::surface_download`). Every other message goes to the host's decoder.
 pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     match message.header.r#type {
@@ -107,12 +111,23 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
             None
         }
         RGFX_CMD_SURFACE_PAGES => {
+            let cached = read_at::<RgfxSurfacePagesCache>(message, RGFX_SURFACE_PAGES_CACHE_OFFSET)
+                .is_some_and(|c| c.flags & RGFX_SURFACE_PAGES_CACHED != 0);
             let status = read::<RgfxSurfacePages>(message)
                 .map_or(RGFX_STATUS_INVALID_ARGUMENT, |pages| {
-                    shared.surface_pages(&pages)
+                    shared.surface_pages(&pages, cached)
                 });
             Some(complete(seqno, status))
         }
+        RGFX_CMD_SURFACE_DOWNLOAD => match read::<RgfxSurfaceDownload>(message) {
+            Some(download) => {
+                shared
+                    .host
+                    .surface_download(download.block_offset, shared.complete_answer(seqno));
+                None
+            }
+            None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
+        },
         RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
             // Whatever the answer, the block is no longer its process's to name.
             Some(release) => {
@@ -140,6 +155,13 @@ pub(crate) fn lifecycle(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
 /// `message`'s bytes as command `T`, or `None` where they are fewer than it.
 fn read<T: FromBytes>(message: &Message) -> Option<T> {
     T::read_from_prefix(&message.bytes).ok().map(|(t, _)| t)
+}
+
+/// The `T` that follows a command's own struct at byte `offset` of `message`, or `None` where
+/// the message ends before it (a message that does not carry it).
+fn read_at<T: FromBytes>(message: &Message, offset: u32) -> Option<T> {
+    let bytes = message.bytes.get(offset as usize..)?;
+    T::read_from_prefix(bytes).ok().map(|(t, _)| t)
 }
 
 /// A `COMPLETE` for command `seqno`.
@@ -270,16 +292,23 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
 
 /// `PRESENT_SURFACE` on display 0: the host answers once it shows the surface, or refuses it
 /// (`Host::present_surface`).
-fn present_surface(shared: &Shared, command: &RgfxPresentSurface, seqno: u64) {
+fn present_surface(
+    shared: &Shared,
+    command: &RgfxPresentSurface,
+    generation: Option<u64>,
+    seqno: u64,
+) {
     log::trace!(
         target: "reims_graphics",
         "PRESENT_SURFACE of transaction {}: IOSurface {}",
         command.transaction_id,
         command.iosurface_id
     );
-    shared
-        .host
-        .present_surface(command.iosurface_id, shared.complete_answer(seqno));
+    shared.host.present_surface(
+        command.iosurface_id,
+        generation,
+        shared.complete_answer(seqno),
+    );
 }
 
 /// `SET_VBLANK`.

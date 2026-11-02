@@ -188,6 +188,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
             }
+            // No RGFX_FEATURE_SURFACE_CACHE yet: a write the host's own devices make into a
+            // cached surface's pages does not reach its cache.
             let features = if decoder.surface_pages_available() {
                 u64::from(RGFX_FEATURE_SURFACE_PAGES)
             } else {
@@ -487,15 +489,56 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
-        // No buffer lies over the block's surface view any more: it goes with the block.
-        decoder.block_released(release.offset);
         let drain = decoder.drain_context(
             release.context,
             false,
             Box::new(move || answer.answer(RGFX_STATUS_OK)),
         );
+        // No buffer lies over the block's surface view any more: it goes with the block, and its
+        // device cache once the surface's pages hold what was written of it, which the answer
+        // waits for.
+        let held = Arc::clone(&drain);
+        let released = entry::run(|_| {
+            decoder.block_released(&self.device, release.offset, Box::new(move || drop(held)))
+        });
+        if let Err(raise) = released {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the block at {:#x}: the platform raised at its device cache's write back \
+                 ({raise:?})",
+                release.offset
+            );
+        }
         drop(decoder);
         drop(drain);
+    }
+
+    /// `SURFACE_DOWNLOAD` of the block at `block`: answered once the surface's pages hold its
+    /// device cache ([`GraphicsDecoder::surface_download`]).
+    fn download_surface(&self, block: u64, answer: CompleteAnswer) {
+        let answer = Arc::new(Mutex::new(Some(answer)));
+        let give = Arc::clone(&answer);
+        let done = entry::run(|_| {
+            self.decoder.lock().surface_download(
+                &self.device,
+                block,
+                Box::new(move || {
+                    if let Some(answer) = give.lock().take() {
+                        answer.answer(RGFX_STATUS_OK);
+                    }
+                }),
+            )
+        });
+        if let Err(raise) = done {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the block at {block:#x}: the platform raised at its device cache's download \
+                 ({raise:?})"
+            );
+            if let Some(answer) = answer.lock().take() {
+                answer.answer(RGFX_STATUS_REFUSED);
+            }
+        }
     }
 
     /// Carries out one stage-3 message under a library entry: from ring 0 an object-lifecycle create
@@ -853,12 +896,26 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// write its copy have finished, after the presents before it ([`PresentQueue`]), answering
     /// once the window shows it; answered invalid at once, with nothing changed, where the decoder
     /// holds no texture over it.
-    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
+    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         if iosurface_id == 0 {
             self.presents.present(0, None, answer, Vec::new());
             return;
         }
-        let found = self.decoder.lock().surface_present(iosurface_id);
+        let mut decoder = self.decoder.lock();
+        if let Some(generation) = generation {
+            // The pages as of the present's generation, where the surface has a device cache.
+            let filled =
+                entry::run(|_| decoder.fill_presented(&self.device, iosurface_id, generation));
+            if let Err(raise) = filled {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface {iosurface_id}: the platform raised at its device cache's fill for \
+                     a present ({raise:?})"
+                );
+            }
+        }
+        let found = decoder.surface_present(iosurface_id);
+        drop(decoder);
         match found {
             Some((texture, writers, owner)) => {
                 // The process that made the texture over the surface the display shows owns the
@@ -915,8 +972,9 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
             .is_none_or(|f| f(offset, length))
     }
 
-    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
-        self.control.present_surface(iosurface_id, answer);
+    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+        self.control
+            .present_surface(iosurface_id, generation, answer);
     }
 
     fn refreshed(&self) {
@@ -939,14 +997,18 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.features
     }
 
-    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>) -> u32 {
+    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, cached: bool) -> u32 {
         let control = &self.control;
         entry::run(|_| {
             control
                 .decoder
                 .lock()
-                .surface_pages(&control.device, pages, &runs)
+                .surface_pages(&control.device, pages, &runs, cached)
         })
+    }
+
+    fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
+        self.control.download_surface(block_offset, answer);
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {

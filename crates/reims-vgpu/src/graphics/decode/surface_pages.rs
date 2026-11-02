@@ -33,7 +33,7 @@ use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::memory::mapping::Mapping;
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
-use reims_vgpu_core::platform::{HostRange, Platform};
+use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::RaiseResult;
 
 /// The guest's page: every run is whole pages of it.
@@ -251,6 +251,11 @@ impl<P: Platform> SurfaceViews<P> {
             .map(|(v, _)| Arc::clone(v))
     }
 
+    /// The view of the block at `block`.
+    pub(crate) fn view(&self, block: u64) -> Option<Arc<SurfaceView<P>>> {
+        self.by_block.get(&block).map(|(v, _)| Arc::clone(v))
+    }
+
     /// The block at `offset` went (its `BLOCK_RELEASE`): its view goes once the buffers over it
     /// and the cache have let it go.
     pub(crate) fn released(&mut self, offset: u64) {
@@ -306,6 +311,16 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         let Some(view) = self.surface_views.view_for(&m) else {
             return Ok(Err(super::DecodeError::Refused));
         };
+        // A block with a device cache: the buffer is the cache, over the surface's bytes in the
+        // pages' layout (`surface_cache`).
+        if let Some(cache) = self.surface_caches.buffer(m.block_offset) {
+            let cache = cache.clone_ref();
+            return self.insert_over(
+                m.obj_id,
+                super::ObjHandle::Buffer(cache),
+                Some((m.block_offset, m.block_size)),
+            );
+        }
         match buffer_over(device, &view, m.length, m.options.into())? {
             Some(buffer) => self.insert_over(
                 m.obj_id,
@@ -318,7 +333,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use reims_graphics::region::Region;
     use reims_graphics::wire::{
         RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
@@ -333,22 +348,22 @@ mod tests {
     use super::*;
 
     /// The processes' blocks start here.
-    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4000;
+    pub(crate) const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4000;
     /// The guest RAM's first byte.
-    const RAM: u64 = 0x10_0000;
+    pub(crate) const RAM: u64 = 0x10_0000;
 
-    struct Rig {
-        p: Arc<FakePlatform>,
-        device: <FakePlatform as Platform>::Device,
-        ram: GuestRam,
-        dec: GraphicsDecoder<FakePlatform>,
+    pub(crate) struct Rig {
+        pub(crate) p: Arc<FakePlatform>,
+        pub(crate) device: <FakePlatform as Platform>::Device,
+        pub(crate) ram: GuestRam,
+        pub(crate) dec: GraphicsDecoder<FakePlatform>,
         /// The host's page, which the runs are whole pages of here.
-        page: u64,
+        pub(crate) page: u64,
     }
 
     /// A decoder over a region with a MiB of blocks, and `pages` host pages of guest RAM from
     /// [`RAM`] behind its memory map.
-    fn rig(pages: u64) -> Rig {
+    pub(crate) fn rig(pages: u64) -> Rig {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let page = p.vm().page_size();
@@ -387,7 +402,18 @@ mod tests {
     impl Rig {
         /// A `SURFACE_PAGES` for the block at `block` of `runs`, given as (page, pages) of guest
         /// RAM, over `length` bytes; its answer.
-        fn pages(&mut self, block: u64, runs: &[(u64, u64)], length: u64) -> u32 {
+        pub(crate) fn pages(&mut self, block: u64, runs: &[(u64, u64)], length: u64) -> u32 {
+            self.pages_cached(block, runs, length, false)
+        }
+
+        /// [`Self::pages`], the block marked `cached`.
+        pub(crate) fn pages_cached(
+            &mut self,
+            block: u64,
+            runs: &[(u64, u64)],
+            length: u64,
+            cached: bool,
+        ) -> u32 {
             let runs: Vec<RgfxPageRun> = runs
                 .iter()
                 .map(|&(at, n)| RgfxPageRun {
@@ -404,11 +430,16 @@ mod tests {
                 runs_offset: block + 0x1000,
                 length,
             };
-            self.dec.surface_pages(&self.device, &m, &runs)
+            self.dec.surface_pages(&self.device, &m, &runs, cached)
         }
 
         /// A `BUFFER_OVER_SURFACE_PAGES` of `length` bytes over the block at `block`.
-        fn buffer(&mut self, obj_id: u64, block: u64, length: u64) -> Result<(), DecodeError> {
+        pub(crate) fn buffer(
+            &mut self,
+            obj_id: u64,
+            block: u64,
+            length: u64,
+        ) -> Result<(), DecodeError> {
             let m = RgfxBufferOverSurfacePages {
                 header: header(RGFX_CMD_BUFFER_OVER_SURFACE_PAGES),
                 obj_id,
@@ -467,7 +498,9 @@ mod tests {
             Err(DecodeError::Refused)
         );
         // The buffer holds the view after the block's release.
-        r.dec.block_released(BLOCK);
+        r.dec
+            .block_released(&r.device, BLOCK, Box::new(|| ()))
+            .unwrap();
         assert_eq!(r.buffer(13, BLOCK, page), Err(DecodeError::Refused));
         assert!(
             Arc::strong_count(&view) > 2,
@@ -489,7 +522,9 @@ mod tests {
         let page = r.page;
         assert_eq!(r.pages(BLOCK, &[(3, 1), (0, 1)], 2 * page), RGFX_STATUS_OK);
         let first = r.view(BLOCK);
-        r.dec.block_released(BLOCK);
+        r.dec
+            .block_released(&r.device, BLOCK, Box::new(|| ()))
+            .unwrap();
         let mark = r.p.call_log().mark();
         assert_eq!(
             r.pages(BLOCK + 0x8000, &[(3, 1), (0, 1)], 2 * page),
@@ -509,7 +544,9 @@ mod tests {
             assert_eq!(r.pages(BLOCK, &[(10 + i, 1)], page), RGFX_STATUS_OK);
         }
         assert_eq!(r.dec.surface_views.len().1, CACHED_VIEWS);
-        r.dec.block_released(BLOCK + 0x8000);
+        r.dec
+            .block_released(&r.device, BLOCK + 0x8000, Box::new(|| ()))
+            .unwrap();
         assert_eq!(
             Arc::strong_count(&first),
             1,
@@ -540,7 +577,7 @@ mod tests {
             ..RgfxSurfacePages::default()
         };
         assert_eq!(
-            r.dec.surface_pages(&r.device, &m, &runs),
+            r.dec.surface_pages(&r.device, &m, &runs, false),
             RGFX_STATUS_REFUSED
         );
         let c = r.dec.surface_views.counts();
@@ -573,6 +610,9 @@ mod tests {
             address: RAM,
             length: 0x4000,
         }];
-        assert_eq!(dec.surface_pages(&device, &m, &runs), RGFX_STATUS_REFUSED);
+        assert_eq!(
+            dec.surface_pages(&device, &m, &runs, false),
+            RGFX_STATUS_REFUSED
+        );
     }
 }

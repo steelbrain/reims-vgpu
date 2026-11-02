@@ -50,7 +50,8 @@ pub const RGFX_MSIX_VECTORS: u32 = 1;
 pub const RGFX_REG_MAGIC: u32 = 0x000;
 /// `VERSION`, RO: [`RGFX_VERSION`].
 pub const RGFX_REG_VERSION: u32 = 0x004;
-/// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`].
+/// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`] and
+/// [`RGFX_FEATURE_SURFACE_CACHE`].
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -58,6 +59,15 @@ pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
 /// to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
 /// view is a copy of its pages in a block of the region.
 pub const RGFX_FEATURE_SURFACE_PAGES: u32 = 1 << 0;
+/// `FEATURES_LO` bit 1, `SURFACE_CACHE`, beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host keeps
+/// the GPU's copy of an IOSurface whose block the kext marks cached ([`RGFX_SURFACE_PAGES_CACHED`])
+/// in its own GPU's memory, the surface's device cache, as a GPU that does not share the CPU's
+/// memory keeps one. The cache is filled from the surface's pages at the first command buffer
+/// that uses it after the CPU's generation of the surface moved (`RGFX_OP_SURFACE_USE`), and the
+/// pages from the cache only at a [`RGFX_CMD_SURFACE_DOWNLOAD`] and at the block's
+/// `BLOCK_RELEASE`. No host sets it yet; the kext alone reads it, and nothing the guest's
+/// processes see changes but the time copies take.
+pub const RGFX_FEATURE_SURFACE_CACHE: u32 = 1 << 1;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -400,8 +410,19 @@ pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
 /// `BLOCK_RELEASE`; [`RGFX_STATUS_REFUSED`] where it made none, for a run that is not whole pages
 /// from a page of guest RAM, runs whose lengths do not sum to `length`, or a view the host could
 /// not map, and [`RGFX_STATUS_INVALID_ARGUMENT`] where the runs do not lie in the block. The kext
-/// gives a surface whose pages were refused a block that holds a copy of them instead.
+/// gives a surface whose pages were refused a block that holds a copy of them instead. Where the
+/// device has [`RGFX_FEATURE_SURFACE_CACHE`], an [`RgfxSurfacePagesCache`] may follow the message
+/// at [`RGFX_SURFACE_PAGES_CACHE_OFFSET`], whose [`RGFX_SURFACE_PAGES_CACHED`] gives the block a
+/// device cache.
 pub const RGFX_CMD_SURFACE_PAGES: u32 = 0x2f6;
+/// `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
+/// device has [`RGFX_FEATURE_SURFACE_CACHE`]: a CPU lock of the IOSurface whose cached block is at
+/// `block_offset` follows a GPU write of it, and the command buffers that wrote it have finished.
+/// The host copies the surface's device cache into its pages once every command buffer that used
+/// the cache before this message was taken has finished, and answers [`RGFX_EVT_COMPLETE`] with
+/// [`RGFX_STATUS_OK`] once the pages hold it: at once where no command buffer wrote the cache
+/// since it was last copied either way, or the block has no cache.
+pub const RGFX_CMD_SURFACE_DOWNLOAD: u32 = 0x2f7;
 
 /// Command `COMMAND_BUFFER` (a per-queue submission ring): one command buffer,
 /// its `obj_id` followed by the encoder-op byte stream. Struct and op stream in
@@ -580,6 +601,24 @@ pub struct RgfxPresentSurface {
     pub reserved_1c: u32,
 }
 
+/// Where a `PRESENT_SURFACE` message's [`RgfxPresentSurfaceGen`] starts: right after its
+/// [`RgfxPresentSurface`]. A message whose `size` is at least
+/// `RGFX_PRESENT_SURFACE_GEN_OFFSET + size_of::<RgfxPresentSurfaceGen>()` carries it.
+pub const RGFX_PRESENT_SURFACE_GEN_OFFSET: u32 = 32;
+
+/// The CPU's generation of the presented IOSurface, where its block has a device cache
+/// ([`RGFX_SURFACE_PAGES_CACHED`]), after the [`RgfxPresentSurface`] at
+/// [`RGFX_PRESENT_SURFACE_GEN_OFFSET`]: as an `RGFX_OP_SURFACE_USE`'s, the display shows the
+/// pages as of that generation. A present without it shows the cache as it is.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxPresentSurfaceGen {
+    /// The kext's count of the surface's read-write CPU locks.
+    pub cpu_gen: u64,
+}
+
 /// `COMPLETE`: a command's answer.
 #[repr(C)]
 #[derive(
@@ -706,6 +745,11 @@ const _: () = {
     assert!(size_of::<RgfxBlockGrant>() == 40);
     assert!(size_of::<RgfxPageRun>() == 16);
     assert!(size_of::<RgfxSurfacePages>() == 56);
+    assert!(size_of::<RgfxSurfacePages>() == RGFX_SURFACE_PAGES_CACHE_OFFSET as usize);
+    assert!(size_of::<RgfxSurfacePagesCache>() == 8);
+    assert!(size_of::<RgfxSurfaceDownload>() == 24);
+    assert!(size_of::<RgfxPresentSurface>() == RGFX_PRESENT_SURFACE_GEN_OFFSET as usize);
+    assert!(size_of::<RgfxPresentSurfaceGen>() == 8);
     assert!(size_of::<RgfxBufferOverSurfacePages>() == 56);
     // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
     // no whole chunk more fits there.
@@ -907,6 +951,45 @@ pub struct RgfxSurfacePages {
     pub runs_offset: u64,
     /// The surface's bytes, which the runs hold.
     pub length: u64,
+}
+
+/// Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesCache`] starts: right after its
+/// [`RgfxSurfacePages`]. A message whose `size` is at least
+/// `RGFX_SURFACE_PAGES_CACHE_OFFSET + size_of::<RgfxSurfacePagesCache>()` carries it; one of
+/// `RGFX_SURFACE_PAGES_CACHE_OFFSET` none, and its block has no device cache.
+pub const RGFX_SURFACE_PAGES_CACHE_OFFSET: u32 = 56;
+
+/// [`RgfxSurfacePagesCache::flags`]: the block's surface has a device cache, where the device has
+/// [`RGFX_FEATURE_SURFACE_CACHE`]: its `BUFFER_OVER_SURFACE_PAGES` buffers lie over the cache, every
+/// command buffer that uses the surface names it in an `RGFX_OP_SURFACE_USE` with the CPU's
+/// generation of the surface, and the kext asks a [`RGFX_CMD_SURFACE_DOWNLOAD`] before a CPU lock
+/// that follows a GPU write. Without the feature the host gives the block none.
+pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
+
+/// What a `SURFACE_PAGES` says of its block's device cache, after the [`RgfxSurfacePages`] at
+/// [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfacePagesCache {
+    /// `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`].
+    pub flags: u32,
+    /// Zero.
+    pub reserved_04: u32,
+}
+
+/// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose cached block is at
+/// `block_offset`, copied into the surface's pages.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfaceDownload {
+    /// [`RGFX_CMD_SURFACE_DOWNLOAD`].
+    pub header: RgfxMsgHeader,
+    /// The surface's shared block's region offset.
+    pub block_offset: u64,
 }
 
 /// `BUFFER_OVER_SURFACE_PAGES`: a Shared buffer of `length` bytes over the IOSurface pages the

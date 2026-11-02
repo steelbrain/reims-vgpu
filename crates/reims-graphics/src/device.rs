@@ -171,11 +171,22 @@ pub trait Host: Send + Sync + 'static {
     /// read out of the block, before its first `BLOCK_SHARE`. The host maps them as one view for
     /// the block's `BUFFER_OVER_SURFACE_PAGES` buffers, until the block's `BLOCK_RELEASE`, where
     /// it carries out [`RGFX_FEATURE_SURFACE_PAGES`], and answers [`RGFX_STATUS_OK`]; else
-    /// [`RGFX_STATUS_REFUSED`], with no view. Called on the control thread, in ring order. The
-    /// default maps nothing.
-    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>) -> u32 {
-        let _ = (pages, runs);
+    /// [`RGFX_STATUS_REFUSED`], with no view. `cached`: the kext marked the block cached
+    /// ([`RGFX_SURFACE_PAGES_CACHED`]), and a host that carries out
+    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives it a device cache, which its buffers are. Called on
+    /// the control thread, in ring order. The default maps nothing.
+    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, cached: bool) -> u32 {
+        let _ = (pages, runs, cached);
         RGFX_STATUS_REFUSED
+    }
+
+    /// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose block lies at `block_offset`
+    /// written into its pages ([`RGFX_FEATURE_SURFACE_CACHE`]); the host gives `answer`
+    /// ([`RGFX_STATUS_OK`]) from any thread once the pages hold it. Called on the control thread,
+    /// in ring order. The default answers at once, for a host that keeps no caches.
+    fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
+        let _ = block_offset;
+        answer.answer(RGFX_STATUS_OK);
     }
 
     /// Hands a stage-3 message to the host's decoder: from ring 0, on the control thread, an
@@ -204,9 +215,12 @@ pub trait Host: Send + Sync + 'static {
     /// once the display shows it: [`RGFX_STATUS_OK`], or [`RGFX_STATUS_INVALID_ARGUMENT`], with
     /// nothing changed, where the host holds no texture over that surface. The guest's display
     /// pipe completes its transaction on that answer, so it is given when the surface is shown,
-    /// not before. The default shows nothing and answers at once, refusing every surface but 0,
-    /// for a host with no stage-3 decoder.
-    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
+    /// not before. `generation`, where the present carries one, is the CPU's generation of the
+    /// surface ([`RgfxPresentSurfaceGen`]): a surface with a device cache shows its pages as of
+    /// it. The default shows nothing and answers at once, refusing every surface but 0, for a
+    /// host with no stage-3 decoder.
+    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+        let _ = generation;
         answer.answer(if iosurface_id == 0 {
             RGFX_STATUS_OK
         } else {
@@ -834,8 +848,9 @@ impl Shared {
 
     /// `SURFACE_PAGES`: its runs read out of its block for the host ([`Host::surface_pages`]),
     /// whose answer it is, where the block lies in the processes' blocks and its runs, whole, in
-    /// the block; else logged and [`RGFX_STATUS_INVALID_ARGUMENT`], with no view.
-    pub(crate) fn surface_pages(&self, pages: &RgfxSurfacePages) -> u32 {
+    /// the block; else logged and [`RGFX_STATUS_INVALID_ARGUMENT`], with no view. `cached`: the
+    /// message marked the block cached.
+    pub(crate) fn surface_pages(&self, pages: &RgfxSurfacePages, cached: bool) -> u32 {
         let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
         let block_end = pages.block_offset.checked_add(pages.block_size);
         let runs_bytes = u64::from(pages.run_count) * size_of::<RgfxPageRun>() as u64;
@@ -867,7 +882,7 @@ impl Shared {
             .iter()
             .filter_map(|run| RgfxPageRun::read_from_bytes(run).ok())
             .collect();
-        self.host.surface_pages(pages, runs)
+        self.host.surface_pages(pages, runs, cached)
     }
 
     /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`

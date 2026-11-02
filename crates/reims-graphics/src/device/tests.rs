@@ -47,13 +47,16 @@ impl Screen for TestScreen {
     }
 }
 
+/// The surfaces a host was asked to show, each with the CPU generation its present carried.
+type Presented = Arc<Mutex<Vec<(u32, Option<u64>)>>>;
+
 /// A host that counts its interrupts and answers whether the scanout was written as the test
 /// sets it.
 struct TestHost {
     interrupts: Arc<AtomicU32>,
     written: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
-    presented: Arc<Mutex<Vec<u32>>>,
+    presented: Presented,
     refreshes: Arc<AtomicU32>,
 }
 
@@ -72,8 +75,8 @@ impl Host for TestHost {
     fn refreshed(&self) {
         self.refreshes.fetch_add(1, Ordering::SeqCst);
     }
-    fn present_surface(&self, iosurface_id: u32, answer: PresentAnswer) {
-        self.presented.lock().push(iosurface_id);
+    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+        self.presented.lock().push((iosurface_id, generation));
         answer.answer(if iosurface_id == 0 || iosurface_id == HELD_SURFACE {
             RGFX_STATUS_OK
         } else {
@@ -90,7 +93,7 @@ struct Rig {
     interrupts: Arc<AtomicU32>,
     written: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
-    presented: Arc<Mutex<Vec<u32>>>,
+    presented: Presented,
     /// The refreshes the host was told of.
     refreshes: Arc<AtomicU32>,
     /// The guest's count of the submission ring.
@@ -333,7 +336,8 @@ fn present_surface(display: u32, iosurface_id: u32) -> Vec<u8> {
 
 /// `PRESENT_SURFACE` hands display 0's surface to the host and answers whether it shows it: a
 /// surface it holds, and 0 (the scanout again), succeed; one it holds no texture over is an
-/// invalid argument; another display is refused before the host is asked
+/// invalid argument; another display is refused before the host is asked. A present that carries
+/// the surface's CPU generation hands it to the host
 #[test]
 fn present_surface_asks_the_host_and_answers_its_word() {
     let mut rig = Rig::new();
@@ -346,7 +350,19 @@ fn present_surface_asks_the_host_and_answers_its_word() {
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_NO_DISPLAY));
     let seqno = rig.send(present_surface(0, 0));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
-    assert_eq!(*rig.presented.lock(), [HELD_SURFACE, 5, 0]);
+    let mut with_generation = present_surface(0, HELD_SURFACE);
+    with_generation.extend_from_slice(RgfxPresentSurfaceGen { cpu_gen: 12 }.as_bytes());
+    let seqno = rig.send(with_generation);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        *rig.presented.lock(),
+        [
+            (HELD_SURFACE, None),
+            (5, None),
+            (0, None),
+            (HELD_SURFACE, Some(12))
+        ]
+    );
 }
 
 /// The registers read as the wire says, and `STATUS` follows the guest's writes
@@ -1408,11 +1424,13 @@ fn control_completion_posts_from_several_threads_land_whole() {
 }
 
 /// The device's feature bits are its host's; a `SURFACE_PAGES` hands the host the runs it lists
-/// in its block, read out of the region, and is answered with the host's answer; one whose runs
-/// lie past the block, or a block outside the processes' blocks, hands nothing and is refused
+/// in its block, read out of the region, and whether the message marks the block cached, and is
+/// answered with the host's answer; one whose runs lie past the block, or a block outside the
+/// processes' blocks, hands nothing and is refused. A `SURFACE_DOWNLOAD` hands the host its block
+/// and is answered with the host's answer
 #[test]
 fn surface_pages_hand_the_host_their_runs() {
-    type Seen = Arc<Mutex<Vec<(RgfxSurfacePages, Vec<RgfxPageRun>)>>>;
+    type Seen = Arc<Mutex<Vec<(RgfxSurfacePages, Vec<RgfxPageRun>, bool)>>>;
     struct Pages(Seen);
     impl Host for Pages {
         fn raise_interrupt(&self, _vector: u32) {}
@@ -1422,9 +1440,23 @@ fn surface_pages_hand_the_host_their_runs() {
         fn features(&self) -> u64 {
             u64::from(RGFX_FEATURE_SURFACE_PAGES) | (1 << 40)
         }
-        fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>) -> u32 {
-            self.0.lock().push((*pages, runs));
+        fn surface_pages(
+            &self,
+            pages: &RgfxSurfacePages,
+            runs: Vec<RgfxPageRun>,
+            cached: bool,
+        ) -> u32 {
+            self.0.lock().push((*pages, runs, cached));
             RGFX_STATUS_OK
+        }
+        fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
+            let runs = vec![];
+            let pages = RgfxSurfacePages {
+                block_offset,
+                ..Default::default()
+            };
+            self.0.lock().push((pages, runs, true));
+            answer.answer(RGFX_STATUS_NOT_FOUND);
         }
     }
     let seen: Seen = Arc::default();
@@ -1462,6 +1494,33 @@ fn surface_pages_hand_the_host_their_runs() {
     };
     let seqno = rig.send(pages(BLOCK, BLOCK + 0x1000, 2).as_bytes().to_vec());
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    // The same, marked cached.
+    let mut cached = pages(BLOCK, BLOCK + 0x1000, 2).as_bytes().to_vec();
+    cached.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_CACHED,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    let seqno = rig.send(cached);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    let seqno = rig.send(
+        RgfxSurfaceDownload {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SURFACE_DOWNLOAD,
+                ..Default::default()
+            },
+            block_offset: BLOCK,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    assert_eq!(
+        rig.complete(),
+        (seqno, RGFX_STATUS_NOT_FOUND),
+        "the host's answer"
+    );
     // Runs past the block, and a block outside the processes' blocks: refused, nothing handed.
     let seqno = rig.send(pages(BLOCK, BLOCK + 0x1ff0, 2).as_bytes().to_vec());
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
@@ -1474,10 +1533,13 @@ fn surface_pages_hand_the_host_their_runs() {
     let seen = seen.lock();
     assert_eq!(
         seen.len(),
-        1,
-        "only the SURFACE_PAGES whose runs lie in its block"
+        3,
+        "only the SURFACE_PAGES whose runs lie in its block, and the download"
     );
     assert_eq!(seen[0].0.block_offset, BLOCK);
     assert_eq!(seen[0].0.context, 3);
     assert_eq!(seen[0].1, runs);
+    assert!(!seen[0].2, "a message without the cache's flags");
+    assert_eq!((seen[1].1.as_slice(), seen[1].2), (&runs[..], true));
+    assert_eq!((seen[2].0.block_offset, seen[2].1.len()), (BLOCK, 0));
 }
