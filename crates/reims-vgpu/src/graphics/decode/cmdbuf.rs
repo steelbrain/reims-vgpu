@@ -1915,6 +1915,124 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 0x5a));
     }
 
+    /// A `BUFFER_CREATE` of `length` bytes, id `obj_id`, at `gpu_address` (0: where the host
+    /// places it).
+    #[cfg(feature = "vulkan")]
+    fn buffer_at(obj_id: u64, gpu_address: u64, length: u64) -> RgfxBufferCreate {
+        RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            gpu_address,
+            length,
+            ..RgfxBufferCreate::default()
+        }
+    }
+
+    /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
+    /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), a
+    /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
+    /// pin of: the runtime makes its bytes at an address it picks itself.
+    #[cfg(feature = "vulkan")]
+    fn decoder_with_a_texture_buffer() -> (
+        GraphicsDecoder<reims_vgpu_vulkan::VulkanPlatform>,
+        <reims_vgpu_vulkan::VulkanPlatform as Platform>::Device,
+    ) {
+        use crate::platform::ApiPlatform as _;
+        use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        let platform = reims_vgpu_vulkan::VulkanPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        dec.hold_resource_ids(0, 0);
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let texture = RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 10,
+            gpu_address: RGFX_CONTEXT_VA_BASE,
+            resource_id: 1,
+            desc: RgfxTextureDescriptor {
+                // RGBA8Unorm, MTLTextureTypeTextureBuffer, ShaderRead, Shared.
+                pixel_format: 70,
+                texture_type: 9,
+                width: 1 << 18,
+                height: 1,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+            ..RgfxTextureCreate::default()
+        };
+        assert_eq!(dec.decode(&device, texture.as_bytes()).unwrap(), Ok(()));
+        (dec, device)
+    }
+
+    /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
+    /// pinned at the pick after a texture buffer's is made, though the runtime made the texture
+    /// buffer's bytes where it picks.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
+        use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let (mut dec, device) = decoder_with_a_texture_buffer();
+        let buffer = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+    }
+
+    /// The host's own ranges lie below every slot's GPU addresses: a buffer the host places
+    /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, every
+    /// slot's first pick and the last slot's last pick are made.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_the_host_s_own_ranges_lie_below_every_slot() {
+        use reims_graphics::wire::{
+            RGFX_CONTEXT_SLOTS, RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_SPAN,
+        };
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let (mut dec, device) = decoder_with_a_texture_buffer();
+        let placed = buffer_at(11, 0, 64 << 20);
+        assert_eq!(dec.decode(&device, placed.as_bytes()).unwrap(), Ok(()));
+        let Some(ObjHandle::Buffer(buffer)) = dec.objects.get(&11) else {
+            panic!("no buffer 11");
+        };
+        assert!(buffer.gpu_address() < RGFX_CONTEXT_VA_BASE);
+        // A pick of 64 KiB holds 96 KiB: its four pages, the guard page, rounded up to 32 KiB.
+        let slots = u64::from(RGFX_CONTEXT_SLOTS);
+        let last = RGFX_CONTEXT_VA_BASE + slots * RGFX_CONTEXT_VA_SPAN - 0x1_8000;
+        let picks = (0..slots).map(|s| RGFX_CONTEXT_VA_BASE + s * RGFX_CONTEXT_VA_SPAN);
+        for (obj_id, at) in (20..).zip(picks.chain([last])) {
+            let pinned = buffer_at(obj_id, at, 0x1_0000);
+            assert_eq!(
+                dec.decode(&device, pinned.as_bytes()).unwrap(),
+                Ok(()),
+                "the pin at {at:#x}"
+            );
+        }
+    }
+
     /// The render-pass descriptor is built from the wire schema: its colour
     /// attachment carries the wire load and store actions.
     #[test]

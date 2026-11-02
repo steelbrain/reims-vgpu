@@ -6026,7 +6026,7 @@ void test_automatic_shared_heap_buffers_are_its_bytes()
 
 // A heap's GPU address goes back once its destroy is retired: churned 1 GiB heaps, each made
 // while the one before it lives, take spans that never meet a live one and are picked again
-// once the picks have gone round the context's 64 GiB, so the churn never runs out. One a
+// once the picks have gone round the context's range, so the churn never runs out. One a
 // command buffer in flight holds back keeps its span till the buffer completes.
 void test_addresses_reused_after_destroy()
 {
@@ -6042,7 +6042,9 @@ void test_addresses_reused_after_destroy()
 	RgfxHeap *held = nil;
 	uint64_t heldAt = 0;
 	bool reused = false;
-	for (int i = 0; i < 200; i++) {
+	// Once round the range, and a few more.
+	const uint64_t rounds = RGFX_CONTEXT_VA_SPAN / span + 8;
+	for (uint64_t i = 0; i < rounds; i++) {
 		@autoreleasepool {
 			RgfxHeap *heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
 			uint64_t at = heapAddress();
@@ -6054,7 +6056,7 @@ void test_addresses_reused_after_destroy()
 			drainRing(fx.ring);
 		}
 	}
-	CHECK(reused && seen.size() < 200 && held != nil);
+	CHECK(reused && seen.size() < rounds && held != nil);
 	@autoreleasepool {
 		held = nil;
 	}

@@ -770,11 +770,18 @@
 #define RGFX_CONTEXT_SLOTS 32
 
 // Where slot 0's GPU addresses start; slot `s`'s start [`RGFX_CONTEXT_VA_SPAN`] bytes a slot
-// later.
-#define RGFX_CONTEXT_VA_BASE 4294967296
+// later. The slots fill the top half of the Metal address space, `[2^46, 2^47)`, which no range
+// the host places itself reaches: the platform's runtime places its own buffers of Metal's space
+// lowest first from 2^32, and the Vulkan platform's model of Metal's layout places the host's
+// unpinned buffers and textures lowest first from 2^40, each as far as its live ranges reach,
+// which the host's memory bounds far below 2^46. A guest's pin meets only the guest's own
+// ranges then.
+#define RGFX_CONTEXT_VA_BASE 70368744177664
 
-// The GPU addresses each slot picks from.
-#define RGFX_CONTEXT_VA_SPAN 68719476736
+// The GPU addresses each slot picks from: 2 TiB, so a process's picks, which go forward through
+// its slot before they come round to a range given back, come round only after 2^26 picks of
+// the least span.
+#define RGFX_CONTEXT_VA_SPAN 2199023255552
 
 // The first texture resource id the host refuses: every process's textures share the host
 // device's one space of ids, and Metal ends the process for a texture placed at 16381 or more

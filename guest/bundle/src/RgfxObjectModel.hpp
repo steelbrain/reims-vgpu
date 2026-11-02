@@ -108,9 +108,9 @@ public:
 	/// any number is minted.
 	void setBases(uint64_t obj_id_base, uint64_t address_base);
 
-	/// Where this space's GPU addresses begin by default: above the low 4 GiB,
-	/// clear of any identity-mapped low range and of zero.
-	static constexpr uint64_t kDefaultAddressBase = 0x1'0000'0000ull;
+	/// Where this space's GPU addresses begin by default: slot 0's, where no range
+	/// the host places itself lies (RGFX_CONTEXT_VA_BASE).
+	static constexpr uint64_t kDefaultAddressBase = RGFX_CONTEXT_VA_BASE;
 
 private:
 	/// The context's address range from `base`, every byte free. Caller holds m_addressLock
