@@ -1330,6 +1330,40 @@ fn a_command_buffer_waits_for_the_creates_before_it() {
     );
 }
 
+/// A reset wakes a command buffer's wait for the creates before it, though the control thread is
+/// still in one: its queue's thread stops waiting and hands the buffer on, whose answers the reset
+/// drops.
+#[test]
+fn a_reset_wakes_a_command_buffer_waiting_for_the_creates_before_it() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    seen.gate.store(false, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1));
+    seen.wait("the buffer create never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
+    });
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE]
+    );
+
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    seen.wait(
+        "the command buffer still waits for ring 0 past a reset",
+        |seen| seen.handed.lock().contains(&RGFX_CMD_COMMAND_BUFFER),
+    );
+    seen.gate.store(true, Ordering::SeqCst);
+}
+
 /// The control completion ring takes posts from several threads at once (the control thread's
 /// answers and the host's compile threads' replies): each lands whole, once, in its thread's order.
 #[test]

@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
@@ -95,7 +95,8 @@ use crate::wire::*;
 /// `-machine max-ram-below-4g=1G`). With q35's default of 2 GiB there the BAR gets no address.
 pub const REGION_SIZE: u64 = 1 << 30;
 
-/// How long the control thread waits before it looks for room in the completion ring again.
+/// How long a thread waits before it looks for room in a full completion ring again: the guest
+/// makes room by moving the ring's consumer count, which wakes nothing.
 const ROOM_POLL: Duration = Duration::from_millis(1);
 
 /// The smallest a command queue's data ring may be: a power of two large enough to hold a
@@ -257,6 +258,11 @@ pub(crate) struct Shared {
     /// carried out or handed to the host: a command buffer waits for it to pass what was
     /// published before it.
     control_done: AtomicU64,
+    /// Held by a queue thread while it looks at `control_done` and sleeps for it to move, and by
+    /// whoever signals a move, so a move between the look and the sleep still wakes it.
+    control_moved: Mutex<()>,
+    /// Signalled each time `control_done` moves, the device resets or it ends.
+    control_moved_signal: Condvar,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
@@ -395,6 +401,8 @@ impl Device {
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
             control_done: AtomicU64::new(0),
+            control_moved: Mutex::new(()),
+            control_moved_signal: Condvar::new(),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
         });
@@ -593,6 +601,15 @@ impl Shared {
         for queue in self.queues.lock().by_obj.values() {
             queue.end();
         }
+        self.signal_control_moved();
+    }
+
+    /// Wakes the queue threads waiting for `control_done` to move, after it moves, a reset or the
+    /// device's end. A queue ends either here, at a reset, or on the control thread, which moves
+    /// `control_done` once the message that ended it is done.
+    fn signal_control_moved(&self) {
+        drop(self.control_moved.lock());
+        self.control_moved_signal.notify_all();
     }
 
     fn ending(&self) -> bool {
@@ -626,6 +643,7 @@ impl Shared {
         queues.by_obj.clear();
         queues.by_ring.clear();
         drop(queues);
+        self.signal_control_moved();
         self.screen.scanout(None);
         self.screen.cursor_image(None);
         self.screen.cursor_moved(0, 0, true);
@@ -678,6 +696,7 @@ impl Shared {
                         // A reset meanwhile restarted the count; this message's is moot.
                         if self.epoch.load(Ordering::Acquire) == epoch {
                             self.control_done.store(through, Ordering::Release);
+                            self.signal_control_moved();
                         }
                         (answer, epoch)
                     }
@@ -685,6 +704,7 @@ impl Shared {
                         let answer = control::answer(self, &message);
                         self.control_done
                             .store(submit.consumer.consumed(), Ordering::Release);
+                        self.signal_control_moved();
                         (answer, epoch)
                     }
                     Ok(None) => return,
@@ -1154,15 +1174,18 @@ impl Shared {
             // Wait for the control thread to have carried out every message up to there, so the
             // resource is registered before the buffer's ops name it. This thread only reads ring
             // 0's counts; it never consumes that ring, so it keeps one consumer and its
-            // `consumer_idle` handshake is untouched.
+            // `consumer_idle` handshake is untouched. It sleeps until the control thread signals
+            // a move of `control_done`, a reset or the end.
             let epoch = self.epoch.load(Ordering::Acquire);
             let created_through = self.submit.lock().consumer.published_count(&self.region);
+            let mut moved = self.control_moved.lock();
             while self.control_done.load(Ordering::Acquire) < created_through {
                 if self.ending() || queue.ended() || self.epoch.load(Ordering::Acquire) != epoch {
                     break;
                 }
-                std::thread::sleep(ROOM_POLL);
+                self.control_moved_signal.wait(&mut moved);
             }
+            drop(moved);
             // A buffer too large for the ring: its message, from the block, with nothing held,
             // once the block's grant (posted before the buffer) has been carried out.
             let message = if message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION {
