@@ -315,7 +315,11 @@ is its transport:
   library itself, with no BQL: an access waits at most for the command the
   control thread is taking. A write of 0, the control ring's id, to
   DOORBELL (0x20) is taken by an ioeventfd (an eventfd on Linux, a pipe on
-  a Mac), whose file the library's control thread polls.
+  a Mac), whose file the library's control thread polls. A write of a
+  command queue's ring goes to `rvg_graphics_device_mmio_write_taking`,
+  which may take the queue's next command buffer on the vCPU, where nothing
+  need be waited for, and post its `CB_SUBMITTED` there, raising the
+  interrupt inside the write.
 - **BAR 2**, 64-bit and prefetchable: the library's region, 256 MiB of
   private anonymous memory of QEMU's process, as two RAM regions over the
   one mapping: the control rings, below 0x20000, and the guest's
@@ -329,8 +333,11 @@ is its transport:
   pages in place. The graphics device takes no dirty source: resolving the
   pages behind each IOSurface's import cost its thread about 5 ms a command
   buffer on a discrete GPU, more than the whole copies it saved.
-- An interrupt the library raises, on its control or refresh thread, is
-  sent by a BH under the BQL.
+- An interrupt the library raises, on a thread of its own or on the vCPU
+  inside a DOORBELL write, is written to the vector's irqfd where KVM's
+  in-kernel irqchip injects MSI-X through one and MSI-X is enabled, and KVM
+  injects it on the raising thread; elsewhere (HVF, TCG) a BH sends it under
+  the BQL. Neither waits for a lock.
 - Under `-display none` the library opens a window for the display, unless
   `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. The window keeps the size
   the person gives it, and the display offers the guest that size in pixels
