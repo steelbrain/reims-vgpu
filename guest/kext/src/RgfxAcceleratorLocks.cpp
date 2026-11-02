@@ -56,15 +56,18 @@ constexpr UInt32 kWaitMs = 2000;
 constexpr UInt32 kPollUs = 1000;
 // The most queues one surface's lock looks at the completions of.
 constexpr UInt32 kMaxLookedAt = 16;
-// The most cached surfaces at once (every shared block in place may be one), and how long a
-// lock waits for a download's answer: the host copies once the buffers that used the cache
-// before have finished.
-constexpr UInt32 kMaxCached = 1024;
+// The most cached surfaces at once (kRgfxCachedMaxSurfaces: every shared block in place may be
+// one, held, dormant or released and not yet answered), and how long a lock waits for a
+// download's answer: the host copies once the buffers that used the cache before have finished.
+constexpr UInt32 kMaxCached = kRgfxCachedMaxSurfaces;
 constexpr UInt32 kDownloadAnswerMs = 2000;
 // How many device caches made are logged, with what IOSurface answered, and how many writes
 // named of surfaces the kext cannot follow.
 constexpr UInt32 kCachesLogged = 4;
 constexpr UInt32 kSkipsLogged = 8;
+// How many surfaces left uncached for want of room are logged one by one; the dormancy line
+// counts them all.
+constexpr UInt32 kNoRoomLogged = 4;
 
 // One initialised object (it lands in __DATA,__data, as the contexts' state does), made at the
 // first write named and kept for the kernel's life.
@@ -85,9 +88,12 @@ struct LockState {
 	// Under `lock`: the surfaces whose blocks have a device cache on the host. The waiting locks
 	// sleep on `table` for these too.
 	RgfxCacheTable caches;
+	// Under `lock`: surfaces left uncached as the table had no room, the first kNoRoomLogged
+	// logged.
+	uint64_t noRoom;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0};
 
 bool startLocks()
 {
@@ -386,10 +392,13 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
 	const char *why = nullptr;
 	RgfxCachedSurface *c = nullptr;
-	if (rgfxCacheFind(state.caches, key))
+	bool logged = true;
+	if (rgfxCacheFind(state.caches, key)) {
 		why = "its previous block is cached still, its release unanswered";
-	else if (!(c = rgfxCacheAdd(state.caches, key, offset, surfaceId)))
+	} else if (!(c = rgfxCacheAdd(state.caches, key, offset, surfaceId))) {
 		why = "no room for its device cache's state";
+		logged = ++state.noRoom <= kNoRoomLogged;
+	}
 	if (c) {
 		c->genAt = genAt;
 		c->map = header;
@@ -397,10 +406,21 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	}
 	IOLockUnlock(state.lock);
 	if (why) {
-		IOLog("RgfxAccelerator: IOSurface %u: %s: it is not cached\n", surfaceId, why);
+		if (logged)
+			IOLog("RgfxAccelerator: IOSurface %u: %s: it is not cached\n", surfaceId, why);
 		unwireSurface(wire);
 	}
 	return c != nullptr;
+}
+
+UInt64 rgfxSurfaceCacheNoRoom()
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return 0;
+	IOLockLock(state.lock);
+	const UInt64 n = state.noRoom;
+	IOLockUnlock(state.lock);
+	return n;
 }
 
 void rgfxSurfaceCacheReleased(UInt64 offset)

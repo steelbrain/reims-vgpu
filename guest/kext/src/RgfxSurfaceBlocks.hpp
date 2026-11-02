@@ -109,6 +109,16 @@ struct RgfxSurfaceTable {
 
 // The most dormant blocks kept at once.
 constexpr uint32_t kRgfxDormantMaxBlocks = 1024;
+// The most planes with a shared block at once, held or dormant: 512 held past the dormant ones.
+constexpr uint32_t kRgfxSurfaceMaxBlocks = 512 + kRgfxDormantMaxBlocks;
+// The most cached surfaces at once (RgfxSurfaceCaches.hpp): one for every block the table holds,
+// any of them cached, and as many again whose release is posted and not yet answered, as a
+// surface stays cached from its block's let-go until then. Fewer, and dormant blocks, which are
+// all cached, would take the states of the surfaces made next. More releases unanswered at once
+// than the table holds blocks (a host slow to answer a storm of let-gos) can still fill it: a
+// surface made then has its block in place uncached, which is correct, only slower, and the
+// kext counts it (the dormancy line's "not cached: no room").
+constexpr uint32_t kRgfxCachedMaxSurfaces = 2 * kRgfxSurfaceMaxBlocks;
 
 // Why a dormant block was let go: the kext counts each (RgfxAccelerator::dormantStats).
 enum RgfxDormantCause : uint32_t {

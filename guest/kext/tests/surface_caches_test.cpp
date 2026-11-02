@@ -145,6 +145,33 @@ void dormancy()
 	          e->dormant,
 	      "made nonvolatile, it sleeps");
 }
+
+// The table the kext sizes (kRgfxCachedMaxSurfaces) has a state for every block the surface table
+// holds, the dormant ones at their cap among them, and for as many again released and not yet
+// answered: a new surface past the dormant cap is still cached.
+void room()
+{
+	static RgfxCachedSurface entries[kRgfxCachedMaxSurfaces];
+	RgfxCacheTable t = {entries, 0, kRgfxCachedMaxSurfaces};
+	bool purgeable = false;
+	uint64_t key = 0x10000;
+	bool ok = true;
+	for (uint32_t i = 0; i < kRgfxDormantMaxBlocks; i++, key++)
+		ok &= rgfxCacheAdd(t, key, key << 12, static_cast<uint32_t>(key)) != nullptr &&
+		      rgfxCacheSleep(t, key, true, &purgeable);
+	check(ok, "the dormant blocks at their cap are cached");
+	int surfaceObject = 0;
+	void *map = nullptr, *wire = nullptr;
+	for (uint32_t i = 0; i < kRgfxSurfaceMaxBlocks; i++, key++)
+		ok &= rgfxCacheAdd(t, key, key << 12, static_cast<uint32_t>(key)) != nullptr &&
+		      !rgfxCacheLetGo(t, key, true, &surfaceObject, &map, &wire);
+	check(ok, "so are as many blocks as the surface table holds, released and unanswered");
+	for (uint32_t i = kRgfxDormantMaxBlocks; i < kRgfxSurfaceMaxBlocks; i++, key++)
+		ok &= rgfxCacheAdd(t, key, key << 12, static_cast<uint32_t>(key)) != nullptr;
+	check(ok && t.count == t.capacity, "and every block held past the dormant ones");
+	check(rgfxCacheAdd(t, key, key << 12, static_cast<uint32_t>(key)) == nullptr,
+	      "past them, none");
+}
 } // namespace
 
 int main()
@@ -245,6 +272,7 @@ int main()
 	      "a block let go with no release lets the cache, the surface and the wiring go at once");
 
 	dormancy();
+	room();
 	std::printf("surface_caches_test: OK (%d checks)\n", checks);
 	return 0;
 }

@@ -163,6 +163,8 @@ struct DormantStats {
 	UInt64 unreadWritten;
 	UInt64 changes;
 	UInt64 loggedChanges;
+	// The surfaces left uncached for want of room (rgfxSurfaceCacheNoRoom) at the last line.
+	UInt64 loggedNoRoom;
 	UInt64 loggedAt;
 };
 DormantStats dormantStats = {};
@@ -532,7 +534,7 @@ void RgfxAccelerator::unpinBlock(const RgfxBlockPin &pin)
 
 namespace {
 // The most planes with a shared block at once, held or dormant, and the most bytes of one plane.
-constexpr UInt32 kMaxSurfaceBlocks = 512 + kRgfxDormantMaxBlocks;
+constexpr UInt32 kMaxSurfaceBlocks = kRgfxSurfaceMaxBlocks;
 constexpr UInt64 kMaxPlaneBytes = 256ull << 20;
 
 // The plane of `length` bytes at `address` in `task`, wired: its descriptor, prepared, and its
@@ -685,14 +687,18 @@ void noteDormant()
 	const uint64_t now = mach_absolute_time();
 	uint64_t interval = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(kDormantLogMs) * 1000000ull, &interval);
+	// Read first, holding no other lock.
+	const UInt64 noRoom = rgfxSurfaceCacheNoRoom();
 	IOLockLock(contextLock);
-	const bool log = dormantStats.changes != dormantStats.loggedChanges &&
+	const bool log = (dormantStats.changes != dormantStats.loggedChanges ||
+	                  noRoom != dormantStats.loggedNoRoom) &&
 	                 now - dormantStats.loggedAt >= interval;
 	const DormantStats d = dormantStats;
 	const UInt32 count = surfaceTable.dormantCount;
 	const UInt64 bytes = surfaceTable.dormantBytes;
 	if (log) {
 		dormantStats.loggedChanges = dormantStats.changes;
+		dormantStats.loggedNoRoom = noRoom;
 		dormantStats.loggedAt = now;
 	}
 	IOLockUnlock(contextLock);
@@ -702,13 +708,13 @@ void noteDormant()
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
 		      "volatile), %llu asked otherwise; %llu released with no client left (%llu of them "
-		      "written, not copied)\n",
+		      "written, not copied); %llu not cached: no room\n",
 		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
 		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
 		      d.letGo[kRgfxDormantNoClients],
 		      d.letGo[kRgfxDormantCount], d.letGo[kRgfxDormantBytes],
 		      d.letGo[kRgfxDormantTableFull], d.letGo[kRgfxDormantNoSpace], d.volatileFirst,
-		      d.letGo[kRgfxDormantStale], d.unread, d.unreadWritten);
+		      d.letGo[kRgfxDormantStale], d.unread, d.unreadWritten, noRoom);
 }
 
 // The last holder, of context `context`, of the cached entry `e` let it go: the block sleeps
