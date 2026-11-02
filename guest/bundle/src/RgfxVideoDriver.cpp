@@ -8,12 +8,15 @@
  * AVD_CreateAVDAccelerator for a table of sixteen entry points. It does so in
  * VTDecoderXPCService and VTEncoderXPCService, one of each per client process.
  *
- * This first cut records: it answers the driver's identity, gives AppleGVA a capability block
- * that lists nothing, and writes every call AppleGVA makes, with what its arguments point at,
- * and every read AppleGVA makes of the capability block, with the reading instruction, to
- * rgfx-avd.<pid>.log in the process's temporary directory. Nothing is decoded yet; with no
- * capability listed, AppleGVA gives the session up and VideoToolbox falls back to its software
- * decoders.
+ * This cut records: it answers the driver's identity, gives AppleGVA a capability block that
+ * lists one engine and the functions in kFunctions, and writes every call AppleGVA makes, with
+ * what its arguments point at, and every read AppleGVA makes of the capability block, with the
+ * reading instruction, to rgfx-avd.<pid>.log in the process's temporary directory. Nothing is
+ * decoded yet: every entry answers success and fills nothing in.
+ *
+ * AppleGVA hands this driver a session only where it picks the AMD driver for the flow: on a
+ * board without an Intel GPU, or with com.apple.AppleGVA's gvaForceAMDKE set, which the install
+ * sets.
  *
  * Layouts AppleGVA and the driver share are named by what they hold where that is stated by
  * the calls' use; a field whose meaning nothing states yet is field_xx, xx its byte offset.
@@ -51,8 +54,84 @@ struct DriverIdentity {
 };
 static_assert(sizeof(DriverIdentity) == 0x2c + 4, "identity layout");
 
-// The capability block's size. It is all zero: no engine and no function listed.
-constexpr size_t kCapabilityBytes = 0xb378;
+// The capability block AppleGVA walks: the engines, then the functions (one per codec and
+// direction the driver runs), each a count and an array of record pointers. The records lie in
+// the block too, so the reads of them are recorded with the block's.
+struct Engine {
+	uint32_t type;
+	char name[0x84];
+	uint64_t field_88;
+	uint32_t field_90;
+	uint32_t field_94;
+};
+static_assert(sizeof(Engine) == 0x98, "engine layout");
+
+struct Function {
+	uint32_t function_id;
+	uint32_t field_04;
+	uint64_t sub_id;
+	uint32_t field_10;
+	uint32_t field_14;
+	uint64_t field_18;
+	uint64_t field_20;
+	uint32_t field_28;
+	uint32_t input_format; // the fourcc of what the function takes: 'rawb' for a bitstream
+	uint32_t field_30;
+	uint8_t field_34[0x22c - 0x34];
+	uint32_t output_format_count;
+	uint8_t output_formats[0x200];
+	const Function *field_430;
+};
+static_assert(sizeof(Function) == 0x438, "function layout");
+
+constexpr size_t kMaxEngines = 4;
+constexpr size_t kMaxFunctions = 41;
+
+struct CapabilityBlock {
+	uint32_t engine_count;
+	uint32_t field_04;
+	const Engine *const *engines;
+	uint32_t function_count;
+	uint32_t field_14;
+	const Function *const *functions;
+	Engine engine[kMaxEngines];
+	const Engine *engine_list[kMaxEngines];
+	Function function[kMaxFunctions];
+	const Function *function_list[kMaxFunctions];
+};
+
+// What the block lists while the driver records: one engine, and the functions below. Values
+// that are not yet known stay zero, so the record shows which of them AppleGVA reads.
+struct FunctionAnswer {
+	uint32_t function_id;
+	uint64_t sub_id;
+	uint32_t input_format;
+};
+constexpr FunctionAnswer kFunctions[] = {
+	{1, 0x8, 'rawb'}, // decode, H.264
+};
+
+void fillCapabilities(CapabilityBlock &b)
+{
+	memset(&b, 0, sizeof b);
+	b.engine[0].type = 4;
+	strcpy(b.engine[0].name, "video engine");
+	b.engine_list[0] = &b.engine[0];
+	b.engine_count = 1;
+	b.engines = b.engine_list;
+	for (const FunctionAnswer &a : kFunctions) {
+		Function &f = b.function[b.function_count];
+		f.function_id = a.function_id;
+		f.sub_id = a.sub_id;
+		f.input_format = a.input_format;
+		f.field_28 = 1;
+		f.field_30 = 1;
+		b.function_list[b.function_count++] = &f;
+	}
+	b.functions = b.function_list;
+}
+
+constexpr size_t kCapabilityBytes = sizeof(CapabilityBlock);
 
 // The sixteen entry points, in table order, by what AppleGVA asks of each.
 constexpr const char *kEntryNames[16] = {
@@ -212,6 +291,7 @@ void traceCapabilityReads()
 	if (p == MAP_FAILED)
 		return;
 	g_capabilities = (uint8_t *)p;
+	fillCapabilities(*(CapabilityBlock *)p);
 	struct sigaction sa = {};
 	sa.sa_sigaction = onFault;
 	sa.sa_flags = SA_SIGINFO;
@@ -237,7 +317,18 @@ void writeReads(FILE *f)
 			image = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
 			off = r.pc - (uint64_t)di.dli_fbase;
 		}
-		fprintf(f, "CAPREAD +%04x by %s+0x%llx\n", r.offset, image, (unsigned long long)off);
+		char where[64];
+		const size_t engines = offsetof(CapabilityBlock, engine);
+		const size_t functions = offsetof(CapabilityBlock, function);
+		if (r.offset >= engines && r.offset < engines + sizeof(Engine) * kMaxEngines)
+			snprintf(where, sizeof where, "engine[%zu]+0x%zx", (r.offset - engines) / sizeof(Engine),
+				 (r.offset - engines) % sizeof(Engine));
+		else if (r.offset >= functions && r.offset < functions + sizeof(Function) * kMaxFunctions)
+			snprintf(where, sizeof where, "function[%zu]+0x%zx",
+				 (r.offset - functions) / sizeof(Function), (r.offset - functions) % sizeof(Function));
+		else
+			snprintf(where, sizeof where, "block+0x%x", r.offset);
+		fprintf(f, "CAPREAD %s by %s+0x%llx\n", where, image, (unsigned long long)off);
 	}
 }
 
