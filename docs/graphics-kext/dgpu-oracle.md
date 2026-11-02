@@ -427,6 +427,27 @@ oracle cannot be traced, being protected, so which framework reads the profile f
 measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
 the frontend makes the same bytes under either (Q10).
 
+## Q12: texture descriptors Metal's validation ends the process at
+
+Probe: a scratch probe, not kept, one case a process, with `MTL_DEBUG_LAYER` unset: a 64 x 64
+Private texture by the device's `newTextureWithDescriptor:` and by an Automatic heap's, of the
+three-channel formats 45 and 100, and 2DMultisample ones (4x, 2x and 1x) of BC1, ASTC (186, 222),
+GBGR422, BGRG422 and Unspecialized (263). The guest's x86 macOS 26.6 makes these descriptors
+and sent them on (boot pm29, oracle_caps); the oracles' answers, alike at the device and the heap:
+
+| descriptor | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| a three-channel format (45 to 48, 95 to 100, 120 to 122) | the process ends at the descriptor's setter: "pixelFormat (45) is not a valid MTLPixelFormat." | the same | the process ends at the create: "MTLTextureDescriptor has invalid pixelFormat (45)." |
+| multisample, of a compressed or 4:2:2 format | the process ends at the create, Metal listing each rule broken: the format "does not support multisample textures", "a compressed pixel format set with a sample count greater than one" (at 1x: "sampleCount must be > 1"), compressed formats' types, and the 4:2:2 formats' 2D | the same | the same |
+| multisample, of Unspecialized (263) | the process ends: "invalid pixelFormat (263)", and Invalid "does not support multisample textures" | the same | the process ends: Unspecialized "does not support multisample textures" |
+
+The x86 GPUs name a format they lack (ASTC) as an invalid one, where the M3 names it. Every
+message is `-[MTLTextureDescriptorInternal validateWithDevice:]`'s "Texture Descriptor
+Validation", but the x86 setter's. Our stack: the device's and the heaps' creators end the
+process at each of these with the words of the M3's create, sending the host nothing *(class
+3)*, rather than sending a create the host refuses (`rgfxEndAtInvalidTextureDescriptor`,
+RgfxTexture.h).
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

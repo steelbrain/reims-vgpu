@@ -6,6 +6,7 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxHeap.h"
+#import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxUnsupported.h"
 
@@ -393,7 +394,112 @@ bool rgfxViewFormatsMayMatch(MTLPixelFormat from, MTLPixelFormat to)
 // Why the bundle answers a view nil without asking the host, each logged once.
 enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, kSliceCount, kViews };
 
+// Metal's name of each format no multisample texture has, as its validation names it: the
+// compressed formats (BC, PVRTC, EAC and ETC2, ASTC), the 4:2:2 ones, and Unspecialized.
+struct RgfxNamedFormat {
+	uint32_t format;
+	const char *name;
+};
+const RgfxNamedFormat kNoMultisample[] = {
+    {130, "MTLPixelFormatBC1_RGBA"},       {131, "MTLPixelFormatBC1_RGBA_sRGB"},
+    {132, "MTLPixelFormatBC2_RGBA"},       {133, "MTLPixelFormatBC2_RGBA_sRGB"},
+    {134, "MTLPixelFormatBC3_RGBA"},       {135, "MTLPixelFormatBC3_RGBA_sRGB"},
+    {140, "MTLPixelFormatBC4_RUnorm"},     {141, "MTLPixelFormatBC4_RSnorm"},
+    {142, "MTLPixelFormatBC5_RGUnorm"},    {143, "MTLPixelFormatBC5_RGSnorm"},
+    {150, "MTLPixelFormatBC6H_RGBFloat"},  {151, "MTLPixelFormatBC6H_RGBUfloat"},
+    {152, "MTLPixelFormatBC7_RGBAUnorm"},  {153, "MTLPixelFormatBC7_RGBAUnorm_sRGB"},
+    {160, "MTLPixelFormatPVRTC_RGB_2BPP"}, {161, "MTLPixelFormatPVRTC_RGB_2BPP_sRGB"},
+    {162, "MTLPixelFormatPVRTC_RGB_4BPP"}, {163, "MTLPixelFormatPVRTC_RGB_4BPP_sRGB"},
+    {164, "MTLPixelFormatPVRTC_RGBA_2BPP"}, {165, "MTLPixelFormatPVRTC_RGBA_2BPP_sRGB"},
+    {166, "MTLPixelFormatPVRTC_RGBA_4BPP"}, {167, "MTLPixelFormatPVRTC_RGBA_4BPP_sRGB"},
+    {170, "MTLPixelFormatEAC_R11Unorm"},   {172, "MTLPixelFormatEAC_R11Snorm"},
+    {174, "MTLPixelFormatEAC_RG11Unorm"},  {176, "MTLPixelFormatEAC_RG11Snorm"},
+    {178, "MTLPixelFormatEAC_RGBA8"},      {179, "MTLPixelFormatEAC_RGBA8_sRGB"},
+    {180, "MTLPixelFormatETC2_RGB8"},      {181, "MTLPixelFormatETC2_RGB8_sRGB"},
+    {182, "MTLPixelFormatETC2_RGB8A1"},    {183, "MTLPixelFormatETC2_RGB8A1_sRGB"},
+    {186, "MTLPixelFormatASTC_4x4_sRGB"},  {187, "MTLPixelFormatASTC_5x4_sRGB"},
+    {188, "MTLPixelFormatASTC_5x5_sRGB"},  {189, "MTLPixelFormatASTC_6x5_sRGB"},
+    {190, "MTLPixelFormatASTC_6x6_sRGB"},  {192, "MTLPixelFormatASTC_8x5_sRGB"},
+    {193, "MTLPixelFormatASTC_8x6_sRGB"},  {194, "MTLPixelFormatASTC_8x8_sRGB"},
+    {195, "MTLPixelFormatASTC_10x5_sRGB"}, {196, "MTLPixelFormatASTC_10x6_sRGB"},
+    {197, "MTLPixelFormatASTC_10x8_sRGB"}, {198, "MTLPixelFormatASTC_10x10_sRGB"},
+    {199, "MTLPixelFormatASTC_12x10_sRGB"}, {200, "MTLPixelFormatASTC_12x12_sRGB"},
+    {204, "MTLPixelFormatASTC_4x4_LDR"},   {205, "MTLPixelFormatASTC_5x4_LDR"},
+    {206, "MTLPixelFormatASTC_5x5_LDR"},   {207, "MTLPixelFormatASTC_6x5_LDR"},
+    {208, "MTLPixelFormatASTC_6x6_LDR"},   {210, "MTLPixelFormatASTC_8x5_LDR"},
+    {211, "MTLPixelFormatASTC_8x6_LDR"},   {212, "MTLPixelFormatASTC_8x8_LDR"},
+    {213, "MTLPixelFormatASTC_10x5_LDR"},  {214, "MTLPixelFormatASTC_10x6_LDR"},
+    {215, "MTLPixelFormatASTC_10x8_LDR"},  {216, "MTLPixelFormatASTC_10x10_LDR"},
+    {217, "MTLPixelFormatASTC_12x10_LDR"}, {218, "MTLPixelFormatASTC_12x12_LDR"},
+    {222, "MTLPixelFormatASTC_4x4_HDR"},   {223, "MTLPixelFormatASTC_5x4_HDR"},
+    {224, "MTLPixelFormatASTC_5x5_HDR"},   {225, "MTLPixelFormatASTC_6x5_HDR"},
+    {226, "MTLPixelFormatASTC_6x6_HDR"},   {228, "MTLPixelFormatASTC_8x5_HDR"},
+    {229, "MTLPixelFormatASTC_8x6_HDR"},   {230, "MTLPixelFormatASTC_8x8_HDR"},
+    {231, "MTLPixelFormatASTC_10x5_HDR"},  {232, "MTLPixelFormatASTC_10x6_HDR"},
+    {233, "MTLPixelFormatASTC_10x8_HDR"},  {234, "MTLPixelFormatASTC_10x10_HDR"},
+    {235, "MTLPixelFormatASTC_12x10_HDR"}, {236, "MTLPixelFormatASTC_12x12_HDR"},
+    {240, "MTLPixelFormatGBGR422"},        {241, "MTLPixelFormatBGRG422"},
+    {263, "MTLPixelFormatUnspecialized"},
+};
+
 } // namespace
+
+// Metal's validation lists each rule a descriptor breaks, a line each, in this order (measured:
+// a 4x and a 2x 2DMultisample texture of BC1, GBGR422 and Unspecialized, a 1x one of BC1, and 2D
+// ones of 45 and 100; the x86 GPUs name a format they lack, ASTC among them, as an invalid one).
+void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
+{
+	if (descriptor == nil) {
+		return;
+	}
+	const uint64_t format = descriptor.pixelFormat;
+	const MTLTextureType type = descriptor.textureType;
+	const bool multisample =
+	    type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
+	const bool threeChannel = (format >= 45 && format <= 48) ||
+	                          (format >= 95 && format <= 100) || (format >= 120 && format <= 122);
+	const char *name = nullptr;
+	for (const RgfxNamedFormat &f : kNoMultisample) {
+		if (f.format == format) {
+			name = f.name;
+		}
+	}
+	if (!threeChannel && !(multisample && name != nullptr)) {
+		return;
+	}
+	NSMutableString *words = [NSMutableString stringWithString:@"Texture Descriptor Validation\n"];
+	if (threeChannel) {
+		[words appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n",
+		                    (unsigned long long)format];
+		if (multisample) {
+			[words appendString:@"MTLTextureDescriptor pixelFormat (MTLPixelFormatInvalid) does "
+			                    @"not support multisample textures.\n"];
+		}
+	} else {
+		[words appendFormat:@"MTLTextureDescriptor pixelFormat (%s) does not support multisample "
+		                    @"textures.\n",
+		                    name];
+		const bool subsampled = format == 240 || format == 241;
+		const bool blocks = format != 263; // compressed, or 4:2:2
+		if (descriptor.sampleCount > 1 && blocks) {
+			[words appendString:@"MTLTextureDescriptor has a compressed pixel format set with a "
+			                    @"sample count greater than one.\n"];
+		} else if (descriptor.sampleCount <= 1) {
+			[words appendString:@"MTLTextureDescriptor sampleCount must be > 1 for multisample "
+			                    @"textures.\n"];
+		}
+		if (blocks) {
+			[words appendString:@"MTLTextureDescriptor: compressed pixel formats require texture "
+			                    @"type of MTLTextureType2D[Array], MTLTextureType3D or "
+			                    @"MTLTextureTypeCube[Array].\n"];
+		}
+		if (subsampled) {
+			[words appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires "
+			                    @"MTLTextureType2D.\n"];
+		}
+	}
+	RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]", words);
+}
 
 @interface RgfxTexture () <RgfxMetalTextureInternals>
 @end

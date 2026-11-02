@@ -777,6 +777,32 @@ static int dies_case(const char *name)
 		desc.mipmapLevelCount = 2;
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:64];
 	}
+	// A texture of a placement heap, in the format and type the case names.
+	auto heapTexture = [&](MTLPixelFormat format, NSUInteger samples) {
+		MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+		hd.size = 0x100000;
+		hd.storageMode = MTLStorageModePrivate;
+		hd.type = MTLHeapTypePlacement;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&fx.ser];
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		if (samples > 0) {
+			td.textureType = MTLTextureType2DMultisample;
+			td.sampleCount = samples;
+			td.usage = MTLTextureUsageRenderTarget;
+		}
+		(void)[heap newTextureWithDescriptor:td offset:0];
+	};
+	if (std::strcmp(name, "texture-three-channel") == 0)
+		heapTexture(static_cast<MTLPixelFormat>(45), 0);
+	if (std::strcmp(name, "texture-multisample-compressed") == 0)
+		heapTexture(MTLPixelFormatBC1_RGBA, 4);
+	if (std::strcmp(name, "texture-multisample-422") == 0)
+		heapTexture(MTLPixelFormatGBGR422, 2);
 	}
 	return 0;
 }
@@ -789,6 +815,53 @@ void test_mipmapped_buffer_texture_ends_the_process()
 	checkDies("buffer-texture-levels",
 	          "_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor "
 	          "Validation\nLinear texture: cannot be mipmapped, mipmapLevelCount (2) disallowed\n'");
+}
+
+// A texture Metal's descriptor validation ends the process at on every Mac (a three-channel
+// format; a multisample one of a compressed or 4:2:2 format) ends it with Metal's words, the rules
+// it breaks a line each (docs/graphics-kext/dgpu-oracle.md, Q12); the check passes every other.
+void test_invalid_texture_descriptors_end_the_process()
+{
+	checkDies("texture-three-channel",
+	          "-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion `Texture "
+	          "Descriptor Validation\nMTLTextureDescriptor has invalid pixelFormat (45).\n'");
+	checkDies("texture-multisample-compressed",
+	          "-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion `Texture "
+	          "Descriptor Validation\n"
+	          "MTLTextureDescriptor pixelFormat (MTLPixelFormatBC1_RGBA) does not support "
+	          "multisample textures.\n"
+	          "MTLTextureDescriptor has a compressed pixel format set with a sample count greater "
+	          "than one.\n"
+	          "MTLTextureDescriptor: compressed pixel formats require texture type of "
+	          "MTLTextureType2D[Array], MTLTextureType3D or MTLTextureTypeCube[Array].\n'");
+	checkDies("texture-multisample-422",
+	          "MTLTextureDescriptor pixelFormat (MTLPixelFormatGBGR422) does not support "
+	          "multisample textures.\n"
+	          "MTLTextureDescriptor has a compressed pixel format set with a sample count greater "
+	          "than one.\n"
+	          "MTLTextureDescriptor: compressed pixel formats require texture type of "
+	          "MTLTextureType2D[Array], MTLTextureType3D or MTLTextureTypeCube[Array].\n"
+	          "MTLTextureDescriptor: MTLPixelFormat422 requires MTLTextureType2D.\n'");
+
+	// What Metal makes passes: a compressed 2D texture, a multisample one of a plain format, and
+	// the formats beside the three-channel ones.
+	auto passes = [](MTLPixelFormat format, MTLTextureType type, NSUInteger samples) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.textureType = type;
+		td.sampleCount = samples;
+		rgfxEndAtInvalidTextureDescriptor(td);
+		g_checks++;
+	};
+	passes(MTLPixelFormatBC1_RGBA, MTLTextureType2D, 1);
+	passes(MTLPixelFormatGBGR422, MTLTextureType2D, 1);
+	passes(MTLPixelFormatRGBA8Unorm, MTLTextureType2DMultisample, 4);
+	passes(MTLPixelFormatBGR5A1Unorm, MTLTextureType2D, 1); // 43
+	passes(MTLPixelFormatRGBA16Unorm, MTLTextureType2D, 1);  // 110
+	passes(MTLPixelFormatRG32Uint, MTLTextureType2D, 1);     // 103
 }
 
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
@@ -7711,6 +7784,7 @@ int main(int argc, char **argv)
 		test_texture_cpu_copies();
 		test_tiled_texture_over_backing();
 		test_mipmapped_buffer_texture_ends_the_process();
+		test_invalid_texture_descriptors_end_the_process();
 		test_texture_views();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();

@@ -76,6 +76,8 @@
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
+	// Where Metal's validation ends the process, so does the bundle, sending nothing.
+	rgfxEndAtInvalidTextureDescriptor(descriptor);
 	// A Managed texture's CPU copy is a region block; one of a format or shape no CPU copy
 	// holds is made without one.
 	if (descriptor != nil && descriptor.storageMode == MTLStorageModeManaged &&

@@ -117,6 +117,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 @end
 
+/// Ends the process, with Metal's words, at a descriptor Metal's texture descriptor validation
+/// ends it at on every Mac (measured on the AMD, Intel and M3 GPUs at the device's and a heap's
+/// newTextureWithDescriptor:, docs/graphics-kext/dgpu-oracle.md, Q12): one of a three-channel
+/// format (45 to 48, 95 to 100 and 120 to 122), which Metal's setter takes and Metal describes no
+/// format for, and a multisample one of a compressed or 4:2:2 format, or of
+/// MTLPixelFormatUnspecialized. The device's and the heaps' texture creators call it before they
+/// send the host anything; it returns for any other descriptor.
+void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor);
+
 NS_ASSUME_NONNULL_END
 
 #endif // RGFX_TEXTURE_H_
