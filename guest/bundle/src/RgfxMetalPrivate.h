@@ -104,6 +104,14 @@ NS_ASSUME_NONNULL_END
 // measured: macOS 26 Metal.framework, required, `@32@0:8Q16Q24`: a texture over a legacy
 // IOAccel surface, by its id and buffer (CoreDisplay's display surfaces).
 - (nullable id<MTLTexture>)newTextureWithSurface:(NSUInteger)surfaceId buffer:(NSUInteger)buffer;
+// measured: macOS 27 Metal.framework's x86-64 slice, _MTLDevice's, `@32@0:8@16^@24` and
+// `v32@0:8@16@?24`; WindowServer on the macOS 26 guest sends the first.
+- (nullable id<MTLComputePipelineState>)
+    newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *_Nonnull)descriptor
+                                    error:(NSError *_Nullable *_Nullable)error;
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *_Nonnull)descriptor
+                            completionHandler:
+                                (MTLNewComputePipelineStateCompletionHandler _Nonnull)completionHandler;
 @end
 
 // measured: macOS 27 Metal.framework — the private command-queue SPI our queue

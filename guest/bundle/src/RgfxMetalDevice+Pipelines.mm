@@ -596,6 +596,34 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 		completionHandler(state, nil, err);
 }
 
+// The descriptor's forms without options, which the MTLDevice protocol does not declare and
+// _MTLDevice implements (measured: macOS 27 Metal.framework's x86-64 slice, `@32@0:8@16^@24` and
+// `v32@0:8@16@?24`). WindowServer's Core Animation makes its compute_average_luma pipeline through
+// the first (measured: the x86-64 guest, macOS 26, on opening Calculator): inherited, it sent the
+// create on to the base device's `compiler`, which is nil on our device, so it answered nil with
+// no error and Core Animation ended WindowServer. Both answer as the options form does with no
+// options.
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:
+                                   (MTLComputePipelineDescriptor *)descriptor
+                                                               error:(__autoreleasing NSError **)error
+{
+	return [self rgfxComputePipelineForDescriptor:descriptor
+	                                      options:MTLPipelineOptionNone
+	                                        error:error];
+}
+
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
+                            completionHandler:
+                                (MTLNewComputePipelineStateCompletionHandler)completionHandler
+{
+	NSError *err = nil;
+	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
+	                                                                  options:MTLPipelineOptionNone
+	                                                                    error:&err];
+	if (completionHandler)
+		completionHandler(state, err);
+}
+
 // --- binary archives ---------------------------------------------------------
 
 // The device's archives are its own, keyed by its architecture's name (RgfxBinaryArchive.h).

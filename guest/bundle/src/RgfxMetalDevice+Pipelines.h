@@ -90,6 +90,12 @@ NS_ASSUME_NONNULL_BEGIN
                             completionHandler:
                                 (MTLNewComputePipelineStateWithReflectionCompletionHandler)
                                     completionHandler;
+- (nullable id<MTLComputePipelineState>)
+    newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
+                                    error:(__autoreleasing NSError *_Nullable *_Nullable)error;
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
+                            completionHandler:
+                                (MTLNewComputePipelineStateCompletionHandler)completionHandler;
 
 // Argument encoders.
 - (nullable id<MTLArgumentEncoder>)
