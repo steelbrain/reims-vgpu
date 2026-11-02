@@ -260,6 +260,24 @@ RgfxCreated RgfxSerializer::createBufferOverHostMemory(uint64_t length, uint32_t
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createBufferOverSurfacePages(uint64_t length, uint32_t options,
+                                                         uint64_t block_offset,
+                                                         uint64_t block_size)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxBufferOverSurfacePages msg = {};
+	msg.obj_id = out.obj_id;
+	msg.block_offset = block_offset;
+	msg.block_size = block_size;
+	msg.length = length;
+	msg.options = options;
+	out.posted =
+	    m_control.tryPost(RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
                                                  uint32_t options)
 {

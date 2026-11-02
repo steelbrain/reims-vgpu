@@ -146,7 +146,7 @@ SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_test
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)
 	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) $(PROTOCOL_QUIET) -I tests \
-		$(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(FRAMEWORKS) -o $@
+		$(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(FRAMEWORKS) -framework CoreVideo -o $@
 
 # A Core Image kernel library, compiled from tests/ci_kernel.metal for the shell tests' extern
 # functions; built here, never committed. Built for macOS 14 and Metal 3.1: a guest's Metal on

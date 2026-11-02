@@ -207,6 +207,35 @@ bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uin
 	return true;
 }
 
+// The kext's shared blocks of surfaces in place, as RgfxRegion's surface pages source: the
+// block every process that holds the surface gets, found by the whole allocation it maps at
+// `base`, the device's GPU using those pages. Unsupported where the device lacks the feature or
+// refused the pages; refused for any other answer, among them a kext that takes three inputs.
+RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
+                                             uint64_t size, uint64_t *offset, uint64_t *serial,
+                                             bool *fresh)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in[4] = {reinterpret_cast<uintptr_t>(base), length, size, 1};
+	uint64_t out[4] = {};
+	uint32_t outCount = 4;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 4, out, &outCount);
+	if (kr == kIOReturnUnsupported)
+		return RgfxRegion::kPagesUnsupported;
+	if (kr != KERN_SUCCESS || outCount != 4)
+		return RgfxRegion::kPagesRefused;
+	if (out[1] != size) {
+		IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &out[0], 1, nullptr,
+		                          nullptr);
+		return RgfxRegion::kPagesRefused;
+	}
+	*offset = out[0];
+	*serial = out[2];
+	*fresh = out[3] != 0;
+	return RgfxRegion::kPagesGiven;
+}
+
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
@@ -393,6 +422,8 @@ RGFX_LOG_UNRECOGNIZED
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
 	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
+	_region->setSurfacePagesSource(&rgfxKextSurfacePages, _caps.linearTextureAlignment(),
+	                               connContext);
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).

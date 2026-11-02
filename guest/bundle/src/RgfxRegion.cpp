@@ -25,6 +25,15 @@ uint64_t RgfxRegion::used() const
 	return m_cursor - m_floor;
 }
 
+bool RgfxRegion::freeBytes(uint64_t *bytes) const
+{
+	if (m_alloc != nullptr) {
+		return false;
+	}
+	*bytes = m_size > m_cursor ? m_size - m_cursor : 0;
+	return true;
+}
+
 void RgfxRegion::setBlockSource(AllocFn alloc, ReleaseFn release, void *context)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
@@ -53,6 +62,37 @@ RgfxRegion::SurfaceBlock RgfxRegion::acquireSurface(const void *plane, uint64_t 
 	}
 	if (offset < m_floor || offset > m_size || size > m_size - offset) {
 		releaseSurface(offset);
+		return out;
+	}
+	out.block = {offset, m_base + offset, size, true};
+	out.serial = serial;
+	out.fresh = fresh;
+	return out;
+}
+
+void RgfxRegion::setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignment, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_pagesAcquire = acquire;
+	m_pagesAlignment = alignment;
+	m_pagesContext = context;
+}
+
+RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint64_t length,
+                                                         uint64_t size, PagesAnswer *answer)
+{
+	SurfaceBlock out = {};
+	uint64_t offset = 0, serial = 0;
+	bool fresh = false;
+	*answer = m_pagesAcquire == nullptr
+	              ? kPagesUnsupported
+	              : m_pagesAcquire(m_pagesContext, base, length, size, &offset, &serial, &fresh);
+	if (*answer != kPagesGiven) {
+		return out; // block.ok == false
+	}
+	if (offset < m_floor || offset > m_size || size > m_size - offset) {
+		releaseSurface(offset);
+		*answer = kPagesRefused;
 		return out;
 	}
 	out.block = {offset, m_base + offset, size, true};

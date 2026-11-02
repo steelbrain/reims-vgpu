@@ -238,6 +238,12 @@ public:
 	                                       uint64_t region_offset,
 	                                       uint64_t align = kDefaultAddressAlign);
 
+	/// A Shared buffer of `length` bytes over the IOSurface pages of the shared block at
+	/// `block_offset`, whose part its holders map is `block_size` bytes. No GPU address: the
+	/// create names none.
+	RgfxCreated createBufferOverSurfacePages(uint64_t length, uint32_t options,
+	                                         uint64_t block_offset, uint64_t block_size);
+
 	/// A buffer at `offset` in the heap `heap`.
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);

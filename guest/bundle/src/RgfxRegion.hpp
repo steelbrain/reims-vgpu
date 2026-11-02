@@ -78,6 +78,11 @@ public:
 	/// Bytes handed out past the floor (diagnostics / the next free offset − floor).
 	uint64_t used() const;
 
+	/// The bytes no block can take yet, where the region places blocks itself (no block source):
+	/// true, with `*bytes` the room past the last block. False where a block source places them,
+	/// which keeps its own count (the kext). A diagnostic, read without the lock, as used().
+	bool freeBytes(uint64_t *bytes) const;
+
 	/// A block of `size` bytes aligned up to `align` (a power of two, at least 1), from the
 	/// block source where one is set, else bump-allocated; never overlaps another live block.
 	/// `ok` is false when `align` is not a power of two or the region has no room.
@@ -116,8 +121,38 @@ public:
 	/// false without a surface source, or where it gives none.
 	SurfaceBlock acquireSurface(const void *plane, uint64_t length, uint64_t size);
 
-	/// Lets go of one acquireSurface of the block at `offset`.
+	/// Lets go of one acquireSurface or acquireSurfacePages of the block at `offset`.
 	void releaseSurface(uint64_t offset);
+
+	/// How an ask for a surface's shared block in place ended (acquireSurfacePages).
+	enum PagesAnswer {
+		kPagesGiven = 0,
+		// The device does not use surfaces' pages in place, or refused this surface's.
+		kPagesUnsupported,
+		// No block: another holder of the surface copies it, or the kext had no room.
+		kPagesRefused,
+	};
+
+	/// Where surfaces' shared blocks in place come from (RgfxIOSurface.h): `acquire` answers the
+	/// block whose part the processes map is `size` bytes, for the surface whose whole
+	/// allocation, `length` bytes, this process maps at `base`, the device's GPU using those pages
+	/// in place. Its blocks go back through the surface source's release (releaseSurface).
+	/// `alignment` is what the host's textures over the pages ask of each plane's offset and
+	/// rows (0: none known). Called with `context`, from any thread.
+	typedef PagesAnswer (*SurfacePagesFn)(void *context, const void *base, uint64_t length,
+	                                      uint64_t size, uint64_t *offset, uint64_t *serial,
+	                                      bool *fresh);
+	void setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignment, void *context);
+
+	/// Whether a surface pages source is set, and the alignment it gave.
+	bool hasSurfacePages() const { return m_pagesAcquire != nullptr; }
+	uint64_t surfacePagesAlignment() const { return m_pagesAlignment; }
+
+	/// The shared block in place of `size` bytes for the surface of `length` bytes at `base`,
+	/// the one every process that holds the surface gets; `*answer` says how the ask ended, and
+	/// `block.ok` is true only where it is kPagesGiven.
+	SurfaceBlock acquireSurfacePages(const void *base, uint64_t length, uint64_t size,
+	                                 PagesAnswer *answer);
 
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).
@@ -154,6 +189,9 @@ private:
 	SurfaceAcquireFn m_surfaceAcquire = nullptr; // the surface source, where set (the kext)
 	ReleaseFn m_surfaceRelease = nullptr;
 	void *m_surfaceContext = nullptr;
+	SurfacePagesFn m_pagesAcquire = nullptr; // the surface pages source, where set (the kext)
+	uint64_t m_pagesAlignment = 0;
+	void *m_pagesContext = nullptr;
 
 	std::mutex m_lock;
 };

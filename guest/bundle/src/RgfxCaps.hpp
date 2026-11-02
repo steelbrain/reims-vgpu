@@ -157,6 +157,10 @@ public:
 	/// `minimumTextureBufferAlignmentForPixelFormat:` of the raw `MTLPixelFormat` `format`; 0
 	/// where the blob has no answer (a format Metal asserts on, among them).
 	uint64_t textureBufferAlignment(uint64_t format) const;
+	/// What the host's textures over a buffer's bytes ask of their offset and rows: the largest of
+	/// `minimumLinearTextureAlignmentForPixelFormat:`(BGRA8Unorm) and every format's
+	/// texture-buffer alignment, the blob's answers; 0 where it has no linear answer.
+	uint64_t linearTextureAlignment() const;
 	/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of `format` at
 	/// `samples` (1, 2 or 4) in pages of the raw `MTLSparsePageSize` `page` (101, 102 or 103),
 	/// the same for every texture type, into `out` (width, height, depth); false, with `out`

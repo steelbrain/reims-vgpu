@@ -5,6 +5,8 @@
 
 #include "RgfxCaps.hpp"
 
+#include <algorithm>
+
 #include <cstring>
 
 // The enum counts match the blob's arrays: a drift in either is caught here, at
@@ -106,6 +108,16 @@ uint64_t RgfxCaps::textureBufferAlignment(uint64_t format) const
 {
 	const RgfxFormatAnswers *a = formatAnswers(m_info, format);
 	return a ? a->texture_buffer_alignment : 0;
+}
+
+uint64_t RgfxCaps::linearTextureAlignment() const
+{
+	uint64_t align = m_info.min_linear_alignment_bgra8;
+	if (align == 0)
+		return 0;
+	for (uint32_t k = 0; k < m_info.format_count; k++)
+		align = std::max<uint64_t>(align, m_info.formats[k].texture_buffer_alignment);
+	return align;
 }
 
 bool RgfxCaps::sparseTile(uint64_t format, uint64_t samples, int64_t page, uint64_t out[3]) const

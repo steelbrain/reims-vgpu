@@ -50,6 +50,7 @@
 
 #include "RgfxHeapSizes.hpp"
 
+#include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
 
 #include <mach/mach.h>
@@ -6122,6 +6123,593 @@ void test_iosurface_writers()
 	CFRelease(surface);
 }
 
+// A surface whose planes the host's textures lie over, where the device uses surfaces in place
+// (RgfxIOSurface.h): its GPU view is its own pages. The kext's block in place is asked for by the
+// surface's base, its whole allocation in whole pages and the part the processes map, one page
+// for the header and the writers; a BUFFER_OVER_SURFACE_PAGES over the allocation names the
+// block, and each texture lies over its plane's own offset and rows there, its writers in the
+// block, its facts plane 1's own. Nothing is copied: no block of the process's own and no copy
+// block are made, syncs leave the block's bytes be, and the texture's CPU access reads and writes
+// the surface's pages. The texture has no GPU address; the block goes back as the texture goes.
+// A surface whose rows miss the host's alignment is copied, as before.
+void test_iosurface_in_place()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		uint64_t copyOffset = RGFX_ALLOCATIONS_OFFSET + 0x60000;
+		const void *base = nullptr;
+		uint64_t length = 0, size = 0;
+		int asked = 0, copies = 0;
+		std::vector<uint64_t> released;
+		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
+		                                     uint64_t size, uint64_t *offset, uint64_t *serial,
+		                                     bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->base = base;
+			src->length = length;
+			src->size = size;
+			src->asked++;
+			*offset = src->offset;
+			*serial = 9;
+			*fresh = true;
+			return RgfxRegion::kPagesGiven;
+		}
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->copies++;
+			*offset = src->copyOffset;
+			*serial = 10;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfacePagesSource(&Source::pages, 16, &src);
+	// The block in place: its header first, untouched, then the writers, emptied, and nothing
+	// more of the page written.
+	const uint64_t kWriters = 16;
+	uint8_t *block = mem.data() + src.offset;
+	auto blockLeft = [&]() {
+		for (uint64_t i = 0; i < 0x1000; i++) {
+			bool writer = i >= kWriters && i < kWriters + sizeof(RgfxSurfaceWriters);
+			if (block[i] != (writer ? 0 : 0xcd))
+				return false;
+		}
+		return true;
+	};
+	auto overPlane = [&](IOSurfaceRef s, MTLPixelFormat format, NSUInteger w, NSUInteger h,
+	                     NSUInteger plane) {
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                                              width:w
+		                                                                             height:h
+		                                                                          mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:plane
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	auto allocBytes = [](IOSurfaceRef s) {
+		return (static_cast<uint64_t>(IOSurfaceGetAllocSize(s)) + 0xfff) & ~uint64_t(0xfff);
+	};
+
+	// A 16 x 16 BGRA surface.
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef flat = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(flat != nullptr);
+	const uint64_t rowBytes = IOSurfaceGetBytesPerRow(flat);
+	auto *pixels = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(flat));
+	IOSurfaceLock(flat, 0, nullptr);
+	for (uint64_t i = 0; i < rowBytes * 16; i++)
+		pixels[i] = static_cast<uint8_t>(i * 3);
+	IOSurfaceUnlock(flat, 0, nullptr);
+	std::memset(block, 0xcd, 0x1000);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = overPlane(flat, MTLPixelFormatBGRA8Unorm, 16, 16, 0);
+		CHECK(t != nil && src.asked == 1 && src.copies == 0 && blocks.allocated.empty());
+		CHECK(src.base == pixels && src.length == allocBytes(flat) && src.size == 0x1000);
+		auto buffer =
+		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
+		CHECK(buffer.obj_id != 0 && buffer.block_offset == src.offset &&
+		      buffer.block_size == 0x1000 && buffer.length == allocBytes(flat) &&
+		      (buffer.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared &&
+		      buffer.reserved_34 == 0);
+		auto made =
+		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(made.texture.buffer_obj_id == buffer.obj_id && made.texture.offset == 0 &&
+		      made.texture.bytes_per_row == rowBytes && made.texture.plane == 0 &&
+		      made.texture.writers_offset == kWriters &&
+		      made.texture.iosurface_id == IOSurfaceGetID(flat));
+		CHECK(made.facts.plane_count == 0 && made.facts.chroma_offset == 0 &&
+		      made.facts.chroma_bytes_per_row == 0);
+		CHECK(ringEmpty(fx.ring) && blockLeft());
+		CHECK([(id<RgfxMetalTextureInternals>)t gpuAddress] == 0 &&
+		      t.allocatedSize == allocBytes(flat));
+
+		// A CPU write of the surface reaches the GPU's view with no copy at a commit.
+		IOSurfaceLock(flat, 0, nullptr);
+		pixels[5] = 0x77;
+		IOSurfaceUnlock(flat, 0, nullptr);
+		rgfxIOSurfaceSyncBeforeCommit();
+		CHECK(blockLeft());
+
+		// The texture's CPU access is the surface's pages.
+		uint32_t texel = 0;
+		[t getBytes:&texel bytesPerRow:4 fromRegion:MTLRegionMake2D(1, 2, 1, 1) mipmapLevel:0];
+		CHECK(std::memcmp(&texel, pixels + 2 * rowBytes + 4, 4) == 0);
+		const uint32_t written = 0x0badf00d;
+		[t replaceRegion:MTLRegionMake2D(1, 2, 1, 1)
+		     mipmapLevel:0
+		       withBytes:&written
+		     bytesPerRow:4];
+		CHECK(std::memcmp(pixels + 2 * rowBytes + 4, &written, 4) == 0 && blockLeft());
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring); // the texture's and the buffer's destroys
+	CHECK(src.released == std::vector<uint64_t>({src.offset}));
+
+	// A surface with planes: one buffer over its allocation, each plane's texture at the plane's
+	// own place and rows, the facts naming plane 1's.
+	const uint32_t kX420 = 0x78343230;
+	NSDictionary *planar = @{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @48,
+		(id)kIOSurfacePixelFormat : @(kX420),
+		(id)kIOSurfaceAllocSize : @(128 * 48 + 128 * 24),
+		(id)kIOSurfacePlaneInfo : @[
+			@{
+				(id)kIOSurfacePlaneWidth : @64,
+				(id)kIOSurfacePlaneHeight : @48,
+				(id)kIOSurfacePlaneBytesPerElement : @2,
+				(id)kIOSurfacePlaneBytesPerRow : @128,
+				(id)kIOSurfacePlaneOffset : @0,
+				(id)kIOSurfacePlaneSize : @(128 * 48),
+			},
+			@{
+				(id)kIOSurfacePlaneWidth : @32,
+				(id)kIOSurfacePlaneHeight : @24,
+				(id)kIOSurfacePlaneBytesPerElement : @4,
+				(id)kIOSurfacePlaneBytesPerRow : @128,
+				(id)kIOSurfacePlaneOffset : @(128 * 48),
+				(id)kIOSurfacePlaneSize : @(128 * 24),
+			},
+		],
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)planar);
+	CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == 2);
+	auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(surface));
+	auto *chromaRows = static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(surface, 1));
+	const uint64_t kChroma = static_cast<uint64_t>(chromaRows - base);
+	CHECK(kChroma == 128 * 48);
+	IOSurfaceLock(surface, 0, nullptr);
+	for (uint64_t i = 0; i < 128 * 24; i++)
+		chromaRows[i] = static_cast<uint8_t>(i * 5);
+	IOSurfaceUnlock(surface, 0, nullptr);
+	std::memset(block, 0xcd, 0x1000);
+	src.released.clear();
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *luma = overPlane(surface, MTLPixelFormatR16Unorm, 64, 48, 0);
+		CHECK(luma != nil && src.asked == 2 && src.copies == 0 && blocks.allocated.empty());
+		CHECK(src.base == base && src.length == allocBytes(surface) && src.size == 0x1000);
+		auto buffer =
+		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
+		CHECK(buffer.block_offset == src.offset && buffer.length == allocBytes(surface));
+		auto first =
+		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(first.texture.buffer_obj_id == buffer.obj_id && first.texture.offset == 0 &&
+		      first.texture.bytes_per_row == 128 && first.texture.writers_offset == kWriters);
+		CHECK(first.facts.surface_pixel_format == kX420 && first.facts.plane_count == 2 &&
+		      first.facts.width == 64 && first.facts.height == 48 &&
+		      first.facts.chroma_offset == kChroma && first.facts.chroma_bytes_per_row == 128);
+		RgfxIOSurfaceTexture *chroma = overPlane(surface, MTLPixelFormatRG16Unorm, 32, 24, 1);
+		CHECK(chroma != nil && src.asked == 2);
+		auto second =
+		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(second.texture.buffer_obj_id == buffer.obj_id &&
+		      second.texture.offset == kChroma && second.texture.bytes_per_row == 128 &&
+		      second.texture.plane == 1 &&
+		      std::memcmp(&second.facts, &first.facts, sizeof(first.facts)) == 0);
+		uint32_t texel = 0;
+		[chroma getBytes:&texel bytesPerRow:4 fromRegion:MTLRegionMake2D(3, 1, 1, 1) mipmapLevel:0];
+		CHECK(std::memcmp(&texel, chromaRows + 128 + 12, 4) == 0);
+		CHECK(ringEmpty(fx.ring) && blockLeft());
+	}
+	drainRing(fx.ring);
+	CHECK(src.released == std::vector<uint64_t>({src.offset}));
+
+	// Rows the host's textures cannot lie over: a copy, as before, and no ask in place.
+	region.setSurfacePagesSource(&Source::pages, rowBytes * 2, &src);
+	IOSurfaceRef misaligned = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(misaligned != nullptr && IOSurfaceGetBytesPerRow(misaligned) == rowBytes);
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = overPlane(misaligned, MTLPixelFormatBGRA8Unorm, 16, 16, 0);
+		CHECK(t != nil && src.asked == 2 && src.copies == 1);
+		auto create =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(create.region_offset == src.copyOffset && create.length == 8192);
+		auto made =
+		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(made.texture.buffer_obj_id == create.obj_id && made.texture.bytes_per_row == 256 &&
+		      made.texture.writers_offset == 4096 + 16);
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	for (IOSurfaceRef s : {flat, surface, misaligned})
+		CFRelease(s);
+}
+
+// Where the device uses no surface in place, or the kext gives no block in place, a surface's
+// GPU view is a copy, as before: the ask in place is made, then the kext's copy block is asked
+// for by plane 0's pages, a BUFFER_OVER_HOST_MEMORY lies over it, and it is synced from the
+// pages.
+void test_iosurface_in_place_fallback()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesUnsupported;
+		int asked = 0, copies = 0;
+		std::vector<uint64_t> released;
+		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t,
+		                                     uint64_t *, uint64_t *, bool *)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->asked++;
+			return src->answer;
+		}
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			// A serial of its own each time, as a block made again has.
+			*serial = 10 + ++src->copies;
+			*offset = src->offset;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfacePagesSource(&Source::pages, 16, &src);
+	// 16 x 16 BGRA: the copy's rows 256 bytes apart, its header at 4096, the block 8192 bytes.
+	const uint64_t kPitch = 256;
+	uint8_t *block = mem.data() + src.offset;
+	auto blockIs = [&](uint32_t v) {
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++)
+				if (reinterpret_cast<uint32_t *>(block + y * kPitch)[x] != v)
+					return false;
+		return true;
+	};
+	int asked = 0, copies = 0;
+	for (RgfxRegion::PagesAnswer answer :
+	     {RgfxRegion::kPagesUnsupported, RgfxRegion::kPagesRefused}) {
+		src.answer = answer;
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(s != nullptr);
+		IOSurfaceLock(s, 0, nullptr);
+		auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++)
+				reinterpret_cast<uint32_t *>(base + y * IOSurfaceGetBytesPerRow(s))[x] =
+				    0x2468ace0 + answer;
+		IOSurfaceUnlock(s, 0, nullptr);
+		@autoreleasepool {
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                                                       width:16
+			                                                      height:16
+			                                                   mipmapped:NO];
+			RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+			                                                            iosurface:s
+			                                                                plane:0
+			                                                               region:&region
+			                                                               device:nil
+			                                                           serializer:&fx.ser];
+			CHECK(t != nil && src.asked == ++asked && src.copies == ++copies &&
+			      blocks.allocated.empty());
+			auto create =
+			    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+			CHECK(create.region_offset == src.offset && create.length == 8192);
+			auto made = expectMessage<RgfxSurfaceTextureMessage>(fx.ring,
+			                                                     RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+			CHECK(made.texture.buffer_obj_id == create.obj_id && made.texture.offset == 0 &&
+			      made.texture.bytes_per_row == kPitch && made.texture.writers_offset == 4096 + 16);
+			CHECK(blockIs(0x2468ace0 + answer) && ringEmpty(fx.ring));
+			CHECK([(id<RgfxMetalTextureInternals>)t gpuAddress] != 0 && t.allocatedSize == 8192);
+		}
+		drainRing(fx.ring);
+		CHECK(src.released.size() == static_cast<size_t>(copies) &&
+		      src.released.back() == src.offset);
+		CFRelease(s);
+	}
+}
+
+// Core Image's blur of a large image, as a guest boot met it (newTextureWithDescriptor:iosurface:
+// plane: answered nil, the region too small for their copies): fifteen one-plane RGhA surfaces of
+// 6094 x 1566 alive at once, a 6016 x 6016 '420f' source as IOSurfaceCreate lays it out and as
+// CoreVideo does (plane 0 past a 512-byte header, measured on the M3 Max under macOS 27), and
+// 3020 x 3020 RGBA and BGRA outputs, each in the shape and rows IOSurface gives it here. In place,
+// none needs a region block for its pixels: every plane asked for gets a texture, in place, over a
+// region with no room for a copy of any of them, at the plane's own offset from the surface's
+// base and with its own rows.
+void test_iosurface_in_place_core_image_set()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x80000;
+		const void *base = nullptr;
+		uint64_t length = 0, size = 0, offset = 0;
+		int asked = 0, copies = 0;
+		std::vector<uint64_t> released;
+		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
+		                                     uint64_t size, uint64_t *offset, uint64_t *serial,
+		                                     bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			src->base = base;
+			src->length = length;
+			src->size = size;
+			src->offset = src->next;
+			src->next += size;
+			*offset = src->offset;
+			*serial = ++src->asked;
+			*fresh = true;
+			return RgfxRegion::kPagesGiven;
+		}
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *, uint64_t *,
+		                    bool *)
+		{
+			static_cast<Source *>(c)->copies++;
+			return false;
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfacePagesSource(&Source::pages, 16, &src);
+	auto make = [](uint32_t width, uint32_t height, uint32_t bytesPerElement, uint32_t format) {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @(width),
+			(id)kIOSurfaceHeight : @(height),
+			(id)kIOSurfaceBytesPerElement : @(bytesPerElement),
+			(id)kIOSurfacePixelFormat : @(format),
+		};
+		return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	};
+	const uint32_t kRGhA = 0x52476841, kRGBA = 0x52474241, kBGRA = 0x42475241, k420f = 0x34323066;
+	std::vector<IOSurfaceRef> surfaces;
+	for (int i = 0; i < 15; i++)
+		surfaces.push_back(make(6094, 1566, 8, kRGhA));
+	NSDictionary *biPlanar = @{
+		(id)kIOSurfaceWidth : @6016,
+		(id)kIOSurfaceHeight : @6016,
+		(id)kIOSurfacePixelFormat : @(k420f),
+		(id)kIOSurfacePlaneInfo : @[
+			@{
+				(id)kIOSurfacePlaneWidth : @6016,
+				(id)kIOSurfacePlaneHeight : @6016,
+				(id)kIOSurfacePlaneBytesPerElement : @1,
+			},
+			@{
+				(id)kIOSurfacePlaneWidth : @3008,
+				(id)kIOSurfacePlaneHeight : @3008,
+				(id)kIOSurfacePlaneBytesPerElement : @2,
+			},
+		],
+	};
+	surfaces.push_back(IOSurfaceCreate((__bridge CFDictionaryRef)biPlanar));
+	CVPixelBufferRef pixelBuffer = nullptr;
+	NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+	CHECK(CVPixelBufferCreate(nullptr, 6016, 6016, k420f, (__bridge CFDictionaryRef)attrs,
+	                          &pixelBuffer) == kCVReturnSuccess);
+	surfaces.push_back((IOSurfaceRef)CFRetain(CVPixelBufferGetIOSurface(pixelBuffer)));
+	surfaces.push_back(make(3020, 3020, 4, kRGBA));
+	surfaces.push_back(make(3020, 3020, 4, kBGRA));
+	for (IOSurfaceRef s : surfaces)
+		CHECK(s != nullptr);
+
+	auto pageUp = [](uint64_t n) { return (n + 0xfff) & ~uint64_t(0xfff); };
+	std::vector<uint64_t> blocks;
+	@autoreleasepool {
+		NSMutableArray *alive = [NSMutableArray array];
+		for (IOSurfaceRef s : surfaces) {
+			uint32_t format = IOSurfaceGetPixelFormat(s);
+			size_t planes = std::max<size_t>(IOSurfaceGetPlaneCount(s), 1);
+			auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+			uint64_t buffer = 0;
+			for (size_t k = 0; k < planes; k++) {
+				MTLPixelFormat pf = format == kRGhA   ? MTLPixelFormatRGBA16Float
+				                    : format == kRGBA ? MTLPixelFormatRGBA8Unorm
+				                    : format == kBGRA ? MTLPixelFormatBGRA8Unorm
+				                    : k == 0          ? MTLPixelFormatR8Unorm
+				                                      : MTLPixelFormatRG8Unorm;
+				size_t w = planes == 1 ? IOSurfaceGetWidth(s) : IOSurfaceGetWidthOfPlane(s, k);
+				size_t h = planes == 1 ? IOSurfaceGetHeight(s) : IOSurfaceGetHeightOfPlane(s, k);
+				size_t rowBytes = planes == 1 && IOSurfaceGetPlaneCount(s) == 0
+				                      ? IOSurfaceGetBytesPerRow(s)
+				                      : IOSurfaceGetBytesPerRowOfPlane(s, k);
+				auto *rows = static_cast<uint8_t *>(IOSurfaceGetPlaneCount(s) == 0
+				                                        ? IOSurfaceGetBaseAddress(s)
+				                                        : IOSurfaceGetBaseAddressOfPlane(s, k));
+				MTLTextureDescriptor *td =
+				    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+				                                                       width:w
+				                                                      height:h
+				                                                   mipmapped:NO];
+				td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+				           MTLTextureUsageRenderTarget;
+				td.storageMode = MTLStorageModeShared;
+				RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+				                                                            iosurface:s
+				                                                                plane:k
+				                                                               region:&region
+				                                                               device:nil
+				                                                           serializer:&fx.ser];
+				CHECK(t != nil);
+				if (t == nil)
+					continue;
+				[alive addObject:t];
+				if (k == 0) {
+					// The surface's first texture asks for its block in place, by its base and
+					// whole allocation, and lays the buffer over them.
+					CHECK(src.base == base && src.length == pageUp(IOSurfaceGetAllocSize(s)) &&
+					      src.size == 0x1000);
+					auto over = expectMessage<RgfxBufferOverSurfacePages>(
+					    fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
+					CHECK(over.block_offset == src.offset && over.block_size == 0x1000 &&
+					      over.length == pageUp(IOSurfaceGetAllocSize(s)));
+					buffer = over.obj_id;
+					blocks.push_back(src.offset);
+				}
+				auto made = expectMessage<RgfxSurfaceTextureMessage>(
+				    fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+				CHECK(made.texture.buffer_obj_id == buffer &&
+				      made.texture.offset == static_cast<uint64_t>(rows - base) &&
+				      made.texture.bytes_per_row == rowBytes && made.texture.plane == k &&
+				      made.texture.writers_offset == 16 &&
+				      made.texture.iosurface_id == IOSurfaceGetID(s));
+				if (planes == 2) {
+					auto *chroma = static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(s, 1));
+					CHECK(made.facts.plane_count == 2 &&
+					      made.facts.chroma_offset == static_cast<uint64_t>(chroma - base) &&
+					      made.facts.chroma_bytes_per_row == IOSurfaceGetBytesPerRowOfPlane(s, 1));
+				}
+				std::string line;
+				CHECK(rgfxIOSurfaceNilLog(s, "region", &line) == 0);
+			}
+		}
+		CHECK(alive.count == 15 + 2 + 2 + 1 + 1);
+		CHECK(src.asked == static_cast<int>(surfaces.size()) && src.copies == 0);
+		// No block of the region's own, for a copy or anything else.
+		CHECK(region.used() == 0 && ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring); // the textures' and the buffers' destroys
+	std::sort(src.released.begin(), src.released.end());
+	CHECK(src.released == blocks);
+	for (IOSurfaceRef s : surfaces)
+		CFRelease(s);
+	CVPixelBufferRelease(pixelBuffer);
+}
+
+// A texture newTextureWithDescriptor:iosurface:plane: cannot make is nil, as Metal answers one,
+// and never silently: each cause logs one "RGFX:" line per surface, however often it is asked.
+// A surface whose view is refused in place and that has no room for a copy names the checks that
+// refused, the surface, the block asked and the region's free bytes; a plane past the surface's
+// and a call with no descriptor name theirs. Nothing reaches the host.
+void test_iosurface_nil_is_logged()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		static RgfxRegion::PagesAnswer pages(void *, const void *, uint64_t, uint64_t,
+		                                     uint64_t *, uint64_t *, bool *)
+		{
+			return RgfxRegion::kPagesUnsupported;
+		}
+		static bool acquire(void *, const void *, uint64_t, uint64_t, uint64_t *, uint64_t *,
+		                    bool *)
+		{
+			return false;
+		}
+		static void release(void *, uint64_t) {}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfacePagesSource(&Source::pages, 16, &src);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @6094,
+		(id)kIOSurfaceHeight : @1566,
+		(id)kIOSurfaceBytesPerElement : @8,
+		(id)kIOSurfacePixelFormat : @(0x52476841u),
+	};
+	IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(s != nullptr);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+	                                                       width:6094
+	                                                      height:1566
+	                                                   mipmapped:NO];
+	auto texture = [&](MTLTextureDescriptor *d, NSUInteger plane) {
+		return [RgfxIOSurfaceTexture textureWithDescriptor:d
+		                                        iosurface:s
+		                                            plane:plane
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	// The copy the region has no room for: the rows 256 bytes apart, the header and the writers.
+	uint64_t pitch = (IOSurfaceGetBytesPerRow(s) + 255) & ~uint64_t(255);
+	uint64_t size = (pitch * 1566 + 16 + sizeof(RgfxSurfaceWriters) + 0xfff) & ~uint64_t(0xfff);
+	auto has = [](const std::string &line, const std::string &part) {
+		return line.find(part) != std::string::npos;
+	};
+	std::string line;
+	@autoreleasepool {
+		CHECK(texture(td, 0) == nil && texture(td, 0) == nil);
+	}
+	CHECK(rgfxIOSurfaceNilLog(s, "region", &line) == 2);
+	CHECK(has(line, "IOSurface " + std::to_string(IOSurfaceGetID(s)) + " 'RGhA' 6094x1566") &&
+	      has(line, "0 planes; plane 0: 1566 rows of " +
+	                    std::to_string(IOSurfaceGetBytesPerRow(s)) + " bytes") &&
+	      has(line, "not in place (the device uses no surface in place, or refused its pages)") &&
+	      has(line, "no shared copy block of " + std::to_string(size) + " bytes") &&
+	      has(line, "(1048576 bytes free)"));
+	@autoreleasepool {
+		CHECK(texture(td, 1) == nil && texture(nil, 0) == nil);
+	}
+	CHECK(rgfxIOSurfaceNilLog(s, "plane", &line) == 1 &&
+	      has(line, "plane 1, past its planes"));
+	CHECK(rgfxIOSurfaceNilLog(s, "arguments", &line) == 1 &&
+	      has(line, "no descriptor"));
+	CHECK(rgfxIOSurfaceNilLog(s, "buffer", &line) == 0 && line.empty());
+	CHECK(region.used() == 0 && ringEmpty(fx.ring));
+	CFRelease(s);
+}
+
 // A queue's command buffers keep it alive; once they are gone it ends on the device, its
 // completion ring read no more, and only then does what it holds go back.
 void test_queue_ends_after_its_buffers()
@@ -6370,6 +6958,10 @@ int main()
 		test_iosurface_shared_block();
 		test_iosurface_planes();
 		test_iosurface_writers();
+		test_iosurface_in_place();
+		test_iosurface_in_place_fallback();
+		test_iosurface_in_place_core_image_set();
+		test_iosurface_nil_is_logged();
 		test_queue_ends_after_its_buffers();
 		test_serializer_destroys_queues();
 		test_objects_outlive_an_uncommitted_buffer();

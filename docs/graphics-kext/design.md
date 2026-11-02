@@ -110,6 +110,10 @@ Stages:
      live there too.
    - Real discrete Macs keep Shared in system memory, so this is Metal's
      discrete model.
+   - IOSurfaces are the one place the host reaches guest RAM: where the
+     device has `RGFX_FEATURE_SURFACE_PAGES`, the host maps a surface's own
+     guest pages for its GPU in place (Decided 14, "Today"), from the guest
+     RAM's map QEMU gives it, as the apple-gfx lane maps guest memory.
    - VRAM mapped into the guest was considered and dropped. It needed kernel
      6.13 or later and resizable BAR, and was good for guest writes only:
      measured on amdgpu, CPU reads from VRAM run at 15 MiB/s with memcpy,
@@ -243,22 +247,41 @@ Stages:
     metal2vulkan's host-page rules: in place where only sampled, otherwise a
     shadow copy that is announced. Stage 2 needs none of this, since its
     compositor is software.
-    - **Today:** a surface's GPU copy is one region block, holding every
+    - **Today:** the GPU works on a surface's own guest pages in place, and
+      copies them only where the host cannot use them. Where the device has
+      `RGFX_FEATURE_SURFACE_PAGES` and the host's linear textures can lie
+      over every plane (the base is a page's, each plane's offset from it and
+      its rows are multiples of the host's linear texture alignment, every
+      plane lies in the allocation), the bundle asks the kext for the surface's shared
+      block in place. The kext wires the surface's whole allocation, writes
+      its page runs into the block past the part the processes map, and
+      hands them to the host (`SURFACE_PAGES`, answered), which maps them as
+      one view. Each process's buffer lies over the view
+      (`BUFFER_OVER_SURFACE_PAGES`), and each texture over its plane's own
+      offset and rows. The block holds only the header and the writers, and
+      nothing is copied or synced: the GPU and every CPU use the same
+      pages, so such a surface has no GPU copy to keep in step. A surface
+      whose layout misses the host's alignment, a device
+      without the feature, or pages the host refuses (not whole pages of
+      guest RAM, or a view it cannot map) keep the copy below; so does every
+      other holder of that surface, since the kext gives a surface's blocks
+      in one mode.
+    - **The copy:** a surface's GPU copy is one region block, holding every
       plane in plane order, that every process holding the surface shares
       (the kext's, found by plane 0's pages; "Processes name only their
       own"), so one process's GPU writes reach another's GPU with no copy, and
       a texture over one plane that reads another (a two-plane YCbCr texture
-      over plane 0 reads plane 1's chroma) finds both in one buffer. Its
-      `TEXTURE_FROM_IOSURFACE` carries the surface's facts
+      over plane 0 reads plane 1's chroma) finds both in one buffer. In
+      either mode, its `TEXTURE_FROM_IOSURFACE` carries the surface's facts
       (`RgfxSurfaceFacts`: OSType, planes, size, plane 1's place, YCbCr
       matrix), which the host's surface creator reads as Metal reads the
-      surface. The block syncs from the pages before
+      surface. The copy syncs from the pages before
       a commit where the surface's seed moved since any holder synced it, and
       back to the pages at the completion of each command buffer that writes
       it, since no lock callback reaches the bundle yet. The block's header
       holds the seed every holder agrees on (`guest/bundle/src/RgfxIOSurface.h`).
-      Moving the write-back to the CPU's lock, through IOSurface's device
-      caches, is what is left of this item.
+      Moving the copy's write-back to the CPU's lock, through IOSurface's
+      device caches, is what is left of this item.
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
@@ -566,7 +589,13 @@ block, whatever id it claims. The kext wires those pages while the process holds
 posts `BLOCK_SHARE` (context, offset, size) for each holder before the process
 learns of the block, and `BLOCK_UNSHARE` as a holder other than the last lets
 it go (selector 0x10a, or its close). The last holder's let-go frees the block
-as a free does, and its `BLOCK_RELEASE` ends every hold.
+as a free does, and its `BLOCK_RELEASE` ends every hold. A block in place
+(0x109's fourth input) is found by the pages of the surface's whole
+allocation, which every holder's ask wires. Before its first `BLOCK_SHARE`,
+the kext writes their runs into the block, past the part the processes map
+and are granted, and posts `SURFACE_PAGES`; other asks for the surface wait
+for its answer. A refusal frees the block as a share not posted does, and the
+ask answers `kIOReturnUnsupported`, so the process copies the surface.
 
 **Processes map only their own.** No process maps the region whole: it holds
 every process's blocks, the control rings and the device page. Each
@@ -704,8 +733,8 @@ process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
 Metal makes one over any range the process maps readable, at any alignment:
 malloc'd, `vm_allocate`d, read-only, or a file mapping (measured on an M3 Max,
 16 KiB and 4 KiB pages). Over such memory the buffer lies over a block of its
-own, and `contents` stays the app's pointer, since the host never reaches guest
-RAM (Decided 5). The block syncs with the memory as the IOSurface copies do
+own, and `contents` stays the app's pointer, since the host reaches guest RAM
+only for IOSurfaces' pages (Decided 5). The block syncs with the memory as the IOSurface copies do
 (Decided 14): from the memory before the commit of each command buffer that uses
 the buffer, and back to it as one that may write it completes, before its
 completion is reported. Each side's bytes that moved since the two last agreed go

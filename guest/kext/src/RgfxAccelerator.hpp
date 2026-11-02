@@ -139,7 +139,13 @@ enum {
 	// Every process that holds the surface gets the same block for the plane, and its lifecycle
 	// messages may name it from then on, until it lets go of its last ask. The device has the
 	// hold (BLOCK_SHARE) before this returns. kIOReturnBadArgument where the range is not mapped
-	// in the process, or the plane's block has another size.
+	// in the process, or the plane's block has another size or mode.
+	// A fourth input of 1 asks for the block in place (RGFX_FEATURE_SURFACE_PAGES): the first
+	// input is then the surface's page-aligned base, the second its whole allocation (whole
+	// pages), and the size that of the part the processes map, which holds no pixels: the device
+	// uses the surface's own pages, which the kext wires and hands it (SURFACE_PAGES) before the
+	// first hold. The size out is that part's. kIOReturnUnsupported where the device lacks the
+	// feature or refused the pages: the process copies the surface instead.
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
 	// once no process holds it, through its BLOCK_RELEASE.
@@ -221,8 +227,8 @@ public:
 	void unpinBlock(const RgfxBlockPin &pin);
 	// The shared blocks of IOSurface planes (RgfxSurfaceBlocks.hpp), for our user client `client`
 	// of context `context` in `task`: the block of the plane of `length` bytes at `address` in
-	// the task, of `size` bytes (kRgfxAccelMethodSurfaceBlock), and letting go of one ask of
-	// it. dropSurfaceBlocks lets go of every one of the client's after its close, the device
+	// the task, of `size` bytes, a copy block or one in place (`inPlace`,
+	// kRgfxAccelMethodSurfaceBlock), and letting go of one ask of it. dropSurfaceBlocks lets go of every one of the client's after its close, the device
 	// answered (`closed`) or not; pinRange pins a span of one the client holds. Each holder has
 	// the block mapped in its window from its first ask until its hold ends, which takes it
 	// back before the block can go to anyone else.
@@ -233,7 +239,7 @@ public:
 		bool fresh;
 	};
 	IOReturn acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
-	                             UInt64 address, UInt64 length, UInt64 size,
+	                             UInt64 address, UInt64 length, UInt64 size, bool inPlace,
 	                             SurfaceBlock *block);
 	IOReturn releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset);
 	void dropSurfaceBlocks(const void *client, bool closed);
@@ -303,6 +309,11 @@ private:
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	void teardown();
+	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
+	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
+	// `offset`, and posted for context `context`; true where the device answered OK.
+	bool postSurfacePages(UInt32 context, UInt64 offset, UInt64 total, UInt64 size,
+	                      UInt64 length, const RgfxPageRun *runs, UInt32 count);
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;

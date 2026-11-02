@@ -9,6 +9,13 @@
 // id they claim. Each holder's wired pages stay wired while it holds the block, so the pages
 // cannot be reused for another surface under its key.
 //
+// A block is made in one of two modes, which the asker picks and its entry keeps. A copy block
+// holds a copy of the plane, keyed by the plane's pages. An in-place block holds only what the
+// holders share past the pixels (the bundle's header and writers), keyed by the pages of the
+// surface's whole allocation, which the device's GPU uses in place (SURFACE_PAGES): past the
+// part the processes map, the block holds the pages' runs for the device. One surface's blocks
+// are all of one mode: an ask in the other mode finds no block while one of the first lives.
+//
 // The block is the table's (its RgfxBlockTable owner is its entry), and each holding client is
 // counted: one hold per client, with a count of its asks. The device learns of each holder's
 // context before the process learns of the block (BLOCK_SHARE), and of a holder letting it go
@@ -23,11 +30,9 @@
 
 #include <stdint.h>
 
-// A run of physically contiguous bytes of a plane's pages.
-struct RgfxPageRun {
-	uint64_t addr;
-	uint64_t length;
-};
+// RgfxPageRun, a run of physically contiguous bytes of a plane's pages, is the wire's: an
+// in-place block hands its runs to the device as they are.
+#include "reims_graphics_wire.h"
 
 // The most clients that hold one plane's block.
 constexpr uint32_t kRgfxSurfaceHolders = 16;
@@ -46,10 +51,15 @@ struct RgfxSurfaceHold {
 // A plane's shared block, where `used`.
 struct RgfxSurfaceEntry {
 	bool used;
-	// The block: its region offset, its bytes and its RgfxBlockTable serial.
+	// The block: its region offset, the bytes its holders map and its RgfxBlockTable serial.
 	uint64_t offset;
 	uint64_t size;
 	uint64_t serial;
+	// Whether the device's GPU uses the surface's pages in place, the block holding no copy.
+	bool inPlace;
+	// An in-place block the device has not yet answered for its pages (SURFACE_PAGES): no other
+	// client holds it until the answer, which keeps the block or lets it go.
+	bool pending;
 	// The key: the plane's bytes and their runs (the caller's memory, which it frees once the
 	// entry goes).
 	uint64_t length;
@@ -64,29 +74,63 @@ struct RgfxSurfaceTable {
 	uint32_t capacity;
 };
 
-// The entry whose key is the `count` runs of `runs` over `length` bytes, its block `size` bytes,
-// or -1. A plane whose pages match but whose block size does not is no entry's: the asker gets no
-// block, rather than one laid out apart from the other holders'.
-inline int32_t rgfxSurfaceFind(const RgfxSurfaceTable &t, const RgfxPageRun *runs, uint32_t count,
-                               uint64_t length, uint64_t size, bool *sizeDiffers)
+// The guest's page, by which the two modes' keys of one surface meet: a copy's starts at plane
+// 0's first byte, which may lie past the start of the surface's first page (CoreVideo places a
+// plane 512 bytes in), and one in place at the page's start.
+constexpr uint64_t kRgfxSurfacePage = 0x1000;
+
+// Whether a run starting at `a` and one starting at `b` start in the same guest page.
+inline bool rgfxSurfaceSamePage(uint64_t a, uint64_t b)
 {
-	*sizeDiffers = false;
+	return a / kRgfxSurfacePage == b / kRgfxSurfacePage;
+}
+
+// The entry of mode `inPlace` whose key is the `count` runs of `runs` over `length` bytes, its
+// block `size` bytes, or -1. A plane whose pages match but whose block size does not is no
+// entry's, and nor is one whose first byte lies in the first page of an entry of the other mode:
+// the asker gets no block (`*differs`), rather than one laid out apart from the other holders'.
+inline int32_t rgfxSurfaceFind(const RgfxSurfaceTable &t, const RgfxPageRun *runs, uint32_t count,
+                               uint64_t length, uint64_t size, bool inPlace, bool *differs)
+{
+	*differs = false;
 	for (uint32_t i = 0; i < t.capacity; i++) {
 		const RgfxSurfaceEntry &e = t.entries[i];
-		if (!e.used || e.length != length || e.runCount != count)
+		if (!e.used)
+			continue;
+		if (e.inPlace != inPlace) {
+			if (count && e.runCount && rgfxSurfaceSamePage(e.runs[0].address, runs[0].address)) {
+				*differs = true;
+				return -1;
+			}
+			continue;
+		}
+		if (e.length != length || e.runCount != count)
 			continue;
 		bool same = true;
 		for (uint32_t r = 0; r < count && same; r++)
-			same = e.runs[r].addr == runs[r].addr && e.runs[r].length == runs[r].length;
+			same = e.runs[r].address == runs[r].address && e.runs[r].length == runs[r].length;
 		if (!same)
 			continue;
 		if (e.size != size) {
-			*sizeDiffers = true;
+			*differs = true;
 			return -1;
 		}
 		return static_cast<int32_t>(i);
 	}
 	return -1;
+}
+
+// Whether an entry whose pages start in `runs[0]`'s page, of either mode, waits for the device's
+// answer (`pending`): the asker waits for it before it looks for the plane's block.
+inline bool rgfxSurfacePending(const RgfxSurfaceTable &t, const RgfxPageRun *runs, uint32_t count)
+{
+	for (uint32_t i = 0; i < t.capacity && count; i++) {
+		const RgfxSurfaceEntry &e = t.entries[i];
+		if (e.used && e.pending && e.runCount &&
+		    rgfxSurfaceSamePage(e.runs[0].address, runs[0].address))
+			return true;
+	}
+	return false;
 }
 
 // The entry of the block at `offset`, or -1.
@@ -200,7 +244,7 @@ inline bool rgfxSurfaceAppendRun(RgfxPageRun *runs, uint32_t *count, uint32_t ca
 {
 	if (length == 0)
 		return true;
-	if (*count && runs[*count - 1].addr + runs[*count - 1].length == addr) {
+	if (*count && runs[*count - 1].address + runs[*count - 1].length == addr) {
 		runs[*count - 1].length += length;
 		return true;
 	}

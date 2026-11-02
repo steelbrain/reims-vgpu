@@ -59,6 +59,21 @@ NS_ASSUME_NONNULL_BEGIN
                                                    device:(nullable id<MTLDevice>)device
                                                serializer:(nullable RgfxSerializer *)serializer;
 
+/// Creates a Shared buffer of `length` bytes over an IOSurface's own pages, those the shared
+/// block at `blockOffset` (its holders' part `blockSize` bytes) has the host use in place,
+/// serialising an `RGFX_CMD_BUFFER_OVER_SURFACE_PAGES` through `serializer`. `contents` is the
+/// surface's base in this process; it is NOT owned here, and `deallocator` (may be nil) is
+/// called on dealloc. The buffer has no GPU address: the create names none. Returns nil if
+/// `serializer` is null.
++ (nullable instancetype)bufferOverSurfacePagesWithContents:(void *)contents
+                                               blockOffset:(uint64_t)blockOffset
+                                                 blockSize:(uint64_t)blockSize
+                                                    length:(NSUInteger)length
+                                                   options:(MTLResourceOptions)options
+                                               deallocator:(nullable void (^)(void))deallocator
+                                                    device:(nullable id<MTLDevice>)device
+                                                serializer:(nullable RgfxSerializer *)serializer;
+
 #ifdef __cplusplus
 /// The buffer `newBufferWithLength:options:` (`bytes` null) and
 /// `newBufferWithBytes:length:options:` make: a Shared one over a block of `region`, which the

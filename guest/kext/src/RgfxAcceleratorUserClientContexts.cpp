@@ -178,14 +178,18 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return kIOReturnSuccess;
 	}
 	case kRgfxAccelMethodSurfaceBlock: {
-		if (a->scalarInputCount != 3 || a->scalarOutputCount != 4)
+		// Three inputs ask for a copy block; a fourth of 1, for one in place.
+		if (a->scalarInputCount < 3 || a->scalarInputCount > 4 || a->scalarOutputCount != 4)
+			return kIOReturnBadArgument;
+		bool inPlace = a->scalarInputCount == 4 && in[3] != 0;
+		if (a->scalarInputCount == 4 && in[3] > 1)
 			return kIOReturnBadArgument;
 		// Under the queue lock, so no hold is made for a context releaseContext has closed:
 		// every hold of the client's goes in its dropSurfaceBlocks.
 		IOLockLock(queueLock);
 		RgfxAccelerator::SurfaceBlock block = {};
 		IOReturn r = hasContext ? owner->acquireSurfaceBlock(this, context, task, in[0], in[1],
-		                                                     in[2], &block)
+		                                                     in[2], inPlace, &block)
 		                        : kIOReturnBadArgument;
 		IOLockUnlock(queueLock);
 		if (r != kIOReturnSuccess)

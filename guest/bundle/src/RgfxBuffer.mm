@@ -139,6 +139,30 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	return buffer;
 }
 
++ (instancetype)bufferOverSurfacePagesWithContents:(void *)contents
+                                      blockOffset:(uint64_t)blockOffset
+                                        blockSize:(uint64_t)blockSize
+                                           length:(NSUInteger)length
+                                          options:(MTLResourceOptions)options
+                                      deallocator:(void (^)(void))deallocator
+                                           device:(id<MTLDevice>)device
+                                       serializer:(RgfxSerializer *)serializer
+{
+	if (serializer == nullptr) {
+		return nil; // a buffer must have a route to the host
+	}
+	RgfxCreated created = serializer->createBufferOverSurfacePages(
+	    length, static_cast<uint32_t>(options), blockOffset, blockSize);
+	return [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                              gpuAddress:0
+	                                  length:length
+	                                 options:options
+	                                contents:contents
+	                             deallocator:deallocator
+	                                  device:device
+	                              serializer:serializer];
+}
+
 + (instancetype)bufferForDeviceWithLength:(NSUInteger)length
                                   options:(MTLResourceOptions)options
                                     bytes:(const void *)bytes
