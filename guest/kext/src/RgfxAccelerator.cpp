@@ -66,13 +66,14 @@ struct BundleWatch {
 	// Under lock: where the accelerator stands (above).
 	IOLock *lock;
 	UInt32 state;
-	// The repeating check.
+	// The repeating check, and under lock whether it is running (stop waits for it to end).
 	thread_call_t call;
+	bool running;
 	// The bundle's executable: /Library/GPUBundles/NAME.bundle/Contents/MacOS/NAME, NAME the
 	// accelerator's MetalPluginName (the bundle's Makefile names its executable so).
 	char path[256];
 };
-BundleWatch bundle = {nullptr, kBundleWatching, nullptr, {}};
+BundleWatch bundle = {nullptr, kBundleWatching, nullptr, false, {}};
 
 UInt32 bundleState()
 {
@@ -137,6 +138,9 @@ void registerAccelerator(RgfxAccelerator *accelerator, const char *when)
 // The repeating check, on a thread call: registers the accelerator once the bundle is there.
 void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 {
+	IOLockLock(bundle.lock);
+	bundle.running = true;
+	IOLockUnlock(bundle.lock);
 	bool found = bundleOnDisk();
 	IOLockLock(bundle.lock);
 	bool watching = bundle.state == kBundleWatching;
@@ -147,6 +151,10 @@ void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 	IOLockUnlock(bundle.lock);
 	if (watching && found)
 		registerAccelerator(static_cast<RgfxAccelerator *>(accelerator), "");
+	IOLockLock(bundle.lock);
+	bundle.running = false;
+	IOLockWakeup(bundle.lock, &bundle.running, false);
+	IOLockUnlock(bundle.lock);
 }
 } // namespace
 
@@ -287,10 +295,15 @@ fail:
 
 void RgfxAccelerator::stop(IOService *provider)
 {
-	// The check ends: none runs after this.
+	// The check ends: a pending one is cancelled, a running one (registerService included)
+	// finishes first, and one that starts after finds the watch settled and does nothing.
 	if (bundle.lock) {
 		leaveWatching(kBundleSettled);
-		thread_call_cancel_wait(bundle.call);
+		IOLockLock(bundle.lock);
+		while (bundle.running)
+			IOLockSleep(bundle.lock, &bundle.running, THREAD_UNINT);
+		IOLockUnlock(bundle.lock);
+		thread_call_free(bundle.call);
 	}
 	// The framebuffer stops calling queueInterrupt (and lets this accelerator go).
 	if (ReimsGraphics *fb = copyFramebuffer()) {
