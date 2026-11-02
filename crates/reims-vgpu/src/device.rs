@@ -281,6 +281,28 @@ struct Lease {
     _dirty: Option<Harvester>,
 }
 
+/// What a device over `map` holds of the guest's RAM: the platform's lease
+/// ([`ApiPlatform::guest_memory`]), given the dirty log of the harvest of `dirty_source` where the
+/// host gives one and [`dirty_page_tracking_on`], and that log.
+pub(crate) fn lease_guest_memory<P: ApiPlatform>(
+    platform: &P,
+    map: &MemoryMap,
+    dirty_source: Option<DirtySource>,
+) -> (GuestMemoryLease, Option<Arc<DirtyLog>>) {
+    let dirty = (dirty_source.filter(|_| dirty_page_tracking_on())).map(|source| {
+        let ram: Vec<_> = (map.ranges().iter())
+            .map(|r| r.physical_address..r.physical_address + r.physical_length)
+            .collect();
+        Harvester::new(&ram, source)
+    });
+    let log = dirty.as_ref().map(|h| h.log().clone());
+    let lease = Arc::new(Lease {
+        _platform: platform.guest_memory(map, log.clone()),
+        _dirty: dirty,
+    });
+    (lease, log)
+}
+
 /// One reference to a device. `P` is the platform: [`DefaultPlatform`] in the product, core's
 /// fake platform in tests.
 pub struct Device<P: Platform = DefaultPlatform> {
@@ -330,19 +352,10 @@ impl<P: ApiPlatform> Device<P> {
             let mut guest_memory: Option<GuestMemoryLease> = None;
             let mut dirty_log = None;
             if let Some(map) = &config.memory_map {
-                let dirty = (config.dirty_source.clone())
-                    .filter(|_| dirty_page_tracking_on())
-                    .map(|source| {
-                        let ram: Vec<_> = (map.ranges().iter())
-                            .map(|r| r.physical_address..r.physical_address + r.physical_length)
-                            .collect();
-                        Harvester::new(&ram, source)
-                    });
-                dirty_log = dirty.as_ref().map(|h| h.log().clone());
-                guest_memory = Some(Arc::new(Lease {
-                    _platform: platform.guest_memory(map, dirty_log.clone()),
-                    _dirty: dirty,
-                }));
+                let (lease, log) =
+                    lease_guest_memory(platform.as_ref(), map, config.dirty_source.clone());
+                guest_memory = Some(lease);
+                dirty_log = log;
             }
             let core = config.into_core::<P>(metal);
             match CoreDevice::new(platform.clone(), core) {

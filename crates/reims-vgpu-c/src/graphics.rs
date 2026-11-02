@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use reims_vgpu::{GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn};
 
-use crate::device::{RvgMemoryMap, RvgMemoryRangeFile, memory_map};
+use crate::device::{RvgDirtySource, RvgMemoryMap, RvgMemoryRangeFile, dirty_source, memory_map};
 use crate::ffi;
 use crate::handle;
 use crate::sized::{self, HostStruct};
@@ -145,6 +145,12 @@ pub struct RvgGraphicsDeviceConfig {
     /// RvgDeviceConfig.memory_files are, with the same refusals; NULL for none. Files without a
     /// map are refused (RVG_ERR_INVALID_ARGUMENT).
     pub memory_files: *const RvgMemoryRangeFile,
+    /// With `memory_map`: the host's dirty source, or NULL for none, as RvgDeviceConfig's: with
+    /// it the library's Vulkan runtime copies again only the pages the guest wrote of those it
+    /// keeps copies of (a render target over an IOSurface's pages), and without it copies each
+    /// use whole. Its `destroy` runs at the device's end, or before the create returns where the
+    /// device takes none (no memory map, or a refusal).
+    pub dirty_source: *const RvgDirtySource,
 }
 
 // SAFETY: repr(C), a u32 first; pointers.
@@ -184,11 +190,11 @@ unsafe fn live<'a>(device: *const RvgGraphicsDevice, call: &'static str) -> &'a 
 }
 
 /// A new graphics device, its region mapped and zeroed, its threads started, with a window for
-/// its display where the config gives one. Its config and window config are read, with their
-/// tables, before either table is the library's: a struct_size refusal runs no destroy, and a
-/// later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
-/// RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
-/// a thread). Calls back: never, but a refusal's destroys.
+/// its display where the config gives one. Its config, window config and dirty source are read,
+/// with their tables, before any table is the library's: a struct_size refusal runs no destroy,
+/// and a later refusal runs each, the window's first and the dirty source's last. Refusals:
+/// RVG_ERR_INVALID_ARGUMENT, RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the
+/// region's memory, a pipe or a thread). Calls back: never, but a refusal's destroys.
 ///
 /// # Safety
 /// `config` is NULL or a live config; `device` is NULL or writable.
@@ -235,15 +241,24 @@ unsafe fn create(
             Err(s) => return s,
         },
     };
+    // SAFETY: the config's contract: NULL or a live source.
+    let dirty = match unsafe { sized::read(c.dirty_source) } {
+        Ok(d) => d,
+        Err(s) => return s,
+    };
     // From here the tables are the library's: a refusal ends them before it returns, the
     // window's first, as a release does.
     let table = Table::new(callbacks.ctx, callbacks.destroy);
     let window_table = window.as_ref().map(|(_, t)| Table::new(t.ctx, t.destroy));
+    let dirty = dirty.map(|d| (Table::new(d.ctx, d.destroy), d));
     let refuse = |s: RvgStatus| {
         if let Some(t) = &window_table {
             t.end();
         }
         table.end();
+        if let Some((t, _)) = &dirty {
+            t.end();
+        }
         s
     };
     if device.is_null() {
@@ -280,6 +295,7 @@ unsafe fn create(
             _ => None,
         },
         memory_map,
+        dirty_source: dirty.as_ref().and_then(|(t, d)| dirty_source(t, d)),
     };
     match GraphicsDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
         Ok(d) => {

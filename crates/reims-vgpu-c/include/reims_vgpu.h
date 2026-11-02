@@ -1027,6 +1027,12 @@ typedef struct {
   // RvgDeviceConfig.memory_files are, with the same refusals; NULL for none. Files without a
   // map are refused (RVG_ERR_INVALID_ARGUMENT).
   const RvgMemoryRangeFile *memory_files;
+  // With `memory_map`: the host's dirty source, or NULL for none, as RvgDeviceConfig's: with
+  // it the library's Vulkan runtime copies again only the pages the guest wrote of those it
+  // keeps copies of (a render target over an IOSurface's pages), and without it copies each
+  // use whole. Its `destroy` runs at the device's end, or before the create returns where the
+  // device takes none (no memory map, or a refusal).
+  const RvgDirtySource *dirty_source;
 } RvgGraphicsDeviceConfig;
 
 // Write the request, which the call rewrote in place, into the element's writable part, with a
@@ -1495,11 +1501,11 @@ RvgScalerOutcome rvg_scaler_device_process(RvgScalerDevice *device,
 void rvg_scaler_device_reset(RvgScalerDevice *device);
 
 // A new graphics device, its region mapped and zeroed, its threads started, with a window for
-// its display where the config gives one. Its config and window config are read, with their
-// tables, before either table is the library's: a struct_size refusal runs no destroy, and a
-// later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
-// RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
-// a thread). Calls back: never, but a refusal's destroys.
+// its display where the config gives one. Its config, window config and dirty source are read,
+// with their tables, before any table is the library's: a struct_size refusal runs no destroy,
+// and a later refusal runs each, the window's first and the dirty source's last. Refusals:
+// RVG_ERR_INVALID_ARGUMENT, RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the
+// region's memory, a pipe or a thread). Calls back: never, but a refusal's destroys.
 //
 // # Safety
 // `config` is NULL or a live config; `device` is NULL or writable.

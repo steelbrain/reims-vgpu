@@ -572,7 +572,7 @@ const _: () = assert!(
 /// with the table's `ctx`.
 /// The host's dirty source as the Rust API's, its functions called under `ffi::host_call`; `None`
 /// for a source that is none (`RvgDirtySource`).
-fn dirty_source(t: &Arc<Table>, d: &RvgDirtySource) -> Option<DirtySource> {
+pub(crate) fn dirty_source(t: &Arc<Table>, d: &RvgDirtySource) -> Option<DirtySource> {
     if d.kvm_vm_fd < 0 || d.for_each_slot.is_none() {
         return None;
     }

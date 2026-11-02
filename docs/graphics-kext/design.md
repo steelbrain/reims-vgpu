@@ -281,7 +281,10 @@ Stages:
       (`BUFFER_OVER_SURFACE_PAGES`), and each texture over its plane's own
       offset and rows. The block holds only the header and the writers, and
       nothing is copied or synced: the GPU and every CPU use the same
-      pages, so such a surface has no GPU copy to keep in step. A surface
+      pages, so such a surface has no GPU copy to keep in step. Where the
+      host's runtime keeps a shadow of the pages itself (a render target on
+      the Vulkan platform), the host's KVM dirty log has it copy in again
+      only the pages the guest wrote. A surface
       whose layout misses the host's alignment, a device
       without the feature, or pages the host refuses (not whole pages of
       guest RAM, or a view it cannot map) keep the copy below; so does every
