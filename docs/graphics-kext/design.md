@@ -164,14 +164,25 @@ Stages:
      Apple's Metal Feature Set Tables the lane fully carries, and only where
      the platform claims it too; the iOS feature sets of a family not
      claimed answer no with it (2026-10-31). Apple1 answers as Apple2, as
-     Metal does: the tables' first Apple column is Apple2. Today the lane
-     carries Apple1 and Apple2: Apple2's rows need argument encoders,
+     Metal does: the tables' first Apple column is Apple2.
+   - No Apple family is claimed until the lane carries every piece of
+     Apple7's rows and of the families' before it (2026-11-01). A Mac's GPU
+     answers no Apple family (Intel, AMD) or Apple1 to Apple7 at least
+     (Apple silicon), and the guest's frameworks choose their paths from
+     those answers together. With Apple1 and Apple2 answered yes and Apple3
+     no, RenderBox made its passes' extra attachments memoryless and used
+     them in a way Metal fails: every command buffer it drew an app icon in
+     failed with `MTLCommandBufferErrorInvalidResource`, and the Dock's icons
+     were blank (an x86-64 macOS 26 guest). With no Apple family, as an
+     Intel or AMD Mac answers, they draw.
+   - Today the lane carries Apple1's and Apple2's pieces (argument encoders,
      placement in `Automatic` heaps with the heap texture size, programmable
-     sample positions, texture views and Metal IO queues, and it carries
-     them all; the IO queues are Metal's own over the bundle's device, with
-     nothing on the wire. Apple3 waits on indirect command buffers. Each
-     family's pieces are listed in `device_info.rs` (`APPLE_PIECES`), and the
-     claim rises as each piece lands.
+     sample positions, texture views and Metal IO queues; the IO queues are
+     Metal's own over the bundle's device, with nothing on the wire) and
+     binary archives, so it claims no Apple family. Apple3 waits on indirect
+     command buffers. Each family's pieces are listed in `device_info.rs`
+     (`APPLE_PIECES`), and the claim rises to Apple7 when the last of its
+     pieces lands, then family by family.
    - Mac1, Mac2, Common1 to Common3 and Metal3 keep the platform's answer for
      now, though their rows need some of the same pieces: argument encoders
      for Mac1, Mac2 and Metal3, and the heaps, sample positions and IO

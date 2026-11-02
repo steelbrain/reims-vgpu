@@ -326,7 +326,9 @@ fn command_buffer(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
 }
 
 /// The device-info caps blob is written into the region at [`RGFX_DEVICE_INFO_OFFSET`] at init,
-/// mirroring the GPU device's caps the guest bundle reads before it makes any queue
+/// mirroring the GPU device's caps the guest bundle reads before it makes any queue; on the fake
+/// (an M3 Max's answers) it answers no Apple family and no iOS feature set, as an Intel or AMD
+/// Mac's GPU does, and the platform's Mac2 and macOS_GPUFamily2_v1
 #[test]
 fn device_info_is_written_into_the_region_at_init() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -346,6 +348,27 @@ fn device_info_is_written_into_the_region_at_init() {
         &info.name[..info.name_len as usize],
         caps.name.as_deref().unwrap().as_bytes()
     );
+    let family = |value: i64| {
+        let n = info.family_count as usize;
+        let k = info.family_values[..n].iter().position(|&f| f == value);
+        k.map(|k| info.family_answers[k])
+    };
+    let feature_set = |value: u64| {
+        let n = info.feature_set_count as usize;
+        let k = info.feature_set_values[..n]
+            .iter()
+            .position(|&f| f == value);
+        k.map(|k| info.feature_set_answers[k])
+    };
+    for apple in 1001..=1011 {
+        assert_eq!(family(apple), Some(0), "family {apple}");
+    }
+    assert_eq!(family(2002), Some(1));
+    // iOS_GPUFamily1_v1 (0) to iOS_GPUFamily5_v1 (16); macOS_GPUFamily2_v1 (10005).
+    for set in 0..=16 {
+        assert_eq!(feature_set(set), Some(0), "feature set {set}");
+    }
+    assert_eq!(feature_set(10005), Some(1));
 }
 
 /// An object-create message on ring 0 reaches the decoder: its handle is held

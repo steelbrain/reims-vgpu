@@ -213,7 +213,8 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues (Metal's own IO
 /// queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
-/// the Apple families it holds back rise with it.
+/// the Apple families it holds back rise with it once every piece up to Apple7's is here
+/// ([`cap_apple_families`]).
 const WIRED: &[Piece] = &[
     Piece::ArgumentEncoders,
     Piece::AutomaticHeaps,
@@ -223,14 +224,30 @@ const WIRED: &[Piece] = &[
     Piece::IoCommandQueues,
 ];
 
+/// `MTLGPUFamilyApple7`, the M1's: the first Apple family a Mac's GPU answers. A Mac's GPU
+/// answers no Apple family (an Intel or AMD GPU) or every one from Apple1 to Apple7 at least (an
+/// Apple silicon GPU); none answers Apple1 or Apple2 without Apple7.
+const FIRST_MAC_APPLE_FAMILY: i64 = 1007;
+
 /// `identity` with each Apple family answered yes only where the platform answers yes and `wired`
-/// holds every piece of its rows and of each Apple family's before it ([`APPLE_PIECES`]), and each
-/// iOS feature set of a family so lowered answered no with it.
+/// holds every piece of its rows and of each Apple family's before it ([`APPLE_PIECES`]) and of
+/// Apple7's and each family's before it ([`FIRST_MAC_APPLE_FAMILY`]), and each iOS feature set of
+/// a family so lowered answered no with it. Short of Apple7, the device answers no Apple family,
+/// as an Intel or AMD Mac's GPU does:
+/// the guest's frameworks choose their paths by the families a Mac's GPU answers together, and
+/// Apple1 and Apple2 without Apple3 is no Mac's. On those answers RenderBox makes its passes'
+/// extra attachments memoryless and uses them in a way Metal fails: every command buffer it
+/// renders an app's icon in failed with `MTLCommandBufferErrorInvalidResource` and the icons
+/// were blank (measured, an x86-64 macOS 26 guest); with no Apple family it renders them.
 fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
-    let mut carried = true;
+    let holds = |pieces: &[Piece]| pieces.iter().all(|piece| wired.contains(piece));
+    let mut carried = APPLE_PIECES
+        .iter()
+        .filter(|(family, _)| *family <= FIRST_MAC_APPLE_FAMILY)
+        .all(|(_, pieces)| holds(pieces));
     let mut lowered = [false; SDK_FAMILIES.len()];
     for (family, pieces) in APPLE_PIECES {
-        carried &= pieces.iter().all(|piece| wired.contains(piece));
+        carried &= holds(pieces);
         if !carried {
             identity.families[at(family)] = Some(false);
             lowered[at(family)] = true;
@@ -251,7 +268,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// | answer | the lane's | waits on |
 /// |---|---|---|
-/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks: the platform's of Apple1 and Apple2, every piece of which it carries, and no from Apple3 on | each family's pieces in [`APPLE_PIECES`] the lane lacks, from Apple3's indirect command buffers and compute indirect barriers on |
+/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks, and no for every one while the lane lacks a piece of Apple7's rows or of a family's before it ([`cap_apple_families`]): today no for every one, as an Intel or AMD Mac's GPU answers, though the lane carries Apple1's and Apple2's pieces | each piece in [`APPLE_PIECES`] up to Apple7's the lane lacks, from Apple3's indirect command buffers and compute indirect barriers on, then each later family's |
 /// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's | nothing [`APPLE_PIECES`] lists: it lists the Apple families' pieces alone, and the pieces of Apple1 and Apple2 these rows were held to (argument encoders, automatic heaps, sample positions and IO command queues) the lane carries |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
@@ -523,8 +540,8 @@ mod tests {
 
     /// Every family of the SDK and -1009 is answered, each the platform's (the fake answers as
     /// an M3 Max: Apple1 to Apple9, Mac1 and Mac2, the Common families and Metal3), but the
-    /// Apple families past Apple2, which need pieces the lane lacks, and Metal4; a value that
-    /// names no family is listed nowhere
+    /// Apple families, none of which the lane claims short of Apple7's pieces, and Metal4; a value
+    /// that names no family is listed nowhere
     #[test]
     fn every_family_is_the_platforms_or_the_lanes() {
         let p = Arc::new(FakePlatform::new());
@@ -532,11 +549,12 @@ mod tests {
         caps.families[6] = Ok(false);
         let info = device_info(&caps, p.device().identity_caps(), 4);
         assert_eq!(info.family_count, 21);
-        for yes in [1001, 1002, 2001, 2002, 3001, 3002, 3003, 5001] {
+        for yes in [2001, 2002, 3001, 3002, 3003, 5001] {
             assert_eq!(family(&info, yes), Some(1), "family {yes}");
         }
         for no in [
-            1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 4001, 4002, 5002, -1009,
+            1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 4001, 4002, 5002,
+            -1009,
         ] {
             assert_eq!(family(&info, no), Some(0), "family {no}");
         }
@@ -544,144 +562,127 @@ mod tests {
     }
 
     /// Every feature set is answered as the platform answers it, the fake's (an M3 Max's) every
-    /// iOS one and macOS' but 10002 and no tvOS one, but the iOS sets of Apple3 and later, whose
-    /// families the lane answers no: iOS_GPUFamily1 and 2's stand with Apple1 and Apple2
+    /// iOS one and macOS' but 10002 and no tvOS one, but the iOS sets, whose families the lane
+    /// answers no; the macOS sets stand with Mac1 and Mac2
     #[test]
     fn every_feature_set_is_the_platforms_or_its_familys() {
         let p = Arc::new(FakePlatform::new());
         let info = device_info(&p.device().caps(), p.device().identity_caps(), 4);
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
-        for set in [
-            0, 1, 2, 3, 5, 6, 8, 9, 12, 13, 10000, 10001, 10003, 10004, 10005,
-        ] {
+        for set in [10000, 10001, 10003, 10004, 10005] {
             assert_eq!(feature_set(&info, set), Some(1), "feature set {set}");
         }
-        for set in [4, 7, 10, 11, 14, 15, 16, 10002, 30000, 30005] {
+        for set in [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 10002, 30000, 30005,
+        ] {
             assert_eq!(feature_set(&info, set), Some(0), "feature set {set}");
         }
     }
 
     /// An Apple family keeps the platform's yes only while the lane carries every piece of its
-    /// rows and the rows before it: with every piece the fake's Apple1 to Apple9 and their iOS
-    /// sets stand; without imageblocks, an Apple4 piece, Apple4 and later answer no and so do
-    /// iOS_GPUFamily4 and 5, while Apple1 to Apple3, their sets and Mac1 stand; without argument
-    /// encoders, texture views or Automatic heaps, no Apple family does; with the lane's pieces
-    /// Apple1 and Apple2 stand, and without any one of them none; with Apple1 to Apple3's pieces
-    /// Apple3 stands, and without binary archives it does not
+    /// rows and the rows before it, and every piece up to Apple7's: with every piece the fake's
+    /// Apple1 to Apple9 and their iOS sets stand; without placement sparse, an Apple8 piece,
+    /// Apple1 to Apple7 and their sets stand and Apple8 and Apple9 do not; without a piece of
+    /// Apple7's rows or a family's before it (Apple7's Metal 4, Apple4's imageblocks, Apple1's
+    /// argument encoders) no Apple family and no iOS set stands, while Mac2 and the macOS sets
+    /// do; the lane's own pieces, Apple1's, Apple2's and binary archives, claim none, nor do
+    /// Apple1 to Apple3's, while Apple1 to Apple7's claim those seven
     #[test]
     fn an_apple_family_drops_where_the_lane_lacks_a_piece() {
         let p = Arc::new(FakePlatform::new());
         let platform = p.device().identity_caps();
-        let every: Vec<Piece> = APPLE_PIECES
-            .iter()
-            .flat_map(|(_, pieces)| pieces.iter().copied())
-            .collect();
+        let capped = |wired: &[Piece]| -> IdentityCaps {
+            let mut identity = platform.clone();
+            cap_apple_families(&mut identity, wired);
+            identity
+        };
+        let up_to = |families: usize| -> Vec<Piece> {
+            APPLE_PIECES[..families]
+                .iter()
+                .flat_map(|(_, pieces)| pieces.iter().copied())
+                .collect()
+        };
+        let every = up_to(APPLE_PIECES.len());
         let without = |missing: Piece| -> IdentityCaps {
             let wired: Vec<Piece> = every.iter().copied().filter(|&p| p != missing).collect();
-            let mut identity = platform.clone();
-            cap_apple_families(&mut identity, &wired);
-            identity
+            capped(&wired)
         };
         let answer = |identity: &IdentityCaps, family: i64| identity.families[at(family)];
         let set = |identity: &IdentityCaps, set: u64| {
             identity.feature_sets[FEATURE_SETS.iter().position(|&s| s == set).unwrap()]
         };
 
-        let mut whole = platform.clone();
-        cap_apple_families(&mut whole, &every);
+        let whole = capped(&every);
         assert_eq!(whole.families, platform.families);
         assert_eq!(whole.feature_sets, platform.feature_sets);
 
-        let no_imageblocks = without(Piece::Imageblocks);
-        for family in [1001, 1002, 1003, 2001, 2002, 5001] {
-            assert_eq!(
-                answer(&no_imageblocks, family),
-                Some(true),
-                "family {family}"
-            );
+        // Past Apple7, a family falls with its own pieces and the later ones with it.
+        let no_placement = without(Piece::PlacementSparse);
+        for family in [1001, 1002, 1003, 1004, 1005, 1006, 1007, 2001, 2002, 5001] {
+            assert_eq!(answer(&no_placement, family), Some(true), "family {family}");
         }
-        for family in [1004, 1005, 1006, 1007, 1008, 1009] {
+        for family in [1008, 1009] {
             assert_eq!(
-                answer(&no_imageblocks, family),
+                answer(&no_placement, family),
                 Some(false),
                 "family {family}"
             );
         }
-        // iOS_GPUFamily3_v4 (14) stands; iOS_GPUFamily4_v1 (11) and 5_v1 (16) fall.
-        assert_eq!(set(&no_imageblocks, 14), Some(true));
-        assert_eq!(set(&no_imageblocks, 11), Some(false));
-        assert_eq!(set(&no_imageblocks, 16), Some(false));
-        assert_eq!(set(&no_imageblocks, 10000), Some(true));
+        // iOS_GPUFamily1_v1 (0) and iOS_GPUFamily5_v1 (16) stand.
+        assert_eq!(set(&no_placement, 0), Some(true));
+        assert_eq!(set(&no_placement, 16), Some(true));
+
+        // Short of Apple7, no Apple family stands, whichever piece is missing.
+        for missing in [Piece::Metal4, Piece::Imageblocks, Piece::ArgumentEncoders] {
+            let short = without(missing);
+            for family in 1001..=1011 {
+                assert_eq!(
+                    answer(&short, family),
+                    Some(false),
+                    "{missing:?} family {family}"
+                );
+            }
+            assert_eq!(answer(&short, 2002), Some(true), "{missing:?}");
+            // iOS_GPUFamily1_v1 (0), 2_v1 (1), 3_v4 (14) and 5_v1 (16) fall;
+            // macOS_GPUFamily2_v1 (10005) stands.
+            for s in [0, 1, 14, 16] {
+                assert_eq!(set(&short, s), Some(false), "{missing:?} set {s}");
+            }
+            assert_eq!(set(&short, 10005), Some(true), "{missing:?}");
+        }
 
         // The lane's own pieces: argument encoders, texture views, Automatic heaps, sample
-        // positions and IO queues, Apple2's (and so Apple1's), so Apple1 and Apple2 stand and
-        // Apple3, which needs indirect command buffers, does not; neither would stand without any
-        // one of them, and with each lowered falls each iOS feature set of its family.
-        assert!(WIRED.contains(&Piece::ArgumentEncoders));
-        assert!(WIRED.contains(&Piece::TextureViews));
-        assert!(WIRED.contains(&Piece::AutomaticHeaps));
-        assert!(WIRED.contains(&Piece::SamplePositions));
-        assert!(WIRED.contains(&Piece::IoCommandQueues));
-        let mut lane = platform.clone();
-        cap_apple_families(&mut lane, WIRED);
-        assert_eq!(answer(&lane, 1001), Some(true));
-        assert_eq!(answer(&lane, 1002), Some(true));
-        for family in 1003..=1011 {
-            assert_eq!(answer(&lane, family), Some(false), "family {family}");
-        }
-        assert_eq!(answer(&lane, 2002), Some(true));
-        let lane_only = |missing: Piece| -> IdentityCaps {
-            let wired: Vec<Piece> = WIRED.iter().copied().filter(|&p| p != missing).collect();
-            let mut identity = platform.clone();
-            cap_apple_families(&mut identity, &wired);
-            identity
-        };
+        // positions and IO queues, Apple1's and Apple2's, and binary archives, Apple3's. They
+        // fall short of Apple7, so no Apple family stands; Mac2 does.
         for piece in [
             Piece::ArgumentEncoders,
             Piece::TextureViews,
             Piece::AutomaticHeaps,
             Piece::SamplePositions,
             Piece::IoCommandQueues,
+            Piece::BinaryArchives,
         ] {
-            let short = lane_only(piece);
-            for family in 1001..=1011 {
-                assert_eq!(
-                    answer(&short, family),
-                    Some(false),
-                    "{piece:?} family {family}"
-                );
-            }
-            assert_eq!(answer(&short, 2002), Some(true), "{piece:?}");
+            assert!(WIRED.contains(&piece), "{piece:?}");
         }
-
-        let no_encoders = without(Piece::ArgumentEncoders);
+        let lane = capped(WIRED);
         for family in 1001..=1011 {
-            assert_eq!(answer(&no_encoders, family), Some(false), "family {family}");
+            assert_eq!(answer(&lane, family), Some(false), "family {family}");
         }
-        assert_eq!(answer(&no_encoders, 2002), Some(true));
-        assert_eq!(set(&no_encoders, 0), Some(false));
+        assert_eq!(answer(&lane, 2002), Some(true));
+        assert_eq!(set(&lane, 0), Some(false));
+        assert_eq!(set(&lane, 10005), Some(true));
 
-        // Binary archives are the lane's too, so once the rest of Apple1 to Apple3's pieces are
-        // carried, Apple3 stands and Apple4 does not; without binary archives Apple3 falls back
-        // to Apple2.
-        assert!(WIRED.contains(&Piece::BinaryArchives));
-        let to_apple3: Vec<Piece> = APPLE_PIECES[..3]
-            .iter()
-            .flat_map(|(_, pieces)| pieces.iter().copied())
-            .collect();
-        let mut apple3 = platform.clone();
-        cap_apple_families(&mut apple3, &to_apple3);
-        assert_eq!(answer(&apple3, 1003), Some(true));
-        assert_eq!(answer(&apple3, 1004), Some(false));
-        let no_archives: Vec<Piece> = to_apple3
-            .iter()
-            .copied()
-            .filter(|&p| p != Piece::BinaryArchives)
-            .collect();
-        let mut apple2 = platform.clone();
-        cap_apple_families(&mut apple2, &no_archives);
-        assert_eq!(answer(&apple2, 1002), Some(true));
-        assert_eq!(answer(&apple2, 1003), Some(false));
+        // Every piece of Apple1 to Apple3's claims none; every piece of Apple1 to Apple7's claims
+        // those seven, and not Apple8.
+        let apple3 = capped(&up_to(3));
+        for family in 1001..=1011 {
+            assert_eq!(answer(&apple3, family), Some(false), "family {family}");
+        }
+        let apple7 = capped(&up_to(7));
+        for family in 1001..=1007 {
+            assert_eq!(answer(&apple7, family), Some(true), "family {family}");
+        }
+        assert_eq!(answer(&apple7, 1008), Some(false));
     }
 
     /// The identity is the platform's, a name longer than v1's 32 bytes whole and the memory as
