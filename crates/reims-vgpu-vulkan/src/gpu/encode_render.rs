@@ -240,7 +240,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
@@ -424,6 +424,10 @@ pub struct RenderEncoderObject {
     undrawn: Mutex<bool>,
     /// What its draws may write through what it binds ([`Reach`]).
     reach: Mutex<Reach>,
+    /// Whether `reach` holds nothing a draw asks of ([`Reach::quiet`]), so a draw, a tile
+    /// dispatch or an execution asks nothing of it ([`VulkanRenderEncoder::issues`]): set at
+    /// each bind.
+    quiet: AtomicBool,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
@@ -1429,6 +1433,15 @@ impl Reach {
         self.pipeline = Some((Arc::clone(reflection), writes));
     }
 
+    /// Whether it holds nothing a draw asks of: no bind at a slot and nothing made resident that
+    /// decides anything ([`matters`]), so [`Self::kept`] and [`Self::unsent_dropped`] find
+    /// nothing, whatever the pipeline state. Most passes bind only plain memory, and stay so.
+    fn quiet(&self) -> bool {
+        (self.buffers.iter().chain(&self.textures)).all(BTreeMap::is_empty)
+            && self.used_textures.is_empty()
+            && self.used_buffers.is_empty()
+    }
+
     /// Whether a texture bound or made resident for writing, or a buffer bound to the tile
     /// stage, lies on a surface whose GPU writes never reach its memory
     /// ([`crate::os::gpu_read_only`]), or is a texture whose writes the runtime refuses. A vertex
@@ -1657,6 +1670,7 @@ fn opened(
         varying_rates: taken.class == Some(Class::Varying),
         undrawn: Mutex::new(taken.mutable),
         reach: Mutex::new(Reach::default()),
+        quiet: AtomicBool::new(true),
         bfloat_loaded: bfloat_loaded(&d),
         pass: d,
     });
@@ -1885,6 +1899,7 @@ impl VulkanRenderEncoder {
                 Bind::Used(textures, buffers, true) => reach.used(textures, buffers),
                 Bind::Used(_, _, false) => {}
             }
+            self.quiet.store(reach.quiet(), Ordering::Release);
         });
     }
 
@@ -1897,8 +1912,14 @@ impl VulkanRenderEncoder {
     /// surface are sent, and dropped as on Metal. Before that, it dies where it may write through
     /// an object over memory the runtime imports through a writable twin of read-only pages,
     /// whose pages the write would reach ([`Reach::kept`], [`crate::gpu::writes::kept_write`]).
-    /// One that issues nothing, which Metal writes nothing of, is not asked.
+    /// One that issues nothing, which Metal writes nothing of, is not asked. A pass that holds
+    /// nothing a draw asks of ([`Reach::quiet`]) finds nothing, so its draws only check the
+    /// task's end, where the lookup would have.
     fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
+        if self.quiet.load(Ordering::Acquire) {
+            stop_if_task_ended();
+            return;
+        }
         let (kept, written) = plain(|| {
             let reach = self.reach.lock();
             let kept = (crate::os::TWINS_READ_ONLY)
@@ -3623,6 +3644,33 @@ pub(crate) mod tests {
         assert_eq!(r.textures[FRAGMENT].get(&2), Some(&dropped));
         r.bind_one(FRAGMENT, false, 2, plain);
         assert!(r.textures[FRAGMENT].is_empty());
+    }
+
+    /// A pass is quiet while it holds nothing a draw asks of, as a pass that binds only plain
+    /// memory does: its draws then ask nothing ([`VulkanRenderEncoder::issues`]). A bind or a
+    /// resident use that decides something ends it, and a bind of plain memory in that slot
+    /// brings it back
+    #[test]
+    fn a_pass_is_quiet_while_it_holds_nothing_a_draw_asks_of() {
+        let plain = Bound {
+            meets: true,
+            ..Bound::default()
+        };
+        let dropped = Bound {
+            dropped: true,
+            ..plain.clone()
+        };
+        let mut r = Reach::default();
+        assert!(r.quiet());
+        r.bind_one(FRAGMENT, false, 0, plain.clone());
+        r.bind_one(VERTEX, true, 1, plain.clone());
+        assert!(r.quiet());
+        r.bind_one(FRAGMENT, false, 0, dropped.clone());
+        assert!(!r.quiet() && r.unsent_dropped());
+        r.bind_one(FRAGMENT, false, 0, plain);
+        assert!(r.quiet());
+        r.used(vec![dropped], Vec::new());
+        assert!(!r.quiet() && r.unsent_dropped());
     }
 
     /// An open encoder on a target, on this platform.
