@@ -50,8 +50,8 @@ pub const RGFX_MSIX_VECTORS: u32 = 1;
 pub const RGFX_REG_MAGIC: u32 = 0x000;
 /// `VERSION`, RO: [`RGFX_VERSION`].
 pub const RGFX_REG_VERSION: u32 = 0x004;
-/// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`] and
-/// [`RGFX_FEATURE_SURFACE_CACHE`].
+/// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`],
+/// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`].
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -69,6 +69,11 @@ pub const RGFX_FEATURE_SURFACE_PAGES: u32 = 1 << 0;
 /// has the next use fill it again. Set where the host's GPU does not share the CPU's memory; the
 /// kext alone reads it, and nothing the guest's processes see changes but the time copies take.
 pub const RGFX_FEATURE_SURFACE_CACHE: u32 = 1 << 1;
+/// `FEATURES_LO` bit 2, `CB_SUBMITTED`: a command buffer that holds an
+/// [`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED) gets a [`RGFX_EVT_CB_SUBMITTED`], at which
+/// the guest's `commitAndWaitUntilSubmitted` returns. Without it the guest sends no such op, and
+/// that call returns at the buffer's `CB_SCHEDULED`.
+pub const RGFX_FEATURE_CB_SUBMITTED: u32 = 1 << 2;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -456,6 +461,13 @@ pub const RGFX_EVT_SAMPLER_STATE: u32 = 0x404;
 /// scheduled, as Metal's becomes `Scheduled`: every wait of it is satisfied and the host's
 /// platform has submitted its work. Posted ahead of the buffer's [`RgfxCbComplete`], once.
 pub const RGFX_EVT_CB_SCHEDULED: u32 = 0x405;
+/// Event `CB_SUBMITTED` ([`RgfxCbSubmitted`], a per-queue completion ring), where the device has
+/// [`RGFX_FEATURE_CB_SUBMITTED`]: a command buffer that asked for it
+/// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)) is submitted, as Metal's is when its
+/// `commitAndWaitUntilSubmitted` returns. Posted once, ahead of the buffer's [`RgfxCbScheduled`]
+/// and [`RgfxCbComplete`]: as soon as the host has committed it, where it waits for no event, and
+/// else once its waits are satisfied, at its scheduling.
+pub const RGFX_EVT_CB_SUBMITTED: u32 = 0x406;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1186,6 +1198,23 @@ pub struct RgfxCbScheduled {
     /// [`RGFX_EVT_CB_SCHEDULED`], with the command buffer's submission `seqno`.
     pub header: RgfxMsgHeader,
     /// The command buffer that is scheduled.
+    pub cb_obj_id: u64,
+}
+
+/// `CB_SUBMITTED`, on the command buffer's queue's completion ring: the buffer, which asked for it
+/// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)), is submitted: the host has committed it
+/// to its platform, so every message the guest sends after this event is carried out after that
+/// commit, and its waits for events are satisfied. Ahead of its [`RgfxCbScheduled`] and its
+/// [`RgfxCbComplete`]. A buffer the host could not carry out has none: its `CB_COMPLETE` stands for
+/// it. The guest reads a record of at least this size.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCbSubmitted {
+    /// [`RGFX_EVT_CB_SUBMITTED`], with the command buffer's submission `seqno`.
+    pub header: RgfxMsgHeader,
+    /// The command buffer that is submitted.
     pub cb_obj_id: u64,
 }
 
@@ -2529,6 +2558,7 @@ const _: () = {
     assert!(size_of::<RgfxBufferAtOffset>() == 56);
     assert!(size_of::<RgfxCbComplete>() == 48);
     assert!(size_of::<RgfxCbScheduled>() == 24);
+    assert!(size_of::<RgfxCbSubmitted>() == 24);
     assert!(size_of::<RgfxEventSignalled>() == 32);
     assert!(size_of::<RgfxTextureDescriptor>() == 48);
     assert!(size_of::<RgfxTextureCreate>() == 104);

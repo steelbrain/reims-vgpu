@@ -71,6 +71,7 @@ include = [
     "RgfxBufferStrideBinding",
     "RgfxCbComplete",
     "RgfxCbScheduled",
+    "RgfxCbSubmitted",
     "RgfxColorAttachmentDesc",
     "RgfxCommandBuffer",
     "RgfxCommandBufferInRegion",

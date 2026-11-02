@@ -35,11 +35,11 @@ use reims_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxEventSignalled,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState,
-    RgfxSurfacePages,
+    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxBlockRelease,
+    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -67,8 +67,8 @@ use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
     CompletionSink, DecodeError, FailedContexts, GraphicsDecoder, LibraryJob, LibraryStart,
-    MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, compile_refusing,
-    complete, make_library, refused_reply, refusing,
+    MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, SubmittedSink,
+    compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{PresentAnswers, PresentQueue};
@@ -189,14 +189,17 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
             }
-            // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks.
-            let features = match (decoder.surface_pages_available(), unified_memory) {
-                (false, _) => 0,
-                (true, true) => u64::from(RGFX_FEATURE_SURFACE_PAGES),
-                (true, false) => {
-                    u64::from(RGFX_FEATURE_SURFACE_PAGES) | u64::from(RGFX_FEATURE_SURFACE_CACHE)
-                }
-            };
+            // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks. Every
+            // host answers a command buffer's ask for its submission.
+            let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
+                | match (decoder.surface_pages_available(), unified_memory) {
+                    (false, _) => 0,
+                    (true, true) => u64::from(RGFX_FEATURE_SURFACE_PAGES),
+                    (true, false) => {
+                        u64::from(RGFX_FEATURE_SURFACE_PAGES)
+                            | u64::from(RGFX_FEATURE_SURFACE_CACHE)
+                    }
+                };
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),
@@ -608,6 +611,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let scheduled: ScheduledSink = Arc::new(move |record: RgfxCbScheduled| {
                 scheduled_poster.post(record.as_bytes());
             });
+            let submitted_poster = poster.clone();
+            let submitted: SubmittedSink = Arc::new(move |record: RgfxCbSubmitted| {
+                submitted_poster.post(record.as_bytes());
+            });
             let reflection_poster = poster.clone();
             let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
                 reflection_poster.post(record.as_bytes());
@@ -617,6 +624,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 decoder.set_completion_sink(sink);
                 decoder.set_signal_sink(signal);
                 decoder.set_scheduled_sink(scheduled);
+                decoder.set_submitted_sink(submitted);
                 decoder.set_reflection_sink(reflection);
                 decoder.set_context(Some(sender_context(poster, message)));
                 if r#type == RGFX_CMD_OBJECT_DESTROY {

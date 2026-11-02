@@ -251,14 +251,16 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The blocks `uses` names that have caches, before command buffer `cb` of queue `queue`
     /// runs: each filled where it holds an older generation than the use's, or none, or a device
     /// of the host wrote its pages since its last fill, and `cb` made to wait for each one's last
-    /// fill. A use that may write marks its cache written.
+    /// fill not yet done; and whether it waits for one. A use that may write marks its cache
+    /// written.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
-    ) -> RaiseResult<Vec<u64>> {
+    ) -> RaiseResult<(Vec<u64>, bool)> {
         let mut used = Vec::new();
+        let mut waits = false;
         for u in uses {
             if !self.by_block.contains_key(&u.block_offset) || used.contains(&u.block_offset) {
                 continue;
@@ -284,9 +286,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 && cache.filled_at > t.done.load(Ordering::Acquire)
             {
                 cb.encode_wait(Some(EventRef::Event(&t.event)), cache.filled_at)?;
+                waits = true;
             }
         }
-        Ok(used)
+        Ok((used, waits))
     }
 
     /// Ends command buffer `cb` of queue `queue`, which used the caches of `used`: it signals the

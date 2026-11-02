@@ -90,6 +90,12 @@ pub const RGFX_OP_WAIT_EVENT: u16 = 0x0006;
 /// older generation, and orders a later copy of the cache after the buffer. An op naming a block
 /// with no cache does nothing.
 pub const RGFX_OP_SURFACE_USE: u16 = 0x0007;
+/// Op `SUBMITTED` (no body), where the device has
+/// [`RGFX_FEATURE_CB_SUBMITTED`](crate::wire::RGFX_FEATURE_CB_SUBMITTED): the command buffer is
+/// committed by `commitAndWaitUntilSubmitted`, and asks for its
+/// [`RGFX_EVT_CB_SUBMITTED`](crate::wire::RGFX_EVT_CB_SUBMITTED). Anywhere in the stream, once;
+/// the bundle puts it first.
+pub const RGFX_OP_SUBMITTED: u16 = 0x0008;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;

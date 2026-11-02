@@ -3258,7 +3258,8 @@ fn a_failed_context_s_queues_and_queries_are_refused() {
 }
 
 /// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
-/// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does
+/// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
+/// a command buffer's ask for its submission (`CB_SUBMITTED`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -3288,9 +3289,15 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     } else {
         0
     };
-    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_LO.into()), want);
+    assert_eq!(
+        device.mmio_read(RGFX_REG_FEATURES_LO.into()),
+        want | RGFX_FEATURE_CB_SUBMITTED
+    );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
-    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_LO.into()), 0);
+    assert_eq!(
+        device.mmio_read(RGFX_REG_FEATURES_LO.into()),
+        RGFX_FEATURE_CB_SUBMITTED
+    );
 }

@@ -37,6 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
@@ -64,9 +65,9 @@ use reims_graphics::wire::{
     RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
     RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
     RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxCbScheduled, RgfxColorAttachmentDesc,
-    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
-    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
+    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled,
+    RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
     RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
     RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
     RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
@@ -137,6 +138,12 @@ pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>;
 /// The ring loop sets one that writes it to the queue's completion ring; until it is set, a
 /// command buffer gets no scheduled handler.
 pub(crate) type ScheduledSink = Arc<dyn Fn(RgfxCbScheduled) + Send + Sync>;
+
+/// A sink the decoder calls with the `CB_SUBMITTED` record of each command buffer that asks for it
+/// (`RGFX_OP_SUBMITTED`) once the buffer is submitted, ahead of its scheduled and completion
+/// records. The ring loop sets one that writes it to the queue's completion ring; until it is set,
+/// no buffer's ask is answered.
+pub(crate) type SubmittedSink = Arc<dyn Fn(RgfxCbSubmitted) + Send + Sync>;
 
 /// A sink the decoder calls with a pipeline create's reflection reply once the
 /// pipeline is made (or refused). The ring loop sets one that writes the reply to
@@ -278,6 +285,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where a command buffer's `CB_SCHEDULED` goes once it is scheduled; `None` registers no
     /// scheduled handler (the ring loop sets a sink later).
     scheduled_sink: Option<ScheduledSink>,
+    /// Where the `CB_SUBMITTED` of a command buffer that asks for it goes once it is submitted;
+    /// `None` answers no ask (the ring loop sets a sink later).
+    submitted_sink: Option<SubmittedSink>,
     /// The watch over command buffers that wait on events, which logs the ones that wait long
     /// (diagnostics only: [`waits`]).
     waits: waits::WaitWatch<P>,
@@ -305,6 +315,10 @@ pub struct GraphicsDecoder<P: Platform> {
     surface_views: surface_pages::SurfaceViews<P>,
     /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
     surface_caches: surface_cache::SurfaceCaches<P>,
+    /// By queue: how many of its command buffers that wait for an event are not yet scheduled.
+    /// A buffer committed behind one is not submitted until it is, as Metal's is not
+    /// ([`cmdbuf`]'s submission).
+    held_queues: HashMap<u64, Arc<AtomicUsize>>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -329,6 +343,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             completion_sink: None,
             signal_sink: None,
             scheduled_sink: None,
+            submitted_sink: None,
             reflection_sink: None,
             context: None,
             spans: HashMap::new(),
@@ -338,6 +353,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             unified_memory: false,
             surface_views: surface_pages::SurfaceViews::new(None),
             surface_caches: surface_cache::SurfaceCaches::new(true),
+            held_queues: HashMap::new(),
             region,
         }
     }
@@ -516,6 +532,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.scheduled_sink = Some(sink);
     }
 
+    /// Sets the sink the decoder hands the `CB_SUBMITTED` of each command buffer that asks for it
+    /// to once the buffer is submitted (the ring loop's, writing the queue's completion ring).
+    pub(crate) fn set_submitted_sink(&mut self, sink: SubmittedSink) {
+        self.submitted_sink = Some(sink);
+    }
+
     /// Sets the sink the decoder hands each pipeline create's reflection reply to
     /// (the ring loop's, writing the queue's completion ring).
     pub(crate) fn set_reflection_sink(&mut self, sink: ReflectionSink) {
@@ -665,6 +687,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         self.spans.retain(|id, _| !ours(id));
+        self.held_queues.retain(|id, _| !ours(id));
         let managed: Vec<u64> = self.managed.keys().copied().filter(ours).collect();
         for id in managed {
             if let Some(copy) = self.managed.remove(&id) {
@@ -864,6 +887,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     refused_release(m.obj_id, &refusal);
                 }
                 self.spans.remove(&m.obj_id);
+                self.held_queues.remove(&m.obj_id);
                 if let Some(copy) = self.managed.remove(&m.obj_id) {
                     drop_refused(m.obj_id, copy);
                 }
