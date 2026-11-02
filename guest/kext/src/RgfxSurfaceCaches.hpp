@@ -20,6 +20,18 @@
 //     still the surface's, past the holders' own wiring, which ends at their let-go: never
 //     pages the guest has purged, paged out or given to another; a block that is not cached
 //     lets its cache go with it (rgfxCacheLetGo, rgfxCacheReleased).
+//   - The block's last holder letting go leaves it dormant (RgfxSurfaceBlocks.hpp), and the
+//     surface cached, its memory wired and its device cache held: its locks go on as before, a
+//     download among them, and its generation moves on. Its BLOCK_RELEASE, once the dormant
+//     block is let go, has the host copy a cache the GPU wrote into the pages, and a lock waits
+//     for the answer; then the surface is no longer cached.
+//   - A dormant surface's device cache purged (op 5, as each client of the surface goes), or
+//     the surface made empty (op 7), marks it to be let go (rgfxCachePurged,
+//     rgfxCachePurgeable), and the kext's release thread lets its block go, the pages taking
+//     what the GPU wrote; a surface made empty while held does not sleep at its last let-go.
+//     A surface made volatile keeps its dormant block, the first of them to go under the caps
+//     (RgfxSurfaceBlocks.hpp), as IOSurfaceRef.h lets a volatile surface's contents be
+//     discarded; made nonvolatile again (op 6, or op 7), it is neither.
 // A wait that does not end in kWaitMs goes on, as a lock waiting for a write does.
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
@@ -31,6 +43,8 @@
 #define RGFX_SURFACE_CACHES_HPP_
 
 #include <stdint.h>
+
+#include "RgfxSurfaceBlocks.hpp"
 
 // One cached surface.
 struct RgfxCachedSurface {
@@ -48,13 +62,25 @@ struct RgfxCachedSurface {
 	bool downloading;
 	// The block's BLOCK_RELEASE is posted and not yet answered.
 	bool releasing;
+	// The block is dormant (no client holds it).
+	bool dormant;
+	// The dormant block is to be let go, and why (a RgfxDormantCause); kRgfxCacheKept for none.
+	uint32_t letGo;
+	// The surface was made volatile, or empty, and not nonvolatile since.
+	bool purgeable;
+	bool emptied;
 	// Where the kext writes `cpuGen` for the processes (the block's header, mapped), the
-	// mapping, and the surface's memory, which the kext holds wired from the block's caching
-	// until it is cached no more, opaque here.
+	// mapping, the surface's memory, held wired while the block lives, and the surface's
+	// reference, which the table holds from the block's let-go until its release is answered,
+	// opaque here.
 	volatile uint64_t *genAt;
 	void *map;
 	void *wire;
+	void *surface;
 };
+
+// RgfxCachedSurface::letGo where nothing asks the dormant block to go.
+constexpr uint32_t kRgfxCacheKept = ~0u;
 
 struct RgfxCacheTable {
 	RgfxCachedSurface *entries;
@@ -86,7 +112,8 @@ inline RgfxCachedSurface *rgfxCacheAtBlock(RgfxCacheTable &t, uint64_t offset)
 inline RgfxCachedSurface *rgfxCacheOfSurface(RgfxCacheTable &t, uint32_t surfaceId)
 {
 	for (uint32_t i = 0; i < t.count; i++) {
-		if (t.entries[i].surfaceId == surfaceId && !t.entries[i].releasing)
+		const RgfxCachedSurface &c = t.entries[i];
+		if (c.surfaceId == surfaceId && !c.releasing)
 			return &t.entries[i];
 	}
 	return nullptr;
@@ -104,11 +131,12 @@ inline RgfxCachedSurface *rgfxCacheAdd(RgfxCacheTable &t, uint64_t key, uint64_t
 	c.key = key;
 	c.offset = offset;
 	c.surfaceId = surfaceId;
+	c.letGo = kRgfxCacheKept;
 	return &c;
 }
 
-// Takes `c` out of the table: its mapping and its surface's wired memory, which the caller lets
-// go, in `*map` and `*wire`.
+// Takes `c` out of the table: its mapping and its wired memory, which the caller lets go, in
+// `*map` and `*wire`.
 inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map, void **wire)
 {
 	*map = c->map;
@@ -116,13 +144,13 @@ inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map,
 	*c = t.entries[--t.count];
 }
 
-// The block of surface `key` goes: a cached one stays, its locks waiting and its memory wired,
-// until the block's release is answered where `releasing`, else it is taken out (its mapping
-// and wired memory in `*map` and `*wire`, for the caller to let go). True where the caller
-// releases the device cache's reference now; false where the table keeps it, and the wiring,
-// for the answer (rgfxCacheReleased).
-inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void **map,
-                           void **wire)
+// The block of surface `key` goes: a cached one stays, its locks waiting, until the block's
+// release is answered where `releasing`, else it is taken out (its mapping and wired memory in
+// `*map` and `*wire`, for the caller to let go). True where the caller releases the device
+// cache's reference and the surface's, `surface`, now; false where the table keeps both for the
+// answer (rgfxCacheReleased).
+inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void *surface,
+                           void **map, void **wire)
 {
 	*map = *wire = nullptr;
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
@@ -130,6 +158,7 @@ inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void
 		return true;
 	if (releasing) {
 		c->releasing = true;
+		c->surface = surface;
 		return false;
 	}
 	rgfxCacheRemove(t, c, map, wire);
@@ -137,18 +166,101 @@ inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void
 }
 
 // The BLOCK_RELEASE of the block at `offset` was answered: the cached surface releasing it is
-// taken out (its mapping and wired memory in `*map` and `*wire`, which the caller unwires only
-// now), and its key, the device cache whose reference the caller releases now, returned; 0
-// where none was releasing it.
-inline uint64_t rgfxCacheReleased(RgfxCacheTable &t, uint64_t offset, void **map, void **wire)
+// taken out (its mapping, wired memory and surface's reference in `*map`, `*wire` and
+// `*surface`), and its key, the device cache whose reference the caller releases now, before
+// the surface's, returned; 0 where none was releasing it.
+inline uint64_t rgfxCacheReleased(RgfxCacheTable &t, uint64_t offset, void **map, void **wire,
+                                  void **surface)
 {
-	*map = *wire = nullptr;
+	*map = *wire = *surface = nullptr;
 	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
 	if (c == nullptr || !c->releasing)
 		return 0;
 	const uint64_t key = c->key;
+	*surface = c->surface;
 	rgfxCacheRemove(t, c, map, wire);
 	return key;
+}
+
+// The block of surface `key` is dormant (`dormant`), or held again: false where the surface is
+// not cached, made empty (it does not sleep), or is to be let go (it is held again by no ask).
+// `*purgeable` where the surface is volatile.
+inline bool rgfxCacheSleep(RgfxCacheTable &t, uint64_t key, bool dormant, bool *purgeable)
+{
+	*purgeable = false;
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr || (dormant && c->emptied) || (!dormant && c->letGo != kRgfxCacheKept))
+		return false;
+	c->dormant = dormant;
+	*purgeable = c->purgeable;
+	return true;
+}
+
+// The new states op 7 carries, as IOMemoryDescriptor numbers them (kIOMemoryPurgeable*):
+// nonvolatile, and the two that may lose a surface's bytes, volatile and empty.
+constexpr uint64_t kRgfxPurgeableNonVolatile = 2;
+constexpr uint64_t kRgfxPurgeableVolatile = 3;
+constexpr uint64_t kRgfxPurgeableEmpty = 4;
+
+// Surface `key`'s device cache was purged (op 5): a dormant block of it is to be let go. True
+// where one is, not asked to go before.
+inline bool rgfxCachePurged(RgfxCacheTable &t, uint64_t key)
+{
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr || !c->dormant || c->letGo != kRgfxCacheKept)
+		return false;
+	c->letGo = kRgfxDormantPurged;
+	return true;
+}
+
+// Surface `key` was made `state` (op 7): volatile marks it, its dormant block the first to go
+// under the caps; empty marks it, its dormant block to be let go now, a held one not to sleep;
+// nonvolatile ends both; reading the state changes nothing. True where a dormant block of it is
+// to be looked at again, on the release thread.
+inline bool rgfxCachePurgeable(RgfxCacheTable &t, uint64_t key, uint64_t state)
+{
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr)
+		return false;
+	if (state == kRgfxPurgeableNonVolatile) {
+		c->purgeable = c->emptied = false;
+	} else if (state == kRgfxPurgeableVolatile) {
+		c->purgeable = true;
+	} else if (state == kRgfxPurgeableEmpty) {
+		c->emptied = true;
+		if (c->dormant && c->letGo == kRgfxCacheKept)
+			c->letGo = kRgfxDormantEmptied;
+	} else {
+		return false;
+	}
+	return c->dormant;
+}
+
+// The dormant block at `offset` of a cached surface is to be let go: its surface had no client
+// left at its sleep. True where it is, not asked to go before.
+inline bool rgfxCacheUnclaimed(RgfxCacheTable &t, uint64_t offset)
+{
+	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	if (c == nullptr || !c->dormant || c->releasing || c->letGo != kRgfxCacheKept)
+		return false;
+	c->letGo = kRgfxDormantNoClients;
+	return true;
+}
+
+// Surface `key` was made nonvolatile by op 6 (IOSurfaceDeviceCache::unpurge): as op 7 with
+// nonvolatile.
+inline bool rgfxCacheUnpurged(RgfxCacheTable &t, uint64_t key)
+{
+	return rgfxCachePurgeable(t, key, kRgfxPurgeableNonVolatile);
+}
+
+// The block at `offset` of a cached surface, where it is dormant and asked to go: why, else
+// kRgfxCacheKept. `*purgeable` where its surface is volatile.
+inline uint32_t rgfxCacheLetGoOf(RgfxCacheTable &t, uint64_t offset, bool *purgeable)
+{
+	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	*purgeable = c != nullptr && c->purgeable;
+	return c != nullptr && c->dormant && !c->releasing ? c->letGo : kRgfxCacheKept;
 }
 
 // A GPU write of surface `key` was named. False where it is not cached.

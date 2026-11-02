@@ -80,6 +80,12 @@ uint32_t rgfxIOSurfaceRootAcceleratorID(void *root, void *accelerator)
 RgfxDeviceCache *rgfxIOSurfaceDeviceCache(OSObject *surface, void *accelerator,
                                           uint32_t acceleratorId, uint32_t third)
     __asm__("__ZN9IOSurface25deviceCacheForAcceleratorEPvjj");
+// IOSurface::getClientRetainCount() const: the surface's clients, one for each process's
+// IOSurfaceClient of it: one more at a process's creation or lookup of it (clientRetain), one
+// fewer as each goes (clientRelease), and 0 at the op 5 of the last one's going (measured in the
+// guest).
+int32_t rgfxIOSurfaceClientCount(const OSObject *surface)
+    __asm__("__ZNK9IOSurface20getClientRetainCountEv");
 // IOSurface::getMemoryDescriptor() const: the surface's memory.
 IOMemoryDescriptor *rgfxIOSurfaceMemory(const OSObject *surface)
     __asm__("__ZNK9IOSurface19getMemoryDescriptorEv");

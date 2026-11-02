@@ -185,9 +185,10 @@ class ReimsGraphics;
 
 // A surface's shared block goes (RgfxAcceleratorContexts.cpp): its device cache's pending writes
 // go, waking the locks waiting on them, and its device cache and IOSurface are released
-// (RgfxAcceleratorLocks.cpp). Either may be null. A cached block's surface stays cached until its
-// BLOCK_RELEASE is answered where `releasing` (rgfxSurfaceCacheReleased), its locks waiting for
-// the answer and its cache and its memory's wiring held until then; else it goes.
+// (RgfxAcceleratorLocks.cpp), the cache's first. Either may be null. A cached block's surface
+// stays cached until its BLOCK_RELEASE is answered where `releasing` (rgfxSurfaceCacheReleased),
+// its locks waiting for the answer and its cache, its surface and its memory's wiring held until
+// then; else it goes.
 void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
 // The surface `surface` of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID
 // `surfaceId`, has its block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page
@@ -198,8 +199,21 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
 // it cannot be.
 bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
                          IOMemoryMap *header, UInt32 genOffset);
+// The cached surface of device cache `cache` has its block dormant (RgfxSurfaceBlocks.hpp), or
+// held again: false where it is not cached, made empty (it does not sleep), or, held again,
+// where it is to be let go. `*purgeable` where the surface is volatile.
+bool rgfxSurfaceCacheSleep(void *cache, bool *purgeable);
+bool rgfxSurfaceCacheWake(void *cache);
+// The dormant cached block at `offset` is to be let go: its surface had no client left at its
+// sleep (rgfxCacheUnclaimed). Takes the locks' lock alone.
+void rgfxSurfaceCacheUnclaimed(UInt64 offset);
+// Why the dormant cached block at `offset` is to be let go (a RgfxDormantCause), else
+// kRgfxCacheKept; `*written` where a buffer wrote its cache since its last copy, `*purgeable`
+// where its surface is volatile.
+uint32_t rgfxSurfaceCacheLetGoOf(UInt64 offset, bool *written, bool *purgeable);
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
-// cached no more, its locks go on, its device cache is released, and its memory unwired.
+// cached no more, its locks go on, and its device cache is released, then the surface, then its
+// memory unwired.
 void rgfxSurfaceCacheReleased(UInt64 offset);
 // The CPU generation of the cached surface of IOSurfaceID `surfaceId`, for a present of it;
 // false where it is not cached.
@@ -304,6 +318,9 @@ public:
 	IOReturn acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
 	                             UInt64 address, UInt64 length, UInt64 size, bool inPlace,
 	                             uint32_t surfaceId, bool cacheable, SurfaceBlock *block);
+	// A dormant block's surface asked it to go (RgfxAcceleratorLocks.cpp): the release thread
+	// lets it go (RgfxAcceleratorContexts.cpp). From any thread, under no lock of the kext's.
+	void wakeReleases();
 	// A CPU lock of the cached surface whose block is at `offset` follows a GPU write: the host
 	// copies its device cache into its pages (SURFACE_DOWNLOAD). True once answered OK, waiting
 	// up to `timeoutMs` (RgfxAcceleratorContexts.cpp).
@@ -418,6 +435,10 @@ private:
 	// block in place of entry `e` at `offset`, still pending, and records the block cached
 	// (rgfxSurfaceCacheAdd): false, nothing made, where it cannot be.
 	bool cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId, UInt64 offset);
+	// Holds the dormant block of entry `e` again for the ask of the surface of IOSurfaceID
+	// `surfaceId` in `task`, where it is that block's surface (RgfxSurfaceBlocks.hpp): false,
+	// nothing changed, where it is not. Under the contexts' lock.
+	bool reviveSurfaceBlock(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId);
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;

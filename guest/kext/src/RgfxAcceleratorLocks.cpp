@@ -145,9 +145,15 @@ bool surfaceHolds(OSObject *surface, UInt64 phys)
 
 void wakeLocked();
 
+static_assert(kRgfxPurgeableNonVolatile == kIOMemoryPurgeableNonVolatile, "op 7's nonvolatile");
+static_assert(kRgfxPurgeableVolatile == kIOMemoryPurgeableVolatile, "op 7's volatile");
+static_assert(kRgfxPurgeableEmpty == kIOMemoryPurgeableEmpty, "op 7's empty");
+
 // The control function every device cache the kext makes calls (RgfxIOSurfaceKPI.hpp), from
 // inside a CPU lock of its surface: op 2 waits while a write of the surface is pending, op 3
-// releases the reference IOSurface took for the call it ends, and op 6 answers in its byte.
+// releases the reference IOSurface took for the call it ends, op 6 answers in its byte, and
+// ops 5, 6 and 7 mark a dormant block of the surface: to go, or the first to go, or neither
+// (RgfxSurfaceCaches.hpp).
 void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint64_t a,
                     uint64_t b)
 {
@@ -158,10 +164,25 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 		reinterpret_cast<OSObject *>(cache)->release();
 		return;
 	}
-	if (op != 2 || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		return;
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
 	const uint64_t key = reinterpret_cast<uintptr_t>(cache);
+	if (op == 5 || op == 6 || op == 7) {
+		// The cache was purged (a client of the surface went), or the surface made empty: a
+		// dormant block of it goes, on the release thread, never in this call. Made volatile,
+		// or nonvolatile again, the release thread marks it.
+		IOLockLock(state.lock);
+		const bool look = op == 5   ? rgfxCachePurged(state.caches, key)
+		                  : op == 6 ? rgfxCacheUnpurged(state.caches, key)
+		                            : rgfxCachePurgeable(state.caches, key, a);
+		IOLockUnlock(state.lock);
+		if (look)
+			accel->wakeReleases();
+		return;
+	}
+	if (op != 2)
+		return;
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	uint32_t surfaceId = 0;
@@ -296,7 +317,7 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 }
 
 namespace {
-// Lets go of a cached surface's memory, wired while its block is cached (rgfxSurfaceCacheAdd).
+// Lets go of a cached surface's memory, wired while its block lived (rgfxSurfaceCacheAdd).
 void unwireSurface(void *wire)
 {
 	if (IOMemoryDescriptor *md = static_cast<IOMemoryDescriptor *>(wire)) {
@@ -314,19 +335,22 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing)
 		IOLockLock(state.lock);
 		const uint64_t key = reinterpret_cast<uintptr_t>(cache);
 		bool wake = rgfxLockForgetKey(state.table, key);
-		// A cached surface's locks wait for its block's release, the cache held until the
-		// answer (rgfxSurfaceCacheReleased), or it is cached no more.
+		// A cached surface's locks wait for its block's release, the cache and the surface held
+		// until the answer (rgfxSurfaceCacheReleased), or it is cached no more.
 		wake |= rgfxCacheFind(state.caches, key) != nullptr;
-		kept = !rgfxCacheLetGo(state.caches, key, releasing, &map, &wire);
+		kept = !rgfxCacheLetGo(state.caches, key, releasing, surface, &map, &wire);
 		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);
 	}
 	if (map)
 		static_cast<IOMemoryMap *>(map)->release();
-	// The reference rgfxSurfaceLocksAttach took, out of every lock: IOSurface frees a cache
-	// released to none (RgfxIOSurfaceKPI.hpp).
-	if (cache && !kept)
+	if (kept)
+		return;
+	// The references rgfxSurfaceLocksAttach took, out of every lock, the cache's first: IOSurface
+	// frees a cache released to none (RgfxIOSurfaceKPI.hpp), while its surface lives. Then the
+	// surface's memory is unwired.
+	if (cache)
 		reinterpret_cast<OSObject *>(cache)->release();
 	if (surface)
 		static_cast<OSObject *>(surface)->release();
@@ -338,8 +362,9 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 {
 	if (!cache || !surface || !header || !startLocks())
 		return false;
-	// The surface's memory, wired while the block is cached: the holders' wiring ends at their
-	// let-go, before the block's BLOCK_RELEASE has the host copy the cache into the pages.
+	// The surface's memory, wired while the block lives, held or dormant: the pages the host
+	// maps stay the surface's, past its last holder and its own end, until the block's release
+	// is answered.
 	IOMemoryDescriptor *wire =
 	    OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(static_cast<OSObject *>(surface)));
 	if (!wire || wire->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
@@ -382,21 +407,69 @@ void rgfxSurfaceCacheReleased(UInt64 offset)
 {
 	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		return;
-	void *map = nullptr, *wire = nullptr;
+	void *map = nullptr, *wire = nullptr, *surface = nullptr;
 	IOLockLock(state.lock);
 	// One cached surface at most has the block: its offset is reused only past this release.
 	OSObject *cache = reinterpret_cast<OSObject *>(
-	    static_cast<uintptr_t>(rgfxCacheReleased(state.caches, offset, &map, &wire)));
+	    static_cast<uintptr_t>(rgfxCacheReleased(state.caches, offset, &map, &wire, &surface)));
 	if (cache)
 		wakeLocked();
 	IOLockUnlock(state.lock);
 	if (map)
 		static_cast<IOMemoryMap *>(map)->release();
-	// The cache's reference, held for the answer (rgfxSurfaceLocksForget); then the surface's
-	// memory, which the host's copy wrote, is unwired.
+	// The cache's reference and the surface's, held for the answer (rgfxSurfaceLocksForget), in
+	// that order; then the surface's memory is unwired.
 	if (cache)
 		cache->release();
+	if (surface)
+		static_cast<OSObject *>(surface)->release();
 	unwireSurface(wire);
+}
+
+bool rgfxSurfaceCacheSleep(void *cache, bool *purgeable)
+{
+	*purgeable = false;
+	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return false;
+	IOLockLock(state.lock);
+	const bool slept =
+	    rgfxCacheSleep(state.caches, reinterpret_cast<uintptr_t>(cache), true, purgeable);
+	IOLockUnlock(state.lock);
+	return slept;
+}
+
+bool rgfxSurfaceCacheWake(void *cache)
+{
+	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return false;
+	bool purgeable = false;
+	IOLockLock(state.lock);
+	const bool woke =
+	    rgfxCacheSleep(state.caches, reinterpret_cast<uintptr_t>(cache), false, &purgeable);
+	IOLockUnlock(state.lock);
+	return woke;
+}
+
+void rgfxSurfaceCacheUnclaimed(UInt64 offset)
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	rgfxCacheUnclaimed(state.caches, offset);
+	IOLockUnlock(state.lock);
+}
+
+uint32_t rgfxSurfaceCacheLetGoOf(UInt64 offset, bool *written, bool *purgeable)
+{
+	*written = *purgeable = false;
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return kRgfxCacheKept;
+	IOLockLock(state.lock);
+	const uint32_t why = rgfxCacheLetGoOf(state.caches, offset, purgeable);
+	if (const RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset))
+		*written = c->writes != c->copied;
+	IOLockUnlock(state.lock);
+	return why;
 }
 
 bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen)

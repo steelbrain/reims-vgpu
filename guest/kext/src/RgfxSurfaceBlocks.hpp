@@ -20,9 +20,17 @@
 // counted: one hold per client, with a count of its asks. The device learns of each holder's
 // context before the process learns of the block (BLOCK_SHARE), and of a holder letting it go
 // (BLOCK_UNSHARE). The last holder's let-go frees the block (its BLOCK_RELEASE, which the device
-// refuses while an object of any context lies in it). The caller holds the accelerator's lock
-// around every call. Header-only and free of the kernel's headers, so its native test
-// (tests/surface_blocks_test.cpp) builds it as the kext does.
+// refuses while an object of any context lies in it), but for a cached block in place
+// (RgfxSurfaceCaches.hpp), which stays, dormant, with its host device cache, its runs and its
+// header, its surface and the surface's device cache retained and the surface's pages wired:
+// the surface's next ask, by the same device cache, holds it again (rgfxSurfaceRevives), and
+// the cache's copy in the GPU's memory is used again rather than made and filled anew, as a GPU
+// of its own memory keeps a surface's copy past the textures over it. The dormant blocks are
+// let go past kRgfxDormantMaxBlocks of them or a byte cap the caller sets (rgfxSurfaceOverCaps),
+// those of volatile surfaces first, then the oldest, and for the causes RgfxDormantCause names.
+// The caller holds the accelerator's lock around every call. Header-only and free of the
+// kernel's headers, so its native test (tests/surface_blocks_test.cpp) builds it as the kext
+// does.
 //
 // Our own code.
 #ifndef RGFX_SURFACE_BLOCKS_HPP_
@@ -78,11 +86,51 @@ struct RgfxSurfaceEntry {
 	// The block's GPU copy is the host's device cache (RGFX_SURFACE_PAGES_CACHED): its surface
 	// and cache were made with it (RgfxSurfaceCaches.hpp).
 	bool cached;
+	// A cached block no client holds, kept for its surface (rgfxSurfaceSleep), `surface` and
+	// `cache` retained still: the surface's IOSurfaceID, and its cache's address, are no other
+	// surface's while the block lasts. `dormantSeq` orders the dormant blocks, the oldest the
+	// lowest.
+	bool dormant;
+	uint64_t dormantSeq;
+	// A dormant block whose surface was made volatile (RgfxSurfaceCaches.hpp): the first of
+	// them to go.
+	bool purgeable;
 };
 
 struct RgfxSurfaceTable {
 	RgfxSurfaceEntry *entries;
 	uint32_t capacity;
+	// The dormant entries: how many, the bytes of their surfaces' pages, all wired, and the last
+	// `dormantSeq` given.
+	uint32_t dormantCount = 0;
+	uint64_t dormantBytes = 0;
+	uint64_t dormantSeq = 0;
+};
+
+// The most dormant blocks kept at once.
+constexpr uint32_t kRgfxDormantMaxBlocks = 1024;
+
+// Why a dormant block was let go: the kext counts each (RgfxAccelerator::dormantStats).
+enum RgfxDormantCause : uint32_t {
+	// Its surface's device cache was purged (IOSurface's op 5: a client of the surface went, or
+	// the surface was made nonvolatile after empty).
+	kRgfxDormantPurged = 0,
+	// Its surface was made empty (op 7).
+	kRgfxDormantEmptied,
+	// Its surface had no client at its sleep: the last went while the block was held, its op 5
+	// then letting nothing go.
+	kRgfxDormantNoClients,
+	// Past kRgfxDormantMaxBlocks dormant blocks, the oldest.
+	kRgfxDormantCount,
+	// Past the caller's cap of dormant bytes, the oldest.
+	kRgfxDormantBytes,
+	// The table had no free entry for a new block, the oldest.
+	kRgfxDormantTableFull,
+	// The region had no room for a new block, the oldest.
+	kRgfxDormantNoSpace,
+	// An ask of its pages it does not answer: by another device cache, or in the other mode.
+	kRgfxDormantStale,
+	kRgfxDormantCauses,
 };
 
 // The guest's page, by which the two modes' keys of one surface meet: a copy's starts at plane
@@ -198,7 +246,8 @@ enum RgfxSurfaceLetGo {
 	// (BLOCK_UNSHARE) and unwires the pages.
 	kRgfxSurfaceLetGoHold,
 	// The client was its last holder: the caller frees the block (its BLOCK_RELEASE names
-	// `context`), unwires the pages and lets the entry go (rgfxSurfaceClear).
+	// `context`), or keeps a cached one dormant (rgfxSurfaceSleep), unwires the pages and lets
+	// the entry go (rgfxSurfaceClear).
 	kRgfxSurfaceLetGoLast,
 };
 
@@ -241,9 +290,88 @@ inline bool rgfxSurfaceHeldBy(const RgfxSurfaceTable &t, const void *client, uin
 	return false;
 }
 
-// Lets the entry go once its block has none holding it; its runs are the caller's to free.
-inline void rgfxSurfaceClear(RgfxSurfaceEntry &e)
+// The entry's last holder let it go, and its block stays for its surface: dormant, the newest.
+inline void rgfxSurfaceSleep(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
 {
+	if (e.dormant)
+		return;
+	e.dormant = true;
+	e.dormantSeq = ++t.dormantSeq;
+	t.dormantCount++;
+	t.dormantBytes += e.length;
+}
+
+// The entry is dormant no more: held again, or let go.
+inline void rgfxSurfaceWake(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
+{
+	if (!e.dormant)
+		return;
+	e.dormant = false;
+	e.dormantSeq = 0;
+	e.purgeable = false;
+	t.dormantCount--;
+	t.dormantBytes -= e.length;
+}
+
+// Whether a dormant entry is held again by an ask whose surface's device cache is `cache`, and
+// `cacheKept` (nothing asked the block to go since it slept): only the same cache, which only
+// the same surface has, the entry holding it.
+inline bool rgfxSurfaceRevives(const RgfxSurfaceEntry &e, const void *cache, bool cacheKept)
+{
+	return e.used && e.dormant && cache != nullptr && e.cache == cache && cacheKept;
+}
+
+// The dormant entry to go first, or -1: the oldest of those whose surfaces are volatile, else
+// the oldest. One still pending, its last holder's BLOCK_UNSHARE not yet posted, is not let go,
+// so no BLOCK_RELEASE overtakes that.
+inline int32_t rgfxSurfaceOldestDormant(const RgfxSurfaceTable &t)
+{
+	int32_t oldest = -1;
+	for (uint32_t i = 0; i < t.capacity; i++) {
+		const RgfxSurfaceEntry &e = t.entries[i];
+		if (!e.used || !e.dormant || e.pending)
+			continue;
+		const RgfxSurfaceEntry *o = oldest < 0 ? nullptr : &t.entries[oldest];
+		if (o == nullptr || (e.purgeable && !o->purgeable) ||
+		    (e.purgeable == o->purgeable && e.dormantSeq < o->dormantSeq))
+			oldest = static_cast<int32_t>(i);
+	}
+	return oldest;
+}
+
+// The dormant entry to let go while the dormant blocks pass kRgfxDormantMaxBlocks or `maxBytes`
+// of pages, the first to go (rgfxSurfaceOldestDormant), and why; -1 within both.
+inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
+                                   RgfxDormantCause *why)
+{
+	if (t.dormantCount > kRgfxDormantMaxBlocks)
+		*why = kRgfxDormantCount;
+	else if (t.dormantBytes > maxBytes)
+		*why = kRgfxDormantBytes;
+	else
+		return -1;
+	return rgfxSurfaceOldestDormant(t);
+}
+
+// A dormant entry whose pages start in the page of `runs[0]`, of either mode, or -1: one an ask
+// it does not answer finds in its way (rgfxSurfaceFind's `*differs`, or a cache not its own).
+inline int32_t rgfxSurfaceDormantMeeting(const RgfxSurfaceTable &t, const RgfxPageRun *runs,
+                                         uint32_t count)
+{
+	for (uint32_t i = 0; i < t.capacity && count; i++) {
+		const RgfxSurfaceEntry &e = t.entries[i];
+		if (e.used && e.dormant && e.runCount &&
+		    rgfxSurfaceSamePage(e.runs[0].address, runs[0].address))
+			return static_cast<int32_t>(i);
+	}
+	return -1;
+}
+
+// Lets the entry go once its block has none holding it; its runs are the caller's to free. A
+// dormant one leaves the table's count of them.
+inline void rgfxSurfaceClear(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
+{
+	rgfxSurfaceWake(t, e);
 	e = RgfxSurfaceEntry{};
 }
 

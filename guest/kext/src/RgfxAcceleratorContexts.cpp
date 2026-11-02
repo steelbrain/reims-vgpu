@@ -47,13 +47,16 @@
 
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
+#include "RgfxIOSurfaceKPI.hpp"
 #include "ReimsGraphics.hpp"
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
+#include <sys/sysctl.h>
 
 namespace {
 // The most blocks handed out at once.
@@ -73,6 +76,14 @@ constexpr UInt32 kCloseAnswerMs = 10000;
 constexpr UInt32 kReleaseAnswerMs = 10000;
 // Every block is page-aligned and a whole number of pages, so a block can back a mapping.
 constexpr UInt64 kPage = 0x1000;
+// The guest's memory where hw.memsize gives none, for the dormant blocks' cap of bytes.
+constexpr UInt64 kDormantMemoryUnknown = 2ull << 30;
+// How often the dormant blocks' line is logged at most, and how long a new block waits for
+// dormant blocks' releases to give the region room for it.
+constexpr UInt32 kDormantLogMs = 10000;
+constexpr UInt32 kDormantRoomMs = 100;
+// How many dormant blocks a new block that finds no room in the region lets go.
+constexpr UInt32 kDormantRoomBlocks = 16;
 
 UInt64 alignUp(UInt64 value, UInt64 align)
 {
@@ -129,6 +140,26 @@ bool surfacePages = false;
 bool surfaceCache = false;
 // Under contextLock: the shared blocks of surface planes, made at the first ask.
 RgfxSurfaceTable surfaceTable = {nullptr, 0};
+// The bytes of surface pages the dormant blocks hold at most (RgfxSurfaceBlocks.hpp): an eighth
+// of the guest's memory, read at the first context's open.
+UInt64 dormantMaxBytes = 0;
+// What the dormant blocks did, under contextLock, logged once something changed and
+// kDormantLogMs passed since the last line (noteDormant).
+struct DormantStats {
+	UInt64 slept;
+	UInt64 revived;
+	UInt64 letGo[kRgfxDormantCauses];
+	// Let go as their surface's cache was purged (op 5, a client of the surface going) with a
+	// cache the GPU wrote since its last copy: the host copies it into the pages, which no one
+	// may read any more.
+	UInt64 purgedWritten;
+	// Let go past a cap, a table entry or the region's room, of a surface made volatile.
+	UInt64 volatileFirst;
+	UInt64 changes;
+	UInt64 loggedChanges;
+	UInt64 loggedAt;
+};
+DormantStats dormantStats = {};
 
 UInt64 loadHeader64(const volatile UInt8 *header, UInt32 field)
 {
@@ -142,12 +173,20 @@ void queueInterruptHook(OSObject *target)
 		accel->queueInterrupt();
 }
 
-// The release thread call: posts each freed block's BLOCK_RELEASE in turn and waits for its
-// answer here, never on the freeing thread. OK gives the block out again; a refusal, or no answer
-// in time, keeps it until its owner's close is answered.
+bool reapDormant();
+void noteDormant();
+
+// The release thread call: lets go of the dormant blocks their surfaces asked to go
+// (reapDormant), then posts each freed block's BLOCK_RELEASE in turn and waits for its answer
+// here, never on the freeing thread. OK gives the block out again; a refusal, or no answer in
+// time, keeps it until its owner's close is answered.
 void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
+	IOLockLock(contextLock);
+	reapDormant();
+	IOLockUnlock(contextLock);
+	noteDormant();
 	for (;;) {
 		RgfxBlock block;
 		IOLockLock(contextLock);
@@ -171,6 +210,8 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		rgfxSurfaceCacheReleased(block.offset);
 		IOLockLock(contextLock);
 		rgfxBlockReleased(blockTable, block.offset, block.serial, ok);
+		// A new block waiting for the region's room looks again.
+		IOLockWakeup(contextLock, &surfaceTable, false);
 		IOLockUnlock(contextLock);
 		if (!ok)
 			IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
@@ -211,6 +252,11 @@ bool RgfxAccelerator::startContexts()
 		surfaceCache = surfacePages && (features & RGFX_FEATURE_SURFACE_CACHE) != 0;
 		blocksStart = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 		blocksEnd = (regionSize - RGFX_CURSOR_SPAN) & ~(kPage - 1);
+		uint64_t memory = 0;
+		size_t length = sizeof(memory);
+		if (sysctlbyname("hw.memsize", &memory, &length, nullptr, 0) != 0 || !memory)
+			memory = kDormantMemoryUnknown;
+		dormantMaxBytes = memory / 8;
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
 		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u context slots, surfaces %s\n",
 		      blocksStart, blocksEnd, RGFX_CONTEXT_SLOTS,
@@ -465,8 +511,8 @@ void RgfxAccelerator::unpinBlock(const RgfxBlockPin &pin)
 // MARK: - Shared blocks of surface planes
 
 namespace {
-// The most planes with a shared block at once, and the most bytes of one plane.
-constexpr UInt32 kMaxSurfaceBlocks = 512;
+// The most planes with a shared block at once, held or dormant, and the most bytes of one plane.
+constexpr UInt32 kMaxSurfaceBlocks = 512 + kRgfxDormantMaxBlocks;
 constexpr UInt64 kMaxPlaneBytes = 256ull << 20;
 
 // The plane of `length` bytes at `address` in `task`, wired: its descriptor, prepared, and its
@@ -545,15 +591,16 @@ bool writeRuns(IODeviceMemory *region, UInt64 at, const RgfxPageRun *runs, UInt3
 	return true;
 }
 
-// The last holder of entry `e` let it go: its block is freed (its BLOCK_RELEASE names
-// `context`), or kept for good where the device may still use it (`keep`, a close not answered,
-// or a create naming it in flight), and the entry goes. Under contextLock; whether a release is
-// to be posted.
+// The last holder of entry `e` let it go, or the dormant `e` goes: its block is freed (its
+// BLOCK_RELEASE names `context`, or a dormant block's last holder's), or kept for good where the
+// device may still use it (`keep`, a close not answered, or a create naming it in flight), and
+// the entry goes. Under contextLock; whether a release is to be posted.
 bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
 {
 	bool release = false;
 	if (!keep) {
-		rgfxBlockSetContext(blockTable, e.offset, context);
+		if (!e.dormant)
+			rgfxBlockSetContext(blockTable, e.offset, context);
 		release = rgfxBlockFree(blockTable, &e, e.offset) == kRgfxBlockOk;
 	}
 	if (!release)
@@ -562,7 +609,129 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
 	// Its surface's locks no longer wait for the writes named of it; a cached one's wait for
 	// its release's answer, which copies the cache into the pages.
 	rgfxSurfaceLocksForget(e.cache, e.surface, e.cached && release);
-	rgfxSurfaceClear(e);
+	rgfxSurfaceClear(surfaceTable, e);
+	return release;
+}
+
+// The dormant entry `i` goes, for `why`. Under contextLock; whether a release is to be posted.
+bool letGoDormant(UInt32 i, RgfxDormantCause why, bool written = false)
+{
+	dormantStats.letGo[why]++;
+	if (why == kRgfxDormantPurged && written)
+		dormantStats.purgedWritten++;
+	if (why >= kRgfxDormantCount && why <= kRgfxDormantNoSpace &&
+	    surfaceTable.entries[i].purgeable)
+		dormantStats.volatileFirst++;
+	dormantStats.changes++;
+	return letGoBlock(surfaceTable.entries[i], 0, false);
+}
+
+// The dormant blocks past their caps go, the oldest first. Under contextLock; whether a release
+// is to be posted.
+bool trimDormant()
+{
+	bool release = false;
+	RgfxDormantCause why = kRgfxDormantCauses;
+	for (int32_t i; (i = rgfxSurfaceOverCaps(surfaceTable, dormantMaxBytes, &why)) >= 0;)
+		release |= letGoDormant(static_cast<UInt32>(i), why);
+	return release;
+}
+
+// The dormant blocks their surfaces asked to go (rgfxSurfaceCacheLetGoOf) go, and the others
+// take whether their surfaces are volatile. Under contextLock; whether a release is to be
+// posted.
+bool reapDormant()
+{
+	bool release = false;
+	for (UInt32 i = 0; surfaceTable.dormantCount && i < surfaceTable.capacity; i++) {
+		RgfxSurfaceEntry &e = surfaceTable.entries[i];
+		if (!e.used || !e.dormant || e.pending)
+			continue;
+		bool written = false, purgeable = false;
+		const uint32_t why = rgfxSurfaceCacheLetGoOf(e.offset, &written, &purgeable);
+		e.purgeable = purgeable;
+		if (why < kRgfxDormantCauses)
+			release |= letGoDormant(i, static_cast<RgfxDormantCause>(why), written);
+	}
+	return release;
+}
+
+// Logs what the dormant blocks did, where it changed and kDormantLogMs passed since the last
+// line. Not under contextLock.
+void noteDormant()
+{
+	if (!contextLock)
+		return;
+	const uint64_t now = mach_absolute_time();
+	uint64_t interval = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kDormantLogMs) * 1000000ull, &interval);
+	IOLockLock(contextLock);
+	const bool log = dormantStats.changes != dormantStats.loggedChanges &&
+	                 now - dormantStats.loggedAt >= interval;
+	const DormantStats d = dormantStats;
+	const UInt32 count = surfaceTable.dormantCount;
+	const UInt64 bytes = surfaceTable.dormantBytes;
+	if (log) {
+		dormantStats.loggedChanges = dormantStats.changes;
+		dormantStats.loggedAt = now;
+	}
+	IOLockUnlock(contextLock);
+	if (log)
+		IOLog("RgfxAccelerator: dormant surface blocks: %u held (%llu of %llu MiB); %llu slept, "
+		      "%llu revived; let go: %llu purged (%llu with a cache written), %llu made "
+		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
+		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
+		      "volatile), %llu asked otherwise\n",
+		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
+		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
+		      d.letGo[kRgfxDormantNoClients],
+		      d.letGo[kRgfxDormantCount], d.letGo[kRgfxDormantBytes],
+		      d.letGo[kRgfxDormantTableFull], d.letGo[kRgfxDormantNoSpace], d.volatileFirst,
+		      d.letGo[kRgfxDormantStale]);
+}
+
+// The last holder, of context `context`, of the cached entry `e` let it go: the block sleeps
+// rather than going, where its surface stays cached (rgfxSurfaceCacheSleep), the entry keeping
+// its references of the surface and its device cache. Under contextLock. The entry stays
+// pending until the caller has posted the hold's BLOCK_UNSHARE and called wakeSlept with
+// `*surface`, the surface retained once more, so no ask's BLOCK_SHARE overtakes it.
+bool sleepBlock(RgfxSurfaceEntry &e, UInt32 context, OSObject **surface)
+{
+	*surface = nullptr;
+	bool purgeable = false;
+	if (!e.cached || !e.inPlace || e.pending || !e.cache || !e.surface ||
+	    !rgfxSurfaceCacheSleep(e.cache, &purgeable))
+		return false;
+	rgfxBlockSetContext(blockTable, e.offset, context);
+	rgfxSurfaceSleep(surfaceTable, e);
+	e.purgeable = purgeable;
+	e.pending = true;
+	*surface = static_cast<OSObject *>(e.surface);
+	(*surface)->retain();
+	dormantStats.slept++;
+	dormantStats.changes++;
+	return true;
+}
+
+// The BLOCK_UNSHARE of the block at `offset` (serial `serial`) that slept is posted: the entry
+// is no longer pending, and the dormant blocks past their caps, or asked to go meanwhile, go.
+// Its surface, `surface` (sleepBlock), is read for its clients once, out of the contexts' lock,
+// then released: one with none left, its last gone while the block was held, its op 5 then
+// letting nothing go, asks the block to go. Takes contextLock; whether a release is to be
+// posted.
+bool wakeSlept(UInt64 offset, UInt64 serial, OSObject *surface)
+{
+	if (surface && rgfxIOSurfaceClientCount(surface) == 0)
+		rgfxSurfaceCacheUnclaimed(offset);
+	OSSafeReleaseNULL(surface);
+	IOLockLock(contextLock);
+	const int32_t at = rgfxSurfaceAt(surfaceTable, offset);
+	if (at >= 0 && surfaceTable.entries[at].serial == serial)
+		surfaceTable.entries[at].pending = false;
+	IOLockWakeup(contextLock, &surfaceTable, false);
+	bool release = reapDormant();
+	release |= trimDormant();
+	IOLockUnlock(contextLock);
 	return release;
 }
 } // namespace
@@ -598,29 +767,89 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		}
 	}
 	// A block in place is no other ask's until the device has answered for its pages: the ask
-	// waits for the answer, which keeps the block or lets it go.
-	while (table.entries && rgfxSurfacePending(table, runs, count))
-		IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
-	bool differs = false;
-	int32_t at = table.entries
-	                 ? rgfxSurfaceFind(table, runs, count, length, size, inPlace, &differs)
-	                 : -1;
+	// waits for the answer, which keeps the block or lets it go. A dormant block of the plane is
+	// held again by an ask of the same surface (reviveSurfaceBlock), and goes where the ask is
+	// another's, or of the other mode: the ask then makes its own.
+	bool differs = false, revived = false, release = false, waitedForRoom = false;
+	int32_t at = -1, slot = -1;
+	RgfxBlockPin pin = {};
+	UInt64 offset = 0;
+	// A block in place holds the runs past the part the processes map, whole pages of them.
+	UInt64 runBytes = sizeof(RgfxPageRun) * static_cast<UInt64>(count);
+	UInt64 total = inPlace ? size + alignUp(runBytes, kPage) : size;
+	RgfxBlockResult made = kRgfxBlockTableFull;
+	for (;;) {
+		while (table.entries && rgfxSurfacePending(table, runs, count))
+			IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
+		differs = false;
+		at = table.entries ? rgfxSurfaceFind(table, runs, count, length, size, inPlace, &differs)
+		                   : -1;
+		if (at >= 0 && table.entries[at].dormant) {
+			revived = reviveSurfaceBlock(table.entries[at], task, surfaceId);
+			if (revived)
+				break;
+			release |= letGoDormant(static_cast<UInt32>(at), kRgfxDormantStale);
+			continue;
+		}
+		const int32_t meeting =
+		    at < 0 && differs ? rgfxSurfaceDormantMeeting(table, runs, count) : -1;
+		if (meeting >= 0) {
+			release |= letGoDormant(static_cast<UInt32>(meeting), kRgfxDormantStale);
+			continue;
+		}
+		if (at >= 0 || differs || !table.entries)
+			break;
+		// A new block: a dormant one gives its entry where the table is full, and the region's
+		// room where it has none, its release waited for a while, once.
+		slot = rgfxSurfaceFreeEntry(table);
+		if (slot < 0) {
+			const int32_t oldest = rgfxSurfaceOldestDormant(table);
+			if (oldest >= 0) {
+				release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantTableFull);
+				slot = rgfxSurfaceFreeEntry(table);
+			}
+		}
+		made = slot < 0 ? kRgfxBlockTableFull
+		                : rgfxBlockAlloc(blockTable, &table.entries[slot], context, total, kPage,
+		                                 &offset, &pin);
+		if (made != kRgfxBlockNoSpace || waitedForRoom || !table.dormantCount)
+			break;
+		waitedForRoom = true;
+		for (UInt32 n = 0; n < kDormantRoomBlocks; n++) {
+			const int32_t oldest = rgfxSurfaceOldestDormant(table);
+			if (oldest < 0)
+				break;
+			release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantNoSpace);
+		}
+		if (release)
+			thread_call_enter(releaseCall);
+		release = false;
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(kDormantRoomMs, kMillisecondScale, &deadline);
+		IOLockSleepDeadline(contextLock, &surfaceTable, deadline, THREAD_UNINT);
+	}
+	if (release)
+		thread_call_enter(releaseCall);
 	if (at >= 0) {
-		// Another process's plane: this client holds its block too, in its window from its
-		// first hold, mapped under the lock so no let-go of the hold comes between.
+		// Another process's plane, or a dormant one held again: this client holds its block
+		// too, in its window from its first hold, mapped under the lock so no let-go of the
+		// hold comes between. A block held again is fresh to its holders.
 		RgfxSurfaceEntry &e = table.entries[at];
 		RgfxSurfaceHoldResult held = rgfxSurfaceHold(e, client, context, pages);
-		*block = {e.offset, e.size, e.serial, false, e.cached};
+		*block = {e.offset, e.size, e.serial, revived, e.cached};
 		IOReturn mapped = kIOReturnSuccess;
 		if (held == kRgfxSurfaceHoldNew) {
 			mapped = client->mapSpan(e.offset, e.size);
 			if (mapped != kIOReturnSuccess) {
-				// No hold the device was not told of, nor one not in the window.
+				// No hold the device was not told of, nor one not in the window; a block held
+				// again goes, holding none.
 				void *mine = nullptr;
 				UInt32 c = 0;
 				rgfxSurfaceLetGo(e, client, true, &mine, &c);
 				client->unmapSpan(e.offset, e.size);
 				held = kRgfxSurfaceHoldFull;
+				if (!e.holdCount && letGoBlock(e, context, false))
+					thread_call_enter(releaseCall);
 			}
 		}
 		IOLockUnlock(contextLock);
@@ -642,7 +871,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			void *mine = nullptr;
 			UInt32 c = 0;
 			IOLockLock(contextLock);
-			bool release = false;
+			release = false;
 			int32_t again = rgfxSurfaceAt(table, block->offset);
 			RgfxSurfaceLetGo gone = again >= 0 ? rgfxSurfaceLetGo(table.entries[again], client,
 			                                                      true, &mine, &c)
@@ -656,17 +885,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			if (release)
 				thread_call_enter(releaseCall);
 		}
+		if (revived)
+			noteDormant();
 		return posted;
 	}
-	int32_t slot = !differs && table.entries ? rgfxSurfaceFreeEntry(table) : -1;
-	// A block in place holds the runs past the part the processes map, whole pages of them.
-	UInt64 runBytes = sizeof(RgfxPageRun) * static_cast<UInt64>(count);
-	UInt64 total = inPlace ? size + alignUp(runBytes, kPage) : size;
-	RgfxBlockPin pin = {};
-	UInt64 offset = 0;
-	RgfxBlockResult made = slot < 0 ? kRgfxBlockTableFull
-	                                : rgfxBlockAlloc(blockTable, &table.entries[slot], context,
-	                                                 total, kPage, &offset, &pin);
 	if (made != kRgfxBlockOk) {
 		IOLockUnlock(contextLock);
 		freeRuns(runs, count);
@@ -694,7 +916,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	if (mapped != kIOReturnSuccess) {
 		client->unmapSpan(offset, size);
 		rgfxBlockDrop(blockTable, pin);
-		rgfxSurfaceClear(e);
+		rgfxSurfaceClear(table, e);
 		if (inPlace)
 			IOLockWakeup(contextLock, &surfaceTable, false);
 		IOLockUnlock(contextLock);
@@ -724,7 +946,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		                       nullptr, nullptr, 0);
 	}
 	void *mine = nullptr;
-	bool release = false;
+	release = false;
 	IOLockLock(contextLock);
 	rgfxBlockUnpin(blockTable, pin);
 	if (posted != kIOReturnSuccess) {
@@ -746,6 +968,35 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	if (release)
 		thread_call_enter(releaseCall);
 	return posted;
+}
+
+void RgfxAccelerator::wakeReleases()
+{
+	if (__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
+		thread_call_enter(releaseCall);
+}
+
+bool RgfxAccelerator::reviveSurfaceBlock(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId)
+{
+	void *surface = nullptr, *cache = nullptr;
+	if (!surfaceCache || !surfaceId || !e.runCount ||
+	    !rgfxSurfaceLocksAttach(this, task, surfaceId, e.runs[0].address, &surface, &cache))
+		return false;
+	// The asker's surface is the dormant block's only where IOSurface gives it the same device
+	// cache, which the block holds: no other surface has it, and no new cache takes its address
+	// while it is held.
+	const bool same = cache == e.cache && surface == e.surface &&
+	                  rgfxSurfaceRevives(e, cache, rgfxSurfaceCacheWake(cache));
+	// The attach's references go: the entry holds its own of both.
+	static_cast<OSObject *>(cache)->release();
+	static_cast<OSObject *>(surface)->release();
+	if (!same)
+		return false;
+	rgfxSurfaceWake(surfaceTable, e);
+	e.surfaceId = surfaceId;
+	dormantStats.revived++;
+	dormantStats.changes++;
+	return true;
 }
 
 bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId,
@@ -843,15 +1094,20 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 	                               : rgfxSurfaceLetGo(table.entries[at], client, false, &pages,
 	                                                  &context);
 	UInt64 size = at < 0 ? 0 : table.entries[at].size;
+	UInt64 serial = at < 0 ? 0 : table.entries[at].serial;
 	// Out of the client's window once its hold ends, before the block can be anyone else's.
 	if (gone == kRgfxSurfaceLetGoHold || gone == kRgfxSurfaceLetGoLast)
 		client->unmapSpan(offset, size);
-	bool release = false;
-	if (gone == kRgfxSurfaceLetGoLast)
-		release = letGoBlock(table.entries[at], context, false);
+	bool release = false, slept = false;
+	OSObject *sleeper = nullptr;
+	if (gone == kRgfxSurfaceLetGoLast) {
+		slept = sleepBlock(table.entries[at], context, &sleeper);
+		if (!slept)
+			release = letGoBlock(table.entries[at], context, false);
+	}
 	IOLockUnlock(contextLock);
-	if (gone == kRgfxSurfaceLetGoHold) {
-		// The other holders keep it; the device no longer lets this context name it.
+	if (gone == kRgfxSurfaceLetGoHold || slept) {
+		// Other holders keep it, or it sleeps: the device no longer lets this context name it.
 		RgfxBlockGrant unshare = {};
 		unshare.context = context;
 		unshare.offset = offset;
@@ -859,9 +1115,13 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 		postLifecycle(RGFX_CMD_BLOCK_UNSHARE, &unshare, sizeof(unshare), 0, nullptr, 0, nullptr,
 		              nullptr, 0);
 	}
+	if (slept)
+		release |= wakeSlept(offset, serial, sleeper);
 	unwire(pages);
 	if (release)
 		thread_call_enter(releaseCall);
+	if (slept)
+		noteDormant();
 	return gone == kRgfxSurfaceLetGoNotHeld ? kIOReturnBadArgument : kIOReturnSuccess;
 }
 
@@ -918,18 +1178,28 @@ void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)
 		        ? rgfxSurfaceLetGo(table.entries[i], client, true, &pages, &context)
 		        : kRgfxSurfaceLetGoNotHeld;
 		// The device ended the context's holds at its close; the last holder's block goes as
-		// its blocks go, or is kept where the close was not answered.
-		if (gone == kRgfxSurfaceLetGoLast)
-			release |= letGoBlock(table.entries[i], context, !closed);
+		// its blocks go, or sleeps where cached, or is kept where the close was not answered.
+		const UInt64 offset = table.entries[i].offset, serial = table.entries[i].serial;
+		bool slept = false;
+		OSObject *sleeper = nullptr;
+		if (gone == kRgfxSurfaceLetGoLast) {
+			slept = closed && sleepBlock(table.entries[i], context, &sleeper);
+			if (!slept)
+				release |= letGoBlock(table.entries[i], context, !closed);
+		}
 		IOLockUnlock(contextLock);
 		if (gone != kRgfxSurfaceLetGoNotHeld)
 			dropped++;
+		// The device ended the hold already: no BLOCK_UNSHARE.
+		if (slept)
+			release |= wakeSlept(offset, serial, sleeper);
 		unwire(pages);
 	}
 	if (release)
 		thread_call_enter(releaseCall);
 	if (dropped)
 		IOLog("RgfxAccelerator: %u shared surface blocks let go at a close\n", dropped);
+	noteDormant();
 }
 
 // MARK: - The queues' completion rings
