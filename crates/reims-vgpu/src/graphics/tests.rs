@@ -671,7 +671,13 @@ impl QueueRing {
 
     /// Publishes `command` (its `size` its length) on the submission ring and rings the queue's
     /// doorbell (its ring id is the submission ring's offset).
-    fn send(&mut self, device: &GraphicsDevice<FakePlatform>, mut command: Vec<u8>) {
+    fn send(&mut self, device: &GraphicsDevice<FakePlatform>, command: Vec<u8>) {
+        self.publish(command);
+        device.mmio_write(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
+    }
+
+    /// Publishes `command` (its `size` its length) on the submission ring, ringing no doorbell.
+    fn publish(&mut self, mut command: Vec<u8>) {
         let len = command.len() as u32;
         command[4..8].copy_from_slice(&len.to_le_bytes());
         let (submit_off, data) = (self.submit_off, self.data);
@@ -689,7 +695,6 @@ impl QueueRing {
             self.produced += command.len() as u64;
             self.store_u64(self.submit_off as usize, self.produced);
         }
-        device.mmio_write(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
     }
 
     /// Whether the completion ring has an event the guest has not taken, other than a
@@ -820,6 +825,103 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(gone, "the queue's destroy never ended it");
+}
+
+/// A command buffer that asks for its `CB_SUBMITTED` and need wait for nothing, rung through
+/// `mmio_write_taking`, is taken on the ringing thread: its `CB_SUBMITTED` is on its queue's
+/// completion ring, the queue's vector raised on that thread, before the write returns; its queue's
+/// thread walks and commits it, and it completes as one that thread took. One that does not ask is
+/// left to the queue's thread, and completes as before
+#[test]
+fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
+    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+
+    let raised = Arc::new(super::Mutex::new(Vec::<(u32, Option<String>)>::new()));
+    let platform = Arc::new(FakePlatform::new());
+    let record = Arc::clone(&raised);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |vector| {
+                let name = std::thread::current().name().map(str::to_owned);
+                record.lock().push((vector, name));
+            })),
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, mut guest) = (3, Guest::new(&device));
+    let queue = obj(context, 1);
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1)
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
+    for _ in 0..2000 {
+        // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
+        let idle = unsafe {
+            AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
+                .load(Ordering::SeqCst)
+        };
+        if idle == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    ring.arm();
+
+    let mut asking = command_buffer(queue, 100);
+    let submitted = RgfxOpHeader {
+        tag: RGFX_OP_SUBMITTED,
+        flags: 0,
+        len: 8,
+    };
+    asking.extend_from_slice(submitted.as_bytes());
+    asking[RGFX_COMMAND_BUFFER_OPS_OFFSET as usize - 8..RGFX_COMMAND_BUFFER_OPS_OFFSET as usize]
+        .copy_from_slice(&8u64.to_le_bytes());
+    ring.publish(asking);
+    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    assert!(
+        ring.has_event(),
+        "the CB_SUBMITTED is posted before the write returns"
+    );
+    let bytes = ring.event().unwrap();
+    let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+    assert_eq!(
+        (posted.header.r#type, posted.cb_obj_id),
+        (RGFX_EVT_CB_SUBMITTED, 100)
+    );
+    let here = std::thread::current().name().map(str::to_owned);
+    assert_eq!(raised.lock().first(), Some(&(1, here)));
+
+    let complete = |ring: &mut QueueRing| {
+        for _ in 0..3000 {
+            platform.world().complete_all(CompleteOn::Caller);
+            if ring.has_event() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap()
+    };
+    let done = complete(&mut ring);
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+
+    ring.publish(command_buffer(queue, 101));
+    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    let done = complete(&mut ring);
+    assert_eq!((done.cb_obj_id, done.status), (101, RGFX_CB_OK));
+    assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
 }
 
 /// The window shows the guest's cursor once it has an image and while the guest shows it,

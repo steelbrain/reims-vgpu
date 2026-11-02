@@ -739,7 +739,7 @@ static bool on_graphics_scanout_written(void *ctx, uint64_t offset, uint64_t len
 
 /* A graphics device with no window, on every host: its registers, its region, its doorbell, a
  * GET_DISPLAYS the guest writes into the control ring answered with DISPLAYS and an interrupt,
- * its reset, and its release, which ends its table once its threads have ended. */
+ * a taking write, its reset, and its release, which ends its table once its threads have ended. */
 static void check_graphics(void) {
     RvgGraphicsCallbacks cb = {sizeof cb, &graphics_destroyed, on_graphics_destroy,
                                on_graphics_raise, on_graphics_scanout_written};
@@ -785,6 +785,9 @@ static void check_graphics(void) {
     uint32_t answer[4];
     memcpy(answer, region + 0x10000 + 256, sizeof answer);
     CHECK(produced >= 16 && answer[0] == 0x101 && answer[2] == 1);
+    /* The taking write rings as the plain one does: a ring no queue has is ignored. */
+    rvg_graphics_device_mmio_write_taking(d, 0x020, 0x40000);
+    CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 1);
 
     rvg_graphics_device_reset(d);
     CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 0);

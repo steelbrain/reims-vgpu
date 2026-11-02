@@ -324,6 +324,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// A buffer committed behind one is not submitted until it is, as Metal's is not
     /// ([`cmdbuf`]'s submission).
     held_queues: HashMap<u64, Arc<AtomicUsize>>,
+    /// By queue: how many command buffers the host made on it have not completed ([`cmdbuf`]'s
+    /// take on a doorbell's thread).
+    in_flight: HashMap<u64, Arc<AtomicUsize>>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the object table drops before it (a buffer
@@ -359,6 +362,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_views: surface_pages::SurfaceViews::new(None),
             surface_caches: surface_cache::SurfaceCaches::new(true),
             held_queues: HashMap::new(),
+            in_flight: HashMap::new(),
             region,
         }
     }
@@ -717,6 +721,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         self.spans.retain(|id, _| !ours(id));
         self.held_queues.retain(|id, _| !ours(id));
+        self.in_flight.retain(|id, _| !ours(id));
         let managed: Vec<u64> = self.managed.keys().copied().filter(ours).collect();
         for id in managed {
             if let Some(copy) = self.managed.remove(&id) {
@@ -917,6 +922,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 self.spans.remove(&m.obj_id);
                 self.held_queues.remove(&m.obj_id);
+                self.in_flight.remove(&m.obj_id);
                 if let Some(copy) = self.managed.remove(&m.obj_id) {
                     drop_refused(m.obj_id, copy);
                 }
@@ -1380,13 +1386,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.decode_pipeline(device, message)
             }
             RGFX_CMD_COMMAND_BUFFER => {
-                // The buffer's context's drain, held until its completion handler has run.
-                let drain = (self.context)
-                    .map(|context| Arc::clone(self.drains.entry(context).or_default()));
+                let drain = self.command_buffer_drain();
                 self.decode_command_buffer(device, message, drain)
             }
             _ => Ok(Err(DecodeError::UnknownCommand)),
         }
+    }
+
+    /// The current context's drain, which a command buffer of it holds until its completion
+    /// handler has run.
+    pub(crate) fn command_buffer_drain(&mut self) -> Option<Arc<Drain>> {
+        (self.context).map(|context| Arc::clone(self.drains.entry(context).or_default()))
     }
 
     /// Inserts a new object's handle under its guest-picked id.

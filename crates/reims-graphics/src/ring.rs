@@ -170,6 +170,16 @@ impl Consumer {
     /// The next message, with the pads before it skipped, and the host's count moved past it and
     /// written to the header; `None` where the guest has published no more.
     pub(crate) fn next(&mut self, region: &Region) -> Result<Option<Message>, Broken> {
+        let message = self.peek(region)?;
+        if let Some(message) = &message {
+            self.take(region, message);
+        }
+        Ok(message)
+    }
+
+    /// [`Self::next`], with the pads before the message skipped but the message itself left on
+    /// the ring, for [`Self::take`].
+    pub(crate) fn peek(&mut self, region: &Region) -> Result<Option<Message>, Broken> {
         loop {
             let ahead = self.published(region)?;
             if ahead == 0 {
@@ -206,9 +216,14 @@ impl Consumer {
             let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(&bytes) else {
                 return Err(broken(size));
             };
-            self.consume(region, size64);
             return Ok(Some(Message { header, bytes }));
         }
+    }
+
+    /// Takes `message`, which [`Self::peek`] answered last: the host's count moves past it and is
+    /// written to the header.
+    pub(crate) fn take(&mut self, region: &Region, message: &Message) {
+        self.consume(region, u64::from(message.header.size));
     }
 
     /// Moves the host's count on by `size` and publishes it: the guest may write those bytes

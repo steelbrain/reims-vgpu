@@ -44,7 +44,7 @@ use reims_graphics::wire::{
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
-    Screen,
+    Screen, Taken,
 };
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
@@ -54,7 +54,7 @@ use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::Texture;
 use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
@@ -210,7 +210,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),
-                decoder: Mutex::new(decoder),
+                decoder: Arc::new(Mutex::new(decoder)),
                 device: gpu_device,
                 presents: Arc::new(PresentQueue::new(Arc::clone(&presented))),
                 presented,
@@ -277,6 +277,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| self.device.mmio_write(offset, value));
     }
 
+    /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring may take the queue's
+    /// next command buffer on the calling thread and post its `CB_SUBMITTED` there, calling
+    /// `raise_interrupt` inside this call (`reims-graphics`'s `Device::mmio_write_taking`). It
+    /// waits for no lock but the queues' table, as `mmio_write`'s doorbell does.
+    pub fn mmio_write_taking(&self, offset: u64, value: u32) {
+        entry::run(|_| self.device.mmio_write_taking(offset, value));
+    }
+
     /// Takes a copy of `fd`, the host's `ioeventfd` for `DOORBELL` with ring 0. False where `fd`
     /// is not open or the device has one already.
     pub fn set_doorbell(&self, fd: RawFd) -> bool {
@@ -304,8 +312,9 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
 /// whole under it, and a command buffer's completion, which runs on a GPU thread of its own, never
 /// touches the decoder — it only posts through the queue's poster.
 struct GraphicsControl<P: ApiPlatform> {
-    /// The decoder.
-    decoder: Mutex<GraphicsDecoder<P>>,
+    /// The decoder, whose lock a doorbell's thread's take carries to the queue's service thread
+    /// ([`Self::take_command_buffer`]).
+    decoder: Arc<Mutex<GraphicsDecoder<P>>>,
     /// The GPU device it drives.
     device: P::Device,
     /// The surface the display pipe shows, shared with the window's sink.
@@ -319,6 +328,26 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The decoder's failed contexts, which the device asks of at a `QUEUE_CREATE`
     /// (`Host::context_refused`) with no lock of the decoder's taken.
     failed: Arc<FailedContexts>,
+}
+
+/// The sinks of a ring's messages ([`GraphicsControl::sinks`]), which the decoder posts through.
+struct Sinks {
+    completion: CompletionSink,
+    signal: SignalSink,
+    scheduled: ScheduledSink,
+    submitted: SubmittedSink,
+    reflection: ReflectionSink,
+}
+
+impl Sinks {
+    /// Points `decoder`'s sinks at these.
+    fn point<P: Platform>(self, decoder: &mut GraphicsDecoder<P>) {
+        decoder.set_completion_sink(self.completion);
+        decoder.set_signal_sink(self.signal);
+        decoder.set_scheduled_sink(self.scheduled);
+        decoder.set_submitted_sink(self.submitted);
+        decoder.set_reflection_sink(self.reflection);
+    }
 }
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
@@ -606,39 +635,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             _ => {}
         }
         entry::run(|_| {
-            let queue_poster = poster.clone();
-            let presents = Arc::clone(&self.presents);
-            let queue = poster.queue_obj_id();
-            let sink: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
-                queue_poster.post(record.as_bytes());
-                // A present waiting for the buffer is shown once its completion is posted.
-                if let Some(queue) = queue {
-                    presents.finished(queue, record.header.seqno);
-                }
-            });
-            let signal_poster = poster.clone();
-            let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled| {
-                signal_poster.post(record.as_bytes());
-            });
-            let scheduled_poster = poster.clone();
-            let scheduled: ScheduledSink = Arc::new(move |record: RgfxCbScheduled| {
-                scheduled_poster.post(record.as_bytes());
-            });
-            let submitted_poster = poster.clone();
-            let submitted: SubmittedSink = Arc::new(move |record: RgfxCbSubmitted| {
-                submitted_poster.post(record.as_bytes());
-            });
-            let reflection_poster = poster.clone();
-            let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
-                reflection_poster.post(record.as_bytes());
-            });
+            let sinks = self.sinks(poster);
             let outcome = {
                 let mut decoder = self.decoder.lock();
-                decoder.set_completion_sink(sink);
-                decoder.set_signal_sink(signal);
-                decoder.set_scheduled_sink(scheduled);
-                decoder.set_submitted_sink(submitted);
-                decoder.set_reflection_sink(reflection);
+                sinks.point(&mut decoder);
                 decoder.set_context(Some(sender_context(poster, message)));
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
                     let (_, _, obj_id) = message_identity(message);
@@ -662,32 +662,143 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 (outcome, stood_in)
             };
             let (outcome, stood_in) = outcome;
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let (ty, seqno, obj_id) = message_identity(message);
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
-                         carried out: {e:?}"
-                    );
-                    if !stood_in {
-                        self.fail_queue_command_buffer(poster, message);
-                    }
-                }
-                Err(raise) => {
-                    let (ty, seqno, obj_id) = message_identity(message);
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
-                         {raise}"
-                    );
-                    if !stood_in {
-                        self.fail_queue_command_buffer(poster, message);
-                    }
-                }
+            self.report(poster, message, outcome, stood_in);
+        });
+    }
+
+    /// The sinks of the ring `poster` posts onto, for a message from it ([`Self::handle_stage3`]):
+    /// a buffer's completion, with the present waiting for it, its shared events' values, its
+    /// `CB_SCHEDULED` and `CB_SUBMITTED`, and a pipeline's reflection.
+    fn sinks(&self, poster: &CompletionPoster) -> Sinks {
+        let queue_poster = poster.clone();
+        let presents = Arc::clone(&self.presents);
+        let queue = poster.queue_obj_id();
+        let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
+            queue_poster.post(record.as_bytes());
+            // A present waiting for the buffer is shown once its completion is posted.
+            if let Some(queue) = queue {
+                presents.finished(queue, record.header.seqno);
             }
         });
+        let signal_poster = poster.clone();
+        let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled| {
+            signal_poster.post(record.as_bytes());
+        });
+        let scheduled_poster = poster.clone();
+        let scheduled: ScheduledSink = Arc::new(move |record: RgfxCbScheduled| {
+            scheduled_poster.post(record.as_bytes());
+        });
+        let submitted_poster = poster.clone();
+        let submitted: SubmittedSink = Arc::new(move |record: RgfxCbSubmitted| {
+            submitted_poster.post(record.as_bytes());
+        });
+        let reflection_poster = poster.clone();
+        let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
+            reflection_poster.post(record.as_bytes());
+        });
+        Sinks {
+            completion,
+            signal,
+            scheduled,
+            submitted,
+            reflection,
+        }
+    }
+
+    /// Logs a stage-3 `message` the decoder did not carry out (`outcome`), and posts its command
+    /// buffer's failure onto its ring through `poster` where no stand-in (`stood_in`) posts it.
+    fn report(
+        &self,
+        poster: &CompletionPoster,
+        message: &[u8],
+        outcome: RaiseResult<Result<(), DecodeError>>,
+        stood_in: bool,
+    ) {
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let (ty, seqno, obj_id) = message_identity(message);
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
+                     carried out: {e:?}"
+                );
+                if !stood_in {
+                    self.fail_queue_command_buffer(poster, message);
+                }
+            }
+            Err(raise) => {
+                let (ty, seqno, obj_id) = message_identity(message);
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
+                     {raise}"
+                );
+                if !stood_in {
+                    self.fail_queue_command_buffer(poster, message);
+                }
+            }
+        }
+    }
+
+    /// [`Host::take_command_buffer`]: takes the `COMMAND_BUFFER` `message` of the queue `poster`
+    /// posts onto, on a doorbell's thread, where it gets its `CB_SUBMITTED` at its take
+    /// ([`GraphicsDecoder::submits_at_take`]) and nothing need be waited for: it runs on that
+    /// queue, the compile table and the decoder are free, each tried, and no pipeline it names is
+    /// still compiling. It is begun here under the decoder's lock, its command buffer made and its
+    /// sinks pointed at the queue's ring, as [`Self::handle_stage3`] begins it. The lock is carried
+    /// to the queue's service thread with the rest of its work, which walks and commits it, then
+    /// reports a failure as `handle_stage3` does, so the guest's later messages are carried out
+    /// after its commit, as they are after a buffer the service thread takes. Its `CB_SUBMITTED`
+    /// is posted here, waiting for nothing, or else by the service thread before the walk; a
+    /// buffer the platform refused at its make gets none, and its failure on the service thread.
+    fn take_command_buffer(
+        self: &Arc<Self>,
+        poster: &CompletionPoster,
+        message: &[u8],
+    ) -> Option<Taken> {
+        if foreign_queue(poster, message) || !self.pending.none_named_by(message) {
+            return None;
+        }
+        let mut decoder = Mutex::try_lock_arc(&self.decoder)?;
+        self.sinks(poster).point(&mut decoder);
+        decoder.set_context(Some(sender_context(poster, message)));
+        if !decoder.submits_at_take(message) {
+            return None;
+        }
+        let drain = decoder.command_buffer_drain();
+        let begun = refusing(|| decoder.begin_command_buffer(&self.device, message, drain, false));
+        let submitted = match &begun {
+            Ok(Ok(begun)) => begun.submitted_at_take().cloned(),
+            _ => None,
+        };
+        let post = submitted.clone().map(|submitted| {
+            let poster = poster.clone();
+            Box::new(move || {
+                submitted.try_post(|record| poster.try_post(record.as_bytes()));
+            }) as Box<dyn FnOnce() + Send>
+        });
+        let (control, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
+        let rest = Box::new(move || {
+            entry::run(|_| {
+                let mut decoder = decoder;
+                if let Some(submitted) = &submitted {
+                    submitted.post();
+                }
+                let outcome = match begun {
+                    Ok(Ok(begun)) => {
+                        refusing(|| decoder.finish_command_buffer(&control.device, &message, begun))
+                    }
+                    Ok(Err(e)) => Ok(Err(e)),
+                    Err(raise) => Err(raise),
+                };
+                let stood_in = !matches!(outcome, Ok(Ok(())))
+                    && matches!(refusing(|| decoder.stand_in_for_failed(&message)), Ok(true));
+                drop(decoder);
+                control.report(&poster, &message, outcome, stood_in);
+            });
+        });
+        Some(Taken { post, rest })
     }
 
     /// A pipeline create from ring 0: prepared here, on the control thread, with the decoder's
@@ -1036,6 +1147,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         self.control.handle_stage3(completion, message);
+    }
+
+    fn take_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> Option<Taken> {
+        self.control.take_command_buffer(completion, message)
     }
 }
 

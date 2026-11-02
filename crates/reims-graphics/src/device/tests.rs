@@ -1543,3 +1543,347 @@ fn surface_pages_hand_the_host_their_runs() {
     assert_eq!((seen[1].1.as_slice(), seen[1].2), (&runs[..], true));
     assert_eq!((seen[2].0.block_offset, seen[2].1.len()), (BLOCK, 0));
 }
+
+/// What a [`TakingHost`] records, and what it is set to do.
+#[derive(Default)]
+struct Taking {
+    /// Take command buffers on a doorbell's thread ([`Host::take_command_buffer`]).
+    takes: AtomicBool,
+    /// While set, a `BUFFER_CREATE` or a `COMMAND_BUFFER` handed to the host waits.
+    shut: AtomicBool,
+    /// Each raise: its vector, and the name of the thread it ran on.
+    raised: Mutex<Vec<(u32, Option<String>)>>,
+    /// The types of the messages handed to [`Host::stage3_message`], in order.
+    handed: Mutex<Vec<u32>>,
+    /// Each command buffer carried out, and the name of the thread it was carried out on.
+    carried: Mutex<Vec<(u64, Option<String>)>>,
+}
+
+/// A host whose command buffers post a `CB_SUBMITTED` and then a `CB_COMPLETE`, as the decoder's
+/// do, and which takes them on a doorbell's thread where it is set to: the `CB_SUBMITTED` posted
+/// there, the rest carried out on the queue's thread.
+struct TakingHost(Arc<Taking>);
+
+/// The calling thread's name.
+fn thread_name() -> Option<String> {
+    std::thread::current().name().map(str::to_owned)
+}
+
+/// Command buffer `cb_obj_id`'s `CB_SUBMITTED` at `seqno`.
+fn cb_submitted(seqno: u64, cb_obj_id: u64) -> RgfxCbSubmitted {
+    RgfxCbSubmitted {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_CB_SUBMITTED,
+            size: size_of::<RgfxCbSubmitted>() as u32,
+            seqno,
+        },
+        cb_obj_id,
+    }
+}
+
+/// Command buffer `cb_obj_id`'s `CB_COMPLETE` at `seqno`.
+fn cb_complete(seqno: u64, cb_obj_id: u64) -> RgfxCbComplete {
+    RgfxCbComplete {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_CB_COMPLETE,
+            size: size_of::<RgfxCbComplete>() as u32,
+            seqno,
+        },
+        cb_obj_id,
+        gpu_start_ns: 0,
+        gpu_end_ns: 0,
+        status: RGFX_CB_OK,
+        error_code: 0,
+    }
+}
+
+impl Host for TakingHost {
+    fn raise_interrupt(&self, vector: u32) {
+        self.0.raised.lock().push((vector, thread_name()));
+    }
+    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+        false
+    }
+    fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
+        let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        self.0.handed.lock().push(header.r#type);
+        if matches!(
+            header.r#type,
+            RGFX_CMD_BUFFER_CREATE | RGFX_CMD_COMMAND_BUFFER
+        ) {
+            while self.0.shut.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if header.r#type == RGFX_CMD_COMMAND_BUFFER {
+            let (cb, _) = RgfxCommandBuffer::read_from_prefix(message).unwrap();
+            completion.post(cb_submitted(header.seqno, cb.cb_obj_id).as_bytes());
+            self.0.carried.lock().push((cb.cb_obj_id, thread_name()));
+            completion.post(cb_complete(header.seqno, cb.cb_obj_id).as_bytes());
+        }
+    }
+    fn take_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> Option<Taken> {
+        if !self.0.takes.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (cb, _) = RgfxCommandBuffer::read_from_prefix(message).unwrap();
+        let (seqno, id) = (cb.header.seqno, cb.cb_obj_id);
+        let posted = Arc::new(AtomicBool::new(false));
+        let (poster, posted_here) = (completion.clone(), Arc::clone(&posted));
+        let (rest_poster, taking) = (completion.clone(), Arc::clone(&self.0));
+        Some(Taken {
+            post: Some(Box::new(move || {
+                let done = poster.try_post(cb_submitted(seqno, id).as_bytes());
+                posted_here.store(done, Ordering::SeqCst);
+            })),
+            rest: Box::new(move || {
+                if !posted.load(Ordering::SeqCst) {
+                    rest_poster.post(cb_submitted(seqno, id).as_bytes());
+                }
+                taking.carried.lock().push((id, thread_name()));
+                rest_poster.post(cb_complete(seqno, id).as_bytes());
+            }),
+        })
+    }
+}
+
+/// An empty `COMMAND_BUFFER` `cb_obj_id` of queue `queue`, with seqno `seqno`.
+fn command_buffer(queue: u64, cb_obj_id: u64, seqno: u64) -> Vec<u8> {
+    use crate::ops::RGFX_COMMAND_BUFFER_OPS_OFFSET;
+    RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: RGFX_COMMAND_BUFFER_OPS_OFFSET,
+            seqno,
+        },
+        queue_obj_id: queue,
+        cb_obj_id,
+        op_bytes: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Publishes `messages` at the tests' queue submission ring's count `at`, without a doorbell;
+/// returns the count past them.
+fn publish_unrung(rig: &Rig, mut at: u64, messages: &[Vec<u8>]) -> u64 {
+    for message in messages {
+        rig.region().write(QUEUE_SUBMIT + 256 + at, message);
+        at += message.len() as u64;
+    }
+    rig.region()
+        .atomic_u64(QUEUE_SUBMIT)
+        .store(at, Ordering::SeqCst);
+    at
+}
+
+/// The events on the tests' queue completion ring, each one's type, seqno and the command buffer
+/// it names, once `count` of them are there or about 2 s have passed.
+fn queue_events(rig: &Rig, count: usize) -> Vec<(u32, u64, u64)> {
+    let mut events = Vec::new();
+    let mut at = 0;
+    for _ in 0..2000 {
+        let produced = rig
+            .region()
+            .atomic_u64(QUEUE_COMPLETE)
+            .load(Ordering::SeqCst);
+        while at < produced {
+            let head = rig.region().read(QUEUE_COMPLETE + 256 + at, 24).unwrap();
+            let word = |from: usize| u64::from_le_bytes(head[from..from + 8].try_into().unwrap());
+            let size = u64::from(u32::from_le_bytes(head[4..8].try_into().unwrap()));
+            events.push((word(0) as u32, word(8), word(16)));
+            at += size;
+        }
+        if events.len() >= count {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    events
+}
+
+/// A rig over a [`TakingHost`], started, with queue `queue` made and its completion ring armed.
+fn taking_rig(taking: &Arc<Taking>, queue: u64) -> Rig {
+    let mut rig = Rig::with_host(Box::new(TakingHost(Arc::clone(taking))));
+    rig.start();
+    let seqno = rig.send(queue_create(queue));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+    rig.region()
+        .atomic_u32(QUEUE_COMPLETE + 0xc0)
+        .store(1, Ordering::SeqCst);
+    rig
+}
+
+/// A doorbell write through `mmio_write_taking` takes the queue's next command buffer on the
+/// writing thread: its `CB_SUBMITTED` is on the queue's completion ring, its vector raised on
+/// that thread, before the write returns; the rest of it is carried out on the queue's thread,
+/// which then takes the buffer published after it, so the queue's events keep its order.
+#[test]
+fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let rig = taking_rig(&taking, QUEUE);
+
+    publish_unrung(
+        &rig,
+        0,
+        &[command_buffer(QUEUE, 100, 1), command_buffer(QUEUE, 101, 2)],
+    );
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    let here = thread_name();
+    assert_eq!(
+        queue_events(&rig, 0).first(),
+        Some(&(RGFX_EVT_CB_SUBMITTED, 1, 100)),
+        "the CB_SUBMITTED is posted before the doorbell write returns"
+    );
+    assert_eq!(taking.raised.lock().first(), Some(&(3, here.clone())));
+
+    assert_eq!(
+        queue_events(&rig, 4),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+            (RGFX_EVT_CB_SUBMITTED, 2, 101),
+            (RGFX_EVT_CB_COMPLETE, 2, 101),
+        ]
+    );
+    let carried = taking.carried.lock();
+    assert_eq!(
+        carried.iter().map(|c| c.0).collect::<Vec<_>>(),
+        vec![100, 101]
+    );
+    assert!(
+        carried.iter().all(|c| c
+            .1
+            .as_deref()
+            .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-"))),
+        "both carried out on the queue's thread: {carried:?}"
+    );
+    // The first was taken on the doorbell's thread, the second handed over as usual.
+    assert_eq!(
+        *taking.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
+    );
+}
+
+/// A doorbell write through `mmio_write_taking` leaves the buffer on the ring for the queue's
+/// thread where the host does not take it, where the queue's thread holds a message of the
+/// queue's, and where a ring-0 message published before it is not yet carried out: the queue's
+/// thread hands it to the host as it hands any, in the queue's order and after the ring-0 message.
+#[test]
+fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let on_queue_thread = |taking: &Taking, ids: &[u64]| {
+        let carried = taking.carried.lock();
+        assert_eq!(carried.iter().map(|c| c.0).collect::<Vec<_>>(), ids);
+        assert!(
+            carried.iter().all(|c| {
+                c.1.as_deref()
+                    .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-"))
+            }),
+            "{carried:?}"
+        );
+    };
+
+    // The host does not take it.
+    let taking = Arc::new(Taking::default());
+    let rig = taking_rig(&taking, QUEUE);
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert_eq!(queue_events(&rig, 2).len(), 2);
+    on_queue_thread(&taking, &[100]);
+    let raised = taking.raised.lock().clone();
+    assert!(
+        raised[0]
+            .1
+            .as_deref()
+            .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-")),
+        "{raised:?}"
+    );
+    drop(rig);
+
+    // The queue's thread holds a buffer of the queue's.
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let rig = taking_rig(&taking, QUEUE);
+    taking.shut.store(true, Ordering::SeqCst);
+    let at = publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    let handed = |taking: &Taking| taking.handed.lock().len() == 2;
+    for _ in 0..2000 {
+        if handed(&taking) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(handed(&taking), "the first buffer never reached the host");
+    publish_unrung(&rig, at, &[command_buffer(QUEUE, 101, 2)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert!(queue_events(&rig, 0).is_empty() && taking.carried.lock().is_empty());
+    taking.shut.store(false, Ordering::SeqCst);
+    assert_eq!(
+        queue_events(&rig, 4),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+            (RGFX_EVT_CB_SUBMITTED, 2, 101),
+            (RGFX_EVT_CB_COMPLETE, 2, 101),
+        ]
+    );
+    on_queue_thread(&taking, &[100, 101]);
+    drop(rig);
+
+    // A ring-0 create published before it is not yet carried out.
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let mut rig = taking_rig(&taking, QUEUE);
+    taking.shut.store(true, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1));
+    let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
+    for _ in 0..2000 {
+        if created(&taking) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(created(&taking), "the create never reached the host");
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert!(queue_events(&rig, 0).is_empty() && taking.carried.lock().is_empty());
+    taking.shut.store(false, Ordering::SeqCst);
+    assert_eq!(queue_events(&rig, 2).len(), 2);
+    on_queue_thread(&taking, &[100]);
+    assert_eq!(
+        *taking.handed.lock(),
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_COMMAND_BUFFER
+        ]
+    );
+}
+
+/// `mmio_write_taking` writes every register but `DOORBELL` as `mmio_write` does.
+#[test]
+fn a_taking_write_starts_and_resets_as_a_plain_one() {
+    let rig = Rig::new();
+    rig.device
+        .mmio_write_taking(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_STATUS.into()),
+        RGFX_STATUS_DRIVER_READY
+    );
+    rig.device
+        .mmio_write_taking(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_STATUS.into()),
+        RGFX_STATUS_RESET
+    );
+}

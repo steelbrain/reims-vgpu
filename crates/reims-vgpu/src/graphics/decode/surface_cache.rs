@@ -269,16 +269,37 @@ impl<P: Platform> SurfaceCaches<P> {
         self.by_block.contains_key(&block)
     }
 
+    /// Whether [`Self::before`] would neither fill a cache `uses` names nor make the command
+    /// buffer wait for one's fill: each holds its use's generation or a newer one, no device of
+    /// the host wrote its pages since its last fill, and its last fill is done.
+    pub(crate) fn ready(&self, uses: &[RgfxOpSurfaceUse]) -> bool {
+        uses.iter().all(|u| {
+            let Some(cache) = self.by_block.get(&u.block_offset) else {
+                return true;
+            };
+            let filled = self
+                .transfer
+                .as_ref()
+                .is_none_or(|t| cache.filled_at <= t.done.load(Ordering::Acquire));
+            cache.generation.is_some_and(|held| u.cpu_gen <= held)
+                && !self.watched.written(u.block_offset)
+                && filled
+        })
+    }
+
     /// The blocks `uses` names that have caches, before command buffer `cb` of queue `queue`
     /// runs: each filled where it holds an older generation than the use's, or none, or a device
     /// of the host wrote its pages since its last fill, and `cb` made to wait for each one's last
     /// fill not yet done; and whether it waits for one. A use that may write marks its cache
-    /// written.
+    /// written. Where not `may_fill` (the caller found them [`Self::ready`], with nothing changed
+    /// since but the host's writes), nothing is filled: a write of the host's since `ready` is
+    /// left for the next use's fill, as one made after this use.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
+        may_fill: bool,
     ) -> RaiseResult<(Vec<u64>, bool)> {
         let mut used = Vec::new();
         let mut waits = false;
@@ -290,8 +311,8 @@ impl<P: Platform> SurfaceCaches<P> {
             let older = self.by_block[&u.block_offset]
                 .generation
                 .is_none_or(|held| u.cpu_gen > held);
-            let host_wrote = self.watched.take(u.block_offset);
-            if older || host_wrote {
+            let host_wrote = may_fill && self.watched.take(u.block_offset);
+            if may_fill && (older || host_wrote) {
                 if !older {
                     self.counts.host_writes += 1;
                 }
@@ -972,6 +993,56 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         let counts = r.dec.surface_caches.counts();
         assert_eq!((counts.made, counts.downloads), (2, 3));
+    }
+
+    /// A use of `block` at generation `cpu_gen` that only reads it.
+    fn reading(block_offset: u64, cpu_gen: u64) -> [RgfxOpSurfaceUse; 1] {
+        [RgfxOpSurfaceUse {
+            block_offset,
+            cpu_gen,
+            flags: 0,
+            reserved_14: 0,
+        }]
+    }
+
+    /// A cache is ready for a buffer taken on a doorbell's thread, which fills none, once it is
+    /// filled at its use's generation or a newer one, its fill is done, and no device of the
+    /// host's wrote over its pages since; such a buffer's readying fills nothing and leaves a
+    /// write since for the next use, which fills the cache again
+    #[test]
+    fn a_cache_is_ready_once_filled_at_its_use_s_generation_and_untouched() {
+        let mut r = cached();
+        let page = r.page;
+        let first = r.ram.host_addr(RAM + page).unwrap().addr().to_u64();
+        let ready = |r: &Rig, cpu_gen| r.dec.surface_caches.ready(&reading(BLOCK, cpu_gen));
+        assert!(!ready(&r, 0), "never filled");
+        assert!(
+            r.dec.surface_caches.ready(&reading(BLOCK + 0x8000, 0)),
+            "no cache"
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        assert!(!ready(&r, 1), "its fill is not done");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(ready(&r, 1) && ready(&r, 0));
+        assert!(!ready(&r, 2), "a newer generation");
+
+        device_writes::wrote(std::slice::from_ref(&(first..first + 8)));
+        assert!(!ready(&r, 1), "the host wrote its pages");
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let mark = r.p.call_log().mark();
+        let (used, waits) = (r.dec.surface_caches)
+            .before(&r.device, &cb, &reading(BLOCK, 1), false)
+            .unwrap();
+        assert_eq!((used, waits), (vec![BLOCK], false));
+        assert!(r.p.call_log().sels_since(mark).is_empty(), "nothing filled");
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            1,
+            "the next use fills"
+        );
     }
 
     /// A device of the host's write over a cache's pages has the cache's next use fill it again,

@@ -79,9 +79,11 @@ const _: () = {
 /// (`reims-vgpu.graphics-control`), its refresh thread (`reims-vgpu.graphics-refresh`), a command
 /// queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
-/// scheduled or completed handler; never inside a call of the host's into the library, and with
-/// no lock of the library's held; they may call at once. It may wait for a lock the host holds
-/// while it calls the device (QEMU's BQL). May call: rvg_status_message and the
+/// scheduled or completed handler; or the host's own, inside rvg_graphics_device_mmio_write_taking.
+/// Never inside another call of the host's into the library, and with no lock of the library's
+/// held; they may call at once. It may wait for a lock the host holds while it calls the device
+/// (QEMU's BQL), but not for one the host holds while it calls
+/// rvg_graphics_device_mmio_write_taking. May call: rvg_status_message and the
 /// rvg_graphics_device_* functions, except the release of its own device. Without it the guest
 /// gets no interrupt.
 pub type RvgGraphicsRaiseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, vector: u32)>;
@@ -370,6 +372,34 @@ pub unsafe extern "C" fn rvg_graphics_device_mmio_write(
         unsafe { live(device, "rvg_graphics_device_mmio_write") }
             .device
             .mmio_write(offset, value);
+    })
+}
+
+/// rvg_graphics_device_mmio_write, but a write to RVG_GRAPHICS_REG_DOORBELL of a command queue's
+/// ring (any value but RVG_GRAPHICS_DOORBELL_CONTROL) may take the queue's next command buffer on
+/// the calling thread, ahead of the queue's own thread, and post the event that says it is
+/// submitted there: raise_interrupt is then called on the calling thread, inside this call, after
+/// that event is published. The host's raise_interrupt must therefore not wait for a lock the host
+/// holds while it calls this. A buffer is taken only where nothing need be waited for (each lock
+/// the take needs is tried, and the queue's thread holds none of the queue's messages); otherwise
+/// the write wakes the queue's thread, as rvg_graphics_device_mmio_write does. What the guest sees
+/// is the same either way but for when the event comes. It waits for nothing
+/// rvg_graphics_device_mmio_write does not. On any thread, the vCPU's included. Calls back:
+/// raise_interrupt, as above.
+///
+/// # Safety
+/// `device` is a live graphics device handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_graphics_device_mmio_write_taking(
+    device: *mut RvgGraphicsDevice,
+    offset: u64,
+    value: u32,
+) {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        unsafe { live(device, "rvg_graphics_device_mmio_write_taking") }
+            .device
+            .mmio_write_taking(offset, value);
     })
 }
 

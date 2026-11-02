@@ -35,6 +35,10 @@ zerocopy.workspace = true
 sha2.workspace = true
 # A window frame that fails, or a window that gets no sink (`window::vulkan`).
 log.workspace = true
+# The reims-graphics decoder's lock, which a doorbell's thread takes and its queue's service thread
+# lets go (`graphics`'s take on a doorbell): `arc_lock`'s owned guard, and `send_guard`, which lets
+# it cross threads.
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 # KVM's dirty-log ioctls, in a host's dirty source's harvest (`dirty`); on Linux, the guest's RAM
 # as a host maps it, a shared mapping of a file (`platform::tests`).
 libc.workspace = true

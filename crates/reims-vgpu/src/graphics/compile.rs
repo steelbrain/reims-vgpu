@@ -456,6 +456,18 @@ impl Pending {
         self.done.notify_all();
     }
 
+    /// Whether no pipeline the command buffer `message` names is pending, answered waiting for
+    /// nothing: false where another thread holds the table.
+    pub(crate) fn none_named_by(&self, message: &[u8]) -> bool {
+        let Some(ids) = self.ids.try_lock() else {
+            return false;
+        };
+        ids.is_empty()
+            || !named_pipelines(message)
+                .iter()
+                .any(|id| ids.contains_key(id))
+    }
+
     /// Waits until no pipeline the command buffer `message` names is pending.
     pub(crate) fn wait_for_command_buffer(&self, message: &[u8]) {
         let mut ids = self.ids.lock();
