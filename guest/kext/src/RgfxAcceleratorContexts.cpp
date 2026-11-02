@@ -19,9 +19,10 @@
  *     answers its BLOCK_RELEASE OK, which a thread call of the kext's own posts, so a free
  *     returns at once; the client's are freed after its close is answered, and kept from use
  *     for good where it is not.
- *   - The shared blocks of IOSurface planes (RgfxSurfaceBlocks.hpp): one block per plane for
- *     every process that holds the surface, found by the plane's physical pages, which the kext
- *     wires in each asking process's task while it holds the block. The device learns of each
+ *   - The shared blocks of IOSurface planes (RgfxSurfaceBlocks.hpp): one block per plane asked
+ *     for by every process that holds the surface (the bundle asks by each surface's plane 0, its
+ *     block holding every plane), found by the plane's physical pages, which the kext wires in
+ *     each asking process's task while it holds the block. The device learns of each
  *     holder (BLOCK_SHARE) before the process learns of the block, and of each but the last
  *     letting go (BLOCK_UNSHARE); the last frees the block as a client's free does.
  *   - The completion rings of the clients' queues, watched: the device raises its one vector

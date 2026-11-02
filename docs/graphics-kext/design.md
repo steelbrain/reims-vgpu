@@ -232,10 +232,16 @@ Stages:
     metal2vulkan's host-page rules: in place where only sampled, otherwise a
     shadow copy that is announced. Stage 2 needs none of this, since its
     compositor is software.
-    - **Today:** a surface plane's GPU copy is one region block that every
-      process holding the surface shares (the kext's, found by the plane's
-      pages; "Processes name only their own"), so one process's GPU writes
-      reach another's GPU with no copy. The block syncs from the pages before
+    - **Today:** a surface's GPU copy is one region block, holding every
+      plane in plane order, that every process holding the surface shares
+      (the kext's, found by plane 0's pages; "Processes name only their
+      own"), so one process's GPU writes reach another's GPU with no copy, and
+      a texture over one plane that reads another (a two-plane YCbCr texture
+      over plane 0 reads plane 1's chroma) finds both in one buffer. Its
+      `TEXTURE_FROM_IOSURFACE` carries the surface's facts
+      (`RgfxSurfaceFacts`: OSType, planes, size, plane 1's place, YCbCr
+      matrix), which the host's surface creator reads as Metal reads the
+      surface. The block syncs from the pages before
       a commit where the surface's seed moved since any holder synced it, and
       back to the pages at the completion of each command buffer that writes
       it, since no lock callback reaches the bundle yet. The block's header
@@ -541,11 +547,11 @@ posts a block's `BLOCK_GRANT` (context, offset, size) on ring 0 before its
 allocation returns, keeping the block pinned until then so no free overtakes
 it. The host keeps the grant until the block's `BLOCK_RELEASE` or the context's
 `CONTEXT_CLOSE`, and copies a buffer out of a block only while the grant
-stands. An IOSurface plane's shared block (§14) is held by every process that
-holds the surface: the kext finds it by the plane's physical pages, which a
-process presents through its own CPU mapping of the plane (user-client
-selector 0x109), so only a holder of the surface can reach the block, whatever
-id it claims. The kext wires those pages while the process holds the block,
+stands. An IOSurface's shared block (§14) is held by every process that
+holds the surface: the kext finds it by the physical pages of the surface's
+plane 0, which a process presents through its own CPU mapping of the plane
+(user-client selector 0x109), so only a holder of the surface can reach the
+block, whatever id it claims. The kext wires those pages while the process holds the block,
 posts `BLOCK_SHARE` (context, offset, size) for each holder before the process
 learns of the block, and `BLOCK_UNSHARE` as a holder other than the last lets
 it go (selector 0x10a, or its close). The last holder's let-go frees the block

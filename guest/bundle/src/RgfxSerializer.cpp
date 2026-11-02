@@ -431,7 +431,8 @@ RgfxCreated RgfxSerializer::createTextureFromIOSurface(RgfxObjId buffer, uint64_
                                                        uint64_t bytes_per_row,
                                                        uint32_t iosurface_id, uint32_t plane,
                                                        const RgfxTextureDescriptor &desc,
-                                                       uint64_t writers_offset)
+                                                       uint64_t writers_offset,
+                                                       const RgfxSurfaceFacts &facts)
 {
 	RgfxCreated out = {};
 	out.resource_id = m_ids.allocResourceId();
@@ -439,16 +440,17 @@ RgfxCreated RgfxSerializer::createTextureFromIOSurface(RgfxObjId buffer, uint64_
 		return out;
 	out.obj_id = m_ids.allocObjId();
 
-	RgfxTextureFromIOSurface msg = {};
-	msg.obj_id = out.obj_id;
-	msg.resource_id = out.resource_id;
-	msg.buffer_obj_id = buffer;
-	msg.offset = offset;
-	msg.bytes_per_row = bytes_per_row;
-	msg.iosurface_id = iosurface_id;
-	msg.plane = plane;
-	msg.desc = desc;
-	msg.writers_offset = writers_offset;
+	RgfxSurfaceTextureMessage msg = {};
+	msg.texture.obj_id = out.obj_id;
+	msg.texture.resource_id = out.resource_id;
+	msg.texture.buffer_obj_id = buffer;
+	msg.texture.offset = offset;
+	msg.texture.bytes_per_row = bytes_per_row;
+	msg.texture.iosurface_id = iosurface_id;
+	msg.texture.plane = plane;
+	msg.texture.desc = desc;
+	msg.texture.writers_offset = writers_offset;
+	msg.facts = facts;
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_TEXTURE_FROM_IOSURFACE, &msg, sizeof(msg), &out.seqno);
 	return out;

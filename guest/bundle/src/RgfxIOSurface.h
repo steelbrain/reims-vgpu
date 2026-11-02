@@ -5,17 +5,22 @@
  * (docs/graphics-kext/design.md, Decided 5 and 14), and processes share a surface by its global
  * IOSurfaceID (WindowServer and its clients alias the same window and drawable surfaces). So a
  * surface's own pages stay its CPU copy, which every process and the CPU agree on, and its GPU
- * view is one block of the device region per plane: the plane's shared block, the one every
- * process that holds the surface gets from the accelerator kext (RgfxRegion::acquireSurface),
- * found by the plane's pages the process maps. Each process makes a Shared buffer over the
- * block and its texture over that buffer (TEXTURE_FROM_IOSURFACE, which also names the texture
- * by the surface's id on the host, for presents). What one process's GPU draws there, another's
- * samples there, with no copy. Where the kext gives no shared block, the process keeps a block
- * of its own for the plane, as before.
+ * view is one block of the device region holding every plane: the surface's shared block, the
+ * one every process that holds the surface gets from the accelerator kext
+ * (RgfxRegion::acquireSurface), found by the pages of plane 0 the process maps. Each process
+ * makes a Shared buffer over the block and each texture over its plane's rows in that buffer
+ * (TEXTURE_FROM_IOSURFACE, which also names the texture by the surface's id on the host, for
+ * presents, and carries the surface's facts, RgfxSurfaceFacts: its OSType, planes, size, plane
+ * 1's place in the block and its YCbCr matrix, which a texture over plane 0 that reads plane 1,
+ * a two-plane YCbCr one, needs). What one process's GPU draws there, another's samples there,
+ * with no copy. Where the kext gives no shared block, the process keeps a block of its own for
+ * the surface, as before.
  *
- * The block's rows are kShadowRowAlign apart, and a header past them (RgfxSurfaceHeader) holds
- * the surface's seed when the block last matched the pages, which every holder reads and
- * writes. The block syncs with the pages at two points:
+ * The block holds the planes in plane order, each from a kShadowRowAlign multiple, its rows
+ * kShadowRowAlign apart, as the surface's own memory holds them one after another; a header past
+ * the last (RgfxSurfaceHeader) holds the surface's seed when the block last matched the pages,
+ * which every holder reads and writes. The block syncs with the pages, every plane, at two
+ * points:
  *   - before a commit, from the pages, where the surface's seed is not the header's: a CPU
  *     wrote the surface under a lock since any holder synced it;
  *   - when a command buffer that writes the block completes, before it reports completion,

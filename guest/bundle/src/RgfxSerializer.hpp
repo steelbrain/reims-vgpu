@@ -24,6 +24,7 @@
 #ifndef RGFX_SERIALIZER_HPP_
 #define RGFX_SERIALIZER_HPP_
 
+#include <cstddef>
 #include <cstdint>
 
 #include "RgfxObjectModel.hpp"
@@ -126,6 +127,17 @@ struct RgfxComputePipelineParams {
 /// forward (a library's), kRgfxNoAnswer where none came back; 0 for the others.
 /// A texture create with no resource id left (RgfxIdSpace::allocResourceId) posts
 /// nothing and answers every field 0: the caller makes no texture.
+/// A `TEXTURE_FROM_IOSURFACE` as the bundle sends it: the struct, then the surface's facts at
+/// RGFX_SURFACE_FACTS_OFFSET.
+struct RgfxSurfaceTextureMessage {
+	RgfxTextureFromIOSurface texture;
+	RgfxSurfaceFacts facts;
+};
+
+static_assert(offsetof(RgfxSurfaceTextureMessage, facts) == RGFX_SURFACE_FACTS_OFFSET,
+              "the facts follow the struct, where the host reads them");
+static_assert(sizeof(RgfxSurfaceTextureMessage) % 8 == 0, "a ring message is whole words");
+
 struct RgfxCreated {
 	RgfxObjId obj_id;
 	uint64_t gpu_address;
@@ -282,14 +294,15 @@ public:
 	                                          const RgfxTextureDescriptor &desc);
 
 	/// A texture of shape `desc` over plane `plane` of the IOSurface `iosurface_id`,
-	/// lying over the buffer `buffer` (this process's copy of the plane) from
+	/// lying over the buffer `buffer` (this process's copy of the surface) from
 	/// `offset`, each row `bytes_per_row` apart, the copy's writers (RgfxSurfaceWriters)
-	/// `writers_offset` bytes into the buffer (RGFX_SURFACE_NO_WRITERS for none). A resource
-	/// id is picked.
+	/// `writers_offset` bytes into the buffer (RGFX_SURFACE_NO_WRITERS for none), the
+	/// surface's `facts` after it (RgfxSurfaceTextureMessage). A resource id is picked.
 	RgfxCreated createTextureFromIOSurface(RgfxObjId buffer, uint64_t offset,
 	                                       uint64_t bytes_per_row, uint32_t iosurface_id,
 	                                       uint32_t plane, const RgfxTextureDescriptor &desc,
-	                                       uint64_t writers_offset);
+	                                       uint64_t writers_offset,
+	                                       const RgfxSurfaceFacts &facts);
 
 	// --- state objects --------------------------------------------------------
 

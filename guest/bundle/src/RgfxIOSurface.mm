@@ -80,6 +80,49 @@ uint8_t *planeBase(IOSurfaceRef s, size_t plane)
 	return static_cast<uint8_t *>(p);
 }
 
+/// One plane of a surface's copy: its shape on the CPU, and where its rows lie in the copy.
+struct ShadowPlane {
+	PlaneShape shape = {};
+	uint64_t pitch = 0;  // the copy's row pitch (kShadowRowAlign multiple)
+	uint64_t offset = 0; // the plane's first byte in the copy (kShadowRowAlign multiple)
+};
+
+/// The surface's YCbCr matrix as one of RGFX_YCBCR_MATRIX_*. CoreVideo keeps a pixel buffer's
+/// propagated kCVImageBufferYCbCrMatrixKey attachment on its surface as the value
+/// "IOSurfaceYCbCrMatrix", the attachment's string (measured on the M3 Max under macOS 27.0.1
+/// with IOSurfaceCopyAllValues, for each of CoreVideo's six matrix constants). Read from the
+/// surface itself: a CVPixelBuffer made over the surface reads it back too, but holds the
+/// surface in use (IOSurfaceIsInUse, a use count of 1) while it lives, which Metal does not.
+uint32_t ycbcrMatrix(IOSurfaceRef s)
+{
+	CFTypeRef value = IOSurfaceCopyValue(s, CFSTR("IOSurfaceYCbCrMatrix"));
+	if (value == nullptr) {
+		return RGFX_YCBCR_MATRIX_NONE;
+	}
+	static const struct {
+		CFStringRef name;
+		uint32_t code;
+	} kMatrices[] = {
+	    {CFSTR("ITU_R_601_4"), RGFX_YCBCR_MATRIX_ITU_R_601_4},
+	    {CFSTR("ITU_R_709_2"), RGFX_YCBCR_MATRIX_ITU_R_709_2},
+	    {CFSTR("ITU_R_2020"), RGFX_YCBCR_MATRIX_ITU_R_2020},
+	    {CFSTR("SMPTE_240M_1995"), RGFX_YCBCR_MATRIX_SMPTE_240M_1995},
+	    {CFSTR("DCI_P3"), RGFX_YCBCR_MATRIX_DCI_P3},
+	    {CFSTR("P3_D65"), RGFX_YCBCR_MATRIX_P3_D65},
+	};
+	uint32_t code = RGFX_YCBCR_MATRIX_OTHER;
+	if (CFGetTypeID(value) == CFStringGetTypeID()) {
+		for (const auto &m : kMatrices) {
+			if (CFEqual(value, m.name)) {
+				code = m.code;
+				break;
+			}
+		}
+	}
+	CFRelease(value);
+	return code;
+}
+
 /// The process's copies between surfaces' pages and the GPU's view of them, by direction: a
 /// diagnostic, a line in kCopyLog at most every kCopyReportNs while copies run.
 struct CopyCount {
@@ -148,7 +191,7 @@ void countCopy(CopyCount &c, uint64_t bytes, uint64_t start)
 
 } // namespace
 
-/// What every process holding a plane's shared block agrees on, in the block past the plane's
+/// What every process holding a surface's shared block agrees on, in the block past the planes'
 /// rows (RgfxSurfaceShadow::header): the surface's seed when the block last matched the
 /// surface's pages, valid where `serial` is the block's own (a block made again holds an older
 /// one's bytes until its first holder writes it).
@@ -161,15 +204,17 @@ struct RgfxSurfaceHeader {
 static_assert(sizeof(RgfxSurfaceHeader) % alignof(RgfxSurfaceWriters) == 0,
               "the writers follow the header, aligned");
 
-/// The GPU's view of one surface plane, in a block of the device region: the plane's shared
-/// block, which every process holding the surface draws and samples (the kext's,
-/// RgfxRegion::acquireSurface), or this process's own block where the kext gives none.
+/// The GPU's view of one surface, every plane of it, in a block of the device region: the
+/// surface's shared block, which every process holding the surface draws and samples (the
+/// kext's, RgfxRegion::acquireSurface), or this process's own block where the kext gives none.
+/// Its planes lie in it in order, as the surface's do in its own memory, each at its own
+/// offset, so a texture over one plane that reads another (a two-plane YCbCr texture over plane
+/// 0 reads plane 1's chroma) finds both in the one buffer, and every texture over the surface
+/// reads and writes the same bytes, as Metal's over one surface do.
 struct RgfxSurfaceShadow {
 	IOSurfaceRef surface = nullptr; // retained
 	uint32_t surfaceId = 0;
-	uint32_t plane = 0;
-	PlaneShape shape = {};
-	uint64_t pitch = 0; // the copy's row pitch (kShadowRowAlign multiple)
+	std::vector<ShadowPlane> planes; // by plane; a surface without planes has the one plane 0
 	RgfxRegion::Block block = {};
 	RgfxRegion *region = nullptr; // where the block goes back at the copy's end
 	id<MTLBuffer> buffer = nil; // the Shared buffer over the block
@@ -252,6 +297,33 @@ struct RgfxSurfaceShadow {
 
 	uint8_t *copy() const { return const_cast<uint8_t *>(block.ptr); }
 
+	/// The bytes of the surface's planes, as its CPU mapping lays them out.
+	uint64_t planeBytes() const
+	{
+		uint64_t n = 0;
+		for (const ShadowPlane &p : planes) {
+			n += p.shape.rowBytes * p.shape.rows;
+		}
+		return n;
+	}
+
+	/// What a texture over the surface tells the host of it (RgfxSurfaceFacts), its YCbCr
+	/// matrix as it is now.
+	RgfxSurfaceFacts facts() const
+	{
+		RgfxSurfaceFacts f = {};
+		f.surface_pixel_format = IOSurfaceGetPixelFormat(surface);
+		f.plane_count = static_cast<uint32_t>(IOSurfaceGetPlaneCount(surface));
+		f.width = static_cast<uint32_t>(IOSurfaceGetWidth(surface));
+		f.height = static_cast<uint32_t>(IOSurfaceGetHeight(surface));
+		if (planes.size() >= 2) {
+			f.chroma_offset = planes[1].offset;
+			f.chroma_bytes_per_row = planes[1].pitch;
+		}
+		f.ycbcr_matrix = ycbcrMatrix(surface);
+		return f;
+	}
+
 	/// The surface's seed when the block last matched its pages; false where it never has.
 	bool syncedSeed(uint32_t *out) const
 	{
@@ -285,13 +357,16 @@ struct RgfxSurfaceShadow {
 		if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &s) != kIOReturnSuccess) {
 			return;
 		}
-		const uint8_t *src = planeBase(surface, plane);
-		if (src != nullptr) {
-			copyRows(copy(), pitch, src, shape.rowBytes);
+		for (size_t k = 0; k < planes.size(); k++) {
+			const ShadowPlane &p = planes[k];
+			const uint8_t *src = planeBase(surface, k);
+			if (src != nullptr) {
+				copyRows(p, copy() + p.offset, p.pitch, src, p.shape.rowBytes);
+			}
 		}
 		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &s);
 		setSynced(s);
-		countCopy(gUploads, shape.rowBytes * shape.rows, start);
+		countCopy(gUploads, planeBytes(), start);
 	}
 
 	/// Copy -> pages, under a write lock; records the seed the unlock leaves, so the
@@ -303,13 +378,16 @@ struct RgfxSurfaceShadow {
 		if (IOSurfaceLock(surface, 0, &s) != kIOReturnSuccess) {
 			return;
 		}
-		uint8_t *dst = planeBase(surface, plane);
-		if (dst != nullptr) {
-			copyRows(dst, shape.rowBytes, copy(), pitch);
+		for (size_t k = 0; k < planes.size(); k++) {
+			const ShadowPlane &p = planes[k];
+			uint8_t *dst = planeBase(surface, k);
+			if (dst != nullptr) {
+				copyRows(p, dst, p.shape.rowBytes, copy() + p.offset, p.pitch);
+			}
 		}
 		IOSurfaceUnlock(surface, 0, &s);
 		setSynced(s);
-		countCopy(gWriteBacks, shape.rowBytes * shape.rows, start);
+		countCopy(gWriteBacks, planeBytes(), start);
 	}
 
 	/// Uploads when the surface's seed moved since the block last matched it, in any process
@@ -323,25 +401,27 @@ struct RgfxSurfaceShadow {
 		}
 	}
 
-	void copyRows(uint8_t *dst, uint64_t dstPitch, const uint8_t *src, uint64_t srcPitch) const
+	/// Plane `p`'s rows from `src` to `dst`, each at its pitch.
+	static void copyRows(const ShadowPlane &p, uint8_t *dst, uint64_t dstPitch, const uint8_t *src,
+	                     uint64_t srcPitch)
 	{
 		if (dstPitch == srcPitch) {
-			std::memcpy(dst, src, shape.rowBytes * shape.rows);
+			std::memcpy(dst, src, p.shape.rowBytes * p.shape.rows);
 			return;
 		}
-		for (uint64_t r = 0; r < shape.rows; r++) {
-			std::memcpy(dst + r * dstPitch, src + r * srcPitch, shape.rowBytes);
+		for (uint64_t r = 0; r < p.shape.rows; r++) {
+			std::memcpy(dst + r * dstPitch, src + r * srcPitch, p.shape.rowBytes);
 		}
 	}
 };
 
 namespace {
 
-/// The process's copies by (IOSurfaceID, plane). A dead copy's block goes back to the
-/// region (RgfxRegion::release), which hands it to the accelerator kext to give out again.
+/// The process's copies by IOSurfaceID. A dead copy's block goes back to the region
+/// (RgfxRegion::release), which hands it to the accelerator kext to give out again.
 struct Registry {
 	std::mutex lock;
-	std::map<std::pair<uint32_t, uint32_t>, std::weak_ptr<RgfxSurfaceShadow>> shadows;
+	std::map<uint32_t, std::weak_ptr<RgfxSurfaceShadow>> shadows;
 };
 
 Registry &registry()
@@ -372,21 +452,29 @@ RgfxSurfaceShadow::~RgfxSurfaceShadow()
 
 namespace {
 
-/// The process's copy of `surface`'s plane `plane`, made (and synced) on first use.
-std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plane,
-                                             RgfxRegion *region, id<MTLDevice> device,
-                                             RgfxSerializer *serializer)
+/// The process's copy of every plane of `surface`, made (and synced) on first use.
+std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *region,
+                                             id<MTLDevice> device, RgfxSerializer *serializer)
 {
-	PlaneShape shape;
-	if (!planeShape(surface, plane, &shape) || planeBase(surface, plane) == nullptr) {
-		return nullptr;
+	// Every holder lays the block out alike, from the surface's shape alone: each plane's rows in
+	// plane order, then the header, then the writers.
+	std::vector<ShadowPlane> planes(std::max<size_t>(IOSurfaceGetPlaneCount(surface), 1));
+	uint64_t end = 0;
+	for (size_t k = 0; k < planes.size(); k++) {
+		ShadowPlane &p = planes[k];
+		if (!planeShape(surface, k, &p.shape) || planeBase(surface, k) == nullptr) {
+			return nullptr;
+		}
+		p.pitch = alignUp(p.shape.rowBytes, kShadowRowAlign);
+		p.offset = alignUp(end, kShadowRowAlign);
+		end = p.offset + p.pitch * p.shape.rows;
 	}
 	uint32_t surfaceId = IOSurfaceGetID(surface);
 	Registry &r = registry();
 	std::shared_ptr<RgfxSurfaceShadow> shadow;
 	{
 		std::lock_guard<std::mutex> g(r.lock);
-		auto it = r.shadows.find({surfaceId, plane});
+		auto it = r.shadows.find(surfaceId);
 		if (it != r.shadows.end()) {
 			shadow = it->second.lock();
 			// A live copy holds its surface, so its id still names that surface.
@@ -397,17 +485,16 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		shadow = std::make_shared<RgfxSurfaceShadow>();
 		shadow->surface = (IOSurfaceRef)CFRetain(surface);
 		shadow->surfaceId = surfaceId;
-		shadow->plane = plane;
-		shadow->shape = shape;
-		shadow->pitch = alignUp(shape.rowBytes, kShadowRowAlign);
-		// Every holder lays the block out alike, from the plane's shape alone: the rows, then
-		// the header, then the writers.
-		uint64_t headerAt = alignUp(shadow->pitch * shape.rows, alignof(RgfxSurfaceHeader));
+		shadow->planes = planes;
+		uint64_t headerAt = alignUp(end, alignof(RgfxSurfaceHeader));
 		uint64_t writersAt = headerAt + sizeof(RgfxSurfaceHeader);
 		uint64_t size =
 		    alignUp(writersAt + sizeof(RgfxSurfaceWriters), RgfxRegion::kDefaultBlockAlign);
+		// The kext finds the surface's shared block by plane 0's pages, which no other surface
+		// holds.
+		const PlaneShape &first = planes[0].shape;
 		RgfxRegion::SurfaceBlock sharedBlock =
-		    region->acquireSurface(planeBase(surface, plane), shape.rowBytes * shape.rows, size);
+		    region->acquireSurface(planeBase(surface, 0), first.rowBytes * first.rows, size);
 		shadow->region = region;
 		if (sharedBlock.block.ok) {
 			shadow->block = sharedBlock.block;
@@ -426,7 +513,7 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, uint32_t plan
 		shadow->writers = reinterpret_cast<RgfxSurfaceWriters *>(shadow->copy() + writersAt);
 		if (!shadow->shared || sharedBlock.fresh)
 			std::memset(static_cast<void *>(shadow->writers), 0, sizeof(RgfxSurfaceWriters));
-		r.shadows[{surfaceId, plane}] = shadow;
+		r.shadows[surfaceId] = shadow;
 	}
 	uint64_t offset = shadow->block.offset;
 	bool shared = shadow->shared;
@@ -484,6 +571,7 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 
 @implementation RgfxIOSurfaceTexture {
 	std::shared_ptr<RgfxSurfaceShadow> _shadow;
+	NSUInteger _plane;
 }
 
 + (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -496,8 +584,10 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	if (descriptor == nil || surface == nullptr || region == nullptr || serializer == nullptr) {
 		return nil;
 	}
-	std::shared_ptr<RgfxSurfaceShadow> shadow =
-	    shadowFor(surface, static_cast<uint32_t>(plane), region, device, serializer);
+	if (plane >= std::max<size_t>(IOSurfaceGetPlaneCount(surface), 1)) {
+		return nil;
+	}
+	std::shared_ptr<RgfxSurfaceShadow> shadow = shadowFor(surface, region, device, serializer);
 	if (shadow == nullptr) {
 		return nil;
 	}
@@ -507,9 +597,10 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	RgfxTextureDescriptor hostDesc = desc;
 	hostDesc.options = (hostDesc.options & ~static_cast<uint32_t>(MTLResourceStorageModeMask)) |
 	                   static_cast<uint32_t>(MTLResourceStorageModeShared);
+	const ShadowPlane &p = shadow->planes[plane];
 	RgfxCreated created = serializer->createTextureFromIOSurface(
-	    [(RgfxResource *)shadow->buffer rgfxObjId], 0, shadow->pitch, shadow->surfaceId,
-	    shadow->plane, hostDesc, shadow->writersAt);
+	    [(RgfxResource *)shadow->buffer rgfxObjId], p.offset, p.pitch, shadow->surfaceId,
+	    static_cast<uint32_t>(plane), hostDesc, shadow->writersAt, shadow->facts());
 	if (created.resource_id == 0) {
 		return nil; // no resource id left: no texture, as Metal answers one it cannot make
 	}
@@ -521,6 +612,7 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	                                                           serializer:serializer];
 	if (t != nil) {
 		t->_shadow = std::move(shadow);
+		t->_plane = plane;
 		[t rgfxTakeDescriptor:descriptor];
 	}
 	return t;
@@ -536,13 +628,13 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	return _shadow->surface;
 }
 
-// The texture lies at the start of its copy's buffer, in the buffer's allocation, so the textures
-// over one plane share both, as Metal's over one surface do (measured on the M3 Max under macOS
-// 27: one allocationID and one gpuAddress for two textures and a view over a surface, of any
-// storage mode).
+// The texture lies at its plane's offset in its copy's buffer, in the buffer's allocation, so the
+// textures over one plane share both, as Metal's over one surface do (measured on the M3 Max under
+// macOS 27: one allocationID and one gpuAddress for two textures and a view over a surface, of any
+// storage mode); plane 0's lie at the buffer's start.
 - (uint64_t)gpuAddress
 {
-	return _shadow->buffer.gpuAddress;
+	return _shadow->buffer.gpuAddress + _shadow->planes[_plane].offset;
 }
 
 - (uint64_t)rgfxAllocationId
@@ -552,10 +644,10 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 
 - (NSUInteger)iosurfacePlane
 {
-	return _shadow->plane;
+	return _plane;
 }
 
-// The bytes the texture takes: its copy of the plane in the region (SecurityAgent's RenderBox
+// The bytes the texture takes: its copy of the surface in the region (SecurityAgent's RenderBox
 // asks as it accounts a surface's texture).
 - (NSUInteger)allocatedSize
 {
@@ -567,7 +659,7 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 
 - (BOOL)rgfxCpuRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice
 {
-	const PlaneShape &s = _shadow->shape;
+	const PlaneShape &s = _shadow->planes[_plane].shape;
 	return level == 0 && slice == 0 && s.elementWidth == 1 && s.elementHeight == 1 &&
 	       region.origin.y + region.size.height <= s.rows &&
 	       (region.origin.x + region.size.width) * s.bytesPerElement <= s.rowBytes;
@@ -585,10 +677,12 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	}
 	_shadow->uploadIfChanged();
 	std::lock_guard<std::mutex> g(_shadow->lock);
-	uint64_t bpe = _shadow->shape.bytesPerElement;
+	const ShadowPlane &p = _shadow->planes[_plane];
+	uint64_t bpe = p.shape.bytesPerElement;
+	const uint8_t *rows = _shadow->copy() + p.offset;
 	for (NSUInteger r = 0; r < region.size.height; r++) {
 		std::memcpy(static_cast<uint8_t *>(pixelBytes) + r * bytesPerRow,
-		            _shadow->copy() + (region.origin.y + r) * _shadow->pitch + region.origin.x * bpe,
+		            rows + (region.origin.y + r) * p.pitch + region.origin.x * bpe,
 		            region.size.width * bpe);
 	}
 }
@@ -618,9 +712,11 @@ RgfxTextureDescriptor wireDescriptor(MTLTextureDescriptor *d)
 	}
 	_shadow->uploadIfChanged();
 	std::lock_guard<std::mutex> g(_shadow->lock);
-	uint64_t bpe = _shadow->shape.bytesPerElement;
+	const ShadowPlane &p = _shadow->planes[_plane];
+	uint64_t bpe = p.shape.bytesPerElement;
+	uint8_t *rows = _shadow->copy() + p.offset;
 	for (NSUInteger r = 0; r < region.size.height; r++) {
-		std::memcpy(_shadow->copy() + (region.origin.y + r) * _shadow->pitch + region.origin.x * bpe,
+		std::memcpy(rows + (region.origin.y + r) * p.pitch + region.origin.x * bpe,
 		            static_cast<const uint8_t *>(pixelBytes) + r * bytesPerRow,
 		            region.size.width * bpe);
 	}

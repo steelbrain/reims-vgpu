@@ -1,5 +1,6 @@
-// RgfxSurfaceBlocks: the accelerator kext's shared blocks, one per IOSurface plane that the
-// processes holding the surface draw and sample on the GPU (guest/bundle/src/RgfxIOSurface.h).
+// RgfxSurfaceBlocks: the accelerator kext's shared blocks, one per IOSurface plane the processes
+// holding the surface ask by, which they draw and sample on the GPU (the bundle asks by each
+// surface's plane 0, the block holding every plane: guest/bundle/src/RgfxIOSurface.h).
 //
 // A process asks for a plane's block with its own CPU mapping of the plane. The kext wires that
 // range in the process's task and reads its physical pages, and the pages are the block's key:
