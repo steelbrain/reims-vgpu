@@ -76,6 +76,7 @@ use reims_graphics::wire::{
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
     RgfxVertexBufferLayout,
 };
+use reims_vgpu_core::collections::hasher::KeyBuild;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -252,7 +253,11 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The platform whose device the decoder drives, held for the descriptor
     /// builders ([`Platform::texture_descriptor`]) some per-device creates need.
     platform: Arc<P>,
-    objects: HashMap<u64, ObjHandle<P>>,
+    /// The objects the guest's processes made, by id: looked up at each op that names one, so
+    /// hashed by core's fixed integer hasher
+    /// ([`KeyHasher`](reims_vgpu_core::collections::KeyHasher)), which also makes the order a
+    /// context's objects drop in at its close the same in every run.
+    objects: HashMap<u64, ObjHandle<P>, KeyBuild>,
     /// The textures over each IOSurface's plane 0, by the surface's global id:
     /// every `TEXTURE_FROM_IOSURFACE` naming the surface whose texture the table
     /// holds, in the order made, so a destroy of one leaves the others (another
@@ -332,7 +337,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         GraphicsDecoder {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
-            objects: HashMap::new(),
+            objects: HashMap::default(),
             surfaces: HashMap::new(),
             surface_writers: HashMap::new(),
             library_chunks: HashMap::new(),
@@ -3739,6 +3744,38 @@ mod tests {
         assert_eq!(dec.decode(&device, grant(3, 0).as_bytes()).unwrap(), Ok(()));
         assert_eq!(made(&mut dec, obj(3, 1), 5), Ok(()));
         assert_eq!(made(&mut dec, obj(2, 7), 16319), Ok(()));
+    }
+
+    /// The objects table's order, which a context's objects drop in at its close, is a function
+    /// of their ids and the history of creates and destroys, the same in every run: its hasher
+    /// is fixed. Two decoders that made the same buffers hold them in one order.
+    #[test]
+    fn a_contexts_objects_drop_in_the_same_order_every_run() {
+        let order = || {
+            let p = Arc::new(FakePlatform::new());
+            let device = p.device();
+            let mut dec = GraphicsDecoder::<FakePlatform>::new(
+                Arc::clone(&p),
+                Arc::new(Region::new(0x10000).unwrap()),
+            );
+            for n in 1..=64 {
+                let buffer = RgfxBufferCreate {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_CMD_BUFFER_CREATE,
+                        size: size_of::<RgfxBufferCreate>() as u32,
+                        seqno: 0,
+                    },
+                    obj_id: (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n,
+                    length: 64,
+                    ..RgfxBufferCreate::default()
+                };
+                assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+            }
+            dec.objects.keys().copied().collect::<Vec<u64>>()
+        };
+        let first = order();
+        assert_eq!(first.len(), 64);
+        assert_eq!(first, order());
     }
 
     /// A texture over a buffer the platform makes none of (Metal's nil, which names no reason) is
