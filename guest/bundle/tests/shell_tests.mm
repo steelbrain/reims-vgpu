@@ -2260,8 +2260,8 @@ void test_stitched_libraries_in_archives()
 // for it: over tests/air_arguments.metal's stitchable functions, each return type and argument
 // is equal to Metal's own (its -isEqual:, both ways), of the same classes, and -bindings is
 // -arguments' object, made once. A visible function that is not stitchable answers nil and no
-// arguments. Where the signature has a type the reader does not know, the shadow answers, and the
-// library's other functions still answer their own. tools/reflection_check.mm compares them
+// arguments. Where the signature has a type the reader does not know, or an acceleration
+// structure, the shadow answers, and the library's other functions still answer their own. tools/reflection_check.mm compares them
 // getter by getter on a device.
 void test_stitchable_reflection_from_air()
 {
@@ -2310,6 +2310,12 @@ void test_stitchable_reflection_from_air()
 		if (theirs.functionType != MTLFunctionTypeVisible)
 			continue;
 		RgfxFunction *fn = (RgfxFunction *)[lib newFunctionWithName:name];
+		if ([name isEqualToString:@"sig_acceleration"]) {
+			// Metal's own reflection of an acceleration structure ends the process, so it is not
+			// asked. Ours is refused, and its shadow answers (none here).
+			CHECK(ask(fn, @"arguments") == nil && ask(fn, @"returnType") == nil);
+			continue;
+		}
 		NSArray *arguments = ask(fn, @"arguments"), *metals = ask(theirs, @"arguments");
 		CHECK(arguments != nil && metals != nil && arguments.count == metals.count);
 		for (NSUInteger i = 0; i < arguments.count && i < metals.count; i++)
@@ -2320,7 +2326,7 @@ void test_stitchable_reflection_from_air()
 		CHECK([fn rgfxShadow] == nil); // no shadow made to answer them
 		compared++;
 	}
-	CHECK(compared == 9);
+	CHECK(compared == 17);
 
 	// Field by field, what Core Image reads among them: the return's data type, and each
 	// argument's name, binding type, and type's data type and name.

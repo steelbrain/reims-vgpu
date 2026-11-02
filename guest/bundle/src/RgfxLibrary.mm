@@ -602,7 +602,10 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 		if (visible == nullptr)
 			why = "its module lists no such visible function";
 	}
-	if (visible == nullptr && why != nullptr && rgfxAirUnreadFirstLog(name))
+	if (visible != nullptr && visible->signature == RgfxAirVisible::Signature::Unknown)
+		why = "it has a type the reader does not know";
+	if ((visible == nullptr || visible->signature == RgfxAirVisible::Signature::Unknown) && why != nullptr &&
+	    rgfxAirUnreadFirstLog(name))
 		NSLog(@"RGFX: %s: no signature read (%s): Metal's own function answers its reflection "
 		      @"(logged once a process)",
 		      name.c_str(), why);

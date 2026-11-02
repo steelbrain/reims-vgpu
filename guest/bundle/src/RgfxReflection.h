@@ -11,29 +11,37 @@
 //   - the return type: a type object of the return's type; a void return's is of data type
 //     kVoidDataType;
 //   - one binding per argument, in order, named as the argument, of access 0, index 0 and array
-//     length 0, inactive and unused: a scalar, vector, matrix or metal::array is of binding type
-//     kValueBindingType and its type object; a struct of kStructBindingType and its struct type;
-//     a pointer of kPointerBindingType and its pointer type; a texture is a texture binding of
-//     its sample type's data type, its texture type, access and depth; a sampler is of binding
-//     type 3 and no type object;
+//     length 0, inactive and unused: a scalar, vector, matrix, metal::array, enum or function
+//     table is of binding type kValueBindingType and its type object; a struct of
+//     kStructBindingType and its struct type; a pointer (a reference too) of kPointerBindingType
+//     and its pointer type; a texture is a texture binding of its sample type's data type, its
+//     texture type, access and depth; a sampler is of binding type 3 and no type object;
 //   - a scalar's, vector's or matrix's type object is of its data type (a packed vector's is its
-//     vector's), a metal::array's of none (MTLDataTypeNone);
+//     vector's); a metal::array's, an enum's and a function table's are of none (MTLDataTypeNone);
 //   - a struct type holds one member per field, each of its name, offset and data type, of
 //     pixel format, ALU type, argument index and raster order group 0 and render target
 //     0xFFFFFFFF, with the type object of a struct, array, pointer or texture field, and none for
 //     another. It is named as the struct, but nameless where it is a field's type or a field's
-//     pointee;
+//     pointee. An atomic is the struct Metal's library makes it;
 //   - an array type is of its length, its element type and a stride of the array's alignment,
-//     with a type object of its element type alone (a texture type of that data type where its
-//     elements are textures). Its element type is the element's data type, but
-//     kArrayVectorElement for vectors and kArrayMatrixElement for matrices;
-//   - a pointer type is of its pointee's data type, size and alignment, of access 0, neither a
-//     constant buffer nor an argument buffer, with the pointee's type object: a struct's struct
-//     type, an array's type object of its data type alone, and another's type object. A field's
-//     pointee is described otherwise: an array's type object is of its element type, and one
-//     that is no struct's or array's is of none;
+//     with a type object of its element type alone (a texture type, as a pointee's below, where
+//     its elements are textures). Its element type is the element's data type, but
+//     kArrayVectorElement for vectors, kArrayMatrixElement for matrices, and the function table
+//     data types for tables;
+//   - a pointer type (a reference's too) is of its pointee's data type (kVoidDataType for void),
+//     of access 0, neither a constant buffer nor an argument buffer, with the pointee's size and
+//     alignment (a pointer's pointee's where the pointee is a pointer, and none for an enum or a
+//     sampler) and the pointee's type object: a struct's struct type, a texture's texture type,
+//     an array's type object of its data type alone, and another's type object. A field's
+//     pointee is described otherwise: an array's type object is of its element type, a
+//     pointer's of its own pointee's data type, and one that is no struct, array, pointer or
+//     texture is of none;
 //   - a texture type is of its sample type's data type, its texture type, its access (0 to sample
-//     or read it, 2 to write it, 1 for both) and whether it is a depth texture.
+//     or read it, 2 to write it, 1 for both) and whether it is a depth texture; a pointee's or an
+//     array element's is of data type texture and texture type 0, not a depth texture, and of
+//     its address space's number as its access, whatever its own;
+//   - a signature that holds an acceleration structure has none: Metal's own reflection of one
+//     ends the process.
 #ifndef RGFX_REFLECTION_H_
 #define RGFX_REFLECTION_H_
 

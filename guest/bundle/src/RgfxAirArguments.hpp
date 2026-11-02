@@ -73,27 +73,34 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 // `air.visible`: one node per function, of the function, a node of its outputs and one of its
 // inputs, then, for a stitchable function, a node `air.stitching_info` of its signature. That
 // node's first operand is the return's `air.stitching_type` (none where it returns void), each
-// later one an `air.stitching_argument` of an argument's `air.stitching_type` and its name, in
-// the argument's order. A stitching type's first operand is the type's node: its name
+// later one an `air.stitching_argument` of an argument's `air.stitching_type` and its name (none
+// for an unnamed argument), in the argument's order. A stitching type's first operand is the type's node: its name
 // (`air.float_type`, `air.struct_type`, ...), its size and alignment, and an address space's
-// node or none, then what the kind adds:
-//   scalars (`air.float_type`, `air.half_type`, `air.int_type`, `air.uint_type`, `air.short_type`,
-//     `air.ushort_type`, `air.char_type`, `air.uchar_type`, `air.bool_type`, `air.long_type`,
-//     `air.ulong_type`): nothing;
+// node or none (a node of one `air.address_space` node, of the space's number), then what the
+// kind adds:
+//   scalars (`air.float_type`, `air.half_type`, `air.bfloat_type`, `air.int_type`, `air.uint_type`,
+//     `air.short_type`, `air.ushort_type`, `air.char_type`, `air.uchar_type`, `air.bool_type`,
+//     `air.long_type`, `air.ulong_type`) and `air.void_type` (a pointer's pointee): nothing;
 //   `air.vector_type`, `air.packed_vector_type`: the element's node and the component count;
 //   `air.matrix_type`: the element's node, the column count and the row count;
 //   `air.array_type` (an array of C's), `air.array_of_type` (a metal::array): the element's node
 //     and the length;
-//   `air.struct_type`: the struct's name and a node of its fields, each an `air.record_field` of
-//     its offset, a second integer, its type's node and its name;
-//   `air.pointer_type`: the pointee's node;
+//   `air.struct_type`: the struct's name and a node of its fields (none for an atomic of no
+//     size), each an `air.record_field` of its offset, a second integer, its type's node and its
+//     name. An atomic is the struct `metal::_atomic<T>`;
+//   `air.enum_type`: the enum's name and its underlying scalar's node;
+//   `air.pointer_type`, `air.lvalue_reference_type` and `air.rvalue_reference_type` (references,
+//     read as pointers): the pointee's node;
 //   `air.texture_<shape>_type`, `air.depth_<shape>_type`: the sample type's node and the access
 //     (`sample`, `read`, `write`, `read_write`);
-//   `air.sampler_type`: nothing.
+//   `air.sampler_type`: nothing;
+//   `air.visible_function_table_type`: an `air.function_type` node of the functions' signature;
+//     `air.intersection_function_table_type`: the tag's name (`triangle_data`, ...);
+//   `air.acceleration_structure_type`: `instancing` for an instance acceleration structure.
 // Read from modules Apple's Metal compiler built from our own sources (tests/air_arguments.metal),
 // as LLVM's text form of the same modules prints them.
 
-enum class RgfxAirScalar : uint8_t { Float, Half, Int, UInt, Short, UShort, Char, UChar, Bool, Long, ULong };
+enum class RgfxAirScalar : uint8_t { Float, Half, BFloat, Int, UInt, Short, UShort, Char, UChar, Bool, Long, ULong };
 
 // A texture's shape, as its type's name gives it (`air.texture_2d_array_type`: T2DArray).
 enum class RgfxAirTextureShape : uint8_t {
@@ -104,12 +111,27 @@ struct RgfxAirField;
 
 // One type of a stitchable function's signature.
 struct RgfxAirType {
-	enum class Kind : uint8_t { Scalar, Vector, Matrix, Array, ArrayOf, Struct, Pointer, Texture, Sampler };
+	enum class Kind : uint8_t {
+		Scalar,
+		Vector,
+		Matrix,
+		Array,
+		ArrayOf,
+		Struct,
+		Pointer,
+		Texture,
+		Sampler,
+		Void,
+		Enum,
+		VisibleFunctionTable,
+		IntersectionFunctionTable,
+		AccelerationStructure,
+	};
 	Kind kind = Kind::Scalar;
-	// Scalar, Vector and Matrix: the elements'; Texture: its samples'.
+	// Scalar, Vector and Matrix: the elements'; Texture: its samples'; Enum: its underlying type.
 	RgfxAirScalar scalar = RgfxAirScalar::Float;
-	// The type's size and alignment, in bytes.
-	uint32_t size = 0, align = 0;
+	// The type's size and alignment, in bytes, and its address space (0 where it has none).
+	uint32_t size = 0, align = 0, addressSpace = 0;
 	// Vector: its components; Matrix: its columns; Array and ArrayOf: its length.
 	uint32_t count = 0;
 	// Matrix: its rows.
@@ -121,10 +143,11 @@ struct RgfxAirType {
 	RgfxAirTextureShape shape = RgfxAirTextureShape::T2D;
 	bool depth = false;
 	RgfxAirAccess access = RgfxAirAccess::Unknown;
-	// Struct: its name and fields, in their order.
+	// Struct and Enum: its name; Struct: its fields, in their order.
 	std::string name;
 	std::vector<RgfxAirField> fields;
-	// Array, ArrayOf and Pointer: the element's (the pointee's) type, its one entry.
+	// Array, ArrayOf and Pointer (a reference among them): the element's (the pointee's) type, its
+	// one entry.
 	std::vector<RgfxAirType> element;
 };
 
@@ -146,7 +169,7 @@ struct RgfxAirVisible {
 	// Whether it returns void; else its return type.
 	bool returnsVoid = false;
 	RgfxAirType returnType;
-	// Its arguments' names and types, in their order.
+	// Its arguments' names (empty for an unnamed one) and types, in their order.
 	std::vector<std::string> argumentNames;
 	std::vector<RgfxAirType> argumentTypes;
 };

@@ -176,12 +176,14 @@ kernel void calls_through_table(device float *out [[buffer(0)]],
 	w.write(float4(out[g]), uint2(g, 0));
 }
 
-// Stitchable functions' signatures (rgfxReadAirVisible), of every kind of type the reader knows:
-// scalars, vectors (packed ones among them) and matrices of each scalar; structs, nested; arrays of
-// C's and metal::arrays, of scalars, vectors, matrices, structs, arrays, pointers, textures and
-// samplers; pointers to scalars, vectors, matrices, structs and arrays, as arguments and as fields;
-// textures of each shape and access, depth ones among them; samplers; a void return and none at
-// all. `doubled` above is visible and not stitchable: it has no signature.
+// Stitchable functions' signatures (rgfxReadAirVisible), of every kind of type a stitchable
+// function can take: scalars (bfloat and every integer width among them), vectors (packed ones
+// among them) and matrices; structs, nested; arrays of C's and metal::arrays, of scalars, vectors,
+// matrices, structs, arrays, pointers, textures, samplers, enums and function tables; pointers
+// and references in each address space, to each of those, to pointers and to void, as arguments
+// and as fields; atomics; enums; textures of each shape and access, depth ones among them;
+// samplers; function tables; an acceleration structure; an unnamed argument; a void return and
+// none at all. `doubled` above is visible and not stitchable: it has no signature.
 struct SigPair {
 	float2 xy;
 	float w;
@@ -258,3 +260,133 @@ struct SigFields {
 }
 
 [[stitchable]] texture2d<float> sig_returns_texture(texture2d<float> t) { return t; }
+
+// References, read as pointers: Metal reflects the two alike. Arguments of each kind of referent,
+// and a struct's fields, as Core Image's CIKL kernels take a sampler in a struct with a reference
+// field.
+struct SigReferences {
+	texture2d<float> t;
+	sampler s;
+	constant float4x4 &transform;
+	float2 origin;
+	device SigPair &pair;
+	constant float3 (&rows)[2];
+};
+
+[[stitchable]] float4 sig_references(SigReferences r, thread const float4 &v, device float &d,
+                                     constant SigPair &cp, thread float2x2 &m)
+{
+	return r.t.sample(r.s, r.origin) + r.transform[0] + r.pair.w + r.rows[1].x + v + d + cp.w + m[0][0];
+}
+
+// Pointers and references in each address space, to each kind of pointee: pointers to pointers,
+// to void, to arrays and to scalars, packed vectors and matrices; an rvalue reference, and an
+// lvalue reference to a pointer. Metal sizes a pointer to a pointer by the innermost pointee.
+[[stitchable]] float sig_address_spaces(threadgroup float *t, threadgroup float &r, thread float &&rv,
+                                        device float *device *pp, thread float **tp, device void *v,
+                                        constant void *cv, threadgroup SigPair *tsp,
+                                        device SigPair *device *psp, device float (*device *ppa)[3],
+                                        thread device float *&rp, device bfloat *pbf,
+                                        device packed_float3 *ppf, device bool *pb, device long *pl,
+                                        device float3x3 *pm, device SigPair (&rsa)[2])
+{
+	return t[0] + r + rv + pp[0][0] + tp[0][0] + tsp->w + psp[0]->w + (*ppa[0])[1] + rp[0] + float(pbf[0]) +
+	       ppf->x + float(pb[0]) + float(pl[0]) + (*pm)[0][0] + rsa[1].w;
+}
+
+// Atomics: Metal's library makes each the struct `metal::_atomic<T>` of one field; a float's is of
+// no size and no field, as nothing in this file lays one out.
+struct SigAtomics {
+	atomic_int a;
+	float b;
+	atomic_uint c[2];
+	device atomic_float *pf;
+};
+
+[[stitchable]] float sig_atomics(device atomic_int *a, device atomic_uint *b, device atomic_float *c,
+                                 device SigAtomics *w, threadgroup atomic_int *ta)
+{
+	return w->b + float(atomic_load_explicit(a, memory_order_relaxed));
+}
+
+// Enums, of each underlying size, and bfloats.
+enum class SigE : int { A, B };
+enum class SigE8 : uchar { A };
+
+struct SigEnums {
+	SigE e;
+	SigE8 f;
+	SigE8 fs[2];
+	bfloat bf;
+	bfloat3 bf3;
+	bfloat2 bfs[2];
+	device SigE *pe;
+	device bfloat *pbf;
+};
+
+[[stitchable]] SigE8 sig_enums(SigE e, SigE8 f, SigEnums w, device SigE *pe, bfloat bf, bfloat2 b2,
+                               bfloat3 b3, bfloat4 b4)
+{
+	return e == SigE::A && float(bf) > 0 ? f : w.f;
+}
+
+[[stitchable]] bfloat3 sig_returns_bfloat(bfloat3 a) { return a; }
+
+// Function tables, as arguments, fields, arrays and a pointee.
+struct SigTables {
+	visible_function_table<float(float)> t;
+	intersection_function_table<triangle_data> it;
+	visible_function_table<float(float)> ts[2];
+	intersection_function_table<triangle_data> its[2];
+	float y;
+};
+
+[[stitchable]] float sig_tables(visible_function_table<float(float)> t,
+                                intersection_function_table<triangle_data> it, SigTables w,
+                                array<visible_function_table<float(float)>, 2> ts,
+                                device visible_function_table<float(float)> *pt, float x)
+{
+	return t[0](x) + w.y;
+}
+
+// Pointers to textures and samplers, and a struct's fields of each kind of pointee: Metal gives a
+// pointed-to texture its pointer's address space as its access.
+struct SigPointees {
+	device texture2d<float> *pt;
+	constant texture2d<float> *ptc;
+	constant sampler *ps;
+	texture2d<float, access::write> tw[2];
+	device float *device *pp;
+	device SigPair *device *psp;
+	device void *device *ppv;
+	device SigE *device *ppe;
+	device float (*device *ppa)[3];
+	device float4 *device *ppv4;
+	device float2x2 *device *ppm;
+	device texture2d<float> *device *ppt;
+	device void *pv;
+	device packed_half3 *pph3;
+	device SigAtomics *pa;
+	device float *device &rp;
+	device void *pvs[2];
+	device array<float2, 3> *pao;
+	packed_char4 pc4;
+	packed_int3 pi3;
+};
+
+[[stitchable]] float sig_pointees(device texture2d<float, access::read> *ptr,
+                                  device texture2d<half, access::write> *ptw,
+                                  constant texture2d<float> *ptc, threadgroup texture2d<float> *ptg,
+                                  thread texture2d<float> &rt, device depth2d<float> *pd,
+                                  device texture3d<int> *p3, constant sampler *ps,
+                                  device array<float2, 3> *pao, SigPointees p)
+{
+	return p.rp[0];
+}
+
+// An unnamed argument: Metal names it "".
+[[stitchable]] float sig_unnamed(float a, float4, int b) { return a + float(b); }
+
+// An acceleration structure: Metal's own reflection of a signature that holds one ends the
+// process, so the device answers none.
+[[stitchable]] float sig_acceleration(instance_acceleration_structure s, float x) { return x; }

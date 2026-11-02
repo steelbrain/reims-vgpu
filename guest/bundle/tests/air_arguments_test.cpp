@@ -478,6 +478,143 @@ int main()
 	check(isTexture(sigReturnsTexture.returnType, RgfxAirTextureShape::T2D, Scalar::Float, RgfxAirAccess::Sample),
 	      "sig_returns_texture returns a texture");
 
+	// References, read as pointers, as arguments and as a struct's fields.
+	const RgfxAirVisible sigReferences = visible(lib, "sig_references");
+	const std::vector<RgfxAirType> &rf = sigReferences.argumentTypes;
+	if (rf.size() == 5) {
+		const RgfxAirType &r = rf[0];
+		const RgfxAirType *transform = field(r, "transform", 16), *pair = field(r, "pair", 32),
+		                  *rows = field(r, "rows", 40);
+		const RgfxAirType *m = transform != nullptr ? elementOf(*transform, Kind::Pointer) : nullptr,
+		                  *p = pair != nullptr ? elementOf(*pair, Kind::Pointer) : nullptr,
+		                  *a = rows != nullptr ? elementOf(*rows, Kind::Pointer) : nullptr;
+		const RgfxAirType *row = a != nullptr ? elementOf(*a, Kind::Array, 2) : nullptr;
+		check(r.kind == Kind::Struct && r.name == "SigReferences" && r.size == 48 && r.fields.size() == 6 &&
+		          m != nullptr && isMatrix(*m, Scalar::Float, 4, 4, 64) && m->addressSpace == 2 && p != nullptr &&
+		          isPair(*p) && p->addressSpace == 1 && row != nullptr && isVector(*row, Scalar::Float, 3, 16),
+		      "sig_references: SigReferences's reference fields, to float4x4, SigPair and float3[2]");
+		const RgfxAirType *v = elementOf(rf[1], Kind::Pointer), *d = elementOf(rf[2], Kind::Pointer),
+		                  *cp = elementOf(rf[3], Kind::Pointer), *mm = elementOf(rf[4], Kind::Pointer);
+		check(v != nullptr && isVector(*v, Scalar::Float, 4, 16) && v->addressSpace == 0 && d != nullptr &&
+		          isScalar(*d, Scalar::Float, 4) && d->addressSpace == 1 && cp != nullptr && isPair(*cp) &&
+		          cp->addressSpace == 2 && mm != nullptr && isMatrix(*mm, Scalar::Float, 2, 2, 16),
+		      "sig_references: references to float4, float, SigPair and float2x2, in their address spaces");
+	} else {
+		check(false, "sig_references: five arguments");
+	}
+
+	// Pointers in each address space, to pointers and to void; an rvalue reference.
+	const RgfxAirVisible sigSpaces = visible(lib, "sig_address_spaces");
+	const std::vector<RgfxAirType> &as = sigSpaces.argumentTypes;
+	if (as.size() == 17) {
+		const RgfxAirType *t = elementOf(as[0], Kind::Pointer), *r = elementOf(as[1], Kind::Pointer),
+		                  *rv = elementOf(as[2], Kind::Pointer), *pp = elementOf(as[3], Kind::Pointer),
+		                  *v = elementOf(as[5], Kind::Pointer), *cv = elementOf(as[6], Kind::Pointer),
+		                  *pbf = elementOf(as[11], Kind::Pointer), *ppf = elementOf(as[12], Kind::Pointer);
+		check(t != nullptr && isScalar(*t, Scalar::Float, 4) && t->addressSpace == 3 && r != nullptr &&
+		          r->addressSpace == 3 && rv != nullptr && isScalar(*rv, Scalar::Float, 4) && rv->addressSpace == 0,
+		      "sig_address_spaces: threadgroup pointers and references, an rvalue reference");
+		const RgfxAirType *inner = pp != nullptr ? elementOf(*pp, Kind::Pointer) : nullptr;
+		check(inner != nullptr && pp->addressSpace == 1 && isScalar(*inner, Scalar::Float, 4) &&
+		          inner->addressSpace == 1,
+		      "sig_address_spaces: a pointer to a pointer");
+		check(v != nullptr && v->kind == Kind::Void && v->addressSpace == 1 && v->size == 0 && cv != nullptr &&
+		          cv->kind == Kind::Void && cv->addressSpace == 2,
+		      "sig_address_spaces: pointers to void, device and constant");
+		check(pbf != nullptr && isScalar(*pbf, Scalar::BFloat, 2) && ppf != nullptr &&
+		          isVector(*ppf, Scalar::Float, 3, 12, true),
+		      "sig_address_spaces: pointers to bfloat and packed_float3");
+	} else {
+		check(false, "sig_address_spaces: seventeen arguments");
+	}
+
+	// Atomics: structs of Metal's library, a float's of no size and no field.
+	const RgfxAirVisible sigAtomics = visible(lib, "sig_atomics");
+	const std::vector<RgfxAirType> &at = sigAtomics.argumentTypes;
+	if (at.size() == 5) {
+		const RgfxAirType *a = elementOf(at[0], Kind::Pointer), *c = elementOf(at[2], Kind::Pointer),
+		                  *w = elementOf(at[3], Kind::Pointer);
+		check(a != nullptr && a->kind == Kind::Struct && a->name == "metal::_atomic<int>" && a->size == 4 &&
+		          a->fields.size() == 1 && a->fields[0].offset == 0 && isScalar(a->fields[0].type, Scalar::Int, 4),
+		      "sig_atomics: an atomic_int, a struct of one int");
+		check(c != nullptr && c->kind == Kind::Struct && c->name == "metal::_atomic<float>" && c->size == 0 &&
+		          c->fields.empty(),
+		      "sig_atomics: an atomic_float, a struct of no size and no field");
+		const RgfxAirType *cs = w != nullptr ? field(*w, "c", 8) : nullptr;
+		const RgfxAirType *ce = cs != nullptr ? elementOf(*cs, Kind::Array, 2) : nullptr;
+		check(w != nullptr && w->name == "SigAtomics" && w->fields.size() == 4 && ce != nullptr &&
+		          ce->name == "metal::_atomic<unsigned int>",
+		      "sig_atomics: SigAtomics, an array of atomics among its fields");
+	} else {
+		check(false, "sig_atomics: five arguments");
+	}
+
+	// Enums and bfloats.
+	const RgfxAirVisible sigEnums = visible(lib, "sig_enums");
+	const std::vector<RgfxAirType> &en = sigEnums.argumentTypes;
+	const RgfxAirType &e8 = sigEnums.returnType;
+	check(e8.kind == Kind::Enum && e8.name == "SigE8" && e8.scalar == Scalar::UChar && e8.size == 1,
+	      "sig_enums returns an enum of uchar");
+	if (en.size() == 8) {
+		const RgfxAirType *pe = elementOf(en[3], Kind::Pointer);
+		check(en[0].kind == Kind::Enum && en[0].name == "SigE" && en[0].scalar == Scalar::Int && en[0].size == 4 &&
+		          en[2].kind == Kind::Struct && en[2].name == "SigEnums" && en[2].fields.size() == 8 &&
+		          pe != nullptr && pe->kind == Kind::Enum,
+		      "sig_enums: enums as arguments, fields and a pointee");
+		check(isScalar(en[4], Scalar::BFloat, 2) && isVector(en[5], Scalar::BFloat, 2, 4) &&
+		          isVector(en[6], Scalar::BFloat, 3, 8) && isVector(en[7], Scalar::BFloat, 4, 8),
+		      "sig_enums: bfloat and its vectors");
+	} else {
+		check(false, "sig_enums: eight arguments");
+	}
+
+	// Function tables.
+	const RgfxAirVisible sigTables = visible(lib, "sig_tables");
+	const std::vector<RgfxAirType> &tb = sigTables.argumentTypes;
+	if (tb.size() == 6) {
+		const RgfxAirType *ts = field(tb[2], "ts", 16), *its = field(tb[2], "its", 32);
+		const RgfxAirType *tse = ts != nullptr ? elementOf(*ts, Kind::Array, 2) : nullptr,
+		                  *itse = its != nullptr ? elementOf(*its, Kind::Array, 2) : nullptr,
+		                  *of = elementOf(tb[3], Kind::ArrayOf, 2), *pt = elementOf(tb[4], Kind::Pointer);
+		check(tb[0].kind == Kind::VisibleFunctionTable && tb[1].kind == Kind::IntersectionFunctionTable,
+		      "sig_tables: a visible and an intersection function table");
+		check(tse != nullptr && tse->kind == Kind::VisibleFunctionTable && itse != nullptr &&
+		          itse->kind == Kind::IntersectionFunctionTable && of != nullptr &&
+		          of->kind == Kind::VisibleFunctionTable && pt != nullptr && pt->kind == Kind::VisibleFunctionTable,
+		      "sig_tables: arrays of tables, a metal::array of them and a pointer to one");
+	} else {
+		check(false, "sig_tables: six arguments");
+	}
+
+	// Pointers to textures and samplers, in each address space.
+	const RgfxAirVisible sigPointees = visible(lib, "sig_pointees");
+	const std::vector<RgfxAirType> &pe = sigPointees.argumentTypes;
+	if (pe.size() == 10) {
+		const RgfxAirType *ptr = elementOf(pe[0], Kind::Pointer), *ptc = elementOf(pe[2], Kind::Pointer),
+		                  *ptg = elementOf(pe[3], Kind::Pointer), *rt = elementOf(pe[4], Kind::Pointer),
+		                  *ps = elementOf(pe[7], Kind::Pointer);
+		check(ptr != nullptr && isTexture(*ptr, RgfxAirTextureShape::T2D, Scalar::Float, RgfxAirAccess::Read) &&
+		          ptr->addressSpace == 1 && ptc != nullptr && ptc->addressSpace == 2 && ptg != nullptr &&
+		          ptg->addressSpace == 3 && rt != nullptr && rt->addressSpace == 0,
+		      "sig_pointees: textures pointed to in each address space");
+		check(ps != nullptr && ps->kind == Kind::Sampler && ps->addressSpace == 2, "sig_pointees: a sampler pointed to");
+	} else {
+		check(false, "sig_pointees: ten arguments");
+	}
+
+	const RgfxAirVisible sigUnnamed = visible(lib, "sig_unnamed");
+	check(sigUnnamed.signature == RgfxAirVisible::Signature::Read &&
+	          sigUnnamed.argumentNames == std::vector<std::string>{"a", "", "b"} &&
+	          sigUnnamed.argumentTypes.size() == 3 && isVector(sigUnnamed.argumentTypes[1], Scalar::Float, 4, 16),
+	      "sig_unnamed: an unnamed argument, named empty");
+
+	// An acceleration structure is read; Metal answers no reflection of it (RgfxReflection.h).
+	const RgfxAirVisible sigAcceleration = visible(lib, "sig_acceleration");
+	check(sigAcceleration.signature == RgfxAirVisible::Signature::Read &&
+	          sigAcceleration.argumentTypes.size() == 2 &&
+	          sigAcceleration.argumentTypes[0].kind == Kind::AccelerationStructure,
+	      "sig_acceleration: an acceleration structure");
+
 	// A type the reader does not know: that function's signature is unknown, read beside the rest.
 	{
 		std::vector<uint8_t> other = lib;

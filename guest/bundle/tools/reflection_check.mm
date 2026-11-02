@@ -9,6 +9,9 @@
 // is first called in a forked child, as some end the process where they do not apply (a buffer's
 // alignment on a texture's binding): such a getter is "asserts" on both, never called in the
 // tool's own process. Each object's class is compared too, and -isEqual: both ways.
+// Where ours is refused (a signature that holds an acceleration structure), Metal's own is
+// probed in a process of its own (the tool, run as `reflection_check LIB --probe FUNCTION`), and
+// agrees where it ends the process or answers nil.
 // Prints one line per difference (with -v, every line of both walks), and
 //   reflection_check: F functions, G values, D differ
 // Exits 1 where any differs. It runs on a Mac and in a guest (stock: the device's own Metal):
@@ -21,12 +24,15 @@
 #import <objc/runtime.h>
 
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <string>
 #include <vector>
+
+extern char **environ;
 
 #include "RgfxAirArguments.hpp"
 #import "RgfxReflection.h"
@@ -102,6 +108,38 @@ std::string safely(id o, SEL s, const char *rt)
 	int status = 0;
 	waitpid(p, &status, 0);
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? out : "asserts";
+}
+
+// Metal's own reflection of `function`, asked in a new process of this tool: "nil", "made", or
+// "ends the process".
+std::string probe(const char *tool, const char *lib, const char *function)
+{
+	fflush(stdout);
+	int fd[2];
+	if (pipe(fd) != 0)
+		return "(no pipe)";
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, fd[1], 1);
+	posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+	posix_spawn_file_actions_addclose(&actions, fd[0]);
+	char *const args[] = {const_cast<char *>(tool), const_cast<char *>(lib), const_cast<char *>("--probe"),
+	                      const_cast<char *>(function), nullptr};
+	pid_t p = 0;
+	const int spawned = posix_spawnp(&p, tool, &actions, nullptr, args, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	close(fd[1]);
+	std::string out;
+	char buf[256];
+	ssize_t n;
+	while ((n = read(fd[0], buf, sizeof buf)) > 0)
+		out.append(buf, static_cast<size_t>(n));
+	close(fd[0]);
+	if (spawned != 0)
+		return "(not spawned)";
+	int status = 0;
+	waitpid(p, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? out : "ends the process";
 }
 
 bool skipped(NSString *s)
@@ -182,6 +220,15 @@ int main(int argc, char **argv)
 			fprintf(stderr, "usage: reflection_check LIB.metallib [-v]\n");
 			return 2;
 		}
+		if (argc == 4 && strcmp(argv[2], "--probe") == 0) {
+			id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+			id<MTLLibrary> l = [d newLibraryWithURL:[NSURL fileURLWithPath:@(argv[1])] error:nil];
+			id<MTLFunction> f = [l newFunctionWithName:@(argv[3])];
+			id r = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("returnType"));
+			id a = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("arguments"));
+			printf("%s", r == nil && a == nil ? "nil" : "made");
+			return 0;
+		}
 		const bool verbose = argc > 2 && strcmp(argv[2], "-v") == 0;
 		NSData *bytes = [NSData dataWithContentsOfFile:@(argv[1])];
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -202,13 +249,6 @@ int main(int argc, char **argv)
 				continue;
 			functions++;
 			const std::string fn = name.UTF8String;
-			id theirReturn = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("returnType"));
-			id theirArguments = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("arguments"));
-			id theirBindings = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("bindings"));
-			if (theirBindings != theirArguments) {
-				printf("%s: Metal's bindings are not its arguments' object\n", fn.c_str());
-				differ++;
-			}
 			// Ours, from the function's own module.
 			const uint8_t *bitcode = nullptr;
 			size_t bitcodeSize = 0;
@@ -226,15 +266,25 @@ int main(int argc, char **argv)
 				differ++;
 				continue;
 			}
+			NSString *why = nil;
 			if (visible->signature == RgfxAirVisible::Signature::None) {
 				ourArguments = @[];
-			} else {
-				NSString *why = nil;
-				if (!rgfxStitchableReflection(*visible, &ourReturn, &ourArguments, &why)) {
-					printf("%s: no reflection built (%s)\n", fn.c_str(), why.UTF8String);
-					differ++;
-					continue;
-				}
+			} else if (!rgfxStitchableReflection(*visible, &ourReturn, &ourArguments, &why)) {
+				// Refused: Metal's own must end the process or answer nil.
+				const std::string theirs = probe(argv[0], argv[1], fn.c_str());
+				const bool agrees =
+				    visible->signature == RgfxAirVisible::Signature::Read && (theirs == "ends the process" || theirs == "nil");
+				printf("%s: no reflection built (%s); Metal's own: %s\n", fn.c_str(), why.UTF8String, theirs.c_str());
+				values++;
+				differ += agrees ? 0 : 1;
+				continue;
+			}
+			id theirReturn = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("returnType"));
+			id theirArguments = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("arguments"));
+			id theirBindings = ((id(*)(id, SEL))objc_msgSend)(f, sel_registerName("bindings"));
+			if (theirBindings != theirArguments) {
+				printf("%s: Metal's bindings are not its arguments' object\n", fn.c_str());
+				differ++;
 			}
 			const std::vector<std::string> theirs[] = {walked(theirReturn, fn + ".returnType"),
 			                                           walked(theirArguments, fn + ".arguments")};

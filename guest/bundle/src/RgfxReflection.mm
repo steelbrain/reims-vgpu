@@ -13,7 +13,7 @@ namespace {
 
 // What Metal's own reflection answers where its public enums name no value (measured: macOS 27,
 // M3 Max; macOS 26.7.1, AMD Radeon Pro 5300M).
-// The data type of a void return.
+// The data type of a void return, and of a pointer's void pointee.
 constexpr NSUInteger kVoidDataType = 61;
 // The binding type of an argument that is a scalar, vector or matrix; a struct; a pointer.
 constexpr NSUInteger kValueBindingType = 18;
@@ -24,6 +24,26 @@ constexpr NSUInteger kNoRenderTarget = 0xFFFFFFFF;
 // The element type of an array of vectors, and of matrices, whatever their scalar and size.
 constexpr NSUInteger kArrayVectorElement = 137;
 constexpr NSUInteger kArrayMatrixElement = 136;
+
+// Why a signature that holds an acceleration structure has no reflection: Metal's own reflection
+// of one ends the process (measured: macOS 27, M3 Max, and macOS 26.7.1, AMD Radeon Pro 5300M,
+// where the structure is an argument or a struct's field).
+NSString *const kNoAccelerationStructures =
+    @"it holds an acceleration structure, which Metal's own reflection does not answer";
+
+// Whether `t` is or holds an acceleration structure.
+bool holdsAccelerationStructure(const RgfxAirType &t)
+{
+	if (t.kind == RgfxAirType::Kind::AccelerationStructure)
+		return true;
+	for (const RgfxAirType &e : t.element)
+		if (holdsAccelerationStructure(e))
+			return true;
+	for (const RgfxAirField &f : t.fields)
+		if (holdsAccelerationStructure(f.type))
+			return true;
+	return false;
+}
 
 // Metal's reflection classes the answers are made of, looked up once, each with the initialiser
 // it is made with (RgfxMetalReflectionInitialisers).
@@ -75,6 +95,7 @@ MTLDataType scalarDataType(RgfxAirScalar s)
 	switch (s) {
 	case RgfxAirScalar::Float: return MTLDataTypeFloat;
 	case RgfxAirScalar::Half: return MTLDataTypeHalf;
+	case RgfxAirScalar::BFloat: return MTLDataTypeBFloat;
 	case RgfxAirScalar::Int: return MTLDataTypeInt;
 	case RgfxAirScalar::UInt: return MTLDataTypeUInt;
 	case RgfxAirScalar::Short: return MTLDataTypeShort;
@@ -88,8 +109,9 @@ MTLDataType scalarDataType(RgfxAirScalar s)
 	return MTLDataTypeNone;
 }
 
-// The data type of `t`: false for a vector or matrix Metal has no data type for. A metal::array's
-// is none (MTLDataTypeNone).
+// The data type of `t`: false for a vector or matrix Metal has no data type for, and for an
+// acceleration structure. A metal::array's, an enum's and a function table's are none
+// (MTLDataTypeNone).
 bool dataType(const RgfxAirType &t, MTLDataType &out)
 {
 	switch (t.kind) {
@@ -116,12 +138,17 @@ bool dataType(const RgfxAirType &t, MTLDataType &out)
 	case RgfxAirType::Kind::Pointer: out = MTLDataTypePointer; return true;
 	case RgfxAirType::Kind::Texture: out = MTLDataTypeTexture; return true;
 	case RgfxAirType::Kind::Sampler: out = MTLDataTypeSampler; return true;
+	case RgfxAirType::Kind::Void: out = static_cast<MTLDataType>(kVoidDataType); return true;
+	case RgfxAirType::Kind::Enum:
+	case RgfxAirType::Kind::VisibleFunctionTable:
+	case RgfxAirType::Kind::IntersectionFunctionTable: out = MTLDataTypeNone; return true;
+	case RgfxAirType::Kind::AccelerationStructure: return false;
 	}
 	return false;
 }
 
 // The element type an array's type is of: its element's data type, but kArrayVectorElement for a
-// vector and kArrayMatrixElement for a matrix.
+// vector, kArrayMatrixElement for a matrix, and a function table's own data type for a table.
 bool arrayElementType(const RgfxAirType &e, MTLDataType &out)
 {
 	if (!dataType(e, out))
@@ -130,7 +157,36 @@ bool arrayElementType(const RgfxAirType &e, MTLDataType &out)
 		out = static_cast<MTLDataType>(kArrayVectorElement);
 	else if (e.kind == RgfxAirType::Kind::Matrix)
 		out = static_cast<MTLDataType>(kArrayMatrixElement);
+	else if (e.kind == RgfxAirType::Kind::VisibleFunctionTable)
+		out = MTLDataTypeVisibleFunctionTable;
+	else if (e.kind == RgfxAirType::Kind::IntersectionFunctionTable)
+		out = MTLDataTypeIntersectionFunctionTable;
 	return true;
+}
+
+// The size and alignment a pointer to `e` is of: a scalar's, vector's, matrix's, struct's or
+// array's own, a pointer's pointee's where the pointee is a pointer, and none for another (void,
+// an enum, a texture, a sampler, a function table), whatever its node says.
+void pointeeExtent(const RgfxAirType &e, uint32_t &size, uint32_t &align)
+{
+	switch (e.kind) {
+	case RgfxAirType::Kind::Scalar:
+	case RgfxAirType::Kind::Vector:
+	case RgfxAirType::Kind::Matrix:
+	case RgfxAirType::Kind::Struct:
+	case RgfxAirType::Kind::Array:
+	case RgfxAirType::Kind::ArrayOf:
+		size = e.size;
+		align = e.align;
+		return;
+	case RgfxAirType::Kind::Pointer:
+		pointeeExtent(e.element.at(0), size, align);
+		return;
+	default:
+		size = 0;
+		align = 0;
+		return;
+	}
 }
 
 MTLTextureType textureType(RgfxAirTextureShape s)
@@ -185,6 +241,14 @@ struct Builder {
 		                              isDepthTexture:depth ? YES : NO];
 	}
 
+	// The type object of a texture that is an array's element or a pointer's pointee: of data type
+	// texture and texture type 0, whatever its sample type and shape, not a depth texture, and of
+	// its address space's number as its access.
+	id elementTexture(const RgfxAirType &e)
+	{
+		return texture(MTLDataTypeTexture, MTLTextureType1D, static_cast<MTLBindingAccess>(e.addressSpace), false);
+	}
+
 	// The type object of `t`, nil for a sampler. `inStruct` where it is a field's type, or its
 	// type's: a struct type there is nameless, and a pointer's pointee is described otherwise.
 	id type(const RgfxAirType &t, bool inStruct)
@@ -197,7 +261,13 @@ struct Builder {
 		case RgfxAirType::Kind::Vector:
 		case RgfxAirType::Kind::Matrix:
 		case RgfxAirType::Kind::ArrayOf:
+		case RgfxAirType::Kind::Void:
+		case RgfxAirType::Kind::Enum:
+		case RgfxAirType::Kind::VisibleFunctionTable:
+		case RgfxAirType::Kind::IntersectionFunctionTable:
 			return plain(dt);
+		case RgfxAirType::Kind::AccelerationStructure:
+			return nil; // typeOf failed (rgfxStitchableReflection refuses it first)
 		case RgfxAirType::Kind::Sampler:
 			return nil;
 		case RgfxAirType::Kind::Texture:
@@ -209,10 +279,9 @@ struct Builder {
 				ok = false;
 				return nil;
 			}
-			// The element's type object is of its element type alone; a texture's is a texture
-			// type of that data type, of texture type 0.
-			id details = e.kind == RgfxAirType::Kind::Texture ? texture(et, MTLTextureType1D, MTLBindingAccessReadOnly, false)
-			                                                 : plain(et);
+			// The element's type object is of its element type alone; a texture's is
+			// elementTexture's.
+			id details = e.kind == RgfxAirType::Kind::Texture ? elementTexture(e) : plain(et);
 			return [make(c.arrayType) initWithArrayLength:t.count
 			                                 elementType:et
 			                                      stride:t.align
@@ -226,23 +295,30 @@ struct Builder {
 			id pointee = nil;
 			if (e.kind == RgfxAirType::Kind::Struct) {
 				pointee = type(e, inStruct);
+			} else if (e.kind == RgfxAirType::Kind::Texture) {
+				pointee = elementTexture(e);
 			} else if (e.kind == RgfxAirType::Kind::Array) {
 				// An array's type object of its data type alone; a field's of its element type.
 				MTLDataType inner = MTLDataTypeArray;
 				if (inStruct && !arrayElementType(e.element.at(0), inner))
 					ok = false;
 				pointee = plain(inner);
+			} else if (e.kind == RgfxAirType::Kind::Pointer && inStruct) {
+				// A field's pointer to a pointer: of its pointee's pointee's data type.
+				pointee = plain(typeOf(e.element.at(0)));
 			} else {
 				// A field's pointee's type object is of no data type.
 				pointee = plain(inStruct ? MTLDataTypeNone : et);
 			}
 			if (!ok)
 				return nil;
+			uint32_t size = 0, align = 0;
+			pointeeExtent(e, size, align);
 			return [make(c.pointerType) initWithElementType:et
 			                         elementTypeDescription:pointee
 			                                         access:MTLBindingAccessReadOnly
-			                                      alignment:e.align
-			                                       dataSize:e.size
+			                                      alignment:align
+			                                       dataSize:size
 			                elementIsIndirectArgumentBuffer:NO
 			                               isConstantBuffer:NO];
 		}
@@ -331,6 +407,13 @@ bool rgfxStitchableReflection(const RgfxAirVisible &fn, id __strong *returnType,
 	}
 	if (fn.signature != RgfxAirVisible::Signature::Read) {
 		*why = @"its signature was not read";
+		return false;
+	}
+	bool holds = !fn.returnsVoid && holdsAccelerationStructure(fn.returnType);
+	for (const RgfxAirType &a : fn.argumentTypes)
+		holds = holds || holdsAccelerationStructure(a);
+	if (holds) {
+		*why = kNoAccelerationStructures;
 		return false;
 	}
 	Builder b{c};
