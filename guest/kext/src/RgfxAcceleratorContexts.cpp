@@ -50,6 +50,7 @@
 #include "RgfxIOSurfaceKPI.hpp"
 #include "ReimsGraphics.hpp"
 #include "RgfxSurfaceBlocks.hpp"
+#include "RgfxSurfaceCaches.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -150,11 +151,16 @@ struct DormantStats {
 	UInt64 revived;
 	UInt64 letGo[kRgfxDormantCauses];
 	// Let go as their surface's cache was purged (op 5, a client of the surface going) with a
-	// cache the GPU wrote since its last copy: the host copies it into the pages, which no one
-	// may read any more.
+	// cache the GPU wrote since its last copy: the host copies it into the pages, unless no
+	// client of the surface is left as the release is posted (`unread`).
 	UInt64 purgedWritten;
 	// Let go past a cap, a table entry or the region's room, of a surface made volatile.
 	UInt64 volatileFirst;
+	// Blocks of cached surfaces released with no client of the surface left
+	// (RGFX_BLOCK_RELEASE_NO_CLIENT), and of them those whose cache a buffer wrote since its
+	// last copy, which the host then does not copy into the pages.
+	UInt64 unread;
+	UInt64 unreadWritten;
 	UInt64 changes;
 	UInt64 loggedChanges;
 	UInt64 loggedAt;
@@ -198,6 +204,15 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		release.context = block.context;
 		release.offset = block.offset;
 		release.size = block.size;
+		// A cached surface with no client left has no process to read its pages, the kext's
+		// reference the last but IOSurface's own (the display pipe names a surface by its ID and
+		// holds none): its cache's writes need not reach them. Its clients are read here, out of
+		// every lock, as at a block's sleep.
+		bool written = false;
+		if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
+			release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
+			surface->release();
+		}
 		RgfxComplete answer = {};
 		UInt32 length = 0;
 		IOReturn r = accel->postLifecycle(RGFX_CMD_BLOCK_RELEASE, &release, sizeof(release),
@@ -209,6 +224,11 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		// before the block can be anyone else's.
 		rgfxSurfaceCacheReleased(block.offset);
 		IOLockLock(contextLock);
+		if (release.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
+			dormantStats.unread++;
+			dormantStats.unreadWritten += written;
+			dormantStats.changes++;
+		}
 		rgfxBlockReleased(blockTable, block.offset, block.serial, ok);
 		// A new block waiting for the region's room looks again.
 		IOLockWakeup(contextLock, &surfaceTable, false);
@@ -681,13 +701,14 @@ void noteDormant()
 		      "%llu revived; let go: %llu purged (%llu with a cache written), %llu made "
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
-		      "volatile), %llu asked otherwise\n",
+		      "volatile), %llu asked otherwise; %llu released with no client left (%llu of them "
+		      "written, not copied)\n",
 		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
 		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
 		      d.letGo[kRgfxDormantNoClients],
 		      d.letGo[kRgfxDormantCount], d.letGo[kRgfxDormantBytes],
 		      d.letGo[kRgfxDormantTableFull], d.letGo[kRgfxDormantNoSpace], d.volatileFirst,
-		      d.letGo[kRgfxDormantStale]);
+		      d.letGo[kRgfxDormantStale], d.unread, d.unreadWritten);
 }
 
 // The last holder, of context `context`, of the cached entry `e` let it go: the block sleeps

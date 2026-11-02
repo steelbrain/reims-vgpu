@@ -124,6 +124,8 @@ pub(crate) struct CacheCounts {
     /// Fills a device of the host's write over the pages asked, and downloads and releases of a
     /// written cache it kept from copying.
     pub(crate) host_writes: u64,
+    /// Releases of a written cache not copied, as no process could read the pages.
+    pub(crate) unread: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and whether a device of the host wrote
@@ -228,7 +230,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 }
                 return Ok(true);
             }
-            self.released(device, block, Box::new(|| {}))?;
+            self.released(device, block, false, Box::new(|| {}))?;
         }
         let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
             return Ok(false);
@@ -433,18 +435,23 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The block at `block` went (its `BLOCK_RELEASE`): its cache goes once the pages hold what a
-    /// buffer wrote of it, unless a device of the host wrote them since its last fill; `done`
-    /// then, at once where nothing is to copy.
+    /// buffer wrote of it, unless a device of the host wrote them since its last fill, or no
+    /// process can read them (`unread`: its surface has no client left); `done` then, at once
+    /// where nothing is to copy.
     pub(crate) fn released(
         &mut self,
         device: &P::Device,
         block: u64,
+        unread: bool,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
-        if self.written_since_host(block) {
-            self.write_back(device, block, done)?;
-        } else {
+        if !self.written_since_host(block) {
             done();
+        } else if unread {
+            self.counts.unread += 1;
+            done();
+        } else {
+            self.write_back(device, block, done)?;
         }
         self.by_block.remove(&block);
         self.watched.0.lock().remove(&block);
@@ -873,6 +880,7 @@ mod tests {
             .block_released(
                 &r.device,
                 BLOCK,
+                false,
                 Box::new(move || set.store(true, Ordering::SeqCst)),
             )
             .unwrap();
@@ -882,6 +890,32 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
         assert_eq!(r.dec.surface_caches.counts().downloads, 1);
+    }
+
+    /// A release of a written cache whose surface no process can read (its `BLOCK_RELEASE`'s
+    /// `RGFX_BLOCK_RELEASE_NO_CLIENT`) copies nothing and is done at once; the cache goes all the
+    /// same
+    #[test]
+    fn an_unread_release_copies_nothing() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let released = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&released);
+        let mark = r.p.call_log().mark();
+        r.dec
+            .block_released(
+                &r.device,
+                BLOCK,
+                true,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+            )
+            .unwrap();
+        assert!(released.load(Ordering::SeqCst), "done at once");
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        assert_eq!(r.dec.surface_caches.len(), 0);
+        let counts = r.dec.surface_caches.counts();
+        assert_eq!((counts.downloads, counts.unread), (0, 1));
     }
 
     /// A block named again over the same pages keeps its cache, which its next use fills again;
@@ -997,6 +1031,7 @@ mod tests {
             .block_released(
                 &r.device,
                 BLOCK,
+                false,
                 Box::new(move || set.store(true, Ordering::SeqCst)),
             )
             .unwrap();

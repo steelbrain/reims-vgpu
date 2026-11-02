@@ -1038,7 +1038,9 @@
 // [`RGFX_STATUS_REFUSED`] at once where an object it holds, or a live queue's ring, still lies in
 // the block; otherwise it answers OK once every command buffer of the context it had committed
 // has finished. Posted after every message the process posted before its free, and nothing the
-// process posts after it can name the block.
+// process posts after it can name the block. A block over an IOSurface's pages with a device
+// cache has the cache copied into the pages first, where a command buffer wrote it since the last
+// copy, unless [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says no process can read them.
 #define RGFX_CMD_BLOCK_RELEASE 754
 
 // `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
@@ -1166,6 +1168,11 @@
 
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
+
+// [`RgfxBlockRelease::flags`]: the block's IOSurface has no client left, no process holding it,
+// so no reader of its pages: the host drops the block's device cache with it, rather than
+// copying what command buffers wrote of it into the pages first. Without it the host copies.
+#define RGFX_BLOCK_RELEASE_NO_CLIENT (1 << 0)
 
 // Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesCache`] starts: right after its
 // [`RgfxSurfacePages`]. A message whose `size` is at least
@@ -1978,8 +1985,8 @@ typedef struct {
   RgfxMsgHeader header;
   // The context that held the block.
   uint32_t context;
-  // Zero.
-  uint32_t reserved_14;
+  // `RGFX_BLOCK_RELEASE_*` bits; zero from a kext that sets none.
+  uint32_t flags;
   // The block's region offset.
   uint64_t offset;
   // The block's size in bytes.

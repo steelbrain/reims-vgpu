@@ -1842,7 +1842,7 @@ fn block_release(context: u32, offset: u64, size: u64) -> Vec<u8> {
             seqno: 0,
         },
         context,
-        reserved_14: 0,
+        flags: 0,
         offset,
         size,
     }

@@ -99,12 +99,26 @@ void dormancy()
 	check(!rgfxCachePurged(t, kOther), "it is asked once");
 	int surfaceObject = 0;
 	void *map = nullptr, *wire = nullptr, *held = nullptr;
+	bool written = true;
+	check(rgfxCacheReleasingSurface(t, kOtherBlock, &written) == nullptr && !written,
+	      "no release yet: no surface releasing");
 	check(!rgfxCacheLetGo(t, kOther, true, &surfaceObject, &map, &wire) &&
 	          rgfxCacheLetGoOf(t, kOtherBlock, &purgeable) == kRgfxCacheKept,
 	      "its release posted, nothing asks it to go again");
+	check(rgfxCacheReleasingSurface(t, kOtherBlock, &written) == &surfaceObject && !written,
+	      "its surface is the release's, its cache copied");
+	rgfxCacheFind(t, kOther)->writes++;
+	check(rgfxCacheReleasingSurface(t, kOtherBlock, &written) == &surfaceObject && written,
+	      "a buffer wrote its cache since: written");
+	check(rgfxCacheReleaseFlags(0) == RGFX_BLOCK_RELEASE_NO_CLIENT &&
+	          rgfxCacheReleaseFlags(1) == 0 && rgfxCacheReleaseFlags(2) == 0 &&
+	          rgfxCacheReleaseFlags(-1) == 0,
+	      "its release says no client only where the surface has none");
 	check(rgfxCacheReleased(t, kOtherBlock, &map, &wire, &held) == kOther && t.count == 1 &&
 	          rgfxCacheFind(t, kOther) == nullptr && held == &surfaceObject,
 	      "its release answered, it is cached no more");
+	check(rgfxCacheReleasingSurface(t, kOtherBlock, &written) == nullptr && !written,
+	      "answered: no surface releasing");
 
 	// A dormant block whose surface had no client left at its sleep is let go, once, and only
 	// a dormant one.

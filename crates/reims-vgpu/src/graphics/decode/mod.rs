@@ -434,9 +434,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     target: "reims_vgpu::graphics",
                     "IOSurface device caches: {} made; {} fills of {} MiB, {} downloads of {} MiB, \
                      {} asked of a cache nothing wrote; {} fills or downloads the host's devices' \
-                     writes changed",
+                     writes changed; {} written caches released uncopied, no process reading",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
-                    d.downloaded_bytes >> 20, d.clean, d.host_writes
+                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread
                 );
             }
         }
@@ -483,7 +483,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         if !self.surface_caches.has(block) {
             return;
         }
-        if let Err(raise) = self.surface_caches.released(device, block, Box::new(|| {})) {
+        if let Err(raise) = self
+            .surface_caches
+            .released(device, block, false, Box::new(|| {}))
+        {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the IOSurface block at {block:#x}: the platform raised at the copy of its device \
@@ -505,16 +508,19 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The block at `offset` was released: its surface view, if any, goes once the buffers over
-    /// it have, and its device cache once the pages hold what a command buffer wrote of it;
+    /// it have, and its device cache once the pages hold what a command buffer wrote of it, or at
+    /// once where no process can read them (`unread`,
+    /// [`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT));
     /// `done` then ([`surface_cache`]).
     pub(crate) fn block_released(
         &mut self,
         device: &P::Device,
         offset: u64,
+        unread: bool,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
         self.surface_views.released(offset);
-        self.surface_caches.released(device, offset, done)
+        self.surface_caches.released(device, offset, unread, done)
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`

@@ -165,6 +165,24 @@ inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void
 	return true;
 }
 
+// The surface of the cached block at `offset` whose BLOCK_RELEASE is posted and not yet
+// answered, the reference the table holds until then (opaque here), and whether a buffer wrote
+// its cache since its last copy (`*written`); null where no cached surface is releasing it.
+inline void *rgfxCacheReleasingSurface(RgfxCacheTable &t, uint64_t offset, bool *written)
+{
+	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	*written = c != nullptr && c->releasing && c->writes != c->copied;
+	return c != nullptr && c->releasing ? c->surface : nullptr;
+}
+
+// The flags of a cached block's BLOCK_RELEASE, its surface having `clients` clients left
+// (IOSurface's count, read as the release is posted): none, and no process can read its pages,
+// which the host then need not copy the cache into (RGFX_BLOCK_RELEASE_NO_CLIENT).
+inline uint32_t rgfxCacheReleaseFlags(int32_t clients)
+{
+	return clients == 0 ? RGFX_BLOCK_RELEASE_NO_CLIENT : 0;
+}
+
 // The BLOCK_RELEASE of the block at `offset` was answered: the cached surface releasing it is
 // taken out (its mapping, wired memory and surface's reference in `*map`, `*wire` and
 // `*surface`), and its key, the device cache whose reference the caller releases now, before

@@ -434,7 +434,10 @@ Stages:
         empty for this. A let-go block's `BLOCK_RELEASE` copies the cache
         into the pages where a buffer wrote it since the last copy, and a
         lock waits for the answer; the kext releases the device cache, then
-        the surface, then unwires the memory. The kext logs the dormant
+        the surface, then unwires the memory. Where the surface has no
+        client left as the release is posted, no process can read its pages,
+        and the release says so (`RGFX_BLOCK_RELEASE_NO_CLIENT`): the host
+        drops the cache uncopied. The kext logs the dormant
         blocks' count and the let-gos by cause. Op 6, which IOSurface calls
         as a surface turns nonvolatile again, is answered as the AMD's driver
         does (a byte set to 0xff), so IOSurface answers the old state

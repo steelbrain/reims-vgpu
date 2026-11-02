@@ -426,6 +426,20 @@ void rgfxSurfaceCacheReleased(UInt64 offset)
 	unwireSurface(wire);
 }
 
+OSObject *rgfxSurfaceCacheReleasingSurface(UInt64 offset, bool *written)
+{
+	*written = false;
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return nullptr;
+	IOLockLock(state.lock);
+	OSObject *surface =
+	    static_cast<OSObject *>(rgfxCacheReleasingSurface(state.caches, offset, written));
+	if (surface)
+		surface->retain();
+	IOLockUnlock(state.lock);
+	return surface;
+}
+
 bool rgfxSurfaceCacheSleep(void *cache, bool *purgeable)
 {
 	*purgeable = false;

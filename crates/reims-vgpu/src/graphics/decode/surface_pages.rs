@@ -521,7 +521,7 @@ pub(super) mod tests {
         );
         // The buffer holds the view after the block's release.
         r.dec
-            .block_released(&r.device, BLOCK, Box::new(|| ()))
+            .block_released(&r.device, BLOCK, false, Box::new(|| ()))
             .unwrap();
         assert_eq!(r.buffer(13, BLOCK, page), Err(DecodeError::Refused));
         assert!(
@@ -545,7 +545,7 @@ pub(super) mod tests {
         assert_eq!(r.pages(BLOCK, &[(3, 1), (0, 1)], 2 * page), RGFX_STATUS_OK);
         let first = r.view(BLOCK);
         r.dec
-            .block_released(&r.device, BLOCK, Box::new(|| ()))
+            .block_released(&r.device, BLOCK, false, Box::new(|| ()))
             .unwrap();
         let mark = r.p.call_log().mark();
         assert_eq!(
@@ -567,7 +567,7 @@ pub(super) mod tests {
         }
         assert_eq!(r.dec.surface_views.len().1, CACHED_VIEWS);
         r.dec
-            .block_released(&r.device, BLOCK + 0x8000, Box::new(|| ()))
+            .block_released(&r.device, BLOCK + 0x8000, false, Box::new(|| ()))
             .unwrap();
         assert_eq!(
             Arc::strong_count(&first),

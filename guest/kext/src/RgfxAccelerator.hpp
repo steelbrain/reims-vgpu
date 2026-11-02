@@ -211,6 +211,10 @@ void rgfxSurfaceCacheUnclaimed(UInt64 offset);
 // kRgfxCacheKept; `*written` where a buffer wrote its cache since its last copy, `*purgeable`
 // where its surface is volatile.
 uint32_t rgfxSurfaceCacheLetGoOf(UInt64 offset, bool *written, bool *purgeable);
+// The surface of the cached block at `offset` whose BLOCK_RELEASE is posted (rgfxSurfaceLocksForget
+// with `releasing`), retained for the caller, who releases it; `*written` where a buffer wrote
+// its cache since its last copy. Null where no cached surface is releasing the block.
+OSObject *rgfxSurfaceCacheReleasingSurface(UInt64 offset, bool *written);
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
 // cached no more, its locks go on, and its device cache is released, then the surface, then its
 // memory unwired.
