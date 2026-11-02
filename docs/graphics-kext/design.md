@@ -232,6 +232,27 @@ Stages:
     what this bridge already does for the existing lane.
     - Iterating: patch a copy of a VM's OpenCore image directly
       (scripts/internal/opencore-add-kexts.sh). No rebuild inside the guest.
+    - The loader binds our kext from a table generated from one build of
+      it: each bridge site (a GOT or vtable pointer, a call into
+      IOGraphicsFamily, IOAcceleratorFamily or AppleGraphicsDeviceControl) by
+      its offset in the binary. Swapping a new ReimsGraphics binary into an
+      image's set therefore binds only while those sites stay put, and no
+      script here regenerates the table. A change that grows the kext's
+      `__const` or `__data` (a new initialized global, or a member of one)
+      moves every pointer after it. A change in an object linked before the
+      provider calls (`ReimsGraphics.o`, `RgfxAccelerator.o`) moves those
+      calls. Either needs the table generated again; a swap fails to bind. To
+      spot it, the loader logs `apvload: ... ReimsGraphics: got +0x...
+      <symbol> failed the placeholder check (old 0x...)`, then
+      `publishIndependent: ReimsGraphics not ready (bind failed)`, and the
+      guest boots with no framebuffer or Metal device. Before a swap, check
+      that `otool -rv` lists every relocation at or past `__DATA`, and every
+      provider call, at the same offset and symbol as the binary the table
+      was made from. The swap also keeps the set's own `Info.plist`, whose
+      `OSBundleLibraries` name the bridge shims and which carries no
+      personalities. The build's own `Info.plist` makes OpenCore refuse the
+      kext ("Prelinked injection ReimsGraphics.kext ... Invalid Parameter"
+      on the serial log).
     - Shipping (later): reims-util injects the set when it builds an image.
       Not needed to prototype.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
