@@ -6,15 +6,19 @@ use super::values::ComputePassDesc;
 use super::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
 
-/// What a completed handler learns of its buffer: core's handlers read `status` and `error` of the
-/// buffer they were added to, on Metal's completion thread. The platform reads both when the
-/// handler runs; neither getter has an effect.
+/// What a completed handler learns of its buffer: core's handlers read `status`, `error` and the
+/// GPU times of the buffer they were added to, on Metal's completion thread. The platform reads
+/// them when the handler runs; no getter has an effect.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompletedInfo {
     /// `-[MTLCommandBuffer status]` when the handler runs.
     pub status: CommandBufferStatus,
     /// `-[MTLCommandBuffer error]` when the handler runs; `None` for nil.
     pub error: Option<NsErrorText>,
+    /// `-[MTLCommandBuffer GPUStartTime]` and `GPUEndTime` when the handler runs, in nanoseconds
+    /// of the platform's host clock ([`CompletedInfo::gpu_times`]); `None` where the platform
+    /// answers none. Only the graphics lane reads them, into its guest's `CB_COMPLETE`.
+    pub gpu_times_ns: Option<(u64, u64)>,
 }
 
 /// The domain of the error a command buffer completes with where the platform's read of it, as
@@ -37,7 +41,17 @@ impl CompletedInfo {
                 code: ERROR_INTERNAL,
                 description: refusal.to_string(),
             }),
+            gpu_times_ns: None,
         }
+    }
+
+    /// [`CompletedInfo::gpu_times_ns`] of a buffer whose `GPUStartTime` and `GPUEndTime` are
+    /// `start` and `end`, in seconds of host time: `None` where either is 0 (Metal's answer for a
+    /// buffer the GPU did not run) or not finite, or the run ends before it starts.
+    pub fn gpu_times(start: f64, end: f64) -> Option<(u64, u64)> {
+        let ns = |t: f64| (t.is_finite() && t > 0.0).then(|| (t * 1e9).round() as u64);
+        let (start, end) = (ns(start)?, ns(end)?);
+        (end >= start).then_some((start, end))
     }
 
     /// Whether the platform refused the command buffer's read ([`CompletedInfo::refused`]).

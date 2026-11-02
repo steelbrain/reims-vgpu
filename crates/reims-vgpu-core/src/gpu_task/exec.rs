@@ -992,6 +992,7 @@ mod tests {
                 CompletedInfo {
                     status: CommandBufferStatus::COMPLETED,
                     error: None,
+                    gpu_times_ns: None,
                 },
                 Some(exec),
                 9,

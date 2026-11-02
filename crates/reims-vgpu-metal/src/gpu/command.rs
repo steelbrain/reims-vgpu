@@ -41,13 +41,17 @@ impl reims_vgpu_core::platform::command::CommandQueue<MetalPlatform> for MetalCo
     }
 }
 
-/// What a completed handler learns of `cb`: its `status` and `error`, read when the handler runs.
+/// What a completed handler learns of `cb`: its `status`, `error` and GPU times, read when the
+/// handler runs.
 fn completed_info(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> CompletedInfo {
     let status = msg::get("status", || cb.status());
     let error = msg::get("error", || cb.error());
+    let start = msg::get("GPUStartTime", || cb.GPUStartTime());
+    let end = msg::get("GPUEndTime", || cb.GPUEndTime());
     CompletedInfo {
         status: CommandBufferStatus(status.0.to_u64()),
         error: error.as_deref().map(error_text),
+        gpu_times_ns: CompletedInfo::gpu_times(start, end),
     }
 }
 

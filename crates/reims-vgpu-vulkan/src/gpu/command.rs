@@ -1240,9 +1240,14 @@ fn completed_handler(
                     let error = cb
                         .error()
                         .map(|e| command_buffer_error(e, cb.error_description()));
+                    let gpu_times_ns = match (cb.gpu_start_time(), cb.gpu_end_time()) {
+                        (Ok(start), Ok(end)) => CompletedInfo::gpu_times(start, end),
+                        _ => None,
+                    };
                     CompletedInfo {
                         status: CommandBufferStatus(cb.status().raw()),
                         error,
+                        gpu_times_ns,
                     }
                 },
                 block,
@@ -1770,6 +1775,57 @@ mod tests {
         #[cfg(target_os = "macos")]
         if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
             assert_eq!(held::<reims_vgpu_metal::MetalPlatform>(&md), vulkan);
+        }
+    }
+
+    /// A completed handler learns its buffer's GPU times, in nanoseconds of the host's clock: a
+    /// run of a blit fill that ends no earlier than it starts and lasts under a second, as
+    /// Metal's on this host
+    #[test]
+    fn a_completed_handler_learns_the_gpu_times() {
+        use reims_vgpu_core::platform::Platform;
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_core::platform::types::NsRange;
+
+        /// On `d`: the GPU times a blit fill's completed handler learned.
+        fn learned<P: Platform>(d: &P::Device) -> Option<(u64, u64)> {
+            let q = d.new_command_queue().unwrap();
+            let b = d
+                .new_buffer_of_length(OnFault::Return, 16, 0)
+                .unwrap()
+                .unwrap();
+            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+            let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for cmd in [
+                BlitCmd::FillBuffer {
+                    buffer: &b,
+                    range: NsRange::new(0, 16),
+                    value: 0x5a,
+                },
+                BlitCmd::EndEncoding,
+            ] {
+                blit.encode(OnFault::Return, cmd).unwrap();
+            }
+            let (done, completed) = mpsc::channel();
+            let handler: CompletedHandler = Box::new(move |info| {
+                done.send(info.gpu_times_ns).unwrap();
+            });
+            cb.add_completed_handler(OnFault::Return, handler).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            completed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        }
+        let plausible = |times: Option<(u64, u64)>| {
+            matches!(times, Some((start, end)) if start > 0 && end >= start
+                && end - start < 1_000_000_000)
+        };
+        let vulkan = learned::<VulkanPlatform>(&dev());
+        assert!(plausible(vulkan), "{vulkan:?}");
+        #[cfg(target_os = "macos")]
+        if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
+            let metal = learned::<reims_vgpu_metal::MetalPlatform>(&md);
+            assert!(plausible(metal), "{metal:?}");
         }
     }
 

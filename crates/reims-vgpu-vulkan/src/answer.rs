@@ -2492,12 +2492,16 @@ mod tests {
         // A recorded near-equivalent of Metal's answer (`rt::Exactness::NearEquivalent`), or work
         // the runtime fails instead (`FailsInstead`): relayed and logged, each for one of the
         // module's reasons, named below.
-        // - `UncalibratedGpuTimes`, `UntimedCommandBuffer` and `GpuTimesFromHost`: no value the
-        //   guest or the host sees. They are a command buffer's GPU times, which core's traits
-        //   answer neither; only debug lines read them, and `gpu_times_from_host`
-        //   (`crate::platform`'s `device_options`) leaves the first two unreachable. VM boots
-        //   relay `GpuTimesFromHost`, which the runtime also takes on MoltenVK 1.4.1 whatever the
-        //   option (its `TimestampsWaitForEveryQueue`).
+        // - `UncalibratedGpuTimes`, `UntimedCommandBuffer` and `GpuTimesFromHost`: a command
+        //   buffer's GPU times, which only the graphics lane's guest sees, as the length of the
+        //   buffer's run (its bundle's `GPUEndTime` less `GPUStartTime`, the end where the
+        //   completion reached the guest), and debug lines read. `gpu_times_from_host`
+        //   (`crate::platform`'s `device_options`) leaves the first two unreachable, and makes
+        //   the run's length the time from the end of its submission, or the end of its queue's
+        //   run before it, to the runtime's seeing it complete: within Metal's envelope of a
+        //   run's length, which counts from the GPU's start. VM boots relay `GpuTimesFromHost`,
+        //   which the runtime also takes on MoltenVK 1.4.1 whatever the option (its
+        //   `TimestampsWaitForEveryQueue`).
         // - `UnmeasuredUniqueIdentifier`: the difference dies where it shows. The runtime
         //   announces it where a call answers an identifier it has not measured to be Metal's
         //   number: a state's with indirect command buffer support, which this platform reads as

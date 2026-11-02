@@ -304,7 +304,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let record = if stand_in {
                 cb_failed(cb_obj_id, seqno)
             } else {
-                cb_complete(cb_obj_id, seqno, 0, 0, info.error.as_ref())
+                let (start, end) = info.gpu_times_ns.unwrap_or((0, 0));
+                cb_complete(cb_obj_id, seqno, start, end, info.error.as_ref())
             };
             if let Some(sink) = &sink {
                 sink(record);
@@ -926,6 +927,51 @@ mod tests {
         assert_eq!(recs[0].cb_obj_id, 100);
         assert_eq!(recs[0].header.seqno, 55);
         assert_eq!(recs[0].status, RGFX_CB_OK);
+        // The fake answers no GPU times unless set: 0 for each.
+        assert_eq!((recs[0].gpu_start_ns, recs[0].gpu_end_ns), (0, 0));
+    }
+
+    /// A command buffer's completion record carries the GPU times the platform answers as its
+    /// completed handler runs, in nanoseconds of the host's clock, which the guest bundle reports
+    /// as `GPUStartTime` and `GPUEndTime`; a failed buffer the platform gives none of carries 0.
+    #[test]
+    fn a_completion_record_carries_the_platforms_gpu_times() {
+        use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let captured = Arc::new(Mutex::new(Vec::<RgfxCbComplete>::new()));
+        let sink = Arc::clone(&captured);
+        dec.set_completion_sink(Arc::new(move |record| sink.lock().push(record)));
+        let message = command_buffer_message(140, 70, &render_ops());
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let committed = p.world().committed();
+        assert_eq!(committed.len(), 1);
+        assert!(
+            p.world()
+                .set_gpu_times(committed[0], 5_000_000_000, 5_002_000_000)
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        let message = command_buffer_message(141, 71, &render_ops());
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let failed = p.world().committed();
+        assert_eq!(failed.len(), 1);
+        let error = NsErrorText {
+            domain: "MTLCommandBufferErrorDomain".to_owned(),
+            code: 1,
+            description: "Internal Error".to_owned(),
+        };
+        assert!(p.world().complete(
+            failed[0],
+            CommandBufferStatus::ERROR,
+            Some(error),
+            CompleteOn::Caller
+        ));
+        let recs = captured.lock();
+        let times: Vec<_> = recs
+            .iter()
+            .map(|r| (r.cb_obj_id, r.gpu_start_ns, r.gpu_end_ns))
+            .collect();
+        assert_eq!(times, [(140, 5_000_000_000, 5_002_000_000), (141, 0, 0)]);
     }
 
     /// With a scheduled sink, a command buffer gets a scheduled handler before its completed

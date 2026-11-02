@@ -364,6 +364,9 @@ pub struct CommandBufferModel {
     /// handler runs ([`World::complete_dying_read`]); `None` for a read that finds what the model
     /// holds.
     pub read_dies: Option<String>,
+    /// `GPUStartTime` and `GPUEndTime` in nanoseconds, which its completed handlers learn
+    /// ([`World::set_gpu_times`]); `None`, the default, for none.
+    pub gpu_times_ns: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for CommandBufferModel {
@@ -1181,6 +1184,18 @@ impl World {
         true
     }
 
+    /// Sets the GPU times the command buffer `id`'s completed handlers learn when it completes
+    /// ([`CompletedInfo::gpu_times_ns`]). `false` if no such live buffer.
+    pub fn set_gpu_times(&self, id: ObjId, start_ns: u64, end_ns: u64) -> bool {
+        let Some(h) = self.find(id) else {
+            return false;
+        };
+        if let Model::CommandBuffer(m) = &mut h.obj().state.lock().model {
+            m.gpu_times_ns = Some((start_ns, end_ns));
+        }
+        true
+    }
+
     /// Completes every committed buffer successfully, in commit order.
     pub fn complete_all(&self, on: CompleteOn) -> usize {
         let ids = self.committed();
@@ -1284,7 +1299,7 @@ pub fn complete_obj(
     error: Option<NsErrorText>,
     on: CompleteOn,
 ) {
-    let (handlers, signals, read_dies) = {
+    let (handlers, signals, read_dies, gpu_times_ns) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {
             return;
@@ -1295,6 +1310,7 @@ pub fn complete_obj(
             std::mem::take(&mut m.handlers),
             std::mem::take(&mut m.signal_on_complete),
             m.read_dies.take(),
+            m.gpu_times_ns,
         )
     };
     for (ev, v) in &signals {
@@ -1302,7 +1318,11 @@ pub fn complete_obj(
     }
     cb.cv.notify_all();
     cb.world.note_completed(cb);
-    let info = CompletedInfo { status, error };
+    let info = CompletedInfo {
+        status,
+        error,
+        gpu_times_ns,
+    };
     let run = move || {
         super::calllog::as_completion_thread(|| {
             with_read_death(read_dies, || {
