@@ -1597,6 +1597,190 @@ fn a_sampler_create_is_answered_on_ring_0() {
     assert_eq!(device.decoder_object_count(), 1);
 }
 
+/// A `SAMPLER_CREATE` of `obj_id`, from a whole descriptor.
+fn sampler_create(obj_id: u64) -> Vec<u8> {
+    RgfxSamplerCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SAMPLER_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        max_anisotropy: 1,
+        flags: 0b101,
+        lod_max_clamp_bits: f32::MAX.to_bits(),
+        ..RgfxSamplerCreate::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Sends a sampler create of `obj_id` on ring 0 and takes its `SAMPLER_STATE`: its status.
+fn sampler_answered(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, obj_id: u64) -> u32 {
+    guest.send(device, sampler_create(obj_id));
+    let bytes = guest.event().expect("a SAMPLER_STATE");
+    let answer = RgfxSamplerState::read_from_bytes(&bytes).unwrap();
+    assert_eq!(answer.header.r#type, RGFX_EVT_SAMPLER_STATE);
+    assert_eq!(answer.header.seqno, guest.seqno);
+    answer.status
+}
+
+/// A command buffer whose compute pass binds the sampler `sampler` at index 0.
+fn sampler_command_buffer(queue_obj_id: u64, cb_obj_id: u64, sampler: u64) -> Vec<u8> {
+    use reims_graphics::ops::compute::{
+        RGFX_OP_COMPUTE_SET_SAMPLER_STATES, RgfxComputeOpSetSamplerStates,
+        RgfxComputeSamplerBinding,
+    };
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
+    };
+    let op = |tag: u16, body: &[u8]| {
+        let mut bytes = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: (8 + body.len()) as u32,
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let mut ops = op(
+        RGFX_OP_ENCODER_BEGIN_COMPUTE,
+        RgfxComputePassDesc::default().as_bytes(),
+    );
+    let mut bind = RgfxComputeOpSetSamplerStates {
+        location: 0,
+        length: 1,
+    }
+    .as_bytes()
+    .to_vec();
+    bind.extend_from_slice(
+        RgfxComputeSamplerBinding {
+            sampler_obj_id: sampler,
+        }
+        .as_bytes(),
+    );
+    ops.extend(op(RGFX_OP_COMPUTE_SET_SAMPLER_STATES, &bind));
+    ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+    let mut bytes = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        queue_obj_id,
+        cb_obj_id,
+        op_bytes: ops.len() as u64,
+    }
+    .as_bytes()
+    .to_vec();
+    bytes.extend(ops);
+    bytes
+}
+
+/// A sampler create is answered while a command buffer's walk holds the decoder's lock: the
+/// sampler is made with none of it held, and the decoder holds it from its next lock
+#[test]
+fn a_sampler_create_is_answered_while_a_walk_holds_the_decoder() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // The test holds the decoder's lock, as a command buffer's walk and commit do.
+    let walk = device.control.decoder.0.lock();
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        platform
+            .call_log()
+            .calls_to("newSamplerStateWithDescriptor:")
+            .len(),
+        1
+    );
+    drop(walk);
+    assert_eq!(device.decoder_object_count(), 1);
+}
+
+/// A destroy of a sampler, and a close of its context, carried out right behind its create while
+/// a walk held the decoder's lock, find the sampler stored first: neither leaves it behind
+#[test]
+fn a_destroy_or_close_behind_a_sampler_create_finds_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let walk = device.control.decoder.0.lock();
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    // Behind the held lock on ring 0; then a close of a context with nothing, answered once the
+    // destroy is done.
+    guest.send(&device, object_destroy(obj(1, 4)));
+    drop(walk);
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0, "the destroy missed it");
+
+    let walk = device.control.decoder.0.lock();
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(2, 4)),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, context_close(2));
+    drop(walk);
+    let bytes = guest.event().expect("the close's COMPLETE");
+    let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+    assert_eq!(
+        (complete.header.seqno, complete.status),
+        (guest.seqno, RGFX_STATUS_OK)
+    );
+    assert_eq!(device.decoder_object_count(), 0, "the close missed it");
+}
+
+/// A command buffer naming a sampler made while a walk held the decoder's lock finds it: the
+/// buffer is carried out after the create, under a later lock, and runs
+#[test]
+fn a_command_buffer_finds_a_sampler_made_under_a_walk() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let walk = device.control.decoder.0.lock();
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    drop(walk);
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+    // One that names a sampler never made fails at its op.
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 101, obj(1, 5)));
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
+    let failed = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(failed.cb_obj_id, 101);
+    assert_ne!(failed.status, RGFX_CB_OK);
+}
+
 /// An argument layout query on ring 0 writes the platform's layout into the sender's block and is
 /// answered by a `COMPLETE` at its seqno, making no object; one whose block is another process's
 /// is refused, with nothing written

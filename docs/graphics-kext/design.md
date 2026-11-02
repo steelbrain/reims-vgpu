@@ -1096,7 +1096,9 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   after it for a tracked resource. The host answers as it takes the buffer, under the
   decoder's lock, which every queue's message and every host call that reads or changes what a
   command buffer's walk and commit use takes, and which the buffer's decode holds through its
-  commit: every message the guest sends after the answer is carried out after that commit.
+  commit: every message the guest sends after the answer is carried out after that commit, but
+  for a sampler create, whose sampler is made and answered with no lock held, touching nothing
+  the walk and commit use, and stored in the decoder's table at its next lock, after it.
   metal2vulkan orders by commit across queues, and Metal orders behind what it has submitted,
   which a held queue's buffers are not, hence the rule for a queue held by a wait. Tested
   through the decoder on both platforms
