@@ -1022,7 +1022,8 @@ opens the `Platform` command buffer and walks the ops:
   device cache"). One naming a block with no cache does nothing.
 - `SUBMITTED` (no body), where the device has `CB_SUBMITTED`: the buffer is
   committed by `commitAndWaitUntilSubmitted`, and asks for its `CB_SUBMITTED`
-  ("Submitted", below).
+  ("Submitted", below). The bundle puts it last, as it commits; the host reads
+  it as it takes the buffer, before its other ops.
 
 A command buffer too large for half its queue's submission ring goes out of
 line: the bundle writes the whole `COMMAND_BUFFER` message into a block of the
@@ -1069,25 +1070,37 @@ carry out has no `CB_SCHEDULED`, and its `CB_COMPLETE` stands for both; so does 
 bit 2; every host sets it). A command buffer committed by `commitAndWaitUntilSubmitted` carries a
 `SUBMITTED` op, and the host posts its `CB_SUBMITTED` record (the command-buffer `ObjId`, at the
 buffer's seqno; 24 bytes) once, ahead of its `CB_SCHEDULED` and `CB_COMPLETE`: as soon as the
-host has committed it, where it waits for no event (the host's fills of device caches included)
-and no buffer before it on its queue waits for one and is not yet scheduled; else at its
-scheduling. The call returns there. A guest whose bundle sends no such op never sees the event,
+host takes it, before it walks the buffer's ops, where the buffer waits for no event (its
+`WAIT_EVENT` ops), the host fills no device cache it uses first (decided at the take from its
+`SURFACE_USE` ops, which lead the stream; a fill not yet done counts) and no buffer before it on
+its queue waits for one and is not yet scheduled; else at its scheduling. The call returns
+there. A guest whose bundle sends no such op never sees the event,
 and a bundle sends it only where the bit is set, which it reads in the device info's
 `features_lo`. What Metal does, on the M3, the 5300M and the 630
 (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7), and the class of each choice:
 - Contract (all three agree): the call returns once the buffer is submitted, about 0.1 to 0.4 ms
   behind a long buffer, and not before the signal where the buffer, or one before it on its
   queue, waits for an event. A buffer committed on any queue once the call returned is ordered
-  after it for a tracked resource. The host answers no earlier than its own commit, so every
-  message the guest sends after it is carried out after that commit; metal2vulkan orders by
-  commit across queues, and Metal orders behind what it has submitted, which a held queue's
-  buffers are not, hence the rule for a queue held by a wait. Tested through the decoder on
-  both platforms (`a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
+  after it for a tracked resource. The host answers as it takes the buffer, under the
+  decoder's lock, which every queue's message and every host call that reads or changes what a
+  command buffer's walk and commit use takes, and which the buffer's decode holds through its
+  commit: every message the guest sends after the answer is carried out after that commit.
+  metal2vulkan orders by commit across queues, and Metal orders behind what it has submitted,
+  which a held queue's buffers are not, hence the rule for a queue held by a wait. Tested
+  through the decoder on both platforms
+  (`a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
 - Loose (they race): whether the buffer is `Scheduled`, and its scheduled handlers have run, by
   the time the call returns. Ours is the cheapest: still `Committed`, the handlers at its
   `CB_SCHEDULED`, as on an idle queue on all three.
 - Loose (later than Metal, inside the envelope): a buffer that waits for an event already
-  reached is answered at its scheduling, not at its commit.
+  reached is answered at its scheduling, not at its take.
+- Loose (what "submitted" means on the host): Metal answers once it has submitted the buffer;
+  ours once the host has taken the message, before it encodes the buffer on its platform, which
+  the guest cannot tell apart, as nothing the guest sends after the answer is carried out
+  before that commit.
+- Inside the envelope (a fault): a buffer whose ops the host cannot carry out after it was
+  answered fails at its `CB_COMPLETE`, as Metal reports a command buffer's errors at its
+  completion, not at its commit.
 
 **Shared events.** The host's event is the one command buffers wait on and
 signal; the bundle keeps the value as the process knows it. It only rises, as

@@ -93,8 +93,9 @@ pub const RGFX_OP_SURFACE_USE: u16 = 0x0007;
 /// Op `SUBMITTED` (no body), where the device has
 /// [`RGFX_FEATURE_CB_SUBMITTED`](crate::wire::RGFX_FEATURE_CB_SUBMITTED): the command buffer is
 /// committed by `commitAndWaitUntilSubmitted`, and asks for its
-/// [`RGFX_EVT_CB_SUBMITTED`](crate::wire::RGFX_EVT_CB_SUBMITTED). Anywhere in the stream, once;
-/// the bundle puts it first.
+/// [`RGFX_EVT_CB_SUBMITTED`](crate::wire::RGFX_EVT_CB_SUBMITTED). Anywhere in the stream, once:
+/// the host reads it as it takes the buffer, before its other ops. The bundle puts it last, as it
+/// commits.
 pub const RGFX_OP_SUBMITTED: u16 = 0x0008;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.

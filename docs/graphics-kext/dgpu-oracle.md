@@ -331,8 +331,8 @@ The M3 also runs a creator's handler after the creator returns, on the global de
 Our stack: `commitAndWaitUntilSubmitted` and `waitUntilScheduled` return at submission
 (c95fca750), and handlers run on the process's completion thread in Metal's order. A buffer
 `commitAndWaitUntilSubmitted` commits asks for its submission (`CB_SUBMITTED`, design.md,
-"Submitted"), and the call returns at the host's answer: at its commit, or at the signal for one
-that waits on an event or is behind one that does, so an idle queue's buffer returns while it
+"Submitted"), and the call returns at the host's answer: as the host takes it, or at the signal
+for one that waits on an event or is behind one that does, so an idle queue's buffer returns while it
 is still `Committed`, as on all three. The host
 sends the platform's GPU times, from which the bundle answers `GPUStartTime` and `GPUEndTime`,
 and the async creators run their create and handler on the global default-QoS queue, after the

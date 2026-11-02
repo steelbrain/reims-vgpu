@@ -101,7 +101,7 @@ public:
 	/// Registers `handler` for the command buffer submitted at `seqno`, which asked for its
 	/// submission (RGFX_OP_SUBMITTED); fired once, when its RGFX_EVT_CB_SUBMITTED arrives, then
 	/// removed. Its RGFX_EVT_CB_SCHEDULED or RGFX_EVT_CB_COMPLETE removes it unfired: the host
-	/// posts CB_SUBMITTED ahead of both, and none for a buffer it could not carry out.
+	/// posts CB_SUBMITTED ahead of both, and none for a buffer it could not take.
 	void expectSubmitted(uint64_t seqno, SubmittedHandler handler);
 
 	/// Registers `handler` for the pipeline created at `seqno`; fired once, when its

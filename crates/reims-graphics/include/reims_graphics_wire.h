@@ -67,8 +67,9 @@
 // Op `SUBMITTED` (no body), where the device has
 // [`RGFX_FEATURE_CB_SUBMITTED`](crate::wire::RGFX_FEATURE_CB_SUBMITTED): the command buffer is
 // committed by `commitAndWaitUntilSubmitted`, and asks for its
-// [`RGFX_EVT_CB_SUBMITTED`](crate::wire::RGFX_EVT_CB_SUBMITTED). Anywhere in the stream, once;
-// the bundle puts it first.
+// [`RGFX_EVT_CB_SUBMITTED`](crate::wire::RGFX_EVT_CB_SUBMITTED). Anywhere in the stream, once:
+// the host reads it as it takes the buffer, before its other ops. The bundle puts it last, as it
+// commits.
 #define RGFX_OP_SUBMITTED 8
 
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
@@ -1133,8 +1134,9 @@
 // [`RGFX_FEATURE_CB_SUBMITTED`]: a command buffer that asked for it
 // ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)) is submitted, as Metal's is when its
 // `commitAndWaitUntilSubmitted` returns. Posted once, ahead of the buffer's [`RgfxCbScheduled`]
-// and [`RgfxCbComplete`]: as soon as the host has committed it, where it waits for no event, and
-// else once its waits are satisfied, at its scheduling.
+// and [`RgfxCbComplete`]: as soon as the host takes it, before it carries out its ops, where it
+// waits for no event, the host fills no device cache it uses first and no buffer before it on its
+// queue waits; else once its waits are satisfied, at its scheduling.
 #define RGFX_EVT_CB_SUBMITTED 1030
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
@@ -2125,11 +2127,13 @@ typedef struct {
 } RgfxCbScheduled;
 
 // `CB_SUBMITTED`, on the command buffer's queue's completion ring: the buffer, which asked for it
-// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)), is submitted: the host has committed it
-// to its platform, so every message the guest sends after this event is carried out after that
-// commit, and its waits for events are satisfied. Ahead of its [`RgfxCbScheduled`] and its
-// [`RgfxCbComplete`]. A buffer the host could not carry out has none: its `CB_COMPLETE` stands for
-// it. The guest reads a record of at least this size.
+// ([`RGFX_OP_SUBMITTED`](crate::ops::RGFX_OP_SUBMITTED)), is submitted: the host has taken it and
+// carries it out whole before any message the guest sends after this event, so that later work
+// comes after the buffer's commit to the host's platform, and its waits for events are satisfied.
+// Ahead of its [`RgfxCbScheduled`] and its [`RgfxCbComplete`]. A buffer the host could not take
+// has none: its `CB_COMPLETE` stands for it. One whose ops the host then cannot carry out has it,
+// and its failure at its `CB_COMPLETE`, as Metal reports a command buffer's errors at its
+// completion. The guest reads a record of at least this size.
 typedef struct {
   // [`RGFX_EVT_CB_SUBMITTED`], with the command buffer's submission `seqno`.
   RgfxMsgHeader header;

@@ -24,11 +24,14 @@
 //! buffer is submitted (measured on the 5300M, the 630 and the M3: about 0.3 ms behind a 100 ms
 //! buffer, the buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer
 //! that waits on an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7).
-//! The host posts it as soon as it has committed a buffer that waits for no event and has none
-//! before it on its queue that waits for one and is not yet scheduled ([`Held`]): every message
-//! the guest sends after it is carried out after that commit, so the platform orders the guest's
-//! later work after it as it orders by commit. Any other buffer gets it at its scheduling, once
-//! the waits are satisfied: Metal orders a tracked resource across queues behind what it has
+//! The host posts it as soon as it takes a buffer that waits for no event, needs no fill of a
+//! device cache and has none before it on its queue that waits for one and is not yet scheduled
+//! ([`Held`]), before it walks the buffer's ops ([`Take`]): the device's one decoder carries out
+//! each message whole under its lock, so every message the guest sends after it, on any queue, is
+//! carried out after the buffer's commit, and the platform orders the guest's later work after it
+//! as it orders by commit. A buffer whose walk then faults has its failure at its completion, as
+//! Metal reports a command buffer's errors. Any other buffer gets it at its scheduling, once the
+//! waits are satisfied: Metal orders a tracked resource across queues behind what it has
 //! submitted, not behind a buffer its queue holds (measured on the M3 through the decoder, a
 //! later commit on another queue ran first), and the host's fills of device caches are waits
 //! too. Either way it goes once, ahead of the buffer's `CB_SCHEDULED` and `CB_COMPLETE`
@@ -93,21 +96,18 @@ use super::{
 const ON: OnFault = OnFault::Return;
 
 /// What a command buffer's op stream does with events: the shared events it signals, whose values
-/// go to the guest once it finishes, the events it waits for, and whether it asks for its
-/// `CB_SUBMITTED`.
+/// go to the guest once it finishes, and the events it waits for.
 #[derive(Default)]
 struct EventOps {
     /// Each (shared event, value) the buffer signals, in stream order.
     signals: Vec<(u64, u64)>,
     /// Each (event, value) the buffer waits for, in stream order.
     waits: Vec<(u64, u64)>,
-    /// The stream holds a `SUBMITTED`.
-    submitted: bool,
 }
 
-/// A command buffer's `CB_SUBMITTED`, posted once: by the first of the host's commit (for a buffer
-/// that waits for no event), the buffer's scheduled handler and its completed handler, each of
-/// which posts it ahead of its own record, so it comes before them on the ring.
+/// A command buffer's `CB_SUBMITTED`, posted once: by the first of the host's take of it (for a
+/// buffer that waits for nothing), the buffer's scheduled handler and its completed handler, each
+/// of which posts it ahead of its own record, so it comes before them on the ring.
 struct Submitted {
     sink: SubmittedSink,
     record: RgfxCbSubmitted,
@@ -181,20 +181,40 @@ fn event_ops(mut ops: &[u8]) -> Vec<(bool, RgfxOpEvent)> {
     out
 }
 
-/// The `SURFACE_USE` ops of the op stream `ops`, in stream order. The scan stops at an op it
-/// cannot step past, as the walk does.
-fn surface_uses(mut ops: &[u8]) -> Vec<RgfxOpSurfaceUse> {
-    let mut out = Vec::new();
+/// What the host reads of a command buffer's op stream as it takes the buffer, before its walk:
+/// the IOSurface device caches it uses, filled first where the CPU wrote them since, and whether
+/// it waits for an event and asks for its `CB_SUBMITTED`, which together decide whether it is
+/// submitted at once.
+#[derive(Default)]
+struct Take {
+    /// The `SURFACE_USE` ops, in stream order.
+    uses: Vec<RgfxOpSurfaceUse>,
+    /// The stream holds a `WAIT_EVENT`, of an event the host holds or not.
+    waits: bool,
+    /// The stream holds a `SUBMITTED`.
+    asks: bool,
+}
+
+/// What the host takes of the op stream `ops` ([`Take`]). The scan stops at an op it cannot step
+/// past, as the walk does.
+fn take(mut ops: &[u8]) -> Take {
+    let mut out = Take::default();
     while let Some(h) = read::<RgfxOpHeader>(ops) {
         let len = h.len as usize;
         if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
             break;
         }
-        if h.tag == RGFX_OP_SURFACE_USE
-            && let Ok((op, _)) =
-                RgfxOpSurfaceUse::read_from_prefix(&ops[RGFX_OP_BODY_OFFSET as usize..len])
-        {
-            out.push(op);
+        match h.tag {
+            RGFX_OP_SURFACE_USE => {
+                if let Ok((op, _)) =
+                    RgfxOpSurfaceUse::read_from_prefix(&ops[RGFX_OP_BODY_OFFSET as usize..len])
+                {
+                    out.uses.push(op);
+                }
+            }
+            RGFX_OP_WAIT_EVENT => out.waits = true,
+            RGFX_OP_SUBMITTED => out.asks = true,
+            _ => {}
         }
         ops = &ops[len..];
     }
@@ -241,7 +261,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// commits with a completion handler, which holds `drain` (its context's) until it has run.
     /// The IOSurfaces whose device caches it uses (its `SURFACE_USE` ops) are filled first where
     /// they hold an older generation, and it signals its queue's end event for their later copies
-    /// ([`super::surface_cache`]).
+    /// ([`super::surface_cache`]). A buffer that asks for its `CB_SUBMITTED` and waits for nothing
+    /// gets it before the walk; any other at its scheduling.
     pub(super) fn decode_command_buffer(
         &mut self,
         device: &P::Device,
@@ -270,9 +291,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                 None => return Ok(Err(DecodeError::Refused)),
             }
         };
-        let (used, fill_waits) = self
-            .surface_caches
-            .before(device, &cb, &surface_uses(ops))?;
+        let take = take(ops);
+        let (used, fill_waits) = self.surface_caches.before(device, &cb, &take.uses)?;
+        // Submitted at once, unless it waits (for an event, or for the host's fill of a device
+        // cache) or a buffer before it on its queue does: then at its scheduling. The guest's
+        // later messages are carried out after this one's commit, under the decoder's lock.
+        let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
+        let (behind, held) = self.hold(m.queue_obj_id, fill_waits || take.waits);
+        if held.is_none()
+            && !behind
+            && let Some(submitted) = &submitted
+        {
+            submitted.post();
+        }
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
         let mut events = EventOps::default();
@@ -284,8 +315,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         // Register the scheduled and completion paths and commit. The GPU start and end times
         // are 0 here; the ring loop fills them when it posts the record on the queue's
         // completion ring in a later increment.
-        let submitted = self.submitted(m.cb_obj_id, m.header.seqno, events.submitted);
-        let (behind, held) = self.hold(m.queue_obj_id, fill_waits || !events.waits.is_empty());
         if let Some(handler) =
             self.scheduled_handler(m.cb_obj_id, m.header.seqno, submitted.clone(), held.clone())
         {
@@ -297,18 +326,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             events,
             drain,
             false,
-            (submitted.clone(), held.clone()),
+            (submitted, held.clone()),
         );
         cb.add_completed_handler(ON, handler)?;
         commit_holding(&cb, held.as_deref())?;
-        // Submitted once committed, unless it or a buffer before it on its queue waits: then at
-        // its scheduling.
-        if held.is_none()
-            && !behind
-            && let Some(submitted) = submitted
-        {
-            submitted.post();
-        }
         Ok(Ok(()))
     }
 
@@ -655,10 +676,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     events.waits.push((op.event_obj_id, op.value));
                 }
             }
-            // Carried out before the walk, wherever it lies (`surface_uses`).
-            RGFX_OP_SURFACE_USE => {}
-            // Answered once the buffer is committed (`decode_command_buffer`).
-            RGFX_OP_SUBMITTED => events.submitted = true,
+            // Carried out before the walk, wherever they lie ([`take`]).
+            RGFX_OP_SURFACE_USE | RGFX_OP_SUBMITTED => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -1303,14 +1322,51 @@ mod tests {
         );
     }
 
+    /// Over a decoder of [`posting`], whose records it keeps posting there: the call-log mark at
+    /// which each buffer's `CB_SUBMITTED` was posted, by buffer. Every call logged before the
+    /// mark was made before the post.
+    fn submitted_at(
+        p: &Arc<FakePlatform>,
+        dec: &mut GraphicsDecoder<FakePlatform>,
+        posted: &Posted,
+    ) -> Arc<Mutex<Vec<(u64, u64)>>> {
+        let at = Arc::new(Mutex::new(Vec::new()));
+        let (log, marks, posted) = (Arc::clone(p), Arc::clone(&at), Arc::clone(posted));
+        dec.set_submitted_sink(Arc::new(move |m| {
+            marks.lock().push((m.cb_obj_id, log.call_log().mark()));
+            posted
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, m.header.seqno));
+        }));
+        at
+    }
+
+    /// The selectors called from `from` up to the post of buffer `cb_obj_id`'s `CB_SUBMITTED`,
+    /// which `at` ([`submitted_at`]) holds.
+    fn called_before_submitted(
+        p: &FakePlatform,
+        at: &Mutex<Vec<(u64, u64)>>,
+        from: u64,
+        cb_obj_id: u64,
+    ) -> Vec<&'static str> {
+        let (_, posted) = *at.lock().iter().find(|(cb, _)| *cb == cb_obj_id).unwrap();
+        (p.call_log().since(from).into_iter())
+            .filter(|c| c.seq < posted)
+            .map(|c| c.sel)
+            .collect()
+    }
+
     /// With no scheduled sink, a buffer that asks and waits for no event gets no scheduled
-    /// handler and is submitted once the host has committed it; one that waits for an event gets
-    /// one, which holds its queue until it runs and posts the buffer's `CB_SUBMITTED` there, at
-    /// its scheduling (the fake schedules a buffer as it is committed). A buffer the platform
-    /// cannot run is submitted at its completion, ahead of its `CB_COMPLETE`.
+    /// handler and is submitted as the host takes it, before it walks any op: its `SUBMITTED`
+    /// ends the stream, as the bundle appends it at the commit, and the post comes ahead of the
+    /// buffer's first encoder and its commit. One that waits for an event gets a scheduled
+    /// handler, which holds its queue until it runs and posts the buffer's `CB_SUBMITTED` there,
+    /// at its scheduling, after its commit (the fake schedules a buffer as it is committed).
     #[test]
-    fn a_buffer_is_submitted_at_its_commit_unless_it_waits() {
+    fn a_buffer_is_submitted_as_it_is_taken_unless_it_waits() {
+        const ENCODER: &str = "renderCommandEncoderWithDescriptor:";
         let (p, mut dec, posted) = posting(false);
+        let at = submitted_at(&p, &mut dec, &posted);
         let device = p.device();
         create_events(&p, &mut dec, 0);
         let scheduled = |p: &FakePlatform, mark| {
@@ -1318,20 +1374,26 @@ mod tests {
                 .sels_since(mark)
                 .contains(&"addScheduledHandler:")
         };
-        let mut ops = op(RGFX_OP_SUBMITTED, &[]);
-        ops.extend(render_ops());
+        let mut ops = render_ops();
+        ops.extend(op(RGFX_OP_SUBMITTED, &[]));
         let mark = p.call_log().mark();
         let message = command_buffer_message(150, 80, &ops);
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert!(!scheduled(&p, mark));
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 150, 80)]);
-        let mut ops = op(RGFX_OP_SUBMITTED, &[]);
-        ops.extend(event_op(RGFX_OP_WAIT_EVENT, 7, 1));
+        let before = called_before_submitted(&p, &at, mark, 150);
+        assert!(!before.contains(&ENCODER) && !before.contains(&"commit"));
+        let all = p.call_log().sels_since(mark);
+        assert!(all.contains(&ENCODER) && all.contains(&"commit"));
+        let mut ops = event_op(RGFX_OP_WAIT_EVENT, 7, 1);
         ops.extend(render_ops());
+        ops.extend(op(RGFX_OP_SUBMITTED, &[]));
         let mark = p.call_log().mark();
         let message = command_buffer_message(151, 81, &ops);
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert!(scheduled(&p, mark));
+        let before = called_before_submitted(&p, &at, mark, 151);
+        assert!(before.contains(&ENCODER) && before.contains(&"commit"));
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(
             *posted.lock(),
@@ -1342,21 +1404,25 @@ mod tests {
                 (RGFX_EVT_CB_COMPLETE, 151, 81)
             ]
         );
-        // Its scheduling let the queue go: a later buffer is submitted once committed.
-        let mut ops = op(RGFX_OP_SUBMITTED, &[]);
-        ops.extend(render_ops());
+        // Its scheduling let the queue go: a later buffer is submitted as it is taken.
+        let mut ops = render_ops();
+        ops.extend(op(RGFX_OP_SUBMITTED, &[]));
+        let mark = p.call_log().mark();
         let message = command_buffer_message(152, 82, &ops);
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert_eq!(
             posted.lock().last(),
             Some(&(RGFX_EVT_CB_SUBMITTED, 152, 82))
         );
+        assert!(!called_before_submitted(&p, &at, mark, 152).contains(&ENCODER));
     }
 
-    /// A buffer that asks but cannot be carried out gets no `CB_SUBMITTED`: the stand-in's
-    /// `CB_COMPLETE`, its failure, stands for it.
+    /// A buffer that asks and waits for nothing but whose walk then faults is submitted as it was
+    /// taken, and fails at its completion, as Metal reports a command buffer's errors: the
+    /// stand-in's `CB_COMPLETE`, its failure, follows. One the host cannot take, of a queue it
+    /// does not hold, gets no `CB_SUBMITTED`.
     #[test]
-    fn a_buffer_not_carried_out_is_not_submitted() {
+    fn a_buffer_whose_walk_faults_is_submitted_then_fails() {
         let (p, mut dec, posted) = posting(true);
         let device = p.device();
         let mut ops = op(RGFX_OP_SUBMITTED, &[]);
@@ -1374,7 +1440,22 @@ mod tests {
         assert!(refusing(|| dec.decode(&device, &message)).is_err());
         assert!(dec.stand_in_for_failed(&message).unwrap());
         p.world().complete_all(CompleteOn::Caller);
-        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 160, 90)]);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_CB_SUBMITTED, 160, 90),
+                (RGFX_EVT_CB_COMPLETE, 160, 90)
+            ]
+        );
+        let mut message = command_buffer_message(161, 91, &op(RGFX_OP_SUBMITTED, &[]));
+        let (mut m, _) = RgfxCommandBuffer::read_from_prefix(&message).unwrap();
+        m.queue_obj_id = 0x77;
+        message[..size_of::<RgfxCommandBuffer>()].copy_from_slice(m.as_bytes());
+        assert_eq!(
+            dec.decode(&device, &message).unwrap(),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(posted.lock().len(), 2);
     }
 
     /// A `COMMAND_BUFFER` message for queue `queue_obj_id`, command buffer `cb_obj_id`, carrying

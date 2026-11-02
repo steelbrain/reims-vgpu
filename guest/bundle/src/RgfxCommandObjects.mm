@@ -1175,8 +1175,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		RgfxCmdBuffer *strongSelf = self;
 		RgfxReplyReader *reader = _reader;
 		// One commitAndWaitUntilSubmitted commits asks for its submission where the host
-		// answers it: the call then returns at the host's commit of it, or at the signal it or
-		// a buffer before it on its queue waits for, as Metal's does, not at its scheduling.
+		// answers it: the call then returns as the host takes it, or at the signal it or a
+		// buffer before it on its queue waits for, as Metal's does, not at its scheduling.
 		// Nothing else waits for a submission, so no other buffer asks.
 		const bool asks = _waitsSubmitted && queue.asksSubmitted;
 		if (asks)

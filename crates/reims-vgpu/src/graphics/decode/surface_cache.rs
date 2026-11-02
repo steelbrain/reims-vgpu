@@ -577,7 +577,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use reims_graphics::ops::{
-        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SURFACE_USE, RgfxCommandBuffer, RgfxOpHeader,
+        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_USE, RgfxCommandBuffer,
+        RgfxOpHeader,
     };
     use reims_graphics::wire::{
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_OK, RgfxMsgHeader,
@@ -622,6 +623,17 @@ mod tests {
     /// Command buffer `cb_obj_id` on queue `queue`, which uses each (block, generation, writes)
     /// of `uses` and does nothing else.
     fn use_surfaces(r: &mut Rig, queue: u64, cb_obj_id: u64, uses: &[(u64, u64, bool)]) {
+        use_surfaces_asking(r, queue, cb_obj_id, uses, false);
+    }
+
+    /// [`use_surfaces`], whose buffer asks for its `CB_SUBMITTED` where it `asks`.
+    fn use_surfaces_asking(
+        r: &mut Rig,
+        queue: u64,
+        cb_obj_id: u64,
+        uses: &[(u64, u64, bool)],
+        asks: bool,
+    ) {
         let mut ops = Vec::new();
         for &(block_offset, cpu_gen, writes) in uses {
             let body = RgfxOpSurfaceUse {
@@ -637,6 +649,14 @@ mod tests {
             };
             ops.extend_from_slice(header.as_bytes());
             ops.extend_from_slice(body.as_bytes());
+        }
+        if asks {
+            let header = RgfxOpHeader {
+                tag: RGFX_OP_SUBMITTED,
+                flags: 0,
+                len: 8,
+            };
+            ops.extend_from_slice(header.as_bytes());
         }
         let m = RgfxCommandBuffer {
             header: RgfxMsgHeader {
@@ -735,6 +755,41 @@ mod tests {
             );
         }
         assert_eq!(r.dec.surface_caches.counts().fills, 2);
+    }
+
+    /// A buffer that asks for its `CB_SUBMITTED` and uses a cache the host fills first waits for
+    /// the fill, so it gets it at its scheduling, after its commit (the fake schedules a buffer as
+    /// it is committed), not as the host takes it; once the fill is done, a buffer of the same
+    /// generation waits for nothing and gets it as it is taken, before its commit.
+    #[test]
+    fn a_buffer_behind_a_fill_is_submitted_at_its_scheduling() {
+        let mut r = cached();
+        let at = Arc::new(Mutex::new(Vec::new()));
+        let (log, marks) = (Arc::clone(&r.p), Arc::clone(&at));
+        r.dec.set_submitted_sink(Arc::new(move |m| {
+            marks.lock().push((m.cb_obj_id, log.call_log().mark()));
+        }));
+        // The buffer's own commit, the last of those since `from`.
+        let commit = |r: &Rig, from| {
+            (r.p.call_log().since(from).iter())
+                .filter(|c| c.sel == "commit")
+                .map(|c| c.seq)
+                .max()
+                .unwrap()
+        };
+        let mark = r.p.call_log().mark();
+        use_surfaces_asking(&mut r, 1, 0x100, &[(BLOCK, 0, false)], true);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "a fill");
+        let (cb, posted) = at.lock()[0];
+        assert_eq!(cb, 0x100);
+        assert!(posted > commit(&r, mark), "at its scheduling");
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_surfaces_asking(&mut r, 1, 0x101, &[(BLOCK, 0, false)], true);
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        let (cb, posted) = at.lock()[1];
+        assert_eq!(cb, 0x101);
+        assert!(posted <= commit(&r, mark), "as it is taken");
     }
 
     /// Two queues' buffers of one generation take one fill, whichever the host takes first, and
