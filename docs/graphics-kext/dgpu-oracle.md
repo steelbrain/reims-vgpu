@@ -351,6 +351,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | sparse tile sizes | 0x0x0 | n/r | 64x64 and up | 64x64 and up |
 | families | Mac2, Common1-3, Metal3; no Apple | the same | Apple1-9, Metal4 too | as AMD |
 | `supportsFeatureSet:(10002)` | 1 | 0 | 0 | 0 |
+| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10002 (the M3's 10 before) |
 | `heapTextureSizeAndAlign` alignment | 65536 | 4096 | 128 | |
 
 Formats (`F` lines): both x86 GPUs make every uncompressed color format but B5G6R5, A1BGR5,
@@ -367,6 +368,36 @@ choices inside the envelope *(class 2)*: `minimumLinearTextureAlignmentForPixelF
 SPI linear alignments 256 for every format, as both x86 GPUs answer, which suits the Vulkan
 hosts' linear images (4ee4bcaf0, 4a329e614); and `maxBufferLength` at most three quarters of
 `recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
+
+## Q10: runtime source compile
+
+Probe: `oracle_source DEVICE [OUT]`. A source of a vertex, a fragment and a kernel function,
+compiled by `newLibraryWithSource:options:error:`, by the base class's implementation called on
+the device, and by `_MTLDevice`'s compiler-task form called on the device with no task.
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| library | `_MTLLibrary` | the same | the same |
+| its bytes (`libraryDataContents`) | a .metallib (`MTLB`) of AIR, 12324 bytes | the same bytes as AMD | 12324 bytes (macOS 27) |
+| the three routes | the same bytes | the same | the same |
+| a source that does not compile | nil; `MTLLibraryErrorDomain` 3 with the compiler's log | the same | the same |
+| a source that compiles, also with an unused variable | the library; `*error` nil | the same | the same |
+
+How the base class compiles (dtrace on the AMD device's classes, and method swaps on all three):
+its form without a task calls the compiler-task form on the device, which reaches Metal's
+compiler service through `_MTLDevice`'s own `getCompilerConnectionManager:`, on the caller's
+thread. It never asks the device for its `compiler`: a compiler answered nil, or one made with a
+plugin that does not exist, changed nothing. Of the device it reads `featureProfile` (AMD and
+Intel answer 10002, the M3 10), `supportsFamily:withFamilyArray:count:`, and Metal's own settings
+for the compiler service and for shader capture. Six sources (a kernel, framebuffer fetch, an
+imageblock, simdgroup matrices, bfloat and ray tracing) compiled under `featureProfile` 10 and
+10002 made the same bytes, in either order.
+
+Our stack: the device's source forms run that compiler-task form on super, over the device, and
+make the device's library of its bytes through `newLibraryWithData:`, as an app's .metallib is
+made; Metal's library is kept as the shadow, and Metal's error and nil pass through unchanged
+*(class 3)*. The lane answers `featureProfile` 10002, an x86 Mac's *(class 2)*. Before this, the
+device refused every source, which lost Chrome's WebGL contexts at their first link.
 
 ## Not measured
 
