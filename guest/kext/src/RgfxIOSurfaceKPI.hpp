@@ -23,8 +23,16 @@
 //     a read-write lock of a surface with a cache that is not current calls op 2 with 0, then
 //     op 3; a read-only one, none. An AvoidSync lock of a surface whose cache is current answers
 //     kIOReturnCannotLock with no call, until a plain lock has synced it;
-//   - a client of the surface going calls op 5 (IOSurface::purge), and setPurgeable op 7 with
-//     the new state (0 nonvolatile, 1 volatile, 2 empty, 3 to read it).
+//   - IOSurfaceDeviceCache::purge calls op 5, at each client of the surface going and when a
+//     surface set empty is made nonvolatile again;
+//   - setPurgeable calls op 7 with the new state as IOMemoryDescriptor numbers it
+//     (kIOMemoryPurgeable*: 1 to read it, 2 nonvolatile, 3 volatile, 4 empty), but a change to
+//     nonvolatile after empty, or after volatile while the AMD's resource held the cache, calls
+//     op 6 instead, from IOSurfaceDeviceCache::unpurge, its second argument the address of a
+//     byte: the AMD's driver sets the byte from 0 to 0xff both after volatile, where IOSurface
+//     then answers the old state volatile, and after empty, where it answers empty and calls
+//     op 5. In the guest a control function that leaves the byte 0 has IOSurface answer empty
+//     after volatile too.
 // The accelerator ID came from IOSurfaceRoot::generateUniqueAcceleratorID(the accelerator) on
 // both, 1 for IOGPU and 2 for the AMD's (taken before the trace began).
 //
@@ -39,9 +47,9 @@
 struct RgfxDeviceCache;
 
 // The control function a device cache calls: the accelerator its cache was made for, the cache,
-// the op (0 sync, 2 wait, 3 done, 4 freed, 5 purged, 7 purgeable), and the op's two arguments
-// (op 2's first: 1 for a read-only lock, 0 for a read-write one; op 7's the new state; the second
-// measured 0).
+// the op (0 sync, 2 wait, 3 done, 4 freed, 5 purged, 6 made nonvolatile, 7 purgeable), and the
+// op's two arguments (op 2's first: 1 for a read-only lock, 0 for a read-write one; op 7's the new
+// state; op 6's second the address of the byte it answers in; the others measured 0).
 typedef void (*RgfxDeviceCacheControl)(void *accelerator, RgfxDeviceCache *cache, uint32_t op,
                                        uint64_t a, uint64_t b);
 
