@@ -1500,6 +1500,8 @@ pub struct Placing {
     reserved: Option<Arc<rt::AddressPool>>,
     /// Whether the space placed it at its pin, a range or a slot, `Some(pinned)`.
     placed: Option<bool>,
+    /// Why the space refused the guest's pin, where it did.
+    pin_refused: Option<PinRefused>,
 }
 
 impl Placing {
@@ -1509,6 +1511,12 @@ impl Placing {
     /// placed, where Metal makes the resource.
     pub fn nil_at_conflict(&self) -> bool {
         self.placed.is_none_or(|pinned| pinned)
+    }
+
+    /// Why the space refused the guest's pin, where it did ([`MetalSpace::pin`]): the creator
+    /// answers nil for it.
+    pub fn pin_refused(&self) -> Option<&PinRefused> {
+        self.pin_refused.as_ref()
     }
 
     /// Whether the space refused a heap ([`placing`] with [`Bytes::Heap`]): a pin off a granule or
@@ -1677,12 +1685,20 @@ pub fn placing(length: u64, bytes: Bytes, pin: Option<u64>) -> (rt::AddressPlace
             placed: slot.as_ref().map(|_| false),
             slot,
             reserved: None,
+            pin_refused: None,
         };
         return (rt::AddressPlacement::At(address), placing);
     }
     let mut space = process();
+    let mut pin_refused = None;
     let placed = match pin {
-        Some(address) => space.pin(address, length).ok().map(|held| (address, held)),
+        Some(address) => match space.pin(address, length) {
+            Ok(held) => Some((address, held)),
+            Err(refused) => {
+                pin_refused = Some(refused);
+                None
+            }
+        },
         None => {
             let offset = match bytes {
                 Bytes::NoCopy(offset) => offset & (PAGE - 1),
@@ -1702,6 +1718,7 @@ pub fn placing(length: u64, bytes: Bytes, pin: Option<u64>) -> (rt::AddressPlace
                 held: vec![held],
                 slot: None,
                 reserved: None,
+                pin_refused: None,
             },
         ),
         None => (
@@ -1711,6 +1728,7 @@ pub fn placing(length: u64, bytes: Bytes, pin: Option<u64>) -> (rt::AddressPlace
                 slot: None,
                 reserved: None,
                 placed: None,
+                pin_refused,
             },
         ),
     };

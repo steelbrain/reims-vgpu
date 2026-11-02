@@ -60,7 +60,7 @@ use crate::gpu::desc::{
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventHandle};
 use crate::gpu::icb::VulkanIcb;
-use crate::gpu::metal_space::{self, Placing, SurfacePlace, TextureKind};
+use crate::gpu::metal_space::{self, PinRefused, Placing, SurfacePlace, TextureKind};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
 use crate::gpu::resource::{
     BufferObject, ComputePipelineObject, HeapObject, LibraryObject, TextureObject, Under,
@@ -389,6 +389,41 @@ fn no_copy_release(
         backing::keep_alive((twin, hold, traced)),
         kept,
     )
+}
+
+/// [`create`] of a buffer, its nil answer logged with its reason, once ([`no_buffer`]): `pinned`
+/// where Metal's space refused the guest's pin ([`Placing::pin_refused`]), the span the pin needs
+/// and the held byte it meets or the granule it is off; else the runtime's refusal (no memory,
+/// an import that failed). The guest learns only that the buffer is nil, and its later uses of it
+/// fail far from the cause.
+fn create_buffer<T>(
+    sel: &'static str,
+    nil: Nil,
+    pinned: Option<&PinRefused>,
+    call: impl FnOnce() -> Result<T, rt::Error>,
+) -> RaiseResult<Option<T>> {
+    let mut refused = None;
+    let made = create(sel, Policy::Dies, nil, || {
+        call().inspect_err(|e| refused = Some(e.to_string()))
+    });
+    if matches!(made, Ok(None)) {
+        match (pinned, refused) {
+            (Some(pinned), _) => {
+                no_buffer(
+                    sel,
+                    &format_args!("Metal's space refused the pin: {pinned:x?}"),
+                );
+            }
+            (None, Some(refused)) => no_buffer(sel, &refused),
+            (None, None) => {}
+        }
+    }
+    made
+}
+
+/// Logs that `sel` answered nil, its buffer refused for `why`.
+fn no_buffer(sel: &'static str, why: &dyn std::fmt::Display) {
+    log::warn!(target: "reims_vgpu_vulkan::gpu", "{sel} answered nil: {why}");
 }
 
 /// What Metal answers where the runtime refuses a buffer or heap made at `placing`'s address:
@@ -739,7 +774,7 @@ impl VulkanDevice {
             Some(other) => descriptor.with_range_of(other),
             None => descriptor,
         };
-        create(sel, Policy::Dies, nil, || {
+        create_buffer(sel, nil, None, || {
             self.raw
                 .new_buffer_with_descriptor(with_token(descriptor, token))
         })
@@ -935,33 +970,31 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // and what keeps them mapped until the runtime freed its import.
         let (imported, run, keep, kept) =
             no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
-        let made = create(
-            sel,
-            Policy::Dies,
-            placed_nil(&placing, Nil::BufferLength),
-            || {
-                // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
-                // runs, or for the buffer's life with none, and an unmap of core's through the
-                // platform's VM waits for the keep-alive; a twin of them stays until it goes.
-                let memory = unsafe { crate::os::host_memory(imported, bytes.logged()) };
-                let contents = rt::BufferContents::NoCopy {
-                    memory,
-                    deallocator: run,
-                    keep_alive: Some(keep),
-                };
-                let descriptor = rt::BufferDescriptor::new(bytes.len(), options, contents)
-                    .with_placement(placement);
-                match self
-                    .raw
-                    .new_buffer_with_descriptor(with_token(descriptor, token))
-                {
-                    Ok(raw) => Ok(Some(raw)),
-                    // Pages Metal makes no buffer over: nil.
-                    Err(_) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => Ok(None),
-                    Err(e) => Err(e),
+        let made = create_buffer(sel, placed_nil(&placing, Nil::BufferLength), None, || {
+            // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
+            // runs, or for the buffer's life with none, and an unmap of core's through the
+            // platform's VM waits for the keep-alive; a twin of them stays until it goes.
+            let memory = unsafe { crate::os::host_memory(imported, bytes.logged()) };
+            let contents = rt::BufferContents::NoCopy {
+                memory,
+                deallocator: run,
+                keep_alive: Some(keep),
+            };
+            let descriptor =
+                rt::BufferDescriptor::new(bytes.len(), options, contents).with_placement(placement);
+            match self
+                .raw
+                .new_buffer_with_descriptor(with_token(descriptor, token))
+            {
+                Ok(raw) => Ok(Some(raw)),
+                // Pages Metal makes no buffer over: nil.
+                Err(e) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => {
+                    no_buffer(sel, &format_args!("pages it cannot read: {e}"));
+                    Ok(None)
                 }
-            },
-        )
+                Err(e) => Err(e),
+            }
+        })
         .map(Option::flatten);
         keep_unrun(&made, slot);
         made.map(|b| {
@@ -1045,10 +1078,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let descriptor = rt::BufferDescriptor::new(length, options, rt::BufferContents::Zero)
             .with_placement(placement);
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create(
+        let made = create_buffer(
             sel,
-            Policy::Dies,
             placed_nil(&placing, Nil::BufferLength),
+            placing.pin_refused(),
             || self.raw.new_buffer_with_descriptor(descriptor),
         );
         metal_space::let_go(pool);
@@ -1669,10 +1702,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let descriptor =
             rt::BufferDescriptor::new(desc.length, options, contents).with_placement(placement);
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create(
+        let made = create_buffer(
             sel,
-            Policy::Dies,
             placed_nil(&placing, Nil::BufferLength),
+            placing.pin_refused(),
             || self.raw.new_buffer_with_descriptor(descriptor),
         );
         metal_space::let_go(pool);
@@ -2192,6 +2225,42 @@ pub(crate) mod tests {
             raw,
             caps: OnceLock::new(),
         })
+    }
+
+    /// A buffer pinned where another's span lies is nil, and the line it logs names the runtime's
+    /// refusal: the held range the pin met.
+    #[test]
+    fn a_pinned_buffer_the_runtime_refuses_logs_why() {
+        use reims_vgpu_core::platform::resource::Buffer;
+        use reims_vgpu_core::platform::values::OptionSet;
+        use reims_vgpu_core::testkit::logs;
+        let d = dev();
+        let pin = metal_space::END / 4 + 0x100_0000;
+        let pinned = || BufferDesc {
+            length: 0x1000,
+            options: vec![OptionSet::StorageMode(0)],
+            pinned_gpu_address: Some(pin),
+            contents: None,
+            no_copy: false,
+            deallocator: None,
+        };
+        let first = d.new_buffer(pinned()).unwrap().unwrap();
+        assert_eq!(first.gpu_address(), pin);
+        let logs = logs::capture();
+        assert!(d.new_buffer(pinned()).unwrap().is_none());
+        let lines = logs.take();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (level, target, line) = &lines[0];
+        assert_eq!(
+            (*level, target.as_str()),
+            (log::Level::Warn, "reims_vgpu_vulkan::gpu")
+        );
+        assert!(
+            line.starts_with(
+                "newBufferWithDescriptor: answered nil: Metal's space refused the pin: Held {"
+            ) && line.contains(&format!("held: {pin:x}")),
+            "{line}"
+        );
     }
 
     /// A Shared heap over host memory lies in it, in place: a buffer placed at an offset is the
