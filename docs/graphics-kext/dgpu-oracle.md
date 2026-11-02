@@ -9,7 +9,7 @@ stricter than the M3's, guests may rely on it.
 
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
-`oracle_errors`, `oracle_source` and `oracle_ycbcr`.
+`oracle_errors`, `oracle_source`, `oracle_ycbcr` and `oracle_ca_ycbcr`.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -509,9 +509,30 @@ two plane textures and composites the frame from them. The matrix is a constant 
 shaders there, read from the surface's tag, and the frame shows by BT.709 on the lane. On the stock
 lane the same frame shows by BT.601: the lane's desktop is the stock's colours re-encoded by
 BT.601 and decoded by BT.709, within 1.1 levels on average (the guests' captures), with no
-parameter fitted. What an x86 Mac's frameworks make of that tag is not measured.
+parameter fitted.
 
-## The display's colour against the stock lane: a deliberate divergence
+What the frameworks convert such a frame by on a Mac (probe: `oracle_ca_ycbcr DEVICE`, 11-02):
+64 x 64 CVPixelBuffers over IOSurfaces, of OSType `x420` and `420v` (both video range), tagged
+ITU_R_709_2 or ITU_R_601_4 by CoreVideo's propagated `kCVImageBufferYCbCrMatrixKey`, or untagged;
+each quadrant holds one patch of known codes. CoreAnimation draws each as a layer's contents, by
+a CARenderer into a BGRA8 texture of the device on a queue of the device; VideoToolbox converts
+each to a 32BGRA pixel buffer by a VTPixelTransferSession, on a device it picks itself. Every
+read is within 0.0044 of one matrix's conversion of the codes and at least 0.085 from the other's.
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| CoreAnimation, `x420` and `420v` | by the tag: BT.709 under ITU_R_709_2, BT.601 under ITU_R_601_4 and untagged | the same | the same |
+| VideoToolbox, `420v` | the same as CoreAnimation | the same | the same |
+| VideoToolbox, `x420` | by the tag; untagged, BT.709 | the same | by the tag; untagged, BT.601 |
+
+With the surface's primaries and transfer function set to ITU_R_709_2 and the renderer's colour
+space sRGB, CoreAnimation's colour-matched reads still move with the tag, by 0.13 between the two
+matrices, on all three. *(class 3 for a tagged frame: all three convert ITU_R_709_2 by BT.709,
+as our lane shows the aerial; class 2 for VideoToolbox's untagged `x420`.)* On the lane the
+guest's own frameworks convert, by the tag our surfaces keep as set, so the lane has no answer of
+its own to change.
+
+## The display's colour against the stock lane: deliberate divergences
 
 Measured on a Linux host, in boots of 11-02: the stock lane's host shot of the desktop beside
 ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside its host shot.
@@ -540,6 +561,11 @@ ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside i
   take its EDID's colour bytes, a profile change that may move no pixel, or a gamma table and a
   colour matrix on our display pipe, through the kext, the wire and the host, and would make our
   pixels less faithful on an sRGB monitor.
+- **Y'CbCr images: decided, the lane keeps the tag's matrix.** The default aerial wallpaper, a
+  frame tagged ITU_R_709_2, shows by BT.709 on our lane and by BT.601 on the stock lane: that is
+  the shift between the two lanes' guest captures, which the display pipe's gamma does not reach
+  (Q13). CoreAnimation and VideoToolbox convert such a frame by BT.709 on the AMD, the Intel 630
+  and the M3 *(class 3)*: ours is the Macs' answer, and the stock lane's BT.601 is its own.
 
 ## Not measured
 
@@ -547,5 +573,3 @@ ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside i
   except that a read-write lock does not wait for a buffer that only reads the surface).
 - Page faults: no probe made a GPU address fault, on a Mac whose Intel GPU drives the display.
 - Surfaces whose rows miss the host's alignment.
-- What an x86 Mac's CoreAnimation and VideoToolbox convert a Y'CbCr surface by: its tag, or BT.601
-  as the stock lane's desktop shows (Q13).
