@@ -317,18 +317,28 @@ bool rgfxSurfaceCacheAdd(void *cache, UInt64 offset, uint32_t surfaceId, IOMemor
 		return false;
 	auto *genAt = reinterpret_cast<volatile uint64_t *>(header->getVirtualAddress() + genOffset);
 	__atomic_store_n(genAt, 0, __ATOMIC_RELEASE);
+	const uint64_t key = reinterpret_cast<uintptr_t>(cache);
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	IOLockLock(state.lock);
-	RgfxCachedSurface *c =
-	    rgfxCacheAdd(state.caches, reinterpret_cast<uintptr_t>(cache), offset, surfaceId);
+	// IOSurface gives a surface one device cache, so the surface's previous block may still be
+	// in the table, its release unanswered: the copy into the pages the answer waits for comes
+	// before this block's locks.
+	while (rgfxCacheFind(state.caches, key) && mach_absolute_time() < deadline)
+		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+	const char *why = nullptr;
+	RgfxCachedSurface *c = nullptr;
+	if (rgfxCacheFind(state.caches, key))
+		why = "its previous block is cached still, its release unanswered";
+	else if (!(c = rgfxCacheAdd(state.caches, key, offset, surfaceId)))
+		why = "no room for its device cache's state";
 	if (c) {
 		c->genAt = genAt;
 		c->map = header;
 	}
 	IOLockUnlock(state.lock);
-	if (!c)
-		IOLog("RgfxAccelerator: IOSurface %u: no room for its device cache's state: it is not "
-		      "cached\n",
-		      surfaceId);
+	if (why)
+		IOLog("RgfxAccelerator: IOSurface %u: %s: it is not cached\n", surfaceId, why);
 	return c != nullptr;
 }
 

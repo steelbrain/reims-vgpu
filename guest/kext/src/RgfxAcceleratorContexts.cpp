@@ -761,7 +761,9 @@ bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t su
 	                                    kRgfxSurfaceCpuGenOffset)) {
 		if (header)
 			header->release();
-		rgfxSurfaceLocksForget(cache, surface, false);
+		// The cache is the surface's, which another block of it may still use: only the
+		// surface's retain goes.
+		static_cast<OSObject *>(surface)->release();
 		return false;
 	}
 	// The entry is pending until the device answers its pages, so no other asker reads these.

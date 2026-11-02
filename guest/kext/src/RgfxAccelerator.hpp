@@ -191,7 +191,9 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
 // The surface of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID `surfaceId`, has its
 // block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page mapped at `header`,
 // which the kext keeps (and releases once the surface is cached no more) to write its CPU
-// generation at `genOffset`, 0 from here. False, `header` the caller's, where it cannot be.
+// generation at `genOffset`, 0 from here. Where the surface's previous block is cached still,
+// its release unanswered, waits for the answer first, as a lock does. False, `header` the
+// caller's and the table as it was, where it cannot be.
 bool rgfxSurfaceCacheAdd(void *cache, UInt64 offset, uint32_t surfaceId, IOMemoryMap *header,
                          UInt32 genOffset);
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
