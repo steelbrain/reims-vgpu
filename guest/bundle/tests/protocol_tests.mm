@@ -364,6 +364,8 @@ void test_inline_bytes_without_region()
 	fx.complete(cb, seqno, MTLCommandBufferStatusError);
 	CHECK(cb.error != nil && [cb.error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
 	      cb.error.code == MTLCommandBufferErrorOutOfMemory);
+	CHECK([cb.error.localizedDescription
+	    isEqualToString:@"Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"]);
 	} // @autoreleasepool
 }
 

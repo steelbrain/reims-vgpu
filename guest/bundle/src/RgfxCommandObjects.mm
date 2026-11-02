@@ -1160,6 +1160,54 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	}
 }
 
+// The NSError Metal gives a command buffer that failed with `code`, an `MTLCommandBufferError`.
+// Each description is the one Metal gave on the M3 Max (macOS 27.0.1), naming the IOGPU error
+// behind the code: Apple's x86-64 guest stack gives the same for a hang and for revoked access.
+// Metal puts that IOGPU error under it (`NSUnderlyingError`, `IOGPUCommandQueueErrorDomain`,
+// its own description none): measured for InvalidResource, whose IOGPU code is 9 as its own
+// is, so only it carries one. Internal's is a recovery's victim, the one failure Metal was seen
+// to give that code for. A code with none measured (or the host's 0) has no description.
+static NSError *rgfxCommandBufferError(NSInteger code)
+{
+	struct Known {
+		NSInteger code;
+		const char *description;
+		bool underlying;
+	};
+	static const Known known[] = {
+	    {MTLCommandBufferErrorInternal,
+	     "Discarded (victim of GPU error/recovery) "
+	     "(00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim)",
+	     false},
+	    {MTLCommandBufferErrorTimeout,
+	     "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)", false},
+	    {MTLCommandBufferErrorPageFault,
+	     "Caused GPU Address Fault Error (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)",
+	     false},
+	    {MTLCommandBufferErrorAccessRevoked,
+	     "Ignored (for causing prior/excessive GPU errors) "
+	     "(00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)",
+	     false},
+	    {MTLCommandBufferErrorOutOfMemory,
+	     "Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)", false},
+	    {MTLCommandBufferErrorInvalidResource,
+	     "Invalid Resource (00000009:kIOGPUCommandBufferCallbackErrorInvalidResource)", true},
+	};
+	for (const Known &k : known) {
+		if (k.code != code)
+			continue;
+		NSMutableDictionary *info = [NSMutableDictionary
+		    dictionaryWithObject:@(k.description)
+		                  forKey:NSLocalizedDescriptionKey];
+		if (k.underlying)
+			info[NSUnderlyingErrorKey] = [NSError errorWithDomain:@"IOGPUCommandQueueErrorDomain"
+			                                                 code:code
+			                                             userInfo:nil];
+		return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:code userInfo:info];
+	}
+	return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:code userInfo:nil];
+}
+
 // Delivers the host's completion for this command buffer, on the thread that took it off
 // the ring (the completion thread, or a waiter where none drives the ring): records any
 // error, flips the status, then fires the scheduled then the completed handlers (in the
@@ -1191,22 +1239,17 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
 	if (msg->status == RGFX_CB_OK && uploadsFailed) {
-		_cbError = [NSError
-		    errorWithDomain:MTLCommandBufferErrorDomain
-		               code:MTLCommandBufferErrorOutOfMemory
-		           userInfo:@{
-			           NSLocalizedDescriptionKey :
-			               @"inline bytes (set*Bytes:) found no room in the device's memory"
-		           }];
+		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
+		NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
+		      @"device's memory; it fails as out of memory");
+		_cbError = rgfxCommandBufferError(MTLCommandBufferErrorOutOfMemory);
 		_status.store(MTLCommandBufferStatusError);
 	} else if (msg->status == RGFX_CB_OK) {
 		_status.store(MTLCommandBufferStatusCompleted);
 	} else {
 		// The host preserved the raw MTLCommandBufferError code behind the status; it
-		// travels back in the native command-buffer error domain for the guest.
-		_cbError = [NSError errorWithDomain:MTLCommandBufferErrorDomain
-		                               code:static_cast<NSInteger>(msg->error_code)
-		                           userInfo:nil];
+		// travels back as the error Metal gives for it.
+		_cbError = rgfxCommandBufferError(static_cast<NSInteger>(msg->error_code));
 		_status.store(MTLCommandBufferStatusError);
 	}
 	for (MTLCommandBufferHandler block in _scheduledHandlers) {

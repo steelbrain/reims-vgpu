@@ -3074,8 +3074,46 @@ void test_reply_reader_completion()
 	CHECK(cb2.status == MTLCommandBufferStatusError);
 	CHECK(cb2.error != nil);
 	CHECK(cb2.error.code == 2);
+	// Metal's description of a hang, with nothing under it.
+	CHECK([cb2.error.localizedDescription
+	    isEqualToString:@"Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)"]);
+	CHECK(cb2.error.userInfo[NSUnderlyingErrorKey] == nil);
 	// No run length known: the run starts as it ends.
 	CHECK(cb2.GPUEndTime > 0 && cb2.GPUStartTime == cb2.GPUEndTime);
+
+	// An invalid resource carries Metal's description and the IOGPU error under it, as Metal's
+	// does (measured on the M3 Max); a code Metal was not measured failing with carries the
+	// code alone.
+	auto failWith = [&](uint32_t status, uint32_t code) -> id<MTLCommandBuffer> {
+		id<MTLCommandBuffer> b = [queue commandBuffer];
+		uint64_t objId = ((RgfxResource *)b).rgfxObjId;
+		[b commit];
+		RgfxMsgHeader hdr = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&hdr, &bytes));
+		RgfxCbComplete msg = {};
+		msg.header.type = RGFX_EVT_CB_COMPLETE;
+		msg.header.size = sizeof(msg);
+		msg.header.seqno = hdr.seqno;
+		msg.cb_obj_id = objId;
+		msg.status = status;
+		msg.error_code = code;
+		CHECK(completion.postFromHost(&msg, sizeof(msg)));
+		[b waitUntilCompleted];
+		CHECK(b.status == MTLCommandBufferStatusError);
+		return b;
+	};
+	id<MTLCommandBuffer> invalid = failWith(RGFX_CB_INVALID_RESOURCE, 9);
+	CHECK([invalid.error.domain isEqualToString:MTLCommandBufferErrorDomain]);
+	CHECK(invalid.error.code == MTLCommandBufferErrorInvalidResource);
+	CHECK([invalid.error.localizedDescription
+	    isEqualToString:@"Invalid Resource (00000009:kIOGPUCommandBufferCallbackErrorInvalidResource)"]);
+	NSError *under = invalid.error.userInfo[NSUnderlyingErrorKey];
+	CHECK(under != nil && [under.domain isEqualToString:@"IOGPUCommandQueueErrorDomain"] &&
+	      under.code == 9 && under.userInfo.count == 0);
+	CHECK(invalid.error.userInfo.count == 2);
+	id<MTLCommandBuffer> unknown = failWith(RGFX_CB_INTERNAL, 0);
+	CHECK(unknown.error.code == 0 && unknown.error.userInfo.count == 0);
 
 	// A descriptor's error options are kept for the buffer to answer, and no buffer has logs.
 	MTLCommandBufferDescriptor *desc = [[MTLCommandBufferDescriptor alloc] init];
