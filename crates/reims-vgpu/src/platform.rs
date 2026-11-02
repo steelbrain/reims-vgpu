@@ -67,6 +67,13 @@ pub trait ApiPlatform: Platform {
         Box::new(())
     }
 
+    /// The host's hardware video for a graphics device on `device`, the guest's video driver's
+    /// (`crate::GraphicsVideo`); `None` where the platform has none, and by default.
+    fn graphics_video(&self, device: &Self::Device) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
+        let _ = device;
+        None
+    }
+
     /// The planes of `surface`, in order: what a video device's codecs read of a guest pixel
     /// buffer's layout beyond core's `Surface`. Empty for a surface without planes, whose layout
     /// is the surface's own, and by default, for a platform that does not say.

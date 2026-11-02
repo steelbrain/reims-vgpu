@@ -86,6 +86,14 @@ impl ApiPlatform for VulkanPlatform {
             .collect()
     }
 
+    /// Vulkan Video on the device's video-decode queue (`graphics::vulkan::video`).
+    fn graphics_video(
+        &self,
+        device: &<Self as Platform>::Device,
+    ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
+        crate::graphics::vulkan_graphics_video(device)
+    }
+
     fn lend_surface_bytes(
         &self,
         surface: &<Self as Platform>::Surface,

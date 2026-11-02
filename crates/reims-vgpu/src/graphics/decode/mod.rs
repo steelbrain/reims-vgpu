@@ -50,7 +50,7 @@ use reims_graphics::wire::{
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
-    RGFX_CMD_TEXTURE_VIEW, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
     RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
     RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
@@ -74,7 +74,7 @@ use reims_graphics::wire::{
     RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
     RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
-    RgfxVertexBufferLayout,
+    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_core::collections::hasher::KeyBuild;
 use reims_vgpu_core::host::HostPtr;
@@ -109,8 +109,11 @@ mod managed;
 mod render;
 mod surface_cache;
 mod surface_pages;
+mod video;
 mod view;
 mod waits;
+
+pub use video::{GraphicsVideo, GraphicsVideoSession, H264Decode, VideoPlane};
 
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
@@ -329,6 +332,9 @@ enum ObjHandle<P: Platform> {
     // not yet constructed; kept whole for when that op lands (project rule "Unread is not dead").
     #[allow(dead_code)]
     Icb(P::Icb),
+    /// A video session ([`RGFX_CMD_VIDEO_SESSION_CREATE`]), which its command buffers' video
+    /// encoders name.
+    VideoSession(Arc<dyn GraphicsVideoSession<P>>),
 }
 
 /// Why a message was not carried out.
@@ -375,6 +381,11 @@ pub struct GraphicsDecoder<P: Platform> {
     /// Where in the region each of those textures' copy keeps its
     /// [`RgfxSurfaceWriters`], by the texture's id, where its message gave one.
     surface_writers: HashMap<u64, u64>,
+    /// Where each texture over an IOSurface's plane, of any plane, lies in its buffer, by the
+    /// texture's id: what a video encoder's picture is written through.
+    surface_places: HashMap<u64, video::PlanePlace>,
+    /// The host's hardware video, which makes the video sessions; `None` where it has none.
+    video: Option<Arc<dyn GraphicsVideo<P>>>,
     /// The bytes of each library whose `LIBRARY_FROM_REGION` chunks have not yet
     /// reached its length, by the library's id.
     library_chunks: HashMap<u64, Vec<u8>>,
@@ -453,6 +464,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             objects: HashMap::default(),
             surfaces: HashMap::new(),
             surface_writers: HashMap::new(),
+            surface_places: HashMap::new(),
+            video: None,
             library_chunks: HashMap::new(),
             making_libraries: HashMap::new(),
             library_cache: LibraryCache::new(RELEASED_BUDGET),
@@ -809,6 +822,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             !textures.is_empty()
         });
         self.surface_writers.remove(&obj_id);
+        self.surface_places.remove(&obj_id);
     }
 
     /// Forgets the surface names of textures the table no longer holds: a caller
@@ -818,6 +832,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     pub(crate) fn forget_dropped_surfaces(&mut self) {
         let objects = &self.objects;
         self.surface_writers
+            .retain(|t, _| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
+        self.surface_places
             .retain(|t, _| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
         self.surfaces.retain(|_, textures| {
             textures.retain(|t| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
@@ -1432,6 +1448,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Some(texture) => {
                         // An id made again names only its new texture's surface.
                         self.forget_surface_texture(m.obj_id);
+                        self.surface_places.insert(
+                            m.obj_id,
+                            video::PlanePlace {
+                                buffer_obj_id: m.buffer_obj_id,
+                                offset: m.offset,
+                                bytes_per_row: m.bytes_per_row,
+                                width: u64::from(m.desc.width),
+                                height: u64::from(m.desc.height),
+                            },
+                        );
                         if m.plane == 0 {
                             self.surfaces
                                 .entry(m.iosurface_id)
@@ -1445,6 +1471,22 @@ impl<P: Platform> GraphicsDecoder<P> {
                     }
                     None => Ok(Err(DecodeError::Refused)),
                 }
+            }
+            RGFX_CMD_VIDEO_SESSION_CREATE => {
+                let Some(m) = read::<RgfxVideoSessionCreate>(message) else {
+                    return Ok(Err(DecodeError::Malformed));
+                };
+                let Some(session) =
+                    (self.video.as_ref()).and_then(|video| video.session(m.codec, m.direction))
+                else {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "video session {:#x} not made: the host has no codec {} in direction {}",
+                        m.obj_id, m.codec, m.direction
+                    );
+                    return Ok(Err(DecodeError::Refused));
+                };
+                self.insert(m.obj_id, ObjHandle::VideoSession(session))
             }
             RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
                 self.decode_pipeline(device, message)

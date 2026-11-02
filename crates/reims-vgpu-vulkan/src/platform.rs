@@ -242,6 +242,17 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
     DEVICE.get_or_init(|| device)
 }
 
+/// The device extensions every device enables where it has them, for the video-decode queue's
+/// decodes ([`device_options`]): Vulkan Video's H.264 decode, and `VK_KHR_synchronization2`, whose
+/// commands the decodes record and submit with, core only from Vulkan 1.3, above the runtime's
+/// instance.
+pub const VIDEO_DECODE_EXTENSIONS: [&std::ffi::CStr; 4] = [
+    c"VK_KHR_video_queue",
+    c"VK_KHR_video_decode_queue",
+    c"VK_KHR_video_decode_h264",
+    c"VK_KHR_synchronization2",
+];
+
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
@@ -257,8 +268,15 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
-/// those below the least severity the log takes ([`crate::answer::least_severity`]). One set,
-/// so the runtime keeps one device per physical device across `open_device` and every other open.
+/// those below the least severity the log takes ([`crate::answer::least_severity`]), and a
+/// video-decode queue of the caller's, with the extensions its decodes use where the device has
+/// them ([`VIDEO_DECODE_EXTENSIONS`]). One set, so the runtime keeps one device per physical
+/// device across `open_device` and every other open.
+///
+/// **The video-decode queue** is the reims-graphics device's hardware video's (reims-vgpu's
+/// `platform::vulkan::graphics_video`), which alone submits to it. A device without a
+/// video-decode family is made all the same, with no such queue, and so is one without the
+/// extensions.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
@@ -321,6 +339,10 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
                 rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
+        options.extra_queues = vec![ash::vk::QueueFlags::VIDEO_DECODE_KHR];
+        options.optional_device_extensions = (VIDEO_DECODE_EXTENSIONS.iter())
+            .map(|&name| name.to_owned())
+            .collect();
         options
     });
     &OPTIONS

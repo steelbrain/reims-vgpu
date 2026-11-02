@@ -65,13 +65,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
-    RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING,
-    RGFX_OP_GROUP_RENDER, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_USE,
-    RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
+    RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE,
+    RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER, RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT,
+    RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
+    RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
     RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_MAX_SAMPLE_POSITIONS,
     RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
-    RgfxOpHeader, RgfxOpSurfaceUse, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
-    RgfxRenderPassSamplePositions, op_group,
+    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
+    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, op_group,
 };
 use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
@@ -98,8 +99,8 @@ use zerocopy::FromBytes;
 
 use super::super::completion::{cb_complete, cb_failed};
 use super::{
-    DecodeError, Drain, GraphicsDecoder, ObjHandle, SubmittedSink, blit, compute, op_fault, read,
-    refusing, render,
+    DecodeError, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, SubmittedSink, blit,
+    compute, op_fault, read, refusing, render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -327,6 +328,8 @@ enum OpenEncoder<P: Platform> {
     Render(P::RenderEncoder),
     Compute(P::ComputeEncoder),
     Blit(P::BlitEncoder),
+    /// A video encoder: its session's work, placed in the command buffer itself.
+    Video(Arc<dyn GraphicsVideoSession<P>>),
 }
 
 /// Whether Metal takes `positions` as a pass's sample positions, where `makes` answers whether
@@ -787,6 +790,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                         return Err(unknown_op(h.tag));
                     }
                 }
+                RGFX_OP_GROUP_VIDEO => {
+                    let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
+                        return Err(no_encoder(h.tag, "video"));
+                    };
+                    if !video::decode_op(h.tag, body, self, session, cb)? {
+                        return Err(unknown_op(h.tag));
+                    }
+                }
                 _ => return Err(unknown_op(h.tag)),
             }
             ops = &ops[len..];
@@ -835,10 +846,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .ok_or_else(|| op_fault("the blit encoder was nil"))?;
                 *encoder = Some(OpenEncoder::Blit(enc));
             }
+            RGFX_OP_ENCODER_BEGIN_VIDEO => {
+                already_open(encoder, "ENCODER_BEGIN_VIDEO")?;
+                let pass = RgfxOpVideoPass::read_from_prefix(body)
+                    .map(|(pass, _)| pass)
+                    .map_err(|_| op_fault("ENCODER_BEGIN_VIDEO: body too short"))?;
+                *encoder = Some(OpenEncoder::Video(
+                    self.require_video_session(pass.session_obj_id)?,
+                ));
+            }
             RGFX_OP_ENCODER_END => match encoder.take() {
                 Some(OpenEncoder::Render(enc)) => enc.encode(ON, RenderCmd::EndEncoding)?,
                 Some(OpenEncoder::Compute(enc)) => enc.encode(ON, ComputeCmd::EndEncoding)?,
                 Some(OpenEncoder::Blit(enc)) => enc.encode(ON, BlitCmd::EndEncoding)?,
+                Some(OpenEncoder::Video(_)) => {}
                 None => return Err(op_fault("ENCODER_END with no open encoder")),
             },
             RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT => {
@@ -1027,6 +1048,7 @@ fn end_abandoned<P: Platform>(open: OpenEncoder<P>) {
         OpenEncoder::Render(enc) => enc.encode(ON, RenderCmd::EndEncoding),
         OpenEncoder::Compute(enc) => enc.encode(ON, ComputeCmd::EndEncoding),
         OpenEncoder::Blit(enc) => enc.encode(ON, BlitCmd::EndEncoding),
+        OpenEncoder::Video(_) => Ok(()),
     });
 }
 
@@ -1086,20 +1108,25 @@ mod tests {
         RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetScissorRect,
         RgfxOpSetVertexBuffer, RgfxOpSetViewport,
     };
+    use reims_graphics::ops::video::{RGFX_OP_VIDEO_DECODE_H264, RgfxVideoOpDecodeH264};
     use reims_graphics::wire::{
         RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE,
         RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-        RGFX_CMD_TEXTURE_CREATE, RGFX_EVT_CB_COMPLETE, RgfxBufferCreate, RgfxCbComplete,
-        RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxSharedEventSetValue,
-        RgfxTextureCreate, RgfxTextureDescriptor,
+        RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_VIDEO_SESSION_CREATE,
+        RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS, RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE,
+        RgfxBufferCreate, RgfxCbComplete, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
+        RgfxSharedEventSetValue, RgfxTextureCreate, RgfxTextureDescriptor,
+        RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
     use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
     use reims_vgpu_core::platform::values::AttachmentState;
     use reims_vgpu_core::sync::Mutex;
     use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_core::testkit::calllog::Arg;
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
+    use super::super::{GraphicsVideo, H264Decode, VideoPlane};
     use super::*;
 
     /// One op: its header then its body, `len` the whole op.
@@ -1288,6 +1315,195 @@ mod tests {
         let mut msg = m.as_bytes().to_vec();
         msg.extend_from_slice(ops);
         msg
+    }
+
+    /// What a fake host's video was handed: each decode's access unit (offset, size), its
+    /// parameter sets and its planes (offset, bytes per row, width, height).
+    #[derive(Default)]
+    struct VideoSeen {
+        decodes: Mutex<Vec<(u64, u64, Vec<u8>, [u64; 4], [u64; 4])>>,
+    }
+
+    /// A fake host's video of H.264 decode alone, recording into its [`VideoSeen`]; each of its
+    /// sessions' decodes answers the next value of the session's event, from 1.
+    struct FakeVideo(Arc<VideoSeen>, <FakePlatform as Platform>::Device);
+
+    /// A session of [`FakeVideo`]'s.
+    struct FakeSession {
+        seen: Arc<VideoSeen>,
+        event: <FakePlatform as Platform>::SharedEvent,
+        decodes: AtomicUsize,
+    }
+
+    impl GraphicsVideo<FakePlatform> for FakeVideo {
+        fn caps(&self) -> Vec<reims_graphics::wire::RgfxVideoCodecCaps> {
+            Vec::new()
+        }
+        fn session(
+            &self,
+            codec: u32,
+            direction: u32,
+        ) -> Option<Arc<dyn GraphicsVideoSession<FakePlatform>>> {
+            if codec != RGFX_VIDEO_CODEC_H264 || direction != RGFX_VIDEO_DECODE {
+                return None;
+            }
+            Some(Arc::new(FakeSession {
+                seen: Arc::clone(&self.0),
+                event: self.1.new_shared_event()?,
+                decodes: AtomicUsize::new(0),
+            }))
+        }
+    }
+
+    impl GraphicsVideoSession<FakePlatform> for FakeSession {
+        fn event(&self) -> &<FakePlatform as Platform>::SharedEvent {
+            &self.event
+        }
+
+        fn decode_h264(&self, d: &H264Decode<'_, FakePlatform>) -> RaiseResult<u64> {
+            let plane =
+                |p: &VideoPlane<'_, FakePlatform>| [p.offset, p.bytes_per_row, p.width, p.height];
+            self.seen.decodes.lock().push((
+                d.offset,
+                d.size,
+                d.parameter_sets.to_vec(),
+                plane(&d.luma),
+                plane(&d.chroma),
+            ));
+            Ok(self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1)
+        }
+    }
+
+    /// A texture over IOSurface 0x99's plane `plane`, in buffer 6, at `offset` with rows of 64
+    /// bytes, `width` by `height` pixels of `pixel_format`.
+    fn surface_plane_texture(
+        obj_id: u64,
+        plane: u32,
+        pixel_format: u32,
+        offset: u64,
+        width: u32,
+        height: u32,
+    ) -> RgfxTextureFromIOSurface {
+        RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: size_of::<RgfxTextureFromIOSurface>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            resource_id: obj_id,
+            buffer_obj_id: 6,
+            offset,
+            bytes_per_row: 64,
+            iosurface_id: 0x99,
+            plane,
+            desc: RgfxTextureDescriptor {
+                pixel_format,
+                texture_type: 2,
+                width,
+                height,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 3,
+                ..RgfxTextureDescriptor::default()
+            },
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
+        }
+    }
+
+    /// A video encoder hands its session each decode with the objects it names resolved: the
+    /// access unit's place in its buffer, the parameter sets that follow the op's body, and where
+    /// each plane's texture lies in the surface's buffer; the command buffer then waits for the
+    /// session's event to reach the value the decode answers, before its commit. A session the
+    /// host has no video for is refused.
+    #[test]
+    fn a_video_encoder_hands_its_session_each_decode() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let session = RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 40,
+            codec: RGFX_VIDEO_CODEC_H264,
+            direction: RGFX_VIDEO_DECODE,
+        };
+        assert_eq!(
+            dec.decode(&device, session.as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        assert_eq!(dec.decode(&device, session.as_bytes()).unwrap(), Ok(()));
+
+        // The surface's buffer, and a texture over each of its two planes.
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+
+        let sets = [0u8, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68];
+        let mut decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 16,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            parameter_sets_size: sets.len() as u32,
+            ..RgfxVideoOpDecodeH264::default()
+        }
+        .as_bytes()
+        .to_vec();
+        decode.extend_from_slice(&sets);
+        decode.resize(decode.len().next_multiple_of(8), 0);
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes());
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, &decode));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(100, 1, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            *seen.decodes.lock(),
+            [(
+                16,
+                100,
+                sets.to_vec(),
+                [32, 64, 64, 16],
+                [32 + 64 * 16, 64, 32, 8]
+            )]
+        );
+        let calls = p.call_log().calls();
+        let sels: Vec<&str> = calls
+            .iter()
+            .map(|c| c.sel)
+            .filter(|&sel| sel == "encodeWaitForEvent:value:" || sel == "commit")
+            .collect();
+        assert_eq!(sels, ["encodeWaitForEvent:value:", "commit"]);
+        let wait = calls
+            .iter()
+            .find(|c| c.sel == "encodeWaitForEvent:value:")
+            .unwrap();
+        assert_eq!(wait.args.get(1), Some(&Arg::U64(1)));
     }
 
     /// A command buffer opens a render encoder for its pass, sends each reference

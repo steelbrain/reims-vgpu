@@ -39,9 +39,10 @@ use reims_graphics::wire::{
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_PAGES,
     RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
-    RgfxSamplerState, RgfxSurfacePages,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_VERSION,
+    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState,
+    RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -87,6 +88,11 @@ mod present;
 mod sink;
 #[cfg(feature = "vulkan")]
 mod vulkan;
+
+#[cfg(feature = "vulkan")]
+pub(crate) use vulkan::graphics_video as vulkan_graphics_video;
+
+pub use decode::{GraphicsVideo, GraphicsVideoSession, H264Decode, VideoPlane};
 
 /// Raises MSI-X vector `vector`: the device's interrupt.
 pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
@@ -217,6 +223,21 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The processes read the features from the device info, as no register is theirs.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
+            // The host's hardware video, whose codecs the video caps after the device info list
+            // for the guest's video driver.
+            if let Some(video) = platform.graphics_video(&gpu_device) {
+                let mut caps = RgfxVideoCaps {
+                    version: RGFX_VIDEO_CAPS_VERSION,
+                    ..RgfxVideoCaps::default()
+                };
+                for (slot, codec) in caps.codecs.iter_mut().zip(video.caps()) {
+                    *slot = codec;
+                    caps.codec_count += 1;
+                }
+                debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
+                region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
+                decoder.set_video(video);
+            }
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),
