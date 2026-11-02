@@ -350,10 +350,12 @@ RGFX_LOG_UNRECOGNIZED
 	id<MTLLibrary> _shadow;                   // Metal's own over _source, made on first use
 	BOOL _shadowTried;
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
-	std::mutex _airLock; // guards _air
+	std::mutex _airLock; // guards _air and _visible
 	// Each entry point's arguments read from its bitcode in `_source`, by name, once each: null
 	// where they did not read.
 	std::map<std::string, std::shared_ptr<const RgfxAirFunction>> _air;
+	// Each visible function's signature read likewise; null where it did not read.
+	std::map<std::string, std::shared_ptr<const RgfxAirVisible>> _visible;
 }
 
 // The host drops the library's id as the app lets it go. Its functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
@@ -492,6 +494,8 @@ static bool rgfxMade(uint32_t status)
 		if (entry->type == MTLFunctionTypeVertex || entry->type == MTLFunctionTypeFragment ||
 		    entry->type == MTLFunctionTypeKernel)
 			[fn rgfxSetAirFunction:[self rgfxAirFunctionNamed:entry->name]];
+		else if (entry->type == MTLFunctionTypeVisible)
+			[fn rgfxSetAirVisible:[self rgfxAirVisibleNamed:entry->name]];
 	}
 	return fn;
 }
@@ -504,6 +508,41 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	return logged.insert(name).second;
 }
 
+// Reads the module the library holds for the function `name`, from the bytes it was made from,
+// with `read`; false where the library kept no bytes (one Metal's link or stitching made), with
+// `*why` null, or where it holds no module for the function or `read` says false, with `*why`
+// saying so.
+- (bool)rgfxReadModuleOf:(const std::string &)name
+                    with:(bool (^)(const uint8_t *bitcode, size_t size))read
+                     why:(const char **)why
+{
+	*why = nullptr;
+	dispatch_data_t source = nil;
+	{
+		std::lock_guard<std::mutex> shadowHold(_shadowLock);
+		source = _source;
+	}
+	if (source == nil)
+		return false;
+	const void *mapped = nullptr;
+	size_t size = 0;
+	dispatch_data_t map = dispatch_data_create_map(source, &mapped, &size);
+	// The library was made from a universal .metallib's AIR slice; the bytes kept are whole.
+	const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
+	rgfxMetallibAirSlice(bytes, size);
+	const uint8_t *bitcode = nullptr;
+	size_t bitcodeSize = 0;
+	if (map == nil || !rgfxMetallibBitcode(bytes, size, name, &bitcode, &bitcodeSize)) {
+		*why = "the library holds no bitcode for it";
+		return false;
+	}
+	if (!read(bitcode, bitcodeSize)) {
+		*why = "its module did not read";
+		return false;
+	}
+	return true;
+}
+
 // The arguments of the entry point `name`, read from its bitcode in the bytes the library was
 // made from, once: null where the library kept no bytes (one Metal's link or stitching made), or
 // they do not read, so which textures the function writes is unknown.
@@ -513,44 +552,62 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	auto known = _air.find(name);
 	if (known != _air.end())
 		return known->second;
-	dispatch_data_t source = nil;
-	{
-		std::lock_guard<std::mutex> shadowHold(_shadowLock);
-		source = _source;
-	}
+	__block std::vector<RgfxAirFunction> read;
+	const char *why = nullptr;
 	std::shared_ptr<const RgfxAirFunction> air;
-	if (source != nil) {
-		const void *mapped = nullptr;
-		size_t size = 0;
-		dispatch_data_t map = dispatch_data_create_map(source, &mapped, &size);
-		// The library was made from a universal .metallib's AIR slice; the bytes kept are whole.
-		const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
-		rgfxMetallibAirSlice(bytes, size);
-		const uint8_t *bitcode = nullptr;
-		size_t bitcodeSize = 0;
-		std::vector<RgfxAirFunction> read;
-		const char *why = nullptr;
-		if (map == nil || !rgfxMetallibBitcode(bytes, size, name, &bitcode, &bitcodeSize))
-			why = "the library holds no bitcode for it";
-		else if (!rgfxReadAirFunctions(bitcode, bitcodeSize, read))
-			why = "its module did not read";
-		else {
-			for (RgfxAirFunction &f : read) {
-				if (f.name == name) {
-					air = std::make_shared<const RgfxAirFunction>(std::move(f));
-					break;
-				}
+	if ([self rgfxReadModuleOf:name
+	                      with:^bool(const uint8_t *bitcode, size_t size) {
+		                      return rgfxReadAirFunctions(bitcode, size, read);
+	                      }
+	                       why:&why]) {
+		for (RgfxAirFunction &f : read) {
+			if (f.name == name) {
+				air = std::make_shared<const RgfxAirFunction>(std::move(f));
+				break;
 			}
-			if (air == nullptr)
-				why = "its module declares no such entry point";
 		}
-		if (air == nullptr && rgfxAirUnreadFirstLog(name))
-			NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
-			      @"where their usage has ShaderWrite (logged once a process)",
-			      name.c_str(), why);
+		if (air == nullptr)
+			why = "its module declares no such entry point";
 	}
+	if (air == nullptr && why != nullptr && rgfxAirUnreadFirstLog(name))
+		NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
+		      @"where their usage has ShaderWrite (logged once a process)",
+		      name.c_str(), why);
 	_air.emplace(name, air);
 	return air;
+}
+
+// The signature of the visible function `name`, read as rgfxAirFunctionNamed: reads arguments:
+// null where it did not read, so Metal's own function answers its reflection.
+- (std::shared_ptr<const RgfxAirVisible>)rgfxAirVisibleNamed:(const std::string &)name
+{
+	std::lock_guard<std::mutex> hold(_airLock);
+	auto known = _visible.find(name);
+	if (known != _visible.end())
+		return known->second;
+	__block std::vector<RgfxAirVisible> read;
+	const char *why = nullptr;
+	std::shared_ptr<const RgfxAirVisible> visible;
+	if ([self rgfxReadModuleOf:name
+	                      with:^bool(const uint8_t *bitcode, size_t size) {
+		                      return rgfxReadAirVisible(bitcode, size, read);
+	                      }
+	                       why:&why]) {
+		for (RgfxAirVisible &v : read) {
+			if (v.name == name) {
+				visible = std::make_shared<const RgfxAirVisible>(std::move(v));
+				break;
+			}
+		}
+		if (visible == nullptr)
+			why = "its module lists no such visible function";
+	}
+	if (visible == nullptr && why != nullptr && rgfxAirUnreadFirstLog(name))
+		NSLog(@"RGFX: %s: no signature read (%s): Metal's own function answers its reflection "
+		      @"(logged once a process)",
+		      name.c_str(), why);
+	_visible.emplace(name, visible);
+	return visible;
 }
 
 // The NSError Metal answers for a name the library does not hold.

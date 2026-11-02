@@ -2255,6 +2255,120 @@ void test_stitched_libraries_in_archives()
 	drain();
 }
 
+// A visible function answers its reflection from its signature in its AIR module
+// (RgfxReflection.h), as Metal's own function on a device with a compiler does, and asks no shadow
+// for it: over tests/air_arguments.metal's stitchable functions, each return type and argument
+// is equal to Metal's own (its -isEqual:, both ways), of the same classes, and -bindings is
+// -arguments' object, made once. A visible function that is not stitchable answers nil and no
+// arguments. Where the signature has a type the reader does not know, the shadow answers, and the
+// library's other functions still answer their own. tools/reflection_check.mm compares them
+// getter by getter on a device.
+void test_stitchable_reflection_from_air()
+{
+	Fixture fx(0x80000); // the library's bytes fit, twice
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto library = [&](NSData *data) {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:data.bytes
+		                                         length:data.length
+		                                            key:nullptr
+		                                         device:nil
+		                                     serializer:&fx.ser
+		                                         status:&status];
+		[lib rgfxSetSource:dispatch_data_create(data.bytes, data.length, nil, ^{
+			     (void)data;
+		     })
+		       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			       return nil;
+		       }];
+		return lib;
+	};
+	RgfxLibrary *lib = library(bytes);
+	id<MTLLibrary> genuine = [metal newLibraryWithData:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		                                (void)bytes;
+	                                }) error:nil];
+	CHECK(lib != nil && genuine != nil);
+	auto ask = [](id object, NSString *member) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto number = [](id object, NSString *member) {
+		return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto same = [](id ours, id theirs) {
+		return ours == nil ? theirs == nil
+		                   : theirs != nil && [ours class] == [theirs class] && [ours isEqual:theirs] &&
+		                         [theirs isEqual:ours];
+	};
+	unsigned compared = 0;
+	for (NSString *name in genuine.functionNames) {
+		id<MTLFunction> theirs = [genuine newFunctionWithName:name];
+		if (theirs.functionType != MTLFunctionTypeVisible)
+			continue;
+		RgfxFunction *fn = (RgfxFunction *)[lib newFunctionWithName:name];
+		NSArray *arguments = ask(fn, @"arguments"), *metals = ask(theirs, @"arguments");
+		CHECK(arguments != nil && metals != nil && arguments.count == metals.count);
+		for (NSUInteger i = 0; i < arguments.count && i < metals.count; i++)
+			CHECK(same(arguments[i], metals[i]));
+		CHECK(same(ask(fn, @"returnType"), ask(theirs, @"returnType")));
+		CHECK(ask(fn, @"bindings") == arguments && ask(fn, @"arguments") == arguments);
+		CHECK(ask(fn, @"returnType") == ask(fn, @"returnType"));
+		CHECK([fn rgfxShadow] == nil); // no shadow made to answer them
+		compared++;
+	}
+	CHECK(compared == 9);
+
+	// Field by field, what Core Image reads among them: the return's data type, and each
+	// argument's name, binding type, and type's data type and name.
+	RgfxFunction *sigStruct = (RgfxFunction *)[lib newFunctionWithName:@"sig_struct"];
+	MTLStructType *pair = ask(sigStruct, @"returnType");
+	CHECK([pair isKindOfClass:[MTLStructType class]] && pair.dataType == MTLDataTypeStruct &&
+	      [ask(pair, @"typeName") isEqualToString:@"SigPair"] && pair.members.count == 3);
+	if (pair.members.count == 3) {
+		CHECK([pair.members[0].name isEqualToString:@"xy"] && pair.members[0].offset == 0 &&
+		      pair.members[0].dataType == MTLDataTypeFloat2);
+		CHECK([pair.members[2].name isEqualToString:@"n"] && pair.members[2].offset == 12 &&
+		      pair.members[2].dataType == MTLDataTypeInt);
+	}
+	NSArray *structArguments = ask(sigStruct, @"arguments");
+	CHECK(structArguments.count == 5);
+	if (structArguments.count == 5) {
+		id o = structArguments[0];
+		MTLStructType *outer = ask(o, @"dataTypeDescription");
+		CHECK([ask(o, @"name") isEqualToString:@"o"] && number(o, @"type") == 29 &&
+		      [ask(outer, @"typeName") isEqualToString:@"SigOuter"]);
+		// A struct field's struct type is nameless (measured, as Metal's).
+		CHECK(outer.members.count == 3 && outer.members[0].structType != nil &&
+		      [ask(outer.members[0].structType, @"typeName") isEqualToString:@""] &&
+		      outer.members[0].structType.members.count == 3);
+		id i = structArguments[1];
+		CHECK([ask(i, @"name") isEqualToString:@"i"] && number(i, @"type") == 18 &&
+		      number(ask(i, @"dataTypeDescription"), @"dataType") == MTLDataTypeInt);
+	}
+	CHECK(number(ask([lib newFunctionWithName:@"sig_void"], @"returnType"), @"dataType") == 61);
+	RgfxFunction *doubled = (RgfxFunction *)[lib newFunctionWithName:@"doubled"];
+	NSArray *none = ask(doubled, @"arguments");
+	CHECK(ask(doubled, @"returnType") == nil && none != nil && none.count == 0 && ask(doubled, @"bindings") == none);
+
+	// A signature with a type the reader does not know: the shadow answers (none here: nil).
+	NSMutableData *spoilt = [bytes mutableCopy];
+	const char kind[] = "air.sampler_type";
+	uint8_t *b = static_cast<uint8_t *>(spoilt.mutableBytes);
+	for (uint8_t *at = b; (at = std::search(at, b + spoilt.length, kind, kind + sizeof(kind) - 1)) != b + spoilt.length;
+	     at++)
+		at[sizeof(kind) - 2] = '_';
+	RgfxLibrary *other = library(spoilt);
+	RgfxFunction *unknown = (RgfxFunction *)[other newFunctionWithName:@"sig_fields"];
+	CHECK(other != nil && unknown != nil);
+	CHECK(ask(unknown, @"arguments") == nil && ask(unknown, @"returnType") == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxFunction class], NSSelectorFromString(@"arguments")));
+	CHECK(same(ask([other newFunctionWithName:@"sig_struct"], @"returnType"), ask(sigStruct, @"returnType")));
+}
+
 // A function answers Metal's private members from its shadow, Metal's own function of the same
 // entry point, made of its library's on first use: a stitchable function's bindings and return
 // type, a kernel's nils, and each one's AIR. One made with constant values has no shadow: it
@@ -8778,6 +8892,7 @@ int main(int argc, char **argv)
 		test_source_compiles_through_metals_frontend();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
+		test_stitchable_reflection_from_air();
 		test_library_members_as_metal();
 		test_command_graph();
 		test_parallel_render_encoder();

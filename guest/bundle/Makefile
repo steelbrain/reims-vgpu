@@ -27,6 +27,10 @@
 #                   only needs to COMPILE off the guest, not run).
 #   make sweep      the guest's correctness sweep of the system frameworks on the device
 #                   (tools/sweep), build/sweep-x86_64; ARCH=arm64 for an Apple-silicon Mac.
+#   make reflection-check
+#                   the stitchable functions' reflection the bundle builds against Metal's own,
+#                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
+#                   build/air_arguments.metallib.
 #   make clean      remove build/
 #
 # Everything lands in build/, never committed.
@@ -270,7 +274,21 @@ $(SWEEPBIN): $(SWEEP_SRCS) $(wildcard tools/sweep/*.h) Makefile
 	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
 		-Wall -Wextra -Werror -Wno-unused-parameter $(SWEEP_SRCS) $(SWEEP_FW) -o $@
 
+# --- the stitchable reflection's check against Metal's own (tools/reflection_check.mm) ---------
+# One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
+# run on a real device, never in `make test`: it compares with Metal's own compiler's answers.
+# Its library is the AIR reader's (AIR_LIB).
+REFLECTBIN = $(BUILD)/reflection_check-$(ARCH)
+
+reflection-check: $(REFLECTBIN) $(AIR_LIB)
+
+$(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArguments.cpp $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) -mmacosx-version-min=14.0 -x objective-c++ \
+		tools/reflection_check.mm src/RgfxReflection.mm -x c++ src/RgfxAirArguments.cpp \
+		-framework Foundation -framework Metal -o $@
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep clean
+.PHONY: all test bundle package sweep reflection-check clean

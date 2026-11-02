@@ -127,6 +127,13 @@ typedef struct {
 /// The arguments `rgfxSetAirFunction:` set; null where the library could not read them, so
 /// which textures the function writes is unknown.
 - (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunction;
+/// Sets a visible function's signature, as its AIR module declares it: the library reads it from
+/// the bitcode its .metallib holds for the function (RgfxAirArguments.hpp). The function then
+/// answers -returnType, -arguments and -bindings from it (RgfxReflection.h) where Metal's own
+/// function would make them with its device's compiler, which ours does not have: nil and an
+/// empty array for one that is not stitchable; Metal's own function answers where it is null, or
+/// of a type the reader does not know.
+- (void)rgfxSetAirVisible:(std::shared_ptr<const RgfxAirVisible>)visible;
 #endif
 
 /// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's

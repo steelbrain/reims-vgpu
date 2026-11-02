@@ -9,6 +9,7 @@
 #import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
+#import "RgfxReflection.h"
 
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -56,6 +57,11 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	id<MTLFunction> _shadow;                      // Metal's own, for Core Image's link
 	std::mutex _shadowLock;                       // guards _shadow, set once in use
 	std::shared_ptr<const RgfxAirFunction> _air;  // its arguments, from the library's bitcode
+	std::shared_ptr<const RgfxAirVisible> _visible; // its signature, where it is a visible one
+	std::once_flag _reflected;                      // the two below, made once from _visible
+	id _returnType;                                 // what -returnType answers
+	NSArray *_arguments;                            // what -arguments and -bindings answer
+	BOOL _reflectedHere;                            // whether the two above are the answers
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -292,11 +298,53 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 // nil arguments, imported libraries and return type for a plain library function, the bindings
 // and the type of a stitchable one, the declared constants of one made with no values for them,
 // and the function's AIR as its bitcode data. The shadow, Metal's own function of the same entry
-// point, answers them here.
+// point, answers them here, but a visible function's reflection, which Metal makes with its
+// device's compiler (RgfxReflection.h): Metal's own function on our device has none, and answers
+// nil.
+
+// A visible function's reflection, made once from its signature: false where Metal's own
+// function answers it (no signature read, or none Metal's classes could be made of, logged once a
+// process).
+- (BOOL)rgfxReflected
+{
+	std::call_once(_reflected, [self] {
+		if (_visible == nullptr || _visible->signature == RgfxAirVisible::Signature::Unknown)
+			return;
+		if (_visible->signature == RgfxAirVisible::Signature::None) {
+			// A visible function that is not stitchable (measured: macOS 27, M3 Max; macOS 26.7.1,
+			// AMD Radeon Pro 5300M).
+			_arguments = @[];
+			_reflectedHere = YES;
+			return;
+		}
+		NSString *why = nil;
+		id returnType = nil;
+		NSArray *arguments = nil;
+		if (!rgfxStitchableReflection(*_visible, &returnType, &arguments, &why)) {
+			static std::once_flag logged;
+			std::call_once(logged, [&] {
+				NSLog(@"RGFX: %s: no reflection made (%@): Metal's own function answers it (logged "
+				      @"once a process)",
+				      _name.c_str(), why);
+			});
+			return;
+		}
+		_returnType = returnType;
+		_arguments = arguments;
+		_reflectedHere = YES;
+	});
+	return _reflectedHere;
+}
 
 - (NSArray *)arguments
 {
-	return [self rgfxShadowAnswer:_cmd];
+	return [self rgfxReflected] ? _arguments : [self rgfxShadowAnswer:_cmd];
+}
+
+// The same object as -arguments (measured, as -arguments).
+- (NSArray *)bindings
+{
+	return [self rgfxReflected] ? _arguments : [self rgfxShadowAnswer:_cmd];
 }
 
 - (NSArray *)importedLibraries
@@ -306,7 +354,7 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 
 - (id)returnType
 {
-	return [self rgfxShadowAnswer:_cmd];
+	return [self rgfxReflected] ? _returnType : [self rgfxShadowAnswer:_cmd];
 }
 
 - (id)bitcodeData
@@ -371,6 +419,11 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 - (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunction
 {
 	return _air;
+}
+
+- (void)rgfxSetAirVisible:(std::shared_ptr<const RgfxAirVisible>)visible
+{
+	_visible = std::move(visible);
 }
 
 // The host lays out the argument buffer the function takes at `bufferIndex` from the library's

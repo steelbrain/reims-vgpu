@@ -97,6 +97,75 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable id<MTLFunction>)newExternFunctionWithName:(NSString *)name;
 - (nullable NSData *)libraryDataContents;
 @end
+
+// measured: macOS 27 (M3 Max) and macOS 26.7.1 (AMD Radeon Pro 5300M) Metal.framework — the
+// initialisers of Metal's reflection classes (the runtime's method lists, with their type
+// encodings) that RgfxReflection.mm makes a stitchable function's reflection with:
+//   MTLTypeInternal                  initWithDataType:                         @24@0:8Q16
+//   MTLStructTypeInternal            initWithMembers:count:typeName:           @40@0:8^@16Q24@32
+//   MTLArrayTypeInternal             initWithArrayLength:elementType:stride:pixelFormat:aluType:
+//                                    details:                                  @64@0:8Q16Q24Q32Q40Q48@56
+//   MTLPointerTypeInternal           initWithElementType:elementTypeDescription:access:alignment:
+//                                    dataSize:elementIsIndirectArgumentBuffer:isConstantBuffer:
+//                                                                              @64@0:8Q16@24Q32Q40Q48B56B60
+//   MTLTextureReferenceTypeInternal  initWithDataType:textureType:access:isDepthTexture:
+//                                                                              @44@0:8Q16Q24Q32B40
+//   MTLStructMemberInternal          initWithName:offset:dataType:pixelFormat:aluType:
+//                                    indirectArgumentIndex:render_target:raster_order_group:details:
+//                                                                              @88@0:8@16Q24Q32Q40Q48Q56Q64Q72@80
+//   MTLBindingInternal               initWithName:type:access:index:active:arrayLength:
+//                                    typeDescription:                          @68@0:8@16Q24Q32Q40B48Q52@60
+//   MTLTextureBindingInternal        initWithName:access:isActive:locationIndex:arraySize:dataType:
+//                                    textureType:isDepthTexture:               @72@0:8@16Q24B32Q36Q44Q52Q60B68
+// What each parameter holds is read from the objects Metal's own compiler makes, getter by getter
+// (tools/reflection_check.mm); `details` is the nested type object.
+@protocol RgfxMetalReflectionInitialisers
+- (nullable instancetype)initWithDataType:(NSUInteger)dataType;
+- (nullable instancetype)initWithMembers:(__unsafe_unretained id _Nonnull const *_Nullable)members
+                                   count:(NSUInteger)count
+                                typeName:(nullable NSString *)typeName;
+- (nullable instancetype)initWithArrayLength:(NSUInteger)arrayLength
+                                 elementType:(NSUInteger)elementType
+                                      stride:(NSUInteger)stride
+                                 pixelFormat:(NSUInteger)pixelFormat
+                                     aluType:(NSUInteger)aluType
+                                     details:(nullable id)details;
+- (nullable instancetype)initWithElementType:(NSUInteger)elementType
+                      elementTypeDescription:(nullable id)elementTypeDescription
+                                      access:(NSUInteger)access
+                                   alignment:(NSUInteger)alignment
+                                    dataSize:(NSUInteger)dataSize
+             elementIsIndirectArgumentBuffer:(BOOL)elementIsIndirectArgumentBuffer
+                            isConstantBuffer:(BOOL)isConstantBuffer;
+- (nullable instancetype)initWithDataType:(NSUInteger)dataType
+                              textureType:(NSUInteger)textureType
+                                   access:(NSUInteger)access
+                           isDepthTexture:(BOOL)isDepthTexture;
+- (nullable instancetype)initWithName:(NSString *)name
+                               offset:(NSUInteger)offset
+                             dataType:(NSUInteger)dataType
+                          pixelFormat:(NSUInteger)pixelFormat
+                              aluType:(NSUInteger)aluType
+                indirectArgumentIndex:(NSUInteger)indirectArgumentIndex
+                        render_target:(NSUInteger)renderTarget
+                   raster_order_group:(NSUInteger)rasterOrderGroup
+                              details:(nullable id)details;
+- (nullable instancetype)initWithName:(NSString *)name
+                                 type:(NSUInteger)type
+                               access:(NSUInteger)access
+                                index:(NSUInteger)index
+                               active:(BOOL)active
+                          arrayLength:(NSUInteger)arrayLength
+                      typeDescription:(nullable id)typeDescription;
+- (nullable instancetype)initWithName:(NSString *)name
+                               access:(NSUInteger)access
+                             isActive:(BOOL)isActive
+                        locationIndex:(NSUInteger)locationIndex
+                            arraySize:(NSUInteger)arraySize
+                             dataType:(NSUInteger)dataType
+                          textureType:(NSUInteger)textureType
+                       isDepthTexture:(BOOL)isDepthTexture;
+@end
 NS_ASSUME_NONNULL_END
 
 // measured: macOS 27 Metal.framework — the private device SPI our MTLDevice must
