@@ -10,7 +10,11 @@
 // argument's node starts with its position and its kind (`air.buffer`, `air.indirect_buffer` for
 // an argument buffer, `air.texture`, `air.sampler`), then names its binding with
 // `air.location_index` and two integers, the index and the count (an array's length), and its
-// access with one of `air.read`, `air.write`, `air.read_write` and `air.sample`. Read from modules
+// access with one of `air.read`, `air.write`, `air.read_write` and `air.sample`. An argument
+// declared under a function constant puts `air.function_constant` and the constant's node ahead
+// of its kind; it is read as the function's whatever the constant's value. A binding of a kind
+// the reader does not know makes the function's answer unknown; stage input attributes, function
+// tables and acceleration structures are named, as bindings of no texture. Read from modules
 // that Apple's Metal compiler built from our own sources (tests/air_arguments.metal), and as
 // LLVM's text form of the same modules prints them.
 //

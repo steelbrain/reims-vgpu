@@ -1,9 +1,12 @@
 // The shaders of air_arguments_test.cpp: entry points of every stage the reader answers for,
 // with binding arguments of each kind and access, arrays of them, argument buffers with and
-// without a written texture, a function constant and a function of no texture. Built into a
-// .metallib by Apple's Metal compiler at test time; never committed.
+// without a written texture, a function constant, arguments declared under function constants,
+// a stage input, a function table and an acceleration structure, and a function of no texture.
+// Built into a .metallib by Apple's Metal compiler at test time; never committed.
+#include <metal_raytracing>
 #include <metal_stdlib>
 using namespace metal;
+using namespace raytracing;
 
 struct WritesOne {
 	texture2d<float, access::write> out [[id(0)]];
@@ -63,4 +66,62 @@ fragment float4 writes_in_fragment(VertexOut in [[stage_in]],
 	float4 c = s.sample(smp, float2(0));
 	w.write(c, uint2(in.p.xy));
 	return c;
+}
+
+constant bool kHasLuma [[function_constant(1)]];
+constant bool kHasChroma [[function_constant(2)]];
+constant bool kHasPacked [[function_constant(3)]];
+
+// A conversion kernel whose planes and output are declared under function constants, among
+// four read buffers: each is its argument whatever the constants' values.
+kernel void conditional_planes(device const uint *rows [[buffer(0)]],
+                               constant uint &width [[buffer(1)]],
+                               constant float4 &matrix [[buffer(2)]],
+                               device const float *offsets [[buffer(3)]],
+                               texture2d<half, access::read> luma [[texture(0), function_constant(kHasLuma)]],
+                               texture2d<half, access::read> chroma
+                                   [[texture(1), function_constant(kHasChroma)]],
+                               texture2d<uint, access::write> packed
+                                   [[texture(2), function_constant(kHasPacked)]],
+                               device float *spill [[buffer(4), function_constant(kHasPacked)]],
+                               uint2 g [[thread_position_in_grid]])
+{
+	float v = float(rows[g.y] + width) * matrix.x + offsets[0];
+	if (kHasLuma)
+		v += float(luma.read(g).x);
+	if (kHasChroma)
+		v += float(chroma.read(g / 2).x);
+	if (kHasPacked) {
+		packed.write(uint4(uint(v)), g);
+		spill[g.x] = v;
+	}
+}
+
+[[visible]] float doubled(float x)
+{
+	return x * 2;
+}
+
+struct Attributes {
+	float4 position [[attribute(0)]];
+};
+
+// Bindings of no texture besides buffers and samplers: a stage input's attribute, a function
+// table and an acceleration structure.
+vertex VertexOut reads_attributes(Attributes in [[stage_in]], constant float4 &scale [[buffer(1)]])
+{
+	VertexOut o;
+	o.p = in.position * scale;
+	return o;
+}
+
+kernel void calls_through_table(device float *out [[buffer(0)]],
+                                visible_function_table<float(float)> table [[buffer(1)]],
+                                instance_acceleration_structure scene [[buffer(2)]],
+                                texture2d<float, access::write> w [[texture(3)]],
+                                uint g [[thread_position_in_grid]])
+{
+	(void)scene;
+	out[g] = table[0](out[g]);
+	w.write(float4(out[g]), uint2(g, 0));
 }

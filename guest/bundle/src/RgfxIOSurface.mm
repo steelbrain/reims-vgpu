@@ -24,6 +24,7 @@
 #include <utility>
 
 #include "RgfxEncoder.hpp"
+#include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -1352,20 +1353,59 @@ void RgfxSurfaceBindings::bind(NSUInteger index, id texture)
 	}
 }
 
+void RgfxSurfaceBindings::resident(id resource)
+{
+	if (resource == nil)
+		return;
+	const bool texture = [resource conformsToProtocol:@protocol(MTLTexture)];
+	if (rgfxSurfaceRoot(resource) == nil &&
+	    !(RgfxMemoryShadow::anyLive() && rgfxShadowOf(resource) != nullptr))
+		return;
+	for (const Resident &r : m_resident) {
+		if (r.resource == resource)
+			return;
+	}
+	m_resident.push_back({resource, texture, false});
+}
+
 void RgfxSurfaceBindings::noteWrites(RgfxEncoder *enc, const RgfxAirFunction *fn)
 {
 	for (Bound &b : m_bound) {
 		if (b.noted) {
 			continue;
 		}
-		const bool writes =
-		    fn != nullptr
-		        ? rgfxAirWritesTexture(*fn, static_cast<uint32_t>(b.index))
-		        : ([(id<MTLTexture>)b.texture usage] & MTLTextureUsageShaderWrite) != 0;
+		bool writes;
+		if (fn != nullptr) {
+			writes = rgfxAirWritesTexture(*fn, static_cast<uint32_t>(b.index));
+		} else {
+			const MTLTextureUsage usage = [(id<MTLTexture>)b.texture usage];
+			writes = usage == MTLTextureUsageUnknown || (usage & MTLTextureUsageShaderWrite) != 0;
+		}
 		if (writes) {
 			rgfxIOSurfaceNoteWrite(enc, b.texture);
 			b.noted = true;
 		}
+	}
+	if (m_resident.empty())
+		return;
+	bool textures = fn == nullptr, buffers = fn == nullptr;
+	if (fn != nullptr) {
+		for (const RgfxAirArgument &a : fn->arguments) {
+			if (a.kind == RgfxAirKind::IndirectBuffer) {
+				buffers = true;
+				textures = textures || a.writesTextures;
+			}
+		}
+	}
+	for (Resident &r : m_resident) {
+		if (r.noted || !(r.texture ? textures : buffers))
+			continue;
+		rgfxIOSurfaceNoteWrite(enc, r.resource);
+		if (enc != nullptr && RgfxMemoryShadow::anyLive()) {
+			if (std::shared_ptr<RgfxMemoryShadow> shadow = rgfxShadowOf(r.resource))
+				enc->noteShadowUse(shadow, true);
+		}
+		r.noted = true;
 	}
 }
 

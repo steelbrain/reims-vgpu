@@ -217,6 +217,14 @@ uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
 	return rgfxNamed(enc, obj);
 }
 
+/// `resource`, used with `usage`, resident in `bindings` where the usage has no Write: a
+/// function may still write it through an argument buffer (RgfxSurfaceBindings::resident).
+void rgfxNoteResident(RgfxSurfaceBindings &bindings, id resource, MTLResourceUsage usage)
+{
+	if ((usage & MTLResourceUsageWrite) == 0)
+		bindings.resident(resource);
+}
+
 /// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
 uint32_t rgfxResourceKind(id<MTLResource> res)
 {
@@ -2429,6 +2437,8 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxResourceBinding e = {};
 	e.obj_id = rgfxUses(_enc, resource, usage);
 	e.kind = rgfxResourceKind(resource);
+	rgfxNoteResident(_vertexSurfaces, resource, usage);
+	rgfxNoteResident(_fragmentSurfaces, resource, usage);
 	_enc->renderUseResources(&e, 1, static_cast<uint64_t>(usage));
 }
 - (void)useResources:(const id<MTLResource> __nonnull[__nonnull])resources
@@ -2439,6 +2449,8 @@ RGFX_LOG_UNRECOGNIZED
 	for (NSUInteger i = 0; i < count; i++) {
 		r[i].obj_id = rgfxUses(_enc, resources[i], usage);
 		r[i].kind = rgfxResourceKind(resources[i]);
+		rgfxNoteResident(_vertexSurfaces, resources[i], usage);
+		rgfxNoteResident(_fragmentSurfaces, resources[i], usage);
 	}
 	_enc->renderUseResources(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
 	                         static_cast<uint64_t>(usage));
@@ -2450,6 +2462,10 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxResourceBinding e = {};
 	e.obj_id = rgfxUses(_enc, resource, usage);
 	e.kind = rgfxResourceKind(resource);
+	if (stages & MTLRenderStageVertex)
+		rgfxNoteResident(_vertexSurfaces, resource, usage);
+	if (stages & MTLRenderStageFragment)
+		rgfxNoteResident(_fragmentSurfaces, resource, usage);
 	_enc->renderUseResourcesStages(&e, 1, static_cast<uint64_t>(usage),
 	                               static_cast<uint64_t>(stages));
 }
@@ -2462,6 +2478,10 @@ RGFX_LOG_UNRECOGNIZED
 	for (NSUInteger i = 0; i < count; i++) {
 		r[i].obj_id = rgfxUses(_enc, resources[i], usage);
 		r[i].kind = rgfxResourceKind(resources[i]);
+		if (stages & MTLRenderStageVertex)
+			rgfxNoteResident(_vertexSurfaces, resources[i], usage);
+		if (stages & MTLRenderStageFragment)
+			rgfxNoteResident(_fragmentSurfaces, resources[i], usage);
 	}
 	_enc->renderUseResourcesStages(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
 	                               static_cast<uint64_t>(usage), static_cast<uint64_t>(stages));
@@ -3192,6 +3212,7 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxComputeResourceRef e = {};
 	e.obj_id = rgfxUses(_enc, resource, usage);
 	e.kind = rgfxResourceKind(resource);
+	rgfxNoteResident(_surfaces, resource, usage);
 	_enc->computeUseResources(&e, 1, static_cast<uint64_t>(usage));
 }
 - (void)useResources:(const id<MTLResource> __nonnull[__nonnull])resources
@@ -3202,6 +3223,7 @@ RGFX_LOG_UNRECOGNIZED
 	for (NSUInteger i = 0; i < count; i++) {
 		r[i].obj_id = rgfxUses(_enc, resources[i], usage);
 		r[i].kind = rgfxResourceKind(resources[i]);
+		rgfxNoteResident(_surfaces, resources[i], usage);
 	}
 	_enc->computeUseResources(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
 	                          static_cast<uint64_t>(usage));

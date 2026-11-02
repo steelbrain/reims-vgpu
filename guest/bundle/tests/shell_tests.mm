@@ -108,8 +108,9 @@ struct Fixture {
 	RgfxIdSpace &ids;
 	RgfxSerializer &ser;
 
-	Fixture()
-	    : ring(*new TestRing(0x8000)),
+	// `ringBytes`: the control ring's, which a library's bytes must fit.
+	explicit Fixture(uint32_t ringBytes = 0x8000)
+	    : ring(*new TestRing(ringBytes)),
 	      writer(*new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID,
 	                                 TestRing::doorbell, nullptr)),
 	      ids(*new RgfxIdSpace()), ser(*new RgfxSerializer(writer, ids))
@@ -1954,7 +1955,7 @@ namespace {
 // kept no bytes has none to give, and a render pipeline's stage with no function binds nothing.
 void test_library_air_arguments()
 {
-	Fixture fx;
+	Fixture fx(0x20000);
 	const char *path = getenv("RGFX_AIR_ARGUMENTS");
 	CHECK(path != nullptr);
 	if (path == nullptr)
@@ -5335,7 +5336,8 @@ void test_no_copy_buffers()
 
 // A no-copy buffer bound to a shader is one the command buffer may write, so its completion
 // writes it back; a texture over it is one only where its usage has ShaderWrite. A bound buffer
-// with no copy of app memory notes nothing beside them.
+// with no copy of app memory notes nothing beside them. One used to read is written back where a
+// kernel after it has an argument buffer, through which it may write it, and not where none has.
 void test_binds_note_shadow_writes()
 {
 	@autoreleasepool {
@@ -5417,6 +5419,49 @@ void test_binds_note_shadow_writes()
 		CHECK(!writtenBack([&](id<MTLComputeCommandEncoder> ce) {
 			[ce setTextures:both withRange:NSMakeRange(0, 2)];
 		}, 0x1020));
+
+		// A kernel of `arguments`, its AIR as read.
+		auto kernel = [&](std::vector<RgfxAirArgument> arguments) {
+			RgfxFunction *fn = [RgfxFunction functionWithLibrary:nil
+			                                                name:@"k"
+			                                           constants:nullptr
+			                                               count:0
+			                                              device:nil
+			                                          serializer:&f.ser];
+			auto air = std::make_shared<RgfxAirFunction>();
+			air->name = "k";
+			air->stage = RgfxAirStage::Kernel;
+			air->arguments = std::move(arguments);
+			[fn rgfxSetAirFunction:air];
+			NSError *err = nil;
+			RgfxComputePipelineState *ps =
+			    [RgfxComputePipelineState computePipelineStateWithFunction:fn
+			                                                       device:nil
+			                                                   serializer:&f.ser
+			                                                        error:&err];
+			CHECK(ps != nil);
+			drainRing(f.control);
+			return ps;
+		};
+		RgfxComputePipelineState *throughArgs =
+		    kernel({{RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, false}});
+		RgfxComputePipelineState *noArgs =
+		    kernel({{RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, false}});
+		const MTLSize one = MTLSizeMake(1, 1, 1);
+		CHECK(writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce useResource:b usage:MTLResourceUsageRead];
+			[ce setComputePipelineState:throughArgs];
+			[ce dispatchThreads:one threadsPerThreadgroup:one];
+		}, 0x30));
+		CHECK(!writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce useResource:b usage:MTLResourceUsageRead];
+			[ce setComputePipelineState:noArgs];
+			[ce dispatchThreads:one threadsPerThreadgroup:one];
+		}, 0x40));
+		CHECK(!writtenBack([&](id<MTLComputeCommandEncoder> ce) {
+			[ce setComputePipelineState:throughArgs];
+			[ce useResource:b usage:MTLResourceUsageRead];
+		}, 0x50));
 		reads = nil;
 		writes = nil;
 		plain = nil;
@@ -7073,9 +7118,11 @@ void test_iosurface_writes_named()
 
 // A buffer names a surface to the kext only where it writes it (RgfxSurfaceBindings): a texture
 // bound where the draw's or dispatch's function writes, by its AIR arguments, or, where they are
-// unknown, one whose usage has ShaderWrite; or a resource used with Write usage. A texture a
-// function only samples or reads, one bound with no dispatch after, and one used to read, are not
-// named, so no CPU lock waits for them.
+// unknown, one whose usage has ShaderWrite or is unknown; a resource used with Write usage; and
+// one used to read, where a function after it has an argument buffer that may write a texture,
+// or arguments unknown. A texture a function only samples or reads, one bound with no dispatch
+// after, and one used to read with no such function after, are not named, so no CPU lock waits
+// for them.
 void test_iosurface_writes_by_function()
 {
 	// Never freed, as Fixture's: the queue and its buffers may go after the test.
@@ -7148,6 +7195,23 @@ void test_iosurface_writes_by_function()
 		air->stage = stage;
 		for (const auto &[index, access] : textures)
 			air->arguments.push_back({RgfxAirKind::Texture, index, 1, access, false});
+		[fn rgfxSetAirFunction:air];
+		return fn;
+	};
+	// A function of `stage` of one argument buffer at buffer 0, whose struct writes a texture or
+	// not.
+	auto argumentBuffer = [&](RgfxAirStage stage, bool writesTextures) -> RgfxFunction * {
+		RgfxFunction *fn = [RgfxFunction functionWithLibrary:nil
+		                                                name:@"a"
+		                                           constants:nullptr
+		                                               count:0
+		                                              device:nil
+		                                          serializer:&ser];
+		auto air = std::make_shared<RgfxAirFunction>();
+		air->name = "a";
+		air->stage = stage;
+		air->arguments.push_back(
+		    {RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, writesTextures});
 		[fn rgfxSetAirFunction:air];
 		return fn;
 	};
@@ -7272,6 +7336,40 @@ void test_iosurface_writes_by_function()
 		[ce endEncoding];
 		CHECK(named(cb) == 1);
 
+		// Unknown usage allows every use: where the kernel's arguments are unknown, named.
+		td.usage = MTLTextureUsageUnknown;
+		RgfxIOSurfaceTexture *anyUse = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                                 iosurface:surface
+		                                                                     plane:0
+		                                                                    region:&region
+		                                                                    device:nil
+		                                                                serializer:&ser];
+		CHECK(anyUse != nil);
+		cb = [queue commandBuffer];
+		ce = [cb computeCommandEncoder];
+		[ce setComputePipelineState:unknown];
+		[ce setTexture:anyUse atIndex:0];
+		[ce dispatchThreads:one threadsPerThreadgroup:one];
+		[ce endEncoding];
+		CHECK(named(cb) == 1);
+
+		// Used to read, then a kernel whose argument buffer may write a texture: named, as a
+		// discrete Mac's driver lands the write whatever usage was given; one whose argument
+		// buffer writes none: not named; one whose arguments are unknown: named.
+		RgfxComputePipelineState *argsWrite = compute(argumentBuffer(RgfxAirStage::Kernel, true));
+		RgfxComputePipelineState *argsRead = compute(argumentBuffer(RgfxAirStage::Kernel, false));
+		drainRing(control);
+		for (const auto &[ps, want] :
+		     {std::pair<RgfxComputePipelineState *, int>{argsWrite, 1}, {argsRead, 0}, {unknown, 1}}) {
+			cb = [queue commandBuffer];
+			ce = [cb computeCommandEncoder];
+			[ce useResource:t usage:MTLResourceUsageRead];
+			[ce setComputePipelineState:ps];
+			[ce dispatchThreads:one threadsPerThreadgroup:one];
+			[ce endEncoding];
+			CHECK(named(cb) == want);
+		}
+
 		// A draw whose functions sample it: not named; one whose fragment function writes it at
 		// the index it is bound: named. A pipeline with no fragment function binds nothing there.
 		RgfxRenderPipelineState *sampling =
@@ -7311,6 +7409,22 @@ void test_iosurface_writes_by_function()
 		[re useResource:t usage:MTLResourceUsageWrite];
 		[re endEncoding];
 		CHECK(named(cb) == 1);
+
+		// Used to read by the stage whose function's argument buffer may write a texture: named
+		// at the draw; by the other stage alone: not named.
+		RgfxRenderPipelineState *fragmentArgs = render(
+		    function(RgfxAirStage::Vertex, {}), argumentBuffer(RgfxAirStage::Fragment, true));
+		drainRing(control);
+		for (const auto &[stages, want] : {std::pair<MTLRenderStages, int>{MTLRenderStageFragment, 1},
+		                                   {MTLRenderStageVertex, 0}}) {
+			cb = [queue commandBuffer];
+			re = [cb renderCommandEncoderWithDescriptor:rp];
+			[re setRenderPipelineState:fragmentArgs];
+			[re useResource:t usage:MTLResourceUsageRead stages:stages];
+			[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[re endEncoding];
+			CHECK(named(cb) == want);
+		}
 	}
 	drainRing(control);
 	CFRelease(surface);

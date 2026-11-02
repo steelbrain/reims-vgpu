@@ -613,6 +613,29 @@ bool indirectWritesTextures(const Module &m, const Module::Md &node)
 	return true;
 }
 
+// The binding kinds besides buffers, argument buffers, textures and samplers that our Metal
+// compiler gives an `air.location_index`, none of them a texture: a vertex function's stage
+// input attribute, and the function tables and acceleration structures, bound among the
+// buffers.
+bool bindsNoTexture(const std::string &kind)
+{
+	return kind == "air.vertex_input" || kind == "air.visible_function_table" ||
+	       kind == "air.intersection_function_table" ||
+	       kind == "air.instance_acceleration_structure" ||
+	       kind == "air.primitive_acceleration_structure";
+}
+
+// Whether an argument node names a binding (`air.location_index`).
+bool hasBinding(const Module &m, const Module::Md &node)
+{
+	for (uint64_t op : node.ops) {
+		const std::string *s = mdString(m, op);
+		if (s != nullptr && *s == "air.location_index")
+			return true;
+	}
+	return false;
+}
+
 std::string globalName(const Module &m, uint64_t v)
 {
 	if (v >= m.globals.size())
@@ -650,7 +673,16 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 		const Module::Md *arg = mdAt(m, argId);
 		if (arg == nullptr || arg->kind != Module::Md::kNode || arg->ops.size() < 2)
 			return false;
+		size_t kindAt = 1;
 		const std::string *kind = mdString(m, arg->ops[1]);
+		// An argument declared under a function constant: the constant's node, then its kind.
+		// It is the function's whatever the constant's value.
+		if (kind != nullptr && *kind == "air.function_constant") {
+			kindAt = 3;
+			kind = arg->ops.size() > kindAt ? mdString(m, arg->ops[kindAt]) : nullptr;
+			if (kind == nullptr)
+				return false;
+		}
 		if (kind == nullptr)
 			continue; // an output or a built-in, of no binding
 		RgfxAirArgument a = {};
@@ -663,9 +695,13 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			a.kind = RgfxAirKind::Texture;
 		else if (*kind == "air.sampler")
 			a.kind = RgfxAirKind::Sampler;
-		else
+		else if (bindsNoTexture(*kind))
 			continue;
-		if (!binding(m, *arg, 2, a))
+		else if (hasBinding(m, *arg))
+			return false; // a binding of a kind the reader does not know: it may be a texture
+		else
+			continue; // a built-in or a stage input, of no binding
+		if (!binding(m, *arg, kindAt + 1, a))
 			return false;
 		// A texture of no access the reader knows is one it may write.
 		if (a.kind == RgfxAirKind::Texture && a.access == RgfxAirAccess::Unknown)

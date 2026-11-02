@@ -173,13 +173,27 @@ class RgfxSurfaceBindings {
 public:
 	/// `texture` bound at `index`.
 	void bind(NSUInteger index, id _Nullable texture);
-	/// At a draw or dispatch of the function whose arguments are `fn`: records on `enc` as
-	/// written (rgfxIOSurfaceNoteWrite) each bound texture the function writes
-	/// (rgfxAirWritesTexture), once while it stays bound; where `fn` is null, its arguments
-	/// unknown, each whose usage has ShaderWrite.
+	/// `resource` made resident (useResource:usage:) with no Write in its usage: a texture over an
+	/// IOSurface or a resource over app memory, which a function may yet write through an
+	/// argument buffer (noteWrites).
+	void resident(id _Nullable resource);
+	/// At a draw or dispatch of the function whose arguments are `fn`, records on `enc` as
+	/// written, once each while it stays bound or resident:
+	/// - each bound texture over an IOSurface the function writes (rgfxAirWritesTexture), or,
+	///   where `fn` is null, its arguments unknown, each whose usage has ShaderWrite or is
+	///   MTLTextureUsageUnknown, which allows every use;
+	/// - each resident texture (rgfxIOSurfaceNoteWrite, and its copy of app memory) where `fn` is
+	///   null or one of its argument buffers may write a texture, and each resident buffer over
+	///   app memory where `fn` is null or has an argument buffer. Metal takes the usage
+	///   useResource gave for the app's promise, but a discrete Mac's driver lands a write the
+	///   promise left out, and the app's pages then hold it: so does a surface's here.
 	void noteWrites(RgfxEncoder *_Nullable enc, const RgfxAirFunction *_Nullable fn);
-	/// Drops every binding, as the encoder ends.
-	void clear() { m_bound.clear(); }
+	/// Drops every binding and resident resource, as the encoder ends.
+	void clear()
+	{
+		m_bound.clear();
+		m_resident.clear();
+	}
 
 private:
 	struct Bound {
@@ -187,7 +201,13 @@ private:
 		id _Nonnull texture;
 		bool noted;
 	};
+	struct Resident {
+		id _Nonnull resource;
+		bool texture;
+		bool noted;
+	};
 	std::vector<Bound> m_bound;
+	std::vector<Resident> m_resident;
 };
 
 /// Where the writes `writes` (taken from a command buffer's encoder) are named to the kext: the

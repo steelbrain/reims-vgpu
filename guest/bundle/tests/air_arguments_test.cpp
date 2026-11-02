@@ -1,10 +1,12 @@
 // The AIR argument reader's test (src/RgfxAirArguments.*), over the .metallib Apple's Metal
 // compiler builds from tests/air_arguments.metal at test time (RGFX_AIR_ARGUMENTS names it):
 // every entry point's binding arguments, kind, index, count and access, as the source declares
-// them; which texture bindings each may write; and no answer, nor a crash, for bytes that are
-// not such a module.
+// them, those under function constants among them; which texture bindings each may write; no
+// answer for a binding of a kind the reader does not know; and no answer, nor a crash, for bytes
+// that are not such a module.
 #include "RgfxAirArguments.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +112,53 @@ int main()
 	expect(fragment, RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Sample, "a sampled texture at 0");
 	check(rgfxAirWritesTexture(fragment, 5) && !rgfxAirWritesTexture(fragment, 0),
 	      "writes_in_fragment writes texture 5 alone");
+
+	// Arguments under function constants are the function's whatever the constants' values: a
+	// texture written there is written.
+	const RgfxAirFunction planes = entry(lib, "conditional_planes");
+	check(planes.arguments.size() == 8,
+	      "conditional_planes: four buffers, three textures and a buffer under constants");
+	for (uint32_t i = 0; i < 4; i++)
+		expect(planes, RgfxAirKind::Buffer, i, 1, RgfxAirAccess::Read,
+		       ("a read buffer at " + std::to_string(i)).c_str());
+	expect(planes, RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, "a read texture at 0 under a constant");
+	expect(planes, RgfxAirKind::Texture, 1, 1, RgfxAirAccess::Read, "a read texture at 1 under a constant");
+	expect(planes, RgfxAirKind::Texture, 2, 1, RgfxAirAccess::Write,
+	       "a written texture at 2 under a constant");
+	expect(planes, RgfxAirKind::Buffer, 4, 1, RgfxAirAccess::ReadWrite,
+	       "a device buffer at 4 under a constant");
+	check(!rgfxAirWritesTexture(planes, 0) && !rgfxAirWritesTexture(planes, 1) &&
+	          rgfxAirWritesTexture(planes, 2),
+	      "conditional_planes writes texture 2 alone");
+
+	// A stage input's attribute, a function table and an acceleration structure: bindings of no
+	// texture, beside those the function has.
+	const RgfxAirFunction attributes = entry(lib, "reads_attributes");
+	check(attributes.stage == RgfxAirStage::Vertex && attributes.arguments.size() == 1,
+	      "reads_attributes: its buffer alone, past its stage input");
+	expect(attributes, RgfxAirKind::Buffer, 1, 1, RgfxAirAccess::Read, "a constant at buffer 1");
+	const RgfxAirFunction table = entry(lib, "calls_through_table");
+	check(table.arguments.size() == 2, "calls_through_table: its buffer and texture alone");
+	expect(table, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::ReadWrite, "a device buffer at 0");
+	expect(table, RgfxAirKind::Texture, 3, 1, RgfxAirAccess::Write, "access::write at 3");
+
+	// A binding of a kind the reader does not know may be a texture: the function has no answer.
+	{
+		std::vector<uint8_t> other = lib;
+		const char kind[] = "air.visible_function_table";
+		auto it = std::search(other.begin(), other.end(), kind, kind + sizeof(kind) - 1);
+		check(it != other.end(), "the library names the function table's kind");
+		*(it + sizeof(kind) - 2) = '_';
+		const uint8_t *bc = nullptr;
+		size_t n = 0;
+		std::vector<RgfxAirFunction> fns;
+		check(rgfxMetallibBitcode(other.data(), other.size(), "calls_through_table", &bc, &n) &&
+		          !rgfxReadAirFunctions(bc, n, fns) && fns.empty(),
+		      "calls_through_table, its table's kind unknown: no answer");
+		check(rgfxMetallibBitcode(other.data(), other.size(), "conditional_planes", &bc, &n) &&
+		          rgfxReadAirFunctions(bc, n, fns),
+		      "conditional_planes is still read beside it");
+	}
 
 	const uint8_t *bitcode = nullptr;
 	size_t size = 0;
