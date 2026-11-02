@@ -2802,14 +2802,12 @@ fn blended_state<P: Platform>(
 /// (`InvalidDescriptor(ColorAttachment)`), which the creator answers
 /// ([`crate::gpu::states::pipeline_error`]), where this platform died at the runtime's refusal
 /// of an extended-range one. A function that writes a second output (`xr_dual_half_fragment`) is
-/// made as on Metal, but compiled with fast math into an extended-range form or twin, which dies
-/// at the creator, naming the runtime's refusal (`ExtendedRangeBlend(DualSource)`, and
-/// `ExtendedRangeBlend(SrgbForm)` into `BGRA10_XR_sRGB`), where Metal makes it. And a state of a `half4` output into `RGBA8Uint`, unblended, whose output the
+/// made as on Metal, compiled with fast math or without, into every one of those formats. And a
+/// state of a `half4` output into `RGBA8Uint`, unblended, whose output the
 /// runtime refuses for its type class (`InvalidDescriptor(ColorAttachment)` too), is answered as
 /// Metal answers it
 #[test]
 fn second_source_blends_without_a_second_output_are_refused_as_metals() {
-    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -2840,16 +2838,8 @@ fn second_source_blends_without_a_second_output_are_refused_as_metals() {
         let ours =
             catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        let refused = library == ROUNDING
-            && fragment == "xr_dual_half_fragment"
-            && XR_LINEAR.into_iter().chain(XR_SRGB).any(|f| f == format);
         match ours {
-            Ok(ours) if !refused && ours == theirs => {}
-            Err(site)
-                if refused
-                    && theirs.is_ok()
-                    && site.file == STATE
-                    && line.contains("ExtendedRangeBlend(") => {}
+            Ok(ours) if ours == theirs => {}
             Ok(ours) => differ.push(format!("{what}: ours {ours:?}, Metal {theirs:?}")),
             Err(site) => differ.push(format!(
                 "{what}: died at {}: {line}; Metal {theirs:?}",
