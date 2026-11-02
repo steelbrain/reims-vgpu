@@ -74,8 +74,14 @@
 			<integer>1</integer>
 			<key>IOClass</key>
 			<string>RgfxAccelerator</string>
+			<key>IODVDBundleName</key>
+			<string>reims-graphics</string>
+			<key>IOGVACodec</key>
+			<string>RgfxVideo</string>
 			<key>IOMatchCategory</key>
 			<string>IOAccelerator</string>
+			<key>IOVARendererID</key>
+			<integer>16908292</integer>
 			<key>IOPCIPrimaryMatch</key>
 			<string>0x52471234</string>
 			<key>IOProbeScore</key>

@@ -95,6 +95,9 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxCompletionThread.cpp src/RgfxFunctionConstants.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp
 
+# The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
+VIDEO_SRCS = src/RgfxVideoDriver.cpp
+VIDEO_OBJ_ARCH = $(VIDEO_SRCS:src/%.cpp=$(BUILD)/obj/$(ARCH)/core/%.o)
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
 # so each later slice's wrappers + category are picked up with no Makefile edit.
 SHELL_SRCS = $(wildcard src/*.mm)
@@ -218,11 +221,11 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(S
 
 bundle: $(BUNDLEBIN)
 
-$(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) Makefile
+$(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) Makefile
 	@mkdir -p $(@D)
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) \
 		-bundle -undefined dynamic_lookup $(FRAMEWORKS) $(PRIVFW) \
-		$(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) -o $@
+		$(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) -o $@
 	@echo "$(notdir $@): $$(cat src/*.mm | grep -o 'RGFX_UNSUPPORTED[A-Z_]*(' | wc -l | tr -d ' ')" \
 	      "members marked RGFX_UNSUPPORTED (src/RgfxUnsupported.h)"
 
