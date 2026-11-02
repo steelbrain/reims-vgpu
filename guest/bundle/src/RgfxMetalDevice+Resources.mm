@@ -6,12 +6,15 @@
 
 #import "RgfxMetalDevice+Resources.h"
 
+#import "RgfxBlockCall.h"
 #import "RgfxBuffer.h"
 #import "RgfxDepthStencilState.h"
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
+#import "RgfxMetalPrivate.h"
 #import "RgfxSampler.h"
 #import "RgfxTexture.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxObjectModel.hpp" // RGFX_OBJ_NONE
 #include "RgfxRegion.hpp"
@@ -104,6 +107,67 @@
 	                                            region:[self region]
 	                                            device:self
 	                                        serializer:[self serializer]];
+}
+
+// The same with a slice (measured: _MTLDevice's on macOS 27's x86-64 slice,
+// `@48@0:8@16^{__IOSurface=}24Q32Q40`). On the M3 Max, slices 0, 1 and 2 of a one-plane surface
+// each answer a texture over the surface's plane that reads what the plane's texture writes, so
+// every slice answers the plane's texture.
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                 iosurface:(IOSurfaceRef)iosurface
+                                     plane:(NSUInteger)plane
+                                     slice:(NSUInteger)slice
+{
+	(void)slice;
+	return [self newTextureWithDescriptor:descriptor iosurface:iosurface plane:plane];
+}
+
+// A tiled texture over the caller's bytes (measured: IOGPUMetalDevice's on macOS 27's x86-64 slice,
+// `@64@0:8^v16Q24@?32@40Q48Q56`, and `@56@0:8^v16Q24@32Q40Q48` without the deallocator, which
+// calls the first). The base makes a buffer of its own buffer class over the bytes and asks it
+// for the texture (newTiledTextureWithDescriptor:offset:bytesPerRow:). Ours is the same over the
+// device's no-copy buffer: a Shared one, as a tiled texture needs (RgfxBuffer.mm), with the
+// descriptor's other resource options. The deallocator goes to that buffer, which calls it with
+// the bytes and their length; one whose own signature takes other arguments is refused.
+- (id<MTLTexture>)newTiledTextureWithBytesNoCopy:(void *)bytes
+                                          length:(NSUInteger)length
+                                     deallocator:(id)deallocator
+                                      descriptor:(MTLTextureDescriptor *)descriptor
+                                          offset:(NSUInteger)offset
+                                     bytesPerRow:(NSUInteger)bytesPerRow
+{
+	if (deallocator != nil &&
+	    ![RgfxBlockArgumentTypes(deallocator) isEqualToArray:@[ @"^v", @"Q" ]]) {
+		RGFX_UNSUPPORTED("tiled textures with a deallocator of another type");
+		return nil;
+	}
+	if (descriptor == nil)
+		return nil;
+	const MTLResourceOptions options =
+	    (descriptor.resourceOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared;
+	id<MTLBuffer> buffer = [self newBufferWithBytesNoCopy:bytes
+	                                               length:length
+	                                              options:options
+	                                          deallocator:deallocator];
+	if (![(id)buffer isKindOfClass:[RgfxBuffer class]])
+		return nil;
+	return [(id<RgfxMetalBufferInternals>)buffer newTiledTextureWithDescriptor:descriptor
+	                                                                   offset:offset
+	                                                              bytesPerRow:bytesPerRow];
+}
+
+- (id<MTLTexture>)newTiledTextureWithBytesNoCopy:(void *)bytes
+                                          length:(NSUInteger)length
+                                      descriptor:(MTLTextureDescriptor *)descriptor
+                                          offset:(NSUInteger)offset
+                                     bytesPerRow:(NSUInteger)bytesPerRow
+{
+	return [self newTiledTextureWithBytesNoCopy:bytes
+	                                     length:length
+	                                deallocator:nil
+	                                 descriptor:descriptor
+	                                     offset:offset
+	                                bytesPerRow:bytesPerRow];
 }
 
 // --- samplers ----------------------------------------------------------------

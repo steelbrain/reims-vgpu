@@ -12,8 +12,11 @@
  * tensors are what the wire does not carry yet.
  *
  * Without these the IOGPU base's own creators answer, which build on IOGPU objects the device
- * does not have. Like the rest of the device it is compiled into the bundle but not linked
- * into the unit tests (RgfxMetalDevice.h). Our own ObjC++.
+ * does not have. The same goes for the base classes' creators no header declares, refused here
+ * too where the device does not make what they make: tests/inherited_tests.mm keeps every
+ * base-class creator answered by the device or listed, with why, as left to the base. Like the
+ * rest of the device it is compiled into the bundle but not linked into the unit tests
+ * (RgfxMetalDevice.h). Our own ObjC++.
  */
 
 #ifndef RGFX_METAL_DEVICE_UNSUPPORTED_H_

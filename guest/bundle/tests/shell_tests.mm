@@ -35,6 +35,7 @@
 #import "RgfxTexture.h"
 #import "RgfxArgumentEncoder.h"
 #import "RgfxBinaryArchive.h"
+#import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxFunction.h"
 #import "RgfxLibrary.h"
@@ -6256,6 +6257,55 @@ void rgfxProtocolTests();
 void rgfxArchiveTests();
 void rgfxResourceTests();
 
+// A block's arguments come from its own signature, and a creation's completion handler is called
+// with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
+// handler of another shape is not called, and that is logged.
+void test_block_call()
+{
+	CHECK(RgfxBlockArgumentTypes(nil) == nil);
+	NSObject *object = [NSObject new];
+	NSError *error = RgfxMakeError(RgfxMetalErrorUnsupported, @"refused");
+	SEL cmd = @selector(test_block_call_selector);
+
+	__block id gotObject = nil;
+	__block id gotError = nil;
+	__block int calls = 0;
+	void (^two)(id, NSError *) = ^(id o, NSError *e) {
+		calls++;
+		gotObject = o;
+		gotError = e;
+	};
+	CHECK([RgfxBlockArgumentTypes(two) isEqualToArray:(@[ @"@", @"@" ])]);
+	CHECK(RgfxCallCreationHandler(two, object, error, cmd));
+	CHECK(calls == 1 && gotObject == object && gotError == error);
+
+	// A block that captures an object carries copy and dispose helpers before its signature.
+	__block id gotReflection = object;
+	void (^three)(id, id, NSError *) = ^(id o, id reflection, NSError *e) {
+		calls++;
+		gotObject = o;
+		gotReflection = reflection;
+		gotError = e;
+		(void)object;
+	};
+	CHECK([RgfxBlockArgumentTypes(three) isEqualToArray:(@[ @"@", @"@", @"@" ])]);
+	CHECK(RgfxCallCreationHandler(three, nil, error, cmd));
+	CHECK(calls == 2 && gotObject == nil && gotReflection == nil && gotError == error);
+
+	// Not called: one object, or arguments that are not objects; nil is no call to make.
+	void (^one)(NSError *) = ^(NSError *e) {
+		calls++;
+	};
+	void (^dealloc)(void *, NSUInteger) = ^(void *p, NSUInteger n) {
+		calls++;
+	};
+	CHECK([RgfxBlockArgumentTypes(dealloc) isEqualToArray:(@[ @"^v", @"Q" ])]);
+	CHECK(!RgfxCallCreationHandler(one, object, error, cmd));
+	CHECK(!RgfxCallCreationHandler(dealloc, object, error, cmd));
+	CHECK(RgfxCallCreationHandler(nil, object, error, cmd));
+	CHECK(calls == 2);
+}
+
 int main()
 {
 	@autoreleasepool {
@@ -6332,6 +6382,7 @@ int main()
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
+		test_block_call();
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm

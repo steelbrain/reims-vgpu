@@ -7,6 +7,7 @@
 
 #import "RgfxArgumentEncoder.h"
 #import "RgfxBinaryArchive.h"
+#import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
@@ -277,6 +278,48 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	    error);
 }
 
+// A library of a descriptor, by _MTLDevice's entry points for one (measured: macOS 27's x86-64
+// slice, `@32@0:8@16^@24` for the first two, `@40@0:8@16@24^@32` and `v32@0:8@16@?24`). On the
+// M3 Max a stitched library's descriptor answers its stitched library, and any other descriptor
+// MTLLibraryErrorDomain's MTLLibraryErrorInternal, "descriptor is not a
+// MTLStitchedLibraryDescriptor." Ours is the same over the stitched route above.
+- (nullable id<MTLLibrary>)rgfxLibraryWithDescriptor:(id)descriptor
+                                             archive:(nullable id<MTLBinaryArchive>)archive
+                                               error:(__autoreleasing NSError **)error
+{
+	if ([descriptor isKindOfClass:[MTLStitchedLibraryDescriptor class]])
+		return [self newLibraryWithStitchedDescriptor:descriptor
+		                     destinationBinaryArchive:archive
+		                                        error:error];
+	RGFX_UNSUPPORTED_ERROR_IN(error, "libraries of a descriptor other than a stitched library's",
+	                          MTLLibraryErrorDomain, MTLLibraryErrorInternal);
+	return nil;
+}
+
+- (id<MTLLibrary>)newLibraryWithDescriptor:(id)descriptor error:(__autoreleasing NSError **)error
+{
+	return [self rgfxLibraryWithDescriptor:descriptor archive:nil error:error];
+}
+
+- (id<MTLLibrary>)newLibraryWithDescriptorSPI:(id)descriptor error:(__autoreleasing NSError **)error
+{
+	return [self rgfxLibraryWithDescriptor:descriptor archive:nil error:error];
+}
+
+- (id<MTLLibrary>)newLibraryWithDescriptor:(id)descriptor
+                  destinationBinaryArchive:(id<MTLBinaryArchive>)archive
+                                     error:(__autoreleasing NSError **)error
+{
+	return [self rgfxLibraryWithDescriptor:descriptor archive:archive error:error];
+}
+
+- (void)newLibraryWithDescriptor:(id)descriptor completionHandler:(id)completionHandler
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib = [self rgfxLibraryWithDescriptor:descriptor archive:nil error:&error];
+	RgfxCallCreationHandler(completionHandler, lib, error, _cmd);
+}
+
 // The DAG's text is Metal's to read (its parser answers its errors, MTLLibraryErrorDomain 3).
 - (id<MTLLibrary>)newLibraryWithDAG:(id)dag
                           functions:(NSArray<id<MTLFunction>> *)functions
@@ -398,6 +441,30 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&err];
 	if (completionHandler)
 		completionHandler(lib, err);
+}
+
+// The forms with a compiler task (measured: _MTLDevice's on macOS 27's x86-64 slice,
+// `@48@0:8@16@24@32^@40` and `v48@0:8@16@24@32@?40`; on the M3 Max, newLibraryWithSource:options:
+// error: makes its library through the first). The task is the compiler's, which the device does
+// not have: each answers as the form without it.
+- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source
+                               options:(MTLCompileOptions *)options
+                          compilerTask:(id)compilerTask
+                                 error:(__autoreleasing NSError **)error
+{
+	(void)compilerTask;
+	return [self newLibraryWithSource:source options:options error:error];
+}
+
+- (void)newLibraryWithSource:(NSString *)source
+                     options:(MTLCompileOptions *)options
+                compilerTask:(id)compilerTask
+           completionHandler:(id)completionHandler
+{
+	(void)compilerTask;
+	NSError *err = nil;
+	id<MTLLibrary> lib = [self newLibraryWithSource:source options:options error:&err];
+	RgfxCallCreationHandler(completionHandler, lib, err, _cmd);
 }
 
 // --- render pipelines --------------------------------------------------------
@@ -602,7 +669,8 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 // the first (measured: the x86-64 guest, macOS 26, on opening Calculator): inherited, it sent the
 // create on to the base device's `compiler`, which is nil on our device, so it answered nil with
 // no error and Core Animation ended WindowServer. Both answer as the options form does with no
-// options.
+// options. No header gives the second's handler type: it is called by its own signature
+// (RgfxBlockCall.h), as the other creators below without a public form call theirs.
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:
                                    (MTLComputePipelineDescriptor *)descriptor
                                                                error:(__autoreleasing NSError **)error
@@ -620,8 +688,63 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
 	                                                                  options:MTLPipelineOptionNone
 	                                                                    error:&err];
-	if (completionHandler)
-		completionHandler(state, err);
+	RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+}
+
+// The precompiled forms (measured: _MTLDevice's on macOS 27's x86-64 slice, `v48@0:8@16Q24@32@?40`
+// each): the pipeline cache they take is Metal's own, which the device keeps none of, so each
+// makes the pipeline as the options form does, and refuses a descriptor of any other kind.
+- (void)newPrecompiledComputePipelineStateWithDescriptor:(id)descriptor
+                                                 options:(MTLPipelineOption)options
+                                           pipelineCache:(id)pipelineCache
+                                       completionHandler:(id)completionHandler
+{
+	(void)pipelineCache;
+	NSError *err = nil;
+	id<MTLComputePipelineState> state = nil;
+	if ([descriptor isKindOfClass:[MTLComputePipelineDescriptor class]])
+		state = [self rgfxComputePipelineForDescriptor:descriptor options:options error:&err];
+	else
+		RGFX_UNSUPPORTED_ERROR(&err, "precompiled compute pipelines of another descriptor");
+	RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+}
+
+- (void)newPrecompiledRenderPipelineStateWithDescriptor:(id)descriptor
+                                                options:(MTLPipelineOption)options
+                                          pipelineCache:(id)pipelineCache
+                                      completionHandler:(id)completionHandler
+{
+	(void)pipelineCache;
+	NSError *err = nil;
+	id<MTLRenderPipelineState> state = nil;
+	if ([descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]])
+		state = [self rgfxRenderPipelineForDescriptor:descriptor options:options error:&err];
+	else
+		RGFX_UNSUPPORTED_ERROR(&err, "precompiled render pipelines of another descriptor");
+	RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+}
+
+// Core Image's pipeline of a link (measured: _MTLDevice's on macOS 27's x86-64 slice,
+// `@40@0:8@16r^{?=BQ^{?}}24^@32`). On the M3 Max, given the functions and info Core Image links,
+// it answers the pipeline of the one kernel their link makes (`ciKernelMain`, of functionType 3;
+// the two pipelines' limits match), and the link's error where the link fails. Ours is the same:
+// our link (above), then our pipeline of its one function.
+- (id<MTLComputePipelineState>)
+    newComputePipelineStateWithImageFilterFunctionsSPI:(NSArray<id<MTLFunction>> *)functions
+                               imageFilterFunctionInfo:(const void *)info
+                                                 error:(__autoreleasing NSError **)error
+{
+	id<MTLLibrary> linked = [self newLibraryWithImageFilterFunctionsSPI:functions
+	                                            imageFilterFunctionInfo:info
+	                                                              error:error];
+	if (linked == nil)
+		return nil;
+	NSArray<NSString *> *names = linked.functionNames;
+	if (names.count != 1) {
+		RGFX_UNSUPPORTED_ERROR(error, "a Core Image link of other than one kernel");
+		return nil;
+	}
+	return [self rgfxComputePipelineForFunction:[linked newFunctionWithName:names[0]] error:error];
 }
 
 // --- binary archives ---------------------------------------------------------
@@ -647,6 +770,18 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	                                        region:[self region]
 	                                        device:self
 	                                    serializer:[self serializer]];
+}
+
+// The same with the encoder's struct type answered through `structType` (measured: _MTLDevice's on
+// macOS 27's x86-64 slice, `@32@0:8@16^@24`; the M3 Max answers its encoder and an
+// MTLStructTypeInternal). The device has no argument reflection, so it answers nil there.
+- (id<MTLArgumentEncoder>)
+    newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments
+                         structType:(__autoreleasing id *)structType
+{
+	if (structType)
+		*structType = nil;
+	return [self newArgumentEncoderWithArguments:arguments];
 }
 
 @end

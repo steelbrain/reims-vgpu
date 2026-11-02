@@ -94,7 +94,10 @@ NS_ASSUME_NONNULL_END
 // on it; this forward-declaration lists ONLY the ones a slice overrides, answered
 // from the host caps blob. A later slice that overrides more SPI adds its
 // selectors here, each tagged measured. (All four below are NSUInteger getters,
-// type-encoding `Q16@0:8`; `-supportsPrimitiveType:` is `B24@0:8Q16`.)
+// type-encoding `Q16@0:8`; `-supportsPrimitiveType:` is `B24@0:8Q16`.) The base
+// classes' creators the device answers that nothing in the bundle calls or types
+// are tagged where they are implemented instead (RgfxMetalDevice+*.mm), and
+// tests/inherited_tests.mm checks them against the base classes at run time.
 @protocol MTLDeviceSPI <MTLDevice>
 - (NSUInteger)maxVertexSamplers;
 - (NSUInteger)maxFragmentTextures;

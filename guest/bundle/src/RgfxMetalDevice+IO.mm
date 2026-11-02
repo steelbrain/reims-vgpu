@@ -49,39 +49,51 @@ BOOL rgfxMetalIOFileIsThere(NSURL *url, NSError **error)
 	return [[queue alloc] initWithDevice:self descriptor:descriptor];
 }
 
-- (id<MTLIOFileHandle>)newIOFileHandleWithURL:(NSURL *)url error:(NSError **)error
+// A raw or a compressed handle over the file at `url`, reading through the page cache unless
+// `uncached`.
+- (nullable id<MTLIOFileHandle>)rgfxIOHandleWithURL:(NSURL *)url
+                                         compressed:(BOOL)compressed
+                                    compressionType:(NSInteger)compressionType
+                                           uncached:(BOOL)uncached
+                                              error:(NSError **)error
 {
 	Class handle =
-	    rgfxMetalIOClass("_MTLIOHandleRaw", @selector(initWithDevice:path:error:uncached:));
+	    compressed
+	        ? rgfxMetalIOClass("_MTLIOHandleCompressed",
+	                           @selector(initWithDevice:path:compressionType:error:uncached:))
+	        : rgfxMetalIOClass("_MTLIOHandleRaw", @selector(initWithDevice:path:error:uncached:));
 	if (handle == Nil) {
 		RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
 		return nil;
 	}
 	if (!rgfxMetalIOFileIsThere(url, error))
 		return nil;
+	if (!compressed)
+		return [[handle alloc] initWithDevice:self
+		                                 path:url.fileSystemRepresentation
+		                                error:error
+		                             uncached:uncached];
 	return [[handle alloc] initWithDevice:self
 	                                 path:url.fileSystemRepresentation
+	                      compressionType:compressionType
 	                                error:error
-	                             uncached:NO];
+	                             uncached:uncached];
+}
+
+- (id<MTLIOFileHandle>)newIOFileHandleWithURL:(NSURL *)url error:(NSError **)error
+{
+	return [self rgfxIOHandleWithURL:url compressed:NO compressionType:0 uncached:NO error:error];
 }
 
 - (id<MTLIOFileHandle>)newIOFileHandleWithURL:(NSURL *)url
                             compressionMethod:(MTLIOCompressionMethod)compressionMethod
                                         error:(NSError **)error
 {
-	Class handle = rgfxMetalIOClass("_MTLIOHandleCompressed",
-	                                @selector(initWithDevice:path:compressionType:error:uncached:));
-	if (handle == Nil) {
-		RGFX_UNSUPPORTED_ERROR_IN(error, kIO, MTLIOErrorDomain, MTLIOErrorInternal);
-		return nil;
-	}
-	if (!rgfxMetalIOFileIsThere(url, error))
-		return nil;
-	return [[handle alloc] initWithDevice:self
-	                                 path:url.fileSystemRepresentation
-	                      compressionType:compressionMethod
-	                                error:error
-	                             uncached:NO];
+	return [self rgfxIOHandleWithURL:url
+	                      compressed:YES
+	                 compressionType:compressionMethod
+	                        uncached:NO
+	                           error:error];
 }
 
 // The names Metal deprecated for the two above.
@@ -95,6 +107,54 @@ BOOL rgfxMetalIOFileIsThere(NSURL *url, NSError **error)
                                     error:(NSError **)error
 {
 	return [self newIOFileHandleWithURL:url compressionMethod:compressionMethod error:error];
+}
+
+// The forms no header declares (measured: IOGPUMetalDevice's on macOS 27's x86-64 slice,
+// `@40@0:8@16q24^@32` with a compression type, `@32@0:8@16^@24` without): the same handles,
+// uncached for the Uncached ones. The compression type is the compressed handle's own
+// (`initWithDevice:path:compressionType:error:uncached:`), which the public forms pass their
+// compression method as.
+- (id<MTLIOFileHandle>)newIOHandleWithURL:(NSURL *)url
+                          compressionType:(NSInteger)compressionType
+                                    error:(NSError **)error
+{
+	return [self rgfxIOHandleWithURL:url
+	                      compressed:YES
+	                 compressionType:compressionType
+	                        uncached:NO
+	                           error:error];
+}
+
+- (id<MTLIOFileHandle>)newUncachedIOHandleWithURL:(NSURL *)url error:(NSError **)error
+{
+	return [self rgfxIOHandleWithURL:url compressed:NO compressionType:0 uncached:YES error:error];
+}
+
+- (id<MTLIOFileHandle>)newUncachedIOFileHandleWithURL:(NSURL *)url error:(NSError **)error
+{
+	return [self rgfxIOHandleWithURL:url compressed:NO compressionType:0 uncached:YES error:error];
+}
+
+- (id<MTLIOFileHandle>)newUncachedIOHandleWithURL:(NSURL *)url
+                                  compressionType:(NSInteger)compressionType
+                                            error:(NSError **)error
+{
+	return [self rgfxIOHandleWithURL:url
+	                      compressed:YES
+	                 compressionType:compressionType
+	                        uncached:YES
+	                           error:error];
+}
+
+- (id<MTLIOFileHandle>)newUncachedIOFileHandleWithURL:(NSURL *)url
+                                    compressionMethod:(NSInteger)compressionMethod
+                                                error:(NSError **)error
+{
+	return [self rgfxIOHandleWithURL:url
+	                      compressed:YES
+	                 compressionType:compressionMethod
+	                        uncached:YES
+	                           error:error];
 }
 
 @end

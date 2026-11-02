@@ -15,9 +15,11 @@
 #     the bundle but excluded from the user-space unit test.
 #
 #   make            build the serialiser objects (x86_64, the guest's arch)
-#   make test       build + run both checks: the serialiser check (x86_64, under
-#                   Rosetta) and the Metal-shell wrapper/routing check (this Mac's
-#                   native arch). The device shell is not in the test binary.
+#   make test       build + run the three checks: the serialiser check (x86_64, under
+#                   Rosetta), the Metal-shell wrapper/routing check (this Mac's
+#                   native arch; the device shell is not in its binary), and the
+#                   device's base-class check (x86_64, under Rosetta), which loads
+#                   the bundle (tests/inherited_tests.mm).
 #   make bundle     compile + bundle-link the whole x86_64 loadable bundle, device
 #                   shell included (links clean with -undefined dynamic_lookup; it
 #                   only needs to COMPILE off the guest, not run).
@@ -102,6 +104,7 @@ WRAP_OBJ_NAT   = $(WRAP_SRCS:src/%.mm=$(BUILD)/obj/$(NATIVE)/shell/%.o)
 
 SER_TESTBIN   = $(BUILD)/serializer_tests
 SHELL_TESTBIN = $(BUILD)/shell_tests
+INHERIT_TESTBIN = $(BUILD)/inherited_tests
 BUNDLEBIN     = $(BUILD)/reims-graphics.bundle
 
 all: $(CORE_OBJ_ARCH)
@@ -165,9 +168,19 @@ $(STITCHABLE): tests/stitchable.metal Makefile
 		-o $(BUILD)/stitchable.air
 	xcrun -sdk macosx metallib $(BUILD)/stitchable.air -o $@
 
-test: $(SER_TESTBIN) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE)
+# --- the device's base-class check (x86_64, Rosetta) --------------------------
+# Loads the bundle and checks, at run time, that every creator of the device's base classes is
+# answered by the device or listed as left to the base (tests/inherited_tests.mm).
+
+$(INHERIT_TESTBIN): tests/inherited_tests.mm Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) tests/inherited_tests.mm -framework Foundation \
+		-o $@
+
+test: $(SER_TESTBIN) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) $(SHELL_TESTBIN)
+	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 
 # --- the loadable bundle (x86_64, device shell included) ---------------------
 # The IOGPUMetalDevice superclass is linked two-level against IOGPU (PRIVFW), so

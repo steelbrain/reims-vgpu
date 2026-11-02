@@ -9,6 +9,7 @@
 #import "RgfxEvent.h"
 #import "RgfxFence.h"
 #import "RgfxSharedEvent.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxSerializer.hpp"
 
@@ -43,6 +44,37 @@
 	// lands this declines the import. FOLLOW-UP: resolve the handle through the host
 	// and wrap the event it names.
 	(void)sharedEventHandle;
+	return nil;
+}
+
+// The creators with options (measured: _MTLDevice's on macOS 27's x86-64 slice, `@24@0:8q16`
+// each). What the options ask for no header states; on the M3 Max, options 0, 1 and 2 each answer
+// an event of the class the form without options answers. So options 0 answers that form's event,
+// and any other is refused, logged, rather than answered by an event that ignores it.
+- (id<MTLEvent>)newEventWithOptions:(NSInteger)options
+{
+	if (options != 0) {
+		RGFX_UNSUPPORTED("events with options");
+		return nil;
+	}
+	return [self newEvent];
+}
+
+- (id<MTLSharedEvent>)newSharedEventWithOptions:(NSInteger)options
+{
+	if (options != 0) {
+		RGFX_UNSUPPORTED("shared events with options");
+		return nil;
+	}
+	return [self newSharedEvent];
+}
+
+// A shared event over a Mach port (measured: _MTLDevice's, `@20@0:8I16`): as one from another
+// process's handle, above, the device has no host event to name by it.
+- (id<MTLSharedEvent>)newSharedEventWithMachPort:(mach_port_t)port
+{
+	(void)port;
+	RGFX_UNSUPPORTED("shared events from another process");
 	return nil;
 }
 
