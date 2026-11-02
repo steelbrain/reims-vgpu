@@ -15,6 +15,8 @@
 EFI_HANDLE         gImageHandle;
 EFI_BOOT_SERVICES  *gBS;
 
+STATIC EFI_SYSTEM_TABLE  *mSystemTable;
+
 STATIC EFI_DEVICE_PATH_UTILITIES_PROTOCOL  *mDevicePathUtilities;
 STATIC REIMS_GRAPHICS_PRIVATE_DATA         *mControllers;
 
@@ -558,6 +560,80 @@ ReleaseController (
 }
 
 /**
+  Append Text to Line at Length, as far as Line's Size characters leave room
+  for the terminating null; return the new length.
+**/
+STATIC
+UINTN
+AppendText (
+  IN OUT CHAR16  *Line,
+  IN     UINTN   Size,
+  IN     UINTN   Length,
+  IN     CHAR8   *Text
+  )
+{
+  while ((*Text != 0) && (Length + 1 < Size)) {
+    Line[Length++] = (CHAR16)*Text++;
+  }
+
+  Line[Length] = 0;
+  return Length;
+}
+
+/**
+  Append Value in decimal to Line at Length, as AppendText does.
+**/
+STATIC
+UINTN
+AppendDecimal (
+  IN OUT CHAR16  *Line,
+  IN     UINTN   Size,
+  IN     UINTN   Length,
+  IN     UINT32  Value
+  )
+{
+  CHAR8  Digits[11];
+  UINTN  Index;
+
+  Index         = sizeof (Digits) - 1;
+  Digits[Index] = 0;
+  do {
+    Digits[--Index] = (CHAR8)('0' + Value % 10);
+    Value          /= 10;
+  } while (Value != 0);
+
+  return AppendText (Line, Size, Length, &Digits[Index]);
+}
+
+/**
+  Say on the firmware's console that the device speaks version Version of the
+  wire, not this driver's RGFX_VERSION, so the driver leaves it: the version
+  names the region's layout and the messages, and a driver of another version
+  misreads them (docs/graphics-kext/design.md, "The wire's version"). Firmware
+  with no console yet says nothing.
+**/
+STATIC
+VOID
+SayWrongVersion (
+  IN UINT32  Version
+  )
+{
+  CHAR16  Line[160];
+  UINTN   Length;
+
+  if ((mSystemTable == NULL) || (mSystemTable->ConOut == NULL)) {
+    return;
+  }
+
+  Length = AppendText (Line, ARRAY_SIZE (Line), 0, "ReimsGraphics: the device speaks wire version ");
+  Length = AppendDecimal (Line, ARRAY_SIZE (Line), Length, Version);
+  Length = AppendText (Line, ARRAY_SIZE (Line), Length, ", this option ROM version ");
+  Length = AppendDecimal (Line, ARRAY_SIZE (Line), Length, RGFX_VERSION);
+  Length = AppendText (Line, ARRAY_SIZE (Line), Length, ": no display. The ROM and the host must come from one build.\r\n");
+  mSystemTable->ConOut->OutputString (mSystemTable->ConOut, Line);
+}
+
+/**
   Bind to Controller: check the device, open its rings, choose the mode, and
   install Device Path and Graphics Output protocols on a child handle with
   that mode set.
@@ -614,10 +690,12 @@ ReimsGraphicsDriverBindingStart (
                              EFI_PCI_IO_ATTRIBUTE_MEMORY | EFI_PCI_IO_ATTRIBUTE_BUS_MASTER,
                              NULL
                              );
-  if (!EFI_ERROR (Status) &&
-      ((ReadRegister (Private, RGFX_REG_MAGIC) != RGFX_MAGIC) ||
-       (ReadRegister (Private, RGFX_REG_VERSION) != RGFX_VERSION)))
-  {
+  if (!EFI_ERROR (Status) && (ReadRegister (Private, RGFX_REG_MAGIC) != RGFX_MAGIC)) {
+    Status = EFI_UNSUPPORTED;
+  }
+
+  if (!EFI_ERROR (Status) && (ReadRegister (Private, RGFX_REG_VERSION) != RGFX_VERSION)) {
+    SayWrongVersion (ReadRegister (Private, RGFX_REG_VERSION));
     Status = EFI_UNSUPPORTED;
   }
 
@@ -769,6 +847,7 @@ ReimsGraphicsEntryPoint (
 
   gImageHandle = ImageHandle;
   gBS          = SystemTable->BootServices;
+  mSystemTable = SystemTable;
 
   Status = gBS->LocateProtocol (&gEfiDevicePathUtilitiesProtocolGuid, NULL, (VOID **)&mDevicePathUtilities);
   if (EFI_ERROR (Status)) {

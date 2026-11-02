@@ -1,7 +1,8 @@
 /** @file
   The subset of the UEFI specification this driver uses: base types, the
   system and boot services tables, the PCI configuration header, device path
-  nodes, and the driver model, PCI I/O, and Graphics Output protocols.
+  nodes, and the driver model, PCI I/O, Graphics Output and Simple Text
+  Output protocols.
 
   Names follow the UEFI specification. Table services the driver does not
   call are declared as opaque pointers so that every field keeps its
@@ -246,14 +247,31 @@ typedef struct {
   VOID                                          *CreateEventEx;
 } EFI_BOOT_SERVICES;
 
+//
+// The Simple Text Output protocol, up to the one service the driver calls.
+//
+typedef struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
+
+typedef
+EFI_STATUS
+(EFIAPI *EFI_TEXT_STRING)(
+  IN EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL  *This,
+  IN CHAR16                           *String
+  );
+
+struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
+  VOID               *Reset;
+  EFI_TEXT_STRING    OutputString;
+};
+
 typedef struct {
-  EFI_TABLE_HEADER     Hdr;
-  CHAR16               *FirmwareVendor;
-  UINT32               FirmwareRevision;
-  EFI_HANDLE           ConsoleInHandle;
-  VOID                 *ConIn;
-  EFI_HANDLE           ConsoleOutHandle;
-  VOID                 *ConOut;
+  EFI_TABLE_HEADER                   Hdr;
+  CHAR16                             *FirmwareVendor;
+  UINT32                             FirmwareRevision;
+  EFI_HANDLE                         ConsoleInHandle;
+  VOID                               *ConIn;
+  EFI_HANDLE                         ConsoleOutHandle;
+  EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL    *ConOut;
   EFI_HANDLE           StandardErrorHandle;
   VOID                 *StdErr;
   VOID                 *RuntimeServices;

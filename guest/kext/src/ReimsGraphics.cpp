@@ -810,9 +810,16 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	registers = reinterpret_cast<volatile UInt8 *>(registerMap->getVirtualAddress());
-	if (readRegister(RGFX_REG_MAGIC) != RGFX_MAGIC || readRegister(RGFX_REG_VERSION) != RGFX_VERSION) {
-		IOLog("ReimsGraphics: not the device: magic 0x%x, version %u\n",
-		      readRegister(RGFX_REG_MAGIC), readRegister(RGFX_REG_VERSION));
+	if (readRegister(RGFX_REG_MAGIC) != RGFX_MAGIC) {
+		IOLog("ReimsGraphics: not the device: magic 0x%x\n", readRegister(RGFX_REG_MAGIC));
+		goto fail;
+	}
+	// The wire's version names the region's layout and the messages (design.md, "The wire's
+	// version"): a kext of another version misreads them, so it leaves the device.
+	if (readRegister(RGFX_REG_VERSION) != RGFX_VERSION) {
+		IOLog("ReimsGraphics: the device speaks wire version %u, this kext version %u: not starting. "
+		      "The kext and the host must come from one build.\n",
+		      readRegister(RGFX_REG_VERSION), RGFX_VERSION);
 		goto fail;
 	}
 

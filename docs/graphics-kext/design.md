@@ -374,13 +374,34 @@ sit in BAR0 from 0x800.
 | offset | name | access | meaning |
 |---|---|---|---|
 | 0x000 | `MAGIC` | RO | 0x58464752 ("RGFX") |
-| 0x004 | `VERSION` | RO | 1 |
+| 0x004 | `VERSION` | RO | the wire's version, `RGFX_VERSION` (below) |
 | 0x008 | `FEATURES_LO` | RO | feature bits 0-31; 0 in stage 2 |
 | 0x00c | `FEATURES_HI` | RO | feature bits 32-63 |
 | 0x010 | `STATUS` | RW | writing 0 resets the device; the guest writes 1 (driver ready) once it has read the rings' headers |
 | 0x014 | `REGION_SIZE_LO` | RO | BAR2's size, low 32 bits |
 | 0x018 | `REGION_SIZE_HI` | RO | BAR2's size, high 32 bits |
 | 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
+
+**The wire's version.** `VERSION` reads `RGFX_VERSION`
+(`crates/reims-graphics/src/wire.rs`), the version of the wire the host
+speaks. The kext's framebuffer and accelerator, and the option ROM, each
+accept only the version they were built with. They read it right after
+`MAGIC`, before anything else of the device, and on any other version they
+leave the device and say why, naming both versions: the kext in the kernel
+log, the ROM on the firmware's console where it has one.
+
+Every change a guest built before it would misread moves `RGFX_VERSION` on by
+one, in the same commit:
+- a register's offset, width or meaning;
+- an offset or a size in the region: the control rings, the device info, the
+  scanout's room, the blocks' room, the cursor;
+- a message's or an op's number, layout or meaning, a ring's format, or a
+  status the guest acts on.
+
+A change that no guest built before it can misread leaves it: a new feature
+bit (`FEATURES_LO`, `FEATURES_HI`), or a new message or op that older guests
+never send. A version number is never used twice. The host speaks one version:
+the host, the kext, the option ROM and the bundle ship from one build.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
