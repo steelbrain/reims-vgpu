@@ -417,9 +417,8 @@ offset:bytesPerRow:`, which asks the buffer it makes for the second.
 (RgfxBuffer.mm). With the lane answering `featureProfile` 10002, an x86 Mac's, WindowServer asked
 the lane for a 7-level texture over a buffer, which the host's platform refused, and every later
 command buffer naming it faulted, so its composition stopped (boot ro1-p2, 11-02); answering 10
-it asked for none (ro1-p1 and its control). That path is one with no Mac's answer to copy that
-the host could keep cheaply: levels 1 and up live in the GPU's own memory, apart from the
-buffer's. Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
+it asked for none (ro1-p1 and its control). The x86 answer on that path is not one the host
+keeps cheaply: levels 1 and up live in the GPU's own memory, apart from the buffer's. Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
 for blurs, scales and renders to a texture on the AMD and the Intel GPU. WindowServer on the
 oracle cannot be traced, being protected, so which framework reads the profile for it is not
 measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
