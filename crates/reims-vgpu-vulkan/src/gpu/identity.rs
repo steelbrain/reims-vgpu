@@ -29,10 +29,11 @@
 //!
 //! **The runtime gives no answer** of `isLowPower`, `isHeadless`, `isRemovable`, `location`,
 //! `locationNumber`, `maxTransferRate`, the peer group, `maxArgumentBufferSamplerCount`,
-//! `maximumConcurrentCompilationTaskCount`, `architecture.name`, `supports32BitMSAA`,
-//! `supportsPullModelInterpolation`, `supportsPrimitiveMotionBlur`, `supportsPlacementSparse`,
-//! `supportsCounterSampling:` and `recommendedMaxWorkingSetSize`: each is `None` here (the working
-//! set the heaps' sum), and a query of the runtime's to come.
+//! `maximumConcurrentCompilationTaskCount`, `architecture.name`, `supportsPrimitiveMotionBlur`,
+//! `supportsPlacementSparse`, `supportsCounterSampling:` and `recommendedMaxWorkingSetSize`: each
+//! is `None` here (the working set the heaps' sum), and a query of the runtime's to come.
+//! `supports32BitMSAA` and `supportsPullModelInterpolation` are the runtime's answers; a gap in the
+//! latter is `None`.
 
 use ash::vk;
 use metal2vulkan::metal::TextureType;
@@ -327,6 +328,8 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
             supports_raytracing_from_render: rt_render,
             supports_function_pointers: fp,
             supports_function_pointers_from_render: fp_render,
+            supports_32bit_msaa: Some(device.supports_32bit_msaa()),
+            supports_pull_model_interpolation: props.supports_pull_model_interpolation().ok(),
             ..IdentityFlags::default()
         },
     }

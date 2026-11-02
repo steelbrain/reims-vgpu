@@ -344,7 +344,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | 256 (4a329e614) |
 | `iosurfaceTextureAlignmentBytes` | 16 | 16 | 16 | |
 | `isDepth24Stencil8PixelFormatSupported` | 1 | 0 | 0 | 0 |
-| `supports32BitMSAA`, `supportsPullModelInterpolation` | 1, 1 | 1, 1 | 1, 1 | 0, 0 |
+| `supports32BitMSAA`, `supportsPullModelInterpolation` | 1, 1 | 1, 1 | 1, 1 | the runtime's: 1, 1 on the 5080 (metal2vulkan 7da81ee3d8; 0, 0 before) |
 | `supportsTextureSampleCount:(8)` | 1 | 1 | 0 | 0 |
 | barycentrics | 1 | 0 | 1 | 1 |
 | `supportsRaytracing`, `supportsFunctionPointers`, `supportsDynamicLibraries` | 1 | 1 | 1 | 0 (lane) |

@@ -1150,6 +1150,18 @@ pub fn create<T>(
 ///   under vertex amplification above 1, and every line in a pass of a rasterization rate map or
 ///   of an execution's command, whose width Metal's answer is not measured for. Announced at each
 ///   such draw, inside its call, which dies at its selector;
+/// - `WideEdgeDepthBias`: a draw of a triangle's edges in fill mode `Lines` at a width other than
+///   1, drawn as the band, under a depth bias the device applies otherwise than Metal (a slope
+///   factor, or a constant factor over a float depth): Metal biases the edges by the triangle's
+///   depth slope and its largest depth's exponent, the device each of the band's triangles by its
+///   own. Such draws died before the runtime drew triangles' edges as bands (`DeviceWideLines` or
+///   `LinesAtNearestWidth`), so placing it here ends no run that went on. Announced at each such
+///   draw, inside its call, which dies at its selector;
+/// - the note `DeviceInterpolationOffset`: a fragment function's interpolant read at an offset
+///   (`interpolate_at_offset`), at the device's interpolation offset, which Vulkan rounds to a grid
+///   of at least sixteenths and clamps to the device's range, where Metal's grid and range are not
+///   measured. Such reads died before the runtime lowered Metal's `interpolant` inputs, so placing
+///   it here ends no run that went on. Announced at each draw that binds such a pipeline;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -1182,7 +1194,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 135] = [
+pub const DIES: [rt::Degradation; 137] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1207,6 +1219,7 @@ pub const DIES: [rt::Degradation; 135] = [
     rt::Degradation::DeviceAnisotropicFilter,
     rt::Degradation::ViewBaseTexelOffset,
     rt::Degradation::DeviceInterpolation,
+    rt::Degradation::DeviceInterpolationOffset,
     rt::Degradation::QuadsSplitByClipping,
     rt::Degradation::VertexSimdgroupGrouping,
     rt::Degradation::FragmentSimdgroupGrouping,
@@ -1312,6 +1325,7 @@ pub const DIES: [rt::Degradation; 135] = [
     rt::Degradation::ProvokingVertexUnmatched,
     rt::Degradation::DeviceWideLines,
     rt::Degradation::LinesAtNearestWidth,
+    rt::Degradation::WideEdgeDepthBias,
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
     rt::Degradation::ReadOnlyPagesWritten,
