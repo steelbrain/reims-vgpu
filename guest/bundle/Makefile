@@ -15,13 +15,14 @@
 #     the bundle but excluded from the user-space unit test.
 #
 #   make            build the serialiser objects (x86_64, the guest's arch)
-#   make test       build + run the four checks: the serialiser check (x86_64, under
+#   make test       build + run the five checks: the serialiser check (x86_64, under
 #                   Rosetta), the AIR argument reader's check (x86_64, under Rosetta,
 #                   over a .metallib built from tests/air_arguments.metal), the
 #                   Metal-shell wrapper/routing check (this Mac's native arch; the
 #                   device shell is not in its binary), and the device's base-class
 #                   check (x86_64, under Rosetta), which loads the bundle
-#                   (tests/inherited_tests.mm).
+#                   (tests/inherited_tests.mm), and the video driver's H.264
+#                   parameter-set check (x86_64, under Rosetta, tests/video_h264_tests.cpp).
 #   make bundle     compile + bundle-link the whole x86_64 loadable bundle, device
 #                   shell included (links clean with -undefined dynamic_lookup; it
 #                   only needs to COMPILE off the guest, not run).
@@ -96,7 +97,7 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
-VIDEO_SRCS = src/RgfxVideoDriver.cpp
+VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp
 VIDEO_OBJ_ARCH = $(VIDEO_SRCS:src/%.cpp=$(BUILD)/obj/$(ARCH)/core/%.o)
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
 # so each later slice's wrappers + category are picked up with no Makefile edit.
@@ -117,6 +118,7 @@ SER_TESTBIN   = $(BUILD)/serializer_tests
 AIR_TESTBIN   = $(BUILD)/air_arguments_test
 SHELL_TESTBIN = $(BUILD)/shell_tests
 INHERIT_TESTBIN = $(BUILD)/inherited_tests
+VIDEO_TESTBIN = $(BUILD)/video_h264_tests
 BUNDLEBIN     = $(BUILD)/reims-graphics.bundle
 
 all: $(CORE_OBJ_ARCH)
@@ -205,13 +207,22 @@ $(INHERIT_TESTBIN): tests/inherited_tests.mm Makefile
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) tests/inherited_tests.mm -framework Foundation \
 		-o $@
 
+# --- the video driver's H.264 parameter-set check (x86_64, Rosetta) ----------
+
+$(VIDEO_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o tests/video_h264_tests.cpp \
+	tests/video_h264_cases.hpp $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o \
+		tests/video_h264_tests.cpp -o $@
+
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) \
-	$(INHERIT_TESTBIN) $(BUNDLEBIN)
+	$(INHERIT_TESTBIN) $(VIDEO_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
 		$(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
+	arch -$(ARCH) $(VIDEO_TESTBIN)
 
 # --- the loadable bundle (x86_64, device shell included) ---------------------
 # The IOGPUMetalDevice superclass is linked two-level against IOGPU (PRIVFW), so
