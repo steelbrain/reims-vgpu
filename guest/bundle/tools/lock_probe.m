@@ -22,8 +22,12 @@
 // the CPU's old pixels on those two GPUs, whose locks sync the surface, the GPU's on the M3 Max.
 // Prints a line per case, PASS or FAIL against those answers (INFO for the last), then "LOCK OK"
 // when every case passed, else "LOCK FAIL".
+// Its shaders are lock_probe.metal, loaded from lock_probe.metallib beside the executable.
 // Build: xcrun clang -arch x86_64 -fobjc-arc -framework Metal -framework IOSurface
 //        -framework Foundation lock_probe.m -o lock_probe
+//        xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 lock_probe.metal
+//        -o lock_probe.air
+//        xcrun -sdk macosx metallib lock_probe.air -o lock_probe.metallib
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
@@ -59,31 +63,6 @@ static double ms(uint64_t a, uint64_t b)
 		mach_timebase_info(&tb);
 	return ((double)b - (double)a) * tb.numer / tb.denom / 1e6;
 }
-
-static NSString *kSource =
-    @"#include <metal_stdlib>\nusing namespace metal;\n"
-     // k is 0 at run time, so the colour is fixed while the loop's cost stays.
-     "kernel void spin(texture2d<float, access::write> t [[texture(0)]],"
-     " constant uint &n [[buffer(0)]], constant float &k [[buffer(1)]],"
-     " uint2 g [[thread_position_in_grid]]) {\n"
-     "  float v = float(g.x & 255) / 255.0;\n"
-     "  for (uint i = 0; i < n; i++) { v = fract(v * 1.0001 + 0.37); }\n"
-     "  t.write(float4(64.0 / 255.0 + k * v, 128.0 / 255.0, 192.0 / 255.0, 1.0), g);\n}\n"
-     "kernel void reader(texture2d<float, access::read> t [[texture(0)]],"
-     " constant uint &n [[buffer(0)]], constant float &k [[buffer(1)]],"
-     " device float *o [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {\n"
-     "  float v = t.read(g).x;\n"
-     "  for (uint i = 0; i < n; i++) { v = fract(v * 1.0001 + 0.37); }\n"
-     "  if (k > 0.5) o[0] = v;\n}\n"
-     "struct VO { float4 p [[position]]; };\n"
-     "vertex VO vs(uint vid [[vertex_id]]) {\n"
-     "  float2 q[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};\n"
-     "  VO o; o.p = float4(q[vid], 0, 1); return o; }\n"
-     "fragment float4 fs(VO in [[stage_in]], constant uint &n [[buffer(0)]],"
-     " constant float &k [[buffer(1)]]) {\n"
-     "  float v = fract(in.p.x * 0.001);\n"
-     "  for (uint i = 0; i < n; i++) { v = fract(v * 1.0001 + 0.37); }\n"
-     "  return float4(64.0 / 255.0 + k * v, 128.0 / 255.0, 192.0 / 255.0, 1.0); }\n";
 
 // The child: looks surface ID up, locks it (mode 0 read-only, 1 read-write, 2 AvoidSync
 // read-only, 3 no lock at all), checks every pixel against EXPECT where it is not 0, unlocks, and
@@ -413,9 +392,12 @@ int main(int argc, char **argv)
 		       p->device.hasUnifiedMemory);
 		p->queue = [p->device newCommandQueue];
 		NSError *err = nil;
-		id<MTLLibrary> lib = [p->device newLibraryWithSource:kSource options:nil error:&err];
+		// The shaders come compiled (lock_probe.metal), as the guest's device compiles no source.
+		NSString *dir = [@(argv[0]) stringByDeletingLastPathComponent];
+		NSURL *url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"lock_probe.metallib"]];
+		id<MTLLibrary> lib = [p->device newLibraryWithURL:url error:&err];
 		if (!lib) {
-			printf("LOCK FAIL: library: %s\n", err.description.UTF8String);
+			printf("LOCK FAIL: library %s: %s\n", url.path.UTF8String, err.description.UTF8String);
 			return 1;
 		}
 		p->writer = [p->device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"spin"]
