@@ -187,18 +187,19 @@ class ReimsGraphics;
 // go, waking the locks waiting on them, and its device cache and IOSurface are released
 // (RgfxAcceleratorLocks.cpp). Either may be null. A cached block's surface stays cached until its
 // BLOCK_RELEASE is answered where `releasing` (rgfxSurfaceCacheReleased), its locks waiting for
-// the answer and its cache held until then; else it goes.
+// the answer and its cache and its memory's wiring held until then; else it goes.
 void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
-// The surface of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID `surfaceId`, has its
-// block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page mapped at `header`,
-// which the kext keeps (and releases once the surface is cached no more) to write its CPU
-// generation at `genOffset`, 0 from here. Where the surface's previous block is cached still,
-// its release unanswered, waits for the answer first, as a lock does. False, `header` the
-// caller's and the table as it was, where it cannot be.
-bool rgfxSurfaceCacheAdd(void *cache, UInt64 offset, uint32_t surfaceId, IOMemoryMap *header,
-                         UInt32 genOffset);
+// The surface `surface` of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID
+// `surfaceId`, has its block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page
+// mapped at `header`, which the kext keeps (and releases once the surface is cached no more) to
+// write its CPU generation at `genOffset`, 0 from here. The surface's memory is wired until
+// then. Where the surface's previous block is cached still, its release unanswered, waits for
+// the answer first, as a lock does. False, `header` the caller's and the table as it was, where
+// it cannot be.
+bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
+                         IOMemoryMap *header, UInt32 genOffset);
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
-// cached no more, its locks go on, and its device cache is released.
+// cached no more, its locks go on, its device cache is released, and its memory unwired.
 void rgfxSurfaceCacheReleased(UInt64 offset);
 // The CPU generation of the cached surface of IOSurfaceID `surfaceId`, for a present of it;
 // false where it is not cached.

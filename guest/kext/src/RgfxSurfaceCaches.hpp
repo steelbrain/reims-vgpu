@@ -16,8 +16,10 @@
 //   - The block's last holder letting go posts its BLOCK_RELEASE, which the host answers once
 //     the pages hold the cache: a lock waits for the answer, then the surface is no longer
 //     cached. The kext holds the surface's device cache until then, so its locks still reach
-//     the kext; a block that is not cached lets its cache go with it (rgfxCacheLetGo,
-//     rgfxCacheReleased).
+//     the kext, and the surface's memory wired, so the host's copy lands in pages that are
+//     still the surface's, past the holders' own wiring, which ends at their let-go: never
+//     pages the guest has purged, paged out or given to another; a block that is not cached
+//     lets its cache go with it (rgfxCacheLetGo, rgfxCacheReleased).
 // A wait that does not end in kWaitMs goes on, as a lock waiting for a write does.
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
@@ -46,10 +48,12 @@ struct RgfxCachedSurface {
 	bool downloading;
 	// The block's BLOCK_RELEASE is posted and not yet answered.
 	bool releasing;
-	// Where the kext writes `cpuGen` for the processes (the block's header, mapped), and the
-	// mapping, opaque here.
+	// Where the kext writes `cpuGen` for the processes (the block's header, mapped), the
+	// mapping, and the surface's memory, which the kext holds wired from the block's caching
+	// until it is cached no more, opaque here.
 	volatile uint64_t *genAt;
 	void *map;
+	void *wire;
 };
 
 struct RgfxCacheTable {
@@ -103,20 +107,24 @@ inline RgfxCachedSurface *rgfxCacheAdd(RgfxCacheTable &t, uint64_t key, uint64_t
 	return &c;
 }
 
-// Takes `c` out of the table: its mapping, which the caller lets go, in `*map`.
-inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map)
+// Takes `c` out of the table: its mapping and its surface's wired memory, which the caller lets
+// go, in `*map` and `*wire`.
+inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map, void **wire)
 {
 	*map = c->map;
+	*wire = c->wire;
 	*c = t.entries[--t.count];
 }
 
-// The block of surface `key` goes: a cached one stays, its locks waiting, until the block's
-// release is answered where `releasing`, else it is taken out (its mapping in `*map`, for the
-// caller to let go). True where the caller releases the device cache's reference now; false
-// where the table keeps it for the answer (rgfxCacheReleased).
-inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void **map)
+// The block of surface `key` goes: a cached one stays, its locks waiting and its memory wired,
+// until the block's release is answered where `releasing`, else it is taken out (its mapping
+// and wired memory in `*map` and `*wire`, for the caller to let go). True where the caller
+// releases the device cache's reference now; false where the table keeps it, and the wiring,
+// for the answer (rgfxCacheReleased).
+inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void **map,
+                           void **wire)
 {
-	*map = nullptr;
+	*map = *wire = nullptr;
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr)
 		return true;
@@ -124,21 +132,22 @@ inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void
 		c->releasing = true;
 		return false;
 	}
-	rgfxCacheRemove(t, c, map);
+	rgfxCacheRemove(t, c, map, wire);
 	return true;
 }
 
 // The BLOCK_RELEASE of the block at `offset` was answered: the cached surface releasing it is
-// taken out (its mapping in `*map`), and its key, the device cache whose reference the caller
-// releases now, returned; 0 where none was releasing it.
-inline uint64_t rgfxCacheReleased(RgfxCacheTable &t, uint64_t offset, void **map)
+// taken out (its mapping and wired memory in `*map` and `*wire`, which the caller unwires only
+// now), and its key, the device cache whose reference the caller releases now, returned; 0
+// where none was releasing it.
+inline uint64_t rgfxCacheReleased(RgfxCacheTable &t, uint64_t offset, void **map, void **wire)
 {
-	*map = nullptr;
+	*map = *wire = nullptr;
 	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
 	if (c == nullptr || !c->releasing)
 		return 0;
 	const uint64_t key = c->key;
-	rgfxCacheRemove(t, c, map);
+	rgfxCacheRemove(t, c, map, wire);
 	return key;
 }
 

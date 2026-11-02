@@ -757,7 +757,7 @@ bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t su
 	// The header's page, where the kext writes the surface's CPU generation for the processes.
 	IOMemoryMap *header = region->createMappingInTask(
 	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, offset, kPage);
-	if (!header || !rgfxSurfaceCacheAdd(cache, offset, surfaceId, header,
+	if (!header || !rgfxSurfaceCacheAdd(cache, surface, offset, surfaceId, header,
 	                                    kRgfxSurfaceCpuGenOffset)) {
 		if (header)
 			header->release();
