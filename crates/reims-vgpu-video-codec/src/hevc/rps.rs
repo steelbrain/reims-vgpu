@@ -27,6 +27,19 @@ struct Flags {
 }
 
 impl ShortTermRps {
+    /// `DeltaPocS0[]` with `UsedByCurrPicS0[]` (7.4.8): the pictures
+    /// before the current one, nearest first, as the set's syntax derives
+    /// them, predicted or not.
+    pub fn negative(&self) -> &[(i32, bool)] {
+        &self.negative
+    }
+
+    /// `DeltaPocS1[]` with `UsedByCurrPicS1[]`: the pictures after it,
+    /// nearest first.
+    pub fn positive(&self) -> &[(i32, bool)] {
+        &self.positive
+    }
+
     /// `NumDeltaPocs`.
     pub(crate) fn num_delta_pocs(&self) -> usize {
         self.negative.iter().chain(&self.positive).count()

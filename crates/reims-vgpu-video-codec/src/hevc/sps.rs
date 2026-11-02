@@ -16,7 +16,7 @@ pub struct ProfileTierLevel {
     /// `general_profile_space`.
     pub(crate) general_profile_space: u8,
     /// `general_tier_flag`.
-    pub(crate) general_tier_flag: bool,
+    pub general_tier_flag: bool,
     /// `general_profile_idc`: 1 Main, 2 Main 10, 3 Main Still Picture, 4
     /// the format range extensions, 9 screen content coding (A.3).
     pub general_profile_idc: u8,
@@ -83,7 +83,7 @@ pub struct SubLayerOrdering {
     /// `sps_max_num_reorder_pics`.
     pub max_num_reorder_pics: u8,
     /// `sps_max_latency_increase_plus1`.
-    pub(crate) max_latency_increase_plus1: u32,
+    pub max_latency_increase_plus1: u32,
 }
 
 /// The PCM sample parameters, when `pcm_enabled_flag`.
@@ -122,9 +122,11 @@ pub struct Vui {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sps {
     /// `sps_video_parameter_set_id`.
-    pub(crate) sps_video_parameter_set_id: u8,
+    pub sps_video_parameter_set_id: u8,
     /// `sps_max_sub_layers_minus1`.
-    pub(crate) sps_max_sub_layers_minus1: u8,
+    pub sps_max_sub_layers_minus1: u8,
+    /// `sps_temporal_id_nesting_flag`.
+    pub sps_temporal_id_nesting_flag: bool,
     /// The general profile, tier and level.
     pub profile_tier_level: ProfileTierLevel,
     /// `sps_seq_parameter_set_id`.
@@ -138,7 +140,7 @@ pub struct Sps {
     /// `pic_height_in_luma_samples`.
     pub pic_height_in_luma_samples: u32,
     /// `conf_win_{left,right,top,bottom}_offset`, in chroma samples.
-    pub(crate) conformance_window: [u32; 4],
+    pub conformance_window: [u32; 4],
     /// `bit_depth_luma_minus8`.
     pub bit_depth_luma_minus8: u8,
     /// `bit_depth_chroma_minus8`.
@@ -290,7 +292,7 @@ impl Sps {
         if sps_max_sub_layers_minus1 > 6 {
             return Err(Error::OutOfRange("sps_max_sub_layers_minus1"));
         }
-        r.skip(1)?; // sps_temporal_id_nesting_flag
+        let sps_temporal_id_nesting_flag = r.bit()?;
         let profile_tier_level = ProfileTierLevel::parse(&mut r, sps_max_sub_layers_minus1)?;
         let sps_seq_parameter_set_id = r.ue_u8(15, "sps_seq_parameter_set_id")?;
         let chroma_format_idc = r.ue_u8(3, "chroma_format_idc")?;
@@ -424,6 +426,7 @@ impl Sps {
         let mut sps = Self {
             sps_video_parameter_set_id,
             sps_max_sub_layers_minus1,
+            sps_temporal_id_nesting_flag,
             profile_tier_level,
             sps_seq_parameter_set_id,
             chroma_format_idc,

@@ -19,7 +19,7 @@ pub struct Pps {
     /// `pps_pic_parameter_set_id`.
     pub pps_pic_parameter_set_id: u8,
     /// `pps_seq_parameter_set_id`.
-    pub(crate) pps_seq_parameter_set_id: u8,
+    pub pps_seq_parameter_set_id: u8,
     /// `dependent_slice_segments_enabled_flag`.
     pub dependent_slice_segments_enabled_flag: bool,
     /// `output_flag_present_flag`.

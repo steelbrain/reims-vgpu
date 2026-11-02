@@ -208,6 +208,11 @@ impl<A: Accelerator> Decoder<A> {
         &self.accelerator
     }
 
+    /// The accelerator, to change what it holds between samples.
+    pub fn accelerator_mut(&mut self) -> &mut A {
+        &mut self.accelerator
+    }
+
     /// Decodes one sample, an access unit, tagged `id`. Returns the
     /// pictures that come out: in decode order, the sample's own picture
     /// unless it is not output (a skipped RASL picture, or one with
