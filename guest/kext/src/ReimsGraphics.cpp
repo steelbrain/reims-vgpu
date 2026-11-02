@@ -701,8 +701,17 @@ bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowByt
 // (RgfxScanoutOwner.hpp).
 void ReimsGraphics::scanoutOwnerMoved(task_t owner)
 {
-	if (!pci)
+	RgfxAccelerator *accelerator = copyAccelerator();
+	if (!accelerator)
 		return;
+	accelerator->scanoutOwnerMoved(owner);
+	accelerator->release();
+}
+
+RgfxAccelerator *ReimsGraphics::copyAccelerator()
+{
+	if (!pci)
+		return nullptr;
 	RgfxAccelerator *accelerator = nullptr;
 	if (OSIterator *clients = pci->getClientIterator()) {
 		while (OSObject *o = clients->getNextObject()) {
@@ -714,15 +723,21 @@ void ReimsGraphics::scanoutOwnerMoved(task_t owner)
 		}
 		clients->release();
 	}
-	if (!accelerator)
-		return;
-	accelerator->scanoutOwnerMoved(owner);
-	accelerator->release();
+	return accelerator;
 }
 
 IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                       IOUserClient **clientH)
 {
+	// WindowServer's first server connection settles whether the accelerator registers this
+	// boot (RgfxAccelerator::settleBundle), before IOFramebuffer makes the connection and with no
+	// lock of ours held.
+	if (type == kIOFBServerConnectType) {
+		if (RgfxAccelerator *accelerator = copyAccelerator()) {
+			accelerator->settleBundle();
+			accelerator->release();
+		}
+	}
 	if (type != kIOFBServerConnectType || !stateLock) {
 		IOReturn r = super::newUserClient(owningTask, securityID, type, clientH);
 		FBTRACE(32, "newUserClient type %u -> 0x%x", type, r);

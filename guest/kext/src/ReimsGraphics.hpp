@@ -37,6 +37,8 @@
 #include "RgfxScanoutOwner.hpp"
 #include "reims_graphics_wire.h"
 
+class RgfxAccelerator;
+
 class ReimsGraphics : public IOFramebuffer {
 	OSDeclareDefaultStructors(ReimsGraphics);
 
@@ -151,6 +153,8 @@ public:
 	// The scanout's owner moved to `owner`: the accelerator takes every other task's hold of the
 	// scanout back (RgfxAccelerator::scanoutOwnerMoved). With no lock held.
 	void scanoutOwnerMoved(task_t owner);
+	// The accelerator on our PCI device, retained for the caller, or nullptr before it started.
+	RgfxAccelerator *copyAccelerator();
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);

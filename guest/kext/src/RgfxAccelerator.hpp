@@ -197,6 +197,13 @@ public:
 	// (IOAccelTypes), as a display pipe's accelerator does.
 	ReimsGraphics *copyFramebuffer();
 
+	// The bundle (RgfxAccelerator.cpp, "The bundle"): the accelerator registers only once the
+	// bundle MetalPluginName names is on disk, and opens no user client before. A check from
+	// start repeats until the bundle is there; the framebuffer's first server connection,
+	// WindowServer's, settles it with a last check of its own, before IOFramebuffer makes the
+	// connection, and no check runs after. A bundle installed later is used from the next boot.
+	void settleBundle();
+
 	// The processes' contexts (RgfxAcceleratorContexts.cpp). A context number is handed out once
 	// (from 1); a slot of the GPU-address space is held until the close.
 	IOReturn openContext(UInt32 *context, UInt32 *slot);
@@ -309,6 +316,8 @@ private:
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	void teardown();
+	// Starts the bundle's check (settleBundle); false where it cannot.
+	bool watchBundle();
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
 	// `offset`, and posted for context `context`; true where the device answered OK.

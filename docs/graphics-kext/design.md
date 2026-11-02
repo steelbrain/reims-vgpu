@@ -978,12 +978,44 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
 IOService in the one kext, on the same PCI device as the Stage-2 framebuffer:
 the framebuffer matches in category `IOFramebuffer`, the accelerator in category
 `IOAccelerator`, both children of the one `IOPCIDevice`. Its `Info.plist`
-personality carries `MetalPluginName
-= /Library/GPUBundles/reims-graphics.bundle` and `MetalPluginClassName
+personality carries `MetalPluginName = reims-graphics` (the bundle
+`/Library/GPUBundles/reims-graphics.bundle`) and `MetalPluginClassName
 = RgfxMetalDevice`, which is how Metal (`IOServiceMatching("IOAccelerator")`)
 finds and loads the bundle. The accelerator maps BAR 0 for the doorbell and
 holds BAR 2 to map each process's part of it in; it touches no pixels and no
 control ring (the framebuffer owns those).
+
+**Registration waits for the bundle.** Where the accelerator is registered and
+its bundle is not on disk, every WindowServer aborts in CoreDisplay as it
+brings the display up, and launchd starts another until it gives up: the
+screen stays black. That is every boot before the bundle is installed: the
+install boot, Recovery, the installer. Where no accelerator is registered,
+WindowServer composites in software on the framebuffer. Measured on msi
+(x86-64 macOS 26, no bundle): an accelerator that does not start leaves
+WindowServer up with a console session and the desktop drawn, the framebuffer
+still naming it in `IOAccelTypes`; a registered accelerator still aborts it,
+the framebuffer naming it or not. So the accelerator starts as before but
+registers only once its bundle is on disk:
+- From its start, a thread call checks every 100 ms for the bundle's
+  executable, `/Library/GPUBundles/NAME.bundle/Contents/MacOS/NAME`, NAME its
+  `MetalPluginName`: nothing before the root file system is mounted
+  (`vfs_rootvnode`), then a `vnode_lookup`. `/Library/GPUBundles` is on the
+  data volume, which launchd mounts early in boot, well before it starts
+  WindowServer, so with the bundle installed the accelerator is registered
+  before WindowServer looks for a GPU.
+- WindowServer's first server connection to the framebuffer settles it.
+  `ReimsGraphics::newUserClient` has the accelerator check once more before
+  IOFramebuffer makes the connection, with no lock held, and register at once
+  where the bundle is there; WindowServer opens that connection before any of
+  the accelerator's user clients. No check runs after it.
+- **A bundle installed later takes effect at the next boot**: a running
+  WindowServer never sees a GPU appear under it. The guest's install puts the
+  bundle in place and reboots.
+- Unregistered, the accelerator refuses every user client
+  (`kIOReturnNotReady`): a task can still reach it by the framebuffer's
+  `IOAccelTypes` path.
+- Neither the check nor its wait runs on the kext's start or the
+  framebuffer's console path.
 
 `RgfxAcceleratorUserClient`
 (`guest/kext/src/RgfxAcceleratorUserClient.{hpp,cpp}`) is **our own** transport,
