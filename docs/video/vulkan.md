@@ -18,6 +18,7 @@ they say otherwise.
 | what | where |
 |---|---|
 | The device: another's (`VideoDevice::from_raw`) or its own (`VideoDevice::create`) | `src/device.rs` |
+| Copies out on a queue another submitter lends (`LentQueue`), each submitted from a thread once the host sees its decode done | `src/lent.rs` |
 | The profiles, and what the device answers for each (`h264_capabilities`, `h265_capabilities`) | `src/profile.rs` |
 | The outputs a decoder lands its pictures in: images (`SurfaceSpec`) or buffer planes (`BufferPlanes`), and sources of its own (`DecodeImages`, `HostBuffers`) | `src/surface.rs` |
 | A decoded picture: its output, its DPB slot, its timeline value; the read back of tests | `src/picture.rs` |
@@ -29,7 +30,7 @@ they say otherwise.
 | The GPU-less tests of the H.265 plans over the codec crate's decoding process, and of the std structures | `src/h265/tests.rs` |
 | The session, of either codec: its memory, its DPB pictures, and the command and bitstream buffers of each decode and copy | `src/session.rs` |
 | A session parameters object, of either codec | `src/params.rs` |
-| Each frame's NV12 MD5, as the VA-API backend's `h264-framemd5`, from images or buffers (`--buffer`), with copies on the decode or the graphics queue (`--copy-on-graphics`); the device's answers (`--capabilities`) | `examples/vulkan-h264-framemd5.rs` |
+| Each frame's NV12 MD5, as the VA-API backend's `h264-framemd5`, from images or buffers (`--buffer`), with copies on the decode or the graphics queue (`--copy-on-graphics`) or on a lent graphics queue (`--copy-lent`); the device's answers (`--capabilities`) | `examples/vulkan-h264-framemd5.rs` |
 | Each frame's NV12 or P010 MD5, as the VA-API backend's `hevc-framemd5`, with the same options, and access units read in place (`--in-place`) | `examples/vulkan-h265-framemd5.rs` |
 | The VA-API H.264 check's streams, decoded here against their references | `tools/h264-check.sh` |
 | The VA-API HEVC check's streams, decoded here against their references | `tools/h265-check.sh` |
@@ -48,7 +49,12 @@ the copy queue being the decode queue where its family copies, else the
 graphics queue; and `VK_KHR_video_maintenance1` and
 `VK_KHR_unified_image_layouts` (`unifiedImageLayoutsVideo`) where it has
 them. A device handed over decodes H.264 alone (`VideoDevice::from_raw`),
-or the codecs its owner enabled (`VideoDevice::from_raw_with_codecs`);
+or the codecs its owner enabled (`VideoDevice::from_raw_with_codecs`),
+copying out on the copy queue it names, or on a queue of the owner's that
+the owner lends for each submission (`VideoDevice::from_raw_copying_on`,
+a `LentQueue`): reims-vgpu lends a metal2vulkan command queue's, whose
+family the runtime's buffers, an IOSurface's device cache among them, are
+shared with;
 `h265_capabilities` answers nothing for a device without H.265. Where no
 device decodes H.264 it says why, device by device (on a Mac: the loader is not found,
 or MoltenVK has no video queue).
@@ -213,8 +219,11 @@ next, and the decode after it waits for that copy, since it may set the
 same DPB picture up again. A picture names the value after which its
 output holds it (`Picture::value`): its decode's where the decode or a
 copy in its own command buffer writes the output, its copy's where the
-copy queue does. Graphics work waits for it before it samples the output,
-and `Picture::wait` blocks on it. An output, a view, a bitstream buffer, a
+copy queue does. On a lent queue, which the owner's own work also runs
+on, a copy that waited on the GPU would hold that work behind its decode:
+a thread of the device's instead waits on the host for the decode's value,
+then submits the copy with no wait. Graphics work waits for it before it
+samples the output, and `Picture::wait` blocks on it. An output, a view, a bitstream buffer, a
 parameters object, a DPB picture or a session is let go only once the
 timeline has passed the last work that used it. `Picture::read_back`, for
 tests, copies both planes out on the copy queue after the picture's
@@ -236,14 +245,16 @@ value.
   display order and decode order, against ffmpeg's frames: the crafted
   streams, the SPS switch, the lost reference and the interlaced
   refusals included. One stream is decoded again with its copies on the
-  graphics queue, and three landed in buffers, one of them through the
-  graphics queue. It makes the streams first, then runs itself again
-  holding every GPU's lock.
-- On the 5080 (11-02) all 66 of the check's verdicts pass: every stream
+  graphics queue, and again with them on a lent graphics queue, into
+  images and into buffers, and three landed in buffers, one of them
+  through the graphics queue. It makes the streams first, then runs itself
+  again holding every GPU's lock.
+- On the 5080 (11-03) all 68 of the check's verdicts pass: every stream
   from MP4 and Annex B in display order and from MP4 in decode order, the
   crafted streams, 2- and 3-byte lengths, frames held by the caller, the
-  copy on the graphics queue, the four buffer landings, the SPS switch,
-  the lost reference and both interlaced refusals. Before the frame
+  copy on the graphics queue, the two copies on a lent queue, the four
+  buffer landings, the SPS switch, the lost reference and both interlaced
+  refusals. Before the frame
   numbers were shifted, the Baseline streams with two or more
   references, `baseline-720p-poc1`, the long-term streams and
   `gaps2-ref4` and `gaps9-ref4` failed from the first wrap on.
