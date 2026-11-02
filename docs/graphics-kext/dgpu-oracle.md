@@ -351,7 +351,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | sparse tile sizes | 0x0x0 | n/r | 64x64 and up | 64x64 and up |
 | families | Mac2, Common1-3, Metal3; no Apple | the same | Apple1-9, Metal4 too | as AMD |
 | `supportsFeatureSet:(10002)` | 1 | 0 | 0 | 0 |
-| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10002 (the M3's 10 before) |
+| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10, the M3's (Q11) |
 | `heapTextureSizeAndAlign` alignment | 65536 | 4096 | 128 | |
 
 Formats (`F` lines): both x86 GPUs make every uncompressed color format but B5G6R5, A1BGR5,
@@ -396,8 +396,34 @@ imageblock, simdgroup matrices, bfloat and ray tracing) compiled under `featureP
 Our stack: the device's source forms run that compiler-task form on super, over the device, and
 make the device's library of its bytes through `newLibraryWithData:`, as an app's .metallib is
 made; Metal's library is kept as the shadow, and Metal's error and nil pass through unchanged
-*(class 3)*. The lane answers `featureProfile` 10002, an x86 Mac's *(class 2)*. Before this, the
-device refused every source, which lost Chrome's WebGL contexts at their first link.
+*(class 3)*. Before this, the device refused every source, which lost Chrome's WebGL contexts
+at their first link.
+
+## Q11: mipmapped textures over a buffer, and the feature profile
+
+Probe: a scratch probe, not kept. A 256 x 256 BGRA8 texture over a buffer, rows 1024 bytes apart,
+with 1, 2 and 7 mipmap levels, by each form: the public `newTextureWithDescriptor:offset:bytesPerRow:`
+of a Shared buffer, the buffer's SPI `newTiledTextureWithDescriptor:offset:bytesPerRow:` (descriptor
+Managed, buffer Shared), and the device's SPI `newTiledTextureWithBytesNoCopy:length:descriptor:
+offset:bytesPerRow:`, which asks the buffer it makes for the second.
+
+| form, 2 or 7 levels | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| public | Metal asserts: "Linear texture: cannot be mipmapped"; the process ends | the same | the same |
+| the buffer's tiled SPI | made, with the levels asked, storage Shared; level 0 over the buffer's bytes; levels 1 and up rendered to and read by a blit and a kernel, their pixels nowhere in the buffer | the same | the buffer does not answer the selector |
+| the device's tiled SPI | as the buffer's | the same | an unrecognized-selector exception (the device asks its buffer for the buffer's SPI) |
+
+*(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
+(RgfxBuffer.mm). With the lane answering `featureProfile` 10002, an x86 Mac's, WindowServer asked
+the lane for a 7-level texture over a buffer, which the host's platform refused, and every later
+command buffer naming it faulted, so its composition stopped (boot ro1-p2, 11-02); answering 10
+it asked for none (ro1-p1 and its control). That path is one with no Mac's answer to copy that
+the host could keep cheaply: levels 1 and up live in the GPU's own memory, apart from the
+buffer's. Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
+for blurs, scales and renders to a texture on the AMD and the Intel GPU. WindowServer on the
+oracle cannot be traced, being protected, so which framework reads the profile for it is not
+measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
+the frontend makes the same bytes under either (Q10).
 
 ## Not measured
 
