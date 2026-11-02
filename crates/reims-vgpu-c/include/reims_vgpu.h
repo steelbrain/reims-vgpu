@@ -969,10 +969,13 @@ typedef uint32_t RvgScalerOutcome;
 
 // `raise_interrupt(ctx, vector)`: raise the device's MSI-X vector `vector` (0).
 //
-// Thread: the device's control thread (`reims-vgpu.graphics-control`) or its refresh thread
-// (`reims-vgpu.graphics-refresh`), never inside a call of the host's into the library, and with
-// no lock of the library's held; the two threads may call at once. It may wait for a lock the
-// host holds while it calls the device (QEMU's BQL). May call: rvg_status_message and the
+// Thread: the one that posts the event it raises for: the device's control thread
+// (`reims-vgpu.graphics-control`), its refresh thread (`reims-vgpu.graphics-refresh`), a command
+// queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
+// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
+// scheduled or completed handler; never inside a call of the host's into the library, and with
+// no lock of the library's held; they may call at once. It may wait for a lock the host holds
+// while it calls the device (QEMU's BQL). May call: rvg_status_message and the
 // rvg_graphics_device_* functions, except the release of its own device. Without it the guest
 // gets no interrupt.
 typedef void (*RvgGraphicsRaiseFn)(void *ctx, uint32_t vector);

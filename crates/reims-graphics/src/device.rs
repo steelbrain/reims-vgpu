@@ -43,10 +43,11 @@
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
 //! queue's service.
 //!
-//! **The host's calls.** No call of the host's into the device waits for either thread, and no
-//! callback of the host's runs inside one: each runs on one of the two threads, with no lock of
-//! the device's held, so a callback may wait for something the host holds while it calls the
-//! device (QEMU's BQL). [`Device::mmio_write`]'s reset waits only for the message the control
+//! **The host's calls.** No call of the host's into the device waits for its threads, and no
+//! callback of the host's runs inside one: each runs on a thread of the device's, or, for
+//! [`Host::raise_interrupt`], on the thread that posts its event, with no lock of the device's
+//! held, so a callback may wait for something the host holds while it calls the device (QEMU's
+//! BQL). [`Device::mmio_write`]'s reset waits only for the message the control
 //! thread is taking, which never waits for the host.
 //!
 //! **The end.** The last [`Device`] handle's drop ends both threads without waiting for them: each
@@ -116,10 +117,14 @@ const COMPLETE: RingAt = RingAt {
 };
 
 /// What the device asks of the host that runs it (QEMU, through the C API's callbacks). Each is
-/// called on one of the device's threads, never inside a call of the host's into the device, and
-/// with no lock of the device's held; the two threads may call at once.
+/// called on one of the device's threads, or, for [`Host::raise_interrupt`], on the thread that
+/// posts the event it raises for; never inside a call of the host's into the device, and with no
+/// lock of the device's held; they may call at once.
 pub trait Host: Send + Sync + 'static {
-    /// Raise MSI-X vector `vector` (0, the control completion ring's).
+    /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
+    /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On the thread that posts it: the control, refresh or
+    /// a queue's service thread, or one of the host's that holds a [`CompletionPoster`] or a
+    /// [`CompleteAnswer`].
     fn raise_interrupt(&self, vector: u32);
 
     /// Whether the guest wrote any of the `length` bytes at `offset` in the region since the last
