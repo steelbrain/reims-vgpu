@@ -25,6 +25,8 @@
 #   make bundle     compile + bundle-link the whole x86_64 loadable bundle, device
 #                   shell included (links clean with -undefined dynamic_lookup; it
 #                   only needs to COMPILE off the guest, not run).
+#   make sweep      the guest's correctness sweep of the system frameworks on the device
+#                   (tools/sweep), build/sweep-x86_64; ARCH=arm64 for an Apple-silicon Mac.
 #   make clean      remove build/
 #
 # Everything lands in build/, never committed.
@@ -251,7 +253,24 @@ $(PACKAGETGZ): $(BUNDLEBIN) Info.plist $(WIRE_H) Makefile
 	COPYFILE_DISABLE=1 tar -C $(dir $(PACKAGE)) -czf $@ reims-graphics.bundle
 	@echo "$(notdir $@): $(PACKAGE), ad-hoc signed"
 
+# --- the guest's correctness sweep (tools/sweep; sweep.m says what it checks) ----------------
+# One binary for ARCH (x86_64, the guest's; ARCH=arm64 for an Apple-silicon Mac), run in a guest
+# or on a Mac, never in `make test`: it needs the system frameworks on a real device.
+SWEEP_SRCS = $(wildcard tools/sweep/*.m)
+SWEEP_FW   = -framework Foundation -framework CoreGraphics -framework ImageIO -framework Metal \
+	-framework MetalPerformanceShaders -framework CoreImage -framework AVFoundation \
+	-framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework Accelerate \
+	-framework QuartzCore
+SWEEPBIN   = $(BUILD)/sweep-$(ARCH)
+
+sweep: $(SWEEPBIN)
+
+$(SWEEPBIN): $(SWEEP_SRCS) $(wildcard tools/sweep/*.h) Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter $(SWEEP_SRCS) $(SWEEP_FW) -o $@
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package clean
+.PHONY: all test bundle package sweep clean
