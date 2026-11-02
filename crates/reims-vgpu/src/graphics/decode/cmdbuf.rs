@@ -1317,11 +1317,14 @@ mod tests {
         msg
     }
 
-    /// What a fake host's video was handed: each decode's access unit (offset, size), its
-    /// parameter sets and its planes (offset, bytes per row, width, height).
+    /// A decode a fake host's video was handed: its access unit (offset, size), its parameter
+    /// sets and its planes (offset, bytes per row, width, height).
+    type SeenDecode = (u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
+
+    /// What a fake host's video was handed: each decode.
     #[derive(Default)]
     struct VideoSeen {
-        decodes: Mutex<Vec<(u64, u64, Vec<u8>, [u64; 4], [u64; 4])>>,
+        decodes: Mutex<Vec<SeenDecode>>,
     }
 
     /// A fake host's video of H.264 decode alone, recording into its [`VideoSeen`]; each of its

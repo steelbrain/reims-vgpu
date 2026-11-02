@@ -56,15 +56,16 @@ use crate::graphics::decode::{
 /// How long a session's end waits for its last signal to land.
 const TEARDOWN_WAIT: Duration = Duration::from_secs(10);
 
+/// The video of each runtime device, by its registry ID, while one lives.
+type MadeVideos = Vec<(u64, Weak<DeviceVideo>)>;
+
 /// The hardware video of `device`: the one its sessions share, made on first use; `None` where
 /// the device has no video-decode queue, lacks the extensions its decodes use, or decodes no
 /// H.264.
 pub(crate) fn graphics_video(
     device: &VulkanDevice,
 ) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
-    // The video of each runtime device, by its registry ID, while one lives.
-    static MADE: LazyLock<Mutex<Vec<(u64, Weak<DeviceVideo>)>>> =
-        LazyLock::new(|| Mutex::new(Vec::new()));
+    static MADE: LazyLock<Mutex<MadeVideos>> = LazyLock::new(|| Mutex::new(Vec::new()));
     let mut made = MADE.lock();
     made.retain(|(_, video)| video.strong_count() > 0);
     let kept = (made.iter())
@@ -429,7 +430,7 @@ fn decode_access_unit(
         }
         None => state.decoder.decode(sample, id),
     };
-    decoded.map_err(|error| decode_fault(error))?;
+    decoded.map_err(decode_fault)?;
     Ok(())
 }
 
