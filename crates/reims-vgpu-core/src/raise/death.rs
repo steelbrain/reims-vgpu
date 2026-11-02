@@ -256,6 +256,12 @@ pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     crate::raise::refusals::trap(id, detail);
     #[cfg(any(test, feature = "testkit"))]
     if crate::testkit::capture::capture_enabled() {
+        // A captured death unwinds quietly, before its line below is written: the line goes to
+        // stderr first, so a test that dies where it should not shows what it died of.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!("{}\n", message(&id, detail)).as_bytes(),
+        );
         crate::testkit::capture::capture(id.site())
     }
     let mut line = message(&id, detail);
