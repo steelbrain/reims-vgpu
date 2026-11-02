@@ -481,6 +481,36 @@ process at each of these with the words of the M3's create, sending the host not
 3)*, rather than sending a create the host refuses (`rgfxEndAtInvalidTextureDescriptor`,
 RgfxTexture.h).
 
+## The display's colour against the stock lane: a deliberate divergence
+
+Measured on a Linux host, in boots of 11-02: the stock lane's host shot of the desktop beside
+ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside its host shot.
+
+- **The profile.** The guest builds each display's ColorSync profile from its EDID. Ours
+  (`makeEdid`, ReimsGraphics.cpp) sets the base block's "sRGB is the default colour space" bit
+  (byte 0x18, bit 2), and macOS builds an sRGB profile: its tone curve is the sRGB curve (within
+  1e-5), its colourants and white sRGB's and D65's, whatever the chromaticity bytes say. The stock
+  framebuffer's EDID, made from the host's display descriptor (its default colour space: sRGB's
+  primaries and white 0.312727, 0.329023, each truncated to 10 bits), clears the bit and gives the
+  same gamma byte, 2.2, and macOS builds a profile of gamma 2.2 and those chromaticities. Both
+  profiles' video-card gamma (`vcgt`) is the identity.
+- **The pixels.** Both WindowServers render the same sRGB-encoded frame: text in the desktop's
+  widgets matches within 1.5 levels (a mean of 0.3) once the stock host's curve is undone. Stock's
+  display pipe then gives the host a gamma table and a colour matrix that re-encode the frame for
+  its profile's gamma 2.2 (`displayPresentFragmentWithGammaTableAndColorMatrix`, shaders.metal):
+  about enc2.2(dec_sRGB(v)) a channel, 16 to 23, 32 to 38, 64 to 67, 128 to 127 and 200 to 199.
+  Our display pipe takes no gamma table (request 2 of RgfxDeviceControl answers none), and the
+  host presents our frame as it is: the guest capture and the host shot agree within 2 levels for
+  98.5% of pixels. On the host, the stock lane's dark tones are lighter than ours, by up to about
+  7 levels.
+- **Decided: the lane keeps its own.** Colour management depends on the display, and each lane
+  is consistent with what it declares: ours declares sRGB and shows sRGB pixels, which is right
+  for the usual sRGB monitor showing the host's window without colour management, and stock
+  declares gamma 2.2 and re-encodes for it. Real Macs differ by panel too. Matching stock would
+  take its EDID's colour bytes, a profile change that may move no pixel, or a gamma table and a
+  colour matrix on our display pipe, through the kext, the wire and the host, and would make our
+  pixels less faithful on an sRGB monitor.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
