@@ -378,6 +378,39 @@ Stages:
         the other order) reads the newer bytes; a download of a cache nothing
         wrote since its last copy copies nothing; and a host whose GPU shares
         the CPU's memory keeps no cache, its surfaces in place as above.
+      - *Which surfaces are cached:* the guest's choice, and the host's
+        invalidation. The bundle asks a block in place cached for a surface
+        of one plane and no YCbCr, by IOSurface's description of its pixel
+        format: the windows, layers and drawables the guest's compositors and
+        apps draw, which the CPU and the GPU write. Video frames, of two
+        planes or YCbCr, stay uncached, sparing the fills a host-side video
+        device's writes would cost. Correctness does not rest on that choice:
+        a surface a host-side device writes (the M2 scaler, the VideoToolbox
+        decoder) may be cached all the same, and the host invalidates the
+        cache of a block whose pages such a device wrote, so the next
+        `SURFACE_USE` fills it from the pages and a download copies nothing.
+        The device says `RGFX_FEATURE_SURFACE_CACHE` only with that
+        invalidation in place.
+      - *The guest's side:* the kext makes a cached block's IOSurface device
+        cache with the block, and its control function, at op 2 of a CPU
+        lock once the GPU's writes are done, asks `SURFACE_DOWNLOAD` where
+        the GPU wrote the surface since the pages last took the cache, and
+        waits for the answer, one lock of a surface asking at a time. A
+        read-write lock then moves the surface's CPU generation, the count
+        the kext writes into the block's header for the processes. IOSurface
+        calls op 2 at every read-write lock of a surface with a device cache,
+        current or not, and at a read-only lock only where a GPU write made
+        the cache current (`RgfxIOSurfaceKPI.hpp`), so the count misses no
+        read-write lock and a read-only lock after a GPU write downloads.
+        Once the block's last holder lets it go, a lock waits for its
+        `BLOCK_RELEASE` answer, which copies the cache into the pages a last
+        time; a present of a cached surface carries its generation. In the
+        bundle, a commit names each cached surface its buffer binds,
+        attaches, blits or declares it uses, with the generation the header
+        holds and whether the buffer writes it, before the first encoder;
+        and a texture's own CPU access (`getBytes`, `replaceRegion`) locks
+        the surface as a CPU access does (`guest/kext/src/RgfxSurfaceCaches.hpp`,
+        `guest/bundle/src/RgfxIOSurface.h`).
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
@@ -732,10 +765,13 @@ the kext writes their runs into the block, past the part the processes map
 and are granted, and posts `SURFACE_PAGES`; other asks for the surface wait
 for its answer. A refusal frees the block as a share not posted does, and the
 ask answers `kIOReturnUnsupported`, so the process copies the surface. Where
-the device has `RGFX_FEATURE_SURFACE_CACHE`, the kext may mark the block cached
-in its `SURFACE_PAGES`, and then asks `SURFACE_DOWNLOAD` (block offset) at a CPU
-lock that follows a GPU write, answered once the surface's pages hold the
-host's device cache (Decided 14, "The device cache").
+the device has `RGFX_FEATURE_SURFACE_CACHE`, 0x109's fifth and sixth inputs
+(the surface's IOSurfaceID, and 1 where the process asks it cached) have the
+kext mark a block it makes cached in its `SURFACE_PAGES`, and a fifth output
+answers whether the block is, whichever ask made it. The kext then writes the
+surface's CPU generation at offset 16 of the block, and asks `SURFACE_DOWNLOAD`
+(block offset) at a CPU lock that follows a GPU write, answered once the
+surface's pages hold the host's device cache (Decided 14, "The device cache").
 A command buffer that writes surfaces' shared blocks is named to the kext
 after it is posted and before its commit returns (selector 0x10c: the queue,
 the buffer's seqno, and a pair of the block's offset and the surface's
