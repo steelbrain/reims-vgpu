@@ -4032,6 +4032,26 @@ void test_command_buffer_event_ops()
 	}
 }
 
+// RgfxResourceId reads the id of each of our objects, whatever its class, and answers 0 for nil
+// and for an object no device of ours made.
+void test_resource_ids()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		RgfxEvent *ev = [RgfxEvent eventWithDevice:nil serializer:&f.ser];
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		CHECK(ev.rgfxObjId != 0 && RgfxResourceId(ev) == ev.rgfxObjId);
+		CHECK(f.queue.rgfxObjId != 0 && RgfxResourceId(f.queue) == f.queue.rgfxObjId);
+		CHECK(((RgfxResource *)cb).rgfxObjId != 0 &&
+		      RgfxResourceId(cb) == ((RgfxResource *)cb).rgfxObjId);
+		CHECK(RgfxResourceId(nil) == 0);
+		CHECK(RgfxResourceId([NSObject new]) == 0);
+		id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+		id<MTLBuffer> theirs = [metal newBufferWithLength:16 options:MTLResourceStorageModeShared];
+		CHECK(theirs != nil && RgfxResourceId(theirs) == 0);
+	}
+}
+
 // A queue's command buffers start their messages with room for the largest of its recent ones:
 // a commit's size raises the queue's reserve, each smaller one takes an eighth off it, and its
 // ring's size bounds it. A message made with a reserve has that room before its first op.
@@ -8376,6 +8396,7 @@ int main(int argc, char **argv)
 		test_reply_reader_event();
 		test_command_buffer_event_ops();
 		test_message_reserve();
+		test_resource_ids();
 		test_reply_reader_arm();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();

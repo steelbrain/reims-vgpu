@@ -73,6 +73,14 @@ RGFX_LOG_UNRECOGNIZED
 	return _objId;
 }
 
+// In the class's implementation, so it reads the ivar.
+uint64_t RgfxResourceId(__unsafe_unretained id obj)
+{
+	if (obj == nil || ![obj isKindOfClass:[RgfxResource class]])
+		return 0;
+	return ((RgfxResource *)obj)->_objId;
+}
+
 - (id<MTLDevice>)device
 {
 	return _device;

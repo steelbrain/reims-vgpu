@@ -136,13 +136,11 @@ bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length
 }
 
 /// The host handle naming `obj` (0 = nil). Every Metal object the guest sees is one
-/// of our RgfxResource wrappers.
-uint64_t rgfxId(id obj)
+/// of our RgfxResource wrappers. These helpers take their object unretained: their callers hold
+/// it for the call.
+uint64_t rgfxId(__unsafe_unretained id obj)
 {
-	if (obj != nil && [obj isKindOfClass:[RgfxResource class]]) {
-		return [(RgfxResource *)obj rgfxObjId];
-	}
-	return 0;
+	return RgfxResourceId(obj);
 }
 
 /// Records on `enc` that its command buffer uses the copy of app memory `obj` reaches, if any
@@ -165,7 +163,7 @@ void rgfxKeep(void *context, const void *object)
 
 /// rgfxId of an object an encoder of the command buffer names, which the buffer keeps where it
 /// keeps what it encodes (RgfxEncoder::setKeeper).
-uint64_t rgfxNamed(RgfxEncoder *enc, id obj)
+uint64_t rgfxNamed(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
 	if (enc != nullptr)
 		enc->keep((__bridge const void *)obj);
@@ -174,7 +172,7 @@ uint64_t rgfxNamed(RgfxEncoder *enc, id obj)
 
 /// rgfxId of a resource the command buffer only reads (a blit's source, an index or indirect
 /// buffer).
-uint64_t rgfxReads(RgfxEncoder *enc, id obj)
+uint64_t rgfxReads(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
 	rgfxNoteShadowUse(enc, obj, false);
 	rgfxIOSurfaceNoteUse(enc, obj);
@@ -183,7 +181,7 @@ uint64_t rgfxReads(RgfxEncoder *enc, id obj)
 
 /// rgfxId of a resource the command buffer writes (a blit's destination, a fill, a synchronize,
 /// a render attachment).
-uint64_t rgfxWrites(RgfxEncoder *enc, id obj)
+uint64_t rgfxWrites(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
 	rgfxNoteShadowUse(enc, obj, true);
 	rgfxIOSurfaceNoteUse(enc, obj);
@@ -194,7 +192,7 @@ uint64_t rgfxWrites(RgfxEncoder *enc, id obj)
 /// has ShaderWrite. Its copy of app memory, if any, is looked up first: most bound resources have
 /// none, and one that has is ours, a buffer or a texture over one (rgfxShadowOf), so whether it
 /// may be written is our texture class's answer, with no protocol lookup on the bind's path.
-uint64_t rgfxBinds(RgfxEncoder *enc, id obj)
+uint64_t rgfxBinds(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
 	if (enc != nullptr && obj != nil && RgfxMemoryShadow::anyLive()) {
 		if (std::shared_ptr<RgfxMemoryShadow> shadow = rgfxShadowOf(obj)) {

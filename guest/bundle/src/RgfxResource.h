@@ -127,6 +127,11 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 #ifdef __cplusplus
+/// `obj`'s rgfxObjId where it is one of ours, else 0: nil, and an object no device of ours made,
+/// name no object. Read with no message and no retain, for the encoders, which name an object
+/// for each op that takes one.
+uint64_t RgfxResourceId(__unsafe_unretained id _Nullable obj);
+
 /// Whether `a`'s memory meets `b`'s: both lie in one heap over byte ranges that meet.
 BOOL RgfxResourcesAlias(RgfxResource *a, id _Nullable b);
 #endif
