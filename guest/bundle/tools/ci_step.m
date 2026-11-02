@@ -1,18 +1,19 @@
 // ci_step: a Core Image chain over a large picture on the default Metal device, timed, with its
-// pixels checked against the same chain on Core Image's software renderer.
+// pixels checked for a lost result.
 //   ci_step [IMAGE]   IMAGE defaults to /System/Library/Desktop Pictures/Mac Blue.heic.
 // The chain: the picture, CIGaussianBlur (radius 10, over its clamped edges, cropped back to the
 // picture), CIColorControls (saturation 1.2, brightness 0.02, contrast 1.1), CISepiaTone (0.4),
 // CILanczosScaleTransform (0.5). A CIContext on the device makes a CGImage of its extent
-// ("CGImage made", timed), drawn into an RGBA8 sRGB bitmap ("bitmap", timed). Three checks:
-// - the middle 512 x 512 of the result made again on a software CIContext, every pixel of it
-//   within kTolerance of the device's. Core Image writes a surface on the device and reads it
-//   back on the CPU, so a GPU write lost on its way to the surface's pages fails here;
-// - that middle not all one colour: the software leg decodes the picture through ImageIO as the
-//   device's does, and with a Metal device ImageIO converts a HEIC's planes on that device, so a
-//   decode that lost its writes reads as one colour on both;
+// ("CGImage made", timed), drawn into an RGBA8 sRGB bitmap ("bitmap", timed). Two checks:
+// - the middle 512 x 512 of the result not all one colour: Core Image writes a surface on the
+//   device and reads it back on the CPU, and with a Metal device ImageIO converts a HEIC's planes
+//   on that device, so a decode or a chain whose GPU writes were lost reads as one colour;
 // - a 512 x 512 gradient made on the CPU, encoded to HEIC and decoded back, within
 //   kRoundTripError per channel on average (lossy; a lost decode is 100 and more).
+// The chain is not compared with a software CIContext's: kCIContextUseSoftwareRenderer gives a
+// Metal context on the default device (measured: macOS 27, M3 Max), the device under test, and
+// no formula of ours is known for this chain's filters. The sweep's Core Image cases
+// (tools/sweep/sweep_ci.m) check filters against formulas computed on the CPU.
 // Prints the times, the first pixel, each check's numbers, then "ci_step: OK" (exit 0) or
 // "ci_step: FAIL" (exit 1).
 // Build: xcrun clang -arch x86_64 -fobjc-arc -framework Metal -framework Foundation
@@ -27,7 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { kSide = 512, kTolerance = 4, kRoundTripError = 8 };
+enum { kSide = 512, kRoundTripError = 8 };
 
 static double nowMs(void)
 {
@@ -151,52 +152,18 @@ int main(int argc, char **argv)
 		       got[2], got[3]);
 		CGImageRelease(made);
 
-		// The middle kSide x kSide on the CPU. Core Image's y runs up, the bitmap's rows down.
-		size_t mx = (w - kSide) / 2, my = (h - kSide) / 2;
-		CGRect middle = CGRectMake(extent.origin.x + mx, extent.origin.y + my, kSide, kSide);
-		CIContext *cpu = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer : @YES}];
-		CGImageRef reference = [cpu createCGImage:result fromRect:middle];
-		uint8_t *want = reference ? bitmapOf(reference) : NULL;
-		if (reference)
-			CGImageRelease(reference);
-		if (want == NULL) {
-			printf("ci_step: no software reference\nci_step: FAIL\n");
-			free(got);
-			return 1;
-		}
-		int worst = 0;
-		size_t wx = 0, wy = 0;
-		const size_t top = h - my - kSide;
+		// The middle kSide x kSide of the result.
+		const size_t mx = (w - kSide) / 2, my = (h - kSide) / 2;
 		bool oneColour = true;
-		for (size_t y = 0; y < kSide; y++) {
-			for (size_t x = 0; x < kSide; x++) {
-				const uint8_t *g = got + ((top + y) * w + mx + x) * 4;
-				const uint8_t *r = want + (y * kSide + x) * 4;
-				if (memcmp(g, got + (top * w + mx) * 4, 4) != 0)
-					oneColour = false;
-				for (int c = 0; c < 4; c++) {
-					int d = abs((int)g[c] - (int)r[c]);
-					if (d > worst) {
-						worst = d;
-						wx = x;
-						wy = y;
-					}
-				}
-			}
-		}
-		const uint8_t *g = got + ((top + wy) * w + mx + wx) * 4;
-		const uint8_t *r = want + (wy * kSide + wx) * 4;
-		printf("ci_step: middle %d x %d against the software renderer: largest difference %d at (%zu, %zu),"
-		       " %u %u %u %u for %u %u %u %u\n",
-		       kSide, kSide, worst, mx + wx, top + wy, g[0], g[1], g[2], g[3], r[0], r[1], r[2], r[3]);
-		printf("ci_step: middle %s\n", oneColour ? "all one colour" : "of more than one colour");
+		for (size_t y = my; y < my + kSide && oneColour; y++)
+			for (size_t x = mx; x < mx + kSide && oneColour; x++)
+				oneColour = memcmp(got + (y * w + x) * 4, got + (my * w + mx) * 4, 4) == 0;
+		printf("ci_step: middle %d x %d %s\n", kSide, kSide, oneColour ? "all one colour" : "of more than one colour");
 		free(got);
-		free(want);
 		const double roundTrip = heicRoundTripError();
 		printf("ci_step: HEIC round trip of a %d x %d gradient: mean error %.1f per channel\n", kSide,
 		       kSide, roundTrip);
-		const bool ok = worst <= kTolerance && !oneColour && roundTrip >= 0 &&
-		                roundTrip <= kRoundTripError;
+		const bool ok = !oneColour && roundTrip >= 0 && roundTrip <= kRoundTripError;
 		printf("ci_step: %s\n", ok ? "OK" : "FAIL");
 		return ok ? 0 : 1;
 	}
