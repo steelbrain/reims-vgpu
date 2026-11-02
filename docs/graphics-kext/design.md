@@ -409,9 +409,38 @@ Stages:
         current or not, and at a read-only lock only where a GPU write made
         the cache current (`RgfxIOSurfaceKPI.hpp`), so the count misses no
         read-write lock and a read-only lock after a GPU write downloads.
-        Once the block's last holder lets it go, a lock waits for its
-        `BLOCK_RELEASE` answer, which copies the cache into the pages a last
-        time; a present of a cached surface carries its generation. In the
+        Once the block's last holder lets it go, the block sleeps rather
+        than going: dormant, it keeps the host's cache, its generation and
+        its watch of device writes, the kext keeping the surface and its
+        device cache retained and the surface's memory wired, so its
+        IOSurfaceID and its cache are no other surface's meanwhile. The next
+        ask of the surface, which IOSurface answers with the same device
+        cache, holds the block again (`BLOCK_SHARE` with no `SURFACE_PAGES`),
+        and the cache is used again rather than made and filled anew, as a
+        GPU of its own memory keeps a surface's copy past the textures over
+        it: in a window drag 98% of the blocks asked were such a surface's,
+        most back within 100 ms. A dormant block is let go on the release
+        thread, never in IOSurface's call: at op 5 (a client of the surface
+        going, or the surface made nonvolatile after empty); at op 7 to
+        empty, and a surface made empty while held does not sleep; at its
+        sleep where the surface has no client left, its last gone while the
+        block was held (IOSurface's client count, read once there); past
+        1024 dormant blocks or an eighth of the guest's memory in their
+        surfaces' wired bytes, and where the table or the region has no room
+        for a new block, those of surfaces made volatile first (IOSurfaceRef.h
+        lets a volatile surface's contents go), then the oldest; and where an
+        ask of the pages names another cache or the other mode. Made
+        nonvolatile again (op 6, or op 7), a surface is neither volatile nor
+        empty for this. A let-go block's `BLOCK_RELEASE` copies the cache
+        into the pages where a buffer wrote it since the last copy, and a
+        lock waits for the answer; the kext releases the device cache, then
+        the surface, then unwires the memory. The kext logs the dormant
+        blocks' count and the let-gos by cause. Op 6, which IOSurface calls
+        as a surface turns nonvolatile again, is answered as the AMD's driver
+        does (a byte set to 0xff), so IOSurface answers the old state
+        volatile, after volatile and after empty alike, the contents kept,
+        which IOSurfaceRef.h's old states allow. A present of a cached
+        surface carries its generation. In the
         bundle, a commit names each cached surface its buffer binds,
         attaches, blits or declares it uses, with the generation the header
         holds and whether the buffer writes it, before the first encoder;
@@ -765,7 +794,10 @@ block, whatever id it claims. The kext wires those pages while the process holds
 posts `BLOCK_SHARE` (context, offset, size) for each holder before the process
 learns of the block, and `BLOCK_UNSHARE` as a holder other than the last lets
 it go (selector 0x10a, or its close). The last holder's let-go frees the block
-as a free does, and its `BLOCK_RELEASE` ends every hold. A block in place
+as a free does, and its `BLOCK_RELEASE` ends every hold; a cached block in
+place instead sleeps, its last holder's `BLOCK_UNSHARE` posted, until an ask of
+its surface holds it again with a `BLOCK_SHARE` alone or the kext lets it go
+with its `BLOCK_RELEASE` (§14, "The device cache"). A block in place
 (0x109's fourth input) is found by the pages of the surface's whole
 allocation, which every holder's ask wires. Before its first `BLOCK_SHARE`,
 the kext writes their runs into the block, past the part the processes map
