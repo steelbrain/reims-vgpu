@@ -53,8 +53,13 @@
 #include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
 
+#include <crt_externs.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -681,6 +686,12 @@ void test_tiled_texture_over_backing()
 	while (fx.ring.next(&h, &bytes)) {
 	}
 
+	// More than one level answers nil, sending nothing: the host does not carry levels 1 and up.
+	desc.mipmapLevelCount = 2;
+	CHECK([tiled newTiledTextureWithDescriptor:desc offset:tileOffset bytesPerRow:pitch] == nil);
+	CHECK(ringEmpty(fx.ring));
+	desc.mipmapLevelCount = 1;
+
 	// A buffer other than Shared answers nil.
 	std::vector<uint8_t> other(pitch * 6, 0);
 #pragma clang diagnostic push
@@ -701,6 +712,83 @@ void test_tiled_texture_over_backing()
 	                                                               bytesPerRow:pitch] == nil);
 	CHECK(ringEmpty(fx.ring));
 	}
+}
+
+// This binary's path, which the death checks run again with --dies CASE (main).
+static const char *g_self = nullptr;
+
+// The exit status of a death case that raised SIGABRT: its handler exits with it, so the death
+// writes no crash report.
+static const int kAborted = 128 + SIGABRT;
+
+// Runs this binary again with --dies `name`, the case of `dies_case` that ends the process, and
+// checks that it raised SIGABRT with `words` on its stderr, as Metal's failed assertion does.
+static void checkDies(const char *name, const char *words)
+{
+	int fds[2];
+	CHECK(pipe(fds) == 0);
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	char *args[] = {const_cast<char *>(g_self), const_cast<char *>("--dies"),
+	                const_cast<char *>(name), nullptr};
+	pid_t pid = 0;
+	CHECK(posix_spawn(&pid, g_self, &fa, nullptr, args, *_NSGetEnviron()) == 0);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	std::string err;
+	char chunk[512];
+	ssize_t n;
+	while ((n = read(fds[0], chunk, sizeof chunk)) > 0)
+		err.append(chunk, static_cast<size_t>(n));
+	close(fds[0]);
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	const bool aborted = WIFEXITED(status) && WEXITSTATUS(status) == kAborted;
+	if (!aborted || err.find(words) == std::string::npos)
+		std::fprintf(stderr, "--dies %s ended with status %d:\n%s\n", name, status, err.c_str());
+	CHECK(aborted);
+	CHECK(err.find(words) != std::string::npos);
+}
+
+// The cases checkDies runs, each in a process of its own: each ends the process where it should,
+// else it answers 0, which its check fails.
+static int dies_case(const char *name)
+{
+	signal(SIGABRT, [](int) { _exit(kAborted); });
+	Fixture fx;
+	@autoreleasepool {
+	if (std::strcmp(name, "buffer-texture-levels") == 0) {
+		std::vector<uint8_t> memory(4096, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		desc.mipmapLevelCount = 2;
+		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:64];
+	}
+	}
+	return 0;
+}
+
+// A texture of more than one level over a buffer's bytes (the public
+// newTextureWithDescriptor:offset:bytesPerRow:) ends the process with Metal's words, as Metal
+// does on the AMD, the Intel and the M3 GPU (docs/graphics-kext/dgpu-oracle.md, Q11).
+void test_mipmapped_buffer_texture_ends_the_process()
+{
+	checkDies("buffer-texture-levels",
+	          "_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor "
+	          "Validation\nLinear texture: cannot be mipmapped, mipmapLevelCount (2) disallowed\n'");
 }
 
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
@@ -7604,8 +7692,11 @@ void test_block_call()
 	CHECK(calls == 2);
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	g_self = argv[0];
+	if (argc == 3 && std::strcmp(argv[1], "--dies") == 0)
+		return dies_case(argv[2]);
 	@autoreleasepool {
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
@@ -7619,6 +7710,7 @@ int main()
 		test_texture_routing();
 		test_texture_cpu_copies();
 		test_tiled_texture_over_backing();
+		test_mipmapped_buffer_texture_ends_the_process();
 		test_texture_views();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();

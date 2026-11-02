@@ -414,7 +414,9 @@ offset:bytesPerRow:`, which asks the buffer it makes for the second.
 | the device's tiled SPI | as the buffer's | the same | an unrecognized-selector exception (the device asks its buffer for the buffer's SPI) |
 
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
-(RgfxBuffer.mm). With the lane answering `featureProfile` 10002, an x86 Mac's, WindowServer asked
+(RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with
+Metal's words *(class 3)*, sending the host nothing; the tiled forms answer nil for one, logged
+once, until the host carries levels 1 and up. With the lane answering `featureProfile` 10002, an x86 Mac's, WindowServer asked
 the lane for a 7-level texture over a buffer, which the host's platform refused, and every later
 command buffer naming it faulted, so its composition stopped (boot ro1-p2, 11-02); answering 10
 it asked for none (ro1-p1 and its control). The x86 answer on that path is not one the host

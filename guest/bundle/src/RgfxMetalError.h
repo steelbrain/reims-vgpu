@@ -14,6 +14,9 @@
 
 #import <Foundation/Foundation.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// The bundle's NSError domain.
@@ -39,6 +42,18 @@ static inline NSError *RgfxMakeError(RgfxMetalErrorCode code, NSString *message)
 	return [NSError errorWithDomain:RgfxMetalErrorDomain
 	                           code:code
 	                       userInfo:@{NSLocalizedDescriptionKey : message}];
+}
+
+/// Ends the process as Metal does at a failed assertion of its validation, at a call every Mac
+/// ends the process at (docs/graphics-kext/dgpu-oracle.md, class 3): Metal's words, `message`
+/// from `function`, on stderr as Metal writes them, then SIGABRT. So the guest dies at the call
+/// it dies at on a Mac, and the host is sent nothing of it.
+__attribute__((noreturn)) static inline void RgfxMetalAssertionFailed(const char *function,
+                                                                      NSString *message)
+{
+	fprintf(stderr, "%s: failed assertion `%s'\n", function, message.UTF8String);
+	NSLog(@"RGFX: %s ends the process, as Metal's validation does", function);
+	abort();
 }
 
 NS_ASSUME_NONNULL_END

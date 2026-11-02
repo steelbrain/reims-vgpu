@@ -3,6 +3,7 @@
  */
 
 #import "RgfxBuffer.h"
+#import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -437,11 +438,20 @@ RGFX_RESOURCE_SPI
 // --- what a buffer that is not sparse or remote answers ------------------------------
 
 // A texture over the buffer's bytes from `offset`, rows `bytesPerRow` apart
-// (TEXTURE_FROM_BUFFER); it keeps the buffer, which its `buffer` answers.
+// (TEXTURE_FROM_BUFFER); it keeps the buffer, which its `buffer` answers. Metal ends the process
+// at a descriptor of more than one level, with these words, on the AMD, the Intel and the M3 GPU
+// alike (docs/graphics-kext/dgpu-oracle.md, Q11), and so does the bundle, sending nothing.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
 {
+	if (descriptor != nil && descriptor.mipmapLevelCount > 1) {
+		RgfxMetalAssertionFailed(
+		    "_mtlValidateStrideTextureParameters",
+		    [NSString stringWithFormat:@"Texture Descriptor Validation\nLinear texture: cannot be "
+		                               @"mipmapped, mipmapLevelCount (%lu) disallowed\n",
+		                               (unsigned long)descriptor.mipmapLevelCount]);
+	}
 	return [RgfxTexture textureWithDescriptor:descriptor
 	                                   buffer:self
 	                                   offset:offset
@@ -466,7 +476,10 @@ RGFX_RESOURCE_SPI
 // and pitch past that pass (an offset of 4, a pitch of 4100). WindowServer's arguments pass. Not
 // measured: what the driver of a GPU with Managed storage answers, as no such GPU is on hand, nor
 // how Metal refuses what its validation asserts at: the bundle answers nil, logged once for each
-// rule, as it does for the linear form's.
+// rule, as it does for the linear form's. A descriptor of more than one level the AMD and the
+// Intel GPU make, level 0 over the buffer's bytes and levels 1 and up in the GPU's own memory
+// (docs/graphics-kext/dgpu-oracle.md, Q11), which the host does not carry: the bundle answers nil,
+// logged once, and sends nothing.
 - (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                          offset:(NSUInteger)offset
                                     bytesPerRow:(NSUInteger)bytesPerRow
@@ -489,6 +502,16 @@ RGFX_RESOURCE_SPI
 			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of storage %lu, not Shared, which "
 			      @"Metal's validation asserts at: answered nil",
 			      (unsigned long long)[self rgfxObjId], (unsigned long)[self storageMode]);
+		}
+		return nil;
+	}
+	if (descriptor.mipmapLevelCount > 1) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of %lu mipmap levels, whose levels "
+			      @"1 and up the host does not carry: answered nil",
+			      (unsigned long long)[self rgfxObjId],
+			      (unsigned long)descriptor.mipmapLevelCount);
 		}
 		return nil;
 	}
