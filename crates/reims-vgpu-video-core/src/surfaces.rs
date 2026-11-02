@@ -61,6 +61,12 @@ pub trait GuestSurface: Send + Sync {
     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
         None
     }
+
+    /// A device wrote the surface's memory ([`GuestSurface::device_memory`]):
+    /// called once the write is in the guest's pages, before the guest is
+    /// told of it. The host may keep a copy of the pages elsewhere that the
+    /// write makes stale. The default does nothing.
+    fn device_wrote(&self) {}
 }
 
 /// A surface's layout.

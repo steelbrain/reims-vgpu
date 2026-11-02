@@ -375,7 +375,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             .surface_pages(&self.platform, device, pages, runs);
         let status = match made {
             Ok(Ok(())) => {
-                self.cache_surface(device, pages.block_offset, cached);
+                self.cache_surface(device, pages.block_offset, runs, cached);
                 RGFX_STATUS_OK
             }
             Ok(Err(why)) => {
@@ -410,26 +410,34 @@ impl<P: Platform> GraphicsDecoder<P> {
                 log::info!(
                     target: "reims_vgpu::graphics",
                     "IOSurface device caches: {} made; {} fills of {} MiB, {} downloads of {} MiB, \
-                     {} asked of a cache nothing wrote",
+                     {} asked of a cache nothing wrote; {} fills or downloads the host's devices' \
+                     writes changed",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
-                    d.downloaded_bytes >> 20, d.clean
+                    d.downloaded_bytes >> 20, d.clean, d.host_writes
                 );
             }
         }
         status
     }
 
-    /// Gives the block at `block`, whose view was just made, a device cache where the kext marked
-    /// it `cached` and the device keeps caches ([`surface_cache`]); else the block keeps its view
-    /// alone, and its buffers lie over the pages.
-    fn cache_surface(&mut self, device: &P::Device, block: u64, cached: bool) {
+    /// Gives the block at `block`, whose view of `runs` was just made, a device cache where the
+    /// kext marked it `cached` and the device keeps caches ([`surface_cache`]); else the block
+    /// keeps its view alone, and its buffers lie over the pages.
+    fn cache_surface(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        runs: &[RgfxPageRun],
+        cached: bool,
+    ) {
         if !cached || !self.surface_caches.on() {
             return;
         }
         let Some(view) = self.surface_views.view(block) else {
             return;
         };
-        match self.surface_caches.make(device, block, &view) {
+        let pages = self.surface_views.host_runs(runs);
+        match self.surface_caches.make(device, block, &view, pages) {
             Ok(true) => {}
             Ok(false) => log::warn!(
                 target: "reims_vgpu::graphics",

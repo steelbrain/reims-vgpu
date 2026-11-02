@@ -570,13 +570,15 @@ fn a_misaligned_destination_is_staged_and_the_same() {
 /// The platform the library runs on.
 type P = crate::DefaultPlatform;
 
-/// A surface of the platform's, as the mapper gives the guest's, and its lends.
+/// A surface of the platform's, as the mapper gives the guest's, its lends, and the writes of
+/// its memory by a device it was told of.
 struct Platform {
     platform: Arc<P>,
     surface: <P as reims_vgpu_core::platform::Platform>::Surface,
     layout: SurfaceLayout,
     memory: Option<Box<dyn DeviceMemory>>,
     lends: AtomicUsize,
+    device_writes: AtomicUsize,
 }
 
 impl GuestSurface for Platform {
@@ -600,6 +602,10 @@ impl GuestSurface for Platform {
 
     fn device_memory(&self) -> Option<&dyn DeviceMemory> {
         self.memory.as_deref()
+    }
+
+    fn device_wrote(&self) {
+        self.device_writes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -661,6 +667,7 @@ fn platform_surface(
         layout,
         memory,
         lends: AtomicUsize::new(0),
+        device_writes: AtomicUsize::new(0),
     }
 }
 
@@ -674,8 +681,9 @@ fn snapshot(s: &Platform) -> Vec<u8> {
 }
 
 /// Surfaces the process's platform makes, whose memory it lends to devices, are reached in place:
-/// no lend of either, and the reference's bytes; one the guest made read-only for its clients is
-/// never written: staged, its write lend refused, kIOReturnNotWritable, its bytes as they were
+/// no lend of either, the reference's bytes, and the destination told its memory was written; one
+/// the guest made read-only for its clients is never written: staged, its write lend refused,
+/// kIOReturnNotWritable, its bytes as they were
 #[test]
 fn platform_surfaces_are_reached_in_place() {
     for (gpu, backend) in gpus() {
@@ -726,6 +734,11 @@ fn platform_surfaces_are_reached_in_place() {
                 })
             {
                 assert_eq!(lends, 0, "{gpu}: in place, no lend");
+                assert_eq!(
+                    destination.device_writes.load(Ordering::Relaxed),
+                    1,
+                    "{gpu}: told of the write"
+                );
             }
         }
         // A destination the guest made read-only for its clients: lent to no device, so staged,
@@ -765,6 +778,11 @@ fn platform_surfaces_are_reached_in_place() {
             assert_eq!(status, io_return::NOT_WRITABLE, "{gpu}");
             assert_eq!(snapshot(&destination), before, "{gpu}: as it was");
         }
+        assert_eq!(
+            destination.device_writes.load(Ordering::Relaxed),
+            0,
+            "{gpu}: staged, written in its lend alone"
+        );
     }
 }
 

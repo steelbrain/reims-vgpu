@@ -686,8 +686,9 @@
 // memory keeps one. The cache is filled from the surface's pages at the first command buffer
 // that uses it after the CPU's generation of the surface moved (`RGFX_OP_SURFACE_USE`), and the
 // pages from the cache only at a [`RGFX_CMD_SURFACE_DOWNLOAD`] and at the block's
-// `BLOCK_RELEASE`. No host sets it yet; the kext alone reads it, and nothing the guest's
-// processes see changes but the time copies take.
+// `BLOCK_RELEASE`; a write the host's own devices make into the pages (a video device's frame)
+// has the next use fill it again. Set where the host's GPU does not share the CPU's memory; the
+// kext alone reads it, and nothing the guest's processes see changes but the time copies take.
 #define RGFX_FEATURE_SURFACE_CACHE (1 << 1)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes

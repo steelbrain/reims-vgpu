@@ -389,6 +389,22 @@ impl<P: Platform> HostDeviceCore<P> {
     /// Another reference to the IOSurface mapped at `mapping_id`, made on the device's queue;
     /// `None` for an id out of range or a slot with no surface.
     pub fn retain_surface_with_mapping_id(&self, mapping_id: u64) -> Option<P::Surface> {
+        self.retain_mapped(mapping_id, false)
+            .map(|(surface, _)| surface)
+    }
+
+    /// [`Self::retain_surface_with_mapping_id`], with the host address of each guest page the
+    /// surface was made over, in order, each a VM page: none for a host-only surface. They stay
+    /// its pages while the reference lives, as the guest's unmap of it is Busy.
+    pub fn retain_surface_and_pages_with_mapping_id(
+        &self,
+        mapping_id: u64,
+    ) -> Option<(P::Surface, Vec<u64>)> {
+        self.retain_mapped(mapping_id, true)
+    }
+
+    /// The surface at `mapping_id`, retained on the device's queue, and its pages where `pages`.
+    fn retain_mapped(&self, mapping_id: u64, pages: bool) -> Option<(P::Surface, Vec<u64>)> {
         log::debug!("retain surface {mapping_id}");
         let this = self.block_self()?;
         self.hw_queue.sync(move || {
@@ -399,10 +415,16 @@ impl<P: Platform> HostDeviceCore<P> {
                 return None;
             }
             let st = this.state.lock();
-            st.slots
-                .get(mapping_id.to_usize())
-                .and_then(|slot| slot.surface.as_ref())
-                .map(Handle::clone_ref)
+            let slot = st.slots.get(mapping_id.to_usize())?;
+            let surface = slot.surface.as_ref().map(Handle::clone_ref)?;
+            Some((
+                surface,
+                if pages {
+                    slot.pages.clone()
+                } else {
+                    Vec::new()
+                },
+            ))
         })
     }
 
@@ -701,6 +723,21 @@ mod tests {
         assert_eq!(Some(s.id()), r.surface(1));
         assert_eq!(Surface::retain_count(&s), 2);
         assert_eq!(r.unmap(1), IoReturn::Busy);
+    }
+
+    /// A surface retained with its pages comes with the host address of each guest page it was
+    /// made over, in order, as its slot holds them; a host-only one with none
+    #[test]
+    fn a_surface_is_retained_with_its_pages() {
+        let r = rig();
+        assert!(r.dev.retain_surface_and_pages_with_mapping_id(1).is_none());
+        r.mapped_v2(1, 2);
+        let want = r.dev.state.lock().slots[1].pages.clone();
+        assert_eq!(want.len(), 2);
+        let (s, pages) = r.dev.retain_surface_and_pages_with_mapping_id(1).unwrap();
+        assert_eq!(Some(s.id()), r.surface(1));
+        assert_eq!(pages, want);
+        assert_eq!(Surface::retain_count(&s), 2);
     }
 
     /// A surface a host holds keeps its pages while it holds it: the guest's unmap of it is

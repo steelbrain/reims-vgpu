@@ -1967,6 +1967,7 @@ impl ZeroCopy {
         parts.device += clock.elapsed_since(writing);
         match written {
             Ok(DeviceWrite::Written) => {
+                held.surface.device_wrote();
                 parts.written += 1;
                 Some(Ok(()))
             }

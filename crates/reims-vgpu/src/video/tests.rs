@@ -13,6 +13,45 @@ use reims_vgpu_video_core::wire::surface_boxes::read_surface_release;
 
 use super::*;
 
+/// A watcher of the host's devices' writes that keeps what it is told.
+struct Seen(Mutex<Vec<std::ops::Range<u64>>>);
+
+impl crate::device_writes::Watcher for Seen {
+    fn wrote(&self, runs: &[std::ops::Range<u64>]) {
+        self.0.lock().extend_from_slice(runs);
+    }
+}
+
+/// A device's write of a held surface's memory reports the surface's pages to the host's
+/// devices' watchers; a lend for writing that fails reports nothing
+#[test]
+fn a_held_surfaces_writes_report_its_pages() {
+    let p = Arc::new(FakePlatform::new());
+    let surface = p.fake_surfaces().make_simple(4, 4, 0, 4);
+    // Addresses no other test writes, as the watchers are the process's.
+    let at = 0x5ee0_0000_0000;
+    let held = MappedSurface {
+        mapping_id: 7,
+        surface: Ours::new(surface),
+        platform: Arc::clone(&p),
+        device: OnceLock::new(),
+        pages: crate::device_writes::page_runs(&[at, at + 0x4000, at + 0x10000], 0x4000),
+    };
+    let seen = Arc::new(Seen(Mutex::new(Vec::new())));
+    let watcher: Arc<dyn crate::device_writes::Watcher> = Arc::clone(&seen) as _;
+    crate::device_writes::watch(&watcher);
+    assert!(
+        held.write(&mut |_| {}).is_err(),
+        "the fake platform lends nothing"
+    );
+    assert!(seen.0.lock().is_empty());
+    held.device_wrote();
+    assert_eq!(
+        seen.0.lock().as_slice(),
+        [at..at + 0x8000, at + 0x10000..at + 0x14000]
+    );
+}
+
 /// A `subs` atom naming `ids`, the rest 0.
 fn subs(ids: &[u64]) -> Vec<u8> {
     let mut m = Vec::new();

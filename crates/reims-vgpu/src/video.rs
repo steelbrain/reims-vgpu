@@ -26,7 +26,9 @@
 //!   decoders through the platform ([`ApiPlatform::lend_surface_bytes`]), and to its encoders to
 //!   read ([`ApiPlatform::lend_surface_bytes_for_reading`]). Its memory is lent to the decoders'
 //!   device too, where the platform lends it ([`ApiPlatform::surface_device_memory`]), so that
-//!   the device writes frames into it with no copy by the CPU, while the session holds it.
+//!   the device writes frames into it with no copy by the CPU, while the session holds it. Each
+//!   write of it, in a lend or by a device, is reported with its guest pages
+//!   ([`crate::device_writes`]), so a graphics device's cache of the surface does not hide it.
 //! - **Codecs.** The session decodes and encodes on the host's backend, which the device picks
 //!   itself ([`backend_choice`]): VideoToolbox on macOS (reims-vgpu-video-videotoolbox); on
 //!   Linux, on the GPU the library's GPU device runs on, NVIDIA's NVDEC and NVENC where it is an
@@ -46,6 +48,7 @@
 //! Every call runs as an entry ([`crate::entry`]); the device's last drop is a reset.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock, Weak};
 
 use reims_vgpu_core::iosurface::{HostDeviceCore, IoSurfaceHostDevice};
@@ -158,6 +161,9 @@ pub struct SurfacePlane {
 pub(crate) struct MappedSurface<P: ApiPlatform = DefaultPlatform> {
     mapping_id: u64,
     surface: Ours<P::Surface>,
+    /// Its guest pages, host addresses in the guest's RAM, as runs: what a write of it writes
+    /// ([`crate::device_writes`]); none for a host-only surface.
+    pages: Vec<Range<u64>>,
     platform: Arc<P>,
     /// Its memory as the platform lends it to a device, asked for once
     /// ([`GuestSurface::device_memory`]).
@@ -209,6 +215,8 @@ impl<P: ApiPlatform> GuestSurface for MappedSurface<P> {
 
     /// Lends its bytes, from its first byte to the end of its allocation, through the platform
     /// ([`ApiPlatform::lend_surface_bytes`]); a surface they cannot be lent of is unreachable.
+    /// Once the lend returns the host's devices' writes have its pages
+    /// ([`crate::device_writes`]).
     fn write(&self, write: &mut dyn FnMut(&mut [u8])) -> Result<(), SurfaceError> {
         self.platform
             .lend_surface_bytes(&self.surface, write)
@@ -218,7 +226,9 @@ impl<P: ApiPlatform> GuestSurface for MappedSurface<P> {
                     self.mapping_id
                 );
                 SurfaceError::Unreachable(why.to_owned())
-            })
+            })?;
+        crate::device_writes::wrote(&self.pages);
+        Ok(())
     }
 
     /// Lends its bytes for reading, laid out as [`Self::write`] lends them, through the platform
@@ -252,6 +262,12 @@ impl<P: ApiPlatform> GuestSurface for MappedSurface<P> {
                 .ok()
         });
         lent.as_deref()
+    }
+
+    /// A device wrote its memory ([`Self::device_memory`]): the host's devices' writes have its
+    /// pages ([`crate::device_writes`]).
+    fn device_wrote(&self) {
+        crate::device_writes::wrote(&self.pages);
     }
 }
 
@@ -311,12 +327,14 @@ impl<P: ApiPlatform> MapperSurfaces<P> {
                 "no IOSurface device to map it through".to_owned(),
             ));
         };
-        let surface = core.retain_surface_with_mapping_id(mapping_id);
+        let surface = core.retain_surface_and_pages_with_mapping_id(mapping_id);
         drop(core);
-        let surface = surface.ok_or(SurfaceError::Unknown(mapping_id))?;
+        let (surface, pages) = surface.ok_or(SurfaceError::Unknown(mapping_id))?;
+        let pages = crate::device_writes::page_runs(&pages, self.platform.vm().page_size());
         let surface = MappedSurface {
             mapping_id,
             surface: Ours::new(surface),
+            pages,
             platform: Arc::clone(&self.platform),
             device: OnceLock::new(),
         };

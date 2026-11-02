@@ -348,8 +348,8 @@ Stages:
       completion ring's `completed_seqno` reaches the buffer, whichever comes
       first. A lock still waiting after 2 s goes on with an "RGFX: WARN" line
       (`guest/kext/src/RgfxAcceleratorLocks.cpp`).
-    - **The device cache:** where the device has
-      `RGFX_FEATURE_SURFACE_CACHE`, which no host offers yet, a block the
+    - **The device cache:** where the host's GPU does not share the CPU's
+      memory, the device has `RGFX_FEATURE_SURFACE_CACHE`, and a block the
       kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
       the host: a Private buffer of the surface's bytes in the pages' layout,
       which every buffer over the block is, so every texture over the
@@ -363,8 +363,13 @@ Stages:
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
       committed since the last copy (`reims-vgpu`'s
-      `graphics/decode/surface_cache.rs`). Each choice, by what real GPUs
-      show (M3, AMD and Intel Macs):
+      `graphics/decode/surface_cache.rs`). A write the host's own devices
+      make into the pages (a video device's frame, in a CPU lend or by a
+      device of the host) moves no count: the host watches each cache's
+      pages, and such a write has the cache's next use fill it whatever the
+      count, and keeps a download or a release before that from copying the
+      cache over the write (`reims-vgpu`'s `device_writes.rs`). Each choice,
+      by what real GPUs show (M3, AMD and Intel Macs):
       - *Contract, where all agree:* a CPU lock after a GPU write sees it,
         and a GPU use after a read-write lock sees the CPU's writes; the
         seed moves at a read-write lock (not at its unlock), not at a

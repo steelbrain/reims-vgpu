@@ -24,6 +24,11 @@
 //!   asked, each after every command buffer that used the cache before it: each such buffer
 //!   signals its queue's end event as it ends, and the copy waits for the latest value of each
 //!   queue's. So a frame drawn from the cache before a CPU write still reads what it read.
+//! - **The host's own writes.** A device of the host that writes a surface's pages itself (a
+//!   video device's frame, [`crate::device_writes`]) moves no generation, so each cache's pages
+//!   are watched: a write over them makes the cache's next use fill it whatever its generation,
+//!   and a download or a release before that copies nothing, the pages being newer than the
+//!   cache.
 //!
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
 //! it, and a GPU use after a read-write lock sees the CPU's writes. A CPU write made without a
@@ -48,6 +53,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,8 +64,10 @@ use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::sync::Mutex;
 
 use super::surface_pages::{SurfaceView, buffer_over};
+use crate::device_writes::{self, Watcher};
 
 /// The copies run under a live raise handler (the ring loop's, or the control thread's entry).
 const ON: OnFault = OnFault::Return;
@@ -109,8 +117,45 @@ pub(crate) struct CacheCounts {
     /// Downloads, and their bytes.
     pub(crate) downloads: u64,
     pub(crate) downloaded_bytes: u64,
-    /// Downloads asked of a cache nothing wrote since its last copy, answered at once.
+    /// Downloads answered at once: of a cache nothing wrote since its last copy, or one whose
+    /// pages a device of the host wrote since.
     pub(crate) clean: u64,
+    /// Fills a device of the host's write over the pages asked, and downloads and releases of a
+    /// written cache it kept from copying.
+    pub(crate) host_writes: u64,
+}
+
+/// One cache's pages, host addresses in the guest's RAM, and whether a device of the host wrote
+/// them since the cache's last fill ([`device_writes`]).
+struct Pages {
+    runs: Vec<Range<u64>>,
+    written: bool,
+}
+
+/// Each cache's [`Pages`], by block. Its lock is a leaf.
+#[derive(Default)]
+struct Watched(Mutex<HashMap<u64, Pages>>);
+
+impl Watched {
+    /// Whether a device of the host wrote the block's pages since its last fill.
+    fn written(&self, block: u64) -> bool {
+        self.0.lock().get(&block).is_some_and(|p| p.written)
+    }
+
+    /// [`Watched::written`], cleared: the fill about to be made reads the write.
+    fn take(&self, block: u64) -> bool {
+        (self.0.lock().get_mut(&block)).is_some_and(|p| std::mem::take(&mut p.written))
+    }
+}
+
+impl Watcher for Watched {
+    fn wrote(&self, runs: &[Range<u64>]) {
+        for pages in self.0.lock().values_mut() {
+            if !pages.written && device_writes::overlap(&pages.runs, runs) {
+                pages.written = true;
+            }
+        }
+    }
 }
 
 /// The device caches of the blocks the kext marked cached, by block offset.
@@ -121,17 +166,23 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     transfer: Option<Transfer<P>>,
     /// Each command queue's end event, by the queue's id, and the last value signalled.
     ends: HashMap<u64, (P::Event, u64)>,
+    /// The caches' pages, watched for the host's devices' writes while this lives.
+    watched: Arc<Watched>,
     counts: CacheCounts,
 }
 
 impl<P: Platform> SurfaceCaches<P> {
     /// No caches; `on` keeps them where the kext asks.
     pub(crate) fn new(on: bool) -> Self {
+        let watched = Arc::new(Watched::default());
+        let watcher: Arc<dyn Watcher> = Arc::clone(&watched) as Arc<dyn Watcher>;
+        device_writes::watch(&watcher);
         SurfaceCaches {
             on,
             by_block: HashMap::new(),
             transfer: None,
             ends: HashMap::new(),
+            watched,
             counts: CacheCounts::default(),
         }
     }
@@ -148,13 +199,17 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// A cache for the block at `block`, whose surface's pages `view` maps, in place of any it
     /// had: `Ok(false)` where the platform made no buffer for it, and the block keeps its view.
+    /// `host_pages` are the pages' host addresses in the guest's RAM, [`device_writes::sorted`],
+    /// which the host's devices' writes are watched over.
     pub(crate) fn make(
         &mut self,
         device: &P::Device,
         block: u64,
         view: &Arc<SurfaceView<P>>,
+        host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
         self.by_block.remove(&block);
+        self.watched.0.lock().remove(&block);
         let length = view.length();
         let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
             return Ok(false);
@@ -174,6 +229,11 @@ impl<P: Platform> SurfaceCaches<P> {
                 users: HashMap::new(),
             },
         );
+        let pages = Pages {
+            runs: host_pages,
+            written: false,
+        };
+        self.watched.0.lock().insert(block, pages);
         self.counts.made += 1;
         Ok(true)
     }
@@ -189,8 +249,9 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The blocks `uses` names that have caches, before command buffer `cb` of queue `queue`
-    /// runs: each filled where it holds an older generation than the use's, or none, and `cb`
-    /// made to wait for each one's last fill. A use that may write marks its cache written.
+    /// runs: each filled where it holds an older generation than the use's, or none, or a device
+    /// of the host wrote its pages since its last fill, and `cb` made to wait for each one's last
+    /// fill. A use that may write marks its cache written.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
@@ -203,10 +264,14 @@ impl<P: Platform> SurfaceCaches<P> {
                 continue;
             }
             used.push(u.block_offset);
-            let stale = self.by_block[&u.block_offset]
+            let older = self.by_block[&u.block_offset]
                 .generation
                 .is_none_or(|held| u.cpu_gen > held);
-            if stale {
+            let host_wrote = self.watched.take(u.block_offset);
+            if older || host_wrote {
+                if !older {
+                    self.counts.host_writes += 1;
+                }
                 self.fill(device, u.block_offset, u.cpu_gen)?;
             }
             let Some(cache) = self.by_block.get_mut(&u.block_offset) else {
@@ -254,7 +319,8 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Fills the cache of the block at `block` from the surface's pages, as of CPU generation
-    /// `generation`, on the transfer queue, after every command buffer that used it before.
+    /// `generation` or the newer one it holds, on the transfer queue, after every command buffer
+    /// that used it before.
     fn fill(&mut self, device: &P::Device, block: u64, generation: u64) -> RaiseResult<()> {
         if !self.make_transfer(device)? {
             return Ok(());
@@ -281,7 +347,7 @@ impl<P: Platform> SurfaceCaches<P> {
         cb.commit(ON)?;
         let length = cache.length;
         if let Some(cache) = self.by_block.get_mut(&block) {
-            cache.generation = Some(generation);
+            cache.generation = Some(cache.generation.map_or(generation, |g| g.max(generation)));
             cache.filled_at = value;
             cache.users.clear();
         }
@@ -291,18 +357,24 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Fills the cache of the block at `block` where it holds an older generation than
-    /// `generation`, and waits for the fill: a present of the surface shows the pages as of that
-    /// generation.
+    /// `generation`, or a device of the host wrote its pages since its last fill, and waits for
+    /// the fill: a present of the surface shows the pages as of that generation.
     pub(crate) fn fill_now(
         &mut self,
         device: &P::Device,
         block: u64,
         generation: u64,
     ) -> RaiseResult<()> {
-        let stale = (self.by_block.get(&block))
-            .is_some_and(|c| c.generation.is_none_or(|held| generation > held));
-        if !stale {
+        let Some(cache) = self.by_block.get(&block) else {
             return Ok(());
+        };
+        let older = cache.generation.is_none_or(|held| generation > held);
+        let host_wrote = self.watched.take(block);
+        if !older && !host_wrote {
+            return Ok(());
+        }
+        if !older {
+            self.counts.host_writes += 1;
         }
         self.fill(device, block, generation)?;
         let Some(t) = &self.transfer else {
@@ -318,15 +390,16 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: the pages written from its cache, after every
-    /// command buffer that used it, where one that may write it was committed since its last copy;
-    /// `done` once the pages hold it, at once where nothing is to copy.
+    /// command buffer that used it, where one that may write it was committed since its last copy
+    /// and no device of the host wrote the pages since its last fill; `done` once the pages hold
+    /// it, at once where nothing is to copy.
     pub(crate) fn download(
         &mut self,
         device: &P::Device,
         block: u64,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
-        let written = self.by_block.get(&block).is_some_and(|c| c.written);
+        let written = self.written_since_host(block);
         if !written {
             if self.by_block.contains_key(&block) {
                 self.counts.clean += 1;
@@ -338,21 +411,36 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The block at `block` went (its `BLOCK_RELEASE`): its cache goes once the pages hold what a
-    /// buffer wrote of it; `done` then, at once where nothing is to copy.
+    /// buffer wrote of it, unless a device of the host wrote them since its last fill; `done`
+    /// then, at once where nothing is to copy.
     pub(crate) fn released(
         &mut self,
         device: &P::Device,
         block: u64,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
-        let written = self.by_block.get(&block).is_some_and(|c| c.written);
-        if written {
+        if self.written_since_host(block) {
             self.write_back(device, block, done)?;
         } else {
             done();
         }
         self.by_block.remove(&block);
+        self.watched.0.lock().remove(&block);
         Ok(())
+    }
+
+    /// Whether the block's cache holds a command buffer's write the pages do not: one was
+    /// committed since its last copy, and no device of the host wrote the pages since its last
+    /// fill. Where one did, its write is the newer, and the cache's is dropped.
+    fn written_since_host(&mut self, block: u64) -> bool {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return false;
+        };
+        if cache.written && self.watched.written(block) {
+            cache.written = false;
+            self.counts.host_writes += 1;
+        }
+        cache.written
     }
 
     /// Copies the cache of the block at `block` into the surface's pages on the transfer queue,
@@ -473,11 +561,12 @@ mod tests {
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_OK, RgfxMsgHeader,
         RgfxQueueCreate,
     };
+    use reims_vgpu_core::num::ToU64 as _;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
-    use super::super::surface_pages::tests::{BLOCK, Rig, rig};
+    use super::super::surface_pages::tests::{BLOCK, RAM, Rig, rig};
     use super::*;
 
     const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
@@ -716,6 +805,75 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
         assert_eq!(r.dec.surface_caches.counts().downloads, 1);
+    }
+
+    /// A device of the host's write over a cache's pages has the cache's next use fill it again,
+    /// though of the generation it holds, and once; a write beside them does nothing. A cache a
+    /// buffer wrote is not copied over such a write, at a download or at a release
+    #[test]
+    fn a_host_devices_write_over_the_pages_refills_the_cache_and_is_not_overwritten() {
+        let mut r = cached();
+        let page = r.page;
+        let cache = cache_id(&r);
+        // The block's surface is guest pages 1 and 2.
+        let first = r.ram.host_addr(RAM + page).unwrap().addr().to_u64();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        device_writes::wrote(&[first - page..first, first + 2 * page..first + 3 * page]);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "beside the pages"
+        );
+
+        device_writes::wrote(&[
+            first + page + 8..first + page + 16,
+            first + 9 * page..u64::MAX,
+        ]);
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        let mark = r.p.call_log().mark();
+        r.dec
+            .surface_download(
+                &r.device,
+                BLOCK,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+            )
+            .unwrap();
+        assert!(done.load(Ordering::SeqCst), "answered at once");
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "the cache is not copied over the host's write"
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, false)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "filled again, of the same generation");
+        assert_eq!(filled[0].1, cache);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x103, &[(BLOCK, 1, true)]);
+        assert!(copies(&r.p.call_log().since(mark)).is_empty(), "once");
+
+        device_writes::wrote(&[first..first + 1, first + 9 * page..u64::MAX]);
+        let released = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&released);
+        let mark = r.p.call_log().mark();
+        r.dec
+            .block_released(
+                &r.device,
+                BLOCK,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+            )
+            .unwrap();
+        assert!(released.load(Ordering::SeqCst), "done at once");
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        let counts = r.dec.surface_caches.counts();
+        assert_eq!(
+            (counts.fills, counts.downloads, counts.host_writes),
+            (2, 0, 3)
+        );
     }
 
     /// A use of a block with no cache does nothing

@@ -35,10 +35,11 @@ use reims_graphics::wire::{
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxEventSignalled, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
+    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_PAGES,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxEventSignalled,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState,
+    RgfxSurfacePages,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -188,12 +189,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
             }
-            // No RGFX_FEATURE_SURFACE_CACHE yet: a write the host's own devices make into a
-            // cached surface's pages does not reach its cache.
-            let features = if decoder.surface_pages_available() {
-                u64::from(RGFX_FEATURE_SURFACE_PAGES)
-            } else {
-                0
+            // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks.
+            let features = match (decoder.surface_pages_available(), unified_memory) {
+                (false, _) => 0,
+                (true, true) => u64::from(RGFX_FEATURE_SURFACE_PAGES),
+                (true, false) => {
+                    u64::from(RGFX_FEATURE_SURFACE_PAGES) | u64::from(RGFX_FEATURE_SURFACE_CACHE)
+                }
             };
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {

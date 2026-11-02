@@ -18,7 +18,10 @@
 //!   bytes, the host lends it for writing (never a surface the guest made read-only for its
 //!   clients), and it is not the source's own memory. Anything else is **staged**: the source
 //!   copied in its lend into a buffer of the GPU's own, the destination written there and copied
-//!   back in its lend, the bytes the reference writes alone ([`covered`]).
+//!   back in its lend, the bytes the reference writes alone ([`covered`]). A destination written
+//!   in place is told so once the GPU is done with it
+//!   ([`reims_vgpu_video_core::surfaces::GuestSurface::device_wrote`]), as a lend is a write of
+//!   its own.
 //! - **Statuses**, in [`TransformJob::with_bytes`]'s order: a source that cannot be read, a
 //!   destination that cannot be written, a surface too small for its layout
 //!   (kIOReturnBadArgument), then the transform's own: kIOReturnUnsupported for a side outside
@@ -750,6 +753,8 @@ impl<G: Gpu> Accelerator for GpuAccelerator<G> {
         let staged = destination.staged;
         let ran = self.run(job, source, destination);
         if !staged {
+            // Written in place, by the GPU, as far as it ran.
+            job.destination.device_wrote();
             return ran.err().unwrap_or(io_return::SUCCESS);
         }
         // Staged: the destination's lend says whether it can be written, then what the kernel

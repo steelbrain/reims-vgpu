@@ -33,6 +33,7 @@
 compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
 
 mod device;
+mod device_writes;
 pub mod dirty;
 mod display;
 mod entry;

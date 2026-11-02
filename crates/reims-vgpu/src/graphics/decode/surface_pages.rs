@@ -24,6 +24,7 @@
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 
 use reims_graphics::wire::{RgfxBufferOverSurfacePages, RgfxPageRun, RgfxSurfacePages};
@@ -31,6 +32,7 @@ use reims_vgpu_core::guest::records::APV_PAGE_SIZE;
 use reims_vgpu_core::host::{HostPtr, PhysRange};
 use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::memory::mapping::Mapping;
+use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
@@ -254,6 +256,26 @@ impl<P: Platform> SurfaceViews<P> {
     /// The view of the block at `block`.
     pub(crate) fn view(&self, block: u64) -> Option<Arc<SurfaceView<P>>> {
         self.by_block.get(&block).map(|(v, _)| Arc::clone(v))
+    }
+
+    /// The host addresses of the guest pages of `runs` in the mapping of the guest's RAM the
+    /// memory map names, as runs ([`crate::device_writes::sorted`]): what the host's devices'
+    /// writes of them name. A page the map does not hold is left out.
+    pub(crate) fn host_runs(&self, runs: &[RgfxPageRun]) -> Vec<Range<u64>> {
+        let Some((memory, _)) = &self.memory else {
+            return Vec::new();
+        };
+        let mut pages = Vec::new();
+        for r in runs {
+            for at in (r.address..r.address.saturating_add(r.length)).step_by(GUEST_PAGE.to_usize())
+            {
+                let host = memory.virtual_address_for_physical(at, GUEST_PAGE);
+                if !host.is_null() {
+                    pages.push(host.addr().to_u64());
+                }
+            }
+        }
+        crate::device_writes::page_runs(&pages, GUEST_PAGE)
     }
 
     /// The block at `offset` went (its `BLOCK_RELEASE`): its view goes once the buffers over it
