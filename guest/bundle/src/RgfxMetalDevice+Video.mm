@@ -4,6 +4,7 @@
  */
 
 #import "RgfxCommandObjects.h"
+#import "RgfxIOSurface.h"
 #import "RgfxMetalDevice.h"
 
 #include <mutex>
@@ -130,7 +131,8 @@ void rgfx::video::forgetOutputs(Session *session)
 
 namespace {
 
-// A texture of `format` over `surface`'s plane `plane`, of the plane's size.
+// A texture of `format` over `surface`'s plane `plane`, of the plane's size; over the surface's
+// device cache where the host lands pictures there and the texture makes the surface's block.
 id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_t plane,
                             MTLPixelFormat format)
 {
@@ -140,6 +142,10 @@ id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_
 	                                                      height:IOSurfaceGetHeightOfPlane(surface, plane)
 	                                                   mipmapped:NO];
 	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	const RgfxVideoCaps *caps = [device videoCaps];
+	if ((caps->flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED) == 0)
+		return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
+	RgfxAskCachedScope ask;
 	return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
 }
 

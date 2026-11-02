@@ -140,6 +140,19 @@ NS_ASSUME_NONNULL_END
 /// surface's seed moved since any holder synced it (a view in place needs none).
 void rgfxIOSurfaceSyncBeforeCommit(void);
 
+/// While one lives on a thread, a surface's block that the thread's texture makes in place asks a
+/// device cache whatever the surface's planes and format: for a video decoder's outputs, whose
+/// pictures the host lands in the cache where its video caps say so
+/// (RGFX_VIDEO_CAPS_OUTPUT_CACHED), so they cross to the pages only at a CPU lock. A block
+/// another holder made keeps the mode that holder's ask gave it.
+class RgfxAskCachedScope {
+public:
+	RgfxAskCachedScope();
+	~RgfxAskCachedScope();
+	RgfxAskCachedScope(const RgfxAskCachedScope &) = delete;
+	RgfxAskCachedScope &operator=(const RgfxAskCachedScope &) = delete;
+};
+
 /// Lets go of every view the keep holds (the views in place kept past their textures,
 /// RgfxIOSurface.mm): at the process's memory pressure, and for the tests.
 void rgfxIOSurfaceKeepFlush(void);

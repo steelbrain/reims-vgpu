@@ -302,6 +302,8 @@ std::atomic<uint64_t> gCached{0};            // of them, cached on the host (the
 /// The views alive in the process whose blocks are cached: a command buffer looks for its uses of
 /// cached surfaces only while one lives (rgfxIOSurfaceNoteUse).
 std::atomic<uint64_t> gCachedLive{0};
+/// The RgfxAskCachedScopes alive on this thread.
+thread_local unsigned tAskCached = 0;
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
 std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
@@ -730,10 +732,12 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 			countView(gCopiedAlignment);
 		} else {
 			// The bundle asks a device cache for surfaces of one plane and no YCbCr: those the
-			// guest's compositors and apps draw. Video frames, of two planes or YCbCr, stay
-			// uncached, as host-side video devices may write their pages (design.md, "The
-			// device cache").
-			const bool cacheable = IOSurfaceGetPlaneCount(surface) <= 1 && !holdsYCbCr(surface);
+			// guest's compositors and apps draw. Other video frames, of two planes or YCbCr,
+			// stay uncached, as host-side video devices may write their pages (design.md, "The
+			// device cache"), but for the outputs of the bundle's own video decoder, which the
+			// host lands in their caches (RgfxAskCachedScope).
+			const bool cacheable = tAskCached > 0 ||
+			                       (IOSurfaceGetPlaneCount(surface) <= 1 && !holdsYCbCr(surface));
 			RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesRefused;
 			sharedBlock = region->acquireSurfacePages(IOSurfaceGetBaseAddress(surface), ownLength,
 			                                          ownSize, surfaceId, cacheable, &answer);
@@ -1269,6 +1273,16 @@ void rgfxIOSurfaceSyncBeforeCommit(void)
 	for (const auto &s : live) {
 		s->uploadIfChanged();
 	}
+}
+
+RgfxAskCachedScope::RgfxAskCachedScope()
+{
+	tAskCached++;
+}
+
+RgfxAskCachedScope::~RgfxAskCachedScope()
+{
+	tAskCached--;
 }
 
 // The texture over an IOSurface that `texture` is, or views through any views; nil for any other.

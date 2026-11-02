@@ -8470,6 +8470,33 @@ void test_iosurface_cached()
 		RgfxIOSurfaceTexture *video = overSurface(CVPixelBufferGetIOSurface(yuv),
 		                                          MTLTextureUsageShaderRead);
 		CHECK(video != nil && !src.cacheable);
+		// A video decoder's output, its plane's texture made under RgfxAskCachedScope: asked
+		// cached, though it has two planes of YCbCr; and one made after the scope is not.
+		auto lumaOf = [&](CVPixelBufferRef pb) {
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+			                                                       width:16
+			                                                      height:16
+			                                                   mipmapped:NO];
+			td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			return [RgfxIOSurfaceTexture textureWithDescriptor:td
+			                                        iosurface:CVPixelBufferGetIOSurface(pb)
+			                                            plane:0
+			                                           region:&region
+			                                           device:nil
+			                                       serializer:&ser];
+		};
+		CVPixelBufferRef decoded = pixelBuffer(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+		CVPixelBufferRef other = pixelBuffer(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+		{
+			RgfxAskCachedScope ask;
+			CHECK(lumaOf(decoded) != nil && src.cacheable &&
+			      src.surfaceId == IOSurfaceGetID(CVPixelBufferGetIOSurface(decoded)));
+		}
+		CHECK(lumaOf(other) != nil && !src.cacheable &&
+		      src.surfaceId == IOSurfaceGetID(CVPixelBufferGetIOSurface(other)));
+		CVPixelBufferRelease(decoded); // the views hold their surfaces
+		CVPixelBufferRelease(other);
 		src.answerCached = true;
 		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
