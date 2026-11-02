@@ -99,13 +99,9 @@ struct ContextState {
 	bool hooked;
 	// The thread call that posts freed blocks' releases (releaseFreedBlocks).
 	thread_call_t releaseCall;
-	// Whether the device uses surfaces' own pages in place (RGFX_FEATURE_SURFACE_PAGES), read
-	// from FEATURES_LO at the first context's open.
-	bool surfacePages;
 };
 ContextState state = {
-    nullptr, 0, 0, 1, {nullptr, 0, kMaxBlocks, 0, 0, 0}, {}, nullptr, nullptr, 0, false, nullptr,
-    false};
+    nullptr, 0, 0, 1, {nullptr, 0, kMaxBlocks, 0, 0, 0}, {}, nullptr, nullptr, 0, false, nullptr};
 IOLock *&contextLock = state.contextLock;
 UInt32 &slotsHeld = state.slotsHeld;
 UInt32 &nextSlot = state.nextSlot;
@@ -120,7 +116,9 @@ IOLock *&watchLock = state.watchLock;
 RgfxWatchedRing *&watched = state.watched;
 UInt32 &watchedCount = state.watchedCount;
 bool &hooked = state.hooked;
-bool &surfacePages = state.surfacePages;
+// Whether the device uses surfaces' own pages in place (RGFX_FEATURE_SURFACE_PAGES), read from
+// FEATURES_LO at the first context's open.
+bool surfacePages = false;
 // Under contextLock: the shared blocks of surface planes, made at the first ask.
 RgfxSurfaceTable surfaceTable = {nullptr, 0};
 
