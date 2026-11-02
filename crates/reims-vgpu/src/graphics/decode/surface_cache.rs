@@ -28,6 +28,23 @@
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
 //! it, and a GPU use after a read-write lock sees the CPU's writes. A CPU write made without a
 //! read-write lock reaches the GPU at the next fill, as on a GPU of its own memory.
+//!
+//! **Why a buffer, not an image (measured).** A texture over a Private buffer is a linear image in
+//! the GPU's memory on the Vulkan platform, and renders and samples as fast as a Private texture,
+//! where one over host pages is a shadow filled across PCIe at each first use. On an RTX 5080
+//! Laptop GPU (NVIDIA 615.71.09, Linux 7.2.8, metal2vulkan 45b3427434), a 3840x2400 BGRA8Unorm
+//! target, commit to completion, median of 60 frames, two rounds:
+//!
+//! | frame | Private texture | over a Private buffer | over host pages |
+//! |---|---|---|---|
+//! | a load-store pass, one quad in a 2400x2400 scissor | 96, 219 us | 105, 169 us | 1497, 1507 us |
+//! | the same, a 256x256 scissor | 41 us | 41 us | 276 us |
+//! | six full-target draws, each sampling a source of the target's size | 408, 439 us | 436, 440 us | 8563, 8570 us |
+//!
+//! The runtime renders a linear image in place where the driver reports its format's linear
+//! tiling as a color attachment, and on NVIDIA under `VK_NV_linear_color_attachment` where every
+//! color attachment of the pass is linear; elsewhere it renders through a stand-in copied within
+//! the GPU's memory. Neither is measured on a discrete RADV or ANV device yet.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
