@@ -165,6 +165,12 @@ pub const RGFX_DEVICE_INFO_OFFSET: u64 = RGFX_CONTROL_COMPLETE_OFFSET
     + RGFX_RING_HEADER_SIZE as u64
     + RGFX_CONTROL_RING_DATA_SIZE as u64;
 
+/// Where the video caps ([`RgfxVideoCaps`]) sit in the region: right after the device-info blob
+/// (whose size is 1432 bytes and 64 per format), written with it at the device's init. A host
+/// older than them leaves the bytes zero, which read as no codec.
+pub const RGFX_VIDEO_CAPS_OFFSET: u64 =
+    RGFX_DEVICE_INFO_OFFSET + 1432 + 64 * RGFX_DEVICE_INFO_FORMATS as u64;
+
 /// A ring's header, at the start of the ring: each field in a 64-byte line of its own, so the
 /// producer's and the consumer's writes never share a cache line.
 #[repr(C)]
@@ -367,6 +373,12 @@ pub const RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER: u32 = 0x21b;
 /// `BLOCK_RELEASE` is refused while the buffer lives. Not answered; refused, making nothing,
 /// where the block has no view of its pages or `length` passes them.
 pub const RGFX_CMD_BUFFER_OVER_SURFACE_PAGES: u32 = 0x21c;
+/// Command `VIDEO_SESSION_CREATE` ([`RgfxVideoSessionCreate`]): a video session of one codec and
+/// direction, which command buffers' video encoders name
+/// ([`RGFX_OP_ENCODER_BEGIN_VIDEO`](crate::ops::RGFX_OP_ENCODER_BEGIN_VIDEO)); `OBJECT_DESTROY`
+/// drops it. What the host's hardware takes is in the video caps ([`RgfxVideoCaps`]). Not
+/// answered: where the host has no such session, the command buffers that name it fail.
+pub const RGFX_CMD_VIDEO_SESSION_CREATE: u32 = 0x21d;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -2204,6 +2216,97 @@ impl Default for RgfxDeviceInfo {
     }
 }
 
+/// The version of the [`RgfxVideoCaps`] layout the host writes; 0, a host's that writes none.
+pub const RGFX_VIDEO_CAPS_VERSION: u32 = 1;
+
+/// The most codec answers [`RgfxVideoCaps`] holds.
+pub const RGFX_VIDEO_CAPS_CODECS: usize = 16;
+
+/// [`RgfxVideoCodecCaps::codec`] and [`RgfxVideoSessionCreate::codec`]: H.264.
+pub const RGFX_VIDEO_CODEC_H264: u32 = 1;
+/// [`RgfxVideoCodecCaps::codec`] and [`RgfxVideoSessionCreate::codec`]: HEVC.
+pub const RGFX_VIDEO_CODEC_HEVC: u32 = 2;
+
+/// [`RgfxVideoCodecCaps::direction`] and [`RgfxVideoSessionCreate::direction`]: decode.
+pub const RGFX_VIDEO_DECODE: u32 = 1;
+/// [`RgfxVideoCodecCaps::direction`] and [`RgfxVideoSessionCreate::direction`]: encode.
+pub const RGFX_VIDEO_ENCODE: u32 = 2;
+
+/// [`RgfxVideoCodecCaps::profiles`] of H.264: Baseline (`profile_idc` 66; a Constrained
+/// Baseline stream decodes as one).
+pub const RGFX_VIDEO_H264_BASELINE: u32 = 1 << 0;
+/// [`RgfxVideoCodecCaps::profiles`] of H.264: Main (77).
+pub const RGFX_VIDEO_H264_MAIN: u32 = 1 << 1;
+/// [`RgfxVideoCodecCaps::profiles`] of H.264: High (100).
+pub const RGFX_VIDEO_H264_HIGH: u32 = 1 << 2;
+
+/// [`RgfxVideoCodecCaps::formats`]: 8-bit 4:2:0 in two planes, NV12 (`'420v'`, `'420f'`).
+pub const RGFX_VIDEO_FORMAT_NV12: u32 = 1 << 0;
+/// [`RgfxVideoCodecCaps::formats`]: 10-bit 4:2:0 in two planes, P010 (`'x420'`, `'xf20'`).
+pub const RGFX_VIDEO_FORMAT_P010: u32 = 1 << 1;
+
+/// What the host's hardware takes of one codec in one direction, as its video API answers it.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoCodecCaps {
+    /// An `RGFX_VIDEO_CODEC_*`.
+    pub codec: u32,
+    /// [`RGFX_VIDEO_DECODE`] or [`RGFX_VIDEO_ENCODE`].
+    pub direction: u32,
+    /// The profiles taken, `RGFX_VIDEO_<codec>_*` bits.
+    pub profiles: u32,
+    /// The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2).
+    pub max_level: u32,
+    /// The smallest coded picture: width, height.
+    pub min_size: [u32; 2],
+    /// The largest coded picture: width, height.
+    pub max_size: [u32; 2],
+    /// The most pictures the decoded picture buffer holds, the current one included.
+    pub max_dpb_pictures: u32,
+    /// The most pictures one picture references.
+    pub max_references: u32,
+    /// The output formats taken, `RGFX_VIDEO_FORMAT_*` bits.
+    pub formats: u32,
+    /// What a decode reads its access unit in place at: where the access unit starts at a
+    /// multiple of this many bytes in its buffer, and its length, zeros padding its end, is one
+    /// too; elsewhere the host copies it. 1 where any place and length do; 0 for an encode.
+    pub bitstream_alignment: u32,
+}
+
+/// The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
+/// [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
+/// video driver lists, and none for the rest, which the guest's software codecs serve.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoCaps {
+    /// [`RGFX_VIDEO_CAPS_VERSION`]; 0 from a host that writes none.
+    pub version: u32,
+    /// The entries of `codecs` in use.
+    pub codec_count: u32,
+    /// The codecs' answers, `codec_count` in use.
+    pub codecs: [RgfxVideoCodecCaps; RGFX_VIDEO_CAPS_CODECS],
+}
+
+/// `VIDEO_SESSION_CREATE`: a video session.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoSessionCreate {
+    /// [`RGFX_CMD_VIDEO_SESSION_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The session's guest-picked id.
+    pub obj_id: u64,
+    /// An `RGFX_VIDEO_CODEC_*`.
+    pub codec: u32,
+    /// [`RGFX_VIDEO_DECODE`] or [`RGFX_VIDEO_ENCODE`].
+    pub direction: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Stage 3: render and compute pipeline creates and their reflection reply
 // (RGFX_CMD_RENDER_PIPELINE_CREATE 0x20d, RGFX_CMD_COMPUTE_PIPELINE_CREATE
@@ -2621,6 +2724,16 @@ const _: () = {
     assert!(
         RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64 <= RGFX_ALLOCATIONS_OFFSET
     );
+    // The video caps follow it, still in the completion ring's span.
+    assert!(size_of::<RgfxVideoCodecCaps>() == 48);
+    assert!(size_of::<RgfxVideoCaps>() == 8 + 48 * RGFX_VIDEO_CAPS_CODECS);
+    assert!(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64);
+    assert!(RGFX_VIDEO_CAPS_OFFSET.is_multiple_of(8));
+    assert!(
+        RGFX_VIDEO_CAPS_OFFSET + size_of::<RgfxVideoCaps>() as u64
+            <= RGFX_CONTROL_COMPLETE_OFFSET + RGFX_CONTROL_RING_SPAN
+    );
+    assert!(size_of::<RgfxVideoSessionCreate>() == 32);
     // Pipeline creates and reflection.
     assert!(size_of::<RgfxFunctionConstant>() == 40);
     assert!(size_of::<RgfxColorAttachmentDesc>() == 40);

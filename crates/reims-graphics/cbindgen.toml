@@ -216,6 +216,7 @@ include = [
     "RgfxOpUseHeapsStages",
     "RgfxOpUseResources",
     "RgfxOpUseResourcesStages",
+    "RgfxOpVideoPass",
     "RgfxOpWaitForFence",
     "RgfxPageRun",
     "RgfxPipelineReflection",
@@ -259,6 +260,10 @@ include = [
     "RgfxVblank",
     "RgfxVertexAttribute",
     "RgfxVertexBufferLayout",
+    "RgfxVideoCaps",
+    "RgfxVideoCodecCaps",
+    "RgfxVideoOpDecodeH264",
+    "RgfxVideoSessionCreate",
     "RgfxViewMapping",
     "RgfxViewportElem",
 ]

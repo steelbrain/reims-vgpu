@@ -29,6 +29,9 @@
 // The blit-encoder group (`tag >> 12`): [`blit`].
 #define RGFX_OP_GROUP_BLIT 3
 
+// The video-encoder group (`tag >> 12`): [`video`].
+#define RGFX_OP_GROUP_VIDEO 4
+
 // Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
 // describes (an [`RgfxRenderPassDesc`] then its `color_count`
 // [`RgfxRenderPassColorAttachment`] records). Holds the encoder until
@@ -71,6 +74,11 @@
 // the host reads it as it takes the buffer, before its other ops. The bundle puts it last, as it
 // commits.
 #define RGFX_OP_SUBMITTED 8
+
+// Op `ENCODER_BEGIN_VIDEO` ([`RgfxOpVideoPass`]): open a video encoder on the session the body
+// names, for the [`video`] ops, until [`RGFX_OP_ENCODER_END`]. A command buffer with a video
+// encoder has no other encoder.
+#define RGFX_OP_ENCODER_BEGIN_VIDEO 9
 
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
@@ -645,6 +653,27 @@
 // `setDepthStoreActionOptions:`.
 #define RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS 4175
 
+// Op `DECODE_H264` ([`RgfxVideoOpDecodeH264`], then its parameter sets): decode one H.264
+// access unit into an IOSurface of two planes, NV12's (`'420v'` or `'420f'`).
+//
+// The access unit is its slices' NAL units, in Annex-B form (each after a start code), the
+// `bitstream_size` bytes at `bitstream_offset` in the buffer `bitstream_buffer_obj_id`, which
+// the host reads in place. The SPS and PPS NAL units the slices use, in Annex-B form too,
+// follow the body (`parameter_sets_size` bytes, padded with zeros to a multiple of 8) where
+// they changed since the session's last decode, its first included; the host keeps those it
+// was given before, by their ids, as a decoder of a stream does.
+//
+// The picture lands in the surface whose planes `luma_texture_obj_id` (`R8Unorm`, plane 0) and
+// `chroma_texture_obj_id` (`RG8Unorm`, plane 1) lie over (`TEXTURE_FROM_IOSURFACE`), at their
+// origin, in its coded size cropped as the SPS says. The command buffer writes the surface: a
+// CPU lock of it waits for the buffer's completion, as for any GPU write. Which pictures the
+// stream references, and when they leave the decoded picture buffer, is the host's, from the
+// stream: the surface holds the output alone.
+#define RGFX_OP_VIDEO_DECODE_H264 16384
+
+// Where a `DECODE_H264` op's parameter sets start: right after its body.
+#define RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET 48
+
 // The device's PCI vendor ID: a placeholder until the owner picks the device's own.
 #define RGFX_PCI_VENDOR_ID 4660
 
@@ -816,6 +845,11 @@
 // KiB, smaller than the 64 KiB span), after the ring and before the guest's allocations, so it
 // adds no offset the rings or the allocations move for. It is a flat caps page, never a ring.
 #define RGFX_DEVICE_INFO_OFFSET ((RGFX_CONTROL_COMPLETE_OFFSET + (uint64_t)RGFX_RING_HEADER_SIZE) + (uint64_t)RGFX_CONTROL_RING_DATA_SIZE)
+
+// Where the video caps ([`RgfxVideoCaps`]) sit in the region: right after the device-info blob
+// (whose size is 1432 bytes and 64 per format), written with it at the device's init. A host
+// older than them leaves the bytes zero, which read as no codec.
+#define RGFX_VIDEO_CAPS_OFFSET ((RGFX_DEVICE_INFO_OFFSET + 1432) + (64 * (uint64_t)RGFX_DEVICE_INFO_FORMATS))
 
 // A pad to the ring's end: its `size` covers the bytes left, 8 or more, and it has no `seqno`.
 #define RGFX_MSG_PAD 0
@@ -1023,6 +1057,13 @@
 // `BLOCK_RELEASE` is refused while the buffer lives. Not answered; refused, making nothing,
 // where the block has no view of its pages or `length` passes them.
 #define RGFX_CMD_BUFFER_OVER_SURFACE_PAGES 540
+
+// Command `VIDEO_SESSION_CREATE` ([`RgfxVideoSessionCreate`]): a video session of one codec and
+// direction, which command buffers' video encoders name
+// ([`RGFX_OP_ENCODER_BEGIN_VIDEO`](crate::ops::RGFX_OP_ENCODER_BEGIN_VIDEO)); `OBJECT_DESTROY`
+// drops it. What the host's hardware takes is in the video caps ([`RgfxVideoCaps`]). Not
+// answered: where the host has no such session, the command buffers that name it fail.
+#define RGFX_CMD_VIDEO_SESSION_CREATE 541
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -1335,6 +1376,40 @@
 // The sparse tiles [`RgfxFormatAnswers::sparse_tiles`] holds: sample counts 1, 2 and 4, each
 // at pages of 16, 64 and 256 KiB.
 #define RGFX_DEVICE_INFO_SPARSE_TILES 9
+
+// The version of the [`RgfxVideoCaps`] layout the host writes; 0, a host's that writes none.
+#define RGFX_VIDEO_CAPS_VERSION 1
+
+// The most codec answers [`RgfxVideoCaps`] holds.
+#define RGFX_VIDEO_CAPS_CODECS 16
+
+// [`RgfxVideoCodecCaps::codec`] and [`RgfxVideoSessionCreate::codec`]: H.264.
+#define RGFX_VIDEO_CODEC_H264 1
+
+// [`RgfxVideoCodecCaps::codec`] and [`RgfxVideoSessionCreate::codec`]: HEVC.
+#define RGFX_VIDEO_CODEC_HEVC 2
+
+// [`RgfxVideoCodecCaps::direction`] and [`RgfxVideoSessionCreate::direction`]: decode.
+#define RGFX_VIDEO_DECODE 1
+
+// [`RgfxVideoCodecCaps::direction`] and [`RgfxVideoSessionCreate::direction`]: encode.
+#define RGFX_VIDEO_ENCODE 2
+
+// [`RgfxVideoCodecCaps::profiles`] of H.264: Baseline (`profile_idc` 66; a Constrained
+// Baseline stream decodes as one).
+#define RGFX_VIDEO_H264_BASELINE (1 << 0)
+
+// [`RgfxVideoCodecCaps::profiles`] of H.264: Main (77).
+#define RGFX_VIDEO_H264_MAIN (1 << 1)
+
+// [`RgfxVideoCodecCaps::profiles`] of H.264: High (100).
+#define RGFX_VIDEO_H264_HIGH (1 << 2)
+
+// [`RgfxVideoCodecCaps::formats`]: 8-bit 4:2:0 in two planes, NV12 (`'420v'`, `'420f'`).
+#define RGFX_VIDEO_FORMAT_NV12 (1 << 0)
+
+// [`RgfxVideoCodecCaps::formats`]: 10-bit 4:2:0 in two planes, P010 (`'x420'`, `'xf20'`).
+#define RGFX_VIDEO_FORMAT_P010 (1 << 1)
 
 // A pipeline reflection reply's status: the pipeline was created.
 #define RGFX_PIPELINE_OK 0
@@ -3975,6 +4050,13 @@ typedef struct {
   uint64_t stages;
 } RgfxOpUseResourcesStages;
 
+// The body of [`RGFX_OP_ENCODER_BEGIN_VIDEO`].
+typedef struct {
+  // The video session
+  // ([`RGFX_CMD_VIDEO_SESSION_CREATE`](crate::wire::RGFX_CMD_VIDEO_SESSION_CREATE)'s object).
+  uint64_t session_obj_id;
+} RgfxOpVideoPass;
+
 // `waitForFence:beforeStages:`. The fence must name an object.
 typedef struct {
   // The fence (must not be nil).
@@ -4789,6 +4871,74 @@ typedef struct {
   // The step rate.
   uint32_t step_rate;
 } RgfxVertexBufferLayout;
+
+// What the host's hardware takes of one codec in one direction, as its video API answers it.
+typedef struct {
+  // An `RGFX_VIDEO_CODEC_*`.
+  uint32_t codec;
+  // [`RGFX_VIDEO_DECODE`] or [`RGFX_VIDEO_ENCODE`].
+  uint32_t direction;
+  // The profiles taken, `RGFX_VIDEO_<codec>_*` bits.
+  uint32_t profiles;
+  // The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2).
+  uint32_t max_level;
+  // The smallest coded picture: width, height.
+  uint32_t min_size[2];
+  // The largest coded picture: width, height.
+  uint32_t max_size[2];
+  // The most pictures the decoded picture buffer holds, the current one included.
+  uint32_t max_dpb_pictures;
+  // The most pictures one picture references.
+  uint32_t max_references;
+  // The output formats taken, `RGFX_VIDEO_FORMAT_*` bits.
+  uint32_t formats;
+  // What a decode reads its access unit in place at: where the access unit starts at a
+  // multiple of this many bytes in its buffer, and its length, zeros padding its end, is one
+  // too; elsewhere the host copies it. 1 where any place and length do; 0 for an encode.
+  uint32_t bitstream_alignment;
+} RgfxVideoCodecCaps;
+
+// The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
+// [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
+// video driver lists, and none for the rest, which the guest's software codecs serve.
+typedef struct {
+  // [`RGFX_VIDEO_CAPS_VERSION`]; 0 from a host that writes none.
+  uint32_t version;
+  // The entries of `codecs` in use.
+  uint32_t codec_count;
+  // The codecs' answers, `codec_count` in use.
+  RgfxVideoCodecCaps codecs[RGFX_VIDEO_CAPS_CODECS];
+} RgfxVideoCaps;
+
+// The body of [`RGFX_OP_VIDEO_DECODE_H264`], followed by its parameter sets.
+typedef struct {
+  // The buffer that holds the access unit.
+  uint64_t bitstream_buffer_obj_id;
+  // The access unit's first byte in the buffer.
+  uint64_t bitstream_offset;
+  // The access unit's bytes.
+  uint64_t bitstream_size;
+  // The texture over the output surface's plane 0.
+  uint64_t luma_texture_obj_id;
+  // The texture over the output surface's plane 1.
+  uint64_t chroma_texture_obj_id;
+  // The bytes of SPS and PPS NAL units after this body, before its padding; 0 for none.
+  uint32_t parameter_sets_size;
+  // Zero.
+  uint32_t reserved_2c;
+} RgfxVideoOpDecodeH264;
+
+// `VIDEO_SESSION_CREATE`: a video session.
+typedef struct {
+  // [`RGFX_CMD_VIDEO_SESSION_CREATE`].
+  RgfxMsgHeader header;
+  // The session's guest-picked id.
+  uint64_t obj_id;
+  // An `RGFX_VIDEO_CODEC_*`.
+  uint32_t codec;
+  // [`RGFX_VIDEO_DECODE`] or [`RGFX_VIDEO_ENCODE`].
+  uint32_t direction;
+} RgfxVideoSessionCreate;
 
 // One element of a vertex-amplification view-mapping array
 // ([`RgfxOpSetVertexAmplificationCount`]): an `MTLVertexAmplificationViewMapping`.

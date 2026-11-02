@@ -24,6 +24,7 @@
 //! | render encoder | 1 | `0x1xxx` | [`render`] |
 //! | compute encoder | 2 | `0x2xxx` | [`compute`] |
 //! | blit encoder | 3 | `0x3xxx` | [`blit`] |
+//! | video encoder | 4 | `0x4xxx` | [`video`] |
 //!
 //! The host dispatches by group: framing ops (encoder begin/end) it handles
 //! itself, and each encoder group's ops it hands to that group's decoder.
@@ -45,6 +46,7 @@ use crate::wire::RgfxMsgHeader;
 pub mod blit;
 pub mod compute;
 pub mod render;
+pub mod video;
 
 /// The group of ops a `tag` belongs to: `tag >> 12`.
 pub const fn op_group(tag: u16) -> u16 {
@@ -61,6 +63,8 @@ pub const RGFX_OP_GROUP_RENDER: u16 = 0x1;
 pub const RGFX_OP_GROUP_COMPUTE: u16 = 0x2;
 /// The blit-encoder group (`tag >> 12`): [`blit`].
 pub const RGFX_OP_GROUP_BLIT: u16 = 0x3;
+/// The video-encoder group (`tag >> 12`): [`video`].
+pub const RGFX_OP_GROUP_VIDEO: u16 = 0x4;
 
 /// Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
 /// describes (an [`RgfxRenderPassDesc`] then its `color_count`
@@ -97,6 +101,10 @@ pub const RGFX_OP_SURFACE_USE: u16 = 0x0007;
 /// the host reads it as it takes the buffer, before its other ops. The bundle puts it last, as it
 /// commits.
 pub const RGFX_OP_SUBMITTED: u16 = 0x0008;
+/// Op `ENCODER_BEGIN_VIDEO` ([`RgfxOpVideoPass`]): open a video encoder on the session the body
+/// names, for the [`video`] ops, until [`RGFX_OP_ENCODER_END`]. A command buffer with a video
+/// encoder has no other encoder.
+pub const RGFX_OP_ENCODER_BEGIN_VIDEO: u16 = 0x0009;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
@@ -115,6 +123,17 @@ pub struct RgfxOpSurfaceUse {
     pub flags: u32,
     /// Zero.
     pub reserved_14: u32,
+}
+
+/// The body of [`RGFX_OP_ENCODER_BEGIN_VIDEO`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpVideoPass {
+    /// The video session
+    /// ([`RGFX_CMD_VIDEO_SESSION_CREATE`](crate::wire::RGFX_CMD_VIDEO_SESSION_CREATE)'s object).
+    pub session_obj_id: u64,
 }
 
 /// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
@@ -391,6 +410,8 @@ const _: () = {
     assert!(size_of::<RgfxComputePassDesc>() == 8);
     assert!(size_of::<RgfxOpEvent>() == 16);
     assert!(size_of::<RgfxOpSurfaceUse>() == 24);
+    assert!(size_of::<RgfxOpVideoPass>() == 8);
+    assert!(op_group(RGFX_OP_ENCODER_BEGIN_VIDEO) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);
     // Each group's tag range maps to its own `op_group`.
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_RENDER) == RGFX_OP_GROUP_FRAMING);
