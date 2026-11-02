@@ -46,8 +46,10 @@ constexpr UInt32 kWaitMs = 2000;
 constexpr UInt32 kPollUs = 1000;
 // The most queues one surface's lock looks at the completions of.
 constexpr UInt32 kMaxLookedAt = 16;
-// How many device caches made are logged, with what IOSurface answered.
+// How many device caches made are logged, with what IOSurface answered, and how many writes
+// named of surfaces the kext cannot follow.
 constexpr UInt32 kCachesLogged = 4;
+constexpr UInt32 kSkipsLogged = 8;
 
 // One initialised object (it lands in __DATA,__data, as the contexts' state does), made at the
 // first write named and kept for the kernel's life.
@@ -63,9 +65,11 @@ struct LockState {
 	// Writes the table had no room for, logged at the first.
 	uint32_t dropped;
 	uint32_t waitMs;
+	// Writes named of surfaces the kext cannot follow, logged up to kSkipsLogged.
+	uint32_t skipsLogged;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs};
+                   kWaitMs, 0};
 
 bool startLocks()
 {
@@ -246,18 +250,38 @@ void RgfxAccelerator::noteSurfaceWrites(RgfxAcceleratorUserClient *client, task_
                                         UInt64 queue, UInt64 seqno, const UInt64 *pairs,
                                         UInt32 count)
 {
-	if (!startLocks())
+	if (!startLocks()) {
+		if (__atomic_fetch_add(&state.skipsLogged, 1, __ATOMIC_RELAXED) < kSkipsLogged)
+			IOLog("RgfxAccelerator: no memory for the GPU's pending writes: CPU locks of "
+			      "surfaces wait for no GPU write\n");
 		return;
+	}
 	for (UInt32 i = 0; i < count; i++) {
 		const UInt64 offset = pairs[2 * i];
 		const UInt64 id = pairs[2 * i + 1];
 		RgfxDeviceCache *cache = nullptr;
 		OSObject *surface = nullptr;
 		bool inPlace = false;
-		if (id == 0 || id > UINT32_MAX ||
-		    !surfaceDeviceCache(client, task, offset, static_cast<uint32_t>(id),
-		                        reinterpret_cast<void **>(&cache), &surface, &inPlace))
+		SurfaceCacheAnswer answer =
+		    id == 0 || id > UINT32_MAX
+		        ? kSurfaceCacheOtherSurface
+		        : surfaceDeviceCache(client, task, offset, static_cast<uint32_t>(id),
+		                             reinterpret_cast<void **>(&cache), &surface, &inPlace);
+		if (answer != kSurfaceCacheMade) {
+			// kSurfaceCacheNone was logged where the cache was tried.
+			if (answer != kSurfaceCacheNone &&
+			    __atomic_fetch_add(&state.skipsLogged, 1, __ATOMIC_RELAXED) < kSkipsLogged) {
+				static const char *const why[] = {"", "is not a shared block it holds",
+				                                  "has its pages not yet the device's",
+				                                  "is another surface's"};
+				char name[32] = {};
+				proc_name(proc_selfpid(), name, sizeof(name));
+				IOLog("RgfxAccelerator: %s[%d] names a GPU write of IOSurface %llu at block "
+				      "0x%llx, which %s: its locks do not wait for it\n",
+				      name, proc_selfpid(), id, offset, why[answer]);
+			}
 			continue;
+		}
 		// Noted before the cache is current, so a lock that finds it current finds the write.
 		IOLockLock(state.lock);
 		bool kept = rgfxLockNote(state.table, reinterpret_cast<uintptr_t>(cache), queue, seqno,

@@ -798,32 +798,40 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 	return gone == kRgfxSurfaceLetGoNotHeld ? kIOReturnBadArgument : kIOReturnSuccess;
 }
 
-bool RgfxAccelerator::surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t task,
-                                         UInt64 offset, uint32_t surfaceId, void **cache,
-                                         OSObject **surface, bool *inPlace)
+RgfxAccelerator::SurfaceCacheAnswer
+RgfxAccelerator::surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t task,
+                                    UInt64 offset, uint32_t surfaceId, void **cache,
+                                    OSObject **surface, bool *inPlace)
 {
 	if (!contextLock)
-		return false;
+		return kSurfaceCacheNotHeld;
 	RgfxSurfaceTable &table = surfaceTable;
 	IOLockLock(contextLock);
 	int32_t at = table.entries ? rgfxSurfaceAt(table, offset) : -1;
 	RgfxSurfaceEntry *e = at >= 0 ? &table.entries[at] : nullptr;
-	bool ok = e && !e->pending && e->runCount && rgfxSurfaceHeldBy(table, client, offset, 1);
-	if (ok && !e->cache && !e->noCache) {
+	SurfaceCacheAnswer answer = kSurfaceCacheMade;
+	if (!e || !e->runCount || !rgfxSurfaceHeldBy(table, client, offset, 1))
+		answer = kSurfaceCacheNotHeld;
+	else if (e->pending)
+		answer = kSurfaceCachePending;
+	if (answer == kSurfaceCacheMade && !e->cache && !e->noCache) {
 		e->noCache = !rgfxSurfaceLocksAttach(this, task, surfaceId, e->runs[0].address,
 		                                     &e->surface, &e->cache);
 		if (!e->noCache)
 			e->surfaceId = surfaceId;
 	}
-	ok = ok && e->cache && e->surfaceId == surfaceId;
-	if (ok) {
+	if (answer == kSurfaceCacheMade && !e->cache)
+		answer = kSurfaceCacheNone;
+	else if (answer == kSurfaceCacheMade && e->surfaceId != surfaceId)
+		answer = kSurfaceCacheOtherSurface;
+	if (answer == kSurfaceCacheMade) {
 		*cache = e->cache;
 		*surface = static_cast<OSObject *>(e->surface);
 		(*surface)->retain();
 		*inPlace = e->inPlace;
 	}
 	IOLockUnlock(contextLock);
-	return ok;
+	return answer;
 }
 
 void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)

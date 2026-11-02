@@ -258,8 +258,14 @@ void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const 
 	words.push_back(seqno);
 	words.push_back(count);
 	words.insert(words.end(), writes, writes + 2 * static_cast<size_t>(count));
-	IOConnectCallStructMethod(conn, kRgfxAccelMethodSurfaceWrites, words.data(),
-	                          words.size() * sizeof(uint64_t), nullptr, nullptr);
+	kern_return_t r = IOConnectCallStructMethod(conn, kRgfxAccelMethodSurfaceWrites, words.data(),
+	                                            words.size() * sizeof(uint64_t), nullptr, nullptr);
+	// A refusal leaves the surfaces' CPU locks waiting for nothing; the kext logs it too.
+	static std::atomic<int> refusals{0};
+	if (r != KERN_SUCCESS && refusals.fetch_add(1) < 4)
+		NSLog(@"RGFX: the kext refused the naming of %u surface writes of queue %llu's buffer %llu "
+		      @"(0x%x)",
+		      count, (unsigned long long)queue, (unsigned long long)seqno, r);
 }
 
 void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)

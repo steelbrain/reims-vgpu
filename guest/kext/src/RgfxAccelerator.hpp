@@ -306,10 +306,19 @@ public:
 	// The device cache of the shared block at `offset`, which `client` holds, for the surface of
 	// ID `surfaceId` (RgfxAcceleratorContexts.cpp): made at the first ask and kept with the
 	// block's entry. Its IOSurface comes retained, for the caller to release, and `*inPlace` says
-	// whether the device draws it in place. False where the client holds no such block, the
-	// block's surface is another, or no cache could be made.
-	bool surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t task, UInt64 offset,
-	                        uint32_t surfaceId, void **cache, OSObject **surface, bool *inPlace);
+	// whether the device draws it in place. Else why there is none: the client holds no such
+	// block, its pages are not yet the device's, its surface is another, or no cache could be made
+	// (logged where it was tried).
+	enum SurfaceCacheAnswer : UInt32 {
+		kSurfaceCacheMade,
+		kSurfaceCacheNotHeld,
+		kSurfaceCachePending,
+		kSurfaceCacheOtherSurface,
+		kSurfaceCacheNone,
+	};
+	SurfaceCacheAnswer surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t task,
+	                                      UInt64 offset, uint32_t surfaceId, void **cache,
+	                                      OSObject **surface, bool *inPlace);
 	void retireSurfaceWrites(UInt64 queue, UInt64 seqno);
 	void forgetQueueWrites(UInt64 queue);
 

@@ -14,6 +14,7 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <sys/proc.h>
 
 namespace {
 // How long a pipeline create waits for its reflection: the host compiles it first, which may
@@ -367,9 +368,20 @@ IOReturn RgfxAcceleratorUserClient::surfaceWritesMethod(IOExternalMethodArgument
 	if (r == kIOReturnSuccess && (count != (size / sizeof(UInt64) - 3) / 2 ||
 	                              size != (3 + 2 * count) * sizeof(UInt64) || !ownsQueue(words[0])))
 		r = kIOReturnBadArgument;
-	if (r == kIOReturnSuccess)
+	if (r == kIOReturnSuccess) {
 		owner->noteSurfaceWrites(this, task, words[0], words[1], words + 3,
 		                         static_cast<UInt32>(count));
+	} else {
+		// A refused naming leaves its surfaces' locks waiting for nothing: the first few say so.
+		static UInt32 refusalsLogged;
+		if (__atomic_fetch_add(&refusalsLogged, 1, __ATOMIC_RELAXED) < 8) {
+			char name[32] = {};
+			proc_name(proc_selfpid(), name, sizeof(name));
+			IOLog("RgfxAccelerator: %s[%d]'s naming of a command buffer's surface writes "
+			      "(%llu bytes) is refused (0x%x): their locks do not wait for them\n",
+			      name, proc_selfpid(), size, r);
+		}
+	}
 	IOFree(words, size);
 	return r;
 }
