@@ -842,14 +842,19 @@ the map m2v gave). The ring's armed/interrupt handshake is the stage-2 one.
 goes on the queue's completion ring once the host's platform has scheduled the buffer: the
 buffer's platform scheduled handler posts it, which Metal and metal2vulkan run once every wait
 of the buffer is satisfied and its work is submitted, ahead of its `CB_COMPLETE`. The guest's
-buffer is then submitted (`commitAndWaitUntilSubmitted` returns, before the scheduled handlers
-run), becomes `Scheduled`, runs its scheduled handlers, then lets `waitUntilScheduled` return,
-as Metal's does (measured on the M3 Max, macOS 27: on an idle queue
-`commitAndWaitUntilSubmitted` returns in 0.05-0.1 ms with the buffer `Committed` and its
-scheduled handler about 10 us from running; behind a 120 ms buffer it and `waitUntilScheduled`
-return in 0.1 ms, `Scheduled`; a buffer that waits for an event nothing has signalled is
-neither submitted nor scheduled until the event is signalled, or Metal's timeout fails it after
-5 s). A buffer the host could not
+buffer then becomes `Scheduled` and runs its scheduled handlers, as Metal's does. Metal's
+`commitAndWaitUntilSubmitted` and `waitUntilScheduled` return there too (measured on the M3
+Max, macOS 27: on an idle queue `commitAndWaitUntilSubmitted` returns in 0.05-0.1 ms with the
+buffer `Committed` and its scheduled handler about 10 us from running; behind a 120 ms buffer
+it and `waitUntilScheduled` return in 0.1 ms, `Scheduled`; a buffer that waits for an event
+nothing has signalled is neither submitted nor scheduled until the event is signalled, or
+Metal's timeout fails it after 5 s). The bundle's wait for the buffer's completion instead: on
+Metal a CPU lock of a surface the buffer writes, from another process, waits for the GPU's
+writes (measured likewise: a read-only or read-write lock from another process returns at the
+writing buffer's completion, one from the committing process at once, and a read-write lock
+also waits for a buffer that only reads it), and the kext makes no such lock wait yet. Until it
+does, returning at submission would let a screen capture read a surface's pages before the GPU
+wrote them. A buffer the host could not
 carry out has no `CB_SCHEDULED`, and its `CB_COMPLETE` stands for both; so does every
 `CB_COMPLETE` from a host that posts none.
 

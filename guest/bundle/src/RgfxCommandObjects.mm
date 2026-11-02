@@ -1366,20 +1366,26 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 }
 
 // The command-buffer SPI SkyLight's compositor and VideoToolbox call: commits, then waits until
-// the buffer is submitted (its CB_SCHEDULED, rgfxReachScheduled), not until it runs, as Metal's
-// does; YES unless it failed by then.
+// the buffer completes; YES unless it failed. Metal's returns once the buffer is submitted
+// (`_submitted`, its CB_SCHEDULED), and a CPU lock of a surface the buffer writes, in another
+// process, then waits for the GPU's writes (measured on the M3 Max, macOS 27: a read-only or
+// read-write lock from another process returns at the writing buffer's completion; one from the
+// committing process at once). The kext makes no such lock wait yet, so returning at submission
+// let a screen capture read the pages before the GPU wrote them: this waits for the completion
+// until it does, as waitUntilScheduled does.
 - (BOOL)commitAndWaitUntilSubmitted
 {
 	[self commit];
-	[self rgfxWaitFor:_submitted reached:&_scheduledReached];
+	[self rgfxWaitFor:_done reached:nullptr];
 	return self.status != MTLCommandBufferStatusError;
 }
 
 - (void)waitUntilScheduled
 {
-	// Blocks until the buffer is scheduled and its scheduled handlers have run
-	// (rgfxReachScheduled), as Metal's does.
-	[self rgfxWaitFor:_scheduled reached:&_scheduledRan];
+	// Blocks until the buffer completes (commitAndWaitUntilSubmitted says why), though its
+	// scheduled handlers run at its CB_SCHEDULED (rgfxReachScheduled), as Metal's do; Metal's
+	// returns once they have (`_scheduled`).
+	[self rgfxWaitFor:_done reached:nullptr];
 }
 
 - (void)waitUntilCompleted
