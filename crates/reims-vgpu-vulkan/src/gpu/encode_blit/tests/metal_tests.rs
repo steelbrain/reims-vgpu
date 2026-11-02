@@ -2935,11 +2935,46 @@ fn rg11b10_float_mipmaps_are_the_metal_platforms() {
     assert!(differ.is_empty(), "{differ:#?}");
 }
 
-/// `generateMipmapsForTexture:` of `BGRA10_XR` and `BGR10_XR` textures writes Metal's levels
-/// on this host, byte for byte, and announces no `mipmap-tie-rounding`. The runtime floors each filter tap's term before the sum,
-/// where the exact sum missed the M3 Max's code by one at a level's ties. The chains are
-/// Private textures of `ShaderRead` usage and random codes, of every level: 64 by 64, 45 by
-/// 29 and 256 by 256
+/// The 10-bit codes of one texel of `BGRA10_XR` (552: four 16-bit words, the code in each
+/// word's top 10 bits) or `BGR10_XR` (554: three codes packed from bit 0 of a 32-bit word)
+fn extended_range_codes(format: u64, texel: &[u8]) -> Vec<i32> {
+    if format == 552 {
+        (texel.chunks(2))
+            .map(|w| i32::from(u16::from_le_bytes([w[0], w[1]]) >> 6))
+            .collect()
+    } else {
+        let word = u32::from_le_bytes(texel.try_into().unwrap());
+        (0..3)
+            .map(|i| ((word >> (10 * i)) & 0x3ff) as i32)
+            .collect()
+    }
+}
+
+/// The texels of `first` as Metal's blits leave a `BGRA10_XR` texture it keeps compressed: each
+/// 16-bit word's low 6 bits clear, and alpha's code within 384 to 894
+fn canonical_extended_range(first: &mut [u8]) {
+    for (i, w) in first.chunks_mut(2).enumerate() {
+        let code = u16::from_le_bytes([w[0], w[1]]) >> 6;
+        let code = if i % 4 == 3 {
+            code.clamp(384, 894)
+        } else {
+            code
+        };
+        w.copy_from_slice(&(code << 6).to_le_bytes());
+    }
+}
+
+/// `generateMipmapsForTexture:` of `BGRA10_XR` and `BGR10_XR` textures keeps Metal's first
+/// level byte for byte, and writes each later level within two codes of Metal's in every
+/// channel, announcing `DeviceFilteredMipmaps`: the runtime takes a level as the device's
+/// linear filter of the one above, where Apple's GPUs round apart among themselves
+/// (`answer.rs`). Measured on the M3 Max (macOS 27.0.1): a level filtered from Metal's own
+/// level of even size is within one code, and two are reached where a level halves an odd
+/// size (45 by 29 to 22 by 14) and where a level is filtered from one already a code apart.
+/// The chains are Private textures of `ShaderRead` usage and random codes, of every level: 64
+/// by 64, 45 by 29 and 256 by 256. A `BGRA10_XR` chain's codes are in Metal's encoding
+/// ([`canonical_extended_range`]), so its first level is Metal's under either
+/// `extended_range_blits` form
 #[test]
 fn extended_range_mipmaps_are_the_metal_platforms() {
     let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
@@ -2958,7 +2993,10 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
                 "format {format} {}x{} of {levels} levels",
                 extent[0], extent[1]
             );
-            let first = noise(seed, extent[0] * extent[1] * texel);
+            let mut first = noise(seed, extent[0] * extent[1] * texel);
+            if format == 552 {
+                canonical_extended_range(&mut first);
+            }
             let theirs = mipmaps_on::<reims_vgpu_metal::MetalPlatform>(
                 &metal,
                 &metal_desc,
@@ -2973,18 +3011,33 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
                 let line = crate::answer::LAST_LINE.lock().clone();
                 panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
             });
-            for (level, (o, m)) in ours.iter().zip(&theirs).enumerate() {
-                let step = usize::try_from(texel).unwrap();
-                let wrong = (o.chunks(step).zip(m.chunks(step)))
+            let step = usize::try_from(texel).unwrap();
+            if ours[0] != theirs[0] {
+                let n = (ours[0].chunks(step).zip(theirs[0].chunks(step)))
                     .filter(|(a, b)| a != b)
                     .count();
-                if wrong != 0 {
-                    differ.push(format!("{what} level {level}: {wrong} texels differ"));
+                differ.push(format!("{what} level 0: {n} texels differ"));
+            }
+            for (level, (o, m)) in ours.iter().zip(&theirs).enumerate().skip(1) {
+                let far = (o.chunks(step).zip(m.chunks(step)))
+                    .map(|(a, b)| {
+                        let (a, b) = (
+                            extended_range_codes(format, a),
+                            extended_range_codes(format, b),
+                        );
+                        a.iter().zip(&b).map(|(x, y)| (x - y).abs()).max().unwrap()
+                    })
+                    .max()
+                    .unwrap();
+                if far > 2 {
+                    differ.push(format!("{what} level {level}: {far} codes from Metal's"));
                 }
             }
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");
+    let filtered = rt::Degradation::DeviceFilteredMipmaps;
+    assert!(crate::answer::RELAYED.lock().contains(&filtered));
 }
 
 /// Each of `cases` read back as Metal's reads back ([`fills_on`]), Metal's bytes the same on a
