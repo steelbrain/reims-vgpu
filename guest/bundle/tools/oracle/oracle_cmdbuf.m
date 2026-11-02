@@ -7,8 +7,10 @@
 //             writes), and a second dispatch copies the buffer to another, under each ordering
 //             Metal offers or leaves out: tracked and untracked buffers, fences, one serial
 //             encoder, one concurrent encoder with and without a barrier, a blit after the
-//             kernel, a second command buffer, a buffer from an untracked heap. Prints the
-//             copied words that are not 7 (the copy ran before the write), over 5 runs each.
+//             kernel, a second command buffer, a buffer from an untracked heap, and a second
+//             command buffer on a second queue, tracked and untracked, committed once the first's
+//             commitAndWaitUntilSubmitted returns (else its commit). Prints the copied words
+//             that are not 7 (the copy ran before the write), over 5 runs each.
 //   timing    a ~200 ms command buffer and a tiny one behind it: when each is scheduled and
 //             completed, from commit; waitUntilScheduled and commitAndWaitUntilSubmitted
 //             (where the buffer responds to it) of the tiny one; the handlers' threads and
@@ -16,6 +18,13 @@
 //             host clock; a buffer waiting on an unsignalled shared event; the asynchronous
 //             pipeline creators' handler threads; tiny buffers' commit-to-scheduled and
 //             commit-to-completed latency.
+//   submitted where the buffer responds to commitAndWaitUntilSubmitted, a tiny buffer's call,
+//             20 times each: behind a ~100 ms buffer on the same queue, on an idle queue, and
+//             for a buffer that first waits on an unsignalled shared event, which a second
+//             thread signals 100 ms after the call. For each: when the call returns (ms from
+//             the first commit), the buffer's status then (and the long buffer's), whether its
+//             scheduled handler had run by then, when that handler runs, and how long
+//             waitUntilScheduled blocks right after the call.
 // Build: see README.md.
 #import "oracle_common.h"
 #include <dispatch/dispatch.h>
@@ -84,6 +93,8 @@ enum Order {
 	kUntrackedBlitAfter,
 	kUntracked2Cb,
 	kHeap2Enc,
+	kTracked2Queue,
+	kUntracked2Queue,
 	kOrderCount
 };
 
@@ -97,13 +108,18 @@ static const char *const kOrderName[] = {
     "untracked, compute encoder then a blit copy, no fence",
     "untracked, two command buffers, one queue",
     "from an untracked heap, two compute encoders, no fence",
+    "tracked, two command buffers, two queues, the second committed once the first is submitted",
+    "untracked, two command buffers, two queues, the second committed once the first is submitted",
 };
+
+static id<MTLCommandQueue> gQ2;
 
 static size_t run_order(enum Order o, id<MTLHeap> heap, double *gpu_ms)
 {
+	int tracked = o == kTracked2Enc || o == kTracked2Queue;
 	MTLResourceOptions opt = MTLResourceStorageModeShared |
-	                         (o == kTracked2Enc ? MTLResourceHazardTrackingModeTracked
-	                                            : MTLResourceHazardTrackingModeUntracked);
+	                         (tracked ? MTLResourceHazardTrackingModeTracked
+	                                  : MTLResourceHazardTrackingModeUntracked);
 	id<MTLBuffer> b = o == kHeap2Enc
 	                      ? [heap newBufferWithLength:N * 4 options:MTLResourceStorageModePrivate]
 	                      : [D newBufferWithLength:N * 4 options:opt];
@@ -163,11 +179,13 @@ static size_t run_order(enum Order o, id<MTLHeap> heap, double *gpu_ms)
 		[bl endEncoding];
 		break;
 	}
-	case kUntracked2Cb: {
+	case kUntracked2Cb:
+	case kTracked2Queue:
+	case kUntracked2Queue: {
 		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
 		enc_slow(e, b, gIters);
 		[e endEncoding];
-		cb2 = [Q commandBuffer];
+		cb2 = [o == kUntracked2Cb ? Q : gQ2 commandBuffer];
 		e = [cb2 computeCommandEncoder];
 		enc_copy(e, b, c);
 		[e endEncoding];
@@ -176,7 +194,11 @@ static size_t run_order(enum Order o, id<MTLHeap> heap, double *gpu_ms)
 	default:
 		break;
 	}
-	[cb commit];
+	SEL caws = sel_registerName("commitAndWaitUntilSubmitted");
+	if ((o == kTracked2Queue || o == kUntracked2Queue) && [(id)cb respondsToSelector:caws])
+		((void (*)(id, SEL))objc_msgSend)((id)cb, caws);
+	else
+		[cb commit];
 	if (cb2)
 		[cb2 commit];
 	[cb waitUntilCompleted];
@@ -214,6 +236,7 @@ static void case_hazards(void)
 	hd.storageMode = MTLStorageModePrivate;
 	hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
 	id<MTLHeap> heap = [D newHeapWithDescriptor:hd];
+	gQ2 = [D newCommandQueue];
 	for (int o = 0; o < kOrderCount; o++) {
 		size_t bad = 0;
 		double gpu = 0, worst = 0;
@@ -456,6 +479,147 @@ static void case_timing(void)
 	}
 }
 
+static const char *status_name(MTLCommandBufferStatus s)
+{
+	switch (s) {
+	case MTLCommandBufferStatusNotEnqueued:
+		return "NotEnqueued";
+	case MTLCommandBufferStatusEnqueued:
+		return "Enqueued";
+	case MTLCommandBufferStatusCommitted:
+		return "Committed";
+	case MTLCommandBufferStatusScheduled:
+		return "Scheduled";
+	case MTLCommandBufferStatusCompleted:
+		return "Completed";
+	case MTLCommandBufferStatusError:
+		return "Error";
+	}
+	return "?";
+}
+
+static void sort_ms(double *v, int n)
+{
+	for (int i = 0; i < n; i++)
+		for (int j = i + 1; j < n; j++)
+			if (v[j] < v[i]) {
+				double t = v[i];
+				v[i] = v[j];
+				v[j] = t;
+			}
+}
+
+static void print_ms(const char *what, double *v, int n)
+{
+	sort_ms(v, n);
+	printf("    %-46s median %8.3f ms, min %8.3f, max %8.3f\n", what, v[n / 2], v[0], v[n - 1]);
+}
+
+enum { SUBMITTED_RUNS = 20 };
+
+// One run of each `submitted` scenario: 0 behind a long buffer, 1 on an idle queue, 2 waiting on
+// an unsignalled shared event. Times are ms from the first commit (the long buffer's, else the
+// call's).
+typedef struct {
+	double returned, scheduled_handler, wait_scheduled;
+	MTLCommandBufferStatus status, long_status;
+	int handler_before_return;
+} Submitted;
+
+static Submitted submitted_run(int scenario, SEL caws, id<MTLBuffer> big, id<MTLBuffer> small, uint32_t iters)
+{
+	Submitted r = {0};
+	id<MTLCommandBuffer> a = scenario == 0 ? long_cb(Q, big, iters) : nil;
+	id<MTLSharedEvent> ev = scenario == 2 ? [D newSharedEvent] : nil;
+	id<MTLCommandBuffer> b = [Q commandBuffer];
+	if (ev)
+		[b encodeWaitForEvent:ev value:1];
+	id<MTLBlitCommandEncoder> e = [b blitCommandEncoder];
+	[e fillBuffer:small range:NSMakeRange(0, 256) value:1];
+	[e endEncoding];
+	__block volatile double ts = 0;
+	[b addScheduledHandler:^(id<MTLCommandBuffer> _) { ts = oracle_now_ms(); }];
+	double t0 = oracle_now_ms();
+	if (ev)
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+		               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ ev.signaledValue = 1; });
+	if (a)
+		[a commit];
+	((void (*)(id, SEL))objc_msgSend)((id)b, caws);
+	double t1 = oracle_now_ms();
+	r.status = b.status;
+	r.long_status = a ? a.status : MTLCommandBufferStatusNotEnqueued;
+	r.handler_before_return = ts != 0;
+	[b waitUntilScheduled];
+	double t2 = oracle_now_ms();
+	[b waitUntilCompleted];
+	[a waitUntilCompleted];
+	usleep(2000);
+	r.returned = t1 - t0;
+	r.wait_scheduled = t2 - t1;
+	r.scheduled_handler = ts - t0;
+	return r;
+}
+
+static void case_submitted(void)
+{
+	gSlow = cpipe("slow_write");
+	if (!gSlow)
+		return;
+	id<MTLBuffer> big = [D newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> small = [D newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+	SEL caws = sel_registerName("commitAndWaitUntilSubmitted");
+	if (![(id)[Q commandBuffer] respondsToSelector:caws]) {
+		printf("case submitted: n/r\n");
+		return;
+	}
+	// Calibrate the long buffer near 100 ms.
+	uint32_t iters = 2000;
+	double gpu = 0;
+	for (int k = 0; k < 6; k++) {
+		oracle_commit_wait(long_cb(Q, big, iters), NULL, &gpu);
+		if ((gpu > 75 && gpu < 150) || k == 5)
+			break;
+		iters = (uint32_t)(iters * (100.0 / (gpu > 0.5 ? gpu : 0.5)));
+	}
+	printf("case submitted: long buffer %u iterations = %.1f ms GPU\n", iters, gpu);
+	static const char *const names[] = {
+	    "1. behind a long buffer on the same queue",
+	    "2. on an idle queue",
+	    "3. waiting on a shared event a second thread signals at 100 ms",
+	};
+	for (int s = 0; s < 3; s++) {
+		printf("  %s, %d runs (ms from the first commit)\n", names[s], SUBMITTED_RUNS);
+		double ret[SUBMITTED_RUNS], sch[SUBMITTED_RUNS], wsch[SUBMITTED_RUNS];
+		int status[6] = {0}, long_status[6] = {0}, before = 0;
+		for (int k = 0; k < SUBMITTED_RUNS; k++) {
+			Submitted r = submitted_run(s, caws, big, small, iters);
+			ret[k] = r.returned;
+			sch[k] = r.scheduled_handler;
+			wsch[k] = r.wait_scheduled;
+			status[r.status < 6 ? r.status : 5]++;
+			long_status[r.long_status < 6 ? r.long_status : 5]++;
+			before += r.handler_before_return;
+		}
+		print_ms("commitAndWaitUntilSubmitted returns", ret, SUBMITTED_RUNS);
+		print_ms("its scheduled handler runs", sch, SUBMITTED_RUNS);
+		print_ms("waitUntilScheduled right after blocks for", wsch, SUBMITTED_RUNS);
+		printf("    scheduled handler had run by the return: %d of %d\n", before, SUBMITTED_RUNS);
+		printf("    status at the return:");
+		for (int i = 0; i < 6; i++)
+			if (status[i])
+				printf(" %s %d", status_name(i), status[i]);
+		printf("\n");
+		if (s == 0) {
+			printf("    the long buffer's status then:");
+			for (int i = 0; i < 6; i++)
+				if (long_status[i])
+					printf(" %s %d", status_name(i), long_status[i]);
+			printf("\n");
+		}
+	}
+}
+
 static int run_case(int argc, char **argv)
 {
 	L = oracle_library(D, gArgv0, "oracle");
@@ -465,6 +629,8 @@ static int run_case(int argc, char **argv)
 		case_hazards();
 	else if (!strcmp(argv[0], "timing"))
 		case_timing();
+	else if (!strcmp(argv[0], "submitted"))
+		case_submitted();
 	else
 		return 2;
 	return 0;
@@ -485,7 +651,7 @@ int main(int argc, char **argv)
 	}
 	oracle_header("oracle_cmdbuf", D);
 	D = nil;
-	static const char *const all[] = {"hazards", "timing"};
+	static const char *const all[] = {"hazards", "timing", "submitted"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;

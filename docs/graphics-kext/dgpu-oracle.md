@@ -267,6 +267,8 @@ first); a second dispatch copies them. Runs where any copied word is not 7, of 5
 | untracked, compute encoder then a blit copy, no fence | 5 | 0 | 5 |
 | untracked, two command buffers, one queue | 0 | 0 | 5 |
 | from an untracked heap, two compute encoders | 0 | 0 | 0 |
+| tracked, two command buffers, two queues, the second committed once the first's `commitAndWaitUntilSubmitted` returns | 0 | 0 | 0 |
+| untracked, the same | 0 | 0 | 5 |
 
 On AMD a blit runs beside compute work: a tiny blit command buffer committed behind a 200 ms
 compute one ran at once (GPU time 0.38 to 0.39 ms after commit), though its completion was
@@ -276,7 +278,8 @@ Our stack: tracked resources are ordered; untracked ones are left to the program
 encoders run in order, and the bundle has its own fence across every 8 encoders. **Relaxation:
 none.** Untracked compute across encoders and command buffers is ordered on every x86 GPU, so
 guests may rely on it; whether the Vulkan platform orders successive command buffers' untracked
-work is worth a check.
+work is worth a check. A tracked resource is ordered across two queues by commit on all three,
+the later buffer committed as soon as the earlier one's `commitAndWaitUntilSubmitted` returns.
 
 ## Q7: command-buffer timing and handlers
 
@@ -295,6 +298,26 @@ Probe: `oracle_cmdbuf DEVICE timing`. Times are from commit.
 | `GPUStartTime`/`GPUEndTime` | real, on the host clock (the long one +0.59 to +202.28 ms) | real |
 | `kernelStartTime`/`kernelEndTime` | +0.08 / +0.16 ms | +0.06 / +0.09 ms |
 | async compute and render pipeline creators | return with the handler pending; it runs about 60 ms later on `Device serial queue` | the same |
+
+`oracle_cmdbuf DEVICE submitted`: a tiny buffer's `commitAndWaitUntilSubmitted`, 20 runs each,
+times from the first commit (medians), on the 5300M, the 630 (both macOS 26.7.1) and the M3 Max
+(macOS 27.0.1):
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| behind a ~100 ms buffer, same queue: the call returns | 0.35 ms | 0.27 ms | 0.15 ms |
+| its scheduled handler | 0.29 ms | 0.26 ms | 0.15 ms |
+| status at the return | Scheduled 18, Committed 2 | Scheduled 20 | Scheduled 19, Committed 1 |
+| scheduled handler run by the return | 18 of 20 | 20 of 20 | 17 of 20 |
+| idle queue: the call returns / scheduled handler | 0.13 / 0.20 ms | 0.15 / 0.20 ms | 0.05 / 0.06 ms |
+| idle queue: status at the return | Committed 20 | Committed 20 | Committed 20 |
+| `waitUntilScheduled` right after the return, idle queue | blocks 0.12 ms | 0.09 ms | 0.01 ms |
+| waiting on a shared event a second thread signals at 100 ms: the call returns | at the signal (107.1 ms) | the same (105.5 ms) | the same (106.0 ms) |
+| the same: status at the return | Committed 20 | Committed 20 | Committed 20 |
+
+So the call returns once the buffer is submitted, which for a buffer waiting on an event is at the
+signal; whether the buffer is `Scheduled` by then, and its scheduled handlers have run, is a race
+on all three, and an idle queue returns while it is still `Committed`.
 
 The M3 also runs a creator's handler after the creator returns, on the global default-QoS queue
 (`com.apple.root.default-qos`) *(class 3 that it runs after the return; class 2 which queue)*.
