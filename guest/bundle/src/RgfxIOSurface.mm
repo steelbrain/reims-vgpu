@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <map>
 #include <mutex>
@@ -416,6 +417,7 @@ struct RgfxSurfaceShadow {
 	bool shared = false;        // the plane's shared block, else this process's own
 	bool inPlace = false;       // the GPU uses the surface's pages; the block holds no copy
 	bool cached = false;        // in place, and its GPU copy is the host's device cache
+	std::atomic<bool> keepVolatile{false}; // a texture over it set it volatile or empty: unkept
 	uint64_t serial = 0;        // the shared block's
 	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the planes' rows of a copy
 	uint32_t seed = 0;          // this process's own block: the seed when it last matched
@@ -894,6 +896,148 @@ private:
 
 } // namespace
 
+namespace {
+
+// The keep: the views in place the process holds past their textures, so a texture made over the
+// same surface soon after finds its view, and the view's block, held, and asks the kext for
+// nothing. A compositor makes a texture over its flattened layers' surface each composite and
+// lets it go at its end; without the keep each such texture asks the kext for the surface's block
+// again, which wires and walks every page of the surface before it finds the block it holds
+// (about 140 us for 12 MiB, measured on the RTX 5080 boot, 1.3 asks a composite). A view stays
+// kept until kKeepNs past its last texture's making: three composites at 60 Hz. The process's
+// commitAndWaitUntilSubmitted calls count no composites: WindowServer makes about three a
+// composite (measured on that boot). The keep holds at most kKeepMaxViews views and
+// kKeepMaxBytes of their surfaces, the least recently textured let go first, lets go of all of
+// them at the process's memory pressure, and keeps none a texture over it set volatile or empty
+// (setPurgeableState:). A kept view holds
+// its surface (CFRetain) as a texture over it does, and the kext keeps its pages wired as for a
+// live texture; the surface's use count is never touched, so IOSurfaceIsInUse answers as before.
+constexpr size_t kKeepMaxViews = 8;
+constexpr uint64_t kKeepMaxBytes = 256ull << 20;
+constexpr uint64_t kKeepNs = 50ull * 1000 * 1000;
+
+struct Kept {
+	std::shared_ptr<RgfxSurfaceShadow> view;
+	uint64_t until = 0; // nowNs() at which it goes
+	uint64_t bytes = 0; // its surface's
+};
+
+struct Keep {
+	std::mutex lock;
+	std::vector<Kept> views; // the least recently textured first
+	uint64_t bytes = 0;
+	bool sweeping = false; // a sweep is due
+	dispatch_source_t pressure = nil;
+};
+
+Keep &keep()
+{
+	static Keep *k = new Keep(); // never destroyed: views go at any time
+	return *k;
+}
+
+/// Moves out of `k` (locked) into `gone` the views due to go at `now`, or all of them.
+void expire(Keep &k, uint64_t now, bool all, std::vector<std::shared_ptr<RgfxSurfaceShadow>> *gone)
+{
+	for (auto it = k.views.begin(); it != k.views.end();) {
+		if (all || now >= it->until || it->view->keepVolatile.load(std::memory_order_relaxed)) {
+			k.bytes -= it->bytes;
+			gone->push_back(std::move(it->view));
+			it = k.views.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+/// Lets go of the views due to go at `now`, or all of them; their blocks go back outside the
+/// keep's lock, as the views die.
+void sweep(uint64_t now, bool all)
+{
+	Keep &k = keep();
+	std::vector<std::shared_ptr<RgfxSurfaceShadow>> gone;
+	{
+		std::lock_guard<std::mutex> g(k.lock);
+		expire(k, now, all, &gone);
+	}
+}
+
+/// Schedules a sweep kKeepNs on, where `k` (locked) holds views and none is due: a process that
+/// stops making textures lets its kept views go all the same.
+void armSweep(Keep &k)
+{
+	if (k.sweeping || k.views.empty())
+		return;
+	k.sweeping = true;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(kKeepNs)),
+	               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		Keep &kk = keep();
+		std::vector<std::shared_ptr<RgfxSurfaceShadow>> gone;
+		{
+			std::lock_guard<std::mutex> g(kk.lock);
+			kk.sweeping = false;
+			expire(kk, nowNs(), false, &gone);
+			armSweep(kk);
+		}
+	});
+}
+
+/// Keeps `view`, whose texture was just made, past its textures (the keep); a copy is not kept.
+void keepView(const std::shared_ptr<RgfxSurfaceShadow> &view)
+{
+	if (!view->inPlace)
+		return;
+	Keep &k = keep();
+	std::vector<std::shared_ptr<RgfxSurfaceShadow>> gone;
+	std::lock_guard<std::mutex> g(k.lock);
+	const uint64_t now = nowNs();
+	auto held = std::find_if(k.views.begin(), k.views.end(),
+	                         [&](const Kept &e) { return e.view == view; });
+	if (held != k.views.end()) {
+		k.bytes -= held->bytes;
+		gone.push_back(std::move(held->view));
+		k.views.erase(held);
+	}
+	const uint64_t bytes = IOSurfaceGetAllocSize(view->surface);
+	if (!view->keepVolatile.load(std::memory_order_relaxed) && bytes <= kKeepMaxBytes) {
+		k.views.push_back({view, now + kKeepNs, bytes});
+		k.bytes += bytes;
+	}
+	expire(k, now, false, &gone);
+	while (k.views.size() > kKeepMaxViews || k.bytes > kKeepMaxBytes) {
+		k.bytes -= k.views.front().bytes;
+		gone.push_back(std::move(k.views.front().view));
+		k.views.erase(k.views.begin());
+	}
+	if (k.pressure == nil) {
+		k.pressure = dispatch_source_create(
+		    DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+		    DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+		    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+		if (k.pressure != nil) {
+			dispatch_source_set_event_handler(k.pressure, ^{
+				rgfxIOSurfaceKeepFlush();
+			});
+			dispatch_resume(k.pressure);
+		}
+	}
+	armSweep(k);
+	// `gone` may hold the views' last references: they die once the lock is released (its
+	// guard goes first, as it was declared last).
+}
+
+} // namespace
+
+void rgfxIOSurfaceKeepFlush(void)
+{
+	sweep(0, true);
+}
+
+void rgfxIOSurfaceKeepSweepAt(uint64_t now)
+{
+	sweep(now, false);
+}
+
 @interface RgfxIOSurfaceTexture ()
 - (std::shared_ptr<RgfxSurfaceShadow>)rgfxShadow;
 @end
@@ -951,10 +1095,27 @@ private:
 		logNoTexture(surface, "texture", "the texture object was not made");
 		return nil;
 	}
+	keepView(shadow);
 	t->_shadow = std::move(shadow);
 	t->_plane = plane;
 	[t rgfxTakeDescriptor:descriptor];
 	return t;
+}
+
+// The state answers as any texture's (RgfxTexture); a volatile or empty one, which lets the
+// surface's pages be purged, also lets its view go from the keep at once, and keeps it out until
+// a texture over the surface is set non-volatile again.
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+	if (_shadow != nullptr &&
+	    (state == MTLPurgeableStateVolatile || state == MTLPurgeableStateEmpty ||
+	     state == MTLPurgeableStateNonVolatile)) {
+		_shadow->keepVolatile.store(state != MTLPurgeableStateNonVolatile,
+		                            std::memory_order_relaxed);
+		if (state != MTLPurgeableStateNonVolatile)
+			sweep(nowNs(), false);
+	}
+	return [super setPurgeableState:state];
 }
 
 - (std::shared_ptr<RgfxSurfaceShadow>)rgfxShadow

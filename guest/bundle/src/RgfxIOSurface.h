@@ -140,6 +140,14 @@ NS_ASSUME_NONNULL_END
 /// surface's seed moved since any holder synced it (a view in place needs none).
 void rgfxIOSurfaceSyncBeforeCommit(void);
 
+/// Lets go of every view the keep holds (the views in place kept past their textures,
+/// RgfxIOSurface.mm): at the process's memory pressure, and for the tests.
+void rgfxIOSurfaceKeepFlush(void);
+
+/// Lets go of the views the keep holds that are due to go at `nowNs` (CLOCK_UPTIME_RAW): the
+/// keep's own sweep, and the tests' passing of its time.
+void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
+
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
 /// over an IOSurface or a view of one, through any views (otherwise nothing).
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);

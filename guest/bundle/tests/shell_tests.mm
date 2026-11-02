@@ -7466,6 +7466,7 @@ void test_iosurface_in_place()
 		CHECK(std::memcmp(pixels + 2 * rowBytes + 4, &written, 4) == 0 && blockLeft());
 		CHECK(ringEmpty(fx.ring));
 	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(fx.ring); // the texture's and the buffer's destroys
 	CHECK(src.released == std::vector<uint64_t>({src.offset}));
 
@@ -7537,6 +7538,7 @@ void test_iosurface_in_place()
 		CHECK(std::memcmp(&texel, chromaRows + 128 + 12, 4) == 0);
 		CHECK(ringEmpty(fx.ring) && blockLeft());
 	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(fx.ring);
 	CHECK(src.released == std::vector<uint64_t>({src.offset}));
 
@@ -7554,17 +7556,157 @@ void test_iosurface_in_place()
 		    expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
 		CHECK(made.texture.buffer_obj_id == create.obj_id && made.texture.bytes_per_row == 256 &&
 		      made.texture.writers_offset == 4096 + kSurfaceHeader);
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(fx.ring);
 	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(fx.ring);
 	for (IOSurfaceRef s : {flat, surface, misaligned})
 		CFRelease(s);
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
 // Where the device uses no surface in place, or the kext gives no block in place, a surface's
 // GPU view is a copy, as before: the ask in place is made, then the kext's copy block is asked
 // for by plane 0's pages, a BUFFER_OVER_HOST_MEMORY lies over it, and it is synced from the
 // pages.
+// The views in place a process makes are kept past their textures (the keep, RgfxIOSurface.mm):
+// a texture made over the same surface soon after asks the kext for nothing, and the view's block
+// goes back once the keep lets the view go: past its time, at a flush (the process's memory
+// pressure), past the keep's count of views, or at once where a texture over it was set
+// volatile. A kept view leaves the surface's use count alone.
+void test_iosurface_keep()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		int asked = 0;
+		std::vector<uint64_t> released;
+		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
+		                                     bool, uint64_t *offset, uint64_t *serial,
+		                                     bool *fresh, bool *cached)
+		{
+			Source *src = static_cast<Source *>(c);
+			// A block of its own for each ask.
+			*offset = RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * static_cast<uint64_t>(src->asked);
+			src->asked++;
+			*serial = 9;
+			*fresh = true;
+			*cached = false;
+			return RgfxRegion::kPagesGiven;
+		}
+		static bool acquire(void *, const void *, uint64_t, uint64_t, uint64_t *, uint64_t *,
+		                    bool *)
+		{
+			return false;
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfacePagesSource(&Source::pages, 16, &src);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	auto over = [&](IOSurfaceRef s) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                      width:16
+		                                                     height:16
+		                                                  mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	IOSurfaceRef a = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(a != nullptr);
+
+	// Kept past its texture: the next texture over the surface asks nothing, and the surface is
+	// not in use.
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 1);
+	}
+	drainRing(fx.ring);
+	CHECK(src.released.empty() && !IOSurfaceIsInUse(a));
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 1);
+	}
+	drainRing(fx.ring);
+	CHECK(src.released.empty());
+
+	// Past its time it goes.
+	rgfxIOSurfaceKeepSweepAt(UINT64_MAX);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 1);
+
+	// Short of its time it stays, and its next texture asks nothing.
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 2);
+	}
+	rgfxIOSurfaceKeepSweepAt(0);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 1);
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 2);
+	}
+	rgfxIOSurfaceKeepSweepAt(UINT64_MAX);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 2);
+
+	// Set volatile through a texture over it: let go with the texture, the state answered as
+	// before.
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = over(a);
+		CHECK(t != nil && src.asked == 3);
+		CHECK([t setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+		CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateVolatile);
+	}
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 3);
+
+	// A flush, as at memory pressure, lets every kept view go.
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 4);
+	}
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 3);
+	rgfxIOSurfaceKeepFlush();
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 4);
+
+	// Past eight views the least recently textured goes.
+	std::vector<IOSurfaceRef> many;
+	for (int i = 0; i < 9; i++) {
+		many.push_back(IOSurfaceCreate((__bridge CFDictionaryRef)props));
+		@autoreleasepool {
+			CHECK(over(many.back()) != nil);
+		}
+	}
+	drainRing(fx.ring);
+	CHECK(src.asked == 13 && src.released.size() == 5);
+	CHECK(src.released.back() == RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * 4);
+	rgfxIOSurfaceKeepFlush();
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 13);
+	for (IOSurfaceRef s : many)
+		CFRelease(s);
+	CFRelease(a);
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
+}
+
 void test_iosurface_in_place_fallback()
 {
 	Fixture fx;
@@ -7657,11 +7799,13 @@ void test_iosurface_in_place_fallback()
 			CHECK(blockIs(0x2468ace0 + answer) && ringEmpty(fx.ring));
 			CHECK([(id<RgfxMetalTextureInternals>)t gpuAddress] != 0 && t.allocatedSize == 8192);
 		}
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(fx.ring);
 		CHECK(src.released.size() == static_cast<size_t>(copies) &&
 		      src.released.back() == src.offset);
 		CFRelease(s);
 	}
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
 // Core Image's blur of a large image, as a guest boot met it (newTextureWithDescriptor:iosurface:
@@ -7835,12 +7979,14 @@ void test_iosurface_in_place_core_image_set()
 		// No block of the region's own, for a copy or anything else.
 		CHECK(region.used() == 0 && ringEmpty(fx.ring));
 	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(fx.ring); // the textures' and the buffers' destroys
 	std::sort(src.released.begin(), src.released.end());
 	CHECK(src.released == blocks);
 	for (IOSurfaceRef s : surfaces)
 		CFRelease(s);
 	CVPixelBufferRelease(pixelBuffer);
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
 // A surface whose block the kext made cached, its GPU copy in a device cache on the host
@@ -7949,6 +8095,7 @@ void test_iosurface_cached()
 		CHECK(completion.postFromHost(&done, sizeof(done)));
 		CHECK(reader.pump() == 1);
 		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
 		return out;
 	};
@@ -7994,6 +8141,7 @@ void test_iosurface_cached()
 		header[2] = 7; // the kext's CPU generation, at kRgfxSurfaceCpuGenOffset
 		id<MTLTexture> view = [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
 		CHECK(view != nil);
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
 
 		// A 4:2:2 YCbCr surface of one plane is not asked cached, and one the kext answers not
@@ -8003,6 +8151,7 @@ void test_iosurface_cached()
 		                                          MTLTextureUsageShaderRead);
 		CHECK(video != nil && !src.cacheable);
 		src.answerCached = true;
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
 
 		// Sampled in a kernel through a view, then bound again: named once, not written.
@@ -8017,6 +8166,7 @@ void test_iosurface_cached()
 		                          serializer:&ser
 		                               error:nil];
 		CHECK(ps != nil);
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
 		id<MTLCommandBuffer> cb = [queue commandBuffer];
 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -8045,6 +8195,7 @@ void test_iosurface_cached()
 		                                             device:nil
 		                                         serializer:&ser];
 		CHECK(buffer != nil);
+		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
 		cb = [queue commandBuffer];
 		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
@@ -8090,6 +8241,7 @@ void test_iosurface_cached()
 		         bytesPerRow:4];
 		CHECK(IOSurfaceGetSeed(plain) == plainSeed);
 	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(control);
 
 	// Its textures gone, the process lets the block go, and the kext keeps it dormant: the next
@@ -8116,10 +8268,12 @@ void test_iosurface_cached()
 		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
 		CHECK(is(uses(cb), dormant, 9, RGFX_SURFACE_USE_WRITES));
 	}
+	rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 	drainRing(control);
 	CHECK(letGo() == 2);
 	CVPixelBufferRelease(bgra);
 	CVPixelBufferRelease(yuv);
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
 // A texture newTextureWithDescriptor:iosurface:plane: cannot make is nil, as Metal answers one,
@@ -8198,6 +8352,7 @@ void test_iosurface_nil_is_logged()
 	CHECK(rgfxIOSurfaceNilLog(s, "buffer", &line) == 0 && line.empty());
 	CHECK(region.used() == 0 && ringEmpty(fx.ring));
 	CFRelease(s);
+	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
 // A queue's command buffers keep it alive; once they are gone it ends on the device, its
@@ -8463,6 +8618,7 @@ int main(int argc, char **argv)
 		test_iosurface_writes_named();
 		test_iosurface_writes_by_function();
 		test_iosurface_in_place();
+		test_iosurface_keep();
 		test_iosurface_in_place_fallback();
 		test_iosurface_in_place_core_image_set();
 		test_iosurface_cached();
