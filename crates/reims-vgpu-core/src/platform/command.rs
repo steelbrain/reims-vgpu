@@ -49,6 +49,12 @@ impl CompletedInfo {
     /// `start` and `end`, in seconds of host time: `None` where either is 0 (Metal's answer for a
     /// buffer the GPU did not run) or not finite, or the run ends before it starts.
     pub fn gpu_times(start: f64, end: f64) -> Option<(u64, u64)> {
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a finite positive f64 to u64 rounds, saturating at u64::MAX"
+        )]
         let ns = |t: f64| (t.is_finite() && t > 0.0).then(|| (t * 1e9).round() as u64);
         let (start, end) = (ns(start)?, ns(end)?);
         (end >= start).then_some((start, end))
