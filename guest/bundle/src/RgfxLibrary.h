@@ -129,6 +129,18 @@ id<MTLLibrary> _Nullable RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions
                                              RgfxLibraryMaker makeLibrary,
                                              NSError *__autoreleasing _Nullable *_Nullable error);
 
+/// A library of source compiled at run time (`newLibraryWithSource:` and its forms): `compile`,
+/// Metal's own frontend over the device, and the library it answers made one of ours by
+/// `makeLibrary` over the bytes Metal answers for it (`libraryDataContents`, a .metallib of AIR),
+/// which keeps Metal's library as its shadow; the host takes the bytes as it takes an app's
+/// .metallib. Metal's error passes through as Metal gave it: alone where it refuses the source
+/// (MTLLibraryErrorDomain 3 and its log), and with the library where it compiled it (nil, measured:
+/// macOS 27, a source with an unused variable among them). A library `compile` answers that is
+/// already ours is answered as it is.
+typedef id<MTLLibrary> _Nullable (^RgfxCompileBlock)(NSError *__autoreleasing _Nullable *_Nullable error);
+id<MTLLibrary> _Nullable RgfxCompileOverMetal(RgfxCompileBlock compile, RgfxLibraryMaker makeLibrary,
+                                              NSError *__autoreleasing _Nullable *_Nullable error);
+
 /// A stitched library of a descriptor (`newLibraryWithStitchedDescriptor:` and Metal's other
 /// descriptor entry points), by `stitch`, Metal's own, over a copy of `descriptor` whose functions
 /// are their shadows and which names no binary archive (Metal would read ours as its own) nor fails

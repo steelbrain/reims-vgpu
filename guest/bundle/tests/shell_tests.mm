@@ -1675,6 +1675,90 @@ void test_stitched_dag_over_shadows()
 	CHECK(!fx.ring.next(&h, &drain));
 }
 
+// A runtime source compile (RgfxCompileOverMetal) over Metal's own frontend, as the device's
+// newLibraryWithSource: runs it: _MTLDevice's compiler-task form, on this Mac's device. The
+// library is ours, made over the bytes Metal's public compile of the same source makes, its
+// shadow Metal's library, with no error; a source Metal refuses answers nil and Metal's own error,
+// with the same text as the public compile's, and reaches neither the maker nor the ring.
+void test_source_compiles_through_metals_frontend()
+{
+	Fixture fx;
+	RgfxSerializer *ser = &fx.ser;
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	SEL sel = @selector(newLibraryWithSource:options:compilerTask:error:);
+	Class base = objc_getClass("_MTLDevice");
+	CHECK(class_getInstanceMethod(base, sel) != nullptr);
+	if (class_getInstanceMethod(base, sel) == nullptr)
+		return;
+	IMP frontend = class_getMethodImplementation(base, sel);
+	MTLCompileOptions *options = [MTLCompileOptions new];
+	__block id<MTLLibrary> metals = nil;
+	__block NSError *given = nil;
+	RgfxCompileBlock (^compileOf)(NSString *) = ^RgfxCompileBlock(NSString *source) {
+		return ^id<MTLLibrary>(NSError **e) {
+			metals = ((id(*)(id, SEL, NSString *, MTLCompileOptions *, id, NSError **))frontend)(
+			    metal, sel, source, options, nil, e);
+			given = *e;
+			return metals;
+		};
+	};
+	__block NSData *made = nil;
+	RgfxLibraryMaker makeLibrary = ^id<MTLLibrary>(dispatch_data_t data, NSError **) {
+		const void *bytes = nullptr;
+		size_t size = 0;
+		dispatch_data_t map = dispatch_data_create_map(data, &bytes, &size);
+		made = [NSData dataWithBytes:bytes length:size];
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes
+		                                         length:size
+		                                            key:nullptr
+		                                         device:nil
+		                                     serializer:ser
+		                                         status:&status];
+		(void)map;
+		return lib;
+	};
+
+	NSString *source = @"#include <metal_stdlib>\n"
+	                   @"using namespace metal;\n"
+	                   @"kernel void doubled(device float *o [[buffer(0)]],\n"
+	                   @"                    uint i [[thread_position_in_grid]]) { o[i] = float(i) * 2.0f; }\n";
+	NSError *err = nil;
+	id<MTLLibrary> ours = RgfxCompileOverMetal(compileOf(source), makeLibrary, &err);
+	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]] && err == nil && given == nil);
+	CHECK(metals != nil && [(RgfxLibrary *)ours rgfxShadow] == metals);
+	NSError *publicError = nil;
+	id<MTLLibrary> pub = [metal newLibraryWithSource:source options:options error:&publicError];
+	NSData *publicBytes = [(id<RgfxMetalLibraryInternals>)pub libraryDataContents];
+	CHECK(pub != nil && publicError == nil);
+	CHECK(made.length > 0 && [made isEqualToData:publicBytes]);
+	auto bytes = nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	RgfxLibraryCreate head;
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(head.obj_id == [(RgfxLibrary *)ours rgfxObjId] && head.byte_length == made.length);
+	CHECK(std::memcmp(bytes.data() + RGFX_LIBRARY_BYTES_OFFSET, made.bytes, made.length) == 0);
+
+	NSString *bad = @"#include <metal_stdlib>\n"
+	                @"kernel void broken(device float *o [[buffer(0)]]) { o[0] = undeclared; }\n";
+	err = nil;
+	id<MTLLibrary> refused = RgfxCompileOverMetal(
+	    compileOf(bad),
+	    ^id<MTLLibrary>(dispatch_data_t, NSError **) {
+		    CHECK(false); // nothing to make of no library
+		    return nil;
+	    },
+	    &err);
+	CHECK(refused == nil && metals == nil && given != nil && err == given);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorCompileFailure);
+	publicError = nil;
+	CHECK([metal newLibraryWithSource:bad options:options error:&publicError] == nil);
+	CHECK([err.localizedDescription isEqualToString:publicError.localizedDescription]);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> drain;
+	CHECK(!fx.ring.next(&h, &drain));
+	CHECK(ours != nil); // kept until here: its release would post
+}
+
 } // namespace
 
 // A device that stitches as ours does (RgfxStitchOverShadows), on Metal's own stitch, making its
@@ -7553,6 +7637,7 @@ int main()
 		test_stitched_library_over_shadows();
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();
+		test_source_compiles_through_metals_frontend();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
 		test_library_members_as_metal();

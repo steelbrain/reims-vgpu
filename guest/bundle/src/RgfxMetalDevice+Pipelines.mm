@@ -391,21 +391,12 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	return [self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];
 }
 
+// A library of source compiled at run time: the form with a compiler task, with none.
 - (id<MTLLibrary>)newLibraryWithSource:(NSString *)source
                                options:(MTLCompileOptions *)options
                                  error:(__autoreleasing NSError **)error
 {
-	// DOCUMENTED UNSUPPORTED. Source→AIR needs the Metal compiler, which runs on the
-	// host; the guest shell carries no compiler. We refuse rather than fabricate an
-	// empty library — the way the host device-info answers an unsupported query. A
-	// host-side compile path would land its own wire message.
-	(void)source;
-	(void)options;
-	if (error)
-		*error = RgfxMakeError(RgfxMetalErrorUnsupported,
-		                       @"newLibraryWithSource: runtime source compilation is not supported; "
-		                       @"provide a prebuilt .metallib via newLibraryWithData:/WithURL:");
-	return nil;
+	return [self newLibraryWithSource:source options:options compilerTask:nil error:error];
 }
 
 - (void)newLibraryWithSource:(NSString *)source
@@ -424,16 +415,30 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 }
 
 // The forms with a compiler task (measured: _MTLDevice's on macOS 27's x86-64 slice,
-// `@48@0:8@16@24@32^@40` and `v48@0:8@16@24@32@?40`; on the M3 Max, newLibraryWithSource:options:
-// error: makes its library through the first). The task is the compiler's, which the device does
-// not have: each answers as the form without it.
+// `@48@0:8@16@24@32^@40` and `v48@0:8@16@24@32@?40`). The first is Metal's own frontend over the
+// device (RgfxCompileOverMetal): the base class's, which _MTLDevice's form without a task calls on
+// the device, and which reaches Metal's compiler service through the base class alone, never the
+// device's `compiler`, reading of the device only its feature profile, its families, and Metal's
+// own settings for the compiler service and for shader capture (measured: macOS 26.7.1 on an AMD
+// Radeon Pro 5300M and an Intel UHD 630, macOS 27 on the M3 Max). Its library's bytes are AIR, the
+// same on the AMD and the Intel device.
+// Where the base class lacks the form, its form without a task, which then calls none of ours.
 - (id<MTLLibrary>)newLibraryWithSource:(NSString *)source
                                options:(MTLCompileOptions *)options
                           compilerTask:(id)compilerTask
                                  error:(__autoreleasing NSError **)error
 {
-	(void)compilerTask;
-	return [self newLibraryWithSource:source options:options error:error];
+	BOOL tasks = [IOGPUMetalDevice instancesRespondToSelector:_cmd];
+	return RgfxCompileOverMetal(
+	    ^id<MTLLibrary>(NSError *__autoreleasing *e) {
+		    if (!tasks)
+			    return [super newLibraryWithSource:source options:options error:e];
+		    return [super newLibraryWithSource:source options:options compilerTask:compilerTask error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    error);
 }
 
 - (void)newLibraryWithSource:(NSString *)source

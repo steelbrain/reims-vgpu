@@ -7,8 +7,8 @@
  *
  * The descriptor→params mapping lives in the wrapper factories (so it is unit-tested
  * off the device); this category only reads bytes (data/URL), builds the completion
- * closures, and hands unsupported paths (source compilation, a default library) a
- * documented refusal, the way the host device-info answers an unsupported query.
+ * closures, and compiles source at run time through Metal's own frontend over the device
+ * (RgfxCompileOverMetal).
  *
  * Reflection: a pipeline create is answered by the host with an RgfxPipelineReflection
  * on the completion ring, read by a later transport piece; the reflection out-params

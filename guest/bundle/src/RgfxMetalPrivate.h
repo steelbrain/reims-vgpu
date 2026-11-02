@@ -76,6 +76,16 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable id<MTLLibrary>)newLibraryWithDAG:(id)dag
                                    functions:(NSArray<id<MTLFunction>> *)functions
                                        error:(NSError *_Nullable *_Nullable)error;
+// measured: macOS 27 and 26.7.1, `@40@0:8@16@24^@32` and `@48@0:8@16@24@32^@40`, _MTLDevice's: a
+// library of source compiled by Metal's frontend; the first calls the second on the device with
+// no task, which reaches Metal's compiler service through _MTLDevice alone.
+- (nullable id<MTLLibrary>)newLibraryWithSource:(NSString *)source
+                                        options:(nullable MTLCompileOptions *)options
+                                          error:(NSError *_Nullable *_Nullable)error;
+- (nullable id<MTLLibrary>)newLibraryWithSource:(NSString *)source
+                                        options:(nullable MTLCompileOptions *)options
+                                   compilerTask:(nullable id)compilerTask
+                                          error:(NSError *_Nullable *_Nullable)error;
 @end
 
 // measured: macOS 27 and 26.6.1 Metal.framework — the private selectors of Metal's own library

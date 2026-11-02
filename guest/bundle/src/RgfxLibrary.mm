@@ -854,6 +854,28 @@ NSArray<id<MTLFunction>> *RgfxShadowFunctions(NSArray<id<MTLFunction>> *function
 	return shadows;
 }
 
+// `metal`, Metal's own library, made ours by `makeLibrary` over the bytes it answers, keeping it as
+// the shadow; `noBytes` is the error where it answers none.
+static id<MTLLibrary> rgfxOursOver(id<MTLLibrary> metal, RgfxLibraryMaker makeLibrary, NSString *noBytes,
+                                   NSError **error)
+{
+	NSData *bytes = [metal respondsToSelector:@selector(libraryDataContents)]
+	                    ? [(id<RgfxMetalLibraryInternals>)metal libraryDataContents]
+	                    : nil;
+	if (bytes.length == 0) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorRefused, noBytes);
+		return nil;
+	}
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	id<MTLLibrary> lib = makeLibrary(data, error);
+	if ([(id)lib isKindOfClass:[RgfxLibrary class]])
+		[(RgfxLibrary *)lib rgfxAdoptShadow:metal];
+	return lib;
+}
+
 id<MTLLibrary> RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions, RgfxLinkBlock link,
                                    RgfxLibraryMaker makeLibrary, NSError **error)
 {
@@ -863,20 +885,22 @@ id<MTLLibrary> RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions, RgfxLink
 	id<MTLLibrary> linked = link(shadows, error);
 	if (linked == nil || [(id)linked isKindOfClass:[RgfxLibrary class]])
 		return linked;
-	NSData *bytes = [linked respondsToSelector:@selector(libraryDataContents)]
-	                    ? [(id<RgfxMetalLibraryInternals>)linked libraryDataContents]
-	                    : nil;
-	if (bytes.length == 0) {
+	return rgfxOursOver(linked, makeLibrary, @"link: Metal's linked library answered no bytes", error);
+}
+
+id<MTLLibrary> RgfxCompileOverMetal(RgfxCompileBlock compile, RgfxLibraryMaker makeLibrary, NSError **error)
+{
+	NSError *metals = nil;
+	id<MTLLibrary> compiled = compile(&metals);
+	if (compiled == nil || [(id)compiled isKindOfClass:[RgfxLibrary class]]) {
 		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorRefused, @"link: Metal's linked library answered no bytes");
-		return nil;
+			*error = metals;
+		return compiled;
 	}
-	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
-		(void)bytes;
-	});
-	id<MTLLibrary> lib = makeLibrary(data, error);
-	if ([(id)lib isKindOfClass:[RgfxLibrary class]])
-		[(RgfxLibrary *)lib rgfxAdoptShadow:linked];
+	id<MTLLibrary> lib = rgfxOursOver(compiled, makeLibrary,
+	                                  @"newLibraryWithSource: Metal's library answered no bytes", error);
+	if (lib != nil && error)
+		*error = metals;
 	return lib;
 }
 
