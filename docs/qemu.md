@@ -357,6 +357,24 @@ and `make -C build/qemu qemu-system-x86_64`.
 - under `-display none`, the window opens and the library imports the
   region for it with no refusal.
 
+### Measuring WindowServer's composites
+
+dtrace in an x86-64 guest adds to what it measures, so WindowServer's
+composite time (`CompositorMetal::CompositeLayersToDestination`, CLTD) is
+read with that function's own entry and return probes and no others, and
+QEMU's CPU time is read with no dtrace in the guest. A script that also
+probes what CLTD calls splits its time up, but its total is no longer
+CLTD's. On-CPU samples of a guest thread key their state on `tid`: a
+`profile` probe does not see a thread's `self->` variables.
+
+**Measured** on the RTX 5080 Laptop GPU host with a macOS 26.6.1 x86-64
+guest, under KVM:
+- each pid or objc probe that fires costs the guest about 10 µs. A script
+  of about 50 of them a composite adds 0.4 to 0.5 ms to CLTD, with Apple's
+  own driver as much as with ours;
+- `profile-997` on the guest's eight vCPUs adds about 30% of a host core to
+  QEMU's CPU time.
+
 ## apple-gfx on reims-vgpu
 
 `vendor/qemu`'s `apple-gfx` is three C files, `hw/display/apple-gfx.c`,
