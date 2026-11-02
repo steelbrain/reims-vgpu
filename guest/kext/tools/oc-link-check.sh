@@ -7,15 +7,15 @@
 #   tools/oc-link-check.sh KEXTINJECT BOOT_KC KDK KEXT OUT
 #
 # OpenCore links an injected kext against the Boot KC alone, and
-# IOGraphicsFamily lives in the System KC. So the kext loads beside a library
-# of placeholders, as the loader bridge carries one for it: every
-# IOGraphicsFamily name the kext imports, as a ud2 stub for a function and
-# zeroes for a class's vtable or metaclass (a zero vtable has no entries, so
-# OpenCore leaves each inherited slot to be resolved by its name). The kext is
-# injected with OSBundleLibraries naming that library in IOGraphicsFamily's
-# place. This builds the placeholders from the KDK's IOGraphicsFamily
-# (only its export list is read), injects both, and fails unless both are
-# injected with every name resolved.
+# IOGraphicsFamily and AppleGraphicsDeviceControl live in the System KC. So the
+# kext loads beside a library of placeholders, as the loader's bridges carry
+# them for it: every name of those two the kext imports, as a ud2 stub for a
+# function and zeroes for a class's vtable or metaclass (a zero vtable has no
+# entries, so OpenCore leaves each inherited slot to be resolved by its name).
+# The kext is injected with OSBundleLibraries naming that library in their
+# place. This builds the placeholders from the KDK's two (only their export
+# lists are read), injects both kexts, and fails unless both are injected
+# with every name resolved.
 #
 # Skipped, exit 0 and a line saying so, without KEXTINJECT or BOOT_KC.
 # Everything lands in OUT; out.bin is read, never booted.
@@ -33,8 +33,13 @@ fi
 	echo "usage: tools/oc-link-check.sh KEXTINJECT BOOT_KC KDK KEXT OUT" >&2
 	exit 2
 }
-family=$kdk/IOGraphicsFamily.kext/IOGraphicsFamily
-[ -f "$family" ] || { echo "oc-link-check: the KDK has no $family" >&2; exit 2; }
+# The System KC's libraries the kext names, by bundle ID, and their binaries in the KDK.
+families=(com.apple.iokit.IOGraphicsFamily com.apple.AppleGraphicsDeviceControl)
+binaries=("$kdk/IOGraphicsFamily.kext/IOGraphicsFamily"
+	"$kdk/AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDeviceControl.kext/Contents/MacOS/AppleGraphicsDeviceControl")
+for family in "${binaries[@]}"; do
+	[ -f "$family" ] || { echo "oc-link-check: the KDK has no $family" >&2; exit 2; }
+done
 
 abs() { (cd "$(dirname "$1")" && echo "$PWD/$(basename "$1")"); }
 ki=$(abs "$ki") kc=$(abs "$kc") kext=$(abs "$kext")
@@ -46,9 +51,11 @@ SHIM_ID=com.steelbrain.ReimsGraphics.LinkCheckIOGraphicsFamily
 SHIM=LinkCheckIOGraphicsFamily
 exe=$(plutil -extract CFBundleExecutable raw "$kext/Contents/Info.plist")
 
-# The placeholders: the kext's imports that IOGraphicsFamily exports.
+# The placeholders: the kext's imports that those libraries export.
 nm -arch x86_64 -u "$kext/Contents/MacOS/$exe" | sort -u > "$out/obj/imports"
-nm -arch x86_64 -gU "$family" | awk '{ print $3 }' | sort -u > "$out/obj/family"
+for family in "${binaries[@]}"; do
+	nm -arch x86_64 -gU "$family" | awk '{ print $3 }'
+done | sort -u > "$out/obj/family"
 comm -12 "$out/obj/imports" "$out/obj/family" > "$out/obj/names"
 {
 	echo '.text'
@@ -62,7 +69,7 @@ cat > "$out/obj/kmod_info.c" << EOF
 #include <mach/mach_types.h>
 KMOD_EXPLICIT_DECL($SHIM_ID, "1.0.0", 0, 0)
 EOF
-sdk=$(xcrun --sdk macosx27.0 --show-sdk-path)
+sdk=$(xcrun --sdk macosx --show-sdk-path)
 arch=(-arch x86_64 -isysroot "$sdk" -mmacosx-version-min=26.0)
 bundle=$out/kexts/$SHIM.kext
 mkdir -p "$bundle/Contents/MacOS"
@@ -84,15 +91,16 @@ plistlib.dump({
 }, open(path, "wb"))
 EOF
 
-# The kext, naming the placeholders in IOGraphicsFamily's place.
+# The kext, naming the placeholders in those libraries' place.
 staged=$out/kexts/$(basename "$kext")
 cp -R "$kext" "$staged"
-python3 -I - "$staged/Contents/Info.plist" "$SHIM_ID" << 'EOF'
+python3 -I - "$staged/Contents/Info.plist" "$SHIM_ID" "${families[@]}" << 'EOF'
 import plistlib, sys
-path, ident = sys.argv[1:]
+path, ident, *families = sys.argv[1:]
 info = plistlib.load(open(path, "rb"))
 libraries = info["OSBundleLibraries"]
-del libraries["com.apple.iokit.IOGraphicsFamily"]
+for family in families:
+    libraries.pop(family, None)
 libraries[ident] = "1.0.0"
 plistlib.dump(info, open(path, "wb"))
 EOF
@@ -131,4 +139,4 @@ if [ "$resolved" != "$imports" ]; then
 	status=1
 fi
 [ "$status" = 0 ] || exit 1
-echo "oc-link-check: all $imports names resolved, $(wc -l < "$out/obj/names" | tr -d ' ') of them to the IOGraphicsFamily placeholders"
+echo "oc-link-check: all $imports names resolved, $(wc -l < "$out/obj/names" | tr -d ' ') of them to the System KC's placeholders"
