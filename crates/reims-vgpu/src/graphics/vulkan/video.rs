@@ -11,13 +11,27 @@
 //!   device takes it there: the guest's video driver pads each access unit with zeros to the
 //!   device's bitstream alignment, which the caps answer ([`RgfxVideoCodecCaps`]'s
 //!   `bitstream_alignment`). Elsewhere the decoder copies it.
-//! - **A picture lands in the surface's planes**, in the buffer the planes' textures lie in,
-//!   through a buffer of the decoder's over that buffer's import ([`ImportedPlanes`]): one GPU
-//!   copy out of the decoder's DPB picture writes them, cropped. The guest's video driver
+//! - **A picture lands in the surface's planes**, in the buffer the planes' textures lie in: one
+//!   GPU copy out of the decoder's DPB picture writes them, cropped. The guest's video driver
 //!   recycles an output surface once it is shown, whether or not its picture is still a
 //!   reference, so the decoder keeps its references in DPB pictures of its own, and the copy out
 //!   is the one GPU copy a picture costs where the device's DPB pictures and outputs coincide.
-//!   The write is bracketed for the dirty log ([`host_write`]) while the planes are held.
+//!   - On a GPU of its own memory, the surface's block has a device cache, which the guest's
+//!     video driver asks for (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`): the picture lands there, in the
+//!     runtime's buffer itself, and crosses the bus only at a CPU lock, as the cache's download.
+//!     The runtime shares its buffers with its own queues' families alone, so the copy runs on
+//!     the `VkQueue` of a runtime command queue of the decoders' own, which the runtime lends
+//!     for each submission ([`RuntimeQueue`]). Logical queues share `VkQueue`s, so the decoders
+//!     submit each copy there once the host sees its decode done, with no wait on the GPU that
+//!     would hold a guest's work behind the decode. Measured on an RTX 5080 Laptop GPU: a 4K
+//!     picture lands there in 100 us of the GPU (1080p in 27), where the decode queue copies it
+//!     within the GPU's memory in 180 to 215, and into the pages across PCIe in 3.5 ms, as the
+//!     link idles down under a load of decodes alone; a CPU lock of the surface then downloads it
+//!     in 1 to 5 ms (12.4 MB).
+//!   - Elsewhere it lands in the surface's pages, through a buffer of the decoder's over the
+//!     buffer's import ([`ImportedPlanes`]), copied in the decode's own submission where the GPU
+//!     shares the CPU's memory. The write is bracketed for the dirty log ([`host_write`]) while
+//!     the planes are held.
 //! - **Order.** A decode starts as the host takes the command buffer that encodes it, after the
 //!   session's earlier decodes on the same queue. The session's shared event, which the command
 //!   buffer waits for, is then signalled by a submission of no work on the decode queue that
@@ -41,8 +55,9 @@ use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::raise::{Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video_vulkan::{
-    Error as VideoError, H264Capabilities, H264Decoder, H264Profile, HostImport, ImportedPlanes,
-    RawDevice, SampleMemory, SurfaceSource, SurfaceSpec, VideoDevice, h264_capabilities,
+    BufferPlanes, Error as VideoError, H264Capabilities, H264Decoder, H264Profile, HostImport,
+    ImportedPlanes, Landing, LentQueue, RawDevice, SampleMemory, Surface, SurfaceSource,
+    SurfaceSpec, VideoDevice, h264_capabilities,
 };
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
@@ -91,8 +106,34 @@ struct DeviceVideo {
     video: Arc<VideoDevice>,
     /// What it answers for each H.264 profile it decodes.
     h264: Vec<H264Capabilities>,
+    /// Whether the decoders copy pictures out on a runtime queue ([`RuntimeQueue`]), which
+    /// writes the runtime's buffers, an IOSurface's device cache among them.
+    caches: bool,
     /// The runtime's device, whose handles `video` uses.
     device: VulkanDevice,
+}
+
+/// The `VkQueue` of a runtime command queue of the decoders' own, which the decoders copy
+/// pictures out on, lent by the runtime for each submission (`CommandQueue::with_vk_queue`): of
+/// a family the runtime's buffers are shared with. No command buffer is made on this queue, but
+/// logical queues share `VkQueue`s, so the runtime's work for the guest may run there too: each
+/// copy is submitted once the host sees its decode done, and waits for nothing on the GPU.
+struct RuntimeQueue {
+    queue: rt::CommandQueue,
+    family: u32,
+}
+
+impl LentQueue for RuntimeQueue {
+    fn family(&self) -> u32 {
+        self.family
+    }
+
+    fn with_queue(&self, submit: &mut dyn FnMut(vk::Queue)) {
+        // SAFETY: `submit` submits once, keeps nothing and waits for nothing on the host (the
+        // trait's word): it makes no call into the runtime, and its submission waits for
+        // nothing.
+        unsafe { self.queue.with_vk_queue(|queue, _| submit(queue)) }
+    }
 }
 
 impl DeviceVideo {
@@ -112,6 +153,27 @@ impl DeviceVideo {
             log::info!("hardware video: the device does not enable {missing:?}");
             return None;
         }
+        // On a GPU of its own memory, a runtime queue for the copies out, which reach the
+        // runtime's buffers.
+        let unified = device
+            .identity_caps()
+            .flags
+            .has_unified_memory
+            .unwrap_or(false);
+        let lent = (!unified)
+            .then(|| match raw.new_command_queue() {
+                Ok(queue) => {
+                    // SAFETY: the closure only reads the family; it submits nothing.
+                    let family = unsafe { queue.with_vk_queue(|_, family| family) };
+                    Some(RuntimeQueue { queue, family })
+                }
+                Err(error) => {
+                    log::info!("hardware video: no runtime queue for its copies ({error})");
+                    None
+                }
+            })
+            .flatten()
+            .filter(|lent| handles.queue_families.contains(&lent.family));
         // SAFETY: the physical device is the instance's.
         let families = unsafe {
             handles
@@ -123,7 +185,7 @@ impl DeviceVideo {
             .ok()
             .and_then(|family| families.get(family))
             .is_some_and(|family| family.queue_flags.intersects(copies));
-        if !decode_copies {
+        if lent.is_none() && !decode_copies {
             log::info!(
                 "hardware video: the video-decode family {} copies nothing, which a picture's \
                  landing in a surface's planes takes",
@@ -144,11 +206,30 @@ impl DeviceVideo {
             graphics_family: handles.queue_family,
             unified_image_layouts_video: false,
         };
+        let caches = lent.is_some();
+        let copy_family = lent.as_ref().map_or(queue.family, |lent| lent.family);
         // SAFETY: the handles are the runtime's device's, made as `RawDevice` says (the video
         // extensions and synchronization2 checked above, timeline semaphores the runtime's own
         // events use), and live while `device` holds the device, which outlives `video`; the
-        // queue is submitted to by `video`'s decoders alone.
-        let video = unsafe { VideoDevice::from_raw(device_raw) };
+        // decode queue is submitted to by `video`'s decoders alone, and a lent queue is the
+        // device's, of its family.
+        let video = unsafe {
+            match lent {
+                Some(lent) => VideoDevice::from_raw_copying_on(
+                    device_raw,
+                    vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+                    Box::new(lent),
+                ),
+                None => Ok(VideoDevice::from_raw(device_raw)),
+            }
+        };
+        let video = match video {
+            Ok(video) => video,
+            Err(error) => {
+                log::warn!("hardware video: {error}");
+                return None;
+            }
+        };
         let h264 = h264_capabilities(&video);
         if h264.is_empty() {
             log::info!(
@@ -158,13 +239,15 @@ impl DeviceVideo {
             return None;
         }
         log::info!(
-            "hardware video: H.264 decode on {}, queue family {}",
+            "hardware video: H.264 decode on {}, queue family {}, its pictures copied out on \
+             family {copy_family}",
             video.name(),
             queue.family
         );
         Some(Self {
             video,
             h264,
+            caches,
             device: device.clone_ref(),
         })
     }
@@ -185,6 +268,11 @@ impl GraphicsVideo<VulkanPlatform> for VulkanVideo {
             return None;
         }
         Some(Arc::new(H264Session::new(&self.0)?))
+    }
+
+    /// Where the decoders copy pictures out on a runtime queue, which writes a device cache.
+    fn lands_in_device_caches(&self) -> bool {
+        self.0.caches
     }
 }
 
@@ -231,14 +319,34 @@ fn h264_caps(profiles: &[H264Capabilities]) -> Option<RgfxVideoCodecCaps> {
     Some(caps)
 }
 
+/// Where a decode's picture lands: its output surface's planes.
+enum Output {
+    /// In the surface's pages, through the decoder's buffer over their import.
+    Pages(ImportedPlanes),
+    /// In the surface's device cache, the runtime's buffer, which `keep` holds.
+    Cache {
+        planes: BufferPlanes,
+        _keep: Arc<dyn Send + Sync>,
+    },
+}
+
+impl Surface for Output {
+    fn landing(&self) -> Landing {
+        match self {
+            Self::Pages(planes) => planes.landing(),
+            Self::Cache { planes, .. } => Landing::Buffer(*planes),
+        }
+    }
+}
+
 /// Where a decoder's next picture lands: the output of the decode being taken, which the session
 /// puts here before it decodes the access unit.
-struct GuestOutputs(Arc<Mutex<Option<ImportedPlanes>>>);
+struct GuestOutputs(Arc<Mutex<Option<Output>>>);
 
 impl SurfaceSource for GuestOutputs {
-    type Surface = ImportedPlanes;
+    type Surface = Output;
 
-    fn surface(&mut self, _spec: &SurfaceSpec) -> Result<ImportedPlanes, VideoError> {
+    fn surface(&mut self, _spec: &SurfaceSpec) -> Result<Output, VideoError> {
         self.0.lock().take().ok_or_else(|| {
             VideoError::Unsupported(
                 "a second picture in one access unit, which has one output".into(),
@@ -252,7 +360,7 @@ struct H264Session {
     /// The decoder, and the counts it is driven by; dropped first.
     state: Mutex<DecodeState>,
     /// The output of the decode being taken ([`GuestOutputs`]).
-    next: Arc<Mutex<Option<ImportedPlanes>>>,
+    next: Arc<Mutex<Option<Output>>>,
     /// The shared event each decode signals.
     event: VulkanSharedEvent,
     /// The device, held while the decoder lives.
@@ -358,7 +466,7 @@ impl GraphicsVideoSession<VulkanPlatform> for H264Session {
     fn decode_h264(&self, decode: &H264Decode<'_, VulkanPlatform>) -> RaiseResult<u64> {
         let mut state = self.state.lock();
         let state = &mut *state;
-        let output = output(&self.video.video, decode)?;
+        let output = output(&self.video, decode)?;
         *self.next.lock() = Some(output);
         let decoded = decode_access_unit(state, decode);
         // An output no picture took goes now.
@@ -450,10 +558,7 @@ fn plane_import(plane: &VideoPlane<'_, VulkanPlatform>) -> Option<(rt::VkHostMem
 }
 
 /// The output `decode`'s planes are, in the buffers their textures lie in, which it holds.
-fn output(
-    video: &Arc<VideoDevice>,
-    decode: &H264Decode<'_, VulkanPlatform>,
-) -> RaiseResult<ImportedPlanes> {
+fn output(video: &DeviceVideo, decode: &H264Decode<'_, VulkanPlatform>) -> RaiseResult<Output> {
     let (luma, chroma) = (&decode.luma, &decode.chroma);
     let in_buffer = |p: &VideoPlane<'_, VulkanPlatform>| {
         p.bytes_per_row
@@ -464,6 +569,10 @@ fn output(
     if !in_buffer(luma) || !in_buffer(chroma) {
         return Err(decode_fault("an output plane past its buffer"));
     }
+    if luma.cached || chroma.cached {
+        return cache_output(video, luma, chroma);
+    }
+    let video = &video.video;
     let (Some((import, luma_host)), Some((chroma_import, chroma_host))) =
         (plane_import(luma), plane_import(chroma))
     else {
@@ -512,5 +621,53 @@ fn output(
     // the command buffer waiting for it completes.
     let planes = unsafe { ImportedPlanes::new(video, &host, luma_shape, chroma_shape, keep) }
         .map_err(decode_fault)?;
-    planes.ok_or_else(|| decode_fault("an output the device takes no buffer over"))
+    (planes.map(Output::Pages))
+        .ok_or_else(|| decode_fault("an output the device takes no buffer over"))
+}
+
+/// The output of planes in their surface's device cache: the runtime's buffer itself, which the
+/// decoders' copy out writes on a runtime queue ([`RuntimeQueue`]), with no host write to log.
+fn cache_output(
+    video: &DeviceVideo,
+    luma: &VideoPlane<'_, VulkanPlatform>,
+    chroma: &VideoPlane<'_, VulkanPlatform>,
+) -> RaiseResult<Output> {
+    if !video.caches {
+        return Err(decode_fault(
+            "an output surface in a device cache, which the device's copies do not reach",
+        ));
+    }
+    // SAFETY: the buffers are written only by the decode's copy, ordered after the cache's fill
+    // (the op's wait) and before the work of the command buffer that waits for the decode, while
+    // the output holds them.
+    let ((buffer, luma_base), (chroma_buffer, chroma_base)) =
+        unsafe { (luma.buffer.raw.vk_buffer(), chroma.buffer.raw.vk_buffer()) };
+    if !(luma.cached && chroma.cached) || chroma_buffer != buffer {
+        return Err(decode_fault("an output surface whose planes lie apart"));
+    }
+    let plane = |p: &VideoPlane<'_, VulkanPlatform>, base: u64| {
+        Some((
+            base.checked_add(p.offset)?,
+            u32::try_from(p.bytes_per_row).ok()?,
+        ))
+    };
+    let size = (luma_base.checked_add(luma.buffer.length()))
+        .zip(chroma_base.checked_add(chroma.buffer.length()))
+        .map(|(a, b)| a.max(b));
+    let (Some(luma_plane), Some(chroma_plane), Some(size)) =
+        (plane(luma, luma_base), plane(chroma, chroma_base), size)
+    else {
+        return Err(decode_fault("an output plane past 4 GiB"));
+    };
+    let planes = BufferPlanes {
+        buffer,
+        luma: luma_plane,
+        chroma: chroma_plane,
+        size,
+    };
+    let keep: Arc<dyn Send + Sync> = Arc::new((luma.buffer.clone_ref(), chroma.buffer.clone_ref()));
+    Ok(Output::Cache {
+        planes,
+        _keep: keep,
+    })
 }

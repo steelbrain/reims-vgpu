@@ -2244,6 +2244,12 @@ pub const RGFX_VIDEO_H264_HIGH: u32 = 1 << 2;
 pub const RGFX_VIDEO_FORMAT_NV12: u32 = 1 << 0;
 /// [`RgfxVideoCodecCaps::formats`]: 10-bit 4:2:0 in two planes, P010 (`'x420'`, `'xf20'`).
 pub const RGFX_VIDEO_FORMAT_P010: u32 = 1 << 1;
+/// [`RgfxVideoCaps::flags`]: the host lands a decoded picture in its output surface's device
+/// cache ([`RGFX_FEATURE_SURFACE_CACHE`]), in the GPU's own memory, where the surface's block has
+/// one. The guest's video driver then asks its output surfaces' blocks cached, so a picture
+/// reaches the pages only at a CPU lock of the surface, and the GPU's other uses of it read it
+/// where it landed. Without it, a picture lands in the surface's pages.
+pub const RGFX_VIDEO_CAPS_OUTPUT_CACHED: u32 = 1 << 0;
 
 /// What the host's hardware takes of one codec in one direction, as its video API answers it.
 #[repr(C)]
@@ -2289,6 +2295,10 @@ pub struct RgfxVideoCaps {
     pub codec_count: u32,
     /// The codecs' answers, `codec_count` in use.
     pub codecs: [RgfxVideoCodecCaps; RGFX_VIDEO_CAPS_CODECS],
+    /// `RGFX_VIDEO_CAPS_*` bits; 0 from a host older than them.
+    pub flags: u32,
+    /// Zero.
+    pub reserved_30c: u32,
 }
 
 /// `VIDEO_SESSION_CREATE`: a video session.
@@ -2726,7 +2736,8 @@ const _: () = {
     );
     // The video caps follow it, still in the completion ring's span.
     assert!(size_of::<RgfxVideoCodecCaps>() == 48);
-    assert!(size_of::<RgfxVideoCaps>() == 8 + 48 * RGFX_VIDEO_CAPS_CODECS);
+    assert!(size_of::<RgfxVideoCaps>() == 8 + 48 * RGFX_VIDEO_CAPS_CODECS + 8);
+    assert!(core::mem::offset_of!(RgfxVideoCaps, reserved_30c) == 0x30c);
     assert!(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64);
     assert!(RGFX_VIDEO_CAPS_OFFSET.is_multiple_of(8));
     assert!(

@@ -39,10 +39,10 @@ use reims_graphics::wire::{
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_SAMPLER_STATE,
     RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_PAGES,
     RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_VERSION,
-    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState,
-    RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -226,8 +226,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The host's hardware video, whose codecs the video caps after the device info list
             // for the guest's video driver.
             if let Some(video) = platform.graphics_video(&gpu_device) {
+                // Pictures land in device caches only where the kext makes them.
+                let cached = features & u64::from(RGFX_FEATURE_SURFACE_CACHE) != 0
+                    && video.lands_in_device_caches();
                 let mut caps = RgfxVideoCaps {
                     version: RGFX_VIDEO_CAPS_VERSION,
+                    flags: if cached {
+                        RGFX_VIDEO_CAPS_OUTPUT_CACHED
+                    } else {
+                        0
+                    },
                     ..RgfxVideoCaps::default()
                 };
                 for (slot, codec) in caps.codecs.iter_mut().zip(video.caps()) {

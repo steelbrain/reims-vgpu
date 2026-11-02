@@ -1321,10 +1321,12 @@ mod tests {
     /// sets and its planes (offset, bytes per row, width, height).
     type SeenDecode = (u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
 
-    /// What a fake host's video was handed: each decode.
+    /// What a fake host's video was handed: each decode, and whether each of its planes was in a
+    /// device cache.
     #[derive(Default)]
     struct VideoSeen {
         decodes: Mutex<Vec<SeenDecode>>,
+        cached: Mutex<Vec<[bool; 2]>>,
     }
 
     /// A fake host's video of H.264 decode alone, recording into its [`VideoSeen`]; each of its
@@ -1373,6 +1375,10 @@ mod tests {
                 plane(&d.luma),
                 plane(&d.chroma),
             ));
+            self.seen
+                .cached
+                .lock()
+                .push([d.luma.cached, d.chroma.cached]);
             Ok(self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1)
         }
     }
@@ -1495,6 +1501,7 @@ mod tests {
                 [32 + 64 * 16, 64, 32, 8]
             )]
         );
+        assert_eq!(*seen.cached.lock(), [[false, false]], "a buffer of its own");
         let calls = p.call_log().calls();
         let sels: Vec<&str> = calls
             .iter()
@@ -1507,6 +1514,102 @@ mod tests {
             .find(|c| c.sel == "encodeWaitForEvent:value:")
             .unwrap();
         assert_eq!(wait.args.get(1), Some(&Arg::U64(1)));
+    }
+
+    /// A video output whose surface's block has a device cache is handed to the session as in
+    /// the cache, which each buffer over the block is, once the cache's fill is done.
+    #[test]
+    fn a_video_output_in_a_cached_block_is_in_its_cache() {
+        use super::super::surface_pages::tests::{BLOCK, rig};
+        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+        use reims_graphics::wire::RGFX_STATUS_OK;
+
+        let mut r = rig(8);
+        let page = r.page;
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            ..RgfxQueueCreate::default()
+        };
+        let bitstream = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 2,
+            length: 4096,
+            ..RgfxBufferCreate::default()
+        };
+        let session = RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 40,
+            codec: RGFX_VIDEO_CODEC_H264,
+            direction: RGFX_VIDEO_DECODE,
+        };
+        let seen = Arc::new(VideoSeen::default());
+        r.dec
+            .set_video(Arc::new(FakeVideo(Arc::clone(&seen), r.p.device())));
+        for m in [queue.as_bytes(), bitstream.as_bytes(), session.as_bytes()] {
+            assert_eq!(r.dec.decode(&r.device, m).unwrap(), Ok(()));
+        }
+        assert_eq!(r.buffer(6, BLOCK, 2 * page), Ok(()));
+        r.dec.hold_resource_ids(0, 0);
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(r.dec.decode(&r.device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let surface_use = RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen: 0,
+            flags: RGFX_SURFACE_USE_WRITES,
+            reserved_14: 0,
+        };
+        // The first use fills the cache; the decode's buffer, of the same generation, fills
+        // nothing, and its decode finds the fill done.
+        let first = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &command_buffer_message(100, 1, &first))
+                .unwrap(),
+            Ok(())
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 0,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            ..RgfxVideoOpDecodeH264::default()
+        };
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()));
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &command_buffer_message(101, 2, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(*seen.cached.lock(), [[true, true]]);
+        assert_eq!(r.dec.surface_caches.counts().fills, 1);
     }
 
     /// A command buffer opens a render encoder for its pass, sends each reference

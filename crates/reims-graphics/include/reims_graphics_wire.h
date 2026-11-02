@@ -1411,6 +1411,13 @@
 // [`RgfxVideoCodecCaps::formats`]: 10-bit 4:2:0 in two planes, P010 (`'x420'`, `'xf20'`).
 #define RGFX_VIDEO_FORMAT_P010 (1 << 1)
 
+// [`RgfxVideoCaps::flags`]: the host lands a decoded picture in its output surface's device
+// cache ([`RGFX_FEATURE_SURFACE_CACHE`]), in the GPU's own memory, where the surface's block has
+// one. The guest's video driver then asks its output surfaces' blocks cached, so a picture
+// reaches the pages only at a CPU lock of the surface, and the GPU's other uses of it read it
+// where it landed. Without it, a picture lands in the surface's pages.
+#define RGFX_VIDEO_CAPS_OUTPUT_CACHED (1 << 0)
+
 // A pipeline reflection reply's status: the pipeline was created.
 #define RGFX_PIPELINE_OK 0
 
@@ -4908,6 +4915,10 @@ typedef struct {
   uint32_t codec_count;
   // The codecs' answers, `codec_count` in use.
   RgfxVideoCodecCaps codecs[RGFX_VIDEO_CAPS_CODECS];
+  // `RGFX_VIDEO_CAPS_*` bits; 0 from a host older than them.
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_30c;
 } RgfxVideoCaps;
 
 // The body of [`RGFX_OP_VIDEO_DECODE_H264`], followed by its parameter sets.

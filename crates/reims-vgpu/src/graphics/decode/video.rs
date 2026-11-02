@@ -24,6 +24,10 @@ use zerocopy::FromBytes;
 
 use super::{GraphicsDecoder, ObjHandle, bad_reference, op_fault};
 
+/// How long a decode waits for its output's device cache to be filled: a copy of the surface's
+/// pages, a few milliseconds even across a slow bus.
+const FILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The host's hardware video for a graphics device: the codecs it takes, which the device's video
 /// caps answer, and its sessions.
 pub trait GraphicsVideo<P: Platform>: Send + Sync {
@@ -32,6 +36,12 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// A session of `codec` (`RGFX_VIDEO_CODEC_*`) in `direction` (`RGFX_VIDEO_DECODE` or
     /// `RGFX_VIDEO_ENCODE`); `None` where the hardware has no such codec.
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>>;
+    /// Whether a decode lands its picture in an output surface's device cache, where the
+    /// surface's block has one, as well as in its pages
+    /// ([`RGFX_VIDEO_CAPS_OUTPUT_CACHED`](reims_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED)).
+    fn lands_in_device_caches(&self) -> bool {
+        false
+    }
 }
 
 /// A video session: each picture's work, started in order, and the shared event it signals.
@@ -74,6 +84,10 @@ pub struct VideoPlane<'a, P: Platform> {
     pub width: u64,
     /// Its height in pixels.
     pub height: u64,
+    /// Whether the buffer is the surface's device cache, in the GPU's own memory
+    /// ([`RGFX_FEATURE_SURFACE_CACHE`](reims_graphics::wire::RGFX_FEATURE_SURFACE_CACHE)), rather
+    /// than a buffer over its pages.
+    pub cached: bool,
 }
 
 /// One H.264 access unit to decode ([`RGFX_OP_VIDEO_DECODE_H264`]).
@@ -133,6 +147,27 @@ pub(super) fn decode_op<P: Platform>(
             }
             let (luma_place, luma) = objs.plane_of(m.luma_texture_obj_id)?;
             let (chroma_place, chroma) = objs.plane_of(m.chroma_texture_obj_id)?;
+            // The block of a plane in its surface's device cache.
+            let cache_of = |buffer_obj_id| {
+                (objs.span_of(buffer_obj_id))
+                    .map(|(block, _)| block)
+                    .filter(|&block| objs.surface_caches.has(block))
+            };
+            let (luma_cache, chroma_cache) = (
+                cache_of(luma_place.buffer_obj_id),
+                cache_of(chroma_place.buffer_obj_id),
+            );
+            // An output in a device cache the host is filling for this buffer (a CPU wrote the
+            // surface since): the picture lands once the fill is done, so the fill's older bytes
+            // never land over it.
+            for block in luma_cache.into_iter().chain(chroma_cache) {
+                if !objs.surface_caches.wait_filled(block, FILL_WAIT) {
+                    return Err(op_fault(format_args!(
+                        "video op {tag:#06x}: its output's device cache was not filled within \
+                         {FILL_WAIT:?}"
+                    )));
+                }
+            }
             let decode = H264Decode {
                 bitstream: &bitstream,
                 offset: m.bitstream_offset,
@@ -144,6 +179,7 @@ pub(super) fn decode_op<P: Platform>(
                     bytes_per_row: luma_place.bytes_per_row,
                     width: luma_place.width,
                     height: luma_place.height,
+                    cached: luma_cache.is_some(),
                 },
                 chroma: VideoPlane {
                     buffer: &chroma,
@@ -151,6 +187,7 @@ pub(super) fn decode_op<P: Platform>(
                     bytes_per_row: chroma_place.bytes_per_row,
                     width: chroma_place.width,
                     height: chroma_place.height,
+                    cached: chroma_cache.is_some(),
                 },
             };
             let done = session.decode_h264(&decode)?;

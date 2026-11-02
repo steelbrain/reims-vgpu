@@ -78,6 +78,9 @@ pub(crate) const STORAGE_PRIVATE: u64 = 2 << 4;
 /// `MTLResourceStorageModeMask`.
 pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
 
+/// How often [`SurfaceCaches::wait_filled`] looks at a fill.
+const FILL_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// One surface's device cache.
 struct SurfaceCache<P: Platform> {
     /// The cache: a Private buffer of the surface's bytes, which the block's buffers are.
@@ -267,6 +270,29 @@ impl<P: Platform> SurfaceCaches<P> {
     /// Whether the block at `block` has a cache.
     pub(crate) fn has(&self, block: u64) -> bool {
         self.by_block.contains_key(&block)
+    }
+
+    /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be
+    /// done, polling for about `timeout` at most (each poll sleeps at least [`FILL_POLL`]): for
+    /// work the host starts outside a command buffer that writes the cache, which
+    /// [`Self::before`]'s wait does not order. True where it is done, or the block has no cache
+    /// or no fill.
+    pub(crate) fn wait_filled(&self, block: u64, timeout: std::time::Duration) -> bool {
+        let (Some(cache), Some(t)) = (self.by_block.get(&block), &self.transfer) else {
+            return true;
+        };
+        // The fill's completion handler raises `done`: a fill is a copy of the block, rare (a
+        // cache's first use, or one after a CPU's write under a lock) and short, so the wait
+        // polls it.
+        let mut polls = timeout.as_micros() / FILL_POLL.as_micros();
+        while cache.filled_at > t.done.load(Ordering::Acquire) {
+            if polls == 0 {
+                return false;
+            }
+            polls -= 1;
+            std::thread::sleep(FILL_POLL);
+        }
+        true
     }
 
     /// Whether [`Self::before`] would neither fill a cache `uses` names nor make the command
@@ -818,6 +844,33 @@ mod tests {
         let (cb, posted) = at.lock()[1];
         assert_eq!(cb, 0x101);
         assert!(posted <= commit(&r, mark), "as it is taken");
+    }
+
+    /// A wait for a cache's fill, as a decode that writes the cache outside a command buffer
+    /// takes, lasts while the fill runs and ends once it is done; a block with no cache, or none
+    /// filled, waits for nothing
+    #[test]
+    fn a_wait_for_a_fill_ends_once_it_is_done() {
+        let mut r = cached();
+        let short = std::time::Duration::from_millis(1);
+        assert!(
+            r.dec.surface_caches.wait_filled(BLOCK, short),
+            "no fill yet"
+        );
+        assert!(
+            r.dec.surface_caches.wait_filled(BLOCK + 0x8000, short),
+            "no cache"
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        assert!(
+            !r.dec.surface_caches.wait_filled(BLOCK, short),
+            "the fill runs"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(
+            r.dec.surface_caches.wait_filled(BLOCK, short),
+            "the fill is done"
+        );
     }
 
     /// Two queues' buffers of one generation take one fill, whichever the host takes first, and
