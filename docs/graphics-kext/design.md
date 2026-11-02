@@ -308,12 +308,25 @@ Stages:
       left of this item.
     - **CPU locks** wait for the GPU's pending writes, as Metal's do on the
       x86-64 Macs (measured on a MacBook Pro's AMD Radeon Pro 5300M and Intel
-      UHD 630 under macOS 26.7, `guest/bundle/tools/lock_probe.m`): a
-      read-only or read-write lock of a surface, in any process, the
-      committer's included once the buffer is submitted, returns once every
-      buffer that writes the surface has finished and its results are in the
-      pages; a pending buffer that only reads the surface holds no lock (the
-      M3 Max's read-write lock waits for it too). The kext drives IOSurface's
+      UHD 630 under macOS 26.7, `guest/bundle/tools/lock_probe.m`). Where the
+      Macs measured agree, their answer is the contract and is kept exactly;
+      where they differ, the docs promise neither answer and the cheapest one
+      within them is taken:
+      - a read-only or read-write lock of a surface, in any process, returns
+        once every buffer that writes the surface has finished and its
+        results are in the pages. The AMD, the Intel and the M3 Max agree:
+        contract, kept exactly;
+      - a pending buffer that only reads the surface holds no lock. The AMD
+        and the Intel agree; the M3 Max's read-write lock waits for it.
+        Divergent, so the cheaper rule, which tracks writes only;
+      - the committer's own lock waits from the buffer's submission on. At
+        the commit itself the AMD's returns at once, a race. Loose: ours
+        waits from the commit on;
+      - a read of the pages with no lock after the buffer completes sees the
+        GPU's pixels on ours and stale ones on the AMD and the Intel. The
+        docs ask for a lock before the CPU reads, so either holds.
+
+      The kext drives IOSurface's
       device caches as those Macs' drivers do (measured with fbt on the AMD's
       IOAcceleratorFamily2 and the guest's IOGPU; the kext's
       `RgfxIOSurfaceKPI.hpp`). At the first write a process names of a
