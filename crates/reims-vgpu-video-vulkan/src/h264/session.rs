@@ -30,9 +30,11 @@ use ash::vk;
 use ash::vk::native::{StdVideoDecodeH264PictureInfo, StdVideoDecodeH264ReferenceInfo};
 use reims_vgpu_video_codec::h264::{pps::Pps, sps::Sps};
 
+use super::SampleMemory;
 use super::params::ParameterSets;
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
+use crate::import::{BufferUse, ImportBuffer, buffer_over};
 use crate::picture::{ImageView, color_range, plane, planes};
 use crate::profile::{H264Capabilities, PICTURE_FORMAT};
 use crate::surface::{BufferPlanes, bind_image_memory};
@@ -67,10 +69,40 @@ pub(crate) fn slice_layout(
     Ok((offsets, at.next_multiple_of(size_alignment.max(1))))
 }
 
+/// A sample whose bytes lie in device memory too
+/// ([`super::H264Decoder::decode_in_place`]): where its bytes are on the
+/// host, which its slices lie in.
+pub(crate) struct InMemory {
+    /// Its first byte.
+    pub(crate) start: NonNull<u8>,
+    /// Its bytes.
+    pub(crate) len: usize,
+    /// Where they lie in device memory.
+    pub(crate) memory: SampleMemory,
+}
+
+// SAFETY: `start` is read only while the call that set it borrows the
+// sample, on that call's thread.
+unsafe impl Send for InMemory {}
+
+/// A picture's slices as its decode reads them in place: a buffer of the
+/// session's bound over the sample's memory, where the first slice's start
+/// code lies in it, the bytes the decode reads from there, each slice's
+/// offset from there, and what keeps the memory. It goes once the decode
+/// is done.
+struct InPlace {
+    buffer: ImportBuffer,
+    offset: u64,
+    range: u64,
+    offsets: Vec<u32>,
+}
+
 /// A decode as [`Session::decode`] records it.
 pub(crate) struct Decode<'a> {
     /// The picture's slices, each its NAL unit from the header byte on.
     pub(crate) slices: &'a [&'a [u8]],
+    /// The sample they lie in, where its bytes lie in device memory too.
+    pub(crate) in_memory: Option<&'a InMemory>,
     /// The parameters object holding the picture's SPS and PPS.
     pub(crate) parameters: vk::VideoSessionParametersKHR,
     /// Where the picture lands.
@@ -470,23 +502,103 @@ impl Session {
     /// output where the device decodes into DPB pictures alone. Returns
     /// the value after which the output holds the picture.
     pub(crate) fn decode(&mut self, decode: &Decode<'_>) -> Result<u64, Error> {
-        let (offsets, range) =
-            slice_layout(decode.slices, self.caps.min_bitstream_buffer_size_alignment)?;
-        let mut submission = self.submission(range)?;
-        match self.record_and_submit(&mut submission, decode, &offsets, range) {
-            Ok(value) => {
-                submission.value = value;
-                self.busy.push_back(submission);
-                Ok(value)
-            }
-            Err(error) => {
-                // Its work was not submitted, or it signals no later than
-                // the timeline's last value: done once that is.
-                submission.value = self.timeline.last_submitted();
-                self.busy.push_back(submission);
-                Err(error)
-            }
+        let in_place = match decode.in_memory {
+            Some(sample) => self.in_place(sample, decode.slices)?,
+            None => None,
+        };
+        let (offsets, range) = match &in_place {
+            Some(place) => (place.offsets.clone(), place.range),
+            None => slice_layout(decode.slices, self.caps.min_bitstream_buffer_size_alignment)?,
+        };
+        let mut submission = self.submission(if in_place.is_some() { 0 } else { range })?;
+        let source = in_place
+            .as_ref()
+            .map(|place| (place.buffer.buffer, place.offset));
+        let decoded = self.record_and_submit(&mut submission, decode, &offsets, range, source);
+        // Where it failed, its work was not submitted, or it signals no
+        // later than the timeline's last value: done once that is.
+        submission.value = match decoded {
+            Ok(value) => value,
+            Err(_) => self.timeline.last_submitted(),
+        };
+        if let Some(place) = in_place {
+            self.timeline.retire(submission.value, Box::new(place));
         }
+        self.busy.push_back(submission);
+        decoded
+    }
+
+    /// Where `slices`, which lie in `sample`, are read in place: a buffer
+    /// bound over the sample's memory from the first slice's start code,
+    /// where the device takes them there (see
+    /// [`super::H264Decoder::decode_in_place`]); `None` where it does not,
+    /// or a slice lies elsewhere.
+    fn in_place(&self, sample: &InMemory, slices: &[&[u8]]) -> Result<Option<InPlace>, Error> {
+        let import = &sample.memory.import;
+        // Each slice's start code, from the sample's first byte.
+        let mut starts = Vec::with_capacity(slices.len());
+        let mut end = 0;
+        for slice in slices {
+            let at = slice
+                .as_ptr()
+                .addr()
+                .wrapping_sub(sample.start.as_ptr().addr());
+            let Some(code) = at.checked_sub(START_CODE.len()) else {
+                return Ok(None);
+            };
+            let slice_end = at.saturating_add(slice.len());
+            if at > sample.len || slice_end > sample.len {
+                return Ok(None);
+            }
+            // SAFETY: the sample's bytes, `len` of them from `start`, are
+            // the caller's slice, borrowed for the call that decodes it,
+            // and `code` lies in them.
+            let code_at = unsafe { sample.start.as_ptr().add(code) };
+            // SAFETY: as above: `code..at` lies in them.
+            let before = unsafe { std::slice::from_raw_parts(code_at, START_CODE.len()) };
+            if before != START_CODE {
+                return Ok(None);
+            }
+            starts.push(code);
+            end = end.max(slice_end);
+        }
+        let Some(&first) = starts.iter().min() else {
+            return Ok(None);
+        };
+        let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let offset_alignment = self.caps.min_bitstream_buffer_offset_alignment.max(1);
+        let range = to_u64(end - first)
+            .next_multiple_of(self.caps.min_bitstream_buffer_size_alignment.max(1));
+        let at = import.offset.saturating_add(to_u64(first));
+        if at % offset_alignment != 0
+            || to_u64(first).saturating_add(range) > to_u64(sample.len)
+            || to_u64(sample.len) > import.size
+        {
+            return Ok(None);
+        }
+        let Ok(offsets) = starts
+            .iter()
+            .map(|&start| u32::try_from(start - first))
+            .collect::<Result<Vec<u32>, _>>()
+        else {
+            return Ok(None);
+        };
+        let families = [self.device.decode_family()];
+        let made_for = BufferUse {
+            usage: vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
+            families: &families,
+            profile: Some(self.caps.profile),
+        };
+        let Some((buffer, base)) = buffer_over(&self.device, import, at, at + range, made_for)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(InPlace {
+            buffer: ImportBuffer::new(&self.device, buffer, Arc::clone(&sample.memory.keep)),
+            offset: at - base,
+            range,
+            offsets,
+        }))
     }
 
     /// The layout DPB pictures are kept in.
@@ -505,15 +617,19 @@ impl Session {
             .ok_or_else(|| Error::Unsupported(format!("DPB slot {slot} past the session's")))
     }
 
+    /// Records and submits `decode`, its slices read from `source` (a
+    /// buffer and the offset of the first slice's start code in it), or,
+    /// with none, from the submission's own buffer, written here.
     fn record_and_submit(
         &mut self,
         submission: &mut Submission,
         decode: &Decode<'_>,
         offsets: &[u32],
         range: u64,
+        source: Option<(vk::Buffer, u64)>,
     ) -> Result<u64, Error> {
-        if let Target::Buffer(planes, (_, _, width, _)) = decode.output {
-            planes.check(width)?;
+        if let Target::Buffer(planes, (_, _, width, height)) = decode.output {
+            planes.check(width, height)?;
         }
         // Where the device decodes into outputs, a picture that lands in a
         // buffer is decoded into the session's scratch image and copied
@@ -531,7 +647,13 @@ impl Session {
                 usage,
             )?);
         }
-        submission.bitstream.write(decode.slices, offsets, range);
+        let (src_buffer, src_offset) = match source {
+            Some(source) => source,
+            None => {
+                submission.bitstream.write(decode.slices, offsets, range);
+                (submission.bitstream.buffer, 0)
+            }
+        };
         let device = self.device.device();
         let command = submission.command;
         begin(device, command)?;
@@ -610,7 +732,7 @@ impl Session {
         // SAFETY: recording into the session's command buffer, whose last
         // work is done, with the arrays alive through the call; so for each
         // command recorded below.
-        unsafe { device.cmd_pipeline_barrier2(command, &dependency) };
+        unsafe { self.device.cmd_pipeline_barrier2(command, &dependency) };
 
         let resource = |view| {
             vk::VideoPictureResourceInfoKHR::default()
@@ -684,8 +806,8 @@ impl Session {
             .std_picture_info(&decode.picture_info)
             .slice_offsets(offsets);
         let info = vk::VideoDecodeInfoKHR::default()
-            .src_buffer(submission.bitstream.buffer)
-            .src_buffer_offset(0)
+            .src_buffer(src_buffer)
+            .src_buffer_offset(src_offset)
             .src_buffer_range(range)
             .dst_picture_resource(output_resource)
             .setup_reference_slot(&setup_slot)
@@ -714,7 +836,7 @@ impl Session {
                     .subresource_range(color_range())];
                 // SAFETY: as above.
                 unsafe {
-                    device.cmd_pipeline_barrier2(
+                    self.device.cmd_pipeline_barrier2(
                         command,
                         &vk::DependencyInfo::default().image_memory_barriers(&to_general),
                     );
@@ -831,7 +953,7 @@ impl Session {
         // SAFETY: recording into a command buffer of the session's, with
         // the array alive through the call; so for each command below.
         unsafe {
-            device.cmd_pipeline_barrier2(
+            self.device.cmd_pipeline_barrier2(
                 command,
                 &vk::DependencyInfo::default().image_memory_barriers(&before),
             );
@@ -881,7 +1003,7 @@ impl Session {
                     .dst_access_mask(vk::AccessFlags2::HOST_READ | vk::AccessFlags2::MEMORY_READ)];
                 // SAFETY: as above.
                 unsafe {
-                    device.cmd_pipeline_barrier2(
+                    self.device.cmd_pipeline_barrier2(
                         command,
                         &vk::DependencyInfo::default().memory_barriers(&to_host),
                     );
@@ -896,7 +1018,7 @@ impl Session {
                 .dst_access_mask(vk::AccessFlags2::NONE)];
             // SAFETY: as above.
             unsafe {
-                device.cmd_pipeline_barrier2(
+                self.device.cmd_pipeline_barrier2(
                     command,
                     &vk::DependencyInfo::default().image_memory_barriers(&back),
                 );
@@ -1137,19 +1259,68 @@ mod tests {
             buffer: vk::Buffer::null(),
             luma,
             chroma,
+            size: 2_000_000,
         }
     }
 
     #[test]
     fn buffer_planes_take_what_a_transfer_queue_copies() {
-        assert!(planes((256, 1344), (1_000_064, 1344)).check(1280).is_ok());
+        assert!(
+            planes((256, 1344), (1_000_064, 1344))
+                .check(1280, 720)
+                .is_ok()
+        );
         // Offsets a multiple of 4, pitches at least the width, the chroma
         // pitch even.
-        assert!(planes((2, 1344), (1_000_064, 1344)).check(1280).is_err());
-        assert!(planes((256, 1344), (1_000_066, 1344)).check(1280).is_err());
-        assert!(planes((256, 1279), (1_000_064, 1344)).check(1280).is_err());
-        assert!(planes((256, 1281), (1_000_064, 1281)).check(1281).is_err());
-        assert!(planes((256, 1281), (1_000_064, 1282)).check(1281).is_ok());
+        assert!(
+            planes((2, 1344), (1_000_064, 1344))
+                .check(1280, 720)
+                .is_err()
+        );
+        assert!(
+            planes((256, 1344), (1_000_066, 1344))
+                .check(1280, 720)
+                .is_err()
+        );
+        assert!(
+            planes((256, 1279), (1_000_064, 1344))
+                .check(1280, 720)
+                .is_err()
+        );
+        assert!(
+            planes((256, 1281), (1_000_064, 1281))
+                .check(1281, 720)
+                .is_err()
+        );
+        assert!(
+            planes((256, 1281), (1_000_064, 1282))
+                .check(1281, 720)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn buffer_planes_hold_the_crop_within_the_buffer() {
+        // The chroma plane's 360 rows of 1280 bytes end 1_000_064 + 1344 *
+        // 359 + 1280 = 1_483_840 bytes in; the luma plane's 720 end before
+        // its start.
+        let fits = planes((0, 1344), (1_000_064, 1344));
+        assert!(fits.check(1280, 720).is_ok());
+        let short = BufferPlanes {
+            size: 1_483_839,
+            ..fits
+        };
+        assert!(short.check(1280, 720).is_err());
+        assert!(
+            BufferPlanes {
+                size: 1_483_840,
+                ..fits
+            }
+            .check(1280, 720)
+            .is_ok()
+        );
+        // The luma plane's rows run into the end of a buffer as small.
+        assert!(planes((0, 1344), (0, 1344)).check(1280, 1500).is_err());
     }
 
     #[test]

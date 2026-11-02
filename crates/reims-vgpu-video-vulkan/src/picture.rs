@@ -366,7 +366,7 @@ impl<'a> ReadBack<'a> {
             .dst_access_mask(vk::AccessFlags2::HOST_READ)];
         // SAFETY: as above, with the array alive through the call.
         unsafe {
-            vk_device.cmd_pipeline_barrier2(
+            self.device.cmd_pipeline_barrier2(
                 self.command,
                 &vk::DependencyInfo::default().memory_barriers(&to_host),
             );

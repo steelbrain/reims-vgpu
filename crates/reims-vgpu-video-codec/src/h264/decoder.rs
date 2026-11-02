@@ -200,6 +200,11 @@ impl<A: Accelerator> Decoder<A> {
         &self.accelerator
     }
 
+    /// The accelerator, to change what it holds between samples.
+    pub fn accelerator_mut(&mut self) -> &mut A {
+        &mut self.accelerator
+    }
+
     /// The SPS the decoder is configured for, once a picture has started:
     /// what the tests check an SPS took over by.
     #[cfg(test)]

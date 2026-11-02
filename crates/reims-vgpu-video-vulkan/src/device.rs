@@ -55,12 +55,17 @@ const REQUIRED_EXTENSIONS: [&CStr; 3] = [
 pub struct RawDevice {
     /// The loader the instance was made through.
     pub entry: ash::Entry,
-    /// The instance, of Vulkan 1.3 or later.
+    /// The instance.
     pub instance: ash::Instance,
+    /// The `VkApplicationInfo::apiVersion` the instance was made with, at
+    /// least Vulkan 1.2: below 1.3, the crate records and submits through
+    /// `VK_KHR_synchronization2`'s commands, which the device then enables.
+    pub instance_api_version: u32,
     /// The device's physical device.
     pub physical_device: vk::PhysicalDevice,
     /// The device, made with `VK_KHR_video_queue`,
-    /// `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264`, and the
+    /// `VK_KHR_video_decode_queue` and `VK_KHR_video_decode_h264` (and
+    /// `VK_KHR_synchronization2` on an instance below Vulkan 1.3), and the
     /// `timelineSemaphore` and `synchronization2` features.
     pub device: ash::Device,
     /// A queue family with `VK_QUEUE_VIDEO_DECODE_BIT_KHR` whose video
@@ -108,6 +113,9 @@ pub struct VideoDevice {
     video_instance: ash::khr::video_queue::Instance,
     video: ash::khr::video_queue::Device,
     decode: ash::khr::video_decode_queue::Device,
+    /// `VK_KHR_synchronization2`'s commands, on an instance below Vulkan
+    /// 1.3, where the core ones are not there.
+    synchronization2: Option<ash::khr::synchronization2::Device>,
     /// Whether the device and instance are ours to destroy.
     owned: bool,
 }
@@ -198,6 +206,7 @@ impl VideoDevice {
         let raw = RawDevice {
             entry,
             instance,
+            instance_api_version: vk::API_VERSION_1_3,
             physical_device: choice.physical_device,
             device,
             decode_family: choice.decode_family,
@@ -220,6 +229,8 @@ impl VideoDevice {
         let video = ash::khr::video_queue::Device::new(&raw.instance, &raw.device);
         let decode = ash::khr::video_decode_queue::Device::new(&raw.instance, &raw.device);
         let copy_queue = (raw.copy_queue != raw.decode_queue).then(|| Mutex::new(raw.copy_queue));
+        let synchronization2 = (raw.instance_api_version < vk::API_VERSION_1_3)
+            .then(|| ash::khr::synchronization2::Device::new(&raw.instance, &raw.device));
         Self {
             entry: raw.entry,
             instance: raw.instance,
@@ -236,6 +247,7 @@ impl VideoDevice {
             video_instance,
             video,
             decode,
+            synchronization2,
             owned,
         }
     }
@@ -349,17 +361,71 @@ impl VideoDevice {
         Self::unique(&[self.decode_family, self.copy_family])
     }
 
+    /// Records `dependency` into `command`: `vkCmdPipelineBarrier2`, or
+    /// its `VK_KHR_synchronization2` alias on an instance below 1.3.
+    ///
+    /// # Safety
+    ///
+    /// `command` is the device's and recording, and what `dependency`
+    /// points at lives through the call.
+    pub(crate) unsafe fn cmd_pipeline_barrier2(
+        &self,
+        command: vk::CommandBuffer,
+        dependency: &vk::DependencyInfo<'_>,
+    ) {
+        match &self.synchronization2 {
+            // SAFETY: as the caller promises.
+            Some(khr) => unsafe { khr.cmd_pipeline_barrier2(command, dependency) },
+            // SAFETY: as the caller promises.
+            None => unsafe { self.device.cmd_pipeline_barrier2(command, dependency) },
+        }
+    }
+
+    /// Submits `submits` to `queue` with `fence`: `vkQueueSubmit2`, or its
+    /// `VK_KHR_synchronization2` alias on an instance below 1.3.
+    ///
+    /// # Safety
+    ///
+    /// `queue` is the device's and held by the caller for the call; the
+    /// submissions' command buffers are recorded and their semaphores, and
+    /// `fence` where given, the device's.
+    unsafe fn queue_submit2(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), Error> {
+        match &self.synchronization2 {
+            // SAFETY: as the caller promises.
+            Some(khr) => unsafe { khr.queue_submit2(queue, submits, fence) },
+            // SAFETY: as the caller promises.
+            None => unsafe { self.device.queue_submit2(queue, submits, fence) },
+        }
+        .named("vkQueueSubmit2")
+    }
+
     /// Submits to the decode queue.
     pub(crate) fn submit_decode(&self, submits: &[vk::SubmitInfo2<'_>]) -> Result<(), Error> {
         let queue = self.decode_queue.lock();
         // SAFETY: the queue is the device's and is held for the call; the
         // submissions' command buffers are recorded and their semaphores
         // the device's.
-        unsafe {
-            self.device
-                .queue_submit2(*queue, submits, vk::Fence::null())
-        }
-        .named("vkQueueSubmit2")
+        unsafe { self.queue_submit2(*queue, submits, vk::Fence::null()) }
+    }
+
+    /// Submits to the decode queue a batch of no work that waits for
+    /// `waits` and then signals `signals`: the caller's own semaphores,
+    /// ordered after a decoder's work by a wait for its timeline
+    /// semaphore's value ([`crate::H264Decoder::submitted`]).
+    pub fn signal_on_decode_queue(
+        &self,
+        waits: &[vk::SemaphoreSubmitInfo<'_>],
+        signals: &[vk::SemaphoreSubmitInfo<'_>],
+    ) -> Result<(), Error> {
+        let submits = [vk::SubmitInfo2::default()
+            .wait_semaphore_infos(waits)
+            .signal_semaphore_infos(signals)];
+        self.submit_decode(&submits)
     }
 
     /// Submits to the copy queue, with `fence`.
@@ -373,7 +439,7 @@ impl VideoDevice {
             None => self.decode_queue.lock(),
         };
         // SAFETY: as in `submit_decode`, with the fence unsignalled.
-        unsafe { self.device.queue_submit2(*queue, submits, fence) }.named("vkQueueSubmit2")
+        unsafe { self.queue_submit2(*queue, submits, fence) }
     }
 
     /// The first memory type of `bits` with every flag of one of `wanted`,

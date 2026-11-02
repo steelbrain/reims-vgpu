@@ -34,6 +34,7 @@
 mod device;
 mod error;
 mod h264;
+mod import;
 mod picture;
 mod profile;
 mod std_types;
@@ -42,7 +43,8 @@ mod timeline;
 
 pub use device::{RawDevice, VideoDevice};
 pub use error::Error;
-pub use h264::{Frame, H264Decoder};
+pub use h264::{Frame, H264Decoder, SampleMemory};
+pub use import::{HostImport, ImportedPlanes};
 pub use picture::{Nv12, Picture};
 pub use profile::{
     H264Capabilities, H264Profile, OUTPUT_FLAGS, OUTPUT_USAGE, PICTURE_FORMAT, h264_capabilities,

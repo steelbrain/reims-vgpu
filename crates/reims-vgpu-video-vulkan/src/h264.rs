@@ -23,9 +23,10 @@ use reims_vgpu_video_codec::h264::{
     SliceParams, avcc::DecoderConfiguration, slice::MemoryManagement, slice::SliceType, sps::Sps,
 };
 
-use self::session::{Decode, Session, Target};
+use self::session::{Decode, InMemory, Session, Target};
 use crate::device::VideoDevice;
 use crate::error::Error;
+use crate::import::HostImport;
 use crate::picture::{ImageView, Picture};
 use crate::profile::{H264Capabilities, H264Profile, h264_capabilities};
 use crate::std_types::zeroed;
@@ -35,6 +36,17 @@ use crate::timeline::Timeline;
 /// A decoded frame: its picture, which holds the output it landed in, and
 /// what the decoder knows of it.
 pub type Frame<T> = Output<Picture<T>>;
+
+/// A sample's bytes in device memory, which [`H264Decoder::decode_in_place`]
+/// reads in place: host pages the device imported by their pointer, as
+/// metal2vulkan's `Buffer::vk_host_memory` answers for a buffer over them.
+pub struct SampleMemory {
+    /// Where the sample lies: its first byte at the import's offset.
+    pub import: HostImport,
+    /// What keeps the memory alive, held until every decode that reads
+    /// the sample in place is done.
+    pub keep: Arc<dyn Send + Sync>,
+}
 
 /// An H.264 decoder on a [`VideoDevice`], landing its pictures in the
 /// outputs `S` gives.
@@ -87,6 +99,43 @@ impl<S: SurfaceSource> H264Decoder<S> {
         self.inner.decode(sample, id)
     }
 
+    /// [`Self::decode`] of a sample whose bytes lie in `memory` too, which
+    /// each picture's decode reads in place, with no copy, where the
+    /// device takes them there: the first slice's start code at a multiple
+    /// of `minBitstreamBufferOffsetAlignment` in the memory, and the
+    /// sample holding the slices padded to a multiple of
+    /// `minBitstreamBufferSizeAlignment` from there, the padding zeros as
+    /// the caller wrote them. Elsewhere the slices are copied as `decode`
+    /// copies them.
+    ///
+    /// # Safety
+    ///
+    /// `memory` is memory of the decoder's device that holds `sample`'s
+    /// bytes at its offset, valid while its `keep` lives; nothing writes
+    /// those bytes until the decodes reading them are done, which they are
+    /// once [`Self::semaphore`] reaches [`Self::submitted`] after the call.
+    pub unsafe fn decode_in_place(
+        &mut self,
+        sample: &[u8],
+        id: u64,
+        memory: SampleMemory,
+    ) -> Result<Vec<Frame<S::Surface>>, Error> {
+        self.inner.accelerator_mut().in_memory = Some(InMemory {
+            start: std::ptr::NonNull::from(sample).cast(),
+            len: sample.len(),
+            memory,
+        });
+        let decoded = self.inner.decode(sample, id);
+        self.inner.accelerator_mut().in_memory = None;
+        decoded
+    }
+
+    /// The value [`Self::semaphore`] reaches once every decode and copy
+    /// submitted so far is done.
+    pub fn submitted(&self) -> u64 {
+        self.inner.accelerator().timeline.last_submitted()
+    }
+
     /// Emits the frames still waiting for display order. References are
     /// kept, so decoding can go on.
     pub fn flush(&mut self) -> Vec<Frame<S::Surface>> {
@@ -124,6 +173,9 @@ struct VulkanH264<S: SurfaceSource> {
     /// The stream's session, which holds the timeline itself, and waits
     /// for its decodes as it goes.
     session: Option<Session>,
+    /// Where the sample being decoded lies in device memory, while
+    /// [`H264Decoder::decode_in_place`] decodes it.
+    in_memory: Option<InMemory>,
 }
 
 impl<S: SurfaceSource> VulkanH264<S> {
@@ -141,6 +193,7 @@ impl<S: SurfaceSource> VulkanH264<S> {
             capabilities,
             source,
             session: None,
+            in_memory: None,
         })
     }
 
@@ -282,6 +335,7 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
         let nals: Vec<&[u8]> = slices.iter().map(|s| s.nal).collect();
         let decode = Decode {
             slices: &nals,
+            in_memory: self.in_memory.as_ref(),
             parameters,
             output: match picture.surface().landing() {
                 Landing::Image(image) => Target::Image(image, picture.output_view()),

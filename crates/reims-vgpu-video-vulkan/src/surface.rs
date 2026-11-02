@@ -123,7 +123,9 @@ pub enum Landing {
 /// gives where they are more than one, as an output image is. Each
 /// offset is a multiple of 4, and each pitch at least the crop's width,
 /// the chroma pitch an even number, as Vulkan's copies take them where
-/// the queue that copies neither draws nor computes.
+/// the queue that copies neither draws nor computes; and each plane's
+/// rows of the crop lie in the buffer's `size` bytes, which a picture
+/// whose crop does not fit is refused for.
 ///
 /// The copy makes its writes available to the host before the picture's
 /// value is signalled, so that a host that has waited for it reads them
@@ -138,12 +140,14 @@ pub struct BufferPlanes {
     /// The chroma plane: its first byte, and the bytes from one row to the
     /// next.
     pub chroma: (u64, u32),
+    /// The buffer's bytes.
+    pub size: u64,
 }
 
 impl BufferPlanes {
-    /// Whether planes cropped to `width` fit as Vulkan copies them, or
-    /// why not.
-    pub(crate) fn check(&self, width: u32) -> Result<(), Error> {
+    /// Whether planes cropped to `width` by `height` fit as Vulkan copies
+    /// them, and in the buffer, or why not.
+    pub(crate) fn check(&self, width: u32, height: u32) -> Result<(), Error> {
         let (luma, chroma) = (self.luma, self.chroma);
         if luma.0 % 4 != 0 || chroma.0 % 4 != 0 {
             return Err(Error::Unsupported(format!(
@@ -157,6 +161,18 @@ impl BufferPlanes {
                 "pitches {} and {} for a frame {width} wide: each at least its width, the \
                  chroma pitch even",
                 luma.1, chroma.1
+            )));
+        }
+        // Where a plane's last row of the crop ends.
+        let end = |(offset, pitch): (u64, u32), rows: u32, row: u32| {
+            let before_last = u64::from(pitch).checked_mul(u64::from(rows.saturating_sub(1)))?;
+            offset.checked_add(before_last)?.checked_add(u64::from(row))
+        };
+        let fits = |plane, rows, row| end(plane, rows, row).is_some_and(|end| end <= self.size);
+        if !fits(luma, height, width) || !fits(chroma, height.div_ceil(2), chroma_width) {
+            return Err(Error::Unsupported(format!(
+                "a frame {width} by {height} at {} and {} past a buffer of {} bytes",
+                luma.0, chroma.0, self.size
             )));
         }
         Ok(())
@@ -342,6 +358,7 @@ impl HostBuffer {
                 buffer,
                 luma: (luma, pitch),
                 chroma: (chroma, pitch),
+                size,
             },
         };
         // SAFETY: the buffer is the device's.

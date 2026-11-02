@@ -251,6 +251,7 @@ fn run() -> Result<(), String> {
         let raw = RawDevice {
             entry: owner.entry().clone(),
             instance: owner.instance().clone(),
+            instance_api_version: ash::vk::API_VERSION_1_3,
             physical_device: owner.physical_device(),
             device: owner.device().clone(),
             decode_family: owner.decode_family(),
