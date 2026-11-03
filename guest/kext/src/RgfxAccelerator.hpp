@@ -83,10 +83,10 @@ enum {
 };
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
-// second word kRgfxAccelMethodFeatures answers: Submit's deferred flag and TakeAnswers, and
-// OpenContext's span. Each bit is set by the change that lands its call.
+// second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
+// TakeAnswers, and OpenContext's span. Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord =
-    kRgfxKextFeatureDeferredAnswers | kRgfxKextFeatureContextSpan;
+    kRgfxKextFeaturePagesBlock | kRgfxKextFeatureDeferredAnswers | kRgfxKextFeatureContextSpan;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -222,6 +222,13 @@ public:
 	IOReturn allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context, UInt64 size,
 	                    UInt64 align, UInt64 *offset);
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
+	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
+	// `length` bytes at `address` in `task`, `writable` there: the block's offset and size. The
+	// block is never in the owner's window; freeBlock frees it, and its pages are unwired once
+	// its release is answered OK, or once freeBlocks frees it after the owner's close.
+	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
+	                    UInt64 address, UInt64 length, bool writable, UInt64 *offset,
+	                    UInt64 *size);
 	void freeBlocks(const void *owner);
 	void keepBlocks(const void *owner);
 	// Pins the owner's live block that holds the `length` bytes at `offset`, for a create that
@@ -382,6 +389,12 @@ private:
 	// the device answered OK.
 	bool postSurfacePages(UInt32 context, UInt64 offset, UInt64 total, UInt64 size,
 	                      UInt64 length, const RgfxPageRun *runs, UInt32 count, bool cached);
+	// SURFACE_PAGES of the block of `total` bytes at `offset` made for context `context`: its
+	// `count` runs of `length` bytes at region offset `runsOffset`, already written, with
+	// `flags` (RGFX_SURFACE_PAGES_*, none sent where 0). kIOReturnSuccess where the device
+	// answered OK, kIOReturnUnsupported where it answered otherwise, else why it did not answer.
+	IOReturn postPages(UInt32 context, UInt64 offset, UInt64 total, UInt64 runsOffset,
+	                   UInt64 length, UInt32 count, UInt32 flags);
 	// Makes the device cache of the surface of IOSurfaceID `surfaceId` in `task` for the fresh
 	// block in place of entry `e` at `offset`, still pending, and records the block cached
 	// (rgfxSurfaceCacheAdd): false, nothing made, where it cannot be.

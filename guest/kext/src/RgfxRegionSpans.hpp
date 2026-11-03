@@ -19,8 +19,8 @@ struct RgfxRegionSpan {
 constexpr unsigned kRgfxMaxRegionSpans = 2;
 
 // The spans of the region the `size`-byte `message` of `type` names: a heap's or a buffer's block
-// over host memory, a library chunk's bytes and its ack slot, and the block an argument layout's
-// answer is written into. Writes them to `spans` and
+// over host memory, the pages block a buffer over pages lies over, a library chunk's bytes and its
+// ack slot, and the block an argument layout's answer is written into. Writes them to `spans` and
 // answers how many (0 for a message that names none); -1 for a message of one of those types too
 // short to hold its record.
 inline int rgfxRegionSpans(uint32_t type, const uint8_t *message, uint64_t size,
@@ -41,6 +41,14 @@ inline int rgfxRegionSpans(uint32_t type, const uint8_t *message, uint64_t size,
 			return -1;
 		__builtin_memcpy(&m, message, sizeof(m));
 		spans[0] = { m.region_offset, m.length };
+		return 1;
+	}
+	case RGFX_CMD_BUFFER_OVER_PAGES: {
+		RgfxBufferOverPages m;
+		if (size < sizeof(m))
+			return -1;
+		__builtin_memcpy(&m, message, sizeof(m));
+		spans[0] = { m.block_offset, m.block_size };
 		return 1;
 	}
 	case RGFX_CMD_LIBRARY_FROM_REGION: {

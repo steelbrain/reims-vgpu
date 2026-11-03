@@ -128,10 +128,24 @@ int main()
 		check(rgfxBlockNextRelease(x.t, &release) && release.offset == releasing, "releasing");
 		rgfxBlockFree(x.t, a, freed);
 
+		// Pages blocks of each client's hold their wired pages: the answered close's are taken
+		// out, each once, before its blocks go; the other client's stay with its block.
+		int pagesA = 0, pagesA2 = 0, pagesB = 0;
+		check(rgfxBlockSetWired(x.t, live, &pagesA) && rgfxBlockSetWired(x.t, releasing, &pagesA2) &&
+		          rgfxBlockSetWired(x.t, other, &pagesB),
+		      "pages blocks hold their wired pages");
 		Table y = x;
 		y.t.blocks = y.blocks;
+		void *took[2] = {rgfxBlockTakeWired(x.t, a), rgfxBlockTakeWired(x.t, a)};
+		check(took[0] == &pagesA && took[1] == &pagesA2, "the closed client's wired pages, in order");
+		check(rgfxBlockTakeWired(x.t, a) == nullptr, "each once");
 		check(rgfxBlockFreeOwner(x.t, a) == 3 && x.t.count == 1 && x.t.blocks[0].owner == b,
 		      "an answered close frees the client's blocks");
+		check(x.t.blocks[0].wired == &pagesB, "the other client's pages stay wired");
+		// A releasing block taken out answers no wired pages to its release's answer.
+		void *wired = &pagesB;
+		rgfxBlockReleased(x.t, releasing, release.serial, true, &wired);
+		check(wired == nullptr, "a release answered after the close unwires nothing");
 
 		check(rgfxBlockKeepOwner(y.t, a) == 3 && y.t.count == 4, "an unanswered close keeps them");
 		RgfxBlockPin pin;

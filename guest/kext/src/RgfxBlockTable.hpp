@@ -46,10 +46,11 @@ struct RgfxBlock {
 	// dropped that object. A block kept for another reason (a close not answered) is not
 	// `refused`, and is never posted again.
 	bool refused;
-	// For an in-place surface block: the wired pages (an opaque kernel descriptor) the host's
-	// GPU maps in place, kept while the block is in the table so the guest cannot recycle the
-	// pages under the host's view. The caller unwires it once the block leaves the table (its
-	// release answered OK, rgfxBlockReleased). Null for a copy block or a block over no surface.
+	// For an in-place surface block or a pages block: the wired pages (an opaque kernel
+	// descriptor) the host's GPU maps in place, kept while the block is in the table so the guest
+	// cannot recycle the pages under the host's view. The caller unwires it once the block leaves
+	// the table (its release answered OK, rgfxBlockReleased; a pages block's owner's close
+	// answered, rgfxBlockTakeWired). Null for any other block.
 	void *wired;
 	// Made for a client that may take the reserve (rgfxBlockAlloc's `mayReserve`): counted in
 	// the table's reservedCount and reservedBytes while it is in the table.
@@ -370,8 +371,24 @@ inline uint32_t rgfxBlockRetryRefused(RgfxBlockTable &t, uint64_t now = 0)
 	return n;
 }
 
+// `owner`'s close was answered: one of its blocks' wired pages (its pages blocks', the only ones it
+// owns that hold any), taken from the block for the caller to unwire before the blocks go
+// (rgfxBlockFreeOwner); null where none is left.
+inline void *rgfxBlockTakeWired(RgfxBlockTable &t, const void *owner)
+{
+	for (uint32_t i = 0; i < t.count; i++) {
+		RgfxBlock &b = t.blocks[i];
+		if (b.owner == owner && b.wired) {
+			void *wired = b.wired;
+			b.wired = nullptr;
+			return wired;
+		}
+	}
+	return nullptr;
+}
+
 // `owner`'s close was answered: the device holds nothing of its blocks, and they all go. How
-// many.
+// many. The caller takes their wired pages first (rgfxBlockTakeWired).
 inline uint32_t rgfxBlockFreeOwner(RgfxBlockTable &t, const void *owner)
 {
 	uint32_t kept = 0, freed = 0;

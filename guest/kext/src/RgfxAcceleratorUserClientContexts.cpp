@@ -251,6 +251,23 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (a->scalarInputCount != 1)
 			return kIOReturnBadArgument;
 		return owner->releaseSurfaceBlock(this, in[0]);
+	case kRgfxAccelMethodPagesBlock: {
+		if (a->scalarInputCount != 3 || a->scalarOutputCount != 2 || in[2] > 1)
+			return kIOReturnBadArgument;
+		// Under the queue lock, so no pages block is made for a context releaseContext has
+		// closed: every block of the client's goes after its close.
+		IOLockLock(queueLock);
+		UInt64 offset = 0, size = 0;
+		IOReturn r = hasContext ? owner->pagesBlock(this, context, task, in[0], in[1], in[2] != 0,
+		                                            &offset, &size)
+		                        : kIOReturnBadArgument;
+		IOLockUnlock(queueLock);
+		if (r != kIOReturnSuccess)
+			return r;
+		out[0] = offset;
+		out[1] = size;
+		return kIOReturnSuccess;
+	}
 	case kRgfxAccelMethodSurfaceWrites:
 		return surfaceWritesMethod(a);
 	case kRgfxAccelMethodSurfaceRetire:

@@ -54,6 +54,7 @@
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxLatency.hpp"
+#include "RgfxPagesBlock.hpp"
 #include "RgfxReleaseTable.hpp"
 
 #include <IOKit/IOLib.h>
@@ -711,7 +712,11 @@ IOReturn RgfxAccelerator::freeBlock(RgfxAcceleratorUserClient *owner, UInt64 off
 	UInt64 size = 0;
 	RgfxBlockResult r = rgfxBlockFreeable(blockTable, owner, offset, &size);
 	if (r == kRgfxBlockOk) {
-		owner->unmapSpan(offset, size);
+		// A pages block, the one kind of a client's own that holds wired pages, was never in
+		// the window.
+		const int64_t at = rgfxBlockIndex(blockTable, offset);
+		if (at < 0 || !blockTable.blocks[at].wired)
+			owner->unmapSpan(offset, size);
 		r = rgfxBlockFree(blockTable, owner, offset, mach_absolute_time());
 	}
 	IOLockUnlock(contextLock);
@@ -729,6 +734,16 @@ void RgfxAccelerator::freeBlocks(const void *owner)
 {
 	if (!contextLock)
 		return;
+	// The device holds nothing of the owner's now: its pages blocks' pages are unwired, out of
+	// the lock, each taken from its block first so no release's answer unwires it again.
+	for (;;) {
+		IOLockLock(contextLock);
+		void *wired = rgfxBlockTakeWired(blockTable, owner);
+		IOLockUnlock(contextLock);
+		if (!wired)
+			break;
+		unwire(wired);
+	}
 	IOLockLock(contextLock);
 	UInt32 freed = rgfxBlockFreeOwner(blockTable, owner);
 	IOLockUnlock(contextLock);
@@ -1456,7 +1471,19 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
 		      offset);
 		return false;
 	}
-	// The message, then where the block is cached, what it says of the cache.
+	IOReturn r = postPages(context, offset, total, offset + size, length, count,
+	                       cached ? RGFX_SURFACE_PAGES_CACHED : 0);
+	if (r != kIOReturnSuccess && r != kIOReturnUnsupported)
+		IOLog("RgfxAccelerator: the block 0x%llx's pages were not answered (0x%x): its surface "
+		      "is copied\n",
+		      offset, r);
+	return r == kIOReturnSuccess;
+}
+
+IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
+                                    UInt64 runsOffset, UInt64 length, UInt32 count, UInt32 flags)
+{
+	// The message, then where it has flags, the part that holds them.
 	struct {
 		RgfxSurfacePages pages;
 		RgfxSurfacePagesCache cache;
@@ -1467,21 +1494,130 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
 	message.pages.run_count = count;
 	message.pages.block_offset = offset;
 	message.pages.block_size = total;
-	message.pages.runs_offset = offset + size;
+	message.pages.runs_offset = runsOffset;
 	message.pages.length = length;
-	message.cache.flags = RGFX_SURFACE_PAGES_CACHED;
+	message.cache.flags = flags;
 	RgfxComplete answer = {};
 	UInt32 answered = 0;
 	IOReturn r = postLifecycle(RGFX_CMD_SURFACE_PAGES, &message,
-	                           cached ? sizeof(message) : sizeof(message.pages), RGFX_EVT_COMPLETE,
+	                           flags ? sizeof(message) : sizeof(message.pages), RGFX_EVT_COMPLETE,
 	                           &answer, sizeof(answer), &answered, nullptr, kQueueAnswerMs);
-	if (r != kIOReturnSuccess || answered < sizeof(answer)) {
-		IOLog("RgfxAccelerator: the block 0x%llx's pages were not answered (0x%x): its surface "
-		      "is copied\n",
-		      offset, r);
-		return false;
+	if (r == kIOReturnSuccess && answered < sizeof(answer))
+		r = kIOReturnTimeout;
+	if (r != kIOReturnSuccess)
+		return r;
+	return answer.status == RGFX_STATUS_OK ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+
+IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 context,
+                                     task_t task, UInt64 address, UInt64 length, bool writable,
+                                     UInt64 *offset, UInt64 *size)
+{
+	if (!contextLock)
+		return kIOReturnNotReady;
+	// A device that maps no guest pages in place, or one that did not take the feature, makes
+	// no pages block: the process copies the memory instead.
+	if (!surfacePages || !region || !(featureWord() & RGFX_FEATURE_PAGES_BUFFERS))
+		return kIOReturnUnsupported;
+	// Read-only memory is not mapped in place until such pages have a user: the GPU's writes
+	// would land in pages the process cannot write.
+	if (!writable)
+		return kIOReturnUnsupported;
+	RgfxPagesRange range = {};
+	if (!rgfxPagesRange(address, length, kPage, &range))
+		return kIOReturnBadArgument;
+	// Wired for the block's life, which resolves copy-on-write first, so a private mapping's
+	// pages are its own before the device maps them.
+	IOMemoryDescriptor *md =
+	    IOMemoryDescriptor::withAddressRange(range.base, range.length, kIODirectionOutIn, task);
+	if (!md)
+		return kIOReturnNoMemory;
+	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
+		md->release();
+		return kIOReturnBadArgument;
 	}
-	return answer.status == RGFX_STATUS_OK;
+	auto segment = [md](uint64_t at, uint64_t *bytes) -> uint64_t {
+		IOByteCount n = 0;
+		const addr64_t phys = md->getPhysicalSegment(at, &n, kIOMemoryMapperNone);
+		*bytes = n;
+		return phys;
+	};
+	const uint32_t count = rgfxPagesRuns(range.length, segment, nullptr, 0);
+	if (!count) {
+		unwire(md);
+		return kIOReturnBadArgument;
+	}
+	// The client's block, holding the wired pages from here on, and pinned until the device has
+	// its grant. It is never in the client's window: the process never sees a guest physical
+	// address.
+	const UInt64 bytes = rgfxPagesBlockSize(count, kPage);
+	RgfxBlockPin pin = {};
+	UInt64 at = 0;
+	IOLockLock(contextLock);
+	const RgfxBlockResult made = rgfxBlockAlloc(blockTable, client, context, bytes, kPage, &at,
+	                                            &pin, client->isWindowServer());
+	if (made == kRgfxBlockOk)
+		rgfxBlockSetWired(blockTable, at, md);
+	IOLockUnlock(contextLock);
+	if (made != kRgfxBlockOk) {
+		unwire(md);
+		if (made == kRgfxBlockNoSpace)
+			return kIOReturnNoSpace;
+		return made == kRgfxBlockTableFull ? kIOReturnNoResources : kIOReturnBadArgument;
+	}
+	// The runs, written straight into the block through a kernel mapping of it, write-back as
+	// the device reads the region.
+	bool written = false;
+	if (IOMemoryMap *map = region->createMappingInTask(
+	        kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, at, bytes)) {
+		auto *runs = reinterpret_cast<RgfxPageRun *>(map->getVirtualAddress());
+		written = rgfxPagesRuns(range.length, segment, runs, count) == count;
+		map->release();
+	}
+	IOReturn r = written ? postPages(context, at, bytes, at, range.length, count,
+	                                 RGFX_SURFACE_PAGES_PRIVATE)
+	                     : kIOReturnUnsupported;
+	// The device has no view of a block it never heard of, or refused: the block goes back as if
+	// never made, and its pages are unwired.
+	if (!written || r == kIOReturnUnsupported) {
+		void *wired = nullptr;
+		IOLockLock(contextLock);
+		const int64_t i = rgfxBlockIndex(blockTable, at);
+		if (i >= 0 && blockTable.blocks[i].serial == pin.serial) {
+			wired = blockTable.blocks[i].wired;
+			rgfxBlockDrop(blockTable, pin);
+		}
+		IOLockUnlock(contextLock);
+		unwire(wired);
+		return kIOReturnUnsupported;
+	}
+	if (r == kIOReturnSuccess) {
+		RgfxBlockGrant grant = {};
+		grant.context = context;
+		grant.offset = at;
+		grant.size = bytes;
+		r = postLifecycle(RGFX_CMD_BLOCK_GRANT, &grant, sizeof(grant), 0, nullptr, 0, nullptr,
+		                  nullptr, 0);
+	}
+	IOLockLock(contextLock);
+	rgfxBlockUnpin(blockTable, pin);
+	// Pages not answered, or a grant not posted: the device may have a view of the pages, so the
+	// block goes through its release, which drops the view, and is unwired at its answer.
+	const bool release =
+	    r != kIOReturnSuccess &&
+	    rgfxBlockFree(blockTable, client, at, mach_absolute_time()) == kRgfxBlockOk;
+	IOLockUnlock(contextLock);
+	if (release)
+		thread_call_enter(releaseCall);
+	if (r != kIOReturnSuccess) {
+		IOLog("RgfxAccelerator: context %u's pages block 0x%llx (%u runs of 0x%llx bytes) was "
+		      "not answered or granted (0x%x): it is released, and the memory copied\n",
+		      context, at, count, range.length, r);
+		return kIOReturnUnsupported;
+	}
+	*offset = at;
+	*size = bytes;
+	return kIOReturnSuccess;
 }
 
 IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset)

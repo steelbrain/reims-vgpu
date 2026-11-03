@@ -77,6 +77,7 @@ inline bool rgfxSubmitMakes(uint32_t type)
 	case RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER:
 	case RGFX_CMD_BUFFER_OVER_SURFACE_PAGES:
 	case RGFX_CMD_VIDEO_SESSION_CREATE:
+	case RGFX_CMD_BUFFER_OVER_PAGES:
 	case RGFX_CMD_ICB_CREATE:
 		return true;
 	default:

@@ -704,9 +704,12 @@ only where no negotiation can carry it.
   `features_lo` bits 0-2, with no kext feature.
 - Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
   `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bits 9-12 are
-  reserved. No host offers one of them yet, the kext takes none, and the host
-  carries out none of their queue flags: each lands with its feature, which
-  says what it changes.
+  reserved. Of them the host offers bit 7, `PAGES_BUFFERS`, where it offers
+  `SURFACE_PAGES`, and the kext takes it: a process's no-copy buffers lie over
+  its own pages, wired by the kext in a pages block (selector 0x10e, "The
+  accelerator's user client"; `BUFFER_OVER_PAGES`). No host offers the others
+  yet, the kext takes none of them, and the host carries out none of their
+  queue flags: each lands with its feature, which says what it changes.
 - Bit 10 is reserved for a pipeline's warm-up, and bit 11 is `SURFACE_ORDER`:
   a command buffer that uses IOSurfaces runs after the buffers of other queues
   it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below).
@@ -2095,13 +2098,13 @@ the kext and the bundle include.
 | 0x10b | `DeviceInfo` | | the device info and video caps |
 | 0x10c | `SurfaceWrites` | | the surfaces a command buffer writes |
 | 0x10d | `SurfaceRetire` | | a queue's writes up to a seqno retire |
-| 0x10e | `PagesBlock` | 1 << 0 `PagesBlock` | reserved: a block over a process's own pages |
+| 0x10e | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
 | 0x10f | `Features` | | the device's feature word and the kext's |
 | 0x110 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
 | 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
 
-The kext sets 1 << 4 `DeferredAnswers` and 1 << 5 `ContextSpan`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers` and 1 << 5 `ContextSpan`; no other bit yet.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU

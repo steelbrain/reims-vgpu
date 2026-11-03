@@ -31,6 +31,16 @@ int main()
 	CHECK(s[0].offset == 0x8400000 && s[0].length == 0x1000);
 	CHECK(spansOf(RGFX_CMD_BUFFER_OVER_HOST_MEMORY, buffer, sizeof(buffer) - 8, s) == -1);
 
+	// A buffer over pages names its pages block, not the bytes of the view it lies at.
+	RgfxBufferOverPages pages = {};
+	pages.block_offset = 0x8800000;
+	pages.block_size = 0x2000;
+	pages.offset = 0x123;
+	pages.length = 0x40000;
+	CHECK(spansOf(RGFX_CMD_BUFFER_OVER_PAGES, pages, sizeof(pages), s) == 1);
+	CHECK(s[0].offset == 0x8800000 && s[0].length == 0x2000);
+	CHECK(spansOf(RGFX_CMD_BUFFER_OVER_PAGES, pages, sizeof(pages) - 8, s) == -1);
+
 	RgfxHeapOverHostMemory heap = {};
 	heap.region_offset = 0x9000000;
 	heap.size_bytes = 0x20000;

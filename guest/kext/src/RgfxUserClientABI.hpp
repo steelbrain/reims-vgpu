@@ -122,11 +122,27 @@ enum {
 	// The client's queue scalarInput[0] has its buffers up to the seqno scalarInput[1] complete,
 	// their copies written back: their writes retire.
 	kRgfxAccelMethodSurfaceRetire = 0x10d,
+	// A pages block over the process's own memory (kRgfxKextFeaturePagesBlock;
+	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and 1 for memory the
+	// process may write; out the block's region offset and its size. The kext wires the pages that
+	// hold the range, rounded out to whole pages, in the process for as long as the block lives,
+	// lists their guest RAM runs in the block, and hands them to the device (SURFACE_PAGES, marked
+	// RGFX_SURFACE_PAGES_PRIVATE) before its grant (BLOCK_GRANT): the device's view of them starts
+	// at the range's first page, so a buffer over the range's first byte lies at that byte's
+	// offset in its page (BUFFER_OVER_PAGES). The block is the client's, freed through
+	// kRgfxAccelMethodFree; the process never maps it, so it never sees a guest physical address.
+	// The pages are unwired once the device has answered the block's release, or the client's
+	// close, and stay wired for good where neither is answered. kIOReturnUnsupported where the
+	// device lacks RGFX_FEATURE_PAGES_BUFFERS or refused the pages, and for memory the process may
+	// not write (0) until read-only pages have a user: the GPU's writes would land in pages the
+	// process cannot write. kIOReturnBadArgument where the range is not mapped in the process;
+	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
+	// for the block.
+	kRgfxAccelMethodPagesBlock = 0x10e,
 
 	kRgfxAccelMethodContextFirst = kRgfxAccelMethodOpenContext,
-	kRgfxAccelMethodContextLast = kRgfxAccelMethodSurfaceRetire,
+	kRgfxAccelMethodContextLast = kRgfxAccelMethodPagesBlock,
 
-	// 0x10e is kept for PagesBlock (kRgfxKextFeaturePagesBlock).
 	// The features: no input; out: the device's feature word (the kext's RgfxFeatures.hpp), the
 	// RGFX_FEATURE_* bits 0 to 2 as the host offers them and from bit 3 the ones the framebuffer
 	// took for the kext and its bundle; then the kext's own word (kRgfxKextFeature*, below). A

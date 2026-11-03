@@ -117,6 +117,7 @@ static void protocol()
 		kRgfxAccelMethodDeviceInfo,
 		kRgfxAccelMethodSurfaceWrites,
 		kRgfxAccelMethodSurfaceRetire,
+		kRgfxAccelMethodPagesBlock,
 	};
 	CHECK(context[0] == kRgfxAccelMethodContextFirst && context[0] == 0x100);
 	for (unsigned i = 1; i < sizeof(context) / sizeof(context[0]); i++)
@@ -126,12 +127,13 @@ static void protocol()
 }
 
 // The features call and the kext's own feature bits, as design.md's registry gives them out:
-// Features at 0x10f, past 0x10e, which PagesBlock keeps, and one bit for each call or flag a kext
-// may lack, none shared.
+// Features at 0x10f, past PagesBlock at 0x10e, and one bit for each call or flag a kext may lack,
+// none shared.
 static void features()
 {
+	CHECK(kRgfxAccelMethodPagesBlock == 0x10e);
 	CHECK(kRgfxAccelMethodFeatures == 0x10f);
-	CHECK(kRgfxAccelMethodFeatures == kRgfxAccelMethodContextLast + 2);
+	CHECK(kRgfxAccelMethodFeatures == kRgfxAccelMethodContextLast + 1);
 	const uint64_t bits[] = {
 		kRgfxKextFeaturePagesBlock,
 		kRgfxKextFeatureSubmitBatch,
