@@ -947,6 +947,35 @@ queue, and take 49 to 123 us now, as beside none
 (`a_burst_beside_waiting_queues`, release build, M3 Max under other builds'
 load).
 
+**The surface and ICB workers.** A lane hands what it would wait long for, and
+the guest learns of only through an answer or a later message, to a worker of
+the host's: a `SURFACE_PAGES`, whose view of a 3840x2400 layer took 9000
+mappings, made in 16 to 478 ms (msi 5080 host), a pages block's
+`BUFFER_OVER_PAGES` that makes or follows such a view, the let-go of a released
+block's views and device cache and of a buffer over a view at its destroy, and
+an `ICB_CREATE`. A worker runs the jobs of one
+key one at a time, in the order they were handed over, and different keys' at
+once, on at most four threads (`reims-vgpu.graphics-surfaces-<i>`,
+`reims-vgpu.icb-create-<i>`), each made as a job finds none waiting and gone
+after a second with none. The surface worker's key is the block, the ICB
+worker's the process. So a block's slow view holds up only that block's later
+jobs, and a key that finds every thread busy waits for the next free one. No
+job waits for a job of another key, so jobs waiting for a thread never wait
+for each other: a `BUFFER_OVER_PAGES` waits only for its own block's
+`SURFACE_PAGES`, done before it, and a `SURFACE_PAGES` for nothing, as a debug
+build checks. What the guest can tell apart from one thread: two
+`BUFFER_OVER_PAGES` of one process on different blocks are made in either
+order, which no answer orders, and the process's later messages wait for
+both. Tested by `a_key_whose_job_hangs_holds_no_other_keys_jobs`,
+`a_key_waits_for_a_free_thread_once_every_thread_is_busy`,
+`each_keys_jobs_run_one_at_a_time_in_handed_order` and
+`an_idle_thread_ends_after_the_idle_time`. Beside K blocks that each run 25 ms
+jobs back to back, another block's job starts after its hand-off in 0.015 ms at
+the median for K of 1 or 2, 5 to 6 ms for 4, 22 to 23 ms for 6 and 35 to 38 ms
+for 8, where one thread took 24, 54 to 56, 115 to 117, 179 to 182 and 241 ms
+(`another_blocks_job_beside_busy_blocks`, two runs of each, release build, M3
+Max at load averages of 28 to 52).
+
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process
 holds much, so neither does the kext. The one process whose refusal would stall

@@ -519,8 +519,8 @@ pub(crate) struct Shared<P: Platform> {
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
     /// The blocks whose `SURFACE_PAGES` is not yet carried out ([`worker::Unsettled`]).
     unsettled: Arc<worker::Unsettled>,
-    /// The thread the views are made and let go of on ([`worker::Worker`]), and a block's device
-    /// cache at its release ([`Caches::release`]).
+    /// The threads the views are made and let go of on, a block's jobs in their order
+    /// ([`worker::Worker`]), and a block's device cache at its release ([`Caches::release`]).
     surface_worker: Arc<worker::Worker>,
     /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
     surface_caches: Arc<Caches<P>>,
@@ -843,9 +843,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.unsettled.begin(block, resets, begun)
     }
 
-    /// Hands the `SURFACE_PAGES` of the block at `block` to the surface worker
-    /// ([`worker::Worker`]), begun here ([`Self::begin_surface_pages`]): `job`
-    /// runs there, with its settle, which it lets go of once it has answered.
+    /// Hands the `SURFACE_PAGES` of the block at `block` to the surface worker, behind the
+    /// block's jobs handed to it before ([`worker::Worker`]), begun here
+    /// ([`Self::begin_surface_pages`]): `job` runs there, with its settle, which it lets go of once
+    /// it has answered, and waits for nothing.
     pub(crate) fn hand_off_surface_pages(
         &self,
         block: u64,
@@ -855,7 +856,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let begun = settle.begun;
         self.shared
             .surface_worker
-            .submit(Box::new(move || job(settle)));
+            .submit_waitless(block, Box::new(move || job(settle)));
         log::debug!(
             target: "reims_vgpu::graphics::surface_pages",
             "SURFACE_PAGES of the block at {block:#x} handed to the worker in {} us",
@@ -1063,10 +1064,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.settle_surface(offset);
         let gone = self.shared.surface_views.lock().released(offset);
         if let Some(gone) = gone {
-            self.shared.surface_worker.drop_later(offset, gone);
+            self.shared.surface_worker.drop_later(offset, offset, gone);
         }
         let worker = Arc::clone(&self.shared.surface_worker);
-        let let_go = Box::new(move |cache| worker.drop_later(offset, cache));
+        let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         (self.surface_caches).release(device, offset, unread, done, failed, let_go);
     }
 
@@ -1362,9 +1363,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .private_unmade(m.block_offset)
     }
 
-    /// Hands `job` to the surface worker, behind what was handed to it before.
-    pub(crate) fn on_surface_worker(&self, job: worker::Job) {
-        self.shared.surface_worker.submit(job);
+    /// Hands `job`, of the block at `block`, to the surface worker, behind the block's jobs handed
+    /// to it before.
+    pub(crate) fn on_surface_worker(&self, block: u64, job: worker::Job) {
+        self.shared.surface_worker.submit(block, job);
     }
 
     /// The surface worker (for the tests).
@@ -2382,6 +2384,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             let Entry {
                 managed,
                 handle,
+                span,
                 over_view,
                 ..
             } = removed.into_entry();
@@ -2389,9 +2392,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             // buffer's over host memory the GPU address, which the guest's next create may take
             // at once.
             if over_view {
+                // Behind its block's jobs, or its own where it has no block.
+                let key = span.map_or(obj_id, |(offset, _)| offset);
                 self.shared
                     .surface_worker
-                    .drop_later(obj_id, (managed, handle));
+                    .drop_later(key, obj_id, (managed, handle));
             } else {
                 if let Some(copy) = managed {
                     drop_refused(obj_id, copy);

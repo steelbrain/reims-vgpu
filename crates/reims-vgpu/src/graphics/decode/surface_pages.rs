@@ -47,12 +47,13 @@
 //! on the msi 5080 host, macOS 26 guest, Safari scrolling: every run one page, 74% of them
 //! downwards), so a 3840x2400 layer takes 9000 mappings, made in 16 to 478 ms and imported in 18 to
 //! 21 ms. Ring 0 waits for none of it: the block's lane hands each `SURFACE_PAGES` to the surface
-//! worker, `reims-vgpu.graphics-surfaces` ([`Worker`]), which makes the views in the order they are
-//! handed over (each block's in its ring order) and answers each once its block's view, and
-//! device cache, are made. Until then the block is unsettled ([`Unsettled`]): every later message
-//! that names it, on ring 0 or a queue's ring, waits for it first, and a command buffer that uses
-//! it is not answered at a doorbell, so it sees the block as it would have right after the
-//! `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
+//! worker, `reims-vgpu.graphics-surfaces-<i>` ([`Worker`]), whose threads make each block's views
+//! in the order they are handed over (its ring order), other blocks' beside them, and answer each
+//! once its block's view, and device cache, are made. Until then the block is unsettled
+//! ([`Unsettled`]): every later message that names it, on ring 0 or a queue's ring, waits for it
+//! first, and a command buffer that uses it is not answered at a doorbell, so it sees the block as
+//! it would have right after the `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only
+//! checks its runs, is carried out
 //! there too, in its order with the rest. The guest's kext names a block only after the answer, so
 //! in its order nothing waits. A pages block's view, which its first `BUFFER_OVER_PAGES`
 //! makes, is made on the worker as well (`GraphicsControl::start_buffer_over_pages`): that
@@ -286,9 +287,11 @@ impl<P: Platform> SurfaceViews<P> {
     /// the cache's over the same runs, else one made, with a buffer over it on `device`. The
     /// mapping and the import are made with `views` unlocked, so a message that asks of the
     /// views meanwhile does not wait for them; the views and the cache are changed only here,
-    /// by one `SURFACE_PAGES` at a time (the surface [`Worker`]), and at a release, which names
-    /// another block, and a reset, which waits for it. What leaves the views goes once the lock
-    /// is let go, on this thread. `None` where the device was reset since `settle` began it.
+    /// by one `SURFACE_PAGES` of a block at a time (the surface [`Worker`]), and at a release,
+    /// which names another block, and a reset, which waits for it. Two blocks' at once change
+    /// only their own entries, and two views made at once over the same runs are both cached.
+    /// What leaves the views goes once the lock is let go, on this thread. `None` where the
+    /// device was reset since `settle` began it.
     ///
     /// [`Worker`]: super::worker::Worker
     pub(crate) fn surface_pages(

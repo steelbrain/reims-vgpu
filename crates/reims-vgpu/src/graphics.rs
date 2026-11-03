@@ -117,9 +117,9 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// (`reims-vgpu.graphics-block-<offset>`), its refresh thread, a command queue's service thread
 /// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
 /// (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
-/// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces`), the
-/// indirect command buffers' worker (`reims-vgpu.icb-create`), or the platform's thread that runs
-/// a command buffer's scheduled or completed handler; or the host's own, inside
+/// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces-<i>`),
+/// the indirect command buffers' worker (`reims-vgpu.icb-create-<i>`), or the platform's thread
+/// that runs a command buffer's scheduled or completed handler; or the host's own, inside
 /// [`GraphicsDevice::mmio_write_taking`].
 /// Each is called never inside another call of the host's into the device, and with no lock held
 /// that a function of the device's waits for, directly or through a thread of the library's, so
@@ -915,7 +915,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ([`Self::start_pipeline`], [`Self::start_library`]), and a command buffer that names a
     /// pipeline still compiling waits for it first (`compile`), and is then begun here and walked
     /// and committed on its queue's lane ([`Self::begin_command_buffer`]). An indirect command
-    /// buffer's create is made on the ICB thread ([`Self::start_icb`]), and the destroy of one
+    /// buffer's create is made on the ICB worker ([`Self::start_icb`]), and the destroy of one
     /// still being made waits for it. A library lookup is answered here
     /// ([`Self::lookup_library`]).
     fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
@@ -1374,10 +1374,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// A `BUFFER_OVER_PAGES` from ring 0 that makes its pages block's view (the block's first),
     /// follows its block's `SURFACE_PAGES` still on the surface worker, or follows another of its
     /// context's still being made: begun here, in ring order, and carried out on the surface
-    /// worker behind what was handed to it before, so the view's mapping and import hold neither
-    /// ring 0 nor the views' lock (`decode::surface_pages`). Until it is made its context and its
-    /// block are unsettled ([`Self::pages_buffers`]): every later message of the context waits
-    /// for it ([`Self::handle_stage3`]), none of its command buffers is answered at a doorbell
+    /// worker behind its block's jobs handed to it before (another block's may be made first:
+    /// `decode::worker`), so the view's mapping and import hold neither ring 0 nor the views'
+    /// lock (`decode::surface_pages`). Until it is made its context and its block are unsettled
+    /// ([`Self::pages_buffers`]): every later message of the context waits for it
+    /// ([`Self::handle_stage3`]), none of its command buffers is answered at a doorbell
     /// ([`Self::answer_command_buffer`]), and its block's release, a new `SURFACE_PAGES` of its
     /// block and its context's close wait for it, so each sees the buffer as right after its
     /// create. Made under the reset gate, held shared recursively, as the surface
@@ -1406,7 +1407,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             self.pages_buffers.begin(m.block_offset, 0, begun),
         );
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        decoder.on_surface_worker(Box::new(move || {
+        decoder.on_surface_worker(m.block_offset, Box::new(move || {
             let outcome = {
                 let _carried = me.reset_gate.read_recursive();
                 if poster.stale() {
@@ -1428,21 +1429,24 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         true
     }
 
-    /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB thread
-    /// ([`Self::create_icb`]), so ring 0 goes on meanwhile. Its answer goes through `poster`
-    /// before it settles. Nothing of the guest's names the buffer before that answer: the bundle
-    /// waits for it, for the buffer's `gpuResourceID`, before it hands the buffer out. So only the
-    /// kext's destroy behind a create it stopped waiting for can name it while it is made, and
-    /// that destroy waits for it ([`Self::handle_stage3`]). Made under the reset gate, held shared
-    /// (recursively, as for the surface worker's jobs); where the device was reset since its
-    /// begin, nothing is made and nothing answered.
+    /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB worker,
+    /// behind its context's creates handed to it before ([`Self::create_icb`]), so ring 0 goes on
+    /// meanwhile. Its answer goes through `poster` before it settles. Nothing of the guest's
+    /// names the buffer before that answer: the bundle waits for it, for the buffer's
+    /// `gpuResourceID`, before it hands the buffer out. So only the kext's destroy behind a create
+    /// it stopped waiting for can name it while it is made, and that destroy waits for it
+    /// ([`Self::handle_stage3`]). Made under the reset gate, held shared (recursively, as for the
+    /// surface worker's jobs); where the device was reset since its begin, nothing is made and
+    /// nothing answered.
     fn start_icb(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let (_, seqno, obj_id) = message_identity(message);
         // The poster's epoch says whether the device was reset since: the settle's count of
         // resets is not read.
         let settle = self.icbs.begin(obj_id, 0, self.pool.now());
+        // Behind its process's creates, beside other processes'.
+        let key = u64::from(sender_context(poster, message));
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        self.icb_worker.submit(Box::new(move || {
+        let job = Box::new(move || {
             {
                 let _carried = me.reset_gate.read_recursive();
                 if !poster.stale() {
@@ -1458,10 +1462,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     .as_micros()
             );
             drop(settle);
-        }));
+        });
+        self.icb_worker.submit(key, job);
     }
 
-    /// An indirect command buffer's create from ring 0, on the ICB thread ([`Self::start_icb`]),
+    /// An indirect command buffer's create from ring 0, on the ICB worker ([`Self::start_icb`]),
     /// answered through `poster` with its `gpuResourceID` (`ICB_STATE`), which the guest's buffer answers and its argument
     /// buffers hold, so a kernel encoding through one reaches this buffer: the id the platform
     /// numbers it by. The buffer is stored under its id before the answer. A create the platform
