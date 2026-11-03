@@ -1553,6 +1553,113 @@ fn a_command_buffer_waits_for_the_creates_before_it() {
     );
 }
 
+/// A command buffer waits for no ring-0 message of another process's: it is decoded while the
+/// control thread is still in another process's create published before it.
+#[test]
+fn a_command_buffer_waits_for_no_other_process_s_creates() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    seen.gate.store(false, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
+    seen.wait("the buffer create never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
+    });
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    let done = first_queue_completion(&rig).expect("held up by another process's create");
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_COMMAND_BUFFER
+        ]
+    );
+    seen.gate.store(true, Ordering::SeqCst);
+}
+
+/// A command buffer waits for its own process's messages on ring 0, and so for every message
+/// before them: its process's create behind another's the control thread is still in holds it up.
+#[test]
+fn a_command_buffer_waits_for_its_process_s_creates_behind_another_s() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    seen.gate.store(false, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
+    seen.wait("the buffer create never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
+    });
+    rig.send(object_message(RGFX_CMD_SAMPLER_CREATE, QUEUE + 1));
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE],
+        "the command buffer ran before its process's create"
+    );
+    seen.gate.store(true, Ordering::SeqCst);
+    let done = first_queue_completion(&rig).expect("the command buffer completed");
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_SAMPLER_CREATE,
+            RGFX_CMD_COMMAND_BUFFER
+        ]
+    );
+}
+
+/// Process B learns of process A's surface over IPC after A's messages were posted, which may be
+/// before ring 0 has carried them out: B's buffer waits for the share of the surface's block the
+/// kext posts for B's context before B learns of it, and so for A's messages before the share.
+#[test]
+fn a_command_buffer_waits_for_another_process_s_messages_before_its_share() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const B: u32 = 5;
+    const QUEUE: u64 = ((B as u64) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const A_OBJECT: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const SURFACE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    seen.gate.store(false, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, A_OBJECT));
+    seen.wait("A's create never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
+    });
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, B, SURFACE, 0x1000));
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE],
+        "B's command buffer ran before the share of A's surface"
+    );
+    seen.gate.store(true, Ordering::SeqCst);
+    let done = first_queue_completion(&rig).expect("the command buffer completed");
+    assert_eq!(done.cb_obj_id, 100);
+    assert!(rig.region().held_by(B, SURFACE, 0x1000));
+}
+
 /// A reset wakes a command buffer's wait for the creates before it, though the control thread is
 /// still in one: its queue's thread stops waiting and ends, handing the host nothing more of the
 /// queue's, neither the buffer nor the queue's destroy, which the host's reset stands for.
@@ -2075,8 +2182,9 @@ fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
 
 /// A doorbell write through `mmio_write_taking` leaves the buffer on the ring for the queue's
 /// thread where the host does not take it, where the queue's thread holds a message of the
-/// queue's, and where a ring-0 message published before it is not yet carried out: the queue's
-/// thread hands it to the host as it hands any, in the queue's order and after the ring-0 message.
+/// queue's, and where a ring-0 message of its process's published before it is not yet carried
+/// out: the queue's thread hands it to the host as it hands any, in the queue's order and after
+/// the ring-0 message.
 #[test]
 fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
@@ -2143,7 +2251,7 @@ fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
     on_queue_thread(&taking, &[100, 101]);
     drop(rig);
 
-    // A ring-0 create published before it is not yet carried out.
+    // A ring-0 create of its process's published before it is not yet carried out.
     let taking = Arc::new(Taking::default());
     taking.takes.store(true, Ordering::SeqCst);
     let mut rig = taking_rig(&taking, QUEUE);
@@ -2172,6 +2280,37 @@ fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
             RGFX_CMD_COMMAND_BUFFER
         ]
     );
+}
+
+/// A doorbell write through `mmio_write_taking` takes a command buffer on its thread while the
+/// control thread is still in another process's create published before it.
+#[test]
+fn a_doorbell_write_takes_a_command_buffer_behind_another_process_s_create() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let mut rig = taking_rig(&taking, QUEUE);
+    taking.shut.store(true, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
+    let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
+    for _ in 0..2000 {
+        if created(&taking) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(created(&taking), "the create never reached the host");
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert_eq!(
+        queue_events(&rig, 0).first(),
+        Some(&(RGFX_EVT_CB_SUBMITTED, 1, 100)),
+        "the CB_SUBMITTED is posted before the doorbell write returns"
+    );
+    assert_eq!(queue_events(&rig, 2).len(), 2);
+    taking.shut.store(false, Ordering::SeqCst);
 }
 
 /// `mmio_write_taking` writes every register but `DOORBELL` as `mmio_write` does.

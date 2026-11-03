@@ -762,8 +762,34 @@ rings. At the process's close or death the kext destroys its queues, then
 closes its context (`CONTEXT_CLOSE`: the host drops its objects, then
 answers once the context's command buffers have finished), then frees its
 chunks of resource ids and, on that answer only, its blocks. A command
-buffer is decoded once the host has carried out every control-ring message
-published before its queue's thread took it.
+buffer is decoded once the host has carried out every control-ring message of
+its context's published before its queue's thread took it, and every message
+before those.
+
+**A buffer's wait on ring 0.** A buffer names only its own context's objects
+and spans in blocks its context holds, so what it can depend on on ring 0 is
+its context's: a message about an object (`QUEUE_CREATE` to
+`BUFFER_OVER_PAGES`), whose id carries the context's bits, or one the kext
+posts for a context (`CONTEXT_CLOSE` to `SURFACE_PAGES`), which names it.
+Another process's surface reaches a buffer only through the share of its block
+the kext posts for the buffer's context before the process learns of the block:
+the share comes after the surface's `SURFACE_PAGES` and after every message the
+process that made the surface posted before it handed the surface on, and ring
+0 is carried out in order, so a buffer that waits for its share waits for those
+too. Shared events and textures do not cross processes. A display command
+(`GET_DISPLAYS` to `PRESENT_SURFACE`) or a `SURFACE_DOWNLOAD` holds up no buffer:
+none reads what they make. A buffer posted after a present or a download of a
+surface it writes, but taken before it, is among the writers that message
+waits for, as one posted before it is: the guest writes a surface the display
+pipe shows, or one a CPU lock holds, only racing them. Every buffer waits for a
+message of any other type, which the host refuses. The queues' threads read
+ring 0 ahead of the control thread, each message once, and keep the count
+through each context's last message (`reims_graphics`'s `device::backlog`), so
+a buffer behind another process's backlog on ring 0 is decoded at once.
+Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
+`a_command_buffer_waits_for_its_process_s_creates_behind_another_s`,
+`a_command_buffer_waits_for_another_process_s_messages_before_its_share` and
+`a_doorbell_write_takes_a_command_buffer_behind_another_process_s_create`.
 
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process
@@ -1634,9 +1660,10 @@ after the commit. Each outcome the new design allows is one of those two:
   the begin. A close during the walk empties the table at once and the walk
   keeps naming its objects; the buffer took its context's drain before its
   view, so the close is answered after the buffer's completion handler. The
-  begin comes after ring 0 has carried out every message published before the
-  buffer was taken (`reims_graphics`'s queue gate), so a buffer finds every
-  create its process sent before it. Tested by
+  begin comes after ring 0 has carried out every message of its context's
+  published before the buffer was taken (`reims_graphics`'s queue gate, "A
+  buffer's wait on ring 0"), so a buffer finds every create its process sent
+  before it. Tested by
   `a_walk_names_what_its_table_held_at_its_begin`,
   `a_walk_names_nothing_made_after_its_begin` and
   `a_close_during_a_walk_leaves_it_its_objects` (the decoder's `cmdbuf`

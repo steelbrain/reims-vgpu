@@ -37,9 +37,11 @@
 //! posts what it owes there (a buffer's completion), raising the queue's own MSI-X vector. Its
 //! doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`, as
 //! the control ring's is 0). A command buffer is handed to the host only once the control thread
-//! has handed it every ring-0 message published before the thread took the buffer, so the creates
-//! it names are made, or, for a pipeline the host compiles on threads of its own, known to the host,
-//! which holds a buffer that names it until it is made. An `OBJECT_DESTROY` of the queue, a
+//! has handed it every ring-0 message of the buffer's context's published before the thread took
+//! the buffer, and every message before those (`backlog`: another context's backlog holds it up
+//! only where it lies before one of its own), so the creates it names are made, or, for a pipeline
+//! the host compiles on threads of its own, known to the host, which holds a buffer that names it
+//! until it is made. An `OBJECT_DESTROY` of the queue, a
 //! `CONTEXT_CLOSE` of its process (the host then
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
 //! queue's service.
@@ -61,9 +63,10 @@
 //! takes anything more of the queue's. The offer is made only where nothing need be waited for: no
 //! lock of the device's is held elsewhere (each is tried; the queues' table, held elsewhere, is
 //! waited for as [`Device::mmio_write`] waits for it, and no offer is made), the service thread
-//! holds no message of the queue's, and the control thread has carried out every ring-0 message
-//! published before the buffer. Otherwise the buffer stays on the ring and the service thread
-//! takes it as it takes any, so the queue's events keep its order.
+//! holds no message of the queue's, at most `DOORBELL_READS` of ring 0's messages are left to
+//! read, and the control thread has carried out every ring-0 message the buffer waits for.
+//! Otherwise the buffer stays on the ring and the service thread takes it as it takes any, so the
+//! queue's events keep its order.
 //!
 //! **The end.** The last [`Device`] handle's drop ends both threads without waiting for them: each
 //! sees the end at its next wake (the control thread at once, the refresh thread within a
@@ -99,12 +102,19 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
+use crate::device::backlog::Backlog;
 use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
 use crate::ring::{Consumer, Message, Posted, Producer, RingAt, sized};
 use crate::wake::{self, Wake};
 use crate::wire::*;
+
+mod backlog;
+
+/// How many of ring 0's messages a doorbell's take reads ([`Backlog::read`]) before it leaves the
+/// buffer to its queue's thread.
+const DOORBELL_READS: usize = 32;
 
 /// The region's size: the control rings, the framebuffer's scanout span and cursor, and room for
 /// the guest processes' rings, buffers, heaps and surfaces (a 3840x2400 BGRA8 surface is 37 MB);
@@ -437,8 +447,8 @@ pub(crate) struct Shared {
     /// tests make it long to see what wakes a post.
     room_poll_ns: AtomicU64,
     /// The control submission ring's count through the last message the control thread has
-    /// carried out or handed to the host: a command buffer waits for it to pass what was
-    /// published before it.
+    /// carried out or handed to the host: a command buffer waits for it to pass the last message
+    /// published before it that is its context's or every buffer's ([`backlog`]).
     control_done: AtomicU64,
     /// Held by a queue thread while it looks at `control_done` and sleeps for it to move, and by
     /// whoever signals a move, so a move between the look and the sleep still wakes it.
@@ -575,6 +585,9 @@ struct Submit {
     consumer: Consumer,
     /// The ring is broken: nothing is taken until a reset.
     broken: bool,
+    /// Ring 0's messages, by whose each is, for the command buffers' waits ([`Backlog`]); empty
+    /// on a queue's ring.
+    backlog: Backlog,
 }
 
 /// The display, as the guest has set it, and what the device has told it.
@@ -623,6 +636,7 @@ impl Device {
             submit: Mutex::new(Submit {
                 consumer,
                 broken: false,
+                backlog: Backlog::default(),
             }),
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
@@ -924,6 +938,7 @@ impl Shared {
         let mut completion = self.completion.lock();
         submit.consumer.reset(&self.region);
         submit.broken = false;
+        submit.backlog = Backlog::default();
         self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
         *display = DisplayState::default();
@@ -1039,7 +1054,12 @@ impl Shared {
                     continue;
                 }
                 let epoch = self.epoch.load(Ordering::Acquire);
-                match submit.consumer.next(&self.region) {
+                let next = submit.consumer.next(&self.region);
+                if let Ok(Some(message)) = &next {
+                    let through = submit.consumer.consumed();
+                    submit.backlog.took(message, through);
+                }
+                match next {
                     Ok(Some(message)) if control::is_unheld(&message) => {
                         let through = submit.consumer.consumed();
                         drop(submit);
@@ -1296,9 +1316,10 @@ impl Shared {
     /// Offers `queue`'s next message to the host on this thread, a doorbell's (the module doc),
     /// where it is a `COMMAND_BUFFER` of at most [`TAKE_ON_DOORBELL_MAX`] bytes, the device is
     /// started and the queue lives, and nothing need be waited for: `queue`'s `consuming`, its
-    /// submission ring and the control submission ring are each free, and the control thread
-    /// has carried out every ring-0 message published before the buffer, as the service thread
-    /// waits for before it hands a buffer over. Where the host takes it, the buffer leaves the
+    /// submission ring and the control submission ring are each free, at most [`DOORBELL_READS`]
+    /// of ring 0's messages are left to read, and the control thread has carried out every
+    /// ring-0 message the buffer waits for, as the service thread waits for before it hands a
+    /// buffer over. Where the host takes it, the buffer leaves the
     /// ring, the rest of its work is handed to the service thread, and its `CB_SUBMITTED` is
     /// posted here, before the caller wakes the service thread, which would post it first
     /// otherwise. Where it does not, the ring is left as it was (but for pads before the message,
@@ -1325,15 +1346,16 @@ impl Shared {
             {
                 return;
             }
-            // The order the service thread keeps (`take_queue_messages`), read after the peek.
-            let Some(created_through) = self
-                .submit
-                .try_lock()
-                .map(|control| control.consumer.published_count(&self.region))
-            else {
+            // The order the service thread keeps (`take_queue_messages`), read after the peek, of
+            // as much of ring 0 as a doorbell reads.
+            let Some(mut control) = self.submit.try_lock() else {
                 return;
             };
-            if self.control_done.load(Ordering::Acquire) < created_through {
+            let control = &mut *control;
+            let done = self.control_done.load(Ordering::Acquire);
+            let read =
+                (control.backlog).read(&control.consumer, &self.region, done, DOORBELL_READS);
+            if !read || done < control.backlog.waits_for(queue.context) {
                 return;
             }
             let poster = self.queue_poster(queue);
@@ -1468,6 +1490,7 @@ impl Shared {
             submit: Mutex::new(Submit {
                 consumer,
                 broken: false,
+                backlog: Backlog::default(),
             }),
             taken_seqno: AtomicU64::new(0),
             consuming: Mutex::new(None),
@@ -1662,14 +1685,21 @@ impl Shared {
             // ride ring 0, whose sole consumer is the control thread; command buffers ride the
             // queues' own rings (this thread). A create a buffer uses is posted before it in guest
             // order, so it is within ring 0's producer at the moment this thread takes the buffer.
-            // Wait for the control thread to have carried out every message up to there, so the
-            // resource is registered before the buffer's ops name it. This thread only reads ring
-            // 0's counts; it never consumes that ring, so it keeps one consumer and its
-            // `consumer_idle` handshake is untouched. It sleeps until the control thread signals
-            // a move of `control_done`, a reset or the end.
-            let created_through = self.submit.lock().consumer.published_count(&self.region);
+            // Wait for the control thread to have carried out every message up to the last of
+            // them, of the buffer's context's or every buffer's ([`Backlog`]), so the resource is
+            // registered before the buffer's ops name it. This thread only reads ring 0; it never
+            // consumes it, so it keeps one consumer and its `consumer_idle` handshake is
+            // untouched. It sleeps until the control thread signals a move of `control_done`, a
+            // reset or the end.
+            let waits_for = {
+                let mut control = self.submit.lock();
+                let control = &mut *control;
+                let done = self.control_done.load(Ordering::Acquire);
+                (control.backlog).read(&control.consumer, &self.region, done, usize::MAX);
+                control.backlog.waits_for(queue.context)
+            };
             let mut moved = self.control_moved.lock();
-            while self.control_done.load(Ordering::Acquire) < created_through {
+            while self.control_done.load(Ordering::Acquire) < waits_for {
                 if self.ending()
                     || queue.ended()
                     || self.epoch.load(Ordering::Acquire) != queue.epoch

@@ -120,6 +120,18 @@ pub(crate) struct Message {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// How far [`Consumer::walk_published`] went: the count through the messages it walked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Walked {
+    /// Through every message the guest has published.
+    All(u64),
+    /// Through the most it was to walk, with more published.
+    Most(u64),
+    /// Up to a count or a message the protocol refuses, where [`Consumer::peek`] would find the
+    /// ring broken.
+    Broken(u64),
+}
+
 /// The host's end of a submission ring: it reads what the guest produces.
 #[derive(Debug)]
 pub(crate) struct Consumer {
@@ -260,6 +272,54 @@ impl Consumer {
             walked += size;
         }
         highest
+    }
+
+    /// Walks the messages the guest has published and the host has not taken, in ring order, read
+    /// where they lie, pads skipped, nothing taken: from count `from`, where that is past the
+    /// host's own count, and at most `most` of them. `visit` is given the count through each, its
+    /// `type`, and its 8 bytes at offset 16, its first field past the header, where it holds them.
+    pub(crate) fn walk_published(
+        &self,
+        region: &Region,
+        from: u64,
+        most: usize,
+        mut visit: impl FnMut(u64, u32, Option<u64>),
+    ) -> Walked {
+        let mut at = from.max(self.count);
+        let Ok(ahead) = self.published(region) else {
+            return Walked::Broken(at);
+        };
+        let end = self.count.wrapping_add(ahead);
+        let mut walked = 0;
+        while at < end {
+            if walked == most {
+                return Walked::Most(at);
+            }
+            let Some(start) = region.read(self.at.data_at(at), 8) else {
+                return Walked::Broken(at);
+            };
+            let r#type = u32::from_le_bytes([start[0], start[1], start[2], start[3]]);
+            let size = u64::from(u32::from_le_bytes([start[4], start[5], start[6], start[7]]));
+            let least = if r#type == RGFX_MSG_PAD {
+                8
+            } else {
+                HEADER_SIZE
+            };
+            if size % 8 != 0 || size < least || size > self.at.left_to_end(at) || size > end - at {
+                return Walked::Broken(at);
+            }
+            if r#type != RGFX_MSG_PAD {
+                let field = (size >= HEADER_SIZE + 8)
+                    .then(|| region.read(self.at.data_at(at) + HEADER_SIZE, 8))
+                    .flatten()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_le_bytes);
+                walked += 1;
+                visit(at + size, r#type, field);
+            }
+            at += size;
+        }
+        Walked::All(at)
     }
 
     /// Takes `message`, which [`Self::peek`] answered last: the host's count moves past it and is
@@ -542,6 +602,63 @@ mod tests {
                 guest.count
             );
         }
+    }
+
+    /// A walk reads what the guest published past the host's count, across the end and its pad,
+    /// taking nothing: from where it is asked, at most as many as asked, and up to a message the
+    /// protocol refuses.
+    #[test]
+    fn a_walk_reads_the_published_messages_without_taking_them() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        let mut guest = Guest { count: 0 };
+        let mut field = |seqno: u64, len: usize| {
+            let mut bytes = message(0x200 + seqno as u32, seqno, len);
+            if len >= 24 {
+                bytes[16..24].copy_from_slice(&(seqno * 10).to_le_bytes());
+            }
+            guest.write(&region, &bytes);
+            guest.count
+        };
+        let first = field(1, 200);
+        let short = field(2, 16);
+        consumer.next(&region).unwrap().unwrap();
+        // Past the end: a 40-byte pad, then the message at the ring's start.
+        let wrapped = field(3, 48);
+        assert_eq!(wrapped, 256 + 48);
+        let mut seen = Vec::new();
+        let walked = consumer.walk_published(&region, 0, usize::MAX, |through, r#type, f| {
+            seen.push((through, r#type, f));
+        });
+        assert_eq!(walked, Walked::All(wrapped));
+        assert_eq!(
+            seen,
+            [(short, 0x202, None), (wrapped, 0x203, Some(30))],
+            "from the host's count, the pad skipped"
+        );
+        assert_eq!(consumer.consumed(), first, "nothing taken");
+        seen.clear();
+        let walked = consumer.walk_published(&region, short, 1, |through, r#type, f| {
+            seen.push((through, r#type, f));
+        });
+        assert_eq!(walked, Walked::All(wrapped));
+        assert_eq!(seen, [(wrapped, 0x203, Some(30))]);
+        assert_eq!(
+            consumer.walk_published(&region, first, 1, |_, _, _| {}),
+            Walked::Most(short)
+        );
+        // A size the protocol refuses ends the walk there.
+        let mut bad = message(0x204, 4, 24);
+        bad[4..8].copy_from_slice(&20u32.to_le_bytes());
+        region.write(AT.data_at(wrapped), &bad);
+        region
+            .atomic_u64(PRODUCER)
+            .store(wrapped + 24, Ordering::Release);
+        assert_eq!(
+            consumer.walk_published(&region, wrapped, usize::MAX, |_, _, _| {}),
+            Walked::Broken(wrapped)
+        );
     }
 
     /// A pad of 8 bytes, the least the end can leave, is skipped
