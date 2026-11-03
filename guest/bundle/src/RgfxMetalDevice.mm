@@ -556,7 +556,8 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 	if (!_slabs->start())
-		rgfxDiag("RGFX: no slab thread; creates zero and frees let slabs go themselves\n");
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
