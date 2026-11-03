@@ -5,7 +5,8 @@
  * a context the driver deletes, by DeleteContexts or by a CreateContexts that fails part way,
  * takes its session with it, closed and out of the live sessions, that a decode the driver
  * cannot send fails its schedule, that no answer of the driver AppleGVA may divide by is 0 (an
- * alignment, a plane's size or pitch, a budget, a limit, a decoder's tile parameter).
+ * alignment, a plane's size or pitch, a budget, a limit, a decoder's tile parameter), and that
+ * each driver AppleGVA makes keeps bitstream pools of its own.
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the first failure.
  */
@@ -16,6 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "RgfxVideoChannel.hpp"
 
@@ -178,7 +182,11 @@ constexpr uint64_t kOk = 0, kUnsupported = 1, kNotSent = 5;
 enum {
 	kCreateContexts = 2,
 	kDeleteContexts = 3,
+	kCreateDriver = 0,
+	kDeleteDriver = 1,
 	kGetBitstreamBufferInfo = 4,
+	kAllocateBitstreamBufferPool = 5,
+	kFreeBitstreamBufferPool = 6,
 	kGetPixelBufferInfo = 7,
 	kFreePixelBufferPool = 9,
 	kSchedule = 10,
@@ -257,10 +265,89 @@ void releaseToken(void *) {}
 namespace {
 
 DriverTable *g_table;
+// The driver CreateDriver made, which the checks call the entries on.
+void *g_driver;
+
+uint64_t callOn(void *driver, int entry, const void *record, const void *out = nullptr)
+{
+	return g_table->entry[entry]((uint64_t)driver, (uint64_t)record, (uint64_t)out);
+}
 
 uint64_t call(int entry, const void *record, const void *out = nullptr)
 {
-	return g_table->entry[entry]((uint64_t)g_table->driver, (uint64_t)record, (uint64_t)out);
+	return callOn(g_driver, entry, record, out);
+}
+
+// A driver made as AppleGVA makes one.
+void *createDriver()
+{
+	void *driver = nullptr;
+	uint8_t create[0x20] = {};
+	CHECK(g_table->entry[kCreateDriver]((uint64_t)&driver, (uint64_t)create, 0) == kOk && driver,
+	      "CreateDriver");
+	return driver;
+}
+
+// AllocateBitstreamBufferPool's record.
+struct BitstreamPool {
+	uint32_t pool;
+	uint32_t field_04;
+	uint32_t size;
+	Format format;
+	uint32_t count;
+	uint64_t *addresses;
+};
+static_assert(offsetof(BitstreamPool, addresses) == 0x18, "bitstream pool layout");
+
+// One buffer of `bytes` in `driver`'s pool `pool`: its address, 0 where refused.
+uint64_t allocate(void *driver, uint32_t pool, uint32_t bytes)
+{
+	uint64_t address = 0;
+	BitstreamPool p = {pool, 0, bytes, {'rawb', 1}, 1, &address};
+	return callOn(driver, kAllocateBitstreamBufferPool, &p) == kOk ? address : 0;
+}
+
+// Whether the `bytes` at `address` are mapped and hold what was written there.
+bool holds(uint64_t address, uint32_t bytes, uint8_t value)
+{
+	unsigned char present = 0;
+	const size_t page = (size_t)getpagesize();
+	for (uint64_t at = address & ~(uint64_t)(page - 1); at < address + bytes; at += page)
+		if (mincore((void *)at, page, (char *)&present) != 0)
+			return false;
+	const uint8_t *b = (const uint8_t *)address;
+	for (uint32_t i = 0; i < bytes; i++)
+		if (b[i] != value)
+			return false;
+	return true;
+}
+
+// Each driver keeps bitstream pools of its own: a second driver's pool of the same type leaves
+// the first's buffers mapped and theirs, a driver's pool allocated again replaces its own, a
+// driver deleted takes its pools with it alone, and a handle no CreateDriver made is refused.
+void checkPoolsPerDriver()
+{
+	constexpr uint32_t kBytes = 0x10000;
+	void *first = createDriver(), *second = createDriver();
+	CHECK(first != second, "two drivers share a handle");
+	const uint64_t a = allocate(first, 0, kBytes);
+	CHECK(a != 0, "the first driver's pool refused");
+	std::memset((void *)a, 0x11, kBytes);
+	const uint64_t b = allocate(second, 0, kBytes);
+	CHECK(b != 0 && b != a, "the second driver's pool took the first's buffer");
+	std::memset((void *)b, 0x22, kBytes);
+	CHECK(holds(a, kBytes, 0x11), "the second driver's pool freed or wrote the first's buffer");
+	const uint64_t again = allocate(second, 0, kBytes);
+	CHECK(again != 0, "a pool allocated again refused");
+	std::memset((void *)again, 0x33, kBytes);
+	CHECK(holds(a, kBytes, 0x11), "a pool allocated again freed another driver's buffer");
+	CHECK(callOn(second, kDeleteDriver, nullptr) == kOk, "DeleteDriver");
+	CHECK(holds(a, kBytes, 0x11), "a deleted driver freed another driver's buffer");
+	CHECK(allocate(second, 0, kBytes) == 0, "a pool allocated on a deleted driver");
+	int notADriver = 0;
+	CHECK(allocate(&notADriver, 0, kBytes) == 0, "a pool allocated on no driver");
+	CHECK(callOn(first, kFreeBitstreamBufferPool, (const void *)0) == kOk, "FreeBitstreamBufferPool");
+	CHECK(callOn(first, kDeleteDriver, nullptr) == kOk, "DeleteDriver");
 }
 
 FunctionInfo decodeH264()
@@ -505,6 +592,8 @@ int main()
 	uint8_t params[64] = {}, identity[64] = {};
 	CHECK(AVD_CreateAVDAccelerator(&table, params, identity) == 0 && table, "the driver's table");
 	g_table = (DriverTable *)table;
+	g_driver = createDriver();
+	checkPoolsPerDriver();
 	checkFailedCreate();
 	checkDelete();
 	checkUnsentDecode();

@@ -35,6 +35,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <initializer_list>
 #include <mutex>
@@ -427,7 +428,7 @@ struct FunctionAvailable {
 	uint32_t budget; // out, 0 where the function is not listed
 };
 
-int g_driver; // what the driver pointer AppleGVA passes back points at
+int g_tableDriver; // what the table's driver pointer points at
 
 size_t pageSize() { return (size_t)getpagesize(); }
 
@@ -450,7 +451,11 @@ uint64_t u64At(const uint8_t *base, size_t off)
 
 // A context AppleGVA made for one function of a pipeline; the decode's holds the session on the
 // host and the parameter sets it last sent there.
+struct Driver;
+
 struct Context {
+	// The driver AppleGVA made the context on, whose bitstream buffers its pictures name.
+	Driver *driver;
 	uint32_t function_id;
 	uint64_t sub_id;
 	uint32_t width;
@@ -474,14 +479,35 @@ struct BitstreamBuffers {
 	uint8_t *buffers[32];
 };
 constexpr size_t kMaxPools = 8;
-std::mutex g_poolLock;
-BitstreamBuffers g_pools[kMaxPools];
 
-// The buffer AppleGVA names by (pool, index): its bytes and their count; false where none is.
-bool bitstreamBuffer(uint32_t pool, uint32_t index, const uint8_t **bytes, size_t *size)
+// A driver AppleGVA made (CreateDriver), one for each of its decoders, with bitstream pools of its
+// own, as AMD's driver keeps them. A pool allocated again replaces its driver's pool of that type
+// alone: with the pools a process's, a second decoder's pool (HEVC with alpha decodes its two
+// layers in two in one process) freed the buffers the first was still writing access units in.
+struct Driver {
+	BitstreamBuffers pools[kMaxPools];
+};
+
+// The live drivers, and their pools, under g_poolLock.
+std::mutex g_poolLock;
+std::vector<Driver *> g_drivers;
+
+// `handle` as a live driver, under g_poolLock; null where it names none.
+Driver *liveDriver(uint64_t handle)
+{
+	for (Driver *d : g_drivers)
+		if ((uint64_t)d == handle)
+			return d;
+	return nullptr;
+}
+
+// The buffer `driver` names by (pool, index): its bytes and their count; false where none is.
+bool bitstreamBuffer(Driver *driver, uint32_t pool, uint32_t index, const uint8_t **bytes, size_t *size)
 {
 	std::lock_guard<std::mutex> hold(g_poolLock);
-	for (const BitstreamBuffers &b : g_pools)
+	if (!liveDriver((uint64_t)driver))
+		return false;
+	for (const BitstreamBuffers &b : driver->pools)
 		if (b.count && b.pool == pool && index < b.count) {
 			*bytes = b.buffers[index];
 			*size = b.bytes;
@@ -491,14 +517,16 @@ bool bitstreamBuffer(uint32_t pool, uint32_t index, const uint8_t **bytes, size_
 }
 
 // The buffer of index `index` of the pool AppleGVA names an HEVC picture's slice segments in,
-// which they name by index alone: the pool of type 0, else the one pool there is.
-bool hevcBitstreamBuffer(uint32_t index, const uint8_t **bytes, size_t *size)
+// which they name by index alone: `driver`'s pool of type 0, else the one pool it has.
+bool hevcBitstreamBuffer(Driver *driver, uint32_t index, const uint8_t **bytes, size_t *size)
 {
-	if (bitstreamBuffer(0, index, bytes, size))
+	if (bitstreamBuffer(driver, 0, index, bytes, size))
 		return true;
 	std::lock_guard<std::mutex> hold(g_poolLock);
+	if (!liveDriver((uint64_t)driver))
+		return false;
 	const BitstreamBuffers *only = nullptr;
-	for (const BitstreamBuffers &b : g_pools)
+	for (const BitstreamBuffers &b : driver->pools)
 		if (b.count) {
 			if (only)
 				return false;
@@ -660,7 +688,7 @@ void *decodeHevcPicture(const Command *c)
 	const uint8_t *records = (const uint8_t *)u64At(P, 0x30);
 	const uint8_t *bytes;
 	size_t bufferBytes;
-	if (!slices || !records || !hevcBitstreamBuffer(u32At(records, 0x8), &bytes, &bufferBytes))
+	if (!slices || !records || !hevcBitstreamBuffer(context->driver, u32At(records, 0x8), &bytes, &bufferBytes))
 		return nullptr;
 	uint64_t first = UINT64_MAX, end = 0;
 	for (uint32_t i = 0; i < slices; i++) {
@@ -700,7 +728,7 @@ void *decodeH264Picture(const Command *c)
 	size_t bufferBytes;
 	const uint32_t pool = u32At(P, 0x270), index = u32At(P, 0x274), slices = u32At(P, 0x278);
 	const uint8_t *entries = (const uint8_t *)u64At(P, 0x290);
-	if (!slices || !entries || !bitstreamBuffer(pool, index, &bytes, &bufferBytes))
+	if (!slices || !entries || !bitstreamBuffer(context->driver, pool, index, &bytes, &bufferBytes))
 		return nullptr;
 	uint64_t first = UINT64_MAX, end = 0;
 	for (uint32_t i = 0; i < slices; i++) {
@@ -741,7 +769,10 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 	case 0: { // CreateDriver
 		if (!a0)
 			return kBadArgument;
-		*(void **)a0 = &g_driver;
+		Driver *driver = new Driver{};
+		std::lock_guard<std::mutex> hold(g_poolLock);
+		g_drivers.push_back(driver);
+		*(void **)a0 = driver;
 		return kOk;
 	}
 	case 2: { // CreateContexts
@@ -750,8 +781,8 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			return kBadArgument;
 		for (uint32_t i = 0; i < ci->info->count; i++) {
 			const FunctionInfo *fi = ci->info->functions[i];
-			Context *context = fi ? new Context{fi->function_id, fi->sub_id, fi->width,
-							    fi->height, nullptr, {}}
+			Context *context = fi ? new Context{(Driver *)a0, fi->function_id, fi->sub_id,
+							    fi->width, fi->height, nullptr, {}}
 					      : nullptr;
 			const uint32_t codec = !context || fi->function_id != kFunctionDecode ? 0
 			                       : fi->sub_id == kCodecH264                       ? RGFX_VIDEO_CODEC_H264
@@ -798,11 +829,14 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		if (!p || !p->addresses || p->count == 0 || p->count > 32 || p->size == 0)
 			return kBadArgument;
 		std::lock_guard<std::mutex> hold(g_poolLock);
+		Driver *driver = liveDriver(a0);
+		if (!driver)
+			return kBadArgument;
 		BitstreamBuffers *slot = nullptr;
-		for (BitstreamBuffers &b : g_pools)
+		for (BitstreamBuffers &b : driver->pools)
 			if (b.count && b.pool == p->pool)
 				freePool(*(slot = &b));
-		for (BitstreamBuffers &b : g_pools)
+		for (BitstreamBuffers &b : driver->pools)
 			if (!slot && !b.count)
 				slot = &b;
 		if (!slot)
@@ -823,7 +857,10 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 	}
 	case 6: { // FreeBitstreamBufferPool
 		std::lock_guard<std::mutex> hold(g_poolLock);
-		for (BitstreamBuffers &b : g_pools)
+		Driver *driver = liveDriver(a0);
+		if (!driver)
+			return kBadArgument;
+		for (BitstreamBuffers &b : driver->pools)
 			if (b.count && b.pool == (uint32_t)a1)
 				freePool(b);
 		return kOk;
@@ -974,7 +1011,19 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		}
 		return kOk;
 	}
-	default: // DeleteDriver, Set{Context,Driver}Parameter: answered success
+	case 1: { // DeleteDriver: its pools go with it
+		std::lock_guard<std::mutex> hold(g_poolLock);
+		Driver *driver = liveDriver(a0);
+		if (!driver)
+			return kBadArgument;
+		for (BitstreamBuffers &b : driver->pools)
+			if (b.count)
+				freePool(b);
+		g_drivers.erase(std::find(g_drivers.begin(), g_drivers.end(), driver));
+		delete driver;
+		return kOk;
+	}
+	default: // Set{Context,Driver}Parameter: answered success
 		return kOk;
 	}
 }
@@ -1000,7 +1049,7 @@ AVD_CreateAVDAccelerator(void **out, const void *params, void *identity)
 	if (!out || !params || !identity)
 		return 5;
 	Entries<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>::fill(g_table);
-	g_table.driver = &g_driver;
+	g_table.driver = &g_tableDriver;
 	DriverIdentity id = {};
 	id.renderer_id = kRendererID;
 	static std::once_flag filled;
