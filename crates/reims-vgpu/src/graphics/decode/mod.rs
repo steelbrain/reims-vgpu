@@ -234,17 +234,33 @@ pub(crate) type DrainAnswer = Box<dyn FnOnce() + Send>;
 
 /// The command buffers one context committed since its last drain began: each holds a clone
 /// until its completion handler has run, and the answers waiting on them are given when the last
-/// clone goes ([`GraphicsDecoder::drain_context`]).
+/// clone goes ([`GraphicsDecoder::drain_context`]). A drain holds the one begun after it, so a
+/// later drain ends only after every earlier one: its answers wait for every buffer committed
+/// before it, those of the drains before it too.
 #[derive(Default)]
 pub(crate) struct Drain {
     /// Given when the drain drops.
     answers: Mutex<Vec<DrainAnswer>>,
+    /// The drain begun after this one, which ends no sooner.
+    later: Mutex<Option<Arc<Drain>>>,
 }
 
 impl Drop for Drain {
     fn drop(&mut self) {
         for answer in self.answers.get_mut().drain(..) {
             answer();
+        }
+        // The later drains this one held, each ended here where this was its last hold, in turn
+        // rather than by recursion: a buffer that runs long may hold up many.
+        let mut later = self.later.get_mut().take();
+        while let Some(next) = later {
+            let Some(mut next) = Arc::into_inner(next) else {
+                break;
+            };
+            for answer in next.answers.get_mut().drain(..) {
+                answer();
+            }
+            later = next.later.get_mut().take();
         }
     }
 }
@@ -2327,11 +2343,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Begins a drain of `context`'s command buffers: `answer` is given once every one the decoder
-    /// has begun for the context has finished its completion handler, and not later ones. The
-    /// drain is returned for the caller to drop with no lock held: the answer goes then where no
-    /// buffer is in flight, else on the GPU thread of the last to finish. `closed` ends the
-    /// context's drains and its state (its `CONTEXT_CLOSE`); else a new one begins for its later
-    /// buffers.
+    /// has begun for the context has finished its completion handler, those begun before an
+    /// earlier drain among them, and not later ones. The drain is returned for the caller to drop
+    /// with no lock held: the answer goes then where no buffer is in flight, else on the GPU
+    /// thread of the last to finish. `closed` ends the context's drains and its state (its
+    /// `CONTEXT_CLOSE`); else a new one begins for its later buffers, held by this one
+    /// ([`Drain`]).
     pub(crate) fn drain_context(
         &self,
         context: u32,
@@ -2343,8 +2360,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             state.map(|state| std::mem::take(&mut *state.drain.lock()))
         } else {
             let state = self.context_made(context);
-            let drain = std::mem::take(&mut *state.drain.lock());
-            Some(drain)
+            let mut current = state.drain.lock();
+            let next = Arc::new(Drain::default());
+            *current.later.lock() = Some(Arc::clone(&next));
+            Some(std::mem::replace(&mut *current, next))
         }
         .unwrap_or_default();
         drain.answers.lock().push(answer);
