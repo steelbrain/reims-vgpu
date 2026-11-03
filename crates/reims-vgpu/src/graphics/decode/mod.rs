@@ -1031,8 +1031,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         );
         let c = views.lock().counts();
         let d = self.surface_caches.lock().counts();
-        // A deferred block makes no view, so it is counted here too.
-        let counted = (c.made + c.reused + c.bad_runs + c.not_mapped + c.private)
+        // A deferred block, and a block named by its runs, make no view, so they are counted
+        // here too.
+        let counted = (c.made + c.reused + c.bad_runs + c.not_mapped + c.private + c.by_runs)
             .saturating_add(d.deferred + d.deferred_refused);
         let now = clock.now_mono();
         let logged_at = &self.shared.views_logged_at;
@@ -1046,8 +1047,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "IOSurface pages in place: {} views made, {} taken from the cache; {} pages \
-                 blocks' views made; refused: {} for bad runs, {} not mapped",
-                c.made, c.reused, c.private, c.bad_runs, c.not_mapped
+                 blocks' views made; {} named by their runs; refused: {} for bad runs, {} not \
+                 mapped",
+                c.made, c.reused, c.private, c.by_runs, c.bad_runs, c.not_mapped
             );
             if d.made != 0 {
                 log::info!(
@@ -1057,11 +1059,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                      writes changed; {} written caches copied at a release with no client \
                      left; {} copies out not made, the CPU's generation past the cache's; {} \
                      deferred, {} refused, {} named their pages ({} copied), {} released \
-                     unnamed; {} early copies of {} MiB, {} downloads they answered, {} unread",
+                     unnamed; {} early copies of {} MiB, {} downloads they answered, {} unread; \
+                     {} copy by runs, {} copies by runs refused",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
-                    d.early, d.early_bytes >> 20, d.early_read, d.early_unread
+                    d.early, d.early_bytes >> 20, d.early_read, d.early_unread, d.by_runs,
+                    d.runs_refused
                 );
             }
         }
