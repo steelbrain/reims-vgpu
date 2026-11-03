@@ -2,7 +2,7 @@
 # The graphics lane's landing gate: checks one commit end to end and compares it with the last
 # good baseline. Run it on the Mac, from any checkout of the repository that has this script:
 #
-#   scripts/internal/lane-gate.sh [--record] [--baseline SHA] [--resume [RUNID]] [--image PATH]
+#   scripts/internal/lane-gate.sh [--record | --landed] [--baseline SHA] [--resume [RUNID]] [--image PATH]
 #                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
 #                                 [--no-appload] [--no-bench | --wait-bench]
@@ -12,6 +12,10 @@
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
 #                 noise band again from every baseline with two samples or more, and make SHA the
 #                 last good baseline (baselines/LAST) when the run passed
+#   --landed      REV is a car that landed on the lane: --record, and once its bench leg has run,
+#                 REV becomes baselines/LAST whatever the verdict (a car gated without the Mac's
+#                 checks is incomplete), so the next car's bench is judged against this one's. Its
+#                 own baseline is LAST as it was, the car that landed before it
 #   --baseline    compare with SHA's baseline (default: baselines/LAST)
 #   --resume      go on with REV's newest run (or RUNID), skipping the steps it finished
 #   --image PATH  boot this OpenCore image on the lane host instead of the one the gate builds
@@ -101,10 +105,11 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
+record=0 landed=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
+    --landed) record=1 landed=1 ;;
     --baseline) base_sha=$2; shift ;;
     --resume) if [[ ${2:-} =~ ^[0-9a-f]{12}- ]]; then resume=$2; shift; else resume=newest; fi ;;
     --image) image=$2; shift ;;
@@ -615,6 +620,13 @@ if [[ $bench == only ]]; then
   report > "$RUN/report.out"
   set -e
   head -1 "$RUN/report.txt"
+  if ((landed)); then
+    if [[ -f $RUN/steps/bench.ok ]]; then
+      ln -sfn "$sha" "$GH/baselines/LAST"; say "baselines/LAST is now ${sha:0:12}, the car that landed"
+    else
+      say "baselines/LAST stays ${base_sha:0:12}: the landed car's bench boot failed"
+    fi
+  fi
   say "lane-gate bench leg: report $RUN/report.txt; $(( $(date +%s) - T0 )) s"
   exit 0
 fi
@@ -672,14 +684,17 @@ set +e
 report
 verdict=$?
 set -e
-if ((record && verdict == 0)); then ln -sfn "$sha" "$GH/baselines/LAST"; say "baselines/LAST is now ${sha:0:12}"; fi
+if ((record && !landed && verdict == 0)); then ln -sfn "$sha" "$GH/baselines/LAST"; say "baselines/LAST is now ${sha:0:12}"; fi
+if ((landed)) && { [[ $bench == no || $msi_ok != 1 || $img_ok != 1 || $gb != 0 ]] || skipped bench; }; then
+  say "baselines/LAST stays ${base_sha:0:12}: the landed car has no bench leg to judge the next one against"
+fi
 say "lane-gate: report $RUN/report.txt; $(( $(date +%s) - T0 )) s this pass"
 
 # The bench leg: after the verdict, the boot that holds the GPU alone. Detached, it holds none of
 # this gate's descriptors (lockf's among them), so the next gate can start while it waits its turn.
 if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped bench; then
   again=(--resume "$runid" --bench-only)
-  ((record)) && again+=(--record)
+  if ((landed)); then again+=(--landed); elif ((record)); then again+=(--record); fi
   [[ -z $image ]] || again+=(--image "$image")
   [[ -z $host_dir ]] || again+=(--host "$host_dir")
   [[ -z $load ]] || again+=(--load "$load")
