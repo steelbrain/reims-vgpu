@@ -778,11 +778,13 @@ process that made the surface posted before it handed the surface on, and ring
 0 is carried out in order, so a buffer that waits for its share waits for those
 too. Shared events and textures do not cross processes. A display command
 (`GET_DISPLAYS` to `PRESENT_SURFACE`) or a `SURFACE_DOWNLOAD` holds up no buffer:
-none reads what they make. A buffer posted after a present or a download of a
-surface it writes, but taken before it, is among the writers that message
-waits for, as one posted before it is: the guest writes a surface the display
-pipe shows, or one a CPU lock holds, only racing them. Every buffer waits for a
-message of any other type, which the host refuses. The queues' threads read
+none reads what they make. A present waits for the writers the guest's record
+of its surface names, whatever the host has taken. A download waits for the
+buffers that used the surface's device cache before it was taken, so a buffer
+posted after it that writes the surface, but taken before it, is among them,
+as one posted before it is: the guest writes a surface a CPU lock holds only
+racing the lock. Every buffer waits for a message of any other type, which the
+host refuses. The queues' threads read
 ring 0 ahead of the control thread, each message once, and keep the count
 through each context's last message (`reims_graphics`'s `device::backlog`), so
 a buffer behind another process's backlog on ring 0 is decoded at once.
