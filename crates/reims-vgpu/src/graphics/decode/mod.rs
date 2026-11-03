@@ -718,10 +718,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on `device` that holds
     /// its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with none, logged as a guest
     /// error. `flags` are the message's `RGFX_SURFACE_PAGES_*`: a block marked
-    /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view its `BUFFER_OVER_PAGES` buffers'
-    /// alone, with no device cache ([`surface_pages`]); else one marked
-    /// [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache. A summary of what the views did
-    /// is logged every [`VIEWS_LOGGED_EVERY`].
+    /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view made at its first
+    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]); else
+    /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache. A summary of what the
+    /// views did is logged every [`VIEWS_LOGGED_EVERY`].
     pub(crate) fn surface_pages(
         &mut self,
         device: &P::Device,
@@ -733,7 +733,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let made = {
             let mut views = self.shared.surface_views.lock();
             if private {
-                views.private_pages(&self.platform, device, pages, runs)
+                Ok(views.private_pages(&self.platform, pages, runs))
             } else {
                 views.surface_pages(&self.platform, device, pages, runs)
             }

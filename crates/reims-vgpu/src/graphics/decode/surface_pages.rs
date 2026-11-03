@@ -25,9 +25,11 @@
 //! **Pages blocks** (`RGFX_FEATURE_PAGES_BUFFERS`). A `SURFACE_PAGES` marked
 //! `RGFX_SURFACE_PAGES_PRIVATE` names a block of one process's own, which holds nothing but the
 //! runs of pages of that process's the kext wired for it (its `PagesBlock` call): an app's memory
-//! under a no-copy buffer. Its view is checked and mapped as a surface's, with a buffer over the
-//! whole view that holds the runtime's import of its pages, and is the block's alone: it stays out
-//! of the cache, as no other block names those pages and a view of a GiB would push every
+//! under a no-copy buffer. Its runs are checked as a surface's, and must lie in guest RAM, at its
+//! `SURFACE_PAGES`; its view is made at its first `BUFFER_OVER_PAGES`, so a pages block no buffer
+//! is laid over costs no mapping or import. The view is mapped as a surface's, with a buffer over
+//! the whole of it that holds the runtime's import of its pages, and is the block's alone: it stays
+//! out of the cache, as no other block names those pages and a view of a GiB would push every
 //! surface's out of it. A `BUFFER_OVER_PAGES` of the context the block was made for lies over a
 //! part of the view, at the guest's GPU address, which keeps the app pointer's place in its page.
 //! The view goes at the block's `BLOCK_RELEASE` or its context's close, once the buffers over it
@@ -112,7 +114,8 @@ pub(crate) struct ViewCounts {
     /// `SURFACE_PAGES` refused for runs outside guest RAM, or a view or buffer the host did not
     /// make.
     pub(crate) not_mapped: u64,
-    /// Pages blocks' views made (`RGFX_SURFACE_PAGES_PRIVATE`), which `made` does not count.
+    /// Pages blocks' views made (`RGFX_SURFACE_PAGES_PRIVATE`), each at its block's first
+    /// `BUFFER_OVER_PAGES`, which `made` does not count.
     pub(crate) private: u64,
 }
 
@@ -124,16 +127,20 @@ struct Cached<P: Platform> {
     _import: P::Buffer,
 }
 
-/// A pages block's view (the module doc), which its `BUFFER_OVER_PAGES` buffers lie over.
+/// A pages block (the module doc): its runs, and the view its `BUFFER_OVER_PAGES` buffers lie
+/// over.
 struct Private<P: Platform> {
-    view: Arc<SurfaceView<P>>,
+    /// The runs, checked, in order.
+    runs: Vec<(u64, u64)>,
+    /// The bytes they hold, the view's length.
+    length: u64,
     /// The block's size, as its `SURFACE_PAGES` gave it.
     block_size: u64,
     /// The context the block was made for, the one that may name it.
     context: u32,
-    /// A buffer over the whole view, which holds the runtime's import of its pages for the
-    /// buffers over its parts.
-    _import: P::Buffer,
+    /// The view, made at the block's first `BUFFER_OVER_PAGES`, with a buffer over the whole of
+    /// it that holds the runtime's import of its pages for the buffers over its parts.
+    view: Option<(Arc<SurfaceView<P>>, P::Buffer)>,
 }
 
 /// The views of the surfaces whose blocks name their pages, by block offset, and the cache.
@@ -198,40 +205,56 @@ impl<P: Platform> SurfaceViews<P> {
         }
     }
 
-    /// `SURFACE_PAGES` of a pages block (`RGFX_SURFACE_PAGES_PRIVATE`, the module doc): the view
-    /// of `runs` for the block `pages` names, in place of any it had, made for it alone, with a
-    /// buffer over it on `device` that holds its import.
+    /// `SURFACE_PAGES` of a pages block (`RGFX_SURFACE_PAGES_PRIVATE`, the module doc): `runs`,
+    /// checked and in guest RAM, for the block `pages` names, in place of any view it had; its
+    /// view is made at its first `BUFFER_OVER_PAGES` ([`Self::private_view`]).
     pub(crate) fn private_pages(
         &mut self,
         platform: &P,
-        device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
-    ) -> RaiseResult<Result<(), PagesRefusal>> {
+    ) -> Result<(), PagesRefusal> {
         self.by_block.remove(&pages.block_offset);
         self.private.remove(&pages.block_offset);
-        let view = match self.checked_runs(platform, pages, runs) {
-            Ok(key) => self.mapped(&key, pages.length),
-            Err(why) => Err(why),
+        let runs = match self.checked_runs(platform, pages, runs) {
+            Ok(key) if !self.in_ram(&key) => Err(PagesRefusal::NotMapped),
+            checked => checked,
         };
-        let view = match view {
-            Ok(view) => view,
-            Err(why) => return Ok(Err(self.refused(why))),
-        };
-        let Some(import) = buffer_over(device, &view, 0, view.length(), 0, None)? else {
-            return Ok(Err(self.refused(PagesRefusal::NoBuffer)));
-        };
-        self.counts.private += 1;
+        let runs = runs.map_err(|why| self.refused(why))?;
         self.private.insert(
             pages.block_offset,
             Private {
-                view,
+                runs,
+                length: pages.length,
                 block_size: pages.block_size,
                 context: pages.context,
-                _import: import,
+                view: None,
             },
         );
-        Ok(Ok(()))
+        Ok(())
+    }
+
+    /// Whether every byte of the runs `key` lies in the guest RAM the memory map holds, each run
+    /// split across the map's ranges in their order, as [`MemoryMap::new_range_mapping`] maps it.
+    fn in_ram(&self, key: &[(u64, u64)]) -> bool {
+        let Some((memory, _)) = &self.memory else {
+            return false;
+        };
+        key.iter().all(|&(address, length)| {
+            let Some(end) = address.checked_add(length) else {
+                return false;
+            };
+            let mut at = address;
+            for r in memory.ranges() {
+                if at >= r.physical_address && at < r.physical_end {
+                    at = r.physical_end.min(end);
+                    if at == end {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
     }
 
     /// `why`, counted.
@@ -353,17 +376,40 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// The view of the pages block at `block`, where it was made for `context` (any context
-    /// where `None`, the decoder's own tests) and holds the `block_size` bytes a message names.
+    /// where `None`, the decoder's own tests) and holds the `block_size` bytes a message names:
+    /// made with its import on `device` the first time, the module doc. `None` where the block is
+    /// no such pages block, or the view or its import is not made, which is counted.
     pub(crate) fn private_view(
-        &self,
+        &mut self,
+        device: &P::Device,
         block: u64,
         block_size: u64,
         context: Option<u32>,
-    ) -> Option<Arc<SurfaceView<P>>> {
-        self.private
-            .get(&block)
+    ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
+        let Some(p) = (self.private.get(&block))
             .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
-            .map(|p| Arc::clone(&p.view))
+        else {
+            return Ok(None);
+        };
+        if let Some((view, _)) = &p.view {
+            return Ok(Some(Arc::clone(view)));
+        }
+        let view = match self.mapped(&p.runs, p.length) {
+            Ok(view) => view,
+            Err(why) => {
+                self.refused(why);
+                return Ok(None);
+            }
+        };
+        let Some(import) = buffer_over(device, &view, 0, view.length(), 0, None)? else {
+            self.refused(PagesRefusal::NoBuffer);
+            return Ok(None);
+        };
+        self.counts.private += 1;
+        if let Some(p) = self.private.get_mut(&block) {
+            p.view = Some((Arc::clone(&view), import));
+        }
+        Ok(Some(view))
     }
 
     /// The host addresses of the guest pages of `runs` in the mapping of the guest's RAM the
@@ -531,10 +577,11 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             return Ok(Err(super::DecodeError::BadReference));
         }
         let view = (self.shared.surface_views.lock()).private_view(
+            device,
             m.block_offset,
             m.block_size,
             self.context,
-        );
+        )?;
         let Some(view) = view.filter(|v| {
             m.length != 0 && (m.offset.checked_add(m.length)).is_some_and(|end| end <= v.length())
         }) else {
@@ -695,9 +742,15 @@ pub(super) mod tests {
             Arc::clone(&self.dec.views_of_surfaces().by_block[&block].0)
         }
 
-        /// The view the pages block at `block` has.
+        /// The view the pages block at `block` has: its first buffer made it.
         fn private_view(&self, block: u64) -> Arc<SurfaceView<FakePlatform>> {
-            Arc::clone(&self.dec.views_of_surfaces().private[&block].view)
+            let views = self.dec.views_of_surfaces();
+            Arc::clone(&views.private[&block].view.as_ref().expect("no view yet").0)
+        }
+
+        /// Whether the pages block at `block` has a view.
+        fn has_private_view(&self, block: u64) -> bool {
+            self.dec.views_of_surfaces().private[&block].view.is_some()
         }
 
         /// A `BUFFER_OVER_PAGES` of `length` bytes at `offset` in the view of the pages block at
@@ -865,8 +918,9 @@ pub(super) mod tests {
         assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
     }
 
-    /// A pages block's runs are one view, its own: no cache entry is made or taken for it, and a
-    /// `BUFFER_OVER_PAGES` lies over the bytes at its offset in the view, at the guest's GPU
+    /// A pages block's runs are one view, its own, made at its first `BUFFER_OVER_PAGES` and kept
+    /// for the next: no cache entry is made or taken for it, and a `BUFFER_OVER_PAGES` lies over
+    /// the bytes at its offset in the view, at the guest's GPU
     /// address, over the app's own page, and over the block, so the block is not released while
     /// it lives. A range past the view, an empty one, and a `BUFFER_OVER_SURFACE_PAGES` of the
     /// block are refused; after the block's release the buffer still holds the view, and the
@@ -893,32 +947,49 @@ pub(super) mod tests {
         );
         assert_eq!(
             r.p.call_log().sels_since(mark),
+            Vec::<&str>::new(),
+            "no view or import before a buffer is laid over the block"
+        );
+        assert!(!r.has_private_view(BLOCK));
+        let views = r.dec.views_of_surfaces();
+        assert_eq!((views.len(), views.private_len()), ((1, 1), 1));
+        let c = views.counts();
+        assert_eq!((c.made, c.reused, c.private), (1, 0, 0));
+        drop(views);
+
+        let pin = 0x1_0000_0123;
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.pages_buffer(10, pin, BLOCK, 0x123, 2 * page), Ok(()));
+        assert_eq!(
+            r.p.call_log().sels_since(mark),
             [
                 "mach_vm_allocate",
                 "mach_vm_remap",
                 "mach_vm_remap",
                 "mach_vm_protect",
+                "newBufferWithDescriptor:",
                 "newBufferWithDescriptor:"
             ],
-            "a view of its two runs and its import, made anew, not the cache's of page 5"
+            "the first buffer: a view of the block's two runs and its import, made anew, not the \
+             cache's of page 5, then the buffer"
         );
-        let views = r.dec.views_of_surfaces();
-        assert_eq!((views.len(), views.private_len()), ((1, 1), 1));
-        let c = views.counts();
-        assert_eq!((c.made, c.reused, c.private), (1, 0, 1));
-        drop(views);
+        assert_eq!(r.dec.views_of_surfaces().counts().private, 1);
         let view = r.private_view(BLOCK);
         assert_eq!(view.length(), 3 * page);
-
-        let pin = 0x1_0000_0123;
-        assert_eq!(r.pages_buffer(10, pin, BLOCK, 0x123, 2 * page), Ok(()));
         let (gpu_address, contents) = r.buffer_at(10);
         assert_eq!(gpu_address, pin);
         assert_eq!(contents, view.base().wrapping_add(0x123));
         assert_eq!(r.p.fake_vm().read(contents, 3).unwrap(), b"app");
         assert!(r.dec.span_in_use(BLOCK, 0x2000));
-        // Its last byte the view's: taken; one past it, or none, refused.
+        // Its last byte the view's: taken, over the view the first made; one past it, or none,
+        // refused.
+        let mark = r.p.call_log().mark();
         assert_eq!(r.pages_buffer(11, 0, BLOCK, page, 2 * page), Ok(()));
+        assert_eq!(
+            r.p.call_log().sels_since(mark),
+            ["newBufferWithDescriptor:"]
+        );
+        assert_eq!(r.dec.views_of_surfaces().counts().private, 1);
         assert_eq!(
             r.pages_buffer(12, 0, BLOCK, page, 2 * page + 1),
             Err(DecodeError::Refused)
@@ -1051,6 +1122,12 @@ pub(super) mod tests {
         assert_eq!(
             r.pages_flagged(BLOCK + 0x4000, 3, &[(2, 1)], page, private),
             RGFX_STATUS_OK
+        );
+        let obj = |context: u64, n: u64| (context << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        assert_eq!(r.pages_buffer(obj(2, 1), 0, BLOCK, 0, page), Ok(()));
+        assert_eq!(
+            r.pages_buffer(obj(3, 1), 0, BLOCK + 0x4000, 0, page),
+            Ok(())
         );
         let view = r.private_view(BLOCK);
         r.dec.drop_context(2);
