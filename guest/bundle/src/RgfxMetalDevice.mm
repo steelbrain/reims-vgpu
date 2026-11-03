@@ -63,6 +63,17 @@ void rgfxDiag(const char *fmt, ...)
 // The accelerator's user-client protocol, the kext's own header: its type and selectors.
 #include "../../kext/src/RgfxUserClientABI.hpp"
 
+// The kext's own features, the second word kRgfxAccelMethodFeatures answers (the kext's
+// RgfxAccelerator.hpp, kept in step by hand): a call or flag below is used only where the word
+// holds its bit.
+enum : uint64_t {
+	kRgfxKextFeaturePagesBlock = 1ull << 0,
+	kRgfxKextFeatureSubmitBatch = 1ull << 1,
+	kRgfxKextFeatureWakeCompletions = 1ull << 2,
+	kRgfxKextFeatureConsumedDoorbell = 1ull << 3,
+	kRgfxKextFeatureDeferredAnswers = 1ull << 4,
+};
+
 namespace {
 // The largest object-lifecycle message the kext takes (ReimsGraphics::kLifecycleMessageMax):
 // half the control ring.
@@ -436,15 +447,15 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
 		rgfxDiag("RGFX: caps blob not read (kr=0x%x) or invalid; using defaults\n", kr);
-	// The feature word, from the kext; a kext older than the call leaves the blob's bits 0 to 2
-	// (RgfxCaps::takeFeatures).
-	uint64_t features = 0;
-	uint32_t featuresCount = 1;
-	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, &features,
+	// The device's feature word and the kext's own, from the kext; a kext older than the call
+	// leaves the blob's bits 0 to 2 and no kext feature (RgfxCaps::takeFeatures).
+	uint64_t features[2] = {};
+	uint32_t featuresCount = 2;
+	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, features,
 	                               &featuresCount);
-	if (kr == KERN_SUCCESS && featuresCount != 1)
+	if (kr == KERN_SUCCESS && featuresCount != 2)
 		kr = kIOReturnBadArgument;
-	_caps.takeFeatures(kr, features);
+	_caps.takeFeatures(kr, features[0], features[1]);
 
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers

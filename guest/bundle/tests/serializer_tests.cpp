@@ -281,8 +281,6 @@ void test_resource_id_chunks()
 	CHECK(am.resource_id == again.resource_id && am.obj_id == again.obj_id);
 }
 
-// The feature word: the kext's where it answers the call, and the blob's bits 0 to 2 where it
-// answers kIOReturnUnsupported (a kext older than the call) or fails otherwise.
 // The negotiation's records as the bundle compiles them (wire.rs asserts the same).
 static_assert(RGFX_REG_DRIVER_FEATURES_LO == 0x024 && RGFX_REG_DRIVER_FEATURES_HI == 0x028,
               "DRIVER_FEATURES");
@@ -301,11 +299,14 @@ static_assert(offsetof(RgfxDeviceInfo, features_lo) == 0x451 &&
                   offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452,
               "the device info's feature and reduction bytes");
 
+// The feature words: the kext's where it answers the call, and where it answers
+// kIOReturnUnsupported (a kext older than the call) or fails otherwise, the blob's bits 0 to 2
+// and no kext feature.
 void test_caps_features()
 {
 	RgfxCaps caps;
-	caps.takeFeatures(kIOReturnUnsupported, 0);
-	CHECK(caps.features() == 0); // no blob: nothing
+	caps.takeFeatures(kIOReturnUnsupported, 0, 0);
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0); // no blob: nothing
 
 	RgfxDeviceInfo info = {};
 	info.version = RGFX_DEVICE_INFO_VERSION;
@@ -313,16 +314,18 @@ void test_caps_features()
 	                   RGFX_FEATURE_QUIET_SCHEDULED; // bit 3 offered, but taken by no kext
 	CHECK(caps.load(info));
 	CHECK(caps.features() == 0); // nothing before the probe
-	caps.takeFeatures(kIOReturnUnsupported, 0xffff);
+	caps.takeFeatures(kIOReturnUnsupported, 0xffff, 0x1f);
 	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
-	caps.takeFeatures(kIOReturnBadArgument, 0xffff);
+	CHECK(caps.kextFeatures() == 0);
+	caps.takeFeatures(kIOReturnBadArgument, 0xffff, 0x1f);
 	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
-	// A kext that answers gives the word as it is, bits from 3 and 32 among them.
+	CHECK(caps.kextFeatures() == 0);
+	// A kext that answers gives both words as they are, bits from 3 and 32 among them.
 	const uint64_t word = RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_CB_PARTS | (1ull << 40);
-	caps.takeFeatures(KERN_SUCCESS, word);
-	CHECK(caps.features() == word);
-	caps.takeFeatures(KERN_SUCCESS, 0);
-	CHECK(caps.features() == 0);
+	caps.takeFeatures(KERN_SUCCESS, word, 1ull << 4);
+	CHECK(caps.features() == word && caps.kextFeatures() == 1ull << 4);
+	caps.takeFeatures(KERN_SUCCESS, 0, 0);
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
 }
 
 void test_caps()

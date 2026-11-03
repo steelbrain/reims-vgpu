@@ -28,7 +28,7 @@ static_assert(kRgfxLimitCount == sizeof(RgfxDeviceInfo::limits) / sizeof(uint64_
 static_assert(kRgfxFlagCount == sizeof(RgfxDeviceInfo::flags),
               "flag count must match RgfxDeviceInfo::flags");
 
-RgfxCaps::RgfxCaps() : m_valid(false), m_features(0)
+RgfxCaps::RgfxCaps() : m_valid(false), m_features(0), m_kextFeatures(0)
 {
 	std::memset(&m_info, 0, sizeof(m_info));
 	m_name[0] = '\0';
@@ -68,11 +68,12 @@ bool RgfxCaps::load(const RgfxDeviceInfo &info)
 	return true;
 }
 
-void RgfxCaps::takeFeatures(int kr, uint64_t word)
+void RgfxCaps::takeFeatures(int kr, uint64_t word, uint64_t kext)
 {
 	constexpr uint64_t kOffered =
 	    RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_CB_SUBMITTED;
 	m_features = kr == 0 ? word : featuresLo() & kOffered;
+	m_kextFeatures = kr == 0 ? kext : 0;
 }
 
 bool RgfxCaps::supportsFamily(int64_t family) const
