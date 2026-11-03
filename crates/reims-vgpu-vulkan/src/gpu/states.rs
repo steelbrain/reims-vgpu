@@ -1843,6 +1843,28 @@ mod tests {
         assert_ne!(nearest.gpu_resource_id(), a.gpu_resource_id());
     }
 
+    /// Among many live samplers, and past a sweep of the handles of ones gone, each equal request
+    /// still answers the one object while it lives
+    #[test]
+    fn equal_sampler_requests_are_one_object_among_many() {
+        let d = dev();
+        let desc = |i: u16| SamplerDesc {
+            lod_max_clamp: Some(1000.0 - f32::from(i)),
+            ..SamplerDesc::default()
+        };
+        let held: Vec<_> = (0..200)
+            .map(|i| d.new_sampler_state(&desc(i)).unwrap().unwrap())
+            .collect();
+        for i in 200..400 {
+            drop(d.new_sampler_state(&desc(i)).unwrap().unwrap());
+        }
+        for (i, h) in (0..).zip(&held) {
+            let again = d.new_sampler_state(&desc(i)).unwrap().unwrap();
+            assert_eq!(again.id(), h.id(), "{i}");
+            assert_eq!(again.gpu_resource_id(), h.gpu_resource_id(), "{i}");
+        }
+    }
+
     /// A value's resource index places the sampler at that ID, and its resource index is its ID
     #[test]
     fn a_sampler_takes_the_id_of_its_resource_index() {

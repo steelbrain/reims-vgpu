@@ -10,6 +10,7 @@
 //! texture on the surface through its resource ID alone keeps that image's memory and not the
 //! buffer, so it holds no reference of the surface.
 
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
@@ -738,26 +739,59 @@ pub type VulkanHeap = Obj<HeapObject>;
 /// `id<MTLSamplerState>`.
 pub type VulkanSamplerState = Obj<rt::SamplerState>;
 
-/// The sampler states with a live handle: the one object each runtime state is.
-static SAMPLERS: Mutex<Vec<Weak<rt::SamplerState>>> = Mutex::new(Vec::new());
+/// The sampler states' handles, by their runtime state's resource ID: the one object each runtime
+/// state is. A live runtime state's ID is its own on its device, so an ID names one live state of
+/// a device; its list holds the handles of other devices' states, and of states gone.
+struct SamplerHandles {
+    by_id: BTreeMap<u64, Vec<Weak<rt::SamplerState>>>,
+    /// The handles listed, gone ones among them.
+    listed: usize,
+    /// Where the next sweep of the gone ones is due: twice the handles live at the last.
+    sweep_at: usize,
+}
+
+/// The handles of [`SamplerHandles`].
+static SAMPLERS: Mutex<SamplerHandles> = Mutex::new(SamplerHandles {
+    by_id: BTreeMap::new(),
+    listed: 0,
+    sweep_at: SAMPLER_SWEEP_FLOOR,
+});
+
+/// The fewest handles listed before a sweep.
+const SAMPLER_SWEEP_FLOOR: usize = 256;
 
 /// The handle of `raw`: the object a live handle to the same runtime state already is, or a new
 /// one. The runtime answers one state for equal requests while it lives, as Metal answers one
 /// object (one identity) on this host, so the handles of equal requests are one object too. The
 /// ID it takes is in the runtime's sampler ID pool, which Metal's sampler mempool follows
-/// ([`crate::gpu::metal_space`]'s `Samplers`).
+/// ([`crate::gpu::metal_space`]'s `Samplers`). The handle is found by that ID, so a create costs
+/// the same however many samplers live (it read every live handle before: 11 us a create with
+/// 1000 alive, measured on the msi RTX 5080).
 pub(crate) fn sampler_state(raw: rt::SamplerState) -> VulkanSamplerState {
-    let mut live = SAMPLERS.lock();
-    live.retain(|weak| weak.strong_count() > 0);
-    if let Some(held) = live
+    let id = plain(|| rt::SamplerState::gpu_resource_id(&raw)).0;
+    let mut table = SAMPLERS.lock();
+    let handles = table.by_id.entry(id).or_default();
+    if let Some(held) = handles
         .iter()
         .filter_map(Obj::upgrade)
         .find(|held| **held == raw)
     {
         return held;
     }
+    let before = handles.len();
+    handles.retain(|weak| weak.strong_count() > 0);
     let made = Obj::new(raw);
-    live.push(made.downgrade());
+    handles.push(made.downgrade());
+    let after = handles.len();
+    table.listed = table.listed + after - before;
+    if table.listed >= table.sweep_at {
+        table.by_id.retain(|_, listed| {
+            listed.retain(|weak| weak.strong_count() > 0);
+            !listed.is_empty()
+        });
+        table.listed = table.by_id.values().map(Vec::len).sum();
+        table.sweep_at = (2 * table.listed).max(SAMPLER_SWEEP_FLOOR);
+    }
     made
 }
 
