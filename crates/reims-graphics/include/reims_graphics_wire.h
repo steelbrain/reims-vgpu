@@ -837,8 +837,9 @@
 // [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 // guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 // [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
-// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`] and
-// [`RGFX_FEATURE_MANAGED_AT_OFFSET`]). Bits 9, 10 and 15 are reserved.
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
+// [`RGFX_FEATURE_MANAGED_AT_OFFSET`] and [`RGFX_FEATURE_SUBMIT_ROOM`]). Bits 9, 10 and 15 are
+// reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -925,6 +926,15 @@
 // host memory of its own. Offered where a `Managed` buffer is two copies: where the host's GPU
 // does not share the CPU's memory.
 #define RGFX_FEATURE_MANAGED_AT_OFFSET (1 << 14)
+
+// `FEATURES_LO` bit 16, `SUBMIT_ROOM`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: a guest producer that finds a submission ring full, ring 0 or
+// a queue's, may store 1 in the ring's `producer_waiting`, fence, and look for room once more
+// before it waits. After each take that moves a submission ring's `consumer`, the host fences and
+// reads the flag; where it reads 1, it stores 0 and posts an [`RGFX_EVT_SUBMIT_ROOM`] on the
+// ring's completion ring: ring 0's for ring 0, the queue's for a queue's. Either the guest's look
+// sees the take's room, or the host's read sees the flag.
+#define RGFX_FEATURE_SUBMIT_ROOM (1 << 16)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1447,6 +1457,12 @@
 // Event `ICB_STATE` ([`RgfxIcbState`], on the control completion ring): an `ICB_CREATE`'s
 // answer.
 #define RGFX_EVT_ICB_STATE 1031
+
+// Event `SUBMIT_ROOM` (a header alone, its `seqno` 0), where the guest took
+// [`RGFX_FEATURE_SUBMIT_ROOM`]: on a submission ring's completion ring, the host read the ring's
+// `producer_waiting` as 1 after a take that moved its `consumer`, and stored 0 there. A producer
+// waiting for room on the ring looks again.
+#define RGFX_EVT_SUBMIT_ROOM 1032
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -5074,7 +5090,9 @@ typedef struct {
   // (docs/graphics-kext/design.md, "Surface locks").
   uint64_t completed_seqno;
   // 1 while the host waits for room on a completion ring created to wake it
-  // ([`RGFX_FEATURE_CONSUMED_DOORBELL`]), written by the host; 0 on every other ring.
+  // ([`RGFX_FEATURE_CONSUMED_DOORBELL`]), written by the host; on a submission ring, 1 while a
+  // guest producer waits for room ([`RGFX_FEATURE_SUBMIT_ROOM`]), written 1 by the guest and 0
+  // by the host as it posts the ring's [`RGFX_EVT_SUBMIT_ROOM`]; 0 on every other ring.
   uint32_t producer_waiting;
   // The rest of `producer`'s line.
   uint8_t reserved_14[44];

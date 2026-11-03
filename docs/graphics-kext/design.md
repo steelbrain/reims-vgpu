@@ -718,6 +718,13 @@ only where no negotiation can carry it.
   the sender's, so no buffer imports host memory of its own (the slabs,
   below). A host offers it where a Managed buffer is two copies, a GPU that does
   not share the CPU's memory. Bit 15 is reserved for heaps over guest pages.
+- Bit 16 is `SUBMIT_ROOM`: a guest producer that finds a submission ring full
+  stores 1 in the ring's `producer_waiting`, fences, and looks once more before
+  it waits. After each take that moves the ring's `consumer`, the host fences
+  and reads the flag, and where it reads 1 it stores 0 and posts a header-only
+  `RGFX_EVT_SUBMIT_ROOM` (0x408) on the ring's completion ring, ring 0's or the
+  queue's. The waiting producer looks again at that record: one interrupt after
+  the host's take, not at a sleep's end.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
