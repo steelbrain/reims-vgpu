@@ -380,10 +380,23 @@ def median_baseline(bdir):
     ref = {"meta": runs[0]["meta"], "items": runs[0]["items"], "samples": len(runs),
            "cargo_fails": runs[0].get("cargo_fails"), "crashes": runs[0].get("crashes"), "metrics": {}}
     names = set().union(*(r["metrics"] for r in runs))
+    ref["metrics_best"] = {}
     for n in names:
         vals = [r["metrics"][n] for r in runs if n in r["metrics"]]
         ref["metrics"][n] = statistics.median(vals)
+        ref["metrics_best"][n] = max(vals)
     return ref
+
+
+# Bimodal metrics: (regex, the slow mode's share of the fast one, low and high, its owner). A value
+# in the slow mode is KNOWN-bimodal and decides nothing; any other compares with the baseline's fast
+# mode (its best sample), and repeated runs give such a metric no noise band. frag.fill.2160p's
+# GPU time doubles from boot to boot (134 or 256 Gpix/s on msi's 5080, 11-03), which rgk-fill owns.
+BIMODAL = [(r"bench\.frag\.fill\.2160p\.gpix_s", 0.40, 0.65, "rgk-fill")]
+
+
+def bimodal(name):
+    return next((b for b in BIMODAL if re.fullmatch(b[0], name)), None)
 
 
 def contains(sha, fix):
@@ -421,7 +434,7 @@ def noise_from(bdirs_root):
             continue
         for n in set().union(*(r["metrics"] for r in runs)):
             vals = [r["metrics"][n] for r in runs if n in r["metrics"]]
-            if len(vals) < 2:
+            if len(vals) < 2 or bimodal(n):
                 continue
             med = statistics.median(vals)
             if med:
@@ -522,9 +535,15 @@ def compare(run, base, noise):
             mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)")
             continue
         bv = bm[name]
+        bi = bimodal(name)
+        if bi:
+            bv = base.get("metrics_best", {}).get(name, bv)
         rel = (v - bv) / abs(bv) if bv else 0.0
         verdict = ""
-        if g and tool_changed(name, run.meta, base["meta"]):
+        if bi and bv and bi[1] <= v / bv <= bi[2]:
+            verdict = f"KNOWN-bimodal: its slow mode ({bi[3]} owns it)"
+            items["metric." + name] = {"status": "KNOWN", "detail": f"{v:g} against the fast mode's {bv:g}: the slow mode, which {bi[3]} owns"}
+        elif g and tool_changed(name, run.meta, base["meta"]):
             verdict = "not gated: its tool changed since the baseline"
         elif g:
             bnd = band(name, noise)
