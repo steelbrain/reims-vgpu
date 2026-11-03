@@ -22,8 +22,8 @@
 //   gpu         kernel-encoded render and compute commands (an ICB in an argument buffer), GPU
 //               reset, a GPU-encoded ICB copied, CPU and GPU writes mixed
 //   residency   an executed ICB's buffers without useResource
-//   timing      CPU encode cost per command at 1024 and 16384, the commit after it, execution
-//               GPU time
+//   timing      CPU encode cost per command at 1024 and 16384, the commit after it, what each
+//               encode draws, execution GPU time
 //   freed       buffers the commands name released before an execute, a heap's among them
 //   resets      what a command's reset and resetWithRange: keep of a command's pipeline state
 // Render results print as the 8 cells of a 64x8 target, each the hex digit of the color index
@@ -1909,6 +1909,18 @@ static void case_timing(void)
 		printf("  %5lu: CPU encode, draw alone (inherited): %.0f ns a command, the commit after "
 		       "it %.0f us\n",
 		       (unsigned long)n, (t1 - t0) * 1e6 / n, commit_ms() * 1e3);
+		// What both encodes draw, executed once each after the timing: command i draws cell
+		// i % 8 in color i % 15, so the last of each cell, 8 from the end, is color
+		// (n - 8 + cell) % 15; the inherited draws take the encoder's color 7.
+		char what[64];
+		exec_render(b, NSMakeRange(NSNotFound, 0), nil, NO, 0);
+		snprintf(what, sizeof what, "%5lu: pipeline + 2 buffers + draw, executed",
+		         (unsigned long)n);
+		line(what, "bcde0123");
+		exec_render(bi, NSMakeRange(NSNotFound, 0), gDraw, YES, 7);
+		snprintf(what, sizeof what, "%5lu: draw alone (inherited, color 7), executed",
+		         (unsigned long)n);
+		line(what, "77777777");
 	}
 	n = 16384;
 	id<MTLIndirectCommandBuffer> b = icb(rdesc(MTLIndirectCommandTypeDraw, NO, NO), n);
@@ -1930,6 +1942,7 @@ static void case_timing(void)
 		printf("  execute %lu draws: wall %.2f ms, GPU %.2f ms (%.0f ns a draw)\n", (unsigned long)n,
 		       wall, gpu, gpu * 1e6 / n);
 	}
+	line("16384: encoded again after resetWithRange, executed", "bcde0123");
 }
 
 // ---- runner ----------------------------------------------------------------------------------
