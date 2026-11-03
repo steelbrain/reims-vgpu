@@ -71,10 +71,9 @@ impl reims_vgpu_core::platform::icb::IndirectCommandBuffer<MetalPlatform> for Me
     /// `resetWithRange:`, a raise inside Metal the caller's to catch, as the commands' setters'.
     fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()> {
         let icb = self.get();
-        let range = NSRange::new(location.to_usize(), length.to_usize());
         // SAFETY: the caller passes a range inside the buffer's size (the trait's contract).
         msg::send("resetWithRange:", Policy::Caught, || unsafe {
-            icb.resetWithRange(range)
+            icb.resetWithRange(NSRange::new(location.to_usize(), length.to_usize()))
         })
     }
     /// `resourceIndex` (SPI).
