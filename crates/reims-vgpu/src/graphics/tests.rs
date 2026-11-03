@@ -3760,3 +3760,264 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         RGFX_FEATURE_CB_SUBMITTED
     );
 }
+
+/// What the poison-fill tests write over the guest's memory before the host answers into it: a
+/// 32-bit word no field the host writes holds.
+const POISON: u32 = 0xa5a5_dead;
+
+/// Fills `len` bytes of the region at `offset` with [`POISON`].
+fn poison(device: &GraphicsDevice<FakePlatform>, offset: u64, len: u64) {
+    let words: Vec<u8> = (0..len / 4).flat_map(|_| POISON.to_le_bytes()).collect();
+    // SAFETY: the region is the device's, mapped at this address while it lives, and the span
+    // lies in it; the host writes none of it until the guest's next message.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            words.as_ptr(),
+            device.region_base().add(offset as usize),
+            words.len(),
+        )
+    };
+}
+
+/// The offsets of `bytes`' 32-bit words still [`POISON`]: bytes the host answered for and never
+/// wrote.
+fn unwritten(bytes: &[u8]) -> Vec<usize> {
+    let (words, _) = bytes.as_chunks::<4>();
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| u32::from_le_bytes(**w) == POISON)
+        .map(|(i, _)| i * 4)
+        .collect()
+}
+
+/// Every answer on ring 0's completion ring writes every byte of itself: with the ring's data
+/// poisoned before each command, no word of a `COMPLETE`, `PIPELINE_REFLECTION`,
+/// `SAMPLER_STATE` or `SIZE_AND_ALIGN` is left as the guest's memory held it, and each is as long
+/// as its type's struct
+#[test]
+fn ring_0_s_answers_write_every_byte_they_name() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    let size_query = RgfxHeapTextureSizeAndAlign {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 3),
+        desc: RgfxTextureDescriptor {
+            pixel_format: 80,
+            texture_type: 2,
+            width: 256,
+            height: 128,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            ..RgfxTextureDescriptor::default()
+        },
+    }
+    .as_bytes()
+    .to_vec();
+    let layout_query = {
+        let descriptor = RgfxArgumentDescriptor {
+            data_type: 60, // MTLDataTypePointer
+            index: 0,
+            ..RgfxArgumentDescriptor::default()
+        };
+        let mut bytes = RgfxArgumentLayoutQuery {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ARGUMENT_LAYOUT,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: obj(1, 5),
+            reply_offset: BLOCK,
+            reply_length: 0x1000,
+            source: RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
+            count: 1,
+            descriptors_offset: size_of::<RgfxArgumentLayoutQuery>() as u32,
+            ..RgfxArgumentLayoutQuery::default()
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(descriptor.as_bytes());
+        bytes
+    };
+    guest.send(&device, block_grant(1, BLOCK, 0x1000));
+    let commands: Vec<(Vec<u8>, u32, usize)> = vec![
+        (
+            library_create(obj(1, 10)),
+            RGFX_EVT_COMPLETE,
+            size_of::<RgfxComplete>(),
+        ),
+        (
+            render_pipeline_create(obj(1, 11), obj(1, 10)),
+            RGFX_EVT_PIPELINE_REFLECTION,
+            size_of::<RgfxPipelineReflection>(),
+        ),
+        (
+            compute_pipeline_create(obj(1, 12), obj(1, 10)),
+            RGFX_EVT_PIPELINE_REFLECTION,
+            size_of::<RgfxPipelineReflection>(),
+        ),
+        (
+            sampler_create(obj(1, 4)),
+            RGFX_EVT_SAMPLER_STATE,
+            size_of::<RgfxSamplerState>(),
+        ),
+        (
+            size_query,
+            RGFX_EVT_SIZE_AND_ALIGN,
+            size_of::<RgfxSizeAndAlign>(),
+        ),
+        (layout_query, RGFX_EVT_COMPLETE, size_of::<RgfxComplete>()),
+        (
+            queue_create(1, 1, SUBMIT_OFF, COMPLETE_OFF, 0x1_0000, 0),
+            RGFX_EVT_COMPLETE,
+            size_of::<RgfxComplete>(),
+        ),
+        (
+            context_close(1),
+            RGFX_EVT_COMPLETE,
+            size_of::<RgfxComplete>(),
+        ),
+    ];
+    for (command, answer, size) in commands {
+        let r#type = u32::from_le_bytes(command[..4].try_into().unwrap());
+        poison(&device, RGFX_CONTROL_COMPLETE_OFFSET + 256, RING_DATA);
+        guest.send(&device, command);
+        let bytes = next_event(&mut guest, answer);
+        let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
+        assert_eq!(header.seqno, guest.seqno, "command {type:#x}");
+        assert_eq!(bytes.len(), size, "command {type:#x}'s answer's length");
+        assert_eq!(
+            unwritten(&bytes),
+            Vec::<usize>::new(),
+            "command {type:#x}'s answer left these offsets unwritten"
+        );
+        // Each answered OK (every status's OK is 0): a refusal would say nothing of what an OK
+        // answer writes.
+        let status = if answer == RGFX_EVT_PIPELINE_REFLECTION {
+            RgfxPipelineReflection::read_from_bytes(&bytes)
+                .unwrap()
+                .status
+        } else {
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap())
+        };
+        assert_eq!(status, 0, "command {type:#x} was not answered OK");
+    }
+}
+
+/// An argument layout answered OK writes every byte of the answer it says it took (its
+/// `needed`), over a block the guest's memory had poisoned; one answered `TOO_SMALL` writes its
+/// `needed` alone, as the wire says
+#[test]
+fn an_argument_layout_writes_every_byte_it_answers() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1000;
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    let descriptors = [
+        RgfxArgumentDescriptor {
+            data_type: 58, // MTLDataTypeTexture
+            index: 0,
+            texture_type: 2,
+            ..RgfxArgumentDescriptor::default()
+        },
+        RgfxArgumentDescriptor {
+            data_type: 60, // MTLDataTypePointer
+            index: 1,
+            array_length: 4,
+            ..RgfxArgumentDescriptor::default()
+        },
+    ];
+    let query = |reply_length: u64| {
+        let mut bytes = RgfxArgumentLayoutQuery {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ARGUMENT_LAYOUT,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: obj(1, 1),
+            reply_offset: BLOCK,
+            reply_length,
+            source: RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
+            count: 2,
+            descriptors_offset: size_of::<RgfxArgumentLayoutQuery>() as u32,
+            ..RgfxArgumentLayoutQuery::default()
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(descriptors.as_bytes());
+        bytes
+    };
+    poison(&device, BLOCK, SIZE);
+    guest.send(&device, query(SIZE));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    // SAFETY: as `Guest`'s helpers; the block lies in the region.
+    let needed = unsafe { guest.load_u64(BLOCK as usize) };
+    assert!(needed > size_of::<RgfxArgumentLayoutReply>() as u64 && needed <= SIZE);
+    // SAFETY: as above.
+    let answer = unsafe { guest.read(BLOCK as usize, needed as usize) };
+    assert_eq!(
+        unwritten(&answer),
+        Vec::<usize>::new(),
+        "the layout's unwritten offsets"
+    );
+
+    poison(&device, BLOCK, SIZE);
+    let small = size_of::<RgfxArgumentLayoutReply>() as u64;
+    guest.send(&device, query(small));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_TOO_SMALL);
+    // SAFETY: as above.
+    let answer = unsafe { guest.read(BLOCK as usize, small as usize) };
+    assert_eq!(u64::from_le_bytes(answer[..8].try_into().unwrap()), needed);
+    assert_eq!(unwritten(&answer), vec![8, 12], "only `needed` is written");
+}
+
+/// A command buffer's `CB_COMPLETE` writes every byte of itself over a completion ring the guest's
+/// memory had poisoned: its status, its id and its GPU times
+#[test]
+fn a_command_buffer_s_completion_writes_every_byte() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            queue_create(2, 1, SUBMIT_OFF, COMPLETE_OFF, DATA, 0)
+        ),
+        RGFX_STATUS_OK
+    );
+    poison(&device, COMPLETE_OFF + 256, u64::from(DATA));
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(DATA));
+    ring.arm();
+    ring.send(&device, command_buffer(obj(2, 1), 100));
+    assert!(complete_until_event(&platform, &mut ring), "no CB_COMPLETE");
+    let bytes = ring.event().expect("a CB_COMPLETE");
+    let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+    assert_eq!(bytes.len(), size_of::<RgfxCbComplete>());
+    assert_eq!(
+        unwritten(&bytes),
+        Vec::<usize>::new(),
+        "the completion's unwritten offsets"
+    );
+}
