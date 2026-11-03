@@ -17,6 +17,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <spawn.h>
 #include <string>
@@ -455,6 +456,78 @@ void test_handlers_run_on_the_completion_queue()
 		std::vector<std::string> want = {"s0@own",   "c0@own",   "s1@given",
 		                                 "c1@given", "s2@given", "c2@given"};
 		CHECK(log == want);
+	}
+}
+
+// A buffer with no handler and nothing to write back completes on the thread that takes its
+// records off the ring, which wakes its waiter, as Metal's does for a buffer with no completed
+// handler: its wait returns while the queue's completion queue runs nothing. One with a handler
+// still runs there, and a buffer with no handler behind one whose record is still to run
+// completes after it, in the ring's order, its status final before its wait returns.
+void test_buffers_without_handlers_complete_where_seen()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		dispatch_queue_t given = dispatch_queue_create("test.completion", DISPATCH_QUEUE_SERIAL);
+		[(id<QueueTestCompletionQueueSPI>)q.queue setCompletionQueue:given];
+		dispatch_suspend(given);
+		bool resumed = false;
+		auto within = [](const std::function<bool()> &pred) {
+			for (int i = 0; i < 5000 && !pred(); i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			return pred();
+		};
+
+		// No handler: the wait returns, Completed, with the completion queue suspended.
+		id<MTLCommandBuffer> plain = [q.queue commandBuffer];
+		[plain commit];
+		const uint64_t s0 = nextSeqno(q);
+		std::atomic<bool> waited{false};
+		std::atomic<bool> *waitedp = &waited;
+		MTLCommandBufferStatus atReturn = MTLCommandBufferStatusNotEnqueued;
+		std::thread waiter([plain, waitedp, &atReturn] {
+			[plain waitUntilCompleted];
+			atReturn = plain.status;
+			waitedp->store(true);
+		});
+		hostScheduled(q, *driven.kext, s0, plain);
+		hostComplete(q, *driven.kext, s0, plain);
+		const bool seen = within([&] { return waited.load(); });
+		CHECK(seen);
+		if (!seen) {
+			dispatch_resume(given);
+			resumed = true;
+		}
+		waiter.join();
+		CHECK(atReturn == MTLCommandBufferStatusCompleted);
+
+		// A handler: its record waits for the queue, and so does a buffer with none behind it.
+		__block MTLCommandBufferStatus behindAtHandler = MTLCommandBufferStatusCompleted;
+		id<MTLCommandBuffer> handled = [q.queue commandBuffer];
+		id<MTLCommandBuffer> behind = [q.queue commandBuffer];
+		__unsafe_unretained id<MTLCommandBuffer> behindRaw = behind; // alive through the test
+		[handled addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			behindAtHandler = behindRaw.status;
+		}];
+		[handled commit];
+		const uint64_t s1 = nextSeqno(q);
+		[behind commit];
+		const uint64_t s2 = nextSeqno(q);
+		hostComplete(q, *driven.kext, s1, handled);
+		hostComplete(q, *driven.kext, s2, behind);
+		// Both taken off the ring; neither delivered while the queue runs nothing.
+		CHECK(within([&] { return q.completion.consumerCount() == q.completion.produced; }));
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(resumed || handled.status != MTLCommandBufferStatusCompleted);
+		CHECK(resumed || behind.status != MTLCommandBufferStatusCompleted);
+		if (!resumed)
+			dispatch_resume(given);
+		[behind waitUntilCompleted];
+		CHECK(handled.status == MTLCommandBufferStatusCompleted);
+		CHECK(behindAtHandler != MTLCommandBufferStatusCompleted);
+		CHECK(behind.status == MTLCommandBufferStatusCompleted);
 	}
 }
 
@@ -1052,6 +1125,7 @@ void rgfxQueueTests(const char *self)
 	test_handlers_after_commit_end_the_process();
 	test_handlers_of_queues_wait_for_each_other();
 	test_handlers_run_on_the_completion_queue();
+	test_buffers_without_handlers_complete_where_seen();
 	test_one_queues_handlers_run_in_order();
 	test_slots_and_submission_do_not_wait_for_handlers();
 	test_buffers_run_in_enqueue_order();

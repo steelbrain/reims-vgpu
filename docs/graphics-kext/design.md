@@ -1672,10 +1672,15 @@ two queues' at once (measured on the M3 Max, an AMD 5300M and an Intel 630).
 The scheduling makes the buffer `Scheduled` and runs its scheduled handlers,
 and the completion runs its write-backs, its status, its completed handlers
 and its waiters. `waitUntilScheduled` and `waitUntilCompleted` return once
-the handlers have run, as Metal's do. A wait for a buffer of a queue from that
-queue's completion queue, a handler's for its own buffer or a later buffer of
-its queue, waits for good, as Metal's does on all three GPUs; a wait for
-another queue's buffer is released. `commitAndWaitUntilSubmitted` returns at
+the handlers have run, as Metal's do. A buffer with no scheduled or completed
+handler and nothing to write back (every surface it writes in place, no copy of
+app memory) behind none of its queue's records still to run has its records run
+by the completion thread itself, which wakes its waiters: one wake where the
+queue's would be two, as Metal's waiter for a buffer with no completed handler
+is woken by the thread that saw it complete. A wait for a buffer of a queue
+from that queue's completion queue, a handler's for its own buffer or a later
+buffer of its queue, waits for good, as Metal's does on all three GPUs; a wait
+for another queue's buffer is released. `commitAndWaitUntilSubmitted` returns at
 the submission, whatever handlers run. Waiters take the ring themselves only
 once the thread has ended (its context closed), and then run the records too.
 

@@ -994,9 +994,13 @@ struct RgfxBarrierSlot {
 
 // Runs one of its command buffers' records (the buffer's scheduling or completion, with its
 // handlers) behind every record handed over before it, on the queue's completion queue: the one
-// setCompletionQueue: gave, else its own serial queue. Where `here` (no completion thread drives
-// the ring, so the thread that took it off delivers) and nothing waits on a dispatch queue, it
-// runs at once on this thread instead.
+// setCompletionQueue: gave, else its own serial queue. Where `here` and nothing waits on a
+// dispatch queue, it runs at once on this thread instead: where no completion thread drives the
+// ring, so the thread that took it off delivers, and for a buffer that runs nothing of the app's
+// and writes nothing back (_deliversWhereSeen), whose waiters the thread that saw its completion
+// then wakes itself, as Metal's does for a buffer with no completed handler (measured on the M3
+// Max: the wait returned 3 to 10 us after the status read Completed), one wake where the queue's
+// would be two.
 - (void)rgfxDeliver:(dispatch_block_t)record here:(BOOL)here
 {
 	if (here && _deliveriesInFlight.load(std::memory_order_acquire) == 0) {
@@ -1261,6 +1265,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
+	// Whether its records run where they are seen (rgfxDeliver:here:), fixed at its commit: it
+	// has no scheduled or completed handler, and nothing to write back at its completion (every
+	// surface it writes is in place, and it writes no copy of app memory).
+	bool _deliversWhereSeen;
 	// Where its encoders' inline bytes go: chunks of the queue's upload pool, given back once
 	// the host has completed the buffer (RgfxUploads.h). The encoders share it. `_uploadsFailed`:
 	// some found no chunk, noted as they go back (rgfxHostDone:).
@@ -1527,6 +1535,15 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_writesInPlace = writesRegion != nullptr && rgfxIOSurfaceWritesInPlace(_surfaceWrites);
 	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
 	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
+	// With no handler to run and nothing to write back, its records run on the thread that takes
+	// them off the ring, where nothing of the queue's waits on the completion queue: no handler
+	// can be added after the commit, so the lists are final here.
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		_deliversWhereSeen = _completedHandlers.count == 0 && _scheduledHandlers.count == 0 &&
+		                     (_surfaceWrites.empty() || rgfxIOSurfaceWritesInPlace(_surfaceWrites)) &&
+		                     _shadowWrites.empty();
+	}
 	// Committed before the host can see it, so a completion never finds an older status.
 	_status.store(MTLCommandBufferStatusCommitted);
 
@@ -1586,22 +1603,23 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		RgfxCmdBuffer *strongSelf = self;
 		RgfxReplyReader *reader = _reader;
 		const bool asks = _asksSubmitted;
-		expect = [reader, strongSelf, queue, asks](uint64_t seqno) {
+		const bool whereSeen = _deliversWhereSeen;
+		expect = [reader, strongSelf, queue, asks, whereSeen](uint64_t seqno) {
 			if (asks) {
 				reader->expectSubmitted(seqno, [strongSelf](const RgfxCbSubmitted &) {
 					[strongSelf rgfxReachSubmitted];
 				});
 			}
-			reader->expectScheduled(seqno, [strongSelf, queue, reader](const RgfxCbScheduled &) {
+			reader->expectScheduled(seqno, [strongSelf, queue, reader, whereSeen](const RgfxCbScheduled &) {
 				[strongSelf rgfxReachSubmitted];
 				[queue rgfxDeliver:^{
 					@autoreleasepool {
 						[strongSelf rgfxReachScheduled];
 					}
 				}
-				              here:!reader->driven()];
+				              here:whereSeen || !reader->driven()];
 			});
-			reader->expectCompletion(seqno, [strongSelf, queue, reader](const RgfxCbComplete &m) {
+			reader->expectCompletion(seqno, [strongSelf, queue, reader, whereSeen](const RgfxCbComplete &m) {
 				[strongSelf rgfxHostDone:&m];
 				const RgfxCbComplete msg = m;
 				[queue rgfxDeliver:^{
@@ -1609,7 +1627,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 						[strongSelf rgfxDeliverCompletion:&msg];
 					}
 				}
-				              here:!reader->driven()];
+				              here:whereSeen || !reader->driven()];
 			});
 		};
 		// While the ring is full: where no thread drives the ring, take the queue's

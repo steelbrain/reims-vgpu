@@ -35,7 +35,9 @@
  * slot, its message's block, its inline bytes' chunks). Its record then runs on the
  * queue's completion queue, the dispatch queue setCompletionQueue: gave or a serial queue
  * of the queue's own, behind the queue's earlier records, as Metal runs its handlers:
- * the write-backs, the status, the scheduled then completed handlers, the waiters.
+ * the write-backs, the status, the scheduled then completed handlers, the waiters. A buffer
+ * with no handler and nothing to write back, behind none of its queue's records still to
+ * run, has its records run on the thread that took them off instead, which wakes its waiters.
  * `waitUntilCompleted` blocks until the record has run the handlers, as Metal's does, and
  * takes the ring itself only where no thread drives it (a unit test, or its thread has
  * ended), where the taker runs the record too.
