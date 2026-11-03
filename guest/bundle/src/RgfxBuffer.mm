@@ -10,6 +10,7 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <os/log.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -523,10 +524,39 @@ RGFX_RESOURCE_SPI
 
 // --- what a buffer that is not sparse or remote answers ------------------------------
 
+// Whether a texture of `descriptor` over the buffer from `offset`, rows `bytesPerRow` apart, lies
+// at the device's linear texture alignment for its format
+// (minimumLinearTextureAlignmentForPixelFormat:): Metal's rule for both forms of a 2D texture over
+// a buffer of either storage, the public one and the linear SPI. Off it the AMD 5300M answers nil and the Intel 630 ends the process at
+// its validation's failed assertion (measured under macOS 26.7.1: `oracle_storage AMD linalign`, a
+// 468 x 36 BGRA8 texture at offsets 0, 0x40 and 0x100 and pitches 1872, 1920 and 2048, made at
+// offsets 0 and 0x100 with the pitch 2048 alone); the bundle answers nil, as the AMD, logged at
+// debug. A texture buffer takes an alignment of its own, and a device that answers none (a unit
+// test's nil device) asks none.
+- (BOOL)rgfxAtLinearAlignment:(MTLTextureDescriptor *)descriptor
+                       offset:(NSUInteger)offset
+                  bytesPerRow:(NSUInteger)bytesPerRow
+{
+	if (descriptor == nil || descriptor.textureType == MTLTextureTypeTextureBuffer)
+		return YES;
+	const NSUInteger alignment =
+	    [self.device minimumLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat];
+	if (alignment <= 1 || (offset % alignment == 0 && bytesPerRow % alignment == 0))
+		return YES;
+	os_log_debug(OS_LOG_DEFAULT,
+	             "RGFX: a texture over buffer 0x%llx at offset %lu, %lu bytes a row (format %lu): "
+	             "not at the device's linear texture alignment, %lu: answered nil",
+	             (unsigned long long)[self rgfxObjId], (unsigned long)offset,
+	             (unsigned long)bytesPerRow, (unsigned long)descriptor.pixelFormat,
+	             (unsigned long)alignment);
+	return NO;
+}
+
 // A texture over the buffer's bytes from `offset`, rows `bytesPerRow` apart
 // (TEXTURE_FROM_BUFFER); it keeps the buffer, which its `buffer` answers. Metal ends the process
 // at a descriptor of more than one level, with these words, on the AMD, the Intel and the M3 GPU
-// alike (docs/graphics-kext/dgpu-oracle.md, Q11), and so does the bundle, sending nothing.
+// alike (docs/graphics-kext/dgpu-oracle.md, Q11), and so does the bundle, sending nothing. One off
+// the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -538,6 +568,8 @@ RGFX_RESOURCE_SPI
 		                               @"mipmapped, mipmapLevelCount (%lu) disallowed\n",
 		                               (unsigned long)descriptor.mipmapLevelCount]);
 	}
+	if (![self rgfxAtLinearAlignment:descriptor offset:offset bytesPerRow:bytesPerRow])
+		return nil;
 	return [RgfxTexture textureWithDescriptor:descriptor
 	                                   buffer:self
 	                                   offset:offset
@@ -621,9 +653,16 @@ RGFX_RESOURCE_SPI
 			return nil;
 		}
 	}
+	// As newTextureWithDescriptor:offset:bytesPerRow: makes one, at any offset and pitch: the AMD's
+	// tiled form takes those its public form refuses (`oracle_storage AMD linalign`).
 	MTLTextureDescriptor *shared = [descriptor copy];
 	shared.storageMode = [self storageMode];
-	return [self newTextureWithDescriptor:shared offset:offset bytesPerRow:bytesPerRow];
+	return [RgfxTexture textureWithDescriptor:shared
+	                                   buffer:self
+	                                   offset:offset
+	                              bytesPerRow:bytesPerRow
+	                                   device:self.device
+	                               serializer:[self serializer]];
 }
 
 // A texture over the buffer's bytes as Metal's linear form makes one, which the host's platform
@@ -634,7 +673,7 @@ RGFX_RESOURCE_SPI
 // process, at its validation's failed assertion, for a texture of another type than 2D, 2D array
 // and texture buffer, or of more than one level, which the bundle answers nil, logged, as it
 // answers a view Metal ends the process at. One past the buffer's bytes Metal answers nil, and the
-// host refuses.
+// host refuses; one off the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                           offset:(NSUInteger)offset
                                      bytesPerRow:(NSUInteger)bytesPerRow
@@ -656,6 +695,8 @@ RGFX_RESOURCE_SPI
 		}
 		return nil;
 	}
+	if (![self rgfxAtLinearAlignment:descriptor offset:offset bytesPerRow:bytesPerRow])
+		return nil;
 	return [RgfxTexture linearTextureWithDescriptor:descriptor
 	                                         buffer:self
 	                                         offset:offset

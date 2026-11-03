@@ -6030,6 +6030,107 @@ void test_buffer_texture_replace_region_tells_the_host()
 	drainRing(fx.ring);
 }
 
+// A device that answers only its linear texture alignment: 256 bytes, as the AMD 5300M's and the
+// lane's.
+@interface RgfxLinearAlignmentDevice : NSObject
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+@end
+@implementation RgfxLinearAlignmentDevice
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	return 256;
+}
+@end
+
+// A 2D texture over a buffer, by the public form and the linear SPI, over a Shared and a Managed
+// buffer, is made at offsets and pitches that are multiples of the device's linear texture
+// alignment and is nil, posting nothing, off them, as the AMD 5300M answers (`oracle_storage AMD
+// linalign`: 468 x 36 BGRA8 at offsets 0, 0x40 and 0x100 and pitches 1872, 1920 and 2048). A
+// texture buffer takes no part of the rule, nor the tiled SPI, which takes any offset and pitch.
+void test_buffer_texture_linear_alignment()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	id<MTLDevice> device = (id<MTLDevice>)[RgfxLinearAlignmentDevice new];
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:468
+	                                                      height:36
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead;
+	const NSUInteger offsets[] = {0, 0x40, 0x100}, pitches[] = {1872, 1920, 2048};
+	RgfxRegion::Block block = region.allocate(0x12000);
+	CHECK(block.ok);
+	for (const MTLResourceOptions storage :
+	     {MTLResourceStorageModeShared, MTLResourceStorageModeManaged}) {
+		@autoreleasepool {
+			RgfxBuffer *buf = [RgfxBuffer
+			    bufferOverHostMemoryWithContents:const_cast<uint8_t *>(block.ptr)
+			                        regionOffset:block.offset
+			                              length:0x12000
+			                             options:storage
+			                         deallocator:nil
+			                              device:device
+			                          serializer:&fx.ser];
+			CHECK(buf != nil);
+			drainRing(fx.ring);
+			desc.storageMode = buf.storageMode;
+			id<RgfxMetalBufferInternals> spi = (id<RgfxMetalBufferInternals>)buf;
+			for (const NSUInteger offset : offsets) {
+				for (const NSUInteger pitch : pitches) {
+					drainRing(fx.ring); // the last place's textures' destroys
+					const bool aligned = offset % 256 == 0 && pitch % 256 == 0;
+					id<MTLTexture> plain = [buf newTextureWithDescriptor:desc
+					                                             offset:offset
+					                                        bytesPerRow:pitch];
+					CHECK((plain != nil) == aligned);
+					if (aligned) {
+						CHECK(expectMessage<RgfxTextureFromBuffer>(fx.ring,
+						                                           RGFX_CMD_TEXTURE_FROM_BUFFER)
+						          .bytes_per_row == pitch);
+					}
+					id<MTLTexture> linear = [spi newLinearTextureWithDescriptor:desc
+					                                                     offset:offset
+					                                                bytesPerRow:pitch
+					                                              bytesPerImage:pitch * 36];
+					CHECK((linear != nil) == aligned);
+					if (aligned) {
+						CHECK(expectMessage<RgfxLinearTextureFromBuffer>(
+						          fx.ring, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER)
+						          .offset == offset);
+					}
+					CHECK(ringEmpty(fx.ring));
+				}
+			}
+			if (storage == MTLResourceStorageModeShared) {
+				// The tiled SPI: a Managed descriptor over the Shared buffer, at any place.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+				desc.storageMode = MTLStorageModeManaged;
+#pragma clang diagnostic pop
+				drainRing(fx.ring);
+				id<MTLTexture> tiled = [spi newTiledTextureWithDescriptor:desc
+				                                                   offset:0x40
+				                                              bytesPerRow:1920];
+				CHECK(tiled != nil);
+				CHECK(expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER)
+				          .bytes_per_row == 1920);
+			}
+			// A texture buffer of 64 texels at offset 0x40.
+			MTLTextureDescriptor *tb =
+			    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			                                                           width:64
+			                                                 resourceOptions:storage
+			                                                           usage:MTLTextureUsageShaderRead];
+			CHECK([spi newLinearTextureWithDescriptor:tb offset:0x40 bytesPerRow:256 bytesPerImage:0] !=
+			      nil);
+			drainRing(fx.ring);
+		}
+		drainRing(fx.ring);
+	}
+}
+
 // didModifyData of a texture over a Managed buffer, the plain form's, the linear form's and a view's,
 // tells the host the whole buffer (BUFFER_DID_MODIFY_RANGE of all of it), as Metal's uploads it to
 // the GPU's copy (the AMD 5300M's two copies, `oracle_storage AMD didmodify length` and `nocopy`);
@@ -10756,6 +10857,7 @@ int main(int argc, char **argv)
 		test_managed_buffer_range();
 		test_buffer_texture_replace_region_tells_the_host();
 		test_buffer_texture_did_modify_data_tells_the_host();
+		test_buffer_texture_linear_alignment();
 		test_managed_texture_cpu_copy();
 		test_objects_destroyed_as_let_go();
 		test_function_keeps_its_library();
