@@ -2230,6 +2230,31 @@ mod tests {
         assert_eq!(words(&out_again), [0; 4]);
     }
 
+    /// A command naming a buffer released before its execution runs with no error, reading zero
+    /// there: the runtime resolves the address the command holds to no live buffer, as it
+    /// resolves a pointer to none, so the slot reads zero and drops writes. Metal's answer
+    /// varies (oracle_icb `freed`, an AMD 5300M and an Intel 630 on macOS 26.7.1, an M3 Max on
+    /// macOS 27.0.1): each reads a small released buffer's last bytes; the AMD and the M3 read
+    /// zero from a released buffer of 1 to 64 MiB, where the Intel reads other bytes; the AMD
+    /// draws nothing through a released vertex or fragment buffer; none fails the command buffer.
+    /// Ignored until the runtime runs the command: metal2vulkan c8a0481cf8 on MoltenVK runs
+    /// nothing there, its output keeping [0; 4], where a nil buffer at the same index reads zero
+    #[test]
+    #[ignore = "metal2vulkan runs no command whose buffer was released (handed to it 11-03)"]
+    fn a_command_naming_a_released_buffer_reads_zero() {
+        let d = dev();
+        let out = holding(&d, &[0; 4]);
+        let input = holding(&d, &[10, 20, 30, 40]);
+        let (icb, _pipeline) = add_into(&d, 1, &out, &input);
+        drop(input);
+        let resident = [
+            Some(ResourceRef::Buffer(&out)),
+            Some(ResourceRef::Icb(&icb)),
+        ];
+        execute_first(&d, &icb, &resident);
+        assert_eq!(words(&out), [1; 4]);
+    }
+
     /// The tests' kernels that encode indirect commands, which `build.rs` compiled from
     /// `icb_encode.metal`.
     const ICB_ENCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icb_encode.metallib"));
