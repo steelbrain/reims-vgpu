@@ -753,11 +753,22 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                         .surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
                 }
                 let foreign = foreign_queue(poster, message);
+                // An ICB_WRITE's records run on the control ring, ahead of the process's later
+                // command buffers: how long they take is logged (diagnostics).
+                let icb_start = (r#type == RGFX_CMD_ICB_WRITE).then(|| self.pool.now());
                 let outcome = if foreign {
                     Ok(Err(DecodeError::BadReference))
                 } else {
                     refusing(|| decoder.decode(&self.device, message))
                 };
+                if let Some(start) = icb_start {
+                    log::debug!(
+                        target: "reims_vgpu::graphics::icb",
+                        "ICB_WRITE of {} bytes applied in {} us",
+                        message.len(),
+                        self.pool.now().saturating_duration_since(start).as_micros()
+                    );
+                }
                 // A command buffer of the process's own queue that was not carried out is stood
                 // in for on that queue, which posts its failure in the queue's order, its shared
                 // event values ahead of it; else its failure is posted below, at once.

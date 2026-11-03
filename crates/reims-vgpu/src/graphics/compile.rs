@@ -221,6 +221,11 @@ impl CompilePool {
         CompilePool::with_threads(threads, now)
     }
 
+    /// The platform's monotonic clock, as the pool reads it.
+    pub(crate) fn now(&self) -> MonoTime {
+        (self.shared.now)()
+    }
+
     /// A pool of `threads` threads, those the host starts.
     fn with_threads(threads: usize, now: Now) -> CompilePool {
         let shared = Arc::new(Shared {
