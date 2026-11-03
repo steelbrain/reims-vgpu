@@ -58,7 +58,11 @@ RgfxEncoder::RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId
 	m_head.queue_obj_id = queue_obj_id;
 	m_head.cb_obj_id = cb_obj_id;
 	m_head.op_bytes = 0;
-	const size_t size = kHeadroom + RGFX_COMMAND_BUFFER_OPS_OFFSET + std::max<size_t>(reserve, 64);
+	// Room for the reserve, up to what the ring takes: past it the message moves to a region
+	// block (setMessageBlocks, grow), sized from the queue's guess.
+	const size_t inline_max = ring.dataSize() / 2;
+	const size_t ops = std::min(reserve, inline_max);
+	const size_t size = kHeadroom + RGFX_COMMAND_BUFFER_OPS_OFFSET + std::max<size_t>(ops, 64);
 	m_store = static_cast<uint8_t *>(std::malloc(size));
 	if (m_store == nullptr)
 		std::abort();
@@ -81,20 +85,83 @@ RgfxEncoder::RgfxEncoder(SegmentOf of)
 
 RgfxEncoder::~RgfxEncoder()
 {
-	std::free(m_store);
+	if (m_inBlock)
+		giveBackBlock();
+	else
+		std::free(m_store);
+}
+
+void RgfxEncoder::giveBackBlock()
+{
+	if (m_blocks != nullptr && m_block.ptr != nullptr)
+		m_blocks->giveBack(m_block);
+	m_block = {};
+}
+
+bool RgfxEncoder::moveToBlock(size_t size)
+{
+	RgfxMessageBlock block = {};
+	if (m_blocks == nullptr || !m_blocks->take(size, &block))
+		return false;
+	uint8_t *to = const_cast<uint8_t *>(block.ptr);
+	const size_t used = static_cast<size_t>(m_cur - m_store);
+	std::memcpy(to, m_store, used);
+	if (m_inBlock)
+		giveBackBlock(); // never posted: no host reads it
+	else
+		std::free(m_store);
+	m_ops = to + (m_ops - m_store);
+	m_cur = to + used;
+	m_store = to;
+	m_end = to + block.size;
+	m_block = block;
+	m_inBlock = true;
+	return true;
+}
+
+void RgfxEncoder::moveToHeap(size_t size)
+{
+	const size_t used = static_cast<size_t>(m_cur - m_store);
+	uint8_t *to;
+	if (m_inBlock) {
+		to = static_cast<uint8_t *>(std::malloc(size));
+		if (to != nullptr)
+			std::memcpy(to, m_store, used);
+	} else {
+		to = static_cast<uint8_t *>(std::realloc(m_store, size));
+	}
+	if (to == nullptr)
+		std::abort(); // as std::vector's growth ends the process where memory runs out
+	if (m_inBlock) {
+		giveBackBlock();
+		m_inBlock = false;
+	}
+	m_ops = to + (m_ops - m_store);
+	m_cur = to + used;
+	m_store = to;
+	m_end = to + size;
 }
 
 void RgfxEncoder::grow(size_t n)
 {
 	const size_t used = static_cast<size_t>(m_cur - m_store);
-	const size_t size = std::max(used + n, 2 * static_cast<size_t>(m_end - m_store));
-	uint8_t *to = static_cast<uint8_t *>(std::realloc(m_store, size));
-	if (to == nullptr)
-		std::abort(); // as std::vector's growth ends the process where memory runs out
-	m_ops = to + (m_ops - m_store);
-	m_cur = to + used;
-	m_store = to;
-	m_end = to + size;
+	const size_t need = used + n;
+	const size_t doubled = std::max(need, 2 * static_cast<size_t>(m_end - m_store));
+	// A message too large for its ring goes in a block: once it outgrows the ring it moves
+	// there, to a block as large as its queue's guess, and grows from block to block.
+	if (m_ring != nullptr && m_blocks != nullptr) {
+		const uint64_t message = RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix +
+		                         static_cast<uint64_t>(m_cur - m_ops) + n;
+		if (m_inBlock || message > UINT32_MAX || !m_ring->fits(static_cast<uint32_t>(message))) {
+			const size_t first = m_inBlock ? doubled
+			                               : std::max<size_t>(doubled, kHeadroom +
+			                                                               RGFX_COMMAND_BUFFER_OPS_OFFSET +
+			                                                               m_blockHint);
+			if (moveToBlock(first))
+				return;
+		}
+	}
+	moveToHeap(doubled);
 }
 
 void RgfxEncoder::appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
@@ -135,40 +202,50 @@ void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
 bool RgfxEncoder::fitsRing() const
 {
 	const uint64_t size = messageSize();
-	return m_ring != nullptr && size <= UINT32_MAX && m_ring->fits(static_cast<uint32_t>(size));
+	return m_ring != nullptr && !m_inBlock && size <= UINT32_MAX &&
+	       m_ring->fits(static_cast<uint32_t>(size));
 }
 
 bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &whileWaiting,
-                         const std::function<void(uint64_t)> &beforePublish)
-{
-	if (!fitsRing())
-		return false;
-	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
-	m_head.op_bytes = opBytes();
-	std::memcpy(message, &m_head, sizeof(m_head));
-	return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(messageSize()),
-	                    out_seqno, whileWaiting, beforePublish);
-}
-
-bool RgfxEncoder::finishInRegion(volatile uint8_t *block, uint64_t region_offset,
-                                 uint64_t *out_seqno, const std::function<void()> &whileWaiting,
-                                 const std::function<void(uint64_t)> &beforePublish)
+                         const std::function<void(uint64_t)> &beforePublish,
+                         RgfxMessageBlock *held)
 {
 	const uint64_t size = messageSize();
 	if (m_ring == nullptr || size > UINT32_MAX)
 		return false;
 	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_head.op_bytes = opBytes();
+	if (!m_inBlock && m_ring->fits(static_cast<uint32_t>(size))) {
+		std::memcpy(message, &m_head, sizeof(m_head));
+		return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(size),
+		                    out_seqno, whileWaiting, beforePublish);
+	}
+	// Out of line: the block the message was built in, else one it is copied to now.
 	m_head.header.type = RGFX_CMD_COMMAND_BUFFER;
 	m_head.header.size = static_cast<uint32_t>(size);
 	m_head.header.seqno = 0;
 	std::memcpy(message, &m_head, sizeof(m_head));
+	if (!m_inBlock) {
+		const size_t at = static_cast<size_t>(message - m_store);
+		if (!moveToBlock(static_cast<size_t>(m_cur - m_store)))
+			return false;
+		message = m_store + at;
+	}
 	// Write-back memory the host reads once the reference's `producer` is published (a
-	// release store), so the copy is ordered before it.
-	std::memcpy(const_cast<uint8_t *>(block), message, size);
+	// release store), so the message's writes are ordered before it.
 	RgfxCommandBufferInRegion ref = {};
-	ref.region_offset = region_offset;
+	ref.region_offset = m_block.offset + static_cast<uint64_t>(message - m_store);
 	ref.byte_length = size;
+	if (held != nullptr) {
+		// The holder has it before the host can see the message, as the completion may come
+		// before the post returns; it gives it back once the buffer is done, or goes. The
+		// builder writes it no more.
+		*held = m_block;
+		m_block = {};
+		m_inBlock = false;
+		m_store = m_ops = m_cur = m_end = nullptr;
+		m_prefix = 0;
+	}
 	return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
 	                    whileWaiting, beforePublish);
 }

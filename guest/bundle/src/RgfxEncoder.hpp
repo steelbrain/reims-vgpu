@@ -50,6 +50,28 @@
 #include "RgfxRingWriter.hpp"
 #include "reims_graphics_wire.h"
 
+/// A block of the device region a command buffer's message lies in, from its queue's pool
+/// (RgfxMessageBlocks): its region offset, its CPU address and its size.
+struct RgfxMessageBlock {
+	uint64_t offset;
+	volatile uint8_t *ptr;
+	uint64_t size;
+};
+
+/// Where a command buffer's message goes once it is too large for its queue's ring: blocks of
+/// the device region, which the host reads it from (COMMAND_BUFFER_IN_REGION). In the bundle,
+/// the queue's RgfxBodyPool (RgfxUploads.h). Locked: any thread's encoder takes and gives back.
+class RgfxMessageBlocks {
+public:
+	/// A block of at least `size` bytes; false where the region has no room.
+	virtual bool take(uint64_t size, RgfxMessageBlock *block) = 0;
+	/// Takes back a block no message posted is in, or whose command buffer is done.
+	virtual void giveBack(const RgfxMessageBlock &block) = 0;
+
+protected:
+	~RgfxMessageBlocks() = default;
+};
+
 /// The kinds of render state an encoder sets that Metal gives a defined default at each
 /// encoder's start (MTLRenderCommandEncoder.h), each with the op that sets it: what a parallel
 /// pass sets back between its sub-encoders (RgfxEncoder::appendSegment). Bindings are not among
@@ -81,10 +103,12 @@ struct RgfxRenderTargetSize {
 /// at a time, between a `begin*` and `endEncoder`; the op methods are called while
 /// the matching encoder is open, as the host's walk expects (`decode::cmdbuf`).
 ///
-/// The message is written in a buffer of the builder's own, which grows by doubling. Each op
-/// takes its whole length at once (a pointer bump) and is stored with fixed-size copies. Room
-/// before the header takes the SURFACE_USE ops a commit puts first (prependSurfaceUses), so they
-/// move nothing.
+/// The message is written once, where it is posted from: a buffer of the builder's own while
+/// it fits its queue's ring, else, once it outgrows the ring, a block of the queue's region
+/// pool (setMessageBlocks), where it grows by doubling and from which the host reads it with no
+/// copy of the guest's. Each op takes its whole length at once (a pointer bump) and is stored
+/// with fixed-size copies. Room before the header takes the SURFACE_USE ops a commit puts
+/// first (prependSurfaceUses), so they move nothing.
 ///
 /// A segment (SegmentOf) is a stream of ops alone, with no header: a parallel render pass's
 /// sub-encoder writes one of its own, on its own thread, and the pass joins them into its
@@ -113,6 +137,16 @@ public:
 	~RgfxEncoder();
 	RgfxEncoder(const RgfxEncoder &) = delete;
 	RgfxEncoder &operator=(const RgfxEncoder &) = delete;
+
+	/// Where the message moves once it no longer fits the ring: `blocks`, taking a block of at
+	/// least `hint` bytes first (the queue's guess of the message's size). A message starts in
+	/// a buffer of the builder's own whatever the guess, so one that fits the ring rides it; it
+	/// is copied once, when it outgrows the ring, at most the ring's half.
+	void setMessageBlocks(std::shared_ptr<RgfxMessageBlocks> blocks, uint64_t hint)
+	{
+		m_blocks = std::move(blocks);
+		m_blockHint = hint;
+	}
 
 	// --- framing --------------------------------------------------------------
 
@@ -438,17 +472,21 @@ public:
 
 	// --- finish ---------------------------------------------------------------
 
-	/// Sets `op_bytes` and posts the command buffer on the ring, waiting for room
-	/// (RgfxRingWriter::post, `whileWaiting` called as it waits). Returns whether it
-	/// reached the ring: false, posting nothing, for a message the ring does not fit
-	/// (fitsRing()), which goes out of line with finishInRegion. On success
-	/// `*out_seqno` (when not null) holds the stamped seqno. `beforePublish` gets the seqno
-	/// before the host can see the buffer (RgfxRingWriter::tryPost), so its completion is
-	/// expected first.
+	/// Sets `op_bytes` and posts the command buffer, waiting for room
+	/// (RgfxRingWriter::post, `whileWaiting` called as it waits): on the ring where the message
+	/// fits it (fitsRing()), else as a COMMAND_BUFFER_IN_REGION naming its block, the one it was
+	/// built in, or one taken now from setMessageBlocks's pool, into which it is copied. The
+	/// block must stay the process's until the buffer completes: it goes to `*held` (when not
+	/// null) before the message is posted, whether or not the post succeeds, and its holder
+	/// gives it back to the pool then; else the builder holds it until it goes. Returns whether the message was posted: false for one no block could be had for,
+	/// or too long for a header's `size`. On success `*out_seqno` (when not null) holds the
+	/// stamped seqno, which the completion carries. `beforePublish` gets the seqno before the
+	/// host can see the buffer (RgfxRingWriter::tryPost), so its completion is expected first.
 	bool finish(uint64_t *out_seqno = nullptr, const std::function<void()> &whileWaiting = {},
-	            const std::function<void(uint64_t)> &beforePublish = {});
+	            const std::function<void(uint64_t)> &beforePublish = {},
+	            RgfxMessageBlock *held = nullptr);
 
-	/// Whether the finished message fits the ring (RgfxRingWriter::fits).
+	/// Whether the finished message goes on the ring (RgfxRingWriter::fits), not in a block.
 	bool fitsRing() const;
 
 	/// The finished message's length: the header, the op stream and the surface uses before it.
@@ -460,15 +498,8 @@ public:
 		return static_cast<size_t>(m_end - m_ops) + RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix;
 	}
 
-	/// Out of line: writes the whole COMMAND_BUFFER message (its header's `type` and `size`
-	/// stamped, `seqno` 0) to `block`, the CPU address of region offset `region_offset`, of at
-	/// least messageSize() bytes, then posts a COMMAND_BUFFER_IN_REGION naming it, waiting
-	/// for room as finish() does; its seqno is the one the completion carries. The block must
-	/// stay the process's until the buffer completes. False for a message too long for a
-	/// header's `size`.
-	bool finishInRegion(volatile uint8_t *block, uint64_t region_offset, uint64_t *out_seqno,
-	                    const std::function<void()> &whileWaiting = {},
-	                    const std::function<void(uint64_t)> &beforePublish = {});
+	/// Whether the message is being built in a block of the region pool (setMessageBlocks).
+	bool inBlock() const { return m_inBlock; }
 
 	/// The op-stream bytes appended so far (the message size less the header).
 	uint64_t opBytes() const { return static_cast<uint64_t>(m_cur - m_ops) + m_prefix; }
@@ -625,9 +656,16 @@ private:
 	// `stride` bytes at `elems`; len = 8 + head_n + count*stride.
 	void appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
 	                   uint32_t count, size_t stride);
-	// Makes room for `n` more bytes: a buffer of at least twice the size, the bytes so far
-	// copied there.
+	// Makes room for `n` more bytes: a larger buffer of the builder's own, or a block of the
+	// region pool once the message outgrows the ring, its bytes so far copied there once.
 	void grow(size_t n);
+	// Moves the bytes so far to a block of at least `size` bytes; false, nothing moved, where
+	// none was had.
+	bool moveToBlock(size_t size);
+	// Moves the bytes so far to a buffer of the builder's own of `size` bytes.
+	void moveToHeap(size_t size);
+	// Gives back the block the builder holds, if any.
+	void giveBackBlock();
 
 	struct Named {
 		const void *object;
@@ -642,14 +680,19 @@ private:
 
 	RgfxRingWriter *m_ring; // null for a segment
 	RgfxCommandBuffer m_head;
-	// The storage: a buffer of the builder's own (malloc) from m_store, m_end the end; the op
-	// stream from m_ops (kHeadroom and the header before it, none for a segment) to m_cur. The
-	// surface uses put first lie in the m_prefix bytes before m_ops.
+	// The storage: a buffer of the builder's own (malloc) or a region block (m_inBlock), from
+	// m_store, m_end the end; the op stream from m_ops (kHeadroom and the header before it,
+	// none for a segment) to m_cur. The surface uses put first lie in the m_prefix bytes
+	// before m_ops.
 	uint8_t *m_store = nullptr;
 	uint8_t *m_ops = nullptr;
 	uint8_t *m_cur = nullptr;
 	uint8_t *m_end = nullptr;
 	size_t m_prefix = 0;
+	bool m_inBlock = false;
+	RgfxMessageBlock m_block = {};
+	std::shared_ptr<RgfxMessageBlocks> m_blocks;
+	uint64_t m_blockHint = 0;
 	uint32_t m_renderStateSet = 0;
 	uint64_t m_keepStamp;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;

@@ -32,6 +32,8 @@
 #include <os/lock.h>
 #include <vector>
 
+#include "RgfxEncoder.hpp"
+
 class RgfxRegion;
 class RgfxSerializer;
 
@@ -68,20 +70,17 @@ private:
 };
 
 /// A block a command buffer too large for its queue's ring puts its message in.
-struct RgfxBodyBlock {
-	uint64_t offset;
-	volatile uint8_t *ptr;
-	uint64_t size;
-};
+using RgfxBodyBlock = RgfxMessageBlock;
 
 /// A queue's blocks for the messages of its command buffers too large for its ring: one taken
-/// at the commit, given back at the completion (the host read the message out of it before it
-/// ran the buffer), or as a buffer no completion comes for goes, and reused by the next such
-/// buffer, so the block stays the process's, and
-/// in its window, with no kext call per buffer. A block is a power of two of at least
-/// kGranule bytes; the pool keeps kKeep free ones and gives the rest back to the region, and
-/// gives back all it holds when it goes. Locked: commits and completions come on any thread.
-class RgfxBodyPool {
+/// as the message outgrows the ring (RgfxEncoder::setMessageBlocks), or at the commit, given
+/// back at the completion (the host read the message out of it before it ran the buffer), or as
+/// a buffer no completion comes for goes, and reused by the next such buffer, so the block stays
+/// the process's, and in its window, with no kext call per buffer. A block is a power of two of
+/// at least kGranule bytes; the pool keeps kKeep free ones and gives the rest back to the
+/// region, and gives back all it holds when it goes. Locked: commits and completions come on any
+/// thread.
+class RgfxBodyPool final : public RgfxMessageBlocks {
 public:
 	static constexpr uint64_t kGranule = 64 * 1024;
 	static constexpr size_t kKeep = 8;
@@ -94,9 +93,9 @@ public:
 
 	/// A free block of at least `size` bytes, made where none of its size is free. False where
 	/// the region has no room.
-	bool take(uint64_t size, RgfxBodyBlock *block);
+	bool take(uint64_t size, RgfxBodyBlock *block) override;
 	/// Takes back a block a command buffer is done with.
-	void giveBack(const RgfxBodyBlock &block);
+	void giveBack(const RgfxBodyBlock &block) override;
 	/// How many blocks the pool has made (diagnostics and tests).
 	uint64_t made() const;
 

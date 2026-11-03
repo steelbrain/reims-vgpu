@@ -863,6 +863,162 @@ void test_ring_post_waits_for_room()
 	CHECK(ring.producer() == full + sizeof(msg));
 }
 
+// Blocks of a plain buffer standing in for the device region, as a queue's pool hands them out
+// (RgfxMessageBlocks): each taken block at the next free offset, its size the next power of two
+// of at least 64 KiB, and what was given back.
+struct TestBlocks final : RgfxMessageBlocks {
+	std::vector<uint8_t> mem = std::vector<uint8_t>(0x800000, 0);
+	uint64_t next = 0;
+	std::vector<RgfxMessageBlock> taken, given;
+	bool refuse = false;
+	bool take(uint64_t size, RgfxMessageBlock *block) override
+	{
+		uint64_t bytes = 0x10000;
+		while (bytes < size)
+			bytes <<= 1;
+		if (refuse || next + bytes > mem.size())
+			return false;
+		*block = {next, mem.data() + next, bytes};
+		next += bytes;
+		taken.push_back(*block);
+		return true;
+	}
+	void giveBack(const RgfxMessageBlock &block) override { given.push_back(block); }
+};
+
+// A command buffer's message is built where it is posted from: on the ring while it fits half of
+// it, else in a block, which it moves to once as it outgrows the ring and grows from by doubling,
+// and which the COMMAND_BUFFER_IN_REGION names, the whole COMMAND_BUFFER in it; the block goes to
+// whoever holds the posted message, the ones it outgrew back to the pool. The surface uses a
+// commit puts first lead the op stream, in the order put, before every op, however many.
+void test_command_buffer_storage()
+{
+	TestRing ring(0x1000); // up to 2 KiB a message on the ring
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	auto blocks = std::make_shared<TestBlocks>();
+	auto walkOps = [](const uint8_t *ops, uint64_t n, std::vector<uint16_t> *tags,
+	                  std::vector<uint64_t> *firstWords) {
+		OpWalk walk(ops, n);
+		while (!walk.done()) {
+			uint16_t tag = 0, flags = 0;
+			uint32_t len = 0;
+			const uint8_t *body = nullptr;
+			size_t body_len = 0;
+			if (!walk.next(&tag, &flags, &len, &body, &body_len))
+				return false;
+			uint64_t w = 0;
+			if (body_len >= 8)
+				std::memcpy(&w, body, 8);
+			tags->push_back(tag);
+			firstWords->push_back(w);
+		}
+		return true;
+	};
+	auto uses = [](size_t n, uint64_t base) {
+		std::vector<RgfxOpSurfaceUse> u(n);
+		for (size_t i = 0; i < n; i++)
+			u[i].block_offset = base + i;
+		return u;
+	};
+
+	// Small, with a few uses: on the ring, the uses first, then the ops.
+	{
+		RgfxEncoder enc(writer, 1, 2);
+		enc.setMessageBlocks(blocks, 0);
+		enc.beginBlitPass();
+		enc.blitFillBuffer(9, 0, 4, 1);
+		enc.endEncoder();
+		std::vector<RgfxOpSurfaceUse> u = uses(3, 100);
+		enc.prependSurfaceUses(u.data(), 2);
+		enc.prependSurfaceUses(u.data() + 2, 1); // put later, so first
+		CHECK(!enc.inBlock());
+		uint64_t seqno = 0;
+		RgfxMessageBlock held = {};
+		CHECK(enc.finish(&seqno, {}, {}, &held) && held.ptr == nullptr);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER && h.size == bytes.size());
+		RgfxCommandBuffer cb = {};
+		std::memcpy(&cb, bytes.data(), sizeof(cb));
+		CHECK(cb.cb_obj_id == 2 && cb.op_bytes == bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET);
+		std::vector<uint16_t> tags;
+		std::vector<uint64_t> words;
+		CHECK(walkOps(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes, &tags, &words));
+		CHECK((tags == std::vector<uint16_t>{RGFX_OP_SURFACE_USE, RGFX_OP_SURFACE_USE,
+		                                      RGFX_OP_SURFACE_USE, RGFX_OP_ENCODER_BEGIN_BLIT,
+		                                      RGFX_OP_BLIT_FILL_BUFFER, RGFX_OP_ENCODER_END}));
+		CHECK(words[0] == 102 && words[1] == 100 && words[2] == 101 && words[4] == 9);
+		CHECK(blocks->taken.empty());
+	}
+
+	// Past the ring: built in a block from the op that outgrows it, grown block to block, the
+	// outgrown ones back to the pool; more uses than the room before the header move the ops.
+	{
+		RgfxEncoder enc(writer, 1, 3, 0x100);
+		enc.setMessageBlocks(blocks, 0);
+		enc.beginBlitPass();
+		int fills = 0;
+		while (!enc.inBlock()) {
+			enc.blitFillBuffer(static_cast<RgfxObjId>(fills), 0, 4, 1);
+			fills++;
+		}
+		CHECK(blocks->taken.size() == 1 && fills > 2048 / 48 && fills < 4096 / 32);
+		for (; fills < 5000; fills++) // 5000 fills of 40 bytes: 200 KB, past one 64 KiB block
+			enc.blitFillBuffer(static_cast<RgfxObjId>(fills), 0, 4, 1);
+		enc.endEncoder();
+		CHECK(blocks->taken.size() == 3 && blocks->given.size() == 2);
+		std::vector<RgfxOpSurfaceUse> u = uses(100, 1000);
+		enc.prependSurfaceUses(u.data(), u.size());
+		uint64_t seqno = 0;
+		RgfxMessageBlock held = {};
+		CHECK(enc.finish(&seqno, {}, {}, &held));
+		CHECK(held.ptr == blocks->taken.back().ptr && blocks->given.size() == 2);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+		RgfxCommandBufferInRegion ref = {};
+		std::memcpy(&ref, bytes.data(), sizeof(ref));
+		CHECK(ref.region_offset >= held.offset && ref.region_offset % 8 == 0 &&
+		      ref.region_offset + ref.byte_length <= held.offset + held.size);
+		const uint8_t *message = blocks->mem.data() + ref.region_offset;
+		RgfxCommandBuffer cb = {};
+		std::memcpy(&cb, message, sizeof(cb));
+		CHECK(cb.header.type == RGFX_CMD_COMMAND_BUFFER && cb.header.size == ref.byte_length &&
+		      cb.header.seqno == 0 && cb.cb_obj_id == 3 &&
+		      cb.op_bytes == ref.byte_length - RGFX_COMMAND_BUFFER_OPS_OFFSET);
+		std::vector<uint16_t> tags;
+		std::vector<uint64_t> words;
+		CHECK(walkOps(message + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes, &tags, &words));
+		CHECK(tags.size() == 100 + 5002);
+		bool inOrder = true;
+		for (size_t i = 0; i < 100; i++)
+			inOrder = inOrder && tags[i] == RGFX_OP_SURFACE_USE && words[i] == 1000 + i;
+		CHECK(inOrder && tags[100] == RGFX_OP_ENCODER_BEGIN_BLIT && tags.back() == RGFX_OP_ENCODER_END);
+		for (size_t i = 0; i < 5000; i++)
+			inOrder = inOrder && tags[101 + i] == RGFX_OP_BLIT_FILL_BUFFER && words[101 + i] == i;
+		CHECK(inOrder);
+	}
+
+	// Past the ring with no block to be had: built in a buffer of its own, and not posted.
+	{
+		blocks->refuse = true;
+		RgfxEncoder enc(writer, 1, 4);
+		enc.setMessageBlocks(blocks, 0);
+		enc.beginBlitPass();
+		for (int i = 0; i < 200; i++)
+			enc.blitFillBuffer(9, 0, 4, 1);
+		enc.endEncoder();
+		CHECK(!enc.inBlock() && enc.messageSize() > 2048);
+		RgfxMessageBlock held = {};
+		CHECK(!enc.finish(nullptr, {}, {}, &held) && held.ptr == nullptr);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(!ring.next(&h, &bytes));
+		blocks->refuse = false;
+	}
+}
+
 // A pass's sample positions follow its colour records, and its flag says so; a pass without
 // them carries none, whatever flag its description held. The depth store action options are
 // one op.
@@ -1837,6 +1993,7 @@ int main()
 	test_ring_wrap_and_no_room();
 	test_ring_post_waits_for_room();
 	test_command_buffer_encoder();
+	test_command_buffer_storage();
 	test_video_command_buffer();
 	test_render_pass_sample_positions();
 	test_forwarded_lifecycle();

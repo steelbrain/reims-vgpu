@@ -49,6 +49,7 @@
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxUnsupported.h"
+#import "RgfxUploads.h"
 
 #include "RgfxHeapSizes.hpp"
 
@@ -4361,8 +4362,9 @@ void test_resource_ids()
 }
 
 // A queue's command buffers start their messages with room for the largest of its recent ones:
-// a commit's size raises the queue's reserve, each smaller one takes an eighth off it, and its
-// ring's size bounds it. A message made with a reserve has that room before its first op.
+// a commit's size raises the queue's reserve, each smaller one takes an eighth off it, and one
+// too large for the ring raises it too, for the block the next such message moves to. A message
+// made with a reserve has that room before its first op, up to what its ring takes.
 void test_message_reserve()
 {
 	QueueFixture f;
@@ -4397,10 +4399,10 @@ void test_message_reserve()
 		(void)commit(1);
 		CHECK(f.queue.rgfxMessageReserve == once - once / 8);
 		CHECK(commit(250) > large && f.queue.rgfxMessageReserve > large);
-		// One too large for the ring, here with no region to go to, sizes the next at the
-		// ring's size.
+		// One too large for the ring, here with no region to go to, sizes the next at its own
+		// size.
 		CHECK(commit(3000) == 0);
-		CHECK(f.queue.rgfxMessageReserve == f.submitWriter.dataSize());
+		CHECK(f.queue.rgfxMessageReserve > f.submitWriter.dataSize());
 
 		RgfxEncoder reserved(f.submitWriter, 1, 2, 0x1800);
 		CHECK(reserved.capacity() >= 0x1800 && reserved.messageSize() == RGFX_COMMAND_BUFFER_OPS_OFFSET);
@@ -5176,8 +5178,10 @@ void test_command_buffer_out_of_line()
 	CHECK(h.size == sizeof(RgfxCommandBufferInRegion));
 	RgfxCommandBufferInRegion ref = {};
 	std::memcpy(&ref, bytes.data(), sizeof(ref));
-	CHECK(blocks.allocated.size() == 1 && ref.region_offset == blocks.allocated[0]);
-	CHECK(ref.byte_length > 2048 && ref.byte_length % 8 == 0);
+	// Built in the block once it outgrew the ring, after the room a commit's surface uses take.
+	CHECK(blocks.allocated.size() == 1 && ref.region_offset > blocks.allocated[0] &&
+	      ref.region_offset + ref.byte_length <= blocks.allocated[0] + RgfxBodyPool::kGranule);
+	CHECK(ref.byte_length > 2048 && ref.byte_length % 8 == 0 && ref.region_offset % 8 == 0);
 
 	// The block holds the whole message: a COMMAND_BUFFER of that length, seqno 0, its ops.
 	RgfxCommandBuffer body = {};

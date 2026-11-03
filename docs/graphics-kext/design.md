@@ -1189,11 +1189,20 @@ opens the `Platform` command buffer and walks the ops:
   it as it takes the buffer, before its other ops.
 
 A command buffer too large for half its queue's submission ring goes out of
-line: the bundle writes the whole `COMMAND_BUFFER` message into a block of the
-process's own and posts a `COMMAND_BUFFER_IN_REGION` (region offset and
-length) on the ring. The queue's service thread copies the message out of the
-block once, as it does a ring's, with the reference's seqno, and the bundle
-gives the block back when the buffer completes. Metal sets no maximum size, so
+line: the whole `COMMAND_BUFFER` message lies in a block of the process's own,
+from its queue's pool, and the ring carries a `COMMAND_BUFFER_IN_REGION`
+(region offset and length).
+- The bundle builds the message on its own heap while it fits half the ring.
+- When it outgrows that, the message moves once into a block as large as the
+  queue's recent largest message, and doubles from block to block after that.
+- The header and the commit's `SURFACE_USE` ops go into room kept before the
+  ops, so the commit posts the block with no copy.
+
+The queue's service thread copies the message out of the block once, as it
+does a ring's, with the reference's seqno, and the bundle gives the block back
+when the buffer completes. Encoders do not stream as they end yet (Decided 3):
+that needs a command buffer in several messages, which the wire does not
+have. The whole buffer goes at its commit. Metal sets no maximum size, so
 nothing is refused for size. A queue holds `maxCommandBufferCount` buffers
 (64 by default) alive and not completed. `-commandBuffer` blocks past that, as
 Metal's does, which keeps the ring from filling in the common case. A commit

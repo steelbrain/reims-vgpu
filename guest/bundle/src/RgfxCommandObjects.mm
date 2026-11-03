@@ -687,7 +687,7 @@ struct RgfxBarrierSlot {
 {
 	const uint32_t was = _messageReserve.load(std::memory_order_relaxed);
 	const uint64_t next = std::max<uint64_t>(bytes, was - was / 8);
-	_messageReserve.store(static_cast<uint32_t>(std::min<uint64_t>(next, _submitRing->dataSize())),
+	_messageReserve.store(static_cast<uint32_t>(std::min<uint64_t>(next, UINT32_MAX)),
 	                      std::memory_order_relaxed);
 }
 
@@ -1210,7 +1210,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
-		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, queue.rgfxMessageReserve);
+		const uint32_t reserve = queue.rgfxMessageReserve;
+		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, reserve);
+		// Past its ring, the message is built in a block of the queue's pool, the size of the
+		// queue's recent largest first.
+		cb->_encoder->setMessageBlocks([queue rgfxBodyPool], reserve);
 		// One with unretained references keeps them too, though it answers retainedReferences
 		// NO: the host must not drop an object before a buffer that names it has run.
 		cb->_encoder->setKeeper(&rgfxKeep, &cb->_kept);
@@ -1519,21 +1523,16 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	}
 
 	// Post the command buffer on the queue's submission ring, waiting for room; one too
-	// large for the ring goes in a block of the process's own, which the ring names. Its size
-	// sizes the queue's next messages first.
-	[queue rgfxNoteMessageBytes:_encoder->messageSize()];
-	bool posted = false;
-	if (_encoder->fitsRing()) {
-		posted = _encoder->finish(&_seqno, whileWaiting, expect);
-	} else if (std::shared_ptr<RgfxBodyPool> pool = [queue rgfxBodyPool]) {
-		RgfxBodyBlock block = {};
-		if (pool->take(_encoder->messageSize(), &block)) {
-			_bodyPool = pool;
-			_body = block;
-			posted = _encoder->finishInRegion(block.ptr, block.offset, &_seqno, whileWaiting,
-			                                  expect);
-		}
-	}
+	// large for the ring lies in a block of the queue's pool, which the ring names, held until
+	// it completes. Its size sizes the queue's next messages first.
+	// The block is the buffer's before the host can see it: its completion may come before the
+	// post returns.
+	const uint64_t messageBytes = _encoder->messageSize();
+	[queue rgfxNoteMessageBytes:messageBytes];
+	const bool outOfLine = !_encoder->fitsRing();
+	if (outOfLine)
+		_bodyPool = [queue rgfxBodyPool];
+	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
 	// A present of a surface it writes, made after this commit, waits for it on the host.
 	if (posted && !written.empty())
 		rgfxIOSurfaceNoteCommitted(written, queue, queue.rgfxObjId, _seqno);
@@ -1551,8 +1550,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		// handlers run off the committing thread.
 		NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
 		      @"with MTLCommandBufferErrorOutOfMemory",
-		      (unsigned long long)[self rgfxObjId],
-		      (unsigned long long)_encoder->messageSize());
+		      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
 		RgfxCbComplete failed = {};
 		failed.header.type = RGFX_EVT_CB_COMPLETE;
 		failed.cb_obj_id = [self rgfxObjId];

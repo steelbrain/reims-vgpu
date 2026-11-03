@@ -115,10 +115,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// returns at the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
 @property(nonatomic) BOOL asksSubmitted;
 
-/// The bytes a new command buffer's message has room for before it grows (RgfxEncoder): the
+/// The bytes the queue guesses a new command buffer's message takes (RgfxEncoder): the
 /// largest of the queue's recent messages, as its command buffers committed them. Each smaller
-/// one takes an eighth off, so one large buffer does not hold it; the queue's submission ring's
-/// size at most. 0 before the first commit.
+/// one takes an eighth off, so one large buffer does not hold it. A message has room for it
+/// before it grows, up to the size its ring takes; past that, the block of the queue's pool it
+/// moves to has room for it. 0 before the first commit.
 @property(nonatomic, readonly) uint32_t rgfxMessageReserve;
 
 /// The most command buffers of this queue alive and not completed at once:

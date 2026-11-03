@@ -137,6 +137,8 @@ bool RgfxBodyPool::take(uint64_t size, RgfxBodyBlock *block)
 
 void RgfxBodyPool::giveBack(const RgfxBodyBlock &block)
 {
+	if (block.ptr == nullptr)
+		return; // none was had: a buffer whose message found no block
 	{
 		std::lock_guard<std::mutex> hold(m_lock);
 		if (m_free.size() < kKeep) {
