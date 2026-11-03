@@ -70,6 +70,7 @@ use crate::entry;
 use crate::error::Error;
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
+use crate::graphics::decode::worker::{Unsettled, Worker};
 use crate::graphics::decode::{
     CompletionSink, DecodeError, Decoders, FailedContexts, GraphicsDecoder, LibraryJob,
     LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, Sinks,
@@ -260,6 +261,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 presented,
                 pool,
                 pending: Pending::default(),
+                icb_worker: Worker::new("reims-vgpu.icb-create"),
+                icbs: Arc::default(),
                 reset_gate: Arc::default(),
             });
             let host = Box::new(CallbackHost {
@@ -375,6 +378,14 @@ struct GraphicsControl<P: ApiPlatform> {
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
+    /// The thread ring 0's `ICB_CREATE`s are made on, in ring order, off the control thread: the
+    /// platform's make of a large buffer can take seconds (measured: about 24 s near 11.7 million
+    /// commands on the Vulkan runtime on an RTX 5080), which would hold every process's control
+    /// messages ([`Self::start_icb`]).
+    icb_worker: Worker,
+    /// The indirect command buffers whose create was handed to [`Self::icb_worker`] and is not
+    /// yet answered, by object id.
+    icbs: Arc<Unsettled>,
     /// The decoder's failed contexts, which the device asks of at a `QUEUE_CREATE`
     /// (`Host::context_refused`).
     failed: Arc<FailedContexts>,
@@ -686,8 +697,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ///
     /// A pipeline or library create is made on the compile pool instead
     /// ([`Self::start_pipeline`], [`Self::start_library`]), and a command buffer that names a
-    /// pipeline still compiling waits for it first (`compile`). A library lookup is answered here
-    /// ([`Self::lookup_library`]).
+    /// pipeline still compiling waits for it first (`compile`). An indirect command buffer's
+    /// create is made on the ICB thread ([`Self::start_icb`]), and the destroy of one still being
+    /// made waits for it. A library lookup is answered here ([`Self::lookup_library`]).
     fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
         match r#type {
@@ -716,11 +728,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 return;
             }
             RGFX_CMD_ICB_CREATE => {
-                self.create_icb(poster, message);
+                self.start_icb(poster, message);
                 return;
             }
             RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
             RGFX_CMD_ICB_WRITE => self.pending.wait_for_icb_write(message),
+            // The destroy of an indirect command buffer still being made (the kext destroys
+            // behind a create it stopped waiting for, after a minute, or one made for a context
+            // that had closed) waits for its create, so it and everything after it keep their
+            // places in ring order.
+            RGFX_CMD_OBJECT_DESTROY => self.icbs.wait(message_identity(message).2),
             _ => {}
         }
         entry::run(|_| {
@@ -1086,8 +1103,41 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         poster.post(answer.as_bytes());
     }
 
-    /// An indirect command buffer's create from ring 0, answered at once through `poster` with
-    /// its `gpuResourceID` (`ICB_STATE`), which the guest's buffer answers and its argument
+    /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB thread
+    /// ([`Self::create_icb`]), so ring 0 goes on meanwhile. Its answer goes through `poster`
+    /// before it settles. Nothing of the guest's names the buffer before that answer: the bundle
+    /// waits for it, for the buffer's `gpuResourceID`, before it hands the buffer out. So only the
+    /// kext's destroy behind a create it stopped waiting for can name it while it is made, and
+    /// that destroy waits for it ([`Self::handle_stage3`]). Made under the reset gate, held shared
+    /// (recursively, as for the surface worker's jobs); where the device was reset since its
+    /// begin, nothing is made and nothing answered.
+    fn start_icb(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+        let (_, seqno, obj_id) = message_identity(message);
+        // The poster's epoch says whether the device was reset since: the settle's count of
+        // resets is not read.
+        let settle = self.icbs.begin(obj_id, 0, self.pool.now());
+        let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
+        self.icb_worker.submit(Box::new(move || {
+            {
+                let _carried = me.reset_gate.read_recursive();
+                if !poster.stale() {
+                    me.create_icb(&poster, &message);
+                }
+            }
+            log::debug!(
+                target: "reims_vgpu::graphics::icb",
+                "ICB_CREATE (seqno {seqno}, object {obj_id:#x}) answered {} us after its begin",
+                me.pool
+                    .now()
+                    .saturating_duration_since(settle.begun)
+                    .as_micros()
+            );
+            drop(settle);
+        }));
+    }
+
+    /// An indirect command buffer's create from ring 0, on the ICB thread ([`Self::start_icb`]),
+    /// answered through `poster` with its `gpuResourceID` (`ICB_STATE`), which the guest's buffer answers and its argument
     /// buffers hold, so a kernel encoding through one reaches this buffer: the id the platform
     /// numbers it by. The buffer is stored under its id before the answer. A create the platform
     /// raises at is answered refused, as one it refuses.

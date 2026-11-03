@@ -150,9 +150,10 @@ mod tables;
 mod video;
 mod view;
 mod waits;
-// Its users, the ring-0 messages carried out off the control thread, come after it.
+// Of its members, ICB_CREATE uses the worker, its settles and their waits; the users of the
+// rest, the surface pages' messages, come after it.
 #[allow(dead_code)]
-mod worker;
+pub(crate) mod worker;
 
 pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
 

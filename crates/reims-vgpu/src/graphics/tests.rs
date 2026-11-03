@@ -4830,3 +4830,107 @@ fn an_icb_is_made_written_and_executed_through_the_rings() {
             < at("executeCommandsInBuffer:withRange:")
     );
 }
+
+/// A headless device whose guest took indirect command buffers, ready.
+fn icb_device(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
+    let (device, platform) = headless_on(raised);
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_LO.into(),
+        RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    (device, platform)
+}
+
+/// An `ICB_CREATE` of 4 dispatches, one kernel buffer bound, as indirect command buffer `obj_id`.
+fn icb_create(obj_id: u64) -> Vec<u8> {
+    RgfxIcbCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_ICB_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        max_command_count: 4,
+        command_types: 0x20,
+        max_kernel_buffer_bind_count: 1,
+        ..RgfxIcbCreate::default()
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A display command behind an `ICB_CREATE` on ring 0 is answered while the buffer is made, off
+/// the control thread, and the create is answered at its seqno after
+#[test]
+fn a_display_command_behind_a_slow_icb_create_is_answered() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = icb_device(&raised);
+    let mut guest = Guest::new(&device);
+    device.control.icb_worker.hold();
+    guest.send(&device, icb_create(obj(1, 50)));
+    let create = guest.seqno;
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let displays = next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&displays).unwrap();
+    assert_eq!(header.seqno, guest.seqno);
+
+    device.control.icb_worker.release();
+    let bytes = next_event(&mut guest, RGFX_EVT_ICB_STATE);
+    let state = RgfxIcbState::read_from_bytes(&bytes).unwrap();
+    assert_eq!((state.header.seqno, state.status), (create, RGFX_STATUS_OK));
+    assert_ne!(state.gpu_resource_id, 0);
+}
+
+/// An `OBJECT_DESTROY` of an indirect command buffer still being made (the kext's destroy behind
+/// a create it stopped waiting for) waits for the create, and the messages after it wait with it:
+/// the create is answered first, then the display command behind the destroy, and the buffer is
+/// not kept
+#[test]
+fn a_destroy_of_an_icb_being_made_waits_for_its_create() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = icb_device(&raised);
+    let mut guest = Guest::new(&device);
+    let before = device.decoder_object_count();
+    device.control.icb_worker.hold();
+    guest.send(&device, icb_create(obj(1, 50)));
+    let create = guest.seqno;
+    guest.send(&device, object_destroy(obj(1, 50)));
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let displays = guest.seqno;
+    // The worker goes on a while later, from another thread: the display command behind the
+    // destroy is not answered before the create.
+    let control = Arc::clone(&device.control);
+    let opener = std::thread::Builder::new()
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            control.icb_worker.release();
+        })
+        .unwrap();
+    let bytes = next_event(&mut guest, RGFX_EVT_ICB_STATE);
+    let state = RgfxIcbState::read_from_bytes(&bytes).unwrap();
+    assert_eq!((state.header.seqno, state.status), (create, RGFX_STATUS_OK));
+    let bytes = next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
+    assert_eq!(header.seqno, displays);
+    opener.join().unwrap();
+    assert_eq!(device.decoder_object_count(), before);
+}
