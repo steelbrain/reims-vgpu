@@ -136,10 +136,23 @@ UInt64 rgfxSurfaceCacheNoRoom();
 // with `releasing`), retained for the caller, who releases it; `*written` where a buffer wrote
 // its cache since its last copy. Null where no cached surface is releasing the block.
 OSObject *rgfxSurfaceCacheReleasingSurface(UInt64 offset, bool *written);
+// What a cached surface held for its block's release, taken out by rgfxSurfaceCacheReleased: its
+// header's mapping, its device cache's reference, the surface's and its memory's wiring.
+struct RgfxReleasedSurface {
+	void *map;
+	void *cache;
+	void *surface;
+	void *wire;
+};
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
-// cached no more, its locks go on, and its device cache is released, then the surface, then its
-// memory unwired.
-void rgfxSurfaceCacheReleased(UInt64 offset);
+// cached no more and its locks go on, what it held in `*gone`, for the caller to let go with
+// rgfxSurfaceCacheLetGo out of the contexts' lock (all null where none was releasing the block).
+// Takes the locks' lock alone, so the caller may hold the contexts' lock.
+void rgfxSurfaceCacheReleased(UInt64 offset, RgfxReleasedSurface *gone);
+// Lets go of what rgfxSurfaceCacheReleased took out: the mapping, the device cache's reference,
+// then the surface's, then the memory's wiring. Under none of the kext's locks: a release may
+// free the cache or the surface, which call back into the kext.
+void rgfxSurfaceCacheLetGo(const RgfxReleasedSurface &gone);
 // The CPU generation of the cached surface of IOSurfaceID `surfaceId`, for a present of it;
 // false where it is not cached.
 bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen);

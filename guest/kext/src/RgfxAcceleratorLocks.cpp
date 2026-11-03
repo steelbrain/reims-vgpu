@@ -466,27 +466,31 @@ UInt64 rgfxSurfaceCacheNoRoom()
 	return n;
 }
 
-void rgfxSurfaceCacheReleased(UInt64 offset)
+void rgfxSurfaceCacheReleased(UInt64 offset, RgfxReleasedSurface *gone)
 {
+	*gone = {};
 	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		return;
-	void *map = nullptr, *wire = nullptr, *surface = nullptr;
 	IOLockLock(state.lock);
 	// One cached surface at most has the block: its offset is reused only past this release.
-	OSObject *cache = reinterpret_cast<OSObject *>(
-	    static_cast<uintptr_t>(rgfxCacheReleased(state.caches, offset, &map, &wire, &surface)));
-	if (cache)
+	gone->cache = reinterpret_cast<void *>(static_cast<uintptr_t>(
+	    rgfxCacheReleased(state.caches, offset, &gone->map, &gone->wire, &gone->surface)));
+	if (gone->cache)
 		wakeLocked();
 	IOLockUnlock(state.lock);
-	if (map)
-		static_cast<IOMemoryMap *>(map)->release();
+}
+
+void rgfxSurfaceCacheLetGo(const RgfxReleasedSurface &gone)
+{
+	if (gone.map)
+		static_cast<IOMemoryMap *>(gone.map)->release();
 	// The cache's reference and the surface's, held for the answer (rgfxSurfaceLocksForget), in
 	// that order; then the surface's memory is unwired.
-	if (cache)
-		cache->release();
-	if (surface)
-		static_cast<OSObject *>(surface)->release();
-	unwireSurface(wire);
+	if (gone.cache)
+		static_cast<OSObject *>(gone.cache)->release();
+	if (gone.surface)
+		static_cast<OSObject *>(gone.surface)->release();
+	unwireSurface(gone.wire);
 }
 
 OSObject *rgfxSurfaceCacheReleasingSurface(UInt64 offset, bool *written)

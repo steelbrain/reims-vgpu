@@ -286,9 +286,11 @@ void finishRelease(const RgfxReleaseEntry &e, bool answered)
 	// block's surface keeps them, its locks waiting, for the release posted again: the device
 	// copies the cache into the pages at that release's answer. Only while the block is still
 	// this release's: a pages block its owner's answered close took may have given its offset to
-	// another block since, whose own release holds its surface.
+	// another block since, whose own release holds its surface. What it held goes out of the
+	// lock.
+	RgfxReleasedSurface gone = {};
 	if (ok && rgfxBlockReleasingAt(blockTable, e.offset, e.serial))
-		rgfxSurfaceCacheReleased(e.offset);
+		rgfxSurfaceCacheReleased(e.offset, &gone);
 	if (e.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
 		dormantStats.unread++;
 		dormantStats.unreadWritten += e.written;
@@ -302,7 +304,8 @@ void finishRelease(const RgfxReleaseEntry &e, bool answered)
 	IOLockWakeup(contextLock, &surfaceTable, false);
 	IOLockUnlock(contextLock);
 	// The device no longer maps an in-place block's pages once it has answered OK: unwire them,
-	// out of the lock.
+	// and let go of its surface, out of the lock.
+	rgfxSurfaceCacheLetGo(gone);
 	unwire(wired);
 	if (!ok)
 		IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
