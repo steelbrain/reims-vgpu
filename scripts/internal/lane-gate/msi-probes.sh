@@ -33,6 +33,14 @@
 #   out/            what run.sh left in its directory's out/, copied back
 #   probe/          the probe as it was dropped
 #   shots.txt       where it asked for screenshots (below): "EPOCH LABEL" each, or why none came
+#   hang/           where it failed and the guest's SSH no longer answers: msi-hang.py's snapshot
+#                   of the guest, taken before QEMU is stopped (QEMU's threads, every vCPU's
+#                   registers and stack, the scanout; the scanout alone where the hang catcher
+#                   below took the rest); the probes after it are not reached (they go back to
+#                   the queue)
+# The hang catcher (HANG_CATCH, default ~/.cache/s1-hang-msi/hang-catch.py, where it is there)
+# watches the boot while the probes run and writes R/hang/ (watch.txt, guest-info.txt, catch-N/ at
+# a hang: its docstring says what); the round waits for a catch it started before QEMU stops.
 # run.sh gets PROBE_NAME and PROBE_PASS (the guest user's password, for sudo) in its environment.
 # Screenshots: a probe whose directory holds a file named shots may ask for the guest's own
 # screenshot, which screencapture over SSH cannot take (no Screen Recording grant): run.sh runs
@@ -53,6 +61,10 @@ else
   Gput() { sshpass -p "$GUEST_PASS" scp -q -r -P "$PORT" "${SOPTS[@]}" "$1" "$GUEST_USER@127.0.0.1:$2"; }
   Gget() { sshpass -p "$GUEST_PASS" scp -q -r -P "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1:$1" "$2"; }
 fi
+# Whether the guest's SSH answers (twice ConnectTimeout, which bounds the banner's exchange too).
+alive() {
+  timeout 20 sshpass -p "$GUEST_PASS" ssh -p "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" true < /dev/null 2> /dev/null
+}
 iso() { date -d "@$1" +%Y-%m-%dT%H:%M:%S.%3N 2> /dev/null || date -r "${1%.*}" +%Y-%m-%dT%H:%M:%S.000; }
 now() { date +%s.%N 2> /dev/null | cut -c1-14; }
 # The tips match where one names the other (a short sha and the full one).
@@ -126,7 +138,26 @@ shots() {
     fi
   done
 }
-settled=0
+settled=0 hung= HC=
+HANG_CATCH=${HANG_CATCH:-$HOME/.cache/s1-hang-msi/hang-catch.py}
+if [[ -z ${FAKE_GUEST:-} && -f $HANG_CATCH && -n ${QEMU_PID:-} && -n ${R:-} ]]; then
+  mkdir -p "$R/hang"
+  python3 -I "$HANG_CATCH" --boot-dir "$B" --pid "$QEMU_PID" --port "$PORT" --out "$R/hang" \
+    --user "$GUEST_USER" --password "$GUEST_PASS" > "$R/hang.log" 2>&1 &
+  HC=$!
+  log "the hang catcher: $HANG_CATCH ($(sha256sum "$HANG_CATCH" | cut -c1-12)), pid $HC, into $R/hang"
+fi
+# Waits while the catcher's catch is under way (a HANG line with no "catch N written" after it),
+# 150 s at most; with an argument, first up to that many seconds for its HANG line.
+catch_wait() {
+  [[ -n $HC ]] || return 0
+  local w=$R/hang/watch.txt i
+  for (( i = 0; i < ${1:-0}; i++ )); do grep -q HANG "$w" 2> /dev/null && break; sleep 1; done
+  for (( i = 0; i < 150; i++ )); do
+    awk '/HANG/ { h = 1 } /catch [0-9]+ written/ { h = 0 } END { exit !h }' "$w" 2> /dev/null || return 0
+    sleep 1
+  done
+}
 in_order() {  # the probes' directories, in .order's order where it is there
   if [[ -s $PROBES/.order ]]; then
     while read -r n; do [[ -n $n && -d $PROBES/$n ]] && echo "$PROBES/$n/"; done < "$PROBES/.order"
@@ -149,6 +180,8 @@ for p in $(in_order); do
     echo "skipped: budget '${budget:-none}' is not 1 to 180 s" > "$out/status"
   elif ! same_tip "$tip" "$PROBE_TIP"; then
     echo "skipped: valid for ${tip:-no tip}, and the published tip is $PROBE_TIP" > "$out/status"
+  elif [[ -n $hung ]]; then
+    echo "not reached: the guest stopped answering SSH in $hung" > "$out/status"
   elif (( $(date +%s) + budget + 30 > DEADLINE )); then
     echo "not reached: the hold had $(( DEADLINE - $(date +%s) )) s left for a ${budget} s budget" > "$out/status"
   else
@@ -179,7 +212,16 @@ for p in $(in_order); do
     echo "$start" > "$out/start"
     echo "$end" > "$out/end"
     awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f\n", b - a }' > "$out/wall_s"
-    G "test -d ~/probes/$name/out" 2> /dev/null && Gget "probes/$name/out" "$out/out" 2> /dev/null
+    # A probe that failed where the guest's SSH no longer answers: the guest's state, now.
+    if [[ $(cat "$out/rc") != 0 && -z ${FAKE_GUEST:-} ]] && ! alive && ! alive; then
+      hung=$name
+      log "$name: the guest's SSH no longer answers: the hang snapshot"
+      catch_wait 45
+      python3 -I "$(dirname "$0")/msi-hang.py" "${QEMU_PID:-0}" "$B" "$out/hang" "$([[ -n $HC ]] && echo scanout)" > /dev/null 2>&1
+      sed 's/^/  hang: /' "$out/hang/hang.log" 2> /dev/null
+    else
+      G "test -d ~/probes/$name/out" 2> /dev/null && Gget "probes/$name/out" "$out/out" 2> /dev/null
+    fi
     if [[ -n ${B:-} && -f $B/launch.log ]]; then
       awk -v a="$(iso "$start")" -v b="$(iso "$end")" '
         /^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { t = substr($1, 1, 23); keep = t >= a && t <= b }
@@ -198,4 +240,9 @@ for p in $(in_order); do
   cp -R "$p" "$out/probe"
   [[ $(cat "$out/status") == ran ]] || log "$name: $(cat "$out/status")"
 done
+if [[ -n $HC ]]; then
+  catch_wait
+  kill "$HC" 2> /dev/null
+  grep -E 'HANG|catch [0-9]+ written' "$R/hang/watch.txt" 2> /dev/null | sed 's/^/  hang catcher: /'
+fi
 exit 0

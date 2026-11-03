@@ -22,7 +22,7 @@
 # wall_s, host.log, gpu-clocks.txt, out/, status), and the probe leaves the queue once it ran or
 # was skipped. One not reached in a round's hold stays queued for the next.
 #
-#   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--hold S]
+#   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...] [--hold S]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -35,14 +35,15 @@
 # the guest's screenshots and the kext's log of the boot, in the round's capture/), the host's log
 # at info,reims_graphics=trace,reims_vgpu::graphics=debug; a round with --capture runs with no
 # probe too. --first NAME,... has the round consider those probes first, in that order, before the
-# others oldest first; --hold S sets the round's hold (config.sh's HOLD_S) for this round. --list shows the
+# others oldest first, and --only NAME,... takes those alone, in that order; --hold S sets the
+# round's hold (config.sh's HOLD_S) for this round. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
 # with three example probes, one of them for another tip.
 set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
-force=0 list=0 dry=0 capture=0 want_tip= first= hold=
+force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0
 while (($#)); do
   a=$1
   shift
@@ -51,6 +52,7 @@ while (($#)); do
     --capture) capture=1 force=1 ;;
     --tip) want_tip=${1:?--tip SHA}; shift ;;
     --first) first=${1:?--first NAME,...}; shift ;;
+    --only) first=${1:?--only NAME,...} only=1; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
@@ -105,14 +107,16 @@ RES=$MSI_RGK_RUN/probe-results
 queue=$(msi "mkdir -p '$Q' '$RES'; cd '$Q' && now=\$(date +%s) && for d in */; do d=\${d%/}; [ -d \"\$d\" ] || continue
   m=\$(stat -c %Y \"\$d\" 2> /dev/null || stat -f %m \"\$d\"); echo \"\$((now - m)) \$(tr -dc 0-9 < \"\$d/budget\" 2> /dev/null || true) \$(tr -dc 0-9a-f < \"\$d/tip\" 2> /dev/null || true) \$d\"
   done | sort -rn")
+queue_all=$queue
 if [[ -n $first ]]; then  # --first: those probes first, in the order given
   IFS=, read -r -a firsts <<< "$first"
   head_=$(for f in "${firsts[@]}"; do awk -v f="$f" '$4 == f' <<< "$queue"; done)
   rest_=$(awk -v l="$first" 'BEGIN { n = split(l, a, ","); for (i = 1; i <= n; i++) s[a[i]] = 1 } !($4 in s)' <<< "$queue")
+  ((only)) && rest_=
   queue=$(printf '%s\n%s\n' "$head_" "$rest_" | sed '/^$/d')
 fi
-n=$(printf '%s' "$queue" | grep -c . || true)
-oldest=$(printf '%s\n' "$queue" | awk '$1 + 0 > m { m = $1 + 0 } END { print m + 0 }')
+n=$(printf '%s' "$queue_all" | grep -c . || true)
+oldest=$(printf '%s\n' "$queue_all" | awk '$1 + 0 > m { m = $1 + 0 } END { print m + 0 }')
 # The published tips: the newest (published-last), and those whose image and host the lane host
 # still has. A probe's tip resolves to one of them by its first 9 characters.
 pubs=$(msi "cd '$MSI_RGK_RUN' && for d in tip-host/*/; do d=\${d%/}; s=\${d#tip-host/}
@@ -173,6 +177,7 @@ msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take
 put "$L/msi-probes.sh" "$RD/bin/"
 put "$L/msi-xid.sh" "$RD/bin/"
 put "$L/msi-capture.py" "$RD/bin/"
+put "$L/msi-hang.py" "$RD/bin/"
 if ((dry)); then
   msi "PROBES='$RD/probes' PROBE_RESULTS='$RES' PROBE_TIP='$PUB' DEADLINE=$(( $(date +%s) + HOLD_S )) FAKE_GUEST='$D/guest' \
     R='$RD' bash '$RD/bin/msi-probes.sh'"

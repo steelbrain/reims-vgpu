@@ -457,6 +457,10 @@ done
 ((copied)) || { copy_failed_state; log "BOOT_FAIL copying the payload into the guest"; exit 6; }
 kv payload_tries "$try"
 log "payload copied"
+# The kext's load address, for a hang snapshot's registers and stacks (msi-hang.py) to be read
+# against.
+G "kmutil showloaded --list-only 2> /dev/null | grep -i -E 'reims|rgfx'; true" > "$R/kext-load.txt" 2>&1 || true
+log "kext loaded: $(tr -s ' ' < "$R/kext-load.txt" | tr '\n' ';' | cut -c1-300)"
 
 # RgfxGate installs the bundle at the first boot, and the accelerator registers for it the same
 # boot: a Metal device that is not ours here is a failure (the run goes on after one reboot).
