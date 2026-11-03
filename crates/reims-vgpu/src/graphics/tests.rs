@@ -3701,6 +3701,12 @@ fn a_completion_the_platform_refuses_fails_its_context() {
             RGFX_STATUS_OK
         );
     }
+    // Each queue's handle is made on its own service thread, which may start after its create is
+    // answered: both are made before the counts below.
+    assert!(
+        holds_objects(&device, 2),
+        "the two queues' handles were not made"
+    );
     let mut ring3 = QueueRing::new(&device, SUBMIT_3, COMPLETE_3, u64::from(RING_DATA));
     let mut ring4 = QueueRing::new(&device, SUBMIT_4, COMPLETE_4, u64::from(RING_DATA));
     guest.send(&device, event_create(obj(3, 5)));
@@ -4406,6 +4412,18 @@ fn a_reset_drops_every_object_the_guest_made() {
     let again = world.live("MTLTexture")[textures_before..].to_vec();
     assert_eq!(again.len(), 1);
     assert_ne!(again, texture, "a texture of its own");
+}
+
+/// Waits about 2 s for the decoder to hold `n` objects; whether it came to. A queue's handle is
+/// made on its service thread, which may start after the queue's create is answered.
+fn holds_objects(device: &GraphicsDevice<FakePlatform>, n: usize) -> bool {
+    for _ in 0..2000 {
+        if device.decoder_object_count() == n {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
 }
 
 /// Waits about 2 s for the decoder's reset, on the control thread, to have dropped every object
