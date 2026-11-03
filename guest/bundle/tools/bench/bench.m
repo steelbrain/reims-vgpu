@@ -1,7 +1,7 @@
 // bench: a GPU-heavy benchmark of the Metal device, to compare a guest's GPU lane with another
 // lane on the same host, and with real Macs. Every case warms up first, then runs REPS
 // repetitions and prints the median of each number (and the spread of the first).
-//   bench [-d NAME] [-r REPS] [-m SECONDS] [-i ITERS] [-t SECONDS] [-l] [CASE...]
+//   bench [-d NAME] [-r REPS] [-m SECONDS] [-i ITERS] [-t SECONDS] [-v] [-l] [CASE...]
 //     -d NAME     the first of MTLCopyAllDevices whose name holds NAME; the default is
 //                 MTLCreateSystemDefaultDevice (which, on a dual-GPU MacBook, switches the
 //                 display to the discrete GPU: pass -d there).
@@ -10,6 +10,8 @@
 //                 a sampler of the host's CPU and GPU to see each case.
 //     -i ITERS    the heavy fragment shader's loop count (default 256).
 //     -t SECONDS  how long `onscreen` animates (default 20).
+//     -v          a "# rep" line for each repetition of the frame cases (frag.*): when it
+//                 started, its frames (one command buffer each) and their rate.
 //     -l          lists the devices and exits.
 //     CASE        runs only the cases whose name holds one of these; with none, every case
 //                 but `onscreen`, which needs the logged-in user's window server session.
@@ -63,6 +65,9 @@ static double gSeconds = 20;
 static double gWall;
 // -m: the least time a case's repetitions take; when the case started.
 static double gMinSeconds, gCaseStart;
+// -v: a line a repetition of the frame cases; the case running.
+static BOOL gVerbose;
+static NSString *gCaseName;
 
 static NSString *const kShaders = @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
@@ -244,6 +249,7 @@ static void runCase(NSString *name, BOOL byDefault, NSString * (^body)(void))
 	fflush(stdout);
 	const double t0 = now();
 	gCaseStart = t0;
+	gCaseName = name;
 	NSString *line = nil;
 	@try {
 		@autoreleasepool {
@@ -334,6 +340,11 @@ static void frames(void (^encode)(id<MTLCommandBuffer>, int), NSMutableArray *fp
 		finishAll(cbs);
 		const double el = now() - s;
 		[fps addObject:@(n / el)];
+		if (gVerbose) {
+			printf("# rep %s %d at %.3f s: %d frames (command buffers) in %.1f ms, %.1f a second, gpu span %.3f ms a frame\n",
+			       gCaseName.UTF8String, r, s - gCaseStart, n, el * 1e3, n / el, gpuSpanMs(cbs) / n);
+			fflush(stdout);
+		}
 		[wall addObject:@(el * 1e3 / n)];
 		[gpu addObject:@(gpuSpanMs(cbs) / n)];
 	}
@@ -820,6 +831,8 @@ int main(int argc, char **argv)
 				gMinSeconds = atof(argv[++i]);
 			else if (strcmp(argv[i], "-l") == 0)
 				list = YES;
+			else if (strcmp(argv[i], "-v") == 0)
+				gVerbose = YES;
 			else
 				[patterns addObject:@(argv[i])];
 		}
