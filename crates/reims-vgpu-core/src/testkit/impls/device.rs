@@ -34,6 +34,10 @@ use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
 use crate::rt::Hold;
 
+/// The name the fake logs and scripts [`GpuDevice::new_command_queue_unshared`] under: no selector
+/// of Metal's names it.
+pub const UNSHARED_QUEUE: &str = "newCommandQueue (unshared)";
+
 /// A device's model: its capabilities.
 #[derive(Debug)]
 pub struct DeviceModel {
@@ -171,6 +175,14 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
 
     fn new_command_queue(&self) -> Option<<FakePlatform as Platform>::CommandQueue> {
         fatal(self.make(Policy::Fatal, "newCommandQueue", vec![], |w| {
+            Some(w.new_obj::<kind::CommandQueue>(Model::None))
+        }))
+    }
+
+    /// Logged and scripted under [`UNSHARED_QUEUE`], as no selector of Metal's names it; its
+    /// queue is `newCommandQueue`'s.
+    fn new_command_queue_unshared(&self) -> Option<<FakePlatform as Platform>::CommandQueue> {
+        fatal(self.make(Policy::Fatal, UNSHARED_QUEUE, vec![], |w| {
             Some(w.new_obj::<kind::CommandQueue>(Model::None))
         }))
     }

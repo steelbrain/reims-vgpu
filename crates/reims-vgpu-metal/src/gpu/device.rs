@@ -400,6 +400,12 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         created(msg::get("newCommandQueue", || d.newCommandQueue()))
     }
 
+    /// `newCommandQueue`'s queue: Metal has no call that keeps a queue from sharing the GPU's
+    /// queues, so the platform makes the queue any create makes.
+    fn new_command_queue_unshared(&self) -> Option<MetalCommandQueue> {
+        self.new_command_queue()
+    }
+
     fn deserialize_compute_pipeline_descriptor(
         &self,
         hold: Hold<'_>,

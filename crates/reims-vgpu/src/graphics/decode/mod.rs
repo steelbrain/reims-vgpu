@@ -1420,14 +1420,33 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Ok(Ok(()))
             }
             RGFX_CMD_QUEUE_CREATE => {
+                use reims_graphics::wire::{
+                    RGFX_QUEUE_CREATE_FLAGS_OFFSET, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
+                };
                 let Some(m) = read::<RgfxQueueCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
-                // The ring pair this message places (`submit_offset`,
-                // `complete_offset`, the data sizes and the vector) is set up
-                // with the ring loop in a later increment; here the queue handle
-                // is made so later command buffers can name it.
-                match device.new_command_queue() {
+                // The ring pair this message places (`submit_offset`, `complete_offset`, the data
+                // sizes and the vector) is the device's; here the queue handle is made so later
+                // command buffers can name it. A queue whose tail holds `RGFX_QUEUE_UNSHARED`
+                // (the device took it only where the driver took its feature, and the kext asks it
+                // for WindowServer's queues) is the platform's queue that shares its GPU queue
+                // with no other command queue.
+                let unshared =
+                    read_at::<RgfxQueueCreateFlags>(message, RGFX_QUEUE_CREATE_FLAGS_OFFSET)
+                        .is_some_and(|tail| tail.flags & RGFX_QUEUE_UNSHARED != 0);
+                let made = if unshared {
+                    device.new_command_queue_unshared()
+                } else {
+                    device.new_command_queue()
+                };
+                if unshared && made.is_some() {
+                    log::info!(
+                        target: "reims_vgpu::graphics",
+                        "queue {:#x}: made unshared (RGFX_QUEUE_UNSHARED)", m.obj_id
+                    );
+                }
+                match made {
                     Some(queue) => {
                         let mut entry = Entry::of(ObjHandle::CommandQueue(queue));
                         let order = self.shared.surface_order.lock().marks(m.obj_id);
@@ -3041,6 +3060,12 @@ fn read<T: FromBytes>(message: &[u8]) -> Option<T> {
     T::read_from_prefix(message).ok().map(|(t, _)| t)
 }
 
+/// The `T` that follows a message's own struct at byte `offset` of `message`, or `None` where the
+/// message ends before it (a message that does not carry it).
+fn read_at<T: FromBytes>(message: &[u8], offset: u32) -> Option<T> {
+    read(message.get(offset as usize..)?)
+}
+
 /// The core texture descriptor values from a wire texture descriptor, with the
 /// guest-picked resource id pinned as the texture's resource index (the SPI the
 /// guest's argument buffers name it by), which the caller checked lies in its
@@ -3565,6 +3590,96 @@ mod tests {
         assert_eq!(made_type(heap(one | 2, 1).as_bytes(), &mut dec), "1");
         assert_eq!(made_type(over(one | 3, 0).as_bytes(), &mut dec), "1");
         assert_eq!(made_type(over(one | 4, 1).as_bytes(), &mut dec), "1");
+    }
+
+    /// A queue create whose tail holds `RGFX_QUEUE_UNSHARED` makes the platform's unshared queue,
+    /// and one without it (no tail, a tail of none, or of other flags) the plain `newCommandQueue`,
+    /// each stored under its id. A queue the platform makes nothing of, either way, is refused and
+    /// stores nothing.
+    #[test]
+    fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
+        use reims_graphics::wire::{
+            RGFX_QUEUE_QUIET_SCHEDULED, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
+        };
+        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        let create = |obj_id: u64, flags: Option<u32>| {
+            let mut bytes = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: 0,
+                    seqno: 0,
+                },
+                obj_id,
+                submit_offset: 0x2_0000,
+                complete_offset: 0x3_0000,
+                submit_data_size: 0x1_0000,
+                complete_data_size: 0x1_0000,
+                priority: 0,
+                vector: 0,
+            }
+            .as_bytes()
+            .to_vec();
+            if let Some(flags) = flags {
+                let tail = RgfxQueueCreateFlags {
+                    flags,
+                    reserved_04: 0,
+                };
+                bytes.extend_from_slice(tail.as_bytes());
+            }
+            let size = bytes.len() as u32;
+            bytes[4..8].copy_from_slice(&size.to_le_bytes());
+            bytes
+        };
+        // What the decode answers, and the platform calls it made.
+        let decode = |dec: &mut GraphicsDecoder<FakePlatform>, bytes: &[u8]| {
+            let mark = p.call_log().mark();
+            let outcome = dec.decode(&device, bytes).unwrap();
+            let calls: Vec<&str> = p.call_log().since(mark).iter().map(|c| c.sel).collect();
+            (outcome, calls)
+        };
+        let plain = vec!["newCommandQueue"];
+
+        let unshared = Some(RGFX_QUEUE_UNSHARED);
+        assert_eq!(
+            decode(&mut dec, &create(1, unshared)),
+            (Ok(()), vec![UNSHARED_QUEUE])
+        );
+        let both = Some(RGFX_QUEUE_UNSHARED | RGFX_QUEUE_QUIET_SCHEDULED);
+        assert_eq!(
+            decode(&mut dec, &create(2, both)),
+            (Ok(()), vec![UNSHARED_QUEUE])
+        );
+        assert_eq!(decode(&mut dec, &create(3, None)), (Ok(()), plain.clone()));
+        assert_eq!(
+            decode(&mut dec, &create(4, Some(0))),
+            (Ok(()), plain.clone())
+        );
+        let quiet = Some(RGFX_QUEUE_QUIET_SCHEDULED);
+        assert_eq!(decode(&mut dec, &create(5, quiet)), (Ok(()), plain.clone()));
+        for obj_id in 1..=5 {
+            assert!(
+                matches!(dec.named(obj_id), Some(ObjHandle::CommandQueue(_))),
+                "queue {obj_id}"
+            );
+        }
+
+        // Each call's nil refuses its create.
+        p.script().push(UNSHARED_QUEUE, Step::Nil);
+        assert_eq!(
+            decode(&mut dec, &create(6, unshared)),
+            (Err(DecodeError::Refused), vec![UNSHARED_QUEUE])
+        );
+        p.script().push("newCommandQueue", Step::Nil);
+        assert_eq!(
+            decode(&mut dec, &create(7, None)),
+            (Err(DecodeError::Refused), plain)
+        );
+        assert!(dec.named(6).is_none() && dec.named(7).is_none());
     }
 
     /// A sampler create is answered with the sampler's `gpuResourceID`, the id the platform

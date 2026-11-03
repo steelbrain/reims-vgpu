@@ -1816,6 +1816,105 @@ impl WalkGate {
     }
 }
 
+/// Queue `n` of `context` created as [`create_queue`] does, its `QUEUE_CREATE` carrying the flags
+/// tail with `flags`, as the kext sends it with a flag set. Its status.
+fn create_queue_flagged(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    (context, n): (u32, u64),
+    rings: (u64, u64),
+    data: u32,
+    flags: u32,
+) -> u32 {
+    let span = u64::from(RGFX_RING_HEADER_SIZE + data);
+    guest.send(device, block_grant(context, rings.0, span));
+    guest.send(device, block_grant(context, rings.1, span));
+    let mut create = queue_create(context, n, rings.0, rings.1, data, 0);
+    let tail = RgfxQueueCreateFlags {
+        flags,
+        reserved_04: 0,
+    };
+    create.extend_from_slice(tail.as_bytes());
+    answered(device, guest, create)
+}
+
+/// The platform's queue creators' calls, newest last, once `count` of them were made (about 2 s):
+/// each queue's handle is made on its service thread, after its create is answered.
+fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
+    use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+    let made = || -> Vec<&'static str> {
+        let calls = platform.call_log().calls();
+        let creators = calls.iter().map(|c| c.sel);
+        creators
+            .filter(|&sel| sel == "newCommandQueue" || sel == UNSHARED_QUEUE)
+            .collect()
+    };
+    for _ in 0..2000 {
+        if made().len() >= count {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    made()
+}
+
+/// Where the kext took `UNSHARED_QUEUES`, a `QUEUE_CREATE` flagged `RGFX_QUEUE_UNSHARED` is made
+/// on the platform's unshared queue, and one with no flag on its plain `newCommandQueue`. Where it
+/// did not take the feature, a flagged create is refused and the platform makes no queue for it.
+#[test]
+fn a_queue_the_kext_asks_unshared_is_the_platforms_unshared_queue() {
+    use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+    const RING_DATA: u32 = 0x1_0000;
+    let rings = |n: u64| {
+        let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * 0x4_0000;
+        (at, at + 0x2_0000)
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+
+    let (device, platform) = headless_on(&raised);
+    let unshared = RGFX_FEATURE_UNSHARED_QUEUES;
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), unshared);
+    assert_eq!(
+        device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into()),
+        unshared
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let flagged = |guest: &mut Guest, n: u64, flags: u32| {
+        create_queue_flagged(&device, guest, (1, n), rings(n), RING_DATA, flags)
+    };
+    assert_eq!(flagged(&mut guest, 1, RGFX_QUEUE_UNSHARED), RGFX_STATUS_OK);
+    assert_eq!(queue_calls(&platform, 1), [UNSHARED_QUEUE]);
+    let plain = create_queue(&device, &mut guest, 1, 2, rings(2), RING_DATA, 0);
+    assert_eq!(plain, RGFX_STATUS_OK);
+    assert_eq!(
+        queue_calls(&platform, 2),
+        [UNSHARED_QUEUE, "newCommandQueue"]
+    );
+    assert_eq!(flagged(&mut guest, 3, 0), RGFX_STATUS_OK);
+    assert_eq!(
+        queue_calls(&platform, 3),
+        [UNSHARED_QUEUE, "newCommandQueue", "newCommandQueue"]
+    );
+
+    // A kext that did not take the feature.
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let refused = create_queue_flagged(
+        &device,
+        &mut guest,
+        (1, 1),
+        rings(1),
+        RING_DATA,
+        RGFX_QUEUE_UNSHARED,
+    );
+    assert_eq!(refused, RGFX_STATUS_INVALID_ARGUMENT);
+    let plain = create_queue(&device, &mut guest, 1, 2, rings(2), RING_DATA, 0);
+    assert_eq!(plain, RGFX_STATUS_OK);
+    assert_eq!(queue_calls(&platform, 1), ["newCommandQueue"]);
+}
+
 /// Ring 0 is carried out while a command buffer's walk is in flight on a queue: a sampler create
 /// is answered, and a destroy of the sampler the walk names is carried out, with the walk stopped
 /// at its gate. The walk names the sampler as it was at the buffer's begin, as one carried out
@@ -4029,8 +4128,9 @@ fn a_failed_context_s_pipeline_creates_are_carried_out() {
 /// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
 /// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
 /// a command buffer's ask for its submission (`CB_SUBMITTED`), orders command buffers over the
-/// IOSurfaces they share (`SURFACE_ORDER`) and makes indirect command buffers
-/// (`INDIRECT_COMMAND_BUFFERS`)
+/// IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
+/// (`INDIRECT_COMMAND_BUFFERS`) and makes the queues the kext asks unshared on the platform's
+/// unshared queue (`UNSHARED_QUEUES`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -4065,6 +4165,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         want | RGFX_FEATURE_CB_SUBMITTED
             | RGFX_FEATURE_SURFACE_ORDER
             | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+            | RGFX_FEATURE_UNSHARED_QUEUES
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
 
@@ -4074,6 +4175,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         RGFX_FEATURE_CB_SUBMITTED
             | RGFX_FEATURE_SURFACE_ORDER
             | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+            | RGFX_FEATURE_UNSHARED_QUEUES
     );
 }
 

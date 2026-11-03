@@ -136,6 +136,8 @@ CHECK(offsetof(RgfxRingHeader, producer_waiting) == 0x10);
 CHECK(offsetof(RgfxRingHeader, raise_all) == 0xc4);
 CHECK(RGFX_QUEUE_CREATE_FLAGS_OFFSET == sizeof(RgfxQueueCreate));
 CHECK(sizeof(RgfxQueueCreate) + sizeof(RgfxQueueCreateFlags) == 64);
+CHECK(RGFX_FEATURE_UNSHARED_QUEUES == (1 << 13));
+CHECK(RGFX_QUEUE_UNSHARED == (1 << 3));
 CHECK(RGFX_OP_QUEUE_BARRIER == 0x000a);
 CHECK(sizeof(RgfxOpHeader) + sizeof(RgfxOpQueueBarrier) == 24);
 CHECK(offsetof(RgfxOpQueueBarrier, before_stages) == 8);

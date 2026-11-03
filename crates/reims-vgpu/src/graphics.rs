@@ -40,12 +40,12 @@ use reims_graphics::wire::{
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
-    RgfxVideoCaps,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
+    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
+    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
+    RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -214,12 +214,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             }
             // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks, and
             // places its `Managed` buffers' CPU copies in the guest's heaps. Every host answers a
-            // command buffer's ask for its submission, and orders command buffers of different
-            // queues over the IOSurfaces they share where the guest names the order. Both
+            // command buffer's ask for its submission, orders command buffers of different queues
+            // over the IOSurfaces they share where the guest names the order, and makes a queue
+            // the kext asks unshared (WindowServer's) on the platform's unshared queue. Both
             // platforms make indirect command buffers, so every host decodes their messages.
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | u64::from(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS)
+                | u64::from(RGFX_FEATURE_UNSHARED_QUEUES)
                 | if unified_memory {
                     0
                 } else {

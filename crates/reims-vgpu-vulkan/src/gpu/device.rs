@@ -196,6 +196,22 @@ pub struct DeviceObject {
     caps: OnceLock<Arc<DeviceCaps>>,
 }
 
+/// How many uncompleted command buffers a queue of `newCommandQueue` holds at most, as Metal's
+/// and the runtime's `new_command_queue`'s.
+const METAL_MAX_COMMAND_BUFFER_COUNT: usize = 64;
+
+/// The runtime's queue of at most `count` uncompleted command buffers for a command queue the
+/// graphics lane's kext asks unshared (`RGFX_QUEUE_UNSHARED`, WindowServer's queues): the
+/// runtime's `new_command_queue_with_max_command_buffer_count`, the queue every create makes,
+/// given its `VkQueue` round robin over the device's. Its refusals are the runtime's: a `count` of
+/// 0 (`Invalid`, `MaxCommandBufferCount`) and a lost device (`DeviceLost`).
+pub(crate) fn unshared_queue(
+    raw: &rt::Device,
+    count: usize,
+) -> Result<rt::CommandQueue, rt::Error> {
+    raw.new_command_queue_with_max_command_buffer_count(count)
+}
+
 /// The registry ID this platform answers for `raw`: for the runtime's system default device,
 /// Metal's for its system default device, asked at run time on macOS
 /// ([`crate::os::default_registry_id`]), and the runtime's own for any other device, or where
@@ -1097,6 +1113,17 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// device ([`metal_space::FirstUse::Queue`]).
     fn new_command_queue(&self) -> Option<VulkanCommandQueue> {
         let raw = get("newCommandQueue", || self.raw.new_command_queue());
+        metal_space::first_use(metal_space::FirstUse::Queue);
+        Some(Obj::new(QueueObject::new(raw, self.clone_ref())))
+    }
+
+    /// A queue of at most 64 uncompleted command buffers, as `newCommandQueue`'s, made by
+    /// [`unshared_queue`]; a refusal dies at the call, as `newCommandQueue`'s does. A first use
+    /// of Metal's device, as `newCommandQueue`'s.
+    fn new_command_queue_unshared(&self) -> Option<VulkanCommandQueue> {
+        let raw = get("newCommandQueue", || {
+            unshared_queue(&self.raw, METAL_MAX_COMMAND_BUFFER_COUNT)
+        });
         metal_space::first_use(metal_space::FirstUse::Queue);
         Some(Obj::new(QueueObject::new(raw, self.clone_ref())))
     }
@@ -3411,6 +3438,25 @@ pub(crate) mod tests {
         assert_eq!(opened.signaled_value(), 7);
         let site = catch_death(|| d.open_shared_event(None)).unwrap_err();
         assert_eq!(site.file, "newSharedEventWithHandle:");
+    }
+
+    /// An unshared queue runs a command buffer as `newCommandQueue`'s does, and its maker passes
+    /// the runtime's refusals on as they are: a count of 0 is the runtime's `Invalid`
+    /// (`MaxCommandBufferCount`), where the platform asks for Metal's 64.
+    #[test]
+    fn an_unshared_queue_runs_and_its_refusals_are_the_runtimes() {
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        let d = dev();
+        match unshared_queue(&d.raw, 0) {
+            Err(rt::Error::Invalid(i)) => assert_eq!(i.problem, rt::Problem::MaxCommandBufferCount),
+            Err(e) => panic!("refused otherwise: {e}"),
+            Ok(_) => panic!("a count of 0 made a queue"),
+        }
+        let queue = d.new_command_queue_unshared().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status().0, 4, "completed");
     }
 
     #[cfg(target_os = "macos")]

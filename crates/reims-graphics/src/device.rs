@@ -185,7 +185,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8, 11, 12 and 14.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 14.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -197,12 +197,14 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_QUEUE_VECTORS
     | RGFX_FEATURE_SURFACE_ORDER
     | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+    | RGFX_FEATURE_UNSHARED_QUEUES
     | RGFX_FEATURE_MANAGED_AT_OFFSET) as u64;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
-/// take for a `QUEUE_CREATE` to ask for it: none yet, so a create that asks for any flag is
-/// refused.
-const QUEUE_FLAGS: &[(u32, u64)] = &[];
+/// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
+/// for any other flag is refused. The host hands a queue's flags to [`Host::stage3_message`] in
+/// its `QUEUE_CREATE`'s tail.
+const QUEUE_FLAGS: &[(u32, u64)] = &[(RGFX_QUEUE_UNSHARED, RGFX_FEATURE_UNSHARED_QUEUES as u64)];
 
 /// The control submission ring.
 const SUBMIT: RingAt = RingAt {
@@ -502,6 +504,9 @@ pub(crate) struct QueueShared {
     context: u32,
     /// The `QUEUE_CREATE` that made it, which the host is handed first.
     create: RgfxQueueCreate,
+    /// The `RGFX_QUEUE_*` flags its create asked for, all of them ones the host carries out
+    /// ([`QUEUE_FLAGS`]): the host is handed them in the create's tail.
+    flags: u32,
     /// The reset count its `QUEUE_CREATE` was taken at: a reset since ends it, and its posts are
     /// dropped.
     epoch: u64,
@@ -529,6 +534,20 @@ pub(crate) struct QueueShared {
 }
 
 impl QueueShared {
+    /// The `QUEUE_CREATE` the host is handed: the create as the guest sent it, with the tail of
+    /// its flags where it has any, as the kext sends it.
+    fn create_message(&self) -> Vec<u8> {
+        let mut message = self.create.as_bytes().to_vec();
+        if self.flags != 0 {
+            let tail = RgfxQueueCreateFlags {
+                flags: self.flags,
+                reserved_04: 0,
+            };
+            message.extend_from_slice(tail.as_bytes());
+        }
+        message
+    }
+
     /// The queue's service is ending (a destroy, a reset, or the device's end).
     fn ended(&self) -> bool {
         self.ending.load(Ordering::Acquire)
@@ -1485,6 +1504,7 @@ impl Shared {
             obj_id: q.obj_id,
             context: (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32,
             create: *q,
+            flags,
             epoch,
             ring_id: q.submit_offset,
             vector: q.vector,
@@ -1580,7 +1600,7 @@ impl Shared {
     fn queue_service(&self, queue: &Arc<QueueShared>) {
         let poster = self.queue_poster(queue);
         // The host makes the queue's handle first, so a command buffer on it can name it.
-        self.host.stage3_message(&poster, queue.create.as_bytes());
+        self.host.stage3_message(&poster, &queue.create_message());
         self.queue_loop(queue, &poster);
         // A command buffer a doorbell's thread took is carried out, as one this thread took is.
         let handed = queue.consuming.lock().take();

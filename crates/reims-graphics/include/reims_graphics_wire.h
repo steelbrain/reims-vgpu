@@ -837,8 +837,8 @@
 // [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 // guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 // [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
-// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`] and [`RGFX_FEATURE_MANAGED_AT_OFFSET`]). Bits 9, 10,
-// 13 and 15 are reserved.
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`] and
+// [`RGFX_FEATURE_MANAGED_AT_OFFSET`]). Bits 9, 10 and 15 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -910,6 +910,14 @@
 // the bit; the kext takes it where it answers the create, and its bundle makes indirect command
 // buffers only where it was taken.
 #define RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS (1 << 12)
+
+// `FEATURES_LO` bit 13, `UNSHARED_QUEUES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: a queue created with [`RGFX_QUEUE_UNSHARED`] is the
+// platform's queue that shares its GPU queue with no other command queue, so no other process's
+// work joins it there. The kext asks it for every queue of WindowServer's. Every host offers it:
+// where the platform shares no GPU queue between command queues (Metal, a Vulkan device that
+// keeps a queue of its own for each), the queue is the one any create makes.
+#define RGFX_FEATURE_UNSHARED_QUEUES (1 << 13)
 
 // `FEATURES_LO` bit 14, `MANAGED_AT_OFFSET`, which the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`], a
@@ -1482,6 +1490,11 @@
 // [`RgfxQueueCreateFlags::flags`]: the host waits for room on the queue's completion ring until a
 // [`RGFX_REG_CONSUMED`] write ([`RGFX_FEATURE_CONSUMED_DOORBELL`]).
 #define RGFX_QUEUE_CONSUMED_DOORBELL (1 << 1)
+
+// [`RgfxQueueCreateFlags::flags`]: the queue shares its GPU queue with no other command queue
+// ([`RGFX_FEATURE_UNSHARED_QUEUES`]). The kext sets it itself, for every queue of
+// WindowServer's, and never for a process that asks for it. Bit 2 is reserved.
+#define RGFX_QUEUE_UNSHARED (1 << 3)
 
 // [`RgfxBlockRelease::flags`]: the block's IOSurface has no client left, no process holding it,
 // so no reader of its pages: the host drops the block's device cache with it, rather than
@@ -4801,9 +4814,10 @@ typedef struct {
 // The modes a `QUEUE_CREATE` asks for its queue, after the [`RgfxQueueCreate`] at
 // [`RGFX_QUEUE_CREATE_FLAGS_OFFSET`]. A flag whose feature the guest did not take
 // ([`RGFX_REG_DRIVER_FEATURES_LO`]), or one the host does not carry out, refuses the create with
-// [`RGFX_STATUS_INVALID_ARGUMENT`]; the host carries out none yet.
+// [`RGFX_STATUS_INVALID_ARGUMENT`]; the host carries out [`RGFX_QUEUE_UNSHARED`] alone.
 typedef struct {
-  // `RGFX_QUEUE_*`: [`RGFX_QUEUE_QUIET_SCHEDULED`] and [`RGFX_QUEUE_CONSUMED_DOORBELL`].
+  // `RGFX_QUEUE_*`: [`RGFX_QUEUE_QUIET_SCHEDULED`], [`RGFX_QUEUE_CONSUMED_DOORBELL`] and
+  // [`RGFX_QUEUE_UNSHARED`].
   uint32_t flags;
   // Zero.
   uint32_t reserved_04;

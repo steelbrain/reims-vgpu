@@ -49,14 +49,16 @@ const EVERY_FEATURE: u64 = PEER_FEATURES
         | RGFX_FEATURE_QUEUE_BARRIER
         | RGFX_FEATURE_CB_PARTS
         | RGFX_FEATURE_PAGES_BUFFERS
-        | RGFX_FEATURE_QUEUE_VECTORS) as u64;
+        | RGFX_FEATURE_QUEUE_VECTORS
+        | RGFX_FEATURE_UNSHARED_QUEUES) as u64;
 
 /// A host that offers `features`, answers each `COMMAND_BUFFER` with its `CB_COMPLETE`
-/// (`RGFX_CB_OK`, GPU times 0) on the queue's completion ring, as [`QueueTestHost`] does, and
-/// keeps every interrupt for the guest to take.
+/// (`RGFX_CB_OK`, GPU times 0) on the queue's completion ring, as [`QueueTestHost`] does, keeps
+/// every interrupt for the guest to take, and keeps each `QUEUE_CREATE` it is handed, whole.
 struct PeerHost {
     raised: Arc<Raised>,
     features: u64,
+    creates: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Host for PeerHost {
@@ -72,6 +74,9 @@ impl Host for PeerHost {
     }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        if header.r#type == RGFX_CMD_QUEUE_CREATE {
+            self.creates.lock().push(message.to_vec());
+        }
         if header.r#type != RGFX_CMD_COMMAND_BUFFER {
             return;
         }
@@ -201,6 +206,8 @@ struct FakeGuest {
     raised: Arc<Raised>,
     trace: Vec<String>,
     control: GuestRing,
+    /// The `QUEUE_CREATE`s the host was handed, in order ([`PeerHost`]).
+    creates: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeGuest {
@@ -212,15 +219,18 @@ impl FakeGuest {
     /// A guest of a device whose host offers `features`.
     fn offered(features: u64) -> FakeGuest {
         let raised = Arc::new(Raised::default());
+        let creates = Arc::default();
         let rig = Rig::with_host(Box::new(PeerHost {
             raised: Arc::clone(&raised),
             features,
+            creates: Arc::clone(&creates),
         }));
         FakeGuest {
             rig,
             raised,
             trace: Vec::new(),
             control: GuestRing::control(),
+            creates,
         }
     }
 
@@ -761,7 +771,8 @@ fn driver_features_are_fixed_while_ready_and_cleared_by_a_reset() {
 
 /// A `QUEUE_CREATE` whose tail asks for a flag the host does not carry out for the features the
 /// driver took is refused, making no rings, whether or not the driver took the flag's feature:
-/// the host carries out no flag yet. A tail of no flag makes the queue, as a create without one.
+/// the host carries out none of these flags yet. A tail of no flag makes the queue, as a create
+/// without one.
 #[test]
 fn a_queue_flag_the_host_does_not_carry_out_refuses_the_create() {
     const CONTEXT: u32 = 7;
@@ -788,4 +799,99 @@ fn a_queue_flag_the_host_does_not_carry_out_refuses_the_create() {
         assert_eq!(guest.create_queue_flagged(QUEUE, 0), RGFX_STATUS_OK);
         assert_eq!(guest.rig.device.queue_count(), 1);
     }
+}
+
+/// The `QUEUE_CREATE` of the `n`th queue the host was handed, once it was: the service thread hands
+/// it as it starts.
+fn handed_create(guest: &FakeGuest, n: usize) -> Vec<u8> {
+    guest.wait_for("the host was never handed the queue's create", |g| {
+        g.creates.lock().len() > n
+    });
+    guest.creates.lock()[n].clone()
+}
+
+/// Where the driver took `UNSHARED_QUEUES`, a `QUEUE_CREATE` whose tail asks for
+/// `RGFX_QUEUE_UNSHARED` makes the queue, and the host is handed the create with the flag in its
+/// tail, as the guest sent it. A create with no flag, whether it has no tail or a tail of none, is
+/// handed with no tail, as a wire-2 kext sends it.
+#[test]
+fn an_unshared_queue_is_handed_to_the_host_with_its_flag() {
+    const CONTEXT: u32 = 7;
+    const QUEUE: u64 = ((CONTEXT as u64) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taken = u64::from(RGFX_FEATURE_UNSHARED_QUEUES);
+    let mut guest = FakeGuest::offered(EVERY_FEATURE);
+    assert_eq!(guest.start_taking(Some(taken)), taken);
+    guest.arm_control();
+    guest.grant_queue_rings(CONTEXT);
+
+    assert_eq!(
+        guest.create_queue_flagged(QUEUE, RGFX_QUEUE_UNSHARED),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(guest.rig.device.queue_count(), 1);
+    let handed = handed_create(&guest, 0);
+    let flags_at = RGFX_QUEUE_CREATE_FLAGS_OFFSET as usize;
+    assert_eq!(handed.len(), flags_at + size_of::<RgfxQueueCreateFlags>());
+    let (create, _) = RgfxQueueCreate::read_from_prefix(&handed).unwrap();
+    assert_eq!(
+        (create.obj_id, create.header.size),
+        (QUEUE, handed.len() as u32)
+    );
+    let tail = RgfxQueueCreateFlags::read_from_bytes(&handed[flags_at..]).unwrap();
+    assert_eq!(tail.flags, RGFX_QUEUE_UNSHARED);
+
+    // Each re-open over the same rings ends the queue before it.
+    assert_eq!(guest.create_queue_flagged(QUEUE + 1, 0), RGFX_STATUS_OK);
+    let handed = handed_create(&guest, 1);
+    assert_eq!(handed.len(), flags_at);
+    assert_eq!(
+        RgfxQueueCreate::read_from_prefix(&handed).unwrap().0.obj_id,
+        QUEUE + 1
+    );
+    guest.create_queue(QUEUE + 2, "plain");
+    assert_plain_create(&handed_create(&guest, 2), QUEUE + 2);
+    assert_eq!(guest.rig.device.queue_count(), 1);
+}
+
+/// `RGFX_QUEUE_UNSHARED` where the driver did not take `UNSHARED_QUEUES` refuses the create, and
+/// the host is handed nothing: a host that does not offer the feature (one built before it)
+/// leaves it untaken whatever the driver writes, and a driver may also not write it.
+#[test]
+fn an_unshared_queue_the_driver_did_not_negotiate_is_refused() {
+    const CONTEXT: u32 = 7;
+    const QUEUE: u64 = ((CONTEXT as u64) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let unshared = u64::from(RGFX_FEATURE_UNSHARED_QUEUES);
+    for (offered, wanted) in [
+        (EVERY_FEATURE & !unshared, Some(unshared)),
+        (EVERY_FEATURE, None),
+        (EVERY_FEATURE, Some(u64::from(RGFX_FEATURE_QUIET_SCHEDULED))),
+    ] {
+        let mut guest = FakeGuest::offered(offered);
+        let taken = guest.start_taking(wanted);
+        assert_eq!(
+            taken & unshared,
+            0,
+            "{offered:#x} offered, {wanted:?} wanted"
+        );
+        guest.arm_control();
+        guest.grant_queue_rings(CONTEXT);
+        assert_eq!(
+            guest.create_queue_flagged(QUEUE, RGFX_QUEUE_UNSHARED),
+            RGFX_STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(guest.rig.device.queue_count(), 0);
+        // The next queue is made, and is the first the host is handed.
+        guest.create_queue(QUEUE + 1, "plain");
+        assert_plain_create(&handed_create(&guest, 0), QUEUE + 1);
+        assert_eq!(guest.creates.lock().len(), 1);
+    }
+}
+
+/// `handed` is `queue_create(obj_id)` as the guest posted it, with no tail: its size its own, its
+/// seqno the ring's.
+fn assert_plain_create(handed: &[u8], obj_id: u64) {
+    let sent = queue_create(obj_id);
+    assert_eq!(handed.len(), sent.len());
+    assert_eq!(&handed[4..8], &(sent.len() as u32).to_le_bytes());
+    assert_eq!(&handed[16..], &sent[16..]);
 }

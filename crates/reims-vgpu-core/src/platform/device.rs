@@ -95,6 +95,14 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;
+    /// No Metal counterpart: a queue as [`new_command_queue`](GpuDevice::new_command_queue)'s,
+    /// which shares the GPU queue it submits to with no other command queue for its life, where
+    /// the platform would otherwise share one between command queues. The graphics lane makes
+    /// WindowServer's queues so (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues
+    /// on the GPU behind its frames. A platform that shares no GPU queue between command queues
+    /// answers `new_command_queue`'s queue. Never nil-checked; a raise inside it dies at the
+    /// call, as one inside `newCommandQueue` does.
+    fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;
     /// sel: newComputePipelineDescriptorWithSerializedData:deserializationContext: SPI
     /// `data` becomes a `dispatch_data_t` with core's destructor; `context` runs synchronously
     /// during the call. aborts: a malformed or truncated blob, inside Metal's deserializer.
