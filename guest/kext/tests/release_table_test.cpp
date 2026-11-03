@@ -1,6 +1,6 @@
 // The native test of RgfxReleaseTable.hpp: releases in flight are answered in any order, an answer
 // that comes before its entry is marked posted still finds it, and one not answered in time is
-// retired as unanswered.
+// told of once and stays in flight, holding its block, until its answer retires it.
 #include "RgfxReleaseTable.hpp"
 
 #include <cstdio>
@@ -95,7 +95,8 @@ int main()
 		check(x.t.inFlight == 1, "an entry not posted is free again");
 	}
 	{
-		// Not answered in time: retired unanswered, the oldest first in the timer's eyes.
+		// Not answered in time: told of once, the oldest first in the timer's eyes, and kept in
+		// flight, so its block and its surface stay the device's, until its answer comes.
 		Table x;
 		post(x, 0x1000, 41, 100);
 		post(x, 0x2000, 42, 500);
@@ -106,13 +107,38 @@ int main()
 		      "not before its time");
 		check(rgfxReleaseTakeDone(x.t, 100 + kTimeout, kTimeout, &e, &answered) && !answered &&
 		          e.offset == 0x1000,
-		      "retired unanswered at its time");
-		check(rgfxReleaseOldest(x.t) == 500, "the next oldest");
-		check(!rgfxReleaseAnswer(x.t, 41, 0), "a late answer finds nothing");
-		check(rgfxReleaseAnswer(x.t, 42, 0) &&
-		          rgfxReleaseTakeDone(x.t, 600, kTimeout, &e, &answered) && answered,
-		      "an answered release goes before its time");
-		check(rgfxReleaseOldest(x.t) == 0, "none waiting");
+		      "told of as late at its time");
+		check(x.t.inFlight == 2 && x.entries[0].state == kRgfxReleaseLate,
+		      "and still in flight, not retired");
+		check(rgfxReleaseOldest(x.t) == 500, "the next oldest is the timer's");
+		check(!rgfxReleaseTakeDone(x.t, 100 + 100 * kTimeout, kTimeout, &e, &answered) ||
+		          e.offset != 0x1000,
+		      "a late release is told of once, however long it waits");
+		check(x.t.inFlight == 2, "and nothing was retired for the wait");
+		check(rgfxReleaseAnswer(x.t, 41, 2), "the late answer finds its release");
+		check(rgfxReleaseTakeDone(x.t, 100 + 100 * kTimeout, kTimeout, &e, &answered) &&
+		          answered && e.offset == 0x1000 && e.status == 2,
+		      "which it retires with its status");
+		check(x.t.inFlight == 1, "only then is its entry free");
+	}
+	{
+		// Never answered: the release holds its entry for good, and the table's room shrinks by
+		// it, rather than its block going out again.
+		Table x;
+		post(x, 0x1000, 45, 100);
+		RgfxReleaseEntry e;
+		bool answered = true;
+		check(rgfxReleaseTakeDone(x.t, 100 + kTimeout, kTimeout, &e, &answered) && !answered,
+		      "late");
+		for (uint64_t now = 100 + kTimeout; now < 100 + 1000 * kTimeout; now += kTimeout)
+			check(!rgfxReleaseTakeDone(x.t, now, kTimeout, &e, &answered),
+			      "a release never answered is never retired");
+		check(x.t.inFlight == 1, "it stays in flight");
+		check(rgfxReleaseOldest(x.t) == 0, "and arms no timer");
+		check(post(x, 0x2000, 46, 200) >= 0 && rgfxReleaseAnswer(x.t, 46, 0) &&
+		          rgfxReleaseTakeDone(x.t, 300, kTimeout, &e, &answered) && answered &&
+		          e.offset == 0x2000,
+		      "the other entries go on");
 	}
 	{
 		// A full table reserves nothing until an entry is retired.

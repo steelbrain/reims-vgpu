@@ -6,8 +6,14 @@
 // room, each in its own entry, and returns; the framebuffer's work loop hands each answer to its
 // entry by seqno (rgfxReleaseAnswer), in whatever order the contexts' drains end, and enters the
 // worker, which retires the answered entries (rgfxReleaseTakeDone). So releases posted together
-// share their contexts' drains, and one slow context holds back only its own blocks. An entry
-// not answered in time is retired as unanswered, which keeps its block as before.
+// share their contexts' drains, and one slow context holds back only its own blocks.
+//
+// An entry not answered in time is late: the worker is told of it once, to log it, and it stays in
+// flight until its answer, which retires it as any other. The device's answer is its word that it
+// is done with the block: until then it may still run a buffer over the block, or copy a cached
+// surface's GPU copy into the surface's pages (a host slowed by tens of seconds does both late),
+// so nothing the release holds (the block, its wired pages, its surface and the surface's wire)
+// is handed back before it.
 //
 // An entry is reserved before its release is posted, and the post writes its seqno into the
 // entry before the message is published (ReimsGraphics::tryPost's `waiterSeqno`), so an answer
@@ -28,6 +34,8 @@ enum RgfxReleaseState : uint8_t {
 	kRgfxReleasePosting,
 	// On the ring, not yet answered.
 	kRgfxReleasePosted,
+	// On the ring, not answered in time (rgfxReleaseTakeDone told of it once): still waiting.
+	kRgfxReleaseLate,
 	// Answered, `status` the device's, to be retired.
 	kRgfxReleaseAnswered,
 };
@@ -98,7 +106,8 @@ inline bool rgfxReleaseAnswer(RgfxReleaseTable &t, uint64_t seqno, uint32_t stat
 		return false;
 	for (uint32_t i = 0; i < t.capacity; i++) {
 		RgfxReleaseEntry &e = t.entries[i];
-		if ((e.state == kRgfxReleasePosting || e.state == kRgfxReleasePosted) &&
+		if ((e.state == kRgfxReleasePosting || e.state == kRgfxReleasePosted ||
+		     e.state == kRgfxReleaseLate) &&
 		    __atomic_load_n(&e.seqno, __ATOMIC_ACQUIRE) == seqno) {
 			e.status = status;
 			e.state = kRgfxReleaseAnswered;
@@ -108,8 +117,9 @@ inline bool rgfxReleaseAnswer(RgfxReleaseTable &t, uint64_t seqno, uint32_t stat
 	return false;
 }
 
-// Takes one entry done with, freeing it: an answered one (`*answered` true), else one posted
-// before `now - timeout` (`*answered` false: it was not answered in time). False where none is.
+// Takes one entry done with, freeing it: an answered one (`*answered` true). Else one posted
+// before `now - timeout` and not yet late becomes late, and a copy of it is given with
+// `*answered` false, its entry kept in flight for its answer. False where neither is.
 inline bool rgfxReleaseTakeDone(RgfxReleaseTable &t, uint64_t now, uint64_t timeout,
                                 RgfxReleaseEntry *out, bool *answered)
 {
@@ -127,13 +137,13 @@ inline bool rgfxReleaseTakeDone(RgfxReleaseTable &t, uint64_t now, uint64_t time
 	}
 	if (stale < 0)
 		return false;
+	t.entries[stale].state = kRgfxReleaseLate;
 	*out = t.entries[stale];
 	*answered = false;
-	rgfxReleaseUnposted(t, static_cast<uint32_t>(stale));
 	return true;
 }
 
-// When the oldest release still waiting was posted, or 0 where none waits.
+// When the oldest release still waiting and not yet late was posted, or 0 where none is.
 inline uint64_t rgfxReleaseOldest(const RgfxReleaseTable &t)
 {
 	uint64_t oldest = 0;

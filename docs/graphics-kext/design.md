@@ -1365,9 +1365,13 @@ in one, which keeps its parent's span after the parent's destroy. It also
 refuses one where a live queue's ring lies in the block. Otherwise it answers
 OK once every command buffer the context committed before the release has run
 its completion handler. Command buffers committed later do not hold it up. On
-OK the block goes back to the pool; on a refusal, or no answer in time, it
-stays out of use until its process's close. A block a create in flight names
-is pinned from the kext's check until the create is answered, and a free of it
+OK the block goes back to the pool; on a refusal it stays out of use until its
+process's close posts its release again. A release not answered in 10 s is
+logged and stays in flight: the host may still run a buffer over the block or
+copy a cached surface's GPU copy into the surface's pages, so the block, its
+wired pages, and a cached surface with its wire are held, never handed back to
+macOS, until the answer comes. A block a create in flight names is pinned from
+the kext's check until the create is answered, and a free of it
 meanwhile fails busy, so no block changes hands between the check and the
 host's carrying out of the message. A context's close is answered under the
 same rule, after its objects are dropped and its queues' threads are past

@@ -85,7 +85,8 @@ constexpr UInt32 kRingConsumer = 0x40;
 constexpr UInt32 kQueueAnswerMs = 30000;
 constexpr UInt32 kCloseAnswerMs = 10000;
 // How long a BLOCK_RELEASE waits for its answer, which comes once the context's command buffers
-// committed before it have finished. One not answered in time keeps its block.
+// committed before it have finished, before it is logged as late. A late one stays in flight,
+// its block, pages and surface the device's, until its answer.
 constexpr UInt32 kReleaseAnswerMs = 10000;
 // Every block is page-aligned and a whole number of pages, so a block can back a mapping.
 constexpr UInt64 kPage = 0x1000;
@@ -201,12 +202,15 @@ DormantStats dormantStats = {};
 // What the releases took, under contextLock, logged once more were answered and kReleaseLogMs
 // passed since the last line (noteReleases): from a block's free to its release's answer
 // (`latency`), and from a dormant block's ask to go to the worker's reap of it (`reapWait`, while
-// the worker is busy with releases); the releases kept, the most in flight at once, and the new
-// surface blocks that waited for the region's room and the ones that found none after.
+// the worker is busy with releases); the releases kept, the ones late, the most in flight at
+// once, and the new surface blocks that waited for the region's room and the ones that found
+// none after.
 struct ReleaseStats {
 	RgfxLatency latency;
 	RgfxLatency reapWait;
 	UInt64 kept;
+	// The releases not answered in kReleaseAnswerMs, each still waiting then.
+	UInt64 late;
 	UInt32 inFlightMost;
 	UInt64 roomWaits;
 	UInt64 roomWaitsFailed;
@@ -270,14 +274,18 @@ void releaseTimerFired(thread_call_param_t, thread_call_param_t)
 	thread_call_enter(releaseCall);
 }
 
-// A release done with: answered OK, the block goes out again; refused, or not answered in time,
-// or never posted, it is kept until a context close (rgfxBlockReleased).
+// A release done with: answered OK, the block goes out again; refused, or never posted, it is
+// kept until a context close posts it again (rgfxBlockReleased). A release not answered in time
+// never comes here before its answer (retireReleases).
 void finishRelease(const RgfxReleaseEntry &e, bool answered)
 {
 	const bool ok = answered && e.status == RGFX_STATUS_OK;
-	// A cached block's pages hold its cache now, or never will: its surface's locks go on,
-	// before the block can be anyone else's.
-	rgfxSurfaceCacheReleased(e.offset);
+	// Answered OK, a cached block's pages hold its cache: its surface's locks go on, and its
+	// surface and the surface's wire are let go, before the block can be anyone else's. A kept
+	// block's surface keeps them, its locks waiting, for the release posted again: the device
+	// copies the cache into the pages at that release's answer.
+	if (ok)
+		rgfxSurfaceCacheReleased(e.offset);
 	IOLockLock(contextLock);
 	if (e.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
 		dormantStats.unread++;
@@ -297,10 +305,13 @@ void finishRelease(const RgfxReleaseEntry &e, bool answered)
 	if (!ok)
 		IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
 		      e.context, e.offset, e.size,
-		      answered ? "the device refused its release" : "its release was not answered");
+		      answered ? "the device refused its release" : "its release was not posted");
 }
 
-// Retires every release answered, or waiting past kReleaseAnswerMs.
+// Retires every release answered. One waiting past kReleaseAnswerMs is logged, once, and stays in
+// flight: the device may still run a buffer over its block or copy its surface's cache into the
+// surface's pages, so its block, its wired pages, its surface and the surface's wire stay the
+// device's until the answer, which retires it as any other.
 void retireReleases()
 {
 	uint64_t timeout = 0;
@@ -314,7 +325,17 @@ void retireReleases()
 		IOLockUnlock(releaseLock);
 		if (!any)
 			return;
-		finishRelease(e, answered);
+		if (answered) {
+			finishRelease(e, true);
+			continue;
+		}
+		IOLockLock(contextLock);
+		releaseStats.late++;
+		IOLockUnlock(contextLock);
+		IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes): its release is not "
+		      "answered after %u ms: the block, its pages and its surface stay the device's until "
+		      "it is\n",
+		      e.context, e.offset, e.size, kReleaseAnswerMs);
 	}
 }
 
@@ -967,7 +988,7 @@ void noteReleases()
 	const bool log = releaseStats.latency.count != releaseStats.loggedCount &&
 	                 now - releaseStats.loggedAt >= interval;
 	UInt64 count = 0, p50 = 0, p99 = 0, most = 0, reaps = 0, r50 = 0, r99 = 0, rmost = 0;
-	UInt64 kept = 0, waits = 0, failed = 0;
+	UInt64 kept = 0, late = 0, waits = 0, failed = 0;
 	UInt32 inFlight = 0;
 	if (log) {
 		const ReleaseStats &s = releaseStats;
@@ -980,6 +1001,7 @@ void noteReleases()
 		r99 = rgfxLatencyPercentile(s.reapWait, 990);
 		rmost = s.reapWait.maxNs;
 		kept = s.kept;
+		late = s.late;
 		inFlight = s.inFlightMost;
 		waits = s.roomWaits;
 		failed = s.roomWaitsFailed;
@@ -988,11 +1010,11 @@ void noteReleases()
 	}
 	IOLockUnlock(contextLock);
 	if (log)
-		IOLog("RgfxAccelerator: releases: %llu answered (%llu kept), %u in flight at most; freed "
-		      "to answered p50 %llu us, p99 %llu us, max %llu us; dormant reaps %llu, waited p50 "
-		      "%llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none)\n",
-		      count, kept, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps, r50 / 1000,
-		      r99 / 1000, rmost / 1000, waits, failed);
+		IOLog("RgfxAccelerator: releases: %llu answered (%llu kept, %llu late), %u in flight at "
+		      "most; freed to answered p50 %llu us, p99 %llu us, max %llu us; dormant reaps %llu, "
+		      "waited p50 %llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none)\n",
+		      count, kept, late, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps,
+		      r50 / 1000, r99 / 1000, rmost / 1000, waits, failed);
 }
 
 // The most WindowServer's blocks came to at the last line of noteReserve. Under contextLock.
