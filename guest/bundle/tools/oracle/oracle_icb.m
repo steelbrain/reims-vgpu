@@ -27,6 +27,8 @@
 // found there ('.' where nothing drew, '?' where something unexpected did).
 // Build: see README.md.
 #import "oracle_common.h"
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -157,6 +159,14 @@ static void setup(void)
 	gSpin = cpso("icb_spin", NO);
 }
 
+static MTLIndirectCommandBufferDescriptor *cdesc_info(void)
+{
+	MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+	d.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+	d.maxKernelBufferBindCount = 2;
+	return d;
+}
+
 static MTLIndirectCommandBufferDescriptor *rdesc(MTLIndirectCommandType types, BOOL inheritPso,
                                                  BOOL inheritBuffers)
 {
@@ -277,6 +287,25 @@ static void exec_render(id<MTLIndirectCommandBuffer> b, NSRange range,
 	run(cb);
 }
 
+// The members of `proto` (required and optional, instance) `obj` does not respond to.
+static void responds(const char *what, id obj, Protocol *proto)
+{
+	printf("  %s (%s) lacks:", what, object_getClassName(obj));
+	int missing = 0;
+	for (int req = 1; req >= 0; req--) {
+		unsigned n = 0;
+		struct objc_method_description *m =
+		    protocol_copyMethodDescriptionList(proto, (BOOL)req, YES, &n);
+		for (unsigned i = 0; i < n; i++)
+			if (![obj respondsToSelector:m[i].name]) {
+				printf(" %s%s", req ? "" : "(opt)", sel_getName(m[i].name));
+				missing++;
+			}
+		free(m);
+	}
+	printf("%s\n", missing ? "" : " nothing");
+}
+
 // ---- info ------------------------------------------------------------------------------------
 
 static void case_info(void)
@@ -369,6 +398,34 @@ static void case_info(void)
 	}
 	printf("; texture %llu; pipeline %llu\n", (unsigned long long)gTarget.gpuResourceID._impl,
 	       (unsigned long long)gDraw.gpuResourceID._impl);
+	{
+		MTLIndirectCommandBufferDescriptor *k = [MTLIndirectCommandBufferDescriptor new];
+		k.commandTypes = MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawMeshThreadgroups;
+		k.maxVertexBufferBindCount = 1;
+		k.maxFragmentBufferBindCount = 1;
+		k.maxObjectBufferBindCount = 1;
+		k.maxMeshBufferBindCount = 1;
+		id<MTLIndirectCommandBuffer> rb = icb(k, 4);
+		id<MTLIndirectCommandBuffer> cbuf = icb(cdesc_info(), 4);
+		responds("ICB", rb, @protocol(MTLIndirectCommandBuffer));
+		responds("render command", [rb indirectRenderCommandAtIndex:0],
+		         @protocol(MTLIndirectRenderCommand));
+		responds("compute command", [cbuf indirectComputeCommandAtIndex:0],
+		         @protocol(MTLIndirectComputeCommand));
+		printf("  descriptor SPI answers:");
+		const char *spi[] = {"maxScissorRectCount", "maxViewportCount",
+		                     "inheritStencilReferenceValues", "inheritDepthTestBounds",
+		                     "inheritScissorRects", "inheritViewports", "inheritBlendColor",
+		                     "allowOverrideRenderStates", "resourceIndex"};
+		for (size_t i = 0; i < sizeof spi / sizeof spi[0]; i++) {
+			SEL sel = sel_registerName(spi[i]);
+			if ([k respondsToSelector:sel])
+				printf(" %s=%ld", spi[i], (long)((NSInteger(*)(id, SEL))objc_msgSend)(k, sel));
+			else
+				printf(" %s=(none)", spi[i]);
+		}
+		printf("\n");
+	}
 	printf("  pipelines: draw supportICB %s, add supportICB %s, spin supportICB %s\n",
 	       yesno(gDraw.supportIndirectCommandBuffers), yesno(gAdd.supportIndirectCommandBuffers),
 	       yesno(gSpin.supportIndirectCommandBuffers));
