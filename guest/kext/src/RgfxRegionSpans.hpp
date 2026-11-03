@@ -51,6 +51,14 @@ inline int rgfxRegionSpans(uint32_t type, const uint8_t *message, uint64_t size,
 		spans[0] = { m.block_offset, m.block_size };
 		return 1;
 	}
+	case RGFX_CMD_HEAP_OVER_PAGES: {
+		RgfxHeapOverPages m;
+		if (size < sizeof(m))
+			return -1;
+		__builtin_memcpy(&m, message, sizeof(m));
+		spans[0] = { m.block_offset, m.block_size };
+		return 1;
+	}
 	case RGFX_CMD_LIBRARY_FROM_REGION: {
 		RgfxLibraryFromRegion m;
 		if (size < sizeof(m))

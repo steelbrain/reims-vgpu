@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out seven:
+// its bundle carry out eight:
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
@@ -24,6 +24,9 @@
 //  - MANAGED_AT_OFFSET (bit 14): the bundle places its Managed buffers' CPU copies in heaps over
 //    its blocks (BUFFER_MANAGED_AT_OFFSET, which Submit posts as it posts BUFFER_AT_OFFSET), which
 //    needs nothing more of the kext;
+//  - HEAP_OVER_PAGES (bit 15): the bundle makes its slabs' heaps over pages blocks of one run, its
+//    superpages (HEAP_OVER_PAGES, which Submit checks names a block of the process's, as it does
+//    BUFFER_OVER_PAGES);
 //  - SUBMIT_ROOM (bit 16): a post that finds a submission ring full sets the ring's
 //    producer_waiting and waits for the host's SUBMIT_ROOM record: the framebuffer's on ring 0,
 //    the bundle's on its queues' rings.
@@ -55,7 +58,8 @@ constexpr uint64_t kRgfxOfferedFeatures =
 constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_SURFACE_ORDER |
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_UNSHARED_QUEUES |
-    RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_SUBMIT_ROOM | RGFX_FEATURE_ICB_SLOTS;
+    RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
+    RGFX_FEATURE_ICB_SLOTS;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

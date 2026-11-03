@@ -41,6 +41,15 @@ int main()
 	CHECK(s[0].offset == 0x8800000 && s[0].length == 0x2000);
 	CHECK(spansOf(RGFX_CMD_BUFFER_OVER_PAGES, pages, sizeof(pages) - 8, s) == -1);
 
+	// A heap over pages names its pages block too, not the guest RAM it lies over.
+	RgfxHeapOverPages pagesHeap = {};
+	pagesHeap.block_offset = 0x8c00000;
+	pagesHeap.block_size = 0x2000;
+	pagesHeap.size_bytes = 0x200000;
+	CHECK(spansOf(RGFX_CMD_HEAP_OVER_PAGES, pagesHeap, sizeof(pagesHeap), s) == 1);
+	CHECK(s[0].offset == 0x8c00000 && s[0].length == 0x2000);
+	CHECK(spansOf(RGFX_CMD_HEAP_OVER_PAGES, pagesHeap, sizeof(pagesHeap) - 8, s) == -1);
+
 	RgfxHeapOverHostMemory heap = {};
 	heap.region_offset = 0x9000000;
 	heap.size_bytes = 0x20000;
