@@ -347,6 +347,10 @@ def resize(q):
     q.button(False)
     th.join()
     guest("killall TextEdit", gui=True)
+    # The guest's samples as winmon gave them ("at T W H"), for a size outside the pointer's path
+    # to be read later.
+    with open(os.path.join(R, "drag-resize-track.txt"), "w") as f:
+        f.write(f"# press {x0:.0f},{y0:.0f} window {w} drag {t0:.3f}-{t1:.3f}\n" + tracker.get("out", ""))
     ws_, hs, moves = [], [], 0
     for line in tracker.get("out", "").splitlines():
         f = line.split()
