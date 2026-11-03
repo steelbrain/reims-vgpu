@@ -474,6 +474,49 @@ fn get_displays_answers_the_screen_s_mode() {
     assert_eq!(armed, 0);
 }
 
+/// A post whose guest took the record and armed the ring again before the post cleared `armed`
+/// (a consumer already awake) raises nothing and leaves the ring armed; with the record not taken
+/// the arm is cleared and the vector raised
+#[test]
+fn a_record_taken_before_the_clear_leaves_the_ring_armed() {
+    let mut rig = Rig::new();
+    rig.start();
+    let take = Arc::new(AtomicBool::new(true));
+    let t = Arc::clone(&take);
+    rig.device
+        .shared
+        .completion
+        .lock()
+        .set_between(move |region, count| {
+            if t.load(Ordering::SeqCst) {
+                region
+                    .atomic_u64(RGFX_CONTROL_COMPLETE_OFFSET + 0x40)
+                    .store(count, Ordering::SeqCst);
+            }
+            region
+                .atomic_u32(RGFX_CONTROL_COMPLETE_OFFSET + 0xc0)
+                .store(1, Ordering::SeqCst);
+        });
+    let armed = |rig: &Rig| {
+        rig.region()
+            .atomic_u32(RGFX_CONTROL_COMPLETE_OFFSET + 0xc0)
+            .load(Ordering::SeqCst)
+    };
+    rig.send(get_displays());
+    rig.event().unwrap();
+    assert_eq!(
+        rig.interrupts.load(Ordering::SeqCst),
+        0,
+        "taken: nothing raised"
+    );
+    assert_eq!(armed(&rig), 1, "the guest's arm stands");
+    take.store(false, Ordering::SeqCst);
+    rig.send(get_displays());
+    rig.event().unwrap();
+    assert_eq!(rig.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(armed(&rig), 0);
+}
+
 /// Before the guest writes `STATUS` 1 nothing is taken; once it does, what it published is
 #[test]
 fn commands_wait_for_the_driver_s_start() {

@@ -22,9 +22,11 @@
 //! reads 1 it writes the ring's id to [`RGFX_REG_DOORBELL`]. The consumer (the host) sets
 //! `consumer_idle` before it sleeps, issues a full fence and reads `producer` again, so no wake
 //! is lost, and clears it when it wakes. The producer of a completion ring (the host) publishes a
-//! message, issues a full fence and reads `armed`; if it reads 1, it clears it and raises the
-//! ring's MSI-X vector. The guest sets `armed` after it has drained the ring, issues a full fence
-//! and reads `producer` again.
+//! message, issues a full fence and reads `armed`; if it reads 1, it clears it, reads `consumer`,
+//! and raises the ring's MSI-X vector, or, where the guest has taken every message published, sets
+//! `armed` again and raises nothing: the 1 it cleared was an arm the guest made after its take.
+//! The guest stores `consumer` as it drains the ring, then sets `armed`, issues a full fence and
+//! reads `producer` again.
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -197,7 +199,8 @@ pub struct RgfxRingHeader {
     /// The rest of `consumer_idle`'s line.
     pub reserved_84: [u8; 60],
     /// 1 when the guest wants an interrupt, set by the guest on a completion ring and cleared by
-    /// the host as it raises one.
+    /// the host as it raises one; the host sets it again where the guest had taken every message
+    /// as the host cleared it.
     pub armed: u32,
     /// The rest of `armed`'s line.
     pub reserved_c4: [u8; 60],

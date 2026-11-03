@@ -4427,7 +4427,8 @@ typedef struct {
   // The rest of `consumer_idle`'s line.
   uint8_t reserved_84[60];
   // 1 when the guest wants an interrupt, set by the guest on a completion ring and cleared by
-  // the host as it raises one.
+  // the host as it raises one; the host sets it again where the guest had taken every message
+  // as the host cleared it.
   uint32_t armed;
   // The rest of `armed`'s line.
   uint8_t reserved_c4[60];

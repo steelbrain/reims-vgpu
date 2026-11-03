@@ -6,6 +6,15 @@
 //! reads its own count back from guest memory. The guest's count is read with an acquire load,
 //! and checked against the host's before anything is read of the ring: a count that runs ahead by
 //! more than the ring holds, or behind the host's, is a broken ring ([`Broken`]).
+//!
+//! **The completion rings' interrupt.** The host publishes a record, fences, then reads and
+//! clears `armed`. A guest consumer already awake (from the buffer's `CB_SCHEDULED`, say) can take
+//! that record between the publish and the clear and arm again, so the clear takes an arm made
+//! after the take: a vector for a record already taken, and the guest asleep with `armed` 0, for
+//! which the host raises nothing more. So a post whose clear read 1 reads `consumer` too, and
+//! where the guest has taken every record published, sets `armed` back and raises nothing
+//! ([`rearm_or_raise`]). The guest stores `consumer` before it arms, so a clear that read its arm
+//! sees its take; only the host writes 0, so the store of 1 undoes nothing of the guest's.
 
 use std::sync::atomic::{Ordering, fence};
 
@@ -290,11 +299,36 @@ impl Consumer {
     }
 }
 
+/// What a completion ring's post does about its interrupt ([`rearm_or_raise`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// The guest had not armed the ring: nothing.
+    Unarmed,
+    /// Armed, with a record the guest has not taken: the ring stays cleared and the vector is
+    /// raised.
+    Raise,
+    /// Armed, with every record taken: the arm is one the guest made after its take, or one it
+    /// makes again before it sleeps, so the ring is armed again and nothing is raised.
+    Rearm,
+}
+
+/// What a post does about the interrupt, from `armed` as its clear read it and the guest's
+/// `consumer` read after the clear, against `count`, the host's count with the message published.
+pub(crate) fn rearm_or_raise(prev_armed: u32, consumer: u64, count: u64) -> Wake {
+    if prev_armed != 1 {
+        Wake::Unarmed
+    } else if consumer == count {
+        Wake::Rearm
+    } else {
+        Wake::Raise
+    }
+}
+
 /// What [`Producer::post`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Posted {
     /// The message is in the ring and published. `raise` is whether the guest had armed the
-    /// ring, which the post cleared: the host raises the ring's vector.
+    /// ring and not taken every record ([`rearm_or_raise`]): the host raises the ring's vector.
     Yes {
         /// Raise the ring's interrupt.
         raise: bool,
@@ -312,12 +346,42 @@ pub(crate) struct Producer {
     at: RingAt,
     /// The host's count: what it has published.
     count: u64,
+    /// Tests: what the guest does between a post's publish and its clear of `armed`.
+    #[cfg(test)]
+    between: Option<Between>,
+}
+
+/// Tests: a guest's steps between a post's publish and its clear, given the region and the
+/// host's count.
+#[cfg(test)]
+struct Between(BetweenSteps);
+
+/// Tests: what [`Between`] runs.
+#[cfg(test)]
+type BetweenSteps = Box<dyn FnMut(&Region, u64) + Send>;
+
+#[cfg(test)]
+impl std::fmt::Debug for Between {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Between")
+    }
 }
 
 impl Producer {
     /// The producer of a ring at `at`, nothing published yet.
     pub(crate) fn new(at: RingAt) -> Producer {
-        Producer { at, count: 0 }
+        Producer {
+            at,
+            count: 0,
+            #[cfg(test)]
+            between: None,
+        }
+    }
+
+    /// Tests: runs `between` in each post from now on, after the publish and before the clear.
+    #[cfg(test)]
+    pub(crate) fn set_between(&mut self, between: impl FnMut(&Region, u64) + Send + 'static) {
+        self.between = Some(Between(Box::new(between)));
     }
 
     /// Back to a ring nothing has passed through ([`RingAt::initialize`]), `consumer_idle` 0.
@@ -328,8 +392,9 @@ impl Producer {
 
     /// Writes `message` (its header first, its `size` its length, a multiple of 8, at least 16
     /// and at most the ring) and publishes it: first a pad to the ring's end where the bytes left
-    /// there are fewer than the message. Then a full fence, and `armed` read and cleared
-    /// ([`Posted::Yes`]).
+    /// there are fewer than the message. Then a full fence, `armed` read and cleared, and where it
+    /// read 1, `consumer` read and the ring armed again where the guest took every record
+    /// ([`rearm_or_raise`], [`Posted::Yes`]).
     pub(crate) fn post(&mut self, region: &Region, message: &[u8]) -> Posted {
         let len = message.len() as u64;
         debug_assert!(len.is_multiple_of(8) && len >= HEADER_SIZE && len <= self.at.data_size);
@@ -372,12 +437,27 @@ impl Producer {
         region
             .atomic_u64(self.at.header + PRODUCER)
             .store(self.count, Ordering::Release);
+        #[cfg(test)]
+        if let Some(between) = &mut self.between {
+            (between.0)(region, self.count);
+        }
         fence(Ordering::SeqCst);
-        let raise = region
-            .atomic_u32(self.at.header + ARMED)
-            .swap(0, Ordering::SeqCst)
-            == 1;
-        Posted::Yes { raise }
+        let armed = region.atomic_u32(self.at.header + ARMED);
+        let prev = armed.swap(0, Ordering::SeqCst);
+        let wake = if prev == 1 {
+            let consumer = region
+                .atomic_u64(self.at.header + CONSUMER)
+                .load(Ordering::SeqCst);
+            rearm_or_raise(prev, consumer, self.count)
+        } else {
+            Wake::Unarmed
+        };
+        if wake == Wake::Rearm {
+            armed.store(1, Ordering::SeqCst);
+        }
+        Posted::Yes {
+            raise: wake == Wake::Raise,
+        }
     }
 }
 
@@ -623,4 +703,69 @@ mod tests {
         producer.reset(&region);
         assert_eq!(completed(), 0);
     }
+
+    /// An unarmed ring raises nothing; an armed one raises while a record is not taken, and is
+    /// armed again where every record is
+    #[test]
+    fn a_post_raises_or_arms_again_by_what_the_guest_took() {
+        assert_eq!(rearm_or_raise(0, 0, 24), Wake::Unarmed);
+        assert_eq!(rearm_or_raise(0, 24, 24), Wake::Unarmed);
+        assert_eq!(rearm_or_raise(2, 24, 24), Wake::Unarmed, "only 1 arms");
+        assert_eq!(rearm_or_raise(1, 0, 24), Wake::Raise);
+        assert_eq!(rearm_or_raise(1, 16, 24), Wake::Raise);
+        assert_eq!(rearm_or_raise(1, 24, 24), Wake::Rearm);
+        assert_eq!(rearm_or_raise(1, u64::MAX, u64::MAX), Wake::Rearm);
+    }
+
+    /// A guest that takes the record and arms between the post's publish and its clear (a
+    /// consumer already awake) keeps its arm, and nothing is raised; one that arms with the
+    /// record not taken has it raised and cleared; one that only takes has nothing raised
+    #[test]
+    fn an_arm_after_the_take_survives_the_post() {
+        let region = Region::new(4096).unwrap();
+        let mut producer = Producer::new(AT);
+        producer.reset(&region);
+        let complete = sized(&RgfxComplete {
+            header: RgfxMsgHeader {
+                r#type: crate::wire::RGFX_EVT_COMPLETE,
+                size: 0,
+                seqno: 1,
+            },
+            status: 0,
+            reserved_14: 0,
+        });
+        let take = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let arm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (t, a) = (take.clone(), arm.clone());
+        producer.set_between(move |region, count| {
+            if t.load(Ordering::SeqCst) {
+                region.atomic_u64(CONSUMER).store(count, Ordering::Release);
+            }
+            if a.load(Ordering::SeqCst) {
+                region.atomic_u32(ARMED).store(1, Ordering::SeqCst);
+            }
+        });
+        let armed = || region.atomic_u32(ARMED).load(Ordering::SeqCst);
+        assert_eq!(
+            producer.post(&region, &complete),
+            Posted::Yes { raise: false }
+        );
+        assert_eq!(armed(), 1, "the arm made after the take stands");
+        take.store(false, Ordering::SeqCst);
+        assert_eq!(
+            producer.post(&region, &complete),
+            Posted::Yes { raise: true }
+        );
+        assert_eq!(armed(), 0);
+        take.store(true, Ordering::SeqCst);
+        arm.store(false, Ordering::SeqCst);
+        assert_eq!(
+            producer.post(&region, &complete),
+            Posted::Yes { raise: false }
+        );
+        assert_eq!(armed(), 0);
+    }
 }
+
+#[cfg(test)]
+mod interleavings;
