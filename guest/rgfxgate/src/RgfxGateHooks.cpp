@@ -166,15 +166,28 @@ void installHooks(KernelPatcher &patcher) {
 	else
 		patcher.clearError();
 
+	// Build the routes. The signature hook is useful only with
+	// csblob_get_cdhash: without it wrapVSig cannot know our blob and would just
+	// pass every signature check through. Where that symbol did not resolve (a
+	// future macOS renames or drops it), leave the signature hook out and say so
+	// loudly: our bundle then fails the signature wall and WindowServer
+	// crash-loops with no GPU, so the inert gate is named in the log rather than
+	// left a silent brick, exactly as the csfg miss disables the whole gate.
 	KernelPatcher::RouteRequest reqs[] = {
 		{"_mac_file_check_library_validation", wrapLibVal, orgLibVal},
 		{"_mac_file_check_mmap", wrapMmap, orgMmap},
-		{"_mac_vnode_check_signature", wrapVSig, orgVSig},
 		{"_mac_vnode_check_create", wrapVCreate, orgVCreate},
 		{"_mac_vnode_check_open", wrapVOpen, orgVOpen},
 		{"_mac_vnode_check_truncate", wrapVTrunc, orgVTrunc},
+		{"_mac_vnode_check_signature", wrapVSig, orgVSig}, // last: dropped below if no csblob
 	};
-	if (!patcher.routeMultiple(KernelPatcher::KernelID, reqs, arrsize(reqs), 0, 0, true, true)) {
+	size_t count = arrsize(reqs);
+	if (gCsblobGetCdhash == nullptr) {
+		SYSLOG("rgfxgate", "could not resolve _csblob_get_cdhash; signature gate "
+		                   "inert, our bundle will not load");
+		count -= 1; // drop the trailing signature route
+	}
+	if (!patcher.routeMultiple(KernelPatcher::KernelID, reqs, count, 0, 0, true, true)) {
 		SYSLOG("rgfxgate", "routeMultiple failed (err %d)", patcher.getError());
 		patcher.clearError();
 		return;
