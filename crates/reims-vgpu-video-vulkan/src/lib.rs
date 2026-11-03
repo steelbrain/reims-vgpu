@@ -26,6 +26,14 @@
 //! - [`DecodeImages`] and [`HostBuffers`] make outputs of their own, and
 //!   [`Picture::read_back`] copies an image out, for the tests and tools.
 //!
+//! - [`H264Encoder`] and [`H265Encoder`] encode frames on an encode queue
+//!   attached to the device ([`VideoDevice::attach_encode`]): sources read
+//!   in place ([`SourceSpec`]) or through one GPU copy out of a buffer, the
+//!   bitstream written straight into a buffer their [`BitstreamSource`]
+//!   gives, host pages imported by their pointer among them. What each
+//!   profile encodes is [`h264_encode_capabilities`] and
+//!   [`h265_encode_capabilities`].
+//!
 //! Every `unsafe` block holds one operation and says why it is sound, and
 //! every `unsafe fn` its contract (the lints below).
 
@@ -36,6 +44,7 @@
 )]
 
 mod device;
+mod encode;
 mod error;
 mod h264;
 mod h265;
@@ -50,6 +59,21 @@ mod surface;
 mod timeline;
 
 pub use device::{RawDevice, VideoDevice};
+pub use encode::caps::{
+    EncodeCapabilities, EncodeCodec, EncodeProfile, QualityPreference, Tuning,
+    h264_encode_capabilities, h265_encode_capabilities,
+};
+pub use encode::device::{ENCODE_EXTENSIONS, RawEncodeQueue};
+pub use encode::frame::{EncodeStatus, EncodedFrame, Feedback, GpuTime};
+pub use encode::io::{
+    BitstreamBuffer, BitstreamSource, BitstreamSpec, BitstreamTarget, EncodeSource, HostBitstream,
+    HostBitstreams, ImportedBitstream, ImportedSource, SourcePicture, SourceSpec,
+};
+pub use encode::plan::{GopConfig, MAX_B_FRAMES, PictureKind};
+pub use encode::rate::{DEFAULT_BUFFER_MS, DEFAULT_INITIAL_MS, RateControl, Vbv};
+pub use encode::{
+    EncodeConfig, FrameParams, H264Encoder, H265Encoder, ParameterSetMode, SourceCounts,
+};
 pub use error::Error;
 pub use h264::{Frame, H264Decoder};
 pub use h265::{H265Decoder, H265Frame};

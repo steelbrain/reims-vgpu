@@ -37,7 +37,7 @@ use ash::vk::native::{
 
 use crate::device::VideoDevice;
 use crate::error::{Error, Named};
-use crate::import::{BufferUse, ImportBuffer, SampleMemory, buffer_over};
+use crate::import::{AnyProfile, BufferUse, ImportBuffer, SampleMemory, buffer_over};
 use crate::picture::{ImageView, color_range, plane, planes};
 use crate::profile::{Capabilities, VideoProfile};
 use crate::surface::{BufferPlanes, bind_image_memory};
@@ -291,7 +291,7 @@ pub(crate) enum Target {
 /// The copy regions of the crop `(x, y, width, height)` into `planes`:
 /// the luma plane's, then the chroma plane's at half the size, of samples
 /// of `sample_bytes` bytes (1 in NV12, 2 in P010).
-fn buffer_regions(
+pub(crate) fn buffer_regions(
     planes: &BufferPlanes,
     crop: (u32, u32, u32, u32),
     sample_bytes: u32,
@@ -575,68 +575,7 @@ impl<P: SessionParameters> Session<P> {
 
     /// Binds memory of its own to each of the session's bindings.
     fn bind_memory(&mut self) -> Result<(), Error> {
-        let fp = self.device.video().fp();
-        let vk_device = self.device.device().handle();
-        let mut count = 0;
-        // SAFETY: the session is the device's; a null output asks for the
-        // count alone.
-        unsafe {
-            (fp.get_video_session_memory_requirements_khr)(
-                vk_device,
-                self.handle,
-                &mut count,
-                std::ptr::null_mut(),
-            )
-        }
-        .named("vkGetVideoSessionMemoryRequirementsKHR")?;
-        let mut requirements = vec![
-            vk::VideoSessionMemoryRequirementsKHR::default();
-            usize::try_from(count).unwrap_or(0)
-        ];
-        // SAFETY: as above, with an output of `count` elements.
-        unsafe {
-            (fp.get_video_session_memory_requirements_khr)(
-                vk_device,
-                self.handle,
-                &mut count,
-                requirements.as_mut_ptr(),
-            )
-        }
-        .named("vkGetVideoSessionMemoryRequirementsKHR")?;
-        requirements.truncate(usize::try_from(count).unwrap_or(0));
-        let mut binds = Vec::with_capacity(requirements.len());
-        for requirement in &requirements {
-            let memory = self.device.allocate(
-                &requirement.memory_requirements,
-                &[
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    vk::MemoryPropertyFlags::empty(),
-                ],
-                None,
-            )?;
-            self.memory.push(memory);
-            binds.push(
-                vk::BindVideoSessionMemoryInfoKHR::default()
-                    .memory_bind_index(requirement.memory_bind_index)
-                    .memory(memory)
-                    .memory_offset(0)
-                    .memory_size(requirement.memory_requirements.size),
-            );
-        }
-        if binds.is_empty() {
-            return Ok(());
-        }
-        // SAFETY: each memory was allocated for its binding, which is bound
-        // to none yet; the array lives through the call.
-        unsafe {
-            (fp.bind_video_session_memory_khr)(
-                vk_device,
-                self.handle,
-                u32::try_from(binds.len()).unwrap_or(u32::MAX),
-                binds.as_ptr(),
-            )
-        }
-        .named("vkBindVideoSessionMemoryKHR")
+        bind_session_memory(&self.device, self.handle, &mut self.memory)
     }
 
     /// The DPB slots the session has.
@@ -765,8 +704,9 @@ impl<P: SessionParameters> Session<P> {
         let families = [self.device.decode_family()];
         let made_for = BufferUse {
             usage: vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
+            flags: vk::BufferCreateFlags::empty(),
             families: &families,
-            profile: Some(self.caps.profile),
+            profile: Some(AnyProfile::Decode(self.caps.profile)),
         };
         let Some((buffer, base)) = buffer_over(&self.device, import, at, at + range, made_for)?
         else {
@@ -1280,8 +1220,78 @@ impl<P: SessionParameters> Drop for Session<P> {
     }
 }
 
+/// Binds memory of its own to each of `session`'s bindings, pushing each
+/// allocation to `memory`, which the caller frees once the session is
+/// destroyed.
+pub(crate) fn bind_session_memory(
+    device: &VideoDevice,
+    session: vk::VideoSessionKHR,
+    memory: &mut Vec<vk::DeviceMemory>,
+) -> Result<(), Error> {
+    let fp = device.video().fp();
+    let vk_device = device.device().handle();
+    let mut count = 0;
+    // SAFETY: the session is the device's; a null output asks for the
+    // count alone.
+    unsafe {
+        (fp.get_video_session_memory_requirements_khr)(
+            vk_device,
+            session,
+            &mut count,
+            std::ptr::null_mut(),
+        )
+    }
+    .named("vkGetVideoSessionMemoryRequirementsKHR")?;
+    let mut requirements =
+        vec![vk::VideoSessionMemoryRequirementsKHR::default(); usize::try_from(count).unwrap_or(0)];
+    // SAFETY: as above, with an output of `count` elements.
+    unsafe {
+        (fp.get_video_session_memory_requirements_khr)(
+            vk_device,
+            session,
+            &mut count,
+            requirements.as_mut_ptr(),
+        )
+    }
+    .named("vkGetVideoSessionMemoryRequirementsKHR")?;
+    requirements.truncate(usize::try_from(count).unwrap_or(0));
+    let mut binds = Vec::with_capacity(requirements.len());
+    for requirement in &requirements {
+        let allocated = device.allocate(
+            &requirement.memory_requirements,
+            &[
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::empty(),
+            ],
+            None,
+        )?;
+        memory.push(allocated);
+        binds.push(
+            vk::BindVideoSessionMemoryInfoKHR::default()
+                .memory_bind_index(requirement.memory_bind_index)
+                .memory(allocated)
+                .memory_offset(0)
+                .memory_size(requirement.memory_requirements.size),
+        );
+    }
+    if binds.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: each memory was allocated for its binding, which is bound
+    // to none yet; the array lives through the call.
+    unsafe {
+        (fp.bind_video_session_memory_khr)(
+            vk_device,
+            session,
+            u32::try_from(binds.len()).unwrap_or(u32::MAX),
+            binds.as_ptr(),
+        )
+    }
+    .named("vkBindVideoSessionMemoryKHR")
+}
+
 /// `extent` rounded up to whole multiples of `granularity` each way.
-fn granular(extent: vk::Extent2D, granularity: vk::Extent2D) -> vk::Extent2D {
+pub(crate) fn granular(extent: vk::Extent2D, granularity: vk::Extent2D) -> vk::Extent2D {
     let up = |size: u32, step: u32| size.next_multiple_of(step.max(1));
     vk::Extent2D {
         width: up(extent.width, granularity.width),
@@ -1290,7 +1300,7 @@ fn granular(extent: vk::Extent2D, granularity: vk::Extent2D) -> vk::Extent2D {
 }
 
 /// A command pool of `family` whose command buffers are reset one by one.
-fn command_pool(device: &VideoDevice, family: u32) -> Result<vk::CommandPool, Error> {
+pub(crate) fn command_pool(device: &VideoDevice, family: u32) -> Result<vk::CommandPool, Error> {
     let info = vk::CommandPoolCreateInfo::default()
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
         .queue_family_index(family);
@@ -1299,7 +1309,7 @@ fn command_pool(device: &VideoDevice, family: u32) -> Result<vk::CommandPool, Er
 }
 
 /// A primary command buffer of `pool`, which the session alone uses.
-fn allocate_command(
+pub(crate) fn allocate_command(
     device: &VideoDevice,
     pool: vk::CommandPool,
 ) -> Result<vk::CommandBuffer, Error> {
@@ -1317,7 +1327,7 @@ fn allocate_command(
 }
 
 /// Begins `command` anew, its last work done.
-fn begin(device: &ash::Device, command: vk::CommandBuffer) -> Result<(), Error> {
+pub(crate) fn begin(device: &ash::Device, command: vk::CommandBuffer) -> Result<(), Error> {
     // SAFETY: the command buffer is a session's, from a pool that resets
     // them one by one, and its last work is done.
     unsafe { device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty()) }

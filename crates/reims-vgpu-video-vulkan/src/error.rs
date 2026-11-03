@@ -13,6 +13,9 @@ pub enum Error {
     /// No device decodes the codec through Vulkan Video, or the device
     /// given does not: why, device by device.
     NoVideoDecode(String),
+    /// No encode queue encodes the codec through Vulkan Video on the
+    /// device given, or the device has no encode queue attached: why.
+    NoVideoEncode(String),
     /// What the stream needs and the device does not do.
     Unsupported(String),
     /// An H.264 stream, refused by the decoding process above the
@@ -32,6 +35,7 @@ impl std::fmt::Display for Error {
             Self::Loader(why) => write!(f, "no Vulkan loader: {why}"),
             Self::Vulkan(call, result) => write!(f, "{call}: {result}"),
             Self::NoVideoDecode(why) => write!(f, "no Vulkan Video decode: {why}"),
+            Self::NoVideoEncode(why) => write!(f, "no Vulkan Video encode: {why}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Stream(error) => write!(f, "{error}"),
             Self::H265Stream(error) => write!(f, "{error}"),

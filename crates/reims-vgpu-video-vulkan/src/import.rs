@@ -10,6 +10,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::device::VideoDevice;
+use crate::encode::caps::EncodeProfile;
 use crate::error::{Error, Named};
 use crate::profile::VideoProfile;
 use crate::surface::{BufferPlanes, Landing, Surface};
@@ -49,11 +50,30 @@ pub struct HostImport {
 pub(crate) struct BufferUse<'a> {
     /// Its usage.
     pub(crate) usage: vk::BufferUsageFlags,
+    /// Its create flags.
+    pub(crate) flags: vk::BufferCreateFlags,
     /// The families it is shared between, `CONCURRENT` where more than
     /// one.
     pub(crate) families: &'a [u32],
-    /// The video profile a decode's use of it names, if any.
-    pub(crate) profile: Option<VideoProfile>,
+    /// The video profile a decode's or encode's use of it names, if any.
+    pub(crate) profile: Option<AnyProfile>,
+}
+
+/// A decode or an encode profile, as a buffer's create info names it.
+#[derive(Clone, Copy)]
+pub(crate) enum AnyProfile {
+    Decode(VideoProfile),
+    Encode(EncodeProfile),
+}
+
+impl AnyProfile {
+    /// Calls `f` with a `VkVideoProfileListInfoKHR` of the profile alone.
+    fn with_list<R>(&self, f: impl FnOnce(&mut vk::VideoProfileListInfoKHR<'_>) -> R) -> R {
+        match self {
+            Self::Decode(profile) => profile.with_list(f),
+            Self::Encode(profile) => profile.with_list(f),
+        }
+    }
 }
 
 /// A buffer over `import`'s memory from `from` (an offset in the memory)
@@ -119,6 +139,7 @@ fn unbound(
     let mut external =
         vk::ExternalMemoryBufferCreateInfo::default().handle_types(import.handle_type);
     let info = vk::BufferCreateInfo::default()
+        .flags(made_for.flags)
         .size(size.max(1))
         .usage(made_for.usage)
         .push_next(&mut external);
@@ -226,6 +247,7 @@ impl ImportedPlanes {
         let families = device.output_families();
         let made_for = BufferUse {
             usage: vk::BufferUsageFlags::TRANSFER_DST,
+            flags: vk::BufferCreateFlags::empty(),
             families: &families,
             profile: None,
         };

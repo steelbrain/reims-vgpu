@@ -10,11 +10,12 @@
 //! video-decode queue, for the tests and the tools.
 
 use std::ffi::{CStr, c_char, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use reims_vgpu_video_core::sync::Mutex;
 
+use crate::encode::device::{EncodeChoice, EncodeQueue, RawEncodeQueue};
 use crate::error::{Error, Named};
 use crate::lent::{LentCopies, LentQueue, Submitter};
 
@@ -143,6 +144,8 @@ pub struct VideoDevice {
     submitter: Submitter,
     /// Whether the device and instance are ours to destroy.
     owned: bool,
+    /// The encoders' queue, once attached ([`VideoDevice::attach_encode`]).
+    pub(crate) encode: OnceLock<EncodeQueue>,
 }
 
 /// What [`VideoDevice::create`] found on one physical device.
@@ -163,6 +166,9 @@ struct Choice {
     /// The kind of device, best first: discrete, integrated, virtual,
     /// then any other.
     rank: u8,
+    /// A queue of a video-encode family the device has one free for, and
+    /// the codecs it encodes.
+    encode: Option<EncodeChoice>,
 }
 
 /// The queue flags of a family that copies: every graphics or compute
@@ -253,7 +259,11 @@ impl VideoDevice {
     /// the decode family decodes H.265 too, and
     /// `VK_KHR_video_maintenance1` and `VK_KHR_unified_image_layouts`'s
     /// `unifiedImageLayoutsVideo` where the device has them. Its copies run on the decode queue where the
-    /// decode family copies, else on the graphics queue.
+    /// decode family copies, else on the graphics queue. Where a family
+    /// encodes H.264 or H.265 through Vulkan Video, it has one encode queue
+    /// too, of a family of its own, else a second queue of the decode
+    /// family's, with the encode extensions the family's codecs need
+    /// ([`Self::attach_encode`]'s queue).
     /// [`Error::NoVideoDecode`] says why each device was passed over where
     /// none decodes H.264.
     pub fn create() -> Result<Arc<Self>, Error> {
@@ -267,7 +277,29 @@ impl VideoDevice {
         // SAFETY: `info` and what it points at live through the call.
         let instance = unsafe { entry.create_instance(&info, None) }.named("vkCreateInstance")?;
         match make_device(&instance) {
-            Ok((choice, device)) => Ok(Arc::new(Self::owned(entry, instance, choice, device))),
+            Ok((choice, device)) => {
+                let encode = choice.encode;
+                let maintenance1 = choice.maintenance1;
+                let made = Self::owned(entry, instance, choice, device);
+                if let Some(encode) = encode {
+                    // SAFETY: the device was made with this queue and the
+                    // encode extensions of its codecs; nothing else submits
+                    // to it.
+                    let queue =
+                        unsafe { made.device.get_device_queue(encode.family, encode.index) };
+                    let raw = RawEncodeQueue {
+                        family: encode.family,
+                        queue,
+                        codecs: encode.codecs,
+                        video_maintenance1: maintenance1,
+                    };
+                    // SAFETY: as above.
+                    if let Err(error) = unsafe { made.attach_encode(raw) } {
+                        log::debug!("no encode queue: {error}");
+                    }
+                }
+                Ok(Arc::new(made))
+            }
             Err(error) => {
                 // SAFETY: nothing made from the instance is left.
                 unsafe { instance.destroy_instance(None) };
@@ -355,6 +387,7 @@ impl VideoDevice {
             decode,
             submitter,
             owned,
+            encode: OnceLock::new(),
         }
     }
 
@@ -501,7 +534,7 @@ impl VideoDevice {
     /// `queue` is the device's and held by the caller for the call; the
     /// submissions' command buffers are recorded and their semaphores, and
     /// `fence` where given, the device's.
-    unsafe fn queue_submit2(
+    pub(crate) unsafe fn queue_submit2(
         &self,
         queue: vk::Queue,
         submits: &[vk::SubmitInfo2<'_>],
@@ -664,8 +697,26 @@ fn make_device(instance: &ash::Instance) -> Result<(Choice, ash::Device), Error>
                 .queue_priorities(&priorities[..1]),
         ]
     };
+    let mut queue_infos = queue_infos;
+    if let Some(encode) = choice.encode.filter(|e| e.index == 0) {
+        queue_infos.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(encode.family)
+                .queue_priorities(&priorities[..1]),
+        );
+    } else if let Some(encode) = choice.encode {
+        // The encode queue is the decode family's second.
+        for info in &mut queue_infos {
+            if info.queue_family_index == encode.family {
+                *info = info.queue_priorities(&priorities[..2]);
+            }
+        }
+    }
     let mut extensions: Vec<*const c_char> =
         REQUIRED_EXTENSIONS.iter().map(|e| e.as_ptr()).collect();
+    if let Some(encode) = choice.encode {
+        extensions.extend(encode.extensions().iter().map(|e| e.as_ptr()));
+    }
     if choice.maintenance1 {
         extensions.push(ash::khr::video_maintenance1::NAME.as_ptr());
     }
@@ -796,6 +847,16 @@ fn examine(
             "{name}: timeline semaphores and synchronization2 are needed"
         ));
     }
+    let encode = EncodeChoice::find(
+        &flags,
+        &video,
+        &has,
+        decode_family,
+        graphics_family,
+        flags
+            .get(usize::try_from(decode_family).unwrap_or(usize::MAX))
+            .map_or(0, |&(_, count)| count),
+    );
     let rank = match properties.device_type {
         vk::PhysicalDeviceType::DISCRETE_GPU => 0,
         vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
@@ -814,5 +875,6 @@ fn examine(
             && unified.unified_image_layouts == vk::TRUE
             && unified.unified_image_layouts_video == vk::TRUE,
         rank,
+        encode,
     })
 }

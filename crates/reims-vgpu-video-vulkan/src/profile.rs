@@ -436,43 +436,51 @@ fn video_formats(
     profile: VideoProfile,
     usage: vk::ImageUsageFlags,
 ) -> Result<Vec<vk::VideoFormatPropertiesKHR<'static>>, Error> {
+    profile.with_list(|list| video_formats_in(device, list, usage))
+}
+
+/// The formats the profiles of `list` take for `usage`: decode into or
+/// predict from, encode from.
+pub(crate) fn video_formats_in(
+    device: &VideoDevice,
+    list: &mut vk::VideoProfileListInfoKHR<'_>,
+    usage: vk::ImageUsageFlags,
+) -> Result<Vec<vk::VideoFormatPropertiesKHR<'static>>, Error> {
     let fp = device.video_instance().fp();
-    profile.with_list(|list| {
-        let info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
-            .image_usage(usage)
-            .push_next(list);
-        let mut count = 0;
-        // SAFETY: as in `profile_capabilities`; a null output asks for the
-        // count alone.
-        let result = unsafe {
-            (fp.get_physical_device_video_format_properties_khr)(
-                device.physical_device(),
-                &info,
-                &mut count,
-                std::ptr::null_mut(),
-            )
-        };
-        if result == vk::Result::ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR
-            || result == vk::Result::ERROR_FORMAT_NOT_SUPPORTED
-        {
-            return Ok(Vec::new());
-        }
-        result.named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
-        let mut formats =
-            vec![vk::VideoFormatPropertiesKHR::default(); usize::try_from(count).unwrap_or(0)];
-        // SAFETY: as above, with an output of `count` elements.
-        unsafe {
-            (fp.get_physical_device_video_format_properties_khr)(
-                device.physical_device(),
-                &info,
-                &mut count,
-                formats.as_mut_ptr(),
-            )
-        }
-        .named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
-        formats.truncate(usize::try_from(count).unwrap_or(0));
-        Ok(formats)
-    })
+    let info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(usage)
+        .push_next(list);
+    let mut count = 0;
+    // SAFETY: the physical device is the instance's; `info` and its chain
+    // live through the call; a null output asks for the count alone.
+    let result = unsafe {
+        (fp.get_physical_device_video_format_properties_khr)(
+            device.physical_device(),
+            &info,
+            &mut count,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == vk::Result::ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR
+        || result == vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+    {
+        return Ok(Vec::new());
+    }
+    result.named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
+    let mut formats =
+        vec![vk::VideoFormatPropertiesKHR::default(); usize::try_from(count).unwrap_or(0)];
+    // SAFETY: as above, with an output of `count` elements.
+    unsafe {
+        (fp.get_physical_device_video_format_properties_khr)(
+            device.physical_device(),
+            &info,
+            &mut count,
+            formats.as_mut_ptr(),
+        )
+    }
+    .named("vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
+    formats.truncate(usize::try_from(count).unwrap_or(0));
+    Ok(formats)
 }
 
 /// Whether images of `format` that no decode writes, copied into, sampled
