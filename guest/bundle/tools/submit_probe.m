@@ -1,7 +1,8 @@
 // submit_probe: the fixed cost and the latency of a command buffer on a Metal device, and of a
 // shared event's signal, to compare a guest's GPU lane with real Macs. No shaders: a "tiny"
 // command buffer is one blit filling 16 bytes of a Shared buffer, an "empty" one has no encoder.
-//   submit_probe [-d NAME] [-t SECONDS] [-g MICROSECONDS] [-n THREADS] [-q QUEUES] [-v] [-l] [CASE...]
+//   submit_probe [-d NAME] [-t SECONDS] [-g MICROSECONDS] [-n THREADS] [-q QUEUES] [-s SECONDS] [-v] [-l]
+//                [CASE...]
 //     -d NAME   the first of MTLCopyAllDevices whose name holds NAME; the default is
 //               MTLCreateSystemDefaultDevice (on a dual-GPU MacBook pass -d, which keeps the
 //               display where it is).
@@ -11,6 +12,9 @@
 //     -n MAX    the most threads of the mt cases (default 8; they run 2, 4 and 8, up to MAX).
 //     -q N      makes N more queues first, each with one command buffer run through it, and keeps
 //               them idle for the whole run: what a device with many quiet queues costs the cases.
+//               It prints how many it made; newCommandQueue answering nil ends the making there.
+//     -s SEC    after making the -q queues, holds them SEC seconds before the cases run, so several
+//               processes can hold quiet queues on one device while another measures.
 //     -v        two more lines a case: "# top" with the 8 largest samples of its first
 //               distribution (each with when it was taken, seconds into the case, and the
 //               wall-clock time), and "# hist" with its log2 histogram in microseconds.
@@ -76,6 +80,7 @@ static double gSeconds = 3;
 static double gGapUs = 2000;
 static int gMaxThreads = 8;
 static int gIdleQueues;
+static double gHoldSeconds;
 static BOOL gVerbose;
 static double gNsPerTick;
 
@@ -863,6 +868,8 @@ int main(int argc, char **argv)
 				gMaxThreads = atoi(argv[++i]);
 			else if (strcmp(argv[i], "-q") == 0 && i + 1 < argc)
 				gIdleQueues = atoi(argv[++i]);
+			else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
+				gHoldSeconds = atof(argv[++i]);
 			else if (strcmp(argv[i], "-l") == 0)
 				list = YES;
 			else if (strcmp(argv[i], "-v") == 0)
@@ -913,19 +920,29 @@ int main(int argc, char **argv)
 		if (gIdleQueues > 0) {
 			id<MTLBuffer> buf = newShared();
 			double q0 = nowUs();
+			// Under the watchdog: a queue whose command buffer never completes is a hang.
+			atomic_store(&gCaseName, "making idle queues");
+			atomic_store(&gBusy, 1);
 			for (int i = 0; i < gIdleQueues; i++) {
 				@autoreleasepool {
 					id<MTLCommandQueue> q = [gDevice newCommandQueue];
-					if (q == nil)
+					if (q == nil) {
+						printf("submit_probe: newCommandQueue answered nil after %d idle queues\n", i);
 						break;
+					}
 					[idle addObject:q];
 					id<MTLCommandBuffer> cb = makeBuffer(q, buf, YES, i);
 					[cb commit];
 					[cb waitUntilCompleted];
+					progress();
 				}
 			}
+			atomic_store(&gBusy, 0);
 			printf("submit_probe: %lu idle queues made in %.0f ms\n", (unsigned long)idle.count,
 			       (nowUs() - q0) / 1e3);
+			fflush(stdout);
+			if (gHoldSeconds > 0)
+				usleep((useconds_t)(gHoldSeconds * 1e6));
 		}
 
 		runCase(@"rate.commit.empty", ^{ return commitRate(NO); });
