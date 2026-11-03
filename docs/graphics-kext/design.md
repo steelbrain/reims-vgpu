@@ -1736,8 +1736,19 @@ commit. Each outcome the new design allows is one of those two:
   of the same context not answered at its take is not waited for either: the
   guest sent the message with no answer from it, so under the lock the message
   could have come before its take, and the buffer may see the bytes, as it may
-  on Metal. Tested by `a_buffer_sent_after_an_answer_is_committed_after_it` (its
-  range messages) and the sequencer's `a_range_message_waits_for_its_context_alone`.
+  on Metal. Ring 0 does not wait for those tickets: the message is checked
+  there (a bad reference or a range past its object is found at once), and its
+  copy and its platform call are made where the last ticket is given back,
+  after that buffer's commit, a context's range messages one at a time in the
+  order they came. Every command buffer of the context begun after it came is
+  committed after it, as one begun after ring 0 carried it out was, and it
+  holds its context's drain, so the context's close and its blocks' releases
+  are answered after it. It reads the block when it runs, not when it came: a
+  CPU write made after the message and before the next commit may reach the
+  GPU with it, as Metal's copy of a `Managed` resource is made at the next
+  submission. Tested by `a_buffer_sent_after_an_answer_is_committed_after_it`
+  (its range messages) and the sequencer's
+  `a_range_message_is_carried_out_once_its_context_s_tickets_are_given_back`.
 - **Device caches.** A command buffer counts among the users of each cached
   block it uses from its begin to its commit. A fill waits for every user, and
   a copy out of a cache (a download, a release, the block named again) for every
@@ -1822,10 +1833,9 @@ commit. Each outcome the new design allows is one of those two:
   `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order` and
   `busy_lanes_hold_one_thread_each_and_the_budget_s`.
-- **What still waits on ring 0's thread:** a range message, for its own
-  context's answered buffers; a block named again, for that block's writers; a
-  present's fill, for that block's users; and the device's reset, for every
-  message in flight. A context's close waits for no
+- **What still waits on ring 0's thread:** a block named again, for that
+  block's writers; a present's fill, for that block's users; and the device's
+  reset, for every message in flight. A context's close waits for no
   walk: `reims_graphics` fences each of its queues, which waits only for a take
   of the queue's submission ring or a post onto its completion ring under way,
   and the close is answered once its buffers have finished

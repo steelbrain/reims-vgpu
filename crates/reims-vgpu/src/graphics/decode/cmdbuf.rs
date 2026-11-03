@@ -567,8 +567,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return false;
             }
         }
-        // Its turn in its queue's lane, tried here, so its begin takes no lock it need wait for; a
-        // take not made lets the turn go at once.
+        // Its context's range messages before it, and its turn in its queue's lane, tried here,
+        // so its begin takes no lock it need wait for; a take not made lets the turn go at once.
+        let asked = match self.context {
+            Some(context) => match self.shared.sequencer.ranges_asked(context, true) {
+                Some(asked) => asked,
+                None => return false,
+            },
+            None => None,
+        };
         let Some(turn) = self.turn_on(counts) else {
             return false;
         };
@@ -577,6 +584,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         *self.turn.borrow_mut() = turn;
         *self.held_caches.borrow_mut() = Some(held);
+        self.ranges.set(Some(asked));
         true
     }
 
@@ -662,9 +670,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         drain: Option<Arc<Drain>>,
         may_fill: bool,
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
-        // It is committed after every buffer answered `CB_SUBMITTED` before now.
+        // It is committed after every buffer answered `CB_SUBMITTED` before now, and after its
+        // context's range messages that came before now.
         if self.mark.get().is_none() {
             self.mark.set(Some(self.shared.sequencer.mark()));
+        }
+        if self.ranges.get().is_none() {
+            let asked = (self.context)
+                .and_then(|context| self.shared.sequencer.ranges_asked(context, false))
+                .flatten();
+            self.ranges.set(Some(asked));
         }
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return Ok(Err(DecodeError::Malformed));
@@ -786,10 +801,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
             commit_holding(&cb, held.as_deref())
         };
-        // After every buffer answered `CB_SUBMITTED` before its begin ([`super::sequencer`]).
-        if let Some(mark) = self.mark.get() {
-            self.shared.sequencer.wait_for(mark);
-        }
+        // After every buffer answered `CB_SUBMITTED` before its begin, and its context's range
+        // messages before it ([`Self::wait_to_commit`]).
+        self.wait_to_commit();
         match uses {
             // Its end event signalled for the caches' later copies, and committed, under their
             // lock ([`super::surface_cache::Caches::finish`]).
@@ -914,10 +928,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         );
         let handler = signalling(handler, signalled);
         cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
-        // In the commit order where the buffer was ([`super::sequencer`]).
-        if let Some(mark) = self.mark.get() {
-            self.shared.sequencer.wait_for(mark);
-        }
+        // In the commit order where the buffer was, after its context's range messages before it
+        // ([`Self::wait_to_commit`]).
+        self.wait_to_commit();
         commit_holding(&cb, held.as_deref())?;
         Ok(true)
     }
@@ -967,6 +980,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         match release {
             Some(release) => release.signal(host_queue),
             None => Ok(()),
+        }
+    }
+
+    /// Waits, with no lock held, until the command buffer may be committed: after the buffers of
+    /// its queue taken before it ([`super::lane`]), every buffer answered `CB_SUBMITTED` before
+    /// its begin, and its context's range messages that came before its begin
+    /// ([`super::sequencer`]).
+    fn wait_to_commit(&self) {
+        self.wait_turn();
+        let sequencer = &self.shared.sequencer;
+        if let Some(mark) = self.mark.get() {
+            sequencer.wait_for(mark);
+        }
+        if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
+            sequencer.wait_for_ranges(context, asked);
         }
     }
 
@@ -3654,8 +3682,9 @@ mod tests {
     }
 
     /// A command buffer the guest sends after another's `CB_SUBMITTED` is committed after it, on
-    /// another queue: its walk goes on, and its commit waits for the first's; a range message of
-    /// the first's context waits for it too, and another context's does not.
+    /// another queue: its walk goes on, and its commit waits for the first's. A range message is
+    /// checked where it comes, waiting for neither (one naming no `Managed` buffer is refused
+    /// there, of either context).
     #[test]
     fn a_buffer_sent_after_an_answer_is_committed_after_it() {
         let (p, mut dec, posted) = posting(false);
@@ -3712,8 +3741,11 @@ mod tests {
                 .name("second".into())
                 .spawn_scoped(scope, || second.decode(&p.device(), &later).unwrap())
                 .unwrap();
-            let r = scope.spawn(|| ring0.decode(&p.device(), &range(2)).unwrap());
-            // Another context's range message waits for nothing of context 0's.
+            assert_eq!(
+                ring0.decode(&p.device(), &range(2)).unwrap(),
+                Err(DecodeError::BadReference),
+                "checked where it came"
+            );
             assert_eq!(
                 other
                     .decode(
@@ -3725,12 +3757,10 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(commits().is_empty(), "committed before the answered buffer");
-            assert!(!b.is_finished() && !r.is_finished());
+            assert!(!b.is_finished());
             gate.open();
             assert_eq!(a.join().unwrap(), Ok(()));
             assert_eq!(b.join().unwrap(), Ok(()));
-            // Buffer 2 is no `Managed` buffer: carried out, and refused, after the commit.
-            assert_eq!(r.join().unwrap(), Err(DecodeError::BadReference));
         });
         assert_eq!(commits(), ["first", "second"]);
     }

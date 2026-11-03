@@ -3087,6 +3087,78 @@ fn a_managed_range_is_carried_out_before_a_later_command_buffer() {
     assert!(modified < at("commit", None));
 }
 
+/// A `Managed` buffer's range sent behind a command buffer of its process answered at its take
+/// and still walked holds nothing up on ring 0, which answers the next message meanwhile: its
+/// `didModifyRange:` is made once that buffer is committed, and before the commit of a buffer the
+/// process sends after it
+#[test]
+fn a_managed_range_behind_an_answered_walk_holds_up_nothing_on_ring_0() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
+    ring.send(&device, asking(obj(1, 1), 100));
+    assert!(gate.reached(), "the walk did not start");
+    let bytes = ring.event().expect("a CB_SUBMITTED");
+    assert_eq!(
+        RgfxCbSubmitted::read_from_bytes(&bytes).unwrap().cb_obj_id,
+        100
+    );
+    let range = RgfxBufferDidModifyRange {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 2),
+        location: 0x40,
+        length: 0x10,
+    };
+    guest.send(&device, range.as_bytes().to_vec());
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK,
+        "ring 0 waited for the walk"
+    );
+    let modified = |calls: &[reims_vgpu_core::testkit::calllog::Call]| {
+        let range = Arg::val(&reims_vgpu_core::platform::types::NsRange::new(0x40, 0x10));
+        (calls.iter()).position(|c| c.sel == "didModifyRange:" && c.args.first() == Some(&range))
+    };
+    assert_eq!(
+        modified(&platform.call_log().calls()),
+        None,
+        "carried out before the answered buffer's commit"
+    );
+    ring.send(&device, command_buffer(obj(1, 1), 101));
+    gate.open();
+    committed(&platform, 2);
+    let calls = platform.call_log().calls();
+    let commits: Vec<usize> = (calls.iter().enumerate())
+        .filter(|(_, c)| c.sel == "commit")
+        .map(|(i, _)| i)
+        .collect();
+    let modified = modified(&calls).expect("no didModifyRange:");
+    assert!(
+        commits[commits.len() - 2] < modified && modified < commits[commits.len() - 1],
+        "between the two buffers' commits"
+    );
+}
+
 /// A library from region chunks is checked against its own process's blocks, whichever process
 /// sent the message before it: process 1's chunk over its block, sent after process 2's create,
 /// is made; process 2's chunk over process 1's block is refused

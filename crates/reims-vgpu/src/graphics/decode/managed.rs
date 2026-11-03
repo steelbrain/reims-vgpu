@@ -14,8 +14,11 @@
 //!     copy (`contents`), and `didModifyRange:` has the platform copy it to the GPU's by its next
 //!     submission, before any of its commands. A texture's `TEXTURE_REPLACE_REGION` is the
 //!     platform's `replaceRegion:` from the block, which is done before the call returns.
-//!   - Ring 0 is carried out before any later command buffer of the process, on any queue, so
-//!     either is ordered before every command buffer committed after it, as Metal promises.
+//!   - Either is checked on ring 0 where it comes, and carried out once the process's command
+//!     buffers answered `CB_SUBMITTED` before it are committed, with no wait on ring 0
+//!     ([`GraphicsDecoder::after_submitted`]); every command buffer of the process begun after it,
+//!     on any queue, is committed after it, so it is ordered before every command buffer
+//!     committed after it, as Metal promises.
 //!   - `synchronizeResource:` and `synchronizeTexture:slice:level:` copy the GPU's copy to the
 //!     block where the blit encoder runs them ([`GraphicsDecoder::synchronize_managed`]), so the
 //!     CPU sees it once the command buffer completes.
@@ -24,6 +27,7 @@
 //! contract everywhere.
 
 use std::ptr;
+use std::sync::Arc;
 
 use reims_graphics::managed::LinearLayout;
 use reims_graphics::wire::{
@@ -40,7 +44,7 @@ use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
 use super::tables::Entry;
-use super::{DecodeError, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
+use super::{DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
 
 /// `MTLStorageModeManaged`.
 pub(super) const STORAGE_MODE_MANAGED: u64 = 1;
@@ -282,9 +286,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// `BUFFER_DID_MODIFY_RANGE`: the range copied from the block to the platform buffer's host
-    /// copy, where the buffer has one, and `didModifyRange:`. A bad reference for an object that
-    /// is no `Managed` buffer; malformed for a range past it.
-    pub(super) fn did_modify_range(&self, message: &[u8]) -> RaiseResult<Result<(), DecodeError>> {
+    /// copy, where the buffer has one, and `didModifyRange:`, after the context's buffers answered
+    /// before it are committed ([`Self::after_submitted`], which `drain` is held through). A bad
+    /// reference for an object that is no `Managed` buffer; malformed for a range past it: both
+    /// found here.
+    pub(super) fn did_modify_range(
+        &self,
+        message: &[u8],
+        drain: Option<Arc<Drain>>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
         let Some(m) = read::<RgfxBufferDidModifyRange>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -300,19 +310,24 @@ impl<P: Platform> GraphicsDecoder<P> {
         {
             return Ok(Err(DecodeError::Malformed));
         }
-        if copy.cpu.is_some() {
-            let contents = buffer.contents();
-            // SAFETY: the range lies inside the block (checked above against its length), inside
-            // the region, and inside the platform buffer's host copy of the same length.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    self.region.base().add((copy.at + m.location) as usize),
-                    contents.as_ptr::<u8>().add(m.location as usize),
-                    m.length as usize,
-                );
+        let (buffer, region) = (buffer.clone_ref(), Arc::clone(&self.region));
+        let (from, copies) = (copy.at + m.location, copy.cpu.is_some());
+        self.after_submitted("BUFFER_DID_MODIFY_RANGE", m.obj_id, drain, move || {
+            if copies {
+                let contents = buffer.contents();
+                // SAFETY: the range lies inside the block (checked against its length), inside
+                // the region, which `region` keeps mapped, and inside the platform buffer's host
+                // copy of the same length.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        region.base().add(from as usize),
+                        contents.as_ptr::<u8>().add(m.location as usize),
+                        m.length as usize,
+                    );
+                }
             }
-        }
-        buffer.did_modify_range(OnFault::Return, NsRange::new(m.location, m.length))?;
+            buffer.did_modify_range(OnFault::Return, NsRange::new(m.location, m.length))
+        });
         Ok(Ok(()))
     }
 
@@ -385,9 +400,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// `TEXTURE_REPLACE_REGION`: the platform's `replaceRegion:` from the region's bytes in the
-    /// block, where the texture is a copy of its own. A bad reference for an object that is no
-    /// `Managed` texture; malformed for a region the layout does not hold.
-    pub(super) fn replace_region(&self, message: &[u8]) -> RaiseResult<Result<(), DecodeError>> {
+    /// block, where the texture is a copy of its own, after the context's buffers answered before
+    /// it are committed ([`Self::after_submitted`], which `drain` is held through). A bad reference
+    /// for an object that is no `Managed` texture; malformed for a region the layout does not
+    /// hold: both found here.
+    pub(super) fn replace_region(
+        &self,
+        message: &[u8],
+        drain: Option<Arc<Drain>>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
         let Some(m) = read::<RgfxTextureReplaceRegion>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -412,33 +433,35 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Ok(()));
         }
         let three_d = texture.texture_type() == TEXTURE_TYPE_3D;
-        // SAFETY: the region's bytes lie inside the layout, which lies inside the block (checked
-        // at the create), inside the region, which the decoder holds mapped.
-        let bytes = unsafe {
-            HostRange::new(
-                HostPtr::from_ptr(self.region.base().add((copy.at + offset) as usize)),
-                span,
+        let (texture, region) = (texture.clone_ref(), Arc::clone(&self.region));
+        let (from, bytes_per_row) = (copy.at + offset, l.bytes_per_row);
+        let bytes_per_image = if three_d { l.bytes_per_image } else { 0 };
+        self.after_submitted("TEXTURE_REPLACE_REGION", m.obj_id, drain, move || {
+            // SAFETY: the region's bytes lie inside the layout, which lies inside the block
+            // (checked at the create), inside the region, which `region` keeps mapped.
+            let bytes = unsafe {
+                HostRange::new(HostPtr::from_ptr(region.base().add(from as usize)), span)
+            };
+            texture.replace_region(
+                MtlRegion {
+                    origin: MtlOrigin {
+                        x: origin[0],
+                        y: origin[1],
+                        z: origin[2],
+                    },
+                    size: MtlSize {
+                        width: size[0],
+                        height: size[1],
+                        depth: size[2],
+                    },
+                },
+                level,
+                slice,
+                bytes,
+                bytes_per_row,
+                bytes_per_image,
             )
-        };
-        texture.replace_region(
-            MtlRegion {
-                origin: MtlOrigin {
-                    x: origin[0],
-                    y: origin[1],
-                    z: origin[2],
-                },
-                size: MtlSize {
-                    width: size[0],
-                    height: size[1],
-                    depth: size[2],
-                },
-            },
-            level,
-            slice,
-            bytes,
-            l.bytes_per_row,
-            if three_d { l.bytes_per_image } else { 0 },
-        )?;
+        });
         Ok(Ok(()))
     }
 

@@ -11,23 +11,48 @@
 //!   before the answer is not held up, as under one lock it could have been carried out first.
 //! - **Range messages.** `BUFFER_DID_MODIFY_RANGE` and `TEXTURE_REPLACE_REGION` of a `Managed`
 //!   object reach the platform's next submission, so one is carried out only once every ticket of
-//!   its context issued before it is given back ([`Sequencer::wait_for_context`]): its object is
-//!   its process's alone, so no other context's buffer can see it.
-//! - **Cost.** A mark is one atomic load, and so is a commit's check where no ticket is out: a
-//!   device where nothing asks for `CB_SUBMITTED` pays nothing more.
+//!   its context issued before it is given back ([`Sequencer::after_context`]): its object is its
+//!   process's alone, so no other context's buffer can see it. Ring 0 does not wait for it: it is
+//!   carried out where the last of those tickets is given back, after its buffer's commit, the
+//!   context's range messages one at a time in the order they came, and every command buffer of
+//!   the context begun after it is committed after it ([`Sequencer::ranges_asked`],
+//!   [`Sequencer::wait_for_ranges`]), as one begun after ring 0 carried it out was.
+//! - **Cost.** A mark is one atomic load, and so is a commit's check where no ticket is out, and
+//!   a begin's check of range messages where none waits: a device where nothing asks for
+//!   `CB_SUBMITTED` pays nothing more.
 //!
 //! A ticket is issued after its buffer's begin, so a buffer never waits for its own or a later
-//! one, and a buffer holding one waits only for older ones: the waits end.
+//! one, and a buffer holding one waits only for older ones; a range message waits only for the
+//! tickets issued before it, and a buffer only for the range messages that came before its begin:
+//! the waits end.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
 
-/// The tickets out, by number, with the context of each.
+/// A range message's work, carried out once its context's tickets before it are given back.
+pub(crate) type RangeOp = Box<dyn FnOnce() + Send>;
+
+/// The tickets out, by number, with the context of each, and each context's range messages.
 #[derive(Default)]
-struct Open(BTreeMap<u64, Option<u32>>);
+struct Open {
+    tickets: BTreeMap<u64, Option<u32>>,
+    ranges: HashMap<u32, Ranges>,
+}
+
+/// One context's range messages ([`Sequencer::after_context`]).
+#[derive(Default)]
+struct Ranges {
+    /// Each not yet carried out, with the last ticket issued when it came, in the order they came.
+    waiting: VecDeque<(u64, RangeOp)>,
+    /// A thread is carrying them out.
+    running: bool,
+    /// How many came, and how many were carried out.
+    asked: u64,
+    done: u64,
+}
 
 /// The device's commit order for `CB_SUBMITTED` (the module doc).
 #[derive(Default)]
@@ -36,6 +61,8 @@ pub(crate) struct Sequencer {
     issued: AtomicU64,
     /// Every ticket up to this one is given back.
     done_through: AtomicU64,
+    /// Range messages that came and are not yet carried out, on every context.
+    ranges_waiting: AtomicUsize,
     open: Mutex<Open>,
     given_back: Condvar,
 }
@@ -68,7 +95,7 @@ impl Sequencer {
         };
         let number = self.issued.load(Ordering::Acquire) + 1;
         self.issued.store(number, Ordering::Release);
-        open.0.insert(number, context);
+        open.tickets.insert(number, context);
         Some(Ticket {
             sequencer: Arc::clone(self),
             number,
@@ -86,35 +113,99 @@ impl Sequencer {
         }
     }
 
-    /// Waits until every ticket of `context` up to `mark` is given back; whether it waited.
-    pub(crate) fn wait_for_context(&self, context: u32, mark: u64) -> bool {
-        if self.done_through.load(Ordering::Acquire) >= mark {
-            return false;
-        }
+    /// Carries out `op`, a range message of `context`'s, once every ticket of `context` issued
+    /// before now is given back, after the context's range messages before it: here where none
+    /// is out, else where the last of them is given back, on that thread, waiting for nothing
+    /// here.
+    pub(crate) fn after_context(&self, context: u32, op: RangeOp) {
         let mut open = self.open.lock();
-        let mut waited = false;
-        while open
-            .0
-            .range(..=mark)
-            .any(|(_, holder)| *holder == Some(context))
-        {
-            waited = true;
+        let mark = self.issued.load(Ordering::Acquire);
+        let ranges = open.ranges.entry(context).or_default();
+        ranges.asked += 1;
+        ranges.waiting.push_back((mark, op));
+        self.ranges_waiting.fetch_add(1, Ordering::AcqRel);
+        self.carry_out(open, context);
+    }
+
+    /// How many range messages of `context` came before now, where any is still to be carried
+    /// out on the device: a command buffer begun now is committed after each
+    /// ([`Self::wait_for_ranges`]); `Some(None)` where none waits. `None` where `try_only` and
+    /// the order is busy.
+    pub(crate) fn ranges_asked(&self, context: u32, try_only: bool) -> Option<Option<u64>> {
+        if self.ranges_waiting.load(Ordering::Acquire) == 0 {
+            return Some(None);
+        }
+        let open = if try_only {
+            self.open.try_lock()?
+        } else {
+            self.open.lock()
+        };
+        Some(open.ranges.get(&context).map(|r| r.asked))
+    }
+
+    /// Waits, with no lock of the caller's held, until `asked` range messages of `context` are
+    /// carried out.
+    pub(crate) fn wait_for_ranges(&self, context: u32, asked: u64) {
+        let mut open = self.open.lock();
+        while open.ranges.get(&context).is_some_and(|r| r.done < asked) {
             self.given_back.wait(&mut open);
         }
-        waited
+    }
+
+    /// Carries out, on this thread and one at a time, each range message of `context` whose
+    /// tickets are all given back, oldest first, unless another thread is carrying them out.
+    fn carry_out<'s>(&'s self, mut open: MutexGuard<'s, Open>, context: u32) {
+        loop {
+            let Open { tickets, ranges } = &mut *open;
+            let Some(r) = ranges.get_mut(&context) else {
+                return;
+            };
+            if r.running {
+                return;
+            }
+            let ready = r.waiting.front().is_some_and(|&(mark, _)| {
+                !(tickets.range(..=mark)).any(|(_, holder)| *holder == Some(context))
+            });
+            if !ready {
+                return;
+            }
+            let Some((_, op)) = r.waiting.pop_front() else {
+                return;
+            };
+            r.running = true;
+            drop(open);
+            op();
+            open = self.open.lock();
+            if let Some(r) = open.ranges.get_mut(&context) {
+                r.running = false;
+                r.done += 1;
+            }
+            self.ranges_waiting.fetch_sub(1, Ordering::AcqRel);
+            self.given_back.notify_all();
+        }
     }
 
     /// Ticket `number` is given back.
     fn give_back(&self, number: u64) {
         let mut open = self.open.lock();
-        open.0.remove(&number);
-        let through = open.0.first_key_value().map_or_else(
+        let holder = open.tickets.remove(&number).flatten();
+        let through = open.tickets.first_key_value().map_or_else(
             || self.issued.load(Ordering::Acquire),
             |(&first, _)| first - 1,
         );
         self.done_through.store(through, Ordering::Release);
-        drop(open);
         self.given_back.notify_all();
+        match holder {
+            Some(context)
+                if open
+                    .ranges
+                    .get(&context)
+                    .is_some_and(|r| !r.waiting.is_empty()) =>
+            {
+                self.carry_out(open, context);
+            }
+            _ => drop(open),
+        }
     }
 }
 
@@ -167,28 +258,50 @@ mod tests {
         s.wait_for(mark);
     }
 
-    /// A range message waits for its own context's tickets alone.
+    /// A range message waits for its own context's tickets alone, holding up no thread: it is
+    /// carried out where the last of them is given back, after the range messages before it, and
+    /// a buffer begun after it is committed after it.
     #[test]
-    fn a_range_message_waits_for_its_context_alone() {
+    fn a_range_message_is_carried_out_once_its_context_s_tickets_are_given_back() {
         let s = Arc::new(Sequencer::default());
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let range = |n: u32| {
+            let done = Arc::clone(&done);
+            Box::new(move || done.lock().push(n)) as RangeOp
+        };
         let other = s.issue(Some(2), false).unwrap();
-        let mark = s.mark();
-        assert!(
-            !s.wait_for_context(1, mark),
+        assert_eq!(s.ranges_asked(1, false), Some(None), "none waits");
+        s.after_context(1, range(1));
+        assert_eq!(
+            *done.lock(),
+            [1],
             "another context's ticket holds nothing up"
         );
         let own = s.issue(Some(1), false).unwrap();
-        let mark = s.mark();
+        s.after_context(1, range(2));
+        s.after_context(1, range(3));
+        assert_eq!(
+            *done.lock(),
+            [1],
+            "carried out with its context's ticket out"
+        );
+        let asked = s.ranges_asked(1, false).flatten().unwrap();
+        let went = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let waiter = scope.spawn(|| s.wait_for_context(1, mark));
+            scope.spawn(|| {
+                s.wait_for_ranges(1, asked);
+                went.store(true, Ordering::Release);
+            });
             std::thread::sleep(Duration::from_millis(50));
-            assert!(!waiter.is_finished());
-            drop(own);
             assert!(
-                waiter.join().unwrap(),
-                "it waited for its own context's ticket"
+                !went.load(Ordering::Acquire),
+                "committed before the range messages"
             );
+            drop(own);
         });
+        assert!(went.load(Ordering::Acquire));
+        assert_eq!(*done.lock(), [1, 2, 3], "in the order they came");
+        assert_eq!(s.ranges_asked(1, false), Some(None));
         drop(other);
     }
 }

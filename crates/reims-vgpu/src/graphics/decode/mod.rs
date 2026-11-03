@@ -535,6 +535,10 @@ pub struct GraphicsDecoder<P: Platform> {
     try_only: bool,
     /// The commit order's mark at the command buffer's begin ([`Sequencer::mark`]).
     mark: Cell<Option<u64>>,
+    /// The range messages of its context that came before the command buffer's begin, which it is
+    /// committed after, where any was still to be carried out then ([`Sequencer::ranges_asked`]);
+    /// `None` until its begin.
+    ranges: Cell<Option<Option<u64>>>,
     /// The command buffer's ticket in the commit order, where it was answered at its take; given
     /// back with the handle, after its commit or its stand-in's.
     ticket: RefCell<Option<Ticket>>,
@@ -595,6 +599,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             views: RefCell::new(Vec::new()),
             try_only: false,
             mark: Cell::new(None),
+            ranges: Cell::new(None),
             ticket: RefCell::new(None),
             turn: RefCell::new(None),
             held_caches: RefCell::new(None),
@@ -625,6 +630,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     pub(crate) fn end_message(&mut self) {
         self.views.get_mut().clear();
         self.mark.set(None);
+        self.ranges.set(None);
         self.ticket.get_mut().take();
         self.turn.get_mut().take();
         self.held_caches.get_mut().take();
@@ -1552,13 +1558,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => self.buffer_over_surface_pages(device, message),
             RGFX_CMD_BUFFER_MANAGED_AT_OFFSET => self.managed_buffer_at_offset(device, message),
             RGFX_CMD_BUFFER_DID_MODIFY_RANGE => {
-                self.after_submitted();
-                self.did_modify_range(message)
+                let drain = self.command_buffer_drain();
+                self.did_modify_range(message, drain)
             }
             RGFX_CMD_MANAGED_TEXTURE_CREATE => self.managed_texture(device, message),
             RGFX_CMD_TEXTURE_REPLACE_REGION => {
-                self.after_submitted();
-                self.replace_region(message)
+                let drain = self.command_buffer_drain();
+                self.replace_region(message, drain)
             }
             RGFX_CMD_TEXTURE_VIEW => self.texture_view(message),
             RGFX_CMD_HEAP_CREATE => {
@@ -1920,13 +1926,34 @@ impl<P: Platform> GraphicsDecoder<P> {
         Some(drain)
     }
 
-    /// Waits until each command buffer of the current context answered `CB_SUBMITTED` at its take
-    /// before now is committed ([`sequencer`]): for a range message of a `Managed` object, which
-    /// reaches the platform's next submission.
-    fn after_submitted(&self) {
-        if let Some(context) = self.context {
-            let sequencer = &self.shared.sequencer;
-            sequencer.wait_for_context(context, sequencer.mark());
+    /// Carries out `op`, the platform's part of a range message of a `Managed` object (`what`
+    /// `obj_id`), which reaches the platform's next submission, once each command buffer of the
+    /// current context answered `CB_SUBMITTED` at its take before now is committed
+    /// ([`sequencer`]): at once where none is out, else on the thread that commits the last of
+    /// them, with no wait here. It holds `drain`, its context's, until it has run, so the
+    /// context's close and its blocks' releases are answered after it; the context's command
+    /// buffers begun after it are committed after it. A raise of the platform's at it is logged,
+    /// as a message not carried out.
+    fn after_submitted(
+        &self,
+        what: &'static str,
+        obj_id: u64,
+        drain: Option<Arc<Drain>>,
+        op: impl FnOnce() -> RaiseResult<()> + Send + 'static,
+    ) {
+        let run = move || {
+            if let Err(raise) = refusing(op) {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "{what} of object {obj_id:#x} was not carried out: the platform raised \
+                     ({raise:?})"
+                );
+            }
+            drop(drain);
+        };
+        match self.context {
+            Some(context) => self.shared.sequencer.after_context(context, Box::new(run)),
+            None => run(),
         }
     }
 
