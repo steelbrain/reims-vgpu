@@ -159,7 +159,7 @@ impl<P: Platform> WaitWatch<P> {
         if !state.started {
             let shared = Arc::clone(&self.shared);
             let spawned = std::thread::Builder::new()
-                .name("rgfx-event-waits".into())
+                .name("reims-vgpu.graphics-event-waits".into())
                 .spawn(move || run(&shared));
             // Without the thread nothing is logged; the buffers run as before.
             state.started = spawned.is_ok();
