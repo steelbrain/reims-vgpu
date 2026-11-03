@@ -1418,9 +1418,10 @@ the host's import, and the kext's block table holds one entry per slab:
   region's, as is a slab where the kernel has no superpage to give (no
   contiguous 2 MiB free, or the wire budget spent) or the kext gives no pages
   block. Each superpage is one kernel call: a slab of several reserves its
-  range (no access, at a 2 MiB boundary) and makes each superpage over its
-  own piece (`VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`), and one refusal gives
-  the whole range back in one deallocation, so the slab is the region's. A
+  range (no access, at a 2 MiB boundary), then gives back each piece in turn
+  and makes a superpage in its hole (`VM_FLAGS_FIXED`), and one refusal gives
+  back the superpages before it and the reservation after it, so the slab is
+  the region's. A
   call for several superpages that runs out partway takes down past what it
   made on macOS 26.4 and later (xnu's `vm_map_enter` deletes up to the
   request's end after shrinking its size), a deallocation gap whose

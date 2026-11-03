@@ -1000,14 +1000,15 @@ void test_pages_slab_source()
 // call for superpages makes them one by one; at one it cannot make it takes down the whole range
 // it was asked for, the part it never made among it. Taking down a piece that is not mapped, there
 // or in any deallocation, is the guard exception (DEALLOC_GAP) a process with its VM guard on dies
-// of, here counted in `gaps`. A fixed call takes what lies in its range first and puts it back
-// where it fails.
+// of, here counted in `gaps`. A fixed call is refused where anything lies in its range. Another
+// thread may take a hole the moment it is made (`foreignAt`): a piece of the test's own there.
 struct GuardedVm {
-	enum Piece { kReserved, kSuperpage };
+	enum Piece { kReserved, kSuperpage, kForeign };
 	std::map<uint64_t, Piece> pieces; // mapped 2 MiB pieces, by address
 	uint64_t next = 0x200000000ull;   // where anywhere goes next
 	uint64_t free = 0;
 	uint64_t gaps = 0;
+	uint64_t foreignAt = 0; // a hole made here is another thread's at once
 	bool refuseReserve = false;
 	std::vector<std::string> log;
 
@@ -1038,20 +1039,15 @@ struct GuardedVm {
 		GuardedVm *vm = static_cast<GuardedVm *>(context);
 		vm->log.push_back("superpages " + std::to_string(size) + (fixed ? " fixed" : ""));
 		const uint64_t start = fixed ? *at : vm->anywhere(size);
-		std::map<uint64_t, Piece> taken;
 		if (fixed)
 			for (uint64_t a = start; a < start + size; a += 2 * kMiB)
-				if (vm->pieces.count(a)) {
-					taken[a] = vm->pieces[a];
-					vm->pieces.erase(a);
-				}
+				if (vm->pieces.count(a))
+					return KERN_NO_SPACE;
 		for (uint64_t a = start; a < start + size; a += 2 * kMiB) {
 			if (vm->free == 0) {
 				// The piece's entry is in, with no superpage under it; then [start, end) goes.
 				vm->pieces[a] = kReserved;
 				vm->takeDown(start, size);
-				for (const auto &t : taken)
-					vm->pieces[t.first] = t.second;
 				return KERN_NO_SPACE;
 			}
 			vm->free--;
@@ -1076,6 +1072,8 @@ struct GuardedVm {
 		GuardedVm *vm = static_cast<GuardedVm *>(context);
 		vm->log.push_back("deallocate " + std::to_string(size));
 		vm->takeDown(at, size);
+		if (vm->foreignAt != 0 && at <= vm->foreignAt && vm->foreignAt < at + size)
+			vm->pieces[vm->foreignAt] = kForeign;
 	}
 	RgfxSuperpageVm calls()
 	{
@@ -1098,9 +1096,10 @@ struct GuardedVm {
 };
 
 // Superpages are one kernel call each, so a refusal never takes down memory that is not mapped: a
-// slab of several reserves its range and makes each superpage over its piece, and one the kernel
-// cannot make gives back the whole range, its superpages and the reservation's rest, with no gap.
-// One superpage is one call anywhere.
+// slab of several reserves its range and makes each superpage in the hole its piece leaves, and
+// one the kernel cannot make gives back the superpages before it and the reservation after it,
+// with no gap, and never touches the hole, which another thread may hold. One superpage is one
+// call anywhere.
 void test_superpages_one_call_each()
 {
 	GuardedVm vm;
@@ -1111,20 +1110,32 @@ void test_superpages_one_call_each()
 	CHECK(rgfxTakeSuperpages(calls, 6 * kMiB, &bytes) == KERN_NO_SPACE);
 	CHECK(vm.gaps == 0);
 	CHECK(vm.pieces.empty() && vm.free == 1);
-	CHECK(vm.log == std::vector<std::string>({"reserve 6291456", "superpages 2097152 fixed",
-	                                          "superpages 2097152 fixed", "deallocate 6291456"}));
-	// Room for all three: one reservation, three superpages over it, at a 2 MiB boundary.
+	CHECK(vm.log == std::vector<std::string>({"reserve 6291456", "deallocate 2097152",
+	                                          "superpages 2097152 fixed", "deallocate 2097152",
+	                                          "superpages 2097152 fixed", "deallocate 2097152",
+	                                          "deallocate 2097152"}));
+	// Room for all three: one reservation, three superpages in it, at a 2 MiB boundary.
 	vm.free = 10;
 	vm.log.clear();
 	CHECK(rgfxTakeSuperpages(calls, 6 * kMiB, &bytes) == KERN_SUCCESS);
 	const uint64_t at = reinterpret_cast<uintptr_t>(bytes);
 	CHECK(at % (2 * kMiB) == 0 && vm.runOfSuperpages(at, 6 * kMiB) && vm.pieces.size() == 3);
-	CHECK(vm.log == std::vector<std::string>({"reserve 6291456", "superpages 2097152 fixed",
-	                                          "superpages 2097152 fixed",
-	                                          "superpages 2097152 fixed"}));
+	CHECK(vm.log == std::vector<std::string>(
+	                    {"reserve 6291456", "deallocate 2097152", "superpages 2097152 fixed",
+	                     "deallocate 2097152", "superpages 2097152 fixed", "deallocate 2097152",
+	                     "superpages 2097152 fixed"}));
 	CHECK(vm.free == 7 && vm.gaps == 0);
 	rgfxGiveSuperpages(calls, bytes, 6 * kMiB);
 	CHECK(vm.pieces.empty() && vm.free == 10 && vm.gaps == 0);
+	// Another thread takes the second piece's hole: refused there, the superpage before it and the
+	// reservation after it given back, the other thread's piece left alone.
+	vm.foreignAt = vm.next + 2 * kMiB;
+	CHECK(rgfxTakeSuperpages(calls, 6 * kMiB, &bytes) == KERN_NO_SPACE);
+	CHECK(vm.gaps == 0 && vm.free == 10);
+	CHECK(vm.pieces.size() == 1 && vm.pieces.begin()->first == vm.foreignAt &&
+	      vm.pieces.begin()->second == GuardedVm::kForeign);
+	vm.pieces.clear();
+	vm.foreignAt = 0;
 	// None at all: refused at the first, no gap.
 	vm.free = 0;
 	CHECK(rgfxTakeSuperpages(calls, 4 * kMiB, &bytes) == KERN_NO_SPACE);

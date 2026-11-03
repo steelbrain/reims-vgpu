@@ -13,7 +13,7 @@ constexpr int kTag = VM_MAKE_TAG(VM_MEMORY_IOACCELERATOR);
 int kernelSuperpages(void *, uint64_t *at, uint64_t size, bool fixed)
 {
 	mach_vm_address_t a = fixed ? *at : 0;
-	const int where = fixed ? VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE : VM_FLAGS_ANYWHERE;
+	const int where = fixed ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE;
 	const kern_return_t kr =
 	    mach_vm_allocate(mach_task_self(), &a, size, where | VM_FLAGS_SUPERPAGE_SIZE_2MB | kTag);
 	if (kr == KERN_SUCCESS)
@@ -23,7 +23,8 @@ int kernelSuperpages(void *, uint64_t *at, uint64_t size, bool fixed)
 
 int kernelReserve(void *, uint64_t *at, uint64_t size)
 {
-	// Never touched: the superpages replace every byte of it. Not inherited, as superpages are not.
+	// Never touched: the superpages take its place, piece by piece. Not inherited, as superpages
+	// are not.
 	mach_vm_address_t a = 0;
 	const kern_return_t kr =
 	    mach_vm_map(mach_task_self(), &a, size, kRgfxSuperpage - 1, VM_FLAGS_ANYWHERE | kTag,
@@ -64,11 +65,16 @@ int rgfxTakeSuperpages(const RgfxSuperpageVm &vm, uint64_t size, uint8_t **bytes
 		return kr;
 	for (uint64_t offset = 0; offset < size; offset += kRgfxSuperpage) {
 		uint64_t at = base + offset;
+		vm.deallocate(vm.context, at, kRgfxSuperpage);
 		kr = vm.superpages(vm.context, &at, kRgfxSuperpage, true);
 		if (kr != KERN_SUCCESS) {
-			// The superpages made so far and the reservation's rest, its refused piece among
-			// them: the whole range, mapped end to end.
-			vm.deallocate(vm.context, base, size);
+			// The superpages before the hole and the reservation after it; the hole stays as
+			// the refusal left it.
+			if (offset != 0)
+				vm.deallocate(vm.context, base, offset);
+			const uint64_t rest = offset + kRgfxSuperpage;
+			if (rest < size)
+				vm.deallocate(vm.context, base + rest, size - rest);
 			return kr;
 		}
 	}

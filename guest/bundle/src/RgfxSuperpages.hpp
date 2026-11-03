@@ -16,11 +16,15 @@
  * call for one superpage takes down only what it made, in every process.
  *
  * So one superpage is one call, anywhere; and several are a range reserved first (anywhere, at a
- * 2 MiB boundary, no access), each superpage then made over its own 2 MiB of it (fixed,
- * overwriting what lies there). A superpage the kernel cannot make leaves its piece of the
- * reservation in place (vm_map_enter puts back what an overwriting call took, under the lock it
- * held since), so the range is whole, superpages and reservation alike, and one deallocation of
- * it meets no gap.
+ * 2 MiB boundary, no access), then for each 2 MiB of it in turn, that piece of the reservation
+ * given back and a superpage made in the hole it leaves (fixed, not overwriting). Where the kernel
+ * refuses one, what the call made was its own one entry, which it takes down whole, and the run
+ * gives back the superpages before the hole and the reservation after it: two deallocations, each
+ * of memory the run holds, so neither meets a gap, and the hole is left as it is (empty, or
+ * another thread's, which took it in the moment it was free). Not an overwriting call over the
+ * reservation: where one fails, vm_map_enter puts back what it took only where no entry starts
+ * at the range's end on xnu-12377.81.4 and earlier (vm_map_lookup_entry(map, end) is true there),
+ * and the reservation's next piece always does, so a refusal would leave a hole in the run.
  *
  * Our own code; it names only the SDK's public Mach VM calls.
  */
@@ -38,19 +42,18 @@ constexpr uint64_t kRgfxSuperpage = 2ull << 20;
 struct RgfxSuperpageVm {
 	void *context = nullptr;
 	/// `size` bytes (a multiple of 2 MiB) of superpages, zeroed and wired: anywhere, *at set,
-	/// where `fixed` is false; at *at, over what lies there, where it is true.
+	/// where `fixed` is false; at *at, where nothing lies, where it is true.
 	int (*superpages)(void *context, uint64_t *at, uint64_t size, bool fixed) = nullptr;
 	/// `size` bytes anywhere at a 2 MiB boundary, with no access and no pages: the range several
-	/// superpages are made over. *at set.
+	/// superpages are made in, piece by piece. *at set.
 	int (*reserve)(void *context, uint64_t *at, uint64_t size) = nullptr;
 	/// Gives back `size` bytes at `at`.
 	void (*deallocate)(void *context, uint64_t at, uint64_t size) = nullptr;
 };
 
-/// The kernel's own calls on this task: mach_vm_allocate (VM_FLAGS_SUPERPAGE_SIZE_2MB; fixed is
-/// VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE), mach_vm_map (the reservation) and mach_vm_deallocate,
-/// every range tagged VM_MEMORY_IOACCELERATOR, so vmmap and footprint file it where Metal's own
-/// memory shows.
+/// The kernel's own calls on this task: mach_vm_allocate (VM_FLAGS_SUPERPAGE_SIZE_2MB, fixed or
+/// anywhere), mach_vm_map (the reservation) and mach_vm_deallocate, every range tagged
+/// VM_MEMORY_IOACCELERATOR, so vmmap and footprint file it where Metal's own memory shows.
 RgfxSuperpageVm rgfxKernelSuperpageVm();
 
 /// `size` bytes (a positive multiple of 2 MiB) of superpages, one kernel call each: 0 and *bytes,
