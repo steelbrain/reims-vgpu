@@ -5,14 +5,15 @@
 # DIR holds sweep, bench, present_probe and decode_md5 (x86_64 builds of guest/bundle/tools),
 # webgl.html, webgl-serve.pl, h264.list and hevc.list (the decode sets: their streams, in corpus/
 # beside each one's reference .md5, with the timed passes after a stream whose rate is measured),
-# and h264-odd.list and hevc-odd.list (odd sizes and crops, in corpus/odd/).
+# h264-odd.list and hevc-odd.list (odd sizes and crops, in corpus/odd/), and, where the tree has
+# them, oracle_icb and its oracle_icb.metallib (guest/bundle/tools/oracle).
 #
 # It prints what it finds as lines the gate's report reads ("GATE item NAME PASS|FAIL|SKIP
 # detail", "GATE metric NAME VALUE"), each phase between "GATE phase NAME start" and "... end",
 # and the tools' own result lines ("sweep: ...", "bench: ...", "present_probe: ...",
 # "decode_md5: ...") as they come. The phases run in the order given (default: info idle bench
 # present sweep decode webgl final), over one run or several: what a later phase reads stays in
-# DIR. The gate's correctness boot runs info sweep decode webgl present final, its bench boot
+# DIR. The gate's correctness boot runs info sweep decode icb webgl present final, its bench boot
 # info webgl present idle bench, then benchretry where the host asks, then decodefps final.
 # benchretry runs the cases in GATE_RETRY again (run_benchretry). decode checks every
 # stream's MD5s, decodefps also times the streams the lists time (decode_md5 -l), and present
@@ -146,6 +147,21 @@ run_benchretry() {
 			break
 		fi
 		limit 60 ./bench -m 20 -v "$c" 2>&1 | grep --line-buffered -E '^bench: |^# start|^# rep '
+	done
+}
+
+# oracle_icb's cases that check what CPU- and GPU-encoded indirect command buffers draw and
+# dispatch (each result line, "^ differs" under one that is not what Metal draws), and its timing
+# (CPU encodes of 1024 and 16384 commands): each line as "oracle_icb: CASE | LINE", then the case's
+# exit status. Each case runs in a child of its own, which says how it died.
+run_icb() {
+	[ -x ./oracle_icb ] || { item icb SKIP "the tree has no oracle_icb"; return; }
+	local dev c
+	dev=$(limit 30 ./bench -l 2>/dev/null | sed -n 's/^bench: device "\([^"]*\)".*/\1/p' | head -1)
+	[ -n "$dev" ] || { item icb FAIL "no Metal device to run oracle_icb on"; return; }
+	for c in render compute ranges reset gpu timing; do
+		limit 180 ./oracle_icb "$dev" "$c" 2>&1 | sed "s/^/oracle_icb: $c | /"
+		echo "oracle_icb: $c rc ${PIPESTATUS[0]}"
 	done
 }
 

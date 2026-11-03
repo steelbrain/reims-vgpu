@@ -68,7 +68,7 @@ MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "bundle-files", "rgfxgate
 # The informational metrics a report shows beside the gated ones.
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
          r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
-         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(core_mhz|clock_reps_ok)\.bench\..*",
+         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(shared\.)?icb\..*", r"(core_mhz|clock_reps_ok)\.bench\..*",
          r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)"]
 
 
@@ -190,6 +190,7 @@ class Run:
         self.video_offer, self.metal_device = None, None
         self.guest_text = text  # clocks() reads the bench cases' times from it
         crashes, crash_lines = None, []
+        icb = {}  # oracle_icb's cases: their lines and exit status (the icb phase)
         for line in text.splitlines():
             m = re.match(r"([0-9.]+) (.*)$", line)
             if not m:
@@ -245,6 +246,13 @@ class Run:
                     if m2.group(2) == "OK":
                         for k, v in kv_numbers(m2.group(3)).items():
                             self.lmetric(f"bench.{m2.group(1)}.{k}", v)
+            elif body.startswith("oracle_icb: "):
+                m2 = re.match(r"oracle_icb: (\S+) \| (.*)$", body)
+                if m2:
+                    icb.setdefault(m2.group(1), {"lines": [], "rc": None})["lines"].append(m2.group(2))
+                m2 = re.match(r"oracle_icb: (\S+) rc (\d+)$", body)
+                if m2:
+                    icb.setdefault(m2.group(1), {"lines": [], "rc": None})["rc"] = int(m2.group(2))
             elif body.startswith("present_probe: "):
                 m2 = re.match(r"present_probe: (\S+) (OK|FAIL)\s*(.*)$", body)
                 if m2:
@@ -266,6 +274,7 @@ class Run:
                     kv = kv_numbers(m2.group(4))
                     if "fps" in kv:
                         self.lmetric(name + ".fps", kv["fps"])
+        self.icb(icb)
         if crashes is not None:
             names = sorted({re.sub(r"[-_]\d{4}-\d\d-\d\d.*$", "", c) for c in crashes.split() if c != "none"})
             self.crashes = names
@@ -275,6 +284,45 @@ class Run:
         for p, (a, b) in self.phases.items():
             if a is None or b is None:
                 self.litem("phase." + p, "FAIL", "started but did not end (a hang the alarm or the hold cut)")
+
+    def icb(self, cases):
+        """oracle_icb's cases (the icb phase): FAIL where a result is not what Metal draws or
+        dispatches ("^ differs", "<- differs"), where the barriered dispatches came out wrong in
+        any run, or where the case's child died or exited nonzero; its timing's CPU encode costs
+        and execute times are metrics."""
+        for case, c in sorted(cases.items()):
+            lines = c["lines"]
+            checks = sum(1 for l in lines if re.match(r"  \S.{59} ", l))
+            bad = []
+            for i, l in enumerate(lines):
+                if l.strip() == "^ differs" and i:
+                    bad.append(lines[i - 1].strip())
+                elif l.rstrip().endswith("<- differs") or re.match(r"\s*=> .*(died on signal|exited) ", l):
+                    bad.append(l.strip())
+                else:
+                    m = re.search(r"with barrier: (\d+) of (\d+) runs not all", l)
+                    if m and int(m.group(1)):
+                        bad.append(l.strip())
+            if c["rc"] not in (0, None):
+                bad.append(f"exit {c['rc']}")
+            if c["rc"] is None:
+                bad.append("no exit status (cut off)")
+            self.litem(f"icb.{case}", "FAIL" if bad else "PASS",
+                       (f"{len(bad)} of {checks} results wrong: " + "; ".join(re.sub(r"\s+", " ", b) for b in bad[:4]))
+                       if bad else f"{checks} results as Metal's" if checks else "ran; it checks no results")
+            if case != "timing":
+                continue
+            gpu = []
+            for l in lines:
+                m = re.match(r"\s*(\d+): CPU encode, (pipeline \+ 2 buffers \+ draw|draw alone \(inherited\)): (\d+) ns a command", l)
+                if m:
+                    key = "encode_ns" if m.group(2).startswith("pipeline") else "encode_inherited_ns"
+                    self.lmetric(f"icb.{key}.{m.group(1)}", float(m.group(3)))
+                m = re.match(r"\s*execute (\d+) draws: wall [0-9.]+ ms, GPU ([0-9.]+) ms", l)
+                if m:
+                    gpu.append(float(m.group(2)))
+            if gpu:
+                self.lmetric("icb.execute_gpu_ms.16384", statistics.median(gpu))
 
     def clocks(self, d):
         """The GPU's core clock over each bench case (gpu-clocks.txt, the host's nvidia-smi ten times

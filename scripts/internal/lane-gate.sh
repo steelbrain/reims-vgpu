@@ -22,8 +22,8 @@
 #                 never --record it
 #   --skip PART   leave out the Mac's checks (mac) or the correctness boot (boot); the run is then
 #                 incomplete
-#   --phases      the correctness boot's guest-run.sh phases (default: info sweep decode webgl
-#                 present final)
+#   --phases      the correctness boot's guest-run.sh phases (default: info sweep decode icb
+#                 webgl present final)
 #   --bench-phases  the bench boot's (default: info webgl present idle bench decodefps final)
 #   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot): a tag the
 #                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
@@ -203,6 +203,17 @@ do_guest_build() {
     "$(tool_src guest/bundle/tools/winmon.m)" -o "$P/winmon"
   cp guest/bundle/build/sweep-x86_64 "$P/sweep"
   cp guest/bundle/build/bench-x86_64 "$P/bench"
+  # oracle_icb (the ICB probe, with its metallib beside it), as its build.sh builds it, where the
+  # tree has it: the icb phase's checks of CPU- and GPU-encoded indirect command buffers.
+  local o=guest/bundle/tools/oracle
+  if [[ -f $o/oracle_icb.m && -f $o/oracle_icb.metal ]]; then
+    xcrun clang -arch x86_64 -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal -framework IOSurface \
+      -framework CoreVideo -framework QuartzCore -framework VideoToolbox -framework CoreGraphics \
+      -framework Foundation "$o/oracle_icb.m" -o "$P/oracle_icb"
+    xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$o/oracle_icb.metal" -o "$ART/oracle_icb.air"
+    xcrun -sdk macosx metallib "$ART/oracle_icb.air" -o "$P/oracle_icb.metallib"
+    rm -f "$ART/oracle_icb.air"
+  fi
   cp "$L/guest/"* "$P/"
   # RgfxGate's payload is the bundle it carries; its Makefile does not see the bundle change.
   make -C guest/rgfxgate clean
@@ -217,6 +228,7 @@ do_guest_build() {
   { for f in guest/bundle/tools/sweep/*.[mh] guest/bundle/tools/bench/bench.m; do shasum "$f"; done | shasum | echo "sweep+bench $(cut -c1-16)"
     echo "present_probe $(shasum < "$(tool_src guest/bundle/tools/present_probe.m)" | cut -c1-16)"
     echo "decode_md5 $(shasum < "$(tool_src guest/bundle/tools/decode_md5.m)" | cut -c1-16)"
+    [[ ! -f $o/oracle_icb.m ]] || echo "oracle_icb $(cat "$o/oracle_icb.m" "$o/oracle_icb.metal" "$o/oracle_common.h" | shasum | cut -c1-16)"
     echo "drag $(cat "$(tool_src guest/bundle/tools/winmon.m)" "$L/msi-drag.py" | shasum | cut -c1-16)"
     echo "bundle $(shasum < guest/bundle/build/reims-graphics.bundle | cut -c1-16)"
     echo "kext $(shasum < guest/kext/build/ReimsGraphics.kext/Contents/MacOS/ReimsGraphics | cut -c1-16)"
@@ -461,7 +473,7 @@ do_publish() {
 # picks each boot's SSH port.
 do_boot() {
   local mode=$1 oc=${image:-$MR/oc.qcow2} out=$MR/out-$1 excl=0 hold=${HOLD_SHARED_S:-1200}
-  local ph=${phases:-info sweep decode webgl present final} pres=5
+  local ph=${phases:-info sweep decode icb webgl present final} pres=5
   if [[ $mode == bench ]]; then
     # WebGL's frame rate and present_probe's answers first: the quickest read of a tip's frame pace.
     excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10
