@@ -577,6 +577,9 @@ sit in BAR0 from 0x800.
 | 0x014 | `REGION_SIZE_LO` | RO | BAR2's size, low 32 bits |
 | 0x018 | `REGION_SIZE_HI` | RO | BAR2's size, high 32 bits |
 | 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
+| 0x024 | `DRIVER_FEATURES_LO` | RW | feature bits 0-31 the guest's driver takes; reads back the ones the host took ("Negotiated features", below) |
+| 0x028 | `DRIVER_FEATURES_HI` | RW | feature bits 32-63, likewise |
+| 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
 
 **The wire's version.** `VERSION` reads `RGFX_VERSION`
 (`crates/reims-graphics/src/wire.rs`), the version of the wire the host
@@ -614,8 +617,42 @@ one, in the same commit:
 
 A change that no guest built before it can misread leaves it: a new feature
 bit (`FEATURES_LO`, `FEATURES_HI`), or a new message or op that older guests
-never send. A version number is never used twice. The host speaks one version:
-the host, the kext, the option ROM and the bundle ship from one build.
+never send. A version number is never used twice. The host speaks one version,
+and a host and a guest of that version from different builds meet through the
+features they negotiate (below).
+
+**Negotiated features.** A change lands as a feature bit, and moves `VERSION`
+only where no negotiation can carry it.
+- The host offers its bits in `FEATURES_LO` and `FEATURES_HI`. Bits 0-2
+  (`SURFACE_PAGES`, `SURFACE_CACHE`, `CB_SUBMITTED`) need no answer: the host
+  acts on them as it offers them.
+- From bit 3, the host acts on a bit only where the guest's driver took it.
+  The framebuffer kext writes `DRIVER_FEATURES_LO` and `_HI` after `STATUS` 0
+  and before `STATUS` 1, in `ReimsGraphics::start`, with the bits it and its
+  bundle carry out, masked by the offer (`RgfxFeatures.hpp`). It reads back the
+  bits the host took: those written that the host offers and knows.
+- The host ignores a write while `STATUS` is 1, and a reset (the guest's
+  `STATUS` 0 or the host's) clears the set. A guest that never writes it (the
+  option ROM, a kext built before the registers) gets the wire as it was, and
+  a host built before them reads them as 0, so its guest takes nothing.
+- A feature with a mode per queue rides `QUEUE_CREATE`'s tail,
+  `RgfxQueueCreateFlags` (`flags`, `RGFX_QUEUE_*`) after its 56 bytes. The kext
+  sends the tail only with a flag set. A flag whose feature the guest did not
+  take, or that the host does not carry out, refuses the create
+  (`INVALID_ARGUMENT`).
+- New ops and messages are decoded wherever the host offers their bit, as
+  `RGFX_OP_SUBMITTED` is.
+- The accelerator answers its processes' `Features` call (selector 0x10f) with
+  the word they work by: bits 0-2 as offered, and from bit 3 the bits taken.
+  `QueueCreate` (0x103) takes a seventh input, the flags the process wants, and
+  answers a second output, the flags granted: those whose feature the word
+  holds. A kext older than the call answers `kIOReturnUnsupported`, and the
+  bundle then works by the device info's `features_lo` bits 0-2.
+- Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
+  `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bit 9 is
+  reserved. No host offers one of them yet, the kext takes none, and the host
+  carries out no queue flag: each lands with its feature, which says what it
+  changes.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -657,7 +694,8 @@ Metal.
 **Contexts.** Each process that opens the accelerator's user client gets a
 context from the kext: a number `c`, handed out once from 1 (its object ids are
 `c << 40` and up), and one of 32 slots, held until its close, for its GPU
-addresses (`0x1_0000_0000 + s << 36`). The kext hands out its region blocks
+addresses (`RGFX_CONTEXT_VA_BASE + s * RGFX_CONTEXT_VA_SPAN`: 2 TiB a slot
+from 2^46, `0x4000_0000_0000 + s << 41`). The kext hands out its region blocks
 (first fit, page granular). The process hands each create and destroy of its
 objects (ids in its range) to the kext by a user-client call; the kext posts it
 on the control ring and, for a pipeline create, hands the reflection back once
@@ -1530,6 +1568,17 @@ registers only once its bundle is on disk:
   IOFramebuffer makes the connection, with no lock held, and register at once
   where the bundle is there; WindowServer opens that connection before any of
   the accelerator's user clients. No check runs after it.
+- **RgfxGate's install pass comes first.** Where RgfxGate installs the
+  bundle, nothing on disk counts while its install pass is under way: an update
+  that keeps the wire version would find the old bundle and its marker before
+  the pass drops the marker and rewrites the files, and WindowServer could
+  then load a bundle mid-rewrite. RgfxGate publishes `RgfxGateInstallDone` on
+  IOResources, false from the pass's start and true once the pass has ended,
+  on every path (the installer and Recovery, a data volume that never mounts,
+  a failed write). The check looks again while it is false. The settling
+  connection waits up to 5 s for it, and leaves the accelerator unregistered
+  for the boot where the pass is still under way. Without RgfxGate there is no
+  property, and the check counts what it finds.
 - **A bundle installed later takes effect at the next boot**: a running
   WindowServer never sees a GPU appear under it. The guest's install puts the
   bundle in place and reboots.
