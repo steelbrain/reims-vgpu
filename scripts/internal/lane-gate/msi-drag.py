@@ -351,20 +351,27 @@ def resize(q):
     # to be read later.
     with open(os.path.join(R, "drag-resize-track.txt"), "w") as f:
         f.write(f"# press {x0:.0f},{y0:.0f} window {w} drag {t0:.3f}-{t1:.3f}\n" + tracker.get("out", ""))
-    ws_, hs, moves = [], [], 0
+    # The sizes during the drag only: at the button's release the window can grow on its own to
+    # the screen's visible edges (seen: 603 x 505 to 1707 x 1023 in 250 ms, from the release on),
+    # which w_after says. The guest's clock is within 0.2 s of the host's (clock.txt); the last
+    # 0.1 s of the path is near its start, so leaving it out keeps the ranges.
+    ws_, hs, after, moves = [], [], [], 0
     for line in tracker.get("out", "").splitlines():
         f = line.split()
         if len(f) == 4 and f[0] == "at":
-            ws_.append(float(f[2]))
-            hs.append(float(f[3]))
+            if float(f[1]) <= t1 - 0.1:
+                ws_.append(float(f[2]))
+                hs.append(float(f[3]))
+            else:
+                after.append(float(f[2]))
         m = re.match(r"track samples=(\d+) moves=(\d+)", line)
         if m:
             moves = int(m.group(2))
     wr = max(ws_) - min(ws_) if ws_ else 0
     hr = max(hs) - min(hs) if hs else 0
     res = {"w_range": round(wr), "h_range": round(hr), "w": f"{min(ws_, default=0):.0f}-{max(ws_, default=0):.0f}",
-           "h": f"{min(hs, default=0):.0f}-{max(hs, default=0):.0f}", "window_moves_s": round(moves / SECONDS, 1),
-           "press": f"{x0:.0f},{y0:.0f}", "seconds": round(t1 - t0, 2)}
+           "h": f"{min(hs, default=0):.0f}-{max(hs, default=0):.0f}", "w_after": f"{max(after, default=0):.0f}",
+           "window_moves_s": round(moves / SECONDS, 1), "press": f"{x0:.0f},{y0:.0f}", "seconds": round(t1 - t0, 2)}
     if wr < 0.7 * 2 * RADIUS or hr < 0.7 * 1.2 * RADIUS:
         res.update(moved=0, why=f"the window's size spanned {wr:.0f} x {hr:.0f} points, the pointer's "
                                 f"{2 * RADIUS} x {1.2 * RADIUS:.0f}")
