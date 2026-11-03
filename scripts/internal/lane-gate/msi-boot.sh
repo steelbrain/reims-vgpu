@@ -293,7 +293,10 @@ fi
     [[ -z $g ]] && compgen -G "$RGK_RUN/quiet-want/$TAG.*" > /dev/null && g=1 && echo "gpu $(date +%s.%N | cut -c1-14)"
     [[ -f $B/launch.log && $B/launch.log -nt $R/.start ]] || continue
     [[ -z $q ]] && grep -q -x -E 'HOST_(NOT_)?QUIET' "$B/launch.log" && q=1 && echo "quiet $(date +%s.%N | cut -c1-14)"
-    grep -q -x GPU_HELD "$B/launch.log" && { echo "held $(date +%s.%N | cut -c1-14)"; break; }
+    # The host's free memory as QEMU starts (it moves a boot's time by 30 s and more where it is
+    # below the guest's RAM: the runtime imports all of it at the start).
+    grep -q -x GPU_HELD "$B/launch.log" && { echo "held $(date +%s.%N | cut -c1-14)"
+      grep -E '^(MemFree|MemAvailable|Cached):' /proc/meminfo > "$R/meminfo-start.txt"; break; }
   done ) > "$R/boot-times.txt" 2> /dev/null &
 TIMES=$!
 # rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
@@ -325,6 +328,9 @@ T_GPU=${T_GPU:-${T_QUIET:-$T_HELD}}
 T0=${T_HELD:-$T_QEMU}
 T0=${T0%.*}
 [[ -n $T0 ]] && kv lock_wait_s "$(( T0 - START ))"
+[[ -s $R/meminfo-start.txt ]] && while read -r k v _; do
+  kv "$(tr 'A-Z' 'a-z' <<< "${k%:}")_start_mib" "$(( v / 1024 ))"
+done < "$R/meminfo-start.txt"
 [[ -n $T0 ]] || T0=$START
 case $out in
 *SSH_OK*) ;;
