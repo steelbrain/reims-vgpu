@@ -211,7 +211,12 @@ mod tests {
         );
         let counts = || {
             let c = device.raw.work_counts();
-            (c.host_ram_chunks_imported, c.chunk_bound_buffers_made)
+            (
+                c.host_ram_chunks_imported,
+                c.chunk_bound_buffers_made,
+                c.host_pointer_imports_made,
+                c.copied_heaps_made,
+            )
         };
         let before = counts();
         let over = |offset: u64, length: u64| {
@@ -262,6 +267,223 @@ mod tests {
         ];
         assert_eq!(b_bytes, [0, 0xa5, 0xa5]);
         drop((cb, e, q, a, b, lease));
+        // SAFETY: the mapping made above, which nothing uses any more.
+        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+    }
+    /// What a slab of guest RAM costs on this device (arch-shared-mem's design): placement heaps
+    /// over one 2 MiB run of the leased RAM each, 4 KiB buffers placed in one of them, heaps over
+    /// views of 2 and 32 runs apart, and a command buffer's round trip with one heap alive and with
+    /// all of them. Timings only, printed as `slab:` lines: run alone, holding the GPU.
+    #[test]
+    #[ignore = "a measurement: run alone, holding the GPU"]
+    fn slab_heap_costs() {
+        use reims_vgpu_core::platform::resource::Heap as _;
+        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        use std::time::Instant;
+        const SHARED_TRACKED: u64 = 0x200;
+        const PLACEMENT: i64 = 1;
+        let device = dev();
+        let length = 4608 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, unmapped at the end.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        // Every page touched first, as a guest's superpages are.
+        // SAFETY: the mapping above, `length` bytes.
+        unsafe { std::ptr::write_bytes(start.cast::<u8>(), 0, length.to_usize()) };
+        let at = start.addr().to_u64();
+        let lease = lease_guest_memory(
+            [GuestRamFile {
+                host: at,
+                guest: 0,
+                length,
+                fd: std::sync::Arc::clone(&fd),
+                offset: 0,
+            }],
+            None,
+        );
+        let counts = || {
+            let c = device.raw.work_counts();
+            (
+                c.host_ram_chunks_imported,
+                c.chunk_bound_buffers_made,
+                c.host_pointer_imports_made,
+                c.copied_heaps_made,
+            )
+        };
+        let heap_at = |addr: u64, len: u64| {
+            // SAFETY: mapped pages of the test's, mapped until after every heap is dropped.
+            let bytes = unsafe { HostRange::new(HostPtr::from_addr(addr.to_usize()), len) };
+            let desc = HeapDesc {
+                size: len,
+                heap_type: PLACEMENT,
+                options: vec![OptionSet::ResourceOptions(SHARED_TRACKED)],
+                address_ranges: None,
+                pinned_gpu_address: None,
+            };
+            device.new_heap_over_host_memory(bytes, &desc).unwrap().heap.unwrap()
+        };
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            (v[v.len() / 2], v[v.len() - 1])
+        };
+        let before = counts();
+        let mut heaps = Vec::new();
+        let mut made = Vec::new();
+        let mut first = 0.0;
+        for i in 0..2000u64 {
+            let t = Instant::now();
+            heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            if i == 0 {
+                first = us;
+            }
+            made.push(us);
+        }
+        let (p50, max) = median(&mut made);
+        let after = counts();
+        println!(
+            "slab: one-run heaps n=2000 first_us={first:.1} p50_us={p50:.1} max_us={max:.1} \
+             chunks_imported={} chunk_bound={} host_pointer_imports={} copied_heaps={} \
+             imports_need_files={}",
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+            imports_need_files()
+        );
+        let mut placed = Vec::new();
+        let mut times = Vec::new();
+        for k in 0..512u64 {
+            let t = Instant::now();
+            let b = heaps[1].new_buffer_of_length(4096, SHARED_TRACKED, k * 4096).unwrap();
+            times.push(t.elapsed().as_secs_f64() * 1e6);
+            placed.push(b.unwrap());
+        }
+        let (p50, max) = median(&mut times);
+        println!("slab: placed 4 KiB buffers n=512 p50_us={p50:.2} max_us={max:.1}");
+        // Views of runs: 2 MiB runs 4 MiB apart from 4,100 MiB on (2 runs, 4 MiB; 32 runs, 64 MiB), as
+        // superpage slabs of several superpages are; 4 KiB runs 8 KiB apart from 4,300 MiB on (512
+        // runs, 2 MiB; 4,096 runs, 16 MiB), as a slab of scattered guest pages is.
+        let view = |runs: u64, run: u64, from: u64| {
+            let len = runs * run;
+            // SAFETY: a fresh reservation, then each run mapped over it from the file.
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len.to_usize(),
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED);
+            for r in 0..runs {
+                let off = from + 2 * run * r;
+                // SAFETY: within the reservation above.
+                let p = unsafe {
+                    libc::mmap(
+                        base.cast::<u8>().add((run * r).to_usize()).cast(),
+                        run.to_usize(),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        fd.as_raw_fd(),
+                        off as libc::off_t,
+                    )
+                };
+                assert_ne!(p, libc::MAP_FAILED);
+            }
+            (base, len)
+        };
+        let mut views = Vec::new();
+        for (runs, run, from) in [
+            (2u64, 2 * MIB, 4100 * MIB),
+            (32, 2 * MIB, 4100 * MIB),
+            (512, 4096, 4300 * MIB),
+            (4096, 4096, 4300 * MIB),
+        ] {
+            let t = Instant::now();
+            let (base, len) = view(runs, run, from);
+            let map_us = t.elapsed().as_secs_f64() * 1e6;
+            let c0 = counts();
+            let t = Instant::now();
+            let h = heap_at(base.addr().to_u64(), len);
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            let c1 = counts();
+            let t = Instant::now();
+            let b = h.new_buffer_of_length(4096, SHARED_TRACKED, len - 4096).unwrap().unwrap();
+            let place_us = t.elapsed().as_secs_f64() * 1e6;
+            println!(
+                "slab: view heap runs={runs} run={run} bytes={len} map_us={map_us:.1} heap_us={us:.1} \
+                 place_us={place_us:.1} chunk_bound={} host_pointer_imports={} copied_heaps={}",
+                c1.1 - c0.1,
+                c1.2 - c0.2,
+                c1.3 - c0.3
+            );
+            views.push((h, b, base, len));
+        }
+        // A command buffer's round trip: a 4-byte fill of one placed buffer, committed and waited.
+        let q = device.new_command_queue().unwrap();
+        let round = || {
+            let mut v = Vec::new();
+            for _ in 0..100 {
+                let t = Instant::now();
+                let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+                let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+                let fill = BlitCmd::FillBuffer {
+                    buffer: &placed[0],
+                    range: NsRange::new(0, 4),
+                    value: 0x5a,
+                };
+                e.encode(OnFault::Die, fill).unwrap();
+                e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Die).unwrap();
+                cb.wait_until_completed(OnFault::Die).unwrap();
+                assert!(cb.error().is_none(), "{:?}", cb.error());
+                v.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            median(&mut v)
+        };
+        // Warmed up first, so the GPU's clocks do not favour the later rounds; then 2,004 heaps, 200,
+        // 2, and 2,000 again, made anew over the chunks already imported.
+        round();
+        let all = round();
+        drop(views);
+        heaps.truncate(200);
+        let some = round();
+        heaps.truncate(2);
+        let few = round();
+        let mut again = Vec::new();
+        for i in 2..2000u64 {
+            let t = Instant::now();
+            heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
+            again.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        let (again50, againmax) = median(&mut again);
+        let back = round();
+        println!(
+            "slab: cb round trip p50/max us: {:.1}/{:.1} with 2,004 heaps, {:.1}/{:.1} with 200, \
+             {:.1}/{:.1} with 2, {:.1}/{:.1} with 2,000 again (made again at p50 {again50:.1} us, \
+             max {againmax:.1})",
+            all.0, all.1, some.0, some.1, few.0, few.1, back.0, back.1
+        );
+        let keep = heaps;
+        // SAFETY: the RAM, which no GPU work uses now.
+        let byte = unsafe {
+            std::ptr::with_exposed_provenance::<u8>((at + 2 * MIB).to_usize()).read_volatile()
+        };
+        assert_eq!(byte, 0x5a, "the fill reached the RAM");
+        drop((q, placed, keep, lease));
         // SAFETY: the mapping made above, which nothing uses any more.
         assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
     }
