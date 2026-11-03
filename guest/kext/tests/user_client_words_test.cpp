@@ -1,7 +1,8 @@
 // What the kext's user clients answer, word for word, built natively: the display pipe's VBL and
 // completion notifications (RgfxPipeNotifications.hpp), the replies to the IOGPU base's device
 // calls and which calls it answers (RgfxIOGPUReplies.hpp), and the user-client protocol the
-// bundle shares (RgfxUserClientABI.hpp): its type, and its context selectors without a gap.
+// bundle shares (RgfxUserClientABI.hpp): its type, its context selectors without a gap, and the
+// features call with the kext's own feature bits.
 #include <cstdio>
 #include <cstring>
 
@@ -124,12 +125,31 @@ static void protocol()
 	CHECK(kRgfxSurfaceCpuGenOffset == 16);
 }
 
+// The features call and the kext's own feature bits, as design.md's registry gives them out:
+// Features at 0x10f, past 0x10e, which PagesBlock keeps, and one bit for each call or flag a kext
+// may lack, none shared.
+static void features()
+{
+	CHECK(kRgfxAccelMethodFeatures == 0x10f);
+	CHECK(kRgfxAccelMethodFeatures == kRgfxAccelMethodContextLast + 2);
+	const uint64_t bits[] = {
+		kRgfxKextFeaturePagesBlock,
+		kRgfxKextFeatureSubmitBatch,
+		kRgfxKextFeatureWakeCompletions,
+		kRgfxKextFeatureConsumedDoorbell,
+		kRgfxKextFeatureDeferredAnswers,
+	};
+	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
+		CHECK(bits[i] == uint64_t(1) << i);
+}
+
 int main()
 {
 	vbl();
 	completion();
 	iogpu();
 	protocol();
+	features();
 	if (g_failed) {
 		std::fprintf(stderr, "user_client_words_test: %d of %d checks failed\n", g_failed,
 		             g_checks);
