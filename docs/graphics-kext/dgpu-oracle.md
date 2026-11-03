@@ -614,18 +614,20 @@ compute commands add 5 into an output.
 - **No error, and the command runs** *(class 3)*. Every case completes, and every dispatch runs
   and writes its live buffers.
 - **What a released buffer reads** *(class 2)*. The lane's Metal arm reads what the host's Metal
-  reads. Its Vulkan arm is to read zero, the runtime resolving the address to no live buffer, once
-  metal2vulkan runs the command (below).
+  reads. Its Vulkan arm reads zero, the runtime resolving the address to no live buffer, except
+  in an indirect command buffer resident for writing, which runs nothing there yet (below).
 - **A buffer made since at the same address** *(class 2 for the lane)*. All three Macs reuse the
   address. The guest's next-fit picks do not reuse a range soon after its release, so the lane's
   commands do not reach a buffer made soon after.
 - **The command a miss skips** *(class 4)*. On the Vulkan arm over MoltenVK, a dispatch whose
-  input was released runs nothing, at 16 bytes and at 1 MiB: its output keeps what it held, and
-  the runtime gives no notice. A nil buffer at the same index runs the dispatch, reading zero,
-  and a live buffer no encoder made resident is reached, so the released buffer's address alone
-  misses this way. That is no Mac's answer. It is handed to metal2vulkan, whose execute is to run
-  the command with the slot reading zero, as it runs one with a nil buffer; the lane's test,
-  `a_command_naming_a_released_buffer_reads_zero`, waits ignored until it does.
+  input was released runs nothing, with no error and no notice, where an encoder made its
+  indirect command buffer resident for writing: the runtime then executes the buffer from its
+  records on the host. Made resident for reading alone, the dispatch runs, reading zero there,
+  as it does through a nil buffer at the same index. Skipping the command is no Mac's answer.
+  It is handed to metal2vulkan, whose host replay is to run the command with the slot reading
+  zero; the lane's test of it,
+  `a_command_naming_a_released_buffer_reads_zero_in_a_buffer_resident_for_writing`, waits
+  ignored until it does.
 
 ## The display's colour against the stock lane: deliberate divergences
 
