@@ -2222,6 +2222,12 @@ void ReimsGraphics::setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook)
 		old->release();
 }
 
+IOReturn ReimsGraphics::postAnswered(UInt32 type, const void *message, UInt32 size,
+                                     UInt64 *waiterSeqno)
+{
+	return post(type, message, size, nullptr, waiterSeqno);
+}
+
 IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 count,
                                      UInt64 *const *waiterSeqnos, UInt32 *posted)
 {

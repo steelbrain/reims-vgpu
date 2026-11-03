@@ -202,6 +202,11 @@ public:
 	void setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook);
 	IOReturn postReleases(const RgfxBlockRelease *releases, UInt32 count,
 	                      UInt64 *const *waiterSeqnos, UInt32 *posted);
+	// A lifecycle message (a CONTEXT_CLOSE) no thread waits for here, its COMPLETE handed to the
+	// setReleaseAnswer hook: as postLifecycle with `replyType` 0, but it writes the seqno into
+	// *waiterSeqno before the message is published, so the answer, however soon it comes, finds
+	// the caller's entry. Thread context only.
+	IOReturn postAnswered(UInt32 type, const void *message, UInt32 size, UInt64 *waiterSeqno);
 
 	// The accelerator's object lifecycle (a create or destroy, QUEUE_CREATE, CONTEXT_CLOSE) on
 	// the control ring: `message` is the whole message in kernel memory, at most

@@ -48,6 +48,7 @@
 
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
+#include "RgfxCloseTable.hpp"
 #include "RgfxContextSlots.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
 #include "ReimsGraphics.hpp"
@@ -55,6 +56,7 @@
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxLatency.hpp"
 #include "RgfxPagesBlock.hpp"
+#include "RgfxIdChunks.hpp"
 #include "RgfxReleaseTable.hpp"
 
 #include <IOKit/IOLib.h>
@@ -84,6 +86,8 @@ constexpr UInt32 kRingConsumer = 0x40;
 // control ring in order, behind whatever pipeline compiles were posted before them.
 constexpr UInt32 kQueueAnswerMs = 30000;
 constexpr UInt32 kCloseAnswerMs = 10000;
+// The most closes in flight, late ones included (RgfxCloseTable.hpp).
+constexpr UInt32 kMaxCloses = 32;
 // How long a BLOCK_RELEASE waits for its answer, which comes once the context's command buffers
 // committed before it have finished, before it is logged as late. A late one stays in flight,
 // its block, pages and surface the device's, until its answer.
@@ -245,6 +249,7 @@ void noteDormant();
 void noteReserve();
 void noteReleases();
 void unwire(void *pages);
+bool releaseAnswered(OSObject *, UInt64 seqno, UInt32 status);
 
 // The releases in flight (RgfxReleaseTable.hpp), made at the first context's open, under
 // releaseLock, which the work loop takes to hand an answer over; and the timer that runs the
@@ -254,19 +259,42 @@ RgfxReleaseTable releaseTable = {nullptr, 0, 0};
 thread_call_t releaseTimer = nullptr;
 bool releaseHooked = false;
 
+// The closes in flight (RgfxCloseTable.hpp), under releaseLock: their answers come through the
+// same hook as the releases'. Its entries' addresses are their late holdings' owners, so it is
+// never moved.
+RgfxCloseEntry closeEntries[kMaxCloses] = {};
+RgfxCloseTable closeTable = {closeEntries, kMaxCloses};
+
+// The framebuffer's work loop hands this worker's hook each COMPLETE no lifecycle waiter takes:
+// named once, before the first release or close is posted.
+void hookAnswers(RgfxAccelerator *accel)
+{
+	if (__atomic_load_n(&releaseHooked, __ATOMIC_ACQUIRE))
+		return;
+	if (ReimsGraphics *fb = accel->copyFramebuffer()) {
+		fb->setReleaseAnswer(accel, &releaseAnswered);
+		fb->release();
+		__atomic_store_n(&releaseHooked, true, __ATOMIC_RELEASE);
+	}
+}
+
 // The framebuffer's work loop hands each COMPLETE no lifecycle waiter takes here first: an
-// answer to a release in flight is recorded, and the worker runs to retire it.
+// answer to a release in flight is recorded, and the worker runs to retire it; an answer to a
+// close wakes its waiting thread, or, late, runs the worker to let go of what it held.
 bool releaseAnswered(OSObject *, UInt64 seqno, UInt32 status)
 {
 	IOLock *lock = __atomic_load_n(&releaseLock, __ATOMIC_ACQUIRE);
 	if (!lock)
 		return false;
 	IOLockLock(lock);
-	const bool mine = rgfxReleaseAnswer(releaseTable, seqno, status);
+	bool mine = rgfxReleaseAnswer(releaseTable, seqno, status);
+	const bool close = !mine && rgfxCloseAnswer(closeTable, seqno, status);
+	if (close)
+		IOLockWakeup(lock, &closeTable, false);
 	IOLockUnlock(lock);
-	if (mine)
+	if (mine || close)
 		thread_call_enter(releaseCall);
-	return mine;
+	return mine || close;
 }
 
 void releaseTimerFired(thread_call_param_t, thread_call_param_t)
@@ -344,6 +372,39 @@ void retireReleases()
 	}
 }
 
+// Lets go of what each late close answered held, its token's, as the closing thread lets go of a
+// close answered in time (RgfxAcceleratorUserClient::releaseContext): answered OK, the device
+// maps none of the context's resource ids or GPU addresses to an object, so its resource-id
+// chunks go and its units are given back; refused, they are kept from use for good.
+void retireCloses(RgfxAccelerator *accel)
+{
+	for (;;) {
+		uint32_t at = 0;
+		IOLockLock(releaseLock);
+		const bool any = rgfxCloseTakeLate(closeTable, &at);
+		const RgfxCloseEntry c = any ? closeTable.entries[at] : RgfxCloseEntry{};
+		IOLockUnlock(releaseLock);
+		if (!any)
+			return;
+		const void *token = rgfxCloseToken(closeTable, at);
+		const bool ok = c.status == RGFX_STATUS_OK;
+		if (ok) {
+			accel->freeIdChunks(token);
+			IOLockLock(contextLock);
+			rgfxContextSlotsGive(slots, c.firstUnit, c.units);
+			IOLockUnlock(contextLock);
+		} else {
+			accel->keepIdChunks(token);
+		}
+		IOLockLock(releaseLock);
+		rgfxCloseRetired(closeTable, at);
+		IOLockUnlock(releaseLock);
+		IOLog("RgfxAccelerator: context %u's late close was answered (status %u): what it held is "
+		      "%s\n",
+		      c.context, c.status, ok ? "let go" : "kept from use for good");
+	}
+}
+
 // The release thread call, the guest's one (THREAD_CALL_OPTIONS_ONCE): lets go of the dormant
 // blocks their surfaces asked to go (reapDormant); retires the releases answered; then posts
 // each freed block's BLOCK_RELEASE on ring 0, kReleaseBatch at a time with one doorbell at most,
@@ -365,13 +426,9 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 	noteDormant();
 	// The answers come through the framebuffer's work loop: name this worker's hook there
 	// before the first release is posted.
-	if (!releaseHooked) {
-		if (ReimsGraphics *fb = accel->copyFramebuffer()) {
-			fb->setReleaseAnswer(accel, &releaseAnswered);
-			fb->release();
-			releaseHooked = true;
-		}
-	}
+	hookAnswers(accel);
+	// The late closes answered let go of what they held, whose releases this run posts.
+	retireCloses(accel);
 	retireReleases();
 	for (bool more = true; more;) {
 		// A batch of freed blocks, each in an entry of its own, posted at once.
@@ -597,30 +654,96 @@ IOReturn RgfxAccelerator::openContext(UInt32 *context, bool oldSpan, bool window
 	return kIOReturnSuccess;
 }
 
-bool RgfxAccelerator::closeContext(UInt32 context, UInt32 first, UInt32 units)
+RgfxAccelerator::CloseAnswer RgfxAccelerator::closeContext(UInt32 context, UInt32 first,
+                                                           UInt32 units, int32_t *late)
 {
 	// The device ends the context's queues and drops its objects, and answers once the
 	// context's command buffers have finished; the caller has closed its queues already, and
-	// frees its blocks after this only where the close was answered OK.
+	// lets go of what the context held only once the close is answered OK.
+	*late = -1;
+	if (!startContexts())
+		return kCloseRefused;
 	RgfxContextClose close = {};
 	close.context = context;
-	RgfxComplete answer = {};
-	UInt32 length = 0;
-	IOReturn r = postLifecycle(RGFX_CMD_CONTEXT_CLOSE, &close, sizeof(close), RGFX_EVT_COMPLETE,
-	                           &answer, sizeof(answer), &length, nullptr, kCloseAnswerMs);
-	bool closed = r == kIOReturnSuccess && length >= sizeof(answer) &&
-	              answer.status == RGFX_STATUS_OK;
-	if (!closed)
-		IOLog("RgfxAccelerator: context %u: the device did not answer its close (0x%x, "
-		      "status %u)\n",
-		      context, r, length >= sizeof(answer) ? answer.status : 0);
-	if (contextLock) {
-		IOLockLock(contextLock);
-		rgfxContextSlotsGive(slots, first, units);
-		IOLockUnlock(contextLock);
+	// The close's entry is the answer's to find, its seqno written before the device sees the
+	// close; with every entry taken, the close waits as any lifecycle message does, and one not
+	// answered then keeps what the context held for good.
+	hookAnswers(this);
+	IOLockLock(releaseLock);
+	const int32_t at = rgfxCloseReserve(closeTable, context, first, units);
+	IOLockUnlock(releaseLock);
+	IOReturn r = kIOReturnNotReady;
+	uint32_t status = RGFX_STATUS_OK;
+	bool inTime = false;
+	if (at < 0) {
+		RgfxComplete answer = {};
+		UInt32 length = 0;
+		r = postLifecycle(RGFX_CMD_CONTEXT_CLOSE, &close, sizeof(close), RGFX_EVT_COMPLETE,
+		                  &answer, sizeof(answer), &length, nullptr, kCloseAnswerMs);
+		inTime = r == kIOReturnSuccess && length >= sizeof(answer);
+		status = inTime ? answer.status : 0;
+	} else {
+		ReimsGraphics *fb = copyFramebuffer();
+		if (fb) {
+			r = fb->postAnswered(RGFX_CMD_CONTEXT_CLOSE, &close, sizeof(close),
+			                     &closeTable.entries[at].seqno);
+			fb->release();
+		}
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(kCloseAnswerMs, kMillisecondScale, &deadline);
+		IOLockLock(releaseLock);
+		if (r != kIOReturnSuccess) {
+			rgfxCloseUnposted(closeTable, static_cast<uint32_t>(at));
+		} else {
+			while (!rgfxCloseAnswered(closeTable, static_cast<uint32_t>(at))) {
+				if (IOLockSleepDeadline(releaseLock, &closeTable, deadline, THREAD_UNINT) ==
+				    THREAD_TIMED_OUT)
+					break;
+			}
+			inTime = rgfxCloseInTime(closeTable, static_cast<uint32_t>(at), &status);
+		}
+		IOLockUnlock(releaseLock);
+		if (r == kIOReturnSuccess && !inTime) {
+			*late = at;
+			IOLog("RgfxAccelerator: context %u: its close is not answered after %u ms: what it "
+			      "held, its %u GPU address units from %u among it, stays the device's until it "
+			      "is\n",
+			      context, kCloseAnswerMs, units, first);
+			return kCloseLate;
+		}
 	}
+	const bool closed = inTime && status == RGFX_STATUS_OK;
+	if (!closed) {
+		IOLog("RgfxAccelerator: context %u: the device did not answer its close (0x%x, "
+		      "status %u): what it held, its %u GPU address units from %u among it, is kept "
+		      "from use for good\n",
+		      context, r, status, units, first);
+		return kCloseRefused;
+	}
+	IOLockLock(contextLock);
+	rgfxContextSlotsGive(slots, first, units);
+	IOLockUnlock(contextLock);
 	IOLog("RgfxAccelerator: context %u closed (unit %u, %u units)\n", context, first, units);
-	return closed;
+	return kCloseAnswered;
+}
+
+void RgfxAccelerator::parkClose(const void *client, int32_t late)
+{
+	if (late < 0 || static_cast<uint32_t>(late) >= kMaxCloses || !contextLock)
+		return;
+	const void *token = rgfxCloseToken(closeTable, static_cast<uint32_t>(late));
+	IOLockLock(contextLock);
+	const uint32_t ids = rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, client, token);
+	IOLockUnlock(contextLock);
+	IOLockLock(releaseLock);
+	const bool answered = rgfxClosePark(closeTable, static_cast<uint32_t>(late));
+	const uint32_t pending = rgfxCloseLateCount(closeTable);
+	IOLockUnlock(releaseLock);
+	IOLog("RgfxAccelerator: context %u's late close holds %u resource-id chunks for its answer "
+	      "(%u closes late)\n",
+	      closeTable.entries[late].context, ids, pending);
+	if (answered)
+		thread_call_enter(releaseCall);
 }
 
 // MARK: - Resource ids
@@ -630,19 +753,14 @@ IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 
 	if (!contextLock)
 		return kIOReturnNotReady;
 	IOLockLock(contextLock);
-	UInt32 chunk = 0;
-	while (chunk < RGFX_RESOURCE_ID_CHUNKS && idChunkOwners[chunk])
-		chunk++;
-	if (chunk == RGFX_RESOURCE_ID_CHUNKS) {
-		IOLockUnlock(contextLock);
+	const int32_t taken = rgfxIdChunkTake(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, owner);
+	const UInt32 held = rgfxIdChunksHeld(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS);
+	IOLockUnlock(contextLock);
+	if (taken < 0) {
 		IOLog("RgfxAccelerator: context %u: every resource-id chunk is held\n", context);
 		return kIOReturnNoResources;
 	}
-	idChunkOwners[chunk] = owner;
-	UInt32 held = 0;
-	for (UInt32 i = 0; i < RGFX_RESOURCE_ID_CHUNKS; i++)
-		held += idChunkOwners[i] ? 1 : 0;
-	IOLockUnlock(contextLock);
+	const UInt32 chunk = static_cast<UInt32>(taken);
 	IOLog("RgfxAccelerator: context %u: resource-id chunk %u (%u of %u held)\n", context, chunk,
 	      held, RGFX_RESOURCE_ID_CHUNKS);
 	// The device learns of the chunk before the process does, so the grant is on the control
@@ -667,16 +785,24 @@ void RgfxAccelerator::freeIdChunks(const void *owner)
 	if (!contextLock)
 		return;
 	IOLockLock(contextLock);
-	UInt32 freed = 0;
-	for (UInt32 i = 0; i < RGFX_RESOURCE_ID_CHUNKS; i++) {
-		if (idChunkOwners[i] == owner) {
-			idChunkOwners[i] = nullptr;
-			freed++;
-		}
-	}
+	const UInt32 freed = rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, owner, nullptr);
 	IOLockUnlock(contextLock);
 	if (freed)
 		IOLog("RgfxAccelerator: %u resource-id chunks freed\n", freed);
+}
+
+void RgfxAccelerator::keepIdChunks(const void *owner)
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	const UInt32 kept =
+	    rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, owner, rgfxBlockNoOwner());
+	IOLockUnlock(contextLock);
+	if (kept)
+		IOLog("RgfxAccelerator: %u resource-id chunks kept from use: their context's close was "
+		      "refused\n",
+		      kept);
 }
 
 // MARK: - Blocks

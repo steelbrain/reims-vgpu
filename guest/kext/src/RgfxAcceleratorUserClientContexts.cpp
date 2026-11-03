@@ -619,22 +619,36 @@ void RgfxAcceleratorUserClient::releaseContext()
 	}
 	for (UInt32 i = 0; i < listed; i++)
 		accel->closeQueue(queues[i]);
-	// The blocks go only once the device has answered the close: it then holds nothing of
-	// them, and the context's command buffers have finished.
-	bool closed = accel->closeContext(context, firstUnit, units);
+	// What the context held goes only once the device has answered the close: it then holds
+	// nothing of it, maps none of its resource ids or GPU addresses to an object, and the
+	// context's command buffers have finished. A close answered late lets go of it then.
+	int32_t late = -1;
+	const RgfxAccelerator::CloseAnswer closed =
+	    accel->closeContext(context, firstUnit, units, &late);
 	// Its deferred creates' answers, taken by no one now; a waiter for one returns.
 	accel->dropDeferred(context);
-	accel->freeIdChunks(this);
-	if (closed)
+	switch (closed) {
+	case RgfxAccelerator::kCloseAnswered:
+		accel->freeIdChunks(this);
 		accel->freeBlocks(this);
-	else
+		accel->dropSurfaceBlocks(this, true);
+		break;
+	case RgfxAccelerator::kCloseLate:
+		accel->parkClose(this, late);
 		accel->keepBlocks(this);
-	accel->dropSurfaceBlocks(this, closed);
+		accel->dropSurfaceBlocks(this, false);
+		break;
+	case RgfxAccelerator::kCloseRefused:
+		accel->keepIdChunks(this);
+		accel->keepBlocks(this);
+		accel->dropSurfaceBlocks(this, false);
+		break;
+	}
 	accel->revokeGrants(this);
 	IOLockUnlock(queueLock);
 	// The device dropped this context's objects at its close: a block whose release it refused
 	// because an object lay in it may now be free to go.
-	if (closed)
+	if (closed == RgfxAccelerator::kCloseAnswered)
 		accel->retryRefusedBlocks();
 }
 

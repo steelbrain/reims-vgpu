@@ -222,14 +222,35 @@ public:
 	// (`windowServer`) may take the last units free. kIOReturnNoResources where no run is free.
 	IOReturn openContext(UInt32 *context, bool oldSpan, bool windowServer, UInt32 *first,
 	                     UInt32 *units);
-	// True where the device answered the close OK: it holds nothing of the context, and every
-	// command buffer of it has finished. The context's units are given back either way.
-	bool closeContext(UInt32 context, UInt32 first, UInt32 units);
+	// How a context's close ended (closeContext).
+	enum CloseAnswer {
+		// Answered OK in time: the device holds nothing of the context, and every command
+		// buffer of it has finished. Its units are given back, and the caller lets go of the
+		// rest (freeIdChunks, freeBlocks, dropSurfaceBlocks closed).
+		kCloseAnswered,
+		// Refused, or never posted: the device may hold all of it for good, its units too, so
+		// the caller keeps the rest from use (keepIdChunks, keepBlocks, dropSurfaceBlocks not
+		// closed).
+		kCloseRefused,
+		// Not answered in kCloseAnswerMs: the caller hands the resource-id chunks to the close
+		// (parkClose with `*late`), whose answer, however late, lets go of them and the units as
+		// one in time does, and keeps the blocks from use (keepBlocks, dropSurfaceBlocks not
+		// closed).
+		kCloseLate,
+	};
+	CloseAnswer closeContext(UInt32 context, UInt32 first, UInt32 units, int32_t *late);
+	// A late close's holdings: the client's resource-id chunks are the close's own (its token's,
+	// RgfxCloseTable.hpp) from here on, none of them anyone else's, until its answer lets go of
+	// them on the release thread. Never answered, they stay the device's for good, as its units
+	// do.
+	void parkClose(const void *client, int32_t late);
 	// Chunks of the texture resource ids, each owned by `owner` for context `context` and posted
 	// to the device (RESOURCE_ID_CHUNK) before takeIdChunk returns its first id; the owner's are
 	// freed after its context's close is answered.
 	IOReturn takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId);
 	void freeIdChunks(const void *owner);
+	// The owner's chunks are kept from use for good: its close was refused.
+	void keepIdChunks(const void *owner);
 	// Blocks of the region past RGFX_CONTEXT_ALLOCATIONS_OFFSET (RgfxBlockTable.hpp), each owned
 	// by `owner` of context `context`. freeBlock returns at once; the block is given out again
 	// once the device answers its BLOCK_RELEASE OK, posted from a thread of the kext's own, and
