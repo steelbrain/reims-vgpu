@@ -1124,6 +1124,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// A buffer never committed, or whose completion never came, gives its slot back, and lets
 	// what it kept go with it.
 	[self rgfxGiveSlotBack];
+	// And the block its message lay in, as its completion would have: a buffer posted with a
+	// completion to come is kept until it comes (the reader holds it), so the host has read the
+	// message from any block given back here, or will never read it.
+	if (_bodyPool != nullptr) {
+		_bodyPool->giveBack(_body);
+		_bodyPool = nullptr;
+	}
 	delete _encoder;
 }
 

@@ -75,7 +75,8 @@ struct RgfxBodyBlock {
 
 /// A queue's blocks for the messages of its command buffers too large for its ring: one taken
 /// at the commit, given back at the completion (the host read the message out of it before it
-/// ran the buffer), and reused by the next such buffer, so the block stays the process's, and
+/// ran the buffer), or as a buffer no completion comes for goes, and reused by the next such
+/// buffer, so the block stays the process's, and
 /// in its window, with no kext call per buffer. A block is a power of two of at least
 /// kGranule bytes; the pool keeps kKeep free ones and gives the rest back to the region, and
 /// gives back all it holds when it goes. Locked: commits and completions come on any thread.

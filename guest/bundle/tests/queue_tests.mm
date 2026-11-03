@@ -30,6 +30,7 @@
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxObjectModel.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
@@ -743,6 +744,88 @@ void test_enqueue_and_commit_are_once()
 	checkDies("commit-and-wait-after-commit", "commit an already committed command buffer");
 }
 
+// The region's blocks, placed one after another past the floor up to `limit`, and those live.
+struct Blocks {
+	uint64_t next = RGFX_ALLOCATIONS_OFFSET;
+	uint64_t limit = 0;
+	uint64_t made = 0;
+	std::vector<uint64_t> live;
+	static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		Blocks *b = static_cast<Blocks *>(c);
+		const uint64_t at = (b->next + align - 1) & ~(align - 1);
+		if (at + size > b->limit)
+			return false;
+		b->next = at + size;
+		b->made++;
+		b->live.push_back(at);
+		*offset = at;
+		return true;
+	}
+	static void release(void *c, uint64_t offset)
+	{
+		std::vector<uint64_t> &live = static_cast<Blocks *>(c)->live;
+		for (auto it = live.begin(); it != live.end(); ++it) {
+			if (*it == offset) {
+				live.erase(it);
+				return;
+			}
+		}
+		CHECK(false); // a block released twice, or never placed
+	}
+};
+
+// A command buffer let go with no completion gives back the region block its message lies in, as
+// its completion does: one encoded past what its queue's ring takes and never committed, and one
+// posted out of line on a queue whose completion ring nothing reads. Buffer after buffer reuse
+// one block, and the queue's going gives it back to the region. (A buffer let go so used to keep
+// its block, and the region lost one a buffer.)
+void test_buffers_let_go_give_their_blocks_back()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	Blocks blocks;
+	blocks.limit = mem.size();
+	region.setBlockSource(&Blocks::alloc, &Blocks::release, &blocks);
+	__weak RgfxCommandQueue *weakQueue = nil;
+	@autoreleasepool {
+		Queue q; // no reader: no completion comes
+		q.queue.region = &region;
+		weakQueue = q.queue;
+		// Far past half the 32 KiB ring.
+		auto encode = [&q] {
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+			for (int i = 0; i < 2000; i++)
+				[blit fillBuffer:handle(40)
+				           range:NSMakeRange(4 * static_cast<NSUInteger>(i), 4)
+				           value:static_cast<uint8_t>(i)];
+			[blit endEncoding];
+			return cb;
+		};
+		const int n = 16;
+		for (int i = 0; i < n; i++) {
+			@autoreleasepool {
+				(void)encode();
+			}
+		}
+		CHECK(blocks.made <= 1);
+		for (int i = 0; i < n; i++) {
+			@autoreleasepool {
+				id<MTLCommandBuffer> cb = encode();
+				[cb commit];
+				RgfxMsgHeader h = {};
+				std::vector<uint8_t> bytes;
+				CHECK(q.submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+			}
+		}
+		CHECK(blocks.made == 1);
+		CHECK(blocks.live.size() == 1);
+	}
+	CHECK(weakQueue == nil);
+	CHECK(blocks.live.empty());
+}
+
 } // namespace
 
 int rgfxQueueDiesCase(const char *name)
@@ -801,4 +884,5 @@ void rgfxQueueTests(const char *self)
 	test_threads_commit_in_enqueue_order();
 	test_submitted_waits_for_the_buffers_before();
 	test_enqueue_and_commit_are_once();
+	test_buffers_let_go_give_their_blocks_back();
 }
