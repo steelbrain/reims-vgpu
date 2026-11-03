@@ -9908,3 +9908,317 @@ fn type_9_faults_revoke_queues_as_metals() {
         assert_eq!(after_type_9s(&p, &d, draws), theirs, "{draws:?}");
     }
 }
+
+/// A step of a visibility case's pass: `setVisibilityResultMode:offset:` of a mode at an offset,
+/// a draw of `render_depth`'s triangle over the whole target at a depth (0.25 passes the depth
+/// test of a pass with depth, 0.75 fails it), or a scissor rectangle over the target's left
+/// columns.
+#[derive(Clone, Copy, Debug)]
+enum Vis {
+    Mode(u64, u64),
+    Draw(f32),
+    Scissor(u64),
+}
+
+/// A pass of a visibility case: its samples, whether it has a `Depth32Float` attachment
+/// (cleared to 0.5, tested `Less`, unwritten), its `visibilityResultType`, and its steps.
+#[derive(Clone, Copy, Debug)]
+struct VisPass<'a> {
+    samples: u64,
+    depth: bool,
+    result_type: u64,
+    steps: &'a [Vis],
+}
+
+/// The side of a visibility case's target.
+const VIS_SIDE: u64 = 16;
+
+/// The 64-bit words of a visibility result buffer holding `init` after `passes` drew over it in
+/// one command buffer, each pass over its own `VIS_SIDE` square BGRA8 target, cleared.
+fn visibility_results<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    init: &[u64],
+    passes: &[VisPass<'_>],
+) -> Vec<u64> {
+    use reims_vgpu_core::platform::values::{DepthStencilDesc, PassSet};
+
+    let words: Vec<u8> = init.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let length = u64::try_from(words.len()).unwrap();
+    let results = buffer::<P>(d, length, 0, &words);
+    let tested = d
+        .new_depth_stencil_state(&DepthStencilDesc {
+            depth_compare_function: Some(1), // Less
+            depth_write_enabled: Some(false),
+            front: None,
+            back: None,
+        })
+        .unwrap()
+        .unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let (mut kept_buffers, mut kept_textures) = (Vec::new(), Vec::new());
+    for pass in passes {
+        let mut entries = Vec::new();
+        let count = format!("04 04 {:02x}000000", pass.samples);
+        if pass.samples > 1 {
+            entries.push(count.as_str());
+        }
+        if pass.depth {
+            entries.push("09 04 fc000000"); // Depth32Float
+        }
+        let state = blob_state::<P>(d, ("render_depth", "render_color"), &entries);
+        let attachment = |format: u64| {
+            let desc = p.texture_descriptor(&TextureDesc {
+                texture_type: if pass.samples > 1 { 4 } else { 2 },
+                pixel_format: format,
+                width: VIS_SIDE,
+                height: VIS_SIDE,
+                sample_count: pass.samples,
+                usage: TARGET,
+                resource_options: Some(0x20), // Private
+                ..TextureDesc::default()
+            });
+            d.new_texture(OnFault::Die, &desc).unwrap().unwrap()
+        };
+        let colour = attachment(BGRA8);
+        let rp = p.render_pass_descriptor();
+        rp.set_color_attachment(
+            OnFault::Die,
+            0,
+            &ColorAttachmentSet {
+                texture: Some(Some(&colour)),
+                load_action: Some(CLEAR),
+                store_action: Some(0), // DontCare
+                ..ColorAttachmentSet::default()
+            },
+        )
+        .unwrap();
+        let depth = pass.depth.then(|| attachment(252));
+        if let Some(depth) = &depth {
+            rp.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+                texture: Some(Some(depth)),
+                load_action: Some(CLEAR),
+                store_action: Some(0),
+                clear_depth: Some(0.5),
+                ..Default::default()
+            });
+        }
+        rp.set_pass(&PassSet {
+            visibility_result_buffer: Some(Some(&results)),
+            visibility_result_type: Some(pass.result_type),
+            ..PassSet::default()
+        });
+        let e = cb.render_encoder(OnFault::Die, &rp).unwrap().unwrap();
+        e.encode(
+            OnFault::Die,
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+        )
+        .unwrap();
+        if pass.depth {
+            e.encode(
+                OnFault::Die,
+                RenderCmd::SetDepthStencilState {
+                    depth_stencil_state: Some(&tested),
+                },
+            )
+            .unwrap();
+        }
+        for step in pass.steps {
+            match *step {
+                Vis::Mode(mode, offset) => e
+                    .encode(
+                        OnFault::Die,
+                        RenderCmd::SetVisibilityResultMode { mode, offset },
+                    )
+                    .unwrap(),
+                Vis::Scissor(width) => e
+                    .encode(
+                        OnFault::Die,
+                        RenderCmd::SetScissorRect {
+                            rect: MtlScissorRect {
+                                x: 0,
+                                y: 0,
+                                width,
+                                height: VIS_SIDE,
+                            },
+                        },
+                    )
+                    .unwrap(),
+                Vis::Draw(z) => {
+                    let params = [z, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+                    let params = buffer::<P>(d, 32, 0, &bytes(&params));
+                    e.encode(
+                        OnFault::Die,
+                        RenderCmd::SetVertexBuffer {
+                            buffer: Some(&params),
+                            offset: 0,
+                            index: 0,
+                        },
+                    )
+                    .unwrap();
+                    e.encode(
+                        OnFault::Die,
+                        RenderCmd::DrawPrimitives {
+                            primitive_type: 3,
+                            vertex_start: 0,
+                            vertex_count: 3,
+                        },
+                    )
+                    .unwrap();
+                    kept_buffers.push(params);
+                }
+            }
+        }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        kept_textures.push(colour);
+        kept_textures.extend(depth);
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{passes:?}: {:?}", cb.error());
+    let n = init.len();
+    // SAFETY: a Shared buffer of `n` words, which no command uses any more.
+    let words = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u64>(), n) };
+    words.to_vec()
+}
+
+/// A visibility result buffer's words, each Metal's own fill until a pass writes it.
+const VIS_FILL: u64 = 0xeeee_eeee_eeee_eeee;
+
+/// A pass's visibility results are Metal's: a `Counting` result is the samples that passed the
+/// depth test (every sample of the target, at 1 and 4 samples, the scissor's alone, none where
+/// the depth test fails, two draws' together at one offset), a `Boolean` one 1 where any did and
+/// 0 where none did; an offset set with no draw after it gets 0, one left set at the encoder's
+/// end gets its draws', one never set keeps its bytes, and a later pass in the command buffer
+/// rewrites only its own offsets; `Disabled` writes nothing. A pass of type `Accumulate` resets
+/// its results as the AMD Radeon Pro 5300M and the Intel UHD 630 do under macOS 26.7.1, where
+/// Metal's docs promise accumulation and the M3 Max accumulates: the runtime does not build it.
+/// Left out, as the Macs differ: a draw after `Disabled` at an offset once a mode was set, which
+/// the M3 Max writes 0 at and the x86-64 Macs, and the runtime, leave.
+#[test]
+fn visibility_results_are_metals() {
+    use Vis::{Draw, Mode, Scissor};
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let (all, quad) = (VIS_SIDE * VIS_SIDE, VIS_SIDE * VIS_SIDE * 4);
+    let one = |steps| VisPass {
+        samples: 1,
+        depth: false,
+        result_type: 0,
+        steps,
+    };
+    let fill = [VIS_FILL; 4];
+    let modes: &[Vis] = &[Mode(2, 0), Draw(0.25), Mode(1, 8), Draw(0.25), Mode(0, 0)];
+    let unclosed: &[Vis] = &[Mode(2, 0), Draw(0.25), Mode(1, 8), Draw(0.25)];
+    let undrawn: &[Vis] = &[Mode(2, 0), Mode(1, 8)];
+    let scissored: &[Vis] = &[Scissor(4), Mode(2, 0), Draw(0.25), Mode(1, 8), Draw(0.25)];
+    let twice: &[Vis] = &[Mode(2, 0), Draw(0.25), Draw(0.25), Mode(1, 8), Draw(0.25)];
+    let depth_tested: &[Vis] = &[
+        Mode(2, 0),
+        Draw(0.75),
+        Mode(1, 8),
+        Draw(0.75),
+        Mode(2, 16),
+        Draw(0.25),
+        Mode(1, 24),
+        Draw(0.25),
+    ];
+    let disabled: &[Vis] = &[Mode(0, 8), Draw(0.25)];
+    let later: &[Vis] = &[Mode(2, 16), Draw(0.25)];
+    let accumulating: &[Vis] = &[
+        Mode(2, 0),
+        Draw(0.25),
+        Mode(1, 8),
+        Draw(0.25),
+        Mode(1, 16),
+        Mode(2, 24),
+    ];
+    let cases: Vec<(&str, Vec<VisPass<'_>>, [u64; 4], [u64; 4])> = vec![
+        (
+            "modes",
+            vec![one(modes)],
+            fill,
+            [all, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "unclosed",
+            vec![one(unclosed)],
+            fill,
+            [all, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "undrawn",
+            vec![one(undrawn)],
+            fill,
+            [0, 0, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "scissored",
+            vec![one(scissored)],
+            fill,
+            [all / 4, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "twice",
+            vec![one(twice)],
+            fill,
+            [2 * all, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "multisampled",
+            vec![VisPass {
+                samples: 4,
+                ..one(unclosed)
+            }],
+            fill,
+            [quad, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "depth tested",
+            vec![VisPass {
+                depth: true,
+                ..one(depth_tested)
+            }],
+            fill,
+            [0, 0, all, 1],
+        ),
+        (
+            "multisampled, depth tested",
+            vec![VisPass {
+                samples: 4,
+                depth: true,
+                ..one(depth_tested)
+            }],
+            fill,
+            [0, 0, quad, 1],
+        ),
+        ("disabled", vec![one(disabled)], fill, fill),
+        (
+            "two passes",
+            vec![one(modes), one(later)],
+            fill,
+            [all, 1, all, VIS_FILL],
+        ),
+    ];
+    for (name, passes, init, want) in &cases {
+        let ours = visibility_results(&p, &d, init, passes);
+        let theirs = visibility_results(&mp, &md, init, passes);
+        assert_eq!(theirs, want, "{name} on Metal");
+        assert_eq!(ours, theirs, "{name}");
+    }
+    let start = [100, 5, 7, 9];
+    let accumulated = [VisPass {
+        result_type: 1,
+        ..one(accumulating)
+    }];
+    let reset = [one(accumulating)];
+    let ours = visibility_results(&p, &d, &start, &accumulated);
+    assert_eq!(ours, [all, 1, 0, 0]);
+    assert_eq!(ours, visibility_results(&mp, &md, &start, &reset));
+}
