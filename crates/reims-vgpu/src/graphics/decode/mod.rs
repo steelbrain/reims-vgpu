@@ -69,6 +69,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -557,6 +558,58 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The waits its command buffer makes for buffers of other queues, taken at its begin, for
     /// the work the host starts off it ([`Self::wait_for_order_on_cpu`]).
     order_waits: RefCell<Vec<surface_order::OrderWait<P>>>,
+    /// The entries the message found last ([`Recent`]).
+    recent: Recent<P>,
+}
+
+/// How many entries [`Recent`] keeps.
+const RECENT: usize = 8;
+
+/// The entries a message found last, each by its id, at a slot its id picks: a lookup of an id
+/// the message found before finds its entry here, with no look into its view's map. A draw's
+/// binds name the same few objects again and again (each of `draws.10k`'s 10,000 draws binds its
+/// upload chunk, 256 draws a chunk), and the view's lookup was most of what naming one cost.
+/// What it keeps is what the view answered, which it answers again until the message makes or
+/// removes that id itself ([`GraphicsDecoder::saw`]) or ends ([`GraphicsDecoder::end_message`]),
+/// which empty it; the context it may name is the message's, fixed until it ends.
+struct Recent<P: Platform>([RecentSlot<P>; RECENT]);
+
+/// A slot of [`Recent`]: an id and the entry found for it.
+type RecentSlot<P> = Cell<Option<(u64, NonNull<Entry<P>>)>>;
+
+// SAFETY: as a view's ([`View`]), which lends the entries it points to: used on one thread at a
+// time (it is not `Sync`); moved to another, it moves its pointers, to entries that are
+// `Send + Sync`.
+unsafe impl<P: Platform> Send for Recent<P> where Entry<P>: Send + Sync {}
+
+impl<P: Platform> Recent<P> {
+    fn new() -> Recent<P> {
+        Recent(std::array::from_fn(|_| Cell::new(None)))
+    }
+
+    /// `obj_id`'s slot.
+    fn slot(&self, obj_id: u64) -> &RecentSlot<P> {
+        &self.0[obj_id as usize % RECENT]
+    }
+
+    /// The entry the message found last for `obj_id`, where it is kept.
+    fn get(&self, obj_id: u64) -> Option<NonNull<Entry<P>>> {
+        self.slot(obj_id)
+            .get()
+            .and_then(|(id, at)| (id == obj_id).then_some(at))
+    }
+
+    /// Keeps `at`, the entry the message found for `obj_id`.
+    fn put(&self, obj_id: u64, at: NonNull<Entry<P>>) {
+        self.slot(obj_id).set(Some((obj_id, at)));
+    }
+
+    /// Keeps nothing.
+    fn clear(&self) {
+        for slot in &self.0 {
+            slot.set(None);
+        }
+    }
 }
 
 /// What the tests call after each op of a command buffer's walk, with its index, but for the
@@ -608,6 +661,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             held_caches: RefCell::new(None),
             drain: RefCell::new(None),
             order_waits: RefCell::new(Vec::new()),
+            recent: Recent::new(),
         }
     }
 
@@ -631,6 +685,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Ends the message carried out on this handle: what it named is let go of, and its place in
     /// the commit order given back.
     pub(crate) fn end_message(&mut self) {
+        self.recent.clear();
         self.views.get_mut().clear();
         self.mark.set(None);
         self.ranges.set(None);
@@ -954,6 +1009,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// resolves to nothing (a bad reference where it is named). `None` too where only tried and a
     /// lock is busy.
     fn entry(&self, obj_id: u64) -> Option<&Entry<P>> {
+        if let Some(at) = self.recent.get(obj_id) {
+            // SAFETY: an entry a view of `views` found below, which the view lends for its own
+            // life; the view stays there until the message ends, which empties the cache first.
+            return Some(unsafe { at.as_ref() });
+        }
         if !self.owned(obj_id) {
             return None;
         }
@@ -974,9 +1034,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                 found
             }
         };
+        let found = found.and_then(|p| NonNull::new(p.cast_mut()))?;
+        self.recent.put(obj_id, found);
         // SAFETY: the view lends the entry for its own life, and it stays in `views` until the
         // handle drops or a message begins anew on it, which takes `&mut self`: so for `&self`'s.
-        found.map(|p| unsafe { &*p })
+        Some(unsafe { found.as_ref() })
     }
 
     /// The object `obj_id` names, where it is the current context's: a process names only its own
@@ -2011,6 +2073,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The message's own change of `obj_id` in `context`'s table: made at `at`, or removed.
     fn saw(&self, context: &Arc<Context<P>>, obj_id: u64, at: Option<std::ptr::NonNull<Entry<P>>>) {
+        self.recent.clear();
         for view in self.views.borrow().iter() {
             if Arc::ptr_eq(view.context(), context) {
                 match at {
@@ -3906,6 +3969,61 @@ mod tests {
             dec.heap_texture_size_and_align(&device, &query.as_bytes()[..8])
                 .is_none()
         );
+    }
+
+    /// A message names what its view sees, through the entries it found last ([`Recent`]): an
+    /// object it destroys is named no more, and one it makes again under the same id is the new
+    /// one, as are two ids at one slot of the cache. One another thread destroys meanwhile is
+    /// still named, as the view sees it, and outlives the message's naming of it; the next
+    /// message sees the destroy.
+    #[test]
+    fn a_message_names_what_its_own_destroys_and_makes_left() {
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_graphics::region::Region::new(0x10000).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
+        dec.set_context(Some(1));
+        let fence = || ObjHandle::Fence(device.new_fence().unwrap().unwrap());
+        let event = || ObjHandle::Event(device.new_event(OnFault::Return).unwrap().unwrap());
+        let is_fence = |h: Option<&ObjHandle<FakePlatform>>| matches!(h, Some(ObjHandle::Fence(_)));
+        let is_event = |h: Option<&ObjHandle<FakePlatform>>| matches!(h, Some(ObjHandle::Event(_)));
+        let a = (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 5;
+        let b = a + RECENT as u64;
+
+        // Found, then found again (from the cache).
+        assert_eq!(dec.insert(a, fence()).unwrap(), Ok(()));
+        assert!(is_fence(dec.named(a)));
+        assert!(is_fence(dec.named(a)));
+        // Its own destroy: named no more.
+        dec.remove(a);
+        assert!(dec.named(a).is_none());
+        // Made again under the same id: the new object.
+        assert_eq!(dec.insert(a, event()).unwrap(), Ok(()));
+        assert!(is_event(dec.named(a)));
+        // Another id at the same slot, before and after its make, and the first again.
+        assert!(dec.named(b).is_none());
+        assert_eq!(dec.insert(b, fence()).unwrap(), Ok(()));
+        assert!(is_fence(dec.named(b)));
+        assert!(is_event(dec.named(a)));
+        assert!(is_fence(dec.named(b)));
+
+        // A destroy on another thread's handle (ring 0's), while this message names `a`: the view
+        // still sees it, and keeps it until the message ends.
+        let mut ring0 = dec.sender(Some(1), Sinks::default());
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                ring0.remove(a);
+                ring0.remove(b);
+                ring0.end_message();
+            });
+        });
+        assert!(is_event(dec.named(a)));
+        assert!(is_fence(dec.named(b)));
+        dec.end_message();
+        // The next message sees the destroys (each answer read through, where there is one).
+        assert!(!is_event(dec.named(a)) && dec.named(a).is_none());
+        assert!(!is_fence(dec.named(b)) && dec.named(b).is_none());
     }
 
     /// A create of each state object calls the platform and holds its handle;
