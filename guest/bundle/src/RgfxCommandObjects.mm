@@ -1178,6 +1178,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
+	// The IOSurface views it only reads, where the process names its buffers' order: named among
+	// their readers once it is posted, and held until it completes, so the slots stay named while
+	// it runs (rgfxIOSurfaceNameUses).
+	std::vector<std::shared_ptr<void>> _surfaceReads;
 	// Where this buffer's writes of IOSurfaces' shared blocks are named to the kext, null where
 	// it has none: its completion retires them there, so a CPU lock of one of the surfaces waits
 	// until then (RgfxIOSurface.h, rgfxIOSurfaceWritesPosted).
@@ -1423,8 +1427,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_surfaceWrites = _encoder->takeSurfaceWrites();
 	// The cached surfaces it uses are named before its first encoder, each with the CPU's
 	// generation of it as of this commit, so the host fills each one's device cache first where
-	// the CPU wrote it since.
-	rgfxIOSurfaceNameUses(_encoder, _surfaceWrites);
+	// the CPU wrote it since; and, where the process names its buffers' order, the buffers of
+	// other queues it runs after, as the surfaces' blocks name them now.
+	_surfaceReads = rgfxIOSurfaceNameUses(_encoder, _surfaceWrites, _queue.rgfxObjId);
 	// The surfaces it writes are named to the kext once it is posted, and retired at its
 	// completion, which may come before the naming: the kext then keeps nothing of them.
 	RgfxRegion *writesRegion = rgfxIOSurfaceWritesRegion(_surfaceWrites);
@@ -1482,6 +1487,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The copies it writes, named among their writers once it is posted: its completion may
 	// clear _surfaceWrites by then.
 	std::vector<std::shared_ptr<void>> written = _surfaceWrites;
+	std::vector<std::shared_ptr<void>> read = _surfaceReads;
 	RgfxRegion *writesRegion = _surfaceWritesRegion;
 	std::function<void(uint64_t)> expect;
 	std::function<void()> whileWaiting;
@@ -1533,9 +1539,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	if (outOfLine)
 		_bodyPool = [queue rgfxBodyPool];
 	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
-	// A present of a surface it writes, made after this commit, waits for it on the host.
+	// A present of a surface it writes, made after this commit, waits for it on the host; and so
+	// does a buffer of another queue committed after it that uses the surface, where one of the two
+	// writes it (rgfxIOSurfaceNameUses).
 	if (posted && !written.empty())
 		rgfxIOSurfaceNoteCommitted(written, queue, queue.rgfxObjId, _seqno);
+	if (posted && !read.empty())
+		rgfxIOSurfaceNoteRead(read, queue, queue.rgfxObjId, _seqno);
 	// A CPU lock of a surface it writes waits for it from here, before the commit returns, as
 	// Metal's does once the buffer is submitted.
 	if (posted && writesRegion != nullptr)
@@ -1650,6 +1660,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
+	_surfaceReads.clear();
 	// Its results are in the surfaces' pages: the CPU locks waiting for them go on.
 	if (_surfaceWritesRegion != nullptr) {
 		rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], _seqno);

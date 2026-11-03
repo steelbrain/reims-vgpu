@@ -181,6 +181,24 @@ void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
 	const size_t bytes = count * len;
 	if (bytes == 0)
 		return;
+	uint8_t *at = prependRoom(bytes);
+	for (size_t i = 0; i < count; i++) {
+		putHeader(at + i * len, RGFX_OP_SURFACE_USE, len);
+		std::memcpy(at + i * len + RGFX_OP_BODY_OFFSET, &uses[i], sizeof(uses[i]));
+	}
+}
+
+void RgfxEncoder::prependSurfaceOrder(const RgfxSurfaceOrderWait *waits, size_t count)
+{
+	const size_t len = RGFX_OP_BODY_OFFSET + count * sizeof(RgfxSurfaceOrderWait);
+	uint8_t *at = prependRoom(len);
+	putHeader(at, RGFX_OP_SURFACE_ORDER, len);
+	if (count != 0)
+		std::memcpy(at + RGFX_OP_BODY_OFFSET, waits, count * sizeof(RgfxSurfaceOrderWait));
+}
+
+uint8_t *RgfxEncoder::prependRoom(size_t bytes)
+{
 	// Before the header's room: the ops move up where the room before them is short.
 	const size_t room = static_cast<size_t>(m_ops - m_store) - RGFX_COMMAND_BUFFER_OPS_OFFSET - m_prefix;
 	if (room < bytes) {
@@ -191,12 +209,8 @@ void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
 		std::memmove(m_ops + shift - m_prefix, m_ops - m_prefix, m_prefix);
 		m_ops += shift;
 	}
-	uint8_t *at = m_ops - m_prefix - bytes;
-	for (size_t i = 0; i < count; i++) {
-		putHeader(at + i * len, RGFX_OP_SURFACE_USE, len);
-		std::memcpy(at + i * len + RGFX_OP_BODY_OFFSET, &uses[i], sizeof(uses[i]));
-	}
 	m_prefix += bytes;
+	return m_ops - m_prefix;
 }
 
 bool RgfxEncoder::fitsRing() const

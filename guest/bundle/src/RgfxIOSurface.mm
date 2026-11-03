@@ -302,6 +302,9 @@ std::atomic<uint64_t> gCached{0};            // of them, cached on the host (the
 /// The views alive in the process whose blocks are cached: a command buffer looks for its uses of
 /// cached surfaces only while one lives (rgfxIOSurfaceNoteUse).
 std::atomic<uint64_t> gCachedLive{0};
+/// The process names its command buffers' order over IOSurfaces (rgfxIOSurfaceSetOrder): every
+/// surface a buffer uses is noted, and its commit names the buffers of other queues it runs after.
+std::atomic<bool> gSurfaceOrder{false};
 /// The RgfxAskCachedScopes alive on this thread.
 thread_local unsigned tAskCached = 0;
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
@@ -425,6 +428,12 @@ struct RgfxSurfaceShadow {
 	// By slot: the queue this process named there (0: none), and that queue while it lives.
 	uint64_t slotQueue[RGFX_SURFACE_WRITER_SLOTS] = {};
 	__weak id slotOwner[RGFX_SURFACE_WRITER_SLOTS];
+	// Past the writers, where the block has room for them: each queue's latest buffer that only
+	// reads the view, the same record, which only the bundles read (gSurfaceOrder); and this
+	// process's slots of it, as the writers'.
+	RgfxSurfaceWriters *readers = nullptr;
+	uint64_t readerQueue[RGFX_SURFACE_WRITER_SLOTS] = {};
+	__weak id readerOwner[RGFX_SURFACE_WRITER_SLOTS];
 
 	~RgfxSurfaceShadow();
 
@@ -432,62 +441,101 @@ struct RgfxSurfaceShadow {
 	void noteWriter(id queue, uint64_t queueId, uint64_t seqno)
 	{
 		std::lock_guard<std::mutex> g(writersLock);
+		if (!noteIn(writers, slotQueue, slotOwner, queue, queueId, seqno)) {
+			static std::atomic<bool> logged{false};
+			if (!logged.exchange(true)) {
+				NSLog(@"RGFX: IOSurface %u: no writer slot left for queue 0x%llx: a present of "
+				      @"the surface may show it before the queue's command buffers finish",
+				      surfaceId, (unsigned long long)queueId);
+			}
+		}
+	}
+
+	/// Names the buffer at `seqno` on `queue` (id `queueId`) among the copy's readers, where the
+	/// block has them.
+	void noteReader(id queue, uint64_t queueId, uint64_t seqno)
+	{
+		if (readers == nullptr)
+			return;
+		std::lock_guard<std::mutex> g(writersLock);
+		if (!noteIn(readers, readerQueue, readerOwner, queue, queueId, seqno)) {
+			static std::atomic<bool> logged{false};
+			if (!logged.exchange(true)) {
+				NSLog(@"RGFX: IOSurface %u: no reader slot left for queue 0x%llx: a later write "
+				      @"of the surface by another queue may not wait for its reads",
+				      surfaceId, (unsigned long long)queueId);
+			}
+		}
+	}
+
+	/// Raises `queue`'s slot of `rec` to `seqno`: the slot it holds, else one of ours whose queue
+	/// is gone, else an empty one; false where none is left. Under writersLock.
+	static bool noteIn(RgfxSurfaceWriters *rec, uint64_t (&queues)[RGFX_SURFACE_WRITER_SLOTS],
+	                   __weak id (&owners)[RGFX_SURFACE_WRITER_SLOTS], id queue, uint64_t queueId,
+	                   uint64_t seqno)
+	{
 		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
-			if (slotQueue[i] == queueId) {
+			if (queues[i] == queueId) {
 				// Only this process writes the slot: its seqno only rises.
-				uint64_t *s = &writers->writers[i].seqno;
+				uint64_t *s = &rec->writers[i].seqno;
 				if (__atomic_load_n(s, __ATOMIC_RELAXED) < seqno)
 					__atomic_store_n(s, seqno, __ATOMIC_RELEASE);
-				return;
+				return true;
 			}
 		}
 		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
-			if (slotQueue[i] != 0 && slotOwner[i] == nil) {
+			if (queues[i] != 0 && owners[i] == nil) {
 				// A queue of ours that is gone, its buffers all finished: the slot is ours to give.
-				give(i, queue, queueId, seqno);
-				return;
+				give(rec, queues, owners, i, queue, queueId, seqno);
+				return true;
 			}
 		}
 		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
 			uint64_t empty = 0;
-			if (slotQueue[i] == 0 &&
-			    __atomic_compare_exchange_n(&writers->writers[i].queue_obj_id, &empty, queueId,
-			                                false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-				__atomic_store_n(&writers->writers[i].seqno, seqno, __ATOMIC_RELEASE);
-				slotQueue[i] = queueId;
-				slotOwner[i] = queue;
-				return;
+			if (queues[i] == 0 &&
+			    __atomic_compare_exchange_n(&rec->writers[i].queue_obj_id, &empty, queueId, false,
+			                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+				__atomic_store_n(&rec->writers[i].seqno, seqno, __ATOMIC_RELEASE);
+				queues[i] = queueId;
+				owners[i] = queue;
+				return true;
 			}
 		}
-		static std::atomic<bool> logged{false};
-		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: IOSurface %u: no writer slot left for queue 0x%llx: a present of the "
-			      @"surface may show it before the queue's command buffers finish",
-			      surfaceId, (unsigned long long)queueId);
-		}
+		return false;
 	}
 
-	/// Gives slot `i`, ours, to `queue`: its seqno emptied, then the queue, then the seqno.
-	void give(uint32_t i, id queue, uint64_t queueId, uint64_t seqno)
+	/// Gives slot `i` of `rec`, ours, to `queue`: its seqno emptied, then the queue, then the
+	/// seqno.
+	static void give(RgfxSurfaceWriters *rec, uint64_t (&queues)[RGFX_SURFACE_WRITER_SLOTS],
+	                 __weak id (&owners)[RGFX_SURFACE_WRITER_SLOTS], uint32_t i, id queue,
+	                 uint64_t queueId, uint64_t seqno)
 	{
-		__atomic_store_n(&writers->writers[i].seqno, 0, __ATOMIC_RELEASE);
-		__atomic_store_n(&writers->writers[i].queue_obj_id, queueId, __ATOMIC_RELEASE);
-		__atomic_store_n(&writers->writers[i].seqno, seqno, __ATOMIC_RELEASE);
-		slotQueue[i] = queueId;
-		slotOwner[i] = queue;
+		__atomic_store_n(&rec->writers[i].seqno, 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&rec->writers[i].queue_obj_id, queueId, __ATOMIC_RELEASE);
+		__atomic_store_n(&rec->writers[i].seqno, seqno, __ATOMIC_RELEASE);
+		queues[i] = queueId;
+		owners[i] = queue;
 	}
 
-	/// Empties this process's slots: the seqno, then the queue.
+	/// Empties this process's slots, of the writers and the readers: the seqno, then the queue.
 	void emptyWriters()
 	{
 		std::lock_guard<std::mutex> g(writersLock);
+		emptyIn(writers, slotQueue, slotOwner);
+		if (readers != nullptr)
+			emptyIn(readers, readerQueue, readerOwner);
+	}
+
+	static void emptyIn(RgfxSurfaceWriters *rec, uint64_t (&queues)[RGFX_SURFACE_WRITER_SLOTS],
+	                    __weak id (&owners)[RGFX_SURFACE_WRITER_SLOTS])
+	{
 		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
-			if (slotQueue[i] == 0)
+			if (queues[i] == 0)
 				continue;
-			__atomic_store_n(&writers->writers[i].seqno, 0, __ATOMIC_RELEASE);
-			__atomic_store_n(&writers->writers[i].queue_obj_id, 0, __ATOMIC_RELEASE);
-			slotQueue[i] = 0;
-			slotOwner[i] = nil;
+			__atomic_store_n(&rec->writers[i].seqno, 0, __ATOMIC_RELEASE);
+			__atomic_store_n(&rec->writers[i].queue_obj_id, 0, __ATOMIC_RELEASE);
+			queues[i] = 0;
+			owners[i] = nil;
 		}
 	}
 
@@ -796,8 +844,17 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		// any holder's texture names them.
 		shadow->writersAt = writersAt;
 		shadow->writers = reinterpret_cast<RgfxSurfaceWriters *>(shadow->copy() + writersAt);
+		// The readers follow where the block's room past the writers holds them: every holder
+		// asks the block's size from the writers' end alone, so a holder of a bundle without
+		// readers asks the same block.
+		const uint64_t readersEnd = writersAt + 2 * sizeof(RgfxSurfaceWriters);
+		if (readersEnd <=
+		    alignUp(writersAt + sizeof(RgfxSurfaceWriters), RgfxRegion::kDefaultBlockAlign))
+			shadow->readers = shadow->writers + 1;
+		const size_t slots =
+		    (shadow->readers != nullptr ? 2 : 1) * sizeof(RgfxSurfaceWriters);
 		if (!shadow->shared || sharedBlock.fresh)
-			std::memset(static_cast<void *>(shadow->writers), 0, sizeof(RgfxSurfaceWriters));
+			std::memset(static_cast<void *>(shadow->writers), 0, slots);
 		r.shadows[surfaceId] = shadow;
 	}
 	uint64_t offset = shadow->block.offset;
@@ -1319,43 +1376,106 @@ void rgfxIOSurfaceNoteUse(RgfxEncoder *enc, __unsafe_unretained id resource)
 		return;
 	rgfxNoteSync(enc, *view);
 	const uint64_t stamp = enc->keepStamp();
-	if ((*view)->cached && (*view)->usedBy.load(std::memory_order_relaxed) != stamp) {
+	const bool named = (*view)->cached || gSurfaceOrder.load(std::memory_order_relaxed);
+	if (named && (*view)->usedBy.load(std::memory_order_relaxed) != stamp) {
 		(*view)->usedBy.store(stamp, std::memory_order_relaxed);
 		enc->noteSurfaceUse(*view);
 	}
 }
 
-void rgfxIOSurfaceNameUses(RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes)
+void rgfxIOSurfaceSetOrder(bool on)
+{
+	gSurfaceOrder.store(on, std::memory_order_relaxed);
+}
+
+/// Each slot of `rec` that names a queue other than `own`, read as the host reads a writer (its
+/// queue, its seqno, then its queue again, a slot whose queue changed between reading as free),
+/// added to `waits`: once a queue, at its highest seqno.
+static void nameSlots(const RgfxSurfaceWriters *rec, uint64_t own,
+                      std::vector<RgfxSurfaceOrderWait> &waits)
+{
+	for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
+		const RgfxSurfaceWriter &slot = rec->writers[i];
+		const uint64_t queue = __atomic_load_n(&slot.queue_obj_id, __ATOMIC_ACQUIRE);
+		if (queue == 0 || queue == own)
+			continue;
+		const uint64_t seqno = __atomic_load_n(&slot.seqno, __ATOMIC_ACQUIRE);
+		if (seqno == 0 || __atomic_load_n(&slot.queue_obj_id, __ATOMIC_ACQUIRE) != queue)
+			continue;
+		auto it = std::find_if(waits.begin(), waits.end(), [queue](const RgfxSurfaceOrderWait &w) {
+			return w.queue_obj_id == queue;
+		});
+		if (it == waits.end())
+			waits.push_back({queue, seqno});
+		else if (it->seqno < seqno)
+			it->seqno = seqno;
+	}
+}
+
+std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
+    RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes, uint64_t queueObjId)
 {
 	const std::vector<std::shared_ptr<void>> uses = enc->takeSurfaceUses();
-	if (gCachedLive.load(std::memory_order_relaxed) == 0)
-		return;
-	std::vector<RgfxSurfaceShadow *> named;
-	std::vector<RgfxOpSurfaceUse> ops;
-	auto name = [&](const std::shared_ptr<void> &p, bool writes) {
-		auto *s = static_cast<RgfxSurfaceShadow *>(p.get());
-		if (!s->cached)
-			return;
-		auto it = std::find(named.begin(), named.end(), s);
-		if (it != named.end()) {
-			if (writes)
-				ops[it - named.begin()].flags |= RGFX_SURFACE_USE_WRITES;
-			return;
-		}
-		named.push_back(s);
-		RgfxOpSurfaceUse op = {};
-		op.block_offset = s->block.offset;
-		// As the kext left it at the surface's last read-write CPU lock, in any process.
-		op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
-		op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
-		ops.push_back(op);
-	};
-	for (const auto &w : writes)
-		name(w, true);
-	for (const auto &u : uses)
-		name(u, false);
-	if (!ops.empty())
-		enc->prependSurfaceUses(ops.data(), ops.size());
+	std::vector<std::shared_ptr<void>> reads;
+	const bool order = gSurfaceOrder.load(std::memory_order_relaxed);
+	if (gCachedLive.load(std::memory_order_relaxed) == 0 && !order)
+		return reads;
+	if (gCachedLive.load(std::memory_order_relaxed) != 0) {
+		std::vector<RgfxSurfaceShadow *> named;
+		std::vector<RgfxOpSurfaceUse> ops;
+		auto name = [&](const std::shared_ptr<void> &p, bool writes) {
+			auto *s = static_cast<RgfxSurfaceShadow *>(p.get());
+			if (!s->cached)
+				return;
+			auto it = std::find(named.begin(), named.end(), s);
+			if (it != named.end()) {
+				if (writes)
+					ops[it - named.begin()].flags |= RGFX_SURFACE_USE_WRITES;
+				return;
+			}
+			named.push_back(s);
+			RgfxOpSurfaceUse op = {};
+			op.block_offset = s->block.offset;
+			// As the kext left it at the surface's last read-write CPU lock, in any process.
+			op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
+			op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
+			ops.push_back(op);
+		};
+		for (const auto &w : writes)
+			name(w, true);
+		for (const auto &u : uses)
+			name(u, false);
+		if (!ops.empty())
+			enc->prependSurfaceUses(ops.data(), ops.size());
+	}
+	if (!order || (uses.empty() && writes.empty()))
+		return reads;
+	// The buffers of other queues it runs after, as the surfaces' blocks name them now: of each
+	// surface it writes, the writers and the readers; of each it only reads, the writers. Each
+	// was posted before its slot named it, so before this commit.
+	std::vector<RgfxSurfaceShadow *> seen;
+	std::vector<RgfxSurfaceOrderWait> waits;
+	for (const auto &w : writes) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(w.get());
+		if (std::find(seen.begin(), seen.end(), s) != seen.end())
+			continue;
+		seen.push_back(s);
+		if (s->writers != nullptr)
+			nameSlots(s->writers, queueObjId, waits);
+		if (s->readers != nullptr)
+			nameSlots(s->readers, queueObjId, waits);
+	}
+	for (const auto &u : uses) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(u.get());
+		if (std::find(seen.begin(), seen.end(), s) != seen.end())
+			continue;
+		seen.push_back(s);
+		if (s->writers != nullptr)
+			nameSlots(s->writers, queueObjId, waits);
+		reads.push_back(u);
+	}
+	enc->prependSurfaceOrder(waits.data(), waits.size());
+	return reads;
 }
 
 void RgfxSurfaceBindings::rebind(NSUInteger index, __unsafe_unretained id texture, bool overSurface)
@@ -1497,6 +1617,13 @@ void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes
 		done.push_back(s);
 		s->noteWriter(queue, queueObjId, seqno);
 	}
+}
+
+void rgfxIOSurfaceNoteRead(const std::vector<std::shared_ptr<void>> &reads, id queue,
+                           uint64_t queueObjId, uint64_t seqno)
+{
+	for (const auto &r : reads)
+		static_cast<RgfxSurfaceShadow *>(r.get())->noteReader(queue, queueObjId, seqno);
 }
 
 uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef surface, const char *cause, std::string *line)

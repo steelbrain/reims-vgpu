@@ -7754,6 +7754,254 @@ void test_iosurface_writers()
 	CFRelease(surface);
 }
 
+// A process that names its command buffers' order (rgfxIOSurfaceSetOrder; RgfxIOSurface.h): a
+// commit of a buffer that uses a surface names, once and before its first other op
+// (RGFX_OP_SURFACE_ORDER), the buffers of other queues it runs after, as the surface's block names
+// them at the commit: of a surface it only reads, the writers; of one it writes, the writers and
+// the readers; each queue once, at its highest seqno; never its own queue, nor a slot whose seqno
+// is 0. Once posted, a buffer that only reads the surface raises its queue's reader slot, and one
+// that writes it its writer slot. A surface named by no other queue gives the op with no wait; a
+// surface no buffer of another queue used names nothing of the other's; a buffer that uses no
+// surface carries no op, and nor does any buffer without the order, whose reads raise no slot.
+// A block made for this process starts with no readers, whatever it held.
+void test_iosurface_order()
+{
+	// Never freed, as Fixture's: the queues and their buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+	struct Source {
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t size, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			*offset = src->next;
+			src->next += (size + 0xfff) & ~uint64_t(0xfff);
+			*serial = 7;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+	} &src = *new Source();
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	auto queueMade = [&]() {
+		drainRing(control);
+		RgfxCommandQueue *q = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                              submitOffset:0
+		                                            completeOffset:0
+		                                          completeDataSize:0
+		                                                       ids:&ids
+		                                                  maxCount:0
+		                                                    device:nil
+		                                                serializer:&ser];
+		CHECK(q != nil);
+		(void)expectQueueCreate(control);
+		return q;
+	};
+	using Slot = std::pair<uint64_t, uint64_t>;
+	using Waits = std::vector<Slot>;
+	// What a commit carried: its seqno, whether it named its order, and the waits it named.
+	struct Committed {
+		uint64_t seqno = 0;
+		bool order = false;
+		Waits waits;
+	};
+	auto commit = [&](id<MTLCommandBuffer> cb) {
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		Committed out;
+		out.seqno = h.seqno;
+		size_t at = RGFX_COMMAND_BUFFER_OPS_OFFSET;
+		bool first = true;
+		while (at + sizeof(RgfxOpHeader) <= bytes.size()) {
+			RgfxOpHeader op = {};
+			std::memcpy(&op, bytes.data() + at, sizeof(op));
+			CHECK(op.len >= RGFX_OP_BODY_OFFSET && at + op.len <= bytes.size());
+			if (op.tag == RGFX_OP_SURFACE_ORDER) {
+				const size_t body = op.len - RGFX_OP_BODY_OFFSET;
+				CHECK(first && !out.order && body % sizeof(RgfxSurfaceOrderWait) == 0);
+				out.order = true;
+				for (size_t i = 0; i < body / sizeof(RgfxSurfaceOrderWait); i++) {
+					RgfxSurfaceOrderWait w = {};
+					std::memcpy(&w, bytes.data() + at + RGFX_OP_BODY_OFFSET + i * sizeof(w),
+					            sizeof(w));
+					out.waits.push_back({w.queue_obj_id, w.seqno});
+				}
+				std::sort(out.waits.begin(), out.waits.end());
+			}
+			first = false;
+			at += op.len;
+		}
+		drainRing(control);
+		return out;
+	};
+	auto sorted = [](Waits w) {
+		std::sort(w.begin(), w.end());
+		return w;
+	};
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	IOSurfaceRef unrelated = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr && unrelated != nullptr);
+	// 16 x 16 BGRA: rows 256 bytes apart, the header at 4096, the writers after it, then the
+	// readers; the surface's block first, the unrelated one's 8192 bytes on.
+	const uint64_t kWriters = 4096 + kSurfaceHeader;
+	auto *writers = reinterpret_cast<RgfxSurfaceWriters *>(mem.data() + src.next + kWriters);
+	RgfxSurfaceWriters *readers = writers + 1;
+	auto *otherReaders =
+	    reinterpret_cast<RgfxSurfaceWriters *>(mem.data() + src.next + 0x2000 + kWriters) + 1;
+	// The block held an older one's readers.
+	for (auto &r : readers->writers)
+		r = {0x5000000000 + 9, 77};
+	auto slot = [](const RgfxSurfaceWriters *rec, int i) {
+		return Slot(rec->writers[i].queue_obj_id, rec->writers[i].seqno);
+	};
+	const Slot kEmpty = {0, 0};
+	// Other processes' buffers, as their slots name them.
+	const Slot kOtherWriter = {0x6000000000 + 3, 12}, kOtherReader = {0x7000000000 + 5, 30};
+	auto texture = [&](IOSurfaceRef s) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                            iosurface:s
+		                                                                plane:0
+		                                                               region:&region
+		                                                               device:nil
+		                                                           serializer:&ser];
+		CHECK(t != nil);
+		drainRing(control);
+		return t;
+	};
+	id<MTLBuffer> buffer = [RgfxBuffer bufferWithLength:16 * 16 * 4
+	                                            options:MTLResourceStorageModeShared
+	                                             device:nil
+	                                         serializer:&ser];
+	CHECK(buffer != nil);
+	drainRing(control);
+	// A buffer of `q` that reads `t` (a blit from it), and one that writes it (an attachment).
+	auto read = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+		[be copyFromTexture:t
+		             sourceSlice:0
+		             sourceLevel:0
+		            sourceOrigin:MTLOriginMake(0, 0, 0)
+		              sourceSize:MTLSizeMake(16, 16, 1)
+		                toBuffer:buffer
+		       destinationOffset:0
+		  destinationBytesPerRow:64
+		destinationBytesPerImage:64 * 16];
+		[be endEncoding];
+		return commit(cb);
+	};
+	auto write = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		return commit(cb);
+	};
+	rgfxIOSurfaceSetOrder(true);
+	RgfxCommandQueue *a = queueMade(), *b = queueMade();
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *t = texture(surface);
+		RgfxIOSurfaceTexture *u = texture(unrelated);
+		for (int i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++)
+			CHECK(slot(writers, i) == kEmpty && slot(readers, i) == kEmpty);
+
+		// Named by no queue: the op, with no wait; once posted, its queue among the readers.
+		Committed r1 = read(a, t);
+		CHECK(r1.order && r1.waits.empty());
+		CHECK(slot(readers, 0) == Slot(a.rgfxObjId, r1.seqno) && slot(writers, 0) == kEmpty);
+
+		// Other processes' buffers: a writer and a reader. A read waits for the writer alone
+		// (RAW), never for its own queue's reader slot, and raises that slot.
+		writers->writers[1] = {kOtherWriter.first, kOtherWriter.second};
+		readers->writers[1] = {kOtherReader.first, kOtherReader.second};
+		Committed r2 = read(a, t);
+		CHECK(r2.order && r2.waits == Waits{kOtherWriter});
+		CHECK(r2.seqno > r1.seqno && slot(readers, 0) == Slot(a.rgfxObjId, r2.seqno));
+
+		// A write of another queue waits for the writers (WAW) and the readers (WAR), its own
+		// process's included; once posted, its queue among the writers.
+		Committed w1 = write(b, t);
+		CHECK(w1.order && w1.waits == sorted({kOtherWriter, kOtherReader,
+		                                       Slot(a.rgfxObjId, r2.seqno)}));
+		CHECK(slot(writers, 0) == Slot(b.rgfxObjId, w1.seqno) && slot(writers, 1) == kOtherWriter);
+
+		// A read after it waits for it (RAW), and for the other process's writer.
+		Committed r3 = read(a, t);
+		CHECK(r3.order && r3.waits == sorted({kOtherWriter, Slot(b.rgfxObjId, w1.seqno)}));
+		CHECK(slot(readers, 0) == Slot(a.rgfxObjId, r3.seqno));
+
+		// A queue in more than one slot, of the writers and the readers, is named once, at its
+		// highest seqno; a slot being given (seqno 0) is not named.
+		writers->writers[2] = {kOtherWriter.first, 15};
+		readers->writers[2] = {kOtherWriter.first, 20};
+		readers->writers[3] = {0x8000000000 + 1, 0};
+		Committed w2 = write(b, t);
+		CHECK(w2.order && w2.waits == sorted({Slot(kOtherWriter.first, 20), kOtherReader,
+		                                       Slot(a.rgfxObjId, r3.seqno)}));
+		CHECK(slot(writers, 0) == Slot(b.rgfxObjId, w2.seqno));
+		Committed r4 = read(a, t);
+		CHECK(r4.waits == sorted({Slot(kOtherWriter.first, 15), Slot(b.rgfxObjId, w2.seqno)}));
+
+		// An unrelated surface names nothing of the first's: read by one queue, no wait; written
+		// by the other, a wait for that read alone.
+		Committed r5 = read(a, u);
+		CHECK(r5.order && r5.waits.empty());
+		CHECK(slot(otherReaders, 0) == Slot(a.rgfxObjId, r5.seqno));
+		Committed w3 = write(b, u);
+		CHECK(w3.order && w3.waits == Waits{Slot(a.rgfxObjId, r5.seqno)});
+
+		// A buffer that uses no surface carries no op.
+		id<MTLCommandBuffer> cb = [a commandBuffer];
+		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+		[be fillBuffer:buffer range:NSMakeRange(0, 64) value:1];
+		[be endEncoding];
+		CHECK(!commit(cb).order);
+
+		// Without the order: no op, and a read raises no reader slot.
+		rgfxIOSurfaceSetOrder(false);
+		Committed r6 = read(a, t);
+		CHECK(!r6.order && slot(readers, 0) == Slot(a.rgfxObjId, r4.seqno));
+		CHECK(!write(b, t).order);
+		rgfxIOSurfaceSetOrder(true);
+		drainRing(control);
+	}
+	// The copies go: our slots empty, the other processes' kept.
+	CHECK(slot(readers, 0) == kEmpty && slot(readers, 1) == kOtherReader);
+	rgfxIOSurfaceSetOrder(false);
+	drainRing(control);
+	CFRelease(surface);
+	CFRelease(unrelated);
+}
+
 // The kext learns of a command buffer's writes of surfaces' shared blocks (RgfxIOSurface.h), so
 // a CPU lock of one waits for them: a commit of a buffer that draws a surface's copy names its
 // queue, its seqno and the block and surface once, before the commit returns, and records the
@@ -8323,13 +8571,13 @@ void test_iosurface_in_place()
 	} src;
 	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
 	region.setSurfacePagesSource(&Source::pages, 16, &src);
-	// The block in place: its header first, untouched, then the writers, emptied, and nothing
-	// more of the page written.
+	// The block in place: its header first, untouched, then the writers and the readers,
+	// emptied, and nothing more of the page written.
 	const uint64_t kWriters = kSurfaceHeader;
 	uint8_t *block = mem.data() + src.offset;
 	auto blockLeft = [&]() {
 		for (uint64_t i = 0; i < 0x1000; i++) {
-			bool writer = i >= kWriters && i < kWriters + sizeof(RgfxSurfaceWriters);
+			bool writer = i >= kWriters && i < kWriters + 2 * sizeof(RgfxSurfaceWriters);
 			if (block[i] != (writer ? 0 : 0xcd))
 				return false;
 		}
@@ -9604,6 +9852,7 @@ int main(int argc, char **argv)
 		test_iosurface_shared_block();
 		test_iosurface_planes();
 		test_iosurface_writers();
+		test_iosurface_order();
 		test_iosurface_writes_named();
 		test_iosurface_writes_by_function();
 		test_iosurface_in_place();

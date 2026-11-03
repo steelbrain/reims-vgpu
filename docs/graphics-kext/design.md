@@ -1485,9 +1485,11 @@ processes here reach the host on rings of their own, which the host takes
 apart, so the order the host takes buffers in is not the order they were
 committed in. The bundle names the order instead, as it commits:
 - Each surface's shared block holds its writers (`RgfxSurfaceWriters`, one
-  slot a queue: its latest buffer that writes the surface) and, after them, its
-  readers (the same record, the latest buffer of each queue that only reads
-  it), which only the bundles read.
+  slot a queue: its latest buffer that writes the surface) and, after them
+  where the block's last page has room, its readers (the same record, the
+  latest buffer of each queue that only reads it), which only the bundles read.
+  A copy whose writers end within 64 bytes of a page's end has no readers, and
+  a write of it waits for no read.
 - A commit of a buffer that uses surfaces reads, for each, the writers of
   other queues, and where the buffer writes the surface the readers too, and
   names each queue once, at its highest seqno, in one `SURFACE_ORDER` op before

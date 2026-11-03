@@ -12,6 +12,7 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxInterop.h"
+#import "RgfxIOSurface.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -497,6 +498,9 @@ RGFX_LOG_UNRECOGNIZED
 	if (kr == KERN_SUCCESS && featuresCount != 2)
 		kr = kIOReturnBadArgument;
 	_caps.takeFeatures(kr, features[0], features[1]);
+	// Where the host orders command buffers of different queues over the surfaces they share,
+	// this process names each one's order (rgfxIOSurfaceNameUses).
+	rgfxIOSurfaceSetOrder((_caps.features() & RGFX_FEATURE_SURFACE_ORDER) != 0);
 
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers

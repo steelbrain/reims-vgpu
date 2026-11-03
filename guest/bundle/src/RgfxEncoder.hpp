@@ -544,6 +544,9 @@ public:
 	/// Puts the `count` `RGFX_OP_SURFACE_USE` ops of bodies `uses` at the op stream's start,
 	/// before its first encoder, where the host reads them before the buffer's work.
 	void prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count);
+	/// Puts one RGFX_OP_SURFACE_ORDER naming `waits` (`count` of them, none among them) before
+	/// the op stream's first op, as prependSurfaceUses does.
+	void prependSurfaceOrder(const RgfxSurfaceOrderWait *waits, size_t count);
 	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
 	/// with retained references keeps what it encodes: `keep(context, object)` for each one
 	/// (once for a run of the same object), from the encode until the buffer completes or goes.
@@ -613,6 +616,9 @@ public:
 	void appendSegment(RgfxEncoder &segment, uint32_t reset, const RgfxRenderTargetSize &target);
 
 private:
+	/// Room for `bytes` more of the prefix, before the ops: the ops move up where the room the
+	/// header leaves is short. Where the bytes go.
+	uint8_t *prependRoom(size_t bytes);
 	/// The bytes before the header a commit's surface uses take with no move: 64 of them.
 	static constexpr size_t kHeadroom = 64 * (RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse));
 
@@ -682,8 +688,8 @@ private:
 	RgfxCommandBuffer m_head;
 	// The storage: a buffer of the builder's own (malloc) or a region block (m_inBlock), from
 	// m_store, m_end the end; the op stream from m_ops (kHeadroom and the header before it,
-	// none for a segment) to m_cur. The surface uses put first lie in the m_prefix bytes
-	// before m_ops.
+	// none for a segment) to m_cur. The surface uses and the surface order put first lie in the
+	// m_prefix bytes before m_ops (prependRoom).
 	uint8_t *m_store = nullptr;
 	uint8_t *m_ops = nullptr;
 	uint8_t *m_cur = nullptr;
