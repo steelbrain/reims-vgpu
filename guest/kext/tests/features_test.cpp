@@ -32,19 +32,26 @@ void check(bool ok, const char *what)
 	}
 }
 
-// Every bit the wire names from bit 3.
+// Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNew = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                           RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
                           RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_QUEUE_VECTORS;
+// The one it does: the bundle orders its command buffers over IOSurfaces, which needs nothing of
+// the kext.
+constexpr uint64_t kOrder = RGFX_FEATURE_SURFACE_ORDER;
 } // namespace
 
 int main()
 {
-	// The kext carries out none of the bits from 3 yet, so it writes 0 whatever the offer.
-	check(kRgfxCarriedFeatures == 0, "the kext takes no bit from 3 yet");
+	// Of the bits from 3 the kext carries out SURFACE_ORDER alone, and writes it only where
+	// offered.
+	check(kRgfxCarriedFeatures == kOrder, "the kext takes SURFACE_ORDER alone");
+	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 40)) == 0,
-	      "every bit offered, still none written");
+	      "every other bit offered, none written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | kOrder) == kOrder,
+	      "SURFACE_ORDER offered, written");
 	check((rgfxDriverFeatures(~0ull) & kRgfxOfferedFeatures) == 0, "bits 0 to 2 are never written");
 
 	// The word: bits 0 to 2 as offered, on a host older than the registers (DRIVER_FEATURES
@@ -53,8 +60,10 @@ int main()
 	      "a wire-2 host's bits 0 to 2");
 	check(rgfxFeatureWord(RGFX_FEATURE_CB_SUBMITTED, 0) == RGFX_FEATURE_CB_SUBMITTED,
 	      "only the bits offered");
-	check(rgfxFeatureWord(kRgfxOfferedFeatures | kNew, 0) == kRgfxOfferedFeatures,
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kNew | kOrder, 0) == kRgfxOfferedFeatures,
 	      "bits from 3 offered but not taken are not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kOrder, kOrder) == (kRgfxOfferedFeatures | kOrder),
+	      "SURFACE_ORDER taken is in the word");
 	// A read-back of bits the kext never wrote, or of bits 0 to 2 the host does not offer, adds
 	// nothing.
 	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNew | (1ull << 40)) == kRgfxOfferedFeatures,

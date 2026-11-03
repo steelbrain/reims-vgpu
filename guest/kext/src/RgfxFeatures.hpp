@@ -6,8 +6,10 @@
 // the host acts on a bit only where the guest's driver took it: the framebuffer writes
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
-// the registers reads them as 0, so nothing from bit 3 is taken there. The kext and its bundle
-// carry out none of those bits yet, so the framebuffer writes 0.
+// the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
+// its bundle carry out SURFACE_ORDER alone: the bundle names, as it commits a command buffer that
+// uses IOSurfaces, the buffers of other queues it runs after (design.md, "Surface order"), which
+// needs nothing of the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -27,8 +29,8 @@ constexpr uint64_t kRgfxOfferedFeatures =
     RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_CB_SUBMITTED;
 
 // The bits from bit 3 the kext and its bundle carry out, which the framebuffer writes to
-// DRIVER_FEATURES where the host offers them: none yet.
-constexpr uint64_t kRgfxCarriedFeatures = 0;
+// DRIVER_FEATURES where the host offers them.
+constexpr uint64_t kRgfxCarriedFeatures = RGFX_FEATURE_SURFACE_ORDER;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
