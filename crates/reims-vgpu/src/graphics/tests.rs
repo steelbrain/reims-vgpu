@@ -5897,3 +5897,96 @@ fn a_reset_drops_a_surface_pages_not_yet_carried_out() {
     assert_eq!(worker.views_of_surfaces().len(), (0, 0));
     assert!(guest.event_now().is_none(), "not answered");
 }
+
+/// A `BUFFER_OVER_PAGES` of `length` bytes over the pages block at [`SURFACE_BLOCK`], at no GPU
+/// address of the guest's.
+fn buffer_over_pages(obj_id: u64, length: u64) -> Vec<u8> {
+    RgfxBufferOverPages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_OVER_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        gpu_address: 0,
+        block_offset: SURFACE_BLOCK,
+        block_size: SURFACE_BLOCK_SIZE,
+        offset: 0,
+        length,
+        options: 0,
+        reserved_44: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A pages block's view, which its first `BUFFER_OVER_PAGES` makes, is made off the control
+/// thread: while it is being made, ring 0 goes on with another context's message, and holds the
+/// buffer's context's next messages, an object's create and the buffer's destroy, and the
+/// block's `BLOCK_RELEASE`. Each is then carried out as right after the buffer: the view and the
+/// buffer are made first, then the create, the destroy and the release, which is answered
+#[test]
+fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    worker.surface_worker().hold();
+    let mark = platform.call_log().mark();
+
+    guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
+    guest.send(&device, event_create(obj(2, 10)));
+    assert!(objects_become(&device, 1), "ring 0 went on past it");
+    guest.send(&device, event_create(obj(1, 12)));
+    guest.send(&device, object_destroy(obj(1, 11)));
+    guest.send(&device, block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let release_seqno = guest.seqno;
+    guest.send(&device, event_create(obj(2, 13)));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the buffer's context waits for its view, and ring 0 behind it"
+    );
+    let buffers = |sels: &[&str]| {
+        sels.iter()
+            .filter(|&&s| s == "newBufferWithDescriptor:")
+            .count()
+    };
+    assert_eq!(
+        buffers(&platform.call_log().sels_since(mark)),
+        0,
+        "no view made yet"
+    );
+    assert!(guest.event_now().is_none(), "nothing answered yet");
+
+    worker.surface_worker().release();
+    let release = complete_of(&guest.event().expect("the BLOCK_RELEASE's answer"));
+    assert_eq!(release, (release_seqno, RGFX_STATUS_OK));
+    assert!(
+        objects_become(&device, 3),
+        "the three events, the buffer gone"
+    );
+    worker.surface_worker().flush();
+    let made = platform.call_log().sels_since(mark);
+    assert_eq!(
+        buffers(&made),
+        2,
+        "the view's import and the buffer over it: {made:?}"
+    );
+    assert_eq!(worker.views_of_surfaces().counts().private, 1);
+    assert!(guest.event_now().is_none(), "nothing else answered");
+}

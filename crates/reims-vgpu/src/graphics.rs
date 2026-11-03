@@ -33,9 +33,10 @@ use parking_lot::{RawRwLock, RwLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
-    RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES,
+    RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
+    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
@@ -45,9 +46,9 @@ use reims_graphics::wire::{
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
     RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
-    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
-    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
-    RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
+    RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -292,6 +293,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 region: Arc::clone(&region),
                 icb_worker: Worker::new("reims-vgpu.icb-create"),
                 icbs: Arc::default(),
+                pages_buffers: Arc::default(),
                 reset_gate: Arc::default(),
             });
             let host = Box::new(CallbackHost {
@@ -418,6 +420,10 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The indirect command buffers whose create was handed to [`Self::icb_worker`] and is not
     /// yet answered, by object id.
     icbs: Arc<Unsettled>,
+    /// The no-copy buffers whose `BUFFER_OVER_PAGES` was handed to the surface worker and is not
+    /// yet made ([`Self::start_buffer_over_pages`]): by their context ([`pages_context`]), and by
+    /// their pages block's offset.
+    pages_buffers: Arc<Unsettled>,
     /// The decoder's failed contexts, which the device asks of at a `QUEUE_CREATE`
     /// (`Host::context_refused`).
     failed: Arc<FailedContexts>,
@@ -592,6 +598,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// buffer of the context the decoder committed has finished: the kext then gives the
     /// context's blocks out again.
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
+        // After its no-copy buffers being made, so none lands in the table its close empties.
+        self.pages_buffers.wait(pages_context(context));
         entry::run(|_| {
             let (dropped, drain) = {
                 let decoder = self.decoder();
@@ -647,6 +655,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// holds lies in the block, else answered once every command buffer of the block's context
     /// the decoder committed has finished.
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        // After the no-copy buffers being made over it, which keep it.
+        self.pages_buffers.wait(release.offset);
         let decoder = self.decoder();
         if decoder.span_in_use(release.offset, release.size) {
             drop(decoder);
@@ -702,6 +712,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         flags: u32,
         answer: CompleteAnswer,
     ) {
+        // After the no-copy buffers being made over the block it describes again, which see it as
+        // before, and whose make on the surface worker would else wait for it, behind them there.
+        self.pages_buffers.wait(pages.block_offset);
         let me = Arc::clone(self);
         let job = move |settle| {
             let status = {
@@ -771,6 +784,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ([`Self::lookup_library`]).
     fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
+        if r#type == RGFX_CMD_BUFFER_OVER_PAGES && self.start_buffer_over_pages(poster, message) {
+            return;
+        }
+        // A message of a context whose no-copy buffer is being made on the surface worker, which
+        // it may name, is carried out after it.
+        self.pages_buffers
+            .wait(pages_context(sender_context(poster, message)));
         match r#type {
             RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
                 self.start_pipeline(poster, message);
@@ -1200,6 +1220,62 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             );
         }
         poster.post(answer.as_bytes());
+    }
+
+    /// A `BUFFER_OVER_PAGES` from ring 0 that makes its pages block's view (the block's first),
+    /// follows its block's `SURFACE_PAGES` still on the surface worker, or follows another of its
+    /// context's still being made: begun here, in ring order, and carried out on the surface
+    /// worker behind what was handed to it before, so the view's mapping and import hold neither
+    /// ring 0 nor the views' lock (`decode::surface_pages`). Until it is made its context and its
+    /// block are unsettled ([`Self::pages_buffers`]): every later message of the context waits
+    /// for it ([`Self::handle_stage3`]), and its block's release, a new `SURFACE_PAGES` of its
+    /// block and its context's close wait for it, so each sees the buffer as right after its
+    /// create. Made under the reset gate, held shared recursively, as the surface
+    /// worker's other jobs are; where the device was reset since, nothing is made. Whether it was
+    /// handed over; else it is carried out here.
+    fn start_buffer_over_pages(
+        self: &Arc<Self>,
+        poster: &CompletionPoster,
+        message: &[u8],
+    ) -> bool {
+        let Ok((m, _)) = RgfxBufferOverPages::read_from_prefix(message) else {
+            return false;
+        };
+        let context = pages_context(sender_context(poster, message));
+        let decoder = self.decoder();
+        if !self
+            .pages_buffers
+            .any([context, m.block_offset].into_iter())
+            && !decoder.buffer_over_pages_makes(message)
+        {
+            return false;
+        }
+        let begun = self.pool.now();
+        let settles = (
+            self.pages_buffers.begin(context, 0, begun),
+            self.pages_buffers.begin(m.block_offset, 0, begun),
+        );
+        let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
+        decoder.on_surface_worker(Box::new(move || {
+            let outcome = {
+                let _carried = me.reset_gate.read_recursive();
+                if poster.stale() {
+                    return;
+                }
+                let mut decoder = (me.decoders)
+                    .sender(Some(sender_context(&poster, &message)), me.sinks(&poster));
+                refusing(|| decoder.decode(&me.device, &message))
+            };
+            me.report(&poster, &message, outcome, false);
+            log::debug!(
+                target: "reims_vgpu::graphics::surface_pages",
+                "BUFFER_OVER_PAGES of the block at {:#x} made on the worker {} us after its begin",
+                m.block_offset,
+                me.pool.now().saturating_duration_since(begun).as_micros()
+            );
+            drop(settles);
+        }));
+        true
     }
 
     /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB thread
@@ -1735,6 +1811,12 @@ fn sender_context(poster: &CompletionPoster, message: &[u8]) -> u32 {
         .queue_obj_id()
         .unwrap_or_else(|| message_identity(message).2);
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
+}
+
+/// The key the no-copy buffers of context `context` being made are unsettled under in
+/// `GraphicsControl::pages_buffers`, apart from their blocks' offsets, which lie below 2^63.
+fn pages_context(context: u32) -> u64 {
+    1 << 63 | u64::from(context)
 }
 
 /// Whether `message` is a `COMMAND_BUFFER` off a queue's ring that names another queue to run on:

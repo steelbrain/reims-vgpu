@@ -52,10 +52,15 @@
 //! block is unsettled ([`Unsettled`]): every later message that names it, on ring 0 or a queue's
 //! ring, waits for it first, so it sees the block as it would have right after the
 //! `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
-//! there too, in its order with the rest. The guest's kext names a block only after the answer, so in its order nothing
-//! waits. What lets a view go is dropped on the worker too, where it may be the last hold of an
-//! import or a mapping: a buffer over a view at its `OBJECT_DESTROY`, and a block's view and
-//! device cache at its `BLOCK_RELEASE`.
+//! there too, in its order with the rest. The guest's kext names a block only after the answer,
+//! so in its order nothing waits. A pages block's view, which its first `BUFFER_OVER_PAGES`
+//! makes, is made on the worker as well (`GraphicsControl::start_buffer_over_pages`): that
+//! message has no answer, so its context's later messages, its block's release and its
+//! context's close wait for it instead. What lets a view go is dropped on the worker too, where
+//! it may be the last hold of an import or a mapping: a surface's buffer
+//! (`BUFFER_OVER_SURFACE_PAGES`) at its `OBJECT_DESTROY`, and a block's views and device cache at
+//! its `BLOCK_RELEASE`. A texture and a pages block's buffer go at once, as the guest may pick
+//! their id or their GPU address again in its next message.
 //!
 //! [`Worker`]: super::worker::Worker
 //! [`Unsettled`]: super::worker::Unsettled
@@ -445,14 +450,6 @@ impl<P: Platform> SurfaceViews<P> {
         Ok(runs.iter().map(|r| (r.address, r.length)).collect())
     }
 
-    /// A new view of the runs `key`, `length` bytes, through the memory map.
-    fn mapped(&self, key: &[(u64, u64)], length: u64) -> Result<Arc<SurfaceView<P>>, PagesRefusal> {
-        let Some((memory, lease)) = self.memory.as_ref() else {
-            return Err(PagesRefusal::NoMemoryMap);
-        };
-        map_view(memory, Arc::clone(lease), key, length)
-    }
-
     /// The cache's view of `runs`, taken to the back, the refusal of runs that cannot be one,
     /// or what the view to make takes.
     fn find(&mut self, platform: &P, pages: &RgfxSurfacePages, runs: &[RgfxPageRun]) -> Found<P> {
@@ -524,38 +521,59 @@ impl<P: Platform> SurfaceViews<P> {
 
     /// The view of the pages block at `block`, where it was made for `context` (any context
     /// where `None`, the decoder's own tests) and holds the `block_size` bytes a message names:
-    /// made with its import on `device` the first time, the module doc. `None` where the block is
-    /// no such pages block, or the view or its import is not made, which is counted.
+    /// made with its import on `device` the first time, the module doc, with `views` unlocked,
+    /// so a message that asks of the views meanwhile does not wait for the mapping or the
+    /// import. `None` where the block is no such pages block, or the view or its import is not
+    /// made, which is counted, or the block went while it was made.
     pub(crate) fn private_view(
-        &mut self,
+        views: &Mutex<SurfaceViews<P>>,
         device: &P::Device,
         block: u64,
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let Some(p) = (self.private.get(&block))
-            .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
-        else {
-            return Ok(None);
+        let (memory, lease, runs, length) = {
+            let mut v = views.lock();
+            let Some(p) = (v.private.get(&block))
+                .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
+            else {
+                return Ok(None);
+            };
+            if let Some((view, _)) = &p.view {
+                return Ok(Some(Arc::clone(view)));
+            }
+            let (runs, length) = (p.runs.clone(), p.length);
+            let Some((memory, lease)) = v.memory.as_ref() else {
+                v.refused(PagesRefusal::NoMemoryMap);
+                return Ok(None);
+            };
+            (Arc::clone(memory), Arc::clone(lease), runs, length)
         };
-        if let Some((view, _)) = &p.view {
-            return Ok(Some(Arc::clone(view)));
-        }
-        let view = match self.mapped(&p.runs, p.length) {
-            Ok(view) => view,
+        let made = match map_view(&memory, lease, &runs, length) {
+            Ok(view) => match buffer_over(device, &view, 0, view.length(), 0, None)? {
+                Some(import) => Ok((view, import)),
+                None => Err(PagesRefusal::NoBuffer),
+            },
+            Err(why) => Err(why),
+        };
+        let mut v = views.lock();
+        let (view, import) = match made {
+            Ok(made) => made,
             Err(why) => {
-                self.refused(why);
+                v.refused(why);
                 return Ok(None);
             }
         };
-        let Some(import) = buffer_over(device, &view, 0, view.length(), 0, None)? else {
-            self.refused(PagesRefusal::NoBuffer);
+        // The block's entry as it was taken, else it went meanwhile (a release, its context's
+        // close): the view goes with no lock held.
+        let Some(p) = (v.private.get_mut(&block)).filter(|p| p.runs == runs && p.view.is_none())
+        else {
+            drop(v);
+            drop((view, import));
             return Ok(None);
         };
-        self.counts.private += 1;
-        if let Some(p) = self.private.get_mut(&block) {
-            p.view = Some((Arc::clone(&view), import));
-        }
+        p.view = Some((Arc::clone(&view), import));
+        v.counts.private += 1;
         Ok(Some(view))
     }
 
@@ -572,6 +590,12 @@ impl<P: Platform> SurfaceViews<P> {
             .get(&block)
             .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
             .and_then(|p| p.ram)
+    }
+
+    /// Whether the block at `block` is a pages block whose view is not made yet: its first
+    /// `BUFFER_OVER_PAGES` makes it ([`Self::private_view`]).
+    pub(crate) fn private_unmade(&self, block: u64) -> bool {
+        self.private.get(&block).is_some_and(|p| p.view.is_none())
     }
 
     /// The host addresses of the guest pages of `runs` in the mapping of the guest's RAM the
@@ -827,7 +851,8 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
         self.settle_surface(m.block_offset);
-        let view = (self.shared.surface_views.lock()).private_view(
+        let view = SurfaceViews::private_view(
+            &self.shared.surface_views,
             device,
             m.block_offset,
             m.block_size,
