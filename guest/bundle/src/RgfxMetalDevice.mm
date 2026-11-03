@@ -60,19 +60,9 @@ void rgfxDiag(const char *fmt, ...)
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 
-// The accelerator's user-client protocol, the kext's own header: its type and selectors.
+// The accelerator's user-client protocol, the kext's own header: its type, its selectors and
+// the kext's own feature bits.
 #include "../../kext/src/RgfxUserClientABI.hpp"
-
-// The kext's own features, the second word kRgfxAccelMethodFeatures answers (the kext's
-// RgfxAccelerator.hpp, kept in step by hand): a call or flag below is used only where the word
-// holds its bit.
-enum : uint64_t {
-	kRgfxKextFeaturePagesBlock = 1ull << 0,
-	kRgfxKextFeatureSubmitBatch = 1ull << 1,
-	kRgfxKextFeatureWakeCompletions = 1ull << 2,
-	kRgfxKextFeatureConsumedDoorbell = 1ull << 3,
-	kRgfxKextFeatureDeferredAnswers = 1ull << 4,
-};
 
 namespace {
 // The largest object-lifecycle message the kext takes (ReimsGraphics::kLifecycleMessageMax):

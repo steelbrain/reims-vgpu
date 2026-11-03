@@ -1605,9 +1605,9 @@ the bundle's wire handshake opens them with `IOServiceOpen` /
 number of the 'RGFX' user client. A new selector takes the next free number
 here first. A selector or a flag that a kext may lack gets a kext feature bit,
 which the kext sets in the second word `Features` answers once it carries it
-out, and the bundle uses it only where that word holds the bit. The numbers'
-code home is `guest/kext/src/RgfxAccelerator.hpp` (the bundle keeps a copy in
-`RgfxMetalDevice.mm`), until `RgfxUserClientABI.hpp` holds them for both.
+out, and the bundle uses it only where that word holds the bit. The numbers
+and the kext feature bits are in `guest/kext/src/RgfxUserClientABI.hpp`, which
+the kext and the bundle include.
 
 | number | name | kext feature bit | what |
 |---|---|---|---|

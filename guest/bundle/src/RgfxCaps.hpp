@@ -267,7 +267,7 @@ public:
 	/// The RGFX_FEATURE_* bits this process works by: bits 0 to 2 as the host offers them, and
 	/// from bit 3 the ones the kext took for its bundle (takeFeatures); 0 before takeFeatures.
 	uint64_t features() const { return m_features; }
-	/// The kext's own features (kRgfxKextFeature*, RgfxMetalDevice.mm): the user-client calls
+	/// The kext's own features (kRgfxKextFeature*, the kext's RgfxUserClientABI.hpp): the user-client calls
 	/// and flags it carries out beyond the first kext with the features call; 0 before
 	/// takeFeatures.
 	uint64_t kextFeatures() const { return m_kextFeatures; }
