@@ -5,6 +5,8 @@
 
 #include "RgfxSerializer.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -549,6 +551,106 @@ RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createIcb(const RgfxIcbCreate &desc)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxIcbCreate msg = desc;
+	msg.obj_id = out.obj_id;
+	if (m_ask == nullptr) {
+		out.posted = m_control.tryPost(RGFX_CMD_ICB_CREATE, &msg, sizeof(msg), &out.seqno);
+		return out;
+	}
+	msg.header.type = RGFX_CMD_ICB_CREATE;
+	msg.header.size = sizeof(msg);
+	RgfxIcbState answer = {};
+	uint32_t length = 0;
+	out.posted = m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) &&
+	             length >= sizeof(answer) && answer.header.type == RGFX_EVT_ICB_STATE;
+	out.status = out.posted ? answer.status : kRgfxNoAnswer;
+	out.seqno = out.posted ? answer.header.seqno : 0;
+	out.resource_id = out.posted && answer.status == RGFX_STATUS_OK ? answer.gpu_resource_id : 0;
+	return out;
+}
+
+void RgfxSerializer::icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const void *body,
+                               uint16_t size)
+{
+	const uint32_t recordBytes = sizeof(RgfxIcbRecord) + size;
+	// The largest message the control ring takes: a forwarding writer's whole size, a ring's
+	// half (RgfxRingWriter::fits).
+	const uint32_t cap =
+	    m_control.fits(m_control.dataSize()) ? m_control.dataSize() : m_control.dataSize() / 2;
+	std::lock_guard<std::mutex> lock(m_icbLock);
+	// The buffer's run of records, most often the last one begun.
+	IcbMessage *message = nullptr;
+	for (size_t i = m_icbMessages.size(); i-- > 0;) {
+		if (m_icbMessages[i].icb == icb) {
+			message = &m_icbMessages[i];
+			break;
+		}
+	}
+	if (message != nullptr && message->bytes.size() + recordBytes > cap) {
+		// Its message is full: it goes now, and a new one takes the record. The records of other
+		// buffers wait: no record names another buffer's commands.
+		postIcbMessage(*message, nullptr);
+		message->bytes.resize(sizeof(RgfxIcbWrite));
+	}
+	if (message == nullptr) {
+		m_icbMessages.push_back({icb, std::vector<uint8_t>(sizeof(RgfxIcbWrite))});
+		message = &m_icbMessages.back();
+		message->bytes.reserve(1024);
+	}
+	const size_t at = message->bytes.size();
+	message->bytes.resize(at + recordBytes);
+	RgfxIcbRecord record = {op, static_cast<uint16_t>(recordBytes), index};
+	std::memcpy(message->bytes.data() + at, &record, sizeof(record));
+	if (size != 0)
+		std::memcpy(message->bytes.data() + at + sizeof(record), body, size);
+	m_icbPending.store(true, std::memory_order_release);
+}
+
+void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
+{
+	if (message.bytes.size() <= sizeof(RgfxIcbWrite))
+		return;
+	RgfxIcbWrite head = {};
+	head.obj_id = message.icb;
+	std::memcpy(message.bytes.data(), &head, sizeof(head));
+	const auto start = std::chrono::steady_clock::now();
+	const uint32_t size = static_cast<uint32_t>(message.bytes.size());
+	if (!m_control.tryPost(RGFX_CMD_ICB_WRITE, message.bytes.data(), size, nullptr)) {
+		// The kext refused it, or the ring had no room: the buffer's commands keep what they
+		// had, as a lost encode.
+		std::fprintf(stderr, "RGFX: ICB_WRITE of %u bytes into 0x%llx was not posted\n", size,
+		             static_cast<unsigned long long>(message.icb));
+	}
+	if (flush != nullptr) {
+		flush->messages++;
+		flush->bytes += size;
+		flush->nanoseconds += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+		                                                         start)
+		        .count());
+	}
+}
+
+RgfxIcbFlush RgfxSerializer::flushIcbWrites()
+{
+	RgfxIcbFlush flush = {};
+	if (!m_icbPending.load(std::memory_order_acquire))
+		return flush;
+	// The posts are made under the lock, so a flush that finds records pending returns only once
+	// they are on the ring, whichever thread posts them.
+	std::lock_guard<std::mutex> lock(m_icbLock);
+	for (IcbMessage &message : m_icbMessages)
+		postIcbMessage(message, &flush);
+	m_icbMessages.clear();
+	m_icbPending.store(false, std::memory_order_release);
+	return flush;
+}
+
 RgfxCreated RgfxSerializer::createDepthStencil(uint32_t depth_compare, bool depth_write_enabled,
                                                const RgfxStencilDescriptor &front,
                                                const RgfxStencilDescriptor &back)
@@ -887,6 +989,9 @@ RgfxCreated RgfxSerializer::createVideoSession(uint32_t codec, uint32_t directio
 
 bool RgfxSerializer::destroy(RgfxObjId obj_id)
 {
+	// A waiting record may name the object (a pipeline or a buffer the app lets go after
+	// encoding it), so the records go first.
+	flushIcbWrites();
 	RgfxObjectDestroy msg = {};
 	msg.obj_id = obj_id;
 	return m_control.tryPost(RGFX_CMD_OBJECT_DESTROY, &msg, sizeof(msg), nullptr);

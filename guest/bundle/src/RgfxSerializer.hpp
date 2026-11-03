@@ -25,10 +25,12 @@
 #define RGFX_SERIALIZER_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxObjectModel.hpp"
@@ -141,6 +143,14 @@ struct RgfxSurfaceTextureMessage {
 static_assert(offsetof(RgfxSurfaceTextureMessage, facts) == RGFX_SURFACE_FACTS_OFFSET,
               "the facts follow the struct, where the host reads them");
 static_assert(sizeof(RgfxSurfaceTextureMessage) % 8 == 0, "a ring message is whole words");
+
+/// What one flushIcbWrites() posted: its ICB_WRITE messages, their bytes, and how long their
+/// posts took, in nanoseconds.
+struct RgfxIcbFlush {
+	uint32_t messages;
+	uint64_t bytes;
+	uint64_t nanoseconds;
+};
 
 struct RgfxCreated {
 	RgfxObjId obj_id;
@@ -413,6 +423,27 @@ public:
 	/// False where the message was not posted.
 	bool setSharedEventValue(RgfxObjId event, uint64_t value);
 
+	// --- indirect command buffers ---------------------------------------------
+
+	/// An indirect command buffer of the descriptor `desc` carries (its header and obj_id are
+	/// stamped here, and the obj_id picked). With an asker set, the device answers the create
+	/// (ICB_STATE): `status` is its status, and `resource_id` the buffer's gpuResourceID, the id
+	/// the host's device numbers it by; `posted` is false where no answer came back. Without one
+	/// the create goes on the ring unanswered, with no resource id.
+	RgfxCreated createIcb(const RgfxIcbCreate &desc);
+
+	/// One CPU encode into the indirect command buffer `icb`: a record of `op` (an
+	/// RGFX_ICB_OP_*) on command `index` (a reset range's location), its body the `size` bytes
+	/// at `body` (a multiple of 8, 0 for none). It waits with the device's other records, in
+	/// call order, until flushIcbWrites() or a destroy() posts them, or until its buffer's
+	/// message would pass the largest the control ring takes, when that message goes at once.
+	void icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const void *body, uint16_t size);
+
+	/// Posts every waiting record (ICB_WRITE, one message for each buffer's run of records), so
+	/// the device carries them out before any command buffer the process posts after this
+	/// returns. One load where none waits.
+	RgfxIcbFlush flushIcbWrites();
+
 	// --- video ----------------------------------------------------------------
 
 	/// A video session of codec `codec` (RGFX_VIDEO_CODEC_*) in direction `direction`
@@ -422,8 +453,8 @@ public:
 	// --- destroy --------------------------------------------------------------
 
 	/// Drops the host handle for `obj_id` (an object of any kind, a queue
-	/// included: the host handle table knows the kind). Returns whether the
-	/// message reached the ring.
+	/// included: the host handle table knows the kind), after the waiting ICB records, which may
+	/// name it. Returns whether the message reached the ring.
 	bool destroy(RgfxObjId obj_id);
 
 	/// The default alignment for a picked GPU address when the caller names none.
@@ -452,6 +483,20 @@ private:
 	};
 	std::mutex m_sizesLock;
 	std::unordered_map<SizeKey, SizeAnswer, SizeKeyHash> m_sizes;
+
+	// The ICB records waiting for flushIcbWrites(), under m_icbLock: one ICB_WRITE message for
+	// each buffer's run of records, in the order the runs began. m_icbPending is set as a record
+	// is added, and cleared only once a flush has posted them all, so a flush that finds it
+	// clear has nothing to wait for, and one that finds it set waits for a flush in progress.
+	struct IcbMessage {
+		RgfxObjId icb;
+		std::vector<uint8_t> bytes; // the RgfxIcbWrite, then the records
+	};
+	std::mutex m_icbLock;
+	std::atomic<bool> m_icbPending{false};
+	std::vector<IcbMessage> m_icbMessages;
+	// Posts `message` (under m_icbLock), adding to `*flush`.
+	void postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush);
 };
 
 #endif // RGFX_SERIALIZER_HPP_

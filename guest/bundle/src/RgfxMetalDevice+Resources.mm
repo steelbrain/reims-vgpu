@@ -10,6 +10,7 @@
 #import "RgfxBuffer.h"
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
+#import "RgfxIndirectCommandBuffer.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxStateCache.h"
 #import "RgfxTexture.h"
@@ -186,6 +187,26 @@
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
 {
 	return [[self stateCache] depthStencilStateWithDescriptor:descriptor];
+}
+
+// --- indirect command buffers ------------------------------------------------
+
+// Made on the host where it makes them (INDIRECT_COMMAND_BUFFERS, which the kext takes for the
+// bundle); nil where it does not, as before the wire carried them.
+- (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:
+                                    (MTLIndirectCommandBufferDescriptor *)descriptor
+                                                       maxCommandCount:(NSUInteger)maxCount
+                                                               options:(MTLResourceOptions)options
+{
+	if (([self caps]->features() & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS) == 0) {
+		RGFX_UNSUPPORTED("indirect command buffers (the host offers none)");
+		return nil;
+	}
+	return [RgfxIndirectCommandBuffer icbWithDescriptor:descriptor
+	                                    maxCommandCount:maxCount
+	                                            options:options
+	                                             device:self
+	                                         serializer:[self serializer]];
 }
 
 // --- heaps -------------------------------------------------------------------

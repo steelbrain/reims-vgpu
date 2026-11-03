@@ -29,6 +29,7 @@
 #import "RgfxFence.h"
 #import "RgfxFunction.h"
 #import "RgfxHeap.h"
+#import "RgfxIndirectCommandBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxBlockCall.h"
 #import "RgfxLibrary.h"
@@ -1646,10 +1647,37 @@ void test_argument_encoder_members()
 	[enc setDepthStencilState:ds atIndex:0];
 	CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
 	CHECK(RgfxUnsupportedWasLogged(c, @selector(setDepthStencilState:atIndex:)));
-	// What the device makes no object of: nil writes 0, unlogged.
+	// An indirect command buffer writes its gpuResourceID, the host's id, as a pipeline; nil 0.
+	{
+		RgfxIcbState state = {};
+		state.header = {RGFX_EVT_ICB_STATE, sizeof(state), 1};
+		state.status = RGFX_STATUS_OK;
+		state.gpu_resource_id = 0x3c;
+		static RgfxIcbState answer;
+		answer = state;
+		ser.setAsker(
+		    [](void *, const void *, uint32_t, void *reply, uint32_t, uint32_t *size) {
+			    std::memcpy(reply, &answer, sizeof(answer));
+			    *size = sizeof(answer);
+			    return true;
+		    },
+		    nullptr);
+		MTLIndirectCommandBufferDescriptor *icbd = [MTLIndirectCommandBufferDescriptor new];
+		icbd.commandTypes = MTLIndirectCommandTypeDraw;
+		RgfxIndirectCommandBuffer *icb = [RgfxIndirectCommandBuffer icbWithDescriptor:icbd
+		                                                              maxCommandCount:2
+		                                                                      options:0
+		                                                                       device:nil
+		                                                                   serializer:&ser];
+		ser.setAsker(nullptr, nullptr);
+		CHECK(icb != nil);
+		[enc setIndirectCommandBuffer:icb atIndex:0];
+		CHECK(wordAt(args, 0) == 0x3c);
+	}
 	[enc setIndirectCommandBuffer:nil atIndex:0];
 	CHECK(wordAt(args, 0) == 0);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setIndirectCommandBuffer:atIndex:)));
+	// What the device makes no object of: nil writes 0, unlogged.
 	std::memset(args.contents, 0x5c, 8);
 	[enc setAccelerationStructure:nil atIndex:0];
 	[enc setVisibleFunctionTable:nil atIndex:0];

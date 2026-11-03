@@ -26,7 +26,7 @@
 %spi-unverified an MTLDeviceSPI feature query the M3 Max, the AMD 5300M and the Intel UHD 630 all answer YES (measured, tools/base_answers_probe.m), and the IOGPU base answers NO here: what it gates, and whether the lane carries that, is not established, so the base's NO stands until it is (aud-tests-04)
 %spi-no-mesh the IOGPU base answers NO, the lane's answer: it makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-ray-tracing the IOGPU base answers NO, the lane's answer: it makes no acceleration structures (ray tracing is RGFX_UNSUPPORTED, and supportsRaytracing answers the host's NO), where Metal's devices answer YES
-%spi-no-icb the IOGPU base answers NO, the lane's answer: it makes no indirect command buffers (none on the wire, RGFX_UNSUPPORTED), where Metal's devices answer YES
+%icb-render-states the macOS 26 render states of an indirect command: the AMD 5300M and the Intel 630 raise an unrecognized selector for each, answering respondsToSelector: YES (measured, tools/oracle/oracle_icb.m), and so does the command (the M3 Max raises an API-not-supported exception)
 %spi-no-counters the IOGPU base answers NO, the lane's answer: it samples no counters (counter sampling is RGFX_UNSUPPORTED, and counterSets is nil), where Metal's devices answer YES
 %spi-no-dylibs the IOGPU base answers NO, the lane's answer: it makes no dynamic libraries (RGFX_UNSUPPORTED, and supportsDynamicLibraries answers NO), where Metal's devices answer YES
 %spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
@@ -46,7 +46,7 @@ setComputePipelineState:atIndex: implemented
 setComputePipelineStates:withRange: implemented
 setDepthStencilState:atIndex: partial depth/stencil states in argument buffers (no resource id on the wire)
 setDepthStencilStates:withRange: implemented
-setIndirectCommandBuffer:atIndex: partial indirect command buffers
+setIndirectCommandBuffer:atIndex: implemented
 setIndirectCommandBuffers:withRange: implemented
 setIntersectionFunctionTable:atIndex: partial ray tracing
 setIntersectionFunctionTables:withRange: implemented
@@ -292,6 +292,55 @@ iosurfacePlane implemented
 replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage: implemented
 replaceRegion:mipmapLevel:withBytes:bytesPerRow: implemented
 setPurgeableState: implemented
+
+[RgfxIndirectCommandBuffer]
+allocatedSize implemented
+cpuCacheMode implemented
+gpuResourceID implemented
+hazardTrackingMode implemented
+indirectComputeCommandAtIndex: implemented
+indirectRenderCommandAtIndex: implemented
+resetWithRange: implemented
+resourceOptions implemented
+size implemented
+storageMode implemented
+
+[RgfxIndirectComputeCommand]
+clearBarrier implemented
+concurrentDispatchThreadgroups:threadsPerThreadgroup: implemented
+concurrentDispatchThreads:threadsPerThreadgroup: implemented
+reset implemented
+setBarrier implemented
+setComputePipelineState: implemented
+setImageblockWidth:height: implemented
+setKernelBuffer:offset:atIndex: implemented
+setKernelBuffer:offset:attributeStride:atIndex: implemented
+setStageInRegion: implemented
+setThreadgroupMemoryLength:atIndex: implemented
+
+[RgfxIndirectRenderCommand]
+clearBarrier implemented
+drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:instanceCount:baseInstance:tessellationFactorBuffer:tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride: implemented
+drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance: implemented
+drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading (no mesh pipeline create on the wire)
+drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading (no mesh pipeline create on the wire)
+drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:tessellationFactorBuffer:tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride: implemented
+drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance: implemented
+reset implemented
+setBarrier implemented
+setCullMode: metal %icb-render-states
+setDepthBias:slopeScale:clamp: metal %icb-render-states
+setDepthClipMode: metal %icb-render-states
+setDepthStencilState: metal %icb-render-states
+setFragmentBuffer:offset:atIndex: implemented
+setFrontFacingWinding: metal %icb-render-states
+setMeshBuffer:offset:atIndex: unsupported mesh shading (no mesh pipeline create on the wire)
+setObjectBuffer:offset:atIndex: unsupported mesh shading (no mesh pipeline create on the wire)
+setObjectThreadgroupMemoryLength:atIndex: unsupported mesh shading (no mesh pipeline create on the wire)
+setRenderPipelineState: implemented
+setTriangleFillMode: metal %icb-render-states
+setVertexBuffer:offset:atIndex: implemented
+setVertexBuffer:offset:attributeStride:atIndex: implemented
 
 [RgfxLibrary]
 functionNames implemented
@@ -558,7 +607,7 @@ newIOHandleWithURL:error: implemented
 newIndirectArgumentBufferLayoutWithStructType: unsupported argument buffers of a layout object
 newIndirectArgumentEncoderWithArguments: absent %absent-as-metal
 newIndirectArgumentEncoderWithLayout: unsupported argument buffers of a layout object
-newIndirectCommandBufferWithDescriptor:maxCommandCount:options: unsupported indirect command buffers (none on the wire)
+newIndirectCommandBufferWithDescriptor:maxCommandCount:options: partial indirect command buffers where the host offers none (INDIRECT_COMMAND_BUFFERS)
 newIndirectCommandBufferWithDescriptor:maxCount:options: implemented
 newIndirectComputeCommandEncoderWithBuffer: unsupported indirect command encoders (none on the wire)
 newIndirectRenderCommandEncoderWithBuffer: unsupported indirect command encoders (none on the wire)
@@ -715,7 +764,7 @@ supportsBufferPrefetchStatistics base %base-spi
 supportsBufferWithAddressRanges base %base-spi
 supportsBufferWithIOSurface base %base-spi
 supportsBufferlessClientStorageTexture base %base-spi
-supportsCMPIndirectCommandBuffers base %spi-no-icb
+supportsCMPIndirectCommandBuffers implemented
 supportsColorSpaceConversionMatrixSelection base %base-spi
 supportsCombinedMSAAStoreAndResolveAction implemented
 supportsCommandBufferJump base %spi-unverified
@@ -760,7 +809,7 @@ supportsFragmentOnlyEncoders base %base-spi
 supportsFunctionPointers implemented
 supportsFunctionPointersFromMesh base %base-spi
 supportsFunctionPointersFromRender implemented
-supportsGFXIndirectCommandBuffers base %spi-no-icb
+supportsGFXIndirectCommandBuffers implemented
 supportsGPUStatistics base %spi-no-counters
 supportsGlobalVariableBindingInDylibs base %spi-no-dylibs
 supportsGlobalVariableBindings base %base-spi

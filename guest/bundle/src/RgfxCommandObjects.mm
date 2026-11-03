@@ -46,6 +46,7 @@
 #import "RgfxFence.h"
 #import "RgfxSharedEvent.h"
 #import "RgfxIOSurface.h"
+#import "RgfxIndirectCommandBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
 #import "RgfxRenderPipelineState.h"
@@ -289,6 +290,24 @@ void rgfxNoteResident(RgfxSurfaceBindings &bindings, __unsafe_unretained id reso
 {
 	if ((usage & MTLResourceUsageWrite) == 0)
 		bindings.resident(resource);
+}
+
+/// Logs a command buffer's flush of ICB records (RgfxSerializer::flushIcbWrites): the process's
+/// first 16, then each one longer than any before, with its messages, bytes and time.
+void rgfxNoteIcbFlush(const RgfxIcbFlush &flush)
+{
+	static std::atomic<uint32_t> logged{0};
+	static std::atomic<uint64_t> longest{0};
+	uint64_t was = longest.load(std::memory_order_relaxed);
+	bool longer = false;
+	while (flush.nanoseconds > was &&
+	       !(longer = longest.compare_exchange_weak(was, flush.nanoseconds,
+	                                                std::memory_order_relaxed))) {
+	}
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || longer) {
+		NSLog(@"RGFX: ICB_WRITE flush: %u messages, %llu bytes, %llu us", flush.messages,
+		      (unsigned long long)flush.bytes, (unsigned long long)(flush.nanoseconds / 1000));
+	}
 }
 
 /// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
@@ -1552,6 +1571,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	const bool outOfLine = !_encoder->fitsRing();
 	if (outOfLine)
 		_bodyPool = [queue rgfxBodyPool];
+	// The CPU's encodes into indirect command buffers go first, on the control ring, which the
+	// host carries out before any later command buffer of the process: the buffer sees every
+	// encode made before its commit, as on every Mac.
+	if (RgfxSerializer *serializer = [queue serializer]) {
+		const RgfxIcbFlush flush = serializer->flushIcbWrites();
+		if (flush.messages != 0)
+			rgfxNoteIcbFlush(flush);
+	}
 	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
 	// A present of a surface it writes, made after this commit, waits for it on the host; and so
 	// does a buffer of another queue committed after it that uses the surface, where one of the two
@@ -2920,9 +2947,12 @@ RGFX_LOG_UNRECOGNIZED
 	_enc->renderUseHeapsStages(h.empty() ? nullptr : h.data(), static_cast<uint32_t>(count),
 	                           static_cast<uint64_t>(stages));
 }
+// The range within the buffer's commands (RgfxIcbClamp): past its size a Mac draws part of it,
+// faults or draws nothing, and the lane draws the commands it has.
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                       withRange:(NSRange)executionRange
 {
+	executionRange = RgfxIcbClamp(indirectCommandBuffer, executionRange);
 	_enc->renderExecuteCommandsInBuffer(rgfxNamed(_enc, indirectCommandBuffer), executionRange.location,
 	                                    executionRange.length);
 }
@@ -3675,9 +3705,11 @@ RGFX_LOG_UNRECOGNIZED
 	_enc->computeMemoryBarrierResources(r.empty() ? nullptr : r.data(),
 	                                    static_cast<uint32_t>(count));
 }
+// As the render encoder's.
 - (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                       withRange:(NSRange)executionRange
 {
+	executionRange = RgfxIcbClamp(indirectCommandBuffer, executionRange);
 	_enc->computeExecuteCommandsInBuffer(rgfxNamed(_enc, indirectCommandBuffer), executionRange.location,
 	                                     executionRange.length);
 }
@@ -4056,8 +4088,11 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 {
 	_enc->blitOptimizeForCpuSlice(rgfxNamed(_enc, texture), slice, level);
 }
+// Each range within its buffer's commands (RgfxIcbClamp), as the encoders' executes; a copy
+// takes no more commands than the destination has from its index.
 - (void)resetCommandsInBuffer:(id<MTLIndirectCommandBuffer>)buffer withRange:(NSRange)range
 {
+	range = RgfxIcbClamp(buffer, range);
 	_enc->blitResetCommandsInBuffer(rgfxNamed(_enc, buffer), range.location, range.length);
 }
 - (void)copyIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)source
@@ -4065,12 +4100,15 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
                       destination:(id<MTLIndirectCommandBuffer>)destination
                  destinationIndex:(NSUInteger)destinationIndex
 {
+	sourceRange = RgfxIcbClamp(source, sourceRange);
+	const NSRange into = RgfxIcbClamp(destination, NSMakeRange(destinationIndex, sourceRange.length));
 	_enc->blitCopyIndirectCommandBuffer(rgfxNamed(_enc, source), rgfxNamed(_enc, destination), sourceRange.location,
-	                                    sourceRange.length, destinationIndex);
+	                                    into.length, into.location);
 }
 - (void)optimizeIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                             withRange:(NSRange)range
 {
+	range = RgfxIcbClamp(indirectCommandBuffer, range);
 	_enc->blitOptimizeIndirectCommandBuffer(rgfxNamed(_enc, indirectCommandBuffer), range.location,
 	                                        range.length);
 }

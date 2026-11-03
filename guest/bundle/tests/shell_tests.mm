@@ -47,6 +47,7 @@
 #include <vector>
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
+#import "RgfxIndirectCommandBuffer.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
@@ -941,8 +942,24 @@ static int dies_case(const char *name)
 		heapTexture(MTLPixelFormatBC1_RGBA, 4);
 	if (std::strcmp(name, "texture-multisample-422") == 0)
 		heapTexture(MTLPixelFormatGBGR422, 2);
+	if (std::strcmp(name, "icb-memoryless") == 0) {
+		MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+		d.commandTypes = MTLIndirectCommandTypeDraw;
+		(void)[RgfxIndirectCommandBuffer icbWithDescriptor:d
+		                                   maxCommandCount:4
+		                                           options:MTLResourceStorageModeMemoryless
+		                                            device:nil
+		                                        serializer:&fx.ser];
+	}
 	}
 	return 0;
+}
+
+// A Memoryless indirect command buffer ends the process, before the host is asked, as on the AMD
+// 5300M, the Intel 630 (an assertion) and the M3 Max (a trap).
+void test_memoryless_icb_ends_the_process()
+{
+	checkDies("icb-memoryless", "an indirect command buffer cannot be Memoryless (storageMode 3)");
 }
 
 // A texture of more than one level over a buffer's bytes (the public
@@ -9795,6 +9812,7 @@ void rgfxQueueTests(const char *self);
 int rgfxQueueDiesCase(const char *name);
 void rgfxCreateTests();
 void rgfxKnownPipelineTests();
+void rgfxIcbTests();
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -9868,6 +9886,7 @@ int main(int argc, char **argv)
 		test_tiled_texture_over_backing();
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_invalid_texture_descriptors_end_the_process();
+		test_memoryless_icb_ends_the_process();
 		test_texture_views();
 		test_texture_framebuffer_only();
 		test_texture_unknown_usage();
@@ -9964,6 +9983,7 @@ int main(int argc, char **argv)
 		rgfxQueueTests(argv[0]); // tests/queue_tests.mm
 		rgfxCreateTests();        // tests/create_tests.mm
 		rgfxKnownPipelineTests(); // tests/known_pipeline_tests.mm
+		rgfxIcbTests();           // tests/icb_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

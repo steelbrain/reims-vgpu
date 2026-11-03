@@ -303,14 +303,13 @@ uint64_t resourceId(MTLResourceID id)
 		[self setDepthStencilState:depthStencilStates[i] atIndex:range.location + i];
 }
 
-// The device makes no indirect command buffer, acceleration structure or function table: only
-// nil reaches these, which writes 0.
+// The buffer's gpuResourceID, the id the host's device numbered it by, as a pipeline's; 0 for nil.
 - (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)indirectCommandBuffer
                          atIndex:(NSUInteger)index
 {
-	if (indirectCommandBuffer != nil)
-		RGFX_UNSUPPORTED("indirect command buffers");
-	[self rgfxWord:0 atIndex:index cmd:_cmd];
+	[self rgfxWord:indirectCommandBuffer != nil ? resourceId(indirectCommandBuffer.gpuResourceID) : 0
+	       atIndex:index
+	           cmd:_cmd];
 }
 
 - (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __nullable[__nonnull])buffers
@@ -320,6 +319,8 @@ uint64_t resourceId(MTLResourceID id)
 		[self setIndirectCommandBuffer:buffers[i] atIndex:range.location + i];
 }
 
+// The device makes no acceleration structure or function table: only nil reaches these, which
+// writes 0.
 - (void)setAccelerationStructure:(id<MTLAccelerationStructure>)accelerationStructure
                          atIndex:(NSUInteger)index
 {

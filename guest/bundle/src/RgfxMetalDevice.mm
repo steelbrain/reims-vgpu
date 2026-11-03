@@ -1157,6 +1157,18 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.spiFeature(kRgfxSpiDepthClipMode);
 }
 
+// Render and compute indirect command buffers, where the host makes them, as Metal's devices
+// answer YES (measured: M3 Max, AMD 5300M, Intel 630).
+- (BOOL)supportsGFXIndirectCommandBuffers
+{
+	return (_caps.features() & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS) != 0;
+}
+
+- (BOOL)supportsCMPIndirectCommandBuffers
+{
+	return (_caps.features() & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS) != 0;
+}
+
 - (BOOL)supportsIndirectDrawAndDispatch
 {
 	return _caps.spiFeature(kRgfxSpiIndirectDrawAndDispatch);

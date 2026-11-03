@@ -60,22 +60,13 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
-// --- argument encoders and indirect command buffers -----------------------------------
+// --- argument encoders --------------------------------------------------------------
 
 // No argument-buffer layout on the wire: no encoder, which apps and Metal's own frameworks check,
 // rather than one that lays out nothing.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)bufferBinding
 {
 	RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
-	return nil;
-}
-
-- (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:
-                                    (MTLIndirectCommandBufferDescriptor *)descriptor
-                                                       maxCommandCount:(NSUInteger)maxCount
-                                                               options:(MTLResourceOptions)options
-{
-	RGFX_UNSUPPORTED("indirect command buffers (none on the wire)");
 	return nil;
 }
 
