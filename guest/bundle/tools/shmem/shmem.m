@@ -34,6 +34,11 @@
 //   align.MODE.SIZE      64 buffers of SIZE held: allocatedSize, how many contents pointers and
 //                        gpuAddresses are page aligned, the smallest gap between two contents
 //                        and two gpuAddresses, and how many share a page with another.
+//   bw.MODE.SIZE         the GPU's read rate of SIZE buffers of MODE: as many as hold 64 MiB (at
+//                        least one, at most 1024), each blitted whole into one Private buffer, one
+//                        command buffer a round, -rounds rounds after one not counted: the p50 and
+//                        best of the GPU's time (GPUStartTime to GPUEndTime) and of the wall's
+//                        (commit to completion), and the GB/s of each.
 //   superpage            (x86_64) 2 MiB superpages (VM_FLAGS_SUPERPAGE_SIZE_2MB) allocated
 //                        until the kernel refuses or the cap: n, us p50/p99, wired delta, then
 //                        freed. No Metal.
@@ -368,6 +373,63 @@ static void hold(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint6
 	free(tail);
 }
 
+static void bwCase(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint64_t size)
+{
+	uint64_t count = (64ull << 20) / size;
+	count = count < 1 ? 1 : count > 1024 ? 1024 : count;
+	NSMutableArray<id<MTLBuffer>> *src = [NSMutableArray arrayWithCapacity:count];
+	for (uint64_t i = 0; i < count; i++) {
+		id<MTLBuffer> b = [d newBufferWithLength:size options:opts];
+		if (b == nil) {
+			printf("shm: %s nil at buffer %llu of %llu\n", name.UTF8String, (unsigned long long)i,
+			       (unsigned long long)count);
+			return;
+		}
+		[src addObject:b];
+	}
+	id<MTLBuffer> dst = [d newBufferWithLength:size * count options:MTLResourceStorageModePrivate];
+	if (dst == nil) {
+		printf("shm: %s nil Private buffer of %llu bytes\n", name.UTF8String,
+		       (unsigned long long)(size * count));
+		return;
+	}
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	const int rounds = gRounds < 1 ? 1 : gRounds;
+	double *gpu = calloc(rounds, sizeof *gpu), *wall = calloc(rounds, sizeof *wall);
+	NSString *err = nil;
+	for (int r = -1; r < rounds && err == nil; r++) {
+		@autoreleasepool {
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+			for (uint64_t i = 0; i < count; i++)
+				[b copyFromBuffer:src[i] sourceOffset:0 toBuffer:dst destinationOffset:i * size
+				             size:size];
+			[b endEncoding];
+			double t0 = nowUs();
+			[cb commit];
+			[cb waitUntilCompleted];
+			double t = nowUs() - t0;
+			if (cb.status != MTLCommandBufferStatusCompleted)
+				err = [NSString stringWithFormat:@"status %ld %@", (long)cb.status,
+				                                 cb.error.localizedDescription];
+			if (r >= 0) {
+				gpu[r] = (cb.GPUEndTime - cb.GPUStartTime) * 1e6;
+				wall[r] = t;
+			}
+		}
+	}
+	const double bytes = (double)(size * count);
+	double g50 = quant(gpu, rounds, 0.5), gBest = gpu[0], w50 = quant(wall, rounds, 0.5),
+	       wBest = wall[0];
+	printf("shm: %s buffers=%llu bytes=%.1fMiB rounds=%d gpu_us=%.1f gpu_best_us=%.1f gbps=%.2f "
+	       "best_gbps=%.2f wall_us=%.1f wall_best_us=%.1f wall_gbps=%.2f%s%s\n",
+	       name.UTF8String, (unsigned long long)count, bytes / (1 << 20), rounds, g50, gBest,
+	       g50 > 0 ? bytes / g50 / 1e3 : 0, gBest > 0 ? bytes / gBest / 1e3 : 0, w50, wBest,
+	       w50 > 0 ? bytes / w50 / 1e3 : 0, err ? " err=" : "", err ? err.UTF8String : "");
+	free(gpu);
+	free(wall);
+}
+
 static void maxCase(id<MTLDevice> d, NSString *name, MTLResourceOptions opts)
 {
 	const uint64_t page = pageBytes();
@@ -615,6 +677,10 @@ int main(int argc, const char **argv)
 					MTLResourceOptions o = modeOf(p[1], &ok);
 					if (ok)
 						hold(d, c, o, sizeOf(p[2]));
+				} else if (p.count == 3 && [p[0] isEqualToString:@"bw"]) {
+					MTLResourceOptions o = modeOf(p[1], &ok);
+					if (ok)
+						bwCase(d, c, o, sizeOf(p[2]));
 				} else if (p.count == 2 && [p[0] isEqualToString:@"max"]) {
 					MTLResourceOptions o = modeOf(p[1], &ok);
 					if (ok)
