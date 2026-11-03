@@ -6193,6 +6193,119 @@ void test_no_copy_buffers()
 	CHECK(!RgfxMemoryShadow::anyLive());
 }
 
+// newBufferWithBytesNoCopy: over writable Shared app memory where the region has pages blocks
+// (RgfxBuffer.h): the buffer lies over the app's own pages, no block or shadow of its own, its
+// create a BUFFER_OVER_PAGES over the block the kext gave for exactly the app's bytes, at the
+// pointer's offset in its page, which its GPU address keeps. Its block goes back once the host
+// has dropped it, before the deallocator. Read-only memory, Managed storage, a null pointer and
+// bytes in the region never ask for a block, and a block not given, or one the region does not
+// hold, falls back to the shadow.
+void test_no_copy_buffers_in_place()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Pages {
+		std::vector<std::tuple<const void *, uint64_t, bool>> asked;
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		uint64_t size = 0x1000;
+		bool gives = true;
+		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		                  uint64_t *offset, uint64_t *size)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			p->asked.emplace_back(address, length, writable);
+			*offset = p->offset;
+			*size = p->size;
+			return p->gives;
+		}
+	} pages;
+	CHECK(!region.hasPagesBlocks());
+	region.setPagesBlockSource(&Pages::block, &pages);
+	CHECK(region.hasPagesBlocks());
+	const MTLResourceOptions shared = MTLResourceStorageModeShared;
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x40000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app) + 0x1123;
+	std::atomic<int> freedState{0};
+	std::atomic<int> *freed = &freedState;
+	size_t releasedBefore = 0;
+	@autoreleasepool {
+		RgfxBuffer *b = [RgfxBuffer bufferWithBytesNoCopy:p
+		                                           length:0x14000
+		                                          options:shared
+		                                      deallocator:^(void *, NSUInteger) {
+			                                      freed->fetch_add(1);
+		                                      }
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&f.ser];
+		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] == nullptr);
+		CHECK(pages.asked.size() == 1 && std::get<0>(pages.asked[0]) == p &&
+		      std::get<1>(pages.asked[0]) == 0x14000 && std::get<2>(pages.asked[0]));
+		CHECK(blocks.allocated.empty()); // no block of its own
+		auto create = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(create.obj_id == b.rgfxObjId && create.length == 0x14000);
+		CHECK(create.block_offset == pages.offset && create.block_size == pages.size);
+		CHECK(create.offset == 0x123 && create.gpu_address == b.gpuAddress);
+		CHECK(b.gpuAddress % 0x1000 == 0x123 && b.gpuAddress >= RGFX_CONTEXT_VA_BASE);
+		releasedBefore = blocks.released.size();
+	}
+	CHECK(eventually([&] { return freedState.load() == 1; }));
+	CHECK(blocks.released.size() == releasedBefore + 1 &&
+	      blocks.released.back() == pages.offset);
+	auto destroy = expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY);
+	(void)destroy;
+	drainRing(f.control);
+
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	@autoreleasepool {
+		// Never asked: Managed storage, a null pointer, bytes in the region, read-only memory.
+		pages.asked.clear();
+		RgfxBuffer *managed = noCopy(p, 0x1000, MTLResourceStorageModeManaged);
+		CHECK(managed != nil && [managed rgfxShadow] != nullptr);
+		RgfxBuffer *own = noCopy(nullptr, 0x1000, shared);
+		CHECK(own != nil && [own rgfxShadow] == nullptr);
+		RgfxRegion::Block inRegion = region.allocate(0x1000);
+		RgfxBuffer *placed = noCopy(const_cast<uint8_t *>(inRegion.ptr), 0x1000, shared);
+		CHECK(placed != nil && [placed rgfxShadow] == nullptr);
+		uint8_t *ro = reinterpret_cast<uint8_t *>(app) + 0x30000;
+		CHECK(vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(ro), 0x4000, false,
+		                 VM_PROT_READ) == KERN_SUCCESS);
+		RgfxBuffer *readOnly = noCopy(ro, 0x4000, shared);
+		CHECK(readOnly != nil && [readOnly rgfxShadow] != nullptr);
+		CHECK(pages.asked.empty());
+
+		// Asked, and no block given, or one the region does not hold: a shadow.
+		pages.gives = false;
+		RgfxBuffer *refused = noCopy(p, 0x1000, shared);
+		CHECK(refused != nil && [refused rgfxShadow] != nullptr && pages.asked.size() == 1);
+		pages.gives = true;
+		pages.offset = mem.size();
+		const size_t released = blocks.released.size();
+		RgfxBuffer *outside = noCopy(p, 0x1000, shared);
+		CHECK(outside != nil && [outside rgfxShadow] != nullptr && pages.asked.size() == 2);
+		CHECK(blocks.released.size() == released + 1 && blocks.released.back() == mem.size());
+		drainRing(f.control);
+	}
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x40000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 
 // A no-copy buffer bound to a shader is one the command buffer may write, so its completion
 // writes it back; a texture over it is one only where its usage has ShaderWrite. A bound buffer
@@ -10056,6 +10169,7 @@ int main(int argc, char **argv)
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
+		test_no_copy_buffers_in_place();
 		test_binds_note_shadow_writes();
 		test_block_call();
 		rgfxProtocolTests(); // tests/protocol_tests.mm

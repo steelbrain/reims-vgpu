@@ -99,9 +99,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// The buffer `newBufferWithBytesNoCopy:length:options:deallocator:` makes over the caller's
 /// `length` bytes at `pointer`, whose `contents` is `pointer`, with `deallocator` (may be nil)
 /// called with them once the buffer is gone from the host. Bytes in `region` (a block of the
-/// process's) the host sees in place; any others get a block of their own, the GPU's copy,
-/// synced with them at the command buffers that use the buffer (RgfxMemoryShadow.hpp). A null
-/// `pointer` is a buffer with contents of its own, zeroed, whose deallocator gets null.
+/// process's) the host sees in place. Shared bytes the process may write, where `region` has
+/// pages blocks (RgfxRegion::acquirePages), the host sees in place too: the kext wires their
+/// pages for the buffer's life, and the buffer's GPU address keeps the pointer's offset in its
+/// page. Any others, and those the kext or the host makes no pages block of, get a block of
+/// their own, the GPU's copy, synced with them at the command buffers that use the buffer
+/// (RgfxMemoryShadow.hpp). A null `pointer` is a buffer with contents of its own, zeroed, whose
+/// deallocator gets null.
 ///
 /// What Metal makes, as measured (M3 Max, macOS 27, 16 KiB and, under Rosetta, 4 KiB pages):
 /// any pointer and length, at any alignment, over memory the process maps readable: malloc'd,

@@ -22,6 +22,10 @@
 #include "RgfxSlabs.hpp"
 
 namespace {
+/// The page the kext rounds a pages block's range out to (its RgfxPagesBlock.hpp), the guest's:
+/// the device's view of a block starts at the page of the buffer's first byte.
+constexpr uint64_t kRgfxGuestPage = 0x1000;
+
 /// Whether this process maps every byte of [p, p + length) readable, and in `*writable` whether
 /// it maps them all writable too.
 bool rgfxMappedReadable(const void *p, size_t length, bool *writable)
@@ -88,6 +92,10 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	// The bytes of its slab a device buffer takes, whole pages (RgfxSlabs); 0 for any other,
 	// which takes its length.
 	NSUInteger _allocatedSize;
+	// The GPU address the create picked, which goes back after the destroy where `_ownsAddress`:
+	// a buffer over pages lies past it by its pointer's offset in its page; 0 for any other,
+	// whose pick is `_gpuAddress`.
+	uint64_t _addressPick;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -249,6 +257,21 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	bool writable = true;
 	if (pointer != nullptr && !rgfxMappedReadable(pointer, length, &writable))
 		return nil;
+	// The app's own pages in place, where the kext wires them for the buffer and the host maps
+	// them: nothing copied or synced. Read-only and Managed memory, and memory the kext or the
+	// host makes no pages block of, takes a shadow below.
+	if (pointer != nullptr && writable && region->hasPagesBlocks() &&
+	    (options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared) {
+		RgfxBuffer *inPlace = [RgfxBuffer bufferOverPagesOf:pointer
+		                                             length:length
+		                                            options:options
+		                                        deallocator:appDeallocator
+		                                             region:region
+		                                             device:device
+		                                         serializer:serializer];
+		if (inPlace != nil)
+			return inPlace;
+	}
 	RgfxRegion::Block block = region->allocate(length);
 	if (!block.ok)
 		return nil;
@@ -285,6 +308,49 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 		return nil;
 	}
 	buffer->_shadow = std::move(shadow);
+	return buffer;
+}
+
+// A no-copy buffer over the app's own pages (bufferWithBytesNoCopy): a pages block of them, and a
+// buffer over its view at the pointer's offset in its page, which keeps the block until the host
+// has dropped the buffer. Nil where the kext gives no block, or the device never got the create.
++ (instancetype)bufferOverPagesOf:(void *)pointer
+                           length:(NSUInteger)length
+                          options:(MTLResourceOptions)options
+                      deallocator:(void (^)(void *, NSUInteger))appDeallocator
+                           region:(RgfxRegion *)region
+                           device:(id<MTLDevice>)device
+                       serializer:(RgfxSerializer *)serializer
+{
+	RgfxRegion::Block block = region->acquirePages(pointer, length, true);
+	if (!block.ok)
+		return nil;
+	const uint64_t offset = reinterpret_cast<uintptr_t>(pointer) & (kRgfxGuestPage - 1);
+	RgfxCreated created = serializer->createBufferOverPages(length, static_cast<uint32_t>(options),
+	                                                        block.offset, block.size, offset);
+	if (created.obj_id == 0 || serializer->refused(created)) {
+		region->release(block.offset); // no buffer lies over the block
+		return nil;
+	}
+	// The block goes back once the host has dropped the buffer, then the caller's memory: the
+	// kext unwires its pages once the device has answered the block's release.
+	const uint64_t at = block.offset;
+	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
+	                                            gpuAddress:created.gpu_address + offset
+	                                                length:length
+	                                               options:options
+	                                              contents:pointer
+	                                           deallocator:^{
+		                                           region->release(at);
+		                                           if (appDeallocator != nil)
+			                                           appDeallocator(pointer, length);
+	                                           }
+	                                                device:device
+	                                            serializer:serializer];
+	if (buffer != nil) {
+		buffer->_ownsAddress = YES;
+		buffer->_addressPick = created.gpu_address;
+	}
 	return buffer;
 }
 
@@ -351,7 +417,7 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 		std::free(_contents);
 	void (^deallocator)(void) = _hostDeallocator;
 	RgfxSerializer *serializer = _serializer;
-	uint64_t address = _ownsAddress ? _gpuAddress : 0;
+	uint64_t address = !_ownsAddress ? 0 : _addressPick != 0 ? _addressPick : _gpuAddress;
 	[self rgfxRetireThen:[deallocator, serializer, address] {
 		if (deallocator != nil)
 			deallocator();
