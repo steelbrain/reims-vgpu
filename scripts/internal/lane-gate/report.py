@@ -6,7 +6,8 @@ with a baseline, and writes results.json and report.txt into the run.
     report.py --record RUN BASELINES          adds RUN as a sample of its commit's baseline
     report.py --noise-from BASELINES FILE     the noise band from every baseline with 2+ samples
     report.py --reidle BASELINES RUN...       RUN's recorded qemu_cpu.idle read from 2 s into the
-                                              phase (runs from before the guest settled it)
+                                              phase (runs from before the guest settled it); a
+                                              report of such a run takes --idle-skip 2
 
 A run's directory holds:
   steps/NAME.ok | NAME.fail     each step's result (the first line: its seconds), NAME.log
@@ -1131,7 +1132,9 @@ def main(argv):
             if gated(n):
                 print(f"  {n:48s} max deviation {dev[n]:6.2%} -> band {band(n, dev):6.2%}")
         return 0
-    run = Run(argv[0]).parse()
+    # --idle-skip 2: a run from before the guest settled its idle phase, read as --reidle reads it.
+    skip = float(argv[argv.index("--idle-skip") + 1]) if "--idle-skip" in argv[1:] else 0
+    run = Run(argv[0], idle_skip_s=skip).parse()
     base, noise, history = None, {}, None
     i = 1
     while i < len(argv):
