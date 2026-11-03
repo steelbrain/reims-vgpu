@@ -26,13 +26,16 @@
 #   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
 #   gpu-clocks.txt  the GPU's power state and clocks ten times a second over the guest's run and
 #                 the drags: "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W"
+#   capture/, capture.txt   where boot.env sets CAPTURE=1: the boot as the display showed it
+#                 (msi-capture.py's scanout reads and the guest's screenshots, the kext's log lines
+#                 of the boot), and a summary of it
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
 # GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
 # LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
 # PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
 # load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
-# (the host's REIMS_VGPU_LOG filter, default info). A probe boot (probe-batch.sh) sets PROBES,
+# (the host's REIMS_VGPU_LOG filter, default info), and CAPTURE (1: the boot capture, below). A probe boot (probe-batch.sh) sets PROBES,
 # PROBE_RESULTS and PROBE_TIP in place of PHASES and CORPUS (msi-probes.sh says what they are).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
@@ -84,6 +87,7 @@ stop_load() {
 }
 finish() {
   local qp=$P
+  [[ -d $R/capture ]] && touch "$R/capture/stop"
   stop_clocks
   stop_load
   stop_qemu
@@ -167,6 +171,21 @@ excl=()
 sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", a - b }'; }
 stamp() { date -d "$1" +%s.%N 2> /dev/null | cut -c1-14; }
 touch "$R/.start"
+# The boot capture (CAPTURE=1, msi-capture.py): the guest's scanout read from QEMU's memory every
+# CAPTURE_MS (default 100) ms from QEMU's start, and the guest's screenshots once a second from the
+# host's first present, until CAPTURE_SETTLE_S (default 60) seconds after the desktop is up, where
+# the Dock has settled (below). The scanout's reader runs as root, for /proc/PID/mem.
+CAPPIDS=()
+if [[ ${CAPTURE:-0} == 1 ]]; then
+  rm -rf "$R/capture" && mkdir -p "$R/capture"
+  ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
+    exec sudo -n env CAPTURE_MODE="${CAPTURE_MODE:-3840x2400}" CAPTURE_MS="${CAPTURE_MS:-100}" \
+      python3 -I "$(dirname "$0")/msi-capture.py" scanout "$B" "$R" ) > /dev/null 2>&1 &
+  CAPPIDS+=($!)
+  ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
+    exec python3 -I "$(dirname "$0")/msi-capture.py" shots "$B" "$R" ) > /dev/null 2>&1 &
+  CAPPIDS+=($!)
+fi
 ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
   q= g=
   while sleep 0.5; do
@@ -243,6 +262,7 @@ desktop() {
 desktop || { log "BOOT_FAIL no desktop (WindowServer, Dock, Finder) in 3 min"; exit 5; }
 [[ -n $T_QEMU ]] && kv desktop_s "$(sub "$(date +%s.%N | cut -c1-14)" "$T_QEMU")"
 log "desktop up"
+T_DESK=$(date +%s)
 # The boot's timeline from QEMU's first line: the host's first present of a guest frame, and from
 # the guest (its clock set against the host's over SSH, to a second) the kernel's boot and the
 # start of WindowServer, loginwindow and Dock (the user's login).
@@ -263,6 +283,59 @@ if [[ -n $T_QEMU ]]; then
       kv "$(echo "$p" | tr 'A-Z' 'a-z')_s" "$(sub "$(( gnow - el + off ))" "$T_QEMU")"
     done
   fi
+fi
+
+# The boot capture's end (CAPTURE=1): the readers stop CAPTURE_SETTLE_S seconds after the desktop
+# came up. The guest's screenshots come back into capture/shots/ (shots-files.tsv: "FILE
+# GUEST_MTIME NAME", the guest's clock; clock.txt its offset from the host's), and the kext's lines
+# of the boot into capture/kext.log, whose scanout line says whether the reader's mode was the
+# guest's. capture.txt sums it up.
+if [[ ${CAPTURE:-0} == 1 ]]; then
+  w=$(( T_DESK + ${CAPTURE_SETTLE_S:-60} - $(date +%s) ))
+  (( w > 0 )) && sleep "$w"
+  touch "$R/capture/stop"
+  for p in "${CAPPIDS[@]}"; do
+    for _ in $(seq 1 40); do kill -0 "$p" 2> /dev/null || break; sleep 0.5; done
+  done
+  h0=$(date +%s.%N | cut -c1-14)
+  gt=$(G "perl -MTime::HiRes=time -e 'printf \"%.3f\\n\", time'" 2> /dev/null)
+  h1=$(date +%s.%N | cut -c1-14)
+  [[ $gt =~ ^[0-9.]+$ ]] &&
+    echo "host_minus_guest_s $(awk -v a="$h0" -v b="$h1" -v g="$gt" 'BEGIN { printf "%.3f", (a + b) / 2 - g }')" > "$R/capture/clock.txt"
+  Gs 'bash -s' > "$R/capture/shots-files.tsv" 2> /dev/null << 'SHOTS'
+bt=$(sysctl -n kern.boottime | sed 's/.* sec = \([0-9]*\),.*/\1/')
+rm -rf ~/lane-gate-shots && mkdir -p ~/lane-gate-shots
+n=0
+for f in ~/Desktop/*.png; do
+  [ -f "$f" ] || continue
+  [ "$(stat -f %m "$f")" -ge "$bt" ] || continue
+  n=$((n + 1))
+  b=$(printf '%03d.png' "$n")
+  echo "$b $(stat -f %Fm "$f") ${f##*/}"
+  mv "$f" ~/lane-gate-shots/"$b"
+done
+SHOTS
+  Gcp "$GUEST_USER@127.0.0.1:lane-gate-shots" "$R/capture/shots" 2> /dev/null && G 'rm -rf ~/lane-gate-shots' 2> /dev/null
+  G "echo '$GUEST_PASS' | sudo -S -p '' perl -e 'alarm 180; exec @ARGV' log show --last boot --style compact --predicate 'sender == \"ReimsGraphics\"'" \
+    > "$R/capture/kext.log" 2> /dev/null
+  line=$(grep -m1 -oE 'scanout [0-9]+x[0-9]+ at [0-9.]+ Hz, stride [0-9]+' "$R/capture/kext.log")
+  mode=${CAPTURE_MODE:-3840x2400}
+  stride=$(( (${mode%x*} * 4 + 255) / 256 * 256 ))
+  if [[ -z $line ]]; then mok=unknown
+  elif [[ $line == "scanout $mode at "*", stride $stride" ]]; then mok=1
+  else mok=0
+  fi
+  {
+    echo "dir $R/capture"
+    echo "scanout $(cat "$R/capture/scanout.done" 2> /dev/null)"
+    echo "shots $(cat "$R/capture/shots.done" 2> /dev/null) files=$(grep -c . "$R/capture/shots-files.tsv")"
+    echo "mode $mode stride $stride; the kext's first: ${line:-none}; as assumed: $mok"
+    cat "$R/capture/clock.txt" 2> /dev/null
+  } > "$R/capture.txt"
+  kv capture_distinct "$(sed -n 's/.*distinct=\([0-9]*\).*/\1/p' "$R/capture/scanout.done" 2> /dev/null)"
+  kv capture_shots "$(grep -c . "$R/capture/shots-files.tsv")"
+  kv capture_mode_ok "$mok"
+  log "boot capture: $(tr '\n' ';' < "$R/capture.txt")"
 fi
 
 # Right after login the guest's SSH can miss its banner timeout while the desktop's apps start: a

@@ -476,6 +476,12 @@ class Run:
             self.litem("host.no-xid", "FAIL" if own else "PASS",
                        (f"{len(own)} from this boot's QEMU: {', '.join(own)}" if own
                         else "no Xid line from this boot's QEMU") + more)
+        # The boot capture (msi-boot.sh's CAPTURE): what it kept, on the lane host.
+        cap = read(os.path.join(r, "capture.txt")).strip()
+        if cap:
+            ok = (kv.get("capture_distinct", "0") not in ("", "0") and kv.get("capture_shots", "0") not in ("", "0")
+                  and kv.get("capture_mode_ok") != "0")
+            self.litem("host.boot-capture", "PASS" if ok else "FAIL", cap.replace("\n", "; "))
         if "first_boot_accel" in kv:
             self.litem("host.same-boot-accel", "PASS" if kv["first_boot_accel"] == "1" else "FAIL",
                       "our Metal device on the first boot" if kv["first_boot_accel"] == "1"
