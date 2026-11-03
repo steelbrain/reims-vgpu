@@ -22,7 +22,8 @@
 # wall_s, host.log, gpu-clocks.txt, out/, status), and the probe leaves the queue once it ran or
 # was skipped. One not reached in a round's hold stays queued for the next.
 #
-#   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...] [--hold S]
+#   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
+#                  [--exclude NAME,...] [--hold S]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -35,7 +36,8 @@
 # the guest's screenshots and the kext's log of the boot, in the round's capture/), the host's log
 # at info,reims_graphics=trace,reims_vgpu::graphics=debug; a round with --capture runs with no
 # probe too. --first NAME,... has the round consider those probes first, in that order, before the
-# others oldest first, and --only NAME,... takes those alone, in that order; --hold S sets the
+# others oldest first, and --only NAME,... takes those alone, in that order; --exclude NAME,...
+# leaves those in the queue (a probe that must come last in its own round); --hold S sets the
 # round's hold (config.sh's HOLD_S) for this round. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
@@ -43,7 +45,7 @@
 set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
-force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0
+force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude=
 while (($#)); do
   a=$1
   shift
@@ -53,6 +55,7 @@ while (($#)); do
     --tip) want_tip=${1:?--tip SHA}; shift ;;
     --first) first=${1:?--first NAME,...}; shift ;;
     --only) first=${1:?--only NAME,...} only=1; shift ;;
+    --exclude) exclude=${1?--exclude NAME,...}; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
@@ -108,6 +111,8 @@ queue=$(msi "mkdir -p '$Q' '$RES'; cd '$Q' && now=\$(date +%s) && for d in */; d
   m=\$(stat -c %Y \"\$d\" 2> /dev/null || stat -f %m \"\$d\"); echo \"\$((now - m)) \$(tr -dc 0-9 < \"\$d/budget\" 2> /dev/null || true) \$(tr -dc 0-9a-f < \"\$d/tip\" 2> /dev/null || true) \$d\"
   done | sort -rn")
 queue_all=$queue
+[[ -n $exclude ]] &&  # --exclude: those stay queued
+  queue=$(awk -v l="$exclude" 'BEGIN { n = split(l, a, ","); for (i = 1; i <= n; i++) s[a[i]] = 1 } !($4 in s)' <<< "$queue")
 if [[ -n $first ]]; then  # --first: those probes first, in the order given
   IFS=, read -r -a firsts <<< "$first"
   head_=$(for f in "${firsts[@]}"; do awk -v f="$f" '$4 == f' <<< "$queue"; done)
