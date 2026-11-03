@@ -262,6 +262,22 @@ open(sys.argv[2] + "/cargo-fails.txt", "w").write("".join(f + "\n" for f in sort
 open(sys.argv[2] + "/cargo-summary.txt", "w").write(f"{total} tests run, {len(fails)} failed\n")
 print(f"{total} tests run, {len(fails)} failed")
 EOF
+  # A GPU test that fails under the check's load runs once more alone (AGENTS.md, Checking a
+  # change): passing alone, it is not a failure, and the report names it as load-sensitive.
+  : > "$RES/cargo-alone.txt"
+  local bin name rest=()
+  while read -r bin name; do
+    [[ -n $name ]] || continue
+    if "$SRC/scripts/internal/gpu-locks.sh" -- cargo nextest run "${pkgs[@]}" --features "$feats" \
+      -E "binary_id($bin) & test(=$name)" > "$RES/cargo-alone.log" 2>&1; then
+      echo "$bin $name" >> "$RES/cargo-alone.txt"
+      echo "passes alone: $bin $name"
+    else
+      rest+=("$bin $name")
+      echo "fails alone too: $bin $name"
+    fi
+  done < "$RES/cargo-fails.txt"
+  printf '%s\n' "${rest[@]}" | sed '/^$/d' > "$RES/cargo-fails.txt"
 }
 
 mac_checks() {

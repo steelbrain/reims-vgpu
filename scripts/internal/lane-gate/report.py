@@ -275,6 +275,10 @@ class Run:
         self.cargo_fails = sorted({l.strip() for l in read(p).splitlines() if l.strip()})
         self.metrics["cargo.failed"] = len(self.cargo_fails)
         summary = read(os.path.join(r, "cargo-summary.txt")).strip()
+        # The tests that failed under the check's load and passed run again alone.
+        alone = sorted({l.strip() for l in read(os.path.join(r, "cargo-alone.txt")).splitlines() if l.strip()})
+        if alone:
+            summary += f"; {len(alone)} passed run again alone (load-sensitive): " + ", ".join(alone)
         self.item("cargo.tests", "PASS", summary)
 
     def to_json(self):
