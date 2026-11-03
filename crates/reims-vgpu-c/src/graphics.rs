@@ -76,8 +76,10 @@ const _: () = {
 /// `raise_interrupt(ctx, vector)`: raise the device's MSI-X vector `vector` (0).
 ///
 /// Thread: the one that posts the event it raises for: the device's control thread
-/// (`reims-vgpu.graphics-control`), its refresh thread (`reims-vgpu.graphics-refresh`), a command
-/// queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
+/// (`reims-vgpu.graphics-control`), a lane that carries out a guest process's control messages
+/// (`reims-vgpu.graphics-context-<n>`) or its presents (`reims-vgpu.graphics-presents`), its
+/// refresh thread (`reims-vgpu.graphics-refresh`), a command queue's service thread
+/// (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
 /// scheduled or completed handler; or the host's own, inside rvg_graphics_device_mmio_write_taking.
 /// Never inside another call of the host's into the library. The library may hold locks of its

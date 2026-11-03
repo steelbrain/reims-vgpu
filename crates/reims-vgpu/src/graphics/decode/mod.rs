@@ -28,8 +28,9 @@
 //! for the caller to catch. An op-stream reference the host cannot honour faults
 //! the exec the same way ([`bad_reference`], [`op_fault`]).
 //!
-//! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on the
-//! control thread, each queue's command buffers on the queue's service thread (or a doorbell's),
+//! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on their
+//! context's lane (the presents on the presents' lane, a download on the control thread), each
+//! queue's command buffers on the queue's service thread (or a doorbell's),
 //! and the compiles' ends on the compile pool. Each message is carried out through a
 //! [`GraphicsDecoder`] of its own, a handle on the state the decoder keeps for every context
 //! ([`Shared`]) with the message's sender and the sinks its records go to; no lock is held across a
@@ -42,8 +43,9 @@
 //! **The locks** (each held only for what it guards, never across a command buffer's walk, a
 //! platform call that waits, a wait of another kind, or a post, but where said):
 //! - `GraphicsControl`'s reset gate, outside every lock here: held shared by each message carried
-//!   out off the control thread, from before its staleness check to its end, and alone by the
-//!   device's reset ([`GraphicsDecoder::reset`]), which so finds no message in flight.
+//!   out off ring 0's threads, from before its staleness check to its end, and alone by the
+//!   device's reset ([`GraphicsDecoder::reset`]), which so finds no message in flight (ring 0's
+//!   own have returned by then: the device tells the host of a reset once its lanes' have).
 //! - `contexts`: which contexts have state ([`tables::Context`]), to find, make or drop one.
 //! - each context's table ([`tables`]): read at a message's first naming of an object, and
 //!   written to take or close a view and at each make and removal. A message sees the table as of
@@ -1305,6 +1307,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming another,
     /// or none, has nothing to wait for); and the context that made the texture. The caller holds
     /// its own reference to the texture: a destroy of it after this leaves it drawable.
+    /// The textures IOSurface `iosurface_id` is named by, oldest first: those over its plane 0,
+    /// the newest of which a present of it shows ([`Self::surface_present`]).
+    pub(crate) fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {
+        (self.shared.surfaces.lock().by_surface.get(&iosurface_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn surface_present(
         &self,
         iosurface_id: u32,

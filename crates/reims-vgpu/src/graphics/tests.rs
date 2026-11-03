@@ -480,10 +480,9 @@ fn a_texture_create_needs_its_context_s_chunk_of_resource_ids() {
     let (device, _platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
-    // Ring 0 is carried out in order, so once the close of a context that holds nothing is
-    // answered, everything sent before it is.
-    let carried_out = |guest: &mut Guest| {
-        assert_eq!(answered(&device, guest, context_close(99)), RGFX_STATUS_OK);
+    // Once a lookup of the context's is answered, everything of its sent before it is.
+    let carried_out = |guest: &mut Guest, context: u32| {
+        carried_out_of(&device, guest, context);
         device.decoder_object_count()
     };
     let first = 1 + 7 * RGFX_RESOURCE_ID_CHUNK;
@@ -497,7 +496,7 @@ fn a_texture_create_needs_its_context_s_chunk_of_resource_ids() {
     guest.send(&device, texture_create(obj(3, 4), 0));
     guest.send(&device, event_create(obj(3, 5)));
     assert_eq!(
-        carried_out(&mut guest),
+        carried_out(&mut guest, 3),
         2,
         "the texture in the chunk, and the event"
     );
@@ -507,10 +506,10 @@ fn a_texture_create_needs_its_context_s_chunk_of_resource_ids() {
     );
     assert_eq!(device.decoder_object_count(), 0);
     guest.send(&device, texture_create(obj(4, 1), first));
-    assert_eq!(carried_out(&mut guest), 0, "the closed context's chunk");
+    assert_eq!(carried_out(&mut guest, 4), 0, "the closed context's chunk");
     guest.send(&device, resource_id_chunk(4, 7));
     guest.send(&device, texture_create(obj(4, 1), first));
-    assert_eq!(carried_out(&mut guest), 1, "the chunk given again");
+    assert_eq!(carried_out(&mut guest, 4), 1, "the chunk given again");
 }
 
 /// A command buffer on a queue is decoded and committed once ring 0 has carried out what was
@@ -689,6 +688,18 @@ fn answered(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, command: V
     assert_eq!(complete.header.r#type, RGFX_EVT_COMPLETE);
     assert_eq!(complete.header.seqno, guest.seqno);
     complete.status
+}
+
+/// Waits for every ring-0 message of `context`'s sent before it to be carried out, as the guest's
+/// process knows its messages done: by an answer of its own context's, which the context's lane
+/// gives after them. A lookup of a library key no library has, which makes nothing.
+fn carried_out_of(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, context: u32) {
+    let lookup = library_lookup(obj(context, 0xfff), 0, [0xee; 32]);
+    assert_ne!(
+        answered(device, guest, lookup),
+        RGFX_STATUS_OK,
+        "a lookup's miss"
+    );
 }
 
 /// A stand-in guest driving one command queue's own submission and completion rings, at the region
@@ -1132,7 +1143,7 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
 
 /// A raise may call the device at once, as the header lets it, wherever it comes from: at a
 /// command buffer's `CB_SUBMITTED` posted on its queue's thread and on a doorbell's thread, and at
-/// a present the host answers at once with no window, under the presents' queue. Its `STATUS` read, its doorbell through `mmio_write_taking` and its reset each
+/// a present the host answers at once with no window, on the presents' lane. Its `STATUS` read, its doorbell through `mmio_write_taking` and its reset each
 /// return, and the device is reset
 #[test]
 fn a_raise_may_call_the_device_at_once() {
@@ -1204,7 +1215,7 @@ fn a_raise_may_call_the_device_at_once() {
     assert_eq!(returned.lock().first(), Some(&here));
     reset(&device);
 
-    // On the control thread, at a present of the scanout, which the host shows and answers at once.
+    // On the presents' lane, at a present of the scanout, which the host shows and answers at once.
     let (device, returned, mut guest, _ring) = started();
     // SAFETY: as `Guest`'s helpers; `armed` is at 0xc0 of the control completion ring.
     unsafe {
@@ -1219,7 +1230,7 @@ fn a_raise_may_call_the_device_at_once() {
     guest.send(&device, present_surface(0));
     assert_eq!(
         returned_on(&returned).as_deref(),
-        Some("reims-vgpu.graphics-control")
+        Some("reims-vgpu.graphics-presents")
     );
     reset(&device);
 }
@@ -1673,18 +1684,8 @@ fn a_destroy_of_a_pending_pipeline_cancels_it() {
     device.control.pool.hold();
     guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
     guest.send(&device, object_destroy(obj(1, 11)));
-    // The destroy is carried out before the GET_DISPLAYS after it is answered.
-    guest.send(
-        &device,
-        RgfxMsgHeader {
-            r#type: RGFX_CMD_GET_DISPLAYS,
-            size: 0,
-            seqno: 0,
-        }
-        .as_bytes()
-        .to_vec(),
-    );
-    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    // The destroy is carried out before a lookup of its context's after it is answered.
+    carried_out_of(&device, &mut guest, 1);
     device.control.pool.release();
     next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
     assert_eq!(device.decoder_object_count(), 1);
@@ -2061,16 +2062,13 @@ fn ring_0_is_carried_out_while_a_walk_is_in_flight() {
     ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
     assert!(gate.reached(), "the walk did not start");
     // With the walk stopped: a create answered, and the walked sampler's destroy carried out
-    // (the close of a context with nothing behind it is answered once it is).
+    // (a lookup of its context's is answered once it is).
     assert_eq!(
         sampler_answered(&device, &mut guest, obj(1, 5)),
         RGFX_STATUS_OK
     );
     guest.send(&device, object_destroy(obj(1, 4)));
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 1);
     assert_eq!(
         device.decoder_object_count(),
         2,
@@ -2883,17 +2881,7 @@ fn a_pipeline_naming_a_pending_library_waits_for_it() {
     guest.send(&device, library_create(obj(1, 10)));
     guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
     let pipeline = guest.seqno;
-    guest.send(
-        &device,
-        RgfxMsgHeader {
-            r#type: RGFX_CMD_GET_DISPLAYS,
-            size: 0,
-            seqno: 0,
-        }
-        .as_bytes()
-        .to_vec(),
-    );
-    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    carried_out_of(&device, &mut guest, 1);
     assert_eq!(library_makes(&platform), 0);
 
     device.control.pool.release();
@@ -2926,21 +2914,12 @@ fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
     guest.send(&device, object_destroy(obj(1, 10)));
     // A pipeline create after the destroy names no library.
     guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 10)));
-    guest.send(
-        &device,
-        RgfxMsgHeader {
-            r#type: RGFX_CMD_GET_DISPLAYS,
-            size: 0,
-            seqno: 0,
-        }
-        .as_bytes()
-        .to_vec(),
-    );
+    guest.send(&device, library_lookup(obj(1, 0xfff), 0, [0xee; 32]));
     let refused = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
     let refused = RgfxPipelineReflection::read_from_bytes(&refused).unwrap();
     assert_eq!(refused.obj_id, obj(1, 12));
     assert_eq!(refused.status, RGFX_PIPELINE_REFUSED);
-    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    next_event(&mut guest, RGFX_EVT_COMPLETE);
     device.control.pool.release();
     let got = events(&mut guest, 2);
     let reflection = got
@@ -3439,7 +3418,7 @@ fn a_library_chunk_is_checked_against_its_sender_s_blocks() {
         .as_bytes()
         .to_vec()
     };
-    // The control thread's last message is process 2's (refused: its block is not process 2's).
+    // Ring 0's message before it is process 2's (refused: its block is not process 2's).
     guest.send(&device, buffer_over_host_memory(obj(2, 1), BLOCK, 0x1000));
     assert_eq!(
         answered(&device, &mut guest, chunk(obj(1, 10))),
@@ -3609,11 +3588,11 @@ fn a_compile_the_platform_refuses_is_a_refused_reflection() {
     assert_eq!(device.decoder_object_count(), 3);
 }
 
-/// With no compile thread, a create's compile runs on the control thread, where the platform
+/// With no compile thread, a create's compile runs on its context's lane, where the platform
 /// ending the process refuses it as on the pool: the reflection or the `COMPLETE` is refused, and
 /// the next creates are made
 #[test]
-fn a_create_compiled_on_the_control_thread_the_platform_refuses_is_refused() {
+fn a_create_compiled_on_its_lane_the_platform_refuses_is_refused() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     device.control.pool.stop();
@@ -3731,10 +3710,7 @@ fn a_create_the_platform_refuses_makes_nothing() {
         &device,
         heap_texture_create(obj(3, 5), first + 2, obj(3, 9), 0x1000),
     );
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(
         device.decoder_object_count(),
         1,
@@ -3746,10 +3722,7 @@ fn a_create_the_platform_refuses_makes_nothing() {
         &device,
         heap_texture_create(obj(3, 6), first + 3, obj(3, 9), 0x1000),
     );
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(
         device.decoder_object_count(),
         4,
@@ -3811,19 +3784,13 @@ fn a_view_the_platform_refuses_makes_nothing() {
         &device,
         texture_view(obj(3, 2), obj(3, 1), first + 1, 80, (3, 1), (0, 1)),
     );
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(device.decoder_object_count(), 1, "the view refused");
     guest.send(
         &device,
         texture_view(obj(3, 3), obj(3, 1), first + 2, 81, (0, 1), (0, 1)),
     );
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(
         device.decoder_object_count(),
         2,
@@ -4414,10 +4381,7 @@ fn a_completion_the_platform_refuses_fails_its_context() {
             .len(),
         0
     );
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(
         device.decoder_object_count(),
         3,
@@ -4432,10 +4396,7 @@ fn a_completion_the_platform_refuses_fails_its_context() {
 
     // The failed context's destroys are carried out.
     guest.send(&device, object_destroy(obj(3, 5)));
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(device.decoder_object_count(), 2, "the event destroyed");
 
     // Closed, the context's number is fresh: the next process given it runs its work.
@@ -4476,10 +4437,7 @@ fn a_release_the_platform_dies_at_is_refused() {
     for n in 1..=3 {
         guest.send(&device, event_create(obj(3, n)));
     }
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     let events: Vec<ObjId> = (world.live("MTLEvent").into_iter())
         .filter(|id| !before.contains(id))
         .collect();
@@ -4489,10 +4447,7 @@ fn a_release_the_platform_dies_at_is_refused() {
     // At a destroy.
     world.die_at_release(events[0]);
     guest.send(&device, object_destroy(obj(3, 1)));
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(device.decoder_object_count(), 2, "the destroy carried out");
 
     // At the close: the context's other objects go all the same.
@@ -4505,10 +4460,7 @@ fn a_release_the_platform_dies_at_is_refused() {
 
     // The device goes on.
     guest.send(&device, event_create(obj(3, 4)));
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
+    carried_out_of(&device, &mut guest, 3);
     assert_eq!(device.decoder_object_count(), 1);
 }
 
@@ -5259,18 +5211,9 @@ fn a_library_made_across_a_reset_is_not_in_the_new_device_s_cache() {
     guest.send(&device, event_create(obj(1, 5)));
     device.control.pool.hold();
     guest.send(&device, keyed_library_create(obj(1, 10), &bytes, Some(key)));
-    // Ring order: once GET_DISPLAYS is answered, the create is on the compile pool, held.
-    guest.send(
-        &device,
-        RgfxMsgHeader {
-            r#type: RGFX_CMD_GET_DISPLAYS,
-            size: 0,
-            seqno: 0,
-        }
-        .as_bytes()
-        .to_vec(),
-    );
-    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    // Its context's order: once a lookup of its context's is answered, the create is on the
+    // compile pool, held.
+    carried_out_of(&device, &mut guest, 1);
     assert_eq!(device.decoder_object_count(), 1);
 
     device.reset();
@@ -5612,7 +5555,7 @@ fn icb_create(obj_id: u64) -> Vec<u8> {
 }
 
 /// A display command behind an `ICB_CREATE` on ring 0 is answered while the buffer is made, off
-/// the control thread, and the create is answered at its seqno after
+/// ring 0's threads, and the create is answered at its seqno after
 #[test]
 fn a_display_command_behind_a_slow_icb_create_is_answered() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -5643,9 +5586,9 @@ fn a_display_command_behind_a_slow_icb_create_is_answered() {
 }
 
 /// An `OBJECT_DESTROY` of an indirect command buffer still being made (the kext's destroy behind
-/// a create it stopped waiting for) waits for the create, and the messages after it wait with it:
-/// the create is answered first, then the display command behind the destroy, and the buffer is
-/// not kept
+/// a create it stopped waiting for) waits for the create, and its context's messages after it wait
+/// with it: the create is answered first, then the context's lookup behind the destroy, and the
+/// buffer is not kept
 #[test]
 fn a_destroy_of_an_icb_being_made_waits_for_its_create() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -5656,18 +5599,9 @@ fn a_destroy_of_an_icb_being_made_waits_for_its_create() {
     guest.send(&device, icb_create(obj(1, 50)));
     let create = guest.seqno;
     guest.send(&device, object_destroy(obj(1, 50)));
-    guest.send(
-        &device,
-        RgfxMsgHeader {
-            r#type: RGFX_CMD_GET_DISPLAYS,
-            size: 0,
-            seqno: 0,
-        }
-        .as_bytes()
-        .to_vec(),
-    );
-    let displays = guest.seqno;
-    // The worker goes on a while later, from another thread: the display command behind the
+    guest.send(&device, library_lookup(obj(1, 0xfff), 0, [0xee; 32]));
+    let lookup = guest.seqno;
+    // The worker goes on a while later, from another thread: the context's lookup behind the
     // destroy is not answered before the create.
     let control = Arc::clone(&device.control);
     let opener = std::thread::Builder::new()
@@ -5679,9 +5613,9 @@ fn a_destroy_of_an_icb_being_made_waits_for_its_create() {
     let bytes = next_event(&mut guest, RGFX_EVT_ICB_STATE);
     let state = RgfxIcbState::read_from_bytes(&bytes).unwrap();
     assert_eq!((state.header.seqno, state.status), (create, RGFX_STATUS_OK));
-    let bytes = next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    let bytes = next_event(&mut guest, RGFX_EVT_COMPLETE);
     let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
-    assert_eq!(header.seqno, displays);
+    assert_eq!(header.seqno, lookup);
     opener.join().unwrap();
     assert_eq!(device.decoder_object_count(), before);
 }
@@ -5715,16 +5649,7 @@ fn a_create_reusing_a_pending_icb_s_id_after_its_destroy_keeps_its_object() {
         .as_bytes()
         .to_vec(),
     );
-    guest.send(
-        &device,
-        RgfxMsgHeader {
-            r#type: RGFX_CMD_GET_DISPLAYS,
-            size: 0,
-            seqno: 0,
-        }
-        .as_bytes()
-        .to_vec(),
-    );
+    guest.send(&device, library_lookup(obj(1, 0xfff), 0, [0xee; 32]));
     let control = Arc::clone(&device.control);
     let opener = std::thread::Builder::new()
         .spawn(move || {
@@ -5733,7 +5658,7 @@ fn a_create_reusing_a_pending_icb_s_id_after_its_destroy_keeps_its_object() {
         })
         .unwrap();
     next_event(&mut guest, RGFX_EVT_ICB_STATE);
-    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    next_event(&mut guest, RGFX_EVT_COMPLETE);
     opener.join().unwrap();
     let calls = platform.call_log().calls();
     let icb = calls
@@ -5871,7 +5796,7 @@ fn complete_of(bytes: &[u8]) -> (u64, u32) {
     (complete.header.seqno, complete.status)
 }
 
-/// A `SURFACE_PAGES`' view is made off the control thread: while it is being made, ring 0 goes
+/// A `SURFACE_PAGES`' view is made off ring 0's threads: while it is being made, ring 0 goes
 /// on with a message that does not name the block, and holds the messages that do, a
 /// `BUFFER_OVER_SURFACE_PAGES` and an `OBJECT_DESTROY` of its buffer posted right after it, and
 /// the block's `BLOCK_RELEASE`. Each is then carried out as right after the `SURFACE_PAGES`,
@@ -5899,7 +5824,7 @@ fn a_surface_s_view_is_made_off_ring_0_and_the_messages_naming_it_wait_for_it() 
     assert_eq!(
         device.decoder_object_count(),
         1,
-        "the messages naming the block wait for its view, and ring 0 behind them"
+        "the messages naming the block wait for its view, and their context's behind them"
     );
     let buffers = |sels: &[&str]| {
         sels.iter()
@@ -5981,11 +5906,11 @@ fn buffer_over_pages(obj_id: u64, length: u64) -> Vec<u8> {
     .to_vec()
 }
 
-/// A pages block's view, which its first `BUFFER_OVER_PAGES` makes, is made off the control
-/// thread: while it is being made, ring 0 goes on with another context's message, and holds the
-/// buffer's context's next messages, an object's create and the buffer's destroy, and the
-/// block's `BLOCK_RELEASE`. Each is then carried out as right after the buffer: the view and the
-/// buffer are made first, then the create, the destroy and the release, which is answered
+/// A pages block's view, which its first `BUFFER_OVER_PAGES` makes, is made off ring 0's threads:
+/// while it is being made, ring 0 goes on with another context's messages, before and after the
+/// buffer's context's next messages, an object's create and the buffer's destroy, and the block's
+/// `BLOCK_RELEASE`, which wait for it. Each is then carried out as right after the buffer: the view
+/// and the buffer are made first, then the create, the destroy and the release, which is answered
 #[test]
 fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
     let (device, platform, _ram, page) = surface_device(8);
@@ -6016,11 +5941,15 @@ fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
     guest.send(&device, block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
     let release_seqno = guest.seqno;
     guest.send(&device, event_create(obj(2, 13)));
+    assert!(
+        objects_become(&device, 2),
+        "ring 0 went on with the other context"
+    );
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(
         device.decoder_object_count(),
-        1,
-        "the buffer's context waits for its view, and ring 0 behind it"
+        2,
+        "the buffer's context waits for its view, and no other context"
     );
     let buffers = |sels: &[&str]| {
         sels.iter()

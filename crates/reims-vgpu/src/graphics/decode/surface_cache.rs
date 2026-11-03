@@ -73,7 +73,8 @@ use super::refusing;
 use super::surface_pages::{SurfaceView, buffer_over};
 use crate::device_writes::{self, Watcher};
 
-/// The copies run under a live raise handler (the ring loop's, or the control thread's entry).
+/// The copies run under a live raise handler (the ring loop's, or the entry of the ring-0 thread
+/// that asks for them).
 const ON: OnFault = OnFault::Return;
 
 /// `MTLResourceStorageModePrivate`, in `MTLResourceOptions`.
@@ -253,7 +254,7 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     pending: HashMap<u64, Users>,
     /// By block: the fills of its cache waiting for those command buffers to finish.
     filling: HashMap<u64, usize>,
-    /// By block: the copies out of its cache asked of the control thread (a download, a release)
+    /// By block: the copies out of its cache asked on ring 0 (a download, a release)
     /// that wait for the command buffers that may write it begun before each was asked, in the
     /// order they were asked ([`Caches::after_writers`]).
     deferred: HashMap<u64, VecDeque<Deferred<P>>>,
@@ -797,12 +798,13 @@ impl<P: Platform> SurfaceCaches<P> {
 ///   command buffer begun and not finished that uses the cache, and a later command buffer's use
 ///   of the cache waits for a fill waiting so, so fills are not held off for good.
 /// - **A copy out of a cache** (a download, a release, the block's pages named again) waits for
-///   every one of them that may write it. A download and a release, which the control thread
-///   asks for and are answered when their copy is done, do not wait there: each is made in the
+///   every one of them that may write it. A download and a release, which ring 0 asks for (a
+///   download on the control thread, a release on its context's lane) and are answered when
+///   their copy is done, do not wait there: each is made in the
 ///   finish of the last buffer that may write the cache begun before it was asked
 ///   ([`Caches::after_writers`]), in the order they were asked, and a command buffer begun after
 ///   it waits at its begin until it is made. The block's pages named again, which the buffers
-///   over the block made on the control thread after it lie over, waits there.
+///   over the block made on ring 0 after it lie over, waits there.
 ///
 /// So a copy comes before or after each such buffer's whole use, as under one lock, and the
 /// queues' end events order it on the GPU after the buffers committed before it
@@ -1071,8 +1073,8 @@ impl<P: Platform> Caches<P> {
     /// the block at `block`'s cache has finished, after the copies out of it asked before: here
     /// where none is, else in the last one's finish, on its thread, waiting for nothing here. A
     /// command buffer begun meanwhile that uses the cache waits at its begin until `op` has run
-    /// ([`Self::before`]), as one begun after the copy, which the control thread made before
-    /// going on, waited for it.
+    /// ([`Self::before`]), as one begun after the copy, which the ring-0 thread that asked for it
+    /// made before going on, waited for it.
     fn after_writers(&self, block: u64, op: CopyOut<P>) {
         let mut state = self.state.lock();
         state.after_writers(block, op);

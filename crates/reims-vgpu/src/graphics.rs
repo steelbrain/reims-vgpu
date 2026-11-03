@@ -109,8 +109,10 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
 /// A graphics device's callbacks. `scanout_written` is called on the device's refresh thread
 /// (`reims-vgpu.graphics-refresh`), and `raise_interrupt` on the thread that posts the event it
-/// raises for: the device's control thread (`reims-vgpu.graphics-control`), its refresh thread, a
-/// command queue's service thread (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
+/// raises for: the device's control thread (`reims-vgpu.graphics-control`), a lane that carries
+/// out a guest process's control messages (`reims-vgpu.graphics-context-<n>`) or its presents
+/// (`reims-vgpu.graphics-presents`), its refresh thread, a command queue's service thread
+/// (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
 /// scheduled or completed handler; or the host's own, inside [`GraphicsDevice::mmio_write_taking`].
 /// Each is called never inside another call of the host's into the device, and with no lock held
@@ -390,12 +392,12 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
 }
 
 /// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`], which
-/// feeds it ring 0's object lifecycle on the control thread and the command queues' own rings'
-/// messages on their service threads. Each message is carried out on a decoder of its own over the
-/// shared state ([`Decoders::sender`]), whose locks are each held for a short section
-/// (`decode`'s module doc): no thread holds one across a command buffer's walk, so a walk holds up
-/// neither ring 0 nor another queue. A command buffer's completion, which runs on a GPU thread of
-/// its own, never touches the decoder: it only posts through the queue's poster.
+/// feeds it ring 0's object lifecycle on each context's lane (`reims-graphics`' device) and the
+/// command queues' own rings' messages on their service threads. Each message is carried out on a
+/// decoder of its own over the shared state ([`Decoders::sender`]), whose locks are each held for a
+/// short section (`decode`'s module doc): no thread holds one across a command buffer's walk, so a
+/// walk holds up neither ring 0 nor another queue. A command buffer's completion, which runs on a
+/// GPU thread of its own, never touches the decoder: it only posts through the queue's poster.
 struct GraphicsControl<P: ApiPlatform> {
     /// The decoder's state, which each message's decoder is made over, and which a doorbell's
     /// thread's answer reads with no decoder made ([`Self::answer_command_buffer`]).
@@ -412,10 +414,10 @@ struct GraphicsControl<P: ApiPlatform> {
     pending: Pending,
     /// The device's region, where an `ICB_SLOTS` names the slots whose pipelines it waits for.
     region: Arc<Region>,
-    /// The thread ring 0's `ICB_CREATE`s are made on, in ring order, off the control thread: the
-    /// platform's make of a large buffer can take seconds (measured: about 24 s near 11.7 million
-    /// commands on the Vulkan runtime on an RTX 5080), which would hold every process's control
-    /// messages ([`Self::start_icb`]).
+    /// The thread ring 0's `ICB_CREATE`s are made on, in the order their lanes hand them over, off
+    /// the lanes: the platform's make of a large buffer can take seconds (measured: about 24 s
+    /// near 11.7 million commands on the Vulkan runtime on an RTX 5080), which would hold the
+    /// process's later control messages ([`Self::start_icb`]).
     icb_worker: Worker,
     /// The indirect command buffers whose create was handed to [`Self::icb_worker`] and is not
     /// yet answered, by object id.
@@ -428,13 +430,14 @@ struct GraphicsControl<P: ApiPlatform> {
     /// (`Host::context_refused`).
     failed: Arc<FailedContexts>,
     /// What the device's reset waits for ([`Self::reset`]): held shared by each message carried
-    /// out off the control thread, a queue's command buffer, create or destroy, from before it
+    /// out off ring 0's threads, a queue's command buffer, create or destroy, from before it
     /// asks whether its poster is stale to its end, by each compile's and library make's store,
     /// and by each `SURFACE_PAGES` the surface worker carries out ([`Self::start_surface_pages`]);
     /// held alone by the reset. So a reset comes after everything of the guest's that
     /// began before it, as under one lock over the decoder, and whatever begins after it finds
-    /// its poster stale (or its compile cancelled), and none of it outlives the reset. The control
-    /// thread's own messages are carried out in order with the reset, on its thread.
+    /// its poster stale (or its compile cancelled), and none of it outlives the reset. Ring 0's
+    /// own messages are carried out in order with the reset: the device tells the host of it, on
+    /// its control thread, once every message a lane began before it has returned.
     reset_gate: Arc<RwLock<()>>,
 }
 
@@ -677,7 +680,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // No buffer lies over the block's surface view any more: it goes with the block, and its
         // device cache once the surface's pages hold what was written of it, which the answer
         // waits for. The copy is made once the buffers still walked that may write the cache
-        // have finished, on the last one's thread: the control thread goes on.
+        // have finished, on the last one's thread: the context's lane goes on.
         let held = Arc::clone(&drain);
         let unread = release.flags & RGFX_BLOCK_RELEASE_NO_CLIENT != 0;
         let offset = release.offset;
@@ -1092,7 +1095,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         })
     }
 
-    /// A pipeline create from ring 0: prepared here, on the control thread, with the decoder's
+    /// A pipeline create from ring 0: prepared here, on its context's lane, with the decoder's
     /// table (a malformed create or one naming no library is refused here, unanswered, as the
     /// decoder refuses it), marked pending, and compiled on the compile pool, so ring 0 goes on
     /// meanwhile; its reply goes through `poster` when the compile ends ([`Self::compile`]).
@@ -1382,7 +1385,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// A library create from ring 0 (a `LIBRARY_CREATE`, or a `LIBRARY_FROM_REGION` chunk):
-    /// prepared here, on the control thread, with the decoder's table (a malformed message is
+    /// prepared here, on its context's lane, with the decoder's table (a malformed message is
     /// refused here, as the decoder refuses it, and answered where the guest waits), then made on
     /// the compile pool ([`Self::make`]), so ring 0 goes on meanwhile.
     fn start_library(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
@@ -1529,6 +1532,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         self.control
             .present_surface(iosurface_id, generation, answer);
+    }
+
+    fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {
+        self.control.decoder().surface_textures(iosurface_id)
     }
 
     fn refreshed(&self) {

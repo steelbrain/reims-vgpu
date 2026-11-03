@@ -26,7 +26,7 @@
 //! download waits for the buffers that used the surface's device cache before it was taken, so a
 //! buffer posted after it that writes the surface, but taken before it, is among them, as one
 //! posted before it is: the guest writes a surface a CPU lock holds only racing the lock
-//! (`a_command_buffer_is_handed_over_before_a_download_published_ahead_of_it`). Every
+//! (`a_command_buffer_is_handed_over_while_a_download_published_ahead_of_it_is_carried_out`). Every
 //! buffer waits for a message of any other type, and for one too short to hold its field: the
 //! host refuses either, and the order is as it was.
 //!
@@ -113,13 +113,14 @@ impl Backlog {
     }
 
     /// Reads what the guest published on ring 0 since the last look, at most `most` messages of
-    /// it, the control thread having carried out what lies before count `done`; false where
-    /// `most` were read and more are left, which a look after it reads on.
+    /// it, `done` answering whether every message of a context through a count is carried out
+    /// (by the control thread, or by the context's lane); false where `most` were read and more
+    /// are left, which a look after it reads on.
     pub(super) fn read(
         &mut self,
         consumer: &Consumer,
         region: &Region,
-        done: u64,
+        done: impl Fn(u32, u64) -> bool,
         most: usize,
     ) -> bool {
         let walked = consumer.walk_published(region, self.read, most, |through, r#type, field| {
@@ -131,7 +132,8 @@ impl Backlog {
             );
         });
         if self.last.len() > KEEP {
-            self.last.retain(|_, through| *through > done);
+            self.last
+                .retain(|&context, through| !done(context, *through));
         }
         match walked {
             Walked::All(through) => self.read = through,
@@ -147,11 +149,17 @@ impl Backlog {
         true
     }
 
-    /// The count a command buffer of `context` waits for the control thread to carry out: through
-    /// the last message read of its context's or of every buffer's.
+    /// The count a command buffer of `context` waits for the control thread to carry out or hand
+    /// to the context's lane: through the last message read of its context's or of every
+    /// buffer's.
     pub(super) fn waits_for(&self, context: u32) -> u64 {
-        let own = self.last.get(&context).copied().unwrap_or(0);
-        own.max(self.every)
+        self.own(context).max(self.every)
+    }
+
+    /// The count through the last message read of `context`'s, which a command buffer of the
+    /// context waits for its lane to carry out; 0 for none.
+    pub(super) fn own(&self, context: u32) -> u64 {
+        self.last.get(&context).copied().unwrap_or(0)
     }
 
     /// The control thread took `message`, through count `through`: read here where no look

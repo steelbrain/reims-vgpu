@@ -1,17 +1,17 @@
-//! Ring-0 work carried out off the control thread, answered later, while the later messages that
+//! Ring-0 work carried out off ring 0's threads, answered later, while the later messages that
 //! name its object wait for it: a [`Worker`] thread that runs the jobs in the order they are
 //! handed over, and the [`Unsettled`] keys (a block's offset, an object's id) whose job is not
 //! yet done.
 //!
-//! The control thread begins the key's [`Settle`] in ring order and hands the job over; the job
-//! carries the work out, posts the message's answer, then drops the settle, so a message that
-//! waited for the key is answered after it. A message that names the key, on ring 0 or a queue's
-//! ring, waits for it first ([`Unsettled::wait`]), holding no lock the job takes; a thread that
-//! waits for nothing (a doorbell's) asks instead ([`Unsettled::try_any`]) and leaves the message
-//! to a thread that may. A job takes `GraphicsControl`'s reset gate shared, recursively, as a queue
-//! that holds it may be waiting for the key while the reset waits for the gate, and carries
-//! nothing out where the device was reset since its begin (the caller's count of resets, kept in
-//! the settle).
+//! The ring-0 thread that carries the message out (its context's lane) begins the key's [`Settle`]
+//! in its context's ring order and hands the job over; the job carries the work out, posts the
+//! message's answer, then drops the settle, so a message that waited for the key is answered after
+//! it. A message that names the key, on ring 0 or a queue's ring, waits for it first
+//! ([`Unsettled::wait`]), holding no lock the job takes; a thread that waits for nothing (a
+//! doorbell's) asks instead ([`Unsettled::try_any`]) and leaves the message to a thread that may. A
+//! job takes `GraphicsControl`'s reset gate shared, recursively, as a queue that holds it may be
+//! waiting for the key while the reset waits for the gate, and carries nothing out where the device
+//! was reset since its begin (the caller's count of resets, kept in the settle).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

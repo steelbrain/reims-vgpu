@@ -2,7 +2,7 @@
 //! device's cache of the libraries it made, by content key.
 //!
 //! **Creates.** `LIBRARY_CREATE`, and the last chunk of a `LIBRARY_FROM_REGION` library, are
-//! prepared on the control thread ([`GraphicsDecoder::prepare_library`]): the message is read and
+//! prepared on its context's lane ([`GraphicsDecoder::prepare_library`]): the message is read and
 //! its bytes copied out, so every refusal of the message is at its op, and the library is marked
 //! being made. The library is then made with no lock held ([`make_library`]), on a compile thread
 //! where the host has one, and stored ([`GraphicsDecoder::finish_library`]). Each create is
@@ -538,7 +538,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         (Some(m.header.seqno), RGFX_STATUS_OK)
     }
 
-    /// The first step of a `LIBRARY_CREATE` or `LIBRARY_FROM_REGION`, on the control thread: the
+    /// The first step of a `LIBRARY_CREATE` or `LIBRARY_FROM_REGION`, on its context's lane: the
     /// message read and its bytes copied out (a chunk's acked), each refusal here at its op as
     /// [`Self::decode`]'s; a library's last bytes are marked being made, so pipeline creates that
     /// name it wait for it ([`LibraryRef`]).

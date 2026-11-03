@@ -9,7 +9,7 @@
 //! The guest's RAM is what QEMU gives the device: on Linux a shared mapping of a memfd, whose file
 //! the platform's lease registers; on macOS anonymous memory. Each surface is fresh pages, as a
 //! browser's are: its runs are slots of the RAM picked at random, so no two surfaces name the same
-//! runs and the cache of views takes none. Each step is timed as the control thread carries it
+//! runs and the cache of views takes none. Each step is timed as ring 0's thread carries it
 //! out:
 //! - `SURFACE_PAGES`: the view (a range mapping of the runs) and the buffer over all of it, which
 //!   holds the runtime's import; for a cached block also the device cache;
@@ -309,7 +309,7 @@ fn measure<P: ApiPlatform>(label: &str) {
             eprintln!("{label}: {} skipped: the RAM is too small", case.name);
             continue;
         }
-        // Through the decoder, as the control thread carries the messages out.
+        // Through the decoder, as ring 0's thread carries the messages out.
         for cached in [false, true] {
             let mut steps: [Step; 4] = Default::default();
             let mut refused = 0u64;

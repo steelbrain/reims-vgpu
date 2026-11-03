@@ -264,6 +264,18 @@ impl Rig {
         (c.header.seqno, c.status)
     }
 
+    /// Waits about 2 s for the lanes to have carried out every message handed to them: a message
+    /// of one context's answered says nothing of another's.
+    fn lanes_done(&self) {
+        for _ in 0..2000 {
+            if self.device.shared.lanes.idle() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the lanes never carried out what they were handed");
+    }
+
     fn arm(&self) {
         self.region()
             .atomic_u32(RGFX_CONTROL_COMPLETE_OFFSET + 0xc0)
@@ -971,6 +983,9 @@ impl Host for QueueTestHost {
     }
     fn surface_download(&self, _block_offset: u64, answer: crate::device::CompleteAnswer) {
         self.handed.lock().push(RGFX_CMD_SURFACE_DOWNLOAD);
+        while !self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         answer.answer(RGFX_STATUS_OK);
     }
     fn stage3_message(&self, completion: &crate::device::CompletionPoster, message: &[u8]) {
@@ -1249,6 +1264,10 @@ fn a_queue_s_rings_lie_in_its_process_s_blocks() {
         rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 3, ring, span));
     }
     refused(&mut rig, "another process's blocks");
+    // The grants to the other process are carried out on its lane: the kext grants a block
+    // another process holds only once that process's release of it is answered, so they come
+    // before the grant below.
+    rig.lanes_done();
     // Its own submission ring, and another's completion ring.
     rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 5, QUEUE_SUBMIT, span));
     refused(&mut rig, "the completion ring in another's block");
@@ -1441,9 +1460,11 @@ fn a_block_grant_is_kept_in_the_blocks_or_the_scanout() {
     for (context, offset, size) in grants {
         rig.send(block_message(RGFX_CMD_BLOCK_GRANT, context, offset, size));
     }
-    // A grant is not answered: the close after them is, once the ring has taken them.
+    // A grant is not answered: the close after them is, once the ring has taken them, and their
+    // lanes then carry them out.
     let seqno = rig.send(context_close(99));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.lanes_done();
 
     let region = rig.region();
     assert!(region.held_by(5, SCANOUT, 0x87_0000));
@@ -1459,6 +1480,7 @@ fn a_block_grant_is_kept_in_the_blocks_or_the_scanout() {
     rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 10, SCANOUT, 0x87_0000));
     let seqno = rig.send(context_close(99));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.lanes_done();
     assert!(rig.region().held_by(10, SCANOUT, 0x87_0000));
     assert!(!rig.region().held_by(5, SCANOUT, 0x1000));
 
@@ -1488,6 +1510,7 @@ fn a_shared_block_is_held_by_each_context_it_is_shared_with() {
     rig.send(block_message(RGFX_CMD_BLOCK_SHARE, 7, SCANOUT, 0x1000));
     let seqno = rig.send(context_close(99));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.lanes_done();
     let region = rig.region();
     assert!(region.held_by(5, BLOCK, 0x2_0000));
     assert!(region.held_by(6, BLOCK + 0x1_0000, 0x1_0000));
@@ -1496,6 +1519,7 @@ fn a_shared_block_is_held_by_each_context_it_is_shared_with() {
     rig.send(block_message(RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK, 0x2_0000));
     let seqno = rig.send(context_close(99));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.lanes_done();
     assert!(!rig.region().held_by(5, BLOCK, 0x1000));
     assert!(rig.region().held_by(6, BLOCK, 0x1000));
 
@@ -1594,10 +1618,12 @@ fn a_command_buffer_waits_for_no_other_process_s_creates() {
     seen.gate.store(true, Ordering::SeqCst);
 }
 
-/// A command buffer waits for its own process's messages on ring 0, and so for every message
-/// before them: its process's create behind another's the control thread is still in holds it up.
+/// A process's ring-0 messages and command buffers go on while another process's create is
+/// carried out: each context's messages are carried out on its own lane, so the other process's
+/// create holds up only that process's later messages. The command buffer still waits for its
+/// own process's create before it.
 #[test]
-fn a_command_buffer_waits_for_its_process_s_creates_behind_another_s() {
+fn a_process_s_messages_go_on_while_another_s_create_is_carried_out() {
     let seen = QueueTestSeen::new();
     let mut rig = Rig::with_host(seen.host());
     rig.start();
@@ -1614,15 +1640,12 @@ fn a_command_buffer_waits_for_its_process_s_creates_behind_another_s() {
     });
     rig.send(object_message(RGFX_CMD_SAMPLER_CREATE, QUEUE + 1));
     publish_command_buffer(&rig, QUEUE, 100, 1, true);
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(
-        *seen.handed.lock(),
-        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE],
-        "the command buffer ran before its process's create"
-    );
+    let done = first_queue_completion(&rig);
     seen.gate.store(true, Ordering::SeqCst);
-    let done = first_queue_completion(&rig).expect("the command buffer completed");
-    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(
+        done.expect("held up by another process's create").cb_obj_id,
+        100
+    );
     assert_eq!(
         *seen.handed.lock(),
         vec![
@@ -1681,27 +1704,21 @@ fn a_command_buffer_waits_for_no_other_process_s_later_object_messages() {
     }
 }
 
-/// A command buffer waits for no `SURFACE_DOWNLOAD`: one published after a download, behind another
-/// process's create the control thread is still in, is handed to the host before the download.
-/// So a buffer that writes the surface and is taken first is among the users the download waits
-/// for, as one published before it is; only a guest that writes a surface while racing its CPU
-/// lock of it can tell.
+/// A command buffer waits for no `SURFACE_DOWNLOAD`: one published after a download the host is
+/// still carrying out is handed to the host meanwhile. So a buffer that writes the surface and is
+/// taken first is among the users the download waits for, as one published before it is; only a
+/// guest that writes a surface while racing its CPU lock of it can tell.
 #[test]
-fn a_command_buffer_is_handed_over_before_a_download_published_ahead_of_it() {
+fn a_command_buffer_is_handed_over_while_a_download_published_ahead_of_it_is_carried_out() {
     let seen = QueueTestSeen::new();
     let mut rig = Rig::with_host(seen.host());
     rig.start();
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
-    const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
     let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     wait_queue_idle(&rig);
 
     seen.gate.store(false, Ordering::SeqCst);
-    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
-    seen.wait("the buffer create never reached the host", |seen| {
-        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
-    });
     rig.send(
         RgfxSurfaceDownload {
             header: RgfxMsgHeader {
@@ -1714,29 +1731,30 @@ fn a_command_buffer_is_handed_over_before_a_download_published_ahead_of_it() {
         .as_bytes()
         .to_vec(),
     );
-    publish_command_buffer(&rig, QUEUE, 100, 1, true);
-    let done = first_queue_completion(&rig).expect("held up by the download");
-    assert_eq!(done.cb_obj_id, 100);
-    seen.gate.store(true, Ordering::SeqCst);
     seen.wait("the download never reached the host", |seen| {
         seen.handed.lock().last() == Some(&RGFX_CMD_SURFACE_DOWNLOAD)
     });
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    let done = first_queue_completion(&rig);
+    seen.gate.store(true, Ordering::SeqCst);
+    assert_eq!(done.expect("held up by the download").cb_obj_id, 100);
     assert_eq!(
         *seen.handed.lock(),
         vec![
             RGFX_CMD_QUEUE_CREATE,
-            RGFX_CMD_BUFFER_CREATE,
-            RGFX_CMD_COMMAND_BUFFER,
-            RGFX_CMD_SURFACE_DOWNLOAD
+            RGFX_CMD_SURFACE_DOWNLOAD,
+            RGFX_CMD_COMMAND_BUFFER
         ]
     );
 }
 
 /// Process B learns of process A's surface over IPC after A's messages were posted, which may be
-/// before ring 0 has carried them out: B's buffer waits for the share of the surface's block the
-/// kext posts for B's context before B learns of it, and so for A's messages before the share.
+/// before they are carried out: B's buffer waits for the share of the surface's block the kext
+/// posts for B's context before B learns of it, its own context's message, and not for A's
+/// messages before it. B's buffer names only B's objects, and what it reads of A's surface the
+/// host made at the surface's `SURFACE_PAGES`, which the kext waits for before it posts the share.
 #[test]
-fn a_command_buffer_waits_for_another_process_s_messages_before_its_share() {
+fn a_command_buffer_waits_for_its_share_of_another_process_s_surface_not_for_that_process() {
     let seen = QueueTestSeen::new();
     let mut rig = Rig::with_host(seen.host());
     rig.start();
@@ -1755,16 +1773,11 @@ fn a_command_buffer_waits_for_another_process_s_messages_before_its_share() {
     });
     rig.send(block_message(RGFX_CMD_BLOCK_SHARE, B, SURFACE, 0x1000));
     publish_command_buffer(&rig, QUEUE, 100, 1, true);
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(
-        *seen.handed.lock(),
-        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE],
-        "B's command buffer ran before the share of A's surface"
-    );
+    let done = first_queue_completion(&rig);
+    let shared = rig.region().held_by(B, SURFACE, 0x1000);
     seen.gate.store(true, Ordering::SeqCst);
-    let done = first_queue_completion(&rig).expect("the command buffer completed");
-    assert_eq!(done.cb_obj_id, 100);
-    assert!(rig.region().held_by(B, SURFACE, 0x1000));
+    assert_eq!(done.expect("held up by A's create").cb_obj_id, 100);
+    assert!(shared, "B's buffer ran before its share");
 }
 
 /// A reset wakes a command buffer's wait for the creates before it, though the control thread is
@@ -1795,16 +1808,16 @@ fn a_reset_wakes_a_command_buffer_waiting_for_the_creates_before_it() {
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     // The queue's thread holds the device's shared state while it lives; the device, its control
-    // thread and its refresh thread hold the rest.
+    // thread, its refresh thread and the context's lane, in the create, hold the rest.
     for _ in 0..2000 {
-        if Arc::strong_count(&rig.device.shared) == 3 {
+        if Arc::strong_count(&rig.device.shared) == 4 {
             break;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
         Arc::strong_count(&rig.device.shared),
-        3,
+        4,
         "the queue's thread still waits for ring 0 past a reset"
     );
     seen.gate.store(true, Ordering::SeqCst);
@@ -1840,7 +1853,8 @@ impl Host for ResetTellingHost {
 }
 
 /// A reset has the host drop what it made ([`Host::device_reset`]) once, on the control thread,
-/// before the thread hands it anything the guest published after the reset; the reset ends its
+/// before the host is handed anything the guest published after the reset (an object's create on
+/// its context's lane); the reset ends its
 /// queues, which hand the host no destroy of theirs, and no block is any process's, the scanout's
 /// span's among them.
 #[test]
@@ -1888,12 +1902,13 @@ fn a_reset_is_told_to_the_host_before_the_messages_after_it() {
     std::thread::sleep(Duration::from_millis(50));
     let control = Some("reims-vgpu.graphics-control".to_owned());
     let queue = Some(format!("reims-vgpu.graphics-queue-{QUEUE:#x}"));
+    let lane = Some("reims-vgpu.graphics-context-4".to_owned());
     assert_eq!(
         *seen.lock(),
         [
             (RGFX_CMD_QUEUE_CREATE, queue),
-            (RESET_TOLD, control.clone()),
-            (RGFX_CMD_EVENT_CREATE, control),
+            (RESET_TOLD, control),
+            (RGFX_CMD_EVENT_CREATE, lane),
         ]
     );
 }
@@ -2520,3 +2535,575 @@ fn a_taking_write_starts_and_resets_as_a_plain_one() {
 
 /// The wire round trip with a fake peer (`peer.rs`).
 mod peer;
+
+// ---------------------------------------------------------------------------------------------
+// Ring 0's lanes (`device::lanes`): what crosses contexts waits for the lanes it reads.
+
+/// What an [`OrderHost`] records, in the order it carries each out: a stage-3 message's type, a
+/// present (`PRESENT_SURFACE`), a block's release (`BLOCK_RELEASE`) and a context's close
+/// (`CONTEXT_CLOSE`), each with the count of the control completion ring's records published as
+/// it began; and its gate, open.
+#[derive(Default)]
+struct OrderSeen {
+    order: Arc<Mutex<Vec<(u32, u64)>>>,
+    gate: Arc<AtomicBool>,
+    named: Arc<Mutex<Vec<u64>>>,
+    region: Arc<OnceLock<Arc<Region>>>,
+}
+
+impl OrderSeen {
+    fn new() -> OrderSeen {
+        let seen = OrderSeen::default();
+        seen.gate.store(true, Ordering::SeqCst);
+        seen
+    }
+
+    /// A rig over an [`OrderHost`] of these, started.
+    fn rig(&self) -> Rig {
+        let host = OrderHost {
+            order: Arc::clone(&self.order),
+            gate: Arc::clone(&self.gate),
+            named: Arc::clone(&self.named),
+            region: Arc::clone(&self.region),
+        };
+        let rig = Rig::with_host(Box::new(host));
+        let _ = self.region.set(Arc::clone(&rig.device.shared.region));
+        rig.start();
+        rig
+    }
+
+    /// The types carried out so far, and the resets told ([`RESET_TOLD`]), with no held create's
+    /// end ([`HELD_ENDED`]).
+    fn types(&self) -> Vec<u32> {
+        (self.order.lock().iter())
+            .map(|&(t, _)| t)
+            .filter(|&t| t != HELD_ENDED)
+            .collect()
+    }
+
+    /// Waits about 2 s for `type` to be carried out `n` times.
+    fn wait_for(&self, r#type: u32, n: usize) {
+        for _ in 0..2000 {
+            if self.types().iter().filter(|&&t| t == r#type).count() >= n {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "type {:#x} was not carried out {n} times: {:x?}",
+            r#type,
+            self.types()
+        );
+    }
+
+    /// Shuts the gate, sends `context`'s buffer create the host then holds, and waits for the host
+    /// to hold it: the context's lane is in it.
+    fn hold(&self, rig: &mut Rig, context: u32) {
+        self.gate.store(false, Ordering::SeqCst);
+        let held = self.types().len();
+        rig.send(object_message(
+            RGFX_CMD_BUFFER_CREATE,
+            (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 0xfff,
+        ));
+        for _ in 0..2000 {
+            if self.types().len() > held {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the create was not carried out");
+    }
+
+    /// Opens the gate.
+    fn release(&self) {
+        self.gate.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A host that records what it carries out ([`OrderSeen`]), holds a `BUFFER_CREATE` while its gate
+/// is shut, answers a render pipeline's create, a present, a release and a close at once, and
+/// names an IOSurface by the objects `named` holds.
+struct OrderHost {
+    order: Arc<Mutex<Vec<(u32, u64)>>>,
+    gate: Arc<AtomicBool>,
+    named: Arc<Mutex<Vec<u64>>>,
+    region: Arc<OnceLock<Arc<Region>>>,
+}
+
+/// What an [`OrderHost`] records as a held `BUFFER_CREATE` ends.
+const HELD_ENDED: u32 = u32::MAX - 1;
+
+impl OrderHost {
+    fn record(&self, r#type: u32) {
+        let published = self.region.get().map_or(0, |region| {
+            region
+                .atomic_u64(RGFX_CONTROL_COMPLETE_OFFSET)
+                .load(Ordering::SeqCst)
+        });
+        self.order.lock().push((r#type, published));
+    }
+}
+
+impl Host for OrderHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+        false
+    }
+    fn context_closed(&self, _context: u32, answer: CompleteAnswer) {
+        self.record(RGFX_CMD_CONTEXT_CLOSE);
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn block_released(&self, _release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        self.record(RGFX_CMD_BLOCK_RELEASE);
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
+        self.record(RGFX_CMD_PRESENT_SURFACE);
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn surface_textures(&self, _iosurface_id: u32) -> Vec<u64> {
+        self.named.lock().clone()
+    }
+    fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
+        let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        self.record(header.r#type);
+        match header.r#type {
+            RGFX_CMD_BUFFER_CREATE => {
+                while !self.gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.record(HELD_ENDED);
+            }
+            RGFX_CMD_RENDER_PIPELINE_CREATE => {
+                let mut reflection = RgfxPipelineReflection::new_zeroed();
+                reflection.header = RgfxMsgHeader {
+                    r#type: RGFX_EVT_PIPELINE_REFLECTION,
+                    size: size_of::<RgfxPipelineReflection>() as u32,
+                    seqno: header.seqno,
+                };
+                completion.post(reflection.as_bytes());
+            }
+            _ => {}
+        }
+    }
+    fn device_reset(&self) {
+        self.record(RESET_TOLD);
+    }
+}
+
+/// A `TEXTURE_FROM_IOSURFACE` of texture `obj_id` over plane `plane` of IOSurface `iosurface_id`.
+fn texture_from_iosurface(obj_id: u64, iosurface_id: u32, plane: u32) -> Vec<u8> {
+    let mut m = RgfxTextureFromIOSurface::new_zeroed();
+    m.header.r#type = RGFX_CMD_TEXTURE_FROM_IOSURFACE;
+    m.obj_id = obj_id;
+    m.iosurface_id = iosurface_id;
+    m.plane = plane;
+    m.as_bytes().to_vec()
+}
+
+/// A `PRESENT_SURFACE` of IOSurface `iosurface_id` on display 0.
+fn present(iosurface_id: u32) -> Vec<u8> {
+    let mut m = RgfxPresentSurface::new_zeroed();
+    m.header.r#type = RGFX_CMD_PRESENT_SURFACE;
+    m.iosurface_id = iosurface_id;
+    m.as_bytes().to_vec()
+}
+
+/// A `RESOURCE_ID_CHUNK` of chunk `chunk` for `context`.
+fn id_chunk(context: u32, chunk: u32) -> Vec<u8> {
+    RgfxResourceIdChunk {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        chunk,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Waits 50 ms, the time a message not held up takes many times over.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+/// A present of a surface waits for another context's `TEXTURE_FROM_IOSURFACE` of the surface's
+/// plane 0 published before it, which a lane is still behind: the host shows the newest live
+/// texture over the surface, and refuses a present of a surface it holds none over.
+#[test]
+fn a_present_waits_for_another_context_s_texture_over_its_surface() {
+    const A: u32 = 6;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    rig.send(texture_from_iosurface(
+        (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
+        7,
+        0,
+    ));
+    rig.send(present(7));
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE],
+        "the present overtook the texture"
+    );
+    seen.release();
+    seen.wait_for(RGFX_CMD_PRESENT_SURFACE, 1);
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+            RGFX_CMD_PRESENT_SURFACE
+        ]
+    );
+}
+
+/// A present of a surface waits for another context's destroy of a texture the host names the
+/// surface by, and for the close of a context that holds one, each published before it.
+#[test]
+fn a_present_waits_for_a_destroy_or_a_close_of_a_texture_over_its_surface() {
+    const A: u32 = 6;
+    const TEXTURE: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    for gone in [
+        object_message(RGFX_CMD_OBJECT_DESTROY, TEXTURE),
+        context_close(A),
+    ] {
+        let r#type = u32::from_le_bytes(gone[0..4].try_into().unwrap());
+        let seen = OrderSeen::new();
+        seen.named.lock().push(TEXTURE);
+        let mut rig = seen.rig();
+        seen.hold(&mut rig, A);
+        rig.send(gone);
+        rig.send(present(7));
+        settle();
+        assert_eq!(
+            seen.types(),
+            [RGFX_CMD_BUFFER_CREATE],
+            "the present overtook type {type:#x}"
+        );
+        seen.release();
+        seen.wait_for(RGFX_CMD_PRESENT_SURFACE, 1);
+        assert_eq!(
+            seen.types(),
+            [RGFX_CMD_BUFFER_CREATE, r#type, RGFX_CMD_PRESENT_SURFACE]
+        );
+    }
+}
+
+/// A present waits for no message that leaves its surface's textures as they are: a destroy of
+/// an object the host does not name the surface by, a texture over another surface or another
+/// plane, another context's close, or a create; it is carried out while those wait.
+#[test]
+fn a_present_waits_for_no_message_that_leaves_its_surface_s_textures() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    let seen = OrderSeen::new();
+    seen.named
+        .lock()
+        .push((u64::from(B) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1);
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    let obj = |n: u64| (u64::from(A) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+    rig.send(object_message(RGFX_CMD_OBJECT_DESTROY, obj(2)));
+    rig.send(texture_from_iosurface(obj(3), 8, 0));
+    rig.send(texture_from_iosurface(obj(4), 7, 1));
+    rig.send(context_close(A));
+    rig.send(present(7));
+    seen.wait_for(RGFX_CMD_PRESENT_SURFACE, 1);
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE, RGFX_CMD_PRESENT_SURFACE]
+    );
+    seen.release();
+}
+
+/// The release of a block shared with other contexts waits for each other holder's messages
+/// published before it (its destroy of an object over the block, its unshare): the host refuses a
+/// release while an object of any context lies in the block.
+#[test]
+fn a_shared_block_s_release_waits_for_its_other_holders() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    const SURFACE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, A, SURFACE, 0x1000));
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, B, SURFACE, 0x1000));
+    seen.hold(&mut rig, A);
+    rig.send(object_message(
+        RGFX_CMD_OBJECT_DESTROY,
+        (u64::from(A) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
+    ));
+    rig.send(block_message(RGFX_CMD_BLOCK_UNSHARE, A, SURFACE, 0x1000));
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, B, SURFACE, 0x1000));
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE],
+        "the release overtook its other holder's messages"
+    );
+    seen.release();
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_OBJECT_DESTROY,
+            RGFX_CMD_BLOCK_RELEASE
+        ]
+    );
+}
+
+/// The release of a block only its context held waits for no other context.
+#[test]
+fn an_unshared_block_s_release_waits_for_no_other_context() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, B, BLOCK, 0x1000));
+    seen.hold(&mut rig, A);
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, B, BLOCK, 0x1000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BLOCK_RELEASE]
+    );
+    seen.release();
+}
+
+/// A grant of the scanout's span waits for every other context's messages published before it: a
+/// grant takes the span from whoever held it, so the last one published holds it, as WindowServer's
+/// contexts are granted it in turn.
+#[test]
+fn a_scanout_grant_waits_for_every_context_s_messages_before_it() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    const SCANOUT: u64 = RGFX_ALLOCATIONS_OFFSET;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, A, SCANOUT, 0x1000));
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, B, SCANOUT, 0x1000));
+    settle();
+    assert!(
+        !rig.region().held_by(B, SCANOUT, 0x1000),
+        "the later grant overtook the earlier one"
+    );
+    seen.release();
+    rig.lanes_done();
+    assert!(rig.region().held_by(B, SCANOUT, 0x1000));
+    assert!(!rig.region().held_by(A, SCANOUT, 0x1000));
+}
+
+/// A resource id chunk granted to a context after another held it waits for that context's close
+/// published before it, and a new context's first message waits for every close published before
+/// it: the kext frees a closed context's chunks and its slot of GPU addresses once it stops
+/// waiting for the close's answer, so the close may still hold textures at the chunk's ids and
+/// buffers in the slot.
+#[test]
+fn a_chunk_or_a_new_context_waits_for_the_close_before_it() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    const C: u32 = 7;
+    // B's chunk, of a context with messages before A's (not a new one), then C's first message.
+    for (late, r#type) in [
+        (id_chunk(B, 3), RGFX_CMD_RESOURCE_ID_CHUNK),
+        (
+            object_message(
+                RGFX_CMD_EVENT_CREATE,
+                u64::from(C) << RGFX_CONTEXT_OBJ_ID_SHIFT,
+            ),
+            RGFX_CMD_EVENT_CREATE,
+        ),
+    ] {
+        let seen = OrderSeen::new();
+        let mut rig = seen.rig();
+        rig.send(object_message(
+            RGFX_CMD_EVENT_CREATE,
+            u64::from(B) << RGFX_CONTEXT_OBJ_ID_SHIFT,
+        ));
+        rig.send(id_chunk(A, 3));
+        // Each on its own context's lane, in either order.
+        seen.wait_for(RGFX_CMD_EVENT_CREATE, 1);
+        seen.wait_for(RGFX_CMD_RESOURCE_ID_CHUNK, 1);
+        seen.hold(&mut rig, A);
+        let held = seen.types();
+        rig.send(context_close(A));
+        rig.send(late);
+        settle();
+        assert_eq!(seen.types(), held, "type {type:#x} overtook the close");
+        seen.release();
+        seen.wait_for(r#type, 2);
+        assert_eq!(seen.types()[held.len()..], [RGFX_CMD_CONTEXT_CLOSE, r#type]);
+    }
+}
+
+/// A context's first message waits for every close published before it, whichever context has
+/// the higher number: the kext numbers contexts at their opens, and a process may post its first
+/// message after a process opened later has posted its own.
+#[test]
+fn a_context_s_first_message_waits_for_the_close_before_it_whatever_its_number() {
+    const A: u32 = 6;
+    const OPENED_LATER: u32 = 8;
+    const OPENED_EARLIER: u32 = 7;
+    let obj = |context: u32| u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    let held = seen.types();
+    rig.send(context_close(A));
+    rig.send(object_message(RGFX_CMD_EVENT_CREATE, obj(OPENED_LATER)));
+    rig.send(object_message(RGFX_CMD_FENCE_CREATE, obj(OPENED_EARLIER)));
+    settle();
+    assert_eq!(seen.types(), held, "a first message overtook the close");
+    seen.release();
+    seen.wait_for(RGFX_CMD_EVENT_CREATE, 1);
+    seen.wait_for(RGFX_CMD_FENCE_CREATE, 1);
+    assert_eq!(seen.types()[held.len()], RGFX_CMD_CONTEXT_CLOSE);
+}
+
+/// A context's synchronous create is answered while another context's create is carried out, and
+/// before its own context's later messages are: its lane posts the answer before it takes the
+/// next.
+#[test]
+fn a_sync_create_is_answered_before_its_context_s_later_messages_are_carried_out() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    let obj = |n: u64| (u64::from(B) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+    let seqno = rig.send(object_message(RGFX_CMD_RENDER_PIPELINE_CREATE, obj(1)));
+    rig.send(object_message(RGFX_CMD_EVENT_CREATE, obj(2)));
+    let answer = rig.event().expect("the create was answered");
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&answer).unwrap();
+    assert_eq!(
+        (header.r#type, header.seqno),
+        (RGFX_EVT_PIPELINE_REFLECTION, seqno)
+    );
+    seen.wait_for(RGFX_CMD_EVENT_CREATE, 1);
+    let order = seen.order.lock().clone();
+    assert_eq!(
+        order.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+        [
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_RENDER_PIPELINE_CREATE,
+            RGFX_CMD_EVENT_CREATE
+        ]
+    );
+    assert!(
+        order[2].1 > order[1].1,
+        "the event's create was carried out before the pipeline's answer was posted"
+    );
+    seen.release();
+}
+
+/// Answers of two contexts' messages come in the order each context's are carried out, not ring
+/// 0's: the kext matches each answer by its seqno.
+#[test]
+fn a_context_s_answer_comes_before_one_published_ahead_of_it_by_another_context() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    let first = rig.send(object_message(
+        RGFX_CMD_RENDER_PIPELINE_CREATE,
+        (u64::from(A) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
+    ));
+    let second = rig.send(object_message(
+        RGFX_CMD_RENDER_PIPELINE_CREATE,
+        (u64::from(B) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
+    ));
+    let seqno = |bytes: Vec<u8>| RgfxMsgHeader::read_from_prefix(&bytes).unwrap().0.seqno;
+    assert_eq!(seqno(rig.event().expect("B's answer")), second);
+    seen.release();
+    assert_eq!(seqno(rig.event().expect("A's answer")), first);
+}
+
+/// A reset drops what the lanes have not begun: a lane's message begun before it goes on, the
+/// host is told of the reset only once that message has ended, and the messages behind it, in its
+/// context's lane or in another lane waiting for it, are never carried out.
+/// A lane's thread is woken only for what it waits for: one with nothing to do goes after
+/// [`lanes::IDLE`] while another context's lane is busy, rather than waking at each of its jobs, as
+/// every lane once did (a device of many processes holds many such lanes).
+#[test]
+fn an_idle_lane_goes_while_another_context_s_is_busy() {
+    const IDLE_CONTEXT: u32 = 4;
+    const BUSY: u64 = 5;
+    let mut rig = Rig::new();
+    rig.start();
+    rig.send(object_message(
+        RGFX_CMD_EVENT_CREATE,
+        (u64::from(IDLE_CONTEXT) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
+    ));
+    let served = || rig.device.shared.lanes.served(Key::Context(IDLE_CONTEXT));
+    for _ in 0..2000 {
+        if served() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        served(),
+        "the context's message was never handed to its lane"
+    );
+    rig.lanes_done();
+    // The busy context posts every 20 ms, for at most three times the idle lane's wait.
+    let rounds = 3 * lanes::IDLE.as_millis() / 20;
+    let mut gone = false;
+    for n in 0..rounds {
+        rig.send(object_message(
+            RGFX_CMD_EVENT_CREATE,
+            (BUSY << RGFX_CONTEXT_OBJ_ID_SHIFT) | (n as u64 + 2),
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        if !rig.device.shared.lanes.served(Key::Context(IDLE_CONTEXT)) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(
+        gone,
+        "the idle lane's thread was woken by the busy context's jobs"
+    );
+}
+
+#[test]
+fn a_reset_drops_what_the_lanes_have_not_begun() {
+    const A: u32 = 6;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, A);
+    rig.send(object_message(
+        RGFX_CMD_RENDER_PIPELINE_CREATE,
+        (u64::from(A) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
+    ));
+    // The present's lane waits for the texture, in A's.
+    rig.send(texture_from_iosurface(
+        (u64::from(A) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 2,
+        7,
+        0,
+    ));
+    rig.send(present(7));
+    settle();
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE],
+        "told before the create ended"
+    );
+    seen.release();
+    seen.wait_for(RESET_TOLD, 1);
+    settle();
+    let order: Vec<u32> = seen.order.lock().iter().map(|&(t, _)| t).collect();
+    assert_eq!(order, [RGFX_CMD_BUFFER_CREATE, HELD_ENDED, RESET_TOLD]);
+}

@@ -42,18 +42,19 @@
 //! stays mapped as long as the device, so the heap needs no hold on the view; it lies over the
 //! block, which is not released while it lives.
 //!
-//! **Off the control thread.** A view costs a kernel mapping per run, and the runtime's import
-//! of them: real surfaces' runs are single 4 KiB pages, most laid right below the run before
-//! (measured on the msi 5080 host, macOS 26 guest, Safari scrolling: every run one page, 74% of
-//! them downwards), so a 3840x2400 layer takes 9000 mappings, made in 16 to 478 ms and imported
-//! in 18 to 21 ms. Ring 0 waits for none of it: the control thread hands each `SURFACE_PAGES` to
-//! the surface worker, `reims-vgpu.graphics-surfaces` ([`Worker`]), which makes the views in ring
-//! order and answers each once its block's view, and device cache, are made. Until then the
-//! block is unsettled ([`Unsettled`]): every later message that names it, on ring 0 or a queue's
-//! ring, waits for it first, and a command buffer that uses it is not answered at a doorbell, so
-//! it sees the block as it would have right after the `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
-//! there too, in its order with the rest. The guest's kext names a block only after the answer,
-//! so in its order nothing waits. A pages block's view, which its first `BUFFER_OVER_PAGES`
+//! **Off ring 0's threads.** A view costs a kernel mapping per run, and the runtime's import of
+//! them: real surfaces' runs are single 4 KiB pages, most laid right below the run before (measured
+//! on the msi 5080 host, macOS 26 guest, Safari scrolling: every run one page, 74% of them
+//! downwards), so a 3840x2400 layer takes 9000 mappings, made in 16 to 478 ms and imported in 18 to
+//! 21 ms. Ring 0 waits for none of it: the context's lane hands each `SURFACE_PAGES` to the surface
+//! worker, `reims-vgpu.graphics-surfaces` ([`Worker`]), which makes the views in the order they are
+//! handed over (each context's in its ring order) and answers each once its block's view, and
+//! device cache, are made. Until then the block is unsettled ([`Unsettled`]): every later message
+//! that names it, on ring 0 or a queue's ring, waits for it first, and a command buffer that uses
+//! it is not answered at a doorbell, so it sees the block as it would have right after the
+//! `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
+//! there too, in its order with the rest. The guest's kext names a block only after the answer, so
+//! in its order nothing waits. A pages block's view, which its first `BUFFER_OVER_PAGES`
 //! makes, is made on the worker as well (`GraphicsControl::start_buffer_over_pages`): that
 //! message has no answer, so its context's later messages, its block's release and its
 //! context's close wait for it instead, and none of its context's command buffers is answered at

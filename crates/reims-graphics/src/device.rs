@@ -1,6 +1,7 @@
 //! [`Device`]: the device's host side, as the host's process runs it. It owns the region (BAR 2),
-//! answers the registers (BAR 0), takes the guest's control commands on a thread of its own, and
-//! sends the display's events on another.
+//! answers the registers (BAR 0), takes the guest's control commands on a thread of its own,
+//! carries each process's out on a thread of the process's, and sends the display's events on
+//! another.
 //!
 //! **Threads.** `reims-vgpu.graphics-control` takes the control submission ring: woken by a
 //! doorbell (the host's `ioeventfd`, or a `DOORBELL` write through [`Device::mmio_write`]) or by
@@ -9,9 +10,12 @@
 //! completion ring has no room, it waits for the guest to take more ([`Room`]), and takes no
 //! command meanwhile. The guest's kexts are its sole producer, under one lock: the framebuffer's
 //! display commands, and the object lifecycle the accelerator posts for the guest's processes
-//! (creates and destroys, `QUEUE_CREATE`, `CONTEXT_CLOSE`), which the control thread hands to the
-//! host's decoder ([`Host::stage3_message`]) with no ring held, in ring order; their replies (a
-//! pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
+//! (creates and destroys, `QUEUE_CREATE`, `CONTEXT_CLOSE`), which the control thread hands, with
+//! no ring held, to the lane of the process's context (`lanes`): `reims-vgpu.graphics-context-*`
+//! carries the context's messages out in ring order, handing its creates and destroys to the
+//! host's decoder ([`Host::stage3_message`]), so one context's slow message holds up only its own
+//! later ones. `reims-vgpu.graphics-presents` carries the `PRESENT_SURFACE`s out, in ring order.
+//! The replies (a pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
 //! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
 //! single consumer, and their `consumer_idle` handshakes never race.
 //! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
@@ -36,12 +40,13 @@
 //! they name), and the host
 //! posts what it owes there (a buffer's completion), raising the queue's own MSI-X vector. Its
 //! doorbell is the submission ring's region offset (the value the guest writes to `DOORBELL`, as
-//! the control ring's is 0). A command buffer is handed to the host only once the control thread
-//! has handed it every ring-0 message of the buffer's context's published before the thread took
-//! the buffer, and every message before those (`backlog`: another context's backlog holds it up
-//! only where it lies before one of its own), so the creates it names are made, or, for a pipeline
-//! the host compiles on threads of its own, known to the host, which holds a buffer that names it
-//! until it is made. An `OBJECT_DESTROY` of the queue, a
+//! the control ring's is 0). A command buffer is handed to the host only once every ring-0 message
+//! of the buffer's context's published before the thread took the buffer is carried out by the
+//! context's lane, and the control thread has taken every message before those (`backlog`:
+//! another context's backlog holds it up only where it lies before one of its own, and only for
+//! as long as the control thread takes to hand it to its lane), so the creates it names are made,
+//! or, for a pipeline the host compiles on threads of its own, known to the host, which holds a
+//! buffer that names it until it is made. An `OBJECT_DESTROY` of the queue, a
 //! `CONTEXT_CLOSE` of its process (the host then
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
 //! queue's service.
@@ -66,14 +71,14 @@
 //! queues' table, held elsewhere, is waited for as [`Device::mmio_write`] waits for it, and no
 //! offer is made), the service thread holds no message of the queue's, none answered is left for
 //! it to take, the buffer fits the thread's copy of it ([`DOORBELL_MESSAGE_MAX`]), at most
-//! `DOORBELL_READS` of ring 0's messages are left to read, and the control thread has carried out
-//! every ring-0 message the buffer waits for. Otherwise the service thread takes the buffer as it
-//! takes any, so the queue's events keep its order either way.
+//! `DOORBELL_READS` of ring 0's messages are left to read, and every ring-0 message the buffer
+//! waits for is carried out. Otherwise the service thread takes the buffer as it takes any, so
+//! the queue's events keep its order either way.
 //!
-//! **The end.** The last [`Device`] handle's drop ends both threads without waiting for them: each
-//! sees the end at its next wake (the control thread at once, the refresh thread within a
-//! refresh), and the last of them to let go drops its reference to the region and the host's
-//! callbacks.
+//! **The end.** The last [`Device`] handle's drop ends its threads without waiting for them: each
+//! sees the end at its next wake (the control thread and the lanes' at once, or once the message
+//! a lane carries out returns, the refresh thread within a refresh), and the last of them to let
+//! go drops its reference to the region and the host's callbacks.
 //!
 //! **Reset.** Writing `STATUS` 0, and the host's reset, put the device back as it was made, as a
 //! device's function reset does: no command is taken until the guest writes `STATUS` 1, the
@@ -84,7 +89,9 @@
 //! and once a take of its ring or a post onto it under way has finished nothing touches its rings
 //! again; no block is any process's (the kext grants them again), and the host drops everything
 //! it made for the guest's processes ([`Host::device_reset`], on the control thread before it
-//! takes anything the guest publishes after the reset). Nothing begun before the reset reaches
+//! takes anything the guest publishes after the reset, and once every message a lane began before
+//! it has returned; a lane's message not yet begun is dropped). Nothing begun before the reset
+//! reaches
 //! the guest after it: its answers and events are dropped, and a queue made before it hands the
 //! host nothing more, not even its own destroy, which the host's reset stands for.
 //! What the guest wrote in its allocations stays.
@@ -105,6 +112,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
 use crate::device::backlog::Backlog;
+use crate::device::lanes::{Key, Lanes};
 use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
@@ -113,6 +121,7 @@ use crate::wake::{self, Wake};
 use crate::wire::*;
 
 mod backlog;
+mod lanes;
 
 /// How many of ring 0's messages a doorbell's take reads ([`Backlog::read`]) before it leaves the
 /// buffer to its queue's thread.
@@ -234,8 +243,9 @@ const COMPLETE: RingAt = RingAt {
 pub trait Host: Send + Sync + 'static {
     /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
     /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On
-    /// the thread that posts it: the control, refresh or a queue's service thread, the host's
-    /// inside [`Device::mmio_write_taking`], or one of the host's that holds a
+    /// the thread that posts it: the control, refresh or a queue's service thread, a lane's
+    /// (`reims-vgpu.graphics-context-*`, `reims-vgpu.graphics-presents`), the host's inside
+    /// [`Device::mmio_write_taking`], or one of the host's that holds a
     /// [`CompletionPoster`] or a [`CompleteAnswer`]. Locks may be held around it, none that a call
     /// of the device's waits for: a queue's claim on its messages, on its service thread and
     /// inside [`Device::mmio_write_taking`], and those the host holds while it posts or answers
@@ -252,7 +262,7 @@ pub trait Host: Send + Sync + 'static {
     /// object whose id lies in the context's range (`context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up,
     /// below the next context's), and gives `answer` ([`RGFX_STATUS_OK`]) once every command
     /// buffer of the context it had committed has finished, from any thread: the kext then gives
-    /// the context's blocks out again. Called on the control thread, in ring order, after the
+    /// the context's blocks out again. Called on the context's lane, in ring order, after the
     /// context's queues were ended. The default drops nothing and answers at once, for a host with
     /// no stage-3 decoder.
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
@@ -263,7 +273,7 @@ pub trait Host: Send + Sync + 'static {
     /// Whether the host refuses context `context`'s new work: its work failed off its op's thread
     /// (the host's stage-3 decoder failed it), and only its destroys and its close are carried
     /// out. A `QUEUE_CREATE` of such a context is refused ([`RGFX_STATUS_REFUSED`]) and makes no
-    /// rings. Called on the control thread. The default refuses nothing, for a host with no
+    /// rings. Called on the context's lane. The default refuses nothing, for a host with no
     /// stage-3 decoder.
     fn context_refused(&self, context: u32) -> bool {
         let _ = context;
@@ -274,7 +284,9 @@ pub trait Host: Send + Sync + 'static {
     /// `release.size`), in which no live queue's ring lies. The host gives `answer` from any
     /// thread: [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block, else
     /// [`RGFX_STATUS_OK`] once every command buffer of the context it had committed has finished.
-    /// The kext gives the block out again only on OK. Called on the control thread, in ring order.
+    /// The kext gives the block out again only on OK. Called on the context's lane, in ring order,
+    /// after the lanes of the other contexts that held the block have carried out what they were
+    /// handed before it.
     /// The default answers OK at once, for a host with no stage-3 decoder.
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         let _ = release;
@@ -285,8 +297,9 @@ pub trait Host: Send + Sync + 'static {
     /// object of every context, as each context's close does ([`Host::context_closed`]), with no
     /// answer owed, and everything else it keeps for the guest's processes, so that the device is
     /// as one just made (the module doc). Called on the control thread once the reset's queues
-    /// have ended and their rings are no longer touched, and before the thread carries out any
-    /// ring-0 message the guest publishes after the reset; resets in a row may be told once. A
+    /// have ended and their rings are no longer touched and every ring-0 message a lane began
+    /// before the reset has returned, and before any ring-0 message the guest publishes after the
+    /// reset is carried out; resets in a row may be told once. A
     /// queue's service thread that has not yet seen its end may still hand the host a message of
     /// the queue's after this: its poster is then [`CompletionPoster::stale`], which the host
     /// checks under the lock this takes, and carries nothing of it out. The default does
@@ -312,7 +325,7 @@ pub trait Host: Send + Sync + 'static {
     /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
     /// buffers alone. The host gives `answer` from any thread once it has carried the message
     /// out, and carries out every later message that names the block as if after it. Called on
-    /// the control thread, in ring order. The default maps nothing, and refuses at once.
+    /// the context's lane, in ring order. The default maps nothing, and refuses at once.
     fn surface_pages(
         &self,
         pages: &RgfxSurfacePages,
@@ -333,11 +346,12 @@ pub trait Host: Send + Sync + 'static {
         answer.answer(RGFX_STATUS_OK);
     }
 
-    /// Hands a stage-3 message to the host's decoder: from ring 0, on the control thread, an
+    /// Hands a stage-3 message to the host's decoder: from ring 0, on its context's lane, an
     /// object-lifecycle create or destroy; from a command queue's own submission ring, on its
     /// service thread, a `COMMAND_BUFFER` (after the queue's `QUEUE_CREATE`, which the device
     /// hands over first, and before its `OBJECT_DESTROY`). Each ring's messages come whole, in the
-    /// order the guest published them, with `completion` to post what the host owes onto that
+    /// order the guest published them (ring 0's, each context's in that order, on one thread at a
+    /// time), with `completion` to post what the host owes onto that
     /// ring's completion ring (a pipeline's reflection on the control one, a buffer's
     /// `CB_COMPLETE` on the queue's), raising its MSI-X vector; this returns nothing. A ring-0
     /// message may be carried out after this returns (a pipeline compile on the host's own
@@ -363,6 +377,17 @@ pub trait Host: Send + Sync + 'static {
         false
     }
 
+    /// The objects the host names IOSurface `iosurface_id` by: the live textures over its plane 0,
+    /// one of which a `PRESENT_SURFACE` of it shows ([`Host::present_surface`]). Asked on the
+    /// control thread as it hands a present to the presents' lane, with the lanes' lock held, so
+    /// the present waits for the lanes whose messages before it change them (`device::lanes`):
+    /// it waits for nothing and calls nothing of the device's. The default names none, for a host
+    /// with no stage-3 decoder.
+    fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {
+        let _ = iosurface_id;
+        Vec::new()
+    }
+
     /// A refresh of display 0, on the refresh thread, after its `VBLANK` (while the guest has
     /// them on): the vblank at which the presents the window has shown since the last one are
     /// first on the display, which the host answers here ([`Host::present_surface`]). The default
@@ -370,7 +395,9 @@ pub trait Host: Send + Sync + 'static {
     fn refreshed(&self) {}
 
     /// Shows the IOSurface of global ID `iosurface_id` on display 0 in place of the scanout
-    /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the control thread, and gives `answer`
+    /// (`PRESENT_SURFACE`; 0 shows the scanout again), on the presents' lane, in ring order, once
+    /// the lanes have carried out the messages before it that change the textures over the
+    /// surface ([`Host::surface_textures`]), and gives `answer`
     /// once the display shows it: [`RGFX_STATUS_OK`], or [`RGFX_STATUS_INVALID_ARGUMENT`], with
     /// nothing changed, where the host holds no texture over that surface. The guest's display
     /// pipe completes its transaction on that answer, so it is given when the surface is shown,
@@ -445,14 +472,19 @@ pub(crate) struct Shared {
     /// tests make it long to see what wakes a post.
     room_poll_ns: AtomicU64,
     /// The control submission ring's count through the last message the control thread has
-    /// carried out or handed to the host: a command buffer waits for it to pass the last message
-    /// published before it that is its context's or every buffer's ([`backlog`]).
+    /// carried out, handed to the host or handed to a lane: a command buffer waits for it to pass
+    /// the last message published before it that is its context's or every buffer's
+    /// ([`backlog`]), and for its context's lane to carry out its context's ([`lanes`]).
     control_done: AtomicU64,
     /// Held by a queue thread while it looks at `control_done` and sleeps for it to move, and by
     /// whoever signals a move, so a move between the look and the sleep still wakes it.
     control_moved: Mutex<()>,
-    /// Signalled each time `control_done` moves, the device resets or it ends.
+    /// Signalled each time `control_done` moves, a lane carries a message out, the device resets
+    /// or it ends.
     control_moved_signal: Condvar,
+    /// Ring 0's lanes, which carry out each context's object-lifecycle messages, and the
+    /// presents, off the control thread ([`lanes`]).
+    lanes: Arc<Lanes>,
     /// The command queues' own rings and service threads, by queue id and by ring id.
     queues: Mutex<Queues>,
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
@@ -661,6 +693,7 @@ impl Device {
             control_done: AtomicU64::new(0),
             control_moved: Mutex::new(()),
             control_moved_signal: Condvar::new(),
+            lanes: Arc::default(),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
         });
@@ -699,11 +732,13 @@ impl Device {
     }
 
     /// Whether the control thread and every queue's service thread sleep with no wake pending
-    /// ([`Wake::parked`]): what they write of the rings stays as it is until the guest acts.
+    /// ([`Wake::parked`]), and no lane has a message to carry out: what they write of the rings
+    /// stays as it is until the guest acts.
     #[cfg(test)]
     pub(crate) fn parked(&self) -> bool {
         let doorbell = self.shared.doorbell.get().map(AsRawFd::as_raw_fd);
         self.shared.wake.parked(doorbell)
+            && self.shared.lanes.idle()
             && self
                 .shared
                 .queues
@@ -939,13 +974,14 @@ impl Shared {
         for queue in self.queues.lock().by_obj.values() {
             queue.end();
         }
+        self.lanes.end();
         self.signal_control_moved();
         self.room.wake();
     }
 
     /// Wakes the queue threads waiting for `control_done` to move, after it moves, a reset or the
-    /// device's end. A queue ends either here, at a reset, or on the control thread, which moves
-    /// `control_done` once the message that ended it is done.
+    /// device's end. A queue ends either here, at a reset, or on its context's lane, which wakes
+    /// them once the message that ended it is done.
     fn signal_control_moved(&self) {
         drop(self.control_moved.lock());
         self.control_moved_signal.notify_all();
@@ -965,7 +1001,9 @@ impl Shared {
     fn reset(&self) {
         self.status.store(RGFX_STATUS_RESET, Ordering::Release);
         self.driver_features.store(0, Ordering::Release);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        // Nothing the lanes were handed before it is begun now.
+        self.lanes.reset(epoch);
         let mut submit = self.submit.lock();
         let mut display = self.display.lock();
         let mut completion = self.completion.lock();
@@ -1034,6 +1072,9 @@ impl Shared {
     /// thread, before the thread takes anything the guest published after it.
     fn tell_reset(&self) {
         if self.reset_owed.swap(false, Ordering::AcqRel) {
+            // After every message a lane began before the reset, as the control thread's own
+            // message in flight comes before it.
+            self.lanes.wait_begun(self.epoch.load(Ordering::Acquire));
             self.host.device_reset();
             log::info!(target: "reims_graphics", "the device was reset");
         }
@@ -1109,7 +1150,15 @@ impl Shared {
                         if room {
                             self.post_room(epoch);
                         }
-                        let answer = control::unheld(self, &message, epoch);
+                        // A context's object-lifecycle message and a present go to their lane,
+                        // which answers them; the rest is carried out here.
+                        let answer = match Key::of(&message) {
+                            Some(key) => {
+                                self.hand(key, message, through, epoch);
+                                None
+                            }
+                            None => control::unheld(self, &message, epoch),
+                        };
                         // A reset meanwhile restarted the count; this message's is moot.
                         if self.epoch.load(Ordering::Acquire) == epoch {
                             self.control_done.store(through, Ordering::Release);
@@ -1148,6 +1197,40 @@ impl Shared {
             if let Some(answer) = answer {
                 self.post_waiting(&answer, epoch);
             }
+        }
+    }
+
+    /// Whether every ring-0 message of context `context`'s through count `through` is carried out:
+    /// taken by the control thread, and carried out by it or by the context's lane.
+    fn carried_out(&self, context: u32, through: u64) -> bool {
+        self.control_done.load(Ordering::Acquire) >= through && self.lanes.through(context, through)
+    }
+
+    /// Hands `message`, taken at reset count `epoch`, ring 0's count through it `through`, to the
+    /// lane `key` ([`lanes`]), starting the lane's thread where it has none. Where no thread can
+    /// be started, the lane's jobs are carried out here.
+    fn hand(&self, key: Key, message: Message, through: u64, epoch: u64) {
+        let start = self.lanes.hand(key, message, through, epoch, |surface| {
+            self.host.surface_textures(surface)
+        });
+        if !start {
+            return;
+        }
+        let lanes = Arc::clone(&self.lanes);
+        let shared = self.weak_self.get().cloned().unwrap_or_default();
+        let started = std::thread::Builder::new()
+            .name(key.thread_name())
+            .spawn(move || serve_lane(&lanes, &shared, key, true));
+        if let Err(e) = started {
+            log::warn!(
+                target: "reims_graphics",
+                "{} could not be started ({e}): its messages are carried out on the control \
+                 thread",
+                key.thread_name()
+            );
+            self.lanes.unserved(key);
+            let shared = self.weak_self.get().cloned().unwrap_or_default();
+            serve_lane(&self.lanes, &shared, key, false);
         }
     }
 
@@ -1215,7 +1298,7 @@ impl Shared {
         Post::Done
     }
 
-    /// `CONTEXT_CLOSE` of `context` (the module doc), on the control thread: its queues end, then
+    /// `CONTEXT_CLOSE` of `context` (the module doc), on its lane: its queues end, then
     /// the host drops its objects and gives `answer` once its command buffers have finished.
     pub(crate) fn close_context(&self, context: u32, answer: CompleteAnswer) {
         let ended: Vec<Arc<QueueShared>> = {
@@ -1434,9 +1517,19 @@ impl Shared {
                 return;
             }
             let done = self.control_done.load(Ordering::Acquire);
-            let read =
-                (control.backlog).read(&control.consumer, &self.region, done, DOORBELL_READS);
-            if !read || done < control.backlog.waits_for(queue.context) {
+            let read = (control.backlog).read(
+                &control.consumer,
+                &self.region,
+                |context, through| {
+                    done >= through && self.lanes.try_through(context, through) == Some(true)
+                },
+                DOORBELL_READS,
+            );
+            if !read
+                || done < control.backlog.waits_for(queue.context)
+                || (self.lanes).try_through(queue.context, control.backlog.own(queue.context))
+                    != Some(true)
+            {
                 return;
             }
         }
@@ -1766,25 +1859,34 @@ impl Shared {
             // ride ring 0, whose sole consumer is the control thread; command buffers ride the
             // queues' own rings (this thread). A create a buffer uses is posted before it in guest
             // order, so it is within ring 0's producer at the moment this thread takes the buffer.
-            // Wait for the control thread to have carried out every message up to the last of
-            // them, of the buffer's context's or every buffer's ([`Backlog`]), so the resource is
-            // registered before the buffer's ops name it. This thread only reads ring 0; it never
-            // consumes it, so it keeps one consumer and its `consumer_idle` handshake is
-            // untouched. It sleeps until the control thread signals a move of `control_done`, a
-            // reset or the end. A buffer the host answered on a doorbell's thread waits no more:
-            // that thread found ring 0 carried out through what the buffer waits for.
+            // Wait for the control thread to have carried out or handed to a lane every message
+            // up to the last of them, of the buffer's context's or every buffer's ([`Backlog`]),
+            // and for the context's lane to have carried out the context's ([`lanes`]), so the
+            // resource is registered before the buffer's ops name it. This thread only reads ring
+            // 0; it never consumes it, so it keeps one consumer and its `consumer_idle` handshake
+            // is untouched. It sleeps until the control thread signals a move of `control_done`
+            // or a lane a message carried out, a reset or the end. A buffer the host answered on a
+            // doorbell's thread waits no more: that thread found ring 0 carried out through what
+            // the buffer waits for.
             let answered = consuming.take() == Some(message.header.seqno);
-            let waits_for = if answered {
-                0
+            let (waits_for, own) = if answered {
+                (0, 0)
             } else {
                 let mut control = self.submit.lock();
                 let control = &mut *control;
-                let done = self.control_done.load(Ordering::Acquire);
-                (control.backlog).read(&control.consumer, &self.region, done, usize::MAX);
-                control.backlog.waits_for(queue.context)
+                (control.backlog).read(
+                    &control.consumer,
+                    &self.region,
+                    |context, through| self.carried_out(context, through),
+                    usize::MAX,
+                );
+                let backlog = &control.backlog;
+                (backlog.waits_for(queue.context), backlog.own(queue.context))
             };
             let mut moved = self.control_moved.lock();
-            while self.control_done.load(Ordering::Acquire) < waits_for {
+            while self.control_done.load(Ordering::Acquire) < waits_for
+                || !self.lanes.through(queue.context, own)
+            {
                 if self.ending()
                     || queue.ended()
                     || self.epoch.load(Ordering::Acquire) != queue.epoch
@@ -1971,6 +2073,29 @@ impl Shared {
 
 /// A completion ring locked: waiting for it where `wait`, else only where no other thread holds
 /// it.
+/// A lane's thread ([`lanes`]): carries out each job of the lane `key` in turn, with no lock of
+/// the device's held, as the control thread carries out an object-lifecycle message, posts its
+/// answer, and goes once the lane has had no job for a while (at once where not `wait`), or the
+/// device ends. A job taken before a reset is not carried out.
+fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, wait: bool) {
+    while let Some(job) = lanes.next(key, wait) {
+        let Some(shared) = shared.upgrade() else {
+            lanes.finished(key);
+            return;
+        };
+        let answer = if shared.epoch.load(Ordering::Acquire) == job.epoch {
+            control::unheld(&shared, &job.message, job.epoch)
+        } else {
+            None
+        };
+        lanes.finished(key);
+        shared.signal_control_moved();
+        if let Some(answer) = answer {
+            shared.post_waiting(&answer, job.epoch);
+        }
+    }
+}
+
 fn lock_ring(ring: &Mutex<Producer>, wait: bool) -> Option<MutexGuard<'_, Producer>> {
     if wait {
         Some(ring.lock())

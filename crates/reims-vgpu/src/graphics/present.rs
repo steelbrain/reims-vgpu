@@ -23,7 +23,8 @@
 //! A present of a surface whose device cache holds an older CPU generation than the present's
 //! waits too for the fill the host commits for it on taking the present (`decode/surface_cache.rs`):
 //! it is shown once that fill has finished, which tells the queue ([`PresentQueue::filled`]), so
-//! the control thread that takes the present, ring 0's only reader, waits for nothing on the GPU.
+//! the presents' lane that carries the present out (`reims-graphics`' device) waits for nothing on
+//! the GPU.
 //!
 //! [`PresentAnswers`]: when a shown present is answered. The guest's display pipe completes a
 //! transaction on its answer, and holds at most two unanswered (the kext's `RgfxDisplayPipe`),

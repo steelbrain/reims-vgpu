@@ -817,8 +817,8 @@ closes its context (`CONTEXT_CLOSE`: the host drops its objects, then
 answers once the context's command buffers have finished), then frees its
 chunks of resource ids and, on that answer only, its blocks. A command
 buffer is decoded once the host has carried out every control-ring message of
-its context's published before its queue's thread took it, and every message
-before those.
+its context's published before its queue's thread took it, and has taken every
+message before those.
 
 **A buffer's wait on ring 0.** A buffer names only its own context's objects
 and spans in blocks its context holds, so what it can depend on on ring 0 is
@@ -827,27 +827,77 @@ its context's: a message about an object (every type from `QUEUE_CREATE` below
 the process's), whose id carries the context's bits, or one the kext posts for
 a context (`CONTEXT_CLOSE` to `SURFACE_PAGES`), which names it.
 Another process's surface reaches a buffer only through the share of its block
-the kext posts for the buffer's context before the process learns of the block:
-the share comes after the surface's `SURFACE_PAGES` and after every message the
-process that made the surface posted before it handed the surface on, and ring
-0 is carried out in order, so a buffer that waits for its share waits for those
-too. Shared events and textures do not cross processes. A display command
-(`GET_DISPLAYS` to `PRESENT_SURFACE`) or a `SURFACE_DOWNLOAD` holds up no buffer:
-none reads what they make. A present waits for the writers the guest's record
-of its surface names, whatever the host has taken. A download waits for the
-buffers that used the surface's device cache before it was taken, so a buffer
-posted after it that writes the surface, but taken before it, is among them,
-as one posted before it is: the guest writes a surface a CPU lock holds only
-racing the lock. Every buffer waits for a message of any other type, which the
-host refuses. The queues' threads read
+the kext posts for the buffer's context before the process learns of the block,
+after the surface's `SURFACE_PAGES` was answered: what the buffer reads of the
+surface the host made there, and the buffer names none of the other process's
+objects, so it waits for its own context's share and for none of the other
+process's messages. Shared events and textures do not cross processes. A
+display command (`GET_DISPLAYS` to `PRESENT_SURFACE`) or a `SURFACE_DOWNLOAD`
+holds up no buffer: none reads what they make. A present waits for the writers
+the guest's record of its surface names, whatever the host has taken. A
+download waits for the buffers that used the surface's device cache before it
+was taken, so a buffer posted after it that writes the surface, but taken
+before it, is among them, as one posted before it is: the guest writes a
+surface a CPU lock holds only racing the lock. Every buffer waits for a message
+of any other type, which the host refuses. The queues' threads read
 ring 0 ahead of the control thread, each message once, and keep the count
 through each context's last message (`reims_graphics`'s `device::backlog`), so
 a buffer behind another process's backlog on ring 0 is decoded at once.
 Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 `a_command_buffer_waits_for_no_other_process_s_later_object_messages`,
-`a_command_buffer_waits_for_its_process_s_creates_behind_another_s`,
-`a_command_buffer_waits_for_another_process_s_messages_before_its_share` and
-`a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
+`a_process_s_messages_go_on_while_another_s_create_is_carried_out`,
+`a_command_buffer_waits_for_its_share_of_another_process_s_surface_not_for_that_process`
+and `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
+
+**Ring 0's lanes.** The control thread takes ring 0 in ring order and carries
+out only the display commands and `SURFACE_DOWNLOAD`s itself. It hands each
+context's messages, in ring order, to that context's lane, a thread of its own
+(`reims-vgpu.graphics-context-<n>`, made as a message comes to a lane with
+none, gone after 1 s with none), and every `PRESENT_SURFACE` to the presents'
+lane (`reims-vgpu.graphics-presents`). A lane carries its messages out one at a
+time and posts their answers, so one process's slow message (a heap over pages
+took 469 ms at the median and 4.25 s at most in a boot on an RTX 5080 host)
+holds up only that process's later messages and command buffers. A message
+waits for another context's lane only where it reads what that lane's earlier
+messages change, and only for messages published before it
+(`reims_graphics`'s `device::lanes`):
+- a present waits for each lane's `TEXTURE_FROM_IOSURFACE` of its surface's
+  plane 0, its destroy of a texture the host names the surface by, and the
+  close of a context that holds one: the host shows the newest live texture
+  over the surface;
+- a shared block's `BLOCK_RELEASE` waits for each other context that held it:
+  the host refuses a release while an object of any context lies in the block;
+- a `BLOCK_GRANT` in the scanout's span waits for every lane: a grant takes the
+  span from whoever held it, and WindowServer's contexts are granted it in turn;
+- a `RESOURCE_ID_CHUNK` another context held waits for that context's close,
+  and a context's first message for every close before it, whatever the
+  context's number (the kext numbers contexts at their opens, and a process
+  may post its first message after one opened later): the kext frees a closed
+  context's chunks and its slot of GPU addresses once it stops waiting for the
+  close's answer.
+
+Each wait is for a message published earlier, and every lane with a message
+has a thread, so the waits end. What the guest can tell apart from one thread:
+answers to different processes come in another order than their messages,
+which the kext matches by seqno; and two processes' messages that no answer
+orders are carried out in either order, as the processes' own posts race. A
+process that waited for an answer finds its message carried out. A reset drops
+the messages a lane has not begun, and is told to the host once those begun
+have returned. A lane's thread is woken only for its own messages and for the
+lanes its next message waits for, so a lane with nothing to do costs nothing
+and goes after a second with none, whatever other processes do. Tested by
+`a_present_waits_for_another_context_s_texture_over_its_surface`,
+`a_present_waits_for_a_destroy_or_a_close_of_a_texture_over_its_surface`,
+`a_present_waits_for_no_message_that_leaves_its_surface_s_textures`,
+`a_shared_block_s_release_waits_for_its_other_holders`,
+`an_unshared_block_s_release_waits_for_no_other_context`,
+`a_scanout_grant_waits_for_every_context_s_messages_before_it`,
+`a_chunk_or_a_new_context_waits_for_the_close_before_it`,
+`a_context_s_first_message_waits_for_the_close_before_it_whatever_its_number`,
+`a_sync_create_is_answered_before_its_context_s_later_messages_are_carried_out`,
+`a_context_s_answer_comes_before_one_published_ahead_of_it_by_another_context`,
+`a_reset_drops_what_the_lanes_have_not_begun` and
+`an_idle_lane_goes_while_another_context_s_is_busy`.
 
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process
