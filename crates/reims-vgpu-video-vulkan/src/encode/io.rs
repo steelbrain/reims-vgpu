@@ -26,7 +26,7 @@ use ash::vk;
 use crate::device::VideoDevice;
 use crate::encode::caps::EncodeProfile;
 use crate::error::{Error, Named};
-use crate::import::{AnyProfile, BufferUse, HostImport, ImportBuffer, buffer_over};
+use crate::import::{AnyProfile, BufferUse, HostImport, ImportBuffer, buffer_over, plane_span};
 use crate::surface::BufferPlanes;
 
 /// How a source image an encoder reads in place is made, which its
@@ -438,9 +438,10 @@ pub struct ImportedSource {
 
 impl ImportedSource {
     /// The planes `luma` and `chroma` (each its first byte from `import`'s
-    /// offset, the bytes from one of its rows to the next, and its rows)
-    /// in `import`; `None` where a plane lies outside the import or the
-    /// device takes no buffer over it.
+    /// offset, the bytes from one of its rows to the next, its rows, and
+    /// the bytes of a row) in `import`, each ending at its last row's last
+    /// byte ([`plane_span`]); `None` where a plane lies outside the import
+    /// or the device takes no buffer over it.
     ///
     /// # Safety
     ///
@@ -450,15 +451,11 @@ impl ImportedSource {
     pub unsafe fn new(
         device: &Arc<VideoDevice>,
         import: &HostImport,
-        luma: (u64, u32, u32),
-        chroma: (u64, u32, u32),
+        luma: (u64, u32, u32, u32),
+        chroma: (u64, u32, u32, u32),
         keep: Arc<dyn Send + Sync>,
     ) -> Result<Option<Self>, Error> {
-        let place = |(offset, pitch, rows): (u64, u32, u32)| {
-            let start = import.offset.checked_add(offset)?;
-            let end = start.checked_add(u64::from(pitch).checked_mul(u64::from(rows))?)?;
-            Some((start, end))
-        };
+        let place = |plane| plane_span(import.offset, plane);
         let (Some(luma_at), Some(chroma_at)) = (place(luma), place(chroma)) else {
             return Ok(None);
         };

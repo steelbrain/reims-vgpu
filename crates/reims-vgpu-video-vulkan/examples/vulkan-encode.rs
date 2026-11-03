@@ -858,8 +858,8 @@ impl Buffers {
             ImportedSource::new(
                 &self.device,
                 &self.memory.import(at),
-                (0, pitch, height),
-                (self.frame.0, pitch, height / 2),
+                (0, pitch, height, pitch),
+                (self.frame.0, pitch, height / 2, pitch),
                 keep,
             )
         }

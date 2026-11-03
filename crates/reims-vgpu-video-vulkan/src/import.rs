@@ -212,7 +212,10 @@ impl Drop for ImportBuffer {
 /// Where a plane `(offset, pitch, rows, row)` from `base` lies: its first
 /// byte, and the end of its last row, `row` bytes past that row's start;
 /// `None` for no rows, or past 2^64.
-fn plane_span(base: u64, (offset, pitch, rows, row): (u64, u32, u32, u32)) -> Option<(u64, u64)> {
+pub(crate) fn plane_span(
+    base: u64,
+    (offset, pitch, rows, row): (u64, u32, u32, u32),
+) -> Option<(u64, u64)> {
     let start = base.checked_add(offset)?;
     let before_last = u64::from(pitch).checked_mul(u64::from(rows.checked_sub(1)?))?;
     Some((
@@ -287,10 +290,19 @@ impl Surface for ImportedPlanes {
 mod tests {
     use super::*;
 
-    /// A plane's span runs from its first byte to its last row's last, `row` bytes past that row's
-    /// start, not a whole pitch; no rows is no span.
+    /// A plane's span, a decode's output's ([`ImportedPlanes`]) or an encode's source's
+    /// ([`crate::ImportedSource`]), runs from its first byte to its last row's last, `row`
+    /// bytes past that row's start, not a whole pitch: a tile's chroma at (256, 512) of a
+    /// 2048-byte pitch plane at 3145728 in 4718592 bytes, 256 rows of 512 bytes, ends inside
+    /// them, where 256 whole rows would end 512 bytes past; no rows is no span.
     #[test]
     fn a_plane_s_span_ends_at_its_last_row_s_last_byte() {
+        let tile = 3_145_728 + 512 * 2048 + 256 * 2;
+        assert_eq!(
+            plane_span(0, (tile, 2048, 256, 512)),
+            Some((tile, 4_718_592 - 1024))
+        );
+        assert_eq!(tile + 256 * 2048, 4_718_592 + 512);
         assert_eq!(
             plane_span(4096, (512, 2048, 3, 1024)),
             Some((4608, 4608 + 2 * 2048 + 1024))
