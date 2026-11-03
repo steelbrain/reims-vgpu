@@ -10088,6 +10088,10 @@ fn visibility_results<P: Platform>(
 /// A visibility result buffer's words, each Metal's own fill until a pass writes it.
 const VIS_FILL: u64 = 0xeeee_eeee_eeee_eeee;
 
+/// A case of [`visibility_results_are_metals`]: its name, its passes, the buffer's words before
+/// them and the words Metal leaves.
+type VisCase<'a> = (&'static str, Vec<VisPass<'a>>, [u64; 4], [u64; 4]);
+
 /// A pass's visibility results are Metal's: a `Counting` result is the samples that passed the
 /// depth test (every sample of the target, at 1 and 4 samples, the scissor's alone, none where
 /// the depth test fails, two draws' together at one offset), a `Boolean` one 1 where any did and
@@ -10139,7 +10143,7 @@ fn visibility_results_are_metals() {
         Mode(1, 16),
         Mode(2, 24),
     ];
-    let cases: Vec<(&str, Vec<VisPass<'_>>, [u64; 4], [u64; 4])> = vec![
+    let cases: Vec<VisCase<'_>> = vec![
         (
             "modes",
             vec![one(modes)],
