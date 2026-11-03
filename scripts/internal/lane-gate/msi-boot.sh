@@ -222,10 +222,11 @@ touch "$R/.start"
 # seconds after the desktop is up, where the Dock has settled (below). The scanout's reader runs as
 # root, for /proc/PID/mem.
 CAPPIDS=()
-# A cold pipeline cache (COLD_CACHE=KEY) and a command at QEMU's start (QEMU_HOOK_B64): QEMU runs
-# under a wrapper that rgk-boot2.sh's run.sh execs with the GPU lock (fd 9) held. It sets the
-# host's cache entry KEY aside, starts the hook (with no lock), runs QEMU as its child, and once
-# QEMU has stopped removes the entry QEMU made and puts KEY back, the lock still held.
+# A cold pipeline cache (COLD_CACHE=KEY) and a command at QEMU's start (QEMU_HOOK_B64): rgk-boot2.sh's
+# run.sh execs a wrapper, with the GPU lock (fd 9) held, which execs QEMU in turn, so QEMU keeps
+# run.sh's pid (rgk-boot2.sh counts SSH only from that pid). The wrapper sets the host's cache
+# entry KEY aside and leaves a process holding the lock that, once QEMU has stopped, removes the
+# entry QEMU made and puts KEY back; it starts the hook with no lock held.
 if [[ -n ${COLD_CACHE:-} || -n ${QEMU_HOOK_B64:-} ]]; then
   hook=$(printf '%s' "${QEMU_HOOK_B64:-}" | base64 -d)
   {
@@ -244,15 +245,15 @@ if [[ -n $COLD ]]; then
   elif [[ -e $C ]]; then mv "$C" "$A" && say "the pipeline cache entry set aside: $C"
   else say "no pipeline cache entry $C: cold already"; COLD=; fi
 fi
-"$REAL" "$@" &
-q=$!
+q=$$  # QEMU's, once this script execs it
+if [[ -n $COLD ]]; then
+  ( while kill -0 "$q" 2> /dev/null && [[ $(cat "/proc/$q/stat" 2> /dev/null | cut -d' ' -f3) != Z ]]; do sleep 0.5; done
+    rm -rf "$C"; mv "$A" "$C" && say "the pipeline cache entry put back: $C" ) &
+fi
 if [[ -n $HOOK ]]; then
   ( exec 6>&- 7>&- 8>&- 9>&-; sleep 0.5; h=${HOOK//\{PID\}/$q}; h=${h//\{DIR\}/$R}; say "hook: $h"; eval "$h" ) &
 fi
-trap 'kill $q 2> /dev/null' TERM INT HUP
-while kill -0 "$q" 2> /dev/null; do wait "$q"; rc=$?; done
-if [[ -n $COLD ]]; then rm -rf "$C"; mv "$A" "$C" && say "the pipeline cache entry put back: $C"; fi
-exit ${rc:-0}
+exec "$REAL" "$@"
 WRAP
   } > "$R/qemu-wrap.sh"
   chmod +x "$R/qemu-wrap.sh"
