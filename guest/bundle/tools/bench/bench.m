@@ -12,8 +12,11 @@
 //     -t SECONDS  how long `onscreen` animates (default 20).
 //     -j THREADS  how many threads encode and commit `draws.10k`'s command buffers at once, onto
 //                 its one queue (default 1).
-//     -v          a "# rep" line for each repetition of the frame cases (frag.*): when it
-//                 started, its frames (one command buffer each) and their rate.
+//     -v          a "# rep" line for each repetition of the GPU-bound cases: when it started
+//                 (from the case's start) and how long it took. A frame case's (frag.*) gives
+//                 its frames (one command buffer each) and their rate; compute.fma's, blit.256m's,
+//                 sample.tex's and mps.sgemm's give its numbers as the case's line names them:
+//                 "# rep NAME R at S s: MS ms, key=value ...".
 //     -l          lists the devices and exits.
 //     CASE        runs only the cases whose name holds one of these; with none, every case
 //                 but `onscreen`, which needs the logged-in user's window server session.
@@ -70,7 +73,7 @@ static int gThreads = 1;
 static double gWall;
 // -m: the least time a case's repetitions take; when the case started.
 static double gMinSeconds, gCaseStart;
-// -v: a line a repetition of the frame cases; the case running.
+// -v: a line a repetition of the GPU-bound cases; the case running.
 static BOOL gVerbose;
 static NSString *gCaseName;
 
@@ -276,6 +279,17 @@ static NSString *spread(NSArray<NSNumber *> *xs, const char *fmt)
 	return [NSString stringWithFormat:f, minOf(xs), maxOf(xs)];
 }
 
+// -v: the line of repetition `r` of a GPU-bound case other than the frame cases, which started at
+// `start` (now()) and has just ended: its numbers, "key=value ...".
+static void repLine(int r, double start, NSString *values)
+{
+	if (!gVerbose)
+		return;
+	printf("# rep %s %d at %.3f s: %.1f ms, %s\n", gCaseName.UTF8String, r, start - gCaseStart, (now() - start) * 1e3,
+	       values.UTF8String);
+	fflush(stdout);
+}
+
 // --- the cases ----------------------------------------------------------------------------------
 
 typedef struct {
@@ -426,11 +440,14 @@ static NSString *computeFma(void)
 	NSMutableArray *gf = [NSMutableArray array], *gfw = [NSMutableArray array], *gpu = [NSMutableArray array];
 	const double flops = (double)threads * iters * 8 * 4 * 2;
 	for (int r = 0; more(r); r++) {
+		const double s = now();
 		id<MTLCommandBuffer> cb = run();
 		const double g = gpuMs(cb), w = gWall * 1e3;
 		[gf addObject:@(flops / (g * 1e6))];
 		[gfw addObject:@(flops / (w * 1e6))];
 		[gpu addObject:@(g)];
+		repLine(r, s, [NSString stringWithFormat:@"gflops=%.0f gflops_wall=%.0f gpu_ms=%.2f", flops / (g * 1e6),
+		                                         flops / (w * 1e6), g]);
 	}
 	return [NSString stringWithFormat:@"gflops=%.0f gflops_wall=%.0f gpu_ms=%.2f iters=%u %@", median(gf),
 	                                  median(gfw), median(gpu), iters, spread(gf, "%.0f")];
@@ -466,11 +483,14 @@ static NSString *blitCopy(NSUInteger bytes)
 	NSMutableArray *gb = [NSMutableArray array], *gbw = [NSMutableArray array], *gpu = [NSMutableArray array];
 	const int copies = 4;
 	for (int r = 0; more(r); r++) {
+		const double s = now();
 		id<MTLCommandBuffer> cb = run(copies);
 		const double g = gpuMs(cb), w = gWall * 1e3;
 		[gb addObject:@((double)bytes * copies / (g * 1e6))];
 		[gbw addObject:@((double)bytes * copies / (w * 1e6))];
 		[gpu addObject:@(g / copies)];
+		repLine(r, s, [NSString stringWithFormat:@"gbps=%.1f gbps_wall=%.1f gpu_ms=%.2f", (double)bytes * copies / (g * 1e6),
+		                                         (double)bytes * copies / (w * 1e6), g / copies]);
 	}
 	return [NSString stringWithFormat:@"gbps=%.1f gbps_wall=%.1f gpu_ms=%.2f copies=%d %@", median(gb), median(gbw),
 	                                  median(gpu), copies, spread(gb, "%.1f")];
@@ -518,11 +538,14 @@ static NSString *sampleTex(void)
 	NSMutableArray *gs = [NSMutableArray array], *gsw = [NSMutableArray array], *gpu = [NSMutableArray array];
 	const double samples = (double)grid * grid * 16 * passes;
 	for (int r = 0; more(r); r++) {
+		const double s = now();
 		id<MTLCommandBuffer> cb = run();
 		const double g = gpuMs(cb), w = gWall * 1e3;
 		[gs addObject:@(samples / (g * 1e6))];
 		[gsw addObject:@(samples / (w * 1e6))];
 		[gpu addObject:@(g / passes)];
+		repLine(r, s, [NSString stringWithFormat:@"gsamples_s=%.1f gsamples_s_wall=%.1f gpu_ms=%.3f", samples / (g * 1e6),
+		                                         samples / (w * 1e6), g / passes]);
 	}
 	return [NSString stringWithFormat:@"gsamples_s=%.1f gsamples_s_wall=%.1f gpu_ms=%.3f %@", median(gs), median(gsw),
 	                                  median(gpu), spread(gs, "%.1f")];
@@ -708,11 +731,14 @@ static NSString *sgemm(NSUInteger n)
 	NSMutableArray *gf = [NSMutableArray array], *gfw = [NSMutableArray array], *gpu = [NSMutableArray array];
 	const double flops = 2.0 * n * n * n * per;
 	for (int r = 0; more(r); r++) {
+		const double s = now();
 		id<MTLCommandBuffer> cb = run();
 		const double g = gpuMs(cb), w = gWall * 1e3;
 		[gf addObject:@(flops / (g * 1e6))];
 		[gfw addObject:@(flops / (w * 1e6))];
 		[gpu addObject:@(g / per)];
+		repLine(r, s, [NSString stringWithFormat:@"gflops=%.0f gflops_wall=%.0f gpu_ms=%.2f", flops / (g * 1e6),
+		                                         flops / (w * 1e6), g / per]);
 	}
 	return [NSString stringWithFormat:@"gflops=%.0f gflops_wall=%.0f gpu_ms=%.2f per_cb=%d %@", median(gf), median(gfw),
 	                                  median(gpu), per, spread(gf, "%.0f")];
