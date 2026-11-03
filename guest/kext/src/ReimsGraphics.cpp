@@ -34,6 +34,7 @@ constexpr UInt32 kMsgAlign = 8;
 constexpr UInt32 kRingProducer = __builtin_offsetof(RgfxRingHeader, producer);
 constexpr UInt32 kRingConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
 constexpr UInt32 kRingConsumerIdle = __builtin_offsetof(RgfxRingHeader, consumer_idle);
+constexpr UInt32 kRingProducerWaiting = __builtin_offsetof(RgfxRingHeader, producer_waiting);
 constexpr UInt32 kRingArmed = __builtin_offsetof(RgfxRingHeader, armed);
 
 // The cursor image's slot, at the region's end: 256 x 256 BGRA8, the largest
@@ -238,6 +239,8 @@ IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt
 			return kIOReturnSuccess;
 		if (!ready)
 			return kIOReturnNotReady;
+		if (askForRoom() && tryPost(type, message, size, seqno, waiterSeqno))
+			return kIOReturnSuccess;
 		if (!waitForRoom(mark, deadline)) {
 			IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
@@ -250,10 +253,20 @@ UInt64 ReimsGraphics::roomMark() const
 	return rgfxRingRoomMark(room);
 }
 
+bool ReimsGraphics::askForRoom()
+{
+	if (!submitRoom)
+		return false;
+	store32(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducerWaiting, 1);
+	fullFence();
+	return true;
+}
+
 bool ReimsGraphics::waitForRoom(UInt64 mark, uint64_t deadline)
 {
 	uint64_t backstop = 0;
-	nanoseconds_to_absolutetime(static_cast<uint64_t>(kRgfxRingRoomBackstopUs) * 1000, &backstop);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(rgfxRingRoomBackstopUs(submitRoom)) * 1000,
+	                            &backstop);
 	rgfxRingRoomWait(room);
 	IOLockLock(stateLock);
 	if (ready && rgfxRingRoomSleeps(room, mark)) {
@@ -616,6 +629,10 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	case RGFX_EVT_DISPLAY_CHANGED:
 		refreshWanted = true;
 		return;
+	case RGFX_EVT_SUBMIT_ROOM:
+		// The host took from the control ring after a post set its producer_waiting: the pass
+		// that drains this wakes the posts waiting for room (service).
+		return;
 	case RGFX_EVT_PIPELINE_REFLECTION:
 	case RGFX_EVT_SIZE_AND_ALIGN:
 	case RGFX_EVT_SAMPLER_STATE:
@@ -969,6 +986,7 @@ bool ReimsGraphics::start(IOService *provider)
 	nextSeqno = 1;
 	modeSet.reset();
 	taken = false;
+	submitRoom = false;
 
 	pci->setMemoryEnable(true);
 	pci->setBusLeadEnable(true);
@@ -1070,6 +1088,7 @@ bool ReimsGraphics::start(IOService *provider)
 		setProperty("RgfxFeaturesOffered", offered, 64);
 		setProperty("RgfxFeaturesWanted", wanted, 64);
 		setProperty("RgfxFeaturesTaken", took, 64);
+		submitRoom = (took & RGFX_FEATURE_SUBMIT_ROOM) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -2193,11 +2212,9 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 	*posted = 0;
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kPostTimeoutMs, kMillisecondScale, &deadline);
-	while (*posted < count) {
-		if (!ready)
-			return kIOReturnNotReady;
-		const UInt64 mark = roomMark();
-		// As many as fit, under one hold of the ring's lock and with one doorbell at most.
+	// As many as fit, under one hold of the ring's lock and with one doorbell at most: whether
+	// all are posted.
+	auto look = [&]() {
 		UInt32 n = 0;
 		IOSimpleLockLock(submitLock);
 		while (*posted + n < count &&
@@ -2208,7 +2225,13 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 			publishLocked();
 		IOSimpleLockUnlock(submitLock);
 		*posted += n;
-		if (*posted == count)
+		return *posted == count;
+	};
+	while (*posted < count) {
+		if (!ready)
+			return kIOReturnNotReady;
+		const UInt64 mark = roomMark();
+		if (look() || (askForRoom() && look()))
 			break;
 		if (!waitForRoom(mark, deadline)) {
 			IOLog("ReimsGraphics: command %u: the control ring stayed full\n",

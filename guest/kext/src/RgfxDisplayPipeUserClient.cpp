@@ -464,6 +464,9 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		r = framebuffer->postPresent(surface, id, &seqno);
 		if (r != kIOReturnNoSpace)
 			break;
+		if (framebuffer->askForRoom() &&
+		    (r = framebuffer->postPresent(surface, id, &seqno)) != kIOReturnNoSpace)
+			break;
 		IOLockUnlock(lock);
 		const bool more = framebuffer->waitForRoom(mark, ringDeadline);
 		IOLockLock(lock);

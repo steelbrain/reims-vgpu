@@ -2,10 +2,10 @@
 // postReleases and the display pipe's present). Header-only and free of the kernel's headers, so
 // its native test (tests/ring_room_test.cpp) builds it as the kext does.
 //
-// The host takes ring 0 on a thread of its own and writes nothing the guest is woken by as it
-// does, so a post that found no room looks again at the work loop's next pass: each device
-// interrupt makes one (an answer, a queue's completion, a refresh), and so has the host moved
-// on. A post reads the passes so far (its mark) before it looks at the ring; finding no room, it
+// The host takes ring 0 on a thread of its own, so a post that found no room looks again at the
+// work loop's next pass: each device interrupt makes one (an answer, a queue's completion, a
+// refresh, and, where the host took SUBMIT_ROOM, the record it posts once it has taken from a ring
+// whose producer_waiting the post set), and so has the host moved on. A post reads the passes so far (its mark) before it looks at the ring; finding no room, it
 // counts itself waiting, then, under the lock the work loop wakes it under, sleeps only where
 // no pass came since its mark, until the next pass or its backstop. A pass counts itself, then
 // wakes the waiters where any is counted. Each side writes its count before it reads the other's
@@ -26,8 +26,16 @@ struct RgfxRingRoom {
 };
 
 // How long a post that found no room sleeps at most before it looks again where no pass wakes
-// it sooner, in microseconds: the poll a post made before the passes woke it.
+// it sooner, in microseconds: where the host took SUBMIT_ROOM, its record makes a pass once the
+// host has taken from the ring, and the sleep's end is only a backstop; else the poll a post made
+// before the passes woke it.
 constexpr uint32_t kRgfxRingRoomBackstopUs = 1000;
+constexpr uint32_t kRgfxRingRoomEventBackstopUs = 20000;
+
+inline uint32_t rgfxRingRoomBackstopUs(bool submitRoom)
+{
+	return submitRoom ? kRgfxRingRoomEventBackstopUs : kRgfxRingRoomBackstopUs;
+}
 
 // A post's mark: the passes so far, read before it looks at the ring.
 inline uint64_t rgfxRingRoomMark(const RgfxRingRoom &r)

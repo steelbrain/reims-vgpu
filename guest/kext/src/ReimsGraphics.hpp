@@ -174,6 +174,12 @@ public:
 	// device is not ready. Thread context only, never on the work loop.
 	UInt64 roomMark() const;
 	bool waitForRoom(UInt64 mark, uint64_t deadline);
+	// Where the host took SUBMIT_ROOM: tells it that a post waits for room on the control ring
+	// (producer_waiting 1, then a full fence), so its next take posts RGFX_EVT_SUBMIT_ROOM, whose
+	// pass wakes the post. The caller then looks once more before waitForRoom: either that look
+	// finds what the host took, or the host's take finds the flag. False, nothing done, where the
+	// host did not take it.
+	bool askForRoom();
 	bool addPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
 	void removePipe(OSObject *client);
 	void setPipeVblankEnabled(OSObject *client, bool enabled);
@@ -375,6 +381,8 @@ private:
 	// The control ring's room (roomMark, waitForRoom): the work loop's passes, which it moves
 	// at each, and the posts waiting for room, which a pass wakes under stateLock. Atomic.
 	RgfxRingRoom room;
+	// The host took SUBMIT_ROOM (askForRoom), set before `ready`.
+	bool submitRoom;
 
 	// Under stateLock: answers, the lifecycle's waiters, the display and its modes, the mode
 	// set, and the scanout's owner (its task referenced, its connection retained).

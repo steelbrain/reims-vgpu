@@ -39,14 +39,16 @@ constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CON
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
                                  RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_QUEUE_VECTORS;
 // The ones it does: the bundle orders its command buffers over IOSurfaces and places its Managed
-// buffers' CPU copies in its heaps, neither of which needs anything of the kext, and makes
-// indirect command buffers, whose creates and writes the kext admits; the kext makes
-// WindowServer's queues unshared, which needs nothing of the bundle.
+// buffers' CPU copies in its heaps, neither of which needs anything of the kext, makes indirect
+// command buffers, whose creates and writes the kext admits, and a full submission ring's post
+// waits for the host's room record; the kext makes WindowServer's queues unshared, which needs
+// nothing of the bundle.
 constexpr uint64_t kOrder = RGFX_FEATURE_SURFACE_ORDER;
 constexpr uint64_t kIcb = RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS;
 constexpr uint64_t kUnshared = RGFX_FEATURE_UNSHARED_QUEUES;
 constexpr uint64_t kManaged = RGFX_FEATURE_MANAGED_AT_OFFSET;
-constexpr uint64_t kCarried = kOrder | kIcb | kUnshared | kManaged;
+constexpr uint64_t kRoom = RGFX_FEATURE_SUBMIT_ROOM;
+constexpr uint64_t kCarried = kOrder | kIcb | kUnshared | kManaged | kRoom;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -54,18 +56,22 @@ constexpr uint64_t kNew = kNotCarried | kCarried;
 int main()
 {
 	// Of the bits from 3 the kext carries out SURFACE_ORDER, INDIRECT_COMMAND_BUFFERS,
-	// UNSHARED_QUEUES and MANAGED_AT_OFFSET, and writes each only where offered.
+	// UNSHARED_QUEUES, MANAGED_AT_OFFSET and SUBMIT_ROOM, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
-	      "the kext takes SURFACE_ORDER, ICBs, UNSHARED_QUEUES and MANAGED_AT_OFFSET from bit 3");
+	      "the kext takes SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET and SUBMIT_ROOM "
+	      "from bit 3");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
 	check(RGFX_FEATURE_UNSHARED_QUEUES == (1u << 13), "UNSHARED_QUEUES is bit 13");
 	check(RGFX_FEATURE_MANAGED_AT_OFFSET == (1u << 14), "MANAGED_AT_OFFSET is bit 14");
+	check(RGFX_FEATURE_SUBMIT_ROOM == (1u << 16), "SUBMIT_ROOM is bit 16");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kRoom) == kRoom,
+	      "SUBMIT_ROOM offered, written");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 40)) == kCarried,
-	      "every bit offered, SURFACE_ORDER, ICBs, UNSHARED_QUEUES and MANAGED_AT_OFFSET written");
+	      "every bit offered, the carried bits written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kOrder) == kOrder,
 	      "SURFACE_ORDER offered, written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kIcb) == kIcb,
@@ -93,6 +99,10 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kUnshared, kUnshared) ==
 	          (kRgfxOfferedFeatures | kUnshared),
 	      "UNSHARED_QUEUES taken is in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kRoom, kRoom) == (kRgfxOfferedFeatures | kRoom),
+	      "SUBMIT_ROOM taken is in the word, for the bundle's queue rings");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kRoom, 0) == kRgfxOfferedFeatures,
+	      "SUBMIT_ROOM offered but not taken is not");
 	// A read-back of bits the kext never wrote, or of bits 0 to 2 the host does not offer, adds
 	// nothing.
 	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 40)) ==

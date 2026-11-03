@@ -75,6 +75,10 @@ int main()
 	      "a backstop past the clock's end is the deadline");
 	check(rgfxRingRoomSleepUntil(1000, 10, 1000) == 1000, "at the deadline, the deadline");
 
+	// The backstop: 1 ms where the host posts no room record, 20 ms where it does.
+	check(rgfxRingRoomBackstopUs(false) == 1000, "the poll's backstop without SUBMIT_ROOM");
+	check(rgfxRingRoomBackstopUs(true) == 20000, "a longer backstop under SUBMIT_ROOM");
+
 	std::printf("ring_room_test: %d checks passed\n", checks);
 	return 0;
 }

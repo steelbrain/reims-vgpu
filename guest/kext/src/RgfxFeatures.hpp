@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out four:
+// its bundle carry out five:
 //  - SURFACE_ORDER (bit 11): the bundle names, as it commits a command buffer that uses
 //    IOSurfaces, the buffers of other queues it runs after (design.md, "Surface order"), which
 //    needs nothing of the kext;
@@ -20,7 +20,10 @@
 //    of the bundle;
 //  - MANAGED_AT_OFFSET (bit 14): the bundle places its Managed buffers' CPU copies in heaps over
 //    its blocks (BUFFER_MANAGED_AT_OFFSET, which Submit posts as it posts BUFFER_AT_OFFSET), which
-//    needs nothing more of the kext.
+//    needs nothing more of the kext;
+//  - SUBMIT_ROOM (bit 16): a post that finds a submission ring full sets the ring's
+//    producer_waiting and waits for the host's SUBMIT_ROOM record: the framebuffer's on ring 0,
+//    the bundle's on its queues' rings.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -44,7 +47,7 @@ constexpr uint64_t kRgfxOfferedFeatures =
 // DRIVER_FEATURES where the host offers them.
 constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SURFACE_ORDER | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS |
-    RGFX_FEATURE_UNSHARED_QUEUES | RGFX_FEATURE_MANAGED_AT_OFFSET;
+    RGFX_FEATURE_UNSHARED_QUEUES | RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_SUBMIT_ROOM;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
