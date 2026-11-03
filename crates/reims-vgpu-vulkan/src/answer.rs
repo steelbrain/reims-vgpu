@@ -586,7 +586,15 @@ pub fn create<T>(
 ///     a float channel off in its last bits, and wholly where a sample is a NaN or an infinity,
 ///     measured at 2 and 4 samples on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit unorm
 ///     tie down. The runtime's notice names the attachment. MoltenVK's average is Metal's own (the
-///     runtime's `ColorResolveAverageIsMetals`), so no device on Metal announces it; a native
+///     runtime's `ColorResolveAverageIsMetals`), so no device on Metal announces it for a resolve
+///     the device averages. Also a resolve of an 8-bit UNORM attachment into its format's sRGB
+///     twin, which no device's average writes, on a device that renders the twin: the runtime's
+///     resolve after the pass decodes the samples and encodes their average by the device's own
+///     sRGB conversions, where Metal's resolve takes its 12-bit tables, and announces it on every
+///     device, MoltenVK among them (the runtime's `color_resolve.rs`; measured for `R8Unorm` and
+///     `RG8Unorm` at 4 samples on the M3 Max under macOS 27.0.1, MoltenVK 1.4.2,
+///     `encode_render`'s `resolves_into_twins_are_the_runtimes`). An sRGB attachment's resolve
+///     into its UNORM twin averages its codes by the unorm rule and announces nothing. A native
 ///     device relays it, the device's own rounding of an average and the runtime's default off
 ///     Apple's GPUs, as the class of a native device's own maths and sampling
 ///     ([`native::NATIVE_RELAYED`]), so a strict run there, this crate's tests on Linux among them,
@@ -957,7 +965,15 @@ pub fn create<T>(
 ///   `0xffc00000`). The hardware allows Metal's bits, the function selecting them itself, as the
 ///   runtime does for its own functions and a 32-bit texel's write, so it dies on every
 ///   device. Announced at each draw or dispatch that binds the pipeline's variant (where it binds
-///   a texture whose format may hold a NaN), inside its call, which dies at its selector;
+///   a texture whose format may hold a NaN), inside its call, which dies at its selector. Also
+///   a GPU blit into, out of or between textures of which one is an `RG11B10Float` texture Metal
+///   keeps losslessly compressed: Metal's blit through the compression makes a NaN field the
+///   quiet NaN, where the device's copy keeps the texels' bytes, as MoltenVK's does where the
+///   texture's image takes `STORAGE` usage or `MUTABLE_FORMAT`, which Metal keeps uncompressed
+///   (the runtime's `compressed_blit.rs` and `CompressedImageCopiesRewriteTexels`; measured on
+///   the M3 Max under macOS 27.0.1, MoltenVK 1.4.2, `encode_render`'s
+///   `drawn_nan_and_infinite_samples_resolve_as_metals`). Announced inside the blit's call, which
+///   dies at its selector;
 /// - the note `DeviceArithmetic`: a `float` division, remainder, square root, fused multiply-add
 ///   or dot product at Vulkan's precision bounds (a division within 2.5 ulp, an `Fma` that may run
 ///   unfused) where Metal answers the correctly rounded value, and a fast division's reciprocal,
@@ -1119,10 +1135,18 @@ pub fn create<T>(
 ///   attribute (`DeviceVertexConversion`) and its alpha to coverage (`DeviceAlphaCoverage`). On a
 ///   device that runs on Metal (MoltenVK) the runtime answers most as Metal's own functions,
 ///   sampler and conversions, which announce nothing there, and one announced there dies (its
-///   filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact` instead); a native
-///   device relays each as the class of a native device's own answers
-///   ([`native::NATIVE_RELAYED`]). Announced at each draw or dispatch that binds the pipeline's
-///   variant, inside its call, which dies at its selector;
+///   filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact` instead). The runtime
+///   announces `DevicePackConversion` on every device, MoltenVK among them, for a function that
+///   converts the texels of a slot or attachment of an extended-range, padded or bfloat form,
+///   which it holds in its codes and converts by the device's arithmetic (a read multiplies a
+///   code by an `f32` reciprocal, a write rounds an `f32` product, where Metal answers the
+///   correctly rounded quotient and encodes by the exact product), so on a device on Metal each
+///   draw of such a function dies of it (the runtime's `lower/arith/extended_range.rs`; measured
+///   on the M3 Max under macOS 27.0.1, MoltenVK 1.4.2: each unblended and blended draw of
+///   `encode_render`'s `half4_extended_range_blends_announce_their_source`). A native device
+///   relays each as the
+///   class of a native device's own answers ([`native::NATIVE_RELAYED`]). Announced at each draw
+///   or dispatch that binds the pipeline's variant, inside its call, which dies at its selector;
 /// - `ProvokingVertexLines` and `ProvokingVertexUnmatched`: a draw under the last provoking vertex
 ///   (`setProvokingVertexMode:` 1) of a pipeline state that reads it (a flat input, a layer or
 ///   viewport its vertex function selects, or `[[barycentric_coord]]`), which the runtime draws

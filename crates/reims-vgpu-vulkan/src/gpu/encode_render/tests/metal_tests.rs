@@ -3561,18 +3561,26 @@ const HALF4_FAST_GAP: [XrGap; 13] = [
 ];
 
 /// A `half4` output (`xr_half_fragment`, each lane a value a `half` holds, computed from the
-/// pixel), compiled with fast math ([`ROUNDING`]), blended into an attachment of each linear
-/// extended-range format under each of [`XR_BLENDS`], across passes ([`xr_across`]) and in the
-/// first draw's pass ([`xr_within`]): Metal's side draws each, and this platform's blended draw
-/// dies at its selector naming `extended-range-blend-source` ([`crate::answer::DIES`]), which
-/// the runtime announces for such an output; [`HALF4_FAST_GAP`]'s 13 configurations
-/// are where its blends missed Metal's. Each unblended draw stores Metal's values, bit for bit,
-/// and none announces `extended-range-blends-stored-codes`
+/// pixel), compiled with fast math ([`ROUNDING`]), drawn into an attachment of each linear
+/// extended-range format unblended and blended under each of [`XR_BLENDS`], across passes
+/// ([`xr_across`]) and in the first draw's pass ([`xr_within`]): Metal's side draws each, and
+/// every draw of this platform's, the blended and the unblended alike, dies at its selector
+/// naming `device-pack-conversion` ([`crate::answer::DIES`]). The runtime holds such an
+/// attachment in its codes, which the fragment function converts by the device's arithmetic
+/// (a read multiplies a code by the `f32` nearest `1 / 510`, a write rounds its value's `f32`
+/// product by 510, where Metal answers the correctly rounded quotient and encodes by the exact
+/// product), and the translation of every function that converts such a texel records
+/// `DevicePackConversion` on every device, MoltenVK among them, which a device on Metal does not
+/// relay (the runtime's `lower/arith/extended_range.rs`; measured on the M3 Max under macOS
+/// 27.0.1, MoltenVK 1.4.2, at the runtime's 57b3b26ba0: all 138 draws). That is the line a
+/// blended draw dies with, where at the runtime's earlier commits it named the render state's
+/// `extended-range-blend-source`, which the runtime announces for such an output; a draw that
+/// did not die is held to [`HALF4_FAST_GAP`], where those blends missed Metal's
 #[test]
 fn half4_extended_range_blends_announce_their_source() {
     let drawn = ("fast math", ROUNDING, "xr_half_fragment");
     let shape = (&XR_LINEAR[..], &XR_BLENDS[..]);
-    let named = "(metal2vulkan-degrade-extended-range-blend-source)";
+    let named = "(metal2vulkan-degrade-device-pack-conversion)";
     let at = "\"drawPrimitives:vertexStart:vertexCount:\"";
     let expect = XrExpect::Announced(Some(&HALF4_FAST_GAP));
     let sides = xr_sides();
@@ -3582,8 +3590,8 @@ fn half4_extended_range_blends_announce_their_source() {
         .partition(|what| what.contains(named) && what.contains(at));
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
     if sides.1.is_some() {
-        let blended = 2 * XR_LINEAR.len() * XR_BLENDS.len();
-        assert_eq!(died.len(), blended, "the blended draws that die: {died:#?}");
+        let draws = 2 * XR_LINEAR.len() * (1 + XR_BLENDS.len());
+        assert_eq!(died.len(), draws, "the draws that die: {died:#?}");
     }
 }
 
@@ -5098,17 +5106,28 @@ fn drawn_specials() -> [Vec<[f32; 4]>; 2] {
 /// A multisampled float colour attachment whose samples draws wrote as NaN (quiet, negative
 /// and of a payload), as either infinity, past the largest half or as plain values, two
 /// values in some pixels' samples, resolves as Metal's, byte for byte ([`drawn_resolved`]):
-/// `R16Float`, `RG16Float`, `RGBA16Float` and `RG11B10Float`, which MoltenVK averages by Metal's
-/// own resolve, announcing nothing (another device resolves them by the runtime's rules of
-/// Metal's resolve), and `R32Float`, which the runtime resolves by its own rule, at 2 and 4
-/// samples, resolved by
+/// `R16Float`, `RG16Float` and `RGBA16Float`, which MoltenVK averages by Metal's own resolve,
+/// announcing nothing (another device resolves them by the runtime's rules of Metal's resolve),
+/// and `R32Float`, which the runtime resolves by its own rule, at 2 and 4 samples, resolved by
 /// the drawing pass (`MultisampleResolve`, `StoreAndMultisampleResolve`) and by a later pass
-/// that loads the samples. Each case whose bytes are not Metal's is named, with the texels off
+/// that loads the samples. Each case whose bytes are not Metal's is named, with the texels off.
+/// `RG11B10Float`'s cases die at the blit that copies the resolve texture into a buffer,
+/// naming `device-nan-encoding`: Metal keeps that 64 by 64 render target, of the descriptor's
+/// default options, losslessly compressed, and its blit through the compression makes a NaN
+/// field the quiet NaN, where the
+/// device's copy keeps the texels' bytes, which the runtime announces at the blit and which
+/// dies on every device ([`crate::answer::DIES`]; the runtime's `compressed_blit.rs`; measured
+/// on the M3 Max under macOS 27.0.1, MoltenVK 1.4.2, at the runtime's 57b3b26ba0). Their
+/// resolved bytes are not compared
 #[test]
 fn drawn_nan_and_infinite_samples_resolve_as_metals() {
     /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
     const RESOLVE: u64 = 2;
     const STORE_AND_RESOLVE: u64 = 3;
+    /// The blit [`drawn_resolved`] reads the resolve texture back with.
+    const TO_BUFFER: &str = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:\
+                             toBuffer:destinationOffset:destinationBytesPerRow:\
+                             destinationBytesPerImage:";
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -5119,6 +5138,14 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
         for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
             for (format, bytes) in [(25, 2), (65, 4), (115, 8), (55, 4), (92, 4)] {
                 let case = (format, bytes, samples);
+                if format == 92 {
+                    let ours = || drawn_resolved(&p, &d, case, store, &drawn_specials());
+                    let line = died_at(TO_BUFFER, ours);
+                    if !line.contains("(metal2vulkan-degrade-device-nan-encoding)") {
+                        differ.push(format!("{format} {samples}x store {store}: {line}"));
+                    }
+                    continue;
+                }
                 let theirs = drawn_resolved(&mp, &md, case, store, &drawn_specials());
                 let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
                 let texel = usize::try_from(bytes).unwrap();
@@ -6856,9 +6883,18 @@ fn late_resolves_beside_a_dropped_one_follow_late_store_actions() {
 }
 
 /// A resolve into the attachment's sRGB twin, or across the 8-bit four-channel family's
-/// channel orders, is the runtime's to resolve or refuse ([`runtime_resolves`]): the pass of a
-/// 4-sample `R8Unorm`, `R8Unorm_sRGB`, `RG8Unorm` or `RG8Unorm_sRGB` attachment resolving into
-/// its twin is made and completes. Other pairs are not
+/// channel orders, is the runtime's to resolve or refuse ([`runtime_resolves`]). The pass of a
+/// 4-sample `R8Unorm_sRGB` or `RG8Unorm_sRGB` attachment resolving into its UNORM twin is made
+/// and completes: the runtime's resolve after the pass averages the samples' codes by the unorm
+/// rule. That of an `R8Unorm` or `RG8Unorm` attachment resolving into its sRGB twin, on a
+/// device that renders the twin, dies as it ends, at `endEncoding`, naming
+/// `device-rounded-resolve`: the runtime's resolve decodes the samples and encodes their average
+/// by the device's own sRGB conversions, where Metal's resolve takes its 12-bit tables, and the
+/// runtime announces that on every device, MoltenVK among them, which a device on Metal does not
+/// relay (the runtime's `color_resolve.rs`; measured on the M3 Max under macOS 27.0.1, MoltenVK
+/// 1.4.2, at the runtime's 57b3b26ba0). On a device that lacks the twin the runtime takes those
+/// tables and announces nothing, so the pass is made and completes (read from the runtime's
+/// code). Other pairs are not
 #[test]
 fn resolves_into_twins_are_the_runtimes() {
     use PixelFormat as P;
@@ -6890,11 +6926,29 @@ fn resolves_into_twins_are_the_runtimes() {
     for (a, b) in others {
         assert!(!runtime_resolves(a, b), "{a:?} {b:?}");
     }
+    use metal2vulkan::device::FormatUsage;
+    use metal2vulkan::vk::Format;
+
     let (p, d) = (platform(), dev());
-    for (from, into) in [(10, 11), (11, 10), (30, 31), (31, 30)] {
+    let profile = d.raw.compile_device().profile();
+    // Each pair, with the sRGB twin a UNORM attachment resolves into.
+    let pairs = [
+        (10, 11, Some(Format::R8_SRGB)),
+        (11, 10, None),
+        (30, 31, Some(Format::R8G8_SRGB)),
+        (31, 30, None),
+    ];
+    for (from, into, srgb) in pairs {
         let target = texture(&p, &d, into, READ | TARGET, (16, 16), None);
         let (cb, e) = resolving_pass(&p, &d, (from, RESOLVE), &target, (0, 0));
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        let end = || e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        if srgb.is_some_and(|twin| profile.supports_format(twin, FormatUsage::ColorAttachment)) {
+            let line = died_at("endEncoding", end);
+            let named = "(metal2vulkan-degrade-device-rounded-resolve)";
+            assert!(line.contains(named), "{from} into {into}: {line}");
+            continue;
+        }
+        end();
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{from} into {into}: {:?}", cb.error());
