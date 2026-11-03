@@ -11,6 +11,15 @@
 // The comparison is of the sorted lists: the decoder's output order is not the file's order.
 // One line a file: "decode_md5: NAME OK frames=N lock_ms_mean=M [fps=F]", "decode_md5: NAME FAIL
 // why", or "decode_md5: NAME SKIP why" where the system has no hardware decoder for the codec.
+// A FAIL of the hashed pass's frames names them, by the access unit each was decoded from (its
+// place in the file, from 0, which the tool stamps as its presentation time in 1/30 s): on the
+// line, "wrong=U,..." (a frame whose MD5 is none of the reference's, or one more of an MD5 than
+// the reference holds), "missing=U,..." (a unit no frame came back for) and "failed=U,..." (a
+// unit the decoder answered an error for), each at most 32 then "+N"; then a line a frame,
+// "decode_md5: NAME frame wrong|missing|failed unit=U type=T pts=U/30 [out=I md5=M]
+// [status=S]", T the unit's first VCL NAL unit type and I the frame's place in the output, at
+// most 100 lines. Scattered single frames read as lost writes, a run from one unit to the
+// next random access point as a reference gone wrong.
 // Exits 1 where a file failed, else 0.
 // Build (-arch arm64 for an Apple-silicon Mac):
 //   xcrun clang -arch x86_64 -mmacosx-version-min=14.0 -fobjc-arc -O2 -Wall -Wextra -Werror
@@ -39,6 +48,10 @@ static double nowMs(void)
 @interface DecodePass : NSObject
 @property BOOL hashes;
 @property NSMutableArray<NSString *> *md5s;
+// The hashed frames in the order they came back: each its MD5 and its stamp (its unit), and each
+// error its stamp and status.
+@property NSMutableArray<NSArray *> *outputs;
+@property NSMutableArray<NSArray *> *failures;
 @property int frames;
 @property int errors;
 @property double lockSum;
@@ -90,6 +103,7 @@ static void decoded(void *ref, void *frameRef, OSStatus status, VTDecodeInfoFlag
 	if (status != noErr || image == NULL) {
 		@synchronized(pass) {
 			pass.errors++;
+			[pass.failures addObject:@[ @(pts.value), @(status) ]];
 		}
 		return;
 	}
@@ -107,9 +121,80 @@ static void decoded(void *ref, void *frameRef, OSStatus status, VTDecodeInfoFlag
 			pass.format = CVPixelBufferGetPixelFormatType(image);
 		pass.frames++;
 		pass.lockSum += lock;
-		if (md5 != nil)
+		if (md5 != nil) {
 			[pass.md5s addObject:md5];
+			[pass.outputs addObject:@[ md5, @(pts.value) ]];
+		}
 	}
+}
+
+// The type of the first VCL NAL unit of `unit` (4-byte-length NAL units), -1 for none.
+static int unitType(NSData *unit, BOOL hevc)
+{
+	const uint8_t *b = unit.bytes;
+	for (size_t at = 0; at + 5 <= unit.length;) {
+		const uint32_t len = CFSwapInt32BigToHost(*(const uint32_t *)(b + at));
+		const int t = hevc ? (b[at + 4] >> 1) & 0x3f : b[at + 4] & 0x1f;
+		if (hevc ? t < 32 : t == 1 || t == 5)
+			return t;
+		at += 4 + (size_t)len;
+	}
+	return -1;
+}
+
+// `list`'s first 32 numbers joined by commas, then "+N" for the rest.
+static NSString *capped(NSArray<NSNumber *> *list)
+{
+	NSMutableString *s = [NSMutableString string];
+	for (NSUInteger i = 0; i < list.count && i < 32; i++)
+		[s appendFormat:@"%@%@", i ? @"," : @"", list[i]];
+	if (list.count > 32)
+		[s appendFormat:@"+%lu", (unsigned long)(list.count - 32)];
+	return s;
+}
+
+// The hashed pass's frames that are not the reference's, named on `line` and printed one a line
+// after it (the header says how).
+static void nameFrames(const char *n, NSArray<NSString *> *ref, NSArray<NSData *> *units, BOOL hevc,
+                       DecodePass *pass, NSMutableString *line, NSMutableArray<NSString *> *detail)
+{
+	NSCountedSet *want = [[NSCountedSet alloc] initWithArray:ref];
+	NSMutableIndexSet *back = [NSMutableIndexSet indexSet];
+	NSMutableArray<NSNumber *> *wrong = [NSMutableArray array], *missing = [NSMutableArray array],
+	                           *failed = [NSMutableArray array];
+	for (NSUInteger i = 0; i < pass.outputs.count; i++) {
+		NSString *md5 = pass.outputs[i][0];
+		NSNumber *unit = pass.outputs[i][1];
+		[back addIndex:unit.unsignedIntegerValue];
+		if ([want countForObject:md5] > 0) {
+			[want removeObject:md5];
+			continue;
+		}
+		[wrong addObject:unit];
+		[detail addObject:[NSString stringWithFormat:@"decode_md5: %s frame wrong unit=%@ type=%d pts=%@/30 out=%lu md5=%@",
+		                                             n, unit, unitType(units[unit.unsignedIntegerValue % units.count], hevc),
+		                                             unit, (unsigned long)i, md5]];
+	}
+	for (NSArray *f in pass.failures) {
+		NSNumber *unit = f[0];
+		[back addIndex:unit.unsignedIntegerValue];
+		[failed addObject:unit];
+		[detail addObject:[NSString stringWithFormat:@"decode_md5: %s frame failed unit=%@ type=%d pts=%@/30 status=%@", n,
+		                                             unit, unitType(units[unit.unsignedIntegerValue % units.count], hevc),
+		                                             unit, f[1]]];
+	}
+	for (NSUInteger u = 0; u < units.count; u++)
+		if (![back containsIndex:u]) {
+			[missing addObject:@(u)];
+			[detail addObject:[NSString stringWithFormat:@"decode_md5: %s frame missing unit=%lu type=%d pts=%lu/30", n,
+			                                             (unsigned long)u, unitType(units[u], hevc), (unsigned long)u]];
+		}
+	if (wrong.count)
+		[line appendFormat:@" wrong=%@", capped(wrong)];
+	if (missing.count)
+		[line appendFormat:@" missing=%@", capped(missing)];
+	if (failed.count)
+		[line appendFormat:@" failed=%@", capped(failed)];
 }
 
 // The NAL units of an Annex B stream, without their start codes or trailing zero bytes.
@@ -299,6 +384,8 @@ static BOOL checkFile(NSString *path, int loops)
 	DecodePass *pass = [DecodePass new];
 	pass.hashes = YES;
 	pass.md5s = [NSMutableArray array];
+	pass.outputs = [NSMutableArray array];
+	pass.failures = [NSMutableArray array];
 	double ms = decodeAll(fd, units, 1, format, pass);
 	if (ms < 0) {
 		printf("decode_md5: %s FAIL decoding: OSStatus %d\n", n, (int)ms);
@@ -318,12 +405,16 @@ static BOOL checkFile(NSString *path, int loops)
 	BOOL ok = pass.errors == 0 && [pass.md5s isEqualToArray:ref];
 	double lockMean = pass.frames ? pass.lockSum / pass.frames : 0;
 	NSMutableString *line = [NSMutableString string];
+	NSMutableArray<NSString *> *detail = [NSMutableArray array];
 	if (ok)
 		[line appendFormat:@"decode_md5: %s OK frames=%d units=%lu format=%@ lock_ms_mean=%.3f hashed_ms=%.1f", n,
 		                   pass.frames, (unsigned long)units.count, fourcc(pass.format), lockMean, ms];
 	else
+	{
 		[line appendFormat:@"decode_md5: %s FAIL frames=%d expected=%lu matching=%d errors=%d format=%@", n,
 		                   pass.frames, (unsigned long)ref.count, common, pass.errors, fourcc(pass.format)];
+		nameFrames(n, ref, units, hevc, pass, line, detail);
+	}
 	if (ok && loops > 0) {
 		DecodePass *timed = [DecodePass new];
 		double tms = decodeAll(fd, units, loops, format, timed);
@@ -336,6 +427,8 @@ static BOOL checkFile(NSString *path, int loops)
 		}
 	}
 	printf("%s\n", line.UTF8String);
+	for (NSUInteger i = 0; i < detail.count && i < 100; i++)
+		printf("%s\n", detail[i].UTF8String);
 	CFRelease(fd);
 	return ok;
 }
