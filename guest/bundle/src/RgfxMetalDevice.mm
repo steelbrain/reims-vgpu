@@ -348,6 +348,7 @@ RGFX_LOG_UNRECOGNIZED
 	mach_vm_address_t _mapBase;  // the window's base in this process (0 until the context opens)
 	mach_vm_size_t _mapSize;     // the window's size, the region's
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
+	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
 }
 
 RGFX_LOG_UNRECOGNIZED
@@ -475,6 +476,7 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
+	_stateCache = [[RgfxStateCache alloc] initWithDevice:self serializer:_serializer];
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
@@ -498,6 +500,11 @@ RGFX_LOG_UNRECOGNIZED
 - (RgfxIdSpace *)ids
 {
 	return &_ids;
+}
+
+- (RgfxStateCache *)stateCache
+{
+	return _stateCache;
 }
 
 - (const RgfxVideoCaps *)videoCaps

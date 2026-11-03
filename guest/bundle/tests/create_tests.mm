@@ -22,6 +22,7 @@
 #import "RgfxIOSurface.h"
 #import "RgfxSampler.h"
 #import "RgfxSharedEvent.h"
+#import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 
 #include "RgfxObjectModel.hpp"
@@ -395,6 +396,30 @@ void test_refused_depth_stencil_create_is_nil()
 	      nil);
 }
 
+// The device's state cache keeps nothing for a create the device never got: the next equal
+// create is posted, and only an object made is answered again for an equal descriptor.
+void test_refused_state_is_not_cached()
+{
+	Refusing &r = *new Refusing();
+	RgfxStateCache *cache = [[RgfxStateCache alloc] initWithDevice:nil serializer:&r.ser];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+	@autoreleasepool {
+		CHECK([cache samplerWithDescriptor:sd] == nil);
+		CHECK([cache depthStencilStateWithDescriptor:dd] == nil);
+		CHECK(r.taken.empty());
+		r.allow = 2;
+		id<MTLSamplerState> sampler = [cache samplerWithDescriptor:sd];
+		id<MTLDepthStencilState> state = [cache depthStencilStateWithDescriptor:dd];
+		CHECK(sampler != nil && state != nil);
+		CHECK(r.taken == std::vector<uint32_t>(
+		                     {RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE}));
+		CHECK([cache samplerWithDescriptor:sd] == sampler);
+		CHECK([cache depthStencilStateWithDescriptor:dd] == state);
+		CHECK(r.taken.size() == 2);
+	}
+}
+
 } // namespace
 
 void rgfxCreateTests()
@@ -408,4 +433,5 @@ void rgfxCreateTests()
 	test_refused_shared_event_create_is_nil();
 	test_refused_sampler_create_is_nil();
 	test_refused_depth_stencil_create_is_nil();
+	test_refused_state_is_not_cached();
 }

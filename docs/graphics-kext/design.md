@@ -759,7 +759,12 @@ are the only kind with chunks.
 **Objects go with their wrappers.** Every host object the bundle makes goes
 from the host as the app lets its wrapper go. A buffer, heap, texture, sampler,
 depth-stencil state, render or compute pipeline, library, event, fence or shared
-event posts its `OBJECT_DESTROY` from its dealloc. A queue ends through the kext
+event posts its `OBJECT_DESTROY` from its dealloc. Samplers and depth-stencil
+states are made once a descriptor: the device answers an equal descriptor,
+label included, with the object it made, as the M3 Max's Metal does, and keeps
+the last 64 of each kind it made after the app lets them go, so an app that
+makes one every frame pays one create (`guest/bundle/src/RgfxStateCache.h`).
+A queue ends through the kext
 (user-client selector 0x104), which stops watching its completion ring and
 posts the destroy. Command buffers ride their queues' own rings, so a destroy
 must not reach the host before a buffer that names the object. A command buffer

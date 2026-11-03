@@ -50,6 +50,7 @@
 
 #import "RgfxArgumentEncoder.h" // RgfxRegionHolder
 #import "RgfxMetalPrivate.h"
+#import "RgfxStateCache.h"
 
 #include "RgfxCaps.hpp"
 #include "RgfxObjectModel.hpp"
@@ -79,6 +80,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// The per-device id space (object ids, GPU addresses, resource ids).
 - (RgfxIdSpace *)ids;
+
+/// The device's samplers and depth/stencil states, one for equal descriptors (RgfxStateCache.h).
+/// Nil where the wire handshake failed.
+- (nullable RgfxStateCache *)stateCache;
 
 /// The host device's caps (identity, limits, features). Invalid until the device
 /// region's caps blob is read.

@@ -29,7 +29,7 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
-class RgfxSerializer;
+#include "RgfxSerializer.hpp" // RgfxSamplerParams
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -37,14 +37,21 @@ NS_ASSUME_NONNULL_BEGIN
 @interface RgfxSampler : RgfxResource <MTLSamplerState>
 
 /// Creates a sampler state of shape `descriptor`, serialising an
-/// `RGFX_CMD_SAMPLER_CREATE` through `serializer` (which picks the objId).
-/// `device` is the owning shell (nil in a unit test). Returns nil if `serializer`
-/// is null or `descriptor` is nil.
+/// `RGFX_CMD_SAMPLER_CREATE` through `serializer` (which picks the objId), labelled with the
+/// descriptor's label (nil for an empty one, as Metal's). A new object each call: the device
+/// answers equal descriptors with one through its RgfxStateCache. `device` is the owning shell
+/// (nil in a unit test). Returns nil if `serializer` is null or `descriptor` is nil.
 + (nullable instancetype)samplerWithDescriptor:(MTLSamplerDescriptor *)descriptor
                                         device:(nullable id<MTLDevice>)device
                                     serializer:(nullable RgfxSerializer *)serializer;
 
 @end
+
+#ifdef __cplusplus
+/// `descriptor`'s state as SAMPLER_CREATE carries it: each enum its Metal raw value, the LOD
+/// clamps as floats, the three booleans in `flags`.
+RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *descriptor);
+#endif
 
 NS_ASSUME_NONNULL_END
 

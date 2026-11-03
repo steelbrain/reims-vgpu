@@ -3,8 +3,9 @@
  * MTLDevice (the category split is described in RgfxMetalDevice.h). It implements
  * the device's MTLDevice resource creators — buffers, textures, samplers,
  * depth/stencil states and heaps — each a thin forwarder to the matching wrapper
- * factory (RgfxBuffer/RgfxTexture/RgfxSampler/RgfxDepthStencilState/RgfxHeap),
- * routing through the device's `-serializer`.
+ * factory (RgfxBuffer/RgfxTexture/RgfxHeap), routing through the device's
+ * `-serializer`, or, for samplers and depth/stencil states, to the device's
+ * RgfxStateCache, which answers equal descriptors with one object.
  *
  * Like the device class itself, this category is COMPILED into the bundle but not
  * linked into the user-space unit test: it names RgfxMetalDevice, which subclasses

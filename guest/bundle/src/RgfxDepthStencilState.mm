@@ -8,13 +8,7 @@
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxStencilDescriptor (wire)
 
-namespace {
-
-/// Maps one face of an MTLStencilDescriptor into the wire's RgfxStencilDescriptor.
-/// Each enum is carried as its Metal raw value. A nil face (Metal's default) maps
-/// to the zero-initialised descriptor, which is MTLCompareFunctionNever and the
-/// keep operations.
-RgfxStencilDescriptor rgfxStencilFromMTL(MTLStencilDescriptor *s)
+RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 {
 	RgfxStencilDescriptor out = {};
 	if (s == nil) {
@@ -28,8 +22,6 @@ RgfxStencilDescriptor rgfxStencilFromMTL(MTLStencilDescriptor *s)
 	out.write_mask = s.writeMask;
 	return out;
 }
-
-} // namespace
 
 @implementation RgfxDepthStencilState
 
@@ -47,16 +39,20 @@ RgfxStencilDescriptor rgfxStencilFromMTL(MTLStencilDescriptor *s)
 	if (serializer == nullptr || descriptor == nil) {
 		return nil; // a state must have a route and a shape
 	}
-	RgfxStencilDescriptor front = rgfxStencilFromMTL(descriptor.frontFaceStencil);
-	RgfxStencilDescriptor back = rgfxStencilFromMTL(descriptor.backFaceStencil);
+	RgfxStencilDescriptor front = RgfxStencilOf(descriptor.frontFaceStencil);
+	RgfxStencilDescriptor back = RgfxStencilOf(descriptor.backFaceStencil);
 	RgfxCreated created = serializer->createDepthStencil(
 	    static_cast<uint32_t>(descriptor.depthCompareFunction),
 	    descriptor.depthWriteEnabled ? true : false, front, back);
 	if (serializer->refused(created))
 		return nil; // the device never got it
-	return [[RgfxDepthStencilState alloc] initWithObjId:created.obj_id
-	                                             device:device
-	                                         serializer:serializer];
+	RgfxDepthStencilState *state = [[RgfxDepthStencilState alloc] initWithObjId:created.obj_id
+	                                                                     device:device
+	                                                                 serializer:serializer];
+	// The descriptor's label, nil for an empty one (measured on the M3 Max under macOS 27).
+	if (state != nil && descriptor.label.length != 0)
+		state.label = descriptor.label;
+	return state;
 }
 
 // The state's id in an argument buffer or an indirect command buffer: the depth/stencil create

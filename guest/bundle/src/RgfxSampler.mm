@@ -8,12 +8,9 @@
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxSamplerParams
 
-namespace {
-
-/// Maps an MTLSamplerDescriptor into the serialiser's RgfxSamplerParams. Each
-/// enum is carried as its Metal raw value; the LOD clamps travel as floats (the
-/// serialiser stores their bits); the three booleans pack into `flags`.
-RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
+// Each enum is carried as its Metal raw value; the LOD clamps travel as floats (the serialiser
+// stores their bits); the three booleans pack into `flags`.
+RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *d)
 {
 	RgfxSamplerParams out = {};
 	out.min_filter = static_cast<uint32_t>(d.minFilter);
@@ -31,8 +28,6 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	            (d.supportArgumentBuffers ? 0x4u : 0u);
 	return out;
 }
-
-} // namespace
 
 @interface RgfxSampler () <RgfxMetalSamplerInternals>
 @end
@@ -55,7 +50,7 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	if (serializer == nullptr || descriptor == nil) {
 		return nil; // a sampler must have a route and a shape
 	}
-	RgfxSamplerParams params = rgfxSamplerParamsFromMTL(descriptor);
+	RgfxSamplerParams params = RgfxSamplerParamsOf(descriptor);
 	RgfxCreated created = serializer->createSampler(params);
 	// A create the device never got, one the host refused, or one not answered
 	// (kRgfxNoAnswer), made no sampler: nil, as Metal answers a sampler it cannot make. One the
@@ -67,8 +62,12 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	RgfxSampler *sampler = [[RgfxSampler alloc] initWithObjId:created.obj_id
 	                                                    device:device
 	                                                serializer:serializer];
-	if (sampler)
+	if (sampler) {
 		sampler->_resourceId = created.resource_id;
+		// The descriptor's label, nil for an empty one (measured on the M3 Max under macOS 27).
+		if (descriptor.label.length != 0)
+			sampler.label = descriptor.label;
+	}
 	return sampler;
 }
 

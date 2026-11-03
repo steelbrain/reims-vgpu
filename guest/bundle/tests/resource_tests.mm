@@ -11,20 +11,24 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <thread>
 #include <vector>
 
 #include <IOSurface/IOSurface.h>
 
 #import "RgfxBuffer.h"
+#import "RgfxDepthStencilState.h"
 #import "RgfxEvent.h"
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxSampler.h"
 #import "RgfxSharedEvent.h"
+#import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -825,6 +829,325 @@ void test_sampler_answers()
 	drainRing(fx.ring);
 }
 
+// A fake device that answers each sampler create SAMPLER_STATE with the next id, or refuses it,
+// counting the creates it was asked; `delay` holds each answer, as a host round trip does.
+struct CountingSamplerAnswer {
+	std::atomic<int> asks{0};
+	std::atomic<uint64_t> next{1};
+	std::atomic<uint32_t> status{RGFX_STATUS_OK};
+	std::chrono::microseconds delay{0};
+
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		CountingSamplerAnswer *self = static_cast<CountingSamplerAnswer *>(context);
+		self->asks++;
+		if (self->delay.count() != 0)
+			std::this_thread::sleep_for(self->delay);
+		RgfxSamplerState answer = {};
+		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 0};
+		answer.status = self->status.load();
+		answer.gpu_resource_id = answer.status == RGFX_STATUS_OK ? self->next++ : 0;
+		CHECK(size == sizeof(RgfxSamplerCreate) && message != nullptr);
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// Whether `ring` holds an OBJECT_DESTROY of `objId`, reading every message on it.
+bool ringDestroys(TestRing &ring, uint64_t objId)
+{
+	bool found = false;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (ring.next(&h, &bytes)) {
+		if (h.type != RGFX_CMD_OBJECT_DESTROY || bytes.size() < sizeof(RgfxObjectDestroy))
+			continue;
+		RgfxObjectDestroy m = {};
+		std::memcpy(&m, bytes.data(), sizeof(m));
+		found = found || m.obj_id == objId;
+	}
+	return found;
+}
+
+// The device answers an equal sampler descriptor with the sampler it made, with no second
+// create, as Metal's does on the M3 Max (macOS 27): every property is compared, the label among
+// them, an empty label as none and -0.0 as 0.0; a sampler the host refused is not kept, so the
+// next create asks again.
+void test_state_cache_samplers()
+{
+	Fixture fx;
+	CountingSamplerAnswer answer;
+	fx.ser.setAsker(&CountingSamplerAnswer::ask, &answer);
+	RgfxStateCache *cache = [[RgfxStateCache alloc] initWithDevice:nil serializer:&fx.ser];
+	@autoreleasepool {
+		MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+		d.minFilter = MTLSamplerMinMagFilterLinear;
+		id<MTLSamplerState> a = [cache samplerWithDescriptor:d];
+		id<MTLSamplerState> b = [cache samplerWithDescriptor:d];
+		id<MTLSamplerState> copied = [cache samplerWithDescriptor:[d copy]];
+		CHECK(a != nil && a == b && a == copied && answer.asks == 1);
+		CHECK(a.label == nil && a.gpuResourceID._impl == 1);
+
+		MTLSamplerDescriptor *zero = [d copy];
+		zero.lodMinClamp = -0.0f;
+		CHECK([cache samplerWithDescriptor:zero] == a && answer.asks == 1);
+
+		MTLSamplerDescriptor *other = [d copy];
+		other.minFilter = MTLSamplerMinMagFilterNearest;
+		id<MTLSamplerState> c = [cache samplerWithDescriptor:other];
+		CHECK(c != nil && c != a && answer.asks == 2);
+		MTLSamplerDescriptor *argBuf = [d copy];
+		argBuf.supportArgumentBuffers = YES;
+		id<MTLSamplerState> e = [cache samplerWithDescriptor:argBuf];
+		CHECK(e != nil && e != a && answer.asks == 3);
+		if ([d respondsToSelector:@selector(lodBias)]) {
+			MTLSamplerDescriptor *bias = [d copy];
+			bias.lodBias = 0.5f;
+			MTLSamplerDescriptor *reduce = [d copy];
+			reduce.reductionMode = MTLSamplerReductionModeMinimum;
+			id<MTLSamplerState> biased = [cache samplerWithDescriptor:bias];
+			id<MTLSamplerState> reduced = [cache samplerWithDescriptor:reduce];
+			CHECK(biased != a && reduced != a && biased != reduced && answer.asks == 5);
+		}
+
+		// Labels: each its own object, answering its label; an empty one is none.
+		const int before = answer.asks;
+		MTLSamplerDescriptor *first = [d copy];
+		first.label = @"first";
+		id<MTLSamplerState> f1 = [cache samplerWithDescriptor:first];
+		MTLSamplerDescriptor *second = [d copy];
+		second.label = @"second";
+		id<MTLSamplerState> s1 = [cache samplerWithDescriptor:second];
+		first.label = [NSMutableString stringWithString:@"first"];
+		id<MTLSamplerState> f2 = [cache samplerWithDescriptor:first];
+		CHECK(f1 != a && s1 != a && f1 != s1 && f1 == f2 && answer.asks == before + 2);
+		CHECK([f1.label isEqualToString:@"first"] && [s1.label isEqualToString:@"second"]);
+		CHECK(a.label == nil);
+		MTLSamplerDescriptor *empty = [d copy];
+		empty.label = @"";
+		CHECK([cache samplerWithDescriptor:empty] == a && answer.asks == before + 2);
+
+		// A refused create makes nothing and keeps nothing.
+		MTLSamplerDescriptor *refused = [d copy];
+		refused.maxAnisotropy = 4;
+		answer.status = RGFX_STATUS_REFUSED;
+		CHECK([cache samplerWithDescriptor:refused] == nil && answer.asks == before + 3);
+		answer.status = RGFX_STATUS_OK;
+		id<MTLSamplerState> later = [cache samplerWithDescriptor:refused];
+		CHECK(later != nil && answer.asks == before + 4);
+		CHECK([cache samplerWithDescriptor:nil] == nil);
+	}
+	drainRing(fx.ring);
+	fx.ser.setAsker(nullptr, nullptr);
+}
+
+// The cache keeps the last samplers and depth/stencil states it made after the app lets them
+// go, so an app that makes one again and again pays one create; one made before the last
+// keptCount goes as the app lets it go, posting its destroy.
+void test_state_cache_keeps_the_last_made()
+{
+	Fixture fx;
+	CountingSamplerAnswer answer;
+	fx.ser.setAsker(&CountingSamplerAnswer::ask, &answer);
+	RgfxStateCache *cache = [[RgfxStateCache alloc] initWithDevice:nil serializer:&fx.ser];
+	const NSUInteger kept = RgfxStateCache.keptCount;
+	CHECK(kept > 1);
+	MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+	d.magFilter = MTLSamplerMinMagFilterLinear;
+	__weak id<MTLSamplerState> weakSampler = nil;
+	uint64_t samplerObj = 0;
+	for (int frame = 0; frame < 10; frame++) {
+		@autoreleasepool {
+			id<MTLSamplerState> s = [cache samplerWithDescriptor:d];
+			CHECK(s != nil);
+			if (frame == 0) {
+				weakSampler = s;
+				samplerObj = ((RgfxSampler *)s).rgfxObjId;
+			}
+			CHECK(s == weakSampler);
+		}
+	}
+	CHECK(answer.asks == 1 && weakSampler != nil);
+	CHECK(!ringDestroys(fx.ring, samplerObj));
+
+	MTLDepthStencilDescriptor *z = [MTLDepthStencilDescriptor new];
+	z.depthCompareFunction = MTLCompareFunctionLess;
+	__weak id<MTLDepthStencilState> weakState = nil;
+	uint64_t stateObj = 0;
+	for (int frame = 0; frame < 10; frame++) {
+		@autoreleasepool {
+			id<MTLDepthStencilState> s = [cache depthStencilStateWithDescriptor:z];
+			CHECK(s != nil);
+			if (frame == 0) {
+				weakState = s;
+				stateObj = ((RgfxDepthStencilState *)s).rgfxObjId;
+				(void)expectMessage<RgfxDepthStencilCreate>(fx.ring, RGFX_CMD_DEPTH_STENCIL_CREATE);
+			}
+			CHECK(s == weakState);
+		}
+	}
+	CHECK(ringEmpty(fx.ring) && weakState != nil);
+
+	// keptCount more of each, let go as made: the first ones go, and post their destroys.
+	for (NSUInteger i = 0; i < kept; i++) {
+		@autoreleasepool {
+			MTLSamplerDescriptor *n = [d copy];
+			n.lodMinClamp = 1.0f + static_cast<float>(i);
+			CHECK([cache samplerWithDescriptor:n] != nil);
+			MTLDepthStencilDescriptor *m = [z copy];
+			MTLStencilDescriptor *face = [MTLStencilDescriptor new];
+			face.readMask = static_cast<uint32_t>(i);
+			m.frontFaceStencil = face;
+			CHECK([cache depthStencilStateWithDescriptor:m] != nil);
+		}
+	}
+	CHECK(weakSampler == nil && weakState == nil);
+	CHECK(answer.asks == static_cast<int>(kept) + 1);
+	{
+		bool samplerGone = false, stateGone = false;
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		while (fx.ring.next(&h, &bytes)) {
+			if (h.type != RGFX_CMD_OBJECT_DESTROY)
+				continue;
+			RgfxObjectDestroy m = {};
+			std::memcpy(&m, bytes.data(), sizeof(m));
+			samplerGone = samplerGone || m.obj_id == samplerObj;
+			stateGone = stateGone || m.obj_id == stateObj;
+		}
+		CHECK(samplerGone && stateGone);
+	}
+	// One the app still holds lives past them, and is answered while it does.
+	id<MTLSamplerState> held = nil;
+	@autoreleasepool {
+		held = [cache samplerWithDescriptor:d];
+		for (NSUInteger i = 0; i < kept; i++) {
+			MTLSamplerDescriptor *n = [d copy];
+			n.lodMaxClamp = 100.0f + static_cast<float>(i);
+			CHECK([cache samplerWithDescriptor:n] != nil);
+		}
+	}
+	const int asks = answer.asks;
+	CHECK([cache samplerWithDescriptor:d] == held && answer.asks == asks);
+	held = nil;
+	cache = nil; // what it kept goes, posting the destroys while the transport lives
+	drainRing(fx.ring);
+	fx.ser.setAsker(nullptr, nullptr);
+}
+
+// Equal depth/stencil descriptors answer one state, with one create on the ring; a face set to
+// nil equals a default face, as on the M3 Max (MTLDepthStencilDescriptor's faces are
+// null_resettable); the label is compared and answered as a sampler's.
+void test_state_cache_depth_stencil()
+{
+	Fixture fx;
+	RgfxStateCache *cache = [[RgfxStateCache alloc] initWithDevice:nil serializer:&fx.ser];
+	@autoreleasepool {
+		MTLDepthStencilDescriptor *z = [MTLDepthStencilDescriptor new];
+		z.depthCompareFunction = MTLCompareFunctionLess;
+		z.depthWriteEnabled = YES;
+		id<MTLDepthStencilState> a = [cache depthStencilStateWithDescriptor:z];
+		auto msg = expectMessage<RgfxDepthStencilCreate>(fx.ring, RGFX_CMD_DEPTH_STENCIL_CREATE);
+		CHECK(msg.obj_id == ((RgfxDepthStencilState *)a).rgfxObjId);
+		CHECK(msg.front.stencil_compare == MTLCompareFunctionAlways &&
+		      msg.front.read_mask == 0xffffffffu && msg.back.write_mask == 0xffffffffu);
+		MTLDepthStencilDescriptor *same = [MTLDepthStencilDescriptor new];
+		same.depthCompareFunction = MTLCompareFunctionLess;
+		same.depthWriteEnabled = YES;
+		same.frontFaceStencil = nil;
+		same.backFaceStencil = [MTLStencilDescriptor new];
+		CHECK([cache depthStencilStateWithDescriptor:same] == a);
+		CHECK([cache depthStencilStateWithDescriptor:z] == a && ringEmpty(fx.ring));
+		CHECK(a.label == nil);
+
+		z.label = @"depth";
+		id<MTLDepthStencilState> labelled = [cache depthStencilStateWithDescriptor:z];
+		(void)expectMessage<RgfxDepthStencilCreate>(fx.ring, RGFX_CMD_DEPTH_STENCIL_CREATE);
+		CHECK(labelled != a && [labelled.label isEqualToString:@"depth"] && a.label == nil);
+		CHECK([cache depthStencilStateWithDescriptor:z] == labelled && ringEmpty(fx.ring));
+		z.label = @"";
+		CHECK([cache depthStencilStateWithDescriptor:z] == a && ringEmpty(fx.ring));
+
+		MTLDepthStencilDescriptor *other = [same copy];
+		MTLStencilDescriptor *back = [MTLStencilDescriptor new];
+		back.stencilFailureOperation = MTLStencilOperationZero;
+		other.backFaceStencil = back;
+		id<MTLDepthStencilState> b = [cache depthStencilStateWithDescriptor:other];
+		auto bmsg = expectMessage<RgfxDepthStencilCreate>(fx.ring, RGFX_CMD_DEPTH_STENCIL_CREATE);
+		CHECK(b != a && bmsg.back.stencil_fail_op == MTLStencilOperationZero);
+		CHECK([cache depthStencilStateWithDescriptor:nil] == nil);
+	}
+	drainRing(fx.ring);
+	RgfxStateCache *none = [[RgfxStateCache alloc] initWithDevice:nil serializer:nullptr];
+	CHECK([none samplerWithDescriptor:[MTLSamplerDescriptor new]] == nil);
+	CHECK([none depthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]] == nil);
+}
+
+// Threads that make one descriptor's sampler and depth/stencil state at once all get one
+// object of each, while each create waits on the host as a round trip does.
+void test_state_cache_threads()
+{
+	Fixture fx;
+	CountingSamplerAnswer answer;
+	answer.delay = std::chrono::microseconds(500);
+	fx.ser.setAsker(&CountingSamplerAnswer::ask, &answer);
+	RgfxStateCache *cache = [[RgfxStateCache alloc] initWithDevice:nil serializer:&fx.ser];
+	constexpr int kThreads = 8, kEach = 50;
+	std::vector<uintptr_t> samplers(kThreads * kEach), states(kThreads * kEach);
+	std::vector<std::thread> threads;
+	for (int t = 0; t < kThreads; t++) {
+		threads.emplace_back([&, t] {
+			for (int i = 0; i < kEach; i++) {
+				@autoreleasepool {
+					MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+					d.mipFilter = MTLSamplerMipFilterLinear;
+					MTLDepthStencilDescriptor *z = [MTLDepthStencilDescriptor new];
+					z.depthCompareFunction = MTLCompareFunctionGreater;
+					id<MTLSamplerState> s = [cache samplerWithDescriptor:d];
+					id<MTLDepthStencilState> ds = [cache depthStencilStateWithDescriptor:z];
+					samplers[t * kEach + i] = reinterpret_cast<uintptr_t>((__bridge void *)s);
+					states[t * kEach + i] = reinterpret_cast<uintptr_t>((__bridge void *)ds);
+				}
+			}
+		});
+	}
+	for (std::thread &t : threads)
+		t.join();
+	for (size_t i = 0; i < samplers.size(); i++) {
+		CHECK(samplers[i] != 0 && samplers[i] == samplers[0]);
+		CHECK(states[i] != 0 && states[i] == states[0]);
+	}
+	CHECK(answer.asks >= 1 && answer.asks <= kThreads);
+	cache = nil;
+	drainRing(fx.ring);
+	fx.ser.setAsker(nullptr, nullptr);
+}
+
+// The factories label what they make with the descriptor's label, as Metal's do; an empty one
+// is none.
+void test_state_labels()
+{
+	Fixture fx;
+	@autoreleasepool {
+		MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+		d.label = @"sampler";
+		RgfxSampler *s = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&fx.ser];
+		CHECK([s.label isEqualToString:@"sampler"]);
+		d.label = @"";
+		CHECK([RgfxSampler samplerWithDescriptor:d device:nil serializer:&fx.ser].label == nil);
+		MTLDepthStencilDescriptor *z = [MTLDepthStencilDescriptor new];
+		z.label = @"state";
+		RgfxDepthStencilState *ds = [RgfxDepthStencilState depthStencilStateWithDescriptor:z
+		                                                                            device:nil
+		                                                                        serializer:&fx.ser];
+		CHECK([ds.label isEqualToString:@"state"]);
+	}
+	drainRing(fx.ring);
+}
+
 // A shared event answers itself as its IOSurface shared event, as Metal's; a plain event answers
 // no such member.
 void test_shared_event_answers()
@@ -856,5 +1179,10 @@ void rgfxResourceTests()
 	test_texture_compression();
 	test_texture_answers();
 	test_sampler_answers();
+	test_state_cache_samplers();
+	test_state_cache_keeps_the_last_made();
+	test_state_cache_depth_stencil();
+	test_state_cache_threads();
+	test_state_labels();
 	test_shared_event_answers();
 }

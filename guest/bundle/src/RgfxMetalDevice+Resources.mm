@@ -8,11 +8,10 @@
 
 #import "RgfxBlockCall.h"
 #import "RgfxBuffer.h"
-#import "RgfxDepthStencilState.h"
 #import "RgfxHeap.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
-#import "RgfxSampler.h"
+#import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
@@ -174,20 +173,19 @@
 
 // --- samplers ----------------------------------------------------------------
 
+// An equal descriptor's sampler where the device holds it, as Metal's (RgfxStateCache.h); none
+// where the wire handshake failed.
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)descriptor
 {
-	return [RgfxSampler samplerWithDescriptor:descriptor
-	                                   device:self
-	                               serializer:[self serializer]];
+	return [[self stateCache] samplerWithDescriptor:descriptor];
 }
 
 // --- depth/stencil state -----------------------------------------------------
 
+// As newSamplerStateWithDescriptor:.
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
 {
-	return [RgfxDepthStencilState depthStencilStateWithDescriptor:descriptor
-	                                                      device:self
-	                                                  serializer:[self serializer]];
+	return [[self stateCache] depthStencilStateWithDescriptor:descriptor];
 }
 
 // --- heaps -------------------------------------------------------------------

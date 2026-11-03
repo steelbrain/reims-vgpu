@@ -23,7 +23,7 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
-class RgfxSerializer;
+#include "RgfxSerializer.hpp" // RgfxStencilDescriptor
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -31,14 +31,24 @@ NS_ASSUME_NONNULL_BEGIN
 @interface RgfxDepthStencilState : RgfxResource <MTLDepthStencilState>
 
 /// Creates a depth/stencil state of shape `descriptor`, serialising an
-/// `RGFX_CMD_DEPTH_STENCIL_CREATE` through `serializer` (which picks the objId).
-/// `device` is the owning shell (nil in a unit test). Returns nil if `serializer`
-/// is null or `descriptor` is nil.
+/// `RGFX_CMD_DEPTH_STENCIL_CREATE` through `serializer` (which picks the objId), labelled with
+/// the descriptor's label (nil for an empty one, as Metal's). A new object each call: the
+/// device answers equal descriptors with one through its RgfxStateCache. `device` is the owning
+/// shell (nil in a unit test). Returns nil if `serializer` is null or `descriptor` is nil, or
+/// where the device never got the create.
 + (nullable instancetype)depthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
                                                   device:(nullable id<MTLDevice>)device
                                               serializer:(nullable RgfxSerializer *)serializer;
 
 @end
+
+#ifdef __cplusplus
+/// One face of a depth/stencil descriptor as DEPTH_STENCIL_CREATE carries it, each enum its
+/// Metal raw value. A nil face is the zero record (MTLCompareFunctionNever, the keep
+/// operations, no mask bits); MTLDepthStencilDescriptor's faces are never nil (null_resettable:
+/// a face set to nil reads back as a new MTLStencilDescriptor).
+RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *_Nullable face);
+#endif
 
 NS_ASSUME_NONNULL_END
 
