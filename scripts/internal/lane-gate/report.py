@@ -611,6 +611,10 @@ def compare(run, base, noise):
             items[name] = {"status": "NOTRUN", "detail": f"the {part} part did not run"}
             # The bench leg reports and never blocks: a run without it is still complete.
             incomplete = incomplete or part != "bench"
+        elif part in ("boot", "bench") and items.get("step." + part, {}).get("status") == "FAIL":
+            # A boot that failed before its guest ran fails once, as step.boot (or step.bench).
+            items[name] = {"status": "NOTRUN", "detail": f"step.{part} failed before it"}
+            incomplete = incomplete or part != "bench"
         elif b["status"] == "PASS":
             items[name] = {"status": "FAIL", "detail": "missing, where the baseline passed"}
     # A failure an entry of the known-failures list matches exactly is KNOWN and decides nothing.
