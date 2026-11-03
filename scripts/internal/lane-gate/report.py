@@ -394,7 +394,9 @@ def compare(run, base, noise):
     ran = set(run.meta.get("ran", []))
     for name, b in sorted((base or {}).get("items", {}).items()):
         # Publishing is the tips' alone (--publish): a run without it misses nothing.
-        if name in items or name == "step.publish":
+        if name == "step.publish" and name not in items:
+            continue
+        if name in items:
             if b["status"] == "PASS" and items[name]["status"] == "SKIP":
                 items[name] = {"status": "FAIL", "detail": "SKIP, where the baseline passed: " + items[name]["detail"]}
             # A drag the baseline made that does not move the window now may be the candidate's doing.
