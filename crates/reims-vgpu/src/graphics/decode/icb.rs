@@ -681,7 +681,7 @@ fn slot_fields(
         | RGFX_ICB_SLOT_PIPELINE
         | RGFX_ICB_SLOT_ACTION
         | RGFX_ICB_SLOT_BARRIER
-        | bits(a) * RGFX_ICB_SLOT_BUFFER_0;
+        | (bits(a) * RGFX_ICB_SLOT_BUFFER_0);
     if !render {
         known |= RGFX_ICB_SLOT_STAGE_IN | RGFX_ICB_SLOT_IMAGEBLOCK;
     }
