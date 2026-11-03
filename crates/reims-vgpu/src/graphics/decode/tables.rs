@@ -108,6 +108,11 @@ pub(crate) struct Entry<P: Platform> {
     /// A heap over a pages block's guest RAM (`HEAP_OVER_PAGES`): the host bytes it lies in, its
     /// first byte and length, which `span`, the block's, does not name.
     pub(crate) ram: Option<(HostPtr, u64)>,
+    /// A buffer over a block's surface view (`BUFFER_OVER_SURFACE_PAGES`), whose drop may be the
+    /// last hold of the view's mapping and lets go of an import, and gives back nothing the guest
+    /// picked (the host places it): it is let go of on the surface worker
+    /// ([`super::surface_pages`]).
+    pub(crate) over_view: bool,
     /// The table's clock at its make.
     made: u64,
 }
@@ -122,6 +127,7 @@ impl<P: Platform> Entry<P> {
             place: None,
             queue: None,
             ram: None,
+            over_view: false,
             made: 0,
         }
     }
@@ -129,6 +135,12 @@ impl<P: Platform> Entry<P> {
     /// The entry, lying over `span`.
     pub(crate) fn over(mut self, span: Option<(u64, u64)>) -> Self {
         self.span = span;
+        self
+    }
+
+    /// The entry, a buffer over a block's surface view (the field `over_view`).
+    pub(crate) fn over_view(mut self) -> Self {
+        self.over_view = true;
         self
     }
 }

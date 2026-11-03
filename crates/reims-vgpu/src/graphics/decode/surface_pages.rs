@@ -508,11 +508,6 @@ impl<P: Platform> SurfaceViews<P> {
         self.resets
     }
 
-    /// Whether the block at `block` has a view.
-    pub(crate) fn holds(&self, block: u64) -> bool {
-        self.by_block.contains_key(&block)
-    }
-
     /// The view of the block at `m.block_offset`, where its holders' part holds the
     /// `m.block_size` bytes `m` names and the view at least `m.length` bytes.
     pub(crate) fn view_for(&self, m: &RgfxBufferOverSurfacePages) -> Option<Arc<SurfaceView<P>>> {
@@ -801,21 +796,17 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         // A block with a device cache: the buffer is the cache, over the surface's bytes in the
         // pages' layout (`surface_cache`).
         let cache = (self.surface_caches.lock().buffer(m.block_offset)).map(|c| c.clone_ref());
-        if let Some(cache) = cache {
-            return self.insert_over(
-                m.obj_id,
-                super::ObjHandle::Buffer(cache),
-                Some((m.block_offset, m.block_size)),
-            );
-        }
-        match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
-            Some(buffer) => self.insert_over(
-                m.obj_id,
-                super::ObjHandle::Buffer(buffer),
-                Some((m.block_offset, m.block_size)),
-            ),
-            None => Ok(Err(super::DecodeError::Refused)),
-        }
+        let buffer = match cache {
+            Some(cache) => cache,
+            None => match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
+                Some(buffer) => buffer,
+                None => return Ok(Err(super::DecodeError::Refused)),
+            },
+        };
+        let span = Some((m.block_offset, m.block_size));
+        let entry = super::tables::Entry::of(super::ObjHandle::Buffer(buffer)).over(span);
+        self.store(m.obj_id, entry.over_view());
+        Ok(Ok(()))
     }
 
     /// `BUFFER_OVER_PAGES`: a Shared buffer over the `length` bytes at `offset` in the view of a
@@ -930,11 +921,13 @@ mod costs;
 pub(super) mod tests {
     use reims_graphics::region::Region;
     use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
-        RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
-        RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
-        RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE,
-        RgfxBufferAtOffset, RgfxMsgHeader, RgfxObjectDestroy,
+        RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
+        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY,
+        RGFX_CMD_SURFACE_PAGES, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+        RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset,
+        RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy, RgfxTextureDescriptor,
+        RgfxTextureFromBuffer,
     };
     use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
     use reims_vgpu_core::platform::resource::Buffer as _;
@@ -1314,6 +1307,94 @@ pub(super) mod tests {
             );
         }
         assert_eq!(Arc::strong_count(&view), 1, "the cache let it go");
+    }
+
+    /// A destroy that gives back a name the guest picked lets go of its object at once, though the
+    /// block it lies over has a view and the surface worker is held: a texture over the view's
+    /// buffer (its resource id) and a buffer over the block's host memory (its GPU address), which
+    /// the guest's next create may take at once. The view's buffer waits for the worker
+    #[test]
+    fn a_destroy_that_gives_back_a_guest_s_name_waits_for_no_worker() {
+        let mut r = rig(64);
+        let page = r.page;
+        let world = Arc::clone(r.p.world());
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(r.pages(BLOCK, &[(1, 1)], page), RGFX_STATUS_OK);
+        assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
+        r.dec.surface_worker().hold();
+        let send = |r: &mut Rig, bytes: &[u8]| r.dec.decode(&r.device, bytes).unwrap();
+        let destroy = |obj_id| RgfxObjectDestroy {
+            header: header(RGFX_CMD_OBJECT_DESTROY),
+            obj_id,
+        };
+        let texture = |obj_id| RgfxTextureFromBuffer {
+            header: header(RGFX_CMD_TEXTURE_FROM_BUFFER),
+            obj_id,
+            resource_id: 0x41,
+            buffer_obj_id: 10,
+            offset: 0,
+            bytes_per_row: 64 * 4,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 64,
+                height: 16,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+        };
+        const PIN: u64 = 0x1_0000_0000;
+        let host_memory = |obj_id| RgfxBufferOverHostMemory {
+            header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
+            obj_id,
+            gpu_address: PIN,
+            region_offset: BLOCK,
+            length: page,
+            ..RgfxBufferOverHostMemory::default()
+        };
+        let textures = world.live("MTLTexture").len();
+        assert_eq!(send(&mut r, texture(11).as_bytes()), Ok(()));
+        assert_eq!(world.live("MTLTexture").len(), textures + 1);
+        assert_eq!(send(&mut r, destroy(11).as_bytes()), Ok(()));
+        assert_eq!(
+            world.live("MTLTexture").len(),
+            textures,
+            "the texture went at once"
+        );
+        assert_eq!(
+            send(&mut r, texture(12).as_bytes()),
+            Ok(()),
+            "at the same resource id"
+        );
+        let buffers = world.live("MTLBuffer").len();
+        assert_eq!(send(&mut r, host_memory(13).as_bytes()), Ok(()));
+        assert_eq!(world.live("MTLBuffer").len(), buffers + 1);
+        assert_eq!(send(&mut r, destroy(13).as_bytes()), Ok(()));
+        assert_eq!(
+            world.live("MTLBuffer").len(),
+            buffers,
+            "the buffer went at once"
+        );
+        assert_eq!(
+            send(&mut r, host_memory(14).as_bytes()),
+            Ok(()),
+            "at the same address"
+        );
+        assert_eq!(send(&mut r, destroy(12).as_bytes()), Ok(()));
+        let buffers = world.live("MTLBuffer").len();
+        assert_eq!(send(&mut r, destroy(10).as_bytes()), Ok(()));
+        assert_eq!(
+            world.live("MTLBuffer").len(),
+            buffers,
+            "the view's buffer waits"
+        );
+        r.dec.surface_worker().release();
+        r.dec.surface_worker().flush();
+        assert_eq!(world.live("MTLBuffer").len(), buffers - 1);
     }
 
     /// A block named again, or released and its offset given to another surface, lies over its
