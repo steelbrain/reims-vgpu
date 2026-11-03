@@ -480,6 +480,24 @@ impl<P: Platform> Presented<P> {
         }
     }
 
+    /// The device's reset: the display shows the scanout (none, after the reset) in place of any
+    /// surface, whose texture is let go of in a refusal scope; the answers still owed are given
+    /// as they come, and dropped, as each is of a present taken before the reset.
+    fn reset(&self) {
+        let previous = self.surface_id.swap(0, Ordering::AcqRel);
+        let shown = self.texture.lock().take();
+        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the texture of IOSurface {previous} was let go of at the device's reset, and its \
+                 release was refused: {refusal}"
+            );
+        }
+        if let Some(window) = self.window.get() {
+            window.new_frame();
+        }
+    }
+
     /// The window draws the latest present: the presents shown so far, answered once the draw has
     /// finished, or once it is dropped undone ([`DrawnPresents`]).
     pub(crate) fn drawn(self: &Arc<Self>) -> DrawnPresents<P> {
@@ -576,6 +594,33 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 "context {context} closed: {dropped} objects dropped"
             );
             drop(drain);
+        });
+    }
+
+    /// The device's reset (`Host::device_reset`): every context's objects dropped as at its close
+    /// ([`Self::close_context`]), with no answer owed, and everything else the decoder keeps for
+    /// the guest's processes ([`GraphicsDecoder::reset`]); the pipelines compiling are not stored,
+    /// the presents waiting are dropped, and the display shows the scanout in place of any
+    /// surface. The device is then as one just made, to the guest: the ids it picks, the
+    /// texture resource ids and samplers' ids it is handed, and what a library lookup finds.
+    fn reset(&self) {
+        entry::run(|_| {
+            let (contexts, dropped) = {
+                let mut decoder = self.decoder.lock();
+                self.pending.reset();
+                let (contexts, dropped) = decoder.reset();
+                for &context in &contexts {
+                    self.pool.context_closed(context);
+                }
+                self.presents.reset();
+                (contexts, dropped)
+            };
+            self.presented.reset();
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "the device was reset: {dropped} objects of {} contexts dropped",
+                contexts.len()
+            );
         });
     }
 
@@ -703,6 +748,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let sinks = self.sinks(poster);
             let outcome = {
                 let mut decoder = self.decoder.lock();
+                // Of a queue the device's reset ended, which the decoder's reset dropped, or is to
+                // drop under this lock: nothing of it is carried out, and nothing is owed.
+                if poster.stale() {
+                    return;
+                }
                 sinks.point(&mut decoder);
                 decoder.set_context(Some(sender_context(poster, message)));
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
@@ -826,6 +876,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             return None;
         }
         let mut decoder = self.decoder.try_lock_arc()?;
+        if poster.stale() {
+            return None;
+        }
         self.sinks(poster).point(&mut decoder);
         decoder.set_context(Some(sender_context(poster, message)));
         if !decoder.submits_at_take(message) {
@@ -874,14 +927,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let prepared = entry::run(|_| {
             let mut decoder = self.decoder.lock();
             decoder.set_context(Some(sender_context(poster, message)));
-            let prepared = decoder.prepare_pipeline(message);
-            if let Ok(job) = &prepared {
-                self.pending.begin(job.obj_id);
-            }
-            prepared
+            decoder
+                .prepare_pipeline(message)
+                .map(|job| (self.pending.begin(job.obj_id), job))
         });
-        let job = match prepared {
-            Ok(job) => job,
+        let (began, job) = match prepared {
+            Ok(prepared) => prepared,
             Err(e) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
@@ -901,16 +952,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let poster = poster.clone();
         if let Err(compile) = self
             .pool
-            .submit(of, Box::new(move || me.compile(job, &poster)))
+            .submit(of, Box::new(move || me.compile(job, began, &poster)))
         {
             compile();
         }
     }
 
-    /// Compiles a prepared pipeline create under a library entry, with no lock held; stores the
-    /// pipeline where no destroy or close cancelled it meanwhile, lets the command buffers that
-    /// wait for it go on, and posts its reply (its reflection, or a refusal) through `poster`.
-    fn compile(&self, job: PipelineJob<P>, poster: &CompletionPoster) {
+    /// Compiles a prepared pipeline create, pending since reset count `began`, under a library
+    /// entry, with no lock held; stores the pipeline where no destroy, close or reset cancelled it
+    /// meanwhile, lets the command buffers that wait for it go on, and posts its reply (its
+    /// reflection, or a refusal) through `poster`.
+    fn compile(&self, job: PipelineJob<P>, began: u64, poster: &CompletionPoster) {
         entry::run(|_| {
             let (obj_id, seqno) = (job.obj_id, job.seqno);
             let compiled = compile_refusing::<P>(&self.device, job);
@@ -923,10 +975,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let reflection = compiled.reflection;
             {
                 let mut decoder = self.decoder.lock();
-                if self.pending.live(obj_id) {
+                if self.pending.live(obj_id, began) {
                     decoder.finish_pipeline(compiled);
                 }
-                self.pending.finish(obj_id);
+                self.pending.finish(obj_id, began);
             }
             poster.post(reflection.as_bytes());
         });
@@ -1191,6 +1243,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         self.control.release_block(release, answer);
+    }
+
+    fn device_reset(&self) {
+        self.control.reset();
     }
 
     fn features(&self) -> u64 {

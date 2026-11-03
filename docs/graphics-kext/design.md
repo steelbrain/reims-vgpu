@@ -670,6 +670,20 @@ chunks of resource ids and, on that answer only, its blocks. A command
 buffer is decoded once the host has carried out every control-ring message
 published before its queue's thread took it.
 
+**Reset.** A reset leaves the device as one just made, as a device's
+function reset does: `STATUS` 0, which the framebuffer writes at its start,
+and QEMU's reset of the device, which a reboot inside one QEMU run makes.
+Every command queue ends, no block is any process's, and the host drops every
+object of every context, as each one's close does, with no answer owed. The
+blocks' surface views and device caches go too, uncopied, since their pages
+are the rebooted guest's again, and so do the library cache, the presents
+waiting and the pipelines compiling. Nothing begun before the reset reaches
+the guest after it. The guest then finds what a new device gives it: the ids
+it picks free from 1 again, every texture resource id and GPU address free
+(a range a buffer of the guest's before the reset still held would refuse the
+rebooted WindowServer's pin of it), a library lookup that misses, and VBLANK
+counts from 0. What the guest wrote in the region stays.
+
 **Texture resource ids.** Every process's textures share the host's one
 device, whose texture ids end below 16381: Metal ends the process for a texture
 placed at 16381 or more (measured on an M4 and an M3 Max), and metal2vulkan

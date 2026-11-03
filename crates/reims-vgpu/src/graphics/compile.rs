@@ -30,6 +30,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reims_graphics::ops::compute::{
@@ -414,45 +415,69 @@ impl Gate {
     }
 }
 
-/// The pipelines being compiled, by id: whether a destroy or a close cancelled each.
+/// The pipelines being compiled, by id: whether a destroy or a close cancelled each, and the
+/// device's resets, which forget them all.
 #[derive(Default)]
 pub(crate) struct Pending {
-    /// Pending ids, each with whether it was cancelled.
-    ids: Mutex<HashMap<u64, bool>>,
-    /// Notified as each pending pipeline is done.
+    /// Pending ids, each with whether it was cancelled and the reset count its compile began at.
+    ids: Mutex<HashMap<u64, (bool, u64)>>,
+    /// The device's resets so far ([`Self::reset`]).
+    resets: AtomicU64,
+    /// Notified as each pending pipeline is done, and at a reset.
     done: Condvar,
 }
 
 impl Pending {
-    /// `obj_id` is being compiled.
-    pub(crate) fn begin(&self, obj_id: u64) {
-        self.ids.lock().insert(obj_id, false);
+    /// `obj_id` is being compiled: the reset count its compile begins at, which its
+    /// [`Self::live`] and [`Self::finish`] name.
+    pub(crate) fn begin(&self, obj_id: u64) -> u64 {
+        let mut ids = self.ids.lock();
+        let began = self.resets.load(Ordering::Acquire);
+        ids.insert(obj_id, (false, began));
+        began
     }
 
     /// An `OBJECT_DESTROY` of `obj_id`: a pending pipeline is not stored when its compile ends.
     pub(crate) fn cancel(&self, obj_id: u64) {
-        if let Some(cancelled) = self.ids.lock().get_mut(&obj_id) {
+        if let Some((cancelled, _)) = self.ids.lock().get_mut(&obj_id) {
             *cancelled = true;
         }
     }
 
     /// Context `context`'s close: none of its pending pipelines is stored.
     pub(crate) fn cancel_context(&self, context: u32) {
-        for (id, cancelled) in self.ids.lock().iter_mut() {
+        for (id, (cancelled, _)) in self.ids.lock().iter_mut() {
             if id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context) {
                 *cancelled = true;
             }
         }
     }
 
-    /// Whether `obj_id`'s compiled pipeline is to be stored: it is pending and not cancelled.
-    pub(crate) fn live(&self, obj_id: u64) -> bool {
-        self.ids.lock().get(&obj_id) == Some(&false)
+    /// The device's reset: no pipeline pending is stored, a command buffer waiting on one goes on,
+    /// and a compile begun before it neither stores its pipeline nor ends the wait of one begun
+    /// after it under the same id.
+    pub(crate) fn reset(&self) {
+        let mut ids = self.ids.lock();
+        self.resets.fetch_add(1, Ordering::AcqRel);
+        ids.clear();
+        drop(ids);
+        self.done.notify_all();
     }
 
-    /// `obj_id`'s compile is done (and its pipeline stored, where it is live): its waiters go on.
-    pub(crate) fn finish(&self, obj_id: u64) {
-        self.ids.lock().remove(&obj_id);
+    /// Whether `obj_id`'s compiled pipeline, begun at reset count `began`, is to be stored: it is
+    /// pending since then and not cancelled.
+    pub(crate) fn live(&self, obj_id: u64, began: u64) -> bool {
+        self.ids.lock().get(&obj_id) == Some(&(false, began))
+    }
+
+    /// `obj_id`'s compile, begun at reset count `began`, is done (and its pipeline stored, where
+    /// it is live): its waiters go on.
+    pub(crate) fn finish(&self, obj_id: u64, began: u64) {
+        let mut ids = self.ids.lock();
+        if ids.get(&obj_id).is_some_and(|&(_, at)| at == began) {
+            ids.remove(&obj_id);
+        }
+        drop(ids);
         self.done.notify_all();
     }
 

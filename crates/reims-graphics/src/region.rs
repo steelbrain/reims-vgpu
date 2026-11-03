@@ -169,6 +169,11 @@ impl Region {
         });
     }
 
+    /// No block is anyone's any more (the device's reset): the kext grants them again.
+    pub fn revoke_all(&self) {
+        self.blocks.lock().clear();
+    }
+
     /// Whether the `len` bytes at `offset` lie in one block context `context` holds.
     pub fn held_by(&self, context: u32, offset: u64, len: u64) -> bool {
         Self::in_held(&self.blocks.lock(), context, offset, len)

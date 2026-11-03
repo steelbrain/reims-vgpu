@@ -69,11 +69,17 @@
 //! refresh), and the last of them to let go drops its reference to the region and the host's
 //! callbacks.
 //!
-//! **Reset.** Writing `STATUS` 0, and the host's reset, put the device back as it was made: no
-//! command is taken until the guest writes `STATUS` 1, both rings are as nothing had passed
-//! through them (the submission ring's `consumer_idle` 1, so the guest rings for its first
-//! message), the display has no scanout, no cursor image (and shows its cursor once it has one)
-//! and no `VBLANK`, and its refresh count is 0.
+//! **Reset.** Writing `STATUS` 0, and the host's reset, put the device back as it was made, as a
+//! device's function reset does: no command is taken until the guest writes `STATUS` 1, both
+//! rings are as nothing had passed through them (the submission ring's `consumer_idle` 1, so the
+//! guest rings for its first message), the display has no scanout, no cursor image (and shows its
+//! cursor once it has one) and no `VBLANK`, and its refresh count is 0. Every command queue ends,
+//! and once a take of its ring or a post onto it under way has finished nothing touches its rings
+//! again; no block is any process's (the kext grants them again), and the host drops everything
+//! it made for the guest's processes ([`Host::device_reset`], on the control thread before it
+//! takes anything the guest publishes after the reset). Nothing begun before the reset reaches
+//! the guest after it: its answers and events are dropped, and a queue made before it hands the
+//! host nothing more, not even its own destroy, which the host's reset stands for.
 //! What the guest wrote in its allocations stays.
 //!
 //! **A broken ring.** A count or a message size the protocol refuses (`ring::Broken`) is logged,
@@ -187,6 +193,18 @@ pub trait Host: Send + Sync + 'static {
         let _ = release;
         answer.answer(RGFX_STATUS_OK);
     }
+
+    /// The device was reset ([`Device::reset`], or the guest's `STATUS` 0): the host drops every
+    /// object of every context, as each context's close does ([`Host::context_closed`]), with no
+    /// answer owed, and everything else it keeps for the guest's processes, so that the device is
+    /// as one just made (the module doc). Called on the control thread once the reset's queues
+    /// have ended and their rings are no longer touched, and before the thread carries out any
+    /// ring-0 message the guest publishes after the reset; resets in a row may be told once. A
+    /// queue's service thread that has not yet seen its end may still hand the host a message of
+    /// the queue's after this: its poster is then [`CompletionPoster::stale`], which the host
+    /// checks under the lock this takes, and carries nothing of it out. The default does
+    /// nothing, for a host with no stage-3 decoder.
+    fn device_reset(&self) {}
 
     /// The device's feature bits, which `FEATURES_LO` and `FEATURES_HI` read: the
     /// `RGFX_FEATURE_*` the host carries out. The default is none, for a host with no stage-3
@@ -326,6 +344,10 @@ pub(crate) struct Shared {
     status: AtomicU32,
     /// Moved on at each reset: work begun before one drops what it would send.
     epoch: AtomicU64,
+    /// A reset the host has not been told of yet ([`Host::device_reset`]): set with the control
+    /// submission ring held, so the control thread sees it before any message published after
+    /// the reset.
+    reset_owed: AtomicBool,
     /// Set at the device's end.
     ending: AtomicBool,
     /// The control thread's own wake.
@@ -393,6 +415,9 @@ pub(crate) struct QueueShared {
     context: u32,
     /// The `QUEUE_CREATE` that made it, which the host is handed first.
     create: RgfxQueueCreate,
+    /// The reset count its `QUEUE_CREATE` was taken at: a reset since ends it, and its posts are
+    /// dropped.
+    epoch: u64,
     /// The ring id: the submission ring's region offset, the `DOORBELL` value that wakes it.
     ring_id: u64,
     /// The completion ring's MSI-X vector.
@@ -480,6 +505,7 @@ impl Device {
             region,
             status: AtomicU32::new(RGFX_STATUS_RESET),
             epoch: AtomicU64::new(0),
+            reset_owed: AtomicBool::new(false),
             ending: AtomicBool::new(false),
             wake: Wake::new()?,
             doorbell: OnceLock::new(),
@@ -638,13 +664,16 @@ impl CompleteAnswer {
 /// pipeline create's reflection). It writes the message and raises the ring's MSI-X vector where
 /// the guest armed it, through that ring's [`Producer`]. It holds weak references to the device
 /// and the queue, so it keeps neither alive; a post after the device has ended, after the queue is
-/// destroyed, or while the device is reset, is dropped.
+/// destroyed, or after a reset that came since the message it posts for was taken (since the
+/// queue was made, for a queue's), is dropped.
 #[derive(Clone)]
 pub struct CompletionPoster {
     /// The device's shared state, weakly.
     shared: Weak<Shared>,
     /// The queue's own rings, weakly, and its id; `None` for the control completion ring.
     queue: Option<(Weak<QueueShared>, u64)>,
+    /// The reset count the work it posts for began at.
+    epoch: u64,
 }
 
 impl CompletionPoster {
@@ -655,6 +684,15 @@ impl CompletionPoster {
         self.queue.as_ref().map(|(_, obj_id)| *obj_id)
     }
 
+    /// Whether the device was reset since the work this posts for began (or has ended): what it
+    /// would post is dropped, and the host carries out nothing more of that work
+    /// ([`Host::device_reset`]).
+    pub fn stale(&self) -> bool {
+        self.shared
+            .upgrade()
+            .is_none_or(|shared| shared.epoch.load(Ordering::Acquire) != self.epoch)
+    }
+
     /// Posts `message` (a whole event, its `size` set and a multiple of 8) onto the ring's
     /// completion ring, waiting for room while the device (and the queue) live and the device is
     /// not reset, and raising the ring's MSI-X vector where the guest armed it. Does nothing where
@@ -663,7 +701,7 @@ impl CompletionPoster {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        let epoch = shared.epoch.load(Ordering::Acquire);
+        let epoch = self.epoch;
         match &self.queue {
             None => shared.post_waiting(message, epoch),
             Some((queue, _)) => {
@@ -681,7 +719,7 @@ impl CompletionPoster {
         let Some(shared) = self.shared.upgrade() else {
             return true;
         };
-        let epoch = shared.epoch.load(Ordering::Acquire);
+        let epoch = self.epoch;
         let posted = match &self.queue {
             None => shared.post_on(message, epoch, false),
             Some((queue, _)) => match queue.upgrade() {
@@ -741,7 +779,9 @@ impl Shared {
         self.status.load(Ordering::Acquire) == RGFX_STATUS_DRIVER_READY
     }
 
-    /// The reset (the module doc).
+    /// The reset (the module doc). It waits for the message the control thread is taking, and
+    /// for a take of a queue's ring or a post onto one under way, none of which waits for the
+    /// host; the host is told on the control thread ([`Self::tell_reset`]).
     fn reset(&self) {
         self.status.store(RGFX_STATUS_RESET, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -753,26 +793,46 @@ impl Shared {
         self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
         *display = DisplayState::default();
+        // With the ring held: the control thread tells the host before any message after this.
+        self.reset_owed.store(true, Ordering::Release);
         drop(completion);
         drop(display);
         drop(submit);
         // The per-queue rings are the guest's to make again after a reset: end their services.
-        let mut queues = self.queues.lock();
-        for queue in queues.by_obj.values() {
+        let ended: Vec<Arc<QueueShared>> = {
+            let mut queues = self.queues.lock();
+            queues.by_ring.clear();
+            queues.by_obj.drain().map(|(_, queue)| queue).collect()
+        };
+        for queue in &ended {
             queue.end();
         }
-        queues.by_obj.clear();
-        queues.by_ring.clear();
-        drop(queues);
+        // No ended queue's thread reads or writes its rings past this, and no block is any
+        // process's: the guest's kext gives its blocks out again.
+        for queue in &ended {
+            queue.fence();
+        }
+        self.region.revoke_all();
         self.signal_control_moved();
+        self.wake.wake();
         self.screen.scanout(None);
         self.screen.cursor_image(None);
         self.screen.cursor_moved(0, 0, true);
     }
 
+    /// Tells the host of a reset it has not been told of ([`Host::device_reset`]), on the control
+    /// thread, before the thread takes anything the guest published after it.
+    fn tell_reset(&self) {
+        if self.reset_owed.swap(false, Ordering::AcqRel) {
+            self.host.device_reset();
+            log::info!(target: "reims_graphics", "the device was reset");
+        }
+    }
+
     /// The control thread (the module doc).
     fn control_thread(&self) {
         while !self.ending() {
+            self.tell_reset();
             self.take_messages();
             // Asleep with `consumer_idle` set only while the device takes the ring.
             let idle = {
@@ -801,13 +861,18 @@ impl Shared {
     /// `PRESENT_SURFACE` are taken with it held and carried out with nothing held, so a reset never
     /// waits for the host, which may wait for its decoder there, or answer a present at once. An
     /// answer is posted with nothing of the device's held, so the interrupt is raised with no lock
-    /// of the device's held, and dropped where a reset came after its message was taken.
+    /// of the device's held, and dropped where a reset came after its message was taken. A reset
+    /// is told to the host before any message published after it is taken ([`Self::tell_reset`]).
     fn take_messages(&self) {
         loop {
+            self.tell_reset();
             let (answer, epoch) = {
                 let mut submit = self.submit.lock();
                 if !self.started() || submit.broken || self.ending() {
                     return;
+                }
+                if self.reset_owed.load(Ordering::Acquire) {
+                    continue;
                 }
                 let epoch = self.epoch.load(Ordering::Acquire);
                 match submit.consumer.next(&self.region) {
@@ -1015,11 +1080,13 @@ impl Shared {
         })
     }
 
-    /// A completion poster onto the control completion ring, for a ring-0 message's replies.
-    pub(crate) fn control_poster(&self) -> CompletionPoster {
+    /// A completion poster onto the control completion ring, for the replies of a ring-0 message
+    /// taken at reset count `epoch`.
+    pub(crate) fn control_poster(&self, epoch: u64) -> CompletionPoster {
         CompletionPoster {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             queue: None,
+            epoch,
         }
     }
 
@@ -1157,10 +1224,11 @@ impl Shared {
         ))
     }
 
-    /// `QUEUE_CREATE` (the module doc): makes a command queue's own submission+completion ring pair
-    /// and starts its service thread, where the ring parameters are valid; the status its
-    /// `COMPLETE` carries. Waits for no thread of the device's and nothing of the host's.
-    pub(crate) fn create_queue(&self, q: &RgfxQueueCreate) -> u32 {
+    /// `QUEUE_CREATE` (the module doc), taken at reset count `epoch`: makes a command queue's own
+    /// submission+completion ring pair and starts its service thread, where the ring parameters
+    /// are valid; the status its `COMPLETE` carries. Waits for no thread of the device's and
+    /// nothing of the host's.
+    pub(crate) fn create_queue(&self, q: &RgfxQueueCreate, epoch: u64) -> u32 {
         let context = (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
         if self.host.context_refused(context) {
             log::warn!(
@@ -1201,6 +1269,7 @@ impl Shared {
             obj_id: q.obj_id,
             context: (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32,
             create: *q,
+            epoch,
             ring_id: q.submit_offset,
             vector: q.vector,
             submit: Mutex::new(Submit {
@@ -1214,6 +1283,10 @@ impl Shared {
         });
         let ended: Vec<Arc<QueueShared>> = {
             let mut queues = self.queues.lock();
+            // A reset since the create was taken ended every queue: this one is not made.
+            if self.epoch.load(Ordering::Acquire) != epoch {
+                return RGFX_STATUS_REFUSED;
+            }
             // A re-open under the same queue id or ring offset ends the old one first.
             let ended: Vec<Arc<QueueShared>> = [
                 queues.by_obj.get(&q.obj_id).cloned(),
@@ -1278,6 +1351,7 @@ impl Shared {
         CompletionPoster {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             queue: Some((Arc::downgrade(queue), queue.obj_id)),
+            epoch: queue.epoch,
         }
     }
 
@@ -1295,8 +1369,9 @@ impl Shared {
             rest();
         }
         // A closed queue's handle goes with it (a process's other objects go at its context's
-        // close). Nothing is posted for it: the queue has ended.
-        if !self.ending() {
+        // close). Nothing is posted for it: the queue has ended. A reset's queue's goes with the
+        // host's reset ([`Host::device_reset`]).
+        if !self.ending() && self.epoch.load(Ordering::Acquire) == queue.epoch {
             let destroy = RgfxObjectDestroy {
                 header: RgfxMsgHeader {
                     r#type: RGFX_CMD_OBJECT_DESTROY,
@@ -1393,16 +1468,22 @@ impl Shared {
             // 0's counts; it never consumes that ring, so it keeps one consumer and its
             // `consumer_idle` handshake is untouched. It sleeps until the control thread signals
             // a move of `control_done`, a reset or the end.
-            let epoch = self.epoch.load(Ordering::Acquire);
             let created_through = self.submit.lock().consumer.published_count(&self.region);
             let mut moved = self.control_moved.lock();
             while self.control_done.load(Ordering::Acquire) < created_through {
-                if self.ending() || queue.ended() || self.epoch.load(Ordering::Acquire) != epoch {
+                if self.ending()
+                    || queue.ended()
+                    || self.epoch.load(Ordering::Acquire) != queue.epoch
+                {
                     break;
                 }
                 self.control_moved_signal.wait(&mut moved);
             }
             drop(moved);
+            // A reset since the queue was made ended it: nothing more of it goes to the host.
+            if self.epoch.load(Ordering::Acquire) != queue.epoch {
+                return;
+            }
             // A buffer too large for the ring: its message, from the block, with nothing held,
             // once the block's grant (posted before the buffer) has been carried out.
             let message = if message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION {

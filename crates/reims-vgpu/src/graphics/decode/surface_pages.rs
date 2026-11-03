@@ -36,7 +36,7 @@ use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_core::raise::{RaiseResult, refusals};
 
 /// The guest's page: every run is whole pages of it.
 pub(crate) const GUEST_PAGE: u64 = 4096;
@@ -282,6 +282,21 @@ impl<P: Platform> SurfaceViews<P> {
     /// and the cache have let it go.
     pub(crate) fn released(&mut self, offset: u64) {
         self.by_block.remove(&offset);
+    }
+
+    /// The device's reset: every block's view and every cached one go, each buffer over them
+    /// let go of in a refusal scope, as no block names its pages any more; what the views did is
+    /// still counted.
+    pub(crate) fn reset(&mut self) {
+        let views = std::mem::take(&mut self.by_block);
+        let cache = std::mem::take(&mut self.cache);
+        if let Err(refusal) = refusals::refusing(move || drop((views, cache))) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface views were let go of at the device's reset, and a release was \
+                 refused: {refusal}"
+            );
+        }
     }
 
     /// How many blocks have a view, and how many views the cache keeps (for the tests).

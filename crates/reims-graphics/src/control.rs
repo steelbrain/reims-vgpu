@@ -81,7 +81,7 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         RGFX_CMD_QUEUE_CREATE => {
             let status = read::<RgfxQueueCreate>(message)
                 .map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
-                    shared.create_queue(&command)
+                    shared.create_queue(&command, epoch)
                 });
             Some(complete(seqno, status))
         }
@@ -91,7 +91,7 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
             if !queue {
                 shared
                     .host
-                    .stage3_message(&shared.control_poster(), &message.bytes);
+                    .stage3_message(&shared.control_poster(epoch), &message.bytes);
             }
             None
         }
@@ -150,7 +150,7 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         _ => {
             shared
                 .host
-                .stage3_message(&shared.control_poster(), &message.bytes);
+                .stage3_message(&shared.control_poster(epoch), &message.bytes);
             None
         }
     }

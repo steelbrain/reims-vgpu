@@ -4021,3 +4021,105 @@ fn a_command_buffer_s_completion_writes_every_byte() {
         "the completion's unwritten offsets"
     );
 }
+
+/// A reset drops everything the guest's processes made, as each one's close does: every object
+/// of every context (a queue, a texture, a buffer over a block at a GPU address its process
+/// pinned, a library, another context's event), and the platform's objects go with them, so
+/// their resource ids and GPU addresses are free again; the library cache goes too. The device
+/// is then as one just made: its queues are gone, the same ids make the same objects again, at
+/// the same texture resource id and the same pinned GPU address, and a lookup of the library
+/// misses
+#[test]
+fn a_reset_drops_every_object_the_guest_made() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let world = platform.world();
+    let textures_before = world.live("MTLTexture").len();
+    let buffers_before = world.live("MTLBuffer").len();
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const SIZE: u64 = 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (library, key) = keyed_metallib();
+    // What a process makes after the device's start, the same before and after the reset.
+    let make = |guest: &mut Guest| {
+        guest.send(&device, block_grant(1, BLOCK, SIZE));
+        assert_eq!(
+            answered(
+                &device,
+                guest,
+                queue_create(1, 1, BLOCK, BLOCK + 0x2_0000, RING_DATA, 0)
+            ),
+            RGFX_STATUS_OK
+        );
+        guest.send(&device, resource_id_chunk(1, 0));
+        guest.send(&device, texture_create(obj(1, 2), 1));
+        let pinned = RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: obj(1, 3),
+            gpu_address: RGFX_CONTEXT_VA_BASE + 0x8000,
+            region_offset: BLOCK + 0x8_0000,
+            length: 0x4000,
+            ..RgfxBufferOverHostMemory::default()
+        };
+        guest.send(&device, pinned.as_bytes().to_vec());
+        assert_eq!(
+            answered(
+                &device,
+                guest,
+                library_lookup(obj(1, 4), library.len(), key)
+            ),
+            RGFX_STATUS_NOT_FOUND,
+            "a lookup misses on a new device"
+        );
+        assert_eq!(
+            answered(
+                &device,
+                guest,
+                keyed_library_create(obj(1, 4), &library, Some(key))
+            ),
+            RGFX_STATUS_OK
+        );
+        guest.send(&device, event_create(obj(2, 1)));
+        for _ in 0..2000 {
+            if device.decoder_object_count() == 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(device.decoder_object_count(), 5);
+        assert_eq!(device.graphics_queue_count(), 1);
+    };
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make(&mut guest);
+    let texture = world.live("MTLTexture")[textures_before..].to_vec();
+    assert_eq!(texture.len(), 1);
+
+    device.reset();
+    for _ in 0..2000 {
+        if device.decoder_object_count() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the reset left the guest's objects"
+    );
+    assert_eq!(device.graphics_queue_count(), 0);
+    assert_eq!(world.live("MTLTexture").len(), textures_before);
+    assert_eq!(world.live("MTLBuffer").len(), buffers_before);
+
+    // The guest's driver starts again, from its first command.
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make(&mut guest);
+    let again = world.live("MTLTexture")[textures_before..].to_vec();
+    assert_eq!(again.len(), 1);
+    assert_ne!(again, texture, "a texture of its own");
+}

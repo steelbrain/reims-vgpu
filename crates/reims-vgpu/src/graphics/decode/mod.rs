@@ -203,6 +203,11 @@ impl FailedContexts {
     fn forget(&self, context: u32) {
         self.0.lock().remove(&context);
     }
+
+    /// Forgets every context, at the device's reset.
+    fn forget_all(&self) {
+        self.0.lock().clear();
+    }
 }
 
 /// The objects ring 0 made with no lock of the decoder's held, in the order made, until the
@@ -884,6 +889,49 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         objects.len()
+    }
+
+    /// The device's reset (`reims_graphics::Host::device_reset`): every context's objects dropped
+    /// as at its close ([`Self::drop_context`]), the lowest context first, then what the decoder
+    /// keeps beside them for the guest's processes: the surfaces' names, the libraries' chunks,
+    /// makes and cache, the blocks' views of their surfaces' pages and their device caches
+    /// (dropped uncopied: the pages are the rebooted guest's again), the queues' counts, and every
+    /// context's failure, chunks of the texture resource ids and drains (their answers are owed
+    /// to no one). Each release is made in a refusal scope. The decoder then holds what one just
+    /// made holds, so a texture's resource id and a sampler's are free for the guest's next use,
+    /// as on a new device. The contexts dropped, in order, and how many objects went.
+    pub(crate) fn reset(&mut self) -> (Vec<u32>, usize) {
+        let context_of = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
+        let mut contexts: Vec<u32> = (self.objects.keys())
+            .chain(self.managed.keys())
+            .chain(self.spans.keys())
+            .chain(self.making_libraries.keys())
+            .chain(self.library_chunks.keys())
+            .chain(self.cached_libraries.keys())
+            .chain(self.held_queues.keys())
+            .chain(self.in_flight.keys())
+            .map(context_of)
+            .chain(self.id_chunks.iter().flatten().copied())
+            .chain(self.drains.keys().copied())
+            .collect();
+        contexts.sort_unstable();
+        contexts.dedup();
+        let dropped = contexts.iter().map(|&c| self.drop_context(c)).sum();
+        self.forget_dropped_surfaces();
+        self.drains.clear();
+        self.failed.forget_all();
+        let cache = std::mem::replace(&mut self.library_cache, LibraryCache::new(RELEASED_BUDGET));
+        if let Err(refusal) = refusals::refusing(move || drop(cache)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the library cache was let go of at the device's reset, and a release was \
+                 refused: {refusal}"
+            );
+        }
+        self.surface_views.reset();
+        self.surface_caches.reset();
+        debug_assert!(self.objects.is_empty() && self.surfaces.is_empty());
+        (contexts, dropped)
     }
 
     /// Whether texture resource id `id` lies in a chunk that the context of object

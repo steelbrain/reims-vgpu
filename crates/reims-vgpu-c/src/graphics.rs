@@ -429,9 +429,11 @@ pub unsafe extern "C" fn rvg_graphics_device_set_doorbell(
     })
 }
 
-/// The guest's bus reset: as a write of 0 to STATUS, the device takes no command until the guest
-/// writes 1, both rings are as new, and the display has no scanout, cursor image or VBLANK.
-/// Waits for the command the device is taking. Calls back: never.
+/// The guest's bus reset: as a write of 0 to STATUS, the device is as one just made. It takes no
+/// command until the guest writes 1, its rings are as new, the display has no scanout, cursor
+/// image or VBLANK, and the device drops every object the guest's processes made, on its control
+/// thread before it takes the guest's next command. Waits for the command the device is taking,
+/// and for a take of a queue's ring or a post onto one under way. Calls back: never.
 ///
 /// # Safety
 /// `device` is a live graphics device handle.

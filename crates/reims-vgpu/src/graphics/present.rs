@@ -121,6 +121,24 @@ impl<P: Platform> PresentQueue<P> {
         self.forget(|q| q >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context));
     }
 
+    /// The device's reset: the presents waiting are dropped unshown, their answers owed to no
+    /// one, and every queue's progress is forgotten. Their textures are let go of in a refusal
+    /// scope.
+    pub(crate) fn reset(&self) {
+        let waiting = {
+            let mut state = self.state.lock();
+            state.finished.clear();
+            std::mem::take(&mut state.waiting)
+        };
+        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(waiting)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the presents waiting were dropped at the device's reset, and a texture's release \
+                 was refused: {refusal}"
+            );
+        }
+    }
+
     /// Drops the queues `gone` names from the progress and from what the presents wait for, then
     /// shows those now ready.
     fn forget(&self, gone: impl Fn(u64) -> bool) {

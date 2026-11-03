@@ -64,7 +64,7 @@ use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedI
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
 
 use super::surface_pages::{SurfaceView, buffer_over};
@@ -580,6 +580,22 @@ impl<P: Platform> SurfaceCaches<P> {
             });
         }
         Ok(true)
+    }
+
+    /// The device's reset: every block's cache goes uncopied, as its surface's pages are the
+    /// rebooted guest's again, and so do the queues' end events, each buffer and event let go of
+    /// in a refusal scope. The host's transfer queue stays, and so do the counts.
+    pub(crate) fn reset(&mut self) {
+        let caches = std::mem::take(&mut self.by_block);
+        let ends = std::mem::take(&mut self.ends);
+        self.watched.0.lock().clear();
+        if let Err(refusal) = refusals::refusing(move || drop((caches, ends))) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface device caches were let go of at the device's reset, and a release \
+                 was refused: {refusal}"
+            );
+        }
     }
 
     /// How many blocks have a cache (for the tests).

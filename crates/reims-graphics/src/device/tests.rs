@@ -1400,8 +1400,8 @@ fn a_command_buffer_waits_for_the_creates_before_it() {
 }
 
 /// A reset wakes a command buffer's wait for the creates before it, though the control thread is
-/// still in one: its queue's thread stops waiting and hands the buffer on, whose answers the reset
-/// drops.
+/// still in one: its queue's thread stops waiting and ends, handing the host nothing more of the
+/// queue's, neither the buffer nor the queue's destroy, which the host's reset stands for.
 #[test]
 fn a_reset_wakes_a_command_buffer_waiting_for_the_creates_before_it() {
     let seen = QueueTestSeen::new();
@@ -1426,11 +1426,108 @@ fn a_reset_wakes_a_command_buffer_waiting_for_the_creates_before_it() {
 
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
-    seen.wait(
-        "the command buffer still waits for ring 0 past a reset",
-        |seen| seen.handed.lock().contains(&RGFX_CMD_COMMAND_BUFFER),
+    // The queue's thread holds the device's shared state while it lives; the device, its control
+    // thread and its refresh thread hold the rest.
+    for _ in 0..2000 {
+        if Arc::strong_count(&rig.device.shared) == 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        Arc::strong_count(&rig.device.shared),
+        3,
+        "the queue's thread still waits for ring 0 past a reset"
     );
     seen.gate.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_BUFFER_CREATE]
+    );
+}
+
+/// What a [`ResetTellingHost`] records: each message's type, or [`RESET_TOLD`], with its thread.
+type TypesTold = Arc<Mutex<Vec<(u32, Option<String>)>>>;
+
+/// A host that records, with each one's thread, the stage-3 messages it is handed and the
+/// device's resets it is told of ([`RESET_TOLD`] in place of a type).
+struct ResetTellingHost(TypesTold);
+
+/// What a [`ResetTellingHost`] records for a reset.
+const RESET_TOLD: u32 = u32::MAX;
+
+impl Host for ResetTellingHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+        false
+    }
+    fn stage3_message(&self, _completion: &CompletionPoster, message: &[u8]) {
+        let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        self.0.lock().push((header.r#type, thread_name()));
+    }
+    fn device_reset(&self) {
+        self.0.lock().push((RESET_TOLD, thread_name()));
+    }
+}
+
+/// A reset has the host drop what it made ([`Host::device_reset`]) once, on the control thread,
+/// before the thread hands it anything the guest published after the reset; the reset ends its
+/// queues, which hand the host no destroy of theirs, and no block is any process's, the scanout's
+/// span's among them.
+#[test]
+fn a_reset_is_told_to_the_host_before_the_messages_after_it() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut rig = Rig::with_host(Box::new(ResetTellingHost(Arc::clone(&seen))));
+    rig.start();
+    const QUEUE: u64 = (4 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const SCANOUT: u64 = RGFX_ALLOCATIONS_OFFSET;
+    rig.send(block_message(
+        RGFX_CMD_BLOCK_GRANT,
+        4,
+        QUEUE_SUBMIT,
+        QUEUE_COMPLETE + 0x2_0000 - QUEUE_SUBMIT,
+    ));
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 4, SCANOUT, 0x1000));
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+    assert!(rig.region().held_by(4, QUEUE_SUBMIT, 0x1000));
+    assert!(rig.region().held_by(4, SCANOUT, 0x1000));
+
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(rig.device.queue_count(), 0);
+    assert!(!rig.region().held_by(4, QUEUE_SUBMIT, 0x1000));
+    assert!(!rig.region().held_by(4, SCANOUT, 0x1000));
+    for _ in 0..2000 {
+        if seen.lock().iter().any(|&(t, _)| t == RESET_TOLD) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // The guest starts again, from its first command.
+    (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+    rig.start();
+    rig.send(object_message(RGFX_CMD_EVENT_CREATE, QUEUE + 1));
+    for _ in 0..2000 {
+        if seen.lock().iter().any(|&(t, _)| t == RGFX_CMD_EVENT_CREATE) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let control = Some("reims-vgpu.graphics-control".to_owned());
+    let queue = Some(format!("reims-vgpu.graphics-queue-{QUEUE:#x}"));
+    assert_eq!(
+        *seen.lock(),
+        [
+            (RGFX_CMD_QUEUE_CREATE, queue),
+            (RESET_TOLD, control.clone()),
+            (RGFX_CMD_EVENT_CREATE, control),
+        ]
+    );
 }
 
 /// The control completion ring takes posts from several threads at once (the control thread's
@@ -1443,7 +1540,7 @@ fn control_completion_posts_from_several_threads_land_whole() {
     rig.start();
     let posters: Vec<_> = (0..THREADS)
         .map(|t| {
-            let poster = rig.device.shared.control_poster();
+            let poster = rig.device.shared.control_poster(0);
             let thread = std::thread::Builder::new().name(format!("poster-{t}"));
             thread
                 .spawn(move || {
