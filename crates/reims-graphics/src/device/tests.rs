@@ -940,6 +940,17 @@ fn queue_create(obj_id: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// Sends the `QUEUE_CREATE` of queue `obj_id` over the tests' rings as the guest's kext does: each
+/// ring's block granted to the queue's process first. The create's seqno.
+fn send_queue_create(rig: &mut Rig, obj_id: u64) -> u64 {
+    let context = (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
+    let span = u64::from(RGFX_RING_HEADER_SIZE + QUEUE_RING_DATA);
+    for ring in [QUEUE_SUBMIT, QUEUE_COMPLETE] {
+        rig.send(block_message(RGFX_CMD_BLOCK_GRANT, context, ring, span));
+    }
+    rig.send(queue_create(obj_id))
+}
+
 /// A ring-0 message of `type` whose payload is `obj_id`: an `OBJECT_DESTROY`, or a create the
 /// test host does not read.
 fn object_message(r#type: u32, obj_id: u64) -> Vec<u8> {
@@ -1076,7 +1087,7 @@ fn a_command_buffer_published_before_its_queue_create_completes() {
     // The guest's first command buffer, published on the queue's zeroed submission ring with no
     // doorbell; then the queue's create.
     publish_command_buffer(&rig, QUEUE, 100, 1, false);
-    let seqno = rig.send(queue_create(QUEUE));
+    let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
 
     // The command buffer completes on the queue's completion ring.
@@ -1107,12 +1118,62 @@ fn a_refused_context_s_queue_create_makes_no_rings() {
     }
     let mut rig = Rig::with_host(Box::new(Refusing));
     rig.start();
-    let seqno = rig.send(queue_create((7 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1));
+    let seqno = send_queue_create(&mut rig, (7 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_REFUSED));
     assert_eq!(rig.device.queue_count(), 0);
-    let seqno = rig.send(queue_create((8 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1));
+    let seqno = send_queue_create(&mut rig, (8 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     assert_eq!(rig.device.queue_count(), 1);
+}
+
+/// A `QUEUE_CREATE` is refused, making no rings, where either ring lies whole in no block its
+/// process holds: in no block, in another process's, or across two of its own; with each ring in
+/// one of its own blocks, it is made
+#[test]
+fn a_queue_s_rings_lie_in_its_process_s_blocks() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let span = u64::from(RGFX_RING_HEADER_SIZE + QUEUE_RING_DATA);
+    let refused = |rig: &mut Rig, what: &str| {
+        let seqno = rig.send(queue_create(QUEUE));
+        assert_eq!(
+            rig.complete(),
+            (seqno, RGFX_STATUS_INVALID_ARGUMENT),
+            "{what}"
+        );
+        assert_eq!(rig.device.queue_count(), 0, "{what}");
+    };
+    refused(&mut rig, "no block");
+    // Another process's blocks.
+    for ring in [QUEUE_SUBMIT, QUEUE_COMPLETE] {
+        rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 3, ring, span));
+    }
+    refused(&mut rig, "another process's blocks");
+    // Its own submission ring, and another's completion ring.
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 5, QUEUE_SUBMIT, span));
+    refused(&mut rig, "the completion ring in another's block");
+    // Its completion ring across two blocks of its own.
+    rig.send(block_message(
+        RGFX_CMD_BLOCK_GRANT,
+        5,
+        QUEUE_COMPLETE,
+        span / 2,
+    ));
+    rig.send(block_message(
+        RGFX_CMD_BLOCK_GRANT,
+        5,
+        QUEUE_COMPLETE + span / 2,
+        span / 2,
+    ));
+    refused(&mut rig, "a ring across two blocks");
+    // Each in one of its own.
+    rig.send(block_message(RGFX_CMD_BLOCK_GRANT, 5, QUEUE_COMPLETE, span));
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(rig.device.queue_count(), 1);
+    assert_eq!(*seen.handed.lock().first().unwrap(), RGFX_CMD_QUEUE_CREATE);
 }
 
 /// A `QUEUE_CREATE` on ring 0 with valid ring parameters makes a command queue's own submission and
@@ -1142,7 +1203,7 @@ fn a_command_queue_gets_its_own_ring_loop() {
 
     // A QUEUE_CREATE with valid rings in the guest's allocations and MSI-X vector 3: the queue is
     // there when it is answered.
-    let seqno = rig.send(queue_create(QUEUE));
+    let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     assert_eq!(rig.device.queue_count(), 1);
     wait_queue_idle(&rig);
@@ -1181,7 +1242,7 @@ fn a_command_queue_gets_its_own_ring_loop() {
     assert_eq!(rig.device.queue_count(), 0);
 
     // CONTEXT_CLOSE ends the context's queues and has the host drop its objects, then is answered.
-    let seqno = rig.send(queue_create(QUEUE));
+    let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     assert_eq!(rig.device.queue_count(), 1);
     let seqno = rig.send(context_close(7));
@@ -1201,7 +1262,7 @@ fn a_command_buffer_in_region_is_taken_from_its_block() {
     let mut rig = Rig::with_host(seen.host());
     rig.start();
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
-    let seqno = rig.send(queue_create(QUEUE));
+    let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     wait_queue_idle(&rig);
 
@@ -1367,7 +1428,7 @@ fn a_command_buffer_waits_for_the_creates_before_it() {
     let mut rig = Rig::with_host(seen.host());
     rig.start();
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
-    let seqno = rig.send(queue_create(QUEUE));
+    let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     wait_queue_idle(&rig);
 
@@ -1408,7 +1469,7 @@ fn a_reset_wakes_a_command_buffer_waiting_for_the_creates_before_it() {
     let mut rig = Rig::with_host(seen.host());
     rig.start();
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
-    let seqno = rig.send(queue_create(QUEUE));
+    let seqno = send_queue_create(&mut rig, QUEUE);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     wait_queue_idle(&rig);
 
@@ -1856,7 +1917,7 @@ fn queue_events(rig: &Rig, count: usize) -> Vec<(u32, u64, u64)> {
 fn taking_rig(taking: &Arc<Taking>, queue: u64) -> Rig {
     let mut rig = Rig::with_host(Box::new(TakingHost(Arc::clone(taking))));
     rig.start();
-    let seqno = rig.send(queue_create(queue));
+    let seqno = send_queue_create(&mut rig, queue);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     wait_queue_idle(&rig);
     rig.region()

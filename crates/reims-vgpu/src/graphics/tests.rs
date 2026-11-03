@@ -518,10 +518,14 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     let context = 2;
     let mut guest = Guest::new(&device);
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
@@ -615,6 +619,25 @@ fn queue_create(
     }
     .as_bytes()
     .to_vec()
+}
+
+/// Creates queue `n` of `context` with its rings at `rings` (submission, completion), each of
+/// `data` bytes, as the guest's kext does: each ring's block granted to the process, then the
+/// `QUEUE_CREATE`, waiting for its `COMPLETE`. Its status.
+fn create_queue(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    context: u32,
+    n: u64,
+    rings: (u64, u64),
+    data: u32,
+    vector: u32,
+) -> u32 {
+    let span = u64::from(RGFX_RING_HEADER_SIZE + data);
+    guest.send(device, block_grant(context, rings.0, span));
+    guest.send(device, block_grant(context, rings.1, span));
+    let create = queue_create(context, n, rings.0, rings.1, data, vector);
+    answered(device, guest, create)
 }
 
 /// A `CONTEXT_CLOSE` of `context`.
@@ -826,10 +849,14 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     let queue = obj(context, 1);
     let mut guest = Guest::new(&device);
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1)
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
         ),
         RGFX_STATUS_OK
     );
@@ -903,10 +930,14 @@ fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
     let (context, mut guest) = (3, Guest::new(&device));
     let queue = obj(context, 1);
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1)
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
         ),
         RGFX_STATUS_OK
     );
@@ -1021,8 +1052,16 @@ fn a_raise_may_call_the_device_at_once() {
         let (device, returned) = calling_back(SUBMIT_OFF);
         device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
         let mut guest = Guest::new(&device);
-        let create = queue_create(context, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 1);
-        assert_eq!(answered(&device, &mut guest, create), RGFX_STATUS_OK);
+        let created = create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1,
+        );
+        assert_eq!(created, RGFX_STATUS_OK);
         let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
         for _ in 0..2000 {
             // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
@@ -1411,10 +1450,14 @@ fn another_context_s_command_buffer_is_not_held_by_a_slow_compile() {
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(2, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+            2,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
@@ -1482,10 +1525,14 @@ fn a_command_buffer_naming_a_pending_pipeline_waits_for_it() {
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+            3,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
@@ -1785,11 +1832,7 @@ fn a_command_buffer_finds_a_sampler_made_under_a_walk() {
     const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
-            &device,
-            &mut guest,
-            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
-        ),
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
@@ -2199,10 +2242,14 @@ fn a_command_buffer_names_only_its_own_process_s_objects() {
     const RING_DATA: u32 = 0x1_0000;
     for (context, submit, complete) in [(1, SUBMIT_1, COMPLETE_1), (2, SUBMIT_2, COMPLETE_2)] {
         assert_eq!(
-            answered(
+            create_queue(
                 &device,
                 &mut guest,
-                queue_create(context, 1, submit, complete, RING_DATA, 0)
+                context,
+                1,
+                (submit, complete),
+                RING_DATA,
+                0
             ),
             RGFX_STATUS_OK
         );
@@ -2489,11 +2536,7 @@ fn a_managed_range_is_carried_out_before_a_later_command_buffer() {
     const RING_DATA: u32 = 0x1_0000;
     let mut guest = Guest::new(&device);
     assert_eq!(
-        answered(
-            &device,
-            &mut guest,
-            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
-        ),
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
         RGFX_STATUS_OK
     );
     guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
@@ -2601,10 +2644,14 @@ fn a_release_and_a_close_wait_for_their_context_s_command_buffers() {
     const RING_DATA: u32 = 0x1_0000;
     for (context, submit, complete) in [(1, SUBMIT_1, COMPLETE_1), (2, SUBMIT_2, COMPLETE_2)] {
         assert_eq!(
-            answered(
+            create_queue(
                 &device,
                 &mut guest,
-                queue_create(context, 1, submit, complete, RING_DATA, 0)
+                context,
+                1,
+                (submit, complete),
+                RING_DATA,
+                0
             ),
             RGFX_STATUS_OK
         );
@@ -2653,11 +2700,7 @@ fn a_queue_s_rings_keep_their_block() {
     const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
-            &device,
-            &mut guest,
-            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
-        ),
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
         RGFX_STATUS_OK
     );
     for at in [SUBMIT, COMPLETE] {
@@ -2969,10 +3012,14 @@ fn an_encode_the_platform_refuses_fails_its_command_buffer() {
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+            3,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
@@ -3104,10 +3151,14 @@ fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_eve
     const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(3, 1, SUBMIT_OFF, COMPLETE_OFF, RING_DATA, 0)
+            3,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
@@ -3289,11 +3340,7 @@ fn surface_and_queue(device: &GraphicsDevice<FakePlatform>) -> (Guest, QueueRing
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(device);
     assert_eq!(
-        answered(
-            device,
-            &mut guest,
-            queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0)
-        ),
+        create_queue(device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
         RGFX_STATUS_OK
     );
     guest.send(device, block_grant(1, BLOCK, 0x1_0000));
@@ -3421,10 +3468,14 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     const RING_DATA: u32 = 0x1_0000;
     for (context, submit, complete) in [(3, SUBMIT_3, COMPLETE_3), (4, SUBMIT_4, COMPLETE_4)] {
         assert_eq!(
-            answered(
+            create_queue(
                 &device,
                 &mut guest,
-                queue_create(context, 1, submit, complete, RING_DATA, 0)
+                context,
+                1,
+                (submit, complete),
+                RING_DATA,
+                0
             ),
             RGFX_STATUS_OK
         );
@@ -3505,10 +3556,14 @@ fn a_completion_the_platform_refuses_fails_its_context() {
         RGFX_STATUS_OK
     );
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(3, 2, SUBMIT_NEXT, COMPLETE_NEXT, RING_DATA, 0)
+            3,
+            2,
+            (SUBMIT_NEXT, COMPLETE_NEXT),
+            RING_DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
@@ -3583,11 +3638,7 @@ fn fail_context(
 ) {
     const RING_DATA: u32 = 0x1_0000;
     assert_eq!(
-        answered(
-            device,
-            guest,
-            queue_create(context, 1, submit, complete, RING_DATA, 0)
-        ),
+        create_queue(device, guest, context, 1, (submit, complete), RING_DATA, 0),
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(device, submit, complete, u64::from(RING_DATA));
@@ -3623,10 +3674,14 @@ fn a_failed_context_s_queues_and_queries_are_refused() {
 
     // The queue create.
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(3, 2, NEXT_SUBMIT, NEXT_COMPLETE, 0x1_0000, 0)
+            3,
+            2,
+            (NEXT_SUBMIT, NEXT_COMPLETE),
+            0x1_0000,
+            0
         ),
         RGFX_STATUS_REFUSED
     );

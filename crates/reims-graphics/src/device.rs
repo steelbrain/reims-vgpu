@@ -22,7 +22,8 @@
 //! tells the host of the refresh ([`Host::refreshed`]), which answers there the presents the
 //! display first shows at it.
 //!
-//! **Per-queue rings.** A `QUEUE_CREATE` on ring 0, where its ring parameters are valid, makes the
+//! **Per-queue rings.** A `QUEUE_CREATE` on ring 0, where its ring parameters are valid (each
+//! ring whole in one block its process holds, among them), makes the
 //! queue's own submission+completion ring pair at the guest-given region offsets and starts a
 //! service thread of its own (`reims-vgpu.graphics-queue-*`) before it is answered, so the process
 //! may write the ring once the create returns. The thread first has the host make the queue's
@@ -1180,8 +1181,10 @@ impl Shared {
 
     /// A `QUEUE_CREATE`'s ring pair, where its parameters are valid: each data ring a power of two
     /// no smaller than [`MIN_QUEUE_RING_DATA`], each ring 8-aligned in the guest's allocations and
-    /// within the region, and the two not overlapping. `None` where any is refused, so the queue
-    /// is refused.
+    /// within the region, the two not overlapping, and each whole in one block the queue's context
+    /// holds ([`Region::held_by`]), as the kext checked: the host posts its completions there and
+    /// reads its counts, which must be the process's own memory, not another's or the scanout's.
+    /// `None` where any is refused, so the queue is refused.
     fn validate_rings(&self, q: &RgfxQueueCreate) -> Option<(RingAt, RingAt)> {
         let submit_data = u64::from(q.submit_data_size);
         let complete_data = u64::from(q.complete_data_size);
@@ -1210,6 +1213,14 @@ impl Shared {
         let (s0, s1) = (q.submit_offset, q.submit_offset + submit_span);
         let (c0, c1) = (q.complete_offset, q.complete_offset + complete_span);
         if s0 < c1 && c0 < s1 {
+            return None;
+        }
+        let context = (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
+        if !self.region.held_by(context, q.submit_offset, submit_span)
+            || !self
+                .region
+                .held_by(context, q.complete_offset, complete_span)
+        {
             return None;
         }
         Some((
@@ -1241,7 +1252,7 @@ impl Shared {
             log::warn!(
                 target: "reims_graphics",
                 "queue {:#x}: its ring parameters are refused (submit {:#x}/{}, complete \
-                 {:#x}/{})",
+                 {:#x}/{}; a ring must lie whole in one block of its process's)",
                 q.obj_id, q.submit_offset, q.submit_data_size, q.complete_offset,
                 q.complete_data_size
             );
