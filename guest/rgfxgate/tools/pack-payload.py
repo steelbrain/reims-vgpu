@@ -28,7 +28,13 @@ stem = name[:-len(".bundle")]
 exec_rel = "Contents/MacOS/" + stem
 
 # cdhash of the executable, from codesign (truncated to CS_CDHASH_LEN = 20 bytes).
-cd = subprocess.run(["codesign", "-dvvv", bundle], capture_output=True, text=True)
+# Pin the x86_64 slice: the guest runs x86_64, and the kernel's csfg_get_cdhash
+# gates on that slice's cdhash. A fat bundle packed on an arm64 Mac would
+# otherwise embed the arm64 slice's hash, and the gate would reject the guest's
+# x86_64 slice -- a silent "bundle won't load". codesign's default --arch is the
+# host's; --arch x86_64 reads the slice the guest actually loads.
+cd = subprocess.run(["codesign", "--arch", "x86_64", "-dvvv", bundle],
+                    capture_output=True, text=True)
 cdhash = None
 for line in (cd.stdout + cd.stderr).splitlines():
     if line.startswith("CDHash="):
