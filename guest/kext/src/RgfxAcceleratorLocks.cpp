@@ -221,8 +221,23 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key)
 	                                        RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_ATTACH,
 	                                        nullptr, nullptr);
 	IOLockLock(state.lock);
-	rgfxCacheAttached(state.caches, key, ok);
+	void *map = nullptr, *wire = nullptr, *surface = nullptr;
+	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(
+	    rgfxCacheAttached(state.caches, key, ok, &map, &wire, &surface)));
 	wakeLocked();
+	if (cache) {
+		// Its block went meanwhile (rgfxCacheLetGo): the let-go is this attach's, out of the
+		// lock. IOSurface holds the cache for the lock calling this, and the lock's process the
+		// surface.
+		IOLockUnlock(state.lock);
+		if (map)
+			static_cast<IOMemoryMap *>(map)->release();
+		cache->release();
+		if (surface)
+			static_cast<OSObject *>(surface)->release();
+		letGoMemory(wire, ok);
+		IOLockLock(state.lock);
+	}
 	if (!ok)
 		IOLog("RgfxAccelerator: IOSurface %u's deferred block 0x%llx: its pages were not "
 		      "named\n",
@@ -528,8 +543,6 @@ bool rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset, OSObje
 	// Read out of every lock, as at a block's sleep.
 	const int32_t clients = rgfxIOSurfaceClientCount(surface);
 	const int32_t retains = surface->getRetainCount();
-	uint64_t deadline = 0;
-	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	bool unattached = false;
 	IOLockLock(state.lock);
 	for (;;) {
@@ -540,8 +553,11 @@ bool rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset, OSObje
 			unattached = !attachLocked(accel, c->key);
 			break;
 		}
-		if (step == kRgfxCacheReleaseWait && mach_absolute_time() < deadline) {
-			IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+		// A lock's attach in flight ends within its SURFACE_PAGES's answer time, and none
+		// starts once the block is releasing (rgfxCacheNext): the release goes after it, never
+		// over it, under no lock but this one, which the sleep lets go.
+		if (step == kRgfxCacheReleaseWait) {
+			IOLockSleep(state.lock, &state.table, THREAD_UNINT);
 			continue;
 		}
 		const RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
@@ -572,12 +588,9 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, void **w
 		bool wake = rgfxLockForgetKey(state.table, key);
 		// A cached surface's locks wait for its block's release, the cache and the surface held
 		// until the answer (rgfxSurfaceCacheReleased), or it is cached no more. A lock naming a
-		// deferred block's pages uses its memory: one not released waits for it.
+		// deferred block's pages uses its memory: that attach lets the surface go once answered,
+		// and nothing here waits for it.
 		const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
-		while (!releasing && c != nullptr && c->deferral == kRgfxCacheAttaching) {
-			IOLockSleep(state.lock, &state.table, THREAD_UNINT);
-			c = rgfxCacheFind(state.caches, key);
-		}
 		wake |= c != nullptr;
 		wired = c == nullptr || rgfxCacheWired(*c);
 		kept = !rgfxCacheLetGo(state.caches, key, releasing, surface, &map, &wire);

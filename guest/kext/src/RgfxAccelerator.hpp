@@ -99,9 +99,11 @@ class ReimsGraphics;
 // (RgfxAcceleratorLocks.cpp), the cache's first. Either may be null. A cached block's surface
 // stays cached until its BLOCK_RELEASE is answered where `releasing` (rgfxSurfaceCacheReleased),
 // its locks waiting for the answer and its cache, its surface and its memory's wiring held until
-// then; else it goes, and the wiring of its memory with it, unless `wire` is given: that wiring
-// is then the caller's (`*wire`, null where the surface was not cached), to hand to a block the
-// device may still map in place, or to unwire.
+// then; else it goes, or, where a lock is naming a deferred block's pages, goes once that attach
+// is answered, which lets it go: the call waits for no host. A surface that goes takes the wiring
+// of its memory with it, unless `wire` is given: that wiring is then the caller's (`*wire`, null
+// where the surface was not cached, or its memory was never wired), to hand to a block the device
+// may still map in place, or to unwire.
 void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, void **wire = nullptr);
 // The surface `surface` of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID
 // `surfaceId`, has its block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page

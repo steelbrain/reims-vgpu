@@ -120,6 +120,9 @@ struct RgfxCachedSurface {
 	uint32_t context;
 	uint64_t size;
 	uint64_t length;
+	// The block went, not released, while a lock or the release named its pages: the attach
+	// lets the surface go once answered (rgfxCacheAttached), so the let-go waits for no host.
+	bool forgotten;
 };
 
 // RgfxCachedSurface::letGo where nothing asks the dormant block to go.
@@ -156,7 +159,7 @@ inline RgfxCachedSurface *rgfxCacheOfSurface(RgfxCacheTable &t, uint32_t surface
 {
 	for (uint32_t i = 0; i < t.count; i++) {
 		const RgfxCachedSurface &c = t.entries[i];
-		if (c.surfaceId == surfaceId && !c.releasing)
+		if (c.surfaceId == surfaceId && !c.releasing && !c.forgotten)
 			return &t.entries[i];
 	}
 	return nullptr;
@@ -198,7 +201,8 @@ inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map,
 // release is answered where `releasing`, else it is taken out (its mapping and wired memory in
 // `*map` and `*wire`, for the caller to let go). True where the caller releases the device
 // cache's reference and the surface's, `surface`, now; false where the table keeps both for the
-// answer (rgfxCacheReleased).
+// answer (rgfxCacheReleased), or, where an attach of a deferred block's pages is in flight, for
+// that attach to let go once answered (rgfxCacheAttached): the let-go never waits for the host.
 inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void *surface,
                            void **map, void **wire)
 {
@@ -206,8 +210,9 @@ inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr)
 		return true;
-	if (releasing) {
-		c->releasing = true;
+	if (releasing || c->deferral == kRgfxCacheAttaching) {
+		c->releasing = releasing;
+		c->forgotten = !releasing;
 		c->surface = surface;
 		return false;
 	}
@@ -413,12 +418,23 @@ inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, 
 }
 
 // The attach a lock or the release asked of surface `key` (kRgfxCacheAttach) was answered, OK
-// where `ok`: its pages are the cache's from here on, or are still to name.
-inline void rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, bool ok)
+// where `ok`: its pages are the cache's from here on, or are still to name. Where its block went
+// meanwhile (`forgotten`), the surface is taken out (its mapping, its memory, wired where `ok`,
+// and the surface's reference in `*map`, `*wire` and `*surface`) and its key returned, the device
+// cache whose reference the caller releases, then the surface's; else 0.
+inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, bool ok, void **map,
+                                  void **wire, void **surface)
 {
+	*map = *wire = *surface = nullptr;
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
-	if (c != nullptr && c->deferral == kRgfxCacheAttaching)
-		c->deferral = ok ? kRgfxCacheAttached : kRgfxCacheDeferred;
+	if (c == nullptr || c->deferral != kRgfxCacheAttaching)
+		return 0;
+	c->deferral = ok ? kRgfxCacheAttached : kRgfxCacheDeferred;
+	if (!c->forgotten)
+		return 0;
+	*surface = c->surface;
+	rgfxCacheRemove(t, c, map, wire);
+	return key;
 }
 
 // The ask of surface `key`'s deferred block read the surface fresh: it asks the host to defer
