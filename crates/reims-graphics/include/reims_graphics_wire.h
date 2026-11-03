@@ -90,6 +90,35 @@
 // `resetWithRange:` of a buffer of compute commands ([`RgfxIcbRange`]).
 #define RGFX_ICB_OP_COMPUTE_RESET_RANGE 44
 
+// A slot's mask bit: the command's `reset`, carried out before the other bits.
+#define RGFX_ICB_SLOT_RESET (1 << 0)
+
+// A slot's mask bit: the command was reset by its buffer's `resetWithRange:`, carried out before
+// the other bits; a run of commands with this bit alone is reset in one call.
+#define RGFX_ICB_SLOT_RESET_RANGE (1 << 1)
+
+// A slot's mask bit: `setRenderPipelineState:` or `setComputePipelineState:` (`pipeline`).
+#define RGFX_ICB_SLOT_PIPELINE (1 << 2)
+
+// A slot's mask bit: the draw or the dispatch (`op` and its body).
+#define RGFX_ICB_SLOT_ACTION (1 << 3)
+
+// A slot's mask bit: `setBarrier` or `clearBarrier` (`barrier`).
+#define RGFX_ICB_SLOT_BARRIER (1 << 4)
+
+// A compute slot's mask bit: `setStageInRegion:` (`stage_in`).
+#define RGFX_ICB_SLOT_STAGE_IN (1 << 5)
+
+// A compute slot's mask bit: `setImageblockWidth:height:` (`imageblock`).
+#define RGFX_ICB_SLOT_IMAGEBLOCK (1 << 6)
+
+// A slot's mask bit of its first binding of the first kind (a render slot's vertex buffer 0, a
+// compute slot's kernel buffer 0); binding `i` is this bit shifted left by `i`, up to 31.
+#define RGFX_ICB_SLOT_BUFFER_0 4294967296
+
+// The most bindings of each kind a slot holds: a `mask_b` bit each, and the upper half of `mask`.
+#define RGFX_ICB_SLOT_BINDINGS 32
+
 // The framing / command-buffer group (`tag >> 12`): encoder begin and end, the command
 // buffer's own event signals and waits, and the IOSurfaces it uses whose blocks have a device
 // cache.
@@ -838,8 +867,8 @@
 // guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 // [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 // [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
-// [`RGFX_FEATURE_MANAGED_AT_OFFSET`] and [`RGFX_FEATURE_SUBMIT_ROOM`]). Bits 9, 10 and 15 are
-// reserved.
+// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_SUBMIT_ROOM`] and [`RGFX_FEATURE_ICB_SLOTS`]).
+// Bits 9, 10 and 15 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -936,6 +965,14 @@
 // sees the take's room, or the host's read sees the flag. Every host offers it, the device
 // carrying it out.
 #define RGFX_FEATURE_SUBMIT_ROOM (1 << 16)
+
+// `FEATURES_LO` bit 17, `ICB_SLOTS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`], and which means nothing without
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: ring 0 carries [`RGFX_CMD_ICB_SLOTS`], the CPU's
+// encodes into indirect command buffers as slots in the process's region ([`crate::icb`],
+// "Slots"), which the host reads where the message names them. The guest still sends `ICB_WRITE`
+// for a buffer it keeps no slots for.
+#define RGFX_FEATURE_ICB_SLOTS (1 << 17)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1313,6 +1350,17 @@
 // feature refuses the message as one it does not know.
 #define RGFX_CMD_BUFFER_MANAGED_AT_OFFSET 555
 
+// Command `ICB_SLOTS` ([`RgfxIcbSlots`], then its runs, [`RgfxIcbSlotRun`]), where the guest took
+// [`RGFX_FEATURE_ICB_SLOTS`]: for each run, the slots of `command_count` commands of indirect
+// command buffer `icb_obj_id` from `first_command`, `slot_bytes` apart from `region_offset`,
+// which must lie in one block the sender holds, as they stand as the host reads them
+// ([`crate::icb`], "Slots"). Each command's bits are carried out on the platform's buffer as its
+// records would be; a run the host cannot read (an object the sender does not hold, a span
+// outside its blocks, a shape it does not know) is skipped alone, as is a command the platform
+// refuses. Ring 0 is carried out before any command buffer the process posts after it, as
+// `ICB_WRITE` is. Not answered.
+#define RGFX_CMD_ICB_SLOTS 556
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -1585,6 +1633,12 @@
 
 // [`RgfxIcbCreate`] `flags`: `inheritBlendColor` (SPI).
 #define RGFX_ICB_INHERIT_BLEND_COLOR (1 << 15)
+
+// [`RgfxIcbSlotRun`] `kind`: render slots ([`crate::icb::RgfxIcbRenderSlot`]).
+#define RGFX_ICB_SLOTS_RENDER 1
+
+// [`RgfxIcbSlotRun`] `kind`: compute slots ([`crate::icb::RgfxIcbComputeSlot`]).
+#define RGFX_ICB_SLOTS_COMPUTE 2
 
 // The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
 // ([`RgfxManagedTextureCreate`]).
@@ -3610,6 +3664,95 @@ typedef struct {
   // width, height, depth.
   uint32_t size[3];
 } RgfxIcbRegion;
+
+// A compute command's slot, its fixed part; then `kernel_count` [`RgfxIcbSlotBuffer`]s, then
+// `threadgroup_count` threadgroup memory lengths (`u32`), padded to 8 bytes.
+typedef struct {
+  // `RGFX_ICB_SLOT_*` bits; kernel buffer `i`'s is `RGFX_ICB_SLOT_BUFFER_0 << i`.
+  uint64_t mask;
+  // Threadgroup memory length `i`'s bit is `1 << i`.
+  uint64_t mask_b;
+  // The pipeline state, 0 for nil.
+  uint64_t pipeline;
+  // The dispatch's op (`RGFX_ICB_OP_DISPATCH_THREADGROUPS` or `RGFX_ICB_OP_DISPATCH_THREADS`).
+  uint16_t op;
+  // 1 for `setBarrier`, 0 for `clearBarrier`.
+  uint16_t barrier;
+  // Bit `i`: kernel buffer `i` was set with its attribute stride.
+  uint32_t strided;
+  // The dispatch's body.
+  RgfxIcbDispatch dispatch;
+  // `setStageInRegion:`'s body.
+  RgfxIcbRegion stage_in;
+  // `setImageblockWidth:height:`'s body.
+  RgfxIcbImageblock imageblock;
+} RgfxIcbComputeSlot;
+
+// A render command's slot, its fixed part; then `vertex_count` [`RgfxIcbSlotBuffer`]s, then
+// `fragment_count`.
+typedef struct {
+  // `RGFX_ICB_SLOT_*` bits; vertex buffer `i`'s is `RGFX_ICB_SLOT_BUFFER_0 << i`.
+  uint64_t mask;
+  // Fragment buffer `i`'s bit is `1 << i`.
+  uint64_t mask_b;
+  // The pipeline state, 0 for nil.
+  uint64_t pipeline;
+  // The draw's op (`RGFX_ICB_OP_DRAW` to `RGFX_ICB_OP_DRAW_INDEXED_PATCHES`).
+  uint16_t op;
+  // 1 for `setBarrier`, 0 for `clearBarrier`.
+  uint16_t barrier;
+  // Bit `i`: vertex buffer `i` was set with its attribute stride.
+  uint32_t strided;
+  // The draw's body, as its record's (72 bytes), zeros past it.
+  uint64_t action[9];
+} RgfxIcbRenderSlot;
+
+// A buffer binding of a slot: the buffer (0 for nil), its offset, and the attribute stride where
+// the slot's `strided` bit says it was set with one.
+typedef struct {
+  // The buffer, 0 for nil.
+  uint64_t obj_id;
+  // `offset`.
+  uint64_t offset;
+  // `attributeStride`.
+  uint64_t stride;
+} RgfxIcbSlotBuffer;
+
+// One run of an `ICB_SLOTS`: the slots of commands `first_command` to `first_command +
+// command_count` of `icb_obj_id`, the first at `region_offset`, `slot_bytes` apart, each of
+// `kind` with `bindings_a` bindings of the first kind (vertex or kernel buffers) and `bindings_b`
+// of the second (fragment buffers or threadgroup memory lengths).
+typedef struct {
+  // The indirect command buffer.
+  uint64_t icb_obj_id;
+  // The first slot's place in the region: 8-aligned.
+  uint64_t region_offset;
+  // The first slot's command.
+  uint32_t first_command;
+  // How many commands' slots.
+  uint32_t command_count;
+  // The bytes from one slot to the next: a multiple of 8, at least the slot's
+  // ([`crate::icb::slot_bytes`]).
+  uint32_t slot_bytes;
+  // [`RGFX_ICB_SLOTS_RENDER`] or [`RGFX_ICB_SLOTS_COMPUTE`].
+  uint16_t kind;
+  // The slot's bindings of the first kind, at most 32.
+  uint8_t bindings_a;
+  // The slot's bindings of the second kind, at most 32.
+  uint8_t bindings_b;
+} RgfxIcbSlotRun;
+
+// `ICB_SLOTS`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's `size`.
+typedef struct {
+  // [`RGFX_CMD_ICB_SLOTS`].
+  RgfxMsgHeader header;
+  // The first run's indirect command buffer, which places the message in its context.
+  uint64_t obj_id;
+  // How many runs follow.
+  uint32_t run_count;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_1c;
+} RgfxIcbSlots;
 
 // `ICB_STATE`: an `ICB_CREATE`'s answer. `status` is [`RGFX_STATUS_OK`] with the buffer's
 // `gpu_resource_id`, or [`RGFX_STATUS_REFUSED`] (the device made none, or the sender's context

@@ -14,6 +14,21 @@
 //! The render ops are `0x01` to `0x1f`, the compute ops `0x21` to `0x3f`. The host carries each
 //! record out on the platform's buffer, and skips one it cannot (an object the sender does not
 //! hold, or the platform's refusal), alone.
+//!
+//! **Slots** ([`RGFX_CMD_ICB_SLOTS`](crate::wire::RGFX_CMD_ICB_SLOTS), where the guest took
+//! [`RGFX_FEATURE_ICB_SLOTS`](crate::wire::RGFX_FEATURE_ICB_SLOTS)): in place of records, the
+//! guest writes each command's state into a slot of its own in a block of the process's region,
+//! as a GPU's driver writes a command's record, and posts nothing while it encodes. A slot is a
+//! fixed part ([`RgfxIcbRenderSlot`], [`RgfxIcbComputeSlot`]), then its bindings
+//! ([`RgfxIcbSlotBuffer`]: a render slot's vertex buffers, then its fragment buffers; a compute
+//! slot's kernel buffers, then its threadgroup memory lengths, a `u32` each, padded to 8 bytes).
+//! Each setter writes its field and sets the field's bit in the slot's `mask` or `mask_b`; a
+//! command's `reset` sets the mask to [`RGFX_ICB_SLOT_RESET`] alone and a `resetWithRange:` to
+//! [`RGFX_ICB_SLOT_RESET_RANGE`] alone, so what was set before them goes. The guest sets each bit
+//! with an atomic OR, after the field's bytes; the host swaps each mask for 0 before it reads the
+//! slot, and carries out the bits it took, so it carries out what the guest set since its last
+//! take, as the slot holds it then: the latest encode. A slot names objects by their `ObjId`, as
+//! records do, and buffers with their offset; a field is the body its record would carry.
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -275,8 +290,120 @@ pub struct RgfxIcbRange {
     pub reserved_04: u32,
 }
 
+/// A slot's mask bit: the command's `reset`, carried out before the other bits.
+pub const RGFX_ICB_SLOT_RESET: u64 = 1 << 0;
+/// A slot's mask bit: the command was reset by its buffer's `resetWithRange:`, carried out before
+/// the other bits; a run of commands with this bit alone is reset in one call.
+pub const RGFX_ICB_SLOT_RESET_RANGE: u64 = 1 << 1;
+/// A slot's mask bit: `setRenderPipelineState:` or `setComputePipelineState:` (`pipeline`).
+pub const RGFX_ICB_SLOT_PIPELINE: u64 = 1 << 2;
+/// A slot's mask bit: the draw or the dispatch (`op` and its body).
+pub const RGFX_ICB_SLOT_ACTION: u64 = 1 << 3;
+/// A slot's mask bit: `setBarrier` or `clearBarrier` (`barrier`).
+pub const RGFX_ICB_SLOT_BARRIER: u64 = 1 << 4;
+/// A compute slot's mask bit: `setStageInRegion:` (`stage_in`).
+pub const RGFX_ICB_SLOT_STAGE_IN: u64 = 1 << 5;
+/// A compute slot's mask bit: `setImageblockWidth:height:` (`imageblock`).
+pub const RGFX_ICB_SLOT_IMAGEBLOCK: u64 = 1 << 6;
+/// A slot's mask bit of its first binding of the first kind (a render slot's vertex buffer 0, a
+/// compute slot's kernel buffer 0); binding `i` is this bit shifted left by `i`, up to 31.
+pub const RGFX_ICB_SLOT_BUFFER_0: u64 = 0x1_0000_0000;
+/// The most bindings of each kind a slot holds: a `mask_b` bit each, and the upper half of `mask`.
+pub const RGFX_ICB_SLOT_BINDINGS: u32 = 32;
+
+/// A render command's slot, its fixed part; then `vertex_count` [`RgfxIcbSlotBuffer`]s, then
+/// `fragment_count`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbRenderSlot {
+    /// `RGFX_ICB_SLOT_*` bits; vertex buffer `i`'s is `RGFX_ICB_SLOT_BUFFER_0 << i`.
+    pub mask: u64,
+    /// Fragment buffer `i`'s bit is `1 << i`.
+    pub mask_b: u64,
+    /// The pipeline state, 0 for nil.
+    pub pipeline: u64,
+    /// The draw's op (`RGFX_ICB_OP_DRAW` to `RGFX_ICB_OP_DRAW_INDEXED_PATCHES`).
+    pub op: u16,
+    /// 1 for `setBarrier`, 0 for `clearBarrier`.
+    pub barrier: u16,
+    /// Bit `i`: vertex buffer `i` was set with its attribute stride.
+    pub strided: u32,
+    /// The draw's body, as its record's (72 bytes), zeros past it.
+    pub action: [u64; 9],
+}
+
+/// A compute command's slot, its fixed part; then `kernel_count` [`RgfxIcbSlotBuffer`]s, then
+/// `threadgroup_count` threadgroup memory lengths (`u32`), padded to 8 bytes.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbComputeSlot {
+    /// `RGFX_ICB_SLOT_*` bits; kernel buffer `i`'s is `RGFX_ICB_SLOT_BUFFER_0 << i`.
+    pub mask: u64,
+    /// Threadgroup memory length `i`'s bit is `1 << i`.
+    pub mask_b: u64,
+    /// The pipeline state, 0 for nil.
+    pub pipeline: u64,
+    /// The dispatch's op (`RGFX_ICB_OP_DISPATCH_THREADGROUPS` or `RGFX_ICB_OP_DISPATCH_THREADS`).
+    pub op: u16,
+    /// 1 for `setBarrier`, 0 for `clearBarrier`.
+    pub barrier: u16,
+    /// Bit `i`: kernel buffer `i` was set with its attribute stride.
+    pub strided: u32,
+    /// The dispatch's body.
+    pub dispatch: RgfxIcbDispatch,
+    /// `setStageInRegion:`'s body.
+    pub stage_in: RgfxIcbRegion,
+    /// `setImageblockWidth:height:`'s body.
+    pub imageblock: RgfxIcbImageblock,
+}
+
+/// A buffer binding of a slot: the buffer (0 for nil), its offset, and the attribute stride where
+/// the slot's `strided` bit says it was set with one.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbSlotBuffer {
+    /// The buffer, 0 for nil.
+    pub obj_id: u64,
+    /// `offset`.
+    pub offset: u64,
+    /// `attributeStride`.
+    pub stride: u64,
+}
+
+/// The least bytes a slot of `kind` ([`RGFX_ICB_SLOTS_RENDER`](crate::wire::RGFX_ICB_SLOTS_RENDER)
+/// or [`RGFX_ICB_SLOTS_COMPUTE`](crate::wire::RGFX_ICB_SLOTS_COMPUTE)) with `a` bindings of the
+/// first kind and `b` of the second takes: its fixed part, then its bindings; `None` for another
+/// kind or more than [`RGFX_ICB_SLOT_BINDINGS`] of either.
+pub fn slot_bytes(kind: u16, a: u32, b: u32) -> Option<u64> {
+    use core::mem::size_of;
+    if a > RGFX_ICB_SLOT_BINDINGS || b > RGFX_ICB_SLOT_BINDINGS {
+        return None;
+    }
+    let buffer = size_of::<RgfxIcbSlotBuffer>() as u64;
+    let (a, b) = (u64::from(a), u64::from(b));
+    match kind {
+        crate::wire::RGFX_ICB_SLOTS_RENDER => {
+            Some(size_of::<RgfxIcbRenderSlot>() as u64 + buffer * (a + b))
+        }
+        crate::wire::RGFX_ICB_SLOTS_COMPUTE => {
+            Some(size_of::<RgfxIcbComputeSlot>() as u64 + buffer * a + (4 * b).next_multiple_of(8))
+        }
+        _ => None,
+    }
+}
+
 const _: () = {
     use core::mem::size_of;
+    assert!(size_of::<RgfxIcbRenderSlot>() == 104);
+    assert!(size_of::<RgfxIcbComputeSlot>() == 88);
+    assert!(size_of::<RgfxIcbSlotBuffer>() == 24);
+    assert!(size_of::<RgfxIcbDrawIndexedPatches>() == 72);
     assert!(size_of::<RgfxIcbRecord>() == 8);
     assert!(size_of::<RgfxIcbObject>() == 8);
     assert!(size_of::<RgfxIcbBuffer>() == 24);

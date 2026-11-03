@@ -5144,9 +5144,24 @@ fn a_library_made_across_a_reset_is_not_in_the_new_device_s_cache() {
 /// buffer's execute, and the buffer completes.
 #[test]
 fn an_icb_is_made_written_and_executed_through_the_rings() {
+    icb_through_the_rings(false);
+}
+
+/// As [`an_icb_is_made_written_and_executed_through_the_rings`], the guest taking slots: the
+/// device offers them, and a command buffer posted after an `ICB_SLOTS` executes the commands
+/// its slots, in a block of the process's, hold.
+#[test]
+fn an_icb_is_written_through_slots_and_executed_through_the_rings() {
+    icb_through_the_rings(true);
+}
+
+/// An indirect command buffer made, its command 1 written by the CPU (as slots where `slots`, as
+/// records else), and executed by a command buffer posted after.
+fn icb_through_the_rings(slots: bool) {
     use reims_graphics::icb::{
-        RGFX_ICB_OP_DISPATCH_THREADGROUPS, RGFX_ICB_OP_KERNEL_BUFFER, RgfxIcbBuffer,
-        RgfxIcbDispatch, RgfxIcbRecord,
+        RGFX_ICB_OP_DISPATCH_THREADGROUPS, RGFX_ICB_OP_KERNEL_BUFFER, RGFX_ICB_SLOT_ACTION,
+        RGFX_ICB_SLOT_BUFFER_0, RgfxIcbBuffer, RgfxIcbComputeSlot, RgfxIcbDispatch, RgfxIcbRecord,
+        RgfxIcbSlotBuffer,
     };
     use reims_graphics::ops::compute::{
         RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RgfxComputeOpExecuteCommandsInBuffer,
@@ -5161,14 +5176,20 @@ fn an_icb_is_made_written_and_executed_through_the_rings() {
         0,
         "the host offers indirect command buffers"
     );
-    device.mmio_write(
-        RGFX_REG_DRIVER_FEATURES_LO.into(),
-        RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
-    );
     assert_ne!(
-        device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into())
-            & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+        device.mmio_read(RGFX_REG_FEATURES_LO.into()) & RGFX_FEATURE_ICB_SLOTS,
         0,
+        "the host offers slots"
+    );
+    let taken = if slots {
+        RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_ICB_SLOTS
+    } else {
+        RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+    };
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), taken);
+    assert_eq!(
+        device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into()) & taken,
+        taken,
         "the guest may take them"
     );
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -5273,7 +5294,61 @@ fn an_icb_is_made_written_and_executed_through_the_rings() {
         }
         .as_bytes(),
     ));
-    guest.send(&device, write);
+    // Command 1's slot, in a block of the process's: its kernel buffer, then its dispatch.
+    const SLOTS: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const STRIDE: u64 = 88 + 24;
+    if slots {
+        guest.send(&device, block_grant(context, SLOTS, 0x1000));
+        let mut slot = RgfxIcbComputeSlot {
+            mask: RGFX_ICB_SLOT_BUFFER_0 | RGFX_ICB_SLOT_ACTION,
+            op: RGFX_ICB_OP_DISPATCH_THREADGROUPS,
+            dispatch: RgfxIcbDispatch {
+                grid: [1, 1, 1],
+                threadgroup: [32, 1, 1],
+            },
+            ..RgfxIcbComputeSlot::default()
+        }
+        .as_bytes()
+        .to_vec();
+        slot.extend_from_slice(
+            RgfxIcbSlotBuffer {
+                obj_id: buffer,
+                offset: 64,
+                stride: 0,
+            }
+            .as_bytes(),
+        );
+        // SAFETY: as `Guest`'s helpers: the block lies in the region, granted to the process.
+        unsafe { guest.write((SLOTS + STRIDE) as usize, &slot) };
+        let mut message = RgfxIcbSlots {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ICB_SLOTS,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: icb,
+            run_count: 1,
+            reserved_1c: 0,
+        }
+        .as_bytes()
+        .to_vec();
+        message.extend_from_slice(
+            RgfxIcbSlotRun {
+                icb_obj_id: icb,
+                region_offset: SLOTS,
+                first_command: 0,
+                command_count: 4,
+                slot_bytes: STRIDE as u32,
+                kind: RGFX_ICB_SLOTS_COMPUTE,
+                bindings_a: 1,
+                bindings_b: 0,
+            }
+            .as_bytes(),
+        );
+        guest.send(&device, message);
+    } else {
+        guest.send(&device, write);
+    }
 
     // A command buffer that executes commands 0 to 3, posted after the write.
     let op = |tag: u16, body: &[u8]| {
@@ -5335,6 +5410,11 @@ fn an_icb_is_made_written_and_executed_through_the_rings() {
         at("concurrentDispatchThreadgroups:threadsPerThreadgroup:")
             < at("executeCommandsInBuffer:withRange:")
     );
+    if slots {
+        // SAFETY: as `Guest`'s helpers.
+        let mask = unsafe { guest.load_u64((SLOTS + STRIDE) as usize) };
+        assert_eq!(mask, 0, "the host took the slot");
+    }
 }
 
 /// A headless device whose guest took indirect command buffers, ready.

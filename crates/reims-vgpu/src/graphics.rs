@@ -35,11 +35,11 @@ use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
-    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_ORDER,
     RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
     RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
@@ -220,12 +220,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // kext asks unshared (WindowServer's) on the platform's unshared queue, and tells a
             // guest producer waiting for room on a submission ring that the device took from it
             // (the device carries SUBMIT_ROOM out). Both platforms make indirect command buffers,
-            // so every host decodes their messages.
+            // so every host decodes their messages, slots included.
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | u64::from(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS)
                 | u64::from(RGFX_FEATURE_UNSHARED_QUEUES)
                 | u64::from(RGFX_FEATURE_SUBMIT_ROOM)
+                | u64::from(RGFX_FEATURE_ICB_SLOTS)
                 | if unified_memory {
                     0
                 } else {
@@ -282,6 +283,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 presented,
                 pool,
                 pending: Pending::default(),
+                region: Arc::clone(&region),
                 icb_worker: Worker::new("reims-vgpu.icb-create"),
                 icbs: Arc::default(),
                 reset_gate: Arc::default(),
@@ -399,6 +401,8 @@ struct GraphicsControl<P: ApiPlatform> {
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
+    /// The device's region, where an `ICB_SLOTS` names the slots whose pipelines it waits for.
+    region: Arc<Region>,
     /// The thread ring 0's `ICB_CREATE`s are made on, in ring order, off the control thread: the
     /// platform's make of a large buffer can take seconds (measured: about 24 s near 11.7 million
     /// commands on the Vulkan runtime on an RTX 5080), which would hold every process's control
@@ -765,6 +769,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 }
             }
             RGFX_CMD_ICB_WRITE => self.pending.wait_for_icb_write(message),
+            RGFX_CMD_ICB_SLOTS => self.pending.wait_for_icb_slots(&self.region, message),
             // The destroy of an indirect command buffer still being made (the kext destroys
             // behind a create it stopped waiting for, after a minute, or one made for a context
             // that had closed) waits for its create, so it and everything after it keep their
@@ -802,9 +807,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                         .surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
                 }
                 let foreign = foreign_queue(poster, message);
-                // An ICB_WRITE's records run on the control ring, ahead of the process's later
-                // command buffers: how long they take is logged (diagnostics).
-                let icb_start = (r#type == RGFX_CMD_ICB_WRITE).then(|| self.pool.now());
+                // An ICB_WRITE's records and an ICB_SLOTS's slots run on the control ring, ahead
+                // of the process's later command buffers: how long they take is logged
+                // (diagnostics).
+                let icb_start = (r#type == RGFX_CMD_ICB_WRITE || r#type == RGFX_CMD_ICB_SLOTS)
+                    .then(|| self.pool.now());
                 let outcome = if foreign {
                     Ok(Err(DecodeError::BadReference))
                 } else {
@@ -813,7 +820,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 if let Some(start) = icb_start {
                     log::debug!(
                         target: "reims_vgpu::graphics::icb",
-                        "ICB_WRITE of {} bytes applied in {} us",
+                        "{} of {} bytes applied in {} us",
+                        if r#type == RGFX_CMD_ICB_SLOTS { "ICB_SLOTS" } else { "ICB_WRITE" },
                         message.len(),
                         self.pool.now().saturating_duration_since(start).as_micros()
                     );

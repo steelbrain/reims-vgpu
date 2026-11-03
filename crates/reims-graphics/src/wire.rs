@@ -57,8 +57,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 /// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
-/// [`RGFX_FEATURE_MANAGED_AT_OFFSET`] and [`RGFX_FEATURE_SUBMIT_ROOM`]). Bits 9, 10 and 15 are
-/// reserved.
+/// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_SUBMIT_ROOM`] and [`RGFX_FEATURE_ICB_SLOTS`]).
+/// Bits 9, 10 and 15 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -140,6 +140,13 @@ pub const RGFX_FEATURE_MANAGED_AT_OFFSET: u32 = 1 << 14;
 /// sees the take's room, or the host's read sees the flag. Every host offers it, the device
 /// carrying it out.
 pub const RGFX_FEATURE_SUBMIT_ROOM: u32 = 1 << 16;
+/// `FEATURES_LO` bit 17, `ICB_SLOTS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`], and which means nothing without
+/// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: ring 0 carries [`RGFX_CMD_ICB_SLOTS`], the CPU's
+/// encodes into indirect command buffers as slots in the process's region ([`crate::icb`],
+/// "Slots"), which the host reads where the message names them. The guest still sends `ICB_WRITE`
+/// for a buffer it keeps no slots for.
+pub const RGFX_FEATURE_ICB_SLOTS: u32 = 1 << 17;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -493,6 +500,16 @@ pub const RGFX_CMD_ICB_WRITE: u32 = 0x229;
 /// ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]), whose bytes are the guest's copy. A host without the
 /// feature refuses the message as one it does not know.
 pub const RGFX_CMD_BUFFER_MANAGED_AT_OFFSET: u32 = 0x22b;
+/// Command `ICB_SLOTS` ([`RgfxIcbSlots`], then its runs, [`RgfxIcbSlotRun`]), where the guest took
+/// [`RGFX_FEATURE_ICB_SLOTS`]: for each run, the slots of `command_count` commands of indirect
+/// command buffer `icb_obj_id` from `first_command`, `slot_bytes` apart from `region_offset`,
+/// which must lie in one block the sender holds, as they stand as the host reads them
+/// ([`crate::icb`], "Slots"). Each command's bits are carried out on the platform's buffer as its
+/// records would be; a run the host cannot read (an object the sender does not hold, a span
+/// outside its blocks, a shape it does not know) is skipped alone, as is a command the platform
+/// refuses. Ring 0 is carried out before any command buffer the process posts after it, as
+/// `ICB_WRITE` is. Not answered.
+pub const RGFX_CMD_ICB_SLOTS: u32 = 0x22c;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1723,6 +1740,55 @@ pub struct RgfxIcbWrite {
     pub header: RgfxMsgHeader,
     /// The indirect command buffer.
     pub obj_id: u64,
+}
+
+/// `ICB_SLOTS`: `run_count` [`RgfxIcbSlotRun`]s follow, to the message's `size`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbSlots {
+    /// [`RGFX_CMD_ICB_SLOTS`].
+    pub header: RgfxMsgHeader,
+    /// The first run's indirect command buffer, which places the message in its context.
+    pub obj_id: u64,
+    /// How many runs follow.
+    pub run_count: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_1c: u32,
+}
+
+/// [`RgfxIcbSlotRun`] `kind`: render slots ([`crate::icb::RgfxIcbRenderSlot`]).
+pub const RGFX_ICB_SLOTS_RENDER: u16 = 1;
+/// [`RgfxIcbSlotRun`] `kind`: compute slots ([`crate::icb::RgfxIcbComputeSlot`]).
+pub const RGFX_ICB_SLOTS_COMPUTE: u16 = 2;
+
+/// One run of an `ICB_SLOTS`: the slots of commands `first_command` to `first_command +
+/// command_count` of `icb_obj_id`, the first at `region_offset`, `slot_bytes` apart, each of
+/// `kind` with `bindings_a` bindings of the first kind (vertex or kernel buffers) and `bindings_b`
+/// of the second (fragment buffers or threadgroup memory lengths).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbSlotRun {
+    /// The indirect command buffer.
+    pub icb_obj_id: u64,
+    /// The first slot's place in the region: 8-aligned.
+    pub region_offset: u64,
+    /// The first slot's command.
+    pub first_command: u32,
+    /// How many commands' slots.
+    pub command_count: u32,
+    /// The bytes from one slot to the next: a multiple of 8, at least the slot's
+    /// ([`crate::icb::slot_bytes`]).
+    pub slot_bytes: u32,
+    /// [`RGFX_ICB_SLOTS_RENDER`] or [`RGFX_ICB_SLOTS_COMPUTE`].
+    pub kind: u16,
+    /// The slot's bindings of the first kind, at most 32.
+    pub bindings_a: u8,
+    /// The slot's bindings of the second kind, at most 32.
+    pub bindings_b: u8,
 }
 
 /// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
@@ -3129,6 +3195,8 @@ const _: () = {
     assert!(size_of::<RgfxIcbCreate>() == 88);
     assert!(size_of::<RgfxIcbState>() == 32);
     assert!(size_of::<RgfxIcbWrite>() == 24);
+    assert!(size_of::<RgfxIcbSlots>() == 32);
+    assert!(size_of::<RgfxIcbSlotRun>() == 32);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
     assert!(size_of::<RgfxDeviceInfo>() == 1432 + 64 * RGFX_DEVICE_INFO_FORMATS);

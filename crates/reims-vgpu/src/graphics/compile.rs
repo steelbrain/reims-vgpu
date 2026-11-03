@@ -35,7 +35,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reims_graphics::icb::{
-    RGFX_ICB_OP_COMPUTE_PIPELINE, RGFX_ICB_OP_RENDER_PIPELINE, RgfxIcbObject, RgfxIcbRecord,
+    RGFX_ICB_OP_COMPUTE_PIPELINE, RGFX_ICB_OP_RENDER_PIPELINE, RGFX_ICB_SLOT_PIPELINE,
+    RgfxIcbObject, RgfxIcbRecord, slot_bytes,
 };
 use reims_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
@@ -46,7 +47,8 @@ use reims_graphics::ops::render::{
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_BODY_OFFSET, RgfxCommandBuffer, RgfxOpHeader,
 };
-use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbWrite};
+use reims_graphics::region::Region;
+use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbWrite};
 use reims_vgpu_core::platform::os::clock::MonoTime;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 use zerocopy::FromBytes;
@@ -527,6 +529,75 @@ impl Pending {
             self.done.wait(&mut ids);
         }
     }
+
+    /// Waits until no pipeline the slots of the `ICB_SLOTS` `message` set in `region` is pending.
+    /// The slots are read outside the lock: a run of 16384 commands is 2.4 MiB of them.
+    pub(crate) fn wait_for_icb_slots(&self, region: &Region, message: &[u8]) {
+        if self.ids.lock().is_empty() {
+            return;
+        }
+        let named = icb_slots_pipelines(region, message);
+        let mut ids = self.ids.lock();
+        while named.iter().any(|id| ids.contains_key(id)) {
+            self.done.wait(&mut ids);
+        }
+    }
+}
+
+/// The pipelines the slots an `ICB_SLOTS` message names set in `region` (their pipeline bit set),
+/// nil left out, read as they stand: whom the message waits for. A pipeline the guest sets in a
+/// slot after this read, racing its own post, and that is still being compiled as the decoder
+/// takes the slot, is refused alone there. A run that does not lie in the region, or of a shape
+/// the decoder does not take, names none.
+pub(crate) fn icb_slots_pipelines(region: &Region, message: &[u8]) -> Vec<u64> {
+    let mut named = Vec::new();
+    let Ok((slots, mut rest)) = RgfxIcbSlots::read_from_prefix(message) else {
+        return named;
+    };
+    for _ in 0..slots.run_count {
+        let Ok((run, after)) = RgfxIcbSlotRun::read_from_prefix(rest) else {
+            break;
+        };
+        rest = after;
+        let stride = u64::from(run.slot_bytes);
+        let Some(least) = slot_bytes(
+            run.kind,
+            u32::from(run.bindings_a),
+            u32::from(run.bindings_b),
+        ) else {
+            continue;
+        };
+        let count = u64::from(run.command_count);
+        if stride < least
+            || !stride.is_multiple_of(8)
+            || !run.region_offset.is_multiple_of(8)
+            || stride
+                .checked_mul(count)
+                .is_none_or(|len| !region.contains(run.region_offset, len))
+        {
+            continue;
+        }
+        // Read a chunk of slots at a time, so the copy stays small.
+        const CHUNK: u64 = 256;
+        let mut start = 0;
+        while start < count {
+            let n = CHUNK.min(count - start);
+            let at = run.region_offset + start * stride;
+            let Some(bytes) = region.read(at, (n * stride) as usize) else {
+                break;
+            };
+            for slot in bytes.chunks_exact(stride as usize) {
+                // The mask and the pipeline, the slot's first and third words.
+                let word = |k: usize| u64::read_from_prefix(&slot[k * 8..]).map_or(0, |(w, _)| w);
+                let (mask, pipeline) = (word(0), word(2));
+                if mask & RGFX_ICB_SLOT_PIPELINE != 0 && pipeline != 0 {
+                    named.push(pipeline);
+                }
+            }
+            start += n;
+        }
+    }
+    named
 }
 
 /// The pipelines an `ICB_WRITE` message's records set, nil left out. The walk stops at a record

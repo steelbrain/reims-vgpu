@@ -234,6 +234,65 @@ impl Region {
         Some(out)
     }
 
+    /// A copy of the `count` records of `stride` bytes from `offset`, each with its first `taken`
+    /// `u64` words swapped for 0 as it is copied, the swaps before the rest of the record is
+    /// read: the bits the guest set there since the last take, with the bytes it wrote before
+    /// setting them ([`crate::icb`], "Slots"). `None`, taking nothing, where the records do not
+    /// lie inside the region, `offset` and `stride` are not 8-aligned, or `stride` holds fewer
+    /// than `taken` words.
+    pub fn take_records(
+        &self,
+        offset: u64,
+        stride: u64,
+        count: u64,
+        taken: usize,
+    ) -> Option<Vec<u8>> {
+        let len = stride.checked_mul(count)?;
+        let words = taken as u64 * 8;
+        if !offset.is_multiple_of(8)
+            || !stride.is_multiple_of(8)
+            || stride < words
+            || !self.contains(offset, len)
+        {
+            return None;
+        }
+        let mut out = vec![0u8; usize::try_from(len).ok()?];
+        for (i, record) in out.chunks_exact_mut(stride as usize).enumerate() {
+            let at = offset + i as u64 * stride;
+            for w in 0..taken {
+                let word = self.atomic_u64(at + w as u64 * 8).swap(0, Ordering::AcqRel);
+                record[w * 8..w * 8 + 8].copy_from_slice(&word.to_le_bytes());
+            }
+            // SAFETY: the record's bytes lie inside the mapping (checked above), which lives as
+            // long as `self`; the guest's concurrent writes change only what is copied.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.base.add((at + words) as usize),
+                    record[taken * 8..].as_mut_ptr(),
+                    record.len() - taken * 8,
+                );
+            }
+        }
+        Some(out)
+    }
+
+    /// [`take_records`](Self::take_records), where the records lie in one block context
+    /// `context` holds, which cannot be revoked while they are taken.
+    pub fn take_records_held(
+        &self,
+        context: u32,
+        offset: u64,
+        stride: u64,
+        count: u64,
+        taken: usize,
+    ) -> Option<Vec<u8>> {
+        let blocks = self.blocks.lock();
+        if !Self::in_held(&blocks, context, offset, stride.checked_mul(count)?) {
+            return None;
+        }
+        self.take_records(offset, stride, count, taken)
+    }
+
     /// Writes `bytes` at `offset`. False, writing nothing, where they do not lie inside the
     /// region.
     pub fn write(&self, offset: u64, bytes: &[u8]) -> bool {

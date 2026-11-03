@@ -20,10 +20,10 @@ use reims_graphics::wire::{
     RGFX_ICB_INHERIT_DEPTH_STENCIL_STATE, RGFX_ICB_INHERIT_DEPTH_TEST_BOUNDS,
     RGFX_ICB_INHERIT_FRONT_FACING_WINDING, RGFX_ICB_INHERIT_PIPELINE_STATE,
     RGFX_ICB_INHERIT_SCISSOR_RECTS, RGFX_ICB_INHERIT_STENCIL_REFERENCE_VALUES,
-    RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE, RGFX_ICB_INHERIT_VIEWPORTS,
+    RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE, RGFX_ICB_INHERIT_VIEWPORTS, RGFX_ICB_SLOTS_RENDER,
     RGFX_ICB_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE, RGFX_ICB_SUPPORT_RAY_TRACING,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxIcbCreate, RgfxIcbState,
-    RgfxIcbWrite, RgfxMsgHeader,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxIcbCreate,
+    RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbState, RgfxIcbWrite, RgfxMsgHeader,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -34,7 +34,7 @@ use reims_vgpu_core::platform::icb::{
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::platform::values::IcbDesc;
 use reims_vgpu_core::raise::RaiseResult;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use super::{DecodeError, Entry, GraphicsDecoder, ObjHandle, op_fault, read, refusing};
 
@@ -231,6 +231,142 @@ impl<P: Platform> GraphicsDecoder<P> {
             );
         }
         Ok(framing)
+    }
+
+    /// An `ICB_SLOTS`: each run's slots taken from the region and carried out on its buffer, each
+    /// field as its record would be. A run that names no indirect command buffer of the sender's,
+    /// a span not wholly in one block the sender holds, commands past the buffer's size or a slot
+    /// shape the host does not know is skipped alone, taking nothing; a field the platform
+    /// refuses is skipped alone. One warning names how many were skipped. Malformed where the
+    /// runs do not fit the message, after the runs before.
+    pub(super) fn icb_slots(&self, message: &[u8]) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(m) = read::<RgfxIcbSlots>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let end = (m.header.size as usize).min(message.len());
+        let mut tally = Tally::default();
+        let mut framing = Ok(());
+        let mut at = size_of::<RgfxIcbSlots>();
+        for _ in 0..m.run_count {
+            let Some(run) = message.get(at..end).and_then(read::<RgfxIcbSlotRun>) else {
+                framing = Err(DecodeError::Malformed);
+                break;
+            };
+            at += size_of::<RgfxIcbSlotRun>();
+            let done = self.slot_run(&run, &mut tally);
+            tally.count(run.icb_obj_id, run.first_command.into(), Ok(done));
+        }
+        if let Some((icb, index, why)) = &tally.first {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "ICB_SLOTS of {} runs (the first on buffer {:#x}): {} of {} runs and fields not \
+                 carried out; the first, buffer {icb:#x} at command {index}: {why}",
+                m.run_count,
+                m.obj_id,
+                tally.skipped,
+                tally.tried
+            );
+        }
+        Ok(framing)
+    }
+
+    /// One run of an `ICB_SLOTS`, refused whole, taking nothing, where its span cannot be read.
+    /// Its slots are taken a chunk at a time, so the copy stays small; consecutive commands
+    /// whose slots hold a range reset alone are reset in one call.
+    fn slot_run(&self, run: &RgfxIcbSlotRun, tally: &mut Tally) -> Result<(), DecodeError> {
+        const CHUNK: u64 = 256;
+        let Some(ObjHandle::Icb(icb)) = self.named(run.icb_obj_id) else {
+            return Err(DecodeError::BadReference);
+        };
+        let kind = run.kind;
+        let (a, b) = (u32::from(run.bindings_a), u32::from(run.bindings_b));
+        let stride = u64::from(run.slot_bytes);
+        let (first, count) = (u64::from(run.first_command), u64::from(run.command_count));
+        let shaped =
+            slot_bytes(kind, a, b).is_some_and(|least| stride >= least && stride.is_multiple_of(8));
+        if !shaped {
+            return Err(DecodeError::Malformed);
+        }
+        let span = stride.checked_mul(count);
+        if first.checked_add(count).is_none_or(|e| e > icb.size())
+            || span.is_none_or(|len| !self.in_own_block(run.region_offset, len))
+        {
+            return Err(DecodeError::BadReference);
+        }
+        let obj = run.icb_obj_id;
+        let mut resets: Option<(u64, u64)> = None;
+        let mut start = 0;
+        while start < count {
+            let n = CHUNK.min(count - start);
+            // A block released since the check, by a guest racing its own post, refuses the
+            // rest of the run.
+            let Some(bytes) = self.take_own(run.region_offset + start * stride, stride, n, 2)
+            else {
+                reset_run(icb, obj, resets.take(), tally);
+                return Err(DecodeError::BadReference);
+            };
+            for (index, slot) in (first + start..).zip(bytes.chunks_exact(stride as usize)) {
+                let (mask, mask_b) = (word(slot, 0), word(slot, 1));
+                if mask == 0 && mask_b == 0 {
+                    continue;
+                }
+                if mask == RGFX_ICB_SLOT_RESET_RANGE && mask_b == 0 {
+                    resets = match resets {
+                        Some((at, len)) if at + len == index => Some((at, len + 1)),
+                        before => {
+                            reset_run(icb, obj, before, tally);
+                            Some((index, 1))
+                        }
+                    };
+                    continue;
+                }
+                reset_run(icb, obj, resets.take(), tally);
+                self.slot(icb, obj, kind, index, slot, (a, b), (mask, mask_b), tally);
+            }
+            start += n;
+        }
+        reset_run(icb, obj, resets, tally);
+        Ok(())
+    }
+
+    /// One command's slot, its bits `masks` taken: the range reset, then each field's record
+    /// carried out on its command ([`slot_fields`]), each refused alone.
+    #[allow(clippy::too_many_arguments)] // the slot and what its run says of it
+    fn slot(
+        &self,
+        icb: &P::Icb,
+        obj: u64,
+        kind: u16,
+        index: u64,
+        slot: &[u8],
+        bindings: (u32, u32),
+        (mask, mask_b): (u64, u64),
+        tally: &mut Tally,
+    ) {
+        if mask & RGFX_ICB_SLOT_RESET_RANGE != 0 {
+            reset_run(icb, obj, Some((index, 1)), tally);
+        }
+        let mask = mask & !RGFX_ICB_SLOT_RESET_RANGE;
+        if mask == 0 && mask_b == 0 {
+            return;
+        }
+        if kind == RGFX_ICB_SLOTS_RENDER {
+            match refusing(|| icb.render_command(index)) {
+                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |op, body| {
+                    tally.count(obj, index, refusing(|| self.render_record(&c, op, body)));
+                }),
+                Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
+                Err(raise) => tally.count(obj, index, Err(raise)),
+            }
+        } else {
+            match refusing(|| icb.compute_command(index)) {
+                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |op, body| {
+                    tally.count(obj, index, refusing(|| self.compute_record(&c, op, body)));
+                }),
+                Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
+                Err(raise) => tally.count(obj, index, Err(raise)),
+            }
+        }
     }
 
     /// One record of an `ICB_WRITE` on `icb` of `size` commands, its command taken from
@@ -482,6 +618,189 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 }
 
+/// What an `ICB_SLOTS` tried and skipped, runs and fields, and the first skipped, for its one
+/// warning.
+#[derive(Default)]
+struct Tally {
+    tried: u64,
+    skipped: u64,
+    first: Option<(u64, u64, String)>,
+}
+
+impl Tally {
+    /// One run or field of buffer `icb` at command `index`, carried out or skipped as `done` says.
+    fn count(&mut self, icb: u64, index: u64, done: RaiseResult<Result<(), DecodeError>>) {
+        self.tried += 1;
+        let why = match done {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => format!("{e:?}"),
+            Err(raise) => raise.to_string(),
+        };
+        self.skipped += 1;
+        self.first.get_or_insert((icb, index, why));
+    }
+}
+
+/// The range reset `run` (its first command and its length), where there is one, in one call.
+fn reset_run<I: IndirectCommandBuffer<P>, P: Platform>(
+    icb: &I,
+    obj: u64,
+    run: Option<(u64, u64)>,
+    tally: &mut Tally,
+) {
+    if let Some((at, len)) = run {
+        tally.count(obj, at, refusing(|| icb.reset_with_range(at, len).map(Ok)));
+    }
+}
+
+/// The `k`th `u64` of a slot (its masks are words 0 and 1).
+fn word(slot: &[u8], k: usize) -> u64 {
+    u64::read_from_prefix(slot.get(k * 8..).unwrap_or_default()).map_or(0, |(w, _)| w)
+}
+
+/// Each field a slot's bits `masks` name, as its record's op and body, to `record`, in a fixed
+/// order: the command's reset, its pipeline, its bindings of the first kind by index, of the
+/// second, the stage-in region and the imageblock (compute), the draw or the dispatch, and the
+/// barrier. A bit the slot's kind does not hold, or an action whose op is not one of the kind's
+/// draws or dispatches, is op 0, which no record is: the record refuses it.
+fn slot_fields(
+    kind: u16,
+    slot: &[u8],
+    (a, b): (u32, u32),
+    (mask, mask_b): (u64, u64),
+    mut record: impl FnMut(u16, &[u8]),
+) {
+    let render = kind == RGFX_ICB_SLOTS_RENDER;
+    let fixed = if render {
+        size_of::<RgfxIcbRenderSlot>()
+    } else {
+        size_of::<RgfxIcbComputeSlot>()
+    };
+    let bits = |n: u32| (1u64 << n) - 1;
+    let mut known = RGFX_ICB_SLOT_RESET
+        | RGFX_ICB_SLOT_PIPELINE
+        | RGFX_ICB_SLOT_ACTION
+        | RGFX_ICB_SLOT_BARRIER
+        | bits(a) * RGFX_ICB_SLOT_BUFFER_0;
+    if !render {
+        known |= RGFX_ICB_SLOT_STAGE_IN | RGFX_ICB_SLOT_IMAGEBLOCK;
+    }
+    if mask & !known != 0 || mask_b & !bits(b) != 0 {
+        record(0, &[]);
+    }
+    let binding = |i: u32| {
+        let at = fixed + i as usize * size_of::<RgfxIcbSlotBuffer>();
+        RgfxIcbSlotBuffer::read_from_prefix(slot.get(at..).unwrap_or_default())
+            .map_or_else(|_| Default::default(), |(s, _)| s)
+    };
+    let buffer_ops =
+        |strided: u32, i: u32, plain: u16, with_stride: u16, record: &mut dyn FnMut(u16, &[u8])| {
+            let s = binding(i);
+            if strided & (1 << i) != 0 {
+                let body = RgfxIcbBufferStride {
+                    obj_id: s.obj_id,
+                    offset: s.offset,
+                    stride: s.stride,
+                    index: i,
+                    reserved_1c: 0,
+                };
+                record(with_stride, body.as_bytes());
+            } else {
+                let body = RgfxIcbBuffer {
+                    obj_id: s.obj_id,
+                    offset: s.offset,
+                    index: i,
+                    reserved_14: 0,
+                };
+                record(plain, body.as_bytes());
+            }
+        };
+    let set = |i: u32| mask & (RGFX_ICB_SLOT_BUFFER_0 << i) != 0;
+    if render {
+        let Ok((s, _)) = RgfxIcbRenderSlot::read_from_prefix(slot) else {
+            return;
+        };
+        if mask & RGFX_ICB_SLOT_RESET != 0 {
+            record(RGFX_ICB_OP_RENDER_RESET, &[]);
+        }
+        if mask & RGFX_ICB_SLOT_PIPELINE != 0 {
+            record(RGFX_ICB_OP_RENDER_PIPELINE, s.pipeline.as_bytes());
+        }
+        for i in (0..a).filter(|&i| set(i)) {
+            let (plain, strided) = (RGFX_ICB_OP_VERTEX_BUFFER, RGFX_ICB_OP_VERTEX_BUFFER_STRIDE);
+            buffer_ops(s.strided, i, plain, strided, &mut record);
+        }
+        for j in (0..b).filter(|&j| mask_b & (1 << j) != 0) {
+            let f = binding(a + j);
+            let body = RgfxIcbBuffer {
+                obj_id: f.obj_id,
+                offset: f.offset,
+                index: j,
+                reserved_14: 0,
+            };
+            record(RGFX_ICB_OP_FRAGMENT_BUFFER, body.as_bytes());
+        }
+        if mask & RGFX_ICB_SLOT_ACTION != 0 {
+            let draws = RGFX_ICB_OP_DRAW..=RGFX_ICB_OP_DRAW_INDEXED_PATCHES;
+            let op = if draws.contains(&s.op) { s.op } else { 0 };
+            record(op, s.action.as_bytes());
+        }
+        if mask & RGFX_ICB_SLOT_BARRIER != 0 {
+            record(
+                if s.barrier != 0 {
+                    RGFX_ICB_OP_RENDER_SET_BARRIER
+                } else {
+                    RGFX_ICB_OP_RENDER_CLEAR_BARRIER
+                },
+                &[],
+            );
+        }
+    } else {
+        let Ok((s, _)) = RgfxIcbComputeSlot::read_from_prefix(slot) else {
+            return;
+        };
+        if mask & RGFX_ICB_SLOT_RESET != 0 {
+            record(RGFX_ICB_OP_COMPUTE_RESET, &[]);
+        }
+        if mask & RGFX_ICB_SLOT_PIPELINE != 0 {
+            record(RGFX_ICB_OP_COMPUTE_PIPELINE, s.pipeline.as_bytes());
+        }
+        for i in (0..a).filter(|&i| set(i)) {
+            let (plain, strided) = (RGFX_ICB_OP_KERNEL_BUFFER, RGFX_ICB_OP_KERNEL_BUFFER_STRIDE);
+            buffer_ops(s.strided, i, plain, strided, &mut record);
+        }
+        let lengths = fixed + a as usize * size_of::<RgfxIcbSlotBuffer>();
+        for j in (0..b).filter(|&j| mask_b & (1 << j) != 0) {
+            let at = lengths + j as usize * 4;
+            let length =
+                u32::read_from_prefix(slot.get(at..).unwrap_or_default()).map_or(0, |(l, _)| l);
+            let body = RgfxIcbThreadgroupMemory { length, index: j };
+            record(RGFX_ICB_OP_THREADGROUP_MEMORY, body.as_bytes());
+        }
+        if mask & RGFX_ICB_SLOT_STAGE_IN != 0 {
+            record(RGFX_ICB_OP_STAGE_IN_REGION, s.stage_in.as_bytes());
+        }
+        if mask & RGFX_ICB_SLOT_IMAGEBLOCK != 0 {
+            record(RGFX_ICB_OP_IMAGEBLOCK, s.imageblock.as_bytes());
+        }
+        if mask & RGFX_ICB_SLOT_ACTION != 0 {
+            let dispatches = RGFX_ICB_OP_DISPATCH_THREADGROUPS..=RGFX_ICB_OP_DISPATCH_THREADS;
+            let op = if dispatches.contains(&s.op) { s.op } else { 0 };
+            record(op, s.dispatch.as_bytes());
+        }
+        if mask & RGFX_ICB_SLOT_BARRIER != 0 {
+            record(
+                if s.barrier != 0 {
+                    RGFX_ICB_OP_COMPUTE_SET_BARRIER
+                } else {
+                    RGFX_ICB_OP_COMPUTE_CLEAR_BARRIER
+                },
+                &[],
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -493,7 +812,15 @@ mod tests {
     use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::{Immutable, IntoBytes};
 
-    use super::super::tests::{compute_create, pipeline_decoder, whole_render_create};
+    use reims_graphics::region::Region;
+    use reims_graphics::wire::{
+        RGFX_CMD_ICB_SLOTS, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
+        RGFX_CURSOR_SPAN, RGFX_ICB_SLOTS_COMPUTE,
+    };
+
+    use super::super::tests::{
+        compute_create, pipeline_decoder, pipeline_decoder_over, whole_render_create,
+    };
     use super::*;
 
     type Dec = GraphicsDecoder<FakePlatform>;
@@ -570,7 +897,12 @@ mod tests {
     /// A decoder holding a render pipeline, a compute pipeline, buffers 2 and 3, and a render
     /// and a compute indirect command buffer of 8 commands each.
     fn setup() -> (Arc<FakePlatform>, Dec) {
-        let (p, mut dec, _) = pipeline_decoder();
+        setup_over(Arc::new(Region::new(0x10000).unwrap()))
+    }
+
+    /// [`setup`] over `region`.
+    fn setup_over(region: Arc<Region>) -> (Arc<FakePlatform>, Dec) {
+        let (p, mut dec, _) = pipeline_decoder_over(region);
         let device = p.device();
         assert_eq!(
             dec.decode(&device, &whole_render_create(RENDER_PIPELINE, true))
@@ -1091,10 +1423,7 @@ mod tests {
                 ("setBarrier", vec![]),
                 at(u64::from(COUNT - 1)),
                 ("setBarrier", vec![]),
-                (
-                    "resetWithRange:",
-                    vec![Arg::U64(0), Arg::U64(COUNT.into())]
-                ),
+                ("resetWithRange:", vec![Arg::U64(0), Arg::U64(COUNT.into())]),
             ]
         );
         let Some(ObjHandle::Icb(icb)) = dec.named(BIG) else {
@@ -1238,5 +1567,639 @@ mod tests {
             crate::graphics::compile::icb_write_pipelines(&write(RENDER_ICB, &broken)),
             vec![7]
         );
+    }
+
+    /// Where the slot tests' slots lie: the processes' first block.
+    const SLOTS: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    /// A slot of [`create`]'s render buffer: 2 vertex buffers, 1 fragment buffer.
+    const RENDER_STRIDE: u64 = 104 + 24 * 3;
+    /// A slot of [`create`]'s compute buffer: 3 kernel buffers, 31 threadgroup memory lengths.
+    const COMPUTE_STRIDE: u64 = 88 + 24 * 3 + 128;
+    /// Render and compute buffers like [`RENDER_ICB`] and [`COMPUTE_ICB`], which slots write.
+    const RENDER_ICB_2: u64 = 60;
+    const COMPUTE_ICB_2: u64 = 61;
+
+    /// [`setup`] over a region with room for slots, with a second render and compute buffer of
+    /// each shape; and the region.
+    fn slot_setup() -> (Arc<FakePlatform>, Dec, Arc<Region>) {
+        let size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(Region::new(size as usize).unwrap());
+        let (p, mut dec) = setup_over(Arc::clone(&region));
+        let device = p.device();
+        for (id, types) in [(RENDER_ICB_2, RENDER_TYPES), (COMPUTE_ICB_2, COMPUTE_TYPES)] {
+            let m = create(id, 1, types, 8);
+            assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        }
+        dec.end_message();
+        (p, dec, region)
+    }
+
+    /// A slot binding.
+    fn bound(obj_id: u64, offset: u64, stride: u64) -> RgfxIcbSlotBuffer {
+        RgfxIcbSlotBuffer {
+            obj_id,
+            offset,
+            stride,
+        }
+    }
+
+    /// A render slot: its fixed part, its 2 vertex buffers and its fragment buffer.
+    fn render_slot(fixed: &RgfxIcbRenderSlot, buffers: [RgfxIcbSlotBuffer; 3]) -> Vec<u8> {
+        let mut s = fixed.as_bytes().to_vec();
+        for b in &buffers {
+            s.extend_from_slice(b.as_bytes());
+        }
+        assert_eq!(s.len() as u64, RENDER_STRIDE);
+        s
+    }
+
+    /// A compute slot: its fixed part, its 3 kernel buffers and its threadgroup memory lengths
+    /// (`lengths`, by index).
+    fn compute_slot(
+        fixed: &RgfxIcbComputeSlot,
+        buffers: [RgfxIcbSlotBuffer; 3],
+        lengths: &[(usize, u32)],
+    ) -> Vec<u8> {
+        let mut s = fixed.as_bytes().to_vec();
+        for b in &buffers {
+            s.extend_from_slice(b.as_bytes());
+        }
+        let mut l = [0u32; 32];
+        for &(i, len) in lengths {
+            l[i] = len;
+        }
+        s.extend_from_slice(l.as_bytes());
+        assert_eq!(s.len() as u64, COMPUTE_STRIDE);
+        s
+    }
+
+    /// The draw's body as a render slot's action.
+    fn action<T: IntoBytes + Immutable>(body: &T) -> [u64; 9] {
+        let mut a = [0u64; 9];
+        a.as_mut_bytes()[..size_of::<T>()].copy_from_slice(body.as_bytes());
+        a
+    }
+
+    /// A run of `count` slots of `stride` bytes at `offset` for commands `first..` of `icb`.
+    fn run(icb: u64, kind: u16, offset: u64, first: u32, count: u32) -> RgfxIcbSlotRun {
+        let render = kind == RGFX_ICB_SLOTS_RENDER;
+        RgfxIcbSlotRun {
+            icb_obj_id: icb,
+            region_offset: offset,
+            first_command: first,
+            command_count: count,
+            slot_bytes: if render {
+                RENDER_STRIDE
+            } else {
+                COMPUTE_STRIDE
+            } as u32,
+            kind,
+            bindings_a: if render { 2 } else { 3 },
+            bindings_b: if render { 1 } else { 31 },
+        }
+    }
+
+    /// An `ICB_SLOTS` of `runs`.
+    fn slots(runs: &[RgfxIcbSlotRun]) -> Vec<u8> {
+        let len = size_of::<RgfxIcbSlots>() + size_of_val(runs);
+        let mut m = RgfxIcbSlots {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ICB_SLOTS,
+                size: len as u32,
+                seqno: 0,
+            },
+            obj_id: runs.first().map_or(0, |r| r.icb_obj_id),
+            run_count: runs.len() as u32,
+            reserved_1c: 0,
+        }
+        .as_bytes()
+        .to_vec();
+        for r in runs {
+            m.extend_from_slice(r.as_bytes());
+        }
+        m
+    }
+
+    /// The masks of the slot at `offset`.
+    fn masks(region: &Region, offset: u64) -> (u64, u64) {
+        let b = region.read(offset, 16).unwrap();
+        (word(&b, 0), word(&b, 1))
+    }
+
+    /// The draw of an `ICB_WRITE` and a render slot's action in the tests.
+    const DRAW_INDEXED: RgfxIcbDrawIndexed = RgfxIcbDrawIndexed {
+        primitive_type: 3,
+        index_count: 6,
+        index_type: 1,
+        instance_count: 1,
+        index_buffer_obj_id: 2,
+        index_buffer_offset: 64,
+        base_vertex: -4,
+        base_instance: 0,
+    };
+
+    /// A draw of `vertex_count` vertices.
+    fn draw(vertex_count: u32) -> RgfxIcbDraw {
+        RgfxIcbDraw {
+            primitive_type: 4,
+            vertex_start: 1,
+            vertex_count,
+            instance_count: 2,
+            base_instance: 7,
+            reserved_14: 0,
+        }
+    }
+
+    /// Slots drive the setters their records would, field by field, in a fixed order (the reset,
+    /// the pipeline, the bindings by index, the stage-in region and imageblock, the action, the
+    /// barrier): what records of the same fields in that order drive on a buffer of the same
+    /// shape. The take leaves the masks 0, so the same message again carries out nothing.
+    #[test]
+    fn slots_drive_the_setters_their_records_would() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        let patches = RgfxIcbDrawIndexedPatches {
+            patches: RgfxIcbDrawPatches {
+                number_of_patch_control_points: 4,
+                patch_start: 1,
+                patch_count: 2,
+                instance_count: 3,
+                base_instance: 4,
+                instance_stride: 12,
+                patch_index_buffer_obj_id: 2,
+                patch_index_buffer_offset: 8,
+                tessellation_factor_buffer_obj_id: 3,
+                tessellation_factor_buffer_offset: 48,
+            },
+            control_point_index_buffer_obj_id: 3,
+            control_point_index_buffer_offset: 16,
+        };
+        let buffer = |obj_id, offset, index| RgfxIcbBuffer {
+            obj_id,
+            offset,
+            index,
+            reserved_14: 0,
+        };
+        let render_records = vec![
+            record(
+                RGFX_ICB_OP_RENDER_PIPELINE,
+                0,
+                &RgfxIcbObject {
+                    obj_id: RENDER_PIPELINE,
+                },
+            ),
+            record(RGFX_ICB_OP_VERTEX_BUFFER, 0, &buffer(2, 16, 0)),
+            record(
+                RGFX_ICB_OP_VERTEX_BUFFER_STRIDE,
+                0,
+                &RgfxIcbBufferStride {
+                    obj_id: 0,
+                    offset: 8,
+                    stride: 24,
+                    index: 1,
+                    reserved_1c: 0,
+                },
+            ),
+            record(RGFX_ICB_OP_FRAGMENT_BUFFER, 0, &buffer(3, 32, 0)),
+            record(RGFX_ICB_OP_DRAW_INDEXED, 0, &DRAW_INDEXED),
+            bare(RGFX_ICB_OP_RENDER_SET_BARRIER, 0),
+            bare(RGFX_ICB_OP_RENDER_RESET, 1),
+            record(
+                RGFX_ICB_OP_RENDER_PIPELINE,
+                1,
+                &RgfxIcbObject {
+                    obj_id: RENDER_PIPELINE,
+                },
+            ),
+            record(RGFX_ICB_OP_DRAW_INDEXED_PATCHES, 2, &patches),
+            bare(RGFX_ICB_OP_RENDER_CLEAR_BARRIER, 2),
+        ];
+        let compute_records = vec![
+            record(
+                RGFX_ICB_OP_COMPUTE_PIPELINE,
+                0,
+                &RgfxIcbObject {
+                    obj_id: COMPUTE_PIPELINE,
+                },
+            ),
+            record(RGFX_ICB_OP_KERNEL_BUFFER, 0, &buffer(2, 8, 0)),
+            record(
+                RGFX_ICB_OP_KERNEL_BUFFER_STRIDE,
+                0,
+                &RgfxIcbBufferStride {
+                    obj_id: 3,
+                    offset: 16,
+                    stride: 12,
+                    index: 2,
+                    reserved_1c: 0,
+                },
+            ),
+            record(
+                RGFX_ICB_OP_THREADGROUP_MEMORY,
+                0,
+                &RgfxIcbThreadgroupMemory {
+                    length: 256,
+                    index: 1,
+                },
+            ),
+            record(
+                RGFX_ICB_OP_THREADGROUP_MEMORY,
+                0,
+                &RgfxIcbThreadgroupMemory {
+                    length: 64,
+                    index: 30,
+                },
+            ),
+            record(
+                RGFX_ICB_OP_STAGE_IN_REGION,
+                0,
+                &RgfxIcbRegion {
+                    origin: [1, 2, 3],
+                    size: [4, 5, 6],
+                },
+            ),
+            record(
+                RGFX_ICB_OP_IMAGEBLOCK,
+                0,
+                &RgfxIcbImageblock {
+                    width: 16,
+                    height: 8,
+                },
+            ),
+            record(
+                RGFX_ICB_OP_DISPATCH_THREADS,
+                0,
+                &RgfxIcbDispatch {
+                    grid: [64, 2, 1],
+                    threadgroup: [32, 1, 1],
+                },
+            ),
+            bare(RGFX_ICB_OP_COMPUTE_CLEAR_BARRIER, 0),
+            bare(RGFX_ICB_OP_COMPUTE_RESET, 3),
+        ];
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &write(RENDER_ICB, &render_records))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            dec.decode(&device, &write(COMPUTE_ICB, &compute_records))
+                .unwrap(),
+            Ok(())
+        );
+        let by_records = calls(&p, mark);
+
+        let r = SLOTS;
+        let c = SLOTS + 0x1_0000;
+        let b0 = RGFX_ICB_SLOT_BUFFER_0;
+        let fixed = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE
+                | RGFX_ICB_SLOT_ACTION
+                | RGFX_ICB_SLOT_BARRIER
+                | b0
+                | b0 << 1,
+            mask_b: 1,
+            pipeline: RENDER_PIPELINE,
+            op: RGFX_ICB_OP_DRAW_INDEXED,
+            barrier: 1,
+            strided: 0b10,
+            action: action(&DRAW_INDEXED),
+        };
+        let buffers = [bound(2, 16, 0), bound(0, 8, 24), bound(3, 32, 0)];
+        assert!(region.write(r, &render_slot(&fixed, buffers)));
+        let reset_then_pipeline = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_RESET | RGFX_ICB_SLOT_PIPELINE,
+            pipeline: RENDER_PIPELINE,
+            ..RgfxIcbRenderSlot::default()
+        };
+        let none = [RgfxIcbSlotBuffer::default(); 3];
+        assert!(region.write(r + RENDER_STRIDE, &render_slot(&reset_then_pipeline, none)));
+        let patched = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BARRIER,
+            op: RGFX_ICB_OP_DRAW_INDEXED_PATCHES,
+            action: action(&patches),
+            ..RgfxIcbRenderSlot::default()
+        };
+        assert!(region.write(r + 2 * RENDER_STRIDE, &render_slot(&patched, none)));
+        let dispatch = RgfxIcbComputeSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE
+                | RGFX_ICB_SLOT_ACTION
+                | RGFX_ICB_SLOT_BARRIER
+                | RGFX_ICB_SLOT_STAGE_IN
+                | RGFX_ICB_SLOT_IMAGEBLOCK
+                | b0
+                | b0 << 2,
+            mask_b: 1 << 1 | 1 << 30,
+            pipeline: COMPUTE_PIPELINE,
+            op: RGFX_ICB_OP_DISPATCH_THREADS,
+            barrier: 0,
+            strided: 0b100,
+            dispatch: RgfxIcbDispatch {
+                grid: [64, 2, 1],
+                threadgroup: [32, 1, 1],
+            },
+            stage_in: RgfxIcbRegion {
+                origin: [1, 2, 3],
+                size: [4, 5, 6],
+            },
+            imageblock: RgfxIcbImageblock {
+                width: 16,
+                height: 8,
+            },
+        };
+        let kernels = [bound(2, 8, 0), bound(0, 0, 0), bound(3, 16, 12)];
+        let lengths = [(1, 256), (30, 64)];
+        assert!(region.write(c, &compute_slot(&dispatch, kernels, &lengths)));
+        let reset = RgfxIcbComputeSlot {
+            mask: RGFX_ICB_SLOT_RESET,
+            ..RgfxIcbComputeSlot::default()
+        };
+        assert!(region.write(
+            c + 3 * COMPUTE_STRIDE,
+            &compute_slot(&reset, [RgfxIcbSlotBuffer::default(); 3], &[])
+        ));
+        let message = slots(&[
+            run(RENDER_ICB_2, RGFX_ICB_SLOTS_RENDER, r, 0, 3),
+            run(COMPUTE_ICB_2, RGFX_ICB_SLOTS_COMPUTE, c, 0, 4),
+        ]);
+        assert_eq!(
+            crate::graphics::compile::icb_slots_pipelines(&region, &message),
+            vec![RENDER_PIPELINE, RENDER_PIPELINE, COMPUTE_PIPELINE]
+        );
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(calls(&p, mark), by_records);
+        for at in [
+            r,
+            r + RENDER_STRIDE,
+            r + 2 * RENDER_STRIDE,
+            c,
+            c + 3 * COMPUTE_STRIDE,
+        ] {
+            assert_eq!(masks(&region, at), (0, 0), "the slot at {at:#x} taken");
+        }
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(calls(&p, mark), vec![]);
+        assert_eq!(
+            crate::graphics::compile::icb_slots_pipelines(&region, &message),
+            Vec::<u64>::new()
+        );
+    }
+
+    /// A run is refused whole, taking nothing, where its span lies in another process's block,
+    /// runs past the sender's block or lies in no block, where it names a buffer of another
+    /// process's or none, commands past the buffer's size, or a slot shape the host does not
+    /// know; the runs around it are carried out, and a field the host cannot carry out is skipped
+    /// alone.
+    #[test]
+    fn a_slot_run_outside_the_senders_block_is_refused_taking_nothing() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        let other = SLOTS + 0x8_0000;
+        region.grant(0, SLOTS, 0x1_0000);
+        region.grant(1, other, 0x1_0000);
+        dec.set_context(Some(0));
+        let pipeline = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE,
+            pipeline: RENDER_PIPELINE,
+            ..RgfxIcbRenderSlot::default()
+        };
+        let none = [RgfxIcbSlotBuffer::default(); 3];
+        let last = SLOTS + 0x1_0000 - RENDER_STRIDE;
+        let elsewhere = SLOTS + 0x4_0000;
+        let good = SLOTS + 0x100;
+        for at in [other, last, elsewhere, good] {
+            assert!(region.write(at, &render_slot(&pipeline, none)));
+        }
+        // The good run's second command names a buffer no one holds, then draws.
+        let half_bad = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BUFFER_0,
+            op: RGFX_ICB_OP_DRAW,
+            action: action(&draw(4)),
+            ..RgfxIcbRenderSlot::default()
+        };
+        let stray = [
+            bound(99, 0, 0),
+            RgfxIcbSlotBuffer::default(),
+            RgfxIcbSlotBuffer::default(),
+        ];
+        assert!(region.write(good + RENDER_STRIDE, &render_slot(&half_bad, stray)));
+        let foreign = (1u64 << RGFX_CONTEXT_OBJ_ID_SHIFT) | RENDER_ICB;
+        let short = RgfxIcbSlotRun {
+            slot_bytes: 100,
+            ..run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, good, 0, 1)
+        };
+        let message = slots(&[
+            run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, other, 0, 1),
+            run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, last, 0, 2),
+            run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, elsewhere, 0, 1),
+            run(foreign, RGFX_ICB_SLOTS_RENDER, good, 0, 1),
+            run(999, RGFX_ICB_SLOTS_RENDER, good, 0, 1),
+            run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, good, 7, 2),
+            short,
+            run(RENDER_ICB, RGFX_ICB_SLOTS_COMPUTE + 1, good, 0, 1),
+            run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, good, 0, 2),
+        ]);
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let at = |i| ("indirectRenderCommandAtIndex:", vec![Arg::U64(i)]);
+        let pipeline_arg = Arg::Obj(Some(
+            dec.require_render_pipeline(RENDER_PIPELINE).unwrap().id(),
+        ));
+        assert_eq!(
+            calls(&p, mark),
+            vec![
+                at(0),
+                ("setRenderPipelineState:", vec![pipeline_arg]),
+                at(1),
+                (
+                    "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:",
+                    vec![
+                        Arg::U64(4),
+                        Arg::U64(1),
+                        Arg::U64(4),
+                        Arg::U64(2),
+                        Arg::U64(7)
+                    ]
+                ),
+            ]
+        );
+        for (at, what) in [
+            (other, "in another process's block"),
+            (last, "past the sender's block"),
+            (elsewhere, "in no block"),
+        ] {
+            assert_eq!(
+                masks(&region, at),
+                (RGFX_ICB_SLOT_PIPELINE, 0),
+                "the slot {what} left as it was"
+            );
+        }
+        assert_eq!(masks(&region, good), (0, 0));
+        // A message too short for its runs is malformed after the runs before.
+        assert!(region.write(good, &render_slot(&pipeline, none)));
+        let mut cut = slots(&[run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, good, 0, 1)]);
+        cut[24..28].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            dec.decode(&device, &cut).unwrap(),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(masks(&region, good), (0, 0), "the run before carried out");
+    }
+
+    /// A take carries a command's reset out before what was set after it, a range reset alone
+    /// or with fields; consecutive commands with a range reset alone are reset in one call.
+    #[test]
+    fn a_reset_then_a_set_in_one_take_is_carried_out_in_that_order() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        let none = [RgfxIcbSlotBuffer::default(); 3];
+        let slot = |mask| RgfxIcbRenderSlot {
+            mask,
+            pipeline: RENDER_PIPELINE,
+            ..RgfxIcbRenderSlot::default()
+        };
+        let range = RGFX_ICB_SLOT_RESET_RANGE;
+        let pipeline = RGFX_ICB_SLOT_PIPELINE;
+        let masks_of = [
+            RGFX_ICB_SLOT_RESET | pipeline,
+            range | pipeline,
+            range,
+            range,
+            pipeline,
+            range,
+            range,
+            range,
+        ];
+        for (i, mask) in (0u64..).zip(masks_of) {
+            assert!(region.write(SLOTS + i * RENDER_STRIDE, &render_slot(&slot(mask), none)));
+        }
+        let mark = p.call_log().mark();
+        let message = slots(&[run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, SLOTS, 0, 8)]);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let at = |i| ("indirectRenderCommandAtIndex:", vec![Arg::U64(i)]);
+        let reset = |i, n| ("resetWithRange:", vec![Arg::U64(i), Arg::U64(n)]);
+        let set = (
+            "setRenderPipelineState:",
+            vec![Arg::Obj(Some(
+                dec.require_render_pipeline(RENDER_PIPELINE).unwrap().id(),
+            ))],
+        );
+        assert_eq!(
+            calls(&p, mark),
+            vec![
+                at(0),
+                ("reset", vec![]),
+                set.clone(),
+                reset(1, 1),
+                at(1),
+                set.clone(),
+                reset(2, 2),
+                at(4),
+                set,
+                reset(5, 3),
+            ]
+        );
+        let Some(ObjHandle::Icb(icb)) = dec.named(RENDER_ICB) else {
+            panic!("no indirect command buffer");
+        };
+        for i in [0, 1] {
+            let c = icb.render_command(i).unwrap().unwrap();
+            assert_ne!(c.pipeline_state_unique_identifier(), 0, "command {i}");
+        }
+    }
+
+    /// Slots and records reach a buffer in the order their messages come: a guest that switches
+    /// to records posts its slots first, and the records' fields, set after, stand.
+    #[test]
+    fn slots_then_records_are_carried_out_in_their_order() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        let slot = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE | RGFX_ICB_SLOT_ACTION,
+            pipeline: RENDER_PIPELINE,
+            op: RGFX_ICB_OP_DRAW,
+            action: action(&draw(4)),
+            ..RgfxIcbRenderSlot::default()
+        };
+        assert!(region.write(
+            SLOTS,
+            &render_slot(&slot, [RgfxIcbSlotBuffer::default(); 3])
+        ));
+        let message = slots(&[run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, SLOTS, 0, 1)]);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let records = [record(RGFX_ICB_OP_DRAW, 0, &draw(9))];
+        assert_eq!(
+            dec.decode(&device, &write(RENDER_ICB, &records)).unwrap(),
+            Ok(())
+        );
+        let Some(ObjHandle::Icb(icb)) = dec.named(RENDER_ICB) else {
+            panic!("no indirect command buffer");
+        };
+        let c = icb.render_command(0).unwrap().unwrap();
+        assert_eq!(c.draw_args().unwrap().vertex_count, 9);
+        assert_ne!(c.pipeline_state_unique_identifier(), 0);
+    }
+
+    /// A take carries out only what the guest set since the last: a GPU-side encode between two
+    /// takes stays where the second take sets other fields, as on Metal, where the latest encode
+    /// of each field stands.
+    #[test]
+    fn a_gpu_encode_between_two_takes_stays() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        let slot = RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE | RGFX_ICB_SLOT_ACTION,
+            pipeline: RENDER_PIPELINE,
+            op: RGFX_ICB_OP_DRAW,
+            action: action(&draw(4)),
+            ..RgfxIcbRenderSlot::default()
+        };
+        let none = [RgfxIcbSlotBuffer::default(); 3];
+        assert!(region.write(SLOTS, &render_slot(&slot, none)));
+        let message = slots(&[run(RENDER_ICB, RGFX_ICB_SLOTS_RENDER, SLOTS, 0, 1)]);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        dec.end_message();
+        // The GPU's encode: a kernel writing the command through its gpuResourceID.
+        {
+            let Some(ObjHandle::Icb(icb)) = dec.named(RENDER_ICB) else {
+                panic!("no indirect command buffer");
+            };
+            let c = icb.render_command(0).unwrap().unwrap();
+            c.encode(IcbRenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 7,
+                instance_count: 1,
+                base_instance: 0,
+            })
+            .unwrap();
+        }
+        // The guest then sets vertex buffer 0 alone: the slot still holds the first draw's
+        // fields, but not their bits.
+        let mut bytes = region.read(SLOTS, RENDER_STRIDE as usize).unwrap();
+        bytes[0..8].copy_from_slice(&RGFX_ICB_SLOT_BUFFER_0.to_le_bytes());
+        bytes[104..128].copy_from_slice(bound(2, 0, 0).as_bytes());
+        assert!(region.write(SLOTS, &bytes));
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let b2 = buffer(&dec, 2);
+        assert_eq!(
+            calls(&p, mark),
+            vec![
+                ("indirectRenderCommandAtIndex:", vec![Arg::U64(0)]),
+                (
+                    "setVertexBuffer:offset:atIndex:",
+                    vec![b2, Arg::U64(0), Arg::U64(0)]
+                ),
+            ]
+        );
+        let Some(ObjHandle::Icb(icb)) = dec.named(RENDER_ICB) else {
+            panic!("no indirect command buffer");
+        };
+        let c = icb.render_command(0).unwrap().unwrap();
+        assert_eq!(c.draw_args().unwrap().vertex_count, 7);
     }
 }
