@@ -203,6 +203,92 @@ bool RgfxCaps::flag(RgfxFlag which) const
 	return m_info.flags[which] != 0;
 }
 
+// The Mac2 family's raw MTLGPUFamily value. Every x86 Mac's GPU and Apple silicon's Macs are of
+// it, and its feature table holds each feature below.
+constexpr int64_t kRgfxFamilyMac2 = 2002;
+
+bool RgfxCaps::spiFeature(RgfxSpiFeature which) const
+{
+	if (!m_valid)
+		return false;
+	switch (which) {
+	// What the wire carries: argument encoders and buffers; the draws with a base vertex and
+	// instance (RENDER_DRAW_*_BASE); binary archives; a sampler's border colour, address modes and
+	// compare function, as given; store actions as given, with the attachments' resolve textures
+	// (RENDER_SET_*_RESOLVE_TEXTURE) and the depth and stencil resolve filters;
+	// COMPUTE_MEMORY_BARRIER_*; a compute pass's dispatch type, which the device runs in order,
+	// as the concurrent type permits; RENDER_SET_VISIBILITY_RESULT_MODE, the counting mode among
+	// them; RENDER_SET_DEPTH_CLIP_MODE_SPI; the indirect draws and dispatches, the indirect
+	// stage-in region and patch draws; a render pass's renderTargetArrayLength, and its
+	// renderTargetWidth, renderTargetHeight and defaultRasterSampleCount with no attachment;
+	// textures over a Shared buffer's bytes (RGFX_CMD_TEXTURE_FROM_BUFFER); COMPUTE_DISPATCH_THREADS;
+	// heaps and their resources; the patch draws and tessellation factors; swizzles;
+	// RENDER_SET_VIEWPORTS and RENDER_SET_SCISSOR_RECTS. The host's device carries them out where
+	// it is of the Mac2 family.
+	case kRgfxSpiArgumentBuffers:
+	case kRgfxSpiBaseVertexInstanceDrawing:
+	case kRgfxSpiBinaryArchives:
+	case kRgfxSpiBlackOrWhiteSamplerBorderColors:
+	case kRgfxSpiCombinedMSAAStoreAndResolveAction:
+	case kRgfxSpiComputeMemoryBarrier:
+	case kRgfxSpiConcurrentComputeDispatch:
+	case kRgfxSpiCountingOcclusionQuery:
+	case kRgfxSpiDepthClipMode:
+	case kRgfxSpiIndirectDrawAndDispatch:
+	case kRgfxSpiIndirectStageInRegion:
+	case kRgfxSpiIndirectTessellation:
+	case kRgfxSpiLayeredRendering:
+	case kRgfxSpiLinearTextureFromSharedBuffer:
+	case kRgfxSpiMSAADepthResolve:
+	case kRgfxSpiMSAADepthResolveFilter:
+	case kRgfxSpiMSAAStencilResolve:
+	case kRgfxSpiMSAAStencilResolveFilter:
+	case kRgfxSpiMirrorClampToEdgeSamplerMode:
+	case kRgfxSpiNonUniformThreadgroupSize:
+	case kRgfxSpiRenderPassWithoutRenderTarget:
+	case kRgfxSpiResourceHeaps:
+	case kRgfxSpiSamplerCompareFunction:
+	case kRgfxSpiTessellation:
+	case kRgfxSpiTextureSwizzle:
+	case kRgfxSpiViewportAndScissorArray:
+	// Features of the Metal Shading Language, which the guest's compiler takes from the app and
+	// the host's platform runs: arrays of samplers and textures, buffer and texture writes from
+	// fragment functions, 64-bit integers, invariant positions, quad-group and SIMD-group
+	// functions, the min_lod_clamp sample option, stencil feedback and cube arrays.
+	case kRgfxSpiArrayOfSamplers:
+	case kRgfxSpiArrayOfTextures:
+	case kRgfxSpiFragmentBufferWrites:
+	case kRgfxSpiInt64:
+	case kRgfxSpiInvariantVertexPosition:
+	case kRgfxSpiQuadGroup:
+	case kRgfxSpiQuadShufflesAndBroadcast:
+	case kRgfxSpiRenderTextureWrites:
+	case kRgfxSpiSIMDGroup:
+	case kRgfxSpiSIMDShufflesAndBroadcast:
+	case kRgfxSpiShaderMinLODClamp:
+	case kRgfxSpiStencilFeedback:
+	case kRgfxSpiTextureCubeArray:
+		return supportsFamily(kRgfxFamilyMac2);
+	// The host's own answers, for features the wire carries: buffers' attribute strides (the
+	// *_ATTRIBUTE_STRIDE ops), raster order groups (areRasterOrderGroupsSupported), the SIMD-group
+	// reductions, and 2D multisample array textures.
+	case kRgfxSpiDynamicAttributeStride:
+		return flag(kRgfxFlagSupportsDynamicAttributeStride);
+	case kRgfxSpiRasterOrderGroups:
+		return flag(kRgfxFlagAreRasterOrderGroupsSupported);
+	case kRgfxSpiSIMDReduction:
+		return flag(kRgfxFlagSupportsSimdReduction);
+	case kRgfxSpiTexture2DMultisampleArray:
+		return flag(kRgfxFlagSupportsTexture2DMultisampleArray);
+	// Read-write texture arguments, at the host's read-write texture tier (Tier1 is 1).
+	case kRgfxSpiReadWriteTextureArguments:
+		return size(kRgfxSizeReadWriteTextureSupport) >= 1;
+	case kRgfxSpiCount:
+		break;
+	}
+	return false;
+}
+
 uint64_t RgfxCaps::maxThreadsPerThreadgroup(uint32_t dim) const
 {
 	if (dim >= 3)

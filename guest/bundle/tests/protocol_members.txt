@@ -22,7 +22,15 @@
 %no-mesh-width the device makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED); for a render pipeline with no object or mesh stage the AMD and Intel devices answer 0, the M3 its SIMD width, 32 (measured), so 0 lies within what Metal answers
 %absent-as-metal none of Metal's own devices answers it either (measured with respondsToSelector:, M3 Max on macOS 27 and the AMD 5300M and Intel 630 on macOS 26.7.1), so a caller that sends it to any device checks first
 %base-creator left to the base, as tests/inherited_tests.mm lists, with why
-%base-spi an MTLDeviceSPI query, setter or tool hook the IOGPU base answers from its own state; the device answers every member of MTLDevice itself. No run compares what the base answers on this device with Metal's own devices (aud-tests-04)
+%base-spi an MTLDeviceSPI query, setter or tool hook the IOGPU base answers from its own state; the device answers every member of MTLDevice itself. tools/base_answers_probe.m compares what the base answers on this device with Metal's own devices (aud-tests-04)
+%spi-unverified an MTLDeviceSPI feature query the M3 Max, the AMD 5300M and the Intel UHD 630 all answer YES (measured, tools/base_answers_probe.m), and the IOGPU base answers NO here: what it gates, and whether the lane carries that, is not established, so the base's NO stands until it is (aud-tests-04)
+%spi-no-mesh the IOGPU base answers NO, the lane's answer: it makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED), where Metal's devices answer YES
+%spi-no-ray-tracing the IOGPU base answers NO, the lane's answer: it makes no acceleration structures (ray tracing is RGFX_UNSUPPORTED, and supportsRaytracing answers the host's NO), where Metal's devices answer YES
+%spi-no-icb the IOGPU base answers NO, the lane's answer: it makes no indirect command buffers (none on the wire, RGFX_UNSUPPORTED), where Metal's devices answer YES
+%spi-no-counters the IOGPU base answers NO, the lane's answer: it samples no counters (counter sampling is RGFX_UNSUPPORTED, and counterSets is nil), where Metal's devices answer YES
+%spi-no-dylibs the IOGPU base answers NO, the lane's answer: it makes no dynamic libraries (RGFX_UNSUPPORTED, and supportsDynamicLibraries answers NO), where Metal's devices answer YES
+%spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
+%spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
 
 [RgfxArgumentEncoder]
 alignment implemented
@@ -673,7 +681,7 @@ sparseTileSizeWithTextureType:pixelFormat:sampleCount: implemented
 sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize: implemented
 startCollectingPipelineDescriptors base %base-spi
 startCollectingPipelineDescriptorsUsingPrefixForNames: base %base-spi
-supportPriorityBand base %base-spi
+supportPriorityBand base %spi-unverified
 supports2DLinearTexArraySPI base %base-spi
 supports32BitFloatFiltering implemented
 supports32BitMSAA implemented
@@ -687,103 +695,103 @@ supportsASTCHDRTextureCompression base %base-spi
 supportsASTCTextureCompression base %base-spi
 supportsAlphaYUVFormats base %base-spi
 supportsAnisoSampleFix base %base-spi
-supportsArgumentBuffers base %base-spi
+supportsArgumentBuffers implemented
 supportsArgumentBuffersTier2 base %base-spi
-supportsArrayOfSamplers base %base-spi
-supportsArrayOfTextures base %base-spi
+supportsArrayOfSamplers implemented
+supportsArrayOfTextures implemented
 supportsAtomicFloat base %base-spi
 supportsAtomicUlongVoidMinMax base %base-spi
 supportsAtomicWaitNotify base %base-spi
 supportsBCTextureCompression implemented
 supportsBGR10A2 base %base-spi
-supportsBaseVertexInstanceDrawing base %base-spi
-supportsBfloat16Buffers base %base-spi
+supportsBaseVertexInstanceDrawing implemented
+supportsBfloat16Buffers base %spi-unverified
 supportsBfloat16Format base %base-spi
-supportsBinaryArchives base %base-spi
-supportsBinaryLibraries base %base-spi
-supportsBlackOrWhiteSamplerBorderColors base %base-spi
+supportsBinaryArchives implemented
+supportsBinaryLibraries base %spi-unverified
+supportsBlackOrWhiteSamplerBorderColors implemented
 supportsBufferBoundsChecking base %base-spi
 supportsBufferPrefetchStatistics base %base-spi
 supportsBufferWithAddressRanges base %base-spi
 supportsBufferWithIOSurface base %base-spi
 supportsBufferlessClientStorageTexture base %base-spi
-supportsCMPIndirectCommandBuffers base %base-spi
+supportsCMPIndirectCommandBuffers base %spi-no-icb
 supportsColorSpaceConversionMatrixSelection base %base-spi
-supportsCombinedMSAAStoreAndResolveAction base %base-spi
-supportsCommandBufferJump base %base-spi
+supportsCombinedMSAAStoreAndResolveAction implemented
+supportsCommandBufferJump base %spi-unverified
 supportsCommandQueueBarriers base %base-spi
 supportsCompressedTextureViewSPI base %base-spi
 supportsComputeCompressedTextureWrite base %base-spi
-supportsComputeMemoryBarrier base %base-spi
-supportsConcurrentComputeDispatch base %base-spi
+supportsComputeMemoryBarrier implemented
+supportsConcurrentComputeDispatch implemented
 supportsConditionalLoadStore base %base-spi
 supportsConditionalTileDispatch base %base-spi
 supportsCounterSampling: implemented
-supportsCountingOcclusionQuery base %base-spi
+supportsCountingOcclusionQuery implemented
 supportsCustomBorderColor base %base-spi
 supportsDeadlineProfile base %base-spi
 supportsDepthBoundsTesting base %base-spi
-supportsDepthClipMode base %base-spi
-supportsDepthClipModeClampExtended base %base-spi
+supportsDepthClipMode implemented
+supportsDepthClipModeClampExtended base %spi-unverified
 supportsDeviceCoherency base %base-spi
 supportsDevicePartitioning base %base-spi
-supportsDynamicAttributeStride base %base-spi
+supportsDynamicAttributeStride implemented
 supportsDynamicControlPointCount base %base-spi
 supportsDynamicLibraries implemented
 supportsExplicitVisibilityGroups base %base-spi
 supportsExtendedIndirectRenderCommand base %base-spi
 supportsExtendedSamplerLODBiasRange base %base-spi
-supportsExtendedVertexFormats base %base-spi
+supportsExtendedVertexFormats base %spi-unverified
 supportsExtendedXR10Formats base %base-spi
 supportsExtendedYUVFormats base %base-spi
 supportsFP32TessFactors base %base-spi
 supportsFP8 base %base-spi
 supportsFamily: implemented
-supportsFastMathInfNaNPropagation base %base-spi
+supportsFastMathInfNaNPropagation base %spi-unverified
 supportsFeatureSet: implemented
 supportsFillTexture base %base-spi
 supportsFixedLinePointFillDepthGradient base %base-spi
 supportsFloat16BCubicFiltering base %base-spi
-supportsFloat16InfNanFiltering base %base-spi
-supportsForceSeamsOnCubemaps base %base-spi
+supportsFloat16InfNanFiltering base %spi-unverified
+supportsForceSeamsOnCubemaps base %spi-unverified
 supportsForkJoin base %base-spi
-supportsFragmentBufferWrites base %base-spi
+supportsFragmentBufferWrites implemented
 supportsFragmentOnlyEncoders base %base-spi
 supportsFunctionPointers implemented
 supportsFunctionPointersFromMesh base %base-spi
 supportsFunctionPointersFromRender implemented
-supportsGFXIndirectCommandBuffers base %base-spi
-supportsGPUStatistics base %base-spi
-supportsGlobalVariableBindingInDylibs base %base-spi
+supportsGFXIndirectCommandBuffers base %spi-no-icb
+supportsGPUStatistics base %spi-no-counters
+supportsGlobalVariableBindingInDylibs base %spi-no-dylibs
 supportsGlobalVariableBindings base %base-spi
 supportsGlobalVariableRelocation base %base-spi
-supportsGlobalVariableRelocationCompute base %base-spi
+supportsGlobalVariableRelocationCompute base %spi-no-dylibs
 supportsGlobalVariableRelocationRender base %base-spi
-supportsHeapAccelerationStructureAllocation base %base-spi
+supportsHeapAccelerationStructureAllocation base %spi-no-ray-tracing
 supportsHeapWithAddressRanges base %base-spi
 supportsIABHashForTools base %base-spi
 supportsImageBlockSampleCoverageControl base %base-spi
 supportsImageBlocks implemented
-supportsIndirectDrawAndDispatch base %base-spi
-supportsIndirectStageInRegion base %base-spi
-supportsIndirectTessellation base %base-spi
-supportsIndirectTextures base %base-spi
-supportsIndirectWritableTextures base %base-spi
-supportsInt64 base %base-spi
+supportsIndirectDrawAndDispatch implemented
+supportsIndirectStageInRegion implemented
+supportsIndirectTessellation implemented
+supportsIndirectTextures base %spi-unverified
+supportsIndirectWritableTextures base %spi-unverified
+supportsInt64 implemented
 supportsInterchangeTiled base %base-spi
 supportsIntersectionFunctionBuffers base %base-spi
-supportsInvariantVertexPosition base %base-spi
+supportsInvariantVertexPosition implemented
 supportsLargeFramebufferConfigs base %base-spi
 supportsLateEvalEvent base %base-spi
-supportsLayeredRendering base %base-spi
+supportsLayeredRendering implemented
 supportsLimitedYUVFormats base %base-spi
 supportsLinearTexture2DArray base %base-spi
-supportsLinearTextureFromSharedBuffer base %base-spi
+supportsLinearTextureFromSharedBuffer implemented
 supportsLossyCompression base %base-spi
-supportsMSAADepthResolve base %base-spi
-supportsMSAADepthResolveFilter base %base-spi
-supportsMSAAStencilResolve base %base-spi
-supportsMSAAStencilResolveFilter base %base-spi
+supportsMSAADepthResolve implemented
+supportsMSAADepthResolveFilter implemented
+supportsMSAAStencilResolve implemented
+supportsMSAAStencilResolveFilter implemented
 supportsMTL4CommandAllocator base %base-spi
 supportsMTL4CommandQueue base %base-spi
 supportsMTL4Compiler base %base-spi
@@ -800,27 +808,27 @@ supportsMachineLearningCommandEncoders base %base-spi
 supportsMemoryOrderAtomics base %base-spi
 supportsMemorylessRenderTargets base %base-spi
 supportsMeshRenderDynamicLibraries base %base-spi
-supportsMeshShaders base %base-spi
+supportsMeshShaders base %spi-no-mesh
 supportsMeshShadersInICB base %base-spi
-supportsMipLevelsSmallerThanBlockSize base %base-spi
-supportsMirrorClampToEdgeSamplerMode base %base-spi
+supportsMipLevelsSmallerThanBlockSize base %spi-unverified
+supportsMirrorClampToEdgeSamplerMode implemented
 supportsMultiPlaneTensors base %base-spi
-supportsMutableTier1ArgumentBuffers base %base-spi
+supportsMutableTier1ArgumentBuffers base %spi-unverified
 supportsNativeHardwareFP16 base %base-spi
 supportsNonPrivateDepthStencilTextures base %base-spi
 supportsNonPrivateMSAATextures base %base-spi
 supportsNonSquareTileShaders implemented
-supportsNonUniformThreadgroupSize base %base-spi
+supportsNonUniformThreadgroupSize implemented
 supportsNonZeroTextureWriteLOD base %base-spi
 supportsNorm16BCubicFiltering base %base-spi
-supportsOpenCLTextureWriteSwizzles base %base-spi
+supportsOpenCLTextureWriteSwizzles base %spi-unverified
 supportsPVRTC base %base-spi
 supportsPackUnpackSmallInteger base %base-spi
-supportsPacked32TextureBufferWrites base %base-spi
-supportsPartialRenderMemoryBarrier base %base-spi
+supportsPacked32TextureBufferWrites base %spi-unverified
+supportsPartialRenderMemoryBarrier base %spi-unverified
 supportsPerPlaneCompression base %base-spi
 supportsPerformanceStateAssertion base %base-spi
-supportsPipelineLibraries base %base-spi
+supportsPipelineLibraries base %spi-no-pipeline-libraries
 supportsPlacementHeaps base %base-spi
 supportsPlacementSparse implemented
 supportsPostDepthCoverage base %base-spi
@@ -831,82 +839,82 @@ supportsProgrammableBlending base %base-spi
 supportsProgrammableSamplePositions base %base-spi
 supportsPublicXR10Formats base %base-spi
 supportsPullModelInterpolation implemented
-supportsQuadGroup base %base-spi
-supportsQuadReduction base %base-spi
-supportsQuadShufflesAndBroadcast base %base-spi
+supportsQuadGroup implemented
+supportsQuadReduction base %spi-unverified
+supportsQuadShufflesAndBroadcast implemented
 supportsQueryTextureLOD implemented
 supportsRGBA10A2Gamma base %base-spi
 supportsRGBTextureBuffers base %base-spi
 supportsRTZRounding base %base-spi
-supportsRasterOrderGroups base %base-spi
+supportsRasterOrderGroups implemented
 supportsRasterOrderGroupsColorAttachment base %base-spi
 supportsRasterizationRateMapWithLayerCount: implemented
 supportsRayTracingAccelerationStructureCPUDeserialization base %base-spi
-supportsRayTracingBuffersFromTables base %base-spi
-supportsRayTracingCurves base %base-spi
+supportsRayTracingBuffersFromTables base %spi-no-ray-tracing
+supportsRayTracingCurves base %spi-no-ray-tracing
 supportsRayTracingDirectIntersectionResultAccess base %base-spi
-supportsRayTracingExtendedVertexFormats base %base-spi
-supportsRayTracingGPUTableUpdateBuffers base %base-spi
-supportsRayTracingICBs base %base-spi
-supportsRayTracingIndirectInstanceAccelerationStructureBuild base %base-spi
+supportsRayTracingExtendedVertexFormats base %spi-no-ray-tracing
+supportsRayTracingGPUTableUpdateBuffers base %spi-no-ray-tracing
+supportsRayTracingICBs base %spi-no-ray-tracing
+supportsRayTracingIndirectInstanceAccelerationStructureBuild base %spi-no-ray-tracing
 supportsRayTracingMatrixLayout base %base-spi
-supportsRayTracingMultiLevelInstancing base %base-spi
+supportsRayTracingMultiLevelInstancing base %spi-no-ray-tracing
 supportsRayTracingPerComponentMotionInterpolation base %base-spi
-supportsRayTracingPerPrimitiveData base %base-spi
+supportsRayTracingPerPrimitiveData base %spi-no-ray-tracing
 supportsRayTracingTraversalMetrics base %base-spi
 supportsRaytracing implemented
 supportsRaytracingFromRender implemented
-supportsReadWriteBufferArguments base %base-spi
-supportsReadWriteTextureArguments base %base-spi
+supportsReadWriteBufferArguments base %spi-unverified
+supportsReadWriteTextureArguments implemented
 supportsReadWriteTextureArgumentsTier2 base %base-spi
-supportsReadWriteTextureCubeArguments base %base-spi
-supportsRelaxedTextureViewRequirements base %base-spi
+supportsReadWriteTextureCubeArguments base %spi-unverified
+supportsRelaxedTextureViewRequirements base %spi-unverified
 supportsRenderDynamicLibraries implemented
 supportsRenderMemoryBarrier base %base-spi
-supportsRenderPassWithoutRenderTarget base %base-spi
+supportsRenderPassWithoutRenderTarget implemented
 supportsRenderTargetTextureRotation base %base-spi
-supportsRenderTextureWrites base %base-spi
+supportsRenderTextureWrites implemented
 supportsRenderToLinearTextures base %base-spi
 supportsResourceDetachBacking base %base-spi
-supportsResourceHeaps base %base-spi
-supportsSIMDGroup base %base-spi
+supportsResourceHeaps implemented
+supportsSIMDGroup implemented
 supportsSIMDGroupMatrix base %base-spi
 supportsSIMDGroupParallelForwardProgress base %base-spi
-supportsSIMDReduction base %base-spi
+supportsSIMDReduction implemented
 supportsSIMDShuffleAndFill base %base-spi
-supportsSIMDShufflesAndBroadcast base %base-spi
+supportsSIMDShufflesAndBroadcast implemented
 supportsSRGBwrites base %base-spi
 supportsSampleCount: implemented
 supportsSamplerAddressModeClampToHalfBorder base %base-spi
-supportsSamplerCompareFunction base %base-spi
+supportsSamplerCompareFunction implemented
 supportsSamplerReductionMode base %base-spi
 supportsSeparateDepthStencil base %base-spi
 supportsSeparateVisibilityAndShadingRate base %base-spi
 supportsSetThreadgroupPackingDisabled base %base-spi
 supportsShaderBarycentricCoordinates implemented
 supportsShaderLODAverage base %base-spi
-supportsShaderMinLODClamp base %base-spi
+supportsShaderMinLODClamp implemented
 supportsSharedFunctionTables base %base-spi
 supportsSharedStorageHeapResources base %base-spi
 supportsSharedStorageTextures base %base-spi
-supportsSharedTextureHandles base %base-spi
+supportsSharedTextureHandles base %spi-no-shared-textures
 supportsSparseDepthAttachments base %base-spi
 supportsSparseHeaps base %base-spi
 supportsSparseTextures base %base-spi
 supportsStackOverflowErrorCode base %base-spi
-supportsStatefulDynamicLibraries base %base-spi
-supportsStencilFeedback base %base-spi
+supportsStatefulDynamicLibraries base %spi-no-dylibs
+supportsStencilFeedback implemented
 supportsStreamingCodecSignaling base %base-spi
 supportsTLS base %base-spi
 supportsTensors base %base-spi
-supportsTessellation base %base-spi
-supportsTexture2DMultisampleArray base %base-spi
+supportsTessellation implemented
+supportsTexture2DMultisampleArray implemented
 supportsTextureAccessPatterns base %base-spi
-supportsTextureCubeArray base %base-spi
+supportsTextureCubeArray implemented
 supportsTextureMultifetch base %base-spi
-supportsTextureOutOfBoundsReads base %base-spi
+supportsTextureOutOfBoundsReads base %spi-unverified
 supportsTextureSampleCount: implemented
-supportsTextureSwizzle base %base-spi
+supportsTextureSwizzle implemented
 supportsTextureViewMinLOD base %base-spi
 supportsTextureWriteRoundingMode: base %base-spi
 supportsTileShaders implemented
@@ -914,9 +922,9 @@ supportsUnalignedVertexFetch base %base-spi
 supportsVariableRateRasterization base %base-spi
 supportsVertexAmplification base %base-spi
 supportsVertexAmplificationCount: implemented
-supportsViewportAndScissorArray base %base-spi
+supportsViewportAndScissorArray implemented
 supportsVirtualSubstreams base %base-spi
-supportsWritableArrayOfTextures base %base-spi
+supportsWritableArrayOfTextures base %spi-unverified
 supportsYCBCRFormats base %base-spi
 supportsYCBCRFormats12 base %base-spi
 supportsYCBCRFormatsPQ base %base-spi

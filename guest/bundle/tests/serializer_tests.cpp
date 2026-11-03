@@ -400,6 +400,61 @@ void test_caps()
 	CHECK(std::strcmp(caps.name(), "NVIDIA GeForce RTX 5080 Laptop GPU") == 0);
 }
 
+// The MTLDeviceSPI feature queries the device answers itself (RgfxCaps::spiFeature): each YES on
+// a host of the Mac2 family whose flags and read-write tier say yes, as Metal's devices answer,
+// and each NO on a host of no Mac2 family with no flags and no tier, and with no caps at all.
+void test_spi_features()
+{
+	RgfxCaps none;
+	for (int k = 0; k < kRgfxSpiCount; k++)
+		CHECK(!none.spiFeature(static_cast<RgfxSpiFeature>(k)));
+
+	RgfxDeviceInfo info = {};
+	info.version = RGFX_DEVICE_INFO_VERSION;
+	info.family_count = 2;
+	info.family_values[0] = 2002; // Mac2
+	info.family_answers[0] = 1;
+	info.family_values[1] = 5001; // Metal3
+	info.family_answers[1] = 1;
+	info.flags[kRgfxFlagSupportsDynamicAttributeStride] = 1;
+	info.flags[kRgfxFlagAreRasterOrderGroupsSupported] = 1;
+	info.flags[kRgfxFlagSupportsSimdReduction] = 1;
+	info.flags[kRgfxFlagSupportsTexture2DMultisampleArray] = 1;
+	info.sizes[kRgfxSizeReadWriteTextureSupport] = 2;
+	RgfxCaps mac;
+	CHECK(mac.load(info));
+	for (int k = 0; k < kRgfxSpiCount; k++)
+		CHECK(mac.spiFeature(static_cast<RgfxSpiFeature>(k)));
+	CHECK(!mac.spiFeature(kRgfxSpiCount));
+
+	// The Mac2 family alone: every query but the four flags' and the tier's.
+	RgfxDeviceInfo family = info;
+	std::memset(family.flags, 0, sizeof family.flags);
+	family.sizes[kRgfxSizeReadWriteTextureSupport] = 0;
+	RgfxCaps fam;
+	CHECK(fam.load(family));
+	CHECK(fam.spiFeature(kRgfxSpiTessellation) && fam.spiFeature(kRgfxSpiSIMDGroup));
+	CHECK(!fam.spiFeature(kRgfxSpiDynamicAttributeStride));
+	CHECK(!fam.spiFeature(kRgfxSpiRasterOrderGroups));
+	CHECK(!fam.spiFeature(kRgfxSpiSIMDReduction));
+	CHECK(!fam.spiFeature(kRgfxSpiTexture2DMultisampleArray));
+	CHECK(!fam.spiFeature(kRgfxSpiReadWriteTextureArguments));
+
+	// The flags and the tier alone: only theirs.
+	RgfxDeviceInfo flagsOnly = info;
+	flagsOnly.family_answers[0] = 0;
+	RgfxCaps fl;
+	CHECK(fl.load(flagsOnly));
+	CHECK(!fl.spiFeature(kRgfxSpiTessellation) && !fl.spiFeature(kRgfxSpiArgumentBuffers));
+	CHECK(!fl.spiFeature(kRgfxSpiInt64));
+	CHECK(fl.spiFeature(kRgfxSpiDynamicAttributeStride) && fl.spiFeature(kRgfxSpiSIMDReduction));
+	CHECK(fl.spiFeature(kRgfxSpiReadWriteTextureArguments));
+	int yes = 0;
+	for (int k = 0; k < kRgfxSpiCount; k++)
+		yes += fl.spiFeature(static_cast<RgfxSpiFeature>(k)) ? 1 : 0;
+	CHECK(yes == 5);
+}
+
 // A heap or buffer whose GPU address finds no room in the context's range is no object: the
 // create posts nothing and answers ids of 0, so the caller answers nil, as Metal does for one it
 // cannot place; a smaller one that fits is made after it.
@@ -1985,6 +2040,7 @@ int main()
 	test_address_picks();
 	test_resource_id_chunks();
 	test_caps();
+	test_spi_features();
 	test_archive_file();
 	test_lifecycle_messages();
 	test_creates_with_no_address_post_nothing();

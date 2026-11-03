@@ -134,6 +134,61 @@ enum RgfxIdentityFlag {
 	kRgfxIdentityCount
 };
 
+/// The MTLDeviceSPI `supports*` queries the device answers itself (RgfxMetalDevice.mm), where
+/// the IOGPU base answers NO from its all-zero device info and the M3 Max, the AMD 5300M and the
+/// Intel UHD 630 all answer YES (measured, tools/base_answers_probe.m). `supportsX` is kRgfxSpiX.
+enum RgfxSpiFeature : int {
+	// What the wire carries, on a host of the Mac2 family (RgfxCaps.cpp says what of the wire).
+	kRgfxSpiArgumentBuffers = 0,
+	kRgfxSpiBaseVertexInstanceDrawing,
+	kRgfxSpiBinaryArchives,
+	kRgfxSpiBlackOrWhiteSamplerBorderColors,
+	kRgfxSpiCombinedMSAAStoreAndResolveAction,
+	kRgfxSpiComputeMemoryBarrier,
+	kRgfxSpiConcurrentComputeDispatch,
+	kRgfxSpiCountingOcclusionQuery,
+	kRgfxSpiDepthClipMode,
+	kRgfxSpiIndirectDrawAndDispatch,
+	kRgfxSpiIndirectStageInRegion,
+	kRgfxSpiIndirectTessellation,
+	kRgfxSpiLayeredRendering,
+	kRgfxSpiLinearTextureFromSharedBuffer,
+	kRgfxSpiMSAADepthResolve,
+	kRgfxSpiMSAADepthResolveFilter,
+	kRgfxSpiMSAAStencilResolve,
+	kRgfxSpiMSAAStencilResolveFilter,
+	kRgfxSpiMirrorClampToEdgeSamplerMode,
+	kRgfxSpiNonUniformThreadgroupSize,
+	kRgfxSpiRenderPassWithoutRenderTarget,
+	kRgfxSpiResourceHeaps,
+	kRgfxSpiSamplerCompareFunction,
+	kRgfxSpiTessellation,
+	kRgfxSpiTextureSwizzle,
+	kRgfxSpiViewportAndScissorArray,
+	// Features of the Metal Shading Language the host runs, on a host of the Mac2 family.
+	kRgfxSpiArrayOfSamplers,
+	kRgfxSpiArrayOfTextures,
+	kRgfxSpiFragmentBufferWrites,
+	kRgfxSpiInt64,
+	kRgfxSpiInvariantVertexPosition,
+	kRgfxSpiQuadGroup,
+	kRgfxSpiQuadShufflesAndBroadcast,
+	kRgfxSpiRenderTextureWrites,
+	kRgfxSpiSIMDGroup,
+	kRgfxSpiSIMDShufflesAndBroadcast,
+	kRgfxSpiShaderMinLODClamp,
+	kRgfxSpiStencilFeedback,
+	kRgfxSpiTextureCubeArray,
+	// The host's own answers, in the device info's flags.
+	kRgfxSpiDynamicAttributeStride,
+	kRgfxSpiRasterOrderGroups,
+	kRgfxSpiSIMDReduction,
+	kRgfxSpiTexture2DMultisampleArray,
+	// The host's read-write texture tier.
+	kRgfxSpiReadWriteTextureArguments,
+	kRgfxSpiCount
+};
+
 class RgfxCaps {
 public:
 	RgfxCaps();
@@ -187,6 +242,9 @@ public:
 	uint64_t limit(RgfxLimit which) const;
 	/// One of the 25 BOOL properties.
 	bool flag(RgfxFlag which) const;
+	/// What the device answers to the MTLDeviceSPI query `which` (RgfxSpiFeature); no for a
+	/// value past the list, and for every query with no caps.
+	bool spiFeature(RgfxSpiFeature which) const;
 
 	/// `registryID`.
 	uint64_t registryId() const { return m_info.registry_id; }

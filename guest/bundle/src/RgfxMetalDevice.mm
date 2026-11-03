@@ -994,6 +994,233 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.valid() && _caps.supportsPrimitiveType(static_cast<uint32_t>(primitiveType));
 }
 
+// --- MTLDeviceSPI feature queries ----------------------------------------------------------
+// The IOGPU base answers each `supports*` query of MTLDeviceSPI from the IOGPU device info, which
+// the kext gives all zero, so it answered NO to every one where the M3 Max, the AMD 5300M and the
+// Intel UHD 630 all answer YES (measured, tools/base_answers_probe.m; aud-tests-04). The device
+// answers those the lane carries out, from the host's answers (RgfxCaps::spiFeature says which
+// and why), and leaves the others to the base's NO (tests/protocol_members.txt says why for each).
+
+- (BOOL)supportsArgumentBuffers
+{
+	return _caps.spiFeature(kRgfxSpiArgumentBuffers);
+}
+
+- (BOOL)supportsBaseVertexInstanceDrawing
+{
+	return _caps.spiFeature(kRgfxSpiBaseVertexInstanceDrawing);
+}
+
+- (BOOL)supportsBinaryArchives
+{
+	return _caps.spiFeature(kRgfxSpiBinaryArchives);
+}
+
+- (BOOL)supportsBlackOrWhiteSamplerBorderColors
+{
+	return _caps.spiFeature(kRgfxSpiBlackOrWhiteSamplerBorderColors);
+}
+
+- (BOOL)supportsCombinedMSAAStoreAndResolveAction
+{
+	return _caps.spiFeature(kRgfxSpiCombinedMSAAStoreAndResolveAction);
+}
+
+- (BOOL)supportsComputeMemoryBarrier
+{
+	return _caps.spiFeature(kRgfxSpiComputeMemoryBarrier);
+}
+
+- (BOOL)supportsConcurrentComputeDispatch
+{
+	return _caps.spiFeature(kRgfxSpiConcurrentComputeDispatch);
+}
+
+- (BOOL)supportsCountingOcclusionQuery
+{
+	return _caps.spiFeature(kRgfxSpiCountingOcclusionQuery);
+}
+
+- (BOOL)supportsDepthClipMode
+{
+	return _caps.spiFeature(kRgfxSpiDepthClipMode);
+}
+
+- (BOOL)supportsIndirectDrawAndDispatch
+{
+	return _caps.spiFeature(kRgfxSpiIndirectDrawAndDispatch);
+}
+
+- (BOOL)supportsIndirectStageInRegion
+{
+	return _caps.spiFeature(kRgfxSpiIndirectStageInRegion);
+}
+
+- (BOOL)supportsIndirectTessellation
+{
+	return _caps.spiFeature(kRgfxSpiIndirectTessellation);
+}
+
+- (BOOL)supportsLayeredRendering
+{
+	return _caps.spiFeature(kRgfxSpiLayeredRendering);
+}
+
+- (BOOL)supportsLinearTextureFromSharedBuffer
+{
+	return _caps.spiFeature(kRgfxSpiLinearTextureFromSharedBuffer);
+}
+
+- (BOOL)supportsMSAADepthResolve
+{
+	return _caps.spiFeature(kRgfxSpiMSAADepthResolve);
+}
+
+- (BOOL)supportsMSAADepthResolveFilter
+{
+	return _caps.spiFeature(kRgfxSpiMSAADepthResolveFilter);
+}
+
+- (BOOL)supportsMSAAStencilResolve
+{
+	return _caps.spiFeature(kRgfxSpiMSAAStencilResolve);
+}
+
+- (BOOL)supportsMSAAStencilResolveFilter
+{
+	return _caps.spiFeature(kRgfxSpiMSAAStencilResolveFilter);
+}
+
+- (BOOL)supportsMirrorClampToEdgeSamplerMode
+{
+	return _caps.spiFeature(kRgfxSpiMirrorClampToEdgeSamplerMode);
+}
+
+- (BOOL)supportsNonUniformThreadgroupSize
+{
+	return _caps.spiFeature(kRgfxSpiNonUniformThreadgroupSize);
+}
+
+- (BOOL)supportsRenderPassWithoutRenderTarget
+{
+	return _caps.spiFeature(kRgfxSpiRenderPassWithoutRenderTarget);
+}
+
+- (BOOL)supportsResourceHeaps
+{
+	return _caps.spiFeature(kRgfxSpiResourceHeaps);
+}
+
+- (BOOL)supportsSamplerCompareFunction
+{
+	return _caps.spiFeature(kRgfxSpiSamplerCompareFunction);
+}
+
+- (BOOL)supportsTessellation
+{
+	return _caps.spiFeature(kRgfxSpiTessellation);
+}
+
+- (BOOL)supportsTextureSwizzle
+{
+	return _caps.spiFeature(kRgfxSpiTextureSwizzle);
+}
+
+- (BOOL)supportsViewportAndScissorArray
+{
+	return _caps.spiFeature(kRgfxSpiViewportAndScissorArray);
+}
+
+- (BOOL)supportsArrayOfSamplers
+{
+	return _caps.spiFeature(kRgfxSpiArrayOfSamplers);
+}
+
+- (BOOL)supportsArrayOfTextures
+{
+	return _caps.spiFeature(kRgfxSpiArrayOfTextures);
+}
+
+- (BOOL)supportsFragmentBufferWrites
+{
+	return _caps.spiFeature(kRgfxSpiFragmentBufferWrites);
+}
+
+- (BOOL)supportsInt64
+{
+	return _caps.spiFeature(kRgfxSpiInt64);
+}
+
+- (BOOL)supportsInvariantVertexPosition
+{
+	return _caps.spiFeature(kRgfxSpiInvariantVertexPosition);
+}
+
+- (BOOL)supportsQuadGroup
+{
+	return _caps.spiFeature(kRgfxSpiQuadGroup);
+}
+
+- (BOOL)supportsQuadShufflesAndBroadcast
+{
+	return _caps.spiFeature(kRgfxSpiQuadShufflesAndBroadcast);
+}
+
+- (BOOL)supportsRenderTextureWrites
+{
+	return _caps.spiFeature(kRgfxSpiRenderTextureWrites);
+}
+
+- (BOOL)supportsSIMDGroup
+{
+	return _caps.spiFeature(kRgfxSpiSIMDGroup);
+}
+
+- (BOOL)supportsSIMDShufflesAndBroadcast
+{
+	return _caps.spiFeature(kRgfxSpiSIMDShufflesAndBroadcast);
+}
+
+- (BOOL)supportsShaderMinLODClamp
+{
+	return _caps.spiFeature(kRgfxSpiShaderMinLODClamp);
+}
+
+- (BOOL)supportsStencilFeedback
+{
+	return _caps.spiFeature(kRgfxSpiStencilFeedback);
+}
+
+- (BOOL)supportsTextureCubeArray
+{
+	return _caps.spiFeature(kRgfxSpiTextureCubeArray);
+}
+
+- (BOOL)supportsDynamicAttributeStride
+{
+	return _caps.spiFeature(kRgfxSpiDynamicAttributeStride);
+}
+
+- (BOOL)supportsRasterOrderGroups
+{
+	return _caps.spiFeature(kRgfxSpiRasterOrderGroups);
+}
+
+- (BOOL)supportsSIMDReduction
+{
+	return _caps.spiFeature(kRgfxSpiSIMDReduction);
+}
+
+- (BOOL)supportsTexture2DMultisampleArray
+{
+	return _caps.spiFeature(kRgfxSpiTexture2DMultisampleArray);
+}
+
+- (BOOL)supportsReadWriteTextureArguments
+{
+	return _caps.spiFeature(kRgfxSpiReadWriteTextureArguments);
+}
+
 // --- what Apple's frameworks send the device beyond MTLDevice (RgfxInterop.h) --------
 // SkyLight, Core Image and MPS send these; each answers what Metal's device answers, measured
 // on the M3 Max (macOS 27), unless it says otherwise.
