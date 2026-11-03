@@ -608,12 +608,76 @@ impl<P: Platform> RenderCmd<'_, P> {
         }
     }
 }
+
+/// One draw of [`RenderEncoder::encode_draws`]: [`RenderCmd::SetVertexBuffer`] of `buffer`,
+/// `offset` and `index`, then [`RenderCmd::DrawPrimitives`] of `primitive_type`, `vertex_start`
+/// and `vertex_count`.
+#[derive(Debug)]
+#[allow(missing_docs)] // the fields are the two commands' arguments
+pub struct VertexDraw<'a, P: Platform> {
+    pub buffer: Option<&'a P::Buffer>,
+    pub offset: u64,
+    pub index: u64,
+    pub primitive_type: u64,
+    pub vertex_start: u64,
+    pub vertex_count: u64,
+}
+
+impl<P: Platform> Clone for VertexDraw<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Platform> Copy for VertexDraw<'_, P> {}
+
+impl<'a, P: Platform> VertexDraw<'a, P> {
+    /// Its `setVertexBuffer:offset:atIndex:`.
+    pub fn vertex_buffer(&self) -> RenderCmd<'a, P> {
+        RenderCmd::SetVertexBuffer {
+            buffer: self.buffer,
+            offset: self.offset,
+            index: self.index,
+        }
+    }
+
+    /// Its `drawPrimitives:vertexStart:vertexCount:`.
+    pub fn primitives(&self) -> RenderCmd<'a, P> {
+        RenderCmd::DrawPrimitives {
+            primitive_type: self.primitive_type,
+            vertex_start: self.vertex_start,
+            vertex_count: self.vertex_count,
+        }
+    }
+}
+
+/// [`RenderEncoder::encode_draws`] as each platform's but the one that takes them its own way
+/// sends them: each draw's two commands through [`RenderEncoder::encode`], in order, up to the
+/// first that raises.
+pub fn encode_each<P: Platform, E: RenderEncoder<P> + ?Sized>(
+    enc: &E,
+    on: OnFault,
+    draws: &[VertexDraw<'_, P>],
+) -> RaiseResult<()> {
+    for draw in draws {
+        enc.encode(on, draw.vertex_buffer())?;
+        enc.encode(on, draw.primitives())?;
+    }
+    Ok(())
+}
+
 /// The render encoder `-renderCommandEncoderWithDescriptor:` answers (`CommandBuffer`).
 pub trait RenderEncoder<P: Platform>: Handle {
     /// Sends one [`RenderCmd`]. `on` says what a raise in a command reached both under a
     /// handler and with none (the display's frame commands and `EndEncoding`) does; the other
     /// commands are reached one way only.
     fn encode(&self, on: OnFault, cmd: RenderCmd<'_, P>) -> RaiseResult<()>;
+    /// Sends each of `draws`, one after another, as [`encode_each`] does: each command does what
+    /// it does alone, in its order, and the first that raises ends them. A platform may take
+    /// them its own way, where that is all it does.
+    fn encode_draws(&self, on: OnFault, draws: &[VertexDraw<'_, P>]) -> RaiseResult<()> {
+        encode_each(self, on, draws)
+    }
     /// Runs `run`, a run of [`Self::encode`]s this thread sends the encoder one after another,
     /// with nothing else sent it between them. Each command does what it does alone, in its
     /// order; a platform may hold the encoder for the run, so that each command takes less.
