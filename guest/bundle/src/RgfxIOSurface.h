@@ -316,6 +316,11 @@ void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes
 /// a GPU's write leaves the seed where the commit moved it.
 void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes);
 
+/// Whether every view in `writes` (taken from a command buffer's encoder) is in place, none a
+/// copy rgfxIOSurfaceWriteBack writes back: the buffer's results are then in the surfaces' pages
+/// once the device has completed it.
+bool rgfxIOSurfaceWritesInPlace(const std::vector<std::shared_ptr<void>> &writes);
+
 /// How many textures over `surface` were answered nil for `cause` ("arguments", "plane",
 /// "plane shape", "region", "buffer", "resource id", "texture"), and the "RGFX:" line logged
 /// for the first, without the prefix (for the tests): 0 and empty where none was.

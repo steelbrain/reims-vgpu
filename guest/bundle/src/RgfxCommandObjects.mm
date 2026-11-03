@@ -564,6 +564,12 @@ struct RgfxBarrierSlot {
 - (std::shared_ptr<RgfxBodyPool>)rgfxBodyPool;
 /// Takes a committed message's `bytes` into rgfxMessageReserve.
 - (void)rgfxNoteMessageBytes:(uint64_t)bytes;
+/// At the take of the completion of a buffer whose writes are named to the kext: whether its
+/// writes retire there, `now` (all in place and named) and no buffer before it retiring at its
+/// delivery; else it is one of those until rgfxRetiredLate.
+- (BOOL)rgfxRetiresAtTake:(BOOL)now;
+/// A buffer rgfxRetiresAtTake: left to retire at its delivery has retired.
+- (void)rgfxRetiredLate;
 /// The next encoder's barrier fence, of the fences the queue made with itself.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 /// Runs `record` on the queue's completion queue, behind the records before it, or here.
@@ -593,6 +599,10 @@ struct RgfxBarrierSlot {
 	// The records handed to a dispatch queue and not yet run: while there are any, a record the
 	// taker of the ring could run itself goes behind them instead.
 	std::atomic<uint32_t> _deliveriesInFlight;
+	// Its buffers taken whose writes retire at their delivery, not yet retired: while there are
+	// any, a later buffer's retire goes behind them too, as the kext retires a queue's writes up
+	// to a seqno (rgfxRetiresAtTake:).
+	std::atomic<uint32_t> _lateRetires;
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
 	unsigned short _gpuPriorityOffset; // and the offsets and background priority with it
 	NSUInteger _backgroundGpuPriority;
@@ -708,6 +718,21 @@ struct RgfxBarrierSlot {
 	const uint64_t next = std::max<uint64_t>(bytes, was - was / 8);
 	_messageReserve.store(static_cast<uint32_t>(std::min<uint64_t>(next, UINT32_MAX)),
 	                      std::memory_order_relaxed);
+}
+
+// The takes come in the ring's order, one at a time; a delivery lets one go only after its
+// retire, so a take that finds none pending finds every earlier buffer's copies written back.
+- (BOOL)rgfxRetiresAtTake:(BOOL)now
+{
+	if (now && _lateRetires.load(std::memory_order_acquire) == 0)
+		return YES;
+	_lateRetires.fetch_add(1, std::memory_order_acq_rel);
+	return NO;
+}
+
+- (void)rgfxRetiredLate
+{
+	_lateRetires.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 // Takes one of the queue's slots, blocking while every one is held, as Metal's -commandBuffer
@@ -1205,6 +1230,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// it has none: its completion retires them there, so a CPU lock of one of the surfaces waits
 	// until then (RgfxIOSurface.h, rgfxIOSurfaceWritesPosted).
 	RgfxRegion *_surfaceWritesRegion;
+	// Whether every surface it writes is in place, and whether its writes are named to the kext
+	// yet: at its completion's take, a buffer of both retires its writes there (rgfxHostDone:).
+	bool _writesInPlace;
+	std::atomic<bool> _writesNamed;
 	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
@@ -1467,6 +1496,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// completion, which may come before the naming: the kext then keeps nothing of them.
 	RgfxRegion *writesRegion = rgfxIOSurfaceWritesRegion(_surfaceWrites);
 	_surfaceWritesRegion = writesRegion;
+	_writesInPlace = writesRegion != nullptr && rgfxIOSurfaceWritesInPlace(_surfaceWrites);
 	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
 	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
 	// Committed before the host can see it, so a completion never finds an older status.
@@ -1589,8 +1619,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		rgfxIOSurfaceNoteRead(read, queue, queue.rgfxObjId, _seqno);
 	// A CPU lock of a surface it writes waits for it from here, before the commit returns, as
 	// Metal's does once the buffer is submitted.
-	if (posted && writesRegion != nullptr)
+	if (posted && writesRegion != nullptr) {
 		rgfxIOSurfaceWritesPosted(writesRegion, written, queue.rgfxObjId, _seqno);
+		_writesNamed.store(true, std::memory_order_release);
+	}
 	if (!posted)
 		_surfaceWritesRegion = nullptr;
 	// The CPU's part ends here, posted or not; the completion may already have come.
@@ -1668,9 +1700,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 
 // What the host is done with at the buffer's completion, on the thread that took it off the
 // ring, before its record goes to the queue's completion queue: it is submitted where it was
-// not yet (its CB_COMPLETE stands for both); the queue's slot goes back, so a handler that makes
-// the next buffer never waits for handlers behind it; its message's block and its inline bytes'
-// chunks go back, whether some found none noted for its status; and its times are taken.
+// not yet (its CB_COMPLETE stands for both); its writes of surfaces all in place retire; the
+// queue's slot goes back, so a handler that makes the next buffer never waits for handlers
+// behind it; its message's block and its inline bytes' chunks go back, whether some found none
+// noted for its status; and its times are taken.
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg
 {
 	[self rgfxReachSubmitted];
@@ -1682,6 +1715,18 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	if (_bodyPool != nullptr) {
 		_bodyPool->giveBack(_body);
 		_bodyPool = nullptr;
+	}
+	// A buffer that writes only surfaces in place has its results in their pages now that the
+	// device has completed it: its writes retire here, so a CPU lock waiting for them goes on
+	// at once, not behind the queue's earlier handlers. One with a copy to write back, behind
+	// one, or not yet named (its post's naming still to come) retires at its delivery. The
+	// record's seqno is the buffer's: _seqno is written after the post, which the host may
+	// complete first.
+	if (_surfaceWritesRegion != nullptr &&
+	    [_queue rgfxRetiresAtTake:_writesInPlace &&
+	                              _writesNamed.load(std::memory_order_acquire)]) {
+		rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], msg->header.seqno);
+		_surfaceWritesRegion = nullptr;
 	}
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
@@ -1702,10 +1747,12 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
 	_surfaceReads.clear();
-	// Its results are in the surfaces' pages: the CPU locks waiting for them go on.
+	// Its results are in the surfaces' pages: the CPU locks waiting for them go on, where its
+	// writes did not retire at the take (rgfxHostDone:), which left it to retire here.
 	if (_surfaceWritesRegion != nullptr) {
 		rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], _seqno);
 		_surfaceWritesRegion = nullptr;
+		[_queue rgfxRetiredLate];
 	}
 	// So does the app memory it may have written under no-copy buffers.
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)

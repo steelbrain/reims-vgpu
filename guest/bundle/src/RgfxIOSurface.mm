@@ -1639,6 +1639,16 @@ uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef surface, const char *cause, std::strin
 	return it->second.first;
 }
 
+bool rgfxIOSurfaceWritesInPlace(const std::vector<std::shared_ptr<void>> &writes)
+{
+	for (const auto &w : writes) {
+		if (!static_cast<RgfxSurfaceShadow *>(w.get())->inPlace) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes)
 {
 	std::vector<RgfxSurfaceShadow *> done;

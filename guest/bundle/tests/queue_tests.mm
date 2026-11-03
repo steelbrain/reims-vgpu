@@ -7,6 +7,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 
 #include <atomic>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #import "RgfxCommandObjects.h"
+#import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxResource.h"
 
@@ -775,6 +777,178 @@ struct Blocks {
 	}
 };
 
+// The process's one chunk of resource ids, for the textures a test makes.
+bool oneIdChunk(void *context, uint64_t *first)
+{
+	int *calls = static_cast<int *>(context);
+	if ((*calls)++ != 0)
+		return false;
+	*first = 1 + 4 * RGFX_RESOURCE_ID_CHUNK;
+	return true;
+}
+
+// A buffer that writes only surfaces in place retires its writes as the completion thread takes
+// its completion, before its handlers, which run behind the queue's earlier ones: a CPU lock
+// waiting for its writes goes on there, as Metal's waits only for the GPU. Its delivery retires
+// nothing more. A buffer that writes a copy retires once its delivery has written the copy back,
+// and so does a later buffer of its queue that writes only surfaces in place, as the kext retires
+// a queue's writes up to a seqno: the copy's would otherwise retire before its write-back.
+void test_in_place_writes_retire_at_the_take()
+{
+	struct Source {
+		uint64_t inPlace = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		uint64_t copy = RGFX_ALLOCATIONS_OFFSET + 0x60000;
+		uint32_t inPlaceId = 0;
+		std::atomic<int> given{0};
+		std::mutex lock;
+		std::vector<uint64_t> retired; // the seqnos, in the calls' order
+		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t,
+		                                     uint32_t surfaceId, bool, uint64_t *offset,
+		                                     uint64_t *serial, bool *fresh, bool *cached)
+		{
+			Source *src = static_cast<Source *>(c);
+			if (surfaceId != src->inPlaceId)
+				return RgfxRegion::kPagesRefused;
+			src->given++;
+			*offset = src->inPlace;
+			*serial = 9;
+			*fresh = true;
+			*cached = false;
+			return RgfxRegion::kPagesGiven;
+		}
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			*offset = static_cast<Source *>(c)->copy;
+			*serial = 10;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+		static void writes(void *, uint64_t, uint64_t, const uint64_t *, uint32_t) {}
+		static void retire(void *c, uint64_t, uint64_t seqno)
+		{
+			Source *src = static_cast<Source *>(c);
+			std::lock_guard<std::mutex> hold(src->lock);
+			src->retired.push_back(seqno);
+		}
+		std::vector<uint64_t> seen()
+		{
+			std::lock_guard<std::mutex> hold(lock);
+			return retired;
+		}
+	};
+	@autoreleasepool {
+		// Three slots: the test takes all three back once the completion thread has taken the
+		// three buffers it holds, which it gives back at each take, after the retire's choice.
+		Queue q(true, 3);
+		int &calls = *new int(0);
+		q.ids.setResourceIdSource(&oneIdChunk, &calls);
+		// Never freed, as the rings: the textures may outlive the test.
+		std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+		RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+		Source &src = *new Source();
+		region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+		region.setSurfacePagesSource(&Source::pages, 16, &src);
+		region.setSurfaceWriteSource(&Source::writes, &Source::retire, &src);
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef inPlace = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		IOSurfaceRef copied = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(inPlace != nullptr && copied != nullptr);
+		src.inPlaceId = IOSurfaceGetID(inPlace);
+		auto over = [&](IOSurfaceRef surface) {
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                                                       width:16
+			                                                      height:16
+			                                                   mipmapped:NO];
+			td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			return [RgfxIOSurfaceTexture textureWithDescriptor:td
+			                                        iosurface:surface
+			                                            plane:0
+			                                           region:&region
+			                                           device:nil
+			                                       serializer:&q.ser];
+		};
+		RgfxIOSurfaceTexture *tp = over(inPlace);
+		RgfxIOSurfaceTexture *tc = over(copied);
+		CHECK(tp != nil && tc != nil && src.given == 1);
+		auto draw = [&](id<MTLTexture> t) {
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = t;
+			rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+			return cb;
+		};
+		// A buffer whose completed handler holds the queue's later records back until let go.
+		dispatch_semaphore_t held = dispatch_semaphore_create(0);
+		dispatch_semaphore_t letGo = dispatch_semaphore_create(0);
+		auto holding = [&]() {
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+				(void)c;
+				dispatch_semaphore_signal(held);
+				waitFor(letGo, 10);
+			}];
+			return cb;
+		};
+		auto retiredBecomes = [&](const std::vector<uint64_t> &want) {
+			for (int i = 0; i < 5000 && src.seen() != want; i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			return src.seen() == want;
+		};
+		Driven driven({&q});
+
+		// In place: retired at the take, while the handler before it holds its delivery.
+		id<MTLCommandBuffer> hold = holding();
+		[hold commit];
+		const uint64_t sh = nextSeqno(q);
+		id<MTLCommandBuffer> a = draw(tp);
+		[a commit];
+		const uint64_t sa = nextSeqno(q);
+		hostComplete(q, *driven.kext, sh, hold);
+		CHECK(waitFor(held, 5) == 0);
+		hostComplete(q, *driven.kext, sa, a);
+		CHECK(retiredBecomes({sa}));
+		CHECK(a.status != MTLCommandBufferStatusCompleted);
+		dispatch_semaphore_signal(letGo);
+		[a waitUntilCompleted];
+		CHECK(a.status == MTLCommandBufferStatusCompleted);
+		CHECK(src.seen() == std::vector<uint64_t>({sa}));
+
+		// A copy, then in place: neither retires until the copy's delivery, then both in order.
+		hold = holding();
+		[hold commit];
+		const uint64_t sh2 = nextSeqno(q);
+		id<MTLCommandBuffer> b = draw(tc);
+		[b commit];
+		const uint64_t sb = nextSeqno(q);
+		id<MTLCommandBuffer> c = draw(tp);
+		[c commit];
+		const uint64_t sc = nextSeqno(q);
+		hostComplete(q, *driven.kext, sh2, hold);
+		CHECK(waitFor(held, 5) == 0);
+		hostComplete(q, *driven.kext, sb, b);
+		hostComplete(q, *driven.kext, sc, c);
+		// All three taken: their slots are back.
+		NSMutableArray<id<MTLCommandBuffer>> *spare = [NSMutableArray array];
+		for (int i = 0; i < 3; i++)
+			[spare addObject:[q.queue commandBuffer]];
+		CHECK(src.seen() == std::vector<uint64_t>({sa}));
+		dispatch_semaphore_signal(letGo);
+		[c waitUntilCompleted];
+		CHECK(src.seen() == std::vector<uint64_t>({sa, sb, sc}));
+		(void)spare;
+	}
+}
+
 // A command buffer let go with no completion gives back the region block its message lies in, as
 // its completion does: one encoded past what its queue's ring takes and never committed, and one
 // posted out of line on a queue whose completion ring nothing reads. Buffer after buffer reuse
@@ -885,4 +1059,5 @@ void rgfxQueueTests(const char *self)
 	test_submitted_waits_for_the_buffers_before();
 	test_enqueue_and_commit_are_once();
 	test_buffers_let_go_give_their_blocks_back();
+	test_in_place_writes_retire_at_the_take();
 }
