@@ -474,6 +474,30 @@ constexpr uint32_t kOk = 0, kUnsupported = 1, kUnsupportedFormat = 3, kBadArgume
 
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 
+// Deletes `context`: its session closed and out of the live ones, and no token naming it, so a
+// later context at its address is never taken for it.
+void deleteContext(Context *context)
+{
+	if (context && context->session) {
+		{
+			std::lock_guard<std::mutex> hold(g_sessionLock);
+			for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it)
+				if (*it == context) {
+					g_sessions.erase(it);
+					break;
+				}
+		}
+		{
+			std::lock_guard<std::mutex> hold(g_tokenLock);
+			for (Token &t : g_tokens)
+				if (t.context == context)
+					t.context = nullptr;
+		}
+		rgfx::video::closeSession(context->session);
+	}
+	delete context;
+}
+
 // The decode command of `c`, following a pipeline's head to it; null where there is none.
 const Command *decodeCommand(const Command *c)
 {
@@ -665,9 +689,10 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			if (codec != 0) {
 				context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
 				if (!context->session) {
+					// The contexts made before it go with their sessions, which leave the
+					// live ones.
 					for (uint32_t j = 0; j < i; j++) {
-						Context *made = (Context *)ci->info->contexts[j];
-						delete made;
+						deleteContext((Context *)ci->info->contexts[j]);
 						ci->info->contexts[j] = nullptr;
 					}
 					delete context;
@@ -685,29 +710,8 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		const ContextDelete *cd = (const ContextDelete *)a1;
 		if (!cd)
 			return kBadArgument;
-		for (uint32_t i = 0; i < cd->count; i++) {
-			Context *context = (Context *)cd->contexts[i];
-			if (context && context->session) {
-				{
-					std::lock_guard<std::mutex> hold(g_sessionLock);
-					for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it)
-						if (*it == context) {
-							g_sessions.erase(it);
-							break;
-						}
-				}
-				// No token names it any more, so a later context at its address is never
-				// taken for it.
-				{
-					std::lock_guard<std::mutex> hold(g_tokenLock);
-					for (Token &t : g_tokens)
-						if (t.context == context)
-							t.context = nullptr;
-				}
-				rgfx::video::closeSession(context->session);
-			}
-			delete context;
-		}
+		for (uint32_t i = 0; i < cd->count; i++)
+			deleteContext((Context *)cd->contexts[i]);
 		return kOk;
 	}
 	case 4: { // GetBitstreamBufferInfo
