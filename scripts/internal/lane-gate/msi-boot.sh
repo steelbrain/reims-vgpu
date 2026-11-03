@@ -68,7 +68,20 @@ for o in json.load(sys.stdin).get("outputs", []):
     print(o.get("name") + "=" + (v if o.get("enabled") else "off"))' 2> /dev/null | tr '\n' ' ')
     [[ -n $outs ]] && break
   done
-  kv "$1" "lid=${lid:-none} ${outs:-outputs=unread}"
+  local reaper
+  reaper=$(XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus \
+    timeout 5 systemctl --user is-active kwin-reaper 2> /dev/null)
+  kv "$1" "lid=${lid:-none} ${outs:-outputs=unread} reaper=${reaper:-unknown}"
+}
+# The kwin reaper's lines (rgk-run's kwin-reaper.sh: kwin's held windows freed while no output is
+# on, with kwin's dma-buf bytes and the GPU's memory before and after) from this script's start to
+# now, into kwin-reaper.txt.
+reaper_lines() {
+  local a
+  a=$(date -d "@$START" '+%m-%d %H:%M:%S')
+  awk -v a="$a" -v b="$(date '+%m-%d %H:%M:%S')" '{ t = $1 " " $2 } t >= a && t <= b' \
+    "$RGK_RUN/kwin-reaper.log" > "$R/kwin-reaper.txt" 2> /dev/null
+  kv reaper_lines "$(grep -c . "$R/kwin-reaper.txt" 2> /dev/null || echo 0)"
 }
 : > "$R/boot.log"
 : > "$R/host.txt"
@@ -509,6 +522,7 @@ kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
 stop_load
 stop_clocks
 display_state display_end
+reaper_lines
 
 # The kext's and bundle's texture-create stalls over the boot ("its previous block is cached still,
 # its release unanswered: it is not cached", about 2 s each): kext-stalls.txt "HOST_EPOCH

@@ -481,7 +481,12 @@ class Run:
         # the end (kwin's state may move the numbers).
         if "display_start" in kv:
             end = kv.get("display_end", "not read")
-            self.litem("host.display", "PASS", kv["display_start"] + ("" if end == kv["display_start"] else f"; at the end {end}"))
+            reaped = [l for l in read(os.path.join(r, "kwin-reaper.txt")).splitlines() if l.strip()]
+            mem = re.findall(r"after: .*?memory\.used=(\d+) MiB", "\n".join(reaped))
+            self.litem("host.display", "PASS", kv["display_start"] + ("" if end == kv["display_start"] else f"; at the end {end}")
+                       + (f"; the kwin reaper logged {len(reaped)} lines in the boot's span"
+                          + (f", the GPU's memory after its last reload {mem[-1]} MiB" if mem else "")
+                          if "reaper_lines" in kv else ""))
         # The texture-create stalls the guest logged ("its previous block is cached still"), about
         # 2 s each: one in the 60 s after the desktop came up fails the boot.
         if kv.get("block_stalls") == "unread":
