@@ -10,7 +10,10 @@
 //     -R ROUNDS the make-and-free rounds of mem.cycle (default 20).
 //     -l        lists the devices and exits.
 //     CASE      runs only the cases whose name holds one of these; with none, every case but
-//               region.fill, which takes most of a lane's region from every other process.
+//               region.fill, which takes most of a lane's region from every other process, and,
+//               on x86-64, heap.shared.16m, where Metal asserts at a Shared heap (measured on the
+//               AMD Radeon Pro 5300M and the Intel UHD 630 under macOS 26.7.1). -CASE skips the
+//               cases whose name holds CASE.
 // The cases (sizes in bytes: 4k = 4096, 1m = 2^20):
 //   buf.MODE.SIZE         newBufferWithLength:options: and its release, MODE private, shared or
 //               managed: make_us, free_us, pairs_s (make and free a second), and use_us, a make
@@ -168,12 +171,17 @@ static void finish(id<MTLCommandBuffer> cb)
 
 static BOOL wanted(NSString *name, BOOL byDefault)
 {
-	if (gPatterns.count == 0)
-		return byDefault;
-	for (NSString *p in gPatterns)
-		if ([name containsString:p])
-			return YES;
-	return NO;
+	BOOL any = NO, picked = NO;
+	for (NSString *p in gPatterns) {
+		if ([p hasPrefix:@"-"]) {
+			if ([name containsString:[p substringFromIndex:1]])
+				return NO;
+			continue;
+		}
+		any = YES;
+		picked = picked || [name containsString:p];
+	}
+	return any ? picked : byDefault;
 }
 
 static void runCase(NSString *name, BOOL byDefault, NSString * (^body)(void))
@@ -1458,7 +1466,12 @@ int main(int argc, char **argv)
 
 		runCase(@"heap.private.16m", YES, ^{ return heapCase(MTLStorageModePrivate, 16u << 20); });
 		runCase(@"heap.private.256m", YES, ^{ return heapCase(MTLStorageModePrivate, 256u << 20); });
-		runCase(@"heap.shared.16m", YES, ^{ return heapCase(MTLStorageModeShared, 16u << 20); });
+#if defined(__x86_64__)
+		const BOOL sharedHeaps = NO;
+#else
+		const BOOL sharedHeaps = YES;
+#endif
+		runCase(@"heap.shared.16m", sharedHeaps, ^{ return heapCase(MTLStorageModeShared, 16u << 20); });
 		runCase(@"heap.place.buf.64k", YES, ^{ return heapPlace(NO); });
 		runCase(@"heap.place.tex.1024", YES, ^{ return heapPlace(YES); });
 		runCase(@"heap.query", YES, ^{ return heapQuery(); });
