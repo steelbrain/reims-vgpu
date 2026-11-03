@@ -938,6 +938,11 @@ bool ReimsGraphics::start(IOService *provider)
 		    readRegister(RGFX_REG_DRIVER_FEATURES_LO);
 		IOLog("ReimsGraphics: features offered 0x%llx, taken 0x%llx of 0x%llx\n", offered, took,
 		      wanted);
+		// The same three words on the registry, where the guest's tools read them at any time:
+		// the kernel's message buffer has let go of the line by the time a login runs.
+		setProperty("RgfxFeaturesOffered", offered, 64);
+		setProperty("RgfxFeaturesWanted", wanted, 64);
+		setProperty("RgfxFeaturesTaken", took, 64);
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);

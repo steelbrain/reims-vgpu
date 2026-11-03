@@ -630,7 +630,10 @@ only where no negotiation can carry it.
   The framebuffer kext writes `DRIVER_FEATURES_LO` and `_HI` after `STATUS` 0
   and before `STATUS` 1, in `ReimsGraphics::start`, with the bits it and its
   bundle carry out, masked by the offer (`RgfxFeatures.hpp`). It reads back the
-  bits the host took: those written that the host offers and knows.
+  bits the host took: those written that the host offers and knows. It logs
+  the three words, and sets them on its service as `RgfxFeaturesOffered`,
+  `RgfxFeaturesWanted` and `RgfxFeaturesTaken`, which `ioreg` reads at any
+  time after the kernel's message buffer has let go of the line.
 - The host ignores a write while `STATUS` is 1, and a reset (the guest's
   `STATUS` 0 or the host's) clears the set. A guest that never writes it (the
   option ROM, a kext built before the registers) gets the wire as it was, and
