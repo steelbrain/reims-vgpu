@@ -459,6 +459,21 @@ pub enum DecodeError {
 /// How many `SURFACE_PAGES` pass between the logs of what the surface views did.
 const VIEWS_LOGGED_EVERY: u64 = 256;
 
+/// What a present of an IOSurface shows ([`GraphicsDecoder::surface_present`]).
+pub(crate) struct SurfacePresent<P: Platform> {
+    /// The latest texture a guest process made over the surface's plane 0 with
+    /// `TEXTURE_FROM_IOSURFACE` and has not destroyed.
+    pub(crate) texture: P::Texture,
+    /// The region block it lies in (its buffer's): its offset and size.
+    pub(crate) span: Option<(u64, u64)>,
+    /// The command buffers committed that write the texture's copy, which the present waits for:
+    /// the slots of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming
+    /// another, or none, has nothing to wait for).
+    pub(crate) writers: Vec<RgfxSurfaceWriter>,
+    /// The context that made the texture.
+    pub(crate) owner: u32,
+}
+
 /// The context an object id lies in.
 fn context_of(obj_id: u64) -> u32 {
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
@@ -1321,15 +1336,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn surface_texture(&self, iosurface_id: u32) -> Option<P::Texture> {
         self.surface_present(iosurface_id)
-            .map(|(texture, _, _)| texture)
+            .map(|present| present.texture)
     }
 
-    /// What a present of IOSurface `iosurface_id` shows: the latest texture a guest process made
-    /// over its plane 0 with `TEXTURE_FROM_IOSURFACE` and has not destroyed, and the command
-    /// buffers committed that write that texture's copy, which the present waits for: the slots
-    /// of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming another,
-    /// or none, has nothing to wait for); and the context that made the texture. The caller holds
-    /// its own reference to the texture: a destroy of it after this leaves it drawable.
     /// The textures IOSurface `iosurface_id` is named by, oldest first: those over its plane 0,
     /// the newest of which a present of it shows ([`Self::surface_present`]).
     pub(crate) fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {
@@ -1338,19 +1347,18 @@ impl<P: Platform> GraphicsDecoder<P> {
             .unwrap_or_default()
     }
 
-    pub(crate) fn surface_present(
-        &self,
-        iosurface_id: u32,
-    ) -> Option<(P::Texture, Vec<RgfxSurfaceWriter>, u32)> {
+    /// What a present of IOSurface `iosurface_id` shows ([`SurfacePresent`]). The caller holds its
+    /// own reference to the texture: a destroy of it after this leaves it drawable.
+    pub(crate) fn surface_present(&self, iosurface_id: u32) -> Option<SurfacePresent<P>> {
         let (obj_id, writers_at) = {
             let names = self.shared.surfaces.lock();
             let obj_id = *names.by_surface.get(&iosurface_id)?.last()?;
             (obj_id, names.writers.get(&obj_id).copied())
         };
-        let texture = self
+        let (texture, span) = self
             .context_state(context_of(obj_id))?
             .with_live(obj_id, |e| match &e.handle {
-                ObjHandle::Texture(texture) => Some(texture.clone_ref()),
+                ObjHandle::Texture(texture) => Some((texture.clone_ref(), e.span)),
                 _ => None,
             })
             .flatten()?;
@@ -1371,8 +1379,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .collect()
             })
             .unwrap_or_default();
-        let owner = context_of(obj_id);
-        Some((texture, writers, owner))
+        Some(SurfacePresent {
+            texture,
+            span,
+            writers,
+            owner: context_of(obj_id),
+        })
     }
 
     /// Forgets texture `obj_id` as a name of the surfaces it lies over.

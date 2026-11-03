@@ -285,7 +285,8 @@ pub trait Host: Send + Sync + 'static {
     /// thread: [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block, else
     /// [`RGFX_STATUS_OK`] once every command buffer of the context it had committed has finished,
     /// and, of a shared block, every one each earlier holder had committed before its
-    /// `BLOCK_UNSHARE` ([`Host::block_unshared`]). The kext gives the block out again only on OK,
+    /// `BLOCK_UNSHARE` ([`Host::block_unshared`]), and once the host's display no longer reads
+    /// a surface's texture over the block. The kext gives the block out again only on OK,
     /// and the memory of a surface's block in place back to the guest's system. Called on the
     /// context's lane, in ring order, after the lanes of the other contexts that held the block
     /// have carried out what they were handed before it.

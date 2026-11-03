@@ -4229,7 +4229,7 @@ fn shown_width(device: &GraphicsDevice<FakePlatform>) -> Option<u64> {
         .texture
         .lock()
         .as_ref()
-        .map(|t| t.width())
+        .map(|t| t.texture.width())
 }
 
 /// Context 1 with a queue (its rings at `SUBMIT` and `COMPLETE`), resource-id chunk 0, and a
@@ -4302,6 +4302,116 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
         RGFX_STATUS_OK
     );
     assert_eq!(device.control.pool.favoured(), None);
+}
+
+/// A presented surface's block is given back only once the display is done with it, as a
+/// compositor holds the IOSurface it shows: its release, after the texture's and its buffer's
+/// destroys, waits while the display shows the texture, and then while a window draw of it (a
+/// new layout, the cursor) is on the GPU; once the release is answered, no draw reads the block
+#[test]
+fn a_presented_surface_s_block_waits_for_the_display() {
+    use reims_vgpu_core::platform::command::CommandBuffer as _;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    let draw = sink::ScanoutDraw::new(
+        Arc::clone(&platform),
+        &device.control.region,
+        &Arc::new(Shown::default()),
+        &device.control.presented,
+    )
+    .unwrap();
+    // With no window, the present is answered as it is shown.
+    let status = answered(&device, &mut guest, present_surface(0x77));
+    assert_eq!(status, RGFX_STATUS_OK);
+    let (drawable, _) = device.control.presented.shown().expect("the surface shown");
+    let rect = reims_vgpu_window::PixelRect {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    };
+    let (command_buffer, presents) = draw.encode(&drawable, rect).expect("a draw of it");
+    presents.after(&command_buffer);
+    no_catch(command_buffer.commit(OnFault::Die));
+    let drawing = committed(&platform, 1)[0];
+
+    guest.send(&device, object_destroy(obj(1, 3)));
+    guest.send(&device, object_destroy(obj(1, 2)));
+    guest.send(&device, block_release(1, BLOCK, 0x1_0000));
+    let release = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "the release was answered while the display shows the surface"
+    );
+
+    // The scanout is presented: the display lets go of the surface, its draw still on the GPU.
+    guest.send(&device, present_surface(0));
+    let scanout = guest.seqno;
+    assert_eq!(answer_of(&mut guest, scanout), RGFX_STATUS_OK);
+    assert!(
+        quiet(&guest),
+        "the release was answered while a window draw reads the surface"
+    );
+    // A draw from here reads nothing of the block: the guest set no scanout either.
+    assert!(device.control.presented.shown().is_none());
+    assert!(draw.encode(&drawable, rect).is_none());
+
+    let world = platform.world();
+    assert!(world.complete(
+        drawing,
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    assert_eq!(answer_of(&mut guest, release), RGFX_STATUS_OK);
+}
+
+/// A present waiting for the command buffer that writes its surface holds the surface's block
+/// from the present on: a release of the block that comes before the present is shown waits for
+/// it to be shown, then for the display to show something else
+#[test]
+fn a_waiting_present_holds_its_surface_s_block() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    ring.publish(command_buffer_at(obj(1, 1), 100, 4));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 4)]);
+    guest.send(&device, present_surface(0x77));
+    let present = guest.seqno;
+    presents_waiting(&device, 1);
+
+    guest.send(&device, object_destroy(obj(1, 3)));
+    guest.send(&device, object_destroy(obj(1, 2)));
+    guest.send(&device, block_release(1, BLOCK, 0x1_0000));
+    let release = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "the release was answered while a present of the surface waits"
+    );
+
+    // The writer finishes: the surface shows, and the present is answered; the release waits.
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT as u32);
+    let ids = committed(&platform, 1);
+    let world = platform.world();
+    assert!(world.complete(
+        ids[0],
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    ring.event().expect("the writer's CB_COMPLETE");
+    assert_eq!(answer_of(&mut guest, present), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    assert!(
+        quiet(&guest),
+        "the release was answered while the display shows the surface"
+    );
+
+    guest.send(&device, present_surface(0));
+    let scanout = guest.seqno;
+    assert_eq!(answer_of(&mut guest, scanout), RGFX_STATUS_OK);
+    assert_eq!(answer_of(&mut guest, release), RGFX_STATUS_OK);
 }
 
 /// Presents are shown in the order made: one with nothing to wait for, made after one that waits,

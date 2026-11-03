@@ -548,10 +548,12 @@ pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 /// [`RGFX_STATUS_REFUSED`] at once where an object it holds, or a live queue's ring, still lies in
 /// the block; otherwise it answers OK once every command buffer of the context it had committed
 /// has finished, and, of a shared block, every one each earlier holder had committed before its
-/// [`RGFX_CMD_BLOCK_UNSHARE`]. Posted after every message the process posted before its free, and
-/// nothing the process posts after it can name the block. A block over an IOSurface's pages with
-/// a device cache has the cache copied into the pages first, where a command buffer wrote it since
-/// the last copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
+/// [`RGFX_CMD_BLOCK_UNSHARE`], once the host's display no longer shows or draws an IOSurface's
+/// texture over the block, as a compositor holds the surface it shows: until the display pipe's
+/// next present. Posted after every message the process posted before its free, and nothing the
+/// process posts after it can name the block. A block over an IOSurface's pages with a device
+/// cache has the cache copied into the pages first, where a command buffer wrote it since the last
+/// copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
 pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
 /// `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
 /// `context` the region block of `size` bytes at `offset`. Posted before the process learns of the

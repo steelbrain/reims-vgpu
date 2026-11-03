@@ -26,6 +26,14 @@
 //! the presents' lane that carries the present out (`reims-graphics`' device) waits for nothing on
 //! the GPU.
 //!
+//! **What a present holds.** A present holds its surface's region block from its taking
+//! ([`DisplayHold`]): while it waits, while the display shows it (until the next present, or the
+//! device's reset), and in each window draw of it until the draw has finished on the GPU, which
+//! may come after the next present. A `BLOCK_RELEASE` of the block is answered only once no hold
+//! of it is left, so the window never reads a block the kext has given out again, nor a surface's
+//! pages its system has; the holds a present's show lets go of are let go of past the queue's
+//! lock, so a release answered there holds up no present.
+//!
 //! [`PresentAnswers`]: when a shown present is answered. The guest's display pipe completes a
 //! transaction on its answer, and holds at most two unanswered (the kext's `RgfxDisplayPipe`),
 //! so the answer says the frame is on the display, as a display's flip completes at the vblank
@@ -58,8 +66,8 @@ use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
-use super::Presented;
 use super::decode::FillWait;
+use super::{DisplayHold, Presented, ShownTexture};
 
 /// The presents waiting for their surfaces' writers, and how far each queue has finished.
 pub(crate) struct PresentQueue<P: Platform> {
@@ -85,8 +93,8 @@ struct State<P: Platform> {
 struct Waiting<P: Platform> {
     /// The IOSurface's id; 0 for the scanout.
     id: u32,
-    /// The texture over it; `None` for the scanout.
-    texture: Option<P::Texture>,
+    /// The texture over it, its block held; `None` for the scanout.
+    texture: Option<ShownTexture<P>>,
     /// The present's answer, owed once it is shown.
     answer: PresentAnswer,
     /// The command buffers it waits for.
@@ -121,7 +129,7 @@ impl<P: Platform> PresentQueue<P> {
     pub(crate) fn present(
         &self,
         id: u32,
-        texture: Option<P::Texture>,
+        texture: Option<ShownTexture<P>>,
         answer: PresentAnswer,
         writers: Vec<RgfxSurfaceWriter>,
         fill: Option<FillWait>,
@@ -135,7 +143,9 @@ impl<P: Platform> PresentQueue<P> {
             writers,
             fill,
         });
-        self.show_ready(&mut state);
+        let gone = self.show_ready(&mut state);
+        drop(state);
+        drop(gone);
     }
 
     /// A fill of a device cache finished: the presents at the front waiting for nothing more are
@@ -143,7 +153,9 @@ impl<P: Platform> PresentQueue<P> {
     pub(crate) fn filled(&self) {
         let mut state = self.state.lock();
         if !state.waiting.is_empty() {
-            self.show_ready(&mut state);
+            let gone = self.show_ready(&mut state);
+            drop(state);
+            drop(gone);
         }
     }
 
@@ -160,7 +172,9 @@ impl<P: Platform> PresentQueue<P> {
         let done = state.finished.entry(queue).or_insert(0);
         *done = (*done).max(seqno);
         if !state.waiting.is_empty() {
-            self.show_ready(&mut state);
+            let gone = self.show_ready(&mut state);
+            drop(state);
+            drop(gone);
         }
     }
 
@@ -237,11 +251,17 @@ impl<P: Platform> PresentQueue<P> {
         for waiting in &mut state.waiting {
             waiting.writers.retain(|w| !gone(w.queue_obj_id));
         }
-        self.show_ready(&mut state);
+        let let_go = self.show_ready(&mut state);
+        drop(state);
+        drop(let_go);
     }
 
-    /// Shows the presents at the front whose writers have finished, oldest first.
-    fn show_ready(&self, state: &mut State<P>) {
+    /// Shows the presents at the front whose writers have finished, oldest first. The holds of
+    /// the textures they replace are returned, for the caller to let go of once it has let go of
+    /// the state: a release waiting for one is answered there, off the present's path.
+    #[must_use]
+    fn show_ready(&self, state: &mut State<P>) -> Vec<Arc<DisplayHold>> {
+        let mut gone = Vec::new();
         loop {
             let ready = state.waiting.front().is_some_and(|front| {
                 front.fill.as_ref().is_none_or(FillWait::done)
@@ -253,12 +273,12 @@ impl<P: Platform> PresentQueue<P> {
                     })
             });
             if !ready {
-                return;
+                return gone;
             }
             let Some(shown) = state.waiting.pop_front() else {
-                return;
+                return gone;
             };
-            self.presented.show(shown.id, shown.texture, shown.answer);
+            gone.extend(self.presented.show(shown.id, shown.texture, shown.answer));
         }
     }
 

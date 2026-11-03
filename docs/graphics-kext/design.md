@@ -1366,15 +1366,18 @@ refuses one where a live queue's ring lies in the block. Otherwise it answers
 OK once every command buffer the context committed before the release has run
 its completion handler, and, for a shared block, every one each earlier holder
 committed before its `BLOCK_UNSHARE`: the kext unwired that holder's pages at
-its unshare, and gives the surface's memory back at the answer. Command buffers
-committed later do not hold it up. On OK the block goes back to the pool; on a
-refusal it stays out of use until its process's close posts its release again.
-A release not answered in 10 s is logged and stays in flight: the host may
-still run a buffer over the block or copy a cached surface's GPU copy into the
-surface's pages, so the block, its wired pages, and a cached surface with its
-wire are held, never handed back to macOS, until the answer comes. A block a
-create in flight names is pinned from the kext's check until the create is
-answered, and a free of it
+its unshare, and gives the surface's memory back at the answer. It also waits
+while the host's display holds a surface's texture over the block, as a
+compositor holds the IOSurface it shows: from the surface's present until the
+display pipe's next present (or the device's reset), and each window draw of
+it until the draw has finished. Command buffers committed later do not hold it
+up. On OK the block goes back to the pool; on a refusal it stays out of use
+until its process's close posts its release again. A release not answered in
+10 s is logged and stays in flight: the host may still run a buffer over the
+block or copy a cached surface's GPU copy into the surface's pages, so the
+block, its wired pages, and a cached surface with its wire are held, never
+handed back to macOS, until the answer comes. A block a create in flight names
+is pinned from the kext's check until the create is answered, and a free of it
 meanwhile fails busy, so no block changes hands between the check and the
 host's carrying out of the message. A context's close is answered under the
 same rule, after its objects are dropped and its queues' threads are past

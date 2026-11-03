@@ -26,7 +26,7 @@
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
@@ -56,12 +56,12 @@ use reims_graphics::{
 };
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::Texture;
 use reims_vgpu_core::platform::values::TextureDesc;
+use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
@@ -76,9 +76,10 @@ use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::worker::{Unsettled, Worker};
 use crate::graphics::decode::{
-    Begun, CompletionSink, DecodeError, Decoders, FailedContexts, GraphicsDecoder, LibraryJob,
-    LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, Sinks,
-    SubmittedSink, compile_refusing, complete, make_library, refused_reply, refusing,
+    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, FailedContexts, GraphicsDecoder,
+    LibraryJob, LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink,
+    Sinks, SubmittedSink, SurfacePresent, compile_refusing, complete, make_library, refused_reply,
+    refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
@@ -444,14 +445,48 @@ struct GraphicsControl<P: ApiPlatform> {
     reset_gate: Arc<RwLock<()>>,
 }
 
+/// The display's hold of the region block a surface's texture lies over, as a compositor holds
+/// the IOSurface it shows: made as the present is taken ([`Presented::hold`]), and held by the
+/// present until it is shown, by the display while it shows the texture, and by each window draw
+/// of it until the draw has finished on the GPU, so the block's memory stays while any of them
+/// may read it. A `BLOCK_RELEASE` of a block that meets the span is answered only once every hold
+/// of it has gone ([`Presented::after_shown`]).
+pub(crate) struct DisplayHold {
+    /// The block the texture lies in, its offset and size; `None` for one in none.
+    span: Option<(u64, u64)>,
+    /// Given when the hold goes.
+    answers: Mutex<Vec<DrainAnswer>>,
+}
+
+impl Drop for DisplayHold {
+    fn drop(&mut self) {
+        for answer in self.answers.get_mut().drain(..) {
+            answer();
+        }
+    }
+}
+
+/// A texture over a surface a present shows, with the display's hold of its block.
+pub(crate) struct ShownTexture<P: Platform> {
+    /// The texture.
+    pub(crate) texture: P::Texture,
+    /// The hold of the block it lies in.
+    hold: Arc<DisplayHold>,
+}
+
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
 /// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
 /// the presents' answers, given at the first refresh of the device's display after that draw has
-/// finished ([`PresentAnswers`]). The window draws a present when it is made, never on its own:
-/// each present is the guest's own, and none is batched or repeated by the GPU's work.
+/// finished ([`PresentAnswers`]). The window draws a present when it is made, and again where the
+/// window needs a frame (a new layout, the cursor): each present is the guest's own, and none is
+/// batched or repeated by the GPU's work. The texture's block is held until the next present, the
+/// device's reset or the device's end, and each draw of it until it has finished
+/// ([`DisplayHold`]).
 pub(crate) struct Presented<P: Platform> {
     /// The texture shown; `None` shows the scanout.
-    pub(crate) texture: Mutex<Option<P::Texture>>,
+    pub(crate) texture: Mutex<Option<ShownTexture<P>>>,
+    /// The holds made and not yet gone, for a release to find those of its block.
+    holds: Mutex<Vec<Weak<DisplayHold>>>,
     /// The surface's IOSurface ID, 0 for none.
     surface_id: AtomicU32,
     /// The window, once it has opened.
@@ -468,6 +503,7 @@ impl<P: Platform> Default for Presented<P> {
     fn default() -> Self {
         Presented {
             texture: Mutex::new(None),
+            holds: Mutex::default(),
             surface_id: AtomicU32::new(0),
             window: OnceLock::new(),
             refused: AtomicBool::new(false),
@@ -478,10 +514,63 @@ impl<P: Platform> Default for Presented<P> {
 }
 
 impl<P: Platform> Presented<P> {
+    /// `texture`, over a surface whose present was taken, held for the display from now: the
+    /// block at `span` it lies in is not given back until the display is done with it
+    /// ([`DisplayHold`]).
+    fn hold(&self, texture: P::Texture, span: Option<(u64, u64)>) -> ShownTexture<P> {
+        let hold = Arc::new(DisplayHold {
+            span,
+            answers: Mutex::default(),
+        });
+        if span.is_some() {
+            let mut holds = self.holds.lock();
+            holds.retain(|h| h.strong_count() > 0);
+            holds.push(Arc::downgrade(&hold));
+        }
+        ShownTexture { texture, hold }
+    }
+
+    /// `answer`, the answer to the release of the `size` bytes at region offset `offset`, given
+    /// once every hold of a block that meets them has gone too ([`DisplayHold`]): `answer` itself
+    /// where the display holds none.
+    fn after_shown(&self, offset: u64, size: u64, answer: DrainAnswer) -> DrainAnswer {
+        let end = offset.saturating_add(size);
+        // Taken out of the list first: a hold whose other holders go meanwhile gives its answers
+        // where it is let go of here, with no lock held.
+        let live: Vec<Arc<DisplayHold>> =
+            self.holds.lock().iter().filter_map(Weak::upgrade).collect();
+        let held: Vec<&Arc<DisplayHold>> = (live.iter())
+            .filter(|h| {
+                h.span
+                    .is_some_and(|(at, len)| at < end && offset < at.saturating_add(len))
+            })
+            .collect();
+        if held.is_empty() {
+            return answer;
+        }
+        let join = Arc::new(DisplayHold {
+            span: None,
+            answers: Mutex::new(vec![answer]),
+        });
+        for hold in held {
+            let join = Arc::clone(&join);
+            hold.answers.lock().push(Box::new(move || drop(join)));
+        }
+        drop(live);
+        Box::new(move || drop(join))
+    }
+
     /// Shows `texture` (the surface `id`'s), or the scanout for `None`, and asks the window for a
     /// frame; `answer` is given at the vblank the display first shows it ([`PresentAnswers`]), or
-    /// at once without a window.
-    fn show(&self, id: u32, texture: Option<P::Texture>, answer: PresentAnswer) {
+    /// at once without a window. The hold of the texture shown before is returned, for the caller
+    /// to let go of with no lock held: a release waiting for it may be answered there.
+    #[must_use]
+    fn show(
+        &self,
+        id: u32,
+        texture: Option<ShownTexture<P>>,
+        answer: PresentAnswer,
+    ) -> Option<Arc<DisplayHold>> {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
         if previous != id {
             log::info!(
@@ -493,6 +582,7 @@ impl<P: Platform> Presented<P> {
         // refusal scope, so a release the platform dies at is refused, logged, and the present
         // goes on.
         let shown = std::mem::replace(&mut *self.texture.lock(), texture);
+        let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
         if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -507,6 +597,7 @@ impl<P: Platform> Presented<P> {
             }
             None => answer.answer(RGFX_STATUS_OK),
         }
+        hold
     }
 
     /// The device's reset: the display shows the scanout (none, after the reset) in place of any
@@ -515,6 +606,7 @@ impl<P: Platform> Presented<P> {
     fn reset(&self) {
         let previous = self.surface_id.swap(0, Ordering::AcqRel);
         let shown = self.texture.lock().take();
+        let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
         if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -522,6 +614,7 @@ impl<P: Platform> Presented<P> {
                  release was refused: {refusal}"
             );
         }
+        drop(hold);
         if let Some(window) = self.window.get() {
             window.new_frame();
         }
@@ -533,7 +626,14 @@ impl<P: Platform> Presented<P> {
         DrawnPresents {
             presented: Arc::clone(self),
             drawing: self.answers.drawn(),
+            hold: None,
         }
+    }
+
+    /// The texture shown, and the hold of its block, for a window draw of it; `None` for the
+    /// scanout.
+    pub(crate) fn shown(&self) -> Option<(P::Texture, Arc<DisplayHold>)> {
+        (self.texture.lock().as_ref()).map(|s| (Handle::clone_ref(&s.texture), Arc::clone(&s.hold)))
     }
 
     /// A refresh of the device's display: the presents it now shows are answered.
@@ -570,20 +670,29 @@ impl<P: Platform> Presented<P> {
 
 /// The presents a window's draw shows: answered at the refresh after the draw has finished on the
 /// GPU ([`DrawnPresents::after`]), or after the draw is dropped before its commit, once every
-/// present shown before them is ([`PresentAnswers::refreshed`]).
+/// present shown before them is ([`PresentAnswers::refreshed`]); and the hold of the block of the
+/// surface it draws, let go of then too.
 pub(crate) struct DrawnPresents<P: Platform> {
     /// Where they are answered.
     presented: Arc<Presented<P>>,
     /// The presents the draw took.
     drawing: Drawing,
+    /// The hold of the block of the surface the draw reads, where it reads one.
+    hold: Option<Arc<DisplayHold>>,
 }
 
 impl<P: Platform> DrawnPresents<P> {
-    /// The presents are answered after `command_buffer`, the draw, has finished: its completed
-    /// handler holds them. Called before its commit; where the handler is refused, or the buffer
-    /// is never committed, they are answered as if it had finished.
+    /// The draw reads the surface whose block `hold` holds: it holds it until it has finished.
+    pub(crate) fn reading(&mut self, hold: Arc<DisplayHold>) {
+        self.hold = Some(hold);
+    }
+
+    /// The presents are answered, and the surface's block let go of, after `command_buffer`, the
+    /// draw, has finished: its completed handler holds them. Called before its commit; where the
+    /// handler is refused, or the buffer is never committed, they are answered as if it had
+    /// finished.
     pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
-        if self.drawing.is_empty() {
+        if self.drawing.is_empty() && self.hold.is_none() {
             return;
         }
         no_catch(command_buffer.add_completed_handler(OnFault::Die, Box::new(move |_| drop(self))));
@@ -659,8 +768,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// `BLOCK_RELEASE` (`Host::block_released`): refused at once where an object the decoder
     /// holds lies in the block, else answered once every command buffer of the block's context
-    /// the decoder committed has finished, and every one an earlier holder's context committed
-    /// before its `BLOCK_UNSHARE` ([`Self::unshare_block`]).
+    /// the decoder committed has finished, every one an earlier holder's context committed
+    /// before its `BLOCK_UNSHARE` ([`Self::unshare_block`]), and once the display no longer shows
+    /// or draws a surface's texture over the block ([`DisplayHold`]).
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         // After the no-copy buffers being made over it, which keep it.
         self.pages_buffers.wait(release.offset);
@@ -676,10 +786,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
-        let answer = decoder.after_unshares(
+        let answer = self.presented.after_shown(
             release.offset,
+            release.size,
             Box::new(move || answer.answer(RGFX_STATUS_OK)),
         );
+        let answer = decoder.after_unshares(release.offset, answer);
         let drain = decoder.drain_context(release.context, false, answer);
         // No buffer lies over the block's surface view any more: it goes with the block, and its
         // device cache once the surface's pages hold what was written of it, which the answer
@@ -1488,12 +1600,20 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let found = decoder.surface_present(iosurface_id);
         drop(decoder);
         match found {
-            Some((texture, writers, owner)) => {
+            Some(SurfacePresent {
+                texture,
+                span,
+                writers,
+                owner,
+            }) => {
                 // The process that made the texture over the surface the display shows owns the
                 // scanout (WindowServer): its compiles go first.
                 self.pool.favour(owner);
+                // Its block is held from here, before the texture's destroy and the block's
+                // release can come: the present shows it later.
+                let shown = self.presented.hold(texture, span);
                 self.presents
-                    .present(iosurface_id, Some(texture), answer, writers, fill);
+                    .present(iosurface_id, Some(shown), answer, writers, fill);
             }
             None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
         }

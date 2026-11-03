@@ -228,14 +228,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
-        let presents = self.presented.drawn();
-        let surface = self
-            .presented
-            .texture
-            .lock()
-            .as_ref()
-            .map(Handle::clone_ref);
-        if let Some(surface) = surface {
+        let mut presents = self.presented.drawn();
+        if let Some((surface, hold)) = self.presented.shown() {
             let (from, to) = (surface.pixel_format(), texture.pixel_format());
             self.presented.seen_format(from, to);
             let drawn = if BGRA8_FORMATS.contains(&from) && BGRA8_FORMATS.contains(&to) {
@@ -244,6 +238,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 self.encode_converted(&surface, texture, region)
             };
             if let Some(drawn) = drawn {
+                // The surface's block stays until the draw has read it.
+                presents.reading(hold);
                 return Some((drawn, presents));
             }
             self.presented.refuse_format(from, to);
