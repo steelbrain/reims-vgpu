@@ -8,22 +8,33 @@
 //!   `suspended` about 10 s after its last work. An `nvidia-smi` query then took 992 ms, against
 //!   18 ms awake, and WindowServer's frame at each minute's turn, which follows a static screen,
 //!   waited 954 ms for the buffer it makes first. The same make took under 5 ms while the guest
-//!   drew. Awake and idle, at P8 with a 180 MHz graphics clock, the board drew 7.2 W (the median
-//!   of `nvidia-smi`'s `power.draw` each second for 56 s: a mean of 8.35 W, 7.55 W after the first
-//!   20 s). Suspended, the board is powered off, and `nvidia-smi` reads it only by resuming it.
+//!   drew. Kept awake, the minute's make took 0.34 to 0.48 ms.
+//! - **What it costs.** Awake and idle, at P8 with a 180 MHz graphics clock, the board drew 7.2 W
+//!   with no process on it (the median of `nvidia-smi`'s `power.draw` read each second for 56 s,
+//!   the reads keeping it awake: a mean of 8.35 W, 7.55 W after the first 20 s), and 9.25 W with a
+//!   guest booted, idle between two of WindowServer's minute frames, and kept awake by this
+//!   module (the median of the same reads each second for 50 s). Suspended, the board is powered
+//!   off, and `nvidia-smi` reads it only by resuming it.
 //! - **The guest's work.** Every command buffer the device commits counts
 //!   ([`Awake::touch`], from the commit). A window's present counts as the frame's command buffer
 //!   it follows, and so does a guest's.
 //! - **The keeping.** For [`AWAKE_FOR`] after the last of that work, the thread
-//!   `reims-vgpu.gpu-awake` looks every half [`period`]. At each look that finds no commit since
-//!   the look before, it submits one command buffer of a timestamp write (empty where the queue's
-//!   family writes no timestamps), so the GPU is never a whole period without work. Past
-//!   [`AWAKE_FOR`] it parks until the next commit, and the GPU suspends as the host's policy has
-//!   it: the first frame after a longer break pays the resume once.
-//! - **The period** is half the device's autosuspend delay, read where sysfs gives it for the
-//!   device's PCI address (`power/autosuspend_delay_ms`, `VK_EXT_pci_bus_info`'s address), else
-//!   half of [`ASSUMED_DELAY`]. The RTX 5080 Laptop GPU's file answers EIO, so its period is
-//!   2.5 s; amdgpu writes its delay there.
+//!   `reims-vgpu.gpu-awake` looks at the device's count of commits every [`look`]. At each look
+//!   that finds no commit since the look before, it submits one command buffer of a timestamp
+//!   write (empty where the queue's family writes no timestamps), so the GPU goes at most two
+//!   looks without work. Past [`AWAKE_FOR`] it parks until the next commit, and the GPU suspends
+//!   as the host's policy has it: the first frame after a longer break pays the resume once.
+//! - **How often it looks.** Every quarter of the device's autosuspend delay where sysfs gives
+//!   one for the device's PCI address (`power/autosuspend_delay_ms`, `VK_EXT_pci_bus_info`'s
+//!   address): the kernel's autosuspend counts from the driver's last sign of work, so half the
+//!   delay without work never reaches it. Elsewhere every [`UNREAD_LOOK`], which holds the RTX
+//!   5080 Laptop GPU: its file answers EIO, and its driver suspends it by an idle detection of its
+//!   own, which the submission's kind does not move and its spacing does. Measured with a test
+//!   program holding one device and 512 MiB of its memory, reading `runtime_status` every 100 ms:
+//!   one submission every 1 s or every 1.25 s, a timestamp write, an empty command buffer or a
+//!   4 KiB fill alike, and the GPU suspended every 42 to 47 s, each time for about 1.2 s until the
+//!   next submission resumed it (a guest's frame in that window waits for the resume); one every
+//!   500 ms, and it did not suspend in 400 s; every 250 ms, not in 60 s.
 //! - **On every GPU.** No driver or GPU kind is told apart: a GPU without runtime suspend, or
 //!   one that drives the host's display, gets one small command buffer per look while the guest
 //!   is idle, and none while it draws.
@@ -50,11 +61,13 @@ use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 /// How long after the guest's last GPU work the GPU is kept awake.
 pub(crate) const AWAKE_FOR: Duration = Duration::from_secs(5 * 60);
 
-/// The autosuspend delay assumed where sysfs gives none for the device.
-pub(crate) const ASSUMED_DELAY: Duration = Duration::from_secs(5);
+/// How often the thread looks where sysfs gives no autosuspend delay for the device: two looks,
+/// the longest the GPU goes without work, are the 500 ms spacing that held the RTX 5080 Laptop
+/// GPU awake (the module docs).
+pub(crate) const UNREAD_LOOK: Duration = Duration::from_millis(250);
 
-/// The shortest period, for a delay of a few milliseconds.
-const LEAST_PERIOD: Duration = Duration::from_millis(100);
+/// The shortest time between looks, for a delay of a few milliseconds.
+const LEAST_LOOK: Duration = Duration::from_millis(50);
 
 /// The log target of the thread's lines.
 const TARGET: &str = "reims_vgpu_vulkan::awake";
@@ -78,11 +91,11 @@ impl Awake {
     /// Starts `device`'s thread (the module docs), parked until the device's first commit.
     pub(crate) fn start(device: &rt::Device) -> Awake {
         let shared = Arc::new(Shared::default());
-        let period = period(delay_text(device).as_deref());
+        let look = look(delay_text(device).as_deref());
         let (device, kept) = (device.clone(), Arc::clone(&shared));
         let spawned = std::thread::Builder::new()
             .name("reims-vgpu.gpu-awake".into())
-            .spawn(move || keep(&device, &kept, period));
+            .spawn(move || keep(&device, &kept, look));
         match spawned {
             Ok(_) => Awake(Some(shared)),
             Err(e) => {
@@ -109,16 +122,17 @@ impl Awake {
     }
 }
 
-/// The longest the thread lets the GPU go without work, for the device's autosuspend delay as
-/// sysfs writes it (`delay_ms`, milliseconds): half the delay, at least [`LEAST_PERIOD`]; half of
-/// [`ASSUMED_DELAY`] where there is no file, it cannot be read, or it holds no positive delay
-/// (`-1`, which turns autosuspend off).
-pub(crate) fn period(delay_ms: Option<&str>) -> Duration {
-    let delay = delay_ms
+/// How often the thread looks, for the device's autosuspend delay as sysfs writes it (`delay_ms`,
+/// milliseconds): every quarter of the delay, at least [`LEAST_LOOK`] apart; every
+/// [`UNREAD_LOOK`] where there is no file, it cannot be read, or it holds no positive delay (`-1`,
+/// which turns autosuspend off).
+pub(crate) fn look(delay_ms: Option<&str>) -> Duration {
+    delay_ms
         .and_then(|text| text.trim().parse::<u64>().ok())
         .filter(|&ms| ms > 0)
-        .map_or(ASSUMED_DELAY, Duration::from_millis);
-    (delay / 2).max(LEAST_PERIOD)
+        .map_or(UNREAD_LOOK, |ms| {
+            (Duration::from_millis(ms) / 4).max(LEAST_LOOK)
+        })
 }
 
 /// The text of `device`'s `power/autosuspend_delay_ms` in sysfs, where it has a PCI address and
@@ -170,12 +184,12 @@ impl Keep {
     }
 }
 
-/// The thread: looks every half `period` (the module docs) until a submission fails.
-fn keep(device: &rt::Device, shared: &Shared, period: Duration) {
+/// The thread: looks every `look` (the module docs) until a submission fails.
+fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
     let _ = shared.thread.set(std::thread::current());
     log::debug!(
         target: TARGET,
-        "the GPU is kept awake {AWAKE_FOR:?} after the last commit, at most {period:?} without work"
+        "the GPU is kept awake {AWAKE_FOR:?} after the last commit, looked at every {look:?}"
     );
     let clock = crate::os::OsClock::new();
     let mut keep = Keep::default();
@@ -203,7 +217,7 @@ fn keep(device: &rt::Device, shared: &Shared, period: Duration) {
                 continue;
             }
         }
-        clock.sleep_until(Deadline::Mono(now.saturating_add(period / 2)));
+        clock.sleep_until(Deadline::Mono(now.saturating_add(look)));
     }
 }
 
@@ -384,7 +398,7 @@ mod tests {
     /// after that starts the looks again, for another [`AWAKE_FOR`].
     #[test]
     fn it_stops_awake_for_after_the_last_work_and_starts_again_on_new_work() {
-        let step = period(None) / 2;
+        let step = look(None);
         let mut keep = Keep::default();
         let mut now = at(10.0);
         let mut last = now;
@@ -412,12 +426,11 @@ mod tests {
         assert_eq!(keep.look(work, again.saturating_add(AWAKE_FOR)), Look::Rest);
     }
 
-    /// A look every half period keeps the GPU under a period without work: a commit right after
-    /// one look shows at the next, and the look after submits.
+    /// The GPU goes under two looks without work: a commit right after one look shows at the
+    /// next, and the look after submits.
     #[test]
-    fn the_gpu_goes_under_a_period_without_work() {
-        let period = period(None);
-        let step = period / 2;
+    fn the_gpu_goes_under_two_looks_without_work() {
+        let step = look(None);
         let mut keep = Keep::default();
         let first = at(1.0);
         assert_eq!(keep.look(1, first), Look::Busy);
@@ -425,19 +438,20 @@ mod tests {
         assert_eq!(keep.look(2, first.saturating_add(step)), Look::Busy);
         let touch = first.saturating_add(2 * step);
         assert_eq!(keep.look(2, touch), Look::Touch);
-        assert!(touch.saturating_duration_since(commit) < period);
+        assert!(touch.saturating_duration_since(commit) < 2 * step);
     }
 
-    /// The period is half sysfs's delay, at least [`LEAST_PERIOD`], else half the assumed one.
+    /// The thread looks every quarter of sysfs's delay, at least [`LEAST_LOOK`] apart, else every
+    /// [`UNREAD_LOOK`].
     #[test]
-    fn the_period_is_half_the_autosuspend_delay() {
-        assert_eq!(period(Some("5000\n")), Duration::from_millis(2500));
-        assert_eq!(period(Some("10000")), Duration::from_secs(5));
-        assert_eq!(period(Some("20\n")), LEAST_PERIOD);
-        assert_eq!(period(None), ASSUMED_DELAY / 2);
-        assert_eq!(period(Some("")), ASSUMED_DELAY / 2);
-        assert_eq!(period(Some("-1\n")), ASSUMED_DELAY / 2);
-        assert_eq!(period(Some("0\n")), ASSUMED_DELAY / 2);
+    fn it_looks_every_quarter_of_the_autosuspend_delay() {
+        assert_eq!(look(Some("5000\n")), Duration::from_millis(1250));
+        assert_eq!(look(Some("10000")), Duration::from_millis(2500));
+        assert_eq!(look(Some("20\n")), LEAST_LOOK);
+        assert_eq!(look(None), UNREAD_LOOK);
+        assert_eq!(look(Some("")), UNREAD_LOOK);
+        assert_eq!(look(Some("-1\n")), UNREAD_LOOK);
+        assert_eq!(look(Some("0\n")), UNREAD_LOOK);
     }
 
     /// The submission runs on the device: its fence signals, and the buffer, recorded once, is
