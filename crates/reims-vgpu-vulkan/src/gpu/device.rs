@@ -194,6 +194,8 @@ pub struct DeviceObject {
     pub registry_id: u64,
     /// Its capabilities, once read.
     caps: OnceLock<Arc<DeviceCaps>>,
+    /// Its keeping awake while the guest draws ([`crate::awake`]).
+    pub(crate) awake: crate::awake::Awake,
 }
 
 /// How many uncompleted command buffers a queue of `newCommandQueue` holds at most, as Metal's
@@ -305,7 +307,8 @@ pub(crate) fn first_adopted() -> Option<rt::Device> {
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
 /// placement of degradations ([`crate::answer::native::device_made`]), and its warm pass runs
 /// over the pipeline records earlier processes kept ([`crate::records`]), in the background. Its
-/// work counts go to the log where their target is on ([`crate::work_log`]).
+/// work counts go to the log where their target is on ([`crate::work_log`]), and its GPU is kept
+/// awake while the guest draws ([`crate::awake`]).
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
@@ -322,6 +325,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     }
     crate::work_log::start(&raw);
     let made = Obj::new(DeviceObject {
+        awake: crate::awake::Awake::start(&raw),
         raw,
         registry_id: id,
         caps: OnceLock::new(),
@@ -2303,6 +2307,7 @@ pub(crate) mod tests {
             registry_id: registry_id(&raw),
             raw,
             caps: OnceLock::new(),
+            awake: Default::default(),
         })
     }
 

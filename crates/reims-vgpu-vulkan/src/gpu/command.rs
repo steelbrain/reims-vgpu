@@ -1361,6 +1361,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// with a submission check, which every command buffer here carries but one committed failed,
     /// is the scheduler's thread's, as under `commit`.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
+        // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
+        self.device.awake.touch();
         let progress = self.progress.lock().clone();
         encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");

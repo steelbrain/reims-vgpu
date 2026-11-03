@@ -3149,6 +3149,7 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
         registry_id: registry_id(&raw),
         raw,
         caps: OnceLock::new(),
+        awake: Default::default(),
     });
     (device, OwnCache(dir))
 }

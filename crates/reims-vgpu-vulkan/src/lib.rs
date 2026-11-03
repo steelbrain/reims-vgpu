@@ -25,6 +25,7 @@
 
 pub mod answer;
 pub mod api;
+pub(crate) mod awake;
 pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod host_gpus;
