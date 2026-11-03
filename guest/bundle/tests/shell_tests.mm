@@ -9226,6 +9226,47 @@ void test_iosurface_keep()
 	CHECK(src.released.size() == 13);
 	for (IOSurfaceRef s : many)
 		CFRelease(s);
+
+	// Held elsewhere in the process (the test holds `a`), a view stays past 50 ms, its next
+	// texture asking nothing, as a ring of drawing buffers turning at a few frames a second needs;
+	// past a second it goes all the same.
+	const uint64_t ms = 1000ull * 1000;
+	uint64_t made = 0;
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 14);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	rgfxIOSurfaceKeepSweepAt(made + 200 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 13);
+	@autoreleasepool {
+		CHECK(over(a) != nil && src.asked == 14);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	rgfxIOSurfaceKeepSweepAt(made + 500 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 13);
+	rgfxIOSurfaceKeepSweepAt(made + 1500 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 14);
+
+	// A surface the view alone holds goes past 50 ms, and with it the surface.
+	IOSurfaceRef b = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(b != nullptr);
+	const IOSurfaceID bId = IOSurfaceGetID(b);
+	@autoreleasepool {
+		CHECK(over(b) != nil && src.asked == 15);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	CHECK(CFGetRetainCount(b) == 2);
+	CFRelease(b);
+	rgfxIOSurfaceKeepSweepAt(made + 200 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 15);
+	IOSurfaceRef gone = IOSurfaceLookup(bId);
+	CHECK(gone == nullptr);
+	if (gone != nullptr)
+		CFRelease(gone);
 	CFRelease(a);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }

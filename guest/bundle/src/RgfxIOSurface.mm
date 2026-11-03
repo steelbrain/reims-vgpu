@@ -960,24 +960,47 @@ namespace {
 // nothing. A compositor makes a texture over its flattened layers' surface each composite and
 // lets it go at its end; without the keep each such texture asks the kext for the surface's block
 // again, which wires and walks every page of the surface before it finds the block it holds
-// (about 140 us for 12 MiB, measured on the RTX 5080 boot, 1.3 asks a composite). A view stays
-// kept until kKeepNs past its last texture's making: three composites at 60 Hz. The process's
-// commitAndWaitUntilSubmitted calls count no composites: WindowServer makes about three a
-// composite (measured on that boot). The keep holds at most kKeepMaxViews views and
+// (about 140 us for 12 MiB, measured on the RTX 5080 boot, 1.3 asks a composite). WebKit's WebGL
+// makes a texture over its drawing buffer each frame (ANGLE's bindTexImage) and lets it go as the
+// buffer goes to the display, and the buffer comes back for drawing two or more frames later. A
+// block let go sleeps in the kext, but the buffer's trip to the display ends the sleep (as each
+// other process lets go of the surface: the kext's dormant blocks, RgfxSurfaceBlocks.hpp), so
+// without the keep each frame's texture makes the surface's block anew and waits for the host to
+// map its pages (about 40 ms a frame for the 3840x2054 buffer, 15 frames a second, on the RTX
+// 5080 boot).
+//
+// A view stays kept until kKeepNs past its last texture's making, three composites at 60 Hz, and
+// while anything else in the process holds its surface (its retain count past the view's own),
+// until kKeepHeldNs past it: a ring of buffers turning at a few frames a second keeps its views.
+// A surface the view alone holds goes at the first sweep past kKeepNs, so the keep outlives
+// neither the surface's last texture nor the process's last other hold of it by much more than
+// kKeepNs. The process's commitAndWaitUntilSubmitted calls count no composites: WindowServer makes
+// about three a composite (measured on that boot). The keep holds at most kKeepMaxViews views and
 // kKeepMaxBytes of their surfaces, the least recently textured let go first, lets go of all of
 // them at the process's memory pressure, and keeps none a texture over it set volatile or empty
-// (setPurgeableState:). A kept view holds
-// its surface (CFRetain) as a texture over it does, and the kext keeps its pages wired as for a
-// live texture; the surface's use count is never touched, so IOSurfaceIsInUse answers as before.
+// (setPurgeableState:). A kept view holds its surface (CFRetain) as a texture over it does, so
+// its IOSurfaceID names no other surface, and its block, so the kext keeps the process's wire of
+// the surface's pages as for a live texture: the pages the host maps are the surface's while the
+// view is kept, and a texture made over it again is as one made while the last still lived. The
+// surface's use count is never touched, so IOSurfaceIsInUse answers as before.
 constexpr size_t kKeepMaxViews = 8;
 constexpr uint64_t kKeepMaxBytes = 256ull << 20;
 constexpr uint64_t kKeepNs = 50ull * 1000 * 1000;
+constexpr uint64_t kKeepHeldNs = 1000ull * 1000 * 1000;
 
 struct Kept {
 	std::shared_ptr<RgfxSurfaceShadow> view;
-	uint64_t until = 0; // nowNs() at which it goes
-	uint64_t bytes = 0; // its surface's
+	uint64_t until = 0;     // nowNs() at which it goes where the view alone holds its surface
+	uint64_t heldUntil = 0; // nowNs() at which it goes all the same
+	uint64_t bytes = 0;     // its surface's
 };
+
+/// Whether nothing in the process but `view` holds its surface: the view's is its one retain
+/// (the textures over it hold the view, not the surface).
+bool viewAloneHolds(const RgfxSurfaceShadow &view)
+{
+	return CFGetRetainCount(view.surface) <= 1;
+}
 
 struct Keep {
 	std::mutex lock;
@@ -997,7 +1020,8 @@ Keep &keep()
 void expire(Keep &k, uint64_t now, bool all, std::vector<std::shared_ptr<RgfxSurfaceShadow>> *gone)
 {
 	for (auto it = k.views.begin(); it != k.views.end();) {
-		if (all || now >= it->until || it->view->keepVolatile.load(std::memory_order_relaxed)) {
+		if (all || now >= it->heldUntil || (now >= it->until && viewAloneHolds(*it->view)) ||
+		    it->view->keepVolatile.load(std::memory_order_relaxed)) {
 			k.bytes -= it->bytes;
 			gone->push_back(std::move(it->view));
 			it = k.views.erase(it);
@@ -1057,7 +1081,7 @@ void keepView(const std::shared_ptr<RgfxSurfaceShadow> &view)
 	}
 	const uint64_t bytes = IOSurfaceGetAllocSize(view->surface);
 	if (!view->keepVolatile.load(std::memory_order_relaxed) && bytes <= kKeepMaxBytes) {
-		k.views.push_back({view, now + kKeepNs, bytes});
+		k.views.push_back({view, now + kKeepNs, now + kKeepHeldNs, bytes});
 		k.bytes += bytes;
 	}
 	expire(k, now, false, &gone);
