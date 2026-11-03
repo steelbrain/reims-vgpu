@@ -13,6 +13,9 @@
 //                65,536 of them, spread evenly), committed and waited: what a GPU use costs and
 //                wires.
 //     -touch     the CPU writes one byte a page of each buffer as it is made.
+//     -nofree    hold and align cases keep their buffers for the process's life, which its exit
+//                frees through the context's close: no free per buffer.
+//     -rounds N  the rounds of a zero case (default 200).
 // The cases:
 //   info                 the device's answers and the system's memory and wire limits.
 //   hold.MODE.SIZE       buffers of SIZE (4k, 64k, 1m, 2m, 16m, 64m, 256m) and MODE (shared,
@@ -22,7 +25,7 @@
 //                        currentAllocatedSize deltas (MiB) after the makes, after the use, and
 //                        after all are freed, and the free time.
 //   max.MODE             one buffer of maxBufferLength, and one of a page more: ok or nil, us.
-//   zero.MODE.SIZE       200 rounds of a make, a check that every 64th byte reads zero, a fill of
+//   zero.MODE.SIZE       -rounds rounds of a make, a check that every 64th byte reads zero, a fill of
 //                        0xa5, a free: dirty = the makes that read a byte not zero.
 //   align.MODE.SIZE      64 buffers of SIZE held: allocatedSize, how many contents pointers and
 //                        gpuAddresses are page aligned, the smallest gap between two contents
@@ -48,7 +51,8 @@
 
 static double gCapGiB = 8, gTimeS = 20, gGuardGiB = 6;
 static unsigned long gCount = 1000000;
-static BOOL gUse = NO, gTouch = NO;
+static BOOL gUse = NO, gTouch = NO, gNoFree = NO;
+static int gRounds = 200;
 
 static double nowUs(void)
 {
@@ -283,6 +287,15 @@ static void hold(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint6
 		printf("shm: %s.idle wired=%+.1fMiB footprint=%+.1fMiB\n", name.UTF8String,
 		       mib((int64_t)(wiredBytes() - w0)), mib((int64_t)(footprint() - f0)));
 	}
+	if (gNoFree) {
+		// Kept for the process's life: its exit frees them through the context's close.
+		CFBridgingRetain(held);
+		printf("shm: %s.free skipped (-nofree)\n", name.UTF8String);
+		free(lat);
+		free(head);
+		free(tail);
+		return;
+	}
 	double tf = nowUs();
 	[held removeAllObjects];
 	tf = nowUs() - tf;
@@ -316,7 +329,7 @@ static void maxCase(id<MTLDevice> d, NSString *name, MTLResourceOptions opts)
 static void zeroCase(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint64_t size)
 {
 	unsigned dirty = 0, made = 0;
-	for (int r = 0; r < 200; r++) {
+	for (int r = 0; r < gRounds; r++) {
 		@autoreleasepool {
 			id<MTLBuffer> b = [d newBufferWithLength:size options:opts];
 			if (b == nil)
@@ -372,6 +385,8 @@ static void alignCase(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, 
 		if (cp[i] / page == (cp[i - 1] + size - 1) / page)
 			sharePage++;
 	}
+	if (gNoFree)
+		CFBridgingRetain(held);
 	printf("shm: %s n=%u allocatedSize=%llu contents_page_aligned=%u gpu_page_aligned=%u "
 	       "min_contents_gap=%llu min_gpu_gap=%llu share_page=%u contents_low=0x%llx "
 	       "gpu_low=0x%llx\n",
@@ -498,6 +513,10 @@ int main(int argc, const char **argv)
 				gUse = YES;
 			else if (!strcmp(argv[i], "-touch"))
 				gTouch = YES;
+			else if (!strcmp(argv[i], "-nofree"))
+				gNoFree = YES;
+			else if (!strcmp(argv[i], "-rounds") && i + 1 < argc)
+				gRounds = atoi(argv[++i]);
 			else
 				[cases addObject:@(argv[i])];
 		}

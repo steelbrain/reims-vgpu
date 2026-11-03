@@ -2,7 +2,7 @@
 # spscan: finds the pages shmem's spmark case marked in a QEMU guest's RAM, from the host, and
 # says how physically contiguous each 2 MiB range is in guest-physical memory.
 #   spscan.py QEMU_PID PID [BELOW_4G_BYTES]
-# QEMU_PID's RAM is the memfd named "ram" (memory-backend-memfd,id=ram), the first
+# QEMU_PID's RAM is its largest memfd (QEMU names it "memory-backend-memfd"), the first
 # BELOW_4G_BYTES (default 1 GiB, max-ram-below-4g=1G) at guest-physical 0, the rest from 4 GiB.
 # PID is the guest process that marked them. Reads the file through /proc/QEMU_PID/fd.
 import mmap
@@ -14,12 +14,13 @@ import sys
 def main():
     qpid, gpid = int(sys.argv[1]), int(sys.argv[2])
     below = int(sys.argv[3]) if len(sys.argv) > 3 else 1 << 30
-    path = None
+    path, best = None, 0
     for fd in os.listdir(f"/proc/{qpid}/fd"):
-        link = os.readlink(f"/proc/{qpid}/fd/{fd}")
-        if link.startswith("/memfd:ram"):
-            path = f"/proc/{qpid}/fd/{fd}"
-            break
+        p = f"/proc/{qpid}/fd/{fd}"
+        if os.readlink(p).startswith("/memfd:"):
+            n = os.stat(p).st_size
+            if n > best:
+                path, best = p, n
     if path is None:
         sys.exit("no memfd:ram")
     f = open(path, "rb")
