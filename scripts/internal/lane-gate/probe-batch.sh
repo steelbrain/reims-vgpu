@@ -8,7 +8,7 @@
 #            copy of the directory (~/probes/NAME), with PROBE_NAME and PROBE_PASS (the user's
 #            password, for sudo) in its environment. What it prints is its result; what it leaves in
 #            ./out/ is copied back.
-#   budget   the most seconds it may run, 1 to 180: the guest kills its process group there.
+#   budget   the most seconds it may run, 1 to 300: the guest kills its process group there.
 #   tip      the commit it is valid for, full or short (9 characters or more): a round boots one
 #            tip, the newest published one or an earlier published tip (its image and host still on
 #            the lane host, tip-host/SHORT and loader-fix/oc-sipon-SHORT.qcow2), and a probe for a

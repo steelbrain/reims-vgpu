@@ -181,8 +181,8 @@ for p in $(in_order); do
   tip=$(tr -dc 0-9a-f < "$p/tip" 2> /dev/null)
   if [[ ! -f $p/run.sh ]]; then
     echo "skipped: no run.sh" > "$out/status"
-  elif [[ -z $budget ]] || (( budget < 1 || budget > 180 )); then
-    echo "skipped: budget '${budget:-none}' is not 1 to 180 s" > "$out/status"
+  elif [[ -z $budget ]] || (( budget < 1 || budget > 300 )); then
+    echo "skipped: budget '${budget:-none}' is not 1 to 300 s" > "$out/status"
   elif ! same_tip "$tip" "$PROBE_TIP"; then
     echo "skipped: valid for ${tip:-no tip}, and the published tip is $PROBE_TIP" > "$out/status"
   elif [[ -n $hung ]]; then
