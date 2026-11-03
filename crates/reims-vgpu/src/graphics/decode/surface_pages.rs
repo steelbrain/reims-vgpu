@@ -696,6 +696,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
 }
 
 #[cfg(test)]
+mod costs;
+
+#[cfg(test)]
 pub(super) mod tests {
     use reims_graphics::region::Region;
     use reims_graphics::wire::{
