@@ -1160,11 +1160,14 @@ static void case_order(void)
 		run(cb);
 		line("reset after the execute was encoded, before commit", ".3......");
 	}
-	// In flight: a long kernel first, then the execute; the CPU encodes while it runs.
+	// In flight: a long kernel first, then the execute; the CPU encodes while it runs. One
+	// threadgroup, then 64, add the same 2^23 to one counter in all, tens of milliseconds of one
+	// dispatch on a GPU that serializes the adds: 2^22 a thread of 64 groups ran 115 s on the
+	// lane's RTX 5080, and a dispatch that long holds the GPU past a context switch's timeout.
 	for (int spin = 0; spin < 2; spin++) {
 		enc_draw(b, 0, 0, 4, YES);
 		id<MTLBuffer> ctr = buf(16), n = buf(16);
-		*(uint32_t *)n.contents = 1u << 22;
+		*(uint32_t *)n.contents = spin ? 1u << 11 : 1u << 17;
 		id<MTLCommandBuffer> cb = [Q commandBuffer];
 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
 		[ce setComputePipelineState:gSpin];
