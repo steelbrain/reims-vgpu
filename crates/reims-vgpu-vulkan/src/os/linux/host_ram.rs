@@ -434,9 +434,9 @@ mod tests {
         }
         // A command buffer's round trip: a 4-byte fill of one placed buffer, committed and waited.
         let q = device.new_command_queue().unwrap();
-        let round = || {
+        let round = |n: usize| {
             let mut v = Vec::new();
-            for _ in 0..100 {
+            for _ in 0..n {
                 let t = Instant::now();
                 let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
                 let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -454,15 +454,29 @@ mod tests {
             }
             median(&mut v)
         };
-        // Warmed up first, so the GPU's clocks do not favour the later rounds; then 2,004 heaps, 200,
-        // 2, and 2,000 again, made anew over the chunks already imported.
-        round();
-        let all = round();
+        // Rounds of 20 in a row after heaps are made, each round's median with the time since the
+        // makes ended: whether a submission's cost after many makes follows their count or the time.
+        let series = |label: &str, made_at: Instant| {
+            let mut out = String::new();
+            for _ in 0..8 {
+                let (p50, _) = round(20);
+                let ms = made_at.elapsed().as_secs_f64() * 1e3;
+                out.push_str(&format!(" {p50:.0}us@{ms:.0}ms"));
+            }
+            println!("slab: cb round trips {label}:{out}");
+        };
+        series("after making 2,004 heaps", Instant::now());
+        let all = round(100);
         drop(views);
         heaps.truncate(200);
-        let some = round();
+        let some = round(100);
         heaps.truncate(2);
-        let few = round();
+        let few = round(100);
+        println!(
+            "slab: cb round trip p50/max us: {:.1}/{:.1} with 2,004 heaps, {:.1}/{:.1} with 200, \
+             {:.1}/{:.1} with 2",
+            all.0, all.1, some.0, some.1, few.0, few.1
+        );
         let mut again = Vec::new();
         for i in 2..2000u64 {
             let t = Instant::now();
@@ -470,13 +484,23 @@ mod tests {
             again.push(t.elapsed().as_secs_f64() * 1e6);
         }
         let (again50, againmax) = median(&mut again);
-        let back = round();
-        println!(
-            "slab: cb round trip p50/max us: {:.1}/{:.1} with 2,004 heaps, {:.1}/{:.1} with 200, \
-             {:.1}/{:.1} with 2, {:.1}/{:.1} with 2,000 again (made again at p50 {again50:.1} us, \
-             max {againmax:.1})",
-            all.0, all.1, some.0, some.1, few.0, few.1, back.0, back.1
-        );
+        println!("slab: 1,998 heaps made again at p50 {again50:.1} us, max {againmax:.1}");
+        series("after making 1,998 again", Instant::now());
+        heaps.truncate(2);
+        for i in 2..2000u64 {
+            heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
+        }
+        let made = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        series("after making 1,998 again, then 300 ms idle", made);
+        heaps.truncate(2);
+        for i in 2..2000u64 {
+            heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
+            if i % 100 == 0 {
+                round(1);
+            }
+        }
+        series("after making 1,998 again with a command buffer every 100", Instant::now());
         let keep = heaps;
         // SAFETY: the RAM, which no GPU work uses now.
         let byte = unsafe {
