@@ -815,7 +815,34 @@ offset with the shortest delivery (`guest/kext/src/RgfxVblankClock.hpp`). A
 display pipe transaction completes with the time of the refresh it was
 answered in (or the answer's own time where no `VBLANK` came within a period),
 and a display pipe VBL request is answered once, at the next refresh, with that
-refresh's time and the next one's. The bundle presents a drawable when its
+refresh's time and the next one's.
+
+**The display pipe's notification words.** The kext answers a pipe client with
+asynchronous results whose words IOAccelerator's notification callbacks read
+(`guest/kext/src/RgfxDisplayPipeUserClient.cpp`, `completeLocked` and `sendVbl`).
+A transaction's completion is exactly 11 words: the transaction's cookie in word
+0, its id in the high half of word 1 (the low half 0), the time it was shown in
+word 3, and the action 1 in word 8, the rest 0. The callback reads it as follows:
+- it refuses any other word count;
+- it takes word 0 as the completion block the client registered with the
+  transaction, so a completion with no cookie is not sent (a null word 0 ends the
+  client: WindowServer aborted there when the kext notified its cookie-less
+  shutdown frames, `RgfxPipeTransactions.hpp`);
+- it records word 1's high half as the last transaction completed;
+- in the extended mode IOPresentment uses (it registers its handler with
+  `IOAccelDisplayPipeTransactionSetCompletionHandlerExt`, the one completion setter
+  it imports, on an Intel Mac under macOS 26.7.1 and on the M3 under 27), it accepts
+  action 4 or one with a bit of 0xb set, and hands the block word 1's low half,
+  words 2 to 7 and words 9 and 10.
+
+A VBL request's answer is 6 words: the request's callback and refcon, then the
+refresh's time and the next refresh's, each split over two words, low half first.
+These are the reader's layouts (measured 11-03 from the callbacks' code, read as
+the guest's frameworks run it, for diagnosis only), and the completion's words
+are the ones Apple's own paravirtual display kext sends. WindowServer completes
+every transaction through them on the lane.
+
+The bundle presents a drawable when its
 command buffer is scheduled, as Metal does (`guest/bundle/src/RgfxCommandObjects.mm`);
 what an app then sees of it, its presented handlers, `presentedTime` and
 `nextDrawable`'s pacing, `guest/bundle/tools/present_probe.m` measures on a
