@@ -6123,8 +6123,16 @@ pub(crate) mod tests {
     }
 
     /// A render pass executes an indirect command buffer's draws: the triangle of a command's
-    /// pipeline state covers the target in its fragment's colour; an execution past the buffer's
-    /// size dies at its selector, naming the runtime's refusal
+    /// pipeline state covers the target in its fragment's colour, the codes a plain draw of the
+    /// state stores; an execution past the buffer's size dies at its selector, naming the
+    /// runtime's refusal.
+    ///
+    /// The fragment's green, 0.5, is a tie of `BGRA8Unorm`'s codes (127.5): every Mac stores 0x80
+    /// (measured: M3 Max, AMD 5300M, Intel 630, in `BGRA8Unorm` and `RGBA8Unorm`), and so does a
+    /// device the runtime holds to store Metal's codes (`VkProperty::MetalColorWrites`, MoltenVK
+    /// on Apple's GPUs). On any other the device's own conversion stores either neighbour (0x7f on
+    /// an RTX 5080), which the runtime records for the state's write as
+    /// `device-color-conversion` (`PrecisionNote::DeviceColorConversion`)
     #[test]
     fn a_pass_executes_an_icbs_draws() {
         use metal2vulkan::metal::PixelFormat;
@@ -6240,7 +6248,64 @@ pub(crate) mod tests {
         assert_eq!(cb.error(), None);
         // SAFETY: the Shared buffer's 64 bytes, read after the blit completed.
         let texels = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 64) };
-        assert_eq!(texels, [0x40, 0x80, 0xff, 0xff].repeat(16));
+
+        // The same state drawn plainly, for the codes the device stores for it.
+        let (plain_dst, plain_pass) = pass_of(&p, &d, (4, 4));
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb
+            .render_encoder(OnFault::Die, &plain_pass)
+            .unwrap()
+            .unwrap();
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&pipeline),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        let plain_out = buffer::<VulkanPlatform>(&d, 64, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &plain_dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(4, 4, 1),
+                destination_buffer: &plain_out,
+                destination_offset: 0,
+                destination_bytes_per_row: 16,
+                destination_bytes_per_image: 64,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.error(), None);
+        // SAFETY: the Shared buffer's 64 bytes, read after the blit completed.
+        let plain = unsafe { std::slice::from_raw_parts(plain_out.contents().as_ptr::<u8>(), 64) };
+        eprintln!(
+            "the state's green: {:#04x} executed, {:#04x} drawn plainly",
+            texels[1], plain[1]
+        );
+        assert_eq!(texels, plain);
+        let metals = (d.raw.compile_device().profile().enabled().properties)
+            .contains(&metal2vulkan::device::VkProperty::MetalColorWrites);
+        let greens: &[u8] = if metals { &[0x80] } else { &[0x7f, 0x80] };
+        for texel in texels.chunks(4) {
+            assert!(
+                texel[0] == 0x40 && greens.contains(&texel[1]) && texel[2..] == [0xff, 0xff],
+                "{texel:02x?}"
+            );
+        }
     }
 
     /// An execution whose commands run pipeline states of their own writes no texture bound on
