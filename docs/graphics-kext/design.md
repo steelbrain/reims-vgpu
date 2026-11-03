@@ -643,11 +643,13 @@ only where no negotiation can carry it.
 - New ops and messages are decoded wherever the host offers their bit, as
   `RGFX_OP_SUBMITTED` is.
 - The accelerator answers its processes' `Features` call (selector 0x10f) with
-  the word they work by: bits 0-2 as offered, and from bit 3 the bits taken.
-  `QueueCreate` (0x103) takes a seventh input, the flags the process wants, and
-  answers a second output, the flags granted: those whose feature the word
-  holds. A kext older than the call answers `kIOReturnUnsupported`, and the
-  bundle then works by the device info's `features_lo` bits 0-2.
+  two words: the device's, which they work by (bits 0-2 as offered, and from
+  bit 3 the bits taken), and the kext's own (below, "The accelerator's user
+  client"). `QueueCreate` (0x103) takes a seventh input, the flags the process
+  wants, and answers a second output, the flags granted: those whose feature
+  the device's word holds. A kext older than the call answers
+  `kIOReturnUnsupported`, and the bundle then works by the device info's
+  `features_lo` bits 0-2, with no kext feature.
 - Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
   `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bit 9 is
   reserved. No host offers one of them yet, the kext takes none, and the host
@@ -1598,6 +1600,40 @@ device memory, the device info (selector 0x10b), and
 which the kext and the bundle both include;
 the bundle's wire handshake opens them with `IOServiceOpen` /
 `IOConnectCallStructMethod` / `IOConnectCallScalarMethod`.
+
+**The accelerator's user client: its numbers.** This table gives out every
+number of the 'RGFX' user client. A new selector takes the next free number
+here first. A selector or a flag that a kext may lack gets a kext feature bit,
+which the kext sets in the second word `Features` answers once it carries it
+out, and the bundle uses it only where that word holds the bit. The numbers'
+code home is `guest/kext/src/RgfxAccelerator.hpp` (the bundle keeps a copy in
+`RgfxMetalDevice.mm`), until `RgfxUserClientABI.hpp` holds them for both.
+
+| number | name | kext feature bit | what |
+|---|---|---|---|
+| doorbell 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
+| doorbell 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
+| 0x100 | `OpenContext` | | the context and its window |
+| 0x101 | `Alloc` | | a region block |
+| 0x102 | `Free` | | frees a block |
+| 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
+| 0x104 | `QueueDestroy` | | closes a queue |
+| 0x105 | `Submit` | 1 << 4 `DeferredAnswers` (its deferred flag) | one lifecycle message onto ring 0 |
+| 0x106 | `ResourceIds` | | a chunk of texture resource ids |
+| 0x107 | `WaitCompletions` | | waits for the client's completions |
+| 0x108 | `SurfaceScanout` | | the scanout an IOAccel surface is drawn into |
+| 0x109 | `SurfaceBlock` | | an IOSurface plane's shared block |
+| 0x10a | `SurfaceBlockRelease` | | lets go of a shared block |
+| 0x10b | `DeviceInfo` | | the device info and video caps |
+| 0x10c | `SurfaceWrites` | | the surfaces a command buffer writes |
+| 0x10d | `SurfaceRetire` | | a queue's writes up to a seqno retire |
+| 0x10e | `PagesBlock` | 1 << 0 `PagesBlock` | reserved: a block over a process's own pages |
+| 0x10f | `Features` | | the device's feature word and the kext's |
+| 0x110 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
+| 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
+| 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | reserved: hands a process its held pipeline-create answers |
+
+No kext sets a feature bit yet.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU
