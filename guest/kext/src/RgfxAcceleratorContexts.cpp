@@ -1720,6 +1720,47 @@ IOReturn RgfxAccelerator::postLifecycle(UInt32 type, const void *message, UInt32
 	return r;
 }
 
+IOReturn RgfxAccelerator::postDeferred(UInt32 context, UInt32 type, const void *message,
+                                       UInt32 size, UInt64 *seqno)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return kIOReturnNotReady;
+	IOReturn r = fb->postDeferred(context, type, message, size, seqno);
+	fb->release();
+	return r;
+}
+
+IOReturn RgfxAccelerator::takeDeferred(UInt32 context, UInt64 waitFor, UInt32 timeoutMs,
+                                       UInt8 *out, UInt32 capacity, UInt32 *length,
+                                       UInt32 *count)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return kIOReturnNotReady;
+	IOReturn r = fb->takeDeferred(context, waitFor, timeoutMs, out, capacity, length, count);
+	fb->release();
+	return r;
+}
+
+void RgfxAccelerator::dropDeferred(UInt32 context)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return;
+	fb->dropDeferred(context);
+	fb->release();
+}
+
+void RgfxAccelerator::forgetDeferred(UInt64 seqno)
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	if (!fb)
+		return;
+	fb->forgetDeferred(seqno);
+	fb->release();
+}
+
 UInt32 RgfxAccelerator::openQueue(const RgfxQueueCreate &create, UInt32 flags)
 {
 	struct {

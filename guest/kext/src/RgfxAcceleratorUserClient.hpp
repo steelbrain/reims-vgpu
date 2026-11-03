@@ -83,6 +83,7 @@ private:
 	// The IOGPU base's device calls on its type-5 client: its configuration and device info.
 	IOReturn deviceMethod(uint32_t selector, IOExternalMethodArguments *arguments);
 	IOReturn submitMethod(IOExternalMethodArguments *arguments);
+	IOReturn takeAnswersMethod(IOExternalMethodArguments *arguments);
 	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
 	// Makes the window at the context's open; closeWindow lets it go, every span in it with it,

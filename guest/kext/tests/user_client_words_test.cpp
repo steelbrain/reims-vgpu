@@ -141,6 +141,10 @@ static void features()
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
+	// TakeAnswers past the numbers SubmitBatch and WakeCompletions keep, and Submit's one flag.
+	CHECK(kRgfxAccelMethodTakeAnswers == 0x112);
+	CHECK(kRgfxAccelMethodTakeAnswers == kRgfxAccelMethodFeatures + 3);
+	CHECK(kRgfxSubmitDeferred == 1);
 }
 
 int main()

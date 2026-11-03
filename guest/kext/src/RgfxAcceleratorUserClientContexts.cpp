@@ -161,6 +161,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	}
 	case kRgfxAccelMethodSubmit:
 		return submitMethod(a);
+	case kRgfxAccelMethodTakeAnswers:
+		return takeAnswersMethod(a);
 	case kRgfxAccelMethodWaitCompletions:
 		return waitCompletionsMethod(a);
 	case kRgfxAccelMethodSurfaceScanout: {
@@ -251,7 +253,9 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 
 // kRgfxAccelMethodSubmit (RgfxUserClientABI.hpp): one create or destroy of the client's onto the
 // control ring, and the device's answer back where the create has one: a pipeline's reflection,
-// a library create's or lookup's COMPLETE, an argument layout's COMPLETE.
+// a library create's or lookup's COMPLETE, an argument layout's COMPLETE. A pipeline create with
+// kRgfxSubmitDeferred is posted without waiting where a deferred slot is free (postDeferred), its
+// answer then taken through kRgfxAccelMethodTakeAnswers.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
 	// The context as it is now, read under the queue lock that releaseContext closes it under,
@@ -260,8 +264,10 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	const bool open = hasContext;
 	const UInt32 ctx = context;
 	IOLockUnlock(queueLock);
-	if (!open || a->scalarOutputCount != 1)
+	if (!open || a->scalarOutputCount != 1 || a->scalarInputCount > 1 ||
+	    (a->scalarInputCount == 1 && (a->scalarInput[0] & ~uint64_t{kRgfxSubmitDeferred}) != 0))
 		return kIOReturnBadArgument;
+	const bool deferAsked = a->scalarInputCount == 1 && (a->scalarInput[0] & kRgfxSubmitDeferred);
 	IOMemoryDescriptor *desc = a->structureInputDescriptor;
 	UInt64 size = desc ? desc->getLength() : a->structureInputSize;
 	if (size < kObjIdOffset + sizeof(UInt64) || size % 8 ||
@@ -287,8 +293,11 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	memcpy(&objId, message + kObjIdOffset, sizeof(objId));
 	// Creates and destroys of the client's own objects only: QUEUE_CREATE goes through its own
 	// selector (its rings are checked), CONTEXT_CLOSE is the kext's (RgfxSubmitGate.hpp).
+	const bool pipeline =
+	    type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_COMPUTE_PIPELINE_CREATE;
 	if (r == kIOReturnSuccess &&
-	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx))
+	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx ||
+	     (deferAsked && !pipeline)))
 		r = kIOReturnBadArgument;
 	// An OBJECT_DESTROY of one of the client's command queues is the one accepted message that
 	// changes the kext's own tracking: the kext watches the queue's completion ring and lists it.
@@ -337,7 +346,15 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	UInt32 replyLength = 0;
 	UInt64 seqno = 0;
 	const bool checked = r == kIOReturnSuccess;
-	if (checked)
+	// A deferred create, where a slot is free; with none it is posted and waited for as any.
+	bool deferred = false;
+	if (checked && deferAsked) {
+		r = owner->postDeferred(ctx, type, message, static_cast<UInt32>(size), &seqno);
+		deferred = r == kIOReturnSuccess;
+		if (r == kIOReturnNoResources)
+			r = kIOReturnSuccess;
+	}
+	if (checked && !deferred && r == kIOReturnSuccess)
 		r = owner->postLifecycle(type, message, static_cast<UInt32>(size), replyType, reply,
 		                         sizeof(reply), &replyLength, &seqno, kReflectionMs);
 	IOFree(message, size);
@@ -359,6 +376,11 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		owner->postLifecycle(RGFX_CMD_OBJECT_DESTROY, &destroy, sizeof(destroy), 0, nullptr, 0,
 		                     nullptr, nullptr, 0);
 	}
+	// A deferred create's slot, taken after its context's close dropped the context's: freed
+	// too, as no one takes it now. Its own slot alone, by its seqno: a new context may have the
+	// number now.
+	if (deferred && closedSince)
+		owner->forgetDeferred(seqno);
 	// A free of a block from here posts its release behind the message (and its destroy).
 	for (int i = 0; i < pinned; i++)
 		owner->unpinBlock(pins[i]);
@@ -369,6 +391,27 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	if (n && a->structureOutput)
 		memcpy(a->structureOutput, reply, n);
 	a->structureOutputSize = n;
+	return kIOReturnSuccess;
+}
+
+// kRgfxAccelMethodTakeAnswers (RgfxAccelerator.hpp): the answers to the client's deferred
+// pipeline creates the device has given, after waiting for the one asked for. Always succeeds with
+// what it took, the answers' count out, so none is lost on a wait that timed out: the caller finds
+// whether the one it waited for is among them.
+IOReturn RgfxAcceleratorUserClient::takeAnswersMethod(IOExternalMethodArguments *a)
+{
+	IOLockLock(queueLock);
+	const bool open = hasContext;
+	const UInt32 ctx = context;
+	IOLockUnlock(queueLock);
+	if (!open || a->scalarInputCount != 1 || a->scalarOutputCount != 1 || !a->structureOutput)
+		return kIOReturnBadArgument;
+	UInt32 length = 0, count = 0;
+	owner->takeDeferred(ctx, a->scalarInput[0], kReflectionMs,
+	                    static_cast<UInt8 *>(a->structureOutput), a->structureOutputSize, &length,
+	                    &count);
+	a->scalarOutput[0] = count;
+	a->structureOutputSize = length;
 	return kIOReturnSuccess;
 }
 
@@ -504,6 +547,8 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// The blocks go only once the device has answered the close: it then holds nothing of
 	// them, and the context's command buffers have finished.
 	bool closed = accel->closeContext(context, slot);
+	// Its deferred creates' answers, taken by no one now; a waiter for one returns.
+	accel->dropDeferred(context);
 	accel->freeIdChunks(this);
 	if (closed)
 		accel->freeBlocks(this);

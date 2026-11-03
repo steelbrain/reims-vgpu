@@ -360,6 +360,66 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	return r;
 }
 
+IOReturn ReimsGraphics::postDeferred(UInt32 context, UInt32 type, const void *message,
+                                     UInt32 size, UInt64 *seqno)
+{
+	IOLockLock(stateLock);
+	const int slot = deferredAnswers.reserve(context);
+	IOLockUnlock(stateLock);
+	if (slot < 0)
+		return kIOReturnNoResources;
+	UInt64 s = 0;
+	// The slot's seqno is stamped before the device can see the create, so its answer finds it.
+	IOReturn r = post(type, message, size, &s, deferredAnswers.seqnoOf(slot));
+	if (r != kIOReturnSuccess) {
+		IOLockLock(stateLock);
+		deferredAnswers.cancel(slot);
+		IOLockUnlock(stateLock);
+	}
+	if (seqno)
+		*seqno = s;
+	return r;
+}
+
+IOReturn ReimsGraphics::takeDeferred(UInt32 context, UInt64 waitFor, UInt32 timeoutMs, UInt8 *out,
+                                     UInt32 capacity, UInt32 *length, UInt32 *count)
+{
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	IOReturn r = kIOReturnSuccess;
+	IOLockLock(stateLock);
+	while (waitFor != 0 &&
+	       deferredAnswers.state(context, waitFor) == DeferredAnswers::kWaiting) {
+		if (IOLockSleepDeadline(stateLock, &deferredAnswers, deadline, THREAD_UNINT) ==
+		        THREAD_TIMED_OUT &&
+		    deferredAnswers.state(context, waitFor) == DeferredAnswers::kWaiting) {
+			r = kIOReturnTimeout;
+			break;
+		}
+	}
+	*length = deferredAnswers.take(context, out, capacity, count);
+	IOLockUnlock(stateLock);
+	if (r == kIOReturnTimeout)
+		IOLog("ReimsGraphics: context %u: no answer to its deferred create (seqno %llu)\n",
+		      context, waitFor);
+	return r;
+}
+
+void ReimsGraphics::dropDeferred(UInt32 context)
+{
+	IOLockLock(stateLock);
+	deferredAnswers.drop(context);
+	IOLockWakeup(stateLock, &deferredAnswers, false);
+	IOLockUnlock(stateLock);
+}
+
+void ReimsGraphics::forgetDeferred(UInt64 seqno)
+{
+	IOLockLock(stateLock);
+	deferredAnswers.forget(seqno);
+	IOLockUnlock(stateLock);
+}
+
 void ReimsGraphics::kickWorkLoop()
 {
 	if (kick)
@@ -561,8 +621,8 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		fire.proc(fire.target, fire.ref);
 }
 
-// Hands a lifecycle message's answer to its waiting thread: false where no thread waits for an
-// answer of this type to `seqno`.
+// Hands a lifecycle message's answer to its waiting thread, or keeps a deferred create's for its
+// process: false where neither waits for an answer of this type to `seqno`.
 bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UInt8 *payload,
                                     UInt32 size)
 {
@@ -586,6 +646,13 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 		w.done = true;
 		// Only the thread this answer is for: its own `done` event, one thread.
 		IOLockWakeup(stateLock, &w.done, true);
+	}
+	// Else a deferred create's (postDeferred), kept for its process to take; its waiters, if any,
+	// look again.
+	if (!found && deferredAnswers.answer(RgfxMsgHeader{type, size + kHeaderBytes, seqno},
+	                                     payload, size)) {
+		found = true;
+		IOLockWakeup(stateLock, &deferredAnswers, false);
 	}
 	IOLockUnlock(stateLock);
 	return found;

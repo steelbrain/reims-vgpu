@@ -32,6 +32,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+#include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayModes.hpp"
 #include "RgfxPipeClients.hpp"
 #include "RgfxScanoutOwner.hpp"
@@ -198,6 +199,24 @@ public:
 	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
 	                       UInt32 timeoutMs);
 
+	// A pipeline create of context `context` posted without waiting for its answer, which the
+	// device's answer then waits for in a slot of the deferred answers (RgfxDeferredAnswers.hpp)
+	// until takeDeferred takes it: as postLifecycle with `replyType` 0, but for its slot.
+	// kIOReturnNoResources, posting nothing, where no slot is free: the caller posts the create
+	// as postLifecycle does, and waits. Thread context only.
+	IOReturn postDeferred(UInt32 context, UInt32 type, const void *message, UInt32 size,
+	                      UInt64 *seqno);
+	// Copies context `context`'s answers to its deferred creates into the `capacity` bytes at
+	// `out`, each whole, in their seqnos' order, while they fit, and frees their slots: the bytes
+	// in `*length`, the answers in `*count`. Where `waitFor` is the seqno of one of its creates
+	// still waiting, waits up to `timeoutMs` for its answer first. Thread context only.
+	IOReturn takeDeferred(UInt32 context, UInt64 waitFor, UInt32 timeoutMs, UInt8 *out,
+	                      UInt32 capacity, UInt32 *length, UInt32 *count);
+	// Frees context `context`'s deferred slots, at its close, and lets its waiters go.
+	void dropDeferred(UInt32 context);
+	// Frees the deferred slot of the create at `seqno`, posted after its context closed.
+	void forgetDeferred(UInt64 seqno);
+
 private:
 #if RGFX_FB_TRACE
 	IOReturn connectionAttribute(IOIndex connectIndex, IOSelect attribute, uintptr_t *value);
@@ -271,6 +290,12 @@ private:
 	};
 	static constexpr UInt32 kLifecycleWaiters = 32;
 
+	// The deferred creates' answers (postDeferred): 256 slots, at most 64 a context.
+	static constexpr UInt32 kDeferredAnswers = 256;
+	static constexpr UInt32 kDeferredPerContext = 64;
+	typedef RgfxDeferredAnswers<kDeferredAnswers, kDeferredPerContext, kLifecycleReplyMax>
+	    DeferredAnswers;
+
 	// Registers and the control rings.
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
@@ -342,6 +367,9 @@ private:
 	RgfxScanoutOwner scanoutOwner;
 	ControlWaiter controlWaiters[kControlWaiters];
 	LifecycleWaiter lifecycleWaiters[kLifecycleWaiters];
+	// The deferred creates' answers; its waiters (takeDeferred) sleep on it, and each answer or
+	// drop wakes them all.
+	DeferredAnswers deferredAnswers;
 	bool haveDisplay;
 	UInt32 displayId;
 	bool connected;

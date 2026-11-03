@@ -58,7 +58,10 @@ enum {
 	// ReimsGraphics::kLifecycleMessageMax bytes, naming only the client's own blocks of the region
 	// (RgfxRegionSpans.hpp); out: the seqno, and for a create the device answers (a pipeline's,
 	// a library's), its answer as struct out once the device has given it. A create not answered
-	// in time fails, and the kext destroys its object behind it.
+	// in time fails, and the kext destroys its object behind it. One scalar in, of the
+	// kRgfxSubmit* flags, may follow: kRgfxSubmitDeferred posts a pipeline create without
+	// waiting, its answer kept for kRgfxAccelMethodTakeAnswers, and answers no struct out; where
+	// the kext has no slot left for the answer, the create is posted and answered as without it.
 	kRgfxAccelMethodSubmit = 0x105,
 	// Gives the client's context a chunk of RGFX_RESOURCE_ID_CHUNK texture resource ids, from
 	// the guest's one pool of RGFX_RESOURCE_ID_CHUNKS: no input; out: the chunk's first id.
@@ -128,8 +131,22 @@ enum {
 	// beside the range above.
 	kRgfxAccelMethodFeatures = 0x10f,
 	// 0x110 is kept for SubmitBatch (kRgfxKextFeatureSubmitBatch), 0x111 for WakeCompletions
-	// (kRgfxKextFeatureWakeCompletions), 0x112 for TakeAnswers (kRgfxKextFeatureDeferredAnswers).
+	// (kRgfxKextFeatureWakeCompletions).
+	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
+	// device has given (kRgfxKextFeatureDeferredAnswers): in the seqno of one to wait for first
+	// (0: none), up to a minute; struct out, the answers taken, each a whole
+	// RGFX_EVT_PIPELINE_REFLECTION, in their seqnos' order, as many as fit; out their count.
+	// Returns success whether or not the one waited for came: the answers that did are out all
+	// the same. The kext routes it to its context methods beside the range above.
+	kRgfxAccelMethodTakeAnswers = 0x112,
 	// A new selector takes the next number design.md's registry gives out.
+};
+
+// kRgfxAccelMethodSubmit's flags, its optional scalar in.
+enum {
+	// Post a pipeline create without waiting for its answer (kRgfxAccelMethodTakeAnswers;
+	// kRgfxKextFeatureDeferredAnswers).
+	kRgfxSubmitDeferred = 1 << 0,
 };
 
 // The kext's own features, the second word kRgfxAccelMethodFeatures answers: the user-client
