@@ -277,7 +277,7 @@ EOF
       echo "fails alone too: $bin $name"
     fi
   done < "$RES/cargo-fails.txt"
-  printf '%s\n' "${rest[@]}" | sed '/^$/d' > "$RES/cargo-fails.txt"
+  printf '%s\n' ${rest[@]+"${rest[@]}"} | sed '/^$/d' > "$RES/cargo-fails.txt"
 }
 
 mac_checks() {
