@@ -182,7 +182,8 @@ pub struct RgfxCommandBuffer {
     pub queue_obj_id: u64,
     /// The command buffer's guest-picked id, which its completion names.
     pub cb_obj_id: u64,
-    /// The bytes of op stream that follow this message.
+    /// The bytes of op stream that follow this message's fixed part: all of the message's
+    /// bytes past it. A message whose `op_bytes` counts fewer or more is refused.
     pub op_bytes: u64,
 }
 

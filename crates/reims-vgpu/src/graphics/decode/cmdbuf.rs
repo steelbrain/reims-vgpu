@@ -183,13 +183,14 @@ fn leaving(handler: CompletedHandler, in_flight: InFlight) -> CompletedHandler {
     })
 }
 
-/// The op stream of the `COMMAND_BUFFER` `message` whose fixed part is `m`: its `op_bytes`, which
-/// must lie within the message.
+/// The op stream of the `COMMAND_BUFFER` `message` whose fixed part is `m`: all of the message's
+/// ops, which its `op_bytes` must count. The bundle writes a buffer's message as its fixed part
+/// and its whole op stream, `op_bytes` the stream's length (`RgfxEncoder::finish`), so a message
+/// that disagrees is not one the guest made: carrying out the ops a shorter `op_bytes` covers
+/// would drop the rest without a word and answer the buffer completed.
 fn ops_of<'m>(message: &'m [u8], m: &RgfxCommandBuffer) -> Option<&'m [u8]> {
-    let start = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
-    (m.op_bytes as usize)
-        .checked_add(start)
-        .and_then(|end| message.get(start..end))
+    let ops = message.get(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize..)?;
+    (u64::try_from(ops.len()).ok()? == m.op_bytes).then_some(ops)
 }
 
 /// A `COMMAND_BUFFER` begun ([`GraphicsDecoder::begin_command_buffer`]): its command buffer made on
@@ -434,7 +435,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        // The op stream follows the message; `op_bytes` must lie within it.
+        // The op stream follows the message's fixed part; `op_bytes` must count all of it.
         let Some(ops) = ops_of(message, &m) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -585,9 +586,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(false);
         };
         let in_flight = InFlight::new(self.in_flight.entry(m.queue_obj_id).or_default());
-        let start = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
-        let ops = message.get(start..).unwrap_or_default();
-        let ops = &ops[..usize::try_from(m.op_bytes).map_or(ops.len(), |n| n.min(ops.len()))];
+        // All of the message's ops, as the walk takes them ([`ops_of`]), whatever its `op_bytes`
+        // read, so a wait or signal past a wrong count still runs.
+        let ops = message
+            .get(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize..)
+            .unwrap_or_default();
         let mut events = EventOps::default();
         for (signal, op) in event_ops(ops) {
             let (event, shared) = match self.named(op.event_obj_id) {
@@ -2695,6 +2698,53 @@ mod tests {
         let queue = std::mem::offset_of!(RgfxCommandBuffer, queue_obj_id);
         elsewhere[queue..queue + 8].copy_from_slice(&99u64.to_le_bytes());
         assert!(!dec.stand_in_for_failed(&elsewhere).unwrap());
+    }
+
+    /// A buffer whose `op_bytes` count fewer than its message's ops is refused as malformed, none
+    /// of its ops carried out, and is stood in for by all of its event ops, those past the count
+    /// among them, so none is dropped with the ops the count leaves out.
+    #[test]
+    fn a_buffer_whose_op_bytes_are_short_is_refused_and_stood_in_for_by_all_its_events() {
+        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        let (p, mut dec) = setup();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            signals.lock().push((m.header.r#type, m.obj_id, m.value));
+        }));
+        let completions = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, u64::from(m.status)));
+        }));
+
+        let mut ops = event_op(RGFX_OP_SIGNAL_EVENT, 7, 4);
+        let first = ops.len() as u64;
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 5));
+        let mut message = command_buffer_message(130, 70, &ops);
+        let op_bytes = std::mem::offset_of!(RgfxCommandBuffer, op_bytes);
+        message[op_bytes..op_bytes + 8].copy_from_slice(&first.to_le_bytes());
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &message).unwrap(),
+            Err(DecodeError::Malformed)
+        );
+        assert!(!p.call_log().sels_since(mark).contains(&"commit"));
+        assert!(posted.lock().is_empty());
+
+        assert!(dec.stand_in_for_failed(&message).unwrap());
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 4),
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 5),
+                (RGFX_EVT_CB_COMPLETE, 130, u64::from(RGFX_CB_INTERNAL)),
+            ]
+        );
     }
 
     /// An event op with an encoder open faults the exec, as does one naming no event.

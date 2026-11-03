@@ -586,15 +586,13 @@ fn no_command_buffer_ends_the_host_or_goes_unanswered() {
             let cb_obj_id = OBJECTS + 1 + i;
             let ops = op_stream(&mut rng);
             let m = command_buffer(&mut rng, cb_obj_id, &ops);
-            // The ops the decoder walks: the message's `op_bytes` of them (another test checks
-            // that those are all of them, `a_command_buffer_s_op_bytes_are_its_message_s_ops`).
+            // The ops the decoder walks: all of the message's, which its `op_bytes` must count
+            // (`a_command_buffer_s_op_bytes_are_its_message_s_ops`).
             let op_bytes = RgfxCommandBuffer::read_from_prefix(&m).unwrap().0.op_bytes;
-            let walked = (op_bytes as usize)
-                .checked_add(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize)
-                .and_then(|end| m.get(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize..end));
-            let holds_unknown = walked
-                .and_then(framed_tags)
-                .is_some_and(|tags| tags.into_iter().any(unknown));
+            let walked = &m[RGFX_COMMAND_BUFFER_OPS_OFFSET as usize..];
+            let counted = op_bytes == walked.len() as u64;
+            let holds_unknown =
+                framed_tags(walked).is_some_and(|tags| tags.into_iter().any(unknown));
             let what = || {
                 format!(
                     "case {case} (RGFX_FUZZ_SEED's mix {case_seed:#x}), command buffer {i}: {}",
@@ -631,6 +629,11 @@ fn no_command_buffer_ends_the_host_or_goes_unanswered() {
                 "{}: carried out, though an op's tag is none a group decodes",
                 what()
             );
+            assert!(
+                !(done && !counted),
+                "{}: carried out, though its op_bytes are not its ops",
+                what()
+            );
             if let Ok(Err(e)) = &outcome {
                 assert_ne!(*e, DecodeError::UnknownCommand, "{}", what());
             }
@@ -654,7 +657,6 @@ fn no_command_buffer_ends_the_host_or_goes_unanswered() {
 /// answered completed. Found by `no_command_buffer_ends_the_host_or_goes_unanswered`: a buffer
 /// whose `op_bytes` read 0 was carried out as an empty one and completed, its blit pass dropped.
 #[test]
-#[ignore = "aud-tests-05: a command buffer's ops past its op_bytes are dropped and it completes"]
 fn a_command_buffer_s_op_bytes_are_its_message_s_ops() {
     let (p, mut dec, seen) = setup();
     let device = p.device();

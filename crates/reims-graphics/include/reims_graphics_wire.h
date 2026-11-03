@@ -2277,7 +2277,8 @@ typedef struct {
   uint64_t queue_obj_id;
   // The command buffer's guest-picked id, which its completion names.
   uint64_t cb_obj_id;
-  // The bytes of op stream that follow this message.
+  // The bytes of op stream that follow this message's fixed part: all of the message's
+  // bytes past it. A message whose `op_bytes` counts fewer or more is refused.
   uint64_t op_bytes;
 } RgfxCommandBuffer;
 
