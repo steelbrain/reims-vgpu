@@ -264,7 +264,13 @@ bool RgfxAccelerator::startContexts()
 	RgfxWatchedRing *rings =
 	    static_cast<RgfxWatchedRing *>(IOMalloc(sizeof(RgfxWatchedRing) * kMaxWatched));
 	// The accelerator is the device's one, for the kernel's life, as the state is.
-	thread_call_t call = thread_call_allocate(releaseFreedBlocks, this);
+	// One release worker at a time: THREAD_CALL_OPTIONS_ONCE coalesces an enter made while it
+	// runs into a single re-run after it returns, so a storm of frees cannot fan it out into a
+	// thread per free (each of which blocks in postLifecycle for its answer, until the 'high'
+	// group's 500-thread cap panics). It runs at kernel priority, below the framebuffer work
+	// loop that delivers its answers, so the one worker never starves that loop.
+	thread_call_t call = thread_call_allocate_with_options(
+	    releaseFreedBlocks, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
 	RgfxBlock *expected = nullptr;
 	if (lock && wlock && table && rings && call &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,

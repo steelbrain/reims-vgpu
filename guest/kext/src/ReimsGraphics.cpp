@@ -299,8 +299,11 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	UInt64 s = 0;
 	IOReturn r = post(type, message, size, &s, &w->seqno);
 	IOLockLock(stateLock);
+	// Each waiter sleeps on its own `done`, so an answer wakes only the thread it is for, not
+	// every waiter (which, with many in flight, would herd on stateLock and starve the work loop
+	// that delivers the answers). The free event below stays the shared array, a slot's seekers'.
 	while (r == kIOReturnSuccess && !w->done) {
-		if (IOLockSleepDeadline(stateLock, lifecycleWaiters, deadline, THREAD_UNINT) ==
+		if (IOLockSleepDeadline(stateLock, &w->done, deadline, THREAD_UNINT) ==
 		    THREAD_TIMED_OUT && !w->done)
 			r = kIOReturnTimeout;
 	}
@@ -532,7 +535,8 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 			w.reply[b] = payload[b - kHeaderBytes];
 		w.length = n;
 		w.done = true;
-		IOLockWakeup(stateLock, lifecycleWaiters, false);
+		// Only the thread this answer is for: its own `done` event, one thread.
+		IOLockWakeup(stateLock, &w.done, true);
 	}
 	IOLockUnlock(stateLock);
 	return found;
