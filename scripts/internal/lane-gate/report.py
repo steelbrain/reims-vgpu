@@ -549,6 +549,10 @@ def write_report(run, base, noise, history=None):
             for _, it in its:
                 st[it["status"]] = st.get(it["status"], 0) + 1
             out.append(f"  {g}: " + ", ".join(f"{v} {k}" for k, v in sorted(st.items())))
+            # A part that did not run at all takes one line, not one per item.
+            if len({(it["status"], it["detail"]) for _, it in its}) == 1 and its[0][1]["status"] != "PASS":
+                out[-1] += f" ({its[0][1]['detail']})"
+                continue
             for name, it in its:
                 if it["status"] != "PASS":
                     out.append(f"    {it['status']:7s} {name}: {it['detail']}")
