@@ -330,7 +330,11 @@ mod tests {
                 address_ranges: None,
                 pinned_gpu_address: None,
             };
-            device.new_heap_over_host_memory(bytes, &desc).unwrap().heap.unwrap()
+            device
+                .new_heap_over_host_memory(bytes, &desc)
+                .unwrap()
+                .heap
+                .unwrap()
         };
         let median = |v: &mut Vec<f64>| {
             v.sort_by(f64::total_cmp);
@@ -365,7 +369,9 @@ mod tests {
         let mut times = Vec::new();
         for k in 0..512u64 {
             let t = Instant::now();
-            let b = heaps[1].new_buffer_of_length(4096, SHARED_TRACKED, k * 4096).unwrap();
+            let b = heaps[1]
+                .new_buffer_of_length(4096, SHARED_TRACKED, k * 4096)
+                .unwrap();
             times.push(t.elapsed().as_secs_f64() * 1e6);
             placed.push(b.unwrap());
         }
@@ -421,7 +427,10 @@ mod tests {
             let us = t.elapsed().as_secs_f64() * 1e6;
             let c1 = counts();
             let t = Instant::now();
-            let b = h.new_buffer_of_length(4096, SHARED_TRACKED, len - 4096).unwrap().unwrap();
+            let b = h
+                .new_buffer_of_length(4096, SHARED_TRACKED, len - 4096)
+                .unwrap()
+                .unwrap();
             let place_us = t.elapsed().as_secs_f64() * 1e6;
             println!(
                 "slab: view heap runs={runs} run={run} bytes={len} map_us={map_us:.1} heap_us={us:.1} \
@@ -500,7 +509,10 @@ mod tests {
                 round(1);
             }
         }
-        series("after making 1,998 again with a command buffer every 100", Instant::now());
+        series(
+            "after making 1,998 again with a command buffer every 100",
+            Instant::now(),
+        );
         let keep = heaps;
         // SAFETY: the RAM, which no GPU work uses now.
         let byte = unsafe {
