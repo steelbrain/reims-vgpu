@@ -65,8 +65,9 @@ GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 
 die() { echo "lane-gate: $*" >&2; exit 2; }
 # One gate at a time: lockf holds $GH/lock for the run, and refuses at once when another holds it.
+# A bench leg (--bench-only) takes no lock: it waits its turn on the lane host beside later gates.
 mkdir -p "$GH/runs" "$GH/baselines"
-if [[ -z ${LANE_GATE_LOCKED:-} ]]; then
+if [[ -z ${LANE_GATE_LOCKED:-} && " $* " != *" --bench-only "* ]]; then
   export LANE_GATE_LOCKED=1
   exec lockf -t 0 "$GH/lock" "$0" "$@"
 fi
