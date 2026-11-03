@@ -396,6 +396,31 @@ inline void rgfxSurfaceUndefer(RgfxSurfaceTable &t, RgfxSurfaceEntry &e, RgfxPag
 	e.runCount = count;
 }
 
+// How a SURFACE_PAGES that names a block's pages ended, and so what the caller does with them:
+// named (the host maps them until the block's release is answered OK), not named (the host
+// answered otherwise, or nothing was posted: the caller unwires them), or unanswered (the host
+// may yet take and map them: they stay wired, as named ones, until the block's release is
+// answered OK, never given back to the guest before).
+enum RgfxPagesNaming : uint32_t {
+	kRgfxPagesNamed = 0,
+	kRgfxPagesNotNamed,
+	kRgfxPagesUnanswered,
+};
+
+// The naming of a SURFACE_PAGES posted, `answered` or not, OK where `ok`.
+inline RgfxPagesNaming rgfxPagesNaming(bool answered, bool ok)
+{
+	if (!answered)
+		return kRgfxPagesUnanswered;
+	return ok ? kRgfxPagesNamed : kRgfxPagesNotNamed;
+}
+
+// Whether the pages stay wired after a naming: unless the host answered it did not take them.
+inline bool rgfxPagesNamingWired(RgfxPagesNaming n)
+{
+	return n != kRgfxPagesNotNamed;
+}
+
 // Whether a new deferred block of `length` bytes fits the device's budget for deferred blocks'
 // caches, `budget` bytes (DEFERRED_BUDGET_LO and _HI), beside those of the deferred blocks there
 // are: a budget of 0 defers none.

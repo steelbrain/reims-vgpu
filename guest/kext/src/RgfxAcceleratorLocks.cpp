@@ -216,14 +216,16 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key)
 	IOMemoryDescriptor *memory = static_cast<IOMemoryDescriptor *>(c->wire);
 	const uint32_t surfaceId = c->surfaceId;
 	IOLockUnlock(state.lock);
-	const bool ok =
-	    memory && accel->attachSurfacePages(context, offset, size, length, memory,
-	                                        RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_ATTACH,
-	                                        nullptr, nullptr);
+	const RgfxPagesNaming naming =
+	    memory ? accel->attachSurfacePages(context, offset, size, length, memory,
+	                                       RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_ATTACH,
+	                                       nullptr, nullptr)
+	           : kRgfxPagesNotNamed;
+	const bool ok = naming == kRgfxPagesNamed;
 	IOLockLock(state.lock);
 	void *map = nullptr, *wire = nullptr, *surface = nullptr;
 	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(
-	    rgfxCacheAttached(state.caches, key, ok, &map, &wire, &surface)));
+	    rgfxCacheAttached(state.caches, key, naming, &map, &wire, &surface)));
 	wakeLocked();
 	if (cache) {
 		// Its block went meanwhile (rgfxCacheLetGo): the let-go is this attach's, out of the
@@ -235,7 +237,7 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key)
 		cache->release();
 		if (surface)
 			static_cast<OSObject *>(surface)->release();
-		letGoMemory(wire, ok);
+		letGoMemory(wire, rgfxPagesNamingWired(naming));
 		IOLockLock(state.lock);
 	}
 	if (!ok)
@@ -536,21 +538,26 @@ void rgfxSurfaceCacheSettle(void *cache, bool deferred)
 	IOLockUnlock(state.lock);
 }
 
-bool rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset, OSObject *surface)
+RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset,
+                                                OSObject *surface)
 {
 	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
-		return false;
+		return kRgfxReleaseAsIs;
 	// Read out of every lock, as at a block's sleep.
 	const int32_t clients = rgfxIOSurfaceClientCount(surface);
 	const int32_t retains = surface->getRetainCount();
-	bool unattached = false;
+	RgfxReleaseAttach did = kRgfxReleaseAsIs;
 	IOLockLock(state.lock);
 	for (;;) {
 		const RgfxCacheReleaseStep step =
 		    rgfxCacheReleaseNext(state.caches, offset, clients, retains);
 		if (step == kRgfxCacheReleaseAttach) {
-			const RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
-			unattached = !attachLocked(accel, c->key);
+			const uint64_t key = rgfxCacheAtBlock(state.caches, offset)->key;
+			attachLocked(accel, key);
+			// Named, or asked and not answered (kRgfxCacheAttachLate): the host may map them.
+			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
+			did = c != nullptr && rgfxCacheHostPages(*c) ? kRgfxReleaseAttached
+			                                             : kRgfxReleaseUnattached;
 			break;
 		}
 		// A lock's attach in flight ends within its SURFACE_PAGES's answer time, and none
@@ -561,11 +568,34 @@ bool rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset, OSObje
 			continue;
 		}
 		const RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
-		unattached = c != nullptr && c->deferral == kRgfxCacheDeferred;
+		if (c != nullptr && c->deferral == kRgfxCacheDeferred)
+			did = kRgfxReleaseUnattached;
 		break;
 	}
 	IOLockUnlock(state.lock);
-	return unattached;
+	return did;
+}
+
+IOMemoryDescriptor *rgfxSurfaceCacheHostPages(void *cache, UInt64 offset)
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return nullptr;
+	IOLockLock(state.lock);
+	const RgfxCachedSurface *c = cache ? rgfxCacheFind(state.caches, reinterpret_cast<uintptr_t>(cache))
+	                                   : rgfxCacheAtBlock(state.caches, offset);
+	IOMemoryDescriptor *memory = c != nullptr && rgfxCacheHostPages(*c)
+	                                 ? static_cast<IOMemoryDescriptor *>(c->wire)
+	                                 : nullptr;
+	if (memory)
+		memory->retain();
+	IOLockUnlock(state.lock);
+	if (memory && memory->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
+		IOLog("RgfxAccelerator: the deferred block 0x%llx's pages could not be wired for its "
+		      "block\n",
+		      offset);
+		OSSafeReleaseNULL(memory);
+	}
+	return memory;
 }
 
 namespace {

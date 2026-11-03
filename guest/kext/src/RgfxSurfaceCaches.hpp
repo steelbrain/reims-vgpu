@@ -74,6 +74,10 @@ enum RgfxCacheDeferral : uint32_t {
 	kRgfxCacheAttaching,
 	// Its pages were named after its ask: as a block not deferred.
 	kRgfxCacheAttached,
+	// Its attach was not answered in time: the host may yet take its pages, so they stay wired,
+	// as an attached block's, until its release is answered OK, and a lock goes on as for one
+	// attached, never naming them again.
+	kRgfxCacheAttachLate,
 };
 
 // One cached surface.
@@ -185,7 +189,17 @@ inline RgfxCachedSurface *rgfxCacheAdd(RgfxCacheTable &t, uint64_t key, uint64_t
 // named, whose memory is only retained, and which the caller then releases unprepared.
 inline bool rgfxCacheWired(const RgfxCachedSurface &c)
 {
-	return c.deferral == kRgfxCacheNotDeferred || c.deferral == kRgfxCacheAttached;
+	return c.deferral == kRgfxCacheNotDeferred || c.deferral == kRgfxCacheAttached ||
+	       c.deferral == kRgfxCacheAttachLate;
+}
+
+// Whether the host may map a deferred block's pages: named, being named, or asked and not
+// answered. Its holders wire none, so its block takes a wire of them as it goes, which it keeps
+// until its release is answered OK.
+inline bool rgfxCacheHostPages(const RgfxCachedSurface &c)
+{
+	return c.deferral == kRgfxCacheAttaching || c.deferral == kRgfxCacheAttached ||
+	       c.deferral == kRgfxCacheAttachLate;
 }
 
 // Takes `c` out of the table: its mapping and its wired memory, which the caller lets go, in
@@ -417,19 +431,23 @@ inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, 
 		c->copied = mark;
 }
 
-// The attach a lock or the release asked of surface `key` (kRgfxCacheAttach) was answered, OK
-// where `ok`: its pages are the cache's from here on, or are still to name. Where its block went
-// meanwhile (`forgotten`), the surface is taken out (its mapping, its memory, wired where `ok`,
-// and the surface's reference in `*map`, `*wire` and `*surface`) and its key returned, the device
-// cache whose reference the caller releases, then the surface's; else 0.
-inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, bool ok, void **map,
-                                  void **wire, void **surface)
+// The attach a lock or the release asked of surface `key` (kRgfxCacheAttach) ended as `naming`:
+// its pages are the cache's from here on, or are still to name, or, not answered, may yet be the
+// host's (kRgfxCacheAttachLate). Where its block went meanwhile (`forgotten`), the surface is
+// taken out (its mapping, its memory, wired where rgfxPagesNamingWired, and the surface's
+// reference in `*map`, `*wire` and `*surface`) and its key returned, the device cache whose
+// reference the caller releases, then the surface's; else 0. Such a block took a wire of its own
+// as it went (rgfxCacheHostPages), so the host's pages outlive the cache's.
+inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, RgfxPagesNaming naming,
+                                  void **map, void **wire, void **surface)
 {
 	*map = *wire = *surface = nullptr;
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr || c->deferral != kRgfxCacheAttaching)
 		return 0;
-	c->deferral = ok ? kRgfxCacheAttached : kRgfxCacheDeferred;
+	c->deferral = naming == kRgfxPagesNamed       ? kRgfxCacheAttached
+	              : naming == kRgfxPagesUnanswered ? kRgfxCacheAttachLate
+	                                               : kRgfxCacheDeferred;
 	if (!c->forgotten)
 		return 0;
 	*surface = c->surface;

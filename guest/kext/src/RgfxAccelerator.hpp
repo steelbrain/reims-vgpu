@@ -91,6 +91,8 @@ constexpr uint64_t kRgfxKextFeatureWord =
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
 struct RgfxSurfaceEntry;
+// How a SURFACE_PAGES naming a block's pages ended (RgfxSurfaceBlocks.hpp).
+enum RgfxPagesNaming : uint32_t;
 class RgfxSurfaceUserClient;
 class ReimsGraphics;
 
@@ -199,11 +201,28 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 // The host answered the ask of the block of device cache `cache`: deferred where `deferred`,
 // else its pages are named, its surface's memory wired. Locks waiting for the answer go on.
 void rgfxSurfaceCacheSettle(void *cache, bool deferred);
+// What rgfxSurfaceCacheReleaseAttach did.
+enum RgfxReleaseAttach {
+	// Nothing: not a deferred block, or one whose pages were named before.
+	kRgfxReleaseAsIs,
+	// A deferred block going with its pages never named: nothing reads them.
+	kRgfxReleaseUnattached,
+	// Its pages were named now, or asked and not answered: the host may map them until the
+	// block's release is answered OK, so the block takes a wire of them
+	// (rgfxSurfaceCacheHostPages).
+	kRgfxReleaseAttached,
+};
 // The release thread is to post the BLOCK_RELEASE of the cached block at `offset`, of surface
 // `surface` (retained by the caller): a deferred block's pages are named first where the GPU
-// wrote it and the surface lives past the kext's own references (rgfxCacheReleaseNext). True
-// where the block goes with its pages never named. Under no lock of the kext's.
-bool rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset, OSObject *surface);
+// wrote it and the surface lives past the kext's own references (rgfxCacheReleaseNext). Under no
+// lock of the kext's.
+RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset,
+                                                OSObject *surface);
+// The pages of the deferred block of device cache `cache`, or else of the block at `offset`,
+// where the host may map them (rgfxCacheHostPages): its surface's memory, retained and wired once
+// more for the block to hold until its release is answered OK; else null. Takes the locks' lock
+// alone, and wires out of it.
+IOMemoryDescriptor *rgfxSurfaceCacheHostPages(void *cache, UInt64 offset);
 
 // A command queue's completion ring the accelerator watches for its client
 // (RgfxAcceleratorContexts.cpp): the ring's header, mapped into the kernel, and the producer
@@ -351,13 +370,14 @@ public:
 	// Names the pages of the in-place block at `offset` made by context `context`: wires the
 	// first `length` bytes of the surface's memory `memory`, writes their runs past the `size`
 	// bytes its holders map, and posts its SURFACE_PAGES with `flags` (RGFX_SURFACE_PAGES_*): a
-	// deferred block's attach, or the pages of a block its ask meant to defer. True where the
-	// device answered OK, `memory` then wired and the runs in `*runs` (IOMalloc'd, `*count`
-	// of them, the caller's) where asked for; false, `memory` as it was. Under no lock of the
-	// kext's.
-	bool attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size, UInt64 length,
-	                        IOMemoryDescriptor *memory, UInt32 flags, RgfxPageRun **runs,
-	                        UInt32 *count);
+	// deferred block's attach, or the pages of a block its ask meant to defer. Named, the device
+	// answered OK, `memory` wired, and the runs in `*runs` (IOMalloc'd, `*count` of them, the
+	// caller's) where asked for; not named, `memory` as it was; unanswered, `memory` left wired
+	// once more, which the caller keeps until the block's release is answered OK, the host free to
+	// take the pages yet (rgfxPagesNaming). Under no lock of the kext's.
+	RgfxPagesNaming attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size, UInt64 length,
+	                                   IOMemoryDescriptor *memory, UInt32 flags,
+	                                   RgfxPageRun **runs, UInt32 *count);
 	IOReturn releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset);
 	void dropSurfaceBlocks(const void *client, bool closed);
 	// The processes' object lifecycle, on the framebuffer's control ring

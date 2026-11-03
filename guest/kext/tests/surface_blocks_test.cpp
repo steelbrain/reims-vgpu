@@ -4,7 +4,8 @@
 // held again only by its own device cache, live, and the dormant blocks past their caps go
 // oldest first. A deferred block is found by its surface alone, never by pages, counts against
 // the device's budget while it lives and against half of it while dormant, and keeps room for
-// one run a page of its whole allocation, every plane's.
+// one run a page of its whole allocation, every plane's. Pages a SURFACE_PAGES named and the
+// host never answered for stay wired.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
@@ -246,8 +247,24 @@ void deferred()
 	check(t.deferredBytes == kBgra4k, "and its let-go counts nothing twice");
 }
 
+// A SURFACE_PAGES naming a block's pages: named, refused, or never answered, where the host may
+// yet take them and they stay wired.
+void naming()
+{
+	check(rgfxPagesNaming(true, true) == kRgfxPagesNamed && rgfxPagesNamingWired(kRgfxPagesNamed),
+	      "answered OK: named, wired");
+	check(rgfxPagesNaming(true, false) == kRgfxPagesNotNamed &&
+	          !rgfxPagesNamingWired(kRgfxPagesNotNamed),
+	      "answered otherwise: not named, unwired");
+	check(rgfxPagesNaming(false, false) == kRgfxPagesUnanswered &&
+	          rgfxPagesNaming(false, true) == kRgfxPagesUnanswered &&
+	          rgfxPagesNamingWired(kRgfxPagesUnanswered),
+	      "never answered: kept wired, the host free to take them yet");
+}
+
 int main()
 {
+	naming();
 	deferred();
 	dormancy();
 	RgfxSurfaceEntry entries[4] = {};

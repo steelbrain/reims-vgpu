@@ -490,12 +490,25 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 			// lives on, so the release copies the cache into them (rgfxCacheReleaseNext).
 			bool written = false;
 			if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
-				if (rgfxSurfaceCacheReleaseAttach(accel, block.offset, surface)) {
-					IOLockLock(contextLock);
+				const RgfxReleaseAttach attach =
+				    rgfxSurfaceCacheReleaseAttach(accel, block.offset, surface);
+				// Pages the host may map now: the block holds them wired until its release is
+				// answered OK, whatever becomes of its cache.
+				IOMemoryDescriptor *hostPages = attach == kRgfxReleaseAttached
+				                                    ? rgfxSurfaceCacheHostPages(nullptr, block.offset)
+				                                    : nullptr;
+				IOLockLock(contextLock);
+				if (attach == kRgfxReleaseUnattached) {
 					dormantStats.deferredUnattached++;
 					dormantStats.changes++;
-					IOLockUnlock(contextLock);
 				}
+				const bool held =
+				    !hostPages || rgfxBlockSetWired(blockTable, block.offset, hostPages);
+				IOLockUnlock(contextLock);
+				if (!held)
+					IOLog("RgfxAccelerator: the deferred block 0x%llx's pages stay wired for "
+					      "good: its block is gone\n",
+					      block.offset);
 				release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
 				surface->release();
 			}
@@ -1105,6 +1118,11 @@ bool writeRuns(IODeviceMemory *region, UInt64 at, const RgfxPageRun *runs, UInt3
 bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nullptr,
                 bool *kept = nullptr)
 {
+	// A deferred block's holders wire no pages: where the host may map them (named, being named,
+	// or asked and not answered), the block takes a wire of its own, before its cache goes.
+	IOMemoryDescriptor *hostPages = e.inPlace && e.deferred && !wired && e.cache
+	                                    ? rgfxSurfaceCacheHostPages(e.cache, e.offset)
+	                                    : nullptr;
 	bool release = false;
 	if (!keep) {
 		if (!e.dormant)
@@ -1118,6 +1136,12 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nu
 	bool ownedWire = e.inPlace && wired && rgfxBlockSetWired(blockTable, e.offset, wired);
 	if (kept)
 		*kept = ownedWire;
+	// Never given back to the guest while the host may map it: kept for good where the block
+	// cannot hold it.
+	if (hostPages && !rgfxBlockSetWired(blockTable, e.offset, hostPages))
+		IOLog("RgfxAccelerator: the deferred block 0x%llx's pages stay wired for good: its block "
+		      "is gone\n",
+		      e.offset);
 	freeRuns(e.runs, e.runCount);
 	// Its surface's locks no longer wait for the writes named of it; a cached one's wait for
 	// its release's answer, which copies the cache into the pages. A cached block kept instead
@@ -1819,8 +1843,9 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 		                             RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED,
 		                             &status);
 		if (r == kIOReturnSuccess || r != kIOReturnUnsupported || status != RGFX_STATUS_REFUSED) {
-			// Deferred, or not answered: a block whose answer did not come goes, its pages
-			// never named.
+			// Deferred, or not answered: a block whose answer did not come goes through its
+			// release, its region bytes given out again only at an OK answer. No guest page was
+			// named, so nothing the host may touch is given back.
 			rgfxSurfaceCacheSettle(cache, true);
 			IOLockLock(contextLock);
 			dormantStats.deferred += r == kIOReturnSuccess;
@@ -1842,12 +1867,27 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 	IOMemoryDescriptor *memory = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
 	RgfxPageRun *runs = nullptr;
 	UInt32 count = 0;
-	const bool named =
-	    memory && attachSurfacePages(context, offset, size, length, memory,
-	                                 *cached ? RGFX_SURFACE_PAGES_CACHED : 0, &runs, &count);
+	const RgfxPagesNaming naming =
+	    memory ? attachSurfacePages(context, offset, size, length, memory,
+	                                *cached ? RGFX_SURFACE_PAGES_CACHED : 0, &runs, &count)
+	           : kRgfxPagesNotNamed;
 	if (*cached)
-		rgfxSurfaceCacheSettle(cache, !named);
-	if (!named) {
+		rgfxSurfaceCacheSettle(cache, naming != kRgfxPagesNamed);
+	if (naming == kRgfxPagesUnanswered) {
+		// The host may yet map the pages: the asker's hold takes the wiring the naming left, which
+		// the block keeps as it goes until its release is answered OK.
+		memory->retain();
+		IOLockLock(contextLock);
+		if (e.holdCount)
+			e.holds[0].pages = memory;
+		const bool held = e.holdCount != 0;
+		IOLockUnlock(contextLock);
+		if (!held)
+			IOLog("RgfxAccelerator: the block 0x%llx's pages stay wired for good: no hold to "
+			      "keep them\n",
+			      offset);
+	}
+	if (naming != kRgfxPagesNamed) {
 		OSSafeReleaseNULL(uncached);
 		return false;
 	}
@@ -1864,29 +1904,39 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 	return true;
 }
 
-bool RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size,
-                                         UInt64 length, IOMemoryDescriptor *memory, UInt32 flags,
-                                         RgfxPageRun **runsOut, UInt32 *countOut)
+RgfxPagesNaming RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size,
+                                                    UInt64 length, IOMemoryDescriptor *memory,
+                                                    UInt32 flags, RgfxPageRun **runsOut,
+                                                    UInt32 *countOut)
 {
 	if (length > memory->getLength() || memory->prepare(kIODirectionOutIn) != kIOReturnSuccess)
-		return false;
+		return kRgfxPagesNotNamed;
 	UInt32 count = 0;
 	RgfxPageRun *runs = walkRuns(memory, 0, length, &count);
+	RgfxPagesNaming naming = kRgfxPagesNotNamed;
 	const char *why = nullptr;
-	if (!runs)
+	if (!runs) {
 		why = "its runs do not fit";
-	else if (!writeRuns(region, offset + size, runs, count))
+	} else if (!writeRuns(region, offset + size, runs, count)) {
 		why = "its runs could not be written";
-	else if (IOReturn r = postPages(context, offset, size + rgfxSurfaceRunRoom(length),
-	                                offset + size, length, count, flags);
-	         r != kIOReturnSuccess)
-		why = r == kIOReturnUnsupported ? "the device refused them" : "they were not answered";
-	if (why) {
+	} else {
+		const IOReturn r = postPages(context, offset, size + rgfxSurfaceRunRoom(length),
+		                             offset + size, length, count, flags);
+		naming = rgfxPagesNaming(r == kIOReturnSuccess || r == kIOReturnUnsupported,
+		                         r == kIOReturnSuccess);
+		if (naming == kRgfxPagesNotNamed)
+			why = "the device refused them";
+		else if (naming == kRgfxPagesUnanswered)
+			why = "they were not answered, and stay wired until the block's release is answered";
+	}
+	if (naming != kRgfxPagesNamed) {
 		IOLog("RgfxAccelerator: the block 0x%llx's pages (flags 0x%x) were not named: %s\n",
 		      offset, flags, why);
 		freeRuns(runs, count);
-		memory->complete(kIODirectionOutIn);
-		return false;
+		// The host may yet take pages it did not answer for: those stay wired.
+		if (!rgfxPagesNamingWired(naming))
+			memory->complete(kIODirectionOutIn);
+		return naming;
 	}
 	if (runsOut) {
 		*runsOut = runs;
@@ -1894,7 +1944,7 @@ bool RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offset, UInt64 s
 	} else {
 		freeRuns(runs, count);
 	}
-	return true;
+	return naming;
 }
 
 bool RgfxAccelerator::downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs)
