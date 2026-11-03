@@ -187,7 +187,8 @@ so an app with a short `didModifyRange:` works on AMD, where ours uploads the ra
 
 ## Q3: Shared storage
 
-Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `spin`.
+Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `argenc shared|managed`,
+`nocopy`, `didmodify length|nocopy`, `linalign`, `spin`.
 
 - **Shared textures** (`newTextureWithDescriptor:` of storage Shared) are made on AMD, Intel and
   the M3. On AMD such a texture behaves like an unsynchronized Managed one: `getBytes:` never
@@ -198,6 +199,40 @@ Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `spin`.
   buffer is seen by the next GPU read of the texture, and a render clear of the texture lands
   in the buffer at completion. Over a Managed buffer it follows Managed's rules. That is our
   design (Decided 4).
+- **Where a texture over a buffer may lie** (`linalign`, 11-03): the public form
+  (`newTextureWithDescriptor:offset:bytesPerRow:`) and the linear SPI
+  (`newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`) take offsets and pitches
+  that are multiples of `minimumLinearTextureAlignmentForPixelFormat:` (256 on both), over
+  Shared and Managed buffers alike. Of 468 x 36 BGRA8 at offsets 0, 0x40 and 0x100 and pitches
+  1872, 1920 and 2048, AMD makes those at 0 and 0x100 with 2048 and answers nil for the rest;
+  Intel ends the process at `_mtlValidateStrideTextureParameters`' assertion. The tiled SPI
+  (`newTiledTextureWithDescriptor:offset:bytesPerRow:`, a Managed descriptor over a Shared
+  buffer) takes every one. Ours: the two forms answer nil off the alignment, as AMD, and the
+  tiled SPI takes any place (`RgfxBuffer.mm`).
+- **replaceRegion: of a linear texture over a Managed buffer** (`lintex managed`, 11-03) reaches
+  the GPU's next read of the texture with no `didModifyRange:`, on AMD as on Intel, and the
+  buffer's bytes hold the rows. A replaceRegion: of a 16 x 1 corner after a CPU write of the
+  whole buffer with no call shows the GPU the corner and the CPU's write: AMD uploads the whole
+  buffer, Intel is one copy. Ours: the bundle tells the host the rows' span, as the buffer's
+  `didModifyRange:` of it (`RgfxTexture.mm`, rgfxCopyRegion:), and only the span, as Q2's
+  `didModifyRange:` uploads its range alone.
+- **didModifyData (SPI) of a linear texture over a Managed buffer** (`didmodify`, 11-03): on AMD
+  the GPU sees a CPU write with no call only after the texture's `didModifyData`, which uploads
+  the whole buffer, made by `newBufferWithLength:` or over the app's pages alike; Intel is one
+  copy. CoreAnimation calls it: a dtrace (the objc provider) of an in-process CARenderer on AMD
+  showed `-[MTLIOAccelTexture didModifyData]` on a backing texture it reused once the CPU redrew
+  it, and no `didModifyRange:` of the texture's buffer; it made those textures with
+  `newTiledTextureWithBytesNoCopy:` (a scratch probe, not kept). Ours: the buffer's
+  `didModifyRange:` of all of it (`RgfxTexture.mm`).
+- **A no-copy Managed buffer** (`nocopy`, 11-03) is two copies on AMD: the GPU's copy holds zeros,
+  not the pages' bytes, until a `didModifyRange:`, and a CPU write with no call is never seen
+  (also 200 ms later). Ours is two copies on a discrete host too, the GPU's copy filled from the
+  pages at the create.
+- **An argument encoder writing a Managed argument buffer** (`argenc managed`, 11-03):
+  `setBuffer:` and `setTexture:` reach the GPU's copy on AMD only at the app's
+  `didModifyRange:`; Intel is one copy. A Shared argument buffer's writes are seen at once on
+  both. Ours: the encoder writes the buffer's bytes and tells the host nothing, as Metal leaves
+  the call to the app.
 - **A Shared buffer while the GPU runs:** a 1.3 s kernel polling a word (atomic and plain loads)
   never saw a CPU write made 20 ms after scheduling, on either x86 GPU; a kernel storing its
   progress was never seen by a CPU polling every millisecond before completion. Shared memory is
