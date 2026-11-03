@@ -35,9 +35,11 @@
 #                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
 #   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
 #                 info,reims_graphics::room=debug to count a path's debug records
-#   --bench-host-log FILTER  the bench boot's host log filter (default info,reims_vgpu::work=debug,
-#                 the runtime's work counts each second, which report.py rates the drags and WebGL
-#                 by); another filter makes a control: never --record it
+#   --bench-host-log FILTER  the bench boot's host log filter (default info), as
+#                 info,reims_vgpu::work=debug for the runtime's work counts each second, which
+#                 report.py rates the drags and WebGL by; their logger costs the numbers it rates
+#                 (car 9: draws.10k 2.54M a second without it, 0.80M with it), so another filter
+#                 makes a control: never --record it
 #   --final-cmd CMD  run CMD in the guest (bash, as the user, 120 s at most) at the end of the
 #                 correctness boot's final phase; its output is guest.log's "GATE final-cmd:" lines
 #   --capture-boot  capture what the correctness boot's display showed as it booted (msi-boot.sh's
@@ -552,9 +554,9 @@ LOCK_WAIT_S=${LOCK_WAIT_S:-3600}
 PHASES="$ph"
 PRESENT_S=$pres
 LOAD=$([[ $mode == bench ]] && echo "$load")
-# The bench's host log carries the host's work counts each second (reims_vgpu::work at debug: the
-# runtime's and each guest context's), which report.py reads over the drags and WebGL.
-HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo "${bench_host_log:-info,reims_vgpu::work=debug}")
+# The bench's host log is info: the work counts' logger (reims_vgpu::work at debug) slows what it
+# rates, and runs only where --bench-host-log asks for it.
+HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo "${bench_host_log:-info}")
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_cmd" | base64 | tr -d '\n')
