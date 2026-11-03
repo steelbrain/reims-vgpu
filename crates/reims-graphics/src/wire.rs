@@ -204,20 +204,26 @@ pub const RGFX_CONTEXT_ALLOCATIONS_OFFSET: u64 = RGFX_ALLOCATIONS_OFFSET + RGFX_
 /// `c << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's: the guest bundle picks them
 /// there, and `CONTEXT_CLOSE` drops the context's.
 pub const RGFX_CONTEXT_OBJ_ID_SHIFT: u32 = 40;
-/// How many processes hold the device at once: each holds one slot of the GPU address space,
-/// which the kext hands out with its context.
-pub const RGFX_CONTEXT_SLOTS: u32 = 32;
-/// Where slot 0's GPU addresses start; slot `s`'s start [`RGFX_CONTEXT_VA_SPAN`] bytes a slot
-/// later. The slots fill the top half of the Metal address space, `[2^46, 2^47)`, which no range
-/// the host places itself reaches: the platform's runtime places its own buffers of Metal's space
-/// lowest first from 2^32, and the Vulkan platform's model of Metal's layout places the host's
-/// unpinned buffers and textures lowest first from 2^40, each as far as its live ranges reach,
-/// which the host's memory bounds far below 2^46. A guest's pin meets only the guest's own
-/// ranges then.
+/// Where the guest's GPU addresses start. The kext hands each context (each process) a range of
+/// its own from `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, the top half of the Metal address
+/// space, `[2^46, 2^47)`, which no range the host places itself reaches: the platform's runtime
+/// places its own buffers of Metal's space lowest first from 2^32, and the Vulkan platform's
+/// model of Metal's layout places the host's unpinned buffers and textures lowest first from
+/// 2^40, each as far as its live ranges reach, which the host's memory bounds far below 2^46. A
+/// guest's pin meets only the guest's own ranges then. The host takes each range as given: it
+/// knows no context's range, only that the guest's lie here.
 pub const RGFX_CONTEXT_VA_BASE: u64 = 0x4000_0000_0000;
-/// The GPU addresses each slot picks from: 2 TiB, so a process's picks, which go forward through
-/// its slot before they come round to a range given back, come round only after 2^26 picks of
-/// the least span.
+/// Where the guest's GPU addresses end: 2^47, the Metal address space's end.
+pub const RGFX_CONTEXT_VA_END: u64 = 0x8000_0000_0000;
+/// The unit the kext hands the contexts' ranges out in: 64 GiB, so the guest's addresses hold
+/// [`RGFX_CONTEXT_VA_UNITS`] of them. A context holds an aligned run of units, a power of two of
+/// them, from its open to its close (`guest/kext/src/RgfxContextSlots.hpp`).
+pub const RGFX_CONTEXT_VA_UNIT: u64 = 0x10_0000_0000;
+/// How many units the guest's GPU addresses hold: 1024.
+pub const RGFX_CONTEXT_VA_UNITS: u32 = 1024;
+/// The GPU addresses a context holds where its bundle takes no span from the kext (a kext or a
+/// bundle without the kext's `ContextSpan` feature, whose `OpenContext` answers five values):
+/// 2 TiB from a base 2 TiB aligned, as each of the 32 slots of a kext before it held.
 pub const RGFX_CONTEXT_VA_SPAN: u64 = 0x200_0000_0000;
 /// The first texture resource id the host refuses: every process's textures share the host
 /// device's one space of ids, and Metal ends the process for a texture placed at 16381 or more
@@ -952,10 +958,19 @@ const _: () = {
     );
     // The bundle keeps a chunk's free ids in one 64-bit mask.
     assert!(RGFX_RESOURCE_ID_CHUNK == 64);
-    // Every slot's GPU addresses lie below the Metal address space's end, 2^47.
-    assert!(RGFX_CONTEXT_VA_BASE + RGFX_CONTEXT_SLOTS as u64 * RGFX_CONTEXT_VA_SPAN <= 1u64 << 47);
-    // ... and at 2^46 or above, which the host's own ranges never reach (RGFX_CONTEXT_VA_BASE).
+    // The units fill the guest's GPU addresses, which end at the Metal address space's end,
+    // 2^47, and start at 2^46 or above, which the host's own ranges never reach
+    // (RGFX_CONTEXT_VA_BASE).
+    assert!(
+        RGFX_CONTEXT_VA_BASE + RGFX_CONTEXT_VA_UNITS as u64 * RGFX_CONTEXT_VA_UNIT
+            == RGFX_CONTEXT_VA_END
+    );
+    assert!(RGFX_CONTEXT_VA_END <= 1u64 << 47);
     assert!(RGFX_CONTEXT_VA_BASE >= 1u64 << 46);
+    // A context of the old span holds a whole number of units, a power of two of them, so it is
+    // an aligned run of them.
+    assert!(RGFX_CONTEXT_VA_SPAN % RGFX_CONTEXT_VA_UNIT == 0);
+    assert!((RGFX_CONTEXT_VA_SPAN / RGFX_CONTEXT_VA_UNIT).is_power_of_two());
 };
 
 // ---------------------------------------------------------------------------
@@ -2544,6 +2559,10 @@ pub const RGFX_DEVICE_INFO_FEATURE_SETS: usize = 32;
 
 /// The integer identity answers [`RgfxDeviceInfo::sizes`] holds.
 pub const RGFX_DEVICE_INFO_SIZES: usize = 19;
+
+/// Where [`RgfxDeviceInfo::sizes`] holds `maxBufferLength`, which the kext reads to size the
+/// contexts' GPU-address ranges (`guest/kext/src/RgfxContextSlots.hpp`).
+pub const RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH: usize = 7;
 
 /// The `BOOL` identity answers [`RgfxDeviceInfo::identity_flags`] holds.
 pub const RGFX_DEVICE_INFO_IDENTITY_FLAGS: usize = 19;

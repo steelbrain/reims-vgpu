@@ -83,9 +83,10 @@ enum {
 };
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
-// second word kRgfxAccelMethodFeatures answers: Submit's deferred flag and TakeAnswers. Each bit
-// is set by the change that lands its call.
-constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeatureDeferredAnswers;
+// second word kRgfxAccelMethodFeatures answers: Submit's deferred flag and TakeAnswers, and
+// OpenContext's span. Each bit is set by the change that lands its call.
+constexpr uint64_t kRgfxKextFeatureWord =
+    kRgfxKextFeatureDeferredAnswers | kRgfxKextFeatureContextSpan;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -196,11 +197,15 @@ public:
 	void settleBundle();
 
 	// The processes' contexts (RgfxAcceleratorContexts.cpp). A context number is handed out once
-	// (from 1); a slot of the GPU-address space is held until the close.
-	IOReturn openContext(UInt32 *context, UInt32 *slot);
+	// (from 1); a run of units of the GPU-address space (RgfxContextSlots.hpp), `*units` from
+	// `*first`, is held until the close: the units a context holds, or RGFX_CONTEXT_VA_SPAN's
+	// for a bundle that takes no span from the kext (`oldSpan`). WindowServer's
+	// (`windowServer`) may take the last units free. kIOReturnNoResources where no run is free.
+	IOReturn openContext(UInt32 *context, bool oldSpan, bool windowServer, UInt32 *first,
+	                     UInt32 *units);
 	// True where the device answered the close OK: it holds nothing of the context, and every
-	// command buffer of it has finished.
-	bool closeContext(UInt32 context, UInt32 slot);
+	// command buffer of it has finished. The context's units are given back either way.
+	bool closeContext(UInt32 context, UInt32 first, UInt32 units);
 	// Chunks of the texture resource ids, each owned by `owner` for context `context` and posted
 	// to the device (RESOURCE_ID_CHUNK) before takeIdChunk returns its first id; the owner's are
 	// freed after its context's close is answered.

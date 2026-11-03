@@ -31,9 +31,12 @@ enum {
 enum {
 	// Opens the client's context and its window. No input; out: the context number c, the
 	// object-id base (c << RGFX_CONTEXT_OBJ_ID_SHIFT), the GPU-address base of the context's
-	// slot, and the window's base in the process and its size (the region's): region offset o
+	// range, and the window's base in the process and its size (the region's): region offset o
 	// of what the client is given lies at the base plus o, and nothing else of the region is
-	// mapped there (RgfxAcceleratorUserClient.hpp).
+	// mapped there (RgfxAcceleratorUserClient.hpp). A sixth output, where asked
+	// (kRgfxKextFeatureContextSpan), is the range's span in bytes, from the base; a client that
+	// asks for five holds RGFX_CONTEXT_VA_SPAN from the base. kIOReturnNoResources where the
+	// kext has no range left (RgfxContextSlots.hpp).
 	kRgfxAccelMethodOpenContext = 0x100,
 	// A region block: in size, align (a power of two); out: its region offset.
 	kRgfxAccelMethodAlloc = 0x101,
@@ -163,6 +166,8 @@ enum {
 	kRgfxKextFeatureConsumedDoorbell = 1 << 3,
 	// Submit's (0x105) deferred-answer flag, and TakeAnswers, 0x112.
 	kRgfxKextFeatureDeferredAnswers = 1 << 4,
+	// OpenContext's (0x100) sixth output, the span of the context's GPU addresses.
+	kRgfxKextFeatureContextSpan = 1 << 5,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

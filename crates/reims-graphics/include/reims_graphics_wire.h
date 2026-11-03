@@ -1049,22 +1049,30 @@
 // there, and `CONTEXT_CLOSE` drops the context's.
 #define RGFX_CONTEXT_OBJ_ID_SHIFT 40
 
-// How many processes hold the device at once: each holds one slot of the GPU address space,
-// which the kext hands out with its context.
-#define RGFX_CONTEXT_SLOTS 32
-
-// Where slot 0's GPU addresses start; slot `s`'s start [`RGFX_CONTEXT_VA_SPAN`] bytes a slot
-// later. The slots fill the top half of the Metal address space, `[2^46, 2^47)`, which no range
-// the host places itself reaches: the platform's runtime places its own buffers of Metal's space
-// lowest first from 2^32, and the Vulkan platform's model of Metal's layout places the host's
-// unpinned buffers and textures lowest first from 2^40, each as far as its live ranges reach,
-// which the host's memory bounds far below 2^46. A guest's pin meets only the guest's own
-// ranges then.
+// Where the guest's GPU addresses start. The kext hands each context (each process) a range of
+// its own from `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, the top half of the Metal address
+// space, `[2^46, 2^47)`, which no range the host places itself reaches: the platform's runtime
+// places its own buffers of Metal's space lowest first from 2^32, and the Vulkan platform's
+// model of Metal's layout places the host's unpinned buffers and textures lowest first from
+// 2^40, each as far as its live ranges reach, which the host's memory bounds far below 2^46. A
+// guest's pin meets only the guest's own ranges then. The host takes each range as given: it
+// knows no context's range, only that the guest's lie here.
 #define RGFX_CONTEXT_VA_BASE 70368744177664
 
-// The GPU addresses each slot picks from: 2 TiB, so a process's picks, which go forward through
-// its slot before they come round to a range given back, come round only after 2^26 picks of
-// the least span.
+// Where the guest's GPU addresses end: 2^47, the Metal address space's end.
+#define RGFX_CONTEXT_VA_END 140737488355328
+
+// The unit the kext hands the contexts' ranges out in: 64 GiB, so the guest's addresses hold
+// [`RGFX_CONTEXT_VA_UNITS`] of them. A context holds an aligned run of units, a power of two of
+// them, from its open to its close (`guest/kext/src/RgfxContextSlots.hpp`).
+#define RGFX_CONTEXT_VA_UNIT 68719476736
+
+// How many units the guest's GPU addresses hold: 1024.
+#define RGFX_CONTEXT_VA_UNITS 1024
+
+// The GPU addresses a context holds where its bundle takes no span from the kext (a kext or a
+// bundle without the kext's `ContextSpan` feature, whose `OpenContext` answers five values):
+// 2 TiB from a base 2 TiB aligned, as each of the 32 slots of a kext before it held.
 #define RGFX_CONTEXT_VA_SPAN 2199023255552
 
 // The first texture resource id the host refuses: every process's textures share the host
@@ -1775,6 +1783,10 @@
 
 // The integer identity answers [`RgfxDeviceInfo::sizes`] holds.
 #define RGFX_DEVICE_INFO_SIZES 19
+
+// Where [`RgfxDeviceInfo::sizes`] holds `maxBufferLength`, which the kext reads to size the
+// contexts' GPU-address ranges (`guest/kext/src/RgfxContextSlots.hpp`).
+#define RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH 7
 
 // The `BOOL` identity answers [`RgfxDeviceInfo::identity_flags`] holds.
 #define RGFX_DEVICE_INFO_IDENTITY_FLAGS 19

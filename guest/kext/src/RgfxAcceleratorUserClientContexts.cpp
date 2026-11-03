@@ -10,6 +10,7 @@
 
 #include "RgfxAcceleratorUserClient.hpp"
 #include "ReimsGraphics.hpp"
+#include "RgfxContextSlots.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxRegionSpans.hpp"
 #include "RgfxSubmitGate.hpp"
@@ -35,15 +36,19 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	uint64_t *out = a->scalarOutput;
 	switch (selector) {
 	case kRgfxAccelMethodOpenContext: {
-		if (a->scalarOutputCount != 5)
+		// Five outputs, or a sixth of the span (kRgfxKextFeatureContextSpan). A bundle that asks
+		// for five picks through RGFX_CONTEXT_VA_SPAN, so its context holds that span.
+		const bool spanAsked = a->scalarOutputCount == 6;
+		if (a->scalarOutputCount != 5 && !spanAsked)
 			return kIOReturnBadArgument;
 		IOLockLock(queueLock);
 		if (!hasContext) {
 			// The window first: a context with no window is never opened.
-			UInt32 opened = 0, openedSlot = 0;
+			UInt32 opened = 0, openedFirst = 0, openedUnits = 0;
 			IOReturn r = openWindow();
 			if (r == kIOReturnSuccess) {
-				r = owner->openContext(&opened, &openedSlot);
+				r = owner->openContext(&opened, !spanAsked, windowServer, &openedFirst,
+				                       &openedUnits);
 				if (r != kIOReturnSuccess)
 					closeWindow();
 			}
@@ -53,17 +58,27 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			}
 			IOLockLock(listLock);
 			context = opened;
-			slot = openedSlot;
+			firstUnit = openedFirst;
+			units = openedUnits;
 			hasContext = true;
 			IOLockUnlock(listLock);
 		}
+		const uint64_t span = static_cast<uint64_t>(units) * RGFX_CONTEXT_VA_UNIT;
+		// A context opened with a span asked for, asked again for five: its span is less than
+		// the one the asker would pick through.
+		if (!spanAsked && span < RGFX_CONTEXT_VA_SPAN) {
+			IOLockUnlock(queueLock);
+			return kIOReturnBadArgument;
+		}
 		out[0] = context;
 		out[1] = static_cast<uint64_t>(context) << RGFX_CONTEXT_OBJ_ID_SHIFT;
-		out[2] = RGFX_CONTEXT_VA_BASE + static_cast<uint64_t>(slot) * RGFX_CONTEXT_VA_SPAN;
+		out[2] = rgfxContextBase(firstUnit);
 		IOLockLock(windowLock);
 		out[3] = windowBase;
 		out[4] = windowSize;
 		IOLockUnlock(windowLock);
+		if (spanAsked)
+			out[5] = span;
 		IOLockUnlock(queueLock);
 		return kIOReturnSuccess;
 	}
@@ -589,7 +604,7 @@ void RgfxAcceleratorUserClient::releaseContext()
 		accel->closeQueue(queues[i]);
 	// The blocks go only once the device has answered the close: it then holds nothing of
 	// them, and the context's command buffers have finished.
-	bool closed = accel->closeContext(context, slot);
+	bool closed = accel->closeContext(context, firstUnit, units);
 	// Its deferred creates' answers, taken by no one now; a waiter for one returns.
 	accel->dropDeferred(context);
 	accel->freeIdChunks(this);

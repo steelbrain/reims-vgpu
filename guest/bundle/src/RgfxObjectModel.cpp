@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <iterator>
 
+#include <os/log.h>
+
 namespace {
 uint64_t alignUp(uint64_t value, uint64_t align)
 {
@@ -15,9 +17,9 @@ uint64_t alignUp(uint64_t value, uint64_t align)
 }
 } // namespace
 
-RgfxIdSpace::RgfxIdSpace(uint64_t address_base) : m_nextObjId(1)
+RgfxIdSpace::RgfxIdSpace(uint64_t address_base, uint64_t address_span) : m_nextObjId(1)
 {
-	resetAddresses(address_base);
+	resetAddresses(address_base, address_span);
 }
 
 RgfxObjId RgfxIdSpace::allocObjId()
@@ -85,12 +87,12 @@ uint64_t RgfxIdSpace::addressSpan(uint64_t size)
 	return alignUp((pages + 1) * kAddressPage, kAddressGranule);
 }
 
-void RgfxIdSpace::resetAddresses(uint64_t base)
+void RgfxIdSpace::resetAddresses(uint64_t base, uint64_t span)
 {
 	m_freeRanges.clear();
 	m_livePicks.clear();
 	const uint64_t start = alignUp(base, kAddressGranule);
-	const uint64_t end = base + RGFX_CONTEXT_VA_SPAN;
+	const uint64_t end = base + span;
 	if (start < end)
 		m_freeRanges[start] = end - start;
 	m_addressCursor = start;
@@ -134,6 +136,17 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 		}
 		it = m_freeRanges.begin();
 	}
+	if (!m_addressesFull) {
+		m_addressesFull = true;
+		uint64_t live = 0;
+		for (const auto &pick : m_livePicks)
+			live += pick.second;
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: no GPU address left for %llu bytes: %llu MiB of the context's range "
+		             "in %llu picks",
+		             (unsigned long long)size, (unsigned long long)(live >> 20),
+		             (unsigned long long)m_livePicks.size());
+	}
 	return 0;
 }
 
@@ -162,10 +175,10 @@ void RgfxIdSpace::freeAddress(uint64_t address)
 	m_freeRanges[start] = length;
 }
 
-void RgfxIdSpace::setBases(uint64_t obj_id_base, uint64_t address_base)
+void RgfxIdSpace::setBases(uint64_t obj_id_base, uint64_t address_base, uint64_t address_span)
 {
 	// 0 names no object, so a context's first id is its base + 1.
 	m_nextObjId.store(obj_id_base + 1, std::memory_order_relaxed);
 	std::lock_guard<std::mutex> hold(m_addressLock);
-	resetAddresses(address_base);
+	resetAddresses(address_base, address_span);
 }

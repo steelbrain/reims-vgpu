@@ -52,7 +52,8 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	ucType = type;
 	hasContext = false;
 	context = 0;
-	slot = 0;
+	firstUnit = 0;
+	units = 0;
 	queueCount = 0;
 	creatingQueue = 0;
 	queueLock = IOLockAlloc();

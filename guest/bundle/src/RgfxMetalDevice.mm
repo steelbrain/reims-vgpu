@@ -514,11 +514,25 @@ RGFX_LOG_UNRECOGNIZED
 
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers
-	// meet, and this one maps nothing of the region but its own.
-	uint64_t ctx[5] = {};
-	uint32_t ctxCount = 5;
+	// meet, and this one maps nothing of the region but its own. The span of its GPU addresses
+	// comes sixth where the kext answers it; a kext that does not gives RGFX_CONTEXT_VA_SPAN.
+	const uint32_t ctxWanted = (_caps.kextFeatures() & kRgfxKextFeatureContextSpan) ? 6 : 5;
+	uint64_t ctx[6] = {0, 0, 0, 0, 0, RGFX_CONTEXT_VA_SPAN};
+	uint32_t ctxCount = ctxWanted;
 	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
-	if (kr != KERN_SUCCESS || ctxCount != 5 || ctx[3] == 0 || ctx[4] < RGFX_ALLOCATIONS_OFFSET) {
+	if (kr == kIOReturnNoResources) {
+		// The kext has no range of GPU addresses left for another process: no device here, the
+		// answer every Metal client handles, where a device whose every create answers nil
+		// stops the frameworks that make their first objects at its open.
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: OPEN_CONTEXT refused: the device holds as many processes as it "
+		             "can; no Metal device in this one");
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return nil;
+	}
+	if (kr != KERN_SUCCESS || ctxCount != ctxWanted || ctx[3] == 0 ||
+	    ctx[4] < RGFX_ALLOCATIONS_OFFSET || ctx[5] == 0) {
 		os_log_error(OS_LOG_DEFAULT,
 		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); transport "
 		             "stubbed",
@@ -532,7 +546,7 @@ RGFX_LOG_UNRECOGNIZED
 	_mapBase = addr;
 	_mapSize = mapSize;
 	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
-	_ids.setBases(ctx[1], ctx[2]);
+	_ids.setBases(ctx[1], ctx[2], ctx[5]);
 	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
 	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext);
 	_region = new RgfxRegion(base, mapSize);

@@ -58,10 +58,12 @@ public:
 	/// with `context`.
 	typedef bool (*ResourceIdChunkFn)(void *context, uint64_t *first_id);
 
-	/// A space whose GPU addresses start at `address_base`. Object ids start at
-	/// 1 (0 is [`RGFX_OBJ_NONE`]). Until a chunk source is set, resource ids come
-	/// from every chunk of the pool in order, as for the device's one process.
-	explicit RgfxIdSpace(uint64_t address_base = kDefaultAddressBase);
+	/// A space whose GPU addresses are the `address_span` bytes from
+	/// `address_base`. Object ids start at 1 (0 is [`RGFX_OBJ_NONE`]). Until a
+	/// chunk source is set, resource ids come from every chunk of the pool in
+	/// order, as for the device's one process.
+	explicit RgfxIdSpace(uint64_t address_base = kDefaultAddressBase,
+	                     uint64_t address_span = RGFX_CONTEXT_VA_SPAN);
 
 	/// The next object id, never 0 and never reused.
 	RgfxObjId allocObjId();
@@ -103,19 +105,21 @@ public:
 	static constexpr uint64_t kAddressGranule = 0x8000;
 
 	/// Moves the object ids and GPU addresses to the process's context's ranges,
-	/// which the accelerator kext hands out (its object-id base and GPU-address
-	/// base), so no two processes' numbers meet on the host. Called once, before
+	/// which the accelerator kext hands out (its object-id base, and its GPU
+	/// addresses' base and span: RGFX_CONTEXT_VA_SPAN where the kext names
+	/// none), so no two processes' numbers meet on the host. Called once, before
 	/// any number is minted.
-	void setBases(uint64_t obj_id_base, uint64_t address_base);
+	void setBases(uint64_t obj_id_base, uint64_t address_base,
+	              uint64_t address_span = RGFX_CONTEXT_VA_SPAN);
 
-	/// Where this space's GPU addresses begin by default: slot 0's, where no range
-	/// the host places itself lies (RGFX_CONTEXT_VA_BASE).
+	/// Where this space's GPU addresses begin by default: the guest's first, where
+	/// no range the host places itself lies (RGFX_CONTEXT_VA_BASE).
 	static constexpr uint64_t kDefaultAddressBase = RGFX_CONTEXT_VA_BASE;
 
 private:
-	/// The context's address range from `base`, every byte free. Caller holds m_addressLock
-	/// (or is the constructor).
-	void resetAddresses(uint64_t base);
+	/// The context's address range, `span` bytes from `base`, every byte free. Caller holds
+	/// m_addressLock (or is the constructor).
+	void resetAddresses(uint64_t base, uint64_t span);
 
 	std::atomic<uint64_t> m_nextObjId;
 
@@ -125,6 +129,8 @@ private:
 	std::map<uint64_t, uint64_t> m_freeRanges;
 	std::map<uint64_t, uint64_t> m_livePicks;
 	uint64_t m_addressCursor = 0;
+	// Whether a pick found no room, which is logged once.
+	bool m_addressesFull = false;
 
 	// The texture resource ids, under m_idsLock: the chunks the process holds,
 	// by index (chunk k holds ids 1 + k * 64 to 64 + k * 64), in the order taken,

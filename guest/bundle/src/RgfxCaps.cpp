@@ -15,6 +15,8 @@
 static_assert(RGFX_DEVICE_INFO_SPARSE_TILES == 9, "3 sample counts at 3 pages");
 static_assert(kRgfxSizeCount == RGFX_DEVICE_INFO_SIZES,
               "size count must match RgfxDeviceInfo::sizes");
+static_assert(kRgfxSizeMaxBufferLength == RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH,
+              "maxBufferLength where the kext reads it");
 static_assert(kRgfxIdentityCount == RGFX_DEVICE_INFO_IDENTITY_FLAGS,
               "identity flag count must match RgfxDeviceInfo::identity_flags");
 static_assert(sizeof(RgfxDeviceInfo::family_values) / sizeof(int64_t) ==

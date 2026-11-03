@@ -5,12 +5,13 @@
  *   - A context number, handed out once from 1: the process's object ids are
  *     c << RGFX_CONTEXT_OBJ_ID_SHIFT and up, so no two processes' ids meet in the host's one
  *     handle table, and the host drops the process's at CONTEXT_CLOSE.
- *   - A slot of RGFX_CONTEXT_SLOTS, held until the close: the process's GPU addresses come from
- *     the slot's range. Slots are handed out round-robin, so a slot freed by one process is the
- *     last one the next process takes.
+ *   - A run of units of the guest's GPU addresses (RgfxContextSlots.hpp), held until the close:
+ *     the process's GPU addresses come from the run's range. Runs are handed out round-robin, so
+ *     a run freed by one process is the last one the next process takes, and the last units
+ *     free go to WindowServer alone.
  *   - Chunks of the texture resource ids, on demand, from one pool for the guest: every
  *     process's textures share the host device's one space of ids, which ends below
- *     RGFX_RESOURCE_ID_LIMIT, so ids are not split by slot. Each chunk is posted to the device
+ *     RGFX_RESOURCE_ID_LIMIT, so ids are not split by context. Each chunk is posted to the device
  *     (RESOURCE_ID_CHUNK) before the process learns of it, and the client's are freed at its
  *     close, after its CONTEXT_CLOSE is answered.
  *   - Region blocks past RGFX_CONTEXT_ALLOCATIONS_OFFSET (rings, Shared buffers and heaps,
@@ -47,6 +48,7 @@
 
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
+#include "RgfxContextSlots.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
 #include "ReimsGraphics.hpp"
 #include "RgfxSurfaceBlocks.hpp"
@@ -114,11 +116,12 @@ namespace {
 // One initialised object (it lands in __DATA,__data, a section the kext has already, so the
 // image's layout before its code stays as the loader's sites were taken from).
 struct ContextState {
-	// Under contextLock: the slots held (a bit each), the next slot to try, the next context
-	// number, and the blocks handed out, sorted by offset.
+	// Under contextLock: the units of GPU addresses held, the units a context holds (set at the
+	// state's start, from the device's maxBufferLength), the next context number, and the
+	// blocks handed out, sorted by offset.
 	IOLock *contextLock;
-	UInt32 slotsHeld;
-	UInt32 nextSlot;
+	RgfxContextSlots slots;
+	UInt32 contextUnits;
 	UInt32 nextContext;
 	RgfxBlockTable blockTable;
 	// Under contextLock: the client holding each chunk of the texture resource ids, null where
@@ -133,11 +136,20 @@ struct ContextState {
 	// The thread call that posts freed blocks' releases (releaseFreedBlocks).
 	thread_call_t releaseCall;
 };
-ContextState state = {nullptr, 0, 0, 1, {nullptr, 0, kMaxBlocks, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-                      {},      nullptr, nullptr, 0, false, nullptr};
+ContextState state = {nullptr,
+                      kRgfxContextSlotsEmpty,
+                      1,
+                      1,
+                      {nullptr, 0, kMaxBlocks, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                      {},
+                      nullptr,
+                      nullptr,
+                      0,
+                      false,
+                      nullptr};
 IOLock *&contextLock = state.contextLock;
-UInt32 &slotsHeld = state.slotsHeld;
-UInt32 &nextSlot = state.nextSlot;
+RgfxContextSlots &slots = state.slots;
+UInt32 &contextUnits = state.contextUnits;
 UInt32 &nextContext = state.nextContext;
 RgfxBlockTable &blockTable = state.blockTable;
 RgfxBlock *&blocks = state.blockTable.blocks;
@@ -490,10 +502,23 @@ bool RgfxAccelerator::startContexts()
 		if (sysctlbyname("hw.memsize", &memory, &length, nullptr, 0) != 0 || !memory)
 			memory = kDormantMemoryUnknown;
 		dormantMaxBytes = memory / 8;
+		// A context's units hold twice the device's largest buffer (RgfxContextSlots.hpp).
+		UInt64 maxBufferLength = 0;
+		const void *info = nullptr;
+		if (IOMemoryMap *map = mapDeviceInfo(sizeof(RgfxDeviceInfo), &info)) {
+			const RgfxDeviceInfo *d = static_cast<const RgfxDeviceInfo *>(info);
+			if (d->version == RGFX_DEVICE_INFO_VERSION)
+				maxBufferLength = d->sizes[RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH];
+			map->release();
+		}
+		contextUnits = rgfxContextUnitsFor(maxBufferLength);
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
-		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u context slots, surfaces %s; "
-		      "WindowServer's reserve: %u of %u entries, %llu MiB\n",
-		      blocksStart, blocksEnd, RGFX_CONTEXT_SLOTS, surfacePages ? "in place" : "copied",
+		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u contexts of %u GiB of GPU addresses "
+		      "(maxBufferLength %llu MiB), surfaces %s; WindowServer's reserve: %u of %u "
+		      "entries, %llu MiB\n",
+		      blocksStart, blocksEnd, kRgfxContextUnits / contextUnits,
+		      static_cast<UInt32>((contextUnits * RGFX_CONTEXT_VA_UNIT) >> 30),
+		      maxBufferLength >> 20, surfacePages ? "in place" : "copied",
 		      blockTable.reserveEntries, kMaxBlocks, blockTable.reserveBytes >> 20);
 		return true;
 	}
@@ -521,34 +546,30 @@ bool RgfxAccelerator::startContexts()
 
 // MARK: - Contexts
 
-IOReturn RgfxAccelerator::openContext(UInt32 *context, UInt32 *slot)
+IOReturn RgfxAccelerator::openContext(UInt32 *context, bool oldSpan, bool windowServer,
+                                     UInt32 *first, UInt32 *units)
 {
 	if (!startContexts())
 		return kIOReturnNotReady;
 	IOLockLock(contextLock);
-	UInt32 found = RGFX_CONTEXT_SLOTS;
-	for (UInt32 i = 0; i < RGFX_CONTEXT_SLOTS; i++) {
-		UInt32 s = (nextSlot + i) % RGFX_CONTEXT_SLOTS;
-		if (!(slotsHeld & (1u << s))) {
-			found = s;
-			break;
-		}
-	}
-	if (found == RGFX_CONTEXT_SLOTS) {
+	const UInt32 want = oldSpan ? kRgfxContextOldSpanUnits : contextUnits;
+	UInt32 at = 0;
+	if (!rgfxContextSlotsTake(slots, want, windowServer, &at)) {
+		const UInt32 free = slots.freeUnits;
 		IOLockUnlock(contextLock);
-		IOLog("RgfxAccelerator: every context slot is held\n");
+		IOLog("RgfxAccelerator: every context slot is held (%u of %u units free, %u asked)\n",
+		      free, kRgfxContextUnits, want);
 		return kIOReturnNoResources;
 	}
-	slotsHeld |= 1u << found;
-	nextSlot = (found + 1) % RGFX_CONTEXT_SLOTS;
-	*slot = found;
+	*first = at;
+	*units = want;
 	*context = nextContext++;
 	IOLockUnlock(contextLock);
-	IOLog("RgfxAccelerator: context %u opened in slot %u\n", *context, *slot);
+	IOLog("RgfxAccelerator: context %u opened at unit %u (%u units)\n", *context, at, want);
 	return kIOReturnSuccess;
 }
 
-bool RgfxAccelerator::closeContext(UInt32 context, UInt32 slot)
+bool RgfxAccelerator::closeContext(UInt32 context, UInt32 first, UInt32 units)
 {
 	// The device ends the context's queues and drops its objects, and answers once the
 	// context's command buffers have finished; the caller has closed its queues already, and
@@ -565,12 +586,12 @@ bool RgfxAccelerator::closeContext(UInt32 context, UInt32 slot)
 		IOLog("RgfxAccelerator: context %u: the device did not answer its close (0x%x, "
 		      "status %u)\n",
 		      context, r, length >= sizeof(answer) ? answer.status : 0);
-	if (contextLock && slot < RGFX_CONTEXT_SLOTS) {
+	if (contextLock) {
 		IOLockLock(contextLock);
-		slotsHeld &= ~(1u << slot);
+		rgfxContextSlotsGive(slots, first, units);
 		IOLockUnlock(contextLock);
 	}
-	IOLog("RgfxAccelerator: context %u closed (slot %u)\n", context, slot);
+	IOLog("RgfxAccelerator: context %u closed (unit %u, %u units)\n", context, first, units);
 	return closed;
 }
 

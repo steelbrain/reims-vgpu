@@ -765,9 +765,31 @@ Metal.
 
 **Contexts.** Each process that opens the accelerator's user client gets a
 context from the kext: a number `c`, handed out once from 1 (its object ids are
-`c << 40` and up), and one of 32 slots, held until its close, for its GPU
-addresses (`RGFX_CONTEXT_VA_BASE + s * RGFX_CONTEXT_VA_SPAN`: 2 TiB a slot
-from 2^46, `0x4000_0000_0000 + s << 41`). The kext hands out its region blocks
+`c << 40` and up), and a range of GPU addresses, held until its close, from
+which its bundle picks every buffer's, heap's and texture's address
+(`guest/kext/src/RgfxContextSlots.hpp`). The guest's addresses are
+`[2^46, 2^47)` (`RGFX_CONTEXT_VA_BASE` to `RGFX_CONTEXT_VA_END`), which the
+host's own ranges never reach, in 1024 units of 64 GiB
+(`RGFX_CONTEXT_VA_UNIT`); a context holds an aligned run of units: one, unless
+the device's `maxBufferLength` is more than 32 GiB, and then the least power of
+two that holds twice it (at most 32), so a buffer of `maxBufferLength` always
+fits. The kext reads `maxBufferLength` from the device info at the first open.
+`OpenContext` answers the range's span sixth (kext feature `ContextSpan`); a
+bundle that asks for five values picks through `RGFX_CONTEXT_VA_SPAN`, 2 TiB,
+and gets an aligned run of 32 units, so an older bundle keeps working on a
+newer kext, and a newer bundle on an older kext takes the 2 TiB it hands
+out. Runs go round-robin, so a run given back is the last one the next
+contexts take, and the last 32 units free go to WindowServer alone, as the
+blocks' and queues' reserves do. The host knows none of this: it pins each
+address as given. Sized from what a desktop uses (measured on the RTX 5080
+host, a6e722f47): 17 processes held a context on an idle desktop and 57 once
+39 apps were open, where the 32 slots of 2 TiB the kext had before refused the
+33rd process and every later one. Past the last run, `OpenContext` answers
+`kIOReturnNoResources`, and the bundle answers no device in that process
+(`initWithAcceleratorPort:` answers nil), which every Metal client handles,
+where a device whose every create answered nil stopped the frameworks that make
+their first objects at its open (Maps, Journal and Photos aborted, Games
+faulted). The kext hands out its region blocks
 (first fit, page granular). The process hands each create and destroy of its
 objects (ids in its range) to the kext by a user-client call; the kext posts it
 on the control ring and, for a pipeline create, hands the reflection back once
@@ -2054,7 +2076,7 @@ the kext and the bundle include.
 |---|---|---|---|
 | doorbell 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
 | doorbell 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
-| 0x100 | `OpenContext` | | the context and its window |
+| 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
 | 0x101 | `Alloc` | | a region block |
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
@@ -2074,7 +2096,7 @@ the kext and the bundle include.
 | 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
 
-The kext sets 1 << 4 `DeferredAnswers`; no other bit yet.
+The kext sets 1 << 4 `DeferredAnswers` and 1 << 5 `ContextSpan`; no other bit yet.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU

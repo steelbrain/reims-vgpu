@@ -785,7 +785,10 @@ mod tests {
             info.sizes[0],
             identity.sizes.recommended_max_working_set_size.unwrap()
         );
-        assert_eq!(info.sizes[7], identity.sizes.max_buffer_length.unwrap());
+        assert_eq!(
+            info.sizes[reims_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
+            identity.sizes.max_buffer_length.unwrap()
+        );
         // maximum_concurrent_compilation_task_count is the device's compile threads.
         assert_eq!(info.sizes[12], 4);
         assert_eq!(info.sizes[13], 8);

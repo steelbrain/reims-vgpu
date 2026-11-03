@@ -2996,14 +2996,15 @@ mod tests {
         assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
     }
 
-    /// The host's own ranges lie below every slot's GPU addresses: a buffer the host places
-    /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, every
-    /// slot's first pick and the last slot's last pick are made.
+    /// The host's own ranges lie below the guest's GPU addresses: a buffer the host places
+    /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, the
+    /// first pick of every unit the kext hands the contexts out in and the last unit's last pick
+    /// are made.
     #[cfg(feature = "vulkan")]
     #[test]
-    fn on_vulkan_the_host_s_own_ranges_lie_below_every_slot() {
+    fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
         use reims_graphics::wire::{
-            RGFX_CONTEXT_SLOTS, RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_SPAN,
+            RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,
         };
         use reims_vgpu_core::platform::resource::Buffer as _;
         let _pool = reims_vgpu_core::rt::Pool::here();
@@ -3015,9 +3016,9 @@ mod tests {
         };
         assert!(buffer.gpu_address() < RGFX_CONTEXT_VA_BASE);
         // A pick of 64 KiB holds 96 KiB: its four pages, the guard page, rounded up to 32 KiB.
-        let slots = u64::from(RGFX_CONTEXT_SLOTS);
-        let last = RGFX_CONTEXT_VA_BASE + slots * RGFX_CONTEXT_VA_SPAN - 0x1_8000;
-        let picks = (0..slots).map(|s| RGFX_CONTEXT_VA_BASE + s * RGFX_CONTEXT_VA_SPAN);
+        let units = u64::from(RGFX_CONTEXT_VA_UNITS);
+        let last = RGFX_CONTEXT_VA_END - 0x1_8000;
+        let picks = (0..units).map(|u| RGFX_CONTEXT_VA_BASE + u * RGFX_CONTEXT_VA_UNIT);
         for (obj_id, at) in (20..).zip(picks.chain([last])) {
             let pinned = buffer_at(obj_id, at, 0x1_0000);
             assert_eq!(

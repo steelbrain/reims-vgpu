@@ -93,11 +93,11 @@ void test_address_picks()
 	CHECK(RgfxIdSpace::addressSpan(64 * page) == 66 * page);
 	CHECK(RgfxIdSpace::addressSpan(65 * page) == 66 * page);
 
-	// A context's range, as the kext hands it (slot 3), its picks granule-aligned and their
-	// spans apart, whatever their sizes: one of a heap's 1 MiB, then a buffer's 16 KiB.
+	// A context's range, as the kext hands it (a unit, the fourth), its picks granule-aligned
+	// and their spans apart, whatever their sizes: one of a heap's 1 MiB, then a buffer's 16 KiB.
 	RgfxIdSpace ids;
-	const uint64_t base = RGFX_CONTEXT_VA_BASE + 3 * RGFX_CONTEXT_VA_SPAN;
-	ids.setBases(uint64_t{4} << RGFX_CONTEXT_OBJ_ID_SHIFT, base);
+	const uint64_t base = RGFX_CONTEXT_VA_BASE + 3 * RGFX_CONTEXT_VA_UNIT;
+	ids.setBases(uint64_t{4} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
 	uint64_t prev = 0, prevSize = 0;
 	const uint64_t sizes[] = {1u << 20, 0x4000, 256, 1, 0x4001, 4u << 20, 0x8000};
 	for (uint64_t size : sizes) {
@@ -123,7 +123,7 @@ void test_address_picks()
 	// Round the range: 1 GiB picks till none is left, then two side by side given back, which
 	// a pick of both their spans takes, at the first's address.
 	RgfxIdSpace full;
-	full.setBases(uint64_t{5} << RGFX_CONTEXT_OBJ_ID_SHIFT, base);
+	full.setBases(uint64_t{5} << RGFX_CONTEXT_OBJ_ID_SHIFT, base, RGFX_CONTEXT_VA_UNIT);
 	const uint64_t gib = uint64_t{1} << 30;
 	std::vector<uint64_t> picks;
 	for (;;) {
@@ -132,8 +132,9 @@ void test_address_picks()
 			break;
 		picks.push_back(at);
 	}
-	CHECK(picks.size() == RGFX_CONTEXT_VA_SPAN / RgfxIdSpace::addressSpan(gib));
-	CHECK(picks.back() + RgfxIdSpace::addressSpan(gib) <= base + RGFX_CONTEXT_VA_SPAN);
+	CHECK(picks.size() == RGFX_CONTEXT_VA_UNIT / RgfxIdSpace::addressSpan(gib));
+	CHECK(picks.front() == base);
+	CHECK(picks.back() + RgfxIdSpace::addressSpan(gib) <= base + RGFX_CONTEXT_VA_UNIT);
 	full.freeAddress(picks[10]);
 	full.freeAddress(picks[11]);
 	uint64_t both = full.allocAddress(2 * RgfxIdSpace::addressSpan(gib) - 2 * page, 1);

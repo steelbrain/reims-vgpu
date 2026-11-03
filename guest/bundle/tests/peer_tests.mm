@@ -787,8 +787,10 @@ struct Process {
 	      control(&Kext::forward, &k, kLifecycleMessageMax), serializer(control, ids),
 	      completions(&Kext::waitCompletions, &k)
 	{
+		// The context's range as the kext hands it: a unit of GPU addresses.
 		ids.setBases(static_cast<uint64_t>(kContext) << RGFX_CONTEXT_OBJ_ID_SHIFT,
-		             RGFX_CONTEXT_VA_BASE + kContext * RGFX_CONTEXT_VA_SPAN);
+		             RGFX_CONTEXT_VA_BASE + kContext * RGFX_CONTEXT_VA_UNIT,
+		             RGFX_CONTEXT_VA_UNIT);
 		region.setBlockSource(&Kext::alloc, &Kext::release, &k);
 		k.setLifecycleReader(&lifecycle);
 		serializer.setQueueOpener(&Kext::openQueue, &k);

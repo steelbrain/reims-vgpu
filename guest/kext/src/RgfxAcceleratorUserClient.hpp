@@ -114,7 +114,10 @@ private:
 	// them, never wait behind another thread's wait for the device.
 	bool hasContext;
 	UInt32 context;
-	UInt32 slot;
+	// The context's run of units of GPU addresses (RgfxContextSlots.hpp): its first unit and
+	// how many.
+	UInt32 firstUnit;
+	UInt32 units;
 	UInt32 queueCount;
 	UInt64 queues[kMaxQueues];
 	// The queue a QUEUE_CREATE is making, its device's answer not yet in; 0 for none.
