@@ -202,7 +202,7 @@ fi
 # The round: its probes leave the queue for its directory, and those it does not reach go back.
 ROUND=$(date +%Y%m%d-%H%M%S)
 RD=$MSI_GATE/probes/$ROUND
-msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]}; do mv \"\$p\" '$RD/probes/'; done && printf '%s\\n' ${take[*]} > '$RD/probes/.order'"
+msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]:-}; do mv \"\$p\" '$RD/probes/'; done && printf '%s\\n' ${take[*]:-} > '$RD/probes/.order'"
 put "$L/msi-probes.sh" "$RD/bin/"
 put "$L/msi-xid.sh" "$RD/bin/"
 put "$L/msi-capture.py" "$RD/bin/"
@@ -254,7 +254,7 @@ EOF
 fi
 
 # Each probe's status; the ones not reached (or never started: a failed boot) go back to the queue.
-for p in "${take[@]}"; do
+for p in ${take[@]+"${take[@]}"}; do
   st=$(msi "cat '$RES/$p/status' 2> /dev/null || echo 'not reached: the boot did not run it'")
   echo "  $p: $st"
   case $st in
