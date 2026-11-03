@@ -900,7 +900,13 @@ and goes after a second with none, whatever other processes do. Tested by
 `an_idle_lane_goes_while_another_context_s_is_busy` and
 `lanes_keep_every_order_over_random_interleavings`, which checks random
 interleavings of several processes' messages against an order worked out from
-the messages alone.
+the messages alone. A synchronous create's answer takes 7.2 us on average from
+its doorbell, against 4.1 us from the control thread alone, and 68 us against
+23 us where the lane's thread is made again after a pause
+(`a_sync_create_s_round_trip`, release build, M3 Max). A context's burst of 200
+messages and a synchronous create take as long beside 75 idle lanes as beside
+none: 0.1 to 1.4 ms at the median either way, on the M3 Max under other builds'
+load (`a_burst_beside_idle_lanes`, release build).
 
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process

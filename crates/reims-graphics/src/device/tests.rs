@@ -2537,6 +2537,8 @@ fn a_taking_write_starts_and_resets_as_a_plain_one() {
 mod lanes_fuzz;
 /// The wire round trip with a fake peer (`peer.rs`).
 mod peer;
+/// What a synchronous create's round trip costs, measured by hand (`round_trip.rs`).
+mod round_trip;
 
 // ---------------------------------------------------------------------------------------------
 // Ring 0's lanes (`device::lanes`): what crosses contexts waits for the lanes it reads.
