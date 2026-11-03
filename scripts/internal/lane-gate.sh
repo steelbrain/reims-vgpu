@@ -3,8 +3,8 @@
 # good baseline. Run it on the Mac, from any checkout of the repository that has this script:
 #
 #   scripts/internal/lane-gate.sh [--record] [--baseline SHA] [--resume [RUNID]] [--image PATH]
-#                                 [--host DIR] [--skip mac|boot] [--phases "PHASE..."]
-#                                 [--no-bench | --wait-bench] [--publish] [REV]
+#                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
+#                                 [--bench-phases "PHASE..."] [--no-bench | --wait-bench] [--publish] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
@@ -16,10 +16,14 @@
 #   --host DIR    boot the host build in DIR on the lane host (a published tip-host/SHORT, its QEMU
 #                 and option ROM) instead of the one the gate builds: a control that changes only
 #                 the host against REV's guest; never --record it
+#   --load DUTY   run a fixed GPU load beside the bench boot's measurements (lane-gate/gpuload.c:
+#                 the GPU busy DUTY of every 10 ms, 0 to 1), in place of other work's unknown load;
+#                 never --record it
 #   --skip PART   leave out the Mac's checks (mac) or the correctness boot (boot); the run is then
 #                 incomplete
 #   --phases      the correctness boot's guest-run.sh phases (default: info sweep decode webgl
 #                 present final)
+#   --bench-phases  the bench boot's (default: info webgl present idle bench decodefps final)
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -77,7 +81,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= host_dir= skip= phases= rev=HEAD bench=detach publish=0
+record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= rev=HEAD bench=detach publish=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -85,6 +89,8 @@ while (($#)); do
     --resume) if [[ ${2:-} =~ ^[0-9a-f]{12}- ]]; then resume=$2; shift; else resume=newest; fi ;;
     --image) image=$2; shift ;;
     --host) host_dir=$2; shift ;;
+    --load) load=$2; shift ;;
+    --bench-phases) bench_phases=$2; shift ;;
     --skip) skip="$skip $2"; shift ;;
     --phases) phases=$2; shift ;;
     --no-bench) bench=no ;;
@@ -126,6 +132,7 @@ fi
 if [[ -z $base_sha && -e $GH/baselines/LAST ]]; then base_sha=$(basename "$(readlink "$GH/baselines/LAST")"); fi
 [[ -z $base_sha ]] || base_sha=$(git -C "$SRC" rev-parse --verify "$base_sha^{commit}")
 [[ -z $host_dir ]] || ((!record)) || die "--host makes a control: it is never a sample of REV's baseline (--record)"
+[[ -z $load ]] || ((!record)) || die "--load measures beside a fixed load: it is never a sample of REV's baseline (--record)"
 BASE=${base_sha:+$GH/baselines/$base_sha}
 [[ -z $BASE || -d $BASE/runs ]] || die "no baseline of $base_sha in $GH/baselines"
 
@@ -345,7 +352,7 @@ do_ship() {  # the gate's own scripts, which the host's steps run
   # Each script replaces the old one by a rename, never in place: a detached bench leg may be
   # running the old one, and bash reads a script as it runs it.
   msi "rm -rf '$MR/bin/.incoming' && mkdir -p '$MR/bin/.incoming'"
-  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" "$L/msi-drag.py" \
+  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" "$L/msi-drag.py" "$L/gpuload.c" "$L/gpuload.comp" \
     "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
   msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
 }
@@ -444,7 +451,7 @@ do_boot() {
   local ph=${phases:-info sweep decode webgl present final} pres=5
   if [[ $mode == bench ]]; then
     # WebGL's frame rate and present_probe's answers first: the quickest read of a tip's frame pace.
-    excl=1 hold=$HOLD_S ph="info webgl present idle bench decodefps final" pres=10
+    excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10
   fi
   # The guest runner and its files as the gate has them now (a resumed run keeps its tools).
   cp "$L/guest/"* "$ART/payload/"
@@ -466,6 +473,7 @@ HOLD_S=$hold
 LOCK_WAIT_S=${LOCK_WAIT_S:-3600}
 PHASES="$ph"
 PRESENT_S=$pres
+LOAD=$([[ $mode == bench ]] && echo "$load")
 EOF
   set +e
   msi "bash '$MR/bin/msi-boot.sh' '$out'"
@@ -473,7 +481,7 @@ EOF
   set -e
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
-  for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv serial.log desktop.png drag.txt drag.log; do
+  for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv gpuload.log serial.log desktop.png drag.txt drag.log; do
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
@@ -485,7 +493,7 @@ EOF
 # meta.json for report.py: what the run is, and which parts ran in any of its passes.
 write_meta() {
   python3 -I - "$RUN/meta.json" "$sha" "$subject" "$runid" "${base_sha:-}" "$(sort -u "$RUN/ran" 2> /dev/null | tr '\n' ' ')" \
-    "$image|$host_dir" "$phases" "$(( $(date +%s) - $(cat "$RUN/started") ))" "$ART/tools.txt" "${MAC_KNOWN_FAILS:-}" \
+    "$image|$host_dir|$load" "$phases" "$(( $(date +%s) - $(cat "$RUN/started") ))" "$ART/tools.txt" "${MAC_KNOWN_FAILS:-}" \
     "${KNOWN_FAILS:-}" "$(cat "$ART/tip-codecs.txt" 2> /dev/null || echo unknown)" "$MSI" << 'EOF'
 import json, sys
 out, sha, subject, runid, base, ran, image, phases, wall, tools_txt, known_txt, known_items, codecs, host = sys.argv[1:]
@@ -500,7 +508,8 @@ try:
 except (OSError, ValueError) as e:
     sys.exit(f"lane-gate: the known-failures list {known_items}: {e}")
 json.dump({"sha": sha, "subject": subject, "runid": runid, "baseline": base, "ran": ran.split(),
-           "image": image.split("|")[0], "host_build": image.split("|")[1], "phases": phases, "wall_s": int(wall), "tools": tools,
+           "image": image.split("|")[0], "host_build": image.split("|")[1], "load": image.split("|")[2],
+           "phases": phases, "wall_s": int(wall), "tools": tools,
            "known_cargo_fails": lines(known_txt),
            "known_fails": known_fails, "lane_host": host,
            "tip_codecs": None if codecs == "unknown" else codecs.split()}, open(out, "w"), indent=1)
@@ -597,6 +606,8 @@ if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped b
   ((record)) && again+=(--record)
   [[ -z $image ]] || again+=(--image "$image")
   [[ -z $host_dir ]] || again+=(--host "$host_dir")
+  [[ -z $load ]] || again+=(--load "$load")
+  [[ -z $bench_phases ]] || again+=(--bench-phases "$bench_phases")
   [[ -z $base_sha ]] || again+=(--baseline "$base_sha")
   if [[ $bench == wait ]]; then
     "$0" "${again[@]}" "$sha" | tee "$RUN/bench.out"

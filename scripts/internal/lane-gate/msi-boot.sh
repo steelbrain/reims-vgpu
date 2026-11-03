@@ -16,11 +16,13 @@
 #                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
 #                 its commonest colour (or desktop_capture none), how long the hold was
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
+#   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
 # GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
 # LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
-# PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S).
+# PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
+# load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
 . "$R/boot.env"
@@ -50,7 +52,17 @@ stop_qemu() {
   P=
 }
 B=$RGK_RUN/boots/$TAG
+LOADPID=
+stop_load() {
+  [[ -n $LOADPID ]] || return 0
+  kill "$LOADPID" 2> /dev/null
+  wait "$LOADPID" 2> /dev/null
+  LOADPID=
+  kv load_duty "$(sed -n 's/^gpuload: end duty=\([0-9.]*\).*/\1/p' "$R/gpuload.log")"
+  log "fixed GPU load stopped: $(tail -1 "$R/gpuload.log")"
+}
 finish() {
+  stop_load
   stop_qemu
   [[ -n ${SAMPLER:-} ]] && kill "$SAMPLER" 2> /dev/null
   [[ -s $R/watchdog.pid ]] && kill "$(cat "$R/watchdog.pid")" 2> /dev/null
@@ -75,6 +87,14 @@ for f in "$QEMU" "$(dirname "$QEMU")/qemu-bundle/usr/local/share/qemu/efi-virtio
   [[ -s $f ]] || { log "BOOT_FAIL missing $f"; exit 2; }
 done
 log "boot $TAG ($([[ ${EXCLUSIVE:-1} == 1 ]] && echo exclusive || echo shared)): QEMU $QEMU, ROM $ROM, OC $OC"
+# LOAD: a fixed GPU load beside the guest's run and the drags (gpuload, built here for this host).
+GL=
+if [[ -n ${LOAD:-} ]]; then
+  GL=$R/gpuload
+  ( cd "$R" && glslc -mfmt=c "$(dirname "$0")/gpuload.comp" -o gpuload.spv.inc &&
+    cc -O2 -Wall -Wextra -Werror -I"$R" "$(dirname "$0")/gpuload.c" -lvulkan -o gpuload ) >> "$R/boot.log" 2>&1 ||
+    { log "BOOT_FAIL missing gpuload (its build failed)"; exit 2; }
+fi
 # The host GPUs' hardware decoders, as Vulkan Video lists each GPU's decode profiles (a query: no
 # GPU work): "GPU-NAME<TAB>gpu<TAB>-" for each GPU, then "GPU-NAME<TAB>CODEC<TAB>PROFILE" for each
 # profile it decodes, h264 or hevc, the profile as the Std headers name it (MAIN, MAIN_10, HIGH).
@@ -161,6 +181,16 @@ else
 fi
 sleep 15
 
+if [[ -n $GL ]]; then
+  ( closefds; exec "$GL" -d "$LOAD" ) > "$R/gpuload.log" 2>&1 &
+  LOADPID=$!
+  for _ in $(seq 1 40); do grep -q '^gpuload: .* of .* ms' "$R/gpuload.log" && break; sleep 0.5; done
+  grep -q '^gpuload: .* of .* ms' "$R/gpuload.log" ||
+    { log "BOOT_FAIL gpuload did not start: $(tail -2 "$R/gpuload.log" | tr '\n' ' ')"; exit 8; }
+  log "fixed GPU load: $(head -1 "$R/gpuload.log")"
+fi
+# The host's load beside the measurements (other work on the host shares its CPU and memory).
+kv load_start "$(cut -d' ' -f1 /proc/loadavg)"
 log "guest run: ${PHASES:-all phases}, $(left) s left"
 ts() { perl -MTime::HiRes=time -ne '$| = 1; printf "%.3f %s", time, $_'; }
 timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
@@ -177,6 +207,8 @@ if [[ ${DRAG:-1} == 1 ]] && (( $(left) > 150 )); then
   kv drag_rc $?
   log "window drags done"
 fi
+kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
+stop_load
 
 # The screen as WindowServer composed it, read back by the guest: the screenshot a person takes
 # with Command-Shift-3, the keys sent over QMP to the guest's keyboard. The system's screenshot

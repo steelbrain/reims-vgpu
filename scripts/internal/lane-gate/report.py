@@ -277,8 +277,8 @@ class Run:
             parts = line.split(None, 1)
             if len(parts) == 2:
                 kv[parts[0]] = parts[1].strip()
-        for k in ("boot_ssh_s", "desktop_s", "hold_s", "lock_wait_s"):
-            if k in kv:
+        for k in ("boot_ssh_s", "desktop_s", "hold_s", "lock_wait_s", "load_start", "load_end", "load_duty"):
+            if re.fullmatch(r"[0-9]+(\.[0-9]*)?", kv.get(k, "")):
                 self.lmetric("host." + k, float(kv[k]))
         fatal = int(kv.get("fatal_lines", "-1") or -1) + max(0, int(kv.get("serial_fatal_lines", "0") or 0))
         self.litem("host.no-fatal", "PASS" if fatal == 0 else "FAIL",
@@ -575,7 +575,8 @@ def write_report(run, base, noise, history=None):
     out = [f"lane-gate {verdict}: {m.get('sha', '?')} ({m.get('subject', '')}); {bench}",
            f"run {m.get('runid', '?')}, {m.get('wall_s', '?')} s wall; baseline "
            + (f"{base['meta'].get('sha', '?')[:12]} ({base['samples']} samples)" if base else "none")
-           + (f"; a control: the host build {m['host_build']} against this commit's guest" if m.get("host_build") else ""),
+           + (f"; a control: the host build {m['host_build']} against this commit's guest" if m.get("host_build") else "")
+           + (f"; beside a fixed GPU load (gpuload, duty {m['load']})" if m.get("load") else ""),
            "items: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
     for title, names in (("failed:", failed), ("bench (not gating):", bench_issues)):
         if names:
