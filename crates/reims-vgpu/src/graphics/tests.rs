@@ -8,7 +8,7 @@ use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_core::testkit::faults::Fault;
 use reims_vgpu_core::testkit::objects::CompleteOn;
-use reims_vgpu_core::testkit::{Arg, FakePlatform};
+use reims_vgpu_core::testkit::{Arg, FakePlatform, HeldCall};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
@@ -2293,6 +2293,233 @@ fn a_queue_s_buffer_runs_beside_another_queue_s_walk() {
     assert!(complete_until_event(&platform, &mut first), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&first.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+}
+
+/// `message`, a command buffer, with a `SUBMITTED` op after its ops: it asks for its
+/// `CB_SUBMITTED`, as `commitAndWaitUntilSubmitted` commits it.
+fn with_ask(mut message: Vec<u8>) -> Vec<u8> {
+    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+
+    let submitted = RgfxOpHeader {
+        tag: RGFX_OP_SUBMITTED,
+        flags: 0,
+        len: 8,
+    };
+    message.extend_from_slice(submitted.as_bytes());
+    let field =
+        RGFX_COMMAND_BUFFER_OPS_OFFSET as usize - 8..RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
+    let ops = u64::from_le_bytes(message[field.clone()].try_into().unwrap()) + 8;
+    message[field].copy_from_slice(&ops.to_le_bytes());
+    message
+}
+
+/// A device with process 1's queues 1 and 2 and process 2's queue 1 made, their rings in that
+/// order, each process's shared event 20, library 10 and render pipeline 11, and process 1's
+/// sampler 4.
+fn two_processes(
+    raised: &Arc<AtomicU32>,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    Guest,
+    [QueueRing; 3],
+) {
+    const RING_DATA: u32 = 0x1_0000;
+    let rings = |n: u64| {
+        let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * 0x4_0000;
+        (at, at + 0x2_0000)
+    };
+    let (device, platform) = headless_on(raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    for (at, (context, n)) in [(1, 1), (1, 2), (2, 1)].into_iter().enumerate() {
+        let made = create_queue(
+            &device,
+            &mut guest,
+            context,
+            n,
+            rings(at as u64),
+            RING_DATA,
+            0,
+        );
+        assert_eq!(made, RGFX_STATUS_OK);
+    }
+    for context in [1, 2] {
+        guest.send(&device, shared_event_create(obj(context, 20), 0));
+        make_library(&device, &mut guest, obj(context, 10));
+        guest.send(
+            &device,
+            render_pipeline_create(obj(context, 11), obj(context, 10)),
+        );
+        expect_reflection(&mut guest, obj(context, 11), RGFX_PIPELINE_OK);
+    }
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    let ring = |at: u64| {
+        let (submit, complete) = rings(at);
+        QueueRing::new(&device, submit, complete, u64::from(RING_DATA))
+    };
+    let queues = [ring(0), ring(1), ring(2)];
+    (device, platform, guest, queues)
+}
+
+/// Holds the next draw the platform is sent, a walk's, as a driver's cold pipeline make holds
+/// a draw: the hold, once a walk reached it.
+fn hold_next_draw(platform: &FakePlatform) -> HeldCall {
+    let draw = HeldCall::new();
+    platform.faults().at(
+        "MTLRenderCommandEncoder",
+        "drawPrimitives:vertexStart:vertexCount:",
+        0,
+        Fault::Hold(draw.clone()),
+    );
+    draw
+}
+
+/// The `(type, object, value)` of `ring`'s next `n` events but `CB_SCHEDULED`, completing the
+/// platform's committed buffers meanwhile: a `CB_COMPLETE`'s buffer and status, an
+/// `EVENT_SIGNALLED`'s event and value, a `CB_SUBMITTED`'s buffer.
+fn ring_events(platform: &FakePlatform, ring: &mut QueueRing, n: usize) -> Vec<(u32, u64, u64)> {
+    let mut got = Vec::new();
+    while got.len() < n {
+        assert!(
+            complete_until_event(platform, ring),
+            "no event, after {got:?}"
+        );
+        let bytes = ring.event().unwrap();
+        let (header, _) = RgfxMsgHeader::read_from_prefix(&bytes).unwrap();
+        got.push(match header.r#type {
+            RGFX_EVT_CB_COMPLETE => {
+                let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
+                (header.r#type, done.cb_obj_id, u64::from(done.status))
+            }
+            RGFX_EVT_EVENT_SIGNALLED => {
+                let signalled = RgfxEventSignalled::read_from_bytes(&bytes).unwrap();
+                (header.r#type, signalled.obj_id, signalled.value)
+            }
+            RGFX_EVT_CB_SUBMITTED => {
+                let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+                (header.r#type, posted.cb_obj_id, 0)
+            }
+            other => panic!("event {other:#x} on a queue's completion ring"),
+        });
+    }
+    got
+}
+
+/// A command buffer whose walk is held inside the platform's draw, as a driver's cold pipeline
+/// make holds one, holds up no other queue's: with the draw held, another process's ring-0
+/// messages are carried out and its pipeline compiled, and its buffers are taken, begun, answered
+/// their `CB_SUBMITTED`, committed and completed, one of them drawing too; so is a buffer on the
+/// held process's other queue. The held buffer completes once its draw returns
+#[test]
+fn a_walk_held_in_a_draw_holds_up_no_other_queue() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, [mut held, mut beside, mut other]) = two_processes(&raised);
+    let draw = hold_next_draw(&platform);
+    held.send(
+        &device,
+        render_command_buffer(obj(1, 1), 100, obj(1, 11), obj(1, 20)),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+
+    // Process 2, with the draw held: ring 0 carried out, a pipeline compiled.
+    make_library(&device, &mut guest, obj(2, 30));
+    guest.send(&device, render_pipeline_create(obj(2, 31), obj(2, 30)));
+    expect_reflection(&mut guest, obj(2, 31), RGFX_PIPELINE_OK);
+    // Its buffer that asks for its `CB_SUBMITTED`, and one that draws.
+    other.send(&device, asking(obj(2, 1), 200));
+    other.send(
+        &device,
+        render_command_buffer(obj(2, 1), 201, obj(2, 31), obj(2, 20)),
+    );
+    assert_eq!(
+        ring_events(&platform, &mut other, 5),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 200, 0),
+            (RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK)),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(2, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(2, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 201, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    // The held process's other queue.
+    beside.send(&device, sampler_command_buffer(obj(1, 2), 300, obj(1, 4)));
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_COMPLETE, 300, u64::from(RGFX_CB_OK))]
+    );
+    assert!(!held.has_event(), "the held buffer completed");
+
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+}
+
+/// A command buffer answered its `CB_SUBMITTED` whose walk is held inside the platform's draw
+/// holds up no other queue's take or begin, only the commits of the buffers begun after its
+/// answer, which come after it ([`decode::sequencer`]): another process's buffer that asks for
+/// its `CB_SUBMITTED` is answered with the draw held, and committed once the held buffer is
+#[test]
+fn a_held_walk_answered_its_submitted_holds_only_later_commits() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, _, mut other]) = two_processes(&raised);
+    let draw = hold_next_draw(&platform);
+    held.send(
+        &device,
+        with_ask(render_command_buffer(
+            obj(1, 1),
+            100,
+            obj(1, 11),
+            obj(1, 20),
+        )),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+    assert_eq!(
+        ring_events(&platform, &mut held, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
+    );
+    let commits = platform.call_log().count("commit");
+    other.send(&device, asking(obj(2, 1), 200));
+    assert_eq!(
+        ring_events(&platform, &mut other, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 200, 0)],
+        "the other process's buffer was not begun beside the held walk"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        platform.call_log().count("commit"),
+        commits,
+        "a buffer begun after the held one's answer was committed before it"
+    );
+
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(
+        ring_events(&platform, &mut other, 1),
+        [(RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK))]
+    );
 }
 
 /// A command buffer with the ops `ops`, each a tag and its body, on queue `queue_obj_id`.

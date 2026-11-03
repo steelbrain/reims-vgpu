@@ -40,4 +40,4 @@ pub use clock::VirtualClock;
 pub use guest_ram::GuestRam;
 pub use objects::{CompleteOn, Fk, World, kind};
 pub use platform::FakePlatform;
-pub use script::{Policy, Script, Step};
+pub use script::{HeldCall, Policy, Script, Step};

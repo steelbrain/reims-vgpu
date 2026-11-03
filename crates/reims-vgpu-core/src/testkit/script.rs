@@ -11,12 +11,15 @@
 //!   by the send's [`Policy`], the label the metal crate's message layer gives the same send:
 //!   `Err(Raise)`, or a death at the send;
 //! - `Die`: Metal, IOGPU or the driver crashed, which ends the process whatever thread it is on
-//!   (an isolated task's too): a death marker.
+//!   (an isolated task's too): a death marker;
+//! - `Hold`: the call takes as long as the test makes it, on the thread that made it (a driver's
+//!   cold pipeline make inside a draw, say), and then the model answers ([`HeldCall`]).
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::sync::Mutex;
+use crate::sync::{Condvar, Mutex};
 
 use crate::platform::ObjId;
 use crate::platform::types::NsErrorText;
@@ -70,6 +73,62 @@ pub enum Step {
     /// A crash inside Metal, IOGPU or the driver (class b). `None` is the fake's marker site,
     /// [`metal_crash_site`]; `Some` names another.
     Die(Option<DeathSite>),
+    /// The call is held, with nothing of the fake's locked, until the test lets it go; then the
+    /// model answers.
+    Hold(HeldCall),
+}
+
+/// A call the fake holds on the thread that made it until the test lets it go ([`Step::Hold`]).
+/// `Clone` shares it.
+#[derive(Clone, Default)]
+pub struct HeldCall {
+    /// Whether a call is held, and whether the test let it go; and their moves.
+    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+}
+
+impl std::fmt::Debug for HeldCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (reached, open) = *self.state.0.lock();
+        f.debug_struct("HeldCall")
+            .field("reached", &reached)
+            .field("open", &open)
+            .finish()
+    }
+}
+
+impl HeldCall {
+    /// A hold no call has reached yet.
+    pub fn new() -> HeldCall {
+        HeldCall::default()
+    }
+
+    /// Waits, `timeout` at most, for a call to be held; whether one is or was.
+    pub fn reached(&self, timeout: Duration) -> bool {
+        let (lock, moved) = &*self.state;
+        let mut s = lock.lock();
+        if !s.0 {
+            let _ = moved.wait_while_for(&mut s, |s| !s.0, timeout);
+        }
+        s.0
+    }
+
+    /// Lets the held call go on, and any later call this hold reaches.
+    pub fn open(&self) {
+        let (lock, moved) = &*self.state;
+        lock.lock().1 = true;
+        moved.notify_all();
+    }
+
+    /// Holds the calling thread until the test lets the call go.
+    fn hold(&self) {
+        let (lock, moved) = &*self.state;
+        let mut s = lock.lock();
+        s.0 = true;
+        moved.notify_all();
+        while !s.1 {
+            moved.wait(&mut s);
+        }
+    }
 }
 
 impl std::fmt::Debug for Step {
@@ -85,6 +144,7 @@ impl std::fmt::Debug for Step {
                 .field("reason", reason)
                 .finish(),
             Step::Die(s) => f.debug_tuple("Die").field(s).finish(),
+            Step::Hold(h) => f.debug_tuple("Hold").field(h).finish(),
         }
     }
 }
@@ -369,6 +429,11 @@ impl Script {
             if *n == 0 {
                 let _ = g.remove(pos);
             }
+        }
+        drop(g);
+        if let Step::Hold(held) = &step {
+            held.hold();
+            return Step::Default;
         }
         step
     }

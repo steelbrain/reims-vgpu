@@ -7,7 +7,7 @@
 //! `MTLDevice`, …). Faults ride the platform's [`Script`]: a class's entry and a selector's entry
 //! are consulted in the order they were added.
 
-use super::script::{Key, Script, Step};
+use super::script::{HeldCall, Key, Script, Step};
 use crate::platform::ObjId;
 use crate::platform::types::NsErrorText;
 
@@ -27,6 +27,8 @@ pub enum Fault {
     },
     /// Metal, IOGPU or the driver crashes (the fake's marker death site).
     Crash,
+    /// The call takes until the test lets it go ([`HeldCall`]), then answers as the model does.
+    Hold(HeldCall),
 }
 
 impl Fault {
@@ -36,6 +38,7 @@ impl Fault {
             Fault::Error(e) => Step::Error(e),
             Fault::Raise { name, reason } => Step::Raise { name, reason },
             Fault::Crash => Step::crash(),
+            Fault::Hold(held) => Step::Hold(held),
         }
     }
 }
