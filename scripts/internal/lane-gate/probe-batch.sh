@@ -22,23 +22,31 @@
 # wall_s, host.log, gpu-clocks.txt, out/, status), and the probe leaves the queue once it ran or
 # was skipped. One not reached in a round's hold stays queued for the next.
 #
-#   probe-batch.sh [--force] [--list] [--dry-run]
+#   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the oldest probe's that is published. It takes the probes for that
 # tip oldest first while their budgets fit the hold (those for other published tips wait for their
-# own round), boots the tip once through msi-boot.sh (an exclusive request: the GPU alone, in the
+# own round; --tip SHA picks the round's tip, a published one), boots the tip once through msi-boot.sh (an exclusive request: the GPU alone, in the
 # host's turnstile, the host quiet; the gate's one request on the host while it runs), waits for
-# the host's load to settle under 4, runs them back to back and powers the guest off. --list shows the
+# the host's load to settle under 4, runs them back to back and powers the guest off. --capture
+# also captures the boot as the gate's --capture-boot does (msi-boot.sh's CAPTURE: its scanout,
+# the guest's screenshots and the kext's log of the boot, in the round's capture/), the host's log
+# at info,reims_graphics=trace,reims_vgpu::graphics=debug; a round with --capture runs with no
+# probe too. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
 # with three example probes, one of them for another tip.
 set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
-force=0 list=0 dry=0
-for a in "$@"; do
+force=0 list=0 dry=0 capture=0 want_tip=
+while (($#)); do
+  a=$1
+  shift
   case $a in
     --force) force=1 ;;
+    --capture) capture=1 force=1 ;;
+    --tip) want_tip=${1:?--tip SHA}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -57,6 +65,7 @@ PROBE_HOST_LOG=info,reims_graphics=trace
 # The hold the probes get: the boot's own time to the desktop and the device check (about 90 s),
 # the longest load settle (180 s) and a margin come first.
 FIT_S=$(( HOLD_S - 90 - 180 - 60 ))
+# A capture's wait for the Dock to settle and its fetch (about 90 s) come off it too (--capture).
 
 if ((dry)); then
   D=$(mktemp -d /tmp/probe-dry.XXXXXX)
@@ -110,12 +119,17 @@ while read -r age budget tip name; do
   [[ -n $RT ]] && break
 done <<< "$queue"
 RT=${RT:-$SHORT}
+if [[ -n $want_tip ]]; then
+  RT=$(published "$want_tip")
+  [[ -n $RT ]] || { echo "probe-batch: $want_tip has no published image and host on the lane host" >&2; exit 2; }
+fi
 if [[ $RT != "$SHORT" ]]; then
   PUB=$(git -C "$L" rev-parse --verify -q "$RT^{commit}" 2> /dev/null || echo "$RT")
   SHORT=$RT
 fi
 # What a round takes: the probes for its tip, oldest first, while their budgets fit; those for a
 # tip with no published build are skipped (their results say why); the others wait.
+((capture)) && FIT_S=$(( FIT_S - 90 ))
 take=() fit=0
 while read -r age budget tip name; do
   [[ -n ${name:-} ]] || continue
@@ -132,7 +146,7 @@ if (( !dry && !force )) && (( n < WAIT_N )) && (( ${oldest:-0} < WAIT_S )); then
   echo "probe-batch: no round (a round runs at $WAIT_N waiting or the oldest at $(( WAIT_S / 60 )) min, or with --force)"
   exit 0
 fi
-((${#take[@]})) || { echo "probe-batch: nothing to run"; exit 0; }
+((${#take[@]} || capture)) || { echo "probe-batch: nothing to run"; exit 0; }
 
 # The round: its probes leave the queue for its directory, and those it does not reach go back.
 ROUND=$(date +%Y%m%d-%H%M%S)
@@ -167,7 +181,8 @@ EXCLUSIVE=1
 HOLD_S=$HOLD_S
 LOCK_WAIT_S=${LOCK_WAIT_S:-10800}
 DRAG=0
-HOST_LOG=$PROBE_HOST_LOG
+HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")
+CAPTURE=$capture
 PROBES=$RD/probes
 PROBE_RESULTS=$RES
 PROBE_TIP=$PUB
@@ -175,6 +190,7 @@ EOF
   msi "bash '$RD/bin/msi-boot.sh' '$RD'" || echo "probe-batch: the boot ended $? (its log: $RD/boot.log)"
   # The round's GPU errors (msi-boot.sh's xid.txt), the boot's own QEMU's marked "own".
   msi "cat '$RD/xid.txt' 2> /dev/null" | sed 's/^/  Xid: /'
+  ((capture)) && msi "cat '$RD/capture.txt' 2> /dev/null" | sed 's/^/  capture: /'
 fi
 
 # Each probe's status; the ones not reached (or never started: a failed boot) go back to the queue.

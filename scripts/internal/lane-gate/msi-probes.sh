@@ -126,6 +126,7 @@ shots() {
 }
 settled=0
 for p in "$PROBES"/*/; do
+  [[ -d $p ]] || continue  # a round with no probe (a capture alone)
   p=${p%/}
   name=${p##*/}
   out=$PROBE_RESULTS/$name
