@@ -169,7 +169,7 @@ fi
 # The round: its probes leave the queue for its directory, and those it does not reach go back.
 ROUND=$(date +%Y%m%d-%H%M%S)
 RD=$MSI_GATE/probes/$ROUND
-msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]}; do mv \"\$p\" '$RD/probes/'; done"
+msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]}; do mv \"\$p\" '$RD/probes/'; done && printf '%s\\n' ${take[*]} > '$RD/probes/.order'"
 put "$L/msi-probes.sh" "$RD/bin/"
 put "$L/msi-xid.sh" "$RD/bin/"
 put "$L/msi-capture.py" "$RD/bin/"

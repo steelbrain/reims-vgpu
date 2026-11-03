@@ -5,7 +5,8 @@
 #   msi-probes.sh
 # Its environment:
 #   PROBES          the round's probes, one directory each (run.sh, budget, tip, and any files
-#                   run.sh reads), run in name order
+#                   run.sh reads), run in the order PROBES/.order lists them (one name a line,
+#                   the round's take order), else in name order
 #   PROBE_RESULTS   where each probe's results go: PROBE_RESULTS/NAME/, replaced
 #   PROBE_TIP       the published tip the boot runs (its image and host): a probe whose tip names
 #                   another commit is skipped
@@ -126,7 +127,14 @@ shots() {
   done
 }
 settled=0
-for p in "$PROBES"/*/; do
+in_order() {  # the probes' directories, in .order's order where it is there
+  if [[ -s $PROBES/.order ]]; then
+    while read -r n; do [[ -n $n && -d $PROBES/$n ]] && echo "$PROBES/$n/"; done < "$PROBES/.order"
+  else
+    for p in "$PROBES"/*/; do echo "$p"; done
+  fi
+}
+for p in $(in_order); do
   [[ -d $p ]] || continue  # a round with no probe (a capture alone)
   p=${p%/}
   name=${p##*/}
