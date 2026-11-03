@@ -2740,7 +2740,12 @@ mod tests {
         //   before this platform adopts the device's class ([`crate::gpu::device`]'s `adopt`), where
         //   a kind of [`DIES`] would die in strict mode on every native device's first creation:
         //   relayed instead, the same answer on every device.
-        const PRECISION: [D; 11] = [
+        // - `DeviceBooleanVisibility`: a `Boolean` visibility result where a sample passed is the
+        //   device's nonzero occlusion value, which Metal's own devices differ in too (an M3 Max
+        //   writes 1, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 the samples that
+        //   passed, as the runtime records), so no one nonzero value is Metal's; 0 where none
+        //   passed, as Metal's.
+        const PRECISION: [D; 12] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
@@ -2752,6 +2757,7 @@ mod tests {
             D::DepthDenormals,
             D::DeviceFilteredMipmaps,
             D::FloatTininessAfterRounding,
+            D::DeviceBooleanVisibility,
         ];
         // A pipeline stage's precision notes, each arithmetic, filtering or ordering of the device
         // that its documentation says can differ from Metal's: relayed, but those [`DIES`] and
