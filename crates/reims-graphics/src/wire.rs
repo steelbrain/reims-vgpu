@@ -57,8 +57,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 /// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
-/// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_SUBMIT_ROOM`] and [`RGFX_FEATURE_ICB_SLOTS`]).
-/// Bits 9, 10 and 15 are reserved.
+/// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
+/// [`RGFX_FEATURE_SUBMIT_ROOM`] and [`RGFX_FEATURE_ICB_SLOTS`]). Bits 9 and 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -132,6 +132,11 @@ pub const RGFX_FEATURE_UNSHARED_QUEUES: u32 = 1 << 13;
 /// host memory of its own. Offered where a `Managed` buffer is two copies: where the host's GPU
 /// does not share the CPU's memory.
 pub const RGFX_FEATURE_MANAGED_AT_OFFSET: u32 = 1 << 14;
+/// `FEATURES_LO` bit 15, `HEAP_OVER_PAGES`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_HEAP_OVER_PAGES`], a heap over the
+/// one run of guest RAM a pages block of the process's holds ([`RGFX_FEATURE_PAGES_BUFFERS`]), so
+/// the buffers placed in it lie in the process's own pages. Offered wherever `PAGES_BUFFERS` is.
+pub const RGFX_FEATURE_HEAP_OVER_PAGES: u32 = 1 << 15;
 /// `FEATURES_LO` bit 16, `SUBMIT_ROOM`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_LO`]: a guest producer that finds a submission ring full, ring 0 or
 /// a queue's, may store 1 in the ring's `producer_waiting`, fence, and look for room once more
@@ -507,6 +512,12 @@ pub const RGFX_CMD_ICB_WRITE: u32 = 0x229;
 /// ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]), whose bytes are the guest's copy. A host without the
 /// feature refuses the message as one it does not know.
 pub const RGFX_CMD_BUFFER_MANAGED_AT_OFFSET: u32 = 0x22b;
+/// Command `HEAP_OVER_PAGES` ([`RgfxHeapOverPages`]), where the guest took
+/// [`RGFX_FEATURE_HEAP_OVER_PAGES`]: a Shared heap over the guest's RAM a pages block of the
+/// sender's context holds, which must be one run, in place; buffers are placed in it as in a heap
+/// over host memory (`BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`). A host without the feature
+/// refuses the message as one it does not know.
+pub const RGFX_CMD_HEAP_OVER_PAGES: u32 = 0x22a;
 /// Command `ICB_SLOTS` ([`RgfxIcbSlots`], then its runs, [`RgfxIcbSlotRun`]), where the guest took
 /// [`RGFX_FEATURE_ICB_SLOTS`]: for each run, the slots of `command_count` commands of indirect
 /// command buffer `icb_obj_id` from `first_command`, `slot_bytes` apart from `region_offset`,
@@ -1453,6 +1464,32 @@ pub struct RgfxBufferAtOffset {
     pub options: u32,
     /// Pads to a multiple of 8; 0.
     pub reserved_34: u32,
+}
+
+/// `HEAP_OVER_PAGES`: a heap of `size_bytes` at the guest-picked `gpu_address` over the guest's
+/// RAM of the pages block of `block_size` bytes at `block_offset`, a block of the sender's
+/// context whose pages are one run, at least `size_bytes` rounded up to Metal's 16 KiB page.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxHeapOverPages {
+    /// [`RGFX_CMD_HEAP_OVER_PAGES`].
+    pub header: RgfxMsgHeader,
+    /// The new heap's guest-picked id.
+    pub obj_id: u64,
+    /// The heap's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The pages block's region offset, a block of the sender's context.
+    pub block_offset: u64,
+    /// The pages block's size in bytes.
+    pub block_size: u64,
+    /// The heap's size in bytes.
+    pub size_bytes: u64,
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// `MTLHeapType` (Automatic, Placement or Sparse); widened on decode.
+    pub heap_type: i32,
 }
 
 /// `BUFFER_MANAGED_AT_OFFSET`: a `Managed` buffer of `length` bytes at the guest-picked
@@ -3184,6 +3221,8 @@ const _: () = {
     assert!(size_of::<RgfxBufferOverHostMemory>() == 56);
     assert!(size_of::<RgfxBufferAtOffset>() == 56);
     assert!(size_of::<RgfxBufferManagedAtOffset>() == 64);
+    assert!(size_of::<RgfxHeapOverPages>() == 64);
+    assert!(core::mem::offset_of!(RgfxHeapOverPages, heap_type) == 60);
     assert!(size_of::<RgfxCbComplete>() == 48);
     assert!(size_of::<RgfxCbScheduled>() == 24);
     assert!(size_of::<RgfxCbSubmitted>() == 24);

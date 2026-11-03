@@ -127,6 +127,7 @@ include = [
     "RgfxHeapBinding",
     "RgfxHeapCreate",
     "RgfxHeapOverHostMemory",
+    "RgfxHeapOverPages",
     "RgfxHeapTextureSizeAndAlign",
     "RgfxIcbBuffer",
     "RgfxIcbBufferStride",

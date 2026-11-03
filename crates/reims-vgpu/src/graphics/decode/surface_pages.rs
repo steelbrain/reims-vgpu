@@ -34,6 +34,13 @@
 //! part of the view, at the guest's GPU address, which keeps the app pointer's place in its page.
 //! The view goes at the block's `BLOCK_RELEASE` or its context's close, once the buffers over it
 //! have let it go.
+//!
+//! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block of one run, a slab's
+//! 2 MiB superpage, can hold a `HEAP_OVER_PAGES`: a heap over that run where the guest's RAM is
+//! mapped for the host (the memory map's), not over the view, so the platform imports it as it
+//! does guest RAM, and the buffers placed in it cost what a heap over host memory's do. The RAM
+//! stays mapped as long as the device, so the heap needs no hold on the view; it lies over the
+//! block, which is not released while it lives.
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -41,7 +48,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use reims_graphics::wire::{
-    RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxPageRun, RgfxSurfacePages,
+    RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxPageRun,
+    RgfxSurfacePages,
 };
 use reims_vgpu_core::guest::records::APV_PAGE_SIZE;
 use reims_vgpu_core::host::{HostPtr, PhysRange};
@@ -49,7 +57,7 @@ use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::memory::mapping::Mapping;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
+use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 
@@ -141,6 +149,9 @@ struct Private<P: Platform> {
     /// The view, made at the block's first `BUFFER_OVER_PAGES`, with a buffer over the whole of
     /// it that holds the runtime's import of its pages for the buffers over its parts.
     view: Option<(Arc<SurfaceView<P>>, P::Buffer)>,
+    /// Where the guest's RAM mapping holds the block's pages, where they are one run: what a
+    /// `HEAP_OVER_PAGES` lies over, which makes no view.
+    ram: Option<(HostPtr, u64)>,
 }
 
 /// The views of the surfaces whose blocks name their pages, by block offset, and the cache.
@@ -221,6 +232,13 @@ impl<P: Platform> SurfaceViews<P> {
             checked => checked,
         };
         let runs = runs.map_err(|why| self.refused(why))?;
+        let ram = match (runs.as_slice(), &self.memory) {
+            (&[(address, length)], Some((memory, _))) => {
+                let host = memory.virtual_address_for_physical(address, length);
+                (!host.is_null()).then_some((host, length))
+            }
+            _ => None,
+        };
         self.private.insert(
             pages.block_offset,
             Private {
@@ -229,6 +247,7 @@ impl<P: Platform> SurfaceViews<P> {
                 block_size: pages.block_size,
                 context: pages.context,
                 view: None,
+                ram,
             },
         );
         Ok(())
@@ -410,6 +429,21 @@ impl<P: Platform> SurfaceViews<P> {
             p.view = Some((Arc::clone(&view), import));
         }
         Ok(Some(view))
+    }
+
+    /// Where the guest's RAM mapping holds the pages of the pages block at `block`, where they are
+    /// one run and the block was made for `context` (any where `None`) and holds the `block_size`
+    /// bytes a message names: its first byte and length.
+    pub(crate) fn private_ram(
+        &self,
+        block: u64,
+        block_size: u64,
+        context: Option<u32>,
+    ) -> Option<(HostPtr, u64)> {
+        self.private
+            .get(&block)
+            .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
+            .and_then(|p| p.ram)
     }
 
     /// The host addresses of the guest pages of `runs` in the mapping of the guest's RAM the
@@ -599,20 +633,81 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             None => Ok(Err(super::DecodeError::Refused)),
         }
     }
+
+    /// `HEAP_OVER_PAGES`: a Shared heap over the guest's RAM of a pages block of the sender's
+    /// whose pages are one run (the module doc), in place, as a `HEAP_OVER_HOST_MEMORY` is over
+    /// the region: its memory is the `size_bytes` from the run's first byte, rounded up to
+    /// Metal's 16 KiB page. It lies over the block, and records its bytes, where a
+    /// `BUFFER_MANAGED_AT_OFFSET` in it finds its CPU copy. A block the sender does not hold is a
+    /// guest protocol error; one that is no pages block of its context's, of more than one run,
+    /// or smaller than the heap, is refused.
+    pub(super) fn heap_over_pages(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), super::DecodeError>> {
+        let Some(m) = super::read::<RgfxHeapOverPages>(message) else {
+            return Ok(Err(super::DecodeError::Malformed));
+        };
+        if !self.in_own_block(m.block_offset, m.block_size) {
+            return Ok(Err(super::DecodeError::BadReference));
+        }
+        let ram = (self.shared.surface_views.lock()).private_ram(
+            m.block_offset,
+            m.block_size,
+            self.context,
+        );
+        let Some((at, length)) = ram.and_then(|(at, run)| {
+            let length = m.size_bytes.checked_next_multiple_of(super::HEAP_PAGE)?;
+            (m.size_bytes != 0 && length <= run).then_some((at, length))
+        }) else {
+            return Ok(Err(super::DecodeError::Refused));
+        };
+        // SAFETY: the bytes lie in the run (checked above), in the mapping of the guest's RAM,
+        // which stays mapped as long as the device, and so the heap.
+        let bytes = unsafe { HostRange::new(at, length) };
+        let desc = HeapDesc {
+            size: m.size_bytes,
+            heap_type: super::host_heap_type(m.heap_type),
+            options: vec![OptionSet::ResourceOptions(m.options.into())],
+            address_ranges: None,
+            pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
+        };
+        match device.new_heap_over_host_memory(bytes, &desc)?.heap {
+            Some(heap) => {
+                let mut entry = super::tables::Entry::of(super::ObjHandle::Heap(heap))
+                    .over(Some((m.block_offset, m.block_size)));
+                entry.ram = Some((at, length));
+                self.store(m.obj_id, entry);
+                Ok(Ok(()))
+            }
+            None => {
+                super::heap_refused(
+                    m.obj_id,
+                    m.size_bytes,
+                    m.heap_type,
+                    m.options,
+                    m.gpu_address,
+                );
+                Ok(Err(super::DecodeError::Refused))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use reims_graphics::region::Region;
     use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_OBJECT_DESTROY,
-        RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
-        RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_CACHED,
-        RGFX_SURFACE_PAGES_PRIVATE, RgfxMsgHeader, RgfxObjectDestroy,
+        RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+        RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
+        RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE,
+        RgfxBufferAtOffset, RgfxMsgHeader, RgfxObjectDestroy,
     };
     use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
     use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::testkit::{FakePlatform, GuestRam};
+    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam};
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder, no_raise};
@@ -775,6 +870,32 @@ pub(super) mod tests {
                 reserved_44: 0,
             };
             self.dec.decode(&self.device, m.as_bytes()).unwrap()
+        }
+
+        /// A `HEAP_OVER_PAGES` of `size` bytes over the pages block at `block` (of
+        /// [`Self::pages_flagged`]'s size), at an address of its id's.
+        pub(crate) fn pages_heap(
+            &mut self,
+            obj_id: u64,
+            block: u64,
+            size: u64,
+        ) -> Result<(), DecodeError> {
+            let m = RgfxHeapOverPages {
+                header: header(RGFX_CMD_HEAP_OVER_PAGES),
+                obj_id,
+                gpu_address: 0x2_0000_0000 + (obj_id & 0xff) * 0x100_0000,
+                block_offset: block,
+                block_size: 0x2000,
+                size_bytes: size,
+                options: 0,
+                heap_type: 1,
+            };
+            self.dec.decode(&self.device, m.as_bytes()).unwrap()
+        }
+
+        /// The host's first byte of guest RAM.
+        pub(crate) fn ram_base(&self) -> HostPtr {
+            self.ram.ranges()[0].host()
         }
 
         /// The GPU address and the contents of the buffer `obj_id` names.
@@ -1069,6 +1190,98 @@ pub(super) mod tests {
             r.pages_buffer(obj(2, 2), 0, BLOCK + 0x8000, 0, page),
             Err(DecodeError::Refused)
         );
+    }
+
+    /// A pages block of one run holds a heap over the guest's RAM itself, not over its view, at
+    /// the guest's address, rounded up to Metal's page: a buffer placed in it lies at the heap's
+    /// address plus its offset, and the block is in use while either lives. A block of two runs, a surface's block,
+    /// one with no view, a heap past the run or of no bytes, and another context's block are
+    /// refused; a block outside the processes' is a bad reference
+    #[test]
+    fn a_pages_block_of_one_run_holds_a_heap_over_the_guest_s_ram() {
+        let mut r = rig(16);
+        let page = r.page;
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(2, 4)], 4 * page, private),
+            RGFX_STATUS_OK
+        );
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.pages_heap(20, BLOCK, 4 * page - 0x100), Ok(()));
+        assert_eq!(
+            r.p.call_log().sels_since(mark),
+            ["newHeapWithDescriptor:"],
+            "one heap, with no mapping made"
+        );
+        let calls = r.p.call_log().since(mark);
+        let first = r.ram_base().wrapping_add(2 * page);
+        assert_eq!(
+            calls[0].args[..2],
+            [Arg::Ptr(first.addr()), Arg::U64(4 * page)],
+            "over the run's pages where the guest's RAM is mapped, whole pages of Metal's"
+        );
+        assert!(r.dec.span_in_use(BLOCK, 0x2000));
+        let at = RgfxBufferAtOffset {
+            header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+            obj_id: 21,
+            heap_obj_id: 20,
+            offset: page,
+            length: 0x100,
+            options: 0,
+            reserved_34: 0,
+        };
+        assert_eq!(r.dec.decode(&r.device, at.as_bytes()).unwrap(), Ok(()));
+        let (gpu_address, _) = r.buffer_at(21);
+        assert_eq!(gpu_address, 0x2_0000_0000 + 20 * 0x100_0000 + page);
+
+        // Refusals.
+        assert_eq!(
+            r.pages_flagged(BLOCK + 0x4000, 0, &[(8, 1), (10, 1)], 2 * page, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_heap(22, BLOCK + 0x4000, page),
+            Err(DecodeError::Refused),
+            "two runs"
+        );
+        assert_eq!(r.pages(BLOCK + 0x8000, &[(12, 1)], page), RGFX_STATUS_OK);
+        assert_eq!(
+            r.pages_heap(22, BLOCK + 0x8000, page),
+            Err(DecodeError::Refused),
+            "a surface's block"
+        );
+        assert_eq!(
+            r.pages_heap(22, BLOCK + 0xc000, page),
+            Err(DecodeError::Refused),
+            "no view"
+        );
+        assert_eq!(
+            r.pages_heap(22, BLOCK, 4 * page + 1),
+            Err(DecodeError::Refused),
+            "past the run"
+        );
+        assert_eq!(r.pages_heap(22, BLOCK, 0), Err(DecodeError::Refused));
+        assert_eq!(r.pages_heap(22, 0, page), Err(DecodeError::BadReference));
+        r.dec.region.grant(3, BLOCK, 0x2000);
+        r.dec.set_context(Some(3));
+        let obj = (3 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+        assert_eq!(
+            r.pages_heap(obj, BLOCK, page),
+            Err(DecodeError::Refused),
+            "a pages block made for context 0"
+        );
+        r.dec.set_context(None);
+
+        // The block is in use while the buffer or the heap lives.
+        for obj_id in [20, 21] {
+            assert!(r.dec.span_in_use(BLOCK, 0x2000));
+            let destroy = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        }
+        assert!(!r.dec.span_in_use(BLOCK, 0x2000));
     }
 
     /// A pages block's runs are checked as a surface's: runs outside guest RAM, not whole pages,

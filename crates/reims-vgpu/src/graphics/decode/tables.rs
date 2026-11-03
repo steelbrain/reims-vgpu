@@ -35,6 +35,7 @@ use std::sync::atomic::AtomicUsize;
 
 use parking_lot::RwLock;
 use reims_vgpu_core::collections::hasher::KeyBuild;
+use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
@@ -104,6 +105,9 @@ pub(crate) struct Entry<P: Platform> {
     pub(crate) place: Option<PlanePlace>,
     /// A command queue's counts.
     pub(crate) queue: Option<QueueCounts>,
+    /// A heap over a pages block's guest RAM (`HEAP_OVER_PAGES`): the host bytes it lies in, its
+    /// first byte and length, which `span`, the block's, does not name.
+    pub(crate) ram: Option<(HostPtr, u64)>,
     /// The table's clock at its make.
     made: u64,
 }
@@ -117,6 +121,7 @@ impl<P: Platform> Entry<P> {
             span: None,
             place: None,
             queue: None,
+            ram: None,
             made: 0,
         }
     }

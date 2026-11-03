@@ -80,8 +80,8 @@ use reims_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-    RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
-    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE,
+    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
     RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE,
     RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE,
@@ -1643,6 +1643,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => self.buffer_over_surface_pages(device, message),
             RGFX_CMD_BUFFER_MANAGED_AT_OFFSET => self.managed_buffer_at_offset(device, message),
+            RGFX_CMD_HEAP_OVER_PAGES => self.heap_over_pages(device, message),
             RGFX_CMD_BUFFER_OVER_PAGES => self.buffer_over_pages(device, message),
             RGFX_CMD_BUFFER_DID_MODIFY_RANGE => {
                 let drain = self.command_buffer_drain();
@@ -2123,6 +2124,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// and lies over one.
     fn span_of(&self, obj_id: u64) -> Option<(u64, u64)> {
         self.entry(obj_id).and_then(|e| e.span)
+    }
+
+    /// The host bytes of the heap over a pages block's guest RAM `obj_id` names
+    /// (`HEAP_OVER_PAGES`): its first byte and length.
+    fn ram_of(&self, obj_id: u64) -> Option<(HostPtr, u64)> {
+        self.entry(obj_id).and_then(|e| e.ram)
     }
 
     /// Whether an object the decoder holds lies in the `size` bytes at region offset `offset`:
