@@ -23,6 +23,8 @@
 //               reset, a GPU-encoded ICB copied, CPU and GPU writes mixed
 //   residency   an executed ICB's buffers without useResource
 //   timing      CPU encode cost per command, execution GPU time
+//   freed       buffers the commands name released before an execute, a heap's among them
+//   resets      what a command's reset and resetWithRange: keep of a command's pipeline state
 // Render results print as the 8 cells of a 64x8 target, each the hex digit of the color index
 // found there ('.' where nothing drew, '?' where something unexpected did).
 // Build: see README.md.
@@ -1601,6 +1603,271 @@ static void case_residency(void)
 	line("a Private vertex buffer blitted first, never made resident", NULL);
 }
 
+// ---- freed -----------------------------------------------------------------------------------
+
+// The commands of `b` executed in one pass that makes `resident` resident (none past the null).
+static void exec_resident(id<MTLIndirectCommandBuffer> b, id<MTLBuffer> __strong *resident, int n)
+{
+	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	id<MTLRenderCommandEncoder> e = begin_pass(cb);
+	for (int i = 0; i < n; i++)
+		if (resident[i])
+			[e useResource:resident[i]
+			         usage:MTLResourceUsageRead
+			        stages:MTLRenderStageVertex | MTLRenderStageFragment];
+	[e executeCommandsInBuffer:b withRange:NSMakeRange(0, b.size)];
+	end_pass(cb, e);
+	run(cb);
+}
+
+// A buffer of `len` bytes, every 16-byte color in it color index `k`.
+static id<MTLBuffer> colors_of(NSUInteger len, NSUInteger k)
+{
+	id<MTLBuffer> b = buf(len);
+	float *c = b.contents;
+	for (NSUInteger i = 0; i < len / 16; i++) {
+		c[i * 4 + 0] = (float)(((k % 15) + 1) * 16) / 255.0f;
+		c[i * 4 + 3] = 1.0f;
+	}
+	return b;
+}
+
+static void case_freed(void)
+{
+	printf("freed (a buffer the commands name released before the execute):\n");
+	id<MTLIndirectCommandBuffer> b = icb(rdesc(MTLIndirectCommandTypeDraw, NO, NO), 8);
+	id<MTLBuffer> rects = [D newBufferWithBytes:gRects.contents length:gRects.length
+	                                    options:MTLResourceStorageModeShared];
+	id<MTLBuffer> colors = [D newBufferWithBytes:gColors.contents length:gColors.length
+	                                     options:MTLResourceStorageModeShared];
+	for (NSUInteger i = 0; i < 8; i++) {
+		id<MTLIndirectRenderCommand> c = [b indirectRenderCommandAtIndex:i];
+		[c setRenderPipelineState:gDraw];
+		[c setVertexBuffer:rects offset:i * 16 atIndex:0];
+		[c setFragmentBuffer:colors offset:i * 16 atIndex:0];
+		[c drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+		    instanceCount:1 baseInstance:0];
+	}
+	{
+		id<MTLBuffer> live[] = {rects, colors};
+		exec_resident(b, live, 2);
+		line("both buffers live and resident", "01234567");
+	}
+	@autoreleasepool {
+		colors = nil;
+	}
+	{
+		id<MTLBuffer> live[] = {rects};
+		exec_resident(b, live, 1);
+		line("the fragment buffer released", NULL);
+	}
+	{
+		// Buffers of its size made since, in color 9, resident: does a command reach one?
+		id<MTLBuffer> fresh[4];
+		for (int i = 0; i < 4; i++)
+			fresh[i] = colors_of(gColors.length, 9);
+		id<MTLBuffer> live[] = {rects, fresh[0], fresh[1], fresh[2], fresh[3]};
+		exec_resident(b, live, 5);
+		line("then 4 buffers of its size made, in color 9, resident", NULL);
+	}
+	@autoreleasepool {
+		rects = nil;
+	}
+	exec_resident(b, NULL, 0);
+	line("the vertex buffer released too", NULL);
+	// A heap's buffers: the heap made resident after its fragment buffer was released.
+	{
+		// Private: the x86 devices refuse a Shared heap (an assertion); a blit fills it.
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = 64 * 1024;
+		hd.storageMode = MTLStorageModePrivate;
+		id<MTLHeap> heap = [D newHeapWithDescriptor:hd];
+		id<MTLBuffer> hr = [heap newBufferWithLength:gRects.length options:MTLResourceStorageModePrivate];
+		id<MTLBuffer> hc = [heap newBufferWithLength:gColors.length options:MTLResourceStorageModePrivate];
+		{
+			id<MTLCommandBuffer> fill = [Q commandBuffer];
+			id<MTLBlitCommandEncoder> bl = [fill blitCommandEncoder];
+			[bl copyFromBuffer:gRects sourceOffset:0 toBuffer:hr destinationOffset:0 size:gRects.length];
+			[bl copyFromBuffer:gColors sourceOffset:0 toBuffer:hc destinationOffset:0 size:gColors.length];
+			[bl endEncoding];
+			run(fill);
+		}
+		id<MTLIndirectCommandBuffer> hb = icb(rdesc(MTLIndirectCommandTypeDraw, NO, NO), 8);
+		for (NSUInteger i = 0; i < 8; i++) {
+			id<MTLIndirectRenderCommand> c = [hb indirectRenderCommandAtIndex:i];
+			[c setRenderPipelineState:gDraw];
+			[c setVertexBuffer:hr offset:i * 16 atIndex:0];
+			[c setFragmentBuffer:hc offset:i * 16 atIndex:0];
+			[c drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+			    instanceCount:1 baseInstance:0];
+		}
+		@autoreleasepool {
+			hc = nil;
+		}
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		id<MTLRenderCommandEncoder> e = begin_pass(cb);
+		[e useHeap:heap stages:MTLRenderStageVertex | MTLRenderStageFragment];
+		[e executeCommandsInBuffer:hb withRange:NSMakeRange(0, 8)];
+		end_pass(cb, e);
+		run(cb);
+		line("a heap's fragment buffer released, the heap resident", NULL);
+	}
+	// Compute: a dispatch adds vals[0] (5) to out; vals released, then out.
+	id<MTLBuffer> out = buf(64 * 4);
+	id<MTLBuffer> vals = buf(16);
+	*(uint32_t *)vals.contents = 5;
+	id<MTLIndirectCommandBuffer> cbuf = icb(cdesc(MTLIndirectCommandTypeConcurrentDispatch, NO, NO), 1);
+	{
+		id<MTLIndirectComputeCommand> c = [cbuf indirectComputeCommandAtIndex:0];
+		[c setComputePipelineState:gAdd];
+		[c setKernelBuffer:out offset:0 atIndex:0];
+		[c setKernelBuffer:vals offset:0 atIndex:1];
+		[c concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+		            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	}
+	exec_compute(cbuf, NSMakeRange(0, 1), nil, out, vals, nil);
+	printf("  %-60s %u\n", "a dispatch adding vals[0] = 5, both live", ((uint32_t *)out.contents)[0]);
+	@autoreleasepool {
+		vals = nil;
+	}
+	exec_compute(cbuf, NSMakeRange(0, 1), nil, out, nil, nil);
+	printf("  %-60s %u\n", "again, vals released", ((uint32_t *)out.contents)[0]);
+	{
+		id<MTLBuffer> fresh[4];
+		for (int i = 0; i < 4; i++) {
+			fresh[i] = buf(16);
+			*(uint32_t *)fresh[i].contents = 100;
+		}
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e useResource:out usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+		for (int i = 0; i < 4; i++)
+			[e useResource:fresh[i] usage:MTLResourceUsageRead];
+		[e executeCommandsInBuffer:cbuf withRange:NSMakeRange(0, 1)];
+		[e endEncoding];
+		run(cb);
+		printf("  %-60s %u\n", "again, 4 buffers of 16 B made since (100), resident",
+		       ((uint32_t *)out.contents)[0]);
+	}
+	// Released while a command buffer that executes the command waits behind a spin: a command
+	// buffer of unretained references, so the release is the buffer's last.
+	{
+		id<MTLBuffer> o2 = buf(64 * 4), v2 = buf(16), n = buf(16);
+		*(uint32_t *)v2.contents = 5;
+		*(uint32_t *)n.contents = 1u << 20;
+		id<MTLBuffer> counter = [D newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+		id<MTLIndirectCommandBuffer> c2 =
+		    icb(cdesc(MTLIndirectCommandTypeConcurrentDispatch, NO, NO), 1);
+		id<MTLIndirectComputeCommand> k = [c2 indirectComputeCommandAtIndex:0];
+		[k setComputePipelineState:gAdd];
+		[k setKernelBuffer:o2 offset:0 atIndex:0];
+		[k setKernelBuffer:v2 offset:0 atIndex:1];
+		[k concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+		           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		id<MTLCommandBuffer> cb = [Q commandBufferWithUnretainedReferences];
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e setComputePipelineState:gSpin];
+		[e setBuffer:counter offset:0 atIndex:0];
+		[e setBuffer:n offset:0 atIndex:1];
+		[e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		[e useResource:o2 usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+		[e useResource:v2 usage:MTLResourceUsageRead];
+		[e executeCommandsInBuffer:c2 withRange:NSMakeRange(0, 1)];
+		[e endEncoding];
+		[cb commit];
+		@autoreleasepool {
+			v2 = nil;
+		}
+		[cb waitUntilCompleted];
+		printf("  %-60s %u%s\n", "vals released while the execute waits behind a spin",
+		       ((uint32_t *)o2.contents)[0],
+		       cb.status == MTLCommandBufferStatusCompleted ? "" : "  (command buffer failed)");
+	}
+	// A large buffer released (its own pages, no suballocation): what does the command read?
+	for (NSUInteger mib = 1; mib <= 64; mib *= 8) {
+		id<MTLBuffer> o3 = buf(64 * 4);
+		id<MTLBuffer> big = [D newBufferWithLength:mib << 20 options:MTLResourceStorageModeShared];
+		*(uint32_t *)big.contents = 5;
+		id<MTLIndirectCommandBuffer> c3 =
+		    icb(cdesc(MTLIndirectCommandTypeConcurrentDispatch, NO, NO), 1);
+		id<MTLIndirectComputeCommand> k = [c3 indirectComputeCommandAtIndex:0];
+		[k setComputePipelineState:gAdd];
+		[k setKernelBuffer:o3 offset:0 atIndex:0];
+		[k setKernelBuffer:big offset:0 atIndex:1];
+		[k concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+		           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		@autoreleasepool {
+			big = nil;
+		}
+		exec_compute(c3, NSMakeRange(0, 1), nil, o3, nil, nil);
+		char what[64];
+		snprintf(what, sizeof what, "vals of %lu MiB released before the execute", (unsigned long)mib);
+		printf("  %-60s %u\n", what, ((uint32_t *)o3.contents)[0]);
+	}
+	// The written buffer released: where do the writes go? A buffer made after it, resident.
+	id<MTLBuffer> after = nil;
+	@autoreleasepool {
+		out = nil;
+	}
+	after = buf(64 * 4);
+	{
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e useResource:after usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+		[e executeCommandsInBuffer:cbuf withRange:NSMakeRange(0, 1)];
+		[e endEncoding];
+		run(cb);
+		printf("  %-60s %u\n", "out released too; a buffer of its size made since, resident",
+		       ((uint32_t *)after.contents)[0]);
+	}
+}
+
+// ---- resets ----------------------------------------------------------------------------------
+
+// What a command's reset and a buffer's resetWithRange: keep: commands 0 and 1 are encoded whole,
+// command 0 reset by its reset, command 1 by resetWithRange {1,1}; then each is given its
+// buffers and its draw or dispatch again, no pipeline state, and executed with none on the encoder.
+static void case_resets(void)
+{
+	printf("resets (what each reset keeps; buffers and draw encoded again, no pipeline):\n");
+	id<MTLIndirectCommandBuffer> b = icb(rdesc(MTLIndirectCommandTypeDraw, NO, NO), 2);
+	for (NSUInteger i = 0; i < 2; i++)
+		enc_draw(b, i, i, i + 1, YES);
+	exec_render(b, NSMakeRange(NSNotFound, 0), nil, NO, 0);
+	line("render: both encoded", "12......");
+	[[b indirectRenderCommandAtIndex:0] reset];
+	[b resetWithRange:NSMakeRange(1, 1)];
+	for (NSUInteger i = 0; i < 2; i++)
+		enc_draw(b, i, i, i + 1, NO);
+	exec_render(b, NSMakeRange(NSNotFound, 0), nil, NO, 0);
+	line("render: 0 reset, 1 resetWithRange, then buffers and draw", NULL);
+	id<MTLBuffer> out = buf(2 * 64 * 4), vals = buf(16);
+	*(uint32_t *)vals.contents = 5;
+	id<MTLIndirectCommandBuffer> c = icb(cdesc(MTLIndirectCommandTypeConcurrentDispatch, NO, NO), 2);
+	for (int pass = 0; pass < 2; pass++) {
+		for (NSUInteger i = 0; i < 2; i++) {
+			id<MTLIndirectComputeCommand> k = [c indirectComputeCommandAtIndex:i];
+			if (pass == 0)
+				[k setComputePipelineState:gAdd];
+			[k setKernelBuffer:out offset:i * 256 atIndex:0];
+			[k setKernelBuffer:vals offset:0 atIndex:1];
+			[k concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+			            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		}
+		memset(out.contents, 0, out.length);
+		exec_compute(c, NSMakeRange(0, 2), nil, out, vals, nil);
+		const uint32_t *o = out.contents;
+		printf("  %-60s %u %u\n",
+		       pass ? "compute: 0 reset, 1 resetWithRange, then buffers and dispatch"
+		            : "compute: both encoded (add 5)",
+		       o[0], o[64]);
+		if (pass == 0) {
+			[[c indirectComputeCommandAtIndex:0] reset];
+			[c resetWithRange:NSMakeRange(1, 1)];
+		}
+	}
+}
+
 // ---- timing ----------------------------------------------------------------------------------
 
 static void case_timing(void)
@@ -1677,6 +1944,10 @@ static int run_case(int argc, char **argv)
 		case_residency();
 	else if (!strcmp(argv[0], "timing"))
 		case_timing();
+	else if (!strcmp(argv[0], "freed"))
+		case_freed();
+	else if (!strcmp(argv[0], "resets"))
+		case_resets();
 	else
 		return 2;
 	return 0;
@@ -1742,7 +2013,7 @@ int main(int argc, char **argv)
 	const BOOL validate = getenv("ORACLE_VALIDATE") && *getenv("ORACLE_VALIDATE") == '1';
 	static const char *const all[] = {"info",   "types",   "limits", "descriptor", "setters",
 	                                  "render", "patches", "ranges", "reset",      "order",
-	                                  "compute", "gpu",    "residency", "timing"};
+	                                  "compute", "gpu",    "residency", "timing", "freed",      "resets"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;
