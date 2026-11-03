@@ -59,7 +59,8 @@ finish() {
     grep -E 'the display shows IOSurface|reims-vgpu: fatal|panic| ERROR | WARN ' "$B/launch.log" > "$R/host-events.log"
     gzip -c "$B/launch.log" > "$R/launch.log.gz"
     cp -f "$B/serial.log" "$R/serial.log" 2> /dev/null
-    kv serial_fatal_lines "$(grep -c 'reims-vgpu: fatal' "$B/serial.log" 2> /dev/null || echo 0)"
+    n=$(grep -c 'reims-vgpu: fatal' "$B/serial.log" 2> /dev/null)
+    kv serial_fatal_lines "${n:-0}"
   fi
   rm -f "$B"/*.qcow2
   kv hold_s "$(( $(date +%s) - T0 ))"
