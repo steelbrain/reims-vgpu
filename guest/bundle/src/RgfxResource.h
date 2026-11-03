@@ -35,7 +35,10 @@
 #include "RgfxObjectModel.hpp" // RgfxObjId
 
 #ifdef __cplusplus
+#include <atomic>
+#include <cstdint>
 #include <functional>
+#include <objc/runtime.h>
 
 class RgfxSerializer;
 #endif
@@ -46,12 +49,20 @@ class RgfxSerializer;
 NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxResource : NSObject {
-@protected
-	// The guest-picked id naming this object's host handle (RgfxObjId == uint64_t).
+@package
+	// The guest-picked id naming this object's host handle (RgfxObjId == uint64_t). Read by
+	// the encoders with no message (RgfxResourceId).
 	uint64_t _objId;
 	// Borrowed: the owning device's serialiser, the route for mutating calls.
 	// Null in a unit test that drives a wrapper without a device.
 	RgfxSerializer *_serializer;
+	// The keep stamp of the command buffer that last kept the object (RgfxEncoder::keepStamp),
+	// 0 before any: its encoders keep it once, at its first naming. Any thread's encoder reads
+	// and writes it, relaxed: a lost write only keeps it once more.
+	uint64_t _rgfxKeptBy;
+	// The texture over an IOSurface the object is, or views through any views (a view holds
+	// its texture, so this outlives it); nil for every other.
+	__unsafe_unretained id _Nullable _rgfxSurfaceRoot;
 }
 
 /// The object's guest-picked id (0 names no object).
@@ -127,10 +138,31 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 #ifdef __cplusplus
+/// Whether `obj` is one of ours (an RgfxResource), with no message: its class is looked up in a
+/// small table of classes found to be ours, and only a class not yet there asks isKindOfClass:.
+/// A class never leaves the table: classes are not unloaded.
+bool RgfxIsResourceClassSlow(__unsafe_unretained id _Nonnull obj, uintptr_t cls);
+extern std::atomic<uintptr_t> gRgfxResourceClasses[32];
+inline bool RgfxIsResource(__unsafe_unretained id _Nullable obj)
+{
+	if (obj == nil)
+		return false;
+	const uintptr_t cls = reinterpret_cast<uintptr_t>((__bridge void *)object_getClass(obj));
+	if (gRgfxResourceClasses[(cls >> 4) & 31].load(std::memory_order_relaxed) == cls)
+		return true;
+	return RgfxIsResourceClassSlow(obj, cls);
+}
+
 /// `obj`'s rgfxObjId where it is one of ours, else 0: nil, and an object no device of ours made,
 /// name no object. Read with no message and no retain, for the encoders, which name an object
 /// for each op that takes one.
-uint64_t RgfxResourceId(__unsafe_unretained id _Nullable obj);
+inline uint64_t RgfxResourceId(__unsafe_unretained id _Nullable obj)
+{
+	if (!RgfxIsResource(obj))
+		return 0;
+	__unsafe_unretained RgfxResource *r = (RgfxResource *)obj;
+	return r->_objId;
+}
 
 /// Whether `a`'s memory meets `b`'s: both lie in one heap over byte ranges that meet.
 BOOL RgfxResourcesAlias(RgfxResource *a, id _Nullable b);

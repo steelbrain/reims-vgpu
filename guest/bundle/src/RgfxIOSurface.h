@@ -163,12 +163,13 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
 
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
 /// over an IOSurface or a view of one, through any views (otherwise nothing).
-void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, id _Nullable texture);
+void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, __unsafe_unretained id _Nullable texture);
 
 /// Records on `enc` that its command buffer uses `resource`, when `resource` is a texture over an
-/// IOSurface whose shared block is cached (a device cache on the host), or a view of one;
-/// otherwise nothing, and nothing at all while no such texture lives in the process.
-void rgfxIOSurfaceNoteUse(RgfxEncoder *_Nullable enc, id _Nullable resource);
+/// IOSurface whose shared block is cached (a device cache on the host), or a view of one, once a
+/// command buffer; otherwise nothing, and nothing at all while no such texture lives in the
+/// process.
+void rgfxIOSurfaceNoteUse(RgfxEncoder *_Nullable enc, __unsafe_unretained id _Nullable resource);
 
 /// At a commit, before the command buffer is posted: names in `enc`'s op stream, before its
 /// first encoder, each cached surface the buffer uses (rgfxIOSurfaceNoteUse) or writes (`writes`,
@@ -184,12 +185,18 @@ void rgfxIOSurfaceNameUses(RgfxEncoder *_Nonnull enc,
 /// binding of any other texture, or of nil, drops the index's.
 class RgfxSurfaceBindings {
 public:
-	/// `texture` bound at `index`.
-	void bind(NSUInteger index, id _Nullable texture);
+	/// `texture` bound at `index`, `overSurface` where it is a texture over an IOSurface or a
+	/// view of one (as rgfxBinds answers it).
+	void bind(NSUInteger index, __unsafe_unretained id _Nullable texture, bool overSurface)
+	{
+		if (m_bound.empty() && !overSurface)
+			return; // the common case: no surface bound, and none binding
+		rebind(index, texture, overSurface);
+	}
 	/// `resource` made resident (useResource:usage:) with no Write in its usage: a texture over an
 	/// IOSurface or a resource over app memory, which a function may yet write through an
 	/// argument buffer (noteWrites).
-	void resident(id _Nullable resource);
+	void resident(__unsafe_unretained id _Nullable resource);
 	/// At a draw or dispatch of the function whose arguments are `fn`, records on `enc` as
 	/// written, once each while it stays bound or resident:
 	/// - each bound texture over an IOSurface the function writes (rgfxAirWritesTexture), and,
@@ -201,15 +208,28 @@ public:
 	///   app memory where `fn` is null or has an argument buffer. Metal takes the usage
 	///   useResource gave for the app's promise, but a discrete Mac's driver lands a write the
 	///   promise left out, and the app's pages then hold it: so does a surface's here.
-	void noteWrites(RgfxEncoder *_Nullable enc, const RgfxAirFunction *_Nullable fn);
+	void noteWrites(RgfxEncoder *_Nullable enc, const RgfxAirFunction *_Nullable fn)
+	{
+		// What a draw notes follows from the function and what is bound or resident alone:
+		// once both are as they were at the last draw, every write is noted already.
+		if (m_changed || fn != m_lastFn)
+			noteChangedWrites(enc, fn);
+	}
+	/// The encoder's pipeline changed: the next draw looks at every binding again, the
+	/// function's arguments being another's.
+	void pipelineChanged() { m_changed = true; }
 	/// Drops every binding and resident resource, as the encoder ends.
 	void clear()
 	{
 		m_bound.clear();
 		m_resident.clear();
+		m_changed = true;
 	}
 
 private:
+	void rebind(NSUInteger index, __unsafe_unretained id _Nullable texture, bool overSurface);
+	void noteChangedWrites(RgfxEncoder *_Nullable enc, const RgfxAirFunction *_Nullable fn);
+
 	struct Bound {
 		NSUInteger index;
 		id _Nonnull texture;
@@ -222,6 +242,10 @@ private:
 	};
 	std::vector<Bound> m_bound;
 	std::vector<Resident> m_resident;
+	// A binding, a resident resource or the pipeline changed since the last draw's notes, which
+	// were for the function `m_lastFn`.
+	bool m_changed = true;
+	const RgfxAirFunction *_Nullable m_lastFn = nullptr;
 };
 
 /// Where the writes `writes` (taken from a command buffer's encoder) are named to the kext: the

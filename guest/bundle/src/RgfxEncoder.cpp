@@ -9,6 +9,8 @@
 #include "RgfxEncoder.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -37,80 +39,88 @@ size_t roundUp8(size_t n)
 
 } // namespace
 
+namespace {
+
+/// The next command buffer's keep stamp (RgfxEncoder::keepStamp): every builder takes its own,
+/// never 0, which no object records before it is first kept.
+std::atomic<uint64_t> g_nextKeepStamp{1};
+
+} // namespace
+
 RgfxEncoder::RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id,
                          size_t reserve)
-    : m_ring(ring), m_head{}, m_buf()
+    : m_ring(&ring), m_head{},
+      m_keepStamp(g_nextKeepStamp.fetch_add(1, std::memory_order_relaxed))
 {
 	m_head.queue_obj_id = queue_obj_id;
 	m_head.cb_obj_id = cb_obj_id;
 	m_head.op_bytes = 0;
-	m_buf.reserve(std::max<size_t>(reserve, RGFX_COMMAND_BUFFER_OPS_OFFSET));
-	// Reserve the fixed header; its RgfxMsgHeader is stamped by the ring writer on
-	// post, and op_bytes is filled by finish(). The op stream starts right after.
-	m_buf.resize(RGFX_COMMAND_BUFFER_OPS_OFFSET, 0);
-	std::memcpy(m_buf.data(), &m_head, sizeof(m_head));
+	const size_t size = kHeadroom + RGFX_COMMAND_BUFFER_OPS_OFFSET + std::max<size_t>(reserve, 64);
+	m_store = static_cast<uint8_t *>(std::malloc(size));
+	if (m_store == nullptr)
+		std::abort();
+	m_ops = m_store + kHeadroom + RGFX_COMMAND_BUFFER_OPS_OFFSET;
+	m_cur = m_ops;
+	m_end = m_store + size;
 }
 
-void RgfxEncoder::appendBytes(const void *src, size_t n)
+RgfxEncoder::~RgfxEncoder()
 {
-	const uint8_t *b = static_cast<const uint8_t *>(src);
-	m_buf.insert(m_buf.end(), b, b + n);
+	std::free(m_store);
 }
 
-void RgfxEncoder::appendOp(uint16_t tag)
+void RgfxEncoder::grow(size_t n)
 {
-	RgfxOpHeader h = {};
-	h.tag = tag;
-	h.flags = 0;
-	h.len = RGFX_OP_BODY_OFFSET; // header only, 8
-	appendBytes(&h, sizeof(h));
-}
-
-void RgfxEncoder::appendOp(uint16_t tag, const void *body, size_t n)
-{
-	RgfxOpHeader h = {};
-	h.tag = tag;
-	h.flags = 0;
-	h.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + n);
-	appendBytes(&h, sizeof(h));
-	appendBytes(body, n);
+	const size_t used = static_cast<size_t>(m_cur - m_store);
+	const size_t size = std::max(used + n, 2 * static_cast<size_t>(m_end - m_store));
+	uint8_t *to = static_cast<uint8_t *>(std::realloc(m_store, size));
+	if (to == nullptr)
+		std::abort(); // as std::vector's growth ends the process where memory runs out
+	m_ops = to + (m_ops - m_store);
+	m_cur = to + used;
+	m_store = to;
+	m_end = to + size;
 }
 
 void RgfxEncoder::appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
                                 uint32_t count, size_t stride)
 {
-	RgfxOpHeader h = {};
-	h.tag = tag;
-	h.flags = 0;
-	h.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + head_n + static_cast<size_t>(count) * stride);
-	appendBytes(&h, sizeof(h));
-	appendBytes(head, head_n);
-	if (count && stride)
-		appendBytes(elems, static_cast<size_t>(count) * stride);
+	const size_t tail = static_cast<size_t>(count) * stride;
+	uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + head_n + tail);
+	putHeader(at, tag, RGFX_OP_BODY_OFFSET + head_n + tail);
+	std::memcpy(at + RGFX_OP_BODY_OFFSET, head, head_n);
+	if (tail != 0)
+		std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, tail);
 }
 
 void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
 {
 	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse);
-	std::vector<uint8_t> ops(count * len);
-	for (size_t i = 0; i < count; i++) {
-		RgfxOpHeader h = {};
-		h.tag = RGFX_OP_SURFACE_USE;
-		h.len = static_cast<uint32_t>(len);
-		std::memcpy(ops.data() + i * len, &h, sizeof(h));
-		std::memcpy(ops.data() + i * len + RGFX_OP_BODY_OFFSET, &uses[i], sizeof(uses[i]));
+	const size_t bytes = count * len;
+	if (bytes == 0)
+		return;
+	// Before the header's room: the ops move up where the room before them is short.
+	const size_t room = static_cast<size_t>(m_ops - m_store) - RGFX_COMMAND_BUFFER_OPS_OFFSET - m_prefix;
+	if (room < bytes) {
+		const size_t shift = bytes - room;
+		(void)reserve(shift);
+		const size_t stream = static_cast<size_t>(m_cur - m_ops) - shift;
+		std::memmove(m_ops + shift, m_ops, stream);
+		std::memmove(m_ops + shift - m_prefix, m_ops - m_prefix, m_prefix);
+		m_ops += shift;
 	}
-	m_buf.insert(m_buf.begin() + RGFX_COMMAND_BUFFER_OPS_OFFSET, ops.begin(), ops.end());
-}
-
-uint64_t RgfxEncoder::opBytes() const
-{
-	return m_buf.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET;
+	uint8_t *at = m_ops - m_prefix - bytes;
+	for (size_t i = 0; i < count; i++) {
+		putHeader(at + i * len, RGFX_OP_SURFACE_USE, len);
+		std::memcpy(at + i * len + RGFX_OP_BODY_OFFSET, &uses[i], sizeof(uses[i]));
+	}
+	m_prefix += bytes;
 }
 
 bool RgfxEncoder::fitsRing() const
 {
-	return m_buf.size() <= UINT32_MAX && m_ring.fits(static_cast<uint32_t>(m_buf.size()));
+	const uint64_t size = messageSize();
+	return size <= UINT32_MAX && m_ring->fits(static_cast<uint32_t>(size));
 }
 
 bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &whileWaiting,
@@ -118,31 +128,34 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 {
 	if (!fitsRing())
 		return false;
+	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_head.op_bytes = opBytes();
-	std::memcpy(m_buf.data(), &m_head, sizeof(m_head));
-	return m_ring.post(RGFX_CMD_COMMAND_BUFFER, m_buf.data(),
-	                   static_cast<uint32_t>(m_buf.size()), out_seqno, whileWaiting, beforePublish);
+	std::memcpy(message, &m_head, sizeof(m_head));
+	return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(messageSize()),
+	                    out_seqno, whileWaiting, beforePublish);
 }
 
 bool RgfxEncoder::finishInRegion(volatile uint8_t *block, uint64_t region_offset,
                                  uint64_t *out_seqno, const std::function<void()> &whileWaiting,
                                  const std::function<void(uint64_t)> &beforePublish)
 {
-	if (m_buf.size() > UINT32_MAX)
+	const uint64_t size = messageSize();
+	if (size > UINT32_MAX)
 		return false;
+	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_head.op_bytes = opBytes();
 	m_head.header.type = RGFX_CMD_COMMAND_BUFFER;
-	m_head.header.size = static_cast<uint32_t>(m_buf.size());
+	m_head.header.size = static_cast<uint32_t>(size);
 	m_head.header.seqno = 0;
-	std::memcpy(m_buf.data(), &m_head, sizeof(m_head));
+	std::memcpy(message, &m_head, sizeof(m_head));
 	// Write-back memory the host reads once the reference's `producer` is published (a
 	// release store), so the copy is ordered before it.
-	std::memcpy(const_cast<uint8_t *>(block), m_buf.data(), m_buf.size());
+	std::memcpy(const_cast<uint8_t *>(block), message, size);
 	RgfxCommandBufferInRegion ref = {};
 	ref.region_offset = region_offset;
-	ref.byte_length = m_buf.size();
-	return m_ring.post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
-	                   whileWaiting, beforePublish);
+	ref.byte_length = size;
+	return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
+	                    whileWaiting, beforePublish);
 }
 
 // --- framing ----------------------------------------------------------------
@@ -160,15 +173,14 @@ void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
 	}
 	desc.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
 	const size_t colorBytes = static_cast<size_t>(color_count) * sizeof(RgfxRenderPassColorAttachment);
-	RgfxOpHeader h = {};
-	h.tag = RGFX_OP_ENCODER_BEGIN_RENDER;
-	h.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes +
-	                              sizeof(*positions));
-	appendBytes(&h, sizeof(h));
-	appendBytes(&desc, sizeof(desc));
+	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + sizeof(*positions);
+	uint8_t *at = reserve(len);
+	putHeader(at, RGFX_OP_ENCODER_BEGIN_RENDER, len);
+	at += RGFX_OP_BODY_OFFSET;
+	std::memcpy(at, &desc, sizeof(desc));
 	if (colorBytes)
-		appendBytes(colors, colorBytes);
-	appendBytes(positions, sizeof(*positions));
+		std::memcpy(at + sizeof(desc), colors, colorBytes);
+	std::memcpy(at + sizeof(desc) + colorBytes, positions, sizeof(*positions));
 }
 
 void RgfxEncoder::beginComputePass()
@@ -202,16 +214,15 @@ void RgfxEncoder::videoDecodeH264(const RgfxVideoOpDecodeH264 &body, const uint8
 	RgfxVideoOpDecodeH264 b = body;
 	b.parameter_sets_size = size;
 	b.reserved_2c = 0;
-	static const uint8_t zeros[8] = {};
 	const size_t padded = (static_cast<size_t>(size) + 7) & ~static_cast<size_t>(7);
-	RgfxOpHeader h = {};
-	h.tag = RGFX_OP_VIDEO_DECODE_H264;
-	h.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + sizeof(b) + padded);
-	appendBytes(&h, sizeof(h));
-	appendBytes(&b, sizeof(b));
+	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(b) + padded;
+	uint8_t *at = reserve(len);
+	putHeader(at, RGFX_OP_VIDEO_DECODE_H264, len);
+	at += RGFX_OP_BODY_OFFSET;
+	std::memcpy(at, &b, sizeof(b));
 	if (size != 0)
-		appendBytes(parameterSets, size);
-	appendBytes(zeros, padded - size);
+		std::memcpy(at + sizeof(b), parameterSets, size);
+	std::memset(at + sizeof(b) + size, 0, padded - size);
 }
 
 void RgfxEncoder::endEncoder()
@@ -1561,18 +1572,14 @@ void RgfxEncoder::blitFillTexture(RgfxObjId texture, uint64_t level, uint64_t sl
 	h.length = length;
 
 	size_t body_n = roundUp8(sizeof(h) + static_cast<size_t>(length));
-	RgfxOpHeader oh = {};
-	oh.tag = RGFX_OP_BLIT_FILL_TEXTURE;
-	oh.flags = 0;
-	oh.len = static_cast<uint32_t>(RGFX_OP_BODY_OFFSET + body_n);
-	appendBytes(&oh, sizeof(oh));
-	appendBytes(&h, sizeof(h));
+	uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + body_n);
+	putHeader(at, RGFX_OP_BLIT_FILL_TEXTURE, RGFX_OP_BODY_OFFSET + body_n);
+	at += RGFX_OP_BODY_OFFSET;
+	std::memcpy(at, &h, sizeof(h));
 	if (length)
-		appendBytes(bytes, static_cast<size_t>(length));
+		std::memcpy(at + sizeof(h), bytes, static_cast<size_t>(length));
 	// Zero-pad the fill bytes to the op's 8-aligned length.
-	size_t pad = body_n - (sizeof(h) + static_cast<size_t>(length));
-	for (size_t i = 0; i < pad; i++)
-		m_buf.push_back(0);
+	std::memset(at + sizeof(h) + length, 0, body_n - (sizeof(h) + static_cast<size_t>(length)));
 }
 
 void RgfxEncoder::blitFillTextureColor(RgfxObjId texture, uint64_t level, uint64_t slice,

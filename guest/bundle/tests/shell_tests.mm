@@ -4334,6 +4334,48 @@ void test_message_reserve()
 	}
 }
 
+// A command buffer keeps each object its encoders name once, however often they name it and in
+// whichever of its encoders, a parallel pass's sub-encoders among them: binds alternating between
+// objects keep each one once, from the first (its retain count rises by one), until it completes.
+void test_command_buffer_keeps_once()
+{
+	QueueFixture f;
+	TestHandle *a = handle(0x51), *b = handle(0x52);
+	const long a0 = CFGetRetainCount((__bridge CFTypeRef)a);
+	const long b0 = CFGetRetainCount((__bridge CFTypeRef)b);
+	uint64_t seqno = 0;
+	id<MTLCommandBuffer> cb = nil;
+	@autoreleasepool {
+		cb = [f.queue commandBuffer];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = handle(42);
+		id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+		for (int i = 0; i < 100; i++) { // within half the ring, with no region to go to
+			[e setVertexBuffer:(i & 1) ? a : b offset:0 atIndex:0];
+			[e setFragmentBuffer:(i & 1) ? b : a offset:0 atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		}
+		[e endEncoding];
+		id<MTLParallelRenderCommandEncoder> pass = [cb parallelRenderCommandEncoderWithDescriptor:rp];
+		id<MTLRenderCommandEncoder> s1 = [pass renderCommandEncoder];
+		id<MTLRenderCommandEncoder> s2 = [pass renderCommandEncoder];
+		[s1 setVertexBuffer:a offset:0 atIndex:0];
+		[s2 setVertexBuffer:a offset:0 atIndex:0];
+		[s1 endEncoding];
+		[s2 endEncoding];
+		[pass endEncoding];
+		[cb commit];
+		seqno = f.nextSeqno();
+	}
+	CHECK(CFGetRetainCount((__bridge CFTypeRef)a) == a0 + 1);
+	CHECK(CFGetRetainCount((__bridge CFTypeRef)b) == b0 + 1);
+	RgfxCbComplete done = cbComplete(seqno, ((RgfxResource *)cb).rgfxObjId);
+	CHECK(f.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted];
+	CHECK(CFGetRetainCount((__bridge CFTypeRef)a) == a0);
+	CHECK(CFGetRetainCount((__bridge CFTypeRef)b) == b0);
+}
+
 // armAndCheck sets the ring's `armed` and says whether records wait; a ringless reader
 // has nothing to arm.
 void test_reply_reader_arm()
@@ -9050,6 +9092,7 @@ int main(int argc, char **argv)
 		test_reply_reader_event();
 		test_command_buffer_event_ops();
 		test_message_reserve();
+		test_command_buffer_keeps_once();
 		test_resource_ids();
 		test_reply_reader_arm();
 		test_completion_thread_runs_handlers();

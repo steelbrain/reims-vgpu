@@ -164,18 +164,20 @@ RgfxUploadArena::~RgfxUploadArena()
 	giveBack();
 }
 
-bool RgfxUploadArena::put(const void *bytes, uint64_t length, id<MTLBuffer> __strong *buffer,
-                          uint64_t *offset)
+bool RgfxUploadArena::put(const void *bytes, uint64_t length,
+                          __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
 {
 	if (m_pool == nullptr) {
 		m_failed.store(true, std::memory_order_release);
 		return false;
 	}
-	std::lock_guard<std::mutex> hold(m_lock);
+	os_unfair_lock_lock(&m_lock);
 	uint64_t at = alignUp(m_cursor, kUploadAlign);
 	if (m_chunks.empty() || at + length > m_chunks.back().size) {
 		RgfxUploadChunk chunk = {};
+		// Rare: a chunk a 64 KiB of bytes, from the pool, which may make one.
 		if (!m_pool->take(length == 0 ? 1 : length, &chunk)) {
+			os_unfair_lock_unlock(&m_lock);
 			m_failed.store(true, std::memory_order_release);
 			return false;
 		}
@@ -189,15 +191,18 @@ bool RgfxUploadArena::put(const void *bytes, uint64_t length, id<MTLBuffer> __st
 	m_cursor = at + length;
 	*buffer = c.buffer;
 	*offset = at;
+	os_unfair_lock_unlock(&m_lock);
 	return true;
 }
 
 void RgfxUploadArena::giveBack()
 {
-	std::lock_guard<std::mutex> hold(m_lock);
-	if (m_pool != nullptr && !m_chunks.empty()) {
-		m_pool->giveBack(m_chunks);
-	}
-	m_chunks.clear();
+	std::vector<RgfxUploadChunk> chunks;
+	os_unfair_lock_lock(&m_lock);
+	chunks.swap(m_chunks);
 	m_cursor = 0;
+	os_unfair_lock_unlock(&m_lock);
+	if (m_pool != nullptr && !chunks.empty()) {
+		m_pool->giveBack(chunks);
+	}
 }

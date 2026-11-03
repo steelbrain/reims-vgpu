@@ -1022,6 +1022,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	                                            serializer:_serializer];
 	if (view != nil) {
 		view->_parent = self;
+		// A view of a texture over an IOSurface writes and reads the surface's texels.
+		view->_rgfxSurfaceRoot = _rgfxSurfaceRoot;
 		view->_parentLevel = static_cast<NSUInteger>(base);
 		view->_parentSlice = subrange ? slices.location : 0;
 		// The view's storage is its texture's, and so are its layout's choices.

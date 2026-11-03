@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <os/lock.h>
 #include <vector>
 
 class RgfxRegion;
@@ -114,8 +115,9 @@ public:
 	RgfxUploadArena &operator=(const RgfxUploadArena &) = delete;
 
 	/// Copies `length` bytes at `bytes` into a chunk at a 256-byte boundary, and answers the
-	/// chunk's buffer and the offset there. False (nothing copied) where no chunk was had.
-	bool put(const void *bytes, uint64_t length, id<MTLBuffer> __strong *buffer,
+	/// chunk's buffer (unretained: the arena holds it until giveBack) and the offset there.
+	/// False (nothing copied) where no chunk was had.
+	bool put(const void *bytes, uint64_t length, __unsafe_unretained id<MTLBuffer> *buffer,
 	         uint64_t *offset);
 
 	/// Gives every chunk taken back to the pool: the host is done reading them.
@@ -132,7 +134,7 @@ public:
 
 private:
 	std::shared_ptr<RgfxUploadPool> m_pool;
-	std::mutex m_lock;
+	os_unfair_lock m_lock = OS_UNFAIR_LOCK_INIT; // a put is a few stores: no sleeping lock
 	std::vector<RgfxUploadChunk> m_chunks; // taken; the last is the one being filled
 	uint64_t m_cursor = 0;                 // the next free byte of the last chunk
 	std::atomic<bool> m_failed{false};     // a put() found no chunk

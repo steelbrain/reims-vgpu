@@ -118,7 +118,7 @@ std::atomic<uint64_t> g_bytesDropped{0};
 /// the log, where no chunk could be had (the region has no room): the binding is not made, and
 /// the command buffer fails with MTLCommandBufferErrorOutOfMemory when it completes.
 bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length,
-                  id<MTLBuffer> __strong *buffer, uint64_t *offset)
+                  __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
 {
 	if (uploads != nullptr && uploads->put(bytes, length, buffer, offset)) {
 		return true;
@@ -143,7 +143,7 @@ uint64_t rgfxId(__unsafe_unretained id obj)
 /// Records on `enc` that its command buffer uses the copy of app memory `obj` reaches, if any
 /// (rgfxShadowOf: a no-copy buffer's, or a texture's over one), which its commit syncs in and,
 /// where it `writes`, its completion writes back.
-void rgfxNoteShadowUse(RgfxEncoder *enc, id obj, bool writes)
+void rgfxNoteShadowUse(RgfxEncoder *enc, __unsafe_unretained id obj, bool writes)
 {
 	if (enc == nullptr || obj == nil || !RgfxMemoryShadow::anyLive())
 		return;
@@ -158,53 +158,100 @@ void rgfxKeep(void *context, const void *object)
 	static_cast<std::vector<id> *>(context)->push_back((__bridge id)object);
 }
 
+/// How an encoder names a resource (rgfxNote): only by its id (a pipeline, a state, a fence);
+/// as one the command buffer reads, writes, or binds to a function, which may write it.
+enum RgfxNaming { kRgfxNamed, kRgfxReads, kRgfxWrites, kRgfxBinds };
+
+/// Records on `enc` the use of the copy of app memory our `obj` reaches (rgfxNoteShadowUse), as
+/// the naming `how` uses it: a bound texture writes it where its usage has ShaderWrite.
+void rgfxNoteShadowAs(RgfxEncoder *enc, __unsafe_unretained id obj, RgfxNaming how)
+{
+	if (how != kRgfxBinds) {
+		rgfxNoteShadowUse(enc, obj, how == kRgfxWrites);
+		return;
+	}
+	if (std::shared_ptr<RgfxMemoryShadow> shadow = rgfxShadowOf(obj)) {
+		const bool writes = ![obj isKindOfClass:[RgfxTexture class]] ||
+		                    ([(RgfxTexture *)obj usage] & MTLTextureUsageShaderWrite) != 0;
+		enc->noteShadowUse(shadow, writes);
+	}
+}
+
+/// rgfxId of `obj`, named by an encoder of `enc`'s command buffer as `how` says, which the buffer
+/// keeps where it keeps what it encodes (RgfxEncoder::setKeeper): one of ours once a command
+/// buffer, by the stamp it records (RgfxResource's _rgfxKeptBy), any other each time it is not
+/// the last named. A resource read, written or bound also has its copies noted: of app memory
+/// (rgfxNoteShadowAs) and of an IOSurface (rgfxIOSurfaceNoteUse); `*overSurface` (when not null)
+/// says whether it is a texture over an IOSurface or a view of one. One class lookup in all.
+template <RgfxNaming how>
+__attribute__((always_inline)) inline uint64_t rgfxNote(RgfxEncoder *enc, __unsafe_unretained id obj,
+                                                        bool *overSurface = nullptr)
+{
+	uint64_t id = 0;
+	if (enc != nullptr && enc->namedBefore((__bridge const void *)obj, &id))
+		return id; // kept, and over no copy (RgfxEncoder::namedNote)
+	if (!RgfxIsResource(obj)) {
+		if (enc != nullptr && obj != nil)
+			enc->keep((__bridge const void *)obj);
+		return 0;
+	}
+	__unsafe_unretained RgfxResource *r = (RgfxResource *)obj;
+	const bool surface = r->_rgfxSurfaceRoot != nil;
+	const bool shadows = RgfxMemoryShadow::anyLive();
+	if (how != kRgfxNamed) {
+		if (overSurface != nullptr)
+			*overSurface = surface;
+		if (enc != nullptr && shadows)
+			rgfxNoteShadowAs(enc, obj, how);
+		if (surface)
+			rgfxIOSurfaceNoteUse(enc, obj);
+	}
+	id = r->_objId;
+	if (enc != nullptr) {
+		const uint64_t stamp = enc->keepStamp();
+		if (__atomic_load_n(&r->_rgfxKeptBy, __ATOMIC_RELAXED) != stamp) {
+			__atomic_store_n(&r->_rgfxKeptBy, stamp, __ATOMIC_RELAXED);
+			enc->keep((__bridge const void *)obj);
+		}
+		// With no copy of app memory alive, this one has none, and never will: a resource's
+		// copy is made with it.
+		if (!surface && !shadows)
+			enc->namedNote((__bridge const void *)obj, id);
+	}
+	return id;
+}
+
 /// rgfxId of an object an encoder of the command buffer names, which the buffer keeps where it
-/// keeps what it encodes (RgfxEncoder::setKeeper).
+/// keeps what it encodes.
 uint64_t rgfxNamed(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
-	if (enc != nullptr)
-		enc->keep((__bridge const void *)obj);
-	return rgfxId(obj);
+	return rgfxNote<kRgfxNamed>(enc, obj);
 }
 
 /// rgfxId of a resource the command buffer only reads (a blit's source, an index or indirect
 /// buffer).
 uint64_t rgfxReads(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
-	rgfxNoteShadowUse(enc, obj, false);
-	rgfxIOSurfaceNoteUse(enc, obj);
-	return rgfxNamed(enc, obj);
+	return rgfxNote<kRgfxReads>(enc, obj);
 }
 
 /// rgfxId of a resource the command buffer writes (a blit's destination, a fill, a synchronize,
 /// a render attachment).
 uint64_t rgfxWrites(RgfxEncoder *enc, __unsafe_unretained id obj)
 {
-	rgfxNoteShadowUse(enc, obj, true);
-	rgfxIOSurfaceNoteUse(enc, obj);
-	return rgfxNamed(enc, obj);
+	return rgfxNote<kRgfxWrites>(enc, obj);
 }
 
 /// rgfxId of a resource bound to a shader, which may write a buffer, and a texture whose usage
-/// has ShaderWrite. Its copy of app memory, if any, is looked up first: most bound resources have
-/// none, and one that has is ours, a buffer or a texture over one (rgfxShadowOf), so whether it
-/// may be written is our texture class's answer, with no protocol lookup on the bind's path.
-uint64_t rgfxBinds(RgfxEncoder *enc, __unsafe_unretained id obj)
+/// has ShaderWrite; `*overSurface` as rgfxNote's.
+uint64_t rgfxBinds(RgfxEncoder *enc, __unsafe_unretained id obj, bool *overSurface = nullptr)
 {
-	if (enc != nullptr && obj != nil && RgfxMemoryShadow::anyLive()) {
-		if (std::shared_ptr<RgfxMemoryShadow> shadow = rgfxShadowOf(obj)) {
-			const bool writes = ![obj isKindOfClass:[RgfxTexture class]] ||
-			                    ([(RgfxTexture *)obj usage] & MTLTextureUsageShaderWrite) != 0;
-			enc->noteShadowUse(shadow, writes);
-		}
-	}
-	rgfxIOSurfaceNoteUse(enc, obj);
-	return rgfxNamed(enc, obj);
+	return rgfxNote<kRgfxBinds>(enc, obj, overSurface);
 }
 
 /// rgfxId of a resource used with `usage` (useResource:usage:), which writes it where the usage
 /// has Write: a texture over an IOSurface, or a view of one, among them.
-uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
+uint64_t rgfxUses(RgfxEncoder *enc, __unsafe_unretained id obj, MTLResourceUsage usage)
 {
 	const bool writes = (usage & MTLResourceUsageWrite) != 0;
 	if (writes)
@@ -216,7 +263,8 @@ uint64_t rgfxUses(RgfxEncoder *enc, id obj, MTLResourceUsage usage)
 
 /// `resource`, used with `usage`, resident in `bindings` where the usage has no Write: a
 /// function may still write it through an argument buffer (RgfxSurfaceBindings::resident).
-void rgfxNoteResident(RgfxSurfaceBindings &bindings, id resource, MTLResourceUsage usage)
+void rgfxNoteResident(RgfxSurfaceBindings &bindings, __unsafe_unretained id resource,
+                      MTLResourceUsage usage)
 {
 	if ((usage & MTLResourceUsageWrite) == 0)
 		bindings.resident(resource);
@@ -951,6 +999,9 @@ struct RgfxBarrierSlot {
 // The encoders' inline bytes go to their command buffer's upload arena, handed over as the
 // command buffer vends them.
 @interface RgfxRenderCommandEncoder ()
+// At a draw: each stage's bound textures over IOSurfaces its function writes, as written. Direct:
+// a draw calls it with no message.
+- (void)rgfxNoteDrawWrites __attribute__((objc_direct));
 // The command buffer that made it (commandBuffer).
 - (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
@@ -1979,9 +2030,15 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // RgfxRenderCommandEncoder
 // =============================================================================
 
+// The encoders' methods take the objects they are given unretained, as Metal's do: the caller
+// holds each for the call, which only names it (the command buffer keeps what it names), so no
+// retain and release of each argument is spent on every call.
+#pragma clang attribute push(__attribute__((objc_externally_retained)), apply_to = objc_method)
+
 @implementation RgfxRenderCommandEncoder {
 	RgfxEncoder *_enc; // borrowed: the command buffer's encoder
 	BOOL _emitEnd;
+	id _pipeline; // the last pipeline set, whose functions' arguments are below
 	__weak id<MTLDevice> _device;
 	// Its command buffer, held from the encoder's making until its endEncoding, as Metal's encoders
 	// hold theirs (measured on the M3 Max, an AMD 5300M and an Intel 630): `_enc` is the buffer's.
@@ -2001,7 +2058,6 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
 }
 
-// At a draw: each stage's bound textures over IOSurfaces its function writes, as written.
 - (void)rgfxNoteDrawWrites
 {
 	_vertexSurfaces.noteWrites(_enc, _vertexAir.get());
@@ -2103,12 +2159,17 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipelineState
 {
-	if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]]) {
-		_vertexAir = [(RgfxRenderPipelineState *)pipelineState rgfxVertexAirFunction];
-		_fragmentAir = [(RgfxRenderPipelineState *)pipelineState rgfxFragmentAirFunction];
-	} else {
-		_vertexAir = nullptr;
-		_fragmentAir = nullptr;
+	if (pipelineState != _pipeline) {
+		_pipeline = pipelineState;
+		if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]]) {
+			_vertexAir = [(RgfxRenderPipelineState *)pipelineState rgfxVertexAirFunction];
+			_fragmentAir = [(RgfxRenderPipelineState *)pipelineState rgfxFragmentAirFunction];
+		} else {
+			_vertexAir = nullptr;
+			_fragmentAir = nullptr;
+		}
+		_vertexSurfaces.pipelineChanged();
+		_fragmentSurfaces.pipelineChanged();
 	}
 	_enc->renderSetRenderPipelineState(rgfxNamed(_enc, pipelineState));
 }
@@ -2283,17 +2344,19 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)setVertexTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	_vertexSurfaces.bind(index, texture);
+	bool overSurface = false;
 	RgfxTextureBinding e = {};
-	e.texture_obj_id = rgfxBinds(_enc, texture);
+	e.texture_obj_id = rgfxBinds(_enc, texture, &overSurface);
+	_vertexSurfaces.bind(index, texture, overSurface);
 	_enc->renderSetVertexTextures(index, &e, 1);
 }
 - (void)setVertexTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		_vertexSurfaces.bind(range.location + i, textures[i]);
-		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
+		bool overSurface = false;
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i], &overSurface);
+		_vertexSurfaces.bind(range.location + i, textures[i], overSurface);
 	}
 	_enc->renderSetVertexTextures(range.location, t.empty() ? nullptr : t.data(),
 	                              static_cast<uint32_t>(range.length));
@@ -2364,15 +2427,18 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)setFragmentTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	_fragmentSurfaces.bind(index, texture);
-	_enc->renderSetFragmentTexture(rgfxBinds(_enc, texture), index);
+	bool overSurface = false;
+	const uint64_t obj = rgfxBinds(_enc, texture, &overSurface);
+	_fragmentSurfaces.bind(index, texture, overSurface);
+	_enc->renderSetFragmentTexture(obj, index);
 }
 - (void)setFragmentTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		_fragmentSurfaces.bind(range.location + i, textures[i]);
-		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
+		bool overSurface = false;
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i], &overSurface);
+		_fragmentSurfaces.bind(range.location + i, textures[i], overSurface);
 	}
 	_enc->renderSetFragmentTextures(range.location, t.empty() ? nullptr : t.data(),
 	                                static_cast<uint32_t>(range.length));
@@ -2784,31 +2850,31 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> buffer = nil;
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
 	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
-		[self setVertexBuffer:buffer offset:offset atIndex:index];
+		_enc->renderSetVertexBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setVertexBytes:(const void *)bytes
                 length:(NSUInteger)length
        attributeStride:(NSUInteger)stride
                atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> buffer = nil;
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
 	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
 		[self setVertexBuffer:buffer offset:offset attributeStride:stride atIndex:index];
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> buffer = nil;
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
 	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
-		[self setFragmentBuffer:buffer offset:offset atIndex:index];
+		_enc->renderSetFragmentBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setTileBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> buffer = nil;
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
 	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
 		[self setTileBuffer:buffer offset:offset atIndex:index];
@@ -3203,6 +3269,7 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxBarrierSlot _barrier;                   // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;
 	RgfxSurfaceBindings _surfaces;              // the textures over IOSurfaces bound
+	id _pipeline;                                // the last pipeline set, whose arguments are _air
 	std::shared_ptr<const RgfxAirFunction> _air; // the pipeline's function's arguments
 }
 
@@ -3296,9 +3363,13 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state
 {
-	_air = [(id)state isKindOfClass:[RgfxComputePipelineState class]]
-	           ? [(RgfxComputePipelineState *)state rgfxAirFunction]
-	           : nullptr;
+	if (state != _pipeline) {
+		_pipeline = state;
+		_air = [(id)state isKindOfClass:[RgfxComputePipelineState class]]
+		           ? [(RgfxComputePipelineState *)state rgfxAirFunction]
+		           : nullptr;
+		_surfaces.pipelineChanged();
+	}
 	_enc->computeSetComputePipelineState(rgfxNamed(_enc, state));
 }
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
@@ -3357,15 +3428,18 @@ RGFX_LOG_UNRECOGNIZED
 }
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	_surfaces.bind(index, texture);
-	_enc->computeSetTexture(rgfxBinds(_enc, texture), index);
+	bool overSurface = false;
+	const uint64_t obj = rgfxBinds(_enc, texture, &overSurface);
+	_surfaces.bind(index, texture, overSurface);
+	_enc->computeSetTexture(obj, index);
 }
 - (void)setTextures:(const id<MTLTexture> __nullable [__nonnull])textures withRange:(NSRange)range
 {
 	std::vector<RgfxComputeTextureBinding> t(range.length);
 	for (NSUInteger i = 0; i < range.length; i++) {
-		_surfaces.bind(range.location + i, textures[i]);
-		t[i].texture_obj_id = rgfxBinds(_enc, textures[i]);
+		bool overSurface = false;
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i], &overSurface);
+		_surfaces.bind(range.location + i, textures[i], overSurface);
 	}
 	_enc->computeSetTextures(range.location, t.empty() ? nullptr : t.data(),
 	                         static_cast<uint32_t>(range.length));
@@ -3530,7 +3604,7 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> buffer = nil;
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
 	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
 		[self setBuffer:buffer offset:offset atIndex:index];
@@ -3540,7 +3614,7 @@ RGFX_LOG_UNRECOGNIZED
     attributeStride:(NSUInteger)stride
             atIndex:(NSUInteger)index
 {
-	id<MTLBuffer> buffer = nil;
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
 	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
 		[self setBuffer:buffer offset:offset attributeStride:stride atIndex:index];
@@ -4127,3 +4201,5 @@ RGFX_LOG_UNRECOGNIZED
 }
 
 @end
+
+#pragma clang attribute pop

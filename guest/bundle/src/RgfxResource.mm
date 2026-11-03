@@ -73,12 +73,15 @@ RGFX_LOG_UNRECOGNIZED
 	return _objId;
 }
 
-// In the class's implementation, so it reads the ivar.
-uint64_t RgfxResourceId(__unsafe_unretained id obj)
+std::atomic<uintptr_t> gRgfxResourceClasses[32];
+
+bool RgfxIsResourceClassSlow(__unsafe_unretained id obj, uintptr_t cls)
 {
-	if (obj == nil || ![obj isKindOfClass:[RgfxResource class]])
-		return 0;
-	return ((RgfxResource *)obj)->_objId;
+	if (![obj isKindOfClass:[RgfxResource class]])
+		return false;
+	// The slot's last class: two of ours that share a slot take turns, and stay right.
+	gRgfxResourceClasses[(cls >> 4) & 31].store(cls, std::memory_order_relaxed);
+	return true;
 }
 
 - (id<MTLDevice>)device

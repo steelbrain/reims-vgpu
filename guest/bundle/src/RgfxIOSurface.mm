@@ -421,6 +421,10 @@ struct RgfxSurfaceShadow {
 	bool inPlace = false;       // the GPU uses the surface's pages; the block holds no copy
 	bool cached = false;        // in place, and its GPU copy is the host's device cache
 	std::atomic<bool> keepVolatile{false}; // a texture over it set it volatile or empty: unkept
+	// The keep stamp (RgfxEncoder::keepStamp) of the command buffer that last named the view as
+	// used (a cached one, rgfxIOSurfaceNoteUse): each command buffer names it once. Relaxed: a
+	// lost write only names it once more.
+	std::atomic<uint64_t> usedBy{0};
 	uint64_t serial = 0;        // the shared block's
 	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the planes' rows of a copy
 	uint32_t seed = 0;          // this process's own block: the seed when it last matched
@@ -1107,6 +1111,7 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 	keepView(shadow);
 	t->_shadow = std::move(shadow);
 	t->_plane = plane;
+	t->_rgfxSurfaceRoot = t;
 	[t rgfxTakeDescriptor:descriptor];
 	return t;
 }
@@ -1130,6 +1135,13 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 - (std::shared_ptr<RgfxSurfaceShadow>)rgfxShadow
 {
 	return _shadow;
+}
+
+// The view of `t`, read with no message and no copy, for the encoders' notes below.
+static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
+    __unsafe_unretained RgfxIOSurfaceTexture *t)
+{
+	return t->_shadow;
 }
 
 - (IOSurfaceRef)iosurface
@@ -1289,35 +1301,37 @@ RgfxAskCachedScope::~RgfxAskCachedScope()
 	tAskCached--;
 }
 
-// The texture over an IOSurface that `texture` is, or views through any views; nil for any other.
-static RgfxIOSurfaceTexture *rgfxSurfaceRoot(id texture)
+// The view of the texture over an IOSurface that `resource` is, or views through any views (the
+// root each texture records as it is made); null for any other.
+static const std::shared_ptr<RgfxSurfaceShadow> *rgfxSurfaceView(__unsafe_unretained id resource)
 {
-	// A view writes the texels of the texture it views, through every view between.
-	id root = texture;
-	while ([root isKindOfClass:[RgfxTexture class]] && [(RgfxTexture *)root parentTexture] != nil) {
-		root = [(RgfxTexture *)root parentTexture];
-	}
-	return [root isKindOfClass:[RgfxIOSurfaceTexture class]] ? (RgfxIOSurfaceTexture *)root : nil;
+	if (!RgfxIsResource(resource))
+		return nullptr;
+	__unsafe_unretained RgfxResource *r = (RgfxResource *)resource;
+	__unsafe_unretained RgfxIOSurfaceTexture *root = r->_rgfxSurfaceRoot;
+	return root != nil ? &rgfxShadowOfRoot(root) : nullptr;
 }
 
-void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, id texture)
+void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, __unsafe_unretained id texture)
 {
-	RgfxIOSurfaceTexture *root = rgfxSurfaceRoot(texture);
-	if (enc != nullptr && root != nil) {
-		enc->noteSurfaceWrite([root rgfxShadow]);
-	}
+	if (enc == nullptr)
+		return;
+	if (const std::shared_ptr<RgfxSurfaceShadow> *view = rgfxSurfaceView(texture))
+		enc->noteSurfaceWrite(*view);
 }
 
-void rgfxIOSurfaceNoteUse(RgfxEncoder *enc, id resource)
+void rgfxIOSurfaceNoteUse(RgfxEncoder *enc, __unsafe_unretained id resource)
 {
-	if (enc == nullptr || resource == nil || gCachedLive.load(std::memory_order_relaxed) == 0)
+	if (enc == nullptr || gCachedLive.load(std::memory_order_relaxed) == 0)
 		return;
-	RgfxIOSurfaceTexture *root = rgfxSurfaceRoot(resource);
-	if (root == nil)
+	const std::shared_ptr<RgfxSurfaceShadow> *view = rgfxSurfaceView(resource);
+	if (view == nullptr)
 		return;
-	std::shared_ptr<RgfxSurfaceShadow> shadow = [root rgfxShadow];
-	if (shadow->cached)
-		enc->noteSurfaceUse(std::move(shadow));
+	const uint64_t stamp = enc->keepStamp();
+	if ((*view)->cached && (*view)->usedBy.load(std::memory_order_relaxed) != stamp) {
+		(*view)->usedBy.store(stamp, std::memory_order_relaxed);
+		enc->noteSurfaceUse(*view);
+	}
 }
 
 void rgfxIOSurfaceNameUses(RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes)
@@ -1353,11 +1367,11 @@ void rgfxIOSurfaceNameUses(RgfxEncoder *enc, const std::vector<std::shared_ptr<v
 		enc->prependSurfaceUses(ops.data(), ops.size());
 }
 
-void RgfxSurfaceBindings::bind(NSUInteger index, id texture)
+void RgfxSurfaceBindings::rebind(NSUInteger index, __unsafe_unretained id texture, bool overSurface)
 {
 	auto it = std::find_if(m_bound.begin(), m_bound.end(),
 	                       [index](const Bound &b) { return b.index == index; });
-	if (texture == nil || rgfxSurfaceRoot(texture) == nil) {
+	if (!overSurface) {
 		if (it != m_bound.end()) {
 			m_bound.erase(it);
 		}
@@ -1365,29 +1379,36 @@ void RgfxSurfaceBindings::bind(NSUInteger index, id texture)
 	}
 	if (it == m_bound.end()) {
 		m_bound.push_back({index, texture, false});
+		m_changed = true;
 	} else if (it->texture != texture) {
 		it->texture = texture;
 		it->noted = false;
+		m_changed = true;
 	}
 }
 
-void RgfxSurfaceBindings::resident(id resource)
+void RgfxSurfaceBindings::resident(__unsafe_unretained id resource)
 {
 	if (resource == nil)
 		return;
-	const bool texture = [resource conformsToProtocol:@protocol(MTLTexture)];
-	if (rgfxSurfaceRoot(resource) == nil &&
+	if (rgfxSurfaceView(resource) == nullptr &&
 	    !(RgfxMemoryShadow::anyLive() && rgfxShadowOf(resource) != nullptr))
 		return;
 	for (const Resident &r : m_resident) {
 		if (r.resource == resource)
 			return;
 	}
+	const bool texture = [resource conformsToProtocol:@protocol(MTLTexture)];
 	m_resident.push_back({resource, texture, false});
+	m_changed = true;
 }
 
-void RgfxSurfaceBindings::noteWrites(RgfxEncoder *enc, const RgfxAirFunction *fn)
+void RgfxSurfaceBindings::noteChangedWrites(RgfxEncoder *enc, const RgfxAirFunction *fn)
 {
+	m_changed = false;
+	m_lastFn = fn;
+	if (m_bound.empty() && m_resident.empty())
+		return;
 	const bool anywhere = fn != nullptr && rgfxAirWritesTextureAnywhere(*fn);
 	for (Bound &b : m_bound) {
 		if (b.noted) {

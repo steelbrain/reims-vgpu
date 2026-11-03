@@ -40,6 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -53,6 +54,13 @@
 /// encoder ops — and posts it on a queue's submission ring. One encoder is open
 /// at a time, between a `begin*` and `endEncoder`; the op methods are called while
 /// the matching encoder is open, as the host's walk expects (`decode::cmdbuf`).
+///
+/// The message is written in a buffer of the builder's own, which grows by doubling. Each op
+/// takes its whole length at once (a pointer bump) and is stored with fixed-size copies. Room
+/// before the header takes the SURFACE_USE ops a commit puts first (prependSurfaceUses), so they
+/// move nothing.
+///
+/// Thread safety: none; one thread writes a builder at a time.
 class RgfxEncoder {
 public:
 	/// A builder that will post to `ring` (a queue's submission ring) a command
@@ -61,6 +69,10 @@ public:
 	/// (RgfxCommandQueue's rgfxMessageReserve), so its ops are not copied as it grows.
 	RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id,
 	            size_t reserve = 0);
+
+	~RgfxEncoder();
+	RgfxEncoder(const RgfxEncoder &) = delete;
+	RgfxEncoder &operator=(const RgfxEncoder &) = delete;
 
 	// --- framing --------------------------------------------------------------
 
@@ -390,20 +402,23 @@ public:
 	/// (RgfxRingWriter::post, `whileWaiting` called as it waits). Returns whether it
 	/// reached the ring: false, posting nothing, for a message the ring does not fit
 	/// (fitsRing()), which goes out of line with finishInRegion. On success
-	/// `*out_seqno` (when not null) holds the stamped seqno. The built message stays
-	/// readable through [`message`] afterwards. `beforePublish` gets the seqno before the
-	/// host can see the buffer (RgfxRingWriter::tryPost), so its completion is expected first.
+	/// `*out_seqno` (when not null) holds the stamped seqno. `beforePublish` gets the seqno
+	/// before the host can see the buffer (RgfxRingWriter::tryPost), so its completion is
+	/// expected first.
 	bool finish(uint64_t *out_seqno = nullptr, const std::function<void()> &whileWaiting = {},
 	            const std::function<void(uint64_t)> &beforePublish = {});
 
 	/// Whether the finished message fits the ring (RgfxRingWriter::fits).
 	bool fitsRing() const;
 
-	/// The finished message's length: messageSize() bytes go to finishInRegion's block.
-	uint64_t messageSize() const { return m_buf.size(); }
+	/// The finished message's length: the header, the op stream and the surface uses before it.
+	uint64_t messageSize() const { return RGFX_COMMAND_BUFFER_OPS_OFFSET + opBytes(); }
 
 	/// The bytes the message holds before it grows.
-	size_t capacity() const { return m_buf.capacity(); }
+	size_t capacity() const
+	{
+		return static_cast<size_t>(m_end - m_ops) + RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix;
+	}
 
 	/// Out of line: writes the whole COMMAND_BUFFER message (its header's `type` and `size`
 	/// stamped, `seqno` 0) to `block`, the CPU address of region offset `region_offset`, of at
@@ -415,19 +430,23 @@ public:
 	                    const std::function<void()> &whileWaiting = {},
 	                    const std::function<void(uint64_t)> &beforePublish = {});
 
-	/// The command-buffer bytes built so far: the `RgfxCommandBuffer` header (its
-	/// `op_bytes` is set by [`finish`]) then the op stream. For tests and
-	/// diagnostics.
-	const std::vector<uint8_t> &message() const { return m_buf; }
 	/// The op-stream bytes appended so far (the message size less the header).
-	uint64_t opBytes() const;
+	uint64_t opBytes() const { return static_cast<uint64_t>(m_cur - m_ops) + m_prefix; }
+
+	/// The op stream built so far, opBytes() long: the surface uses put first, then the ops.
+	/// For tests and diagnostics.
+	const uint8_t *ops() const { return m_ops - m_prefix; }
 
 	// --- IOSurface copies this command buffer writes -------------------------
 
 	/// Records that the command buffer writes the IOSurface copy `shadow` (opaque
 	/// here: the Metal shell's RgfxSurfaceShadow), which its completion writes back
 	/// to the surface's pages. Held until taken.
-	void noteSurfaceWrite(std::shared_ptr<void> shadow) { m_surfaceWrites.push_back(std::move(shadow)); }
+	void noteSurfaceWrite(std::shared_ptr<void> shadow)
+	{
+		if (m_surfaceWrites.empty() || m_surfaceWrites.back() != shadow)
+			m_surfaceWrites.push_back(std::move(shadow));
+	}
 	/// The copies recorded so far, which the caller now holds.
 	std::vector<std::shared_ptr<void>> takeSurfaceWrites() { return std::move(m_surfaceWrites); }
 	/// Records that the command buffer uses the IOSurface view `shadow`, whose block is cached
@@ -464,6 +483,29 @@ public:
 		m_lastKept = object; // kept, so no other object takes its address meanwhile
 		m_keep(m_keepContext, object);
 	}
+	/// The command buffer's own stamp, which no other command buffer's builder has: an object
+	/// that records the stamp of the last builder to keep it (the Metal shell's RgfxResource) is
+	/// kept once a command buffer, at its first naming.
+	uint64_t keepStamp() const { return m_keepStamp; }
+	/// The id of `object` where the builder named it before and it was kept (namedNote): a
+	/// command buffer keeps what it names until it completes, so no other object takes its
+	/// address meanwhile. A few recent objects are held, by address.
+	bool namedBefore(const void *object, uint64_t *id) const
+	{
+		const Named &n = m_named[namedSlot(object)];
+		if (n.object != object)
+			return false;
+		*id = n.id;
+		return true;
+	}
+	/// Notes that `object`, named `id`, is kept (keep), and that a naming of it needs nothing
+	/// noted but its id: none of its copies a commit or a completion syncs (the Metal shell's
+	/// IOSurface and app-memory copies). Nothing where nothing is kept (no keeper).
+	void namedNote(const void *object, uint64_t id)
+	{
+		if (m_keep != nullptr)
+			m_named[namedSlot(object)] = {object, id};
+	}
 	/// Records that the command buffer uses the copy of app memory `shadow` (a no-copy
 	/// buffer's; RgfxMemoryShadow.hpp), which its commit syncs in, and, where `writes`, its
 	/// completion writes back. Held until taken.
@@ -479,26 +521,82 @@ public:
 	std::vector<RgfxShadowUse> takeShadowUses() { return std::move(m_shadowUses); }
 
 private:
+	/// The bytes before the header a commit's surface uses take with no move: 64 of them.
+	static constexpr size_t kHeadroom = 64 * (RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse));
+
+	// Takes `n` bytes at the stream's end (growing it where it has less room) and answers them.
+	__attribute__((always_inline)) uint8_t *reserve(size_t n)
+	{
+		if (__builtin_expect(static_cast<size_t>(m_end - m_cur) < n, 0))
+			grow(n);
+		uint8_t *at = m_cur;
+		m_cur += n;
+		return at;
+	}
+	// Writes an op's header, of `len` bytes in all, at `at`.
+	__attribute__((always_inline)) static void putHeader(uint8_t *at, uint16_t tag, size_t len)
+	{
+		RgfxOpHeader h;
+		h.tag = tag;
+		h.flags = 0;
+		h.len = static_cast<uint32_t>(len);
+		std::memcpy(at, &h, sizeof(h));
+	}
 	// Appends an op with no body (header only, len 8).
-	void appendOp(uint16_t tag);
+	__attribute__((always_inline)) void appendOp(uint16_t tag)
+	{
+		putHeader(reserve(RGFX_OP_BODY_OFFSET), tag, RGFX_OP_BODY_OFFSET);
+	}
 	// Appends an op whose body is `n` bytes at `body` (an 8-multiple); len = 8 + n.
-	void appendOp(uint16_t tag, const void *body, size_t n);
+	__attribute__((always_inline)) void appendOp(uint16_t tag, const void *body, size_t n)
+	{
+		uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + n);
+		putHeader(at, tag, RGFX_OP_BODY_OFFSET + n);
+		std::memcpy(at + RGFX_OP_BODY_OFFSET, body, n);
+	}
+	// Appends an op whose body is `body`, a wire struct.
+	template <typename T> __attribute__((always_inline)) void appendBody(uint16_t tag, const T &body)
+	{
+		static_assert(sizeof(T) % 8 == 0, "an op body is a multiple of 8 bytes");
+		appendOp(tag, &body, sizeof(T));
+	}
 	// Appends an array-tailed op: `head` (`head_n` bytes) then `count` elements of
 	// `stride` bytes at `elems`; len = 8 + head_n + count*stride.
 	void appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
 	                   uint32_t count, size_t stride);
-	// Appends raw bytes to the message buffer.
-	void appendBytes(const void *src, size_t n);
+	// Makes room for `n` more bytes: a buffer of at least twice the size, the bytes so far
+	// copied there.
+	void grow(size_t n);
 
-	RgfxRingWriter &m_ring;
+	struct Named {
+		const void *object;
+		uint64_t id;
+	};
+	static constexpr size_t kNamedSlots = 32; // 2^(64 - 59)
+	static size_t namedSlot(const void *object)
+	{
+		// Fibonacci hashing: objects a malloc zone lays out a power of two apart spread too.
+		return static_cast<size_t>((reinterpret_cast<uint64_t>(object) * 0x9e3779b97f4a7c15ull) >> 59);
+	}
+
+	RgfxRingWriter *m_ring;
 	RgfxCommandBuffer m_head;
-	std::vector<uint8_t> m_buf;
+	// The storage: a buffer of the builder's own (malloc) from m_store, m_end the end; the op
+	// stream from m_ops (kHeadroom and the header before it) to m_cur. The surface uses put
+	// first lie in the m_prefix bytes before m_ops.
+	uint8_t *m_store = nullptr;
+	uint8_t *m_ops = nullptr;
+	uint8_t *m_cur = nullptr;
+	uint8_t *m_end = nullptr;
+	size_t m_prefix = 0;
+	uint64_t m_keepStamp;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;
 	std::vector<std::shared_ptr<void>> m_surfaceUses;
 	std::vector<RgfxShadowUse> m_shadowUses;
 	void (*m_keep)(void *, const void *) = nullptr;
 	void *m_keepContext = nullptr;
 	const void *m_lastKept = nullptr;
+	Named m_named[kNamedSlots] = {};
 };
 
 #endif // RGFX_ENCODER_HPP_
