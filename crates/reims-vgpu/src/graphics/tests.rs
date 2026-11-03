@@ -5990,3 +5990,118 @@ fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
     assert_eq!(worker.views_of_surfaces().counts().private, 1);
     assert!(guest.event_now().is_none(), "nothing else answered");
 }
+
+/// A command buffer of a context whose no-copy buffer is being made on the surface worker is not
+/// answered at its doorbell, though it asks for its `CB_SUBMITTED` and need wait for nothing
+/// else: the doorbell write returns with nothing on its queue's ring, and the queue's thread
+/// waits for the buffer's make. Once the worker has made it, the queue's thread begins the
+/// command buffer and posts its `CB_SUBMITTED`, and it completes
+#[test]
+fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, queue) = (1, obj(1, 1));
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    for _ in 0..2000 {
+        // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
+        let idle = unsafe {
+            AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
+                .load(Ordering::SeqCst)
+        };
+        if idle == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    ring.arm();
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    worker.surface_worker().hold();
+    let mark = platform.call_log().mark();
+
+    guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
+    let mut handed = false;
+    for _ in 0..2000 {
+        if device
+            .control
+            .pages_buffers
+            .any(std::iter::once(pages_context(context)))
+        {
+            handed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(handed, "ring 0 handed the buffer to the worker");
+    ring.publish(asking(queue, 100));
+    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    assert!(!ring.has_event(), "not answered at the doorbell");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!ring.has_event(), "the queue's thread waits for the make");
+    let buffers = |sels: &[&str]| {
+        sels.iter()
+            .filter(|&&s| s == "newBufferWithDescriptor:")
+            .count()
+    };
+    assert_eq!(buffers(&platform.call_log().sels_since(mark)), 0);
+
+    worker.surface_worker().release();
+    let mut submitted = None;
+    for _ in 0..2000 {
+        if ring.has_event() {
+            submitted = ring.event();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let posted = RgfxCbSubmitted::read_from_bytes(&submitted.expect("a CB_SUBMITTED")).unwrap();
+    assert_eq!(
+        (posted.header.r#type, posted.cb_obj_id),
+        (RGFX_EVT_CB_SUBMITTED, 100)
+    );
+    let made = platform.call_log().sels_since(mark);
+    assert_eq!(
+        buffers(&made),
+        2,
+        "the view's import and the buffer over it, before the command buffer: {made:?}"
+    );
+    let mut done = None;
+    for _ in 0..3000 {
+        platform.world().complete_all(CompleteOn::Caller);
+        if ring.has_event() {
+            done = ring.event();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let done = RgfxCbComplete::read_from_bytes(&done.expect("a CB_COMPLETE")).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+}

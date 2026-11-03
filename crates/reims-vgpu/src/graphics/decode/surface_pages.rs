@@ -50,13 +50,14 @@
 //! the surface worker, `reims-vgpu.graphics-surfaces` ([`Worker`]), which makes the views in ring
 //! order and answers each once its block's view, and device cache, are made. Until then the
 //! block is unsettled ([`Unsettled`]): every later message that names it, on ring 0 or a queue's
-//! ring, waits for it first, so it sees the block as it would have right after the
-//! `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
+//! ring, waits for it first, and a command buffer that uses it is not answered at a doorbell, so
+//! it sees the block as it would have right after the `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
 //! there too, in its order with the rest. The guest's kext names a block only after the answer,
 //! so in its order nothing waits. A pages block's view, which its first `BUFFER_OVER_PAGES`
 //! makes, is made on the worker as well (`GraphicsControl::start_buffer_over_pages`): that
 //! message has no answer, so its context's later messages, its block's release and its
-//! context's close wait for it instead. What lets a view go is dropped on the worker too, where
+//! context's close wait for it instead, and none of its context's command buffers is answered at
+//! a doorbell meanwhile. What lets a view go is dropped on the worker too, where
 //! it may be the last hold of an import or a mapping: a surface's buffer
 //! (`BUFFER_OVER_SURFACE_PAGES`) at its `OBJECT_DESTROY`, and a block's views and device cache at
 //! its `BLOCK_RELEASE`. A texture and a pages block's buffer go at once, as the guest may pick

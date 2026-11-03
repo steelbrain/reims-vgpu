@@ -7,8 +7,8 @@
 //! carries the work out, posts the message's answer, then drops the settle, so a message that
 //! waited for the key is answered after it. A message that names the key, on ring 0 or a queue's
 //! ring, waits for it first ([`Unsettled::wait`]), holding no lock the job takes; a thread that
-//! waits for nothing (a doorbell's) asks instead ([`Unsettled::any`]) and leaves the message to
-//! a thread that may. A job takes `GraphicsControl`'s reset gate shared, recursively, as a queue
+//! waits for nothing (a doorbell's) asks instead ([`Unsettled::try_any`]) and leaves the message
+//! to a thread that may. A job takes `GraphicsControl`'s reset gate shared, recursively, as a queue
 //! that holds it may be waiting for the key while the reset waits for the gate, and carries
 //! nothing out where the device was reset since its begin (the caller's count of resets, kept in
 //! the settle).
@@ -170,13 +170,23 @@ impl Unsettled {
         }
     }
 
-    /// Whether any of `keys` is unsettled, for a thread that waits for nothing (a doorbell's).
+    /// Whether any of `keys` is unsettled.
     pub(crate) fn any(&self, mut keys: impl Iterator<Item = u64>) -> bool {
         if self.count.load(Ordering::Acquire) == 0 {
             return false;
         }
         let unsettled = self.keys.lock();
         keys.any(|k| unsettled.contains_key(&k))
+    }
+
+    /// [`Self::any`], for a thread that waits for nothing and allocates nothing (a doorbell's, the
+    /// guest's vCPU): `None` where the keys are held elsewhere, their lock only tried.
+    pub(crate) fn try_any(&self, mut keys: impl Iterator<Item = u64>) -> Option<bool> {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return Some(false);
+        }
+        let unsettled = self.keys.try_lock()?;
+        Some(keys.any(|k| unsettled.contains_key(&k)))
     }
 }
 

@@ -540,11 +540,12 @@ impl<P: Platform> Decoders<P> {
     /// module doc), where it gets that at its take ([`Begun::submitted_at_take`]) with nothing
     /// waited for or allocated on the way: its context's work is not refused, it names a command
     /// queue of its context, it asks for its `CB_SUBMITTED`, its last op, and waits for no event,
-    /// it uses no
-    /// device cache ([`super::surface_cache`]) and waits for no buffer of another queue
-    /// ([`super::surface_order`]), no buffer before it holds its queue, its queue holds fewer than
-    /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed and no answered buffer not yet
-    /// begun, and each lock it takes is free, each tried. Its turn in its queue's lane and its
+    /// it uses no device cache ([`super::surface_cache`]) and no block whose `SURFACE_PAGES` the
+    /// surface worker is still carrying out ([`super::worker::Unsettled`]), which its begin waits
+    /// for, and waits for no buffer of another queue ([`super::surface_order`]), no buffer before
+    /// it holds its queue, its queue holds fewer than [`TAKE_IN_FLIGHT_MAX`] command buffers made
+    /// and not completed and no answered buffer not yet begun, and each lock it takes is free,
+    /// each tried. Its turn in its queue's lane and its
     /// ticket in the commit order are taken together, or neither, and kept on its queue
     /// ([`Answered`]), and the answer is posted through `post`, which waits for nothing and answers
     /// whether it posted it. False, with nothing taken, where it is not answered.
@@ -572,6 +573,7 @@ impl<P: Platform> Decoders<P> {
             || context_of(m.queue_obj_id) != context
             || shared.failed.try_has(context) != Some(false)
             || shared.surface_caches.none_cached(glance.used_blocks()) != Some(true)
+            || shared.unsettled.try_any(glance.used_blocks()) != Some(false)
         {
             return false;
         }
@@ -3179,6 +3181,38 @@ mod tests {
         assert!(failed.fail(0, failed.resets()));
         assert!(!answered(&dec, &asking(177, 107)), "its context failed");
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 175, 105)]);
+    }
+
+    /// A buffer that uses a block whose `SURFACE_PAGES` the surface worker is still carrying out
+    /// is not answered on a doorbell's thread, with nothing taken, while another block's does not
+    /// hold it; once its block is settled it is
+    #[test]
+    fn a_buffer_using_a_block_still_being_made_is_not_answered_at_the_doorbell() {
+        let (p, mut dec, posted) = posting(false);
+        create_events(&p, &mut dec, 0);
+        const BLOCK: u64 = 0x5_0000;
+        let used = RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen: 0,
+            flags: 0,
+            reserved_14: 0,
+        };
+        let mut ops = op(RGFX_OP_SURFACE_USE, used.as_bytes());
+        ops.extend(render_ops());
+        ops.extend(op(RGFX_OP_SUBMITTED, &[]));
+        let message = command_buffer_message(180, 110, &ops);
+        let settle = dec.begin_surface_pages(BLOCK);
+        assert!(
+            !answer(&dec, &message, &posted, true),
+            "its block is unsettled"
+        );
+        assert!(!let_go_of_answer(&dec), "nothing taken");
+        drop(settle);
+        let other = dec.begin_surface_pages(BLOCK + 0x1_0000);
+        assert!(answer(&dec, &message, &posted, true), "another block's");
+        assert!(let_go_of_answer(&dec));
+        drop(other);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 180, 110)]);
     }
 
     /// A buffer answered on a doorbell's thread calls nothing of the platform's there, and its

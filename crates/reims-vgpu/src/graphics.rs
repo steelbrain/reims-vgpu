@@ -1057,13 +1057,18 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ring of the queue `poster` posts onto `CB_SUBMITTED`, on a doorbell's thread, before the
     /// queue's service thread takes it, where it gets that at its take and nothing need be waited
     /// for or allocated (`decode`'s [`Decoders::answer_at_doorbell`]): it runs on that queue, no
-    /// reset is under way, every lock it takes is free, each tried, and no pipeline it names is
-    /// still compiling. Its `CB_SUBMITTED` is posted through `poster` waiting for nothing, once
+    /// reset is under way, every lock it takes is free, each tried, no pipeline it names is still
+    /// compiling, and no no-copy buffer of its context is being made on the surface worker
+    /// ([`Self::start_buffer_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is posted through `poster` waiting for nothing, once
     /// its turn in its queue's lane and its ticket in the commit order are taken, which its begin
     /// on the service thread takes in their place ([`Self::begin_command_buffer`]), so the
     /// guest's later buffers are committed after it as they would be had it been answered there.
     fn answer_command_buffer(&self, poster: &CompletionPoster, message: &[u8]) -> bool {
         if foreign_queue(poster, message) || !self.pending.none_named_by(message) {
+            return false;
+        }
+        let context = sender_context(poster, message);
+        if (self.pages_buffers).try_any(std::iter::once(pages_context(context))) != Some(false) {
             return false;
         }
         // No reset under way: the decoder's reset lets go of what the answer keeps on the queue.
@@ -1073,7 +1078,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if poster.stale() {
             return false;
         }
-        let context = sender_context(poster, message);
         (self.decoders).answer_at_doorbell(context, message, |record| {
             poster.try_post(record.as_bytes())
         })
@@ -1228,7 +1232,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// worker behind what was handed to it before, so the view's mapping and import hold neither
     /// ring 0 nor the views' lock (`decode::surface_pages`). Until it is made its context and its
     /// block are unsettled ([`Self::pages_buffers`]): every later message of the context waits
-    /// for it ([`Self::handle_stage3`]), and its block's release, a new `SURFACE_PAGES` of its
+    /// for it ([`Self::handle_stage3`]), none of its command buffers is answered at a doorbell
+    /// ([`Self::answer_command_buffer`]), and its block's release, a new `SURFACE_PAGES` of its
     /// block and its context's close wait for it, so each sees the buffer as right after its
     /// create. Made under the reset gate, held shared recursively, as the surface
     /// worker's other jobs are; where the device was reset since, nothing is made. Whether it was
