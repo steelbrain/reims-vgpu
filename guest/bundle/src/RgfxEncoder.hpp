@@ -50,6 +50,32 @@
 #include "RgfxRingWriter.hpp"
 #include "reims_graphics_wire.h"
 
+/// The kinds of render state an encoder sets that Metal gives a defined default at each
+/// encoder's start (MTLRenderCommandEncoder.h), each with the op that sets it: what a parallel
+/// pass sets back between its sub-encoders (RgfxEncoder::appendSegment). Bindings are not among
+/// them: a function that reads an index nothing was bound at is outside Metal's contract.
+enum : uint32_t {
+	kRgfxRenderStateCullMode = 1u << 0,          // None
+	kRgfxRenderStateFrontFacing = 1u << 1,       // Clockwise
+	kRgfxRenderStateFillMode = 1u << 2,          // Fill
+	kRgfxRenderStateDepthClipMode = 1u << 3,     // Clip
+	kRgfxRenderStateDepthBias = 1u << 4,         // 0, 0, 0
+	kRgfxRenderStateBlendColor = 1u << 5,        // 0, 0, 0, 0
+	kRgfxRenderStateStencilReference = 1u << 6,  // 0, 0
+	kRgfxRenderStateViewport = 1u << 7,          // the target's size, depth 0 to 1
+	kRgfxRenderStateScissor = 1u << 8,           // the target's size
+	kRgfxRenderStateDepthStencil = 1u << 9,      // nil: the default depth-stencil state
+	kRgfxRenderStateVisibility = 1u << 10,       // Disabled, offset 0
+	kRgfxRenderStateTessellationScale = 1u << 11 // 1.0
+};
+
+/// The size of a render pass's target, which Metal's default viewport and scissor rectangle
+/// cover: what a parallel pass's sub-encoder starts from (RgfxEncoder::appendSegment).
+struct RgfxRenderTargetSize {
+	uint64_t width;
+	uint64_t height;
+};
+
 /// Builds one `RGFX_CMD_COMMAND_BUFFER` message — its header, then a stream of
 /// encoder ops — and posts it on a queue's submission ring. One encoder is open
 /// at a time, between a `begin*` and `endEncoder`; the op methods are called while
@@ -60,7 +86,12 @@
 /// before the header takes the SURFACE_USE ops a commit puts first (prependSurfaceUses), so they
 /// move nothing.
 ///
-/// Thread safety: none; one thread writes a builder at a time.
+/// A segment (SegmentOf) is a stream of ops alone, with no header: a parallel render pass's
+/// sub-encoder writes one of its own, on its own thread, and the pass joins them into its
+/// command buffer's stream in the order they were made (appendSegment).
+///
+/// Thread safety: none; one thread writes a builder at a time, as Metal's command buffer and
+/// encoders are used. A segment is its own builder.
 class RgfxEncoder {
 public:
 	/// A builder that will post to `ring` (a queue's submission ring) a command
@@ -69,6 +100,15 @@ public:
 	/// (RgfxCommandQueue's rgfxMessageReserve), so its ops are not copied as it grows.
 	RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id,
 	            size_t reserve = 0);
+
+	/// What a segment is made of: the builder whose command buffer it is part of.
+	struct SegmentOf {
+		const RgfxEncoder &parent;
+	};
+	/// A segment of `of.parent`'s command buffer: an op stream with no header, which keeps what
+	/// it names where the parent does (setKeeper, keepStamp), and is joined into the parent by
+	/// appendSegment.
+	explicit RgfxEncoder(SegmentOf of);
 
 	~RgfxEncoder();
 	RgfxEncoder(const RgfxEncoder &) = delete;
@@ -469,6 +509,7 @@ public:
 	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
 	/// with retained references keeps what it encodes: `keep(context, object)` for each one
 	/// (once for a run of the same object), from the encode until the buffer completes or goes.
+	/// A parallel pass's segments keep there too, each on its own thread, so `keep` is locked.
 	/// None set: nothing is kept.
 	void setKeeper(void (*keep)(void *context, const void *object), void *context)
 	{
@@ -483,9 +524,9 @@ public:
 		m_lastKept = object; // kept, so no other object takes its address meanwhile
 		m_keep(m_keepContext, object);
 	}
-	/// The command buffer's own stamp, which no other command buffer's builder has: an object
-	/// that records the stamp of the last builder to keep it (the Metal shell's RgfxResource) is
-	/// kept once a command buffer, at its first naming.
+	/// The command buffer's own stamp, which no other command buffer's builder has, and which
+	/// its segments share: an object that records the stamp of the last builder to keep it
+	/// (the Metal shell's RgfxResource) is kept once a command buffer, at its first naming.
 	uint64_t keepStamp() const { return m_keepStamp; }
 	/// The id of `object` where the builder named it before and it was kept (namedNote): a
 	/// command buffer keeps what it names until it completes, so no other object takes its
@@ -519,6 +560,19 @@ public:
 	}
 	/// The uses recorded so far, which the caller now holds.
 	std::vector<RgfxShadowUse> takeShadowUses() { return std::move(m_shadowUses); }
+
+	// --- parallel render passes ---------------------------------------------------
+
+	/// The render state, of the kinds Metal gives a defined default (kRgfxRenderState*), that
+	/// this builder's ops have set: what a parallel pass resets after the segment.
+	uint32_t renderStateSet() const { return m_renderStateSet; }
+
+	/// Joins `segment` (one of this command buffer's, SegmentOf) at the stream's end: its ops,
+	/// then the surface and app-memory uses it recorded, which this builder now holds. Before
+	/// its ops, the render state an earlier segment set (`reset`, kRgfxRenderState*) is set
+	/// back to Metal's defaults with the ops that set it, the viewport and scissor rectangle
+	/// to `target`'s whole size, as each sub-encoder of a parallel pass starts from them.
+	void appendSegment(RgfxEncoder &segment, uint32_t reset, const RgfxRenderTargetSize &target);
 
 private:
 	/// The bytes before the header a commit's surface uses take with no move: 64 of them.
@@ -579,16 +633,17 @@ private:
 		return static_cast<size_t>((reinterpret_cast<uint64_t>(object) * 0x9e3779b97f4a7c15ull) >> 59);
 	}
 
-	RgfxRingWriter *m_ring;
+	RgfxRingWriter *m_ring; // null for a segment
 	RgfxCommandBuffer m_head;
 	// The storage: a buffer of the builder's own (malloc) from m_store, m_end the end; the op
-	// stream from m_ops (kHeadroom and the header before it) to m_cur. The surface uses put
-	// first lie in the m_prefix bytes before m_ops.
+	// stream from m_ops (kHeadroom and the header before it, none for a segment) to m_cur. The
+	// surface uses put first lie in the m_prefix bytes before m_ops.
 	uint8_t *m_store = nullptr;
 	uint8_t *m_ops = nullptr;
 	uint8_t *m_cur = nullptr;
 	uint8_t *m_end = nullptr;
 	size_t m_prefix = 0;
+	uint32_t m_renderStateSet = 0;
 	uint64_t m_keepStamp;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;
 	std::vector<std::shared_ptr<void>> m_surfaceUses;

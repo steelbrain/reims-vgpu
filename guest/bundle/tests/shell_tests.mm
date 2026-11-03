@@ -4408,6 +4408,195 @@ void test_message_reserve()
 	}
 }
 
+// The ops of the next command buffer posted on `submit`, inline: each one's tag and body.
+static std::vector<std::pair<uint16_t, std::vector<uint8_t>>> postedOps(TestRing &submit)
+{
+	std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ops;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+	RgfxCommandBuffer cbh = {};
+	std::memcpy(&cbh, bytes.data(), sizeof(cbh));
+	OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cbh.op_bytes);
+	while (!walk.done()) {
+		uint16_t tag = 0;
+		uint32_t len = 0;
+		const uint8_t *body = nullptr;
+		size_t body_len = 0;
+		CHECK(walk.next(&tag, &len, &body, &body_len));
+		ops.push_back({tag, std::vector<uint8_t>(body, body + body_len)});
+	}
+	return ops;
+}
+
+// Metal starts each sub-encoder of a parallel pass from the default state (MTLRenderCommandEncoder.h;
+// measured on the M3 Max, an AMD 5300M and an Intel 630 for the cull mode and the scissor): each
+// kind of state a sub-encoder set is set back to Metal's default, with the op that sets it, before
+// the next one's ops, the viewport and scissor to the pass's target (level 1 of a 64 x 32
+// attachment: 32 x 16), and none that no sub-encoder before set.
+void test_parallel_sub_encoders_start_from_defaults()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		int calls = 0;
+		f.ids.setResourceIdSource(&oneChunk, &calls);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:64
+		                                                      height:32
+		                                                   mipmapped:YES];
+		td.usage = MTLTextureUsageRenderTarget;
+		RgfxTexture *target = [RgfxTexture textureWithDescriptor:td
+		                                                    heap:RGFX_OBJ_NONE
+		                                              heapOffset:0
+		                                                  device:nil
+		                                              serializer:&f.ser];
+		CHECK(target != nil);
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = target;
+		rp.colorAttachments[0].level = 1;
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		id<MTLParallelRenderCommandEncoder> pass = [cb parallelRenderCommandEncoderWithDescriptor:rp];
+		id<MTLRenderCommandEncoder> a = [pass renderCommandEncoder];
+		id<MTLRenderCommandEncoder> b = [pass renderCommandEncoder];
+		id<MTLRenderCommandEncoder> c = [pass renderCommandEncoder];
+		[a setRenderPipelineState:handle(7)];
+		[a setCullMode:MTLCullModeBack];
+		[a setFrontFacingWinding:MTLWindingCounterClockwise];
+		[a setTriangleFillMode:MTLTriangleFillModeLines];
+		[a setDepthClipMode:MTLDepthClipModeClamp];
+		[a setDepthBias:1 slopeScale:2 clamp:3];
+		[a setBlendColorRed:1 green:1 blue:1 alpha:1];
+		[a setStencilReferenceValue:5];
+		[a setViewport:(MTLViewport){1, 1, 4, 4, 0.25, 0.5}];
+		[a setScissorRect:(MTLScissorRect){1, 1, 2, 2}];
+		[a setDepthStencilState:handle(8)];
+		[a setVisibilityResultMode:MTLVisibilityResultModeBoolean offset:64];
+		[a setTessellationFactorScale:2];
+		[a drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[a endEncoding];
+		[b setRenderPipelineState:handle(7)];
+		[b drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:3 vertexCount:3];
+		[b endEncoding];
+		[c drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:6 vertexCount:3];
+		[c endEncoding];
+		[pass endEncoding];
+		[cb commit];
+		drainRing(f.control);
+		std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ops = postedOps(f.submit);
+		// From the first draw's end to the second's pipeline: the defaults, in this order.
+		size_t at = 0;
+		while (at < ops.size() && ops[at].first != RGFX_OP_RENDER_DRAW_PRIMITIVES)
+			at++;
+		CHECK(at < ops.size());
+		auto body = [&](size_t i) { return ops[i].second; };
+		auto bytesOf = [](const auto &v) {
+			return std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(&v),
+			                            reinterpret_cast<const uint8_t *>(&v) + sizeof(v));
+		};
+		RgfxOpSetCullMode cull = {};
+		RgfxOpSetFrontFacingWinding winding = {};
+		RgfxOpSetTriangleFillMode fill = {};
+		RgfxOpSetDepthClipModeSpi clip = {};
+		RgfxOpSetDepthBias bias = {};
+		RgfxOpSetBlendColorRed blend = {};
+		RgfxOpSetStencilFrontReferenceValue stencil = {};
+		RgfxOpSetViewport viewport = {};
+		const double w = 32, h = 16, one = 1;
+		std::memcpy(&viewport.width_bits, &w, 8);
+		std::memcpy(&viewport.height_bits, &h, 8);
+		std::memcpy(&viewport.zfar_bits, &one, 8);
+		RgfxOpSetScissorRect scissor = {};
+		scissor.width = 32;
+		scissor.height = 16;
+		RgfxOpSetDepthStencilState depthStencil = {};
+		RgfxOpSetVisibilityResultMode visibility = {};
+		RgfxOpSetTessellationFactorScale scale = {};
+		const float fone = 1;
+		std::memcpy(&scale, &fone, 4);
+		const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> defaults = {
+		    {RGFX_OP_RENDER_SET_CULL_MODE, bytesOf(cull)},
+		    {RGFX_OP_RENDER_SET_FRONT_FACING_WINDING, bytesOf(winding)},
+		    {RGFX_OP_RENDER_SET_TRIANGLE_FILL_MODE, bytesOf(fill)},
+		    {RGFX_OP_RENDER_SET_DEPTH_CLIP_MODE_SPI, bytesOf(clip)},
+		    {RGFX_OP_RENDER_SET_DEPTH_BIAS, bytesOf(bias)},
+		    {RGFX_OP_RENDER_SET_BLEND_COLOR_RED, bytesOf(blend)},
+		    {RGFX_OP_RENDER_SET_STENCIL_FRONT_REFERENCE_VALUE, bytesOf(stencil)},
+		    {RGFX_OP_RENDER_SET_VIEWPORT, bytesOf(viewport)},
+		    {RGFX_OP_RENDER_SET_SCISSOR_RECT, bytesOf(scissor)},
+		    {RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE, bytesOf(depthStencil)},
+		    {RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE, bytesOf(visibility)},
+		    {RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_SCALE, bytesOf(scale)},
+		};
+		CHECK(ops.size() >= at + 1 + defaults.size() + 4);
+		bool same = true;
+		for (size_t i = 0; i < defaults.size(); i++)
+			same = same && ops[at + 1 + i] == defaults[i];
+		CHECK(same);
+		at += 1 + defaults.size();
+		// The second sub-encoder set only its pipeline, which has no default to set back: the
+		// third's draw follows the second's at once.
+		CHECK(ops[at].first == RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE);
+		CHECK(ops[at + 1].first == RGFX_OP_RENDER_DRAW_PRIMITIVES && body(at + 1)[8] == 3);
+		CHECK(ops[at + 2].first == RGFX_OP_RENDER_DRAW_PRIMITIVES && body(at + 2)[8] == 6);
+		// Then the pass's end (after its queue barrier fence's update).
+		at += 3;
+		while (at < ops.size() && ops[at].first == RGFX_OP_RENDER_UPDATE_FENCE)
+			at++;
+		CHECK(at + 1 == ops.size() && ops[at].first == RGFX_OP_ENCODER_END);
+		CHECK(f.queue != nil);
+	}
+}
+
+// Threads encode their own sub-encoders of one pass at once, as Metal allows: every draw of each
+// lands, each sub-encoder's whole and in the order they were made, whichever ends first.
+void test_parallel_sub_encoders_on_threads()
+{
+	QueueFixture f(0x100000); // half of it takes a round's message
+	@autoreleasepool {
+		TestHandle *buffers[2] = {handle(0x100), handle(0x101)};
+		for (int round = 0; round < 20; round++) {
+			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = handle(42);
+			id<MTLParallelRenderCommandEncoder> pass = [cb parallelRenderCommandEncoderWithDescriptor:rp];
+			id<MTLRenderCommandEncoder> subs[2] = {[pass renderCommandEncoder], [pass renderCommandEncoder]};
+			std::atomic<int> go{0};
+			std::vector<std::thread> threads;
+			for (int t = 0; t < 2; t++) {
+				threads.emplace_back([&, t] {
+					go.fetch_add(1);
+					while (go.load() < 2) {
+					}
+					for (int i = 0; i < 2000; i++) {
+						[subs[t] setVertexBuffer:buffers[t] offset:static_cast<NSUInteger>(i) atIndex:0];
+						[subs[t] drawPrimitives:MTLPrimitiveTypeTriangle
+						            vertexStart:static_cast<NSUInteger>(t * 100000 + i)
+						            vertexCount:3];
+					}
+					[subs[t] endEncoding];
+				});
+			}
+			for (std::thread &th : threads)
+				th.join();
+			[pass endEncoding];
+			[cb commit];
+			std::vector<uint64_t> starts;
+			for (const auto &op : postedOps(f.submit)) {
+				if (op.first != RGFX_OP_RENDER_DRAW_PRIMITIVES)
+					continue;
+				RgfxOpDrawPrimitives d = {};
+				std::memcpy(&d, op.second.data(), sizeof(d));
+				starts.push_back(d.vertex_start);
+			}
+			bool ordered = starts.size() == 4000;
+			for (size_t i = 0; ordered && i < 4000; i++)
+				ordered = starts[i] == (i < 2000 ? i : 100000 + (i - 2000));
+			CHECK(ordered);
+		}
+	}
+}
+
 // A command buffer keeps each object its encoders name once, however often they name it and in
 // whichever of its encoders, a parallel pass's sub-encoders among them: binds alternating between
 // objects keep each one once, from the first (its retain count rises by one), until it completes.
@@ -9167,6 +9356,8 @@ int main(int argc, char **argv)
 		test_reply_reader_event();
 		test_command_buffer_event_ops();
 		test_message_reserve();
+		test_parallel_sub_encoders_start_from_defaults();
+		test_parallel_sub_encoders_on_threads();
 		test_command_buffer_keeps_once();
 		test_resource_ids();
 		test_reply_reader_arm();

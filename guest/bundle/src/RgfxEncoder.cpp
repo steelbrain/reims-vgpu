@@ -45,6 +45,9 @@ namespace {
 /// never 0, which no object records before it is first kept.
 std::atomic<uint64_t> g_nextKeepStamp{1};
 
+/// The storage a segment starts with: room for a few hundred ops.
+constexpr size_t kSegmentStart = 4096;
+
 } // namespace
 
 RgfxEncoder::RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId cb_obj_id,
@@ -62,6 +65,18 @@ RgfxEncoder::RgfxEncoder(RgfxRingWriter &ring, RgfxObjId queue_obj_id, RgfxObjId
 	m_ops = m_store + kHeadroom + RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_cur = m_ops;
 	m_end = m_store + size;
+}
+
+RgfxEncoder::RgfxEncoder(SegmentOf of)
+    : m_ring(nullptr), m_head{}, m_keepStamp(of.parent.m_keepStamp), m_keep(of.parent.m_keep),
+      m_keepContext(of.parent.m_keepContext)
+{
+	m_store = static_cast<uint8_t *>(std::malloc(kSegmentStart));
+	if (m_store == nullptr)
+		std::abort();
+	m_ops = m_store;
+	m_cur = m_ops;
+	m_end = m_store + kSegmentStart;
 }
 
 RgfxEncoder::~RgfxEncoder()
@@ -120,7 +135,7 @@ void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
 bool RgfxEncoder::fitsRing() const
 {
 	const uint64_t size = messageSize();
-	return size <= UINT32_MAX && m_ring->fits(static_cast<uint32_t>(size));
+	return m_ring != nullptr && size <= UINT32_MAX && m_ring->fits(static_cast<uint32_t>(size));
 }
 
 bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &whileWaiting,
@@ -140,7 +155,7 @@ bool RgfxEncoder::finishInRegion(volatile uint8_t *block, uint64_t region_offset
                                  const std::function<void(uint64_t)> &beforePublish)
 {
 	const uint64_t size = messageSize();
-	if (size > UINT32_MAX)
+	if (m_ring == nullptr || size > UINT32_MAX)
 		return false;
 	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_head.op_bytes = opBytes();
@@ -284,6 +299,7 @@ void RgfxEncoder::renderSetFragmentTexture(RgfxObjId texture, uint64_t index)
 void RgfxEncoder::renderSetViewport(double origin_x, double origin_y, double width, double height,
                                     double znear, double zfar)
 {
+	m_renderStateSet |= kRgfxRenderStateViewport;
 	RgfxOpSetViewport b = {};
 	b.origin_x_bits = f64bits(origin_x);
 	b.origin_y_bits = f64bits(origin_y);
@@ -296,6 +312,7 @@ void RgfxEncoder::renderSetViewport(double origin_x, double origin_y, double wid
 
 void RgfxEncoder::renderSetScissorRect(uint64_t x, uint64_t y, uint64_t width, uint64_t height)
 {
+	m_renderStateSet |= kRgfxRenderStateScissor;
 	RgfxOpSetScissorRect b = {};
 	b.x = x;
 	b.y = y;
@@ -576,6 +593,7 @@ void RgfxEncoder::renderWaitForFence(RgfxObjId fence, uint64_t stages)
 
 void RgfxEncoder::renderSetCullMode(uint64_t cull_mode)
 {
+	m_renderStateSet |= kRgfxRenderStateCullMode;
 	RgfxOpSetCullMode b = {};
 	b.cull_mode = cull_mode;
 	appendOp(RGFX_OP_RENDER_SET_CULL_MODE, &b, sizeof(b));
@@ -583,6 +601,7 @@ void RgfxEncoder::renderSetCullMode(uint64_t cull_mode)
 
 void RgfxEncoder::renderSetFrontFacingWinding(uint64_t winding)
 {
+	m_renderStateSet |= kRgfxRenderStateFrontFacing;
 	RgfxOpSetFrontFacingWinding b = {};
 	b.front_facing_winding = winding;
 	appendOp(RGFX_OP_RENDER_SET_FRONT_FACING_WINDING, &b, sizeof(b));
@@ -590,6 +609,7 @@ void RgfxEncoder::renderSetFrontFacingWinding(uint64_t winding)
 
 void RgfxEncoder::renderSetTriangleFillMode(uint64_t fill_mode)
 {
+	m_renderStateSet |= kRgfxRenderStateFillMode;
 	RgfxOpSetTriangleFillMode b = {};
 	b.fill_mode = fill_mode;
 	appendOp(RGFX_OP_RENDER_SET_TRIANGLE_FILL_MODE, &b, sizeof(b));
@@ -597,6 +617,7 @@ void RgfxEncoder::renderSetTriangleFillMode(uint64_t fill_mode)
 
 void RgfxEncoder::renderSetDepthClipModeSpi(uint64_t mode)
 {
+	m_renderStateSet |= kRgfxRenderStateDepthClipMode;
 	RgfxOpSetDepthClipModeSpi b = {};
 	b.mode = mode;
 	appendOp(RGFX_OP_RENDER_SET_DEPTH_CLIP_MODE_SPI, &b, sizeof(b));
@@ -656,6 +677,7 @@ void RgfxEncoder::renderSetColorStoreActionOptions(uint64_t store_action_options
 
 void RgfxEncoder::renderSetVisibilityResultMode(uint64_t mode, uint64_t offset)
 {
+	m_renderStateSet |= kRgfxRenderStateVisibility;
 	RgfxOpSetVisibilityResultMode b = {};
 	b.mode = mode;
 	b.offset = offset;
@@ -736,6 +758,7 @@ void RgfxEncoder::renderSetPointSize(float point_size)
 
 void RgfxEncoder::renderSetTessellationFactorScale(float scale)
 {
+	m_renderStateSet |= kRgfxRenderStateTessellationScale;
 	RgfxOpSetTessellationFactorScale b = {};
 	b.scale_bits = f32bits(scale);
 	appendOp(RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_SCALE, &b, sizeof(b));
@@ -743,6 +766,7 @@ void RgfxEncoder::renderSetTessellationFactorScale(float scale)
 
 void RgfxEncoder::renderSetBlendColor(float red, float green, float blue, float alpha)
 {
+	m_renderStateSet |= kRgfxRenderStateBlendColor;
 	RgfxOpSetBlendColorRed b = {};
 	b.red_bits = f32bits(red);
 	b.green_bits = f32bits(green);
@@ -753,6 +777,7 @@ void RgfxEncoder::renderSetBlendColor(float red, float green, float blue, float 
 
 void RgfxEncoder::renderSetDepthBias(float depth_bias, float slope_scale, float clamp)
 {
+	m_renderStateSet |= kRgfxRenderStateDepthBias;
 	RgfxOpSetDepthBias b = {};
 	b.depth_bias_bits = f32bits(depth_bias);
 	b.slope_scale_bits = f32bits(slope_scale);
@@ -778,6 +803,7 @@ void RgfxEncoder::renderSetPrimitiveRestartEnabled(uint64_t index, bool enabled)
 void RgfxEncoder::renderSetStencilReferenceValues(uint32_t front_reference_value,
                                                   uint32_t back_reference_value)
 {
+	m_renderStateSet |= kRgfxRenderStateStencilReference;
 	RgfxOpSetStencilFrontReferenceValue b = {};
 	b.front_reference_value = front_reference_value;
 	b.back_reference_value = back_reference_value;
@@ -796,6 +822,7 @@ void RgfxEncoder::renderSetStencilCleared()
 
 void RgfxEncoder::renderSetDepthStencilState(RgfxObjId depth_stencil_state)
 {
+	m_renderStateSet |= kRgfxRenderStateDepthStencil;
 	RgfxOpSetDepthStencilState b = {};
 	b.depth_stencil_state_obj_id = depth_stencil_state;
 	appendOp(RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE, &b, sizeof(b));
@@ -987,6 +1014,7 @@ void RgfxEncoder::renderSetTileSamplerStatesLodClamps(uint64_t range_location,
 
 void RgfxEncoder::renderSetScissorRects(const RgfxScissorRectElem *rects, uint32_t count)
 {
+	m_renderStateSet |= kRgfxRenderStateScissor;
 	RgfxOpSetScissorRects h = {};
 	h.count = count;
 	appendArrayOp(RGFX_OP_RENDER_SET_SCISSOR_RECTS, &h, sizeof(h), rects, count,
@@ -995,6 +1023,7 @@ void RgfxEncoder::renderSetScissorRects(const RgfxScissorRectElem *rects, uint32
 
 void RgfxEncoder::renderSetViewports(const RgfxViewportElem *viewports, uint32_t count)
 {
+	m_renderStateSet |= kRgfxRenderStateViewport;
 	RgfxOpSetViewports h = {};
 	h.count = count;
 	appendArrayOp(RGFX_OP_RENDER_SET_VIEWPORTS, &h, sizeof(h), viewports, count,
@@ -1712,4 +1741,54 @@ void RgfxEncoder::blitWaitForFence(RgfxObjId fence)
 	RgfxBlitOpWaitForFence b = {};
 	b.fence_obj_id = fence;
 	appendOp(RGFX_OP_BLIT_WAIT_FOR_FENCE, &b, sizeof(b));
+}
+
+// --- parallel render passes ---------------------------------------------------------------
+
+namespace {
+
+template <typename T> void appendAll(std::vector<T> &to, std::vector<T> &from)
+{
+	to.insert(to.end(), std::make_move_iterator(from.begin()), std::make_move_iterator(from.end()));
+	from.clear();
+}
+
+} // namespace
+
+void RgfxEncoder::appendSegment(RgfxEncoder &segment, uint32_t reset,
+                                const RgfxRenderTargetSize &target)
+{
+	// Metal's default of each kind the segment before set (MTLRenderCommandEncoder.h).
+	if (reset & kRgfxRenderStateCullMode)
+		renderSetCullMode(0); // MTLCullModeNone
+	if (reset & kRgfxRenderStateFrontFacing)
+		renderSetFrontFacingWinding(0); // MTLWindingClockwise
+	if (reset & kRgfxRenderStateFillMode)
+		renderSetTriangleFillMode(0); // MTLTriangleFillModeFill
+	if (reset & kRgfxRenderStateDepthClipMode)
+		renderSetDepthClipModeSpi(0); // MTLDepthClipModeClip
+	if (reset & kRgfxRenderStateDepthBias)
+		renderSetDepthBias(0, 0, 0);
+	if (reset & kRgfxRenderStateBlendColor)
+		renderSetBlendColor(0, 0, 0, 0);
+	if (reset & kRgfxRenderStateStencilReference)
+		renderSetStencilReferenceValues(0, 0);
+	if (reset & kRgfxRenderStateViewport)
+		renderSetViewport(0, 0, static_cast<double>(target.width),
+		                  static_cast<double>(target.height), 0, 1);
+	if (reset & kRgfxRenderStateScissor)
+		renderSetScissorRect(0, 0, target.width, target.height);
+	if (reset & kRgfxRenderStateDepthStencil)
+		renderSetDepthStencilState(0); // nil: the default state
+	if (reset & kRgfxRenderStateVisibility)
+		renderSetVisibilityResultMode(0, 0); // MTLVisibilityResultModeDisabled
+	if (reset & kRgfxRenderStateTessellationScale)
+		renderSetTessellationFactorScale(1.0f);
+	const size_t n = static_cast<size_t>(segment.m_cur - segment.m_ops);
+	if (n != 0)
+		std::memcpy(reserve(n), segment.m_ops, n);
+	segment.m_cur = segment.m_ops;
+	appendAll(m_surfaceWrites, segment.m_surfaceWrites);
+	appendAll(m_surfaceUses, segment.m_surfaceUses);
+	appendAll(m_shadowUses, segment.m_shadowUses);
 }

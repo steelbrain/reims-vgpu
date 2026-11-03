@@ -58,6 +58,7 @@
 #include <deque>
 #include <mach/mach_time.h>
 #include <mutex>
+#include <os/lock.h>
 #include <vector>
 
 #include "RgfxEncoder.hpp"
@@ -151,11 +152,31 @@ void rgfxNoteShadowUse(RgfxEncoder *enc, __unsafe_unretained id obj, bool writes
 		enc->noteShadowUse(shadow, writes);
 }
 
+/// The objects a command buffer keeps from its encode until it completes or goes
+/// (RgfxEncoder::setKeeper): locked, as a parallel pass's sub-encoders keep on their own threads.
+/// Each object comes once a command buffer (its keep stamp), so the lock is taken once an object.
+struct RgfxKept {
+	os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+	std::vector<id> objects;
+
+	/// Lets every object go, outside the lock (a dealloc may run).
+	void clear()
+	{
+		std::vector<id> gone;
+		os_unfair_lock_lock(&lock);
+		gone.swap(objects);
+		os_unfair_lock_unlock(&lock);
+	}
+};
+
 /// The keeper of a command buffer with retained references (RgfxEncoder::setKeeper): `context`
-/// is the buffer's list of what it keeps.
+/// is the buffer's RgfxKept.
 void rgfxKeep(void *context, const void *object)
 {
-	static_cast<std::vector<id> *>(context)->push_back((__bridge id)object);
+	RgfxKept *kept = static_cast<RgfxKept *>(context);
+	os_unfair_lock_lock(&kept->lock);
+	kept->objects.push_back((__bridge id)object);
+	os_unfair_lock_unlock(&kept->lock);
 }
 
 /// How an encoder names a resource (rgfxNote): only by its id (a pipeline, a state, a fence);
@@ -393,6 +414,30 @@ bool rgfxTakesSamplePositions(id<MTLDevice> device, const RgfxRenderPassSamplePo
 		      @"make: answered no encoder",
 		      p.count);
 	return false;
+}
+
+/// The size of the target of pass `d`, which Metal's default viewport and scissor rectangle
+/// cover: the smallest of its attachments (ours, RgfxTexture) at their levels, else its
+/// renderTargetWidth and renderTargetHeight where it has none.
+RgfxRenderTargetSize rgfxTargetSize(MTLRenderPassDescriptor *d)
+{
+	RgfxRenderTargetSize size = {UINT64_MAX, UINT64_MAX};
+	auto meet = [&size](MTLRenderPassAttachmentDescriptor *a) {
+		id t = a.texture;
+		if (![t isKindOfClass:[RgfxTexture class]])
+			return;
+		RgfxTexture *texture = t;
+		size.width = std::min<uint64_t>(size.width, std::max<NSUInteger>(1, texture.width >> a.level));
+		size.height =
+		    std::min<uint64_t>(size.height, std::max<NSUInteger>(1, texture.height >> a.level));
+	};
+	for (uint32_t i = 0; i < 8; i++)
+		meet(d.colorAttachments[i]);
+	meet(d.depthAttachment);
+	meet(d.stencilAttachment);
+	if (size.width == UINT64_MAX)
+		size = {d.renderTargetWidth, d.renderTargetHeight};
+	return size;
 }
 
 uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
@@ -1011,6 +1056,10 @@ struct RgfxBarrierSlot {
 // its fence's last encoder now and updates the fence at its end; not for a parallel pass's
 // sub-encoder, whose pass does both.
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot begin:(BOOL)begin;
+// A parallel pass's sub-encoder: `segment` is the stream it writes, its own (SegmentOf), which
+// the pass joins at its end (rgfxSegment).
+- (void)rgfxAdoptSegment:(std::unique_ptr<RgfxEncoder>)segment;
+- (RgfxEncoder *)rgfxSegment;
 @end
 @interface RgfxComputeCommandEncoder ()
 // The command buffer that made it (commandBuffer).
@@ -1030,6 +1079,9 @@ struct RgfxBarrierSlot {
 - (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer;
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads;
 - (void)rgfxSetTileWidth:(NSUInteger)width height:(NSUInteger)height;
+// The pass's descriptor, a copy of which gives the size of its target, the default viewport and
+// scissor rectangle each sub-encoder starts from, where one is to be set back.
+- (void)rgfxSetPass:(MTLRenderPassDescriptor *)pass;
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot;
 @end
 
@@ -1122,7 +1174,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// What its encoders named, kept from the encode until it completes or goes, so nothing it
 	// names leaves the host before it runs, as Metal's buffer with retained references keeps what
 	// it encodes.
-	std::vector<id> _kept;
+	RgfxKept _kept;
 	// The IOSurface copies this buffer writes, written back to their surfaces' pages
 	// when it completes (RgfxIOSurface.h).
 	std::vector<std::shared_ptr<void>> _surfaceWrites;
@@ -1313,6 +1365,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	[enc rgfxSetCommandBuffer:self];
 	[enc rgfxSetUploads:_uploads];
 	[enc rgfxSetTileWidth:renderPassDescriptor.tileWidth height:renderPassDescriptor.tileHeight];
+	[enc rgfxSetPass:renderPassDescriptor];
 	[enc rgfxSetBarrierSlot:[_queue rgfxTakeBarrierSlot]];
 	return enc;
 }
@@ -2036,7 +2089,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 #pragma clang attribute push(__attribute__((objc_externally_retained)), apply_to = objc_method)
 
 @implementation RgfxRenderCommandEncoder {
-	RgfxEncoder *_enc; // borrowed: the command buffer's encoder
+	RgfxEncoder *_enc; // borrowed: the command buffer's encoder, or the segment below
+	// A parallel pass's sub-encoder's own stream, which the pass joins into its command buffer's
+	// at its end (RgfxEncoder::SegmentOf); null for an encoder of its own pass.
+	std::unique_ptr<RgfxEncoder> _segment;
 	BOOL _emitEnd;
 	id _pipeline; // the last pipeline set, whose functions' arguments are below
 	__weak id<MTLDevice> _device;
@@ -2100,6 +2156,17 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 {
 	_commandBuffer = commandBuffer;
 	_commandBufferHold = commandBuffer;
+}
+
+- (void)rgfxAdoptSegment:(std::unique_ptr<RgfxEncoder>)segment
+{
+	_segment = std::move(segment);
+	_enc = _segment.get();
+}
+
+- (RgfxEncoder *)rgfxSegment
+{
+	return _segment.get();
 }
 
 // The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
@@ -4059,6 +4126,16 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	NSUInteger _tileWidth, _tileHeight;
 	RgfxBarrierSlot _barrier; // the pass's queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;
+	MTLRenderPassDescriptor *_pass; // a copy of the pass's descriptor
+	// Its sub-encoders, in the order they were made, which is the order they run in; any
+	// thread may make one.
+	os_unfair_lock _subsLock;
+	NSMutableArray<RgfxRenderCommandEncoder *> *_subs;
+}
+
+- (void)rgfxSetPass:(MTLRenderPassDescriptor *)pass
+{
+	_pass = [pass copy];
 }
 
 - (void)rgfxSetBarrierSlot:(const RgfxBarrierSlot &)slot
@@ -4086,6 +4163,8 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 		_enc = enc;
 		_device = device;
 		_traceId = RgfxNextTraceObjectId();
+		_subsLock = OS_UNFAIR_LOCK_INIT;
+		_subs = [NSMutableArray array];
 	}
 	return self;
 }
@@ -4136,18 +4215,25 @@ RGFX_LOG_UNRECOGNIZED
 {
 }
 
+// Sub-encoders of a parallel pass share the one open render pass, and write no framing of their
+// own: the pass writes the one RGFX_OP_ENCODER_END. Each writes a stream of its own (a segment
+// of the command buffer's), so threads encode them at once, as Metal allows; the pass joins them
+// at its end in the order they were made, which is the order Metal runs them in, each from
+// Metal's default state (measured on the M3 Max, an AMD 5300M and an Intel 630: the second made,
+// encoded first, draws last).
 - (nullable id<MTLRenderCommandEncoder>)renderCommandEncoder
 {
-	// Sub-encoders of a parallel pass share the one open render pass; they forward
-	// ops to the same RgfxEncoder and do NOT write their own begin/end framing. This
-	// encoder writes the single RGFX_OP_ENCODER_END on its own endEncoding.
 	RgfxRenderCommandEncoder *sub = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_enc
 	                                                                          emitEnd:NO
 	                                                                           device:_device];
+	[sub rgfxAdoptSegment:std::make_unique<RgfxEncoder>(RgfxEncoder::SegmentOf{*_enc})];
 	[sub rgfxSetCommandBuffer:_commandBuffer];
 	[sub rgfxSetUploads:_uploads];
 	[sub rgfxSetTileWidth:_tileWidth height:_tileHeight];
 	[sub rgfxSetBarrierSlot:_barrier begin:NO];
+	os_unfair_lock_lock(&_subsLock);
+	[_subs addObject:sub];
+	os_unfair_lock_unlock(&_subsLock);
 	return sub;
 }
 
@@ -4155,6 +4241,25 @@ RGFX_LOG_UNRECOGNIZED
 {
 	if (!_ended) {
 		_ended = YES;
+		os_unfair_lock_lock(&_subsLock);
+		NSArray<RgfxRenderCommandEncoder *> *subs = [_subs copy];
+		[_subs removeAllObjects];
+		os_unfair_lock_unlock(&_subsLock);
+		// Each sub-encoder's ops in turn, the render state the one before set back to Metal's
+		// defaults first.
+		uint32_t reset = 0;
+		RgfxRenderTargetSize target = {};
+		bool sized = false;
+		for (RgfxRenderCommandEncoder *sub in subs) {
+			RgfxEncoder *segment = [sub rgfxSegment];
+			const uint32_t set = segment->renderStateSet();
+			if (!sized && (reset & (kRgfxRenderStateViewport | kRgfxRenderStateScissor))) {
+				target = rgfxTargetSize(_pass);
+				sized = true;
+			}
+			_enc->appendSegment(*segment, reset, target);
+			reset = set;
+		}
 		if (_barrier.fences[_barrier.slot] != 0)
 			_enc->renderUpdateFence(_barrier.fences[_barrier.slot], kRgfxBarrierRenderStages);
 		_enc->endEncoder();
