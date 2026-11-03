@@ -6,7 +6,7 @@
 #                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
 #                                 [--no-appload] [--no-bench | --wait-bench]
-#                                 [--publish] [REV]
+#                                 [--publish | --probe-tip] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
@@ -45,6 +45,9 @@
 #                 as loader-fix/oc-sipon-SHORT.qcow2 and tip-host/SHORT/ under the host's RGK_RUN
 #                 (lane-gate/msi-publish.sh), unless nothing they carry changed since the last
 #                 commit the gate published (published-last)
+#   --probe-tip   publish REV's image and host build as --publish does, always, for probes tipped at
+#                 it (a fix's proof), without making it the lane's tip: published-last stays, so a
+#                 probe round's tip stays the lane's (probe-batch.sh --tip SHA runs a round on REV)
 #
 # What it runs, the Mac's leg beside the lane host's build:
 #   Mac:  the guest kexts, bundle and tools (lane-gate/guest: guest-run.sh's payload); then
@@ -96,7 +99,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0
+record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -117,6 +120,7 @@ while (($#)); do
     --wait-bench) bench=wait ;;
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
     --publish) publish=1 ;;
+    --probe-tip) publish=1 probe_tip=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) die "unknown option $1" ;;
     *) rev=$1 ;;
@@ -473,7 +477,7 @@ PUBLISHED_PATHS=(guest/kext guest/bundle guest/rgfxgate crates firmware vendor/q
 do_publish() {
   local last short qc m2v
   last=$(cat "$GH/published-last" 2> /dev/null || true)
-  if [[ -n $last ]] && git -C "$SRC" cat-file -e "$last^{commit}" 2> /dev/null &&
+  if ((!probe_tip)) && [[ -n $last ]] && git -C "$SRC" cat-file -e "$last^{commit}" 2> /dev/null &&
     git -C "$SRC" diff --quiet "$last" "$sha" -- "${PUBLISHED_PATHS[@]}"; then
     echo "NOT_PUBLISHED: nothing the image or the host carries changed since ${last:0:9}, whose they are"
     return 0
@@ -486,7 +490,7 @@ do_publish() {
   cdhash=$(codesign -dvvv "$TREE/guest/bundle/build/package/reims-graphics.bundle" 2>&1 | sed -n 's/^CDHash=//p')
   scp -q "$ART/reims-graphics.bundle.tgz" "$MSI:$MR/reims-graphics.bundle.tgz"
   msi "bash '$MR/bin/msi-publish.sh' '$MR' '$MSI_GATE/qemu/$qc/build' '$MSI_GATE/target/dist-vulkan' '$short' '$qc' '$m2v' '$MSI_RGK_RUN' '$cdhash'"
-  echo "$sha" > "$GH/published-last"
+  ((probe_tip)) || echo "$sha" > "$GH/published-last"
 }
 
 # --- the boot ---------------------------------------------------------------------------------
