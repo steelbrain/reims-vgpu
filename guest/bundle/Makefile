@@ -48,6 +48,8 @@
 #                   the wire round trip of the bundle's ring code against the host's library
 #                   (tests/peer_tests.mm; native arch, this Mac's GPU, never in `make test`):
 #                   build, then run holding the GPU lock. DIST names `cargo xtask dist`'s tree.
+#   make spguard    what the kernel's VM guard makes of the device's superpages
+#                   (tools/spguard), build/spguard-x86_64, run in a guest.
 #   make clean      remove build/
 #
 # Everything lands in build/, never committed.
@@ -452,6 +454,17 @@ $(PIPELINES_LIBDIR)/stamp: tools/pipelines/pipelines.metal Makefile
 	rm -f $(@D)/*.air
 	echo $(PIPELINES_SEED) > $@
 
+# --- the VM guard and the device's superpages (tools/spguard; spguard.cpp says what each case does) -
+# One x86-64 binary, run in a guest, never in `make test`: no Metal.
+SPGUARDBIN = $(BUILD)/spguard-x86_64
+
+spguard: $(SPGUARDBIN)
+
+$(SPGUARDBIN): tools/spguard/spguard.cpp src/RgfxSuperpages.cpp src/RgfxSuperpages.hpp Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch x86_64 $(CXXFLAGS) -mmacosx-version-min=13.0 tools/spguard/spguard.cpp \
+		src/RgfxSuperpages.cpp -o $@
+
 # --- the stitchable reflection's check against Metal's own (tools/reflection_check.mm) ---------
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`: it compares with Metal's own compiler's answers.
@@ -470,5 +483,5 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all test bundle package sweep bench pipelines res submit-probe reflection-check peer-test peer-test-build \
-	clean
+	spguard clean
 
