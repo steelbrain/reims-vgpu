@@ -4934,3 +4934,72 @@ fn a_destroy_of_an_icb_being_made_waits_for_its_create() {
     opener.join().unwrap();
     assert_eq!(device.decoder_object_count(), before);
 }
+
+/// An id the kext's destroy of an indirect command buffer still being made names, made again by a
+/// later create (a context's number is given again after its close, and its ids start again from
+/// its base), names the later object: the ICB is made, then destroyed, then the buffer made under
+/// its id, which is kept
+#[test]
+fn a_create_reusing_a_pending_icb_s_id_after_its_destroy_keeps_its_object() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = icb_device(&raised);
+    let mut guest = Guest::new(&device);
+    let before = device.decoder_object_count();
+    let id = obj(1, 50);
+    device.control.icb_worker.hold();
+    guest.send(&device, icb_create(id));
+    guest.send(&device, object_destroy(id));
+    guest.send(
+        &device,
+        RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: id,
+            length: 4096,
+            ..RgfxBufferCreate::default()
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let control = Arc::clone(&device.control);
+    let opener = std::thread::Builder::new()
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            control.icb_worker.release();
+        })
+        .unwrap();
+    next_event(&mut guest, RGFX_EVT_ICB_STATE);
+    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    opener.join().unwrap();
+    let calls = platform.call_log().calls();
+    let icb = calls
+        .iter()
+        .position(|c| c.sel == "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:")
+        .expect("the ICB's make");
+    let buffer = calls
+        .iter()
+        .rposition(|c| c.sel.starts_with("newBuffer"))
+        .expect("the buffer's make");
+    assert!(
+        icb < buffer,
+        "the buffer was made before the ICB its id named first"
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        before + 1,
+        "the destroy removed the later buffer"
+    );
+}

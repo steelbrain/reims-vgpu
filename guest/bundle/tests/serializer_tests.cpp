@@ -58,6 +58,26 @@ void test_id_space()
 	CHECK(b >= a + RgfxIdSpace::addressSpan(100)); // a's span, its guard page included
 }
 
+// An object id is given once in a context: ids only grow, and nothing gives one back (a destroy
+// frees none), so the kext's destroy behind a create it stopped waiting for names no later object
+// of the same context. Only a new context's bases start them again, from its base + 1: a later
+// context under a number given again can name the id, which the host keeps in ring order
+// (graphics/tests.rs, a_create_reusing_a_pending_icb_s_id_after_its_destroy_keeps_its_object).
+void test_obj_ids_are_given_once()
+{
+	RgfxIdSpace ids;
+	RgfxObjId last = 0;
+	for (int i = 0; i < 1000; i++) {
+		const RgfxObjId id = ids.allocObjId();
+		CHECK(id > last);
+		last = id;
+	}
+	const uint64_t base = uint64_t(7) << RGFX_CONTEXT_OBJ_ID_SHIFT;
+	ids.setBases(base, RgfxIdSpace::kDefaultAddressBase);
+	CHECK(ids.allocObjId() == base + 1);
+	CHECK(ids.allocObjId() == base + 2);
+}
+
 // GPU addresses hold Metal's span of a pin: each starts a 32 KiB granule, holds the pages its
 // bytes touch and one guard page, rounded up to a granule, and no two live spans meet, so the
 // host pins every one. A span given back is picked again once the picks have gone round the
@@ -2183,6 +2203,7 @@ void test_argument_layout_parse()
 int main()
 {
 	test_id_space();
+	test_obj_ids_are_given_once();
 	test_address_picks();
 	test_resource_id_chunks();
 	test_caps();
