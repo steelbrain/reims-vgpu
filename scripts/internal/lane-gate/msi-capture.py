@@ -104,19 +104,24 @@ def give_back(paths):
 def scanout(pid, t_end):
     from compression import zstd  # Python 3.14
 
-    blocks, tree = (r.get("return", "") for r in qmp(
-        {"execute": "human-monitor-command", "arguments": {"command-line": "info ramblock"}},
-        {"execute": "human-monitor-command", "arguments": {"command-line": "info mtree"}}))
-    log("ramblocks:\n" + blocks)
     # The allocations are a RAM pointer region (memory_region_init_ram_ptr), whose RAM block has
     # no name in "info ramblock": it is the nameless block of the region's size, which "info
-    # mtree" states ("START-END (prio P, ram): reims-graphics-pci.allocations").
-    size = None
-    for line in tree.splitlines():
-        m = re.search(r"([0-9a-f]+)-([0-9a-f]+) \(prio [-0-9]+, ram\): reims-graphics-pci\.allocations$", line.strip())
-        if m:
-            size = int(m.group(2), 16) - int(m.group(1), 16) + 1
-            break
+    # mtree" states ("START-END (prio P, ram): reims-graphics-pci.allocations") once the guest's
+    # firmware has mapped the device's BAR, a moment after QEMU's start: asked again until then.
+    size, blocks = None, ""
+    while size is None and time.time() < t_end and not os.path.exists(STOP):
+        blocks, tree = (r.get("return", "") for r in qmp(
+            {"execute": "human-monitor-command", "arguments": {"command-line": "info ramblock"}},
+            {"execute": "human-monitor-command", "arguments": {"command-line": "info mtree"}}))
+        for line in tree.splitlines():
+            m = re.search(r"([0-9a-f]+)-([0-9a-f]+) \(prio [-0-9]+, ram\): reims-graphics-pci\.allocations$", line.strip())
+            if m:
+                size = int(m.group(2), 16) - int(m.group(1), 16) + 1
+                break
+        else:
+            time.sleep(0.1)
+    log(f"ramblocks (the allocations {size} bytes, {time.time() - os.path.getmtime(os.path.join(B, 'qemu.pid')):.1f} s "
+        f"after QEMU's start):\n" + blocks)
     # "Block Name  PSize  Offset  Used  Total  HVA  RO": a nameless block's line starts with its
     # page size; its four hexadecimal fields are offset, used, total and the host's address.
     found = []
