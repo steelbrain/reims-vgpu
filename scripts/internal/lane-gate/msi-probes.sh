@@ -50,8 +50,12 @@
 set -uo pipefail
 : "${PROBES:?}" "${PROBE_RESULTS:?}" "${PROBE_TIP:?}" "${DEADLINE:?}"
 log() { echo "$(date +%T) probes: $*"; }
+# ServerAlive: a session to a guest whose network stalled ends after 60 s of silence (a stall can
+# outlast the guest's TCP state, and the session then waits forever: the shots poll did, for 15
+# minutes, after a 1-minute stall).
 SOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password
-  -o PubkeyAuthentication=no -o ConnectTimeout=5 -o LogLevel=ERROR)
+  -o PubkeyAuthentication=no -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=12
+  -o LogLevel=ERROR)
 if [[ -n ${FAKE_GUEST:-} ]]; then
   G() { (cd "$FAKE_GUEST" && HOME=$FAKE_GUEST bash -c "$*"); }
   Gput() { cp -R "$1" "$FAKE_GUEST/$2"; }
