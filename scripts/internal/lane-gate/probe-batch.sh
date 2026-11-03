@@ -192,6 +192,9 @@ EOF
   # The round's GPU errors (msi-boot.sh's xid.txt), the boot's own QEMU's marked "own".
   msi "cat '$RD/xid.txt' 2> /dev/null" | sed 's/^/  Xid: /'
   ((capture)) && msi "cat '$RD/capture.txt' 2> /dev/null" | sed 's/^/  capture: /'
+  # The kext's block-cache stalls over the whole boot (a capture round's ring reader), "S" each
+  # one's seconds after the desktop came up.
+  ((capture)) && msi "grep -E '^(kring_lines|kring_first_s|block_stalls|block_stalls_early) ' '$RD/host.txt'; cat '$RD/kext-stalls.txt' 2> /dev/null" | sed 's/^/  stalls: /'
 fi
 
 # Each probe's status; the ones not reached (or never started: a failed boot) go back to the queue.

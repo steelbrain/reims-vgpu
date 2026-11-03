@@ -489,8 +489,13 @@ class Run:
                           if "reaper_lines" in kv else ""))
         # The texture-create stalls the guest logged ("its previous block is cached still"), about
         # 2 s each: one in the 60 s after the desktop came up fails the boot.
+        # A count from no kext lines at all says nothing (a boot before the kernel ring's reader
+        # counted none from the empty log store).
         if kv.get("block_stalls") == "unread":
             self.litem("guest.block-cache-stalls", "NOTRUN", "the guest's log could not be read")
+        elif "block_stalls" in kv and kv.get("kring_lines", "0") in ("", "0"):
+            self.litem("guest.block-cache-stalls", "NOTRUN",
+                       "none of the kext's lines were read from the guest's kernel ring, so no stall could be seen")
         elif "block_stalls" in kv:
             hits = [l.split() for l in read(os.path.join(r, "kext-stalls.txt")).splitlines() if len(l.split()) == 2]
             early = int(kv.get("block_stalls_early", "0") or 0)

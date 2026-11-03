@@ -488,6 +488,30 @@ if command -v nvidia-smi > /dev/null; then
 fi
 # The host's load beside the measurements (other work on the host shares its CPU and memory).
 kv load_start "$(cut -d' ' -f1 /proc/loadavg)"
+# The kext's texture-create stalls ("RgfxAccelerator: IOSurface N: its previous block is cached
+# still, its release unanswered: it is not cached", about 2 s each), from its lines in the ring
+# (kernel-rgfx.log): kext-stalls.txt "HOST_EPOCH S_AFTER_DESKTOP" a hit, the uptime set on the
+# host's clock (kring-clock.txt). block_stalls counts them, block_stalls_early those in the 60 s
+# after the desktop came up; kring_first_s says from when the ring's lines reach (its first line's
+# uptime: a boot's earlier lines had left the ring by its first read).
+# A probe boot counts them too, at its end.
+stalls() {
+  [[ -n ${KRINGPID:-} ]] && { kill "$KRINGPID" 2> /dev/null; KRINGPID=; }
+  kring
+  kring_log
+  if [[ -s $R/kring-clock.txt ]]; then
+    read -r bt off < "$R/kring-clock.txt"
+    sed -n 's/^\[\([0-9.]*\)\]: RgfxAccelerator: IOSurface [0-9]*: its previous block is cached still.*/\1/p' "$R/kernel-rgfx.log" |
+      awk -v bt="$bt" -v off="$off" -v d="${T_DESK:-0}" '{ t = bt + $1 + off; printf "%.3f %.1f\n", t, t - d }' > "$R/kext-stalls.txt"
+    kv kring_lines "$(grep -c . "$R/kernel-rgfx.log")"
+    kv kring_first_s "$(sed -n '1s/^\[\([0-9.]*\)\].*/\1/p' "$R/kernel-rgfx.log")"
+    kv block_stalls "$(grep -c . "$R/kext-stalls.txt")"
+    kv block_stalls_early "$(awk '$2 >= 0 && $2 <= 60' "$R/kext-stalls.txt" | grep -c .)"
+    [[ -d $R/capture ]] && cp "$R/kext-stalls.txt" "$R/capture/"
+  else
+    kv block_stalls unread
+  fi
+}
 # A probe boot: the round's probes back to back (msi-probes.sh), and nothing of the gate's run.
 if [[ -n ${PROBES:-} ]]; then
   log "probes: $(ls "$PROBES" | tr '\n' ' ')$(left) s left"
@@ -495,6 +519,7 @@ if [[ -n ${PROBES:-} ]]; then
     PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS bash "$(dirname "$0")/msi-probes.sh" 2>&1 | tee -a "$R/boot.log"
   kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
   log "probes done"
+  [[ ${CAPTURE:-0} == 1 ]] && stalls
   exit 0
 fi
 log "guest run: ${PHASES:-all phases}, $(left) s left"
@@ -562,27 +587,7 @@ stop_clocks
 display_state display_end
 reaper_lines
 
-# The kext's texture-create stalls ("RgfxAccelerator: IOSurface N: its previous block is cached
-# still, its release unanswered: it is not cached", about 2 s each), from its lines in the ring
-# (kernel-rgfx.log): kext-stalls.txt "HOST_EPOCH S_AFTER_DESKTOP" a hit, the uptime set on the
-# host's clock (kring-clock.txt). block_stalls counts them, block_stalls_early those in the 60 s
-# after the desktop came up; kring_first_s says from when the ring's lines reach (its first line's
-# uptime: a boot's earlier lines had left the ring by its first read).
-[[ -n ${KRINGPID:-} ]] && { kill "$KRINGPID" 2> /dev/null; KRINGPID=; }
-kring
-kring_log
-if [[ -s $R/kring-clock.txt ]]; then
-  read -r bt off < "$R/kring-clock.txt"
-  sed -n 's/^\[\([0-9.]*\)\]: RgfxAccelerator: IOSurface [0-9]*: its previous block is cached still.*/\1/p' "$R/kernel-rgfx.log" |
-    awk -v bt="$bt" -v off="$off" -v d="${T_DESK:-0}" '{ t = bt + $1 + off; printf "%.3f %.1f\n", t, t - d }' > "$R/kext-stalls.txt"
-  kv kring_lines "$(grep -c . "$R/kernel-rgfx.log")"
-  kv kring_first_s "$(sed -n '1s/^\[\([0-9.]*\)\].*/\1/p' "$R/kernel-rgfx.log")"
-  kv block_stalls "$(grep -c . "$R/kext-stalls.txt")"
-  kv block_stalls_early "$(awk '$2 >= 0 && $2 <= 60' "$R/kext-stalls.txt" | grep -c .)"
-  [[ -d $R/capture ]] && cp "$R/kext-stalls.txt" "$R/capture/"
-else
-  kv block_stalls unread
-fi
+stalls
 
 # The screen as WindowServer composed it, read back by the guest: the screenshot a person takes
 # with Command-Shift-3, the keys sent over QMP to the guest's keyboard. The system's screenshot
