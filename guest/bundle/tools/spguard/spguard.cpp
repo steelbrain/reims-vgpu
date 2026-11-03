@@ -13,10 +13,11 @@
 //   old.fixed     the same one call, at a fixed address of a free range of its own: the
 //                 exception's subcode less the address, in superpages (the kernel's cleanup takes
 //                 down past the end of the last superpage entry it made).
-//   new.short     rgfxTakeSuperpages over as many bytes: each call the kernel was asked (the
-//                 reservation, how many superpages it made over it before the first refusal and
-//                 that refusal, the deallocation), the guard exceptions, and the process's
-//                 IOAccelerator-tagged bytes after it (0: nothing left mapped).
+//   new.short     rgfxTakeSuperpages over as many bytes: what the kernel was asked (the
+//                 reservation, how many superpages it made in it before the first refusal and that
+//                 refusal, the deallocations after it and their bytes), the guard exceptions, and
+//                 the process's IOAccelerator-tagged bytes before and after it (equal: nothing left
+//                 mapped).
 //   new.room.MIB  rgfxTakeSuperpages of MIB MiB with room for them: its answer and time, the
 //                 entries the range holds (one a superpage, each 2 MiB and tagged), the guard
 //                 exceptions; then the same bytes in car 8's one call, for its time.
@@ -226,38 +227,34 @@ void describeRange(uint64_t at, uint64_t size, uint64_t *entries, bool *twoMiBTa
 // The kernel's own calls, each one counted, for new.short's account of what was asked.
 struct Counting {
 	RgfxSuperpageVm kernel = rgfxKernelSuperpageVm();
-	uint64_t reserved = 0, reserveAt = 0, made = 0, deallocated = 0;
+	uint64_t reserved = 0, made = 0, cleanups = 0, cleanupBytes = 0;
 	int refusal = 0;
-	std::string order;
 
 	static int superpages(void *c, uint64_t *at, uint64_t size, bool fixed)
 	{
 		Counting *k = static_cast<Counting *>(c);
 		const int kr = k->kernel.superpages(k->kernel.context, at, size, fixed);
-		if (kr == KERN_SUCCESS) {
+		if (kr == KERN_SUCCESS)
 			k->made++;
-		} else if (k->refusal == 0) {
+		else if (k->refusal == 0)
 			k->refusal = kr;
-			k->order += ",refused" + std::string(fixed ? "-fixed" : "");
-		}
 		return kr;
 	}
 	static int reserve(void *c, uint64_t *at, uint64_t size)
 	{
 		Counting *k = static_cast<Counting *>(c);
 		const int kr = k->kernel.reserve(k->kernel.context, at, size);
-		if (kr == KERN_SUCCESS) {
+		if (kr == KERN_SUCCESS)
 			k->reserved = size;
-			k->reserveAt = *at;
-		}
-		k->order += "reserve";
 		return kr;
 	}
 	static void deallocate(void *c, uint64_t at, uint64_t size)
 	{
 		Counting *k = static_cast<Counting *>(c);
-		k->deallocated += size;
-		k->order += ",deallocate";
+		if (k->refusal != 0) {
+			k->cleanups++;
+			k->cleanupBytes += size;
+		}
 		k->kernel.deallocate(k->kernel.context, at, size);
 	}
 	RgfxSuperpageVm calls()
@@ -342,12 +339,14 @@ void newShort()
 	if (kr == KERN_SUCCESS)
 		rgfxGiveSuperpages(k.calls(), bytes, size);
 	const uint64_t after = taggedBytes(&entriesAfter);
-	printf("spg: new.short free_mib=%llu asked_mib=%llu kr=%d us=%.0f calls=%s made=%llu "
-	       "reserved_mib=%llu deallocated_mib=%llu tagged_mib_before=%llu tagged_mib_after=%llu%s\n",
+	printf("spg: new.short free_mib=%llu asked_mib=%llu kr=%d us=%.0f reserved_mib=%llu made=%llu "
+	       "refusal=%d cleanups=%llu cleanup_mib=%llu tagged_mib_before=%llu "
+	       "tagged_mib_after=%llu%s\n",
 	       (unsigned long long)(freeBytes / kMiB), (unsigned long long)(size / kMiB), kr, us,
-	       k.order.c_str(), (unsigned long long)k.made, (unsigned long long)(k.reserved / kMiB),
-	       (unsigned long long)(k.deallocated / kMiB), (unsigned long long)(before / kMiB),
-	       (unsigned long long)(after / kMiB), seenSince(from).c_str());
+	       (unsigned long long)(k.reserved / kMiB), (unsigned long long)k.made, k.refusal,
+	       (unsigned long long)k.cleanups, (unsigned long long)(k.cleanupBytes / kMiB),
+	       (unsigned long long)(before / kMiB), (unsigned long long)(after / kMiB),
+	       seenSince(from).c_str());
 }
 
 void newRoom(uint64_t mib)
