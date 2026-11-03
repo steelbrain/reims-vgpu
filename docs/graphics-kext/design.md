@@ -1304,7 +1304,9 @@ the host's import, and the kext's block table holds one entry per slab:
   `BLOCK_RELEASE`.
 - Where the region has no block for a new slab, the process's own empty and
   cached slabs go first, then smaller slabs are tried down to the buffer's
-  size; nil only past that.
+  size; nil only past that. Any other block of the process's the kext has no
+  room for (a texture's CPU copy, a heap, an upload chunk, an IOSurface's
+  block) is asked again once those slabs went (`RgfxRegion::setReclaim`).
 
 The host makes an `Automatic` heap a `Placement` heap: the guest places what
 the heap makes itself, as Metal's Automatic heap places it (lowest free offset

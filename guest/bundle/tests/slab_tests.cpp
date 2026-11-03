@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -530,6 +531,90 @@ void test_region_slab_source()
 	CHECK(!ring.next(&h, &bytes));
 }
 
+// A kext of the test's own: blocks first fit past the floor.
+struct Kext {
+	RgfxHeapRanges free;
+	std::map<uint64_t, uint64_t> sizes; // each block's, by region offset
+	int reclaims = 0, reclaimed = 0;
+	RgfxSlabs *slabs = nullptr;
+
+	explicit Kext(uint64_t size) : free(size) {}
+	static bool alloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		Kext *k = static_cast<Kext *>(context);
+		if (!k->free.take(size, align, offset))
+			return false;
+		*offset += RGFX_ALLOCATIONS_OFFSET;
+		k->sizes[*offset] = size;
+		return true;
+	}
+	static void release(void *context, uint64_t offset)
+	{
+		Kext *k = static_cast<Kext *>(context);
+		auto it = k->sizes.find(offset);
+		if (it == k->sizes.end())
+			return;
+		k->free.give(offset - RGFX_ALLOCATIONS_OFFSET, it->second);
+		k->sizes.erase(it);
+	}
+	static bool reclaim(void *context)
+	{
+		Kext *k = static_cast<Kext *>(context);
+		k->reclaims++;
+		const bool went = k->slabs != nullptr ? k->slabs->reclaim() : false;
+		k->reclaimed += went;
+		return went;
+	}
+};
+
+// Where the kext has no room for a block, the region lets the slabs the process keeps go (the
+// cached and the empty ones) and asks once more: a block is refused only where nothing the
+// process holds could make room.
+void test_region_reclaims_slabs()
+{
+	constexpr uint64_t kRoom = 80 * kMiB; // a cache of 5 MiB
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + kRoom, 0xee);
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	Kext kext(kRoom);
+	region.setBlockSource(&Kext::alloc, &Kext::release, &kext);
+	region.setReclaim(&Kext::reclaim, &kext);
+	RgfxRegionSlabSource source(region, ser);
+	RgfxSlabs slabs(source);
+	kext.slabs = &slabs;
+	// A 4 MiB buffer freed stays cached, a 256 KiB one's slab stays empty: 4.5 MiB kept.
+	RgfxSlabs::Range big, small;
+	CHECK(slabs.take(4 * kMiB, kShared, 0, &big) && slabs.take(256 << 10, kShared, 0, &small));
+	slabs.give(big);
+	slabs.give(small);
+	CHECK(slabs.stats().cachedSlabs == 1 && slabs.stats().emptySlabs == 1);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (ring.next(&h, &bytes)) {
+	}
+	// Room for 3.5 MiB past the rest: a 4.5 MiB block is placed where both slabs lay, once they
+	// went, their heaps destroyed.
+	RgfxRegion::Block filler = region.allocate(72 * kMiB);
+	CHECK(filler.ok && kext.reclaims == 0);
+	RgfxRegion::Block block = region.allocate(4 * kMiB + (512 << 10));
+	CHECK(block.ok && kext.reclaims == 1 && kext.reclaimed == 1);
+	CHECK(slabs.stats().slabs == 0 && slabs.stats().cachedSlabs == 0);
+	int destroys = 0;
+	while (ring.next(&h, &bytes))
+		destroys += h.type == RGFX_CMD_OBJECT_DESTROY;
+	CHECK(destroys == 2);
+	// Nothing left to give back: refused after one reclaim that let nothing go.
+	CHECK(!region.allocate(4 * kMiB).ok && kext.reclaims == 2 && kext.reclaimed == 1);
+	region.release(block.offset);
+	// The slabs' own blocks ask through the region too: a buffer past the room is nil.
+	RgfxSlabs::Range none;
+	CHECK(!slabs.take(16 * kMiB, kShared, 0, &none));
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -543,4 +628,5 @@ void rgfxSlabTests()
 	test_slab_fallbacks();
 	test_slab_thread();
 	test_region_slab_source();
+	test_region_reclaims_slabs();
 }

@@ -207,6 +207,12 @@ bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offse
 	       KERN_SUCCESS;
 }
 
+// The device's slabs, as RgfxRegion's reclaim; `context` is the RgfxSlabs.
+bool rgfxSlabsReclaim(void *context)
+{
+	return static_cast<RgfxSlabs *>(context)->reclaim();
+}
+
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
 // user client's connect. False once every chunk of the guest's pool is held.
 bool rgfxKextResourceIds(void *context, uint64_t *first_id)
@@ -558,6 +564,8 @@ RGFX_LOG_UNRECOGNIZED
 	if (!_slabs->start())
 		os_log_error(OS_LOG_DEFAULT,
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");
+	// A block the kext has no room for is asked again once the slabs the process keeps went.
+	_region->setReclaim(&rgfxSlabsReclaim, _slabs.get());
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {

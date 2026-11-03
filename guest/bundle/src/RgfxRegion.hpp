@@ -99,6 +99,16 @@ public:
 	typedef void (*ReleaseFn)(void *context, uint64_t offset);
 	void setBlockSource(AllocFn alloc, ReleaseFn release, void *context);
 
+	/// What the process keeps for reuse and can give back where the kext has no room: `reclaim`
+	/// lets go of such blocks (the buffers' empty and cached slabs, RgfxSlabs.hpp) and answers
+	/// whether it let any go, and allocate() then asks the block source once more, so a block is
+	/// refused only where the process holds nothing it could give back. The surface sources'
+	/// refusals are not asked again: theirs also answer how the kext shares a surface, and
+	/// their callers fall back to allocate(). Called with `context` from the thread that asks,
+	/// holding no lock of the region's.
+	typedef bool (*ReclaimFn)(void *context);
+	void setReclaim(ReclaimFn reclaim, void *context);
+
 	/// The shared block of an IOSurface plane (acquireSurface): the block, its serial (unique to
 	/// the block's allocation) and whether this ask made it, so its bytes are not yet the
 	/// plane's. A block in place may be `cached` (acquireSurfacePages).
@@ -204,6 +214,8 @@ public:
 private:
 	/// Rounds `value` up to a multiple of `align` (a power of two).
 	static uint64_t alignUp(uint64_t value, uint64_t align);
+	/// Whether the reclaim, where set, let a block go (setReclaim).
+	bool reclaimed();
 
 	volatile uint8_t *m_base;
 	uint64_t m_size;
@@ -212,6 +224,8 @@ private:
 	AllocFn m_alloc = nullptr;     // the block source, where set (the kext)
 	ReleaseFn m_release = nullptr;
 	void *m_sourceContext = nullptr;
+	ReclaimFn m_reclaim = nullptr; // the process's blocks kept for reuse, where set (the slabs)
+	void *m_reclaimContext = nullptr;
 	SurfaceAcquireFn m_surfaceAcquire = nullptr; // the surface source, where set (the kext)
 	ReleaseFn m_surfaceRelease = nullptr;
 	void *m_surfaceContext = nullptr;

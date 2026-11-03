@@ -42,6 +42,18 @@ void RgfxRegion::setBlockSource(AllocFn alloc, ReleaseFn release, void *context)
 	m_sourceContext = context;
 }
 
+void RgfxRegion::setReclaim(ReclaimFn reclaim, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_reclaim = reclaim;
+	m_reclaimContext = context;
+}
+
+bool RgfxRegion::reclaimed()
+{
+	return m_reclaim != nullptr && m_reclaim(m_reclaimContext);
+}
+
 void RgfxRegion::setSurfaceSource(SurfaceAcquireFn acquire, ReleaseFn release, void *context)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
@@ -151,8 +163,9 @@ RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align)
 
 	if (m_alloc != nullptr) {
 		uint64_t offset = 0;
-		if (!m_alloc(m_sourceContext, size, align, &offset) || offset < m_floor ||
-		    offset > m_size || size > m_size - offset) {
+		const bool placed = m_alloc(m_sourceContext, size, align, &offset) ||
+		                    (reclaimed() && m_alloc(m_sourceContext, size, align, &offset));
+		if (!placed || offset < m_floor || offset > m_size || size > m_size - offset) {
 			return out; // no room; ok == false
 		}
 		out.offset = offset;

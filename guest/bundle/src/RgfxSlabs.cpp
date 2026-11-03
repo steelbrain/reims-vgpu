@@ -458,7 +458,12 @@ void RgfxSlabs::drop(Slab *slab)
 	delete slab;
 }
 
-void RgfxSlabs::dropDoomed(bool evict)
+bool RgfxSlabs::reclaim()
+{
+	return dropDoomed(true) != 0;
+}
+
+size_t RgfxSlabs::dropDoomed(bool evict)
 {
 	std::vector<Slab *> drops;
 	{
@@ -489,6 +494,7 @@ void RgfxSlabs::dropDoomed(bool evict)
 	}
 	for (Slab *slab : drops)
 		drop(slab);
+	return drops.size();
 }
 
 bool RgfxSlabs::step()

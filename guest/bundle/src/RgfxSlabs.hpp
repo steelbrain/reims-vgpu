@@ -196,6 +196,11 @@ public:
 	/// Gives `range` back, once its buffer's destroy is posted.
 	void give(const Range &range);
 
+	/// Lets every empty and cached slab go, with the doomed ones, where the source had no room
+	/// for another block of the process's (RgfxRegion::setReclaim): true where one went. Called
+	/// without the lock.
+	bool reclaim();
+
 	/// Does one piece of the background's work (a drop, a piece zeroed, an idle cached slab let
 	/// go): false where there was none. The thread runs it; the tests call it.
 	bool step();
@@ -267,7 +272,8 @@ private:
 	void uncache(Slab *slab);
 	/// Drops the doomed slabs no piece is being zeroed in, and lets every empty and cached slab
 	/// go first where `evict`: the process's own room given back before a create is refused.
-	void dropDoomed(bool evict);
+	/// Answers how many it dropped.
+	size_t dropDoomed(bool evict);
 	/// Gives a slab's heap and memory back, and frees it. Called without the lock.
 	void drop(Slab *slab);
 	/// The class of `options`. Caller holds the lock.
