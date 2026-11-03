@@ -79,8 +79,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// The buffer `newBufferWithLength:options:` (`bytes` null) and
 /// `newBufferWithBytes:length:options:` make: a Shared one in a range of a slab of `slabs`, which
 /// the host sees in place, a Managed one with its CPU copy there (RgfxSlabs.hpp), and a Private
-/// one the GPU's alone, its contents NULL. The range is whole 4 KiB pages, page aligned; its
-/// bytes are `length` bytes from `bytes`, then zeros.
+/// one the GPU's alone, its contents NULL. The range is whole 4 KiB pages, which allocatedSize
+/// answers, as both x86-64 Macs' GPUs do; its bytes are `length` bytes from `bytes`, then zeros.
 ///
 /// Nil where Metal makes none (measured on the M3 Max, macOS 27, in every storage mode, with
 /// bytes and without): for a length of 0 and for one past `maxLength` (the device's

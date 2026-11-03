@@ -85,6 +85,9 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	// A no-copy buffer over app memory outside the region: the block it lies over, the GPU's
 	// copy of `_contents` (RgfxMemoryShadow.hpp).
 	std::shared_ptr<RgfxMemoryShadow> _shadow;
+	// The bytes of its slab a device buffer takes, whole pages (RgfxSlabs); 0 for any other,
+	// which takes its length.
+	NSUInteger _allocatedSize;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -212,8 +215,10 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	                                           deallocator:^{ slabs->give(range); }
 	                                                device:device
 	                                            serializer:serializer];
-	if (buffer != nil)
+	if (buffer != nil) {
 		buffer->_ownsAddress = made.ownsAddress;
+		buffer->_allocatedSize = range.size;
+	}
 	return buffer;
 }
 
@@ -367,10 +372,12 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	return _length;
 }
 
-// The bytes the buffer takes: its length.
+// The bytes the buffer takes: a device buffer's range of its slab, whole 4 KiB pages, as both
+// x86-64 Macs' GPUs answer (4096 for a 256-byte Shared buffer, measured: AMD 5300M, Intel 630;
+// the M3 Max packs small buffers and answers 256); any other its length.
 - (NSUInteger)allocatedSize
 {
-	return _length;
+	return _allocatedSize != 0 ? _allocatedSize : _length;
 }
 
 - (uint64_t)gpuAddress
@@ -596,7 +603,7 @@ RGFX_RESOURCE_SPI
 // the M3 Max under macOS 27: a 1 MiB buffer answers its size, one in a heap the heap's; Metal
 // suballocates small buffers from 128 KiB pools, which answer the pool's size). The slabs the
 // device's buffers lie in are the host's objects and none of the app's, so a buffer answers its
-// own size.
+// own pages.
 - (uint64_t)resourceSize
 {
 	id<MTLHeap> heap = self.heap;

@@ -1291,10 +1291,11 @@ the host's import, and the kext's block table holds one entry per slab:
   there, at the heap's GPU address plus its offset. A Managed slab is a plain
   block, and each buffer a `BUFFER_OVER_HOST_MEMORY` over its own range, its CPU
   copy. The buffer's `heap` is nil: the slab is no object of the app's.
-- Contents and GPU addresses start a page, as both x86-64 Macs' GPUs answer
-  (AMD 5300M, Intel 630, measured with `tools/shmem`). Every new buffer reads
-  zeros: a create zeroes what of its range is dirty, and a background thread
-  zeroes freed ranges first.
+- `allocatedSize` is the pages taken, 4096 for a 256-byte buffer, and contents
+  and GPU addresses start a page, as both x86-64 Macs' GPUs answer (AMD 5300M,
+  Intel 630, measured with `tools/shmem`). Every new buffer reads zeros: a
+  create zeroes what of its range is dirty, and a background thread zeroes
+  freed ranges first.
 - A buffer up to 1 MiB shares a slab of its class, the slabs growing from
   128 KiB to 2 MiB; a larger one takes a slab of its own, which is cached for
   reuse at offset 0 once freed (a sixteenth of the region at most, 2 s idle).

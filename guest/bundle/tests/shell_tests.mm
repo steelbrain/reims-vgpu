@@ -370,7 +370,8 @@ void test_device_buffers_answer_as_metal()
 }
 
 // What a device buffer in a slab answers, as both x86-64 Macs' GPUs agree (measured, AMD 5300M and
-// Intel 630): its contents and GPU address a page apart from the next, its heap none. A buffer made over a freed one's pages reads zeros, and the freed one's destroy comes
+// Intel 630): whole 4 KiB pages, its contents and GPU address a page apart from the next, its
+// heap none. A buffer made over a freed one's pages reads zeros, and the freed one's destroy comes
 // before the new one's create; its pages go back to its slab, not to the region.
 void test_device_buffers_take_pages_of_slabs()
 {
@@ -395,7 +396,8 @@ void test_device_buffers_take_pages_of_slabs()
 			[held addObject:make(256, MTLResourceStorageModeShared)];
 		for (NSUInteger i = 0; i < held.count; i++) {
 			RgfxBuffer *b = held[i];
-			CHECK(b.length == 256 && b.heap == nil && b.heapOffset == 0);
+			CHECK(b.allocatedSize == 0x1000 && b.length == 256 && b.heap == nil &&
+			      b.heapOffset == 0);
 			CHECK(reinterpret_cast<uintptr_t>([b contents]) % 0x1000 == 0 && b.gpuAddress % 0x1000 == 0);
 			if (i > 0 && i < 32) {
 				CHECK(b.gpuAddress == held[i - 1].gpuAddress + 0x1000);
@@ -405,10 +407,10 @@ void test_device_buffers_take_pages_of_slabs()
 			// Metal's default hazard tracking for a buffer: Tracked.
 			CHECK(b.resourceOptions == MTLResourceHazardTrackingModeTracked);
 		}
-		CHECK(make(0x10000, MTLResourceStorageModeShared) != nil);
-		CHECK(make(0x10001, MTLResourceStorageModeShared) != nil);
+		CHECK(make(0x10000, MTLResourceStorageModeShared).allocatedSize == 0x10000);
+		CHECK(make(0x10001, MTLResourceStorageModeShared).allocatedSize == 0x11000);
 		RgfxBuffer *mib = make(0x100001, MTLResourceStorageModeManaged);
-		CHECK(mib != nil && mib.length == 0x100001);
+		CHECK(mib.allocatedSize == 0x101000 && mib.length == 0x100001);
 		uint8_t *first = static_cast<uint8_t *>([held[0] contents]);
 		firstId = held[0].rgfxObjId;
 		std::memset(first, 0xa5, 256);

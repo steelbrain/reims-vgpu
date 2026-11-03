@@ -12,8 +12,9 @@
  * give back: neither calls the kext, and the region's block table holds one entry per slab.
  *
  * What the buffers answer, as both x86-64 Macs' GPUs (AMD 5300M, Intel 630) agree (measured with
- * tools/shmem's align and zero cases): a buffer takes whole 4 KiB pages (kGranule), its contents
- * and GPU address start a page, and a new buffer reads zeros, whatever its memory held before.
+ * tools/shmem's align and zero cases): a buffer takes whole 4 KiB pages (kGranule; allocatedSize
+ * 4096 for a 256-byte buffer), its contents and GPU address start a page, and a new buffer reads
+ * zeros, whatever its memory held before.
  *
  * THE CLASSES. Buffers share a slab only where their options are the same once the hazard
  * tracking is resolved (the caller resolves it): the host's placed buffer takes its heap's
@@ -150,7 +151,7 @@ private:
 
 class RgfxSlabs {
 public:
-	/// A range of a slab a buffer lies in: `size` bytes, whole pages, at `offset` of its slab,
+	/// A range of a slab a buffer lies in: `size` bytes (allocatedSize) at `offset` of its slab,
 	/// at `contents` here. `slab` names it for give().
 	struct Range {
 		const void *slab = nullptr;
