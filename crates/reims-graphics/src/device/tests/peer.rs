@@ -50,7 +50,8 @@ const EVERY_FEATURE: u64 = PEER_FEATURES
         | RGFX_FEATURE_CB_PARTS
         | RGFX_FEATURE_PAGES_BUFFERS
         | RGFX_FEATURE_QUEUE_VECTORS
-        | RGFX_FEATURE_UNSHARED_QUEUES) as u64;
+        | RGFX_FEATURE_UNSHARED_QUEUES
+        | RGFX_FEATURE_SUBMIT_ROOM) as u64;
 
 /// A host that offers `features`, answers each `COMMAND_BUFFER` with its `CB_COMPLETE`
 /// (`RGFX_CB_OK`, GPU times 0) on the queue's completion ring, as [`QueueTestHost`] does, keeps
@@ -128,6 +129,7 @@ fn type_name(r#type: u32) -> String {
         RGFX_EVT_COMPLETE => "COMPLETE".into(),
         RGFX_EVT_DISPLAYS => "DISPLAYS".into(),
         RGFX_EVT_CB_COMPLETE => "CB_COMPLETE".into(),
+        RGFX_EVT_SUBMIT_ROOM => "SUBMIT_ROOM".into(),
         other => format!("{other:#x}"),
     }
 }
@@ -723,6 +725,77 @@ fn peer_wire2_traffic_is_the_same_on_a_host_offering_every_feature() {
         .collect();
     assert!(guest.trace.contains(&every));
     assert_eq!(trace, recorded);
+}
+
+/// Where the guest took `SUBMIT_ROOM`, a producer that set a submission ring's `producer_waiting`
+/// gets a header-only `SUBMIT_ROOM` (seqno 0) on the ring's completion ring after the host's next
+/// take of the ring, and the flag is cleared: on ring 0 ahead of the taken command's answer, and on
+/// a queue's ring ahead of the taken buffer's completion. A guest that did not take the bit gets
+/// none, and its flag is left as it set it.
+#[test]
+fn a_producer_waiting_for_room_gets_a_record_after_the_host_s_take() {
+    const CONTEXT: u32 = 7;
+    const QUEUE: u64 = ((CONTEXT as u64) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let room = u64::from(RGFX_FEATURE_SUBMIT_ROOM);
+    for taken in [true, false] {
+        let mut guest = FakeGuest::offered(EVERY_FEATURE);
+        let wanted = taken.then_some(room);
+        assert_eq!(guest.start_taking(wanted), wanted.unwrap_or(0));
+        guest.arm_control();
+        guest.grant_queue_rings(CONTEXT);
+        let mut queue = guest.create_queue(QUEUE, "queue");
+        fn waiting(guest: &FakeGuest, ring: u64) -> &std::sync::atomic::AtomicU32 {
+            guest.region().atomic_u32(ring + 0x10)
+        }
+        // Each record's type; a room record is its header alone, at seqno 0.
+        let types = |records: &[Vec<u8>]| -> Vec<u32> {
+            records
+                .iter()
+                .map(|r| {
+                    let (h, _) = RgfxMsgHeader::read_from_prefix(r).unwrap();
+                    if h.r#type == RGFX_EVT_SUBMIT_ROOM {
+                        assert_eq!((h.size, h.seqno), (16, 0));
+                    }
+                    h.r#type
+                })
+                .collect()
+        };
+        let expected = |answer: u32| {
+            if taken {
+                vec![RGFX_EVT_SUBMIT_ROOM, answer]
+            } else {
+                vec![answer]
+            }
+        };
+
+        waiting(&guest, RGFX_CONTROL_SUBMIT_OFFSET).store(1, Ordering::SeqCst);
+        let mut control = std::mem::replace(&mut guest.control, GuestRing::control());
+        guest.post(&mut control, vec![vblank(0)]);
+        let records = guest.answers(&mut control, expected(RGFX_EVT_COMPLETE).len());
+        guest.control = control;
+        assert_eq!(
+            types(&records),
+            expected(RGFX_EVT_COMPLETE),
+            "ring 0, taken {taken}"
+        );
+        assert_eq!(
+            waiting(&guest, RGFX_CONTROL_SUBMIT_OFFSET).load(Ordering::SeqCst),
+            u32::from(!taken)
+        );
+
+        waiting(&guest, QUEUE_SUBMIT).store(1, Ordering::SeqCst);
+        guest.post(&mut queue, vec![empty_command_buffer(QUEUE, 100)]);
+        let records = guest.answers(&mut queue, expected(RGFX_EVT_CB_COMPLETE).len());
+        assert_eq!(
+            types(&records),
+            expected(RGFX_EVT_CB_COMPLETE),
+            "a queue's, taken {taken}"
+        );
+        assert_eq!(
+            waiting(&guest, QUEUE_SUBMIT).load(Ordering::SeqCst),
+            u32::from(!taken)
+        );
+    }
 }
 
 /// A `DRIVER_FEATURES` write takes the bits written that the host offers and knows, each half on

@@ -137,7 +137,8 @@ pub const RGFX_FEATURE_MANAGED_AT_OFFSET: u32 = 1 << 14;
 /// before it waits. After each take that moves a submission ring's `consumer`, the host fences and
 /// reads the flag; where it reads 1, it stores 0 and posts an [`RGFX_EVT_SUBMIT_ROOM`] on the
 /// ring's completion ring: ring 0's for ring 0, the queue's for a queue's. Either the guest's look
-/// sees the take's room, or the host's read sees the flag.
+/// sees the take's room, or the host's read sees the flag. Every host offers it, the device
+/// carrying it out.
 pub const RGFX_FEATURE_SUBMIT_ROOM: u32 = 1 << 16;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.

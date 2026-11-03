@@ -724,7 +724,7 @@ only where no negotiation can carry it.
   and reads the flag, and where it reads 1 it stores 0 and posts a header-only
   `RGFX_EVT_SUBMIT_ROOM` (0x408) on the ring's completion ring, ring 0's or the
   queue's. The waiting producer looks again at that record: one interrupt after
-  the host's take, not at a sleep's end.
+  the host's take, not at a sleep's end. Every host offers it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

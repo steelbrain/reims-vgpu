@@ -4530,8 +4530,9 @@ fn a_failed_context_s_pipeline_creates_are_carried_out() {
 /// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
 /// a command buffer's ask for its submission (`CB_SUBMITTED`), orders command buffers over the
 /// IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
-/// (`INDIRECT_COMMAND_BUFFERS`) and makes the queues the kext asks unshared on the platform's
-/// unshared queue (`UNSHARED_QUEUES`)
+/// (`INDIRECT_COMMAND_BUFFERS`), makes the queues the kext asks unshared on the platform's
+/// unshared queue (`UNSHARED_QUEUES`), and tells a producer waiting for room on a full submission
+/// ring of the device's takes (`SUBMIT_ROOM`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -4567,6 +4568,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SURFACE_ORDER
             | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
             | RGFX_FEATURE_UNSHARED_QUEUES
+            | RGFX_FEATURE_SUBMIT_ROOM
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
 
@@ -4577,6 +4579,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SURFACE_ORDER
             | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
             | RGFX_FEATURE_UNSHARED_QUEUES
+            | RGFX_FEATURE_SUBMIT_ROOM
     );
 }
 

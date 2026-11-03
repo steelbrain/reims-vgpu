@@ -36,6 +36,7 @@ pub(crate) struct RingAt {
 /// The header fields' offsets, from `wire::RgfxRingHeader`.
 const PRODUCER: u64 = 0x00;
 const COMPLETED_SEQNO: u64 = 0x08;
+const PRODUCER_WAITING: u64 = 0x10;
 const CONSUMER: u64 = 0x40;
 const CONSUMER_IDLE: u64 = 0x80;
 const ARMED: u64 = 0xc0;
@@ -80,14 +81,17 @@ impl std::fmt::Display for Broken {
 }
 
 impl RingAt {
-    /// Writes the header of a ring nothing has passed through: both counts 0, `armed` 0, and
-    /// `consumer_idle` as given.
+    /// Writes the header of a ring nothing has passed through: both counts 0, `armed` and
+    /// `producer_waiting` 0, and `consumer_idle` as given.
     pub(crate) fn initialize(&self, region: &Region, consumer_idle: bool) {
         region
             .atomic_u64(self.header + PRODUCER)
             .store(0, Ordering::Release);
         region
             .atomic_u64(self.header + COMPLETED_SEQNO)
+            .store(0, Ordering::Release);
+        region
+            .atomic_u32(self.header + PRODUCER_WAITING)
             .store(0, Ordering::Release);
         region
             .atomic_u64(self.header + CONSUMER)
@@ -351,6 +355,16 @@ impl Consumer {
         pending
     }
 
+    /// After a take, where the guest took `SUBMIT_ROOM`: a full fence, then whether the guest's
+    /// producer waits for room (`producer_waiting` 1), the flag cleared. The guest stores the flag,
+    /// fences and looks for room once more, so either its look sees the take or this sees the
+    /// flag, and the caller posts the ring's `SUBMIT_ROOM` record.
+    pub(crate) fn room_wanted(&self, region: &Region) -> bool {
+        fence(Ordering::SeqCst);
+        let waiting = region.atomic_u32(self.at.header + PRODUCER_WAITING);
+        waiting.load(Ordering::SeqCst) == 1 && waiting.swap(0, Ordering::SeqCst) == 1
+    }
+
     /// The host woke: clears `consumer_idle`, so the guest rings no doorbell while it takes.
     pub(crate) fn awake(&self, region: &Region) {
         region
@@ -602,6 +616,30 @@ mod tests {
                 guest.count
             );
         }
+    }
+
+    /// A take's room check answers whether the guest's producer waits for room, once: it clears
+    /// the flag, so the next take's check is false until the guest sets it again; and a reset
+    /// clears it.
+    #[test]
+    fn a_take_s_room_check_answers_a_waiting_producer_once() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        let waiting = region.atomic_u32(PRODUCER_WAITING);
+        let mut guest = Guest { count: 0 };
+        guest.write(&region, &message(7, 1, 16));
+        consumer.next(&region).unwrap().unwrap();
+        assert!(!consumer.room_wanted(&region), "no producer waits");
+        waiting.store(1, Ordering::SeqCst);
+        guest.write(&region, &message(7, 2, 16));
+        consumer.next(&region).unwrap().unwrap();
+        assert!(consumer.room_wanted(&region), "the waiting producer");
+        assert_eq!(waiting.load(Ordering::SeqCst), 0, "the flag cleared");
+        assert!(!consumer.room_wanted(&region), "answered once");
+        waiting.store(1, Ordering::SeqCst);
+        consumer.reset(&region);
+        assert_eq!(waiting.load(Ordering::SeqCst), 0, "a reset clears it");
     }
 
     /// A walk reads what the guest published past the host's count, across the end and its pad,

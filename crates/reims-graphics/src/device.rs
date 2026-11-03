@@ -185,7 +185,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 14.
+/// `RGFX_FEATURE_*`, bits 0 to 8, 11 to 14 and 16.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -198,7 +198,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_ORDER
     | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
     | RGFX_FEATURE_UNSHARED_QUEUES
-    | RGFX_FEATURE_MANAGED_AT_OFFSET) as u64;
+    | RGFX_FEATURE_MANAGED_AT_OFFSET
+    | RGFX_FEATURE_SUBMIT_ROOM) as u64;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -1080,7 +1081,7 @@ impl Shared {
     fn take_messages(&self) {
         loop {
             self.tell_reset();
-            let (answer, epoch) = {
+            let (answer, epoch, room) = {
                 let mut submit = self.submit.lock();
                 if !self.started() || submit.broken || self.ending() {
                     return;
@@ -1090,6 +1091,9 @@ impl Shared {
                 }
                 let epoch = self.epoch.load(Ordering::Acquire);
                 let next = submit.consumer.next(&self.region);
+                // A guest post waiting for room, told with nothing held: after this take, or
+                // after the last, where the ring is empty.
+                let room = next.is_ok() && self.room_wanted(&submit.consumer);
                 if let Ok(Some(message)) = &next {
                     let through = submit.consumer.consumed();
                     submit.backlog.took(message, through);
@@ -1098,22 +1102,31 @@ impl Shared {
                     Ok(Some(message)) if control::is_unheld(&message) => {
                         let through = submit.consumer.consumed();
                         drop(submit);
+                        if room {
+                            self.post_room(epoch);
+                        }
                         let answer = control::unheld(self, &message, epoch);
                         // A reset meanwhile restarted the count; this message's is moot.
                         if self.epoch.load(Ordering::Acquire) == epoch {
                             self.control_done.store(through, Ordering::Release);
                             self.signal_control_moved();
                         }
-                        (answer, epoch)
+                        (answer, epoch, false)
                     }
                     Ok(Some(message)) => {
                         let answer = control::answer(self, &message);
                         self.control_done
                             .store(submit.consumer.consumed(), Ordering::Release);
                         self.signal_control_moved();
-                        (answer, epoch)
+                        (answer, epoch, room)
                     }
-                    Ok(None) => return,
+                    Ok(None) => {
+                        drop(submit);
+                        if room {
+                            self.post_room(epoch);
+                        }
+                        return;
+                    }
                     Err(broken) => {
                         log::error!(
                             target: "reims_graphics",
@@ -1125,10 +1138,26 @@ impl Shared {
                     }
                 }
             };
+            if room {
+                self.post_room(epoch);
+            }
             if let Some(answer) = answer {
                 self.post_waiting(&answer, epoch);
             }
         }
+    }
+
+    /// After a take of a submission ring: whether the guest took `SUBMIT_ROOM` and a producer
+    /// waits for room on it ([`Consumer::room_wanted`], which clears the flag).
+    fn room_wanted(&self, consumer: &Consumer) -> bool {
+        self.driver_features.load(Ordering::Acquire) & u64::from(RGFX_FEATURE_SUBMIT_ROOM) != 0
+            && consumer.room_wanted(&self.region)
+    }
+
+    /// Posts ring 0's `SUBMIT_ROOM` record on the control completion ring, for work begun at reset
+    /// count `epoch`: the guest's posts waiting for room on ring 0 look again.
+    fn post_room(&self, epoch: u64) {
+        self.post_waiting(&submit_room(), epoch);
     }
 
     /// Posts `message`, waiting for room ([`Room`]) while the device is not reset or ended.
@@ -1677,45 +1706,52 @@ impl Shared {
             rest();
         }
         loop {
-            let message = {
+            let (next, room) = {
                 let mut submit = queue.submit.lock();
                 if !self.started() || submit.broken || self.ending() || queue.ended() {
                     return;
                 }
                 let next = submit.consumer.next(&self.region);
+                // A commit waiting for room: after this take, a doorbell's thread's before it, or
+                // the last, where the ring is empty.
+                let room = next.is_ok() && self.room_wanted(&submit.consumer);
                 if let Ok(Some(message)) = &next {
                     queue.took(message.header.seqno);
                 }
-                match next {
-                    Ok(Some(message))
-                        if message.header.r#type == RGFX_CMD_COMMAND_BUFFER
-                            || message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION =>
-                    {
-                        message
-                    }
-                    Ok(Some(message)) => {
-                        // A queue's ring carries only its process's command buffers; every other
-                        // message rides ring 0, through the kext, which checks that its sender
-                        // owns the object it names. Refused here, and the ring goes on.
-                        log::warn!(
-                            target: "reims_graphics",
-                            "queue {:#x}'s submission ring carried a message of type {:#x} \
-                             (seqno {}), which it may not carry: refused",
-                            queue.obj_id, message.header.r#type, message.header.seqno
-                        );
-                        continue;
-                    }
-                    Ok(None) => return,
-                    Err(broken) => {
-                        log::error!(
-                            target: "reims_graphics",
-                            "queue {:#x}'s submission ring is broken ({broken}): it takes nothing \
-                             more until the device is reset", queue.obj_id
-                        );
-                        submit.broken = true;
-                        return;
-                    }
+                if let Err(broken) = &next {
+                    log::error!(
+                        target: "reims_graphics",
+                        "queue {:#x}'s submission ring is broken ({broken}): it takes nothing \
+                         more until the device is reset", queue.obj_id
+                    );
+                    submit.broken = true;
                 }
+                (next, room)
+            };
+            // Told with nothing held, on the queue's completion ring.
+            if room {
+                self.post_queue_waiting(queue, &submit_room(), queue.epoch);
+            }
+            let message = match next {
+                Ok(Some(message))
+                    if message.header.r#type == RGFX_CMD_COMMAND_BUFFER
+                        || message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION =>
+                {
+                    message
+                }
+                Ok(Some(message)) => {
+                    // A queue's ring carries only its process's command buffers; every other
+                    // message rides ring 0, through the kext, which checks that its sender owns
+                    // the object it names. Refused here, and the ring goes on.
+                    log::warn!(
+                        target: "reims_graphics",
+                        "queue {:#x}'s submission ring carried a message of type {:#x} \
+                         (seqno {}), which it may not carry: refused",
+                        queue.obj_id, message.header.r#type, message.header.seqno
+                    );
+                    continue;
+                }
+                Ok(None) | Err(_) => return,
             };
             // Order this command buffer after the creates its process posted before it. Creates
             // ride ring 0, whose sole consumer is the control thread; command buffers ride the
@@ -1937,6 +1973,11 @@ fn event_header(r#type: u32) -> RgfxMsgHeader {
         size: 0,
         seqno: 0,
     }
+}
+
+/// A `SUBMIT_ROOM` record: its header alone, `seqno` 0.
+fn submit_room() -> Vec<u8> {
+    sized(&event_header(RGFX_EVT_SUBMIT_ROOM))
 }
 
 /// The host's monotonic clock, in nanoseconds.
