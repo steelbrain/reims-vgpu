@@ -794,6 +794,19 @@ the guest moves the scanout or changes its size, so no copy is made on the way
 to the window, and no other page of the region is pinned for it. While vblank is
 enabled, the host sends `VBLANK` at each refresh of the window's screen.
 
+**Refresh times.** The host answers a `PRESENT_SURFACE` in the refresh that
+shows its surface, right after that refresh's `VBLANK`. The kext maps each
+`VBLANK`'s host time into the guest's `mach_absolute_time` by the clocks'
+offset with the shortest delivery (`guest/kext/src/RgfxVblankClock.hpp`). A
+display pipe transaction completes with the time of the refresh it was
+answered in (or the answer's own time where no `VBLANK` came within a period),
+and a display pipe VBL request is answered once, at the next refresh, with that
+refresh's time and the next one's. The bundle presents a drawable when its
+command buffer is scheduled, as Metal does (`guest/bundle/src/RgfxCommandObjects.mm`);
+what an app then sees of it, its presented handlers, `presentedTime` and
+`nextDrawable`'s pacing, `guest/bundle/tools/present_probe.m` measures on a
+guest and on a Mac alike.
+
 **Boot display.** The device's option ROM gives firmware a GOP framebuffer in
 BAR2, and the kext takes the display over when it starts.
 

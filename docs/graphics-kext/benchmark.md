@@ -120,5 +120,8 @@ post-ramp repetitions were few: ours 1748 fps (13), paravirt 1991 fps (6).
     `PRESENT_SURFACE` in the 20 s window. So ours gives apps neither present feedback nor
     display-rate back pressure, and its displayed rate is unmeasured here. That is a lane bug,
     handed on to be fixed.
+  - Fixed since: the bundle's `presentDrawable:` presented nothing. With the fix, `onscreen -t
+    10` on msi presents 120.0 frames a second, 1201 presented and 0 dropped, frame p50 8.33 ms,
+    with QEMU at 40% and SM at 41% (measured 2026-11-03).
   - Paravirt and both real Macs report `presentedTime` and throttle to what is displayed:
     paravirt 848 presented / 0 dropped; Intel 630 6.7 of 6.8; M3 119.8 at 120 Hz.
