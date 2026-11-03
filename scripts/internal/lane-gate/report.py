@@ -277,7 +277,7 @@ class Run:
             parts = line.split(None, 1)
             if len(parts) == 2:
                 kv[parts[0]] = parts[1].strip()
-        for k in ("boot_ssh_s", "desktop_s", "hold_s", "lock_wait_s", "load_start", "load_end", "load_duty"):
+        for k in ("boot_ssh_s", "desktop_s", "hold_s", "lock_wait_s", "load_start", "load_end", "load_duty", "host_quiet"):
             if re.fullmatch(r"[0-9]+(\.[0-9]*)?", kv.get(k, "")):
                 self.lmetric("host." + k, float(kv[k]))
         fatal = int(kv.get("fatal_lines", "-1") or -1) + max(0, int(kv.get("serial_fatal_lines", "0") or 0))
@@ -380,14 +380,28 @@ def median_baseline(bdir):
     return ref
 
 
+def bench_host(metrics):
+    """The lane host's state beside the bench boot: whether it was quiet, and its load average."""
+    if not any(k.startswith("host.") for k in metrics):
+        return ""
+    q = metrics.get("host.host_quiet")
+    quiet = "HOST_QUIET" if q == 1 else "HOST_NOT_QUIET" if q == 0 else "host quiet not stated"
+    load = (f", load average {metrics['host.load_start']:g} to {metrics['host.load_end']:g}"
+            if "host.load_start" in metrics and "host.load_end" in metrics else "")
+    return f"; bench host: {quiet}{load}"
+
+
 def noise_from(bdirs_root):
-    """Per gated metric: the largest relative distance from its commit's median seen in repeated runs."""
+    """Per gated metric: the largest relative distance from its commit's median seen in repeated runs,
+    from the bench samples taken in host quiet only (host.host_quiet 1: no build on the lane host beside
+    QEMU), as other work's CPU and memory use moves the Vulkan platform's numbers far past noise."""
     dev = {}
     for sha in sorted(os.listdir(bdirs_root)):
         rd = os.path.join(bdirs_root, sha, "runs")
-        if not os.path.isdir(rd):
+        if sha == "LAST" or not os.path.isdir(rd):
             continue
         runs = [json.loads(read(os.path.join(rd, f))) for f in sorted(os.listdir(rd)) if f.endswith(".json")]
+        runs = [r for r in runs if r["metrics"].get("host.host_quiet") == 1]
         if len(runs) < 2:
             continue
         for n in set().union(*(r["metrics"] for r in runs)):
@@ -576,7 +590,8 @@ def write_report(run, base, noise, history=None):
            f"run {m.get('runid', '?')}, {m.get('wall_s', '?')} s wall; baseline "
            + (f"{base['meta'].get('sha', '?')[:12]} ({base['samples']} samples)" if base else "none")
            + (f"; a control: the host build {m['host_build']} against this commit's guest" if m.get("host_build") else "")
-           + (f"; beside a fixed GPU load (gpuload, duty {m['load']})" if m.get("load") else ""),
+           + (f"; beside a fixed GPU load (gpuload, duty {m['load']})" if m.get("load") else "")
+           + bench_host(cur["metrics"]),
            "items: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
     for title, names in (("failed:", failed), ("bench (not gating):", bench_issues)):
         if names:

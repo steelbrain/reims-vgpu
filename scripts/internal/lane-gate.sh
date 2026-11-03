@@ -387,7 +387,8 @@ do_stage() {
 do_msi_build() {
   local qc
   qc=$(cat "$ART/qemu-commit")
-  msi "bash '$MR/bin/msi-build.sh' '$MSI_GATE' '$MSI_GATE/tree' '$MSI_GATE/stage' '$qc' '$MSI_QEMU_SUBPROJECTS'" | tee "$RES/msi-build.txt"
+  # Every build on the lane host waits for host quiet (build-quiet.sh): never beside a measured boot.
+  msi "bash '$MSI_RGK_RUN/build-quiet.sh' -- bash '$MR/bin/msi-build.sh' '$MSI_GATE' '$MSI_GATE/tree' '$MSI_GATE/stage' '$qc' '$MSI_QEMU_SUBPROJECTS'" | tee "$RES/msi-build.txt"
   grep -q MSI_BUILD_OK "$RES/msi-build.txt"
   local q r
   q=$(awk '$1 == "BUILT" && $2 == "qemu" {print $3}' "$RES/msi-build.txt")

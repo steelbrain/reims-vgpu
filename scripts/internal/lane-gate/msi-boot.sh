@@ -14,7 +14,9 @@
 #   desktop.png   the guest's screenshot of its screen after its run, at a quarter of its size
 #   host.txt      "KEY VALUE" lines: the SSH port, the wait for the GPU, boot and desktop times
 #                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
-#                 its commonest colour (or desktop_capture none), how long the hold was
+#                 its commonest colour (or desktop_capture none), how long the hold was, the
+#                 host's load average beside the measurements, and host_quiet (a measured boot's:
+#                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
 #   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
@@ -70,6 +72,12 @@ finish() {
   rm -f "$R/watchdog.pid"
   if [[ -f $B/launch.log ]]; then
     kv fatal_lines "$(grep -c 'reims-vgpu: fatal' "$B/launch.log")"
+    # A measured boot's hold of host quiet: HOST_QUIET where no build ran beside QEMU, HOST_NOT_QUIET
+    # where the wait for running builds ran out (rgk-boot2.sh); none for a shared boot.
+    case $(grep -m1 -o -E 'HOST_(NOT_)?QUIET' "$B/launch.log") in
+    HOST_QUIET) kv host_quiet 1 ;;
+    HOST_NOT_QUIET) kv host_quiet 0 ;;
+    esac
     grep -E 'the display shows IOSurface|reims-vgpu: fatal|panic| ERROR | WARN ' "$B/launch.log" > "$R/host-events.log"
     gzip -c "$B/launch.log" > "$R/launch.log.gz"
     cp -f "$B/serial.log" "$R/serial.log" 2> /dev/null
@@ -91,9 +99,10 @@ log "boot $TAG ($([[ ${EXCLUSIVE:-1} == 1 ]] && echo exclusive || echo shared)):
 GL=
 if [[ -n ${LOAD:-} ]]; then
   GL=$R/gpuload
-  ( cd "$R" && glslc -mfmt=c "$(dirname "$0")/gpuload.comp" -o gpuload.spv.inc &&
-    cc -O2 -Wall -Wextra -Werror -I"$R" "$(dirname "$0")/gpuload.c" -lvulkan -o gpuload ) >> "$R/boot.log" 2>&1 ||
-    { log "BOOT_FAIL missing gpuload (its build failed)"; exit 2; }
+  # A build on the host waits for host quiet (build-quiet.sh), never beside a measured boot.
+  ( cd "$R" && bash "$RGK_RUN/build-quiet.sh" -- glslc -mfmt=c "$(dirname "$0")/gpuload.comp" -o gpuload.spv.inc &&
+    bash "$RGK_RUN/build-quiet.sh" -- cc -O2 -Wall -Wextra -Werror -I"$R" "$(dirname "$0")/gpuload.c" -lvulkan -o gpuload ) \
+    >> "$R/boot.log" 2>&1 || { log "BOOT_FAIL missing gpuload (its build failed)"; exit 2; }
 fi
 # The host GPUs' hardware decoders, as Vulkan Video lists each GPU's decode profiles (a query: no
 # GPU work): "GPU-NAME<TAB>gpu<TAB>-" for each GPU, then "GPU-NAME<TAB>CODEC<TAB>PROFILE" for each
