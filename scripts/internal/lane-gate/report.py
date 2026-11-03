@@ -495,9 +495,12 @@ class Run:
             hits = [l.split() for l in read(os.path.join(r, "kext-stalls.txt")).splitlines() if len(l.split()) == 2]
             early = int(kv.get("block_stalls_early", "0") or 0)
             at = ", ".join(f"{float(h[1]):+.1f} s" for h in hits[:20]) + (" ..." if len(hits) > 20 else "")
+            first = kv.get("kring_first_s", "")
+            seen = (f"; the kext's lines read from {float(first):.0f} s of the guest's uptime on"
+                    if re.fullmatch(r"[0-9.]+", first) else "")
             self.litem("guest.block-cache-stalls", "FAIL" if early else "PASS",
                        f"{len(hits)} 'its previous block is cached still' stalls" + (f", {early} in the 60 s after the desktop came up" if early else "")
-                       + (f"; at {at} from the desktop" if hits else ""))
+                       + (f"; at {at} from the desktop" if hits else "") + seen)
             if kv["block_stalls"].isdigit():
                 self.lmetric("host.block_stalls", float(kv["block_stalls"]))
         # The boot capture (msi-boot.sh's CAPTURE): what it kept, on the lane host.

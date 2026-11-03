@@ -20,6 +20,9 @@
 #                 host's load average beside the measurements, and host_quiet (a measured boot's:
 #                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
+#   kernel-rgfx.log, kring.raw, kring-clock.txt   the kext's lines from the guest kernel's ring
+#                 (it logs to no log stream), the guest's boot time and clock against the host's;
+#                 kext-stalls.txt its texture-create stalls on the host's clock (below)
 #   xid.txt       the kernel's NVRM Xid lines (the NVIDIA driver's GPU errors) from this script's
 #                 start to its end, as msi-xid.sh prints them; host.txt's xid_lines counts them
 #                 (unread where the kernel log could not be read), xid_own those of this boot's QEMU
@@ -126,6 +129,7 @@ stop_load() {
 }
 finish() {
   local qp=$P
+  [[ -n ${KRINGPID:-} ]] && kill "$KRINGPID" 2> /dev/null
   [[ -d $R/capture ]] && touch "$R/capture/stop"
   stop_clocks
   stop_load
@@ -303,6 +307,35 @@ desktop || { log "BOOT_FAIL no desktop (WindowServer, Dock, Finder) in 3 min"; e
 [[ -n $T_QEMU ]] && kv desktop_s "$(sub "$(date +%s.%N | cut -c1-14)" "$T_QEMU")"
 log "desktop up"
 T_DESK=$(date +%s)
+# The kext's lines: its IOLog lines reach only the kernel's ring (dmesg, 128 KiB, which a busy
+# desktop's other lines fill in a minute or two), no log stream. From the desktop on, the ring's
+# Rgfx, RGFX and ReimsGraphics lines are taken every 5 s into kring.raw ("[UPTIME]: LINE"), in the
+# correctness boot and in a captured one (the bench boot's at the desktop and at its end only, so
+# no read lands among its measurements); kernel-rgfx.log holds them once each, in order. The guest's boot
+# time and clock against the host's (kring-clock.txt: "BOOTTIME HOST_MINUS_GUEST") put each line
+# on the host's clock.
+kring() {
+  G "echo '$GUEST_PASS' | sudo -S -p '' dmesg" 2> /dev/null |
+    perl -ne 'while (/\[ *(\d+\.\d+)\]: ((?:R[Gg][Ff][Xx]|ReimsGraphics).*?)(?=\[ *\d+\.\d+\]: |Sandbox: |$)/g) { print "[$1]: $2\n" }' >> "$R/kring.raw"
+}
+kring_log() {  # kring.raw's lines once each, by uptime
+  sort -u "$R/kring.raw" 2> /dev/null | sort -t']' -k1.2,1n > "$R/kernel-rgfx.log"
+}
+h0=$(date +%s.%N | cut -c1-14)
+g=$(G "perl -MTime::HiRes=time -e 'printf \"%.3f\\n\", time'; sysctl -n kern.boottime" 2> /dev/null)
+h1=$(date +%s.%N | cut -c1-14)
+gt=$(echo "$g" | sed -n 1p)
+bt=$(echo "$g" | sed -n 's/.*sec = \([0-9]*\), usec = \([0-9]*\).*/\1 \2/p' | head -1 | awk '{ printf "%d.%06d", $1, $2 }')
+[[ $gt =~ ^[0-9.]+$ && -n $bt ]] &&
+  echo "$bt $(awk -v a="$h0" -v b="$h1" -v g="$gt" 'BEGIN { printf "%.3f", (a + b) / 2 - g }')" > "$R/kring-clock.txt"
+: > "$R/kring.raw"
+kring
+KRINGPID=
+if [[ ${EXCLUSIVE:-0} != 1 && -z ${PROBES:-} ]] || [[ ${CAPTURE:-0} == 1 ]]; then
+  ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
+    while kill -0 "$P" 2> /dev/null; do sleep 5; kring; done ) > /dev/null 2>&1 &
+  KRINGPID=$!
+fi
 # The boot's timeline from QEMU's first line: the host's first present of a guest frame, and from
 # the guest (its clock set against the host's over SSH, to a second) the kernel's boot and the
 # start of WindowServer, loginwindow and Dock (the user's login).
@@ -356,8 +389,10 @@ for f in ~/Desktop/*.png; do
 done
 SHOTS
   Gcp "$GUEST_USER@127.0.0.1:lane-gate-shots" "$R/capture/shots" 2> /dev/null && G 'rm -rf ~/lane-gate-shots' 2> /dev/null
-  G "echo '$GUEST_PASS' | sudo -S -p '' perl -e 'alarm 180; exec @ARGV' log show --last boot --style compact --predicate 'senderImagePath CONTAINS \"ReimsGraphics\"'" \
-    > "$R/capture/kext.log" 2> /dev/null
+  kring
+  kring_log
+  cp "$R/kernel-rgfx.log" "$R/capture/kext.log"
+  cp "$R/kring-clock.txt" "$R/capture/" 2> /dev/null
   line=$(grep -m1 -oE 'scanout [0-9]+x[0-9]+ at [0-9.]+ Hz, stride [0-9]+' "$R/capture/kext.log")
   mode=${CAPTURE_MODE:-3840x2400}
   stride=$(( (${mode%x*} * 4 + 255) / 256 * 256 ))
@@ -524,28 +559,21 @@ stop_clocks
 display_state display_end
 reaper_lines
 
-# The kext's and bundle's texture-create stalls over the boot ("its previous block is cached still,
-# its release unanswered: it is not cached", about 2 s each): kext-stalls.txt "HOST_EPOCH
-# S_AFTER_DESKTOP" a hit, from the guest's log (its times set against the host's clock over SSH).
-# block_stalls counts them, block_stalls_early those in the 60 s after the desktop came up.
-h0=$(date +%s.%N | cut -c1-14)
-gt=$(G "perl -MTime::HiRes=time -e 'printf \"%.3f\\n\", time'" 2> /dev/null)
-h1=$(date +%s.%N | cut -c1-14)
-if [[ $gt =~ ^[0-9.]+$ ]] && G "echo '$GUEST_PASS' | sudo -S -p '' perl -e 'alarm 120; exec @ARGV' log show --last boot --style ndjson \
-    --predicate 'senderImagePath CONTAINS \"ReimsGraphics\" AND eventMessage CONTAINS \"its previous block is cached still\"'" \
-    > "$R/kext-stalls.ndjson" 2> /dev/null; then
-  python3 -I - "$R/kext-stalls.ndjson" "$(awk -v a="$h0" -v b="$h1" -v g="$gt" 'BEGIN { printf "%.3f", (a + b) / 2 - g }')" \
-    "${T_DESK:-0}" > "$R/kext-stalls.txt" << 'PY'
-import datetime, json, sys
-off, desk = float(sys.argv[2]), float(sys.argv[3])
-for line in open(sys.argv[1], errors="replace"):
-    try:
-        e = json.loads(line)
-        t = datetime.datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z").timestamp() + off
-    except (ValueError, KeyError):
-        continue
-    print(f"{t:.3f} {t - desk:.1f}")
-PY
+# The kext's texture-create stalls ("RgfxAccelerator: IOSurface N: its previous block is cached
+# still, its release unanswered: it is not cached", about 2 s each), from its lines in the ring
+# (kernel-rgfx.log): kext-stalls.txt "HOST_EPOCH S_AFTER_DESKTOP" a hit, the uptime set on the
+# host's clock (kring-clock.txt). block_stalls counts them, block_stalls_early those in the 60 s
+# after the desktop came up; kring_first_s says from when the ring's lines reach (its first line's
+# uptime: a boot's earlier lines had left the ring by its first read).
+[[ -n ${KRINGPID:-} ]] && { kill "$KRINGPID" 2> /dev/null; KRINGPID=; }
+kring
+kring_log
+if [[ -s $R/kring-clock.txt ]]; then
+  read -r bt off < "$R/kring-clock.txt"
+  sed -n 's/^\[\([0-9.]*\)\]: RgfxAccelerator: IOSurface [0-9]*: its previous block is cached still.*/\1/p' "$R/kernel-rgfx.log" |
+    awk -v bt="$bt" -v off="$off" -v d="${T_DESK:-0}" '{ t = bt + $1 + off; printf "%.3f %.1f\n", t, t - d }' > "$R/kext-stalls.txt"
+  kv kring_lines "$(grep -c . "$R/kernel-rgfx.log")"
+  kv kring_first_s "$(sed -n '1s/^\[\([0-9.]*\)\].*/\1/p' "$R/kernel-rgfx.log")"
   kv block_stalls "$(grep -c . "$R/kext-stalls.txt")"
   kv block_stalls_early "$(awk '$2 >= 0 && $2 <= 60' "$R/kext-stalls.txt" | grep -c .)"
   [[ -d $R/capture ]] && cp "$R/kext-stalls.txt" "$R/capture/"
