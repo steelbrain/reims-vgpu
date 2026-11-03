@@ -366,6 +366,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable IOSurfaceRef)iosurface;
 - (nullable id)addressRanges;
 @end
+// measured: macOS 27 and 26.7.1 Metal.framework: MTLTextureDescriptor's private
+// `framebufferOnly` (`B16@0:8` on arm64, `c16@0:8` on x86-64; NO in a new descriptor), which a
+// CAMetalLayer sets on its drawables' descriptors from its own framebufferOnly. Metal's textures
+// answer it as isFramebufferOnly, and so do their views (M3 Max and AMD 5300M).
+@protocol RgfxMetalTextureDescriptor <NSObject>
+- (BOOL)framebufferOnly;
+@end
 NS_ASSUME_NONNULL_END
 
 #endif // RGFX_METAL_PRIVATE_H_

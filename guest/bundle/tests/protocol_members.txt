@@ -1164,7 +1164,7 @@ height implemented
 iosurface implemented
 iosurfacePlane implemented
 isAliasable implemented
-isFramebufferOnly gap aud-tests-03: answers NO for every texture, a CAMetalLayer drawable's too; Metal's drawable textures answer the layer's framebufferOnly, YES by default (measured: M3 Max, AMD 5300M, Intel 630)
+isFramebufferOnly implemented
 isShareable metal the device makes no shareable texture (newSharedTextureWithDescriptor: and its handles are RGFX_UNSUPPORTED)
 isSparse metal %no-sparse
 makeAliasable implemented

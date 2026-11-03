@@ -6766,6 +6766,42 @@ void test_heap_outlives_its_resources()
 	CHECK(nextDestroyed(fx.ring) == heapId && ringEmpty(fx.ring));
 }
 
+// A texture answers isFramebufferOnly from its descriptor's private framebufferOnly, which a
+// CAMetalLayer sets for its drawables, and its views answer their texture's: NO unless set, as
+// Metal's (measured on the M3 Max and the AMD 5300M).
+void test_texture_framebuffer_only()
+{
+	Fixture fx;
+	@autoreleasepool {
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		desc.usage = MTLTextureUsageRenderTarget;
+		desc.storageMode = MTLStorageModePrivate;
+		RgfxTexture *plain = [RgfxTexture textureWithDescriptor:desc
+		                                                   heap:RGFX_OBJ_NONE
+		                                             heapOffset:0
+		                                                 device:nil
+		                                             serializer:&fx.ser];
+		CHECK(plain != nil && !plain.isFramebufferOnly);
+		SEL set = @selector(setFramebufferOnly:);
+		CHECK([desc respondsToSelector:set]);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(desc, set, YES);
+		RgfxTexture *drawable = [RgfxTexture textureWithDescriptor:desc
+		                                                      heap:RGFX_OBJ_NONE
+		                                                heapOffset:0
+		                                                    device:nil
+		                                                serializer:&fx.ser];
+		CHECK(drawable != nil && drawable.isFramebufferOnly);
+		id<MTLTexture> view = [drawable newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		CHECK(view != nil && view.isFramebufferOnly);
+		CHECK(![plain newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB].isFramebufferOnly);
+		drainRing(fx.ring);
+	}
+}
+
 // A texture's views (RGFX_CMD_TEXTURE_VIEW): each form posts its view of the texture with the
 // fields it names, and the view answers its own shape and its texture's memory, as Metal's do
 // (measured on the M3 Max under macOS 27.0.1). A view Metal makes none of, or asserts at,
@@ -9408,6 +9444,7 @@ int main(int argc, char **argv)
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_views();
+		test_texture_framebuffer_only();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();
 		test_sampler_routing();

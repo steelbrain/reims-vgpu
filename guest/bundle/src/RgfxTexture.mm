@@ -526,7 +526,8 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
 	// (rgfxTakeDescriptor:): Metal's defaults until then.
 	BOOL _allowGPUOptimizedContents;
 	MTLTextureCompressionType _compressionType;
-	uint64_t _number; // uniqueIdentifier
+	BOOL _framebufferOnly; // the descriptor's private framebufferOnly (RgfxMetalPrivate.h)
+	uint64_t _number;      // uniqueIdentifier
 }
 
 namespace {
@@ -768,6 +769,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	}
 	_allowGPUOptimizedContents = descriptor.allowGPUOptimizedContents;
 	_compressionType = descriptor.compressionType;
+	_framebufferOnly = [descriptor respondsToSelector:@selector(framebufferOnly)] &&
+	                   [(id<RgfxMetalTextureDescriptor>)descriptor framebufferOnly];
 }
 
 - (void)dealloc
@@ -1029,6 +1032,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		// The view's storage is its texture's, and so are its layout's choices.
 		view->_allowGPUOptimizedContents = _allowGPUOptimizedContents;
 		view->_compressionType = _compressionType;
+		view->_framebufferOnly = _framebufferOnly;
 	}
 	return view;
 }
@@ -1422,9 +1426,11 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	return _parent != nil ? _parent.iosurfacePlane : 0;
 }
 
+// A CAMetalLayer's drawable answers the layer's framebufferOnly, which the layer sets on the
+// texture's descriptor; any other texture NO.
 - (BOOL)isFramebufferOnly
 {
-	return NO;
+	return _framebufferOnly;
 }
 
 // --- the CPU's copies of a texture with no CPU copy of its own ----------------------
