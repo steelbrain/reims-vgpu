@@ -329,8 +329,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(())
     }
 
-    /// One command's slot, its bits `masks` taken: the range reset, then each field's record
-    /// carried out on its command ([`slot_fields`]), each refused alone.
+    /// One command's slot, its bits `masks` taken: the range reset, then each field carried out
+    /// on its command ([`slot_fields`]) as its record would be, each refused alone.
     #[allow(clippy::too_many_arguments)] // the slot and what its run says of it
     fn slot(
         &self,
@@ -352,21 +352,97 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if kind == RGFX_ICB_SLOTS_RENDER {
             match refusing(|| icb.render_command(index)) {
-                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |op, body| {
-                    tally.count(obj, index, refusing(|| self.render_record(&c, op, body)));
+                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |field| {
+                    tally.count(obj, index, refusing(|| self.render_field(&c, field)));
                 }),
                 Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
                 Err(raise) => tally.count(obj, index, Err(raise)),
             }
         } else {
             match refusing(|| icb.compute_command(index)) {
-                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |op, body| {
-                    tally.count(obj, index, refusing(|| self.compute_record(&c, op, body)));
+                Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |field| {
+                    tally.count(obj, index, refusing(|| self.compute_field(&c, field)));
                 }),
                 Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
                 Err(raise) => tally.count(obj, index, Err(raise)),
             }
         }
+    }
+
+    /// A render slot's `field` on its command: a binding or the pipeline state sent as its record
+    /// would send it, with no record made between, and the rest by its record.
+    fn render_field(
+        &self,
+        c: &P::IndirectRenderCommand,
+        field: Field<'_>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let cmd = match field {
+            Field::Record(op, body) => return self.render_record(c, op, body),
+            Field::Pipeline(obj_id) => IcbRenderCmd::SetRenderPipelineState {
+                pipeline_state: self.get_render_pipeline(obj_id)?,
+            },
+            Field::Binding(index, s, strided) => {
+                let buffer = self.get_buffer(s.obj_id)?;
+                match strided {
+                    true => IcbRenderCmd::SetVertexBufferAttributeStride {
+                        buffer,
+                        offset: s.offset,
+                        stride: s.stride,
+                        index: index.into(),
+                    },
+                    false => IcbRenderCmd::SetVertexBuffer {
+                        buffer,
+                        offset: s.offset,
+                        index: index.into(),
+                    },
+                }
+            }
+            Field::Second(index, s) => IcbRenderCmd::SetFragmentBuffer {
+                buffer: self.get_buffer(s.obj_id)?,
+                offset: s.offset,
+                index: index.into(),
+            },
+            Field::Length(..) => return Ok(Err(DecodeError::UnknownCommand)),
+        };
+        c.encode(cmd)?;
+        Ok(Ok(()))
+    }
+
+    /// A compute slot's `field` on its command, as [`render_field`](Self::render_field) does.
+    fn compute_field(
+        &self,
+        c: &P::IndirectComputeCommand,
+        field: Field<'_>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let cmd = match field {
+            Field::Record(op, body) => return self.compute_record(c, op, body),
+            Field::Pipeline(obj_id) => IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: self.get_compute_pipeline(obj_id)?,
+            },
+            Field::Binding(index, s, strided) => {
+                let buffer = self.get_buffer(s.obj_id)?;
+                match strided {
+                    true => IcbComputeCmd::SetKernelBufferAttributeStride {
+                        buffer,
+                        offset: s.offset,
+                        stride: s.stride,
+                        index: index.into(),
+                    },
+                    false => IcbComputeCmd::SetKernelBuffer {
+                        buffer,
+                        offset: s.offset,
+                        index: index.into(),
+                    },
+                }
+            }
+            Field::Length(index, length) => IcbComputeCmd::SetThreadgroupMemoryLength {
+                length: length.into(),
+                index: index.into(),
+            },
+            Field::Second(..) => return Ok(Err(DecodeError::UnknownCommand)),
+        };
+        c.encode(cmd)?;
+        Ok(Ok(()))
     }
 
     /// One record of an `ICB_WRITE` on `icb` of `size` commands, its command taken from
@@ -658,17 +734,34 @@ fn word(slot: &[u8], k: usize) -> u64 {
     u64::read_from_prefix(slot.get(k * 8..).unwrap_or_default()).map_or(0, |(w, _)| w)
 }
 
-/// Each field a slot's bits `masks` name, as its record's op and body, to `record`, in a fixed
-/// order: the command's reset, its pipeline, its bindings of the first kind by index, of the
-/// second, the stage-in region and the imageblock (compute), the draw or the dispatch, and the
-/// barrier. A bit the slot's kind does not hold, or an action whose op is not one of the kind's
-/// draws or dispatches, is op 0, which no record is: the record refuses it.
+/// A field of a slot, as [`slot_fields`] hands it on: a record's op and body, or a binding or
+/// pipeline state taken from the slot as it lies there.
+enum Field<'s> {
+    /// A field its record carries out: the reset, the stage-in region, the imageblock, the
+    /// action and the barrier, and op 0 for a bit the slot's kind does not hold.
+    Record(u16, &'s [u8]),
+    /// The pipeline state.
+    Pipeline(u64),
+    /// A binding of the first kind (a vertex or kernel buffer) at its index, and whether it was
+    /// set with its attribute stride.
+    Binding(u32, RgfxIcbSlotBuffer, bool),
+    /// A fragment buffer at its index.
+    Second(u32, RgfxIcbSlotBuffer),
+    /// A threadgroup memory length at its index.
+    Length(u32, u32),
+}
+
+/// Each field a slot's bits `masks` name to `field`, in a fixed order: the command's reset, its
+/// pipeline, its bindings of the first kind by index, of the second, the stage-in region and the
+/// imageblock (compute), the draw or the dispatch, and the barrier. A bit the slot's kind does
+/// not hold, or an action whose op is not one of the kind's draws or dispatches, is op 0, which
+/// no record is: the record refuses it.
 fn slot_fields(
     kind: u16,
     slot: &[u8],
     (a, b): (u32, u32),
     (mask, mask_b): (u64, u64),
-    mut record: impl FnMut(u16, &[u8]),
+    mut field: impl FnMut(Field<'_>),
 ) {
     let render = kind == RGFX_ICB_SLOTS_RENDER;
     let fixed = if render {
@@ -686,117 +779,91 @@ fn slot_fields(
         known |= RGFX_ICB_SLOT_STAGE_IN | RGFX_ICB_SLOT_IMAGEBLOCK;
     }
     if mask & !known != 0 || mask_b & !bits(b) != 0 {
-        record(0, &[]);
+        field(Field::Record(0, &[]));
     }
     let binding = |i: u32| {
         let at = fixed + i as usize * size_of::<RgfxIcbSlotBuffer>();
         RgfxIcbSlotBuffer::read_from_prefix(slot.get(at..).unwrap_or_default())
             .map_or_else(|_| Default::default(), |(s, _)| s)
     };
-    let buffer_ops =
-        |strided: u32, i: u32, plain: u16, with_stride: u16, record: &mut dyn FnMut(u16, &[u8])| {
-            let s = binding(i);
-            if strided & (1 << i) != 0 {
-                let body = RgfxIcbBufferStride {
-                    obj_id: s.obj_id,
-                    offset: s.offset,
-                    stride: s.stride,
-                    index: i,
-                    reserved_1c: 0,
-                };
-                record(with_stride, body.as_bytes());
-            } else {
-                let body = RgfxIcbBuffer {
-                    obj_id: s.obj_id,
-                    offset: s.offset,
-                    index: i,
-                    reserved_14: 0,
-                };
-                record(plain, body.as_bytes());
-            }
-        };
     let set = |i: u32| mask & (RGFX_ICB_SLOT_BUFFER_0 << i) != 0;
     if render {
         let Ok((s, _)) = RgfxIcbRenderSlot::read_from_prefix(slot) else {
             return;
         };
         if mask & RGFX_ICB_SLOT_RESET != 0 {
-            record(RGFX_ICB_OP_RENDER_RESET, &[]);
+            field(Field::Record(RGFX_ICB_OP_RENDER_RESET, &[]));
         }
         if mask & RGFX_ICB_SLOT_PIPELINE != 0 {
-            record(RGFX_ICB_OP_RENDER_PIPELINE, s.pipeline.as_bytes());
+            field(Field::Pipeline(s.pipeline));
         }
         for i in (0..a).filter(|&i| set(i)) {
-            let (plain, strided) = (RGFX_ICB_OP_VERTEX_BUFFER, RGFX_ICB_OP_VERTEX_BUFFER_STRIDE);
-            buffer_ops(s.strided, i, plain, strided, &mut record);
+            field(Field::Binding(i, binding(i), s.strided & (1 << i) != 0));
         }
         for j in (0..b).filter(|&j| mask_b & (1 << j) != 0) {
-            let f = binding(a + j);
-            let body = RgfxIcbBuffer {
-                obj_id: f.obj_id,
-                offset: f.offset,
-                index: j,
-                reserved_14: 0,
-            };
-            record(RGFX_ICB_OP_FRAGMENT_BUFFER, body.as_bytes());
+            field(Field::Second(j, binding(a + j)));
         }
         if mask & RGFX_ICB_SLOT_ACTION != 0 {
             let draws = RGFX_ICB_OP_DRAW..=RGFX_ICB_OP_DRAW_INDEXED_PATCHES;
             let op = if draws.contains(&s.op) { s.op } else { 0 };
-            record(op, s.action.as_bytes());
+            field(Field::Record(op, s.action.as_bytes()));
         }
         if mask & RGFX_ICB_SLOT_BARRIER != 0 {
-            record(
+            field(Field::Record(
                 if s.barrier != 0 {
                     RGFX_ICB_OP_RENDER_SET_BARRIER
                 } else {
                     RGFX_ICB_OP_RENDER_CLEAR_BARRIER
                 },
                 &[],
-            );
+            ));
         }
     } else {
         let Ok((s, _)) = RgfxIcbComputeSlot::read_from_prefix(slot) else {
             return;
         };
         if mask & RGFX_ICB_SLOT_RESET != 0 {
-            record(RGFX_ICB_OP_COMPUTE_RESET, &[]);
+            field(Field::Record(RGFX_ICB_OP_COMPUTE_RESET, &[]));
         }
         if mask & RGFX_ICB_SLOT_PIPELINE != 0 {
-            record(RGFX_ICB_OP_COMPUTE_PIPELINE, s.pipeline.as_bytes());
+            field(Field::Pipeline(s.pipeline));
         }
         for i in (0..a).filter(|&i| set(i)) {
-            let (plain, strided) = (RGFX_ICB_OP_KERNEL_BUFFER, RGFX_ICB_OP_KERNEL_BUFFER_STRIDE);
-            buffer_ops(s.strided, i, plain, strided, &mut record);
+            field(Field::Binding(i, binding(i), s.strided & (1 << i) != 0));
         }
         let lengths = fixed + a as usize * size_of::<RgfxIcbSlotBuffer>();
         for j in (0..b).filter(|&j| mask_b & (1 << j) != 0) {
             let at = lengths + j as usize * 4;
             let length =
                 u32::read_from_prefix(slot.get(at..).unwrap_or_default()).map_or(0, |(l, _)| l);
-            let body = RgfxIcbThreadgroupMemory { length, index: j };
-            record(RGFX_ICB_OP_THREADGROUP_MEMORY, body.as_bytes());
+            field(Field::Length(j, length));
         }
         if mask & RGFX_ICB_SLOT_STAGE_IN != 0 {
-            record(RGFX_ICB_OP_STAGE_IN_REGION, s.stage_in.as_bytes());
+            field(Field::Record(
+                RGFX_ICB_OP_STAGE_IN_REGION,
+                s.stage_in.as_bytes(),
+            ));
         }
         if mask & RGFX_ICB_SLOT_IMAGEBLOCK != 0 {
-            record(RGFX_ICB_OP_IMAGEBLOCK, s.imageblock.as_bytes());
+            field(Field::Record(
+                RGFX_ICB_OP_IMAGEBLOCK,
+                s.imageblock.as_bytes(),
+            ));
         }
         if mask & RGFX_ICB_SLOT_ACTION != 0 {
             let dispatches = RGFX_ICB_OP_DISPATCH_THREADGROUPS..=RGFX_ICB_OP_DISPATCH_THREADS;
             let op = if dispatches.contains(&s.op) { s.op } else { 0 };
-            record(op, s.dispatch.as_bytes());
+            field(Field::Record(op, s.dispatch.as_bytes()));
         }
         if mask & RGFX_ICB_SLOT_BARRIER != 0 {
-            record(
+            field(Field::Record(
                 if s.barrier != 0 {
                     RGFX_ICB_OP_COMPUTE_SET_BARRIER
                 } else {
                     RGFX_ICB_OP_COMPUTE_CLEAR_BARRIER
                 },
                 &[],
-            );
+            ));
         }
     }
 }
