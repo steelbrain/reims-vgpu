@@ -94,14 +94,14 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
                                   serializer:(nullable RgfxSerializer *)serializer;
 
 /// Creates a library from `length` bytes of .metallib/AIR at `bytes` by streaming
-/// them through the process's staging window in `region` (two blocks, used in
-/// turn, so the copy of one chunk overlaps the host's copy-out of the one before),
-/// one RGFX_CMD_LIBRARY_FROM_REGION per chunk, for a library larger than one ring
-/// message. Waits for the host to have copied a block out before writing it again.
-/// The chunks carry the content key where `key` (32 bytes) is not null. Returns nil
-/// if `serializer` or `region` is null, the region has no room for the window, the
-/// host did not take a chunk (`*status` kRgfxNoAnswer), or the device refused the
-/// library (`*status` its answer to the last chunk).
+/// them through a staging window of `region` made for this library and given back
+/// once the host has copied it out (RgfxLibraryStream.hpp), one
+/// RGFX_CMD_LIBRARY_FROM_REGION per chunk, for a library larger than one ring
+/// message. The chunks carry the content key where `key` (32 bytes) is not null.
+/// Returns nil if `serializer` or `region` is null, the region has no room for a
+/// window even of page-sized chunks, the host did not take a chunk (`*status`
+/// kRgfxNoAnswer), or the device refused the library (`*status` its answer to the
+/// last chunk).
 + (nullable instancetype)libraryStreamingBytes:(const void *)bytes
                                        length:(NSUInteger)length
                                           key:(nullable const uint8_t *)key

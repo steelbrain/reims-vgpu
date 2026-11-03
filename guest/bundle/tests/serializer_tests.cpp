@@ -40,6 +40,7 @@
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 void rgfxSlabTests();
+void rgfxLibraryStreamTests();
 
 namespace {
 
@@ -2457,6 +2458,7 @@ int main()
 	test_argument_layout_queries();
 	test_argument_layout_parse();
 	rgfxSlabTests();
+	rgfxLibraryStreamTests();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }

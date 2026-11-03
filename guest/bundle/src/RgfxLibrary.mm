@@ -29,6 +29,7 @@
 
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
+#include "RgfxLibraryStream.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -161,98 +162,6 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 		}
 		q = end;
 	}
-	return true;
-}
-
-// The process's staging window for streamed libraries: two blocks of the device
-// region used in turn, each with an ack slot the host writes once it has copied the
-// block's chunk out. Made on the first large library and kept for the process's life
-// (one device a process). The lock serialises streams, which share the window.
-struct LibraryStaging {
-	std::mutex lock;
-	bool made = false;
-	uint64_t chunk = 0;            // each block's size
-	uint64_t blockOffset[2] = {};  // region offsets of the two blocks
-	volatile uint8_t *block[2] = {};
-	uint64_t ackOffset[2] = {};    // region offsets of the two ack slots
-	volatile uint64_t *ack[2] = {};
-	uint64_t expected[2] = {};     // the ack each block's last chunk asked for (0: none)
-	uint64_t nextToken = 1;
-};
-
-LibraryStaging &libraryStaging()
-{
-	static LibraryStaging staging;
-	return staging;
-}
-
-// Each staging block's size: 32 MiB, so QuartzCore's 160 MB library goes in five
-// chunks per block; a smaller window when the region has no room for two of those.
-constexpr uint64_t kStagingChunkSizes[] = { 32ull << 20, 8ull << 20, 1ull << 20 };
-
-bool makeStaging(LibraryStaging &st, RgfxRegion &region)
-{
-	for (uint64_t chunk : kStagingChunkSizes) {
-		// One block: a page of ack slots (one a cache line), then the two chunk blocks.
-		RgfxRegion::Block b = region.allocate(0x1000 + 2 * chunk);
-		if (!b.ok)
-			continue;
-		st.chunk = chunk;
-		for (int i = 0; i < 2; i++) {
-			st.ackOffset[i] = b.offset + 64 * static_cast<uint64_t>(i);
-			st.ack[i] = reinterpret_cast<volatile uint64_t *>(b.ptr + 64 * i);
-			__atomic_store_n(st.ack[i], 0, __ATOMIC_RELEASE);
-			st.blockOffset[i] = b.offset + 0x1000 + chunk * static_cast<uint64_t>(i);
-			st.block[i] = b.ptr + 0x1000 + chunk * i;
-			st.expected[i] = 0;
-		}
-		st.made = true;
-		return true;
-	}
-	return false;
-}
-
-// Waits, about ten seconds at most, for the host to have copied block `i`'s last chunk.
-bool awaitBlock(LibraryStaging &st, int i)
-{
-	for (int t = 0; t < 50000; t++) {
-		if (__atomic_load_n(st.ack[i], __ATOMIC_ACQUIRE) == st.expected[i])
-			return true;
-		usleep(200);
-	}
-	return false;
-}
-
-// Streams `length` bytes to the host as one library: each chunk copied into the next
-// staging block once the host has copied out what it last held, then posted.
-// The last chunk's answer is `*outStatus`.
-bool streamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes, uint64_t length,
-                   const uint8_t *key, RgfxObjId *outObjId, uint32_t *outStatus)
-{
-	LibraryStaging &st = libraryStaging();
-	std::lock_guard<std::mutex> guard(st.lock);
-	if (!st.made && !makeStaging(st, region))
-		return false;
-	const RgfxObjId objId = ser.allocLibraryId();
-	int i = 0;
-	for (uint64_t at = 0; at < length; at += st.chunk, i ^= 1) {
-		const uint64_t n = length - at < st.chunk ? length - at : st.chunk;
-		if (!awaitBlock(st, i))
-			return false;
-		std::memcpy(const_cast<uint8_t *>(st.block[i]), bytes + at, n);
-		const uint64_t token = st.nextToken++;
-		st.expected[i] = token;
-		bool posted = false;
-		for (int r = 0; r < 2000 && !posted; r++) {
-			posted = ser.postLibraryChunk(objId, st.blockOffset[i], n, length, at, st.ackOffset[i],
-			                              token, key, outStatus);
-			if (!posted)
-				usleep(1000);
-		}
-		if (!posted)
-			return false;
-	}
-	*outObjId = objId;
 	return true;
 }
 
@@ -519,8 +428,8 @@ static bool rgfxMade(uint32_t status)
 		return nil;
 	}
 	RgfxObjId objId = 0;
-	if (!streamLibrary(*region, *serializer, static_cast<const uint8_t *>(bytes), length, key,
-	                   &objId, status) ||
+	if (!rgfxStreamLibrary(*region, *serializer, static_cast<const uint8_t *>(bytes), length, key,
+	                       &objId, status) ||
 	    !rgfxMade(*status)) {
 		return nil;
 	}
