@@ -10,7 +10,7 @@
  * device that the host reads in place: AppleGVA writes the next access unit into the same
  * buffer of its pool as soon as a picture is scheduled, without waiting for the decode that
  * reads it. The output surfaces are reached through textures over their planes, made once per
- * surface.
+ * surface and place a picture lands at in it.
  *
  * Plain C++, so the driver's AppleGVA side stays C++; every handle is opaque.
  */
@@ -56,12 +56,19 @@ void forgetOutputs(Session *session);
 /// (H.264's SPS and PPS, HEVC's SPS and PPS; `parameterSetsSize` bytes, 0 for none), into the
 /// two-plane surface `output`: NV12's ('420v', '420f'), or, for HEVC of 10 bits, P010's ('x420',
 /// 'xf20'). The call copies the bytes: the caller may write them again once it returns.
+///
+/// The picture lands at `x`, `y` in `output` (luma samples from its top left; chroma at half of
+/// each), `width` by `height` of it, its crop: at (0, 0) for a frame of its own, through
+/// textures over the whole planes; at its place for an HEIF grid's tile in its canvas, through
+/// textures of its crop there, which lies inside the planes. A place off (0, 0) is of even
+/// samples, and each plane's first byte there is at the alignment outputPlaneAlignment answers.
 struct Decode {
 	const uint8_t *bytes;
 	size_t size;
 	const uint8_t *parameterSets;
 	uint32_t parameterSetsSize;
 	IOSurfaceRef output;
+	uint32_t x, y, width, height;
 };
 
 /// Commits the decode on `session`'s queue: a token for its completion, null where it was not

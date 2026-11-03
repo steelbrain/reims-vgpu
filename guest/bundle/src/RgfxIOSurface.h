@@ -142,6 +142,20 @@ NS_ASSUME_NONNULL_BEGIN
                                         device:(nullable id<MTLDevice>)device
                                     serializer:(RgfxSerializer *)serializer;
 
+/// The same from `origin` of the plane (elements across, rows down), in the plane's rows: the
+/// video driver's landing of a picture inside a larger surface, as an HEIF grid's tile in its
+/// canvas (RgfxMetalDevice+Video.mm). The caller keeps the origin's bytes across a multiple of
+/// the alignment the host's linear textures take (the plane's rows are); nil where the texture
+/// would reach past its plane's rows or elements, or the plane's elements are not pixels. Its own
+/// CPU access (getBytes, replaceRegion) reads and writes nothing.
++ (nullable instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                                     iosurface:(IOSurfaceRef)surface
+                                         plane:(NSUInteger)plane
+                                        origin:(MTLOrigin)origin
+                                        region:(RgfxRegion *)region
+                                        device:(nullable id<MTLDevice>)device
+                                    serializer:(RgfxSerializer *)serializer;
+
 @end
 
 NS_ASSUME_NONNULL_END

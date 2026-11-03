@@ -28,8 +28,9 @@ RgfxMetalDevice *processDevice()
 	return device;
 }
 
-// The output surfaces a session keeps textures over, past which the least recently used goes:
-// more than a decoder's pool holds, so a session's own surfaces stay.
+// The output surfaces a session keeps textures over (a pair for each place a picture lands at in
+// one: an HEIF grid's canvas has one for each of its tiles but the first), past which the least
+// recently used goes: more than a decoder's pool holds, so a session's own surfaces stay.
 constexpr size_t kOutputsKept = 64;
 
 // The bitstream buffers a session uses in turn: a picture waits for the command buffer that
@@ -49,14 +50,14 @@ struct rgfx::video::Session {
 	// RGFX_VIDEO_CODEC_*.
 	uint32_t codec;
 	std::mutex lock;
-	// The textures over each output surface's two planes, by IOSurfaceID, and when each was
-	// last used.
+	// The textures over each output surface's two planes, by IOSurfaceID and the place in it
+	// the picture lands at (outputKey), and when each was last used.
 	struct Output {
 		id<MTLTexture> luma;
 		id<MTLTexture> chroma;
 		uint64_t lastUse;
 	};
-	std::unordered_map<uint32_t, Output> outputs;
+	std::unordered_map<uint64_t, Output> outputs;
 	uint64_t uses = 0;
 	// The last command buffer committed, which the session's end waits for before the host
 	// drops the session its video encoder names.
@@ -152,22 +153,42 @@ void rgfx::video::forgetOutputs(Session *session)
 
 namespace {
 
-// A texture of `format` over `surface`'s plane `plane`, of the plane's size; over the surface's
-// device cache where the host lands pictures there and the texture makes the surface's block.
-id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_t plane,
-                            MTLPixelFormat format)
+// The key of the textures over `surface` a picture landing at (`x`, `y`) in it uses.
+uint64_t outputKey(IOSurfaceRef surface, uint32_t x, uint32_t y)
 {
-	MTLTextureDescriptor *desc =
-	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
-	                                                       width:IOSurfaceGetWidthOfPlane(surface, plane)
-	                                                      height:IOSurfaceGetHeightOfPlane(surface, plane)
-	                                                   mipmapped:NO];
+	return (uint64_t)IOSurfaceGetID(surface) << 32 | (uint64_t)(y & 0xffff) << 16 | (x & 0xffff);
+}
+
+// A texture of `format` over `surface`'s plane `plane`: of the plane's size, or, `width` by
+// `height` from `origin` in it (a tile's place in its canvas, in the plane's elements), where
+// `width` is not 0; over the surface's device cache where the host lands pictures there and the
+// texture makes the surface's block.
+id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_t plane,
+                            MTLPixelFormat format, MTLOrigin origin, size_t width, size_t height)
+{
+	const size_t w = width ? width : IOSurfaceGetWidthOfPlane(surface, plane);
+	const size_t h = width ? height : IOSurfaceGetHeightOfPlane(surface, plane);
+	MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                                                width:w
+	                                                                               height:h
+	                                                                            mipmapped:NO];
 	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	auto make = [&]() -> id<MTLTexture> {
+		if (width == 0)
+			return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:desc
+		                                         iosurface:surface
+		                                             plane:plane
+		                                            origin:origin
+		                                            region:[device region]
+		                                            device:device
+		                                        serializer:[device serializer]];
+	};
 	const RgfxVideoCaps *caps = [device videoCaps];
 	if ((caps->flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED) == 0)
-		return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
+		return make();
 	RgfxAskCachedScope ask;
-	return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
+	return make();
 }
 
 // What the host reads an access unit of `codec` in place at
@@ -246,11 +267,29 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 	                  &chromaFormat) ||
 	    IOSurfaceGetPlaneCount(decode.output) != 2)
 		return nullptr;
+	// A picture off the surface's origin (a tile in its canvas) lands through textures of its
+	// crop there, each plane's first byte at the host's alignment; at the origin, through the
+	// textures over the whole planes.
+	const bool inside = decode.x != 0 || decode.y != 0;
+	if (inside) {
+		const uint32_t sampleBytes = lumaFormat == MTLPixelFormatR16Unorm ? 2 : 1;
+		const uint32_t alignment = outputPlaneAlignment(sampleBytes);
+		if (decode.x % 2 != 0 || decode.y % 2 != 0 || decode.width == 0 || decode.height == 0 ||
+		    alignment == 0 || (decode.x * sampleBytes) % alignment != 0)
+			return nullptr;
+	}
 	id<MTLTexture> luma, chroma;
 	{
 		std::lock_guard<std::mutex> hold(session->lock);
-		const uint32_t id = IOSurfaceGetID(decode.output);
+		const uint64_t id = outputKey(decode.output, decode.x, decode.y);
 		auto it = session->outputs.find(id);
+		// Another crop at the same place (a grid of other tiles in a canvas surface used again)
+		// takes textures of its own.
+		if (it != session->outputs.end() && inside &&
+		    (it->second.luma.width != decode.width || it->second.luma.height != decode.height)) {
+			session->outputs.erase(it);
+			it = session->outputs.end();
+		}
 		if (it == session->outputs.end()) {
 			if (session->outputs.size() >= kOutputsKept) {
 				auto oldest = session->outputs.begin();
@@ -261,8 +300,12 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 				session->outputs.erase(oldest);
 			}
 			Session::Output output;
-			output.luma = planeTexture(session->device, decode.output, 0, lumaFormat);
-			output.chroma = planeTexture(session->device, decode.output, 1, chromaFormat);
+			const size_t w = inside ? decode.width : 0, h = inside ? decode.height : 0;
+			output.luma = planeTexture(session->device, decode.output, 0, lumaFormat,
+			                           MTLOriginMake(decode.x, decode.y, 0), w, h);
+			output.chroma = planeTexture(session->device, decode.output, 1, chromaFormat,
+			                             MTLOriginMake(decode.x / 2, decode.y / 2, 0), (w + 1) / 2,
+			                             (h + 1) / 2);
 			if (output.luma == nil || output.chroma == nil)
 				return nullptr;
 			it = session->outputs.emplace(id, output).first;

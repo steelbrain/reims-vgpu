@@ -7768,8 +7768,9 @@ void test_iosurface_shared_block()
 // plane order, 256 bytes apart, then the header and the writers, one shared block found by plane
 // 0's pages. A texture over any plane lies in that copy's one buffer at its plane's offset, and its
 // create carries the surface's facts: its OSType, planes, size, plane 1's place in the copy and its
-// YCbCr matrix. A surface without planes keeps its one plane at the copy's start, with no chroma
-// and, without the matrix value, none.
+// YCbCr matrix. A texture from an origin inside a plane lies there in the copy. A surface without
+// planes keeps its one plane at the copy's start, with no chroma and, without the matrix value,
+// none.
 void test_iosurface_planes()
 {
 	Fixture fx;
@@ -7915,6 +7916,52 @@ void test_iosurface_planes()
 
 		// A plane the surface lacks: no texture, nothing sent.
 		CHECK(overPlane(surface, MTLPixelFormatR16Unorm, 64, 48, 2) == nil);
+		CHECK(ringEmpty(fx.ring));
+
+		// Textures inside each plane, from an origin of its elements (a tile's place in its
+		// canvas): in the same buffer at the plane's offset and the origin's rows and elements in
+		// the copy, the GPU address there too; the CPU's access reads and writes nothing. One that
+		// would reach past its plane's rows or elements: none, nothing sent.
+		auto inside = [&](MTLPixelFormat format, NSUInteger x, NSUInteger y, NSUInteger w, NSUInteger h,
+		                  NSUInteger plane) {
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+			                                                                              width:w
+			                                                                             height:h
+			                                                                          mipmapped:NO];
+			return [RgfxIOSurfaceTexture textureWithDescriptor:td
+			                                        iosurface:surface
+			                                            plane:plane
+			                                           origin:MTLOriginMake(x, y, 0)
+			                                           region:&region
+			                                           device:nil
+			                                       serializer:&fx.ser];
+		};
+		RgfxIOSurfaceTexture *tile = inside(MTLPixelFormatR16Unorm, 32, 16, 32, 32, 0);
+		CHECK(tile != nil && src.acquired == 1 && blocks.allocated.empty());
+		auto third = expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(third.texture.buffer_obj_id == buffer.obj_id &&
+		      third.texture.offset == 16 * kPitch + 32 * 2 && third.texture.bytes_per_row == kPitch &&
+		      third.texture.plane == 0);
+		CHECK([(id<RgfxMetalTextureInternals>)tile gpuAddress] ==
+		      [(id<RgfxMetalTextureInternals>)luma gpuAddress] + 16 * kPitch + 32 * 2);
+		RgfxIOSurfaceTexture *tileChroma = inside(MTLPixelFormatRG16Unorm, 16, 8, 16, 16, 1);
+		CHECK(tileChroma != nil);
+		auto fourth = expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		CHECK(fourth.texture.buffer_obj_id == buffer.obj_id &&
+		      fourth.texture.offset == kChroma + 8 * kPitch + 16 * 4 &&
+		      fourth.texture.bytes_per_row == kPitch && fourth.texture.plane == 1);
+		CHECK([(id<RgfxMetalTextureInternals>)tileChroma gpuAddress] ==
+		      [(id<RgfxMetalTextureInternals>)luma gpuAddress] + kChroma + 8 * kPitch + 16 * 4);
+		const uint8_t before = block[16 * kPitch + 32 * 2];
+		const uint16_t sample = 0xbeef;
+		[tile replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&sample bytesPerRow:2];
+		uint16_t read = 0x1234;
+		[tile getBytes:&read bytesPerRow:2 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+		CHECK(block[16 * kPitch + 32 * 2] == before && read == 0x1234);
+		// Past plane 0's 48 rows, past its 64 elements, past plane 1's 24 rows.
+		CHECK(inside(MTLPixelFormatR16Unorm, 32, 16, 32, 33, 0) == nil);
+		CHECK(inside(MTLPixelFormatR16Unorm, 34, 16, 32, 32, 0) == nil);
+		CHECK(inside(MTLPixelFormatRG16Unorm, 16, 8, 16, 17, 1) == nil);
 		CHECK(ringEmpty(fx.ring));
 		drainRing(fx.ring);
 	}

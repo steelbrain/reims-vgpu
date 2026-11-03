@@ -1126,11 +1126,30 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 @implementation RgfxIOSurfaceTexture {
 	std::shared_ptr<RgfxSurfaceShadow> _shadow;
 	NSUInteger _plane;
+	// Bytes from the plane's first byte to the texture's (textureWithDescriptor:...origin:).
+	uint64_t _offset;
 }
 
 + (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
                             iosurface:(IOSurfaceRef)surface
                                 plane:(NSUInteger)plane
+                               region:(RgfxRegion *)region
+                               device:(id<MTLDevice>)device
+                           serializer:(RgfxSerializer *)serializer
+{
+	return [self textureWithDescriptor:descriptor
+	                         iosurface:surface
+	                             plane:plane
+	                            origin:MTLOriginMake(0, 0, 0)
+	                            region:region
+	                            device:device
+	                        serializer:serializer];
+}
+
++ (instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                            iosurface:(IOSurfaceRef)surface
+                                plane:(NSUInteger)plane
+                               origin:(MTLOrigin)origin
                                region:(RgfxRegion *)region
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer
@@ -1158,8 +1177,22 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 	hostDesc.options = (hostDesc.options & ~static_cast<uint32_t>(MTLResourceStorageModeMask)) |
 	                   static_cast<uint32_t>(MTLResourceStorageModeShared);
 	const ShadowPlane &p = shadow->planes[plane];
+	// A texture inside its plane lies in the view, in the plane's rows and elements, each pixel
+	// an element.
+	const uint64_t offset = origin.y * p.pitch + origin.x * p.shape.bytesPerElement;
+	const uint64_t width = descriptor.width, height = descriptor.height;
+	if (offset != 0 &&
+	    (width == 0 || height == 0 || p.shape.elementWidth != 1 || p.shape.elementHeight != 1 ||
+	     origin.y + height > p.shape.rows ||
+	     (origin.x + width) * p.shape.bytesPerElement > p.shape.rowBytes)) {
+		logNoTexture(surface, "origin",
+		             format("%llux%llu at (%lu, %lu) of plane %lu, past the plane",
+		                    (unsigned long long)width, (unsigned long long)height,
+		                    (unsigned long)origin.x, (unsigned long)origin.y, (unsigned long)plane));
+		return nil;
+	}
 	RgfxCreated created = serializer->createTextureFromIOSurface(
-	    [(RgfxResource *)shadow->buffer rgfxObjId], p.offset, p.pitch, shadow->surfaceId,
+	    [(RgfxResource *)shadow->buffer rgfxObjId], p.offset + offset, p.pitch, shadow->surfaceId,
 	    static_cast<uint32_t>(plane), hostDesc, shadow->writersAt, shadow->facts());
 	if (created.resource_id == 0) {
 		// No resource id left: no texture, as Metal answers one it cannot make.
@@ -1183,6 +1216,7 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 	keepView(shadow);
 	t->_shadow = std::move(shadow);
 	t->_plane = plane;
+	t->_offset = offset;
 	t->_rgfxSurfaceRoot = t;
 	[t rgfxTakeDescriptor:descriptor];
 	return t;
@@ -1224,12 +1258,13 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 // The texture lies at its plane's offset in its view's buffer, in the buffer's allocation, so the
 // textures over one plane share both, as Metal's over one surface do (measured on the M3 Max under
 // macOS 27: one allocationID and one gpuAddress for two textures and a view over a surface, of any
-// storage mode); plane 0's lie at the buffer's start. A buffer over the surface's pages in place
-// has no GPU address (its create names none), and nor do its textures.
+// storage mode); plane 0's lie at the buffer's start, and one inside its plane past the plane's
+// offset by its own. A buffer over the surface's pages in place has no GPU address (its create
+// names none), and nor do its textures.
 - (uint64_t)gpuAddress
 {
 	uint64_t base = _shadow->buffer.gpuAddress;
-	return base == 0 ? 0 : base + _shadow->planes[_plane].offset;
+	return base == 0 ? 0 : base + _shadow->planes[_plane].offset + _offset;
 }
 
 - (uint64_t)rgfxAllocationId
@@ -1251,12 +1286,14 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 
 // The texture's own CPU access reads and writes its view, for formats of one element per pixel
 // at level 0 / slice 0: the copy, a write also going to the surface's pages, or in place the
-// pages alone.
+// pages alone. A texture inside its plane (the video driver's, which nothing reads on the CPU)
+// has none.
 
 - (BOOL)rgfxCpuRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice
 {
 	const PlaneShape &s = _shadow->planes[_plane].shape;
-	return level == 0 && slice == 0 && s.elementWidth == 1 && s.elementHeight == 1 &&
+	return _offset == 0 && level == 0 && slice == 0 && s.elementWidth == 1 &&
+	       s.elementHeight == 1 &&
 	       region.origin.y + region.size.height <= s.rows &&
 	       (region.origin.x + region.size.width) * s.bytesPerElement <= s.rowBytes;
 }

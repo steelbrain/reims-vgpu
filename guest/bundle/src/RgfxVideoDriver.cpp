@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <atomic>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -401,22 +402,37 @@ struct TileInfo {
 
 // The tile parameter of the host's decoder of `codec` (RGFX_VIDEO_CODEC_*), from its caps, into
 // `out`; false where the host has no such decoder. A tile is a picture the host decodes, of the
-// sizes it takes (its caps' least and largest coded size), and it lands in a frame of its own,
-// cropped to that frame's origin, which VideoToolbox then lays in the canvas (measured on the RTX
-// 5080 host: a 4096x4096 image's 64 tiles of 512 went through four 512x512 frames). So a tile's
-// place and size in the canvas need only its whole chroma samples, 2 by 2 in 4:2:0, and the
-// canvas's row is at most the widest the host writes: its largest width, in samples of the
-// widest format it puts out.
+// sizes it takes (its caps' least and largest coded size). Where Core Animation draws an HEIF
+// grid, CMPhoto has VideoToolbox's tile decoder lay each HEVC tile straight into one YCbCr canvas
+// of the whole image, and AppleGVA names the tile's place in it in the picture's parameters
+// (hevcTilePlace): the picture lands there, each plane's first byte at the alignment the host's
+// textures and copy take (outputPlaneAlignment). So a tile's place is of whole chroma samples
+// (2 by 2 in 4:2:0) and, across, of samples whose bytes keep that alignment in every format
+// the host puts out; the canvas's row is at most the widest the host writes, its largest width
+// in samples of its widest format. An H.264 picture's parameters name no place the driver knows,
+// so its decoder answers a largest canvas row of 0, with which AppleGVA starts no tile decoder,
+// and its tiles go through frames of their own, which VideoToolbox lays in the canvas (measured
+// on the RTX 5080 host with BGRA canvases: a 4096x4096 image's 64 tiles of 512 went through four
+// 512x512 frames). None of its answers is 0 but that row, as CMPhoto divides by the alignments.
 bool tileInfo(uint32_t codec, TileInfo *out)
 {
 	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE);
 	if (!caps || !caps->max_size[0] || !caps->max_size[1])
 		return false;
-	const uint32_t sampleBytes = caps->formats & RGFX_VIDEO_FORMAT_P010 ? 2 : 1;
+	uint32_t across = 2, widest = 1;
+	for (uint32_t sampleBytes : {1u, 2u}) {
+		if (!(caps->formats & (sampleBytes == 1 ? RGFX_VIDEO_FORMAT_NV12 : RGFX_VIDEO_FORMAT_P010)))
+			continue;
+		const uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
+		if (alignment == 0 || alignment % sampleBytes != 0)
+			return false;
+		across = std::max(across, alignment / sampleBytes);
+		widest = sampleBytes;
+	}
 	const uint32_t least[2] = {caps->min_size[0] ? caps->min_size[0] : 1,
 	                           caps->min_size[1] ? caps->min_size[1] : 1};
-	*out = {2, 2, caps->max_size[0] * sampleBytes, least[0], least[1], caps->max_size[0],
-	        caps->max_size[1]};
+	const uint32_t canvasRow = codec == RGFX_VIDEO_CODEC_HEVC ? caps->max_size[0] * widest : 0;
+	*out = {across, 2, canvasRow, least[0], least[1], caps->max_size[0], caps->max_size[1]};
 	return true;
 }
 
@@ -663,10 +679,54 @@ IOSurfaceRef hevcOutputSurface(const uint8_t *P)
 	return IOSurfaceLookup(u32At(frame, 0x88));
 }
 
-// Commits `sets` and the access unit at `bytes` on `context`'s session, into `output`, the sets
-// sent only where they changed since the session's last: the work on the host, or null.
+// Where in its output surface an HEVC picture lands, in luma samples: its tile's place in an HEIF
+// grid's canvas, which AppleGVA names in the picture's parameters at P+0x58 (across) and P+0x5c
+// (down), and (0, 0) for a frame of its own. Measured on the RTX 5080 host (2026-11-03): for the
+// 12, 12, 32 and 2 tiles of 2048x1536, 2000x1400, 4096x2048 and 1024x1024 grids of 512x512 tiles
+// drawn through Core Animation, each into one canvas of its image, the two read each tile's
+// column and row times 512; for every picture decoded into a frame of its own, both read 0.
+struct Place {
+	uint32_t x, y;
+};
+
+Place hevcTilePlace(const uint8_t *P) { return {u32At(P, 0x58), u32At(P, 0x5c)}; }
+
+// The picture's size as the SPS crops it (its conformance window, in chroma samples of 4:2:0):
+// what the host's copy lands.
+void hevcPictureSize(const rgfx::video::h265::Sps &sps, uint32_t *width, uint32_t *height)
+{
+	const bool crops = sps.conformance_window_flag;
+	const uint32_t cropX = crops ? 2 * (sps.conf_win_left_offset + sps.conf_win_right_offset) : 0;
+	const uint32_t cropY = crops ? 2 * (sps.conf_win_top_offset + sps.conf_win_bottom_offset) : 0;
+	*width = sps.pic_width_in_luma_samples > cropX ? sps.pic_width_in_luma_samples - cropX : 0;
+	*height = sps.pic_height_in_luma_samples > cropY ? sps.pic_height_in_luma_samples - cropY : 0;
+}
+
+// The part of a picture `width` by `height` that lies in a surface `surfaceWidth` by
+// `surfaceHeight` from `place`, a place inside it, into `width` and `height`, in whole chroma
+// samples: an odd remainder loses its last column or row. A grid's tiles are all of one size, so
+// a tile of its last column or row reaches past a canvas whose size is no whole number of tiles;
+// its surface's memory holds whole tiles, but its planes, and the device's copy of them
+// (RgfxIOSurface.h), hold the canvas alone (measured on the RTX 5080 host: a 2000x1400 grid of
+// 512x512 tiles drawn through Core Animation lands in a canvas of planes 2000x1400 and 1000x700,
+// 2048 bytes a row, chroma at byte 3145728 of 4718592, the bytes of 2048x1536).
+void clipToSurface(Place place, size_t surfaceWidth, size_t surfaceHeight, uint32_t *width,
+                   uint32_t *height)
+{
+	const auto clip = [](uint32_t at, size_t side, uint32_t *size) {
+		if (at + (uint64_t)*size > side)
+			*size = (uint32_t)(side - at) & ~1u;
+	};
+	clip(place.x, surfaceWidth, width);
+	clip(place.y, surfaceHeight, height);
+}
+
+// Commits `sets` and the access unit at `bytes` on `context`'s session, into `output` at `place`
+// (`width` by `height` of it there; RgfxVideoChannel.hpp), the sets sent only where they changed
+// since the session's last: the work on the host, or null.
 void *commitPicture(Context *context, std::vector<uint8_t> &sets, const uint8_t *bytes,
-                    size_t size, IOSurfaceRef output)
+                    size_t size, IOSurfaceRef output, Place place = {0, 0}, uint32_t width = 0,
+                    uint32_t height = 0)
 {
 	const bool changed = sets != context->sent;
 	rgfx::video::Decode d = {};
@@ -675,6 +735,10 @@ void *commitPicture(Context *context, std::vector<uint8_t> &sets, const uint8_t 
 	d.parameterSets = changed ? sets.data() : nullptr;
 	d.parameterSetsSize = changed ? (uint32_t)sets.size() : 0;
 	d.output = output;
+	d.x = place.x;
+	d.y = place.y;
+	d.width = width;
+	d.height = height;
 	void *work = rgfx::video::decode(context->session, d);
 	if (work && changed)
 		context->sent = std::move(sets);
@@ -720,7 +784,47 @@ void *decodeHevcPicture(const Command *c)
 		return nullptr;
 	}
 	IOSurfaceRef output = hevcOutputSurface(P);
-	void *work = commitPicture(context, sets, bytes + first, end - first, output);
+	// A tile's place lies inside its canvas, of whole chroma samples, and the part of it that
+	// lands there is what the SPS's conformance window crops it to, which is what the host's copy
+	// lands.
+	const Place place = hevcTilePlace(P);
+	uint32_t width, height;
+	hevcPictureSize(*sps, &width, &height);
+	if (output) {
+		const uint32_t whole[2] = {width, height};
+		const size_t across = IOSurfaceGetWidth(output), down = IOSurfaceGetHeight(output);
+		if (place.x < across && place.y < down)
+			clipToSurface(place, across, down, &width, &height);
+		if (place.x % 2 || place.y % 2 || place.x >= across || place.y >= down || width == 0 ||
+		    height == 0) {
+			static std::atomic<bool> said;
+			notSent(said, "its place lies off its output surface");
+			CFRelease(output);
+			return nullptr;
+		}
+		// The SPS sent crops the picture to that part: its window grown on the right and the
+		// bottom, in chroma samples.
+		if (width != whole[0] || height != whole[1]) {
+			auto cropped = std::make_unique<rgfx::video::h265::Sps>(*sps);
+			if (!sps->conformance_window_flag) {
+				cropped->conformance_window_flag = 1;
+				cropped->conf_win_left_offset = cropped->conf_win_right_offset = 0;
+				cropped->conf_win_top_offset = cropped->conf_win_bottom_offset = 0;
+			}
+			cropped->conf_win_right_offset += (whole[0] - width) / 2;
+			cropped->conf_win_bottom_offset += (whole[1] - height) / 2;
+			sets.clear();
+			if (!rgfx::video::h265::writeSps(*cropped, sets) ||
+			    !rgfx::video::h265::writePps(*pps, sets)) {
+				static std::atomic<bool> said;
+				notSent(said, "its parameter sets are refused");
+				CFRelease(output);
+				return nullptr;
+			}
+		}
+	}
+	void *work =
+	    commitPicture(context, sets, bytes + first, end - first, output, place, width, height);
 	if (output)
 		CFRelease(output);
 	return work;
@@ -900,9 +1004,10 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			return kUnsupportedFormat;
 		if (r->width == 0 || r->height == 0 || r->width > kMaxFrameSide || r->height > kMaxFrameSide)
 			return kBadArgument;
-		// What the host's copy writes, a picture's crop at each plane's origin: luma of the
-		// frame's size, chroma of half, in whole pairs; each plane's first byte and pitch at the
-		// alignment its texture and the copy take, one pitch for both planes.
+		// What the host's copy writes, a picture's crop at each plane's origin (a frame's; a tile
+		// in a canvas lands at its place, hevcTilePlace): luma of the frame's size, chroma of
+		// half, in whole pairs; each plane's first byte and pitch at the alignment its texture and
+		// the copy take, one pitch for both planes.
 		const uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
 		if (alignment == 0)
 			return kUnsupported;
