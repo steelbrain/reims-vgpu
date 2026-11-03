@@ -337,6 +337,8 @@ pub(crate) struct LibraryJob<P: Platform> {
     /// The key the guest sent with the bytes.
     guest_key: Option<LibraryKey>,
     slot: Arc<LibrarySlot<P>>,
+    /// The device's resets when it was prepared.
+    resets: u64,
 }
 
 /// What preparing a library message came to.
@@ -360,6 +362,8 @@ pub(crate) struct MadeLibrary<P: Platform> {
     /// The key the host vouches for, and the bytes' length, where it is the guest's.
     key: Option<(LibraryKey, u64)>,
     slot: Arc<LibrarySlot<P>>,
+    /// The device's resets when its create was prepared.
+    resets: u64,
     /// Why the platform made no library, for the host's log; `None` where it made one.
     refusal: Option<String>,
 }
@@ -372,6 +376,7 @@ impl<P: Platform> MadeLibrary<P> {
             library: None,
             key: None,
             slot: job.slot,
+            resets: job.resets,
             refusal: Some(reason.into()),
         }
     }
@@ -407,6 +412,7 @@ pub(crate) fn make_library<P: Platform>(
         library,
         key,
         slot: Arc::clone(&job.slot),
+        resets: job.resets,
         refusal,
     })
 }
@@ -512,6 +518,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             bytes,
             guest_key,
             slot,
+            resets: self.resets,
         })
     }
 
@@ -566,8 +573,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The last step of a library create: the library handed to the pipeline creates waiting on
     /// it, stored under its id where no destroy or close cancelled it meanwhile, and kept under
-    /// its key where the host vouches for the guest's (cancelled, it is kept released). Its
-    /// `COMPLETE` status.
+    /// its key where the host vouches for the guest's (cancelled, it is kept released), unless the
+    /// device was reset since its create was prepared: the rebooted guest's lookups then miss, as
+    /// on a new device. Its `COMPLETE` status.
     pub(crate) fn finish_library(&mut self, made: MadeLibrary<P>) -> u32 {
         made.slot.fill(made.library.as_ref());
         let live = self
@@ -580,9 +588,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(library) = made.library else {
             return RGFX_STATUS_REFUSED;
         };
-        let cached = made
-            .key
-            .is_some_and(|(key, size)| self.library_cache.insert(key, size, &library, live));
+        let cached = made.resets == self.resets
+            && made
+                .key
+                .is_some_and(|(key, size)| self.library_cache.insert(key, size, &library, live));
         if live {
             self.store(made.obj_id, ObjHandle::Library(library));
             if let (true, Some((key, _))) = (cached, made.key) {

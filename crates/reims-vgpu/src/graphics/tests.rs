@@ -4232,3 +4232,175 @@ fn a_reset_drops_every_object_the_guest_made() {
     assert_eq!(again.len(), 1);
     assert_ne!(again, texture, "a texture of its own");
 }
+
+/// Waits about 2 s for the decoder's reset, on the control thread, to have dropped every object
+/// of the guest's.
+fn reset_done(device: &GraphicsDevice<FakePlatform>) {
+    for _ in 0..2000 {
+        if device.decoder_object_count() == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the reset left the guest's objects");
+}
+
+/// Zeroes a queue's ring headers, as the guest's bundle does before its `QUEUE_CREATE`.
+fn zero_ring_headers(device: &GraphicsDevice<FakePlatform>, rings: [u64; 2]) {
+    for ring in rings {
+        // SAFETY: the 256 bytes of each ring header lie in the device's region, mapped while the
+        // device lives; no queue of the host's takes these rings now.
+        unsafe { std::ptr::write_bytes(device.region_base().add(ring as usize), 0, 256) };
+    }
+}
+
+/// A command buffer of the guest before a reset whose completion the platform refuses on its own
+/// thread fails no context of the rebooted guest, whether it completes before the reset or after
+/// it: the kext numbers its contexts from 1 again, and the rebooted guest's context 1 makes its
+/// queue
+#[test]
+fn a_refused_completion_across_a_reset_fails_no_context_of_the_rebooted_guest() {
+    const S: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const C: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const DATA: u32 = 0x1_0000;
+    for after in [false, true] {
+        let raised = Arc::new(AtomicU32::new(0));
+        let (device, platform) = headless_on(&raised);
+        device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+        let mut guest = Guest::new(&device);
+        assert_eq!(
+            create_queue(&device, &mut guest, 1, 1, (S, C), DATA, 0),
+            RGFX_STATUS_OK
+        );
+        let mut ring = QueueRing::new(&device, S, C, u64::from(DATA));
+        ring.send(&device, command_buffer(obj(1, 1), 100));
+        let cb = committed(&platform, 1)[0];
+        let refuse = || {
+            assert!(platform.world().complete_dying_read(
+                cb,
+                "a failure none of Metal's",
+                CompleteOn::Caller
+            ));
+        };
+        if !after {
+            refuse();
+        }
+        // The guest reboots; the host drops what it made, then the buffer may finish.
+        device.reset();
+        reset_done(&device);
+        if after {
+            refuse();
+        }
+
+        // The rebooted guest's driver starts, and its first process (context 1) makes its queue.
+        device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+        let mut guest = Guest::new(&device);
+        zero_ring_headers(&device, [S, C]);
+        assert_eq!(
+            create_queue(&device, &mut guest, 1, 1, (S, C), DATA, 0),
+            RGFX_STATUS_OK,
+            "completed after the reset: {after}"
+        );
+    }
+}
+
+/// A command buffer of the guest before a reset counts for nothing in the rebooted guest's
+/// presents, whether it completes before the reset or after it: the rebooted guest's queue takes
+/// the same id, its seqnos from the start, so a present whose writer is that queue's buffer 5,
+/// published and not yet run, waits for it, though the buffer before the reset was at seqno 9
+#[test]
+fn a_completion_across_a_reset_shows_no_present_of_the_rebooted_guest_early() {
+    for after in [false, true] {
+        let raised = Arc::new(AtomicU32::new(0));
+        let (device, platform) = headless_on(&raised);
+        let (_guest, mut ring) = surface_and_queue(&device);
+        ring.send(&device, command_buffer_at(obj(1, 1), 100, 9));
+        let cb = committed(&platform, 1)[0];
+        let world = platform.world();
+        let complete = || {
+            assert!(world.complete(cb, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller))
+        };
+        if !after {
+            complete();
+        }
+        device.reset();
+        reset_done(&device);
+        if after {
+            complete();
+        }
+
+        // The rebooted guest: the same process numbering, the same queue id, its own seqnos.
+        zero_ring_headers(&device, [SUBMIT, COMPLETE]);
+        let (mut guest, mut ring) = surface_and_queue(&device);
+        ring.publish(command_buffer_at(obj(1, 1), 200, 5));
+        write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 5)]);
+        guest.send(&device, present_surface(0x77));
+        presents_waiting(&device, 1);
+        assert!(
+            quiet(&guest),
+            "completed after the reset: {after}: answered"
+        );
+        assert_eq!(
+            device.control.presents.waiting(),
+            1,
+            "completed after the reset: {after}: shown before its writer ran"
+        );
+        assert_eq!(shown_width(&device), None);
+    }
+}
+
+/// A library create taken before a reset whose make finishes after it leaves nothing the
+/// rebooted guest meets: no object, and a lookup of its key misses, as on a new device
+#[test]
+fn a_library_made_across_a_reset_is_not_in_the_new_device_s_cache() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    guest.send(&device, event_create(obj(1, 5)));
+    device.control.pool.hold();
+    guest.send(&device, keyed_library_create(obj(1, 10), &bytes, Some(key)));
+    // Ring order: once GET_DISPLAYS is answered, the create is on the compile pool, held.
+    guest.send(
+        &device,
+        RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    next_event(&mut guest, RGFX_EVT_DISPLAYS);
+    assert_eq!(device.decoder_object_count(), 1);
+
+    device.reset();
+    reset_done(&device);
+    device.control.pool.release();
+    for _ in 0..2000 {
+        if library_makes(&platform) == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(library_makes(&platform), 1, "the held make never ran");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the make stored its object"
+    );
+
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(1, 10), bytes.len(), key)
+        ),
+        RGFX_STATUS_NOT_FOUND,
+        "the rebooted guest's lookup hits a library made for the guest before"
+    );
+}

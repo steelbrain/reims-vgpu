@@ -117,9 +117,16 @@ impl<P: Platform> PresentQueue<P> {
         self.show_ready(&mut state);
     }
 
-    /// The host posted the `CB_COMPLETE` of the command buffer at `seqno` on queue `queue`'s ring.
-    pub(crate) fn finished(&self, queue: u64, seqno: u64) {
+    /// The host posted the `CB_COMPLETE` of the command buffer at `seqno` on queue `queue`'s ring,
+    /// through `poster`. A buffer of a queue the device's reset ended counts for nothing: the
+    /// rebooted guest's queue may take the same id, its seqnos from the start. The poster is
+    /// looked at with the state held, which the reset takes once the queue has ended
+    /// ([`Self::reset`]), so no buffer of the queue counts after the reset.
+    pub(crate) fn finished(&self, queue: u64, seqno: u64, poster: &CompletionPoster) {
         let mut state = self.state.lock();
+        if poster.stale() {
+            return;
+        }
         let done = state.finished.entry(queue).or_insert(0);
         *done = (*done).max(seqno);
         if !state.waiting.is_empty() {

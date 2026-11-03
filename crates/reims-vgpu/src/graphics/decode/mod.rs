@@ -183,30 +183,52 @@ impl Drop for Drain {
 /// the process. The decoder refuses each one's later work, its command buffers and creates, until
 /// its close: only its destroys are carried out (docs/graphics-kext/design.md, "Guest input the
 /// host refuses"). Shared with the command buffers' completed handlers, which mark a context.
+/// A handler marks one only where no reset of the device came since its buffer's decode: a buffer
+/// of the guest before a reboot may finish after it, and the rebooted guest's processes take the
+/// same context numbers again, from 1.
 ///
 /// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
 #[derive(Default)]
-pub(crate) struct FailedContexts(Mutex<HashSet<u32>>);
+pub(crate) struct FailedContexts(Mutex<Failed>);
+
+/// [`FailedContexts`]' state.
+#[derive(Default)]
+struct Failed {
+    /// The contexts that failed.
+    contexts: HashSet<u32>,
+    /// The device's resets so far ([`FailedContexts::forget_all`]).
+    resets: u64,
+}
 
 impl FailedContexts {
-    /// Marks `context` failed; true where it was not yet.
-    pub(crate) fn fail(&self, context: u32) -> bool {
-        self.0.lock().insert(context)
+    /// The device's resets so far, which a command buffer's completed handler takes at the
+    /// buffer's decode, for its [`Self::fail`].
+    pub(crate) fn resets(&self) -> u64 {
+        self.0.lock().resets
+    }
+
+    /// Marks `context` failed, for a command buffer decoded after `resets` resets
+    /// ([`Self::resets`]); nothing where the device was reset since. True where it was not yet.
+    pub(crate) fn fail(&self, context: u32, resets: u64) -> bool {
+        let mut failed = self.0.lock();
+        failed.resets == resets && failed.contexts.insert(context)
     }
 
     /// Whether `context` failed.
     pub(crate) fn has(&self, context: u32) -> bool {
-        self.0.lock().contains(&context)
+        self.0.lock().contexts.contains(&context)
     }
 
     /// Forgets `context`, at its close.
     fn forget(&self, context: u32) {
-        self.0.lock().remove(&context);
+        self.0.lock().contexts.remove(&context);
     }
 
-    /// Forgets every context, at the device's reset.
+    /// Forgets every context, at the device's reset, and counts the reset.
     fn forget_all(&self) {
-        self.0.lock().clear();
+        let mut failed = self.0.lock();
+        failed.contexts.clear();
+        failed.resets += 1;
     }
 }
 
@@ -400,6 +422,9 @@ pub struct GraphicsDecoder<P: Platform> {
     making_libraries: HashMap<u64, Arc<LibrarySlot<P>>>,
     /// The libraries made from keyed bytes, by key, across every process (`library`).
     library_cache: LibraryCache<P>,
+    /// The device's resets so far ([`Self::reset`]): a library whose make began before one is
+    /// not kept in the cache the reset made anew.
+    resets: u64,
     /// The key of each id the cache's entries are named by.
     cached_libraries: HashMap<u64, LibraryKey>,
     /// The context holding each chunk of the texture resource ids, by chunk, as
@@ -476,6 +501,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             library_chunks: HashMap::new(),
             making_libraries: HashMap::new(),
             library_cache: LibraryCache::new(RELEASED_BUDGET),
+            resets: 0,
             cached_libraries: HashMap::new(),
             id_chunks: vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice(),
             completion_sink: None,
@@ -921,6 +947,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.drains.clear();
         self.failed.forget_all();
         let cache = std::mem::replace(&mut self.library_cache, LibraryCache::new(RELEASED_BUDGET));
+        self.resets += 1;
         if let Err(refusal) = refusals::refusing(move || drop(cache)) {
             log::warn!(
                 target: "reims_vgpu::graphics",

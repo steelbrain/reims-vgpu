@@ -801,7 +801,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             queue_poster.post(record.as_bytes());
             // A present waiting for the buffer is shown once its completion is posted.
             if let Some(queue) = queue {
-                presents.finished(queue, record.header.seqno);
+                presents.finished(queue, record.header.seqno, &queue_poster);
             }
         });
         let signal_poster = poster.clone();
@@ -1203,7 +1203,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         };
         poster.post(cb_failed(cb.cb_obj_id, header.seqno).as_bytes());
         if let Some(queue) = poster.queue_obj_id() {
-            self.presents.finished(queue, header.seqno);
+            self.presents.finished(queue, header.seqno, poster);
         }
     }
 }

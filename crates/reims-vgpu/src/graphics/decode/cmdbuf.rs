@@ -681,6 +681,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let sink = self.completion_sink.clone();
         let signal_sink = self.signal_sink.clone();
         let (failed, context) = (Arc::clone(&self.failed), self.context);
+        let resets = failed.resets();
         let signals = events.signals;
         let watched = (!events.waits.is_empty())
             .then(|| self.waits.watch(cb_obj_id, seqno, context, events.waits));
@@ -690,7 +691,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             // context, whose later work is refused until its close.
             if info.is_refused()
                 && let Some(context) = context
-                && failed.fail(context)
+                && failed.fail(context, resets)
             {
                 log::warn!(
                     target: "reims_vgpu::graphics",
@@ -2021,7 +2022,8 @@ mod tests {
         assert!(!dec.submits_at_take(&asking(175, 105)), "its queue is full");
         p.world().complete_all(CompleteOn::Caller);
         assert!(dec.submits_at_take(&asking(175, 105)));
-        assert!(dec.failed_contexts().fail(0));
+        let failed = dec.failed_contexts();
+        assert!(failed.fail(0, failed.resets()));
         assert!(
             !dec.submits_at_take(&asking(175, 105)),
             "its context failed"
