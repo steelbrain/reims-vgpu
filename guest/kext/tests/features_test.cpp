@@ -33,25 +33,34 @@ void check(bool ok, const char *what)
 }
 
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
-constexpr uint64_t kNew = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
-                          RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
-                          RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_QUEUE_VECTORS;
-// The one it does: the bundle orders its command buffers over IOSurfaces, which needs nothing of
-// the kext.
+constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
+                                 RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
+                                 RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_QUEUE_VECTORS;
+// The ones it does: the bundle orders its command buffers over IOSurfaces, which needs nothing of
+// the kext, and makes indirect command buffers, whose creates and writes the kext admits.
 constexpr uint64_t kOrder = RGFX_FEATURE_SURFACE_ORDER;
+constexpr uint64_t kIcb = RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS;
+constexpr uint64_t kCarried = kOrder | kIcb;
+// Every bit the wire names from bit 3.
+constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
 
 int main()
 {
-	// Of the bits from 3 the kext carries out SURFACE_ORDER alone, and writes it only where
-	// offered.
-	check(kRgfxCarriedFeatures == kOrder, "the kext takes SURFACE_ORDER alone");
+	// Of the bits from 3 the kext carries out SURFACE_ORDER and INDIRECT_COMMAND_BUFFERS, and
+	// writes each only where offered.
+	check(kRgfxCarriedFeatures == kCarried, "the kext takes SURFACE_ORDER and ICBs from bit 3");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
+	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 40)) == 0,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | kOrder) == kOrder,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 40)) == kCarried,
+	      "every bit offered, SURFACE_ORDER and ICBs written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kOrder) == kOrder,
 	      "SURFACE_ORDER offered, written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kIcb) == kIcb,
+	      "ICBs offered, written");
 	check((rgfxDriverFeatures(~0ull) & kRgfxOfferedFeatures) == 0, "bits 0 to 2 are never written");
 
 	// The word: bits 0 to 2 as offered, on a host older than the registers (DRIVER_FEATURES
@@ -66,15 +75,19 @@ int main()
 	      "SURFACE_ORDER taken is in the word");
 	// A read-back of bits the kext never wrote, or of bits 0 to 2 the host does not offer, adds
 	// nothing.
-	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNew | (1ull << 40)) == kRgfxOfferedFeatures,
+	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 40)) ==
+	          kRgfxOfferedFeatures,
 	      "taken bits the kext does not carry out are dropped");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kNew, kNew) == (kRgfxOfferedFeatures | kCarried),
+	      "SURFACE_ORDER and ICBs taken are in the word, for the bundle");
 	check(rgfxFeatureWord(0, kRgfxOfferedFeatures) == 0,
 	      "bits 0 to 2 come from the offer, not the read-back");
 
-	// Queue flags: granted only where the word holds their feature, so none yet.
+	// Queue flags: granted only where the word holds their feature, so none: the kext takes
+	// neither queue feature.
 	const uint32_t both = RGFX_QUEUE_QUIET_SCHEDULED | RGFX_QUEUE_CONSUMED_DOORBELL;
 	check(rgfxQueueFlagsGranted(both, rgfxFeatureWord(kRgfxOfferedFeatures | kNew, kNew)) == 0,
-	      "no flag is granted while the kext takes no feature");
+	      "no flag is granted while the kext takes no queue feature");
 	check(rgfxQueueFlagsGranted(both, RGFX_FEATURE_QUIET_SCHEDULED) == RGFX_QUEUE_QUIET_SCHEDULED,
 	      "QUIET_SCHEDULED with its feature");
 	check(rgfxQueueFlagsGranted(both, RGFX_FEATURE_CONSUMED_DOORBELL) ==

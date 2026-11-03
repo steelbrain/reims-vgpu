@@ -253,9 +253,10 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 
 // kRgfxAccelMethodSubmit (RgfxUserClientABI.hpp): one create or destroy of the client's onto the
 // control ring, and the device's answer back where the create has one: a pipeline's reflection,
-// a library create's or lookup's COMPLETE, an argument layout's COMPLETE. A pipeline create with
-// kRgfxSubmitDeferred is posted without waiting where a deferred slot is free (postDeferred), its
-// answer then taken through kRgfxAccelMethodTakeAnswers.
+// a sampler's or an indirect command buffer's state, a library create's or lookup's COMPLETE, an
+// argument layout's COMPLETE. A pipeline create with kRgfxSubmitDeferred is posted without
+// waiting where a deferred slot is free (postDeferred), its answer then taken through
+// kRgfxAccelMethodTakeAnswers.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
 	// The context as it is now, read under the queue lock that releaseContext closes it under,
@@ -328,7 +329,8 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 			r = kIOReturnBadArgument;
 	}
 	// The answers the client waits for: a pipeline create's reflection, a heap texture size
-	// query's SIZE_AND_ALIGN, a sampler create's SAMPLER_STATE (its resource id), and the
+	// query's SIZE_AND_ALIGN, a sampler create's SAMPLER_STATE and an indirect command buffer
+	// create's ICB_STATE (each its resource id), and the
 	// COMPLETE of a library create or lookup (a library's last region chunk is its create) or of
 	// an argument layout, whose layout the device writes into the client's block before it.
 	UInt32 replyType = 0;
@@ -338,6 +340,8 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 		replyType = RGFX_EVT_SIZE_AND_ALIGN;
 	else if (type == RGFX_CMD_SAMPLER_CREATE)
 		replyType = RGFX_EVT_SAMPLER_STATE;
+	else if (type == RGFX_CMD_ICB_CREATE)
+		replyType = RGFX_EVT_ICB_STATE;
 	else if (type == RGFX_CMD_LIBRARY_CREATE || type == RGFX_CMD_LIBRARY_LOOKUP ||
 	         type == RGFX_CMD_ARGUMENT_LAYOUT ||
 	         (type == RGFX_CMD_LIBRARY_FROM_REGION && lastLibraryChunk(message, size)))

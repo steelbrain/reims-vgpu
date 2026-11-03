@@ -62,12 +62,12 @@ int main()
 	    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
 	    RGFX_CMD_FENCE_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP,
 	    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
-	    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_VIDEO_SESSION_CREATE,
+	    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_CMD_ICB_CREATE,
 	};
 	const uint32_t makesNone[] = {
 	    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_TEXTURE_REPLACE_REGION,
 	    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ARGUMENT_LAYOUT,
-	    RGFX_CMD_SHARED_EVENT_SET_VALUE,
+	    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_ICB_WRITE,
 	};
 	for (uint32_t t : makes)
 		check(rgfxSubmitAdmitted(t) && rgfxSubmitMakes(t), "a create makes an object");
@@ -82,7 +82,7 @@ int main()
 			listed |= t == type;
 		if (type <= RGFX_CMD_VIDEO_SESSION_CREATE)
 			check(listed, "every wire type of the accepted range is placed");
-		else
+		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");
 	}
 
@@ -104,9 +104,11 @@ int main()
 	      "a destroy is not destroyed behind");
 	check(!rgfxSubmitDestroysBehind(RGFX_CMD_SHARED_EVENT_SET_VALUE, true, false, true),
 	      "nor a write into an object");
+	check(!rgfxSubmitDestroysBehind(RGFX_CMD_ICB_WRITE, true, true, true),
+	      "nor an indirect command buffer's commands");
 	// The timeout path is as before for every type that waits for an answer.
 	const uint32_t answered[] = {RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
-	                             RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_LIBRARY_CREATE,
+	                             RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_LIBRARY_CREATE,
 	                             RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_LIBRARY_FROM_REGION};
 	for (uint32_t t : answered)
 		check(rgfxSubmitDestroysBehind(t, true, true, false),
