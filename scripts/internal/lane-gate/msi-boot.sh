@@ -10,8 +10,9 @@
 #                 bench phase left GPU-bound cases with no repetition at the GPU's high clock
 #                 (reps.py), their runs again (benchretry) before the phases after it
 #   cpu.txt       QEMU's CPU time once a second: "EPOCH UTIME_TICKS STIME_TICKS HZ"
-#   host-events.log  the host log's display updates ("the display shows IOSurface") and its
-#                 fatal, error and warning lines, as the host logged them (local ISO times)
+#   host-events.log  the host log's display updates ("the display shows IOSurface"), its
+#                 fatal, error and warning lines, and its work counts (reims_vgpu::work, where
+#                 HOST_LOG enables it), as the host logged them (local ISO times)
 #   launch.log.gz, serial.log   QEMU's whole log and the guest's serial port
 #   desktop.png   the guest's screenshot of its screen after its run, at a quarter of its size
 #   host.txt      "KEY VALUE" lines: the SSH port, the wait for the GPU, boot and desktop times
@@ -161,7 +162,7 @@ finish() {
     HOST_QUIET) kv host_quiet 1 ;;
     HOST_NOT_QUIET) kv host_quiet 0 ;;
     esac
-    grep -E 'the display shows IOSurface|reims-vgpu: fatal|panic| ERROR | WARN ' "$B/launch.log" > "$R/host-events.log"
+    grep -E 'the display shows IOSurface|reims-vgpu: fatal|panic| ERROR | WARN | reims_vgpu::work: ' "$B/launch.log" > "$R/host-events.log"
     gzip -c "$B/launch.log" > "$R/launch.log.gz"
     cp -f "$B/serial.log" "$R/serial.log" 2> /dev/null
     n=$(grep -c 'reims-vgpu: fatal' "$B/serial.log" 2> /dev/null)

@@ -76,7 +76,8 @@ MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "bundle-files", "rgfxgate
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
          r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
          r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(shared\.)?icb\..*", r"(shared\.)?appload\..*", r"(core_mhz|clock_reps_ok)\.bench\..*",
-         r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)"]
+         r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)",
+         r"work\..*"]
 
 
 def gpu_bound(name):
@@ -186,6 +187,7 @@ class Run:
                 self.guest(read(os.path.join(d, "guest.log")))
                 self.host(d)
                 self.drag(d)
+                self.work(d)
                 self.appload(d)
                 self.video(d)
                 self.clocks(d)
@@ -588,6 +590,89 @@ class Run:
             for k in ("qemu_cpu", "gfx_cpu"):
                 if k in kv:
                     self.lmetric(f"{k}.drag.{name}", kv[k])
+
+    # The runtime's counts work() rates over a window, and the field whose subfields sum to a count.
+    WORK_FIELDS = ("shadowed_textures", "shadow_copies", "shadow_texels_copied_in", "shadow_texels_copied_back",
+                   "shadow_merge_dispatches_planned", "shadow_merges_fetched", "shadow_merges_kept_in_images")
+    # WindowServer's context: the first its session opens.
+    WS_CONTEXT = "1"
+
+    def work(self, r):
+        """The host's work counts (host-events.log's reims_vgpu::work lines, one a second where the
+        boot's HOST_LOG enabled them: the runtime's counts as deltas, "work counts over S s: PATH
+        +N, ...", and each guest context's command buffers and render encoders, "graphics work over
+        S s: context C: N command buffers, M render encoders; ...") over the plain and glass drags
+        (drag.txt's t0 and t1) and the WebGL phase: per WindowServer command buffer and per display
+        update. A line counts in a window where the middle of its second lies in it."""
+        lines = read(os.path.join(r, "host-events.log")).splitlines()
+        runtime, graphics, updates = [], [], []
+        for line in lines:
+            t = local_epoch(line[:28])
+            if t is None:
+                continue
+            if "the display shows IOSurface" in line:
+                updates.append(t)
+                continue
+            m = re.search(r"reims_vgpu::work: (work counts|graphics work) over ([0-9.]+) s: (.*)$", line)
+            if not m:
+                continue
+            mid = t - float(m.group(2)) / 2
+            if m.group(1) == "work counts":
+                deltas = {}
+                for part in m.group(3).split(", "):
+                    q = part.rsplit(" ", 1)
+                    if len(q) == 2 and re.fullmatch(r"[+-][0-9]+", q[1]):
+                        deltas[q[0]] = int(q[1])
+                runtime.append((mid, deltas))
+            else:
+                by = {}
+                for part in m.group(3).split("; "):
+                    c = re.match(r"context (\d+): (\d+) command buffers, (\d+) render encoders", part.strip())
+                    if c:
+                        by[c.group(1)] = (int(c.group(2)), int(c.group(3)))
+                graphics.append((mid, by))
+        if not runtime and not graphics:
+            return
+        windows = {}
+        for line in read(os.path.join(r, "drag.txt")).splitlines():
+            m = re.match(r"drag (plain|glass) (.*)$", line)
+            if m:
+                kv = kv_numbers(m.group(2))
+                if kv.get("moved") and "t0" in kv and "t1" in kv:
+                    windows["drag." + m.group(1)] = (kv["t0"], kv["t1"])
+        webgl = getattr(self, "phases", {}).get("webgl")
+        if webgl and None not in webgl:
+            windows["webgl"] = tuple(webgl)
+        for name, (a, b) in windows.items():
+            sums = {}
+            for mid, deltas in runtime:
+                if a <= mid <= b:
+                    for k, v in deltas.items():
+                        sums[k] = sums.get(k, 0) + v
+            cbs = encs = 0
+            for mid, by in graphics:
+                if a <= mid <= b:
+                    c, e = by.get(self.WS_CONTEXT, (0, 0))
+                    cbs, encs = cbs + c, encs + e
+            frames = sum(1 for u in updates if a <= u <= b)
+            sums["shadow_keeps"] = sum(v for k, v in sums.items()
+                                       if k.startswith("shadow_keeps.") and not k.endswith("_texels"))
+            span = b - a
+            self.lmetric(f"work.{name}.ws_command_buffers_s", round(cbs / span, 2))
+            self.lmetric(f"work.{name}.ws_render_encoders_s", round(encs / span, 2))
+            if cbs:
+                self.lmetric(f"work.{name}.ws_render_encoders_per_ws_cb", round(encs / cbs, 3))
+            parts = []
+            for f in self.WORK_FIELDS + ("shadow_keeps",):
+                v = sums.get(f, 0)
+                if cbs:
+                    self.lmetric(f"work.{name}.{f}_per_ws_cb", round(v / cbs, 3))
+                if frames:
+                    self.lmetric(f"work.{name}.{f}_per_frame", round(v / frames, 3))
+                parts.append(f"{f} {v / cbs if cbs else 0:.3g}/{v / frames if frames else 0:.3g}")
+            self.litem(f"work.{name}", "INFO",
+                       f"over {span:.1f} s: WindowServer {cbs} command buffers, {encs} render encoders, "
+                       f"{frames} display updates; per WS command buffer/per update: " + ", ".join(parts))
 
     def appload(self, r):
         """The app load (msi-appload.sh's appload.txt): every app, then 7 Safari pages. Its bar: no

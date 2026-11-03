@@ -270,7 +270,9 @@ def measured(a, b, t0, t1, spans):
         gaps += [y - x for x, y in zip([s0] + ts, ts + [s1])]
     gaps.sort()
     p99 = gaps[min(len(gaps) - 1, int(math.ceil(0.99 * len(gaps))) - 1)] if gaps else total
-    return dict(moved=1, composites_s=round(n / total, 2), gap_p99_ms=round(1000 * p99, 1),
+    # t0 and t1, the window's ends on the host's clock, for the report's counts over it (the host's
+    # work lines, report.py's work).
+    return dict(moved=1, t0=round(t0, 3), t1=round(t1, 3), composites_s=round(n / total, 2), gap_p99_ms=round(1000 * p99, 1),
                 gap_max_ms=round(1000 * (gaps[-1] if gaps else total), 1),
                 qemu_cpu=round(100 * cpu["qemu"] / hz / (t1 - t0), 1),
                 gfx_cpu=round(100 * cpu["gfx"] / hz / (t1 - t0), 1))

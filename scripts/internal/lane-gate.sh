@@ -531,7 +531,9 @@ LOCK_WAIT_S=${LOCK_WAIT_S:-3600}
 PHASES="$ph"
 PRESENT_S=$pres
 LOAD=$([[ $mode == bench ]] && echo "$load")
-HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info)
+# The bench's host log carries the host's work counts each second (reims_vgpu::work at debug: the
+# runtime's and each guest context's), which report.py reads over the drags and WebGL.
+HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info,reims_vgpu::work=debug)
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 EOF
