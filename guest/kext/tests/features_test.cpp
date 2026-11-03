@@ -41,7 +41,7 @@ constexpr uint64_t kNew = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_D
 int main()
 {
 	// The kext carries out none of the bits from 3 yet, so it writes 0 whatever the offer.
-	check(kRgfxKextFeatures == 0, "the kext takes no bit from 3 yet");
+	check(kRgfxCarriedFeatures == 0, "the kext takes no bit from 3 yet");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 40)) == 0,
 	      "every bit offered, still none written");

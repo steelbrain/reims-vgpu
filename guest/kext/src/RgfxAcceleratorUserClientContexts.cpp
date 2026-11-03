@@ -227,9 +227,10 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		owner->retireSurfaceWrites(in[0], in[1]);
 		return kIOReturnSuccess;
 	case kRgfxAccelMethodFeatures:
-		if (a->scalarInputCount != 0 || a->scalarOutputCount != 1)
+		if (a->scalarInputCount != 0 || a->scalarOutputCount != 2)
 			return kIOReturnBadArgument;
 		out[0] = owner->featureWord();
+		out[1] = kRgfxKextFeatureWord;
 		return kIOReturnSuccess;
 	default:
 		return kIOReturnUnsupported;

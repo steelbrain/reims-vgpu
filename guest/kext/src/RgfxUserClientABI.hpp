@@ -21,6 +21,7 @@ enum {
 	// Ring a ring's doorbell: scalarInput[0] is the ring id, written to
 	// RGFX_REG_DOORBELL. No output.
 	kRgfxAccelMethodDoorbell = 0,
+	// 1 is kept for Consumed, the completion ring's room doorbell (kRgfxKextFeatureConsumedDoorbell).
 };
 
 // The process's device context (RgfxAcceleratorContexts.cpp), on our own user client only,
@@ -119,12 +120,32 @@ enum {
 	kRgfxAccelMethodContextFirst = kRgfxAccelMethodOpenContext,
 	kRgfxAccelMethodContextLast = kRgfxAccelMethodSurfaceRetire,
 
-	// 0x10e is kept for the pages blocks' selector.
-	// The device's feature word (the kext's RgfxFeatures.hpp): no input; out: the RGFX_FEATURE_*
-	// bits, 0 to 2 as the host offers them and from bit 3 the ones the framebuffer took for the
-	// kext and its bundle. A kext older than it answers kIOReturnUnsupported. The kext routes it
-	// to its context methods beside the range above.
+	// 0x10e is kept for PagesBlock (kRgfxKextFeaturePagesBlock).
+	// The features: no input; out: the device's feature word (the kext's RgfxFeatures.hpp), the
+	// RGFX_FEATURE_* bits 0 to 2 as the host offers them and from bit 3 the ones the framebuffer
+	// took for the kext and its bundle; then the kext's own word (kRgfxKextFeature*, below). A
+	// kext older than it answers kIOReturnUnsupported. The kext routes it to its context methods
+	// beside the range above.
 	kRgfxAccelMethodFeatures = 0x10f,
+	// 0x110 is kept for SubmitBatch (kRgfxKextFeatureSubmitBatch), 0x111 for WakeCompletions
+	// (kRgfxKextFeatureWakeCompletions), 0x112 for TakeAnswers (kRgfxKextFeatureDeferredAnswers).
+	// A new selector takes the next number design.md's registry gives out.
+};
+
+// The kext's own features, the second word kRgfxAccelMethodFeatures answers: the user-client
+// calls and flags a kext may lack, which the bundle uses only where the word holds their bit
+// (design.md, "The accelerator's user client").
+enum {
+	// PagesBlock, 0x10e.
+	kRgfxKextFeaturePagesBlock = 1 << 0,
+	// SubmitBatch, 0x110.
+	kRgfxKextFeatureSubmitBatch = 1 << 1,
+	// WakeCompletions, 0x111.
+	kRgfxKextFeatureWakeCompletions = 1 << 2,
+	// The doorbell table's method 1, Consumed.
+	kRgfxKextFeatureConsumedDoorbell = 1 << 3,
+	// Submit's (0x105) deferred-answer flag, and TakeAnswers, 0x112.
+	kRgfxKextFeatureDeferredAnswers = 1 << 4,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

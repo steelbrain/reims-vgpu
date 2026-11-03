@@ -82,6 +82,11 @@ enum {
 	kRgfxAccelMethodCount = 1,
 };
 
+// The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
+// second word kRgfxAccelMethodFeatures answers: none yet. Each bit is set by the change that
+// lands its call.
+constexpr uint64_t kRgfxKextFeatureWord = 0;
+
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
 struct RgfxSurfaceEntry;

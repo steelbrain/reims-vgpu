@@ -28,19 +28,19 @@ constexpr uint64_t kRgfxOfferedFeatures =
 
 // The bits from bit 3 the kext and its bundle carry out, which the framebuffer writes to
 // DRIVER_FEATURES where the host offers them: none yet.
-constexpr uint64_t kRgfxKextFeatures = 0;
+constexpr uint64_t kRgfxCarriedFeatures = 0;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
 {
-	return offered & kRgfxKextFeatures;
+	return offered & kRgfxCarriedFeatures;
 }
 
 // The feature word the bundle works by: bits 0 to 2 as offered, and from bit 3 the ones the host
 // took (DRIVER_FEATURES read back), of those the kext carries out.
 inline uint64_t rgfxFeatureWord(uint64_t offered, uint64_t taken)
 {
-	return (offered & kRgfxOfferedFeatures) | (taken & kRgfxKextFeatures);
+	return (offered & kRgfxOfferedFeatures) | (taken & kRgfxCarriedFeatures);
 }
 
 // The flags of `wanted` (RGFX_QUEUE_*) a queue gets, given the feature word: each one whose
