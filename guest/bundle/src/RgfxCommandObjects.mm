@@ -527,6 +527,11 @@ struct RgfxBarrierSlot {
 	RgfxCreated created = serializer->createQueue(submitOffset, completeOffset,
 	                                              submitRing->dataSize(), completeDataSize,
 	                                              /*priority*/ 0, /*vector*/ 0);
+	// One the device never opened (the kext refuses a context's queues past its limit) is no
+	// queue: nothing would take its ring, and a wait for a buffer committed to it would never
+	// return. nil, as Metal's newCommandQueue answers where it can make none.
+	if (!created.posted)
+		return nil;
 	RgfxCommandQueue *q = [[RgfxCommandQueue alloc] initWithObjId:created.obj_id
 	                                                       device:device
 	                                                   serializer:serializer];

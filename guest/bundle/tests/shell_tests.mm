@@ -3569,6 +3569,31 @@ void test_queue_guards()
 	                                 serializer:&ser] == nil);
 }
 
+// A queue whose create the kext refuses (its 257th, kMaxQueues in RgfxAcceleratorUserClient.hpp)
+// is no queue: the device never opened its rings, so a command buffer committed to it would
+// never complete. newCommandQueue answers nil, as Metal does when it cannot make one.
+void test_refused_queue_create_is_nil()
+{
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	ser.setQueueOpener([](void *, const RgfxQueueCreate &) { return false; }, nullptr);
+	TestRing submit(0x8000);
+	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+
+	CHECK([RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                               submitOffset:0
+	                             completeOffset:0
+	                           completeDataSize:0
+	                                        ids:&ids
+	                                   maxCount:0
+	                                     device:nil
+	                                 serializer:&ser] == nil);
+}
+
 // =============================================================================
 // The transport layer: the region allocator and the reply reader
 // =============================================================================
@@ -9016,6 +9041,7 @@ int main(int argc, char **argv)
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_queue_guards();
+		test_refused_queue_create_is_nil();
 		test_region_allocator();
 		test_queue_carries_allocated_offsets();
 		test_reply_reader_completion();
