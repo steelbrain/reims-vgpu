@@ -181,6 +181,8 @@ impl ScalerGpu {
             pipeline(KERNELS[4])?,
             pipeline(KERNELS[5])?,
         ];
+        // Shared: the scaler's work is a guest app's video work, which shares a GPU queue as an
+        // app's own queues do.
         let new_queue = || {
             device
                 .new_command_queue()

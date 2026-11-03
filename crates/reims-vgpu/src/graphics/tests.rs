@@ -1245,9 +1245,9 @@ fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     window.close();
 }
 
-/// The window's sink imports nothing at its making, then only the host pages under the scanout
-/// it draws (to `stride × height` bytes on), again only when the scanout moves or changes size,
-/// and kept to the region
+/// The window's sink makes its queue unshared and imports nothing at its making, then only the
+/// host pages under the scanout it draws (to `stride × height` bytes on), again only when the
+/// scanout moves or changes size, and kept to the region
 #[test]
 fn the_sink_imports_only_the_scanout_s_pages() {
     use reims_vgpu_core::platform::resource::Buffer as _;
@@ -1259,6 +1259,12 @@ fn the_sink_imports_only_the_scanout_s_pages() {
     let presented = Arc::new(Presented::<FakePlatform>::default());
     let draw = sink::ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented).unwrap();
     assert_eq!(platform.call_log().count(IMPORT), 0);
+    // Its queue is unshared: each draw is on a present's path.
+    {
+        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        assert_eq!(platform.call_log().count(UNSHARED_QUEUE), 1);
+        assert_eq!(platform.call_log().count("newCommandQueue"), 0);
+    }
 
     // SAFETY: sysconf reads a constant of the host's.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();

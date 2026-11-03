@@ -66,7 +66,10 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// on macOS, reads it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) device: P::Device,
-    /// The sink's command queue.
+    /// The sink's command queue, unshared ([`new_command_queue_unshared`]): it puts the guest's
+    /// scanout and presented surfaces into the window, each draw on a present's path.
+    ///
+    /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
     pub(crate) queue: P::CommandQueue,
     /// The device's region.
     region: Arc<Region>,
@@ -126,7 +129,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         presented: &Arc<Presented<P>>,
     ) -> Option<ScanoutDraw<P>> {
         let device = platform.metal_device(None)?;
-        let queue = device.new_command_queue()?;
+        let queue = device.new_command_queue_unshared()?;
         // SAFETY: sysconf reads a constant of the host's.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
             .ok()

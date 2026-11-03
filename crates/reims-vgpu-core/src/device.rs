@@ -899,11 +899,13 @@ fn setup_blit_pipelines<P: Platform>(platform: &P, mtl: &P::Device) -> BlitPipel
     }
 }
 
-/// A new command queue with its label: never checked, and the label a send to nil when Metal
-/// answered nil.
+/// A new command queue with its label, unshared ([`GpuDevice::new_command_queue_unshared`]): each
+/// of the device's queues is on a present's path (their fields say how), so none shares its GPU
+/// queue with another command queue, whose long command buffer would hold its own back. Never
+/// checked, and the label a send to nil when Metal answered nil.
 fn labelled_queue<P: Platform>(mtl: &P::Device, label: &str) -> Option<P::CommandQueue> {
     use crate::platform::command::CommandQueue;
-    let queue = mtl.new_command_queue();
+    let queue = mtl.new_command_queue_unshared();
     crate::nil_send!(queue, set_label(label));
     queue
 }
@@ -967,7 +969,11 @@ pub struct DeviceCore<P: Platform> {
     child_fifos: Mutex<Vec<Option<Arc<Fifo<P>>>>>,
     interrupt_fault_mask: AtomicU64,
     /// Never checked: `None` where Metal answered nil, and every send to it is `nil_send!`.
+    /// Unshared ([`labelled_queue`]): a display's present pages the kernel task's backing it
+    /// shows in on it.
     blit_up_queue: Option<P::CommandQueue>,
+    /// Unshared ([`labelled_queue`]): an in-process task's execution syncs its resources on it
+    /// before its command buffer runs, and it is that task's paging queue.
     blit_down_queue: Option<P::CommandQueue>,
     blit_in_rgb_2p_xr10_a8_pipeline: Option<P::ComputePipeline>,
     blit_out_rgb_2p_xr10_a8_pipeline: Option<P::ComputePipeline>,
@@ -1004,6 +1010,8 @@ pub struct DeviceCore<P: Platform> {
     /// none yet, 1 off, 2 on.
     argument_buffers_logged: AtomicU8,
     mtl_device: P::Device,
+    /// Unshared ([`labelled_queue`]): every in-process task's executions run on it, which is
+    /// every task's but where isolation runs one apart, WindowServer's composites among them.
     exec_queue: Option<P::CommandQueue>,
     /// The displays' cores by the host reference's identity: a leaf lock, apart from `displays`.
     display_cores: DisplayRegistry<P>,
@@ -2214,6 +2222,36 @@ mod tests {
         assert!(d.root_node.lock().root_node.is_none());
         assert!(d.root_task.lock().root_task_allocator.is_some());
         assert!(d.memory_map.lock().is_none());
+    }
+
+    /// The device's blit-up, blit-down and exec queues are made unshared, each labelled: each is
+    /// on a present's path.
+    #[test]
+    fn the_device_s_queues_are_unshared() {
+        use crate::testkit::impls::device::UNSHARED_QUEUE;
+        let p = Arc::new(FakePlatform::new());
+        let host = FakeHost::new(&p, GuestRam::new());
+        let d = DeviceCore::create(p.clone(), config(&p, &host)).expect("device");
+        let log = p.call_log();
+        assert_eq!(log.count(UNSHARED_QUEUE), 3);
+        assert_eq!(log.count("newCommandQueue"), 0);
+        let labels: Vec<String> = log
+            .calls_to("setLabel:")
+            .iter()
+            .filter_map(|c| match c.args.first() {
+                Some(crate::testkit::calllog::Arg::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for label in [
+            "reims-vgpu.blit-up",
+            "reims-vgpu.blit-down",
+            "reims-vgpu.exec",
+        ] {
+            assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+        }
+        assert!(d.blit_up_queue.is_some() && d.blit_down_queue.is_some());
+        assert!(d.exec_queue.is_some());
     }
 
     /// The device's capabilities are fields: what

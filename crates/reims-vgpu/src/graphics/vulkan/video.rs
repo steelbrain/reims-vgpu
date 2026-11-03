@@ -167,7 +167,8 @@ impl DeviceVideo {
             return None;
         }
         // On a GPU of its own memory, a queue of the runtime's families for the copies out,
-        // which reach the runtime's buffers: the reserved one, else a lent one.
+        // which reach the runtime's buffers: the reserved one, else a lent one. A lent one stays
+        // shared: the copies are bulk, and a queue that lent its `VkQueue` never moves.
         let unified = device
             .identity_caps()
             .flags

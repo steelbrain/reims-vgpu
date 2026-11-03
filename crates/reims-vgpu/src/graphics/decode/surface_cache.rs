@@ -102,6 +102,10 @@ pub(crate) struct SurfaceCache<P: Platform> {
 
 /// The host's transfer queue, on which every copy runs, and the event its fills signal.
 struct Transfer<P: Platform> {
+    /// Unshared ([`new_command_queue_unshared`]): a present of a surface waits for its fill, and
+    /// a frame drawn from a cache for the fill before it ([`FillWait`]).
+    ///
+    /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
     queue: P::CommandQueue,
     event: P::Event,
     /// The last value a copy signals.
@@ -738,7 +742,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// Makes the transfer queue at its first use; whether there is one.
     fn make_transfer(&mut self, device: &P::Device) -> RaiseResult<bool> {
         if self.transfer.is_none() {
-            let Some(queue) = device.new_command_queue() else {
+            let Some(queue) = device.new_command_queue_unshared() else {
                 return Ok(false);
             };
             let Some(event) = device.new_event(ON)? else {
@@ -1667,6 +1671,30 @@ mod tests {
             flags: 0,
             reserved_14: 0,
         }]
+    }
+
+    /// The transfer queue is made at the first fill, once, and unshared: a present of a surface
+    /// waits for its fill
+    #[test]
+    fn the_transfer_queue_is_made_unshared_at_the_first_fill() {
+        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        let mut r = cached();
+        let (unshared, plain) = (
+            r.p.call_log().count(UNSHARED_QUEUE),
+            r.p.call_log().count("newCommandQueue"),
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "a fill");
+        r.p.world().complete_all(CompleteOn::Caller);
+        use_surfaces(&mut r, 2, 0x101, &[(BLOCK, 2, false)]);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            2,
+            "a second fill"
+        );
+        assert_eq!(r.p.call_log().count(UNSHARED_QUEUE), unshared + 1);
+        assert_eq!(r.p.call_log().count("newCommandQueue"), plain);
     }
 
     /// A fill of a cache waits for every command buffer begun and not finished that uses it, and

@@ -130,7 +130,10 @@ pub(crate) struct ApiState<P: Platform> {
     /// The display thread, made at the first display.
     display_thread: Mutex<Option<DisplayThread>>,
     /// The frame queue of each Metal device a device was created on, by the device's identity
-    /// (`None`: Metal made none).
+    /// (`None`: Metal made none). Unshared ([`new_command_queue_unshared`]): it draws the
+    /// displays' frames, a host's and a window's, so no other queue's work holds them back.
+    ///
+    /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
     frame_queues: Mutex<Vec<(ObjId, Option<P::CommandQueue>)>>,
 }
 
@@ -181,7 +184,7 @@ impl<P: Platform> ApiState<P> {
         if let Some((_, q)) = queues.iter().find(|(d, _)| *d == id) {
             return q.as_ref().map(Handle::clone_ref);
         }
-        let queue = device.new_command_queue();
+        let queue = device.new_command_queue_unshared();
         let found = queue.as_ref().map(Handle::clone_ref);
         queues.push((id, queue));
         found
@@ -396,15 +399,19 @@ mod tests {
         assert!(vm.deallocate(plain, LEN).is_success());
     }
 
-    /// One frame queue per Metal device, made once
+    /// One frame queue per Metal device, made once, and unshared
     #[test]
     fn one_frame_queue_per_device() {
+        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
         let p = Arc::new(FakePlatform::new());
         let s = api_state(&p);
         let d = p.device();
         let q1 = s.frame_queue(&d).unwrap();
         let q2 = s.frame_queue(&d).unwrap();
         assert_eq!(q1.id(), q2.id());
+        let log = p.call_log();
+        assert_eq!(log.count(UNSHARED_QUEUE), 1);
+        assert_eq!(log.count("newCommandQueue"), 0);
         assert_eq!(p.metal_device(Some(0)).map(|d| d.id()), None);
         assert_eq!(p.metal_device(None).map(|d| d.id()), Some(d.id()));
     }

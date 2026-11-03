@@ -97,9 +97,12 @@ pub trait GpuDevice<P: Platform>: Handle {
     fn new_command_queue(&self) -> Option<P::CommandQueue>;
     /// No Metal counterpart: a queue as [`new_command_queue`](GpuDevice::new_command_queue)'s,
     /// which shares the GPU queue it submits to with no other command queue for its life, where
-    /// the platform would otherwise share one between command queues. The graphics lane makes
-    /// WindowServer's queues so (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues
-    /// on the GPU behind its frames. A platform that shares no GPU queue between command queues
+    /// the platform would otherwise share one between command queues: the queues on a present's
+    /// path are made so, lest another queue's long command buffer hold theirs back: WindowServer's
+    /// in the graphics lane (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues on
+    /// the GPU ahead of its frames, and the host's own on that path (the device's blit and exec
+    /// queues, the process's frame queue, a graphics display's scanout draw and the IOSurface
+    /// device caches' transfer queue). A platform that shares no GPU queue between command queues
     /// answers `new_command_queue`'s queue. Never nil-checked; a raise inside it dies at the
     /// call, as one inside `newCommandQueue` does.
     fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;

@@ -152,6 +152,9 @@ impl<P: Platform> GpuTask<P> {
                 }
             }
         };
+        // Both shared: the task's command buffers are one guest process's own work, as an app's
+        // queues are in the graphics lane, and nothing here tells WindowServer's task from an
+        // app's; its paging is that work's bulk copies.
         let command_queue = match &device {
             Some(d) => d.new_command_queue(),
             None => None,
