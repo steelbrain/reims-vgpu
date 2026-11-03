@@ -140,11 +140,11 @@ public:
 	// IOSurface of global ID `surfaceId` on the ring without waiting (thread context only); the
 	// host answers it once the display shows the surface. addPipe adds an associated pipe client
 	// (retained; RgfxPipeClients.hpp: IOPresentment associates several), and the hooks, both
-	// called on the work loop for each client: `present(client, seqno, status)` for every
-	// COMPLETE (each pipe client picks its own seqnos), and, while the client's
-	// setPipeVblankEnabled is on, `vblank(client, count, time, next)` for each VBLANK, `time`
-	// the refresh's and `next` the next one's, in the guest's mach_absolute_time, the host's
-	// stamps mapped into it (RgfxVblankClock.hpp).
+	// called on the work loop for each client: `present(client, seqno, status, time)` for every
+	// COMPLETE (each pipe client picks its own seqnos), `time` that of the refresh whose answer
+	// it is, and, while the client's setPipeVblankEnabled is on, `vblank(client, count, time,
+	// next)` for each VBLANK, `time` the refresh's and `next` the next one's. Times are the
+	// guest's mach_absolute_time, the host's stamps mapped into it (RgfxVblankClock.hpp).
 	// removePipe lets one go; the last one's going shows the scanout again where the pipe
 	// showed a surface (thread context only).
 	// The scanout as it is now (setScanout): its shape, bytes per row and offset in the region.
@@ -160,7 +160,7 @@ public:
 	RgfxAccelerator *copyAccelerator();
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
-	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status);
+	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno);
 	bool addPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
 	void removePipe(OSObject *client);

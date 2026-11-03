@@ -11,6 +11,10 @@
 // kDriftNs a refresh, so it follows the clocks if they drift apart (at most 0.24 ms a second at
 // 120 Hz), and a mapped time never goes back.
 //
+// A display pipe transaction completes at the host's answer, which the host gives in the refresh
+// that showed its surface, right after that refresh's VBLANK: its time is that refresh's
+// (shownAt), where the answer comes within the refresh's period after the VBLANK's receipt.
+//
 // Our own code.
 #ifndef RGFX_VBLANK_CLOCK_HPP_
 #define RGFX_VBLANK_CLOCK_HPP_
@@ -49,6 +53,7 @@ public:
 		count_ = count;
 		hostNs_ = hostNs;
 		time_ = time;
+		receipt_ = receipt;
 		return time;
 	}
 
@@ -57,12 +62,23 @@ public:
 	uint64_t next() const { return have_ ? time_ + period_ : 0; }
 	uint64_t period() const { return period_; }
 
+	// The time of the refresh whose answer is taken at `now`: the last refresh's, where `now` is
+	// within its period after that refresh's VBLANK was taken; else `now` (no VBLANK came
+	// lately: the device's VBLANKs are off).
+	uint64_t shownAt(uint64_t now) const
+	{
+		if (have_ && now >= receipt_ && now - receipt_ < period_)
+			return time_;
+		return now;
+	}
+
 private:
 	bool have_ = false;
 	int64_t offset_ = 0;
 	uint64_t count_ = 0;
 	uint64_t hostNs_ = 0;
 	uint64_t time_ = 0;
+	uint64_t receipt_ = 0;
 	uint64_t period_ = kDefaultPeriodNs;
 };
 

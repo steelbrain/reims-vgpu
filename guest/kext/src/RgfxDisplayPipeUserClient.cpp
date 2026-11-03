@@ -493,16 +493,18 @@ void RgfxDisplayPipeUserClient::completeLocked(const Transactions::Completion &c
 	IOLockWakeup(lock, &completed, false);
 }
 
-void RgfxDisplayPipeUserClient::presentHook(OSObject *client, UInt64 seqno, UInt32 status)
+void RgfxDisplayPipeUserClient::presentHook(OSObject *client, UInt64 seqno, UInt32 status,
+                                            UInt64 time)
 {
 	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, client);
 	if (self)
-		self->presented(seqno, status);
+		self->presented(seqno, status, time);
 }
 
 // The host answered a COMPLETE: where it is one of our PRESENT_SURFACEs, the display shows that
-// transaction's surface, so it and every transaction before it are done, oldest first.
-void RgfxDisplayPipeUserClient::presented(UInt64 seqno, UInt32 status)
+// transaction's surface since the refresh at `time`, so it and every transaction before it are
+// done then, oldest first.
+void RgfxDisplayPipeUserClient::presented(UInt64 seqno, UInt32 status, UInt64 time)
 {
 	IOLockLock(lock);
 	Transactions::Completion done[kMaxOutstanding];
@@ -516,9 +518,8 @@ void RgfxDisplayPipeUserClient::presented(UInt64 seqno, UInt32 status)
 		IOLog("RGFX pipe: transaction %u: the host did not show its IOSurface (status %u)\n",
 		      done[n - 1].id, status);
 	}
-	UInt64 now = mach_absolute_time();
 	for (UInt32 i = 0; i < n; i++)
-		completeLocked(done[i], now);
+		completeLocked(done[i], time);
 	IOLockUnlock(lock);
 }
 

@@ -23,9 +23,10 @@
  * returns at once. The transaction completes when the host answers that PRESENT_SURFACE, which
  * it does once the display shows the surface: a waiter returns, and its completion notification
  * goes out where it carries a cookie (RgfxPipeTransactions.hpp). An answer completes every
- * transaction submitted before it, oldest first. At most two are outstanding; a third submit
- * waits up to five seconds for room, then fails unsent. A transaction with no IOSurface on
- * plane 0 keeps the surface shown and completes with the one before it, or at once.
+ * transaction submitted before it, oldest first, each at the time of the refresh the host
+ * answered in (the device's VBLANK stamp in the guest's clock). At most two are outstanding; a
+ * third submit waits up to five seconds for room, then fails unsent. A transaction with no
+ * IOSurface on plane 0 keeps the surface shown and completes with the one before it, or at once.
  *
  * A VBL registration is a request for one notification, at the next refresh, as the interface's
  * kernel side answers it: the request's callback and refcon (its first two words), then the
@@ -84,8 +85,8 @@ private:
 
 	// The framebuffer's hooks (ReimsGraphics::addPipe), on its work loop.
 	static void vblankHook(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
-	static void presentHook(OSObject *client, UInt64 seqno, UInt32 status);
-	void presented(UInt64 seqno, UInt32 status);
+	static void presentHook(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
+	void presented(UInt64 seqno, UInt32 status, UInt64 time);
 	void completeLocked(const Transactions::Completion &c, UInt64 time);
 	void sendVbl(UInt64 time, UInt64 next);
 

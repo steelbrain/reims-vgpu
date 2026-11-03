@@ -438,7 +438,9 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 			return;
 		UInt32 status = size >= sizeof(uint32_t) ? field32(payload, 0) : kStatusUnreadable;
 		answer(seqno, status);
-		// Every pipe client: the one whose transaction this answers takes it.
+		// Every pipe client: the one whose transaction this answers takes it, at the time of
+		// the refresh the host answered in.
+		UInt64 shown = vblankClock.shownAt(mach_absolute_time());
 		OSObject *clients[kMaxPipeClients];
 		IOSimpleLockLock(interruptLock);
 		UInt32 n = pipes.all(clients);
@@ -448,7 +450,7 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		IOSimpleLockUnlock(interruptLock);
 		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
-				hook(clients[i], seqno, status);
+				hook(clients[i], seqno, status, shown);
 			clients[i]->release();
 		}
 		return;

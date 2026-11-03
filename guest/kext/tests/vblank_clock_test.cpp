@@ -1,7 +1,7 @@
 // The display's refreshes in the guest's clock (RgfxVblankClock.hpp), built natively: a refresh's
 // time is its host stamp plus the clocks' offset with the shortest delivery, never after its
-// receipt and never going back; the offset follows a drift; and the period comes from the
-// stamps.
+// receipt and never going back; the offset follows a drift; the period comes from the stamps;
+// and an answer taken within a period after a VBLANK is that refresh's.
 #include <cstdio>
 
 #include "RgfxVblankClock.hpp"
@@ -23,6 +23,7 @@ static void first()
 {
 	RgfxVblankClock c;
 	CHECK(c.last() == 0 && c.next() == 0);
+	CHECK(c.shownAt(123) == 123); // no VBLANK yet: the answer's own time
 	// The first: its receipt's offset, 60 Hz assumed for the next.
 	CHECK(c.vblank(1, 1000000, 1000000 + kOffset + 40000) == 1000000 + kOffset + 40000);
 	CHECK(c.next() == c.last() + RgfxVblankClock::kDefaultPeriodNs);
@@ -77,12 +78,28 @@ static void neverBack()
 	CHECK(b > a);
 }
 
+static void shown()
+{
+	RgfxVblankClock c;
+	uint64_t host = 1000000;
+	c.vblank(1, host, host + kOffset + 20000);
+	uint64_t t = c.vblank(2, host + kPeriod, host + kPeriod + kOffset + 20000);
+	uint64_t receipt = host + kPeriod + kOffset + 20000;
+	// Taken with the VBLANK, or later within its period: that refresh's time.
+	CHECK(c.shownAt(receipt) == t);
+	CHECK(c.shownAt(receipt + kPeriod - 1) == t);
+	// A period or more after it, or before it: the answer's own time.
+	CHECK(c.shownAt(receipt + kPeriod) == receipt + kPeriod);
+	CHECK(c.shownAt(receipt - 1) == receipt - 1);
+}
+
 int main()
 {
 	first();
 	shortestDelivery();
 	drift();
 	neverBack();
+	shown();
 	if (g_failed) {
 		std::fprintf(stderr, "vblank_clock_test: %d of %d checks failed\n", g_failed, g_checks);
 		return 1;
