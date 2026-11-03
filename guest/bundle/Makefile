@@ -31,6 +31,8 @@
 #                   only needs to COMPILE off the guest, not run).
 #   make sweep      the guest's correctness sweep of the system frameworks on the device
 #                   (tools/sweep), build/sweep-x86_64; ARCH=arm64 for an Apple-silicon Mac.
+#   make pipelines  shader and pipeline costs (tools/pipelines), build/pipelines-x86_64 and
+#                   build/pipelines-metallibs/; ARCH=arm64 for an Apple-silicon Mac.
 #   make bench      the GPU benchmark (tools/bench), build/bench-x86_64; ARCH=arm64 for an
 #                   Apple-silicon Mac.
 #   make res        what resources cost (tools/res), build/res-x86_64; ARCH=arm64 likewise.
@@ -388,6 +390,42 @@ $(SUBMITBIN): tools/submit_probe.m Makefile
 		-Wall -Wextra -Werror -Wno-unused-parameter tools/submit_probe.m -framework Foundation \
 		-framework Metal -o $@
 
+# --- the shader and pipeline costs (tools/pipelines; pipelines.m says what each case measures) --
+# One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
+# run on a real device, never in `make test`. Its source compiles in (pipelines_source.h, from
+# pipelines.metal) for newLibraryWithSource:, and into PIPELINES_LIBS metallibs, one nonce each,
+# for newLibraryWithData:. Their nonces come from PIPELINES_SEED (default: the build's clock), so
+# a new build's metallibs are new to every cache. Built for macOS 14 and Metal 3.0, which a
+# guest's Metal on macOS 26 takes.
+PIPELINESBIN  = $(BUILD)/pipelines-$(ARCH)
+PIPELINES_LIBDIR = $(BUILD)/pipelines-metallibs
+PIPELINES_LIBS = 8
+PIPELINES_SEED ?= $(shell expr $$(date +%s) % 1000000 + 1000000)
+
+pipelines: $(PIPELINESBIN) $(PIPELINES_LIBDIR)/stamp
+
+$(BUILD)/pipelines_source.h: tools/pipelines/pipelines.metal Makefile
+	@mkdir -p $(@D)
+	cd tools/pipelines && xxd -i -n pipelines_metal pipelines.metal > ../../$@
+
+$(PIPELINESBIN): tools/pipelines/pipelines.m $(BUILD)/pipelines_source.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter -I $(BUILD) tools/pipelines/pipelines.m \
+		-framework Foundation -framework Metal -o $@
+
+$(PIPELINES_LIBDIR)/stamp: tools/pipelines/pipelines.metal Makefile
+	@mkdir -p $(@D)
+	rm -f $(@D)/pipelines-*.metallib $(@D)/*.air
+	for i in $$(seq 0 $$(($(PIPELINES_LIBS) - 1))); do \
+		n=$$(( $(PIPELINES_SEED) * 16 + i )); \
+		xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=14.0 -DRGFX_NONCE=$${n}u \
+			tools/pipelines/pipelines.metal -o $(@D)/p$$i.air && \
+		xcrun -sdk macosx metallib $(@D)/p$$i.air -o $(@D)/pipelines-$$(printf %02d $$i).metallib || exit 1; \
+	done
+	rm -f $(@D)/*.air
+	echo $(PIPELINES_SEED) > $@
+
 # --- the stitchable reflection's check against Metal's own (tools/reflection_check.mm) ---------
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`: it compares with Metal's own compiler's answers.
@@ -405,4 +443,6 @@ $(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArgume
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench res submit-probe reflection-check peer-test peer-test-build clean
+.PHONY: all test bundle package sweep bench pipelines res submit-probe reflection-check peer-test peer-test-build \
+	clean
+
