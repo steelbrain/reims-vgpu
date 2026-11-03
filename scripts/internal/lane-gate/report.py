@@ -106,7 +106,8 @@ class Run:
         self.meta = json.loads(read(os.path.join(path, "meta.json"), "{}"))
 
     def item(self, name, status, detail=""):
-        self.items[name] = {"status": status, "detail": detail.strip()[:300]}
+        # A crash report's summary keeps its frames; any other detail its first 300 characters.
+        self.items[name] = {"status": status, "detail": detail.strip()[:1500 if name.endswith("crash-reports") else 300]}
 
     # A boot's items and metrics carry its leg's prefixes: the correctness boot's items none and its
     # metrics "shared." (numbers taken beside other VMs, shown and never gated), the bench boot's
@@ -155,7 +156,7 @@ class Run:
     def guest(self, text):
         self.phases = {}
         self.video_offer, self.metal_device = None, None
-        crashes = None
+        crashes, crash_lines = None, []
         for line in text.splitlines():
             m = re.match(r"([0-9.]+) (.*)$", line)
             if not m:
@@ -175,6 +176,8 @@ class Run:
                 self.video_offer = {"hevc": m2 is not None and m2.group(1) == "1"}
             elif body.startswith("GATE crashes "):
                 crashes = body[len("GATE crashes "):].strip()
+            elif body.startswith("GATE crash "):
+                crash_lines.append(body[len("GATE crash "):].strip())
             elif body.startswith("GATE webgl "):
                 try:
                     w = json.loads(body[len("GATE webgl "):])
@@ -228,7 +231,8 @@ class Run:
             names = sorted({re.sub(r"[-_]\d{4}-\d\d-\d\d.*$", "", c) for c in crashes.split() if c != "none"})
             self.crashes = names
             ws = [n for n in names if "WindowServer" in n]
-            self.litem("guest.crash-reports", "FAIL" if ws else "PASS", ", ".join(names) or "none new")
+            self.litem("guest.crash-reports", "FAIL" if ws else "PASS",
+                       "; ".join([", ".join(names) or "none new"] + crash_lines))
         for p, (a, b) in self.phases.items():
             if a is None or b is None:
                 self.litem("phase." + p, "FAIL", "started but did not end (a hang the alarm or the hold cut)")

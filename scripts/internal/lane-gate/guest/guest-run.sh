@@ -193,6 +193,15 @@ run_final() {
 	if [ $# -eq 3 ]; then item desktop-end PASS "WindowServer $1, Dock $2, Finder $3"; else item desktop-end FAIL "WindowServer/Dock/Finder: $desk"; fi
 	new=$(reports | comm -13 "$D/reports-before.txt" - | tr '\n' ' ')
 	echo "GATE crashes ${new:-none}"
+	# Each new report's exception and faulting thread's top frames (ips-summary.js).
+	local r f
+	for r in $new; do
+		for f in "/Library/Logs/DiagnosticReports/$r" "$HOME/Library/Logs/DiagnosticReports/$r"; do
+			[ -f "$f" ] || continue
+			echo "GATE crash $r: $(limit 20 osascript -l JavaScript "$D/ips-summary.js" "$f" 2>&1 | head -c 1500)"
+			break
+		done
+	done
 }
 
 for p in $PHASES; do
