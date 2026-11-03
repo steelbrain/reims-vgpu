@@ -62,6 +62,7 @@
 #include <os/lock.h>
 #include <vector>
 
+#include "RgfxCommitOrder.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
@@ -602,6 +603,11 @@ struct RgfxBarrierSlot {
 - (BOOL)rgfxEnqueue:(RgfxCmdBuffer *)cb;
 /// Posts the buffers at the front of the enqueue order that are ready, in that order.
 - (void)rgfxPostReady;
+/// Before a buffer of the queue goes on its ring: the buffers of the process's other queues it
+/// is to be committed after (RgfxCommitOrder::name), none where the queue takes no part.
+- (std::vector<RgfxSurfaceOrderWait>)rgfxNameCommitOrder;
+/// A buffer of the queue went on its ring at `seqno` (RgfxCommitOrder::posted).
+- (void)rgfxNotePosted:(uint64_t)seqno;
 @end
 
 @implementation RgfxCommandQueue {
@@ -652,6 +658,11 @@ struct RgfxBarrierSlot {
 	std::deque<RgfxCmdBuffer *> _order;
 	bool _postingFront;
 	std::recursive_mutex _postLock;
+	// Its process's commit order (rgfxJoinCommitOrder:), its slot there, and what its posts named
+	// last, which only its posts read and write, one at a time (`_postLock`).
+	std::shared_ptr<RgfxCommitOrder> _commitOrder;
+	size_t _commitSlot;
+	RgfxCommitNamed _commitNamed;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -715,6 +726,8 @@ struct RgfxBarrierSlot {
 {
 	if (_ownedReader != nullptr)
 		_ownedReader->close();
+	if (_commitOrder != nullptr)
+		_commitOrder->leave(_commitSlot);
 	if (_serializer != nullptr)
 		_serializer->destroyQueue(_objId);
 	if (_release)
@@ -724,6 +737,28 @@ struct RgfxBarrierSlot {
 - (void)rgfxSetRelease:(std::function<void()>)release
 {
 	_release = std::move(release);
+}
+
+- (void)rgfxJoinCommitOrder:(std::shared_ptr<RgfxCommitOrder>)order
+{
+	if (order == nullptr || _commitOrder != nullptr)
+		return;
+	_commitSlot = order->join(_objId);
+	_commitOrder = std::move(order);
+}
+
+- (std::vector<RgfxSurfaceOrderWait>)rgfxNameCommitOrder
+{
+	std::vector<RgfxSurfaceOrderWait> waits;
+	if (_commitOrder != nullptr)
+		_commitOrder->name(_commitSlot, _commitNamed, waits);
+	return waits;
+}
+
+- (void)rgfxNotePosted:(uint64_t)seqno
+{
+	if (_commitOrder != nullptr)
+		_commitOrder->posted(_commitSlot, seqno);
 }
 
 - (NSUInteger)maxCommandBufferCount
@@ -1637,6 +1672,12 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 			whileWaiting = [reader] { reader->pump(); };
 	}
 
+	// The buffers of the process's other queues put on their rings since this queue last named
+	// them, which the host commits this one after, as Metal orders a tracked resource across
+	// queues by commit (RgfxCommitOrder.hpp); read before this one goes on its ring.
+	const std::vector<RgfxSurfaceOrderWait> commitOrder = [queue rgfxNameCommitOrder];
+	_encoder->prependCommitOrder(commitOrder.data(), commitOrder.size());
+
 	// Post the command buffer on the queue's submission ring, waiting for room; one too
 	// large for the ring lies in a block of the queue's pool, which the ring names, held until
 	// it completes. Its size sizes the queue's next messages first.
@@ -1656,6 +1697,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 			rgfxNoteIcbFlush(flush);
 	}
 	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
+	// On its ring: the posts of other queues from here name it (RgfxCommitOrder::posted).
+	if (posted)
+		[queue rgfxNotePosted:_seqno];
 	// A present of a surface it writes, made after this commit, waits for it on the host; and so
 	// does a buffer of another queue committed after it that uses the surface, where one of the two
 	// writes it (rgfxIOSurfaceNameUses).

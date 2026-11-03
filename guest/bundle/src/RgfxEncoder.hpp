@@ -554,6 +554,9 @@ public:
 	/// Puts one RGFX_OP_SURFACE_ORDER naming `waits` (`count` of them, none among them) before
 	/// the op stream's first op, as prependSurfaceUses does.
 	void prependSurfaceOrder(const RgfxSurfaceOrderWait *waits, size_t count);
+	/// Puts one RGFX_OP_COMMIT_ORDER naming `waits` (`count` of them) before the op stream's first
+	/// op, as prependSurfaceOrder does; nothing where `count` is 0.
+	void prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t count);
 	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
 	/// with retained references keeps what it encodes: `keep(context, object)` for each one
 	/// (once for a run of the same object), from the encode until the buffer completes or goes.

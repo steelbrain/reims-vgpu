@@ -149,6 +149,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// stops reading its completion ring, then the serialiser ends it (destroyQueue), then this
 /// runs.
 - (void)rgfxSetRelease:(std::function<void()>)release;
+
+/// The queue takes part in its process's commit order `order` (RGFX_FEATURE_COMMIT_ORDER;
+/// RgfxCommitOrder.hpp): each of its buffers names, as it goes on the ring, the latest buffer
+/// each other queue in `order` put on its ring since, and the queue's slot goes as it does.
+/// Once, before its first commit.
+- (void)rgfxJoinCommitOrder:(std::shared_ptr<class RgfxCommitOrder>)order;
 #endif
 
 @end

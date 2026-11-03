@@ -114,6 +114,10 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 		reader->setRoomEvents(room);
 		submit->setRoomEvents(room);
 	}
+	// Where the host commits a process's command buffers in the order its queues put them on
+	// their rings, the queue takes part in the process's commit order (RgfxCommitOrder.hpp): the
+	// device made one where its word holds RGFX_FEATURE_COMMIT_ORDER.
+	[queue rgfxJoinCommitOrder:[self commitOrder]];
 	// The process's completion thread takes the ring's completions from now on, whether or
 	// not anything waits for them.
 	if (RgfxCompletionThread *completions = [self completionThread])

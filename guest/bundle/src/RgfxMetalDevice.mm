@@ -30,6 +30,7 @@
 #include <os/log.h>
 #include <vector>
 
+#include "RgfxCommitOrder.hpp"
 #include "RgfxCompletionThread.hpp"
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxRegion.hpp"
@@ -468,6 +469,8 @@ RGFX_LOG_UNRECOGNIZED
 	std::unique_ptr<RgfxCompletionThread> _completions; // the queues' completions; null until then
 	RgfxKextLink _link;          // the lifecycle's route to the kext
 	std::shared_ptr<RgfxKnownPipelines> _knownPipelines; // null where the kext defers no answers
+	// The order of its command buffers across its queues (RgfxCommitOrder.hpp), made with it.
+	std::shared_ptr<RgfxCommitOrder> _commitOrder;
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	std::mutex _queueRingsLock;  // queues are made and end on any thread
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
@@ -556,6 +559,10 @@ RGFX_LOG_UNRECOGNIZED
 	// Where the host orders command buffers of different queues over the surfaces they share,
 	// this process names each one's order (rgfxIOSurfaceNameUses).
 	rgfxIOSurfaceSetOrder((_caps.features() & RGFX_FEATURE_SURFACE_ORDER) != 0);
+	// Where the host commits in the order the process's queues put their buffers on their rings,
+	// each queue takes part in it (newCommandQueue; RgfxCommitOrder.hpp).
+	if ((_caps.features() & RGFX_FEATURE_COMMIT_ORDER) != 0)
+		_commitOrder = std::make_shared<RgfxCommitOrder>();
 
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers
@@ -669,6 +676,11 @@ RGFX_LOG_UNRECOGNIZED
 - (RgfxIdSpace *)ids
 {
 	return &_ids;
+}
+
+- (std::shared_ptr<RgfxCommitOrder>)commitOrder
+{
+	return _commitOrder;
 }
 
 - (RgfxStateCache *)stateCache

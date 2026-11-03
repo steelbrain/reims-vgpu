@@ -58,6 +58,7 @@
 #ifdef __cplusplus
 #include <memory>
 
+class RgfxCommitOrder;
 class RgfxKnownPipelines;
 class RgfxSerializer;
 class RgfxRegion;
@@ -89,6 +90,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// The per-device id space (object ids, GPU addresses, resource ids).
 - (RgfxIdSpace *)ids;
+
+/// The order of the process's command buffers across its queues, which each queue takes part in
+/// where the device's word holds RGFX_FEATURE_COMMIT_ORDER (RgfxCommitOrder.hpp).
+- (std::shared_ptr<RgfxCommitOrder>)commitOrder;
 
 /// The device's samplers and depth/stencil states, one for equal descriptors (RgfxStateCache.h).
 /// Nil where the wire handshake failed.

@@ -197,6 +197,16 @@ void RgfxEncoder::prependSurfaceOrder(const RgfxSurfaceOrderWait *waits, size_t 
 		std::memcpy(at + RGFX_OP_BODY_OFFSET, waits, count * sizeof(RgfxSurfaceOrderWait));
 }
 
+void RgfxEncoder::prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t count)
+{
+	if (count == 0)
+		return;
+	const size_t len = RGFX_OP_BODY_OFFSET + count * sizeof(RgfxSurfaceOrderWait);
+	uint8_t *at = prependRoom(len);
+	putHeader(at, RGFX_OP_COMMIT_ORDER, len);
+	std::memcpy(at + RGFX_OP_BODY_OFFSET, waits, count * sizeof(RgfxSurfaceOrderWait));
+}
+
 uint8_t *RgfxEncoder::prependRoom(size_t bytes)
 {
 	// Before the header's room: the ops move up where the room before them is short.

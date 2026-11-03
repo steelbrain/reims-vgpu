@@ -52,6 +52,7 @@
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
 
+#include "RgfxCommitOrder.hpp"
 #include "RgfxHeapSizes.hpp"
 #include "RgfxSlabs.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
@@ -8132,6 +8133,165 @@ void test_iosurface_writers()
 	CFRelease(surface);
 }
 
+// A process's commit order (RgfxCommitOrder.hpp; design.md, "Commit order"): a queue that takes
+// part names, before its buffer goes on its ring, once and before its first other op
+// (RGFX_OP_COMMIT_ORDER), the latest buffer each other queue that takes part put on its ring since
+// this queue last named that queue: never its own queue, nor a queue that takes no part, nor one
+// that put nothing on its ring since. A buffer that finds nothing new carries no op.
+void test_commit_order()
+{
+	// Never freed, as Fixture's: the queues and their buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	auto order = std::make_shared<RgfxCommitOrder>();
+	auto queueMade = [&](bool joins) {
+		drainRing(control);
+		RgfxCommandQueue *q = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                              submitOffset:0
+		                                            completeOffset:0
+		                                          completeDataSize:0
+		                                                       ids:&ids
+		                                                  maxCount:0
+		                                                    device:nil
+		                                                serializer:&ser];
+		CHECK(q != nil);
+		(void)expectQueueCreate(control);
+		if (joins)
+			[q rgfxJoinCommitOrder:order];
+		return q;
+	};
+	using Named = std::vector<std::pair<uint64_t, uint64_t>>;
+	// What a commit carried: its seqno, whether it named its order, and the buffers it named.
+	struct Committed {
+		uint64_t seqno = 0;
+		bool order = false;
+		Named named;
+	};
+	auto commit = [&](RgfxCommandQueue *q) {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		Committed out;
+		out.seqno = h.seqno;
+		size_t at = RGFX_COMMAND_BUFFER_OPS_OFFSET;
+		bool first = true;
+		while (at + sizeof(RgfxOpHeader) <= bytes.size()) {
+			RgfxOpHeader op = {};
+			std::memcpy(&op, bytes.data() + at, sizeof(op));
+			CHECK(op.len >= RGFX_OP_BODY_OFFSET && at + op.len <= bytes.size());
+			if (op.tag == RGFX_OP_COMMIT_ORDER) {
+				const size_t body = op.len - RGFX_OP_BODY_OFFSET;
+				CHECK(first && !out.order && body % sizeof(RgfxSurfaceOrderWait) == 0);
+				out.order = true;
+				for (size_t i = 0; i < body / sizeof(RgfxSurfaceOrderWait); i++) {
+					RgfxSurfaceOrderWait w = {};
+					std::memcpy(&w, bytes.data() + at + RGFX_OP_BODY_OFFSET + i * sizeof(w),
+					            sizeof(w));
+					out.named.push_back({w.queue_obj_id, w.seqno});
+				}
+				std::sort(out.named.begin(), out.named.end());
+				CHECK(!out.named.empty());
+			}
+			first = false;
+			at += op.len;
+		}
+		drainRing(control);
+		return out;
+	};
+	auto sorted = [](Named n) {
+		std::sort(n.begin(), n.end());
+		return n;
+	};
+	@autoreleasepool {
+		RgfxCommandQueue *a = queueMade(true), *b = queueMade(true), *c = queueMade(true);
+		RgfxCommandQueue *apart = queueMade(false);
+		// Nothing on another queue's ring yet: no op.
+		Committed a1 = commit(a);
+		CHECK(!a1.order);
+		// A buffer after it on another queue names it.
+		Committed b1 = commit(b);
+		CHECK(b1.order && b1.named == Named({{a.rgfxObjId, a1.seqno}}));
+		// Nothing new since: no op.
+		Committed b2 = commit(b);
+		CHECK(!b2.order);
+		// Never its own queue: a names b's latest, once.
+		Committed a2 = commit(a);
+		CHECK(a2.order && a2.named == Named({{b.rgfxObjId, b2.seqno}}));
+		// A queue that takes no part names nothing and is named by none.
+		Committed x1 = commit(apart);
+		CHECK(!x1.order);
+		// A third queue's first buffer names each other's latest.
+		Committed c1 = commit(c);
+		CHECK(c1.order &&
+		      c1.named == sorted({{a.rgfxObjId, a2.seqno}, {b.rgfxObjId, b2.seqno}}));
+		Committed b3 = commit(b);
+		CHECK(b3.order &&
+		      b3.named == sorted({{a.rgfxObjId, a2.seqno}, {c.rgfxObjId, c1.seqno}}));
+		CHECK(!commit(apart).order);
+	}
+	drainRing(control);
+}
+
+// Two queues posting at once never name each other's buffers both ways: a post reads the other
+// queue's latest before its buffer goes on its ring and raises its own after, so where one waits
+// for the other, the other was on its ring before the read, and its own read came before this
+// one's raise.
+void test_commit_order_names_no_cycle()
+{
+	RgfxCommitOrder order;
+	constexpr int kPosts = 20000;
+	struct Post {
+		uint64_t seqno;
+		uint64_t named; // the other queue's seqno it names, 0 for none
+	};
+	std::vector<Post> posts[2];
+	auto run = [&](int me) {
+		const size_t slot = order.join(0x100 + static_cast<uint64_t>(me));
+		CHECK(slot != RgfxCommitOrder::kNoSlot);
+		RgfxCommitNamed named;
+		uint64_t last = 0;
+		for (int i = 1; i <= kPosts; i++) {
+			std::vector<RgfxSurfaceOrderWait> waits;
+			order.name(slot, named, waits);
+			CHECK(waits.size() <= 1);
+			// What it names is cumulative: the latest named stands for every one before it.
+			if (!waits.empty())
+				last = waits[0].seqno;
+			posts[me].push_back({static_cast<uint64_t>(i), last});
+			order.posted(slot, static_cast<uint64_t>(i));
+		}
+	};
+	std::thread t0(run, 0), t1(run, 1);
+	t0.join();
+	t1.join();
+	// Post p of queue 0 waits for queue 1 through p.named; post q of queue 1 waits for queue 0
+	// through q.named. A cycle: q.seqno <= p.named and p.seqno <= q.named.
+	size_t j = 0;
+	for (const Post &p : posts[0]) {
+		// The posts of queue 1 that p waits for are 1..p.named; any of them that waits for p
+		// names queue 0 at p.seqno or past. The named seqnos only rise, so the first of them that
+		// can is the one to check: queue 1's posts up to p.named, the last of which names most.
+		if (p.named == 0)
+			continue;
+		while (j + 1 < posts[1].size() && posts[1][j + 1].seqno <= p.named)
+			j++;
+		CHECK(posts[1][j].seqno <= p.named);
+		CHECK(posts[1][j].named < p.seqno);
+	}
+}
+
 // A process that names its command buffers' order (rgfxIOSurfaceSetOrder; RgfxIOSurface.h): a
 // commit of a buffer that uses a surface names, once and before its first other op
 // (RGFX_OP_SURFACE_ORDER), the buffers of other queues it runs after, as the surface's block names
@@ -10391,6 +10551,8 @@ int main(int argc, char **argv)
 		test_iosurface_planes();
 		test_iosurface_writers();
 		test_iosurface_order();
+		test_commit_order();
+		test_commit_order_names_no_cycle();
 		test_iosurface_writes_named();
 		test_iosurface_writes_by_function();
 		test_iosurface_in_place();
