@@ -180,6 +180,12 @@ impl ImportView {
         false
     }
 
+    /// Whether the runtime is told the import's pages are writable: never on macOS, where it
+    /// asks the kernel nothing of them either way.
+    pub(crate) fn vouched(&self) -> bool {
+        false
+    }
+
     /// The runtime's deallocator of the import, and what keeps the import's memory mapped beside
     /// the bytes themselves: `inner`, as it is, and nothing, as the runtime imports the bytes.
     pub(crate) fn release(
@@ -205,6 +211,21 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
 pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>, _logged: bool) -> rt::HostMemory {
     // SAFETY: the caller's.
     unsafe { rt::HostMemory::new(at) }
+}
+
+/// [`host_memory`]: on macOS the runtime asks nothing of the pages' permissions, so a vouch
+/// changes nothing.
+///
+/// # Safety
+///
+/// [`host_memory`]'s.
+pub(crate) unsafe fn host_memory_vouched(
+    at: std::ptr::NonNull<u8>,
+    logged: bool,
+    _vouched: bool,
+) -> rt::HostMemory {
+    // SAFETY: the caller's.
+    unsafe { host_memory(at, logged) }
 }
 
 /// Why this thread's last dma-buf source made none: never, on macOS, where imports carry none.

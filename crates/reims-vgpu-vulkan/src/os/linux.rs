@@ -33,8 +33,8 @@ pub use vm::LinuxVm;
 #[cfg(test)]
 pub(crate) use import::views_through_dma_bufs;
 pub(crate) use import::{
-    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view,
-    learn_view_imports, shown_at,
+    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, host_memory_vouched,
+    import_view, learn_view_imports, shown_at,
 };
 pub(crate) use surface::{
     base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,

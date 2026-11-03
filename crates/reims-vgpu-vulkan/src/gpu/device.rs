@@ -392,26 +392,43 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// own address, and the keep-alive, which the runtime drops once it freed its import: it holds
 /// the twin, and an unmap hold on the bytes' pages, so that core's unmap of its mapping of them
 /// through the platform's VM, which its deallocator may make, waits for the free
-/// ([`crate::remap::UnmapHold`]); and whether the import is a writable twin of read-only pages,
-/// whose GPU writes reach them where Metal drops them ([`Backing::writes_kept`]).
+/// ([`crate::remap::UnmapHold`]); whether the import is a writable twin of read-only pages,
+/// whose GPU writes reach them where Metal drops them ([`Backing::writes_kept`]); and whether
+/// the runtime may be told the pages are writable ([`crate::os::ImportView::vouched`]).
 fn no_copy_release(
     start: NonNull<u8>,
     length: u64,
     run: Option<rt::Deallocator>,
     site: backing::ImportSite,
-) -> (NonNull<u8>, Option<rt::Deallocator>, rt::KeepAlive, bool) {
+) -> NoCopyImport {
     let view = crate::os::import_view(start, length);
     let imported = view.at();
     let kept = view.writes_kept();
+    let vouched = view.vouched();
     let (run, twin) = view.release(start, run);
     let hold = crate::remap::UnmapHold::new(start, length);
     let traced = backing::ImportTrace::new(site, start, length, imported);
-    (
-        imported,
+    NoCopyImport {
+        at: imported,
         run,
-        backing::keep_alive((twin, hold, traced)),
+        keep: backing::keep_alive((twin, hold, traced)),
         kept,
-    )
+        vouched,
+    }
+}
+
+/// What [`no_copy_release`] gives the runtime for a no-copy object.
+struct NoCopyImport {
+    /// The first byte the runtime imports.
+    at: NonNull<u8>,
+    /// The runtime's deallocator.
+    run: Option<rt::Deallocator>,
+    /// What keeps the import's pages mapped until the runtime freed it.
+    keep: rt::KeepAlive,
+    /// The import is a writable twin of read-only pages.
+    kept: bool,
+    /// The runtime may be told the pages are writable.
+    vouched: bool,
 }
 
 /// [`create`] of a buffer, its nil answer logged with its reason, once ([`no_buffer`]): `pinned`
@@ -991,13 +1008,20 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let token = placing.token();
         // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
         // and what keeps them mapped until the runtime freed its import.
-        let (imported, run, keep, kept) =
-            no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
+        let NoCopyImport {
+            at: imported,
+            run,
+            keep,
+            kept,
+            vouched,
+        } = no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
         let made = create_buffer(sel, placed_nil(&placing, Nil::BufferLength), None, || {
             // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
             // runs, or for the buffer's life with none, and an unmap of core's through the
-            // platform's VM waits for the keep-alive; a twin of them stays until it goes.
-            let memory = unsafe { crate::os::host_memory(imported, bytes.logged()) };
+            // platform's VM waits for the keep-alive; a twin of them stays until it goes; and a
+            // vouch is the table's record of the pages as they are mapped now.
+            let memory =
+                unsafe { crate::os::host_memory_vouched(imported, bytes.logged(), vouched) };
             let contents = rt::BufferContents::NoCopy {
                 memory,
                 deallocator: run,
@@ -1713,7 +1737,13 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     })
                 });
                 own = Some(backing::Own::new(start, held));
-                let (imported, run, keep, twinned) = no_copy_release(
+                let NoCopyImport {
+                    at: imported,
+                    run,
+                    keep,
+                    kept: twinned,
+                    vouched,
+                } = no_copy_release(
                     start,
                     bytes.len(),
                     run,
@@ -1724,8 +1754,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
                     // deallocator runs, or for the buffer's life with none, and an unmap of
                     // core's through the platform's VM waits for the keep-alive; a twin of them
-                    // stays until it goes.
-                    memory: unsafe { crate::os::host_memory(imported, bytes.logged()) },
+                    // stays until it goes; and a vouch is the table's record of the pages as they
+                    // are mapped now.
+                    memory: unsafe {
+                        crate::os::host_memory_vouched(imported, bytes.logged(), vouched)
+                    },
                     deallocator: run,
                     keep_alive: Some(keep),
                 }
@@ -1946,15 +1979,21 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let start = pointer(sel, bytes.ptr());
         // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
         // and what keeps them mapped until the runtime freed its import.
-        let (imported, _, keep, kept) =
-            no_copy_release(start, bytes.len(), None, backing::ImportSite::Heap);
+        let NoCopyImport {
+            at: imported,
+            keep,
+            kept,
+            vouched,
+            ..
+        } = no_copy_release(start, bytes.len(), None, backing::ImportSite::Heap);
         let heap = create(sel, Policy::Dies, nil, || {
             // SAFETY: `HostRange::new`'s contract keeps the bytes mapped for the heap's life, and
             // an unmap of core's through the platform's VM waits for the keep-alive; they cover
             // the heap's size rounded up to the runtime's granule (checked above) and start on a
-            // page, the runtime's import unit on this host.
+            // page, the runtime's import unit on this host; and a vouch is the table's record of
+            // the pages as they are mapped now.
             let made = unsafe {
-                let memory = crate::os::host_memory(imported, bytes.logged());
+                let memory = crate::os::host_memory_vouched(imported, bytes.logged(), vouched);
                 match token {
                     Some(token) => self.raw.new_heap_with_bytes_no_copy_and_range_token(
                         memory,
@@ -2413,6 +2452,39 @@ pub(crate) mod tests {
         );
         let line = crate::answer::LAST_LINE.lock().clone().unwrap();
         assert!(line.contains(&format!("{refused:#x}")), "{line}");
+    }
+
+    /// A no-copy buffer over pages the table shows mapped writable is imported with the runtime
+    /// told so, which asks the kernel nothing of them (its count of the mappings it asked about
+    /// stays); once one of the pages is protected read-only, the next buffer over them imports
+    /// a twin with no vouch, and the runtime asks again
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_buffer_is_vouched_for_while_its_pages_are_writable() {
+        use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
+
+        const PAGE: u64 = 0x1000;
+        let d = dev();
+        let vm = crate::os::OsVm::new();
+        let at = crate::os::allocate_aliasable(2 * PAGE).unwrap();
+        let queried = || d.raw.work_counts().host_mappings_queried;
+        let buffer = || {
+            // SAFETY: the pages stay mapped until the deallocation below, after the buffer's drop.
+            let bytes = unsafe { HostRange::new(at, 2 * PAGE) };
+            d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, None)
+                .unwrap()
+                .unwrap()
+        };
+        let before = queried();
+        let vouched = buffer();
+        assert_eq!(queried(), before, "vouched for: nothing asked");
+        drop(vouched);
+        let second = HostPtr::from_addr(at.addr() + 0x1000);
+        assert!(vm.protect_max(second, PAGE, VmProt::READ).is_ok());
+        let checked = buffer();
+        assert!(queried() > before, "a twin, not vouched for: the runtime asked");
+        drop(checked);
+        assert!(vm.deallocate(at, 2 * PAGE).is_success());
     }
 
     /// A no-copy buffer over a mapping of core's, released while a command buffer that reads it
