@@ -896,8 +896,11 @@ and goes after a second with none, whatever other processes do. Tested by
 `a_context_s_first_message_waits_for_the_close_before_it_whatever_its_number`,
 `a_sync_create_is_answered_before_its_context_s_later_messages_are_carried_out`,
 `a_context_s_answer_comes_before_one_published_ahead_of_it_by_another_context`,
-`a_reset_drops_what_the_lanes_have_not_begun` and
-`an_idle_lane_goes_while_another_context_s_is_busy`.
+`a_reset_drops_what_the_lanes_have_not_begun`,
+`an_idle_lane_goes_while_another_context_s_is_busy` and
+`lanes_keep_every_order_over_random_interleavings`, which checks random
+interleavings of several processes' messages against an order worked out from
+the messages alone.
 
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process

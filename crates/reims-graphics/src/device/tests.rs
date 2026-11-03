@@ -2533,6 +2533,8 @@ fn a_taking_write_starts_and_resets_as_a_plain_one() {
     );
 }
 
+/// A fuzz of ring 0's lanes (`lanes_fuzz.rs`).
+mod lanes_fuzz;
 /// The wire round trip with a fake peer (`peer.rs`).
 mod peer;
 
