@@ -521,7 +521,7 @@ EOF
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
   for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log xid.txt \
-    capture.txt; do
+    capture.txt kext-stalls.txt; do
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true

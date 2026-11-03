@@ -44,6 +44,28 @@ START=$(date +%s)
 T0=$START
 log() { echo "$(date +%T) $*" | tee -a "$R/boot.log"; }
 kv() { echo "$1 $2" >> "$R/host.txt"; }
+# The lane host's display as the boot met it: the lid, and each output kwin drives (kscreen-doctor
+# in the desktop session's Wayland display): "lid=closed eDP-1=3840x2400@120,scale=1.9", as KEY.
+display_state() {
+  local lid outs u w
+  lid=$(awk '{print $2}' /proc/acpi/button/lid/*/state 2> /dev/null | head -1)
+  u=$(id -u)
+  for w in /run/user/$u/wayland-[0-9]*; do
+    [[ -S $w ]] || continue
+    outs=$(XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus WAYLAND_DISPLAY=${w##*/} \
+      QT_QPA_PLATFORM=wayland timeout 5 kscreen-doctor -j 2> /dev/null | python3 -I -c '
+import json, sys
+for o in json.load(sys.stdin).get("outputs", []):
+    if not o.get("connected"):
+        continue
+    m = {x["id"]: x for x in o.get("modes", [])}.get(o.get("currentModeId"), {})
+    z = m.get("size", {})
+    v = "%sx%s@%.0f,scale=%s" % (z.get("width"), z.get("height"), m.get("refreshRate", 0), o.get("scale"))
+    print(o.get("name") + "=" + (v if o.get("enabled") else "off"))' 2> /dev/null | tr '\n' ' ')
+    [[ -n $outs ]] && break
+  done
+  kv "$1" "lid=${lid:-none} ${outs:-outputs=unread}"
+}
 : > "$R/boot.log"
 : > "$R/host.txt"
 
@@ -236,6 +258,7 @@ esac
 # The boot's own time: from QEMU's first line to SSH answering.
 [[ -n $T_QEMU ]] && kv boot_ssh_s "$(sub "$T_SSH" "$T_QEMU")"
 log "QEMU $P up, SSH answers"
+display_state display_start
 
 # This run's background helpers close every descriptor above 2 first: none may hold the GPU
 # locks' descriptors, which gpu-locks.sh hands down, past this script's end.
@@ -316,7 +339,7 @@ for f in ~/Desktop/*.png; do
 done
 SHOTS
   Gcp "$GUEST_USER@127.0.0.1:lane-gate-shots" "$R/capture/shots" 2> /dev/null && G 'rm -rf ~/lane-gate-shots' 2> /dev/null
-  G "echo '$GUEST_PASS' | sudo -S -p '' perl -e 'alarm 180; exec @ARGV' log show --last boot --style compact --predicate 'sender == \"ReimsGraphics\"'" \
+  G "echo '$GUEST_PASS' | sudo -S -p '' perl -e 'alarm 180; exec @ARGV' log show --last boot --style compact --predicate 'senderImagePath CONTAINS \"ReimsGraphics\"'" \
     > "$R/capture/kext.log" 2> /dev/null
   line=$(grep -m1 -oE 'scanout [0-9]+x[0-9]+ at [0-9.]+ Hz, stride [0-9]+' "$R/capture/kext.log")
   mode=${CAPTURE_MODE:-3840x2400}
@@ -451,8 +474,9 @@ done
 kv guest_rc "$guest_rc"
 log "guest run done"
 
-# The window drags (msi-drag.py): a plain window and a glass one, each dragged DRAG_S seconds over
-# QMP while the guest tracks the window, with the host's display updates and CPU in that span.
+# The window drags (msi-drag.py): a plain window and a glass one dragged, a window resized live and
+# Mission Control opened and closed, each for DRAG_S seconds over QMP while the guest tracks the
+# window, with the host's display updates and CPU in that span.
 if [[ ${DRAG:-1} == 1 ]] && (( $(left) > 150 )); then
   log "window drags"
   PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS DRAG_S=${DRAG_S:-10} \
@@ -463,6 +487,36 @@ fi
 kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
 stop_load
 stop_clocks
+display_state display_end
+
+# The kext's and bundle's texture-create stalls over the boot ("its previous block is cached still,
+# its release unanswered: it is not cached", about 2 s each): kext-stalls.txt "HOST_EPOCH
+# S_AFTER_DESKTOP" a hit, from the guest's log (its times set against the host's clock over SSH).
+# block_stalls counts them, block_stalls_early those in the 60 s after the desktop came up.
+h0=$(date +%s.%N | cut -c1-14)
+gt=$(G "perl -MTime::HiRes=time -e 'printf \"%.3f\\n\", time'" 2> /dev/null)
+h1=$(date +%s.%N | cut -c1-14)
+if [[ $gt =~ ^[0-9.]+$ ]] && G "echo '$GUEST_PASS' | sudo -S -p '' perl -e 'alarm 120; exec @ARGV' log show --last boot --style ndjson \
+    --predicate 'senderImagePath CONTAINS \"ReimsGraphics\" AND eventMessage CONTAINS \"its previous block is cached still\"'" \
+    > "$R/kext-stalls.ndjson" 2> /dev/null; then
+  python3 -I - "$R/kext-stalls.ndjson" "$(awk -v a="$h0" -v b="$h1" -v g="$gt" 'BEGIN { printf "%.3f", (a + b) / 2 - g }')" \
+    "${T_DESK:-0}" > "$R/kext-stalls.txt" << 'PY'
+import datetime, json, sys
+off, desk = float(sys.argv[2]), float(sys.argv[3])
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        e = json.loads(line)
+        t = datetime.datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z").timestamp() + off
+    except (ValueError, KeyError):
+        continue
+    print(f"{t:.3f} {t - desk:.1f}")
+PY
+  kv block_stalls "$(grep -c . "$R/kext-stalls.txt")"
+  kv block_stalls_early "$(awk '$2 >= 0 && $2 <= 60' "$R/kext-stalls.txt" | grep -c .)"
+  [[ -d $R/capture ]] && cp "$R/kext-stalls.txt" "$R/capture/"
+else
+  kv block_stalls unread
+fi
 
 # The screen as WindowServer composed it, read back by the guest: the screenshot a person takes
 # with Command-Shift-3, the keys sent over QMP to the guest's keyboard. The system's screenshot

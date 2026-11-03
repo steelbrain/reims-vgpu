@@ -476,6 +476,24 @@ class Run:
             self.litem("host.no-xid", "FAIL" if own else "PASS",
                        (f"{len(own)} from this boot's QEMU: {', '.join(own)}" if own
                         else "no Xid line from this boot's QEMU") + more)
+        # The lane host's display beside the boot: its lid and each output's mode, at the start and
+        # the end (kwin's state may move the numbers).
+        if "display_start" in kv:
+            end = kv.get("display_end", "not read")
+            self.litem("host.display", "PASS", kv["display_start"] + ("" if end == kv["display_start"] else f"; at the end {end}"))
+        # The texture-create stalls the guest logged ("its previous block is cached still"), about
+        # 2 s each: one in the 60 s after the desktop came up fails the boot.
+        if kv.get("block_stalls") == "unread":
+            self.litem("guest.block-cache-stalls", "NOTRUN", "the guest's log could not be read")
+        elif "block_stalls" in kv:
+            hits = [l.split() for l in read(os.path.join(r, "kext-stalls.txt")).splitlines() if len(l.split()) == 2]
+            early = int(kv.get("block_stalls_early", "0") or 0)
+            at = ", ".join(f"{float(h[1]):+.1f} s" for h in hits[:20]) + (" ..." if len(hits) > 20 else "")
+            self.litem("guest.block-cache-stalls", "FAIL" if early else "PASS",
+                       f"{len(hits)} 'its previous block is cached still' stalls" + (f", {early} in the 60 s after the desktop came up" if early else "")
+                       + (f"; at {at} from the desktop" if hits else ""))
+            if kv["block_stalls"].isdigit():
+                self.lmetric("host.block_stalls", float(kv["block_stalls"]))
         # The boot capture (msi-boot.sh's CAPTURE): what it kept, on the lane host.
         cap = read(os.path.join(r, "capture.txt")).strip()
         if cap:
