@@ -80,7 +80,7 @@ use crate::graphics::decode::{
     SubmittedSink, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
-use crate::graphics::present::{PresentAnswers, PresentQueue};
+use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
@@ -519,7 +519,7 @@ impl<P: Platform> Presented<P> {
     pub(crate) fn drawn(self: &Arc<Self>) -> DrawnPresents<P> {
         DrawnPresents {
             presented: Arc::clone(self),
-            answers: self.answers.drawn(),
+            drawing: self.answers.drawn(),
         }
     }
 
@@ -556,12 +556,13 @@ impl<P: Platform> Presented<P> {
 }
 
 /// The presents a window's draw shows: answered at the refresh after the draw has finished on the
-/// GPU ([`DrawnPresents::after`]), or after the draw is dropped before its commit.
+/// GPU ([`DrawnPresents::after`]), or after the draw is dropped before its commit, once every
+/// present shown before them is ([`PresentAnswers::refreshed`]).
 pub(crate) struct DrawnPresents<P: Platform> {
     /// Where they are answered.
     presented: Arc<Presented<P>>,
-    /// Their answers.
-    answers: Vec<PresentAnswer>,
+    /// The presents the draw took.
+    drawing: Drawing,
 }
 
 impl<P: Platform> DrawnPresents<P> {
@@ -569,7 +570,7 @@ impl<P: Platform> DrawnPresents<P> {
     /// handler holds them. Called before its commit; where the handler is refused, or the buffer
     /// is never committed, they are answered as if it had finished.
     pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
-        if self.answers.is_empty() {
+        if self.drawing.is_empty() {
             return;
         }
         no_catch(command_buffer.add_completed_handler(OnFault::Die, Box::new(move |_| drop(self))));
@@ -580,7 +581,7 @@ impl<P: Platform> Drop for DrawnPresents<P> {
     fn drop(&mut self) {
         self.presented
             .answers
-            .done(std::mem::take(&mut self.answers));
+            .done(std::mem::take(&mut self.drawing));
     }
 }
 

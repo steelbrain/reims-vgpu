@@ -38,12 +38,22 @@
 //! the host's window does, and the guest's compositor must not wait on the window. A guest that
 //! presents once a vblank so never meets its limit of two: a frame drawn as it is made is
 //! answered at the next vblank, and one the window does not draw at the second.
+//!
+//! The answers go in the order the presents were shown, none while the window's draw of an
+//! earlier present still runs: the guest completes its transactions oldest first, so a later
+//! present's answer completes every earlier one too and frees its surface for the guest's
+//! compositor to draw into, while the window's draw may still be copying out of it. Answered
+//! out of order, a present the window had not drawn by its second refresh freed the surface
+//! of a draw still running on the GPU; the compositor's next frame then landed in it under the
+//! copy, and the window showed that newer frame, then the older one it had presented between,
+//! then the newer again.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
 use reims_graphics::{CompletionPoster, PresentAnswer};
+use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
@@ -279,10 +289,43 @@ pub(crate) struct PresentAnswers<A> {
 struct AnswersState<A> {
     /// The device's refreshes so far.
     refreshes: u64,
-    /// The presents shown that the window has not drawn, each with the refresh count at its show.
-    undrawn: Vec<(A, u64)>,
-    /// The presents whose draw has finished, or will not come: answered at the next refresh.
-    due: Vec<A>,
+    /// The number the next present shown takes.
+    next: u64,
+    /// The presents shown and not yet answered, in the order shown, their numbers counting up
+    /// from the front's.
+    owed: VecDeque<Owed<A>>,
+}
+
+/// A present shown and not yet answered.
+struct Owed<A> {
+    answer: A,
+    /// The refresh count at its show.
+    shown_at: u64,
+    /// Where the window's draw of it is.
+    draw: Draw,
+}
+
+/// Where the window's draw of a present is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Draw {
+    /// The window has not taken it.
+    Not,
+    /// A draw took it and has not finished.
+    Running,
+    /// Its draw finished on the GPU, or will not come.
+    Done,
+}
+
+/// The presents a draw of the window took ([`PresentAnswers::drawn`]), by their numbers, which
+/// it hands back once it has finished or will not ([`PresentAnswers::done`]).
+#[derive(Debug, Default)]
+pub(crate) struct Drawing(std::ops::Range<u64>);
+
+impl Drawing {
+    /// Whether the draw took no present.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl<A> Default for PresentAnswers<A> {
@@ -290,8 +333,8 @@ impl<A> Default for PresentAnswers<A> {
         PresentAnswers {
             state: Mutex::new(AnswersState {
                 refreshes: 0,
-                undrawn: Vec::new(),
-                due: Vec::new(),
+                next: 0,
+                owed: VecDeque::new(),
             }),
         }
     }
@@ -301,38 +344,73 @@ impl<A: Answer> PresentAnswers<A> {
     /// A present is shown; the window will draw it.
     pub(crate) fn shown(&self, answer: A) {
         let mut state = self.state.lock();
-        let at = state.refreshes;
-        state.undrawn.push((answer, at));
+        let shown_at = state.refreshes;
+        state.next += 1;
+        state.owed.push_back(Owed {
+            answer,
+            shown_at,
+            draw: Draw::Not,
+        });
     }
 
-    /// The window draws the latest present: the answers of every present shown so far, which
+    /// The window draws the latest present: every present shown so far that no draw took, which
     /// the draw hands back to [`Self::done`] once it has finished or will not.
-    pub(crate) fn drawn(&self) -> Vec<A> {
+    pub(crate) fn drawn(&self) -> Drawing {
         let mut state = self.state.lock();
-        state.undrawn.drain(..).map(|(answer, _)| answer).collect()
+        let end = state.next;
+        let mut first = end;
+        for (owed, number) in state.owed.iter_mut().rev().zip((0..end).rev()) {
+            if owed.draw != Draw::Not {
+                break;
+            }
+            owed.draw = Draw::Running;
+            first = number;
+        }
+        Drawing(first..end)
     }
 
-    /// A draw of `answers`' presents has finished on the GPU, or will not come: they are
-    /// answered at the next refresh.
-    pub(crate) fn done(&self, answers: Vec<A>) {
-        if !answers.is_empty() {
-            self.state.lock().due.extend(answers);
+    /// The draw that took `drawing`'s presents has finished on the GPU, or will not come: they
+    /// are answered at the next refresh, once every present shown before them is.
+    pub(crate) fn done(&self, drawing: Drawing) {
+        if drawing.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock();
+        let front = state.next - state.owed.len().to_u64();
+        for number in drawing.0 {
+            if let Some(owed) = number
+                .checked_sub(front)
+                .and_then(|i| state.owed.get_mut(i.to_usize()))
+            {
+                owed.draw = Draw::Done;
+            }
         }
     }
 
     /// A refresh of the device's display: the presents whose draw has finished are answered, and
-    /// those not drawn by the second refresh after their show.
+    /// those no draw took by the second refresh after their show, oldest first, up to the first
+    /// whose draw still runs or that is not yet due. The guest completes its transactions oldest
+    /// first, so an answer frees every earlier present's surface for the guest to draw into: none
+    /// is given while the window's draw of an earlier one still reads its surface.
     pub(crate) fn refreshed(&self) {
         let answers: Vec<A> = {
             let mut state = self.state.lock();
             state.refreshes += 1;
             let now = state.refreshes;
-            let mut answers = std::mem::take(&mut state.due);
-            let (late, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.undrawn)
-                .into_iter()
-                .partition(|&(_, at)| at + 2 <= now);
-            state.undrawn = waiting;
-            answers.extend(late.into_iter().map(|(answer, _)| answer));
+            let mut answers = Vec::new();
+            while let Some(front) = state.owed.front() {
+                let due = match front.draw {
+                    Draw::Done => true,
+                    Draw::Not => front.shown_at + 2 <= now,
+                    Draw::Running => false,
+                };
+                if !due {
+                    break;
+                }
+                if let Some(owed) = state.owed.pop_front() {
+                    answers.push(owed.answer);
+                }
+            }
             answers
         };
         for answer in answers {
@@ -347,7 +425,7 @@ mod tests {
 
     use reims_vgpu_core::sync::Mutex;
 
-    use super::{Answer, PresentAnswers};
+    use super::{Answer, Drawing, PresentAnswers};
 
     /// An answer that records the refresh it was given at.
     struct Recorded {
@@ -384,7 +462,7 @@ mod tests {
         let refresh = Arc::new(Mutex::new(0u64));
         let mut shown_at = Vec::new();
         let mut waited = Vec::new();
-        let mut late = Vec::new();
+        let mut late = Drawing::default();
         for r in 1..=refreshes {
             *refresh.lock() = r;
             answers.refreshed();
@@ -439,6 +517,66 @@ mod tests {
                 assert_eq!(at, shown + delay, "frame {frame}'s answer");
             }
         }
+    }
+
+    /// No present is answered while one shown before it waits for its draw to finish: the guest
+    /// completes its transactions oldest first, so a later present's answer would free the
+    /// earlier one's surface for the guest to draw into while the window's draw still reads it
+    #[test]
+    fn a_late_answer_never_overtakes_a_draw_still_running() {
+        let answers = PresentAnswers::<Recorded>::default();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Mutex::new(0u64));
+        let rec = |frame| Recorded {
+            frame,
+            log: Arc::clone(&log),
+            refresh: Arc::clone(&refresh),
+        };
+        answers.shown(rec(0));
+        // The window takes frame 0 and its draw runs on.
+        let drawing = answers.drawn();
+        answers.shown(rec(1));
+        for r in 1..=3 {
+            *refresh.lock() = r;
+            answers.refreshed();
+        }
+        assert!(
+            log.lock().is_empty(),
+            "frame 1 answered while frame 0's draw runs: {:?}",
+            log.lock()
+        );
+        answers.done(drawing);
+        *refresh.lock() = 4;
+        answers.refreshed();
+        assert_eq!(*log.lock(), [(0, 4), (1, 4)]);
+    }
+
+    /// A later draw that finishes, or is dropped, first waits for the earlier one still running:
+    /// both are answered at the refresh after the earlier finishes, in order
+    #[test]
+    fn a_later_draw_done_first_waits_for_the_earlier() {
+        let answers = PresentAnswers::<Recorded>::default();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Mutex::new(0u64));
+        let rec = |frame| Recorded {
+            frame,
+            log: Arc::clone(&log),
+            refresh: Arc::clone(&refresh),
+        };
+        answers.shown(rec(0));
+        let first = answers.drawn();
+        answers.shown(rec(1));
+        let second = answers.drawn();
+        answers.done(second);
+        for r in 1..=3 {
+            *refresh.lock() = r;
+            answers.refreshed();
+        }
+        assert!(log.lock().is_empty(), "answered: {:?}", log.lock());
+        answers.done(first);
+        *refresh.lock() = 4;
+        answers.refreshed();
+        assert_eq!(*log.lock(), [(0, 4), (1, 4)]);
     }
 
     /// A present is never answered before the window's draw of it has finished, while the
