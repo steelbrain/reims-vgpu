@@ -356,19 +356,23 @@ do_ship() {  # the gate's own scripts, which the host's steps run
     "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
   msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
 }
-do_corpus() {  # the decode streams, copied once from the configured source
-  local names
+do_corpus() {  # the decode streams, copied once from the configured sources
+  local names odd
   names=$(cat "$L/guest/h264.list" "$L/guest/hevc.list" | awk '!/^#/ && NF {print $1}')
-  msi bash -s -- "$MSI_GATE/corpus" "$MSI_CORPUS_SRC" $names << 'EOF'
+  odd=$(cat "$L/guest/h264-odd.list" "$L/guest/hevc-odd.list" | awk '!/^#/ && NF {print "odd/" $1}')
+  msi bash -s -- "$MSI_GATE/corpus" "$MSI_CORPUS_SRC" "${MSI_CORPUS_ODD:-}" $names $odd << 'EOF'
 set -euo pipefail
-dst=$1 src=$2; shift 2
-mkdir -p "$dst"
+dst=$1 src=$2 oddsrc=$3; shift 3
+mkdir -p "$dst/odd"
 for s in "$@"; do
+  from=$src/$s
+  [[ $s == odd/* ]] && from=$oddsrc/${s#odd/}
   for f in "$s" "${s%.*}.md5"; do
-    [[ -f $dst/$f ]] || cp --reflink=auto "$src/$f" "$dst/$f"
+    [[ -f $dst/$f ]] || cp --reflink=auto "$(dirname "$from")/$(basename "$f")" "$dst/$f"
   done
 done
-cd "$dst" && sha256sum $(ls | grep -v MANIFEST) > MANIFEST && echo "corpus $(sha256sum < MANIFEST | cut -c1-16), $(ls | wc -l) files"
+cd "$dst" && find . -type f ! -name MANIFEST | sort | xargs sha256sum > MANIFEST &&
+  echo "corpus $(sha256sum < MANIFEST | cut -c1-16), $(find . -type f | wc -l) files"
 EOF
 }
 do_stage() {

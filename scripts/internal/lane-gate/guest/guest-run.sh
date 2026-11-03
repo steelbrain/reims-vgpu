@@ -4,7 +4,8 @@
 #   GATE_PASS=<the user's password> bash guest-run.sh DIR [PHASE...]
 # DIR holds sweep, bench, present_probe and decode_md5 (x86_64 builds of guest/bundle/tools),
 # webgl.html, webgl-serve.pl, h264.list and hevc.list (the decode sets: their streams, in corpus/
-# beside each one's reference .md5, with the timed passes after a stream whose rate is measured).
+# beside each one's reference .md5, with the timed passes after a stream whose rate is measured),
+# and h264-odd.list and hevc-odd.list (odd sizes and crops, in corpus/odd/).
 #
 # It prints what it finds as lines the gate's report reads ("GATE item NAME PASS|FAIL|SKIP
 # detail", "GATE metric NAME VALUE"), each phase between "GATE phase NAME start" and "... end",
@@ -150,14 +151,17 @@ run_sweep() {
 }
 
 # decode: every stream of both sets, MD5s only; decodefps: the timed streams, MD5s and timed passes.
+# The sets h264 and hevc are corpus/'s streams, h264-odd and hevc-odd corpus/odd/'s (odd sizes and
+# crops); a stream's items are decode.SET.NAME.
 run_decode() {
-	local set s loops
-	for set in h264 hevc; do
+	local set s loops dir
+	for set in h264 hevc h264-odd hevc-odd; do
 		[ -f "$set.list" ] || { item "decode-$set" SKIP "no $set.list"; continue; }
+		case $set in *-odd) dir=corpus/odd ;; *) dir=corpus ;; esac
 		while read -r s loops; do
 			case $s in ''|'#'*) continue ;; esac
 			if [ -n "${TIMED:-}" ]; then [ -n "$loops" ] || continue; else loops=0; fi
-			limit 90 ./decode_md5 -l "$loops" "corpus/$s" 2>&1 | grep '^decode_md5: ' | sed "s/^decode_md5: /decode_md5: $set /"
+			limit 90 ./decode_md5 -l "$loops" "$dir/$s" 2>&1 | grep '^decode_md5: ' | sed "s/^decode_md5: /decode_md5: $set /"
 		done < "$set.list"
 	done
 }

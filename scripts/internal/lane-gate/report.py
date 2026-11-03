@@ -253,7 +253,7 @@ class Run:
         for name, it in self.items.items():
             if not name.startswith(self.ip + "decode.") or it["status"] != "SKIP":
                 continue
-            codec = name[len(self.ip + "decode."):].split(".")[0]
+            codec = name[len(self.ip + "decode."):].split(".")[0].split("-")[0]  # hevc-odd's is hevc
             label = labels.get(codec, codec)
             vt = f"VideoToolbox finds no hardware {label} decoder"
             accel = ""

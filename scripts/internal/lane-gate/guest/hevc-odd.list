@@ -1,0 +1,7 @@
+# The HEVC decode set of odd sizes and crops: a stream of corpus/odd/ a line (lane-gate.sh copies
+# them from MSI_CORPUS_ODD), as rgk-video lands them.
+hevc-main-1280x722.265
+hevc-main-1366x766.265
+hevc-main-1366x768.265
+hevc-main-720p-croplt.265
+hevc-main-854x480.265
