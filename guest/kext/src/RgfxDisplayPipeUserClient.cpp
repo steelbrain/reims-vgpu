@@ -27,8 +27,12 @@ constexpr UInt32 kScalerSize = 24;
 // Inside a notification registration: its kind.
 constexpr UInt32 kNotifyKind = 0x10;
 
-// Inside a transaction: its id and options, plane 0 (0x40 bytes), and the cookie its
-// completion carries back.
+// Inside a transaction: its dirty mask, the time it asks to be shown at (where the mask has
+// kDirtyTimestamp; read only for the log), its id and options, plane 0 (0x40 bytes), and the
+// cookie its completion carries back.
+constexpr UInt32 kTxnDirty = 0x0;
+constexpr UInt32 kTxnTimestamp = 0x8;
+constexpr UInt64 kDirtyTimestamp = 0x100;
 constexpr UInt32 kTxnId = 0x10;
 constexpr UInt32 kTxnOptions = 0x14;
 constexpr UInt32 kTxnPlane0 = 0x18;
@@ -392,11 +396,18 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 	UInt32 surface = rd32(t, kTxnPlane0 + kPlaneSurface);
 	UInt64 cookie = rd64(t, kTxnCookie);
 	bool log = id <= kLogFirst / 4 || id % kLogEvery == 0;
-	if (log)
-		IOLog("RGFX pipe: transaction %u (begun %u): dirty %llx options %x plane0 type %u "
-		      "ids %u %u cookie %llx\n",
-		      id, self->begun, rd64(t, 0), rd32(t, kTxnOptions), planeType, surface,
+	if (log) {
+		UInt64 dirty = rd64(t, kTxnDirty);
+		// The time asked for, in microseconds from now (0 where it asks for none).
+		long long at = (dirty & kDirtyTimestamp)
+		                   ? (static_cast<long long>(rd64(t, kTxnTimestamp)) -
+		                      static_cast<long long>(mach_absolute_time())) / 1000
+		                   : 0;
+		IOLog("RGFX pipe: transaction %u (begun %u): dirty %llx at %lld us options %x plane0 "
+		      "type %u ids %u %u cookie %llx\n",
+		      id, self->begun, dirty, at, rd32(t, kTxnOptions), planeType, surface,
 		      rd32(t, kTxnPlane0 + kPlaneSurface + 4), cookie);
+	}
 	IOLockLock(self->lock);
 	if (self->begun == id)
 		self->begun = 0;
