@@ -7,20 +7,25 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out three:
+// its bundle carry out four:
 //  - SURFACE_ORDER (bit 11): the bundle names, as it commits a command buffer that uses
 //    IOSurfaces, the buffers of other queues it runs after (design.md, "Surface order"), which
 //    needs nothing of the kext;
 //  - INDIRECT_COMMAND_BUFFERS (bit 12): the kext admits ICB_CREATE and ICB_WRITE, answers a create
 //    with its ICB_STATE and destroys behind one not answered in time, and the bundle makes
 //    indirect command buffers only where the word holds the bit;
+//  - UNSHARED_QUEUES (bit 13): the accelerator flags each queue WindowServer's process creates
+//    RGFX_QUEUE_UNSHARED (rgfxQueueFlagsSent), so that the host gives it a GPU queue no other
+//    process's queue shares (design.md, "WindowServer's queues are unshared"), which needs nothing
+//    of the bundle;
 //  - MANAGED_AT_OFFSET (bit 14): the bundle places its Managed buffers' CPU copies in heaps over
 //    its blocks (BUFFER_MANAGED_AT_OFFSET, which Submit posts as it posts BUFFER_AT_OFFSET), which
 //    needs nothing more of the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
-// was taken (rgfxQueueFlagsGranted).
+// was taken (rgfxQueueFlagsGranted). RGFX_QUEUE_UNSHARED is never granted to a process that asks
+// for it: the kext alone sets it, from the kernel's own view of the client's task.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/features_test.cpp)
 // builds it as the kext does.
@@ -39,7 +44,7 @@ constexpr uint64_t kRgfxOfferedFeatures =
 // DRIVER_FEATURES where the host offers them.
 constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_SURFACE_ORDER | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS |
-    RGFX_FEATURE_MANAGED_AT_OFFSET;
+    RGFX_FEATURE_UNSHARED_QUEUES | RGFX_FEATURE_MANAGED_AT_OFFSET;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
@@ -65,6 +70,18 @@ inline uint32_t rgfxQueueFlagsGranted(uint32_t wanted, uint64_t word)
 	if (word & RGFX_FEATURE_CONSUMED_DOORBELL)
 		allowed |= RGFX_QUEUE_CONSUMED_DOORBELL;
 	return wanted & allowed;
+}
+
+// The flags a queue's QUEUE_CREATE carries: those `granted` to its process
+// (rgfxQueueFlagsGranted), and RGFX_QUEUE_UNSHARED for a queue of WindowServer's (`windowServer`,
+// the client's task as initWithTask found it) where the feature word holds UNSHARED_QUEUES. A
+// host that does not offer the feature never sees the flag, and a create with no flag goes
+// without the tail, as a wire-2 kext sends it.
+inline uint32_t rgfxQueueFlagsSent(uint32_t granted, bool windowServer, uint64_t word)
+{
+	if (windowServer && (word & RGFX_FEATURE_UNSHARED_QUEUES))
+		granted |= RGFX_QUEUE_UNSHARED;
+	return granted;
 }
 
 #endif // RGFX_FEATURES_HPP_

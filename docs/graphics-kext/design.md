@@ -703,13 +703,16 @@ only where no negotiation can carry it.
   `kIOReturnUnsupported`, and the bundle then works by the device info's
   `features_lo` bits 0-2, with no kext feature.
 - Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
-  `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bit 9 is
+  `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bits 9-12 are
   reserved. No host offers one of them yet, the kext takes none, and the host
-  carries out no queue flag: each lands with its feature, which says what it
-  changes.
+  carries out none of their queue flags: each lands with its feature, which
+  says what it changes.
 - Bit 10 is reserved for a pipeline's warm-up, and bit 11 is `SURFACE_ORDER`:
   a command buffer that uses IOSurfaces runs after the buffers of other queues
   it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below).
+- Bit 13, `UNSHARED_QUEUES`, every host offers and the kext takes: the queue
+  flag `RGFX_QUEUE_UNSHARED` (`1 << 3`; `1 << 2` is reserved), which the kext
+  sets on WindowServer's queues ("WindowServer's queues are unshared", below).
 - Bit 14 is `MANAGED_AT_OFFSET`: ring 0 carries `BUFFER_MANAGED_AT_OFFSET`, a
   Managed buffer whose CPU copy the host places in a heap over host memory of
   the sender's, so no buffer imports host memory of its own (the slabs,
@@ -827,6 +830,22 @@ signing identifier and its platform-binary status (`cs_identity_get`,
 `csproc_get_platform_binary`), are in `com.apple.kpi.private`, which a kext
 outside Apple's namespace cannot link. Resolving them at run time through the
 loader is not worth its risk.
+
+**WindowServer's queues are unshared.** The host's runtime may let command
+queues share a GPU queue, which raises the rate of small command buffers on a
+GPU whose switches between queues idle it. A shared queue can then hold
+another process's long command buffer ahead of the compositor's frame. So
+the accelerator flags every queue WindowServer's process creates
+`RGFX_QUEUE_UNSHARED` in its `QUEUE_CREATE`'s tail, where the host offered
+`UNSHARED_QUEUES` and the framebuffer took it (`rgfxQueueFlagsSent`,
+`RgfxFeatures.hpp`). It decides from its own test of the client's task at
+the open (above), never from what the process asks: `QueueCreate`'s seventh
+input never grants the flag. The host makes such a queue with the platform's
+`new_command_queue_unshared` (`GpuDevice`): on the Vulkan platform the
+runtime's queue `unshared_queue` makes, and on Metal the queue any create
+makes. The host logs each unshared queue
+at info level (`reims_vgpu::graphics`). Nothing the guest's processes see
+changes.
 
 **Reset.** A reset leaves the device as one just made, as a device's
 function reset does: `STATUS` 0, which the framebuffer writes at its start,

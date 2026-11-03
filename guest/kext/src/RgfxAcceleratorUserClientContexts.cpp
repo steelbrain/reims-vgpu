@@ -91,15 +91,17 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return owner->freeBlock(this, in[0]);
 	case kRgfxAccelMethodQueueCreate: {
 		// Six inputs, or a seventh of the flags the process wants with a second output of the
-		// flags granted.
+		// flags granted. A queue of WindowServer's is also made unshared where the host took the
+		// feature (rgfxQueueFlagsSent), whatever the process asked: the second output answers only
+		// what it asked for and was granted.
 		const bool flagged = a->scalarInputCount == 7;
 		if ((a->scalarInputCount != 6 && !flagged) || a->scalarOutputCount != (flagged ? 2u : 1u) ||
 		    !hasContext)
 			return kIOReturnBadArgument;
 		if (flagged && in[6] > UINT32_MAX)
 			return kIOReturnBadArgument;
-		const UInt32 granted =
-		    flagged ? rgfxQueueFlagsGranted(static_cast<uint32_t>(in[6]), owner->featureWord()) : 0;
+		const uint64_t word = owner->featureWord();
+		const UInt32 granted = flagged ? rgfxQueueFlagsGranted(static_cast<uint32_t>(in[6]), word) : 0;
 		RgfxQueueCreate open = {};
 		open.obj_id = in[0];
 		open.submit_offset = in[1];
@@ -141,7 +143,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			unpin();
 			return watch;
 		}
-		UInt32 status = owner->openQueue(open, granted);
+		UInt32 status = owner->openQueue(open, rgfxQueueFlagsSent(granted, windowServer, word));
 		if (status == RGFX_STATUS_OK)
 			queues[queueCount++] = open.obj_id;
 		else
