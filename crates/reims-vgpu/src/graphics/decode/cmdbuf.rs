@@ -154,6 +154,14 @@ impl Submitted {
     }
 }
 
+/// What a command buffer's completion handler posts and lets go where its submission handler has
+/// not ([`submission_handler`]): its `CB_SUBMITTED`, its hold of its queue and its `CB_SCHEDULED`.
+type Unposted = (
+    Option<Arc<Submitted>>,
+    Option<Arc<Held>>,
+    Option<Arc<Scheduled>>,
+);
+
 /// A command buffer's `CB_SCHEDULED`, posted once: by its submission handler, or, for a buffer the
 /// platform failed before it took its work, which runs no submission handler, by its completion
 /// handler ahead of its completion, so each buffer's comes before its `CB_COMPLETE`.
@@ -888,11 +896,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: EventOps,
         drain: Option<Arc<Drain>>,
         stand_in: bool,
-        (submitted, held, scheduled): (
-            Option<Arc<Submitted>>,
-            Option<Arc<Held>>,
-            Option<Arc<Scheduled>>,
-        ),
+        (submitted, held, scheduled): Unposted,
     ) -> CompletedHandler {
         let sink = self.sinks.completion.clone();
         let signal_sink = self.sinks.signal.clone();
