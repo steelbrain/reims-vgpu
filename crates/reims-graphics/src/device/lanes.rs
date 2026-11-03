@@ -3,18 +3,26 @@
 //! only that context's later messages (docs/graphics-kext/design.md, "Ring 0's lanes").
 //!
 //! **Lanes.** The control thread takes ring 0 in ring order, as before, and hands each
+//! `SURFACE_PAGES` and `SURFACE_DOWNLOAD` to the lane of the block it names, each other
 //! object-lifecycle message of a context's ([`backlog`](super::backlog)'s `Whose::Context`) to
 //! the context's lane, and each `PRESENT_SURFACE` to the presents' lane. A lane carries its jobs
 //! out one at a time, in the order they were handed, on a thread made as a job comes to a lane
 //! with none, which goes once the lane has had no job for [`IDLE`]. The control thread carries
-//! the rest out itself: the display commands, a `SURFACE_DOWNLOAD`, and a message no lane is
-//! for, which the host refuses.
+//! the rest out itself: the display commands, and a message no lane is for, which the host
+//! refuses.
+//!
+//! A block's lane keeps the messages that make and copy what the host holds of the block's pages
+//! (its view and device cache) in ring order, whichever process posted them and for whichever
+//! context, and holds them up behind no context's lane: a `SURFACE_PAGES` the kext posts for a
+//! surface's maker from another process's CPU lock, or once the maker has closed, and the
+//! `SURFACE_DOWNLOAD` or `BLOCK_RELEASE` it posts next without waiting for the answer, are
+//! carried out in that order while the maker's lane is behind a slow message.
 //!
 //! **What waits for a lane.** A command buffer of context `c` waits for every message of `c`'s
-//! published before its queue took it ([`Lanes::through`]), as it waited for the control thread
-//! before. A job waits only for jobs handed before it: its own lane's, by the lane's order, and
-//! another lane's where its message reads what that lane's messages change, by the edges it is
-//! handed with ([`Lanes::hand`]):
+//! published before its queue took it ([`Lanes::through`]), on `c`'s lane and on the blocks'
+//! lanes, as it waited for the control thread before. A job waits only for jobs handed before it:
+//! its own lane's, by the lane's order, and another lane's where its message reads what that
+//! lane's messages change, by the edges it is handed with ([`Lanes::hand`]):
 //! - a `PRESENT_SURFACE` of surface `id`, for each lane's `TEXTURE_FROM_IOSURFACE` of `id`'s
 //!   plane 0, its destroys of a texture the host names `id` by, or one such made there, and its
 //!   `CONTEXT_CLOSE` where its context holds one: the host shows the newest live texture over
@@ -29,7 +37,53 @@
 //!   number: the kext numbers contexts at their opens, which come in another order than their
 //!   first messages): the kext frees a closed context's chunks and its slot of GPU addresses once
 //!   the close is answered, or once it gives up waiting for the answer, so a close not yet carried
-//!   out may still hold textures at the chunk's ids and buffers in the slot.
+//!   out may still hold textures at the chunk's ids and buffers in the slot;
+//! - a message of context `c`'s on `c`'s lane, for each block's lane through its last
+//!   `SURFACE_PAGES` for `c` handed before it: `c`'s later messages see the block as its pages
+//!   left it, as when they shared one lane;
+//! - a `BUFFER_OVER_PAGES`, `HEAP_OVER_PAGES`, `BUFFER_OVER_SURFACE_PAGES` or `BLOCK_RELEASE`
+//!   of a block, for the block's lane: each reads the block's view or device cache, which the
+//!   block's lane makes and copies (below);
+//! - a `SURFACE_PAGES` of a block for context `c`, for `c`'s lane through its last message of
+//!   those four kinds that names the block: a block described again is described after what was
+//!   made over it before.
+//!
+//! **What names a block.** Every message that names a region block, or the pages it describes, by
+//! its offset, and what orders it against the block's lane:
+//! - `SURFACE_PAGES` (every flavour: the lanes read no flag) and `SURFACE_DOWNLOAD`: the block's
+//!   lane, in ring order. A download waits for no other lane, as on the control thread before: it
+//!   reads the device cache and writes the pages, which no lane's message writes (command buffers
+//!   write the cache, and the host orders the copy after those that used it).
+//! - `BUFFER_OVER_PAGES`, `HEAP_OVER_PAGES`, `BUFFER_OVER_SURFACE_PAGES` and `BLOCK_RELEASE`: the
+//!   block's lane through their position (above).
+//! - `BLOCK_GRANT`, `BLOCK_SHARE` and `BLOCK_UNSHARE`: no edge. They change only the region's
+//!   grants and holds, the holders the lanes keep at the hand-over, and, at an unshare, the host's
+//!   count of the holder's command buffers the block's release waits for, which the release reads
+//!   after the holder's lane; no block lane's job reads any of them. The kext posts a block's
+//!   grant or share only once the block's first `SURFACE_PAGES` is answered, and gives a block
+//!   out again only once its `BLOCK_RELEASE`, which waited for the block's lane, is answered OK.
+//! - `TEXTURE_FROM_IOSURFACE`: names the block only through its buffer, which a
+//!   `BUFFER_OVER_SURFACE_PAGES` of the context's made before it on the same lane, after the
+//!   block's lane; a `SURFACE_PAGES` its own context posted before it comes first by the edge
+//!   above. What it reads of the block (whether it has a device cache) the block's first
+//!   `SURFACE_PAGES` decides, which is answered before any process learns of the block.
+//! - `QUEUE_CREATE` (its rings), `COMMAND_BUFFER_IN_REGION` and `COMMAND_BUFFER_PART` (their
+//!   bytes), `BUFFER_AT_OFFSET`, `BUFFER_OVER_HOST_MEMORY`, `HEAP_OVER_HOST_MEMORY`,
+//!   `LIBRARY_FROM_REGION`, `ARGUMENT_LAYOUT` and `ICB_SLOTS` (their spans): spans of the
+//!   process's own blocks, checked against the region's grants and holds, which no block lane's
+//!   job changes; the host waits for no block's pages for them.
+//! - A command buffer's `RGFX_OP_SURFACE_USE`s: the buffer waits for its own context's messages on
+//!   every lane (above), and the host waits for a block's `SURFACE_PAGES` being carried out
+//!   before it uses the block. `RGFX_OP_SURFACE_ORDER` names queues and seqnos, no block.
+//! - A CPU lock posts a `SURFACE_DOWNLOAD` after a GPU write, and, where the block's pages were
+//!   put off, the `SURFACE_PAGES` that hands them over before it, on the block's lane; an unlock
+//!   posts nothing (its CPU generation reaches the host in the next command buffer's
+//!   `RGFX_OP_SURFACE_USE`). A synchronize (`BUFFER_DID_MODIFY_RANGE`, a blit's) names objects.
+//! - `PRESENT_SURFACE` names a surface, not a block: it waits for the textures over the surface
+//!   (above) and, in the host, for the block's `SURFACE_PAGES` being carried out; a present that
+//!   races a CPU lock's download in the guest races it here too, as before.
+//! - `SET_SCANOUT` and `SET_CURSOR` name the scanout's and the cursor's spans, which hold no
+//!   process's block.
 //!
 //! Each wait is for a job handed before the waiter, and each lane with a job has a thread, so the
 //! oldest job not yet carried out is never waiting: the waits end, by induction on the ring
@@ -38,7 +92,7 @@
 //! **A reset** drops every job not yet begun ([`Lanes::reset`]); one begun carries on, and the
 //! control thread tells the host of the reset only once it has ended ([`Lanes::wait_begun`]).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,19 +109,29 @@ pub(super) const IDLE: Duration = Duration::from_secs(1);
 /// Which lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Key {
-    /// A context's: its object-lifecycle messages.
+    /// A context's: its object-lifecycle messages but those of a block's lane.
     Context(u32),
     /// The presents': every `PRESENT_SURFACE`, in ring order.
     Presents,
+    /// The block's at this region offset: every `SURFACE_PAGES` and `SURFACE_DOWNLOAD` of it, in
+    /// ring order.
+    Block(u64),
 }
 
 impl Key {
-    /// The lane `message` is handed to, where one is: a context's for its object-lifecycle
+    /// The lane `message` is handed to, where one is: a block's for a `SURFACE_PAGES` or a
+    /// `SURFACE_DOWNLOAD` long enough to name it, a context's for its other object-lifecycle
     /// messages, the presents' for a `PRESENT_SURFACE`; `None` for what the control thread
     /// carries out itself.
     pub(super) fn of(message: &Message) -> Option<Key> {
-        if message.header.r#type == RGFX_CMD_PRESENT_SURFACE {
-            return Some(Key::Presents);
+        match message.header.r#type {
+            RGFX_CMD_PRESENT_SURFACE => return Some(Key::Presents),
+            RGFX_CMD_SURFACE_PAGES | RGFX_CMD_SURFACE_DOWNLOAD => {
+                if let Some(block) = block_of(message) {
+                    return Some(Key::Block(block));
+                }
+            }
+            _ => {}
         }
         match whose(message.header.r#type, field(message)) {
             Whose::Context(context) => Some(Key::Context(context)),
@@ -80,6 +144,7 @@ impl Key {
         match self {
             Key::Context(context) => format!("reims-vgpu.graphics-context-{context}"),
             Key::Presents => "reims-vgpu.graphics-presents".to_owned(),
+            Key::Block(offset) => format!("reims-vgpu.graphics-block-{offset:#x}"),
         }
     }
 }
@@ -107,6 +172,10 @@ struct Note {
     field: u64,
     /// A `TEXTURE_FROM_IOSURFACE`'s surface and plane.
     surface: Option<(u32, u32)>,
+    /// The block it names by offset, for the kinds a block's lane orders ([`block_of`]).
+    block: Option<u64>,
+    /// The context whose command buffers wait for it (`Whose::Context`).
+    context: Option<u32>,
 }
 
 impl Note {
@@ -116,12 +185,19 @@ impl Note {
             .then(|| RgfxTextureFromIOSurface::read_from_prefix(&message.bytes).ok())
             .flatten()
             .map(|(m, _)| (m.iosurface_id, m.plane));
+        let field = field(message);
+        let context = match whose(message.header.r#type, field) {
+            Whose::Context(context) => Some(context),
+            Whose::Every | Whose::NoOne => None,
+        };
         Note {
             through: job.through,
             epoch: job.epoch,
             r#type: message.header.r#type,
-            field: field(message).unwrap_or(0),
+            field: field.unwrap_or(0),
             surface,
+            block: block_of(message),
+            context,
         }
     }
 }
@@ -166,7 +242,9 @@ struct State {
     lanes: HashMap<Key, Lane>,
     /// The reset count the lanes' jobs are of.
     epoch: u64,
-    /// Each shared block's holders since it was granted, made or released, by its offset.
+    /// Each shared block's holders since it was granted or released, by its offset. A
+    /// `SURFACE_PAGES` leaves them: one the kext posts for a block it has handed out, from a CPU
+    /// lock or before the block's release, finds the block held.
     holders: HashMap<u64, HashSet<u32>>,
     /// The context each texture resource id chunk was last granted to.
     chunks: HashMap<u32, u32>,
@@ -174,6 +252,9 @@ struct State {
     /// contexts once each, at their opens, but a context may post its first message after one
     /// opened later posts its own.
     seen: HashSet<u32>,
+    /// The jobs on the blocks' lanes not yet carried out that a context's command buffers wait
+    /// for (its `SURFACE_PAGES`), by context, then ring 0's count through each, then block.
+    pending: BTreeSet<(u32, u64, u64)>,
     /// The lanes whose thread waits for other lanes to carry out the jobs its first job waits
     /// for.
     blocked: HashSet<Key>,
@@ -194,6 +275,32 @@ impl State {
         self.lanes
             .get(&key)
             .is_none_or(|lane| lane.through(self.epoch, through))
+    }
+
+    /// Ring 0's count through which every message of context `context`'s handed is carried out,
+    /// on its lane and on the blocks' (`u64::MAX` where none is left): one below the first not
+    /// yet carried out.
+    fn context_done(&self, context: u32) -> u64 {
+        let epoch = self.epoch;
+        let lane = (self.lanes.get(&Key::Context(context)))
+            .and_then(|lane| lane.unfinished(epoch).next())
+            .map(|note| note.through);
+        let block = (self.pending)
+            .range((context, 0, 0)..=(context, u64::MAX, u64::MAX))
+            .next()
+            .map(|&(_, through, _)| through);
+        lane.into_iter()
+            .chain(block)
+            .min()
+            .map_or(u64::MAX, |through| through.saturating_sub(1))
+    }
+
+    /// The lane `key`'s count through its last job handed, where it has a job not yet carried
+    /// out.
+    fn busy_through(&self, key: Key) -> Option<u64> {
+        (self.lanes.get(&key))
+            .filter(|lane| lane.unfinished(self.epoch).next().is_some())
+            .map(|lane| lane.handed)
     }
 
     /// Each context lane's count through its last job not yet carried out that `matches`.
@@ -235,8 +342,10 @@ impl State {
         note: &Note,
         surface_textures: impl FnOnce(u32) -> Vec<u64>,
     ) -> Vec<(Key, u64)> {
-        let Key::Context(context) = key else {
-            return self.present_edges(message, surface_textures);
+        let context = match key {
+            Key::Context(context) => context,
+            Key::Presents => return self.present_edges(message, surface_textures),
+            Key::Block(block) => return self.block_edges(block, note),
         };
         let mut edges = Vec::new();
         if self.seen.insert(context) {
@@ -257,11 +366,6 @@ impl State {
                     if grant.offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET {
                         edges.extend(self.every_lane_but(key));
                     }
-                }
-            }
-            RGFX_CMD_SURFACE_PAGES => {
-                if let Some(pages) = read::<RgfxSurfacePages>(message) {
-                    self.holders.remove(&pages.block_offset);
                 }
             }
             RGFX_CMD_BLOCK_RELEASE => {
@@ -290,8 +394,44 @@ impl State {
             }
             _ => {}
         }
+        // The block's lane, for a message that reads what it makes of the block.
+        if let Some(block) = note.block
+            && let Some(handed) = self.busy_through(Key::Block(block))
+        {
+            edges.push((Key::Block(block), handed));
+        }
+        // The blocks' lanes, through the context's last `SURFACE_PAGES` on each.
+        let mut last: HashMap<u64, u64> = HashMap::new();
+        for &(_, through, block) in
+            (self.pending).range((context, 0, 0)..=(context, u64::MAX, u64::MAX))
+        {
+            let at = last.entry(block).or_default();
+            *at = (*at).max(through);
+        }
+        edges.extend(last.into_iter().map(|(block, t)| (Key::Block(block), t)));
         edges.retain(|(lane, _)| *lane != key);
         edges
+    }
+
+    /// The edges of a job `note` of block `block`'s lane (the module doc): a `SURFACE_PAGES` for
+    /// context `c` waits for `c`'s lane through its last message not yet carried out that names
+    /// the block; a `SURFACE_DOWNLOAD` waits for no other lane.
+    fn block_edges(&self, block: u64, note: &Note) -> Vec<(Key, u64)> {
+        let (RGFX_CMD_SURFACE_PAGES, Some(context)) = (note.r#type, note.context) else {
+            return Vec::new();
+        };
+        let lane = Key::Context(context);
+        let epoch = self.epoch;
+        (self.lanes.get(&lane))
+            .and_then(|l| {
+                (l.unfinished(epoch))
+                    .filter(|n| n.block == Some(block))
+                    .map(|n| n.through)
+                    .max()
+            })
+            .map(|through| (lane, through))
+            .into_iter()
+            .collect()
     }
 
     /// A `PRESENT_SURFACE`'s edges (the module doc).
@@ -369,6 +509,9 @@ impl Lanes {
         };
         let note = Note::of(&job);
         job.after = state.edges(key, &job.message, &note, surface_textures);
+        if let (Key::Block(block), Some(context)) = (key, note.context) {
+            state.pending.insert((context, through, block));
+        }
         let lane = state.lanes.entry(key).or_default();
         lane.handed = through;
         lane.jobs.push_back((job, note));
@@ -440,19 +583,27 @@ impl Lanes {
         }
     }
 
-    /// The lane `key`'s thread carried out the job [`Self::next`] gave it. Ring 0's count
-    /// through which the lane has carried out every job it was handed ([`Self::through`] holds
-    /// for each count below the first job not yet carried out; `u64::MAX` where it has none).
-    pub(super) fn finished(&self, key: Key) -> u64 {
-        let (blocked, done): (Vec<Arc<Condvar>>, u64) = {
+    /// The lane `key`'s thread carried out the job [`Self::next`] gave it. Where the job was a
+    /// context's, one whose command buffers wait for it, that context, and ring 0's count through
+    /// which every message of the context's handed is carried out ([`Self::through`] holds for
+    /// each count up to it; `u64::MAX` where none is left).
+    pub(super) fn finished(&self, key: Key) -> Option<(u32, u64)> {
+        let (blocked, done): (Vec<Arc<Condvar>>, Option<(u32, u64)>) = {
             let mut state = self.state.lock();
-            if let Some(lane) = state.lanes.get_mut(&key) {
-                lane.running = None;
-            }
             let epoch = state.epoch;
-            let done = (state.lanes.get(&key))
-                .and_then(|lane| lane.unfinished(epoch).next())
-                .map_or(u64::MAX, |note| note.through.saturating_sub(1));
+            let ran = (state.lanes.get_mut(&key)).and_then(|lane| lane.running.take());
+            let context = match key {
+                Key::Context(context) => Some(context),
+                Key::Presents => None,
+                Key::Block(block) => ran
+                    .filter(|note| note.epoch == epoch)
+                    .and_then(|note| note.context.map(|c| (c, note.through)))
+                    .map(|(context, through)| {
+                        state.pending.remove(&(context, through, block));
+                        context
+                    }),
+            };
+            let done = context.map(|context| (context, state.context_done(context)));
             let blocked = (state.blocked.iter())
                 .filter_map(|k| state.lanes.get(k).map(|lane| Arc::clone(&lane.wake)))
                 .collect();
@@ -469,13 +620,13 @@ impl Lanes {
     /// carried out: a command buffer of the context waits for it, once the control thread has
     /// handed out every message it waits for.
     pub(super) fn through(&self, context: u32, through: u64) -> bool {
-        self.state.lock().through(Key::Context(context), through)
+        through <= self.state.lock().context_done(context)
     }
 
     /// [`Self::through`], waiting for nothing: `None` where the lanes' lock is held elsewhere.
     pub(super) fn try_through(&self, context: u32, through: u64) -> Option<bool> {
         let state = self.state.try_lock()?;
-        Some(state.through(Key::Context(context), through))
+        Some(through <= state.context_done(context))
     }
 
     /// The device's reset, to reset count `epoch`: every job not yet begun is dropped, and what
@@ -491,6 +642,7 @@ impl Lanes {
         state.holders.clear();
         state.chunks.clear();
         state.seen.clear();
+        state.pending.clear();
         let wakes = state.wakes();
         drop(state);
         for wake in wakes {
@@ -550,6 +702,23 @@ fn field(message: &Message) -> Option<u64> {
     (message.bytes.get(16..24))
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_le_bytes)
+}
+
+/// The block `message` names by offset, for the kinds a block's lane orders (the module doc):
+/// `SURFACE_PAGES`, `SURFACE_DOWNLOAD`, `BUFFER_OVER_PAGES`, `HEAP_OVER_PAGES`,
+/// `BUFFER_OVER_SURFACE_PAGES` and `BLOCK_RELEASE`, where it is long enough to.
+fn block_of(message: &Message) -> Option<u64> {
+    match message.header.r#type {
+        RGFX_CMD_SURFACE_PAGES => read::<RgfxSurfacePages>(message).map(|m| m.block_offset),
+        RGFX_CMD_SURFACE_DOWNLOAD => read::<RgfxSurfaceDownload>(message).map(|m| m.block_offset),
+        RGFX_CMD_BUFFER_OVER_PAGES => read::<RgfxBufferOverPages>(message).map(|m| m.block_offset),
+        RGFX_CMD_HEAP_OVER_PAGES => read::<RgfxHeapOverPages>(message).map(|m| m.block_offset),
+        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => {
+            read::<RgfxBufferOverSurfacePages>(message).map(|m| m.block_offset)
+        }
+        RGFX_CMD_BLOCK_RELEASE => read::<RgfxBlockRelease>(message).map(|m| m.offset),
+        _ => None,
+    }
 }
 
 /// `message`'s bytes as `T`, where they are as many.

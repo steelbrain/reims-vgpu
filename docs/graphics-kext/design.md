@@ -857,14 +857,20 @@ Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 and `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
 
 **Ring 0's lanes.** The control thread takes ring 0 in ring order and carries
-out only the display commands and `SURFACE_DOWNLOAD`s itself. It hands each
-context's messages, in ring order, to that context's lane, a thread of its own
+out only the display commands itself. It hands each context's messages, in ring
+order, to that context's lane, a thread of its own
 (`reims-vgpu.graphics-context-<n>`, made as a message comes to a lane with
-none, gone after 1 s with none), and every `PRESENT_SURFACE` to the presents'
-lane (`reims-vgpu.graphics-presents`). A lane carries its messages out one at a
-time and posts their answers, so one process's slow message (a heap over pages
-took 469 ms at the median and 4.25 s at most in a boot on an RTX 5080 host)
-holds up only that process's later messages and command buffers. A message
+none, gone after 1 s with none), every `PRESENT_SURFACE` to the presents'
+lane (`reims-vgpu.graphics-presents`), and every `SURFACE_PAGES` and
+`SURFACE_DOWNLOAD` to the lane of the block it names
+(`reims-vgpu.graphics-block-<offset>`), whichever process posted it and for
+whichever context, so a block's pages handed over from another process's CPU
+lock, or after its maker closed, and the download or release posted right
+after them, keep their order without waiting for the maker's lane. A lane
+carries its messages out one at a time and posts their answers, so one
+process's slow message (a heap over pages took 469 ms at the median and 4.25 s
+at most in a boot on an RTX 5080 host) holds up only that process's later
+messages and command buffers. A message
 waits for another context's lane only where it reads what that lane's earlier
 messages change, and only for messages published before it
 (`reims_graphics`'s `device::lanes`):
@@ -881,7 +887,19 @@ messages change, and only for messages published before it
   context's number (the kext numbers contexts at their opens, and a process
   may post its first message after one opened later): the kext frees a closed
   context's chunks and its slot of GPU addresses once it stops waiting for the
-  close's answer.
+  close's answer;
+- a context's message waits for each block's lane through the context's last
+  `SURFACE_PAGES` on it, and a command buffer for its context's messages on
+  the blocks' lanes too, as when they shared the context's lane;
+- a `BUFFER_OVER_PAGES`, `HEAP_OVER_PAGES`, `BUFFER_OVER_SURFACE_PAGES` or
+  `BLOCK_RELEASE` waits for its block's lane: each reads the view or device
+  cache the block's lane makes and copies;
+- a `SURFACE_PAGES` waits for its context's lane only through the last message
+  of those four kinds that names its block; a `SURFACE_DOWNLOAD` waits for no
+  other lane, as on the control thread before.
+
+`reims_graphics`'s `device::lanes` lists every message that names a block or
+its pages by offset, and what orders each against the block's lane.
 
 Each wait is for a message published earlier, and every lane with a message
 has a thread, so the waits end. What the guest can tell apart from one thread:

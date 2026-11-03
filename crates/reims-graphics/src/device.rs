@@ -14,7 +14,9 @@
 //! no ring held, to the lane of the process's context (`lanes`): `reims-vgpu.graphics-context-*`
 //! carries the context's messages out in ring order, handing its creates and destroys to the
 //! host's decoder ([`Host::stage3_message`]), so one context's slow message holds up only its own
-//! later ones. `reims-vgpu.graphics-presents` carries the `PRESENT_SURFACE`s out, in ring order.
+//! later ones. `reims-vgpu.graphics-presents` carries the `PRESENT_SURFACE`s out, in ring order,
+//! and `reims-vgpu.graphics-block-*` a block's `SURFACE_PAGES` and `SURFACE_DOWNLOAD`s, whichever
+//! process posted them.
 //! The replies (a pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
 //! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
 //! single consumer, and their `consumer_idle` handshakes never race.
@@ -249,7 +251,8 @@ pub trait Host: Send + Sync + 'static {
     /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
     /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On
     /// the thread that posts it: the control, refresh or a queue's service thread, a lane's
-    /// (`reims-vgpu.graphics-context-*`, `reims-vgpu.graphics-presents`), the host's inside
+    /// (`reims-vgpu.graphics-context-*`, `reims-vgpu.graphics-presents`,
+    /// `reims-vgpu.graphics-block-*`), the host's inside
     /// [`Device::mmio_write_taking`], or one of the host's that holds a
     /// [`CompletionPoster`] or a [`CompleteAnswer`]. Locks may be held around it, none that a call
     /// of the device's waits for: a queue's claim on its messages, on its service thread and
@@ -293,8 +296,8 @@ pub trait Host: Send + Sync + 'static {
     /// `BLOCK_UNSHARE` ([`Host::block_unshared`]), and once the host's display no longer reads
     /// a surface's texture over the block. The kext gives the block out again only on OK,
     /// and the memory of a surface's block in place back to the guest's system. Called on the
-    /// context's lane, in ring order, after the lanes of the other contexts that held the block
-    /// have carried out what they were handed before it.
+    /// context's lane, in ring order, after the lanes of the other contexts that held the block,
+    /// and the block's own lane, have carried out what they were handed before it.
     /// The default answers OK at once, for a host with no stage-3 decoder.
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         let _ = release;
@@ -344,7 +347,9 @@ pub trait Host: Send + Sync + 'static {
     /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
     /// buffers alone. The host gives `answer` from any thread once it has carried the message
     /// out, and carries out every later message that names the block as if after it. Called on
-    /// the context's lane, in ring order. The default maps nothing, and refuses at once.
+    /// the block's lane (`reims-vgpu.graphics-block-*`), in ring order, after the messages of
+    /// its context's published before it that name the block. The default maps nothing, and
+    /// refuses at once.
     fn surface_pages(
         &self,
         pages: &RgfxSurfacePages,
@@ -358,8 +363,9 @@ pub trait Host: Send + Sync + 'static {
 
     /// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose block lies at `block_offset`
     /// written into its pages ([`RGFX_FEATURE_SURFACE_CACHE`]); the host gives `answer`
-    /// ([`RGFX_STATUS_OK`]) from any thread once the pages hold it. Called on the control thread,
-    /// in ring order. The default answers at once, for a host that keeps no caches.
+    /// ([`RGFX_STATUS_OK`]) from any thread once the pages hold it. Called on the block's lane, in
+    /// ring order, after the block's `SURFACE_PAGES` published before it. The default answers at
+    /// once, for a host that keeps no caches.
     fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
         let _ = block_offset;
         answer.answer(RGFX_STATUS_OK);
@@ -2108,8 +2114,7 @@ fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, wait: bool) {
         } else {
             None
         };
-        let done = lanes.finished(key);
-        if let Key::Context(context) = key {
+        if let Some((context, done)) = lanes.finished(key) {
             shared.gate.carried_out(context, done);
         }
         if let Some(answer) = answer {

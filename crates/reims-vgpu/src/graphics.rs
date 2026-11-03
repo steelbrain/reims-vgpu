@@ -112,8 +112,9 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// A graphics device's callbacks. `scanout_written` is called on the device's refresh thread
 /// (`reims-vgpu.graphics-refresh`), and `raise_interrupt` on the thread that posts the event it
 /// raises for: the device's control thread (`reims-vgpu.graphics-control`), a lane that carries
-/// out a guest process's control messages (`reims-vgpu.graphics-context-<n>`) or its presents
-/// (`reims-vgpu.graphics-presents`), its refresh thread, a command queue's service thread
+/// out a guest process's control messages (`reims-vgpu.graphics-context-<n>`), its presents
+/// (`reims-vgpu.graphics-presents`) or a block's pages and downloads
+/// (`reims-vgpu.graphics-block-<offset>`), its refresh thread, a command queue's service thread
 /// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
 /// (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces`), the
@@ -870,8 +871,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: answered once the surface's pages hold its
     /// device cache ([`GraphicsDecoder::surface_download`]), which is copied once the buffers
-    /// still walked that may write it have finished, on the last one's thread: the control
-    /// thread goes on.
+    /// still walked that may write it have finished, on the last one's thread: the block's lane
+    /// goes on.
     fn download_surface(&self, block: u64, answer: CompleteAnswer) {
         let answer = Arc::new(Mutex::new(Some(answer)));
         let (give, refuse) = (Arc::clone(&answer), answer);

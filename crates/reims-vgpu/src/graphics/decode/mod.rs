@@ -29,7 +29,8 @@
 //! the exec the same way ([`bad_reference`], [`op_fault`]).
 //!
 //! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on their
-//! context's lane (the presents on the presents' lane, a download on the control thread), each
+//! context's lane (the presents on the presents' lane, a block's pages and downloads on the
+//! block's), each
 //! queue's command buffers on the queue's service thread (or a doorbell's),
 //! and the compiles' ends on the compile pool. Each message is carried out through a
 //! [`GraphicsDecoder`] of its own, a handle on the state the decoder keeps for every context

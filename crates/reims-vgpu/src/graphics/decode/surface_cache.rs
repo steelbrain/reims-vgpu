@@ -799,7 +799,7 @@ impl<P: Platform> SurfaceCaches<P> {
 ///   of the cache waits for a fill waiting so, so fills are not held off for good.
 /// - **A copy out of a cache** (a download, a release, the block's pages named again) waits for
 ///   every one of them that may write it. A download and a release, which ring 0 asks for (a
-///   download on the control thread, a release on its context's lane) and are answered when
+///   download on its block's lane, a release on its context's lane) and are answered when
 ///   their copy is done, do not wait there: each is made in the
 ///   finish of the last buffer that may write the cache begun before it was asked
 ///   ([`Caches::after_writers`]), in the order they were asked, and a command buffer begun after

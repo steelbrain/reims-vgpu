@@ -988,6 +988,19 @@ impl Host for QueueTestHost {
         }
         answer.answer(RGFX_STATUS_OK);
     }
+    fn surface_pages(
+        &self,
+        _pages: &RgfxSurfacePages,
+        _runs: Vec<RgfxPageRun>,
+        _flags: u32,
+        answer: crate::device::CompleteAnswer,
+    ) {
+        self.handed.lock().push(RGFX_CMD_SURFACE_PAGES);
+        while !self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        answer.answer(RGFX_STATUS_OK);
+    }
     fn stage3_message(&self, completion: &crate::device::CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         self.handed.lock().push(header.r#type);
@@ -1743,6 +1756,49 @@ fn a_command_buffer_is_handed_over_while_a_download_published_ahead_of_it_is_car
         vec![
             RGFX_CMD_QUEUE_CREATE,
             RGFX_CMD_SURFACE_DOWNLOAD,
+            RGFX_CMD_COMMAND_BUFFER
+        ]
+    );
+}
+
+/// A command buffer waits for its context's `SURFACE_PAGES` published before it, which the
+/// block's lane carries out, as it waited when the context's lane did: woken once that lane has
+/// carried it out.
+#[test]
+fn a_command_buffer_waits_for_its_context_s_pages_on_the_block_s_lane() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    seen.gate.store(false, Ordering::SeqCst);
+    let pages = rig.send(surface_pages_message(
+        5,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000,
+        RGFX_SURFACE_PAGES_CACHED,
+    ));
+    seen.wait("the pages never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_SURFACE_PAGES)
+    });
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    settle();
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SURFACE_PAGES],
+        "the buffer went before its context's pages"
+    );
+    seen.gate.store(true, Ordering::SeqCst);
+    assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
+    let done = first_queue_completion(&rig);
+    assert_eq!(done.expect("never woken").cb_obj_id, 100);
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_SURFACE_PAGES,
             RGFX_CMD_COMMAND_BUFFER
         ]
     );
@@ -2544,13 +2600,15 @@ mod round_trip;
 // Ring 0's lanes (`device::lanes`): what crosses contexts waits for the lanes it reads.
 
 /// What an [`OrderHost`] records, in the order it carries each out: a stage-3 message's type, a
-/// present (`PRESENT_SURFACE`), a block's release (`BLOCK_RELEASE`) and a context's close
-/// (`CONTEXT_CLOSE`), each with the count of the control completion ring's records published as
-/// it began; and its gate, open.
+/// present (`PRESENT_SURFACE`), a block's release (`BLOCK_RELEASE`), pages (`SURFACE_PAGES`) and
+/// download (`SURFACE_DOWNLOAD`), and a context's close (`CONTEXT_CLOSE`), each with the count of
+/// the control completion ring's records published as it began; and its gates, open.
 #[derive(Default)]
 struct OrderSeen {
     order: Arc<Mutex<Vec<(u32, u64)>>>,
     gate: Arc<AtomicBool>,
+    /// While shut, a `SURFACE_PAGES` the host carries out waits.
+    pages: Arc<AtomicBool>,
     named: Arc<Mutex<Vec<u64>>>,
     region: Arc<OnceLock<Arc<Region>>>,
 }
@@ -2559,6 +2617,7 @@ impl OrderSeen {
     fn new() -> OrderSeen {
         let seen = OrderSeen::default();
         seen.gate.store(true, Ordering::SeqCst);
+        seen.pages.store(true, Ordering::SeqCst);
         seen
     }
 
@@ -2567,6 +2626,7 @@ impl OrderSeen {
         let host = OrderHost {
             order: Arc::clone(&self.order),
             gate: Arc::clone(&self.gate),
+            pages: Arc::clone(&self.pages),
             named: Arc::clone(&self.named),
             region: Arc::clone(&self.region),
         };
@@ -2622,6 +2682,30 @@ impl OrderSeen {
     fn release(&self) {
         self.gate.store(true, Ordering::SeqCst);
     }
+
+    /// How many times `type` was carried out so far.
+    fn count(&self, r#type: u32) -> usize {
+        self.types().iter().filter(|&&t| t == r#type).count()
+    }
+
+    /// Shuts the pages' gate, sends `context`'s `SURFACE_PAGES` of `block` the host then holds,
+    /// and waits for the host to hold it: the block's lane is in it. Its seqno.
+    fn hold_pages(&self, rig: &mut Rig, context: u32, block: u64) -> u64 {
+        self.pages.store(false, Ordering::SeqCst);
+        let held = self.count(RGFX_CMD_SURFACE_PAGES);
+        let seqno = rig.send(surface_pages_message(
+            context,
+            block,
+            RGFX_SURFACE_PAGES_CACHED,
+        ));
+        self.wait_for(RGFX_CMD_SURFACE_PAGES, held + 1);
+        seqno
+    }
+
+    /// Opens the pages' gate.
+    fn release_pages(&self) {
+        self.pages.store(true, Ordering::SeqCst);
+    }
 }
 
 /// A host that records what it carries out ([`OrderSeen`]), holds a `BUFFER_CREATE` while its gate
@@ -2630,6 +2714,7 @@ impl OrderSeen {
 struct OrderHost {
     order: Arc<Mutex<Vec<(u32, u64)>>>,
     gate: Arc<AtomicBool>,
+    pages: Arc<AtomicBool>,
     named: Arc<Mutex<Vec<u64>>>,
     region: Arc<OnceLock<Arc<Region>>>,
 }
@@ -2659,6 +2744,23 @@ impl Host for OrderHost {
     }
     fn block_released(&self, _release: &RgfxBlockRelease, answer: CompleteAnswer) {
         self.record(RGFX_CMD_BLOCK_RELEASE);
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn surface_pages(
+        &self,
+        _pages: &RgfxSurfacePages,
+        _runs: Vec<RgfxPageRun>,
+        _flags: u32,
+        answer: CompleteAnswer,
+    ) {
+        self.record(RGFX_CMD_SURFACE_PAGES);
+        while !self.pages.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn surface_download(&self, _block_offset: u64, answer: CompleteAnswer) {
+        self.record(RGFX_CMD_SURFACE_DOWNLOAD);
         answer.answer(RGFX_STATUS_OK);
     }
     fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
@@ -2726,6 +2828,87 @@ fn id_chunk(context: u32, chunk: u32) -> Vec<u8> {
     }
     .as_bytes()
     .to_vec()
+}
+
+/// A `SURFACE_PAGES` of `block` for `context`, listing no runs, with `flags`.
+fn surface_pages_message(context: u32, block: u64, flags: u32) -> Vec<u8> {
+    let mut bytes = RgfxSurfacePages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        run_count: 0,
+        block_offset: block,
+        block_size: 0x1000,
+        runs_offset: block,
+        length: 0,
+    }
+    .as_bytes()
+    .to_vec();
+    bytes.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// A `SURFACE_DOWNLOAD` of `block`.
+fn download_message(block: u64) -> Vec<u8> {
+    RgfxSurfaceDownload {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_DOWNLOAD,
+            size: 0,
+            seqno: 0,
+        },
+        block_offset: block,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A make of `type` over `block` (`BUFFER_OVER_PAGES`, `HEAP_OVER_PAGES` or
+/// `BUFFER_OVER_SURFACE_PAGES`) of object `obj_id`.
+fn over_block(r#type: u32, obj_id: u64, block: u64) -> Vec<u8> {
+    let header = RgfxMsgHeader {
+        r#type,
+        size: 0,
+        seqno: 0,
+    };
+    match r#type {
+        RGFX_CMD_BUFFER_OVER_PAGES => RgfxBufferOverPages {
+            header,
+            obj_id,
+            block_offset: block,
+            block_size: 0x1000,
+            ..Default::default()
+        }
+        .as_bytes()
+        .to_vec(),
+        RGFX_CMD_HEAP_OVER_PAGES => RgfxHeapOverPages {
+            header,
+            obj_id,
+            block_offset: block,
+            block_size: 0x1000,
+            ..Default::default()
+        }
+        .as_bytes()
+        .to_vec(),
+        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => RgfxBufferOverSurfacePages {
+            header,
+            obj_id,
+            block_offset: block,
+            block_size: 0x1000,
+            ..Default::default()
+        }
+        .as_bytes()
+        .to_vec(),
+        _ => panic!("no make over a block of type {type:#x}"),
+    }
 }
 
 /// Waits 50 ms, the time a message not held up takes many times over.
@@ -3077,6 +3260,223 @@ fn an_idle_lane_goes_while_another_context_s_is_busy() {
         gone,
         "the idle lane's thread was woken by the busy context's jobs"
     );
+}
+
+/// A surface's pages the kext hands over from another process's CPU lock, for a maker that has
+/// closed, and the download the lock posts right after them without waiting for their answer, are
+/// carried out in that order on the block's lane, while the maker's lane is still behind a held
+/// message and its close.
+#[test]
+fn a_closed_maker_s_pages_then_a_download_go_in_order_past_its_held_lane() {
+    const MAKER: u32 = 6;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, MAKER);
+    let close = rig.send(context_close(MAKER));
+    // A flag the lanes do not read rides along, as the kext's hand-over of put-off pages carries
+    // one.
+    seen.pages.store(false, Ordering::SeqCst);
+    let pages = rig.send(surface_pages_message(
+        MAKER,
+        BLOCK,
+        RGFX_SURFACE_PAGES_CACHED | (1 << 7),
+    ));
+    let download = rig.send(download_message(BLOCK));
+    seen.wait_for(RGFX_CMD_SURFACE_PAGES, 1);
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE, RGFX_CMD_SURFACE_PAGES],
+        "the download overtook the pages"
+    );
+    seen.release_pages();
+    assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
+    assert_eq!(rig.complete(), (download, RGFX_STATUS_OK));
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_SURFACE_DOWNLOAD
+        ],
+        "the maker's lane is still behind its held message"
+    );
+    seen.release();
+    assert_eq!(rig.complete(), (close, RGFX_STATUS_OK));
+    assert_eq!(seen.count(RGFX_CMD_CONTEXT_CLOSE), 1);
+}
+
+/// Each message that reads what a block's lane makes of the block waits for the lane through its
+/// position, whichever context posts it: a buffer or a heap over a pages block, a buffer over a
+/// surface's pages, a download and a release. A message of another context's, or one over another
+/// block, goes meanwhile.
+#[test]
+fn what_reads_a_block_s_pages_waits_for_the_block_s_lane() {
+    const MAKER: u32 = 6;
+    const OTHER: u32 = 4;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const ELSEWHERE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x30_0000;
+    let obj = |context: u32, n: u64| (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold_pages(&mut rig, MAKER, BLOCK);
+    // Each on a context's lane of its own, so none waits behind another.
+    let kinds = [
+        RGFX_CMD_BUFFER_OVER_PAGES,
+        RGFX_CMD_HEAP_OVER_PAGES,
+        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+    ];
+    for (n, &kind) in kinds.iter().enumerate() {
+        rig.send(over_block(kind, obj(10 + n as u32, 1), BLOCK));
+    }
+    let release = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 13, BLOCK, 0x1000));
+    let download = rig.send(download_message(BLOCK));
+    rig.send(over_block(
+        RGFX_CMD_BUFFER_OVER_PAGES,
+        obj(OTHER, 1),
+        ELSEWHERE,
+    ));
+    rig.send(object_message(RGFX_CMD_EVENT_CREATE, obj(OTHER, 2)));
+    seen.wait_for(RGFX_CMD_EVENT_CREATE, 1);
+    settle();
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_BUFFER_OVER_PAGES,
+            RGFX_CMD_EVENT_CREATE
+        ],
+        "a message that reads the block went before its pages, or another waited"
+    );
+    seen.release_pages();
+    let mut answered: Vec<(u64, u32)> = (0..3).map(|_| rig.complete()).collect();
+    answered.sort_unstable();
+    assert_eq!(
+        answered,
+        [
+            (1, RGFX_STATUS_OK),
+            (release, RGFX_STATUS_OK),
+            (download, RGFX_STATUS_OK)
+        ]
+    );
+    rig.lanes_done();
+    let types = seen.types();
+    let pages_done = types
+        .iter()
+        .position(|&t| t == RGFX_CMD_EVENT_CREATE)
+        .unwrap();
+    let mut after: Vec<u32> = types[pages_done + 1..].to_vec();
+    after.sort_unstable();
+    let mut want = vec![
+        RGFX_CMD_BUFFER_OVER_PAGES,
+        RGFX_CMD_HEAP_OVER_PAGES,
+        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+        RGFX_CMD_BLOCK_RELEASE,
+        RGFX_CMD_SURFACE_DOWNLOAD,
+    ];
+    want.sort_unstable();
+    assert_eq!(after, want);
+}
+
+/// A context's later messages wait for its `SURFACE_PAGES` on the block's lane, as when they
+/// shared the context's lane; another context's do not.
+#[test]
+fn a_context_s_later_messages_wait_for_its_pages_on_the_block_s_lane() {
+    const MAKER: u32 = 6;
+    const OTHER: u32 = 4;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let obj = |context: u32, n: u64| (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold_pages(&mut rig, MAKER, BLOCK);
+    rig.send(object_message(RGFX_CMD_SAMPLER_CREATE, obj(MAKER, 1)));
+    rig.send(object_message(RGFX_CMD_EVENT_CREATE, obj(OTHER, 1)));
+    seen.wait_for(RGFX_CMD_EVENT_CREATE, 1);
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_SURFACE_PAGES, RGFX_CMD_EVENT_CREATE],
+        "the maker's later message went before its pages"
+    );
+    seen.release_pages();
+    seen.wait_for(RGFX_CMD_SAMPLER_CREATE, 1);
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_EVENT_CREATE,
+            RGFX_CMD_SAMPLER_CREATE
+        ]
+    );
+}
+
+/// A block's `SURFACE_PAGES` waits for its context's messages published before it that name the
+/// block, which its context's lane is still behind; not for one over another block, nor for the
+/// lane's other messages.
+#[test]
+fn a_block_s_pages_wait_for_what_their_context_made_over_the_block_before() {
+    const MAKER: u32 = 6;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const ELSEWHERE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x30_0000;
+    let obj = |n: u64| (u64::from(MAKER) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold(&mut rig, MAKER);
+    rig.send(over_block(RGFX_CMD_BUFFER_OVER_PAGES, obj(1), BLOCK));
+    let pages = rig.send(surface_pages_message(
+        MAKER,
+        BLOCK,
+        RGFX_SURFACE_PAGES_PRIVATE,
+    ));
+    let elsewhere = rig.send(surface_pages_message(
+        MAKER,
+        ELSEWHERE,
+        RGFX_SURFACE_PAGES_PRIVATE,
+    ));
+    assert_eq!(rig.complete(), (elsewhere, RGFX_STATUS_OK));
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE, RGFX_CMD_SURFACE_PAGES],
+        "the block's pages went before what was made over the block"
+    );
+    seen.release();
+    assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_BUFFER_OVER_PAGES,
+            RGFX_CMD_SURFACE_PAGES
+        ]
+    );
+}
+
+/// A shared block's release waits for the lanes of its holders also where the kext hands the
+/// block's pages over after the shares: the pages leave the block's holders as they are.
+#[test]
+fn pages_handed_over_leave_a_shared_block_s_holders() {
+    const A: u32 = 6;
+    const B: u32 = 5;
+    const SURFACE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, A, SURFACE, 0x1000));
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, B, SURFACE, 0x1000));
+    seen.hold(&mut rig, A);
+    let pages = rig.send(surface_pages_message(B, SURFACE, RGFX_SURFACE_PAGES_CACHED));
+    assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
+    let release = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, B, SURFACE, 0x1000));
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_BUFFER_CREATE, RGFX_CMD_SURFACE_PAGES],
+        "the release overtook its other holder's messages"
+    );
+    seen.release();
+    assert_eq!(rig.complete(), (release, RGFX_STATUS_OK));
 }
 
 #[test]

@@ -3,8 +3,8 @@
 //! handed over, and the [`Unsettled`] keys (a block's offset, an object's id) whose job is not
 //! yet done.
 //!
-//! The ring-0 thread that carries the message out (its context's lane) begins the key's [`Settle`]
-//! in its context's ring order and hands the job over; the job carries the work out, posts the
+//! The ring-0 thread that carries the message out (its block's or its context's lane) begins the
+//! key's [`Settle`] in that lane's ring order and hands the job over; the job carries the work out, posts the
 //! message's answer, then drops the settle, so a message that waited for the key is answered after
 //! it. A message that names the key, on ring 0 or a queue's ring, waits for it first
 //! ([`Unsettled::wait`]), holding no lock the job takes; a thread that waits for nothing (a
