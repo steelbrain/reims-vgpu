@@ -9,7 +9,8 @@ stricter than the M3's, guests may rely on it.
 
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
-`oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr` and `oracle_sampler`.
+`oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler` and
+`oracle_icb`.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -572,6 +573,59 @@ lane's wire 2 does not carry them.
 
 Wire 2 drops both properties, so the lane samples with Metal's defaults (bias 0, the weighted
 average). The next wire change carries them in a tail of the sampler's create.
+
+## Q15: indirect command buffers after a reset, and after a release
+
+Probe: `oracle_icb DEVICE resets` and `oracle_icb DEVICE freed` (11-03).
+
+`resets` encodes two render commands and two compute commands with a pipeline state, buffers and
+a draw or dispatch. It resets command 0 with the command's `reset` and command 1 with the
+buffer's `resetWithRange:`, then encodes their buffers and draws again without the state. The
+compute commands add 5 into an output.
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| render, after either reset | both draw: the state is kept | neither draws | neither draws |
+| compute, after either reset | the command buffer times out | neither adds | both add 5: the state is kept |
+
+- **What a reset keeps of the state** *(class 2: divergent. The M3 keeps a compute command's
+  state, the Intel 630 drops it and the AMD times out; the AMD alone keeps a render command's.
+  The lane takes the cheapest answer)*. The lane's Vulkan arm keeps a compute command's state
+  after its `reset`, as the M3 does. A range reset, one platform call for the range however many
+  commands it spans, leaves every command fresh, as the Intel 630 does. A render command's reset
+  leaves it fresh on both arms.
+
+`freed` executes commands whose buffers the app released before the execute:
+- a render command's fragment buffer, then also its vertex buffer, then buffers made since at
+  the same size;
+- a heap's buffer, its heap resident;
+- a dispatch's 16-byte input, released before the execute, then behind a spin while the execute
+  waits, and at 1, 8 and 64 MiB;
+- the dispatch's output.
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| the command buffer | completes with no error, every case | the same | the same |
+| a released 16-byte input | the dispatch runs, reading the buffer's last bytes | the same | the same |
+| a released input of 1 to 64 MiB | the dispatch runs, reading zero | it runs, reading other bytes | it runs, reading zero |
+| a released fragment or vertex buffer | nothing draws | draws with the last bytes | draws with the last bytes |
+| a buffer of the same size made since | the command reaches it | the same | the same |
+
+- **No error, and the command runs** *(class 3)*. Every case completes, and every dispatch runs
+  and writes its live buffers.
+- **What a released buffer reads** *(class 2)*. The lane's Metal arm reads what the host's Metal
+  reads. Its Vulkan arm is to read zero, the runtime resolving the address to no live buffer, once
+  metal2vulkan runs the command (below).
+- **A buffer made since at the same address** *(class 2 for the lane)*. All three Macs reuse the
+  address. The guest's next-fit picks do not reuse a range soon after its release, so the lane's
+  commands do not reach a buffer made soon after.
+- **The command a miss skips** *(class 4)*. On the Vulkan arm over MoltenVK, a dispatch whose
+  input was released runs nothing, at 16 bytes and at 1 MiB: its output keeps what it held, and
+  the runtime gives no notice. A nil buffer at the same index runs the dispatch, reading zero,
+  and a live buffer no encoder made resident is reached, so the released buffer's address alone
+  misses this way. That is no Mac's answer. It is handed to metal2vulkan, whose execute is to run
+  the command with the slot reading zero, as it runs one with a nil buffer; the lane's test,
+  `a_command_naming_a_released_buffer_reads_zero`, waits ignored until it does.
 
 ## The display's colour against the stock lane: deliberate divergences
 
