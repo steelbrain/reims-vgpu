@@ -1433,7 +1433,10 @@
 // this is answered [`RGFX_EVT_COMPLETE`] with [`RGFX_STATUS_OK`]. The host answers
 // [`RGFX_STATUS_REFUSED`] at once where an object it holds, or a live queue's ring, still lies in
 // the block; otherwise it answers OK once every command buffer of the context it had committed
-// has finished. Posted after every message the process posted before its free, and nothing the
+// has finished, and, of a shared block, every one each earlier holder had committed before its
+// [`RGFX_CMD_BLOCK_UNSHARE`], once the host's display no longer shows or draws an IOSurface's
+// texture over the block, as a compositor holds the surface it shows: until the display pipe's
+// next present. Posted after every message the process posted before its free, and nothing the
 // process posts after it can name the block. A block over an IOSurface's pages with a device
 // cache has the cache copied into the pages first, where a command buffer wrote it since the last
 // copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
@@ -1462,7 +1465,8 @@
 // no longer holds the shared block of `size` bytes at `offset`, which other contexts still hold.
 // Posted after every message the process posted before it let the block go. Not answered. The
 // block's last holder lets it go with a `BLOCK_RELEASE`, which ends every hold of it, and is
-// refused while an object of any context lies in the block.
+// refused while an object of any context lies in the block; its answer waits for the command
+// buffers this context committed before its unshare too, which may still use the block.
 #define RGFX_CMD_BLOCK_UNSHARE 757
 
 // `SURFACE_PAGES` ([`RgfxSurfacePages`]), on ring 0 from the accelerator kext, where the device
