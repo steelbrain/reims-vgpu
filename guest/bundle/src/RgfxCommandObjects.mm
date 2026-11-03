@@ -1784,7 +1784,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	RgfxEncoder *_enc; // borrowed: the command buffer's encoder
 	BOOL _emitEnd;
 	__weak id<MTLDevice> _device;
+	// Its command buffer, held from the encoder's making until its endEncoding, as Metal's encoders
+	// hold theirs (measured on the M3 Max, an AMD 5300M and an Intel 630): `_enc` is the buffer's.
+	// `_commandBuffer` answers commandBuffer, nil once an ended encoder's buffer is gone.
 	__weak id<MTLCommandBuffer> _commandBuffer;
+	id<MTLCommandBuffer> _commandBufferHold;
 	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
@@ -1840,6 +1844,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 - (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
 {
 	_commandBuffer = commandBuffer;
+	_commandBufferHold = commandBuffer;
 }
 
 // The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
@@ -1891,6 +1896,8 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	_vertexSurfaces.clear();
 	_fragmentSurfaces.clear();
+	// Last: the buffer may go with it, and its RgfxEncoder with it.
+	_commandBufferHold = nil;
 }
 
 // --- state -------------------------------------------------------------------
@@ -2985,7 +2992,11 @@ RGFX_LOG_UNRECOGNIZED
 @implementation RgfxComputeCommandEncoder {
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
+	// Its command buffer, held from the encoder's making until its endEncoding, as Metal's encoders
+	// hold theirs (measured on the M3 Max, an AMD 5300M and an Intel 630): `_enc` is the buffer's.
+	// `_commandBuffer` answers commandBuffer, nil once an ended encoder's buffer is gone.
 	__weak id<MTLCommandBuffer> _commandBuffer;
+	id<MTLCommandBuffer> _commandBufferHold;
 	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
@@ -3032,6 +3043,7 @@ RGFX_LOG_UNRECOGNIZED
 - (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
 {
 	_commandBuffer = commandBuffer;
+	_commandBufferHold = commandBuffer;
 }
 
 // The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
@@ -3079,6 +3091,8 @@ RGFX_LOG_UNRECOGNIZED
 		_enc->computeUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
 	_surfaces.clear();
+	// Last: the buffer may go with it, and its RgfxEncoder with it.
+	_commandBufferHold = nil;
 }
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state
@@ -3428,7 +3442,11 @@ RGFX_LOG_UNRECOGNIZED
 @implementation RgfxBlitCommandEncoder {
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
+	// Its command buffer, held from the encoder's making until its endEncoding, as Metal's encoders
+	// hold theirs (measured on the M3 Max, an AMD 5300M and an Intel 630): `_enc` is the buffer's.
+	// `_commandBuffer` answers commandBuffer, nil once an ended encoder's buffer is gone.
 	__weak id<MTLCommandBuffer> _commandBuffer;
+	id<MTLCommandBuffer> _commandBufferHold;
 	uint64_t _traceId;
 	NSString *_encLabel;
 	RgfxBarrierSlot _barrier; // its queue barrier fence (QUEUE BARRIERS)
@@ -3456,6 +3474,7 @@ RGFX_LOG_UNRECOGNIZED
 - (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
 {
 	_commandBuffer = commandBuffer;
+	_commandBufferHold = commandBuffer;
 }
 
 // The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
@@ -3502,6 +3521,8 @@ RGFX_LOG_UNRECOGNIZED
 	if (_barrier.fences[_barrier.slot] != 0)
 		_enc->blitUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
+	// Last: the buffer may go with it, and its RgfxEncoder with it.
+	_commandBufferHold = nil;
 }
 
 - (void)copyFromBuffer:(id<MTLBuffer>)sourceBuffer
@@ -3753,7 +3774,11 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 @implementation RgfxParallelRenderCommandEncoder {
 	RgfxEncoder *_enc;
 	__weak id<MTLDevice> _device;
+	// Its command buffer, held from the encoder's making until its endEncoding, as Metal's encoders
+	// hold theirs (measured on the M3 Max, an AMD 5300M and an Intel 630): `_enc` is the buffer's.
+	// `_commandBuffer` answers commandBuffer, nil once an ended encoder's buffer is gone.
 	__weak id<MTLCommandBuffer> _commandBuffer;
+	id<MTLCommandBuffer> _commandBufferHold;
 	uint64_t _traceId;
 	NSString *_encLabel;
 	BOOL _ended;
@@ -3795,6 +3820,7 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 - (void)rgfxSetCommandBuffer:(id<MTLCommandBuffer>)commandBuffer
 {
 	_commandBuffer = commandBuffer;
+	_commandBufferHold = commandBuffer;
 }
 
 // The command buffer that made the encoder, as Metal's encoders answer it (SPI, sent by MPS and
@@ -3860,6 +3886,8 @@ RGFX_LOG_UNRECOGNIZED
 			_enc->renderUpdateFence(_barrier.fences[_barrier.slot], kRgfxBarrierRenderStages);
 		_enc->endEncoder();
 	}
+	// Last: the buffer may go with it, and its RgfxEncoder with it.
+	_commandBufferHold = nil;
 }
 
 - (void)setColorStoreAction:(MTLStoreAction)storeAction atIndex:(NSUInteger)colorAttachmentIndex

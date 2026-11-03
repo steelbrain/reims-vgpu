@@ -8927,6 +8927,7 @@ void test_reply_reader_close()
 void rgfxProtocolTests();
 void rgfxArchiveTests();
 void rgfxResourceTests();
+void rgfxQueueTests();
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -9080,6 +9081,7 @@ int main(int argc, char **argv)
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
+		rgfxQueueTests();    // tests/queue_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;
