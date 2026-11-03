@@ -440,21 +440,29 @@ impl Lanes {
         }
     }
 
-    /// The lane `key`'s thread carried out the job [`Self::next`] gave it.
-    pub(super) fn finished(&self, key: Key) {
-        let blocked: Vec<Arc<Condvar>> = {
+    /// The lane `key`'s thread carried out the job [`Self::next`] gave it. Ring 0's count
+    /// through which the lane has carried out every job it was handed ([`Self::through`] holds
+    /// for each count below the first job not yet carried out; `u64::MAX` where it has none).
+    pub(super) fn finished(&self, key: Key) -> u64 {
+        let (blocked, done): (Vec<Arc<Condvar>>, u64) = {
             let mut state = self.state.lock();
             if let Some(lane) = state.lanes.get_mut(&key) {
                 lane.running = None;
             }
-            (state.blocked.iter())
+            let epoch = state.epoch;
+            let done = (state.lanes.get(&key))
+                .and_then(|lane| lane.unfinished(epoch).next())
+                .map_or(u64::MAX, |note| note.through.saturating_sub(1));
+            let blocked = (state.blocked.iter())
                 .filter_map(|k| state.lanes.get(k).map(|lane| Arc::clone(&lane.wake)))
-                .collect()
+                .collect();
+            (blocked, done)
         };
         for wake in blocked {
             wake.notify_one();
         }
         self.moved.notify_all();
+        done
     }
 
     /// Whether every message of context `context`'s handed through ring 0's count `through` is

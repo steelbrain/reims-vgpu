@@ -46,7 +46,9 @@
 //! another context's backlog holds it up only where it lies before one of its own, and only for
 //! as long as the control thread takes to hand it to its lane), so the creates it names are made,
 //! or, for a pipeline the host compiles on threads of its own, known to the host, which holds a
-//! buffer that names it until it is made. An `OBJECT_DESTROY` of the queue, a
+//! buffer that names it until it is made. The thread sleeps for those at the gate, which wakes
+//! it only once they are done, whatever other processes' messages (`gate`). An
+//! `OBJECT_DESTROY` of the queue, a
 //! `CONTEXT_CLOSE` of its process (the host then
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
 //! queue's service.
@@ -112,6 +114,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
 use crate::device::backlog::Backlog;
+use crate::device::gate::{Gate, Look};
 use crate::device::lanes::{Key, Lanes};
 use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
@@ -121,6 +124,7 @@ use crate::wake::{self, Wake};
 use crate::wire::*;
 
 mod backlog;
+mod gate;
 mod lanes;
 
 /// How many of ring 0's messages a doorbell's take reads ([`Backlog::read`]) before it leaves the
@@ -491,12 +495,9 @@ pub(crate) struct Shared {
     /// the last message published before it that is its context's or every buffer's
     /// ([`backlog`]), and for its context's lane to carry out its context's ([`lanes`]).
     control_done: AtomicU64,
-    /// Held by a queue thread while it looks at `control_done` and sleeps for it to move, and by
-    /// whoever signals a move, so a move between the look and the sleep still wakes it.
-    control_moved: Mutex<()>,
-    /// Signalled each time `control_done` moves, a lane carries a message out, the device resets
-    /// or it ends.
-    control_moved_signal: Condvar,
+    /// Where a queue's thread waits for `control_done` and its context's lane, woken only by the
+    /// move it waits for, a reset or the end ([`gate`]).
+    gate: Gate,
     /// Ring 0's lanes, which carry out each context's object-lifecycle messages, and the
     /// presents, off the control thread ([`lanes`]).
     lanes: Arc<Lanes>,
@@ -706,8 +707,7 @@ impl Device {
             room: Room::default(),
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
             control_done: AtomicU64::new(0),
-            control_moved: Mutex::new(()),
-            control_moved_signal: Condvar::new(),
+            gate: Gate::default(),
             lanes: Arc::default(),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
@@ -990,16 +990,8 @@ impl Shared {
             queue.end();
         }
         self.lanes.end();
-        self.signal_control_moved();
+        self.gate.every();
         self.room.wake();
-    }
-
-    /// Wakes the queue threads waiting for `control_done` to move, after it moves, a reset or the
-    /// device's end. A queue ends either here, at a reset, or on its context's lane, which wakes
-    /// them once the message that ended it is done.
-    fn signal_control_moved(&self) {
-        drop(self.control_moved.lock());
-        self.control_moved_signal.notify_all();
     }
 
     fn ending(&self) -> bool {
@@ -1048,7 +1040,7 @@ impl Shared {
             queue.fence();
         }
         self.region.revoke_all();
-        self.signal_control_moved();
+        self.gate.every();
         self.room.wake();
         self.wake.wake();
         self.screen.scanout(None);
@@ -1177,15 +1169,15 @@ impl Shared {
                         // A reset meanwhile restarted the count; this message's is moot.
                         if self.epoch.load(Ordering::Acquire) == epoch {
                             self.control_done.store(through, Ordering::Release);
-                            self.signal_control_moved();
+                            self.gate.counted(through);
                         }
                         (answer, epoch, false)
                     }
                     Ok(Some(message)) => {
                         let answer = control::answer(self, &message);
-                        self.control_done
-                            .store(submit.consumer.consumed(), Ordering::Release);
-                        self.signal_control_moved();
+                        let done = submit.consumer.consumed();
+                        self.control_done.store(done, Ordering::Release);
+                        self.gate.counted(done);
                         (answer, epoch, room)
                     }
                     Ok(None) => {
@@ -1333,6 +1325,10 @@ impl Shared {
         // their blocks out again once the close is answered.
         for queue in &ended {
             queue.fence();
+        }
+        // Their threads waiting for ring 0 look again, and go.
+        if !ended.is_empty() {
+            self.gate.every();
         }
         self.region.revoke_context(context);
         self.host.context_closed(context, answer);
@@ -1711,6 +1707,9 @@ impl Shared {
         for old in &ended {
             old.fence();
         }
+        if !ended.is_empty() {
+            self.gate.every();
+        }
         let service = Arc::clone(&queue);
         let started = std::thread::Builder::new()
             .name(format!("reims-vgpu.graphics-queue-{:#x}", q.obj_id))
@@ -1739,6 +1738,8 @@ impl Shared {
         };
         // Its rings are no longer a live queue's (`rings_in`): nothing touches them past this.
         queue.fence();
+        // Its thread, where it waits for ring 0, looks again and goes.
+        self.gate.every();
         true
     }
 
@@ -1881,10 +1882,11 @@ impl Shared {
             // and for the context's lane to have carried out the context's ([`lanes`]), so the
             // resource is registered before the buffer's ops name it. This thread only reads ring
             // 0; it never consumes it, so it keeps one consumer and its `consumer_idle` handshake
-            // is untouched. It sleeps until the control thread signals a move of `control_done`
-            // or a lane a message carried out, a reset or the end. A buffer the host answered on a
-            // doorbell's thread waits no more: that thread found ring 0 carried out through what
-            // the buffer waits for.
+            // is untouched. It sleeps at the gate, woken once `control_done` reaches what it
+            // waits for, then once its context's lane has carried out its own, or at a reset, the
+            // queue's end or the device's ([`gate`]). A buffer the host answered on a doorbell's
+            // thread waits no more: that thread found ring 0 carried out through what the buffer
+            // waits for.
             let answered = consuming.take() == Some(message.header.seqno);
             let (waits_for, own) = if answered {
                 (0, 0)
@@ -1900,19 +1902,20 @@ impl Shared {
                 let backlog = &control.backlog;
                 (backlog.waits_for(queue.context), backlog.own(queue.context))
             };
-            let mut moved = self.control_moved.lock();
-            while self.control_done.load(Ordering::Acquire) < waits_for
-                || !self.lanes.through(queue.context, own)
-            {
+            self.gate.wait(|| {
                 if self.ending()
                     || queue.ended()
                     || self.epoch.load(Ordering::Acquire) != queue.epoch
                 {
-                    break;
+                    Look::Done
+                } else if self.control_done.load(Ordering::Acquire) < waits_for {
+                    Look::Count(waits_for)
+                } else if !self.lanes.through(queue.context, own) {
+                    Look::Lane(queue.context, own)
+                } else {
+                    Look::Done
                 }
-                self.control_moved_signal.wait(&mut moved);
-            }
-            drop(moved);
+            });
             // A reset since the queue was made ended it: nothing more of it goes to the host.
             if self.epoch.load(Ordering::Acquire) != queue.epoch {
                 return;
@@ -2105,8 +2108,10 @@ fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, wait: bool) {
         } else {
             None
         };
-        lanes.finished(key);
-        shared.signal_control_moved();
+        let done = lanes.finished(key);
+        if let Key::Context(context) = key {
+            shared.gate.carried_out(context, done);
+        }
         if let Some(answer) = answer {
             shared.post_waiting(&answer, job.epoch);
         }

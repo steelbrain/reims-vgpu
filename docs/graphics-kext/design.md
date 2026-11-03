@@ -915,6 +915,20 @@ messages and a synchronous create take as long beside 75 idle lanes as beside
 none: 0.1 to 1.4 ms at the median either way, on the M3 Max under other builds'
 load (`a_burst_beside_idle_lanes`, release build).
 
+A queue's thread waiting for ring 0 before it hands a command buffer on is
+woken once the control thread has taken the messages the buffer waits for, and
+once its context's lane has carried out the context's among them, and by
+nothing else but a reset, its queue's end and the device's
+(`reims_graphics`'s `device::gate`): no other process's message wakes it.
+Tested by `the_gate_wakes_each_waiter_once_what_it_waits_for_holds`, which
+moves the count and many contexts' lanes at random beside many waiting
+threads. Beside 75 other processes' queues each waiting on a held create, a
+context's burst of 200 messages and a synchronous create took 11 to 16 ms at
+the median when every lane's message and control step woke every waiting
+queue, and take 49 to 123 us now, as beside none
+(`a_burst_beside_waiting_queues`, release build, M3 Max under other builds'
+load).
+
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process
 holds much, so neither does the kext. The one process whose refusal would stall
