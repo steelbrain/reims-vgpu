@@ -1004,7 +1004,11 @@ platform reads on the runtime's thread) fails the command buffer, whose
 `CB_COMPLETE` is an internal error, and fails its context: the host refuses
 the context's later command buffers, creates (its queues' and samplers'
 among them), library lookups and heap-size and argument-layout queries at
-once, carries out its destroys, and forgets the failure at its close. A release the
+once, carries out its destroys and its pipeline creates, and forgets the
+failure at its close. A pipeline create is carried out because the bundle
+posts a create equal to one the device accepted before without waiting for
+its answer, so the create must not be refused for a failure its process
+cannot know of when it posts. A release the
 platform dies at (at a destroy, a context's close, or the display's swap of
 the texture it shows) is refused alone, and the destroy or the close is
 carried out whole. So is each of the Vulkan platform's releases of what a

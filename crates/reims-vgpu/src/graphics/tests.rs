@@ -3998,6 +3998,34 @@ fn a_failed_context_s_queues_and_queries_are_refused() {
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
 }
 
+/// A failed context's pipeline creates are carried out as any context's are: its render and
+/// compute creates are answered with their reflections and their pipelines stored, as its process,
+/// which posts a create equal to one the device made before without waiting for the answer, takes
+/// them; its other creates stay refused
+#[test]
+fn a_failed_context_s_pipeline_creates_are_carried_out() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    make_library(&device, &mut guest, obj(3, 10));
+    fail_context(&device, &platform, &mut guest, 3, (SUBMIT, COMPLETE));
+    let before = device.decoder_object_count();
+    guest.send(&device, render_pipeline_create(obj(3, 11), obj(3, 10)));
+    expect_reflection(&mut guest, obj(3, 11), RGFX_PIPELINE_OK);
+    guest.send(&device, compute_pipeline_create(obj(3, 12), obj(3, 10)));
+    expect_reflection(&mut guest, obj(3, 12), RGFX_PIPELINE_OK);
+    assert_eq!(device.decoder_object_count(), before + 2, "both pipelines");
+    // Its library create is still refused.
+    assert_ne!(
+        answered(&device, &mut guest, library_create(obj(3, 13))),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), before + 2);
+}
+
 /// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
 /// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
 /// a command buffer's ask for its submission (`CB_SUBMITTED`)

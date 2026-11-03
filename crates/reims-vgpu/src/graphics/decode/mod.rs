@@ -226,8 +226,12 @@ impl Drop for Drain {
 /// The contexts whose work failed off its op's thread: a command buffer's completion the
 /// platform refused on its own thread ([`CompletedInfo::refused`]), where the paravirt device ends
 /// the process. The decoder refuses each one's later work, its command buffers and creates, until
-/// its close: only its destroys are carried out (docs/graphics-kext/design.md, "Guest input the
-/// host refuses"). Shared with the command buffers' completed handlers, which mark a context.
+/// its close: only its destroys and its pipeline creates are carried out
+/// (docs/graphics-kext/design.md, "Guest input the host refuses"). A pipeline create is the one
+/// create a process posts without waiting for its answer, where the device accepted an equal one
+/// before (the bundle's known pipelines), so it is answered as the device would answer it in any
+/// context, never refused for a failure its process cannot know of when it posts. Shared with the
+/// command buffers' completed handlers, which mark a context.
 /// A handler marks one only where no reset of the device came since its buffer's decode: a buffer
 /// of the guest before a reboot may finish after it, and the rebooted guest's processes take the
 /// same context numbers again, from 1.
@@ -1264,8 +1268,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(header) = read::<RgfxMsgHeader>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        // A failed context's later work is refused: only its destroys are carried out.
-        if header.r#type != RGFX_CMD_OBJECT_DESTROY && self.context_failed() {
+        // A failed context's later work is refused: only its destroys and its pipeline creates
+        // are carried out ([`FailedContexts`]).
+        let carried = matches!(
+            header.r#type,
+            RGFX_CMD_OBJECT_DESTROY
+                | RGFX_CMD_RENDER_PIPELINE_CREATE
+                | RGFX_CMD_COMPUTE_PIPELINE_CREATE
+        );
+        if !carried && self.context_failed() {
             return Ok(Err(DecodeError::ContextFailed));
         }
         match header.r#type {
@@ -1983,9 +1994,6 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// linked functions. Each function is specialised by the index-keyed constants the wire
     /// carries for it, and each linked function made with the options the guest made it with.
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
-        if self.context_failed() {
-            return Err(DecodeError::ContextFailed);
-        }
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
         if header.r#type == RGFX_CMD_COMPUTE_PIPELINE_CREATE {
