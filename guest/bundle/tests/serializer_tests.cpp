@@ -1063,18 +1063,24 @@ void test_ring_post_waits_for_the_room_record()
 }
 
 // A writer's room line counts each sleep for room, those a room record ended apart, and their
-// time in all and at most; it is logged at the first sleep, then at most every interval.
+// time in all and at most; it is logged at the first sleep, then at most every interval, and once
+// more as the writer goes where sleeps came since the last line.
 void test_ring_room_sleeps_count_for_the_line()
 {
 	RgfxRingRoomSleeps s;
+	CHECK(!s.unlogged());
 	CHECK(s.note(300, true, 1000, 500));
+	CHECK(!s.unlogged());
 	CHECK(!s.note(900, false, 1200, 500));
+	CHECK(s.unlogged());
 	CHECK(s.note(100, true, 1500, 500));
+	CHECK(!s.unlogged());
 	CHECK(s.sleeps == 3 && s.woken == 2);
 	CHECK(s.sleptNs == 1300 && s.mostNs == 900);
 	RgfxRingRoomSleeps z;
 	CHECK(z.note(1, false, 0, 500));
 	CHECK(!z.note(1, false, 1, 500));
+	CHECK(z.unlogged());
 }
 
 // Blocks of a plain buffer standing in for the device region, as a queue's pool hands them out

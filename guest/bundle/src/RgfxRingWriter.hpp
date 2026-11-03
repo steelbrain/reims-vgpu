@@ -76,6 +76,9 @@ public:
 	/// the largest message it takes (dataSize()).
 	RgfxRingWriter(RgfxForward forward, void *forward_context, uint32_t max_size);
 
+	/// Logs the room line once more where its posts slept since the last one (noteSleep).
+	~RgfxRingWriter();
+
 	/// Writes a message of `size` bytes (its payload in `message`, a multiple of
 	/// 8, at least the header and at most `data_size`) and publishes it, stamping
 	/// the header's `type`, `size` and `seqno`. Returns false, writing nothing,
@@ -156,9 +159,12 @@ private:
 	// Counts one sleep of post's from `from` (byRecord: a room record ended it), and logs the
 	// counts at the first sleep and then at most every second.
 	void noteSleep(std::chrono::steady_clock::time_point from, bool byRecord);
+	// The room line, with the counts `seen`.
+	void logSleeps(const RgfxRingRoomSleeps &seen) const;
 
 	std::shared_ptr<RgfxRingRoomEvents> m_room; // setRoomEvents'
-	// The posts' sleeps for room, under m_sleepsLock, logged at most every second (post).
+	// The posts' sleeps for room, under m_sleepsLock, logged at the first, at most every second
+	// after it (post), and once more as the writer goes where sleeps came since the last line.
 	std::mutex m_sleepsLock;
 	RgfxRingRoomSleeps m_sleeps;
 

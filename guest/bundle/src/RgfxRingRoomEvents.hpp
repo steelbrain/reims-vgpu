@@ -59,6 +59,8 @@ struct RgfxRingRoomSleeps {
 	uint64_t mostNs = 0;
 	// When the last line was logged, in nanoseconds; 0 before the first.
 	uint64_t loggedNs = 0;
+	// The sleeps the last line counted.
+	uint64_t loggedSleeps = 0;
 
 	/// Counts one sleep of `ns`, `woken` where a room record ended it: whether the counts are
 	/// logged now, at the first sleep and then at most every `intervalNs` (`nowNs` on the same
@@ -73,8 +75,13 @@ struct RgfxRingRoomSleeps {
 		if (loggedNs != 0 && nowNs - loggedNs < intervalNs)
 			return false;
 		loggedNs = nowNs != 0 ? nowNs : 1;
+		loggedSleeps = sleeps;
 		return true;
 	}
+
+	/// Whether sleeps came since the last line: the writer logs the counts once more as it goes,
+	/// so a process's last second of sleeps is not lost.
+	bool unlogged() const { return sleeps != loggedSleeps; }
 };
 
 #endif // RGFX_RING_ROOM_EVENTS_HPP_

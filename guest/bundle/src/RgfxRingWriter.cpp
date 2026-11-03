@@ -87,6 +87,18 @@ RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint3
 {
 }
 
+RgfxRingWriter::~RgfxRingWriter()
+{
+	RgfxRingRoomSleeps seen;
+	{
+		std::lock_guard<std::mutex> hold(m_sleepsLock);
+		if (!m_sleeps.unlogged())
+			return;
+		seen = m_sleeps;
+	}
+	logSleeps(seen);
+}
+
 void RgfxRingWriter::setDeferred(RgfxForwardDeferred post, RgfxAwaitAnswer await, void *context)
 {
 	m_deferredPost = post;
@@ -177,6 +189,11 @@ void RgfxRingWriter::noteSleep(std::chrono::steady_clock::time_point from, bool 
 			return;
 		seen = m_sleeps;
 	}
+	logSleeps(seen);
+}
+
+void RgfxRingWriter::logSleeps(const RgfxRingRoomSleeps &seen) const
+{
 	os_log(OS_LOG_DEFAULT,
 	       "RGFX: ring %u room: %llu sleeps (%llu ended by a SUBMIT_ROOM record), %llu us asleep "
 	       "in all, %llu us at most",
