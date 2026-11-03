@@ -34,11 +34,11 @@ use reims_vgpu_core::platform::blit::ResourceRef;
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::icb::{
     IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
 };
+use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::values::{
     ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, LinkedFunctionsDesc,
     TextureDesc,
@@ -458,7 +458,11 @@ fn measure<P: ApiPlatform>(
     println!(
         "{name}: a full render command's slot carried out{}, median [lowest, highest] of {runs} \
          runs of {REPS} repetitions of {COMMANDS} commands",
-        if executed { " after an execution of every command" } else { "" }
+        if executed {
+            " after an execution of every command"
+        } else {
+            ""
+        }
     );
     for (f, figure) in FIGURES.iter().enumerate() {
         let mut medians = [0.0f64; 3];
