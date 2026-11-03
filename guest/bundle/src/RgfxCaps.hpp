@@ -21,6 +21,7 @@
 #define RGFX_CAPS_HPP_
 
 #include <cstdint>
+#include <string>
 
 #include "reims_graphics_wire.h"
 
@@ -188,6 +189,13 @@ enum RgfxSpiFeature : int {
 	kRgfxSpiReadWriteTextureArguments,
 	kRgfxSpiCount
 };
+
+/// The MTLDeviceSPI `familyName` of a device named `name`: the name without its vendor (a first
+/// word "Apple", "AMD", "Intel", "Intel(R)" or "NVIDIA") and without its model number (the first
+/// later word that starts with a digit, and every word after it), as Metal's devices answer
+/// (measured: "M3 Max" for "Apple M3 Max", "Radeon Pro" for "AMD Radeon Pro 5300M", "UHD
+/// Graphics" for "Intel(R) UHD Graphics 630"). Where that leaves nothing, the whole name.
+std::string rgfxFamilyNameOf(const char *name);
 
 class RgfxCaps {
 public:

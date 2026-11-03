@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include <cstring>
+#include <vector>
 
 // The enum counts match the blob's arrays: a drift in either is caught here, at
 // the guest's own compile, beside wire.rs's assertions on the host side.
@@ -294,4 +295,39 @@ uint64_t RgfxCaps::maxThreadsPerThreadgroup(uint32_t dim) const
 	if (dim >= 3)
 		return 0;
 	return m_info.max_threads_per_threadgroup[dim];
+}
+
+std::string rgfxFamilyNameOf(const char *name)
+{
+	std::vector<std::string> words;
+	std::string word;
+	for (const char *c = name; ; c++) {
+		if (*c == ' ' || *c == '\0') {
+			if (!word.empty())
+				words.push_back(word);
+			word.clear();
+			if (*c == '\0')
+				break;
+		} else {
+			word += *c;
+		}
+	}
+	size_t first = 0;
+	if (!words.empty()) {
+		for (const char *vendor : {"Apple", "AMD", "Intel", "Intel(R)", "NVIDIA"}) {
+			if (words[0] == vendor) {
+				first = 1;
+				break;
+			}
+		}
+	}
+	std::string out;
+	for (size_t k = first; k < words.size(); k++) {
+		if (k > first && words[k][0] >= '0' && words[k][0] <= '9')
+			break;
+		if (!out.empty())
+			out += ' ';
+		out += words[k];
+	}
+	return out.empty() ? std::string(name) : out;
 }

@@ -635,6 +635,15 @@ RGFX_LOG_UNRECOGNIZED
 	return @"reims-graphics";
 }
 
+// The MTLDeviceSPI family name, from the name the device answers (rgfxFamilyNameOf): "GeForce
+// RTX" for "NVIDIA GeForce RTX 5080 Laptop GPU". Metal's devices answer the name without the
+// vendor and the model number, each its own, so the answer is the lane's choice inside what they
+// give (dgpu-oracle.md class 2); the IOGPU base answered "", which no Mac does.
+- (NSString *)familyName
+{
+	return [NSString stringWithUTF8String:rgfxFamilyNameOf(self.name.UTF8String).c_str()];
+}
+
 - (uint64_t)registryID
 {
 	// The guest's own accelerator's registry entry ID: WindowServer finds the Metal device

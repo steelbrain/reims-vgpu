@@ -352,7 +352,7 @@ deviceOrFeatureProfileSupportsFeatureSet: base %base-spi
 deviceSupportsFeatureSet: base %base-spi
 doubleFPConfig implemented
 endCollectingPipelineDescriptors base %base-spi
-familyName base %base-spi
+familyName implemented class 2 (the Macs diverge): the device name without the vendor and the model number, as the Macs answer theirs (measured: "M3 Max" for Apple M3 Max, "Radeon Pro" for AMD Radeon Pro 5300M, "UHD Graphics" for Intel(R) UHD Graphics 630), so "GeForce RTX" for an RTX 5080; the IOGPU base answered ""
 featureProfile implemented
 featureQueries base %base-spi
 functionHandleWithBinaryFunction: unsupported function pointers
@@ -932,7 +932,7 @@ supportsYCBCRFormatsXR base %base-spi
 supportsYCBCRPackedFormats12 base %base-spi
 supportsYCBCRPackedFormatsPQ base %base-spi
 supportsYCBCRPackedFormatsXR base %base-spi
-targetDeviceArchitecture base %base-spi
+targetDeviceArchitecture base class 2 (the Macs diverge): the IOGPU base answers nil, the lane's answer. Each Mac answers an MTLTargetDeviceArchitecture naming its GPU compiler's target (measured: cpuType 0x1000013 subType 0x1a3 on the M3 Max, 0x1000014 0x1773 on the AMD 5300M, 0x1000015 0x950200 on the Intel UHD 630), an instruction set the host cannot run; nil names none
 targetDeviceInfo base %base-spi
 tensorSizeAndAlignWithDescriptor: unsupported tensors
 threadsPerCompilerProcess base %base-spi

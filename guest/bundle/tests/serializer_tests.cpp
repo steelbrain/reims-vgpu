@@ -21,6 +21,7 @@
 #include "RgfxArgumentLayout.hpp"
 #include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
+#include <utility>
 #include "RgfxEncoder.hpp"
 #include "RgfxHeapRanges.hpp"
 #include "RgfxLibraryKey.hpp"
@@ -453,6 +454,23 @@ void test_spi_features()
 	for (int k = 0; k < kRgfxSpiCount; k++)
 		yes += fl.spiFeature(static_cast<RgfxSpiFeature>(k)) ? 1 : 0;
 	CHECK(yes == 5);
+}
+
+// The SPI family name, from the device name, by the rule Metal's devices answer by: the three
+// Macs' names give their own answers (measured), and the hosts' names the lane's.
+void test_family_names()
+{
+	const std::pair<const char *, const char *> cases[] = {
+	    {"Apple M3 Max", "M3 Max"},
+	    {"AMD Radeon Pro 5300M", "Radeon Pro"},
+	    {"Intel(R) UHD Graphics 630", "UHD Graphics"},
+	    {"NVIDIA GeForce RTX 5080 Laptop GPU", "GeForce RTX"},
+	    {"AMD Radeon RX 7900 XTX", "Radeon RX"},
+	    {"reims-graphics", "reims-graphics"}, // the name with no caps: no vendor, no number
+	    {"NVIDIA", "NVIDIA"},                 // nothing left: the whole name
+	};
+	for (const auto &[name, family] : cases)
+		CHECK(rgfxFamilyNameOf(name) == family);
 }
 
 // A heap or buffer whose GPU address finds no room in the context's range is no object: the
@@ -2041,6 +2059,7 @@ int main()
 	test_resource_id_chunks();
 	test_caps();
 	test_spi_features();
+	test_family_names();
 	test_archive_file();
 	test_lifecycle_messages();
 	test_creates_with_no_address_post_nothing();
