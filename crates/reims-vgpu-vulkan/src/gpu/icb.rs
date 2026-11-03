@@ -706,7 +706,8 @@ impl IcbObject {
                     && matches!(place % LENGTHS_A_COMMAND, 36 | 37))
             });
             if !self.inherits.pipeline && !range.is_empty() {
-                let words = Tail::pipeline(n, range.start).start..Tail::pipeline(n, range.end).start;
+                let words =
+                    Tail::pipeline(n, range.start).start..Tail::pipeline(n, range.end).start;
                 sides.tail.clear(words);
             }
         });
@@ -2128,7 +2129,11 @@ mod tests {
 
     /// Executes command 0 of `icb`, `resident` made resident for reading and writing, in a
     /// command buffer of its own, which completes with no error.
-    fn execute_first(d: &VulkanDevice, icb: &VulkanIcb, resident: &[Option<ResourceRef<'_, VulkanPlatform>>]) {
+    fn execute_first(
+        d: &VulkanDevice,
+        icb: &VulkanIcb,
+        resident: &[Option<ResourceRef<'_, VulkanPlatform>>],
+    ) {
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
         let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
