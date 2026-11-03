@@ -526,4 +526,214 @@ mod tests {
         // SAFETY: the mapping made above, which nothing uses any more.
         assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
     }
+
+    /// What a slab's buffers cost as no-copy buffers over its pages, each at an offset of a buffer
+    /// over the whole slab that holds its import first, as a pages block's view holds one
+    /// (arch-shared-mem phase 2b): over one 2 MiB run of the leased RAM, over a view mapping one
+    /// 2 MiB run of the RAM's file, and over a view of 512 4 KiB runs apart. The 4 KiB buffers are
+    /// made at the host's address, then pinned in a freed range, as the guest pins them; a GPU
+    /// fill through the last pinned one reaches the file's page. Timings only, printed as `slab:`
+    /// lines: run alone, holding the GPU.
+    #[test]
+    #[ignore = "a measurement: run alone, holding the GPU"]
+    fn slab_nocopy_costs() {
+        use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
+        let clock = crate::os::OsClock::new();
+        let now = || clock.now_mono();
+        let since = |t: MonoTime| clock.now_mono().saturating_duration_since(t);
+        const SHARED_TRACKED: u64 = 0x200;
+        let device = dev();
+        let length = 256 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, unmapped at the end.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        // SAFETY: the mapping above, `length` bytes.
+        unsafe { std::ptr::write_bytes(start.cast::<u8>(), 0, length.to_usize()) };
+        let at = start.addr().to_u64();
+        let lease = lease_guest_memory(
+            [GuestRamFile {
+                host: at,
+                guest: 0,
+                length,
+                fd: std::sync::Arc::clone(&fd),
+                offset: 0,
+            }],
+            None,
+        );
+        let counts = || {
+            let c = device.raw.work_counts();
+            (
+                c.host_ram_chunks_imported,
+                c.chunk_bound_buffers_made,
+                c.host_pointer_imports_made,
+                c.copied_heaps_made,
+            )
+        };
+        let buffer = |addr: u64, len: u64, pin: Option<u64>| {
+            // SAFETY: mapped pages of the test's, mapped until after every buffer is dropped.
+            let bytes = unsafe { HostRange::new(HostPtr::from_addr(addr.to_usize()), len) };
+            device
+                .new_buffer(BufferDesc {
+                    length: len,
+                    options: vec![OptionSet::ResourceOptions(SHARED_TRACKED)],
+                    pinned_gpu_address: pin,
+                    contents: Some(bytes),
+                    no_copy: true,
+                    deallocator: None,
+                })
+                .unwrap()
+        };
+        // A GPU range of `len` bytes no buffer holds: a buffer's, freed.
+        let freed_range = |len: u64| {
+            let b = device
+                .new_buffer(BufferDesc {
+                    length: len,
+                    options: vec![OptionSet::ResourceOptions(SHARED_TRACKED)],
+                    pinned_gpu_address: None,
+                    contents: None,
+                    no_copy: false,
+                    deallocator: None,
+                })
+                .unwrap()
+                .unwrap();
+            b.gpu_address()
+        };
+        let median = |v: &mut Vec<f64>| {
+            if v.is_empty() {
+                return (0.0, 0.0);
+            }
+            v.sort_by(f64::total_cmp);
+            (v[v.len() / 2], v[v.len() - 1])
+        };
+        // `runs` runs of `run` bytes, `2 * run` apart in the file from `from`, mapped in order.
+        let view = |runs: u64, run: u64, from: u64| {
+            let len = runs * run;
+            // SAFETY: a fresh reservation, then each run mapped over it from the file.
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len.to_usize(),
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED);
+            for r in 0..runs {
+                let off = from + 2 * run * r;
+                // SAFETY: within the reservation above.
+                let p = unsafe {
+                    libc::mmap(
+                        base.cast::<u8>().add((run * r).to_usize()).cast(),
+                        run.to_usize(),
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        fd.as_raw_fd(),
+                        off as libc::off_t,
+                    )
+                };
+                assert_ne!(p, libc::MAP_FAILED);
+            }
+            base.addr().to_u64()
+        };
+        let one_run = view(1, 2 * MIB, 64 * MIB);
+        let scattered = view(512, 4096, 128 * MIB);
+        let mut held = Vec::new();
+        for (label, base) in [
+            ("ram run", at + 2 * MIB),
+            ("view of 1 run", one_run),
+            ("view of 512 runs", scattered),
+        ] {
+            let c0 = counts();
+            let t = now();
+            let whole = buffer(base, 2 * MIB, None).unwrap();
+            let whole_us = since(t).as_secs_f64() * 1e6;
+            let c1 = counts();
+            let mut times = Vec::new();
+            for k in 0..512u64 {
+                let t = now();
+                held.push(buffer(base + k * 4096, 4096, None).unwrap());
+                times.push(since(t).as_secs_f64() * 1e6);
+            }
+            let pin = freed_range(2 * MIB);
+            let (mut pinned, mut nil) = (Vec::new(), 0);
+            for k in 0..512u64 {
+                let t = now();
+                match buffer(base + k * 4096, 4096, Some(pin + k * 4096)) {
+                    Some(b) => {
+                        pinned.push(since(t).as_secs_f64() * 1e6);
+                        assert_eq!(b.gpu_address(), pin + k * 4096);
+                        held.push(b);
+                    }
+                    None => nil += 1,
+                }
+            }
+            let c3 = counts();
+            let (p50, max) = median(&mut times);
+            let (pin50, pinmax) = median(&mut pinned);
+            println!(
+                "slab: no-copy {label} whole_us={whole_us:.1} sub4k_p50_us={p50:.2} \
+                 sub4k_max_us={max:.1} pinned_p50_us={pin50:.2} pinned_max_us={pinmax:.1} \
+                 pinned_nil={nil} whole(chunks={} bound={} ptr_imports={} copied={}) \
+                 subs(chunks={} bound={} ptr_imports={} copied={})",
+                c1.0 - c0.0,
+                c1.1 - c0.1,
+                c1.2 - c0.2,
+                c1.3 - c0.3,
+                c3.0 - c1.0,
+                c3.1 - c1.1,
+                c3.2 - c1.2,
+                c3.3 - c1.3,
+            );
+            held.push(whole);
+        }
+        // The GPU's fill through the last pinned buffer of the one-run view lands in the file's
+        // page it maps: the view's last page, at 64 MiB + 2 MiB - 4 KiB of the RAM.
+        let last = held
+            .iter()
+            .rev()
+            .find(|b| b.contents().addr().to_u64() == one_run + 2 * MIB - 4096)
+            .unwrap();
+        let q = device.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let fill = BlitCmd::FillBuffer {
+            buffer: last,
+            range: NsRange::new(16, 32),
+            value: 0x5a,
+        };
+        e.encode(OnFault::Die, fill).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        // SAFETY: the RAM, mapped readable, which no GPU work uses now.
+        let read = |offset: u64| unsafe {
+            std::ptr::with_exposed_provenance::<u8>((at + offset).to_usize()).read_volatile()
+        };
+        let page = 64 * MIB + 2 * MIB - 4096;
+        assert_eq!(
+            [
+                read(page + 15),
+                read(page + 16),
+                read(page + 47),
+                read(page + 48)
+            ],
+            [0, 0x5a, 0x5a, 0]
+        );
+        drop((cb, e, q, held, lease));
+    }
 }
