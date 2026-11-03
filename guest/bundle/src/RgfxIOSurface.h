@@ -43,7 +43,7 @@
  * every plane. Where the kext gives no shared block, the process keeps a block of its own for the
  * surface. The kext gives a surface's blocks in one mode, so every holder of a surface copied
  * copies it. Each view made, in place or a copy and why, is counted in the "surface copies" line
- * the process logs to /tmp/rgfx-surface-copies.log every 10 s while views are made or copied.
+ * the process logs (os_log, info) every 10 s while views are made or copied.
  *
  * The copy holds the planes in plane order, each from a kShadowRowAlign multiple, its rows
  * kShadowRowAlign apart, as the surface's own memory holds them one after another; a header past

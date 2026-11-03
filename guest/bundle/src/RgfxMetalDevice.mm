@@ -15,13 +15,6 @@
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
-// RGFX DIAG (Wall-2 trace; remove before merge): the guest's logd is broken, so
-// write diagnostics to a file any process (platform or not) can read.
-#include <fcntl.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <unistd.h>
-
 #include <IOKit/IOKitLib.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -31,28 +24,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <os/log.h>
 #include <vector>
-
-namespace {
-// RGFX DIAG (remove before merge): append one line to /tmp/rgfx-diag.log.
-void rgfxDiag(const char *fmt, ...)
-{
-	char line[512];
-	va_list ap;
-	va_start(ap, fmt);
-	int n = vsnprintf(line, sizeof(line), fmt, ap);
-	va_end(ap);
-	if (n <= 0)
-		return;
-	if (static_cast<size_t>(n) > sizeof(line))
-		n = sizeof(line);
-	int fd = open("/tmp/rgfx-diag.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
-	if (fd < 0)
-		return;
-	(void)write(fd, line, static_cast<size_t>(n));
-	close(fd);
-}
-} // namespace
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxRegion.hpp"
@@ -156,7 +129,8 @@ RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t
 		return RgfxCompletionThread::kWoke;
 	if (kr == kIOReturnAborted)
 		return RgfxCompletionThread::kRetry; // a signal broke the sleep
-	rgfxDiag("RGFX: the completion wait ended kr=0x%x; waiters take the rings\n", kr);
+	os_log_error(OS_LOG_DEFAULT, "RGFX: the completion wait ended kr=0x%x; waiters take the rings",
+	             kr);
 	return RgfxCompletionThread::kStop;
 }
 
@@ -354,35 +328,9 @@ RGFX_LOG_UNRECOGNIZED
 
 RGFX_LOG_UNRECOGNIZED
 
-// RGFX DIAG (Wall-2 trace; remove before merge): fires when the bundle is loaded
-// and this class is realized in the ObjC runtime. If this logs but no init below
-// does, Metal loaded the bundle but did not instantiate us by initWithAcceleratorPort
-// (wrong entry point or a pre-instantiation gate); if this never logs, the class is
-// not being realized at all.
-+ (void)load
-{
-	rgfxDiag("RGFX: RgfxMetalDevice +load (class realized in runtime)\n");
-}
-
-// RGFX DIAG (remove before merge): catch a plain -init in case Metal instantiates us
-// that way rather than via initWithAcceleratorPort:.
-- (instancetype)init
-{
-	rgfxDiag("RGFX: -init called (not initWithAcceleratorPort:)\n");
-	NSLog(@"RGFX: -init called");
-	return [super init];
-}
-
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
-	// RGFX DIAG (Wall-2 trace; remove before merge): confirm Metal enters our init
-	// and report whether the IOGPUMetalDevice base accepts or declines. To a file
-	// (the guest's logd is broken) plus the probe's stderr (NSLog).
-	rgfxDiag("RGFX: initWithAcceleratorPort entered, port=0x%x\n", (unsigned)port);
-	NSLog(@"RGFX: initWithAcceleratorPort entered, port=0x%x", (unsigned)port);
 	self = [super initWithAcceleratorPort:port];
-	rgfxDiag("RGFX: [super initWithAcceleratorPort] -> %s\n", self ? "non-nil" : "nil");
-	NSLog(@"RGFX: [super initWithAcceleratorPort] -> %@", self ? @"non-nil" : @"nil");
 	if (self == nil) {
 		return nil; // Apple's base declined (or the port is not ours)
 	}
@@ -404,8 +352,9 @@ RGFX_LOG_UNRECOGNIZED
 	// crashing.
 	kern_return_t kr = IOServiceOpen(port, mach_task_self(), kRgfxAccelUserClientType, &_conn);
 	if (kr != KERN_SUCCESS) {
-		rgfxDiag("RGFX: IOServiceOpen(type=%u) failed kr=0x%x; transport stubbed\n",
-		         kRgfxAccelUserClientType, kr);
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: IOServiceOpen(type=%u) failed kr=0x%x; transport stubbed",
+		             kRgfxAccelUserClientType, kr);
 		return self;
 	}
 
@@ -436,7 +385,8 @@ RGFX_LOG_UNRECOGNIZED
 		infoSize = sizeof(info);
 	}
 	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
-		rgfxDiag("RGFX: caps blob not read (kr=0x%x) or invalid; using defaults\n", kr);
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: caps blob not read (kr=0x%x) or invalid; using defaults", kr);
 	// The device's feature word and the kext's own, from the kext; a kext older than the call
 	// leaves the blob's bits 0 to 2 and no kext feature (RgfxCaps::takeFeatures).
 	uint64_t features[2] = {};
@@ -454,9 +404,10 @@ RGFX_LOG_UNRECOGNIZED
 	uint32_t ctxCount = 5;
 	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
 	if (kr != KERN_SUCCESS || ctxCount != 5 || ctx[3] == 0 || ctx[4] < RGFX_ALLOCATIONS_OFFSET) {
-		rgfxDiag("RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); transport "
-		         "stubbed\n",
-		         kr, (unsigned long long)ctx[3], (unsigned long long)ctx[4]);
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); transport "
+		             "stubbed",
+		             kr, (unsigned long long)ctx[3], (unsigned long long)ctx[4]);
 		IOServiceClose(_conn);
 		_conn = IO_OBJECT_NULL;
 		return self;
@@ -490,13 +441,9 @@ RGFX_LOG_UNRECOGNIZED
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
-		rgfxDiag("RGFX: no completion thread; waiters take the rings\n");
+		os_log_error(OS_LOG_DEFAULT, "RGFX: no completion thread; waiters take the rings");
 		_completions.reset();
 	}
-	rgfxDiag("RGFX: context %llu: ids 0x%llx, va 0x%llx\n", (unsigned long long)ctx[0],
-	         (unsigned long long)ctx[1], (unsigned long long)ctx[2]);
-	rgfxDiag("RGFX: transport up: region=%llu bytes, caps=%s\n", (unsigned long long)mapSize,
-	         _caps.valid() ? "valid" : "default");
 	return self;
 }
 

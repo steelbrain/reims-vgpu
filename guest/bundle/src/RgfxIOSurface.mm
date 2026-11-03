@@ -11,16 +11,15 @@
 #include <cstddef>
 #include <cstring>
 #include <dispatch/dispatch.h>
-#include <fcntl.h>
 #include <map>
 #include <mutex>
+#include <os/log.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
 #include <time.h>
 #include <tuple>
-#include <unistd.h>
 #include <utility>
 
 #include "RgfxEncoder.hpp"
@@ -286,7 +285,7 @@ bool holdsYCbCr(IOSurfaceRef s)
 }
 
 /// The process's copies between surfaces' pages and the GPU's view of them, by direction: a
-/// diagnostic, a line in kCopyLog at most every kCopyReportNs while copies run.
+/// diagnostic, an os_log line (info) at most every kCopyReportNs while copies run.
 struct CopyCount {
 	std::atomic<uint64_t> count{0};
 	std::atomic<uint64_t> bytes{0};
@@ -310,7 +309,6 @@ std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, 
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
 
 const uint64_t kCopyReportNs = 10ull * 1000 * 1000 * 1000;
-const char *const kCopyLog = "/tmp/rgfx-surface-copies.log";
 
 uint64_t nowNs()
 {
@@ -340,23 +338,14 @@ void reportCopies(uint64_t now)
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
 	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
 	         cr = gCopiedRefused;
-	char line[384];
-	int n = snprintf(line, sizeof(line),
-	                 "RGFX: surface copies, pid %d %s, %.1f s: %llu uploads %.1f MiB %.2f ms, "
-	                 "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu "
-	                 "cached), copies %llu for alignment, %llu unsupported, %llu refused by the "
-	                 "kext\n",
-	                 getpid(), getprogname(), (now - last) / 1e9, uc - upCount,
-	                 (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, wc - wbCount,
-	                 (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6, ip - inPlace, cc - cached,
-	                 ca - forAlignment, cu - unsupported, cr - refused);
-	int fd = open(kCopyLog, O_WRONLY | O_CREAT | O_APPEND, 0666);
-	if (fd >= 0 && n > 0) {
-		(void)write(fd, line, std::min(static_cast<size_t>(n), sizeof(line) - 1));
-	}
-	if (fd >= 0) {
-		close(fd);
-	}
+	// The process's id and name are the log's own.
+	os_log_info(OS_LOG_DEFAULT,
+	            "RGFX: surface copies, %.1f s: %llu uploads %.1f MiB %.2f ms, %llu write-backs "
+	            "%.1f MiB %.2f ms; views made: %llu in place (%llu cached), copies %llu for "
+	            "alignment, %llu unsupported, %llu refused by the kext",
+	            (now - last) / 1e9, uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6,
+	            wc - wbCount, (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6, ip - inPlace,
+	            cc - cached, ca - forAlignment, cu - unsupported, cr - refused);
 	last = now;
 	upCount = uc, upBytes = ub, upNs = un, wbCount = wc, wbBytes = wb, wbNs = wn;
 	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;

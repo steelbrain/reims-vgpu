@@ -261,6 +261,7 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(S
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
+	bash tests/bundle_files_check.sh $(BUNDLEBIN)
 
 # --- the wire round trip against the host's library (native arch, this Mac's GPU) ----------
 # The bundle's own ring code (the serialiser, a queue's rings, reader and completion thread, a
