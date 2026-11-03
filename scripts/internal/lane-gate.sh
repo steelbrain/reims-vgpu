@@ -320,7 +320,10 @@ do_cargo() {
   "$SRC/scripts/internal/gpu-locks.sh" -- cargo nextest run "${pkgs[@]}" --features "$feats" --no-fail-fast \
     --tool-config-file "lane-gate:$GH/nextest-tool.toml" -E "$expr" 2>&1 | tail -40
   set -e
-  python3 -I - "$junit" "$RES" << 'EOF'
+  # A run that ended before its report (stopped, or killed with its lock's ticket) wrote no junit:
+  # the step fails (errexit does not reach inside a step's function).
+  [[ -s $junit ]] || { echo "cargo: nextest wrote no $junit: the run did not finish"; return 1; }
+  python3 -I - "$junit" "$RES" << 'EOF' || return 1
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.argv[1]).getroot()
 fails, total = [], 0

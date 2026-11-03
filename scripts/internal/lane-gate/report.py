@@ -642,7 +642,8 @@ class Run:
         alone = sorted({l.strip() for l in read(os.path.join(r, "cargo-alone.txt")).splitlines() if l.strip()})
         if alone:
             summary += f"; {len(alone)} passed run again alone (load-sensitive): " + ", ".join(alone)
-        self.item("cargo.tests", "PASS", summary)
+        self.item("cargo.tests", "PASS" if summary else "FAIL",
+                  summary or "the cargo run wrote no results (cargo-summary.txt): it did not finish")
 
     def to_json(self):
         return {"meta": self.meta, "items": self.items, "metrics": self.metrics,
