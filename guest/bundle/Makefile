@@ -38,6 +38,10 @@
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
 #                   build/air_arguments.metallib.
+#   make peer-test-build, make peer-test
+#                   the wire round trip of the bundle's ring code against the host's library
+#                   (tests/peer_tests.mm; native arch, this Mac's GPU, never in `make test`):
+#                   build, then run holding the GPU lock. DIST names `cargo xtask dist`'s tree.
 #   make clean      remove build/
 #
 # Everything lands in build/, never committed.
@@ -243,6 +247,31 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(S
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
 
+# --- the wire round trip against the host's library (native arch, this Mac's GPU) ----------
+# The bundle's own ring code (the serialiser, a queue's rings, reader and completion thread, a
+# command buffer's commit) against the host's library through its C API, with a stand-in for the
+# kext (tests/peer_tests.mm), recording the wire's traffic against tests/peer_wire2.trace. Never in
+# `make test`: it runs on the GPU, so build it first (`make peer-test-build`), then run
+# `make peer-test` holding the Mac's GPU lock. DIST is the tree `cargo xtask dist` wrote (Metal,
+# release): its archive is linked as QEMU links it, with its pkg-config file's private libraries.
+# RGFX_PEER_RECORD=1 records the trace again.
+DIST          ?= ../../target/dist
+PEER_TESTBIN   = $(BUILD)/peer_tests
+PEER_TRACE     = tests/peer_wire2.trace
+PEER_LIBS      = $(shell sed -n 's/^Libs.private: //p' $(DIST)/lib/pkgconfig/reims-vgpu.pc)
+
+$(PEER_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) tests/peer_tests.mm $(HEADERS) \
+	$(DIST)/lib/libreims_vgpu.a $(DIST)/include/reims_vgpu.h Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(NATIVE) $(CXXFLAGS) $(OBJCXXFLAGS) $(PROTOCOL_QUIET) -I $(DIST)/include \
+		$(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) tests/peer_tests.mm $(DIST)/lib/libreims_vgpu.a \
+		$(FRAMEWORKS) -framework CoreVideo $(PEER_LIBS) -o $@
+
+peer-test-build: $(PEER_TESTBIN)
+
+peer-test: $(PEER_TESTBIN)
+	$(PEER_TESTBIN) $(PEER_TRACE)
+
 # --- the loadable bundle (x86_64, device shell included) ---------------------
 # The IOGPUMetalDevice superclass is linked two-level against IOGPU (PRIVFW), so
 # dyld auto-loads IOGPU and resolves the device shell's base class when Metal
@@ -350,4 +379,4 @@ $(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArgume
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench res reflection-check clean
+.PHONY: all test bundle package sweep bench res reflection-check peer-test peer-test-build clean
