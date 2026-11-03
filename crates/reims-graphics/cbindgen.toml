@@ -66,6 +66,7 @@ include = [
     "RgfxBufferBinding",
     "RgfxBufferCreate",
     "RgfxBufferDidModifyRange",
+    "RgfxBufferManagedAtOffset",
     "RgfxBufferOverHostMemory",
     "RgfxBufferOverPages",
     "RgfxBufferOverSurfacePages",

@@ -836,8 +836,9 @@
 // `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
 // [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 // guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
-// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`] and
-// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]). Bits 9 and 10 are reserved.
+// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`] and [`RGFX_FEATURE_MANAGED_AT_OFFSET`]). Bits 9, 10,
+// 13 and 15 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -909,6 +910,13 @@
 // the bit; the kext takes it where it answers the create, and its bundle makes indirect command
 // buffers only where it was taken.
 #define RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS (1 << 12)
+
+// `FEATURES_LO` bit 14, `MANAGED_AT_OFFSET`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`], a
+// `Managed` buffer whose CPU copy is placed in a heap over host memory, so no buffer imports
+// host memory of its own. Offered where a `Managed` buffer is two copies: where the host's GPU
+// does not share the CPU's memory.
+#define RGFX_FEATURE_MANAGED_AT_OFFSET (1 << 14)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1278,6 +1286,13 @@
 // buffer sees every encode posted before it. Not answered: a record the host cannot carry out
 // is skipped alone.
 #define RGFX_CMD_ICB_WRITE 553
+
+// Command `BUFFER_MANAGED_AT_OFFSET` ([`RgfxBufferManagedAtOffset`]), where the guest took
+// [`RGFX_FEATURE_MANAGED_AT_OFFSET`]: a `Managed` buffer at the guest's address, its CPU copy a
+// `Shared` buffer placed at an offset in a heap over host memory of the sender's
+// ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]), whose bytes are the guest's copy. A host without the
+// feature refuses the message as one it does not know.
+#define RGFX_CMD_BUFFER_MANAGED_AT_OFFSET 555
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -2459,6 +2474,30 @@ typedef struct {
   // How many.
   uint64_t length;
 } RgfxBufferDidModifyRange;
+
+// `BUFFER_MANAGED_AT_OFFSET`: a `Managed` buffer of `length` bytes at the guest-picked
+// `gpu_address`, its CPU copy the `length` bytes at `offset` in the heap `heap_obj_id`, a heap
+// over host memory of the sender's. The host's GPU copy starts as the CPU copy's bytes;
+// `BUFFER_DID_MODIFY_RANGE` and a synchronize copy between the two as for a
+// [`RgfxBufferOverHostMemory`] of a `Managed` buffer.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The buffer's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The heap its CPU copy lies in.
+  uint64_t heap_obj_id;
+  // The CPU copy's offset in the heap.
+  uint64_t offset;
+  // The buffer's length in bytes.
+  uint64_t length;
+  // `MTLResourceOptions` of the `Managed` buffer: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_3c;
+} RgfxBufferManagedAtOffset;
 
 // `BUFFER_OVER_HOST_MEMORY`: a Shared buffer of `length` bytes over the block at
 // `region_offset` in the region, at the guest-picked `gpu_address`. The block is one

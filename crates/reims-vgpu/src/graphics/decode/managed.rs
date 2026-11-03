@@ -27,13 +27,13 @@ use std::ptr;
 
 use reims_graphics::managed::LinearLayout;
 use reims_graphics::wire::{
-    RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferOverHostMemory,
-    RgfxManagedTextureCreate, RgfxTextureReplaceRegion,
+    RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferManagedAtOffset,
+    RgfxBufferOverHostMemory, RgfxManagedTextureCreate, RgfxTextureReplaceRegion,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::{Buffer, Texture};
+use reims_vgpu_core::platform::resource::{Buffer, Heap, Texture};
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
@@ -149,7 +149,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         m: &RgfxBufferOverHostMemory,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let options = u64::from(m.options);
-        let span = Some((m.region_offset, m.length));
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let (buffer, cpu) = if self.unified() {
             match self.buffer_over_block(device, m.region_offset, m.length, options, pin)? {
@@ -157,15 +156,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 None => return Ok(Err(DecodeError::Refused)),
             }
         } else {
-            let desc = BufferDesc {
-                length: m.length,
-                options: vec![OptionSet::ResourceOptions(options)],
-                pinned_gpu_address: pin,
-                contents: None,
-                no_copy: false,
-                deallocator: None,
-            };
-            let Some(buffer) = device.new_buffer(desc)? else {
+            let Some(buffer) = self.gpu_copy(device, m.length, options, pin)? else {
                 return Ok(Err(DecodeError::Refused));
             };
             let Some(cpu) =
@@ -173,32 +164,121 @@ impl<P: Platform> GraphicsDecoder<P> {
             else {
                 return Ok(Err(DecodeError::Refused));
             };
-            let contents = buffer.contents();
-            if contents.is_null() {
+            if !self.fill_gpu_copy(&buffer, m.region_offset, m.length)? {
                 return Ok(Err(DecodeError::Refused));
             }
-            // SAFETY: the block lies inside the region (checked by the caller), and the platform
-            // buffer's host copy holds its `length` bytes; the guest's concurrent writes change
-            // only what is copied.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    self.region.base().add(m.region_offset as usize),
-                    contents.as_ptr::<u8>(),
-                    m.length as usize,
-                );
-            }
-            buffer.did_modify_range(OnFault::Return, NsRange::new(0, m.length))?;
             (buffer, Some(cpu))
         };
-        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(span);
+        self.store_managed_buffer(m.obj_id, buffer, m.region_offset, m.length, cpu);
+        Ok(Ok(()))
+    }
+
+    /// `BUFFER_MANAGED_AT_OFFSET`: the platform's own `Managed` buffer at the guest's address, its
+    /// CPU copy a `Shared` buffer placed at `offset` in the guest's heap over host memory, so the
+    /// buffer imports no host memory of its own. Offered where `Managed` is two copies
+    /// (`RGFX_FEATURE_MANAGED_AT_OFFSET`), and refused on a GPU that shares the CPU's memory. A
+    /// heap the sender does not hold, or one over no block of the region, is a bad reference; a
+    /// CPU copy past the heap's block is malformed.
+    pub(super) fn managed_buffer_at_offset(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(m) = read::<RgfxBufferManagedAtOffset>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        let options = u64::from(m.options);
+        if storage_mode(options) != STORAGE_MODE_MANAGED || self.unified() {
+            return Ok(Err(DecodeError::Refused));
+        }
+        let Some((heap_at, heap_length)) = self.span_of(m.heap_obj_id) else {
+            return Ok(Err(DecodeError::BadReference));
+        };
+        if m.length == 0
+            || m.offset
+                .checked_add(m.length)
+                .is_none_or(|end| end > heap_length)
+        {
+            return Ok(Err(DecodeError::Malformed));
+        }
+        let at = heap_at + m.offset;
+        let Some(ObjHandle::Heap(heap)) = self.named(m.heap_obj_id) else {
+            return Ok(Err(DecodeError::BadReference));
+        };
+        let pin = (m.gpu_address != 0).then_some(m.gpu_address);
+        let Some(buffer) = self.gpu_copy(device, m.length, options, pin)? else {
+            return Ok(Err(DecodeError::Refused));
+        };
+        let Some(cpu) = heap.new_buffer_of_length(m.length, shared(options), m.offset)? else {
+            return Ok(Err(DecodeError::Refused));
+        };
+        if !self.fill_gpu_copy(&buffer, at, m.length)? {
+            return Ok(Err(DecodeError::Refused));
+        }
+        self.store_managed_buffer(m.obj_id, buffer, at, m.length, Some(cpu));
+        Ok(Ok(()))
+    }
+
+    /// The platform's own `Managed` buffer of `length` bytes and `options`, at `pin` where the
+    /// guest has an address for it: a two-copy buffer's GPU copy. `None` where the platform
+    /// refuses it.
+    fn gpu_copy(
+        &self,
+        device: &P::Device,
+        length: u64,
+        options: u64,
+        pin: Option<u64>,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        device.new_buffer(BufferDesc {
+            length,
+            options: vec![OptionSet::ResourceOptions(options)],
+            pinned_gpu_address: pin,
+            contents: None,
+            no_copy: false,
+            deallocator: None,
+        })
+    }
+
+    /// Fills a GPU copy's host copy from the `length` bytes at `at` in the region, which the
+    /// caller checked lie in a block of the sender's, and has the platform copy them to the GPU's
+    /// by the next submission. False where the buffer has no host copy.
+    fn fill_gpu_copy(&self, buffer: &P::Buffer, at: u64, length: u64) -> RaiseResult<bool> {
+        let contents = buffer.contents();
+        if contents.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: the bytes lie inside the region (checked by the caller), and the platform
+        // buffer's host copy holds its `length` bytes; the guest's concurrent writes change only
+        // what is copied.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.region.base().add(at as usize),
+                contents.as_ptr::<u8>(),
+                length as usize,
+            );
+        }
+        buffer.did_modify_range(OnFault::Return, NsRange::new(0, length))?;
+        Ok(true)
+    }
+
+    /// Stores the `Managed` buffer `obj_id`, whose CPU copy is the `length` bytes at `at` in the
+    /// region: `cpu`, a `Shared` buffer over them, where `buffer` is a copy of its own.
+    fn store_managed_buffer(
+        &self,
+        obj_id: u64,
+        buffer: P::Buffer,
+        at: u64,
+        length: u64,
+        cpu: Option<P::Buffer>,
+    ) {
+        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(Some((at, length)));
         entry.managed = Some(ManagedCopy {
-            at: m.region_offset,
-            length: m.length,
+            at,
+            length,
             cpu,
             layout: None,
         });
-        self.store(m.obj_id, entry);
-        Ok(Ok(()))
+        self.store(obj_id, entry);
     }
 
     /// `BUFFER_DID_MODIFY_RANGE`: the range copied from the block to the platform buffer's host
@@ -447,10 +527,11 @@ mod tests {
     };
     use reims_graphics::region::Region;
     use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+        RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
+        RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
         RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_TEXTURE_REPLACE_REGION,
-        RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxMsgHeader, RgfxObjectDestroy,
-        RgfxTextureDescriptor,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxHeapOverHostMemory, RgfxMsgHeader,
+        RgfxObjectDestroy, RgfxTextureDescriptor,
     };
     use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
     use reims_vgpu_core::testkit::{Arg, FakePlatform};
@@ -775,6 +856,117 @@ mod tests {
             r.p.call_log().sels_since(mark),
             ["didModifyRange:", "synchronizeResource:"]
         );
+    }
+
+    /// `BUFFER_MANAGED_AT_OFFSET` on a GPU of its own memory: the platform's own `Managed`
+    /// buffer at the guest's address, filled from the heap's bytes at the offset, beside a CPU
+    /// copy placed in the heap there, with no buffer of host memory of its own. Its range
+    /// messages and synchronize work as a two-copy buffer's; the heap's block stays in use
+    /// while it lives. A heap the sender lacks or one of device memory, a range past the heap's
+    /// block, a buffer not `Managed`, and the message on unified memory are refused.
+    #[test]
+    fn a_managed_buffer_at_an_offset_places_its_cpu_copy_in_the_heap() {
+        let mut r = rig(false);
+        let at = BLOCKS + 0x4_0000;
+        assert_eq!(
+            r.send(&RgfxHeapOverHostMemory {
+                header: header(RGFX_CMD_HEAP_OVER_HOST_MEMORY),
+                obj_id: 30,
+                gpu_address: 0x2_0000_0000,
+                region_offset: at,
+                size_bytes: 0x2_0000,
+                options: 0,
+                heap_type: 1,
+                ..RgfxHeapOverHostMemory::default()
+            }),
+            Ok(())
+        );
+        let first: Vec<u8> = (0..0x100u32).map(|i| (i * 3) as u8).collect();
+        assert!(r.region.write(at + 0x3000, &first));
+        let managed = |obj_id: u64, heap: u64, offset: u64, length: u64, options: u32| {
+            RgfxBufferManagedAtOffset {
+                header: header(RGFX_CMD_BUFFER_MANAGED_AT_OFFSET),
+                obj_id,
+                gpu_address: 0x1_0000_0000 + obj_id * 0x10_0000,
+                heap_obj_id: heap,
+                offset,
+                length,
+                options,
+                reserved_3c: 0,
+            }
+        };
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.send(&managed(10, 30, 0x3000, 0x100, MANAGED)), Ok(()));
+        assert_eq!(
+            made(r.p.call_log().sels_since(mark)),
+            [
+                "newBufferWithDescriptor:",
+                "newBufferWithLength:options:offset:"
+            ],
+            "only the GPU copy is a buffer of its own; the CPU copy is placed in the heap"
+        );
+        let buffer = r.dec.require_buffer(10).unwrap().clone_ref();
+        assert_eq!(buffer.gpu_address(), 0x1_0000_0000 + 10 * 0x10_0000);
+        let host = |b: &<FakePlatform as Platform>::Buffer, off: usize, len: usize| {
+            // SAFETY: the fake's buffer holds its length of bytes.
+            unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>().add(off), len) }
+                .to_vec()
+        };
+        assert_eq!(host(&buffer, 0, 0x100), first);
+        let copy = r.dec.managed_copy(10).unwrap();
+        assert_eq!((copy.at, copy.length), (at + 0x3000, 0x100));
+        assert!(r.dec.span_in_use(at + 0x3000, 0x100));
+
+        // A range copies from the heap's bytes at the offset; a synchronize goes to the CPU copy.
+        assert!(r.region.write(at + 0x3000 + 16, &[0xab; 8]));
+        assert_eq!(r.modified(10, 16, 8), Ok(()));
+        assert_eq!(host(&buffer, 16, 8), [0xab; 8]);
+        let mark = r.p.call_log().mark();
+        assert!(r.synchronize(10, RGFX_BLIT_RESOURCE_BUFFER).unwrap());
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args[2], r.cpu_of(10));
+
+        // Refusals: no such heap, a buffer for a heap, past the heap's block, not Managed.
+        assert_eq!(
+            r.send(&managed(11, 31, 0, 0x100, MANAGED)),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(
+            r.send(&managed(12, 10, 0, 0x100, MANAGED)),
+            Err(DecodeError::BadReference)
+        );
+        assert_eq!(
+            r.send(&managed(13, 30, 0x1_ff00, 0x200, MANAGED)),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            r.send(&managed(14, 30, 0x5000, 0x100, 0)),
+            Err(DecodeError::Refused)
+        );
+        let mut unified = rig(true);
+        assert_eq!(
+            unified.send(&managed(15, 30, 0, 0x100, MANAGED)),
+            Err(DecodeError::Refused)
+        );
+
+        // A destroy forgets the CPU copy, and the heap's block is free once the heap goes too.
+        assert_eq!(
+            r.send(&RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id: 10,
+            }),
+            Ok(())
+        );
+        assert!(r.dec.managed_copy(10).is_none());
+        assert_eq!(
+            r.send(&RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id: 30,
+            }),
+            Ok(())
+        );
+        assert!(!r.dec.span_in_use(at, 0x2_0000) && r.dec.object_count() == 0);
     }
 
     /// On a GPU that does not share the CPU's memory a `Managed` texture is the platform's own

@@ -55,8 +55,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
 /// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 /// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
-/// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`] and
-/// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]). Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
+/// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`] and [`RGFX_FEATURE_MANAGED_AT_OFFSET`]). Bits 9, 10,
+/// 13 and 15 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -116,6 +117,12 @@ pub const RGFX_FEATURE_SURFACE_ORDER: u32 = 1 << 11;
 /// the bit; the kext takes it where it answers the create, and its bundle makes indirect command
 /// buffers only where it was taken.
 pub const RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS: u32 = 1 << 12;
+/// `FEATURES_LO` bit 14, `MANAGED_AT_OFFSET`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`], a
+/// `Managed` buffer whose CPU copy is placed in a heap over host memory, so no buffer imports
+/// host memory of its own. Offered where a `Managed` buffer is two copies: where the host's GPU
+/// does not share the CPU's memory.
+pub const RGFX_FEATURE_MANAGED_AT_OFFSET: u32 = 1 << 14;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -461,6 +468,12 @@ pub const RGFX_CMD_ICB_CREATE: u32 = 0x228;
 /// buffer sees every encode posted before it. Not answered: a record the host cannot carry out
 /// is skipped alone.
 pub const RGFX_CMD_ICB_WRITE: u32 = 0x229;
+/// Command `BUFFER_MANAGED_AT_OFFSET` ([`RgfxBufferManagedAtOffset`]), where the guest took
+/// [`RGFX_FEATURE_MANAGED_AT_OFFSET`]: a `Managed` buffer at the guest's address, its CPU copy a
+/// `Shared` buffer placed at an offset in a heap over host memory of the sender's
+/// ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]), whose bytes are the guest's copy. A host without the
+/// feature refuses the message as one it does not know.
+pub const RGFX_CMD_BUFFER_MANAGED_AT_OFFSET: u32 = 0x22b;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1377,6 +1390,34 @@ pub struct RgfxBufferAtOffset {
     pub options: u32,
     /// Pads to a multiple of 8; 0.
     pub reserved_34: u32,
+}
+
+/// `BUFFER_MANAGED_AT_OFFSET`: a `Managed` buffer of `length` bytes at the guest-picked
+/// `gpu_address`, its CPU copy the `length` bytes at `offset` in the heap `heap_obj_id`, a heap
+/// over host memory of the sender's. The host's GPU copy starts as the CPU copy's bytes;
+/// `BUFFER_DID_MODIFY_RANGE` and a synchronize copy between the two as for a
+/// [`RgfxBufferOverHostMemory`] of a `Managed` buffer.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferManagedAtOffset {
+    /// [`RGFX_CMD_BUFFER_MANAGED_AT_OFFSET`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The buffer's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The heap its CPU copy lies in.
+    pub heap_obj_id: u64,
+    /// The CPU copy's offset in the heap.
+    pub offset: u64,
+    /// The buffer's length in bytes.
+    pub length: u64,
+    /// `MTLResourceOptions` of the `Managed` buffer: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_3c: u32,
 }
 
 /// `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
@@ -3026,6 +3067,7 @@ const _: () = {
     assert!(size_of::<RgfxBufferCreate>() == 48);
     assert!(size_of::<RgfxBufferOverHostMemory>() == 56);
     assert!(size_of::<RgfxBufferAtOffset>() == 56);
+    assert!(size_of::<RgfxBufferManagedAtOffset>() == 64);
     assert!(size_of::<RgfxCbComplete>() == 48);
     assert!(size_of::<RgfxCbScheduled>() == 24);
     assert!(size_of::<RgfxCbSubmitted>() == 24);

@@ -185,7 +185,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8, 11 and 12.
+/// `RGFX_FEATURE_*`, bits 0 to 8, 11, 12 and 14.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -196,7 +196,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_PAGES_BUFFERS
     | RGFX_FEATURE_QUEUE_VECTORS
     | RGFX_FEATURE_SURFACE_ORDER
-    | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS) as u64;
+    | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+    | RGFX_FEATURE_MANAGED_AT_OFFSET) as u64;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: none yet, so a create that asks for any flag is
