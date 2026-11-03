@@ -468,6 +468,9 @@ do_boot() {
   # by one in that order).
   cp "$L/guest/"* "$ART/payload/"
   [[ ! -s $GH/sweep-cases.txt ]] || cp "$GH/sweep-cases.txt" "$ART/payload/"
+  # The streams to check again (decode-repeat.txt, "SET STREAM N" a line), where the gate has any.
+  rm -f "$ART/payload/decode-repeat.txt"
+  [[ ! -s $GH/decode-repeat.txt ]] || cp "$GH/decode-repeat.txt" "$ART/payload/"
   msi "rm -rf '$out' && mkdir -p '$out' && { [ -d '$MR/payload' ] || exit 0; rm -rf '$MR/payload'; }"
   scp -q -r "$ART/payload" "$MSI:$MR/payload"
   msi "cat > '$out/boot.env'" << EOF

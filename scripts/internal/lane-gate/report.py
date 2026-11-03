@@ -592,8 +592,9 @@ def compare(run, base, noise):
             lines.append(f"  note: {len(fixed)} known cargo failures now pass: " + ", ".join(fixed[:5]))
     ran = set(run.meta.get("ran", []))
     for name, b in sorted((base or {}).get("items", {}).items()):
-        # Publishing is the tips' alone (--publish): a run without it misses nothing.
-        if name == "step.publish" and name not in items:
+        # Publishing is the tips' alone (--publish): a run without it misses nothing. Nor does one
+        # without a stream's repeated checks (STREAM.r2, ...: decode-repeat.txt).
+        if name not in items and (name == "step.publish" or re.search(r"\.r\d+$", name)):
             continue
         if name in items:
             if b["status"] == "PASS" and items[name]["status"] == "SKIP":

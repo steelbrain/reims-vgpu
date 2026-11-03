@@ -209,6 +209,23 @@ $(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/case.out")"
 # decode: every stream of both sets, MD5s only; decodefps: the timed streams, MD5s and timed passes.
 # The sets h264 and hevc are corpus/'s streams, h264-odd and hevc-odd corpus/odd/'s (odd sizes and
 # crops); a stream's items are decode.SET.NAME.
+# The streams decode-repeat.txt names ("SET STREAM N" a line, from the gate) checked N times more,
+# each run's line named STREAM.r2, STREAM.r3, ...: a stream whose frames differ only sometimes.
+run_repeats() {
+	local set s n dir i
+	[ -f "$D/decode-repeat.txt" ] || return 0
+	while read -r set s n; do
+		case $set in ''|'#'*) continue ;; esac
+		case $set in *-odd) dir=corpus/odd ;; *) dir=corpus ;; esac
+		i=1
+		while [ "$i" -le "${n:-0}" ]; do
+			i=$((i + 1))
+			limit 90 ./decode_md5 -l 0 "$dir/$s" 2>&1 | grep '^decode_md5: ' |
+				sed "s/^decode_md5: \([^ ]*\) /decode_md5: $set \1.r$i /"
+		done
+	done < "$D/decode-repeat.txt"
+}
+
 run_decode() {
 	local set s loops dir
 	for set in h264 hevc h264-odd hevc-odd; do
@@ -220,6 +237,7 @@ run_decode() {
 			limit 90 ./decode_md5 -l "$loops" "$dir/$s" 2>&1 | grep '^decode_md5: ' | sed "s/^decode_md5: /decode_md5: $set /"
 		done < "$set.list"
 	done
+	run_repeats
 }
 run_decodefps() { TIMED=1 run_decode; }
 
