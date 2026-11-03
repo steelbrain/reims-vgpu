@@ -28,8 +28,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 
+#include "RgfxRingRoomEvents.hpp"
 #include "reims_graphics_wire.h"
 
 /// Rings the doorbell for ring `ring_id`: in the bundle, writes `ring_id` to the
@@ -116,6 +118,10 @@ public:
 	/// tryPost(), waiting while the ring has no room: the doorbell rung, so a host that went
 	/// idle takes the ring again, then a sleep of 20 µs doubling to 1 ms between looks, and
 	/// `whileWaiting` (when set) called before each, as the host consumes on its own thread.
+	/// With room events (setRoomEvents), a post that finds no room stores 1 in the ring's
+	/// producer_waiting, fences and looks once more, then waits for the host's room record
+	/// instead of the sleep: up to 20 ms where no `whileWaiting` is given (a completion thread
+	/// takes the record), else up to the sleep's step, as `whileWaiting` may be what takes it.
 	/// False, writing nothing, only for a message that does not fit().
 	bool post(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	          const std::function<void()> &whileWaiting = {},
@@ -123,6 +129,15 @@ public:
 
 	/// The byte ring's size.
 	uint32_t dataSize() const { return m_dataSize; }
+
+	/// The ring's room records, where the device's word holds RGFX_FEATURE_SUBMIT_ROOM: set once,
+	/// before the first post (the queue's reader hands them over). A forwarding writer takes
+	/// none.
+	void setRoomEvents(std::shared_ptr<RgfxRingRoomEvents> room)
+	{
+		if (m_header != nullptr)
+			m_room = std::move(room);
+	}
 
 private:
 	volatile uint8_t *m_header;
@@ -137,6 +152,8 @@ private:
 	RgfxForwardDeferred m_deferredPost = nullptr;
 	RgfxAwaitAnswer m_await = nullptr;
 	void *m_deferredContext = nullptr;
+
+	std::shared_ptr<RgfxRingRoomEvents> m_room; // setRoomEvents'
 
 	std::mutex m_lock;
 	uint64_t m_produced;

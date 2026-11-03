@@ -18,6 +18,11 @@ namespace {
 constexpr uint32_t kProducer = __builtin_offsetof(RgfxRingHeader, producer);
 constexpr uint32_t kConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
 constexpr uint32_t kConsumerIdle = __builtin_offsetof(RgfxRingHeader, consumer_idle);
+constexpr uint32_t kProducerWaiting = __builtin_offsetof(RgfxRingHeader, producer_waiting);
+
+// How long a post waits for the host's room record at most where a completion thread takes it,
+// before it looks again: a backstop only.
+constexpr uint32_t kRoomBackstopUs = 20000;
 
 // A message's header is 16 bytes; sizes are a multiple of 8.
 constexpr uint32_t kHeaderBytes = sizeof(RgfxMsgHeader);
@@ -36,6 +41,11 @@ void store64(volatile uint8_t *p, uint64_t value)
 uint32_t load32(const volatile uint8_t *p)
 {
 	return __atomic_load_n(reinterpret_cast<const volatile uint32_t *>(p), __ATOMIC_ACQUIRE);
+}
+
+void store32(volatile uint8_t *p, uint32_t value)
+{
+	__atomic_store_n(reinterpret_cast<volatile uint32_t *>(p), value, __ATOMIC_SEQ_CST);
 }
 
 void fullFence()
@@ -120,15 +130,29 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 		return false;
 	uint32_t sleepUs = 0;
 	for (;;) {
+		// The room records so far, read before the look: one that comes after it ends the wait.
+		const uint64_t seen = m_room ? m_room->seen() : 0;
 		if (tryPost(type, message, size, out_seqno, nullptr, beforePublish))
 			return true;
+		// Where the host posts room records, it is told a post waits, then the ring is looked
+		// at once more: either this look finds what the host took, or the host's next take finds
+		// the flag and posts a record.
+		if (m_room) {
+			store32(m_header + kProducerWaiting, 1);
+			fullFence();
+			if (tryPost(type, message, size, out_seqno, nullptr, beforePublish))
+				return true;
+		}
 		// The host takes the ring on a thread of its own: make sure it is awake, then let it.
 		if (m_doorbell && (sleepUs == 0 || load32(m_header + kConsumerIdle) == 1))
 			m_doorbell(m_doorbellContext, m_ringId);
 		if (whileWaiting)
 			whileWaiting();
 		sleepUs = sleepUs == 0 ? 20 : std::min<uint32_t>(sleepUs * 2, 1000);
-		std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+		if (m_room)
+			m_room->waitPast(seen, std::chrono::microseconds(whileWaiting ? sleepUs : kRoomBackstopUs));
+		else
+			std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
 	}
 }
 

@@ -106,6 +106,14 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	// where the host answers it.
 	const RgfxCaps *caps = [self caps];
 	queue.asksSubmitted = caps != nullptr && (caps->features() & RGFX_FEATURE_CB_SUBMITTED) != 0;
+	// A commit that finds the queue's ring full waits for the host's room record on the queue's
+	// completion ring, which the reader hands to the ring's writer, where the device's word holds
+	// SUBMIT_ROOM; else it sleeps between looks (RgfxRingWriter::post).
+	if (caps != nullptr && (caps->features() & RGFX_FEATURE_SUBMIT_ROOM) != 0) {
+		auto room = std::make_shared<RgfxRingRoomEvents>();
+		reader->setRoomEvents(room);
+		submit->setRoomEvents(room);
+	}
 	// The process's completion thread takes the ring's completions from now on, whether or
 	// not anything waits for them.
 	if (RgfxCompletionThread *completions = [self completionThread])

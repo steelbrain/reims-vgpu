@@ -1471,9 +1471,12 @@ have. The whole buffer goes at its commit. Metal sets no maximum size, so
 nothing is refused for size. A queue holds `maxCommandBufferCount` buffers
 (64 by default) alive and not completed. `-commandBuffer` blocks past that, as
 Metal's does, which keeps the ring from filling in the common case. A commit
-that still finds the ring full rings the doorbell and sleeps 20 µs, doubling
-to 1 ms, between looks. Each buffer's completion is expected before the host
-can see it, under the ring's lock.
+that still finds the ring full rings the doorbell and, where the device's word
+holds `SUBMIT_ROOM`, sets the ring's `producer_waiting`, looks once more, and
+waits for the host's `SUBMIT_ROOM` record on the queue's completion ring, which
+the queue's reader hands to the ring's writer, with a 20 ms backstop. Without
+the bit it sleeps 20 µs, doubling to 1 ms, between looks. Each buffer's
+completion is expected before the host can see it, under the ring's lock.
 
 Metal splits one command buffer into several kernel submissions (a render pass;
 a run of blits or of computes with no event between) — m2v's measured

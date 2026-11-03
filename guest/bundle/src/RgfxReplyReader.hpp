@@ -55,10 +55,12 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
+#include "RgfxRingRoomEvents.hpp"
 #include "reims_graphics_wire.h"
 
 class RgfxReplyReader {
@@ -126,6 +128,10 @@ public:
 	/// Fires this reader's listeners for `msg`'s shared event, in registration order.
 	void signalled(const RgfxEventSignalled &msg);
 
+	/// Hands each RGFX_EVT_SUBMIT_ROOM this reader reads to `room` (arrived): a queue's reader,
+	/// to its submission ring's writer (RgfxRingWriter::setRoomEvents).
+	void setRoomEvents(std::shared_ptr<RgfxRingRoomEvents> room);
+
 	/// Reads every message the host has published and not yet consumed, dispatches
 	/// each to its handler, and publishes the consumer count so the host sees the
 	/// room freed. Returns how many messages it dispatched (pads and unmatched or
@@ -187,6 +193,7 @@ private:
 	std::unordered_map<uint64_t, EventListener> m_eventListeners;
 	uint64_t m_nextToken;
 	RgfxReplyReader *m_eventsTo = nullptr; // setEventsTo: borrowed
+	std::shared_ptr<RgfxRingRoomEvents> m_room; // setRoomEvents'
 
 };
 

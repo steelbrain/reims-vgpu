@@ -1006,6 +1006,62 @@ void test_ring_post_waits_for_room()
 	CHECK(ring.producer() == full + sizeof(msg));
 }
 
+// With room events (SUBMIT_ROOM), a post that finds the ring full stores 1 in the ring's
+// producer_waiting and waits for the host's room record, not a sleep's end: room the host takes
+// with no record leaves it waiting (its backstop is 20 ms), and the record, which the queue's
+// reader hands over as it reads RGFX_EVT_SUBMIT_ROOM, ends the wait at once. A post that finds
+// room touches no flag.
+void test_ring_post_waits_for_the_room_record()
+{
+	constexpr uint32_t kData = 0x1000;
+	TestRing ring(kData);
+	RgfxRingWriter writer(ring.base(), kData, 1, TestRing::doorbell, nullptr);
+	auto room = std::make_shared<RgfxRingRoomEvents>();
+	writer.setRoomEvents(room);
+	auto waiting = [&ring] {
+		return __atomic_load_n(reinterpret_cast<uint32_t *>(
+		                           ring.mem.data() +
+		                           __builtin_offsetof(RgfxRingHeader, producer_waiting)),
+		                       __ATOMIC_SEQ_CST);
+	};
+	uint8_t msg[256] = {};
+	CHECK(writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr));
+	CHECK(waiting() == 0);
+	while (writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr)) {
+	}
+	std::atomic<bool> posted{false};
+	bool postedOK = false;
+	std::thread poster([&] {
+		postedOK = writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr);
+		posted = true;
+	});
+	for (int i = 0; i < 5000 && waiting() == 0; i++)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	CHECK(waiting() == 1);
+	// The host takes one message and posts no record: the post still waits.
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	std::this_thread::sleep_for(std::chrono::milliseconds(3));
+	CHECK(!posted);
+	// Its record: the post looks again, and finds the room.
+	const auto start = std::chrono::steady_clock::now();
+	room->arrived();
+	poster.join();
+	CHECK(posted && postedOK);
+	CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(15));
+
+	// A queue's reader hands each RGFX_EVT_SUBMIT_ROOM on its completion ring to the room.
+	TestRing completion(kData);
+	RgfxReplyReader reader(completion.base(), kData);
+	reader.setRoomEvents(room);
+	const uint64_t before = room->seen();
+	RgfxMsgHeader record = {RGFX_EVT_SUBMIT_ROOM, sizeof(RgfxMsgHeader), 0};
+	CHECK(completion.postFromHost(&record, sizeof(record)));
+	CHECK(reader.pump() == 1);
+	CHECK(room->seen() == before + 1);
+}
+
 // Blocks of a plain buffer standing in for the device region, as a queue's pool hands them out
 // (RgfxMessageBlocks): each taken block at the next free offset, its size the next power of two
 // of at least 64 KiB, and what was given back.
@@ -2217,6 +2273,7 @@ int main()
 	test_pipeline_messages();
 	test_ring_wrap_and_no_room();
 	test_ring_post_waits_for_room();
+	test_ring_post_waits_for_the_room_record();
 	test_command_buffer_encoder();
 	test_command_buffer_storage();
 	test_video_command_buffer();

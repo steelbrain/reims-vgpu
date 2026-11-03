@@ -133,6 +133,12 @@ void RgfxReplyReader::setEventsTo(RgfxReplyReader *events)
 	m_eventsTo = events;
 }
 
+void RgfxReplyReader::setRoomEvents(std::shared_ptr<RgfxRingRoomEvents> room)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_room = std::move(room);
+}
+
 std::vector<RgfxReplyReader::EventHandler> RgfxReplyReader::listenersOf(uint64_t obj_id)
 {
 	// In registration order: the tokens rise with each registration.
@@ -302,6 +308,13 @@ uint32_t RgfxReplyReader::pump()
 				}
 				break;
 			}
+			case RGFX_EVT_SUBMIT_ROOM:
+				// The host took from the queue's submission ring, whose producer waits for room.
+				if (m_room != nullptr) {
+					std::shared_ptr<RgfxRingRoomEvents> room = m_room;
+					calls.emplace_back([room]() { room->arrived(); });
+				}
+				break;
 			case RGFX_EVT_EVENT_SIGNALLED: {
 				RgfxEventSignalled msg = {};
 				if (size >= sizeof(msg)) {
