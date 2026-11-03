@@ -54,9 +54,9 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToBuffer {
-                    source_buffer: source.as_ref(),
+                    source_buffer: source,
                     source_offset: m.source_offset,
-                    destination_buffer: destination.as_ref(),
+                    destination_buffer: destination,
                     destination_offset: m.destination_offset,
                     size: m.size,
                 },
@@ -96,7 +96,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToTextureOptions {
-                    source_buffer: source.as_ref(),
+                    source_buffer: source,
                     source_offset: m.source_offset,
                     source_bytes_per_row: m.source_bytes_per_row,
                     source_bytes_per_image: m.source_bytes_per_image,
@@ -105,7 +105,7 @@ pub(crate) fn decode_op<P: Platform>(
                         m.source_size_height,
                         m.source_size_depth,
                     ),
-                    destination_texture: destination.as_ref(),
+                    destination_texture: destination,
                     destination_slice: m.destination_slice,
                     destination_level: m.destination_level,
                     destination_origin: MtlOrigin::new(
@@ -151,7 +151,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyTextureToBufferOptions {
-                    source_texture: source.as_ref(),
+                    source_texture: source,
                     source_slice: m.source_slice,
                     source_level: m.source_level,
                     source_origin: MtlOrigin::new(
@@ -164,7 +164,7 @@ pub(crate) fn decode_op<P: Platform>(
                         m.source_size_height,
                         m.source_size_depth,
                     ),
-                    destination_buffer: destination.as_ref(),
+                    destination_buffer: destination,
                     destination_offset: m.destination_offset,
                     destination_bytes_per_row: m.destination_bytes_per_row,
                     destination_bytes_per_image: m.destination_bytes_per_image,
@@ -344,12 +344,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_GENERATE_MIPMAPS => {
             let m: RgfxBlitOpGenerateMipmaps = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
-            enc.encode(
-                on,
-                BlitCmd::GenerateMipmaps {
-                    texture: texture.as_ref(),
-                },
-            )?;
+            enc.encode(on, BlitCmd::GenerateMipmaps { texture })?;
         }
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE => {
             let m: RgfxBlitOpInvalidateCompressedTexture = body(tag, payload)?;
@@ -449,7 +444,7 @@ pub(crate) fn decode_op<P: Platform>(
                     enc.encode(
                         on,
                         BlitCmd::SynchronizeResource {
-                            resource: Some(ResourceRef::Buffer(&buffer)),
+                            resource: Some(ResourceRef::Buffer(buffer)),
                         },
                     )?;
                 }
@@ -458,7 +453,7 @@ pub(crate) fn decode_op<P: Platform>(
                     enc.encode(
                         on,
                         BlitCmd::SynchronizeResource {
-                            resource: Some(ResourceRef::Texture(&texture)),
+                            resource: Some(ResourceRef::Texture(texture)),
                         },
                     )?;
                 }
@@ -467,7 +462,7 @@ pub(crate) fn decode_op<P: Platform>(
                     enc.encode(
                         on,
                         BlitCmd::SynchronizeResource {
-                            resource: Some(ResourceRef::Icb(&icb)),
+                            resource: Some(ResourceRef::Icb(icb)),
                         },
                     )?;
                 }

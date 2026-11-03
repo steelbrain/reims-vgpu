@@ -93,42 +93,22 @@ fn tail<E: FromBytes + Immutable>(
     Ok(out)
 }
 
-/// A resource reference held by value while its [`ResourceRef`] borrows it for the
-/// encode: `useResources:` and `memoryBarrierWithResources:` take a mixed array of
-/// buffers, textures and indirect command buffers.
-enum OwnedResource<P: Platform> {
-    Buffer(P::Buffer),
-    Texture(P::Texture),
-    Icb(P::Icb),
-}
-
-impl<P: Platform> OwnedResource<P> {
-    /// A borrowed reference to this resource.
-    fn as_ref(&self) -> ResourceRef<'_, P> {
-        match self {
-            OwnedResource::Buffer(b) => ResourceRef::Buffer(b),
-            OwnedResource::Texture(t) => ResourceRef::Texture(t),
-            OwnedResource::Icb(i) => ResourceRef::Icb(i),
-        }
-    }
-}
-
 /// Resolves one wire resource record: a nil kind is `None`, each other kind
 /// resolves `obj_id` through its resolver (a miss or wrong kind faults), and an
 /// unknown kind faults the exec.
-fn resolve_resource<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+fn resolve_resource<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     rec: &RgfxComputeResourceRef,
-) -> RaiseResult<Option<OwnedResource<P>>> {
+) -> RaiseResult<Option<ResourceRef<'a, P>>> {
     match rec.kind {
         RGFX_RESOURCE_KIND_NONE => Ok(None),
-        RGFX_RESOURCE_KIND_BUFFER => Ok(Some(OwnedResource::Buffer(
-            objs.require_buffer(rec.obj_id)?,
-        ))),
-        RGFX_RESOURCE_KIND_TEXTURE => Ok(Some(OwnedResource::Texture(
+        RGFX_RESOURCE_KIND_BUFFER => {
+            Ok(Some(ResourceRef::Buffer(objs.require_buffer(rec.obj_id)?)))
+        }
+        RGFX_RESOURCE_KIND_TEXTURE => Ok(Some(ResourceRef::Texture(
             objs.require_texture(rec.obj_id)?,
         ))),
-        RGFX_RESOURCE_KIND_ICB => Ok(Some(OwnedResource::Icb(
+        RGFX_RESOURCE_KIND_ICB => Ok(Some(ResourceRef::Icb(
             objs.require_indirect_command_buffer(rec.obj_id)?,
         ))),
         other => Err(op_fault(format_args!(
@@ -137,12 +117,11 @@ fn resolve_resource<P: Platform>(
     }
 }
 
-/// Resolves a wire resource array into owned handles the caller borrows for the
-/// encode.
-fn resolve_resources<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+/// Resolves a wire resource array into the objects it names, for the encode.
+fn resolve_resources<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     recs: &[RgfxComputeResourceRef],
-) -> RaiseResult<Vec<Option<OwnedResource<P>>>> {
+) -> RaiseResult<Vec<Option<ResourceRef<'a, P>>>> {
     recs.iter().map(|r| resolve_resource(objs, r)).collect()
 }
 
@@ -162,12 +141,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
             let m: RgfxComputeOpSetComputePipelineState = body(tag, payload)?;
             let state = objs.get_compute_pipeline(m.pipeline_obj_id)?;
-            enc.encode(
-                on,
-                ComputeCmd::SetComputePipelineState {
-                    state: state.as_ref(),
-                },
-            )?;
+            enc.encode(on, ComputeCmd::SetComputePipelineState { state })?;
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET => {
             let m: RgfxComputeOpSetBufferOffset = body(tag, payload)?;
@@ -198,11 +172,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetBuffers>(),
                 m.length as usize,
             )?;
-            let owned: Vec<Option<P::Buffer>> = recs
+            let named: Vec<Option<&P::Buffer>> = recs
                 .iter()
                 .map(|r| objs.get_buffer(r.buffer_obj_id))
                 .collect::<RaiseResult<_>>()?;
-            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let buffers: Vec<Option<&P::Buffer>> = named;
             let offsets: Vec<u64> = recs.iter().map(|r| r.offset).collect();
             enc.encode(
                 on,
@@ -221,11 +195,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetBuffersAttributeStrides>(),
                 m.length as usize,
             )?;
-            let owned: Vec<Option<P::Buffer>> = recs
+            let named: Vec<Option<&P::Buffer>> = recs
                 .iter()
                 .map(|r| objs.get_buffer(r.buffer_obj_id))
                 .collect::<RaiseResult<_>>()?;
-            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let buffers: Vec<Option<&P::Buffer>> = named;
             let offsets: Vec<u64> = recs.iter().map(|r| r.offset).collect();
             let strides: Vec<u64> = recs.iter().map(|r| r.stride).collect();
             enc.encode(
@@ -244,7 +218,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::SetTexture {
-                    texture: texture.as_ref(),
+                    texture,
                     index: m.index,
                 },
             )?;
@@ -257,11 +231,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetTextures>(),
                 m.length as usize,
             )?;
-            let owned: Vec<Option<P::Texture>> = recs
+            let named: Vec<Option<&P::Texture>> = recs
                 .iter()
                 .map(|r| objs.get_texture(r.texture_obj_id))
                 .collect::<RaiseResult<_>>()?;
-            let textures: Vec<Option<&P::Texture>> = owned.iter().map(Option::as_ref).collect();
+            let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
                 ComputeCmd::SetTextures {
@@ -278,12 +252,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetSamplerStates>(),
                 m.length as usize,
             )?;
-            let owned: Vec<Option<P::SamplerState>> = recs
+            let named: Vec<Option<&P::SamplerState>> = recs
                 .iter()
                 .map(|r| objs.get_sampler(r.sampler_obj_id))
                 .collect::<RaiseResult<_>>()?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 ComputeCmd::SetSamplerStates {
@@ -300,12 +273,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetSamplerStatesLodClamps>(),
                 m.length as usize,
             )?;
-            let owned: Vec<Option<P::SamplerState>> = recs
+            let named: Vec<Option<&P::SamplerState>> = recs
                 .iter()
                 .map(|r| objs.get_sampler(r.sampler_obj_id))
                 .collect::<RaiseResult<_>>()?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             let lod_min: Vec<f32> = recs
                 .iter()
                 .map(|r| f32::from_bits(r.lod_min_clamp_bits))
@@ -392,7 +364,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::DispatchThreadgroupsIndirect {
-                    indirect_buffer: indirect_buffer.as_ref(),
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                     threads_per_threadgroup: MtlSize::new(
                         m.threads_width,
@@ -422,7 +394,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::DispatchThreadsIndirect {
-                    indirect_buffer: indirect_buffer.as_ref(),
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -435,11 +407,7 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpUseResources>(),
                 m.count as usize,
             )?;
-            let owned = resolve_resources(objs, &recs)?;
-            let resources: Vec<Option<ResourceRef<'_, P>>> = owned
-                .iter()
-                .map(|o| o.as_ref().map(OwnedResource::as_ref))
-                .collect();
+            let resources = resolve_resources(objs, &recs)?;
             enc.encode(
                 on,
                 ComputeCmd::UseResources {
@@ -456,11 +424,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpUseHeaps>(),
                 m.count as usize,
             )?;
-            let owned: Vec<Option<P::Heap>> = recs
+            let named: Vec<Option<&P::Heap>> = recs
                 .iter()
                 .map(|r| objs.get_heap(r.heap_obj_id))
                 .collect::<RaiseResult<_>>()?;
-            let heaps: Vec<Option<&P::Heap>> = owned.iter().map(Option::as_ref).collect();
+            let heaps: Vec<Option<&P::Heap>> = named;
             enc.encode(on, ComputeCmd::UseHeaps { heaps: &heaps })?;
         }
         RGFX_OP_COMPUTE_MEMORY_BARRIER_RESOURCES => {
@@ -471,11 +439,7 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpMemoryBarrierResources>(),
                 m.count as usize,
             )?;
-            let owned = resolve_resources(objs, &recs)?;
-            let resources: Vec<Option<ResourceRef<'_, P>>> = owned
-                .iter()
-                .map(|o| o.as_ref().map(OwnedResource::as_ref))
-                .collect();
+            let resources = resolve_resources(objs, &recs)?;
             enc.encode(
                 on,
                 ComputeCmd::MemoryBarrierWithResources {
@@ -531,7 +495,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::EncodeStartIf {
-                    buffer: buffer.as_ref(),
+                    buffer,
                     offset: m.offset,
                     comparison: m.comparison,
                     reference_value: m.reference_value,
@@ -544,7 +508,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::EncodeStartWhile {
-                    buffer: buffer.as_ref(),
+                    buffer,
                     offset: m.offset,
                     comparison: m.comparison,
                     reference_value: m.reference_value,

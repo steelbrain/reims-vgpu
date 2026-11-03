@@ -680,7 +680,7 @@ mod tests {
         // The CPU copy's buffer is Shared, over the block, at an address of the platform's.
         assert_eq!(calls[1].args[0], over_block(&r, at, 0x100, 0, None));
         assert_eq!(calls[2].args[0], Arg::val(&NsRange::new(0, 0x100)));
-        let buffer = r.dec.require_buffer(10).unwrap();
+        let buffer = r.dec.require_buffer(10).unwrap().clone_ref();
         assert_eq!(buffer.gpu_address(), 0x1_0000_0000 + 10 * 0x10_0000);
         let host = |b: &<FakePlatform as Platform>::Buffer, off: usize, len: usize| {
             // SAFETY: the fake's buffer holds its length of bytes.

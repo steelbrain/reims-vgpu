@@ -21,8 +21,8 @@
 //!
 //! The array-tailed binds (`setVertexBuffers:`, `useResources:`, `setViewports:`, …)
 //! read a fixed head then the trailing element array ([`elems`]), resolve each
-//! element's reference, and hold the resolved handles in a local `Vec` so the
-//! borrowed slices the encode takes outlive the send.
+//! element's reference, and pass the encode a local `Vec` of the decoder's handles,
+//! borrowed for the op.
 
 // The render-op tags and body structs (`Rgfx*`): the whole render group, so a glob
 // (as the Metal platform's command impl globs `platform::render`).
@@ -75,42 +75,21 @@ fn elems<T: FromBytes>(tag: u16, payload: &[u8], head: usize, count: usize) -> R
     Ok(out)
 }
 
-/// A counted reference to a resource a `useResources:` array names, by kind. Held so
-/// the [`ResourceRef`]s the encode borrows outlive the send.
-enum OwnedResource<P: Platform> {
-    Buffer(P::Buffer),
-    Texture(P::Texture),
-    Icb(P::Icb),
-}
-
-impl<P: Platform> OwnedResource<P> {
-    /// A borrowed [`ResourceRef`] for this resource.
-    fn as_ref(&self) -> ResourceRef<'_, P> {
-        match self {
-            OwnedResource::Buffer(b) => ResourceRef::Buffer(b),
-            OwnedResource::Texture(t) => ResourceRef::Texture(t),
-            OwnedResource::Icb(i) => ResourceRef::Icb(i),
-        }
-    }
-}
-
 /// Resolves one resource-array element: `None` for 0, else the object its
 /// [kind](reims_graphics::ops::render::RGFX_RESOURCE_KIND_BUFFER) names (a miss or an
 /// unknown kind faults).
-fn resolve_resource<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+fn resolve_resource<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     e: &RgfxResourceBinding,
-) -> RaiseResult<Option<OwnedResource<P>>> {
+) -> RaiseResult<Option<ResourceRef<'a, P>>> {
     if e.obj_id == 0 {
         return Ok(None);
     }
     Ok(Some(match e.kind {
         RGFX_RESOURCE_KIND_NONE => return Ok(None),
-        RGFX_RESOURCE_KIND_BUFFER => OwnedResource::Buffer(objs.require_buffer(e.obj_id)?),
-        RGFX_RESOURCE_KIND_TEXTURE => OwnedResource::Texture(objs.require_texture(e.obj_id)?),
-        RGFX_RESOURCE_KIND_ICB => {
-            OwnedResource::Icb(objs.require_indirect_command_buffer(e.obj_id)?)
-        }
+        RGFX_RESOURCE_KIND_BUFFER => ResourceRef::Buffer(objs.require_buffer(e.obj_id)?),
+        RGFX_RESOURCE_KIND_TEXTURE => ResourceRef::Texture(objs.require_texture(e.obj_id)?),
+        RGFX_RESOURCE_KIND_ICB => ResourceRef::Icb(objs.require_indirect_command_buffer(e.obj_id)?),
         other => {
             return Err(op_fault(format_args!(
                 "useResources: resource {} has unknown kind {other}",
@@ -120,67 +99,65 @@ fn resolve_resource<P: Platform>(
     }))
 }
 
-/// Resolves a buffer-binding array into its counted references (nil for 0) and their
-/// offsets, in order.
+/// Resolves a buffer-binding array into its objects (nil for 0) and their offsets, in
+/// order.
 #[allow(clippy::type_complexity)] // the pair mirrors the `buffers`/`offsets` arguments
-fn resolve_buffers<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+fn resolve_buffers<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     es: &[RgfxBufferBinding],
-) -> RaiseResult<(Vec<Option<P::Buffer>>, Vec<u64>)> {
-    let mut owned = Vec::with_capacity(es.len());
+) -> RaiseResult<(Vec<Option<&'a P::Buffer>>, Vec<u64>)> {
+    let mut named = Vec::with_capacity(es.len());
     let mut offsets = Vec::with_capacity(es.len());
     for e in es {
-        owned.push(objs.get_buffer(e.buffer_obj_id)?);
+        named.push(objs.get_buffer(e.buffer_obj_id)?);
         offsets.push(e.offset);
     }
-    Ok((owned, offsets))
+    Ok((named, offsets))
 }
 
-/// Resolves a texture-binding array into its counted references (nil for 0), in
-/// order.
-fn resolve_textures<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+/// Resolves a texture-binding array into its objects (nil for 0), in order.
+fn resolve_textures<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     es: &[RgfxTextureBinding],
-) -> RaiseResult<Vec<Option<P::Texture>>> {
+) -> RaiseResult<Vec<Option<&'a P::Texture>>> {
     es.iter()
         .map(|e| objs.get_texture(e.texture_obj_id))
         .collect()
 }
 
-/// Resolves a sampler-binding array into its counted references (nil for 0), in
-/// order.
-fn resolve_samplers<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+/// Resolves a sampler-binding array into its objects (nil for 0), in order.
+fn resolve_samplers<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     es: &[RgfxSamplerBinding],
-) -> RaiseResult<Vec<Option<P::SamplerState>>> {
+) -> RaiseResult<Vec<Option<&'a P::SamplerState>>> {
     es.iter()
         .map(|e| objs.get_sampler(e.sampler_obj_id))
         .collect()
 }
 
-/// Resolves a sampler-with-LOD-clamps array into its counted references (nil for 0)
-/// and the min and max LOD clamps, each in order.
+/// Resolves a sampler-with-LOD-clamps array into its objects (nil for 0) and the min
+/// and max LOD clamps, each in order.
 #[allow(clippy::type_complexity)] // the triple mirrors the three array arguments
-fn resolve_samplers_lod<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+fn resolve_samplers_lod<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     es: &[RgfxSamplerLodBinding],
-) -> RaiseResult<(Vec<Option<P::SamplerState>>, Vec<f32>, Vec<f32>)> {
-    let mut owned = Vec::with_capacity(es.len());
+) -> RaiseResult<(Vec<Option<&'a P::SamplerState>>, Vec<f32>, Vec<f32>)> {
+    let mut named = Vec::with_capacity(es.len());
     let mut mins = Vec::with_capacity(es.len());
     let mut maxs = Vec::with_capacity(es.len());
     for e in es {
-        owned.push(objs.get_sampler(e.sampler_obj_id)?);
+        named.push(objs.get_sampler(e.sampler_obj_id)?);
         mins.push(f32::from_bits(e.lod_min_clamp_bits));
         maxs.push(f32::from_bits(e.lod_max_clamp_bits));
     }
-    Ok((owned, mins, maxs))
+    Ok((named, mins, maxs))
 }
 
-/// Resolves a heap array into its counted references (nil for 0), in order.
-fn resolve_heaps<P: Platform>(
-    objs: &GraphicsDecoder<P>,
+/// Resolves a heap array into its objects (nil for 0), in order.
+fn resolve_heaps<'a, P: Platform>(
+    objs: &'a GraphicsDecoder<P>,
     es: &[RgfxHeapBinding],
-) -> RaiseResult<Vec<Option<P::Heap>>> {
+) -> RaiseResult<Vec<Option<&'a P::Heap>>> {
     es.iter().map(|e| objs.get_heap(e.heap_obj_id)).collect()
 }
 
@@ -204,7 +181,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetRenderPipelineState {
-                    pipeline_state: pipeline.as_ref(),
+                    pipeline_state: pipeline,
                 },
             )?;
         }
@@ -214,7 +191,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetVertexBuffer {
-                    buffer: buffer.as_ref(),
+                    buffer,
                     offset: m.offset,
                     index: m.index,
                 },
@@ -226,7 +203,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetFragmentBuffer {
-                    buffer: buffer.as_ref(),
+                    buffer,
                     offset: m.offset,
                     index: m.index,
                 },
@@ -238,7 +215,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetFragmentTexture {
-                    texture: texture.as_ref(),
+                    texture,
                     index: m.index,
                 },
             )?;
@@ -398,7 +375,7 @@ pub(crate) fn decode_op<P: Platform>(
                     number_of_patch_control_points: m.number_of_patch_control_points,
                     patch_start: m.patch_start,
                     patch_count: m.patch_count,
-                    patch_index_buffer: patch_index_buffer.as_ref(),
+                    patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
                     instance_count: m.instance_count,
                     base_instance: m.base_instance,
@@ -413,7 +390,7 @@ pub(crate) fn decode_op<P: Platform>(
                 on,
                 RenderCmd::DrawPatchesIndirect {
                     number_of_patch_control_points: m.number_of_patch_control_points,
-                    patch_index_buffer: patch_index_buffer.as_ref(),
+                    patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
                     indirect_buffer: &indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
@@ -431,7 +408,7 @@ pub(crate) fn decode_op<P: Platform>(
                     number_of_patch_control_points: m.number_of_patch_control_points,
                     patch_start: m.patch_start,
                     patch_count: m.patch_count,
-                    patch_index_buffer: patch_index_buffer.as_ref(),
+                    patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
                     control_point_index_buffer: &control_point_index_buffer,
                     control_point_index_buffer_offset: m.control_point_index_buffer_offset,
@@ -450,7 +427,7 @@ pub(crate) fn decode_op<P: Platform>(
                 on,
                 RenderCmd::DrawIndexedPatchesIndirect {
                     number_of_patch_control_points: m.number_of_patch_control_points,
-                    patch_index_buffer: patch_index_buffer.as_ref(),
+                    patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
                     control_point_index_buffer: &control_point_index_buffer,
                     control_point_index_buffer_offset: m.control_point_index_buffer_offset,
@@ -863,7 +840,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetDepthStencilState {
-                    depth_stencil_state: state.as_ref(),
+                    depth_stencil_state: state,
                 },
             )?;
         }
@@ -873,7 +850,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetColorResolveTexture {
-                    texture: texture.as_ref(),
+                    texture,
                     slice: m.slice,
                     depth_plane: m.depth_plane,
                     level: m.level,
@@ -888,7 +865,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetDepthResolveTexture {
-                    texture: texture.as_ref(),
+                    texture,
                     slice: m.slice,
                     depth_plane: m.depth_plane,
                     level: m.level,
@@ -902,7 +879,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetStencilResolveTexture {
-                    texture: texture.as_ref(),
+                    texture,
                     slice: m.slice,
                     depth_plane: m.depth_plane,
                     level: m.level,
@@ -916,7 +893,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::SetTessellationFactorBuffer {
-                    buffer: buffer.as_ref(),
+                    buffer,
                     offset: m.offset,
                     instance_stride: m.instance_stride,
                 },
@@ -932,8 +909,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexBuffers>(),
                 m.range_length as usize,
             )?;
-            let (owned, offsets) = resolve_buffers(objs, &es)?;
-            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let (named, offsets) = resolve_buffers(objs, &es)?;
+            let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetVertexBuffers {
@@ -954,8 +931,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentBuffers>(),
                 m.range_length as usize,
             )?;
-            let (owned, offsets) = resolve_buffers(objs, &es)?;
-            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let (named, offsets) = resolve_buffers(objs, &es)?;
+            let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetFragmentBuffers {
@@ -976,8 +953,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileBuffers>(),
                 m.range_length as usize,
             )?;
-            let (owned, offsets) = resolve_buffers(objs, &es)?;
-            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let (named, offsets) = resolve_buffers(objs, &es)?;
+            let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetTileBuffers {
@@ -998,15 +975,15 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexBuffersAttributeStrides>(),
                 m.range_length as usize,
             )?;
-            let mut owned = Vec::with_capacity(es.len());
+            let mut named = Vec::with_capacity(es.len());
             let mut offsets = Vec::with_capacity(es.len());
             let mut strides = Vec::with_capacity(es.len());
             for e in &es {
-                owned.push(objs.get_buffer(e.buffer_obj_id)?);
+                named.push(objs.get_buffer(e.buffer_obj_id)?);
                 offsets.push(e.offset);
                 strides.push(e.stride);
             }
-            let buffers: Vec<Option<&P::Buffer>> = owned.iter().map(Option::as_ref).collect();
+            let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetVertexBuffersAttributeStrides {
@@ -1030,8 +1007,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexTextures>(),
                 m.range_length as usize,
             )?;
-            let owned = resolve_textures(objs, &es)?;
-            let textures: Vec<Option<&P::Texture>> = owned.iter().map(Option::as_ref).collect();
+            let named = resolve_textures(objs, &es)?;
+            let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetVertexTextures {
@@ -1051,8 +1028,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentTextures>(),
                 m.range_length as usize,
             )?;
-            let owned = resolve_textures(objs, &es)?;
-            let textures: Vec<Option<&P::Texture>> = owned.iter().map(Option::as_ref).collect();
+            let named = resolve_textures(objs, &es)?;
+            let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetFragmentTextures {
@@ -1072,8 +1049,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileTextures>(),
                 m.range_length as usize,
             )?;
-            let owned = resolve_textures(objs, &es)?;
-            let textures: Vec<Option<&P::Texture>> = owned.iter().map(Option::as_ref).collect();
+            let named = resolve_textures(objs, &es)?;
+            let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetTileTextures {
@@ -1095,9 +1072,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexSamplerStates>(),
                 m.range_length as usize,
             )?;
-            let owned = resolve_samplers(objs, &es)?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let named = resolve_samplers(objs, &es)?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetVertexSamplerStates {
@@ -1117,9 +1093,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentSamplerStates>(),
                 m.range_length as usize,
             )?;
-            let owned = resolve_samplers(objs, &es)?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let named = resolve_samplers(objs, &es)?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetFragmentSamplerStates {
@@ -1139,9 +1114,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileSamplerStates>(),
                 m.range_length as usize,
             )?;
-            let owned = resolve_samplers(objs, &es)?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let named = resolve_samplers(objs, &es)?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetTileSamplerStates {
@@ -1161,9 +1135,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexSamplerStatesLodClamps>(),
                 m.range_length as usize,
             )?;
-            let (owned, mins, maxs) = resolve_samplers_lod(objs, &es)?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let (named, mins, maxs) = resolve_samplers_lod(objs, &es)?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetVertexSamplerStatesLodClamps {
@@ -1185,9 +1158,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentSamplerStatesLodClamps>(),
                 m.range_length as usize,
             )?;
-            let (owned, mins, maxs) = resolve_samplers_lod(objs, &es)?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let (named, mins, maxs) = resolve_samplers_lod(objs, &es)?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetFragmentSamplerStatesLodClamps {
@@ -1209,9 +1181,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileSamplerStatesLodClamps>(),
                 m.range_length as usize,
             )?;
-            let (owned, mins, maxs) = resolve_samplers_lod(objs, &es)?;
-            let samplers: Vec<Option<&P::SamplerState>> =
-                owned.iter().map(Option::as_ref).collect();
+            let (named, mins, maxs) = resolve_samplers_lod(objs, &es)?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
                 RenderCmd::SetTileSamplerStatesLodClamps {
@@ -1305,8 +1276,8 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxOpUseHeaps = body(tag, payload)?;
             let es: Vec<RgfxHeapBinding> =
                 elems(tag, payload, size_of::<RgfxOpUseHeaps>(), m.count as usize)?;
-            let owned = resolve_heaps(objs, &es)?;
-            let heaps: Vec<Option<&P::Heap>> = owned.iter().map(Option::as_ref).collect();
+            let named = resolve_heaps(objs, &es)?;
+            let heaps: Vec<Option<&P::Heap>> = named;
             enc.encode(on, RenderCmd::UseHeaps { heaps: &heaps })?;
         }
         RGFX_OP_RENDER_USE_HEAPS_STAGES => {
@@ -1317,8 +1288,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpUseHeapsStages>(),
                 m.count as usize,
             )?;
-            let owned = resolve_heaps(objs, &es)?;
-            let heaps: Vec<Option<&P::Heap>> = owned.iter().map(Option::as_ref).collect();
+            let named = resolve_heaps(objs, &es)?;
+            let heaps: Vec<Option<&P::Heap>> = named;
             enc.encode(
                 on,
                 RenderCmd::UseHeapsStages {
@@ -1335,14 +1306,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpUseResources>(),
                 m.count as usize,
             )?;
-            let owned: Vec<Option<OwnedResource<P>>> = es
+            let resources: Vec<Option<ResourceRef<'_, P>>> = es
                 .iter()
                 .map(|e| resolve_resource(objs, e))
                 .collect::<RaiseResult<_>>()?;
-            let resources: Vec<Option<ResourceRef<'_, P>>> = owned
-                .iter()
-                .map(|o| o.as_ref().map(OwnedResource::as_ref))
-                .collect();
             enc.encode(
                 on,
                 RenderCmd::UseResources {
@@ -1359,14 +1326,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpUseResourcesStages>(),
                 m.count as usize,
             )?;
-            let owned: Vec<Option<OwnedResource<P>>> = es
+            let resources: Vec<Option<ResourceRef<'_, P>>> = es
                 .iter()
                 .map(|e| resolve_resource(objs, e))
                 .collect::<RaiseResult<_>>()?;
-            let resources: Vec<Option<ResourceRef<'_, P>>> = owned
-                .iter()
-                .map(|o| o.as_ref().map(OwnedResource::as_ref))
-                .collect();
             enc.encode(
                 on,
                 RenderCmd::UseResourcesStages {

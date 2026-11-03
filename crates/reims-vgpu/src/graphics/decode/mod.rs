@@ -2585,8 +2585,10 @@ pub(crate) fn refusing<T>(op: impl FnOnce() -> RaiseResult<T>) -> RaiseResult<T>
 /// handle. A `require_*` resolves a reference that must name an object of its kind
 /// (nil or a miss is an exec fault, [`bad_reference`]); a `get_*` resolves a
 /// nil-allowed reference (`0` is `None`, a non-zero miss is an exec fault). Each
-/// returns a fresh counted reference ([`Handle::clone_ref`]) the caller holds for
-/// the encode.
+/// lends the table's own handle for the borrow of the decoder, which no op's encode
+/// outlives: an encode retains what it keeps, and a decoder op of 10,000 a command
+/// buffer takes no counted reference of its own ([`Handle::clone_ref`], an atomic
+/// add and its release) to name an object.
 macro_rules! resolvers {
     ($( ($req:ident, $get:ident, $variant:ident, $assoc:ident, $what:literal) ),* $(,)?) => {
         // The whole object-resolution API: some resolvers are for ops the first slice does not
@@ -2595,19 +2597,19 @@ macro_rules! resolvers {
         impl<P: Platform> GraphicsDecoder<P> {
             $(
                 #[doc = concat!("The ", $what, " `id` names; an exec fault when `id` is 0 or names no ", $what, ".")]
-                pub(crate) fn $req(&self, id: u64) -> RaiseResult<P::$assoc> {
+                pub(crate) fn $req(&self, id: u64) -> RaiseResult<&P::$assoc> {
                     match self.named(id) {
-                        Some(ObjHandle::$variant(h)) => Ok(h.clone_ref()),
+                        Some(ObjHandle::$variant(h)) => Ok(h),
                         _ => Err(bad_reference()),
                     }
                 }
                 #[doc = concat!("The ", $what, " `id` names, `None` for 0; an exec fault when a non-zero `id` names no ", $what, ".")]
-                pub(crate) fn $get(&self, id: u64) -> RaiseResult<Option<P::$assoc>> {
+                pub(crate) fn $get(&self, id: u64) -> RaiseResult<Option<&P::$assoc>> {
                     if id == 0 {
                         return Ok(None);
                     }
                     match self.named(id) {
-                        Some(ObjHandle::$variant(h)) => Ok(Some(h.clone_ref())),
+                        Some(ObjHandle::$variant(h)) => Ok(Some(h)),
                         _ => Err(bad_reference()),
                     }
                 }

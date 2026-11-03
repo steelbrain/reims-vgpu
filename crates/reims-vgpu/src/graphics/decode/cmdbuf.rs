@@ -942,8 +942,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let tex = self.require_texture(a.texture_obj_id)?;
             let resolve = self.get_texture(a.resolve_texture_obj_id)?;
             let aset = ColorAttachmentSet {
-                texture: Some(Some(&tex)),
-                resolve_texture: resolve.as_ref().map(Some),
+                texture: Some(Some(tex)),
+                resolve_texture: resolve.map(Some),
                 level: Some(a.level as u64),
                 slice: Some(a.slice as u64),
                 depth_plane: Some(a.depth_plane as u64),
@@ -988,8 +988,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let tex = self.require_texture(d.texture_obj_id)?;
             let resolve = self.get_texture(d.resolve_texture_obj_id)?;
             let dset = DepthAttachmentSet {
-                texture: Some(Some(&tex)),
-                resolve_texture: resolve.as_ref().map(Some),
+                texture: Some(Some(tex)),
+                resolve_texture: resolve.map(Some),
                 level: Some(d.level as u64),
                 slice: Some(d.slice as u64),
                 depth_plane: Some(d.depth_plane as u64),
@@ -1010,8 +1010,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let tex = self.require_texture(s.texture_obj_id)?;
             let resolve = self.get_texture(s.resolve_texture_obj_id)?;
             let sset = StencilAttachmentSet {
-                texture: Some(Some(&tex)),
-                resolve_texture: resolve.as_ref().map(Some),
+                texture: Some(Some(tex)),
+                resolve_texture: resolve.map(Some),
                 level: Some(s.level as u64),
                 slice: Some(s.slice as u64),
                 depth_plane: Some(s.depth_plane as u64),

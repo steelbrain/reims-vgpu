@@ -169,12 +169,12 @@ pub(super) fn decode_op<P: Platform>(
                 }
             }
             let decode = H264Decode {
-                bitstream: &bitstream,
+                bitstream,
                 offset: m.bitstream_offset,
                 size: m.bitstream_size,
                 parameter_sets: sets,
                 luma: VideoPlane {
-                    buffer: &luma,
+                    buffer: luma,
                     offset: luma_place.offset,
                     bytes_per_row: luma_place.bytes_per_row,
                     width: luma_place.width,
@@ -182,7 +182,7 @@ pub(super) fn decode_op<P: Platform>(
                     cached: luma_cache.is_some(),
                 },
                 chroma: VideoPlane {
-                    buffer: &chroma,
+                    buffer: chroma,
                     offset: chroma_place.offset,
                     bytes_per_row: chroma_place.bytes_per_row,
                     width: chroma_place.width,
@@ -217,7 +217,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in; an exec
     /// fault where `id` names no such texture.
-    fn plane_of(&self, id: u64) -> RaiseResult<(PlanePlace, P::Buffer)> {
+    fn plane_of(&self, id: u64) -> RaiseResult<(PlanePlace, &P::Buffer)> {
         let place = *self.surface_places.get(&id).ok_or_else(bad_reference)?;
         if !matches!(self.named(id), Some(ObjHandle::Texture(_))) {
             return Err(bad_reference());
