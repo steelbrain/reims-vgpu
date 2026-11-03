@@ -1355,7 +1355,11 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Metal's tiler takes Metal's allocation for it as the runtime submits it
     /// ([`tiler_handler`]). One committed while a command buffer of its queue that Metal's GPU
     /// hangs at is in flight runs nothing and completes without an error, as on Metal, as the
-    /// runtime commits it (the module docs).
+    /// runtime commits it (the module docs). It is committed through the runtime's
+    /// `commit_and_submit`, which submits on this thread the ready batches that need nothing of
+    /// the scheduler's thread, and runs their submission handlers here, inside the call; a batch
+    /// with a submission check, which every command buffer here carries but one committed failed,
+    /// is the scheduler's thread's, as under `commit`.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
         let progress = self.progress.lock().clone();
         encoding("commit", Policy::Dies, || {
@@ -1381,8 +1385,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
                     (None, Some(check)) => self
                         .raw
                         .set_submission_check(check)
-                        .and_then(|()| self.raw.commit()),
-                    (None, None) => self.raw.commit(),
+                        .and_then(|()| self.raw.commit_and_submit()),
+                    (None, None) => self.raw.commit_and_submit(),
                 })
             })
         })
