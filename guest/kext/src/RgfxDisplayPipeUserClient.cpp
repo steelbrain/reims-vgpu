@@ -7,6 +7,7 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
+#include "RgfxPipeNotifications.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -46,12 +47,7 @@ constexpr UInt32 kPlaneIOSurface = 1;
 constexpr UInt32 kNotifyCallback = 0x0;
 constexpr UInt32 kNotifyRefcon = 0x8;
 
-// The messages back: a transaction's completion, 11 words (the cookie in word 0, the id in
-// word 1's high half, the completion time in word 3, action 1 in word 8), and a VBL, 6 words
-// (the request's callback and refcon, then the refresh's time and the next one's, each split
-// low half first).
-constexpr UInt32 kCompletionWords = 11;
-constexpr UInt32 kVblWords = 6;
+// The messages back, a transaction's completion and a VBL: RgfxPipeNotifications.hpp.
 
 // The entitlement an association needs: WindowServer has it.
 const char *const kEntitlement = "com.apple.private.hid.client.event-monitor";
@@ -494,12 +490,9 @@ void RgfxDisplayPipeUserClient::completeLocked(const Transactions::Completion &c
 	if (c.id > completed)
 		completed = c.id;
 	if (c.notified && registered) {
-		io_user_reference_t words[kCompletionWords] = {};
-		words[0] = c.cookie;
-		words[1] = static_cast<io_user_reference_t>(c.id) << 32;
-		words[3] = time;
-		words[8] = 1;
-		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, kCompletionWords);
+		io_user_reference_t words[kRgfxPipeCompletionWords];
+		rgfxPipeCompletionWords(words, c.cookie, c.id, time);
+		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, kRgfxPipeCompletionWords);
 	}
 	IOLockWakeup(lock, &completed, false);
 }
@@ -552,14 +545,9 @@ void RgfxDisplayPipeUserClient::sendVbl(UInt64 time, UInt64 next)
 	}
 	for (UInt32 i = 0; i < vblWaiting; i++) {
 		VblRequest &r = vblRequests[i];
-		io_user_reference_t words[kVblWords] = {};
-		words[0] = r.callback;
-		words[1] = r.refcon;
-		words[2] = time & 0xffffffffu;
-		words[3] = time >> 32;
-		words[4] = next & 0xffffffffu;
-		words[5] = next >> 32;
-		sendAsyncResult64(r.reference, kIOReturnSuccess, words, kVblWords);
+		io_user_reference_t words[kRgfxPipeVblWords];
+		rgfxPipeVblWords(words, r.callback, r.refcon, time, next);
+		sendAsyncResult64(r.reference, kIOReturnSuccess, words, kRgfxPipeVblWords);
 		releaseAsyncReference64(r.reference);
 	}
 	vblWaiting = 0;

@@ -867,7 +867,9 @@ refresh's time and the next one's.
 
 **The display pipe's notification words.** The kext answers a pipe client with
 asynchronous results whose words IOAccelerator's notification callbacks read
-(`guest/kext/src/RgfxDisplayPipeUserClient.cpp`, `completeLocked` and `sendVbl`).
+(`guest/kext/src/RgfxDisplayPipeUserClient.cpp`, `completeLocked` and `sendVbl`,
+which build them with `RgfxPipeNotifications.hpp`; `tests/user_client_words_test.cpp`
+pins them).
 A transaction's completion is exactly 11 words: the transaction's cookie in word
 0, its id in the high half of word 1 (the low half 0), the time it was shown in
 word 3, and the action 1 in word 8, the rest 0. The callback reads it as follows:
@@ -1538,7 +1540,8 @@ not Apple's IOGPU user-client ABI: the context's window ("Processes map only
 their own"), where the bundle's `RgfxRegion` / `RgfxRingWriter` write into real
 device memory, the device info (selector 0x10b), and
 `externalMethod(kRgfxAccelMethodDoorbell)`, which writes a ring id to
-`RGFX_REG_DOORBELL`. These ids/selectors are defined in `RgfxAccelerator.hpp`;
+`RGFX_REG_DOORBELL`. These ids/selectors are defined in `RgfxUserClientABI.hpp`,
+which the kext and the bundle both include;
 the bundle's wire handshake opens them with `IOServiceOpen` /
 `IOConnectCallStructMethod` / `IOConnectCallScalarMethod`.
 

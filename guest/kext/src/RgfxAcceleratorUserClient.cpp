@@ -8,6 +8,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 
+#include "RgfxIOGPUReplies.hpp"
 #include "RgfxTrace.hpp"
 
 #define super IOUserClient
@@ -143,20 +144,7 @@ IOReturn RgfxAcceleratorUserClient::doorbellMethod(OSObject *target, void *,
 }
 
 // The user client Apple's IOGPU base opens to build the Metal device
-// (kRgfxIOGPUDeviceUserClientType, from IOGPUDeviceCreateWithOptions inside [super
-// initWithAcceleratorPort:]), and the two calls it
-// makes there, measured: selector 2, the device's info (536 bytes out), then selector 0, its
-// configuration (64 bytes out). Each must succeed at its exact size, or the device is nil.
-enum {
-	kRgfxIOGPUSelConfig = 0,
-	kRgfxIOGPUSelDeviceInfo = 2,
-};
-static const uint32_t kRgfxIOGPUConfigSize = 64;
-static const uint32_t kRgfxIOGPUDeviceInfoSize = 536;
-// The configuration's dedicatedMemorySize (its u64 at 0x10, which the guest's Metal device
-// answers) is the host's working set where its GPU has memory of its own, else 0
-// (RgfxMemorySize.hpp). Its shared-memory size (at 0x20) is the region's: BAR 2's size, from the
-// device.
+// (kRgfxIOGPUDeviceUserClientType), and the two calls it makes there: RgfxIOGPUReplies.hpp.
 
 // Copy a reply into the method's struct-output, whether IOKit provided an inline buffer or an
 // output memory descriptor, and report the exact length written.
@@ -178,18 +166,14 @@ static IOReturn rgfxWriteStructOut(IOExternalMethodArguments *a, const void *buf
 IOReturn RgfxAcceleratorUserClient::deviceMethod(uint32_t selector,
                                                  IOExternalMethodArguments *arguments)
 {
-	if (selector == kRgfxIOGPUSelConfig) {
-		uint8_t config[kRgfxIOGPUConfigSize] = {};
-		RgfxMemorySize memory;
-		if (owner && owner->readMemorySize(&memory))
-			*reinterpret_cast<uint64_t *>(config + 0x10) = memory.dedicatedBytes;
-		*reinterpret_cast<uint64_t *>(config + 0x20) = owner ? owner->getRegionSize() : 0;
-		return rgfxWriteStructOut(arguments, config, sizeof(config));
-	}
-	// The device info, all zero: its u32 at 0x14 counts the u32 entries of a table at 0x18,
-	// which the base reads, so the device has none.
-	uint8_t info[kRgfxIOGPUDeviceInfoSize] = {};
-	return rgfxWriteStructOut(arguments, info, sizeof(info));
+	uint8_t reply[kRgfxIOGPUDeviceInfoSize];
+	static_assert(kRgfxIOGPUConfigSize <= sizeof(reply), "the configuration fits the reply");
+	RgfxMemorySize memory;
+	const uint64_t dedicated = owner && owner->readMemorySize(&memory) ? memory.dedicatedBytes : 0;
+	rgfxIOGPUDeviceReply(selector, reply, dedicated, owner ? owner->getRegionSize() : 0);
+	return rgfxWriteStructOut(arguments, reply,
+	                          selector == kRgfxIOGPUSelConfig ? kRgfxIOGPUConfigSize
+	                                                          : kRgfxIOGPUDeviceInfoSize);
 }
 
 IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
@@ -227,8 +211,8 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 
 	// Our own protocol: the process's context (its ids, blocks and queues), on our own user
 	// client alone.
-	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodOpenContext &&
-	    selector <= kRgfxAccelMethodSurfaceRetire)
+	if (ucType == kRgfxAccelUserClientType && arguments && selector >= kRgfxAccelMethodContextFirst &&
+	    selector <= kRgfxAccelMethodContextLast)
 		return contextMethod(selector, arguments);
 
 	// Our own protocol: the doorbell. ONLY on our own user client (type 0). Apple's IOGPU
@@ -246,12 +230,9 @@ IOReturn RgfxAcceleratorUserClient::externalMethod(uint32_t selector,
 	}
 
 	// The IOGPU base's device calls, on its own client.
-	if (ucType == kRgfxIOGPUDeviceUserClientType && arguments && arguments->scalarInputCount == 0 &&
-	    arguments->scalarOutputCount == 0 && arguments->structureInputSize == 0 &&
-	    ((selector == kRgfxIOGPUSelConfig &&
-	      arguments->structureOutputSize == kRgfxIOGPUConfigSize) ||
-	     (selector == kRgfxIOGPUSelDeviceInfo &&
-	      arguments->structureOutputSize == kRgfxIOGPUDeviceInfoSize)))
+	if (ucType == kRgfxIOGPUDeviceUserClientType && arguments &&
+	    rgfxIOGPUDeviceReplySize(selector, arguments->scalarInputCount, arguments->scalarOutputCount,
+	                             arguments->structureInputSize, arguments->structureOutputSize))
 		return deviceMethod(selector, arguments);
 
 	// Nothing else is ours to answer. A caller of a selector we do not implement gets

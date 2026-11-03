@@ -1,5 +1,5 @@
 // window_probe: what of the reims-graphics device region each process maps, on the kext's own
-// selectors (guest/kext/src/RgfxAccelerator.hpp), with no Metal.
+// selectors (guest/kext/src/RgfxUserClientABI.hpp), with no Metal.
 //   window_probe check     the isolation of the windows, across processes:
 //       1. the whole region does not map, the device info comes from its selector, and the
 //          window holds nothing of the region's head (the rings, the device page);
@@ -41,21 +41,16 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "../../kext/src/RgfxUserClientABI.hpp"
 // The guests' SDK still has global surfaces, which the macOS 27 SDK deprecates.
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 extern char **environ;
 
+// The whole region's memory type (the kext's kRgfxAccelMemoryRegion), which it refuses.
 enum {
-	kUserClientType = 0x52474658,
 	kMemoryRegion = 0,
-	kOpenContext = 0x100,
-	kAlloc = 0x101,
-	kFree = 0x102,
-	kSurfaceScanout = 0x108,
-	kSurfaceBlock = 0x109,
-	kSurfaceBlockRelease = 0x10a,
-	kDeviceInfo = 0x10b,
 };
 static const uint64_t kHead = 0x400000;       // RGFX_ALLOCATIONS_OFFSET
 static const uint64_t kDeviceInfoAt = 0x18100; // RGFX_DEVICE_INFO_OFFSET
@@ -80,17 +75,17 @@ static int openConn(struct Conn *c)
 	    IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RgfxAccelerator"));
 	if (!svc)
 		return -1;
-	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), kUserClientType, &c->conn);
+	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), kRgfxAccelUserClientType, &c->conn);
 	IOObjectRelease(svc);
 	if (kr != KERN_SUCCESS)
 		return -1;
 	uint64_t out[5] = {};
 	uint32_t n = 5;
-	kr = IOConnectCallScalarMethod(c->conn, kOpenContext, NULL, 0, out, &n);
+	kr = IOConnectCallScalarMethod(c->conn, kRgfxAccelMethodOpenContext, NULL, 0, out, &n);
 	if (kr != KERN_SUCCESS) {
 		// A kext with no window answers three.
 		n = 3;
-		kr = IOConnectCallScalarMethod(c->conn, kOpenContext, NULL, 0, out, &n);
+		kr = IOConnectCallScalarMethod(c->conn, kRgfxAccelMethodOpenContext, NULL, 0, out, &n);
 		if (kr != KERN_SUCCESS)
 			return -1;
 		c->base = NULL;
@@ -106,12 +101,12 @@ static int alloc(struct Conn *c, uint64_t size, uint64_t *offset)
 {
 	uint64_t in[2] = {size, 0x1000};
 	uint32_t n = 1;
-	return IOConnectCallScalarMethod(c->conn, kAlloc, in, 2, offset, &n) == KERN_SUCCESS ? 0 : -1;
+	return IOConnectCallScalarMethod(c->conn, kRgfxAccelMethodAlloc, in, 2, offset, &n) == KERN_SUCCESS ? 0 : -1;
 }
 
 static kern_return_t freeBlock(struct Conn *c, uint64_t offset)
 {
-	return IOConnectCallScalarMethod(c->conn, kFree, &offset, 1, NULL, NULL);
+	return IOConnectCallScalarMethod(c->conn, kRgfxAccelMethodFree, &offset, 1, NULL, NULL);
 }
 
 // The bytes at `p` that are not `value`, of `n`.
@@ -200,7 +195,7 @@ static int surfaceBlock(struct Conn *c, const void *plane, uint64_t length, uint
 	uint64_t in[3] = {(uintptr_t)plane, length, size};
 	uint64_t out[4] = {};
 	uint32_t n = 4;
-	kern_return_t kr = IOConnectCallScalarMethod(c->conn, kSurfaceBlock, in, 3, out, &n);
+	kern_return_t kr = IOConnectCallScalarMethod(c->conn, kRgfxAccelMethodSurfaceBlock, in, 3, out, &n);
 	if (kr != KERN_SUCCESS)
 		return -1;
 	*offset = out[0];
@@ -354,7 +349,7 @@ static int peerScanout(void)
 	uint64_t in[2] = {sid, 0};
 	uint64_t out[5] = {};
 	uint32_t n = 5;
-	kern_return_t granted = IOConnectCallScalarMethod(c.conn, kSurfaceScanout, in, 2, out, &n);
+	kern_return_t granted = IOConnectCallScalarMethod(c.conn, kRgfxAccelMethodSurfaceScanout, in, 2, out, &n);
 	uint64_t at = granted == KERN_SUCCESS ? out[0] : kHead;
 	uint64_t length = granted == KERN_SUCCESS && out[1] ? out[1] : 0x10000;
 	if (at >= c.size || length > c.size - at)
@@ -465,7 +460,7 @@ static int formerOwner(const char *self)
 	uint64_t in[2] = {sid, 0};
 	uint64_t out[5] = {};
 	uint32_t n = 5;
-	kern_return_t granted = IOConnectCallScalarMethod(c.conn, kSurfaceScanout, in, 2, out, &n);
+	kern_return_t granted = IOConnectCallScalarMethod(c.conn, kRgfxAccelMethodSurfaceScanout, in, 2, out, &n);
 	uint64_t at = out[0], length = out[1];
 	printf("  former: as the owner: the lock of %dx%d 0x%x at 0x%llx, the grant 0x%x (span "
 	       "0x%llx, 0x%llx bytes)\n",
@@ -525,7 +520,7 @@ static int check(const char *self)
 	uint8_t *info = calloc(1, kDeviceInfoSize);
 	size_t infoSize = kDeviceInfoSize;
 	kern_return_t infoKr =
-	    IOConnectCallStructMethod(c.conn, kDeviceInfo, NULL, 0, info, &infoSize);
+	    IOConnectCallStructMethod(c.conn, kRgfxAccelMethodDeviceInfo, NULL, 0, info, &infoSize);
 	size_t infoBytes = notAll(info, kDeviceInfoSize, 0);
 	size_t headBytes = notAll(c.base, kHead, 0);
 	size_t infoHere = notAll(c.base + (kDeviceInfoAt & ~0xfffull), 0x2000, 0);
@@ -597,7 +592,7 @@ static int check(const char *self)
 		printf("WINDOW FAIL: 4\n");
 		return 1;
 	}
-	kern_return_t let = IOConnectCallScalarMethod(c.conn, kSurfaceBlockRelease, &sblock, 1, NULL,
+	kern_return_t let = IOConnectCallScalarMethod(c.conn, kRgfxAccelMethodSurfaceBlockRelease, &sblock, 1, NULL,
 	                                              NULL);
 	size_t gone = notAll(c.base + sblock, length, 0);
 	printf("4 let go (0x%x): the plane's block reads %zu nonzero bytes here\n", let, gone);

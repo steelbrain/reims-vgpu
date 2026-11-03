@@ -1,6 +1,6 @@
 /*
  * RgfxAcceleratorUserClient: the connection the guest Metal bundle opens to the
- * RgfxAccelerator over OUR protocol (RgfxAccelerator.hpp names the ids and selectors): the
+ * RgfxAccelerator over OUR protocol (RgfxUserClientABI.hpp names the ids and selectors): the
  * doorbell, the process's context and its window.
  *   - The window (RgfxAcceleratorUserClientWindow.cpp): the range of the process where its part
  *     of the region lies, each byte at the window's base plus its region offset. The kext maps

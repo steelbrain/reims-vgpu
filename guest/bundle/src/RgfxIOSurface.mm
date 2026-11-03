@@ -27,6 +27,7 @@
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "../../kext/src/RgfxUserClientABI.hpp"
 
 namespace {
 
@@ -394,8 +395,8 @@ struct RgfxSurfaceHeader {
 	uint64_t cpuGen;
 };
 
-static_assert(offsetof(RgfxSurfaceHeader, cpuGen) == 16,
-              "the kext's kRgfxSurfaceCpuGenOffset (guest/kext/src/RgfxAccelerator.hpp)");
+static_assert(offsetof(RgfxSurfaceHeader, cpuGen) == kRgfxSurfaceCpuGenOffset,
+              "where the kext writes the CPU generation");
 
 static_assert(sizeof(RgfxSurfaceHeader) % alignof(RgfxSurfaceWriters) == 0,
               "the writers follow the header, aligned");

@@ -60,27 +60,8 @@ void rgfxDiag(const char *fmt, ...)
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 
-// The accelerator's user-client ABI, mirroring guest/kext/src/RgfxAccelerator.hpp (that
-// header is kernel-only and not included here, so the values are duplicated and kept in sync
-// by hand): the only user-client type, and the selectors.
-enum {
-	kRgfxAccelUserClientType = 0x52474658, // 'RGFX', clear of the IOAccel surface type 0
-	kRgfxAccelMethodDoorbell = 0,
-	kRgfxAccelMethodOpenContext = 0x100,
-	kRgfxAccelMethodAlloc = 0x101,
-	kRgfxAccelMethodFree = 0x102,
-	kRgfxAccelMethodQueueCreate = 0x103,
-	kRgfxAccelMethodQueueDestroy = 0x104,
-	kRgfxAccelMethodSubmit = 0x105,
-	kRgfxAccelMethodResourceIds = 0x106,
-	kRgfxAccelMethodWaitCompletions = 0x107,
-	kRgfxAccelMethodSurfaceScanout = 0x108,
-	kRgfxAccelMethodSurfaceBlock = 0x109,
-	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
-	kRgfxAccelMethodDeviceInfo = 0x10b,
-	kRgfxAccelMethodSurfaceWrites = 0x10c,
-	kRgfxAccelMethodSurfaceRetire = 0x10d,
-};
+// The accelerator's user-client protocol, the kext's own header: its type and selectors.
+#include "../../kext/src/RgfxUserClientABI.hpp"
 
 namespace {
 // The largest object-lifecycle message the kext takes (ReimsGraphics::kLifecycleMessageMax):

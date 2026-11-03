@@ -232,7 +232,7 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 	return end < chunk.chunk_offset || end >= chunk.total_length;
 }
 
-// kRgfxAccelMethodSubmit (RgfxAccelerator.hpp): one create or destroy of the client's onto the
+// kRgfxAccelMethodSubmit (RgfxUserClientABI.hpp): one create or destroy of the client's onto the
 // control ring, and the device's answer back where the create has one: a pipeline's reflection,
 // a library create's or lookup's COMPLETE, an argument layout's COMPLETE.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
@@ -385,8 +385,8 @@ bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
 	return found;
 }
 
-// kRgfxAccelMethodSurfaceWrites (RgfxAccelerator.hpp): the surfaces a command buffer of one of the
-// client's queues writes, whose CPU locks wait for it from here.
+// kRgfxAccelMethodSurfaceWrites (RgfxUserClientABI.hpp): the surfaces a command buffer of one of
+// the client's queues writes, whose CPU locks wait for it from here.
 IOReturn RgfxAcceleratorUserClient::surfaceWritesMethod(IOExternalMethodArguments *a)
 {
 	if (!hasContext || a->scalarInputCount != 0 || a->scalarOutputCount != 0)
@@ -431,7 +431,7 @@ IOReturn RgfxAcceleratorUserClient::surfaceWritesMethod(IOExternalMethodArgument
 	return r;
 }
 
-// kRgfxAccelMethodWaitCompletions (RgfxAccelerator.hpp): the bundle's completion thread
+// kRgfxAccelMethodWaitCompletions (RgfxUserClientABI.hpp): the bundle's completion thread
 // sleeps here, interruptibly, until a completion ring of the client's holds records for it.
 IOReturn RgfxAcceleratorUserClient::waitCompletionsMethod(IOExternalMethodArguments *a)
 {
@@ -502,7 +502,7 @@ void RgfxAcceleratorUserClient::releaseContext()
 		accel->retryRefusedBlocks();
 }
 
-// kRgfxAccelMethodDeviceInfo (RgfxAccelerator.hpp): the device info the host wrote, read from
+// kRgfxAccelMethodDeviceInfo (RgfxUserClientABI.hpp): the device info the host wrote, read from
 // the region for the process, which maps no page of it; with the video caps after it
 // (RGFX_VIDEO_CAPS_OFFSET) where the output has room for both.
 IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *a)
