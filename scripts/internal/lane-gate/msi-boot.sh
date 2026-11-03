@@ -551,7 +551,7 @@ ts() { perl -MTime::HiRes=time -ne '$| = 1; printf "%.3f %s", time, $_'; }
 guest_rc=0
 guest_run() {  # PHASE...: guest-run.sh's phases, its lines after the host's time into guest.log
   timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
-    "GATE_PASS='$GUEST_PASS' GATE_PRESENT_S=${PRESENT_S:-10} GATE_RETRY='${RETRY:-}' GATE_RETRY_S=${RETRY_S:-0} bash ~/lane-gate/guest-run.sh ~/lane-gate $*" 2>&1 |
+    "GATE_PASS='$GUEST_PASS' GATE_PRESENT_S=${PRESENT_S:-10} GATE_RETRY='${RETRY:-}' GATE_RETRY_S=${RETRY_S:-0} GATE_FINAL_CMD_B64='${FINAL_CMD_B64:-}' bash ~/lane-gate/guest-run.sh ~/lane-gate $*" 2>&1 |
     ts >> "$R/guest.log"
   local rc=${PIPESTATUS[0]}
   (( guest_rc == 0 )) && guest_rc=$rc

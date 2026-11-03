@@ -294,6 +294,12 @@ run_final() {
 			break
 		done
 	done
+	# The gate's --final-cmd: a command of the run's, its output kept in this log.
+	if [ -n "${GATE_FINAL_CMD_B64:-}" ]; then
+		printf '%s' "$GATE_FINAL_CMD_B64" | base64 -d > "$D/final-cmd.sh" 2>/dev/null ||
+			printf '%s' "$GATE_FINAL_CMD_B64" | base64 -D > "$D/final-cmd.sh"
+		limit 120 bash "$D/final-cmd.sh" 2>&1 | sed 's/^/GATE final-cmd: /'
+	fi
 }
 
 for p in $PHASES; do

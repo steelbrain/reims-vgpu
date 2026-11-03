@@ -30,6 +30,8 @@
 #                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
 #   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
 #                 info,reims_graphics::room=debug to count a path's debug records
+#   --final-cmd CMD  run CMD in the guest (bash, as the user, 120 s at most) at the end of the
+#                 correctness boot's final phase; its output is guest.log's "GATE final-cmd:" lines
 #   --capture-boot  capture what the correctness boot's display showed as it booted (msi-boot.sh's
 #                 CAPTURE, lane-gate/msi-capture.py): its scanout every 100 ms from QEMU's memory,
 #                 the guest's screenshots once a second, the kext's log lines; kept on the lane host
@@ -114,6 +116,7 @@ while (($#)); do
     --boot-tag) boot_tag=$2; shift ;;
     --host-log) host_log=$2; shift ;;
     --capture-boot) capture=1 ;;
+    --final-cmd) final_cmd=$2; shift ;;
     --no-appload) appload=0 ;;
     --appload-info) appload_info=$2; shift ;;
     --no-bench) bench=no ;;
@@ -536,6 +539,7 @@ LOAD=$([[ $mode == bench ]] && echo "$load")
 HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info,reims_vgpu::work=debug)
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
+FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_cmd" | base64 | tr -d '\n')
 EOF
   set +e
   msi "bash '$MR/bin/msi-boot.sh' '$out'"
