@@ -6030,6 +6030,105 @@ void test_buffer_texture_replace_region_tells_the_host()
 	drainRing(fx.ring);
 }
 
+// didModifyData of a texture over a Managed buffer, the plain form's, the linear form's and a view's,
+// tells the host the whole buffer (BUFFER_DID_MODIFY_RANGE of all of it), as Metal's uploads it to
+// the GPU's copy (the AMD 5300M's two copies, `oracle_storage AMD didmodify length` and `nocopy`);
+// a no-copy buffer's block takes the app's bytes first. Over a Shared buffer it posts nothing.
+void test_buffer_texture_did_modify_data_tells_the_host()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	const NSUInteger length = 0x2000, offset = 0x100, pitch = 0x100;
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:4
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	auto overBuffer = [&](RgfxBuffer *buf, bool linear) -> id<MTLTexture> {
+		desc.storageMode = buf.storageMode;
+		id<RgfxMetalBufferInternals> spi = (id<RgfxMetalBufferInternals>)buf;
+		id<MTLTexture> tex = linear ? [spi newLinearTextureWithDescriptor:desc
+		                                                           offset:offset
+		                                                      bytesPerRow:pitch
+		                                                    bytesPerImage:pitch * 4]
+		                            : [buf newTextureWithDescriptor:desc
+		                                                     offset:offset
+		                                                bytesPerRow:pitch];
+		CHECK(tex != nil && tex.buffer == buf);
+		drainRing(fx.ring);
+		return tex;
+	};
+	auto modified = [&](id<MTLTexture> tex) {
+		[(id<RgfxMetalTextureInternals>)tex didModifyData];
+	};
+	auto expectWhole = [&](RgfxBuffer *buf) {
+		auto range =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range.obj_id == buf.rgfxObjId && range.location == 0 && range.length == length);
+		CHECK(ringEmpty(fx.ring));
+	};
+	for (const bool linear : {false, true}) {
+		@autoreleasepool {
+			RgfxRegion::Block block = region.allocate(length);
+			CHECK(block.ok);
+			auto over = [&](MTLResourceOptions storage) {
+				RgfxBuffer *b = [RgfxBuffer
+				    bufferOverHostMemoryWithContents:const_cast<uint8_t *>(block.ptr)
+				                        regionOffset:block.offset
+				                              length:length
+				                             options:storage
+				                         deallocator:nil
+				                              device:nil
+				                          serializer:&fx.ser];
+				CHECK(b != nil);
+				drainRing(fx.ring);
+				return b;
+			};
+			RgfxBuffer *managed = over(MTLResourceStorageModeManaged);
+			id<MTLTexture> tex = overBuffer(managed, linear);
+			modified(tex);
+			expectWhole(managed);
+			id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+			CHECK(view != nil);
+			drainRing(fx.ring);
+			modified(view);
+			expectWhole(managed);
+
+			RgfxBuffer *shared = over(MTLResourceStorageModeShared);
+			id<MTLTexture> overShared = overBuffer(shared, linear);
+			modified(overShared);
+			CHECK(ringEmpty(fx.ring));
+		}
+		drainRing(fx.ring);
+	}
+
+	// A no-copy Managed buffer: its contents are the app's memory, which its block takes before
+	// the host is told.
+	@autoreleasepool {
+		std::vector<uint8_t> app(length + 0x20, 0);
+		uint8_t *p = app.data() + 0x13;
+		RgfxBuffer *noCopy = [RgfxBuffer bufferWithBytesNoCopy:p
+		                                                length:length
+		                                               options:MTLResourceStorageModeManaged
+		                                           deallocator:nil
+		                                                region:&region
+		                                                device:nil
+		                                            serializer:&fx.ser];
+		CHECK(noCopy != nil && [noCopy contents] == p);
+		auto made =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		drainRing(fx.ring);
+		id<MTLTexture> tex = overBuffer(noCopy, true);
+		p[offset + 5] = 0xd7;
+		modified(tex);
+		CHECK(mem[made.region_offset + offset + 5] == 0xd7);
+		expectWhole(noCopy);
+	}
+	drainRing(fx.ring);
+}
+
 // A Managed texture's CPU copy is a block of the region, made over a Shared buffer and named by
 // its MANAGED_TEXTURE_CREATE: replaceRegion: writes it at the layout's rows and posts the region
 // (TEXTURE_REPLACE_REGION); getBytes: reads it back with no message; a region past the level
@@ -10656,6 +10755,7 @@ int main(int argc, char **argv)
 		test_managed_layout();
 		test_managed_buffer_range();
 		test_buffer_texture_replace_region_tells_the_host();
+		test_buffer_texture_did_modify_data_tells_the_host();
 		test_managed_texture_cpu_copy();
 		test_objects_destroyed_as_let_go();
 		test_function_keeps_its_library();
