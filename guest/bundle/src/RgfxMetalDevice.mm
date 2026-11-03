@@ -142,12 +142,10 @@ bool rgfxKextAwaitAnswer(void *context, uint64_t seqno)
 }
 
 // Whether the kext keeps a deferred pipeline create's answer for later: its feature word
-// (wire-v3's Features, 0x10f) has kRgfxKextFeatureDeferredAnswers. Until the bundle reads that
-// word, no kext is taken to.
+// (Features, 0x10f) has kRgfxKextFeatureDeferredAnswers. An older kext's word is 0.
 bool rgfxKextDefersAnswers(const RgfxCaps &caps)
 {
-	(void)caps;
-	return false;
+	return (caps.kextFeatures() & kRgfxKextFeatureDeferredAnswers) != 0;
 }
 
 // The serializer's lifecycle route: the kext posts the message on the control ring, stamping

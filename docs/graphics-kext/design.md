@@ -1782,9 +1782,9 @@ the kext and the bundle include.
 | 0x10f | `Features` | | the device's feature word and the kext's |
 | 0x110 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
 | 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
-| 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | reserved: hands a process its held pipeline-create answers |
+| 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
 
-No kext sets a feature bit yet.
+The kext sets 1 << 4 `DeferredAnswers`; no other bit yet.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU

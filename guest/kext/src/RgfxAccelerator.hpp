@@ -83,9 +83,9 @@ enum {
 };
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
-// second word kRgfxAccelMethodFeatures answers: none yet. Each bit is set by the change that
-// lands its call.
-constexpr uint64_t kRgfxKextFeatureWord = 0;
+// second word kRgfxAccelMethodFeatures answers: Submit's deferred flag and TakeAnswers. Each bit
+// is set by the change that lands its call.
+constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeatureDeferredAnswers;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
