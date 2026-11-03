@@ -274,6 +274,20 @@ inline bool rgfxBlockSetWired(RgfxBlockTable &t, uint64_t offset, void *wired)
 	return true;
 }
 
+// The block at `offset`, which stays in the table, holds `wire`, a wiring of pages the device may
+// map in place there, where it holds none yet: it keeps it until it leaves the table
+// (rgfxBlockReleased OK), and never where it is kept for good. True where it holds `wire` now;
+// false where the caller lets `wire` go (the block's own wiring holds the same pages, or no block
+// is there).
+inline bool rgfxBlockHoldWire(RgfxBlockTable &t, uint64_t offset, void *wire)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	if (at < 0 || wire == nullptr || t.blocks[at].wired != nullptr)
+		return false;
+	t.blocks[at].wired = wire;
+	return true;
+}
+
 inline void rgfxBlockUnpin(RgfxBlockTable &t, const RgfxBlockPin &pin)
 {
 	int64_t at = rgfxBlockIndex(t, pin.offset);

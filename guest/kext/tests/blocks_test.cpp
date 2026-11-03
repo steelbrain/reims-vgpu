@@ -266,6 +266,43 @@ int main()
 		check(rgfxBlockRetryRefused(x.t) == 0, "no refused blocks are left");
 	}
 	{
+		// A cached surface block kept instead of released (a create in flight names it) holds the
+		// cache's wiring of its pages where it holds none of a holder's: the device may still map
+		// them in place, and no answer ever hands the wiring back, however many come.
+		Table x;
+		int cachePages = 0, holderPages = 0, other = 0;
+		uint64_t dormant = 0, held = 0;
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &dormant) == kRgfxBlockOk &&
+		          rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &held) == kRgfxBlockOk,
+		      "two surface blocks");
+		RgfxBlockPin pin;
+		check(rgfxBlockPinAny(x.t, dormant, 0x10, &pin) &&
+		          rgfxBlockFree(x.t, a, dormant) == kRgfxBlockBusy,
+		      "a create in flight names the first: it is not freed");
+		rgfxBlockKeepAt(x.t, dormant);
+		check(rgfxBlockHoldWire(x.t, dormant, &cachePages),
+		      "kept with no holder's wiring, it holds the cache's");
+		check(!rgfxBlockHoldWire(x.t, dormant, &other), "and keeps it: a second is not taken");
+		rgfxBlockUnpin(x.t, pin);
+		RgfxBlock rel;
+		check(!rgfxBlockNextRelease(x.t, &rel), "its release is never posted");
+		check(rgfxBlockRetryRefused(x.t) == 0, "nor posted again by a close");
+		void *got = reinterpret_cast<void *>(0x1);
+		for (uint64_t serial = 0; serial < 64; serial++)
+			rgfxBlockReleased(x.t, dormant, serial, true, &got);
+		const int64_t di = rgfxBlockIndex(x.t, dormant);
+		check(got == nullptr && di >= 0 && x.t.blocks[di].wired == &cachePages,
+		      "no answer hands its wiring back: its pages stay wired for good");
+		// The other is kept holding its last holder's wiring: the cache's goes, the block's own
+		// holding the same pages.
+		check(rgfxBlockSetWired(x.t, held, &holderPages), "a holder's wiring");
+		rgfxBlockKeepAt(x.t, held);
+		check(!rgfxBlockHoldWire(x.t, held, &cachePages),
+		      "a block holding a holder's wiring takes no cache's");
+		check(!rgfxBlockHoldWire(x.t, 0x999000, &cachePages), "nor does a block not there");
+		check(!rgfxBlockHoldWire(x.t, held, nullptr), "and no wiring is none to hold");
+	}
+	{
 		// A block kept for good (a close not answered, or a create naming it) is not posted
 		// again by a later close: it is not `refused`.
 		Table x;

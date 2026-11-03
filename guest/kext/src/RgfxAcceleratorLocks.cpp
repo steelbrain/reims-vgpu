@@ -353,8 +353,10 @@ void unwireSurface(void *wire)
 }
 } // namespace
 
-void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing)
+void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, void **wireOut)
 {
+	if (wireOut)
+		*wireOut = nullptr;
 	void *map = nullptr, *wire = nullptr;
 	bool kept = false;
 	if (cache && __atomic_load_n(&state.lock, __ATOMIC_ACQUIRE)) {
@@ -375,12 +377,16 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing)
 		return;
 	// The references rgfxSurfaceLocksAttach took, out of every lock, the cache's first: IOSurface
 	// frees a cache released to none (RgfxIOSurfaceKPI.hpp), while its surface lives. Then the
-	// surface's memory is unwired.
+	// surface's memory is unwired, or its wiring handed to the caller, who keeps it while the
+	// device may map the memory: the wiring holds the memory, whatever becomes of the surface.
 	if (cache)
 		reinterpret_cast<OSObject *>(cache)->release();
 	if (surface)
 		static_cast<OSObject *>(surface)->release();
-	unwireSurface(wire);
+	if (wireOut)
+		*wireOut = wire;
+	else
+		unwireSurface(wire);
 }
 
 bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,

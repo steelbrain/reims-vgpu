@@ -926,8 +926,14 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nu
 		*kept = ownedWire;
 	freeRuns(e.runs, e.runCount);
 	// Its surface's locks no longer wait for the writes named of it; a cached one's wait for
-	// its release's answer, which copies the cache into the pages.
-	rgfxSurfaceLocksForget(e.cache, e.surface, e.cached && release);
+	// its release's answer, which copies the cache into the pages. A cached block kept instead
+	// is cached no more, but the device may still map its pages in place: the block holds their
+	// wiring, the last holder's, or where it gave none (a dormant block's, kept as a create in
+	// flight names it), the cache's, so they never go back to macOS while it is in the table.
+	void *cacheWire = nullptr;
+	rgfxSurfaceLocksForget(e.cache, e.surface, e.cached && release, &cacheWire);
+	if (cacheWire && !rgfxBlockHoldWire(blockTable, e.offset, cacheWire))
+		unwire(cacheWire);
 	rgfxSurfaceClear(surfaceTable, e);
 	return release;
 }
