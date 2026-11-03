@@ -244,6 +244,11 @@ pub const RGFX_OP_RENDER_USE_RESOURCES_STAGES: u16 = 0x104e;
 /// Op `SET_DEPTH_STORE_ACTION_OPTIONS` ([`RgfxOpSetDepthStoreActionOptions`]):
 /// `setDepthStoreActionOptions:`.
 pub const RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS: u16 = 0x104f;
+/// Op `RESET_STATE` (no body), where the host offers
+/// [`RGFX_FEATURE_CB_PARTS`](crate::wire::RGFX_FEATURE_CB_PARTS): the open render encoder's state
+/// becomes a new encoder's for its pass, its bindings kept. No host offers the feature yet, and a
+/// host without it faults the buffer at the op, as at any tag it does not know.
+pub const RGFX_OP_RENDER_RESET_STATE: u16 = 0x1050;
 
 // The resource-kind tags are shared across the encoder groups (defined once in the parent
 // module) so the guest-facing ABI has a single numbering.
@@ -1663,6 +1668,7 @@ const _: () = {
             == super::RGFX_OP_GROUP_RENDER
     );
     assert!(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS == 0x104f);
+    assert!(super::op_group(RGFX_OP_RENDER_RESET_STATE) == super::RGFX_OP_GROUP_RENDER);
 };
 
 #[cfg(test)]

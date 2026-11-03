@@ -80,6 +80,19 @@
 // encoder has no other encoder.
 #define RGFX_OP_ENCODER_BEGIN_VIDEO 9
 
+// Op `QUEUE_BARRIER` ([`RgfxOpQueueBarrier`]), where the host offers
+// [`RGFX_FEATURE_QUEUE_BARRIER`](crate::wire::RGFX_FEATURE_QUEUE_BARRIER):
+// `barrierAfterQueueStages:beforeStages:` on the open render, compute or blit encoder, at the
+// point the op stands. No host offers the feature yet, and a host without it faults the buffer at
+// the op, as at any tag it does not know.
+#define RGFX_OP_QUEUE_BARRIER 10
+
+// Op `SCHEDULED_WANTED` (no body), where the guest took
+// [`RGFX_FEATURE_QUIET_SCHEDULED`](crate::wire::RGFX_FEATURE_QUIET_SCHEDULED): on a quiet queue,
+// the command buffer's `CB_SCHEDULED` raises the ring's vector. Anywhere in the stream, once, as
+// [`RGFX_OP_SUBMITTED`]. No host offers the feature yet.
+#define RGFX_OP_SCHEDULED_WANTED 11
+
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
 
@@ -653,6 +666,12 @@
 // `setDepthStoreActionOptions:`.
 #define RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS 4175
 
+// Op `RESET_STATE` (no body), where the host offers
+// [`RGFX_FEATURE_CB_PARTS`](crate::wire::RGFX_FEATURE_CB_PARTS): the open render encoder's state
+// becomes a new encoder's for its pass, its bindings kept. No host offers the feature yet, and a
+// host without it faults the buffer at the op, as at any tag it does not know.
+#define RGFX_OP_RENDER_RESET_STATE 4176
+
 // Op `DECODE_H264` ([`RgfxVideoOpDecodeH264`], then its parameter sets): decode one H.264
 // access unit into an IOSurface of two planes, NV12's (`'420v'` or `'420f'`).
 //
@@ -705,8 +724,10 @@
 // `VERSION`, RO: [`RGFX_VERSION`].
 #define RGFX_REG_VERSION 4
 
-// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`],
-// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`].
+// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
+// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
+// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
+// [`RGFX_FEATURE_QUEUE_VECTORS`]). Bit 9 is reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -734,6 +755,37 @@
 // that call returns at the buffer's `CB_SCHEDULED`.
 #define RGFX_FEATURE_CB_SUBMITTED (1 << 2)
 
+// `FEATURES_LO` bit 3, `QUIET_SCHEDULED`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: on a queue created with [`RGFX_QUEUE_QUIET_SCHEDULED`], a
+// `CB_SCHEDULED` raises the ring's vector only where its buffer holds
+// [`RGFX_OP_SCHEDULED_WANTED`](crate::ops::RGFX_OP_SCHEDULED_WANTED) or the ring's `raise_all` is
+// nonzero. No host offers it yet.
+#define RGFX_FEATURE_QUIET_SCHEDULED (1 << 3)
+
+// `FEATURES_LO` bit 4, `CONSUMED_DOORBELL`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: a host that finds a completion ring full sets the ring's
+// `producer_waiting` and waits for a [`RGFX_REG_CONSUMED`] write of the ring's offset, on ring 0's
+// completion ring and on a queue's created with [`RGFX_QUEUE_CONSUMED_DOORBELL`]. No host offers
+// it yet.
+#define RGFX_FEATURE_CONSUMED_DOORBELL (1 << 4)
+
+// `FEATURES_LO` bit 5, `QUEUE_BARRIER`: the host decodes
+// [`RGFX_OP_QUEUE_BARRIER`](crate::ops::RGFX_OP_QUEUE_BARRIER). No host offers it yet.
+#define RGFX_FEATURE_QUEUE_BARRIER (1 << 5)
+
+// `FEATURES_LO` bit 6, `CB_PARTS`: a queue's ring carries [`RGFX_CMD_COMMAND_BUFFER_PART`], and
+// the host decodes [`RGFX_OP_RENDER_RESET_STATE`](crate::ops::render::RGFX_OP_RENDER_RESET_STATE).
+// No host offers it yet.
+#define RGFX_FEATURE_CB_PARTS (1 << 6)
+
+// `FEATURES_LO` bit 7, `PAGES_BUFFERS`: ring 0 carries [`RGFX_CMD_BUFFER_OVER_PAGES`], and a
+// `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_PRIVATE`]. No host offers it yet.
+#define RGFX_FEATURE_PAGES_BUFFERS (1 << 7)
+
+// `FEATURES_LO` bit 8, `QUEUE_VECTORS`: the device has an MSI-X vector for each context slot
+// after vector 0, and a queue's completion ring raises its context's. No host offers it yet.
+#define RGFX_FEATURE_QUEUE_VECTORS (1 << 8)
+
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 #define RGFX_REG_STATUS 16
@@ -746,6 +798,21 @@
 
 // `DOORBELL`, WO: writing a ring's id wakes its consumer.
 #define RGFX_REG_DOORBELL 32
+
+// `DRIVER_FEATURES_LO`, RW: the feature bits 0 to 31 the guest's driver uses. A write takes the
+// bits written that `FEATURES_LO` offers and the host knows, and a read answers the bits taken.
+// A write while `STATUS` reads [`RGFX_STATUS_DRIVER_READY`] is ignored, and a reset clears both
+// halves. Bits 0 to 2 need no write: the host acts on them as it offers them. A guest that never
+// writes it (the option ROM, a kext built before it) gets the wire it had before.
+#define RGFX_REG_DRIVER_FEATURES_LO 36
+
+// `DRIVER_FEATURES_HI`, RW: feature bits 32 to 63, as [`RGFX_REG_DRIVER_FEATURES_LO`].
+#define RGFX_REG_DRIVER_FEATURES_HI 40
+
+// `CONSUMED`, WO: writing a completion ring's region offset wakes that ring's producer waiting
+// for room ([`RGFX_FEATURE_CONSUMED_DOORBELL`]). The host does not handle it yet: it reads 0 and
+// ignores a write, as at any offset it does not know.
+#define RGFX_REG_CONSUMED 44
 
 // What `MAGIC` reads: "RGFX", little-endian.
 #define RGFX_MAGIC 1481000786
@@ -1065,6 +1132,12 @@
 // answered: where the host has no such session, the command buffers that name it fail.
 #define RGFX_CMD_VIDEO_SESSION_CREATE 541
 
+// Command `BUFFER_OVER_PAGES` ([`RgfxBufferOverPages`]), where the guest took
+// [`RGFX_FEATURE_PAGES_BUFFERS`]: a buffer over a range of a pages block of the sender's context,
+// the guest's own pages in place. No host offers the feature yet, and a host without it refuses
+// the message as one it does not know.
+#define RGFX_CMD_BUFFER_OVER_PAGES 542
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -1155,6 +1228,24 @@
 // completion names that seqno. The process keeps the block until the buffer completes.
 #define RGFX_CMD_COMMAND_BUFFER_IN_REGION 769
 
+// Command `COMMAND_BUFFER_PART` ([`RgfxCommandBufferPart`], a per-queue submission ring), where
+// the host offers [`RGFX_FEATURE_CB_PARTS`]: one part of a command buffer's ops, in a block of the
+// process's own; the part flagged [`RGFX_CB_PART_LAST`] commits the buffer, and its seqno is the
+// one the completion names. No host offers the feature yet, and a host without it refuses the
+// message as one the ring may not carry.
+#define RGFX_CMD_COMMAND_BUFFER_PART 770
+
+// [`RgfxCommandBufferPart::flags`]: the last part; the host commits the buffer after it.
+#define RGFX_CB_PART_LAST (1 << 0)
+
+// [`RgfxCommandBufferPart::flags`]: drop the buffer uncommitted, with no completion;
+// `region_offset` and `byte_length` are 0.
+#define RGFX_CB_PART_ABORT (1 << 1)
+
+// How many buffers a queue holds sent in part but not yet committed, under
+// [`RGFX_FEATURE_CB_PARTS`]: a part past it fails its buffer at its last part.
+#define RGFX_CB_PARTS_MAX_PARTIAL 64
+
 // Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
 // command buffer finished, with its status and GPU times.
 #define RGFX_EVT_CB_COMPLETE 1024
@@ -1217,6 +1308,21 @@
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
 
+// Where a `QUEUE_CREATE` message's [`RgfxQueueCreateFlags`] starts: right after its
+// [`RgfxQueueCreate`]. A message whose `size` is at least
+// `RGFX_QUEUE_CREATE_FLAGS_OFFSET + size_of::<RgfxQueueCreateFlags>()` carries it; one of
+// `RGFX_QUEUE_CREATE_FLAGS_OFFSET` none, and its queue has no flag. The kext sends it only with a
+// flag set, so a host older than it never sees one.
+#define RGFX_QUEUE_CREATE_FLAGS_OFFSET 56
+
+// [`RgfxQueueCreateFlags::flags`]: the queue's `CB_SCHEDULED` raises only where asked
+// ([`RGFX_FEATURE_QUIET_SCHEDULED`]).
+#define RGFX_QUEUE_QUIET_SCHEDULED (1 << 0)
+
+// [`RgfxQueueCreateFlags::flags`]: the host waits for room on the queue's completion ring until a
+// [`RGFX_REG_CONSUMED`] write ([`RGFX_FEATURE_CONSUMED_DOORBELL`]).
+#define RGFX_QUEUE_CONSUMED_DOORBELL (1 << 1)
+
 // [`RgfxBlockRelease::flags`]: the block's IOSurface has no client left, no process holding it,
 // so no reader of its pages: the host drops the block's device cache with it, rather than
 // copying what command buffers wrote of it into the pages first. Without it the host copies.
@@ -1234,6 +1340,11 @@
 // generation of the surface, and the kext asks a [`RGFX_CMD_SURFACE_DOWNLOAD`] before a CPU lock
 // that follows a GPU write. Without the feature the host gives the block none.
 #define RGFX_SURFACE_PAGES_CACHED (1 << 0)
+
+// [`RgfxSurfacePagesCache::flags`], where the guest took [`RGFX_FEATURE_PAGES_BUFFERS`]: the
+// block is a process's pages block, for its `BUFFER_OVER_PAGES` buffers, not an IOSurface's, and
+// its view stays out of the host's surface-view cache. No host offers the feature yet.
+#define RGFX_SURFACE_PAGES_PRIVATE (1 << 1)
 
 // The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
 // ([`RgfxManagedTextureCreate`]).
@@ -1338,6 +1449,13 @@
 
 // The slots of [`RgfxSurfaceWriters`].
 #define RGFX_SURFACE_WRITER_SLOTS 4
+
+// Where a `SAMPLER_CREATE` message's [`RgfxSamplerCreateExt`] starts: right after its
+// [`RgfxSamplerCreate`]. A message whose `size` is at least
+// `RGFX_SAMPLER_CREATE_EXT_OFFSET + size_of::<RgfxSamplerCreateExt>()` carries it; one of
+// `RGFX_SAMPLER_CREATE_EXT_OFFSET` none, and its sampler has Metal's defaults for both fields.
+// The host does not read it yet.
+#define RGFX_SAMPLER_CREATE_EXT_OFFSET 72
 
 // Where a `LIBRARY_CREATE` message's bytes start: right after its header.
 #define RGFX_LIBRARY_BYTES_OFFSET 72
@@ -2160,6 +2278,29 @@ typedef struct {
   uint32_t reserved_34;
 } RgfxBufferOverHostMemory;
 
+// `BUFFER_OVER_PAGES`: a buffer of `length` bytes at `offset` in the view of the pages block of
+// `block_size` bytes at `block_offset`, at GPU address `gpu_address`.
+typedef struct {
+  // [`RGFX_CMD_BUFFER_OVER_PAGES`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The buffer's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The pages block's region offset, a block of the sender's context.
+  uint64_t block_offset;
+  // The pages block's size in bytes.
+  uint64_t block_size;
+  // Where the buffer starts in the block's view, in bytes.
+  uint64_t offset;
+  // The buffer's length in bytes.
+  uint64_t length;
+  // `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_44;
+} RgfxBufferOverPages;
+
 // `BUFFER_OVER_SURFACE_PAGES`: a Shared buffer of `length` bytes over the IOSurface pages the
 // shared block of `block_size` bytes at `block_offset` names.
 typedef struct {
@@ -2295,6 +2436,26 @@ typedef struct {
   // The message's length: a multiple of 8.
   uint64_t byte_length;
 } RgfxCommandBufferInRegion;
+
+// `COMMAND_BUFFER_PART`: part `part` of command buffer `cb_obj_id`'s ops, the `byte_length` bytes
+// at region offset `region_offset`, in one block of the process's own. Its header's `seqno` is
+// the ring's; the completion names the last part's.
+typedef struct {
+  // [`RGFX_CMD_COMMAND_BUFFER_PART`].
+  RgfxMsgHeader header;
+  // The queue's id.
+  uint64_t queue_obj_id;
+  // The command buffer's guest-picked id.
+  uint64_t cb_obj_id;
+  // The part's number within its buffer, from 0.
+  uint32_t part;
+  // `RGFX_CB_PART_*`: [`RGFX_CB_PART_LAST`] and [`RGFX_CB_PART_ABORT`].
+  uint32_t flags;
+  // Where the part's ops start in the device's region: 8-aligned.
+  uint64_t region_offset;
+  // The part's length: a multiple of 8.
+  uint64_t byte_length;
+} RgfxCommandBufferPart;
 
 // `COMPLETE`: a command's answer.
 typedef struct {
@@ -2825,8 +2986,12 @@ typedef struct {
   // `FEATURES_LO`'s low byte as the device answers it (`RGFX_FEATURE_*`), for the processes,
   // which read no register; 0 from a host older than the field, which wrote it as zero.
   uint8_t features_lo;
+  // `samplerReductionModeSupport` as the host's platform answers it, from a host that reads
+  // the sampler's [`RgfxSamplerCreateExt`]; 0 from every other host, which wrote it as zero.
+  // No host writes it yet.
+  uint8_t sampler_reduction_support;
   // Zero.
-  uint8_t reserved_452[6];
+  uint8_t reserved_453[5];
   // The device `name`, UTF-8, `name_len` bytes used, the rest 0.
   uint8_t name[RGFX_DEVICE_NAME_LEN];
   // The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
@@ -3521,6 +3686,14 @@ typedef struct {
   uint64_t before;
 } RgfxOpMemoryBarrierWithScope;
 
+// The body of [`RGFX_OP_QUEUE_BARRIER`]: raw `MTLStages`.
+typedef struct {
+  // The stages of the work before the barrier that the work after it waits for.
+  uint64_t after_stages;
+  // The stages of the work after the barrier that wait.
+  uint64_t before_stages;
+} RgfxOpQueueBarrier;
+
 // `setAlphaTestReferenceValue:` (SPI). The value travels as its `f32` bits.
 typedef struct {
   // `referenceValue` as `f32` bits.
@@ -4166,6 +4339,17 @@ typedef struct {
   uint32_t vector;
 } RgfxQueueCreate;
 
+// The modes a `QUEUE_CREATE` asks for its queue, after the [`RgfxQueueCreate`] at
+// [`RGFX_QUEUE_CREATE_FLAGS_OFFSET`]. A flag whose feature the guest did not take
+// ([`RGFX_REG_DRIVER_FEATURES_LO`]), or one the host does not carry out, refuses the create with
+// [`RGFX_STATUS_INVALID_ARGUMENT`]; the host carries out none yet.
+typedef struct {
+  // `RGFX_QUEUE_*`: [`RGFX_QUEUE_QUIET_SCHEDULED`] and [`RGFX_QUEUE_CONSUMED_DOORBELL`].
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_04;
+} RgfxQueueCreateFlags;
+
 // One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 // nothing) when `texture_obj_id` is 0.
 typedef struct {
@@ -4416,8 +4600,11 @@ typedef struct {
   // kext reads it to let the CPU locks of IOSurfaces drawn in place go on
   // (docs/graphics-kext/design.md, "Surface locks").
   uint64_t completed_seqno;
+  // 1 while the host waits for room on a completion ring created to wake it
+  // ([`RGFX_FEATURE_CONSUMED_DOORBELL`]), written by the host; 0 on every other ring.
+  uint32_t producer_waiting;
   // The rest of `producer`'s line.
-  uint8_t reserved_10[48];
+  uint8_t reserved_14[44];
   // The consumer's free-running byte count, written by the consumer.
   uint64_t consumer;
   // The rest of `consumer`'s line.
@@ -4430,8 +4617,12 @@ typedef struct {
   // the host as it raises one; the host sets it again where the guest had taken every message
   // as the host cleared it.
   uint32_t armed;
+  // On a completion ring created with [`RGFX_QUEUE_QUIET_SCHEDULED`], how many guest threads
+  // wait for a quiet record, written by the guest: nonzero makes every record raise. The host
+  // reads it on no other ring.
+  uint32_t raise_all;
   // The rest of `armed`'s line.
-  uint8_t reserved_c4[60];
+  uint8_t reserved_c8[56];
 } RgfxRingHeader;
 
 // One element of a sampler-binding array ([`RgfxOpSetVertexSamplerStates`] and the
@@ -4476,6 +4667,15 @@ typedef struct {
   // argument buffer.
   uint32_t flags;
 } RgfxSamplerCreate;
+
+// The descriptor fields a `SAMPLER_CREATE` carries after the [`RgfxSamplerCreate`] at
+// [`RGFX_SAMPLER_CREATE_EXT_OFFSET`].
+typedef struct {
+  // `MTLSamplerReductionMode`.
+  uint32_t reduction_mode;
+  // `lodBias`, as `f32` bits.
+  uint32_t lod_bias_bits;
+} RgfxSamplerCreateExt;
 
 // One element of a sampler-with-LOD-clamps array
 // ([`RgfxOpSetVertexSamplerStatesLodClamps`] and the like): a sampler (0 = nil) and
@@ -4668,7 +4868,7 @@ typedef struct {
 // What a `SURFACE_PAGES` says of its block's device cache, after the [`RgfxSurfacePages`] at
 // [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
 typedef struct {
-  // `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`].
+  // `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`] and [`RGFX_SURFACE_PAGES_PRIVATE`].
   uint32_t flags;
   // Zero.
   uint32_t reserved_04;

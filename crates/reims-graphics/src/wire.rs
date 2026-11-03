@@ -52,8 +52,10 @@ pub const RGFX_MSIX_VECTORS: u32 = 1;
 pub const RGFX_REG_MAGIC: u32 = 0x000;
 /// `VERSION`, RO: [`RGFX_VERSION`].
 pub const RGFX_REG_VERSION: u32 = 0x004;
-/// `FEATURES_LO`, RO: feature bits 0 to 31: [`RGFX_FEATURE_SURFACE_PAGES`],
-/// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`].
+/// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
+/// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
+/// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
+/// [`RGFX_FEATURE_QUEUE_VECTORS`]). Bit 9 is reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -76,6 +78,31 @@ pub const RGFX_FEATURE_SURFACE_CACHE: u32 = 1 << 1;
 /// the guest's `commitAndWaitUntilSubmitted` returns. Without it the guest sends no such op, and
 /// that call returns at the buffer's `CB_SCHEDULED`.
 pub const RGFX_FEATURE_CB_SUBMITTED: u32 = 1 << 2;
+/// `FEATURES_LO` bit 3, `QUIET_SCHEDULED`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: on a queue created with [`RGFX_QUEUE_QUIET_SCHEDULED`], a
+/// `CB_SCHEDULED` raises the ring's vector only where its buffer holds
+/// [`RGFX_OP_SCHEDULED_WANTED`](crate::ops::RGFX_OP_SCHEDULED_WANTED) or the ring's `raise_all` is
+/// nonzero. No host offers it yet.
+pub const RGFX_FEATURE_QUIET_SCHEDULED: u32 = 1 << 3;
+/// `FEATURES_LO` bit 4, `CONSUMED_DOORBELL`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: a host that finds a completion ring full sets the ring's
+/// `producer_waiting` and waits for a [`RGFX_REG_CONSUMED`] write of the ring's offset, on ring 0's
+/// completion ring and on a queue's created with [`RGFX_QUEUE_CONSUMED_DOORBELL`]. No host offers
+/// it yet.
+pub const RGFX_FEATURE_CONSUMED_DOORBELL: u32 = 1 << 4;
+/// `FEATURES_LO` bit 5, `QUEUE_BARRIER`: the host decodes
+/// [`RGFX_OP_QUEUE_BARRIER`](crate::ops::RGFX_OP_QUEUE_BARRIER). No host offers it yet.
+pub const RGFX_FEATURE_QUEUE_BARRIER: u32 = 1 << 5;
+/// `FEATURES_LO` bit 6, `CB_PARTS`: a queue's ring carries [`RGFX_CMD_COMMAND_BUFFER_PART`], and
+/// the host decodes [`RGFX_OP_RENDER_RESET_STATE`](crate::ops::render::RGFX_OP_RENDER_RESET_STATE).
+/// No host offers it yet.
+pub const RGFX_FEATURE_CB_PARTS: u32 = 1 << 6;
+/// `FEATURES_LO` bit 7, `PAGES_BUFFERS`: ring 0 carries [`RGFX_CMD_BUFFER_OVER_PAGES`], and a
+/// `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_PRIVATE`]. No host offers it yet.
+pub const RGFX_FEATURE_PAGES_BUFFERS: u32 = 1 << 7;
+/// `FEATURES_LO` bit 8, `QUEUE_VECTORS`: the device has an MSI-X vector for each context slot
+/// after vector 0, and a queue's completion ring raises its context's. No host offers it yet.
+pub const RGFX_FEATURE_QUEUE_VECTORS: u32 = 1 << 8;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -85,6 +112,18 @@ pub const RGFX_REG_REGION_SIZE_LO: u32 = 0x014;
 pub const RGFX_REG_REGION_SIZE_HI: u32 = 0x018;
 /// `DOORBELL`, WO: writing a ring's id wakes its consumer.
 pub const RGFX_REG_DOORBELL: u32 = 0x020;
+/// `DRIVER_FEATURES_LO`, RW: the feature bits 0 to 31 the guest's driver uses. A write takes the
+/// bits written that `FEATURES_LO` offers and the host knows, and a read answers the bits taken.
+/// A write while `STATUS` reads [`RGFX_STATUS_DRIVER_READY`] is ignored, and a reset clears both
+/// halves. Bits 0 to 2 need no write: the host acts on them as it offers them. A guest that never
+/// writes it (the option ROM, a kext built before it) gets the wire it had before.
+pub const RGFX_REG_DRIVER_FEATURES_LO: u32 = 0x024;
+/// `DRIVER_FEATURES_HI`, RW: feature bits 32 to 63, as [`RGFX_REG_DRIVER_FEATURES_LO`].
+pub const RGFX_REG_DRIVER_FEATURES_HI: u32 = 0x028;
+/// `CONSUMED`, WO: writing a completion ring's region offset wakes that ring's producer waiting
+/// for room ([`RGFX_FEATURE_CONSUMED_DOORBELL`]). The host does not handle it yet: it reads 0 and
+/// ignores a write, as at any offset it does not know.
+pub const RGFX_REG_CONSUMED: u32 = 0x02c;
 /// What `MAGIC` reads: "RGFX", little-endian.
 pub const RGFX_MAGIC: u32 = 0x5846_4752;
 /// What `VERSION` reads: the wire's version, which every change a guest built before it would
@@ -188,8 +227,11 @@ pub struct RgfxRingHeader {
     /// kext reads it to let the CPU locks of IOSurfaces drawn in place go on
     /// (docs/graphics-kext/design.md, "Surface locks").
     pub completed_seqno: u64,
+    /// 1 while the host waits for room on a completion ring created to wake it
+    /// ([`RGFX_FEATURE_CONSUMED_DOORBELL`]), written by the host; 0 on every other ring.
+    pub producer_waiting: u32,
     /// The rest of `producer`'s line.
-    pub reserved_10: [u8; 48],
+    pub reserved_14: [u8; 44],
     /// The consumer's free-running byte count, written by the consumer.
     pub consumer: u64,
     /// The rest of `consumer`'s line.
@@ -202,8 +244,12 @@ pub struct RgfxRingHeader {
     /// the host as it raises one; the host sets it again where the guest had taken every message
     /// as the host cleared it.
     pub armed: u32,
+    /// On a completion ring created with [`RGFX_QUEUE_QUIET_SCHEDULED`], how many guest threads
+    /// wait for a quiet record, written by the guest: nonzero makes every record raise. The host
+    /// reads it on no other ring.
+    pub raise_all: u32,
     /// The rest of `armed`'s line.
-    pub reserved_c4: [u8; 60],
+    pub reserved_c8: [u8; 56],
 }
 
 /// A pad to the ring's end: its `size` covers the bytes left, 8 or more, and it has no `seqno`.
@@ -382,6 +428,11 @@ pub const RGFX_CMD_BUFFER_OVER_SURFACE_PAGES: u32 = 0x21c;
 /// drops it. What the host's hardware takes is in the video caps ([`RgfxVideoCaps`]). Not
 /// answered: where the host has no such session, the command buffers that name it fail.
 pub const RGFX_CMD_VIDEO_SESSION_CREATE: u32 = 0x21d;
+/// Command `BUFFER_OVER_PAGES` ([`RgfxBufferOverPages`]), where the guest took
+/// [`RGFX_FEATURE_PAGES_BUFFERS`]: a buffer over a range of a pages block of the sender's context,
+/// the guest's own pages in place. No host offers the feature yet, and a host without it refuses
+/// the message as one it does not know.
+pub const RGFX_CMD_BUFFER_OVER_PAGES: u32 = 0x21e;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -465,6 +516,21 @@ pub const RGFX_CMD_COMMAND_BUFFER: u32 = 0x300;
 /// the ring, with this reference's `seqno`, and carries it out as it does one from the ring; the
 /// completion names that seqno. The process keeps the block until the buffer completes.
 pub const RGFX_CMD_COMMAND_BUFFER_IN_REGION: u32 = 0x301;
+
+/// Command `COMMAND_BUFFER_PART` ([`RgfxCommandBufferPart`], a per-queue submission ring), where
+/// the host offers [`RGFX_FEATURE_CB_PARTS`]: one part of a command buffer's ops, in a block of the
+/// process's own; the part flagged [`RGFX_CB_PART_LAST`] commits the buffer, and its seqno is the
+/// one the completion names. No host offers the feature yet, and a host without it refuses the
+/// message as one the ring may not carry.
+pub const RGFX_CMD_COMMAND_BUFFER_PART: u32 = 0x302;
+/// [`RgfxCommandBufferPart::flags`]: the last part; the host commits the buffer after it.
+pub const RGFX_CB_PART_LAST: u32 = 1 << 0;
+/// [`RgfxCommandBufferPart::flags`]: drop the buffer uncommitted, with no completion;
+/// `region_offset` and `byte_length` are 0.
+pub const RGFX_CB_PART_ABORT: u32 = 1 << 1;
+/// How many buffers a queue holds sent in part but not yet committed, under
+/// [`RGFX_FEATURE_CB_PARTS`]: a part past it fails its buffer at its last part.
+pub const RGFX_CB_PARTS_MAX_PARTIAL: u32 = 64;
 
 /// Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
 /// command buffer finished, with its status and GPU times.
@@ -756,6 +822,8 @@ const _: () = {
     assert!(offset_of!(RgfxRingHeader, consumer) == 0x40);
     assert!(offset_of!(RgfxRingHeader, consumer_idle) == 0x80);
     assert!(offset_of!(RgfxRingHeader, armed) == 0xc0);
+    assert!(offset_of!(RgfxRingHeader, producer_waiting) == 0x10);
+    assert!(offset_of!(RgfxRingHeader, raise_all) == 0xc4);
     assert!(size_of::<RgfxMsgHeader>() == 16);
     assert!(size_of::<RgfxGetDisplays>() == 16);
     assert!(size_of::<RgfxSetScanout>() == 40);
@@ -789,6 +857,8 @@ const _: () = {
     assert!(size_of::<RgfxPresentSurface>() == RGFX_PRESENT_SURFACE_GEN_OFFSET as usize);
     assert!(size_of::<RgfxPresentSurfaceGen>() == 8);
     assert!(size_of::<RgfxBufferOverSurfacePages>() == 56);
+    assert!(size_of::<RgfxBufferOverPages>() == 72);
+    assert!(offset_of!(RgfxBufferOverPages, options) == 64);
     // Every chunk's ids lie below the limit (the last chunk's last id is CHUNKS * CHUNK), and
     // no whole chunk more fits there.
     assert!(RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK < RGFX_RESOURCE_ID_LIMIT);
@@ -891,6 +961,35 @@ pub struct RgfxQueueCreate {
     pub vector: u32,
 }
 
+/// Where a `QUEUE_CREATE` message's [`RgfxQueueCreateFlags`] starts: right after its
+/// [`RgfxQueueCreate`]. A message whose `size` is at least
+/// `RGFX_QUEUE_CREATE_FLAGS_OFFSET + size_of::<RgfxQueueCreateFlags>()` carries it; one of
+/// `RGFX_QUEUE_CREATE_FLAGS_OFFSET` none, and its queue has no flag. The kext sends it only with a
+/// flag set, so a host older than it never sees one.
+pub const RGFX_QUEUE_CREATE_FLAGS_OFFSET: u32 = 56;
+
+/// [`RgfxQueueCreateFlags::flags`]: the queue's `CB_SCHEDULED` raises only where asked
+/// ([`RGFX_FEATURE_QUIET_SCHEDULED`]).
+pub const RGFX_QUEUE_QUIET_SCHEDULED: u32 = 1 << 0;
+/// [`RgfxQueueCreateFlags::flags`]: the host waits for room on the queue's completion ring until a
+/// [`RGFX_REG_CONSUMED`] write ([`RGFX_FEATURE_CONSUMED_DOORBELL`]).
+pub const RGFX_QUEUE_CONSUMED_DOORBELL: u32 = 1 << 1;
+
+/// The modes a `QUEUE_CREATE` asks for its queue, after the [`RgfxQueueCreate`] at
+/// [`RGFX_QUEUE_CREATE_FLAGS_OFFSET`]. A flag whose feature the guest did not take
+/// ([`RGFX_REG_DRIVER_FEATURES_LO`]), or one the host does not carry out, refuses the create with
+/// [`RGFX_STATUS_INVALID_ARGUMENT`]; the host carries out none yet.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxQueueCreateFlags {
+    /// `RGFX_QUEUE_*`: [`RGFX_QUEUE_QUIET_SCHEDULED`] and [`RGFX_QUEUE_CONSUMED_DOORBELL`].
+    pub flags: u32,
+    /// Zero.
+    pub reserved_04: u32,
+}
+
 /// `CONTEXT_CLOSE`: context `context`'s process is gone.
 #[repr(C)]
 #[derive(
@@ -920,6 +1019,30 @@ pub struct RgfxCommandBufferInRegion {
     /// Where the message starts in the device's region: 8-aligned.
     pub region_offset: u64,
     /// The message's length: a multiple of 8.
+    pub byte_length: u64,
+}
+
+/// `COMMAND_BUFFER_PART`: part `part` of command buffer `cb_obj_id`'s ops, the `byte_length` bytes
+/// at region offset `region_offset`, in one block of the process's own. Its header's `seqno` is
+/// the ring's; the completion names the last part's.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxCommandBufferPart {
+    /// [`RGFX_CMD_COMMAND_BUFFER_PART`].
+    pub header: RgfxMsgHeader,
+    /// The queue's id.
+    pub queue_obj_id: u64,
+    /// The command buffer's guest-picked id.
+    pub cb_obj_id: u64,
+    /// The part's number within its buffer, from 0.
+    pub part: u32,
+    /// `RGFX_CB_PART_*`: [`RGFX_CB_PART_LAST`] and [`RGFX_CB_PART_ABORT`].
+    pub flags: u32,
+    /// Where the part's ops start in the device's region: 8-aligned.
+    pub region_offset: u64,
+    /// The part's length: a multiple of 8.
     pub byte_length: u64,
 }
 
@@ -1010,6 +1133,10 @@ pub const RGFX_SURFACE_PAGES_CACHE_OFFSET: u32 = 56;
 /// generation of the surface, and the kext asks a [`RGFX_CMD_SURFACE_DOWNLOAD`] before a CPU lock
 /// that follows a GPU write. Without the feature the host gives the block none.
 pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
+/// [`RgfxSurfacePagesCache::flags`], where the guest took [`RGFX_FEATURE_PAGES_BUFFERS`]: the
+/// block is a process's pages block, for its `BUFFER_OVER_PAGES` buffers, not an IOSurface's, and
+/// its view stays out of the host's surface-view cache. No host offers the feature yet.
+pub const RGFX_SURFACE_PAGES_PRIVATE: u32 = 1 << 1;
 
 /// What a `SURFACE_PAGES` says of its block's device cache, after the [`RgfxSurfacePages`] at
 /// [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
@@ -1018,7 +1145,7 @@ pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
 pub struct RgfxSurfacePagesCache {
-    /// `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`].
+    /// `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`] and [`RGFX_SURFACE_PAGES_PRIVATE`].
     pub flags: u32,
     /// Zero.
     pub reserved_04: u32,
@@ -1058,6 +1185,33 @@ pub struct RgfxBufferOverSurfacePages {
     pub options: u32,
     /// Pads to a multiple of 8; 0.
     pub reserved_34: u32,
+}
+
+/// `BUFFER_OVER_PAGES`: a buffer of `length` bytes at `offset` in the view of the pages block of
+/// `block_size` bytes at `block_offset`, at GPU address `gpu_address`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxBufferOverPages {
+    /// [`RGFX_CMD_BUFFER_OVER_PAGES`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The buffer's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The pages block's region offset, a block of the sender's context.
+    pub block_offset: u64,
+    /// The pages block's size in bytes.
+    pub block_size: u64,
+    /// Where the buffer starts in the block's view, in bytes.
+    pub offset: u64,
+    /// The buffer's length in bytes.
+    pub length: u64,
+    /// `MTLResourceOptions`: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_44: u32,
 }
 
 /// `BLOCK_GRANT`: the kext gave context `context` the region block of `size` bytes at `offset`.
@@ -1923,6 +2077,26 @@ pub struct RgfxSamplerCreate {
     pub flags: u32,
 }
 
+/// Where a `SAMPLER_CREATE` message's [`RgfxSamplerCreateExt`] starts: right after its
+/// [`RgfxSamplerCreate`]. A message whose `size` is at least
+/// `RGFX_SAMPLER_CREATE_EXT_OFFSET + size_of::<RgfxSamplerCreateExt>()` carries it; one of
+/// `RGFX_SAMPLER_CREATE_EXT_OFFSET` none, and its sampler has Metal's defaults for both fields.
+/// The host does not read it yet.
+pub const RGFX_SAMPLER_CREATE_EXT_OFFSET: u32 = 72;
+
+/// The descriptor fields a `SAMPLER_CREATE` carries after the [`RgfxSamplerCreate`] at
+/// [`RGFX_SAMPLER_CREATE_EXT_OFFSET`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSamplerCreateExt {
+    /// `MTLSamplerReductionMode`.
+    pub reduction_mode: u32,
+    /// `lodBias`, as `f32` bits.
+    pub lod_bias_bits: u32,
+}
+
 /// One face's stencil state, as `MTLStencilDescriptor` gives it.
 #[repr(C)]
 #[derive(
@@ -2200,8 +2374,12 @@ pub struct RgfxDeviceInfo {
     /// `FEATURES_LO`'s low byte as the device answers it (`RGFX_FEATURE_*`), for the processes,
     /// which read no register; 0 from a host older than the field, which wrote it as zero.
     pub features_lo: u8,
+    /// `samplerReductionModeSupport` as the host's platform answers it, from a host that reads
+    /// the sampler's [`RgfxSamplerCreateExt`]; 0 from every other host, which wrote it as zero.
+    /// No host writes it yet.
+    pub sampler_reduction_support: u8,
     /// Zero.
-    pub reserved_452: [u8; 6],
+    pub reserved_453: [u8; 5],
     /// The device `name`, UTF-8, `name_len` bytes used, the rest 0.
     pub name: [u8; RGFX_DEVICE_NAME_LEN],
     /// The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
@@ -2689,6 +2867,10 @@ const _: () = {
     assert!(size_of::<RgfxSharedEventCreate>() == 32);
     assert!(size_of::<RgfxSharedEventSetValue>() == 32);
     assert!(size_of::<RgfxQueueCreate>() == 56);
+    assert!(RGFX_QUEUE_CREATE_FLAGS_OFFSET as usize == size_of::<RgfxQueueCreate>());
+    assert!(size_of::<RgfxQueueCreateFlags>() == 8);
+    assert!(size_of::<RgfxCommandBufferPart>() == 56);
+    assert!(core::mem::offset_of!(RgfxCommandBufferPart, region_offset) == 40);
     assert!(size_of::<RgfxHeapCreate>() == 48);
     assert!(size_of::<RgfxHeapOverHostMemory>() == 56);
     assert!(size_of::<RgfxBufferCreate>() == 48);
@@ -2709,6 +2891,8 @@ const _: () = {
     assert!(core::mem::offset_of!(RgfxSurfaceFacts, ycbcr_matrix) == 0x20);
     assert!(size_of::<RgfxSurfaceWriters>() == 64);
     assert!(size_of::<RgfxSamplerCreate>() == 72);
+    assert!(RGFX_SAMPLER_CREATE_EXT_OFFSET as usize == size_of::<RgfxSamplerCreate>());
+    assert!(size_of::<RgfxSamplerCreateExt>() == 8);
     assert!(size_of::<RgfxStencilDescriptor>() == 24);
     assert!(size_of::<RgfxDepthStencilCreate>() == 80);
     assert!(size_of::<RgfxLibraryCreate>() == 72);
@@ -2727,6 +2911,8 @@ const _: () = {
     assert!(core::mem::offset_of!(RgfxDeviceInfo, formats) == 1432);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, family_answers) == 976);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, name) == 1112);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, features_lo) == 0x451);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, sampler_reduction_support) == 0x452);
     // The device-info blob sits past the completion ring and before the allocations.
     assert!(
         RGFX_DEVICE_INFO_OFFSET
@@ -2764,6 +2950,10 @@ const _: () = {
     assert!(RGFX_CMD_COMMAND_BUFFER > RGFX_CMD_FENCE_CREATE);
     assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
     assert!(RGFX_CMD_COMMAND_BUFFER_IN_REGION > RGFX_CMD_COMMAND_BUFFER);
+    assert!(RGFX_CMD_COMMAND_BUFFER_PART > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+    assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_PART);
+    assert!(RGFX_CMD_BUFFER_OVER_PAGES > RGFX_CMD_VIDEO_SESSION_CREATE);
+    assert!(RGFX_CMD_BUFFER_OVER_PAGES < RGFX_CMD_CONTEXT_CLOSE);
 };
 
 #[cfg(test)]

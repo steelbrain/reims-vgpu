@@ -105,6 +105,17 @@ pub const RGFX_OP_SUBMITTED: u16 = 0x0008;
 /// names, for the [`video`] ops, until [`RGFX_OP_ENCODER_END`]. A command buffer with a video
 /// encoder has no other encoder.
 pub const RGFX_OP_ENCODER_BEGIN_VIDEO: u16 = 0x0009;
+/// Op `QUEUE_BARRIER` ([`RgfxOpQueueBarrier`]), where the host offers
+/// [`RGFX_FEATURE_QUEUE_BARRIER`](crate::wire::RGFX_FEATURE_QUEUE_BARRIER):
+/// `barrierAfterQueueStages:beforeStages:` on the open render, compute or blit encoder, at the
+/// point the op stands. No host offers the feature yet, and a host without it faults the buffer at
+/// the op, as at any tag it does not know.
+pub const RGFX_OP_QUEUE_BARRIER: u16 = 0x000a;
+/// Op `SCHEDULED_WANTED` (no body), where the guest took
+/// [`RGFX_FEATURE_QUIET_SCHEDULED`](crate::wire::RGFX_FEATURE_QUIET_SCHEDULED): on a quiet queue,
+/// the command buffer's `CB_SCHEDULED` raises the ring's vector. Anywhere in the stream, once, as
+/// [`RGFX_OP_SUBMITTED`]. No host offers the feature yet.
+pub const RGFX_OP_SCHEDULED_WANTED: u16 = 0x000b;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
@@ -134,6 +145,18 @@ pub struct RgfxOpVideoPass {
     /// The video session
     /// ([`RGFX_CMD_VIDEO_SESSION_CREATE`](crate::wire::RGFX_CMD_VIDEO_SESSION_CREATE)'s object).
     pub session_obj_id: u64,
+}
+
+/// The body of [`RGFX_OP_QUEUE_BARRIER`]: raw `MTLStages`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpQueueBarrier {
+    /// The stages of the work before the barrier that the work after it waits for.
+    pub after_stages: u64,
+    /// The stages of the work after the barrier that wait.
+    pub before_stages: u64,
 }
 
 /// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
@@ -412,6 +435,9 @@ const _: () = {
     assert!(size_of::<RgfxOpEvent>() == 16);
     assert!(size_of::<RgfxOpSurfaceUse>() == 24);
     assert!(size_of::<RgfxOpVideoPass>() == 8);
+    assert!(size_of::<RgfxOpHeader>() + size_of::<RgfxOpQueueBarrier>() == 24);
+    assert!(op_group(RGFX_OP_QUEUE_BARRIER) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(RGFX_OP_SCHEDULED_WANTED) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_VIDEO) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);
     // Each group's tag range maps to its own `op_group`.
