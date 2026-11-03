@@ -1526,9 +1526,16 @@ from its queue's pool, and the ring carries a `COMMAND_BUFFER_IN_REGION`
 
 The queue's service thread copies the message out of the block once, as it
 does a ring's, with the reference's seqno, and the bundle gives the block back
-when the buffer completes. Encoders do not stream as they end yet (Decided 3):
-that needs a command buffer in several messages, which the wire does not
-have. The whole buffer goes at its commit. Metal sets no maximum size, so
+to the queue's pool when the buffer completes. The pool keeps every block given
+back and reuses the smallest that holds the next message, so of each size a
+queue makes blocks only up to the most of its buffers in flight at once, and a
+stream of large buffers asks the kext for none past them, where handing a block
+back at each completion beyond a few kept cost a later buffer a block
+allocation, a mapping into the process and a grant and release on the control
+ring. Measured on an RTX 5080 host, an out-of-line buffer costs what an inline
+one does, about 2.1 to 2.5 us a dispatch, up to 2000 in flight either way.
+Encoders do not stream as they end yet (Decided 3): that needs a command buffer
+in several messages, which the wire does not have. The whole buffer goes at its commit. Metal sets no maximum size, so
 nothing is refused for size. A queue holds `maxCommandBufferCount` buffers
 (64 by default) alive and not completed. `-commandBuffer` blocks past that, as
 Metal's does, which keeps the ring from filling in the common case. A commit

@@ -5413,6 +5413,44 @@ struct BlockLog {
 	}
 };
 
+// A queue's pool of blocks for out-of-line command buffers keeps every block given back: a
+// second stream as deep as the first makes none and gives none back to the region, a take reuses
+// the smallest free block that holds its message, and the pool gives back all it holds as it goes.
+void test_body_pool_keeps_every_block()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x4000000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	constexpr size_t kDeep = 40; // far past the few a pool once kept
+	{
+		RgfxBodyPool pool(&region);
+		for (int pass = 0; pass < 2; pass++) {
+			std::vector<RgfxBodyBlock> out(kDeep);
+			for (RgfxBodyBlock &b : out)
+				CHECK(pool.take(RgfxBodyPool::kGranule, &b) && b.size == RgfxBodyPool::kGranule);
+			for (const RgfxBodyBlock &b : out)
+				pool.giveBack(b);
+			CHECK(pool.made() == kDeep);
+			CHECK(blocks.allocated.size() == kDeep && blocks.released.empty());
+		}
+		// A larger block, then a take of the granule: the smallest that holds it is reused.
+		RgfxBodyBlock big = {};
+		CHECK(pool.take(2 * RgfxBodyPool::kGranule, &big) && big.size == 2 * RgfxBodyPool::kGranule);
+		CHECK(pool.made() == kDeep + 1);
+		pool.giveBack(big);
+		RgfxBodyBlock small = {};
+		CHECK(pool.take(RgfxBodyPool::kGranule, &small) && small.size == RgfxBodyPool::kGranule);
+		pool.giveBack(small);
+		// With only the large one free of its size, a large take finds it.
+		RgfxBodyBlock again = {};
+		CHECK(pool.take(2 * RgfxBodyPool::kGranule, &again) && again.offset == big.offset);
+		pool.giveBack(again);
+		CHECK(pool.made() == kDeep + 1 && blocks.released.empty());
+	}
+	CHECK(blocks.released.size() == kDeep + 1);
+}
+
 void test_command_buffer_out_of_line()
 {
 	// Outside the pool: the queue's pool of blocks goes back into the region as the queue goes,
@@ -10134,6 +10172,7 @@ int main(int argc, char **argv)
 		test_completion_thread_stops();
 		test_uncompleted_buffer_releases();
 		test_command_buffer_out_of_line();
+		test_body_pool_keeps_every_block();
 		test_completion_expected_before_publish();
 		test_command_buffer_back_pressure();
 		test_texture_destroy_waits_for_buffers();

@@ -112,12 +112,16 @@ bool RgfxBodyPool::take(uint64_t size, RgfxBodyBlock *block)
 	}
 	{
 		std::lock_guard<std::mutex> hold(m_lock);
+		size_t best = m_free.size();
 		for (size_t i = 0; i < m_free.size(); i++) {
-			if (m_free[i].size == bytes) {
-				*block = m_free[i];
-				m_free.erase(m_free.begin() + static_cast<std::ptrdiff_t>(i));
-				return true;
-			}
+			const bool fits = m_free[i].size >= bytes;
+			if (fits && (best == m_free.size() || m_free[i].size < m_free[best].size))
+				best = i;
+		}
+		if (best != m_free.size()) {
+			*block = m_free[best];
+			m_free.erase(m_free.begin() + static_cast<std::ptrdiff_t>(best));
+			return true;
 		}
 	}
 	if (m_region == nullptr) {
@@ -139,16 +143,8 @@ void RgfxBodyPool::giveBack(const RgfxBodyBlock &block)
 {
 	if (block.ptr == nullptr)
 		return; // none was had: a buffer whose message found no block
-	{
-		std::lock_guard<std::mutex> hold(m_lock);
-		if (m_free.size() < kKeep) {
-			m_free.push_back(block);
-			return;
-		}
-	}
-	if (m_region != nullptr) {
-		m_region->release(block.offset);
-	}
+	std::lock_guard<std::mutex> hold(m_lock);
+	m_free.push_back(block);
 }
 
 uint64_t RgfxBodyPool::made() const
