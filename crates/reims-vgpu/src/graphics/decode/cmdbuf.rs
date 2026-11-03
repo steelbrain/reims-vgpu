@@ -1004,6 +1004,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(cb) = queue.command_buffer(ON)? else {
             return Ok(Err(DecodeError::Refused));
         };
+        super::work::command_buffer(self.context);
         let in_flight = InFlight::new(&counts.in_flight);
         let take = take(ops);
         // Each block it uses as its `SURFACE_PAGES` left it ([`super::surface_pages`]).
@@ -1596,6 +1597,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let enc = cb
                     .render_encoder(ON, &pass)?
                     .ok_or_else(|| op_fault("the render encoder was nil"))?;
+                super::work::render_encoder(self.context);
                 *encoder = Some(OpenEncoder::Render(enc, facts));
             }
             RGFX_OP_ENCODER_BEGIN_COMPUTE => {

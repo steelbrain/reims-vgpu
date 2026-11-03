@@ -162,6 +162,7 @@ mod tables;
 mod video;
 mod view;
 mod waits;
+mod work;
 pub(crate) mod worker;
 
 pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
@@ -625,8 +626,10 @@ impl<P: Platform> Recent<P> {
 pub(crate) type WalkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl<P: Platform> GraphicsDecoder<P> {
-    /// A new decoder for `platform` over its `region`, with no objects.
+    /// A new decoder for `platform` over its `region`, with no objects. The first one made turns
+    /// on the contexts' counts where their log target is on ([`work`]).
     pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
+        work::start(&platform);
         let shared = Arc::new(Shared {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
