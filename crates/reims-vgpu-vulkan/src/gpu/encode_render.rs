@@ -1883,6 +1883,11 @@ fn range_of(sel: &'static str, r: NsRange) -> Range<u64> {
     r.location..end
 }
 
+/// The selectors of the commands [`VulkanRenderEncoder::encode`] takes by paths of their own,
+/// as [`RenderCmd::selector`] names them.
+const SET_VERTEX_BUFFER: &str = "setVertexBuffer:offset:atIndex:";
+const DRAW_PRIMITIVES: &str = "drawPrimitives:vertexStart:vertexCount:";
+
 /// A command on the open runtime encoder.
 type Call<'c> = &'c mut dyn FnMut(&mut rt::RenderCommandEncoder) -> Result<(), rt::Error>;
 
@@ -2065,6 +2070,24 @@ impl VulkanRenderEncoder {
             }
             None => self.encoder.nothing(sel),
         }
+    }
+
+    /// `setVertexBuffer:offset:atIndex:`, as [`Self::encode`] runs a bind: what the draws may
+    /// reach through the buffer first ([`Self::bound`]), then the command.
+    fn vertex_buffer(
+        &self,
+        buffer: Option<&VulkanBuffer>,
+        offset: u64,
+        index: u64,
+    ) -> RaiseResult<()> {
+        let sel = SET_VERTEX_BUFFER;
+        if self.encoder.has_command_buffer() {
+            self.bound(Bind::Buffer(VERTEX, index, buffer));
+        }
+        let index = small(sel, index);
+        self.run(sel, &mut |e| {
+            e.set_vertex_buffer(buffer.map(|b| &b.raw), offset, index)
+        })
     }
 
     /// What a draw reads of the encoder's state ([`Held`]).
@@ -2364,6 +2387,24 @@ fn marked_by(sel: &'static str, m: Marks) {
 impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
     #[expect(clippy::too_many_lines, reason = "one arm per command")]
     fn encode(&self, _on: OnFault, cmd: RenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
+        // The two commands of nearly every draw take paths of their own, which run what the
+        // arms below run for them, in their order, without the dispatch on every command first.
+        match cmd {
+            RenderCmd::SetVertexBuffer {
+                buffer,
+                offset,
+                index,
+            } => return self.vertex_buffer(buffer, offset, index),
+            RenderCmd::DrawPrimitives {
+                primitive_type,
+                vertex_start,
+                vertex_count,
+            } => {
+                let sel = DRAW_PRIMITIVES;
+                return self.primitives(sel, primitive_type, (vertex_start, vertex_count, 1, 0));
+            }
+            _ => {}
+        }
         let sel = cmd.selector();
         let encoded = |call: Call<'_>| self.run(sel, call);
         if let Some(bind) = binds(&cmd)
@@ -2578,11 +2619,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 }
                 self.draw(sel, (Some((Shape::Primitives(t), t)), false), call)
             }
-            RenderCmd::DrawPrimitives {
-                primitive_type,
-                vertex_start,
-                vertex_count,
-            } => self.primitives(sel, primitive_type, (vertex_start, vertex_count, 1, 0)),
+            RenderCmd::SetVertexBuffer { .. } | RenderCmd::DrawPrimitives { .. } => {
+                unreachable!("{sel} takes its own path above")
+            }
             RenderCmd::DrawPrimitivesInstances {
                 primitive_type,
                 vertex_start,
@@ -3104,16 +3143,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 });
                 self.encoder.nothing(sel)
             }
-            RenderCmd::SetVertexBuffer {
-                buffer,
-                offset,
-                index,
-            } => {
-                let index = small(sel, index);
-                self.run(sel, &mut |e| {
-                    e.set_vertex_buffer(buffer.map(|b| &b.raw), offset, index)
-                })
-            }
             RenderCmd::SetVertexBufferOffset { offset, index } => {
                 let index = small(sel, index);
                 encoded(&mut |e| e.set_vertex_buffer_offset(offset, index))
@@ -3593,6 +3622,24 @@ impl VulkanRenderEncoder {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The commands `encode` takes by paths of their own die at the selectors the rest name.
+    #[test]
+    fn the_own_paths_selectors_are_the_commands() {
+        use super::{DRAW_PRIMITIVES, SET_VERTEX_BUFFER};
+        let set = RenderCmd::<crate::platform::VulkanPlatform>::SetVertexBuffer {
+            buffer: None,
+            offset: 0,
+            index: 0,
+        };
+        assert_eq!(set.selector(), SET_VERTEX_BUFFER);
+        let draw = RenderCmd::<crate::platform::VulkanPlatform>::DrawPrimitives {
+            primitive_type: 0,
+            vertex_start: 0,
+            vertex_count: 0,
+        };
+        assert_eq!(draw.selector(), DRAW_PRIMITIVES);
+    }
+
     use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
     use reims_vgpu_core::platform::blit::ResourceRef;
     use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
