@@ -1891,10 +1891,13 @@ commit. Each outcome the new design allows is one of those two:
   before the queue's thread wakes to take it (`reims_graphics`'s
   `Device::mmio_write_taking`), where the buffer would get it at its take and
   nothing need be waited for or allocated: the vCPU copies the message onto its
-  stack, reads its ops where they lie, and tries every lock it takes. A buffer
-  that uses a device cache, waits for an event or another queue's buffer, sits
-  behind a held buffer, or finds a lock busy is left to the queue's thread, as
-  before. The answer takes the buffer's turn in its queue's lane and its ticket
+  stack, reads its ops where they lie, and tries every lock it takes. It reads
+  the ops only where the stream's last op is the buffer's `SUBMITTED`, where the
+  bundle appends it at the commit, so a buffer that does not ask costs the vCPU
+  no scan of its ops. A buffer that does not ask, or whose ask is not its last
+  op, or that uses a device cache, waits for an event or another queue's
+  buffer, sits behind a held buffer, or finds a lock busy is left to the
+  queue's thread, as before. The answer takes the buffer's turn in its queue's lane and its ticket
   in the commit order together, with its mark (every ticket issued before its
   own), keeps them on the queue (`cmdbuf`'s `Answered`), and posts the record.
   The queue's thread then takes the buffer without waiting for ring 0 again

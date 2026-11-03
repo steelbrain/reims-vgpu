@@ -391,6 +391,18 @@ struct Take {
     video: bool,
 }
 
+/// Whether the op stream `ops` ends in a `SUBMITTED`, where the bundle puts it: appended as the
+/// buffer is committed, after every op it encodes (its `SURFACE_USE` and `SURFACE_ORDER` ops go
+/// before its first). Only its last 8 bytes are read, so true also where another op's body ends
+/// in such bytes, which the scan of the ops then tells apart; a buffer that asks with its
+/// `SUBMITTED` elsewhere is answered at its take.
+fn ends_in_ask(ops: &[u8]) -> bool {
+    let header = size_of::<RgfxOpHeader>();
+    (ops.len().checked_sub(header))
+        .and_then(|at| read::<RgfxOpHeader>(&ops[at..]))
+        .is_some_and(|h| h.tag == RGFX_OP_SUBMITTED && h.len == RGFX_OP_BODY_OFFSET)
+}
+
 /// What the host takes of the op stream `ops` ([`Take`]). The scan stops at an op it cannot step
 /// past, as the walk does.
 fn take(mut ops: &[u8]) -> Take {
@@ -522,7 +534,8 @@ impl<P: Platform> Decoders<P> {
     /// `CB_SUBMITTED` on a doorbell's thread, before its queue's service thread takes it (the
     /// module doc), where it gets that at its take ([`Begun::submitted_at_take`]) with nothing
     /// waited for or allocated on the way: its context's work is not refused, it names a command
-    /// queue of its context, it asks for its `CB_SUBMITTED` and waits for no event, it uses no
+    /// queue of its context, it asks for its `CB_SUBMITTED`, its last op, and waits for no event,
+    /// it uses no
     /// device cache ([`super::surface_cache`]) and waits for no buffer of another queue
     /// ([`super::surface_order`]), no buffer before it holds its queue, its queue holds fewer than
     /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed and no answered buffer not yet
@@ -543,6 +556,11 @@ impl<P: Platform> Decoders<P> {
         let Some(ops) = ops_of(message, &m) else {
             return false;
         };
+        // A stream that does not end in its ask is left to the take unread, so a buffer that
+        // does not ask costs the doorbell no scan of its ops ([`ends_in_ask`]).
+        if !ends_in_ask(ops) {
+            return false;
+        }
         let glance = Glance::of(ops);
         if !glance.asks
             || glance.waits
@@ -2832,7 +2850,8 @@ mod tests {
     }
 
     /// A buffer is answered on a doorbell's thread only where it gets its `CB_SUBMITTED` at its
-    /// take and need wait for nothing: not without the ask, not where it waits for an event or a
+    /// take and need wait for nothing: not without the ask, not where the ask is not its last op,
+    /// not where it waits for an event or a
     /// buffer before it holds its queue, not on a queue its context does not hold, not while its
     /// queue holds [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed or an answered
     /// buffer not yet begun, and not once its context failed. Where it is, its `CB_SUBMITTED` is
@@ -2860,6 +2879,25 @@ mod tests {
         );
         let plain = command_buffer_message(171, 101, &render_ops());
         assert!(!answered(&dec, &plain), "no ask");
+        // An ask that is not the stream's last op is left to the take, unread; a last op whose
+        // body ends in an ask's bytes is read, and tells it apart.
+        let mut first = op(RGFX_OP_SUBMITTED, &[]);
+        first.extend(render_ops());
+        let first = command_buffer_message(178, 108, &first);
+        assert!(!answered(&dec, &first), "its ask is not its last op");
+        let lookalike = RgfxOpHeader {
+            tag: RGFX_OP_SUBMITTED,
+            flags: 0,
+            len: RGFX_OP_BODY_OFFSET,
+        };
+        let mut lookalike_ops = render_ops();
+        lookalike_ops.extend(op(0x0fff, lookalike.as_bytes()));
+        let lookalike = command_buffer_message(179, 109, &lookalike_ops);
+        assert!(ends_in_ask(&lookalike_ops), "the bytes read as an ask");
+        assert!(
+            !answered(&dec, &lookalike),
+            "an op's body that ends in an ask's bytes"
+        );
         let mut waits = event_op(RGFX_OP_WAIT_EVENT, 7, 1);
         waits.extend(op(RGFX_OP_SUBMITTED, &[]));
         let waits = command_buffer_message(172, 102, &waits);
