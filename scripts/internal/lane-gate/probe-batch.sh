@@ -154,6 +154,7 @@ RD=$MSI_GATE/probes/$ROUND
 msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]}; do mv \"\$p\" '$RD/probes/'; done"
 put "$L/msi-probes.sh" "$RD/bin/"
 put "$L/msi-xid.sh" "$RD/bin/"
+put "$L/msi-capture.py" "$RD/bin/"
 if ((dry)); then
   msi "PROBES='$RD/probes' PROBE_RESULTS='$RES' PROBE_TIP='$PUB' DEADLINE=$(( $(date +%s) + HOLD_S )) FAKE_GUEST='$D/guest' \
     R='$RD' bash '$RD/bin/msi-probes.sh'"

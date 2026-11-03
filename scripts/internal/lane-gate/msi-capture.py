@@ -10,7 +10,10 @@ this boot's QEMU (a qemu.pid newer than RUNDIR/.start), runs until RUNDIR/captur
 CAPTURE_MAX_S seconds (default 600) after QEMU's start, and writes into RUNDIR/capture/:
 
   scanout   the guest's scanout buffer before WindowServer's IOSurfaces take the display: read
-            from QEMU's memory every CAPTURE_MS milliseconds (default 100), at offset 0 of the
+            from QEMU's memory every CAPTURE_MS milliseconds (default 100) until the host's first
+            present of an IOSurface (launch.log's first "PRESENT_SURFACE of transaction" or "the
+            display shows IOSurface" line), after which the display's content lives in the host's
+            device caches and the scanout's pages are no longer drawn, at offset 0 of the
             reims-graphics-pci allocations RAM block (its host address from HMP's `info ramblock`,
             over QMP), through /proc/PID/mem, which needs root (Yama's ptrace scope). The kext
             sets its scanout there (ReimsGraphics::setScanout, RGFX_ALLOCATIONS_OFFSET), rows of
@@ -152,8 +155,23 @@ def scanout(pid, t_end):
     mem = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
     prev, n, distinct = None, 0, 0
     nxt = time.time()
+    # The host's log, read as it grows, for the first present (the reads end there).
+    lp, seen, presented = os.path.join(B, "launch.log"), 0, None
     try:
         while time.time() < t_end and not os.path.exists(STOP):
+            try:
+                with open(lp, "rb") as f:
+                    f.seek(seen)
+                    new = f.read()
+                cut = new.rfind(b"\n") + 1
+                m = re.search(rb"^(\S+) .*(?:PRESENT_SURFACE of transaction|the display shows IOSurface)", new[:cut], re.M)
+                seen += cut
+                if m:
+                    presented = m.group(1).decode(errors="replace")
+                    log(f"the host's first present at {presented}: the scanout's reads end")
+                    break
+            except OSError:
+                pass
             t = time.time()
             try:
                 buf = os.pread(mem, length, hva + off)
@@ -183,7 +201,8 @@ def scanout(pid, t_end):
         os.close(mem)
         idx.close()
         give_back(made)
-    return f"frames={n} distinct={distinct} block={name} stride={stride} rows={first}-{first + rows - 1}"
+    return (f"frames={n} distinct={distinct} block={name} stride={stride} rows={first}-{first + rows - 1} "
+            f"until_first_present={presented or 'none'}")
 
 
 def shots(pid, t_end):

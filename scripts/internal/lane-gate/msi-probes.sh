@@ -101,7 +101,8 @@ rm -f "$shotsh"
 # then the guest's newest Desktop screenshot moved to out/shot-LABEL.png.
 shots() {
   local name=$1 l f
-  for l in $(G "cd ~/probes/$name/out 2> /dev/null && ls shot-request.* 2> /dev/null" | sed 's/^shot-request\.//'); do
+  # (no glob in the guest's command: its shell, zsh, fails one that matches nothing)
+  for l in $(G "ls ~/probes/$name/out 2> /dev/null" | sed -n 's/^shot-request\.//p'); do
     G "rm -f ~/probes/$name/out/shot-request.$l; touch ~/probes/.before-shot"
     if [[ -n ${FAKE_GUEST:-} ]]; then
       echo fake > "$FAKE_GUEST/probes/$name/out/shot-$l.png"

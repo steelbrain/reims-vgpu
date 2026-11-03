@@ -215,9 +215,11 @@ sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", a - b }'; }
 stamp() { date -d "$1" +%s.%N 2> /dev/null | cut -c1-14; }
 touch "$R/.start"
 # The boot capture (CAPTURE=1, msi-capture.py): the guest's scanout read from QEMU's memory every
-# CAPTURE_MS (default 100) ms from QEMU's start, and the guest's screenshots once a second from the
-# host's first present, until CAPTURE_SETTLE_S (default 60) seconds after the desktop is up, where
-# the Dock has settled (below). The scanout's reader runs as root, for /proc/PID/mem.
+# CAPTURE_MS (default 100) ms from QEMU's start to the host's first present of an IOSurface (from
+# there the display's content is in the host's device caches, and the scanout is not drawn), and
+# the guest's screenshots once a second from that present until CAPTURE_SETTLE_S (default 60)
+# seconds after the desktop is up, where the Dock has settled (below). The scanout's reader runs as
+# root, for /proc/PID/mem.
 CAPPIDS=()
 if [[ ${CAPTURE:-0} == 1 ]]; then
   rm -rf "$R/capture" && mkdir -p "$R/capture"
@@ -403,6 +405,7 @@ SHOTS
   {
     echo "dir $R/capture"
     echo "scanout $(cat "$R/capture/scanout.done" 2> /dev/null)"
+    echo "the scanout's frames are the screen only up to WindowServer's first present (until_first_present); later the display shows IOSurfaces, which the guest's screenshots (shots/) show"
     echo "shots $(cat "$R/capture/shots.done" 2> /dev/null) files=$(grep -c . "$R/capture/shots-files.tsv")"
     echo "mode $mode stride $stride; the kext's first: ${line:-none}; as assumed: $mok"
     cat "$R/capture/clock.txt" 2> /dev/null
