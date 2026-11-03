@@ -2230,29 +2230,63 @@ mod tests {
         assert_eq!(words(&out_again), [0; 4]);
     }
 
+    /// The words `add_one` writes into its output from an input released before the execution,
+    /// command 0 of a buffer made resident with `icb_usage`, the output for reading and writing,
+    /// in a command buffer that completes with no error.
+    fn released_input_read(icb_usage: u64) -> Vec<u32> {
+        let d = dev();
+        let out = holding(&d, &[0; 4]);
+        let input = holding(&d, &[10, 20, 30, 40]);
+        let (icb, _pipeline) = add_into(&d, 1, &out, &input);
+        drop(input);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        let buffers = [Some(ResourceRef::Buffer(&out))];
+        let icbs = [Some(ResourceRef::Icb(&icb))];
+        for cmd in [
+            ComputeCmd::UseResources {
+                resources: &buffers,
+                usage: 3,
+            },
+            ComputeCmd::UseResources {
+                resources: &icbs,
+                usage: icb_usage,
+            },
+            ComputeCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: &icb,
+                execution_range: NsRange::new(0, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
+        words(&out)
+    }
+
     /// A command naming a buffer released before its execution runs with no error, reading zero
     /// there: the runtime resolves the address the command holds to no live buffer, as it
     /// resolves a pointer to none, so the slot reads zero and drops writes. Metal's answer
     /// varies (oracle_icb `freed`, an AMD 5300M and an Intel 630 on macOS 26.7.1, an M3 Max on
     /// macOS 27.0.1): each reads a small released buffer's last bytes; the AMD and the M3 read
     /// zero from a released buffer of 1 to 64 MiB, where the Intel reads other bytes; the AMD
-    /// draws nothing through a released vertex or fragment buffer; none fails the command buffer.
-    /// Ignored until the runtime runs the command: metal2vulkan c8a0481cf8 on MoltenVK runs
-    /// nothing there, its output keeping [0; 4], where a nil buffer at the same index reads zero
+    /// draws nothing through a released vertex or fragment buffer; none fails the command buffer
     #[test]
-    #[ignore = "metal2vulkan runs no command whose buffer was released (handed to it 11-03)"]
     fn a_command_naming_a_released_buffer_reads_zero() {
-        let d = dev();
-        let out = holding(&d, &[0; 4]);
-        let input = holding(&d, &[10, 20, 30, 40]);
-        let (icb, _pipeline) = add_into(&d, 1, &out, &input);
-        drop(input);
-        let resident = [
-            Some(ResourceRef::Buffer(&out)),
-            Some(ResourceRef::Icb(&icb)),
-        ];
-        execute_first(&d, &icb, &resident);
-        assert_eq!(words(&out), [1; 4]);
+        assert_eq!(released_input_read(1), [1; 4]);
+    }
+
+    /// The same, in a buffer an encoder made resident for writing, which the runtime executes
+    /// from its records on the host. Ignored until the runtime runs the command there:
+    /// metal2vulkan c8a0481cf8 on MoltenVK runs nothing, the output keeping [0; 4], with no
+    /// error, where the buffer made resident for reading alone runs it reading zero
+    #[test]
+    #[ignore = "metal2vulkan's host replay runs no command naming a released buffer (handed to it 11-03)"]
+    fn a_command_naming_a_released_buffer_reads_zero_in_a_buffer_resident_for_writing() {
+        assert_eq!(released_input_read(3), [1; 4]);
     }
 
     /// The tests' kernels that encode indirect commands, which `build.rs` compiled from
