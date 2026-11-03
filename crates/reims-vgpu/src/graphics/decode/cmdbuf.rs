@@ -122,8 +122,8 @@ use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
-    DecodeError, Decoders, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, ScheduledSink,
-    SubmittedSink, blit, compute, context_of, op_fault, read, refusing, render, video,
+    DecodeError, Decoders, Drain, GraphicsDecoder, ObjHandle, ScheduledSink, SubmittedSink, blit,
+    compute, context_of, op_fault, read, refusing, render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -828,8 +828,9 @@ enum OpenEncoder<P: Platform> {
     Render(P::RenderEncoder, render::PassFacts),
     Compute(P::ComputeEncoder),
     Blit(P::BlitEncoder),
-    /// A video encoder: its session's work, placed in the command buffer itself.
-    Video(Arc<dyn GraphicsVideoSession<P>>),
+    /// A video encoder: its session's work, placed in the command buffer itself; its hold lets
+    /// the session go on the video worker ([`video::SessionHold`]).
+    Video(video::SessionHold<P>),
 }
 
 /// Whether Metal takes `positions` as a pass's sample positions, where `makes` answers whether
@@ -1555,7 +1556,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "video"));
                     };
-                    if !video::decode_op(tag, body, self, session, cb)? {
+                    if !video::decode_op(tag, body, self, session.session(), cb)? {
                         return Err(unknown_op(tag));
                     }
                 }
@@ -2050,7 +2051,7 @@ mod tests {
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
-    use super::super::{GraphicsVideo, VideoDecode, VideoPlane};
+    use super::super::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
     use super::*;
 
     /// One op: its header then its body, `len` the whole op.
@@ -2397,16 +2398,71 @@ mod tests {
         }
     }
 
+    /// A video session's create, of H.264 decode, as object `obj_id`.
+    fn video_session_create(obj_id: u64) -> RgfxVideoSessionCreate {
+        RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            codec: RGFX_VIDEO_CODEC_H264,
+            direction: RGFX_VIDEO_DECODE,
+        }
+    }
+
+    /// A video session's `OBJECT_DESTROY` lets it go on the video worker: the session ends there,
+    /// not on the thread that carries the destroy out.
+    #[test]
+    fn a_video_sessions_destroy_ends_it_on_the_video_worker() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let create = video_session_create(40);
+        assert_eq!(dec.decode(&device, create.as_bytes()).unwrap(), Ok(()));
+        dec.video_worker().hold();
+        assert_eq!(dec.decode(&device, &destroy(40)).unwrap(), Ok(()));
+        assert!(seen.ended_on.lock().is_empty());
+        dec.video_worker().release();
+        dec.video_worker().flush();
+        let worker = Some("reims-vgpu.graphics-video".to_owned());
+        assert_eq!(*seen.ended_on.lock(), [worker]);
+    }
+
+    /// An open video encoder's hold of its session, which a walk takes at `ENCODER_BEGIN_VIDEO`,
+    /// keeps the session past its `OBJECT_DESTROY`; the hold's drop, the last, then ends it on the
+    /// video worker, not on the walk's thread.
+    #[test]
+    fn a_walks_hold_of_a_destroyed_session_ends_it_on_the_video_worker() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let create = video_session_create(40);
+        assert_eq!(dec.decode(&device, create.as_bytes()).unwrap(), Ok(()));
+        let hold = dec.require_video_session(40).unwrap();
+        assert_eq!(dec.decode(&device, &destroy(40)).unwrap(), Ok(()));
+        dec.video_worker().flush();
+        assert!(seen.ended_on.lock().is_empty(), "the walk's hold keeps it");
+        drop(hold);
+        dec.video_worker().flush();
+        let worker = Some("reims-vgpu.graphics-video".to_owned());
+        assert_eq!(*seen.ended_on.lock(), [worker]);
+    }
+
     /// A decode a fake host's video was handed: its session's codec, its access unit (offset,
     /// size), its parameter sets and its planes (offset, bytes per row, width, height).
     type SeenDecode = (u32, u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
 
-    /// What a fake host's video was handed: each decode, and whether each of its planes was in a
-    /// device cache.
+    /// What a fake host's video was handed: each decode, whether each of its planes was in a
+    /// device cache, and the thread each of its sessions ended on.
     #[derive(Default)]
     struct VideoSeen {
         decodes: Mutex<Vec<SeenDecode>>,
         cached: Mutex<Vec<[bool; 2]>>,
+        ended_on: Mutex<Vec<Option<String>>>,
     }
 
     /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
@@ -2440,6 +2496,13 @@ mod tests {
                 event: self.1.new_shared_event()?,
                 decodes: AtomicUsize::new(0),
             }))
+        }
+    }
+
+    impl Drop for FakeSession {
+        fn drop(&mut self) {
+            let thread = std::thread::current().name().map(str::to_owned);
+            self.seen.ended_on.lock().push(thread);
         }
     }
 

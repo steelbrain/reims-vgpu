@@ -435,8 +435,8 @@ enum ObjHandle<P: Platform> {
     /// command buffers execute, copy, optimize and reset.
     Icb(P::Icb),
     /// A video session ([`RGFX_CMD_VIDEO_SESSION_CREATE`]), which its command buffers' video
-    /// encoders name.
-    VideoSession(Arc<dyn GraphicsVideoSession<P>>),
+    /// encoders name, let go of on the video worker ([`video::SessionHold`]).
+    VideoSession(video::SessionHold<P>),
 }
 
 /// Why a message was not carried out.
@@ -527,6 +527,8 @@ pub(crate) struct Shared<P: Platform> {
     /// The thread a closed context's objects and views are let go of on, its close answered
     /// after them ([`GraphicsDecoder::let_go_later`]).
     close_worker: worker::Worker,
+    /// The thread video sessions are let go of on ([`video::SessionHold`]).
+    video_worker: Arc<worker::Worker>,
     /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
     surface_caches: Arc<Caches<P>>,
     /// The commit order `CB_SUBMITTED` promises ([`sequencer`]).
@@ -727,6 +729,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
+            video_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-video")),
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
@@ -1522,6 +1525,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn surface_worker(&self) -> &worker::Worker {
         &self.shared.surface_worker
+    }
+
+    /// The video worker (for the tests).
+    #[cfg(test)]
+    pub(crate) fn video_worker(&self) -> &worker::Worker {
+        &self.shared.video_worker
     }
 
     /// The surfaces' views, locked (for the tests).
@@ -2422,7 +2431,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     );
                     return Ok(Err(DecodeError::Refused));
                 };
-                self.insert(m.obj_id, ObjHandle::VideoSession(session))
+                let hold = video::SessionHold::new(m.obj_id, session, &self.shared.video_worker);
+                self.insert(m.obj_id, ObjHandle::VideoSession(hold))
             }
             RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
                 self.decode_pipeline(device, message)
@@ -2541,7 +2551,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// go of, each in a refusal scope ([`drop_refused`]), at once, or where a view taken before
     /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten. A
     /// buffer over a block's surface view is let go of on the surface worker, where it may be the
-    /// last hold of the view's mapping ([`surface_pages`]).
+    /// last hold of the view's mapping ([`surface_pages`]), and a video session on the video worker
+    /// ([`video::SessionHold`]).
     fn remove(&self, obj_id: u64) {
         let Some(context) = self.context_state(context_of(obj_id)) else {
             return;

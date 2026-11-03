@@ -12,6 +12,7 @@
 //! queue is not the command buffer's ([`super::surface_order`]): a decode whose output another
 //! process still reads lands once the read is done.
 
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use reims_graphics::ops::video::{
@@ -27,6 +28,7 @@ use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
 use zerocopy::FromBytes;
 
+use super::worker::Worker;
 use super::{GraphicsDecoder, ObjHandle, bad_reference, op_fault};
 
 /// How long a decode waits for its output's device cache to be filled: a copy of the surface's
@@ -46,6 +48,58 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// ([`RGFX_VIDEO_CAPS_OUTPUT_CACHED`](reims_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED)).
     fn lands_in_device_caches(&self) -> bool {
         false
+    }
+}
+
+/// A hold of a video session, the object table's or an open video encoder's. Its drop lets go of
+/// the session on the decoder's video worker (`reims-vgpu.graphics-video`), so the last hold's
+/// drop, which ends the session, runs on neither ring 0's threads nor a queue's walk, whichever
+/// lets go last: the session's `OBJECT_DESTROY` or the end of the walk of a command buffer that
+/// still had it open. A session's end waits for its last decode's signal and lets go of its
+/// pictures' memory and the hardware's session: the device's own memory, none of it the guest's.
+/// Measured on the RTX 5080 Laptop GPU host: in a guest's boot, a session whose pictures each had
+/// a bitstream buffer of their own ended in 7.0 to 10.1 ms, its last signal landed or 1.6 ms from
+/// landing; the video crate's session alone, outside a guest, ends in 1.1 ms at 1080p and 1.6 to
+/// 4.2 ms at 4K where its pictures are read in place, and in 2.1 to 4.2 ms where they are copied
+/// into bitstream buffers.
+pub(crate) struct SessionHold<P: Platform> {
+    /// The session's object id, which a refused release is logged under.
+    id: u64,
+    /// The session, which the drop hands to the worker.
+    session: ManuallyDrop<Arc<dyn GraphicsVideoSession<P>>>,
+    worker: Arc<Worker>,
+}
+
+impl<P: Platform> SessionHold<P> {
+    /// A hold of `session`, object `id`, let go of on `worker`.
+    pub(super) fn new(
+        id: u64,
+        session: Arc<dyn GraphicsVideoSession<P>>,
+        worker: &Arc<Worker>,
+    ) -> Self {
+        SessionHold {
+            id,
+            session: ManuallyDrop::new(session),
+            worker: Arc::clone(worker),
+        }
+    }
+
+    /// The session.
+    pub(super) fn session(&self) -> &Arc<dyn GraphicsVideoSession<P>> {
+        &self.session
+    }
+
+    /// Another hold of the same session.
+    pub(super) fn another(&self) -> Self {
+        Self::new(self.id, Arc::clone(&self.session), &self.worker)
+    }
+}
+
+impl<P: Platform> Drop for SessionHold<P> {
+    fn drop(&mut self) {
+        // SAFETY: the drop runs once, and nothing reads the session after it.
+        let session = unsafe { ManuallyDrop::take(&mut self.session) };
+        self.worker.drop_later(self.id, session);
     }
 }
 
@@ -281,13 +335,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         let _ = self.shared.video.set(video);
     }
 
-    /// The session `id` names; an exec fault where it names none.
-    pub(super) fn require_video_session(
-        &self,
-        id: u64,
-    ) -> RaiseResult<Arc<dyn GraphicsVideoSession<P>>> {
+    /// A hold of the session `id` names; an exec fault where it names none.
+    pub(super) fn require_video_session(&self, id: u64) -> RaiseResult<SessionHold<P>> {
         match self.named(id) {
-            Some(ObjHandle::VideoSession(session)) => Ok(Arc::clone(session)),
+            Some(ObjHandle::VideoSession(session)) => Ok(session.another()),
             _ => Err(bad_reference()),
         }
     }
