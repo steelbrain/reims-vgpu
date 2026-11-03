@@ -120,20 +120,47 @@ timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
 # arrival order, and holds the GPU alone for QEMU's life.
 excl=()
 [[ ${EXCLUSIVE:-1} == 1 ]] && excl=(RGK_EXCLUSIVE=1 "RGK_EXCLUSIVE_MAX=$HOLD_S")
+# Where the boot's time goes: rgk-boot2.sh writes run.sh once its turn, a VM slot and the port are
+# in hand; run.sh waits for host quiet (a measured boot's HOST_QUIET line in QEMU's log) and the GPU
+# lock (GPU_HELD) before it execs QEMU, whose lines carry their times. A watch on the log takes the
+# times of those two lines (boot-times.txt), and the hold counts from GPU_HELD.
+sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", a - b }'; }
+stamp() { date -d "$1" +%s.%N 2> /dev/null | cut -c1-14; }
+touch "$R/.start"
+( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
+  q=
+  while sleep 0.5; do
+    [[ -f $B/launch.log && $B/launch.log -nt $R/.start ]] || continue
+    [[ -z $q ]] && grep -q -x -E 'HOST_(NOT_)?QUIET' "$B/launch.log" && q=1 && echo "quiet $(date +%s.%N | cut -c1-14)"
+    grep -q -x GPU_HELD "$B/launch.log" && { echo "held $(date +%s.%N | cut -c1-14)"; break; }
+  done ) > "$R/boot-times.txt" 2> /dev/null &
+TIMES=$!
 # rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
 out=$(env -u PORT "${excl[@]}" RGK_SLOT_WAIT="${LOCK_WAIT_S:-3600}" QEMU="$QEMU" ROM="$ROM" \
   REIMS_VGPU_LOG=info bash "$RGK_RUN/rgk-boot2.sh" "$TAG" "$OC" "$DISK" 2>&1)
+T_SSH=$(date +%s.%N | cut -c1-14)
+kill "$TIMES" 2> /dev/null
 echo "$out" >> "$R/boot.log"
 PORT=$(echo "$out" | awk '$1 == "PORT" && $2 ~ /^[0-9]+$/ {print $2; exit}')
 [[ -n $PORT ]] || PORT=$(cat "$B/port" 2> /dev/null)
 kv port "${PORT:-none}"
 P=$(cat "$B/qemu.pid" 2> /dev/null)
 [[ -n $P && $(cat "/proc/$P/comm" 2> /dev/null) == qemu-system-x86* ]] || P=
-# The hold began when QEMU started, holding the lock.
-if [[ -n $P ]]; then
-  T0=$(( $(date +%s) - $(ps -o etimes= -p "$P" | tr -d ' ') ))
-  kv lock_wait_s "$(( T0 - START ))"
+T_QEMU=
+if [[ -f $B/launch.log && $B/launch.log -nt $R/.start ]]; then
+  T_QEMU=$(stamp "$(grep -m1 -E '^20[0-9-]+T[0-9:.]+[+-][0-9]{4} ' "$B/launch.log" | cut -d' ' -f1)")
 fi
+T_RUN=$([[ $B/run.sh -nt $R/.start ]] && stat -c %Y "$B/run.sh")
+T_QUIET=$(awk '$1 == "quiet" {print $2}' "$R/boot-times.txt")
+T_HELD=$(awk '$1 == "held" {print $2}' "$R/boot-times.txt")
+[[ -n $T_RUN ]] && kv turn_wait_s "$(sub "$T_RUN" "$START")"
+[[ -n $T_RUN && -n $T_QUIET ]] && kv quiet_wait_s "$(sub "$T_QUIET" "$T_RUN")"
+[[ -n $T_HELD ]] && kv gpu_wait_s "$(sub "$T_HELD" "${T_QUIET:-${T_RUN:-$START}}")"
+# The hold began when run.sh held the GPU lock (else when QEMU started).
+T0=${T_HELD:-$T_QEMU}
+T0=${T0%.*}
+[[ -n $T0 ]] && kv lock_wait_s "$(( T0 - START ))"
+[[ -n $T0 ]] || T0=$START
 case $out in
 *SSH_OK*) ;;
 # The host's queue did not reach this boot in LOCK_WAIT_S: nothing of the candidate ran.
@@ -142,7 +169,8 @@ case $out in
 *) log "BOOT_FAIL $(echo "$out" | tail -3 | tr '\n' ' ')"; exit 4 ;;
 esac
 [[ -n $P ]] || { log "BOOT_FAIL no QEMU pid in $B/qemu.pid"; exit 4; }
-kv boot_ssh_s "$(( $(date +%s) - T0 ))"
+# The boot's own time: from QEMU's first line to SSH answering.
+[[ -n $T_QEMU ]] && kv boot_ssh_s "$(sub "$T_SSH" "$T_QEMU")"
 log "QEMU $P up, SSH answers"
 
 # This run's background helpers close every descriptor above 2 first: none may hold the GPU
@@ -168,8 +196,29 @@ desktop() {
   return 1
 }
 desktop || { log "BOOT_FAIL no desktop (WindowServer, Dock, Finder) in 3 min"; exit 5; }
-kv desktop_s "$(( $(date +%s) - T0 ))"
+[[ -n $T_QEMU ]] && kv desktop_s "$(sub "$(date +%s.%N | cut -c1-14)" "$T_QEMU")"
 log "desktop up"
+# The boot's timeline from QEMU's first line: the host's first present of a guest frame, and from
+# the guest (its clock set against the host's over SSH, to a second) the kernel's boot and the
+# start of WindowServer, loginwindow and Dock (the user's login).
+if [[ -n $T_QEMU ]]; then
+  fp=$(grep -m1 'the display shows IOSurface' "$B/launch.log" | cut -d' ' -f1)
+  [[ -n $fp ]] && kv first_present_s "$(sub "$(stamp "$fp")" "$T_QEMU")"
+  hnow=$(date +%s)
+  g=$(G 'date +%s; sysctl -n kern.boottime; for p in WindowServer loginwindow Dock; do echo "$p $(ps -o etime= -p "$(pgrep -x $p | head -1)" 2>/dev/null)"; done' 2> /dev/null)
+  gnow=$(echo "$g" | sed -n 1p)
+  if [[ $gnow =~ ^[0-9]+$ ]]; then
+    off=$(( hnow - gnow ))
+    kb=$(echo "$g" | sed -n 's/.*sec = \([0-9]*\),.*/\1/p' | head -1)
+    [[ -n $kb ]] && kv kernel_s "$(sub "$(( kb + off ))" "$T_QEMU")"
+    for p in WindowServer loginwindow Dock; do
+      e=$(echo "$g" | awk -v p=$p '$1 == p {print $2}')
+      [[ -n $e ]] || continue
+      el=$(echo "$e" | awk -F'[-:]' '{ n = NF; s = $n + 60 * $(n - 1); if (n >= 3) s += 3600 * $(n - 2); if (n >= 4) s += 86400 * $(n - 3); print s }')
+      kv "$(echo "$p" | tr 'A-Z' 'a-z')_s" "$(sub "$(( gnow - el + off ))" "$T_QEMU")"
+    done
+  fi
+fi
 
 # Right after login the guest's SSH can miss its banner timeout while the desktop's apps start: a
 # copy is tried three times, 15 s apart.

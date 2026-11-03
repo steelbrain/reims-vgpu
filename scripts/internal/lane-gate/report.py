@@ -277,7 +277,12 @@ class Run:
             parts = line.split(None, 1)
             if len(parts) == 2:
                 kv[parts[0]] = parts[1].strip()
-        for k in ("boot_ssh_s", "desktop_s", "hold_s", "lock_wait_s", "load_start", "load_end", "load_duty", "host_quiet"):
+        # The boot's waits (turn, host quiet, GPU lock), its timeline from QEMU's first line (the
+        # host's first present, the guest's kernel, WindowServer, loginwindow, Dock, SSH, the
+        # desktop), and the host's state beside the measurements.
+        for k in ("turn_wait_s", "quiet_wait_s", "gpu_wait_s", "lock_wait_s", "first_present_s", "kernel_s",
+                  "windowserver_s", "loginwindow_s", "dock_s", "boot_ssh_s", "desktop_s", "hold_s",
+                  "load_start", "load_end", "load_duty", "host_quiet"):
             if re.fullmatch(r"[0-9]+(\.[0-9]*)?", kv.get(k, "")):
                 self.lmetric("host." + k, float(kv[k]))
         fatal = int(kv.get("fatal_lines", "-1") or -1) + max(0, int(kv.get("serial_fatal_lines", "0") or 0))
