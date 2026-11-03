@@ -440,6 +440,25 @@ mod tests {
         assert_eq!(period(Some("0\n")), ASSUMED_DELAY / 2);
     }
 
+    /// The submission runs on the device: its fence signals, and the buffer, recorded once, is
+    /// submitted again after it.
+    #[test]
+    fn the_touch_runs_on_the_gpu_and_runs_again() {
+        let device = crate::gpu::device::tests::dev();
+        let mut toucher = Toucher::new(&device.raw).unwrap();
+        // SAFETY: the handles are used while the device lives.
+        let vk_device = unsafe { device.raw.raw() }.device;
+        for _ in 0..3 {
+            toucher.touch().unwrap();
+            assert!(toucher.pending);
+            // SAFETY: the fence is the toucher's.
+            let waited = device.raw.with_loader_word(|| unsafe {
+                vk_device.wait_for_fences(&[toucher.fence], true, 5_000_000_000)
+            });
+            assert_eq!(waited, Ok(()));
+        }
+    }
+
     /// A device's `Awake` of a test counts nothing and wakes nothing.
     #[test]
     fn a_default_awake_keeps_nothing() {
