@@ -247,6 +247,7 @@ do_guest_build() {
     grep -rqs IOGVAHEVCDecode guest/kext/src && echo hevc
     true; } > "$ART/tip-codecs.txt"
   { for f in guest/bundle/tools/sweep/*.[mh] guest/bundle/tools/bench/bench.m; do shasum "$f"; done | shasum | echo "sweep+bench $(cut -c1-16)"
+    echo "bench $(shasum < guest/bundle/tools/bench/bench.m | cut -c1-16)"  # bench.m builds alone
     echo "present_probe $(shasum < "$(tool_src guest/bundle/tools/present_probe.m)" | cut -c1-16)"
     echo "decode_md5 $(shasum < "$(tool_src guest/bundle/tools/decode_md5.m)" | cut -c1-16)"
     [[ ! -f $o/oracle_icb.m ]] || echo "oracle_icb $(cat "$o/oracle_icb.m" "$o/oracle_icb.metal" "$o/oracle_common.h" | shasum | cut -c1-16)"

@@ -836,14 +836,21 @@ def noise_from(bdirs_root):
 
 # The tool whose numbers a metric is: where its source differs from the baseline's, the metric is
 # shown but not gated, as the measuring stick moved.
-TOOL_OF = [(r"bench\..*", "sweep+bench"), (r"present\..*", "present_probe"), (r"decode\..*", "decode_md5"),
+TOOL_OF = [(r"bench\..*", "bench"), (r"present\..*", "present_probe"), (r"decode\..*", "decode_md5"),
            (r"(drag\.|[a-z]+_cpu\.drag\.).*", "drag")]
+
+
+# A tool whose hash a run recorded before the tool had its own: bench.m's was the sweep's and
+# bench.m's together, so a sweep change kept the bench's numbers from being gated.
+OLDER_TOOL = {"bench": "sweep+bench"}
 
 
 def tool_changed(name, meta, base_meta):
     for rx, tool in TOOL_OF:
         if re.fullmatch(rx, name):
             a, b = meta.get("tools", {}).get(tool), base_meta.get("tools", {}).get(tool)
+            if (a is None or b is None) and tool in OLDER_TOOL:
+                a, b = (m.get("tools", {}).get(OLDER_TOOL[tool]) for m in (meta, base_meta))
             return a is not None and b is not None and a != b
     return False
 
