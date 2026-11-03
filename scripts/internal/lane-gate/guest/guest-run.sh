@@ -143,6 +143,15 @@ run_final() {
 	if [ $# -eq 3 ]; then item desktop-end PASS "WindowServer $1, Dock $2, Finder $3"; else item desktop-end FAIL "WindowServer/Dock/Finder: $desk"; fi
 	new=$(reports | comm -13 "$D/reports-before.txt" - | tr '\n' ' ')
 	echo "GATE crashes ${new:-none}"
+	# The screen as WindowServer composed it, read back by the CPU (screencapture in the user's
+	# session): the gate's host side counts its colours.
+	rm -f "$D/desktop.png"
+	gui perl -e 'alarm shift @ARGV; exec @ARGV' 30 /usr/sbin/screencapture -x -t png "$D/desktop.png" > /dev/null 2>&1
+	if [ -s "$D/desktop.png" ]; then
+		echo "GATE info capture $(sips -g pixelWidth -g pixelHeight "$D/desktop.png" 2>/dev/null | awk '/pixel/ {printf "%s ", $2}')"
+	else
+		item desktop-capture FAIL "screencapture wrote nothing"
+	fi
 }
 
 for p in $PHASES; do

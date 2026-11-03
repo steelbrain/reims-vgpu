@@ -2,7 +2,7 @@
 """The lane gate's report (scripts/internal/lane-gate.sh): reads one run's directory, compares it
 with a baseline, and writes results.json and report.txt into the run.
 
-    report.py RUN [--baseline DIR] [--noise FILE]
+    report.py RUN [--baseline DIR] [--noise FILE] [--history FILE]
     report.py --record RUN BASELINES          adds RUN as a sample of its commit's baseline
     report.py --noise-from BASELINES FILE     the noise band from every baseline with 2+ samples
 
@@ -13,7 +13,13 @@ A run's directory holds:
   results/cargo-fails.txt       the cargo tests that failed, "BINARY TEST" a line
   meta.json                     the commit, the run's id, the tools' source hashes, what ran
 
-An item is PASS, FAIL or SKIP. Against the baseline, an item the baseline passed that is now
+An item is PASS, FAIL or SKIP, or KNOWN: a failure that an entry of the known-failures list
+(meta.json's known_fails, from the gate's KNOWN_FAILS file) matches exactly, which decides nothing.
+An entry names the item, a regular expression its failure's detail must match (pattern), and
+optionally a relation between two of the pattern's named groups ("m = n - 1"), its owner and its
+ledger row; an entry missing one of those is ignored. --history keeps, across runs, each entry's
+status in each run, and the report counts its hits among the runs that ran the check. Against
+the baseline, an item the baseline passed that is now
 SKIP or missing fails. A metric is a number; the gated ones (GATED) fail where they are worse
 than the baseline's median by more than the noise band: the larger of the metric's floor and
 NOISE_K times the largest relative distance from the median that repeated runs of one commit
@@ -231,8 +237,12 @@ class Run:
             self.litem("host.same-boot-accel", "PASS" if kv["first_boot_accel"] == "1" else "FAIL",
                       "our Metal device on the first boot" if kv["first_boot_accel"] == "1"
                       else "no Metal device of ours until a reboot")
-        colours = int(kv.get("desktop_colours", "0") or 0)
-        self.litem("host.desktop-screendump", "PASS" if colours >= 64 else "FAIL", f"{colours} colours in a sampled screendump")
+        # The guest's capture of its screen at the end (a failed capture is the guest's own item).
+        if "desktop_colours" in kv:
+            colours = int(kv["desktop_colours"] or 0)
+            top = float(kv.get("desktop_top_share", "1") or 1)
+            self.litem("guest.desktop-capture", "PASS" if colours >= 64 and top <= 0.5 else "FAIL",
+                       f"the guest's capture of its screen: {colours} colours, the commonest on {top:.1%} of it")
         # Display updates and QEMU's CPU in each phase.
         updates = [local_epoch(l[:28]) for l in read(os.path.join(r, "host-events.log")).splitlines()
                    if "the display shows IOSurface" in l]
@@ -347,7 +357,8 @@ def compare(run, base, noise):
             lines.append(f"  note: {len(fixed)} known cargo failures now pass: " + ", ".join(fixed[:5]))
     ran = set(run.meta.get("ran", []))
     for name, b in sorted((base or {}).get("items", {}).items()):
-        if name in items:
+        # Publishing is the tips' alone (--publish): a run without it misses nothing.
+        if name in items or name == "step.publish":
             if b["status"] == "PASS" and items[name]["status"] == "SKIP":
                 items[name] = {"status": "FAIL", "detail": "SKIP, where the baseline passed: " + items[name]["detail"]}
             continue
@@ -361,6 +372,18 @@ def compare(run, base, noise):
             incomplete = incomplete or part != "bench"
         elif b["status"] == "PASS":
             items[name] = {"status": "FAIL", "detail": "missing, where the baseline passed"}
+    # A failure an entry of the known-failures list matches exactly is KNOWN and decides nothing.
+    entries = []
+    for e in run.meta.get("known_fails") or []:
+        if not isinstance(e, dict) or not all(e.get(k) for k in ("item", "pattern", "owner", "ledger")):
+            lines.append(f"  note: a known-failures entry without its item, pattern, owner and ledger row is ignored: {e}")
+            continue
+        entries.append(e)
+        it = items.get(e["item"])
+        if it and it["status"] == "FAIL" and known_match(e, it["detail"]):
+            items[e["item"]] = {"status": "KNOWN", "detail": f"{it['detail']} (known: {e.get('why', '')}; "
+                                f"owner {e['owner']}; {e['ledger']})"}
+    cur["known"] = [dict(e, status=items.get(e["item"], {}).get("status", "absent")) for e in entries]
     for name, it in sorted(items.items()):
         if it["status"] == "FAIL":
             failed.append(name)
@@ -404,8 +427,48 @@ def compare(run, base, noise):
     return cur, failed, incomplete, lines, mlines
 
 
-def write_report(run, base, noise):
+def known_match(e, detail):
+    """Whether a known-failures entry matches a failure's detail: its pattern, then its relation."""
+    m = re.search(e["pattern"], detail)
+    if not m:
+        return False
+    rel = e.get("relation")
+    if not rel:
+        return True
+    r = re.fullmatch(r"\s*(\w+)\s*=\s*(\w+)\s*([+-])\s*(\d+)\s*", rel)
+    if not r:
+        return False
+    a, b, sign, k = r.groups()
+    try:
+        va, vb = int(m.group(a)), int(m.group(b))
+    except (IndexError, ValueError, TypeError):
+        return False
+    return va == vb + (int(k) if sign == "+" else -int(k))
+
+
+def known_history(path, cur):
+    """Records this run's status of each known entry in the history file (TSV: RUNID SHA ITEM
+    STATUS), replacing the run's earlier lines, and returns each entry's report line."""
+    runid, sha = cur["meta"].get("runid", "?"), cur["meta"].get("sha", "?")
+    rows = [l.split("\t") for l in read(path).splitlines() if l.count("\t") == 3]
+    rows = [r for r in rows if r[0] != runid]
+    rows += [[runid, sha, e["item"], e["status"]] for e in cur["known"]]
+    with open(path + ".new", "w") as f:
+        f.write("".join("\t".join(r) + "\n" for r in rows))
+    os.replace(path + ".new", path)
+    out = []
+    for e in cur["known"]:
+        mine = [r for r in rows if r[2] == e["item"]]
+        ran = [r for r in mine if r[3] in ("PASS", "FAIL", "KNOWN")]
+        hit = [r for r in mine if r[3] == "KNOWN"]
+        out.append(f"  {e['item']}: this run {e['status']}; known hits in {len(hit)} of the {len(ran)} runs "
+                   f"that ran it (owner {e['owner']}; {e['ledger']})")
+    return out
+
+
+def write_report(run, base, noise, history=None):
     cur, failed, incomplete, notes, mlines = compare(run, base, noise)
+    known_lines = known_history(history, cur) if history and cur.get("known") else []
     counts = {}
     for it in cur["items"].values():
         counts[it["status"]] = counts.get(it["status"], 0) + 1
@@ -428,6 +491,9 @@ def write_report(run, base, noise):
         for f in names:
             it = cur["items"].get(f)
             out.append(f"  {f}: {it['detail'] if it else ''}")
+    if cur.get("known"):
+        out.append("known failures (not gating):")
+        out += known_lines or [f"  {e['item']}: this run {e['status']}" for e in cur["known"]]
     out += notes
     out.append("")
     out.append("items:")
@@ -484,15 +550,17 @@ def main(argv):
                 print(f"  {n:48s} max deviation {dev[n]:6.2%} -> band {band(n, dev):6.2%}")
         return 0
     run = Run(argv[0]).parse()
-    base, noise = None, {}
+    base, noise, history = None, {}, None
     i = 1
     while i < len(argv):
         if argv[i] == "--baseline":
             base = median_baseline(argv[i + 1])
         elif argv[i] == "--noise":
-            noise = json.loads(read(argv[i + 1], "{}"))
+            noise = json.loads(read(argv[i + 1], "{}") or "{}")
+        elif argv[i] == "--history":
+            history = argv[i + 1]
         i += 2
-    return write_report(run, base, noise)
+    return write_report(run, base, noise, history)
 
 
 if __name__ == "__main__":

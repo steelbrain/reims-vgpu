@@ -4,7 +4,7 @@
 #
 #   scripts/internal/lane-gate.sh [--record] [--baseline SHA] [--resume [RUNID]] [--image PATH]
 #                                 [--skip mac|boot] [--phases "PHASE..."] [--no-bench | --wait-bench]
-#                                 [REV]
+#                                 [--publish] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
@@ -19,6 +19,10 @@
 #                 present final)
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
+#   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
+#                 as loader-fix/oc-sipon-SHORT.qcow2 and tip-host/SHORT/ under the host's RGK_RUN
+#                 (lane-gate/msi-publish.sh), unless nothing they carry changed since the last
+#                 commit the gate published (published-last)
 #
 # What it runs, the Mac's leg beside the lane host's build:
 #   Mac:  the guest kexts, bundle and tools (lane-gate/guest: guest-run.sh's payload); then
@@ -36,13 +40,15 @@
 #         decode sets against their MD5s, Safari's WebGL readPixels, present_probe's answers
 #         full-screen and windowed, and the desktop's state (SIP on, the kexts loaded and bound,
 #         the bundle installed, the Metal device ours, WindowServer up throughout, no new crash
-#         report); and the host log's fatal lines and display updates, and a screendump.
+#         report, and the guest's capture of its screen); and the host log's fatal lines and
+#         display updates.
 #   bench: the bench leg, which reports and never decides: a second cold boot holding the GPU
 #         alone (RGK_EXCLUSIVE) for at most HOLD_S seconds, running the GPU benchmark, the
 #         on-screen benchmark, present_probe and the timed decodes, with QEMU's CPU and the host's
 #         display updates, each number against the baseline's with its noise band.
 # Then lane-gate/report.py writes the run's report.txt and results.json: PASS, FAIL or SKIP for
-# every item, and each number against the baseline. Exit 0 when the run passed, 1 when a check
+# every item (KNOWN for a failure the known-failures list, KNOWN_FAILS, matches exactly, with its
+# hits across runs in known-hits.tsv), and each number against the baseline. Exit 0 when the run passed, 1 when a check
 # failed, 2 when a part did not run; the bench leg's failures and regressions show in the report
 # and never change the exit.
 #
@@ -67,7 +73,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= skip= phases= rev=HEAD bench=detach
+record=0 base_sha= resume= image= skip= phases= rev=HEAD bench=detach publish=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -79,6 +85,7 @@ while (($#)); do
     --no-bench) bench=no ;;
     --wait-bench) bench=wait ;;
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
+    --publish) publish=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) die "unknown option $1" ;;
     *) rev=$1 ;;
@@ -275,8 +282,8 @@ do_ship() {  # the gate's own scripts, which the host's steps run
   # run a boot used in the last two hours (a detached bench leg may still wait its turn).
   msi "mkdir -p '$MR/bin' && ls -1dt '$MSI_GATE/runs'/*/ | tail -n +6 | while read -r d; do
     [ -n \"\$(find \"\$d\" -mmin -120 -print -quit)\" ] || rm -rf \"\$d\"; done"
-  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$SRC/scripts/internal/opencore-add-kexts.sh" \
-    "$MSI:$MR/bin/"
+  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" \
+    "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/"
 }
 do_corpus() {  # the decode streams, copied once from the configured source
   local names
@@ -343,6 +350,23 @@ image_leg() {
   step loader do_loader && step image do_image
 }
 
+# The paths whose changes reach the image or the host build.
+PUBLISHED_PATHS=(guest/kext guest/bundle guest/rgfxgate crates firmware vendor/qemu xtask Cargo.toml Cargo.lock)
+do_publish() {
+  local last short qc m2v
+  last=$(cat "$GH/published-last" 2> /dev/null || true)
+  if [[ -n $last ]] && git -C "$SRC" cat-file -e "$last^{commit}" 2> /dev/null &&
+    git -C "$SRC" diff --quiet "$last" "$sha" -- "${PUBLISHED_PATHS[@]}"; then
+    echo "NOT_PUBLISHED: nothing the image or the host carries changed since ${last:0:9}, whose they are"
+    return 0
+  fi
+  short=${sha:0:9}
+  qc=$(cat "$ART/qemu-commit")
+  m2v=$(grep -m1 -o -E '^metal2vulkan-runtime = .*rev = "[0-9a-f]+"' "$TREE/Cargo.toml" | grep -o -E '[0-9a-f]{40}' || echo unknown)
+  msi "bash '$MR/bin/msi-publish.sh' '$MR' '$MSI_GATE/qemu/$qc/build' '$MSI_GATE/target/dist-vulkan' '$short' '$qc' '$m2v' '$MSI_RGK_RUN'"
+  echo "$sha" > "$GH/published-last"
+}
+
 # --- the boot ---------------------------------------------------------------------------------
 
 # do_boot boot|bench: the correctness boot, shared, or the bench boot, the GPU alone. rgk-boot2.sh
@@ -376,7 +400,6 @@ EOF
   msi "bash '$MR/bin/msi-boot.sh' '$out'"
   local rc=$?
   set -e
-  msi "cd '$out' && { [ ! -s desktop.ppm ] || convert desktop.ppm -resize 50% desktop.png; }" || true
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
   for f in boot.log guest.log cpu.txt host-events.log host.txt serial.log desktop.png; do
@@ -391,26 +414,33 @@ EOF
 # meta.json for report.py: what the run is, and which parts ran in any of its passes.
 write_meta() {
   python3 -I - "$RUN/meta.json" "$sha" "$subject" "$runid" "${base_sha:-}" "$(sort -u "$RUN/ran" 2> /dev/null | tr '\n' ' ')" \
-    "$image" "$phases" "$(( $(date +%s) - $(cat "$RUN/started") ))" "$ART/tools.txt" "${MAC_KNOWN_FAILS:-}" << 'EOF'
+    "$image" "$phases" "$(( $(date +%s) - $(cat "$RUN/started") ))" "$ART/tools.txt" "${MAC_KNOWN_FAILS:-}" \
+    "${KNOWN_FAILS:-}" << 'EOF'
 import json, sys
-out, sha, subject, runid, base, ran, image, phases, wall, tools_txt, known_txt = sys.argv[1:]
+out, sha, subject, runid, base, ran, image, phases, wall, tools_txt, known_txt, known_items = sys.argv[1:]
 def lines(p):
     try:
         return [l.strip() for l in open(p) if l.strip()]
     except OSError:
         return []
 tools = dict(l.split(None, 1) for l in lines(tools_txt))
+try:
+    known_fails = json.load(open(known_items)) if known_items else []
+except (OSError, ValueError) as e:
+    sys.exit(f"lane-gate: the known-failures list {known_items}: {e}")
 json.dump({"sha": sha, "subject": subject, "runid": runid, "baseline": base, "ran": ran.split(),
            "image": image, "phases": phases, "wall_s": int(wall), "tools": tools,
-           "known_cargo_fails": lines(known_txt)}, open(out, "w"), indent=1)
+           "known_cargo_fails": lines(known_txt),
+           "known_fails": known_fails}, open(out, "w"), indent=1)
 EOF
 }
+# report: the verdict as its status (0 pass, 1 fail, 2 incomplete). It leaves errexit as it was:
+# its callers take the status with errexit off.
 report() {
   write_meta
-  set +e
-  python3 -I "$L/report.py" "$RUN" ${BASE:+--baseline "$BASE"} --noise "$GH/noise.json"
-  local v=$?
-  set -e
+  local v=0
+  python3 -I "$L/report.py" "$RUN" ${BASE:+--baseline "$BASE"} --noise "$GH/noise.json" \
+    --history "$GH/known-hits.tsv" || v=$?
   if ((record)); then
     python3 -I "$L/report.py" --record "$RUN" "$GH/baselines"
     python3 -I "$L/report.py" --noise-from "$GH/baselines" "$GH/noise.json"
@@ -457,6 +487,13 @@ cat "$RUN/msi-leg.out"
 img_ok=0
 [[ -z $image ]] || img_ok=1
 if [[ -n $p_img ]]; then wait "$p_img" && img_ok=1 || img_ok=0; cat "$RUN/image-leg.out"; fi
+if ((publish)); then
+  if ((msi_ok && img_ok && gb == 0)) && [[ -z $image ]]; then
+    step publish do_publish && grep -E '^(PUBLISHED|NOT_PUBLISHED)' "$RUN/steps/publish.log" | sed 's/^/    /' || true
+  else
+    say "  publish: not run (the host build, the image or the guest build failed, or --image)"
+  fi
+fi
 if ! skipped boot; then
   if ((msi_ok && img_ok && gb == 0)); then
     echo boot >> "$RUN/ran"

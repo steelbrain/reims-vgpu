@@ -51,7 +51,9 @@ B=$RGK_RUN/boots/$TAG
 finish() {
   stop_qemu
   [[ -n ${SAMPLER:-} ]] && kill "$SAMPLER" 2> /dev/null
+  [[ -s $R/watchdog.pid ]] && kill "$(cat "$R/watchdog.pid")" 2> /dev/null
   [[ -n ${WATCHDOG:-} ]] && kill "$WATCHDOG" 2> /dev/null
+  rm -f "$R/watchdog.pid"
   if [[ -f $B/launch.log ]]; then
     kv fatal_lines "$(grep -c 'reims-vgpu: fatal' "$B/launch.log")"
     grep -E 'the display shows IOSurface|reims-vgpu: fatal|panic| ERROR | WARN ' "$B/launch.log" > "$R/host-events.log"
@@ -119,8 +121,12 @@ log "QEMU $P up, SSH answers"
 # This run's background helpers close every descriptor above 2 first: none may hold the GPU
 # locks' descriptors, which gpu-locks.sh hands down, past this script's end.
 closefds() { local f; for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done; }
-# The hold's end: QEMU stops there whatever the guest is doing.
-( closefds; sleep "$(left)"; echo "$(date +%T) watchdog: the hold's $HOLD_S s are up" >> "$R/boot.log"; kill "$P" 2> /dev/null ) &
+# Nor may they hold its stdout and stderr, the SSH session's, which would keep the session open
+# after this script ends.
+# The hold's end: QEMU stops there whatever the guest is doing. finish() stops the watchdog by its
+# sleep's pid (watchdog.pid), and the watchdog then ends without stopping QEMU.
+( closefds; sleep "$(left)" & s=$!; echo "$s" > "$R/watchdog.pid"; wait "$s" || exit 0
+  echo "$(date +%T) watchdog: the hold's $HOLD_S s are up" >> "$R/boot.log"; kill "$P" 2> /dev/null ) > /dev/null 2>&1 &
 WATCHDOG=$!
 ( closefds; hz=$(getconf CLK_TCK); while [[ -r /proc/$P/stat ]]; do
     echo "$(date +%s.%N | cut -c1-14) $(sed 's/^.*) //' "/proc/$P/stat" | awk '{print $12, $13}') $hz"; sleep 1
@@ -164,28 +170,14 @@ timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPT
 kv guest_rc "${PIPESTATUS[0]}"
 log "guest run done"
 
-printf '{"execute":"qmp_capabilities"}\n{"execute":"screendump","arguments":{"filename":"%s","device":"gfx"}}\n' \
-  "$R/desktop.ppm" | timeout 15 socat - "UNIX-CONNECT:$B/qmp.sock" > /dev/null 2>&1
-sleep 1
-if [[ -s $R/desktop.ppm ]]; then
-  kv desktop_colours "$(python3 -I - "$R/desktop.ppm" << 'EOF'
-import sys
-d = open(sys.argv[1], "rb").read()
-# P6: magic, width, height, maxval, then the pixels.
-parts, i = [], 0
-while len(parts) < 4:
-    while d[i:i + 1].isspace():
-        i += 1
-    j = i
-    while not d[j:j + 1].isspace():
-        j += 1
-    parts.append(d[i:j])
-    i = j
-w, h = int(parts[1]), int(parts[2])
-px = d[i + 1:]
-seen = {px[o:o + 3] for y in range(0, h, 8) for o in range(y * w * 3, (y + 1) * w * 3, 24)}
-print(len(seen))
-EOF
-)"
+# The guest's own capture of its screen (guest-run.sh's final phase): QEMU's screendump shows only
+# its placeholder, since reims-graphics-pci's frames go to the library's window.
+rm -f "$R/desktop.png"
+if Gcp "$GUEST_USER@127.0.0.1:lane-gate/desktop.png" "$R/desktop.png" 2> /dev/null && [[ -s $R/desktop.png ]]; then
+  kv desktop_colours "$(magick "$R/desktop.png" -format %k info: 2> /dev/null || echo 0)"
+  # The share of the pixels the commonest colour covers: a white or blank capture is one colour.
+  kv desktop_top_share "$(magick "$R/desktop.png" -format %c histogram:info:- 2> /dev/null |
+    awk '{n = $1 + 0; t += n; if (n > m) m = n} END {printf "%.3f", t ? m / t : 1}')"
+  magick "$R/desktop.png" -resize 25% "$R/desktop.png" 2> /dev/null || true
 fi
 exit 0
