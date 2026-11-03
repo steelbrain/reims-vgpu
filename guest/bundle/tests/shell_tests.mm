@@ -2586,6 +2586,70 @@ void test_library_members_as_metal()
 	}
 }
 
+// A post-tessellation vertex function answers its [[patch]]'s type and control point count, from
+// the library's function list, and every other function MTLPatchTypeNone and -1, as Metal's own
+// functions answer for the same bytes (RgfxLibrary.mm, rgfxPatchOf).
+void test_function_patch_answers()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_PATCH");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	uint32_t status = 0;
+	RgfxLibrary *ours = [RgfxLibrary libraryWithData:bytes.bytes
+	                                          length:bytes.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(ours != nil);
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	id<MTLLibrary> theirs = [MTLCreateSystemDefaultDevice() newLibraryWithData:data error:nil];
+	CHECK(theirs != nil);
+	const struct {
+		const char *name;
+		MTLPatchType type;
+		NSInteger count;
+	} want[] = {
+		{"patch_quad4", MTLPatchTypeQuad, 4},
+		{"patch_quad_any", MTLPatchTypeQuad, -1},
+		{"patch_quad32", MTLPatchTypeQuad, 32},
+		{"patch_triangle_any", MTLPatchTypeTriangle, -1},
+		{"patch_triangle3", MTLPatchTypeTriangle, 3},
+		{"patch_quad_no_points", MTLPatchTypeQuad, -1},
+		{"plain_vertex", MTLPatchTypeNone, -1},
+		{"plain_fragment", MTLPatchTypeNone, -1},
+		{"plain_kernel", MTLPatchTypeNone, -1},
+	};
+	for (const auto &w : want) {
+		NSString *name = @(w.name);
+		id<MTLFunction> f = [ours newFunctionWithName:name];
+		CHECK(f != nil);
+		CHECK(f.patchType == w.type);
+		CHECK(f.patchControlPointCount == w.count);
+		id<MTLFunction> g = [theirs newFunctionWithName:name];
+		CHECK(g != nil && g.patchType == f.patchType &&
+		      g.patchControlPointCount == f.patchControlPointCount);
+	}
+	// A function made apart from the library's table states no patch.
+	RgfxFunction *bare = [RgfxFunction functionWithLibrary:ours
+	                                                  name:@"patch_quad4"
+	                                             constants:nullptr
+	                                                 count:0
+	                                                device:nil
+	                                            serializer:&fx.ser];
+	CHECK(bare.patchType == MTLPatchTypeNone && bare.patchControlPointCount == -1);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A Core Image kernel library's extern functions come from its shadow, Metal's own library over
 // the same bytes: their names, each a function of functionType 4 that holds Metal's own, and nil
 // for a name the shadow does not hold; functionNames leaves them out, as Metal's does. Core
@@ -9358,6 +9422,7 @@ int main(int argc, char **argv)
 		test_async_creates_keep_what_they_use();
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
+		test_function_patch_answers();
 		test_stitched_library_over_shadows();
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();

@@ -100,6 +100,12 @@ typedef struct {
 /// in the .metallib's function list.
 - (void)rgfxSetBitCodeHash:(const uint8_t *)hash;
 
+/// Sets what `patchType` and `patchControlPointCount` answer: the library reads them from the
+/// .metallib's function list (a post-tessellation vertex function's TESS tag). A function made
+/// without them answers MTLPatchTypeNone and -1, as Metal's answer for a function with no
+/// [[patch]].
+- (void)rgfxSetPatchType:(MTLPatchType)type controlPointCount:(NSInteger)count;
+
 /// Sets the function Metal's own library made of the same entry point (`shadow`, an extern
 /// function of the library's shadow, RgfxLibrary): what Metal's Core Image link reads in this
 /// function's place, since it reads Metal's internal objects no RgfxFunction holds. A function

@@ -44,6 +44,8 @@ struct MetallibFunction {
 	bool haveOffsets = false;
 	std::vector<RgfxConstantDecl> constants;
 	bool haveConstants = false;
+	uint8_t tess = 0; // the TESS tag of a post-tessellation vertex function (rgfxPatchOf)
+	bool hasTess = false;
 };
 
 uint16_t rd16(const uint8_t *p)
@@ -85,6 +87,19 @@ MTLFunctionType metallibStage(uint8_t t)
 	default:
 		return MTLFunctionTypeVisible;
 	}
+}
+
+// A post-tessellation vertex function's patch type and control point count, from its TESS tag
+// byte: the type (MTLPatchType) in the low two bits, the count above them, 63 where the
+// shader's [[patch]] states none, which Metal answers as -1. measured: the tag Apple's metal
+// compiler writes for [[patch(triangle|quad[, 3|4|16|32])]] (macOS 27 SDK, deployment targets
+// 14.0 and 27.0), against what Metal's own functions answer for those bytes on the M3 Max
+// (macOS 27) and on the AMD 5300M and Intel 630 (macOS 26.7.1). A function with no TESS tag
+// answers MTLPatchTypeNone and -1 on all three.
+void rgfxPatchOf(uint8_t tess, MTLPatchType *type, NSInteger *count)
+{
+	*type = static_cast<MTLPatchType>(tess & 3);
+	*count = (tess >> 2) == 63 ? -1 : static_cast<NSInteger>(tess >> 2);
 }
 
 // Reads a .metallib's function list: the header's function-list offset (at 0x18),
@@ -131,6 +146,9 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 			} else if (std::memcmp(p + t, "OFFT", 4) == 0 && size >= 8) {
 				f.publicOffset = rd64(data);
 				f.haveOffsets = true;
+			} else if (std::memcmp(p + t, "TESS", 4) == 0 && size >= 1) {
+				f.tess = data[0];
+				f.hasTess = true;
 			}
 			t += 6 + static_cast<uint64_t>(size);
 		}
@@ -491,6 +509,12 @@ static bool rgfxMade(uint32_t status)
 		[fn rgfxSetFunctionType:entry->type];
 		if (entry->hasHash)
 			[fn rgfxSetBitCodeHash:entry->hash];
+		if (entry->hasTess) {
+			MTLPatchType patchType;
+			NSInteger controlPoints;
+			rgfxPatchOf(entry->tess, &patchType, &controlPoints);
+			[fn rgfxSetPatchType:patchType controlPointCount:controlPoints];
+		}
 		if (entry->type == MTLFunctionTypeVertex || entry->type == MTLFunctionTypeFragment ||
 		    entry->type == MTLFunctionTypeKernel)
 			[fn rgfxSetAirFunction:[self rgfxAirFunctionNamed:entry->name]];

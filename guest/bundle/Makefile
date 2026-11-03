@@ -197,6 +197,15 @@ $(STITCHABLE): tests/stitchable.metal Makefile
 		-o $(BUILD)/stitchable.air
 	xcrun -sdk macosx metallib $(BUILD)/stitchable.air -o $@
 
+# The post-tessellation vertex functions of tests/patch.metal, for the shell tests' patch answers.
+PATCH_LIB = $(BUILD)/patch.metallib
+
+$(PATCH_LIB): tests/patch.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/patch.metal \
+		-o $(BUILD)/patch.air
+	xcrun -sdk macosx metallib $(BUILD)/patch.air -o $@
+
 # --- the AIR argument reader's check (x86_64, Rosetta) ------------------------
 # The reader (src/RgfxAirArguments.*) over a .metallib Apple's Metal compiler builds here from
 # tests/air_arguments.metal, never committed.
@@ -242,11 +251,11 @@ $(VIDEO_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o tests/video_h264_tes
 		tests/video_h264_tests.cpp -o $@
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) \
-	$(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(BUNDLEBIN)
+	$(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
-		$(SHELL_TESTBIN)
+		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)

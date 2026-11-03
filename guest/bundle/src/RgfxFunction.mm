@@ -51,6 +51,8 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	BOOL _haveType;
 	RgfxBitCodeHash _hash;                        // the bitcode hash, from the library's table
 	BOOL _haveHash;
+	MTLPatchType _patchType;                      // the [[patch]] type and control point
+	NSInteger _patchControlPointCount;            //   count, from the library's table
 	MTLFunctionOptions _options;                  // the descriptor's, where made from one
 	std::string _specializedName;                 // the descriptor's, where it gave one
 	BOOL _haveSpecializedName;
@@ -96,6 +98,8 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 		_library = library;
 		_libraryObjId = library != nil ? library.rgfxObjId : RGFX_OBJ_NONE;
 		_name = name.UTF8String ? name.UTF8String : "";
+		_patchType = MTLPatchTypeNone;
+		_patchControlPointCount = -1;
 		if (count && constants) {
 			_constants.assign(constants, constants + count);
 		}
@@ -127,6 +131,12 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 {
 	_type = type;
 	_haveType = YES;
+}
+
+- (void)rgfxSetPatchType:(MTLPatchType)type controlPointCount:(NSInteger)count
+{
+	_patchType = type;
+	_patchControlPointCount = count;
 }
 
 - (void)rgfxSetBitCodeHash:(const uint8_t *)hash
@@ -225,12 +235,12 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 
 - (MTLPatchType)patchType
 {
-	return MTLPatchTypeNone;
+	return _patchType;
 }
 
 - (NSInteger)patchControlPointCount
 {
-	return 0;
+	return _patchControlPointCount;
 }
 
 - (MTLFunctionOptions)options

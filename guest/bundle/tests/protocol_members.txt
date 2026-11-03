@@ -250,8 +250,8 @@ name implemented
 newArgumentEncoderWithBufferIndex: implemented
 newArgumentEncoderWithBufferIndex:reflection: partial an argument buffer's reflection (no argument reflection on the wire)
 options implemented
-patchControlPointCount gap aud-tests-02: answers 0 for every function; Metal answers the [[patch]] control point count, or -1 where the shader states none (MTLLibrary.h; measured: M3 Max, AMD 5300M, Intel 630)
-patchType gap aud-tests-02: answers MTLPatchTypeNone for every function; Metal answers the [[patch]] type of a post-tessellation vertex function (measured: M3 Max, AMD 5300M, Intel 630), and the device draws patches
+patchControlPointCount implemented
+patchType implemented
 stageInputAttributes unsupported a function's stage-in attributes (its reflection is not read)
 vertexAttributes unsupported a function's vertex attributes (its reflection is not read)
 
