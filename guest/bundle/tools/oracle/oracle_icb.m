@@ -22,7 +22,8 @@
 //   gpu         kernel-encoded render and compute commands (an ICB in an argument buffer), GPU
 //               reset, a GPU-encoded ICB copied, CPU and GPU writes mixed
 //   residency   an executed ICB's buffers without useResource
-//   timing      CPU encode cost per command, execution GPU time
+//   timing      CPU encode cost per command at 1024 and 16384, the commit after it, execution
+//               GPU time
 //   freed       buffers the commands name released before an execute, a heap's among them
 //   resets      what a command's reset and resetWithRange: keep of a command's pipeline state
 // Render results print as the 8 cells of a 64x8 target, each the hex digit of the color index
@@ -1870,29 +1871,52 @@ static void case_resets(void)
 
 // ---- timing ----------------------------------------------------------------------------------
 
+// The wall time of committing an empty command buffer and waiting for it: what a commit after
+// CPU encodes costs on top of an empty one's, where the device posts the encodes there.
+static double commit_ms(void)
+{
+	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	double t0 = oracle_now_ms();
+	[cb commit];
+	[cb waitUntilCompleted];
+	return oracle_now_ms() - t0;
+}
+
 static void case_timing(void)
 {
 	printf("timing:\n");
-	const NSUInteger n = 16384;
+	const double empty = commit_ms();
+	printf("  an empty command buffer's commit and wait: %.0f us\n", empty * 1e3);
+	NSUInteger n = 1024;
+	for (; n <= 16384; n *= 16) {
+		id<MTLIndirectCommandBuffer> b = icb(rdesc(MTLIndirectCommandTypeDraw, NO, NO), n);
+		double t0 = oracle_now_ms();
+		for (NSUInteger i = 0; i < n; i++)
+			enc_draw(b, i, i % 8, i % 15, YES);
+		double t1 = oracle_now_ms();
+		printf("  %5lu: CPU encode, pipeline + 2 buffers + draw: %.0f ns a command, the commit "
+		       "after it %.0f us\n",
+		       (unsigned long)n, (t1 - t0) * 1e6 / n, commit_ms() * 1e3);
+		id<MTLIndirectCommandBuffer> bi = icb(rdesc(MTLIndirectCommandTypeDraw, YES, YES), n);
+		t0 = oracle_now_ms();
+		for (NSUInteger i = 0; i < n; i++)
+			[[bi indirectRenderCommandAtIndex:i] drawPrimitives:MTLPrimitiveTypeTriangleStrip
+			                                        vertexStart:0
+			                                        vertexCount:4
+			                                      instanceCount:1
+			                                       baseInstance:i % 8];
+		t1 = oracle_now_ms();
+		printf("  %5lu: CPU encode, draw alone (inherited): %.0f ns a command, the commit after "
+		       "it %.0f us\n",
+		       (unsigned long)n, (t1 - t0) * 1e6 / n, commit_ms() * 1e3);
+	}
+	n = 16384;
 	id<MTLIndirectCommandBuffer> b = icb(rdesc(MTLIndirectCommandTypeDraw, NO, NO), n);
-	double t0 = oracle_now_ms();
 	for (NSUInteger i = 0; i < n; i++)
 		enc_draw(b, i, i % 8, i % 15, YES);
-	double t1 = oracle_now_ms();
-	printf("  CPU encode, pipeline + 2 buffers + draw: %.0f ns a command\n", (t1 - t0) * 1e6 / n);
-	id<MTLIndirectCommandBuffer> bi = icb(rdesc(MTLIndirectCommandTypeDraw, YES, YES), n);
-	t0 = oracle_now_ms();
-	for (NSUInteger i = 0; i < n; i++)
-		[[bi indirectRenderCommandAtIndex:i] drawPrimitives:MTLPrimitiveTypeTriangleStrip
-		                                        vertexStart:0
-		                                        vertexCount:4
-		                                      instanceCount:1
-		                                       baseInstance:i % 8];
-	t1 = oracle_now_ms();
-	printf("  CPU encode, draw alone (inherited): %.0f ns a command\n", (t1 - t0) * 1e6 / n);
-	t0 = oracle_now_ms();
+	double t0 = oracle_now_ms();
 	[b resetWithRange:NSMakeRange(0, n)];
-	t1 = oracle_now_ms();
+	double t1 = oracle_now_ms();
 	printf("  resetWithRange of %lu: %.3f ms\n", (unsigned long)n, t1 - t0);
 	for (NSUInteger i = 0; i < n; i++)
 		enc_draw(b, i, i % 8, i % 15, YES);
