@@ -54,7 +54,9 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	context = 0;
 	slot = 0;
 	queueCount = 0;
+	creatingQueue = 0;
 	queueLock = IOLockAlloc();
+	listLock = IOLockAlloc();
 	completionLock = IOLockAlloc();
 	completionCount = 0;
 	completionsClosed = false;
@@ -64,7 +66,8 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	windowBase = 0;
 	windowSize = 0;
 	grants = grantNs = revokes = revokeNs = 0;
-	return queueLock != nullptr && completionLock != nullptr && windowLock != nullptr;
+	return queueLock != nullptr && listLock != nullptr && completionLock != nullptr &&
+	       windowLock != nullptr;
 }
 
 bool RgfxAcceleratorUserClient::start(IOService *provider)
@@ -87,6 +90,9 @@ void RgfxAcceleratorUserClient::free()
 	if (queueLock)
 		IOLockFree(queueLock);
 	queueLock = nullptr;
+	if (listLock)
+		IOLockFree(listLock);
+	listLock = nullptr;
 	if (completionLock)
 		IOLockFree(completionLock);
 	completionLock = nullptr;

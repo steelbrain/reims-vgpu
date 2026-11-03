@@ -40,9 +40,10 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		IOLockLock(queueLock);
 		if (!hasContext) {
 			// The window first: a context with no window is never opened.
+			UInt32 opened = 0, openedSlot = 0;
 			IOReturn r = openWindow();
 			if (r == kIOReturnSuccess) {
-				r = owner->openContext(&context, &slot);
+				r = owner->openContext(&opened, &openedSlot);
 				if (r != kIOReturnSuccess)
 					closeWindow();
 			}
@@ -50,7 +51,11 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 				IOLockUnlock(queueLock);
 				return r;
 			}
+			IOLockLock(listLock);
+			context = opened;
+			slot = openedSlot;
 			hasContext = true;
+			IOLockUnlock(listLock);
 		}
 		out[0] = context;
 		out[1] = static_cast<uint64_t>(context) << RGFX_CONTEXT_OBJ_ID_SHIFT;
@@ -143,10 +148,18 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			unpin();
 			return watch;
 		}
+		// Named in the making, so a destroy of its id meanwhile waits for the create
+		// (destroyQueueIfTracked).
+		IOLockLock(listLock);
+		creatingQueue = open.obj_id;
+		IOLockUnlock(listLock);
 		UInt32 status = owner->openQueue(open, rgfxQueueFlagsSent(granted, windowServer, word));
+		IOLockLock(listLock);
 		if (status == RGFX_STATUS_OK)
 			queues[queueCount++] = open.obj_id;
-		else
+		creatingQueue = 0;
+		IOLockUnlock(listLock);
+		if (status != RGFX_STATUS_OK)
 			owner->unwatchQueue(this, open.obj_id);
 		IOLockUnlock(queueLock);
 		unpin();
@@ -261,12 +274,12 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 // kRgfxAccelMethodTakeAnswers.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
-	// The context as it is now, read under the queue lock that releaseContext closes it under,
+	// The context as it is now, read under the list lock that releaseContext closes it under,
 	// to tell after the post whether it closed meanwhile (rgfxSubmitDestroysBehind).
-	IOLockLock(queueLock);
+	IOLockLock(listLock);
 	const bool open = hasContext;
 	const UInt32 ctx = context;
-	IOLockUnlock(queueLock);
+	IOLockUnlock(listLock);
 	if (!open || a->scalarOutputCount != 1 || a->scalarInputCount > 1 ||
 	    (a->scalarInputCount == 1 && (a->scalarInput[0] & ~uint64_t{kRgfxSubmitDeferred}) != 0))
 		return kIOReturnBadArgument;
@@ -368,9 +381,9 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	// closed since the check: its CONTEXT_CLOSE may then have gone before this create, which the
 	// device's close then never dropped.
 	const bool posted = checked && (r == kIOReturnSuccess || r == kIOReturnTimeout);
-	IOLockLock(queueLock);
+	IOLockLock(listLock);
 	const bool closedSince = !hasContext || context != ctx;
-	IOLockUnlock(queueLock);
+	IOLockUnlock(listLock);
 	if (rgfxSubmitDestroysBehind(type, posted, r == kIOReturnTimeout, closedSince)) {
 		// Not answered in time (the client takes the create as failed, and may make it again
 		// under a new id), or made for a context that has closed: destroy it, so the device keeps
@@ -406,10 +419,10 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 // whether the one it waited for is among them.
 IOReturn RgfxAcceleratorUserClient::takeAnswersMethod(IOExternalMethodArguments *a)
 {
-	IOLockLock(queueLock);
+	IOLockLock(listLock);
 	const bool open = hasContext;
 	const UInt32 ctx = context;
-	IOLockUnlock(queueLock);
+	IOLockUnlock(listLock);
 	if (!open || a->scalarInputCount != 1 || a->scalarOutputCount != 1 || !a->structureOutput)
 		return kIOReturnBadArgument;
 	UInt32 length = 0, count = 0;
@@ -424,28 +437,43 @@ IOReturn RgfxAcceleratorUserClient::takeAnswersMethod(IOExternalMethodArguments 
 // Whether `queue` is one of the client's open queues.
 bool RgfxAcceleratorUserClient::ownsQueue(UInt64 queue)
 {
-	IOLockLock(queueLock);
+	IOLockLock(listLock);
 	bool owns = false;
 	for (UInt32 i = 0; i < queueCount && !owns; i++)
 		owns = queues[i] == queue;
-	IOLockUnlock(queueLock);
+	IOLockUnlock(listLock);
 	return owns;
 }
 
 bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
 {
+	// The destroy of any other object (most of them, posted through submit) is told at once from
+	// the list: an id neither listed nor in the making is none of the client's queues, and
+	// waits for no create or surface ask under the queue lock.
+	IOLockLock(listLock);
+	bool tracked = objId != 0 && objId == creatingQueue;
+	for (UInt32 i = 0; i < queueCount && !tracked; i++)
+		tracked = queues[i] == objId;
+	IOLockUnlock(listLock);
+	if (!tracked)
+		return false;
 	bool found = false;
-	// The whole find, unwatch, close and remove under the queue lock, which QUEUE_CREATE watches
+	// The whole find, remove, unwatch and close under the queue lock, which QUEUE_CREATE watches
 	// and lists a queue under, so a create of this id cannot slip between the check and the post.
+	// Off the list first, so no surface write or retire named for it is taken from here.
 	IOLockLock(queueLock);
+	IOLockLock(listLock);
 	for (UInt32 i = 0; i < queueCount; i++) {
 		if (queues[i] == objId) {
-			owner->unwatchQueue(this, objId);
-			owner->closeQueue(objId);
 			queues[i] = queues[--queueCount];
 			found = true;
 			break;
 		}
+	}
+	IOLockUnlock(listLock);
+	if (found) {
+		owner->unwatchQueue(this, objId);
+		owner->closeQueue(objId);
 	}
 	IOLockUnlock(queueLock);
 	return found;
@@ -536,6 +564,16 @@ void RgfxAcceleratorUserClient::releaseContext()
 	IOLockWakeup(completionLock, &completionCount, false);
 	IOLockUnlock(completionLock);
 	IOLockLock(queueLock);
+	// Closed to the readers first, before its CONTEXT_CLOSE is posted: a submit that finds it
+	// open posts behind the close only to find it closed after (rgfxSubmitDestroysBehind), and
+	// no surface write or retire is taken for its queues, whose writes the unwatch forgets. The
+	// list's entries stay for the closes below: no create or destroy runs under the queue lock.
+	IOLockLock(listLock);
+	const bool had = hasContext;
+	const UInt32 listed = queueCount;
+	hasContext = false;
+	queueCount = 0;
+	IOLockUnlock(listLock);
 	// The process reaches nothing of the region from here on: its window goes before anything
 	// it held is freed, and given to another process.
 	closeWindow();
@@ -543,13 +581,12 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// Under the queue lock, which a QUEUE_CREATE watches its ring under, so none is left.
 	if (accel)
 		accel->unwatchClient(this);
-	if (!hasContext || !accel) {
+	if (!had || !accel) {
 		IOLockUnlock(queueLock);
 		return;
 	}
-	for (UInt32 i = 0; i < queueCount; i++)
+	for (UInt32 i = 0; i < listed; i++)
 		accel->closeQueue(queues[i]);
-	queueCount = 0;
 	// The blocks go only once the device has answered the close: it then holds nothing of
 	// them, and the context's command buffers have finished.
 	bool closed = accel->closeContext(context, slot);
@@ -562,7 +599,6 @@ void RgfxAcceleratorUserClient::releaseContext()
 		accel->keepBlocks(this);
 	accel->dropSurfaceBlocks(this, closed);
 	accel->revokeGrants(this);
-	hasContext = false;
 	IOLockUnlock(queueLock);
 	// The device dropped this context's objects at its close: a block whose release it refused
 	// because an object lay in it may now be free to go.

@@ -106,12 +106,21 @@ private:
 	static const UInt32 kMaxQueues = kRgfxMaxQueuesPerClient;
 	// The most bytes one kRgfxAccelMethodSurfaceWrites names: 1024 surfaces.
 	static const UInt64 kMaxSurfaceWritesBytes = (3 + 2 * 1024) * sizeof(UInt64);
+	// The context and the queues, changed under both locks: queueLock is held across what
+	// changes them (a context's open and release, a queue's create and destroy) and across a
+	// surface block's ask and a resource id chunk's, which a close must not overtake, each of
+	// which may wait for the device. listLock is held only to read or write these fields, so the
+	// process's submits, its commits' surface writes and its completions' retires, which only read
+	// them, never wait behind another thread's wait for the device.
 	bool hasContext;
 	UInt32 context;
 	UInt32 slot;
 	UInt32 queueCount;
 	UInt64 queues[kMaxQueues];
+	// The queue a QUEUE_CREATE is making, its device's answer not yet in; 0 for none.
+	UInt64 creatingQueue;
 	IOLock *queueLock;
+	IOLock *listLock;
 
 	// Under completionLock: the count wakeCompletions raises, which a waiter sleeps on, and
 	// whether the context is released (every waiter then returns).
