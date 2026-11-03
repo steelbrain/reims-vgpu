@@ -6,7 +6,7 @@
 //! doorbell (the host's `ioeventfd`, or a `DOORBELL` write through [`Device::mmio_write`]) or by
 //! the guest's `STATUS`, it takes every message the guest has published, answers each on the
 //! completion ring, then sleeps with the ring's `consumer_idle` handshake (`ring`). While the
-//! completion ring has no room, it waits for the guest to take more, polling, and takes no
+//! completion ring has no room, it waits for the guest to take more ([`Room`]), and takes no
 //! command meanwhile. The guest's kexts are its sole producer, under one lock: the framebuffer's
 //! display commands, and the object lifecycle the accelerator posts for the guest's processes
 //! (creates and destroys, `QUEUE_CREATE`, `CONTEXT_CLOSE`), which the control thread hands to the
@@ -117,9 +117,51 @@ use crate::wire::*;
 /// `-machine max-ram-below-4g=1G`). With q35's default of 2 GiB there the BAR gets no address.
 pub const REGION_SIZE: u64 = 1 << 30;
 
-/// How long a thread waits before it looks for room in a full completion ring again: the guest
-/// makes room by moving the ring's consumer count, which wakes nothing.
+/// How long a post waits for room in a full completion ring before it looks again, where nothing
+/// wakes it sooner ([`Room`]): the guest makes room by moving the ring's consumer count, which
+/// rings nothing.
 const ROOM_POLL: Duration = Duration::from_millis(1);
+
+/// Where the posts onto one full completion ring wait for room, each on the thread that posts
+/// it. The guest makes room by moving the ring's consumer count, a write to the region that
+/// wakes nothing, so a waiting post looks again after the device's poll ([`ROOM_POLL`]); what
+/// the host does see wakes it at once: the ring's doorbell (a guest process takes its queue's
+/// completions on the thread that submits while its rings are full, then rings the queue's
+/// doorbell for what it submits; ring 0's, rung through [`Device::mmio_write`] or the host's
+/// doorbell file, which wakes the control thread), the device's reset, the queue's end and the
+/// device's.
+#[derive(Default)]
+struct Room {
+    /// Moved on at each wake, so a wake between a post's look and its wait ends the wait.
+    wakes: AtomicU64,
+    /// Held around a wait's look at `wakes` and by a wake's notify.
+    lock: Mutex<()>,
+    /// Notified at each wake.
+    woken: Condvar,
+}
+
+impl Room {
+    /// The wakes so far, read before a post looks for room.
+    fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Acquire)
+    }
+
+    /// Wakes the posts waiting for room: they look again at once.
+    fn wake(&self) {
+        self.wakes.fetch_add(1, Ordering::AcqRel);
+        drop(self.lock.lock());
+        self.woken.notify_all();
+    }
+
+    /// Waits for a wake after `seen` ([`Self::wakes`] before the post that found no room), or
+    /// for `poll`.
+    fn wait(&self, seen: u64, poll: Duration) {
+        let mut held = self.lock.lock();
+        if self.wakes.load(Ordering::Acquire) == seen {
+            self.woken.wait_for(&mut held, poll);
+        }
+    }
+}
 
 /// The smallest a command queue's data ring may be: a power of two large enough to hold a
 /// completion record with room to spare. A `QUEUE_CREATE` with a smaller ring gets no per-queue
@@ -361,6 +403,11 @@ pub(crate) struct Shared {
     pub(crate) display: Mutex<DisplayState>,
     /// The control completion ring.
     completion: Mutex<Producer>,
+    /// Where posts onto the control completion ring wait for room.
+    room: Room,
+    /// How long a post waits for room before it looks again, in nanoseconds: [`ROOM_POLL`]; the
+    /// tests make it long to see what wakes a post.
+    room_poll_ns: AtomicU64,
     /// The control submission ring's count through the last message the control thread has
     /// carried out or handed to the host: a command buffer waits for it to pass what was
     /// published before it.
@@ -432,6 +479,8 @@ pub(crate) struct QueueShared {
     consuming: Mutex<Option<Handed>>,
     /// The completion ring.
     complete: Mutex<Producer>,
+    /// Where posts onto the completion ring wait for room.
+    room: Room,
     /// The service thread's own wake.
     wake: Wake,
     /// Set when the queue is destroyed, or at a reset or the device's end.
@@ -444,10 +493,19 @@ impl QueueShared {
         self.ending.load(Ordering::Acquire)
     }
 
-    /// Ends the queue's service: its thread stops at its next wake.
+    /// Ends the queue's service: its thread stops at its next wake, and a post waiting for room
+    /// on its completion ring stops waiting.
     fn end(&self) {
         self.ending.store(true, Ordering::Release);
         self.wake.wake();
+        self.room.wake();
+    }
+
+    /// Its doorbell was rung: its service thread wakes, and so does a post waiting for room on
+    /// its completion ring, as the guest may have taken completions before it rang.
+    fn rung(&self) {
+        self.wake.wake();
+        self.room.wake();
     }
 
     /// Waits out a take of the submission ring or a post onto the completion ring that was under
@@ -516,6 +574,8 @@ impl Device {
             }),
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
+            room: Room::default(),
+            room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
             control_done: AtomicU64::new(0),
             control_moved: Mutex::new(()),
             control_moved_signal: Condvar::new(),
@@ -762,6 +822,7 @@ impl Shared {
             queue.end();
         }
         self.signal_control_moved();
+        self.room.wake();
     }
 
     /// Wakes the queue threads waiting for `control_done` to move, after it moves, a reset or the
@@ -815,6 +876,7 @@ impl Shared {
         }
         self.region.revoke_all();
         self.signal_control_moved();
+        self.room.wake();
         self.wake.wake();
         self.screen.scanout(None);
         self.screen.cursor_image(None);
@@ -850,6 +912,8 @@ impl Shared {
                 break;
             }
             self.wake.sleep(self.doorbell.get().map(AsRawFd::as_raw_fd));
+            // A doorbell may follow the guest's take of completions.
+            self.room.wake();
             if idle {
                 self.submit.lock().consumer.awake(&self.region);
             }
@@ -913,14 +977,20 @@ impl Shared {
         }
     }
 
-    /// Posts `message`, waiting for room while the device is not reset or ended.
+    /// Posts `message`, waiting for room ([`Room`]) while the device is not reset or ended.
     fn post_waiting(&self, message: &[u8], epoch: u64) {
-        while self.post(message, epoch) == Post::NoRoom {
-            if self.ending() {
+        loop {
+            let seen = self.room.wakes();
+            if self.post(message, epoch) != Post::NoRoom || self.ending() {
                 return;
             }
-            std::thread::sleep(ROOM_POLL);
+            self.room.wait(seen, self.room_poll());
         }
+    }
+
+    /// How long a post waits for room before it looks again ([`ROOM_POLL`]).
+    fn room_poll(&self) -> Duration {
+        Duration::from_nanos(self.room_poll_ns.load(Ordering::Relaxed))
     }
 
     /// Posts `message` into the completion ring, for work begun at reset count `epoch`, and
@@ -1097,10 +1167,11 @@ impl Shared {
     fn ring_doorbell(&self, ring_id: u64) {
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
             self.wake.wake();
+            self.room.wake();
             return;
         }
         if let Some(queue) = self.queues.lock().by_ring.get(&ring_id) {
-            queue.wake.wake();
+            queue.rung();
         }
     }
 
@@ -1110,6 +1181,7 @@ impl Shared {
     fn ring_taking(&self, ring_id: u64) {
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
             self.wake.wake();
+            self.room.wake();
             return;
         }
         let queue = match self.queues.try_lock() {
@@ -1118,7 +1190,7 @@ impl Shared {
         };
         if let Some(queue) = queue {
             self.take_on_doorbell(&queue);
-            queue.wake.wake();
+            queue.rung();
         }
     }
 
@@ -1289,6 +1361,7 @@ impl Shared {
             }),
             consuming: Mutex::new(None),
             complete: Mutex::new(producer),
+            room: Room::default(),
             wake,
             ending: AtomicBool::new(false),
         });
@@ -1549,14 +1622,18 @@ impl Shared {
         Some(Message { header, bytes })
     }
 
-    /// Posts `message` onto `queue`'s completion ring, waiting for room while the device is not
-    /// reset or ended and the queue lives.
+    /// Posts `message` onto `queue`'s completion ring, waiting for room ([`Room`]) while the
+    /// device is not reset or ended and the queue lives.
     fn post_queue_waiting(&self, queue: &QueueShared, message: &[u8], epoch: u64) {
-        while self.post_queue(queue, message, epoch) == Post::NoRoom {
-            if self.ending() || queue.ended() {
+        loop {
+            let seen = queue.room.wakes();
+            if self.post_queue(queue, message, epoch) != Post::NoRoom
+                || self.ending()
+                || queue.ended()
+            {
                 return;
             }
-            std::thread::sleep(ROOM_POLL);
+            queue.room.wait(seen, self.room_poll());
         }
     }
 

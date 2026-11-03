@@ -812,6 +812,42 @@ fn a_full_completion_ring_holds_the_commands_back() {
     }
 }
 
+/// A post waiting for room on a full completion ring looks again as soon as the ring's doorbell
+/// is rung, and stops waiting at a reset, though its poll is long: the control thread, holding
+/// back the commands behind an answer the full ring has no room for, answers each once the guest
+/// takes an event and rings, and, waiting at a reset, answers the guest's first command after it
+#[test]
+fn a_post_waiting_for_room_is_woken_by_the_doorbell_and_a_reset() {
+    let mut rig = Rig::new();
+    rig.device
+        .shared
+        .room_poll_ns
+        .store(60_000_000_000, Ordering::Relaxed);
+    rig.start();
+    // 24-byte answers: the 32 KiB ring holds 1365 of them.
+    let count = 1400u64;
+    for _ in 0..count {
+        rig.send(vblank(0));
+    }
+    for seqno in 1..=count {
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+        rig.device
+            .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    }
+
+    // Full again, then a reset: the waiting answer is dropped, and the next command is answered.
+    for _ in 0..count {
+        rig.send(vblank(0));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+    rig.start();
+    let seqno = rig.send(vblank(0));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+}
+
 /// A host that records the vectors it raises and the types of the stage-3 messages it is handed,
 /// and posts what a decoder would: a command buffer's completion through the queue's poster, and a
 /// render pipeline's reflection through ring 0's. A buffer create waits while `gate` is shut: a
