@@ -1752,9 +1752,11 @@ mod tests {
             "beside the pages"
         );
 
+        // Every run lies in the rig's own RAM: the watchers are the process's, and a run past
+        // it would mark the caches of other tests running beside this one written.
         device_writes::wrote(&[
             first + page + 8..first + page + 16,
-            first + 9 * page..u64::MAX,
+            first + 5 * page..first + 7 * page,
         ]);
         let done = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&done);
@@ -1780,7 +1782,7 @@ mod tests {
         use_surfaces(&mut r, 1, 0x103, &[(BLOCK, 1, true)]);
         assert!(copies(&r.p.call_log().since(mark)).is_empty(), "once");
 
-        device_writes::wrote(&[first..first + 1, first + 9 * page..u64::MAX]);
+        device_writes::wrote(&[first..first + 1, first + 5 * page..first + 7 * page]);
         let released = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&released);
         let mark = r.p.call_log().mark();

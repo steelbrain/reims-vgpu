@@ -4662,10 +4662,11 @@ mod tests {
                 ),
             )
         };
+        // The logger is the process's: only this test's refusals, not another test's warnings.
         let lines: Vec<_> = logs
             .take()
             .into_iter()
-            .filter(|(level, ..)| *level == log::Level::Warn)
+            .filter(|(level, _, line)| *level == log::Level::Warn && line.contains(shape))
             .collect();
         assert_eq!(
             lines,
