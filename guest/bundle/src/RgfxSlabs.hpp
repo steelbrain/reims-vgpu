@@ -33,11 +33,13 @@
  * (start) zeroes dirty free bytes in pieces of kZeroPiece, so in a steady state a create finds
  * its range clean. A piece being zeroed is in no free run, so no create takes it meanwhile.
  *
- * LETTING GO. A class keeps up to two empty slabs; a third empty one goes, as does a cached slab
- * past the cap or idle. A slab goes by its source (its heap's OBJECT_DESTROY, then its block's
- * release, whose BLOCK_RELEASE the kext waits for), on the background thread, so a buffer's free
- * never waits for the host; without the thread, at once. Every buffer in a slab had its destroy
- * posted before its range came back, so the heap's destroy follows theirs.
+ * LETTING GO. A class keeps up to two empty slabs, each for kCacheIdleMs at most; a third empty
+ * one goes at once, and one left empty that long goes too, as does a cached slab past the cap or
+ * idle, so a process at rest holds only the slabs its buffers lie in. A slab goes by its source
+ * (its heap's OBJECT_DESTROY, then its block's release, whose BLOCK_RELEASE the kext waits for),
+ * on the background thread, so a buffer's free never waits for the host; without the thread, at
+ * once. Every buffer in a slab had its destroy posted before its range came back, so the heap's
+ * destroy follows theirs.
  *
  * THE FALLBACKS, in order, where a buffer finds no room in its class's slabs: a new slab; then,
  * once the source had no memory for one, the process's own empty and cached slabs let go and a
@@ -198,6 +200,11 @@ public:
 	bool makeBuffer(const Range &range, uint64_t length, uint32_t options,
 	                RgfxSlabSource::Made *out);
 
+	/// The clock the idle times are read from, in ms: `now(context)`, for the tests; the steady
+	/// clock where none is set. Set before any take.
+	typedef uint64_t (*Clock)(void *context);
+	void setClock(Clock now, void *context);
+
 	/// Gives `range` back, once its buffer's destroy is posted.
 	void give(const Range &range);
 
@@ -249,7 +256,7 @@ private:
 		uint64_t used = 0;         // bytes taken by buffers
 		uint32_t zeroing = 0;      // pieces the background is zeroing
 		bool doomed = false;       // let go: no buffer takes from it again
-		uint64_t idleSince = 0;    // a cached slab's time it was cached, in ms
+		uint64_t idleSince = 0;    // the time, in ms, a cached slab was cached, an empty one emptied
 	};
 
 	struct BySerial {
@@ -283,6 +290,12 @@ private:
 	void drop(Slab *slab);
 	/// The class of `options`. Caller holds the lock.
 	Class &classOf(uint32_t options);
+	/// Lets go the empty slabs of small buffers left empty kCacheIdleMs by `now`, and sets when
+	/// the next one is due (m_emptyDue, 0 for none). Caller holds the lock.
+	void decayEmpty(uint64_t now);
+	/// How long the thread may wait before a cached or empty slab is due to go, in ms; -1 where
+	/// none is. Caller holds the lock.
+	int64_t idleWait(uint64_t now) const;
 	void run();
 	uint64_t nowMs() const;
 
@@ -293,6 +306,9 @@ private:
 	std::set<Slab *> m_all;
 	std::vector<Slab *> m_cached;          // dedicated slabs with no buffer, oldest first
 	uint64_t m_cachedBytes = 0;
+	uint64_t m_emptyDue = 0;               // when an empty small slab is next due to go; 0 for none
+	Clock m_clock = nullptr;
+	void *m_clockContext = nullptr;
 	std::vector<Slab *> m_doomed;
 	std::set<Slab *, BySerial> m_dirtySlabs; // slabs with dirty free bytes
 	uint64_t m_nextSerial = 1;

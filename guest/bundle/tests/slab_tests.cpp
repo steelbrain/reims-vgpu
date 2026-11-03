@@ -303,6 +303,72 @@ void test_slab_empty_slabs_go()
 	slabs.give(r);
 }
 
+// The kept empty slabs go once they sat empty kCacheIdleMs, as a cached slab does, so a process
+// at rest holds only the slabs its buffers lie in; one a buffer took from meanwhile stays. The
+// background's step lets them go, its heap destroyed and its memory given back.
+uint64_t g_testNowMs = 0;
+uint64_t testClock(void *) { return g_testNowMs; }
+
+void test_slab_idle_empty_slabs_go()
+{
+	Source source(64 * kMiB);
+	RgfxSlabs slabs(source);
+	g_testNowMs = 1000;
+	slabs.setClock(&testClock, nullptr);
+	auto drain = [&]() {
+		while (slabs.step()) {
+		}
+	};
+	// Two slabs of the class, both emptied at 1000 ms; a third holds a buffer.
+	std::vector<RgfxSlabs::Range> held;
+	while (source.takes < 3) {
+		RgfxSlabs::Range r;
+		CHECK(slabs.take(0x20000, kShared, 0, &r));
+		held.push_back(r);
+	}
+	RgfxSlabs::Range last = held.back();
+	held.pop_back();
+	for (auto &r : held)
+		slabs.give(r);
+	drain();
+	CHECK(slabs.stats().emptySlabs == 2 && slabs.stats().slabs == 3 && source.heapDrops == 0);
+	// Not yet at 2999 ms.
+	g_testNowMs = 1000 + RgfxSlabs::kCacheIdleMs - 1;
+	drain();
+	CHECK(slabs.stats().emptySlabs == 2 && source.heapDrops == 0);
+	// At 3000 ms both go, their heaps destroyed and their memory given back; the slab with a
+	// buffer stays.
+	g_testNowMs = 1000 + RgfxSlabs::kCacheIdleMs;
+	drain();
+	CHECK(slabs.stats().emptySlabs == 0 && slabs.stats().slabs == 1);
+	CHECK(source.heapDrops == 2 && source.gives == 2 && slabs.stats().usedBytes == last.size);
+	// One emptied, then taken from again before its time: it stays, and goes once emptied
+	// for its own kCacheIdleMs.
+	slabs.give(last);
+	g_testNowMs += 1000;
+	RgfxSlabs::Range again;
+	CHECK(slabs.take(0x1000, kShared, 0, &again) && again.slab == last.slab);
+	g_testNowMs += RgfxSlabs::kCacheIdleMs;
+	drain();
+	CHECK(slabs.stats().slabs == 1 && source.heapDrops == 2);
+	slabs.give(again);
+	g_testNowMs += RgfxSlabs::kCacheIdleMs - 1;
+	drain();
+	CHECK(slabs.stats().slabs == 1);
+	g_testNowMs += 1;
+	drain();
+	CHECK(slabs.stats().slabs == 0 && source.heapDrops == 3 && source.gives == 3);
+	// A cached dedicated slab goes on the same clock.
+	RgfxSlabs::Range big;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big));
+	slabs.give(big);
+	drain();
+	CHECK(slabs.stats().cachedSlabs == 1);
+	g_testNowMs += RgfxSlabs::kCacheIdleMs;
+	drain();
+	CHECK(slabs.stats().cachedSlabs == 0 && slabs.stats().slabs == 0);
+}
+
 // A buffer past 1 MiB takes a slab of its own; once freed the slab is cached, and a later buffer
 // of its class that needs at least half of it lies there at offset 0, its bytes zeroed. The cache
 // holds a sixteenth of the source, the oldest let go first.
@@ -624,6 +690,7 @@ void rgfxSlabTests()
 	test_slab_reuse_and_fragmentation();
 	test_slab_zeroing();
 	test_slab_empty_slabs_go();
+	test_slab_idle_empty_slabs_go();
 	test_slab_dedicated_cache();
 	test_slab_fallbacks();
 	test_slab_thread();

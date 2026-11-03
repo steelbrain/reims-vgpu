@@ -243,8 +243,17 @@ bool RgfxSlabs::start()
 	return true;
 }
 
+void RgfxSlabs::setClock(Clock now, void *context)
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	m_clock = now;
+	m_clockContext = context;
+}
+
 uint64_t RgfxSlabs::nowMs() const
 {
+	if (m_clock != nullptr)
+		return m_clock(m_clockContext);
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
 	                                 .count());
@@ -456,8 +465,15 @@ void RgfxSlabs::give(const Range &range)
 		} else {
 			Class &cls = classOf(slab->options);
 			cls.open.insert(slab);
-			if (slab->used == 0 && ++cls.empty > kEmptyKept)
+			if (slab->used == 0 && ++cls.empty > kEmptyKept) {
 				doom(slab);
+			} else if (slab->used == 0) {
+				// Kept for kCacheIdleMs, then let go where nothing took from it meanwhile.
+				slab->idleSince = nowMs();
+				const uint64_t due = slab->idleSince + kCacheIdleMs;
+				if (m_emptyDue == 0 || due < m_emptyDue)
+					m_emptyDue = due;
+			}
 		}
 		dropNow = !m_running && !m_doomed.empty();
 	}
@@ -524,6 +540,8 @@ bool RgfxSlabs::step()
 		const uint64_t now = nowMs();
 		while (!m_cached.empty() && now - m_cached.front()->idleSince >= kCacheIdleMs)
 			doom(m_cached.front());
+		if (m_emptyDue != 0 && now >= m_emptyDue)
+			decayEmpty(now);
 		for (auto it = m_doomed.begin(); it != m_doomed.end(); ++it) {
 			if ((*it)->zeroing == 0) {
 				drops = *it;
@@ -588,16 +606,47 @@ void RgfxSlabs::run()
 		const bool work = !m_doomed.empty() || !m_dirtySlabs.empty();
 		if (work)
 			continue;
-		if (m_cached.empty()) {
+		const int64_t left = idleWait(nowMs());
+		if (left < 0)
 			m_wake.wait(hold);
-		} else {
-			const uint64_t idle = nowMs() - m_cached.front()->idleSince;
-			const uint64_t left = idle >= kCacheIdleMs ? 0 : kCacheIdleMs - idle;
+		else
 			m_wake.wait_for(hold, std::chrono::milliseconds(left + 1));
-		}
 		if (m_stop)
 			return;
 	}
+}
+
+void RgfxSlabs::decayEmpty(uint64_t now)
+{
+	std::vector<Slab *> idle;
+	uint64_t due = 0;
+	for (auto &entry : m_classes) {
+		for (Slab *slab : entry.second.slabs) {
+			if (slab->used != 0 || slab->doomed)
+				continue;
+			const uint64_t at = slab->idleSince + kCacheIdleMs;
+			if (now >= at)
+				idle.push_back(slab);
+			else if (due == 0 || at < due)
+				due = at;
+		}
+	}
+	for (Slab *slab : idle)
+		doom(slab);
+	m_emptyDue = due;
+}
+
+int64_t RgfxSlabs::idleWait(uint64_t now) const
+{
+	uint64_t due = m_emptyDue;
+	if (!m_cached.empty()) {
+		const uint64_t at = m_cached.front()->idleSince + kCacheIdleMs;
+		if (due == 0 || at < due)
+			due = at;
+	}
+	if (due == 0)
+		return -1;
+	return due > now ? static_cast<int64_t>(due - now) : 0;
 }
 
 RgfxSlabs::Stats RgfxSlabs::stats()

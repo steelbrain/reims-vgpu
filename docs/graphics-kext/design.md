@@ -1336,9 +1336,10 @@ the host's import, and the kext's block table holds one entry per slab:
 - A buffer up to 1 MiB shares a slab of its class, the slabs growing from
   128 KiB to 2 MiB; a larger one takes a slab of its own, which is cached for
   reuse at offset 0 once freed (a sixteenth of the region at most, 2 s idle).
-- A class keeps two empty slabs. A slab let go destroys its heap, then frees
-  its block on the background thread, so no buffer's free waits for a
-  `BLOCK_RELEASE`.
+- A class keeps two empty slabs, each for 2 s at most, so a process at rest
+  holds only the slabs its buffers lie in. A slab let go destroys its heap,
+  then frees its block on the background thread, so no buffer's free waits
+  for a `BLOCK_RELEASE`.
 - Where the region has no block for a new slab, the process's own empty and
   cached slabs go first, then smaller slabs are tried down to the buffer's
   size; nil only past that. Any other block of the process's the kext has no
