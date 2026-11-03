@@ -74,6 +74,15 @@ run_info() {
 	set -- $desk
 	if [ $# -eq 3 ]; then item desktop PASS "WindowServer $1, Dock $2, Finder $3"; else item desktop FAIL "WindowServer/Dock/Finder: $desk"; fi
 	run_memory
+	# The wire's features the host offered and the kext took (where the kext states them).
+	local feat; feat=$(ioreg -l -w0 2>/dev/null | grep -o -E '"RgfxFeatures(Offered|Taken)" = [0-9]+' | sort -u | tr -d '"' | tr '\n' ' ')
+	case $feat in
+	*Offered*Taken* | *Taken*Offered*)
+		local off tak; off=$(echo "$feat" | sed -n 's/.*RgfxFeaturesOffered = \([0-9]*\).*/\1/p'); tak=$(echo "$feat" | sed -n 's/.*RgfxFeaturesTaken = \([0-9]*\).*/\1/p')
+		if [ $(( tak & ~off )) -eq 0 ]; then item features PASS "$feat"; else item features FAIL "the kext took features the host did not offer: $feat"; fi ;;
+	"") echo "GATE info features none stated" ;;
+	*) item features FAIL "$feat" ;;
+	esac
 	echo "GATE info uptime $(uptime | tr -s ' ')"
 }
 
@@ -129,6 +138,9 @@ run_present() {
 run_sweep() {
 	limit 420 ./sweep 2>&1 | grep '^sweep: '
 	echo "rc sweep ${PIPESTATUS[0]}"
+	# The bundle writes no file of its own: no /tmp/rgfx-*.log after every Metal process the sweep ran.
+	local logs; logs=$(ls /tmp/rgfx-*.log 2>/dev/null | tr '\n' ' ')
+	if [ -z "$logs" ]; then item no-tmp-files PASS "no /tmp/rgfx-*.log after the sweep"; else item no-tmp-files FAIL "$logs"; fi
 }
 
 # decode: every stream of both sets, MD5s only; decodefps: the timed streams, MD5s and timed passes.

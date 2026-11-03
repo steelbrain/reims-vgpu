@@ -205,6 +205,13 @@ do_kext_check() {
 do_kext_test() { make -C "$TREE/guest/kext" test; }
 do_bundle_test() { make -C "$TREE/guest/bundle" test; }
 do_rgfxgate_test() { make -C "$TREE/guest/rgfxgate" test; }
+# That the packaged bundle, the one RgfxGate installs, writes no file of its own (the tree's
+# bundle_files_check.sh, where it has one).
+do_bundle_files() {
+  local c=$TREE/guest/bundle/tests/bundle_files_check.sh
+  if [[ ! -f $c ]]; then echo "no guest/bundle/tests/bundle_files_check.sh in this tree"; return 0; fi
+  bash "$c" "$TREE/guest/bundle/build/package/reims-graphics.bundle"
+}
 do_fmt() { cd "$TREE" && . scripts/internal/dev-env.sh && cargo fmt --all --check; }
 
 # The packages the change reaches: those with a file changed since the baseline, and every
@@ -288,6 +295,7 @@ mac_checks() {
   step kext-check do_kext_check || ok=1
   step kext-test do_kext_test || ok=1
   step bundle-test do_bundle_test || ok=1
+  step bundle-files do_bundle_files || ok=1
   step rgfxgate-test do_rgfxgate_test || ok=1
   step fmt do_fmt || ok=1
   step cargo do_cargo || ok=1
@@ -386,7 +394,11 @@ do_publish() {
   short=${sha:0:9}
   qc=$(cat "$ART/qemu-commit")
   m2v=$(grep -m1 -o -E '^metal2vulkan-runtime = .*rev = "[0-9a-f]+"' "$TREE/Cargo.toml" | grep -o -E '[0-9a-f]{40}' || echo unknown)
-  msi "bash '$MR/bin/msi-publish.sh' '$MR' '$MSI_GATE/qemu/$qc/build' '$MSI_GATE/target/dist-vulkan' '$short' '$qc' '$m2v' '$MSI_RGK_RUN'"
+  # The signed bundle RgfxGate carries, so that a fixer can build an RgfxGate of exactly the tip's.
+  local cdhash
+  cdhash=$(codesign -dvvv "$TREE/guest/bundle/build/package/reims-graphics.bundle" 2>&1 | sed -n 's/^CDHash=//p')
+  scp -q "$ART/reims-graphics.bundle.tgz" "$MSI:$MR/reims-graphics.bundle.tgz"
+  msi "bash '$MR/bin/msi-publish.sh' '$MR' '$MSI_GATE/qemu/$qc/build' '$MSI_GATE/target/dist-vulkan' '$short' '$qc' '$m2v' '$MSI_RGK_RUN' '$cdhash'"
   echo "$sha" > "$GH/published-last"
 }
 

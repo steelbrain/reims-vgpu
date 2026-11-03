@@ -54,7 +54,7 @@ GATED = [
 ]
 NOISE_K = 2.0
 # The Mac's check steps, which --skip mac leaves out.
-MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "rgfxgate-test", "fmt", "cargo"}
+MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "bundle-files", "rgfxgate-test", "fmt", "cargo"}
 # The informational metrics a report shows beside the gated ones.
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
          r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
