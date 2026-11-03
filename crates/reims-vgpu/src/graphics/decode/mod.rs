@@ -149,6 +149,9 @@ mod tables;
 mod video;
 mod view;
 mod waits;
+// Its users, the ring-0 messages carried out off the control thread, come after it.
+#[allow(dead_code)]
+mod worker;
 
 pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
 
