@@ -11,9 +11,10 @@
 #   host-events.log  the host log's display updates ("the display shows IOSurface") and its
 #                 fatal, error and warning lines, as the host logged them (local ISO times)
 #   launch.log.gz, serial.log   QEMU's whole log and the guest's serial port
-#   desktop.ppm   a screendump of the desktop after the guest's run
-#   host.txt      "KEY VALUE" lines: the wait for the GPU, boot and desktop times (from QEMU's
-#                 start), the fatal count, the screendump's colours, how long the hold was
+#   desktop.png   the guest's screenshot of its screen after its run, at a quarter of its size
+#   host.txt      "KEY VALUE" lines: the SSH port, the wait for the GPU, boot and desktop times
+#                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
+#                 its commonest colour (or desktop_capture none), how long the hold was
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
 # GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
