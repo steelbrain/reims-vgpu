@@ -31,6 +31,7 @@ import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 
 # Gated metrics: (regex, +1 higher is better / -1 lower is better, floor of the band).
@@ -385,6 +386,15 @@ def median_baseline(bdir):
     return ref
 
 
+def contains(sha, fix):
+    """Whether commit sha has commit fix (git, in the repository this script is in)."""
+    if not sha:
+        return False
+    r = subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "merge-base", "--is-ancestor",
+                        fix, sha], capture_output=True)
+    return r.returncode == 0
+
+
 def bench_host(metrics):
     """The lane host's state beside the bench boot: whether it was quiet, and its load average."""
     if not any(k.startswith("host.") for k in metrics):
@@ -485,6 +495,10 @@ def compare(run, base, noise):
     for e in run.meta.get("known_fails") or []:
         if not isinstance(e, dict) or not all(e.get(k) for k in ("item", "pattern", "owner", "ledger")):
             lines.append(f"  note: a known-failures entry without its item, pattern, owner and ledger row is ignored: {e}")
+            continue
+        # An entry whose fix landed (fixed_by, a commit) holds only for commits without the fix.
+        if e.get("fixed_by") and contains(run.meta.get("sha", ""), e["fixed_by"]):
+            lines.append(f"  note: {e['item']}'s known failure is fixed by {e['fixed_by'][:12]}, which this commit has: it must pass")
             continue
         entries.append(e)
         it = items.get(e["item"])
