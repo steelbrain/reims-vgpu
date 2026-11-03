@@ -345,6 +345,14 @@ inline bool rgfxBlockNextRelease(RgfxBlockTable &t, RgfxBlock *block)
 	return false;
 }
 
+// Whether the block at `offset` of `serial` is in the table, its release posted and not yet
+// answered: false where it has gone since (its owner's close) and the offset may be another's.
+inline bool rgfxBlockReleasingAt(const RgfxBlockTable &t, uint64_t offset, uint64_t serial)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	return at >= 0 && t.blocks[at].serial == serial && t.blocks[at].state == kRgfxBlockReleasing;
+}
+
 // The device answered the release of the block at `offset` of `serial`: OK gives it out again,
 // and hands back its wired pages in `*wired` (null where it had none) for the caller to unwire;
 // anything else keeps it, to post again after a context close (rgfxBlockRetryRefused). Nothing

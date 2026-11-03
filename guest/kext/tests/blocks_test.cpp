@@ -143,9 +143,32 @@ int main()
 		      "an answered close frees the client's blocks");
 		check(x.t.blocks[0].wired == &pagesB, "the other client's pages stay wired");
 		// A releasing block taken out answers no wired pages to its release's answer.
+		check(!rgfxBlockReleasingAt(x.t, releasing, release.serial),
+		      "a releasing block taken out is its release's no more");
+		// Its offset is given out again, and that block's release is posted: the old release's
+		// late answer is not the new block's, whose release still holds its surface.
+		uint64_t again = 0;
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &again) == kRgfxBlockOk &&
+		          again == kStart,
+		      "the first freed offset is given out again");
+		uint64_t reused = 0;
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &reused) == kRgfxBlockOk &&
+		          reused == kStart + 0x1000 && rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &reused) ==
+		                                           kRgfxBlockOk &&
+		          reused == releasing,
+		      "and the released block's too");
+		rgfxBlockFree(x.t, b, reused);
+		RgfxBlock newer;
+		check(rgfxBlockNextRelease(x.t, &newer) && newer.offset == releasing &&
+		          newer.serial != release.serial,
+		      "the new block's release, of another serial");
+		check(!rgfxBlockReleasingAt(x.t, releasing, release.serial) &&
+		          rgfxBlockReleasingAt(x.t, releasing, newer.serial),
+		      "the old release's answer finds the offset another's");
 		void *wired = &pagesB;
 		rgfxBlockReleased(x.t, releasing, release.serial, true, &wired);
-		check(wired == nullptr, "a release answered after the close unwires nothing");
+		check(wired == nullptr && rgfxBlockReleasingAt(x.t, releasing, newer.serial),
+		      "a release answered after the close unwires nothing and frees nothing of the new");
 
 		check(rgfxBlockKeepOwner(y.t, a) == 3 && y.t.count == 4, "an unanswered close keeps them");
 		RgfxBlockPin pin;

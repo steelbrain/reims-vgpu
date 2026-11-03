@@ -280,13 +280,15 @@ void releaseTimerFired(thread_call_param_t, thread_call_param_t)
 void finishRelease(const RgfxReleaseEntry &e, bool answered)
 {
 	const bool ok = answered && e.status == RGFX_STATUS_OK;
+	IOLockLock(contextLock);
 	// Answered OK, a cached block's pages hold its cache: its surface's locks go on, and its
 	// surface and the surface's wire are let go, before the block can be anyone else's. A kept
 	// block's surface keeps them, its locks waiting, for the release posted again: the device
-	// copies the cache into the pages at that release's answer.
-	if (ok)
+	// copies the cache into the pages at that release's answer. Only while the block is still
+	// this release's: a pages block its owner's answered close took may have given its offset to
+	// another block since, whose own release holds its surface.
+	if (ok && rgfxBlockReleasingAt(blockTable, e.offset, e.serial))
 		rgfxSurfaceCacheReleased(e.offset);
-	IOLockLock(contextLock);
 	if (e.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
 		dormantStats.unread++;
 		dormantStats.unreadWritten += e.written;
