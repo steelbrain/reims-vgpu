@@ -271,7 +271,7 @@ pub(crate) fn decode_op<P: Platform>(
                     primitive_type: m.primitive_type,
                     index_count: m.index_count,
                     index_type: m.index_type,
-                    index_buffer: &index_buffer,
+                    index_buffer,
                     index_buffer_offset: m.index_buffer_offset,
                 },
             )?;
@@ -311,7 +311,7 @@ pub(crate) fn decode_op<P: Platform>(
                 on,
                 RenderCmd::DrawPrimitivesIndirect {
                     primitive_type: m.primitive_type,
-                    indirect_buffer: &indirect_buffer,
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -325,7 +325,7 @@ pub(crate) fn decode_op<P: Platform>(
                     primitive_type: m.primitive_type,
                     index_count: m.index_count,
                     index_type: m.index_type,
-                    index_buffer: &index_buffer,
+                    index_buffer,
                     index_buffer_offset: m.index_buffer_offset,
                     instance_count: m.instance_count,
                 },
@@ -340,7 +340,7 @@ pub(crate) fn decode_op<P: Platform>(
                     primitive_type: m.primitive_type,
                     index_count: m.index_count,
                     index_type: m.index_type,
-                    index_buffer: &index_buffer,
+                    index_buffer,
                     index_buffer_offset: m.index_buffer_offset,
                     instance_count: m.instance_count,
                     base_vertex: m.base_vertex,
@@ -357,9 +357,9 @@ pub(crate) fn decode_op<P: Platform>(
                 RenderCmd::DrawIndexedPrimitivesIndirect {
                     primitive_type: m.primitive_type,
                     index_type: m.index_type,
-                    index_buffer: &index_buffer,
+                    index_buffer,
                     index_buffer_offset: m.index_buffer_offset,
-                    indirect_buffer: &indirect_buffer,
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -392,7 +392,7 @@ pub(crate) fn decode_op<P: Platform>(
                     number_of_patch_control_points: m.number_of_patch_control_points,
                     patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
-                    indirect_buffer: &indirect_buffer,
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -410,7 +410,7 @@ pub(crate) fn decode_op<P: Platform>(
                     patch_count: m.patch_count,
                     patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
-                    control_point_index_buffer: &control_point_index_buffer,
+                    control_point_index_buffer,
                     control_point_index_buffer_offset: m.control_point_index_buffer_offset,
                     instance_count: m.instance_count,
                     base_instance: m.base_instance,
@@ -429,9 +429,9 @@ pub(crate) fn decode_op<P: Platform>(
                     number_of_patch_control_points: m.number_of_patch_control_points,
                     patch_index_buffer,
                     patch_index_buffer_offset: m.patch_index_buffer_offset,
-                    control_point_index_buffer: &control_point_index_buffer,
+                    control_point_index_buffer,
                     control_point_index_buffer_offset: m.control_point_index_buffer_offset,
-                    indirect_buffer: &indirect_buffer,
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -510,7 +510,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::ExecuteCommandsInBuffer {
-                    indirect_command_buffer: &icb,
+                    indirect_command_buffer: icb,
                     execution_range: NsRange {
                         location: m.range_location,
                         length: m.range_length,
@@ -525,8 +525,8 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::ExecuteCommandsIndirect {
-                    indirect_commandbuffer: &icb,
-                    indirect_range_buffer: &range_buffer,
+                    indirect_commandbuffer: icb,
+                    indirect_range_buffer: range_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -551,7 +551,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::UpdateFence {
-                    fence: &fence,
+                    fence,
                     stages: m.stages,
                 },
             )?;
@@ -562,7 +562,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 RenderCmd::WaitForFence {
-                    fence: &fence,
+                    fence,
                     stages: m.stages,
                 },
             )?;

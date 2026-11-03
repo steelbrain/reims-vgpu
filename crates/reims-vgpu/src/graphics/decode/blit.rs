@@ -69,7 +69,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToTexture {
-                    source_buffer: &source,
+                    source_buffer: source,
                     source_offset: m.source_offset,
                     source_bytes_per_row: m.source_bytes_per_row,
                     source_bytes_per_image: m.source_bytes_per_image,
@@ -78,7 +78,7 @@ pub(crate) fn decode_op<P: Platform>(
                         m.source_size_height,
                         m.source_size_depth,
                     ),
-                    destination_texture: &destination,
+                    destination_texture: destination,
                     destination_slice: m.destination_slice,
                     destination_level: m.destination_level,
                     destination_origin: MtlOrigin::new(
@@ -124,7 +124,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyTextureToBuffer {
-                    source_texture: &source,
+                    source_texture: source,
                     source_slice: m.source_slice,
                     source_level: m.source_level,
                     source_origin: MtlOrigin::new(
@@ -137,7 +137,7 @@ pub(crate) fn decode_op<P: Platform>(
                         m.source_size_height,
                         m.source_size_depth,
                     ),
-                    destination_buffer: &destination,
+                    destination_buffer: destination,
                     destination_offset: m.destination_offset,
                     destination_bytes_per_row: m.destination_bytes_per_row,
                     destination_bytes_per_image: m.destination_bytes_per_image,
@@ -179,7 +179,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyTextureRegion {
-                    source_texture: &source,
+                    source_texture: source,
                     source_slice: m.source_slice,
                     source_level: m.source_level,
                     source_origin: MtlOrigin::new(
@@ -192,7 +192,7 @@ pub(crate) fn decode_op<P: Platform>(
                         m.source_size_height,
                         m.source_size_depth,
                     ),
-                    destination_texture: &destination,
+                    destination_texture: destination,
                     destination_slice: m.destination_slice,
                     destination_level: m.destination_level,
                     destination_origin: MtlOrigin::new(
@@ -210,7 +210,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyTextureRegionOptions {
-                    source_texture: &source,
+                    source_texture: source,
                     source_slice: m.source_slice,
                     source_level: m.source_level,
                     source_origin: MtlOrigin::new(
@@ -223,7 +223,7 @@ pub(crate) fn decode_op<P: Platform>(
                         m.source_size_height,
                         m.source_size_depth,
                     ),
-                    destination_texture: &destination,
+                    destination_texture: destination,
                     destination_slice: m.destination_slice,
                     destination_level: m.destination_level,
                     destination_origin: MtlOrigin::new(
@@ -242,10 +242,10 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyTextureSlices {
-                    source_texture: &source,
+                    source_texture: source,
                     source_slice: m.source_slice,
                     source_level: m.source_level,
-                    destination_texture: &destination,
+                    destination_texture: destination,
                     destination_slice: m.destination_slice,
                     destination_level: m.destination_level,
                     slice_count: m.slice_count,
@@ -260,9 +260,9 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::CopyIndirectCommandBuffer {
-                    source: &source,
+                    source,
                     source_range: NsRange::new(m.source_range_location, m.source_range_length),
-                    destination: &destination,
+                    destination,
                     destination_index: m.destination_index,
                 },
             )?;
@@ -273,7 +273,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::FillBuffer {
-                    buffer: &buffer,
+                    buffer,
                     range: NsRange::new(m.range_location, m.range_length),
                     value: m.value,
                 },
@@ -285,7 +285,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::FillBufferPattern4 {
-                    buffer: &buffer,
+                    buffer,
                     range: NsRange::new(m.range_location, m.range_length),
                     pattern: m.pattern,
                 },
@@ -304,7 +304,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::FillTexture {
-                    texture: &texture,
+                    texture,
                     level: m.level,
                     slice: m.slice,
                     region: MtlRegion::new(
@@ -325,7 +325,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::FillTextureColor {
-                    texture: &texture,
+                    texture,
                     level: m.level,
                     slice: m.slice,
                     region: MtlRegion::new(
@@ -349,10 +349,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE => {
             let m: RgfxBlitOpInvalidateCompressedTexture = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
-            enc.encode(
-                on,
-                BlitCmd::InvalidateCompressedTexture { texture: &texture },
-            )?;
+            enc.encode(on, BlitCmd::InvalidateCompressedTexture { texture })?;
         }
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE_SLICE => {
             let m: RgfxBlitOpInvalidateCompressedTextureSlice = body(tag, payload)?;
@@ -360,7 +357,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::InvalidateCompressedTextureSlice {
-                    texture: &texture,
+                    texture,
                     slice: m.slice,
                     level: m.level,
                 },
@@ -369,7 +366,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_OPTIMIZE_FOR_CPU => {
             let m: RgfxBlitOpOptimizeForCpu = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
-            enc.encode(on, BlitCmd::OptimizeForCpu { texture: &texture })?;
+            enc.encode(on, BlitCmd::OptimizeForCpu { texture })?;
         }
         RGFX_OP_BLIT_OPTIMIZE_FOR_CPU_SLICE => {
             let m: RgfxBlitOpOptimizeForCpuSlice = body(tag, payload)?;
@@ -377,7 +374,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::OptimizeForCpuSlice {
-                    texture: &texture,
+                    texture,
                     slice: m.slice,
                     level: m.level,
                 },
@@ -386,7 +383,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_OPTIMIZE_FOR_GPU => {
             let m: RgfxBlitOpOptimizeForGpu = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
-            enc.encode(on, BlitCmd::OptimizeForGpu { texture: &texture })?;
+            enc.encode(on, BlitCmd::OptimizeForGpu { texture })?;
         }
         RGFX_OP_BLIT_OPTIMIZE_FOR_GPU_SLICE => {
             let m: RgfxBlitOpOptimizeForGpuSlice = body(tag, payload)?;
@@ -394,7 +391,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::OptimizeForGpuSlice {
-                    texture: &texture,
+                    texture,
                     slice: m.slice,
                     level: m.level,
                 },
@@ -406,7 +403,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::OptimizeIndirectCommandBuffer {
-                    indirect_command_buffer: &icb,
+                    indirect_command_buffer: icb,
                     range: NsRange::new(m.range_location, m.range_length),
                 },
             )?;
@@ -417,7 +414,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::ResetCommandsInBuffer {
-                    buffer: &icb,
+                    buffer: icb,
                     range: NsRange::new(m.range_location, m.range_length),
                 },
             )?;
@@ -483,7 +480,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 BlitCmd::SynchronizeTexture {
-                    texture: &texture,
+                    texture,
                     slice: m.slice,
                     level: m.level,
                 },
@@ -492,12 +489,12 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_UPDATE_FENCE => {
             let m: RgfxBlitOpUpdateFence = body(tag, payload)?;
             let fence = objs.require_fence(m.fence_obj_id)?;
-            enc.encode(on, BlitCmd::UpdateFence { fence: &fence })?;
+            enc.encode(on, BlitCmd::UpdateFence { fence })?;
         }
         RGFX_OP_BLIT_WAIT_FOR_FENCE => {
             let m: RgfxBlitOpWaitForFence = body(tag, payload)?;
             let fence = objs.require_fence(m.fence_obj_id)?;
-            enc.encode(on, BlitCmd::WaitForFence { fence: &fence })?;
+            enc.encode(on, BlitCmd::WaitForFence { fence })?;
         }
         _ => return Ok(false),
     }

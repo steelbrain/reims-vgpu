@@ -325,7 +325,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::SetStageInRegionIndirect {
-                    indirect_buffer: &indirect_buffer,
+                    indirect_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -455,13 +455,13 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxComputeOpUpdateFence = body(tag, payload)?;
             // The fence must name an object (nil faults the stream).
             let fence = objs.require_fence(m.fence_obj_id)?;
-            enc.encode(on, ComputeCmd::UpdateFence { fence: &fence })?;
+            enc.encode(on, ComputeCmd::UpdateFence { fence })?;
         }
         RGFX_OP_COMPUTE_WAIT_FOR_FENCE => {
             let m: RgfxComputeOpWaitForFence = body(tag, payload)?;
             // The fence must name an object (nil faults the stream).
             let fence = objs.require_fence(m.fence_obj_id)?;
-            enc.encode(on, ComputeCmd::WaitForFence { fence: &fence })?;
+            enc.encode(on, ComputeCmd::WaitForFence { fence })?;
         }
         RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT => {
             let m: RgfxComputeOpExecuteCommandsIndirect = body(tag, payload)?;
@@ -471,8 +471,8 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::ExecuteCommandsIndirect {
-                    indirect_commandbuffer: &icb,
-                    indirect_range_buffer: &range_buffer,
+                    indirect_commandbuffer: icb,
+                    indirect_range_buffer: range_buffer,
                     indirect_buffer_offset: m.indirect_buffer_offset,
                 },
             )?;
@@ -484,7 +484,7 @@ pub(crate) fn decode_op<P: Platform>(
             enc.encode(
                 on,
                 ComputeCmd::ExecuteCommandsInBuffer {
-                    indirect_command_buffer: &icb,
+                    indirect_command_buffer: icb,
                     execution_range: NsRange::new(m.location, m.length),
                 },
             )?;
