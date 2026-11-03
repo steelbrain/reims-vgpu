@@ -1330,10 +1330,20 @@ another queue's buffer is released. `commitAndWaitUntilSubmitted` returns at
 the submission, whatever handlers run. Waiters take the ring themselves only
 once the thread has ended (its context closed), and then run the records too.
 
-**Left for later** (extends the same op families, not the transport): enqueue
-ordering held in the decoder; command-buffer/queue descriptors and
-`errorOptions`; labels and debug groups answered guest-side; residency sets
-(`useResource`/`useHeap` are in); `MTLIOCommandQueue`; Metal 4.
+**Enqueue order.** A queue's command buffers go on its submission ring in the
+order they were enqueued, whatever order they are committed in, as Metal runs
+them (measured on the M3 Max, an AMD 5300M and an Intel 630). The queue keeps
+its enqueued buffers that are not yet posted, oldest first; a commit with no
+`enqueue` before it enqueues the buffer there. A buffer committed behind one
+not yet committed stays `Committed` and unposted, and the commit that readies
+the front posts every ready buffer behind it, in order, on its own thread. An
+enqueued buffer let go uncommitted stays, holding back the buffers after it,
+as Metal's does.
+
+**Left for later** (extends the same op families, not the transport):
+command-buffer/queue descriptors and `errorOptions`; labels and debug groups
+answered guest-side; residency sets (`useResource`/`useHeap` are in);
+`MTLIOCommandQueue`; Metal 4.
 
 **Where the decoder lives.** In reims-vgpu-core, generic over `P: Platform`,
 beside the Apple-lane decode it mirrors (same handle machinery, descriptor

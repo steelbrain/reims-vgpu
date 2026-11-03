@@ -572,6 +572,164 @@ void test_slots_and_submission_do_not_wait_for_handlers()
 	}
 }
 
+// The cb_obj_ids of the command buffers posted on `q`'s submission ring since the last call, in
+// ring order.
+std::vector<uint64_t> posted(Queue &q)
+{
+	std::vector<uint64_t> out;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (q.submit.next(&h, &bytes)) {
+		if (h.type != RGFX_CMD_COMMAND_BUFFER)
+			continue;
+		RgfxCommandBuffer cbh = {};
+		std::memcpy(&cbh, bytes.data(), sizeof(cbh));
+		out.push_back(cbh.cb_obj_id);
+	}
+	return out;
+}
+
+uint64_t objId(id<MTLCommandBuffer> cb)
+{
+	return ((RgfxResource *)cb).rgfxObjId;
+}
+
+// Command buffers run in the order they were enqueued, whatever order they are committed in, as
+// Metal's do on all three GPUs: one committed before a buffer enqueued ahead of it is not posted,
+// and stays Committed, until that one is committed; then both go, the earlier first. A commit
+// with no enqueue enqueues the buffer there. An enqueued buffer let go uncommitted stays and
+// holds back the buffers after it, as Metal's does.
+void test_buffers_run_in_enqueue_order()
+{
+	@autoreleasepool {
+		Queue q;
+		id<MTLCommandBuffer> a = [q.queue commandBuffer];
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		CHECK(a.status == MTLCommandBufferStatusNotEnqueued);
+		[a enqueue];
+		[b enqueue];
+		CHECK(a.status == MTLCommandBufferStatusEnqueued && b.status == MTLCommandBufferStatusEnqueued);
+		[b commit];
+		CHECK(b.status == MTLCommandBufferStatusCommitted);
+		CHECK(posted(q).empty());
+		// Committed without an enqueue, behind both.
+		id<MTLCommandBuffer> c = [q.queue commandBuffer];
+		[c commit];
+		CHECK(posted(q).empty());
+		[a commit];
+		CHECK((posted(q) == std::vector<uint64_t>{objId(a), objId(b), objId(c)}));
+		// The enqueue a commit makes is its only one: nothing waits behind a posted buffer.
+		id<MTLCommandBuffer> d = [q.queue commandBuffer];
+		[d commit];
+		CHECK((posted(q) == std::vector<uint64_t>{objId(d)}));
+	}
+	@autoreleasepool {
+		Queue q;
+		__weak id<MTLCommandBuffer> weakA = nil;
+		@autoreleasepool {
+			id<MTLCommandBuffer> a = [q.queue commandBuffer];
+			weakA = a;
+			[a enqueue];
+		}
+		CHECK(weakA != nil);
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		[b commit];
+		CHECK(posted(q).empty());
+		CHECK(b.status == MTLCommandBufferStatusCommitted);
+		id<MTLCommandBuffer> a = weakA;
+		[a commit];
+		CHECK((posted(q) == std::vector<uint64_t>{objId(a), objId(b)}));
+	}
+}
+
+// Buffers enqueued in one order and committed from several threads at once, in any order, go on
+// the ring in the enqueue order.
+void test_threads_commit_in_enqueue_order()
+{
+	@autoreleasepool {
+		Queue q;
+		const int n = 400;
+		NSMutableArray<id<MTLCommandBuffer>> *cbs = [NSMutableArray array];
+		std::vector<uint64_t> want;
+		for (int i = 0; i < n; i++) {
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+			[e fillBuffer:handle(7) range:NSMakeRange(0, 4) value:static_cast<uint8_t>(i)];
+			[e endEncoding];
+			[cb enqueue];
+			[cbs addObject:cb];
+			want.push_back(objId(cb));
+		}
+		// The host takes the ring as the threads post, so it never fills.
+		std::atomic<bool> stop{false};
+		std::vector<uint64_t> got;
+		std::thread host([&] {
+			while (!stop.load()) {
+				for (uint64_t id : posted(q))
+					got.push_back(id);
+				std::this_thread::yield();
+			}
+			for (uint64_t id : posted(q))
+				got.push_back(id);
+		});
+		std::vector<std::thread> threads;
+		for (int t = 0; t < 4; t++) {
+			threads.emplace_back([cbs, t] {
+				@autoreleasepool {
+					// Each thread commits every fourth buffer, from the last.
+					for (int i = n - 1 - t; i >= 0; i -= 4)
+						[cbs[static_cast<NSUInteger>(i)] commit];
+				}
+			});
+		}
+		for (std::thread &th : threads)
+			th.join();
+		stop.store(true);
+		host.join();
+		CHECK(got == want);
+	}
+}
+
+// commitAndWaitUntilSubmitted of a buffer behind one enqueued and not yet committed returns only
+// once that one is committed and both are submitted, as Metal's does.
+void test_submitted_waits_for_the_buffers_before()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<MTLCommandBuffer> a = [q.queue commandBuffer];
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		[a enqueue];
+		std::vector<uint64_t> order;
+		std::thread host([&] {
+			// The host schedules each buffer as it takes it.
+			for (int taken = 0; taken < 2;) {
+				RgfxMsgHeader h = {};
+				std::vector<uint8_t> bytes;
+				if (!q.submit.next(&h, &bytes)) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+					continue;
+				}
+				RgfxCommandBuffer cbh = {};
+				std::memcpy(&cbh, bytes.data(), sizeof(cbh));
+				order.push_back(cbh.cb_obj_id);
+				hostScheduled(q, *driven.kext, h.seqno, cbh.cb_obj_id == objId(a) ? a : b);
+				taken++;
+			}
+		});
+		std::thread late([a] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			[a commit];
+		});
+		const auto start = std::chrono::steady_clock::now();
+		CHECK([(id<MTLCommandBufferSPI>)b commitAndWaitUntilSubmitted]);
+		CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(40));
+		late.join();
+		host.join();
+		CHECK((order == std::vector<uint64_t>{objId(a), objId(b)}));
+	}
+}
+
 } // namespace
 
 int rgfxQueueDiesCase(const char *name)
@@ -615,4 +773,7 @@ void rgfxQueueTests(const char *self)
 	test_handlers_run_on_the_completion_queue();
 	test_one_queues_handlers_run_in_order();
 	test_slots_and_submission_do_not_wait_for_handlers();
+	test_buffers_run_in_enqueue_order();
+	test_threads_commit_in_enqueue_order();
+	test_submitted_waits_for_the_buffers_before();
 }

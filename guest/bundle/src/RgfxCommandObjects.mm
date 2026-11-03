@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <mach/mach_time.h>
 #include <mutex>
 #include <vector>
@@ -425,6 +426,13 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 /// The buffer holds one of its queue's `slots` (maxCommandBufferCount), given back once it
 /// completes, or at its dealloc where it never does.
 - (void)rgfxHoldSlot:(dispatch_semaphore_t)slots;
+/// Under its queue's order lock: whether it was not yet enqueued; it is from now on.
+- (BOOL)rgfxTakeEnqueue;
+/// Whether it is committed and ready to post (rgfxPost), once every buffer before it is.
+- (BOOL)rgfxReadyToPost;
+/// Posts its message on the queue's submission ring: its queue's poster calls it in enqueue
+/// order (rgfxPostReady).
+- (void)rgfxPost;
 @end
 
 /// How many barrier fences a queue has (QUEUE BARRIERS, above).
@@ -448,6 +456,10 @@ struct RgfxBarrierSlot {
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 /// Runs `record` on the queue's completion queue, behind the records before it, or here.
 - (void)rgfxDeliver:(dispatch_block_t)record here:(BOOL)here;
+/// Puts `cb` last in the enqueue order, where it is not in it yet.
+- (void)rgfxEnqueue:(RgfxCmdBuffer *)cb;
+/// Posts the buffers at the front of the enqueue order that are ready, in that order.
+- (void)rgfxPostReady;
 @end
 
 @implementation RgfxCommandQueue {
@@ -486,6 +498,14 @@ struct RgfxBarrierSlot {
 	// rgfxMessageReserve's bytes. Command buffers commit on any thread; a lost update only
 	// sizes one message's first allocation.
 	std::atomic<uint32_t> _messageReserve;
+	// The enqueue order (rgfxEnqueue:): the buffers enqueued and not yet posted, oldest first,
+	// under `_orderLock`; `_postingFront` while the oldest is being posted. One thread at a time
+	// posts the ready ones (`_postLock`, which the poster's own handlers may take again where it
+	// runs them, with no thread driving the ring).
+	std::mutex _orderLock;
+	std::deque<RgfxCmdBuffer *> _order;
+	bool _postingFront;
+	std::recursive_mutex _postLock;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -654,6 +674,44 @@ struct RgfxBarrierSlot {
 		b.waitOwn = n >= kRgfxBarrierFences;
 	}
 	return b;
+}
+
+// ENQUEUE ORDER. The queue's command buffers run in the order they were enqueued, whatever
+// order they are committed in, as Metal's do on the M3 Max, an AMD 5300M and an Intel 630
+// (measured): one committed before a buffer enqueued ahead of it waits, Committed, until that
+// one is committed too, and an enqueued buffer let go uncommitted stays, holding back every
+// buffer after it. A commit with no enqueue before it enqueues the buffer there. So the queue
+// keeps the enqueued buffers not yet posted, oldest first, and each commit posts the ready ones
+// at the front, in order, on the one ring: its own, and those committed behind one it waited for.
+- (void)rgfxEnqueue:(RgfxCmdBuffer *)cb
+{
+	std::lock_guard<std::mutex> hold(_orderLock);
+	if ([cb rgfxTakeEnqueue])
+		_order.push_back(cb);
+}
+
+- (void)rgfxPostReady
+{
+	RgfxCommandQueue *keep = self; // a buffer posted here may hold the queue's last reference
+	std::lock_guard<std::recursive_mutex> posting(keep->_postLock);
+	for (;;) {
+		RgfxCmdBuffer *next = nil;
+		{
+			std::lock_guard<std::mutex> hold(_orderLock);
+			// Where this thread is already posting the oldest (a handler it runs commits), the
+			// outer loop posts the rest after it.
+			if (_postingFront || _order.empty() || ![_order.front() rgfxReadyToPost])
+				return;
+			next = _order.front();
+			_postingFront = true;
+		}
+		[next rgfxPost];
+		{
+			std::lock_guard<std::mutex> hold(_orderLock);
+			_order.pop_front();
+			_postingFront = false;
+		}
+	}
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -943,7 +1001,12 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// Committed by commitAndWaitUntilSubmitted, so it asks for its submission where the host
 	// answers it.
 	BOOL _waitsSubmitted;
+	// It asks the host for its submission (RGFX_OP_SUBMITTED), so its post expects CB_SUBMITTED.
+	BOOL _asksSubmitted;
+	// In its queue's enqueue order (under the queue's order lock), and committed and ready to
+	// post once every buffer before it is.
 	BOOL _enqueued;
+	std::atomic<bool> _readyToPost;
 	uint64_t _seqno;
 	// Written by the thread that delivers the completion, read by any: atomic.
 	std::atomic<MTLCommandBufferStatus> _status;
@@ -1191,12 +1254,25 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 // --- submission --------------------------------------------------------------
 
+// Its place in its queue's order, which it runs in (ENQUEUE ORDER, above).
 - (void)enqueue
 {
-	// Ordering across command buffers is a later transport piece; record the intent.
+	[_queue rgfxEnqueue:self];
+}
+
+- (BOOL)rgfxTakeEnqueue
+{
+	if (_enqueued)
+		return NO;
 	_enqueued = YES;
 	MTLCommandBufferStatus expected = MTLCommandBufferStatusNotEnqueued;
 	_status.compare_exchange_strong(expected, MTLCommandBufferStatusEnqueued);
+	return YES;
+}
+
+- (BOOL)rgfxReadyToPost
+{
+	return _readyToPost.load(std::memory_order_acquire);
 }
 
 - (void)commit
@@ -1207,6 +1283,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 			return; // commit is once
 		_committed = YES;
 	}
+	// Not enqueued before, it is now, behind every buffer enqueued before it.
+	[_queue rgfxEnqueue:self];
 	_kernelStart.store(rgfxHostTime());
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
@@ -1223,9 +1301,6 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_surfaceWritesRegion = writesRegion;
 	// So do the copies of app memory it uses, which take the bytes the CPU wrote since.
 	_shadowWrites = rgfxShadowsSyncIn(_encoder->takeShadowUses());
-	// The copies it writes, named among their writers once it is posted: its completion may
-	// clear _surfaceWrites by then.
-	std::vector<std::shared_ptr<void>> written = _surfaceWrites;
 	// Committed before the host can see it, so a completion never finds an older status.
 	_status.store(MTLCommandBufferStatusCommitted);
 
@@ -1246,8 +1321,6 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// thread that took it off runs that too.
 	RgfxCommandQueue *queue = _queue;
 	_reader = queue.replyReader;
-	std::function<void(uint64_t)> expect;
-	std::function<void()> whileWaiting;
 	if (_reader != nullptr) {
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
@@ -1256,15 +1329,36 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		dispatch_group_enter(_submitted);
 		_scheduled = dispatch_group_create();
 		dispatch_group_enter(_scheduled);
-		RgfxCmdBuffer *strongSelf = self;
-		RgfxReplyReader *reader = _reader;
 		// One commitAndWaitUntilSubmitted commits asks for its submission where the host
 		// answers it: the call then returns as the host takes it, or at the signal it or a
 		// buffer before it on its queue waits for, as Metal's does, not at its scheduling.
 		// Nothing else waits for a submission, so no other buffer asks.
-		const bool asks = _waitsSubmitted && queue.asksSubmitted;
-		if (asks)
+		_asksSubmitted = _waitsSubmitted && queue.asksSubmitted;
+		if (_asksSubmitted)
 			_encoder->appendSubmitted();
+	}
+	// Posted once every buffer enqueued before it is: here, or by the commit that makes the
+	// last of them ready. Either way its message goes on the ring before the commit returns,
+	// unless a buffer before it is not yet committed.
+	_readyToPost.store(true, std::memory_order_release);
+	[queue rgfxPostReady];
+}
+
+// Posts the committed buffer's message on its queue's submission ring, on the thread of the
+// commit that made it the oldest ready buffer of the queue (rgfxPostReady).
+- (void)rgfxPost
+{
+	RgfxCommandQueue *queue = _queue;
+	// The copies it writes, named among their writers once it is posted: its completion may
+	// clear _surfaceWrites by then.
+	std::vector<std::shared_ptr<void>> written = _surfaceWrites;
+	RgfxRegion *writesRegion = _surfaceWritesRegion;
+	std::function<void(uint64_t)> expect;
+	std::function<void()> whileWaiting;
+	if (_reader != nullptr) {
+		RgfxCmdBuffer *strongSelf = self;
+		RgfxReplyReader *reader = _reader;
+		const bool asks = _asksSubmitted;
 		expect = [reader, strongSelf, queue, asks](uint64_t seqno) {
 			if (asks) {
 				reader->expectSubmitted(seqno, [strongSelf](const RgfxCbSubmitted &) {
