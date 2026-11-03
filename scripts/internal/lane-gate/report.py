@@ -286,7 +286,8 @@ class Run:
         for case, j in reps.judge(reps.parse_guest(self.guest_text), rows).items():
             p = f"bench.{case}."
             ps = max(set(j["states"]), key=j["states"].count)
-            core, mem = statistics.median(j["core"]), statistics.median(j["mem"])
+            # The core clock the case's number ran at: around what qualified, else its whole run.
+            core, mem = statistics.median(j["ok_core"] or j["core"]), statistics.median(j["mem"])
             self.lmetric(f"pstate.bench.{case}", ps)
             self.lmetric(f"core_mhz.bench.{case}", core)
             self.lmetric(f"mem_mhz.bench.{case}", mem)
@@ -640,8 +641,10 @@ def compare(run, base, noise):
         shown = g or any(re.fullmatch(rx, name) for rx in SHOWN)
         if not shown:
             continue
+        clock = cur["metrics"].get("core_mhz.bench." + name[len("bench."):].rsplit(".", 1)[0]) if gpu_bound(name) else None
+        at = f"@{clock:.0f} MHz  " if clock is not None else ""
         if name not in bm:
-            mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)")
+            mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)  {at}".rstrip())
             continue
         bv = bm[name]
         bi = bimodal(name) if clock_ok_of(cur["metrics"], name) is None else None
@@ -675,7 +678,7 @@ def compare(run, base, noise):
                 verdict = f"better beyond {bnd:.1%}"
             else:
                 verdict = f"within {bnd:.1%}"
-        mlines.append(f"  {name:48s} {v:>12.6g}   base {bv:>12.6g}  {rel:+7.1%}  {verdict}")
+        mlines.append(f"  {name:48s} {v:>12.6g}   base {bv:>12.6g}  {rel:+7.1%}  {at}{verdict}")
     benched = "bench" in ran or os.path.exists(os.path.join(run.path, "results", "guest.log"))
     for name in sorted(bm):
         if gated(name) and name not in cur["metrics"]:

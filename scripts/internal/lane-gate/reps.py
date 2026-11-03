@@ -20,7 +20,12 @@ separated (nothing where every one has some, or where the host sampled no clocks
 import re
 import sys
 
-CORE_MIN_MHZ = 2500
+# Between the modes msi's 5080 shows under load: 2392 to 2805 MHz high, 1.2 to 1.5 GHz under the
+# power cap, and 1.75 to 2.38 GHz in P4 from idle.
+CORE_MIN_MHZ = 2400
+# nvidia-smi's clocks change only about every half second under load (the driver's update): a span
+# is judged on the readings around it, from the one before it to those half a second after it.
+LAG_S = 0.5
 
 
 def clocked(case):
@@ -86,29 +91,32 @@ def parse_clocks(text):
 
 
 def span(rows, a, b):
-    """The samples over [a, b]: those inside, and the one before a (the clock a ran at), or None
-    where the samples do not cover the span."""
-    inside = [r for r in rows if a <= r[0] <= b]
+    """The readings around [a, b]: the one before a (the clock a ran at), those inside, and those
+    up to LAG_S after b (a change during the span shows there), or None where the samples do not
+    cover the span."""
+    inside = [r for r in rows if a <= r[0] <= b + LAG_S]
     before = [r for r in rows if r[0] < a]
-    after = [r for r in rows if r[0] > b]
+    after = [r for r in rows if r[0] > b + LAG_S]
     if not before or not after:
         return None
     return [before[-1]] + inside
 
 
 def high(rows, a, b):
+    """The core clocks around [a, b] where all are at CORE_MIN_MHZ or more, else None."""
     s = span(rows, a, b)
-    return s is not None and min(r[2] for r in s) >= CORE_MIN_MHZ
+    return [r[2] for r in s] if s is not None and min(r[2] for r in s) >= CORE_MIN_MHZ else None
 
 
 def judge(cases, rows):
     """Per case: {"reps": n, "ok": [the high-clock repetitions], "window_ok": a run of the case at
-    the high clock throughout (cases without repetitions), "core": [the core clock over its runs]}."""
+    the high clock throughout (cases without repetitions), "core": [the core clock over its runs],
+    "ok_core": [the core clock around what qualified], "states", "mem"}."""
     out = {}
     for case, runs in cases.items():
         if not clocked(case):
             continue
-        j = {"reps": 0, "ok": [], "window_ok": False, "core": [], "states": [], "mem": []}
+        j = {"reps": 0, "ok": [], "window_ok": False, "core": [], "ok_core": [], "states": [], "mem": []}
         for run in runs:
             if run["end"] is None or not run.get("ok"):
                 continue
@@ -118,10 +126,14 @@ def judge(cases, rows):
             j["mem"] += [r[3] for r in s]
             for rep in run["reps"]:
                 j["reps"] += 1
-                if high(rows, rep[0] - rep[1], rep[0]):
+                c = high(rows, rep[0] - rep[1], rep[0])
+                if c:
                     j["ok"].append(rep)
-            if not run["reps"] and high(rows, run["start"], run["end"]):
+                    j["ok_core"] += c
+            c = None if run["reps"] else high(rows, run["start"], run["end"])
+            if c:
                 j["window_ok"] = True
+                j["ok_core"] += c
         if j["core"]:
             out[case] = j
     return out
