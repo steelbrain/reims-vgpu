@@ -172,6 +172,16 @@ timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPT
 kv guest_rc "${PIPESTATUS[0]}"
 log "guest run done"
 
+# The window drags (msi-drag.py): a plain window and a glass one, each dragged DRAG_S seconds over
+# QMP while the guest tracks the window, with the host's display updates and CPU in that span.
+if [[ ${DRAG:-1} == 1 ]] && (( $(left) > 150 )); then
+  log "window drags"
+  PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS DRAG_S=${DRAG_S:-10} \
+    timeout "$(( $(left) - 60 ))" python3 -I "$(dirname "$0")/msi-drag.py" "$B" "$R" >> "$R/drag.log" 2>&1
+  kv drag_rc $?
+  log "window drags done"
+fi
+
 # The screen as WindowServer composed it, read back by the guest: the screenshot a person takes
 # with Command-Shift-3, the keys sent over QMP to the guest's keyboard. The system's screenshot
 # needs no screen-recording grant, which the lane's SIP-on guests cannot give a tool run over SSH,

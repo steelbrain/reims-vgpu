@@ -50,12 +50,14 @@ GATED = [
     (r"webgl\.raf_fps", 1, 0.03),
     (r"composites_s\.present\.fullscreen", 1, 0.05),
     (r"qemu_cpu\.(idle|present\.fullscreen)", -1, 0.25),
+    (r"drag\.(plain|glass)\.composites_s", 1, 0.10),
 ]
 NOISE_K = 2.0
 # The Mac's check steps, which --skip mac leaves out.
 MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "rgfxgate-test", "fmt", "cargo"}
 # The informational metrics a report shows beside the gated ones.
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
+         r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
          r"host\.(boot_ssh_s|desktop_s|hold_s|lock_wait_s)", r"bench\.draws\.10k\.encode_ms",
          r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)"]
 
@@ -128,6 +130,7 @@ class Run:
             if os.path.exists(os.path.join(d, "guest.log")):
                 self.guest(read(os.path.join(d, "guest.log")))
                 self.host(d)
+                self.drag(d)
         self.ip, self.mp = "", ""
         self.cargo(r)
         return self
@@ -268,6 +271,32 @@ class Run:
             self.litem("host.composites", "PASS" if n > 0 else "FAIL",
                       f"{n} display updates a second during the full-screen present")
 
+    # The window drags (msi-drag.py): a case whose window did not follow the pointer is not run, not
+    # a number; a gap of more than a second between display updates while it moved is a stall.
+    def drag(self, r):
+        for line in read(os.path.join(r, "drag.txt")).splitlines():
+            m = re.match(r"drag (\S+) (.*)$", line)
+            if not m:
+                continue
+            name, kv = m.group(1), kv_numbers(m.group(2))
+            why = re.search(r'why=(".*")', line)
+            if not kv.get("moved"):
+                self.litem("drag." + name, "NOTRUN", "the window did not follow the pointer: "
+                           + (json.loads(why.group(1)) if why else m.group(2)))
+                continue
+            stall = kv.get("gap_max_ms", 0) > 1000
+            self.litem("drag." + name, "FAIL" if stall else "PASS",
+                       f"{kv.get('composites_s')} display updates a second, gap p99 {kv.get('gap_p99_ms')} ms, "
+                       f"max {kv.get('gap_max_ms')} ms" + (" (a stall over 1 s)" if stall else "")
+                       + f"; the window moved {kv.get('window_moves_s')} times a second; QEMU {kv.get('qemu_cpu')}%, "
+                       f"its graphics thread {kv.get('gfx_cpu')}%")
+            for k in ("composites_s", "gap_p99_ms", "gap_max_ms", "window_moves_s"):
+                if k in kv:
+                    self.lmetric(f"drag.{name}.{k}", kv[k])
+            for k in ("qemu_cpu", "gfx_cpu"):
+                if k in kv:
+                    self.lmetric(f"{k}.drag.{name}", kv[k])
+
     def cargo(self, r):
         p = os.path.join(r, "cargo-fails.txt")
         if not os.path.exists(p):
@@ -327,7 +356,8 @@ def noise_from(bdirs_root):
 
 # The tool whose numbers a metric is: where its source differs from the baseline's, the metric is
 # shown but not gated, as the measuring stick moved.
-TOOL_OF = [(r"bench\..*", "sweep+bench"), (r"present\..*", "present_probe"), (r"decode\..*", "decode_md5")]
+TOOL_OF = [(r"bench\..*", "sweep+bench"), (r"present\..*", "present_probe"), (r"decode\..*", "decode_md5"),
+           (r"(drag\.|[a-z]+_cpu\.drag\.).*", "drag")]
 
 
 def tool_changed(name, meta, base_meta):
@@ -367,6 +397,10 @@ def compare(run, base, noise):
         if name in items or name == "step.publish":
             if b["status"] == "PASS" and items[name]["status"] == "SKIP":
                 items[name] = {"status": "FAIL", "detail": "SKIP, where the baseline passed: " + items[name]["detail"]}
+            # A drag the baseline made that does not move the window now may be the candidate's doing.
+            if b["status"] == "PASS" and items[name]["status"] == "NOTRUN" and ".drag." in "." + name:
+                items[name] = {"status": "FAIL", "detail": "where the baseline's window moved, "
+                               + items[name]["detail"]}
             continue
         group = name.split(".", 1)[0]
         if group == "step":

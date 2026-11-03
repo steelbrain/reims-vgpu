@@ -175,6 +175,8 @@ do_guest_build() {
     "$(tool_src guest/bundle/tools/present_probe.m)" -o "$P/present_probe"
   "${cc[@]}" -framework Foundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
     "$(tool_src guest/bundle/tools/decode_md5.m)" -o "$P/decode_md5"
+  "${cc[@]}" -framework Foundation -framework CoreGraphics \
+    "$(tool_src guest/bundle/tools/winmon.m)" -o "$P/winmon"
   cp guest/bundle/build/sweep-x86_64 "$P/sweep"
   cp guest/bundle/build/bench-x86_64 "$P/bench"
   cp "$L/guest/"* "$P/"
@@ -186,6 +188,7 @@ do_guest_build() {
   { for f in guest/bundle/tools/sweep/*.[mh] guest/bundle/tools/bench/bench.m; do shasum "$f"; done | shasum | echo "sweep+bench $(cut -c1-16)"
     echo "present_probe $(shasum < "$(tool_src guest/bundle/tools/present_probe.m)" | cut -c1-16)"
     echo "decode_md5 $(shasum < "$(tool_src guest/bundle/tools/decode_md5.m)" | cut -c1-16)"
+    echo "drag $(cat "$(tool_src guest/bundle/tools/winmon.m)" "$L/msi-drag.py" | shasum | cut -c1-16)"
     echo "bundle $(shasum < guest/bundle/build/reims-graphics.bundle | cut -c1-16)"
     echo "kext $(shasum < guest/kext/build/ReimsGraphics.kext/Contents/MacOS/ReimsGraphics | cut -c1-16)"
   } > "$ART/tools.txt"
@@ -301,7 +304,7 @@ do_ship() {  # the gate's own scripts, which the host's steps run
   # Each script replaces the old one by a rename, never in place: a detached bench leg may be
   # running the old one, and bash reads a script as it runs it.
   msi "rm -rf '$MR/bin/.incoming' && mkdir -p '$MR/bin/.incoming'"
-  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" \
+  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" "$L/msi-drag.py" \
     "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
   msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
 }
@@ -424,7 +427,7 @@ EOF
   set -e
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
-  for f in boot.log guest.log cpu.txt host-events.log host.txt serial.log desktop.png; do
+  for f in boot.log guest.log cpu.txt host-events.log host.txt serial.log desktop.png drag.txt drag.log; do
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
