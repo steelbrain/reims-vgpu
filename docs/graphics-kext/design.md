@@ -773,6 +773,24 @@ own 64-byte line:
   `armed`. If it reads 1, it clears it and raises the ring's vector. The guest
   sets `armed` after draining, issues a full fence and checks `producer`
   again.
+- The re-arm. A consumer already awake (the completion thread after a
+  buffer's `CB_SCHEDULED`) can take a record between the host's publish and
+  its clear, and arm again: the clear then takes an arm made after the take,
+  and its vector comes for a record already taken, so the thread sleeps with
+  `armed` 0 and the host raises nothing for the next record. So where the
+  clear reads 1, the host reads `consumer` too, and where the guest has taken
+  every record published, sets `armed` back to 1 and raises nothing
+  (`ring.rs`, `rearm_or_raise`). The guest stores `consumer` before it arms,
+  so a clear that read its arm sees its take, and only the host writes 0, so
+  the 1 undoes nothing of the guest's. The fix is the host's alone: no kext or
+  bundle changes, and ring 0's completion ring takes it too.
+  `ring/interleavings.rs` walks every interleaving of the host's post, the
+  kext's look and the completion thread's take, arm and sleep (up to 3
+  records and 2 vectors for something else): none leaves a record untaken or
+  the thread asleep unarmed. A wake index the host only reads (virtio's
+  `used_event`) was weighed and declined: it would change a ring's format in
+  the host, the kext and the bundle, and the re-arm closes the race without
+  one.
 
 **Control commands** (guest to host, ring 0). Each is answered by a
 `COMPLETE` with its `seqno` and a status (0 for success), or by the reply
