@@ -12,6 +12,7 @@
 #   DEADLINE        the epoch second the hold ends: a probe starts only where its budget and 30 s
 #                   fit before it, else it stays queued for the next round
 #   B, R            the boot's directory (QEMU's launch.log) and the run's (gpu-clocks.txt)
+#   QEMU_PID        the boot's QEMU, whose Xid lines xid.txt marks as its own
 #   PORT, GUEST_USER, GUEST_PASS   the guest's SSH; or FAKE_GUEST, a directory that stands for the
 #                   guest's home: its commands run there, on this machine
 #   SETTLE_LOAD, SETTLE_S   the host's 1-minute load average the probes wait for (default 4), and
@@ -25,6 +26,9 @@
 #   host.log        QEMU's log lines from start to end (the host's display updates, warnings,
 #                   fatal lines and the rest)
 #   gpu-clocks.txt  the GPU's clocks over the same span, where the host samples them
+#   xid.txt         the NVIDIA driver's GPU errors (the kernel's NVRM Xid lines) over the span, as
+#                   msi-xid.sh prints them, "own" those of the boot's QEMU (QEMU_PID); "unread"
+#                   where the kernel log could not be read
 #   out/            what run.sh left in its directory's out/, copied back
 #   probe/          the probe as it was dropped
 # run.sh gets PROBE_NAME and PROBE_PASS (the guest user's password, for sudo) in its environment.
@@ -121,6 +125,11 @@ for p in "$PROBES"/*/; do
     fi
     [[ -n ${R:-} && -s $R/gpu-clocks.txt ]] &&
       awk -v a="$start" -v b="$end" '$1 >= a && $1 <= b' "$R/gpu-clocks.txt" > "$out/gpu-clocks.txt"
+    if [[ -z ${FAKE_GUEST:-} ]]; then
+      bash "$(dirname "$0")/msi-xid.sh" "${start%.*}" "$(( ${end%.*} + 1 ))" "${QEMU_PID:-}" > "$out/xid.txt" ||
+        echo unread > "$out/xid.txt"
+      [[ -s $out/xid.txt ]] && log "$name: Xid lines: $(tr '\n' ';' < "$out/xid.txt")"
+    fi
     echo ran > "$out/status"
     log "$name: rc $(cat "$out/rc"), $(cat "$out/wall_s") s"
   fi

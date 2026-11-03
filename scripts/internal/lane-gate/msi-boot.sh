@@ -20,6 +20,9 @@
 #                 host's load average beside the measurements, and host_quiet (a measured boot's:
 #                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
+#   xid.txt       the kernel's NVRM Xid lines (the NVIDIA driver's GPU errors) from this script's
+#                 start to its end, as msi-xid.sh prints them; host.txt's xid_lines counts them
+#                 (unread where the kernel log could not be read), xid_own those of this boot's QEMU
 #   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
 #   gpu-clocks.txt  the GPU's power state and clocks ten times a second over the guest's run and
 #                 the drags: "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W"
@@ -80,9 +83,19 @@ stop_load() {
   log "fixed GPU load stopped: $(tail -1 "$R/gpuload.log")"
 }
 finish() {
+  local qp=$P
   stop_clocks
   stop_load
   stop_qemu
+  # The NVIDIA driver's GPU errors from this script's start to now (msi-xid.sh), each with its
+  # process: xid.txt, and xid_own those from this boot's QEMU, which fail the gate.
+  if bash "$(dirname "$0")/msi-xid.sh" "$START" "$(date +%s)" "$qp" > "$R/xid.txt"; then
+    kv xid_lines "$(grep -c . "$R/xid.txt")"
+    kv xid_own "$(grep -c ' own ' "$R/xid.txt")"
+    [[ -s $R/xid.txt ]] && log "Xid lines: $(tr '\n' ';' < "$R/xid.txt")"
+  else
+    kv xid_lines unread
+  fi
   [[ -n ${SAMPLER:-} ]] && kill "$SAMPLER" 2> /dev/null
   [[ -s $R/watchdog.pid ]] && kill "$(cat "$R/watchdog.pid")" 2> /dev/null
   [[ -n ${WATCHDOG:-} ]] && kill "$WATCHDOG" 2> /dev/null
@@ -327,7 +340,7 @@ kv load_start "$(cut -d' ' -f1 /proc/loadavg)"
 # A probe boot: the round's probes back to back (msi-probes.sh), and nothing of the gate's run.
 if [[ -n ${PROBES:-} ]]; then
   log "probes: $(ls "$PROBES" | tr '\n' ' ')$(left) s left"
-  PROBES=$PROBES PROBE_RESULTS=$PROBE_RESULTS PROBE_TIP=$PROBE_TIP DEADLINE=$(( T0 + HOLD_S - 20 )) B=$B R=$R \
+  PROBES=$PROBES PROBE_RESULTS=$PROBE_RESULTS PROBE_TIP=$PROBE_TIP QEMU_PID=$P DEADLINE=$(( T0 + HOLD_S - 20 )) B=$B R=$R \
     PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS bash "$(dirname "$0")/msi-probes.sh" 2>&1 | tee -a "$R/boot.log"
   kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
   log "probes done"

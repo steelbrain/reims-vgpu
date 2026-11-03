@@ -442,6 +442,21 @@ class Run:
         fatal = int(kv.get("fatal_lines", "-1") or -1) + max(0, int(kv.get("serial_fatal_lines", "0") or 0))
         self.litem("host.no-fatal", "PASS" if fatal == 0 else "FAIL",
                   f"{fatal} 'reims-vgpu: fatal' lines" if fatal >= 0 else "no host log")
+        # The NVIDIA driver's GPU errors over the boot (msi-boot.sh's xid.txt: "TIME XID PID NAME
+        # OWN ERROR"): one from this boot's QEMU fails it; the other processes' are named.
+        if kv.get("xid_lines") == "unread":
+            self.litem("host.no-xid", "NOTRUN", "the lane host's kernel log could not be read")
+        elif "xid_lines" in kv:
+            xids = [x for x in (l.split(None, 5) for l in read(os.path.join(r, "xid.txt")).splitlines())
+                    if len(x) >= 5]
+            def said(x):
+                return f"Xid {x[1]} ({x[5] if len(x) > 5 else '-'}) from {x[3]} pid {x[2]} at {x[0][11:]}"
+            own = [said(x) for x in xids if x[4] == "own"]
+            other = [said(x) for x in xids if x[4] != "own"]
+            more = f"; other processes': {', '.join(other)}" if other else ""
+            self.litem("host.no-xid", "FAIL" if own else "PASS",
+                       (f"{len(own)} from this boot's QEMU: {', '.join(own)}" if own
+                        else "no Xid line from this boot's QEMU") + more)
         if "first_boot_accel" in kv:
             self.litem("host.same-boot-accel", "PASS" if kv["first_boot_accel"] == "1" else "FAIL",
                       "our Metal device on the first boot" if kv["first_boot_accel"] == "1"

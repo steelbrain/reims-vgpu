@@ -43,6 +43,11 @@ done
 PUB=$(cat "$GH/published-last")
 SHORT=${PUB:0:9}
 WAIT_N=3 WAIT_S=2700
+# The host's log filter in a probe boot: info, and the display's presents ("PRESENT_SURFACE of
+# transaction", reims_graphics at trace, about 23 lines a second at 120 Hz), so a probe's host.log
+# counts composites. reims_graphics has no other trace lines; at debug it logs SUBMIT_ROOM posts
+# (reims_graphics::room). Gate and bench boots log at info.
+PROBE_HOST_LOG=info,reims_graphics=trace
 # The hold the probes get: the boot's own time to the desktop and the device check (about 90 s),
 # the longest load settle (180 s) and a margin come first.
 FIT_S=$(( HOLD_S - 90 - 180 - 60 ))
@@ -102,6 +107,7 @@ ROUND=$(date +%Y%m%d-%H%M%S)
 RD=$MSI_GATE/probes/$ROUND
 msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]}; do mv \"\$p\" '$RD/probes/'; done"
 put "$L/msi-probes.sh" "$RD/bin/"
+put "$L/msi-xid.sh" "$RD/bin/"
 if ((dry)); then
   msi "PROBES='$RD/probes' PROBE_RESULTS='$RES' PROBE_TIP='$PUB' DEADLINE=$(( $(date +%s) + HOLD_S )) FAKE_GUEST='$D/guest' \
     R='$RD' bash '$RD/bin/msi-probes.sh'"
@@ -126,11 +132,14 @@ EXCLUSIVE=1
 HOLD_S=$HOLD_S
 LOCK_WAIT_S=${LOCK_WAIT_S:-10800}
 DRAG=0
+HOST_LOG=$PROBE_HOST_LOG
 PROBES=$RD/probes
 PROBE_RESULTS=$RES
 PROBE_TIP=$PUB
 EOF
   msi "bash '$RD/bin/msi-boot.sh' '$RD'" || echo "probe-batch: the boot ended $? (its log: $RD/boot.log)"
+  # The round's GPU errors (msi-boot.sh's xid.txt), the boot's own QEMU's marked "own".
+  msi "cat '$RD/xid.txt' 2> /dev/null" | sed 's/^/  Xid: /'
 fi
 
 # Each probe's status; the ones not reached (or never started: a failed boot) go back to the queue.
