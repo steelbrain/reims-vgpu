@@ -44,7 +44,10 @@ enum {
 	// Opens a command queue: in obj_id, submit offset, complete offset, submit data size,
 	// complete data size, priority; out: the device's status (RGFX_STATUS_OK, or the
 	// refusal). Each ring must lie in one of the client's blocks. The device has the queue's
-	// rings when it returns.
+	// rings when it returns. A seventh input, the RGFX_QUEUE_* flags the process wants, asks for
+	// a second output, the flags granted: those whose feature the feature word holds
+	// (kRgfxAccelMethodFeatures, the kext's RgfxFeatures.hpp), which the QUEUE_CREATE carries in
+	// its tail where there are any.
 	kRgfxAccelMethodQueueCreate = 0x103,
 	// Closes the client's queue scalarInput[0].
 	kRgfxAccelMethodQueueDestroy = 0x104,
@@ -115,6 +118,13 @@ enum {
 
 	kRgfxAccelMethodContextFirst = kRgfxAccelMethodOpenContext,
 	kRgfxAccelMethodContextLast = kRgfxAccelMethodSurfaceRetire,
+
+	// 0x10e is kept for the pages blocks' selector.
+	// The device's feature word (the kext's RgfxFeatures.hpp): no input; out: the RGFX_FEATURE_*
+	// bits, 0 to 2 as the host offers them and from bit 3 the ones the framebuffer took for the
+	// kext and its bundle. A kext older than it answers kIOReturnUnsupported. The kext routes it
+	// to its context methods beside the range above.
+	kRgfxAccelMethodFeatures = 0x10f,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

@@ -5,6 +5,7 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
+#include "RgfxFeatures.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOUserClient.h>
@@ -920,12 +921,24 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 
-	// The device from scratch: reset, then take the rings' counters as
-	// they stand and say the driver is ready. Every refusal above leaves the
-	// device untouched; from here on it is ours, and it is reset again when
-	// the kext lets it go.
+	// The device from scratch: reset, then the features the kext takes of the host's offer
+	// (RgfxFeatures.hpp), then take the rings' counters as they stand and say the driver is
+	// ready. Every refusal above leaves the device untouched; from here on it is ours, and it is
+	// reset again when the kext lets it go.
 	taken = true;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+	{
+		const uint64_t offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
+		                         readRegister(RGFX_REG_FEATURES_LO);
+		const uint64_t wanted = rgfxDriverFeatures(offered);
+		writeRegister(RGFX_REG_DRIVER_FEATURES_LO, static_cast<UInt32>(wanted));
+		writeRegister(RGFX_REG_DRIVER_FEATURES_HI, static_cast<UInt32>(wanted >> 32));
+		const uint64_t took =
+		    (static_cast<uint64_t>(readRegister(RGFX_REG_DRIVER_FEATURES_HI)) << 32) |
+		    readRegister(RGFX_REG_DRIVER_FEATURES_LO);
+		IOLog("ReimsGraphics: features offered 0x%llx, taken 0x%llx of 0x%llx\n", offered, took,
+		      wanted);
+	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);

@@ -253,7 +253,11 @@ public:
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
 	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
 	                       UInt32 timeoutMs);
-	UInt32 openQueue(const RgfxQueueCreate &create);
+	// `flags` (RGFX_QUEUE_*, granted by rgfxQueueFlagsGranted) go in the QUEUE_CREATE's tail;
+	// with none, the message has no tail.
+	UInt32 openQueue(const RgfxQueueCreate &create, UInt32 flags);
+	// The device's feature word (kRgfxAccelMethodFeatures), read from its registers.
+	uint64_t featureWord() const;
 	void closeQueue(UInt64 objId);
 	// The completion rings of the clients' queues: watchQueue maps queue `objId`'s ring header
 	// at region offset `completeOffset`, and from then on each interrupt of the device's vector

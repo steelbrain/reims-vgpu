@@ -10,6 +10,7 @@
 
 #include "RgfxAcceleratorUserClient.hpp"
 #include "ReimsGraphics.hpp"
+#include "RgfxFeatures.hpp"
 #include "RgfxRegionSpans.hpp"
 #include "RgfxSubmitGate.hpp"
 
@@ -89,8 +90,16 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			return kIOReturnBadArgument;
 		return owner->freeBlock(this, in[0]);
 	case kRgfxAccelMethodQueueCreate: {
-		if (a->scalarInputCount != 6 || a->scalarOutputCount != 1 || !hasContext)
+		// Six inputs, or a seventh of the flags the process wants with a second output of the
+		// flags granted.
+		const bool flagged = a->scalarInputCount == 7;
+		if ((a->scalarInputCount != 6 && !flagged) || a->scalarOutputCount != (flagged ? 2u : 1u) ||
+		    !hasContext)
 			return kIOReturnBadArgument;
+		if (flagged && in[6] > UINT32_MAX)
+			return kIOReturnBadArgument;
+		const UInt32 granted =
+		    flagged ? rgfxQueueFlagsGranted(static_cast<uint32_t>(in[6]), owner->featureWord()) : 0;
 		RgfxQueueCreate open = {};
 		open.obj_id = in[0];
 		open.submit_offset = in[1];
@@ -132,7 +141,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			unpin();
 			return watch;
 		}
-		UInt32 status = owner->openQueue(open);
+		UInt32 status = owner->openQueue(open, granted);
 		if (status == RGFX_STATUS_OK)
 			queues[queueCount++] = open.obj_id;
 		else
@@ -140,6 +149,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		IOLockUnlock(queueLock);
 		unpin();
 		out[0] = status;
+		if (flagged)
+			out[1] = granted;
 		return kIOReturnSuccess;
 	}
 	case kRgfxAccelMethodQueueDestroy: {
@@ -214,6 +225,11 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (a->scalarInputCount != 2 || !ownsQueue(in[0]))
 			return kIOReturnBadArgument;
 		owner->retireSurfaceWrites(in[0], in[1]);
+		return kIOReturnSuccess;
+	case kRgfxAccelMethodFeatures:
+		if (a->scalarInputCount != 0 || a->scalarOutputCount != 1)
+			return kIOReturnBadArgument;
+		out[0] = owner->featureWord();
 		return kIOReturnSuccess;
 	default:
 		return kIOReturnUnsupported;

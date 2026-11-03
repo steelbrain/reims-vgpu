@@ -1477,12 +1477,21 @@ IOReturn RgfxAccelerator::postLifecycle(UInt32 type, const void *message, UInt32
 	return r;
 }
 
-UInt32 RgfxAccelerator::openQueue(const RgfxQueueCreate &create)
+UInt32 RgfxAccelerator::openQueue(const RgfxQueueCreate &create, UInt32 flags)
 {
+	struct {
+		RgfxQueueCreate create;
+		RgfxQueueCreateFlags tail;
+	} message = {};
+	static_assert(sizeof(message) == RGFX_QUEUE_CREATE_FLAGS_OFFSET + sizeof(RgfxQueueCreateFlags),
+	              "the tail follows the create");
+	message.create = create;
+	message.tail.flags = flags;
+	const UInt32 size = flags ? sizeof(message) : sizeof(create);
 	RgfxComplete answer = {};
 	UInt32 length = 0;
-	IOReturn r = postLifecycle(RGFX_CMD_QUEUE_CREATE, &create, sizeof(create), RGFX_EVT_COMPLETE,
-	                           &answer, sizeof(answer), &length, nullptr, kQueueAnswerMs);
+	IOReturn r = postLifecycle(RGFX_CMD_QUEUE_CREATE, &message, size, RGFX_EVT_COMPLETE, &answer,
+	                           sizeof(answer), &length, nullptr, kQueueAnswerMs);
 	if (r != kIOReturnSuccess || length < sizeof(answer)) {
 		IOLog("RgfxAccelerator: queue 0x%llx: no answer to its create (0x%x)\n", create.obj_id, r);
 		return RGFX_STATUS_INVALID_ARGUMENT;

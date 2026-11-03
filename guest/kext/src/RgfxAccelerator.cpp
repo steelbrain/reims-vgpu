@@ -17,6 +17,7 @@
 #include <sys/vnode.h>
 
 #include "RgfxBundlePaths.hpp"
+#include "RgfxFeatures.hpp"
 #include "RgfxTrace.hpp"
 
 #define super IOAccelerator
@@ -250,6 +251,15 @@ UInt32 RgfxAccelerator::readRegister(UInt32 offset) const
 void RgfxAccelerator::writeRegister(UInt32 offset, UInt32 value)
 {
 	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
+}
+
+uint64_t RgfxAccelerator::featureWord() const
+{
+	const uint64_t offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
+	                         readRegister(RGFX_REG_FEATURES_LO);
+	const uint64_t taken = (static_cast<uint64_t>(readRegister(RGFX_REG_DRIVER_FEATURES_HI)) << 32) |
+	                       readRegister(RGFX_REG_DRIVER_FEATURES_LO);
+	return rgfxFeatureWord(offered, taken);
 }
 
 // MARK: - IOService
