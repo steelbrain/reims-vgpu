@@ -62,6 +62,11 @@
 namespace {
 // The most blocks handed out at once.
 constexpr UInt32 kMaxBlocks = 16384;
+// The blocks' reserve for WindowServer (RgfxBlockTable): the last bytes of the region and the last
+// entries of the table, which no other process is given. Sized from what WindowServer holds at
+// the display's 4K mode, measured: see the commit that set it.
+constexpr UInt64 kWindowServerReserveBytes = 96ull << 20;
+constexpr UInt32 kWindowServerReserveEntries = 1024;
 // The most command queues watched at once, over every client.
 constexpr UInt32 kMaxWatched = 2048;
 // A ring header's fields (RgfxRingHeader).
@@ -117,8 +122,8 @@ struct ContextState {
 	// The thread call that posts freed blocks' releases (releaseFreedBlocks).
 	thread_call_t releaseCall;
 };
-ContextState state = {
-    nullptr, 0, 0, 1, {nullptr, 0, kMaxBlocks, 0, 0, 0}, {}, nullptr, nullptr, 0, false, nullptr};
+ContextState state = {nullptr, 0, 0, 1, {nullptr, 0, kMaxBlocks, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                      {},      nullptr, nullptr, 0, false, nullptr};
 IOLock *&contextLock = state.contextLock;
 UInt32 &slotsHeld = state.slotsHeld;
 UInt32 &nextSlot = state.nextSlot;
@@ -183,6 +188,7 @@ void queueInterruptHook(OSObject *target)
 
 bool reapDormant();
 void noteDormant();
+void noteReserve();
 void unwire(void *pages);
 
 // The release thread call: lets go of the dormant blocks their surfaces asked to go
@@ -285,15 +291,21 @@ bool RgfxAccelerator::startContexts()
 		surfaceCache = surfacePages && (features & RGFX_FEATURE_SURFACE_CACHE) != 0;
 		blocksStart = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 		blocksEnd = (regionSize - RGFX_CURSOR_SPAN) & ~(kPage - 1);
+		// A reserve of no more than a quarter of the blocks' room, on a region too small for it.
+		const UInt64 quarter = ((blocksEnd - blocksStart) / 4) & ~(kPage - 1);
+		blockTable.reserveBytes =
+		    kWindowServerReserveBytes < quarter ? kWindowServerReserveBytes : quarter;
+		blockTable.reserveEntries = kWindowServerReserveEntries;
 		uint64_t memory = 0;
 		size_t length = sizeof(memory);
 		if (sysctlbyname("hw.memsize", &memory, &length, nullptr, 0) != 0 || !memory)
 			memory = kDormantMemoryUnknown;
 		dormantMaxBytes = memory / 8;
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
-		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u context slots, surfaces %s\n",
-		      blocksStart, blocksEnd, RGFX_CONTEXT_SLOTS,
-		      surfacePages ? "in place" : "copied");
+		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u context slots, surfaces %s; "
+		      "WindowServer's reserve: %u of %u entries, %llu MiB\n",
+		      blocksStart, blocksEnd, RGFX_CONTEXT_SLOTS, surfacePages ? "in place" : "copied",
+		      blockTable.reserveEntries, kMaxBlocks, blockTable.reserveBytes >> 20);
 		return true;
 	}
 	if (lock)
@@ -425,10 +437,14 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 {
 	if (!contextLock)
 		return kIOReturnBadArgument;
+	const bool mayReserve = owner->isWindowServer();
 	IOLockLock(contextLock);
 	RgfxBlockPin pin = {};
-	RgfxBlockResult r = rgfxBlockAlloc(blockTable, owner, context, size, align, offset, &pin);
+	RgfxBlockResult r =
+	    rgfxBlockAlloc(blockTable, owner, context, size, align, offset, &pin, mayReserve);
 	IOLockUnlock(contextLock);
+	if (r == kRgfxBlockOk && mayReserve)
+		noteReserve();
 	switch (r) {
 	case kRgfxBlockOk: {
 		const UInt64 bytes = rgfxBlockAlignUp(size, kRgfxBlockPage); // the block's, as allocated
@@ -701,6 +717,32 @@ bool reapDormant()
 	return release;
 }
 
+// The most WindowServer's blocks came to at the last line of noteReserve. Under contextLock.
+UInt32 reserveLoggedCount = 0;
+UInt64 reserveLoggedBytes = 0;
+
+// Logs what WindowServer's blocks came to at most (RgfxBlockTable's peaks), as that grows by
+// 64 blocks or a MiB: what its reserve is sized from. Not under contextLock.
+void noteReserve()
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	const RgfxBlockTable t = blockTable;
+	const bool log = t.reservedPeakCount >= reserveLoggedCount + 64 ||
+	                 t.reservedPeakBytes >= reserveLoggedBytes + (1ull << 20);
+	if (log) {
+		reserveLoggedCount = t.reservedPeakCount;
+		reserveLoggedBytes = t.reservedPeakBytes;
+	}
+	IOLockUnlock(contextLock);
+	if (log)
+		IOLog("RgfxAccelerator: WindowServer's blocks: %u (%llu KiB), at most %u (%llu KiB); "
+		      "its reserve: %u entries, %llu MiB; the table holds %u\n",
+		      t.reservedCount, t.reservedBytes >> 10, t.reservedPeakCount,
+		      t.reservedPeakBytes >> 10, t.reserveEntries, t.reserveBytes >> 20, t.count);
+}
+
 // Logs what the dormant blocks did, where it changed and kDormantLogMs passed since the last
 // line. Not under contextLock.
 void noteDormant()
@@ -861,7 +903,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		}
 		made = slot < 0 ? kRgfxBlockTableFull
 		                : rgfxBlockAlloc(blockTable, &table.entries[slot], context, total, kPage,
-		                                 &offset, &pin);
+		                                 &offset, &pin, client->isWindowServer());
 		if (made != kRgfxBlockNoSpace || waitedForRoom || !table.dormantCount)
 			break;
 		waitedForRoom = true;
@@ -1023,6 +1065,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		unwire(mine);
 	if (release)
 		thread_call_enter(releaseCall);
+	if (client->isWindowServer())
+		noteReserve();
 	return posted;
 }
 

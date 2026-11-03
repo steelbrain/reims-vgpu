@@ -23,7 +23,7 @@ constexpr uint64_t kEnd = 0x20000;
 
 struct Table {
 	RgfxBlock blocks[8] = {};
-	RgfxBlockTable t = {blocks, 0, 8, kStart, kEnd, 0};
+	RgfxBlockTable t = {blocks, 0, 8, kStart, kEnd, 0, 0, 0, 0, 0, 0, 0};
 };
 
 const char kA = 0, kB = 0;
@@ -276,6 +276,88 @@ int main()
 		check(!x.t.blocks[rgfxBlockIndex(x.t, b1)].refused &&
 		          rgfxBlockRetryRefused(x.t) == 0,
 		      "a kept-for-good block is no longer refused");
+	}
+	{
+		// WindowServer's reserve: the last 4 pages and the last 2 entries are its alone.
+		Table x;
+		x.t.reserveBytes = 0x4000;
+		x.t.reserveEntries = 2;
+		uint64_t o[8] = {};
+		check(rgfxBlockAlloc(x.t, a, 1, 0x4000, 0x1000, &o[0], nullptr, true) == kRgfxBlockOk &&
+		          o[0] == kStart,
+		      "WindowServer takes the first gap, outside the reserve, while there is room");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x4000, 0x1000, &o[1]) == kRgfxBlockOk &&
+		          rgfxBlockAlloc(x.t, b, 2, 0x4000, 0x1000, &o[2]) == kRgfxBlockOk,
+		      "another process takes the rest of the room");
+		uint64_t none = 0;
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &none) == kRgfxBlockNoSpace,
+		      "but not the reserve");
+		check(rgfxBlockAlloc(x.t, a, 1, 0x4000, 0x1000, &o[3], nullptr, true) == kRgfxBlockOk &&
+		          o[3] == kEnd - 0x4000,
+		      "which WindowServer reaches once the rest is full");
+		check(x.t.reservedCount == 2 && x.t.reservedBytes == 0x8000,
+		      "WindowServer's blocks are counted");
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &none, nullptr, true) ==
+		          kRgfxBlockNoSpace,
+		      "and the reserve runs out too");
+		// Its block leaves the table at its release: no longer counted, the peak kept.
+		check(rgfxBlockFree(x.t, a, o[3]) == kRgfxBlockOk, "WindowServer frees its block");
+		RgfxBlock rel;
+		check(rgfxBlockNextRelease(x.t, &rel) && rel.offset == o[3], "its release is posted");
+		rgfxBlockReleased(x.t, o[3], rel.serial, true);
+		check(x.t.reservedCount == 1 && x.t.reservedBytes == 0x4000 &&
+		          x.t.reservedPeakCount == 2 && x.t.reservedPeakBytes == 0x8000,
+		      "a released block is no longer counted, the peak stays");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &none) == kRgfxBlockNoSpace,
+		      "the freed reserve is still not another process's");
+	}
+	{
+		// A block may not reach into the reserve, nor be larger than the room outside it.
+		Table x;
+		x.t.reserveBytes = 0x4000;
+		uint64_t at = 0;
+		check(rgfxBlockAlloc(x.t, b, 2, 0xd000, 0x1000, &at) == kRgfxBlockNoSpace,
+		      "a block larger than the room outside the reserve is refused");
+		check(rgfxBlockAlloc(x.t, b, 2, 0xc000, 0x1000, &at) == kRgfxBlockOk && at == kStart,
+		      "one that fits beside it is not");
+		Table y;
+		y.t.reserveBytes = 0x4000;
+		check(rgfxBlockAlloc(y.t, a, 1, 0xd000, 0x1000, &at, nullptr, true) == kRgfxBlockOk,
+		      "WindowServer's may reach into it");
+		Table z;
+		z.t.reserveBytes = 0x20000;
+		check(rgfxBlockAlloc(z.t, b, 2, 0x1000, 0x1000, &at) == kRgfxBlockNoSpace,
+		      "a reserve past the range leaves the others no room");
+		check(rgfxBlockAlloc(z.t, a, 1, 0x1000, 0x1000, &at, nullptr, true) == kRgfxBlockOk,
+		      "and WindowServer all of it");
+	}
+	{
+		// The last 2 of the 8 entries are WindowServer's.
+		Table x;
+		x.t.reserveEntries = 2;
+		uint64_t at = 0;
+		int made = 0;
+		while (rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &at) == kRgfxBlockOk)
+			made++;
+		check(made == 6, "another process gets all but the reserved entries");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &at) == kRgfxBlockTableFull,
+		      "and then the table is full for it");
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &at, nullptr, true) == kRgfxBlockOk &&
+		          rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &at, nullptr, true) == kRgfxBlockOk,
+		      "but not for WindowServer, to the last entry");
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &at, nullptr, true) ==
+		          kRgfxBlockTableFull,
+		      "past which it is full for WindowServer too");
+		check(x.t.reservedPeakCount == 2, "the peak counts WindowServer's entries");
+	}
+	{
+		// With no reserve, every allocation is as before.
+		Table x;
+		uint64_t at = 0;
+		int made = 0;
+		while (rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &at) == kRgfxBlockOk)
+			made++;
+		check(made == 8 && x.t.reservedCount == 0, "no reserve: every entry is anyone's");
 	}
 	std::printf("blocks_test: OK (%d checks)\n", checks);
 	return 0;

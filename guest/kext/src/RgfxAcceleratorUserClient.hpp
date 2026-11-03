@@ -59,6 +59,10 @@ public:
 	IOReturn mapSpan(UInt64 offset, UInt64 length);
 	void unmapSpan(UInt64 offset, UInt64 length);
 
+	// Whether the client's task is WindowServer (initWithTask): its blocks may take the reserve
+	// no other process is given (RgfxBlockTable).
+	bool isWindowServer() const { return windowServer; }
+
 	// Dispatch our selectors (the doorbell).
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
 	                        IOExternalMethodDispatch *dispatch, OSObject *target,
@@ -126,6 +130,9 @@ private:
 	UInt64 revokeNs;
 
 	task_t task;
+	// Whether the task is WindowServer (initWithTask), whose blocks may take the reserve the
+	// others are never given (RgfxBlockTable).
+	bool windowServer;
 	RgfxAccelerator *owner;
 	// The type it was opened as: ours (kRgfxAccelUserClientType) or the IOGPU base's device
 	// client (kRgfxIOGPUDeviceUserClientType); it decides which selectors it answers.

@@ -51,6 +51,9 @@ struct RgfxBlock {
 	// pages under the host's view. The caller unwires it once the block leaves the table (its
 	// release answered OK, rgfxBlockReleased). Null for a copy block or a block over no surface.
 	void *wired;
+	// Made for a client that may take the reserve (rgfxBlockAlloc's `mayReserve`): counted in
+	// the table's reservedCount and reservedBytes while it is in the table.
+	bool reserved;
 };
 
 // A pin of one block (rgfxBlockPin), to give back with rgfxBlockUnpin.
@@ -60,6 +63,13 @@ struct RgfxBlockPin {
 };
 
 // The table: `count` blocks of `capacity`, sorted by offset, between `start` and `end`.
+//
+// The reserve: the last `reserveBytes` of the range and the last `reserveEntries` of the
+// capacity are given only to an allocation that may take them (`mayReserve`, WindowServer's), so
+// no other process, however much it holds, leaves the compositor without room or an entry. Such
+// an allocation takes the first gap from `start` like any other, and reaches into the reserve only
+// where the rest has no room. The blocks made for it are counted while they are in the table
+// (reservedCount, reservedBytes), with the most they came to (the peaks), for the reserve's size.
 struct RgfxBlockTable {
 	RgfxBlock *blocks;
 	uint32_t count;
@@ -67,6 +77,12 @@ struct RgfxBlockTable {
 	uint64_t start;
 	uint64_t end;
 	uint64_t nextSerial;
+	uint64_t reserveBytes;
+	uint32_t reserveEntries;
+	uint32_t reservedCount;
+	uint64_t reservedBytes;
+	uint32_t reservedPeakCount;
+	uint64_t reservedPeakBytes;
 };
 
 enum RgfxBlockResult {
@@ -108,31 +124,41 @@ inline int64_t rgfxBlockIndex(const RgfxBlockTable &t, uint64_t offset)
 
 inline void rgfxBlockRemove(RgfxBlockTable &t, uint32_t at)
 {
+	if (t.blocks[at].reserved) {
+		t.reservedCount--;
+		t.reservedBytes -= t.blocks[at].size;
+	}
 	__builtin_memmove(&t.blocks[at], &t.blocks[at + 1], sizeof(RgfxBlock) * (t.count - at - 1));
 	t.count--;
 }
 
 // A block of `size` bytes (rounded up to pages), aligned to `align` (a power of two, at least a
-// page), for `owner` of context `context`: the first gap, in offset order, that holds it. Where
-// `pin` is not null the block starts pinned, so it is not freed until the caller unpins it (once
-// the device has its grant).
+// page), for `owner` of context `context`: the first gap, in offset order, that holds it, inside
+// the table's reserve too where `mayReserve` (RgfxBlockTable). Where `pin` is not null the block
+// starts pinned, so it is not freed until the caller unpins it (once the device has its grant).
 inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint32_t context,
                                       uint64_t size, uint64_t align, uint64_t *offset,
-                                      RgfxBlockPin *pin = nullptr)
+                                      RgfxBlockPin *pin = nullptr, bool mayReserve = false)
 {
 	if (size == 0 || align == 0 || (align & (align - 1)) != 0)
 		return kRgfxBlockBadArgument;
 	if (align < kRgfxBlockPage)
 		align = kRgfxBlockPage;
-	if (size > t.end - t.start)
+	const uint64_t span = t.end - t.start;
+	const uint64_t end =
+	    mayReserve ? t.end : t.end - (t.reserveBytes < span ? t.reserveBytes : span);
+	const uint32_t capacity =
+	    mayReserve ? t.capacity
+	               : t.capacity - (t.reserveEntries < t.capacity ? t.reserveEntries : t.capacity);
+	if (size > end - t.start)
 		return kRgfxBlockNoSpace;
 	size = rgfxBlockAlignUp(size, kRgfxBlockPage);
-	if (t.count == t.capacity)
+	if (t.count >= capacity)
 		return kRgfxBlockTableFull;
 	uint64_t cursor = t.start;
-	for (uint32_t at = 0; at <= t.count; at++) {
+	for (uint32_t at = 0; at <= t.count && cursor < end; at++) {
 		uint64_t start = rgfxBlockAlignUp(cursor, align);
-		uint64_t gapEnd = at < t.count ? t.blocks[at].offset : t.end;
+		uint64_t gapEnd = at < t.count && t.blocks[at].offset < end ? t.blocks[at].offset : end;
 		if (start <= gapEnd && size <= gapEnd - start) {
 			__builtin_memmove(&t.blocks[at + 1], &t.blocks[at],
 			                  sizeof(RgfxBlock) * (t.count - at));
@@ -146,7 +172,16 @@ inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint
 			b.state = kRgfxBlockLive;
 			b.refused = false;
 			b.wired = nullptr;
+			b.reserved = mayReserve;
 			t.count++;
+			if (mayReserve) {
+				t.reservedCount++;
+				t.reservedBytes += size;
+				if (t.reservedCount > t.reservedPeakCount)
+					t.reservedPeakCount = t.reservedCount;
+				if (t.reservedBytes > t.reservedPeakBytes)
+					t.reservedPeakBytes = t.reservedBytes;
+			}
 			*offset = start;
 			if (pin)
 				*pin = {b.offset, b.serial};

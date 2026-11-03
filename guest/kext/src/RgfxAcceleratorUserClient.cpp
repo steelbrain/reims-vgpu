@@ -15,12 +15,38 @@ OSDefineMetaClassAndStructors(RgfxAcceleratorUserClient, IOUserClient);
 
 // MARK: - Lifecycle
 
+// Whether `task`, which is opening the client, is WindowServer. The kernel's accessors of a
+// process's code-signing identifier and platform-binary status are private KPIs, which a kext
+// outside Apple's namespace cannot link. So the test is the process's name and an entitlement of
+// WindowServer's that Apple alone can grant: AMFI lets no binary hold a com.apple.private
+// entitlement unless Apple signed it, so a process merely named WindowServer fails the test.
+// WindowServer holds com.apple.private.graphics-restart-no-kill on macOS 26.7.1 (an Intel Mac)
+// and macOS 27 (an Apple-silicon Mac), read from its signature. The client is made on the
+// opening thread, so the current process is the task's.
+static bool rgfxIsWindowServer(task_t task)
+{
+	if (task != current_task())
+		return false;
+	char name[MAXCOMLEN + 1] = {};
+	proc_selfname(name, sizeof(name));
+	if (strncmp(name, "WindowServer", sizeof(name)) != 0)
+		return false;
+	OSObject *held =
+	    IOUserClient::copyClientEntitlement(task, "com.apple.private.graphics-restart-no-kill");
+	const bool ok = held == kOSBooleanTrue;
+	OSSafeReleaseNULL(held);
+	return ok;
+}
+
 bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type,
                                              OSDictionary *properties)
 {
 	if (!super::initWithTask(owningTask, securityID, type, properties))
 		return false;
 	task = owningTask;
+	windowServer = rgfxIsWindowServer(owningTask);
+	if (windowServer)
+		IOLog("RgfxAccelerator: WindowServer's client, whose blocks may take the reserve\n");
 	owner = nullptr;
 	ucType = type;
 	hasContext = false;

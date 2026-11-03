@@ -670,6 +670,20 @@ chunks of resource ids and, on that answer only, its blocks. A command
 buffer is decoded once the host has carried out every control-ring message
 published before its queue's thread took it.
 
+**WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
+refuses an allocation only when memory runs out, never because another process
+holds much, so neither does the kext. The one process whose refusal would stall
+every other is the compositor. So the last 96 MiB of the blocks' room and the
+last 1024 of the table's 16384 entries go only to WindowServer's blocks
+(`RgfxBlockTable`'s reserve). WindowServer takes the first gap from the start
+like any process, and reaches into the reserve only once the rest is full; any
+other process is refused at the reserve's edge, as at the region's end. The kext
+knows WindowServer's client by the process's name and an entitlement only Apple
+can grant (`com.apple.private.graphics-restart-no-kill`). The kernel's
+accessors of a process's signing identifier are private KPIs, which a kext
+outside Apple's namespace cannot link. It logs the most WindowServer's blocks
+came to, which is what the reserve is sized from.
+
 **Reset.** A reset leaves the device as one just made, as a device's
 function reset does: `STATUS` 0, which the framebuffer writes at its start,
 and QEMU's reset of the device, which a reboot inside one QEMU run makes.
