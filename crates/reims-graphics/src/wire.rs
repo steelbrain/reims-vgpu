@@ -969,7 +969,7 @@ const _: () = {
     assert!(RGFX_CONTEXT_VA_BASE >= 1u64 << 46);
     // A context of the old span holds a whole number of units, a power of two of them, so it is
     // an aligned run of them.
-    assert!(RGFX_CONTEXT_VA_SPAN % RGFX_CONTEXT_VA_UNIT == 0);
+    assert!(RGFX_CONTEXT_VA_SPAN.is_multiple_of(RGFX_CONTEXT_VA_UNIT));
     assert!((RGFX_CONTEXT_VA_SPAN / RGFX_CONTEXT_VA_UNIT).is_power_of_two());
 };
 
