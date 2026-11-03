@@ -1,4 +1,4 @@
-# The Vulkan Video decoder
+# The Vulkan Video decoder and encoder
 
 `crates/reims-vgpu-video-vulkan`: H.264 and H.265 decode through Vulkan
 Video (`VK_KHR_video_queue`, `VK_KHR_video_decode_queue`,
@@ -8,7 +8,9 @@ codec crate's decoders take them. It is not a backend yet: nothing in core or th
 opens it. It is built to run on the device the library draws with on
 Linux (metal2vulkan's), and to land each picture in the GPU copy of a
 guest IOSurface, which the guest's Metal then samples per plane, or, until
-the IOSurfaces are images, in the IOSurface's own bytes in host memory. Every fact names
+the IOSurfaces are images, in the IOSurface's own bytes in host memory.
+It encodes H.264 and H.265 too, on the same device's encode queue
+([Encode](#encode)). Every fact names
 its run; runs are on an NVIDIA GeForce RTX 5080 Laptop GPU (driver
 615.71.09, Vulkan loader and validation layers 1.4.357, on CachyOS) unless
 they say otherwise.
@@ -34,6 +36,16 @@ they say otherwise.
 | Each frame's NV12 or P010 MD5, as the VA-API backend's `hevc-framemd5`, with the same options, and access units read in place (`--in-place`) | `examples/vulkan-h265-framemd5.rs` |
 | The VA-API H.264 check's streams, decoded here against their references | `tools/h264-check.sh` |
 | The VA-API HEVC check's streams, decoded here against their references | `tools/h265-check.sh` |
+| Encode: the encode queue attached to a device (`VideoDevice::attach_encode`, `RawEncodeQueue`) | `src/encode/device.rs` |
+| Encode: the profiles and what the device answers for each (`h264_encode_capabilities`, `h265_encode_capabilities`) | `src/encode/caps.rs` |
+| Encode: each frame's picture type, references, DPB slot and numbers, with no GPU (`GopConfig`) | `src/encode/plan.rs` |
+| Encode: rate control (`RateControl`, `Vbv`) as Vulkan takes it | `src/encode/rate.rs` |
+| Encode: sources (`EncodeSource`, `SourceSpec`, `ImportedSource`) and bitstream buffers (`BitstreamSource`, `BitstreamSpec`, `ImportedBitstream`, `HostBitstreams`) | `src/encode/io.rs` |
+| Encode: the session, its DPB pictures, and each picture's command buffer | `src/encode/session.rs` |
+| Encode: a picture as it comes out (`EncodedFrame`), its feedback and GPU time, and the query pools | `src/encode/frame.rs` |
+| Encode: what both codecs share (`EncodeConfig`, `FrameParams`), and the H.264 and H.265 halves (`H264Encoder`, `H265Encoder`) | `src/encode.rs`, `src/encode/h264.rs`, `src/encode/h265.rs` |
+| Encodes raw NV12 or P010 frames to Annex B, every option of the encoders, sources in images or host-visible planes, bitstreams in host or imported buffers, per picture GPU time | `examples/vulkan-encode.rs` |
+| The encoders against ffmpeg and this crate's own decoders, and their GPU time | `tools/encode-check.sh` |
 
 ## The device
 
@@ -229,6 +241,103 @@ timeline has passed the last work that used it. `Picture::read_back`, for
 tests, copies both planes out on the copy queue after the picture's
 value.
 
+## Encode
+
+`H264Encoder` and `H265Encoder` encode on the encode queue a device has
+attached (`VideoDevice::attach_encode`, once, from any of the device's
+constructors). `VideoDevice::create` attaches one where a family encodes
+H.264 or H.265: a queue of a family of its own (the 5080's family 4,
+video encode and transfer, two queues, 32-bit timestamps), else the
+decode family's second queue. Another's device hands its encode queue
+over as `RawEncodeQueue`, the family having been made with
+`ENCODE_EXTENSIONS` (`VK_KHR_video_encode_queue`, `_h264`, `_h265`) as
+its codecs need.
+
+The 5080 answers (`vulkan-encode --capabilities`, 11-03):
+
+| | H.264 (Constrained Baseline, Main, High alike) | H.265 Main and Main 10 |
+|---|---|---|
+| sizes | 160x64 to 4096x4096, granularity and input granularity 16x16 | 160x64 to 8192x8192, 32x32 |
+| level, DPB slots, active references | 5.2, 17, 16 | 6.2, 16, 15 |
+| references: P list 0, B list 0, list 1 | 7, 7, 1 | 4, 4, 2; no B picture in a list |
+| slices | 64 | 64 slice segments, one tile |
+| rate control | none (constant QP), CBR, VBR; one layer; up to 120 Mbit/s; QP 0 to 51 | the same |
+| quality levels | 5 (4 with ultra-low-latency tuning) | 7 (5 with it) |
+| feedback | offset and bytes written | the same |
+| sources | NV12 `OPTIMAL` only, no linear tiling | NV12 or P010 `OPTIMAL` only |
+| bitstream offset and size alignment | 256 | 256 |
+| syntax | CABAC and CAVLC, 8x8 transform | CTB 32 only, transform blocks 4 to 32, SAO, no temporal MV prediction |
+
+**Sources** are read where they lie. A source image made as `SourceSpec`
+says (the profile's format, `OPTIMAL`, `VIDEO_ENCODE_SRC`, at least the
+coded size rounded up to the input granularity, in `GENERAL`) is read in
+place: in the product the GPU copy of a guest IOSurface, which on a dGPU
+lives in VRAM already. Planes in a buffer (`SourcePicture::Buffer`, host
+pages imported by their pointer among them: `ImportedSource`) are copied
+once on the GPU, in the encode's own command buffer, into a picture of the
+session's, their last column and row repeated to the picture's whole
+extent, which the device reads past the coded size (the 5080 codes H.265
+to whole 32x32 CTBs: 2176 rows for 2160). No frame is copied on the CPU;
+`SourceCounts` counts the two kinds, and copies on the CPU, which stay 0.
+
+**Bitstreams** go into a buffer the caller's `BitstreamSource` gives for
+each picture (`BitstreamSpec`: `VIDEO_ENCODE_DST` and `TRANSFER_DST`, the
+profile or `VIDEO_PROFILE_INDEPENDENT`), from its offset rounded up to the
+device's alignment: host pages imported by their pointer
+(`ImportedBitstream`), or a buffer of the caller's. In band
+(`ParameterSetMode::InBand`), the GPU writes the parameter sets in front
+of each IDR picture (`vkCmdUpdateBuffer`, padded with leading zeros to
+whole words), ending where the encode writes; out of band, the caller
+takes them from the encoder (`parameter_sets`, `avcc`, `hvcc`). Each
+`EncodedFrame` comes out in decode order with its type, order count,
+`frame_num`, its timeline value, and, once done, its feedback: the
+parameter sets' and the picture's offsets and bytes, and the status.
+
+**Pictures** are planned with no GPU (`plan.rs`): IDR pictures at the
+first frame, each IDR period and each forced frame; I pictures each intra
+period; P pictures predicting from the most recent references; up to 7 B
+pictures between anchors, never references, closed as x264 closes a run
+before an IDR picture. References follow H.264's sliding window, which
+H.265's reference picture sets copy; lists are in their default order.
+H.264: `frame_num` and the order count's LSBs wrap at 256, B pictures
+share their anchor's `frame_num`. H.265: IDR pictures are `IDR_W_RADL`,
+other I pictures trailing pictures (not IRAP: the B pictures before them
+predict across them); each picture carries its own reference picture set.
+B pictures are planned only where the profile and the device have them.
+
+**Rate control** is a constant QP per picture type, CBR, or VBR under a
+peak, within an HRD buffer given in bits at the peak (`Vbv`; by default a
+second, three quarters full at the start) that Vulkan takes in
+milliseconds. The GOP is told to the device as regular and flat where it
+has a period; without one it says nothing of its shape, since Vulkan
+takes no B-picture count without a GOP size. `set_rate_control` changes
+the bitrate from the next picture on; the level stays as it was chosen.
+
+**What the 5080 gets wrong, and what is done about it** (615.71.09, 11-03;
+reports with standalone repros were written for NVIDIA):
+- Encode feedback queries read with `VK_QUERY_RESULT_64_BIT` hold the
+  offset and the bytes written as two 32-bit values in the first 64-bit
+  slot, the status at its own: a picture of 51790 bytes reads as offset
+  `0xca4e00000000` and no bytes. The encoder reads 32-bit results, which
+  are right; a bitstream buffer is far under 4 GiB.
+- The H.264 SPS it writes (`vkGetEncodedVideoSessionParametersKHR`)
+  bounds motion vectors at 2^1 quarter samples
+  (`log2_max_mv_length_horizontal` and `_vertical` 1, which the std VUI
+  has no field for), and its own motion vectors pass the bound, so every
+  stream breaks its SPS; `h264_nvenc` writes 13 and 9. The encoder raises
+  both to 15 in the device's SPS, every other bit kept (`with_mv_lengths`,
+  the codec crate's `raise_mv_lengths`).
+- Not a bug, but measured: H.265 with 8x8 coding blocks allowed takes
+  3.6 to 4.6 times the GPU time a picture (15.6 to 17.9 ms at 4K, 3.9 ms
+  at 1080p) of 16x16 ones, which NVENC's own presets use; the encoder's
+  SPS has 16x16 coding blocks. Quality levels 0 and 1 are the fastest
+  (4K: H.264 4.2 ms, H.265 4.0 ms; level 4 takes H.264 11.5 ms), and the
+  ultra-low-latency tuning roughly doubles the time a picture.
+- The driver codes H.265 pictures to whole CTBs and says so in the SPS it
+  writes (`pic_height_in_luma_samples` 2176, a conformance window to
+  2160): the encoder uses the parameter sets the device wrote, never its
+  own.
+
 ## Checks
 
 - The unit tests (`cargo nextest run -p reims-vgpu-video-vulkan`) need no
@@ -284,6 +393,36 @@ value.
   of `kvz-720p-ref15` before its picture of nine current references, which
   is refused; and the eight runs under the validation layer, which says
   nothing. No case needed a workaround of the driver.
+- `tools/encode-check.sh` encodes 20 streams with `vulkan-encode`
+  (testsrc2 and mandelbrot at 720p, 1080p, 4K and 1918x1078, NV12 and
+  P010; every profile, B pictures, intra and IDR periods, forced IDR
+  pictures, slices, in-band parameter sets, CAVLC, quality levels and
+  tunings, a `frame_num` wrap, a CBR switch mid-stream, sources in images
+  and in host-visible planes, bitstreams in host buffers and in slots of
+  one imported allocation), each under the validation layer, and checks:
+  ffmpeg decodes it with no error to every frame; its PSNR, mean and
+  lowest frame, stays above a floor 1 dB under the 5080's; its HRD buffer
+  at the peak never underflows, and over 300 frames its bitrate is within
+  10% of a CBR target and under a VBR peak; this crate's decoders decode
+  it bit-exact to ffmpeg; IDR pictures land where forced; sources were
+  read as asked, with no copy on the CPU; H.264's SPS bounds motion
+  vectors at 2^15; and the validation layer says nothing. Then it times
+  each encoder at 1080p and 4K.
+- On the 5080 (11-03) all of the encode check's verdicts pass. Bitrates
+  over 300 frames: CBR -1.6% to +4.6% off, VBR +4.6% to +4.7%; PSNR from
+  38.3 dB (720p with noise at 2.5 to 3 Mbit/s) to 48.4 dB (1080p Main 10).
+  GPU time a picture, quality level 0, P pictures, VBR (the mean of a run,
+  the range over two runs of the check; the copy within it for planes in
+  host-visible memory). H.264's swing between the runs, the same build's,
+  is the GPU's, not the encoder's:
+
+  | | in place | from host planes | the copy |
+  |---|---|---|---|
+  | H.264 High 1080p | 1.38 to 1.40 ms | 1.40 to 2.33 ms | 0.14 to 0.16 ms |
+  | H.264 High 4K | 4.39 to 5.26 ms | 4.82 to 4.83 ms | 0.53 ms |
+  | H.265 Main 1080p | 0.84 ms | 0.98 to 0.99 ms | 0.14 ms |
+  | H.265 Main 4K | 3.08 to 3.09 ms | 3.62 to 3.63 ms | 0.54 to 0.55 ms |
+  | H.265 Main 10 4K | 3.21 to 3.23 ms | 4.26 to 4.29 ms | 1.08 ms |
 - The validation layer runs with `VK_LOADER_LAYERS_ENABLE='*validation'`
   and, on this driver, `VK_KHRONOS_VALIDATION_UNIQUE_HANDLES=false`: with
   the layer's handle wrapping on, the driver's `vkQueueSubmit2` of a
@@ -299,4 +438,9 @@ value.
   scratch image for a buffer, is built but unmeasured: the 5080 offers
   coincident pictures alone.
 - Only NVIDIA measured. RADV and ANV, which expose Vulkan Video on the
-  AMD and Intel hosts, are unchecked.
+  AMD and Intel hosts, are unchecked, the encoders included.
+- Encode: no B pictures as references (no pyramid), no long-term
+  references, temporal layers, intra refresh or regions of interest; no
+  HRD parameters in the VUI (the 5080 claims no HRD compliance);
+  `set_rate_control` does not choose the level again for a higher peak.
+  The guest side and the wire are not here.
