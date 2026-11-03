@@ -107,6 +107,9 @@ if [[ -n $P ]]; then
 fi
 case $out in
 *SSH_OK*) ;;
+# The host's queue did not reach this boot in LOCK_WAIT_S: nothing of the candidate ran.
+*GPU_WANTED_EXCLUSIVE* | *VM_SLOTS_BUSY* | *GPU_LOCKED*)
+  log "BOOT_QUEUE_TIMEOUT $(echo "$out" | tail -2 | tr '\n' ' ')"; exit 7 ;;
 *) log "BOOT_FAIL $(echo "$out" | tail -3 | tr '\n' ' ')"; exit 4 ;;
 esac
 [[ -n $P ]] || { log "BOOT_FAIL no QEMU pid in $B/qemu.pid"; exit 4; }

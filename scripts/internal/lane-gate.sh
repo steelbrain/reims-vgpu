@@ -460,7 +460,13 @@ if [[ -n $p_img ]]; then wait "$p_img" && img_ok=1 || img_ok=0; cat "$RUN/image-
 if ! skipped boot; then
   if ((msi_ok && img_ok && gb == 0)); then
     echo boot >> "$RUN/ran"
-    step boot do_boot boot || true
+    if ! step boot do_boot boot && grep -q BOOT_QUEUE_TIMEOUT "$RES/boot/boot.log" 2> /dev/null; then
+      # The candidate did not run: the boot is not run, and a --resume tries it again.
+      say "  boot: not run (the lane host's GPU queue did not reach it in time; --resume $runid)"
+      rm -f "$RUN/steps/boot.fail"
+      grep -v -x boot "$RUN/ran" > "$RUN/ran.new" || true
+      mv "$RUN/ran.new" "$RUN/ran"
+    fi
   else
     say "  boot: not run (the host build, the image or the guest build failed)"
   fi
