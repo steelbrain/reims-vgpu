@@ -202,14 +202,16 @@ const METAL_MAX_COMMAND_BUFFER_COUNT: usize = 64;
 
 /// The runtime's queue of at most `count` uncompleted command buffers for a command queue the
 /// graphics lane's kext asks unshared (`RGFX_QUEUE_UNSHARED`, WindowServer's queues): the
-/// runtime's `new_command_queue_with_max_command_buffer_count`, the queue every create makes,
-/// given its `VkQueue` round robin over the device's. Its refusals are the runtime's: a `count` of
-/// 0 (`Invalid`, `MaxCommandBufferCount`) and a lost device (`DeviceLost`).
+/// runtime's `new_command_queue_unshared`, whose `VkQueue` no other command queue shares where the
+/// runtime shares `VkQueue`s, so no other process's long command buffer queues its frames on the
+/// GPU. On a device that shares none it is the queue every create makes. Its refusals are the
+/// runtime's: a `count` of 0 (`Invalid`, `MaxCommandBufferCount`) and a lost device
+/// (`DeviceLost`).
 pub(crate) fn unshared_queue(
     raw: &rt::Device,
     count: usize,
 ) -> Result<rt::CommandQueue, rt::Error> {
-    raw.new_command_queue_with_max_command_buffer_count(count)
+    raw.new_command_queue_unshared(count)
 }
 
 /// The registry ID this platform answers for `raw`: for the runtime's system default device,

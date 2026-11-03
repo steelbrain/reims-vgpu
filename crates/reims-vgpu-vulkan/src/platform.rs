@@ -391,19 +391,23 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// (`wide_lines`, `WideLinePolicy::Exact`), and a blit into or out of a `BGRA10_XR` texture Metal
 /// keeps compressed rewritten to Metal's encoding (each 16-bit word's low 6 bits clear, alpha's
 /// code within 384 to 894) and a fill's texel encoded so, where the default keeps the bytes the
-/// device's copy moves (`extended_range_blits`, `ExtendedRangeBlitPolicy::Canonical`).
-/// [`EXACT_ALL`] names every one. The
+/// device's copy moves (`extended_range_blits`, `ExtendedRangeBlitPolicy::Canonical`), and every
+/// command queue on the `VkQueue` it took at its creation, where the default lets command queues
+/// share `VkQueue`s on a device whose own check finds its GPU idle at each switch between queues,
+/// so a command buffer can wait on the GPU behind another queue's (`queue_sharing`,
+/// `QueueSharingPolicy::PerQueue`). [`EXACT_ALL`] names every one. The
 /// policy's `completion` and `heap_compression` are no names of these: every device takes their
 /// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 6] = [
+pub const EXACT_FORMS: [&str; 7] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
     "pipeline_waits",
     "wide_lines",
     "extended_range_blits",
+    "queue_sharing",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -440,7 +444,8 @@ pub const EXACT_ALL: &str = "all";
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, ExtendedRangeBlitPolicy, HalfChainPolicy,
-        HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy, WideLinePolicy,
+        HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy, QueueSharingPolicy,
+        WideLinePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -456,6 +461,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "extended_range_blits" => {
                 policy.extended_range_blits = ExtendedRangeBlitPolicy::Canonical;
             }
+            "queue_sharing" => policy.queue_sharing = QueueSharingPolicy::PerQueue,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -759,7 +765,7 @@ pub(crate) mod tests {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, ExtendedRangeBlitPolicy,
             HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
-            WideLinePolicy,
+            QueueSharingPolicy, WideLinePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -773,6 +779,7 @@ pub(crate) mod tests {
         assert_eq!(fast.pipeline_waits, PipelineWaitPolicy::Bounded);
         assert_eq!(fast.wide_lines, WideLinePolicy::Device);
         assert_eq!(fast.extended_range_blits, ExtendedRangeBlitPolicy::Kept);
+        assert_eq!(fast.queue_sharing, QueueSharingPolicy::Adaptive);
         for unchanged in [
             None,
             Some(""),
@@ -787,7 +794,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 6] = [
+        let alone: [(&str, Set); 7] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -802,6 +809,9 @@ pub(crate) mod tests {
             ("extended_range_blits", |p| {
                 p.extended_range_blits = ExtendedRangeBlitPolicy::Canonical;
             }),
+            ("queue_sharing", |p| {
+                p.queue_sharing = QueueSharingPolicy::PerQueue;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -813,7 +823,7 @@ pub(crate) mod tests {
             set(&mut every);
         }
         let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order,\
-                     extended_range_blits";
+                     queue_sharing,extended_range_blits";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());
