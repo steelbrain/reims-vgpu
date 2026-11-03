@@ -226,9 +226,11 @@ CAPPIDS=()
 # run.sh execs a wrapper, with the GPU lock (fd 9) held, which execs QEMU in turn, so QEMU keeps
 # run.sh's pid (rgk-boot2.sh counts SSH only from that pid). The wrapper sets the host's cache
 # entry KEY aside and leaves a process holding the lock that, once QEMU has stopped, removes the
-# entry QEMU made and puts KEY back; it starts the hook with no lock held.
-if [[ -n ${COLD_CACHE:-} || -n ${QEMU_HOOK_B64:-} ]]; then
+# entry QEMU made and puts KEY back; it starts the hook with no lock held. A command before QEMU
+# (PRE_QEMU_B64) runs in it under the lock, just before the exec, into R/pre-qemu.txt.
+if [[ -n ${COLD_CACHE:-} || -n ${QEMU_HOOK_B64:-} || -n ${PRE_QEMU_B64:-} ]]; then
   hook=$(printf '%s' "${QEMU_HOOK_B64:-}" | base64 -d)
+  pre=$(printf '%s' "${PRE_QEMU_B64:-}" | base64 -d)
   {
     echo '#!/bin/bash'
     echo "C=$HOME/.cache/reims-vgpu-vulkan/v1/${COLD_CACHE:-}"
@@ -236,6 +238,7 @@ if [[ -n ${COLD_CACHE:-} || -n ${QEMU_HOOK_B64:-} ]]; then
     echo "COLD=${COLD_CACHE:+1}"
     echo "REAL=$(printf '%q' "$QEMU")"
     echo "HOOK=$(printf '%q' "$hook")"
+    echo "PRE=$(printf '%q' "$pre")"
     echo "R=$(printf '%q' "$R")"
     cat << 'WRAP'
 say() { echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z) lane-gate qemu wrapper: $*"; }
@@ -249,6 +252,11 @@ q=$$  # QEMU's, once this script execs it
 if [[ -n $COLD ]]; then
   ( while kill -0 "$q" 2> /dev/null && [[ $(cat "/proc/$q/stat" 2> /dev/null | cut -d' ' -f3) != Z ]]; do sleep 0.5; done
     rm -rf "$C"; mv "$A" "$C" && say "the pipeline cache entry put back: $C" ) &
+fi
+if [[ -n $PRE ]]; then
+  say "before QEMU: $PRE"
+  ( exec 6>&- 7>&- 8>&-; eval "$PRE" ) > "$R/pre-qemu.txt" 2>&1
+  say "before QEMU: exit $?"
 fi
 if [[ -n $HOOK ]]; then
   ( exec 6>&- 7>&- 8>&- 9>&-; sleep 0.5; h=${HOOK//\{PID\}/$q}; h=${h//\{DIR\}/$R}; say "hook: $h"; eval "$h" ) &
