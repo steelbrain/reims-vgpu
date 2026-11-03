@@ -25,8 +25,12 @@
  * goes out where it carries a cookie (RgfxPipeTransactions.hpp). An answer completes every
  * transaction submitted before it, oldest first. At most two are outstanding; a third submit
  * waits up to five seconds for room, then fails unsent. A transaction with no IOSurface on
- * plane 0 keeps the surface shown and completes with the one before it, or at once. VBL
- * notifications follow the device's VBLANK events while one is registered.
+ * plane 0 keeps the surface shown and completes with the one before it, or at once.
+ *
+ * A VBL registration is a request for one notification, at the next refresh, as the interface's
+ * kernel side answers it: the request's callback and refcon (its first two words), then the
+ * refresh's time and the next one's, each 64-bit value split in two words, low half first. Up
+ * to kMaxVblRequests wait at once; the device's VBLANK events are on while one waits.
  *
  * Our own code; it names only SDK-public IOKit classes.
  */
@@ -65,6 +69,8 @@ private:
 	enum { kKindVbl = 0, kKindTransaction = 1, kKinds = 2 };
 	// The transactions submitted to the host and not yet answered.
 	enum { kMaxOutstanding = 2 };
+	// The VBL requests waiting for the next refresh.
+	enum { kMaxVblRequests = 4 };
 	typedef RgfxPipeTransactions<kMaxOutstanding> Transactions;
 
 	static IOReturn sAssociate(OSObject *target, void *reference, IOExternalMethodArguments *a);
@@ -77,11 +83,11 @@ private:
 	static IOReturn sWait(OSObject *target, void *reference, IOExternalMethodArguments *a);
 
 	// The framebuffer's hooks (ReimsGraphics::addPipe), on its work loop.
-	static void vblankHook(OSObject *client, UInt64 count, UInt64 time);
+	static void vblankHook(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void presentHook(OSObject *client, UInt64 seqno, UInt32 status);
 	void presented(UInt64 seqno, UInt32 status);
 	void completeLocked(const Transactions::Completion &c, UInt64 time);
-	void sendVbl(UInt64 count, UInt64 time);
+	void sendVbl(UInt64 time, UInt64 next);
 
 	void releaseRegistrations();
 
@@ -90,15 +96,23 @@ private:
 	ReimsGraphics *framebuffer; // retained once associated
 	bool associated;
 
-	// Under lock: the registrations, the transaction begun and the last completed.
+	// A VBL request: its wake port's reference, and the callback and refcon it names.
+	struct VblRequest {
+		OSAsyncReference64 reference;
+		UInt64 callback;
+		UInt64 refcon;
+	};
+
+	// Under lock: the transaction registration, the VBL requests waiting, the transaction begun
+	// and the last completed.
 	IOLock *lock;
-	bool registered[kKinds];
-	OSAsyncReference64 references[kKinds];
-	UInt64 cookies[kKinds];
+	bool registered;
+	OSAsyncReference64 transactionRef;
+	VblRequest vblRequests[kMaxVblRequests];
+	UInt32 vblWaiting;
 	UInt32 nextTransaction;
 	UInt32 begun;
 	UInt32 completed;
-	UInt64 lastVblTime;
 	UInt32 logged;
 	UInt32 unnotifiedLogged;
 	Transactions transactions;

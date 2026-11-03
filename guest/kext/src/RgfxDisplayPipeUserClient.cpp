@@ -38,8 +38,14 @@ constexpr UInt32 kPlaneType = 0x0;
 constexpr UInt32 kPlaneSurface = 0x8;
 constexpr UInt32 kPlaneIOSurface = 1;
 
+// Inside a notification registration: the callback and refcon a VBL request names.
+constexpr UInt32 kNotifyCallback = 0x0;
+constexpr UInt32 kNotifyRefcon = 0x8;
+
 // The messages back: a transaction's completion, 11 words (the cookie in word 0, the id in
-// word 1's high half, the completion time in word 3, action 1 in word 8), and a VBL, 6 words.
+// word 1's high half, the completion time in word 3, action 1 in word 8), and a VBL, 6 words
+// (the request's callback and refcon, then the refresh's time and the next one's, each split
+// low half first).
 constexpr UInt32 kCompletionWords = 11;
 constexpr UInt32 kVblWords = 6;
 
@@ -55,10 +61,6 @@ constexpr UInt32 kLogFirst = 48;
 constexpr UInt32 kLogEvery = 600;
 // The transactions with no cookie logged, per client.
 constexpr UInt32 kLogUnnotified = 8;
-
-// A frame at 60 Hz in mach_absolute_time units (nanoseconds on x86-64): the VBL's next-tick
-// estimate before two ticks have been seen.
-constexpr UInt64 kDefaultVblPeriod = 16666667;
 
 inline UInt32 rd32(const UInt8 *p, UInt32 off)
 {
@@ -100,12 +102,11 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	framebuffer = nullptr;
 	associated = false;
 	lock = IOLockAlloc();
-	for (UInt32 k = 0; k < kKinds; k++)
-		registered[k] = false;
+	registered = false;
+	vblWaiting = 0;
 	nextTransaction = 0;
 	begun = 0;
 	completed = 0;
-	lastVblTime = 0;
 	logged = 0;
 	unnotifiedLogged = 0;
 	transactions = Transactions();
@@ -151,12 +152,13 @@ void RgfxDisplayPipeUserClient::releaseRegistrations()
 	if (!lock)
 		return;
 	IOLockLock(lock);
-	for (UInt32 k = 0; k < kKinds; k++) {
-		if (registered[k]) {
-			releaseAsyncReference64(references[k]);
-			registered[k] = false;
-		}
+	if (registered) {
+		releaseAsyncReference64(transactionRef);
+		registered = false;
 	}
+	for (UInt32 i = 0; i < vblWaiting; i++)
+		releaseAsyncReference64(vblRequests[i].reference);
+	vblWaiting = 0;
 	IOLockUnlock(lock);
 }
 
@@ -319,20 +321,37 @@ IOReturn RgfxDisplayPipeUserClient::sRequestNotify(OSObject *target, void *,
 	UInt32 kind = rd32(in, kNotifyKind);
 	if (kind >= kKinds)
 		return kIOReturnBadArgument;
+	if (kind == kKindVbl) {
+		// A request for the next refresh's notification. The device's VBLANK events go on
+		// under the lock, so the last request's answer, which turns them off under it, never
+		// passes a new request.
+		IOLockLock(self->lock);
+		if (self->vblWaiting == kMaxVblRequests) {
+			IOLockUnlock(self->lock);
+			return kIOReturnNoResources;
+		}
+		VblRequest &r = self->vblRequests[self->vblWaiting++];
+		bcopy(a->asyncReference, r.reference, sizeof(OSAsyncReference64));
+		r.callback = rd64(in, kNotifyCallback);
+		r.refcon = rd64(in, kNotifyRefcon);
+		self->framebuffer->setPipeVblankEnabled(self, true);
+		IOLockUnlock(self->lock);
+		if (self->logged < kLogFirst) {
+			self->logged++;
+			IOLog("RGFX pipe: VBL request: callback %016llx refcon %016llx\n", r.callback,
+			      r.refcon);
+		}
+		return kIOReturnSuccess;
+	}
 	IOLog("RGFX pipe: notify kind %u: %016llx %016llx %016llx\n", kind, rd64(in, 0), rd64(in, 8),
 	      rd64(in, 16));
-	// A VBL registration turns the device's VBLANK events on first, so a failed enable leaves
-	// no reference behind.
-	if (kind == kKindVbl)
-		self->framebuffer->setPipeVblankEnabled(self, true);
 	IOLockLock(self->lock);
-	if (self->registered[kind]) {
+	if (self->registered) {
 		IOLockUnlock(self->lock);
 		return kIOReturnBusy;
 	}
-	bcopy(a->asyncReference, self->references[kind], sizeof(OSAsyncReference64));
-	self->cookies[kind] = rd64(in, 0);
-	self->registered[kind] = true;
+	bcopy(a->asyncReference, self->transactionRef, sizeof(OSAsyncReference64));
+	self->registered = true;
 	IOLockUnlock(self->lock);
 	return kIOReturnSuccess;
 }
@@ -463,13 +482,13 @@ void RgfxDisplayPipeUserClient::completeLocked(const Transactions::Completion &c
 {
 	if (c.id > completed)
 		completed = c.id;
-	if (c.notified && registered[kKindTransaction]) {
+	if (c.notified && registered) {
 		io_user_reference_t words[kCompletionWords] = {};
 		words[0] = c.cookie;
 		words[1] = static_cast<io_user_reference_t>(c.id) << 32;
 		words[3] = time;
 		words[8] = 1;
-		sendAsyncResult64(references[kKindTransaction], kIOReturnSuccess, words, kCompletionWords);
+		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, kCompletionWords);
 	}
 	IOLockWakeup(lock, &completed, false);
 }
@@ -503,26 +522,35 @@ void RgfxDisplayPipeUserClient::presented(UInt64 seqno, UInt32 status)
 	IOLockUnlock(lock);
 }
 
-void RgfxDisplayPipeUserClient::vblankHook(OSObject *client, UInt64 count, UInt64 time)
+void RgfxDisplayPipeUserClient::vblankHook(OSObject *client, UInt64, UInt64 time, UInt64 next)
 {
 	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, client);
 	if (self)
-		self->sendVbl(count, time);
+		self->sendVbl(time, next);
 }
 
-// A VBL: the registration's cookie, the tick's count, and its time and the next tick's.
-void RgfxDisplayPipeUserClient::sendVbl(UInt64 count, UInt64 time)
+// A refresh: each waiting VBL request is answered, once, with its callback and refcon, the
+// refresh's time and the next one's; with none left waiting, the device's VBLANK events go off.
+void RgfxDisplayPipeUserClient::sendVbl(UInt64 time, UInt64 next)
 {
 	IOLockLock(lock);
-	UInt64 period = lastVblTime && time > lastVblTime ? time - lastVblTime : kDefaultVblPeriod;
-	lastVblTime = time;
-	if (registered[kKindVbl]) {
-		io_user_reference_t words[kVblWords] = {};
-		words[0] = cookies[kKindVbl];
-		words[1] = count << 32;
-		words[3] = time;
-		words[4] = time + period;
-		sendAsyncResult64(references[kKindVbl], kIOReturnSuccess, words, kVblWords);
+	if (vblWaiting == 0) {
+		IOLockUnlock(lock);
+		return;
 	}
+	for (UInt32 i = 0; i < vblWaiting; i++) {
+		VblRequest &r = vblRequests[i];
+		io_user_reference_t words[kVblWords] = {};
+		words[0] = r.callback;
+		words[1] = r.refcon;
+		words[2] = time & 0xffffffffu;
+		words[3] = time >> 32;
+		words[4] = next & 0xffffffffu;
+		words[5] = next >> 32;
+		sendAsyncResult64(r.reference, kIOReturnSuccess, words, kVblWords);
+		releaseAsyncReference64(r.reference);
+	}
+	vblWaiting = 0;
+	framebuffer->setPipeVblankEnabled(this, false);
 	IOLockUnlock(lock);
 }

@@ -484,12 +484,18 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		for (UInt32 i = 0; i < n; i++)
 			clients[i]->retain();
 		IOSimpleLockUnlock(interruptLock);
-		// The event's count is 8 bytes into its payload (RgfxVblank).
+		// The event's count and the host's stamp are 8 and 16 bytes into its payload
+		// (RgfxVblank); the refresh's time is the stamp in the guest's clock.
 		UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
 		UInt64 now = mach_absolute_time();
+		UInt64 time = size >= 24 ? vblankClock.vblank(count,
+		                                              *reinterpret_cast<const volatile UInt64 *>(payload + 16),
+		                                              now)
+		                         : now;
+		UInt64 next = size >= 24 ? vblankClock.next() : now + RgfxVblankClock::kDefaultPeriodNs;
 		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
-				hook(clients[i], count, now);
+				hook(clients[i], count, time, next);
 			clients[i]->release();
 		}
 		break;
