@@ -555,12 +555,14 @@ class Run:
             did = (f"; the window {'resized' if name == 'resize' else 'moved'} {kv['window_moves_s']:g} times a second"
                    if "window_moves_s" in kv else "")
             if "start_ms" in kv:
-                did += f"; over {kv.get('toggles', 0):g} openings and closings, the first update {kv['start_ms']:g} ms after the key"
+                did += (f"; over {kv.get('animated', kv.get('toggles', 0)):g} of {kv.get('toggles', 0):g} openings and closings"
+                        + (f", each animation {kv['anim_ms']:g} ms" if "anim_ms" in kv else "")
+                        + f", the first update {kv['start_ms']:g} ms after the key")
             self.litem("drag." + name, "FAIL" if stall else "PASS",
                        f"{kv.get('composites_s')} display updates a second, gap p99 {kv.get('gap_p99_ms')} ms, "
                        f"max {kv.get('gap_max_ms')} ms" + (" (a stall over 1 s)" if stall else "")
                        + f"{did}; QEMU {kv.get('qemu_cpu')}%, its graphics thread {kv.get('gfx_cpu')}%")
-            for k in ("composites_s", "gap_p99_ms", "gap_max_ms", "window_moves_s", "start_ms"):
+            for k in ("composites_s", "gap_p99_ms", "gap_max_ms", "window_moves_s", "start_ms", "anim_ms"):
                 if k in kv:
                     self.lmetric(f"drag.{name}.{k}", kv[k])
             for k in ("qemu_cpu", "gfx_cpu"):

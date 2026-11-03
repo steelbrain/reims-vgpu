@@ -20,8 +20,10 @@ where the display updated after a first Control-Up. Writes RUNDIR/drag.txt, one 
   drag CASE moved=1 composites_s= gap_p99_ms= gap_max_ms= qemu_cpu= gfx_cpu= window_moves_s= ...
 the composites being the host log's display updates ("the display shows IOSurface") in the
 case's host-time span, the gaps those between them (and the span's ends), the CPU QEMU's and its
-graphics thread's, in percent of a core. Mission Control's span is the 0.8 s after each
-Control-Up (its animation), its start_ms the median wait from the key to the first update.
+graphics thread's, in percent of a core. Mission Control's numbers are over its animations: each
+from the first display update after a Control-Up to its last within 0.8 s (anim_ms their median
+length, start_ms the median wait from the key to the first update, animated those with two
+updates or more); its CPU over the whole case.
 """
 import datetime
 import json
@@ -356,7 +358,8 @@ def resize(q):
             moves = int(m.group(2))
     wr = max(ws_) - min(ws_) if ws_ else 0
     hr = max(hs) - min(hs) if hs else 0
-    res = {"w_range": round(wr), "h_range": round(hr), "window_moves_s": round(moves / SECONDS, 1),
+    res = {"w_range": round(wr), "h_range": round(hr), "w": f"{min(ws_, default=0):.0f}-{max(ws_, default=0):.0f}",
+           "h": f"{min(hs, default=0):.0f}-{max(hs, default=0):.0f}", "window_moves_s": round(moves / SECONDS, 1),
            "press": f"{x0:.0f},{y0:.0f}", "seconds": round(t1 - t0, 2)}
     if wr < 0.7 * 2 * RADIUS or hr < 0.7 * 1.2 * RADIUS:
         res.update(moved=0, why=f"the window's size spanned {wr:.0f} x {hr:.0f} points, the pointer's "
@@ -411,12 +414,24 @@ def mission(q):
     time.sleep(1.0)
     guest("killall TextEdit", gui=True)
     q.key("meta_l", "w")
-    spans = [(k, k + 0.8) for k in keys]
-    starts = sorted(ts[0] - k for k in keys for ts in [composites(k, k + 0.8)] if ts)
-    res = {"toggles": len(keys), "seconds": round(t1 - t0, 2)}
-    res.update(measured(a, b, t0, t1, spans))
-    if starts:
-        res["start_ms"] = round(1000 * starts[len(starts) // 2], 1)
+    # Each animation from its first display update after the key to its last within 0.8 s: its
+    # rate, the gaps inside it, its length, and the wait from the key to its first update.
+    per = [(k, composites(k, k + 0.8)) for k in keys]
+    anim = [(k, ts) for k, ts in per if len(ts) >= 2]
+    res = {"toggles": len(keys), "animated": len(anim), "seconds": round(t1 - t0, 2)}
+    res.update(measured(a, b, t0, t1, [(t0, t1)]))
+    if not anim:
+        res.update(moved=0, why=f"no Control-Up of {len(keys)} gave two display updates in 0.8 s")
+        return res
+    frames = sum(len(ts) - 1 for _, ts in anim)
+    span = sum(ts[-1] - ts[0] for _, ts in anim)
+    gaps = sorted(y - x for _, ts in anim for x, y in zip(ts, ts[1:]))
+    lengths = sorted(ts[-1] - ts[0] for _, ts in anim)
+    starts = sorted(ts[0] - k for k, ts in anim)
+    res.update(composites_s=round(frames / span, 2) if span else 0,
+               gap_p99_ms=round(1000 * gaps[min(len(gaps) - 1, int(math.ceil(0.99 * len(gaps))) - 1)], 1),
+               gap_max_ms=round(1000 * gaps[-1], 1), anim_ms=round(1000 * lengths[len(lengths) // 2], 1),
+               start_ms=round(1000 * starts[len(starts) // 2], 1))
     return res
 
 
