@@ -420,7 +420,7 @@ pub struct RenderEncoderObject {
     /// Whether the pass ends with the platform's draw of no vertices
     /// ([`crate::gpu::rate_map::no_draw`]): set where the pass's rate map was made of a `Mutable`
     /// descriptor, until a draw of the guest's takes its place ([`VulkanRenderEncoder::drew`]).
-    undrawn: Mutex<bool>,
+    undrawn: AtomicBool,
     /// Whether the reach of `drawing` holds nothing a draw asks of ([`Reach::quiet`]), so a draw, a tile
     /// dispatch or an execution asks nothing of it ([`VulkanRenderEncoder::issues`]): set at
     /// each bind.
@@ -1682,7 +1682,7 @@ fn opened(
         dropped,
         rasterizes: taken.class != Some(Class::Unset),
         varying_rates: taken.class == Some(Class::Varying),
-        undrawn: Mutex::new(taken.mutable),
+        undrawn: AtomicBool::new(taken.mutable),
         quiet: AtomicBool::new(true),
         bfloat_loaded: bfloat_loaded(&d),
         pass: d,
@@ -2025,7 +2025,10 @@ impl VulkanRenderEncoder {
         (drawn, empty): (Option<(Shape, K)>, bool),
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
-        let held = plain(|| self.held());
+        // Reading the encoder's state reaches no runtime, so the task's end is checked where
+        // `plain` checked it, and nothing the runtime announces can fall inside it.
+        stop_if_task_ended();
+        let held = self.held();
         nil_pipeline_drawn(sel, held.nil_pipeline);
         crate::gpu::timing::count_draw();
         match drawn {
@@ -2591,7 +2594,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // once per device, after the stop a thread of a task that ended takes at the
                 // command; where the command buffer is gone, nothing encoded here runs, and the
                 // pass needs no draw.
-                if *self.undrawn.lock()
+                if self.undrawn.load(Ordering::Acquire)
                     && let Some(cb) = self.encoder.command_buffer()
                 {
                     stop_if_task_ended();
@@ -3506,7 +3509,7 @@ impl VulkanRenderEncoder {
         ) && count >= 3
             && instances > 0;
         if whole && drawn.is_ok() {
-            *self.undrawn.lock() = false;
+            self.undrawn.store(false, Ordering::Release);
         }
     }
 
@@ -6880,7 +6883,7 @@ pub(crate) mod tests {
         let stopped = life.run(|| {
             life.exit();
             let e = opened(&cb, raw, (made, Vec::new()), taken).unwrap();
-            assert!(*e.undrawn.lock());
+            assert!(e.undrawn.load(Ordering::Acquire));
             let rect = MtlScissorRect {
                 x: 0,
                 y: 0,
