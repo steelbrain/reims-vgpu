@@ -8943,6 +8943,7 @@ void rgfxArchiveTests();
 void rgfxResourceTests();
 void rgfxQueueTests(const char *self);
 int rgfxQueueDiesCase(const char *name);
+void rgfxCreateTests();
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -9100,6 +9101,7 @@ int main(int argc, char **argv)
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
 		rgfxQueueTests(argv[0]); // tests/queue_tests.mm
+		rgfxCreateTests();        // tests/create_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

@@ -576,6 +576,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (created.resource_id == 0) {
 		return nil;
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it; the copy's buffer goes with `cpu`
 	RgfxTexture *t = [[RgfxTexture alloc] initWithObjId:created.obj_id
 	                                         gpuAddress:created.gpu_address
 	                                         resourceId:created.resource_id
@@ -647,6 +649,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (created.resource_id == 0) {
 		return nil;
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxTexture *t = [[RgfxTexture alloc] initWithObjId:created.obj_id
 	                                         gpuAddress:0
 	                                         resourceId:created.resource_id
@@ -726,6 +730,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (created.resource_id == 0) {
 		return nil; // no resource id left: no texture, as Metal answers one it cannot make
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxTexture *t = [[RgfxTexture alloc] initWithObjId:created.obj_id
 	                                        gpuAddress:created.gpu_address
 	                                        resourceId:created.resource_id
@@ -1006,6 +1012,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (created.resource_id == 0) {
 		return nil; // no resource id left, as for any texture
 	}
+	if (_serializer->refused(created))
+		return nil; // the device never got it
 	RgfxTexture *view = [[RgfxTexture alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:0
 	                                            resourceId:created.resource_id

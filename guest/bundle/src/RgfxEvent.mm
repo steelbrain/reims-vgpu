@@ -21,6 +21,8 @@
 		return nil; // an event must have a route to the host
 	}
 	RgfxCreated created = serializer->createEvent();
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	return [[RgfxEvent alloc] initWithObjId:created.obj_id device:device serializer:serializer];
 }
 

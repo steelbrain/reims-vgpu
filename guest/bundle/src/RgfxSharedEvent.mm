@@ -50,6 +50,8 @@ RGFX_LOG_UNRECOGNIZED
 		return nil; // a shared event must have a route to the host
 	}
 	RgfxCreated created = serializer->createSharedEvent(initialValue);
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxSharedEvent *ev = [[RgfxSharedEvent alloc] initWithObjId:created.obj_id
 	                                                     device:device
 	                                                 serializer:serializer];

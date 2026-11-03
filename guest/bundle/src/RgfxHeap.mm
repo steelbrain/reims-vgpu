@@ -108,6 +108,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	if (created.obj_id == 0) {
 		return nil; // no GPU address left for it
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
 	                                          device:device
 	                                      serializer:serializer];
@@ -170,6 +172,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	if (created.obj_id == 0) {
 		return nil; // no GPU address left for it
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxHeap *heap = [[RgfxHeap alloc] initWithObjId:created.obj_id
 	                                          device:device
 	                                      serializer:serializer];
@@ -331,6 +335,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	}
 	RgfxCreated created = ser->createBufferAtOffset([self rgfxObjId], offset, length,
 	                                                static_cast<uint32_t>(options));
+	if (ser->refused(created))
+		return nil; // the device never got it
 	// At the heap's address plus the offset, where the host places it in the heap it pinned.
 	// A Shared heap's buffer is the heap's bytes there, which the host's is too; it keeps the
 	// heap, and so the bytes, alive.

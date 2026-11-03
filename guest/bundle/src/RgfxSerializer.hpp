@@ -262,6 +262,12 @@ public:
 	/// (RgfxIdSpace::freeAddress).
 	void releaseAddress(uint64_t gpu_address);
 
+	/// Whether the device never got the create `created` describes (its message went nowhere:
+	/// the kext refused it, or the ring had no room), so no object of that id exists there: the
+	/// caller makes none, as Metal answers nil for an object it cannot make. Gives back the GPU
+	/// address and resource id it picked then, as no destroy will follow.
+	bool refused(const RgfxCreated &created);
+
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
 	/// device-placed at a picked GPU address; otherwise it lies at `heap_offset`
 	/// in `heap`. A resource id is picked either way.

@@ -21,6 +21,8 @@
 		return nil; // a fence must have a route to the host
 	}
 	RgfxCreated created = serializer->createFence();
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	return [[RgfxFence alloc] initWithObjId:created.obj_id device:device serializer:serializer];
 }
 

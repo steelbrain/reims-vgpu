@@ -98,6 +98,8 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	if (created.obj_id == 0) {
 		return nil; // no GPU address left for it
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:created.gpu_address
 	                                                length:length
@@ -127,6 +129,8 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	if (created.obj_id == 0) {
 		return nil; // no GPU address left for it
 	}
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                                            gpuAddress:created.gpu_address
 	                                                length:length
@@ -154,6 +158,8 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	}
 	RgfxCreated created = serializer->createBufferOverSurfacePages(
 	    length, static_cast<uint32_t>(options), blockOffset, blockSize);
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	return [[RgfxBuffer alloc] initWithObjId:created.obj_id
 	                              gpuAddress:0
 	                                  length:length

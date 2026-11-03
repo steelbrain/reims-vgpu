@@ -57,10 +57,10 @@ RgfxSamplerParams rgfxSamplerParamsFromMTL(MTLSamplerDescriptor *d)
 	}
 	RgfxSamplerParams params = rgfxSamplerParamsFromMTL(descriptor);
 	RgfxCreated created = serializer->createSampler(params);
-	// A create the host refused, or one not answered (kRgfxNoAnswer), made no sampler: nil, as
-	// Metal answers a sampler it cannot make. One the kext timed out on is followed by its
-	// destroy there, so nothing is left to let go.
-	if (created.status != RGFX_STATUS_OK) {
+	// A create the device never got, one the host refused, or one not answered
+	// (kRgfxNoAnswer), made no sampler: nil, as Metal answers a sampler it cannot make. One the
+	// kext timed out on is followed by its destroy there, so nothing is left to let go.
+	if (serializer->refused(created) || created.status != RGFX_STATUS_OK) {
 		NSLog(@"RGFX: newSamplerStateWithDescriptor: no sampler (status 0x%x)", created.status);
 		return nil;
 	}

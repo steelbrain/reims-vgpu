@@ -1090,6 +1090,10 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 		logNoTexture(surface, "resource id", "every texture resource id is taken");
 		return nil;
 	}
+	if (serializer->refused(created)) {
+		logNoTexture(surface, "create", "the device never got its create");
+		return nil;
+	}
 	RgfxIOSurfaceTexture *t = [[RgfxIOSurfaceTexture alloc] initWithObjId:created.obj_id
 	                                                           gpuAddress:0
 	                                                           resourceId:created.resource_id

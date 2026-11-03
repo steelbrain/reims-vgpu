@@ -306,6 +306,15 @@ void RgfxSerializer::releaseAddress(uint64_t gpu_address)
 	m_ids.freeAddress(gpu_address);
 }
 
+bool RgfxSerializer::refused(const RgfxCreated &created)
+{
+	if (created.posted)
+		return false;
+	m_ids.freeAddress(created.gpu_address);
+	m_ids.freeResourceId(created.resource_id);
+	return true;
+}
+
 RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap,
                                           uint64_t heap_offset, uint64_t align)
 {

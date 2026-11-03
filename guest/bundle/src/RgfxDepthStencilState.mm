@@ -52,6 +52,8 @@ RgfxStencilDescriptor rgfxStencilFromMTL(MTLStencilDescriptor *s)
 	RgfxCreated created = serializer->createDepthStencil(
 	    static_cast<uint32_t>(descriptor.depthCompareFunction),
 	    descriptor.depthWriteEnabled ? true : false, front, back);
+	if (serializer->refused(created))
+		return nil; // the device never got it
 	return [[RgfxDepthStencilState alloc] initWithObjId:created.obj_id
 	                                             device:device
 	                                         serializer:serializer];
