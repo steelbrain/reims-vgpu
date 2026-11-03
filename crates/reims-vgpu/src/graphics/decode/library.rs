@@ -43,6 +43,9 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
+use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+
+use super::tables::Entry;
 use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
 
 /// A library's content key ([`RgfxLibraryLookup`]).
@@ -442,11 +445,81 @@ fn keyed(flags: u32, key: LibraryKey) -> Option<LibraryKey> {
     (flags & RGFX_LIBRARY_FLAG_KEYED != 0).then_some(key)
 }
 
+/// What the decoder keeps of libraries beside its table, under one lock: held across a library's
+/// store, so a destroy, which forgets these first, comes wholly before or after it.
+pub(crate) struct Libraries<P: Platform> {
+    /// The bytes of each `LIBRARY_FROM_REGION` taken so far, by library id.
+    chunks: HashMap<u64, Vec<u8>>,
+    /// The libraries being made, by id: a pipeline create naming one waits for its slot.
+    making: HashMap<u64, Arc<LibrarySlot<P>>>,
+    /// The libraries kept under their keys.
+    cache: LibraryCache<P>,
+    /// The key of the cache entry each library id names.
+    cached: HashMap<u64, LibraryKey>,
+    /// The device's resets so far ([`Self::take_cache`]): a library whose make began before one
+    /// is not kept in the cache the reset made anew.
+    resets: u64,
+}
+
+impl<P: Platform> Libraries<P> {
+    /// None yet.
+    pub(crate) fn new() -> Self {
+        Libraries {
+            chunks: HashMap::new(),
+            making: HashMap::new(),
+            cache: LibraryCache::new(RELEASED_BUDGET),
+            cached: HashMap::new(),
+            resets: 0,
+        }
+    }
+
+    /// The ids of context `context`'s libraries these keep anything of.
+    pub(crate) fn ids_of(&self, context: u32) -> Vec<u64> {
+        let ours = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) == u64::from(context);
+        (self.making.keys())
+            .chain(self.chunks.keys())
+            .chain(self.cached.keys())
+            .copied()
+            .filter(ours)
+            .collect()
+    }
+
+    /// The contexts of the libraries these keep anything of, each once.
+    pub(crate) fn contexts(&self) -> Vec<u32> {
+        let mut contexts: Vec<u32> = (self.making.keys())
+            .chain(self.chunks.keys())
+            .chain(self.cached.keys())
+            .map(|id| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32)
+            .collect();
+        contexts.sort_unstable();
+        contexts.dedup();
+        contexts
+    }
+
+    /// Lets go of the libraries kept under their keys, at the device's reset, once no id names
+    /// one, and counts the reset: what it held, for the caller to let go of in a refusal scope.
+    pub(crate) fn take_cache(&mut self) -> LibraryCache<P> {
+        debug_assert!(self.cached.is_empty());
+        self.resets += 1;
+        std::mem::replace(&mut self.cache, LibraryCache::new(RELEASED_BUDGET))
+    }
+
+    /// Forgets what these keep of library `obj_id`: its make, which is cancelled, its chunks, and
+    /// the cache entry it named.
+    fn forget(&mut self, obj_id: u64) {
+        self.making.remove(&obj_id);
+        self.chunks.remove(&obj_id);
+        if let Some(key) = self.cached.remove(&obj_id) {
+            self.cache.release(&key);
+        }
+    }
+}
+
 impl<P: Platform> GraphicsDecoder<P> {
     /// `LIBRARY_LOOKUP`: binds the message's id to the library kept under its key, where there is
     /// one of its size. The create's seqno (`None` for a message too short to carry one) and its
     /// `COMPLETE` status.
-    pub(crate) fn lookup_library(&mut self, message: &[u8]) -> (Option<u64>, u32) {
+    pub(crate) fn lookup_library(&self, message: &[u8]) -> (Option<u64>, u32) {
         let Some(m) = read::<RgfxLibraryLookup>(message) else {
             let seqno = read::<RgfxMsgHeader>(message).map(|h| h.seqno);
             return (seqno, RGFX_STATUS_INVALID_ARGUMENT);
@@ -455,11 +528,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         if self.context_failed() {
             return (Some(m.header.seqno), RGFX_STATUS_REFUSED);
         }
-        let Some(library) = self.library_cache.take(&m.key, m.slice_size) else {
+        let mut libraries = self.shared.libraries.lock();
+        let Some(library) = libraries.cache.take(&m.key, m.slice_size) else {
             return (Some(m.header.seqno), RGFX_STATUS_NOT_FOUND);
         };
-        self.store(m.obj_id, ObjHandle::Library(library));
-        self.cached_libraries.insert(m.obj_id, m.key);
+        libraries.forget(m.obj_id);
+        self.put(m.obj_id, Entry::of(ObjHandle::Library(library)));
+        libraries.cached.insert(m.obj_id, m.key);
         (Some(m.header.seqno), RGFX_STATUS_OK)
     }
 
@@ -467,7 +542,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// message read and its bytes copied out (a chunk's acked), each refusal here at its op as
     /// [`Self::decode`]'s; a library's last bytes are marked being made, so pipeline creates that
     /// name it wait for it ([`LibraryRef`]).
-    pub(crate) fn prepare_library(&mut self, message: &[u8]) -> LibraryStart<P> {
+    pub(crate) fn prepare_library(&self, message: &[u8]) -> LibraryStart<P> {
         let header = read::<RgfxMsgHeader>(message);
         let refused = |error, answer| LibraryStart::Refused { error, answer };
         let (obj_id, seqno, bytes, guest_key) = match header.map(|h| h.r#type) {
@@ -511,14 +586,18 @@ impl<P: Platform> GraphicsDecoder<P> {
             return refused(DecodeError::ContextFailed, Some(seqno));
         }
         let slot = LibrarySlot::new();
-        self.making_libraries.insert(obj_id, Arc::clone(&slot));
+        let resets = {
+            let mut libraries = self.shared.libraries.lock();
+            libraries.making.insert(obj_id, Arc::clone(&slot));
+            libraries.resets
+        };
         LibraryStart::Make(LibraryJob {
             obj_id,
             seqno,
             bytes,
             guest_key,
             slot,
-            resets: self.resets,
+            resets,
         })
     }
 
@@ -528,15 +607,17 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// span in no block of the sender's is a bad reference; a chunk out of order or past the
     /// length is malformed and drops what came before.
     fn take_library_chunk(
-        &mut self,
+        &self,
         m: &RgfxLibraryFromRegion,
     ) -> Result<Option<Vec<u8>>, DecodeError> {
+        let mut libraries = self.shared.libraries.lock();
+        let chunks = &mut libraries.chunks;
         let Some(chunk) = usize::try_from(m.byte_length)
             .ok()
             .filter(|_| self.in_own_block(m.region_offset, m.byte_length))
             .and_then(|len| self.region.read(m.region_offset, len))
         else {
-            self.library_chunks.remove(&m.obj_id);
+            chunks.remove(&m.obj_id);
             return Err(DecodeError::BadReference);
         };
         // The bytes are out of the block: the guest may write it again.
@@ -544,14 +625,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             || !self.in_own_block(m.ack_offset, 8)
             || !self.region.write(m.ack_offset, &m.ack_value.to_le_bytes())
         {
-            self.library_chunks.remove(&m.obj_id);
+            chunks.remove(&m.obj_id);
             return Err(DecodeError::BadReference);
         }
         let mut bytes = if m.chunk_offset == 0 {
-            self.library_chunks.remove(&m.obj_id);
+            chunks.remove(&m.obj_id);
             Vec::with_capacity(usize::try_from(m.total_length).unwrap_or(0).min(1 << 30))
         } else {
-            match self.library_chunks.remove(&m.obj_id) {
+            match chunks.remove(&m.obj_id) {
                 Some(b) => b,
                 None => return Err(DecodeError::Malformed),
             }
@@ -565,7 +646,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         bytes.extend_from_slice(&chunk);
         if (bytes.len() as u64) < m.total_length {
-            self.library_chunks.insert(m.obj_id, bytes);
+            chunks.insert(m.obj_id, bytes);
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -576,26 +657,25 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// its key where the host vouches for the guest's (cancelled, it is kept released), unless the
     /// device was reset since its create was prepared: the rebooted guest's lookups then miss, as
     /// on a new device. Its `COMPLETE` status.
-    pub(crate) fn finish_library(&mut self, made: MadeLibrary<P>) -> u32 {
+    pub(crate) fn finish_library(&self, made: MadeLibrary<P>) -> u32 {
         made.slot.fill(made.library.as_ref());
-        let live = self
-            .making_libraries
-            .get(&made.obj_id)
-            .is_some_and(|slot| Arc::ptr_eq(slot, &made.slot));
+        let mut libraries = self.shared.libraries.lock();
+        let live =
+            (libraries.making.get(&made.obj_id)).is_some_and(|slot| Arc::ptr_eq(slot, &made.slot));
         if live {
-            self.making_libraries.remove(&made.obj_id);
+            libraries.making.remove(&made.obj_id);
         }
         let Some(library) = made.library else {
             return RGFX_STATUS_REFUSED;
         };
-        let cached = made.resets == self.resets
-            && made
-                .key
-                .is_some_and(|(key, size)| self.library_cache.insert(key, size, &library, live));
+        let cached = made.resets == libraries.resets
+            && (made.key)
+                .is_some_and(|(key, size)| libraries.cache.insert(key, size, &library, live));
         if live {
-            self.store(made.obj_id, ObjHandle::Library(library));
+            libraries.forget(made.obj_id);
+            self.put(made.obj_id, Entry::of(ObjHandle::Library(library)));
             if let (true, Some((key, _))) = (cached, made.key) {
-                self.cached_libraries.insert(made.obj_id, key);
+                libraries.cached.insert(made.obj_id, key);
             }
         }
         RGFX_STATUS_OK
@@ -605,7 +685,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`Self::prepare_library`], [`make_library`], [`Self::finish_library`]); the `COMPLETE` it
     /// owes is not posted.
     pub(super) fn decode_library(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
@@ -632,9 +712,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     pub(super) fn library_ref(&self, obj_id: u64) -> Result<LibraryRef<P>, DecodeError> {
         match self.named(obj_id) {
             Some(ObjHandle::Library(library)) => Ok(LibraryRef::Ready(library.clone_ref())),
-            _ => self
-                .making_libraries
-                .get(&obj_id)
+            _ => (self.shared.libraries.lock().making.get(&obj_id))
                 .filter(|_| self.owned(obj_id))
                 .map(|slot| LibraryRef::Making(Arc::clone(slot)))
                 .ok_or(DecodeError::BadReference),
@@ -643,12 +721,8 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Forgets what the table keeps of library `obj_id` beside its handle: its make, which is
     /// cancelled, its chunks, and the cache entry it named.
-    pub(super) fn forget_library(&mut self, obj_id: u64) {
-        self.making_libraries.remove(&obj_id);
-        self.library_chunks.remove(&obj_id);
-        if let Some(key) = self.cached_libraries.remove(&obj_id) {
-            self.library_cache.release(&key);
-        }
+    pub(super) fn forget_library(&self, obj_id: u64) {
+        self.shared.libraries.lock().forget(obj_id);
     }
 }
 

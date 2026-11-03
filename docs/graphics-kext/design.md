@@ -1333,15 +1333,12 @@ and a bundle sends it only where the bit is set, which it reads in the device in
 - Contract (all three agree): the call returns once the buffer is submitted, about 0.1 to 0.4 ms
   behind a long buffer, and not before the signal where the buffer, or one before it on its
   queue, waits for an event. A buffer committed on any queue once the call returned is ordered
-  after it for a tracked resource. The host answers as it takes the buffer, under the
-  decoder's lock, which every queue's message and every host call that reads or changes what a
-  command buffer's walk and commit use takes, and which the buffer's decode holds through its
-  commit: every message the guest sends after the answer is carried out after that commit, but
-  for a sampler create, whose sampler is made and answered with no lock held, touching nothing
-  the walk and commit use, and stored in the decoder's table at its next lock, after it.
-  metal2vulkan orders by commit across queues, and Metal orders behind what it has submitted,
-  which a held queue's buffers are not, hence the rule for a queue held by a wait. Tested
-  through the decoder on both platforms
+  after it for a tracked resource. The host answers as it takes the buffer, once its ticket in
+  the commit order is issued, and commits every command buffer the guest sends after the
+  answer, on any queue, after that buffer's commit; a range message the guest sends after it
+  waits for that commit too ("What a walk sees", below). metal2vulkan orders by commit across
+  queues, and Metal orders behind what it has submitted, which a held queue's buffers are not,
+  hence the rule for a queue held by a wait. Tested through the decoder on both platforms
   (`a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
 - Loose (they race): whether the buffer is `Scheduled`, and its scheduled handlers have run, by
   the time the call returns. Ours is the cheapest: still `Committed`, the handlers at its
@@ -1439,6 +1436,91 @@ beside the Apple-lane decode it mirrors (same handle machinery, descriptor
 structs and `Platform` calls). The reims-graphics crate stays the transport
 (rings, region, registers); the decoder consumes ring bytes and drives
 `Platform`.
+
+**What a walk sees.** No lock of the device's is held across a command buffer's
+walk and commit. Each context's objects are in a table of their own, each
+message is carried out on a decoder of its own, and every lock is held for a
+short section (the list is in `crates/reims-vgpu/src/graphics/decode/mod.rs`).
+Ring 0 goes on while a queue walks, and so does every other queue. Under the
+single lock this replaces, the decoder's lock was held from a command buffer's
+take to its commit, so each other message came wholly before the take or wholly
+after the commit. Each outcome the new design allows is one of those two:
+- **Objects.** A command buffer names objects as its context's table was when
+  its first lookup (its queue, at its begin) took its view of the table. A
+  create, destroy or close carried out on another thread after that is not
+  seen, and each such change began after the buffer's take, so under the lock
+  it would have waited for the commit. An object destroyed during the walk is
+  named whole, and let go of once the walk's view closes, after the commit, as
+  one destroyed after the buffer. An object made during the walk is not named:
+  the op naming it faults, as it would before the create. An id destroyed, made
+  again and destroyed again during the walk is named as the object it was at
+  the begin. A close during the walk empties the table at once and the walk
+  keeps naming its objects; the buffer took its context's drain before its
+  view, so the close is answered after the buffer's completion handler. The
+  begin comes after ring 0 has carried out every message published before the
+  buffer was taken (`reims_graphics`'s queue gate), so a buffer finds every
+  create its process sent before it. Tested by
+  `a_walk_names_what_its_table_held_at_its_begin`,
+  `a_walk_names_nothing_made_after_its_begin` and
+  `a_close_during_a_walk_leaves_it_its_objects` (the decoder's `cmdbuf`
+  tests), and through the device by `ring_0_is_carried_out_while_a_walk_is_in_flight`,
+  `a_close_during_a_walk_is_answered_after_the_buffer` and
+  `a_queue_s_buffer_runs_beside_another_queue_s_walk` (`graphics/tests.rs`).
+- **The commit order.** A buffer answered `CB_SUBMITTED` at its take holds a
+  ticket, issued before the answer is posted, until it is committed (or its
+  stand-in is). Every command buffer notes the tickets issued at its begin and
+  is committed only once each is given back. A buffer the guest sends after an
+  answer is begun after its ticket, so it is committed after the answered
+  buffer, as under the lock the answered buffer held through its commit. A
+  buffer begun before the answer does not wait: the guest sent it with no
+  answer in hand, so under the lock it could have been taken first. A ticket
+  is issued after its buffer's begin, and a buffer waits only for older
+  tickets, so the waits end. Tested by
+  `a_buffer_sent_after_an_answer_is_committed_after_it`, and the sequencer's
+  `a_commit_waits_only_for_the_tickets_issued_before_its_begin` and
+  `tickets_given_back_out_of_order_hold_through_the_oldest`.
+- **Range messages.** `BUFFER_DID_MODIFY_RANGE` and `TEXTURE_REPLACE_REGION`
+  reach the platform's next submission. One is carried out once every ticket
+  its context held when it came is given back, so a buffer answered before the
+  message was sent does not see its bytes, as under the lock, where the message
+  waited for that buffer's commit. Another context's tickets are not waited
+  for: its buffers cannot name the object, which is its own process's. A buffer
+  of the same context not answered at its take is not waited for either: the
+  guest sent the message with no answer from it, so under the lock the message
+  could have come before its take, and the buffer may see the bytes, as it may
+  on Metal. Tested by `a_buffer_sent_after_an_answer_is_committed_after_it` (its
+  range messages) and the sequencer's `a_range_message_waits_for_its_context_alone`.
+- **Device caches.** A command buffer counts among the users of each cached
+  block it uses from its begin to its commit. A fill waits for every user, and
+  a copy out of a cache (a download, a release, the block named again) for every
+  user that may write it, so each copy comes before a user's begin or after its
+  commit, as under the lock. A buffer counts its blocks in block order, and one
+  past its begin waits for nothing a fill holds, so the waits end. Tested by
+  `a_fill_waits_for_the_buffers_using_the_cache` and
+  `two_queues_take_one_fill_and_a_download_waits_for_both` (`surface_cache`).
+- **The device's reset.** A reset ends every queue at once and is passed to
+  the host on the control thread, before anything the guest publishes after
+  it. Under the lock, the host's reset waited for the message holding the lock,
+  and each message after it found its queue's poster stale and was not carried
+  out. Here each message carried out off the control thread (a queue's command
+  buffer, create or destroy) holds a gate shared, from before it asks whether
+  its poster is stale to its end, and so does each compile's and library
+  make's store. The host's reset holds the gate alone. So the reset waits for
+  every message that passed its check, each of which could have run whole
+  before the reset under the lock. A walk in flight names its objects and
+  commits, and then every object goes, none outliving the reset; a message
+  after the gate finds its poster stale. Only the reset makes ring 0's thread
+  wait for a walk, as the lock did. Tested by `a_reset_during_a_walk_comes_after_it`
+  and `a_reset_drops_every_object_the_guest_made` (`graphics/tests.rs`), and
+  by the decoder's fuzz (`decode/fuzz.rs`).
+- **What still waits on ring 0's thread:** a range message, for its own
+  context's answered buffers; a download, a release or a block named again, for
+  that block's writers; a present's fill, for that block's users; a context's
+  close, whose queues `reims_graphics` fences, each waiting for the message its
+  service thread is carrying out; and the device's reset, for every message in
+  flight. A doorbell's take tries every
+  lock it takes; a take not made lets go of what it took, under locks each held
+  for a short section only.
 
 ## Stage 3 guest stack (from the prior-art study)
 

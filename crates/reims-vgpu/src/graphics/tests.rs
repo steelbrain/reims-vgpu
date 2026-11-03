@@ -1036,9 +1036,8 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
 }
 
 /// A raise may call the device at once, as the header lets it, wherever it comes from: at a
-/// command buffer's `CB_SUBMITTED` posted on its queue's thread and on a doorbell's thread, under
-/// the decoder's lock, and at a present the host answers at once with no window, under the
-/// presents' queue. Its `STATUS` read, its doorbell through `mmio_write_taking` and its reset each
+/// command buffer's `CB_SUBMITTED` posted on its queue's thread and on a doorbell's thread, and at
+/// a present the host answers at once with no window, under the presents' queue. Its `STATUS` read, its doorbell through `mmio_write_taking` and its reset each
 /// return, and the device is reset
 #[test]
 fn a_raise_may_call_the_device_at_once() {
@@ -1756,74 +1755,73 @@ fn sampler_command_buffer(queue_obj_id: u64, cb_obj_id: u64, sampler: u64) -> Ve
     bytes
 }
 
-/// A sampler create is answered while a command buffer's walk holds the decoder's lock: the
-/// sampler is made with none of it held, and the decoder holds it from its next lock
-#[test]
-fn a_sampler_create_is_answered_while_a_walk_holds_the_decoder() {
-    let raised = Arc::new(AtomicU32::new(0));
-    let (device, platform) = headless_on(&raised);
-    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    let mut guest = Guest::new(&device);
-    // The test holds the decoder's lock, as a command buffer's walk and commit do.
-    let walk = device.control.decoder.0.lock();
-    assert_eq!(
-        sampler_answered(&device, &mut guest, obj(1, 4)),
-        RGFX_STATUS_OK
-    );
-    assert_eq!(
-        platform
-            .call_log()
-            .calls_to("newSamplerStateWithDescriptor:")
-            .len(),
-        1
-    );
-    drop(walk);
-    assert_eq!(device.decoder_object_count(), 1);
+/// A gate the first command buffer to walk stops at, after its first op, until the test opens it:
+/// a walk in flight, which holds nothing device-wide.
+/// Whether a walk took the gate, stopped at it, and whether it is open; and their moves.
+type GateState = Arc<(
+    reims_vgpu_core::sync::Mutex<(bool, bool, bool)>,
+    reims_vgpu_core::sync::Condvar,
+)>;
+
+struct WalkGate {
+    state: GateState,
 }
 
-/// A destroy of a sampler, and a close of its context, carried out right behind its create while
-/// a walk held the decoder's lock, find the sampler stored first: neither leaves it behind
-#[test]
-fn a_destroy_or_close_behind_a_sampler_create_finds_it() {
-    let raised = Arc::new(AtomicU32::new(0));
-    let (device, _platform) = headless_on(&raised);
-    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    let mut guest = Guest::new(&device);
-    let walk = device.control.decoder.0.lock();
-    assert_eq!(
-        sampler_answered(&device, &mut guest, obj(1, 4)),
-        RGFX_STATUS_OK
-    );
-    // Behind the held lock on ring 0; then a close of a context with nothing, answered once the
-    // destroy is done.
-    guest.send(&device, object_destroy(obj(1, 4)));
-    drop(walk);
-    assert_eq!(
-        answered(&device, &mut guest, context_close(99)),
-        RGFX_STATUS_OK
-    );
-    assert_eq!(device.decoder_object_count(), 0, "the destroy missed it");
+impl WalkGate {
+    /// The gate, set on `device`'s decoder: the first walk to reach it stops there.
+    fn on(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
+        let state = Arc::new((
+            reims_vgpu_core::sync::Mutex::new((false, false, false)),
+            reims_vgpu_core::sync::Condvar::new(),
+        ));
+        let hook = Arc::clone(&state);
+        device
+            .control
+            .decoder()
+            .set_walk_hook(Some(Arc::new(move |index: usize| {
+                let (lock, moved) = &*hook;
+                let mut s = lock.lock();
+                // (taken by a walk, the walk stopped at it, open)
+                if index != 0 || s.0 {
+                    return;
+                }
+                s.0 = true;
+                s.1 = true;
+                moved.notify_all();
+                while !s.2 {
+                    moved.wait(&mut s);
+                }
+            })));
+        WalkGate { state }
+    }
 
-    let walk = device.control.decoder.0.lock();
-    assert_eq!(
-        sampler_answered(&device, &mut guest, obj(2, 4)),
-        RGFX_STATUS_OK
-    );
-    guest.send(&device, context_close(2));
-    drop(walk);
-    let bytes = guest.event().expect("the close's COMPLETE");
-    let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
-    assert_eq!(
-        (complete.header.seqno, complete.status),
-        (guest.seqno, RGFX_STATUS_OK)
-    );
-    assert_eq!(device.decoder_object_count(), 0, "the close missed it");
+    /// Waits, about 3 s at most, for a walk to stop at the gate; whether one did.
+    fn reached(&self) -> bool {
+        let (lock, moved) = &*self.state;
+        let mut s = lock.lock();
+        for _ in 0..3000 {
+            if s.1 {
+                return true;
+            }
+            moved.wait_for(&mut s, Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Lets the walk stopped at the gate go on.
+    fn open(&self) {
+        let (lock, moved) = &*self.state;
+        lock.lock().2 = true;
+        moved.notify_all();
+    }
 }
 
-/// A command buffer naming a sampler made while a walk held the decoder's lock finds it: the
-/// buffer is carried out after the create, under a later lock, and runs
+/// Ring 0 is carried out while a command buffer's walk is in flight on a queue: a sampler create
+/// is answered, and a destroy of the sampler the walk names is carried out, with the walk stopped
+/// at its gate. The walk names the sampler as it was at the buffer's begin, as one carried out
+/// whole before the destroy would, and completes; the sampler is gone after it.
 #[test]
-fn a_command_buffer_finds_a_sampler_made_under_a_walk() {
+fn ring_0_is_carried_out_while_a_walk_is_in_flight() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1835,23 +1833,200 @@ fn a_command_buffer_finds_a_sampler_made_under_a_walk() {
         create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
         RGFX_STATUS_OK
     );
-    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
-    let walk = device.control.decoder.0.lock();
     assert_eq!(
         sampler_answered(&device, &mut guest, obj(1, 4)),
         RGFX_STATUS_OK
     );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
     ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
-    drop(walk);
+    assert!(gate.reached(), "the walk did not start");
+    // With the walk stopped: a create answered, and the walked sampler's destroy carried out
+    // (the close of a context with nothing behind it is answered once it is).
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 5)),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, object_destroy(obj(1, 4)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(99)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        2,
+        "the queue and the new sampler"
+    );
+    gate.open();
     assert!(complete_until_event(&platform, &mut ring), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
-    // One that names a sampler never made fails at its op.
-    ring.send(&device, sampler_command_buffer(obj(1, 1), 101, obj(1, 5)));
+    // A buffer begun after the destroy does not find it.
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 101, obj(1, 4)));
     assert!(complete_until_event(&platform, &mut ring), "no completion");
     let failed = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
     assert_eq!(failed.cb_obj_id, 101);
     assert_ne!(failed.status, RGFX_CB_OK);
+}
+
+/// A close of a context whose command buffer's walk is in flight ends its queues once the walk
+/// is done (`reims_graphics`'s fence of each), drops its objects, and is answered once the
+/// buffer's completion handler has run
+#[test]
+fn a_close_during_a_walk_is_answered_after_the_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        create_queue(&device, &mut guest, 2, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(2, 4)),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
+    ring.send(&device, sampler_command_buffer(obj(2, 1), 100, obj(2, 4)));
+    assert!(gate.reached(), "the walk did not start");
+    guest.send(&device, context_close(2));
+    let close = guest.seqno;
+    let commits = platform.call_log().count("commit");
+    gate.open();
+    for _ in 0..3000 {
+        if platform.call_log().count("commit") > commits {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        platform.call_log().count("commit") > commits,
+        "not committed"
+    );
+    // The buffer's completion is its ended queue's, which posts nothing more; the close is
+    // answered once its completion handler has run.
+    platform.world().complete_all(CompleteOn::Caller);
+    let bytes = guest.event().expect("the close's COMPLETE");
+    let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+    assert_eq!(
+        (complete.header.seqno, complete.status),
+        (close, RGFX_STATUS_OK)
+    );
+    assert_eq!(device.decoder_object_count(), 0, "the close dropped them");
+}
+
+/// A reset while a command buffer's walk is in flight comes after the walk, as one under a lock
+/// over the decoder would: the device's reset ends the walk's queue at once, but the decoder's
+/// reset waits for the walk, which names its objects and commits, and then drops every object,
+/// none outliving it. Nothing of the buffer reaches the guest after the reset.
+#[test]
+fn a_reset_during_a_walk_comes_after_it() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the walk did not start");
+    let commits = platform.call_log().count("commit");
+    device.reset();
+    // The decoder's reset, on the control thread, waits for the walk.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        device.decoder_object_count(),
+        2,
+        "the reset dropped the walk's objects before the walk ended"
+    );
+    gate.open();
+    for _ in 0..3000 {
+        if device.decoder_object_count() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(device.decoder_object_count(), 0, "the reset left objects");
+    assert!(
+        platform.call_log().count("commit") > commits,
+        "the walk was not committed before the reset"
+    );
+    platform.world().complete_all(CompleteOn::Caller);
+    assert!(!ring.has_event(), "the buffer posted after the reset");
+}
+
+/// A command buffer on one queue is carried out while another queue's walk is in flight: it names
+/// a sampler made meanwhile, which it finds, and completes first
+#[test]
+fn a_queue_s_buffer_runs_beside_another_queue_s_walk() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const RING_DATA: u32 = 0x1_0000;
+    let rings = [
+        (
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000,
+        ),
+        (
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+        ),
+    ];
+    for (n, &(submit, complete)) in rings.iter().enumerate() {
+        assert_eq!(
+            create_queue(
+                &device,
+                &mut guest,
+                1,
+                n as u64 + 1,
+                (submit, complete),
+                RING_DATA,
+                0
+            ),
+            RGFX_STATUS_OK
+        );
+    }
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    let mut first = QueueRing::new(&device, rings[0].0, rings[0].1, u64::from(RING_DATA));
+    let mut second = QueueRing::new(&device, rings[1].0, rings[1].1, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
+    first.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the walk did not start");
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 5)),
+        RGFX_STATUS_OK
+    );
+    second.send(&device, sampler_command_buffer(obj(1, 2), 200, obj(1, 5)));
+    assert!(
+        complete_until_event(&platform, &mut second),
+        "no completion beside the walk"
+    );
+    let done = RgfxCbComplete::read_from_bytes(&second.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (200, RGFX_CB_OK));
+    assert!(!first.has_event(), "the stopped walk completed");
+    gate.open();
+    assert!(complete_until_event(&platform, &mut first), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&first.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
 }
 
 /// An argument layout query on ring 0 writes the platform's layout into the sender's block and is

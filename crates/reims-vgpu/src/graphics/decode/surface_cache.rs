@@ -65,7 +65,7 @@ use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
 
 use super::surface_pages::{SurfaceView, buffer_over};
 use crate::device_writes::{self, Watcher};
@@ -175,6 +175,18 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The caches' pages, watched for the host's devices' writes while this lives.
     watched: Arc<Watched>,
     counts: CacheCounts,
+    /// By block: the command buffers begun and not finished that use its cache ([`Caches`]).
+    pending: HashMap<u64, Users>,
+    /// By block: the fills of its cache waiting for those command buffers to finish.
+    filling: HashMap<u64, usize>,
+}
+
+/// The command buffers begun and not finished that use one block's cache.
+#[derive(Default)]
+struct Users {
+    users: usize,
+    /// Those that may write it.
+    writers: usize,
 }
 
 impl<P: Platform> SurfaceCaches<P> {
@@ -190,6 +202,8 @@ impl<P: Platform> SurfaceCaches<P> {
             ends: HashMap::new(),
             watched,
             counts: CacheCounts::default(),
+            pending: HashMap::new(),
+            filling: HashMap::new(),
         }
     }
 
@@ -272,30 +286,14 @@ impl<P: Platform> SurfaceCaches<P> {
         self.by_block.contains_key(&block)
     }
 
-    /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be
-    /// done, polling for about `timeout` at most (each poll sleeps at least [`FILL_POLL`]): for
-    /// work the host starts outside a command buffer that writes the cache, which
-    /// [`Self::before`]'s wait does not order. True where it is done, or the block has no cache
-    /// or no fill.
-    pub(crate) fn wait_filled(&self, block: u64, timeout: std::time::Duration) -> bool {
-        let (Some(cache), Some(t)) = (self.by_block.get(&block), &self.transfer) else {
-            return true;
-        };
-        // The fill's completion handler raises `done`: a fill is a copy of the block, rare (a
-        // cache's first use, or one after a CPU's write under a lock) and short, so the wait
-        // polls it.
-        let mut polls = timeout.as_micros() / FILL_POLL.as_micros();
-        while cache.filled_at > t.done.load(Ordering::Acquire) {
-            if polls == 0 {
-                return false;
-            }
-            polls -= 1;
-            std::thread::sleep(FILL_POLL);
-        }
-        true
+    /// The transfer event's value at which the block at `block`'s last fill is done, and the
+    /// value done so far; `None` where it has no cache or no fill.
+    fn last_fill(&self, block: u64) -> Option<(u64, Arc<AtomicU64>)> {
+        let (cache, t) = (self.by_block.get(&block)?, self.transfer.as_ref()?);
+        Some((cache.filled_at, Arc::clone(&t.done)))
     }
 
-    /// Whether [`Self::before`] would neither fill a cache `uses` names nor make the command
+    /// Whether [`Caches::before`] would neither fill a cache `uses` names nor make the command
     /// buffer wait for one's fill: each holds its use's generation or a newer one, no device of
     /// the host wrote its pages since its last fill, and its last fill is done.
     pub(crate) fn ready(&self, uses: &[RgfxOpSurfaceUse]) -> bool {
@@ -313,51 +311,101 @@ impl<P: Platform> SurfaceCaches<P> {
         })
     }
 
-    /// The blocks `uses` names that have caches, before command buffer `cb` of queue `queue`
-    /// runs: each filled where it holds an older generation than the use's, or none, or a device
-    /// of the host wrote its pages since its last fill, and `cb` made to wait for each one's last
-    /// fill not yet done; and whether it waits for one. A use that may write marks its cache
-    /// written. Where not `may_fill` (the caller found them [`Self::ready`], with nothing changed
-    /// since but the host's writes), nothing is filled: a write of the host's since `ready` is
-    /// left for the next use's fill, as one made after this use.
-    pub(crate) fn before(
+    /// Whether a present of the block at `block` at CPU generation `generation` needs a fill of
+    /// its cache first ([`Self::fill_now`]). False for a block with no cache.
+    fn needs_fill_at(&self, block: u64, generation: u64) -> bool {
+        self.by_block.get(&block).is_some_and(|cache| {
+            cache.generation.is_none_or(|held| generation > held) || self.watched.written(block)
+        })
+    }
+
+    /// Whether a use of the block at `u.block_offset`'s cache needs a fill first: the cache holds
+    /// an older generation than the use's, or none, or a device of the host wrote its pages since
+    /// its last fill. False for a block with no cache.
+    fn needs_fill(&self, u: &RgfxOpSurfaceUse) -> bool {
+        self.by_block.get(&u.block_offset).is_some_and(|cache| {
+            cache.generation.is_none_or(|held| u.cpu_gen > held)
+                || self.watched.written(u.block_offset)
+        })
+    }
+
+    /// The use `u` of a block with a cache, before command buffer `cb` runs: the cache filled
+    /// where it needs it ([`Self::needs_fill`]) and `may_fill`, its fill marked written where `u`
+    /// may write it, and `cb` made to wait for its last fill not yet done; whether it waits. The
+    /// caller made sure no command buffer begun and not finished uses the cache where it fills
+    /// ([`Caches::before`]).
+    fn before_one(
         &mut self,
         device: &P::Device,
         cb: &P::CommandBuffer,
-        uses: &[RgfxOpSurfaceUse],
+        u: &RgfxOpSurfaceUse,
         may_fill: bool,
-    ) -> RaiseResult<(Vec<u64>, bool)> {
-        let mut used = Vec::new();
-        let mut waits = false;
-        for u in uses {
-            if !self.by_block.contains_key(&u.block_offset) || used.contains(&u.block_offset) {
-                continue;
+    ) -> RaiseResult<bool> {
+        let Some(cache) = self.by_block.get(&u.block_offset) else {
+            return Ok(false);
+        };
+        let older = cache.generation.is_none_or(|held| u.cpu_gen > held);
+        let host_wrote = may_fill && self.watched.take(u.block_offset);
+        if may_fill && (older || host_wrote) {
+            if !older {
+                self.counts.host_writes += 1;
             }
-            used.push(u.block_offset);
-            let older = self.by_block[&u.block_offset]
-                .generation
-                .is_none_or(|held| u.cpu_gen > held);
-            let host_wrote = may_fill && self.watched.take(u.block_offset);
-            if may_fill && (older || host_wrote) {
-                if !older {
-                    self.counts.host_writes += 1;
-                }
-                self.fill(device, u.block_offset, u.cpu_gen)?;
-            }
-            let Some(cache) = self.by_block.get_mut(&u.block_offset) else {
-                continue;
-            };
-            if u.flags & RGFX_SURFACE_USE_WRITES != 0 {
-                cache.written = true;
-            }
-            if let Some(t) = &self.transfer
-                && cache.filled_at > t.done.load(Ordering::Acquire)
-            {
-                cb.encode_wait(Some(EventRef::Event(&t.event)), cache.filled_at)?;
-                waits = true;
+            self.fill(device, u.block_offset, u.cpu_gen)?;
+        }
+        let Some(cache) = self.by_block.get_mut(&u.block_offset) else {
+            return Ok(false);
+        };
+        if u.flags & RGFX_SURFACE_USE_WRITES != 0 {
+            cache.written = true;
+        }
+        if let Some(t) = &self.transfer
+            && cache.filled_at > t.done.load(Ordering::Acquire)
+        {
+            cb.encode_wait(Some(EventRef::Event(&t.event)), cache.filled_at)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// How many command buffers begun and not finished use the block at `block`'s cache; where
+    /// `writers`, only those that may write it.
+    fn pending(&self, block: u64, writers: bool) -> usize {
+        self.pending
+            .get(&block)
+            .map_or(0, |u| if writers { u.writers } else { u.users })
+    }
+
+    /// Counts a command buffer's uses `blocks` (each block, and whether it may write it) among
+    /// those begun and not finished.
+    fn hold(&mut self, blocks: &[(u64, bool)]) {
+        for &(block, writes) in blocks {
+            let users = self.pending.entry(block).or_default();
+            users.users += 1;
+            users.writers += usize::from(writes);
+        }
+    }
+
+    /// A fill of the block at `block` waits no more.
+    fn unfill(&mut self, block: u64) {
+        if let Some(n) = self.filling.get_mut(&block) {
+            *n -= 1;
+            if *n == 0 {
+                self.filling.remove(&block);
             }
         }
-        Ok((used, waits))
+    }
+
+    /// The command buffer whose uses are `blocks` is finished: it leaves their counts.
+    fn unhold(&mut self, blocks: &[(u64, bool)]) {
+        for &(block, writes) in blocks {
+            if let Some(users) = self.pending.get_mut(&block) {
+                users.users = users.users.saturating_sub(1);
+                users.writers = users.writers.saturating_sub(usize::from(writes));
+                if users.users == 0 {
+                    self.pending.remove(&block);
+                }
+            }
+        }
     }
 
     /// Ends command buffer `cb` of queue `queue`, which used the caches of `used`: it signals the
@@ -428,36 +476,38 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Fills the cache of the block at `block` where it holds an older generation than
-    /// `generation`, or a device of the host wrote its pages since its last fill, and waits for
-    /// the fill: a present of the surface shows the pages as of that generation.
-    pub(crate) fn fill_now(
+    /// `generation`, or a device of the host wrote its pages since its last fill: a present of
+    /// the surface shows the pages as of that generation. A command buffer on the transfer queue
+    /// behind the fill, committed, which the caller waits for with no lock held; `None` where
+    /// nothing was filled.
+    fn fill_now(
         &mut self,
         device: &P::Device,
         block: u64,
         generation: u64,
-    ) -> RaiseResult<()> {
+    ) -> RaiseResult<Option<P::CommandBuffer>> {
         let Some(cache) = self.by_block.get(&block) else {
-            return Ok(());
+            return Ok(None);
         };
         let older = cache.generation.is_none_or(|held| generation > held);
         let host_wrote = self.watched.take(block);
         if !older && !host_wrote {
-            return Ok(());
+            return Ok(None);
         }
         if !older {
             self.counts.host_writes += 1;
         }
         self.fill(device, block, generation)?;
         let Some(t) = &self.transfer else {
-            return Ok(());
+            return Ok(None);
         };
         // A command buffer behind the fill on the transfer queue finishes after it.
-        if let Some(cb) = t.queue.command_buffer(ON)? {
-            cb.encode_wait(Some(EventRef::Event(&t.event)), t.signalled)?;
-            cb.commit(ON)?;
-            cb.wait_until_completed(ON)?;
-        }
-        Ok(())
+        let Some(cb) = t.queue.command_buffer(ON)? else {
+            return Ok(None);
+        };
+        cb.encode_wait(Some(EventRef::Event(&t.event)), t.signalled)?;
+        cb.commit(ON)?;
+        Ok(Some(cb))
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: the pages written from its cache, after every
@@ -602,6 +652,321 @@ impl<P: Platform> SurfaceCaches<P> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.by_block.len()
+    }
+}
+
+/// The device caches behind their lock, and the order of their copies against the command buffers
+/// that use them. A command buffer counts among a block's users from its begin to its finish
+/// ([`Uses`]): where its use is the walk's alone, between them, a copy waits for it.
+///
+/// - **A copy into a cache** (a fill, at a command buffer's begin or a present) waits for every
+///   command buffer begun and not finished that uses the cache, and a later command buffer's use
+///   of the cache waits for a fill waiting so, so fills are not held off for good.
+/// - **A copy out of a cache** (a download, a release, the block's pages named again) waits for
+///   every one of them that may write it.
+///
+/// So a copy comes before or after each such buffer's whole use, as under one lock, and the
+/// queues' end events order it on the GPU after the buffers committed before it
+/// ([`SurfaceCaches::after`]). A command buffer counts its blocks in their order, and waits only
+/// for a block past every block it counts, so no two wait for each other. The waits hold no lock
+/// (the cache's lock is let go while they wait).
+pub(crate) struct Caches<P: Platform> {
+    state: Mutex<SurfaceCaches<P>>,
+    moved: Condvar,
+}
+
+/// The blocks of the caches a command buffer uses, and its count among their users
+/// ([`Caches::hold_ready`]).
+pub(crate) type Held<P> = (Vec<u64>, Option<Uses<P>>);
+
+/// A command buffer's count among the users of the blocks it uses ([`Caches`]), until its finish
+/// ([`Caches::finish`]) or its drop.
+pub(crate) struct Uses<P: Platform> {
+    caches: Arc<Caches<P>>,
+    /// Each block, and whether the buffer may write it.
+    blocks: Vec<(u64, bool)>,
+}
+
+impl<P: Platform> Drop for Uses<P> {
+    fn drop(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        self.caches.state.lock().unhold(&self.blocks);
+        self.caches.moved.notify_all();
+    }
+}
+
+/// The blocks of `uses` that have caches, each once, in block order, with the first use of each.
+fn by_block<'u>(
+    caches: &SurfaceCaches<impl Platform>,
+    uses: &'u [RgfxOpSurfaceUse],
+) -> Vec<&'u RgfxOpSurfaceUse> {
+    let mut out: Vec<&RgfxOpSurfaceUse> =
+        uses.iter().filter(|u| caches.has(u.block_offset)).collect();
+    // Stable: the first use of a block stays first.
+    out.sort_by_key(|u| u.block_offset);
+    out.dedup_by_key(|u| u.block_offset);
+    out
+}
+
+impl<P: Platform> Caches<P> {
+    /// No caches; `on` keeps them where the kext asks.
+    pub(crate) fn new(on: bool) -> Self {
+        Caches {
+            state: Mutex::new(SurfaceCaches::new(on)),
+            moved: Condvar::new(),
+        }
+    }
+
+    /// The caches, locked: for what orders nothing against command buffers' uses.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, SurfaceCaches<P>> {
+        self.state.lock()
+    }
+
+    /// Whether the block at `block` has a cache.
+    pub(crate) fn has(&self, block: u64) -> bool {
+        self.state.lock().has(block)
+    }
+
+    /// The device's reset ([`SurfaceCaches::reset`]), which no command buffer is begun across:
+    /// the guest's messages carried out before it have ended.
+    pub(crate) fn reset(&self) {
+        self.state.lock().reset();
+        self.moved.notify_all();
+    }
+
+    /// Starts again with no caches; `on` keeps them where the kext asks.
+    pub(crate) fn set_on(&self, on: bool) {
+        *self.state.lock() = SurfaceCaches::new(on);
+    }
+
+    /// Waits, letting the lock go meanwhile, while a command buffer begun and not finished uses
+    /// the block at `block`'s cache (`writers`: one that may write it).
+    fn wait_users(&self, state: &mut MutexGuard<'_, SurfaceCaches<P>>, block: u64, writers: bool) {
+        while state.pending(block, writers) > 0 {
+            self.moved.wait(state);
+        }
+    }
+
+    /// Waits, letting the lock go meanwhile, while a fill of the block at `block` waits.
+    fn wait_fills(&self, state: &mut MutexGuard<'_, SurfaceCaches<P>>, block: u64) {
+        while state.filling.get(&block).is_some_and(|&n| n > 0) {
+            self.moved.wait(state);
+        }
+    }
+
+    /// The blocks `uses` names that have caches, before command buffer `cb` runs, and its count
+    /// among their users: each filled where it needs it ([`SurfaceCaches::needs_fill`]), after
+    /// every command buffer begun and not finished that uses it, and `cb` made to wait for each
+    /// one's last fill not yet done; and whether it waits for one. A use that may write marks its
+    /// cache written. Where not `may_fill` (the caller found them [`Self::hold_ready`]), nothing
+    /// is filled.
+    pub(crate) fn before(
+        self: &Arc<Self>,
+        device: &P::Device,
+        cb: &P::CommandBuffer,
+        uses: &[RgfxOpSurfaceUse],
+        may_fill: bool,
+    ) -> RaiseResult<(Vec<u64>, bool, Option<Uses<P>>)> {
+        if uses.is_empty() {
+            return Ok((Vec::new(), false, None));
+        }
+        let mut state = self.state.lock();
+        let mut held = Uses {
+            caches: Arc::clone(self),
+            blocks: Vec::new(),
+        };
+        let mut waits = false;
+        let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
+        for u in &picked {
+            let block = u.block_offset;
+            // A fill waits for the block's users, and a use behind a fill waiting for it; what
+            // the use needs is read again after each wait.
+            loop {
+                if may_fill && state.needs_fill(u) {
+                    *state.filling.entry(block).or_default() += 1;
+                    self.wait_users(&mut state, block, false);
+                    state.unfill(block);
+                    self.moved.notify_all();
+                    break;
+                }
+                if !state.filling.contains_key(&block) {
+                    break;
+                }
+                self.wait_fills(&mut state, block);
+            }
+            if !state.has(block) {
+                continue;
+            }
+            let outcome = state.before_one(device, cb, u, may_fill);
+            // Counted at once, so a later fill of the block waits for this buffer.
+            state.hold(&[(block, u.flags & RGFX_SURFACE_USE_WRITES != 0)]);
+            held.blocks
+                .push((block, u.flags & RGFX_SURFACE_USE_WRITES != 0));
+            match outcome {
+                Ok(w) => waits |= w,
+                Err(raise) => {
+                    drop(state);
+                    return Err(raise);
+                }
+            }
+        }
+        drop(state);
+        let used = held.blocks.iter().map(|&(b, _)| b).collect();
+        Ok((used, waits, (!held.blocks.is_empty()).then_some(held)))
+    }
+
+    /// Whether [`Self::before`] would neither fill a cache `uses` names nor wait for anything, and
+    /// so command buffer `cb`'s count among their users where so: taken without waiting for the
+    /// lock (`None` where it is busy, or the buffer must wait). Each cache holds its use's
+    /// generation or a newer one, no device of the host wrote its pages since its last fill, its
+    /// last fill is done, and no fill of it waits.
+    pub(crate) fn hold_ready(self: &Arc<Self>, uses: &[RgfxOpSurfaceUse]) -> Option<Held<P>> {
+        if uses.is_empty() {
+            return Some((Vec::new(), None));
+        }
+        let mut state = self.state.try_lock()?;
+        let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
+        if !state.ready(&picked)
+            || picked
+                .iter()
+                .any(|u| state.filling.contains_key(&u.block_offset))
+        {
+            return None;
+        }
+        let blocks: Vec<(u64, bool)> = picked
+            .iter()
+            .map(|u| (u.block_offset, u.flags & RGFX_SURFACE_USE_WRITES != 0))
+            .collect();
+        for u in &picked {
+            if u.flags & RGFX_SURFACE_USE_WRITES != 0
+                && let Some(cache) = state.by_block.get_mut(&u.block_offset)
+            {
+                cache.written = true;
+            }
+        }
+        state.hold(&blocks);
+        drop(state);
+        let used = blocks.iter().map(|&(b, _)| b).collect();
+        let held = Uses {
+            caches: Arc::clone(self),
+            blocks,
+        };
+        Some((used, (!held.blocks.is_empty()).then_some(held)))
+    }
+
+    /// Ends command buffer `cb` of queue `queue`, which `uses` counted among the users of the
+    /// caches of `used` ([`SurfaceCaches::after`]), and `commit`s it, with the lock held, so a
+    /// later copy finds its end event's value committed; then it leaves their users.
+    pub(crate) fn finish(
+        &self,
+        device: &P::Device,
+        queue: u64,
+        cb: &P::CommandBuffer,
+        mut uses: Uses<P>,
+        used: &[u64],
+        commit: impl FnOnce() -> RaiseResult<()>,
+    ) -> RaiseResult<()> {
+        let mut state = self.state.lock();
+        let done = state.after(device, queue, cb, used).and_then(|()| commit());
+        state.unhold(&uses.blocks);
+        uses.blocks.clear();
+        drop(state);
+        self.moved.notify_all();
+        done
+    }
+
+    /// Fills the cache of the block at `block` where a present of it at `generation` needs it
+    /// ([`SurfaceCaches::fill_now`]), after every command buffer begun and not finished that uses
+    /// it, and waits for the fill with no lock held.
+    pub(crate) fn fill_now(
+        &self,
+        device: &P::Device,
+        block: u64,
+        generation: u64,
+    ) -> RaiseResult<()> {
+        let behind = {
+            let mut state = self.state.lock();
+            if !state.needs_fill_at(block, generation) {
+                return Ok(());
+            }
+            *state.filling.entry(block).or_default() += 1;
+            self.wait_users(&mut state, block, false);
+            let filled = state.fill_now(device, block, generation);
+            state.unfill(block);
+            drop(state);
+            self.moved.notify_all();
+            filled?
+        };
+        match behind {
+            Some(cb) => cb.wait_until_completed(ON),
+            None => Ok(()),
+        }
+    }
+
+    /// `SURFACE_DOWNLOAD` of the block at `block` ([`SurfaceCaches::download`]), after every
+    /// command buffer begun and not finished that may write it.
+    pub(crate) fn download(
+        &self,
+        device: &P::Device,
+        block: u64,
+        done: Box<dyn FnOnce() + Send>,
+    ) -> RaiseResult<()> {
+        let mut state = self.state.lock();
+        self.wait_users(&mut state, block, true);
+        state.download(device, block, done)
+    }
+
+    /// The block at `block` went ([`SurfaceCaches::released`]), after every command buffer begun
+    /// and not finished that may write its cache.
+    pub(crate) fn released(
+        &self,
+        device: &P::Device,
+        block: u64,
+        unread: bool,
+        done: Box<dyn FnOnce() + Send>,
+    ) -> RaiseResult<()> {
+        let mut state = self.state.lock();
+        self.wait_users(&mut state, block, true);
+        state.released(device, block, unread, done)
+    }
+
+    /// A cache for the block at `block` ([`SurfaceCaches::make`]), after every command buffer
+    /// begun and not finished that may write the cache it had.
+    pub(crate) fn make(
+        &self,
+        device: &P::Device,
+        block: u64,
+        view: &Arc<SurfaceView<P>>,
+        host_pages: Vec<Range<u64>>,
+    ) -> RaiseResult<bool> {
+        let mut state = self.state.lock();
+        self.wait_users(&mut state, block, true);
+        state.make(device, block, view, host_pages)
+    }
+
+    /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be done,
+    /// polling for about `timeout` at most (each poll sleeps at least [`FILL_POLL`]), with no lock
+    /// held: for work the host starts outside a command buffer that writes the cache, which a
+    /// command buffer's wait does not order. True where it is done, or the block has no cache or
+    /// no fill.
+    pub(crate) fn wait_filled(&self, block: u64, timeout: std::time::Duration) -> bool {
+        let Some((filled_at, done)) = self.state.lock().last_fill(block) else {
+            return true;
+        };
+        // The fill's completion handler raises `done`: a fill is a copy of the block, rare (a
+        // cache's first use, or one after a CPU's write under a lock) and short, so the wait
+        // polls it.
+        let mut polls = timeout.as_micros() / FILL_POLL.as_micros();
+        while filled_at > done.load(Ordering::Acquire) {
+            if polls == 0 {
+                return false;
+            }
+            polls -= 1;
+            std::thread::sleep(FILL_POLL);
+        }
+        true
     }
 }
 
@@ -767,7 +1132,8 @@ mod tests {
 
     /// The id of the block's cache.
     fn cache_id(r: &Rig) -> u64 {
-        let cache = r.dec.surface_caches.buffer(BLOCK).unwrap();
+        let caches = r.dec.caches();
+        let cache = caches.buffer(BLOCK).unwrap();
         Arg::obj(cache).as_obj().unwrap().0
     }
 
@@ -777,7 +1143,7 @@ mod tests {
     fn a_cached_blocks_buffers_are_its_device_cache() {
         let mut r = cached();
         let page = r.page;
-        assert_eq!(r.dec.surface_caches.len(), 1);
+        assert_eq!(r.dec.caches().len(), 1);
         let mark = r.p.call_log().mark();
         assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
         assert_eq!(r.buffer(11, BLOCK, page), Ok(()));
@@ -787,13 +1153,13 @@ mod tests {
         );
         assert!(r.dec.span_in_use(BLOCK, 0x1000));
         assert_eq!(r.pages(BLOCK + 0x8000, &[(3, 1)], page), RGFX_STATUS_OK);
-        assert_eq!(r.dec.surface_caches.len(), 1, "a block not marked");
+        assert_eq!(r.dec.caches().len(), 1, "a block not marked");
         r.dec.set_unified_memory(true);
         assert_eq!(
             r.pages_cached(BLOCK + 0x10000, &[(4, 1)], page, true),
             RGFX_STATUS_OK
         );
-        assert_eq!(r.dec.surface_caches.len(), 0, "a GPU of the CPU's memory");
+        assert_eq!(r.dec.caches().len(), 0, "a GPU of the CPU's memory");
     }
 
     /// The first use fills the cache from the pages, and so does a use of a newer generation;
@@ -824,7 +1190,7 @@ mod tests {
                 "generation {generation}"
             );
         }
-        assert_eq!(r.dec.surface_caches.counts().fills, 2);
+        assert_eq!(r.dec.caches().counts().fills, 2);
     }
 
     /// A buffer that asks for its `CB_SUBMITTED` and uses a cache the host fills first waits for
@@ -961,7 +1327,7 @@ mod tests {
             .unwrap();
         assert!(done.load(Ordering::SeqCst), "at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
-        assert_eq!(r.dec.surface_caches.counts().clean, 1);
+        assert_eq!(r.dec.caches().counts().clean, 1);
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
         let released = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&released);
@@ -975,11 +1341,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1);
-        assert_eq!(r.dec.surface_caches.len(), 0);
+        assert_eq!(r.dec.caches().len(), 0);
         assert!(!released.load(Ordering::SeqCst));
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
-        assert_eq!(r.dec.surface_caches.counts().downloads, 1);
+        assert_eq!(r.dec.caches().counts().downloads, 1);
     }
 
     /// A release of a written cache whose surface no process can read (its `BLOCK_RELEASE`'s
@@ -1003,8 +1369,8 @@ mod tests {
             .unwrap();
         assert!(released.load(Ordering::SeqCst), "done at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
-        assert_eq!(r.dec.surface_caches.len(), 0);
-        let counts = r.dec.surface_caches.counts();
+        assert_eq!(r.dec.caches().len(), 0);
+        let counts = r.dec.caches().counts();
         assert_eq!((counts.downloads, counts.unread), (0, 1));
     }
 
@@ -1058,9 +1424,9 @@ mod tests {
         let back = copies(&r.p.call_log().since(mark));
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, other);
-        assert_eq!(r.dec.surface_caches.len(), 0, "not cached");
+        assert_eq!(r.dec.caches().len(), 0, "not cached");
         r.p.world().complete_all(CompleteOn::Caller);
-        let counts = r.dec.surface_caches.counts();
+        let counts = r.dec.caches().counts();
         assert_eq!((counts.made, counts.downloads), (2, 3));
     }
 
@@ -1083,10 +1449,10 @@ mod tests {
         let mut r = cached();
         let page = r.page;
         let first = r.ram.host_addr(RAM + page).unwrap().addr().to_u64();
-        let ready = |r: &Rig, cpu_gen| r.dec.surface_caches.ready(&reading(BLOCK, cpu_gen));
+        let ready = |r: &Rig, cpu_gen| r.dec.caches().ready(&reading(BLOCK, cpu_gen));
         assert!(!ready(&r, 0), "never filled");
         assert!(
-            r.dec.surface_caches.ready(&reading(BLOCK + 0x8000, 0)),
+            r.dec.caches().ready(&reading(BLOCK + 0x8000, 0)),
             "no cache"
         );
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
@@ -1100,17 +1466,56 @@ mod tests {
         let queue = r.device.new_command_queue().unwrap();
         let cb = queue.command_buffer(ON).unwrap().unwrap();
         let mark = r.p.call_log().mark();
-        let (used, waits) = (r.dec.surface_caches)
+        let (used, waits, uses) = (r.dec.surface_caches)
             .before(&r.device, &cb, &reading(BLOCK, 1), false)
             .unwrap();
         assert_eq!((used, waits), (vec![BLOCK], false));
         assert!(r.p.call_log().sels_since(mark).is_empty(), "nothing filled");
+        // The buffer is done with the cache: a fill no longer waits for it.
+        drop(uses);
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
         assert_eq!(
             copies(&r.p.call_log().since(mark)).len(),
             1,
             "the next use fills"
+        );
+    }
+
+    /// A fill of a cache waits for every command buffer begun and not finished that uses it, and
+    /// is made once the last of them has finished, as one made after their whole use under one
+    /// lock would be (docs/graphics-kext/design.md, "What a walk sees").
+    #[test]
+    fn a_fill_waits_for_the_buffers_using_the_cache() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let reader = queue.command_buffer(ON).unwrap().unwrap();
+        let (_, _, uses) = (r.dec.surface_caches)
+            .before(&r.device, &reader, &reading(BLOCK, 1), true)
+            .unwrap();
+        assert!(uses.is_some(), "counted among its users");
+        let caches = Arc::clone(&r.dec.surface_caches);
+        let filler = queue.command_buffer(ON).unwrap().unwrap();
+        let mark = r.p.call_log().mark();
+        std::thread::scope(|scope| {
+            let fill = scope.spawn(|| {
+                caches
+                    .before(&r.device, &filler, &reading(BLOCK, 2), true)
+                    .map(|_| ())
+                    .map_err(|_| ())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!fill.is_finished(), "filled under a buffer using the cache");
+            assert!(copies(&r.p.call_log().since(mark)).is_empty());
+            drop(uses);
+            assert!(fill.join().unwrap().is_ok());
+        });
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            1,
+            "filled once its user finished"
         );
     }
 
@@ -1177,7 +1582,7 @@ mod tests {
             .unwrap();
         assert!(released.load(Ordering::SeqCst), "done at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
-        let counts = r.dec.surface_caches.counts();
+        let counts = r.dec.caches().counts();
         assert_eq!(
             (counts.fills, counts.downloads, counts.host_writes),
             (2, 0, 3)

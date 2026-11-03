@@ -153,7 +153,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// where the platform makes no encoder or no function; too small where the answer does not fit
     /// the block, whose first 8 bytes then say how many it takes.
     pub(crate) fn argument_layout(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<(Option<u64>, u32)> {
@@ -340,7 +340,7 @@ mod tests {
     /// for it gets only the bytes it needs, and the status says so
     #[test]
     fn descriptors_answer_the_platforms_layout_into_the_block() {
-        let (p, region, mut dec, reply) = decoder();
+        let (p, region, dec, reply) = decoder();
         let device = p.device();
         let descriptors = [
             descriptor(58, 0, 0),
@@ -406,10 +406,13 @@ mod tests {
     /// member follows layout 0's two
     #[test]
     fn a_functions_argument_buffer_answers_its_nested_layouts() {
-        let (p, region, mut dec, reply) = decoder();
+        let (p, region, dec, reply) = decoder();
         let device = p.device();
         let library = device.new_library(b"lib").unwrap().unwrap().unwrap();
-        dec.store(0x10, ObjHandle::Library(library));
+        dec.store(
+            0x10,
+            super::super::tables::Entry::of(ObjHandle::Library(library)),
+        );
         let m = query(
             RGFX_ARGUMENT_SOURCE_FUNCTION,
             reply,
@@ -459,10 +462,13 @@ mod tests {
     /// index, and a message too short for its head
     #[test]
     fn a_query_the_host_cannot_answer_says_why() {
-        let (p, _region, mut dec, reply) = decoder();
+        let (p, _region, dec, reply) = decoder();
         let device = p.device();
         let library = device.new_library(b"lib").unwrap().unwrap().unwrap();
-        dec.store(0x10, ObjHandle::Library(library));
+        dec.store(
+            0x10,
+            super::super::tables::Entry::of(ObjHandle::Library(library)),
+        );
         let d = [descriptor(58, 0, 0)];
         let bad_source = query(7, reply, 0x1000, 0, &d, "", &[]);
         assert_eq!(

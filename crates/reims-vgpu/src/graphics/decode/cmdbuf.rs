@@ -26,10 +26,10 @@
 //! that waits on an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7).
 //! The host posts it as soon as it takes a buffer that waits for no event, needs no fill of a
 //! device cache and has none before it on its queue that waits for one and is not yet scheduled
-//! ([`Held`]), before it walks the buffer's ops ([`Take`]): the device's one decoder carries out
-//! each message whole under its lock, so every message the guest sends after it, on any queue, is
-//! carried out after the buffer's commit, and the platform orders the guest's later work after it
-//! as it orders by commit. A buffer whose walk then faults has its failure at its completion, as
+//! ([`Held`]), before it walks the buffer's ops ([`Take`]): its ticket in the commit order is
+//! issued first ([`super::sequencer`]), so every command buffer the guest sends after it, on any
+//! queue, is committed after the buffer's commit, and the platform orders the guest's later work
+//! after it as it orders by commit. A buffer whose walk then faults has its failure at its completion, as
 //! Metal reports a command buffer's errors. Any other buffer gets it at its scheduling, once the
 //! waits are satisfied: Metal orders a tracked resource across queues behind what it has
 //! submitted, not behind a buffer its queue holds (measured on the M3 through the decoder, a
@@ -41,9 +41,10 @@
 //! taken on the thread of the guest's doorbell write instead (`reims_graphics`'s
 //! `Device::mmio_write_taking`), where nothing need be waited for there
 //! ([`GraphicsDecoder::submits_at_take`]): it is begun there ([`GraphicsDecoder::begin_command_buffer`],
-//! which makes its command buffer and fills no device cache), its `CB_SUBMITTED` posted there, and
-//! the decoder's lock carried to its queue's service thread, which walks and commits it
-//! ([`GraphicsDecoder::finish_command_buffer`]) before the lock goes. A queue's command buffers made
+//! which makes its command buffer and fills no device cache, trying each lock it takes), its
+//! `CB_SUBMITTED` posted there once its ticket in the commit order is issued, and its decoder
+//! carried to its queue's service thread, which walks and commits it
+//! ([`GraphicsDecoder::finish_command_buffer`]). A queue's command buffers made
 //! and not completed are counted ([`InFlight`]), so the platform's `commandBuffer`, which waits
 //! while a queue holds 64, does not wait on that thread.
 //!
@@ -58,7 +59,6 @@
 //! ([`GraphicsDecoder::stand_in_for_failed`]), whose completion posts the buffer's
 //! failure in the queue's order, with the shared event values it signals ahead of it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -98,6 +98,8 @@ use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
 
 use super::super::completion::{cb_complete, cb_failed};
+use super::surface_cache::Uses;
+use super::tables::QueueCounts;
 use super::{
     DecodeError, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, SubmittedSink, blit,
     compute, op_fault, read, refusing, render, video,
@@ -209,6 +211,8 @@ pub(crate) struct Begun<P: Platform> {
     in_flight: InFlight,
     /// The blocks of the device caches it uses.
     used: Vec<u64>,
+    /// Its count among those caches' users, until its commit.
+    uses: Option<Uses<P>>,
     /// Its `CB_SUBMITTED`, where it asks for one.
     submitted: Option<Arc<Submitted>>,
     /// Its hold of its queue, where it waits.
@@ -261,6 +265,21 @@ impl Held {
             self.queue.fetch_sub(1, Ordering::AcqRel);
         }
     }
+}
+
+/// Whether the queue whose counts are `counts` is held, a buffer of it that waits for an event not
+/// yet scheduled; and, where the buffer to commit `waits` for an event (the host's fill of a device
+/// cache among them), its own hold of the queue, which keeps it and the queue's later buffers from
+/// being submitted before it is scheduled, as Metal submits a queue's buffers in order.
+fn hold(counts: &QueueCounts, waits: bool) -> (bool, Option<Arc<Held>>) {
+    let behind = counts.held.load(Ordering::Acquire) > 0;
+    let held = waits.then(|| {
+        Arc::new(Held {
+            queue: Arc::clone(&counts.held),
+            released: AtomicBool::new(false),
+        })
+    });
+    (behind, held)
 }
 
 /// The event ops of the op stream `ops`, in stream order: whether each signals (else it waits),
@@ -368,7 +387,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`super::surface_cache`]). A buffer that asks for its `CB_SUBMITTED` and waits for nothing
     /// gets it before the walk; any other at its scheduling.
     pub(super) fn decode_command_buffer(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
         drain: Option<Arc<Drain>>,
@@ -378,12 +397,28 @@ impl<P: Platform> GraphicsDecoder<P> {
             Err(e) => return Ok(Err(e)),
         };
         // Submitted at once, unless it waits (for an event, or for the host's fill of a device
-        // cache) or a buffer before it on its queue does: then at its scheduling. The guest's
-        // later messages are carried out after this one's commit, under the decoder's lock.
+        // cache) or a buffer before it on its queue does: then at its scheduling. Its ticket in
+        // the commit order is issued first, so a buffer the guest sends after the answer is
+        // committed after this one ([`super::sequencer`]).
         if let Some(submitted) = begun.submitted_at_take() {
+            self.issue_ticket(false);
             submitted.post();
         }
         self.finish_command_buffer(device, message, begun)
+    }
+
+    /// Issues the message's command buffer its ticket in the commit order, before its
+    /// `CB_SUBMITTED` is posted at its take ([`super::sequencer`]); where `try_only`, false where
+    /// the order is busy, and the caller posts the answer from a thread that may wait.
+    pub(crate) fn issue_ticket(&self, try_only: bool) -> bool {
+        if self.ticket.borrow().is_some() {
+            return true;
+        }
+        let Some(ticket) = self.shared.sequencer.issue(self.context, try_only) else {
+            return false;
+        };
+        *self.ticket.borrow_mut() = Some(ticket);
+        true
     }
 
     /// Whether the `COMMAND_BUFFER` `message`, of the current context, gets its `CB_SUBMITTED` at
@@ -393,7 +428,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// waits for no event, no buffer before it holds its queue, the device caches it uses need no
     /// fill and no wait for one ([`super::surface_cache`]), and its queue holds fewer than
     /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed, so the platform's
-    /// `commandBuffer` does not wait.
+    /// `commandBuffer` does not wait. Where so, the buffer is counted among the users of those
+    /// caches, as its begin would count it ([`super::surface_cache::Caches::hold_ready`]).
     pub(crate) fn submits_at_take(&self, message: &[u8]) -> bool {
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return false;
@@ -401,23 +437,25 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(ops) = ops_of(message, &m) else {
             return false;
         };
-        if self.context_failed()
-            || self.submitted_sink.is_none()
-            || !matches!(self.named(m.queue_obj_id), Some(ObjHandle::CommandQueue(_)))
+        if self.context_failed() || self.sinks.submitted.is_none() {
+            return false;
+        }
+        let Some(counts) = self.queue_counts(m.queue_obj_id) else {
+            return false;
+        };
+        let take = take(ops);
+        if !take.asks
+            || take.waits
+            || counts.held.load(Ordering::Acquire) != 0
+            || counts.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
         {
             return false;
         }
-        let take = take(ops);
-        let count = |counts: &HashMap<u64, Arc<AtomicUsize>>| {
-            counts
-                .get(&m.queue_obj_id)
-                .map_or(0, |n| n.load(Ordering::Acquire))
+        let Some(held) = self.surface_caches.hold_ready(&take.uses) else {
+            return false;
         };
-        take.asks
-            && !take.waits
-            && count(&self.held_queues) == 0
-            && count(&self.in_flight) < TAKE_IN_FLIGHT_MAX
-            && self.surface_caches.ready(&take.uses)
+        *self.held_caches.borrow_mut() = Some(held);
+        true
     }
 
     /// Begins the `COMMAND_BUFFER` `message`, whose completion handler will hold `drain`: opens a
@@ -426,12 +464,16 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// checked [`Self::submits_at_take`], fills none), and makes its `CB_SUBMITTED` and its hold
     /// of its queue ([`Begun`]).
     pub(crate) fn begin_command_buffer(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
         drain: Option<Arc<Drain>>,
         may_fill: bool,
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
+        // It is committed after every buffer answered `CB_SUBMITTED` before now.
+        if self.mark.get().is_none() {
+            self.mark.set(Some(self.shared.sequencer.mark()));
+        }
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -450,13 +492,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                 None => return Ok(Err(DecodeError::Refused)),
             }
         };
-        let in_flight = InFlight::new(self.in_flight.entry(m.queue_obj_id).or_default());
+        let Some(counts) = self.queue_counts(m.queue_obj_id) else {
+            return Ok(Err(DecodeError::BadReference));
+        };
+        let in_flight = InFlight::new(&counts.in_flight);
         let take = take(ops);
-        let (used, fill_waits) = self
-            .surface_caches
-            .before(device, &cb, &take.uses, may_fill)?;
+        let held_caches = self.held_caches.borrow_mut().take();
+        let (used, fill_waits, uses) = match held_caches {
+            Some((used, uses)) => (used, false, uses),
+            None => self
+                .surface_caches
+                .before(device, &cb, &take.uses, may_fill)?,
+        };
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
-        let (behind, held) = self.hold(m.queue_obj_id, fill_waits || take.waits);
+        let (behind, held) = hold(counts, fill_waits || take.waits);
         Ok(Ok(Begun {
             queue_obj_id: m.queue_obj_id,
             cb_obj_id: m.cb_obj_id,
@@ -464,6 +513,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cb,
             in_flight,
             used,
+            uses,
             submitted,
             held,
             behind,
@@ -475,7 +525,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// command buffer, ends its use of the device caches, and commits it with its scheduled and
     /// completed handlers.
     pub(crate) fn finish_command_buffer(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
         begun: Begun<P>,
@@ -487,6 +537,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cb,
             in_flight,
             used,
+            uses,
             submitted,
             held,
             drain,
@@ -501,16 +552,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
             return Ok(Err(e));
         }
-        self.surface_caches
-            .after(device, queue_obj_id, &cb, &used)?;
         // Register the scheduled and completion paths and commit. The GPU start and end times
         // are 0 here; the ring loop fills them when it posts the record on the queue's
         // completion ring in a later increment.
-        if let Some(handler) =
-            self.scheduled_handler(cb_obj_id, seqno, submitted.clone(), held.clone())
-        {
-            cb.add_scheduled_handler(ON, handler)?;
-        }
+        let scheduled = self.scheduled_handler(cb_obj_id, seqno, submitted.clone(), held.clone());
         let handler = self.completed_handler(
             cb_obj_id,
             seqno,
@@ -519,32 +564,35 @@ impl<P: Platform> GraphicsDecoder<P> {
             false,
             (submitted, held.clone()),
         );
-        cb.add_completed_handler(ON, leaving(handler, in_flight))?;
-        commit_holding(&cb, held.as_deref())?;
+        let commit = || {
+            if let Some(scheduled) = scheduled {
+                cb.add_scheduled_handler(ON, scheduled)?;
+            }
+            cb.add_completed_handler(ON, leaving(handler, in_flight))?;
+            commit_holding(&cb, held.as_deref())
+        };
+        // After every buffer answered `CB_SUBMITTED` before its begin ([`super::sequencer`]).
+        if let Some(mark) = self.mark.get() {
+            self.shared.sequencer.wait_for(mark);
+        }
+        match uses {
+            // Its end event signalled for the caches' later copies, and committed, under their
+            // lock ([`super::surface_cache::Caches::finish`]).
+            Some(uses) => {
+                self.surface_caches
+                    .finish(device, queue_obj_id, &cb, uses, &used, commit)?
+            }
+            None => commit()?,
+        }
+        // Committed: a buffer behind it in the commit order goes on.
+        self.ticket.borrow_mut().take();
         Ok(Ok(()))
-    }
-
-    /// Whether queue `queue_obj_id` is held, a buffer of it that waits for an event not yet
-    /// scheduled; and, where the buffer to commit `waits` for an event (the host's fill of a
-    /// device cache among them), its own hold of the queue, which keeps it and the queue's later
-    /// buffers from being submitted before it is scheduled, as Metal submits a queue's buffers in
-    /// order.
-    fn hold(&mut self, queue_obj_id: u64, waits: bool) -> (bool, Option<Arc<Held>>) {
-        let queue = self.held_queues.entry(queue_obj_id).or_default();
-        let behind = queue.load(Ordering::Acquire) > 0;
-        let held = waits.then(|| {
-            Arc::new(Held {
-                queue: Arc::clone(queue),
-                released: AtomicBool::new(false),
-            })
-        });
-        (behind, held)
     }
 
     /// The `CB_SUBMITTED` of command buffer `cb_obj_id`, at `seqno`, where it `asks` for one and
     /// there is a sink.
     fn submitted(&self, cb_obj_id: u64, seqno: u64, asks: bool) -> Option<Arc<Submitted>> {
-        let sink = self.submitted_sink.clone().filter(|_| asks)?;
+        let sink = self.sinks.submitted.clone().filter(|_| asks)?;
         Some(Arc::new(Submitted {
             sink,
             record: RgfxCbSubmitted {
@@ -569,7 +617,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `Ok(false)` where there is none, and the caller posts the failure at once: a message too
     /// short to name its queue, a queue the process does not hold or that makes no command
     /// buffer, and a context whose work is refused ([`Self::context_failed`]).
-    pub(crate) fn stand_in_for_failed(&mut self, message: &[u8]) -> RaiseResult<bool> {
+    pub(crate) fn stand_in_for_failed(&self, message: &[u8]) -> RaiseResult<bool> {
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return Ok(false);
         };
@@ -577,15 +625,17 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(false);
         }
         // The buffer's context's drain, held until the stand-in's completion handler has run.
-        let drain =
-            (self.context).map(|context| Arc::clone(self.drains.entry(context).or_default()));
+        let drain = self.command_buffer_drain();
         let Some(ObjHandle::CommandQueue(queue)) = self.named(m.queue_obj_id) else {
+            return Ok(false);
+        };
+        let Some(counts) = self.queue_counts(m.queue_obj_id) else {
             return Ok(false);
         };
         let Some(cb) = queue.command_buffer(ON)? else {
             return Ok(false);
         };
-        let in_flight = InFlight::new(self.in_flight.entry(m.queue_obj_id).or_default());
+        let in_flight = InFlight::new(&counts.in_flight);
         // All of the message's ops, as the walk takes them ([`ops_of`]), whatever its `op_bytes`
         // read, so a wait or signal past a wrong count still runs.
         let ops = message
@@ -609,7 +659,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         // It holds its queue as the buffer would have.
-        let (_, held) = self.hold(m.queue_obj_id, !events.waits.is_empty());
+        let (_, held) = hold(counts, !events.waits.is_empty());
         if let Some(held) = &held {
             let held = Arc::clone(held);
             cb.add_scheduled_handler(ON, Box::new(move || held.release()))?;
@@ -623,6 +673,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             (None, held.clone()),
         );
         cb.add_completed_handler(ON, leaving(handler, in_flight))?;
+        // In the commit order where the buffer was ([`super::sequencer`]).
+        if let Some(mark) = self.mark.get() {
+            self.shared.sequencer.wait_for(mark);
+        }
         commit_holding(&cb, held.as_deref())?;
         Ok(true)
     }
@@ -639,7 +693,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         submitted: Option<Arc<Submitted>>,
         held: Option<Arc<Held>>,
     ) -> Option<ScheduledHandler> {
-        let sink = self.scheduled_sink.clone();
+        let sink = self.sinks.scheduled.clone();
         if sink.is_none() && held.is_none() {
             return None;
         }
@@ -678,13 +732,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         stand_in: bool,
         (submitted, held): (Option<Arc<Submitted>>, Option<Arc<Held>>),
     ) -> CompletedHandler {
-        let sink = self.completion_sink.clone();
-        let signal_sink = self.signal_sink.clone();
-        let (failed, context) = (Arc::clone(&self.failed), self.context);
+        let sink = self.sinks.completion.clone();
+        let signal_sink = self.sinks.signal.clone();
+        let (failed, context) = (Arc::clone(&self.shared.failed), self.context);
         let resets = failed.resets();
         let signals = events.signals;
-        let watched = (!events.waits.is_empty())
-            .then(|| self.waits.watch(cb_obj_id, seqno, context, events.waits));
+        let watched = (!events.waits.is_empty()).then(|| {
+            self.shared
+                .waits
+                .watch(cb_obj_id, seqno, context, events.waits)
+        });
         Box::new(move |info: CompletedInfo| {
             // The platform refused the buffer's completion on its own thread (a death in its
             // read, in the scope this decode carried there): the buffer fails, and so does its
@@ -759,6 +816,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         encoder: &mut Option<OpenEncoder<P>>,
         events: &mut EventOps,
     ) -> RaiseResult<Result<(), DecodeError>> {
+        #[cfg(test)]
+        let (mut index, hook) = (0, self.walk_hook());
         while !ops.is_empty() {
             let Some((tag, body, len)) = next_op(ops) else {
                 return Ok(Err(DecodeError::Malformed));
@@ -804,6 +863,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 _ => return Err(unknown_op(tag)),
             }
             ops = &ops[len..];
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook(index);
+            }
+            #[cfg(test)]
+            {
+                index += 1;
+            }
         }
         if encoder.is_some() {
             return Err(op_fault("the op stream ended with an encoder still open"));
@@ -1647,7 +1714,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(*seen.cached.lock(), [[true, true]]);
-        assert_eq!(r.dec.surface_caches.counts().fills, 1);
+        assert_eq!(r.dec.caches().counts().fills, 1);
     }
 
     /// A command buffer opens a render encoder for its pass, sends each reference
@@ -2034,7 +2101,7 @@ mod tests {
         assert!(!dec.submits_at_take(&waits), "waits for an event");
         // A buffer of queue 1 that waits, not yet scheduled (the fake schedules each at its
         // commit), holds the queue.
-        let held = Arc::clone(dec.held_queues.entry(1).or_default());
+        let held = Arc::clone(&dec.queue_counts(1).unwrap().held);
         held.fetch_add(1, Ordering::AcqRel);
         assert!(
             !dec.submits_at_take(&asking(173, 103)),
@@ -2241,7 +2308,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        let Some(ObjHandle::Buffer(out)) = dec.objects.get(&11) else {
+        let Some(ObjHandle::Buffer(out)) = dec.object(11) else {
             panic!("no buffer 11");
         };
         // SAFETY: a Shared buffer of `LEN` bytes, read after the command buffer that wrote it
@@ -2376,7 +2443,7 @@ mod tests {
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let placed = buffer_at(11, 0, 64 << 20);
         assert_eq!(dec.decode(&device, placed.as_bytes()).unwrap(), Ok(()));
-        let Some(ObjHandle::Buffer(buffer)) = dec.objects.get(&11) else {
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(11) else {
             panic!("no buffer 11");
         };
         assert!(buffer.gpu_address() < RGFX_CONTEXT_VA_BASE);
@@ -2832,5 +2899,300 @@ mod tests {
                 Err(DecodeError::BadReference)
             );
         }
+    }
+
+    /// A gate the first walk to reach it stops at, after its op `at`, until the test opens it.
+    /// Whether a walk took the gate, stopped at it, and whether it is open; and their moves.
+    type GateState = Arc<(Mutex<(bool, bool, bool)>, reims_vgpu_core::sync::Condvar)>;
+
+    struct Gate(GateState);
+
+    impl Gate {
+        /// The gate, set on the walks of `dec`'s state.
+        fn on(dec: &GraphicsDecoder<FakePlatform>, at: usize) -> Gate {
+            let state = Arc::new((
+                Mutex::new((false, false, false)),
+                reims_vgpu_core::sync::Condvar::new(),
+            ));
+            let hook = Arc::clone(&state);
+            dec.set_walk_hook(Some(Arc::new(move |index: usize| {
+                let (lock, moved) = &*hook;
+                let mut s = lock.lock();
+                // (taken by a walk, the walk stopped at it, open)
+                if index != at || s.0 {
+                    return;
+                }
+                s.0 = true;
+                s.1 = true;
+                moved.notify_all();
+                while !s.2 {
+                    moved.wait(&mut s);
+                }
+            })));
+            Gate(state)
+        }
+
+        /// Waits for a walk to stop at the gate.
+        fn reached(&self) {
+            let (lock, moved) = &*self.0;
+            let mut s = lock.lock();
+            for _ in 0..3000 {
+                if s.1 {
+                    return;
+                }
+                moved.wait_for(&mut s, std::time::Duration::from_millis(1));
+            }
+            panic!("no walk reached the gate");
+        }
+
+        /// Lets the walk stopped at the gate go on.
+        fn open(&self) {
+            let (lock, moved) = &*self.0;
+            lock.lock().2 = true;
+            moved.notify_all();
+        }
+    }
+
+    fn destroy(obj_id: u64) -> Vec<u8> {
+        reims_graphics::wire::RgfxObjectDestroy {
+            header: RgfxMsgHeader {
+                r#type: reims_graphics::wire::RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<reims_graphics::wire::RgfxObjectDestroy>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn buffer_create(obj_id: u64) -> Vec<u8> {
+        RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            length: 64,
+            ..RgfxBufferCreate::default()
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// The gone entries context 0's table keeps for open views.
+    fn kept(dec: &GraphicsDecoder<FakePlatform>) -> usize {
+        dec.context_state(0).map_or(0, |c| c.gone_len())
+    }
+
+    /// A command buffer's walk names objects as its context's table was at its begin, the
+    /// changes ring 0 carries out meanwhile unseen: each outcome is the one the buffer had,
+    /// carried out whole before them, as under one lock (docs/graphics-kext/design.md, "What a
+    /// walk sees"). Destroys mid-walk, of the buffer and textures it names, and an id destroyed,
+    /// made again and destroyed again, leave the walk naming the objects it began with, which are
+    /// let go of once it ends; ring 0 is not held up meanwhile.
+    #[test]
+    fn a_walk_names_what_its_table_held_at_its_begin() {
+        let (p, dec) = setup();
+        let device = p.device();
+        let original = Arg::obj(match dec.object(2) {
+            Some(ObjHandle::Buffer(b)) => b,
+            _ => panic!("no buffer 2"),
+        });
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(None, super::super::Sinks::default());
+        drop(dec);
+        let gate = Gate::on(&ring0, 0);
+        let message = command_buffer_message(100, 1, &render_ops());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| {
+                let outcome = walker.decode(&p.device(), &message).unwrap();
+                walker.end_message();
+                outcome
+            });
+            gate.reached();
+            for m in [
+                destroy(5),
+                destroy(2),
+                buffer_create(2),
+                destroy(2),
+                destroy(3),
+            ] {
+                assert_eq!(ring0.decode(&device, &m).unwrap(), Ok(()));
+            }
+            assert_eq!(ring0.object_count(), 2, "the queue and texture 4");
+            assert_eq!(kept(&ring0), 4, "kept for the walk");
+            gate.open();
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(kept(&ring0), 0, "let go of with the walk");
+        let bound = p.call_log().calls_to("setVertexBuffer:offset:atIndex:");
+        assert_eq!(
+            bound.last().unwrap().args[0],
+            original,
+            "the buffer it began with"
+        );
+    }
+
+    /// A walk does not name an object made after its begin, as one carried out whole before the
+    /// create would not: it fails at the op, as one naming an object destroyed before its begin.
+    #[test]
+    fn a_walk_names_nothing_made_after_its_begin() {
+        let (p, dec) = setup();
+        let device = p.device();
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(None, super::super::Sinks::default());
+        drop(dec);
+        // Destroyed before the begin: the op naming it faults.
+        assert_eq!(ring0.decode(&device, &destroy(3)).unwrap(), Ok(()));
+        let message = command_buffer_message(100, 1, &render_ops());
+        assert!(walker.decode(&device, &message).is_err());
+        // Made after the begin: not named.
+        let gate = Gate::on(&ring0, 0);
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message).map_err(|_| ()));
+            gate.reached();
+            let index = RgfxBufferCreate {
+                length: 65536,
+                ..RgfxBufferCreate::read_from_bytes(&buffer_create(3)).unwrap()
+            };
+            assert_eq!(ring0.decode(&device, index.as_bytes()).unwrap(), Ok(()));
+            gate.open();
+            assert!(
+                walk.join().unwrap().is_err(),
+                "named the buffer made after its begin"
+            );
+        });
+        // A walk begun after the create names it.
+        ring0.set_walk_hook(None);
+        assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+    }
+
+    /// A context's close during a walk of its command buffer drops its objects at once, the walk
+    /// naming them as at its begin; they are let go of once it ends, and a drain the close begins
+    /// is answered once the buffer's completion handler has run.
+    #[test]
+    fn a_close_during_a_walk_leaves_it_its_objects() {
+        let (p, dec) = setup();
+        let device = p.device();
+        let ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(Some(0), super::super::Sinks::default());
+        drop(dec);
+        let gate = Gate::on(&ring0, 0);
+        let message = command_buffer_message(100, 1, &render_ops());
+        let answered = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| {
+                let outcome = walker.decode(&p.device(), &message).unwrap();
+                walker.end_message();
+                outcome
+            });
+            gate.reached();
+            assert_eq!(ring0.drop_context(0), 5);
+            assert_eq!(ring0.object_count(), 0);
+            let flag = Arc::clone(&answered);
+            drop(ring0.drain_context(
+                0,
+                true,
+                Box::new(move || flag.store(true, Ordering::Release)),
+            ));
+            assert_eq!(
+                kept(&ring0),
+                0,
+                "the closed context's state is the walk's alone"
+            );
+            gate.open();
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert!(
+            !answered.load(Ordering::Acquire),
+            "answered before the buffer finished"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert!(answered.load(Ordering::Acquire));
+        drop(device);
+    }
+
+    /// A command buffer the guest sends after another's `CB_SUBMITTED` is committed after it, on
+    /// another queue: its walk goes on, and its commit waits for the first's; a range message of
+    /// the first's context waits for it too, and another context's does not.
+    #[test]
+    fn a_buffer_sent_after_an_answer_is_committed_after_it() {
+        let (p, mut dec, posted) = posting(false);
+        let device = p.device();
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let sinks = dec.sinks.clone();
+        let mut first = dec.sender(Some(0), sinks.clone());
+        let mut second = dec.sender(Some(0), sinks);
+        let mut ring0 = dec.sender(Some(0), super::super::Sinks::default());
+        let mut other = dec.sender(Some(2), super::super::Sinks::default());
+        let gate = Gate::on(&dec, 0);
+        drop(dec);
+        let range = |obj_id| {
+            reims_graphics::wire::RgfxBufferDidModifyRange {
+                header: RgfxMsgHeader {
+                    r#type: reims_graphics::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+                    size: size_of::<reims_graphics::wire::RgfxBufferDidModifyRange>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                location: 0,
+                length: 8,
+            }
+            .as_bytes()
+            .to_vec()
+        };
+        let asked = asking(100, 1);
+        let later = command_buffer_on(6, 200, &render_ops());
+        let commits = || {
+            p.call_log()
+                .calls_to("commit")
+                .into_iter()
+                .filter_map(|c| c.thread)
+                .filter(|t| t == "first" || t == "second")
+                .collect::<Vec<_>>()
+        };
+        std::thread::scope(|scope| {
+            let a = std::thread::Builder::new()
+                .name("first".into())
+                .spawn_scoped(scope, || first.decode(&p.device(), &asked).unwrap())
+                .unwrap();
+            gate.reached();
+            assert_eq!(posted.lock().len(), 1, "answered before its walk");
+            let b = std::thread::Builder::new()
+                .name("second".into())
+                .spawn_scoped(scope, || second.decode(&p.device(), &later).unwrap())
+                .unwrap();
+            let r = scope.spawn(|| ring0.decode(&p.device(), &range(2)).unwrap());
+            // Another context's range message waits for nothing of context 0's.
+            assert_eq!(
+                other
+                    .decode(
+                        &device,
+                        &range((2 << reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT) | 2)
+                    )
+                    .unwrap(),
+                Err(DecodeError::BadReference)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(commits().is_empty(), "committed before the answered buffer");
+            assert!(!b.is_finished() && !r.is_finished());
+            gate.open();
+            assert_eq!(a.join().unwrap(), Ok(()));
+            assert_eq!(b.join().unwrap(), Ok(()));
+            // Buffer 2 is no `Managed` buffer: carried out, and refused, after the commit.
+            assert_eq!(r.join().unwrap(), Err(DecodeError::BadReference));
+        });
+        assert_eq!(commits(), ["first", "second"]);
     }
 }

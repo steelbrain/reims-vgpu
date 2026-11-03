@@ -28,16 +28,46 @@
 //! for the caller to catch. An op-stream reference the host cannot honour faults
 //! the exec the same way ([`bad_reference`], [`op_fault`]).
 //!
-//! [`super::GraphicsControl`] drives it from the device's control thread, one
-//! message at a time, and gives it the sinks that post onto the control
-//! completion ring. The object-resolution API below ([`GraphicsDecoder::require_buffer`]
-//! and the rest) is the whole contract the encoder-op decoders call; some of its
-//! resolvers are for ops the first op slice does not emit yet, and so are not
-//! reached, but they are kept whole (project rule "Unread is not dead").
+//! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on the
+//! control thread, each queue's command buffers on the queue's service thread (or a doorbell's),
+//! and the compiles' ends on the compile pool. Each message is carried out through a
+//! [`GraphicsDecoder`] of its own, a handle on the state the decoder keeps for every context
+//! ([`Shared`]) with the message's sender and the sinks its records go to; no lock is held across a
+//! message by any of them, so one context's command buffer never holds up another's, nor ring 0.
+//! The object-resolution API below ([`GraphicsDecoder::require_buffer`] and the rest) is the whole
+//! contract the encoder-op decoders call; some of its resolvers are for ops the first op slice
+//! does not emit yet, and so are not reached, but they are kept whole (project rule "Unread is not
+//! dead").
+//!
+//! **The locks** (each held only for what it guards, never across a command buffer's walk, a
+//! platform call that waits, a wait of another kind, or a post, but where said):
+//! - `GraphicsControl`'s reset gate, outside every lock here: held shared by each message carried
+//!   out off the control thread, from before its staleness check to its end, and alone by the
+//!   device's reset ([`GraphicsDecoder::reset`]), which so finds no message in flight.
+//! - `contexts`: which contexts have state ([`tables::Context`]), to find, make or drop one.
+//! - each context's table ([`tables`]): read at a message's first naming of an object, and
+//!   written to take or close a view and at each make and removal. A message sees the table as of
+//!   its view ([`tables::View`]).
+//! - each context's drain: a command buffer joins it as it is begun.
+//! - `surfaces`: the IOSurfaces' names (the textures over each one's plane 0, and their copies'
+//!   writers), which presents read.
+//! - `libraries`: the library chunks, makes and cache, on ring 0 and the compile pool. Held across
+//!   a library's store in its context's table, so a destroy never comes between.
+//! - `id_chunks`: the texture resource ids' chunks, on ring 0.
+//! - `surface_views`, then `surface_caches` ([`surface_cache::Caches`]), the blocks' views of
+//!   their surfaces' pages and their device caches. A command buffer that uses a cache holds the
+//!   caches' lock from its end's signal through its commit, never across its walk; a download
+//!   with nothing to copy is answered under it.
+//! - the commit order ([`sequencer`]), and the contexts that failed ([`FailedContexts`]).
+//!
+//! Where two are held at once, they are taken in this order: `libraries`, `contexts`, a context's
+//! table, then the compiles' pending set (`super::compile`, asked under the table's lock as a
+//! compiled pipeline is stored); and `surface_views` before `surface_caches`.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
@@ -76,7 +106,6 @@ use reims_graphics::wire::{
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
     RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
-use reims_vgpu_core::collections::hasher::KeyBuild;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -109,8 +138,10 @@ mod fuzz;
 mod library;
 mod managed;
 mod render;
+mod sequencer;
 mod surface_cache;
 mod surface_pages;
+mod tables;
 mod video;
 mod view;
 mod waits;
@@ -121,11 +152,13 @@ pub use video::{GraphicsVideo, GraphicsVideoSession, H264Decode, VideoPlane};
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
 #[cfg(test)]
 pub(crate) use library::verified_key as test_key;
-use library::{LibraryCache, LibraryKey, LibraryRef, LibrarySlot};
-pub(crate) use library::{
-    LibraryJob, LibraryStart, MadeLibrary, RELEASED_BUDGET, complete, make_library,
-};
-use managed::{ManagedCopy, STORAGE_MODE_MANAGED, storage_mode};
+use library::{Libraries, LibraryRef};
+pub(crate) use library::{LibraryJob, LibraryStart, MadeLibrary, complete, make_library};
+use managed::{STORAGE_MODE_MANAGED, storage_mode};
+use sequencer::Sequencer;
+pub(crate) use sequencer::Ticket;
+use surface_cache::Caches;
+use tables::{Context, Entry, QueueCounts, View};
 
 /// A sink the decoder calls with each command buffer's completion record once its
 /// work finishes (the handler the stream's close registers). The ring loop sets
@@ -156,6 +189,18 @@ pub(crate) type SubmittedSink = Arc<dyn Fn(RgfxCbSubmitted) + Send + Sync>;
 /// the queue's completion ring, keyed to the create by its `seqno`; until it is
 /// set, the reply is built and dropped.
 pub(crate) type ReflectionSink = Arc<dyn Fn(RgfxPipelineReflection) + Send + Sync>;
+
+/// The sinks a message's records go to: those of the ring it came from. A sink not set builds and
+/// drops its records, and a command buffer gets no scheduled handler or `CB_SUBMITTED` without
+/// one.
+#[derive(Clone, Default)]
+pub(crate) struct Sinks {
+    pub(crate) completion: Option<CompletionSink>,
+    pub(crate) signal: Option<SignalSink>,
+    pub(crate) scheduled: Option<ScheduledSink>,
+    pub(crate) submitted: Option<SubmittedSink>,
+    pub(crate) reflection: Option<ReflectionSink>,
+}
 
 /// An answer the host gives once a context's command buffers have finished (a `CONTEXT_CLOSE`'s,
 /// a `BLOCK_RELEASE`'s).
@@ -189,79 +234,59 @@ impl Drop for Drain {
 ///
 /// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
 #[derive(Default)]
-pub(crate) struct FailedContexts(Mutex<Failed>);
-
-/// [`FailedContexts`]' state.
-#[derive(Default)]
-struct Failed {
-    /// The contexts that failed.
-    contexts: HashSet<u32>,
-    /// The device's resets so far ([`FailedContexts::forget_all`]).
-    resets: u64,
+pub(crate) struct FailedContexts {
+    failed: Mutex<HashSet<u32>>,
+    /// How many there are, read without the lock: none, in every run that refuses nothing.
+    count: AtomicUsize,
+    /// The device's resets so far ([`Self::forget_all`]), changed under `failed`'s lock.
+    resets: AtomicU64,
 }
 
 impl FailedContexts {
     /// The device's resets so far, which a command buffer's completed handler takes at the
     /// buffer's decode, for its [`Self::fail`].
     pub(crate) fn resets(&self) -> u64 {
-        self.0.lock().resets
+        self.resets.load(Ordering::Acquire)
     }
 
     /// Marks `context` failed, for a command buffer decoded after `resets` resets
     /// ([`Self::resets`]); nothing where the device was reset since. True where it was not yet.
     pub(crate) fn fail(&self, context: u32, resets: u64) -> bool {
-        let mut failed = self.0.lock();
-        failed.resets == resets && failed.contexts.insert(context)
+        let mut failed = self.failed.lock();
+        if self.resets.load(Ordering::Acquire) != resets {
+            return false;
+        }
+        let new = failed.insert(context);
+        self.count.store(failed.len(), Ordering::Release);
+        new
     }
 
     /// Whether `context` failed.
     pub(crate) fn has(&self, context: u32) -> bool {
-        self.0.lock().contexts.contains(&context)
+        self.count.load(Ordering::Acquire) != 0 && self.failed.lock().contains(&context)
+    }
+
+    /// Whether `context` failed, waiting for no lock: `None` where its lock is busy.
+    fn try_has(&self, context: u32) -> Option<bool> {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return Some(false);
+        }
+        Some(self.failed.try_lock()?.contains(&context))
     }
 
     /// Forgets `context`, at its close.
     fn forget(&self, context: u32) {
-        self.0.lock().contexts.remove(&context);
+        let mut failed = self.failed.lock();
+        failed.remove(&context);
+        self.count.store(failed.len(), Ordering::Release);
     }
 
     /// Forgets every context, at the device's reset, and counts the reset.
     fn forget_all(&self) {
-        let mut failed = self.0.lock();
-        failed.contexts.clear();
-        failed.resets += 1;
-    }
-}
-
-/// The objects ring 0 made with no lock of the decoder's held, in the order made, until the
-/// decoder stores them at its next lock, before anything else there
-/// ([`GraphicsDecoder::store_made`]): the samplers of `SAMPLER_CREATE` ([`Self::sampler_state`]),
-/// whose make reads and changes nothing of the decoder's, so it is not held up behind a command
-/// buffer's walk and commit, which hold the lock throughout. Nothing can name such a sampler
-/// before that store: its process names it only after its answer, which is posted once it is
-/// queued here, so a command buffer that names it is carried out after the create (its queue's
-/// thread waits for ring 0 to reach it), under a later lock; and ring 0's later messages, its
-/// destroy or its context's close among them, are carried out after it under a later lock too.
-pub(crate) struct MadeObjects<P: Platform>(Mutex<Vec<(u64, ObjHandle<P>)>>);
-
-impl<P: Platform> Default for MadeObjects<P> {
-    fn default() -> Self {
-        MadeObjects(Mutex::new(Vec::new()))
-    }
-}
-
-impl<P: Platform> MadeObjects<P> {
-    /// A `SAMPLER_CREATE`'s answer ([`sampler_answer`]), made with no lock of the decoder's
-    /// held: the sampler is queued here for the decoder to store under the message's id.
-    /// `failed`: whether the sender's context failed ([`FailedContexts`]).
-    pub(crate) fn sampler_state(
-        &self,
-        device: &P::Device,
-        failed: bool,
-        message: &[u8],
-    ) -> RaiseResult<Option<RgfxSamplerState>> {
-        sampler_answer::<P>(device, message, failed, |obj_id, sampler| {
-            self.0.lock().push((obj_id, ObjHandle::Sampler(sampler)));
-        })
+        let mut failed = self.failed.lock();
+        failed.clear();
+        self.count.store(0, Ordering::Release);
+        self.resets.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -390,138 +415,189 @@ pub enum DecodeError {
 /// How many `SURFACE_PAGES` pass between the logs of what the surface views did.
 const VIEWS_LOGGED_EVERY: u64 = 256;
 
-/// The stage-3 decoder for one device: the `obj_id` → handle table and the
-/// dispatch from a wire message to a `Platform` call.
-pub struct GraphicsDecoder<P: Platform> {
-    /// The platform whose device the decoder drives, held for the descriptor
-    /// builders ([`Platform::texture_descriptor`]) some per-device creates need.
+/// The context an object id lies in.
+fn context_of(obj_id: u64) -> u32 {
+    (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
+}
+
+/// What the decoder keeps for every context, behind locks of its own (the module doc's list).
+pub(crate) struct Shared<P: Platform> {
+    /// The platform whose device the decoder drives, held for the descriptor builders
+    /// ([`Platform::texture_descriptor`]) some per-device creates need.
     platform: Arc<P>,
-    /// The objects the guest's processes made, by id: looked up at each op that names one, so
-    /// hashed by core's fixed integer hasher
-    /// ([`KeyHasher`](reims_vgpu_core::collections::KeyHasher)), which also makes the order a
-    /// context's objects drop in at its close the same in every run.
-    objects: HashMap<u64, ObjHandle<P>, KeyBuild>,
+    /// Each context's state, by id, made at its first create and dropped at its close.
+    contexts: Mutex<HashMap<u32, Arc<Context<P>>>>,
+    /// The IOSurfaces' names.
+    surfaces: Mutex<SurfaceNames>,
+    /// The host's hardware video, which makes the video sessions; unset where it has none.
+    video: OnceLock<Arc<dyn GraphicsVideo<P>>>,
+    /// The libraries' chunks, makes and cache (`library`).
+    libraries: Mutex<Libraries<P>>,
+    /// The context holding each chunk of the texture resource ids, by chunk, as
+    /// `RESOURCE_ID_CHUNK` gave it, until its `CONTEXT_CLOSE`: every process's
+    /// textures share the one device's ids, so a texture create's id must lie in
+    /// a chunk of its own context ([`GraphicsDecoder::holds_resource_id`]).
+    id_chunks: Mutex<Box<[Option<u32>]>>,
+    /// The watch over command buffers that wait on events, which logs the ones that wait long
+    /// (diagnostics only: [`waits`]).
+    waits: waits::WaitWatch<P>,
+    /// The contexts whose work failed off its op's thread, whose later work is refused.
+    failed: Arc<FailedContexts>,
+    /// Whether a `Managed` resource is one copy, over its block
+    /// ([`GraphicsDecoder::set_unified_memory`]).
+    unified_memory: AtomicBool,
+    /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
+    surface_views: Mutex<surface_pages::SurfaceViews<P>>,
+    /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
+    surface_caches: Arc<Caches<P>>,
+    /// The commit order `CB_SUBMITTED` promises ([`sequencer`]).
+    sequencer: Arc<Sequencer>,
+    /// Called after each op of every command buffer's walk (the tests' look inside a walk).
+    #[cfg(test)]
+    walk_hook: Mutex<Option<WalkHook>>,
+    /// The device's BAR 2 region: the host memory the over-host-memory buffers
+    /// and heaps are placed over. Held so it stays mapped while the decoder's
+    /// objects live; declared last so the contexts drop before it (a buffer
+    /// also keeps its own clone alive in its no-copy deallocator).
+    region: Arc<Region>,
+}
+
+/// The decoder's state, shared by the threads that carry out messages, each on a decoder of its
+/// own ([`Self::sender`]).
+#[derive(Clone)]
+pub(crate) struct Decoders<P: Platform>(Arc<Shared<P>>);
+
+impl<P: Platform> Decoders<P> {
+    /// A decoder for a message from `context` (`None`: what is no context's), its records going
+    /// to `sinks`.
+    pub(crate) fn sender(&self, context: Option<u32>, sinks: Sinks) -> GraphicsDecoder<P> {
+        GraphicsDecoder::on(Arc::clone(&self.0), context, sinks)
+    }
+}
+
+/// The IOSurfaces' names: the textures over each one's plane 0, and where each copy keeps its
+/// writers.
+#[derive(Default)]
+struct SurfaceNames {
     /// The textures over each IOSurface's plane 0, by the surface's global id:
     /// every `TEXTURE_FROM_IOSURFACE` naming the surface whose texture the table
     /// holds, in the order made, so a destroy of one leaves the others (another
     /// process's, or an older one's) to name the surface. A present names its
     /// surface by that id and shows the latest.
-    surfaces: HashMap<u32, Vec<u64>>,
+    by_surface: HashMap<u32, Vec<u64>>,
     /// Where in the region each of those textures' copy keeps its
     /// [`RgfxSurfaceWriters`], by the texture's id, where its message gave one.
-    surface_writers: HashMap<u64, u64>,
-    /// Where each texture over an IOSurface's plane, of any plane, lies in its buffer, by the
-    /// texture's id: what a video encoder's picture is written through.
-    surface_places: HashMap<u64, video::PlanePlace>,
-    /// The host's hardware video, which makes the video sessions; `None` where it has none.
-    video: Option<Arc<dyn GraphicsVideo<P>>>,
-    /// The bytes of each library whose `LIBRARY_FROM_REGION` chunks have not yet
-    /// reached its length, by the library's id.
-    library_chunks: HashMap<u64, Vec<u8>>,
-    /// The libraries being made, by id, until each is stored or cancelled (`library`).
-    making_libraries: HashMap<u64, Arc<LibrarySlot<P>>>,
-    /// The libraries made from keyed bytes, by key, across every process (`library`).
-    library_cache: LibraryCache<P>,
-    /// The device's resets so far ([`Self::reset`]): a library whose make began before one is
-    /// not kept in the cache the reset made anew.
-    resets: u64,
-    /// The key of each id the cache's entries are named by.
-    cached_libraries: HashMap<u64, LibraryKey>,
-    /// The context holding each chunk of the texture resource ids, by chunk, as
-    /// `RESOURCE_ID_CHUNK` gave it, until its `CONTEXT_CLOSE`: every process's
-    /// textures share the one device's ids, so a texture create's id must lie in
-    /// a chunk of its own context ([`Self::holds_resource_id`]).
-    id_chunks: Box<[Option<u32>]>,
-    /// Where a command buffer's completion record goes once its work finishes;
-    /// `None` builds and drops it (the ring loop sets a sink later).
-    completion_sink: Option<CompletionSink>,
-    /// Where the shared events a command buffer signalled go once its work finishes; `None`
-    /// builds and drops them (the ring loop sets a sink later).
-    signal_sink: Option<SignalSink>,
-    /// Where a command buffer's `CB_SCHEDULED` goes once it is scheduled; `None` registers no
-    /// scheduled handler (the ring loop sets a sink later).
-    scheduled_sink: Option<ScheduledSink>,
-    /// Where the `CB_SUBMITTED` of a command buffer that asks for it goes once it is submitted;
-    /// `None` answers no ask (the ring loop sets a sink later).
-    submitted_sink: Option<SubmittedSink>,
-    /// The watch over command buffers that wait on events, which logs the ones that wait long
-    /// (diagnostics only: [`waits`]).
-    waits: waits::WaitWatch<P>,
-    /// Where a pipeline create's reflection reply goes; `None` builds and drops
-    /// it (the ring loop sets a sink later).
-    reflection_sink: Option<ReflectionSink>,
+    writers: HashMap<u64, u64>,
+}
+
+/// The stage-3 decoder: a handle on the device's [`Shared`] state through which one message is
+/// carried out, with the message's sender and the sinks its records go to. It holds what the
+/// message named (its views of its contexts' tables, [`tables::View`]) until it drops, or until
+/// a new message begins on it ([`Self::set_context`], [`Self::decode`]), and a command buffer's
+/// place in the commit order ([`sequencer`]).
+pub struct GraphicsDecoder<P: Platform> {
+    shared: Arc<Shared<P>>,
+    /// The platform, as [`Shared`]'s.
+    platform: Arc<P>,
+    /// The region, as [`Shared`]'s.
+    region: Arc<Region>,
+    /// The device caches, as [`Shared`]'s.
+    surface_caches: Arc<Caches<P>>,
+    /// Where the message's records go.
+    sinks: Sinks,
     /// The context (the process) of the message being carried out, whose objects alone it may
     /// name ([`Self::named`]); `None` names any (the decoder's own tests).
     context: Option<u32>,
-    /// The region span (offset, length) each object lies over, for those over the region's
-    /// memory: a buffer or heap over host memory, and what is placed in one (a buffer at an
-    /// offset, a texture in the heap or over the buffer), with its parent's span. A block is not
-    /// given out again while an object lies in it ([`Self::span_in_use`]).
-    spans: HashMap<u64, (u64, u64)>,
-    /// Each context's command buffers in flight since its last drain began
-    /// ([`Self::drain_context`]).
-    drains: HashMap<u32, Arc<Drain>>,
-    /// The contexts whose work failed off its op's thread, whose later work is refused.
-    failed: Arc<FailedContexts>,
-    /// The objects made with no lock of the decoder's held, which it stores at its next lock.
-    made: Arc<MadeObjects<P>>,
-    /// The CPU copy of each `Managed` buffer and texture ([`managed`]).
-    managed: HashMap<u64, ManagedCopy<P>>,
-    /// Whether a `Managed` resource is one copy, over its block ([`Self::set_unified_memory`]).
-    unified_memory: bool,
-    /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
-    surface_views: surface_pages::SurfaceViews<P>,
-    /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
-    surface_caches: surface_cache::SurfaceCaches<P>,
-    /// By queue: how many of its command buffers that wait for an event are not yet scheduled.
-    /// A buffer committed behind one is not submitted until it is, as Metal's is not
-    /// ([`cmdbuf`]'s submission).
-    held_queues: HashMap<u64, Arc<AtomicUsize>>,
-    /// By queue: how many command buffers the host made on it have not completed ([`cmdbuf`]'s
-    /// take on a doorbell's thread).
-    in_flight: HashMap<u64, Arc<AtomicUsize>>,
-    /// The device's BAR 2 region: the host memory the over-host-memory buffers
-    /// and heaps are placed over. Held so it stays mapped while the decoder's
-    /// objects live; declared last so the object table drops before it (a buffer
-    /// also keeps its own clone alive in its no-copy deallocator).
-    region: Arc<Region>,
+    /// The message's views of the tables it named objects in, one a context.
+    views: RefCell<Vec<View<P>>>,
+    /// The message is carried out on a thread that waits for no lock (a doorbell's): each lock is
+    /// tried, and a busy one makes the message not taken there.
+    try_only: bool,
+    /// The commit order's mark at the command buffer's begin ([`Sequencer::mark`]).
+    mark: Cell<Option<u64>>,
+    /// The command buffer's ticket in the commit order, where it was answered at its take; given
+    /// back with the handle, after its commit or its stand-in's.
+    ticket: RefCell<Option<Ticket>>,
+    /// The device caches a doorbell's take found ready and counted the buffer among the users of
+    /// ([`Caches::hold_ready`]), for its begin.
+    held_caches: RefCell<Option<surface_cache::Held<P>>>,
+    /// The drain of the message's context, taken at its command buffer's begin
+    /// ([`Self::command_buffer_drain`]).
+    drain: RefCell<Option<Arc<Drain>>>,
 }
+
+/// What the tests call after each op of a command buffer's walk, with its index, but for the
+/// render ops, which run inside their encoder's runs
+/// ([`reims_vgpu_core::platform::render::RenderEncoder::encoding`]) and are not counted.
+#[cfg(test)]
+pub(crate) type WalkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl<P: Platform> GraphicsDecoder<P> {
     /// A new decoder for `platform` over its `region`, with no objects.
     pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
-        GraphicsDecoder {
+        let shared = Arc::new(Shared {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
-            objects: HashMap::default(),
-            surfaces: HashMap::new(),
-            surface_writers: HashMap::new(),
-            surface_places: HashMap::new(),
-            video: None,
-            library_chunks: HashMap::new(),
-            making_libraries: HashMap::new(),
-            library_cache: LibraryCache::new(RELEASED_BUDGET),
-            resets: 0,
-            cached_libraries: HashMap::new(),
-            id_chunks: vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice(),
-            completion_sink: None,
-            signal_sink: None,
-            scheduled_sink: None,
-            submitted_sink: None,
-            reflection_sink: None,
-            context: None,
-            spans: HashMap::new(),
-            drains: HashMap::new(),
+            contexts: Mutex::new(HashMap::new()),
+            surfaces: Mutex::default(),
+            video: OnceLock::new(),
+            libraries: Mutex::new(Libraries::new()),
+            id_chunks: Mutex::new(vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice()),
             failed: Arc::default(),
-            made: Arc::default(),
-            managed: HashMap::new(),
-            unified_memory: false,
-            surface_views: surface_pages::SurfaceViews::new(None),
-            surface_caches: surface_cache::SurfaceCaches::new(true),
-            held_queues: HashMap::new(),
-            in_flight: HashMap::new(),
+            unified_memory: AtomicBool::new(false),
+            surface_views: Mutex::new(surface_pages::SurfaceViews::new(None)),
+            surface_caches: Arc::new(Caches::new(true)),
+            sequencer: Arc::default(),
+            #[cfg(test)]
+            walk_hook: Mutex::new(None),
             region,
+        });
+        GraphicsDecoder::on(shared, None, Sinks::default())
+    }
+
+    /// A handle on `shared` for a message of `context`'s, its records going to `sinks`.
+    fn on(shared: Arc<Shared<P>>, context: Option<u32>, sinks: Sinks) -> Self {
+        GraphicsDecoder {
+            platform: Arc::clone(&shared.platform),
+            region: Arc::clone(&shared.region),
+            surface_caches: Arc::clone(&shared.surface_caches),
+            shared,
+            sinks,
+            context,
+            views: RefCell::new(Vec::new()),
+            try_only: false,
+            mark: Cell::new(None),
+            ticket: RefCell::new(None),
+            held_caches: RefCell::new(None),
+            drain: RefCell::new(None),
         }
+    }
+
+    /// A handle on this decoder's state for a message from `context`, its records going to
+    /// `sinks`.
+    #[cfg(test)]
+    pub(crate) fn sender(&self, context: Option<u32>, sinks: Sinks) -> Self {
+        GraphicsDecoder::on(Arc::clone(&self.shared), context, sinks)
+    }
+
+    /// This decoder's state, shared ([`Decoders`]).
+    pub(crate) fn decoders(&self) -> Decoders<P> {
+        Decoders(Arc::clone(&self.shared))
+    }
+
+    /// Whether the message is carried out waiting for no lock (a doorbell's take): each is tried.
+    pub(crate) fn set_try_only(&mut self, try_only: bool) {
+        self.try_only = try_only;
+    }
+
+    /// Ends the message carried out on this handle: what it named is let go of, and its place in
+    /// the commit order given back.
+    pub(crate) fn end_message(&mut self) {
+        self.views.get_mut().clear();
+        self.mark.set(None);
+        self.ticket.get_mut().take();
+        self.held_caches.get_mut().take();
+        self.drain.get_mut().take();
     }
 
     /// The guest's RAM, through which an IOSurface's own pages are mapped for its GPU view
@@ -533,12 +609,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         memory: Arc<MemoryMap<P>>,
         lease: Arc<dyn std::any::Any + Send + Sync>,
     ) {
-        self.surface_views = surface_pages::SurfaceViews::new(Some((memory, lease)));
+        *self.shared.surface_views.lock() = surface_pages::SurfaceViews::new(Some((memory, lease)));
     }
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
     pub(crate) fn surface_pages_available(&self) -> bool {
-        self.surface_views.available(&self.platform)
+        self.shared.surface_views.lock().available(&self.platform)
     }
 
     /// `SURFACE_PAGES`: the view of `runs` for the block `pages` names, which its
@@ -552,9 +628,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         runs: &[RgfxPageRun],
         cached: bool,
     ) -> u32 {
-        let made = self
-            .surface_views
-            .surface_pages(&self.platform, device, pages, runs);
+        let made =
+            (self.shared.surface_views.lock()).surface_pages(&self.platform, device, pages, runs);
         let status = match made {
             Ok(Ok(())) => {
                 self.cache_surface(device, pages.block_offset, runs, cached);
@@ -581,7 +656,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_STATUS_REFUSED
             }
         };
-        let c = self.surface_views.counts();
+        let c = self.shared.surface_views.lock().counts();
         if (c.made + c.reused + c.bad_runs + c.not_mapped).is_multiple_of(VIEWS_LOGGED_EVERY) {
             log::info!(
                 target: "reims_vgpu::graphics",
@@ -589,7 +664,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                  for bad runs, {} not mapped",
                 c.made, c.reused, c.bad_runs, c.not_mapped
             );
-            let d = self.surface_caches.counts();
+            let d = self.surface_caches.lock().counts();
             if d.made != 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
@@ -607,21 +682,18 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Gives the block at `block`, whose view of `runs` was just made, a device cache where the
     /// kext marked it `cached` and the device keeps caches ([`surface_cache`]); else the block
     /// keeps its view alone, and its buffers lie over the pages.
-    fn cache_surface(
-        &mut self,
-        device: &P::Device,
-        block: u64,
-        runs: &[RgfxPageRun],
-        cached: bool,
-    ) {
-        if !cached || !self.surface_caches.on() {
+    fn cache_surface(&self, device: &P::Device, block: u64, runs: &[RgfxPageRun], cached: bool) {
+        if !cached || !self.surface_caches.lock().on() {
             self.uncache_surface(device, block);
             return;
         }
-        let Some(view) = self.surface_views.view(block) else {
-            return;
+        let (view, pages) = {
+            let views = self.shared.surface_views.lock();
+            let Some(view) = views.view(block) else {
+                return;
+            };
+            (view, views.host_runs(runs))
         };
-        let pages = self.surface_views.host_runs(runs);
         match self.surface_caches.make(device, block, &view, pages) {
             Ok(true) => {}
             Ok(false) => log::warn!(
@@ -640,8 +712,8 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The block at `block`, named again without a cache, loses any it had, as at a release: what
     /// a buffer wrote of it goes into the pages first ([`surface_cache`]).
-    fn uncache_surface(&mut self, device: &P::Device, block: u64) {
-        if !self.surface_caches.has(block) {
+    fn uncache_surface(&self, device: &P::Device, block: u64) {
+        if !self.surface_caches.lock().has(block) {
             return;
         }
         if let Err(raise) = self
@@ -660,7 +732,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// pages, after every command buffer that used it ([`surface_cache`]); `done` once the pages
     /// hold it, at once where the block has no cache or nothing wrote it since its last copy.
     pub(crate) fn surface_download(
-        &mut self,
+        &self,
         device: &P::Device,
         block: u64,
         done: Box<dyn FnOnce() + Send>,
@@ -674,13 +746,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// [`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT));
     /// `done` then ([`surface_cache`]).
     pub(crate) fn block_released(
-        &mut self,
+        &self,
         device: &P::Device,
         offset: u64,
         unread: bool,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
-        self.surface_views.released(offset);
+        self.shared.surface_views.lock().released(offset);
         self.surface_caches.released(device, offset, unread, done)
     }
 
@@ -688,15 +760,19 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// shows lies in, where it holds an older CPU generation than `generation`, and waits for the
     /// fill ([`surface_cache`]).
     pub(crate) fn fill_presented(
-        &mut self,
+        &self,
         device: &P::Device,
         iosurface_id: u32,
         generation: u64,
     ) -> RaiseResult<()> {
-        let block = (self.surfaces.get(&iosurface_id))
-            .and_then(|textures| textures.last())
-            .and_then(|obj_id| self.spans.get(obj_id))
-            .map(|&(at, _)| at);
+        let shown = (self.shared.surfaces.lock().by_surface.get(&iosurface_id))
+            .and_then(|textures| textures.last().copied());
+        let block = shown.and_then(|obj_id| {
+            self.context_state(context_of(obj_id))?
+                .with_live(obj_id, |e| e.span)
+                .flatten()
+                .map(|(at, _)| at)
+        });
         match block {
             Some(block) => self.surface_caches.fill_now(device, block, generation),
             None => Ok(()),
@@ -706,65 +782,65 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Sets the sink the decoder hands each command buffer's completion record to
     /// once its work finishes (the ring loop's, writing the queue's completion
     /// ring).
+    #[cfg(test)]
     pub(crate) fn set_completion_sink(&mut self, sink: CompletionSink) {
-        self.completion_sink = Some(sink);
+        self.sinks.completion = Some(sink);
     }
 
     /// Sets the sink the decoder hands each shared event a command buffer signalled to, once the
     /// buffer's work finishes (the ring loop's, writing the queue's completion ring).
+    #[cfg(test)]
     pub(crate) fn set_signal_sink(&mut self, sink: SignalSink) {
-        self.signal_sink = Some(sink);
+        self.sinks.signal = Some(sink);
     }
 
     /// Sets the sink the decoder hands each command buffer's `CB_SCHEDULED` to once the buffer is
     /// scheduled (the ring loop's, writing the queue's completion ring).
+    #[cfg(test)]
     pub(crate) fn set_scheduled_sink(&mut self, sink: ScheduledSink) {
-        self.scheduled_sink = Some(sink);
+        self.sinks.scheduled = Some(sink);
     }
 
     /// Sets the sink the decoder hands the `CB_SUBMITTED` of each command buffer that asks for it
     /// to once the buffer is submitted (the ring loop's, writing the queue's completion ring).
+    #[cfg(test)]
     pub(crate) fn set_submitted_sink(&mut self, sink: SubmittedSink) {
-        self.submitted_sink = Some(sink);
+        self.sinks.submitted = Some(sink);
     }
 
     /// Sets the sink the decoder hands each pipeline create's reflection reply to
     /// (the ring loop's, writing the queue's completion ring).
+    #[cfg(test)]
     pub(crate) fn set_reflection_sink(&mut self, sink: ReflectionSink) {
-        self.reflection_sink = Some(sink);
+        self.sinks.reflection = Some(sink);
     }
 
-    /// Sets the context of the messages carried out next: the process that sent them, whose
-    /// objects alone they may name. On ring 0 it is the context of the object a message creates or
-    /// destroys, which the kext checked is the sender's; on a queue's ring, the queue's.
+    /// Sets the context of the messages carried out next, which begin anew: the process that sent
+    /// them, whose objects alone they may name. On ring 0 it is the context of the object a
+    /// message creates or destroys, which the kext checked is the sender's; on a queue's ring, the
+    /// queue's.
+    #[cfg(test)]
     pub(crate) fn set_context(&mut self, context: Option<u32>) {
+        self.end_message();
         self.context = context;
     }
 
     /// The contexts whose work failed off its op's thread, shared ([`FailedContexts`]).
     pub(crate) fn failed_contexts(&self) -> Arc<FailedContexts> {
-        Arc::clone(&self.failed)
-    }
-
-    /// The objects made with no lock of the decoder's held ([`MadeObjects`]), shared.
-    pub(crate) fn made_objects(&self) -> Arc<MadeObjects<P>> {
-        Arc::clone(&self.made)
-    }
-
-    /// Stores the objects made with no lock of the decoder's held ([`MadeObjects`]), in the order
-    /// made, as their creates would have under the lock. The decoder's owner calls it first at
-    /// each lock, so what is carried out under the lock finds every object made before it.
-    pub(crate) fn store_made(&mut self) {
-        let made = std::mem::take(&mut *self.made.0.lock());
-        for (obj_id, handle) in made {
-            self.store(obj_id, handle);
-        }
+        Arc::clone(&self.shared.failed)
     }
 
     /// Whether the current context's work failed off its op's thread ([`FailedContexts`]), so
-    /// its later work is refused.
+    /// its later work is refused. Where only tried and its lock is busy, as failed: the message is
+    /// not taken there.
     pub(super) fn context_failed(&self) -> bool {
-        self.context.is_some_and(|context| self.failed.has(context))
+        self.context.is_some_and(|context| {
+            if self.try_only {
+                self.shared.failed.try_has(context).unwrap_or(true)
+            } else {
+                self.shared.failed.has(context)
+            }
+        })
     }
 
     /// Whether `obj_id` is the current context's to name (any where none is set).
@@ -773,14 +849,70 @@ impl<P: Platform> GraphicsDecoder<P> {
             .is_none_or(|context| obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context))
     }
 
+    /// The state of context `context`, where it has any; `None` too where only tried and the
+    /// contexts' lock is busy.
+    fn context_state(&self, context: u32) -> Option<Arc<Context<P>>> {
+        let contexts = if self.try_only {
+            self.shared.contexts.try_lock()?
+        } else {
+            self.shared.contexts.lock()
+        };
+        contexts.get(&context).cloned()
+    }
+
+    /// The state of context `context`, made where it has none.
+    fn context_made(&self, context: u32) -> Arc<Context<P>> {
+        let mut contexts = self.shared.contexts.lock();
+        Arc::clone(
+            contexts
+                .entry(context)
+                .or_insert_with(|| Arc::new(Context::new(context))),
+        )
+    }
+
+    /// The entry of `obj_id` the message sees (its view of the object's context's table, taken
+    /// at its first naming of an object there where not before; [`tables`]), where it is the
+    /// current context's to name: a process names only its own objects, and an id of another's
+    /// resolves to nothing (a bad reference where it is named). `None` too where only tried and a
+    /// lock is busy.
+    fn entry(&self, obj_id: u64) -> Option<&Entry<P>> {
+        if !self.owned(obj_id) {
+            return None;
+        }
+        let context = context_of(obj_id);
+        let found = {
+            let views = self.views.borrow();
+            views
+                .iter()
+                .find(|v| v.context().id == context)
+                .map(|v| v.get(obj_id, self.try_only).map(std::ptr::from_ref))
+        };
+        let found = match found {
+            Some(found) => found,
+            None => {
+                let view = View::take(self.context_state(context)?, self.try_only)?;
+                let found = view.get(obj_id, self.try_only).map(std::ptr::from_ref);
+                self.views.borrow_mut().push(view);
+                found
+            }
+        };
+        // SAFETY: the view lends the entry for its own life, and it stays in `views` until the
+        // handle drops or a message begins anew on it, which takes `&mut self`: so for `&self`'s.
+        found.map(|p| unsafe { &*p })
+    }
+
     /// The object `obj_id` names, where it is the current context's: a process names only its own
     /// objects, and an id of another's resolves to nothing (a bad reference where it is named).
     fn named(&self, obj_id: u64) -> Option<&ObjHandle<P>> {
-        if self.owned(obj_id) {
-            self.objects.get(&obj_id)
-        } else {
-            None
-        }
+        self.entry(obj_id).map(|e| &e.handle)
+    }
+
+    /// The counts of the command queue `obj_id` names, where it is one the current context may
+    /// name.
+    pub(super) fn queue_counts(&self, obj_id: u64) -> Option<&QueueCounts> {
+        self.entry(obj_id)
+            .filter(|e| matches!(e.handle, ObjHandle::CommandQueue(_)))
+            .and_then(|e| e.queue.as_ref())
     }
 
     /// Whether `len` bytes at region offset `offset` lie in one block the current context holds
@@ -799,10 +931,57 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// The objects the table holds (for the tests).
+    /// The objects the tables hold (for the tests).
     #[cfg(any(test, feature = "testkit"))]
     pub fn object_count(&self) -> usize {
-        self.objects.len()
+        let contexts: Vec<Arc<Context<P>>> =
+            self.shared.contexts.lock().values().cloned().collect();
+        contexts.iter().map(|c| c.len()).sum()
+    }
+
+    /// The object `obj_id` names as the message sees it (for the tests).
+    #[cfg(test)]
+    fn object(&self, obj_id: u64) -> Option<&ObjHandle<P>> {
+        self.named(obj_id)
+    }
+
+    /// The ids of the objects the tables hold, by context, each in its table's order (for the
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn object_ids(&self) -> Vec<u64> {
+        let mut contexts: Vec<Arc<Context<P>>> =
+            self.shared.contexts.lock().values().cloned().collect();
+        contexts.sort_by_key(|c| c.id);
+        contexts.iter().flat_map(|c| c.ids()).collect()
+    }
+
+    /// The device caches, locked (for the tests).
+    #[cfg(test)]
+    pub(crate) fn caches(
+        &self,
+    ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
+        self.surface_caches.lock()
+    }
+
+    /// The surfaces' views, locked (for the tests).
+    #[cfg(test)]
+    pub(crate) fn views_of_surfaces(
+        &self,
+    ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_pages::SurfaceViews<P>> {
+        self.shared.surface_views.lock()
+    }
+
+    /// Has `hook` called after each op of every command buffer's walk with the op's index (for
+    /// the tests).
+    #[cfg(test)]
+    pub(crate) fn set_walk_hook(&self, hook: Option<WalkHook>) {
+        *self.shared.walk_hook.lock() = hook;
+    }
+
+    /// The hook the walks call (for the tests).
+    #[cfg(test)]
+    pub(crate) fn walk_hook(&self) -> Option<WalkHook> {
+        self.shared.walk_hook.lock().clone()
     }
 
     /// The texture a present of IOSurface `iosurface_id` shows ([`Self::surface_present`]).
@@ -822,99 +1001,104 @@ impl<P: Platform> GraphicsDecoder<P> {
         &self,
         iosurface_id: u32,
     ) -> Option<(P::Texture, Vec<RgfxSurfaceWriter>, u32)> {
-        let obj_id = *self.surfaces.get(&iosurface_id)?.last()?;
-        let Some(ObjHandle::Texture(texture)) = self.objects.get(&obj_id) else {
-            return None;
+        let (obj_id, writers_at) = {
+            let names = self.shared.surfaces.lock();
+            let obj_id = *names.by_surface.get(&iosurface_id)?.last()?;
+            (obj_id, names.writers.get(&obj_id).copied())
         };
-        let writers = self
-            .surface_writers
-            .get(&obj_id)
-            .and_then(|&at| self.region.surface_writers(at))
+        let texture = self
+            .context_state(context_of(obj_id))?
+            .with_live(obj_id, |e| match &e.handle {
+                ObjHandle::Texture(texture) => Some(texture.clone_ref()),
+                _ => None,
+            })
+            .flatten()?;
+        let is_queue = |queue: u64| {
+            self.context_state(context_of(queue))
+                .and_then(|c| {
+                    c.with_live(queue, |e| matches!(e.handle, ObjHandle::CommandQueue(_)))
+                })
+                .unwrap_or(false)
+        };
+        let writers = writers_at
+            .and_then(|at| self.region.surface_writers(at))
             .map(|record| {
                 record
                     .writers
                     .into_iter()
-                    .filter(|w| {
-                        w.seqno != 0
-                            && matches!(
-                                self.objects.get(&w.queue_obj_id),
-                                Some(ObjHandle::CommandQueue(_))
-                            )
-                    })
+                    .filter(|w| w.seqno != 0 && is_queue(w.queue_obj_id))
                     .collect()
             })
             .unwrap_or_default();
-        let owner = (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
-        Some((texture.clone_ref(), writers, owner))
+        let owner = context_of(obj_id);
+        Some((texture, writers, owner))
     }
 
     /// Forgets texture `obj_id` as a name of the surfaces it lies over.
-    fn forget_surface_texture(&mut self, obj_id: u64) {
-        self.surfaces.retain(|_, textures| {
+    fn forget_surface_texture(&self, obj_id: u64) {
+        let mut names = self.shared.surfaces.lock();
+        names.by_surface.retain(|_, textures| {
             textures.retain(|t| *t != obj_id);
             !textures.is_empty()
         });
-        self.surface_writers.remove(&obj_id);
-        self.surface_places.remove(&obj_id);
+        names.writers.remove(&obj_id);
     }
 
-    /// Forgets the surface names of textures the table no longer holds: a caller
-    /// that drops objects other than by `OBJECT_DESTROY` (a context's whole id
-    /// range at its close) calls it, so a later object that takes a dropped id is
-    /// never taken for the surface's texture.
-    pub(crate) fn forget_dropped_surfaces(&mut self) {
-        let objects = &self.objects;
-        self.surface_writers
-            .retain(|t, _| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
-        self.surface_places
-            .retain(|t, _| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
-        self.surfaces.retain(|_, textures| {
-            textures.retain(|t| matches!(objects.get(t), Some(ObjHandle::Texture(_))));
+    /// Forgets the surface names of context `context`'s textures: at its close, so a later object
+    /// that takes a dropped id is never taken for the surface's texture.
+    fn forget_context_surfaces(&self, context: u32) {
+        let ours = |t: &u64| context_of(*t) == context;
+        let mut names = self.shared.surfaces.lock();
+        names.writers.retain(|t, _| !ours(t));
+        names.by_surface.retain(|_, textures| {
+            textures.retain(|t| !ours(t));
             !textures.is_empty()
         });
     }
 
     /// Drops every object of context `context`: those whose id lies in its range,
     /// `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's (its process closed
-    /// the device or died), and its chunks of the texture resource ids. How many objects were
-    /// dropped. Each object is let go of in a refusal scope of its own ([`drop_refused`]), so a
-    /// release the platform dies at is refused, logged, and the close goes on; the context's
-    /// failure ([`FailedContexts`]) is forgotten with it.
-    pub(crate) fn drop_context(&mut self, context: u32) -> usize {
-        for holder in self.id_chunks.iter_mut() {
+    /// the device or died), its chunks of the texture resource ids and its surfaces' names. How
+    /// many objects were dropped. Each object is let go of in a refusal scope of its own
+    /// ([`drop_refused`]), so a release the platform dies at is refused, logged, and the close goes
+    /// on, and the objects before their CPU copies; one a message's view still needs goes when
+    /// that message ends ([`tables`]). The context's failure ([`FailedContexts`]) is forgotten
+    /// with it.
+    pub(crate) fn drop_context(&self, context: u32) -> usize {
+        for holder in self.shared.id_chunks.lock().iter_mut() {
             if *holder == Some(context) {
                 *holder = None;
             }
         }
-        self.failed.forget(context);
-        let ours = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) == u64::from(context);
-        let objects: Vec<u64> = self.objects.keys().copied().filter(ours).collect();
-        for &id in &objects {
-            if let Some(handle) = self.objects.remove(&id) {
+        self.shared.failed.forget(context);
+        let mut dropped = 0;
+        if let Some(state) = self.context_state(context) {
+            let (removed, count) = state.remove_all();
+            dropped = count;
+            let mut copies = Vec::new();
+            for r in removed {
+                let id = r.id();
+                let entry = r.into_entry();
+                let Entry {
+                    managed, handle, ..
+                } = entry;
                 drop_refused(id, handle);
+                if let Some(copy) = managed {
+                    copies.push((id, copy));
+                }
             }
-        }
-        self.spans.retain(|id, _| !ours(id));
-        self.held_queues.retain(|id, _| !ours(id));
-        self.in_flight.retain(|id, _| !ours(id));
-        let managed: Vec<u64> = self.managed.keys().copied().filter(ours).collect();
-        for id in managed {
-            if let Some(copy) = self.managed.remove(&id) {
+            for (id, copy) in copies {
                 drop_refused(id, copy);
             }
         }
-        let libraries: Vec<u64> = (self.making_libraries.keys())
-            .chain(self.library_chunks.keys())
-            .chain(self.cached_libraries.keys())
-            .copied()
-            .filter(ours)
-            .collect();
+        self.forget_context_surfaces(context);
+        let libraries = self.shared.libraries.lock().ids_of(context);
         for id in libraries {
             if let Err(refusal) = refusals::refusing(|| self.forget_library(id)) {
                 refused_release(id, &refusal);
             }
         }
-        objects.len()
+        dropped
     }
 
     /// The device's reset (`reims_graphics::Host::device_reset`): every context's objects dropped
@@ -926,28 +1110,30 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// to no one). Each release is made in a refusal scope. The decoder then holds what one just
     /// made holds, so a texture's resource id and a sampler's are free for the guest's next use,
     /// as on a new device. The contexts dropped, in order, and how many objects went.
-    pub(crate) fn reset(&mut self) -> (Vec<u32>, usize) {
-        let context_of = |id: &u64| (id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
-        let mut contexts: Vec<u32> = (self.objects.keys())
-            .chain(self.managed.keys())
-            .chain(self.spans.keys())
-            .chain(self.making_libraries.keys())
-            .chain(self.library_chunks.keys())
-            .chain(self.cached_libraries.keys())
-            .chain(self.held_queues.keys())
-            .chain(self.in_flight.keys())
-            .map(context_of)
-            .chain(self.id_chunks.iter().flatten().copied())
-            .chain(self.drains.keys().copied())
-            .collect();
+    ///
+    /// It is made with no message of the guest's being carried out on the decoder, as the
+    /// device's reset waits for those that began before it (`GraphicsControl::reset`), so no
+    /// view of a table is open and every object goes here.
+    pub(crate) fn reset(&self) -> (Vec<u32>, usize) {
+        let shared = &self.shared;
+        let mut contexts: Vec<u32> = shared.contexts.lock().keys().copied().collect();
+        contexts.extend(shared.libraries.lock().contexts());
+        contexts.extend(shared.id_chunks.lock().iter().flatten().copied());
         contexts.sort_unstable();
         contexts.dedup();
         let dropped = contexts.iter().map(|&c| self.drop_context(c)).sum();
-        self.forget_dropped_surfaces();
-        self.drains.clear();
-        self.failed.forget_all();
-        let cache = std::mem::replace(&mut self.library_cache, LibraryCache::new(RELEASED_BUDGET));
-        self.resets += 1;
+        *shared.surfaces.lock() = SurfaceNames::default();
+        // Their drains go with them: the answers waiting on those are owed to no one.
+        let states = std::mem::take(&mut *shared.contexts.lock());
+        if let Err(refusal) = refusals::refusing(move || drop(states)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the contexts' tables were let go of at the device's reset, and a release was \
+                 refused: {refusal}"
+            );
+        }
+        shared.failed.forget_all();
+        let cache = shared.libraries.lock().take_cache();
         if let Err(refusal) = refusals::refusing(move || drop(cache)) {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -955,9 +1141,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                  refused: {refusal}"
             );
         }
-        self.surface_views.reset();
+        shared.surface_views.lock().reset();
         self.surface_caches.reset();
-        debug_assert!(self.objects.is_empty() && self.surfaces.is_empty());
         (contexts, dropped)
     }
 
@@ -968,7 +1153,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             return false;
         }
         let context = obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT;
-        self.id_chunks
+        self.shared
+            .id_chunks
+            .lock()
             .get(((id - 1) / RGFX_RESOURCE_ID_CHUNK) as usize)
             .copied()
             .flatten()
@@ -979,12 +1166,26 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `RESOURCE_ID_CHUNK` does.
     #[cfg(test)]
     pub(crate) fn hold_resource_ids(&mut self, context: u32, chunk: u32) {
-        self.id_chunks[chunk as usize] = Some(context);
+        self.shared.id_chunks.lock()[chunk as usize] = Some(context);
+    }
+
+    /// A `SAMPLER_CREATE`'s answer ([`sampler_answer`]), the sampler stored under the message's id
+    /// before it is answered, so a command buffer of its process, which names it only after the
+    /// answer, finds it. Its make holds no lock of the decoder's.
+    pub(crate) fn sampler_state(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Option<RgfxSamplerState>> {
+        let failed = self.context_failed();
+        sampler_answer::<P>(device, message, failed, |obj_id, sampler| {
+            self.store(obj_id, Entry::of(ObjHandle::Sampler(sampler)));
+        })
     }
 
     /// The sampler of a `SAMPLER_CREATE`, stored under its id.
     fn make_sampler(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
@@ -1058,6 +1259,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
+        // A new message: what the last named is let go of.
+        self.end_message();
         let Some(header) = read::<RgfxMsgHeader>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -1077,19 +1280,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if let Err(refusal) = refusals::refusing(|| self.forget_library(m.obj_id)) {
                     refused_release(m.obj_id, &refusal);
                 }
-                self.spans.remove(&m.obj_id);
-                self.held_queues.remove(&m.obj_id);
-                self.in_flight.remove(&m.obj_id);
-                if let Some(copy) = self.managed.remove(&m.obj_id) {
-                    drop_refused(m.obj_id, copy);
-                }
-                if let Some(handle) = self.objects.remove(&m.obj_id) {
-                    let texture = matches!(handle, ObjHandle::Texture(_));
-                    drop_refused(m.obj_id, handle);
-                    if texture {
-                        self.forget_surface_texture(m.obj_id);
-                    }
-                }
+                self.remove(m.obj_id);
                 Ok(Ok(()))
             }
             RGFX_CMD_RESOURCE_ID_CHUNK => {
@@ -1098,7 +1289,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 // The kext's grant: the context holds the chunk until its close. A
                 // chunk past the pool is not one.
-                let Some(holder) = self.id_chunks.get_mut(m.chunk as usize) else {
+                let mut chunks = self.shared.id_chunks.lock();
+                let Some(holder) = chunks.get_mut(m.chunk as usize) else {
                     return Ok(Err(DecodeError::BadResourceId));
                 };
                 *holder = Some(m.context);
@@ -1156,7 +1348,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // with the ring loop in a later increment; here the queue handle
                 // is made so later command buffers can name it.
                 match device.new_command_queue() {
-                    Some(queue) => self.insert(m.obj_id, ObjHandle::CommandQueue(queue)),
+                    Some(queue) => {
+                        let mut entry = Entry::of(ObjHandle::CommandQueue(queue));
+                        entry.queue = Some(QueueCounts::default());
+                        self.store(m.obj_id, entry);
+                        Ok(Ok(()))
+                    }
                     None => Ok(Err(DecodeError::Refused)),
                 }
             }
@@ -1235,9 +1432,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             }
             RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => self.buffer_over_surface_pages(device, message),
-            RGFX_CMD_BUFFER_DID_MODIFY_RANGE => self.did_modify_range(message),
+            RGFX_CMD_BUFFER_DID_MODIFY_RANGE => {
+                self.after_submitted();
+                self.did_modify_range(message)
+            }
             RGFX_CMD_MANAGED_TEXTURE_CREATE => self.managed_texture(device, message),
-            RGFX_CMD_TEXTURE_REPLACE_REGION => self.replace_region(message),
+            RGFX_CMD_TEXTURE_REPLACE_REGION => {
+                self.after_submitted();
+                self.replace_region(message)
+            }
             RGFX_CMD_TEXTURE_VIEW => self.texture_view(message),
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
@@ -1474,7 +1677,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // Over a device cache, a Private buffer, the texture is Private too, as Metal
                 // makes a texture over a buffer in the buffer's storage mode; the guest's own
                 // texture keeps the mode it asked (`surface_cache`).
-                if span.is_some_and(|(at, _)| self.surface_caches.has(at)) {
+                if span.is_some_and(|(at, _)| self.surface_caches.lock().has(at)) {
                     desc.resource_options = Some(
                         desc.resource_options.unwrap_or(0) & !surface_cache::STORAGE_MASK
                             | surface_cache::STORAGE_PRIVATE,
@@ -1525,26 +1728,27 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Some(texture) => {
                         // An id made again names only its new texture's surface.
                         self.forget_surface_texture(m.obj_id);
-                        self.surface_places.insert(
-                            m.obj_id,
-                            video::PlanePlace {
-                                buffer_obj_id: m.buffer_obj_id,
-                                offset: m.offset,
-                                bytes_per_row: m.bytes_per_row,
-                                width: u64::from(m.desc.width),
-                                height: u64::from(m.desc.height),
-                            },
-                        );
+                        let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
+                        entry.place = Some(video::PlanePlace {
+                            buffer_obj_id: m.buffer_obj_id,
+                            offset: m.offset,
+                            bytes_per_row: m.bytes_per_row,
+                            width: u64::from(m.desc.width),
+                            height: u64::from(m.desc.height),
+                        });
+                        self.store(m.obj_id, entry);
                         if m.plane == 0 {
-                            self.surfaces
+                            let mut names = self.shared.surfaces.lock();
+                            names
+                                .by_surface
                                 .entry(m.iosurface_id)
                                 .or_default()
                                 .push(m.obj_id);
                             if let Some(at) = writers {
-                                self.surface_writers.insert(m.obj_id, at);
+                                names.writers.insert(m.obj_id, at);
                             }
                         }
-                        self.insert_over(m.obj_id, ObjHandle::Texture(texture), span)
+                        Ok(Ok(()))
                     }
                     None => Ok(Err(DecodeError::Refused)),
                 }
@@ -1554,7 +1758,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     return Ok(Err(DecodeError::Malformed));
                 };
                 let Some(session) =
-                    (self.video.as_ref()).and_then(|video| video.session(m.codec, m.direction))
+                    (self.shared.video.get()).and_then(|video| video.session(m.codec, m.direction))
                 else {
                     log::warn!(
                         target: "reims_vgpu::graphics",
@@ -1577,74 +1781,149 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The current context's drain, which a command buffer of it holds until its completion
-    /// handler has run.
-    pub(crate) fn command_buffer_drain(&mut self) -> Option<Arc<Drain>> {
-        (self.context).map(|context| Arc::clone(self.drains.entry(context).or_default()))
+    /// handler has run. It is taken once a message, before the message's view of the context's
+    /// table, so a drain begun after that view was taken waits for the buffer
+    /// ([`Self::drain_context`]); a stand-in for the buffer holds the same. `None` with no
+    /// context, or where only tried and a lock is busy.
+    pub(crate) fn command_buffer_drain(&self) -> Option<Arc<Drain>> {
+        if let Some(drain) = self.drain.borrow().as_ref() {
+            return Some(Arc::clone(drain));
+        }
+        let context = self.context?;
+        let drain = if self.try_only {
+            let state = self.context_state(context)?;
+            Arc::clone(&*state.drain.try_lock()?)
+        } else {
+            let state = self.context_made(context);
+            Arc::clone(&*state.drain.lock())
+        };
+        *self.drain.borrow_mut() = Some(Arc::clone(&drain));
+        Some(drain)
+    }
+
+    /// Waits until each command buffer of the current context answered `CB_SUBMITTED` at its take
+    /// before now is committed ([`sequencer`]): for a range message of a `Managed` object, which
+    /// reaches the platform's next submission.
+    fn after_submitted(&self) {
+        if let Some(context) = self.context {
+            let sequencer = &self.shared.sequencer;
+            sequencer.wait_for_context(context, sequencer.mark());
+        }
     }
 
     /// Inserts a new object's handle under its guest-picked id.
-    fn insert(
-        &mut self,
-        obj_id: u64,
-        handle: ObjHandle<P>,
-    ) -> RaiseResult<Result<(), DecodeError>> {
+    fn insert(&self, obj_id: u64, handle: ObjHandle<P>) -> RaiseResult<Result<(), DecodeError>> {
         self.insert_over(obj_id, handle, None)
     }
 
-    /// Inserts a new object's handle under its guest-picked id, with the region span it lies over
-    /// (`spans`), where it lies over one.
+    /// Inserts a new object's handle under its guest-picked id, with the region span it lies over,
+    /// where it lies over one.
     fn insert_over(
-        &mut self,
+        &self,
         obj_id: u64,
         handle: ObjHandle<P>,
         span: Option<(u64, u64)>,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        self.store(obj_id, handle);
-        if let Some(span) = span {
-            self.spans.insert(obj_id, span);
-        }
+        self.store(obj_id, Entry::of(handle).over(span));
         Ok(Ok(()))
     }
 
-    /// Stores `handle` under `obj_id`, in place of what the id named.
-    fn store(&mut self, obj_id: u64, handle: ObjHandle<P>) {
+    /// Stores `entry` under `obj_id`, in place of what the id named.
+    fn store(&self, obj_id: u64, entry: Entry<P>) {
         self.forget_library(obj_id);
-        self.spans.remove(&obj_id);
-        self.managed.remove(&obj_id);
-        self.objects.insert(obj_id, handle);
+        self.put(obj_id, entry);
     }
 
-    /// The region span `obj_id`'s object lies over (`spans`), where it is one the current
-    /// context may name and lies over one.
+    /// Stores `entry` under `obj_id` in its context's table, in place of what the id named, which
+    /// is let go of where no view needs it; the message sees it from now on.
+    fn put(&self, obj_id: u64, entry: Entry<P>) {
+        let context = self.context_made(context_of(obj_id));
+        let (at, replaced) = context.insert(obj_id, entry);
+        self.saw(&context, obj_id, Some(at));
+        // As a store over a live id let go of what it named.
+        drop(replaced.map(tables::Removed::into_entry));
+    }
+
+    /// [`Self::store`], where `live` answers, under the table's lock, that the object is still
+    /// to be stored.
+    fn store_if(&self, obj_id: u64, entry: Entry<P>, live: impl FnOnce() -> bool) {
+        let context = self.context_made(context_of(obj_id));
+        if let Some((at, replaced)) = context.insert_if(obj_id, entry, live) {
+            self.saw(&context, obj_id, Some(at));
+            drop(replaced.map(tables::Removed::into_entry));
+        }
+    }
+
+    /// The message's own change of `obj_id` in `context`'s table: made at `at`, or removed.
+    fn saw(&self, context: &Arc<Context<P>>, obj_id: u64, at: Option<std::ptr::NonNull<Entry<P>>>) {
+        for view in self.views.borrow().iter() {
+            if Arc::ptr_eq(view.context(), context) {
+                match at {
+                    Some(at) => view.made(obj_id, at),
+                    None => view.removed(obj_id),
+                }
+            }
+        }
+    }
+
+    /// Removes what `obj_id` names (an `OBJECT_DESTROY`): its CPU copy and then its object are let
+    /// go of, each in a refusal scope ([`drop_refused`]), at once, or where a view taken before
+    /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten.
+    fn remove(&self, obj_id: u64) {
+        let Some(context) = self.context_state(context_of(obj_id)) else {
+            return;
+        };
+        self.saw(&context, obj_id, None);
+        let Some((texture, removed)) = context.remove(obj_id) else {
+            return;
+        };
+        if let Some(removed) = removed {
+            let Entry {
+                managed, handle, ..
+            } = removed.into_entry();
+            if let Some(copy) = managed {
+                drop_refused(obj_id, copy);
+            }
+            drop_refused(obj_id, handle);
+        }
+        if texture {
+            self.forget_surface_texture(obj_id);
+        }
+    }
+
+    /// The region span `obj_id`'s object lies over, where it is one the current context may name
+    /// and lies over one.
     fn span_of(&self, obj_id: u64) -> Option<(u64, u64)> {
-        self.named(obj_id)
-            .and_then(|_| self.spans.get(&obj_id).copied())
+        self.entry(obj_id).and_then(|e| e.span)
     }
 
     /// Whether an object the decoder holds lies in the `size` bytes at region offset `offset`:
     /// the block they make is not to be given out again while it does.
     pub(crate) fn span_in_use(&self, offset: u64, size: u64) -> bool {
-        let end = offset.saturating_add(size);
-        self.spans
-            .values()
-            .any(|&(at, length)| at < end && offset < at.saturating_add(length))
+        let contexts: Vec<Arc<Context<P>>> =
+            self.shared.contexts.lock().values().cloned().collect();
+        contexts.iter().any(|c| c.span_in(offset, size))
     }
 
     /// Begins a drain of `context`'s command buffers: `answer` is given once every one the decoder
-    /// has committed for the context has finished its completion handler, and not later ones. The
+    /// has begun for the context has finished its completion handler, and not later ones. The
     /// drain is returned for the caller to drop with no lock held: the answer goes then where no
     /// buffer is in flight, else on the GPU thread of the last to finish. `closed` ends the
-    /// context's drains (its `CONTEXT_CLOSE`); else a new one begins for its later buffers.
+    /// context's drains and its state (its `CONTEXT_CLOSE`); else a new one begins for its later
+    /// buffers.
     pub(crate) fn drain_context(
-        &mut self,
+        &self,
         context: u32,
         closed: bool,
         answer: DrainAnswer,
     ) -> Arc<Drain> {
         let drain = if closed {
-            self.drains.remove(&context)
+            let state = self.shared.contexts.lock().remove(&context);
+            state.map(|state| std::mem::take(&mut *state.drain.lock()))
         } else {
-            self.drains.insert(context, Arc::default())
+            let state = self.context_made(context);
+            let drain = std::mem::take(&mut *state.drain.lock());
+            Some(drain)
         }
         .unwrap_or_default();
         drain.answers.lock().push(answer);
@@ -1663,7 +1942,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         let job = match self.prepare_pipeline(message) {
             Ok(job) => job,
             Err(e) => {
-                if let (Some(sink), Some(refused)) = (&self.reflection_sink, refused_reply(message))
+                if let (Some(sink), Some(refused)) =
+                    (&self.sinks.reflection, refused_reply(message))
                 {
                     sink(refused);
                 }
@@ -1672,7 +1952,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let compiled = compile_refusing::<P>(device, job);
         let refused = compiled.is_refused();
-        if let Some(sink) = self.reflection_sink.clone() {
+        if let Some(sink) = self.sinks.reflection.clone() {
             sink(compiled.reflection);
         }
         self.finish_pipeline(compiled);
@@ -1845,10 +2125,20 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The last step of a pipeline create: stores the compiled pipeline under its id (a refused
     /// one stores nothing).
-    pub(crate) fn finish_pipeline(&mut self, compiled: CompiledPipeline<P>) {
+    pub(crate) fn finish_pipeline(&self, compiled: CompiledPipeline<P>) {
+        self.finish_pipeline_if(compiled, || true);
+    }
+
+    /// [`Self::finish_pipeline`], where `live` answers, under the lock of the table the pipeline
+    /// goes in, that no destroy or close cancelled it: a destroy cancels the compile before it
+    /// removes what the id names, so the pipeline is never stored after its destroy.
+    pub(crate) fn finish_pipeline_if(
+        &self,
+        compiled: CompiledPipeline<P>,
+        live: impl FnOnce() -> bool,
+    ) {
         if let Some(handle) = compiled.handle {
-            self.spans.remove(&compiled.obj_id);
-            self.objects.insert(compiled.obj_id, handle);
+            self.store_if(compiled.obj_id, Entry::of(handle), live);
         }
     }
 }
@@ -3194,8 +3484,7 @@ mod tests {
     }
 
     /// A sampler create is answered with the sampler's `gpuResourceID`, the id the platform
-    /// numbers it by, at the create's seqno, and the sampler is stored under its id at the
-    /// decoder's next store of what was made with no lock held, in the order made; a create the
+    /// numbers it by, at the create's seqno, the sampler stored under its id first; a create the
     /// platform makes nothing of is refused with 0 and stores nothing, one of a failed context is
     /// refused with 0, and a short one is an invalid argument.
     #[test]
@@ -3204,7 +3493,6 @@ mod tests {
         let device = p.device();
         let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
-        let made = dec.made_objects();
         let create = |obj_id, seqno| RgfxSamplerCreate {
             header: RgfxMsgHeader {
                 r#type: RGFX_CMD_SAMPLER_CREATE,
@@ -3217,38 +3505,36 @@ mod tests {
             lod_max_clamp_bits: f32::MAX.to_bits(),
             ..RgfxSamplerCreate::default()
         };
-        let first = made
-            .sampler_state(&device, false, create(21, 4).as_bytes())
+        let first = dec
+            .sampler_state(&device, create(21, 4).as_bytes())
             .unwrap()
             .unwrap();
         assert_eq!(first.header.r#type, RGFX_EVT_SAMPLER_STATE);
         assert_eq!(first.header.size as usize, size_of::<RgfxSamplerState>());
         assert_eq!((first.header.seqno, first.status), (4, RGFX_STATUS_OK));
         assert_ne!(first.gpu_resource_id, 0);
-        assert!(dec.named(21).is_none());
-        let second = made
-            .sampler_state(&device, false, create(22, 5).as_bytes())
+        assert!(dec.named(21).is_some(), "stored before its answer");
+        let second = dec
+            .sampler_state(&device, create(22, 5).as_bytes())
             .unwrap()
             .unwrap();
         assert_eq!(second.status, RGFX_STATUS_OK);
         assert_ne!(second.gpu_resource_id, first.gpu_resource_id);
-        dec.store_made();
         assert!(dec.named(21).is_some() && dec.named(22).is_some());
-        // A store of the same id later in the queue takes its place, as a create under the lock
-        // would.
-        let third = made
-            .sampler_state(&device, false, create(21, 8).as_bytes())
+        // A create of the same id takes its place.
+        dec.end_message();
+        let third = dec
+            .sampler_state(&device, create(21, 8).as_bytes())
             .unwrap()
             .unwrap();
-        dec.store_made();
         let Some(ObjHandle::Sampler(stored)) = dec.named(21) else {
             panic!("no sampler under 21");
         };
         assert_eq!(stored.gpu_resource_id(), third.gpu_resource_id);
 
         p.script().push("newSamplerStateWithDescriptor:", Step::Nil);
-        let refused = made
-            .sampler_state(&device, false, create(23, 6).as_bytes())
+        let refused = dec
+            .sampler_state(&device, create(23, 6).as_bytes())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3259,28 +3545,28 @@ mod tests {
             ),
             (6, RGFX_STATUS_REFUSED, 0)
         );
-        let failed = made
-            .sampler_state(&device, true, create(25, 9).as_bytes())
+        assert!(dec.named(23).is_none());
+        let short = create(24, 7);
+        let short = &short.as_bytes()[..size_of::<RgfxMsgHeader>() + 8];
+        let invalid = dec.sampler_state(&device, short).unwrap().unwrap();
+        assert_eq!(
+            (invalid.header.seqno, invalid.status),
+            (7, RGFX_STATUS_INVALID_ARGUMENT)
+        );
+        assert!(dec.sampler_state(&device, &[0u8; 8]).unwrap().is_none());
+        // A failed context's create is refused, and stores nothing.
+        dec.set_context(Some(0));
+        let contexts = dec.failed_contexts();
+        assert!(contexts.fail(0, contexts.resets()));
+        let failed = dec
+            .sampler_state(&device, create(25, 9).as_bytes())
             .unwrap()
             .unwrap();
         assert_eq!(
             (failed.header.seqno, failed.status, failed.gpu_resource_id),
             (9, RGFX_STATUS_REFUSED, 0)
         );
-        dec.store_made();
-        assert!(dec.named(23).is_none() && dec.named(25).is_none());
-        let short = create(24, 7);
-        let short = &short.as_bytes()[..size_of::<RgfxMsgHeader>() + 8];
-        let invalid = made.sampler_state(&device, false, short).unwrap().unwrap();
-        assert_eq!(
-            (invalid.header.seqno, invalid.status),
-            (7, RGFX_STATUS_INVALID_ARGUMENT)
-        );
-        assert!(
-            made.sampler_state(&device, false, &[0u8; 8])
-                .unwrap()
-                .is_none()
-        );
+        assert!(dec.named(25).is_none());
     }
 
     /// A heap texture size query is answered at its seqno with the device's size and alignment
@@ -4000,7 +4286,7 @@ mod tests {
                 };
                 assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
             }
-            dec.objects.keys().copied().collect::<Vec<u64>>()
+            dec.object_ids()
         };
         let first = order();
         assert_eq!(first.len(), 64);
@@ -5621,7 +5907,7 @@ mod tests {
                 .lock()
                 .pop()
                 .map(|(id, status)| (id == obj_id, status));
-            let Some(ObjHandle::ComputePipeline(pipeline)) = dec.objects.get(&obj_id) else {
+            let Some(ObjHandle::ComputePipeline(pipeline)) = dec.object(obj_id) else {
                 assert_eq!(status, Some((true, RGFX_PIPELINE_REFUSED)), "{list:?}");
                 made.push(None);
                 continue;
@@ -5872,7 +6158,7 @@ mod tests {
             ..RgfxBufferCreate::default()
         };
         assert_eq!(dec.decode(device, create.as_bytes()).unwrap(), Ok(()));
-        let Some(ObjHandle::Buffer(b)) = dec.objects.get(&context_obj(n)) else {
+        let Some(ObjHandle::Buffer(b)) = dec.object(context_obj(n)) else {
             panic!("no buffer {n}");
         };
         // SAFETY: a Shared buffer of at least `bytes.len()` bytes, which no command uses yet.
@@ -5990,7 +6276,7 @@ mod tests {
         let (mut dec, device) = surface_decoder::<P>();
         buffer_holding(&mut dec, &device, 10, &pin_bytes());
         let answer = |dec: &GraphicsDecoder<P>, n: u64| {
-            let Some(ObjHandle::Texture(t)) = dec.objects.get(&context_obj(n)) else {
+            let Some(ObjHandle::Texture(t)) = dec.object(context_obj(n)) else {
                 panic!("no texture {n}");
             };
             texture_answer::<P>(&device, t, PIN_SIZE)
@@ -6123,7 +6409,7 @@ mod tests {
             Err(DecodeError::Refused) => return None,
             Err(e) => panic!("{e:?}"),
         }
-        let Some(ObjHandle::Texture(t)) = dec.objects.get(&context_obj(11)) else {
+        let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
             panic!("no texture");
         };
         let sampler = linear_sampler::<P>(&device);

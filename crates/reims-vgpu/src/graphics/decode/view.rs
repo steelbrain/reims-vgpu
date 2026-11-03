@@ -27,7 +27,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `TEXTURE_VIEW`: the platform's view of the named texture (module doc). Malformed for flags
     /// the wire does not define, or a swizzle without its type, levels and slices; a bad reference
     /// for a parent that is no texture the sender holds; a bad resource id as for any texture.
-    pub(super) fn texture_view(&mut self, message: &[u8]) -> RaiseResult<Result<(), DecodeError>> {
+    pub(super) fn texture_view(&self, message: &[u8]) -> RaiseResult<Result<(), DecodeError>> {
         let Some(m) = read::<RgfxTextureView>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };

@@ -335,7 +335,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
     /// buffer over host memory lies over its block. A block the sender does not hold is a guest
     /// protocol error; one with no view, or a length past it, is refused.
     pub(super) fn buffer_over_surface_pages(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), super::DecodeError>> {
@@ -345,13 +345,13 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         if !self.in_own_block(m.block_offset, m.block_size) {
             return Ok(Err(super::DecodeError::BadReference));
         }
-        let Some(view) = self.surface_views.view_for(&m) else {
+        let Some(view) = self.shared.surface_views.lock().view_for(&m) else {
             return Ok(Err(super::DecodeError::Refused));
         };
         // A block with a device cache: the buffer is the cache, over the surface's bytes in the
         // pages' layout (`surface_cache`).
-        if let Some(cache) = self.surface_caches.buffer(m.block_offset) {
-            let cache = cache.clone_ref();
+        let cache = (self.surface_caches.lock().buffer(m.block_offset)).map(|c| c.clone_ref());
+        if let Some(cache) = cache {
             return self.insert_over(
                 m.obj_id,
                 super::ObjHandle::Buffer(cache),
@@ -491,7 +491,7 @@ pub(super) mod tests {
 
         /// The view the block at `block` has.
         fn view(&self, block: u64) -> Arc<SurfaceView<FakePlatform>> {
-            Arc::clone(&self.dec.surface_views.by_block[&block].0)
+            Arc::clone(&self.dec.views_of_surfaces().by_block[&block].0)
         }
     }
 
@@ -572,7 +572,7 @@ pub(super) mod tests {
             "no mapping or buffer made"
         );
         assert!(Arc::ptr_eq(&first, &r.view(BLOCK + 0x8000)));
-        assert_eq!(r.dec.surface_views.counts().reused, 1);
+        assert_eq!(r.dec.views_of_surfaces().counts().reused, 1);
         // The same pages in another order are another view.
         assert_eq!(r.pages(BLOCK, &[(0, 1), (3, 1)], 2 * page), RGFX_STATUS_OK);
         assert!(!Arc::ptr_eq(&first, &r.view(BLOCK)));
@@ -580,7 +580,7 @@ pub(super) mod tests {
         for i in 0..CACHED_VIEWS as u64 {
             assert_eq!(r.pages(BLOCK, &[(10 + i, 1)], page), RGFX_STATUS_OK);
         }
-        assert_eq!(r.dec.surface_views.len().1, CACHED_VIEWS);
+        assert_eq!(r.dec.views_of_surfaces().len().1, CACHED_VIEWS);
         r.dec
             .block_released(&r.device, BLOCK + 0x8000, false, Box::new(|| ()))
             .unwrap();
@@ -617,7 +617,7 @@ pub(super) mod tests {
             r.dec.surface_pages(&r.device, &m, &runs, false),
             RGFX_STATUS_REFUSED
         );
-        let c = r.dec.surface_views.counts();
+        let c = r.dec.views_of_surfaces().counts();
         assert_eq!((c.made, c.bad_runs, c.not_mapped), (0, 3, 1));
         assert_eq!(r.buffer(10, BLOCK, page), Err(DecodeError::Refused));
         // A good one after them has its view.

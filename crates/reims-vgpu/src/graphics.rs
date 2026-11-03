@@ -28,7 +28,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::{ArcMutexGuard, RawMutex};
+use parking_lot::RwLock;
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
@@ -58,7 +58,7 @@ use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::Texture;
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
+use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -70,8 +70,8 @@ use crate::error::Error;
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::{
-    CompletionSink, DecodeError, FailedContexts, GraphicsDecoder, LibraryJob, LibraryStart,
-    MadeLibrary, MadeObjects, PipelineJob, ReflectionSink, ScheduledSink, SignalSink,
+    CompletionSink, DecodeError, Decoders, FailedContexts, GraphicsDecoder, LibraryJob,
+    LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, Sinks,
     SubmittedSink, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
@@ -111,12 +111,11 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// that a function of the device's waits for, directly or through a thread of the library's, so
 /// they may call it at once. `scanout_written` runs with no lock of the library's held.
 /// `raise_interrupt` may run under these: a command queue's claim on its next message, on the
-/// queue's service thread; the decoder's lock, at a command buffer's `CB_SUBMITTED` posted as the
-/// buffer is taken (on its queue's service thread, or inside `mmio_write_taking`), and, with the
-/// download's answer slot, at a `SURFACE_DOWNLOAD` answered at once; a command buffer's
-/// `CB_SUBMITTED` latch, wherever that is posted; and the presents' queue, at a present answered
-/// at once with no window. No function of the device takes any of them, and `mmio_write_taking`
-/// only tries the claim and the decoder's lock.
+/// queue's service thread; the device caches' lock, with the download's answer slot, at a
+/// `SURFACE_DOWNLOAD` answered at once; a command buffer's `CB_SUBMITTED` latch, wherever that is
+/// posted; and the presents' queue, at a present answered at once with no window. No function of
+/// the device takes any of them, and `mmio_write_taking` only tries the claim and the decoder's
+/// locks.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
@@ -250,13 +249,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let presented = Arc::new(Presented::default());
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),
-                made: decoder.made_objects(),
-                decoder: LockedDecoder(Arc::new(Mutex::new(decoder))),
+                decoders: decoder.decoders(),
                 device: gpu_device,
                 presents: Arc::new(PresentQueue::new(Arc::clone(&presented))),
                 presented,
                 pool,
                 pending: Pending::default(),
+                reset_gate: Arc::default(),
             });
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
@@ -292,7 +291,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// The objects the stage-3 decoder holds: the tests check a create reached it.
     #[cfg(any(test, feature = "testkit"))]
     pub fn decoder_object_count(&self) -> usize {
-        self.control.decoder.lock().object_count()
+        self.control
+            .decoders
+            .sender(None, Sinks::default())
+            .object_count()
     }
 
     /// How many command queues have a per-queue ring and service thread: the tests check a
@@ -349,14 +351,15 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
 
 /// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`], which
 /// feeds it ring 0's object lifecycle on the control thread and the command queues' own rings'
-/// messages on their service threads. The decoder is behind a [`Mutex`]: a message is decoded
-/// whole under it, but for a sampler create, whose sampler is made with none of it held and
-/// stored at its next lock ([`MadeObjects`]), and a command buffer's completion, which runs on a
-/// GPU thread of its own, never touches the decoder — it only posts through the queue's poster.
+/// messages on their service threads. Each message is carried out on a decoder of its own over the
+/// shared state ([`Decoders::sender`]), whose locks are each held for a short section
+/// (`decode`'s module doc): no thread holds one across a command buffer's walk, so a walk holds up
+/// neither ring 0 nor another queue. A command buffer's completion, which runs on a GPU thread of
+/// its own, never touches the decoder: it only posts through the queue's poster.
 struct GraphicsControl<P: ApiPlatform> {
-    /// The decoder, whose lock a doorbell's thread's take carries to the queue's service thread
-    /// ([`Self::take_command_buffer`]).
-    decoder: LockedDecoder<P>,
+    /// The decoder's state, which each message's decoder is made over; a doorbell's thread's take
+    /// carries its decoder to the queue's service thread ([`Self::take_command_buffer`]).
+    decoders: Decoders<P>,
     /// The GPU device it drives.
     device: P::Device,
     /// The surface the display pipe shows, shared with the window's sink.
@@ -368,52 +371,16 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
     /// The decoder's failed contexts, which the device asks of at a `QUEUE_CREATE`
-    /// (`Host::context_refused`) and a sampler create with no lock of the decoder's taken.
+    /// (`Host::context_refused`).
     failed: Arc<FailedContexts>,
-    /// The objects made with no lock of the decoder's held, which it stores at its next lock.
-    made: Arc<MadeObjects<P>>,
-}
-
-/// The decoder behind its [`Mutex`]. Each lock first stores the objects made with none of it
-/// held ([`GraphicsDecoder::store_made`]), so what is carried out under it finds every object
-/// ring 0 made before it.
-struct LockedDecoder<P: Platform>(Arc<Mutex<GraphicsDecoder<P>>>);
-
-impl<P: Platform> LockedDecoder<P> {
-    /// The decoder, locked, its made objects stored.
-    fn lock(&self) -> MutexGuard<'_, GraphicsDecoder<P>> {
-        let mut decoder = self.0.lock();
-        decoder.store_made();
-        decoder
-    }
-
-    /// The decoder, locked where it is free, its made objects stored: the guard holds a clone of
-    /// the lock's [`Arc`], so it may be carried to another thread.
-    fn try_lock_arc(&self) -> Option<ArcMutexGuard<RawMutex, GraphicsDecoder<P>>> {
-        let mut decoder = Mutex::try_lock_arc(&self.0)?;
-        decoder.store_made();
-        Some(decoder)
-    }
-}
-
-/// The sinks of a ring's messages ([`GraphicsControl::sinks`]), which the decoder posts through.
-struct Sinks {
-    completion: CompletionSink,
-    signal: SignalSink,
-    scheduled: ScheduledSink,
-    submitted: SubmittedSink,
-    reflection: ReflectionSink,
-}
-
-impl Sinks {
-    /// Points `decoder`'s sinks at these.
-    fn point<P: Platform>(self, decoder: &mut GraphicsDecoder<P>) {
-        decoder.set_completion_sink(self.completion);
-        decoder.set_signal_sink(self.signal);
-        decoder.set_scheduled_sink(self.scheduled);
-        decoder.set_submitted_sink(self.submitted);
-        decoder.set_reflection_sink(self.reflection);
-    }
+    /// What the device's reset waits for ([`Self::reset`]): held shared by each message carried
+    /// out off the control thread, a queue's command buffer, create or destroy, from before it
+    /// asks whether its poster is stale to its end, and by each compile's and library make's
+    /// store; held alone by the reset. So a reset comes after everything of the guest's that
+    /// began before it, as under one lock over the decoder, and whatever begins after it finds
+    /// its poster stale (or its compile cancelled), and none of it outlives the reset. The control
+    /// thread's own messages are carried out in order with the reset, on its thread.
+    reset_gate: Arc<RwLock<()>>,
 }
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
@@ -577,10 +544,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
         entry::run(|_| {
             let (dropped, drain) = {
-                let mut decoder = self.decoder.lock();
-                let dropped = decoder.drop_context(context);
-                decoder.forget_dropped_surfaces();
+                let decoder = self.decoder();
+                // Its compiles first, so none stores a pipeline in the table its close empties.
                 self.pending.cancel_context(context);
+                let dropped = decoder.drop_context(context);
                 self.pool.context_closed(context);
                 self.presents.context_gone(context);
                 let drain = decoder.drain_context(
@@ -607,9 +574,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn reset(&self) {
         entry::run(|_| {
             let (contexts, dropped) = {
-                let mut decoder = self.decoder.lock();
+                // After everything of the guest's that began before the reset has ended.
+                let _alone = self.reset_gate.write();
                 self.pending.reset();
-                let (contexts, dropped) = decoder.reset();
+                let (contexts, dropped) = self.decoder().reset();
                 for &context in &contexts {
                     self.pool.context_closed(context);
                 }
@@ -629,7 +597,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// holds lies in the block, else answered once every command buffer of the block's context
     /// the decoder committed has finished.
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
-        let mut decoder = self.decoder.lock();
+        let decoder = self.decoder();
         if decoder.span_in_use(release.offset, release.size) {
             drop(decoder);
             log::warn!(
@@ -677,7 +645,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let answer = Arc::new(Mutex::new(Some(answer)));
         let give = Arc::clone(&answer);
         let done = entry::run(|_| {
-            self.decoder.lock().surface_download(
+            self.decoder().surface_download(
                 &self.device,
                 block,
                 Box::new(move || {
@@ -748,14 +716,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         entry::run(|_| {
             let sinks = self.sinks(poster);
             let outcome = {
-                let mut decoder = self.decoder.lock();
+                let _carried = self.reset_gate.read();
                 // Of a queue the device's reset ended, which the decoder's reset dropped, or is to
-                // drop under this lock: nothing of it is carried out, and nothing is owed.
+                // drop: nothing of it is carried out, and nothing is owed.
                 if poster.stale() {
                     return;
                 }
-                sinks.point(&mut decoder);
-                decoder.set_context(Some(sender_context(poster, message)));
+                let mut decoder =
+                    (self.decoders).sender(Some(sender_context(poster, message)), sinks);
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
                     let (_, _, obj_id) = message_identity(message);
                     self.pending.cancel(obj_id);
@@ -790,6 +758,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
     }
 
+    /// A decoder over the shared state for what is no context's message, posting nothing.
+    fn decoder(&self) -> GraphicsDecoder<P> {
+        self.decoders.sender(None, Sinks::default())
+    }
+
     /// The sinks of the ring `poster` posts onto, for a message from it ([`Self::handle_stage3`]):
     /// a buffer's completion, with the present waiting for it, its shared events' values, its
     /// `CB_SCHEDULED` and `CB_SUBMITTED`, and a pipeline's reflection.
@@ -821,11 +794,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             reflection_poster.post(record.as_bytes());
         });
         Sinks {
-            completion,
-            signal,
-            scheduled,
-            submitted,
-            reflection,
+            completion: Some(completion),
+            signal: Some(signal),
+            scheduled: Some(scheduled),
+            submitted: Some(submitted),
+            reflection: Some(reflection),
         }
     }
 
@@ -868,14 +841,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// [`Host::take_command_buffer`]: takes the `COMMAND_BUFFER` `message` of the queue `poster`
     /// posts onto, on a doorbell's thread, where it gets its `CB_SUBMITTED` at its take
     /// ([`GraphicsDecoder::submits_at_take`]) and nothing need be waited for: it runs on that
-    /// queue, the compile table and the decoder are free, each tried, and no pipeline it names is
-    /// still compiling. It is begun here under the decoder's lock, its command buffer made and its
-    /// sinks pointed at the queue's ring, as [`Self::handle_stage3`] begins it. The lock is carried
-    /// to the queue's service thread with the rest of its work, which walks and commits it, then
-    /// reports a failure as `handle_stage3` does, so the guest's later messages are carried out
-    /// after its commit, as they are after a buffer the service thread takes. Its `CB_SUBMITTED`
-    /// is posted here, waiting for nothing, or else by the service thread before the walk; a
+    /// queue, every lock of the decoder's it takes is free, each tried, and no pipeline it names is
+    /// still compiling. It is begun here, its command buffer made and its sinks pointed at the
+    /// queue's ring, as [`Self::handle_stage3`] begins it, and its decoder is carried to the
+    /// queue's service thread with the rest of its work, which walks and commits it, then reports
+    /// a failure as `handle_stage3` does. Its `CB_SUBMITTED` is posted here, waiting for nothing,
+    /// once its ticket in the commit order is issued, which the guest's later buffers are
+    /// committed after (`decode`'s `sequencer`); else by the service thread before the walk. A
     /// buffer the platform refused at its make gets none, and its failure on the service thread.
+    /// A take that is not made lets go of what it took, under locks each held for a short section
+    /// only.
     fn take_command_buffer(
         self: &Arc<Self>,
         poster: &CompletionPoster,
@@ -884,22 +859,28 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if foreign_queue(poster, message) || !self.pending.none_named_by(message) {
             return None;
         }
-        let mut decoder = self.decoder.try_lock_arc()?;
+        // Held to the end of the buffer's work, on the service thread ([`Self::reset_gate`]).
+        let carried = self.reset_gate.try_read_arc()?;
         if poster.stale() {
             return None;
         }
-        self.sinks(poster).point(&mut decoder);
-        decoder.set_context(Some(sender_context(poster, message)));
+        let mut decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), self.sinks(poster));
+        decoder.set_try_only(true);
+        // Its drain before its view of the table, as a buffer the service thread takes.
+        let drain = decoder.command_buffer_drain()?;
         if !decoder.submits_at_take(message) {
             return None;
         }
-        let drain = decoder.command_buffer_drain();
-        let begun = refusing(|| decoder.begin_command_buffer(&self.device, message, drain, false));
+        let begun =
+            refusing(|| decoder.begin_command_buffer(&self.device, message, Some(drain), false));
         let submitted = match &begun {
             Ok(Ok(begun)) => begun.submitted_at_take().cloned(),
             _ => None,
         };
-        let post = submitted.clone().map(|submitted| {
+        // Its answer is posted here only once its ticket is issued.
+        let issued = submitted.is_some() && decoder.issue_ticket(true);
+        let post = submitted.clone().filter(|_| issued).map(|submitted| {
             let poster = poster.clone();
             Box::new(move || {
                 submitted.try_post(|record| poster.try_post(record.as_bytes()));
@@ -909,7 +890,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let rest = Box::new(move || {
             entry::run(|_| {
                 let mut decoder = decoder;
+                decoder.set_try_only(false);
                 if let Some(submitted) = &submitted {
+                    decoder.issue_ticket(false);
                     submitted.post();
                 }
                 let outcome = match begun {
@@ -922,6 +905,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let stood_in = !matches!(outcome, Ok(Ok(())))
                     && matches!(refusing(|| decoder.stand_in_for_failed(&message)), Ok(true));
                 drop(decoder);
+                drop(carried);
                 control.report(&poster, &message, outcome, stood_in);
             });
         });
@@ -934,8 +918,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// meanwhile; its reply goes through `poster` when the compile ends ([`Self::compile`]).
     fn start_pipeline(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let prepared = entry::run(|_| {
-            let mut decoder = self.decoder.lock();
-            decoder.set_context(Some(sender_context(poster, message)));
+            let decoder = self
+                .decoders
+                .sender(Some(sender_context(poster, message)), Sinks::default());
             decoder
                 .prepare_pipeline(message)
                 .map(|job| (self.pending.begin(job.obj_id), job))
@@ -982,11 +967,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 );
             }
             let reflection = compiled.reflection;
+            // Stored where no destroy, close or reset cancelled it, under the lock of its table,
+            // which its destroy removes from after cancelling it; a reset waits for the store.
             {
-                let mut decoder = self.decoder.lock();
-                if self.pending.live(obj_id, began) {
-                    decoder.finish_pipeline(compiled);
-                }
+                let _carried = self.reset_gate.read();
+                self.decoder()
+                    .finish_pipeline_if(compiled, || self.pending.live(obj_id, began));
                 self.pending.finish(obj_id, began);
             }
             poster.post(reflection.as_bytes());
@@ -997,9 +983,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// library the device keeps under its key, and no bytes cross.
     fn lookup_library(&self, poster: &CompletionPoster, message: &[u8]) {
         let (seqno, status) = entry::run(|_| {
-            let mut decoder = self.decoder.lock();
-            decoder.set_context(Some(sender_context(poster, message)));
-            decoder.lookup_library(message)
+            (self.decoders)
+                .sender(Some(sender_context(poster, message)), Sinks::default())
+                .lookup_library(message)
         });
         let (obj_id, size) = RgfxLibraryLookup::read_from_prefix(message)
             .map_or((0, 0), |(m, _)| (m.obj_id, m.slice_size));
@@ -1017,9 +1003,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// size and alignment, or a refusal, which the guest answers by a bound of its own.
     fn heap_texture_size(&self, poster: &CompletionPoster, message: &[u8]) {
         let answer = entry::run(|_| {
-            let mut decoder = self.decoder.lock();
-            decoder.set_context(Some(sender_context(poster, message)));
-            decoder.heap_texture_size_and_align(&self.device, message)
+            (self.decoders)
+                .sender(Some(sender_context(poster, message)), Sinks::default())
+                .heap_texture_size_and_align(&self.device, message)
         });
         if let Some(answer) = answer {
             poster.post(answer.as_bytes());
@@ -1029,16 +1015,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// A sampler create from ring 0, answered at once through `poster` with the sampler's
     /// `gpuResourceID` (`SAMPLER_STATE`), which the guest's sampler answers and its argument
     /// buffers hold: the id the platform numbers it by, in the one space the host's own samplers
-    /// and its pipelines' take theirs from, so none is held twice. The sampler is made with no
-    /// lock of the decoder's held, so the answer does not wait for a command buffer's walk and
-    /// commit, and stored under its id at the decoder's next lock ([`MadeObjects`]). A create the
-    /// platform raises at is answered refused, as one it refuses.
+    /// and its pipelines' take theirs from, so none is held twice. The sampler is stored under its
+    /// id before the answer. A create the platform raises at is answered refused, as one it
+    /// refuses.
     fn create_sampler(&self, poster: &CompletionPoster, message: &[u8]) {
         let (ty, seqno, obj_id) = message_identity(message);
-        // A failed context's later work is refused ([`FailedContexts`]).
-        let failed = self.failed.has(sender_context(poster, message));
-        let answer =
-            entry::run(|_| refusing(|| self.made.sampler_state(&self.device, failed, message)));
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer = entry::run(|_| refusing(|| decoder.sampler_state(&self.device, message)));
         let answer = answer.unwrap_or_else(|raise| {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -1077,8 +1061,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn argument_layout(&self, poster: &CompletionPoster, message: &[u8]) {
         let (ty, seqno, obj_id) = message_identity(message);
         let answer = entry::run(|_| {
-            let mut decoder = self.decoder.lock();
-            decoder.set_context(Some(sender_context(poster, message)));
+            let decoder =
+                (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
             refusing(|| decoder.argument_layout(&self.device, message))
         });
         let (seqno, status) = answer.unwrap_or((Some(seqno), RGFX_STATUS_REFUSED));
@@ -1100,9 +1084,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// the compile pool ([`Self::make`]), so ring 0 goes on meanwhile.
     fn start_library(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let start = entry::run(|_| {
-            let mut decoder = self.decoder.lock();
-            decoder.set_context(Some(sender_context(poster, message)));
-            decoder.prepare_library(message)
+            (self.decoders)
+                .sender(Some(sender_context(poster, message)), Sinks::default())
+                .prepare_library(message)
         });
         let job = match start {
             LibraryStart::Make(job) => job,
@@ -1141,7 +1125,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 Err(raise) => MadeLibrary::refused(job, raise.to_string()),
             };
             let reason = made.refusal().map(str::to_owned);
-            let status = self.decoder.lock().finish_library(made);
+            // A reset waits for the store ([`Self::reset_gate`]).
+            let status = {
+                let _carried = self.reset_gate.read();
+                self.decoder().finish_library(made)
+            };
             if status != RGFX_STATUS_OK {
                 let reason = reason.as_deref().unwrap_or("it was cancelled");
                 log::warn!(
@@ -1162,7 +1150,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             self.presents.present(0, None, answer, Vec::new());
             return;
         }
-        let mut decoder = self.decoder.lock();
+        let decoder = self.decoder();
         if let Some(generation) = generation {
             // The pages as of the present's generation, where the surface has a device cache.
             let filled =
@@ -1266,8 +1254,7 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         let control = &self.control;
         entry::run(|_| {
             control
-                .decoder
-                .lock()
+                .decoder()
                 .surface_pages(&control.device, pages, &runs, cached)
         })
     }

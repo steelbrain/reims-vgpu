@@ -39,6 +39,7 @@ use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
+use super::tables::Entry;
 use super::{DecodeError, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
 
 /// `MTLStorageModeManaged`.
@@ -92,15 +93,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// whether the device's GPU shares the CPU's memory (`hasUnifiedMemory`). The decoder starts
     /// with no, the two copies, which hold Metal's contract on any GPU.
     pub(crate) fn set_unified_memory(&mut self, unified: bool) {
-        self.unified_memory = unified;
+        (self.shared.unified_memory).store(unified, std::sync::atomic::Ordering::Release);
         // A GPU of its own memory keeps IOSurfaces' device caches (`surface_cache`).
-        self.surface_caches = super::surface_cache::SurfaceCaches::new(!unified);
+        self.surface_caches.set_on(!unified);
+    }
+
+    /// Whether `Managed` resources are one copy ([`Self::set_unified_memory`]).
+    fn unified(&self) -> bool {
+        (self.shared.unified_memory).load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The CPU copy of the `Managed` buffer or texture `obj_id` names, where the current context
     /// may name it.
     pub(super) fn managed_copy(&self, obj_id: u64) -> Option<&ManagedCopy<P>> {
-        self.named(obj_id).and(self.managed.get(&obj_id))
+        self.entry(obj_id).and_then(|e| e.managed.as_ref())
     }
 
     /// A `Shared` buffer over the `length` bytes at region offset `at`, which the caller checked
@@ -138,14 +144,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// platform's own `Managed` buffer at the guest's address, its host copy filled from the
     /// block and copied to the GPU's by the next submission.
     pub(super) fn managed_buffer(
-        &mut self,
+        &self,
         device: &P::Device,
         m: &RgfxBufferOverHostMemory,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let options = u64::from(m.options);
         let span = Some((m.region_offset, m.length));
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
-        let (buffer, cpu) = if self.unified_memory {
+        let (buffer, cpu) = if self.unified() {
             match self.buffer_over_block(device, m.region_offset, m.length, options, pin)? {
                 Some(buffer) => (buffer, None),
                 None => return Ok(Err(DecodeError::Refused)),
@@ -184,17 +190,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             buffer.did_modify_range(OnFault::Return, NsRange::new(0, m.length))?;
             (buffer, Some(cpu))
         };
-        let stored = self.insert_over(m.obj_id, ObjHandle::Buffer(buffer), span)?;
-        self.managed.insert(
-            m.obj_id,
-            ManagedCopy {
-                at: m.region_offset,
-                length: m.length,
-                cpu,
-                layout: None,
-            },
-        );
-        Ok(stored)
+        let mut entry = Entry::of(ObjHandle::Buffer(buffer)).over(span);
+        entry.managed = Some(ManagedCopy {
+            at: m.region_offset,
+            length: m.length,
+            cpu,
+            layout: None,
+        });
+        self.store(m.obj_id, entry);
+        Ok(Ok(()))
     }
 
     /// `BUFFER_DID_MODIFY_RANGE`: the range copied from the block to the platform buffer's host
@@ -237,7 +241,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// platform's own `Managed` texture beside it. A bad reference for a CPU copy that is no
     /// `Shared` buffer over a block of the sender's, or is shorter than the layout.
     pub(super) fn managed_texture(
-        &mut self,
+        &self,
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), DecodeError>> {
@@ -256,12 +260,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         ) else {
             return Ok(Err(DecodeError::BadReference));
         };
-        if self.managed.contains_key(&m.cpu_buffer_obj_id) || layout.size() > length {
+        if self.managed_copy(m.cpu_buffer_obj_id).is_some() || layout.size() > length {
             return Ok(Err(DecodeError::BadReference));
         }
         let cpu = cpu.clone_ref();
         let desc = texture_desc(&m.desc, m.resource_id);
-        if self.unified_memory && in_place_shape(&m) {
+        if self.unified() && in_place_shape(&m) {
             let mut over = desc;
             over.resource_options = Some(shared(u64::from(m.desc.options)));
             let descriptor = self.platform.texture_descriptor(&over);
@@ -281,7 +285,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Stores a `Managed` texture over the block at `at` of `length` bytes, and its CPU copy.
     fn store_managed_texture(
-        &mut self,
+        &self,
         obj_id: u64,
         texture: P::Texture,
         at: u64,
@@ -289,17 +293,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         cpu: Option<P::Buffer>,
         layout: LinearLayout,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let stored = self.insert_over(obj_id, ObjHandle::Texture(texture), Some((at, length)))?;
-        self.managed.insert(
-            obj_id,
-            ManagedCopy {
-                at,
-                length: layout.size(),
-                cpu,
-                layout: Some(layout),
-            },
-        );
-        Ok(stored)
+        let mut entry = Entry::of(ObjHandle::Texture(texture)).over(Some((at, length)));
+        entry.managed = Some(ManagedCopy {
+            at,
+            length: layout.size(),
+            cpu,
+            layout: Some(layout),
+        });
+        self.store(obj_id, entry);
+        Ok(Ok(()))
     }
 
     /// `TEXTURE_REPLACE_REGION`: the platform's `replaceRegion:` from the region's bytes in the
@@ -605,7 +607,7 @@ mod tests {
         }
 
         fn cpu_of(&self, obj_id: u64) -> Arg {
-            Arg::obj(self.dec.managed.get(&obj_id).unwrap().cpu.as_ref().unwrap())
+            Arg::obj(self.dec.managed_copy(obj_id).unwrap().cpu.as_ref().unwrap())
         }
     }
 
@@ -739,7 +741,7 @@ mod tests {
             }),
             Ok(())
         );
-        assert!(r.dec.managed.is_empty());
+        assert!(r.dec.managed_copy(10).is_none() && r.dec.object_count() == 1);
         assert!(!r.dec.span_in_use(at, 0x100));
     }
 

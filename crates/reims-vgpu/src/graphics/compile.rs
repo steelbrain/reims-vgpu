@@ -24,9 +24,10 @@
 //! that names a pending pipeline (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the
 //! only ops that name one) waits for it before it is decoded; one that names none is not held.
 //! An `OBJECT_DESTROY` of a pending pipeline, or its context's close, cancels it: the compile's
-//! pipeline is then not stored, so the destroy keeps its place in ring order. The decoder's lock is
-//! taken before the pending set's wherever both are held, and a waiter holds only the pending
-//! set's.
+//! pipeline is then not stored, so the destroy keeps its place in ring order: the compile's store
+//! asks the pending set under the lock of the table the pipeline goes in, and the destroy cancels
+//! it before it removes from that table. A table's lock is taken before the pending set's wherever
+//! both are held, and a waiter holds only the pending set's.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

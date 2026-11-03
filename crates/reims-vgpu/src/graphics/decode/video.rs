@@ -201,7 +201,8 @@ pub(super) fn decode_op<P: Platform>(
 impl<P: Platform> GraphicsDecoder<P> {
     /// The host's hardware video, which `VIDEO_SESSION_CREATE` makes its sessions on.
     pub(crate) fn set_video(&mut self, video: Arc<dyn GraphicsVideo<P>>) {
-        self.video = Some(video);
+        // Set once, at the device's make.
+        let _ = self.shared.video.set(video);
     }
 
     /// The session `id` names; an exec fault where it names none.
@@ -218,10 +219,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in; an exec
     /// fault where `id` names no such texture.
     fn plane_of(&self, id: u64) -> RaiseResult<(PlanePlace, &P::Buffer)> {
-        let place = *self.surface_places.get(&id).ok_or_else(bad_reference)?;
-        if !matches!(self.named(id), Some(ObjHandle::Texture(_))) {
-            return Err(bad_reference());
+        let place = match self.entry(id) {
+            Some(e) if matches!(e.handle, ObjHandle::Texture(_)) => e.place,
+            _ => None,
         }
+        .ok_or_else(bad_reference)?;
         Ok((place, self.require_buffer(place.buffer_obj_id)?))
     }
 }
