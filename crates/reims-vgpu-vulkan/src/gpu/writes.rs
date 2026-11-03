@@ -378,15 +378,20 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
 ///
 /// [`Backing::writes_kept`]: crate::gpu::backing::Backing::writes_kept
 pub fn buffer_bind(b: &BufferObject) -> Bound {
-    let kept = match (&b.surface, &b.heap) {
-        (Some(_), _) => true,
-        (None, Some(h)) => h.backing.writes_kept(),
-        (None, None) => b.backing.writes_kept(),
-    };
-    if kept {
+    if buffer_bind_reads(b) {
         buffer_bound(b)
     } else {
         Bound::default()
+    }
+}
+
+/// Whether [`buffer_bind`] reads `b`'s [`buffer_bound`]: `b` lies on a surface, or the GPU's
+/// writes through it reach read-only memory. Else it answers the default one.
+pub fn buffer_bind_reads(b: &BufferObject) -> bool {
+    match (&b.surface, &b.heap) {
+        (Some(_), _) => true,
+        (None, Some(h)) => h.backing.writes_kept(),
+        (None, None) => b.backing.writes_kept(),
     }
 }
 

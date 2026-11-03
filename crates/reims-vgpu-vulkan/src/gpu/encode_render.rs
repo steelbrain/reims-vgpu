@@ -1405,6 +1405,29 @@ fn slot_decides(m: &Bound) -> bool {
     m.meets && matters(m)
 }
 
+/// Whether `bind` decides something in a reach that holds nothing ([`Reach::quiet`]): an object
+/// it binds at a slot does ([`slot_decides`]), or it makes resident for writing one that matters
+/// ([`matters`]). A buffer [`buffer_bind`] reads nothing of decides nothing, and its default
+/// [`Bound`] is not made.
+///
+/// [`buffer_bind`]: crate::gpu::writes::buffer_bind
+fn quiet_bind_decides(bind: &Bind<'_>) -> bool {
+    use crate::gpu::writes::{buffer_bind_reads, buffer_bound, texture_bind};
+    let buffer = |b: Option<&VulkanBuffer>| {
+        b.is_some_and(|b| buffer_bind_reads(b) && slot_decides(&buffer_bound(b)))
+    };
+    let texture = |t: Option<&VulkanTexture>| t.is_some_and(|t| slot_decides(&texture_bind(t)));
+    match bind {
+        Bind::Buffer(_, _, b) => buffer(*b),
+        Bind::Texture(_, _, t) => texture(*t),
+        Bind::Buffers(_, _, list) => list.iter().any(|&b| buffer(b)),
+        Bind::Textures(_, _, list) => list.iter().any(|&t| texture(t)),
+        Bind::Used(textures, buffers, write) => {
+            *write && textures.iter().chain(buffers).any(matters)
+        }
+    }
+}
+
 /// Whether a draw's write through `m` is never sent where it lies on a surface whose GPU writes
 /// never reach its memory, or into a texture whose writes the runtime refuses
 /// ([`VulkanRenderEncoder::issues`]).
@@ -1895,9 +1918,6 @@ impl VulkanRenderEncoder {
     /// `bind`, of a command: what a draw may write through what it binds or makes resident is
     /// read at the draw ([`Reach`]).
     fn bound(&self, bind: Bind<'_>) {
-        use crate::gpu::writes::{buffer_bind, texture_bind};
-        let buffer = |b: Option<&VulkanBuffer>| b.map(|b| buffer_bind(b)).unwrap_or_default();
-        let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bind(t)).unwrap_or_default();
         // A bind into a reach that holds nothing ([`Reach::quiet`]) of objects that decide
         // nothing there leaves it as it is: `bind_one` would empty slots already empty, and
         // `used` keeps none of them. Most binds are such, of plain memory, a draw's among them,
@@ -1905,20 +1925,19 @@ impl VulkanRenderEncoder {
         // `texture_bind`'s own calls, as the bind does, after the task's end is checked where
         // `plain` checked it; one whose objects decide something binds as before.
         stop_if_task_ended();
-        if self.quiet.load(Ordering::Acquire) {
-            let decides = match &bind {
-                Bind::Buffer(_, _, b) => slot_decides(&buffer(*b)),
-                Bind::Texture(_, _, t) => slot_decides(&texture(*t)),
-                Bind::Buffers(_, _, list) => list.iter().any(|&b| slot_decides(&buffer(b))),
-                Bind::Textures(_, _, list) => list.iter().any(|&t| slot_decides(&texture(t))),
-                Bind::Used(textures, buffers, write) => {
-                    *write && textures.iter().chain(buffers).any(matters)
-                }
-            };
-            if !decides {
-                return;
-            }
+        if self.quiet.load(Ordering::Acquire) && !quiet_bind_decides(&bind) {
+            return;
         }
+        self.bind_reach(bind);
+    }
+
+    /// `bind` into the reach, the rest of [`Self::bound`]: out of line, as most binds end
+    /// before it.
+    #[inline(never)]
+    fn bind_reach(&self, bind: Bind<'_>) {
+        use crate::gpu::writes::{buffer_bind, texture_bind};
+        let buffer = |b: Option<&VulkanBuffer>| b.map(|b| buffer_bind(b)).unwrap_or_default();
+        let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bind(t)).unwrap_or_default();
         plain(|| {
             let locked = self.drawing.lock();
             let mut drawing = locked.borrow_mut();
