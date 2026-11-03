@@ -1465,6 +1465,11 @@ form from the platform's answer of whether the GPU shares the CPU's memory:
     it, as Metal promises.
   - A blit encoder's `synchronizeResource:` and `synchronizeTexture:` become
     copies of the GPU's copy into the block at that point of the encoder.
+  - Where the platform refuses the GPU's copy (its memory is full), the object
+    takes the one-copy form over its block instead, a texture only where it
+    has that form's shape: Metal makes Managed resources past a discrete GPU's
+    memory (measured on the AMD 5300M: 12 GiB of Managed buffers, three times
+    its 4 GiB, made, used by one command buffer and read back as written).
 - A buffer comes from `BUFFER_OVER_HOST_MEMORY` with Managed options; a texture
   from `MANAGED_TEXTURE_CREATE`, which names the block's Shared buffer and the
   texel block of its format (bytes, width, height). Both sides compute the
