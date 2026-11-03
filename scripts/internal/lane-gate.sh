@@ -356,7 +356,7 @@ do_ship() {  # the gate's own scripts, which the host's steps run
     "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
   msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
 }
-do_corpus() {  # the decode streams, copied once from the configured sources
+do_corpus() {  # the decode streams and references, copied again wherever their source changed
   local names odd
   names=$(cat "$L/guest/h264.list" "$L/guest/hevc.list" | awk '!/^#/ && NF {print $1}')
   odd=$(cat "$L/guest/h264-odd.list" "$L/guest/hevc-odd.list" | awk '!/^#/ && NF {print "odd/" $1}')
@@ -368,7 +368,8 @@ for s in "$@"; do
   from=$src/$s
   [[ $s == odd/* ]] && from=$oddsrc/${s#odd/}
   for f in "$s" "${s%.*}.md5"; do
-    [[ -f $dst/$f ]] || cp --reflink=auto "$(dirname "$from")/$(basename "$f")" "$dst/$f"
+    g=$(dirname "$from")/$(basename "$f")
+    cmp -s "$g" "$dst/$f" || { cp --reflink=auto "$g" "$dst/$f" && echo "copied $f"; }
   done
 done
 cd "$dst" && find . -type f ! -name MANIFEST | sort | xargs sha256sum > MANIFEST &&
