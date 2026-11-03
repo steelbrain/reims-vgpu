@@ -67,8 +67,8 @@ constexpr UInt32 kMaxBlocks = 16384;
 // the display's 4K mode, measured: see the commit that set it.
 constexpr UInt64 kWindowServerReserveBytes = 96ull << 20;
 constexpr UInt32 kWindowServerReserveEntries = 1024;
-// The most command queues watched at once, over every client.
-constexpr UInt32 kMaxWatched = 2048;
+// The most command queues watched at once, over every client (RgfxQueueLimits.hpp).
+constexpr UInt32 kMaxWatched = kRgfxMaxWatchedQueues;
 // A ring header's fields (RgfxRingHeader).
 constexpr UInt32 kRingProducer = 0x00;
 constexpr UInt32 kRingCompletedSeqno = 0x08;
@@ -736,11 +736,23 @@ void noteReserve()
 		reserveLoggedBytes = t.reservedPeakBytes;
 	}
 	IOLockUnlock(contextLock);
-	if (log)
-		IOLog("RgfxAccelerator: WindowServer's blocks: %u (%llu KiB), at most %u (%llu KiB); "
-		      "its reserve: %u entries, %llu MiB; the table holds %u\n",
-		      t.reservedCount, t.reservedBytes >> 10, t.reservedPeakCount,
-		      t.reservedPeakBytes >> 10, t.reserveEntries, t.reserveBytes >> 20, t.count);
+	if (!log)
+		return;
+	// And its queues, of the watched rings (RgfxQueueLimits.hpp's reserve).
+	UInt32 queues = 0, all = 0;
+	if (watchLock) {
+		IOLockLock(watchLock);
+		for (UInt32 i = 0; i < watchedCount; i++)
+			queues += watched[i].client && watched[i].client->isWindowServer();
+		all = watchedCount;
+		IOLockUnlock(watchLock);
+	}
+	IOLog("RgfxAccelerator: WindowServer's blocks: %u (%llu KiB), at most %u (%llu KiB); "
+	      "its reserve: %u entries, %llu MiB; the table holds %u; its queues: %u of %u "
+	      "watched (reserve %u)\n",
+	      t.reservedCount, t.reservedBytes >> 10, t.reservedPeakCount, t.reservedPeakBytes >> 10,
+	      t.reserveEntries, t.reserveBytes >> 20, t.count, queues, all,
+	      kRgfxWindowServerQueues);
 }
 
 // Logs what the dormant blocks did, where it changed and kDormantLogMs passed since the last
@@ -1341,7 +1353,7 @@ IOReturn RgfxAccelerator::watchQueue(RgfxAcceleratorUserClient *client, UInt64 o
 	volatile UInt8 *header =
 	    reinterpret_cast<volatile UInt8 *>(map->getVirtualAddress()) + (completeOffset - page);
 	IOLockLock(watchLock);
-	if (watchedCount == kMaxWatched) {
+	if (!rgfxWatchAdmitted(watchedCount, client->isWindowServer())) {
 		IOLockUnlock(watchLock);
 		map->release();
 		IOLog("RgfxAccelerator: queue 0x%llx: every watched ring is taken\n", objId);

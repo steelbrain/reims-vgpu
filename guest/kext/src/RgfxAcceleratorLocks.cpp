@@ -50,7 +50,7 @@
 namespace {
 // The most pending writes kept at once (a surface's per queue), and the most queues with any.
 constexpr UInt32 kMaxUses = 4096;
-constexpr UInt32 kMaxQueues = 2048;
+constexpr UInt32 kMaxQueues = kRgfxMaxWatchedQueues;
 // How long a lock waits before it goes on, and how often it looks at the device's completions.
 constexpr UInt32 kWaitMs = 2000;
 constexpr UInt32 kPollUs = 1000;

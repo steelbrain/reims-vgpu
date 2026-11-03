@@ -24,6 +24,7 @@
 #include <IOKit/IOUserClient.h>
 
 #include "RgfxAccelerator.hpp"
+#include "RgfxQueueLimits.hpp"
 
 class IOBufferMemoryDescriptor;
 
@@ -100,7 +101,8 @@ private:
 	// watching a queue the host has torn down.
 	bool destroyQueueIfTracked(UInt64 objId);
 
-	static const UInt32 kMaxQueues = 256;
+	// As many as the device watches for one process (RgfxQueueLimits.hpp).
+	static const UInt32 kMaxQueues = kRgfxMaxQueuesPerClient;
 	// The most bytes one kRgfxAccelMethodSurfaceWrites names: 1024 surfaces.
 	static const UInt64 kMaxSurfaceWritesBytes = (3 + 2 * 1024) * sizeof(UInt64);
 	bool hasContext;

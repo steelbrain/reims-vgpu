@@ -94,7 +94,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/window_test $(BUILD)/tests/scanout_owner_test \
 	$(BUILD)/tests/display_modes_test $(BUILD)/tests/surface_locks_test \
 	$(BUILD)/tests/bundle_paths_test $(BUILD)/tests/surface_caches_test \
-	$(BUILD)/tests/vblank_clock_test $(BUILD)/tests/submit_gate_test $(BUILD)/tests/memory_size_test
+	$(BUILD)/tests/vblank_clock_test $(BUILD)/tests/submit_gate_test $(BUILD)/tests/memory_size_test \
+	$(BUILD)/tests/queue_limits_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

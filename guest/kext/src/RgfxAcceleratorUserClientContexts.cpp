@@ -120,7 +120,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			owner->unpinBlock(pins[1]);
 		};
 		IOLockLock(queueLock);
-		if (queueCount == kMaxQueues) {
+		if (!rgfxQueueAdmitted(queueCount)) {
 			IOLockUnlock(queueLock);
 			unpin();
 			return kIOReturnNoResources;
