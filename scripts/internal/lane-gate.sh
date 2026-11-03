@@ -5,7 +5,7 @@
 #   scripts/internal/lane-gate.sh [--record] [--baseline SHA] [--resume [RUNID]] [--image PATH]
 #                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
-#                                 [--no-bench | --wait-bench]
+#                                 [--no-appload] [--no-bench | --wait-bench]
 #                                 [--publish] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
@@ -34,6 +34,11 @@
 #                 CAPTURE, lane-gate/msi-capture.py): its scanout every 100 ms from QEMU's memory,
 #                 the guest's screenshots once a second, the kext's log lines; kept on the lane host
 #                 in the boot's capture/ (capture.txt, fetched, says where)
+#   --no-appload  leave out the correctness boot's app load (lane-gate/msi-appload.sh: every app
+#                 and 7 Safari pages after the measurements, on a copy of rgk-ctx-slots' appload
+#                 tools from the lane host's APPLOAD_TOOLS, default ~/.cache/rgk-ctx-slots-msi/appload/tools)
+#   --appload-info WHY  report a miss of the app load's bar as INFO, not FAIL, saying why (a
+#                 baseline taken before the bar holds); kept in runs/RUNID/appload-info
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -91,7 +96,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 rev=HEAD bench=detach publish=0
+record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -106,6 +111,8 @@ while (($#)); do
     --boot-tag) boot_tag=$2; shift ;;
     --host-log) host_log=$2; shift ;;
     --capture-boot) capture=1 ;;
+    --no-appload) appload=0 ;;
+    --appload-info) appload_info=$2; shift ;;
     --no-bench) bench=no ;;
     --wait-bench) bench=wait ;;
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
@@ -132,6 +139,7 @@ RUN=$GH/runs/$runid
 ART=$RUN/artifacts
 RES=$RUN/results
 mkdir -p "$RUN/steps" "$ART" "$RES"
+[[ -z $appload_info ]] || echo "$appload_info" > "$RUN/appload-info"
 MR=$MSI_GATE/runs/$runid
 TREE=$GH/tree
 export CARGO_TARGET_DIR=$GH/target
@@ -377,9 +385,14 @@ do_ship() {  # the gate's own scripts, which the host's steps run
   # Each script replaces the old one by a rename, never in place: a detached bench leg may be
   # running the old one, and bash reads a script as it runs it.
   msi "rm -rf '$MR/bin/.incoming' && mkdir -p '$MR/bin/.incoming'"
-  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-xid.sh" "$L/msi-capture.py" "$L/msi-publish.sh" "$L/msi-drag.py" "$L/reps.py" "$L/gpuload.c" "$L/gpuload.comp" \
+  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-xid.sh" "$L/msi-capture.py" "$L/msi-appload.sh" "$L/msi-publish.sh" "$L/msi-drag.py" "$L/reps.py" "$L/gpuload.c" "$L/gpuload.comp" \
     "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
   msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
+  # The app load's tools as rgk-ctx-slots has them now, copied (msi-appload.sh), and their hash.
+  msi "a=\${APPLOAD_TOOLS:-\$HOME/.cache/rgk-ctx-slots-msi/appload/tools}; rm -rf '$MR/bin/appload-tools.new' &&
+    if [ -f \"\$a/analyze-load.py\" ]; then cp -r --reflink=auto \"\$a\" '$MR/bin/appload-tools.new' &&
+      rm -rf '$MR/bin/appload-tools' && mv '$MR/bin/appload-tools.new' '$MR/bin/appload-tools' &&
+      (cd '$MR/bin/appload-tools' && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16) > '$MR/bin/appload-tools.hash'; fi"
 }
 do_corpus() {  # the decode streams and references, copied again wherever their source changed
   local names odd
@@ -513,6 +526,7 @@ PRESENT_S=$pres
 LOAD=$([[ $mode == bench ]] && echo "$load")
 HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info)
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
+APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 EOF
   set +e
   msi "bash '$MR/bin/msi-boot.sh' '$out'"
@@ -521,7 +535,7 @@ EOF
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
   for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log xid.txt \
-    capture.txt kext-stalls.txt; do
+    capture.txt kext-stalls.txt appload.txt appload.log; do
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true

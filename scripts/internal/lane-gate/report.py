@@ -73,7 +73,7 @@ MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "bundle-files", "rgfxgate
 # The informational metrics a report shows beside the gated ones.
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
          r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
-         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(shared\.)?icb\..*", r"(core_mhz|clock_reps_ok)\.bench\..*",
+         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(shared\.)?icb\..*", r"(shared\.)?appload\..*", r"(core_mhz|clock_reps_ok)\.bench\..*",
          r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)"]
 
 
@@ -183,6 +183,7 @@ class Run:
                 self.guest(read(os.path.join(d, "guest.log")))
                 self.host(d)
                 self.drag(d)
+                self.appload(d)
                 self.video(d)
                 self.clocks(d)
         self.ip, self.mp = "", ""
@@ -565,6 +566,55 @@ class Run:
             for k in ("qemu_cpu", "gfx_cpu"):
                 if k in kv:
                     self.lmetric(f"{k}.drag.{name}", kv[k])
+
+    def appload(self, r):
+        """The app load (msi-appload.sh's appload.txt): every app, then 7 Safari pages. Its bar: no
+        region or context refusal from the kext, no crash report in the apps phase, no fatal line.
+        Where the run's appload-info file says why (a baseline before the bar holds), a miss of the
+        bar is INFO, not FAIL."""
+        kv = {}
+        for line in read(os.path.join(r, "host.txt")).splitlines():
+            p = line.split(None, 1)
+            if len(p) == 2 and p[0] == "appload_rc":
+                kv["rc"] = p[1]
+        for line in read(os.path.join(r, "appload.txt")).splitlines():
+            p = line.split(None, 1)
+            kv[p[0]] = p[1].strip() if len(p) == 2 else ""
+        if "rc" not in kv:
+            return
+        if kv["rc"].startswith("skipped") or "apps" not in kv:
+            self.litem("appload.run", "NOTRUN", f"the app load did not run: {kv['rc']}")
+            return
+        info = read(os.path.join(self.path, "appload-info")).strip()
+        miss = "INFO" if info else "FAIL"
+        note = f" ({info})" if info else ""
+        def num(k):
+            v = kv.get(k, "")
+            return int(v) if v.isdigit() else None
+        apps, procs = num("apps"), num("procs_max")
+        self.litem("appload.run", "PASS" if kv["rc"] == "0" else miss,
+                   f"{apps} apps and 7 Safari pages, {procs} processes holding a context at most; exit {kv['rc']}{note}")
+        for item, key, what in (("appload.kext-region-refusals", "kext_region_refusals", "region refusals from the kext"),
+                                ("appload.context-refusals", "context_refusals", "context refusals ('every context slot is held')"),
+                                ("appload.fatal-lines", "fatal_lines", "'reims-vgpu: fatal' lines")):
+            n = num(key)
+            self.litem(item, "NOTRUN" if n is None else ("PASS" if n == 0 else miss),
+                       ("not read" if n is None else f"{n} {what}") + (note if n else ""))
+        n = num("crash_reports_apps")
+        self.litem("appload.crash-reports", "NOTRUN" if n is None else ("PASS" if n == 0 else miss),
+                   "not read" if n is None else f"{n} new crash reports in the apps phase" +
+                   (f": {kv.get('crash_names', '')}{note}" if n else ""))
+        ws = {k: num(k) for k in ("ws_blocks", "ws_kib", "ws_max_blocks", "ws_max_kib", "ws_reserve_mib")}
+        if ws["ws_blocks"] is not None:
+            self.litem("appload.windowserver", "PASS",
+                       f"WindowServer holds {ws['ws_blocks']} blocks, {ws['ws_kib'] / 1024:.1f} MiB (at most "
+                       f"{ws['ws_max_blocks']}, {ws['ws_max_kib'] / 1024:.1f} MiB) of its {ws['ws_reserve_mib']} MiB reserve")
+            self.lmetric("appload.ws_blocks", ws["ws_blocks"])
+            self.lmetric("appload.ws_mib", round(ws["ws_kib"] / 1024, 1))
+            self.lmetric("appload.ws_max_mib", round(ws["ws_max_kib"] / 1024, 1))
+        for k in ("apps", "procs_max", "bundle_region_refusals"):
+            if num(k) is not None:
+                self.lmetric("appload." + k, num(k))
 
     def cargo(self, r):
         p = os.path.join(r, "cargo-fails.txt")

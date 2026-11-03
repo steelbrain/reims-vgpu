@@ -26,6 +26,8 @@
 #   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
 #   gpu-clocks.txt  the GPU's power state and clocks ten times a second over the guest's run and
 #                 the drags: "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W"
+#   appload/, appload.txt, appload.log   where boot.env sets APPLOAD=1: the app load's files, its
+#                 numbers (msi-appload.sh), and its output
 #   capture/, capture.txt   where boot.env sets CAPTURE=1: the boot as the display showed it
 #                 (msi-capture.py's scanout reads and the guest's screenshots, the kext's log lines
 #                 of the boot), and a summary of it
@@ -35,7 +37,9 @@
 # LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
 # PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
 # load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
-# (the host's REIMS_VGPU_LOG filter, default info), and CAPTURE (1: the boot capture, below). A probe boot (probe-batch.sh) sets PROBES,
+# (the host's REIMS_VGPU_LOG filter, default info), CAPTURE (1: the boot capture, below), and
+# APPLOAD (1: the app load after the measurements, msi-appload.sh, with the tools lane-gate.sh
+# copies into this script's appload-tools/). A probe boot (probe-batch.sh) sets PROBES,
 # PROBE_RESULTS and PROBE_TIP in place of PHASES and CORPUS (msi-probes.sh says what they are).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
@@ -483,6 +487,23 @@ if [[ ${DRAG:-1} == 1 ]] && (( $(left) > 150 )); then
     timeout "$(( $(left) - 60 ))" python3 -I "$(dirname "$0")/msi-drag.py" "$B" "$R" >> "$R/drag.log" 2>&1
   kv drag_rc $?
   log "window drags done"
+fi
+
+# The app load (APPLOAD=1, msi-appload.sh): rgk-ctx-slots' busy desktop on this boot, after the
+# measurements, as it leaves every app open; where the hold has room for it (about 6 minutes).
+# appload.txt holds its numbers (msi-appload.sh), appload/ the rest.
+if [[ ${APPLOAD:-0} == 1 ]]; then
+  if (( $(left) > ${APPLOAD_NEED_S:-480} )) && [[ -f $(dirname "$0")/appload-tools/analyze-load.py ]]; then
+    log "app load"
+    PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS B=$B TOOLS="$(dirname "$0")/appload-tools" \
+      timeout "$(( $(left) - 60 ))" bash "$(dirname "$0")/msi-appload.sh" "$R/appload" > "$R/appload.log" 2>&1
+    kv appload_rc $?
+    cp -f "$R/appload/appload.txt" "$R/appload.txt" 2> /dev/null
+    log "app load done: $(tr '\n' ' ' < "$R/appload.txt" 2> /dev/null)"
+  else
+    kv appload_rc "skipped: $(left) s of the hold left, or no tools"
+    log "app load skipped: $(left) s of the hold left"
+  fi
 fi
 kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
 stop_load
