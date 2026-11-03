@@ -285,7 +285,8 @@ pub(crate) fn first_adopted() -> Option<rt::Device> {
 /// The handle of `raw`, a device the runtime made: the object of the same device made before, or
 /// a new one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
-/// placement of degradations ([`crate::answer::native::device_made`]).
+/// placement of degradations ([`crate::answer::native::device_made`]), and its warm pass runs
+/// over the pipeline records earlier processes kept ([`crate::records`]), in the background.
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
@@ -296,6 +297,10 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     crate::answer::native::device_made(raw.properties());
     #[cfg(target_os = "linux")]
     crate::os::learn_view_imports(&raw);
+    #[cfg(not(test))]
+    if let Some(home) = std::env::var_os("HOME") {
+        crate::records::warm(&raw, crate::records::path_in(home.as_ref()));
+    }
     let made = Obj::new(DeviceObject {
         raw,
         registry_id: id,

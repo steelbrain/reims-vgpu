@@ -30,6 +30,7 @@ pub mod gpu;
 pub mod host_gpus;
 pub mod os;
 pub mod platform;
+pub(crate) mod records;
 pub mod remap;
 pub mod swapchain;
 

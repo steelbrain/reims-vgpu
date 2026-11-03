@@ -28,10 +28,10 @@ use reims_vgpu_core::num::ToU64;
 use crate::platform::device_options;
 
 /// The kernel's metallib, which `build.rs` compiled from the metal crate's `scaler.metal`.
-const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scaler.metallib"));
+pub(crate) const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scaler.metallib"));
 
 /// The kernels' names in it, as [`Kernel`] orders them.
-const KERNELS: [&str; 6] = [
+pub(crate) const KERNELS: [&str; 6] = [
     "scaler_lines",
     "scaler_transform",
     "scaler_across",
