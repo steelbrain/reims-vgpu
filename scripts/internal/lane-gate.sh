@@ -5,7 +5,7 @@
 #   scripts/internal/lane-gate.sh [--record | --landed] [--baseline SHA] [--resume [RUNID]] [--image PATH]
 #                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
-#                                 [--no-appload] [--no-bench | --wait-bench]
+#                                 [--no-appload] [--no-bench | --wait-bench] [--qemu-hook CMD]
 #                                 [--publish | --probe-tip] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
@@ -45,6 +45,10 @@
 #                 tools from the lane host's APPLOAD_TOOLS, default ~/.cache/rgk-ctx-slots-msi/appload/tools)
 #   --appload-info WHY  report a miss of the app load's bar as INFO, not FAIL, saying why (a
 #                 baseline taken before the bar holds); kept in runs/RUNID/appload-info
+#   --qemu-hook CMD  run CMD on the lane host as the bench boot's QEMU starts, as probe-batch.sh's
+#                 --qemu-hook ({PID} QEMU's pid, {DIR} the boot's directory, whose guest.log has
+#                 guest-run.sh's lines as they come, "# start CASE" before each bench case); a
+#                 control: never --record it
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -105,11 +109,12 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 landed=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
+record=0 landed=0 qemu_hook= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
     --landed) record=1 landed=1 ;;
+    --qemu-hook) qemu_hook=$2; shift ;;
     --baseline) base_sha=$2; shift ;;
     --resume) if [[ ${2:-} =~ ^[0-9a-f]{12}- ]]; then resume=$2; shift; else resume=newest; fi ;;
     --image) image=$2; shift ;;
@@ -166,6 +171,7 @@ if [[ -z $base_sha && -e $GH/baselines/LAST ]]; then base_sha=$(basename "$(read
 [[ -z $base_sha ]] || base_sha=$(git -C "$SRC" rev-parse --verify "$base_sha^{commit}")
 [[ -z $host_dir ]] || ((!record)) || die "--host makes a control: it is never a sample of REV's baseline (--record)"
 [[ -z $load ]] || ((!record)) || die "--load measures beside a fixed load: it is never a sample of REV's baseline (--record)"
+[[ -z $qemu_hook ]] || ((!record)) || die "--qemu-hook makes a control: it is never a sample of REV's baseline (--record)"
 BASE=${base_sha:+$GH/baselines/$base_sha}
 [[ -z $BASE || -d $BASE/runs ]] || die "no baseline of $base_sha in $GH/baselines"
 
@@ -546,6 +552,7 @@ HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info,reims_vg
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_cmd" | base64 | tr -d '\n')
+QEMU_HOOK_B64=$([[ $mode == bench && -n $qemu_hook ]] && printf '%s' "$qemu_hook" | base64 | tr -d '\n')
 EOF
   set +e
   msi "bash '$MR/bin/msi-boot.sh' '$out'"
@@ -695,6 +702,7 @@ say "lane-gate: report $RUN/report.txt; $(( $(date +%s) - T0 )) s this pass"
 if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped bench; then
   again=(--resume "$runid" --bench-only)
   if ((landed)); then again+=(--landed); elif ((record)); then again+=(--record); fi
+  [[ -z $qemu_hook ]] || again+=(--qemu-hook "$qemu_hook")
   [[ -z $image ]] || again+=(--image "$image")
   [[ -z $host_dir ]] || again+=(--host "$host_dir")
   [[ -z $load ]] || again+=(--load "$load")
