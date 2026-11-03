@@ -363,6 +363,25 @@ inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
 	return rgfxSurfaceOldestDormant(t);
 }
 
+// What an ask whose new block found no room in the region does next. Before its first wait
+// (`deadline` 0), it lets the oldest dormant blocks go and waits for their releases, or gives up
+// where there are none. After it, a block that still finds no room waits on until `deadline`,
+// whatever else woke it meanwhile (any block's release, any ask's answer), and gives up only
+// past it: the releases it asked for are answered once their contexts' buffers finish.
+enum RgfxSurfaceRoomStep {
+	kRgfxSurfaceRoomGiveUp,
+	kRgfxSurfaceRoomLetGoAndWait,
+	kRgfxSurfaceRoomWait,
+};
+
+inline RgfxSurfaceRoomStep rgfxSurfaceRoomStep(uint64_t deadline, uint32_t dormantCount,
+                                               uint64_t now)
+{
+	if (deadline == 0)
+		return dormantCount ? kRgfxSurfaceRoomLetGoAndWait : kRgfxSurfaceRoomGiveUp;
+	return now < deadline ? kRgfxSurfaceRoomWait : kRgfxSurfaceRoomGiveUp;
+}
+
 // A dormant entry whose pages start in the page of `runs[0]`, of either mode, or -1: one an ask
 // it does not answer finds in its way (rgfxSurfaceFind's `*differs`, or a cache not its own).
 inline int32_t rgfxSurfaceDormantMeeting(const RgfxSurfaceTable &t, const RgfxPageRun *runs,

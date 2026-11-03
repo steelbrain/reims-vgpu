@@ -1111,6 +1111,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// held again by an ask of the same surface (reviveSurfaceBlock), and goes where the ask is
 	// another's, or of the other mode: the ask then makes its own.
 	bool differs = false, revived = false, release = false, waitedForRoom = false;
+	// Until when a new block waits for the region's room, once dormant blocks went for it.
+	uint64_t roomDeadline = 0;
 	int32_t at = -1, slot = -1;
 	RgfxBlockPin pin = {};
 	UInt64 offset = 0;
@@ -1152,22 +1154,29 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		made = slot < 0 ? kRgfxBlockTableFull
 		                : rgfxBlockAlloc(blockTable, &table.entries[slot], context, total, kPage,
 		                                 &offset, &pin, client->isWindowServer());
-		if (made != kRgfxBlockNoSpace || waitedForRoom || !table.dormantCount)
+		if (made != kRgfxBlockNoSpace)
 			break;
-		waitedForRoom = true;
-		releaseStats.roomWaits++;
-		for (UInt32 n = 0; n < kDormantRoomBlocks; n++) {
-			const int32_t oldest = rgfxSurfaceOldestDormant(table);
-			if (oldest < 0)
-				break;
-			release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantNoSpace);
+		// No room: dormant blocks go once, and the ask waits for room until its deadline,
+		// whatever else wakes it meanwhile (rgfxSurfaceRoomStep).
+		const RgfxSurfaceRoomStep step =
+		    rgfxSurfaceRoomStep(roomDeadline, table.dormantCount, mach_absolute_time());
+		if (step == kRgfxSurfaceRoomGiveUp)
+			break;
+		if (step == kRgfxSurfaceRoomLetGoAndWait) {
+			waitedForRoom = true;
+			releaseStats.roomWaits++;
+			for (UInt32 n = 0; n < kDormantRoomBlocks; n++) {
+				const int32_t oldest = rgfxSurfaceOldestDormant(table);
+				if (oldest < 0)
+					break;
+				release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantNoSpace);
+			}
+			if (release)
+				thread_call_enter(releaseCall);
+			release = false;
+			clock_interval_to_deadline(kDormantRoomMs, kMillisecondScale, &roomDeadline);
 		}
-		if (release)
-			thread_call_enter(releaseCall);
-		release = false;
-		uint64_t deadline = 0;
-		clock_interval_to_deadline(kDormantRoomMs, kMillisecondScale, &deadline);
-		IOLockSleepDeadline(contextLock, &surfaceTable, deadline, THREAD_UNINT);
+		IOLockSleepDeadline(contextLock, &surfaceTable, roomDeadline, THREAD_UNINT);
 	}
 	if (waitedForRoom && made == kRgfxBlockNoSpace)
 		releaseStats.roomWaitsFailed++;

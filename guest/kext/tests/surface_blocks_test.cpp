@@ -269,6 +269,19 @@ int main()
 	      "runs merge where they meet");
 	check(!rgfxSurfaceAppendRun(runs, &count, 2, 0x20000, 0x1000), "a third run does not fit");
 
+	// No room for a new block: the first time it lets dormant blocks go and waits, or gives up
+	// with none; after that it waits on to its deadline, whatever wakes it, and gives up past it.
+	check(rgfxSurfaceRoomStep(0, 3, 50) == kRgfxSurfaceRoomLetGoAndWait,
+	      "no room: dormant blocks go, and the ask waits");
+	check(rgfxSurfaceRoomStep(0, 0, 50) == kRgfxSurfaceRoomGiveUp,
+	      "no room and none dormant: the ask gives up");
+	check(rgfxSurfaceRoomStep(150, 3, 60) == kRgfxSurfaceRoomWait,
+	      "woken with no room before the deadline: it waits on");
+	check(rgfxSurfaceRoomStep(150, 0, 149) == kRgfxSurfaceRoomWait,
+	      "it waits on once none is dormant: their releases are in flight");
+	check(rgfxSurfaceRoomStep(150, 3, 150) == kRgfxSurfaceRoomGiveUp,
+	      "at the deadline it gives up");
+
 	std::printf("surface_blocks_test: OK (%d checks)\n", checks);
 	return 0;
 }
