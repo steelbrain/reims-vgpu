@@ -574,7 +574,8 @@ def write_report(run, base, noise, history=None):
              else "bench: no regression beyond the noise band" if benched else "bench: not run")
     out = [f"lane-gate {verdict}: {m.get('sha', '?')} ({m.get('subject', '')}); {bench}",
            f"run {m.get('runid', '?')}, {m.get('wall_s', '?')} s wall; baseline "
-           + (f"{base['meta'].get('sha', '?')[:12]} ({base['samples']} samples)" if base else "none"),
+           + (f"{base['meta'].get('sha', '?')[:12]} ({base['samples']} samples)" if base else "none")
+           + (f"; a control: the host build {m['host_build']} against this commit's guest" if m.get("host_build") else ""),
            "items: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))]
     for title, names in (("failed:", failed), ("bench (not gating):", bench_issues)):
         if names:
