@@ -40,13 +40,14 @@ use reims_graphics::wire::{
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
     RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
-    RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_ORDER,
-    RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
-    RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
-    RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
+    RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -221,6 +222,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // guest producer waiting for room on a submission ring that the device took from it
             // (the device carries SUBMIT_ROOM out). Both platforms make indirect command buffers,
             // so every host decodes their messages, slots included.
+            // A host that maps the guest's pages maps a process's own pages too, for its no-copy
+            // buffers (`BUFFER_OVER_PAGES`).
+            let in_place =
+                u64::from(RGFX_FEATURE_SURFACE_PAGES) | u64::from(RGFX_FEATURE_PAGES_BUFFERS);
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | u64::from(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS)
@@ -234,11 +239,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
                 | match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
-                    (true, true) => u64::from(RGFX_FEATURE_SURFACE_PAGES),
-                    (true, false) => {
-                        u64::from(RGFX_FEATURE_SURFACE_PAGES)
-                            | u64::from(RGFX_FEATURE_SURFACE_CACHE)
-                    }
+                    (true, true) => in_place,
+                    (true, false) => in_place | u64::from(RGFX_FEATURE_SURFACE_CACHE),
                 };
             // The processes read the features from the device info, as no register is theirs.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
@@ -1463,12 +1465,12 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.features
     }
 
-    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, cached: bool) -> u32 {
+    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, flags: u32) -> u32 {
         let control = &self.control;
         entry::run(|_| {
             control
                 .decoder()
-                .surface_pages(&control.device, pages, &runs, cached)
+                .surface_pages(&control.device, pages, &runs, flags)
         })
     }
 

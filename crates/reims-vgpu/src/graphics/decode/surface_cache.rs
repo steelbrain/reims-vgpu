@@ -345,7 +345,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
             return Ok(false);
         };
-        let Some(pages) = buffer_over(device, view, length, 0)? else {
+        let Some(pages) = buffer_over(device, view, 0, length, 0, None)? else {
             return Ok(false);
         };
         self.by_block.insert(

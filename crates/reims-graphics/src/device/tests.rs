@@ -1894,13 +1894,13 @@ fn control_completion_posts_from_several_threads_land_whole() {
 }
 
 /// The device's feature bits are its host's; a `SURFACE_PAGES` hands the host the runs it lists
-/// in its block, read out of the region, and whether the message marks the block cached, and is
+/// in its block, read out of the region, and the flags the message gives the block, and is
 /// answered with the host's answer; one whose runs lie past the block, or a block outside the
 /// processes' blocks, hands nothing and is refused. A `SURFACE_DOWNLOAD` hands the host its block
 /// and is answered with the host's answer
 #[test]
 fn surface_pages_hand_the_host_their_runs() {
-    type Seen = Arc<Mutex<Vec<(RgfxSurfacePages, Vec<RgfxPageRun>, bool)>>>;
+    type Seen = Arc<Mutex<Vec<(RgfxSurfacePages, Vec<RgfxPageRun>, u32)>>>;
     struct Pages(Seen);
     impl Host for Pages {
         fn raise_interrupt(&self, _vector: u32) {}
@@ -1914,9 +1914,9 @@ fn surface_pages_hand_the_host_their_runs() {
             &self,
             pages: &RgfxSurfacePages,
             runs: Vec<RgfxPageRun>,
-            cached: bool,
+            flags: u32,
         ) -> u32 {
-            self.0.lock().push((*pages, runs, cached));
+            self.0.lock().push((*pages, runs, flags));
             RGFX_STATUS_OK
         }
         fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
@@ -1925,7 +1925,7 @@ fn surface_pages_hand_the_host_their_runs() {
                 block_offset,
                 ..Default::default()
             };
-            self.0.lock().push((pages, runs, true));
+            self.0.lock().push((pages, runs, u32::MAX));
             answer.answer(RGFX_STATUS_NOT_FOUND);
         }
     }
@@ -1975,6 +1975,17 @@ fn surface_pages_hand_the_host_their_runs() {
     );
     let seqno = rig.send(cached);
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    // A process's pages block: its flags as they are.
+    let mut private = pages(BLOCK, BLOCK + 0x1000, 2).as_bytes().to_vec();
+    private.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    let seqno = rig.send(private);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     let seqno = rig.send(
         RgfxSurfaceDownload {
             header: RgfxMsgHeader {
@@ -2003,15 +2014,22 @@ fn surface_pages_hand_the_host_their_runs() {
     let seen = seen.lock();
     assert_eq!(
         seen.len(),
-        3,
+        4,
         "only the SURFACE_PAGES whose runs lie in its block, and the download"
     );
     assert_eq!(seen[0].0.block_offset, BLOCK);
     assert_eq!(seen[0].0.context, 3);
     assert_eq!(seen[0].1, runs);
-    assert!(!seen[0].2, "a message without the cache's flags");
-    assert_eq!((seen[1].1.as_slice(), seen[1].2), (&runs[..], true));
-    assert_eq!((seen[2].0.block_offset, seen[2].1.len()), (BLOCK, 0));
+    assert_eq!(seen[0].2, 0, "a message without the flags");
+    assert_eq!(
+        (seen[1].1.as_slice(), seen[1].2),
+        (&runs[..], RGFX_SURFACE_PAGES_CACHED)
+    );
+    assert_eq!(
+        (seen[2].1.as_slice(), seen[2].2),
+        (&runs[..], RGFX_SURFACE_PAGES_PRIVATE)
+    );
+    assert_eq!((seen[3].0.block_offset, seen[3].1.len()), (BLOCK, 0));
 }
 
 /// What a [`TakingHost`] records, and what it is set to do.

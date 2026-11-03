@@ -77,27 +77,28 @@ use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
     RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
-    RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
-    RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
-    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
-    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
-    RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
-    RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
-    RGFX_LINKED_BINARY_FUNCTIONS, RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP,
-    RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
-    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
-    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
-    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET,
-    RGFX_SURFACE_NO_WRITERS, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
+    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+    RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE,
+    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE,
+    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
+    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
+    RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP, RGFX_LINKED_PRIVATE_FUNCTIONS,
+    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
+    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
+    RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_CACHED,
+    RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
     RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
     RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
     RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete,
@@ -716,18 +717,34 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `SURFACE_PAGES`: the view of `runs` for the block `pages` names, which its
     /// `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on `device` that holds
     /// its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with none, logged as a guest
-    /// error. A summary of what the views did is logged every [`VIEWS_LOGGED_EVERY`].
+    /// error. `flags` are the message's `RGFX_SURFACE_PAGES_*`: a block marked
+    /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view its `BUFFER_OVER_PAGES` buffers'
+    /// alone, with no device cache ([`surface_pages`]); else one marked
+    /// [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache. A summary of what the views did
+    /// is logged every [`VIEWS_LOGGED_EVERY`].
     pub(crate) fn surface_pages(
         &mut self,
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
-        cached: bool,
+        flags: u32,
     ) -> u32 {
-        let made =
-            (self.shared.surface_views.lock()).surface_pages(&self.platform, device, pages, runs);
+        let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
+        let made = {
+            let mut views = self.shared.surface_views.lock();
+            if private {
+                views.private_pages(&self.platform, device, pages, runs)
+            } else {
+                views.surface_pages(&self.platform, device, pages, runs)
+            }
+        };
         let status = match made {
+            Ok(Ok(())) if private => {
+                self.uncache_surface(device, pages.block_offset);
+                RGFX_STATUS_OK
+            }
             Ok(Ok(())) => {
+                let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
                 self.cache_surface(device, pages.block_offset, runs, cached);
                 RGFX_STATUS_OK
             }
@@ -753,12 +770,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         };
         let c = self.shared.surface_views.lock().counts();
-        if (c.made + c.reused + c.bad_runs + c.not_mapped).is_multiple_of(VIEWS_LOGGED_EVERY) {
+        if (c.made + c.reused + c.bad_runs + c.not_mapped + c.private)
+            .is_multiple_of(VIEWS_LOGGED_EVERY)
+        {
             log::info!(
                 target: "reims_vgpu::graphics",
-                "IOSurface pages in place: {} views made, {} taken from the cache; refused: {} \
-                 for bad runs, {} not mapped",
-                c.made, c.reused, c.bad_runs, c.not_mapped
+                "IOSurface pages in place: {} views made, {} taken from the cache; {} pages \
+                 blocks' views made; refused: {} for bad runs, {} not mapped",
+                c.made, c.reused, c.private, c.bad_runs, c.not_mapped
             );
             let d = self.surface_caches.lock().counts();
             if d.made != 0 {
@@ -1261,6 +1280,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         self.forget_context_surfaces(context);
+        self.shared.surface_views.lock().context_closed(context);
         let libraries = self.shared.libraries.lock().ids_of(context);
         for id in libraries {
             if let Err(refusal) = refusals::refusing(|| self.forget_library(id)) {
@@ -1646,6 +1666,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => self.buffer_over_surface_pages(device, message),
             RGFX_CMD_BUFFER_MANAGED_AT_OFFSET => self.managed_buffer_at_offset(device, message),
+            RGFX_CMD_BUFFER_OVER_PAGES => self.buffer_over_pages(device, message),
             RGFX_CMD_BUFFER_DID_MODIFY_RANGE => {
                 let drain = self.command_buffer_drain();
                 self.did_modify_range(message, drain)

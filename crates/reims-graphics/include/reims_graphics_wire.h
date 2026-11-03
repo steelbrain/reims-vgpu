@@ -920,7 +920,8 @@
 #define RGFX_FEATURE_CB_PARTS (1 << 6)
 
 // `FEATURES_LO` bit 7, `PAGES_BUFFERS`: ring 0 carries [`RGFX_CMD_BUFFER_OVER_PAGES`], and a
-// `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_PRIVATE`]. No host offers it yet.
+// `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_PRIVATE`]. A host offers it where it offers
+// [`RGFX_FEATURE_SURFACE_PAGES`].
 #define RGFX_FEATURE_PAGES_BUFFERS (1 << 7)
 
 // `FEATURES_LO` bit 8, `QUEUE_VECTORS`: the device has an MSI-X vector for each context slot
@@ -1330,8 +1331,8 @@
 
 // Command `BUFFER_OVER_PAGES` ([`RgfxBufferOverPages`]), where the guest took
 // [`RGFX_FEATURE_PAGES_BUFFERS`]: a buffer over a range of a pages block of the sender's context,
-// the guest's own pages in place. No host offers the feature yet, and a host without it refuses
-// the message as one it does not know.
+// the guest's own pages in place. A host without the feature refuses the message as one it does
+// not know.
 #define RGFX_CMD_BUFFER_OVER_PAGES 542
 
 // Command `ICB_CREATE` ([`RgfxIcbCreate`]), where the guest took
@@ -1589,7 +1590,8 @@
 
 // [`RgfxSurfacePagesCache::flags`], where the guest took [`RGFX_FEATURE_PAGES_BUFFERS`]: the
 // block is a process's pages block, for its `BUFFER_OVER_PAGES` buffers, not an IOSurface's, and
-// its view stays out of the host's surface-view cache. No host offers the feature yet.
+// its view stays out of the host's surface-view cache. The block holds the runs alone, of pages
+// the kext wired for the block's context, and the host takes no device cache for it.
 #define RGFX_SURFACE_PAGES_PRIVATE (1 << 1)
 
 // [`RgfxIcbCreate`] `flags`: `inheritPipelineState`.

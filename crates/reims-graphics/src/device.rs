@@ -300,12 +300,15 @@ pub trait Host: Send + Sync + 'static {
     /// read out of the block, before its first `BLOCK_SHARE`. The host maps them as one view for
     /// the block's `BUFFER_OVER_SURFACE_PAGES` buffers, until the block's `BLOCK_RELEASE`, where
     /// it carries out [`RGFX_FEATURE_SURFACE_PAGES`], and answers [`RGFX_STATUS_OK`]; else
-    /// [`RGFX_STATUS_REFUSED`], with no view. `cached`: the kext marked the block cached
-    /// ([`RGFX_SURFACE_PAGES_CACHED`]), and a host that carries out
-    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives it a device cache, which its buffers are. Called on
-    /// the control thread, in ring order. The default maps nothing.
-    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, cached: bool) -> u32 {
-        let _ = (pages, runs, cached);
+    /// [`RGFX_STATUS_REFUSED`], with no view. `flags` are the message's `RGFX_SURFACE_PAGES_*`
+    /// ([`RgfxSurfacePagesCache::flags`], 0 for a message without them):
+    /// [`RGFX_SURFACE_PAGES_CACHED`], where a host that carries out
+    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are; and
+    /// [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a
+    /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
+    /// buffers alone. Called on the control thread, in ring order. The default maps nothing.
+    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, flags: u32) -> u32 {
+        let _ = (pages, runs, flags);
         RGFX_STATUS_REFUSED
     }
 
@@ -1285,9 +1288,9 @@ impl Shared {
 
     /// `SURFACE_PAGES`: its runs read out of its block for the host ([`Host::surface_pages`]),
     /// whose answer it is, where the block lies in the processes' blocks and its runs, whole, in
-    /// the block; else logged and [`RGFX_STATUS_INVALID_ARGUMENT`], with no view. `cached`: the
-    /// message marked the block cached.
-    pub(crate) fn surface_pages(&self, pages: &RgfxSurfacePages, cached: bool) -> u32 {
+    /// the block; else logged and [`RGFX_STATUS_INVALID_ARGUMENT`], with no view. `flags`: the
+    /// message's `RGFX_SURFACE_PAGES_*`, 0 for one without them.
+    pub(crate) fn surface_pages(&self, pages: &RgfxSurfacePages, flags: u32) -> u32 {
         let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
         let block_end = pages.block_offset.checked_add(pages.block_size);
         let runs_bytes = u64::from(pages.run_count) * size_of::<RgfxPageRun>() as u64;
@@ -1319,7 +1322,7 @@ impl Shared {
             .iter()
             .filter_map(|run| RgfxPageRun::read_from_bytes(run).ok())
             .collect();
-        self.host.surface_pages(pages, runs, cached)
+        self.host.surface_pages(pages, runs, flags)
     }
 
     /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`

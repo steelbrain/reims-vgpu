@@ -4531,10 +4531,10 @@ fn a_failed_context_s_pipeline_creates_are_carried_out() {
     assert_eq!(device.decoder_object_count(), before + 2);
 }
 
-/// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
-/// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
-/// a command buffer's ask for its submission (`CB_SUBMITTED`), orders command buffers over the
-/// IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
+/// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS` over it, where
+/// the host's page is the guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does.
+/// Every device answers a command buffer's ask for its submission (`CB_SUBMITTED`), orders command
+/// buffers over the IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
 /// (`INDIRECT_COMMAND_BUFFERS`), makes the queues the kext asks unshared on the platform's
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
 /// ring of the device's takes (`SUBMIT_ROOM`), and reads indirect command buffers' CPU encodes
@@ -4564,7 +4564,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let want = if platform.vm().page_size() == 4096 {
-        RGFX_FEATURE_SURFACE_PAGES
+        RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_PAGES_BUFFERS
     } else {
         0
     };

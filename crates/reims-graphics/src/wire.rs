@@ -101,7 +101,8 @@ pub const RGFX_FEATURE_QUEUE_BARRIER: u32 = 1 << 5;
 /// No host offers it yet.
 pub const RGFX_FEATURE_CB_PARTS: u32 = 1 << 6;
 /// `FEATURES_LO` bit 7, `PAGES_BUFFERS`: ring 0 carries [`RGFX_CMD_BUFFER_OVER_PAGES`], and a
-/// `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_PRIVATE`]. No host offers it yet.
+/// `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_PRIVATE`]. A host offers it where it offers
+/// [`RGFX_FEATURE_SURFACE_PAGES`].
 pub const RGFX_FEATURE_PAGES_BUFFERS: u32 = 1 << 7;
 /// `FEATURES_LO` bit 8, `QUEUE_VECTORS`: the device has an MSI-X vector for each context slot
 /// after vector 0, and a queue's completion ring raises its context's. No host offers it yet.
@@ -482,8 +483,8 @@ pub const RGFX_CMD_BUFFER_OVER_SURFACE_PAGES: u32 = 0x21c;
 pub const RGFX_CMD_VIDEO_SESSION_CREATE: u32 = 0x21d;
 /// Command `BUFFER_OVER_PAGES` ([`RgfxBufferOverPages`]), where the guest took
 /// [`RGFX_FEATURE_PAGES_BUFFERS`]: a buffer over a range of a pages block of the sender's context,
-/// the guest's own pages in place. No host offers the feature yet, and a host without it refuses
-/// the message as one it does not know.
+/// the guest's own pages in place. A host without the feature refuses the message as one it does
+/// not know.
 pub const RGFX_CMD_BUFFER_OVER_PAGES: u32 = 0x21e;
 /// Command `ICB_CREATE` ([`RgfxIcbCreate`]), where the guest took
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: indirect command buffer `obj_id`, made by the
@@ -1240,7 +1241,8 @@ pub const RGFX_SURFACE_PAGES_CACHE_OFFSET: u32 = 56;
 pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
 /// [`RgfxSurfacePagesCache::flags`], where the guest took [`RGFX_FEATURE_PAGES_BUFFERS`]: the
 /// block is a process's pages block, for its `BUFFER_OVER_PAGES` buffers, not an IOSurface's, and
-/// its view stays out of the host's surface-view cache. No host offers the feature yet.
+/// its view stays out of the host's surface-view cache. The block holds the runs alone, of pages
+/// the kext wired for the block's context, and the host takes no device cache for it.
 pub const RGFX_SURFACE_PAGES_PRIVATE: u32 = 1 << 1;
 
 /// What a `SURFACE_PAGES` says of its block's device cache, after the [`RgfxSurfacePages`] at
