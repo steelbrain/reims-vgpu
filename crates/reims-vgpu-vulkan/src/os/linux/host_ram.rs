@@ -277,9 +277,12 @@ mod tests {
     #[test]
     #[ignore = "a measurement: run alone, holding the GPU"]
     fn slab_heap_costs() {
+        use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
         use reims_vgpu_core::platform::resource::Heap as _;
         use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
-        use std::time::Instant;
+        let clock = crate::os::OsClock::new();
+        let now = || clock.now_mono();
+        let since = |t: MonoTime| clock.now_mono().saturating_duration_since(t);
         const SHARED_TRACKED: u64 = 0x200;
         const PLACEMENT: i64 = 1;
         let device = dev();
@@ -345,9 +348,9 @@ mod tests {
         let mut made = Vec::new();
         let mut first = 0.0;
         for i in 0..2000u64 {
-            let t = Instant::now();
+            let t = now();
             heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
-            let us = t.elapsed().as_secs_f64() * 1e6;
+            let us = since(t).as_secs_f64() * 1e6;
             if i == 0 {
                 first = us;
             }
@@ -368,11 +371,11 @@ mod tests {
         let mut placed = Vec::new();
         let mut times = Vec::new();
         for k in 0..512u64 {
-            let t = Instant::now();
+            let t = now();
             let b = heaps[1]
                 .new_buffer_of_length(4096, SHARED_TRACKED, k * 4096)
                 .unwrap();
-            times.push(t.elapsed().as_secs_f64() * 1e6);
+            times.push(since(t).as_secs_f64() * 1e6);
             placed.push(b.unwrap());
         }
         let (p50, max) = median(&mut times);
@@ -418,20 +421,20 @@ mod tests {
             (512, 4096, 4300 * MIB),
             (4096, 4096, 4300 * MIB),
         ] {
-            let t = Instant::now();
+            let t = now();
             let (base, len) = view(runs, run, from);
-            let map_us = t.elapsed().as_secs_f64() * 1e6;
+            let map_us = since(t).as_secs_f64() * 1e6;
             let c0 = counts();
-            let t = Instant::now();
+            let t = now();
             let h = heap_at(base.addr().to_u64(), len);
-            let us = t.elapsed().as_secs_f64() * 1e6;
+            let us = since(t).as_secs_f64() * 1e6;
             let c1 = counts();
-            let t = Instant::now();
+            let t = now();
             let b = h
                 .new_buffer_of_length(4096, SHARED_TRACKED, len - 4096)
                 .unwrap()
                 .unwrap();
-            let place_us = t.elapsed().as_secs_f64() * 1e6;
+            let place_us = since(t).as_secs_f64() * 1e6;
             println!(
                 "slab: view heap runs={runs} run={run} bytes={len} map_us={map_us:.1} heap_us={us:.1} \
                  place_us={place_us:.1} chunk_bound={} host_pointer_imports={} copied_heaps={}",
@@ -446,7 +449,7 @@ mod tests {
         let round = |n: usize| {
             let mut v = Vec::new();
             for _ in 0..n {
-                let t = Instant::now();
+                let t = now();
                 let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
                 let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
                 let fill = BlitCmd::FillBuffer {
@@ -459,22 +462,22 @@ mod tests {
                 cb.commit(OnFault::Die).unwrap();
                 cb.wait_until_completed(OnFault::Die).unwrap();
                 assert!(cb.error().is_none(), "{:?}", cb.error());
-                v.push(t.elapsed().as_secs_f64() * 1e6);
+                v.push(since(t).as_secs_f64() * 1e6);
             }
             median(&mut v)
         };
         // Rounds of 20 in a row after heaps are made, each round's median with the time since the
         // makes ended: whether a submission's cost after many makes follows their count or the time.
-        let series = |label: &str, made_at: Instant| {
+        let series = |label: &str, made_at: MonoTime| {
             let mut out = String::new();
             for _ in 0..8 {
                 let (p50, _) = round(20);
-                let ms = made_at.elapsed().as_secs_f64() * 1e3;
+                let ms = since(made_at).as_secs_f64() * 1e3;
                 out.push_str(&format!(" {p50:.0}us@{ms:.0}ms"));
             }
             println!("slab: cb round trips {label}:{out}");
         };
-        series("after making 2,004 heaps", Instant::now());
+        series("after making 2,004 heaps", now());
         let all = round(100);
         drop(views);
         heaps.truncate(200);
@@ -488,18 +491,18 @@ mod tests {
         );
         let mut again = Vec::new();
         for i in 2..2000u64 {
-            let t = Instant::now();
+            let t = now();
             heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
-            again.push(t.elapsed().as_secs_f64() * 1e6);
+            again.push(since(t).as_secs_f64() * 1e6);
         }
         let (again50, againmax) = median(&mut again);
         println!("slab: 1,998 heaps made again at p50 {again50:.1} us, max {againmax:.1}");
-        series("after making 1,998 again", Instant::now());
+        series("after making 1,998 again", now());
         heaps.truncate(2);
         for i in 2..2000u64 {
             heaps.push(heap_at(at + 2 * MIB * i, 2 * MIB));
         }
-        let made = Instant::now();
+        let made = now();
         std::thread::sleep(std::time::Duration::from_millis(300));
         series("after making 1,998 again, then 300 ms idle", made);
         heaps.truncate(2);
@@ -511,7 +514,7 @@ mod tests {
         }
         series(
             "after making 1,998 again with a command buffer every 100",
-            Instant::now(),
+            now(),
         );
         let keep = heaps;
         // SAFETY: the RAM, which no GPU work uses now.
