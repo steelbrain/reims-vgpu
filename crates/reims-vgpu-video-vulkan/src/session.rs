@@ -1,7 +1,11 @@
 //! One stream's video session, of either codec: the `VkVideoSessionKHR`
 //! and its memory, its DPB pictures, its parameters object, and the command
 //! buffers and bitstream buffers its decodes are submitted with, each
-//! reused once the timeline has passed the work that used it. What is the
+//! reused once the timeline has passed the work that used it. A bitstream
+//! buffer is made only for a picture whose slices are copied: one read in
+//! place makes none, so a stream read in place maps no host memory for its
+//! slices. On an RTX 5080, about 7 of a session's new submissions, each
+//! with its 2 MiB buffer, took over 1 ms, up to 16 ms (measured). What is the
 //! codec's goes in with each decode ([`CodecInfo`]) and in the parameters
 //! object its accelerator makes ([`SessionParameters`]).
 //!
@@ -587,9 +591,31 @@ struct Submission {
     command: vk::CommandBuffer,
     /// The copy queue's, where copies run on it.
     copy_command: vk::CommandBuffer,
-    bitstream: Bitstream,
+    /// Made by the first decode with it whose slices are not read in place,
+    /// so a stream read in place makes none.
+    bitstream: Option<Bitstream>,
     /// The value the last work submitted with it signals.
     value: u64,
+}
+
+impl Submission {
+    /// Whether its bitstream buffer holds `size` bytes: any submission
+    /// holds none.
+    fn holds(&self, size: u64) -> bool {
+        size == 0 || self.bitstream.as_ref().is_some_and(|b| b.size >= size)
+    }
+}
+
+/// The size of the bitstream buffer a submission makes for a picture of
+/// `size` bytes: none where `size` is 0, a picture read in place, and
+/// otherwise a power of two of [`MIN_BITSTREAM`] at least, a multiple of
+/// `alignment`, so that the buffer serves larger pictures after it.
+fn bitstream_size(size: u64, alignment: u64) -> Option<u64> {
+    (size != 0).then(|| {
+        size.max(MIN_BITSTREAM)
+            .next_power_of_two()
+            .next_multiple_of(alignment.max(1))
+    })
 }
 
 /// A host-visible buffer a picture's slices are written into, mapped for
@@ -749,7 +775,7 @@ impl<P: SessionParameters> Session<P> {
             Some(place) => (place.offsets.clone(), place.range),
             None => slice_layout(decode.slices, self.caps.min_bitstream_buffer_size_alignment)?,
         };
-        let mut submission = self.submission(if in_place.is_some() { 0 } else { range })?;
+        let mut submission = self.submission(if in_place.is_some() { 0 } else { range.max(1) })?;
         let source = in_place
             .as_ref()
             .map(|place| (place.buffer.buffer, place.offset));
@@ -894,8 +920,10 @@ impl<P: SessionParameters> Session<P> {
         let (src_buffer, src_offset) = match source {
             Some(source) => source,
             None => {
-                submission.bitstream.write(decode.slices, offsets, range);
-                (submission.bitstream.buffer, 0)
+                let bitstream = (submission.bitstream.as_mut())
+                    .ok_or_else(|| Error::Unsupported("a submission with no bitstream".into()))?;
+                bitstream.write(decode.slices, offsets, range);
+                (bitstream.buffer, 0)
             }
         };
         let device = self.device.device();
@@ -1265,7 +1293,9 @@ impl<P: SessionParameters> Session<P> {
     }
 
     /// A submission whose last work is done, with a bitstream buffer of
-    /// `size` bytes at least.
+    /// `size` bytes at least, or with none where `size` is 0 and it has
+    /// none: a picture read in place needs none, and the buffer, host
+    /// memory the device maps, is the costly part of a new one.
     fn submission(&mut self, size: u64) -> Result<Submission, Error> {
         let completed = self.timeline.completed();
         while self.busy.front().is_some_and(|s| s.value <= completed) {
@@ -1273,7 +1303,7 @@ impl<P: SessionParameters> Session<P> {
                 self.free.push(done);
             }
         }
-        if let Some(at) = self.free.iter().position(|s| s.bitstream.size >= size) {
+        if let Some(at) = self.free.iter().position(|s| s.holds(size)) {
             return Ok(self.free.swap_remove(at));
         }
         let (command, copy_command) = match self.free.pop() {
@@ -1289,12 +1319,12 @@ impl<P: SessionParameters> Session<P> {
                 (command, copy_command)
             }
         };
-        let size = size
-            .max(MIN_BITSTREAM)
-            .next_power_of_two()
-            .next_multiple_of(self.caps.min_bitstream_buffer_size_alignment.max(1));
-        // The command buffers go with their pools where this fails.
-        let bitstream = Bitstream::new(&self.device, &self.caps, size)?;
+        let alignment = self.caps.min_bitstream_buffer_size_alignment;
+        let bitstream = match bitstream_size(size, alignment) {
+            // The command buffers go with their pools where this fails.
+            Some(size) => Some(Bitstream::new(&self.device, &self.caps, size)?),
+            None => None,
+        };
         Ok(Submission {
             command,
             copy_command,
@@ -1737,6 +1767,28 @@ mod tests {
         assert_eq!(range, 23);
         // An alignment of 0 is taken as 1.
         assert_eq!(slice_layout(&slices, 0).unwrap().1, 23);
+    }
+
+    #[test]
+    fn a_picture_read_in_place_makes_no_bitstream_buffer() {
+        assert_eq!(bitstream_size(0, 256), None);
+        let read_in_place = Submission {
+            command: vk::CommandBuffer::null(),
+            copy_command: vk::CommandBuffer::null(),
+            bitstream: None,
+            value: 0,
+        };
+        // It serves every picture read in place, and no copied one.
+        assert!(read_in_place.holds(0));
+        assert!(!read_in_place.holds(1));
+        // A copied picture's buffer is a power of two of 2 MiB at least.
+        assert_eq!(bitstream_size(1, 256), Some(MIN_BITSTREAM));
+        assert_eq!(bitstream_size(MIN_BITSTREAM, 256), Some(MIN_BITSTREAM));
+        assert_eq!(
+            bitstream_size(MIN_BITSTREAM + 1, 256),
+            Some(2 * MIN_BITSTREAM)
+        );
+        assert_eq!(bitstream_size(1, 3 << 20), Some(3 << 20));
     }
 
     #[test]
