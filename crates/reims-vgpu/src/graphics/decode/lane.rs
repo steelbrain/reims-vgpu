@@ -5,7 +5,9 @@
 //! - **Jobs.** The queue's service thread (or a doorbell's) takes and begins each command buffer,
 //!   in the order the guest published them, and hands the rest of its work to the lane
 //!   ([`Lane::run`]): its walk, its commit, its stand-in or the failure posted for it. The lane's
-//!   threads take the jobs in the order they came.
+//!   threads take the jobs in the order they came. A buffer walked in its turn (one that holds a
+//!   video encoder) whose turn is next ([`Turn::is_next`]) is carried out on the service thread
+//!   instead, as it waits there for nothing (`graphics.rs`'s `carry_out`).
 //! - **Threads.** A lane with work has one thread of its own, made as a job comes and none is
 //!   running, which goes once it has had no job for [`IDLE`]. A job that comes while every thread
 //!   of the lane is busy may get the lane another, up to [`LANE_THREADS`] in all, where the
@@ -280,6 +282,12 @@ impl Turn {
         &self.lane
     }
 
+    /// Whether every turn before this one has passed, so that it waits for none: no job of the
+    /// lane's before it is running or waiting to start.
+    pub(crate) fn is_next(&self) -> bool {
+        self.lane.state.lock().passed == self.number
+    }
+
     /// Waits, with no lock of the caller's held, for every turn before this one to pass.
     pub(crate) fn wait(&self) {
         let mut state = self.lane.state.lock();
@@ -311,6 +319,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// A turn is next once every turn before it has passed, whichever order they pass in.
+    #[test]
+    fn a_turn_is_next_once_every_turn_before_it_has_passed() {
+        let lane = Lane::new(1, Budget::new(0));
+        let first = lane.turn(false).unwrap();
+        let second = lane.turn(false).unwrap();
+        let third = lane.turn(false).unwrap();
+        assert!(first.is_next() && !second.is_next() && !third.is_next());
+        drop(second);
+        assert!(!third.is_next(), "next with the first not passed");
+        drop(first);
+        assert!(third.is_next());
+    }
 
     /// A turn waits for every turn before it, whichever order they pass in.
     #[test]

@@ -1011,6 +1011,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// [`Self::handle_stage3`] reports a message, its failure posted in its turn too. The decoder
     /// lets go of what the message holds, and `carried` of the reset gate, before the report,
     /// which may wait for room on the ring.
+    ///
+    /// A buffer walked in its turn ([`Begun::ordered`], one that holds a video encoder) whose
+    /// turn is next is carried out here, on the queue's service thread, rather than on the lane:
+    /// it waits there for no buffer of its queue, and a lane's thread would first have to be
+    /// woken or made for it (measured on the RTX 5080 host: 80 to 90 µs a picture). Its queue's
+    /// next buffer is begun once it is committed; on the video driver's
+    /// queues, a session's own each, that one holds a video encoder too and would have waited for
+    /// this one's turn before its walk anyway.
     fn carry_out(
         self: &Arc<Self>,
         decoder: GraphicsDecoder<P>,
@@ -1020,6 +1028,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         message: Vec<u8>,
     ) {
         let lane = decoder.lane();
+        let here = matches!(&begun, Ok(Ok(b)) if b.ordered()) && decoder.turn_is_next();
         let control = Arc::clone(self);
         let job = move || {
             entry::run(|_| {
@@ -1048,8 +1057,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             });
         };
         match lane {
-            Some(lane) => lane.run(Box::new(job)),
-            None => job(),
+            Some(lane) if !here => lane.run(Box::new(job)),
+            _ => job(),
         }
     }
 

@@ -1904,7 +1904,10 @@ commit. Each outcome the new design allows is one of those two:
     commit, so a buffer after it that asks for its `CB_SUBMITTED` is answered
     at its scheduling, as behind one already committed;
   - a video encoder's work, which its session starts as it is walked: a buffer
-    that holds one is walked only in its turn;
+    that holds one is walked only in its turn, and one whose turn is next at
+    its begin is walked and committed on the service thread itself, where it
+    waits for no buffer of its queue, rather than handed to a lane thread that
+    would first be woken or made for it;
   - its signal of its queue's surface timeline ("Surface order"), and the
     release that stands in for one of a buffer that does not run: each is
     decided in the buffer's turn, after its walk, since the order reads a
@@ -1922,6 +1925,8 @@ commit. Each outcome the new design allows is one of those two:
   the order they came, and every lane with work has a thread of its own, so
   the oldest unfinished buffer of each lane is on a thread, and so is the
   oldest of the device: the waits end, by induction on the begin order. A
+  buffer carried out on its service thread is its lane's oldest unfinished
+  one, and the lane gets no job while it runs. A
   lane's own thread goes after a second with no job; a job that comes while
   every thread of the lane is busy gets another, up to four a lane, only where
   the device-wide budget of twice the host's cores has one free, which a lane
@@ -1929,8 +1934,11 @@ commit. Each outcome the new design allows is one of those two:
   at most. Tested through the device by
   `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
   `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`
-  and `a_video_buffer_is_walked_in_its_turn` (`graphics/tests.rs`), and by the
-  lane's `a_turn_waits_for_every_turn_before_it`,
+  `a_video_buffer_is_walked_in_its_turn` and
+  `a_lone_video_buffer_is_walked_on_its_queue_s_service_thread`
+  (`graphics/tests.rs`), and by the lane's
+  `a_turn_waits_for_every_turn_before_it`,
+  `a_turn_is_next_once_every_turn_before_it_has_passed`,
   `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order` and
   `busy_lanes_hold_one_thread_each_and_the_budget_s`.

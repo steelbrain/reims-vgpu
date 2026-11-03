@@ -2468,6 +2468,61 @@ fn a_video_buffer_is_walked_in_its_turn() {
     }
 }
 
+/// A command buffer that holds a video encoder, sent to a queue with no buffer before it still to
+/// be carried out, is walked on the queue's service thread, not handed to a lane thread: its turn
+/// is next, so it would wait there for nothing. The one sent behind a buffer still walked goes to
+/// the lane ([`a_video_buffer_is_walked_in_its_turn`])
+#[test]
+fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
+        RgfxOpVideoPass,
+    };
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let threads = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&threads);
+    device
+        .control
+        .decoder()
+        .set_walk_hook(Some(Arc::new(move |index: usize| {
+            if index == 0 {
+                let name = std::thread::current().name().map(str::to_owned);
+                seen.lock().push(name.unwrap_or_default());
+            }
+        })));
+    let pass = RgfxOpVideoPass {
+        session_obj_id: obj(1, 9),
+    };
+    let video = |cb| {
+        command_buffer_of(
+            obj(1, 1),
+            cb,
+            &[
+                (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+                (RGFX_OP_ENCODER_END, &[]),
+                (RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()),
+            ],
+        )
+    };
+    // Two, one after the other: the second is sent once the first has completed.
+    for cb in [100, 101] {
+        ring.send(&device, video(cb));
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status == RGFX_CB_OK), (cb, false));
+    }
+    let threads = threads.lock().clone();
+    assert_eq!(threads.len(), 2, "walks seen: {threads:?}");
+    for name in &threads {
+        assert!(
+            name.starts_with("reims-vgpu.graphics-queue-"),
+            "a lone video buffer walked on {name:?}"
+        );
+    }
+}
+
 /// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of
 /// another queue that names the first of two buffers, sent while the first is still walked and
 /// the second, which holds no `SURFACE_ORDER`, has been walked whole beside it, waits on the GPU

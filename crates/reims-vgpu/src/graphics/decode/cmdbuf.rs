@@ -361,6 +361,11 @@ pub(crate) struct Begun<P: Platform> {
 }
 
 impl<P: Platform> Begun<P> {
+    /// It holds a video encoder, so it is walked in its turn.
+    pub(crate) fn ordered(&self) -> bool {
+        self.ordered
+    }
+
     /// Its `CB_SUBMITTED`, where it gets it at its take: it asks for one, waits for no event and
     /// no fill of a device cache (a GPU wait for a buffer of another queue holds back nothing,
     /// [`Line`]), and no buffer before it on its queue holds the queue. Any other gets it at its
@@ -935,6 +940,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Some(turn) = self.turn.borrow().as_ref() {
             turn.wait();
         }
+    }
+
+    /// Whether the command buffer's turn in its queue's lane is next ([`Turn::is_next`]), so that
+    /// it waits for no buffer of its queue; true where it has no turn.
+    pub(crate) fn turn_is_next(&self) -> bool {
+        self.turn.borrow().as_ref().is_none_or(Turn::is_next)
     }
 
     /// The lane of the command buffer's queue, where it was given a turn there.
