@@ -42,11 +42,21 @@ struct Raised {
     moved: Condvar,
 }
 
-/// A host that answers each `COMMAND_BUFFER` with its `CB_COMPLETE` (`RGFX_CB_OK`, GPU times 0)
-/// on the queue's completion ring, as [`QueueTestHost`] does, and keeps every interrupt for the
-/// guest to take.
+/// Every feature bit the wire names, which a host offering all of them offers.
+const EVERY_FEATURE: u64 = PEER_FEATURES
+    | (RGFX_FEATURE_QUIET_SCHEDULED
+        | RGFX_FEATURE_CONSUMED_DOORBELL
+        | RGFX_FEATURE_QUEUE_BARRIER
+        | RGFX_FEATURE_CB_PARTS
+        | RGFX_FEATURE_PAGES_BUFFERS
+        | RGFX_FEATURE_QUEUE_VECTORS) as u64;
+
+/// A host that offers `features`, answers each `COMMAND_BUFFER` with its `CB_COMPLETE`
+/// (`RGFX_CB_OK`, GPU times 0) on the queue's completion ring, as [`QueueTestHost`] does, and
+/// keeps every interrupt for the guest to take.
 struct PeerHost {
     raised: Arc<Raised>,
+    features: u64,
 }
 
 impl Host for PeerHost {
@@ -58,7 +68,7 @@ impl Host for PeerHost {
         false
     }
     fn features(&self) -> u64 {
-        PEER_FEATURES
+        self.features
     }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
@@ -93,6 +103,9 @@ fn register_name(offset: u32) -> String {
         RGFX_REG_REGION_SIZE_LO => "REGION_SIZE_LO".into(),
         RGFX_REG_REGION_SIZE_HI => "REGION_SIZE_HI".into(),
         RGFX_REG_DOORBELL => "DOORBELL".into(),
+        RGFX_REG_DRIVER_FEATURES_LO => "DRIVER_FEATURES_LO".into(),
+        RGFX_REG_DRIVER_FEATURES_HI => "DRIVER_FEATURES_HI".into(),
+        RGFX_REG_CONSUMED => "CONSUMED".into(),
         other => format!("{other:#05x}"),
     }
 }
@@ -191,10 +204,17 @@ struct FakeGuest {
 }
 
 impl FakeGuest {
+    /// A guest of a device whose host offers the real host's features ([`PEER_FEATURES`]).
     fn new() -> FakeGuest {
+        FakeGuest::offered(PEER_FEATURES)
+    }
+
+    /// A guest of a device whose host offers `features`.
+    fn offered(features: u64) -> FakeGuest {
         let raised = Arc::new(Raised::default());
         let rig = Rig::with_host(Box::new(PeerHost {
             raised: Arc::clone(&raised),
+            features,
         }));
         FakeGuest {
             rig,
@@ -245,17 +265,25 @@ impl FakeGuest {
             && region.atomic_u32(ring.submit + 0x80).load(Ordering::SeqCst) == 1
     }
 
-    /// The kext's start: the device checked, reset, the rings' counts taken as they stand, then
-    /// the driver ready.
+    /// The wire-2 kext's start: the device checked, reset, the rings' counts taken as they
+    /// stand, then the driver ready, with no feature written.
     fn start(&mut self) {
+        self.start_taking(None);
+    }
+
+    /// The kext's start, which, given `wanted`, writes `DRIVER_FEATURES` after the reset and
+    /// before the driver is ready: the bits of `wanted` the host offers, read back as the ones it
+    /// took. What it took, 0 where nothing was written.
+    fn start_taking(&mut self, wanted: Option<u64>) -> u64 {
         assert_eq!(self.read(RGFX_REG_MAGIC), RGFX_MAGIC);
         assert_eq!(self.read(RGFX_REG_VERSION), RGFX_VERSION);
         let size = (u64::from(self.read(RGFX_REG_REGION_SIZE_HI)) << 32)
             | u64::from(self.read(RGFX_REG_REGION_SIZE_LO));
         assert_eq!(size, REGION_SIZE);
-        self.read(RGFX_REG_FEATURES_LO);
-        self.read(RGFX_REG_FEATURES_HI);
+        let offered = u64::from(self.read(RGFX_REG_FEATURES_LO))
+            | (u64::from(self.read(RGFX_REG_FEATURES_HI)) << 32);
         self.write(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+        let taken = wanted.map_or(0, |wanted| self.write_driver_features(wanted & offered));
         let region = self.rig.region();
         self.control.produced = region
             .atomic_u64(RGFX_CONTROL_SUBMIT_OFFSET)
@@ -265,6 +293,28 @@ impl FakeGuest {
             .load(Ordering::SeqCst);
         self.write(RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);
         self.read(RGFX_REG_STATUS);
+        taken
+    }
+
+    /// Writes both halves of `DRIVER_FEATURES` with `features`, then reads them back: what the
+    /// device answers.
+    fn write_driver_features(&mut self, features: u64) -> u64 {
+        self.write(RGFX_REG_DRIVER_FEATURES_LO, features as u32);
+        self.write(RGFX_REG_DRIVER_FEATURES_HI, (features >> 32) as u32);
+        self.driver_features()
+    }
+
+    /// `DRIVER_FEATURES` as the device reads it.
+    fn driver_features(&mut self) -> u64 {
+        u64::from(self.read(RGFX_REG_DRIVER_FEATURES_LO))
+            | (u64::from(self.read(RGFX_REG_DRIVER_FEATURES_HI)) << 32)
+    }
+
+    /// The control ring armed, as the kext's service leaves it before its first command.
+    fn arm_control(&mut self) {
+        let control = std::mem::replace(&mut self.control, GuestRing::control());
+        assert!(!self.arm_and_check(&control));
+        self.control = control;
     }
 
     /// Publishes `messages` on `ring`'s submission ring with one producer store, each stamped
@@ -466,6 +516,34 @@ impl FakeGuest {
         assert!(!self.arm_and_check(&queue));
         queue
     }
+
+    /// Creates queue `obj_id` over the tests' rings, new, with a `QUEUE_CREATE` that carries the
+    /// flags tail with `flags`, as the kext sends it where its process asked for a flag. The
+    /// status the host answers.
+    fn create_queue_flagged(&mut self, obj_id: u64, flags: u32) -> u32 {
+        for at in [QUEUE_SUBMIT, QUEUE_COMPLETE] {
+            self.region().write(at, &[0u8; 256]);
+        }
+        let mut create = queue_create(obj_id);
+        create.extend_from_slice(
+            RgfxQueueCreateFlags {
+                flags,
+                reserved_04: 0,
+            }
+            .as_bytes(),
+        );
+        let answer = self.command(create);
+        RgfxComplete::read_from_bytes(&answer).unwrap().status
+    }
+
+    /// Grants the tests' queue rings' blocks to `context`, as the kext does before its first
+    /// queue's create.
+    fn grant_queue_rings(&mut self, context: u32) {
+        let span = u64::from(RGFX_RING_HEADER_SIZE + QUEUE_RING_DATA);
+        for ring in [QUEUE_SUBMIT, QUEUE_COMPLETE] {
+            self.command_unanswered(block_message(RGFX_CMD_BLOCK_GRANT, context, ring, span));
+        }
+    }
 }
 
 /// A `COMMAND_BUFFER` of `cb_obj_id` on queue `queue`, with no ops.
@@ -605,5 +683,109 @@ fn peer_wire2_traffic_is_the_same_each_run() {
     let first = trace_of(wire2_script);
     for _ in 0..4 {
         assert_eq!(trace_of(wire2_script), first);
+    }
+}
+
+/// A wire-2 guest on a host that offers every feature the wire names, which never writes
+/// `DRIVER_FEATURES`, gets the recorded wire-2 traffic: only the `FEATURES_LO` it reads differs.
+#[test]
+fn peer_wire2_traffic_is_the_same_on_a_host_offering_every_feature() {
+    let mut guest = FakeGuest::offered(EVERY_FEATURE);
+    wire2_script(&mut guest);
+    let offered = format!("read FEATURES_LO = {:#x}", PEER_FEATURES);
+    let every = format!("read FEATURES_LO = {:#x}", EVERY_FEATURE);
+    let recorded: Vec<&str> = include_str!("peer_wire2.trace").lines().collect();
+    let trace: Vec<String> = guest
+        .trace
+        .iter()
+        .map(|line| {
+            if *line == every {
+                offered.clone()
+            } else {
+                line.clone()
+            }
+        })
+        .collect();
+    assert!(guest.trace.contains(&every));
+    assert_eq!(trace, recorded);
+}
+
+/// A `DRIVER_FEATURES` write takes the bits written that the host offers and knows, each half on
+/// its own, and a later write before the driver is ready replaces what an earlier one took.
+#[test]
+fn driver_features_take_what_is_written_offered_and_known() {
+    // Bits 3 and 5 of the new ones, bit 9 (reserved) and bit 40, which the host does not know.
+    let offered = PEER_FEATURES
+        | u64::from(RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_QUEUE_BARRIER)
+        | (1 << 9)
+        | (1 << 40);
+    let mut guest = FakeGuest::offered(offered);
+    assert_eq!(guest.driver_features(), 0, "unwritten, it reads 0");
+    guest.write(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+    assert_eq!(
+        guest.write_driver_features(u64::MAX),
+        PEER_FEATURES | u64::from(RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_QUEUE_BARRIER)
+    );
+    assert_eq!(
+        guest.write_driver_features(u64::from(RGFX_FEATURE_CONSUMED_DOORBELL)),
+        0,
+        "a bit not offered is not taken, and the write replaces the last"
+    );
+    guest.write(RGFX_REG_DRIVER_FEATURES_LO, RGFX_FEATURE_QUEUE_BARRIER);
+    guest.write(RGFX_REG_DRIVER_FEATURES_HI, 1 << 8);
+    assert_eq!(
+        guest.driver_features(),
+        u64::from(RGFX_FEATURE_QUEUE_BARRIER)
+    );
+    // The kext's start writes the bits it wants of the offer and reads back the same.
+    let wanted = u64::from(RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CB_SUBMITTED);
+    assert_eq!(guest.start_taking(Some(wanted)), wanted);
+}
+
+/// Once the driver is ready, `DRIVER_FEATURES` writes are ignored until a reset, which clears it:
+/// the guest's `STATUS` 0 and the host's own.
+#[test]
+fn driver_features_are_fixed_while_ready_and_cleared_by_a_reset() {
+    let mut guest = FakeGuest::offered(EVERY_FEATURE);
+    let wanted = u64::from(RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CB_PARTS);
+    assert_eq!(guest.start_taking(Some(wanted)), wanted);
+    assert_eq!(guest.write_driver_features(EVERY_FEATURE), wanted);
+    assert_eq!(guest.write_driver_features(0), wanted);
+    guest.write(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+    assert_eq!(guest.driver_features(), 0);
+
+    assert_eq!(guest.start_taking(Some(wanted)), wanted);
+    guest.rig.device.reset();
+    assert_eq!(guest.driver_features(), 0);
+}
+
+/// A `QUEUE_CREATE` whose tail asks for a flag the host does not carry out for the features the
+/// driver took is refused, making no rings, whether or not the driver took the flag's feature:
+/// the host carries out no flag yet. A tail of no flag makes the queue, as a create without one.
+#[test]
+fn a_queue_flag_the_host_does_not_carry_out_refuses_the_create() {
+    const CONTEXT: u32 = 7;
+    const QUEUE: u64 = ((CONTEXT as u64) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taken = u64::from(RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL);
+    for wanted in [None, Some(taken)] {
+        let mut guest = FakeGuest::offered(EVERY_FEATURE);
+        assert_eq!(guest.start_taking(wanted), wanted.unwrap_or(0));
+        guest.arm_control();
+        guest.grant_queue_rings(CONTEXT);
+        for flags in [
+            RGFX_QUEUE_QUIET_SCHEDULED,
+            RGFX_QUEUE_CONSUMED_DOORBELL,
+            RGFX_QUEUE_QUIET_SCHEDULED | RGFX_QUEUE_CONSUMED_DOORBELL,
+            1 << 5,
+        ] {
+            assert_eq!(
+                guest.create_queue_flagged(QUEUE, flags),
+                RGFX_STATUS_INVALID_ARGUMENT,
+                "flags {flags:#x} with {wanted:?} taken"
+            );
+            assert_eq!(guest.rig.device.queue_count(), 0);
+        }
+        assert_eq!(guest.create_queue_flagged(QUEUE, 0), RGFX_STATUS_OK);
+        assert_eq!(guest.rig.device.queue_count(), 1);
     }
 }

@@ -66,7 +66,7 @@ pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<V
 /// Carries out one object-lifecycle message from ring 0, with no ring held: what answers it, or
 /// `None` for one the host answers itself (a pipeline's reflection, through the control poster)
 /// or not at all. A `QUEUE_CREATE` makes the queue's own ring pair and service thread, answered
-/// with whether its rings were taken; an `OBJECT_DESTROY` of a command queue ends the queue's
+/// with whether its flags and rings were taken; an `OBJECT_DESTROY` of a command queue ends the queue's
 /// service, which drops its handle; a `CONTEXT_CLOSE` ends the context's queues and has the host
 /// drop its objects, and the host answers it once the context's command buffers have finished; a
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
@@ -79,9 +79,11 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
     let seqno = message.header.seqno;
     match message.header.r#type {
         RGFX_CMD_QUEUE_CREATE => {
+            let flags = read_at::<RgfxQueueCreateFlags>(message, RGFX_QUEUE_CREATE_FLAGS_OFFSET)
+                .map_or(0, |tail| tail.flags);
             let status = read::<RgfxQueueCreate>(message)
                 .map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {
-                    shared.create_queue(&command, epoch)
+                    shared.create_queue(&command, flags, epoch)
                 });
             Some(complete(seqno, status))
         }

@@ -71,10 +71,11 @@
 //! callbacks.
 //!
 //! **Reset.** Writing `STATUS` 0, and the host's reset, put the device back as it was made, as a
-//! device's function reset does: no command is taken until the guest writes `STATUS` 1, both
-//! rings are as nothing had passed through them (the submission ring's `consumer_idle` 1, so the
-//! guest rings for its first message), the display has no scanout, no cursor image (and shows its
-//! cursor once it has one) and no `VBLANK`, and its refresh count is 0. Every command queue ends,
+//! device's function reset does: no command is taken until the guest writes `STATUS` 1, the
+//! guest's driver has taken no feature (`DRIVER_FEATURES` reads 0), both rings are as nothing
+//! had passed through them (the submission ring's `consumer_idle` 1, so the guest rings for its
+//! first message), the display has no scanout, no cursor image (and shows its cursor once it has
+//! one) and no `VBLANK`, and its refresh count is 0. Every command queue ends,
 //! and once a take of its ring or a post onto it under way has finished nothing touches its rings
 //! again; no block is any process's (the kext grants them again), and the host drops everything
 //! it made for the guest's processes ([`Host::device_reset`], on the control thread before it
@@ -172,6 +173,23 @@ impl Room {
 /// completion record with room to spare. A `QUEUE_CREATE` with a smaller ring gets no per-queue
 /// ring.
 const MIN_QUEUE_RING_DATA: u64 = 4096;
+
+/// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
+/// `RGFX_FEATURE_*`, bits 0 to 8.
+const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
+    | RGFX_FEATURE_SURFACE_CACHE
+    | RGFX_FEATURE_CB_SUBMITTED
+    | RGFX_FEATURE_QUIET_SCHEDULED
+    | RGFX_FEATURE_CONSUMED_DOORBELL
+    | RGFX_FEATURE_QUEUE_BARRIER
+    | RGFX_FEATURE_CB_PARTS
+    | RGFX_FEATURE_PAGES_BUFFERS
+    | RGFX_FEATURE_QUEUE_VECTORS) as u64;
+
+/// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
+/// take for a `QUEUE_CREATE` to ask for it: none yet, so a create that asks for any flag is
+/// refused.
+const QUEUE_FLAGS: &[(u32, u64)] = &[];
 
 /// The control submission ring.
 const SUBMIT: RingAt = RingAt {
@@ -390,6 +408,9 @@ pub(crate) struct Shared {
     pub(crate) region: Arc<Region>,
     /// `STATUS`.
     status: AtomicU32,
+    /// `DRIVER_FEATURES`: the feature bits the guest's driver took, each one the host offers and
+    /// knows ([`KNOWN_FEATURES`]); 0 from a reset to the driver's write.
+    driver_features: AtomicU64,
     /// Moved on at each reset: work begun before one drops what it would send.
     epoch: AtomicU64,
     /// A reset the host has not been told of yet ([`Host::device_reset`]): set with the control
@@ -591,6 +612,7 @@ impl Device {
             screen,
             region,
             status: AtomicU32::new(RGFX_STATUS_RESET),
+            driver_features: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             reset_owed: AtomicBool::new(false),
             ending: AtomicBool::new(false),
@@ -653,6 +675,12 @@ impl Device {
             RGFX_REG_FEATURES_LO => (self.shared.host.features() & 0xffff_ffff) as u32,
             RGFX_REG_FEATURES_HI => (self.shared.host.features() >> 32) as u32,
             RGFX_REG_STATUS => self.shared.status.load(Ordering::Acquire),
+            RGFX_REG_DRIVER_FEATURES_LO => {
+                (self.shared.driver_features.load(Ordering::Acquire) & 0xffff_ffff) as u32
+            }
+            RGFX_REG_DRIVER_FEATURES_HI => {
+                (self.shared.driver_features.load(Ordering::Acquire) >> 32) as u32
+            }
             RGFX_REG_REGION_SIZE_LO => (size & 0xffff_ffff) as u32,
             RGFX_REG_REGION_SIZE_HI => (size >> 32) as u32,
             _ => 0,
@@ -660,12 +688,15 @@ impl Device {
     }
 
     /// A 32-bit write of BAR 0 at `offset`: `STATUS` 0 resets the device and 1 starts it taking
-    /// commands; `DOORBELL` with a ring's id wakes its consumer. Other values and offsets are
-    /// ignored. A reset waits for the message the control thread is taking from the ring, and no
-    /// write waits for the host's decoder.
+    /// commands; `DRIVER_FEATURES_LO` and `_HI` take, before `STATUS` 1, the bits written that the
+    /// host offers and knows; `DOORBELL` with a ring's id wakes its consumer. Other values and
+    /// offsets (`CONSUMED` among them) are ignored. A reset waits for the message the control
+    /// thread is taking from the ring, and no write waits for the host's decoder.
     pub fn mmio_write(&self, offset: u64, value: u32) {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_STATUS if value == RGFX_STATUS_RESET => self.reset(),
+            RGFX_REG_DRIVER_FEATURES_LO => self.shared.take_driver_features(0, value),
+            RGFX_REG_DRIVER_FEATURES_HI => self.shared.take_driver_features(32, value),
             RGFX_REG_STATUS if value == RGFX_STATUS_DRIVER_READY => {
                 self.shared
                     .status
@@ -884,6 +915,7 @@ impl Shared {
     /// host; the host is told on the control thread ([`Self::tell_reset`]).
     fn reset(&self) {
         self.status.store(RGFX_STATUS_RESET, Ordering::Release);
+        self.driver_features.store(0, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         let mut submit = self.submit.lock();
         let mut display = self.display.lock();
@@ -919,6 +951,33 @@ impl Shared {
         self.screen.scanout(None);
         self.screen.cursor_image(None);
         self.screen.cursor_moved(0, 0, true);
+    }
+
+    /// A write of `DRIVER_FEATURES`' half at bit `shift` (0 for `_LO`, 32 for `_HI`): that half
+    /// becomes the bits of `value` the host offers ([`Host::features`]) and knows
+    /// ([`KNOWN_FEATURES`]), the other half kept. Ignored once the driver is ready: the features
+    /// are fixed from `STATUS` 1 to the next reset.
+    fn take_driver_features(&self, shift: u32, value: u32) {
+        if self.status.load(Ordering::Acquire) == RGFX_STATUS_DRIVER_READY {
+            return;
+        }
+        let half = 0xffff_ffff_u64 << shift;
+        let taken = (u64::from(value) << shift) & self.host.features() & KNOWN_FEATURES;
+        let _ = self
+            .driver_features
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some((old & !half) | taken)
+            });
+    }
+
+    /// The `RGFX_QUEUE_*` flags a `QUEUE_CREATE` may ask for: those the host carries out
+    /// ([`QUEUE_FLAGS`]) whose feature the guest's driver took.
+    fn queue_flags_allowed(&self) -> u32 {
+        let taken = self.driver_features.load(Ordering::Acquire);
+        QUEUE_FLAGS
+            .iter()
+            .filter(|&&(_, feature)| taken & feature != 0)
+            .fold(0, |allowed, &(flag, _)| allowed | flag)
     }
 
     /// Tells the host of a reset it has not been told of ([`Host::device_reset`]), on the control
@@ -1346,12 +1405,22 @@ impl Shared {
         ))
     }
 
-    /// `QUEUE_CREATE` (the module doc), taken at reset count `epoch`: makes a command queue's own
-    /// submission+completion ring pair and starts its service thread, where the ring parameters
-    /// are valid; the status its `COMPLETE` carries. Waits for no thread of the device's and
+    /// `QUEUE_CREATE` (the module doc), taken at reset count `epoch` with its tail's `flags` (0
+    /// where it has none): makes a command queue's own submission+completion ring pair and starts
+    /// its service thread, where the flags are ones the host carries out for the features the
+    /// driver took and the ring parameters are valid; the status its `COMPLETE` carries. Waits for no thread of the device's and
     /// nothing of the host's.
-    pub(crate) fn create_queue(&self, q: &RgfxQueueCreate, epoch: u64) -> u32 {
+    pub(crate) fn create_queue(&self, q: &RgfxQueueCreate, flags: u32, epoch: u64) -> u32 {
         let context = (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
+        let refused_flags = flags & !self.queue_flags_allowed();
+        if refused_flags != 0 {
+            log::warn!(
+                target: "reims_graphics",
+                "queue {:#x}: it asks for flags {refused_flags:#x}, which the host does not \
+                 carry out or whose feature the driver did not take, so it is refused", q.obj_id
+            );
+            return RGFX_STATUS_INVALID_ARGUMENT;
+        }
         if self.host.context_refused(context) {
             log::warn!(
                 target: "reims_graphics",
