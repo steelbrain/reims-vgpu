@@ -760,49 +760,48 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: &mut EventOps,
     ) -> RaiseResult<Result<(), DecodeError>> {
         while !ops.is_empty() {
-            let Some(h) = read::<RgfxOpHeader>(ops) else {
+            let Some((tag, body, len)) = next_op(ops) else {
                 return Ok(Err(DecodeError::Malformed));
             };
-            let len = h.len as usize;
-            if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
-                return Ok(Err(DecodeError::Malformed));
-            }
-            let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
-            match op_group(h.tag) {
-                RGFX_OP_GROUP_FRAMING => self.framing_op(h.tag, body, cb, encoder, events)?,
+            match op_group(tag) {
+                RGFX_OP_GROUP_FRAMING => self.framing_op(tag, body, cb, encoder, events)?,
                 RGFX_OP_GROUP_RENDER => {
                     let Some(OpenEncoder::Render(enc)) = encoder.as_ref() else {
-                        return Err(no_encoder(h.tag, "render"));
+                        return Err(no_encoder(tag, "render"));
                     };
-                    if !render::decode_op(h.tag, body, self, enc, ON)? {
-                        return Err(unknown_op(h.tag));
+                    // This op and the render ops after it, up to the first of another group,
+                    // one run of the encoder's ([`RenderEncoder::encoding`]).
+                    match enc.encoding(|| self.render_ops(ops, enc))? {
+                        Ok(rest) => ops = rest,
+                        Err(e) => return Ok(Err(e)),
                     }
+                    continue;
                 }
                 RGFX_OP_GROUP_COMPUTE => {
                     let Some(OpenEncoder::Compute(enc)) = encoder.as_ref() else {
-                        return Err(no_encoder(h.tag, "compute"));
+                        return Err(no_encoder(tag, "compute"));
                     };
-                    if !compute::decode_op(h.tag, body, self, enc, ON)? {
-                        return Err(unknown_op(h.tag));
+                    if !compute::decode_op(tag, body, self, enc, ON)? {
+                        return Err(unknown_op(tag));
                     }
                 }
                 RGFX_OP_GROUP_BLIT => {
                     let Some(OpenEncoder::Blit(enc)) = encoder.as_ref() else {
-                        return Err(no_encoder(h.tag, "blit"));
+                        return Err(no_encoder(tag, "blit"));
                     };
-                    if !blit::decode_op(h.tag, body, self, enc, ON)? {
-                        return Err(unknown_op(h.tag));
+                    if !blit::decode_op(tag, body, self, enc, ON)? {
+                        return Err(unknown_op(tag));
                     }
                 }
                 RGFX_OP_GROUP_VIDEO => {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
-                        return Err(no_encoder(h.tag, "video"));
+                        return Err(no_encoder(tag, "video"));
                     };
-                    if !video::decode_op(h.tag, body, self, session, cb)? {
-                        return Err(unknown_op(h.tag));
+                    if !video::decode_op(tag, body, self, session, cb)? {
+                        return Err(unknown_op(tag));
                     }
                 }
-                _ => return Err(unknown_op(h.tag)),
+                _ => return Err(unknown_op(tag)),
             }
             ops = &ops[len..];
         }
@@ -810,6 +809,29 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Err(op_fault("the op stream ended with an encoder still open"));
         }
         Ok(Ok(()))
+    }
+
+    /// The render ops at the start of `ops`, on `enc`, up to the first op of another group or
+    /// the stream's end: what is left of `ops`, or a malformed op's error, each as [`Self::walk`]
+    /// answers it at that op.
+    fn render_ops<'o>(
+        &self,
+        mut ops: &'o [u8],
+        enc: &P::RenderEncoder,
+    ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
+        while !ops.is_empty() {
+            let Some((tag, body, len)) = next_op(ops) else {
+                return Ok(Err(DecodeError::Malformed));
+            };
+            if op_group(tag) != RGFX_OP_GROUP_RENDER {
+                break;
+            }
+            if !render::decode_op(tag, body, self, enc, ON)? {
+                return Err(unknown_op(tag));
+            }
+            ops = &ops[len..];
+        }
+        Ok(Ok(ops))
     }
 
     /// A framing op: open the encoder its `ENCODER_BEGIN_*` names, end the open
@@ -1066,6 +1088,18 @@ fn no_encoder(tag: u16, group: &str) -> Raise {
 /// A fault: an op the host does not decode.
 fn unknown_op(tag: u16) -> Raise {
     op_fault(format_args!("unknown op {tag:#06x}"))
+}
+
+/// The op at the start of `ops`: its tag, its body and its whole length, or `None` where its
+/// header is cut short, or its length is under the body's offset, no multiple of 8, or past the
+/// stream's end, a malformed op.
+fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
+    let h = read::<RgfxOpHeader>(ops)?;
+    let len = h.len as usize;
+    if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
+        return None;
+    }
+    Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
 }
 
 /// A fault when an encoder is already open at an `ENCODER_BEGIN_*`.

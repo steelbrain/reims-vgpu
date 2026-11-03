@@ -8,7 +8,9 @@
 //! dispatches and a blit encoder of copies, with a completed handler, committed, then waited for:
 //! one long command buffer ([`WIDE`]) or many short ones ([`MANY`]). Each draw binds what a
 //! guest's draws bind: two vertex buffers at offsets that move, then a fragment texture and
-//! sampler or a fragment buffer by the state, which changes every eighth draw. Each dispatch
+//! sampler or a fragment buffer by the state, which changes every eighth draw. A pass's commands
+//! go as one run of its encoder's (`RenderEncoder::encoding`), as the graphics lane's decoder
+//! sends a pass's ops. Each dispatch
 //! binds two buffers and runs 64 threads, in an encoder that made nothing resident and in one
 //! that made [`RESIDENT`] buffers resident. The platform's device announces what the product's
 //! does ([`product_device`]), and its calls run outside strict mode, as the product's.
@@ -320,48 +322,52 @@ impl<P: Platform> Objects<P> {
         let texture = [Some(&self.texture)];
         let sampler = [Some(&self.sampler)];
         let vertex = [Some(&self.positions), Some(&self.colours)];
-        for i in 0..shape.draws {
-            let at = u64::try_from(i).unwrap();
-            let textured = (i / 8) % 2 == 0;
-            if i % 8 == 0 {
-                let state = Some(&self.states[usize::from(!textured)]);
-                let cmd = RenderCmd::SetRenderPipelineState {
-                    pipeline_state: state,
+        // The pass's commands, one run of the encoder's, as the decoder sends a pass's ops
+        // (`RenderEncoder::encoding`).
+        e.encoding(|| {
+            for i in 0..shape.draws {
+                let at = u64::try_from(i).unwrap();
+                let textured = (i / 8) % 2 == 0;
+                if i % 8 == 0 {
+                    let state = Some(&self.states[usize::from(!textured)]);
+                    let cmd = RenderCmd::SetRenderPipelineState {
+                        pipeline_state: state,
+                    };
+                    t.time(2, || e.encode(o, cmd).unwrap());
+                }
+                let cmd = RenderCmd::SetVertexBuffers {
+                    buffers: &vertex,
+                    offsets: &[0, (at % 64) * 16],
+                    range: NsRange::new(0, 2),
                 };
-                t.time(2, || e.encode(o, cmd).unwrap());
+                t.time(3, || e.encode(o, cmd).unwrap());
+                if textured {
+                    let cmd = RenderCmd::SetFragmentTextures {
+                        textures: &texture,
+                        range: NsRange::new(0, 1),
+                    };
+                    t.time(4, || e.encode(o, cmd).unwrap());
+                    let cmd = RenderCmd::SetFragmentSamplerStates {
+                        samplers: &sampler,
+                        range: NsRange::new(0, 1),
+                    };
+                    t.time(5, || e.encode(o, cmd).unwrap());
+                } else {
+                    let cmd = RenderCmd::SetFragmentBuffer {
+                        buffer: Some(&self.uniforms),
+                        offset: (at % 256) * 256,
+                        index: 0,
+                    };
+                    t.time(6, || e.encode(o, cmd).unwrap());
+                }
+                let cmd = RenderCmd::DrawPrimitives {
+                    primitive_type: STRIP,
+                    vertex_start: 0,
+                    vertex_count: 4,
+                };
+                t.time(7, || e.encode(o, cmd).unwrap());
             }
-            let cmd = RenderCmd::SetVertexBuffers {
-                buffers: &vertex,
-                offsets: &[0, (at % 64) * 16],
-                range: NsRange::new(0, 2),
-            };
-            t.time(3, || e.encode(o, cmd).unwrap());
-            if textured {
-                let cmd = RenderCmd::SetFragmentTextures {
-                    textures: &texture,
-                    range: NsRange::new(0, 1),
-                };
-                t.time(4, || e.encode(o, cmd).unwrap());
-                let cmd = RenderCmd::SetFragmentSamplerStates {
-                    samplers: &sampler,
-                    range: NsRange::new(0, 1),
-                };
-                t.time(5, || e.encode(o, cmd).unwrap());
-            } else {
-                let cmd = RenderCmd::SetFragmentBuffer {
-                    buffer: Some(&self.uniforms),
-                    offset: (at % 256) * 256,
-                    index: 0,
-                };
-                t.time(6, || e.encode(o, cmd).unwrap());
-            }
-            let cmd = RenderCmd::DrawPrimitives {
-                primitive_type: STRIP,
-                vertex_start: 0,
-                vertex_count: 4,
-            };
-            t.time(7, || e.encode(o, cmd).unwrap());
-        }
+        });
         t.time(8, || e.encode(o, RenderCmd::EndEncoding).unwrap());
         let resident: Vec<_> = (self.resident.iter())
             .map(|b| Some(ResourceRef::Buffer(b)))

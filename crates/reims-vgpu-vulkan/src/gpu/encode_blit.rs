@@ -109,6 +109,7 @@
 //! - **`synchronizeResource:` of nil** does nothing, which Metal takes
 //!   (`blit_texture_maintenance`) and the runtime has no form for.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -118,7 +119,7 @@ use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
 use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 
 use crate::answer::{
     Policy, decide, metal_aborts, plain, send, send_describing, unrepresentable, unstopped_at,
@@ -133,8 +134,11 @@ use crate::platform::{Obj, VulkanPlatform};
 /// An open runtime encoder: `None` once `endEncoding` consumed it.
 #[derive(Debug)]
 pub struct EncoderObject<E> {
-    /// The runtime's encoder, until it ends.
-    pub raw: Mutex<Option<E>>,
+    /// The runtime's encoder, until it ends. Only the thread that encodes into it takes it,
+    /// once a command ([`Self::with`]), or once for a run of commands ([`Self::running`]),
+    /// inside which each command's take is the same thread's again, which no atomic operation
+    /// takes. A command's call holds it borrowed, and makes no command of its own encoder.
+    pub raw: ReentrantMutex<RefCell<Option<E>>>,
     /// Its command buffer's count of open encoders, which counts it until it ends or goes.
     open: Arc<AtomicUsize>,
     /// Its command buffer, held weakly: once it goes, nothing encoded here runs.
@@ -176,7 +180,7 @@ impl<E> EncoderObject<E> {
         open.fetch_add(1, Ordering::SeqCst);
         let (at, aborts) = command_buffer.made_encoder(true);
         EncoderObject {
-            raw: Mutex::new(Some(raw)),
+            raw: ReentrantMutex::new(RefCell::new(Some(raw))),
             open: Arc::clone(open),
             command_buffer: command_buffer.downgrade(),
             encodes_icbs: AtomicBool::new(false),
@@ -218,11 +222,20 @@ impl<E> EncoderObject<E> {
     /// Runs `call` on the open encoder, for `sel`: a command after `endEncoding` dies. A slow
     /// call is a debug line ([`crate::gpu::timing::encoder_call`]).
     pub fn with<T>(&self, sel: &'static str, call: impl FnOnce(&mut E) -> T) -> T {
-        let mut raw = self.raw.lock();
+        let held = self.raw.lock();
+        let mut raw = held.borrow_mut();
         let e = raw
             .as_mut()
             .unwrap_or_else(|| unrepresentable(sel, "a command after endEncoding"));
         crate::gpu::timing::encoder_call(sel, &self.pipeline, || call(e))
+    }
+
+    /// Runs `run`, a run of commands this thread encodes one after another, holding the encoder
+    /// for it: each command's take inside it is this thread's again ([`Self::raw`]). It encodes
+    /// nothing itself, and its commands run as each would alone, in their order.
+    pub fn running<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _held = self.raw.lock();
+        run()
     }
 
     /// Encodes nothing for `sel`, a command Metal encodes nothing for; after `endEncoding` it
@@ -237,6 +250,7 @@ impl<E> EncoderObject<E> {
         let e = self
             .raw
             .lock()
+            .borrow_mut()
             .take()
             .unwrap_or_else(|| unrepresentable(sel, "a second endEncoding"));
         self.open.fetch_sub(1, Ordering::SeqCst);
@@ -261,7 +275,7 @@ impl<E> EncoderObject<E> {
 impl<E> Drop for EncoderObject<E> {
     /// An encoder that goes without `endEncoding` is open no more: the runtime abandons it.
     fn drop(&mut self) {
-        if self.raw.get_mut().is_some() {
+        if self.raw.get_mut().get_mut().is_some() {
             self.open.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -1101,7 +1115,10 @@ mod tests {
             blit.encode(OnFault::Return, BlitCmd::EndEncoding)
         });
         assert!(stopped.is_none());
-        assert!(blit.raw.lock().is_some(), "the blit encoder was taken");
+        assert!(
+            blit.raw.lock().borrow().is_some(),
+            "the blit encoder was taken"
+        );
         let cb = buffer();
         let compute = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
         let life = TaskLife::new();
@@ -1111,7 +1128,7 @@ mod tests {
         });
         assert!(stopped.is_none());
         assert!(
-            compute.raw.lock().is_some(),
+            compute.raw.lock().borrow().is_some(),
             "the compute encoder was taken"
         );
     }

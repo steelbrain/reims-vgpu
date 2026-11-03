@@ -237,6 +237,7 @@
 //!   runtime's, as an attachment, a resolve texture and bound to a stage
 //!   ([`crate::gpu::resource::TextureObject::texels`]), and so are its refusals.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -254,7 +255,7 @@ use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 use crate::answer::{
@@ -388,7 +389,10 @@ pub struct RenderEncoderObject {
     pub encoder: EncoderObject<rt::RenderCommandEncoder>,
     /// What Metal's encoder holds of its draws that the runtime's has no form for, behind one
     /// lock: a draw reads it once, and a command that sets it takes the lock once ([`Drawing`]).
-    drawing: Mutex<Drawing>,
+    /// Only the thread that encodes takes it, as [`EncoderObject::raw`], and a run of commands
+    /// holds it ([`RenderEncoder::encoding`]), so each command's take inside the run is this
+    /// thread's again, which no atomic operation takes.
+    drawing: ReentrantMutex<RefCell<Drawing>>,
     /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
     /// map [`open`] took, without the colour resolves [`untouched_resolves`] dropped and the
     /// unused depth and stencil resolve textures [`without_unused_resolves`] removes. Its
@@ -1229,7 +1233,7 @@ pub(crate) fn open(
         e.undecided_dropped(&sources);
         let visibility = (sources.visibility.as_ref())
             .map_or(Kept::No, |b| crate::gpu::writes::buffer_bound(b).kept);
-        plain(|| e.drawing.lock().reach.visibility = visibility);
+        plain(|| e.drawing.lock().borrow_mut().reach.visibility = visibility);
     }
     made
 }
@@ -1675,7 +1679,7 @@ fn opened(
     let aborts = metal_aborts_at(&d);
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
-        drawing: Mutex::new(Drawing::default()),
+        drawing: ReentrantMutex::new(RefCell::new(Drawing::default())),
         undecided: Mutex::new(undecided(&d)),
         late_stores: Mutex::new(Vec::new()),
         no_layers: taken.class == Some(Class::NoLayers),
@@ -1913,7 +1917,8 @@ impl VulkanRenderEncoder {
             }
         }
         plain(|| {
-            let mut drawing = self.drawing.lock();
+            let locked = self.drawing.lock();
+            let mut drawing = locked.borrow_mut();
             let reach = &mut drawing.reach;
             match bind {
                 Bind::Buffer(stage, slot, b) => reach.bind_one(stage, true, slot, buffer(b)),
@@ -1956,7 +1961,8 @@ impl VulkanRenderEncoder {
             return;
         }
         let (kept, written) = plain(|| {
-            let drawing = self.drawing.lock();
+            let locked = self.drawing.lock();
+            let drawing = locked.borrow();
             let reach = &drawing.reach;
             let kept = (crate::os::TWINS_READ_ONLY)
                 .then(|| reach.kept(inherits))
@@ -2047,7 +2053,8 @@ impl VulkanRenderEncoder {
     /// What a draw reads of the encoder's state ([`Held`]).
     fn held(&self) -> Held {
         let (nil_pipeline, marks) = {
-            let drawing = self.drawing.lock();
+            let locked = self.drawing.lock();
+            let drawing = locked.borrow();
             (drawing.nil_pipeline, drawing.marks)
         };
         Held {
@@ -2086,7 +2093,7 @@ impl VulkanRenderEncoder {
     fn binds(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
         let (drawn, heard) = crate::answer::hearing(|| self.run(sel, call));
         if heard.contains(&rt::Degradation::HalfOutputPrecision)
-            && let Some(apart) = plain(|| self.drawing.lock().marks.half_apart)
+            && let Some(apart) = plain(|| self.drawing.lock().borrow().marks.half_apart)
         {
             half_output_apart(sel, apart);
         }
@@ -2112,7 +2119,7 @@ impl VulkanRenderEncoder {
     /// Dies at `sel`, which runs the encoder's pipeline state, after `setRenderPipelineState:`
     /// of nil ([`nil_pipeline_drawn`]).
     fn pipelined(&self, sel: &'static str) {
-        nil_pipeline_drawn(sel, plain(|| self.drawing.lock().nil_pipeline));
+        nil_pipeline_drawn(sel, plain(|| self.drawing.lock().borrow().nil_pipeline));
     }
 
     /// A draw `sel` of primitive type 9 ([`rt::DrawPrimitiveType::Nine`]), which goes to the
@@ -2136,7 +2143,7 @@ impl VulkanRenderEncoder {
         call: Call<'_>,
     ) -> RaiseResult<()> {
         self.pipelined(sel);
-        if !plain(|| self.drawing.lock().marks.pipeline) {
+        if !plain(|| self.drawing.lock().borrow().marks.pipeline) {
             unrepresentable(
                 sel,
                 "primitive type 9 with no pipeline state set, which nothing measured",
@@ -2180,7 +2187,7 @@ impl VulkanRenderEncoder {
         let inherits_pipeline = icb.inherits.pipeline;
         let execution = if inherits_pipeline {
             self.encodes(sel);
-            let m = plain(|| self.drawing.lock().marks);
+            let m = plain(|| self.drawing.lock().borrow().marks);
             Execution {
                 sel,
                 icb: icb.clone_ref(),
@@ -2282,7 +2289,7 @@ impl VulkanRenderEncoder {
     /// Dies at a draw or execution `sel` after `setVertexAmplificationMode:value:` left a count
     /// the runtime does not draw, or one not measured, in either mode ([`Marks`]).
     fn marked(&self, sel: &'static str) {
-        marked_by(sel, plain(|| self.drawing.lock().marks));
+        marked_by(sel, plain(|| self.drawing.lock().borrow().marks));
     }
 }
 
@@ -2880,7 +2887,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             // Metal's indexed strips restart at the index set, until the encoder ends, and
             // nothing else changes (the module docs), as the runtime's do.
             RenderCmd::SetPrimitiveRestartEnabled { enabled, index } => {
-                plain(|| self.drawing.lock().marks.restart = Some((enabled, index)));
+                plain(|| self.drawing.lock().borrow_mut().marks.restart = Some((enabled, index)));
                 encoded(&mut |e| {
                     e.set_primitive_restart_enabled(enabled, index);
                     Ok(())
@@ -2894,7 +2901,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             RenderCmd::SetRenderPipelineState { pipeline_state } => match pipeline_state {
                 None => {
                     self.encoder.nothing(sel)?;
-                    plain(|| self.drawing.lock().nil_pipeline = true);
+                    plain(|| self.drawing.lock().borrow_mut().nil_pipeline = true);
                     self.encoder.pipeline.store(0, Ordering::Relaxed);
                     self.encoder.encodes_icbs.store(false, Ordering::SeqCst);
                     Ok(())
@@ -2907,7 +2914,8 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         .store(state.unique_identifier(), Ordering::Relaxed);
                     self.encoder.encodes_icbs.store(f.encodes, Ordering::SeqCst);
                     plain(|| {
-                        let mut drawing = self.drawing.lock();
+                        let locked = self.drawing.lock();
+                        let mut drawing = locked.borrow_mut();
                         drawing.nil_pipeline = false;
                         drawing.reach.set(&state.reflection, f.writes);
                         let m = &mut drawing.marks;
@@ -3057,7 +3065,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let mappings = (!mappings.is_empty()).then_some(mappings.as_slice());
                 encoded(&mut |e| e.set_vertex_amplification_count(count, mappings))?;
                 plain(|| {
-                    let m = &mut self.drawing.lock().marks;
+                    let locked = self.drawing.lock();
+                    let mut drawing = locked.borrow_mut();
+                    let m = &mut drawing.marks;
                     m.amplification = Some(count);
                     m.amplified = false;
                 });
@@ -3067,7 +3077,9 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             // where it equals the runtime's (the module docs).
             RenderCmd::SetVertexAmplificationMode { mode, value } => {
                 plain(|| {
-                    let m = &mut self.drawing.lock().marks;
+                    let locked = self.drawing.lock();
+                    let mut drawing = locked.borrow_mut();
+                    let m = &mut drawing.marks;
                     let runtime = m.amplification.unwrap_or(1);
                     m.amplified = amplification_count(mode, value) != Some(runtime);
                 });
@@ -3166,7 +3178,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     unrepresentable(sel, &format!("visibility result mode {mode}"))
                 });
                 if mode != rt::VisibilityResultMode::Disabled
-                    && plain(|| self.drawing.lock().reach.visibility.holds())
+                    && plain(|| self.drawing.lock().borrow().reach.visibility.holds())
                 {
                     crate::gpu::writes::kept_write(
                         sel,
@@ -3249,6 +3261,14 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 encoded(&mut |e| e.wait_for_fence(fence, stages))
             }
         }
+    }
+
+    /// The run holds what the encoder holds of its draws ([`RenderEncoderObject::drawing`]) and
+    /// the runtime's encoder ([`EncoderObject::running`]), which each command inside it then
+    /// takes again on this thread.
+    fn encoding<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _drawing = self.drawing.lock();
+        self.encoder.running(run)
     }
 
     fn tile_height(&self) -> u64 {
@@ -6779,6 +6799,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// A run of commands ([`RenderEncoder::encoding`]) holds the runtime's encoder and what the
+    /// encoder holds of its draws for the thread that sends them: its commands take both again
+    /// on that thread, and run as they would alone; another thread takes neither until the run
+    /// ends, which lets both go
+    #[test]
+    fn a_run_of_commands_holds_the_encoder_for_its_thread() {
+        let p = platform();
+        let d = dev();
+        let (_dst, pass) = pass_of(&p, &d, (4, 4));
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        e.encoding(|| {
+            assert!(e.encoder.raw.is_owned_by_current_thread());
+            assert!(e.drawing.is_owned_by_current_thread());
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    assert!(e.encoder.raw.try_lock().is_none());
+                    assert!(e.drawing.try_lock().is_none());
+                });
+            });
+            e.encode(OnFault::Die, RenderCmd::SetCullMode { cull_mode: 1 })
+                .unwrap();
+            e.encode(
+                OnFault::Die,
+                RenderCmd::SetFrontFacingWinding {
+                    front_facing_winding: 1,
+                },
+            )
+            .unwrap();
+        });
+        assert!(!e.encoder.raw.is_locked());
+        assert!(!e.drawing.is_locked());
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        assert!(e.encoder.raw.lock().borrow().is_none());
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.error(), None);
+    }
+
     /// endEncoding in a thread of an isolated task that has ended stops before it touches the
     /// encoder, which stays in its handle, its store action left `Unknown` unset, as Metal's is
     /// left; outside a task the same pass ends, storing nothing for that attachment
@@ -6811,14 +6871,14 @@ pub(crate) mod tests {
         });
         assert!(stopped.is_none());
         assert!(
-            e.encoder.raw.lock().is_some(),
+            e.encoder.raw.lock().borrow().is_some(),
             "the render encoder was taken"
         );
         assert_eq!(e.undecided.lock().len(), 1);
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        assert!(e.encoder.raw.lock().is_none());
+        assert!(e.encoder.raw.lock().borrow().is_none());
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert_eq!(cb.error(), None);

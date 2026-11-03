@@ -1584,7 +1584,8 @@ impl Unit {
         let Some(cb) = Obj::upgrade(&enc.command_buffer) else {
             return;
         };
-        let mut raw = enc.raw.lock();
+        let held = enc.raw.lock();
+        let mut raw = held.borrow_mut();
         let Some(old) = raw.take() else {
             return;
         };

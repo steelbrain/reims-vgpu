@@ -614,6 +614,15 @@ pub trait RenderEncoder<P: Platform>: Handle {
     /// handler and with none (the display's frame commands and `EndEncoding`) does; the other
     /// commands are reached one way only.
     fn encode(&self, on: OnFault, cmd: RenderCmd<'_, P>) -> RaiseResult<()>;
+    /// Runs `run`, a run of [`Self::encode`]s this thread sends the encoder one after another,
+    /// with nothing else sent it between them. Each command does what it does alone, in its
+    /// order; a platform may hold the encoder for the run, so that each command takes less.
+    fn encoding<T>(&self, run: impl FnOnce() -> T) -> T
+    where
+        Self: Sized,
+    {
+        run()
+    }
     /// sel: tileHeight
     /// Declared on MTLRenderCommandEncoder (protocol).
     /// A zero-argument getter: a raise dies at the send (4.2 item 3).
