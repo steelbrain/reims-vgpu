@@ -525,12 +525,17 @@ class Run:
                            + (json.loads(why.group(1)) if why else m.group(2)))
                 continue
             stall = kv.get("gap_max_ms", 0) > 1000
+            # A drag's window moves, a live resize's size changes; Mission Control's numbers are over
+            # its animations, and start_ms its first update's wait after the key.
+            did = (f"; the window {'resized' if name == 'resize' else 'moved'} {kv['window_moves_s']:g} times a second"
+                   if "window_moves_s" in kv else "")
+            if "start_ms" in kv:
+                did += f"; over {kv.get('toggles', 0):g} openings and closings, the first update {kv['start_ms']:g} ms after the key"
             self.litem("drag." + name, "FAIL" if stall else "PASS",
                        f"{kv.get('composites_s')} display updates a second, gap p99 {kv.get('gap_p99_ms')} ms, "
                        f"max {kv.get('gap_max_ms')} ms" + (" (a stall over 1 s)" if stall else "")
-                       + f"; the window moved {kv.get('window_moves_s')} times a second; QEMU {kv.get('qemu_cpu')}%, "
-                       f"its graphics thread {kv.get('gfx_cpu')}%")
-            for k in ("composites_s", "gap_p99_ms", "gap_max_ms", "window_moves_s"):
+                       + f"{did}; QEMU {kv.get('qemu_cpu')}%, its graphics thread {kv.get('gfx_cpu')}%")
+            for k in ("composites_s", "gap_p99_ms", "gap_max_ms", "window_moves_s", "start_ms"):
                 if k in kv:
                     self.lmetric(f"drag.{name}.{k}", kv[k])
             for k in ("qemu_cpu", "gfx_cpu"):

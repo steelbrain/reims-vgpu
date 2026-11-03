@@ -3,20 +3,25 @@
 
     msi-drag.py BOOTDIR RUNDIR      env: PORT GUEST_USER GUEST_PASS [DRAG_S] [DRAG_CASES]
 
-BOOTDIR is rgk-boot2.sh's (qmp.sock, qemu.pid, launch.log), RUNDIR msi-boot.sh's. Each case opens
-a window in the guest, finds a point that drags it, and drags it for DRAG_S seconds (default 10)
-along a steady path, the pointer moved RATE times a second over QMP as a person's hand would:
-  plain   a TextEdit document's window (no toolbar)
-  glass   a Finder window (its toolbar is glass)
-A point drags the window when a short probe drag from it moves the window by the pointer's
-distance, as the window server states the window's bounds (winmon list). During the measured drag
-the guest's winmon tracks the window's origin every 10 ms, and the drag counts only where the
-window followed the pointer across the path's span; otherwise the case is not run (moved=0), not
-a number. Writes RUNDIR/drag.txt, one line a case:
+BOOTDIR is rgk-boot2.sh's (qmp.sock, qemu.pid, launch.log), RUNDIR msi-boot.sh's. Each case moves
+the desktop for DRAG_S seconds (default 10) as a person would, over QMP, the pointer moved RATE
+times a second along a steady path:
+  plain   drags a TextEdit document's window (no toolbar) by its title bar
+  glass   drags a Finder window (its toolbar is glass) by its title bar
+  resize  resizes a TextEdit document's window live by its bottom right corner
+  mission opens and closes Mission Control (Control-Up) once a second, TextEdit's and Finder's
+          windows on the desktop
+A point drags (or resizes) the window when a short probe from it moves the window's origin (or
+its bottom right corner) by the pointer's distance, as the window server states the window's
+bounds (winmon list). During the measured drag the guest's winmon tracks the window's origin (or
+size) every 10 ms, and the case counts only where the window followed the pointer across the
+path's span; otherwise the case is not run (moved=0), not a number. Mission Control counts only
+where the display updated after a first Control-Up. Writes RUNDIR/drag.txt, one line a case:
   drag CASE moved=1 composites_s= gap_p99_ms= gap_max_ms= qemu_cpu= gfx_cpu= window_moves_s= ...
-the composites being the host log's display updates ("the display shows IOSurface") in the drag's
-host-time span, the gaps those between them (and the span's ends), the CPU QEMU's and its
-graphics thread's, in percent of a core.
+the composites being the host log's display updates ("the display shows IOSurface") in the
+case's host-time span, the gaps those between them (and the span's ends), the CPU QEMU's and its
+graphics thread's, in percent of a core. Mission Control's span is the 0.8 s after each
+Control-Up (its animation), its start_ms the median wait from the key to the first update.
 """
 import datetime
 import json
@@ -32,7 +37,7 @@ import time
 B, R = sys.argv[1], sys.argv[2]
 PORT, USER, PASS = os.environ["PORT"], os.environ["GUEST_USER"], os.environ["GUEST_PASS"]
 SECONDS = float(os.environ.get("DRAG_S", "10"))
-CASES = os.environ.get("DRAG_CASES", "plain glass").split()
+CASES = os.environ.get("DRAG_CASES", "plain glass resize mission").split()
 RATE = 120  # pointer moves a second
 RADIUS = 150  # points: the path spans 2 RADIUS across and 1.2 RADIUS down
 SOPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o",
@@ -163,6 +168,10 @@ def composites(t0, t1):
 
 
 def case(q, name):
+    if name == "resize":
+        return resize(q)
+    if name == "mission":
+        return mission(q)
     if name == "plain":
         owner = "TextEdit"
         guest("defaults write com.apple.TextEdit NSShowAppCentricOpenPanelInsteadOfUntitledFile -bool false")
@@ -237,20 +246,177 @@ def case(q, name):
         res.update(moved=0, why=f"the window's origin spanned {xr:.0f} x {yr:.0f} points, the pointer's "
                                 f"{2 * RADIUS} x {1.2 * RADIUS:.0f}")
         return res
+    res.update(measured(a, b, t0, t1, [(t0, t1)]))
+    return res
+
+
+def measured(a, b, t0, t1, spans):
+    """The display updates in SPANS (their rate over the spans' time, the gaps between them and
+    each span's ends), and QEMU's CPU from t0 to t1 (threads() a at t0, b at t1)."""
     hz = os.sysconf("SC_CLK_TCK")
-    span = t1 - t0
     cpu = {"qemu": 0, "gfx": 0}
     for tid, (comm, ticks) in b.items():
         d = ticks - a.get(tid, (comm, ticks))[1]
         cpu["qemu"] += d
         if comm.startswith("reims-vgpu.gra"):
             cpu["gfx"] += d
-    ts = composites(t0, t1)
-    gaps = sorted(y - x for x, y in zip([t0] + ts, ts + [t1]))
-    p99 = gaps[min(len(gaps) - 1, int(math.ceil(0.99 * len(gaps))) - 1)] if gaps else span
-    res.update(moved=1, composites_s=round(len(ts) / span, 2), gap_p99_ms=round(1000 * p99, 1),
-               gap_max_ms=round(1000 * (gaps[-1] if gaps else span), 1),
-               qemu_cpu=round(100 * cpu["qemu"] / hz / span, 1), gfx_cpu=round(100 * cpu["gfx"] / hz / span, 1))
+    n, gaps, total = 0, [], 0.0
+    for s0, s1 in spans:
+        ts = composites(s0, s1)
+        n += len(ts)
+        total += s1 - s0
+        gaps += [y - x for x, y in zip([s0] + ts, ts + [s1])]
+    gaps.sort()
+    p99 = gaps[min(len(gaps) - 1, int(math.ceil(0.99 * len(gaps))) - 1)] if gaps else total
+    return dict(moved=1, composites_s=round(n / total, 2), gap_p99_ms=round(1000 * p99, 1),
+                gap_max_ms=round(1000 * (gaps[-1] if gaps else total), 1),
+                qemu_cpu=round(100 * cpu["qemu"] / hz / (t1 - t0), 1),
+                gfx_cpu=round(100 * cpu["gfx"] / hz / (t1 - t0), 1))
+
+
+def textedit():
+    """A TextEdit document's window, opened: (id, owner, x, y, w, h), or None."""
+    guest("defaults write com.apple.TextEdit NSShowAppCentricOpenPanelInsteadOfUntitledFile -bool false")
+    guest("open -a TextEdit", gui=True)
+    for _ in range(15):
+        time.sleep(1)
+        w = window("TextEdit")
+        if w:
+            return w
+    return None
+
+
+def probe_resize(q, w, x, y):
+    """Whether pressing at (x, y) and moving 40 points right and 30 down resizes window w by those
+    points, its origin kept."""
+    q.move(x, y)
+    time.sleep(0.3)
+    q.button(True)
+    time.sleep(0.1)
+    pace(0.25, lambda i, n: q.move(x + 40 * (i + 1) / n, y + 30 * (i + 1) / n))
+    time.sleep(0.3)
+    after = window(None, w[0])
+    pace(0.25, lambda i, n: q.move(x + 40 - 40 * (i + 1) / n, y + 30 - 30 * (i + 1) / n))
+    time.sleep(0.1)
+    q.button(False)
+    time.sleep(0.3)
+    return (after is not None and abs(after[4] - w[4] - 40) <= 12 and abs(after[5] - w[5] - 30) <= 12
+            and abs(after[2] - w[2]) <= 4 and abs(after[3] - w[3]) <= 4)
+
+
+def resize(q):
+    w = textedit()
+    if not w:
+        return {"moved": 0, "why": "no TextEdit window"}
+    wid, _, wx, wy, ww, wh = w
+    log("resize", "window", w)
+    if wx + ww + RADIUS > SW or wy + wh + 1.2 * RADIUS > SH or ww < RADIUS + 200 or wh < 200:
+        guest("killall TextEdit", gui=True)
+        return {"moved": 0, "why": f"the window {ww:.0f} x {wh:.0f} at {wx:.0f},{wy:.0f} has no room to grow by "
+                                   f"{RADIUS} x {1.2 * RADIUS:.0f} on a {SW:.0f} x {SH:.0f} screen"}
+    press = None
+    for d in (-2, 1, -5, 3, -8):
+        x, y = wx + ww + d, wy + wh + d
+        if probe_resize(q, window(None, wid) or w, x, y):
+            press = (x, y)
+            break
+    if not press:
+        guest("killall TextEdit", gui=True)
+        return {"moved": 0, "why": "no point at the window's bottom right corner resized it"}
+    w = window(None, wid)
+    x0, y0 = press
+    log("resize", "press", press, "window", w)
+    tracker = {}
+    th = threading.Thread(target=lambda: tracker.update(
+        out=guest(f"~/lane-gate/winmon track {wid} {SECONDS + 3:.0f} 10 size", gui=True, timeout=SECONDS + 30)))
+    th.start()
+    time.sleep(1)
+    pid = int(open(os.path.join(B, "qemu.pid")).read())
+    q.move(x0, y0)
+    time.sleep(0.3)
+    q.button(True)
+    time.sleep(0.1)
+    a, t0 = threads(pid), time.time()
+    pace(SECONDS, lambda i, n: q.move(x0 + RADIUS * math.sin(2 * math.pi * i / (RATE * 2)),
+                                      y0 + 0.6 * RADIUS * (1 - math.cos(2 * math.pi * i / (RATE * 2)))))
+    t1, b = time.time(), threads(pid)
+    q.move(x0, y0)
+    time.sleep(0.05)
+    q.button(False)
+    th.join()
+    guest("killall TextEdit", gui=True)
+    ws_, hs, moves = [], [], 0
+    for line in tracker.get("out", "").splitlines():
+        f = line.split()
+        if len(f) == 4 and f[0] == "at":
+            ws_.append(float(f[2]))
+            hs.append(float(f[3]))
+        m = re.match(r"track samples=(\d+) moves=(\d+)", line)
+        if m:
+            moves = int(m.group(2))
+    wr = max(ws_) - min(ws_) if ws_ else 0
+    hr = max(hs) - min(hs) if hs else 0
+    res = {"w_range": round(wr), "h_range": round(hr), "window_moves_s": round(moves / SECONDS, 1),
+           "press": f"{x0:.0f},{y0:.0f}", "seconds": round(t1 - t0, 2)}
+    if wr < 0.7 * 2 * RADIUS or hr < 0.7 * 1.2 * RADIUS:
+        res.update(moved=0, why=f"the window's size spanned {wr:.0f} x {hr:.0f} points, the pointer's "
+                                f"{2 * RADIUS} x {1.2 * RADIUS:.0f}")
+        return res
+    res.update(measured(a, b, t0, t1, [(t0, t1)]))
+    return res
+
+
+def all_windows():
+    """Every on-screen window but the desktop's: {id: "OWNER LAYER X Y W H"}."""
+    out = {}
+    for line in guest("~/lane-gate/winmon all", gui=True).splitlines():
+        f = line.split()
+        if len(f) == 9 and f[0] == "window":
+            out[f[1]] = " ".join(f[3:])
+    return out
+
+
+def mission(q):
+    w = textedit()
+    guest("open ~/Documents", gui=True)
+    time.sleep(2)
+    if not w or not window("Finder"):
+        guest("killall TextEdit", gui=True)
+        return {"moved": 0, "why": "no TextEdit or Finder window to lay out"}
+    q.move(SW / 2, SH / 2)
+    before = all_windows()
+    # A first Control-Up, unmeasured: the display must update after it.
+    t = time.time()
+    q.key("ctrl", "up")
+    time.sleep(1.0)
+    during = all_windows()
+    q.key("ctrl", "up")
+    time.sleep(1.5)
+    shown = len(composites(t, t + 0.8))
+    new = [f"{k} {v}" for k, v in during.items() if before.get(k) != v]
+    log("mission", f"{shown} display updates after the first Control-Up; windows new or moved in it: {new}")
+    if shown < 3:
+        guest("killall TextEdit", gui=True)
+        q.key("meta_l", "w")
+        return {"moved": 0, "why": f"{shown} display updates in the 0.8 s after Control-Up: Mission Control "
+                                   f"did not open"}
+    pid = int(open(os.path.join(B, "qemu.pid")).read())
+    a, t0 = threads(pid), time.time()
+    keys = []
+    while time.time() - t0 < SECONDS - 0.9 or len(keys) % 2:
+        keys.append(time.time())
+        q.key("ctrl", "up")
+        time.sleep(max(0.0, keys[-1] + 1.0 - time.time()))
+    t1, b = time.time(), threads(pid)
+    time.sleep(1.0)
+    guest("killall TextEdit", gui=True)
+    q.key("meta_l", "w")
+    spans = [(k, k + 0.8) for k in keys]
+    starts = sorted(ts[0] - k for k in keys for ts in [composites(k, k + 0.8)] if ts)
+    res = {"toggles": len(keys), "seconds": round(t1 - t0, 2)}
+    res.update(measured(a, b, t0, t1, spans))
+    if starts:
+        res["start_ms"] = round(1000 * starts[len(starts) // 2], 1)
     return res
 
 

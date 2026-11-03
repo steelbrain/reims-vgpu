@@ -3,10 +3,13 @@
 //   winmon screen              the main display's size in points: "screen W H"
 //   winmon list                the on-screen windows of the normal layer, front to back, one a
 //                              line: "window ID PID OWNER X Y W H" (points, from the top left)
-//   winmon track ID SECONDS [MS]
-//                              the window's origin every MS milliseconds (default 10) for SECONDS:
-//                              "at EPOCH X Y" each time it changes, then "track samples=N
-//                              moves=M" (M the samples whose origin differed from the one before)
+//   winmon all                 every on-screen window but the desktop's, front to back, one a
+//                              line: "window ID PID OWNER LAYER X Y W H"
+//   winmon track ID SECONDS [MS] [size]
+//                              the window's origin (or with size, its size) every MS milliseconds
+//                              (default 10) for SECONDS: "at EPOCH X Y" (or "at EPOCH W H") each
+//                              time it changes, then "track samples=N moves=M" (M the samples
+//                              whose value differed from the one before)
 // The window server answers bounds, owners and layers without a screen-recording grant; titles
 // it would not, and winmon reads none.
 // Build (-arch arm64 for an Apple-silicon Mac):
@@ -33,26 +36,32 @@ static BOOL boundsOf(NSDictionary *w, CGRect *r)
 	return b && CGRectMakeWithDictionaryRepresentation(b, r);
 }
 
-static int list(void)
+static int list(BOOL all)
 {
 	NSArray *ws = CFBridgingRelease(CGWindowListCopyWindowInfo(
 	    kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
 	for (NSDictionary *w in ws) {
-		if ([w[(__bridge NSString *)kCGWindowLayer] intValue] != 0)
+		int layer = [w[(__bridge NSString *)kCGWindowLayer] intValue];
+		if (!all && layer != 0)
 			continue;
 		CGRect r;
 		if (!boundsOf(w, &r))
 			continue;
 		NSString *owner = w[(__bridge NSString *)kCGWindowOwnerName] ?: @"?";
-		printf("window %u %d %s %.0f %.0f %.0f %.0f\n", [w[(__bridge NSString *)kCGWindowNumber] unsignedIntValue],
-		       [w[(__bridge NSString *)kCGWindowOwnerPID] intValue],
-		       [[owner stringByReplacingOccurrencesOfString:@" " withString:@"_"] UTF8String], r.origin.x, r.origin.y,
-		       r.size.width, r.size.height);
+		const char *name = [[owner stringByReplacingOccurrencesOfString:@" " withString:@"_"] UTF8String];
+		unsigned wid = [w[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
+		int pid = [w[(__bridge NSString *)kCGWindowOwnerPID] intValue];
+		if (all)
+			printf("window %u %d %s %d %.0f %.0f %.0f %.0f\n", wid, pid, name, layer, r.origin.x, r.origin.y,
+			       r.size.width, r.size.height);
+		else
+			printf("window %u %d %s %.0f %.0f %.0f %.0f\n", wid, pid, name, r.origin.x, r.origin.y, r.size.width,
+			       r.size.height);
 	}
 	return 0;
 }
 
-static int track(CGWindowID wid, double seconds, int ms)
+static int track(CGWindowID wid, double seconds, int ms, BOOL size)
 {
 	CFArrayRef ids = CFArrayCreate(NULL, (const void *[]){(const void *)(uintptr_t)wid}, 1, NULL);
 	double end = epoch() + seconds;
@@ -63,12 +72,13 @@ static int track(CGWindowID wid, double seconds, int ms)
 		CGRect r;
 		if (d.count == 1 && boundsOf(d[0], &r)) {
 			samples++;
-			if (r.origin.x != last.x || r.origin.y != last.y) {
+			CGPoint v = size ? CGPointMake(r.size.width, r.size.height) : r.origin;
+			if (v.x != last.x || v.y != last.y) {
 				if (samples > 1)
 					moves++;
-				printf("at %.3f %.0f %.0f\n", epoch(), r.origin.x, r.origin.y);
+				printf("at %.3f %.0f %.0f\n", epoch(), v.x, v.y);
 				fflush(stdout);
-				last = r.origin;
+				last = v;
 			}
 		}
 		usleep(ms * 1000);
@@ -86,11 +96,12 @@ int main(int argc, char **argv)
 			printf("screen %.0f %.0f\n", b.size.width, b.size.height);
 			return 0;
 		}
-		if (argc == 2 && !strcmp(argv[1], "list"))
-			return list();
-		if ((argc == 4 || argc == 5) && !strcmp(argv[1], "track"))
-			return track((CGWindowID)strtoul(argv[2], NULL, 10), atof(argv[3]), argc == 5 ? atoi(argv[4]) : 10);
-		fprintf(stderr, "usage: winmon screen | list | track ID SECONDS [MS]\n");
+		if (argc == 2 && (!strcmp(argv[1], "list") || !strcmp(argv[1], "all")))
+			return list(!strcmp(argv[1], "all"));
+		BOOL size = argc == 6 && !strcmp(argv[5], "size");
+		if ((argc == 4 || argc == 5 || size) && !strcmp(argv[1], "track"))
+			return track((CGWindowID)strtoul(argv[2], NULL, 10), atof(argv[3]), argc >= 5 ? atoi(argv[4]) : 10, size);
+		fprintf(stderr, "usage: winmon screen | list | all | track ID SECONDS [MS] [size]\n");
 		return 2;
 	}
 }
