@@ -6,11 +6,15 @@
 # never committed.
 #
 #   make BUNDLE_DIR=<signed reims-graphics.bundle dir>   build/RgfxGate.kext
-#   make test                                            native tests of the matching and preference logic
+#   make test                                            native tests of the matching and preference logic,
+#                                                        and of when the payload is made again
 #   make clean
 #
 # BUNDLE_DIR is the signed bundle to embed; packaging reads its cdhash with
-# codesign and writes build/gen/RgfxGatePayload.h.
+# codesign and writes build/gen/RgfxGatePayload.h. The payload is made again
+# whenever the bundle it would embed changes: a file of BUNDLE_DIR newer than
+# it, or a BUNDLE_DIR other than the last (build/gen/bundle-dir holds its
+# path). A make with no BUNDLE_DIR keeps the payload made last.
 
 NAME    = RgfxGate
 VERSION = 1.0.0
@@ -24,6 +28,7 @@ KEXT    = $(BUILD)/$(NAME).kext
 BIN     = $(KEXT)/Contents/MacOS/$(NAME)
 PAYLOAD = $(GEN)/RgfxGatePayload.h
 BUNDLE_DIR ?=
+BUNDLE_STAMP = $(GEN)/bundle-dir
 
 FLAGS = -arch x86_64 -mkernel -nostdlib -fno-builtin -fno-stack-protector \
 	-mno-red-zone -Os -Wall -Wextra -Werror -Wno-unused-parameter
@@ -35,8 +40,19 @@ CXXFLAGS = $(FLAGS) -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
 OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \
 	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/plugin_start.o
 
-.PHONY: all clean test
+.PHONY: all clean test FORCE
 all: $(KEXT)
+
+# A payload over another bundle than the one given would gate-tag a bundle that is not
+# installed, and the given one would load untagged: so the payload depends on every file of
+# BUNDLE_DIR, and on its path, which the stamp holds, rewritten only when it differs.
+ifneq ($(BUNDLE_DIR),)
+$(PAYLOAD): $(BUNDLE_STAMP) $(shell find '$(BUNDLE_DIR)' -type f 2>/dev/null)
+
+$(BUNDLE_STAMP): FORCE
+	@mkdir -p $(GEN)
+	@echo '$(abspath $(BUNDLE_DIR))' | cmp -s - $@ || echo '$(abspath $(BUNDLE_DIR))' > $@
+endif
 
 $(PAYLOAD):
 	@test -n "$(BUNDLE_DIR)" || { echo "set BUNDLE_DIR=<signed reims-graphics.bundle dir>" >&2; exit 2; }
@@ -79,6 +95,7 @@ test:
 	$(BUILD)/obj/match_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/gva_pref_test.cpp -o $(BUILD)/obj/gva_pref_test
 	$(BUILD)/obj/gva_pref_test
+	bash tests/payload_test.sh $(BUILD)/payload-test
 
 clean:
 	rm -rf $(BUILD)/obj $(BUILD)/gen $(KEXT)
