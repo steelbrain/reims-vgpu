@@ -435,6 +435,30 @@ bool rgfxTakesSamplePositions(id<MTLDevice> device, const RgfxRenderPassSamplePo
 	return false;
 }
 
+/// The visibility result buffer of pass `d` (visibilityResultBuffer) and its type
+/// (visibilityResultType, macOS 26), as the pass's record carries them, the buffer's write noted
+/// on `enc` as an attachment's is (noteRenderPassWrites); false where the pass has none of ours,
+/// so it carries none. A pass of type Accumulate adds each Counting result to the word at its
+/// offset and ORs each Boolean one into it, as Metal's docs promise and the M3 Max under macOS
+/// 27 does; the AMD Radeon Pro 5300M and the Intel UHD 630 under macOS 26.7.1 reset it
+/// (measured).
+bool fillVisibility(RgfxEncoder *enc, MTLRenderPassDescriptor *d, RgfxRenderPassVisibility *out)
+{
+	*out = {};
+	id<MTLBuffer> buffer = d.visibilityResultBuffer;
+	if (buffer == nil)
+		return false;
+	rgfxIOSurfaceNoteWrite(enc, buffer);
+	out->buffer_obj_id = rgfxWrites(enc, buffer);
+	if (out->buffer_obj_id == 0)
+		return false;
+	static const bool typed =
+	    [MTLRenderPassDescriptor instancesRespondToSelector:@selector(visibilityResultType)];
+	if (typed)
+		out->result_type = static_cast<uint32_t>(d.visibilityResultType);
+	return true;
+}
+
 /// The size of the target of pass `d`, which Metal's default viewport and scissor rectangle
 /// cover: the smallest of its attachments (ours, RgfxTexture) at their levels, else its
 /// renderTargetWidth and renderTargetHeight where it has none.
@@ -1323,8 +1347,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	if (programmed && !rgfxTakesSamplePositions(self.device, positions))
 		return nil;
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
+	RgfxRenderPassVisibility visibility;
+	const bool visible = fillVisibility(_encoder, renderPassDescriptor, &visibility);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
-	                          programmed ? &positions : nullptr);
+	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr);
 	RgfxRenderCommandEncoder *enc = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                          emitEnd:YES
 	                                                                           device:self.device];
@@ -1428,8 +1454,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	if (programmed && !rgfxTakesSamplePositions(self.device, positions))
 		return nil;
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
+	RgfxRenderPassVisibility visibility;
+	const bool visible = fillVisibility(_encoder, renderPassDescriptor, &visibility);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
-	                          programmed ? &positions : nullptr);
+	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr);
 	RgfxParallelRenderCommandEncoder *enc =
 	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
 	[enc rgfxSetCommandBuffer:self];

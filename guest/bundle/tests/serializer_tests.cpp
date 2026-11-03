@@ -1324,6 +1324,89 @@ void test_render_pass_sample_positions()
 	CHECK(walk.done());
 }
 
+// A pass's visibility result record follows its colour records and its sample positions, in
+// that order, and its flag says so; a pass without one carries none, whatever flag its
+// description held.
+void test_render_pass_visibility()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+	RgfxRenderPassDesc pass = {};
+	RgfxRenderPassColorAttachment colors[2] = {};
+	colors[0].texture_obj_id = 4;
+	colors[1].texture_obj_id = 5;
+	RgfxRenderPassSamplePositions positions = {};
+	positions.count = 2;
+	RgfxRenderPassVisibility visibility = {};
+	visibility.buffer_obj_id = 0x77;
+	visibility.result_type = 1;
+	enc.beginRenderPass(pass, colors, 2, nullptr, &visibility);
+	enc.renderSetVisibilityResultMode(2, 8);
+	enc.endEncoder();
+	enc.beginRenderPass(pass, colors, 1, &positions, &visibility);
+	enc.endEncoder();
+	pass.flags = RGFX_PASS_FLAG_VISIBILITY_RESULT;
+	enc.beginRenderPass(pass, colors, 1);
+	enc.endEncoder();
+	uint64_t seqno = 0;
+	CHECK(enc.finish(&seqno));
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	RgfxCommandBuffer cb = {};
+	std::memcpy(&cb, bytes.data(), sizeof(cb));
+	OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes);
+	uint16_t tag = 0, flags = 0;
+	uint32_t len = 0;
+	const uint8_t *body = nullptr;
+	size_t body_len = 0;
+	RgfxRenderPassDesc got = {};
+	RgfxRenderPassVisibility gotVisibility = {};
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_ENCODER_BEGIN_RENDER);
+	const size_t twoColors = RGFX_RENDER_PASS_COLOR_OFFSET + 2 * sizeof(RgfxRenderPassColorAttachment);
+	CHECK(body_len == twoColors + sizeof(RgfxRenderPassVisibility));
+	std::memcpy(&got, body, sizeof(got));
+	CHECK(got.flags == RGFX_PASS_FLAG_VISIBILITY_RESULT && got.color_count == 2);
+	std::memcpy(&gotVisibility, body + twoColors, sizeof(gotVisibility));
+	CHECK(std::memcmp(&gotVisibility, &visibility, sizeof(visibility)) == 0);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE);
+	RgfxOpSetVisibilityResultMode mode = {};
+	CHECK(body_len == sizeof(mode));
+	std::memcpy(&mode, body, sizeof(mode));
+	CHECK(mode.mode == 2 && mode.offset == 8);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_END);
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_ENCODER_BEGIN_RENDER);
+	const size_t oneColor = RGFX_RENDER_PASS_COLOR_OFFSET + sizeof(RgfxRenderPassColorAttachment);
+	CHECK(body_len ==
+	      oneColor + sizeof(RgfxRenderPassSamplePositions) + sizeof(RgfxRenderPassVisibility));
+	std::memcpy(&got, body, sizeof(got));
+	CHECK(got.flags == (RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_VISIBILITY_RESULT));
+	RgfxRenderPassSamplePositions gotPositions = {};
+	std::memcpy(&gotPositions, body + oneColor, sizeof(gotPositions));
+	CHECK(gotPositions.count == 2);
+	std::memcpy(&gotVisibility, body + oneColor + sizeof(RgfxRenderPassSamplePositions),
+	            sizeof(gotVisibility));
+	CHECK(std::memcmp(&gotVisibility, &visibility, sizeof(visibility)) == 0);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_END);
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+	CHECK(tag == RGFX_OP_ENCODER_BEGIN_RENDER);
+	CHECK(body_len == oneColor);
+	std::memcpy(&got, body, sizeof(got));
+	CHECK(got.flags == 0 && got.color_count == 1);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_END);
+	CHECK(walk.done());
+}
+
 void test_command_buffer_encoder()
 {
 	TestRing ring(0x8000);
@@ -2363,6 +2446,7 @@ int main()
 	test_command_buffer_storage();
 	test_video_command_buffer();
 	test_render_pass_sample_positions();
+	test_render_pass_visibility();
 	test_forwarded_lifecycle();
 	test_library_key();
 	test_library_key_of_file();

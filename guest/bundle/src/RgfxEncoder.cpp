@@ -268,25 +268,38 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 
 void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
                                   const RgfxRenderPassColorAttachment *colors, uint32_t color_count,
-                                  const RgfxRenderPassSamplePositions *positions)
+                                  const RgfxRenderPassSamplePositions *positions,
+                                  const RgfxRenderPassVisibility *visibility)
 {
 	desc.color_count = color_count;
-	if (positions == nullptr) {
-		desc.flags &= ~RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+	desc.flags &= ~(RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_VISIBILITY_RESULT);
+	if (positions == nullptr && visibility == nullptr) {
 		appendArrayOp(RGFX_OP_ENCODER_BEGIN_RENDER, &desc, sizeof(desc), colors, color_count,
 		              sizeof(RgfxRenderPassColorAttachment));
 		return;
 	}
-	desc.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+	if (positions != nullptr)
+		desc.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+	if (visibility != nullptr)
+		desc.flags |= RGFX_PASS_FLAG_VISIBILITY_RESULT;
 	const size_t colorBytes = static_cast<size_t>(color_count) * sizeof(RgfxRenderPassColorAttachment);
-	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + sizeof(*positions);
+	const size_t positionBytes = positions != nullptr ? sizeof(*positions) : 0;
+	const size_t visibilityBytes = visibility != nullptr ? sizeof(*visibility) : 0;
+	const size_t len =
+	    RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + positionBytes + visibilityBytes;
 	uint8_t *at = reserve(len);
 	putHeader(at, RGFX_OP_ENCODER_BEGIN_RENDER, len);
 	at += RGFX_OP_BODY_OFFSET;
 	std::memcpy(at, &desc, sizeof(desc));
+	at += sizeof(desc);
 	if (colorBytes)
-		std::memcpy(at + sizeof(desc), colors, colorBytes);
-	std::memcpy(at + sizeof(desc) + colorBytes, positions, sizeof(*positions));
+		std::memcpy(at, colors, colorBytes);
+	at += colorBytes;
+	if (positionBytes)
+		std::memcpy(at, positions, positionBytes);
+	at += positionBytes;
+	if (visibilityBytes)
+		std::memcpy(at, visibility, visibilityBytes);
 }
 
 void RgfxEncoder::beginComputePass()

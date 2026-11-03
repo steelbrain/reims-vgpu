@@ -918,6 +918,75 @@ void test_sample_positions()
 	} // @autoreleasepool
 }
 
+// A pass's visibility result buffer and its type travel after its colour records, in render
+// and parallel passes, and the modes after it; a pass whose buffer is not ours, or that has none,
+// carries none.
+void test_visibility_result_buffer()
+{
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO],
+	    0x42);
+	RgfxBuffer *results = [[RgfxBuffer alloc] initWithObjId:0x50
+	                                             gpuAddress:0
+	                                                 length:16
+	                                                options:0
+	                                                 device:nil
+	                                             serializer:nullptr];
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	MTLRenderPassDescriptor *rp = onePass(target);
+	rp.visibilityResultBuffer = results;
+	id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:rp];
+	[renc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:0];
+	[renc setVisibilityResultMode:MTLVisibilityResultModeBoolean offset:8];
+	[renc endEncoding];
+	const bool typed =
+	    [MTLRenderPassDescriptor instancesRespondToSelector:@selector(setVisibilityResultType:)];
+	if (typed)
+		rp.visibilityResultType = MTLVisibilityResultTypeAccumulate;
+	id<MTLParallelRenderCommandEncoder> par = [cb parallelRenderCommandEncoderWithDescriptor:rp];
+	[par endEncoding];
+	[[cb renderCommandEncoderWithDescriptor:onePass(target)] endEncoding];
+	[cb commit];
+
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	const size_t at = RGFX_RENDER_PASS_COLOR_OFFSET + sizeof(RgfxRenderPassColorAttachment);
+	const uint32_t types[2] = {0, typed ? 1u : 0u};
+	for (uint32_t i = 0; i < 2; i++) {
+		const Op *b = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, i);
+		CHECK(b != nullptr);
+		if (b == nullptr)
+			continue;
+		CHECK(b->as<RgfxRenderPassDesc>().flags == RGFX_PASS_FLAG_VISIBILITY_RESULT);
+		CHECK(b->body.size() == at + sizeof(RgfxRenderPassVisibility));
+		if (b->body.size() < at + sizeof(RgfxRenderPassVisibility))
+			continue;
+		RgfxRenderPassVisibility v = {};
+		std::memcpy(&v, b->body.data() + at, sizeof(v));
+		CHECK(v.buffer_obj_id == 0x50 && v.result_type == types[i] && v.reserved_0c == 0);
+	}
+	const Op *plain = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 2);
+	CHECK(plain != nullptr && plain->body.size() == at);
+	const Op *m0 = findOp(ops, RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE, 0);
+	const Op *m1 = findOp(ops, RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE, 1);
+	CHECK(m0 != nullptr && m1 != nullptr);
+	if (m0 != nullptr && m1 != nullptr) {
+		CHECK(m0->as<RgfxOpSetVisibilityResultMode>().mode == MTLVisibilityResultModeCounting);
+		CHECK(m0->as<RgfxOpSetVisibilityResultMode>().offset == 0);
+		CHECK(m1->as<RgfxOpSetVisibilityResultMode>().mode == MTLVisibilityResultModeBoolean);
+		CHECK(m1->as<RgfxOpSetVisibilityResultMode>().offset == 8);
+	}
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
 // The members of features the device answers NO for do nothing on the wire: a nil or default
 // argument is exact and not logged; any other use is logged once.
 void test_encoders_unsupported()
@@ -1995,6 +2064,7 @@ void rgfxProtocolTests()
 	test_unrecognized_selectors_logged();
 	test_framework_members();
 	test_sample_positions();
+	test_visibility_result_buffer();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();
 	test_texture_members();
