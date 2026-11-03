@@ -15,14 +15,17 @@
 #     the bundle but excluded from the user-space unit test.
 #
 #   make            build the serialiser objects (x86_64, the guest's arch)
-#   make test       build + run the five checks: the serialiser check (x86_64, under
+#   make test       build + run the checks: the serialiser check (x86_64, under
 #                   Rosetta), the AIR argument reader's check (x86_64, under Rosetta,
 #                   over a .metallib built from tests/air_arguments.metal), the
 #                   Metal-shell wrapper/routing check (this Mac's native arch; the
 #                   device shell is not in its binary), and the device's base-class
 #                   check (x86_64, under Rosetta), which loads the bundle
-#                   (tests/inherited_tests.mm), and the video driver's H.264
-#                   parameter-set check (x86_64, under Rosetta, tests/video_h264_tests.cpp).
+#                   (tests/inherited_tests.mm), the protocol members' check against
+#                   their register (x86_64, under Rosetta, which loads the bundle:
+#                   tests/protocol_members_tests.mm, tests/protocol_members.txt), and the
+#                   video driver's H.264 parameter-set check (x86_64, under Rosetta,
+#                   tests/video_h264_tests.cpp).
 #   make bundle     compile + bundle-link the whole x86_64 loadable bundle, device
 #                   shell included (links clean with -undefined dynamic_lookup; it
 #                   only needs to COMPILE off the guest, not run).
@@ -120,6 +123,7 @@ SER_TESTBIN   = $(BUILD)/serializer_tests
 AIR_TESTBIN   = $(BUILD)/air_arguments_test
 SHELL_TESTBIN = $(BUILD)/shell_tests
 INHERIT_TESTBIN = $(BUILD)/inherited_tests
+MEMBERS_TESTBIN = $(BUILD)/protocol_members_tests
 VIDEO_TESTBIN = $(BUILD)/video_h264_tests
 BUNDLEBIN     = $(BUILD)/reims-graphics.bundle
 
@@ -209,6 +213,17 @@ $(INHERIT_TESTBIN): tests/inherited_tests.mm Makefile
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) tests/inherited_tests.mm -framework Foundation \
 		-o $@
 
+# --- the protocol members' check (x86_64, Rosetta) ----------------------------
+# Loads the bundle and checks every member of every Metal protocol its classes adopt against
+# the register tests/protocol_members.txt, reading the members' bodies from src/: a member the
+# register does not list, or one listed as carried out whose body does nothing or answers a
+# constant, fails (tests/protocol_members_tests.mm).
+
+$(MEMBERS_TESTBIN): tests/protocol_members_tests.mm Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) tests/protocol_members_tests.mm \
+		-framework Foundation -o $@
+
 # --- the video driver's H.264 parameter-set check (x86_64, Rosetta) ----------
 
 $(VIDEO_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o tests/video_h264_tests.cpp \
@@ -218,12 +233,13 @@ $(VIDEO_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o tests/video_h264_tes
 		tests/video_h264_tests.cpp -o $@
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) \
-	$(INHERIT_TESTBIN) $(VIDEO_TESTBIN) $(BUNDLEBIN)
+	$(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
 		$(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
+	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
 
 # --- the loadable bundle (x86_64, device shell included) ---------------------

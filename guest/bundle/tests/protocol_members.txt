@@ -1,0 +1,1196 @@
+# The register of the Metal protocol members the bundle's classes answer, and how each is
+# answered: tests/protocol_members_tests.mm walks every member of every MTL* protocol a class of
+# ours adopts, through the Objective-C runtime, and fails on a member this file does not list, a
+# line no class has, or a kind the code contradicts. Its header says what each kind means and
+# what is checked of it. A new member (a new macOS, a new class or protocol) fails the test until
+# it is listed here; the test's --propose prints a line for each, with the kind the code suggests.
+#
+# One line per member, "selector kind text", under the [Class] that answers it: a member a
+# subclass inherits from a class of ours is listed under that class, and one only a base that is
+# not ours answers, or no class answers, under the class that adopts the protocol. The protocols
+# are those of the Mac the test runs on (its Metal.framework), which the guest's macOS may differ
+# from by a few members.
+#
+# The reasons several lines share:
+
+%debug debug groups, signposts and markers name work for Metal's capture and profiling tools; no result, order or value the guest sees changes, and the device has no such tools
+%no-peers a view of the object on another GPU of a peer group: no buffer or texture of the device is one, and Metal answers nil for an object that is not (measured for a texture: M3 Max)
+%no-sparse the device makes no sparse buffers or textures (their creators are RGFX_UNSUPPORTED), so no resource of it has a sparse tier, tiles or a mip tail
+%pipeline-reflection Metal answers nil for a pipeline a device makes, reflection asked for or not (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
+%no-validation the device validates no shader, and Metal answers MTLShaderValidationDisabled for a pipeline made without validation (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
+%no-mesh the device makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED), and Metal answers 0 for a render pipeline with no object or mesh stage (measured: M3 Max)
+%no-mesh-width the device makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED); for a render pipeline with no object or mesh stage the AMD and Intel devices answer 0, the M3 its SIMD width, 32 (measured), so 0 lies within what Metal answers
+%absent-as-metal none of Metal's own devices answers it either (measured with respondsToSelector:, M3 Max on macOS 27 and the AMD 5300M and Intel 630 on macOS 26.7.1), so a caller that sends it to any device checks first
+%base-creator left to the base, as tests/inherited_tests.mm lists, with why
+%base-spi an MTLDeviceSPI query, setter or tool hook the IOGPU base answers from its own state; the device answers every member of MTLDevice itself. No run compares what the base answers on this device with Metal's own devices (aud-tests-04)
+
+[RgfxArgumentEncoder]
+alignment implemented
+constantDataAtIndex: implemented
+encodedLength implemented
+newArgumentEncoderForBufferAtIndex: implemented
+setAccelerationStructure:atIndex: partial ray tracing
+setArgumentBuffer:offset: implemented
+setArgumentBuffer:startOffset:arrayElement: implemented
+setBuffer:offset:atIndex: implemented
+setBuffers:offsets:withRange: implemented
+setComputePipelineState:atIndex: implemented
+setComputePipelineStates:withRange: implemented
+setDepthStencilState:atIndex: partial depth/stencil states in argument buffers (no resource id on the wire)
+setDepthStencilStates:withRange: implemented
+setIndirectCommandBuffer:atIndex: partial indirect command buffers
+setIndirectCommandBuffers:withRange: implemented
+setIntersectionFunctionTable:atIndex: partial ray tracing
+setIntersectionFunctionTables:withRange: implemented
+setRenderPipelineState:atIndex: implemented
+setRenderPipelineStates:withRange: implemented
+setSamplerState:atIndex: implemented
+setSamplerStates:withRange: implemented
+setTexture:atIndex: implemented
+setTextures:withRange: implemented
+setVisibleFunctionTable:atIndex: partial function pointers
+setVisibleFunctionTables:withRange: implemented
+
+[RgfxBinaryArchive]
+addComputePipelineFunctionsWithDescriptor:error: implemented
+addFunctionWithDescriptor:library:error: implemented
+addLibraryWithDescriptor:error: partial stitched libraries with no device to stitch them
+addMeshRenderPipelineFunctionsWithDescriptor:error: implemented
+addRenderPipelineFunctionsWithDescriptor:error: implemented
+addTileRenderPipelineFunctionsWithDescriptor:error: implemented
+device implemented
+label implemented
+serializeToURL:error: implemented
+setLabel: implemented
+
+[RgfxBlitCommandEncoder]
+barrierAfterQueueStages:beforeStages: implemented
+copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin: implemented
+copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options: implemented
+copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size: implemented
+copyFromTensor:sourceOrigin:sourceDimensions:sourcePlane:toTensor:destinationOrigin:destinationDimensions:destinationPlane: unsupported tensors
+copyFromTensor:sourceOrigin:sourceDimensions:toTensor:destinationOrigin:destinationDimensions: unsupported tensors
+copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage: implemented
+copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:options: implemented
+copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin: implemented
+copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:sliceCount:levelCount: implemented
+copyFromTexture:toTexture: implemented
+copyIndirectCommandBuffer:sourceRange:destination:destinationIndex: implemented
+device implemented
+endEncoding implemented
+fillBuffer:range:value: implemented
+generateMipmapsForTexture: implemented
+getTextureAccessCounters:region:mipLevel:slice:resetCounters:countersBuffer:countersBufferOffset: absent the access counters of a sparse texture's tiles: the device makes no sparse textures
+insertDebugSignpost: metal %debug
+label implemented
+optimizeContentsForCPUAccess: implemented
+optimizeContentsForCPUAccess:slice:level: implemented
+optimizeContentsForGPUAccess: implemented
+optimizeContentsForGPUAccess:slice:level: implemented
+optimizeIndirectCommandBuffer:withRange: implemented
+popDebugGroup metal %debug
+pushDebugGroup: metal %debug
+resetCommandsInBuffer:withRange: implemented
+resetTextureAccessCounters:region:mipLevel:slice: absent the access counters of a sparse texture's tiles: the device makes no sparse textures
+resolveCounters:inRange:destinationBuffer:destinationOffset: unsupported counter sampling
+sampleCountersInBuffer:atSampleIndex:withBarrier: unsupported counter sampling
+setLabel: implemented
+synchronizeResource: implemented
+synchronizeTexture:slice:level: implemented
+updateFence: implemented
+waitForFence: implemented
+
+[RgfxBuffer]
+addDebugMarker:range: metal %debug
+allocatedSize implemented
+contents implemented
+cpuCacheMode implemented
+didModifyRange: implemented
+gpuAddress implemented
+hazardTrackingMode implemented
+length implemented
+newRemoteBufferViewForDevice: unsupported remote buffer views
+newTensorWithDescriptor:offset:error: unsupported tensors
+newTextureWithDescriptor:offset:bytesPerRow: implemented
+remoteStorageBuffer metal %no-peers
+removeAllDebugMarkers metal %debug
+resourceOptions implemented
+sparseBufferTier metal %no-sparse
+storageMode implemented
+
+[RgfxCmdBuffer]
+GPUEndTime implemented
+GPUStartTime implemented
+accelerationStructureCommandEncoder unsupported ray tracing
+accelerationStructureCommandEncoderWithDescriptor: unsupported ray tracing
+addCompletedHandler: implemented
+addScheduledHandler: implemented
+blitCommandEncoder implemented
+blitCommandEncoderWithDescriptor: implemented
+commandQueue implemented
+commit implemented
+computeCommandEncoder implemented
+computeCommandEncoderWithDescriptor: implemented
+computeCommandEncoderWithDispatchType: implemented
+encodeSignalEvent:value: implemented
+encodeWaitForEvent:value: implemented
+enqueue implemented
+error implemented
+errorOptions implemented
+kernelEndTime implemented
+kernelStartTime implemented
+label implemented
+logs implemented
+parallelRenderCommandEncoderWithDescriptor: implemented
+popDebugGroup metal %debug
+presentDrawable: implemented
+presentDrawable:afterMinimumDuration: implemented
+presentDrawable:atTime: implemented
+pushDebugGroup: metal %debug
+renderCommandEncoderWithDescriptor: implemented
+resourceStateCommandEncoder unsupported sparse textures
+resourceStateCommandEncoderWithDescriptor: unsupported sparse textures
+retainedReferences implemented
+setLabel: implemented
+status implemented
+useResidencySet: partial residency sets
+useResidencySets:count: partial residency sets
+waitUntilCompleted implemented
+waitUntilScheduled implemented
+
+[RgfxCommandQueue]
+addResidencySet: partial residency sets
+addResidencySets:count: partial residency sets
+commandBuffer implemented
+commandBufferWithDescriptor: implemented
+commandBufferWithUnretainedReferences implemented
+insertDebugCaptureBoundary metal %debug
+label implemented
+removeResidencySet: partial residency sets
+removeResidencySets:count: partial residency sets
+setLabel: implemented
+
+[RgfxComputeCommandEncoder]
+barrierAfterQueueStages:beforeStages: implemented
+device implemented
+dispatchThreadgroups:threadsPerThreadgroup: implemented
+dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup: implemented
+dispatchThreads:threadsPerThreadgroup: implemented
+dispatchType implemented
+endEncoding implemented
+executeCommandsInBuffer:indirectBuffer:indirectBufferOffset: implemented
+executeCommandsInBuffer:withRange: implemented
+insertDebugSignpost: metal %debug
+label implemented
+memoryBarrierWithResources:count: implemented
+memoryBarrierWithScope: implemented
+popDebugGroup metal %debug
+pushDebugGroup: metal %debug
+sampleCountersInBuffer:atSampleIndex:withBarrier: unsupported counter sampling
+setAccelerationStructure:atBufferIndex: partial ray tracing
+setBuffer:offset:atIndex: implemented
+setBuffer:offset:attributeStride:atIndex: implemented
+setBufferOffset:atIndex: implemented
+setBufferOffset:attributeStride:atIndex: implemented
+setBuffers:offsets:attributeStrides:withRange: implemented
+setBuffers:offsets:withRange: implemented
+setBytes:length:atIndex: implemented
+setBytes:length:attributeStride:atIndex: implemented
+setComputePipelineState: implemented
+setImageblockWidth:height: implemented
+setIntersectionFunctionTable:atBufferIndex: partial ray tracing
+setIntersectionFunctionTables:withBufferRange: partial ray tracing
+setLabel: implemented
+setSamplerState:atIndex: implemented
+setSamplerState:lodMinClamp:lodMaxClamp:atIndex: implemented
+setSamplerStates:lodMinClamps:lodMaxClamps:withRange: implemented
+setSamplerStates:withRange: implemented
+setStageInRegion: implemented
+setStageInRegionWithIndirectBuffer:indirectBufferOffset: implemented
+setTexture:atIndex: implemented
+setTextures:withRange: implemented
+setThreadgroupMemoryLength:atIndex: implemented
+setVisibleFunctionTable:atBufferIndex: partial function pointers
+setVisibleFunctionTables:withBufferRange: partial function pointers
+updateFence: implemented
+useHeap: implemented
+useHeaps:count: implemented
+useResource:usage: implemented
+useResources:count:usage: implemented
+waitForFence: implemented
+
+[RgfxComputePipelineState]
+allocatedSize unsupported a pipeline's allocated size (not in the host's reflection)
+forwardProgressUsage implemented
+functionHandleWithBinaryFunction: unsupported function pointers
+functionHandleWithFunction: unsupported function pointers
+functionHandleWithName: unsupported function pointers
+gpuResourceID implemented
+imageblockMemoryLengthForDimensions: unsupported imageblock memory queries (not in the host's reflection)
+maxTotalThreadsPerThreadgroup implemented
+newComputePipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
+newComputePipelineStateWithBinaryFunctions:error: unsupported binary functions
+newIntersectionFunctionTableWithDescriptor: unsupported ray tracing
+newVisibleFunctionTableWithDescriptor: unsupported function pointers
+recommendedPersistentThreadgroupsPerGridForThreadsPerThreadgroup: unsupported persistent threadgroup queries (not in the host's reflection)
+reflection metal %pipeline-reflection
+requiredThreadsPerThreadgroup implemented
+shaderValidation metal %no-validation
+staticThreadgroupMemoryLength implemented
+supportIndirectCommandBuffers implemented
+threadExecutionWidth implemented
+
+[RgfxDepthStencilState]
+gpuResourceID partial depth/stencil resource ids (none on the wire)
+
+[RgfxFunction]
+functionConstantsDictionary implemented
+functionType implemented
+name implemented
+newArgumentEncoderWithBufferIndex: implemented
+newArgumentEncoderWithBufferIndex:reflection: partial an argument buffer's reflection (no argument reflection on the wire)
+options implemented
+patchControlPointCount gap aud-tests-02: answers 0 for every function; Metal answers the [[patch]] control point count, or -1 where the shader states none (MTLLibrary.h; measured: M3 Max, AMD 5300M, Intel 630)
+patchType gap aud-tests-02: answers MTLPatchTypeNone for every function; Metal answers the [[patch]] type of a post-tessellation vertex function (measured: M3 Max, AMD 5300M, Intel 630), and the device draws patches
+stageInputAttributes unsupported a function's stage-in attributes (its reflection is not read)
+vertexAttributes unsupported a function's vertex attributes (its reflection is not read)
+
+[RgfxHeap]
+allocatedSize implemented
+cpuCacheMode implemented
+currentAllocatedSize implemented
+hazardTrackingMode implemented
+maxAvailableSizeWithAlignment: implemented
+newAccelerationStructureWithDescriptor: unsupported ray tracing
+newAccelerationStructureWithDescriptor:offset: unsupported ray tracing
+newAccelerationStructureWithSize: unsupported ray tracing
+newAccelerationStructureWithSize:offset: unsupported ray tracing
+newBufferWithLength:options: implemented
+newBufferWithLength:options:offset: implemented
+newTextureWithDescriptor: implemented
+newTextureWithDescriptor:offset: implemented
+resourceOptions implemented
+size implemented
+storageMode implemented
+type implemented
+usedSize implemented
+
+[RgfxIOSurfaceTexture]
+allocatedSize implemented
+getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice: implemented
+getBytes:bytesPerRow:fromRegion:mipmapLevel: implemented
+iosurface implemented
+iosurfacePlane implemented
+replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage: implemented
+replaceRegion:mipmapLevel:withBytes:bytesPerRow: implemented
+setPurgeableState: implemented
+
+[RgfxLibrary]
+functionNames implemented
+installName metal every library the device makes is executable (it makes no dynamic library: supportsDynamicLibraries answers NO), and an executable library has no install name (nil, as Metal answers)
+newFunctionWithDescriptor:completionHandler: implemented
+newFunctionWithDescriptor:error: implemented
+newFunctionWithName: implemented
+newFunctionWithName:constantValues:completionHandler: implemented
+newFunctionWithName:constantValues:error: partial function constants set by name
+newIntersectionFunctionWithDescriptor:completionHandler: implemented
+newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
+reflectionForFunctionWithName: partial function reflection (the host sends no argument bindings)
+type metal every library the device makes is executable: it makes no dynamic library (supportsDynamicLibraries answers NO)
+
+[RgfxMetalDevice]
+GPUBVHBuilder base %base-spi
+_deviceWrapper base %base-spi
+_registerInterestNotification base %base-spi
+_removeRequested base %base-spi
+_setDeviceWrapper: base %base-spi
+_wasRemoved base %base-spi
+accelerationStructureSizesWithDescriptor: unsupported ray tracing
+acceleratorPort base %base-spi
+allowLibrariesFromOtherPlatforms base %base-spi
+architecture implemented
+areBarycentricCoordsSupported implemented
+areGPUAssertionsEnabled base %base-spi
+areProgrammableSamplePositionsSupported implemented
+areRasterOrderGroupsSupported implemented
+areWritableHeapsEnabled base %base-spi
+argumentBuffersSupport implemented
+bufferRobustnessSupport base %base-spi
+commandBufferErrorOptions base %base-spi
+commandQueueLimit base %base-spi
+compileVisibleFunction:withDescriptor:completionHandler: partial function pointers
+compileVisibleFunction:withDescriptor:destinationBinaryArchive:error: unsupported function pointers
+compileVisibleFunction:withDescriptor:error: unsupported function pointers
+compilerPropagatesThreadPriority: base %base-creator
+convertSparsePixelRegions:toTileRegions:withTileSize:alignmentMode:numRegions: base %base-spi
+convertSparseTileRegions:toPixelRegions:withTileSize:numRegions: base %base-spi
+copyIOSurfaceSharedTextureProperties: unsupported IOSurface properties for a texture (no layout size on the wire)
+counterSets base %base-spi
+currentAllocatedSize unsupported the device's allocation count (answers 0)
+currentCommandQueueCount base %base-spi
+currentPerformanceState base %base-spi
+dedicatedMemorySize base %base-spi
+defaultCompilerProcessesCount base %base-spi
+defaultTextureWriteRoundingMode base %base-spi
+deserializeCompileTimeStats:addToDictionary: base %base-spi
+deserializeInstanceAccelerationStructure:fromBytes:primitiveAccelerationStructures:withDescriptor: base %base-spi
+deserializeInstanceAccelerationStructureFromBytes:primitiveAccelerationStructures:withDescriptor: base %base-spi
+deserializePrimitiveAccelerationStructure:fromBytes:withDescriptor: base %base-spi
+deserializePrimitiveAccelerationStructureFromBytes:withDescriptor: base %base-spi
+deviceCreationFlags base %base-spi
+deviceLinearReadOnlyTextureAlignmentBytes base %base-spi
+deviceLinearTextureAlignmentBytes implemented
+deviceOrFeatureProfileSupportsFeatureSet: base %base-spi
+deviceSupportsFeatureSet: base %base-spi
+doubleFPConfig implemented
+endCollectingPipelineDescriptors base %base-spi
+familyName base %base-spi
+featureProfile implemented
+featureQueries base %base-spi
+functionHandleWithBinaryFunction: unsupported function pointers
+functionHandleWithFunction: unsupported function pointers
+functionHandleWithFunction:resourceIndex: unsupported function pointers
+genericAddressSpaceDispatchInfo base %base-spi
+getBVHBuilderLock base %base-spi
+getCompilerConnectionManager: base %base-spi
+getDefaultSamplePositions:count: base %base-spi
+getMostCompatibleArchitecture: base %base-spi
+getRawBVHBuilderPtr base %base-spi
+getShaderCacheKeys base %base-spi
+getSurfaceMode:width:height:forId: base %base-spi
+halfFPConfig implemented
+hasUnifiedMemory implemented
+heapAccelerationStructureSizeAndAlignWithDescriptor: unsupported ray tracing
+heapAccelerationStructureSizeAndAlignWithSize: unsupported ray tracing
+heapBufferSizeAndAlignWithLength:options: partial the host's heap buffer alignment (none in the device info): 
+heapTextureSizeAndAlignWithDescriptor: implemented
+indirectArgumentBufferCapabilities base %base-spi
+indirectArgumentBufferDecodingData base %base-spi
+iosurfaceReadOnlyTextureAlignmentBytes base %base-spi
+iosurfaceTextureAlignmentBytes base %base-spi
+isASTCPixelFormatsSupported base %base-spi
+isAnisoSampleFixSupported base %base-spi
+isBCTextureCompressionSupported base %base-spi
+isClampToHalfBorderSupported base %base-spi
+isCompatibleWithAccelerationStructure: base %base-spi
+isCustomBorderColorSupported base %base-spi
+isDepth24Stencil8PixelFormatSupported implemented
+isFixedLinePointFillDepthGradientSupported base %base-spi
+isFloat32FilteringSupported base %base-spi
+isFramebufferReadSupported implemented
+isHeadless implemented
+isLargeMRTSupported base %base-spi
+isLowPower implemented
+isMagicMipmapSupported base %base-spi
+isMsaa32bSupported base %base-spi
+isPlacementHeapSupported base %base-spi
+isQuadDataSharingSupported base %base-spi
+isRGB10A2GammaSupported base %base-spi
+isRTZRoundingSupported base %base-spi
+isRemovable implemented
+isSystemDefaultDevice absent %absent-as-metal
+isVendorSliceCompatibleWithDeploymentTarget:platform:sdkVersion:compilerPluginVersion: base %base-spi
+latestSupportedGenericBVHVersion base %base-spi
+libraryCacheStats base %base-spi
+limits base %base-spi
+linearTextureAlignmentBytes implemented
+linearTextureArrayAlignmentBytes base %base-spi
+linearTextureArrayAlignmentSlice base %base-spi
+llvmVersion base %base-spi
+loadDynamicLibrariesForComputeDescriptor:error: base %base-creator
+loadDynamicLibrariesForComputeDescriptor:options:error: base %base-creator
+loadDynamicLibrariesForFunction:insertLibraries:error: base %base-creator
+loadDynamicLibrariesForFunction:insertLibraries:options:error: base %base-creator
+location implemented
+locationNumber implemented
+mapShaderSampleBufferWithBuffer:capacity:size: unsupported shader sample buffers (shader profiling)
+maxAccelerationStructureLevels base %base-spi
+maxAccelerationStructureTraversalDepth base %base-spi
+maxArgumentBufferSamplerCount implemented
+maxBufferLength implemented
+maxColorAttachments base %base-spi
+maxComputeAttributes base %base-spi
+maxComputeBuffers base %base-spi
+maxComputeInlineDataSize base %base-spi
+maxComputeLocalMemorySizes base %base-spi
+maxComputeSamplers base %base-spi
+maxComputeTextures implemented
+maxComputeThreadgroupMemory base %base-spi
+maxComputeThreadgroupMemoryAlignmentBytes base %base-spi
+maxConcurrentExecutingCompilationTasks base %base-spi
+maxConstantBufferArguments base %base-spi
+maxCustomSamplePositions base %base-spi
+maxFenceInstances base %base-spi
+maxFragmentBuffers base %base-spi
+maxFragmentInlineDataSize base %base-spi
+maxFragmentSamplers base %base-spi
+maxFragmentTextures implemented
+maxFramebufferStorageBits base %base-spi
+maxFunctionConstantIndices base %base-spi
+maxIOCommandsInFlight base %base-spi
+maxIndirectBuffers base %base-spi
+maxIndirectSamplers base %base-spi
+maxIndirectSamplersPerDevice base %base-spi
+maxIndirectTextures base %base-spi
+maxInterpolants base %base-spi
+maxInterpolatedComponents base %base-spi
+maxLineWidth base %base-spi
+maxPointSize base %base-spi
+maxPredicatedNestingDepth base %base-spi
+maxRasterizationRateLayerCount base %base-spi
+maxTessellationFactor base %base-spi
+maxTextureBufferWidth base %base-spi
+maxTextureDepth3D base %base-spi
+maxTextureDimensionCube base %base-spi
+maxTextureHeight2D base %base-spi
+maxTextureHeight3D base %base-spi
+maxTextureLayers base %base-spi
+maxTextureWidth1D base %base-spi
+maxTextureWidth2D base %base-spi
+maxTextureWidth3D base %base-spi
+maxThreadgroupMemoryLength implemented
+maxThreadsPerThreadgroup implemented
+maxTileBuffers base %base-spi
+maxTileInlineDataSize base %base-spi
+maxTileSamplers base %base-spi
+maxTileTextures base %base-spi
+maxTotalComputeThreadsPerThreadgroup base %base-spi
+maxTransferRate implemented
+maxVertexAmplificationCount implemented
+maxVertexAmplificationFactor base %base-spi
+maxVertexAttributes base %base-spi
+maxVertexBuffers base %base-spi
+maxVertexInlineDataSize base %base-spi
+maxVertexSamplers implemented
+maxVertexTextures base %base-spi
+maxViewportCount base %base-spi
+maxVisibilityQueryOffset base %base-spi
+maximumCompilerProcessesCount base %base-spi
+maximumComputeSubstreams base %base-spi
+maximumConcurrentCompilationTaskCount implemented
+metalAssertionsEnabled implemented
+minBufferNoCopyAlignmentBytes base %base-spi
+minConstantBufferAlignmentBytes base %base-spi
+minLinearTextureAlignmentForPixelFormat: base %base-spi
+minLinearTextureBaseAddressAlignmentForDescriptor: base %base-spi
+minLinearTexturePitchAlignmentForDescriptor:mustMatchExactly: base %base-spi
+minTilePixels base %base-spi
+minimumLinearTextureAlignmentForPixelFormat: implemented
+minimumTextureBufferAlignmentForPixelFormat: implemented
+motionEstimatorCapabilities base %base-spi
+mtlTensorFromGpuResourceID: base %base-spi
+name implemented
+newAccelerationStructureWithBuffer:offset: unsupported ray tracing
+newAccelerationStructureWithBuffer:offset:resourceIndex: unsupported ray tracing
+newAccelerationStructureWithDescriptor: unsupported ray tracing
+newAccelerationStructureWithSize: unsupported ray tracing
+newAccelerationStructureWithSize:resourceIndex: unsupported ray tracing
+newAccelerationStructureWithSize:withDescriptor: unsupported ray tracing
+newArchiveWithURL:error: unsupported the Metal 4 API
+newArgumentEncoderWithArguments: implemented
+newArgumentEncoderWithBufferBinding: unsupported argument encoders (no argument-buffer layout on the wire)
+newArgumentEncoderWithLayout: unsupported argument buffers of a layout object
+newArgumentTableWithDescriptor:error: unsupported the Metal 4 API
+newBinaryArchiveWithDescriptor:error: implemented
+newBinaryLibraryWithOptions:url:error: unsupported binary libraries
+newBufferWithBytes:length:options: implemented
+newBufferWithBytes:length:options:gpuAddress: absent %absent-as-metal
+newBufferWithBytesNoCopy:length:options:deallocator: implemented
+newBufferWithBytesNoCopy:length:options:gpuAddress:deallocator: absent %absent-as-metal
+newBufferWithDescriptor: partial buffer descriptors placing a buffer at a GPU address
+newBufferWithIOSurface: unsupported buffers over IOSurfaces
+newBufferWithLength:options: implemented
+newBufferWithLength:options:gpuAddress: absent %absent-as-metal
+newBufferWithLength:options:placementSparsePageSize: unsupported placement sparse buffers
+newCommandAllocator unsupported the Metal 4 API
+newCommandAllocatorWithDescriptor:error: unsupported the Metal 4 API
+newCommandBuffer unsupported the Metal 4 API
+newCommandQueue implemented
+newCommandQueueWithDescriptor: implemented
+newCommandQueueWithMaxCommandBufferCount: implemented
+newCompilerWithDescriptor:error: unsupported the Metal 4 API
+newComputePipelineDescriptorWithSerializedData:deserializationContext: base %base-creator
+newComputePipelineStateWithDescriptor:completionHandler: implemented
+newComputePipelineStateWithDescriptor:error: implemented
+newComputePipelineStateWithDescriptor:options:completionHandler: implemented
+newComputePipelineStateWithDescriptor:options:reflection:error: implemented
+newComputePipelineStateWithFunction:completionHandler: implemented
+newComputePipelineStateWithFunction:error: implemented
+newComputePipelineStateWithFunction:options:completionHandler: implemented
+newComputePipelineStateWithFunction:options:reflection:error: implemented
+newComputePipelineStateWithImageFilterFunctionsSPI:imageFilterFunctionInfo:error: partial a Core Image link of other than one kernel
+newCounterHeapWithDescriptor:error: unsupported the Metal 4 API
+newCounterSampleBufferWithDescriptor:error: unsupported counter sampling
+newDagStringWithGraphs: base %base-creator
+newDefaultLibrary implemented
+newDefaultLibraryWithBundle:error: implemented
+newDepthStencilStateWithDescriptor: implemented
+newDynamicLibrary:computeDescriptor:error: unsupported dynamic libraries
+newDynamicLibrary:error: unsupported dynamic libraries
+newDynamicLibraryFromURL:error: unsupported dynamic libraries
+newDynamicLibraryWithDescriptor:error: unsupported dynamic libraries
+newDynamicLibraryWithURL:error: unsupported dynamic libraries
+newDynamicLibraryWithURL:options:error: unsupported dynamic libraries
+newEvent implemented
+newEventWithOptions: partial events with options
+newFence implemented
+newFunctionWithGLCoreIR:functionType: unsupported OpenGL
+newFunctionWithGLCoreIR:inputsDescription:functionType: unsupported OpenGL
+newFunctionWithGLESIR:functionType: unsupported OpenGL
+newFunctionWithGLESIR:inputsDescription:functionType: unsupported OpenGL
+newFunctionWithGLIR:functionType: unsupported OpenGL
+newFunctionWithGLIR:inputsDescription:functionType: unsupported OpenGL
+newGLDrawable unsupported OpenGL
+newHeapWithDescriptor: implemented
+newIOCommandQueueWithDescriptor:error: partial Metal IO command queues
+newIOFileHandleWithURL:compressionMethod:error: implemented
+newIOFileHandleWithURL:error: implemented
+newIOHandleWithURL:compressionMethod:error: implemented
+newIOHandleWithURL:error: implemented
+newIndirectArgumentBufferLayoutWithStructType: unsupported argument buffers of a layout object
+newIndirectArgumentEncoderWithArguments: absent %absent-as-metal
+newIndirectArgumentEncoderWithLayout: unsupported argument buffers of a layout object
+newIndirectCommandBufferWithDescriptor:maxCommandCount:options: unsupported indirect command buffers (none on the wire)
+newIndirectCommandBufferWithDescriptor:maxCount:options: implemented
+newIndirectComputeCommandEncoderWithBuffer: unsupported indirect command encoders (none on the wire)
+newIndirectRenderCommandEncoderWithBuffer: unsupported indirect command encoders (none on the wire)
+newIntersectionFunctionTableWithDescriptor: unsupported ray tracing
+newLateEvalEvent unsupported late-evaluated events (none on the wire)
+newLibraryWithCIFilters:imageFilterFunctionInfo:error: implemented
+newLibraryWithCIFiltersForComputePipeline:imageFilterFunctionInfo:error: absent %absent-as-metal
+newLibraryWithDAG:functions:error: implemented
+newLibraryWithData:error: implemented
+newLibraryWithDescriptor:completionHandler: implemented
+newLibraryWithDescriptor:error: implemented
+newLibraryWithDescriptorSPI:error: implemented
+newLibraryWithFile:error: implemented
+newLibraryWithGraphs:functions:error: absent %absent-as-metal
+newLibraryWithGraphsSPI:functions:error: absent %absent-as-metal
+newLibraryWithImageFilterFunctionsSPI:imageFilterFunctionInfo:error: implemented
+newLibraryWithMPSGraphPackageURL:name:error: unsupported libraries of an MPS graph package
+newLibraryWithSource:options:completionHandler: implemented
+newLibraryWithSource:options:error: implemented
+newLibraryWithStitchedDescriptor:completionHandler: implemented
+newLibraryWithStitchedDescriptor:error: implemented
+newLibraryWithStitchedDescriptorSPI:error: implemented
+newLibraryWithURL:error: implemented
+newLogStateWithDescriptor:error: unsupported shader log states (none on the wire)
+newMTL4CommandQueue unsupported the Metal 4 API
+newMTL4CommandQueueWithDescriptor:error: unsupported the Metal 4 API
+newMotionEstimationPipelineWithDescriptor: absent motion estimation pipelines: of the oracles only the AMD device answers it; the M3 and Intel ones do not (measured, respondsToSelector:)
+newPerformanceStateAssertion:error: unsupported performance state assertions (none on the wire)
+newPipelineDataSetSerializerWithDescriptor: unsupported the Metal 4 API
+newPipelineLibraryWithFilePath:error: unsupported pipeline libraries
+newPrecompiledComputePipelineStateWithDescriptor:options:pipelineCache:completionHandler: partial precompiled compute pipelines of another descriptor
+newPrecompiledRenderPipelineStateWithDescriptor:options:pipelineCache:completionHandler: partial precompiled render pipelines of another descriptor
+newProfileWithExecutionSize: unsupported profiles
+newRasterizationRateMapWithDescriptor: unsupported rasterization rate maps
+newRenderPipelineDescriptorWithSerializedData:deserializationContext: base %base-creator
+newRenderPipelineStateWithDescriptor:completionHandler: implemented
+newRenderPipelineStateWithDescriptor:error: implemented
+newRenderPipelineStateWithDescriptor:options:completionHandler: implemented
+newRenderPipelineStateWithDescriptor:options:reflection:error: implemented
+newRenderPipelineStateWithMeshDescriptor:completionHandler: partial mesh pipelines (no mesh pipeline create on the wire)
+newRenderPipelineStateWithMeshDescriptor:error: unsupported mesh pipelines (no mesh pipeline create on the wire)
+newRenderPipelineStateWithMeshDescriptor:options:completionHandler: partial mesh pipelines (no mesh pipeline create on the wire)
+newRenderPipelineStateWithMeshDescriptor:options:reflection:error: partial mesh pipelines (no mesh pipeline create on the wire)
+newRenderPipelineStateWithTileDescriptor:completionHandler: implemented
+newRenderPipelineStateWithTileDescriptor:error: implemented
+newRenderPipelineStateWithTileDescriptor:options:completionHandler: partial tile pipelines (no tile pipeline create on the wire)
+newRenderPipelineStateWithTileDescriptor:options:reflection:error: partial tile pipelines (no tile pipeline create on the wire)
+newResidencySetWithDescriptor:error: unsupported residency sets (none on the wire)
+newResourceGroupFromResources:count: unsupported resource groups
+newSamplerStateWithDescriptor: implemented
+newSharedEvent implemented
+newSharedEventWithHandle: unsupported shared event handles (an event shared across processes)
+newSharedEventWithMachPort: unsupported shared events from another process
+newSharedEventWithOptions: partial shared events with options
+newSharedTextureWithDescriptor: unsupported shared textures (no cross-process texture handle on the wire)
+newSharedTextureWithHandle: unsupported shared textures (no cross-process texture handle on the wire)
+newSharedTextureWithHandle:withResourceIndex: unsupported shared textures (no cross-process texture handle on the wire)
+newStructTypeWithSerializedData: base %base-creator
+newTensorWithDescriptor:attachments:error: unsupported tensors
+newTensorWithDescriptor:error: unsupported tensors
+newTextureLayoutWithDescriptor:isHeapOrBufferBacked: unsupported texture layouts
+newTextureViewPoolWithDescriptor:error: unsupported the Metal 4 API
+newTextureWithBytesNoCopy:length:descriptor:deallocator: absent the M3 answers it and raises (the effort's selector-sweep.md row 47); the AMD and Intel devices do not answer it (measured, respondsToSelector:)
+newTextureWithDescriptor: implemented
+newTextureWithDescriptor:iosurface:plane: implemented
+newTextureWithDescriptor:iosurface:plane:slice: implemented
+newTextureWithSurface:buffer: implemented
+newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: base %base-creator
+newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:bytesPerRow: partial tiled textures with a deallocator of another type
+newTiledTextureWithBytesNoCopy:length:descriptor:offset:bytesPerRow: implemented
+newVisibleFunctionTableWithDescriptor: unsupported visible function tables (function pointers)
+originalDefaultCompilerProcessesCount base %base-spi
+originalThreadsPerCompilerProcess base %base-spi
+peerCount implemented
+peerGroupID implemented
+peerIndex implemented
+pipelineCacheStats base %base-spi
+pluginData base %base-spi
+productName base %base-spi
+queryTimestampFrequency implemented
+readWriteTextureSupport implemented
+recommendedMaxWorkingSetSize implemented
+registryID implemented
+requiredLinearTextureBytesPerRowForDescriptor: base %base-spi
+requiresBFloat16Emulation base %base-spi
+requiresLegacyCompilerProcessesCount base %base-spi
+requiresMeshShaderEmulation base %base-spi
+requiresRaytracingEmulation base %base-spi
+reserveGPUAddressRange: absent %absent-as-metal
+reserveResourceIndicesForResourceType:indices:indexCount: metal Metal's writes nothing to indices (types 0, 1 and 2 tried; measured, the effort's selector-sweep.md row 49)
+resourcePatchingTypeForResourceType: implemented
+sampleTimestamps:gpuTimestamp: implemented
+samplerReductionModeSupport base %base-spi
+serializeComputePipelineDescriptor: base %base-spi
+serializeRenderPipelineDescriptor: base %base-spi
+serializeStructType: base %base-spi
+serializeStructType:version: base %base-spi
+serializeTileRenderPipelineDescriptor: base %base-spi
+setCommandBufferErrorOptions: base %base-spi
+setCompilerProcessesCount: base %base-spi
+setGPUAssertionsEnabled: base %base-spi
+setIndirectArgumentBufferDecodingData: base %base-spi
+setMetalAssertionsEnabled: implemented
+setPluginData: base %base-spi
+setRawBVHBuilderPtr: base %base-spi
+setRequiresLegacyCompilerProcessesCount: base %base-spi
+setShaderDebugInfoCaching: base %base-spi
+setShouldMaximizeConcurrentCompilation: base %base-spi
+setWritableHeapsEnabled: base %base-spi
+setupMPSFunctionTable: absent %absent-as-metal
+shaderDebugInfoCaching base %base-spi
+sharedMemorySize base %base-spi
+shouldMaximizeConcurrentCompilation base %base-spi
+singleFPConfig implemented
+sizeOfCounterHeapEntry: unsupported Metal 4 counter heaps
+sparseTexturesSupport base %base-spi
+sparseTileSizeInBytes implemented
+sparseTileSizeInBytesForSparsePageSize: base %base-spi
+sparseTileSizeWithTextureType:pixelFormat:sampleCount: implemented
+sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize: implemented
+startCollectingPipelineDescriptors base %base-spi
+startCollectingPipelineDescriptorsUsingPrefixForNames: base %base-spi
+supportPriorityBand base %base-spi
+supports2DLinearTexArraySPI base %base-spi
+supports32BitFloatFiltering implemented
+supports32BitMSAA implemented
+supports32bpcMSAATextures base %base-spi
+supports3DASTCTextures base %base-spi
+supports3DBCTextures base %base-spi
+supportsAIRNTBinaryArchiveFunctionPointers base %base-spi
+supportsAIRNTBinaryArchiveSpecializedFunctions base %base-spi
+supportsAIRNTBinaryArchiveStitchedFunctions base %base-spi
+supportsASTCHDRTextureCompression base %base-spi
+supportsASTCTextureCompression base %base-spi
+supportsAlphaYUVFormats base %base-spi
+supportsAnisoSampleFix base %base-spi
+supportsArgumentBuffers base %base-spi
+supportsArgumentBuffersTier2 base %base-spi
+supportsArrayOfSamplers base %base-spi
+supportsArrayOfTextures base %base-spi
+supportsAtomicFloat base %base-spi
+supportsAtomicUlongVoidMinMax base %base-spi
+supportsAtomicWaitNotify base %base-spi
+supportsBCTextureCompression implemented
+supportsBGR10A2 base %base-spi
+supportsBaseVertexInstanceDrawing base %base-spi
+supportsBfloat16Buffers base %base-spi
+supportsBfloat16Format base %base-spi
+supportsBinaryArchives base %base-spi
+supportsBinaryLibraries base %base-spi
+supportsBlackOrWhiteSamplerBorderColors base %base-spi
+supportsBufferBoundsChecking base %base-spi
+supportsBufferPrefetchStatistics base %base-spi
+supportsBufferWithAddressRanges base %base-spi
+supportsBufferWithIOSurface base %base-spi
+supportsBufferlessClientStorageTexture base %base-spi
+supportsCMPIndirectCommandBuffers base %base-spi
+supportsColorSpaceConversionMatrixSelection base %base-spi
+supportsCombinedMSAAStoreAndResolveAction base %base-spi
+supportsCommandBufferJump base %base-spi
+supportsCommandQueueBarriers base %base-spi
+supportsCompressedTextureViewSPI base %base-spi
+supportsComputeCompressedTextureWrite base %base-spi
+supportsComputeMemoryBarrier base %base-spi
+supportsConcurrentComputeDispatch base %base-spi
+supportsConditionalLoadStore base %base-spi
+supportsConditionalTileDispatch base %base-spi
+supportsCounterSampling: implemented
+supportsCountingOcclusionQuery base %base-spi
+supportsCustomBorderColor base %base-spi
+supportsDeadlineProfile base %base-spi
+supportsDepthBoundsTesting base %base-spi
+supportsDepthClipMode base %base-spi
+supportsDepthClipModeClampExtended base %base-spi
+supportsDeviceCoherency base %base-spi
+supportsDevicePartitioning base %base-spi
+supportsDynamicAttributeStride base %base-spi
+supportsDynamicControlPointCount base %base-spi
+supportsDynamicLibraries implemented
+supportsExplicitVisibilityGroups base %base-spi
+supportsExtendedIndirectRenderCommand base %base-spi
+supportsExtendedSamplerLODBiasRange base %base-spi
+supportsExtendedVertexFormats base %base-spi
+supportsExtendedXR10Formats base %base-spi
+supportsExtendedYUVFormats base %base-spi
+supportsFP32TessFactors base %base-spi
+supportsFP8 base %base-spi
+supportsFamily: implemented
+supportsFastMathInfNaNPropagation base %base-spi
+supportsFeatureSet: implemented
+supportsFillTexture base %base-spi
+supportsFixedLinePointFillDepthGradient base %base-spi
+supportsFloat16BCubicFiltering base %base-spi
+supportsFloat16InfNanFiltering base %base-spi
+supportsForceSeamsOnCubemaps base %base-spi
+supportsForkJoin base %base-spi
+supportsFragmentBufferWrites base %base-spi
+supportsFragmentOnlyEncoders base %base-spi
+supportsFunctionPointers implemented
+supportsFunctionPointersFromMesh base %base-spi
+supportsFunctionPointersFromRender implemented
+supportsGFXIndirectCommandBuffers base %base-spi
+supportsGPUStatistics base %base-spi
+supportsGlobalVariableBindingInDylibs base %base-spi
+supportsGlobalVariableBindings base %base-spi
+supportsGlobalVariableRelocation base %base-spi
+supportsGlobalVariableRelocationCompute base %base-spi
+supportsGlobalVariableRelocationRender base %base-spi
+supportsHeapAccelerationStructureAllocation base %base-spi
+supportsHeapWithAddressRanges base %base-spi
+supportsIABHashForTools base %base-spi
+supportsImageBlockSampleCoverageControl base %base-spi
+supportsImageBlocks implemented
+supportsIndirectDrawAndDispatch base %base-spi
+supportsIndirectStageInRegion base %base-spi
+supportsIndirectTessellation base %base-spi
+supportsIndirectTextures base %base-spi
+supportsIndirectWritableTextures base %base-spi
+supportsInt64 base %base-spi
+supportsInterchangeTiled base %base-spi
+supportsIntersectionFunctionBuffers base %base-spi
+supportsInvariantVertexPosition base %base-spi
+supportsLargeFramebufferConfigs base %base-spi
+supportsLateEvalEvent base %base-spi
+supportsLayeredRendering base %base-spi
+supportsLimitedYUVFormats base %base-spi
+supportsLinearTexture2DArray base %base-spi
+supportsLinearTextureFromSharedBuffer base %base-spi
+supportsLossyCompression base %base-spi
+supportsMSAADepthResolve base %base-spi
+supportsMSAADepthResolveFilter base %base-spi
+supportsMSAAStencilResolve base %base-spi
+supportsMSAAStencilResolveFilter base %base-spi
+supportsMTL4CommandAllocator base %base-spi
+supportsMTL4CommandQueue base %base-spi
+supportsMTL4Compiler base %base-spi
+supportsMTL4ComputeCommandEncoder base %base-spi
+supportsMTL4Counters base %base-spi
+supportsMTL4LateBoundRenderTargets base %base-spi
+supportsMTL4PSOSpecialization base %base-spi
+supportsMTL4PlacementSparse base %base-spi
+supportsMTL4RenderCommandEncoder base %base-spi
+supportsMTLTextureViewPools base %base-spi
+supportsMXU base %base-spi
+supportsMXUNarrowTileSizes base %base-spi
+supportsMachineLearningCommandEncoders base %base-spi
+supportsMemoryOrderAtomics base %base-spi
+supportsMemorylessRenderTargets base %base-spi
+supportsMeshRenderDynamicLibraries base %base-spi
+supportsMeshShaders base %base-spi
+supportsMeshShadersInICB base %base-spi
+supportsMipLevelsSmallerThanBlockSize base %base-spi
+supportsMirrorClampToEdgeSamplerMode base %base-spi
+supportsMultiPlaneTensors base %base-spi
+supportsMutableTier1ArgumentBuffers base %base-spi
+supportsNativeHardwareFP16 base %base-spi
+supportsNonPrivateDepthStencilTextures base %base-spi
+supportsNonPrivateMSAATextures base %base-spi
+supportsNonSquareTileShaders implemented
+supportsNonUniformThreadgroupSize base %base-spi
+supportsNonZeroTextureWriteLOD base %base-spi
+supportsNorm16BCubicFiltering base %base-spi
+supportsOpenCLTextureWriteSwizzles base %base-spi
+supportsPVRTC base %base-spi
+supportsPackUnpackSmallInteger base %base-spi
+supportsPacked32TextureBufferWrites base %base-spi
+supportsPartialRenderMemoryBarrier base %base-spi
+supportsPerPlaneCompression base %base-spi
+supportsPerformanceStateAssertion base %base-spi
+supportsPipelineLibraries base %base-spi
+supportsPlacementHeaps base %base-spi
+supportsPlacementSparse implemented
+supportsPostDepthCoverage base %base-spi
+supportsPrimitiveMotionBlur implemented
+supportsPrimitiveRestartOverride base %base-spi
+supportsPrimitiveType: implemented
+supportsProgrammableBlending base %base-spi
+supportsProgrammableSamplePositions base %base-spi
+supportsPublicXR10Formats base %base-spi
+supportsPullModelInterpolation implemented
+supportsQuadGroup base %base-spi
+supportsQuadReduction base %base-spi
+supportsQuadShufflesAndBroadcast base %base-spi
+supportsQueryTextureLOD implemented
+supportsRGBA10A2Gamma base %base-spi
+supportsRGBTextureBuffers base %base-spi
+supportsRTZRounding base %base-spi
+supportsRasterOrderGroups base %base-spi
+supportsRasterOrderGroupsColorAttachment base %base-spi
+supportsRasterizationRateMapWithLayerCount: implemented
+supportsRayTracingAccelerationStructureCPUDeserialization base %base-spi
+supportsRayTracingBuffersFromTables base %base-spi
+supportsRayTracingCurves base %base-spi
+supportsRayTracingDirectIntersectionResultAccess base %base-spi
+supportsRayTracingExtendedVertexFormats base %base-spi
+supportsRayTracingGPUTableUpdateBuffers base %base-spi
+supportsRayTracingICBs base %base-spi
+supportsRayTracingIndirectInstanceAccelerationStructureBuild base %base-spi
+supportsRayTracingMatrixLayout base %base-spi
+supportsRayTracingMultiLevelInstancing base %base-spi
+supportsRayTracingPerComponentMotionInterpolation base %base-spi
+supportsRayTracingPerPrimitiveData base %base-spi
+supportsRayTracingTraversalMetrics base %base-spi
+supportsRaytracing implemented
+supportsRaytracingFromRender implemented
+supportsReadWriteBufferArguments base %base-spi
+supportsReadWriteTextureArguments base %base-spi
+supportsReadWriteTextureArgumentsTier2 base %base-spi
+supportsReadWriteTextureCubeArguments base %base-spi
+supportsRelaxedTextureViewRequirements base %base-spi
+supportsRenderDynamicLibraries implemented
+supportsRenderMemoryBarrier base %base-spi
+supportsRenderPassWithoutRenderTarget base %base-spi
+supportsRenderTargetTextureRotation base %base-spi
+supportsRenderTextureWrites base %base-spi
+supportsRenderToLinearTextures base %base-spi
+supportsResourceDetachBacking base %base-spi
+supportsResourceHeaps base %base-spi
+supportsSIMDGroup base %base-spi
+supportsSIMDGroupMatrix base %base-spi
+supportsSIMDGroupParallelForwardProgress base %base-spi
+supportsSIMDReduction base %base-spi
+supportsSIMDShuffleAndFill base %base-spi
+supportsSIMDShufflesAndBroadcast base %base-spi
+supportsSRGBwrites base %base-spi
+supportsSampleCount: implemented
+supportsSamplerAddressModeClampToHalfBorder base %base-spi
+supportsSamplerCompareFunction base %base-spi
+supportsSamplerReductionMode base %base-spi
+supportsSeparateDepthStencil base %base-spi
+supportsSeparateVisibilityAndShadingRate base %base-spi
+supportsSetThreadgroupPackingDisabled base %base-spi
+supportsShaderBarycentricCoordinates implemented
+supportsShaderLODAverage base %base-spi
+supportsShaderMinLODClamp base %base-spi
+supportsSharedFunctionTables base %base-spi
+supportsSharedStorageHeapResources base %base-spi
+supportsSharedStorageTextures base %base-spi
+supportsSharedTextureHandles base %base-spi
+supportsSparseDepthAttachments base %base-spi
+supportsSparseHeaps base %base-spi
+supportsSparseTextures base %base-spi
+supportsStackOverflowErrorCode base %base-spi
+supportsStatefulDynamicLibraries base %base-spi
+supportsStencilFeedback base %base-spi
+supportsStreamingCodecSignaling base %base-spi
+supportsTLS base %base-spi
+supportsTensors base %base-spi
+supportsTessellation base %base-spi
+supportsTexture2DMultisampleArray base %base-spi
+supportsTextureAccessPatterns base %base-spi
+supportsTextureCubeArray base %base-spi
+supportsTextureMultifetch base %base-spi
+supportsTextureOutOfBoundsReads base %base-spi
+supportsTextureSampleCount: implemented
+supportsTextureSwizzle base %base-spi
+supportsTextureViewMinLOD base %base-spi
+supportsTextureWriteRoundingMode: base %base-spi
+supportsTileShaders implemented
+supportsUnalignedVertexFetch base %base-spi
+supportsVariableRateRasterization base %base-spi
+supportsVertexAmplification base %base-spi
+supportsVertexAmplificationCount: implemented
+supportsViewportAndScissorArray base %base-spi
+supportsVirtualSubstreams base %base-spi
+supportsWritableArrayOfTextures base %base-spi
+supportsYCBCRFormats base %base-spi
+supportsYCBCRFormats12 base %base-spi
+supportsYCBCRFormatsPQ base %base-spi
+supportsYCBCRFormatsXR base %base-spi
+supportsYCBCRPackedFormats12 base %base-spi
+supportsYCBCRPackedFormatsPQ base %base-spi
+supportsYCBCRPackedFormatsXR base %base-spi
+targetDeviceArchitecture base %base-spi
+targetDeviceInfo base %base-spi
+tensorSizeAndAlignWithDescriptor: unsupported tensors
+threadsPerCompilerProcess base %base-spi
+tileSizeWithSparsePageSize:textureType:pixelFormat:sampleCount: implemented
+unloadShaderCaches base %base-spi
+unmapShaderSampleBuffer metal the device maps no shader sample buffer (its map is RGFX_UNSUPPORTED), so there is none to unmap
+validateDynamicLibrary:state:error: base %base-spi
+validateDynamicLibraryDescriptor:error: base %base-spi
+validateDynamicLibraryURL:error: base %base-spi
+vendorName base %base-spi
+writeMeshShaderEmulatorDataStructureHeader:meshShaderPSO:scalingFactor: base %base-spi
+
+[RgfxParallelRenderCommandEncoder]
+barrierAfterQueueStages:beforeStages: implemented
+device implemented
+endEncoding implemented
+insertDebugSignpost: metal %debug
+label implemented
+popDebugGroup metal %debug
+pushDebugGroup: metal %debug
+renderCommandEncoder implemented
+setColorStoreAction:atIndex: implemented
+setColorStoreActionOptions:atIndex: implemented
+setDepthStoreAction: implemented
+setDepthStoreActionOptions: implemented
+setLabel: implemented
+setStencilStoreAction: implemented
+setStencilStoreActionOptions: implemented
+
+[RgfxRenderCommandEncoder]
+barrierAfterQueueStages:beforeStages: implemented
+device implemented
+dispatchThreadsPerTile: implemented
+drawIndexedPatches:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:indirectBuffer:indirectBufferOffset: implemented
+drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:instanceCount:baseInstance: implemented
+drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset: implemented
+drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount: implemented
+drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance: implemented
+drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset: implemented
+drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading
+drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading
+drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading
+drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset: implemented
+drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance: implemented
+drawPrimitives:indirectBuffer:indirectBufferOffset: implemented
+drawPrimitives:vertexStart:vertexCount: implemented
+drawPrimitives:vertexStart:vertexCount:instanceCount: implemented
+drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance: implemented
+endEncoding implemented
+executeCommandsInBuffer:indirectBuffer:indirectBufferOffset: implemented
+executeCommandsInBuffer:withRange: implemented
+insertDebugSignpost: metal %debug
+label implemented
+memoryBarrierWithResources:count:afterStages:beforeStages: implemented
+memoryBarrierWithScope:afterStages:beforeStages: implemented
+popDebugGroup metal %debug
+pushDebugGroup: metal %debug
+sampleCountersInBuffer:atSampleIndex:withBarrier: unsupported counter sampling
+setBlendColorRed:green:blue:alpha: implemented
+setColorAttachmentMap: partial color attachment mapping (no op on the wire)
+setColorStoreAction:atIndex: implemented
+setColorStoreActionOptions:atIndex: implemented
+setCullMode: implemented
+setDepthBias:slopeScale:clamp: implemented
+setDepthClipMode: implemented
+setDepthStencilState: implemented
+setDepthStoreAction: implemented
+setDepthStoreActionOptions: implemented
+setDepthTestMinBound:maxBound: partial depth bounds testing (no op on the wire)
+setFragmentAccelerationStructure:atBufferIndex: partial ray tracing
+setFragmentBuffer:offset:atIndex: implemented
+setFragmentBufferOffset:atIndex: implemented
+setFragmentBuffers:offsets:withRange: implemented
+setFragmentBytes:length:atIndex: implemented
+setFragmentIntersectionFunctionTable:atBufferIndex: partial ray tracing
+setFragmentIntersectionFunctionTables:withBufferRange: partial ray tracing
+setFragmentSamplerState:atIndex: implemented
+setFragmentSamplerState:lodMinClamp:lodMaxClamp:atIndex: implemented
+setFragmentSamplerStates:lodMinClamps:lodMaxClamps:withRange: implemented
+setFragmentSamplerStates:withRange: implemented
+setFragmentTexture:atIndex: implemented
+setFragmentTextures:withRange: implemented
+setFragmentVisibleFunctionTable:atBufferIndex: partial function pointers
+setFragmentVisibleFunctionTables:withBufferRange: partial function pointers
+setFrontFacingWinding: implemented
+setLabel: implemented
+setMeshBuffer:offset:atIndex: partial mesh shading
+setMeshBufferOffset:atIndex: unsupported mesh shading
+setMeshBuffers:offsets:withRange: partial mesh shading
+setMeshBytes:length:atIndex: unsupported mesh shading
+setMeshSamplerState:atIndex: partial mesh shading
+setMeshSamplerState:lodMinClamp:lodMaxClamp:atIndex: partial mesh shading
+setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange: partial mesh shading
+setMeshSamplerStates:withRange: partial mesh shading
+setMeshTexture:atIndex: partial mesh shading
+setMeshTextures:withRange: partial mesh shading
+setObjectBuffer:offset:atIndex: partial mesh shading
+setObjectBufferOffset:atIndex: unsupported mesh shading
+setObjectBuffers:offsets:withRange: partial mesh shading
+setObjectBytes:length:atIndex: unsupported mesh shading
+setObjectSamplerState:atIndex: partial mesh shading
+setObjectSamplerState:lodMinClamp:lodMaxClamp:atIndex: partial mesh shading
+setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange: partial mesh shading
+setObjectSamplerStates:withRange: partial mesh shading
+setObjectTexture:atIndex: partial mesh shading
+setObjectTextures:withRange: partial mesh shading
+setObjectThreadgroupMemoryLength:atIndex: unsupported mesh shading
+setRenderPipelineState: implemented
+setScissorRect: implemented
+setScissorRects:count: implemented
+setStencilFrontReferenceValue:backReferenceValue: implemented
+setStencilReferenceValue: implemented
+setStencilStoreAction: implemented
+setStencilStoreActionOptions: implemented
+setTessellationFactorBuffer:offset:instanceStride: implemented
+setTessellationFactorScale: implemented
+setThreadgroupMemoryLength:offset:atIndex: implemented
+setTileAccelerationStructure:atBufferIndex: partial ray tracing
+setTileBuffer:offset:atIndex: implemented
+setTileBufferOffset:atIndex: implemented
+setTileBuffers:offsets:withRange: implemented
+setTileBytes:length:atIndex: implemented
+setTileIntersectionFunctionTable:atBufferIndex: partial ray tracing
+setTileIntersectionFunctionTables:withBufferRange: partial ray tracing
+setTileSamplerState:atIndex: implemented
+setTileSamplerState:lodMinClamp:lodMaxClamp:atIndex: implemented
+setTileSamplerStates:lodMinClamps:lodMaxClamps:withRange: implemented
+setTileSamplerStates:withRange: implemented
+setTileTexture:atIndex: implemented
+setTileTextures:withRange: implemented
+setTileVisibleFunctionTable:atBufferIndex: partial function pointers
+setTileVisibleFunctionTables:withBufferRange: partial function pointers
+setTriangleFillMode: implemented
+setVertexAccelerationStructure:atBufferIndex: partial ray tracing
+setVertexAmplificationCount:viewMappings: implemented
+setVertexBuffer:offset:atIndex: implemented
+setVertexBuffer:offset:attributeStride:atIndex: implemented
+setVertexBufferOffset:atIndex: implemented
+setVertexBufferOffset:attributeStride:atIndex: implemented
+setVertexBuffers:offsets:attributeStrides:withRange: implemented
+setVertexBuffers:offsets:withRange: implemented
+setVertexBytes:length:atIndex: implemented
+setVertexBytes:length:attributeStride:atIndex: implemented
+setVertexIntersectionFunctionTable:atBufferIndex: partial ray tracing
+setVertexIntersectionFunctionTables:withBufferRange: partial ray tracing
+setVertexSamplerState:atIndex: implemented
+setVertexSamplerState:lodMinClamp:lodMaxClamp:atIndex: implemented
+setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange: implemented
+setVertexSamplerStates:withRange: implemented
+setVertexTexture:atIndex: implemented
+setVertexTextures:withRange: implemented
+setVertexVisibleFunctionTable:atBufferIndex: partial function pointers
+setVertexVisibleFunctionTables:withBufferRange: partial function pointers
+setViewport: implemented
+setViewports:count: implemented
+setVisibilityResultMode:offset: implemented
+textureBarrier implemented
+tileHeight partial the device's own tile size (no host query on the wire)
+tileWidth partial the device's own tile size (no host query on the wire)
+updateFence:afterStages: implemented
+useHeap: implemented
+useHeap:stages: implemented
+useHeaps:count: implemented
+useHeaps:count:stages: implemented
+useResource:usage: implemented
+useResource:usage:stages: implemented
+useResources:count:usage: implemented
+useResources:count:usage:stages: implemented
+waitForFence:beforeStages: implemented
+
+[RgfxRenderPipelineState]
+allocatedSize unsupported a pipeline's allocated size (not in the host's reflection)
+functionHandleWithBinaryFunction:stage: unsupported function pointers
+functionHandleWithFunction:stage: unsupported function pointers
+functionHandleWithName:stage: unsupported function pointers
+gpuResourceID implemented
+imageblockMemoryLengthForDimensions: unsupported imageblock memory queries (not in the host's reflection)
+imageblockSampleLength implemented
+maxTotalThreadgroupsPerMeshGrid metal %no-mesh
+maxTotalThreadsPerMeshThreadgroup metal %no-mesh
+maxTotalThreadsPerObjectThreadgroup metal %no-mesh
+maxTotalThreadsPerThreadgroup implemented
+meshThreadExecutionWidth metal %no-mesh-width
+newIntersectionFunctionTableWithDescriptor:stage: unsupported ray tracing
+newRenderPipelineDescriptorForSpecialization unsupported Metal 4 pipeline specialization
+newRenderPipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
+newRenderPipelineStateWithBinaryFunctions:error: unsupported binary functions
+newVisibleFunctionTableWithDescriptor:stage: unsupported function pointers
+objectThreadExecutionWidth metal %no-mesh-width
+reflection metal %pipeline-reflection
+requiredThreadsPerMeshThreadgroup metal %no-mesh
+requiredThreadsPerObjectThreadgroup metal %no-mesh
+requiredThreadsPerTileThreadgroup metal the device makes no tile pipelines (their creators are RGFX_UNSUPPORTED); Metal answers 0, 0, 0 for a render pipeline with no tile function (measured: M3 Max)
+shaderValidation metal %no-validation
+supportIndirectCommandBuffers implemented
+threadgroupSizeMatchesTileSize implemented
+
+[RgfxResource]
+device implemented
+heap implemented
+heapOffset implemented
+isAliasable implemented
+label implemented
+makeAliasable implemented
+setLabel: implemented
+setOwnerWithIdentity: metal the device accounts its memory (the region's blocks, which the kext owns) to no task, so there is no footprint to move to another; the call succeeds, as Metal's does
+setPurgeableState: implemented
+
+[RgfxSampler]
+gpuResourceID implemented
+
+[RgfxSharedEvent]
+newSharedEventHandle unsupported shared event handles (an event shared across processes)
+notifyListener:atValue:block: implemented
+setSignaledValue: implemented
+signaledValue implemented
+waitUntilSignaledValue:timeoutMS: implemented
+
+[RgfxTexture]
+allocatedSize implemented
+allowGPUOptimizedContents implemented
+arrayLength implemented
+buffer implemented
+bufferBytesPerRow implemented
+bufferOffset implemented
+compressionType implemented
+cpuCacheMode implemented
+depth implemented
+firstMipmapInTail metal %no-sparse
+getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice: implemented
+getBytes:bytesPerRow:fromRegion:mipmapLevel: implemented
+gpuResourceID implemented
+hazardTrackingMode implemented
+heap implemented
+heapOffset implemented
+height implemented
+iosurface implemented
+iosurfacePlane implemented
+isAliasable implemented
+isFramebufferOnly gap aud-tests-03: answers NO for every texture, a CAMetalLayer drawable's too; Metal's drawable textures answer the layer's framebufferOnly, YES by default (measured: M3 Max, AMD 5300M, Intel 630)
+isShareable metal the device makes no shareable texture (newSharedTextureWithDescriptor: and its handles are RGFX_UNSUPPORTED)
+isSparse metal %no-sparse
+makeAliasable implemented
+minLOD metal no texture of the device has other than the default 0.0 (Metal's default, measured: M3 Max): views keep it, and setMinLOD: (macOS 27) is not answered
+mipmapLevelCount implemented
+newRemoteTextureViewForDevice: unsupported remote texture views
+newSharedTextureHandle unsupported shared texture handles
+newTextureViewWithDescriptor: implemented
+newTextureViewWithPixelFormat: implemented
+newTextureViewWithPixelFormat:textureType:levels:slices: implemented
+newTextureViewWithPixelFormat:textureType:levels:slices:swizzle: implemented
+parentRelativeLevel implemented
+parentRelativeSlice implemented
+parentTexture implemented
+pixelFormat implemented
+remoteStorageTexture metal %no-peers
+replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage: implemented
+replaceRegion:mipmapLevel:withBytes:bytesPerRow: implemented
+resourceOptions implemented
+rootResource implemented
+sampleCount implemented
+setPurgeableState: implemented
+sparseTextureTier metal %no-sparse
+storageMode implemented
+swizzle implemented
+tailSizeInBytes metal %no-sparse
+textureType implemented
+usage implemented
+width implemented
