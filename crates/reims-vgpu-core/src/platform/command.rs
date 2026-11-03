@@ -129,6 +129,21 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// completed handlers. Reached both under a handler and with none: `on` says which this
     /// call is.
     fn add_scheduled_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()>;
+    /// The platform's submission point, no Metal call: the handler runs once the platform has
+    /// taken the buffer's work for the GPU, its place in its queue's order fixed, on the thread
+    /// that took it, before the buffer is scheduled and before it can complete; a buffer that
+    /// fails before then may run none. It must be short, and wait for no GPU work. Metal tells of
+    /// no point before scheduling, so its scheduled handler stands for it there. Reached both
+    /// under a handler and with none: `on` says which this call is.
+    fn add_submission_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()>;
+    /// The platform's completion as seen, no Metal call: the handler runs once the buffer
+    /// completed or failed, with what a completed handler is given, on the platform's thread
+    /// that saw it, before the buffer's completed handlers, in its queue's commit order; a buffer
+    /// with such handlers and no completed handler wakes no handler thread. It must be short and
+    /// never block. Metal tells of a completion only on its completed handlers' thread, so a
+    /// completed handler stands for it there. Reached both under a handler and with none: `on`
+    /// says which this call is.
+    fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()>;
     /// sel: blitCommandEncoder — May return nil, which core never
     /// checks (the blit decoder's init); later sends to it are no-ops (`nil_send!`).
     ///

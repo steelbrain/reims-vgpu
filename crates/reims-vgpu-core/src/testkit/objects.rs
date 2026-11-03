@@ -354,8 +354,13 @@ pub struct CommandBufferModel {
     pub error: Option<NsErrorText>,
     /// The completed handlers, in the order added.
     pub handlers: Vec<CompletedHandler>,
+    /// The completion-seen handlers, in the order added: run before the completed handlers.
+    pub seen: Vec<CompletedHandler>,
     /// The scheduled handlers, in the order added: run at commit, on the committing thread.
     pub scheduled: Vec<ScheduledHandler>,
+    /// The submission handlers, in the order added: run at commit, on the committing thread,
+    /// before the scheduled handlers.
+    pub submission: Vec<ScheduledHandler>,
     /// `encodeSignalEvent:value:`s, applied at completion.
     pub signal_on_complete: Vec<(AnyHandle, u64)>,
     /// `encodeSignalEventScheduled:value:`s, applied at commit.
@@ -375,7 +380,9 @@ impl std::fmt::Debug for CommandBufferModel {
             .field("status", &self.status)
             .field("error", &self.error)
             .field("handlers", &self.handlers.len())
+            .field("seen", &self.seen.len())
             .field("scheduled", &self.scheduled.len())
+            .field("submission", &self.submission.len())
             .finish_non_exhaustive()
     }
 }
@@ -1306,8 +1313,10 @@ pub fn complete_obj(
         };
         m.status = status;
         m.error = error.clone();
+        let mut handlers = std::mem::take(&mut m.seen);
+        handlers.append(&mut m.handlers);
         (
-            std::mem::take(&mut m.handlers),
+            handlers,
             std::mem::take(&mut m.signal_on_complete),
             m.read_dies.take(),
             m.gpu_times_ns,
@@ -1351,9 +1360,20 @@ pub fn complete_obj(
     }
 }
 
-/// `commit`'s model: Scheduled at once, the scheduled signals applied, the buffer listed for
-/// completion (or completed at once under auto-complete).
+/// `commit`'s model: its submission handlers run, then Scheduled at once, the scheduled signals
+/// applied, the buffer listed for completion (or completed at once under auto-complete).
 pub fn commit_obj(cb: &Arc<FakeObj>) {
+    // Its submission handlers, before it reads `Scheduled`.
+    let submission = {
+        let mut s = cb.state.lock();
+        let Model::CommandBuffer(m) = &mut s.model else {
+            return;
+        };
+        std::mem::take(&mut m.submission)
+    };
+    for h in submission {
+        h();
+    }
     let (signals, scheduled) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {

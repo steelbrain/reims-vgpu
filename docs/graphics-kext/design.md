@@ -1448,12 +1448,24 @@ command-buffer `ObjId`, status, GPU start/end time, and on error the
 `CommandBufferError` the host maps 1:1 from the IOGPU code the runtime returns
 (page fault, hang/timeout, recovery victim, access revoked, invalid resource —
 the map m2v gave). The ring's armed/interrupt handshake is the stage-2 one.
+The buffer's completion-seen handler posts it, with the values of the shared
+events it signalled ahead of it: on metal2vulkan the runtime's thread that saw
+the buffer complete runs it, in its queue's commit order, and with no
+completed handler on the buffer no handler thread is woken; on Metal, which
+tells of a completion only on its completed handlers' thread, a completed
+handler.
 
 **Scheduled** (per-queue completion ring). A `CB_SCHEDULED` record (the command-buffer
 `ObjId`, at the buffer's seqno; 24 bytes, and the guest reads a record of at least that size)
-goes on the queue's completion ring once the host's platform has scheduled the buffer: the
-buffer's platform scheduled handler posts it, which Metal and metal2vulkan run once every wait
-of the buffer is satisfied and its work is submitted, ahead of its `CB_COMPLETE`. The guest's
+goes on the queue's completion ring once the host's platform has taken the buffer's work for
+the GPU, ahead of its `CB_COMPLETE`: the buffer's submission handler posts it. On
+metal2vulkan it runs on the thread that took the buffer's last batch for its `VkQueue`, once
+every wait of the buffer is satisfied, before the buffer reads `Scheduled`, and nothing
+committed later on the queue runs before the buffer; on Metal, which tells of no point before
+scheduling, it is a scheduled handler, run once every wait of the buffer is satisfied and its
+work is submitted. A buffer the platform fails before it takes its work runs no submission
+handler, and its completion handler posts its `CB_SCHEDULED` first
+(`a_buffer_never_submitted_is_scheduled_ahead_of_its_completion`). The guest's
 buffer is then submitted (`commitAndWaitUntilSubmitted` returns, before the scheduled handlers
 run), becomes `Scheduled`, runs its scheduled handlers, then lets `waitUntilScheduled` return,
 as Metal's does (measured on the M3 Max, macOS 27: on an idle queue

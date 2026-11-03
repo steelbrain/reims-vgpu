@@ -67,6 +67,39 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         Ok(())
     }
 
+    /// Run at commit, on the committing thread, before its scheduled handlers, as the fake takes
+    /// a buffer's work as it is committed ([`commit_obj`](super::super::objects::commit_obj)).
+    fn add_submission_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addSubmissionHandler",
+            vec![Arg::Block(true)],
+        )?;
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.submission.push(block);
+        }
+        Ok(())
+    }
+
+    /// Run where the buffer completes, before its completed handlers, the read and `block` in
+    /// the refusal scope it was added in, as a completed handler's are
+    /// ([`complete_obj`](super::super::objects::complete_obj)).
+    fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addCompletionSeenHandler",
+            vec![Arg::Block(true)],
+        )?;
+        let carried = crate::raise::refusals::carry();
+        let block: CompletedHandler = Box::new(move |info| {
+            run_completed(carried, || completion_read(info), block);
+        });
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.seen.push(block);
+        }
+        Ok(())
+    }
+
     fn blit_encoder(
         &self,
         on: OnFault,

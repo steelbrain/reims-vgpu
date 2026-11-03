@@ -1260,8 +1260,9 @@ fn completed_handler(
     })
 }
 
-/// The runtime's scheduled handler running `block` once, on the runtime's handler thread, as
-/// the command buffer becomes `Scheduled`.
+/// The runtime's handler running `block` once: a scheduled handler, on the runtime's handler
+/// thread as the command buffer becomes `Scheduled`, or a submission handler, on the thread that
+/// took its last batch.
 fn scheduled_handler(block: ScheduledHandler) -> rt::Handler {
     #[cfg(test)]
     let slot = reims_vgpu_core::testkit::capture::current_slot();
@@ -1304,6 +1305,32 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let handler = scheduled_handler(block);
         send("addScheduledHandler:", Policy::Dies, || {
             self.raw.add_scheduled_handler(handler)
+        })
+    }
+
+    /// The runtime's submission handler: run on the thread that took the buffer's last batch for
+    /// its `VkQueue`, before it is scheduled, and never for a buffer that fails before then.
+    /// Refused once the buffer is committed.
+    fn add_submission_handler(&self, _on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        let handler = scheduled_handler(block);
+        send("addSubmissionHandler", Policy::Dies, || {
+            self.raw.add_submission_handler(handler)
+        })
+    }
+
+    /// The runtime's completion-seen handler: run on the thread that saw the buffer complete,
+    /// before its completed handlers, a failure read as a completed handler reads it
+    /// ([`completed_handler`]). Refused once the buffer is committed.
+    fn add_completion_seen_handler(
+        &self,
+        _on: OnFault,
+        block: CompletedHandler,
+    ) -> RaiseResult<()> {
+        let handler = completed_handler(block, TaskLife::current(), |cb| {
+            failure(cb);
+        });
+        send("addCompletionSeenHandler", Policy::Dies, || {
+            self.raw.add_completion_seen_handler(handler)
         })
     }
 

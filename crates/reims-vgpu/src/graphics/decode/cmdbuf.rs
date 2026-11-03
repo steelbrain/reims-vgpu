@@ -103,8 +103,8 @@ use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
-    DecodeError, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, SubmittedSink, blit,
-    compute, op_fault, read, refusing, render, video,
+    DecodeError, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, ScheduledSink,
+    SubmittedSink, blit, compute, op_fault, read, refusing, render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -122,8 +122,8 @@ struct EventOps {
 }
 
 /// A command buffer's `CB_SUBMITTED`, posted once: by the first of the host's take of it (for a
-/// buffer that waits for nothing), the buffer's scheduled handler and its completed handler, each
-/// of which posts it ahead of its own record, so it comes before them on the ring.
+/// buffer that waits for nothing), the buffer's submission handler and its completion handler,
+/// each of which posts it ahead of its own record, so it comes before them on the ring.
 pub(crate) struct Submitted {
     sink: SubmittedSink,
     record: RgfxCbSubmitted,
@@ -154,14 +154,35 @@ impl Submitted {
     }
 }
 
+/// A command buffer's `CB_SCHEDULED`, posted once: by its submission handler, or, for a buffer the
+/// platform failed before it took its work, which runs no submission handler, by its completion
+/// handler ahead of its completion, so each buffer's comes before its `CB_COMPLETE`.
+struct Scheduled {
+    sink: ScheduledSink,
+    record: RgfxCbScheduled,
+    /// Whether it is posted, held across the post.
+    posted: Mutex<bool>,
+}
+
+impl Scheduled {
+    /// Posts the record unless it is posted already.
+    fn post(&self) {
+        let mut posted = self.posted.lock();
+        if !*posted {
+            (self.sink)(self.record);
+            *posted = true;
+        }
+    }
+}
+
 /// The most command buffers a queue may hold made and not completed for its next to be taken on
 /// a doorbell's thread ([`GraphicsDecoder::submits_at_take`]): Metal's `commandBuffer`, and the
-/// Vulkan platform's, wait while a queue holds 64, and a buffer leaves the count as its completed
+/// Vulkan platform's, wait while a queue holds 64, and a buffer leaves the count as its completion
 /// handler ends, which may come before the platform lets its place go.
 const TAKE_IN_FLIGHT_MAX: usize = 48;
 
 /// A command buffer's place in its queue's count of the host's command buffers made on the queue
-/// and not completed, which it leaves when dropped: with its completed handler, once that has run
+/// and not completed, which it leaves when dropped: with its completion handler, once that has run
 /// ([`leaving`]), or with the buffer where it is never committed.
 struct InFlight(Arc<AtomicUsize>);
 
@@ -271,6 +292,32 @@ impl Held {
             self.queue.fetch_sub(1, Ordering::AcqRel);
         }
     }
+}
+
+/// The submission handler of a command buffer: once the platform has taken its work for the GPU,
+/// it lets the buffer's queue go where the buffer `held` it, posts its `submitted` where not yet
+/// posted, and then its `scheduled`, so the guest's command buffer becomes `Scheduled` and its
+/// scheduled handlers and `waitUntilScheduled` go on then; nothing committed later on its queue
+/// runs before it. `None` where it has nothing to do.
+fn submission_handler(
+    submitted: Option<Arc<Submitted>>,
+    held: Option<Arc<Held>>,
+    scheduled: Option<Arc<Scheduled>>,
+) -> Option<ScheduledHandler> {
+    if scheduled.is_none() && held.is_none() {
+        return None;
+    }
+    Some(Box::new(move || {
+        if let Some(held) = &held {
+            held.release();
+        }
+        if let Some(submitted) = &submitted {
+            submitted.post();
+        }
+        if let Some(scheduled) = &scheduled {
+            scheduled.post();
+        }
+    }))
 }
 
 /// Whether the queue whose counts are `counts` is held, a buffer of it that waits for an event not
@@ -581,7 +628,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Finishes the `COMMAND_BUFFER` `message` that `begun` began: walks its op stream into its
     /// command buffer, has it signal its queue's surface timeline where it is to
     /// ([`Self::order_signal`]), ends its use of the device caches, and commits it with its
-    /// scheduled and completed handlers.
+    /// submission and completion handlers.
     pub(crate) fn finish_command_buffer(
         &self,
         device: &P::Device,
@@ -613,24 +660,25 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Err(e));
         }
         let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, order, &cb)?;
-        // Register the scheduled and completion paths and commit. The GPU start and end times
-        // are 0 here; the ring loop fills them when it posts the record on the queue's
-        // completion ring in a later increment.
-        let scheduled = self.scheduled_handler(cb_obj_id, seqno, submitted.clone(), held.clone());
+        // Register the submission and completion paths and commit: no scheduled or completed
+        // handler, so the platform posts the buffer's records from the threads that submit it
+        // and see it complete, waking no handler thread.
+        let scheduled = self.scheduled(cb_obj_id, seqno);
+        let submission = submission_handler(submitted.clone(), held.clone(), scheduled.clone());
         let handler = self.completed_handler(
             cb_obj_id,
             seqno,
             events,
             drain,
             false,
-            (submitted, held.clone()),
+            (submitted, held.clone(), scheduled),
         );
         let handler = signalling(handler, signalled);
         let commit = || {
-            if let Some(scheduled) = scheduled {
-                cb.add_scheduled_handler(ON, scheduled)?;
+            if let Some(submission) = submission {
+                cb.add_submission_handler(ON, submission)?;
             }
-            cb.add_completed_handler(ON, leaving(handler, in_flight))?;
+            cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
             commit_holding(&cb, held.as_deref())
         };
         // After every buffer answered `CB_SUBMITTED` before its begin ([`super::sequencer`]).
@@ -743,7 +791,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let (_, held) = hold(counts, !events.waits.is_empty());
         if let Some(held) = &held {
             let held = Arc::clone(held);
-            cb.add_scheduled_handler(ON, Box::new(move || held.release()))?;
+            cb.add_submission_handler(ON, Box::new(move || held.release()))?;
         }
         let signalled =
             self.order_signal(device, queue_obj_id, &counts.order, seqno, names, &cb)?;
@@ -753,10 +801,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             events,
             drain,
             true,
-            (None, held.clone()),
+            (None, held.clone(), None),
         );
         let handler = signalling(handler, signalled);
-        cb.add_completed_handler(ON, leaving(handler, in_flight))?;
+        cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
         // In the commit order where the buffer was ([`super::sequencer`]).
         if let Some(mark) = self.mark.get() {
             self.shared.sequencer.wait_for(mark);
@@ -810,48 +858,29 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// The scheduled handler of command buffer `cb_obj_id`, at `seqno`: once the platform has
-    /// scheduled it, it lets the buffer's queue go where the buffer `held` it, posts its
-    /// `submitted` where not yet posted, and then its `CB_SCHEDULED`, so the guest's command
-    /// buffer becomes `Scheduled` and its scheduled handlers and `waitUntilScheduled` go on then,
-    /// as Metal's do. `None` without a sink, where it holds nothing.
-    fn scheduled_handler(
-        &self,
-        cb_obj_id: u64,
-        seqno: u64,
-        submitted: Option<Arc<Submitted>>,
-        held: Option<Arc<Held>>,
-    ) -> Option<ScheduledHandler> {
-        let sink = self.sinks.scheduled.clone();
-        if sink.is_none() && held.is_none() {
-            return None;
-        }
-        Some(Box::new(move || {
-            if let Some(held) = &held {
-                held.release();
-            }
-            if let Some(submitted) = &submitted {
-                submitted.post();
-            }
-            let Some(sink) = &sink else {
-                return;
-            };
-            sink(RgfxCbScheduled {
+    /// The `CB_SCHEDULED` of command buffer `cb_obj_id`, at `seqno`, where there is a sink.
+    fn scheduled(&self, cb_obj_id: u64, seqno: u64) -> Option<Arc<Scheduled>> {
+        let sink = self.sinks.scheduled.clone()?;
+        Some(Arc::new(Scheduled {
+            sink,
+            record: RgfxCbScheduled {
                 header: RgfxMsgHeader {
                     r#type: RGFX_EVT_CB_SCHEDULED,
                     size: size_of::<RgfxCbScheduled>() as u32,
                     seqno,
                 },
                 cb_obj_id,
-            });
+            },
+            posted: Mutex::new(false),
         }))
     }
 
     /// The completion handler of command buffer `cb_obj_id`, at `seqno`, whose op stream did
-    /// `events`: where its scheduled handler did not, it lets its queue go where it `held` it and
-    /// posts its `submitted`; then it posts the values the buffer signalled its shared events to,
-    /// then its completion, which for a `stand_in` ([`Self::stand_in_for_failed`]) is its failure
-    /// whatever the stand-in's outcome, and lets `drain` (its context's) go.
+    /// `events`, which the platform runs on the thread that saw the buffer complete: where its
+    /// submission handler did not, it lets its queue go where it `held` it and posts its
+    /// `submitted` and its `scheduled`; then it posts the values the buffer signalled its shared
+    /// events to, then its completion, which for a `stand_in` ([`Self::stand_in_for_failed`]) is
+    /// its failure whatever the stand-in's outcome, and lets `drain` (its context's) go.
     fn completed_handler(
         &self,
         cb_obj_id: u64,
@@ -859,7 +888,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: EventOps,
         drain: Option<Arc<Drain>>,
         stand_in: bool,
-        (submitted, held): (Option<Arc<Submitted>>, Option<Arc<Held>>),
+        (submitted, held, scheduled): (
+            Option<Arc<Submitted>>,
+            Option<Arc<Held>>,
+            Option<Arc<Scheduled>>,
+        ),
     ) -> CompletedHandler {
         let sink = self.sinks.completion.clone();
         let signal_sink = self.sinks.signal.clone();
@@ -893,6 +926,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             if let Some(submitted) = &submitted {
                 submitted.post();
+            }
+            if let Some(scheduled) = &scheduled {
+                scheduled.post();
             }
             // The shared events the buffer signalled, ahead of its completion, so the guest
             // has each value before the buffer's handlers run. A buffer that failed may have
@@ -2091,7 +2127,7 @@ mod tests {
             "drawPrimitives:vertexStart:vertexCount:",
             "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
             "endEncoding",
-            "addCompletedHandler:",
+            "addCompletionSeenHandler",
             "commit",
         ];
         let got: Vec<&str> = p
@@ -2157,10 +2193,10 @@ mod tests {
         assert_eq!(times, [(140, 5_000_000_000, 5_002_000_000), (141, 0, 0)]);
     }
 
-    /// With a scheduled sink, a command buffer gets a scheduled handler before its completed
-    /// handler and its commit; once the platform schedules it, its `CB_SCHEDULED` goes to the
-    /// guest at its seqno, ahead of its completion record. With none, it gets no scheduled
-    /// handler.
+    /// With a scheduled sink, a command buffer gets a submission handler before its completion
+    /// handler and its commit, and no scheduled or completed handler; once the platform takes its
+    /// work, its `CB_SCHEDULED` goes to the guest at its seqno, ahead of its completion record.
+    /// With none, it gets no submission handler.
     #[test]
     fn a_command_buffer_posts_its_scheduled_record_ahead_of_its_completion() {
         let (p, mut dec) = setup();
@@ -2182,14 +2218,23 @@ mod tests {
         let mark = p.call_log().mark();
         let message = command_buffer_message(130, 61, &render_ops());
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
-        let want = ["addScheduledHandler:", "addCompletedHandler:", "commit"];
+        let handlers = [
+            "addScheduledHandler:",
+            "addCompletedHandler:",
+            "addSubmissionHandler",
+            "addCompletionSeenHandler",
+            "commit",
+        ];
         let got: Vec<&str> = p
             .call_log()
             .sels_since(mark)
             .into_iter()
-            .filter(|s| want.contains(s))
+            .filter(|s| handlers.contains(s))
             .collect();
-        assert_eq!(got, want);
+        assert_eq!(
+            got,
+            ["addSubmissionHandler", "addCompletionSeenHandler", "commit"]
+        );
         // The fake schedules a buffer as it is committed.
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SCHEDULED, 130, 61)]);
         p.world().complete_all(CompleteOn::Caller);
@@ -2201,17 +2246,58 @@ mod tests {
             ]
         );
 
-        // No sink: no scheduled handler.
+        // No sink: no submission handler.
         let (p, mut dec) = setup();
         let device = p.device();
         let mark = p.call_log().mark();
         let message = command_buffer_message(131, 62, &render_ops());
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
-        assert!(
-            !p.call_log()
-                .sels_since(mark)
-                .contains(&"addScheduledHandler:")
-        );
+        let sels = p.call_log().sels_since(mark);
+        assert!(!sels.contains(&"addSubmissionHandler") && !sels.contains(&"addScheduledHandler:"));
+    }
+
+    /// A buffer the platform fails before it takes its work runs no submission handler: its
+    /// completion handler posts its `CB_SUBMITTED` and `CB_SCHEDULED` ahead of its `CB_COMPLETE`.
+    /// One whose submission handler ran has them posted there, once.
+    #[test]
+    fn a_buffer_never_submitted_is_scheduled_ahead_of_its_completion() {
+        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        let (_p, dec, posted) = posting(true);
+        for ran in [false, true] {
+            posted.lock().clear();
+            let submitted = dec.submitted(150, 80, true);
+            let scheduled = dec.scheduled(150, 80);
+            let submission = submission_handler(submitted.clone(), None, scheduled.clone());
+            let handler = dec.completed_handler(
+                150,
+                80,
+                EventOps::default(),
+                None,
+                false,
+                (submitted, None, scheduled),
+            );
+            let submission = submission.unwrap();
+            if ran {
+                submission();
+                assert_eq!(posted.lock().len(), 2, "posted at the submission");
+            } else {
+                drop(submission);
+            }
+            handler(CompletedInfo {
+                status: CommandBufferStatus::ERROR,
+                error: None,
+                gpu_times_ns: None,
+            });
+            assert_eq!(
+                *posted.lock(),
+                [
+                    (RGFX_EVT_CB_SUBMITTED, 150, 80),
+                    (RGFX_EVT_CB_SCHEDULED, 150, 80),
+                    (RGFX_EVT_CB_COMPLETE, 150, 80)
+                ],
+                "submission handler ran: {ran}"
+            );
+        }
     }
 
     /// A decoder whose submitted, scheduled (where `scheduled`) and completion records go, in the
@@ -2332,7 +2418,7 @@ mod tests {
         let scheduled = |p: &FakePlatform, mark| {
             p.call_log()
                 .sels_since(mark)
-                .contains(&"addScheduledHandler:")
+                .contains(&"addSubmissionHandler")
         };
         let mut ops = render_ops();
         ops.extend(op(RGFX_OP_SUBMITTED, &[]));
@@ -3046,7 +3132,7 @@ mod tests {
             "endEncoding",
             "encodeSignalEvent:value:",
             "encodeSignalEvent:value:",
-            "addCompletedHandler:",
+            "addCompletionSeenHandler",
             "commit",
         ];
         let got: Vec<&str> = p
@@ -3121,7 +3207,7 @@ mod tests {
             "encodeWaitForEvent:value:",
             "encodeSignalEvent:value:",
             "encodeSignalEvent:value:",
-            "addCompletedHandler:",
+            "addCompletionSeenHandler",
             "commit",
         ];
         let got: Vec<&str> = p

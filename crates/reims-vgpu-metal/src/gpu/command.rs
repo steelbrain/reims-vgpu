@@ -106,6 +106,14 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
             self.addScheduledHandler(handler)
         })
     }
+    /// Metal tells of no submission before scheduling: a scheduled handler.
+    fn add_submission_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        self.add_scheduled_handler(on, block)
+    }
+    /// Metal tells of a completion only on its completed handlers' thread: a completed handler.
+    fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        self.add_completed_handler(on, block)
+    }
     /// `blitCommandEncoder`: a `+0` encoder, retained.
     fn blit_encoder(
         &self,
