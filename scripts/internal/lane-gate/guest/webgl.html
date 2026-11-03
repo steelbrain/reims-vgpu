@@ -1,0 +1,148 @@
+<!doctype html>
+<!-- The lane gate's WebGL check (guest-run.sh serves it with webgl-serve.pl and opens it in
+Safari). It renders five known images into a 64 x 64 canvas, reads each back with readPixels and
+compares it with the value it must have, counts requestAnimationFrame callbacks for two seconds,
+and sends what it found to /result as JSON. Every expected value is exact in 8 bits but for the
+gradient and the blend, which allow 1 for rounding. -->
+<html><head><meta charset="utf-8"><title>gate webgl</title></head>
+<body><canvas id="c" width="64" height="64"></canvas>
+<script>
+"use strict";
+const W = 64, H = 64, out = {checks: {}};
+function send() {
+  fetch("/result?" + encodeURIComponent(JSON.stringify(out))).catch(() => {});
+}
+function check(name, got, want, tol) {
+  let worst = 0;
+  for (let i = 0; i < want.length; i++) worst = Math.max(worst, Math.abs(got[i] - want[i]));
+  out.checks[name] = {ok: worst <= tol, max: worst};
+}
+function read() {
+  const px = new Uint8Array(W * H * 4);
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  return px;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+// A quad of four vertices (x, y, then extra per-vertex floats) drawn as a strip.
+function quad(p, verts, per) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+  const stride = (2 + per) * 4;
+  const pos = gl.getAttribLocation(p, "pos");
+  gl.enableVertexAttribArray(pos);
+  gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, stride, 0);
+  if (per) {
+    const v = gl.getAttribLocation(p, "v");
+    gl.enableVertexAttribArray(v);
+    gl.vertexAttribPointer(v, per, gl.FLOAT, false, stride, 8);
+  }
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+const cv = document.getElementById("c");
+const attrs = {antialias: false, preserveDrawingBuffer: true, premultipliedAlpha: false, alpha: true};
+const gl = cv.getContext("webgl2", attrs) || cv.getContext("webgl", attrs);
+try {
+  if (!gl) throw new Error("no WebGL context");
+  out.version = gl.getParameter(gl.VERSION);
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  out.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  gl.viewport(0, 0, W, H);
+  const pick = (px, x, y) => Array.from(px.slice((y * W + x) * 4, (y * W + x) * 4 + 4));
+
+  // 1. A clear.
+  gl.clearColor(0, 153 / 255, 26 / 255, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  let px = read();
+  check("clear", pick(px, 5, 7).concat(pick(px, 60, 60)), [0, 153, 26, 255, 0, 153, 26, 255], 0);
+
+  // 2. A flat colour over the left half; the right half keeps the clear.
+  const flat = program("attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }",
+    "precision mediump float; uniform vec4 col; void main() { gl_FragColor = col; }");
+  gl.useProgram(flat);
+  gl.uniform4f(gl.getUniformLocation(flat, "col"), 1, 0, 128 / 255, 1);
+  quad(flat, [-1, -1, 0, -1, -1, 1, 0, 1], 0);
+  px = read();
+  check("flat", pick(px, 10, 32).concat(pick(px, 50, 32)), [255, 0, 128, 255, 0, 153, 26, 255], 0);
+
+  // 3. A gradient, red along x and green along y, linear so either triangle gives it exactly:
+  //    at pixel centre (x + 0.5, y + 0.5) red is 255 (x + 0.5) / 64.
+  const grad = program("attribute vec2 pos; attribute vec2 v; varying vec2 c; " +
+    "void main() { c = v; gl_Position = vec4(pos, 0.0, 1.0); }",
+    "precision highp float; varying vec2 c; void main() { gl_FragColor = vec4(c, 0.0, 1.0); }");
+  gl.useProgram(grad);
+  quad(grad, [-1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1], 2);
+  px = read();
+  const want = [];
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) want.push(255 * (x + 0.5) / W, 255 * (y + 0.5) / H, 0, 255);
+  check("gradient", px, want, 1);
+
+  // 4. A 4 x 4 texture sampled NEAREST over the canvas: each texel covers 16 x 16 pixels.
+  const texels = new Uint8Array(4 * 4 * 4);
+  for (let i = 0; i < 16; i++) texels.set([(i * 17) & 255, (i * 53 + 7) & 255, (255 - i * 13) & 255, 255], i * 4);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 4, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE, texels);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+                        [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+    gl.texParameteri(gl.TEXTURE_2D, k, v);
+  const samp = program("attribute vec2 pos; attribute vec2 v; varying vec2 uv; " +
+    "void main() { uv = v; gl_Position = vec4(pos, 0.0, 1.0); }",
+    "precision mediump float; uniform sampler2D t; varying vec2 uv; " +
+    "void main() { gl_FragColor = texture2D(t, uv); }");
+  gl.useProgram(samp);
+  quad(samp, [-1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1], 2);
+  px = read();
+  const wantTex = [];
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = Math.floor(y / 16) * 4 + Math.floor(x / 16);
+      wantTex.push(...texels.slice(i * 4, i * 4 + 4));
+    }
+  check("texture", px, wantTex, 0);
+
+  // 5. Half-transparent white blended over opaque black: 128 of 255.
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(flat);
+  gl.uniform4f(gl.getUniformLocation(flat, "col"), 1, 1, 1, 128 / 255);
+  quad(flat, [-1, -1, 1, -1, -1, 1, 1, 1], 0);
+  gl.disable(gl.BLEND);
+  px = read();
+  check("blend", pick(px, 32, 32).slice(0, 3), [128, 128, 128], 1);
+
+  // requestAnimationFrame's rate over two seconds, a clear a frame.
+  let frames = 0, t0 = 0;
+  function tick(t) {
+    if (!t0) t0 = t;
+    frames++;
+    gl.clearColor(frames % 2, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (t - t0 < 2000) return requestAnimationFrame(tick);
+    out.raf_fps = (frames - 1) * 1000 / (t - t0);
+    out.ok = Object.values(out.checks).every(c => c.ok);
+    send();
+  }
+  requestAnimationFrame(tick);
+} catch (e) {
+  out.ok = false;
+  out.error = String(e);
+  send();
+}
+</script></body></html>

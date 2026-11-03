@@ -1,0 +1,9 @@
+# The H.264 decode set: a stream of corpus/ a line, with the timed passes after it where its
+# rate is measured (decode_md5 -l).
+baseline.264
+main.264
+high.264
+cqm.264
+qpoffs.264
+p1080.264 12
+p2160.264 6

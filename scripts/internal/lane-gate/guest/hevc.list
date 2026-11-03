@@ -1,0 +1,16 @@
+# The HEVC decode set: a stream of corpus/ a line, with the timed passes after it where its
+# rate is measured (decode_md5 -l).
+hevc-main-1080p.265 8
+hevc-main10-1080p.265 8
+hevc-main-720p.265
+hevc-main-4k.265 6
+hevc-main10-4k.265 6
+hevc-main-1366x766.265
+hevc-main-720p-cqm.265
+hevc-main-720p-sets-sps.265
+hevc-main-720p-lists.265
+hevc-main-720p-ref1-lt.265
+hevc-main-720p-temporal.265
+hevc-main-360p-lossless.265
+hevc-main-720p-fade.265
+hevc-main10-720p-closed.265
