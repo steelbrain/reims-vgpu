@@ -23,6 +23,10 @@
  * again, and lets each go, gets the same one, with one host create in all. Objects made past
  * those are freed as the app lets them go, as the AMD's and the Intel's are.
  *
+ * The cache lets go of the object a create pushes out of the last kKept on a serial queue of its
+ * own, in the order pushed out: where the app holds that object no more, its dealloc posts its
+ * destroy, a kext call, and the create that pushed it out does not wait for it.
+ *
  * A create that made nothing (one the device never got, a sampler the host refused, or one
  * whose create was not answered) answers nil and is not cached: the next equal create tries
  * again, as before.
@@ -50,6 +54,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// How many objects of each kind the cache keeps after the app lets them go: the last made.
 @property(class, nonatomic, readonly) NSUInteger keptCount;
+
+/// Returns once the objects every cache pushed out before the call are let go (for tests).
++ (void)waitForReleases;
 
 #ifdef __cplusplus
 /// A cache for the objects of `device` (weak; nil in a unit test), made through `serializer`

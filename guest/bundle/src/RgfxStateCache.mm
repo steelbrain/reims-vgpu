@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <iterator>
 #include <mutex>
 #include <unordered_map>
@@ -18,6 +19,21 @@
 namespace {
 
 constexpr size_t kKept = 64;
+
+/// The serial queue the caches let go of the objects they push out on (RgfxStateCache.h).
+dispatch_queue_t rgfxStateReleases()
+{
+	static dispatch_queue_t queue = dispatch_queue_create(
+	    "com.steelbrain.reims-graphics.state-releases", DISPATCH_QUEUE_SERIAL);
+	return queue;
+}
+
+/// Lets go of the reference `ref` holds (rgfxStateReleases).
+void rgfxStateRelease(void *ref)
+{
+	id object = (__bridge_transfer id)ref;
+	(void)object;
+}
 
 /// `value`, with -0.0 as 0.0, as Metal compares a descriptor's floats.
 float rgfxCanonicalFloat(float value)
@@ -95,9 +111,15 @@ public:
 				m_next = (m_next + 1) % kKept;
 			}
 		}
-		// Both are let go as they leave scope, outside the lock: where the app holds `evicted` no
-		// more, its dealloc posts its destroy, and so does a `made` that lost to another thread's.
-		(void)evicted;
+		// The cache's reference to the object pushed out goes to the release queue whole, so this
+		// create never runs its dealloc, which posts its destroy where the app holds it no more.
+		// A `made` that lost to another thread's is let go here as it leaves scope, outside the
+		// lock.
+		if (evicted != nil) {
+			void *ref = (__bridge_retained void *)evicted;
+			evicted = nil;
+			dispatch_async_f(rgfxStateReleases(), ref, &rgfxStateRelease);
+		}
 		return winner != nil ? winner : made;
 	}
 
@@ -159,6 +181,12 @@ NSString *rgfxStateLabel(NSString *label)
 + (NSUInteger)keptCount
 {
 	return kKept;
+}
+
++ (void)waitForReleases
+{
+	dispatch_sync(rgfxStateReleases(), ^{
+	});
 }
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device serializer:(RgfxSerializer *)serializer

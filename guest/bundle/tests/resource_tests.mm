@@ -991,7 +991,8 @@ void test_state_cache_keeps_the_last_made()
 	}
 	CHECK(ringEmpty(fx.ring) && weakState != nil);
 
-	// keptCount more of each, let go as made: the first ones go, and post their destroys.
+	// keptCount more of each, let go as made: the first ones go, and post their destroys, on the
+	// cache's release queue.
 	for (NSUInteger i = 0; i < kept; i++) {
 		@autoreleasepool {
 			MTLSamplerDescriptor *n = [d copy];
@@ -1004,6 +1005,7 @@ void test_state_cache_keeps_the_last_made()
 			CHECK([cache depthStencilStateWithDescriptor:m] != nil);
 		}
 	}
+	[RgfxStateCache waitForReleases];
 	CHECK(weakSampler == nil && weakState == nil);
 	CHECK(answer.asks == static_cast<int>(kept) + 1);
 	{
@@ -1034,6 +1036,7 @@ void test_state_cache_keeps_the_last_made()
 	CHECK([cache samplerWithDescriptor:d] == held && answer.asks == asks);
 	held = nil;
 	cache = nil; // what it kept goes, posting the destroys while the transport lives
+	[RgfxStateCache waitForReleases];
 	drainRing(fx.ring);
 	fx.ser.setAsker(nullptr, nullptr);
 }
