@@ -17,6 +17,14 @@
  *
  * Streams are serialised in the process, so it holds at most one window at a time.
  *
+ * No window is kept for the next stream: what a window costs is small beside the stream
+ * (measured on the RTX 5080 host, 42 apps and 7 WebGL and WebGPU pages open, 75 processes with a
+ * context: 52 streams in 10 processes, at most 12 in one; a window's take from the kext 69 us at
+ * the median and 374 us at most, its give 26 us and 345 us, 6.1 ms in all against the streams'
+ * 1.6 s, the host's compiles in them). That boot refused no region block, where the window each
+ * process kept for its life had held 576 of the region's 731 MiB outside WindowServer's reserve,
+ * and refused blocks from 41 processes on.
+ *
  * Our own code; depends only on the committed wire header.
  */
 
