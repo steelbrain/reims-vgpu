@@ -30,3 +30,7 @@ path = "examples/vulkan-h264-framemd5.rs"
 [[example]]
 name = "vulkan-h265-framemd5"
 path = "examples/vulkan-h265-framemd5.rs"
+
+[[example]]
+name = "vulkan-encode"
+path = "examples/vulkan-encode.rs"
