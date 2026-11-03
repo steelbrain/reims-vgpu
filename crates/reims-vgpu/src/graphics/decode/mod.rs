@@ -2097,10 +2097,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                         // An id made again names only its new texture's surface.
                         self.forget_surface_texture(m.obj_id);
                         let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
+                        let info = device.pixel_format_info(u64::from(m.desc.pixel_format));
                         entry.place = Some(video::PlanePlace {
                             buffer_obj_id: m.buffer_obj_id,
                             offset: m.offset,
                             bytes_per_row: m.bytes_per_row,
+                            row_bytes: video::row_bytes(&info, m.desc.width, m.bytes_per_row),
                             width: u64::from(m.desc.width),
                             height: u64::from(m.desc.height),
                         });

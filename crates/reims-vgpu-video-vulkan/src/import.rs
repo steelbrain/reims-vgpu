@@ -209,6 +209,20 @@ impl Drop for ImportBuffer {
     }
 }
 
+/// Where a plane `(offset, pitch, rows, row)` from `base` lies: its first
+/// byte, and the end of its last row, `row` bytes past that row's start;
+/// `None` for no rows, or past 2^64.
+fn plane_span(base: u64, (offset, pitch, rows, row): (u64, u32, u32, u32)) -> Option<(u64, u64)> {
+    let start = base.checked_add(offset)?;
+    let before_last = u64::from(pitch).checked_mul(u64::from(rows.checked_sub(1)?))?;
+    Some((
+        start,
+        start
+            .checked_add(before_last)?
+            .checked_add(u64::from(row))?,
+    ))
+}
+
 /// NV12 or P010 planes in imported host pages, as a picture's output
 /// ([`Landing::Buffer`]): an IOSurface's planes in the guest's memory, where
 /// one GPU copy out of the decoder's picture writes them, cropped.
@@ -219,10 +233,10 @@ pub struct ImportedPlanes {
 
 impl ImportedPlanes {
     /// The planes `luma` and `chroma` (each its first byte from `import`'s
-    /// offset, the bytes from one of its rows to the next, and its rows)
-    /// in `import`, the luma plane `width` bytes a row and the chroma
-    /// plane as many; `None` where a plane lies outside the import or the
-    /// device takes no buffer over it.
+    /// offset, the bytes from one of its rows to the next, its rows, and
+    /// the bytes of a row) in `import`, each ending at its last row's last
+    /// byte; `None` where a plane lies outside the import or the device
+    /// takes no buffer over it.
     ///
     /// # Safety
     ///
@@ -231,15 +245,11 @@ impl ImportedPlanes {
     pub unsafe fn new(
         device: &Arc<VideoDevice>,
         import: &HostImport,
-        luma: (u64, u32, u32),
-        chroma: (u64, u32, u32),
+        luma: (u64, u32, u32, u32),
+        chroma: (u64, u32, u32, u32),
         keep: Arc<dyn Send + Sync>,
     ) -> Result<Option<Self>, Error> {
-        let place = |(offset, pitch, rows): (u64, u32, u32)| {
-            let start = import.offset.checked_add(offset)?;
-            let end = start.checked_add(u64::from(pitch).checked_mul(u64::from(rows))?)?;
-            Some((start, end))
-        };
+        let place = |plane| plane_span(import.offset, plane);
         let (Some(luma_at), Some(chroma_at)) = (place(luma), place(chroma)) else {
             return Ok(None);
         };
@@ -270,5 +280,23 @@ impl ImportedPlanes {
 impl Surface for ImportedPlanes {
     fn landing(&self) -> Landing {
         Landing::Buffer(self.planes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plane's span runs from its first byte to its last row's last, `row` bytes past that row's
+    /// start, not a whole pitch; no rows is no span.
+    #[test]
+    fn a_plane_s_span_ends_at_its_last_row_s_last_byte() {
+        assert_eq!(
+            plane_span(4096, (512, 2048, 3, 1024)),
+            Some((4608, 4608 + 2 * 2048 + 1024))
+        );
+        assert_eq!(plane_span(0, (0, 2048, 1, 2048)), Some((0, 2048)));
+        assert_eq!(plane_span(0, (0, 2048, 0, 2048)), None);
+        assert_eq!(plane_span(u64::MAX, (1, 2048, 1, 1)), None);
     }
 }

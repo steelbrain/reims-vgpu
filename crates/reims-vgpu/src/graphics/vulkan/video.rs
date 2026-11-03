@@ -753,14 +753,24 @@ fn plane_import(plane: &VideoPlane<'_, VulkanPlatform>) -> Option<(rt::VkHostMem
     Some((import, u64::try_from(host).ok()?.checked_add(plane.offset)?))
 }
 
+/// The end of a plane's bytes from `at`, its first byte: its last row's last byte, `row_bytes`
+/// past that row's start, past which a texture inside a plane whose rows end at its buffer's end
+/// has nothing; `None` for no rows, or past 2^64.
+fn plane_end(at: u64, bytes_per_row: u64, height: u64, row_bytes: u64) -> Option<u64> {
+    let before_last = bytes_per_row.checked_mul(height.checked_sub(1)?)?;
+    at.checked_add(before_last)?.checked_add(row_bytes)
+}
+
+/// [`plane_end`] of `plane` from `at`.
+fn end_of(at: u64, plane: &VideoPlane<'_, VulkanPlatform>) -> Option<u64> {
+    plane_end(at, plane.bytes_per_row, plane.height, plane.row_bytes)
+}
+
 /// The output `decode`'s planes are, in the buffers their textures lie in, which it holds.
 fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> RaiseResult<Output> {
     let (luma, chroma) = (&decode.luma, &decode.chroma);
     let in_buffer = |p: &VideoPlane<'_, VulkanPlatform>| {
-        p.bytes_per_row
-            .checked_mul(p.height)
-            .and_then(|bytes| bytes.checked_add(p.offset))
-            .is_some_and(|end| end <= p.buffer.length())
+        end_of(p.offset, p).is_some_and(|end| end <= p.buffer.length())
     };
     if !in_buffer(luma) || !in_buffer(chroma) {
         return Err(decode_fault("an output plane past its buffer"));
@@ -789,6 +799,7 @@ fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> Rais
             at,
             u32::try_from(p.bytes_per_row).ok()?,
             u32::try_from(p.height).ok()?,
+            u32::try_from(p.row_bytes).ok()?,
         ))
     };
     let (Some(luma_shape), Some(chroma_shape)) =
@@ -796,8 +807,9 @@ fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> Rais
     else {
         return Err(decode_fault("an output plane past 4 GiB"));
     };
-    // The planes' bytes, written while the output lives, for the dirty log.
-    let end = |host: u64, p: &VideoPlane<'_, VulkanPlatform>| host + p.bytes_per_row * p.height;
+    // The planes' bytes, written while the output lives, for the dirty log (each in its buffer,
+    // so its end is too).
+    let end = |host: u64, p: &VideoPlane<'_, VulkanPlatform>| end_of(host, p).unwrap_or(host);
     let first = luma_host.min(chroma_host);
     let last = end(luma_host, luma).max(end(chroma_host, chroma));
     let keep: Arc<dyn Send + Sync> = Arc::new((
@@ -871,6 +883,21 @@ fn cache_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plane ends at its last row's last byte: a tile's chroma at (256, 512) of a 2048-byte
+    /// pitch plane at 3145728 in a buffer of 4718592 bytes, 256 rows of 512 bytes, ends 1024
+    /// bytes before the buffer does, where 256 whole rows past its start would end 512 bytes past
+    /// it (the case of an HEIF grid's last row of tiles but its first); no rows is no plane.
+    #[test]
+    fn a_plane_ends_at_its_last_row_s_last_byte() {
+        let at = 3_145_728 + 512 * 2048 + 256 * 2;
+        assert_eq!(plane_end(at, 2048, 256, 512), Some(at + 255 * 2048 + 512));
+        assert_eq!(plane_end(at, 2048, 256, 512), Some(4_718_592 - 1024));
+        assert_eq!(at + 256 * 2048, 4_718_592 + 512);
+        assert_eq!(plane_end(0, 2048, 1, 2048), Some(2048));
+        assert_eq!(plane_end(0, 2048, 0, 2048), None);
+        assert_eq!(plane_end(u64::MAX, 2048, 2, 1), None);
+    }
 
     /// A device's answer for `profile`: `level`, coded sizes from 64x64 to `max`, `slots` DPB
     /// slots and references, and a bitstream alignment of `alignment`.

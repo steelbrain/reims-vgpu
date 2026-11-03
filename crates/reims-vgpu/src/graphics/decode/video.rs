@@ -23,6 +23,7 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::resource::Buffer as _;
+use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
 use zerocopy::FromBytes;
 
@@ -73,14 +74,30 @@ pub(crate) struct PlanePlace {
     pub(crate) offset: u64,
     /// Bytes from one of its rows to the next.
     pub(crate) bytes_per_row: u64,
+    /// The bytes of one of its rows: its width in its format's blocks (`blockBytes`), at most
+    /// `bytes_per_row` where the format's size is unknown.
+    pub(crate) row_bytes: u64,
     /// Its width in pixels.
     pub(crate) width: u64,
     /// Its height in pixels.
     pub(crate) height: u64,
 }
 
-/// One plane of a picture's output: `height` rows of `width` pixels, `bytes_per_row` apart, from
-/// `offset` in `buffer`.
+/// The bytes of a row `width` pixels wide of a texture of the format `info` describes, its blocks
+/// across; `bytes_per_row` where the format's blocks are unknown (no size), and at most that.
+pub(crate) fn row_bytes(info: &PixelFormatInfo, width: u32, bytes_per_row: u64) -> u64 {
+    if info.block_bytes == 0 || info.block_width == 0 {
+        return bytes_per_row;
+    }
+    (u64::from(width).div_ceil(info.block_width))
+        .saturating_mul(info.block_bytes)
+        .min(bytes_per_row)
+}
+
+/// One plane of a picture's output: `height` rows of `width` pixels, `row_bytes` each,
+/// `bytes_per_row` apart, from `offset` in `buffer`: its last byte is the last row's last, which
+/// may lie less than `bytes_per_row` from the buffer's end (a texture at a place inside a plane
+/// whose rows end where the buffer does).
 pub struct VideoPlane<'a, P: Platform> {
     /// The buffer the plane lies in.
     pub buffer: &'a P::Buffer,
@@ -88,6 +105,8 @@ pub struct VideoPlane<'a, P: Platform> {
     pub offset: u64,
     /// Bytes from one of its rows to the next.
     pub bytes_per_row: u64,
+    /// The bytes of one of its rows.
+    pub row_bytes: u64,
     /// Its width in pixels.
     pub width: u64,
     /// Its height in pixels.
@@ -232,6 +251,7 @@ pub(super) fn decode_op<P: Platform>(
             buffer: luma,
             offset: luma_place.offset,
             bytes_per_row: luma_place.bytes_per_row,
+            row_bytes: luma_place.row_bytes,
             width: luma_place.width,
             height: luma_place.height,
             cached: luma_cache.is_some(),
@@ -240,6 +260,7 @@ pub(super) fn decode_op<P: Platform>(
             buffer: chroma,
             offset: chroma_place.offset,
             bytes_per_row: chroma_place.bytes_per_row,
+            row_bytes: chroma_place.row_bytes,
             width: chroma_place.width,
             height: chroma_place.height,
             cached: chroma_cache.is_some(),
@@ -280,5 +301,34 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         .ok_or_else(bad_reference)?;
         Ok((place, self.require_buffer(place.buffer_obj_id)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(block_bytes: u64, block_width: u64) -> PixelFormatInfo {
+        PixelFormatInfo {
+            name: None,
+            flags: 0,
+            cast_class: 0,
+            block_bytes,
+            block_width,
+            block_height: 1,
+            block_depth: 1,
+        }
+    }
+
+    /// A row's bytes are its whole blocks across, at most its pitch, and its pitch where the
+    /// format's blocks are unknown: the luma (R8Unorm) and chroma (RG16Unorm) of a tile 512
+    /// wide, a compressed format of 4-pixel blocks, and a format of no size.
+    #[test]
+    fn a_row_is_its_blocks_across() {
+        assert_eq!(row_bytes(&info(1, 1), 512, 2048), 512);
+        assert_eq!(row_bytes(&info(4, 1), 256, 2048), 1024);
+        assert_eq!(row_bytes(&info(8, 4), 6, 2048), 16);
+        assert_eq!(row_bytes(&info(4, 1), 1024, 2048), 2048);
+        assert_eq!(row_bytes(&info(0, 0), 512, 2048), 2048);
     }
 }
