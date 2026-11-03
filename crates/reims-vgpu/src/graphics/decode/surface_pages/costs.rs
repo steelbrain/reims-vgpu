@@ -121,7 +121,10 @@ impl XorShift {
 fn surface_runs(rng: &mut XorShift, ram: u64, length: u64, run: u64) -> Vec<RgfxPageRun> {
     let slots = ram / run;
     let count = length.div_ceil(run);
-    assert!(count <= slots, "{length:#x} bytes in runs of {run:#x} do not fit the RAM");
+    assert!(
+        count <= slots,
+        "{length:#x} bytes in runs of {run:#x} do not fit the RAM"
+    );
     let mut order: Vec<u64> = (0..slots).collect();
     for i in 0..count.to_usize() {
         let j = i + (rng.next() % (slots - i.to_u64())).to_usize();
@@ -289,7 +292,10 @@ fn measure<P: ApiPlatform>(label: &str) {
     let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
     dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
-    eprintln!("{label}: {} MiB of guest RAM, {iters} surfaces a case", ram_bytes >> 20);
+    eprintln!(
+        "{label}: {} MiB of guest RAM, {iters} surfaces a case",
+        ram_bytes >> 20
+    );
     let mut obj = 100u64;
     for case in cases(page) {
         if only
@@ -334,7 +340,12 @@ fn measure<P: ApiPlatform>(label: &str) {
                     reserved_34: 0,
                 };
                 let made = steps[1].time(|| dec.decode(&device, over.as_bytes()));
-                assert_eq!(made.ok(), Some(Ok(())), "{}: the buffer over its pages", case.name);
+                assert_eq!(
+                    made.ok(),
+                    Some(Ok(())),
+                    "{}: the buffer over its pages",
+                    case.name
+                );
                 let destroy = RgfxObjectDestroy {
                     header: header(RGFX_CMD_OBJECT_DESTROY),
                     obj_id: obj,
@@ -347,7 +358,10 @@ fn measure<P: ApiPlatform>(label: &str) {
             }
             let mode = if cached { "cached" } else { "plain" };
             if refused != 0 {
-                eprintln!("{label}: {} {mode}: {refused} SURFACE_PAGES refused", case.name);
+                eprintln!(
+                    "{label}: {} {mode}: {refused} SURFACE_PAGES refused",
+                    case.name
+                );
             }
             for (step, name) in steps.iter().zip([
                 "SURFACE_PAGES",
@@ -355,7 +369,10 @@ fn measure<P: ApiPlatform>(label: &str) {
                 "OBJECT_DESTROY",
                 "BLOCK_RELEASE",
             ]) {
-                eprintln!("{label}: {}", step.line(case.name, &format!("{mode} {name}")));
+                eprintln!(
+                    "{label}: {}",
+                    step.line(case.name, &format!("{mode} {name}"))
+                );
             }
         }
         // The same steps one at a time, the views kept as the cache keeps them.
@@ -420,11 +437,69 @@ fn measure<P: ApiPlatform>(label: &str) {
     drop(ram);
 }
 
+/// The range mappings alone, with no GPU device made: what a profiler of the views' own code
+/// runs, outside the GPU's locks (`RGK_BENCH_MAP_ONLY=1` with the Vulkan test).
+#[cfg(feature = "vulkan")]
+fn map_only<P: ApiPlatform>(label: &str) {
+    let platform = P::process();
+    let page = platform.vm().page_size().max(GUEST_PAGE);
+    let ram_bytes = env_u64("RGK_BENCH_RAM_MIB", 768) * MIB;
+    let iters = env_u64("RGK_BENCH_ITERS", 40);
+    let only = std::env::var("RGK_BENCH_CASES").ok();
+    let ram = guest_ram(ram_bytes);
+    let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+    let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+    for case in cases(page) {
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.split(',').any(|n| n == case.name))
+        {
+            continue;
+        }
+        if case.length > ram_bytes / 2 {
+            continue;
+        }
+        let mut steps: [Step; 2] = Default::default();
+        let keep = env_u64("RGK_BENCH_KEEP", 0).to_usize();
+        let mut kept = std::collections::VecDeque::new();
+        for _ in 0..iters {
+            let runs = surface_runs(&mut rng, ram_bytes, case.length, case.run);
+            let ranges: Vec<PhysRange> = runs
+                .iter()
+                .map(|r| PhysRange {
+                    physical_address: r.address,
+                    physical_length: r.length,
+                })
+                .collect();
+            let mapping = steps[0]
+                .time(|| core.new_range_mapping(&ranges, case.length, 0))
+                .expect("a view");
+            kept.push_back(mapping);
+            if kept.len() > keep {
+                let old = kept.pop_front();
+                steps[1].time(|| drop(old));
+            }
+        }
+        kept.clear();
+        for (step, name) in steps.iter().zip(["range mapping", "its unmap"]) {
+            eprintln!("{label}: {}", step.line(case.name, name));
+        }
+    }
+    drop(core);
+    drop(lease);
+    drop(ram);
+}
+
 /// The Vulkan platform's costs (module docs).
 #[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn surface_view_costs_vulkan() {
+    if env_u64("RGK_BENCH_MAP_ONLY", 0) == 1 {
+        map_only::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+        return;
+    }
     measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
     #[cfg(target_os = "linux")]
     raw::measure();
