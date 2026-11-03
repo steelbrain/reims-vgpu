@@ -13,9 +13,10 @@
 // base, so it gets that span: an aligned run of kRgfxContextOldSpanUnits units.
 //
 // Sized from what a busy desktop's processes hold (docs/graphics-kext/design.md, "Contexts",
-// measured): 57 processes held a context with 39 apps open, where 32 slots of 2 TiB refused the
-// 33rd process's and every later one's. One unit holds every process's GPU addresses there many
-// times over.
+// measured on the RTX 5080 host): 74 processes held a context with 42 apps and 7 WebGL and WebGPU
+// pages open, where 32 slots of 2 TiB refused the 33rd process's and every later one's, and the
+// most any one held of its range at once was WindowServer's 204 MiB, so a unit holds it over 300
+// times.
 //
 // Runs are taken round-robin: the search starts past the last run taken, so a run given back is
 // the last one the next contexts take. The last kRgfxContextReservedUnits units free go to
