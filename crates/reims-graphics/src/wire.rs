@@ -52,13 +52,15 @@ pub const RGFX_MSIX_VECTORS: u32 = 1;
 pub const RGFX_REG_MAGIC: u32 = 0x000;
 /// `VERSION`, RO: [`RGFX_VERSION`].
 pub const RGFX_REG_VERSION: u32 = 0x004;
-/// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
-/// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
-/// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
+/// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers:
+/// [`RGFX_FEATURE_SURFACE_PAGES`], [`RGFX_FEATURE_SURFACE_CACHE`] and
+/// [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 /// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 /// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
-/// [`RGFX_FEATURE_SUBMIT_ROOM`] and [`RGFX_FEATURE_ICB_SLOTS`]). Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`] and [`RGFX_FEATURE_COMMIT_ORDER`]).
+/// Bits 9 and 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -153,6 +155,12 @@ pub const RGFX_FEATURE_SUBMIT_ROOM: u32 = 1 << 16;
 /// "Slots"), which the host reads where the message names them. The guest still sends `ICB_WRITE`
 /// for a buffer it keeps no slots for.
 pub const RGFX_FEATURE_ICB_SLOTS: u32 = 1 << 17;
+/// `FEATURES_LO` bit 18, `COMMIT_ORDER`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
+/// [`RGFX_OP_COMMIT_ORDER`](crate::ops::RGFX_OP_COMMIT_ORDER), so a command buffer is committed to
+/// the platform after the buffers of its process's other queues posted before it, as Metal orders a
+/// tracked resource across queues by commit.
+pub const RGFX_FEATURE_COMMIT_ORDER: u32 = 1 << 18;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;

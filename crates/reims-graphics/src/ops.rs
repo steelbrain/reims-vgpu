@@ -128,6 +128,18 @@ pub const RGFX_OP_SCHEDULED_WANTED: u16 = 0x000b;
 /// named buffer that has not finished, and has the buffer signal its own queue's order as it ends,
 /// for the buffers that name it.
 pub const RGFX_OP_SURFACE_ORDER: u16 = 0x000c;
+/// Op `COMMIT_ORDER` (as many [`RgfxSurfaceOrderWait`]s as its `len` holds, none among them), where
+/// the guest took [`RGFX_FEATURE_COMMIT_ORDER`](crate::wire::RGFX_FEATURE_COMMIT_ORDER): the
+/// command buffer is committed after each command buffer of another queue of its process its body
+/// names, and the queue's buffers before it, as Metal orders a tracked resource across queues by
+/// the order the command buffers were committed in (two queues, the second buffer committed right
+/// after the first's `commit`: ordered on the AMD 5300M, the Intel 630 and the M3;
+/// docs/graphics-kext/dgpu-oracle.md, Q6). Before its first encoder, once. The bundle names, as it
+/// posts the buffer, the latest buffer each other queue of the process has posted since this queue
+/// last named it, and posts this one after; the host commits the buffer once each named queue has
+/// committed through the seqno named. It changes no GPU wait: the platform orders what the buffers
+/// share by the order they are committed in.
+pub const RGFX_OP_COMMIT_ORDER: u16 = 0x000d;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
@@ -171,8 +183,9 @@ pub struct RgfxOpQueueBarrier {
     pub before_stages: u64,
 }
 
-/// One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after: the one at `seqno` on the
-/// submission ring of queue `queue_obj_id`, and the queue's buffers before it.
+/// One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after, or an
+/// [`RGFX_OP_COMMIT_ORDER`]'s is committed after: the one at `seqno` on the submission ring of
+/// queue `queue_obj_id`, and the queue's buffers before it.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -488,6 +501,7 @@ const _: () = {
     assert!(op_group(RGFX_OP_QUEUE_BARRIER) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SCHEDULED_WANTED) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_ORDER) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(RGFX_OP_COMMIT_ORDER) == RGFX_OP_GROUP_FRAMING);
     assert!(size_of::<RgfxSurfaceOrderWait>() == 16);
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_VIDEO) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);

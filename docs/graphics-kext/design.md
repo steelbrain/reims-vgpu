@@ -741,6 +741,9 @@ only where no negotiation can carry it.
   `RGFX_EVT_SUBMIT_ROOM` (0x408) on the ring's completion ring, ring 0's or the
   queue's. The waiting producer looks again at that record: one interrupt after
   the host's take, not at a sleep's end. Every host offers it.
+- Bit 18 is `COMMIT_ORDER`: a command buffer is committed after the buffers of
+  its process's other queues it names (`RGFX_OP_COMMIT_ORDER`; "Commit order",
+  below).
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1861,6 +1864,40 @@ surface is scheduled, every lock of the surface waits for it, read-only or
 read-write, in its process or another, and then reads what it wrote; a lock
 taken before the buffer is scheduled may not wait. The kext's locks wait for the
 writes named from the commit on, which is inside that.
+
+**Commit order**, where the guest took `COMMIT_ORDER` (`FEATURES_LO` bit 18).
+Metal orders a tracked resource across a process's queues by the order the
+command buffers were committed in: a copy committed on a second queue right
+after the first queue's `commit` of a 30 ms kernel that writes its source read
+what the kernel wrote in every run on the AMD 5300M, the Intel 630 and the M3
+(dgpu-oracle.md, Q6). The platform orders a tracked resource across its queues
+by the order the host commits to it, so the host has to commit in the guest's
+order. A plain `commit` returns once the buffer is on its queue's ring, and
+each queue's ring is taken on a thread of its own, so a buffer the guest
+committed later on another queue could reach the platform first (before this
+op, the oracle's two-queue row raced in 4 of 15 runs on the lane, each with
+every word stale). The bundle names the order as it posts each buffer:
+- The process keeps its command queues in a list, each with the seqno of its
+  latest buffer on its ring (`posted`), raised once the buffer is there.
+- Before a buffer goes on its ring, it names each other queue of the process
+  whose `posted` rose since this queue last named it, at that `posted`, in one
+  `COMMIT_ORDER` op before its first encoder; then it goes on its ring, and its
+  queue's `posted` rises.
+- So each buffer named was on its ring before the post that names it read
+  `posted`: the names run from later posts to earlier ones and cannot meet in a
+  cycle. A buffer committed but held behind an uncommitted one on its queue is
+  not on its ring, and is not named, as Metal does not submit it either.
+- The host keeps, for each queue, the highest seqno whose buffer was committed,
+  stood in for or failed, raised in the queue's order as each buffer's job
+  ends. A buffer that holds the op is committed once each named queue's mark
+  reaches the seqno named, after its turn in its queue and the commit order's
+  tickets. A name of its own queue, of another process's queue, of a queue the
+  host does not hold, or past every seqno the queue's ring has published, waits
+  for nothing. The wait holds no lock; a queue's destroy, its context's close
+  and the device's reset end it, so a process that names a cycle holds up only
+  its own queues, until it closes.
+- Nothing else changes: no GPU wait is added, the buffer's records go as they
+  did, and the platform orders what the buffers share by the commit order.
 
 **Left for later** (extends the same op families, not the transport):
 command-buffer/queue descriptors and `errorOptions`; labels and debug groups

@@ -210,6 +210,19 @@
 // for the buffers that name it.
 #define RGFX_OP_SURFACE_ORDER 12
 
+// Op `COMMIT_ORDER` (as many [`RgfxSurfaceOrderWait`]s as its `len` holds, none among them), where
+// the guest took [`RGFX_FEATURE_COMMIT_ORDER`](crate::wire::RGFX_FEATURE_COMMIT_ORDER): the
+// command buffer is committed after each command buffer of another queue of its process its body
+// names, and the queue's buffers before it, as Metal orders a tracked resource across queues by
+// the order the command buffers were committed in (two queues, the second buffer committed right
+// after the first's `commit`: ordered on the AMD 5300M, the Intel 630 and the M3;
+// docs/graphics-kext/dgpu-oracle.md, Q6). Before its first encoder, once. The bundle names, as it
+// posts the buffer, the latest buffer each other queue of the process has posted since this queue
+// last named it, and posts this one after; the host commits the buffer once each named queue has
+// committed through the seqno named. It changes no GPU wait: the platform orders what the buffers
+// share by the order they are committed in.
+#define RGFX_OP_COMMIT_ORDER 13
+
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
 
@@ -870,13 +883,15 @@
 // `VERSION`, RO: [`RGFX_VERSION`].
 #define RGFX_REG_VERSION 4
 
-// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
-// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
-// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
+// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers:
+// [`RGFX_FEATURE_SURFACE_PAGES`], [`RGFX_FEATURE_SURFACE_CACHE`] and
+// [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
 // [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 // [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 // [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
-// [`RGFX_FEATURE_SUBMIT_ROOM`] and [`RGFX_FEATURE_ICB_SLOTS`]). Bits 9 and 10 are reserved.
+// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`] and [`RGFX_FEATURE_COMMIT_ORDER`]).
+// Bits 9 and 10 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -988,6 +1003,13 @@
 // "Slots"), which the host reads where the message names them. The guest still sends `ICB_WRITE`
 // for a buffer it keeps no slots for.
 #define RGFX_FEATURE_ICB_SLOTS (1 << 17)
+
+// `FEATURES_LO` bit 18, `COMMIT_ORDER`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
+// [`RGFX_OP_COMMIT_ORDER`](crate::ops::RGFX_OP_COMMIT_ORDER), so a command buffer is committed to
+// the platform after the buffers of its process's other queues posted before it, as Metal orders a
+// tracked resource across queues by commit.
+#define RGFX_FEATURE_COMMIT_ORDER (1 << 18)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -5552,8 +5574,9 @@ typedef struct {
   uint32_t reserved_24;
 } RgfxSurfaceFacts;
 
-// One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after: the one at `seqno` on the
-// submission ring of queue `queue_obj_id`, and the queue's buffers before it.
+// One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after, or an
+// [`RGFX_OP_COMMIT_ORDER`]'s is committed after: the one at `seqno` on the submission ring of
+// queue `queue_obj_id`, and the queue's buffers before it.
 typedef struct {
   // The queue's id.
   uint64_t queue_obj_id;
