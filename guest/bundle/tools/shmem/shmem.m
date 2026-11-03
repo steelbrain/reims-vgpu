@@ -2,7 +2,7 @@
 // make costs while it holds the rest, and what the memory costs the system (the process's
 // footprint, the system's wired pages) at each step: made, used by the GPU, freed. To set the
 // graphics lane's Shared and Managed memory against real Macs.
-//   shmem [-d NAME] [-cap GIB] [-count N] [-time S] [-guard GIB] [-use] [-touch] CASE...
+//   shmem [-d NAME] [-cap GIB] [-count N] [-time S] [-guard GIB] [-use] [-check] [-touch] CASE...
 //     -d NAME    the first of MTLCopyAllDevices whose name holds NAME (default: the system's).
 //     -cap GIB   the most bytes a hold case makes (default 8).
 //     -count N   the most buffers a hold case makes (default 1,000,000).
@@ -12,6 +12,10 @@
 //     -use       after a hold, one command buffer fills 4 bytes of each held buffer (at most
 //                65,536 of them, spread evenly), committed and waited: what a GPU use costs and
 //                wires.
+//     -check     after a hold (and its use), the CPU writes the first word of each held buffer, one
+//                command buffer copies it to the second word and fills the last 4 bytes of each
+//                (and synchronizes a Managed one), and the CPU reads both back: bad = the buffers
+//                whose words are not what was written, and the command buffer's error.
 //     -touch     the CPU writes one byte a page of each buffer as it is made.
 //     -nofree    hold and align cases keep their buffers for the process's life, which its exit
 //                frees through the context's close: no free per buffer.
@@ -51,7 +55,7 @@
 
 static double gCapGiB = 8, gTimeS = 20, gGuardGiB = 6;
 static unsigned long gCount = 1000000;
-static BOOL gUse = NO, gTouch = NO, gNoFree = NO;
+static BOOL gUse = NO, gCheck = NO, gTouch = NO, gNoFree = NO;
 static int gRounds = 200;
 
 static double nowUs(void)
@@ -205,6 +209,49 @@ static double useAll(id<MTLDevice> d, NSArray<id<MTLBuffer>> *held, unsigned *us
 	return t;
 }
 
+// The CPU writes each held buffer's first word; one command buffer copies it to the second word
+// and fills the last 4 bytes; the CPU reads both. Answers the buffers whose words differ.
+static double checkAll(id<MTLDevice> d, NSArray<id<MTLBuffer>> *held, uint64_t size,
+                       BOOL managed, unsigned *bad, NSString **err)
+{
+	*bad = 0;
+	const uint64_t last = size / 4 - 1;
+	for (NSUInteger i = 0; i < held.count; i++) {
+		uint32_t *c = (uint32_t *)held[i].contents;
+		c[0] = (uint32_t)i ^ 0xc0ffee00u;
+		c[1] = 0;
+		c[last] = 0;
+		if (managed) {
+			[held[i] didModifyRange:NSMakeRange(0, 8)];
+			[held[i] didModifyRange:NSMakeRange(size - 4, 4)];
+		}
+	}
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+	for (NSUInteger i = 0; i < held.count; i++) {
+		[b copyFromBuffer:held[i] sourceOffset:0 toBuffer:held[i] destinationOffset:4 size:4];
+		[b fillBuffer:held[i] range:NSMakeRange(size - 4, 4) value:0x5a];
+#if TARGET_OS_OSX
+		if (managed)
+			[b synchronizeResource:held[i]];
+#endif
+	}
+	[b endEncoding];
+	double t0 = nowUs();
+	[cb commit];
+	[cb waitUntilCompleted];
+	double t = nowUs() - t0;
+	if (cb.status != MTLCommandBufferStatusCompleted)
+		*err = [NSString stringWithFormat:@"status %ld %@", (long)cb.status,
+		                                  cb.error.localizedDescription];
+	for (NSUInteger i = 0; i < held.count; i++) {
+		const uint32_t *c = (const uint32_t *)held[i].contents;
+		*bad += c[1] != ((uint32_t)i ^ 0xc0ffee00u) || c[last] != 0x5a5a5a5au;
+	}
+	return t;
+}
+
 static void hold(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint64_t size)
 {
 	const uint64_t cap = (uint64_t)(gCapGiB * 1073741824.0);
@@ -286,6 +333,17 @@ static void hold(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint6
 		usleep(1000000);
 		printf("shm: %s.idle wired=%+.1fMiB footprint=%+.1fMiB\n", name.UTF8String,
 		       mib((int64_t)(wiredBytes() - w0)), mib((int64_t)(footprint() - f0)));
+	}
+	if (gCheck && n && (opts & MTLResourceStorageModeMask) != MTLResourceStorageModePrivate) {
+		unsigned bad = 0;
+		NSString *err = nil;
+		const BOOL managed = (opts & MTLResourceStorageModeMask) != MTLResourceStorageModeShared;
+		double t = checkAll(d, held, size, managed, &bad, &err);
+		printf("shm: %s.check buffers=%lu bad=%u cb_ms=%.1f wired=%+.1fMiB allocated=%+.1fMiB%s%s\n",
+		       name.UTF8String, (unsigned long)held.count, bad, t / 1000,
+		       mib((int64_t)(wiredBytes() - w0)), mib((int64_t)(d.currentAllocatedSize - a0)),
+		       err ? " err=" : "", err ? err.UTF8String : "");
+		fflush(stdout);
 	}
 	if (gNoFree) {
 		// Kept for the process's life: its exit frees them through the context's close.
@@ -511,6 +569,8 @@ int main(int argc, const char **argv)
 				gGuardGiB = atof(argv[++i]);
 			else if (!strcmp(argv[i], "-use"))
 				gUse = YES;
+			else if (!strcmp(argv[i], "-check"))
+				gCheck = YES;
 			else if (!strcmp(argv[i], "-touch"))
 				gTouch = YES;
 			else if (!strcmp(argv[i], "-nofree"))
@@ -538,8 +598,9 @@ int main(int argc, const char **argv)
 			return 1;
 		}
 		printf("shm: start device=\"%s\" cap=%.1fGiB count=%lu time=%.0fs guard=%.1fGiB use=%d "
-		       "touch=%d\n",
-		       d ? d.name.UTF8String : "-", gCapGiB, gCount, gTimeS, gGuardGiB, gUse, gTouch);
+		       "check=%d touch=%d\n",
+		       d ? d.name.UTF8String : "-", gCapGiB, gCount, gTimeS, gGuardGiB, gUse, gCheck,
+		       gTouch);
 		for (NSString *c in cases) {
 			NSArray<NSString *> *p = [c componentsSeparatedByString:@"."];
 			BOOL ok = YES;
