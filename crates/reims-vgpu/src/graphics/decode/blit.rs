@@ -21,17 +21,26 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
 use reims_vgpu_core::platform::host_range::HostRange;
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
 use super::{GraphicsDecoder, op_fault};
 
 /// Reads op body `T` from `payload`, or an exec fault when it is too short.
+#[inline]
 fn body<T: FromBytes>(tag: u16, payload: &[u8]) -> RaiseResult<T> {
     match T::read_from_prefix(payload) {
         Ok((t, _)) => Ok(t),
-        Err(_) => Err(op_fault(format_args!("blit op {tag:#06x}: body too short"))),
+        Err(_) => Err(short_body(tag)),
     }
+}
+
+/// The exec fault of blit op `tag`, whose body is too short: out of line, as no well-formed
+/// op meets it.
+#[cold]
+#[inline(never)]
+fn short_body(tag: u16) -> Raise {
+    op_fault(format_args!("blit op {tag:#06x}: body too short"))
 }
 
 /// Decodes one blit-encoder op: `tag` its op, `payload` its body (the bytes after

@@ -53,20 +53,27 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::ResourceRef;
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::{FromBytes, Immutable};
 
 use super::{GraphicsDecoder, op_fault};
 
 /// Reads op body `T` from the start of `payload`, or an exec fault when it is too
 /// short.
+#[inline]
 fn body<T: FromBytes>(tag: u16, payload: &[u8]) -> RaiseResult<T> {
     match T::read_from_prefix(payload) {
         Ok((t, _)) => Ok(t),
-        Err(_) => Err(op_fault(format_args!(
-            "compute op {tag:#06x}: body too short"
-        ))),
+        Err(_) => Err(short_body(tag)),
     }
+}
+
+/// The exec fault of compute op `tag`, whose body is too short: out of line, as no well-formed
+/// op meets it.
+#[cold]
+#[inline(never)]
+fn short_body(tag: u16) -> Raise {
+    op_fault(format_args!("compute op {tag:#06x}: body too short"))
 }
 
 /// Reads the `count` element records of `E` that follow a head of `head_len` bytes
