@@ -6,7 +6,7 @@
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(draw_cost)'
 //! --no-capture`).
 //!
-//! A command buffer is one render pass of [`DRAWS`] draws of 3 vertices, each after a
+//! A command buffer is one render pass of draws of 3 vertices ([`Shape`]), each after a
 //! `setVertexBuffer:` at index 0 of an upload chunk at its next 256-byte offset, as the bundle
 //! sends `setVertexBytes:` (a 64 KiB `BUFFER_OVER_HOST_MEMORY` chunk of the region, 256 draws a
 //! chunk). Three command buffers go back to back and are then waited for, as `draws.10k` commits
@@ -16,9 +16,11 @@
 //! decoder's share and the platform's. Instructions are the figure a busy host leaves alone
 //! (measured on the M3 Max at a load of 50: within 0.2% run to run, where CPU time moved 15%).
 //!
-//! The environment picks what runs: `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path,
-//! for a profile of it (`decoder`, `platform` or `runtime`), and `DRAW_COST_SECONDS` a time to
-//! keep running that path for, so a sampling profiler can attach.
+//! The environment picks what runs: `DRAW_COST_SHAPE` the shape (`10k`, the default, or `many`,
+//! 64 command buffers of 16 draws, whose figures show a command buffer's own cost),
+//! `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for a profile of it (`decoder`,
+//! `platform` or `runtime`), and `DRAW_COST_SECONDS` a time to keep running that path for, so a
+//! sampling profiler can attach.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -53,10 +55,41 @@ use zerocopy::IntoBytes;
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
-/// Draws a command buffer.
-const DRAWS: usize = 10_000;
-/// Command buffers a repetition, committed back to back and then waited for.
-const CBS: usize = 3;
+/// How a repetition's work is cut: command buffers, committed back to back and then waited for,
+/// each of one render pass of `draws` draws.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    cbs: usize,
+    draws: usize,
+}
+
+impl Shape {
+    /// `draws.10k`'s: 3 command buffers of 10,000 draws.
+    const TEN_K: Shape = Shape {
+        cbs: 3,
+        draws: 10_000,
+    };
+    /// Many short command buffers, as a guest's frame of 60 to 100 is cut: 64 of 16 draws.
+    const MANY: Shape = Shape { cbs: 64, draws: 16 };
+
+    /// The upload chunks a command buffer's draws take.
+    fn chunks_a_cb(self) -> u64 {
+        (self.draws as u64 * ALIGN).div_ceil(CHUNK)
+    }
+
+    /// The chunks the region holds: a repetition's command buffers each take their own.
+    fn chunks(self) -> u64 {
+        self.chunks_a_cb() * self.cbs as u64
+    }
+
+    /// The shape `DRAW_COST_SHAPE` names: `many` or, by default, `10k`.
+    fn chosen() -> Shape {
+        match std::env::var("DRAW_COST_SHAPE").as_deref() {
+            Ok("many") => Shape::MANY,
+            _ => Shape::TEN_K,
+        }
+    }
+}
 /// Repetitions a run times, after [`WARM`] repetitions.
 const REPS: usize = 6;
 /// Repetitions run before the timed ones.
@@ -65,8 +98,6 @@ const WARM: usize = 2;
 /// `kUploadChunkSize` and `kUploadAlign`).
 const CHUNK: u64 = 0x1_0000;
 const ALIGN: u64 = 256;
-/// The chunks the region holds: a repetition's command buffers each take their own.
-const CHUNKS: u64 = (DRAWS as u64 * ALIGN).div_ceil(CHUNK) * CBS as u64;
 
 /// The object ids: the queue, the target, the pipeline, the per-draw constant buffers (vertex 1
 /// and fragment 0), then the chunks from [`CHUNK_ID`].
@@ -212,16 +243,16 @@ fn op(tag: u16, body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// The chunk and offset of draw `draw` of command buffer `cb` of a repetition.
-fn upload_at(cb: usize, draw: usize) -> (u64, u64) {
-    let per_cb = (DRAWS as u64 * ALIGN).div_ceil(CHUNK);
+/// The chunk and offset of draw `draw` of command buffer `cb` of a repetition of `shape`.
+fn upload_at(shape: Shape, cb: usize, draw: usize) -> (u64, u64) {
+    let per_cb = shape.chunks_a_cb();
     let at = draw as u64 * ALIGN;
     (CHUNK_ID + cb as u64 * per_cb + at / CHUNK, at % CHUNK)
 }
 
-/// The `COMMAND_BUFFER` message of command buffer `cb` of a repetition, as the bundle sends
-/// `draws.10k`'s.
-fn command_buffer(cb: usize, cb_obj_id: u64) -> Vec<u8> {
+/// The `COMMAND_BUFFER` message of command buffer `cb` of a repetition of `shape`, as the bundle
+/// sends `draws.10k`'s.
+fn command_buffer(shape: Shape, cb: usize, cb_obj_id: u64) -> Vec<u8> {
     let pass = RgfxRenderPassDesc {
         color_count: 1,
         flags: RGFX_PASS_FLAG_RT_SIZE,
@@ -258,8 +289,8 @@ fn command_buffer(cb: usize, cb_obj_id: u64) -> Vec<u8> {
         index: 0,
     };
     ops.extend(op(RGFX_OP_RENDER_SET_FRAGMENT_BUFFER, fragment.as_bytes()));
-    for draw in 0..DRAWS {
-        let (chunk, offset) = upload_at(cb, draw);
+    for draw in 0..shape.draws {
+        let (chunk, offset) = upload_at(shape, cb, draw);
         let bind = RgfxOpSetVertexBuffer {
             buffer_obj_id: chunk,
             offset,
@@ -305,6 +336,7 @@ fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
 /// A decoder on `P`'s system device, holding the objects [`command_buffer`] names, and the
 /// channel its completions come on.
 struct Bench<P: ApiPlatform> {
+    shape: Shape,
     platform: Arc<P>,
     device: P::Device,
     decoder: GraphicsDecoder<P>,
@@ -312,10 +344,11 @@ struct Bench<P: ApiPlatform> {
 }
 
 impl<P: ApiPlatform> Bench<P> {
-    fn new() -> Bench<P> {
+    fn new(shape: Shape) -> Bench<P> {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
-        let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + CHUNKS * CHUNK + RGFX_CURSOR_SPAN;
+        let region_size =
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET + shape.chunks() * CHUNK + RGFX_CURSOR_SPAN;
         let region = reims_graphics::region::Region::new(region_size as usize).unwrap();
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
         let (tx, completed) = mpsc::channel();
@@ -333,7 +366,7 @@ impl<P: ApiPlatform> Bench<P> {
             ..RgfxQueueCreate::default()
         };
         assert_eq!(decoder.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
-        for n in 0..CHUNKS {
+        for n in 0..shape.chunks() {
             let chunk = RgfxBufferOverHostMemory {
                 header: RgfxMsgHeader {
                     r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
@@ -380,6 +413,7 @@ impl<P: ApiPlatform> Bench<P> {
             assert_eq!(decoder.insert(id, handle).unwrap(), Ok(()));
         }
         Bench {
+            shape,
             platform,
             device,
             decoder,
@@ -424,10 +458,12 @@ impl<P: ApiPlatform> Bench<P> {
             panic!("no pipeline");
         };
         let constants = self.buffer(CONSTANTS_ID);
-        let chunks: Vec<&P::Buffer> = (0..CHUNKS).map(|n| self.buffer(CHUNK_ID + n)).collect();
+        let chunks: Vec<&P::Buffer> = (0..self.shape.chunks())
+            .map(|n| self.buffer(CHUNK_ID + n))
+            .collect();
         let (tx, rx) = mpsc::channel();
         let start = counts();
-        for cb_at in 0..CBS {
+        for cb_at in 0..self.shape.cbs {
             let cb = queue.command_buffer(o).unwrap().unwrap();
             let pass = self.platform.render_pass_descriptor();
             let attachment = ColorAttachmentSet {
@@ -457,8 +493,8 @@ impl<P: ApiPlatform> Bench<P> {
                 for cmd in cmds {
                     e.encode(o, cmd).unwrap();
                 }
-                for draw in 0..DRAWS {
-                    let (chunk, offset) = upload_at(cb_at, draw);
+                for draw in 0..self.shape.draws {
+                    let (chunk, offset) = upload_at(self.shape, cb_at, draw);
                     let bind = RenderCmd::SetVertexBuffer {
                         buffer: Some(chunks[(chunk - CHUNK_ID) as usize]),
                         offset,
@@ -480,7 +516,7 @@ impl<P: ApiPlatform> Bench<P> {
             cb.commit(o).unwrap();
         }
         let spent = counts() - start;
-        for _ in 0..CBS {
+        for _ in 0..self.shape.cbs {
             rx.recv_timeout(Duration::from_secs(30))
                 .expect("a command buffer never completed");
         }
@@ -503,7 +539,8 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
         panic!("no pipeline");
     };
     let constants = &bench.buffer(CONSTANTS_ID).raw;
-    let chunks: Vec<&rt::Buffer> = (0..CHUNKS)
+    let shape = bench.shape;
+    let chunks: Vec<&rt::Buffer> = (0..shape.chunks())
         .map(|n| &bench.buffer(CHUNK_ID + n).raw)
         .collect();
     let pass = bench.platform.render_pass_descriptor();
@@ -518,14 +555,14 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     let (pass, _) = pass.pass();
     let (tx, rx) = mpsc::channel();
     let start = counts();
-    for cb_at in 0..CBS {
+    for cb_at in 0..shape.cbs {
         let cb = queue.raw.command_buffer().unwrap();
         let mut e = cb.render_command_encoder(&pass).unwrap();
         e.set_render_pipeline_state(&pipeline.raw).unwrap();
         e.set_vertex_buffer(Some(constants), 0, 1).unwrap();
         e.set_fragment_buffer(Some(constants), 0, 0).unwrap();
-        for draw in 0..DRAWS {
-            let (chunk, offset) = upload_at(cb_at, draw);
+        for draw in 0..shape.draws {
+            let (chunk, offset) = upload_at(shape, cb_at, draw);
             e.set_vertex_buffer(Some(chunks[(chunk - CHUNK_ID) as usize]), offset, 0)
                 .unwrap();
             e.draw_primitives(triangle, 0, 3, 1, 0).unwrap();
@@ -537,7 +574,7 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
         cb.commit().unwrap();
     }
     let spent = counts() - start;
-    for _ in 0..CBS {
+    for _ in 0..shape.cbs {
         rx.recv_timeout(Duration::from_secs(30))
             .expect("a command buffer never completed");
     }
@@ -573,12 +610,13 @@ fn measure<P: ApiPlatform>(
     let seconds: Option<u64> = std::env::var("DRAW_COST_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok());
+    let shape = bench.shape;
     let mut seqno = 0x1000u64;
     let mut messages = || {
-        (0..CBS)
+        (0..shape.cbs)
             .map(|cb| {
                 seqno += 1;
-                command_buffer(cb, seqno)
+                command_buffer(shape, cb, seqno)
             })
             .collect::<Vec<_>>()
     };
@@ -590,8 +628,9 @@ fn measure<P: ApiPlatform>(
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
-    let a_draw =
-        |c: Counts, reps: u64| c.0.map(|v| v as f64 / (reps * (CBS * DRAWS) as u64) as f64);
+    let a_draw = |c: Counts, reps: u64| {
+        c.0.map(|v| v as f64 / (reps * (shape.cbs * shape.draws) as u64) as f64)
+    };
     if let Some(seconds) = seconds {
         let until = Instant::now() + Duration::from_secs(seconds);
         let mut reps = 0u64;
@@ -643,8 +682,9 @@ fn measure<P: ApiPlatform>(
         }
     }
     println!(
-        "{name}: a draw of draws.10k's shape on the decoding thread, median [lowest, highest] of \
-         {runs} runs of {REPS} repetitions of {CBS} command buffers of {DRAWS} draws"
+        "{name}: a draw on the decoding thread, median [lowest, highest] of {runs} runs of {REPS} \
+         repetitions of {} command buffers of {} draws (a command buffer's: {} times as much)",
+        shape.cbs, shape.draws, shape.draws
     );
     for (f, figure) in FIGURES.iter().enumerate() {
         let mut medians = [0.0f64; 3];
@@ -677,7 +717,7 @@ fn measure<P: ApiPlatform>(
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
 fn on_vulkan_draw_cost() {
-    let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new();
+    let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
     measure("vulkan", bench, Some(through_runtime));
 }
 
@@ -686,6 +726,6 @@ fn on_vulkan_draw_cost() {
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
 fn on_metal_draw_cost() {
-    let bench = Bench::<reims_vgpu_metal::MetalPlatform>::new();
+    let bench = Bench::<reims_vgpu_metal::MetalPlatform>::new(Shape::chosen());
     measure("metal", bench, None);
 }
