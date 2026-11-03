@@ -692,6 +692,33 @@ fn unknown_and_short_commands_are_answered() {
     assert_eq!(rig.complete(), (s, RGFX_STATUS_INVALID_ARGUMENT));
 }
 
+/// The refreshes' times keep to their grid, a period apart from the first, as a panel's vblanks
+/// do: a thread that wakes late for a tick still stamps the tick's time, and one held over
+/// periods skips to the grid's last tick before now, then goes on a period at a time
+#[test]
+fn refresh_times_keep_to_their_grid_under_a_late_wake() {
+    const PERIOD: u64 = 8_333_333;
+    let start = 1_000_000_000;
+    let mut grid = super::RefreshGrid::new(start);
+    // On time: the thread asks before the tick, and sleeps to it.
+    assert_eq!(grid.next(PERIOD, start + 10), start + PERIOD);
+    // Asked 400 us after that tick (it woke late, and the refresh took its time): the next is
+    // still a period after the tick, not after the wake.
+    assert_eq!(
+        grid.next(PERIOD, start + PERIOD + 400_000),
+        start + 2 * PERIOD
+    );
+    // Held 2.5 periods past the tick it slept to: no burst, the grid's last tick before now.
+    let now = start + 2 * PERIOD + 5 * PERIOD / 2;
+    assert_eq!(grid.next(PERIOD, now), start + 4 * PERIOD);
+    assert_eq!(grid.next(PERIOD, now + 1), start + 5 * PERIOD);
+    // A new mode's period runs from the last tick.
+    assert_eq!(
+        grid.next(2 * PERIOD, start + 5 * PERIOD),
+        start + 7 * PERIOD
+    );
+}
+
 /// A refresh shows the scanout where the host's log says the guest wrote it, asking for the
 /// scanout's range; `VBLANK` carries the refresh count while it is on; the host is told of each
 /// refresh

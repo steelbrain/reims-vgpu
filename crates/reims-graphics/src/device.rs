@@ -23,7 +23,8 @@
 //! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
 //! ([`Screen::mode`]): at each refresh it asks the host whether the guest wrote the scanout
 //! ([`Host::scanout_written`]) and has the screen show it where it did, sends `VBLANK` while the
-//! guest has it on (dropping one the completion ring has no room for), sends
+//! guest has it on, stamped with the refresh's time on its grid ([`RefreshGrid`]) as a panel's
+//! hardware stamps its vblank (dropping one the completion ring has no room for), sends
 //! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told, and then
 //! tells the host of the refresh ([`Host::refreshed`]), which answers there the presents the
 //! display first shows at it.
@@ -2045,23 +2046,20 @@ impl Shared {
         Post::Done
     }
 
-    /// The refresh thread (the module doc): a refresh at each period of the display's mode, on
-    /// the monotonic clock, a late one taken at once and the next a period after it.
+    /// The refresh thread (the module doc): a refresh at each tick of its grid
+    /// ([`RefreshGrid`]), stamped with the tick's time however late the thread woke for it.
     fn refresh_thread(&self) {
-        let mut next = now_ns();
+        let mut grid = RefreshGrid::new(now_ns());
         while !self.ending() {
-            let period = self.screen.mode().period_ns();
-            next = next.saturating_add(period);
             let now = now_ns();
-            if next > now {
-                std::thread::sleep(Duration::from_nanos(next - now));
-            } else {
-                next = now;
+            let tick = grid.next(self.screen.mode().period_ns(), now);
+            if tick > now {
+                std::thread::sleep(Duration::from_nanos(tick - now));
             }
             if self.ending() {
                 break;
             }
-            self.refresh(now_ns());
+            self.refresh(tick);
         }
     }
 
@@ -2109,6 +2107,33 @@ impl Shared {
             }
         }
         self.host.refreshed();
+    }
+}
+
+/// The times of a display's refreshes on the monotonic clock: each a period of the display's mode
+/// after the one before, as a panel's vblanks come, however late the refresh thread wakes for one.
+/// Where the next is past already (the thread was held over a period), the grid skips to its last
+/// tick not after now, so it keeps its phase and takes no refreshes in a burst.
+pub(crate) struct RefreshGrid {
+    /// The last tick's time.
+    last: u64,
+}
+
+impl RefreshGrid {
+    /// A grid whose ticks follow `start`.
+    pub(crate) fn new(start: u64) -> Self {
+        Self { last: start }
+    }
+
+    /// The next tick's time, `period` after the last, or the grid's last tick not after `now`
+    /// where that one is past.
+    pub(crate) fn next(&mut self, period: u64, now: u64) -> u64 {
+        let mut tick = self.last.saturating_add(period);
+        if tick <= now && period > 0 {
+            tick += (now - tick) / period * period;
+        }
+        self.last = tick;
+        tick
     }
 }
 
