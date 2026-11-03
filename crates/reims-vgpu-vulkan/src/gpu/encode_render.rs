@@ -1397,6 +1397,12 @@ fn matters(m: &Bound) -> bool {
     !matches!(m.kept, Kept::No) || m.dropped || m.refused.is_some()
 }
 
+/// Whether a slot's bind of `m` is held by the reach ([`Reach::bind_one`]): it lies in memory
+/// and decides something ([`matters`]). A slot bound to anything else is empty.
+fn slot_decides(m: &Bound) -> bool {
+    m.meets && matters(m)
+}
+
 /// Whether a draw's write through `m` is never sent where it lies on a surface whose GPU writes
 /// never reach its memory, or into a texture whose writes the runtime refuses
 /// ([`VulkanRenderEncoder::issues`]).
@@ -1414,7 +1420,7 @@ impl Reach {
         } else {
             &mut self.textures[stage]
         };
-        if !m.meets || !matters(&m) {
+        if !slot_decides(&m) {
             slots.remove(&slot);
         } else if slots.get(&slot) != Some(&m) {
             slots.insert(slot, m);
@@ -1885,6 +1891,27 @@ impl VulkanRenderEncoder {
         use crate::gpu::writes::{buffer_bind, texture_bind};
         let buffer = |b: Option<&VulkanBuffer>| b.map(|b| buffer_bind(b)).unwrap_or_default();
         let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bind(t)).unwrap_or_default();
+        // A bind into a reach that holds nothing ([`Reach::quiet`]) of objects that decide
+        // nothing there leaves it as it is: `bind_one` would empty slots already empty, and
+        // `used` keeps none of them. Most binds are such, of plain memory, a draw's among them,
+        // and they take no lock. The check reaches the runtime only through `buffer_bind` and
+        // `texture_bind`'s own calls, as the bind does, after the task's end is checked where
+        // `plain` checked it; one whose objects decide something binds as before.
+        stop_if_task_ended();
+        if self.quiet.load(Ordering::Acquire) {
+            let decides = match &bind {
+                Bind::Buffer(_, _, b) => slot_decides(&buffer(*b)),
+                Bind::Texture(_, _, t) => slot_decides(&texture(*t)),
+                Bind::Buffers(_, _, list) => list.iter().any(|&b| slot_decides(&buffer(b))),
+                Bind::Textures(_, _, list) => list.iter().any(|&t| slot_decides(&texture(t))),
+                Bind::Used(textures, buffers, write) => {
+                    *write && textures.iter().chain(buffers).any(matters)
+                }
+            };
+            if !decides {
+                return;
+            }
+        }
         plain(|| {
             let mut drawing = self.drawing.lock();
             let reach = &mut drawing.reach;
