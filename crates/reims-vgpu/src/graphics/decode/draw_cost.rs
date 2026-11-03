@@ -119,7 +119,7 @@ const SIDE: u64 = 512;
 
 /// This thread's CPU time in nanoseconds, the instructions it retired and its cycles, each as a
 /// count that only grows; the counters are 0 where the host gives none.
-fn counts() -> Counts {
+pub(super) fn counts() -> Counts {
     let mut at = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -136,7 +136,7 @@ fn counts() -> Counts {
 
 /// What [`counts`] answers, and the differences of two answers.
 #[derive(Debug, Clone, Copy, Default)]
-struct Counts([u64; 3]);
+pub(super) struct Counts(pub(super) [u64; 3]);
 
 impl std::ops::Sub for Counts {
     type Output = Counts;
@@ -154,7 +154,7 @@ impl std::ops::AddAssign for Counts {
 }
 
 /// The names of [`Counts`]' figures.
-const FIGURES: [&str; 3] = ["CPU ns", "instructions", "cycles"];
+pub(super) const FIGURES: [&str; 3] = ["CPU ns", "instructions", "cycles"];
 
 /// This thread's instructions and cycles: on macOS from the kernel's own per-thread counters
 /// (`thread_selfcounts`, which a process reads of its threads unprivileged).
@@ -321,7 +321,7 @@ fn command_buffer(shape: Shape, cb: usize, cb_obj_id: u64) -> Vec<u8> {
 }
 
 /// A function of the suite's fixture `name`.
-fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
+pub(super) fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/suite/fixtures/shaders")
         .join(format!("{name}.metallib"));
@@ -589,7 +589,7 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
 }
 
 /// The median, lowest and highest of `values`.
-fn spread(values: &mut [f64]) -> [f64; 3] {
+pub(super) fn spread(values: &mut [f64]) -> [f64; 3] {
     values.sort_by(f64::total_cmp);
     let n = values.len();
     let median = if n % 2 == 1 {

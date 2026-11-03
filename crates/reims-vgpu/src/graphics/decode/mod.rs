@@ -152,6 +152,8 @@ mod draw_cost;
 #[cfg(test)]
 mod fuzz;
 mod icb;
+#[cfg(test)]
+mod icb_slots_cost;
 mod lane;
 mod library;
 mod managed;
