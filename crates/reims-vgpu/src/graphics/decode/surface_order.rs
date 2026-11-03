@@ -341,7 +341,7 @@ impl<P: Platform> SurfaceOrder<P> {
         names: bool,
         cb: &P::CommandBuffer,
     ) -> RaiseResult<Option<Signalled>> {
-        let Some((event, marks)) = self.to_signal(device, queue, seqno, names) else {
+        let Some((event, marks)) = self.signal_due(device, queue, seqno, names) else {
             return Ok(None);
         };
         cb.encode_signal(Some(EventRef::Shared(&event)), seqno)?;
@@ -359,7 +359,7 @@ impl<P: Platform> SurfaceOrder<P> {
         seqno: u64,
         names: bool,
     ) -> Option<Release<P>> {
-        let (event, marks) = self.to_signal(device, queue, seqno, names)?;
+        let (event, marks) = self.signal_due(device, queue, seqno, names)?;
         self.counts.released += 1;
         Some(Release {
             event,
@@ -371,7 +371,7 @@ impl<P: Platform> SurfaceOrder<P> {
     /// Notes queue `queue`'s buffer at `seqno` taken; where it is to signal (it `names` the op, or
     /// a buffer of another queue waits past what the queue has signalled, and nothing after it
     /// signalled), the queue's timeline and marks, its signal counted in them.
-    fn to_signal(
+    fn signal_due(
         &mut self,
         device: &P::Device,
         queue: u64,

@@ -345,8 +345,8 @@ fn take(mut ops: &[u8]) -> Take {
             RGFX_OP_SUBMITTED => out.asks = true,
             RGFX_OP_SURFACE_ORDER if out.order.is_none() => {
                 let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
-                let waits = body
-                    .chunks_exact(size_of::<RgfxSurfaceOrderWait>())
+                let (waits, _) = body.as_chunks::<{ size_of::<RgfxSurfaceOrderWait>() }>();
+                let waits = (waits.iter())
                     .filter_map(|w| RgfxSurfaceOrderWait::read_from_bytes(w).ok())
                     .collect();
                 out.order = Some(waits);
