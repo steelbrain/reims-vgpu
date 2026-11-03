@@ -5,8 +5,11 @@
 //! **Whose a message is.** A command buffer names only objects of its own context (their ids
 //! carry the context's bits, which the decoder checks) and spans in blocks its context holds, on
 //! a queue of its context's, so the ring-0 messages it can depend on are its context's:
-//! - an object's (`QUEUE_CREATE` to `BUFFER_OVER_PAGES`): the context of the `obj_id` at offset 16,
-//!   which the kext posts only for the process that owns it;
+//! - an object's (every type from `QUEUE_CREATE` below `CONTEXT_CLOSE`): the context of the
+//!   `obj_id` at offset 16. The kext posts a `QUEUE_CREATE` only for the process that owns the
+//!   queue, and takes any other message of the range from a process only where that `obj_id` is
+//!   in the process's range (`RgfxSubmitGate.hpp`'s `rgfxSubmitAdmitted`), so a type the host
+//!   does not know there, which it refuses, is its sender's too;
 //! - a context's (`CONTEXT_CLOSE` to `SURFACE_PAGES`): the `context` at offset 16, which the kext
 //!   writes itself.
 //!
@@ -66,7 +69,7 @@ pub(super) fn whose(r#type: u32, field: Option<u64>) -> Whose {
         (RGFX_CMD_GET_DISPLAYS..=RGFX_CMD_PRESENT_SURFACE | RGFX_CMD_SURFACE_DOWNLOAD, _) => {
             Whose::NoOne
         }
-        (RGFX_CMD_QUEUE_CREATE..=RGFX_CMD_BUFFER_OVER_PAGES, Some(obj_id)) => {
+        (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_CONTEXT_CLOSE, Some(obj_id)) => {
             Whose::Context((obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32)
         }
         (RGFX_CMD_CONTEXT_CLOSE..=RGFX_CMD_SURFACE_PAGES, Some(field)) => {
@@ -183,12 +186,29 @@ mod tests {
 
     /// Each message is its context's, by its object's id or its context field, but a display
     /// command and a download, which are no buffer's, and anything else, which is every buffer's.
+    /// Every type the kext takes from a process by its object's id is its object's context's,
+    /// those after `BUFFER_OVER_PAGES` and one the host does not know among them.
     #[test]
     fn a_message_is_its_context_s_by_its_id_or_its_field() {
         let obj = |context: u64| Some((context << RGFX_CONTEXT_OBJ_ID_SHIFT) | 7);
         assert_eq!(whose(RGFX_CMD_QUEUE_CREATE, obj(5)), Whose::Context(5));
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, obj(6)), Whose::Context(6));
         assert_eq!(whose(RGFX_CMD_BUFFER_OVER_PAGES, obj(7)), Whose::Context(7));
+        for r#type in [
+            RGFX_CMD_ICB_CREATE,
+            RGFX_CMD_ICB_WRITE,
+            RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
+            RGFX_CMD_ICB_SLOTS,
+            RGFX_CMD_BUFFER_OVER_PAGES + 1,
+            RGFX_CMD_CONTEXT_CLOSE - 1,
+        ] {
+            assert_eq!(
+                whose(r#type, obj(8)),
+                Whose::Context(8),
+                "type {:#x}",
+                r#type
+            );
+        }
         // The `context` field, a u32, with the next field's bytes above it.
         let field = Some((0xdead_u64 << 32) | 9);
         for r#type in [
@@ -207,7 +227,8 @@ mod tests {
             assert_eq!(whose(r#type, field), Whose::NoOne);
         }
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, None), Whose::Every);
-        assert_eq!(whose(RGFX_CMD_BUFFER_OVER_PAGES + 1, obj(5)), Whose::Every);
+        assert_eq!(whose(RGFX_CMD_PRESENT_SURFACE + 1, obj(5)), Whose::Every);
+        assert_eq!(whose(RGFX_CMD_SURFACE_DOWNLOAD + 1, obj(5)), Whose::Every);
         assert_eq!(whose(RGFX_CMD_COMMAND_BUFFER, obj(5)), Whose::Every);
     }
 }

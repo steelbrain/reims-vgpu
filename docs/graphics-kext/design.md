@@ -822,9 +822,10 @@ before those.
 
 **A buffer's wait on ring 0.** A buffer names only its own context's objects
 and spans in blocks its context holds, so what it can depend on on ring 0 is
-its context's: a message about an object (`QUEUE_CREATE` to
-`BUFFER_OVER_PAGES`), whose id carries the context's bits, or one the kext
-posts for a context (`CONTEXT_CLOSE` to `SURFACE_PAGES`), which names it.
+its context's: a message about an object (every type from `QUEUE_CREATE` below
+`CONTEXT_CLOSE`, which the kext takes from a process only with an object id of
+the process's), whose id carries the context's bits, or one the kext posts for
+a context (`CONTEXT_CLOSE` to `SURFACE_PAGES`), which names it.
 Another process's surface reaches a buffer only through the share of its block
 the kext posts for the buffer's context before the process learns of the block:
 the share comes after the surface's `SURFACE_PAGES` and after every message the
@@ -843,6 +844,7 @@ ring 0 ahead of the control thread, each message once, and keep the count
 through each context's last message (`reims_graphics`'s `device::backlog`), so
 a buffer behind another process's backlog on ring 0 is decoded at once.
 Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
+`a_command_buffer_waits_for_no_other_process_s_later_object_messages`,
 `a_command_buffer_waits_for_its_process_s_creates_behind_another_s`,
 `a_command_buffer_waits_for_another_process_s_messages_before_its_share` and
 `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.

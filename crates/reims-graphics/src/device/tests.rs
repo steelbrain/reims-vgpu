@@ -977,7 +977,7 @@ impl Host for QueueTestHost {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         self.handed.lock().push(header.r#type);
         match header.r#type {
-            RGFX_CMD_BUFFER_CREATE => {
+            r#type if HELD.contains(&r#type) => {
                 while !self.gate.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -1632,6 +1632,53 @@ fn a_command_buffer_waits_for_its_process_s_creates_behind_another_s() {
             RGFX_CMD_COMMAND_BUFFER
         ]
     );
+}
+
+/// The ring-0 messages a [`QueueTestHost`] holds while its gate is shut: a buffer create, and the
+/// object messages past `BUFFER_OVER_PAGES`, a type the host does not know among them.
+const HELD: [u32; 6] = [
+    RGFX_CMD_BUFFER_CREATE,
+    RGFX_CMD_ICB_CREATE,
+    RGFX_CMD_ICB_WRITE,
+    RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
+    RGFX_CMD_ICB_SLOTS,
+    RGFX_CMD_BUFFER_OVER_PAGES + 1,
+];
+
+/// A command buffer waits for no object message of another process's past `BUFFER_OVER_PAGES`
+/// either: an indirect command buffer's create, write or slots, a Managed buffer placed in a heap,
+/// or a type the host does not know, each its object's context's, as the kext takes it from a
+/// process only with an object id of the process's. The buffer is decoded while the control thread
+/// is still in one published before it.
+#[test]
+fn a_command_buffer_waits_for_no_other_process_s_later_object_messages() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    for &kind in &HELD[1..] {
+        let seen = QueueTestSeen::new();
+        let mut rig = Rig::with_host(seen.host());
+        rig.start();
+        let seqno = send_queue_create(&mut rig, QUEUE);
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+        wait_queue_idle(&rig);
+
+        seen.gate.store(false, Ordering::SeqCst);
+        rig.send(object_message(kind, OTHER));
+        seen.wait("the message never reached the host", |seen| {
+            seen.handed.lock().last() == Some(&kind)
+        });
+        publish_command_buffer(&rig, QUEUE, 100, 1, true);
+        let done = first_queue_completion(&rig);
+        seen.gate.store(true, Ordering::SeqCst);
+        let done = done
+            .unwrap_or_else(|| panic!("held up by another process's message of type {kind:#x}"));
+        assert_eq!(done.cb_obj_id, 100);
+        assert_eq!(
+            *seen.handed.lock(),
+            vec![RGFX_CMD_QUEUE_CREATE, kind, RGFX_CMD_COMMAND_BUFFER],
+            "type {kind:#x}"
+        );
+    }
 }
 
 /// A command buffer waits for no `SURFACE_DOWNLOAD`: one published after a download, behind another
