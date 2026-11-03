@@ -20,8 +20,10 @@
 #include <sys/fcntl.h>
 #include <sys/vnode.h>
 
+#include "RgfxGate.hpp"
 #include "RgfxGatePrefs.hpp"
 #include "rgfx_gva_pref.h"
+#include "rgfx_match.h"
 
 namespace rgfxgate {
 
@@ -122,10 +124,28 @@ void keepVideoPreference() {
 			break;
 		}
 		{
-			int err = FileIO::writeBufferToFile(kGvaPrefPath, out, outLen,
+			// Write a temp sibling, then rename it over the file, so a torn write
+			// or a concurrent cfprefsd write never leaves AppleGVA a half-written
+			// plist. /Library/Preferences is not SIP-restricted, so the rename
+			// needs no hook (rgfxRenameNode, shared with the install's swap).
+			const char *what = found == 0 ? "edit" : "create";
+			char tmp[sizeof(kGvaPrefPath) + 8];
+			if (!rgfx_sibling_path(kGvaPrefPath, ".rgfxtmp", tmp, sizeof(tmp))) {
+				SYSLOG("rgfxgate", "AppleGVA preferences temp path too long; left");
+				break;
+			}
+			int err = FileIO::writeBufferToFile(tmp, out, outLen,
 			                                    O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, 0644);
-			SYSLOG("rgfxgate", "AppleGVA preferences %s %s (%d)", found == 0 ? "edit" : "create",
-			       err == 0 ? "written" : "FAILED", err);
+			if (err != 0) {
+				SYSLOG("rgfxgate", "AppleGVA preferences %s FAILED (%d)", what, err);
+				break;
+			}
+			vfs_context_t wctx = vfs_context_create(nullptr);
+			bool renamed = wctx != nullptr && rgfxRenameNode(tmp, kGvaPrefPath, false, wctx);
+			if (wctx != nullptr)
+				vfs_context_rele(wctx);
+			SYSLOG("rgfxgate", "AppleGVA preferences %s %s", what,
+			       renamed ? "written" : "rename FAILED; left");
 		}
 		break;
 	}
