@@ -9,8 +9,8 @@ stricter than the M3's, guests may rely on it.
 
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
-`oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler` and
-`oracle_icb`.
+`oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
+`oracle_icb` and `oracle_order`.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -628,6 +628,43 @@ compute commands add 5 into an output.
   zero; the lane's test of it,
   `a_command_naming_a_released_buffer_reads_zero_in_a_buffer_resident_for_writing`, waits
   ignored until it does.
+
+## Q16: the order of IOSurface accesses across queues and processes, and its records
+
+Probe: `oracle_order DEVICE xproc|xqueue|xqueue1 raw|war|waw` (11-03). A compute pass of about
+210 ms on the 5300M (610 ms on the 630, 55 ms on the M3) writes or reads a 1024 x 1024 R32Uint
+surface S; right after its commit, a blit over S is committed with `commitAndWaitUntilSubmitted`
+by another process (`xproc`), or by another queue of the same process through a texture of its
+own (`xqueue`) or the pass's texture (`xqueue1`). Every other round the pass runs over an unrelated
+surface instead, as a control. Times are from the blit's commit, over 3 rounds of each of the
+cases each GPU ran:
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `commitAndWaitUntilSubmitted` returns | 0.05 to 0.81 ms | 0.57 to 4.61 ms | 0.04 to 0.12 ms; 1.7 to 4.7 ms in a run's first round |
+| the blit's scheduled handler | 0.07 to 0.83 ms | 0.60 to 4.65 ms | 0.05 to 0.14 ms; 1.8 to 4.7 ms in the first |
+| status at the return | Committed; Scheduled in 2 rounds | Committed; Scheduled in 1 round | Committed |
+| another process's blit, read or write; another queue's write | completes after the pass (207 to 213 ms) | after the pass (609 to 760 ms) | writes after the pass (52 to 60 ms); another process's read as another queue's (next row) |
+| another queue's read of S after the pass's pending write | after the pass in 3 of 6 rounds; at 2.7 to 2.9 ms, reading S before the write, in the others | after it in 1 of 3, at 5.2 ms reading S before it in 2 | after it in each run's first round only, at 0.7 to 1.7 ms reading S before it in the others, from another process too |
+| the control rounds | complete at 0.8 to 2.9 ms | at 2.2 to 6.4 ms, or after the pass (the 630 runs other work in turn) | at 0.7 to 1.7 ms from another process; at 36 to 56 ms from another queue, after the pass |
+
+So a Mac orders such an access on the GPU alone *(class 3)*: the later command buffer is submitted
+and scheduled within a millisecond of its commit on AMD and the M3 (in 1.7 to 4.7 ms in the M3's
+first round of a run), and within the 630's usual 1 to 5 ms, whatever it is ordered behind, and then
+completes after the access it is ordered after. Our stack: the bundle names the order
+(`SURFACE_ORDER`, design.md "Surface order"), the host makes the later buffer wait on the GPU, and
+the wait holds back neither the buffer's `CB_SUBMITTED` nor its `CB_SCHEDULED`, which it posts at
+the buffer's commit, nor those of the buffers committed behind it on its queue (`cmdbuf.rs`,
+`Line`).
+
+**A divergence the lane does not use.** A read on another queue of the same process (on the M3, of
+another process too) is not always ordered after a pending write: on all three GPUs some rounds read
+S before the write, the first round of each run excepted *(class 2: how often differs)*. The probe
+commits the read right after the write's `commit`, which returns before Metal submits the write, so
+a read submitted first on its own queue may simply run first. Writes after a pending access were
+ordered in every round on all three, and so were reads across processes on the x86 GPUs, not on the
+M3. The lane orders all three cases on every queue pair: the read's wait is on the GPU and holds
+back no record, so the order costs the guest no time, and a guest that relies on it sees it kept.
 
 ## The display's colour against the stock lane: deliberate divergences
 

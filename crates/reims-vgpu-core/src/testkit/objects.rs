@@ -922,6 +922,9 @@ pub struct World {
     on_new: Mutex<Vec<(TypeId, Box<dyn Any + Send>)>>,
     /// The objects whose next release dies ([`World::die_at_release`]).
     release_dies: Mutex<Vec<ObjId>>,
+    /// Committed command buffers whose work the platform has not taken, in commit order, while
+    /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
+    held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -954,6 +957,7 @@ impl World {
             library_functions: Mutex::new(Vec::new()),
             on_new: Mutex::new(Vec::new()),
             release_dies: Mutex::new(Vec::new()),
+            held_submissions: Mutex::new(None),
         })
     }
 
@@ -1121,6 +1125,45 @@ impl World {
     /// The auto-complete mode.
     pub fn auto_complete(&self) -> Option<CompleteOn> {
         *self.auto_complete.lock()
+    }
+
+    /// From now until [`World::release_submissions`], a committed command buffer's work is not
+    /// taken at its commit: it stays `Committed`, its submission handlers, scheduled signals and
+    /// scheduled handlers wait, as a platform holds a buffer whose wait is not yet satisfied (the
+    /// Vulkan platform's wait for a shared event's value). Its completion is listed as at any
+    /// commit.
+    pub fn hold_submissions(&self) {
+        let mut held = self.held_submissions.lock();
+        if held.is_none() {
+            *held = Some(Vec::new());
+        }
+    }
+
+    /// Takes the work of every command buffer held since [`World::hold_submissions`], in commit
+    /// order, as a commit takes it, and takes each later buffer's at its commit again; how many
+    /// there were. One completed meanwhile ([`World::complete`]) was failed before the platform
+    /// took it, and runs no submission handler.
+    pub fn release_submissions(&self) -> usize {
+        let held = self.held_submissions.lock().take().unwrap_or_default();
+        for cb in &held {
+            let completed = matches!(&cb.state.lock().model, Model::CommandBuffer(m)
+                if m.status.raw() >= CommandBufferStatus::COMPLETED.raw());
+            if !completed {
+                submit_obj(cb);
+            }
+        }
+        held.len()
+    }
+
+    /// Whether `cb`, just committed, is held ([`World::hold_submissions`]), listed if so.
+    fn holds_submission(&self, cb: &Arc<FakeObj>) -> bool {
+        match self.held_submissions.lock().as_mut() {
+            Some(held) => {
+                held.push(Arc::clone(cb));
+                true
+            }
+            None => false,
+        }
     }
 
     /// The names `functionNames` returns and the fake's libraries list.
@@ -1370,8 +1413,24 @@ pub fn complete_obj(
 }
 
 /// `commit`'s model: its submission handlers run, then Scheduled at once, the scheduled signals
-/// applied, the buffer listed for completion (or completed at once under auto-complete).
+/// applied, the buffer listed for completion (or completed at once under auto-complete). While
+/// submissions are held ([`World::hold_submissions`]) it is only listed for completion, and the
+/// rest waits for [`World::release_submissions`].
 pub fn commit_obj(cb: &Arc<FakeObj>) {
+    if cb.world.holds_submission(cb) {
+        cb.world.note_committed(cb);
+        return;
+    }
+    submit_obj(cb);
+    cb.world.note_committed(cb);
+    if let Some(on) = cb.world.auto_complete() {
+        complete_obj(cb, CommandBufferStatus::COMPLETED, None, on);
+    }
+}
+
+/// The platform takes a committed buffer's work: its submission handlers run, then Scheduled, the
+/// scheduled signals applied and its scheduled handlers run.
+fn submit_obj(cb: &Arc<FakeObj>) {
     // Its submission handlers, before it reads `Scheduled`.
     let submission = {
         let mut s = cb.state.lock();
@@ -1401,10 +1460,6 @@ pub fn commit_obj(cb: &Arc<FakeObj>) {
         h();
     }
     cb.cv.notify_all();
-    cb.world.note_committed(cb);
-    if let Some(on) = cb.world.auto_complete() {
-        complete_obj(cb, CommandBufferStatus::COMPLETED, None, on);
-    }
 }
 
 /// Blocks (on the virtual clock's untimed wait) until the buffer's status reaches `at_least`.

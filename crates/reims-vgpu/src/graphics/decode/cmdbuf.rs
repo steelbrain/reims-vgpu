@@ -25,9 +25,11 @@
 //! buffer, the buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer
 //! that waits on an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7).
 //! The host posts it as soon as it takes a buffer that waits for no event, needs no fill of a
-//! device cache, waits for no buffer of another queue ([`super::surface_order`]) and has none
-//! before it on its queue that waits for one and is not yet scheduled ([`Held`]), before it walks
-//! the buffer's ops ([`Take`]): its ticket in the commit order is
+//! device cache and has none before it on its queue that waits for one and is not yet scheduled
+//! ([`Held`]), before it walks the buffer's ops ([`Take`]); a GPU wait for a buffer of another
+//! queue ([`super::surface_order`]) holds back neither its `CB_SUBMITTED` nor its `CB_SCHEDULED`,
+//! which then goes at its commit ([`Line`]), as a Mac's order of IOSurface accesses holds back no
+//! record (Q16). Its ticket in the commit order is
 //! issued first ([`super::sequencer`]), so every command buffer the guest sends after it, on any
 //! queue, is committed after the buffer's commit, and the platform orders the guest's later work
 //! after it as it orders by commit. A buffer whose walk then faults has its failure at its completion, as
@@ -65,6 +67,7 @@
 //! ([`GraphicsDecoder::stand_in_for_failed`]), whose completion posts the buffer's
 //! failure in the queue's order, with the shared event values it signals ahead of it.
 
+use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -184,6 +187,95 @@ impl Scheduled {
             *posted = true;
         }
     }
+
+    /// Whether the record is posted.
+    fn is_posted(&self) -> bool {
+        *self.posted.lock()
+    }
+}
+
+/// A committed command buffer's records in its queue's [`Line`]: its `CB_SUBMITTED`, where it asks
+/// for one, and its `CB_SCHEDULED`.
+type Records = (Option<Arc<Submitted>>, Arc<Scheduled>);
+
+/// A queue's committed command buffers whose `CB_SCHEDULED` the host may post at their commit,
+/// ahead of the platform's submission, and how many of them wait on the GPU for a buffer of another
+/// queue ([`super::surface_order`]).
+///
+/// That wait is an order on the GPU, as a Mac's order of IOSurface accesses across queues and
+/// processes is, and a Mac holds back no record for it: a buffer the GPU runs after another
+/// process's or queue's 210 ms pass over the same surface returns from
+/// `commitAndWaitUntilSubmitted` in 0.05 to 0.81 ms and is scheduled by 0.83 ms on the 5300M (0.57
+/// to 4.65 ms on the 630; 0.04 to 0.14 ms on the M3, 1.7 to 4.7 ms in a run's first round), and
+/// completes after the pass (docs/graphics-kext/dgpu-oracle.md, Q16). The platform may still hold
+/// the buffer until the buffer it waits for finishes (the Vulkan platform holds a wait on a shared
+/// event on the host until its value is reached), and the buffers behind it on its queue with it.
+/// So such a buffer gets its `CB_SUBMITTED` at its take, as one that waits for nothing does, and
+/// its `CB_SCHEDULED` at its commit; so does every buffer of its queue committed while one of them
+/// is not yet taken by the platform. A buffer that waits for an event, or for the host's fill of a
+/// device cache, or is behind one on its queue, keeps its records at its scheduling ([`Held`]).
+///
+/// The records of a queue go in its commit order: a buffer whose records go at its commit first
+/// posts those of every buffer committed before it on its queue not yet posted, whose order on the
+/// queue is fixed and none of which waits for anything by then ([`Line::post_through`]).
+#[derive(Default)]
+pub(crate) struct Line {
+    /// The committed buffers' records not seen posted, oldest first.
+    line: Mutex<VecDeque<Records>>,
+    /// How many committed buffers of the queue that wait on the GPU for a buffer of another queue
+    /// the platform has not yet taken.
+    ordered: Arc<AtomicUsize>,
+}
+
+impl Line {
+    /// How many committed buffers of the queue that wait on the GPU for a buffer of another queue
+    /// the platform has not yet taken.
+    #[cfg(test)]
+    pub(crate) fn ordered(&self) -> usize {
+        self.ordered.load(Ordering::Acquire)
+    }
+
+    /// Whether a buffer committed now posts its records at its commit, having none of its own
+    /// order: one before it on its queue waits on the GPU for a buffer of another queue and is not
+    /// yet taken by the platform, which takes this one after it.
+    fn behind_an_order(&self) -> bool {
+        self.ordered.load(Ordering::Acquire) > 0
+    }
+
+    /// The count of the queue's ordered buffers not yet taken by the platform, as a hold that
+    /// leaves it once, for a buffer that waits on the GPU for a buffer of another queue.
+    fn ordered_hold(&self) -> Arc<Held> {
+        Arc::new(Held {
+            queue: Arc::clone(&self.ordered),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// Notes the records of a buffer just committed, last in the queue's commit order. Those at
+    /// the front already posted (by their submission or completion handlers) leave.
+    fn committed(&self, submitted: Option<Arc<Submitted>>, scheduled: Arc<Scheduled>) {
+        let mut line = self.line.lock();
+        while line.front().is_some_and(|(_, s)| s.is_posted()) {
+            line.pop_front();
+        }
+        line.push_back((submitted, scheduled));
+    }
+
+    /// Posts, in commit order, the records of every buffer up to and including `last` (one
+    /// [`Self::committed`] noted), each `CB_SUBMITTED` ahead of its `CB_SCHEDULED`, and lets them
+    /// leave. Posted at most once each, whoever posts them.
+    fn post_through(&self, last: &Arc<Scheduled>) {
+        let mut line = self.line.lock();
+        while let Some((submitted, scheduled)) = line.pop_front() {
+            if let Some(submitted) = &submitted {
+                submitted.post();
+            }
+            scheduled.post();
+            if Arc::ptr_eq(&scheduled, last) {
+                break;
+            }
+        }
+    }
 }
 
 /// The most command buffers a queue may hold made and not completed for its next to be answered
@@ -251,6 +343,10 @@ pub(crate) struct Begun<P: Platform> {
     order: bool,
     /// Its queue's marks in the surface order.
     marks: Arc<Marks>,
+    /// It waits on the GPU for a buffer of another queue that has not finished.
+    waits_for_order: bool,
+    /// Its queue's records the host may post at their commit.
+    line: Arc<Line>,
     /// Its `CB_SUBMITTED`, where it asks for one.
     submitted: Option<Arc<Submitted>>,
     /// Its hold of its queue, where it waits.
@@ -265,9 +361,10 @@ pub(crate) struct Begun<P: Platform> {
 }
 
 impl<P: Platform> Begun<P> {
-    /// Its `CB_SUBMITTED`, where it gets it at its take: it asks for one, waits for nothing (no
-    /// event, no fill of a device cache), and no buffer before it on its queue holds the queue.
-    /// Any other gets it at its scheduling.
+    /// Its `CB_SUBMITTED`, where it gets it at its take: it asks for one, waits for no event and
+    /// no fill of a device cache (a GPU wait for a buffer of another queue holds back nothing,
+    /// [`Line`]), and no buffer before it on its queue holds the queue. Any other gets it at its
+    /// scheduling.
     pub(crate) fn submitted_at_take(&self) -> Option<&Arc<Submitted>> {
         (self.submitted.as_ref()).filter(|_| self.held.is_none() && !self.behind)
     }
@@ -288,10 +385,13 @@ fn commit_holding<C: CommandBuffer<P>, P: Platform>(
     committed
 }
 
-/// A command buffer that waits for an event, counted in its queue's hold ([`QueueCounts`]'s
-/// `held`) from its begin until it is scheduled, or else finishes, or goes uncommitted.
+/// A command buffer's place in a count of its queue's: one that waits for an event, counted in its
+/// queue's hold ([`QueueCounts`]'s `held`) from its begin until it is scheduled, or else finishes,
+/// or goes uncommitted; or one that waits on the GPU for a buffer of another queue, counted in its
+/// queue's [`Line`] from its commit until the platform takes it (its submission handler), or else
+/// it finishes.
 struct Held {
-    /// Its queue's count of such buffers not yet scheduled.
+    /// The queue's count of such buffers not yet taken.
     queue: Arc<AtomicUsize>,
     /// Whether it has left the count.
     released: AtomicBool,
@@ -660,6 +760,37 @@ fn signalling(handler: CompletedHandler, signalled: Option<Signalled>) -> Comple
     }
 }
 
+/// `handler`, a command buffer's submission handler, which first lets the buffer's place among its
+/// queue's ordered buffers go where it holds one ([`Line`]); `None` where neither has anything to
+/// do.
+fn taken_with(
+    handler: Option<ScheduledHandler>,
+    ordered: Option<Arc<Held>>,
+) -> Option<ScheduledHandler> {
+    let Some(ordered) = ordered else {
+        return handler;
+    };
+    Some(Box::new(move || {
+        ordered.release();
+        if let Some(handler) = handler {
+            handler();
+        }
+    }))
+}
+
+/// `handler`, a command buffer's completion handler, which first lets the buffer's place among its
+/// queue's ordered buffers go where it holds one and its submission handler did not run
+/// ([`Line`]).
+fn completed_with(handler: CompletedHandler, ordered: Option<Arc<Held>>) -> CompletedHandler {
+    match ordered {
+        None => handler,
+        Some(ordered) => Box::new(move |info: CompletedInfo| {
+            ordered.release();
+            handler(info);
+        }),
+    }
+}
+
 /// The encoder the walk currently holds open, one at a time, between an
 /// `ENCODER_BEGIN_*` and the matching `ENCODER_END`.
 enum OpenEncoder<P: Platform> {
@@ -825,7 +956,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
     /// (filling each that holds an older generation), has it wait on the GPU for the buffers of
     /// other queues its `SURFACE_ORDER` names that have not finished, and makes its
-    /// `CB_SUBMITTED` and its hold of its queue ([`Begun`]).
+    /// `CB_SUBMITTED` and, where it waits for an event or a fill, its hold of its queue
+    /// ([`Begun`]).
     pub(crate) fn begin_command_buffer(
         &self,
         device: &P::Device,
@@ -876,10 +1008,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             None => Vec::new(),
         };
-        let order_held = !order_waits.is_empty();
+        let waits_for_order = !order_waits.is_empty();
         *self.order_waits.borrow_mut() = order_waits;
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
-        let (behind, held) = hold(counts, fill_waits || take.waits || order_held);
+        // Those GPU waits hold back none of its records, nor its queue ([`Line`]).
+        let (behind, held) = hold(counts, fill_waits || take.waits);
         Ok(Ok(Begun {
             queue_obj_id: m.queue_obj_id,
             cb_obj_id: m.cb_obj_id,
@@ -890,6 +1023,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             uses,
             order: take.order.is_some(),
             marks: Arc::clone(&counts.order),
+            waits_for_order,
+            line: Arc::clone(&counts.line),
             submitted,
             held,
             behind,
@@ -918,8 +1053,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             uses,
             order,
             marks,
+            waits_for_order,
+            line,
             submitted,
             held,
+            behind,
             drain,
             ordered,
             ..
@@ -944,7 +1082,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         // handler, so the platform posts the buffer's records from the threads that submit it
         // and see it complete, waking no handler thread.
         let scheduled = self.scheduled(cb_obj_id, seqno);
+        // Its records go at its commit where the platform may hold it, or a buffer before it on
+        // its queue, for a buffer of another queue on the GPU ([`Line`]); else at its scheduling.
+        let early = held.is_none() && !behind && (waits_for_order || line.behind_an_order());
+        let order_hold = waits_for_order.then(|| line.ordered_hold());
+        let noted = scheduled.clone().map(|s| (submitted.clone(), s));
         let submission = submission_handler(submitted.clone(), held.clone(), scheduled.clone());
+        let submission = taken_with(submission, order_hold.clone());
         let handler = self.completed_handler(
             cb_obj_id,
             seqno,
@@ -954,12 +1098,22 @@ impl<P: Platform> GraphicsDecoder<P> {
             (submitted, held.clone(), scheduled),
         );
         let handler = signalling(handler, signalled);
+        let handler = completed_with(handler, order_hold.clone());
         let commit = || {
             if let Some(submission) = submission {
                 cb.add_submission_handler(ON, submission)?;
             }
             cb.add_completion_seen_handler(ON, leaving(handler, in_flight))?;
-            commit_holding(&cb, held.as_deref())
+            if let Some(order_hold) = &order_hold {
+                order_hold.queue.fetch_add(1, Ordering::AcqRel);
+            }
+            let committed = commit_holding(&cb, held.as_deref());
+            if committed.is_err()
+                && let Some(order_hold) = &order_hold
+            {
+                order_hold.release();
+            }
+            committed
         };
         // After every buffer answered `CB_SUBMITTED` before its begin, and its context's range
         // messages before it ([`Self::wait_to_commit`]).
@@ -975,6 +1129,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         // Committed: a buffer behind it in the commit order goes on.
         self.ticket.borrow_mut().take();
+        // Last in its queue's order: its records, and those before it, go now where they go at
+        // its commit.
+        if let Some((submitted, scheduled)) = noted {
+            line.committed(submitted, Arc::clone(&scheduled));
+            if early {
+                line.post_through(&scheduled);
+            }
+        }
         Ok(Ok(()))
     }
 
@@ -3565,6 +3727,182 @@ mod tests {
     fn on_vulkan_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
         let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::VulkanPlatform>();
         assert!(!early, "answered as submitted while its queue was held");
+        assert!(bytes.iter().all(|&b| b == 0x5a));
+    }
+
+    /// Through the decoder on `P`: buffer A of queue 1, which holds the surface order, waits for
+    /// a shared event the CPU sets 100 ms on, then fills a tracked buffer; buffer B of queue 2
+    /// names A in its surface order, asks for its submission and copies the buffer out. The
+    /// records of B posted by the time its decode returned, whether B was still unfinished 100 ms
+    /// on, the order of the completions, and the bytes B copied.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
+    fn an_order_behind_a_held_buffer<P: crate::platform::ApiPlatform>()
+    -> (Vec<u32>, bool, Vec<u64>, Vec<u8>) {
+        use std::time::{Duration, Instant};
+
+        use reims_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
+            RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
+        };
+        use reims_graphics::wire::RgfxSharedEventSetValue;
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        const LEN: u64 = 1 << 20;
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        // B's records, and every completion.
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&records);
+        dec.set_submitted_sink(Arc::new(move |m| {
+            if m.cb_obj_id == 21 {
+                sink.lock().push(m.header.r#type);
+            }
+        }));
+        let sink = Arc::clone(&records);
+        dec.set_scheduled_sink(Arc::new(move |m| {
+            if m.cb_obj_id == 21 {
+                sink.lock().push(m.header.r#type);
+            }
+        }));
+        let sink = Arc::clone(&completed);
+        dec.set_completion_sink(Arc::new(move |m| sink.lock().push(m.cb_obj_id)));
+        for obj_id in [1, 2] {
+            let queue = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: size_of::<RgfxQueueCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                ..RgfxQueueCreate::default()
+            };
+            assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        }
+        for obj_id in [10, 11] {
+            let buffer = RgfxBufferCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_BUFFER_CREATE,
+                    size: size_of::<RgfxBufferCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                length: LEN,
+                ..RgfxBufferCreate::default()
+            };
+            assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        }
+        let event = RgfxSharedEventCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                size: size_of::<RgfxSharedEventCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 7,
+            initial_value: 0,
+        };
+        assert_eq!(dec.decode(&device, event.as_bytes()).unwrap(), Ok(()));
+        let order = |waits: &[RgfxSurfaceOrderWait]| op(RGFX_OP_SURFACE_ORDER, waits.as_bytes());
+
+        let mut ops = order(&[]);
+        ops.extend(event_op(RGFX_OP_WAIT_EVENT, 7, 1));
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        let fill = RgfxBlitOpFillBuffer {
+            buffer_obj_id: 10,
+            range_location: 0,
+            range_length: LEN,
+            value: 0x5a,
+            ..RgfxBlitOpFillBuffer::default()
+        };
+        ops.extend(op(RGFX_OP_BLIT_FILL_BUFFER, fill.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let a = command_buffer_on(1, 20, &ops);
+        assert_eq!(dec.decode(&device, &a).unwrap(), Ok(()));
+
+        let mut ops = order(&[RgfxSurfaceOrderWait {
+            queue_obj_id: 1,
+            seqno: 20,
+        }]);
+        ops.extend(op(RGFX_OP_SUBMITTED, &[]));
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        let copy = RgfxBlitOpCopyBufferToBuffer {
+            source_buffer_obj_id: 10,
+            destination_buffer_obj_id: 11,
+            source_offset: 0,
+            destination_offset: 0,
+            size: LEN,
+        };
+        ops.extend(op(RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, copy.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let b = command_buffer_on(2, 21, &ops);
+        assert_eq!(dec.decode(&device, &b).unwrap(), Ok(()));
+        let posted = records.lock().clone();
+        std::thread::sleep(Duration::from_millis(100));
+        let waited = !completed.lock().contains(&21);
+        let set = RgfxSharedEventSetValue {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_SET_VALUE,
+                size: size_of::<RgfxSharedEventSetValue>() as u32,
+                seqno: 0,
+            },
+            obj_id: 7,
+            value: 1,
+        };
+        assert_eq!(dec.decode(&device, set.as_bytes()).unwrap(), Ok(()));
+        let start = Instant::now();
+        while !completed.lock().contains(&21) || !completed.lock().contains(&20) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "A or B never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let Some(ObjHandle::Buffer(out)) = dec.object(11) else {
+            panic!("no buffer 11");
+        };
+        // SAFETY: a Shared buffer of `LEN` bytes, read after the command buffer that wrote it
+        // finished.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), LEN as usize) };
+        let completed = completed.lock().clone();
+        (posted, waited, completed, bytes.to_vec())
+    }
+
+    /// On Metal, a command buffer that waits on the GPU for a buffer of another queue the
+    /// platform holds is answered as submitted and scheduled as its commit returns, as a Mac
+    /// answers a buffer it orders after another queue's access to an IOSurface
+    /// (docs/graphics-kext/dgpu-oracle.md, Q16), and still runs after that buffer: it completes
+    /// after it and copies what it wrote.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_an_order_behind_a_held_buffer_holds_back_no_record() {
+        let (posted, waited, completed, bytes) =
+            an_order_behind_a_held_buffer::<reims_vgpu_metal::MetalPlatform>();
+        assert_eq!(posted, [RGFX_EVT_CB_SUBMITTED, RGFX_EVT_CB_SCHEDULED]);
+        assert!(waited, "B ran before the buffer it names");
+        assert_eq!(completed, [20, 21]);
+        assert!(bytes.iter().all(|&b| b == 0x5a));
+    }
+
+    /// The same on the Vulkan platform, which holds a wait for a shared event's value on the host
+    /// until it is reached (`on_metal_an_order_behind_a_held_buffer_holds_back_no_record`). B
+    /// still runs after A, copying what A wrote; the order in which the runtime reports the two
+    /// queues' completions is its own: on MoltenVK on the M3 Max it reported B's before A's in 20
+    /// runs of 20, with B's records held back to its scheduling as with them posted at its commit.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_an_order_behind_a_held_buffer_holds_back_no_record() {
+        let (posted, waited, mut completed, bytes) =
+            an_order_behind_a_held_buffer::<reims_vgpu_vulkan::VulkanPlatform>();
+        assert_eq!(posted, [RGFX_EVT_CB_SUBMITTED, RGFX_EVT_CB_SCHEDULED]);
+        assert!(waited, "B ran before the buffer it names");
+        completed.sort_unstable();
+        assert_eq!(completed, [20, 21]);
         assert!(bytes.iter().all(|&b| b == 0x5a));
     }
 

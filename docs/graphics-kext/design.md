@@ -1736,6 +1736,19 @@ committed in. The bundle names the order instead, as it commits:
   whose order is its ring's. A queue the host does not hold, or a seqno past
   every one the queue's ring has published, names no buffer and waits for
   nothing.
+- The wait is an order on the GPU and nothing more, as a Mac's is: a Mac answers
+  a command buffer it runs after another queue's or process's pending access to
+  a surface submitted and scheduled within a millisecond of its commit (the 630,
+  and the M3 in a run's first round, within 1 to 5 ms), and completes it after
+  that access (dgpu-oracle.md, Q16). So the wait holds back none of the buffer's
+  records, nor its queue: it gets its `CB_SUBMITTED` at its take, as a buffer
+  that waits for nothing does, and its `CB_SCHEDULED` at its commit, though the
+  platform may hold it until the buffer it waits for finishes (the Vulkan
+  platform holds a wait for a shared event's value on the host until it is
+  reached). So does every buffer committed behind it on its queue while the
+  platform holds it, and each buffer's records still go in its queue's order. A
+  buffer that waits for an event, or for the host's fill of a device cache, or
+  is behind one, keeps its records at its scheduling.
 - Work the host starts off a buffer's own GPU timeline waits for the same
   buffers on the CPU first: a video session's decode runs on a queue of its own
   as the host walks the buffer, so its output lands only after the reads and

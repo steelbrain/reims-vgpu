@@ -57,6 +57,9 @@ pub(crate) struct QueueCounts {
     /// Its marks in the surface order, which a command buffer that holds no op reads and writes
     /// with no lock ([`super::surface_order::Marks`]).
     pub(crate) order: Arc<super::surface_order::Marks>,
+    /// Its committed command buffers' records the host may post ahead of the platform's
+    /// submission, in commit order ([`super::cmdbuf::Line`]).
+    pub(crate) line: Arc<super::cmdbuf::Line>,
     /// Where its command buffers' walks and commits run, each in its turn; `None` for a queue
     /// whose buffers are carried out whole where they are taken (the decoder's own tests).
     pub(crate) lane: Option<Arc<Lane>>,
@@ -74,6 +77,7 @@ impl QueueCounts {
             held: Arc::default(),
             in_flight: Arc::default(),
             order,
+            line: Arc::default(),
             lane: Some(lane),
             answered: Mutex::default(),
         }

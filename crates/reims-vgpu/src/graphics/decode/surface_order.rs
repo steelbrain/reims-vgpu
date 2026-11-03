@@ -11,9 +11,10 @@
 //!
 //! - **No wait where none is needed.** A named buffer of the buffer's own queue is in its ring's
 //!   order already. One the host has seen finish (its completed handler raised the queue's
-//!   `done`) is a compare. Only the rest are GPU waits; a buffer with one is held as one that waits
-//!   for an event is (`cmdbuf`'s `Held`). Two buffers that share no surface never wait for each
-//!   other, since neither names the other.
+//!   `done`) is a compare. Only the rest are GPU waits, which hold back none of the buffer's
+//!   records, nor its queue: it gets its `CB_SUBMITTED` at its take and its `CB_SCHEDULED` at its
+//!   commit, as a Mac's order of IOSurface accesses holds back none (`cmdbuf`'s `Line`). Two
+//!   buffers that share no surface never wait for each other, since neither names the other.
 //! - **A buffer that holds no op pays nothing** but two atomic operations on its own queue's
 //!   [`Marks`], with no lock: it notes itself taken, and signals only where a buffer of another
 //!   queue waits past what its queue signalled ([`Marks::quiet`]).
@@ -536,13 +537,18 @@ impl<P: Platform> super::GraphicsDecoder<P> {
 mod tests {
     use std::sync::Arc;
 
+    use std::sync::atomic::Ordering;
+
     use reims_graphics::ops::{
-        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SURFACE_ORDER, RgfxCommandBuffer, RgfxOpHeader,
+        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
+        RgfxCommandBuffer, RgfxOpHeader,
     };
     use reims_graphics::wire::{
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-        RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
+        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_CB_SUBMITTED, RgfxMsgHeader, RgfxObjectDestroy,
+        RgfxQueueCreate,
     };
+    use reims_vgpu_core::sync::Mutex;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use reims_vgpu_core::testkit::{FakePlatform, Step};
@@ -625,7 +631,7 @@ mod tests {
                 seqno,
             },
             queue_obj_id: queue,
-            cb_obj_id: queue + 0x100 + seqno,
+            cb_obj_id: cb(queue, seqno),
             op_bytes: ops.len() as u64,
         };
         let mut message = m.as_bytes().to_vec();
@@ -885,5 +891,287 @@ mod tests {
         assert!(!ready(&r, &[(A, 2)]), "nor finished");
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(ready(&r, &[(A, 2)]));
+    }
+
+    /// The records the rig's decoder posted, in order: each one's type and buffer.
+    type Posted = Arc<Mutex<Vec<(u32, u64)>>>;
+
+    /// Has the rig's decoder post its `CB_SUBMITTED`, `CB_SCHEDULED` and `CB_COMPLETE` records
+    /// into one list, in the order posted.
+    fn posting(r: &mut Rig) -> Posted {
+        let posted: Posted = Arc::default();
+        let sink = Arc::clone(&posted);
+        r.dec.set_submitted_sink(Arc::new(move |m| {
+            sink.lock().push((m.header.r#type, m.cb_obj_id))
+        }));
+        let sink = Arc::clone(&posted);
+        r.dec.set_scheduled_sink(Arc::new(move |m| {
+            sink.lock().push((m.header.r#type, m.cb_obj_id))
+        }));
+        let sink = Arc::clone(&posted);
+        r.dec.set_completion_sink(Arc::new(move |m| {
+            sink.lock().push((m.header.r#type, m.cb_obj_id))
+        }));
+        posted
+    }
+
+    /// A `SUBMITTED` op: the buffer asks for its `CB_SUBMITTED`.
+    fn asks() -> Vec<u8> {
+        let header = RgfxOpHeader {
+            tag: RGFX_OP_SUBMITTED,
+            flags: 0,
+            len: 8,
+        };
+        header.as_bytes().to_vec()
+    }
+
+    /// The id the rig's [`message`] gives queue `queue`'s buffer at `seqno`.
+    fn cb(queue: u64, seqno: u64) -> u64 {
+        queue + 0x100 + seqno
+    }
+
+    /// Of `posted`, the records of the buffers `cbs`, in order.
+    fn of(posted: &Posted, cbs: &[u64]) -> Vec<(u32, u64)> {
+        (posted.lock().iter())
+            .filter(|(_, c)| cbs.contains(c))
+            .copied()
+            .collect()
+    }
+
+    /// A buffer that waits on the GPU for a buffer of another queue holds back none of its
+    /// records, nor its queue, as a Mac's order over IOSurfaces holds back none (Q16 of
+    /// docs/graphics-kext/dgpu-oracle.md): with the platform holding every buffer (as the Vulkan
+    /// platform holds a wait for a shared event's value), it gets its `CB_SUBMITTED` at its take
+    /// and its `CB_SCHEDULED` at its commit, after those of the buffer committed before it on its
+    /// queue, and so does the buffer after it; its GPU wait stays, and the completions keep their
+    /// order. Once the platform takes them, nothing is posted twice, and a later buffer's records
+    /// go at its scheduling again
+    #[test]
+    fn an_order_on_the_gpu_holds_back_no_record() {
+        use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
+        const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
+        const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
+        const DONE: u32 = RGFX_EVT_CB_COMPLETE;
+        let mut r = rig();
+        let posted = posting(&mut r);
+        r.p.world().hold_submissions();
+        let (p, x, o, c) = (cb(B, 1), cb(A, 5), cb(B, 2), cb(B, 3));
+
+        let (outcome, _) = r.commit(B, 1, &ops(None, &asks()));
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            of(&posted, &[p]),
+            [(SUB, p)],
+            "at its take; scheduled once taken"
+        );
+        let (_, _) = r.commit(A, 5, &ops(Some(&[]), &[]));
+        assert!(of(&posted, &[x]).is_empty(), "A's: once taken");
+
+        let (outcome, calls) = r.commit(B, 2, &ops(Some(&[(A, 5)]), &asks()));
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            events(&calls, WAIT),
+            [(r.event(A), 5)],
+            "the GPU wait stays"
+        );
+        assert_eq!(
+            of(&posted, &[p, o]),
+            [(SUB, p), (SUB, o), (SCHED, p), (SCHED, o)],
+            "its records at its take and its commit, its queue's earlier one's first"
+        );
+        let (held, line) = r
+            .dec
+            .queue_counts(B)
+            .map(|c| (Arc::clone(&c.held), Arc::clone(&c.line)))
+            .unwrap();
+        assert_eq!(held.load(Ordering::Acquire), 0, "it holds no queue");
+        let (_, _) = r.commit(B, 3, &ops(None, &asks()));
+        assert_eq!(
+            of(&posted, &[c]),
+            [(SUB, c), (SCHED, c)],
+            "the next one, behind it on the platform"
+        );
+
+        assert_eq!(r.p.world().release_submissions(), 4);
+        assert_eq!(of(&posted, &[x]), [(SCHED, x)], "A's at its scheduling");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            of(&posted, &[p, o, c]),
+            [
+                (SUB, p),
+                (SUB, o),
+                (SCHED, p),
+                (SCHED, o),
+                (SUB, c),
+                (SCHED, c),
+                (DONE, p),
+                (DONE, o),
+                (DONE, c)
+            ],
+            "posted once each, the completions in their order"
+        );
+        assert_eq!(line.ordered(), 0);
+
+        // Nothing of B's waits for another queue now: a buffer's scheduling is the platform's.
+        r.p.world().hold_submissions();
+        let d = cb(B, 4);
+        let (_, _) = r.commit(B, 4, &ops(Some(&[(A, 5)]), &asks()));
+        assert_eq!(
+            of(&posted, &[d]),
+            [(SUB, d)],
+            "A's finished: scheduled once taken"
+        );
+        r.p.world().release_submissions();
+        assert_eq!(of(&posted, &[d]), [(SUB, d), (SCHED, d)]);
+    }
+
+    /// A buffer that waits for a guest's event still holds its queue as it did beside the surface
+    /// order: it gets its `CB_SUBMITTED` and `CB_SCHEDULED` at its scheduling, and a buffer behind
+    /// it that waits on the GPU for a buffer of another queue gets them after it, at its own
+    /// scheduling, not at its commit
+    #[test]
+    fn an_event_wait_still_holds_its_queue_beside_an_order() {
+        use reims_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+        use reims_graphics::wire::{
+            RGFX_CMD_SHARED_EVENT_CREATE, RGFX_EVT_CB_SCHEDULED, RgfxSharedEventCreate,
+        };
+        const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
+        const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
+        let mut r = rig();
+        let posted = posting(&mut r);
+        let event = 2 << RGFX_CONTEXT_OBJ_ID_SHIFT | 7;
+        let create = RgfxSharedEventCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                size: size_of::<RgfxSharedEventCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: event,
+            initial_value: 0,
+        };
+        r.dec.set_context(Some(2));
+        assert_eq!(r.dec.decode(&r.device, create.as_bytes()).unwrap(), Ok(()));
+        r.p.world().hold_submissions();
+        let (_, _) = r.commit(A, 5, &ops(Some(&[]), &[]));
+
+        let wait = RgfxOpEvent {
+            event_obj_id: event,
+            value: 1,
+        };
+        let header = RgfxOpHeader {
+            tag: RGFX_OP_WAIT_EVENT,
+            flags: 0,
+            len: (8 + size_of::<RgfxOpEvent>()) as u32,
+        };
+        let mut waits = header.as_bytes().to_vec();
+        waits.extend_from_slice(wait.as_bytes());
+        waits.extend(asks());
+        let (h, o) = (cb(B, 1), cb(B, 2));
+        let (outcome, _) = r.commit(B, 1, &ops(None, &waits));
+        assert_eq!(outcome, Ok(()));
+        let (held, line) = r
+            .dec
+            .queue_counts(B)
+            .map(|c| (Arc::clone(&c.held), Arc::clone(&c.line)))
+            .unwrap();
+        assert_eq!(held.load(Ordering::Acquire), 1, "it holds its queue");
+        let (outcome, calls) = r.commit(B, 2, &ops(Some(&[(A, 5)]), &asks()));
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(events(&calls, WAIT), [(r.event(A), 5)]);
+        assert!(
+            of(&posted, &[h, o]).is_empty(),
+            "both wait for the event's buffer"
+        );
+
+        r.p.world().release_submissions();
+        assert_eq!(
+            of(&posted, &[h, o]),
+            [(SUB, h), (SCHED, h), (SUB, o), (SCHED, o)],
+            "each at its scheduling, in their order"
+        );
+        assert_eq!(held.load(Ordering::Acquire), 0);
+        assert_eq!(line.ordered(), 0);
+    }
+
+    /// A buffer answered on a doorbell's thread behind one that waits on the GPU for a buffer of
+    /// another queue, answered between that buffer's take and its commit (as the queue's lane
+    /// walks it), gets each record once and in its queue's order: its `CB_SUBMITTED` is the
+    /// answer's, which no take or commit posts again, and its `CB_SCHEDULED` goes at its commit,
+    /// after the ordered buffer's; once the platform takes both, nothing is posted again.
+    #[test]
+    fn a_doorbell_answer_behind_an_order_posts_each_record_once_in_order() {
+        use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
+        const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
+        const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
+        const DONE: u32 = RGFX_EVT_CB_COMPLETE;
+        let mut r = rig();
+        let posted = posting(&mut r);
+        r.p.world().hold_submissions();
+        let (_, _) = r.commit(A, 5, &ops(Some(&[]), &[]));
+        let (o, d) = (cb(B, 2), cb(B, 3));
+
+        // The ordered buffer is taken; its walk and commit are still to come.
+        let ordered = message(B, 2, &ops(Some(&[(A, 5)]), &asks()));
+        r.dec.set_context(Some(context(B)));
+        let begun = r
+            .dec
+            .begin_taken(&r.device, &ordered, Some(B))
+            .unwrap()
+            .unwrap();
+        assert_eq!(of(&posted, &[o]), [(SUB, o)], "at its take");
+
+        // The next buffer, now at the head of the ring, ends in its ask: the doorbell answers it.
+        let next = message(B, 3, &ops(None, &asks()));
+        let sink = Arc::clone(&posted);
+        let answered = r
+            .dec
+            .decoders()
+            .answer_at_doorbell(context(B), &next, move |m| {
+                sink.lock().push((m.header.r#type, m.cb_obj_id));
+                true
+            });
+        assert!(answered, "no buffer before it holds its queue");
+        assert_eq!(of(&posted, &[o, d]), [(SUB, o), (SUB, d)]);
+
+        let finished = r
+            .dec
+            .finish_command_buffer(&r.device, &ordered, begun)
+            .unwrap();
+        assert_eq!(finished, Ok(()));
+        assert_eq!(
+            of(&posted, &[o, d]),
+            [(SUB, o), (SUB, d), (SCHED, o)],
+            "the ordered buffer's at its commit"
+        );
+        let begun = r
+            .dec
+            .begin_taken(&r.device, &next, Some(B))
+            .unwrap()
+            .unwrap();
+        let finished = r
+            .dec
+            .finish_command_buffer(&r.device, &next, begun)
+            .unwrap();
+        assert_eq!(finished, Ok(()));
+        assert_eq!(
+            of(&posted, &[o, d]),
+            [(SUB, o), (SUB, d), (SCHED, o), (SCHED, d)],
+            "the answered one's at its commit, behind the ordered one's, its answer not again"
+        );
+
+        assert_eq!(r.p.world().release_submissions(), 3);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            of(&posted, &[o, d]),
+            [
+                (SUB, o),
+                (SUB, d),
+                (SCHED, o),
+                (SCHED, d),
+                (DONE, o),
+                (DONE, d)
+            ],
+            "posted once each"
+        );
     }
 }
