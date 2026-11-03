@@ -6,6 +6,7 @@
 #                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
 #                                 [--no-appload] [--no-bench | --wait-bench] [--qemu-hook CMD]
+#                                 [--bench-host-log FILTER]
 #                                 [--publish | --probe-tip] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
@@ -34,6 +35,9 @@
 #                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
 #   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
 #                 info,reims_graphics::room=debug to count a path's debug records
+#   --bench-host-log FILTER  the bench boot's host log filter (default info,reims_vgpu::work=debug,
+#                 the runtime's work counts each second, which report.py rates the drags and WebGL
+#                 by); another filter makes a control: never --record it
 #   --final-cmd CMD  run CMD in the guest (bash, as the user, 120 s at most) at the end of the
 #                 correctness boot's final phase; its output is guest.log's "GATE final-cmd:" lines
 #   --capture-boot  capture what the correctness boot's display showed as it booted (msi-boot.sh's
@@ -109,12 +113,13 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 landed=0 qemu_hook= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
+record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
     --landed) record=1 landed=1 ;;
     --qemu-hook) qemu_hook=$2; shift ;;
+    --bench-host-log) bench_host_log=$2; shift ;;
     --baseline) base_sha=$2; shift ;;
     --resume) if [[ ${2:-} =~ ^[0-9a-f]{12}- ]]; then resume=$2; shift; else resume=newest; fi ;;
     --image) image=$2; shift ;;
@@ -172,6 +177,7 @@ if [[ -z $base_sha && -e $GH/baselines/LAST ]]; then base_sha=$(basename "$(read
 [[ -z $host_dir ]] || ((!record)) || die "--host makes a control: it is never a sample of REV's baseline (--record)"
 [[ -z $load ]] || ((!record)) || die "--load measures beside a fixed load: it is never a sample of REV's baseline (--record)"
 [[ -z $qemu_hook ]] || ((!record)) || die "--qemu-hook makes a control: it is never a sample of REV's baseline (--record)"
+[[ -z $bench_host_log ]] || ((!record)) || die "--bench-host-log makes a control: it is never a sample of REV's baseline (--record)"
 BASE=${base_sha:+$GH/baselines/$base_sha}
 [[ -z $BASE || -d $BASE/runs ]] || die "no baseline of $base_sha in $GH/baselines"
 
@@ -548,7 +554,7 @@ PRESENT_S=$pres
 LOAD=$([[ $mode == bench ]] && echo "$load")
 # The bench's host log carries the host's work counts each second (reims_vgpu::work at debug: the
 # runtime's and each guest context's), which report.py reads over the drags and WebGL.
-HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info,reims_vgpu::work=debug)
+HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo "${bench_host_log:-info,reims_vgpu::work=debug}")
 CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_cmd" | base64 | tr -d '\n')
@@ -703,6 +709,7 @@ if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped b
   again=(--resume "$runid" --bench-only)
   if ((landed)); then again+=(--landed); elif ((record)); then again+=(--record); fi
   [[ -z $qemu_hook ]] || again+=(--qemu-hook "$qemu_hook")
+  [[ -z $bench_host_log ]] || again+=(--bench-host-log "$bench_host_log")
   [[ -z $image ]] || again+=(--image "$image")
   [[ -z $host_dir ]] || again+=(--host "$host_dir")
   [[ -z $load ]] || again+=(--load "$load")
