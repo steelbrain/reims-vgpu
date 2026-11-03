@@ -469,6 +469,35 @@ Stages:
         and a texture's own CPU access (`getBytes`, `replaceRegion`) locks
         the surface as a CPU access does (`guest/kext/src/RgfxSurfaceCaches.hpp`,
         `guest/bundle/src/RgfxIOSurface.h`).
+      - *Deferred pages:* a fresh surface only the GPU touches has no guest
+        pages until a CPU lock needs them, as on a GPU of its own memory (the
+        AMD 5300M's footprint grew 0 KiB from a 3840x2054 surface's first GPU
+        use). Where the kext took `RGFX_FEATURE_SURFACE_DEFERRED`, and no
+        IOSurface mapper device (`IOSurfaceParavirtMapperService`) is matched,
+        a cacheable ask in place of a surface that reads fresh (its seed 0,
+        none of its pages resident) defers its block: the kext makes the
+        device cache and sets its control function first, then reads the seed
+        and the resident pages under a read-only `lockSurface`, which waits
+        out any lock calling the control functions, so a read-write lock
+        either moved the seed before the read or calls the control function
+        after it (`RgfxIOSurfaceKPI.hpp`). Found fresh, its `SURFACE_PAGES`
+        carries `DEFERRED` and no runs, the block keeping room for one run a
+        page of the whole allocation, every plane's; the host makes the cache
+        as zeros. Not fresh, or refused, the kext names the pages at once, as
+        for any block. A deferred block is found by its surface, never by
+        pages, and its holders wire none. Its first read-write lock, or a
+        read-only one after a GPU write, wires the pages and names them
+        (`ATTACH`) before it goes on, one lock at a time, under no lock of the
+        contexts'; a read-only lock of a surface the GPU never wrote names
+        none, a fresh page reading as the zeros the cache holds. A dormant
+        deferred block stays at a client's going (op 5) while others are
+        left. Its release names its pages first where the GPU wrote it and
+        the surface is retained past the kext's own three references (the
+        table's, the device cache's, and the release thread's), so the
+        release copies the cache into them; else nothing reads them. Deferred
+        blocks fit the host's budget (`DEFERRED_BUDGET_LO` and `_HI`), held
+        and dormant, and dormant ones are let go past half of it, the oldest
+        first (`guest/kext/src/RgfxSurfaceBlocks.hpp`).
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:

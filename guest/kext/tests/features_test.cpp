@@ -11,6 +11,10 @@
 static_assert(RGFX_REG_DRIVER_FEATURES_LO == 0x024, "DRIVER_FEATURES_LO");
 static_assert(RGFX_REG_DRIVER_FEATURES_HI == 0x028, "DRIVER_FEATURES_HI");
 static_assert(RGFX_REG_CONSUMED == 0x02c, "CONSUMED");
+static_assert(RGFX_REG_DEFERRED_BUDGET_LO == 0x030, "DEFERRED_BUDGET_LO");
+static_assert(RGFX_REG_DEFERRED_BUDGET_HI == 0x034, "DEFERRED_BUDGET_HI");
+static_assert(RGFX_SURFACE_PAGES_DEFERRED == (1u << 2), "SURFACE_PAGES_DEFERRED");
+static_assert(RGFX_SURFACE_PAGES_ATTACH == (1u << 3), "SURFACE_PAGES_ATTACH");
 static_assert(offsetof(RgfxRingHeader, producer_waiting) == 0x10, "producer_waiting");
 static_assert(offsetof(RgfxRingHeader, raise_all) == 0xc4, "raise_all");
 static_assert(RGFX_QUEUE_CREATE_FLAGS_OFFSET == sizeof(RgfxQueueCreate), "the tail's offset");
@@ -44,7 +48,8 @@ constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CON
 // as records or as slots, the kext admits, makes its slabs' heaps over pages blocks, whose blocks
 // the kext checks, a full submission ring's post waits for the host's room record, and each post
 // names the buffers of the process's other queues posted before it, which needs nothing of the
-// kext; the kext makes WindowServer's queues unshared, which needs nothing of the bundle.
+// kext; the kext makes WindowServer's queues unshared, which needs nothing of the bundle, and
+// defers fresh cached surfaces' blocks.
 constexpr uint64_t kPages = RGFX_FEATURE_PAGES_BUFFERS;
 constexpr uint64_t kOrder = RGFX_FEATURE_SURFACE_ORDER;
 constexpr uint64_t kIcb = RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS;
@@ -54,8 +59,9 @@ constexpr uint64_t kHeaps = RGFX_FEATURE_HEAP_OVER_PAGES;
 constexpr uint64_t kRoom = RGFX_FEATURE_SUBMIT_ROOM;
 constexpr uint64_t kSlots = RGFX_FEATURE_ICB_SLOTS;
 constexpr uint64_t kCommits = RGFX_FEATURE_COMMIT_ORDER;
+constexpr uint64_t kDeferred = RGFX_FEATURE_SURFACE_DEFERRED;
 constexpr uint64_t kCarried =
-    kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom | kSlots | kCommits;
+    kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom | kSlots | kCommits | kDeferred;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -64,10 +70,10 @@ int main()
 {
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
-	// ICB_SLOTS and COMMIT_ORDER, and writes each only where offered.
+	// ICB_SLOTS, COMMIT_ORDER and SURFACE_DEFERRED, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
-	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots and COMMIT_ORDER from bit 3");
+	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER and SURFACE_DEFERRED from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -84,6 +90,11 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCommits, kCommits) ==
 	          (kRgfxOfferedFeatures | kCommits),
 	      "COMMIT_ORDER taken is in the word");
+	check(RGFX_FEATURE_SURFACE_DEFERRED == (1u << 19), "SURFACE_DEFERRED is bit 19");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDeferred) == kDeferred,
+	      "SURFACE_DEFERRED offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDeferred, 0) == kRgfxOfferedFeatures,
+	      "SURFACE_DEFERRED offered but not taken is not in the word");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

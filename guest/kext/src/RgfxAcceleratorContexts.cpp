@@ -173,6 +173,14 @@ bool surfacePages = false;
 // Whether the device keeps cached surfaces' GPU copies in its own memory
 // (RGFX_FEATURE_SURFACE_CACHE), read with it.
 bool surfaceCache = false;
+// The bytes of the host GPU's memory deferred blocks' device caches may hold
+// (RGFX_FEATURE_SURFACE_DEFERRED, its DEFERRED_BUDGET registers), read at the first context's
+// open: 0, deferring none, where the device or the kext does not take the feature, or where the
+// guest's IOSurfaces have a mapper device of their own (kSurfaceMapperService), which maps their
+// pages for the host.
+UInt64 deferredBudget = 0;
+// The service of that mapper device, the paravirtualized GPU's.
+const char *const kSurfaceMapperService = "IOSurfaceParavirtMapperService";
 // Under contextLock: the shared blocks of surface planes, made at the first ask.
 RgfxSurfaceTable surfaceTable = {nullptr, 0};
 // The bytes of surface pages the dormant blocks hold at most (RgfxSurfaceBlocks.hpp): an eighth
@@ -195,6 +203,11 @@ struct DormantStats {
 	// last copy, which the host copies into the pages all the same.
 	UInt64 unread;
 	UInt64 unreadWritten;
+	// Blocks deferred (RgfxSurfaceBlocks.hpp), deferrals the host refused, and deferred blocks
+	// released with their pages never named.
+	UInt64 deferred;
+	UInt64 deferredRefused;
+	UInt64 deferredUnattached;
 	UInt64 changes;
 	UInt64 loggedChanges;
 	// The surfaces left uncached for want of room (rgfxSurfaceCacheNoRoom) at the last line.
@@ -473,8 +486,16 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 			// mach port or an XPC object holds a surface with no client, and the process that
 			// looks it up from one reads its pages. Its clients are read here, out of every
 			// lock, as at a block's sleep.
+			// A deferred block's pages are named first, where the GPU wrote it and its surface
+			// lives on, so the release copies the cache into them (rgfxCacheReleaseNext).
 			bool written = false;
 			if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
+				if (rgfxSurfaceCacheReleaseAttach(accel, block.offset, surface)) {
+					IOLockLock(contextLock);
+					dormantStats.deferredUnattached++;
+					dormantStats.changes++;
+					IOLockUnlock(contextLock);
+				}
 				release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
 				surface->release();
 			}
@@ -581,6 +602,22 @@ bool RgfxAccelerator::startContexts()
 		const UInt32 features = readRegister(RGFX_REG_FEATURES_LO);
 		surfacePages = (features & RGFX_FEATURE_SURFACE_PAGES) != 0;
 		surfaceCache = surfacePages && (features & RGFX_FEATURE_SURFACE_CACHE) != 0;
+		// Deferred blocks where the kext took the feature, and no mapper device maps the
+		// surfaces' pages.
+		if (surfaceCache && (featureWord() & RGFX_FEATURE_SURFACE_DEFERRED)) {
+			OSDictionary *matching = IOService::serviceMatching(kSurfaceMapperService);
+			IOService *mapper = matching ? IOService::copyMatchingService(matching) : nullptr;
+			OSSafeReleaseNULL(matching);
+			if (!mapper)
+				deferredBudget =
+				    (static_cast<UInt64>(readRegister(RGFX_REG_DEFERRED_BUDGET_HI)) << 32) |
+				    readRegister(RGFX_REG_DEFERRED_BUDGET_LO);
+			else
+				IOLog("RgfxAccelerator: the guest's IOSurfaces have a mapper device (%s): no "
+				      "block is deferred\n",
+				      kSurfaceMapperService);
+			OSSafeReleaseNULL(mapper);
+		}
 		blocksStart = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 		blocksEnd = (regionSize - RGFX_CURSOR_SPAN) & ~(kPage - 1);
 		// A reserve of no more than a quarter of the blocks' room, on a region too small for it.
@@ -605,11 +642,11 @@ bool RgfxAccelerator::startContexts()
 		contextUnits = rgfxContextUnitsFor(maxBufferLength);
 		__atomic_store_n(&contextLock, lock, __ATOMIC_RELEASE);
 		IOLog("RgfxAccelerator: blocks 0x%llx-0x%llx, %u contexts of %u GiB of GPU addresses "
-		      "(maxBufferLength %llu MiB), surfaces %s; WindowServer's reserve: %u of %u "
-		      "entries, %llu MiB\n",
+		      "(maxBufferLength %llu MiB), surfaces %s, deferred blocks' budget %llu MiB; "
+		      "WindowServer's reserve: %u of %u entries, %llu MiB\n",
 		      blocksStart, blocksEnd, kRgfxContextUnits / contextUnits,
 		      static_cast<UInt32>((contextUnits * RGFX_CONTEXT_VA_UNIT) >> 30),
-		      maxBufferLength >> 20, surfacePages ? "in place" : "copied",
+		      maxBufferLength >> 20, surfacePages ? "in place" : "copied", deferredBudget >> 20,
 		      blockTable.reserveEntries, kMaxBlocks, blockTable.reserveBytes >> 20);
 		return true;
 	}
@@ -970,20 +1007,11 @@ namespace {
 constexpr UInt32 kMaxSurfaceBlocks = kRgfxSurfaceMaxBlocks;
 constexpr UInt64 kMaxPlaneBytes = 256ull << 20;
 
-// The plane of `length` bytes at `address` in `task`, wired: its descriptor, prepared, and its
-// pages' runs (`*runs`, IOMalloc'd, `*count` of them, the caller's to free with freeRuns), or
-// null where the range is not mapped there or its runs do not fit.
-IOMemoryDescriptor *wirePlane(task_t task, UInt64 address, UInt64 length, RgfxPageRun **runs,
-                              UInt32 *count)
+// The runs of the first `length` bytes of the prepared `md`, whose first byte lies `address`
+// bytes into a page (IOMalloc'd, `*count` of them, the caller's to free with freeRuns), or null
+// where they do not fit one run a page.
+RgfxPageRun *walkRuns(IOMemoryDescriptor *md, UInt64 address, UInt64 length, UInt32 *count)
 {
-	IOMemoryDescriptor *md =
-	    IOMemoryDescriptor::withAddressRange(address, length, kIODirectionOutIn, task);
-	if (!md)
-		return nullptr;
-	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
-		md->release();
-		return nullptr;
-	}
 	// One run a page at most.
 	UInt32 capacity = static_cast<UInt32>(((address & (kPage - 1)) + length + kPage - 1) / kPage);
 	RgfxPageRun *all = static_cast<RgfxPageRun *>(IOMalloc(sizeof(RgfxPageRun) * capacity));
@@ -1007,13 +1035,31 @@ IOMemoryDescriptor *wirePlane(task_t task, UInt64 address, UInt64 length, RgfxPa
 		bcopy(all, kept, sizeof(RgfxPageRun) * n);
 	if (all)
 		IOFree(all, sizeof(RgfxPageRun) * capacity);
+	*count = kept ? n : 0;
+	return kept;
+}
+
+// The plane of `length` bytes at `address` in `task`, wired: its descriptor, prepared, and its
+// pages' runs (`*runs`, IOMalloc'd, `*count` of them, the caller's to free with freeRuns), or
+// null where the range is not mapped there or its runs do not fit.
+IOMemoryDescriptor *wirePlane(task_t task, UInt64 address, UInt64 length, RgfxPageRun **runs,
+                              UInt32 *count)
+{
+	IOMemoryDescriptor *md =
+	    IOMemoryDescriptor::withAddressRange(address, length, kIODirectionOutIn, task);
+	if (!md)
+		return nullptr;
+	if (md->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
+		md->release();
+		return nullptr;
+	}
+	RgfxPageRun *kept = walkRuns(md, address, length, count);
 	if (!kept) {
 		md->complete(kIODirectionOutIn);
 		md->release();
 		return nullptr;
 	}
 	*runs = kept;
-	*count = n;
 	return md;
 }
 
@@ -1092,7 +1138,8 @@ bool letGoDormant(UInt32 i, RgfxDormantCause why, bool written = false)
 	dormantStats.letGo[why]++;
 	if (why == kRgfxDormantPurged && written)
 		dormantStats.purgedWritten++;
-	if (why >= kRgfxDormantCount && why <= kRgfxDormantNoSpace &&
+	if (((why >= kRgfxDormantCount && why <= kRgfxDormantNoSpace) ||
+	     why == kRgfxDormantDeferredBytes) &&
 	    surfaceTable.entries[i].purgeable)
 		dormantStats.volatileFirst++;
 	dormantStats.changes++;
@@ -1106,6 +1153,9 @@ bool trimDormant()
 	bool release = false;
 	RgfxDormantCause why = kRgfxDormantCauses;
 	for (int32_t i; (i = rgfxSurfaceOverCaps(surfaceTable, dormantMaxBytes, &why)) >= 0;)
+		release |= letGoDormant(static_cast<UInt32>(i), why);
+	// The deferred ones past half the device's budget for them.
+	for (int32_t i; (i = rgfxSurfaceOverDeferredCap(surfaceTable, deferredBudget / 2, &why)) >= 0;)
 		release |= letGoDormant(static_cast<UInt32>(i), why);
 	return release;
 }
@@ -1238,14 +1288,16 @@ void noteDormant()
 		      "%llu revived; let go: %llu purged (%llu with a cache written), %llu made "
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
-		      "volatile), %llu asked otherwise; %llu released with no client left (%llu of them "
-		      "written, not copied); %llu not cached: no room\n",
+		      "volatile), %llu asked otherwise, %llu past the deferred bytes; %llu released with "
+		      "no client left (%llu of them written, not copied); %llu not cached: no room; "
+		      "%llu deferred (%llu refused), %llu released with no pages named\n",
 		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
 		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
 		      d.letGo[kRgfxDormantNoClients],
 		      d.letGo[kRgfxDormantCount], d.letGo[kRgfxDormantBytes],
 		      d.letGo[kRgfxDormantTableFull], d.letGo[kRgfxDormantNoSpace], d.volatileFirst,
-		      d.letGo[kRgfxDormantStale], d.unread, d.unreadWritten, noRoom);
+		      d.letGo[kRgfxDormantStale], d.letGo[kRgfxDormantDeferredBytes], d.unread,
+		      d.unreadWritten, noRoom, d.deferred, d.deferredRefused, d.deferredUnattached);
 }
 
 // The last holder, of context `context`, of the cached entry `e` let it go: the block sleeps
@@ -1309,11 +1361,6 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// pages, which the device maps as they are.
 	if (inPlace ? address % kPage || length % kPage : size < length)
 		return kIOReturnBadArgument;
-	RgfxPageRun *runs = nullptr;
-	UInt32 count = 0;
-	IOMemoryDescriptor *pages = wirePlane(task, address, length, &runs, &count);
-	if (!pages)
-		return kIOReturnBadArgument;
 	RgfxSurfaceTable &table = surfaceTable;
 	IOLockLock(contextLock);
 	if (!table.entries) {
@@ -1324,6 +1371,31 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			table = {made, kMaxSurfaceBlocks};
 		}
 	}
+	// The asker's IOSurface, where a block of it may be deferred (RgfxSurfaceBlocks.hpp): a
+	// deferred block of it is the ask's, found by it whatever the asker's pages, and a fresh one
+	// may be deferred, where cacheable and within the device's budget. Neither wires the asker's
+	// pages: the kext wires them only where neither holds. Released once the ask is done, but a
+	// new deferred entry's, which keeps it.
+	struct SurfaceRef {
+		OSObject *object = nullptr;
+		~SurfaceRef() { OSSafeReleaseNULL(object); }
+	} asker;
+	bool defer = false, deferredFound = false;
+	if (inPlace && surfaceId && deferredBudget && table.entries) {
+		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
+		int32_t d = -1;
+		while (asker.object && (d = rgfxSurfaceFindDeferred(table, asker.object)) >= 0 &&
+		       table.entries[d].pending)
+			IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
+		deferredFound = d >= 0;
+		defer = asker.object && !deferredFound && cacheable &&
+		        rgfxSurfaceDeferFits(table, length, deferredBudget) &&
+		        rgfxSurfaceLocksFresh(asker.object, length);
+	}
+	IOLockUnlock(contextLock);
+	RgfxPageRun *runs = nullptr;
+	UInt32 count = 0;
+	IOMemoryDescriptor *pages = nullptr;
 	// A block in place is no other ask's until the device has answered for its pages: the ask
 	// waits for the answer, which keeps the block or lets it go. A dormant block of the plane is
 	// held again by an ask of the same surface (reviveSurfaceBlock), and goes where the ask is
@@ -1333,68 +1405,117 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	uint64_t roomDeadline = 0;
 	int32_t at = -1, slot = -1;
 	RgfxBlockPin pin = {};
-	UInt64 offset = 0;
-	// A block in place holds the runs past the part the processes map, whole pages of them.
-	UInt64 runBytes = sizeof(RgfxPageRun) * static_cast<UInt64>(count);
-	UInt64 total = inPlace ? size + alignUp(runBytes, kPage) : size;
+	UInt64 offset = 0, total = 0;
 	RgfxBlockResult made = kRgfxBlockTableFull;
-	for (;;) {
-		while (table.entries && rgfxSurfacePending(table, runs, count))
-			IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
-		differs = false;
-		at = table.entries ? rgfxSurfaceFind(table, runs, count, length, size, inPlace, &differs)
-		                   : -1;
-		if (at >= 0 && table.entries[at].dormant) {
-			revived = reviveSurfaceBlock(table.entries[at], task, surfaceId);
-			if (revived)
-				break;
-			release |= letGoDormant(static_cast<UInt32>(at), kRgfxDormantStale);
-			continue;
+	for (bool wire = !defer && !deferredFound;;) {
+		if (wire) {
+			pages = wirePlane(task, address, length, &runs, &count);
+			if (!pages)
+				return kIOReturnBadArgument;
 		}
-		const int32_t meeting =
-		    at < 0 && differs ? rgfxSurfaceDormantMeeting(table, runs, count) : -1;
-		if (meeting >= 0) {
-			release |= letGoDormant(static_cast<UInt32>(meeting), kRgfxDormantStale);
-			continue;
-		}
-		if (at >= 0 || differs || !table.entries)
-			break;
-		// A new block: a dormant one gives its entry where the table is full, and the region's
-		// room where it has none, its release waited for a while, once.
-		slot = rgfxSurfaceFreeEntry(table);
-		if (slot < 0) {
-			const int32_t oldest = rgfxSurfaceOldestDormant(table);
-			if (oldest >= 0) {
-				release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantTableFull);
-				slot = rgfxSurfaceFreeEntry(table);
-			}
-		}
-		made = slot < 0 ? kRgfxBlockTableFull
-		                : rgfxBlockAlloc(blockTable, &table.entries[slot], context, total, kPage,
-		                                 &offset, &pin, client->isWindowServer());
-		if (made != kRgfxBlockNoSpace)
-			break;
-		// No room: dormant blocks go once, and the ask waits for room until its deadline,
-		// whatever else wakes it meanwhile (rgfxSurfaceRoomStep).
-		const RgfxSurfaceRoomStep step =
-		    rgfxSurfaceRoomStep(roomDeadline, table.dormantCount, mach_absolute_time());
-		if (step == kRgfxSurfaceRoomGiveUp)
-			break;
-		if (step == kRgfxSurfaceRoomLetGoAndWait) {
-			waitedForRoom = true;
-			releaseStats.roomWaits++;
-			for (UInt32 n = 0; n < kDormantRoomBlocks; n++) {
-				const int32_t oldest = rgfxSurfaceOldestDormant(table);
-				if (oldest < 0)
+		IOLockLock(contextLock);
+		// The ask finds no deferred block and has no pages: it wires them, and looks again.
+		bool needPages = false;
+		for (;;) {
+			int32_t d = -1;
+			while (table.entries &&
+			       (rgfxSurfacePending(table, runs, count) ||
+			        ((d = rgfxSurfaceFindDeferred(table, asker.object)) >= 0 &&
+			         table.entries[d].pending)))
+				IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
+			differs = false;
+			at = -1;
+			// A deferred block of the asker's surface is its block, held again where dormant.
+			d = table.entries ? rgfxSurfaceFindDeferred(table, asker.object) : -1;
+			if (d >= 0) {
+				RgfxSurfaceEntry &de = table.entries[d];
+				if (de.size != size || de.length != length) {
+					differs = true;
 					break;
-				release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantNoSpace);
+				}
+				if (de.dormant) {
+					revived = reviveDeferredBlock(de, surfaceId);
+					if (!revived) {
+						release |= letGoDormant(static_cast<UInt32>(d), kRgfxDormantStale);
+						continue;
+					}
+				}
+				at = d;
+				break;
 			}
-			if (release)
-				thread_call_enter(releaseCall);
-			release = false;
-			clock_interval_to_deadline(kDormantRoomMs, kMillisecondScale, &roomDeadline);
+			// No pages, no deferred block: a new one is deferred where its surface is fresh
+			// still, and fits the budget.
+			if (!count && (!defer || !rgfxSurfaceDeferFits(table, length, deferredBudget) ||
+			               !rgfxSurfaceLocksFresh(asker.object, length))) {
+				needPages = true;
+				break;
+			}
+			at = table.entries && count
+			         ? rgfxSurfaceFind(table, runs, count, length, size, inPlace, &differs)
+			         : -1;
+			if (at >= 0 && table.entries[at].dormant) {
+				revived = reviveSurfaceBlock(table.entries[at], task, surfaceId);
+				if (revived)
+					break;
+				release |= letGoDormant(static_cast<UInt32>(at), kRgfxDormantStale);
+				continue;
+			}
+			const int32_t meeting =
+			    at < 0 && differs ? rgfxSurfaceDormantMeeting(table, runs, count) : -1;
+			if (meeting >= 0) {
+				release |= letGoDormant(static_cast<UInt32>(meeting), kRgfxDormantStale);
+				continue;
+			}
+			if (at >= 0 || differs || !table.entries)
+				break;
+			// A new block in place holds the runs past the part the processes map, whole pages
+			// of them; a deferred one room for one run a page of the plane.
+			const UInt64 runBytes = sizeof(RgfxPageRun) * static_cast<UInt64>(count);
+			total = !inPlace ? size
+			        : count  ? size + alignUp(runBytes, kPage)
+			                 : size + rgfxSurfaceRunRoom(length);
+			// A new block: a dormant one gives its entry where the table is full, and the
+			// region's room where it has none, its release waited for a while, once.
+			slot = rgfxSurfaceFreeEntry(table);
+			if (slot < 0) {
+				const int32_t oldest = rgfxSurfaceOldestDormant(table);
+				if (oldest >= 0) {
+					release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantTableFull);
+					slot = rgfxSurfaceFreeEntry(table);
+				}
+			}
+			made = slot < 0 ? kRgfxBlockTableFull
+			                : rgfxBlockAlloc(blockTable, &table.entries[slot], context, total,
+			                                 kPage, &offset, &pin, client->isWindowServer());
+			if (made != kRgfxBlockNoSpace)
+				break;
+			// No room: dormant blocks go once, and the ask waits for room until its deadline,
+			// whatever else wakes it meanwhile (rgfxSurfaceRoomStep).
+			const RgfxSurfaceRoomStep step =
+			    rgfxSurfaceRoomStep(roomDeadline, table.dormantCount, mach_absolute_time());
+			if (step == kRgfxSurfaceRoomGiveUp)
+				break;
+			if (step == kRgfxSurfaceRoomLetGoAndWait) {
+				waitedForRoom = true;
+				releaseStats.roomWaits++;
+				for (UInt32 n = 0; n < kDormantRoomBlocks; n++) {
+					const int32_t oldest = rgfxSurfaceOldestDormant(table);
+					if (oldest < 0)
+						break;
+					release |= letGoDormant(static_cast<UInt32>(oldest), kRgfxDormantNoSpace);
+				}
+				if (release)
+					thread_call_enter(releaseCall);
+				release = false;
+				clock_interval_to_deadline(kDormantRoomMs, kMillisecondScale, &roomDeadline);
+			}
+			IOLockSleepDeadline(contextLock, &surfaceTable, roomDeadline, THREAD_UNINT);
 		}
-		IOLockSleepDeadline(contextLock, &surfaceTable, roomDeadline, THREAD_UNINT);
+		if (!needPages)
+			break;
+		IOLockUnlock(contextLock);
+		defer = false;
+		wire = true;
 	}
 	if (waitedForRoom && made == kRgfxBlockNoSpace)
 		releaseStats.roomWaitsFailed++;
@@ -1403,8 +1524,12 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	if (at >= 0) {
 		// Another process's plane, or a dormant one held again: this client holds its block
 		// too, in its window from its first hold, mapped under the lock so no let-go of the
-		// hold comes between. A block held again is fresh to its holders.
+		// hold comes between. A block held again is fresh to its holders. A deferred block's
+		// holders hold no pages: the asker's, where it wired them, go.
 		RgfxSurfaceEntry &e = table.entries[at];
+		IOMemoryDescriptor *own = e.deferred ? pages : nullptr;
+		if (own)
+			pages = nullptr;
 		RgfxSurfaceHoldResult held = rgfxSurfaceHold(e, client, context, pages);
 		*block = {e.offset, e.size, e.serial, revived, e.cached};
 		IOReturn mapped = kIOReturnSuccess;
@@ -1425,6 +1550,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		}
 		IOLockUnlock(contextLock);
 		freeRuns(runs, count);
+		unwire(own);
 		if (held != kRgfxSurfaceHoldNew) {
 			if (!keptWire)
 				unwire(pages);
@@ -1484,6 +1610,14 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	e.length = length;
 	e.runs = runs;
 	e.runCount = count;
+	// A block in place with no pages is deferred, its surface its key from here on.
+	const bool deferring = inPlace && !count;
+	if (deferring) {
+		e.surface = asker.object;
+		asker.object = nullptr;
+		e.surfaceId = surfaceId;
+		rgfxSurfaceDefer(table, e);
+	}
 	rgfxSurfaceHold(e, client, context, pages);
 	*block = {offset, size, pin.serial, true, false};
 	// In the client's window, under the lock, so no let-go of the hold comes between: the part
@@ -1491,6 +1625,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// device was not told of it.
 	IOReturn mapped = client->mapSpan(offset, size);
 	if (mapped != kIOReturnSuccess) {
+		OSObject *deferredSurface = deferring ? static_cast<OSObject *>(e.surface) : nullptr;
 		client->unmapSpan(offset, size);
 		rgfxBlockDrop(blockTable, pin);
 		rgfxSurfaceClear(table, e);
@@ -1499,6 +1634,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		IOLockUnlock(contextLock);
 		freeRuns(runs, count);
 		unwire(pages);
+		OSSafeReleaseNULL(deferredSurface);
 		return mapped;
 	}
 	IOLockUnlock(contextLock);
@@ -1507,13 +1643,21 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// and goes as a share not posted goes where the device maps none of them: the process makes
 	// a copy instead.
 	// A block in place may be cached: its surface's device cache is made before the device
-	// learns of the block, so its CPU generation counts from the start.
-	bool cached = inPlace && surfaceCache && cacheable && surfaceId &&
-	              cacheSurface(e, task, surfaceId, offset);
-	block->cached = cached;
+	// learns of the block, so its CPU generation counts from the start. A deferred one is cached
+	// with no pages, or has them named now (deferSurfaceBlock).
+	bool cached = false;
 	IOReturn posted = kIOReturnSuccess;
-	if (inPlace && !postSurfacePages(context, offset, total, size, length, runs, count, cached))
-		posted = kIOReturnUnsupported;
+	if (deferring) {
+		if (!deferSurfaceBlock(e, context, surfaceId, total, &cached))
+			posted = kIOReturnUnsupported;
+	} else {
+		cached = inPlace && surfaceCache && cacheable && surfaceId &&
+		         cacheSurface(e, task, surfaceId, offset);
+		if (inPlace &&
+		    !postSurfacePages(context, offset, total, size, length, runs, count, cached))
+			posted = kIOReturnUnsupported;
+	}
+	block->cached = cached;
 	if (posted == kIOReturnSuccess) {
 		RgfxBlockGrant share = {};
 		share.context = context;
@@ -1629,6 +1773,130 @@ bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t su
 	return true;
 }
 
+bool RgfxAccelerator::reviveDeferredBlock(RgfxSurfaceEntry &e, uint32_t surfaceId)
+{
+	// The surface is the block's own, found by it: its device cache is the block's, held.
+	if (!rgfxSurfaceRevives(e, e.cache, rgfxSurfaceCacheWake(e.cache)))
+		return false;
+	rgfxSurfaceWake(surfaceTable, e);
+	e.surfaceId = surfaceId;
+	dormantStats.revived++;
+	dormantStats.changes++;
+	return true;
+}
+
+bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId,
+                                        UInt64 total, bool *cached)
+{
+	// The entry is pending until the device answers its pages, so no other asker reads it.
+	OSObject *surface = static_cast<OSObject *>(e.surface);
+	const UInt64 offset = e.offset, size = e.size, length = e.length;
+	// The header's page, where the kext writes the surface's CPU generation for the processes.
+	IOMemoryMap *header = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, offset, kPage);
+	void *cache = nullptr;
+	const RgfxDeferAnswer answer =
+	    header ? rgfxSurfaceLocksDefer(this, surface, surfaceId, offset, size, length, context,
+	                                   header, &cache)
+	           : kRgfxDeferNoCache;
+	// Not cached: its surface is looked up anew at its first write named, as any block's, and the
+	// entry's reference goes once its pages are named.
+	OSObject *uncached = answer == kRgfxDeferNoCache ? surface : nullptr;
+	IOLockLock(contextLock);
+	if (uncached) {
+		e.surface = nullptr;
+	} else {
+		e.cache = cache;
+		e.cached = true;
+	}
+	IOLockUnlock(contextLock);
+	if (uncached)
+		OSSafeReleaseNULL(header);
+	*cached = !uncached;
+	if (answer == kRgfxDeferFresh) {
+		UInt32 status = RGFX_STATUS_OK;
+		const IOReturn r = postPages(context, offset, total, offset + size, length, 0,
+		                             RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED,
+		                             &status);
+		if (r == kIOReturnSuccess || r != kIOReturnUnsupported || status != RGFX_STATUS_REFUSED) {
+			// Deferred, or not answered: a block whose answer did not come goes, its pages
+			// never named.
+			rgfxSurfaceCacheSettle(cache, true);
+			IOLockLock(contextLock);
+			dormantStats.deferred += r == kIOReturnSuccess;
+			dormantStats.changes++;
+			IOLockUnlock(contextLock);
+			if (r != kIOReturnSuccess)
+				IOLog("RgfxAccelerator: the deferred block 0x%llx was not answered (0x%x, status "
+				      "%u): it goes\n",
+				      offset, r, status);
+			return r == kIOReturnSuccess;
+		}
+		IOLockLock(contextLock);
+		dormantStats.deferredRefused++;
+		dormantStats.changes++;
+		IOLockUnlock(contextLock);
+	}
+	// Not fresh, refused, or with no cache: the block's pages are named now, as any block's in
+	// place, and its asker's hold wires them as any holder's.
+	IOMemoryDescriptor *memory = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
+	RgfxPageRun *runs = nullptr;
+	UInt32 count = 0;
+	const bool named =
+	    memory && attachSurfacePages(context, offset, size, length, memory,
+	                                 *cached ? RGFX_SURFACE_PAGES_CACHED : 0, &runs, &count);
+	if (*cached)
+		rgfxSurfaceCacheSettle(cache, !named);
+	if (!named) {
+		OSSafeReleaseNULL(uncached);
+		return false;
+	}
+	IOMemoryDescriptor *held = memory;
+	held->retain();
+	if (held->prepare(kIODirectionOutIn) != kIOReturnSuccess)
+		OSSafeReleaseNULL(held);
+	IOLockLock(contextLock);
+	rgfxSurfaceUndefer(surfaceTable, e, runs, count);
+	if (e.holdCount)
+		e.holds[0].pages = held;
+	IOLockUnlock(contextLock);
+	OSSafeReleaseNULL(uncached);
+	return true;
+}
+
+bool RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size,
+                                         UInt64 length, IOMemoryDescriptor *memory, UInt32 flags,
+                                         RgfxPageRun **runsOut, UInt32 *countOut)
+{
+	if (length > memory->getLength() || memory->prepare(kIODirectionOutIn) != kIOReturnSuccess)
+		return false;
+	UInt32 count = 0;
+	RgfxPageRun *runs = walkRuns(memory, 0, length, &count);
+	const char *why = nullptr;
+	if (!runs)
+		why = "its runs do not fit";
+	else if (!writeRuns(region, offset + size, runs, count))
+		why = "its runs could not be written";
+	else if (IOReturn r = postPages(context, offset, size + rgfxSurfaceRunRoom(length),
+	                                offset + size, length, count, flags);
+	         r != kIOReturnSuccess)
+		why = r == kIOReturnUnsupported ? "the device refused them" : "they were not answered";
+	if (why) {
+		IOLog("RgfxAccelerator: the block 0x%llx's pages (flags 0x%x) were not named: %s\n",
+		      offset, flags, why);
+		freeRuns(runs, count);
+		memory->complete(kIODirectionOutIn);
+		return false;
+	}
+	if (runsOut) {
+		*runsOut = runs;
+		*countOut = count;
+	} else {
+		freeRuns(runs, count);
+	}
+	return true;
+}
+
 bool RgfxAccelerator::downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs)
 {
 	RgfxSurfaceDownload message = {};
@@ -1661,7 +1929,8 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
 }
 
 IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
-                                    UInt64 runsOffset, UInt64 length, UInt32 count, UInt32 flags)
+                                    UInt64 runsOffset, UInt64 length, UInt32 count, UInt32 flags,
+                                    UInt32 *status)
 {
 	// The message, then where it has flags, the part that holds them.
 	struct {
@@ -1686,6 +1955,8 @@ IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
 		r = kIOReturnTimeout;
 	if (r != kIOReturnSuccess)
 		return r;
+	if (status)
+		*status = answer.status;
 	return answer.status == RGFX_STATUS_OK ? kIOReturnSuccess : kIOReturnUnsupported;
 }
 
@@ -1863,7 +2134,7 @@ RgfxAccelerator::surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t ta
 	int32_t at = table.entries ? rgfxSurfaceAt(table, offset) : -1;
 	RgfxSurfaceEntry *e = at >= 0 ? &table.entries[at] : nullptr;
 	SurfaceCacheAnswer answer = kSurfaceCacheMade;
-	if (!e || !e->runCount || !rgfxSurfaceHeldBy(table, client, offset, 1))
+	if (!e || (!e->runCount && !e->deferred) || !rgfxSurfaceHeldBy(table, client, offset, 1))
 		answer = kSurfaceCacheNotHeld;
 	else if (e->pending)
 		answer = kSurfaceCachePending;

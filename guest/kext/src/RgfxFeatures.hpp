@@ -36,7 +36,11 @@
 //    buffer;
 //  - COMMIT_ORDER (bit 18): the bundle names, as it posts a command buffer, the latest buffer each
 //    other queue of its process posted since (design.md, "Commit order"), which needs nothing of
-//    the kext.
+//    the kext;
+//  - SURFACE_DEFERRED (bit 19), meaningful only with SURFACE_CACHE: the kext defers a fresh
+//    cached surface's block in place, naming its pages at the first CPU lock that needs them
+//    (RgfxSurfaceBlocks.hpp), within the budget the host gives in DEFERRED_BUDGET_LO and _HI,
+//    which needs nothing of the bundle.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -62,7 +66,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_SURFACE_ORDER |
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_UNSHARED_QUEUES |
     RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
-    RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER;
+    RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

@@ -47,6 +47,21 @@
 // The accelerator ID came from IOSurfaceRoot::generateUniqueAcceleratorID(the accelerator) on
 // both, 1 for IOGPU and 2 for the AMD's (taken before the trace began).
 //
+// A surface's seed, and its CPU locks, read from IOSurface 393.5.8's code (the guest's macOS
+// 26.6.1, 25G76) and measured in the guest with IOSurfaceGetSeed:
+//   - getLockSeed is the seed IOSurfaceGetSeed reads: 0 for a fresh surface, 4K ones included;
+//     a read-only lock leaves it, a read-write lock moves it as it locks, and a command buffer
+//     that writes the surface moves it at its commit (the kext's setCurrent); a texture made
+//     over the surface leaves it (measured);
+//   - lockSurface holds the surface's mutex throughout but while synchronize_device_caches calls
+//     the device caches' control functions, during which other syncs wait for it to end; a
+//     read-write lock moves the seed after those calls, under the mutex again. A lock of a
+//     surface with no device cache never lets the mutex go. So a read-only lockSurface returns a
+//     seed that counts every read-write lock begun before it, and with no device cache current,
+//     calls no control function (read from code);
+//   - IOSurfaceDeviceCache::init retains its surface, which the cache holds until it is freed
+//     (read from code).
+//
 // Our own code.
 #ifndef RGFX_IOSURFACE_KPI_HPP_
 #define RGFX_IOSURFACE_KPI_HPP_
@@ -96,6 +111,18 @@ void rgfxDeviceCacheSetControl(RgfxDeviceCache *cache, void *context, RgfxDevice
 // IOSurfaceDeviceCache::setCurrent(): the GPU holds the surface's newest contents.
 void rgfxDeviceCacheSetCurrent(RgfxDeviceCache *cache)
     __asm__("__ZN20IOSurfaceDeviceCache10setCurrentEv");
+// IOSurface::getLockSeed() const: the surface's seed, as IOSurfaceGetSeed reads it.
+uint32_t rgfxIOSurfaceLockSeed(const OSObject *surface) __asm__("__ZNK9IOSurface11getLockSeedEv");
+// IOSurface::lockSurface(unsigned int, unsigned int*) and unlockSurface(unsigned int, unsigned
+// int*): a CPU lock of the surface, as a process's, with IOSurface's lock options
+// (kRgfxIOSurfaceLockReadOnly), the seed after it in `*seed` where not null.
+IOReturn rgfxIOSurfaceLock(OSObject *surface, uint32_t options, uint32_t *seed)
+    __asm__("__ZN9IOSurface11lockSurfaceEjPj");
+IOReturn rgfxIOSurfaceUnlock(OSObject *surface, uint32_t options, uint32_t *seed)
+    __asm__("__ZN9IOSurface13unlockSurfaceEjPj");
 }
+
+// IOSurface's kIOSurfaceLockReadOnly.
+constexpr uint32_t kRgfxIOSurfaceLockReadOnly = 1;
 
 #endif // RGFX_IOSURFACE_KPI_HPP_
