@@ -472,6 +472,8 @@ pub(crate) struct QueueShared {
     vector: u32,
     /// The submission ring, held while the service thread takes a message.
     submit: Mutex<Submit>,
+    /// The highest `seqno` of a message taken off the submission ring, 0 before one is.
+    taken_seqno: AtomicU64,
     /// Held by whoever takes the submission ring's messages and hands them over: the service
     /// thread, from its take of a message to its hand-over, or a doorbell's thread, which tries
     /// it and offers the host a message only where it holds it. It holds what a doorbell's thread
@@ -499,6 +501,27 @@ impl QueueShared {
         self.ending.store(true, Ordering::Release);
         self.wake.wake();
         self.room.wake();
+    }
+
+    /// A message of `seqno` was taken off its submission ring.
+    fn took(&self, seqno: u64) {
+        self.taken_seqno.fetch_max(seqno, Ordering::AcqRel);
+    }
+
+    /// The highest `seqno` the guest has published on its submission ring: of a message the host
+    /// took, or of one it has yet to take; `None` where the queue has ended. Waits for a take of
+    /// the ring under way, which waits for nothing.
+    fn published_seqno(&self, region: &Region) -> Option<u64> {
+        let submit = self.submit.lock();
+        if self.ended() {
+            return None;
+        }
+        let waiting = submit.consumer.highest_published_seqno(region);
+        Some(
+            self.taken_seqno
+                .load(Ordering::Acquire)
+                .max(waiting.unwrap_or(0)),
+        )
     }
 
     /// Its doorbell was rung: its service thread wakes, and so does a post waiting for room on
@@ -743,6 +766,16 @@ impl CompletionPoster {
     /// names the queue (and the context) the message came from, whatever the message says.
     pub fn queue_obj_id(&self) -> Option<u64> {
         self.queue.as_ref().map(|(_, obj_id)| *obj_id)
+    }
+
+    /// The highest `seqno` the guest has published on the submission ring of the queue this posts
+    /// for, of a message the host has taken or of one it has yet to take: no command buffer of a
+    /// greater seqno is on the ring. `None` for the control ring's poster, or where the device or
+    /// the queue has ended. Waits for a take of the ring under way, which waits for nothing.
+    pub fn published_seqno(&self) -> Option<u64> {
+        let shared = self.shared.upgrade()?;
+        let (queue, _) = self.queue.as_ref()?;
+        queue.upgrade()?.published_seqno(&shared.region)
     }
 
     /// Whether the device was reset since the work this posts for began (or has ended): what it
@@ -1242,6 +1275,7 @@ impl Shared {
                 return;
             };
             submit.consumer.take(&self.region, &message);
+            queue.took(message.header.seqno);
             *consuming = Some(taken.rest);
             taken.post
         };
@@ -1359,6 +1393,7 @@ impl Shared {
                 consumer,
                 broken: false,
             }),
+            taken_seqno: AtomicU64::new(0),
             consuming: Mutex::new(None),
             complete: Mutex::new(producer),
             room: Room::default(),
@@ -1512,7 +1547,11 @@ impl Shared {
                 if !self.started() || submit.broken || self.ending() || queue.ended() {
                     return;
                 }
-                match submit.consumer.next(&self.region) {
+                let next = submit.consumer.next(&self.region);
+                if let Ok(Some(message)) = &next {
+                    queue.took(message.header.seqno);
+                }
+                match next {
                     Ok(Some(message))
                         if message.header.r#type == RGFX_CMD_COMMAND_BUFFER
                             || message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION =>

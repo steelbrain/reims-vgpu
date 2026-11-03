@@ -13,7 +13,10 @@
 //!
 //! A present whose writers have all finished, with none before it waiting, is shown at once; the
 //! others wait in order, and each `CB_COMPLETE` shows those at the front that are ready, so a
-//! present never overtakes one made before it. A failed buffer finishes as a completed one does
+//! present never overtakes one made before it. A process publishes a buffer on its queue's ring
+//! before it names it a writer, so a writer whose seqno is past every seqno its queue's ring has
+//! published when the present comes names no buffer, and holds nothing: a seqno the guest wrote
+//! wrong never holds its display's presents. A failed buffer finishes as a completed one does
 //! (its `CB_COMPLETE` carries the failure). A queue's destroy, or its context's close, drops what
 //! the presents wait for of it: no buffer of it will finish.
 //!
@@ -34,8 +37,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use reims_graphics::PresentAnswer;
 use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
+use reims_graphics::{CompletionPoster, PresentAnswer};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
@@ -56,6 +59,9 @@ struct State<P: Platform> {
     finished: HashMap<u64, u64>,
     /// The presents not yet shown, oldest first.
     waiting: VecDeque<Waiting<P>>,
+    /// By queue id: the poster onto its completion ring, through which what its submission ring
+    /// has published is read.
+    queues: HashMap<u64, CompletionPoster>,
 }
 
 /// One present not yet shown.
@@ -77,13 +83,22 @@ impl<P: Platform> PresentQueue<P> {
             state: Mutex::new(State {
                 finished: HashMap::new(),
                 waiting: VecDeque::new(),
+                queues: HashMap::new(),
             }),
         }
     }
 
+    /// Queue `queue` was made, its completion ring posted onto through `poster`: what its
+    /// submission ring has published bounds what a present waits for of it.
+    pub(crate) fn queue_made(&self, queue: u64, poster: CompletionPoster) {
+        self.state.lock().queues.insert(queue, poster);
+    }
+
     /// Shows IOSurface `id`'s `texture` (`None`: the scanout) once each command buffer in
     /// `writers` has finished and every present made before it is shown; `answer` goes as
-    /// [`Presented`] gives it.
+    /// [`Presented`] gives it. A writer past what its queue's ring has published holds nothing
+    /// (the module doc). Called with no lock of the decoder's held: what a ring has published is
+    /// read with the ring held.
     pub(crate) fn present(
         &self,
         id: u32,
@@ -91,6 +106,7 @@ impl<P: Platform> PresentQueue<P> {
         answer: PresentAnswer,
         writers: Vec<RgfxSurfaceWriter>,
     ) {
+        let writers = self.published(writers);
         let mut state = self.state.lock();
         state.waiting.push_back(Waiting {
             id,
@@ -111,14 +127,50 @@ impl<P: Platform> PresentQueue<P> {
         }
     }
 
+    /// `writers`, less each whose seqno is past every seqno its queue's ring has published.
+    fn published(&self, writers: Vec<RgfxSurfaceWriter>) -> Vec<RgfxSurfaceWriter> {
+        if writers.is_empty() {
+            return writers;
+        }
+        let posters: Vec<Option<CompletionPoster>> = {
+            let state = self.state.lock();
+            (writers.iter())
+                .map(|w| state.queues.get(&w.queue_obj_id).cloned())
+                .collect()
+        };
+        writers
+            .into_iter()
+            .zip(posters)
+            .filter(|(w, poster)| {
+                let published = poster.as_ref().and_then(CompletionPoster::published_seqno);
+                let named = published.is_none_or(|published| w.seqno <= published);
+                if !named {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a present's writer names seqno {} of queue {:#x}, past the {} its ring \
+                         has published: it holds nothing",
+                        w.seqno,
+                        w.queue_obj_id,
+                        published.unwrap_or_default()
+                    );
+                }
+                named
+            })
+            .map(|(w, _)| w)
+            .collect()
+    }
+
     /// Queue `queue` is gone: nothing more of it finishes.
     pub(crate) fn queue_gone(&self, queue: u64) {
+        self.state.lock().queues.remove(&queue);
         self.forget(|q| q == queue);
     }
 
     /// Context `context` closed: none of its queues' command buffers finish.
     pub(crate) fn context_gone(&self, context: u32) {
-        self.forget(|q| q >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context));
+        let gone = |q: u64| q >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context);
+        self.state.lock().queues.retain(|&q, _| !gone(q));
+        self.forget(gone);
     }
 
     /// The device's reset: the presents waiting are dropped unshown, their answers owed to no
@@ -128,6 +180,7 @@ impl<P: Platform> PresentQueue<P> {
         let waiting = {
             let mut state = self.state.lock();
             state.finished.clear();
+            state.queues.clear();
             std::mem::take(&mut state.waiting)
         };
         if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(waiting)) {

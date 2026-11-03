@@ -220,6 +220,39 @@ impl Consumer {
         }
     }
 
+    /// The highest `seqno` of the messages the guest has published and the host not yet taken,
+    /// read where they lie, pads skipped, nothing taken; `None` where there are none. A message
+    /// the protocol refuses ends the walk there, as [`Self::peek`] would find the ring broken.
+    pub(crate) fn highest_published_seqno(&self, region: &Region) -> Option<u64> {
+        let ahead = self.published(region).ok()?;
+        let mut highest = None;
+        let mut walked = 0u64;
+        while walked < ahead {
+            let at = self.count.wrapping_add(walked);
+            let start = region.read(self.at.data_at(at), 8)?;
+            let r#type = u32::from_le_bytes([start[0], start[1], start[2], start[3]]);
+            let size = u64::from(u32::from_le_bytes([start[4], start[5], start[6], start[7]]));
+            let least = if r#type == RGFX_MSG_PAD {
+                8
+            } else {
+                HEADER_SIZE
+            };
+            if size % 8 != 0 || size < least || size > self.at.left_to_end(at) {
+                break;
+            }
+            if size > ahead - walked {
+                break;
+            }
+            if r#type != RGFX_MSG_PAD {
+                let seqno = region.read(self.at.data_at(at) + 8, 8)?;
+                let seqno = u64::from_le_bytes(seqno.try_into().ok()?);
+                highest = highest.max(Some(seqno));
+            }
+            walked += size;
+        }
+        highest
+    }
+
     /// Takes `message`, which [`Self::peek`] answered last: the host's count moves past it and is
     /// written to the header.
     pub(crate) fn take(&mut self, region: &Region, message: &Message) {

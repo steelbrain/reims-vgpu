@@ -3365,8 +3365,10 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     let (device, platform) = headless_on(&raised);
     let (mut guest, mut ring) = surface_and_queue(&device);
     assert_eq!(device.control.pool.favoured(), None);
-    // The guest committed buffer 5 on the queue, which draws the surface, then presented it; the
-    // host has taken neither buffer 4 nor 5 yet.
+    // The guest committed buffers 4 and 5 on the queue, 5 drawing the surface, then presented it;
+    // the host has taken neither yet (no doorbell was rung).
+    ring.publish(command_buffer_at(obj(1, 1), 100, 4));
+    ring.publish(command_buffer_at(obj(1, 1), 101, 5));
     write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 5)]);
     guest.send(&device, present_surface(0x77));
     presents_waiting(&device, 1);
@@ -3374,16 +3376,18 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert!(quiet(&guest), "answered before it was shown");
     assert_eq!(shown_width(&device), None);
 
-    // Buffer 4 runs and finishes: the present still waits.
-    ring.send(&device, command_buffer_at(obj(1, 1), 100, 4));
-    assert!(complete_until_event(&platform, &mut ring));
+    // The host takes both, and buffer 4 finishes: the present still waits.
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT as u32);
+    let ids = committed(&platform, 2);
+    let world = platform.world();
+    let done = |id| world.complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
+    assert!(done(ids[0]));
     ring.event().expect("buffer 4's CB_COMPLETE");
     presents_waiting(&device, 1);
     assert_eq!(shown_width(&device), None);
 
     // Buffer 5 finishes: the surface shows, and the present is answered.
-    ring.send(&device, command_buffer_at(obj(1, 1), 101, 5));
-    assert!(complete_until_event(&platform, &mut ring));
+    assert!(done(ids[1]));
     let seqno = guest.seqno;
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
     assert_eq!(shown_width(&device), Some(64));
@@ -3402,7 +3406,8 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
 fn presents_keep_their_order_and_a_gone_queue_holds_none() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, _platform) = headless_on(&raised);
-    let (mut guest, _ring) = surface_and_queue(&device);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    ring.publish(command_buffer_at(obj(1, 1), 100, 9));
     write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 9), (obj(1, 7), 3)]);
     guest.send(&device, present_surface(0x77));
     presents_waiting(&device, 1);
@@ -3417,6 +3422,47 @@ fn presents_keep_their_order_and_a_gone_queue_holds_none() {
     assert_eq!(answer_of(&mut guest, first + 1), RGFX_STATUS_OK);
     presents_waiting(&device, 0);
     assert_eq!(shown_width(&device), None, "the scanout, presented last");
+}
+
+/// A writer whose seqno is past every seqno its queue's ring has published, taken or not, names
+/// no command buffer: the present is shown at once, not held for ever, and so is the one after
+/// it; a writer the ring has published holds its present as before
+#[test]
+fn a_writer_past_what_its_queue_published_holds_nothing() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    ring.send(&device, command_buffer_at(obj(1, 1), 100, 1));
+    let taken = committed(&platform, 1);
+    ring.publish(command_buffer_at(obj(1, 1), 101, 2));
+    for bogus in [3, u64::MAX] {
+        write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), bogus)]);
+        guest.send(&device, present_surface(0x77));
+        let seqno = guest.seqno;
+        assert_eq!(
+            answer_of(&mut guest, seqno),
+            RGFX_STATUS_OK,
+            "seqno {bogus}"
+        );
+        presents_waiting(&device, 0);
+    }
+    guest.send(&device, present_surface(0));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+
+    // The published buffer 2, not yet taken, holds its present.
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 2)]);
+    guest.send(&device, present_surface(0x77));
+    presents_waiting(&device, 1);
+    let world = platform.world();
+    assert!(world.complete(
+        taken[0],
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    ring.event().expect("buffer 1's CB_COMPLETE");
+    presents_waiting(&device, 1);
 }
 
 /// A present shows the latest texture a process made over its surface, and an earlier one once

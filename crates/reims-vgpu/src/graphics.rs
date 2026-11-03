@@ -35,14 +35,15 @@ use reims_graphics::wire::{
     RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_SAMPLER_STATE,
-    RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
+    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
+    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState,
+    RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -760,6 +761,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.pending.cancel(obj_id);
                     // A queue's destroy: nothing more of it finishes for a present to wait for.
                     self.presents.queue_gone(obj_id);
+                }
+                // A queue's create, handed with its own poster: what its ring publishes bounds
+                // what a present waits for of it.
+                if r#type == RGFX_CMD_QUEUE_CREATE
+                    && let Some(queue) = poster.queue_obj_id()
+                    && queue == message_identity(message).2
+                {
+                    self.presents.queue_made(queue, poster.clone());
                 }
                 let foreign = foreign_queue(poster, message);
                 let outcome = if foreign {
