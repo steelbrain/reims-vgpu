@@ -138,6 +138,8 @@ mod blit;
 mod cmdbuf;
 mod compute;
 #[cfg(test)]
+mod draw_cost;
+#[cfg(test)]
 mod fuzz;
 mod icb;
 mod lane;
