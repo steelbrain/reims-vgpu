@@ -56,6 +56,50 @@ pub struct RgfxVideoOpDecodeH264 {
 /// Where a `DECODE_H264` op's parameter sets start: right after its body.
 pub const RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET: u32 = 48;
 
+/// Op `DECODE_H265` ([`RgfxVideoOpDecodeH265`], then its parameter sets): decode one HEVC
+/// access unit into an IOSurface of two planes: NV12's (`'420v'` or `'420f'`) for a stream of 8
+/// bits, P010's (`'x420'` or `'xf20'`) for one of 10.
+///
+/// As [`RGFX_OP_VIDEO_DECODE_H264`], on a session of HEVC: the access unit is its slice
+/// segments' NAL units in Annex-B form, the `bitstream_size` bytes at `bitstream_offset` in the
+/// buffer `bitstream_buffer_obj_id`, which the host reads in place, and the SPS and PPS NAL units
+/// they use follow the body, in Annex-B form (`parameter_sets_size` bytes, padded with zeros to a
+/// multiple of 8), where they changed since the session's last decode, its first included. A VPS
+/// there is ignored: the host's decoder makes its own from the SPS.
+///
+/// The picture lands in the surface whose planes `luma_texture_obj_id` (plane 0: `R8Unorm`, or
+/// `R16Unorm` at 10 bits) and `chroma_texture_obj_id` (plane 1: `RG8Unorm`, or `RG16Unorm`) lie
+/// over, at their origin, in its coded size cropped as the SPS says; a sample of 10 bits is the
+/// high bits of its 16. An access unit whose picture the stream's random access skips (a RASL
+/// picture after the CRA picture the session started at) lands nothing, and its command buffer
+/// completes as any other's.
+pub const RGFX_OP_VIDEO_DECODE_H265: u16 = 0x4001;
+
+/// The body of [`RGFX_OP_VIDEO_DECODE_H265`], followed by its parameter sets.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoOpDecodeH265 {
+    /// The buffer that holds the access unit.
+    pub bitstream_buffer_obj_id: u64,
+    /// The access unit's first byte in the buffer.
+    pub bitstream_offset: u64,
+    /// The access unit's bytes.
+    pub bitstream_size: u64,
+    /// The texture over the output surface's plane 0.
+    pub luma_texture_obj_id: u64,
+    /// The texture over the output surface's plane 1.
+    pub chroma_texture_obj_id: u64,
+    /// The bytes of the SPS and PPS NAL units after this body, before its padding; 0 for none.
+    pub parameter_sets_size: u32,
+    /// Zero.
+    pub reserved_2c: u32,
+}
+
+/// Where a `DECODE_H265` op's parameter sets start: right after its body.
+pub const RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET: u32 = 48;
+
 // The video ops' layout.
 const _: () = {
     use core::mem::size_of;
@@ -64,4 +108,9 @@ const _: () = {
         RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET as usize == size_of::<RgfxVideoOpDecodeH264>()
     );
     assert!(super::op_group(RGFX_OP_VIDEO_DECODE_H264) == super::RGFX_OP_GROUP_VIDEO);
+    assert!(size_of::<RgfxVideoOpDecodeH265>() == 48);
+    assert!(
+        RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET as usize == size_of::<RgfxVideoOpDecodeH265>()
+    );
+    assert!(super::op_group(RGFX_OP_VIDEO_DECODE_H265) == super::RGFX_OP_GROUP_VIDEO);
 };

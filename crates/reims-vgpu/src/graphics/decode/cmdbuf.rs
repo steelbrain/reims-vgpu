@@ -1342,15 +1342,18 @@ mod tests {
         RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetScissorRect,
         RgfxOpSetVertexBuffer, RgfxOpSetViewport,
     };
-    use reims_graphics::ops::video::{RGFX_OP_VIDEO_DECODE_H264, RgfxVideoOpDecodeH264};
+    use reims_graphics::ops::video::{
+        RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
+        RgfxVideoOpDecodeH265,
+    };
     use reims_graphics::wire::{
         RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE,
         RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
         RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_VIDEO_SESSION_CREATE,
-        RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS, RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE,
-        RgfxBufferCreate, RgfxCbComplete, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
-        RgfxSharedEventSetValue, RgfxTextureCreate, RgfxTextureDescriptor,
-        RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
+        RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS, RGFX_VIDEO_CODEC_H264,
+        RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxBufferCreate, RgfxCbComplete,
+        RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxSharedEventSetValue,
+        RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
     use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
     use reims_vgpu_core::platform::values::AttachmentState;
@@ -1360,7 +1363,7 @@ mod tests {
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
-    use super::super::{GraphicsVideo, H264Decode, VideoPlane};
+    use super::super::{GraphicsVideo, VideoDecode, VideoPlane};
     use super::*;
 
     /// One op: its header then its body, `len` the whole op.
@@ -1551,9 +1554,9 @@ mod tests {
         msg
     }
 
-    /// A decode a fake host's video was handed: its access unit (offset, size), its parameter
-    /// sets and its planes (offset, bytes per row, width, height).
-    type SeenDecode = (u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
+    /// A decode a fake host's video was handed: its session's codec, its access unit (offset,
+    /// size), its parameter sets and its planes (offset, bytes per row, width, height).
+    type SeenDecode = (u32, u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
 
     /// What a fake host's video was handed: each decode, and whether each of its planes was in a
     /// device cache.
@@ -1563,12 +1566,13 @@ mod tests {
         cached: Mutex<Vec<[bool; 2]>>,
     }
 
-    /// A fake host's video of H.264 decode alone, recording into its [`VideoSeen`]; each of its
-    /// sessions' decodes answers the next value of the session's event, from 1.
+    /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
+    /// its sessions' decodes answers the next value of the session's event, from 1.
     struct FakeVideo(Arc<VideoSeen>, <FakePlatform as Platform>::Device);
 
     /// A session of [`FakeVideo`]'s.
     struct FakeSession {
+        codec: u32,
         seen: Arc<VideoSeen>,
         event: <FakePlatform as Platform>::SharedEvent,
         decodes: AtomicUsize,
@@ -1583,10 +1587,12 @@ mod tests {
             codec: u32,
             direction: u32,
         ) -> Option<Arc<dyn GraphicsVideoSession<FakePlatform>>> {
-            if codec != RGFX_VIDEO_CODEC_H264 || direction != RGFX_VIDEO_DECODE {
+            let codecs = [RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC];
+            if !codecs.contains(&codec) || direction != RGFX_VIDEO_DECODE {
                 return None;
             }
             Some(Arc::new(FakeSession {
+                codec,
                 seen: Arc::clone(&self.0),
                 event: self.1.new_shared_event()?,
                 decodes: AtomicUsize::new(0),
@@ -1599,10 +1605,15 @@ mod tests {
             &self.event
         }
 
-        fn decode_h264(&self, d: &H264Decode<'_, FakePlatform>) -> RaiseResult<u64> {
+        fn codec(&self) -> u32 {
+            self.codec
+        }
+
+        fn decode(&self, d: &VideoDecode<'_, FakePlatform>) -> RaiseResult<u64> {
             let plane =
                 |p: &VideoPlane<'_, FakePlatform>| [p.offset, p.bytes_per_row, p.width, p.height];
             self.seen.decodes.lock().push((
+                self.codec,
                 d.offset,
                 d.size,
                 d.parameter_sets.to_vec(),
@@ -1728,6 +1739,7 @@ mod tests {
         assert_eq!(
             *seen.decodes.lock(),
             [(
+                RGFX_VIDEO_CODEC_H264,
                 16,
                 100,
                 sets.to_vec(),
@@ -1850,6 +1862,108 @@ mod tests {
         let message = command_buffer_message(101, 2, &ops);
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         assert_eq!(seen.decodes.lock().len(), 2);
+    }
+
+    /// An HEVC session takes `DECODE_H265` ops as an H.264 one takes `DECODE_H264`, and a decode
+    /// of the other codec on a session faults its command buffer, handing the session nothing.
+    #[test]
+    fn a_decode_goes_to_a_session_of_its_codec() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let session = |obj_id, codec| RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            codec,
+            direction: RGFX_VIDEO_DECODE,
+        };
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        for m in [
+            session(40, RGFX_VIDEO_CODEC_H264).as_bytes(),
+            session(41, RGFX_VIDEO_CODEC_HEVC).as_bytes(),
+            buffer.as_bytes(),
+        ] {
+            assert_eq!(dec.decode(&device, m).unwrap(), Ok(()));
+        }
+        // P010's planes: rows of 64 pixels of two bytes, then pairs of them.
+        for t in [
+            surface_plane_texture(7, 0, 20, 0, 32, 16),
+            surface_plane_texture(8, 1, 60, 64 * 16, 16, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let sets = [
+            0u8, 0, 0, 1, 0x40, 1, 0, 0, 0, 1, 0x42, 1, 0, 0, 0, 1, 0x44, 1,
+        ];
+        let mut hevc = RgfxVideoOpDecodeH265 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 0,
+            bitstream_size: 64,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            parameter_sets_size: sets.len() as u32,
+            ..RgfxVideoOpDecodeH265::default()
+        }
+        .as_bytes()
+        .to_vec();
+        hevc.extend_from_slice(&sets);
+        hevc.resize(hevc.len().next_multiple_of(8), 0);
+        let h264 = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 0,
+            bitstream_size: 64,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            ..RgfxVideoOpDecodeH264::default()
+        };
+        let pass = |session_obj_id, tag, body: &[u8]| {
+            let pass = RgfxOpVideoPass { session_obj_id };
+            let mut ops = op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes());
+            ops.extend(op(tag, body));
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+            ops
+        };
+        let ops = pass(41, RGFX_OP_VIDEO_DECODE_H265, &hevc);
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(100, 1, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let ops = pass(41, RGFX_OP_VIDEO_DECODE_H264, h264.as_bytes());
+        assert!(
+            dec.decode(&device, &command_buffer_message(100, 2, &ops))
+                .is_err()
+        );
+        let ops = pass(40, RGFX_OP_VIDEO_DECODE_H265, &hevc);
+        assert!(
+            dec.decode(&device, &command_buffer_message(100, 3, &ops))
+                .is_err()
+        );
+        assert_eq!(
+            *seen.decodes.lock(),
+            [(
+                RGFX_VIDEO_CODEC_HEVC,
+                0,
+                64,
+                sets.to_vec(),
+                [0, 64, 32, 16],
+                [64 * 16, 64, 16, 8]
+            )]
+        );
     }
 
     /// A video output whose surface's block has a device cache is handed to the session as in

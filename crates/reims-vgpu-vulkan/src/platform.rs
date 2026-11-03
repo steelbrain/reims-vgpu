@@ -253,6 +253,11 @@ pub const VIDEO_DECODE_EXTENSIONS: [&std::ffi::CStr; 4] = [
     c"VK_KHR_synchronization2",
 ];
 
+/// The device extension of Vulkan Video's H.265 decode, which every device enables where it has
+/// it ([`device_options`]), beside [`VIDEO_DECODE_EXTENSIONS`]: the video-decode queue's decodes
+/// take HEVC where the device has it and the queue's family decodes it, and H.264 without it.
+pub const VIDEO_DECODE_H265_EXTENSION: &std::ffi::CStr = c"VK_KHR_video_decode_h265";
+
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
@@ -272,9 +277,9 @@ pub const VIDEO_DECODE_EXTENSIONS: [&std::ffi::CStr; 4] = [
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
 /// those below the least severity the log takes ([`crate::answer::least_severity`]), and a
 /// video-decode queue of the caller's, with the extensions its decodes use where the device has
-/// them ([`VIDEO_DECODE_EXTENSIONS`]), and one queue of the runtime's own families reserved for
-/// the caller. One set, so the runtime keeps one device per physical device across
-/// `open_device` and every other open.
+/// them ([`VIDEO_DECODE_EXTENSIONS`], [`VIDEO_DECODE_H265_EXTENSION`]), and one queue of the
+/// runtime's own families reserved for the caller. One set, so the runtime keeps one device per
+/// physical device across `open_device` and every other open.
 ///
 /// **The video-decode queue** is the reims-graphics device's hardware video's (reims-vgpu's
 /// `platform::vulkan::graphics_video`), which alone submits to it. A device without a
@@ -360,6 +365,7 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         options.extra_queues = vec![ash::vk::QueueFlags::VIDEO_DECODE_KHR];
         options.reserved_queues = 1;
         options.optional_device_extensions = (VIDEO_DECODE_EXTENSIONS.iter())
+            .chain([&VIDEO_DECODE_H265_EXTENSION])
             .map(|&name| name.to_owned())
             .collect();
         options

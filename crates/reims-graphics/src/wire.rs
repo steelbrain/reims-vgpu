@@ -2428,6 +2428,12 @@ pub const RGFX_VIDEO_H264_MAIN: u32 = 1 << 1;
 /// [`RgfxVideoCodecCaps::profiles`] of H.264: High (100).
 pub const RGFX_VIDEO_H264_HIGH: u32 = 1 << 2;
 
+/// [`RgfxVideoCodecCaps::profiles`] of HEVC: Main (`general_profile_idc` 1; a Main Still
+/// Picture stream decodes as one).
+pub const RGFX_VIDEO_HEVC_MAIN: u32 = 1 << 0;
+/// [`RgfxVideoCodecCaps::profiles`] of HEVC: Main 10 (2).
+pub const RGFX_VIDEO_HEVC_MAIN_10: u32 = 1 << 1;
+
 /// [`RgfxVideoCodecCaps::formats`]: 8-bit 4:2:0 in two planes, NV12 (`'420v'`, `'420f'`).
 pub const RGFX_VIDEO_FORMAT_NV12: u32 = 1 << 0;
 /// [`RgfxVideoCodecCaps::formats`]: 10-bit 4:2:0 in two planes, P010 (`'x420'`, `'xf20'`).
@@ -2451,7 +2457,8 @@ pub struct RgfxVideoCodecCaps {
     pub direction: u32,
     /// The profiles taken, `RGFX_VIDEO_<codec>_*` bits.
     pub profiles: u32,
-    /// The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2).
+    /// The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2; HEVC's
+    /// `general_level_idc`, 153 for 5.1).
     pub max_level: u32,
     /// The smallest coded picture: width, height.
     pub min_size: [u32; 2],

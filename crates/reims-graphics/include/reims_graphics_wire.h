@@ -705,6 +705,28 @@
 // Where a `DECODE_H264` op's parameter sets start: right after its body.
 #define RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET 48
 
+// Op `DECODE_H265` ([`RgfxVideoOpDecodeH265`], then its parameter sets): decode one HEVC
+// access unit into an IOSurface of two planes: NV12's (`'420v'` or `'420f'`) for a stream of 8
+// bits, P010's (`'x420'` or `'xf20'`) for one of 10.
+//
+// As [`RGFX_OP_VIDEO_DECODE_H264`], on a session of HEVC: the access unit is its slice
+// segments' NAL units in Annex-B form, the `bitstream_size` bytes at `bitstream_offset` in the
+// buffer `bitstream_buffer_obj_id`, which the host reads in place, and the SPS and PPS NAL units
+// they use follow the body, in Annex-B form (`parameter_sets_size` bytes, padded with zeros to a
+// multiple of 8), where they changed since the session's last decode, its first included. A VPS
+// there is ignored: the host's decoder makes its own from the SPS.
+//
+// The picture lands in the surface whose planes `luma_texture_obj_id` (plane 0: `R8Unorm`, or
+// `R16Unorm` at 10 bits) and `chroma_texture_obj_id` (plane 1: `RG8Unorm`, or `RG16Unorm`) lie
+// over, at their origin, in its coded size cropped as the SPS says; a sample of 10 bits is the
+// high bits of its 16. An access unit whose picture the stream's random access skips (a RASL
+// picture after the CRA picture the session started at) lands nothing, and its command buffer
+// completes as any other's.
+#define RGFX_OP_VIDEO_DECODE_H265 16385
+
+// Where a `DECODE_H265` op's parameter sets start: right after its body.
+#define RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET 48
+
 // The device's PCI vendor ID: a placeholder until the owner picks the device's own.
 #define RGFX_PCI_VENDOR_ID 4660
 
@@ -1542,6 +1564,13 @@
 
 // [`RgfxVideoCodecCaps::profiles`] of H.264: High (100).
 #define RGFX_VIDEO_H264_HIGH (1 << 2)
+
+// [`RgfxVideoCodecCaps::profiles`] of HEVC: Main (`general_profile_idc` 1; a Main Still
+// Picture stream decodes as one).
+#define RGFX_VIDEO_HEVC_MAIN (1 << 0)
+
+// [`RgfxVideoCodecCaps::profiles`] of HEVC: Main 10 (2).
+#define RGFX_VIDEO_HEVC_MAIN_10 (1 << 1)
 
 // [`RgfxVideoCodecCaps::formats`]: 8-bit 4:2:0 in two planes, NV12 (`'420v'`, `'420f'`).
 #define RGFX_VIDEO_FORMAT_NV12 (1 << 0)
@@ -5118,7 +5147,8 @@ typedef struct {
   uint32_t direction;
   // The profiles taken, `RGFX_VIDEO_<codec>_*` bits.
   uint32_t profiles;
-  // The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2).
+  // The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2; HEVC's
+  // `general_level_idc`, 153 for 5.1).
   uint32_t max_level;
   // The smallest coded picture: width, height.
   uint32_t min_size[2];
@@ -5169,6 +5199,24 @@ typedef struct {
   // Zero.
   uint32_t reserved_2c;
 } RgfxVideoOpDecodeH264;
+
+// The body of [`RGFX_OP_VIDEO_DECODE_H265`], followed by its parameter sets.
+typedef struct {
+  // The buffer that holds the access unit.
+  uint64_t bitstream_buffer_obj_id;
+  // The access unit's first byte in the buffer.
+  uint64_t bitstream_offset;
+  // The access unit's bytes.
+  uint64_t bitstream_size;
+  // The texture over the output surface's plane 0.
+  uint64_t luma_texture_obj_id;
+  // The texture over the output surface's plane 1.
+  uint64_t chroma_texture_obj_id;
+  // The bytes of the SPS and PPS NAL units after this body, before its padding; 0 for none.
+  uint32_t parameter_sets_size;
+  // Zero.
+  uint32_t reserved_2c;
+} RgfxVideoOpDecodeH265;
 
 // `VIDEO_SESSION_CREATE`: a video session.
 typedef struct {

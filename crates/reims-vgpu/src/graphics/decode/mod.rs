@@ -150,7 +150,7 @@ mod video;
 mod view;
 mod waits;
 
-pub use video::{GraphicsVideo, GraphicsVideoSession, H264Decode, VideoPlane};
+pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
 
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};

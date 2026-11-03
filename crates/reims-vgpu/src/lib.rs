@@ -59,7 +59,7 @@ pub use error::{Error, ResumeError};
 pub use frame::{Frame, FrameTarget, MAX_FRAME_TARGET_SIZE, PixelFormat, Region};
 pub use graphics::{
     GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsVideo,
-    GraphicsVideoSession, H264Decode, ScanoutWrittenFn, VideoPlane,
+    GraphicsVideoSession, ScanoutWrittenFn, VideoDecode, VideoPlane,
 };
 pub use iosurface::{IoSurfaceDevice, IoSurfaceDeviceConfig};
 pub use platform::ApiPlatform;

@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use reims_graphics::ops::video::{
-    RGFX_OP_VIDEO_DECODE_H264, RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET, RgfxVideoOpDecodeH264,
+    RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
+    RgfxVideoOpDecodeH265,
 };
-use reims_graphics::wire::RgfxVideoCodecCaps;
+use reims_graphics::wire::{RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::event::EventRef;
@@ -52,10 +53,14 @@ pub trait GraphicsVideoSession<P: Platform>: Send + Sync {
     /// The shared event the session's work signals, which command buffers wait for.
     fn event(&self) -> &P::SharedEvent;
 
+    /// The codec of its access units (`RGFX_VIDEO_CODEC_*`).
+    fn codec(&self) -> u32;
+
     /// Starts the decode of `decode`'s access unit, after the session's earlier work, and answers
-    /// the value [`Self::event`] reaches once the output holds the picture. An `Err` faults the
+    /// the value [`Self::event`] reaches once the output holds the picture, or, for a picture the
+    /// stream's random access skips, once the session's earlier work is done. An `Err` faults the
     /// command buffer, and starts nothing.
-    fn decode_h264(&self, decode: &H264Decode<'_, P>) -> RaiseResult<u64>;
+    fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<u64>;
 }
 
 /// Where a texture over a plane of an IOSurface lies in its buffer, as its
@@ -93,21 +98,65 @@ pub struct VideoPlane<'a, P: Platform> {
     pub cached: bool,
 }
 
-/// One H.264 access unit to decode ([`RGFX_OP_VIDEO_DECODE_H264`]).
-pub struct H264Decode<'a, P: Platform> {
+/// One access unit to decode, of the session's codec: H.264's ([`RGFX_OP_VIDEO_DECODE_H264`]) or
+/// HEVC's ([`RGFX_OP_VIDEO_DECODE_H265`]).
+pub struct VideoDecode<'a, P: Platform> {
     /// The buffer that holds the access unit's slices, in Annex-B form.
     pub bitstream: &'a P::Buffer,
     /// The access unit's first byte in the buffer.
     pub offset: u64,
     /// The access unit's bytes.
     pub size: u64,
-    /// The SPS and PPS NAL units that changed since the session's last decode, in Annex-B form;
-    /// empty for none.
+    /// The parameter sets that changed since the session's last decode (H.264's SPS and PPS,
+    /// HEVC's VPS, SPS and PPS), NAL units in Annex-B form; empty for none.
     pub parameter_sets: &'a [u8],
-    /// The output's luma plane (`R8`).
+    /// The output's luma plane (`R8`, or `R16` at 10 bits).
     pub luma: VideoPlane<'a, P>,
-    /// The output's chroma plane (`RG8`, a pair of bytes a pixel).
+    /// The output's chroma plane (`RG8`, a pair of samples a pixel, or `RG16`).
     pub chroma: VideoPlane<'a, P>,
+}
+
+/// The fields the decode ops' bodies share ([`RgfxVideoOpDecodeH264`],
+/// [`RgfxVideoOpDecodeH265`]), and the session codec each op is of.
+struct DecodeOp {
+    codec: u32,
+    bitstream_buffer_obj_id: u64,
+    bitstream_offset: u64,
+    bitstream_size: u64,
+    luma_texture_obj_id: u64,
+    chroma_texture_obj_id: u64,
+    parameter_sets_size: u32,
+}
+
+impl DecodeOp {
+    /// The op `tag`'s body at the front of `payload`, and the bytes after it, its parameter sets
+    /// first (each body's `*_PARAMETER_SETS_OFFSET` is its size); `None` for a tag that is no
+    /// decode.
+    fn read(tag: u16, payload: &[u8]) -> Option<RaiseResult<(Self, &[u8])>> {
+        macro_rules! body {
+            ($body:ty, $codec:expr) => {
+                <$body>::read_from_prefix(payload)
+                    .map(|(m, rest)| {
+                        let op = Self {
+                            codec: $codec,
+                            bitstream_buffer_obj_id: m.bitstream_buffer_obj_id,
+                            bitstream_offset: m.bitstream_offset,
+                            bitstream_size: m.bitstream_size,
+                            luma_texture_obj_id: m.luma_texture_obj_id,
+                            chroma_texture_obj_id: m.chroma_texture_obj_id,
+                            parameter_sets_size: m.parameter_sets_size,
+                        };
+                        (op, rest)
+                    })
+                    .map_err(|_| op_fault(format_args!("video op {tag:#06x}: body too short")))
+            };
+        }
+        Some(match tag {
+            RGFX_OP_VIDEO_DECODE_H264 => body!(RgfxVideoOpDecodeH264, RGFX_VIDEO_CODEC_H264),
+            RGFX_OP_VIDEO_DECODE_H265 => body!(RgfxVideoOpDecodeH265, RGFX_VIDEO_CODEC_HEVC),
+            _ => return None,
+        })
+    }
 }
 
 /// Decodes one video-encoder op: `tag` its op, `payload` its body (the bytes after its
@@ -120,88 +169,88 @@ pub(super) fn decode_op<P: Platform>(
     session: &Arc<dyn GraphicsVideoSession<P>>,
     cb: &P::CommandBuffer,
 ) -> RaiseResult<bool> {
-    match tag {
-        RGFX_OP_VIDEO_DECODE_H264 => {
-            let (m, rest) = RgfxVideoOpDecodeH264::read_from_prefix(payload)
-                .map_err(|_| op_fault(format_args!("video op {tag:#06x}: body too short")))?;
-            let sets = usize::try_from(m.parameter_sets_size)
-                .ok()
-                .and_then(|n| rest.get(..n))
-                .ok_or_else(|| {
-                    op_fault(format_args!(
-                        "video op {tag:#06x}: {} bytes of parameter sets past its end",
-                        m.parameter_sets_size
-                    ))
-                })?;
-            debug_assert_eq!(
-                payload.len() - rest.len(),
-                RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET as usize
-            );
-            let bitstream = objs.require_buffer(m.bitstream_buffer_obj_id)?;
-            let in_bitstream = m
-                .bitstream_offset
-                .checked_add(m.bitstream_size)
-                .is_some_and(|end| m.bitstream_size > 0 && end <= bitstream.length());
-            if !in_bitstream {
-                return Err(op_fault(format_args!(
-                    "video op {tag:#06x}: an access unit of {} bytes at {} past its buffer",
-                    m.bitstream_size, m.bitstream_offset
-                )));
-            }
-            let (luma_place, luma) = objs.plane_of(m.luma_texture_obj_id)?;
-            let (chroma_place, chroma) = objs.plane_of(m.chroma_texture_obj_id)?;
-            // The block of a plane in its surface's device cache.
-            let cache_of = |buffer_obj_id| {
-                (objs.span_of(buffer_obj_id))
-                    .map(|(block, _)| block)
-                    .filter(|&block| objs.surface_caches.has(block))
-            };
-            let (luma_cache, chroma_cache) = (
-                cache_of(luma_place.buffer_obj_id),
-                cache_of(chroma_place.buffer_obj_id),
-            );
-            // An output in a device cache the host is filling for this buffer (a CPU wrote the
-            // surface since): the picture lands once the fill is done, so the fill's older bytes
-            // never land over it.
-            for block in luma_cache.into_iter().chain(chroma_cache) {
-                if !objs.surface_caches.wait_filled(block, FILL_WAIT) {
-                    return Err(op_fault(format_args!(
-                        "video op {tag:#06x}: its output's device cache was not filled within \
-                         {FILL_WAIT:?}"
-                    )));
-                }
-            }
-            let decode = H264Decode {
-                bitstream,
-                offset: m.bitstream_offset,
-                size: m.bitstream_size,
-                parameter_sets: sets,
-                luma: VideoPlane {
-                    buffer: luma,
-                    offset: luma_place.offset,
-                    bytes_per_row: luma_place.bytes_per_row,
-                    width: luma_place.width,
-                    height: luma_place.height,
-                    cached: luma_cache.is_some(),
-                },
-                chroma: VideoPlane {
-                    buffer: chroma,
-                    offset: chroma_place.offset,
-                    bytes_per_row: chroma_place.bytes_per_row,
-                    width: chroma_place.width,
-                    height: chroma_place.height,
-                    cached: chroma_cache.is_some(),
-                },
-            };
-            // After the buffers of other queues its command buffer runs after: the reads of the
-            // output it would land over among them.
-            objs.wait_for_order_on_cpu();
-            let done = session.decode_h264(&decode)?;
-            cb.encode_wait(Some(EventRef::Shared(session.event())), done)?;
-            Ok(true)
-        }
-        _ => Ok(false),
+    let Some(read) = DecodeOp::read(tag, payload) else {
+        return Ok(false);
+    };
+    let (m, rest) = read?;
+    if m.codec != session.codec() {
+        return Err(op_fault(format_args!(
+            "video op {tag:#06x}: a decode of codec {} on a session of codec {}",
+            m.codec,
+            session.codec()
+        )));
     }
+    let sets = usize::try_from(m.parameter_sets_size)
+        .ok()
+        .and_then(|n| rest.get(..n))
+        .ok_or_else(|| {
+            op_fault(format_args!(
+                "video op {tag:#06x}: {} bytes of parameter sets past its end",
+                m.parameter_sets_size
+            ))
+        })?;
+    let bitstream = objs.require_buffer(m.bitstream_buffer_obj_id)?;
+    let in_bitstream = m
+        .bitstream_offset
+        .checked_add(m.bitstream_size)
+        .is_some_and(|end| m.bitstream_size > 0 && end <= bitstream.length());
+    if !in_bitstream {
+        return Err(op_fault(format_args!(
+            "video op {tag:#06x}: an access unit of {} bytes at {} past its buffer",
+            m.bitstream_size, m.bitstream_offset
+        )));
+    }
+    let (luma_place, luma) = objs.plane_of(m.luma_texture_obj_id)?;
+    let (chroma_place, chroma) = objs.plane_of(m.chroma_texture_obj_id)?;
+    // The block of a plane in its surface's device cache.
+    let cache_of = |buffer_obj_id| {
+        (objs.span_of(buffer_obj_id))
+            .map(|(block, _)| block)
+            .filter(|&block| objs.surface_caches.has(block))
+    };
+    let (luma_cache, chroma_cache) = (
+        cache_of(luma_place.buffer_obj_id),
+        cache_of(chroma_place.buffer_obj_id),
+    );
+    // An output in a device cache the host is filling for this buffer (a CPU wrote the
+    // surface since): the picture lands once the fill is done, so the fill's older bytes
+    // never land over it.
+    for block in luma_cache.into_iter().chain(chroma_cache) {
+        if !objs.surface_caches.wait_filled(block, FILL_WAIT) {
+            return Err(op_fault(format_args!(
+                "video op {tag:#06x}: its output's device cache was not filled within \
+                 {FILL_WAIT:?}"
+            )));
+        }
+    }
+    let decode = VideoDecode {
+        bitstream,
+        offset: m.bitstream_offset,
+        size: m.bitstream_size,
+        parameter_sets: sets,
+        luma: VideoPlane {
+            buffer: luma,
+            offset: luma_place.offset,
+            bytes_per_row: luma_place.bytes_per_row,
+            width: luma_place.width,
+            height: luma_place.height,
+            cached: luma_cache.is_some(),
+        },
+        chroma: VideoPlane {
+            buffer: chroma,
+            offset: chroma_place.offset,
+            bytes_per_row: chroma_place.bytes_per_row,
+            width: chroma_place.width,
+            height: chroma_place.height,
+            cached: chroma_cache.is_some(),
+        },
+    };
+    // After the buffers of other queues its command buffer runs after: the reads of the
+    // output it would land over among them.
+    objs.wait_for_order_on_cpu();
+    let done = session.decode(&decode)?;
+    cb.encode_wait(Some(EventRef::Shared(session.event())), done)?;
+    Ok(true)
 }
 
 impl<P: Platform> GraphicsDecoder<P> {

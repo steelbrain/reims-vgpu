@@ -1,7 +1,9 @@
 //! The reims-graphics device's hardware video on the Vulkan platform ([`graphics_video`]):
-//! Vulkan Video on the runtime's own device, through the video crate's decoder
+//! Vulkan Video on the runtime's own device, through the video crate's decoders
 //! (`reims-vgpu-video-vulkan`), on the video-decode queue the device made for it
-//! (`reims_vgpu_vulkan::platform::VIDEO_DECODE_EXTENSIONS` says what it enables for it).
+//! (`reims_vgpu_vulkan::platform::VIDEO_DECODE_EXTENSIONS` says what it enables for it): H.264,
+//! and HEVC, Main and Main 10, where the device has `VK_KHR_video_decode_h265` and the queue's
+//! family decodes it (`VIDEO_DECODE_H265_EXTENSION`).
 //!
 //! - **One video a device.** The decoders of every session of a runtime device share one
 //!   [`VideoDevice`] over its handles, which alone submits to the device's video-decode queue.
@@ -49,8 +51,9 @@ use std::time::Duration;
 use ash::vk;
 use metal2vulkan_runtime as rt;
 use reims_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_H264_BASELINE,
-    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RgfxVideoCodecCaps,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_FORMAT_NV12,
+    RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
+    RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
 };
 use reims_vgpu_core::memory::dirty::host_write;
 use reims_vgpu_core::platform::Handle as _;
@@ -59,17 +62,18 @@ use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::raise::{Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video_vulkan::{
-    BufferPlanes, Error as VideoError, H264Capabilities, H264Decoder, H264Profile, HostImport,
-    ImportedPlanes, Landing, LentQueue, RawDevice, SampleMemory, Surface, SurfaceSource,
-    SurfaceSpec, VideoDevice, h264_capabilities,
+    BufferPlanes, Capabilities, Error as VideoError, H264Capabilities, H264Decoder, H264Profile,
+    H265Capabilities, H265Decoder, H265Profile, HostImport, ImportedPlanes, Landing, LentQueue,
+    RawDevice, SampleMemory, Surface, SurfaceSource, SurfaceSpec, VideoDevice, h264_capabilities,
+    h265_capabilities, hevc,
 };
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 use reims_vgpu_vulkan::gpu::event::VulkanSharedEvent;
-use reims_vgpu_vulkan::platform::VIDEO_DECODE_EXTENSIONS;
+use reims_vgpu_vulkan::platform::{VIDEO_DECODE_EXTENSIONS, VIDEO_DECODE_H265_EXTENSION};
 
 use crate::graphics::decode::{
-    GraphicsVideo, GraphicsVideoSession, H264Decode, VideoPlane, op_fault,
+    GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane, op_fault,
 };
 
 /// How long a session's end waits for its last signal to land.
@@ -80,7 +84,7 @@ type MadeVideos = Vec<(u64, Weak<DeviceVideo>)>;
 
 /// The hardware video of `device`: the one its sessions share, made on first use; `None` where
 /// the device has no video-decode queue, lacks the extensions its decodes use, or decodes no
-/// H.264.
+/// H.264. HEVC rides with it where the device decodes it.
 pub(crate) fn graphics_video(
     device: &VulkanDevice,
 ) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
@@ -104,12 +108,15 @@ pub(crate) fn graphics_video(
 /// A runtime device's hardware video, as the graphics device sees it.
 struct VulkanVideo(Arc<DeviceVideo>);
 
-/// A runtime device's hardware video: its decoders' device, and what it answers for H.264.
+/// A runtime device's hardware video: its decoders' device, and what it answers for H.264 and
+/// HEVC.
 struct DeviceVideo {
     /// The decoders' device, over the runtime's handles; dropped before the runtime's device.
     video: Arc<VideoDevice>,
     /// What it answers for each H.264 profile it decodes.
     h264: Vec<H264Capabilities>,
+    /// What it answers for each HEVC profile it decodes; none where it decodes no HEVC.
+    h265: Vec<H265Capabilities>,
     /// Whether the decoders copy pictures out on a queue of the runtime's families (the
     /// reserved queue, or a lent one: [`RuntimeQueue`]), which writes the runtime's buffers, an
     /// IOSurface's device cache among them.
@@ -190,6 +197,7 @@ impl DeviceVideo {
                 .instance
                 .get_physical_device_queue_family_properties(handles.physical_device)
         };
+        let codecs = decoded_codecs(&handles, queue.family, raw);
         let copies = vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
         let decode_copies = usize::try_from(queue.family)
             .ok()
@@ -226,19 +234,16 @@ impl DeviceVideo {
             .or(lent.as_ref().map(|lent| lent.family))
             .unwrap_or(queue.family);
         // SAFETY: the handles are the runtime's device's, made as `RawDevice` says (the video
-        // extensions and synchronization2 checked above, timeline semaphores the runtime's own
-        // events use), and live while `device` holds the device, which outlives `video`; the
-        // decode queue and the reserved queue are submitted to by `video`'s decoders alone (the
-        // runtime never submits to either, and this device's one video makes the only decoders
-        // on them), and a lent queue is the device's, of its family.
+        // extensions and synchronization2 checked above, each codec's extension and the decode
+        // family's codecs by `decoded_codecs`, timeline semaphores the runtime's own events
+        // use), and live while `device` holds the device, which outlives `video`; the decode
+        // queue and the reserved queue are submitted to by `video`'s decoders alone (the runtime
+        // never submits to either, and this device's one video makes the only decoders on
+        // them), and a lent queue is the device's, of its family.
         let video = unsafe {
             match lent {
-                Some(lent) => VideoDevice::from_raw_copying_on(
-                    device_raw,
-                    vk::VideoCodecOperationFlagsKHR::DECODE_H264,
-                    Box::new(lent),
-                ),
-                None => Ok(VideoDevice::from_raw(device_raw)),
+                Some(lent) => VideoDevice::from_raw_copying_on(device_raw, codecs, Box::new(lent)),
+                None => Ok(VideoDevice::from_raw_with_codecs(device_raw, codecs)),
             }
         };
         let video = match video {
@@ -256,15 +261,18 @@ impl DeviceVideo {
             );
             return None;
         }
+        let h265 = h265_capabilities(&video);
         log::info!(
-            "hardware video: H.264 decode on {}, queue family {}, its pictures copied out on \
+            "hardware video: H.264{} decode on {}, queue family {}, its pictures copied out on \
              {copy_queue}, family {copy_family}",
+            if h265.is_empty() { "" } else { " and HEVC" },
             video.name(),
             queue.family
         );
         Some(Self {
             video,
             h264,
+            h265,
             caches,
             device: device.clone_ref(),
         })
@@ -272,9 +280,12 @@ impl DeviceVideo {
 }
 
 impl GraphicsVideo<VulkanPlatform> for VulkanVideo {
-    /// H.264 decode: every profile some device profile decodes, at the least of their limits.
+    /// H.264 decode, and HEVC decode where the device has it: every profile some device profile
+    /// decodes, at the least of their limits.
     fn caps(&self) -> Vec<RgfxVideoCodecCaps> {
-        h264_caps(&self.0.h264).into_iter().collect()
+        (h264_caps(&self.0.h264).into_iter())
+            .chain(h265_caps(&self.0.h265))
+            .collect()
     }
 
     fn session(
@@ -282,10 +293,15 @@ impl GraphicsVideo<VulkanPlatform> for VulkanVideo {
         codec: u32,
         direction: u32,
     ) -> Option<Arc<dyn GraphicsVideoSession<VulkanPlatform>>> {
-        if codec != RGFX_VIDEO_CODEC_H264 || direction != RGFX_VIDEO_DECODE {
+        if direction != RGFX_VIDEO_DECODE {
             return None;
         }
-        Some(Arc::new(H264Session::new(&self.0)?))
+        let decoder = match codec {
+            RGFX_VIDEO_CODEC_H264 => CodecDecoder::h264(&self.0)?,
+            RGFX_VIDEO_CODEC_HEVC if !self.0.h265.is_empty() => CodecDecoder::h265(&self.0)?,
+            _ => return None,
+        };
+        Some(Arc::new(DecodeSession::new(&self.0, decoder)?))
     }
 
     /// Where the decoders copy pictures out on a runtime queue, which writes a device cache.
@@ -294,23 +310,28 @@ impl GraphicsVideo<VulkanPlatform> for VulkanVideo {
     }
 }
 
-/// The caps of H.264 decode, from what the device answers for each profile; `None` for none.
-fn h264_caps(profiles: &[H264Capabilities]) -> Option<RgfxVideoCodecCaps> {
+/// The caps of `codec`'s decode at the least of the limits the device answers for its
+/// `profiles`, `level` each one's highest level; `None` for no profile. Its profiles and formats
+/// are the caller's.
+fn decode_caps<P: Copy>(
+    codec: u32,
+    profiles: &[Capabilities<P>],
+    level: impl Fn(&Capabilities<P>) -> u32,
+) -> Option<RgfxVideoCodecCaps> {
     let first = profiles.first()?;
     let mut caps = RgfxVideoCodecCaps {
-        codec: RGFX_VIDEO_CODEC_H264,
+        codec,
         direction: RGFX_VIDEO_DECODE,
-        max_level: u32::from(first.max_level_idc),
+        max_level: level(first),
         min_size: [first.min_coded_extent.width, first.min_coded_extent.height],
         max_size: [first.max_coded_extent.width, first.max_coded_extent.height],
         max_dpb_pictures: first.max_dpb_slots,
         max_references: first.max_active_reference_pictures,
-        formats: RGFX_VIDEO_FORMAT_NV12,
         ..RgfxVideoCodecCaps::default()
     };
     let mut alignment = 1u64;
     for p in profiles {
-        caps.max_level = caps.max_level.min(u32::from(p.max_level_idc));
+        caps.max_level = caps.max_level.min(level(p));
         caps.min_size[0] = caps.min_size[0].max(p.min_coded_extent.width);
         caps.min_size[1] = caps.min_size[1].max(p.min_coded_extent.height);
         caps.max_size[0] = caps.max_size[0].min(p.max_coded_extent.width);
@@ -321,6 +342,16 @@ fn h264_caps(profiles: &[H264Capabilities]) -> Option<RgfxVideoCodecCaps> {
             .max(p.min_bitstream_buffer_offset_alignment)
             .max(p.min_bitstream_buffer_size_alignment);
     }
+    caps.bitstream_alignment = u32::try_from(alignment).unwrap_or(u32::MAX);
+    Some(caps)
+}
+
+/// The caps of H.264 decode, from what the device answers for each profile; `None` for none.
+fn h264_caps(profiles: &[H264Capabilities]) -> Option<RgfxVideoCodecCaps> {
+    let mut caps = decode_caps(RGFX_VIDEO_CODEC_H264, profiles, |p| {
+        u32::from(p.max_level_idc)
+    })?;
+    caps.formats = RGFX_VIDEO_FORMAT_NV12;
     // A stream of a profile decodes on the first of its candidates the device has
     // (`H264Profile::candidates`): Baseline on Main or High, Main on High.
     let has = |profile: H264Profile| profiles.iter().any(|p| p.profile == profile);
@@ -333,8 +364,61 @@ fn h264_caps(profiles: &[H264Capabilities]) -> Option<RgfxVideoCodecCaps> {
             caps.profiles |= bit;
         }
     }
-    caps.bitstream_alignment = u32::try_from(alignment).unwrap_or(u32::MAX);
     Some(caps)
+}
+
+/// The caps of HEVC decode, from what the device answers for Main and Main 10, each into its own
+/// format (NV12, P010); `None` for neither.
+fn h265_caps(profiles: &[H265Capabilities]) -> Option<RgfxVideoCodecCaps> {
+    let mut caps = decode_caps(RGFX_VIDEO_CODEC_HEVC, profiles, |p| {
+        u32::from(p.max_level_idc)
+    })?;
+    for p in profiles {
+        let (bit, format) = if p.profile == H265Profile::MAIN_10 {
+            (RGFX_VIDEO_HEVC_MAIN_10, RGFX_VIDEO_FORMAT_P010)
+        } else {
+            (RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_FORMAT_NV12)
+        };
+        caps.profiles |= bit;
+        caps.formats |= format;
+    }
+    Some(caps)
+}
+
+/// The codecs the device's video-decode family decodes with the extension of each enabled:
+/// H.264's, which the decoders' device takes for granted, and H.265's where the family has it.
+fn decoded_codecs(
+    handles: &rt::DeviceHandles<'_>,
+    family: u32,
+    raw: &rt::Device,
+) -> vk::VideoCodecOperationFlagsKHR {
+    let instance = &handles.instance;
+    // SAFETY: the physical device is the instance's.
+    let count = unsafe {
+        instance.get_physical_device_queue_family_properties2_len(handles.physical_device)
+    };
+    let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); count];
+    let mut properties: Vec<vk::QueueFamilyProperties2<'_>> = (video.iter_mut())
+        .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
+        .collect();
+    // SAFETY: as above, `properties` holds `count` structures, each chained to one of `video`.
+    unsafe {
+        instance
+            .get_physical_device_queue_family_properties2(handles.physical_device, &mut properties);
+    }
+    drop(properties);
+    let decodes = usize::try_from(family)
+        .ok()
+        .and_then(|family| video.get(family))
+        .map_or(vk::VideoCodecOperationFlagsKHR::empty(), |v| {
+            v.video_codec_operations
+        });
+    let mut codecs = vk::VideoCodecOperationFlagsKHR::DECODE_H264;
+    let h265 = vk::VideoCodecOperationFlagsKHR::DECODE_H265;
+    if decodes.contains(h265) && raw.enables_extension(VIDEO_DECODE_H265_EXTENSION) {
+        codecs |= h265;
+    }
+    codecs
 }
 
 /// Where a decode's picture lands: its output surface's planes.
@@ -373,8 +457,103 @@ impl SurfaceSource for GuestOutputs {
     }
 }
 
-/// An H.264 decode session.
-struct H264Session {
+/// A session's decoder, of its codec.
+enum CodecDecoder {
+    H264(H264Decoder<GuestOutputs>),
+    H265(H265Decoder<GuestOutputs>),
+}
+
+impl CodecDecoder {
+    /// An H.264 decoder of Annex-B access units, landing its pictures where the session puts them.
+    fn h264(video: &Arc<DeviceVideo>) -> Option<(Self, Arc<Mutex<Option<Output>>>)> {
+        let next = Arc::new(Mutex::new(None));
+        match H264Decoder::new_annex_b(&video.video, GuestOutputs(Arc::clone(&next))) {
+            Ok(decoder) => Some((Self::H264(decoder), next)),
+            Err(error) => {
+                log::warn!("hardware video: no H.264 decoder: {error}");
+                None
+            }
+        }
+    }
+
+    /// An HEVC decoder of Annex-B access units, as [`Self::h264`].
+    fn h265(video: &Arc<DeviceVideo>) -> Option<(Self, Arc<Mutex<Option<Output>>>)> {
+        let next = Arc::new(Mutex::new(None));
+        match H265Decoder::new_annex_b(&video.video, GuestOutputs(Arc::clone(&next))) {
+            Ok(decoder) => Some((Self::H265(decoder), next)),
+            Err(error) => {
+                log::warn!("hardware video: no HEVC decoder: {error}");
+                None
+            }
+        }
+    }
+
+    /// The session's codec (`RGFX_VIDEO_CODEC_*`).
+    fn codec(&self) -> u32 {
+        match self {
+            Self::H264(_) => RGFX_VIDEO_CODEC_H264,
+            Self::H265(_) => RGFX_VIDEO_CODEC_HEVC,
+        }
+    }
+
+    /// Decodes `sample`, tagged `id`; the frames it gives back go, their outputs written once
+    /// the decoder's timeline passes their work. A picture HEVC's random access skips is no
+    /// failure.
+    fn decode(&mut self, sample: &[u8], id: u64) -> Result<(), VideoError> {
+        match self {
+            Self::H264(decoder) => decoder.decode(sample, id).map(drop),
+            Self::H265(decoder) => skipped_is_none(decoder.decode(sample, id)),
+        }
+    }
+
+    /// [`Self::decode`] of a sample whose bytes lie in `memory` too.
+    ///
+    /// # Safety
+    ///
+    /// As for the decoders' `decode_in_place`.
+    unsafe fn decode_in_place(
+        &mut self,
+        sample: &[u8],
+        id: u64,
+        memory: SampleMemory,
+    ) -> Result<(), VideoError> {
+        // SAFETY: as the caller promises.
+        unsafe {
+            match self {
+                Self::H264(decoder) => decoder.decode_in_place(sample, id, memory).map(drop),
+                Self::H265(decoder) => skipped_is_none(decoder.decode_in_place(sample, id, memory)),
+            }
+        }
+    }
+
+    /// The value the decoder's timeline semaphore reaches once its work submitted so far is done.
+    fn submitted(&self) -> u64 {
+        match self {
+            Self::H264(decoder) => decoder.submitted(),
+            Self::H265(decoder) => decoder.submitted(),
+        }
+    }
+
+    /// The decoder's timeline semaphore.
+    fn semaphore(&self) -> vk::Semaphore {
+        match self {
+            Self::H264(decoder) => decoder.semaphore(),
+            Self::H265(decoder) => decoder.semaphore(),
+        }
+    }
+}
+
+/// An HEVC decode's answer with a RASL picture the decoder skips (8.1.3) taken as no picture:
+/// the guest's output gets nothing, and its command buffer completes.
+fn skipped_is_none<T>(decoded: Result<T, VideoError>) -> Result<(), VideoError> {
+    match decoded {
+        Ok(_) | Err(VideoError::H265Stream(hevc::Error::SkippedLeadingPicture)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A decode session, of one codec.
+struct DecodeSession {
     /// The decoder, and the counts it is driven by; dropped first.
     state: Mutex<DecodeState>,
     /// The output of the decode being taken ([`GuestOutputs`]).
@@ -387,24 +566,18 @@ struct H264Session {
 
 /// A session's decoder, and the counts it is driven by.
 struct DecodeState {
-    decoder: H264Decoder<GuestOutputs>,
+    decoder: CodecDecoder,
     /// The access units decoded, which tag each.
     samples: u64,
     /// The last value of the session's event a decode signals.
     signalled: u64,
 }
 
-impl H264Session {
-    fn new(video: &Arc<DeviceVideo>) -> Option<Self> {
-        let next = Arc::new(Mutex::new(None));
-        let decoder = match H264Decoder::new_annex_b(&video.video, GuestOutputs(Arc::clone(&next)))
-        {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                log::warn!("hardware video: no H.264 decoder: {error}");
-                return None;
-            }
-        };
+impl DecodeSession {
+    fn new(
+        video: &Arc<DeviceVideo>,
+        (decoder, next): (CodecDecoder, Arc<Mutex<Option<Output>>>),
+    ) -> Option<Self> {
         let event = video.device.new_shared_event()?;
         Some(Self {
             state: Mutex::new(DecodeState {
@@ -419,7 +592,7 @@ impl H264Session {
     }
 
     /// Signals the event's `value` once the decoder's work submitted so far is done.
-    fn signal(&self, decoder: &H264Decoder<GuestOutputs>, value: u64) -> RaiseResult<()> {
+    fn signal(&self, decoder: &CodecDecoder, value: u64) -> RaiseResult<()> {
         // SAFETY: the reservation is signalled below, once, by a submission that first waits
         // for `after`, or from the host where that submission fails.
         let reserved = unsafe { self.event.reserve_vk_signal(value) }
@@ -476,12 +649,16 @@ impl H264Session {
     }
 }
 
-impl GraphicsVideoSession<VulkanPlatform> for H264Session {
+impl GraphicsVideoSession<VulkanPlatform> for DecodeSession {
     fn event(&self) -> &VulkanSharedEvent {
         &self.event
     }
 
-    fn decode_h264(&self, decode: &H264Decode<'_, VulkanPlatform>) -> RaiseResult<u64> {
+    fn codec(&self) -> u32 {
+        self.state.lock().decoder.codec()
+    }
+
+    fn decode(&self, decode: &VideoDecode<'_, VulkanPlatform>) -> RaiseResult<u64> {
         let mut state = self.state.lock();
         let state = &mut *state;
         let output = output(&self.video, decode)?;
@@ -497,7 +674,7 @@ impl GraphicsVideoSession<VulkanPlatform> for H264Session {
     }
 }
 
-impl Drop for H264Session {
+impl Drop for DecodeSession {
     fn drop(&mut self) {
         // The decoder's semaphore goes with it: the last signal, which waits for it, lands first.
         let last = self.state.lock().signalled;
@@ -511,7 +688,7 @@ impl Drop for H264Session {
 /// pages imported in place.
 fn decode_access_unit(
     state: &mut DecodeState,
-    decode: &H264Decode<'_, VulkanPlatform>,
+    decode: &VideoDecode<'_, VulkanPlatform>,
 ) -> RaiseResult<()> {
     if !decode.parameter_sets.is_empty() {
         state.samples += 1;
@@ -562,7 +739,7 @@ fn decode_access_unit(
 
 /// A command-buffer fault for a decode the session could not take.
 fn decode_fault(what: impl std::fmt::Display) -> Raise {
-    op_fault(format_args!("an H.264 decode: {what}"))
+    op_fault(format_args!("a video decode: {what}"))
 }
 
 /// Where `plane`'s bytes lie in the runtime's import of its buffer, and the host address of its
@@ -576,7 +753,7 @@ fn plane_import(plane: &VideoPlane<'_, VulkanPlatform>) -> Option<(rt::VkHostMem
 }
 
 /// The output `decode`'s planes are, in the buffers their textures lie in, which it holds.
-fn output(video: &DeviceVideo, decode: &H264Decode<'_, VulkanPlatform>) -> RaiseResult<Output> {
+fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> RaiseResult<Output> {
     let (luma, chroma) = (&decode.luma, &decode.chroma);
     let in_buffer = |p: &VideoPlane<'_, VulkanPlatform>| {
         p.bytes_per_row
@@ -688,4 +865,82 @@ fn cache_output(
         planes,
         _keep: keep,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device's answer for `profile`: `level`, coded sizes from 64x64 to `max`, `slots` DPB
+    /// slots and references, and a bitstream alignment of `alignment`.
+    fn answer<P>(
+        profile: P,
+        level: u8,
+        max: (u32, u32),
+        slots: u32,
+        alignment: u64,
+    ) -> Capabilities<P> {
+        Capabilities {
+            profile,
+            max_level_idc: level,
+            min_coded_extent: vk::Extent2D::default().width(64).height(64),
+            max_coded_extent: vk::Extent2D::default().width(max.0).height(max.1),
+            picture_access_granularity: vk::Extent2D::default().width(16).height(16),
+            max_dpb_slots: slots,
+            max_active_reference_pictures: slots,
+            dpb_and_output_coincide: true,
+            dpb_and_output_distinct: false,
+            decodes_into_output: false,
+            min_bitstream_buffer_offset_alignment: alignment,
+            min_bitstream_buffer_size_alignment: alignment,
+            std_header_version: vk::ExtensionProperties::default(),
+        }
+    }
+
+    /// HEVC's caps list Main and Main 10, each with its format, at the least of their limits,
+    /// and the larger of their alignments; a device of Main alone answers NV12 alone, and one of
+    /// neither answers nothing.
+    #[test]
+    fn hevc_caps_answer_each_profile_the_device_decodes() {
+        let main = answer(H265Profile::MAIN, 186, (8192, 8192), 17, 256);
+        let main10 = answer(H265Profile::MAIN_10, 153, (4096, 8192), 16, 64);
+        let caps = h265_caps(&[main, main10]).unwrap();
+        assert_eq!(
+            caps,
+            RgfxVideoCodecCaps {
+                codec: RGFX_VIDEO_CODEC_HEVC,
+                direction: RGFX_VIDEO_DECODE,
+                profiles: RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10,
+                max_level: 153,
+                min_size: [64, 64],
+                max_size: [4096, 8192],
+                max_dpb_pictures: 16,
+                max_references: 16,
+                formats: RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010,
+                bitstream_alignment: 256,
+            }
+        );
+        let caps = h265_caps(&[main]).unwrap();
+        assert_eq!(caps.profiles, RGFX_VIDEO_HEVC_MAIN);
+        assert_eq!(caps.formats, RGFX_VIDEO_FORMAT_NV12);
+        assert_eq!(caps.max_level, 186);
+        assert!(h265_caps(&[]).is_none());
+    }
+
+    /// H.264's caps list each profile some device profile decodes a stream of: a device of High
+    /// alone decodes Baseline and Main streams too.
+    #[test]
+    fn h264_caps_answer_the_streams_the_profiles_decode() {
+        let high = answer(H264Profile::HIGH, 52, (4096, 4096), 17, 256);
+        let caps = h264_caps(&[high]).unwrap();
+        assert_eq!(
+            caps.profiles,
+            RGFX_VIDEO_H264_BASELINE | RGFX_VIDEO_H264_MAIN | RGFX_VIDEO_H264_HIGH
+        );
+        assert_eq!(
+            (caps.codec, caps.formats),
+            (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_FORMAT_NV12)
+        );
+        assert_eq!((caps.max_level, caps.bitstream_alignment), (52, 256));
+    }
 }

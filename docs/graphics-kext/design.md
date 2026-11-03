@@ -533,9 +533,9 @@ Stages:
       `RGFX_VIDEO_CAPS_OUTPUT_CACHED` in the video caps, the driver asks each
       output surface's block cached (item 14, *Which surfaces are cached*),
       and the copy writes the surface's device cache, within the GPU's
-      memory, on the VkQueue of a runtime command queue (the graphics
-      family on the RTX 5080), submitted once the host sees the decode
-      done, so no wait of the copy's holds the guest's work on that VkQueue.
+      memory, on the queue the runtime reserves for the decoders (family 0
+      on the RTX 5080), which no runtime work runs on, so the copy waits for
+      its decode on the GPU and holds no guest work behind it.
       The guest's GPU work then reads the picture where it landed, and it
       crosses the bus only at a CPU lock, as the cache's download. Measured
       on the RTX 5080: a 4K picture lands in 100 us of the GPU, where the
