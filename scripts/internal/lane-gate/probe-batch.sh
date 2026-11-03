@@ -183,6 +183,7 @@ put "$L/msi-probes.sh" "$RD/bin/"
 put "$L/msi-xid.sh" "$RD/bin/"
 put "$L/msi-capture.py" "$RD/bin/"
 put "$L/msi-hang.py" "$RD/bin/"
+put "$L/msi-hang-catch.py" "$RD/bin/"
 if ((dry)); then
   msi "PROBES='$RD/probes' PROBE_RESULTS='$RES' PROBE_TIP='$PUB' DEADLINE=$(( $(date +%s) + HOLD_S )) FAKE_GUEST='$D/guest' \
     R='$RD' bash '$RD/bin/msi-probes.sh'"

@@ -38,9 +38,10 @@
 #                   registers and stack, the scanout; the scanout alone where the hang catcher
 #                   below took the rest); unless the guest answers again within 3 minutes (it
 #                   restarted), the probes after it are not reached (they go back to the queue)
-# The hang catcher (HANG_CATCH, default ~/.cache/s1-hang-msi/hang-catch.py, where it is there)
-# watches the boot while the probes run and writes R/hang/ (watch.txt, guest-info.txt, catch-N/ at
-# a hang: its docstring says what); the round waits for a catch it started before QEMU stops.
+# The hang catcher (HANG_CATCH, default msi-hang-catch.py beside this script) watches the boot
+# while the probes run and writes R/hang/ (watch.txt, guest-info.txt, catch-N/ at a hang,
+# reboot-N/ with the panic reports after a restart: its docstring says what); the round waits for
+# a catch it started before QEMU stops.
 # run.sh gets PROBE_NAME and PROBE_PASS (the guest user's password, for sudo) in its environment.
 # Screenshots: a probe whose directory holds a file named shots may ask for the guest's own
 # screenshot, which screencapture over SSH cannot take (no Screen Recording grant): run.sh runs
@@ -143,7 +144,7 @@ shots() {
   done
 }
 settled=0 hung= HC=
-HANG_CATCH=${HANG_CATCH:-$HOME/.cache/s1-hang-msi/hang-catch.py}
+HANG_CATCH=${HANG_CATCH:-$(dirname "$0")/msi-hang-catch.py}
 if [[ -z ${FAKE_GUEST:-} && -f $HANG_CATCH && -n ${QEMU_PID:-} && -n ${R:-} ]]; then
   mkdir -p "$R/hang"
   python3 -I "$HANG_CATCH" --boot-dir "$B" --pid "$QEMU_PID" --port "$PORT" --out "$R/hang" \
@@ -256,6 +257,7 @@ done
 if [[ -n $HC ]]; then
   catch_wait
   kill "$HC" 2> /dev/null
-  grep -E 'HANG|catch [0-9]+ written' "$R/hang/watch.txt" 2> /dev/null | sed 's/^/  hang catcher: /'
+  grep -E 'HANG|catch [0-9]+ written|REBOOT|restarting|answers again|panic report' "$R/hang/watch.txt" 2> /dev/null |
+    sed 's/^/  hang catcher: /'
 fi
 exit 0
