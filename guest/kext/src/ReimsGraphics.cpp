@@ -223,21 +223,47 @@ void ReimsGraphics::publishLocked()
 		writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
 }
 
-// Puts one command on ring 0, waiting for space: thread context only.
+// Puts one command on ring 0, waiting for space (waitForRoom): thread context only. A message
+// that can never fit is refused at once.
 IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
                              UInt64 *waiterSeqno)
 {
-	for (UInt32 waited = 0;; waited++) {
+	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax)
+		return kIOReturnBadArgument;
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(kPostTimeoutMs, kMillisecondScale, &deadline);
+	for (;;) {
+		const UInt64 mark = roomMark();
 		if (tryPost(type, message, size, seqno, waiterSeqno))
 			return kIOReturnSuccess;
 		if (!ready)
 			return kIOReturnNotReady;
-		if (waited >= kPostTimeoutMs) {
+		if (!waitForRoom(mark, deadline)) {
 			IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
-			return kIOReturnTimeout;
+			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
-		IOSleep(1);
 	}
+}
+
+UInt64 ReimsGraphics::roomMark() const
+{
+	return rgfxRingRoomMark(room);
+}
+
+bool ReimsGraphics::waitForRoom(UInt64 mark, uint64_t deadline)
+{
+	uint64_t backstop = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kRgfxRingRoomBackstopUs) * 1000, &backstop);
+	rgfxRingRoomWait(room);
+	IOLockLock(stateLock);
+	if (ready && rgfxRingRoomSleeps(room, mark)) {
+		IOLockSleepDeadline(stateLock, &room,
+		                    rgfxRingRoomSleepUntil(mach_absolute_time(), backstop, deadline),
+		                    THREAD_UNINT);
+	}
+	IOLockUnlock(stateLock);
+	rgfxRingRoomDone(room);
+	return ready && mach_absolute_time() < deadline;
 }
 
 // Sends a display-control command and waits for its answer, COMPLETE or DISPLAYS, which the
@@ -449,6 +475,12 @@ void ReimsGraphics::service()
 		fullFence();
 		if (load64(events + kRingProducer) == consumed)
 			break;
+	}
+	// The host has moved on: a post waiting for room on the control ring looks again.
+	if (rgfxRingRoomPass(room)) {
+		IOLockLock(stateLock);
+		IOLockWakeup(stateLock, &room, false);
+		IOLockUnlock(stateLock);
 	}
 
 	// The queues' completions share the vector: the accelerator looks at its rings.
@@ -2069,7 +2101,10 @@ IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt
 	p.present.iosurface_id = surfaceId;
 	p.present.transaction_id = transactionId;
 	const bool cached = rgfxSurfaceCacheGeneration(surfaceId, &p.gen.cpu_gen);
-	IOReturn r = post(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno);
+	// Never waits for room: the caller does, with its lock let go (waitForRoom).
+	IOReturn r = kIOReturnSuccess;
+	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno))
+		r = ready ? kIOReturnNoSpace : kIOReturnNotReady;
 	if (r == kIOReturnSuccess) {
 		IOSimpleLockLock(interruptLock);
 		pipes.shows(surfaceId);
@@ -2156,9 +2191,12 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 	                  sizeof(RgfxBlockRelease) <= kLifecycleMessageMax,
 	              "a release is not a whole message");
 	*posted = 0;
-	for (UInt32 waited = 0; *posted < count;) {
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(kPostTimeoutMs, kMillisecondScale, &deadline);
+	while (*posted < count) {
 		if (!ready)
 			return kIOReturnNotReady;
+		const UInt64 mark = roomMark();
 		// As many as fit, under one hold of the ring's lock and with one doorbell at most.
 		UInt32 n = 0;
 		IOSimpleLockLock(submitLock);
@@ -2172,13 +2210,11 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 		*posted += n;
 		if (*posted == count)
 			break;
-		if (waited >= kPostTimeoutMs) {
+		if (!waitForRoom(mark, deadline)) {
 			IOLog("ReimsGraphics: command %u: the control ring stayed full\n",
 			      RGFX_CMD_BLOCK_RELEASE);
-			return kIOReturnTimeout;
+			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
-		IOSleep(1);
-		waited++;
 	}
 	return kIOReturnSuccess;
 }

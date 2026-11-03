@@ -102,6 +102,7 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	framebuffer = nullptr;
 	associated = false;
 	lock = IOLockAlloc();
+	submitLock = IOLockAlloc();
 	registered = false;
 	vblWaiting = 0;
 	nextTransaction = 0;
@@ -110,7 +111,7 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	logged = 0;
 	unnotifiedLogged = 0;
 	transactions = Transactions();
-	return lock != nullptr;
+	return lock != nullptr && submitLock != nullptr;
 }
 
 bool RgfxDisplayPipeUserClient::start(IOService *provider)
@@ -141,6 +142,9 @@ void RgfxDisplayPipeUserClient::free()
 	if (lock)
 		IOLockFree(lock);
 	lock = nullptr;
+	if (submitLock)
+		IOLockFree(submitLock);
+	submitLock = nullptr;
 	super::free();
 }
 
@@ -404,24 +408,35 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 		      id, self->begun, dirty, at, rd32(t, kTxnOptions), planeType, surface,
 		      rd32(t, kTxnPlane0 + kPlaneSurface + 4), cookie);
 	}
-	IOLockLock(self->lock);
-	if (self->begun == id)
-		self->begun = 0;
+	// One submit at a time, in their order, under a lock the work loop never takes.
+	IOLockLock(self->submitLock);
+	IOReturn r = self->submit(t, id, planeType, surface, cookie);
+	IOLockUnlock(self->submitLock);
+	return r;
+}
+
+// sSubmit's transaction, submitLock held.
+IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 planeType,
+                                           UInt32 surface, UInt64 cookie)
+{
+	IOLockLock(lock);
+	if (begun == id)
+		begun = 0;
 	// Room for one more outstanding transaction, waiting up to five seconds.
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
-	while (!self->transactions.hasRoom()) {
-		if (IOLockSleepDeadline(self->lock, &self->completed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
-		    !self->transactions.hasRoom()) {
-			IOLockUnlock(self->lock);
+	while (!transactions.hasRoom()) {
+		if (IOLockSleepDeadline(lock, &completed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
+		    !transactions.hasRoom()) {
+			IOLockUnlock(lock);
 			IOLog("RGFX pipe: transaction %u: no room in 5 s, not sent\n", id);
 			return kIOReturnTimeout;
 		}
 	}
 	// Notified at its completion where it carries a cookie (RgfxPipeTransactions.hpp).
 	bool notified = rgfxPipeNotifies(cookie);
-	if (!notified && self->unnotifiedLogged < kLogUnnotified) {
-		self->unnotifiedLogged++;
+	if (!notified && unnotifiedLogged < kLogUnnotified) {
+		unnotifiedLogged++;
 		IOLog("RGFX pipe: transaction %u (options 0x%x) carries no cookie: it completes for its "
 		      "waiters, without a notification\n",
 		      id, rd32(t, kTxnOptions));
@@ -430,22 +445,40 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 		// Nothing for the host to show: the display keeps its surface, and the transaction is
 		// done with the last one before it (at once where none is outstanding).
 		Transactions::Completion now = {};
-		if (self->transactions.nothingToShow(id, cookie, notified, &now))
-			self->completeLocked(now, mach_absolute_time());
-		IOLockUnlock(self->lock);
+		if (transactions.nothingToShow(id, cookie, notified, &now))
+			completeLocked(now, mach_absolute_time());
+		IOLockUnlock(lock);
 		return kIOReturnSuccess;
 	}
 	// Posted and recorded under the lock, so the host's answer, which the work loop hands to
-	// presented() under the same lock, finds it recorded.
+	// presented() under the same lock, finds it recorded. Where the control ring has no room, the
+	// lock is let go while the post waits for it: the work loop takes the lock at every COMPLETE,
+	// and every queue's completions wait behind its pass. No other submit runs meanwhile
+	// (submitLock), and presented() only completes transactions, so the room found above stays.
+	uint64_t ringDeadline = 0;
+	clock_interval_to_deadline(5000, kMillisecondScale, &ringDeadline);
 	UInt64 seqno = 0;
-	IOReturn r = self->framebuffer->postPresent(surface, id, &seqno);
+	IOReturn r = kIOReturnSuccess;
+	for (;;) {
+		const UInt64 mark = framebuffer->roomMark();
+		r = framebuffer->postPresent(surface, id, &seqno);
+		if (r != kIOReturnNoSpace)
+			break;
+		IOLockUnlock(lock);
+		const bool more = framebuffer->waitForRoom(mark, ringDeadline);
+		IOLockLock(lock);
+		if (!more) {
+			r = kIOReturnTimeout;
+			break;
+		}
+	}
 	if (r != kIOReturnSuccess) {
-		IOLockUnlock(self->lock);
+		IOLockUnlock(lock);
 		IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
 		return r;
 	}
-	self->transactions.sent(seqno, id, cookie, notified);
-	IOLockUnlock(self->lock);
+	transactions.sent(seqno, id, cookie, notified);
+	IOLockUnlock(lock);
 	return kIOReturnSuccess;
 }
 

@@ -35,6 +35,7 @@
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayModes.hpp"
 #include "RgfxPipeClients.hpp"
+#include "RgfxRingRoom.hpp"
 #include "RgfxScanoutOwner.hpp"
 #include "RgfxVblankClock.hpp"
 #include "reims_graphics_wire.h"
@@ -138,8 +139,11 @@ public:
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
 	// framebuffer, which owns the control ring. postPresent puts PRESENT_SURFACE for the
-	// IOSurface of global ID `surfaceId` on the ring without waiting (thread context only); the
-	// host answers it once the display shows the surface. addPipe adds an associated pipe client
+	// IOSurface of global ID `surfaceId` on the ring without waiting (thread context only),
+	// answering kIOReturnNoSpace where the ring has no room: the caller waits for room with no
+	// lock of the work loop's held (roomMark, waitForRoom), as the work loop hands the present's
+	// answer over under the caller's lock. The host answers it once the display shows the
+	// surface. addPipe adds an associated pipe client
 	// (retained; RgfxPipeClients.hpp: IOPresentment associates several), and the hooks, both
 	// called on the work loop for each client: `present(client, seqno, status, time)` for every
 	// COMPLETE (each pipe client picks its own seqnos), `time` that of the refresh whose answer
@@ -163,6 +167,13 @@ public:
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno);
+	// Room on the control ring for a post that found it full (RgfxRingRoom.hpp): roomMark, read
+	// before the post's look, is the work loop's passes so far; waitForRoom sleeps until a pass
+	// after `mark` (each device interrupt makes one: the host has moved on), its backstop or
+	// `deadline` (mach_absolute_time), and answers false once `deadline` has passed or the
+	// device is not ready. Thread context only, never on the work loop.
+	UInt64 roomMark() const;
+	bool waitForRoom(UInt64 mark, uint64_t deadline);
 	bool addPipe(OSObject *client, PipeVblankHook vblank, PipePresentHook present);
 	void removePipe(OSObject *client);
 	void setPipeVblankEnabled(OSObject *client, bool enabled);
@@ -360,6 +371,10 @@ private:
 
 	// The completion ring's bytes consumed: the work loop's alone.
 	UInt64 consumed;
+
+	// The control ring's room (roomMark, waitForRoom): the work loop's passes, which it moves
+	// at each, and the posts waiting for room, which a pass wakes under stateLock. Atomic.
+	RgfxRingRoom room;
 
 	// Under stateLock: answers, the lifecycle's waiters, the display and its modes, the mode
 	// set, and the scanout's owner (its task referenced, its connection retained).

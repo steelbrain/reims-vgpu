@@ -88,6 +88,8 @@ private:
 	static void presentHook(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	void presented(UInt64 seqno, UInt32 status, UInt64 time);
 	void completeLocked(const Transactions::Completion &c, UInt64 time);
+	// sSubmit's transaction, submitLock held: sent to the host, or done with the one before it.
+	IOReturn submit(const UInt8 *t, UInt32 id, UInt32 planeType, UInt32 surface, UInt64 cookie);
 	void sendVbl(UInt64 time, UInt64 next);
 
 	void releaseRegistrations();
@@ -104,6 +106,9 @@ private:
 		UInt64 refcon;
 	};
 
+	// Held across a submit, which may wait for the control ring's room with `lock` let go: the
+	// submits keep their order. The work loop never takes it.
+	IOLock *submitLock;
 	// Under lock: the transaction registration, the VBL requests waiting, the transaction begun
 	// and the last completed.
 	IOLock *lock;
