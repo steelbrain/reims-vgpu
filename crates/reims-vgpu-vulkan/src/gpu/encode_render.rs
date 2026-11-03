@@ -237,7 +237,7 @@
 //!   runtime's, as an attachment, a resolve texture and bound to a stage
 //!   ([`crate::gpu::resource::TextureObject::texels`]), and so are its refusals.
 
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -251,7 +251,7 @@ use metal2vulkan::pipeline::RenderPipelineDescriptor;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
+use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw, encode_each};
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
@@ -1914,6 +1914,50 @@ const DRAW_PRIMITIVES: &str = "drawPrimitives:vertexStart:vertexCount:";
 /// A command on the open runtime encoder.
 type Call<'c> = &'c mut dyn FnMut(&mut rt::RenderCommandEncoder) -> Result<(), rt::Error>;
 
+/// The runtime's encoder `raw` holds, borrowed for a call of `sel`, which dies after `endEncoding`
+/// as every command does ([`EncoderObject::with`]).
+fn borrowed<'r>(
+    raw: &'r RefCell<Option<rt::RenderCommandEncoder>>,
+    sel: &'static str,
+) -> RefMut<'r, rt::RenderCommandEncoder> {
+    RefMut::map(raw.borrow_mut(), |e| {
+        e.as_mut()
+            .unwrap_or_else(|| unrepresentable(sel, "a command after endEncoding"))
+    })
+}
+
+/// The runtime's `setVertexBuffer:offset:atIndex:` on `e`, as each path sends it.
+#[inline]
+fn set_vertex_buffer(
+    e: &mut rt::RenderCommandEncoder,
+    buffer: Option<&VulkanBuffer>,
+    offset: u64,
+    index: u32,
+) -> Result<(), rt::Error> {
+    #[cfg(test)]
+    tests::sent(SET_VERTEX_BUFFER, || {
+        let buffer = buffer.map(|b| std::ptr::from_ref(&b.raw));
+        format!("{buffer:?} {offset} {index}")
+    });
+    e.set_vertex_buffer(buffer.map(|b| &b.raw), offset, index)
+}
+
+/// The runtime's draw of `count` vertices of `t` from `start`, `instances` times from instance
+/// `base`, on `e`, as each path sends it.
+#[inline]
+fn draw_primitives(
+    e: &mut rt::RenderCommandEncoder,
+    t: rt::DrawPrimitiveType,
+    (start, count): (u32, u32),
+    (instances, base): (u32, u32),
+) -> Result<(), rt::Error> {
+    #[cfg(test)]
+    tests::sent(DRAW_PRIMITIVES, || {
+        format!("{t:?} {start} {count} {instances} {base}")
+    });
+    e.draw_primitives(t, start, count, instances, base)
+}
+
 impl VulkanRenderEncoder {
     /// `bind`, of a command: what a draw may write through what it binds or makes resident is
     /// read at the draw ([`Reach`]).
@@ -2104,9 +2148,7 @@ impl VulkanRenderEncoder {
             self.bound(Bind::Buffer(VERTEX, index, buffer));
         }
         let index = small(sel, index);
-        self.run(sel, &mut |e| {
-            e.set_vertex_buffer(buffer.map(|b| &b.raw), offset, index)
-        })
+        self.run(sel, &mut |e| set_vertex_buffer(e, buffer, offset, index))
     }
 
     /// What a draw reads of the encoder's state ([`Held`]).
@@ -3330,6 +3372,20 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
         }
     }
 
+    /// A run of draws in a pass whose draws ask nothing of what the encoder holds
+    /// ([`Self::draws_quietly`]) takes each command by what is left of its path there
+    /// ([`Self::quiet_draws`]); any other, each command as [`Self::encode`] takes it.
+    fn encode_draws(
+        &self,
+        on: OnFault,
+        draws: &[VertexDraw<'_, VulkanPlatform>],
+    ) -> RaiseResult<()> {
+        self.encoding(|| match self.draws_quietly() {
+            Some(held) => self.quiet_draws(&held, draws),
+            None => encode_each(self, on, draws),
+        })
+    }
+
     /// The run holds what the encoder holds of its draws ([`RenderEncoderObject::drawing`]) and
     /// the runtime's encoder ([`EncoderObject::running`]), which each command inside it then
     /// takes again on this thread.
@@ -3564,7 +3620,7 @@ impl VulkanRenderEncoder {
         let (instances, base) = (small(sel, instances), small(sel, base));
         let t = draw_type(sel, primitive_type);
         let call = |e: &mut rt::RenderCommandEncoder, t| {
-            e.draw_primitives(t, start, count, instances, base)
+            draw_primitives(e, t, (start, count), (instances, base))
         };
         if t == rt::DrawPrimitiveType::Nine {
             let hang = (count >= 3 && instances > 0).then_some(rt::CommandBufferError::GpuHang);
@@ -3598,6 +3654,121 @@ impl VulkanRenderEncoder {
         if whole && drawn.is_ok() {
             self.undrawn.store(false, Ordering::Release);
         }
+    }
+
+    /// What the encoder holds for its draws ([`Held`]), where none of a draw's checks that read it
+    /// can find anything, nor any that reads the thread or the log: no nil pipeline state
+    /// ([`nil_pipeline_drawn`]), none that encodes indirect commands ([`Self::icbs_written`]), a
+    /// pass that loads no bfloat attachment ([`Self::bfloat_drawn`]) and has no rate map of no
+    /// layers or of varying rates ([`Self::layered`]), a command buffer to bind for
+    /// ([`Self::bound`]), a thread that runs no isolated task's code, whose checks of the task's
+    /// end are then each nothing ([`stop_if_task_ended`]), and no timing lines
+    /// ([`crate::gpu::timing::encoder_call`]). A command changes none of them but a pipeline
+    /// state's set, a private setter or the encoder's end, none of which a run of draws holds;
+    /// whether the pass holds anything a draw asks of ([`Reach::quiet`]) is read at each.
+    fn draws_quietly(&self) -> Option<Held> {
+        let held = self.held();
+        let quietly = !held.nil_pipeline
+            && !held.encodes
+            && self.bfloat_loaded.is_none()
+            && !self.no_layers
+            && !self.varying_rates
+            && self.encoder.has_command_buffer()
+            && reims_vgpu_core::tasks::isolation::TaskLife::current().is_none()
+            && !crate::gpu::timing::on();
+        quietly.then_some(held)
+    }
+
+    /// `draws`, where [`Self::draws_quietly`] answered `held`: each command does what
+    /// [`Self::encode`] does for it, in its order, by what is left of its path once the run's
+    /// answers are known, and takes that path where the pass holds something a draw asks of
+    /// ([`Reach::quiet`]), or where its bind or draw needs more. The run takes the runtime's
+    /// encoder once, and borrows it for each call ([`EncoderObject::with`]), so a command that
+    /// takes its path takes it as it does alone; and this thread's calls into the runtime and the
+    /// hearing of the draws are looked up once ([`crate::answer::run`]).
+    fn quiet_draws(
+        &self,
+        held: &Held,
+        draws: &[VertexDraw<'_, VulkanPlatform>],
+    ) -> RaiseResult<()> {
+        #[cfg(test)]
+        tests::QUIET_RUNS.set(tests::QUIET_RUNS.get() + 1);
+        let raw = self.encoder.raw.lock();
+        crate::answer::run(|run| {
+            for draw in draws {
+                self.quiet_vertex_buffer(run, &raw, draw)?;
+                self.quiet_primitives(run, &raw, held, draw)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// `draw`'s `setVertexBuffer:offset:atIndex:` in [`Self::quiet_draws`]: [`Self::vertex_buffer`]
+    /// where its bind is read ([`Self::bound`]), else its index ([`small`]) and the call.
+    fn quiet_vertex_buffer(
+        &self,
+        run: &crate::answer::Run<'_>,
+        raw: &RefCell<Option<rt::RenderCommandEncoder>>,
+        draw: &VertexDraw<'_, VulkanPlatform>,
+    ) -> RaiseResult<()> {
+        let sel = SET_VERTEX_BUFFER;
+        let (buffer, offset) = (draw.buffer, draw.offset);
+        let bind = Bind::Buffer(VERTEX, draw.index, buffer);
+        if !self.quiet.load(Ordering::Acquire) || quiet_bind_decides(&bind) {
+            return self.vertex_buffer(buffer, offset, draw.index);
+        }
+        let index = small(sel, draw.index);
+        let mut refusal = None;
+        run.at(sel, || {
+            if let Err(e) = set_vertex_buffer(&mut borrowed(raw, sel), buffer, offset, index) {
+                refusal = Some(e);
+            }
+        });
+        refusal.map_or(Ok(()), |e| decide(sel, Policy::Dies, e))
+    }
+
+    /// `draw`'s `drawPrimitives:vertexStart:vertexCount:` in [`Self::quiet_draws`], under `held`:
+    /// [`Self::primitives`] where the pass holds something a draw asks of and for type 9
+    /// ([`Self::nine`]), else what [`Self::draw`] checks that can find anything there (its points,
+    /// [`sized`], and the private setters' marks, [`marked_by`]), the call, the `half` outputs the
+    /// runtime announced inside it ([`Self::binds`]), and what it drew ([`Self::drew`]).
+    fn quiet_primitives(
+        &self,
+        run: &crate::answer::Run<'_>,
+        raw: &RefCell<Option<rt::RenderCommandEncoder>>,
+        held: &Held,
+        draw: &VertexDraw<'_, VulkanPlatform>,
+    ) -> RaiseResult<()> {
+        let sel = DRAW_PRIMITIVES;
+        let shape = (draw.vertex_start, draw.vertex_count, 1, 0);
+        if !self.quiet.load(Ordering::Acquire) {
+            return self.primitives(sel, draw.primitive_type, shape);
+        }
+        let (start, count) = (small(sel, draw.vertex_start), small(sel, draw.vertex_count));
+        let t = draw_type(sel, draw.primitive_type);
+        if t == rt::DrawPrimitiveType::Nine {
+            return self.primitives(sel, draw.primitive_type, shape);
+        }
+        crate::gpu::timing::count_draw();
+        if !draws_none(t, count) {
+            sized(sel, Shape::Primitives(t), held.marks);
+            marked_by(sel, held.marks);
+        }
+        let at = run.heard();
+        let mut refusal = None;
+        run.at(sel, || {
+            if let Err(e) = draw_primitives(&mut borrowed(raw, sel), t, (start, count), (1, 0)) {
+                refusal = Some(e);
+            }
+        });
+        let drawn = refusal.map_or(Ok(()), |e| decide(sel, Policy::Dies, e));
+        if run.heard_since(at, rt::Degradation::HalfOutputPrecision)
+            && let Some(apart) = held.marks.half_apart
+        {
+            half_output_apart(sel, apart);
+        }
+        self.drew(t, (count, 1), &drawn);
+        drawn
     }
 
     /// An indexed draw of a raw primitive and index type: `(count, instances, base vertex, base
@@ -3657,6 +3828,227 @@ pub(crate) mod tests {
             vertex_count: 0,
         };
         assert_eq!(draw.selector(), DRAW_PRIMITIVES);
+    }
+
+    /// What a test records of the runtime calls of draws' two commands ([`sent`]).
+    struct Recording {
+        /// Each call: its selector, then its arguments.
+        calls: Vec<String>,
+        /// What runs inside each call, by its place among them, as the runtime's own work there
+        /// would.
+        inside: Box<dyn FnMut(usize)>,
+    }
+
+    thread_local! {
+        /// What this thread's test records ([`recorded`]).
+        static RECORDING: std::cell::RefCell<Option<Recording>> =
+            const { std::cell::RefCell::new(None) };
+        /// How many runs of draws this thread's encoders took by [`VulkanRenderEncoder::quiet_draws`].
+        pub(super) static QUIET_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Records the runtime call of `sel` this thread makes, `args` its arguments, where its test
+    /// records them ([`recorded`]), and runs inside it what the test runs there.
+    pub(super) fn sent(sel: &'static str, args: impl FnOnce() -> String) {
+        RECORDING.with(|r| {
+            if let Some(r) = r.borrow_mut().as_mut() {
+                r.calls.push(format!("{sel} {}", args()));
+                (r.inside)(r.calls.len() - 1);
+            }
+        });
+    }
+
+    /// What `run` does, `inside` run inside each runtime call of draws' commands by its place:
+    /// each call, then how `run` ended (its answer, or the site of its death and the death's
+    /// line).
+    fn recorded(
+        inside: Box<dyn FnMut(usize)>,
+        run: impl FnOnce() -> RaiseResult<()>,
+    ) -> (Vec<String>, String) {
+        let calls = Vec::new();
+        RECORDING.with(|r| *r.borrow_mut() = Some(Recording { calls, inside }));
+        *crate::answer::LAST_LINE.lock() = None;
+        let ended = match catch_death(run) {
+            Ok(answer) => format!("{answer:?}"),
+            Err(site) => format!("{site:?}: {:?}", crate::answer::LAST_LINE.lock().take()),
+        };
+        let recording = RECORDING.with(|r| r.borrow_mut().take());
+        (recording.map(|r| r.calls).unwrap_or_default(), ended)
+    }
+
+    /// Draws sent together ([`VulkanRenderEncoder::encode_draws`]) make the runtime calls each
+    /// makes alone, with the same arguments, in the same order, and end as they do alone: five
+    /// draws of a pass quiet throughout draw; a notice of [`crate::answer::DIES`] the runtime
+    /// announces inside the third draw's `setVertexBuffer:offset:atIndex:` (the copy of
+    /// `answer`'s `a_call_that_unwinds_lets_its_notice_go`, run inside the call) dies at that
+    /// call; so do an offset past the buffer the runtime refuses there and an index past `u32`;
+    /// a third draw of points the state sizes none of, or of no primitive type, dies at its draw;
+    /// and one of type 9, an empty one and one of no buffer take their own paths and go on
+    #[test]
+    fn draws_sent_together_make_the_calls_each_makes_alone() {
+        let d = dev();
+        let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
+        let vertices = buffer::<VulkanPlatform>(&d, 4096, 0, &[0; 4096]);
+        let plain = VertexDraw::<VulkanPlatform> {
+            buffer: Some(&vertices),
+            offset: 32,
+            index: 0,
+            primitive_type: 3,
+            vertex_start: 6,
+            vertex_count: 3,
+        };
+        /// Five draws like `plain`, the third `third`.
+        fn five<'a>(
+            plain: VertexDraw<'a, VulkanPlatform>,
+            third: VertexDraw<'a, VulkanPlatform>,
+        ) -> [VertexDraw<'a, VulkanPlatform>; 5] {
+            let at = |k: u64| VertexDraw {
+                offset: 16 * k,
+                vertex_start: 3 * k,
+                ..plain
+            };
+            [at(0), at(1), third, at(3), at(4)]
+        }
+        // The runtime's notice inside the call at `place`: the third draw's bind is the fifth.
+        let notice_at = |place: usize| -> Box<dyn FnMut(usize)> {
+            let desc = platform().texture_descriptor(&TextureDesc {
+                pixel_format: 550,
+                width: 16,
+                height: 4,
+                usage: 0x3,
+                ..TextureDesc::default()
+            });
+            let t = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+            let queue = d.new_command_queue().unwrap();
+            let cb = queue.raw.command_buffer().unwrap();
+            let mut blit = cb.blit_command_encoder().unwrap();
+            Box::new(move |at| {
+                if at == place {
+                    let texels = t.copied("the copy");
+                    let copied = blit.copy_from_texture_to_texture(
+                        texels,
+                        0,
+                        0,
+                        rt::Origin::new(0, 0, 0),
+                        rt::Size::new(4, 1, 1),
+                        texels,
+                        0,
+                        0,
+                        rt::Origin::new(8, 0, 0),
+                    );
+                    assert!(copied.is_ok(), "{copied:?}");
+                }
+                let _ = (&queue, &cb);
+            })
+        };
+        let nothing = || -> Box<dyn FnMut(usize)> { Box::new(|_| {}) };
+        let cases = [
+            ("a quiet pass", plain, None, None),
+            ("a notice", plain, Some(4), Some(SET_VERTEX_BUFFER)),
+            (
+                "an offset past the buffer",
+                VertexDraw {
+                    offset: 8192,
+                    ..plain
+                },
+                None,
+                Some(SET_VERTEX_BUFFER),
+            ),
+            (
+                "an index past u32",
+                VertexDraw {
+                    index: 1 << 32,
+                    ..plain
+                },
+                None,
+                Some(SET_VERTEX_BUFFER),
+            ),
+            (
+                "points",
+                VertexDraw {
+                    primitive_type: 0,
+                    ..plain
+                },
+                None,
+                Some(DRAW_PRIMITIVES),
+            ),
+            (
+                "no type",
+                VertexDraw {
+                    primitive_type: 99,
+                    ..plain
+                },
+                None,
+                Some(DRAW_PRIMITIVES),
+            ),
+            (
+                "type 9",
+                VertexDraw {
+                    primitive_type: 9,
+                    ..plain
+                },
+                None,
+                None,
+            ),
+            (
+                "an empty draw",
+                VertexDraw {
+                    vertex_count: 0,
+                    ..plain
+                },
+                None,
+                None,
+            ),
+            (
+                "no buffer",
+                VertexDraw {
+                    buffer: None,
+                    ..plain
+                },
+                None,
+                None,
+            ),
+        ];
+        for (case, third, notice, dies) in cases {
+            let draws = five(plain, third);
+            let mut ends = Vec::new();
+            for together in [false, true] {
+                // The command buffer stays, as the walk's does: an encoder whose command buffer
+                // went binds nothing for its draws, and takes no draws together.
+                let (p, d) = (platform(), dev());
+                let (_dst, pass) = pass_of(&p, &d, (4, 4));
+                let q = d.new_command_queue().unwrap();
+                let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+                let set = RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                };
+                e.encode(OnFault::Die, set).unwrap();
+                let inside = notice.map_or_else(nothing, notice_at);
+                let run = || match together {
+                    true => e.encoding(|| e.encode_draws(OnFault::Return, &draws)),
+                    false => e.encoding(|| encode_each(&e, OnFault::Return, &draws)),
+                };
+                let quiet = QUIET_RUNS.get();
+                ends.push(recorded(inside, run));
+                assert_eq!(QUIET_RUNS.get() - quiet, usize::from(together), "{case}");
+                let _ = catch_death(|| e.encode(OnFault::Die, RenderCmd::EndEncoding));
+                drop((e, cb));
+            }
+            assert_eq!(ends[0], ends[1], "{case}");
+            let (calls, ended) = &ends[0];
+            match dies {
+                Some(sel) => {
+                    assert!(ended.contains(&format!("file: {sel:?}")), "{case}: {ended}");
+                    let sets = (calls.iter()).filter(|c| c.starts_with(SET_VERTEX_BUFFER));
+                    assert!(sets.count() >= 2, "{case}: {calls:?}");
+                }
+                None => {
+                    assert_eq!(ended, "Ok(())", "{case}");
+                    assert!(calls.len() >= 9, "{case}: {calls:?}");
+                }
+            }
+        }
     }
 
     use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};

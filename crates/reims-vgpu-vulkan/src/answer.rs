@@ -1694,6 +1694,13 @@ pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
 /// a notice of this one.
 #[inline]
 fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
+    // The call runs inside the one lookup, which a nested call here makes again.
+    CALLS.with(|calls| inside_of(calls, sel, call))
+}
+
+/// [`inside`], of this thread's `calls`.
+#[inline]
+fn inside_of<T>(calls: &Calls, sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
     /// Leaves the call on drop, an unwinding one included, whose notice it drops.
     struct Leave<'a> {
         calls: &'a Calls,
@@ -1708,23 +1715,70 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
             }
         }
     }
-    // The call runs inside the one lookup, which a nested call here makes again.
-    CALLS.with(|calls| {
-        calls.depth.set(calls.depth.get() + 1);
-        let out = {
-            let mut leave = Leave {
-                calls,
-                returned: false,
-            };
-            let out = call();
-            leave.returned = true;
-            out
+    calls.depth.set(calls.depth.get() + 1);
+    let out = {
+        let mut leave = Leave {
+            calls,
+            returned: false,
         };
-        if let Some(notice) = take_pending(calls) {
-            noticed_inside(sel, &notice);
-        }
+        let out = call();
+        leave.returned = true;
         out
-    })
+    };
+    if let Some(notice) = take_pending(calls) {
+        noticed_inside(sel, &notice);
+    }
+    out
+}
+
+/// A run of runtime calls this thread makes one after another ([`run`]): this thread's calls here,
+/// looked up once for them all, and the list of the hearing around them.
+pub(crate) struct Run<'a> {
+    calls: &'a Calls,
+    /// The list of the run's hearing ([`HEARING`]), on [`run`]'s stack.
+    heard: NonNull<Vec<rt::Degradation>>,
+}
+
+/// Runs `run`, whose runtime calls go through [`Run::at`]: each as [`unstopped_at`] runs it, and
+/// what the runtime announces inside each heard as by a [`hearing`] around them all, for the run
+/// to read between them ([`Run::heard`], [`Run::heard_since`]). A hearing inside the run hears
+/// what is announced inside it, as one inside another does.
+pub(crate) fn run<T>(run: impl FnOnce(&Run<'_>) -> T) -> T {
+    /// Puts back the outer hearing on drop, an unwinding run's included.
+    struct Restore(Option<NonNull<Vec<rt::Degradation>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HEARING.with(|h| h.set(self.0));
+        }
+    }
+    let mut heard = Vec::new();
+    let list = NonNull::from(&mut heard);
+    let _outer = Restore(HEARING.with(|h| h.replace(Some(list))));
+    CALLS.with(|calls| run(&Run { calls, heard: list }))
+}
+
+impl Run<'_> {
+    /// Runs `call`, the runtime's form of `sel`, as [`unstopped_at`] does.
+    #[inline]
+    pub(crate) fn at<T>(&self, sel: &'static str, call: impl FnOnce() -> T) -> T {
+        inside_of(self.calls, Some(sel), call)
+    }
+
+    /// How many kinds of [`HEARD`] the runtime announced inside the run's calls so far.
+    #[inline]
+    pub(crate) fn heard(&self) -> usize {
+        // SAFETY: the run's list, on `run`'s stack for the run's life, which [`notice`] writes
+        // only inside a call on this thread, and none runs while the run reads it.
+        unsafe { self.heard.as_ref() }.len()
+    }
+
+    /// Whether the runtime announced `kind` inside the run's calls after the first `at` of what
+    /// it announced ([`Self::heard`]).
+    pub(crate) fn heard_since(&self, at: usize, kind: rt::Degradation) -> bool {
+        // SAFETY: as in [`Self::heard`].
+        let heard = unsafe { self.heard.as_ref() };
+        heard.get(at..).is_some_and(|since| since.contains(&kind))
+    }
 }
 
 /// What [`inside`] does with `notice`, a degradation of [`DIES`] announced inside its call of
@@ -1834,12 +1888,8 @@ pub fn notice(message: &rt::DebugMessage) {
         }
     }
     if !DIES.contains(&notice.degradation) {
-        if HEARD.contains(&notice.degradation)
-            && let Some(mut heard) = HEARING.with(Cell::get)
-        {
-            // SAFETY: the list of the innermost hearing this thread runs, on its stack until it
-            // puts back the one outside it, and read by it only after that.
-            unsafe { heard.as_mut() }.push(notice.degradation);
+        if HEARD.contains(&notice.degradation) {
+            hear(notice.degradation);
         }
         #[cfg(test)]
         RELAYED.lock().push(notice.degradation);
@@ -1882,6 +1932,16 @@ pub fn notice(message: &rt::DebugMessage) {
     keep_pending(notice);
     if depth() == 0 {
         degraded(notice.degradation.code(), notice);
+    }
+}
+
+/// Keeps `kind`, of [`HEARD`], for the innermost [`hearing`] or [`run`] this thread runs, where it
+/// runs one ([`notice`]).
+fn hear(kind: rt::Degradation) {
+    if let Some(mut heard) = HEARING.with(Cell::get) {
+        // SAFETY: the list of the innermost hearing or run this thread runs, on its stack until it
+        // puts back the one outside it, and read by it only between its calls.
+        unsafe { heard.as_mut() }.push(kind);
     }
 }
 
@@ -3001,6 +3061,32 @@ mod tests {
         relaxed(|| inexact("sel:", Inexact::HeapLayout, what));
         relaxed(|| inexact("sel:", Inexact::HeapLayout, what));
         assert_eq!(asked.get(), first);
+    }
+
+    /// A run hears what is announced inside each of its calls, in order ([`Run::heard_since`]),
+    /// and a hearing inside the run hears what is announced inside it alone; the hearing outside
+    /// the run hears none of it, and has its own back after it
+    #[test]
+    fn a_run_hears_what_each_of_its_calls_heard() {
+        let kind = rt::Degradation::HalfOutputPrecision;
+        let ((), outer) = hearing(|| {
+            run(|r| {
+                assert_eq!(r.heard(), 0);
+                r.at("a", || hear(kind));
+                assert!(r.heard_since(0, kind));
+                let at = r.heard();
+                r.at("b", || {});
+                assert!(!r.heard_since(at, kind));
+                let ((), inner) = hearing(|| hear(kind));
+                assert_eq!(inner, [kind]);
+                assert_eq!(r.heard(), at);
+                r.at("c", || hear(kind));
+                assert!(r.heard_since(at, kind) && !r.heard_since(r.heard(), kind));
+            });
+            hear(rt::Degradation::RasterizationRateMap);
+        });
+        assert_eq!(outer, [rt::Degradation::RasterizationRateMap]);
+        assert_eq!(depth(), 0);
     }
 
     /// A call here that the runtime announced a degradation of [`DIES`] inside, and that then
