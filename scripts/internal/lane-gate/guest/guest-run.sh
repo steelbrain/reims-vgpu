@@ -73,7 +73,35 @@ run_info() {
 	local desk; desk="$(wspid) $(pgrep -x Dock | head -1) $(pgrep -x Finder | head -1)"
 	set -- $desk
 	if [ $# -eq 3 ]; then item desktop PASS "WindowServer $1, Dock $2, Finder $3"; else item desktop FAIL "WindowServer/Dock/Finder: $desk"; fi
+	run_memory
 	echo "GATE info uptime $(uptime | tr -s ' ')"
+}
+
+# The GPU's memory as the guest's frameworks state it: system_profiler's "VRAM" (the kext's
+# VRAM,totalMB) and the Metal device's recommendedMaxWorkingSetSize, hasUnifiedMemory and
+# dedicatedMemorySize. A Mac's GPU states VRAM as its working set, and dedicatedMemorySize as
+# the working set where it has memory of its own, else 0 (guest/kext/src/RgfxMemorySize.hpp).
+run_memory() {
+	local vram mem ws uni ded gb
+	vram=$(system_profiler SPDisplaysDataType 2>/dev/null | grep -m1 -E '^ *VRAM' | sed 's/^ *//')
+	mem=$(limit 30 osascript -l JavaScript -e 'ObjC.import("Metal"); var d = $.MTLCreateSystemDefaultDevice();
+		[d.recommendedMaxWorkingSetSize, d.hasUnifiedMemory ? 1 : 0,
+		 d.respondsToSelector("dedicatedMemorySize") ? d.dedicatedMemorySize : -1].join(" ")' 2>/dev/null)
+	echo "GATE info memory vram=\"$vram\" metal=\"$mem\""
+	set -- $mem
+	ws=${1:-0} uni=${2:-} ded=${3:--1}
+	gb=$(echo "$vram" | sed -n 's/.*: *\([0-9][0-9]*\) GB.*/\1/p')
+	if [ -z "$vram" ] || [ "$ws" = 0 ] || [ "$ded" = -1 ]; then
+		item memory FAIL "VRAM \"$vram\", Metal \"$mem\" (working set, unified, dedicatedMemorySize)"
+	elif [ "$uni" = 1 ] && [ "$ded" != 0 ]; then
+		item memory FAIL "unified memory with dedicatedMemorySize $ded"
+	elif [ "$uni" = 0 ] && [ "$ded" != "$ws" ]; then
+		item memory FAIL "dedicatedMemorySize $ded is not the working set $ws"
+	elif [ -n "$gb" ] && [ "$(perl -e 'printf "%.0f", $ARGV[0] / 2**30' "$ws")" != "$gb" ]; then
+		item memory FAIL "VRAM $gb GB is not the working set $ws"
+	else
+		item memory PASS "$vram; recommendedMaxWorkingSetSize $ws, hasUnifiedMemory $uni, dedicatedMemorySize $ded"
+	fi
 }
 
 run_idle() { sleep 10; }

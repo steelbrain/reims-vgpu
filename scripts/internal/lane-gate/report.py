@@ -437,15 +437,17 @@ def known_match(e, detail):
     rel = e.get("relation")
     if not rel:
         return True
-    r = re.fullmatch(r"\s*(\w+)\s*=\s*(\w+)\s*([+-])\s*(\d+)\s*", rel)
+    # "A OP B", or "A OP B + K" / "A OP B - K", OP one of = < <= > >=, A and B named groups.
+    r = re.fullmatch(r"\s*(\w+)\s*(<=|>=|=|<|>)\s*(\w+)\s*(?:([+-])\s*(\d+))?\s*", rel)
     if not r:
         return False
-    a, b, sign, k = r.groups()
+    a, op, b, sign, k = r.groups()
     try:
         va, vb = int(m.group(a)), int(m.group(b))
     except (IndexError, ValueError, TypeError):
         return False
-    return va == vb + (int(k) if sign == "+" else -int(k))
+    vb += (int(k) if sign == "+" else -int(k)) if k else 0
+    return {"=": va == vb, "<": va < vb, "<=": va <= vb, ">": va > vb, ">=": va >= vb}[op]
 
 
 def known_history(path, cur):
