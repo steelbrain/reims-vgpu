@@ -1455,6 +1455,14 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // the buffer's bytes, where its rows lie; any other (a Shared texture, or a Managed one with no
 // CPU copy) is copied through a staging buffer of the region's rows, by a blit the call waits
 // for, so the GPU's later work sees what was written and the bytes read are the GPU's.
+//
+// Over a Managed buffer, Metal's replaceRegion: reaches the GPU's next read of the texture with
+// no didModifyRange: of the app's (measured on the AMD 5300M, whose Managed buffers are two
+// copies, under macOS 26.7.1: `oracle_storage AMD lintex managed`), so a write there tells the
+// host the rows' span, as the buffer's didModifyRange: would. The AMD uploads the whole buffer
+// at a replaceRegion: of a corner, bytes the CPU wrote with no call among them; the span alone
+// is uploaded here, as a didModifyRange: uploads its range alone (docs/graphics-kext/
+// dgpu-oracle.md, Q2 and Q3).
 
 // Copies `region` of `level` and `slice` between the texture and the caller's `bytes`, rows
 // `bytesPerRow` apart and images `bytesPerImage` apart: out of the texture into `bytes` when
@@ -1514,6 +1522,13 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 			copyRows(caller, bytesPerRow, imageBytes, at, _bufferBytesPerRow, 0);
 		} else {
 			copyRows(at, _bufferBytesPerRow, 0, caller, bytesPerRow, imageBytes);
+			// The rows' span, from the first row's first byte written to the last row's last,
+			// told as the buffer's didModifyRange: tells it: a Managed buffer's GPU copy takes
+			// it (BUFFER_DID_MODIFY_RANGE, a no-copy one's block first taking the app's bytes),
+			// and a Shared buffer's posts nothing.
+			const uint64_t first = static_cast<uint64_t>(at - contents);
+			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
+			[_buffer didModifyRange:NSMakeRange(first, span)];
 		}
 		return;
 	}

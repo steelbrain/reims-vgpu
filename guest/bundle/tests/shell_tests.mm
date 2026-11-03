@@ -5916,6 +5916,120 @@ void test_managed_buffer_range()
 	CHECK(!fx.ring.next(&extra, &extraBytes));
 }
 
+// replaceRegion: of a texture over a Managed buffer, the plain form's and the linear form's,
+// writes the rows in the buffer's bytes and tells the host their span (BUFFER_DID_MODIFY_RANGE,
+// from the first row's first byte written to the last row's last), as Metal's reaches the GPU
+// with no didModifyRange: of the app's (the AMD 5300M's two copies, `oracle_storage AMD lintex
+// managed`); a no-copy buffer's block takes the app's bytes first. getBytes: posts nothing, and
+// nor does either over a Shared buffer.
+void test_buffer_texture_replace_region_tells_the_host()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	const NSUInteger length = 0x2000, offset = 0x100, pitch = 0x100;
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:4
+	                                                   mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead;
+	uint8_t in[3 * 4 * 2];
+	for (size_t i = 0; i < sizeof in; i++)
+		in[i] = static_cast<uint8_t>(0xa0 + i);
+	// 3 x 2 texels at (2, 1), rows 12 bytes apart in `in`.
+	const MTLRegion written = MTLRegionMake2D(2, 1, 3, 2);
+	const uint64_t first = offset + 1 * pitch + 2 * 4, span = pitch + 3 * 4;
+	auto rowsLanded = [&](const uint8_t *bytes) {
+		return std::memcmp(bytes + first, in, 12) == 0 &&
+		       std::memcmp(bytes + first + pitch, in + 12, 12) == 0 &&
+		       bytes[first - 1] == 0 && bytes[first + 12] == 0;
+	};
+	auto overBuffer = [&](RgfxBuffer *buf, bool linear) -> id<MTLTexture> {
+		desc.storageMode = buf.storageMode;
+		id<RgfxMetalBufferInternals> spi = (id<RgfxMetalBufferInternals>)buf;
+		id<MTLTexture> tex = linear ? [spi newLinearTextureWithDescriptor:desc
+		                                                           offset:offset
+		                                                      bytesPerRow:pitch
+		                                                    bytesPerImage:pitch * 4]
+		                            : [buf newTextureWithDescriptor:desc
+		                                                     offset:offset
+		                                                bytesPerRow:pitch];
+		CHECK(tex != nil && tex.buffer == buf && tex.storageMode == buf.storageMode);
+		drainRing(fx.ring);
+		return tex;
+	};
+	for (const bool linear : {false, true}) {
+		@autoreleasepool {
+			RgfxRegion::Block block = region.allocate(length);
+			CHECK(block.ok);
+			std::memset(const_cast<uint8_t *>(block.ptr), 0, length);
+			RgfxBuffer *managed = [RgfxBuffer
+			    bufferOverHostMemoryWithContents:const_cast<uint8_t *>(block.ptr)
+			                        regionOffset:block.offset
+			                              length:length
+			                             options:MTLResourceStorageModeManaged
+			                         deallocator:nil
+			                              device:nil
+			                          serializer:&fx.ser];
+			CHECK(managed != nil);
+			drainRing(fx.ring);
+			id<MTLTexture> tex = overBuffer(managed, linear);
+			[tex replaceRegion:written mipmapLevel:0 withBytes:in bytesPerRow:12];
+			CHECK(rowsLanded(const_cast<const uint8_t *>(block.ptr)));
+			auto range =
+			    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+			CHECK(range.obj_id == managed.rgfxObjId && range.location == first &&
+			      range.length == span);
+			CHECK(ringEmpty(fx.ring));
+			uint8_t out[sizeof in] = {};
+			[tex getBytes:out bytesPerRow:12 fromRegion:written mipmapLevel:0];
+			CHECK(std::memcmp(out, in, sizeof in) == 0 && ringEmpty(fx.ring));
+
+			RgfxBuffer *shared = [RgfxBuffer
+			    bufferOverHostMemoryWithContents:const_cast<uint8_t *>(block.ptr)
+			                        regionOffset:block.offset
+			                              length:length
+			                             options:MTLResourceStorageModeShared
+			                         deallocator:nil
+			                              device:nil
+			                          serializer:&fx.ser];
+			drainRing(fx.ring);
+			std::memset(const_cast<uint8_t *>(block.ptr), 0, length);
+			id<MTLTexture> overShared = overBuffer(shared, linear);
+			[overShared replaceRegion:written mipmapLevel:0 withBytes:in bytesPerRow:12];
+			CHECK(rowsLanded(const_cast<const uint8_t *>(block.ptr)) && ringEmpty(fx.ring));
+		}
+		drainRing(fx.ring);
+	}
+
+	// A no-copy Managed buffer: its contents are the app's memory, which its block takes before
+	// the host is told.
+	@autoreleasepool {
+		std::vector<uint8_t> app(length + 0x20, 0);
+		uint8_t *p = app.data() + 0x13;
+		RgfxBuffer *noCopy = [RgfxBuffer bufferWithBytesNoCopy:p
+		                                                length:length
+		                                               options:MTLResourceStorageModeManaged
+		                                           deallocator:nil
+		                                                region:&region
+		                                                device:nil
+		                                            serializer:&fx.ser];
+		CHECK(noCopy != nil && [noCopy contents] == p && [noCopy rgfxShadow] != nullptr);
+		auto made =
+		    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		drainRing(fx.ring);
+		id<MTLTexture> tex = overBuffer(noCopy, false);
+		[tex replaceRegion:written mipmapLevel:0 withBytes:in bytesPerRow:12];
+		CHECK(rowsLanded(p) && rowsLanded(&mem[made.region_offset]));
+		auto range =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range.obj_id == noCopy.rgfxObjId && range.location == first && range.length == span);
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
 // A Managed texture's CPU copy is a block of the region, made over a Shared buffer and named by
 // its MANAGED_TEXTURE_CREATE: replaceRegion: writes it at the layout's rows and posts the region
 // (TEXTURE_REPLACE_REGION); getBytes: reads it back with no message; a region past the level
@@ -10541,6 +10655,7 @@ int main(int argc, char **argv)
 		test_texture_destroy_waits_for_buffers();
 		test_managed_layout();
 		test_managed_buffer_range();
+		test_buffer_texture_replace_region_tells_the_host();
 		test_managed_texture_cpu_copy();
 		test_objects_destroyed_as_let_go();
 		test_function_keeps_its_library();
