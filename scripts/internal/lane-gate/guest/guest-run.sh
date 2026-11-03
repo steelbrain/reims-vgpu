@@ -143,14 +143,19 @@ run_present() {
 	phase present.windowed end
 }
 
-# A new crash report's path and summary (ips-summary.js), among the reports not in BEFORE.
+# A new crash report's name and summary (ips-summary.js), among the reports not in BEFORE. The
+# system writes a report a few seconds after the process died: up to 10 s are waited for one.
 crash_since() {
-	local r f
-	for r in $(reports | comm -13 "$1" -); do
-		for f in "/Library/Logs/DiagnosticReports/$r" "$HOME/Library/Logs/DiagnosticReports/$r"; do
-			[ -f "$f" ] && { echo "$r: $(limit 20 osascript -l JavaScript "$D/ips-summary.js" "$f" 2>&1 | head -c 600)"; return; }
+	local r f n
+	for n in 1 2 3 4 5 6 7 8 9 10; do
+		for r in $(reports | comm -13 "$1" -); do
+			for f in "/Library/Logs/DiagnosticReports/$r" "$HOME/Library/Logs/DiagnosticReports/$r"; do
+				[ -f "$f" ] && { echo "$r: $(limit 20 osascript -l JavaScript "$D/ips-summary.js" "$f" 2>&1 | head -c 600)"; return; }
+			done
 		done
+		sleep 1
 	done
+	echo "no crash report within 10 s"
 }
 
 # The sweep, all its cases in one process. Where that process dies in a case, each case it did not
