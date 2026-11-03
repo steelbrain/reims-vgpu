@@ -31,7 +31,13 @@
 #                   where the kernel log could not be read
 #   out/            what run.sh left in its directory's out/, copied back
 #   probe/          the probe as it was dropped
+#   shots.txt       where it asked for screenshots (below): "EPOCH LABEL" each, or why none came
 # run.sh gets PROBE_NAME and PROBE_PASS (the guest user's password, for sudo) in its environment.
+# Screenshots: a probe whose directory holds a file named shots may ask for the guest's own
+# screenshot, which screencapture over SSH cannot take (no Screen Recording grant): run.sh runs
+# `bash ~/probes/.shot.sh LABEL`, which waits up to 20 s for out/shot-LABEL.png (exit 1 where none
+# came). The host polls the probe's out/ for the request once a second while it runs, sends
+# Command-Shift-3 over QMP ($B/qmp.sock), and moves the guest's new Desktop screenshot there.
 set -uo pipefail
 : "${PROBES:?}" "${PROBE_RESULTS:?}" "${PROBE_TIP:?}" "${DEADLINE:?}"
 log() { echo "$(date +%T) probes: $*"; }
@@ -78,6 +84,46 @@ exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
 EOF
 Gput "$runpl" probes/.run.pl
 rm -f "$runpl"
+# The guest's side of a screenshot: a request, then the wait for its file.
+shotsh=$(mktemp)
+cat > "$shotsh" << 'EOF'
+l=${1:-1}
+mkdir -p out
+rm -f "out/shot-$l.png"
+: > "out/shot-request.$l"
+for _ in $(seq 1 40); do [ -s "out/shot-$l.png" ] && exit 0; sleep 0.5; done
+exit 1
+EOF
+Gput "$shotsh" probes/.shot.sh
+rm -f "$shotsh"
+[[ -n ${FAKE_GUEST:-} ]] || G 'defaults write com.apple.screencapture show-thumbnail -bool false' 2> /dev/null
+# The screenshots a probe asked for (its out/shot-request.LABEL files): Command-Shift-3 over QMP,
+# then the guest's newest Desktop screenshot moved to out/shot-LABEL.png.
+shots() {
+  local name=$1 l f
+  for l in $(G "cd ~/probes/$name/out 2> /dev/null && ls shot-request.* 2> /dev/null" | sed 's/^shot-request\.//'); do
+    G "rm -f ~/probes/$name/out/shot-request.$l; touch ~/probes/.before-shot"
+    if [[ -n ${FAKE_GUEST:-} ]]; then
+      echo fake > "$FAKE_GUEST/probes/$name/out/shot-$l.png"
+      echo "$(now) $l fake" >> "$out/shots.txt"
+      continue
+    fi
+    printf '%s\n' '{"execute":"qmp_capabilities"}' \
+      '{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"meta_l"},{"type":"qcode","data":"shift"},{"type":"qcode","data":"3"}],"hold-time":200}}' |
+      timeout 10 socat - "UNIX-CONNECT:$B/qmp.sock" > /dev/null 2>&1
+    f=
+    for _ in $(seq 1 16); do
+      sleep 1
+      f=$(G 'find ~/Desktop -maxdepth 1 -name "*.png" -newer ~/probes/.before-shot | head -1' 2> /dev/null)
+      [[ -n $f ]] && break
+    done
+    if [[ -n $f ]] && sleep 0.5 && G "mv \"$f\" ~/probes/$name/out/shot-$l.png"; then
+      echo "$(now) $l" >> "$out/shots.txt"
+    else
+      echo "$(now) $l none: the guest saved no screenshot" >> "$out/shots.txt"
+    fi
+  done
+}
 settled=0
 for p in "$PROBES"/*/; do
   p=${p%/}
@@ -110,6 +156,12 @@ for p in "$PROBES"/*/; do
       trap 'kill $s 2> /dev/null; exit 0' TERM
       wait $s && kill "$gp" 2> /dev/null ) &
     wp=$!
+    if [[ -f $p/shots ]]; then
+      while kill -0 "$gp" 2> /dev/null; do
+        shots "$name"
+        sleep 1
+      done
+    fi
     wait "$gp"
     echo $? > "$out/rc"
     kill "$wp" 2> /dev/null; wait "$wp" 2> /dev/null

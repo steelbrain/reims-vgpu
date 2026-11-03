@@ -11,6 +11,9 @@
 #   budget   the most seconds it may run, 1 to 180: the guest kills its process group there.
 #   tip      the commit it is valid for, full or short: a probe for another tip than the published
 #            one is skipped, and its results say so.
+#   shots    (optional, any content) run.sh may take the guest's own screenshots: `bash
+#            ~/probes/.shot.sh LABEL` leaves out/shot-LABEL.png (Command-Shift-3, sent by the host;
+#            exit 1 where none came in 20 s), as screencapture over SSH cannot
 #   (any other files run.sh reads, in the same directory)
 # Write the directory elsewhere and move it in, so a round never takes it half written. Its results
 # land in ~/.cache/rgk-run/probe-results/NAME/ (msi-probes.sh lists the files: stdout, stderr, rc,
@@ -65,7 +68,9 @@ if ((dry)); then
     echo "$t" > "$D/drop/$n/tip"
     mv "$D/drop/$n" "$MSI_RGK_RUN/probe-queue/$n"
   }
-  mk a-hello 10 "$SHORT" 'echo "hello from $PROBE_NAME"; mkdir -p out; date > out/when; echo to-stderr >&2'
+  mk a-hello 10 "$SHORT" 'echo "hello from $PROBE_NAME"; mkdir -p out; date > out/when; echo to-stderr >&2
+bash ~/probes/.shot.sh first && echo "shot first: $(cat out/shot-first.png)"'
+  : > "$MSI_RGK_RUN/probe-queue/a-hello/shots"
   mk b-slow 2 "$PUB" 'echo start; sleep 30; echo never'
   mk c-other 10 0123456789ab 'echo should not run'
   msi() { bash -c "$1"; }
