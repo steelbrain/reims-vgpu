@@ -383,6 +383,10 @@ private:
 	RgfxRingRoom room;
 	// The host took SUBMIT_ROOM (askForRoom), set before `ready`.
 	bool submitRoom;
+	// The sleeps for room (waitForRoom), under stateLock, and the SUBMIT_ROOM records the work
+	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
+	RgfxRingRoomStats roomStats;
+	UInt64 roomRecords;
 
 	// Under stateLock: answers, the lifecycle's waiters, the display and its modes, the mode
 	// set, and the scanout's owner (its task referenced, its connection retained).

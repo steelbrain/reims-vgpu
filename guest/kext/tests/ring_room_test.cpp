@@ -79,6 +79,20 @@ int main()
 	check(rgfxRingRoomBackstopUs(false) == 1000, "the poll's backstop without SUBMIT_ROOM");
 	check(rgfxRingRoomBackstopUs(true) == 20000, "a longer backstop under SUBMIT_ROOM");
 
+	// The sleeps' counts: each sleep counted, a woken one apart, the time in all and at most;
+	// a line at the first sleep, then none until the interval passed.
+	{
+		RgfxRingRoomStats s = {};
+		check(rgfxRingRoomNote(s, 300, true, 1000, 500), "the first sleep is logged");
+		check(!rgfxRingRoomNote(s, 900, false, 1200, 500), "none within the interval");
+		check(rgfxRingRoomNote(s, 100, true, 1500, 500), "one once the interval passed");
+		check(s.sleeps == 3 && s.woken == 2, "every sleep counted, the woken ones apart");
+		check(s.sleptNs == 1300 && s.mostNs == 900, "the time in all and the longest");
+		RgfxRingRoomStats z = {};
+		check(rgfxRingRoomNote(z, 1, false, 0, 500) && !rgfxRingRoomNote(z, 1, false, 1, 500),
+		      "a first line at the clock's 0 still starts the interval");
+	}
+
 	std::printf("ring_room_test: %d checks passed\n", checks);
 	return 0;
 }

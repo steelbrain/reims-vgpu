@@ -50,6 +50,8 @@ constexpr UInt32 kMaxDimension = 16384;
 // How long a command waits for ring space, and then for its answer.
 constexpr UInt32 kPostTimeoutMs = 5000;
 constexpr UInt32 kAnswerTimeoutMs = 5000;
+// How often the control ring's room line is logged at most, while posts sleep for room.
+constexpr UInt32 kRoomLogMs = 1000;
 
 // Answers carry the device's status; a payload the driver cannot read is
 // answered with this one.
@@ -268,14 +270,28 @@ bool ReimsGraphics::waitForRoom(UInt64 mark, uint64_t deadline)
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(rgfxRingRoomBackstopUs(submitRoom)) * 1000,
 	                            &backstop);
 	rgfxRingRoomWait(room);
+	bool log = false;
+	RgfxRingRoomStats seen = {};
 	IOLockLock(stateLock);
 	if (ready && rgfxRingRoomSleeps(room, mark)) {
-		IOLockSleepDeadline(stateLock, &room,
-		                    rgfxRingRoomSleepUntil(mach_absolute_time(), backstop, deadline),
-		                    THREAD_UNINT);
+		const uint64_t from = mach_absolute_time();
+		const wait_result_t r = IOLockSleepDeadline(
+		    stateLock, &room, rgfxRingRoomSleepUntil(from, backstop, deadline), THREAD_UNINT);
+		uint64_t ns = 0, nowNs = 0;
+		const uint64_t to = mach_absolute_time();
+		absolutetime_to_nanoseconds(to - from, &ns);
+		absolutetime_to_nanoseconds(to, &nowNs);
+		log = rgfxRingRoomNote(roomStats, ns, r == THREAD_AWAKENED, nowNs,
+		                       static_cast<uint64_t>(kRoomLogMs) * 1000000ull);
+		seen = roomStats;
 	}
 	IOLockUnlock(stateLock);
 	rgfxRingRoomDone(room);
+	if (log)
+		IOLog("ReimsGraphics: control ring room: %llu sleeps (%llu woken by a pass), %llu us "
+		      "asleep in all, %llu us at most; %llu SUBMIT_ROOM records taken\n",
+		      seen.sleeps, seen.woken, seen.sleptNs / 1000, seen.mostNs / 1000,
+		      __atomic_load_n(&roomRecords, __ATOMIC_RELAXED));
 	return ready && mach_absolute_time() < deadline;
 }
 
@@ -631,7 +647,8 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		return;
 	case RGFX_EVT_SUBMIT_ROOM:
 		// The host took from the control ring after a post set its producer_waiting: the pass
-		// that drains this wakes the posts waiting for room (service).
+		// that drains this wakes the posts waiting for room (service). Counted for the room line.
+		__atomic_fetch_add(&roomRecords, 1, __ATOMIC_RELAXED);
 		return;
 	case RGFX_EVT_PIPELINE_REFLECTION:
 	case RGFX_EVT_SIZE_AND_ALIGN:
@@ -987,6 +1004,8 @@ bool ReimsGraphics::start(IOService *provider)
 	modeSet.reset();
 	taken = false;
 	submitRoom = false;
+	roomStats = {};
+	roomRecords = 0;
 
 	pci->setMemoryEnable(true);
 	pci->setBusLeadEnable(true);
