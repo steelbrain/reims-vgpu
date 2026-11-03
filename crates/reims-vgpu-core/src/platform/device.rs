@@ -236,6 +236,12 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// family and feature set of the SDK, and the identity and capability getters. Read on each
     /// call; only the graphics lane asks it, once per device.
     fn identity_caps(&self) -> IdentityCaps;
+    /// The bytes of the GPU's own memory the process may hold, as the platform answers at the
+    /// call: Metal's `recommendedMaxWorkingSetSize`; on the Vulkan platform the budget of the
+    /// device-local heaps (`VK_EXT_memory_budget`) where the device has the extension, else their
+    /// size. The graphics lane's deferred surfaces take a quarter of it, read once at its device's
+    /// start.
+    fn own_memory_budget(&self) -> u64;
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
     /// `desc`.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>>;

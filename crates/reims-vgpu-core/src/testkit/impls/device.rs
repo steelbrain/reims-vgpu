@@ -585,6 +585,11 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         fake_identity_caps()
     }
 
+    /// The identity's working set ([`FAKE_OWN_MEMORY`]), unlogged.
+    fn own_memory_budget(&self) -> u64 {
+        FAKE_OWN_MEMORY
+    }
+
     /// The value's options folded as Metal's buffer descriptor folds them ([`fold_options`]), its
     /// contents, pin and deallocator.
     fn new_buffer(
@@ -904,6 +909,10 @@ pub fn fake_caps() -> DeviceCaps {
     }
 }
 
+/// The fake device's `recommendedMaxWorkingSetSize`, which it answers as its own memory's budget
+/// too ([`GpuDevice::own_memory_budget`]).
+pub const FAKE_OWN_MEMORY: u64 = 0xcf5c_2c000;
+
 /// The fake device's identity answers: those of an Apple M3 Max under macOS 27 (measured with
 /// `guest/bundle/tools/metal_enum.m`), whose families are Apple1 to Apple9, Mac1 and Mac2, the
 /// Common families and Metal3 and Metal4, and whose feature sets are every iOS one and the macOS
@@ -944,7 +953,7 @@ pub fn fake_identity_caps() -> IdentityCaps {
             })
             .collect(),
         sizes: IdentitySizes {
-            recommended_max_working_set_size: Some(0xcf5c_2c000),
+            recommended_max_working_set_size: Some(FAKE_OWN_MEMORY),
             location: Some(0),
             location_number: Some(0),
             max_transfer_rate: Some(0),

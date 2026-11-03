@@ -214,6 +214,41 @@ fn device_local_bytes(device: &rt::Device) -> u64 {
         .fold(0u64, |sum, heap| sum.saturating_add(heap.size))
 }
 
+/// The bytes of `device`'s device-local memory heaps the process may hold now
+/// ([`GpuDevice::own_memory_budget`]): the heaps' budgets (`VK_EXT_memory_budget`) where the
+/// physical device lists the extension, which a physical-device query may chain without the device
+/// enabling it, else the heaps' sizes ([`device_local_bytes`]).
+///
+/// [`GpuDevice::own_memory_budget`]: reims_vgpu_core::platform::device::GpuDevice::own_memory_budget
+pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
+    // SAFETY: the instance and physical device are the runtime's, read only, while `device`
+    // lives.
+    let lists = unsafe {
+        let raw = device.raw();
+        raw.instance
+            .enumerate_device_extension_properties(raw.physical_device)
+            .unwrap_or_default()
+            .iter()
+            .any(|p| p.extension_name_as_c_str() == Ok(ash::ext::memory_budget::NAME))
+    };
+    if !lists {
+        return device_local_bytes(device);
+    }
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut memory = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    // SAFETY: as above; the one structure chained is of an extension the device lists.
+    unsafe {
+        let raw = device.raw();
+        raw.instance
+            .get_physical_device_memory_properties2(raw.physical_device, &mut memory);
+    }
+    let properties = memory.memory_properties;
+    (properties.memory_heaps_as_slice().iter())
+        .zip(budget.heap_budget)
+        .filter(|(heap, _)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .fold(0u64, |sum, (_, budget)| sum.saturating_add(budget))
+}
+
 /// `architecture.name` of a device of PCI vendor `vendor` and device `device` whose driver
 /// keys its compiled pipelines by `pipeline_cache`: `vulkan_VVVV_DDDD_` and the key in hex.
 ///
@@ -454,5 +489,15 @@ mod tests {
         assert_eq!(bgra8.sparse_tiles.unwrap()[0], [64, 64, 1]);
         let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
         assert_eq!(bc1.texture_buffer_alignment, None);
+    }
+
+    /// The budget of the device's own memory is some of it, no more than its device-local heaps
+    /// hold, as `VK_EXT_memory_budget` bounds each heap's budget by the heap's size
+    #[test]
+    fn the_own_memory_budget_is_within_the_device_local_heaps() {
+        let d = dev();
+        let budget = d.own_memory_budget();
+        assert!(budget > 0);
+        assert!(budget <= device_local_bytes(&d.raw));
     }
 }

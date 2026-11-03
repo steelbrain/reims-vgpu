@@ -722,6 +722,13 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         read_identity_caps(self)
     }
 
+    fn own_memory_budget(&self) -> u64 {
+        let d = self.get();
+        msg::get("recommendedMaxWorkingSetSize", || {
+            d.recommendedMaxWorkingSetSize()
+        })
+    }
+
     // Each creator from a value makes the descriptor with its class's `new`, makes it hold the
     // value (`desc`'s `apply_*`), then sends the descriptor's creator.
 
@@ -1808,6 +1815,11 @@ pub(crate) mod tests {
         assert_eq!(
             identity.architecture_name,
             Some(d.get().architecture().name().to_string())
+        );
+        // The budget of the GPU's own memory is the working set Metal recommends.
+        assert_eq!(
+            Some(d.own_memory_budget()),
+            identity.sizes.recommended_max_working_set_size
         );
         // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB.
         let bgra8 = identity.formats.iter().find(|f| f.format == 80).unwrap();

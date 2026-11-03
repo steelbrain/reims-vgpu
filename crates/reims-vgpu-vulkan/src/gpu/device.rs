@@ -1684,6 +1684,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::gpu::identity::read(&self.raw, &self.caps())
     }
 
+    fn own_memory_budget(&self) -> u64 {
+        crate::gpu::identity::device_local_budget(&self.raw)
+    }
+
     /// The runtime's buffer descriptor of the value: zero bytes, a copy of the contents, or,
     /// with `no_copy`, the contents themselves with the deallocator, at the pinned address when
     /// there is one. Nil as `newBufferWithLength:options:` is, for a pinned address the space
