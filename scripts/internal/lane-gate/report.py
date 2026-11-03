@@ -473,7 +473,7 @@ def write_report(run, base, noise, history=None):
     for it in cur["items"].values():
         counts[it["status"]] = counts.get(it["status"], 0) + 1
     # Correctness decides; the bench leg's failures and regressions are reported beside it.
-    bench_issues = [f for f in failed if f.startswith(("perf.", "metric."))]
+    bench_issues = [f for f in failed if f.startswith(("perf.", "metric.")) or f == "step.bench"]
     failed = [f for f in failed if f not in bench_issues]
     verdict = "FAIL" if failed else ("INCOMPLETE" if incomplete else "PASS")
     m = run.meta

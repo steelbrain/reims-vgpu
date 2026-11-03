@@ -497,9 +497,10 @@ fi
 if ! skipped boot; then
   if ((msi_ok && img_ok && gb == 0)); then
     echo boot >> "$RUN/ran"
-    if ! step boot do_boot boot && grep -q BOOT_QUEUE_TIMEOUT "$RES/boot/boot.log" 2> /dev/null; then
-      # The candidate did not run: the boot is not run, and a --resume tries it again.
-      say "  boot: not run (the lane host's GPU queue did not reach it in time; --resume $runid)"
+    if ! step boot do_boot boot && grep -q -E 'BOOT_QUEUE_TIMEOUT|BOOT_FAIL missing' "$RES/boot/boot.log" 2> /dev/null; then
+      # The candidate did not run (the host's queue did not reach the boot in time, or a file the
+      # boot needs is missing): the boot is not run, and a --resume tries it again.
+      say "  boot: not run ($(grep -m1 -o -E 'BOOT_QUEUE_TIMEOUT|BOOT_FAIL missing [^ ]*' "$RES/boot/boot.log"); --resume $runid)"
       rm -f "$RUN/steps/boot.fail"
       grep -v -x boot "$RUN/ran" > "$RUN/ran.new" || true
       mv "$RUN/ran.new" "$RUN/ran"
