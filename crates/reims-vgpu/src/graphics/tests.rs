@@ -3783,7 +3783,8 @@ fn a_close_waits_for_a_buffer_committed_before_an_earlier_release() {
 }
 
 /// A release the kext posted behind its context's close waits for the context's command buffer
-/// still in flight, as the close does: the kext gives the block out again at its answer
+/// still in flight, as the close does: the kext gives the block out again at its answer. It makes
+/// the closed context no state again
 #[test]
 fn a_release_behind_a_close_waits_for_the_close_s_buffers() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -3820,6 +3821,8 @@ fn a_release_behind_a_close_waits_for_the_close_s_buffers() {
     ));
     assert_eq!(answer_of(&mut guest, close), RGFX_STATUS_OK);
     assert_eq!(answer_of(&mut guest, release), RGFX_STATUS_OK);
+    // The release made the closed context no state again.
+    assert_eq!(device.control.decoder().context_states(), 0);
 }
 
 /// A shared block's release waits for the command buffer an earlier holder committed before its

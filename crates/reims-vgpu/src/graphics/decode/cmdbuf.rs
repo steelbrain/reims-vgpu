@@ -923,7 +923,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// its stand-in's or the failure posted for it comes in the order the queue's buffers were
     /// taken: the turn, the mark and the ticket the answer on a doorbell's thread took for it,
     /// where it was answered there ([`Answered`]). A context whose work is refused gets
-    /// [`DecodeError::ContextFailed`], as `decode` answers it; and where it gets its
+    /// [`DecodeError::ContextFailed`], as `decode` answers it, and one closed before the buffer
+    /// came [`DecodeError::ContextClosed`], with no turn taken; and where it gets its
     /// `CB_SUBMITTED` at its take, that is posted here, once its ticket in the commit order is
     /// issued, unless the answer posted it.
     pub(crate) fn begin_taken(
@@ -934,6 +935,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
         self.end_message();
         let drain = self.command_buffer_drain();
+        if drain.is_none() && self.context_closed() {
+            return Ok(Err(DecodeError::ContextClosed));
+        }
         if let Some(counts) = queue.and_then(|queue| self.queue_counts(queue)) {
             match self.answered_for(counts, message) {
                 Some(answered) => {
@@ -5133,6 +5137,69 @@ mod tests {
         // A walk begun after the create names it.
         ring0.set_walk_hook(None);
         assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+    }
+
+    /// A context's close leaves the decoder no state of it, whatever comes after: a command buffer
+    /// handed over after the close (taken off its ring before it) is refused unrun, as a closed
+    /// context's, and makes it none; a drain begun after the close (a release the kext posted
+    /// behind it) makes none, and ends after the close's own; and a failure of a buffer of the
+    /// context's after the close marks nothing.
+    #[test]
+    fn a_closed_context_s_late_arrivals_make_no_state() {
+        let (p, dec) = setup();
+        let device = p.device();
+        let ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(Some(0), super::super::Sinks::default());
+        let message = command_buffer_message(100, 1, &render_ops());
+        assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+        walker.end_message();
+        assert_eq!(p.world().committed().len(), 1);
+
+        let flag = |f: &Arc<AtomicBool>| -> super::super::DrainAnswer {
+            let f = Arc::clone(f);
+            Box::new(move || f.store(true, Ordering::Release))
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        assert_eq!(ring0.drop_context(0), 5);
+        drop(ring0.drain_context(0, true, flag(&closed)));
+        assert_eq!(ring0.context_states(), 0);
+
+        drop(ring0.drain_context(0, false, flag(&released)));
+        let late = command_buffer_message(101, 2, &render_ops());
+        let mut taken = dec.sender(Some(0), super::super::Sinks::default());
+        assert!(matches!(
+            taken.begin_taken(&device, &late, Some(1)).unwrap(),
+            Err(DecodeError::ContextClosed)
+        ));
+        taken.end_message();
+        assert!(matches!(
+            taken.decode(&device, &late).unwrap(),
+            Err(DecodeError::ContextClosed)
+        ));
+        taken.end_message();
+        let failed = ring0.failed_contexts();
+        assert!(
+            !failed.fail(0, failed.resets()),
+            "the closed context was marked failed"
+        );
+        assert!(!failed.has(0));
+        assert_eq!(
+            ring0.context_states(),
+            0,
+            "a late arrival made the closed context a state"
+        );
+        assert_eq!(p.world().committed().len(), 1, "a late buffer ran");
+
+        assert!(!closed.load(Ordering::Acquire) && !released.load(Ordering::Acquire));
+        p.world().complete_all(CompleteOn::Caller);
+        assert!(closed.load(Ordering::Acquire), "the close was not answered");
+        assert!(
+            released.load(Ordering::Acquire),
+            "the release was not answered"
+        );
+        assert_eq!(ring0.context_states(), 0);
+        drop(device);
     }
 
     /// A context's close during a walk of its command buffer drops its objects at once, the walk

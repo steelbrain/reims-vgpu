@@ -1117,6 +1117,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ) {
         match outcome {
             Ok(Ok(())) => {}
+            // Its queue ended at the close, so nothing posted onto it would reach the guest.
+            Ok(Err(DecodeError::ContextClosed)) => {
+                let (ty, seqno, obj_id) = message_identity(message);
+                log::debug!(
+                    target: "reims_vgpu::graphics",
+                    "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) of a context \
+                     closed before it came was dropped"
+                );
+            }
             Ok(Err(e)) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
@@ -1200,7 +1209,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     Ok(Err(e)) => Ok(Err(e)),
                     Err(raise) => Err(raise),
                 };
-                let stood_in = !matches!(outcome, Ok(Ok(())))
+                // A buffer of a context closed before it came is owed nothing: its queue ended.
+                let stood_in = !matches!(outcome, Ok(Ok(()) | Err(DecodeError::ContextClosed)))
                     && matches!(
                         refusing(|| decoder.stand_in_for_failed(&control.device, &message)),
                         Ok(true)

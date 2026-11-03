@@ -75,7 +75,7 @@
 //! compiled pipeline is stored); and `surface_views` before `surface_caches`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -280,12 +280,18 @@ impl Drop for Drain {
 /// command buffers' completed handlers, which mark a context.
 /// A handler marks one only where no reset of the device came since its buffer's decode: a buffer
 /// of the guest before a reboot may finish after it, and the rebooted guest's processes take the
-/// same context numbers again, from 1.
+/// same context numbers again, from 1. Nor does it mark a context closed since: the closed
+/// contexts are kept too ([`Self::close`]), and what comes to the decoder for one after its close
+/// makes it no state (a command buffer taken off its ring before the close and handed over after
+/// it, a release the kext posted behind the close), but a create of its own, as of a process
+/// given its number again, which opens it again ([`Self::reopen`]).
 ///
 /// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
 #[derive(Default)]
 pub(crate) struct FailedContexts {
     failed: Mutex<HashSet<u32>>,
+    /// The contexts closed since the device's reset, taken under `failed`'s lock.
+    closed: Mutex<Runs>,
     /// How many there are, read without the lock: none, in every run that refuses nothing.
     count: AtomicUsize,
     /// The device's resets so far ([`Self::forget_all`]), changed under `failed`'s lock.
@@ -303,7 +309,7 @@ impl FailedContexts {
     /// ([`Self::resets`]); nothing where the device was reset since. True where it was not yet.
     pub(crate) fn fail(&self, context: u32, resets: u64) -> bool {
         let mut failed = self.failed.lock();
-        if self.resets.load(Ordering::Acquire) != resets {
+        if self.resets.load(Ordering::Acquire) != resets || self.closed.lock().contains(context) {
             return false;
         }
         let new = failed.insert(context);
@@ -331,12 +337,82 @@ impl FailedContexts {
         self.count.store(failed.len(), Ordering::Release);
     }
 
-    /// Forgets every context, at the device's reset, and counts the reset.
+    /// `context` closed (its `CONTEXT_CLOSE`): forgotten, and kept closed until the device's
+    /// reset.
+    fn close(&self, context: u32) {
+        let mut failed = self.failed.lock();
+        failed.remove(&context);
+        self.closed.lock().insert(context);
+        self.count.store(failed.len(), Ordering::Release);
+    }
+
+    /// Whether `context` closed since the device's reset, and was not opened again since.
+    fn closed(&self, context: u32) -> bool {
+        self.closed.lock().contains(context)
+    }
+
+    /// `context`, closed before, is opened again: a create of its own came (a process given its
+    /// number again).
+    fn reopen(&self, context: u32) {
+        let _failed = self.failed.lock();
+        self.closed.lock().remove(context);
+    }
+
+    /// Forgets every context, and every close, at the device's reset, and counts the reset.
     fn forget_all(&self) {
         let mut failed = self.failed.lock();
         failed.clear();
+        self.closed.lock().clear();
         self.count.store(0, Ordering::Release);
         self.resets.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A set of context numbers, kept as the runs of consecutive numbers it holds, each by its first
+/// and its last: the kext numbers contexts in the order of their opens, and the closed ones then
+/// make about one run for each context still open between them.
+#[derive(Debug, Default)]
+struct Runs(BTreeMap<u32, u32>);
+
+impl Runs {
+    /// Whether `n` is held.
+    fn contains(&self, n: u32) -> bool {
+        (self.0.range(..=n).next_back()).is_some_and(|(_, &last)| n <= last)
+    }
+
+    /// Holds `n`, joining it to the runs it is next to.
+    fn insert(&mut self, n: u32) {
+        if self.contains(n) {
+            return;
+        }
+        let before = (self.0.range(..n).next_back())
+            .filter(|&(_, &last)| last.checked_add(1) == Some(n))
+            .map(|(&first, _)| first);
+        let after = n.checked_add(1).and_then(|next| self.0.remove(&next));
+        let first = before.unwrap_or(n);
+        self.0.insert(first, after.unwrap_or(n));
+    }
+
+    /// Holds `n` no longer, splitting its run.
+    fn remove(&mut self, n: u32) {
+        let Some((&first, &last)) = self.0.range(..=n).next_back() else {
+            return;
+        };
+        if n > last {
+            return;
+        }
+        self.0.remove(&first);
+        if first < n {
+            self.0.insert(first, n - 1);
+        }
+        if n < last {
+            self.0.insert(n + 1, last);
+        }
+    }
+
+    /// Holds nothing.
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -458,6 +534,10 @@ pub enum DecodeError {
     /// The message's context failed off its op's thread ([`FailedContexts`]): its later work is
     /// refused.
     ContextFailed,
+    /// The command buffer's context was closed before the buffer came to the decoder (taken off
+    /// its queue's ring before the close, handed over after it): nothing of it is carried out,
+    /// and nothing is owed, its queue having ended at the close.
+    ContextClosed,
 }
 
 /// How many `SURFACE_PAGES` pass between the logs of what the surface views did.
@@ -492,8 +572,9 @@ pub(crate) struct Shared<P: Platform> {
     contexts: Mutex<HashMap<u32, Arc<Context<P>>>>,
     /// The last drains of the contexts closed (`CONTEXT_CLOSE`), by context, while their command
     /// buffers may still run: a later drain of such a context, a release the kext posted behind
-    /// its close, ends after it ([`GraphicsDecoder::drain_context`]).
-    closed: Mutex<HashMap<u32, Weak<Drain>>>,
+    /// its close, ends after it ([`GraphicsDecoder::drain_context`]). Taken under `contexts`'
+    /// lock.
+    closing: Mutex<HashMap<u32, Weak<Drain>>>,
     /// The shared blocks a holder let go of (`BLOCK_UNSHARE`), by offset, until their release:
     /// each one's drain ends once every command buffer such a holder began before its unshare has
     /// finished, and gives the release's answer ([`GraphicsDecoder::block_unshared`]).
@@ -717,7 +798,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
             contexts: Mutex::new(HashMap::new()),
-            closed: Mutex::default(),
+            closing: Mutex::default(),
             unshared: Mutex::default(),
             surfaces: Mutex::default(),
             video: OnceLock::new(),
@@ -1350,14 +1431,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.contexts.lock().get(&context).cloned()
     }
 
-    /// The state of context `context`, made where it has none.
+    /// The state of context `context`, for a create of its own, made where it has none. A create
+    /// of a context closed before opens it again ([`FailedContexts::reopen`]): only a process
+    /// given its number again posts one after the close, which empties the context's
+    /// compiles and waits for its no-copy buffers first. Nothing else makes a state.
     fn context_made(&self, context: u32) -> Arc<Context<P>> {
         let mut contexts = self.shared.contexts.lock();
-        Arc::clone(
-            contexts
-                .entry(context)
-                .or_insert_with(|| Arc::new(Context::new(context))),
-        )
+        if let Some(state) = contexts.get(&context) {
+            return Arc::clone(state);
+        }
+        self.shared.failed.reopen(context);
+        let state = Arc::new(Context::new(context));
+        contexts.insert(context, Arc::clone(&state));
+        state
+    }
+
+    /// Whether the current context was closed before this message came, and has made no state
+    /// since: what of it needs a state is owed nothing ([`DecodeError::ContextClosed`]).
+    fn context_closed(&self) -> bool {
+        self.context.is_some_and(|context| {
+            self.context_state(context).is_none() && self.shared.failed.closed(context)
+        })
+    }
+
+    /// How many contexts the decoder holds a state of.
+    #[cfg(test)]
+    pub(crate) fn context_states(&self) -> usize {
+        self.shared.contexts.lock().len()
     }
 
     /// The entry of `obj_id` the message sees (its view of the object's context's table, taken
@@ -1734,7 +1834,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         *shared.surfaces.lock() = SurfaceNames::default();
         // Their drains go with them, those of the contexts closed and of the unshared blocks too:
         // the answers waiting on those are owed to no one.
-        shared.closed.lock().clear();
+        shared.closing.lock().clear();
         shared.unshared.lock().clear();
         let states = std::mem::take(&mut *shared.contexts.lock());
         if let Err(refusal) = refusals::refusing(move || drop(states)) {
@@ -2439,6 +2539,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_CMD_COMMAND_BUFFER => {
                 let drain = self.command_buffer_drain();
+                if drain.is_none() && self.context_closed() {
+                    return Ok(Err(DecodeError::ContextClosed));
+                }
                 self.decode_command_buffer(device, message, drain)
             }
             _ => Ok(Err(DecodeError::UnknownCommand)),
@@ -2449,13 +2552,18 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// handler has run. It is taken once a message, before the message's view of the context's
     /// table, so a drain begun after that view was taken waits for the buffer
     /// ([`Self::drain_context`]); a stand-in for the buffer holds the same. `None` with no
-    /// context.
+    /// context, or one with no state, whose buffer names none of its objects: it makes it none,
+    /// as only a create does ([`Self::context_made`]). Taken under the states' lock, so a close
+    /// either finds the drain taken or has taken the context's own.
     pub(crate) fn command_buffer_drain(&self) -> Option<Arc<Drain>> {
         if let Some(drain) = self.drain.borrow().as_ref() {
             return Some(Arc::clone(drain));
         }
         let context = self.context?;
-        let drain = Arc::clone(&*self.context_made(context).drain.lock());
+        let drain = {
+            let contexts = self.shared.contexts.lock();
+            Arc::clone(&*contexts.get(&context)?.drain.lock())
+        };
         *self.drain.borrow_mut() = Some(Arc::clone(&drain));
         Some(drain)
     }
@@ -2616,35 +2724,40 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// with no lock held: the answer goes then where no buffer is in flight, else on the GPU
     /// thread of the last to finish. `closed` ends the context's drains and its state (its
     /// `CONTEXT_CLOSE`); else a new one begins for its later buffers, held by this one
-    /// ([`Drain`]). A drain of a context closed before, whose close's drain has not ended (a
-    /// release the kext posted behind the close), gives `answer` only once that one has ended
-    /// too.
+    /// ([`Drain`]). A context with no state has no buffer to wait for, and is made none. A drain
+    /// of a context closed before, whose close's drain has not ended (a release the kext posted
+    /// behind the close), gives `answer` only once that one has ended too.
     pub(crate) fn drain_context(
         &self,
         context: u32,
         closed: bool,
         answer: DrainAnswer,
     ) -> Arc<Drain> {
-        let drain = if closed {
-            let state = self.shared.contexts.lock().remove(&context);
-            let drain: Arc<Drain> = state
-                .map(|state| std::mem::take(&mut *state.drain.lock()))
-                .unwrap_or_default();
-            let mut gone = self.shared.closed.lock();
-            gone.retain(|_, d| d.strong_count() > 0);
-            gone.insert(context, Arc::downgrade(&drain));
-            drain
-        } else {
-            let state = self.context_made(context);
-            let mut current = state.drain.lock();
-            let next = Arc::new(Drain::default());
-            *current.later.lock() = Some(Arc::clone(&next));
-            std::mem::replace(&mut *current, next)
-        };
-        let closing = if closed {
-            None
-        } else {
-            self.shared.closed.lock().get(&context).cloned()
+        let (drain, closing) = {
+            let mut contexts = self.shared.contexts.lock();
+            if closed {
+                let state = contexts.remove(&context);
+                let drain: Arc<Drain> = state
+                    .map(|state| std::mem::take(&mut *state.drain.lock()))
+                    .unwrap_or_default();
+                // Under the states' lock, so no state is made for it after this.
+                self.shared.failed.close(context);
+                let mut closing = self.shared.closing.lock();
+                closing.retain(|_, d| d.strong_count() > 0);
+                closing.insert(context, Arc::downgrade(&drain));
+                (drain, None)
+            } else {
+                let drain = match contexts.get(&context) {
+                    Some(state) => {
+                        let mut current = state.drain.lock();
+                        let next = Arc::new(Drain::default());
+                        *current.later.lock() = Some(Arc::clone(&next));
+                        std::mem::replace(&mut *current, next)
+                    }
+                    None => Arc::default(),
+                };
+                (drain, self.shared.closing.lock().get(&context).cloned())
+            }
         };
         let answer = match closing {
             // At the drain's end: where the close's drain has not ended, its end gives it.
@@ -3963,6 +4076,40 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::*;
+
+    /// The closed contexts' runs hold each number inserted, joined with the runs it is next to,
+    /// and nothing else
+    #[test]
+    fn runs_hold_what_was_inserted_joined() {
+        let mut runs = Runs::default();
+        for n in [3, 1, 2, 7, 5, 6, u32::MAX, 0] {
+            runs.insert(n);
+        }
+        for n in [0, 1, 2, 3, 5, 6, 7, u32::MAX] {
+            assert!(runs.contains(n), "{n}: {runs:?}");
+        }
+        for n in [4, 8, u32::MAX - 1] {
+            assert!(!runs.contains(n), "{n}: {runs:?}");
+        }
+        assert_eq!(runs.0.len(), 3, "{runs:?}");
+        runs.insert(4);
+        runs.insert(4);
+        assert_eq!(
+            runs.0.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(),
+            [(0, 7), (u32::MAX, u32::MAX)]
+        );
+        // A context opened again leaves its run split around it.
+        runs.remove(4);
+        runs.remove(0);
+        runs.remove(u32::MAX);
+        runs.remove(9);
+        assert_eq!(
+            runs.0.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(),
+            [(1, 3), (5, 7)]
+        );
+        runs.clear();
+        assert!(!runs.contains(1));
+    }
 
     /// A library from region chunks: each chunk is read at its offset and acked, and
     /// the library is made, from the bytes unchanged, when the chunks reach its length;
