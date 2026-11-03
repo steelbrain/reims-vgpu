@@ -47,6 +47,7 @@
 #import "RgfxSharedEvent.h"
 #import "RgfxIOSurface.h"
 #import "RgfxInterop.h"
+#import "RgfxMetalError.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
@@ -55,6 +56,7 @@
 #include <atomic>
 #include <cstring>
 #include <mach/mach_time.h>
+#include <mutex>
 #include <vector>
 
 #include "RgfxCompletionThread.hpp"
@@ -919,6 +921,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	std::atomic<CFTimeInterval> _gpuStart;
 	std::atomic<CFTimeInterval> _gpuEnd;
 	NSError *_cbError;
+	// The handlers, added until the commit, which `_handlersLock` orders them against: once
+	// committed, the lists are only read, by the thread that delivers.
+	std::mutex _handlersLock;
 	NSMutableArray *_completedHandlers;
 	NSMutableArray *_scheduledHandlers;
 	// The queue's completion-ring reader, taken at commit; null when the queue has none
@@ -1154,10 +1159,12 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)commit
 {
-	if (_committed) {
-		return; // commit is once
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		if (_committed)
+			return; // commit is once
+		_committed = YES;
 	}
-	_committed = YES;
 	_kernelStart.store(rgfxHostTime());
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
@@ -1458,20 +1465,30 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	return status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError;
 }
 
+// Invoked with this command buffer when its completion is delivered, in the order added
+// (rgfxDeliverCompletion:). A handler added after the commit, before or after the buffer
+// completes, ends the process with Metal's words, as Metal does on the M3 Max, an AMD 5300M and
+// an Intel 630: so does presentDrawable: after the commit, which adds a scheduled handler.
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block
 {
-	// Invoked with this command buffer when its completion is delivered, in the order
-	// added (rgfxDeliverCompletion:).
-	if (block != nil) {
-		[_completedHandlers addObject:[block copy]];
-	}
+	if (block == nil)
+		return;
+	std::lock_guard<std::mutex> hold(_handlersLock);
+	if (_committed)
+		RgfxMetalAssertionFailed("-[_MTLCommandBuffer addCompletedHandler:]",
+		                         @"Completed handler provided after commit call");
+	[_completedHandlers addObject:[block copy]];
 }
 
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block
 {
-	if (block != nil) {
-		[_scheduledHandlers addObject:[block copy]];
-	}
+	if (block == nil)
+		return;
+	std::lock_guard<std::mutex> hold(_handlersLock);
+	if (_committed)
+		RgfxMetalAssertionFailed("-[_MTLCommandBuffer addScheduledHandler:]",
+		                         @"Scheduled handler provided after commit call");
+	[_scheduledHandlers addObject:[block copy]];
 }
 
 // The command-buffer SPI SkyLight's compositor and VideoToolbox call: commits, then waits until

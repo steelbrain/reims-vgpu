@@ -5067,6 +5067,15 @@ void test_texture_destroy_waits_for_buffers()
 	uint64_t texObjId = 0, texResourceId = 0;
 	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
 	CHECK(cb.retainedReferences);
+	// Its handler, added before the commit as Metal requires, looks for the destroy at completion.
+	__block bool destroyedBeforeHandler = true;
+	TestRing *control = &f.control;
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
+		(void)d;
+		RgfxMsgHeader hh = {};
+		std::vector<uint8_t> bb;
+		destroyedBeforeHandler = control->next(&hh, &bb);
+	}];
 	@autoreleasepool {
 		RgfxTexture *tex = texture();
 		texObjId = tex.rgfxObjId;
@@ -5089,14 +5098,6 @@ void test_texture_destroy_waits_for_buffers()
 	CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id ==
 	      otherObjId);
 
-	__block bool destroyedBeforeHandler = true;
-	TestRing *control = &f.control;
-	[cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
-		(void)d;
-		RgfxMsgHeader hh = {};
-		std::vector<uint8_t> bb;
-		destroyedBeforeHandler = control->next(&hh, &bb);
-	}];
 	RgfxCbComplete done = cbComplete(f.nextSeqno(), ((RgfxResource *)cb).rgfxObjId);
 	CHECK(f.completion.postFromHost(&done, sizeof(done)));
 	[cb waitUntilCompleted];
@@ -8927,7 +8928,8 @@ void test_reply_reader_close()
 void rgfxProtocolTests();
 void rgfxArchiveTests();
 void rgfxResourceTests();
-void rgfxQueueTests();
+void rgfxQueueTests(const char *self);
+int rgfxQueueDiesCase(const char *name);
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -8983,6 +8985,8 @@ int main(int argc, char **argv)
 	g_self = argv[0];
 	if (argc == 3 && std::strcmp(argv[1], "--dies") == 0)
 		return dies_case(argv[2]);
+	if (argc == 3 && std::strcmp(argv[1], "--queue-dies") == 0)
+		return rgfxQueueDiesCase(argv[2]);
 	@autoreleasepool {
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
@@ -9081,7 +9085,7 @@ int main(int argc, char **argv)
 		rgfxProtocolTests(); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
-		rgfxQueueTests();    // tests/queue_tests.mm
+		rgfxQueueTests(argv[0]); // tests/queue_tests.mm
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

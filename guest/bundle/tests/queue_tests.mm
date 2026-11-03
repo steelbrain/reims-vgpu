@@ -9,8 +9,14 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <crt_externs.h>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <spawn.h>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 #import "RgfxCommandObjects.h"
@@ -23,7 +29,8 @@
 #include "reims_graphics_wire.h"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing
 
-void rgfxQueueTests();
+void rgfxQueueTests(const char *self);
+int rgfxQueueDiesCase(const char *name);
 
 @interface QueueTestHandle : RgfxResource <MTLBuffer, MTLTexture>
 @end
@@ -32,6 +39,9 @@ void rgfxQueueTests();
 @end
 
 namespace {
+
+const char *g_self = nullptr;
+constexpr int kAborted = 128 + SIGABRT;
 
 QueueTestHandle *handle(uint64_t objId)
 {
@@ -137,9 +147,130 @@ void test_encoder_keeps_its_buffer_until_it_ends()
 	CHECK(weakCB == nil);
 }
 
+// Runs the case `name` of rgfxQueueDiesCase in a process of its own: it must end the process
+// (SIGABRT) with `words` on stderr.
+void checkDies(const char *name, const char *words)
+{
+	int fds[2];
+	CHECK(pipe(fds) == 0);
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	char *args[] = {const_cast<char *>(g_self), const_cast<char *>("--queue-dies"),
+	                const_cast<char *>(name), nullptr};
+	pid_t pid = 0;
+	CHECK(posix_spawn(&pid, g_self, &fa, nullptr, args, *_NSGetEnviron()) == 0);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	std::string err;
+	char chunk[512];
+	ssize_t n;
+	while ((n = read(fds[0], chunk, sizeof chunk)) > 0)
+		err.append(chunk, static_cast<size_t>(n));
+	close(fds[0]);
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	const bool aborted = WIFEXITED(status) && WEXITSTATUS(status) == kAborted;
+	if (!aborted || err.find(words) == std::string::npos)
+		std::fprintf(stderr, "--queue-dies %s ended with status %d:\n%s\n", name, status,
+		             err.c_str());
+	CHECK(aborted);
+	CHECK(err.find(words) != std::string::npos);
+}
+
+// The host's completion of the one command buffer `q` holds on its submission ring: posted on
+// its completion ring and taken off it (the reader is undriven, so the taker delivers).
+void complete(Queue &q, id<MTLCommandBuffer> cb)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(q.submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+	RgfxCbComplete done = {};
+	done.header.type = RGFX_EVT_CB_COMPLETE;
+	done.header.size = sizeof(done);
+	done.header.seqno = h.seqno;
+	done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+	done.status = RGFX_CB_OK;
+	CHECK(q.completion.postFromHost(&done, sizeof(done)));
+	[cb waitUntilCompleted];
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+}
+
+// A handler added after the commit ends the process at the call with Metal's words, before the
+// buffer completes and after, as Metal does; so does presentDrawable: after the commit, which
+// adds a scheduled handler. (It used to race the delivering thread's walk of the list, or be
+// dropped unrun.)
+void test_handlers_after_commit_end_the_process()
+{
+	const char *completed = "-[_MTLCommandBuffer addCompletedHandler:]: failed assertion "
+	                        "`Completed handler provided after commit call'";
+	const char *scheduled = "-[_MTLCommandBuffer addScheduledHandler:]: failed assertion "
+	                        "`Scheduled handler provided after commit call'";
+	checkDies("completed-after-commit", completed);
+	checkDies("completed-after-completion", completed);
+	checkDies("scheduled-after-commit", scheduled);
+	checkDies("scheduled-after-completion", scheduled);
+	checkDies("present-after-commit", scheduled);
+
+	// Added before the commit, each runs once, in the order added.
+	Queue q(true);
+	id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+	__block std::string order;
+	[cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+		(void)c;
+		order += "s";
+	}];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+		(void)c;
+		order += "1";
+	}];
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+		(void)c;
+		order += "2";
+	}];
+	[cb commit];
+	complete(q, cb);
+	CHECK(order == "s12");
+}
+
 } // namespace
 
-void rgfxQueueTests()
+int rgfxQueueDiesCase(const char *name)
 {
+	signal(SIGABRT, [](int) { _exit(kAborted); });
+	@autoreleasepool {
+		Queue q(true);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		[cb commit];
+		auto late = [&](bool completedFirst, void (^add)(void)) {
+			if (completedFirst)
+				complete(q, cb);
+			add();
+		};
+		if (std::strcmp(name, "completed-after-commit") == 0 ||
+		    std::strcmp(name, "completed-after-completion") == 0)
+			late(std::strcmp(name, "completed-after-completion") == 0, ^{
+				[cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+					(void)c;
+				}];
+			});
+		if (std::strcmp(name, "scheduled-after-commit") == 0 ||
+		    std::strcmp(name, "scheduled-after-completion") == 0)
+			late(std::strcmp(name, "scheduled-after-completion") == 0, ^{
+				[cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+					(void)c;
+				}];
+			});
+		if (std::strcmp(name, "present-after-commit") == 0)
+			[cb presentDrawable:(id<MTLDrawable>)[NSObject new]];
+	}
+	return 0;
+}
+
+void rgfxQueueTests(const char *self)
+{
+	g_self = self;
 	test_encoder_keeps_its_buffer_until_it_ends();
+	test_handlers_after_commit_end_the_process();
 }
