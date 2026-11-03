@@ -1036,14 +1036,15 @@ impl Shared {
             self.tell_reset();
             self.take_messages();
             // Asleep with `consumer_idle` set only while the device takes the ring.
-            let idle = {
+            let (idle, epoch) = {
                 let submit = self.submit.lock();
+                let epoch = self.epoch.load(Ordering::Acquire);
                 if !self.started() || submit.broken {
-                    false
+                    (false, epoch)
                 } else if submit.consumer.sleep_or_pending(&self.region) {
                     continue;
                 } else {
-                    true
+                    (true, epoch)
                 }
             };
             if self.ending() {
@@ -1052,8 +1053,14 @@ impl Shared {
             self.wake.sleep(self.doorbell.get().map(AsRawFd::as_raw_fd));
             // A doorbell may follow the guest's take of completions.
             self.room.wake();
+            // A reset while it slept set the ring up anew, its `consumer_idle` 1, so the guest
+            // rings for its first message: that stands. The reset moves the count before it takes
+            // the ring, so one that has not yet set the ring up sets it after this.
             if idle {
-                self.submit.lock().consumer.awake(&self.region);
+                let submit = self.submit.lock();
+                if self.epoch.load(Ordering::Acquire) == epoch {
+                    submit.consumer.awake(&self.region);
+                }
             }
         }
     }
