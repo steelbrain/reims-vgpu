@@ -60,6 +60,8 @@ use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
 
+use super::commit_order;
+
 /// The waits and signals run under a live raise handler (the ring loop's).
 const ON: OnFault = OnFault::Return;
 
@@ -83,6 +85,9 @@ pub(crate) struct Marks {
     signalled: AtomicU64,
     /// The highest seqno signalled whose command buffer has finished.
     done: AtomicU64,
+    /// How far the queue's buffers have been committed, which a buffer of another queue that
+    /// holds `COMMIT_ORDER` waits for ([`super::commit_order`]).
+    pub(crate) commit: commit_order::CommitMark,
 }
 
 impl Marks {
@@ -262,6 +267,69 @@ impl<P: Platform> SurfaceOrder<P> {
             .collect()
     }
 
+    /// The queues a buffer of queue `queue` that holds `COMMIT_ORDER` naming `waits` is committed
+    /// after, each with the seqno to wait for ([`super::commit_order`]): each queue once, at its
+    /// highest seqno named, of those [`Self::commit_named`] keeps.
+    pub(crate) fn commit_after(
+        &self,
+        queue: u64,
+        waits: impl Iterator<Item = RgfxSurfaceOrderWait>,
+    ) -> Vec<(Arc<Marks>, u64)> {
+        let mut after: Vec<(Arc<Marks>, u64)> = Vec::new();
+        for (marks, s) in self.commit_named(queue, waits) {
+            match after.iter_mut().find(|(m, _)| Arc::ptr_eq(m, marks)) {
+                Some((_, v)) => *v = (*v).max(s),
+                None => after.push((Arc::clone(marks), s)),
+            }
+        }
+        after
+    }
+
+    /// Whether the buffers a buffer of queue `queue` that holds `COMMIT_ORDER` naming `waits` is
+    /// committed after are all begun, so it may take its place among the commit order's tickets
+    /// on a doorbell's thread, waiting for nothing ([`super::commit_order`]). Allocates nothing.
+    pub(crate) fn commit_begun(
+        &self,
+        queue: u64,
+        waits: impl Iterator<Item = RgfxSurfaceOrderWait>,
+    ) -> bool {
+        (self.commit_named(queue, waits))
+            .all(|(marks, s)| marks.commit.reached(s, commit_order::Until::Begun))
+    }
+
+    /// The queues and seqnos of `waits` a buffer of queue `queue` that holds `COMMIT_ORDER` is
+    /// committed after: all but the buffer's own queue, a queue of another context, a queue the
+    /// host does not hold or holds ended, a seqno past every one the queue's ring has published,
+    /// and one its mark has reached.
+    fn commit_named(
+        &self,
+        queue: u64,
+        waits: impl Iterator<Item = RgfxSurfaceOrderWait>,
+    ) -> impl Iterator<Item = (&Arc<Marks>, u64)> {
+        let context = queue >> RGFX_CONTEXT_OBJ_ID_SHIFT;
+        waits.filter_map(move |w| {
+            let (q, s) = (w.queue_obj_id, w.seqno);
+            if q == queue || q == 0 || s == 0 || q >> RGFX_CONTEXT_OBJ_ID_SHIFT != context {
+                return None;
+            }
+            let named = self.queues.get(&q)?;
+            if named.ended
+                || named
+                    .marks
+                    .commit
+                    .reached(s, commit_order::Until::Committed)
+            {
+                return None;
+            }
+            if let Some(published) = named.published.as_ref()
+                && published().is_none_or(|p| s > p)
+            {
+                return None;
+            }
+            Some((&named.marks, s))
+        })
+    }
+
     /// Whether a buffer of queue `queue` that names `waits` waits for none of them on the GPU, so
     /// it may be submitted as it is taken: each names its own queue, a queue the host does not
     /// hold, or a buffer the host has seen finish. Allocates nothing.
@@ -439,6 +507,8 @@ impl<P: Platform> SurfaceOrder<P> {
             q.ended = true;
             q.published = None;
             let marks = Arc::clone(&q.marks);
+            // Nothing waits for its commits any more ([`super::commit_order`]).
+            marks.commit.end();
             let waited = marks.waited.load(Ordering::SeqCst);
             if waited > marks.signalled.load(Ordering::Acquire)
                 && let Some(event) = q.event.as_ref()

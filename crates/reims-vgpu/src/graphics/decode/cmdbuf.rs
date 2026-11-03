@@ -78,16 +78,17 @@ use reims_graphics::ops::render::{
 };
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
-    RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
-    RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE,
-    RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER, RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT,
-    RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
-    RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
-    RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_FLAG_VISIBILITY_RESULT,
-    RGFX_PASS_MAX_SAMPLE_POSITIONS, RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer,
-    RgfxComputePassDesc, RgfxOpEvent, RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass,
-    RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassSamplePositions,
-    RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
+    RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
+    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
+    RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
+    RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
+    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
+    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
+    RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
+    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
+    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
+    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxRenderPassVisibility,
+    RgfxSurfaceOrderWait, op_group,
 };
 use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
@@ -114,6 +115,7 @@ use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
 
 use super::super::completion::{cb_complete, cb_failed};
+use super::commit_order::Until;
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
 use super::surface_cache::Uses;
@@ -497,6 +499,9 @@ struct Take {
     asks: bool,
     /// The buffers of other queues its first `SURFACE_ORDER` names, where it holds one.
     order: Option<Vec<RgfxSurfaceOrderWait>>,
+    /// The buffers of its process's other queues its first `COMMIT_ORDER` names, which it is
+    /// committed after ([`super::commit_order`]); empty where it holds none.
+    commit_after: Vec<RgfxSurfaceOrderWait>,
     /// The stream holds a video encoder, whose session's work starts as it is walked.
     video: bool,
 }
@@ -540,6 +545,10 @@ fn take(mut ops: &[u8]) -> Take {
                     .collect();
                 out.order = Some(waits);
             }
+            RGFX_OP_COMMIT_ORDER if out.commit_after.is_empty() => {
+                let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
+                out.commit_after = Glance::order_waits(body).collect();
+            }
             RGFX_OP_ENCODER_BEGIN_VIDEO => out.video = true,
             _ => {}
         }
@@ -570,12 +579,14 @@ fn op_bodies(mut ops: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
 
 /// What an answer on a doorbell's thread reads of a command buffer's op stream, in place and
 /// allocating nothing, as [`take`] reads it: whether it asks for its `CB_SUBMITTED` and waits for
-/// an event, its first `SURFACE_ORDER`'s body, and the blocks its `SURFACE_USE` ops name.
+/// an event, its first `SURFACE_ORDER`'s and `COMMIT_ORDER`'s bodies, and the blocks its
+/// `SURFACE_USE` ops name.
 struct Glance<'o> {
     ops: &'o [u8],
     asks: bool,
     waits: bool,
     order: Option<&'o [u8]>,
+    commit: Option<&'o [u8]>,
 }
 
 impl<'o> Glance<'o> {
@@ -586,12 +597,14 @@ impl<'o> Glance<'o> {
             asks: false,
             waits: false,
             order: None,
+            commit: None,
         };
         for (tag, body) in op_bodies(ops) {
             match tag {
                 RGFX_OP_WAIT_EVENT => glance.waits = true,
                 RGFX_OP_SUBMITTED => glance.asks = true,
                 RGFX_OP_SURFACE_ORDER if glance.order.is_none() => glance.order = Some(body),
+                RGFX_OP_COMMIT_ORDER if glance.commit.is_none() => glance.commit = Some(body),
                 _ => {}
             }
         }
@@ -606,7 +619,7 @@ impl<'o> Glance<'o> {
             .map(|(op, _)| op.block_offset)
     }
 
-    /// The buffers of other queues its first `SURFACE_ORDER` names.
+    /// The buffers of other queues its first `SURFACE_ORDER` (or `COMMIT_ORDER`) names.
     fn order_waits(body: &'o [u8]) -> impl Iterator<Item = RgfxSurfaceOrderWait> + 'o {
         let (waits, _) = body.as_chunks::<{ size_of::<RgfxSurfaceOrderWait>() }>();
         (waits.iter()).filter_map(|w| RgfxSurfaceOrderWait::read_from_bytes(w).ok())
@@ -647,8 +660,9 @@ impl<P: Platform> Decoders<P> {
     /// queue of its context, it asks for its `CB_SUBMITTED`, its last op, and waits for no event,
     /// it uses no device cache ([`super::surface_cache`]) and no block whose `SURFACE_PAGES` the
     /// surface worker is still carrying out ([`super::worker::Unsettled`]), which its begin waits
-    /// for, and waits for no buffer of another queue ([`super::surface_order`]), no buffer before
-    /// it holds its queue, its queue holds fewer than [`TAKE_IN_FLIGHT_MAX`] command buffers made
+    /// for, waits for no buffer of another queue ([`super::surface_order`]), names in its
+    /// `COMMIT_ORDER` only buffers begun ([`super::commit_order`]), no buffer before it holds its
+    /// queue, its queue holds fewer than [`TAKE_IN_FLIGHT_MAX`] command buffers made
     /// and not completed and no answered buffer not yet begun, and each lock it takes is free,
     /// each tried. Its turn in its queue's lane and its
     /// ticket in the commit order are taken together, or neither, and kept on its queue
@@ -687,6 +701,14 @@ impl<P: Platform> Decoders<P> {
                 return false;
             };
             if !order.ready(m.queue_obj_id, Glance::order_waits(body)) {
+                return false;
+            }
+        }
+        if let Some(body) = glance.commit {
+            let Some(order) = shared.surface_order.try_lock() else {
+                return false;
+            };
+            if !order.commit_begun(m.queue_obj_id, Glance::order_waits(body)) {
                 return false;
             }
         }
@@ -735,6 +757,9 @@ impl<P: Platform> Decoders<P> {
                 },
                 cb_obj_id: m.cb_obj_id,
             };
+            // Its place among the tickets is taken: a buffer that names it may take its own
+            // ([`super::commit_order`]).
+            counts.order.commit.begin(m.header.seqno);
             let posted = post(&record);
             *slot = Some(Answered {
                 seqno: m.header.seqno,
@@ -919,11 +944,21 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 None => *self.turn.borrow_mut() = Self::turn_on(counts),
             }
+            // Its queue's commit marks rise to it, in its turn, whether it is committed, stood in
+            // for or fails, however little of its message can be read ([`super::commit_order`]).
+            if let Some(h) = read::<RgfxMsgHeader>(message) {
+                *self.committed.borrow_mut() = Some((Arc::clone(&counts.order), h.seqno));
+            }
         }
         if self.context_failed() {
+            self.note_begun();
             return Ok(Err(DecodeError::ContextFailed));
         }
-        let begun = match self.begin_command_buffer(device, message, drain)? {
+        let begun = self.begin_command_buffer(device, message, drain);
+        // However far its begin got, a buffer that names it waits for it no more before its own
+        // begin, only before its commit ([`super::commit_order`]).
+        self.note_begun();
+        let begun = match begun? {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
@@ -975,9 +1010,29 @@ impl<P: Platform> GraphicsDecoder<P> {
         message: &[u8],
         drain: Option<Arc<Drain>>,
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
+        // The op stream follows the message's fixed part; `op_bytes` must count all of it.
+        let parsed = read::<RgfxCommandBuffer>(message)
+            .and_then(|m| ops_of(message, &m).map(|ops| (m, ops, take(ops))));
+        // The buffers of its process's other queues it is committed after, as its `COMMIT_ORDER`
+        // names them ([`super::commit_order`]).
+        if let Some((m, _, take)) = &parsed
+            && !take.commit_after.is_empty()
+        {
+            *self.commit_after.borrow_mut() = (self.shared.surface_order.lock())
+                .commit_after(m.queue_obj_id, take.commit_after.iter().copied());
+        }
         // It is committed after every buffer answered `CB_SUBMITTED` before now, and after its
-        // context's range messages that came before now.
+        // context's range messages that came before now; and, before it takes that place, the
+        // buffers it is committed after have taken theirs, so none of them waits for its ticket
+        // or a later one ([`super::commit_order`]). An answer on a doorbell's thread took it
+        // where they had.
         if self.mark.get().is_none() {
+            let after = self.commit_after.borrow();
+            if !after.is_empty() {
+                let own = (self.committed.borrow().as_ref()).map(|(marks, _)| Arc::clone(marks));
+                let cancel = &self.shared.commit_cancel;
+                super::commit_order::wait(&after, own.as_deref(), cancel, Until::Begun);
+            }
             self.mark.set(Some(self.shared.sequencer.mark()));
         }
         if self.ranges.get().is_none() {
@@ -986,11 +1041,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .flatten();
             self.ranges.set(Some(asked));
         }
-        let Some(m) = read::<RgfxCommandBuffer>(message) else {
-            return Ok(Err(DecodeError::Malformed));
-        };
-        // The op stream follows the message's fixed part; `op_bytes` must count all of it.
-        let Some(ops) = ops_of(message, &m) else {
+        let Some((m, _, take)) = parsed else {
             return Ok(Err(DecodeError::Malformed));
         };
         // The queue the buffer runs on; a missing or wrong-kind queue is a
@@ -1006,7 +1057,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         super::work::command_buffer(self.context);
         let in_flight = InFlight::new(&counts.in_flight);
-        let take = take(ops);
+        // Its queue's commit marks rise to it, where its begin on a queue's service thread did
+        // not note it already: begun now, and committed as the message ends
+        // ([`super::commit_order`]).
+        if self.committed.borrow().is_none() {
+            *self.committed.borrow_mut() = Some((Arc::clone(&counts.order), m.header.seqno));
+            self.note_begun();
+        }
         // Each block it uses as its `SURFACE_PAGES` left it ([`super::surface_pages`]).
         for u in &take.uses {
             self.settle_surface(u.block_offset);
@@ -1320,7 +1377,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Waits, with no lock held, until the command buffer may be committed: after the buffers of
     /// its queue taken before it ([`super::lane`]), every buffer answered `CB_SUBMITTED` before
     /// its begin, and its context's range messages that came before its begin
-    /// ([`super::sequencer`]).
+    /// ([`super::sequencer`]); then after the buffers of its process's other queues its
+    /// `COMMIT_ORDER` names ([`super::commit_order`]).
     fn wait_to_commit(&self) {
         self.wait_turn();
         let sequencer = &self.shared.sequencer;
@@ -1329,6 +1387,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
             sequencer.wait_for_ranges(context, asked);
+        }
+        let after = std::mem::take(&mut *self.commit_after.borrow_mut());
+        if !after.is_empty() {
+            let own = (self.committed.borrow().as_ref()).map(|(marks, _)| Arc::clone(marks));
+            let cancel = &self.shared.commit_cancel;
+            super::commit_order::wait(&after, own.as_deref(), cancel, Until::Committed);
         }
     }
 
@@ -1655,7 +1719,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             }
             // Carried out before the walk, wherever they lie ([`take`]).
-            RGFX_OP_SURFACE_USE | RGFX_OP_SUBMITTED | RGFX_OP_SURFACE_ORDER => {}
+            RGFX_OP_SURFACE_USE
+            | RGFX_OP_SUBMITTED
+            | RGFX_OP_SURFACE_ORDER
+            | RGFX_OP_COMMIT_ORDER => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -3741,6 +3808,157 @@ mod tests {
         let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::VulkanPlatform>();
         assert!(!early, "answered as submitted while its queue was held");
         assert!(bytes.iter().all(|&b| b == 0x5a));
+    }
+
+    /// Through the decoder on `P`, as the host takes two queues' rings on threads of their own:
+    /// buffer A of queue 1 fills a tracked buffer, and buffer B of queue 2, committed plainly
+    /// after A by the guest, names A in its `COMMIT_ORDER` and copies the buffer out. B is taken
+    /// first, on a thread of its own; A is begun 50 ms on and committed 100 ms after that. The
+    /// bytes B copied.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
+    fn a_plain_commit_after_a_named_buffer_of_another_queue<P: crate::platform::ApiPlatform>()
+    -> Vec<u8> {
+        use std::time::{Duration, Instant};
+
+        use reims_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
+            RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
+        };
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        const LEN: u64 = 1 << 20;
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&completed);
+        dec.set_completion_sink(Arc::new(move |m| sink.lock().push(m.cb_obj_id)));
+        for obj_id in [1, 2] {
+            let queue = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: size_of::<RgfxQueueCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                ..RgfxQueueCreate::default()
+            };
+            assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        }
+        for obj_id in [10, 11] {
+            let buffer = RgfxBufferCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_BUFFER_CREATE,
+                    size: size_of::<RgfxBufferCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                length: LEN,
+                ..RgfxBufferCreate::default()
+            };
+            assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        }
+
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        let fill = RgfxBlitOpFillBuffer {
+            buffer_obj_id: 10,
+            range_location: 0,
+            range_length: LEN,
+            value: 0x5a,
+            ..RgfxBlitOpFillBuffer::default()
+        };
+        ops.extend(op(RGFX_OP_BLIT_FILL_BUFFER, fill.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let a = command_buffer_on(1, 20, &ops);
+        let named = RgfxSurfaceOrderWait {
+            queue_obj_id: 1,
+            seqno: 20,
+        };
+        let mut ops = op(RGFX_OP_COMMIT_ORDER, named.as_bytes());
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        let copy = RgfxBlitOpCopyBufferToBuffer {
+            source_buffer_obj_id: 10,
+            destination_buffer_obj_id: 11,
+            source_offset: 0,
+            destination_offset: 0,
+            size: LEN,
+        };
+        ops.extend(op(RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, copy.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let b = command_buffer_on(2, 21, &ops);
+
+        let mut first = dec.decoders().sender(None, dec.sinks.clone());
+        let mut second = dec.decoders().sender(None, dec.sinks.clone());
+        std::thread::scope(|scope| {
+            let device = &device;
+            let taken_first = scope.spawn(|| {
+                let _pool = reims_vgpu_core::rt::Pool::here();
+                let begun = second.begin_taken(device, &b, Some(2)).unwrap().unwrap();
+                let done = second.finish_command_buffer(device, &b, begun).unwrap();
+                second.end_message();
+                done
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let begun = first.begin_taken(device, &a, Some(1)).unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                first.finish_command_buffer(device, &a, begun).unwrap(),
+                Ok(())
+            );
+            first.end_message();
+            assert_eq!(taken_first.join().unwrap(), Ok(()));
+        });
+        let start = Instant::now();
+        while !completed.lock().contains(&21) || !completed.lock().contains(&20) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "A or B never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let Some(ObjHandle::Buffer(out)) = dec.object(11) else {
+            panic!("no buffer 11");
+        };
+        // SAFETY: a Shared buffer of `LEN` bytes, read after the command buffer that wrote it
+        // finished.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), LEN as usize) };
+        bytes.to_vec()
+    }
+
+    /// On Metal, a plain commit on another queue that the guest made after a buffer's, and that
+    /// names it in its `COMMIT_ORDER`, reads the tracked buffer it writes, though the host took
+    /// it first: Metal orders a tracked resource across a process's queues by commit order (the
+    /// M3, the 5300M and the 630, docs/graphics-kext/dgpu-oracle.md, Q6), and the host commits
+    /// it after the buffer it names.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
+        let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
+            reims_vgpu_metal::MetalPlatform,
+        >();
+        assert!(
+            bytes.iter().all(|&b| b == 0x5a),
+            "committed before the buffer it names"
+        );
+    }
+
+    /// The same on the Vulkan platform
+    /// (`on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names`).
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
+        let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
+            reims_vgpu_vulkan::VulkanPlatform,
+        >();
+        assert!(
+            bytes.iter().all(|&b| b == 0x5a),
+            "committed before the buffer it names"
+        );
     }
 
     /// Through the decoder on `P`: buffer A of queue 1, which holds the surface order, waits for

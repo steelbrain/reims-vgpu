@@ -1887,15 +1887,27 @@ every word stale). The bundle names the order as it posts each buffer:
   `posted`: the names run from later posts to earlier ones and cannot meet in a
   cycle. A buffer committed but held behind an uncommitted one on its queue is
   not on its ring, and is not named, as Metal does not submit it either.
-- The host keeps, for each queue, the highest seqno whose buffer was committed,
-  stood in for or failed, raised in the queue's order as each buffer's job
-  ends. A buffer that holds the op is committed once each named queue's mark
-  reaches the seqno named, after its turn in its queue and the commit order's
-  tickets. A name of its own queue, of another process's queue, of a queue the
-  host does not hold, or past every seqno the queue's ring has published, waits
-  for nothing. The wait holds no lock; a queue's destroy, its context's close
-  and the device's reset end it, so a process that names a cycle holds up only
-  its own queues, until it closes.
+- The host keeps two marks for each queue: the highest seqno whose buffer took
+  its place among the commit order's tickets (its begin), and the highest whose
+  buffer was committed, stood in for or failed, raised in the queue's order as
+  each buffer's job ends. A buffer that holds the op takes its own place among
+  the tickets only once each buffer it names has begun, and is committed only
+  once each named queue's commit mark reaches the seqno named, after its turn
+  in its queue and the tickets. The first wait keeps the tickets from crossing
+  the names. Without it, a queue's service thread could take a buffer that
+  names another queue's buffer, then a later buffer that asks for its
+  `CB_SUBMITTED` and takes a ticket, all before the named buffer's begin. The
+  named buffer would then wait for that ticket, the ticket's buffer for its
+  turn, and the naming buffer for the named one. With it, every wait of a
+  commit is for a buffer begun before it. An answer on a doorbell's thread,
+  which waits for nothing, is left to the service thread where a named buffer
+  has not begun.
+- A name of its own queue, of another process's queue, of a queue the host
+  does not hold, or past every seqno the queue's ring has published, waits for
+  nothing. The waits hold no lock. A queue's destroy, its context's close and
+  a reset of the device end them, and while a reset is under way none waits,
+  so a process that names a cycle holds up only its own queues, until it
+  closes.
 - Nothing else changes: no GPU wait is added, the buffer's records go as they
   did, and the platform orders what the buffers share by the commit order.
 

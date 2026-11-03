@@ -146,6 +146,7 @@ const HEAP_PAGE: u64 = 0x4000;
 mod argument;
 mod blit;
 mod cmdbuf;
+mod commit_order;
 mod compute;
 #[cfg(test)]
 mod draw_cost;
@@ -527,6 +528,9 @@ pub(crate) struct Shared<P: Platform> {
     /// The queues' surface timelines, which order command buffers of different queues over the
     /// IOSurfaces they share ([`surface_order`]).
     surface_order: Mutex<surface_order::SurfaceOrder<P>>,
+    /// The device's resets, which end every wait for another queue's buffers
+    /// ([`commit_order`]).
+    commit_cancel: commit_order::Cancel,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
@@ -549,6 +553,18 @@ impl<P: Platform> Decoders<P> {
     /// to `sinks`.
     pub(crate) fn sender(&self, context: Option<u32>, sinks: Sinks) -> GraphicsDecoder<P> {
         GraphicsDecoder::on(Arc::clone(&self.0), context, sinks)
+    }
+
+    /// A reset of the device is under way: every wait for another queue's buffers ends, and none
+    /// waits until [`Self::reset_done`], so none holds up the reset, which waits for the work begun
+    /// before it ([`commit_order`]).
+    pub(crate) fn resetting(&self) {
+        self.0.commit_cancel.begin();
+    }
+
+    /// The reset [`Self::resetting`] told of is done.
+    pub(crate) fn reset_done(&self) {
+        self.0.commit_cancel.end();
     }
 }
 
@@ -608,8 +624,24 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The waits its command buffer makes for buffers of other queues, taken at its begin, for
     /// the work the host starts off it ([`Self::wait_for_order_on_cpu`]).
     order_waits: RefCell<Vec<surface_order::OrderWait<P>>>,
+    /// The queues of its process its command buffer is committed after, each with the seqno its
+    /// `COMMIT_ORDER` named, taken at its begin ([`commit_order`]).
+    commit_after: RefCell<Vec<(Arc<surface_order::Marks>, u64)>>,
+    /// Its command buffer's queue's marks and its seqno, from its begin: the queue's begun mark
+    /// rises to the seqno once it takes its place among the tickets, and its commit mark as the
+    /// message ends, before its turn passes ([`commit_order`]).
+    committed: RefCell<Option<(Arc<surface_order::Marks>, u64)>>,
     /// The entries the message found last ([`Recent`]).
     recent: Recent<P>,
+}
+
+impl<P: Platform> Drop for GraphicsDecoder<P> {
+    /// As [`GraphicsDecoder::end_message`] does: its command buffer's queue's commit mark rises
+    /// before its turn passes, which a lane's job takes out of the handle first and lets go of
+    /// after ([`commit_order`]).
+    fn drop(&mut self) {
+        self.note_committed();
+    }
 }
 
 /// How many entries [`Recent`] keeps.
@@ -691,6 +723,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
+            commit_cancel: commit_order::Cancel::default(),
             lanes: lane::Budget::of_host(),
             #[cfg(test)]
             walk_hook: Mutex::new(None),
@@ -716,6 +749,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             posted_at_doorbell: Cell::new(false),
             drain: RefCell::new(None),
             order_waits: RefCell::new(Vec::new()),
+            commit_after: RefCell::new(Vec::new()),
+            committed: RefCell::new(None),
             recent: Recent::new(),
         }
     }
@@ -740,10 +775,31 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.mark.set(None);
         self.ranges.set(None);
         self.ticket.get_mut().take();
+        // Its queue's commit mark rises before its turn passes, so a queue's buffers raise it in
+        // its ring's order ([`commit_order`]).
+        self.note_committed();
+        self.commit_after.get_mut().clear();
         self.turn.get_mut().take();
         self.posted_at_doorbell.set(false);
         self.drain.get_mut().take();
         self.order_waits.get_mut().clear();
+    }
+
+    /// The message's command buffer took its place among the commit order's tickets, or got as
+    /// far as it will: its queue's begun mark rises to its seqno ([`commit_order`]).
+    fn note_begun(&self) {
+        if let Some((marks, seqno)) = self.committed.borrow().as_ref() {
+            marks.commit.begin(*seqno);
+        }
+    }
+
+    /// The message's command buffer was committed, stood in for or failed: its queue's commit
+    /// mark rises to its seqno ([`commit_order`]). Called as the message ends, in its turn.
+    fn note_committed(&self) {
+        if let Some((marks, seqno)) = self.committed.borrow_mut().take() {
+            marks.commit.begin(seqno);
+            marks.commit.raise(seqno);
+        }
     }
 
     /// The guest's RAM, through which an IOSurface's own pages are mapped for its GPU view

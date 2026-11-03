@@ -4939,6 +4939,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_UNSHARED_QUEUES
             | RGFX_FEATURE_SUBMIT_ROOM
             | RGFX_FEATURE_ICB_SLOTS
+            | RGFX_FEATURE_COMMIT_ORDER
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
 
@@ -4951,6 +4952,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_UNSHARED_QUEUES
             | RGFX_FEATURE_SUBMIT_ROOM
             | RGFX_FEATURE_ICB_SLOTS
+            | RGFX_FEATURE_COMMIT_ORDER
     );
 }
 
