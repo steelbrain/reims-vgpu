@@ -1570,6 +1570,17 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   The install kext waits for the data volume to mount (`/Library/Preferences`
   appears) and creates the container, with the same class, only where it is
   missing.
+  - *Checklist (per supported OS).* The three load hooks and the three install
+    hooks are Lilu routes of six XNU MAC dispatchers
+    (`_mac_file_check_library_validation`, `_mac_file_check_mmap`,
+    `_mac_vnode_check_signature`, `_mac_vnode_check_{create,open,truncate}`),
+    whose argument lists `RgfxGateHooks.cpp` hard-codes. Routing is by symbol,
+    not by raw bytes, so a moved patch site is not the risk; a changed
+    *prototype* is. When a new `KernelVersion` is added to the supported range
+    (Info.plist, BigSur..Tahoe), re-verify each of the six prototypes against
+    that OS's KDK before shipping it, and confirm `_csfg_get_cdhash` and
+    `_csblob_get_cdhash` still resolve (a miss on either now logs loudly and
+    leaves the gate inert rather than bricking silently).
 - **Bundle updates.** The marker beside the executable (below, "Registration
   waits for the bundle") carries the kext's wire version, and the bundle is the
   kext's own payload, so a newer kext whose executable or wire version differs

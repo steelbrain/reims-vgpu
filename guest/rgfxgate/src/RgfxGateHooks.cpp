@@ -83,8 +83,14 @@ using t_mmap = int (*)(void *, void *, int, int, uint64_t, int *);
 static t_mmap orgMmap;
 static int wrapMmap(void *cred, void *fg, int prot, int flags,
                     uint64_t file_pos, int *maxprot) {
-	if ((prot & kVmProtExecute) && cdhashIsOurs(fg, file_pos))
+	if ((prot & kVmProtExecute) && cdhashIsOurs(fg, file_pos)) {
+		// Short-circuiting skips the original's W^X downgrade of *maxprot, so
+		// clamp it to the requested prot ourselves (our r-x mapping needs no
+		// more), rather than leaving the caller's wider maxprot in place.
+		if (maxprot != nullptr)
+			*maxprot &= prot;
 		return 0; // the GPU process may map our driver executable
+	}
 	return orgMmap(cred, fg, prot, flags, file_pos, maxprot);
 }
 
