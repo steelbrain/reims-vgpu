@@ -65,9 +65,14 @@
 //! ([`GraphicsDecoder::stand_in_for_failed`]), whose completion posts the buffer's
 //! failure in the queue's order, with the shared event values it signals ahead of it.
 
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use reims_graphics::ops::render::{
+    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives,
+    RgfxOpSetVertexBuffer,
+};
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
@@ -94,7 +99,7 @@ use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
+use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
@@ -1337,7 +1342,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         enc: &P::RenderEncoder,
         pass: &render::PassFacts,
     ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
+        let mut draws = Draws::new();
         while !ops.is_empty() {
+            // Draws one after another go to the encoder together; each other op, after them.
+            if let Some((draw, len)) = self.vertex_draw(ops) {
+                draws.push(draw, enc)?;
+                ops = &ops[len..];
+                continue;
+            }
+            draws.send(enc)?;
             let Some((tag, body, len)) = next_op(ops) else {
                 return Ok(Err(DecodeError::Malformed));
             };
@@ -1349,7 +1362,38 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             ops = &ops[len..];
         }
+        draws.send(enc)?;
         Ok(Ok(ops))
+    }
+
+    /// The draw at the start of `ops`, and the bytes of its two ops: a `SET_VERTEX_BUFFER` whose
+    /// body reads and whose buffer resolves, then a `DRAW_PRIMITIVES` whose body reads, as
+    /// [`render::decode_op`] reads each. `None` for anything else, which the walk then carries out
+    /// an op at a time, faulting where each op does. The lookup has no effect on what the message
+    /// names: a miss is looked up again by the op.
+    fn vertex_draw<'s>(&'s self, ops: &[u8]) -> Option<(VertexDraw<'s, P>, usize)> {
+        #[cfg(test)]
+        if !tests::GATHERS.get() {
+            return None;
+        }
+        let (RGFX_OP_RENDER_SET_VERTEX_BUFFER, body, len) = next_op(ops)? else {
+            return None;
+        };
+        let (bind, _) = RgfxOpSetVertexBuffer::read_from_prefix(body).ok()?;
+        let (RGFX_OP_RENDER_DRAW_PRIMITIVES, body, draw_len) = next_op(&ops[len..])? else {
+            return None;
+        };
+        let (draw, _) = RgfxOpDrawPrimitives::read_from_prefix(body).ok()?;
+        let buffer = self.get_buffer(bind.buffer_obj_id).ok()?;
+        let draw = VertexDraw {
+            buffer,
+            offset: bind.offset,
+            index: bind.index,
+            primitive_type: draw.primitive_type,
+            vertex_start: draw.vertex_start,
+            vertex_count: draw.vertex_count,
+        };
+        Some((draw, len + draw_len))
     }
 
     /// A framing op: open the encoder its `ENCODER_BEGIN_*` names, end the open
@@ -1646,6 +1690,51 @@ fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
     Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
 }
 
+/// The most draws [`Draws`] holds before it sends them.
+pub(super) const DRAWS_HELD: usize = 32;
+
+/// Draws a render run met one after another, not yet sent ([`GraphicsDecoder::render_ops`]):
+/// sent together, as each would be alone ([`RenderEncoder::encode_draws`]), before any other op
+/// of the run, before the run ends, and whenever [`DRAWS_HELD`] are held.
+struct Draws<'a, P: Platform> {
+    held: [MaybeUninit<VertexDraw<'a, P>>; DRAWS_HELD],
+    /// How many of `held`, from its start, are draws.
+    len: usize,
+}
+
+impl<'a, P: Platform> Draws<'a, P> {
+    fn new() -> Self {
+        Draws {
+            held: [const { MaybeUninit::uninit() }; DRAWS_HELD],
+            len: 0,
+        }
+    }
+
+    /// Holds `draw`, after sending those held first where they are as many as it holds.
+    #[inline]
+    fn push(&mut self, draw: VertexDraw<'a, P>, enc: &P::RenderEncoder) -> RaiseResult<()> {
+        if self.len == DRAWS_HELD {
+            self.send(enc)?;
+        }
+        self.held[self.len].write(draw);
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Sends the draws held, which it then holds no more.
+    #[inline]
+    fn send(&mut self, enc: &P::RenderEncoder) -> RaiseResult<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let len = std::mem::take(&mut self.len);
+        // SAFETY: the first `len` of `held` were written ([`Self::push`]), and `VertexDraw` is
+        // `Copy`, so they need no drop.
+        let draws = unsafe { std::slice::from_raw_parts(self.held.as_ptr().cast(), len) };
+        enc.encode_draws(ON, draws)
+    }
+}
+
 /// A fault when an encoder is already open at an `ENCODER_BEGIN_*`.
 fn already_open<P: Platform>(encoder: &Option<OpenEncoder<P>>, op: &str) -> RaiseResult<()> {
     if encoder.is_some() {
@@ -1708,6 +1797,7 @@ mod tests {
     use reims_vgpu_core::platform::values::AttachmentState;
     use reims_vgpu_core::sync::Mutex;
     use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_core::testkit::Step;
     use reims_vgpu_core::testkit::calllog::Arg;
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
@@ -1901,6 +1991,162 @@ mod tests {
         let mut msg = m.as_bytes().to_vec();
         msg.extend_from_slice(ops);
         msg
+    }
+
+    thread_local! {
+        /// Whether the walk sends draws together ([`GraphicsDecoder::vertex_draw`]); a test of the
+        /// walk an op at a time sets it false.
+        pub(super) static GATHERS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    }
+
+    /// A draw's two ops: `SET_VERTEX_BUFFER` of `buffer` at `offset`, index 0, then
+    /// `DRAW_PRIMITIVES` of `count` triangles' vertices from `start`.
+    fn draw_ops(buffer: u64, offset: u64, start: u64) -> Vec<u8> {
+        let mut ops = op(
+            RGFX_OP_RENDER_SET_VERTEX_BUFFER,
+            RgfxOpSetVertexBuffer {
+                buffer_obj_id: buffer,
+                offset,
+                index: 0,
+            }
+            .as_bytes(),
+        );
+        ops.extend(op(
+            RGFX_OP_RENDER_DRAW_PRIMITIVES,
+            RgfxOpDrawPrimitives {
+                primitive_type: 3,
+                vertex_start: start,
+                vertex_count: 3,
+            }
+            .as_bytes(),
+        ));
+        ops
+    }
+
+    /// A render pass of `draws`, the ops between `ENCODER_BEGIN_RENDER` and `ENCODER_END`.
+    fn pass_of(draws: &[u8]) -> Vec<u8> {
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+        ops.extend(op(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RgfxOpSetRenderPipelineState { pipeline_obj_id: 0 }.as_bytes(),
+        ));
+        ops.extend_from_slice(draws);
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops
+    }
+
+    /// What a fresh decoder does with a command buffer of `ops`, sending its draws together
+    /// (`gathers`) or an op at a time, with `script` set on its platform first: its answer, and
+    /// each call it made of the platform from the message on, with the call's arguments.
+    fn walked(
+        ops: &[u8],
+        gathers: bool,
+        script: &dyn Fn(&FakePlatform),
+    ) -> (String, Vec<(&'static str, Vec<Arg>)>) {
+        GATHERS.set(gathers);
+        let (p, mut dec) = setup();
+        script(&p);
+        let device = p.device();
+        let mark = p.call_log().mark();
+        let answer = dec.decode(&device, &command_buffer_message(100, 1, ops));
+        p.world().complete_all(CompleteOn::Caller);
+        GATHERS.set(true);
+        let calls = p.call_log().since(mark).into_iter();
+        (
+            format!("{answer:?}"),
+            calls.map(|c| (c.sel, c.args)).collect(),
+        )
+    }
+
+    /// Draws sent together reach the platform as they do an op at a time: the same calls, with
+    /// the same arguments, in the same order, and the same answer, the walk stopping at the same
+    /// op. Five draws whose third names a buffer the context does not hold fault at that op,
+    /// after the first two; so do five whose third `setVertexBuffer:offset:atIndex:` the
+    /// platform raises at, after its call; and so do a draw whose `DRAW_PRIMITIVES` is too short,
+    /// one whose length runs past the stream, a run of draws past what the walk holds, broken by
+    /// another op, and a vertex buffer set with no draw after it
+    #[test]
+    fn draws_sent_together_reach_the_platform_as_they_do_an_op_at_a_time() {
+        const SET: &str = "setVertexBuffer:offset:atIndex:";
+        const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
+        let five = |third: Vec<u8>| {
+            let mut draws = Vec::new();
+            for k in 0..5 {
+                match k {
+                    2 => draws.extend_from_slice(&third),
+                    _ => draws.extend(draw_ops(2, 16 * k, 3 * k)),
+                }
+            }
+            pass_of(&draws)
+        };
+        let short = {
+            let mut ops = draw_ops(2, 32, 6);
+            let draw = ops.len() - size_of::<RgfxOpDrawPrimitives>() - 8;
+            ops.truncate(draw);
+            ops.extend(op(RGFX_OP_RENDER_DRAW_PRIMITIVES, &[0; 8]));
+            ops
+        };
+        let past_the_stream = {
+            let mut third = draw_ops(2, 32, 6);
+            // The `DRAW_PRIMITIVES` header's length, after the `SET_VERTEX_BUFFER` op.
+            let at = 8 + size_of::<RgfxOpSetVertexBuffer>() + 4;
+            third[at..at + 4].copy_from_slice(&4096u32.to_ne_bytes());
+            five(third)
+        };
+        let long_run = {
+            let mut draws = Vec::new();
+            for k in 0..(2 * DRAWS_HELD as u64 + 7) {
+                draws.extend(draw_ops(2 + k % 2, 16 * k, 3 * k));
+                if k == 40 {
+                    draws.extend(op(
+                        RGFX_OP_RENDER_SET_VIEWPORT,
+                        RgfxOpSetViewport {
+                            width_bits: 64.0f64.to_bits(),
+                            height_bits: 64.0f64.to_bits(),
+                            zfar_bits: 1.0f64.to_bits(),
+                            ..RgfxOpSetViewport::default()
+                        }
+                        .as_bytes(),
+                    ));
+                }
+            }
+            pass_of(&draws)
+        };
+        /// What a case sets on its platform first.
+        type Scripted<'s> = &'s dyn Fn(&FakePlatform);
+        let raises_at_third: Scripted<'_> = &|p| {
+            p.script().after(
+                SET,
+                2,
+                Step::raise("NSInvalidArgumentException", "a test's"),
+            )
+        };
+        let none: Scripted<'_> = &|_| {};
+        let cases: [(&str, Vec<u8>, Scripted<'_>, usize); 6] = [
+            (
+                "a bad reference at the third",
+                five(draw_ops(99, 32, 6)),
+                none,
+                2,
+            ),
+            (
+                "a raise at the third",
+                five(draw_ops(2, 32, 6)),
+                raises_at_third,
+                2,
+            ),
+            ("a short third", five(short), none, 2),
+            ("a third past the stream", past_the_stream, none, 2),
+            ("a long run", long_run, none, 2 * DRAWS_HELD + 7),
+            ("the reference ops", render_ops(), none, 1),
+        ];
+        for (case, ops, script, draws) in cases {
+            let together = walked(&ops, true, script);
+            let alone = walked(&ops, false, script);
+            assert_eq!(together, alone, "{case}");
+            let drawn = (together.1.iter()).filter(|(sel, _)| *sel == DRAW).count();
+            assert_eq!(drawn, draws, "{case}: {together:?}");
+        }
     }
 
     /// A decode a fake host's video was handed: its session's codec, its access unit (offset,

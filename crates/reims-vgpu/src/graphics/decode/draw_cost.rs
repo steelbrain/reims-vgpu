@@ -46,7 +46,7 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _, VertexDraw};
 use reims_vgpu_core::platform::resource::Library as _;
 use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
 use reims_vgpu_core::raise::OnFault;
@@ -461,9 +461,27 @@ impl<P: ApiPlatform> Bench<P> {
         let chunks: Vec<&P::Buffer> = (0..self.shape.chunks())
             .map(|n| self.buffer(CHUNK_ID + n))
             .collect();
+        // Each command buffer's draws, made before the count starts.
+        let draws: Vec<Vec<VertexDraw<'_, P>>> = (0..self.shape.cbs)
+            .map(|cb_at| {
+                (0..self.shape.draws)
+                    .map(|draw| {
+                        let (chunk, offset) = upload_at(self.shape, cb_at, draw);
+                        VertexDraw {
+                            buffer: Some(chunks[(chunk - CHUNK_ID) as usize]),
+                            offset,
+                            index: 0,
+                            primitive_type: TRIANGLE,
+                            vertex_start: 0,
+                            vertex_count: 3,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         let (tx, rx) = mpsc::channel();
         let start = counts();
-        for cb_at in 0..self.shape.cbs {
+        for cb_draws in &draws {
             let cb = queue.command_buffer(o).unwrap().unwrap();
             let pass = self.platform.render_pass_descriptor();
             let attachment = ColorAttachmentSet {
@@ -493,20 +511,9 @@ impl<P: ApiPlatform> Bench<P> {
                 for cmd in cmds {
                     e.encode(o, cmd).unwrap();
                 }
-                for draw in 0..self.shape.draws {
-                    let (chunk, offset) = upload_at(self.shape, cb_at, draw);
-                    let bind = RenderCmd::SetVertexBuffer {
-                        buffer: Some(chunks[(chunk - CHUNK_ID) as usize]),
-                        offset,
-                        index: 0,
-                    };
-                    e.encode(o, bind).unwrap();
-                    let drawn = RenderCmd::DrawPrimitives {
-                        primitive_type: TRIANGLE,
-                        vertex_start: 0,
-                        vertex_count: 3,
-                    };
-                    e.encode(o, drawn).unwrap();
+                // The draws go together, as many at once as the walk holds.
+                for held in cb_draws.chunks(super::cmdbuf::DRAWS_HELD) {
+                    e.encode_draws(o, held).unwrap();
                 }
             });
             e.encode(o, RenderCmd::EndEncoding).unwrap();
