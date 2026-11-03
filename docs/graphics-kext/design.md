@@ -1417,7 +1417,16 @@ the host's import, and the kext's block table holds one entry per slab:
   `BUFFER_OVER_PAGES` over the block's view. A larger Managed slab is the
   region's, as is a slab where the kernel has no superpage to give (no
   contiguous 2 MiB free, or the wire budget spent) or the kext gives no pages
-  block. A slab let go
+  block. Each superpage is one kernel call: a slab of several reserves its
+  range (no access, at a 2 MiB boundary) and makes each superpage over its
+  own piece (`VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`), and one refusal gives
+  the whole range back in one deallocation, so the slab is the region's. A
+  call for several superpages that runs out partway takes down past what it
+  made on macOS 26.4 and later (xnu's `vm_map_enter` deletes up to the
+  request's end after shrinking its size), a deallocation gap whose
+  `EXC_GUARD` (`DEALLOC_GAP`) is fatal in every process whose VM guard is on:
+  Apple's platform binaries and the hardened browser processes, WebKit's GPU
+  process among them (`src/RgfxSuperpages.hpp`). A slab let go
   destroys its heap, releases its pages block (the kext answers once the host
   let go of it, and unwires the pages), then deallocates its pages. On the
   RTX 5080 a heap over a run of guest RAM took 13.4 us and a 4 KiB buffer

@@ -37,6 +37,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "RgfxSlabs.hpp"
+#include "RgfxSuperpages.hpp"
 
 // The accelerator's user-client protocol, the kext's own header: its type, its selectors and
 // the kext's own feature bits.
@@ -336,23 +337,17 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 	return true;
 }
 
-// The pages source's memory (RgfxPagesMemory), tagged as the GPU's, so vmmap and footprint file
-// it where Metal's own memory shows: a 2 MiB superpage, zeroed and wired, one run of RAM.
+// The pages source's memory (RgfxPagesMemory): 2 MiB superpages, zeroed and wired, each one run of
+// RAM, one kernel call each, so a refusal is safe in a process whose VM guard is on
+// (RgfxSuperpages.hpp).
 int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
 {
-	mach_vm_address_t at = 0;
-	const kern_return_t kr =
-	    mach_vm_allocate(mach_task_self(), &at, size,
-	                     VM_FLAGS_ANYWHERE | VM_FLAGS_SUPERPAGE_SIZE_2MB |
-	                         VM_MAKE_TAG(VM_MEMORY_IOACCELERATOR));
-	if (kr == KERN_SUCCESS)
-		*bytes = reinterpret_cast<uint8_t *>(at);
-	return kr;
+	return rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, bytes);
 }
 
 void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 {
-	mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(bytes), size);
+	rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
 }
 
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
