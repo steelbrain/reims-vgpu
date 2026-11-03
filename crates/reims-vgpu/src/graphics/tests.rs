@@ -3713,6 +3713,9 @@ fn an_encode_the_platform_refuses_fails_its_command_buffer() {
     let failed = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
     assert_eq!(failed.cb_obj_id, 100);
     assert_ne!(failed.status, RGFX_CB_OK);
+    // It fails as an internal error, `MTLCommandBufferErrorInternal` the code the guest's buffer
+    // reports, never `MTLCommandBufferErrorNone` (0).
+    assert_eq!((failed.status, failed.error_code), (RGFX_CB_INTERNAL, 1));
     ring.send(&device, compute_command_buffer(obj(3, 1), 101, obj(3, 11)));
     assert!(complete_until_event(&platform, &mut ring), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
@@ -4226,6 +4229,8 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     let refused = ring3.event().expect("the refused buffer's completion");
     let refused = RgfxCbComplete::read_from_bytes(&refused).unwrap();
     assert_eq!((refused.cb_obj_id, refused.status), (101, RGFX_CB_INTERNAL));
+    // Its error is `MTLCommandBufferErrorInternal`, which the guest's buffer reports, never 0.
+    assert_eq!(refused.error_code, 1);
     assert!(platform.world().committed().is_empty(), "the buffer ran");
     guest.send(&device, event_create(obj(3, 6)));
     let sampler = RgfxSamplerCreate {

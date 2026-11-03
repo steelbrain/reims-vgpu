@@ -78,7 +78,10 @@ pub fn cb_complete(
 /// The completion record for a command buffer the host could not carry out: a malformed op
 /// stream, a reference the host does not hold, or an exec fault before the buffer was committed.
 /// No GPU ran it and no completion handler will fire for it, so the host posts this itself — an
-/// internal error with no GPU times — and the guest blocked on the buffer unblocks.
+/// internal error with no GPU times — and the guest blocked on the buffer unblocks. Its code is
+/// `MTLCommandBufferErrorInternal`'s, as [`cb_complete`]'s is for that status: the guest's buffer
+/// carries the code as its error's, and a failed buffer whose error is
+/// `MTLCommandBufferErrorNone` (0) is one Metal never gives.
 pub fn cb_failed(cb_obj_id: u64, seqno: u64) -> RgfxCbComplete {
     RgfxCbComplete {
         header: RgfxMsgHeader {
@@ -90,7 +93,7 @@ pub fn cb_failed(cb_obj_id: u64, seqno: u64) -> RgfxCbComplete {
         gpu_start_ns: 0,
         gpu_end_ns: 0,
         status: RGFX_CB_INTERNAL,
-        error_code: 0,
+        error_code: MTL_CB_ERROR_INTERNAL as u32,
     }
 }
 
@@ -134,6 +137,25 @@ mod tests {
             assert_eq!(m.status, status);
             assert_eq!(m.error_code, code as u32);
         }
+    }
+
+    /// A command buffer the host could not carry out fails as an internal error, with
+    /// `MTLCommandBufferErrorInternal`'s code and no GPU times, never with code 0.
+    #[test]
+    fn a_buffer_the_host_could_not_carry_out_is_an_internal_error() {
+        let m = cb_failed(7, 42);
+        assert_eq!(m.header.r#type, RGFX_EVT_CB_COMPLETE);
+        assert_eq!(m.header.size as usize, size_of::<RgfxCbComplete>());
+        assert_eq!(m.header.seqno, 42);
+        assert_eq!(m.cb_obj_id, 7);
+        assert_eq!((m.gpu_start_ns, m.gpu_end_ns), (0, 0));
+        assert_eq!(m.status, RGFX_CB_INTERNAL);
+        assert_eq!(m.error_code, MTL_CB_ERROR_INTERNAL as u32);
+        let internal = cb_complete(7, 42, 0, 0, Some(&cb_error(MTL_CB_ERROR_INTERNAL)));
+        assert_eq!(
+            (m.status, m.error_code),
+            (internal.status, internal.error_code)
+        );
     }
 
     /// An error outside the boundary cases (here out of memory, 8) is a generic

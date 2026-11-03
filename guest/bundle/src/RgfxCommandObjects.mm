@@ -1656,7 +1656,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 // Metal puts that IOGPU error under it (`NSUnderlyingError`, `IOGPUCommandQueueErrorDomain`,
 // its own description none): measured for InvalidResource, whose IOGPU code is 9 as its own
 // is, so only it carries one. Internal's is a recovery's victim, the one failure Metal was seen
-// to give that code for. A code with none measured (or the host's 0) has no description.
+// to give that code for. A code with none measured has no description.
 static NSError *rgfxCommandBufferError(NSInteger code)
 {
 	struct Known {
