@@ -20,6 +20,11 @@
 //! (its `CB_COMPLETE` carries the failure). A queue's destroy, or its context's close, drops what
 //! the presents wait for of it: no buffer of it will finish.
 //!
+//! A present of a surface whose device cache holds an older CPU generation than the present's
+//! waits too for the fill the host commits for it on taking the present (`decode/surface_cache.rs`):
+//! it is shown once that fill has finished, which tells the queue ([`PresentQueue::filled`]), so
+//! the control thread that takes the present, ring 0's only reader, waits for nothing on the GPU.
+//!
 //! [`PresentAnswers`]: when a shown present is answered. The guest's display pipe completes a
 //! transaction on its answer, and holds at most two unanswered (the kext's `RgfxDisplayPipe`),
 //! so the answer says the frame is on the display, as a display's flip completes at the vblank
@@ -43,6 +48,7 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
 use super::Presented;
+use super::decode::FillWait;
 
 /// The presents waiting for their surfaces' writers, and how far each queue has finished.
 pub(crate) struct PresentQueue<P: Platform> {
@@ -74,6 +80,8 @@ struct Waiting<P: Platform> {
     answer: PresentAnswer,
     /// The command buffers it waits for.
     writers: Vec<RgfxSurfaceWriter>,
+    /// The fill of its surface's device cache it waits for, where it asked one.
+    fill: Option<FillWait>,
 }
 
 impl<P: Platform> PresentQueue<P> {
@@ -95,16 +103,17 @@ impl<P: Platform> PresentQueue<P> {
     }
 
     /// Shows IOSurface `id`'s `texture` (`None`: the scanout) once each command buffer in
-    /// `writers` has finished and every present made before it is shown; `answer` goes as
-    /// [`Presented`] gives it. A writer past what its queue's ring has published holds nothing
-    /// (the module doc). Called with no lock of the decoder's held: what a ring has published is
-    /// read with the ring held.
+    /// `writers` has finished, and `fill`, its surface's device cache's fill, where it has one,
+    /// and every present made before it is shown; `answer` goes as [`Presented`] gives it. A
+    /// writer past what its queue's ring has published holds nothing (the module doc). Called
+    /// with no lock of the decoder's held: what a ring has published is read with the ring held.
     pub(crate) fn present(
         &self,
         id: u32,
         texture: Option<P::Texture>,
         answer: PresentAnswer,
         writers: Vec<RgfxSurfaceWriter>,
+        fill: Option<FillWait>,
     ) {
         let writers = self.published(writers);
         let mut state = self.state.lock();
@@ -113,8 +122,18 @@ impl<P: Platform> PresentQueue<P> {
             texture,
             answer,
             writers,
+            fill,
         });
         self.show_ready(&mut state);
+    }
+
+    /// A fill of a device cache finished: the presents at the front waiting for nothing more are
+    /// shown.
+    pub(crate) fn filled(&self) {
+        let mut state = self.state.lock();
+        if !state.waiting.is_empty() {
+            self.show_ready(&mut state);
+        }
     }
 
     /// The host posted the `CB_COMPLETE` of the command buffer at `seqno` on queue `queue`'s ring,
@@ -214,12 +233,13 @@ impl<P: Platform> PresentQueue<P> {
     fn show_ready(&self, state: &mut State<P>) {
         loop {
             let ready = state.waiting.front().is_some_and(|front| {
-                front.writers.iter().all(|w| {
-                    state
-                        .finished
-                        .get(&w.queue_obj_id)
-                        .is_some_and(|&done| done >= w.seqno)
-                })
+                front.fill.as_ref().is_none_or(FillWait::done)
+                    && front.writers.iter().all(|w| {
+                        state
+                            .finished
+                            .get(&w.queue_obj_id)
+                            .is_some_and(|&done| done >= w.seqno)
+                    })
             });
             if !ready {
                 return;

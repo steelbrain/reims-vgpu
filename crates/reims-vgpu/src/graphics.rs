@@ -263,11 +263,19 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoder.set_video(video);
             }
             let presented = Arc::new(Presented::default());
+            let presents = Arc::new(PresentQueue::new(Arc::clone(&presented)));
+            // A present that waits for its surface's fill is shown as the fill finishes.
+            let waiting = Arc::downgrade(&presents);
+            decoder.on_fill_done(Arc::new(move || {
+                if let Some(presents) = waiting.upgrade() {
+                    presents.filled();
+                }
+            }));
             let control = Arc::new(GraphicsControl {
                 failed: decoder.failed_contexts(),
                 decoders: decoder.decoders(),
                 device: gpu_device,
-                presents: Arc::new(PresentQueue::new(Arc::clone(&presented))),
+                presents,
                 presented,
                 pool,
                 pending: Pending::default(),
@@ -1339,22 +1347,24 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// holds no texture over it.
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         if iosurface_id == 0 {
-            self.presents.present(0, None, answer, Vec::new());
+            self.presents.present(0, None, answer, Vec::new(), None);
             return;
         }
         let decoder = self.decoder();
-        if let Some(generation) = generation {
-            // The pages as of the present's generation, where the surface has a device cache.
+        // The pages as of the present's generation, where the surface has a device cache: the
+        // fill is committed here, and the present waits for it in the present queue.
+        let fill = generation.and_then(|generation| {
             let filled =
                 entry::run(|_| decoder.fill_presented(&self.device, iosurface_id, generation));
-            if let Err(raise) = filled {
+            filled.unwrap_or_else(|raise| {
                 log::warn!(
                     target: "reims_vgpu::graphics",
                     "IOSurface {iosurface_id}: the platform raised at its device cache's fill for \
                      a present ({raise:?})"
                 );
-            }
-        }
+                None
+            })
+        });
         let found = decoder.surface_present(iosurface_id);
         drop(decoder);
         match found {
@@ -1363,7 +1373,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // scanout (WindowServer): its compiles go first.
                 self.pool.favour(owner);
                 self.presents
-                    .present(iosurface_id, Some(texture), answer, writers);
+                    .present(iosurface_id, Some(texture), answer, writers, fill);
             }
             None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
         }

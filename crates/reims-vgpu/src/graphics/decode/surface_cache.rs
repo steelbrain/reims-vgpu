@@ -55,8 +55,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use reims_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
@@ -78,9 +78,6 @@ const ON: OnFault = OnFault::Return;
 pub(crate) const STORAGE_PRIVATE: u64 = 2 << 4;
 /// `MTLResourceStorageModeMask`.
 pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
-
-/// How often [`SurfaceCaches::wait_filled`] looks at a fill.
-const FILL_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// One surface's device cache.
 struct SurfaceCache<P: Platform> {
@@ -107,8 +104,77 @@ struct Transfer<P: Platform> {
     event: P::Event,
     /// The last value a copy signals.
     signalled: u64,
-    /// The highest value whose copy has finished.
-    done: Arc<AtomicU64>,
+    /// How far its fills have finished.
+    fills: Arc<Fills>,
+}
+
+/// The longest a wait for a fill sleeps at once ([`Fills::wait`]): the slices count the wait's
+/// timeout with no clock read; a fill's end wakes it at once.
+const FILL_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// What is told as a fill finishes: the host's presents that wait for one ([`FillWait`]).
+pub(crate) type FillHook = Arc<dyn Fn() + Send + Sync>;
+
+/// How far the transfer queue's fills have finished: raised by each fill's completed handler,
+/// which wakes the threads waiting for one ([`Caches::wait_filled`]) and then tells the hook.
+struct Fills {
+    /// The highest transfer value whose fill has finished.
+    done: AtomicU64,
+    /// Held around a waiter's look at `done` and around the wake after it rises, so no wake is
+    /// missed.
+    lock: Mutex<()>,
+    moved: Condvar,
+    /// The host's presents, set once ([`Caches::on_fill_done`]).
+    hook: Arc<OnceLock<FillHook>>,
+}
+
+impl Fills {
+    /// Whether the fill that signals `value` has finished.
+    fn reached(&self, value: u64) -> bool {
+        self.done.load(Ordering::Acquire) >= value
+    }
+
+    /// The fill that signals `value` finished.
+    fn finished(&self, value: u64) {
+        self.done.fetch_max(value, Ordering::AcqRel);
+        drop(self.lock.lock());
+        self.moved.notify_all();
+        if let Some(hook) = self.hook.get() {
+            hook();
+        }
+    }
+
+    /// Waits for the fill that signals `value`, about `timeout` at most, in slices of at most
+    /// [`FILL_WAIT_SLICE`] each woken at once by a fill's end; whether it finished.
+    fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        let slice = FILL_WAIT_SLICE.min(timeout);
+        let mut slices = (timeout.as_micros() / slice.as_micros().max(1)).max(1);
+        let mut guard = self.lock.lock();
+        while !self.reached(value) {
+            if slices == 0 {
+                return false;
+            }
+            if self.moved.wait_for(&mut guard, slice).timed_out() {
+                slices -= 1;
+            }
+        }
+        true
+    }
+}
+
+/// A present's wait for its surface's fill ([`Caches::fill_now`]): the present is shown once the
+/// fill has finished, as once its surface's writers have, waiting for nothing on the control
+/// thread.
+pub(crate) struct FillWait {
+    fills: Arc<Fills>,
+    value: u64,
+}
+
+impl FillWait {
+    /// Whether the fill has finished.
+    pub(crate) fn done(&self) -> bool {
+        self.fills.reached(self.value)
+    }
 }
 
 /// What the caches did, for the log ([`SurfaceCaches::counts`]).
@@ -186,6 +252,8 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     deferred: HashMap<u64, VecDeque<Deferred<P>>>,
     /// The number the next use that may write a cache is counted under.
     next_writer: u64,
+    /// What a fill tells as it finishes, the [`Caches`]' own, kept across [`Caches::set_on`].
+    on_fill_done: Arc<OnceLock<FillHook>>,
 }
 
 /// The command buffers begun and not finished that use one block's cache.
@@ -211,8 +279,9 @@ struct Deferred<P: Platform> {
 }
 
 impl<P: Platform> SurfaceCaches<P> {
-    /// No caches; `on` keeps them where the kext asks.
-    pub(crate) fn new(on: bool) -> Self {
+    /// No caches; `on` keeps them where the kext asks, each fill telling `on_fill_done` as it
+    /// finishes.
+    fn new(on: bool, on_fill_done: Arc<OnceLock<FillHook>>) -> Self {
         let watched = Arc::new(Watched::default());
         let watcher: Arc<dyn Watcher> = Arc::clone(&watched) as Arc<dyn Watcher>;
         device_writes::watch(&watcher);
@@ -227,6 +296,7 @@ impl<P: Platform> SurfaceCaches<P> {
             filling: HashMap::new(),
             deferred: HashMap::new(),
             next_writer: 0,
+            on_fill_done,
         }
     }
 
@@ -311,9 +381,12 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// The transfer event's value at which the block at `block`'s last fill is done, and the
     /// value done so far; `None` where it has no cache or no fill.
-    fn last_fill(&self, block: u64) -> Option<(u64, Arc<AtomicU64>)> {
+    fn last_fill(&self, block: u64) -> Option<FillWait> {
         let (cache, t) = (self.by_block.get(&block)?, self.transfer.as_ref()?);
-        Some((cache.filled_at, Arc::clone(&t.done)))
+        (cache.filled_at != 0).then(|| FillWait {
+            fills: Arc::clone(&t.fills),
+            value: cache.filled_at,
+        })
     }
 
     /// Whether [`Caches::before`] would neither fill a cache `uses` names nor make the command
@@ -327,7 +400,7 @@ impl<P: Platform> SurfaceCaches<P> {
             let filled = self
                 .transfer
                 .as_ref()
-                .is_none_or(|t| cache.filled_at <= t.done.load(Ordering::Acquire));
+                .is_none_or(|t| t.fills.reached(cache.filled_at));
             cache.generation.is_some_and(|held| u.cpu_gen <= held)
                 && !self.watched.written(u.block_offset)
                 && filled
@@ -382,7 +455,7 @@ impl<P: Platform> SurfaceCaches<P> {
             cache.written = true;
         }
         if let Some(t) = &self.transfer
-            && cache.filled_at > t.done.load(Ordering::Acquire)
+            && !t.fills.reached(cache.filled_at)
         {
             cb.encode_wait(Some(EventRef::Event(&t.event)), cache.filled_at)?;
             return Ok(true);
@@ -533,13 +606,8 @@ impl<P: Platform> SurfaceCaches<P> {
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
-        let done = Arc::clone(&transfer.done);
-        cb.add_completed_handler(
-            ON,
-            Box::new(move |_: CompletedInfo| {
-                done.fetch_max(value, Ordering::AcqRel);
-            }),
-        )?;
+        let fills = Arc::clone(&transfer.fills);
+        cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| fills.finished(value)))?;
         cb.commit(ON)?;
         let length = cache.length;
         if let Some(cache) = self.by_block.get_mut(&block) {
@@ -554,15 +622,14 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// Fills the cache of the block at `block` where it holds an older generation than
     /// `generation`, or a device of the host wrote its pages since its last fill: a present of
-    /// the surface shows the pages as of that generation. A command buffer on the transfer queue
-    /// behind the fill, committed, which the caller waits for with no lock held; `None` where
-    /// nothing was filled.
+    /// the surface shows the pages as of that generation. The wait for the cache's last fill,
+    /// which the present makes in the present queue; `None` where nothing was filled.
     fn fill_now(
         &mut self,
         device: &P::Device,
         block: u64,
         generation: u64,
-    ) -> RaiseResult<Option<P::CommandBuffer>> {
+    ) -> RaiseResult<Option<FillWait>> {
         let Some(cache) = self.by_block.get(&block) else {
             return Ok(None);
         };
@@ -575,16 +642,7 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.host_writes += 1;
         }
         self.fill(device, block, generation)?;
-        let Some(t) = &self.transfer else {
-            return Ok(None);
-        };
-        // A command buffer behind the fill on the transfer queue finishes after it.
-        let Some(cb) = t.queue.command_buffer(ON)? else {
-            return Ok(None);
-        };
-        cb.encode_wait(Some(EventRef::Event(&t.event)), t.signalled)?;
-        cb.commit(ON)?;
-        Ok(Some(cb))
+        Ok(self.last_fill(block))
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: the pages written from its cache, after every
@@ -703,7 +761,12 @@ impl<P: Platform> SurfaceCaches<P> {
                 queue,
                 event,
                 signalled: 0,
-                done: Arc::default(),
+                fills: Arc::new(Fills {
+                    done: AtomicU64::new(0),
+                    lock: Mutex::new(()),
+                    moved: Condvar::new(),
+                    hook: Arc::clone(&self.on_fill_done),
+                }),
             });
         }
         Ok(true)
@@ -759,6 +822,8 @@ impl<P: Platform> SurfaceCaches<P> {
 pub(crate) struct Caches<P: Platform> {
     state: Mutex<SurfaceCaches<P>>,
     moved: Condvar,
+    /// What each fill tells as it finishes ([`Self::on_fill_done`]).
+    on_fill_done: Arc<OnceLock<FillHook>>,
 }
 
 /// The blocks of the caches a command buffer uses, and its count among their users
@@ -799,10 +864,18 @@ fn by_block<'u>(
 impl<P: Platform> Caches<P> {
     /// No caches; `on` keeps them where the kext asks.
     pub(crate) fn new(on: bool) -> Self {
+        let on_fill_done = Arc::default();
         Caches {
-            state: Mutex::new(SurfaceCaches::new(on)),
+            state: Mutex::new(SurfaceCaches::new(on, Arc::clone(&on_fill_done))),
             moved: Condvar::new(),
+            on_fill_done,
         }
+    }
+
+    /// Has each fill tell `hook` as it finishes, after the threads waiting for it are woken: the
+    /// host's presents that wait for a fill ([`Self::fill_now`]). Set once; a second is ignored.
+    pub(crate) fn on_fill_done(&self, hook: FillHook) {
+        let _ = self.on_fill_done.set(hook);
     }
 
     /// The caches, locked: for what orders nothing against command buffers' uses.
@@ -824,7 +897,7 @@ impl<P: Platform> Caches<P> {
 
     /// Starts again with no caches; `on` keeps them where the kext asks.
     pub(crate) fn set_on(&self, on: bool) {
-        *self.state.lock() = SurfaceCaches::new(on);
+        *self.state.lock() = SurfaceCaches::new(on, Arc::clone(&self.on_fill_done));
     }
 
     /// Waits, letting the lock go meanwhile, while a command buffer begun and not finished uses
@@ -969,30 +1042,25 @@ impl<P: Platform> Caches<P> {
 
     /// Fills the cache of the block at `block` where a present of it at `generation` needs it
     /// ([`SurfaceCaches::fill_now`]), after every command buffer begun and not finished that uses
-    /// it, and waits for the fill with no lock held.
+    /// it: the wait for the fill, which the caller hands to the present, waiting for nothing on
+    /// the GPU; `None` where the present waits for no fill.
     pub(crate) fn fill_now(
         &self,
         device: &P::Device,
         block: u64,
         generation: u64,
-    ) -> RaiseResult<()> {
-        let behind = {
-            let mut state = self.state.lock();
-            if !state.needs_fill_at(block, generation) {
-                return Ok(());
-            }
-            *state.filling.entry(block).or_default() += 1;
-            self.wait_users(&mut state, block, false);
-            let filled = state.fill_now(device, block, generation);
-            state.unfill(block);
-            drop(state);
-            self.moved.notify_all();
-            filled?
-        };
-        match behind {
-            Some(cb) => cb.wait_until_completed(ON),
-            None => Ok(()),
+    ) -> RaiseResult<Option<FillWait>> {
+        let mut state = self.state.lock();
+        if !state.needs_fill_at(block, generation) {
+            return Ok(None);
         }
+        *state.filling.entry(block).or_default() += 1;
+        self.wait_users(&mut state, block, false);
+        let filled = state.fill_now(device, block, generation);
+        state.unfill(block);
+        drop(state);
+        self.moved.notify_all();
+        filled
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block` ([`SurfaceCaches::download`]), after every
@@ -1085,26 +1153,14 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be done,
-    /// polling for about `timeout` at most (each poll sleeps at least [`FILL_POLL`]), with no lock
-    /// held: for work the host starts outside a command buffer that writes the cache, which a
-    /// command buffer's wait does not order. True where it is done, or the block has no cache or
-    /// no fill.
+    /// `timeout` at most, with no lock held, woken by the fill's completed handler: for work the
+    /// host starts outside a command buffer that writes the cache, which a command buffer's wait
+    /// does not order. True where it is done, or the block has no cache or no fill.
     pub(crate) fn wait_filled(&self, block: u64, timeout: std::time::Duration) -> bool {
-        let Some((filled_at, done)) = self.state.lock().last_fill(block) else {
+        let Some(fill) = self.state.lock().last_fill(block) else {
             return true;
         };
-        // The fill's completion handler raises `done`: a fill is a copy of the block, rare (a
-        // cache's first use, or one after a CPU's write under a lock) and short, so the wait
-        // polls it.
-        let mut polls = timeout.as_micros() / FILL_POLL.as_micros();
-        while filled_at > done.load(Ordering::Acquire) {
-            if polls == 0 {
-                return false;
-            }
-            polls -= 1;
-            std::thread::sleep(FILL_POLL);
-        }
-        true
+        fill.fills.wait(fill.value, timeout)
     }
 }
 
@@ -1391,6 +1447,53 @@ mod tests {
         assert!(
             r.dec.surface_caches.wait_filled(BLOCK, short),
             "the fill is done"
+        );
+    }
+
+    /// A present's fill is committed where the present is taken, which waits for nothing on the
+    /// GPU: the present gets the wait for it, done once the fill has finished, which tells the
+    /// hook (the host's presents) as it does. A present of a generation the cache holds fills
+    /// nothing and waits for nothing
+    #[test]
+    fn a_present_s_fill_is_waited_for_by_the_present_not_where_it_is_asked() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let told = Arc::new(AtomicU64::new(0));
+        let tell = Arc::clone(&told);
+        r.dec.on_fill_done(Arc::new(move || {
+            tell.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mark = r.p.call_log().mark();
+        let caches = Arc::clone(&r.dec.surface_caches);
+        let wait = std::thread::scope(|scope| {
+            let asked = scope.spawn(|| caches.fill_now(&r.device, BLOCK, 2).unwrap());
+            for _ in 0..1000 {
+                if asked.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                asked.is_finished(),
+                "the present's fill was waited for where it was asked"
+            );
+            asked.join().unwrap()
+        });
+        let wait = wait.expect("a wait for the fill");
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "one fill");
+        assert!(!wait.done(), "done before the GPU ran it");
+        assert_eq!(told.load(Ordering::SeqCst), 0);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(wait.done());
+        assert_eq!(told.load(Ordering::SeqCst), 1, "the hook was told once");
+        assert!(
+            r.dec
+                .surface_caches
+                .fill_now(&r.device, BLOCK, 2)
+                .unwrap()
+                .is_none(),
+            "the cache holds the present's generation"
         );
     }
 

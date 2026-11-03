@@ -171,6 +171,7 @@ use managed::{STORAGE_MODE_MANAGED, storage_mode};
 use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
+pub(crate) use surface_cache::{FillHook, FillWait};
 use tables::{Context, Entry, QueueCounts, View};
 
 /// A sink the decoder calls with each command buffer's completion record once its
@@ -799,14 +800,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
-    /// shows lies in, where it holds an older CPU generation than `generation`, and waits for the
-    /// fill ([`surface_cache`]).
+    /// shows lies in, where it holds an older CPU generation than `generation` ([`surface_cache`]):
+    /// the wait for the fill, which the present makes; `None` where it need wait for none.
     pub(crate) fn fill_presented(
         &self,
         device: &P::Device,
         iosurface_id: u32,
         generation: u64,
-    ) -> RaiseResult<()> {
+    ) -> RaiseResult<Option<FillWait>> {
         let shown = (self.shared.surfaces.lock().by_surface.get(&iosurface_id))
             .and_then(|textures| textures.last().copied());
         let block = shown.and_then(|obj_id| {
@@ -817,8 +818,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         });
         match block {
             Some(block) => self.surface_caches.fill_now(device, block, generation),
-            None => Ok(()),
+            None => Ok(None),
         }
+    }
+
+    /// Has each fill of a device cache tell `hook` as it finishes: the host's presents that wait
+    /// for one ([`Self::fill_presented`]).
+    pub(crate) fn on_fill_done(&self, hook: FillHook) {
+        self.surface_caches.on_fill_done(hook);
     }
 
     /// Sets the sink the decoder hands each command buffer's completion record to

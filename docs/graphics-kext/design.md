@@ -1834,8 +1834,10 @@ commit. Each outcome the new design allows is one of those two:
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order` and
   `busy_lanes_hold_one_thread_each_and_the_budget_s`.
 - **What still waits on ring 0's thread:** a block named again, for that
-  block's writers; a present's fill, for that block's users; and the device's
-  reset, for every message in flight. A context's close waits for no
+  block's writers; a present's fill, for that block's users begun and not
+  finished (not for the fill itself: the fill is committed there, and the
+  present waits for it in the present queue, shown at the fill's completion);
+  and the device's reset, for every message in flight. A context's close waits for no
   walk: `reims_graphics` fences each of its queues, which waits only for a take
   of the queue's submission ring or a post onto its completion ring under way,
   and the close is answered once its buffers have finished
