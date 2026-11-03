@@ -4,6 +4,8 @@
 //! the host's MMIO path. A read of each after it wakes takes what woke it.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The device's own wake: a pipe, both ends non-blocking and closed on exec.
 #[derive(Debug)]
@@ -12,6 +14,9 @@ pub(crate) struct Wake {
     read: OwnedFd,
     /// The end a wake writes.
     write: OwnedFd,
+    /// Set from just before [`Self::sleep`]'s poll until it returns ([`Self::parked`]).
+    #[cfg(test)]
+    sleeping: AtomicBool,
 }
 
 impl Wake {
@@ -27,7 +32,39 @@ impl Wake {
         for fd in [&read, &write] {
             set_flags(fd.as_raw_fd());
         }
-        Some(Wake { read, write })
+        Some(Wake {
+            read,
+            write,
+            #[cfg(test)]
+            sleeping: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the thread that sleeps on it is in its sleep with no wake pending, on the pipe or
+    /// on `doorbell`: it took everything it was woken for, so what it writes of the rings stays
+    /// as it is until the guest or the host wakes it. A wake that comes while it is awake stays
+    /// in the pipe, and has it wake once more with nothing to take, which a test's settled state
+    /// must not catch half done.
+    #[cfg(test)]
+    pub(crate) fn parked(&self, doorbell: Option<RawFd>) -> bool {
+        if !self.sleeping.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: self.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: doorbell.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two pollfds, a negative descriptor ignored; a timeout of 0 never blocks.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
+        n == 0
     }
 
     /// The end the control thread polls, for a test that stands it in for a host's doorbell.
@@ -59,8 +96,13 @@ impl Wake {
                 revents: 0,
             },
         ];
+        #[cfg(test)]
+        self.sleeping.store(true, Ordering::SeqCst);
         // SAFETY: two pollfds, a negative descriptor ignored.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        // Before the drain: until it, a wake that ended the poll is still pending.
+        #[cfg(test)]
+        self.sleeping.store(false, Ordering::SeqCst);
         if n <= 0 {
             return;
         }

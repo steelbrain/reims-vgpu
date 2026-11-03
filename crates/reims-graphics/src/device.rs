@@ -702,6 +702,21 @@ impl Device {
         self.shared.queues.lock().by_obj.len()
     }
 
+    /// Whether the control thread and every queue's service thread sleep with no wake pending
+    /// ([`Wake::parked`]): what they write of the rings stays as it is until the guest acts.
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> bool {
+        let doorbell = self.shared.doorbell.get().map(AsRawFd::as_raw_fd);
+        self.shared.wake.parked(doorbell)
+            && self
+                .shared
+                .queues
+                .lock()
+                .by_obj
+                .values()
+                .all(|queue| queue.wake.parked(None))
+    }
+
     /// A 32-bit read of BAR 0 at `offset`. Offsets with no register read 0.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         let size = self.shared.region.size();

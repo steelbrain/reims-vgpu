@@ -268,11 +268,16 @@ impl FakeGuest {
     }
 
     /// Whether the host has taken everything on `ring`'s submission ring and its consumer
-    /// sleeps.
+    /// sleeps, with no wake pending on any of the device's threads ([`Device::parked`]). A wake
+    /// that came while a thread was awake (the guest's `STATUS` writes, a doorbell for what it
+    /// already took) has it wake once more with nothing to take, clearing `consumer_idle` until
+    /// it sleeps again: a header read, or a post's look at `consumer_idle` for its doorbell, in
+    /// that window would make the trace depend on timing.
     fn submit_idle(&self, ring: &GuestRing) -> bool {
         let region = self.region();
         region.atomic_u64(ring.submit + 0x40).load(Ordering::SeqCst) == ring.produced
             && region.atomic_u32(ring.submit + 0x80).load(Ordering::SeqCst) == 1
+            && self.rig.device.parked()
     }
 
     /// The wire-2 kext's start: the device checked, reset, the rings' counts taken as they
