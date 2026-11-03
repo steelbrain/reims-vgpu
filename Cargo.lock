@@ -649,6 +649,7 @@ name = "reims-vgpu-video-codec"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "memchr",
  "reims-vgpu-video-core",
 ]
 

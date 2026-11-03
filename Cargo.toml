@@ -89,6 +89,9 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
 mach2 = "0.7"
 libc = "0.2.180"
+# The codecs' Annex B start-code scan (reims-vgpu-video-codec's h264::nal), at the version the
+# lock already holds for the regex crates.
+memchr = "2.8.3"
 # The Vulkan driver manifests the video devices' GPUs are read through
 # (reims-vgpu-vulkan/src/host_gpus.rs), at the version the runtime's translator takes.
 serde_json = "1.0.151"
