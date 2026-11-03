@@ -555,6 +555,36 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     assert_eq!(device.decoder_object_count(), 0);
 }
 
+/// A create posted after its context's close (a submit in flight in the kext as its process
+/// closes the device or dies) makes nothing: the close dropped the context's objects once, and no
+/// later message drops one made after it.
+#[test]
+#[ignore = "aud-tests-06: a create that follows its context's close makes an object nothing drops"]
+fn a_create_after_its_context_s_close_makes_nothing() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let context = 2;
+    let mut guest = Guest::new(&device);
+    guest.send(&device, event_create(obj(context, 10)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(context)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    guest.send(&device, event_create(obj(context, 11)));
+    // Another context's close after it, answered once ring 0 has carried out the create.
+    assert_eq!(
+        answered(&device, &mut guest, context_close(context + 1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the create after context {context}'s close made an object"
+    );
+}
+
 /// Object id `n` of context `context`.
 fn obj(context: u32, n: u64) -> u64 {
     (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
