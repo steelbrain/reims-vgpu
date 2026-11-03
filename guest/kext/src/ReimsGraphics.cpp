@@ -1334,14 +1334,14 @@ IODeviceMemory *ReimsGraphics::getVRAMRange()
 	if (!region)
 		return nullptr;
 	task_t task = current_task();
-	bool connected = false;
+	bool ownerConnected = false;
 	if (task != kernel_task && stateLock) {
 		IOLockLock(stateLock);
 		const IOUserClient *client = static_cast<const IOUserClient *>(scanoutOwner.client);
-		connected = scanoutOwner.holdsConnection(task, client && !client->isInactive());
+		ownerConnected = scanoutOwner.holdsConnection(task, client && !client->isInactive());
 		IOLockUnlock(stateLock);
 	}
-	bool given = rgfxMayMapVram(task, kernel_task, connected);
+	bool given = rgfxMayMapVram(task, kernel_task, ownerConnected);
 	static char site;
 	RgfxCaller caller;
 	if (caller.pid != 0 && rgfxFirstCalls(&site, static_cast<UInt64>(caller.pid), 4))
@@ -1593,7 +1593,7 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 // of a programmed timing of its size and rate, as the list now names it.
 IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
 {
-	UInt32 taken = 0;
+	UInt32 programmed = 0;
 	IOLockLock(stateLock);
 	modeSet.clearProgrammed();
 	for (UInt32 i = 0; array && i < array->getCount(); i++) {
@@ -1609,7 +1609,7 @@ IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
 		Mode m = {id, t.horizontalActive, t.verticalActive, refreshMhzOf(t)};
 		if (modeSet.addProgrammed(id, m, t, kIODisplayModeIDReservedBase) &&
 		    modeSet.deviceMode(m.width, m.height, m.refreshMhz, nullptr))
-			taken++;
+			programmed++;
 	}
 	modeSet.followProgrammed();
 	UInt32 count = modeSet.programmedCount;
@@ -1619,7 +1619,7 @@ IOReturn ReimsGraphics::setDetailedTimings(OSArray *array)
 	else
 		removeProperty(kIOFBDetailedTimingsKey);
 	IOLog("ReimsGraphics: display %u: %u programmed timings, %u of them the device's modes\n",
-	      displayId, count, taken);
+	      displayId, count, programmed);
 	return kIOReturnSuccess;
 }
 
