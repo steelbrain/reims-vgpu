@@ -23,8 +23,14 @@ the baseline, an item the baseline passed that is now
 SKIP or missing fails. A metric is a number; the gated ones (GATED) fail where they are worse
 than the baseline's median by more than the noise band: the larger of the metric's floor and
 NOISE_K times the largest relative distance from the median that repeated runs of one commit
-showed. Exit 0 when every item passes and no gated metric regressed, 1 when one failed, 2 when a
-part did not run (an incomplete run passes nothing).
+showed. A bench number counts only from time the GPU's core ran at its high clock (reps.py): a
+frame case's from its repetitions that did, any other case's where its whole run did; one that
+did not is KNOWN-clock, compared with nothing and in no band. Where the bench boot ran beside a
+build on the lane host (HOST_NOT_QUIET), its other numbers (bound by the host's CPU and memory:
+draws, upload, readback, present timing, drags, decode, WebGL) are tagged, compared with nothing
+and in no band; a baseline's median leaves them out too. Exit 0 when every item passes and no
+gated metric regressed, 1 when one failed, 2 when a part did not run (an incomplete run passes
+nothing).
 """
 import datetime
 import json
@@ -33,6 +39,9 @@ import re
 import statistics
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import reps  # noqa: E402
 
 # Gated metrics: (regex, +1 higher is better / -1 lower is better, floor of the band).
 GATED = [
@@ -59,15 +68,30 @@ MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "bundle-files", "rgfxgate
 # The informational metrics a report shows beside the gated ones.
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
          r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
-         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(pstate|core_mhz|mem_mhz)\.bench\..*",
+         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(core_mhz|clock_reps_ok)\.bench\..*",
          r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)"]
 
 
-def pstate_of(metrics, name):
-    """The power state (its P number) a bench metric's case ran in, where the run sampled it."""
+def gpu_bound(name):
+    """Whether a metric is a GPU-bound bench case's (reps.clocked): judged by the GPU's clock, and
+    usable beside a build on the lane host."""
+    return name.startswith("bench.") and reps.clocked(name[len("bench."):].rsplit(".", 1)[0])
+
+
+def host_tagged(metrics, name):
+    """Whether a bench boot's metric is tagged: the boot ran beside a build (HOST_NOT_QUIET) and the
+    metric is not GPU-bound. The correctness boot's (shared.) are never gated."""
+    return metrics.get("host.host_quiet") == 0 and not name.startswith(("shared.", "host.", "step_s.", "pstate.", "core_mhz.", "mem_mhz.", "clock_")) \
+        and not gpu_bound(name)
+
+
+def clock_ok_of(metrics, name):
+    """Whether a bench metric's number is from the GPU's high core clock (reps.py): True, False, or
+    None where the run sampled no clocks for its case."""
     if not name.startswith("bench."):
         return None
-    return metrics.get("pstate.bench." + name[len("bench."):].rsplit(".", 1)[0])
+    v = metrics.get("clock_ok.bench." + name[len("bench."):].rsplit(".", 1)[0])
+    return None if v is None else v == 1
 
 
 def gated(name):
@@ -164,7 +188,7 @@ class Run:
     def guest(self, text):
         self.phases = {}
         self.video_offer, self.metal_device = None, None
-        self.case_window = {}  # a bench case's host times: its "# start" line and its result's
+        self.guest_text = text  # clocks() reads the bench cases' times from it
         crashes, crash_lines = None, []
         for line in text.splitlines():
             m = re.match(r"([0-9.]+) (.*)$", line)
@@ -208,12 +232,8 @@ class Run:
                     self.litem("sweep." + m2.group(1), m2.group(2).replace("OK", "PASS"), m2.group(3))
                 elif re.match(r"sweep: \d+ OK", body):
                     self.lmetric("sweep.cases", sum(int(x) for x in re.findall(r"(\d+) [A-Z]+", body)))
-            elif body.startswith("# start "):
-                self.case_window[body[len("# start "):].strip()] = [t, None]
             elif body.startswith("bench: "):
                 m2 = re.match(r"bench: (\S+) (OK|FAIL|SKIP|NOTRUN)\s*(.*)$", body)
-                if m2 and m2.group(1) in self.case_window:
-                    self.case_window[m2.group(1)][1] = t
                 if m2:
                     self.litem("bench." + m2.group(1), {"OK": "PASS"}.get(m2.group(2), m2.group(2)), m2.group(3)[:200])
                     if m2.group(2) == "OK":
@@ -251,35 +271,56 @@ class Run:
                 self.litem("phase." + p, "FAIL", "started but did not end (a hang the alarm or the hold cut)")
 
     def clocks(self, d):
-        """The GPU's power state and clocks over each bench case (gpu-clocks.txt, the host's
-        nvidia-smi four times a second): the state most samples in the case's span show, as metric
-        pstate.bench.CASE (its P number), with the median core and memory clocks."""
-        rows = []
-        for line in read(os.path.join(d, "gpu-clocks.txt")).splitlines():
-            f = line.split()
-            if len(f) >= 4 and re.fullmatch(r"P[0-9]+", f[1]):
-                try:
-                    rows.append((float(f[0]), int(f[1][1:]), float(f[2]), float(f[3])))
-                except ValueError:
-                    pass
+        """The GPU's core clock over each bench case (gpu-clocks.txt, the host's nvidia-smi ten times
+        a second; reps.py). A frame case's numbers are taken again from its repetitions at the high
+        clock alone, over all its runs (the bench phase's, and benchretry's where msi-boot.sh ran it
+        again): metrics clock_reps and clock_reps_ok count them, and clock_ok is 1 where any
+        repetition qualified. Any other case's clock_ok is 1 where its whole run was at the high
+        clock. Each case's item shows that, with its runs' median core and memory clocks and their
+        commonest power state."""
+        rows = reps.parse_clocks(read(os.path.join(d, "gpu-clocks.txt")))
         if not rows:
             return
-        for case, (a, b) in self.case_window.items():
-            if b is None:
-                continue
-            span = [r for r in rows if a <= r[0] <= b]
-            if not span:
-                continue
-            states = [r[1] for r in span]
-            ps = max(set(states), key=states.count)
-            core = statistics.median(r[2] for r in span)
-            mem = statistics.median(r[3] for r in span)
+        m = self.metrics
+        for case, j in reps.judge(reps.parse_guest(self.guest_text), rows).items():
+            p = f"bench.{case}."
+            ps = max(set(j["states"]), key=j["states"].count)
+            core, mem = statistics.median(j["core"]), statistics.median(j["mem"])
             self.lmetric(f"pstate.bench.{case}", ps)
             self.lmetric(f"core_mhz.bench.{case}", core)
             self.lmetric(f"mem_mhz.bench.{case}", mem)
+            if j["reps"]:
+                k, n = len(j["ok"]), j["reps"]
+                self.lmetric(f"clock_reps.bench.{case}", n)
+                self.lmetric(f"clock_reps_ok.bench.{case}", k)
+                self.lmetric(f"clock_ok.bench.{case}", 1 if k else 0)
+                note = f"{k} of {n} reps at {reps.CORE_MIN_MHZ} MHz or more"
+                if k:
+                    # The case's line gives the medians of all its repetitions: its numbers that
+                    # follow the frame rate are scaled to the qualifying repetitions' median rate.
+                    fps = statistics.median(r[2] for r in j["ok"])
+                    gpu = statistics.median(r[3] for r in j["ok"])
+                    line_fps, line_gpu = m.get(self.mp + p + "fps"), m.get(self.mp + p + "gpu_ms")
+                    for key, nd in (("gpix_s", 2), ("mpix_s", 0)):
+                        if line_fps and self.mp + p + key in m:
+                            self.lmetric(p + key, round(m[self.mp + p + key] * fps / line_fps, nd))
+                    if line_gpu and self.mp + p + "gpix_s_gpu" in m:
+                        self.lmetric(p + "gpix_s_gpu", round(m[self.mp + p + "gpix_s_gpu"] * line_gpu / gpu, 2))
+                    self.lmetric(p + "fps", round(fps, 1))
+                    self.lmetric(p + "gpu_ms", round(gpu, 3))
+                    self.lmetric(p + "wall_ms", round(statistics.median(1e3 / r[2] for r in j["ok"]), 3))
+                    note += f", judged on those: fps {fps:.1f}"
+                    if self.mp + p + "gpix_s" in m:
+                        note += f", gpix_s {m[self.mp + p + 'gpix_s']:g}"
+                else:
+                    note += ": not compared"
+            else:
+                self.lmetric(f"clock_ok.bench.{case}", 1 if j["window_ok"] else 0)
+                note = (f"core at {reps.CORE_MIN_MHZ} MHz or more throughout" if j["window_ok"] else
+                        f"core down to {min(j['core']):.0f} MHz: not compared")
             it = self.items.get(self.ip + "bench." + case)
             if it:
-                it["detail"] = f"[P{ps} {core:.0f}/{mem:.0f} MHz] " + it["detail"]
+                it["detail"] = f"[{note}; P{ps} {core:.0f}/{mem:.0f} MHz] " + it["detail"]
 
     def video(self, d):
         """Each decode SKIP (decode_md5's: VideoToolbox finds no hardware decoder for the stream's
@@ -430,11 +471,12 @@ def median_baseline(bdir):
     names = set().union(*(r["metrics"] for r in runs))
     ref["metrics_best"] = {}
     for n in names:
-        vals = [r["metrics"][n] for r in runs if n in r["metrics"]]
-        # A bench number is the median of the samples taken at P0, where any sample says its state.
-        p0 = [r["metrics"][n] for r in runs if n in r["metrics"] and pstate_of(r["metrics"], n) == 0]
-        if any(pstate_of(r["metrics"], n) is not None for r in runs if n in r["metrics"]):
-            vals = p0
+        # A HOST_NOT_QUIET sample's numbers other than the GPU-bound ones are left out.
+        vals = [r["metrics"][n] for r in runs if n in r["metrics"] and not host_tagged(r["metrics"], n)]
+        # A bench number is the median of the samples at the high clock, where any sample says its clock.
+        clocked = [r["metrics"] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n) is not None]
+        if clocked:
+            vals = [x[n] for x in clocked if clock_ok_of(x, n)]
         if not vals:
             continue
         ref["metrics"][n] = statistics.median(vals)
@@ -474,23 +516,23 @@ def bench_host(metrics):
 
 
 def noise_from(bdirs_root):
-    """Per gated metric: the largest relative distance from its commit's median seen in repeated runs,
-    from the bench samples taken in host quiet only (host.host_quiet 1: no build on the lane host beside
-    QEMU), as other work's CPU and memory use moves the Vulkan platform's numbers far past noise."""
+    """Per gated metric: the largest relative distance from its commit's median seen in repeated runs.
+    A GPU-bound bench number's band comes from the samples at the GPU's high clock (reps.py), any
+    other's from the bench samples taken in host quiet only (host.host_quiet 1: no build on the lane
+    host beside QEMU), as other work's CPU and memory use moves those numbers far past noise."""
     dev = {}
     for sha in sorted(os.listdir(bdirs_root)):
         rd = os.path.join(bdirs_root, sha, "runs")
         if sha == "LAST" or not os.path.isdir(rd):
             continue
         runs = [json.loads(read(os.path.join(rd, f))) for f in sorted(os.listdir(rd)) if f.endswith(".json")]
-        runs = [r for r in runs if r["metrics"].get("host.host_quiet") == 1]
         if len(runs) < 2:
             continue
         for n in set().union(*(r["metrics"] for r in runs)):
-            vals = [r["metrics"][n] for r in runs if n in r["metrics"]]
-            # A bench number's band comes only from samples whose case ran at P0.
-            if n.startswith("bench."):
-                vals = [r["metrics"][n] for r in runs if n in r["metrics"] and pstate_of(r["metrics"], n) == 0]
+            if gpu_bound(n):
+                vals = [r["metrics"][n] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n)]
+            else:
+                vals = [r["metrics"][n] for r in runs if n in r["metrics"] and r["metrics"].get("host.host_quiet") == 1]
             if len(vals) < 2 or bimodal(n):
                 continue
             med = statistics.median(vals)
@@ -597,11 +639,16 @@ def compare(run, base, noise):
             bv = base.get("metrics_best", {}).get(name, bv)
         rel = (v - bv) / abs(bv) if bv else 0.0
         verdict = ""
-        ps = pstate_of(cur["metrics"], name)
-        if ps is not None and ps != 0:
-            verdict = f"KNOWN-pstate: its case ran at P{ps}"
-            items["metric." + name] = {"status": "KNOWN", "detail": f"{v:g}: its case ran at P{ps} (the driver's hold "
-                                       "after a power-cap event), not compared"}
+        if host_tagged(cur["metrics"], name):
+            verdict = "tagged HOST_NOT_QUIET: a build ran beside the boot, not compared"
+        elif clock_ok_of(cur["metrics"], name) is False:
+            case = name[len("bench."):].rsplit(".", 1)[0]
+            n = cur["metrics"].get("clock_reps.bench." + case)
+            why = (f"none of its {n:g} reps ran at {reps.CORE_MIN_MHZ} MHz or more" if n
+                   else f"its core clock fell under {reps.CORE_MIN_MHZ} MHz")
+            verdict = f"KNOWN-clock: {why}"
+            if g:
+                items["metric." + name] = {"status": "KNOWN", "detail": f"{v:g}: {why} (the GPU's power cap), not compared"}
         elif bi and bv and bi[1] <= v / bv <= bi[2]:
             verdict = f"KNOWN-bimodal: its slow mode ({bi[3]} owns it)"
             items["metric." + name] = {"status": "KNOWN", "detail": f"{v:g} against the fast mode's {bv:g}: the slow mode, which {bi[3]} owns"}

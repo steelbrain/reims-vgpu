@@ -6,7 +6,9 @@
 # RGK_EXCLUSIVE) holds it alone for QEMU's life. Either is stopped after HOLD_S seconds.
 # RUNDIR holds boot.env (below), and gets the results:
 #   boot.log      what this script did, with times
-#   guest.log     guest-run.sh's output, each line after the host's time (epoch seconds)
+#   guest.log     guest-run.sh's output, each line after the host's time (epoch seconds); where the
+#                 bench phase left frame cases with no repetition at the GPU's high clock
+#                 (reps.py), their runs again (benchretry) before the phases after it
 #   cpu.txt       QEMU's CPU time once a second: "EPOCH UTIME_TICKS STIME_TICKS HZ"
 #   host-events.log  the host log's display updates ("the display shows IOSurface") and its
 #                 fatal, error and warning lines, as the host logged them (local ISO times)
@@ -19,7 +21,7 @@
 #                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
 #   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
-#   gpu-clocks.txt  the GPU's power state and clocks four times a second over the guest's run and
+#   gpu-clocks.txt  the GPU's power state and clocks ten times a second over the guest's run and
 #                 the drags: "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W"
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
@@ -56,10 +58,10 @@ stop_qemu() {
   P=
 }
 B=$RGK_RUN/boots/$TAG
-# The GPU's power state and clocks beside the measurements, four times a second (nvidia-smi, where
-# the host has it): "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W". The driver holds a lower state (P4)
-# for seconds after a power-cap event, at about half the core and memory clocks, so each number
-# is read beside the state it ran in.
+# The GPU's power state and clocks beside the measurements, ten times a second (nvidia-smi, where
+# the host has it): "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W". msi's 5080 holds its core at 1.2 to
+# 1.5 GHz under its power cap for up to 12 s, which a GPU-bound case's numbers follow: reps.py
+# keeps a number only from time the core ran high throughout.
 CLOCKPID=
 stop_clocks() {  # the sampler's pipeline, nvidia-smi among it, then the sampler
   [[ -n $CLOCKPID ]] || return 0
@@ -134,15 +136,17 @@ timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
 excl=()
 [[ ${EXCLUSIVE:-1} == 1 ]] && excl=(RGK_EXCLUSIVE=1 "RGK_EXCLUSIVE_MAX=$HOLD_S")
 # Where the boot's time goes: rgk-boot2.sh writes run.sh once its turn, a VM slot and the port are
-# in hand; run.sh waits for host quiet (a measured boot's HOST_QUIET line in QEMU's log) and the GPU
-# lock (GPU_HELD) before it execs QEMU, whose lines carry their times. A watch on the log takes the
-# times of those two lines (boot-times.txt), and the hold counts from GPU_HELD.
+# in hand; run.sh takes the GPU lock, then (a measured boot) waits for host quiet, its marker in
+# quiet-want/ up meanwhile, until its HOST_QUIET or HOST_NOT_QUIET line in QEMU's log, says
+# GPU_HELD and execs QEMU, whose lines carry their times. A watch takes the times of the marker
+# and of those lines (boot-times.txt: gpu, quiet, held), and the hold counts from GPU_HELD.
 sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", a - b }'; }
 stamp() { date -d "$1" +%s.%N 2> /dev/null | cut -c1-14; }
 touch "$R/.start"
 ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
-  q=
+  q= g=
   while sleep 0.5; do
+    [[ -z $g ]] && compgen -G "$RGK_RUN/quiet-want/$TAG.*" > /dev/null && g=1 && echo "gpu $(date +%s.%N | cut -c1-14)"
     [[ -f $B/launch.log && $B/launch.log -nt $R/.start ]] || continue
     [[ -z $q ]] && grep -q -x -E 'HOST_(NOT_)?QUIET' "$B/launch.log" && q=1 && echo "quiet $(date +%s.%N | cut -c1-14)"
     grep -q -x GPU_HELD "$B/launch.log" && { echo "held $(date +%s.%N | cut -c1-14)"; break; }
@@ -164,11 +168,15 @@ if [[ -f $B/launch.log && $B/launch.log -nt $R/.start ]]; then
   T_QEMU=$(stamp "$(grep -m1 -E '^20[0-9-]+T[0-9:.]+[+-][0-9]{4} ' "$B/launch.log" | cut -d' ' -f1)")
 fi
 T_RUN=$([[ $B/run.sh -nt $R/.start ]] && stat -c %Y "$B/run.sh")
+T_GPU=$(awk '$1 == "gpu" {print $2}' "$R/boot-times.txt")
 T_QUIET=$(awk '$1 == "quiet" {print $2}' "$R/boot-times.txt")
 T_HELD=$(awk '$1 == "held" {print $2}' "$R/boot-times.txt")
+# The GPU lock's time: the marker's (a quiet wait under the watch's half second leaves none: the
+# quiet line's, then); a shared boot has no quiet wait, and holds the lock at GPU_HELD.
+T_GPU=${T_GPU:-${T_QUIET:-$T_HELD}}
 [[ -n $T_RUN ]] && kv turn_wait_s "$(sub "$T_RUN" "$START")"
-[[ -n $T_RUN && -n $T_QUIET ]] && kv quiet_wait_s "$(sub "$T_QUIET" "$T_RUN")"
-[[ -n $T_HELD ]] && kv gpu_wait_s "$(sub "$T_HELD" "${T_QUIET:-${T_RUN:-$START}}")"
+[[ -n $T_GPU ]] && kv gpu_wait_s "$(sub "$T_GPU" "${T_RUN:-$START}")"
+[[ -n $T_GPU && -n $T_QUIET ]] && kv quiet_wait_s "$(sub "$T_QUIET" "$T_GPU")"
 # The hold began when run.sh held the GPU lock (else when QEMU started).
 T0=${T_HELD:-$T_QEMU}
 T0=${T0%.*}
@@ -271,7 +279,7 @@ if [[ -n $GL ]]; then
 fi
 if command -v nvidia-smi > /dev/null; then
   ( closefds; exec > "$R/gpu-clocks.txt" 2> /dev/null
-    timeout "$(left)" nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,power.draw --format=csv,noheader,nounits -lms 250 |
+    timeout "$(left)" nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,power.draw --format=csv,noheader,nounits -lms 100 |
       while IFS=', ' read -r ps gr mem pw; do echo "$(date +%s.%N | cut -c1-14) $ps $gr $mem $pw"; done ) &
   CLOCKPID=$!
 fi
@@ -279,9 +287,34 @@ fi
 kv load_start "$(cut -d' ' -f1 /proc/loadavg)"
 log "guest run: ${PHASES:-all phases}, $(left) s left"
 ts() { perl -MTime::HiRes=time -ne '$| = 1; printf "%.3f %s", time, $_'; }
-timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
-  "GATE_PASS='$GUEST_PASS' GATE_PRESENT_S=${PRESENT_S:-10} bash ~/lane-gate/guest-run.sh ~/lane-gate ${PHASES:-}" 2>&1 | ts > "$R/guest.log"
-kv guest_rc "${PIPESTATUS[0]}"
+guest_rc=0
+guest_run() {  # PHASE...: guest-run.sh's phases, its lines after the host's time into guest.log
+  timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
+    "GATE_PASS='$GUEST_PASS' GATE_PRESENT_S=${PRESENT_S:-10} GATE_RETRY='${RETRY:-}' bash ~/lane-gate/guest-run.sh ~/lane-gate $*" 2>&1 |
+    ts >> "$R/guest.log"
+  local rc=${PIPESTATUS[0]}
+  (( guest_rc == 0 )) && guest_rc=$rc
+}
+# The phases up to bench, then the frame cases with no repetition at the GPU's high clock again
+# (at most two rounds, each while the hold has 480 s left: a round's three cases under their
+# alarms, the phases after it and the drags), then the rest.
+read -ra ph <<< "${PHASES:-info idle bench present sweep decode webgl final}"
+first=() rest=() benched=0
+for p in "${ph[@]}"; do
+  if ((benched)); then rest+=("$p"); else first+=("$p"); [[ $p == bench ]] && benched=1; fi
+done
+: > "$R/guest.log"
+guest_run "${first[@]}"
+for round in 1 2; do
+  ((benched)) && [[ -n $CLOCKPID ]] && (( $(left) > 480 )) || break
+  RETRY=$(python3 -I "$(dirname "$0")/reps.py" "$R/guest.log" "$R/gpu-clocks.txt")
+  [[ -n $RETRY ]] || break
+  log "no repetition at the GPU's high clock: $RETRY; running them again (round $round)"
+  kv bench_retry_$round "${RETRY// /,}"
+  guest_run benchretry
+done
+((${#rest[@]})) && guest_run "${rest[@]}"
+kv guest_rc "$guest_rc"
 log "guest run done"
 
 # The window drags (msi-drag.py): a plain window and a glass one, each dragged DRAG_S seconds over

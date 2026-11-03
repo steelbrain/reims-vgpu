@@ -352,7 +352,7 @@ do_ship() {  # the gate's own scripts, which the host's steps run
   # Each script replaces the old one by a rename, never in place: a detached bench leg may be
   # running the old one, and bash reads a script as it runs it.
   msi "rm -rf '$MR/bin/.incoming' && mkdir -p '$MR/bin/.incoming'"
-  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" "$L/msi-drag.py" "$L/gpuload.c" "$L/gpuload.comp" \
+  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" "$L/msi-drag.py" "$L/reps.py" "$L/gpuload.c" "$L/gpuload.comp" \
     "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
   msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
 }
