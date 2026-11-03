@@ -1,0 +1,820 @@
+//! The order of command buffers of different queues over the IOSurfaces they share
+//! (`RGFX_FEATURE_SURFACE_ORDER`; docs/graphics-kext/design.md, "Surface order").
+//!
+//! A command buffer that holds [`RGFX_OP_SURFACE_ORDER`] names, as the bundle committed it, the
+//! buffers of other queues it runs after: each surface's writers of other queues, and its readers
+//! too where the buffer writes it, as the surface's shared block named them when the commit read
+//! it. The host makes the buffer wait for each on the GPU, on the named queue's surface timeline:
+//! a shared event each buffer of the queue that holds the op signals to its own seqno as it ends.
+//! A queue's buffers signal in their ring's order, each after the work before it on the queue, so
+//! the timeline at a seqno means the queue's buffers up to that one have finished.
+//!
+//! - **No wait where none is needed.** A named buffer of the buffer's own queue is in its ring's
+//!   order already. One the host has seen finish (its completed handler raised the queue's
+//!   `done`) is a compare. Only the rest are GPU waits; a buffer with one is held as one that waits
+//!   for an event is (`cmdbuf`'s `Held`). Two buffers that share no surface never wait for each
+//!   other, since neither names the other.
+//! - **A buffer that holds no op pays nothing** but two atomic operations on its own queue's
+//!   [`Marks`], with no lock: it notes itself taken, and signals only where a buffer of another
+//!   queue waits past what its queue signalled ([`Marks::quiet`]).
+//! - **A buffer named before the host takes it.** Each queue's ring is taken on a thread of its
+//!   own, so a buffer may be decoded before a buffer it names, committed earlier on another queue,
+//!   is taken. Its wait is then for a value not yet signalled (Metal and the Vulkan platform wait
+//!   for a value signalled later), and the named queue's buffer at that seqno signals it when the
+//!   host takes it, whether or not it holds the op (`waited`). The waiter raises `waited` and then
+//!   reads `taken`, and a buffer taken raises `taken` and then reads `waited`, each sequentially
+//!   consistent, so at least one of the two sees the other.
+//! - **Nothing waits for good.** A named buffer that does not run still signals: a stand-in
+//!   signals at its seqno, and a buffer with none gets a command buffer of its own on its queue
+//!   that only signals ([`SurfaceOrder::release`]). A queue's destroy and its context's close
+//!   signal the highest value waited for of it ([`SurfaceOrder::ended`]). A queue the host does
+//!   not hold, or a seqno past every one its ring has published, names no buffer and waits for
+//!   nothing, so a slot a process left as it died, or one written wrong, holds nothing.
+//! - **A signal never overtakes the queue's work.** Each value is signalled by a command buffer on
+//!   the queue's own host queue, after the work committed there before it. A CPU set stands in only
+//!   for a queue that makes no command buffer, and may release a waiter before that queue's last
+//!   work ends.
+//!
+//! The order's state is the decoder's `surface_order` lock, a leaf: held while a buffer's waits
+//! and signal are encoded, never across a platform call that may wait. A command buffer made only
+//! to signal ([`Release`]) is made and committed after the lock is let go of.
+//!
+//! A shared event's value only rises (docs/graphics-kext/design.md, "Shared events"), so a second
+//! signal of a value is harmless.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use reims_graphics::ops::RgfxSurfaceOrderWait;
+use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
+use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
+
+/// The waits and signals run under a live raise handler (the ring loop's).
+const ON: OnFault = OnFault::Return;
+
+/// How many command buffers that hold the op pass between the logs of what the order did.
+const LOGGED_EVERY: u64 = 4096;
+
+/// What a queue's submission ring has published: the highest seqno of a message on it, taken or
+/// not; `None` where the queue has ended at the device. Given by the host as the queue is made.
+pub(crate) type Published = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// One queue's marks, shared with its table entry (`tables::QueueCounts`), so a buffer that holds
+/// no op reads and writes them with no lock ([`Self::quiet`]). Each only rises.
+#[derive(Default)]
+pub(crate) struct Marks {
+    /// The highest seqno of a buffer the host took off the queue's ring.
+    taken: AtomicU64,
+    /// The highest seqno a buffer of another queue waits for.
+    waited: AtomicU64,
+    /// The highest seqno a command buffer committed on the queue signals; 0 for none. Raised under
+    /// the order's lock.
+    signalled: AtomicU64,
+    /// The highest seqno signalled whose command buffer has finished.
+    done: AtomicU64,
+}
+
+impl Marks {
+    /// Notes the queue's buffer at `seqno` taken; whether it need signal nothing, for it holds no
+    /// op: no buffer of another queue waits past what the queue signalled. Where not, the buffer
+    /// signals under the order's lock ([`SurfaceOrder::signal`]).
+    pub(crate) fn quiet(&self, seqno: u64) -> bool {
+        self.taken.fetch_max(seqno, Ordering::SeqCst);
+        self.waited.load(Ordering::SeqCst) <= self.signalled.load(Ordering::SeqCst)
+    }
+}
+
+/// A signal a command buffer carries: its queue's `done` rises to `seqno` once it finishes.
+pub(crate) struct Signalled {
+    marks: Arc<Marks>,
+    seqno: u64,
+}
+
+impl Signalled {
+    /// The command buffer finished.
+    pub(crate) fn finished(&self) {
+        self.marks.done.fetch_max(self.seqno, Ordering::AcqRel);
+    }
+}
+
+/// A signal of a queue's timeline that no buffer of the guest's carries, decided under the
+/// order's lock and made after it ([`Self::signal`]).
+#[must_use]
+pub(crate) struct Release<P: Platform> {
+    event: P::SharedEvent,
+    marks: Arc<Marks>,
+    value: u64,
+}
+
+impl<P: Platform> Release<P> {
+    /// Signals the timeline to its value with a command buffer of `host_queue` holding that alone,
+    /// after the queue's work before it; where there is no queue or it makes no command buffer,
+    /// sets it on the CPU.
+    pub(crate) fn signal(self, host_queue: Option<&P::CommandQueue>) -> RaiseResult<()> {
+        let Release {
+            event,
+            marks,
+            value,
+        } = self;
+        let cb = match host_queue {
+            Some(q) => q.command_buffer(ON)?,
+            None => None,
+        };
+        match cb {
+            Some(cb) => {
+                cb.encode_signal(Some(EventRef::Shared(&event)), value)?;
+                cb.add_completed_handler(
+                    ON,
+                    Box::new(move |_: CompletedInfo| {
+                        marks.done.fetch_max(value, Ordering::AcqRel);
+                    }),
+                )?;
+                cb.commit(ON)?;
+            }
+            None => {
+                event.set_signaled_value(value)?;
+                marks.done.fetch_max(value, Ordering::AcqRel);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the order did, for the log ([`SurfaceOrder::counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OrderCounts {
+    /// Command buffers that held the op.
+    pub(crate) buffers: u64,
+    /// Waits named by them of other queues.
+    pub(crate) named: u64,
+    /// Of those, the GPU waits made.
+    pub(crate) waits: u64,
+    /// Of those, of a buffer the host had not yet taken.
+    pub(crate) ahead: u64,
+    /// Waits named of a queue the host does not hold, or past what its ring has published.
+    pub(crate) stale: u64,
+    /// Signals for buffers that did not run: a command buffer of their own, or a CPU set.
+    pub(crate) released: u64,
+}
+
+/// One queue the host holds, from its create to its end.
+struct Queue<P: Platform> {
+    /// Its marks, shared with its table entry.
+    marks: Arc<Marks>,
+    /// What its ring has published, as the host gave it; `None` where it gave nothing (the
+    /// decoder's own tests).
+    published: Option<Published>,
+    /// Its surface timeline, made at the first buffer that signals or waits on it.
+    event: Option<P::SharedEvent>,
+    /// The queue is gone (destroyed, or its context closed): nothing signals past `signalled`.
+    ended: bool,
+}
+
+impl<P: Platform> Queue<P> {
+    fn new() -> Self {
+        Queue {
+            marks: Arc::default(),
+            published: None,
+            event: None,
+            ended: false,
+        }
+    }
+
+    /// Its timeline, made where it has none; `None` where the platform makes no shared event.
+    fn event(&mut self, device: &P::Device) -> Option<&P::SharedEvent> {
+        if self.event.is_none() {
+            self.event = device.new_shared_event();
+        }
+        self.event.as_ref()
+    }
+}
+
+/// The queues' surface timelines, by queue id.
+pub(crate) struct SurfaceOrder<P: Platform> {
+    queues: HashMap<u64, Queue<P>>,
+    counts: OrderCounts,
+}
+
+impl<P: Platform> SurfaceOrder<P> {
+    pub(crate) fn new() -> Self {
+        SurfaceOrder {
+            queues: HashMap::new(),
+            counts: OrderCounts::default(),
+        }
+    }
+
+    /// What the order did so far.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> OrderCounts {
+        self.counts
+    }
+
+    /// The marks of queue `queue`, which the host holds from now (its create), for its table
+    /// entry.
+    pub(crate) fn marks(&mut self, queue: u64) -> Arc<Marks> {
+        let q = self.queues.entry(queue).or_insert_with(Queue::new);
+        Arc::clone(&q.marks)
+    }
+
+    /// Queue `queue` was made, its ring's published seqnos read through `published`: a wait for
+    /// one of its buffers past them names none.
+    pub(crate) fn queue_made(&mut self, queue: u64, published: Published) {
+        let q = self.queues.entry(queue).or_insert_with(Queue::new);
+        q.published = Some(published);
+    }
+
+    /// The queues of context `context` the host holds, not yet ended.
+    pub(crate) fn queues_of(&self, context: u32) -> Vec<u64> {
+        (self.queues.iter())
+            .filter(|&(&id, q)| id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context) && !q.ended)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Whether a buffer of queue `queue` that names `waits` waits for none of them on the GPU, so
+    /// it may be submitted as it is taken: each names its own queue, a queue the host does not
+    /// hold, or a buffer the host has seen finish.
+    pub(crate) fn ready(&self, queue: u64, waits: &[RgfxSurfaceOrderWait]) -> bool {
+        waits.iter().all(|w| {
+            if w.queue_obj_id == queue || w.queue_obj_id == 0 || w.seqno == 0 {
+                return true;
+            }
+            match self.queues.get(&w.queue_obj_id) {
+                Some(q) => q.marks.done.load(Ordering::Acquire) >= w.seqno,
+                None => true,
+            }
+        })
+    }
+
+    /// Makes `cb`, a command buffer of queue `queue` that holds the op, wait on the GPU for each
+    /// buffer of `waits` not yet finished (the module doc); whether it waits for one.
+    pub(crate) fn before(
+        &mut self,
+        device: &P::Device,
+        queue: u64,
+        cb: &P::CommandBuffer,
+        waits: &[RgfxSurfaceOrderWait],
+    ) -> RaiseResult<bool> {
+        self.counts.buffers += 1;
+        if self.counts.buffers.is_multiple_of(LOGGED_EVERY) {
+            let c = self.counts;
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "surface order: {} command buffers named {} buffers of other queues: {} GPU \
+                 waits ({} for buffers not yet taken), {} naming no buffer; {} signals for \
+                 buffers that did not run",
+                c.buffers, c.named, c.waits, c.ahead, c.stale, c.released
+            );
+        }
+        // One wait a queue, for the highest value of it.
+        let mut targets: Vec<(u64, u64)> = Vec::new();
+        for w in waits {
+            let (q, s) = (w.queue_obj_id, w.seqno);
+            if q == queue || q == 0 || s == 0 {
+                continue;
+            }
+            self.counts.named += 1;
+            let Some(named) = self.queues.get_mut(&q) else {
+                self.counts.stale += 1;
+                continue;
+            };
+            let marks = Arc::clone(&named.marks);
+            let done = marks.done.load(Ordering::Acquire);
+            if done >= s || named.event(device).is_none() {
+                continue;
+            }
+            let signalled = marks.signalled.load(Ordering::Acquire);
+            let target = if named.ended {
+                s.min(signalled)
+            } else if s <= signalled {
+                s
+            } else {
+                if let Some(published) = named.published.as_ref().and_then(|p| p())
+                    && s > published
+                {
+                    self.counts.stale += 1;
+                    continue;
+                }
+                // Not yet signalled. Raised before `taken` is read ([`Marks::quiet`]).
+                marks.waited.fetch_max(s, Ordering::SeqCst);
+                if marks.taken.load(Ordering::SeqCst) >= s {
+                    // Taken without a signal: it held no op, so it used no surface the bundle
+                    // named. What the queue signalled before it is what it can be ordered after.
+                    signalled
+                } else {
+                    // Not yet taken: it signals once taken, if its ring holds it.
+                    self.counts.ahead += 1;
+                    s
+                }
+            };
+            if target <= done {
+                continue;
+            }
+            match targets.iter_mut().find(|(tq, _)| *tq == q) {
+                Some((_, v)) => *v = (*v).max(target),
+                None => targets.push((q, target)),
+            }
+        }
+        for &(q, value) in &targets {
+            if let Some(event) = self.queues.get(&q).and_then(|q| q.event.as_ref()) {
+                cb.encode_wait(Some(EventRef::Shared(event)), value)?;
+                self.counts.waits += 1;
+            }
+        }
+        Ok(!targets.is_empty())
+    }
+
+    /// Notes queue `queue`'s buffer at `seqno` taken, and has `cb`, its command buffer or its
+    /// stand-in, signal the queue's timeline to `seqno` as it ends where it `names` the op or a
+    /// buffer of another queue waits past what the queue has signalled; then what its completed
+    /// handler calls ([`Signalled::finished`]). Called after the buffer's walk, before its commit.
+    pub(crate) fn signal(
+        &mut self,
+        device: &P::Device,
+        queue: u64,
+        seqno: u64,
+        names: bool,
+        cb: &P::CommandBuffer,
+    ) -> RaiseResult<Option<Signalled>> {
+        let Some((event, marks)) = self.to_signal(device, queue, seqno, names) else {
+            return Ok(None);
+        };
+        cb.encode_signal(Some(EventRef::Shared(&event)), seqno)?;
+        Ok(Some(Signalled { marks, seqno }))
+    }
+
+    /// Queue `queue`'s buffer at `seqno`, which `names` the op or not, was taken and will not
+    /// run, and has no stand-in: where a buffer of another queue may wait for it, the signal of the
+    /// queue's timeline to `seqno` that stands in for its, to make once the order's lock is let go
+    /// of ([`Release::signal`]).
+    pub(crate) fn release(
+        &mut self,
+        device: &P::Device,
+        queue: u64,
+        seqno: u64,
+        names: bool,
+    ) -> Option<Release<P>> {
+        let (event, marks) = self.to_signal(device, queue, seqno, names)?;
+        self.counts.released += 1;
+        Some(Release {
+            event,
+            marks,
+            value: seqno,
+        })
+    }
+
+    /// Notes queue `queue`'s buffer at `seqno` taken; where it is to signal (it `names` the op, or
+    /// a buffer of another queue waits past what the queue has signalled, and nothing after it
+    /// signalled), the queue's timeline and marks, its signal counted in them.
+    fn to_signal(
+        &mut self,
+        device: &P::Device,
+        queue: u64,
+        seqno: u64,
+        names: bool,
+    ) -> Option<(P::SharedEvent, Arc<Marks>)> {
+        let q = self.queues.get_mut(&queue)?;
+        let marks = Arc::clone(&q.marks);
+        marks.taken.fetch_max(seqno, Ordering::SeqCst);
+        let signalled = marks.signalled.load(Ordering::Acquire);
+        if !(names || marks.waited.load(Ordering::SeqCst) > signalled) || seqno < signalled {
+            return None;
+        }
+        let event = q.event(device)?.clone_ref();
+        marks.signalled.fetch_max(seqno, Ordering::AcqRel);
+        Some((event, marks))
+    }
+
+    /// Queue `queue` is gone (its destroy, or its context's close): nothing of it signals past
+    /// what it has, so where a buffer of another queue waits past that, the signal of the highest
+    /// value waited for, to make once the order's lock is let go of ([`Release::signal`]).
+    /// Queues gone whose signals have all finished are let go of.
+    pub(crate) fn ended(&mut self, queue: u64) -> Option<Release<P>> {
+        let mut release = None;
+        if let Some(q) = self.queues.get_mut(&queue) {
+            q.ended = true;
+            q.published = None;
+            let marks = Arc::clone(&q.marks);
+            let waited = marks.waited.load(Ordering::SeqCst);
+            if waited > marks.signalled.load(Ordering::Acquire)
+                && let Some(event) = q.event.as_ref()
+            {
+                marks.signalled.fetch_max(waited, Ordering::AcqRel);
+                self.counts.released += 1;
+                release = Some(Release {
+                    event: event.clone_ref(),
+                    marks,
+                    value: waited,
+                });
+            }
+        }
+        let gone: Vec<u64> = (self.queues.iter())
+            .filter(|(_, q)| {
+                q.ended
+                    && q.marks.done.load(Ordering::Acquire)
+                        >= q.marks.signalled.load(Ordering::Acquire)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in gone {
+            if let Some(q) = self.queues.remove(&id)
+                && let Err(refusal) = refusals::refusing(move || drop(q.event))
+            {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "queue {id:#x}'s surface timeline was let go of, and its release was \
+                     refused: {refusal}"
+                );
+            }
+        }
+        release
+    }
+
+    /// The device's reset: every queue's timeline goes, each let go of in a refusal scope. The
+    /// counts stay.
+    pub(crate) fn reset(&mut self) {
+        let queues = std::mem::take(&mut self.queues);
+        if let Err(refusal) = refusals::refusing(move || drop(queues)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the surface timelines were let go of at the device's reset, and a release was \
+                 refused: {refusal}"
+            );
+        }
+    }
+
+    /// Queue `queue`'s timeline, where it has one: its event and (signalled, done, waited,
+    /// taken), for the tests.
+    #[cfg(test)]
+    pub(crate) fn state(&self, queue: u64) -> Option<(P::SharedEvent, [u64; 4])> {
+        let q = self.queues.get(&queue)?;
+        let m = &q.marks;
+        q.event.as_ref().map(|event| {
+            (
+                event.clone_ref(),
+                [
+                    m.signalled.load(Ordering::Acquire),
+                    m.done.load(Ordering::Acquire),
+                    m.waited.load(Ordering::Acquire),
+                    m.taken.load(Ordering::Acquire),
+                ],
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use reims_graphics::ops::{
+        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SURFACE_ORDER, RgfxCommandBuffer, RgfxOpHeader,
+    };
+    use reims_graphics::wire::{
+        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+        RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
+    };
+    use reims_vgpu_core::testkit::calllog::{Arg, Call};
+    use reims_vgpu_core::testkit::objects::CompleteOn;
+    use reims_vgpu_core::testkit::{FakePlatform, Step};
+    use zerocopy::IntoBytes;
+
+    use super::super::{DecodeError, GraphicsDecoder, refusing};
+    use super::*;
+
+    const WAIT: &str = "encodeWaitForEvent:value:";
+    const SIGNAL: &str = "encodeSignalEvent:value:";
+    const SET: &str = "setSignaledValue:";
+
+    /// Queue 1 of process 1, and of process 2.
+    const A: u64 = 1 << RGFX_CONTEXT_OBJ_ID_SHIFT | 1;
+    const B: u64 = 2 << RGFX_CONTEXT_OBJ_ID_SHIFT | 1;
+
+    struct Rig {
+        p: Arc<FakePlatform>,
+        device: <FakePlatform as Platform>::Device,
+        dec: GraphicsDecoder<FakePlatform>,
+    }
+
+    /// A decoder holding queue [`A`] of process 1 and queue [`B`] of process 2.
+    fn rig() -> Rig {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        for queue in [A, B] {
+            let create = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: size_of::<RgfxQueueCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id: queue,
+                ..RgfxQueueCreate::default()
+            };
+            dec.set_context(Some(context(queue)));
+            assert_eq!(dec.decode(&device, create.as_bytes()).unwrap(), Ok(()));
+        }
+        Rig { p, device, dec }
+    }
+
+    fn context(queue: u64) -> u32 {
+        (queue >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
+    }
+
+    /// The ops of a buffer that names `waits` in its `SURFACE_ORDER`, or holds none (`None`), and
+    /// then `rest`.
+    fn ops(waits: Option<&[(u64, u64)]>, rest: &[u8]) -> Vec<u8> {
+        let mut ops = Vec::new();
+        if let Some(waits) = waits {
+            let header = RgfxOpHeader {
+                tag: RGFX_OP_SURFACE_ORDER,
+                flags: 0,
+                len: (8 + 16 * waits.len()) as u32,
+            };
+            ops.extend_from_slice(header.as_bytes());
+            for &(queue_obj_id, seqno) in waits {
+                let w = RgfxSurfaceOrderWait {
+                    queue_obj_id,
+                    seqno,
+                };
+                ops.extend_from_slice(w.as_bytes());
+            }
+        }
+        ops.extend_from_slice(rest);
+        ops
+    }
+
+    /// The `COMMAND_BUFFER` at `seqno` on `queue`, of `ops`.
+    fn message(queue: u64, seqno: u64, ops: &[u8]) -> Vec<u8> {
+        let m = RgfxCommandBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMMAND_BUFFER,
+                size: (RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len()) as u32,
+                seqno,
+            },
+            queue_obj_id: queue,
+            cb_obj_id: queue + 0x100 + seqno,
+            op_bytes: ops.len() as u64,
+        };
+        let mut message = m.as_bytes().to_vec();
+        message.extend_from_slice(ops);
+        message
+    }
+
+    impl Rig {
+        /// Carries out queue `queue`'s buffer at `seqno` of `ops`, as its process's ring hands it
+        /// over, standing in for it where it is not carried out (as the host does); its outcome,
+        /// and the calls made for it.
+        fn commit(
+            &mut self,
+            queue: u64,
+            seqno: u64,
+            ops: &[u8],
+        ) -> (Result<(), DecodeError>, Vec<Call>) {
+            let message = message(queue, seqno, ops);
+            let mark = self.p.call_log().mark();
+            self.dec.set_context(Some(context(queue)));
+            let outcome = refusing(|| self.dec.decode(&self.device, &message));
+            let outcome = match outcome {
+                Ok(Ok(())) => Ok(()),
+                other => {
+                    let _ = refusing(|| self.dec.stand_in_for_failed(&self.device, &message));
+                    other.unwrap_or(Err(DecodeError::Refused))
+                }
+            };
+            (outcome, self.p.call_log().since(mark))
+        }
+
+        /// The id of queue `queue`'s timeline's event.
+        fn event(&self, queue: u64) -> u64 {
+            let (event, _) = self.dec.shared.surface_order.lock().state(queue).unwrap();
+            Arg::obj(&event).as_obj().unwrap().0
+        }
+
+        /// Queue `queue`'s timeline: (signalled, done, waited, taken).
+        fn timeline(&self, queue: u64) -> [u64; 4] {
+            self.dec.shared.surface_order.lock().state(queue).unwrap().1
+        }
+    }
+
+    /// The (event, value) of each call to `sel` in `calls`.
+    fn events(calls: &[Call], sel: &str) -> Vec<(u64, u64)> {
+        (calls.iter())
+            .filter(|c| c.sel == sel)
+            .map(|c| {
+                let event = c.args[0].as_obj().map_or(0, |o| o.0);
+                (event, c.args[1].as_u64().unwrap_or(0))
+            })
+            .collect()
+    }
+
+    /// A buffer of process 2 that names process 1's buffer waits for it on the GPU, on queue
+    /// A's timeline at its seqno, which that buffer signals as it ends; once it has finished, a
+    /// buffer that names it waits for nothing, and so does one that names its own queue
+    #[test]
+    fn a_buffer_waits_on_the_gpu_for_a_named_buffer_of_another_process_until_it_finishes() {
+        let mut r = rig();
+        let (outcome, calls) = r.commit(A, 5, &ops(Some(&[]), &[]));
+        assert_eq!(outcome, Ok(()));
+        let a = r.event(A);
+        assert_eq!(
+            events(&calls, SIGNAL),
+            [(a, 5)],
+            "A's buffer signals its seqno"
+        );
+        assert!(events(&calls, WAIT).is_empty());
+
+        let (outcome, calls) = r.commit(B, 3, &ops(Some(&[(A, 5)]), &[]));
+        assert_eq!(outcome, Ok(()));
+        let b = r.event(B);
+        assert_eq!(events(&calls, WAIT), [(a, 5)], "B's waits for A's");
+        assert_eq!(events(&calls, SIGNAL), [(b, 3)]);
+        let c = r.dec.shared.surface_order.lock().counts();
+        assert_eq!((c.named, c.waits, c.ahead), (1, 1, 0));
+
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.timeline(A)[1], 5, "A's done");
+        let (_, calls) = r.commit(B, 4, &ops(Some(&[(A, 5), (B, 3)]), &[]));
+        assert!(
+            events(&calls, WAIT).is_empty(),
+            "a finished buffer, and one of its own queue"
+        );
+        assert_eq!(events(&calls, SIGNAL), [(b, 4)]);
+        assert_eq!(r.dec.shared.surface_order.lock().counts().waits, 1);
+    }
+
+    /// Process 2's buffer, committed after process 1's but taken first (each ring has its own
+    /// thread), still waits for it: for a value not yet signalled, which process 1's buffer
+    /// signals once it is taken, even one that holds no op; one that names a buffer its queue has
+    /// signalled waits for that value
+    #[test]
+    fn a_buffer_taken_before_one_it_names_waits_for_it() {
+        let mut r = rig();
+        let (_, calls) = r.commit(B, 1, &ops(Some(&[(A, 7)]), &[]));
+        let a = r.event(A);
+        assert_eq!(events(&calls, WAIT), [(a, 7)], "waits before the signal");
+        assert_eq!(r.timeline(A), [0, 0, 7, 0]);
+        assert_eq!(r.dec.shared.surface_order.lock().counts().ahead, 1);
+
+        // A's buffer 6 holds no op, so signals nothing anyone waits for: 6 is below 7, but it
+        // signals all the same, as a buffer of a queue waited past what it signalled.
+        let (_, calls) = r.commit(A, 6, &ops(None, &[]));
+        assert_eq!(events(&calls, SIGNAL), [(a, 6)]);
+        let (_, calls) = r.commit(A, 7, &ops(None, &[]));
+        assert_eq!(
+            events(&calls, SIGNAL),
+            [(a, 7)],
+            "the buffer waited for signals"
+        );
+        assert_eq!(r.timeline(A), [7, 0, 7, 7]);
+        let (_, calls) = r.commit(A, 8, &ops(None, &[]));
+        assert!(events(&calls, SIGNAL).is_empty(), "nothing waits past 7");
+    }
+
+    /// A buffer that holds no op waits for nothing and signals nothing, and its queue gets no
+    /// timeline; one that names a queue the host does not hold, or a seqno past every one the
+    /// named queue's ring has published, waits for nothing
+    #[test]
+    fn buffers_that_share_no_named_buffer_wait_for_nothing() {
+        let mut r = rig();
+        let mark = r.p.call_log().mark();
+        let (_, calls) = r.commit(A, 1, &ops(None, &[]));
+        assert!(events(&calls, WAIT).is_empty() && events(&calls, SIGNAL).is_empty());
+        assert!(
+            r.dec.shared.surface_order.lock().state(A).is_none(),
+            "no timeline"
+        );
+        assert!(
+            !r.p.call_log().sels_since(mark).contains(&"newSharedEvent"),
+            "nothing made"
+        );
+
+        let unknown = 3 << RGFX_CONTEXT_OBJ_ID_SHIFT | 1;
+        r.dec.surface_order_queue_made(A, Arc::new(|| Some(10)));
+        let (_, calls) = r.commit(B, 1, &ops(Some(&[(unknown, 4), (A, 11)]), &[]));
+        assert!(events(&calls, WAIT).is_empty());
+        assert_eq!(r.timeline(A)[2], 0, "nothing waits for A");
+        let (_, calls) = r.commit(B, 2, &ops(Some(&[(A, 10)]), &[]));
+        assert_eq!(
+            events(&calls, WAIT),
+            [(r.event(A), 10)],
+            "within what A published"
+        );
+        let c = r.dec.shared.surface_order.lock().counts();
+        assert_eq!((c.named, c.stale, c.waits), (3, 2, 1));
+    }
+
+    /// A buffer that is not carried out still signals what may be waited for of it: its stand-in
+    /// does; with none (its process's work is refused), a command buffer of its own on its queue
+    /// does; and where its queue makes no command buffer, the timeline is set on the CPU
+    #[test]
+    fn a_buffer_not_carried_out_still_signals() {
+        let mut r = rig();
+        let (_, calls) = r.commit(B, 1, &ops(Some(&[(A, 9)]), &[]));
+        let a = r.event(A);
+        assert_eq!(events(&calls, WAIT), [(a, 9)]);
+        // An op the host does not know faults the buffer, and its stand-in signals.
+        let unknown_op = RgfxOpHeader {
+            tag: 0x0fff,
+            flags: 0,
+            len: 8,
+        };
+        let (outcome, calls) = r.commit(A, 9, &ops(Some(&[]), unknown_op.as_bytes()));
+        assert!(outcome.is_err());
+        assert_eq!(events(&calls, SIGNAL), [(a, 9)], "the stand-in signals");
+
+        // Process 1's work is refused from here.
+        let resets = r.dec.shared.failed.resets();
+        assert!(r.dec.shared.failed.fail(1, resets));
+        let (_, calls) = r.commit(B, 2, &ops(Some(&[(A, 10)]), &[]));
+        assert_eq!(events(&calls, WAIT), [(a, 10)]);
+        let (outcome, calls) = r.commit(A, 10, &ops(Some(&[]), &[]));
+        assert_eq!(outcome, Err(DecodeError::ContextFailed));
+        assert_eq!(
+            events(&calls, SIGNAL),
+            [(a, 10)],
+            "a command buffer of its own signals"
+        );
+        assert!(calls.iter().any(|c| c.sel == "commit"));
+
+        r.p.script().push("commandBuffer", Step::Nil);
+        let (_, calls) = r.commit(A, 11, &ops(Some(&[]), &[]));
+        assert!(events(&calls, SIGNAL).is_empty());
+        let set: Vec<(u64, u64)> = (calls.iter())
+            .filter(|c| c.sel == SET)
+            .map(|c| (c.obj.0, c.args[0].as_u64().unwrap_or(0)))
+            .collect();
+        assert_eq!(set, [(a, 11)], "set on the CPU");
+        assert_eq!(r.timeline(A)[0..2], [11, 11]);
+        assert_eq!(r.dec.shared.surface_order.lock().counts().released, 2);
+    }
+
+    /// A queue's destroy, and its context's close, signal the highest value a buffer of another
+    /// queue waits for of it, from a last command buffer on it; a queue nothing waits past
+    /// signals nothing more
+    #[test]
+    fn a_queue_gone_signals_what_is_waited_for_of_it() {
+        let mut r = rig();
+        let _ = r.commit(B, 1, &ops(Some(&[(A, 12)]), &[]));
+        let a = r.event(A);
+        let destroy = RgfxObjectDestroy {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<RgfxObjectDestroy>() as u32,
+                seqno: 0,
+            },
+            obj_id: A,
+        };
+        r.dec.set_context(Some(1));
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(events(&calls, SIGNAL), [(a, 12)]);
+        assert!(calls.iter().any(|c| c.sel == "commit"));
+        // Its timeline stays until that signal finishes: a buffer that names a later one of it
+        // waits for no more than it signalled.
+        let (_, calls) = r.commit(B, 2, &ops(Some(&[(A, 20)]), &[]));
+        assert_eq!(events(&calls, WAIT), [(a, 12)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let (_, calls) = r.commit(B, 3, &ops(Some(&[(A, 20)]), &[]));
+        assert!(events(&calls, WAIT).is_empty(), "its last signal finished");
+
+        // B's process closes with nothing waiting past what B signalled.
+        let mark = r.p.call_log().mark();
+        r.dec.drop_context(2);
+        assert!(events(&r.p.call_log().since(mark), SIGNAL).is_empty());
+    }
+
+    /// A buffer a doorbell's thread would take is submitted at its take only where it waits for
+    /// no buffer of another queue: each it names is of its own queue, of no queue, or finished
+    #[test]
+    fn a_buffer_that_waits_is_not_submitted_as_it_is_taken() {
+        let mut r = rig();
+        let ready = |r: &Rig, waits: &[(u64, u64)]| {
+            let waits: Vec<RgfxSurfaceOrderWait> = (waits.iter())
+                .map(|&(queue_obj_id, seqno)| RgfxSurfaceOrderWait {
+                    queue_obj_id,
+                    seqno,
+                })
+                .collect();
+            r.dec.shared.surface_order.lock().ready(B, &waits)
+        };
+        assert!(ready(
+            &r,
+            &[(B, 4), (3 << RGFX_CONTEXT_OBJ_ID_SHIFT | 1, 4)]
+        ));
+        assert!(!ready(&r, &[(A, 2)]), "A's buffer has not been taken");
+        let _ = r.commit(A, 2, &ops(Some(&[]), &[]));
+        assert!(!ready(&r, &[(A, 2)]), "nor finished");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(ready(&r, &[(A, 2)]));
+    }
+}

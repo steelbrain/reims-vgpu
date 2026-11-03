@@ -803,7 +803,7 @@
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
 // [`RGFX_OP_SURFACE_ORDER`](crate::ops::RGFX_OP_SURFACE_ORDER), so a command buffer that uses an
 // IOSurface runs after the buffers of other queues committed before it that use the surface,
-// where one of the two writes it. No host offers it yet.
+// where one of the two writes it. Every host offers it.
 #define RGFX_FEATURE_SURFACE_ORDER (1 << 11)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes

@@ -25,8 +25,9 @@
 //! buffer, the buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer
 //! that waits on an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7).
 //! The host posts it as soon as it takes a buffer that waits for no event, needs no fill of a
-//! device cache and has none before it on its queue that waits for one and is not yet scheduled
-//! ([`Held`]), before it walks the buffer's ops ([`Take`]): its ticket in the commit order is
+//! device cache, waits for no buffer of another queue ([`super::surface_order`]) and has none
+//! before it on its queue that waits for one and is not yet scheduled ([`Held`]), before it walks
+//! the buffer's ops ([`Take`]): its ticket in the commit order is
 //! issued first ([`super::sequencer`]), so every command buffer the guest sends after it, on any
 //! queue, is committed after the buffer's commit, and the platform orders the guest's later work
 //! after it as it orders by commit. A buffer whose walk then faults has its failure at its completion, as
@@ -67,18 +68,17 @@ use reims_graphics::ops::{
     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER,
     RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END, RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE,
     RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER, RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT,
-    RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
+    RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
     RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
     RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_MAX_SAMPLE_POSITIONS,
     RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
     RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
-    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, op_group,
+    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxSurfaceOrderWait, op_group,
 };
 use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_core::platform::command::{
@@ -93,12 +93,14 @@ use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
     ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
+use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
 
 use super::super::completion::{cb_complete, cb_failed};
 use super::surface_cache::Uses;
+use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
     DecodeError, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, SubmittedSink, blit,
@@ -213,6 +215,10 @@ pub(crate) struct Begun<P: Platform> {
     used: Vec<u64>,
     /// Its count among those caches' users, until its commit.
     uses: Option<Uses<P>>,
+    /// It holds `SURFACE_ORDER`: it signals its queue's surface timeline as it ends.
+    order: bool,
+    /// Its queue's marks in the surface order.
+    marks: Arc<Marks>,
     /// Its `CB_SUBMITTED`, where it asks for one.
     submitted: Option<Arc<Submitted>>,
     /// Its hold of its queue, where it waits.
@@ -314,6 +320,8 @@ struct Take {
     waits: bool,
     /// The stream holds a `SUBMITTED`.
     asks: bool,
+    /// The buffers of other queues its first `SURFACE_ORDER` names, where it holds one.
+    order: Option<Vec<RgfxSurfaceOrderWait>>,
 }
 
 /// What the host takes of the op stream `ops` ([`Take`]). The scan stops at an op it cannot step
@@ -335,11 +343,37 @@ fn take(mut ops: &[u8]) -> Take {
             }
             RGFX_OP_WAIT_EVENT => out.waits = true,
             RGFX_OP_SUBMITTED => out.asks = true,
+            RGFX_OP_SURFACE_ORDER if out.order.is_none() => {
+                let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
+                let waits = body
+                    .chunks_exact(size_of::<RgfxSurfaceOrderWait>())
+                    .filter_map(|w| RgfxSurfaceOrderWait::read_from_bytes(w).ok())
+                    .collect();
+                out.order = Some(waits);
+            }
             _ => {}
         }
         ops = &ops[len..];
     }
     out
+}
+
+/// Whether the op stream `ops` holds a `SURFACE_ORDER`, as [`take`] finds it.
+fn names_order(ops: &[u8]) -> bool {
+    take(ops).order.is_some()
+}
+
+/// `handler`, which first lets the buffer's queue's surface timeline know it finished, where it
+/// `signalled` it ([`super::surface_order`]), so a buffer decoded once its completion is posted
+/// waits for nothing of it.
+fn signalling(handler: CompletedHandler, signalled: Option<Signalled>) -> CompletedHandler {
+    match signalled {
+        None => handler,
+        Some(signalled) => Box::new(move |info: CompletedInfo| {
+            signalled.finished();
+            handler(info);
+        }),
+    }
 }
 
 /// The encoder the walk currently holds open, one at a time, between an
@@ -426,7 +460,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// thread may begin it, filling no device cache: its context's work is not refused, it names
     /// a command queue of its context, asks for its `CB_SUBMITTED` (with a sink to post it on) and
     /// waits for no event, no buffer before it holds its queue, the device caches it uses need no
-    /// fill and no wait for one ([`super::surface_cache`]), and its queue holds fewer than
+    /// fill and no wait for one ([`super::surface_cache`]), it waits for no buffer of another
+    /// queue ([`super::surface_order`], its lock only tried), and its queue holds fewer than
     /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed, so the platform's
     /// `commandBuffer` does not wait. Where so, the buffer is counted among the users of those
     /// caches, as its begin would count it ([`super::surface_cache::Caches::hold_ready`]).
@@ -451,6 +486,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         {
             return false;
         }
+        if let Some(waits) = &take.order {
+            let Some(order) = self.shared.surface_order.try_lock() else {
+                return false;
+            };
+            if !order.ready(m.queue_obj_id, waits) {
+                return false;
+            }
+        }
         let Some(held) = self.surface_caches.hold_ready(&take.uses) else {
             return false;
         };
@@ -461,8 +504,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Begins the `COMMAND_BUFFER` `message`, whose completion handler will hold `drain`: opens a
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
     /// (filling each that holds an older generation, where `may_fill`; a doorbell's thread, which
-    /// checked [`Self::submits_at_take`], fills none), and makes its `CB_SUBMITTED` and its hold
-    /// of its queue ([`Begun`]).
+    /// checked [`Self::submits_at_take`], fills none), has it wait on the GPU for the buffers of
+    /// other queues its `SURFACE_ORDER` names that have not finished (where `may_fill`: the
+    /// doorbell's take found none), and makes its `CB_SUBMITTED` and its hold of its queue
+    /// ([`Begun`]).
     pub(crate) fn begin_command_buffer(
         &self,
         device: &P::Device,
@@ -504,8 +549,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .surface_caches
                 .before(device, &cb, &take.uses, may_fill)?,
         };
+        // The buffers of other queues it runs after, on the GPU (`surface_order`).
+        let order_waits = match &take.order {
+            Some(waits) if may_fill => {
+                (self.shared.surface_order.lock()).before(device, m.queue_obj_id, &cb, waits)?
+            }
+            _ => false,
+        };
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
-        let (behind, held) = hold(counts, fill_waits || take.waits);
+        let (behind, held) = hold(counts, fill_waits || take.waits || order_waits);
         Ok(Ok(Begun {
             queue_obj_id: m.queue_obj_id,
             cb_obj_id: m.cb_obj_id,
@@ -514,6 +566,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             in_flight,
             used,
             uses,
+            order: take.order.is_some(),
+            marks: Arc::clone(&counts.order),
             submitted,
             held,
             behind,
@@ -522,8 +576,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Finishes the `COMMAND_BUFFER` `message` that `begun` began: walks its op stream into its
-    /// command buffer, ends its use of the device caches, and commits it with its scheduled and
-    /// completed handlers.
+    /// command buffer, has it signal its queue's surface timeline where it is to
+    /// ([`Self::order_signal`]), ends its use of the device caches, and commits it with its
+    /// scheduled and completed handlers.
     pub(crate) fn finish_command_buffer(
         &self,
         device: &P::Device,
@@ -538,6 +593,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             in_flight,
             used,
             uses,
+            order,
+            marks,
             submitted,
             held,
             drain,
@@ -552,6 +609,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
             return Ok(Err(e));
         }
+        let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, order, &cb)?;
         // Register the scheduled and completion paths and commit. The GPU start and end times
         // are 0 here; the ring loop fills them when it posts the record on the queue's
         // completion ring in a later increment.
@@ -564,6 +622,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             false,
             (submitted, held.clone()),
         );
+        let handler = signalling(handler, signalled);
         let commit = || {
             if let Some(scheduled) = scheduled {
                 cb.add_scheduled_handler(ON, scheduled)?;
@@ -617,30 +676,49 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `Ok(false)` where there is none, and the caller posts the failure at once: a message too
     /// short to name its queue, a queue the process does not hold or that makes no command
     /// buffer, and a context whose work is refused ([`Self::context_failed`]).
-    pub(crate) fn stand_in_for_failed(&self, message: &[u8]) -> RaiseResult<bool> {
+    pub(crate) fn stand_in_for_failed(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<bool> {
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
             return Ok(false);
         };
-        if self.context_failed() {
-            return Ok(false);
-        }
-        // The buffer's context's drain, held until the stand-in's completion handler has run.
-        let drain = self.command_buffer_drain();
-        let Some(ObjHandle::CommandQueue(queue)) = self.named(m.queue_obj_id) else {
-            return Ok(false);
-        };
-        let Some(counts) = self.queue_counts(m.queue_obj_id) else {
-            return Ok(false);
-        };
-        let Some(cb) = queue.command_buffer(ON)? else {
-            return Ok(false);
-        };
-        let in_flight = InFlight::new(&counts.in_flight);
         // All of the message's ops, as the walk takes them ([`ops_of`]), whatever its `op_bytes`
         // read, so a wait or signal past a wrong count still runs.
         let ops = message
             .get(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize..)
             .unwrap_or_default();
+        // What other queues' buffers may wait for of it is signalled whatever becomes of it
+        // (`surface_order`).
+        let names = names_order(ops);
+        let (queue_obj_id, seqno) = (m.queue_obj_id, m.header.seqno);
+        if self.context_failed() {
+            let queue = match self.named(queue_obj_id) {
+                Some(ObjHandle::CommandQueue(queue)) => Some(queue.clone_ref()),
+                _ => None,
+            };
+            let marks = self
+                .queue_counts(queue_obj_id)
+                .map(|c| Arc::clone(&c.order));
+            let queue = queue.as_ref();
+            self.order_release(device, queue_obj_id, marks.as_deref(), seqno, names, queue)?;
+            return Ok(false);
+        }
+        // The buffer's context's drain, held until the stand-in's completion handler has run.
+        let drain = self.command_buffer_drain();
+        let Some(ObjHandle::CommandQueue(queue)) = self.named(queue_obj_id) else {
+            return Ok(false);
+        };
+        let Some(counts) = self.queue_counts(queue_obj_id) else {
+            return Ok(false);
+        };
+        let Some(cb) = queue.command_buffer(ON)? else {
+            let marks = Some(&*counts.order);
+            self.order_release(device, queue_obj_id, marks, seqno, names, Some(queue))?;
+            return Ok(false);
+        };
+        let in_flight = InFlight::new(&counts.in_flight);
         let mut events = EventOps::default();
         for (signal, op) in event_ops(ops) {
             let (event, shared) = match self.named(op.event_obj_id) {
@@ -664,6 +742,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let held = Arc::clone(held);
             cb.add_scheduled_handler(ON, Box::new(move || held.release()))?;
         }
+        let signalled =
+            self.order_signal(device, queue_obj_id, &counts.order, seqno, names, &cb)?;
         let handler = self.completed_handler(
             m.cb_obj_id,
             m.header.seqno,
@@ -672,6 +752,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             true,
             (None, held.clone()),
         );
+        let handler = signalling(handler, signalled);
         cb.add_completed_handler(ON, leaving(handler, in_flight))?;
         // In the commit order where the buffer was ([`super::sequencer`]).
         if let Some(mark) = self.mark.get() {
@@ -679,6 +760,51 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         commit_holding(&cb, held.as_deref())?;
         Ok(true)
+    }
+
+    /// Has `cb`, queue `queue_obj_id`'s buffer at `seqno` or its stand-in, signal the queue's
+    /// surface timeline as it ends where it `names` the op or a buffer of another queue waits
+    /// past what the queue signalled ([`super::surface_order::SurfaceOrder::signal`]); what its
+    /// completed handler then calls. One that holds no op and is waited for by none takes no lock
+    /// ([`Marks::quiet`]).
+    fn order_signal(
+        &self,
+        device: &P::Device,
+        queue_obj_id: u64,
+        marks: &Marks,
+        seqno: u64,
+        names: bool,
+        cb: &P::CommandBuffer,
+    ) -> RaiseResult<Option<Signalled>> {
+        if !names && marks.quiet(seqno) {
+            return Ok(None);
+        }
+        (self.shared.surface_order.lock()).signal(device, queue_obj_id, seqno, names, cb)
+    }
+
+    /// Queue `queue_obj_id`'s buffer at `seqno`, which `names` the op or not, will not run and
+    /// has no stand-in: where a buffer of another queue may wait for it, a command buffer of
+    /// `host_queue` (the queue's, where the host holds it) signals the queue's timeline to `seqno`
+    /// after the queue's work before it, made once the order's lock is let go of; where it makes
+    /// none, the timeline is set on the CPU ([`super::surface_order::Release`]).
+    fn order_release(
+        &self,
+        device: &P::Device,
+        queue_obj_id: u64,
+        marks: Option<&Marks>,
+        seqno: u64,
+        names: bool,
+        host_queue: Option<&P::CommandQueue>,
+    ) -> RaiseResult<()> {
+        if !names && marks.is_none_or(|m| m.quiet(seqno)) {
+            return Ok(());
+        }
+        let release =
+            (self.shared.surface_order.lock()).release(device, queue_obj_id, seqno, names);
+        match release {
+            Some(release) => release.signal(host_queue),
+            None => Ok(()),
+        }
     }
 
     /// The scheduled handler of command buffer `cb_obj_id`, at `seqno`: once the platform has
@@ -979,7 +1105,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
             }
             // Carried out before the walk, wherever they lie ([`take`]).
-            RGFX_OP_SURFACE_USE | RGFX_OP_SUBMITTED => {}
+            RGFX_OP_SURFACE_USE | RGFX_OP_SUBMITTED | RGFX_OP_SURFACE_ORDER => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -2053,7 +2179,7 @@ mod tests {
         ));
         let message = command_buffer_message(160, 90, &ops);
         assert!(refusing(|| dec.decode(&device, &message)).is_err());
-        assert!(dec.stand_in_for_failed(&message).unwrap());
+        assert!(dec.stand_in_for_failed(&device, &message).unwrap());
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(
             *posted.lock(),
@@ -2770,7 +2896,7 @@ mod tests {
         assert!(posted.lock().is_empty());
 
         let mark = p.call_log().mark();
-        assert!(dec.stand_in_for_failed(&message).unwrap());
+        assert!(dec.stand_in_for_failed(&device, &message).unwrap());
         let want = [
             "commandBuffer",
             "encodeWaitForEvent:value:",
@@ -2800,7 +2926,7 @@ mod tests {
         let mut elsewhere = command_buffer_message(121, 61, &ops);
         let queue = std::mem::offset_of!(RgfxCommandBuffer, queue_obj_id);
         elsewhere[queue..queue + 8].copy_from_slice(&99u64.to_le_bytes());
-        assert!(!dec.stand_in_for_failed(&elsewhere).unwrap());
+        assert!(!dec.stand_in_for_failed(&device, &elsewhere).unwrap());
     }
 
     /// A buffer whose `op_bytes` count fewer than its message's ops is refused as malformed, none
@@ -2838,7 +2964,7 @@ mod tests {
         assert!(!p.call_log().sels_since(mark).contains(&"commit"));
         assert!(posted.lock().is_empty());
 
-        assert!(dec.stand_in_for_failed(&message).unwrap());
+        assert!(dec.stand_in_for_failed(&device, &message).unwrap());
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(
             *posted.lock(),

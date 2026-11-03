@@ -59,6 +59,9 @@
 //!   caches' lock from its end's signal through its commit, never across its walk; a download
 //!   with nothing to copy is answered under it.
 //! - the commit order ([`sequencer`]), and the contexts that failed ([`FailedContexts`]).
+//! - `surface_order` ([`surface_order::SurfaceOrder`]), the queues' surface timelines: a leaf,
+//!   taken under no other lock and holding none, by a command buffer that holds `SURFACE_ORDER`
+//!   (or is waited for) while its waits and its signal are encoded, and at a queue's make and end.
 //!
 //! Where two are held at once, they are taken in this order: `libraries`, `contexts`, a context's
 //! table, then the compiles' pending set (`super::compile`, asked under the table's lock as a
@@ -140,6 +143,7 @@ mod managed;
 mod render;
 mod sequencer;
 mod surface_cache;
+mod surface_order;
 mod surface_pages;
 mod tables;
 mod video;
@@ -456,6 +460,9 @@ pub(crate) struct Shared<P: Platform> {
     surface_caches: Arc<Caches<P>>,
     /// The commit order `CB_SUBMITTED` promises ([`sequencer`]).
     sequencer: Arc<Sequencer>,
+    /// The queues' surface timelines, which order command buffers of different queues over the
+    /// IOSurfaces they share ([`surface_order`]).
+    surface_order: Mutex<surface_order::SurfaceOrder<P>>,
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
     #[cfg(test)]
     walk_hook: Mutex<Option<WalkHook>>,
@@ -552,6 +559,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None)),
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
+            surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             region,
@@ -834,6 +842,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         Arc::clone(&self.shared.failed)
     }
 
+    /// Queue `queue` was made, its ring's published seqnos read through `published`: a buffer of
+    /// another queue that names one of its buffers past them waits for nothing
+    /// ([`surface_order`]).
+    pub(crate) fn surface_order_queue_made(&self, queue: u64, published: surface_order::Published) {
+        self.shared
+            .surface_order
+            .lock()
+            .queue_made(queue, published);
+    }
+
+    /// Queue `queue_obj_id`, whose handle is `queue` where the host still holds it, is gone (its
+    /// destroy, or its context's close): its surface timeline signals what other queues' buffers
+    /// wait for of it, once the order's lock is let go of ([`surface_order::SurfaceOrder::ended`]).
+    /// A refusal is logged, and the destroy goes on.
+    fn queue_ended(&self, queue_obj_id: u64, queue: Option<&P::CommandQueue>) {
+        let release = self.shared.surface_order.lock().ended(queue_obj_id);
+        if let Some(release) = release
+            && let Err(raise) = refusing(|| release.signal(queue))
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "queue {queue_obj_id:#x}'s surface timeline was ended, and its last signal \
+                 faulted: {raise}"
+            );
+        }
+    }
+
     /// Whether the current context's work failed off its op's thread ([`FailedContexts`]), so
     /// its later work is refused. Where only tried and its lock is busy, as failed: the message is
     /// not taken there.
@@ -1076,9 +1111,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         self.shared.failed.forget(context);
         let mut dropped = 0;
+        let queues = self.shared.surface_order.lock().queues_of(context);
         if let Some(state) = self.context_state(context) {
             let (removed, count) = state.remove_all();
             dropped = count;
+            // Its queues end first, each signalling on its own host queue where it is let go of
+            // here ([`surface_order`]).
+            for &queue in &queues {
+                let handle = (removed.iter().find(|r| r.id() == queue)).and_then(|r| {
+                    match &r.entry().handle {
+                        ObjHandle::CommandQueue(q) => Some(q),
+                        _ => None,
+                    }
+                });
+                self.queue_ended(queue, handle);
+            }
             let mut copies = Vec::new();
             for r in removed {
                 let id = r.id();
@@ -1147,6 +1194,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         shared.surface_views.lock().reset();
         self.surface_caches.reset();
+        shared.surface_order.lock().reset();
         (contexts, dropped)
     }
 
@@ -1291,6 +1339,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if let Err(refusal) = refusals::refusing(|| self.forget_library(m.obj_id)) {
                     refused_release(m.obj_id, &refusal);
                 }
+                // A queue's surface timeline signals what other queues wait for of it. Read from
+                // the table as it is, so the destroy takes no view of it.
+                let queue = (self.context_state(context_of(m.obj_id))).and_then(|c| {
+                    c.with_live(m.obj_id, |e| match &e.handle {
+                        ObjHandle::CommandQueue(q) => Some(q.clone_ref()),
+                        _ => None,
+                    })
+                    .flatten()
+                });
+                if let Some(queue) = &queue {
+                    self.queue_ended(m.obj_id, Some(queue));
+                }
                 self.remove(m.obj_id);
                 Ok(Ok(()))
             }
@@ -1361,7 +1421,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                 match device.new_command_queue() {
                     Some(queue) => {
                         let mut entry = Entry::of(ObjHandle::CommandQueue(queue));
-                        entry.queue = Some(QueueCounts::default());
+                        let order = self.shared.surface_order.lock().marks(m.obj_id);
+                        entry.queue = Some(QueueCounts {
+                            order,
+                            ..QueueCounts::default()
+                        });
                         self.store(m.obj_id, entry);
                         Ok(Ok(()))
                     }

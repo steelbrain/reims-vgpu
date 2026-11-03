@@ -108,7 +108,7 @@ pub const RGFX_FEATURE_QUEUE_VECTORS: u32 = 1 << 8;
 /// [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
 /// [`RGFX_OP_SURFACE_ORDER`](crate::ops::RGFX_OP_SURFACE_ORDER), so a command buffer that uses an
 /// IOSurface runs after the buffers of other queues committed before it that use the surface,
-/// where one of the two writes it. No host offers it yet.
+/// where one of the two writes it. Every host offers it.
 pub const RGFX_FEATURE_SURFACE_ORDER: u32 = 1 << 11;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.

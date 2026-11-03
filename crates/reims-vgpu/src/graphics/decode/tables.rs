@@ -51,6 +51,9 @@ pub(crate) struct QueueCounts {
     /// How many command buffers the host made on it have not completed (a take on a doorbell's
     /// thread).
     pub(crate) in_flight: Arc<AtomicUsize>,
+    /// Its marks in the surface order, which a command buffer that holds no op reads and writes
+    /// with no lock ([`super::surface_order::Marks`]).
+    pub(crate) order: Arc<super::surface_order::Marks>,
 }
 
 /// One object of a context's, as made. Its fields drop in their order: a `Managed` object's CPU
@@ -140,6 +143,11 @@ impl<P: Platform> Removed<P> {
     /// Its object's id.
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The entry.
+    pub(crate) fn entry(&self) -> &Entry<P> {
+        self.owned.entry()
     }
 
     /// The entry, to let go of in parts.

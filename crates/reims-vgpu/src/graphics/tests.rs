@@ -4028,7 +4028,8 @@ fn a_failed_context_s_pipeline_creates_are_carried_out() {
 
 /// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
 /// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
-/// a command buffer's ask for its submission (`CB_SUBMITTED`)
+/// a command buffer's ask for its submission (`CB_SUBMITTED`) and orders command buffers over the
+/// IOSurfaces they share (`SURFACE_ORDER`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -4060,14 +4061,14 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     };
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
-        want | RGFX_FEATURE_CB_SUBMITTED
+        want | RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_SURFACE_ORDER
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
-        RGFX_FEATURE_CB_SUBMITTED
+        RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_SURFACE_ORDER
     );
 }
 

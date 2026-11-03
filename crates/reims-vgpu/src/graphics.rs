@@ -38,12 +38,12 @@ use reims_graphics::wire::{
     RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
     RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
-    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState,
-    RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
+    RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
+    RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -210,8 +210,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoder.set_guest_memory(memory, lease);
             }
             // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks. Every
-            // host answers a command buffer's ask for its submission.
+            // host answers a command buffer's ask for its submission, and orders command buffers
+            // of different queues over the IOSurfaces they share where the guest names the order.
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
+                | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
                     (true, true) => u64::from(RGFX_FEATURE_SURFACE_PAGES),
@@ -737,6 +739,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     && queue == message_identity(message).2
                 {
                     self.presents.queue_made(queue, poster.clone());
+                    // ... and what a buffer of another queue waits for of it (`surface_order`).
+                    let ring = poster.clone();
+                    decoder
+                        .surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
                 }
                 let foreign = foreign_queue(poster, message);
                 let outcome = if foreign {
@@ -750,7 +756,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let stood_in = !matches!(outcome, Ok(Ok(())))
                     && r#type == RGFX_CMD_COMMAND_BUFFER
                     && !foreign
-                    && matches!(refusing(|| decoder.stand_in_for_failed(message)), Ok(true));
+                    && matches!(
+                        refusing(|| decoder.stand_in_for_failed(&self.device, message)),
+                        Ok(true)
+                    );
                 (outcome, stood_in)
             };
             let (outcome, stood_in) = outcome;
@@ -903,7 +912,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     Err(raise) => Err(raise),
                 };
                 let stood_in = !matches!(outcome, Ok(Ok(())))
-                    && matches!(refusing(|| decoder.stand_in_for_failed(&message)), Ok(true));
+                    && matches!(
+                        refusing(|| decoder.stand_in_for_failed(&control.device, &message)),
+                        Ok(true)
+                    );
                 drop(decoder);
                 drop(carried);
                 control.report(&poster, &message, outcome, stood_in);
