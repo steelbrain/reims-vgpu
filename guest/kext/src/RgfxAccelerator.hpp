@@ -168,7 +168,6 @@ public:
 	// IOService
 	bool start(IOService *provider) override;
 	void stop(IOService *provider) override;
-	void free() override;
 
 	// Our own user client: the region-map + doorbell transport the bundle opens.
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
@@ -414,9 +413,6 @@ private:
 	volatile UInt8 *registers;
 	IODeviceMemory *region;
 	UInt64 regionSize;
-
-	// Serialises doorbell writes (Metal rings from app threads).
-	IOSimpleLock *doorbellLock;
 
 	// The contexts' state lives in RgfxAcceleratorContexts.cpp, not in this class, so the
 	// class's layout and its own code stay as the loader's sites were taken from; it is made

@@ -308,10 +308,6 @@ bool RgfxAccelerator::start(IOService *provider)
 	pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
 		return false;
-	doorbellLock = IOSimpleLockAlloc();
-	if (!doorbellLock)
-		return false;
-
 	// The framebuffer enables these too; doing so again is harmless. The
 	// accelerator needs BAR 0 for the doorbell and BAR 2 to hand to the bundle.
 	pci->setMemoryEnable(true);
@@ -425,13 +421,6 @@ void RgfxAccelerator::teardown()
 	registers = nullptr;
 }
 
-void RgfxAccelerator::free()
-{
-	if (doorbellLock)
-		IOSimpleLockFree(doorbellLock);
-	doorbellLock = nullptr;
-	super::free();
-}
 
 // MARK: - The user client
 
@@ -671,13 +660,15 @@ void RgfxAccelerator::publishVideoCodecs()
 	OSSafeReleaseNULL(profiles);
 }
 
+// A queue's doorbell exits to the host, which may offer the ring's next command buffer to its
+// decoder before the write returns: the write holds no lock and leaves interrupts as they are, so
+// the CPU takes its IPIs (a TLB shootdown's among them) however long the host takes, and the
+// other CPUs' rings go to the host meanwhile. A ring id is one 32-bit write, which needs no lock.
 void RgfxAccelerator::ringDoorbell(UInt32 ringId)
 {
 	if (!registers)
 		return;
-	IOInterruptState s = IOSimpleLockLockDisableInterrupt(doorbellLock);
 	writeRegister(RGFX_REG_DOORBELL, ringId);
-	IOSimpleLockUnlockEnableInterrupt(doorbellLock, s);
 }
 
 #if RGFX_FB_TRACE
