@@ -1157,6 +1157,7 @@ impl Shared {
     /// Posts ring 0's `SUBMIT_ROOM` record on the control completion ring, for work begun at reset
     /// count `epoch`: the guest's posts waiting for room on ring 0 look again.
     fn post_room(&self, epoch: u64) {
+        log::debug!(target: "reims_graphics::room", "SUBMIT_ROOM posted for the control ring");
         self.post_waiting(&submit_room(), epoch);
     }
 
@@ -1730,6 +1731,10 @@ impl Shared {
             };
             // Told with nothing held, on the queue's completion ring.
             if room {
+                log::debug!(
+                    target: "reims_graphics::room",
+                    "SUBMIT_ROOM posted for queue {:#x}'s submission ring", queue.obj_id
+                );
                 self.post_queue_waiting(queue, &submit_room(), queue.epoch);
             }
             let message = match next {
