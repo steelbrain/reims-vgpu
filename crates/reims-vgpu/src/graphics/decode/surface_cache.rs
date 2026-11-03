@@ -82,7 +82,7 @@ pub(crate) const STORAGE_PRIVATE: u64 = 2 << 4;
 pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
 
 /// One surface's device cache.
-struct SurfaceCache<P: Platform> {
+pub(crate) struct SurfaceCache<P: Platform> {
     /// The cache: a Private buffer of the surface's bytes, which the block's buffers are.
     device: P::Buffer,
     /// A Shared buffer over the surface's own pages, the other end of each copy.
@@ -655,14 +655,15 @@ impl<P: Platform> SurfaceCaches<P> {
     /// then, at once where nothing is to copy. A release whose surface had no client left
     /// (`unread`, `RGFX_BLOCK_RELEASE_NO_CLIENT`) copies too: a surface with no client can still
     /// be looked up again, from a mach port or an XPC object that holds it (how one process hands
-    /// a surface it drew to another), and the process that looks it up then reads the pages.
+    /// a surface it drew to another), and the process that looks it up then reads the pages. The
+    /// cache is returned, for the caller to let go of.
     pub(crate) fn released(
         &mut self,
         device: &P::Device,
         block: u64,
         unread: bool,
         done: Box<dyn FnOnce() + Send>,
-    ) -> RaiseResult<()> {
+    ) -> RaiseResult<Option<SurfaceCache<P>>> {
         if !self.written_since_host(block) {
             done();
         } else {
@@ -671,9 +672,9 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             self.write_back(device, block, done)?;
         }
-        self.by_block.remove(&block);
+        let gone = self.by_block.remove(&block);
         self.watched.0.lock().remove(&block);
-        Ok(())
+        Ok(gone)
     }
 
     /// Whether the block's cache holds a command buffer's write the pages do not: one was
@@ -1037,8 +1038,9 @@ impl<P: Platform> Caches<P> {
     /// The block at `block` went, its `BLOCK_RELEASE` ([`SurfaceCaches::released`]), after every
     /// command buffer begun and not finished that may write its cache, waiting for none
     /// ([`Self::after_writers`]): `done` once the pages hold the cache, or `failed` where the
-    /// platform raised at the copy. Nothing names the block until it is answered: the kext gives
-    /// it out again only then.
+    /// platform raised at the copy, and the cache handed to `let_go`, which lets go of it on a
+    /// thread of its own, with no lock of the caches' held. Nothing names the block until it is
+    /// answered: the kext gives it out again only then.
     pub(crate) fn release(
         &self,
         device: &P::Device,
@@ -1046,13 +1048,16 @@ impl<P: Platform> Caches<P> {
         unread: bool,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
+        let_go: Box<dyn FnOnce(SurfaceCache<P>) + Send>,
     ) {
         let device = device.clone_ref();
         self.after_writers(
             block,
             Box::new(move |state| {
-                if let Err(raise) = refusing(|| state.released(&device, block, unread, done)) {
-                    failed(raise);
+                match refusing(|| state.released(&device, block, unread, done)) {
+                    Ok(Some(cache)) => let_go(cache),
+                    Ok(None) => {}
+                    Err(raise) => failed(raise),
                 }
             }),
         );
@@ -1074,14 +1079,14 @@ impl<P: Platform> Caches<P> {
     /// The block at `block` named again without a cache, or over other pages, loses it
     /// ([`SurfaceCaches::released`]), after every command buffer begun and not finished that may
     /// write it, waiting for them here: the buffers made over the block after it lie over its
-    /// pages.
+    /// pages. The cache is returned, for the caller to let go of with the lock let go.
     pub(crate) fn released(
         &self,
         device: &P::Device,
         block: u64,
         unread: bool,
         done: Box<dyn FnOnce() + Send>,
-    ) -> RaiseResult<()> {
+    ) -> RaiseResult<Option<SurfaceCache<P>>> {
         let mut state = self.state.lock();
         self.wait_users(&mut state, block, true);
         state.released(device, block, unread, done)

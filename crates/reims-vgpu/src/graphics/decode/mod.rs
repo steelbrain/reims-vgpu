@@ -57,7 +57,11 @@
 //! - `surface_views`, then `surface_caches` ([`surface_cache::Caches`]), the blocks' views of
 //!   their surfaces' pages and their device caches. A command buffer that uses a cache holds the
 //!   caches' lock from its end's signal through its commit, never across its walk; a download
-//!   with nothing to copy is answered under it.
+//!   with nothing to copy is answered under it. A view's mapping and import are made with
+//!   neither held ([`surface_pages::SurfaceViews::surface_pages`]).
+//! - `unsettled` ([`worker::Unsettled`]), the blocks whose `SURFACE_PAGES` the surface
+//!   worker has yet to carry out, taken alone; a message that names one waits for it holding no
+//!   lock here, nor the reset gate alone (the worker takes the gate shared, recursively).
 //! - the commit order ([`sequencer`]), and the contexts that failed ([`FailedContexts`]).
 //! - `surface_order` ([`surface_order::SurfaceOrder`]), the queues' surface timelines: a leaf,
 //!   taken under no other lock and holding none, by a command buffer that holds `SURFACE_ORDER`
@@ -157,9 +161,6 @@ mod tables;
 mod video;
 mod view;
 mod waits;
-// Of its members, ICB_CREATE uses the worker, its settles and their waits; the users of the
-// rest, the surface pages' messages, come after it.
-#[allow(dead_code)]
 pub(crate) mod worker;
 
 pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
@@ -469,6 +470,11 @@ pub(crate) struct Shared<P: Platform> {
     unified_memory: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
+    /// The blocks whose `SURFACE_PAGES` is not yet carried out ([`worker::Unsettled`]).
+    unsettled: Arc<worker::Unsettled>,
+    /// The thread the views are made and let go of on ([`worker::Worker`]), and a block's device
+    /// cache at its release ([`Caches::release`]).
+    surface_worker: Arc<worker::Worker>,
     /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
     surface_caches: Arc<Caches<P>>,
     /// The commit order `CB_SUBMITTED` promises ([`sequencer`]).
@@ -631,6 +637,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             failed: Arc::default(),
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None)),
+            unsettled: Arc::default(),
+            surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
@@ -706,43 +714,104 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.surface_views.lock().available(&self.platform)
     }
 
-    /// `SURFACE_PAGES`: the view of `runs` for the block `pages` names, which its
-    /// `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on `device` that holds
-    /// its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with none, logged as a guest
-    /// error. `flags` are the message's `RGFX_SURFACE_PAGES_*`: a block marked
-    /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view made at its first
-    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]); else
-    /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache. A summary of what the
-    /// views did is logged every [`VIEWS_LOGGED_EVERY`].
+    /// `SURFACE_PAGES` carried out here, at once ([`Self::begin_surface_pages`],
+    /// [`Self::carry_out_surface_pages`]): its answer (for the tests).
+    #[cfg(test)]
     pub(crate) fn surface_pages(
-        &mut self,
+        &self,
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
     ) -> u32 {
+        let settle = self.begin_surface_pages(pages.block_offset);
+        self.carry_out_surface_pages(device, pages, runs, flags, &settle)
+            .unwrap_or(RGFX_STATUS_REFUSED)
+    }
+
+    /// Begins `SURFACE_PAGES` of the block at `block`, in ring order: until the returned
+    /// [`worker::Settle`] drops, every message that names the block waits for it.
+    pub(crate) fn begin_surface_pages(&self, block: u64) -> worker::Settle {
+        let resets = self.shared.surface_views.lock().resets();
+        let begun = self.platform.clock().now_mono();
+        self.shared.unsettled.begin(block, resets, begun)
+    }
+
+    /// Hands the `SURFACE_PAGES` of the block at `block` to the surface worker
+    /// ([`worker::Worker`]), begun here ([`Self::begin_surface_pages`]): `job`
+    /// runs there, with its settle, which it lets go of once it has answered.
+    pub(crate) fn hand_off_surface_pages(
+        &self,
+        block: u64,
+        job: impl FnOnce(worker::Settle) + Send + 'static,
+    ) {
+        let settle = self.begin_surface_pages(block);
+        let begun = settle.begun;
+        self.shared
+            .surface_worker
+            .submit(Box::new(move || job(settle)));
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "SURFACE_PAGES of the block at {block:#x} handed to the worker in {} us",
+            self.platform
+                .clock()
+                .now_mono()
+                .saturating_duration_since(begun)
+                .as_micros()
+        );
+    }
+
+    /// Carries out the `SURFACE_PAGES` `settle` began: the view of `runs` for the block `pages`
+    /// names, which its `BUFFER_OVER_SURFACE_PAGES` buffers lie over, with a buffer over it on
+    /// `device` that holds its import: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with
+    /// none, logged as a guest error; `None`, with nothing made, where the device was reset since
+    /// its begin. `flags` are the message's `RGFX_SURFACE_PAGES_*`: a block marked
+    /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view made at its first
+    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]); else
+    /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache. A summary of what the
+    /// views did is logged every [`VIEWS_LOGGED_EVERY`].
+    pub(crate) fn carry_out_surface_pages(
+        &self,
+        device: &P::Device,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+        flags: u32,
+        settle: &worker::Settle,
+    ) -> Option<u32> {
         let clock = self.platform.clock();
         let start = clock.now_mono();
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
-        let made = {
-            let mut views = self.shared.surface_views.lock();
-            if private {
-                Ok(views.private_pages(&self.platform, pages, runs))
-            } else {
-                views.surface_pages(&self.platform, device, pages, runs)
-            }
+        let views = &self.shared.surface_views;
+        let made = if private {
+            Ok(surface_pages::SurfaceViews::private_pages(
+                views,
+                &self.platform,
+                pages,
+                runs,
+                settle,
+            ))
+        } else {
+            surface_pages::SurfaceViews::surface_pages(
+                views,
+                &self.platform,
+                device,
+                pages,
+                runs,
+                settle,
+            )
         };
         let status = match made {
-            Ok(Ok(())) if private => {
+            Ok(None) => return None,
+            Ok(Some(Ok(()))) if private => {
                 self.uncache_surface(device, pages.block_offset);
                 RGFX_STATUS_OK
             }
-            Ok(Ok(())) => {
+            Ok(Some(Ok(()))) => {
                 let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
                 self.cache_surface(device, pages.block_offset, runs, cached);
                 RGFX_STATUS_OK
             }
-            Ok(Err(why)) => {
+            Ok(Some(Err(why))) => {
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
                     target: "reims_vgpu::graphics",
@@ -765,7 +834,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         log::debug!(
             target: "reims_vgpu::graphics::surface_pages",
-            "SURFACE_PAGES of the block at {:#x} ({:#x} bytes, {} runs{}): {status} in {} us",
+            "SURFACE_PAGES of the block at {:#x} ({:#x} bytes, {} runs{}): {status} in {} us, {} \
+             us in the queue",
             pages.block_offset,
             pages.length,
             runs.len(),
@@ -776,7 +846,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             } else {
                 ""
             },
-            clock.now_mono().saturating_duration_since(start).as_micros()
+            clock.now_mono().saturating_duration_since(start).as_micros(),
+            start.saturating_duration_since(settle.begun).as_micros()
         );
         let c = self.shared.surface_views.lock().counts();
         if (c.made + c.reused + c.bad_runs + c.not_mapped + c.private)
@@ -801,7 +872,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 );
             }
         }
-        status
+        Some(status)
     }
 
     /// Gives the block at `block`, whose view of `runs` was just made, a device cache where the
@@ -864,6 +935,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
+        self.shared.unsettled.wait(block);
         self.surface_caches.download(device, block, done, failed);
     }
 
@@ -872,7 +944,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// its surface had a client left or not (`unread`,
     /// [`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
     /// is only counted), with no wait here for a buffer still walked; `done` then, or `failed`
-    /// where the platform raised at the copy ([`surface_cache`]).
+    /// where the platform raised at the copy ([`surface_cache`]). The block's holds of them are
+    /// let go of on the surface worker, where either may be the last of an import or a mapping.
     pub(crate) fn block_released(
         &self,
         device: &P::Device,
@@ -881,8 +954,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        self.shared.surface_views.lock().released(offset);
-        (self.surface_caches).release(device, offset, unread, done, failed);
+        self.shared.unsettled.wait(offset);
+        let gone = self.shared.surface_views.lock().released(offset);
+        if let Some(gone) = gone {
+            self.shared.surface_worker.drop_later(offset, gone);
+        }
+        let worker = Arc::clone(&self.shared.surface_worker);
+        let let_go = Box::new(move |cache| worker.drop_later(offset, cache));
+        (self.surface_caches).release(device, offset, unread, done, failed, let_go);
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
@@ -903,7 +982,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .map(|(at, _)| at)
         });
         match block {
-            Some(block) => self.surface_caches.fill_now(device, block, generation),
+            Some(block) => {
+                self.shared.unsettled.wait(block);
+                self.surface_caches.fill_now(device, block, generation)
+            }
             None => Ok(None),
         }
     }
@@ -1133,6 +1215,19 @@ impl<P: Platform> GraphicsDecoder<P> {
         &self,
     ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
         self.surface_caches.lock()
+    }
+
+    /// Waits for the block at `block` to be as its `SURFACE_PAGES` left it, where one is being
+    /// carried out ([`worker::Unsettled`]); true.
+    pub(crate) fn surface_settled(&self, block: u64) -> bool {
+        self.shared.unsettled.wait(block);
+        true
+    }
+
+    /// The surface worker (for the tests).
+    #[cfg(test)]
+    pub(crate) fn surface_worker(&self) -> &worker::Worker {
+        &self.shared.surface_worker
     }
 
     /// The surfaces' views, locked (for the tests).
@@ -1906,6 +2001,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 let span = self.span_of(m.buffer_obj_id);
+                if let Some((at, _)) = span {
+                    self.shared.unsettled.wait(at);
+                }
                 // Over a device cache, a Private buffer, the texture is Private too, as Metal
                 // makes a texture over a buffer in the buffer's storage mode; the guest's own
                 // texture keeps the mode it asked (`surface_cache`).
@@ -2116,7 +2214,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Removes what `obj_id` names (an `OBJECT_DESTROY`): its CPU copy and then its object are let
     /// go of, each in a refusal scope ([`drop_refused`]), at once, or where a view taken before
-    /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten.
+    /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten. An
+    /// object over a block with a surface view is let go of on the surface worker, where it may
+    /// be the last hold of the view's import or mapping ([`surface_pages`]).
     fn remove(&self, obj_id: u64) {
         let Some(context) = self.context_state(context_of(obj_id)) else {
             return;
@@ -2127,12 +2227,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         if let Some(removed) = removed {
             let Entry {
-                managed, handle, ..
+                managed,
+                handle,
+                span,
+                ..
             } = removed.into_entry();
-            if let Some(copy) = managed {
-                drop_refused(obj_id, copy);
+            let over_view =
+                span.is_some_and(|(block, _)| self.shared.surface_views.lock().holds(block));
+            if over_view {
+                self.shared
+                    .surface_worker
+                    .drop_later(obj_id, (managed, handle));
+            } else {
+                if let Some(copy) = managed {
+                    drop_refused(obj_id, copy);
+                }
+                drop_refused(obj_id, handle);
             }
-            drop_refused(obj_id, handle);
         }
         if texture {
             self.forget_surface_texture(obj_id);

@@ -310,10 +310,18 @@ pub trait Host: Send + Sync + 'static {
     /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are; and
     /// [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a
     /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
-    /// buffers alone. Called on the control thread, in ring order. The default maps nothing.
-    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, flags: u32) -> u32 {
+    /// buffers alone. The host gives `answer` from any thread once it has carried the message
+    /// out, and carries out every later message that names the block as if after it. Called on
+    /// the control thread, in ring order. The default maps nothing, and refuses at once.
+    fn surface_pages(
+        &self,
+        pages: &RgfxSurfacePages,
+        runs: Vec<RgfxPageRun>,
+        flags: u32,
+        answer: CompleteAnswer,
+    ) {
         let _ = (pages, runs, flags);
-        RGFX_STATUS_REFUSED
+        answer.answer(RGFX_STATUS_REFUSED);
     }
 
     /// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose block lies at `block_offset`
@@ -786,7 +794,8 @@ impl Device {
 /// The `COMPLETE` a ring-0 command owes, which the host gives from any thread once it has carried
 /// the command out: a `PRESENT_SURFACE` once the display shows the surface
 /// ([`Host::present_surface`]), a `CONTEXT_CLOSE` and a `BLOCK_RELEASE` once the command buffers
-/// they wait for have finished ([`Host::context_closed`], [`Host::block_released`]). It holds a
+/// they wait for have finished ([`Host::context_closed`], [`Host::block_released`]), a
+/// `SURFACE_PAGES` once its view is made ([`Host::surface_pages`]). It holds a
 /// weak reference to the device; an answer after the device has ended, or for a command taken
 /// before a reset, is dropped, and so is one never given.
 pub struct CompleteAnswer {
@@ -1277,11 +1286,18 @@ impl Shared {
         }
     }
 
-    /// `SURFACE_PAGES`: its runs read out of its block for the host ([`Host::surface_pages`]),
-    /// whose answer it is, where the block lies in the processes' blocks and its runs, whole, in
-    /// the block; else logged and [`RGFX_STATUS_INVALID_ARGUMENT`], with no view. `flags`: the
-    /// message's `RGFX_SURFACE_PAGES_*`, 0 for one without them.
-    pub(crate) fn surface_pages(&self, pages: &RgfxSurfacePages, flags: u32) -> u32 {
+    /// `SURFACE_PAGES` (`seqno`, taken at reset count `epoch`): its runs read out of its block
+    /// for the host ([`Host::surface_pages`]), which answers it, where the block lies in the
+    /// processes' blocks and its runs, whole, in the block, and `None`; else logged and
+    /// [`RGFX_STATUS_INVALID_ARGUMENT`], with no view. `flags`: the message's
+    /// `RGFX_SURFACE_PAGES_*`, 0 for one without them.
+    pub(crate) fn surface_pages(
+        &self,
+        pages: &RgfxSurfacePages,
+        flags: u32,
+        seqno: u64,
+        epoch: u64,
+    ) -> Option<u32> {
         let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
         let block_end = pages.block_offset.checked_add(pages.block_size);
         let runs_bytes = u64::from(pages.run_count) * size_of::<RgfxPageRun>() as u64;
@@ -1305,7 +1321,7 @@ impl Shared {
                  outside it: the block gets no view of its surface's pages",
                 pages.run_count, pages.runs_offset, pages.block_size, pages.block_offset
             );
-            return RGFX_STATUS_INVALID_ARGUMENT;
+            return Some(RGFX_STATUS_INVALID_ARGUMENT);
         };
         let runs = bytes
             .as_chunks::<{ size_of::<RgfxPageRun>() }>()
@@ -1313,7 +1329,8 @@ impl Shared {
             .iter()
             .filter_map(|run| RgfxPageRun::read_from_bytes(run).ok())
             .collect();
-        self.host.surface_pages(pages, runs, flags)
+        (self.host).surface_pages(pages, runs, flags, self.complete_answer(seqno, epoch));
+        None
     }
 
     /// Whether a live queue's submission or completion ring lies in the `size` bytes at `offset`

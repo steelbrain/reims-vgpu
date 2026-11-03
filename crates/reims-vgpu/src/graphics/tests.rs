@@ -268,6 +268,16 @@ impl Guest {
         device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
     }
 
+    /// The next completion-ring event where one is there now; else `None`, waiting for none.
+    fn event_now(&mut self) -> Option<Vec<u8>> {
+        // SAFETY: as the helpers above.
+        let produced = unsafe { self.load_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize) };
+        if produced == self.consumed {
+            return None;
+        }
+        self.event()
+    }
+
     /// The next completion-ring event, waiting about 2 s; `None` where none came.
     fn event(&mut self) -> Option<Vec<u8>> {
         let at =
@@ -5682,4 +5692,208 @@ fn a_create_reusing_a_pending_icb_s_id_after_its_destroy_keeps_its_object() {
         before + 1,
         "the destroy removed the later buffer"
     );
+}
+
+/// A headless device whose memory map holds `pages` host pages of guest RAM from [`SURFACE_RAM`],
+/// which its `SURFACE_PAGES` views map, started; the RAM, and the host's page.
+fn surface_device(
+    pages: u64,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    reims_vgpu_core::testkit::GuestRam,
+    u64,
+) {
+    let platform = Arc::new(FakePlatform::new());
+    let page = platform.vm().page_size();
+    let ram = reims_vgpu_core::testkit::GuestRam::with_range(SURFACE_RAM, pages * page).unwrap();
+    platform.fake_vm().adopt(&ram);
+    let mut map = crate::MemoryMap::new();
+    for r in ram.ranges() {
+        // SAFETY: the fake RAM stays mapped while the test, which holds it, runs.
+        unsafe {
+            map.push(
+                r.physical_address,
+                r.physical().physical_length,
+                r.host().as_ptr(),
+            );
+        }
+    }
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: Some(map),
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    (device, platform, ram, page)
+}
+
+/// The guest RAM's first byte in [`surface_device`].
+const SURFACE_RAM: u64 = 0x10_0000;
+/// The surface's block in the surface tests, of [`SURFACE_BLOCK_SIZE`] bytes, its runs in its
+/// second half.
+const SURFACE_BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+const SURFACE_BLOCK_SIZE: u64 = 0x2000;
+
+/// A `SURFACE_PAGES` of the block at [`SURFACE_BLOCK`] for context 1's surface of `runs`, given
+/// as (page, pages) of guest RAM, written into the block's second half here.
+fn surface_pages(device: &GraphicsDevice<FakePlatform>, page: u64, runs: &[(u64, u64)]) -> Vec<u8> {
+    let runs: Vec<RgfxPageRun> = runs
+        .iter()
+        .map(|&(at, n)| RgfxPageRun {
+            address: SURFACE_RAM + at * page,
+            length: n * page,
+        })
+        .collect();
+    let runs_offset = SURFACE_BLOCK + SURFACE_BLOCK_SIZE / 2;
+    // SAFETY: the runs lie in the block, in the device's region, mapped while it lives; nothing of
+    // the host's writes them.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            runs.as_bytes().as_ptr(),
+            device.region_base().add(runs_offset as usize),
+            runs.as_bytes().len(),
+        );
+    }
+    RgfxSurfacePages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        context: 1,
+        run_count: runs.len() as u32,
+        block_offset: SURFACE_BLOCK,
+        block_size: SURFACE_BLOCK_SIZE,
+        runs_offset,
+        length: runs.iter().map(|r| r.length).sum(),
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A `BUFFER_OVER_SURFACE_PAGES` of `length` bytes over the block at [`SURFACE_BLOCK`].
+fn buffer_over_surface_pages(obj_id: u64, length: u64) -> Vec<u8> {
+    RgfxBufferOverSurfacePages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        block_offset: SURFACE_BLOCK,
+        block_size: SURFACE_BLOCK_SIZE,
+        length,
+        options: 0,
+        reserved_34: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Waits, about 2 s at most, for the decoder to hold `n` objects; whether it did.
+fn objects_become(device: &GraphicsDevice<FakePlatform>, n: usize) -> bool {
+    for _ in 0..2000 {
+        if device.decoder_object_count() == n {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
+
+/// The `COMPLETE` `bytes` is: its seqno and status.
+fn complete_of(bytes: &[u8]) -> (u64, u32) {
+    let complete = RgfxComplete::read_from_bytes(bytes).unwrap();
+    assert_eq!(complete.header.r#type, RGFX_EVT_COMPLETE);
+    (complete.header.seqno, complete.status)
+}
+
+/// A `SURFACE_PAGES`' view is made off the control thread: while it is being made, ring 0 goes
+/// on with a message that does not name the block, and holds the messages that do, a
+/// `BUFFER_OVER_SURFACE_PAGES` and an `OBJECT_DESTROY` of its buffer posted right after it, and
+/// the block's `BLOCK_RELEASE`. Each is then carried out as right after the `SURFACE_PAGES`,
+/// whose answer comes first: the buffer lies over the view, the release is answered after it,
+/// and the decoder holds what it would have
+#[test]
+fn a_surface_s_view_is_made_off_ring_0_and_the_messages_naming_it_wait_for_it() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let worker = device.control.decoder();
+    worker.surface_worker().hold();
+    let mark = platform.call_log().mark();
+
+    guest.send(&device, surface_pages(&device, page, &[(5, 2), (1, 1)]));
+    let pages_seqno = guest.seqno;
+    guest.send(&device, event_create(obj(1, 10)));
+    assert!(objects_become(&device, 1), "ring 0 went on past it");
+    guest.send(&device, buffer_over_surface_pages(obj(1, 11), 3 * page));
+    guest.send(&device, object_destroy(obj(1, 11)));
+    guest.send(&device, block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let release_seqno = guest.seqno;
+    guest.send(&device, event_create(obj(1, 12)));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the messages naming the block wait for its view, and ring 0 behind them"
+    );
+    let buffers = |sels: &[&str]| {
+        sels.iter()
+            .filter(|&&s| s == "newBufferWithDescriptor:")
+            .count()
+    };
+    assert_eq!(
+        buffers(&platform.call_log().sels_since(mark)),
+        0,
+        "no view made yet"
+    );
+
+    worker.surface_worker().release();
+    let first = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(first, (pages_seqno, RGFX_STATUS_OK), "answered first");
+    let second = complete_of(&guest.event().expect("the BLOCK_RELEASE's answer"));
+    assert_eq!(second, (release_seqno, RGFX_STATUS_OK));
+    assert!(objects_become(&device, 2), "both events, the buffer gone");
+    worker.surface_worker().flush();
+    let made = platform.call_log().sels_since(mark);
+    assert_eq!(
+        buffers(&made),
+        2,
+        "the view's import and the buffer over it: {made:?}"
+    );
+    assert!(guest.event_now().is_none(), "nothing else answered");
+}
+
+/// A `SURFACE_PAGES` the device's reset comes after, before the worker carries it out, makes no
+/// view and is not answered; the reset does not wait for it
+#[test]
+fn a_reset_drops_a_surface_pages_not_yet_carried_out() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    let worker = device.control.decoder();
+    worker.surface_worker().hold();
+    let mark = platform.call_log().mark();
+    guest.send(&device, surface_pages(&device, page, &[(1, 1)]));
+    std::thread::sleep(Duration::from_millis(20));
+    device.reset();
+    let mut reset = false;
+    for _ in 0..2000 {
+        if worker.views_of_surfaces().resets() == 1 {
+            reset = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(reset, "the reset waited for the worker");
+    worker.surface_worker().release();
+    worker.surface_worker().flush();
+    assert!(
+        platform.call_log().sels_since(mark).is_empty(),
+        "no view made"
+    );
+    assert_eq!(worker.views_of_surfaces().len(), (0, 0));
+    assert!(guest.event_now().is_none(), "not answered");
 }

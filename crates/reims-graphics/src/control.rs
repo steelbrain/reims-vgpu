@@ -72,7 +72,7 @@ pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<V
 /// `BLOCK_RELEASE` is refused where a live queue's ring lies in the block, and else the host answers
 /// it; a `BLOCK_GRANT` is kept with the region (`Region::grant`), and so are a `BLOCK_SHARE` and a
 /// `BLOCK_UNSHARE` (`Region::share`, `Region::unshare`); a `SURFACE_PAGES` hands its block's runs
-/// to the host (`Shared::surface_pages`), answered with whether it mapped them; a
+/// to the host (`Shared::surface_pages`), which answers with whether it mapped them; a
 /// `SURFACE_DOWNLOAD` the host answers once the surface's pages hold its device cache
 /// (`Host::surface_download`). Every other message goes to the host's decoder.
 fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
@@ -120,10 +120,10 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
             let flags = read_at::<RgfxSurfacePagesCache>(message, RGFX_SURFACE_PAGES_CACHE_OFFSET)
                 .map_or(0, |c| c.flags);
             let status = read::<RgfxSurfacePages>(message)
-                .map_or(RGFX_STATUS_INVALID_ARGUMENT, |pages| {
-                    shared.surface_pages(&pages, flags)
+                .map_or(Some(RGFX_STATUS_INVALID_ARGUMENT), |pages| {
+                    shared.surface_pages(&pages, flags, seqno, epoch)
                 });
-            Some(complete(seqno, status))
+            status.map(|status| complete(seqno, status))
         }
         RGFX_CMD_SURFACE_DOWNLOAD => match read::<RgfxSurfaceDownload>(message) {
             Some(download) => {

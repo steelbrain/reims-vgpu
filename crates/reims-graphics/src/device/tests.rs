@@ -1963,9 +1963,10 @@ fn surface_pages_hand_the_host_their_runs() {
             pages: &RgfxSurfacePages,
             runs: Vec<RgfxPageRun>,
             flags: u32,
-        ) -> u32 {
+            answer: CompleteAnswer,
+        ) {
             self.0.lock().push((*pages, runs, flags));
-            RGFX_STATUS_OK
+            answer.answer(RGFX_STATUS_OK);
         }
         fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
             let runs = vec![];

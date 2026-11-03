@@ -423,8 +423,9 @@ struct GraphicsControl<P: ApiPlatform> {
     failed: Arc<FailedContexts>,
     /// What the device's reset waits for ([`Self::reset`]): held shared by each message carried
     /// out off the control thread, a queue's command buffer, create or destroy, from before it
-    /// asks whether its poster is stale to its end, and by each compile's and library make's
-    /// store; held alone by the reset. So a reset comes after everything of the guest's that
+    /// asks whether its poster is stale to its end, by each compile's and library make's store,
+    /// and by each `SURFACE_PAGES` the surface worker carries out ([`Self::start_surface_pages`]);
+    /// held alone by the reset. So a reset comes after everything of the guest's that
     /// began before it, as under one lock over the decoder, and whatever begins after it finds
     /// its poster stale (or its compile cancelled), and none of it outlives the reset. The control
     /// thread's own messages are carried out in order with the reset, on its thread.
@@ -687,6 +688,36 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
         drop(decoder);
         drop(drain);
+    }
+
+    /// `SURFACE_PAGES` (`Host::surface_pages`): begun here, in ring order, and carried out on the
+    /// surface worker (`decode::surface_pages`), so ring 0 goes on meanwhile, under the reset
+    /// gate, held shared recursively, as a queue that holds it may wait for the block. Answered
+    /// there once the block's view and device cache are made, before the block settles, so a
+    /// message that names the block and waited for it is answered after it.
+    fn start_surface_pages(
+        self: &Arc<Self>,
+        pages: RgfxSurfacePages,
+        runs: Vec<RgfxPageRun>,
+        flags: u32,
+        answer: CompleteAnswer,
+    ) {
+        let me = Arc::clone(self);
+        let job = move |settle| {
+            let status = {
+                let _carried = me.reset_gate.read_recursive();
+                (me.decoder()).carry_out_surface_pages(&me.device, &pages, &runs, flags, &settle)
+            };
+            // Nothing is owed where the device was reset since.
+            if let Some(status) = status {
+                answer.answer(status);
+            }
+            drop(settle);
+        };
+        entry::run(|_| {
+            self.decoder()
+                .hand_off_surface_pages(pages.block_offset, job);
+        });
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: answered once the surface's pages hold its
@@ -1434,13 +1465,15 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.features
     }
 
-    fn surface_pages(&self, pages: &RgfxSurfacePages, runs: Vec<RgfxPageRun>, flags: u32) -> u32 {
-        let control = &self.control;
-        entry::run(|_| {
-            control
-                .decoder()
-                .surface_pages(&control.device, pages, &runs, flags)
-        })
+    fn surface_pages(
+        &self,
+        pages: &RgfxSurfacePages,
+        runs: Vec<RgfxPageRun>,
+        flags: u32,
+        answer: CompleteAnswer,
+    ) {
+        self.control
+            .start_surface_pages(*pages, runs, flags, answer);
     }
 
     fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {

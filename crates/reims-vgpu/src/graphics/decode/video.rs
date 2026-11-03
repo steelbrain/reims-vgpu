@@ -206,7 +206,7 @@ pub(super) fn decode_op<P: Platform>(
     let cache_of = |buffer_obj_id| {
         (objs.span_of(buffer_obj_id))
             .map(|(block, _)| block)
-            .filter(|&block| objs.surface_caches.has(block))
+            .filter(|&block| objs.surface_settled(block) && objs.surface_caches.has(block))
     };
     let (luma_cache, chroma_cache) = (
         cache_of(luma_place.buffer_obj_id),
