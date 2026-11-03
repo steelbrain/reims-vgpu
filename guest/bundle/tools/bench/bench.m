@@ -1,7 +1,7 @@
 // bench: a GPU-heavy benchmark of the Metal device, to compare a guest's GPU lane with another
 // lane on the same host, and with real Macs. Every case warms up first, then runs REPS
 // repetitions and prints the median of each number (and the spread of the first).
-//   bench [-d NAME] [-r REPS] [-m SECONDS] [-i ITERS] [-t SECONDS] [-v] [-l] [CASE...]
+//   bench [-d NAME] [-r REPS] [-m SECONDS] [-i ITERS] [-t SECONDS] [-j THREADS] [-v] [-l] [CASE...]
 //     -d NAME     the first of MTLCopyAllDevices whose name holds NAME; the default is
 //                 MTLCreateSystemDefaultDevice (which, on a dual-GPU MacBook, switches the
 //                 display to the discrete GPU: pass -d there).
@@ -10,6 +10,8 @@
 //                 a sampler of the host's CPU and GPU to see each case.
 //     -i ITERS    the heavy fragment shader's loop count (default 256).
 //     -t SECONDS  how long `onscreen` animates (default 20).
+//     -j THREADS  how many threads encode and commit `draws.10k`'s command buffers at once, onto
+//                 its one queue (default 1).
 //     -v          a "# rep" line for each repetition of the frame cases (frag.*): when it
 //                 started, its frames (one command buffer each) and their rate.
 //     -l          lists the devices and exits.
@@ -27,8 +29,9 @@
 //   sample.tex       a compute kernel taking 16 bilinear samples a thread from a 4096 x 4096
 //               Private RGBA8 texture: gsamples_s.
 //   draws.10k        10,000 small draws a command buffer, each with its own setVertexBytes, into
-//               a 512 x 512 target, 3 command buffers back to back: draws_s from wall time, and
-//               the CPU's encode time and the GPU's time of one command buffer.
+//               a 512 x 512 target, 3 command buffers back to back on each of THREADS threads,
+//               one queue: draws_s from wall time, and the CPU's encode time and the GPU's time of
+//               one command buffer.
 //   upload.64m       the CPU writes a 64 MiB Shared buffer, the GPU blits it into a Private one:
 //               mbps end to end (write start to blit done), and the CPU write's own rate.
 //   readback.64m     the GPU writes a 64 MiB Shared buffer (a kernel), the CPU copies it out and
@@ -61,6 +64,8 @@ static NSArray<NSString *> *gPatterns;
 static int gReps = 5;
 static uint32_t gIters = 256;
 static double gSeconds = 20;
+// -j: the threads that encode draws.10k at once.
+static int gThreads = 1;
 // The wall time, commit to completion, of the last command buffer a case's run block waited for.
 static double gWall;
 // -m: the least time a case's repetitions take; when the case started.
@@ -527,9 +532,9 @@ static NSString *drawCalls(int draws)
 {
 	id<MTLRenderPipelineState> p = renderPipeline(@"v_small", @"f_flat", MTLPixelFormatRGBA8Unorm, NO);
 	id<MTLTexture> t = target(512, 512);
-	const int cbsPerRep = 3;
-	__block double encodeS = 0;
-	id<MTLCommandBuffer> (^encode)(void) = ^{
+	const int cbsPerRep = 3, threads = gThreads;
+	// A command buffer encoded, and the CPU time its encode took added to `encodeS`.
+	id<MTLCommandBuffer> (^encode)(double *) = ^(double *encodeS) {
 		const double s = now();
 		id<MTLCommandBuffer> cb = [gQueue commandBuffer];
 		id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass(t, MTLLoadActionClear)];
@@ -542,34 +547,48 @@ static NSString *drawCalls(int draws)
 			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		}
 		[e endEncoding];
-		encodeS += now() - s;
+		*encodeS += now() - s;
 		return cb;
 	};
 	{
-		id<MTLCommandBuffer> cb = encode();
+		double unused = 0;
+		id<MTLCommandBuffer> cb = encode(&unused);
 		[cb commit];
 		finish(cb);
 	}
 	NSMutableArray *ds = [NSMutableArray array], *enc = [NSMutableArray array], *gpu = [NSMutableArray array],
 	               *wall = [NSMutableArray array];
+	double *encodeS = calloc((size_t)threads, sizeof(double));
 	for (int r = 0; more(r); r++) {
-		encodeS = 0;
 		NSMutableArray *cbs = [NSMutableArray array];
+		NSLock *lock = [NSLock new];
 		const double s = now();
-		for (int i = 0; i < cbsPerRep; i++) {
-			id<MTLCommandBuffer> cb = encode();
-			[cb commit];
-			[cbs addObject:cb];
-		}
+		// Each thread encodes and commits its buffers back to back, onto the one queue.
+		dispatch_apply((size_t)threads, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t j) {
+			encodeS[j] = 0;
+			for (int i = 0; i < cbsPerRep; i++) {
+				id<MTLCommandBuffer> cb = encode(&encodeS[j]);
+				[cb commit];
+				[lock lock];
+				[cbs addObject:cb];
+				[lock unlock];
+			}
+		});
 		finishAll(cbs);
 		const double el = now() - s;
-		[ds addObject:@((double)draws * cbsPerRep / el)];
-		[enc addObject:@(encodeS * 1e3 / cbsPerRep)];
-		[gpu addObject:@(gpuSpanMs(cbs) / cbsPerRep)];
-		[wall addObject:@(el * 1e3 / cbsPerRep)];
+		double encoded = 0;
+		for (int j = 0; j < threads; j++)
+			encoded += encodeS[j];
+		const int count = cbsPerRep * threads;
+		[ds addObject:@((double)draws * count / el)];
+		[enc addObject:@(encoded * 1e3 / count)];
+		[gpu addObject:@(gpuSpanMs(cbs) / count)];
+		[wall addObject:@(el * 1e3 / count)];
 	}
-	return [NSString stringWithFormat:@"draws_s=%.0f encode_ms=%.2f gpu_ms=%.2f wall_ms=%.2f draws_cb=%d %@",
-	                                  median(ds), median(enc), median(gpu), median(wall), draws, spread(ds, "%.0f")];
+	free(encodeS);
+	return [NSString stringWithFormat:@"draws_s=%.0f encode_ms=%.2f gpu_ms=%.2f wall_ms=%.2f draws_cb=%d threads=%d %@",
+	                                  median(ds), median(enc), median(gpu), median(wall), draws, threads,
+	                                  spread(ds, "%.0f")];
 }
 
 static NSString *upload(NSUInteger bytes)
@@ -829,6 +848,8 @@ int main(int argc, char **argv)
 				gSeconds = atof(argv[++i]);
 			else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc)
 				gMinSeconds = atof(argv[++i]);
+			else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc)
+				gThreads = atoi(argv[++i]);
 			else if (strcmp(argv[i], "-l") == 0)
 				list = YES;
 			else if (strcmp(argv[i], "-v") == 0)
@@ -839,6 +860,8 @@ int main(int argc, char **argv)
 		gPatterns = patterns;
 		if (gReps < 1)
 			gReps = 1;
+		if (gThreads < 1)
+			gThreads = 1;
 		if (list) {
 			for (id<MTLDevice> d in MTLCopyAllDevices())
 				printf("bench: device \"%s\" lowPower=%d removable=%d unified=%d\n", d.name.UTF8String,
