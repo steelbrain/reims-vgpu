@@ -114,6 +114,10 @@ export CARGO_TARGET_DIR=$GH/target
 T0=$(date +%s)
 [[ -f $RUN/started ]] || date +%s > "$RUN/started"
 
+# A resumed run keeps the baseline it started with: LAST may since have become the run's own commit.
+if [[ -z $base_sha && -n $resume && -f $RUN/meta.json ]]; then
+  base_sha=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("baseline") or "")' "$RUN/meta.json")
+fi
 if [[ -z $base_sha && -e $GH/baselines/LAST ]]; then base_sha=$(basename "$(readlink "$GH/baselines/LAST")"); fi
 [[ -z $base_sha ]] || base_sha=$(git -C "$SRC" rev-parse --verify "$base_sha^{commit}")
 BASE=${base_sha:+$GH/baselines/$base_sha}

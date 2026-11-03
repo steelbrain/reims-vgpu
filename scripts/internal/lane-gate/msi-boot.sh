@@ -87,25 +87,8 @@ timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
     p = $2; sub(/^STD_VIDEO_H26[45]_PROFILE_IDC_/, "", p)
     print name[g] "\t" (op ~ /H265/ ? "hevc" : "h264") "\t" p }' | sort -u > "$R/host-video.tsv"
 [[ -s $R/host-video.tsv ]] || rm -f "$R/host-video.tsv"
-# The bench boot is the gate's optional part: it joins the turnstile only once nobody waits for
-# the GPU (no live marker in gpu-want-shared or gpu-want-exclusive), so it never holds up another
-# boot or measurement, and gives up after YIELD_S seconds (default 4 h).
-waiters() {
-  local f n=0
-  for f in "$RGK_RUN"/gpu-want-shared/* "$RGK_RUN"/gpu-want-exclusive/*; do
-    [[ -e $f ]] && kill -0 "${f##*.}" 2> /dev/null && n=$((n + 1))
-  done
-  echo $n
-}
-if [[ ${EXCLUSIVE:-1} == 1 ]]; then
-  y0=$(date +%s)
-  until [[ $(waiters) == 0 ]]; do
-    (( $(date +%s) - y0 < ${YIELD_S:-14400} )) || { log "BOOT_FAIL the GPU's queue was never empty in ${YIELD_S:-14400} s"; exit 3; }
-    sleep 20
-  done
-  kv yield_wait_s "$(( $(date +%s) - y0 ))"
-  log "the GPU's queue is empty after $(( $(date +%s) - y0 )) s: taking the turn"
-fi
+# The bench boot is an ordinary exclusive request: it waits its turn in the host's turnstile, in
+# arrival order, and holds the GPU alone for QEMU's life.
 excl=()
 [[ ${EXCLUSIVE:-1} == 1 ]] && excl=(RGK_EXCLUSIVE=1 "RGK_EXCLUSIVE_MAX=$HOLD_S")
 # rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
