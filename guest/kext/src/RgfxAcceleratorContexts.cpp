@@ -611,7 +611,12 @@ IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 
 		return kIOReturnNoResources;
 	}
 	idChunkOwners[chunk] = owner;
+	UInt32 held = 0;
+	for (UInt32 i = 0; i < RGFX_RESOURCE_ID_CHUNKS; i++)
+		held += idChunkOwners[i] ? 1 : 0;
 	IOLockUnlock(contextLock);
+	IOLog("RgfxAccelerator: context %u: resource-id chunk %u (%u of %u held)\n", context, chunk,
+	      held, RGFX_RESOURCE_ID_CHUNKS);
 	// The device learns of the chunk before the process does, so the grant is on the control
 	// ring before any create that names one of its ids.
 	RgfxResourceIdChunk grant = {};
