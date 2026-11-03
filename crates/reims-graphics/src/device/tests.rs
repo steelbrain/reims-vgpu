@@ -1270,6 +1270,10 @@ fn a_queue_s_rings_lie_in_its_process_s_blocks() {
     let seqno = rig.send(queue_create(QUEUE));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     assert_eq!(rig.device.queue_count(), 1);
+    // The queue's service thread hands the host its create, which may come after the answer.
+    seen.wait("the queue's create was never handed to the host", |seen| {
+        !seen.handed.lock().is_empty()
+    });
     assert_eq!(*seen.handed.lock().first().unwrap(), RGFX_CMD_QUEUE_CREATE);
 }
 
