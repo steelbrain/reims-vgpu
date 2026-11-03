@@ -14,7 +14,7 @@
 # present sweep decode webgl final), over one run or several: what a later phase reads stays in
 # DIR. The gate's correctness boot runs info sweep decode webgl present final, its bench boot
 # info webgl present idle bench, then benchretry where the host asks, then decodefps final.
-# benchretry runs the frame cases in GATE_RETRY again (run_benchretry). decode checks every
+# benchretry runs the cases in GATE_RETRY again (run_benchretry). decode checks every
 # stream's MD5s, decodefps also times the streams the lists time (decode_md5 -l), and present
 # runs present_probe for GATE_PRESENT_S seconds (default 10) each way. Each tool runs under an
 # alarm, so a hang ends as a FAIL line.
@@ -125,7 +125,7 @@ run_memory() {
 run_idle() { sleep 10; }
 
 run_bench() {
-	# The lines pass as they come, each frame case's repetitions among them (-v), so the host can
+	# The lines pass as they come, the GPU-bound cases' repetitions among them (-v), so the host can
 	# read the GPU's core clock beside each (lane-gate/reps.py).
 	limit 300 ./bench -m 3 -v 2>&1 | grep --line-buffered -E '^bench: |^# start|^# rep '
 	echo "rc bench ${PIPESTATUS[0]}"
@@ -134,13 +134,18 @@ run_bench() {
 
 # present_probe full-screen, then in a 1280 x 800 window, each its own sub-phase, so the host's
 # display updates can be counted in each.
-# The frame cases the host found no repetition of at the GPU's high clock in the bench phase
+# The cases the host found no repetition of at the GPU's high clock in the bench phase
 # (GATE_RETRY, from msi-boot.sh): each again for 20 s, of which the host keeps the repetitions at
-# the high clock. msi-boot.sh runs this phase between bench and the phases after it.
+# the high clock, while GATE_RETRY_S seconds (default 300) leave time for one more. msi-boot.sh
+# runs this phase between bench and the phases after it.
 run_benchretry() {
-	local c
+	local c end=$(( $(date +%s) + ${GATE_RETRY_S:-300} ))
 	for c in ${GATE_RETRY:-}; do
-		limit 90 ./bench -m 20 -v "$c" 2>&1 | grep --line-buffered -E '^bench: |^# start|^# rep '
+		if [ $(( $(date +%s) + 30 )) -gt "$end" ]; then
+			echo "GATE benchretry out of time at $c"
+			break
+		fi
+		limit 60 ./bench -m 20 -v "$c" 2>&1 | grep --line-buffered -E '^bench: |^# start|^# rep '
 	done
 }
 

@@ -4,16 +4,17 @@ msi-boot.sh on the lane host, which runs the frame cases again where none of the
 msi's RTX 5080 Laptop holds its core at about 1.2 to 1.5 GHz under its power cap ("SW power cap",
 115 W), 2 s into some starts from idle and about 10 s into sustained load, for up to 12 s; its
 frame cases follow the core clock (docs/graphics-kext/benchmark.md). A GPU-bound case's number
-(CLOCKED) counts only from time the core ran at CORE_MIN_MHZ or more throughout: a frame case's
-(frag.*) from its repetitions that did (bench -v's "# rep" lines), any other's where its whole run
-did. The other cases (draws, upload, readback, onscreen) are bound by the host's CPU, memory and
+(clocked) counts only from time the core ran at CORE_MIN_MHZ or more throughout: from its
+repetitions that did, where bench -v prints them ("# rep" lines: the frame cases', and compute.fma's,
+blit.256m's, sample.tex's and mps.sgemm's in bench builds that print theirs), else where its whole
+run did. The other cases (draws, upload, readback, onscreen) are bound by the host's CPU, memory and
 display, not by the GPU's clock: report.py judges them by the host's quiet instead.
 
 Inputs: guest.log (guest-run.sh's lines, each after the host's time in epoch seconds) and
 gpu-clocks.txt (the host's nvidia-smi ten times a second: "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W").
 
     python3 -I reps.py GUEST_LOG GPU_CLOCKS
-prints the frame cases that ran and have no repetition at the high clock, one line, space
+prints the cases that ran, printed repetitions, and have none at the high clock, one line, space
 separated (nothing where every one has some, or where the host sampled no clocks).
 """
 import re
@@ -26,14 +27,26 @@ def clocked(case):
     """Whether a bench case is GPU-bound: its number follows the GPU's clocks."""
     return case.startswith(("frag.", "compute.", "blit.", "sample.", "mps."))
 
-REP = re.compile(r"# rep (\S+) (\d+) at [0-9.]+ s: (\d+) frames \(command buffers\) in ([0-9.]+) ms, "
-                 r"([0-9.]+) a second, gpu span ([0-9.]+) ms a frame")
+# A frame case's repetition, and any other case's ("# rep NAME R at S s: MS ms, key=value ...").
+FRAME_REP = re.compile(r"# rep (\S+) (\d+) at [0-9.]+ s: (\d+) frames \(command buffers\) in ([0-9.]+) ms, "
+                       r"([0-9.]+) a second, gpu span ([0-9.]+) ms a frame")
+REP = re.compile(r"# rep (\S+) (\d+) at [0-9.]+ s: ([0-9.]+) ms, (.*)$")
+
+
+def numbers(text):
+    out = {}
+    for k, v in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=(-?[0-9.]+(?:e-?[0-9]+)?)(?=[\s,]|$)", text):
+        try:
+            out[k] = float(v)
+        except ValueError:
+            pass
+    return out
 
 
 def parse_guest(text):
     """Each bench case's runs, in order: {case: [{"start": t, "end": t or None, "reps": [...]}]},
-    a repetition (end, seconds, frames a second, GPU span ms a frame), its end the host's time of
-    its line, which bench prints as it ends."""
+    a repetition (end, seconds, its numbers: a frame case's fps and gpu_ms, any other's as its line
+    names them), its end the host's time of its line, which bench prints as it ends."""
     cases = {}
     for line in text.splitlines():
         m = re.match(r"([0-9.]+) (.*)$", line)
@@ -43,9 +56,14 @@ def parse_guest(text):
         if body.startswith("# start "):
             cases.setdefault(body[len("# start "):].strip(), []).append({"start": t, "end": None, "reps": []})
         elif body.startswith("# rep "):
+            r = FRAME_REP.match(body)
+            if r and cases.get(r.group(1)):
+                cases[r.group(1)][-1]["reps"].append(
+                    (t, float(r.group(4)) / 1e3, {"fps": float(r.group(5)), "gpu_ms": float(r.group(6))}))
+                continue
             r = REP.match(body)
             if r and cases.get(r.group(1)):
-                cases[r.group(1)][-1]["reps"].append((t, float(r.group(4)) / 1e3, float(r.group(5)), float(r.group(6))))
+                cases[r.group(1)][-1]["reps"].append((t, float(r.group(3)) / 1e3, numbers(r.group(4))))
         elif body.startswith("bench: "):
             r = re.match(r"bench: (\S+) (OK|FAIL|SKIP|NOTRUN)\b", body)
             if r and cases.get(r.group(1)) and cases[r.group(1)][-1]["end"] is None:
@@ -110,7 +128,7 @@ def judge(cases, rows):
 
 
 def retry(cases, rows):
-    """The frame cases that ran and have no repetition at the high clock."""
+    """The cases that ran, printed repetitions, and have none at the high clock."""
     return [c for c, j in judge(cases, rows).items() if j["reps"] and not j["ok"]]
 
 

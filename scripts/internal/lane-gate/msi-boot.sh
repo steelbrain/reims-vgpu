@@ -7,7 +7,7 @@
 # RUNDIR holds boot.env (below), and gets the results:
 #   boot.log      what this script did, with times
 #   guest.log     guest-run.sh's output, each line after the host's time (epoch seconds); where the
-#                 bench phase left frame cases with no repetition at the GPU's high clock
+#                 bench phase left GPU-bound cases with no repetition at the GPU's high clock
 #                 (reps.py), their runs again (benchretry) before the phases after it
 #   cpu.txt       QEMU's CPU time once a second: "EPOCH UTIME_TICKS STIME_TICKS HZ"
 #   host-events.log  the host log's display updates ("the display shows IOSurface") and its
@@ -290,14 +290,14 @@ ts() { perl -MTime::HiRes=time -ne '$| = 1; printf "%.3f %s", time, $_'; }
 guest_rc=0
 guest_run() {  # PHASE...: guest-run.sh's phases, its lines after the host's time into guest.log
   timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
-    "GATE_PASS='$GUEST_PASS' GATE_PRESENT_S=${PRESENT_S:-10} GATE_RETRY='${RETRY:-}' bash ~/lane-gate/guest-run.sh ~/lane-gate $*" 2>&1 |
+    "GATE_PASS='$GUEST_PASS' GATE_PRESENT_S=${PRESENT_S:-10} GATE_RETRY='${RETRY:-}' GATE_RETRY_S=${RETRY_S:-0} bash ~/lane-gate/guest-run.sh ~/lane-gate $*" 2>&1 |
     ts >> "$R/guest.log"
   local rc=${PIPESTATUS[0]}
   (( guest_rc == 0 )) && guest_rc=$rc
 }
-# The phases up to bench, then the frame cases with no repetition at the GPU's high clock again
-# (at most two rounds, each while the hold has 480 s left: a round's three cases under their
-# alarms, the phases after it and the drags), then the rest.
+# The phases up to bench, then the GPU-bound cases with no repetition at the GPU's high clock
+# again (at most two rounds, each while the hold has 480 s left, and the round given what it
+# leaves above 300 s: the phases after it, the drags and the screenshot), then the rest.
 read -ra ph <<< "${PHASES:-info idle bench present sweep decode webgl final}"
 first=() rest=() benched=0
 for p in "${ph[@]}"; do
@@ -311,7 +311,7 @@ for round in 1 2; do
   [[ -n $RETRY ]] || break
   log "no repetition at the GPU's high clock: $RETRY; running them again (round $round)"
   kv bench_retry_$round "${RETRY// /,}"
-  guest_run benchretry
+  RETRY_S=$(( $(left) - 300 )) guest_run benchretry
 done
 ((${#rest[@]})) && guest_run "${rest[@]}"
 kv guest_rc "$guest_rc"

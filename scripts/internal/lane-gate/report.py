@@ -275,8 +275,9 @@ class Run:
         a second; reps.py). A frame case's numbers are taken again from its repetitions at the high
         clock alone, over all its runs (the bench phase's, and benchretry's where msi-boot.sh ran it
         again): metrics clock_reps and clock_reps_ok count them, and clock_ok is 1 where any
-        repetition qualified. Any other case's clock_ok is 1 where its whole run was at the high
-        clock. Each case's item shows that, with its runs' median core and memory clocks and their
+        repetition qualified. So are compute.fma's, blit.256m's, sample.tex's and mps.sgemm's
+        where the bench build prints their repetitions; where it does not, clock_ok is 1 where the
+        case's whole run was at the high clock. Each case's item shows that, with its runs' median core and memory clocks and their
         commonest power state."""
         rows = reps.parse_clocks(read(os.path.join(d, "gpu-clocks.txt")))
         if not rows:
@@ -295,11 +296,11 @@ class Run:
                 self.lmetric(f"clock_reps_ok.bench.{case}", k)
                 self.lmetric(f"clock_ok.bench.{case}", 1 if k else 0)
                 note = f"{k} of {n} reps at {reps.CORE_MIN_MHZ} MHz or more"
-                if k:
+                if k and case.startswith("frag."):
                     # The case's line gives the medians of all its repetitions: its numbers that
                     # follow the frame rate are scaled to the qualifying repetitions' median rate.
-                    fps = statistics.median(r[2] for r in j["ok"])
-                    gpu = statistics.median(r[3] for r in j["ok"])
+                    fps = statistics.median(r[2]["fps"] for r in j["ok"])
+                    gpu = statistics.median(r[2]["gpu_ms"] for r in j["ok"])
                     line_fps, line_gpu = m.get(self.mp + p + "fps"), m.get(self.mp + p + "gpu_ms")
                     for key, nd in (("gpix_s", 2), ("mpix_s", 0)):
                         if line_fps and self.mp + p + key in m:
@@ -308,10 +309,17 @@ class Run:
                         self.lmetric(p + "gpix_s_gpu", round(m[self.mp + p + "gpix_s_gpu"] * line_gpu / gpu, 2))
                     self.lmetric(p + "fps", round(fps, 1))
                     self.lmetric(p + "gpu_ms", round(gpu, 3))
-                    self.lmetric(p + "wall_ms", round(statistics.median(1e3 / r[2] for r in j["ok"]), 3))
+                    self.lmetric(p + "wall_ms", round(statistics.median(1e3 / r[2]["fps"] for r in j["ok"]), 3))
                     note += f", judged on those: fps {fps:.1f}"
                     if self.mp + p + "gpix_s" in m:
                         note += f", gpix_s {m[self.mp + p + 'gpix_s']:g}"
+                elif k:
+                    # Any other case's repetition gives its own numbers: each is their median.
+                    keys = sorted(set().union(*(r[2] for r in j["ok"])))
+                    for key in keys:
+                        vals = [r[2][key] for r in j["ok"] if key in r[2]]
+                        self.lmetric(p + key, round(statistics.median(vals), 3))
+                    note += ", judged on those: " + " ".join(f"{key}={m[self.mp + p + key]:g}" for key in keys)
                 else:
                     note += ": not compared"
             else:
@@ -484,10 +492,12 @@ def median_baseline(bdir):
     return ref
 
 
-# Bimodal metrics: (regex, the slow mode's share of the fast one, low and high, its owner). A value
-# in the slow mode is KNOWN-bimodal and decides nothing; any other compares with the baseline's fast
-# mode (its best sample), and repeated runs give such a metric no noise band. frag.fill.2160p's
-# GPU time doubles from boot to boot (134 or 256 Gpix/s on msi's 5080, 11-03), which rgk-fill owns.
+# Bimodal metrics, in samples without clock data (gpu-clocks.txt) alone: (regex, the slow mode's
+# share of the fast one, low and high, its owner). There a value in the slow mode is KNOWN-bimodal
+# and decides nothing; any other compares with the baseline's fast mode (its best sample), and
+# such a metric takes no noise band from them. frag.fill.2160p ran 134 or 256 Gpix/s on msi's 5080
+# from boot to boot (11-03): the two modes were the core clock under the power cap, which a
+# sample with clock data judges per repetition instead.
 BIMODAL = [(r"bench\.frag\.fill\.2160p\.gpix_s", 0.40, 0.65, "rgk-fill")]
 
 
@@ -533,7 +543,7 @@ def noise_from(bdirs_root):
                 vals = [r["metrics"][n] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n)]
             else:
                 vals = [r["metrics"][n] for r in runs if n in r["metrics"] and r["metrics"].get("host.host_quiet") == 1]
-            if len(vals) < 2 or bimodal(n):
+            if len(vals) < 2 or (bimodal(n) and not gpu_bound(n)):
                 continue
             med = statistics.median(vals)
             if med:
@@ -634,7 +644,7 @@ def compare(run, base, noise):
             mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)")
             continue
         bv = bm[name]
-        bi = bimodal(name)
+        bi = bimodal(name) if clock_ok_of(cur["metrics"], name) is None else None
         if bi:
             bv = base.get("metrics_best", {}).get(name, bv)
         rel = (v - bv) / abs(bv) if bv else 0.0
