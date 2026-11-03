@@ -677,12 +677,24 @@ every other is the compositor. So the last 96 MiB of the blocks' room and the
 last 1024 of the table's 16384 entries go only to WindowServer's blocks
 (`RgfxBlockTable`'s reserve). WindowServer takes the first gap from the start
 like any process, and reaches into the reserve only once the rest is full; any
-other process is refused at the reserve's edge, as at the region's end. The kext
-knows WindowServer's client by the process's name and an entitlement only Apple
-can grant (`com.apple.private.graphics-restart-no-kill`). The kernel's
-accessors of a process's signing identifier are private KPIs, which a kext
-outside Apple's namespace cannot link. It logs the most WindowServer's blocks
-came to, which is what the reserve is sized from.
+other process is refused at the reserve's edge, as at the region's end. Of the
+watched rings, the last 64 past one process's 2048 queues are WindowServer's
+alone in the same way (`RgfxQueueLimits.hpp`). The kext logs the most
+WindowServer's blocks and queues came to, which is what the reserve is sized
+from.
+
+The kext knows WindowServer's client by two tests at its open: the opening
+process is named `WindowServer`, and it holds the entitlement
+`com.apple.private.graphics-restart-no-kill`
+(`IOUserClient::copyClientEntitlement`). WindowServer holds that entitlement on
+macOS 26.7.1 and 27, read from its signature (`com.apple.WindowServer`,
+a platform binary). With SIP on, AMFI refuses any `com.apple.private`
+entitlement to a binary Apple did not sign. So a process that only takes
+WindowServer's name fails the second test. The direct tests, the process's
+signing identifier and its platform-binary status (`cs_identity_get`,
+`csproc_get_platform_binary`), are in `com.apple.kpi.private`, which a kext
+outside Apple's namespace cannot link. Resolving them at run time through the
+loader is not worth its risk.
 
 **Reset.** A reset leaves the device as one just made, as a device's
 function reset does: `STATUS` 0, which the framebuffer writes at its start,
