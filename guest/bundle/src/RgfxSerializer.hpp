@@ -278,6 +278,13 @@ public:
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);
 
+	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the bytes at
+	/// `offset` in the heap over host memory `heap` (`BUFFER_MANAGED_AT_OFFSET`, where the
+	/// device took RGFX_FEATURE_MANAGED_AT_OFFSET).
+	RgfxCreated createBufferManagedAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
+	                                        uint32_t options,
+	                                        uint64_t align = kDefaultAddressAlign);
+
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
 	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the
 	/// message was not posted.

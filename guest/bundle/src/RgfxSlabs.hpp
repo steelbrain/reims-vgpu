@@ -125,11 +125,15 @@ public:
 
 /// Slabs of the device region: each a block of the kext's (RgfxRegion::allocate), in Metal's
 /// 16 KiB pages, its bytes whatever the block held before. A Shared slab is a Placement heap over
-/// host memory and its buffers BUFFER_AT_OFFSET there; a Managed one a block whose buffers are
-/// each a BUFFER_OVER_HOST_MEMORY over their own range, their CPU copy.
+/// host memory and its buffers BUFFER_AT_OFFSET there. A Managed one is, where the device took
+/// RGFX_FEATURE_MANAGED_AT_OFFSET (`managedAtOffset`), a Shared Placement heap over host memory
+/// too, each buffer a BUFFER_MANAGED_AT_OFFSET at an address of its own whose CPU copy the host
+/// places in the heap at its range; else a block whose buffers are each a
+/// BUFFER_OVER_HOST_MEMORY over their own range, their CPU copy.
 class RgfxRegionSlabSource : public RgfxSlabSource {
 public:
-	RgfxRegionSlabSource(RgfxRegion &region, RgfxSerializer &serializer);
+	RgfxRegionSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
+	                     bool managedAtOffset = false);
 
 	uint64_t unit() const override { return kUnit; }
 	uint64_t capacity() const override;
@@ -147,6 +151,7 @@ public:
 private:
 	RgfxRegion &m_region;
 	RgfxSerializer &m_serializer;
+	bool m_managedAtOffset;
 };
 
 class RgfxSlabs {

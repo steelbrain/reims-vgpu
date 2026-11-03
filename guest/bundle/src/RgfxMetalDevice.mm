@@ -559,7 +559,9 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
 	_stateCache = [[RgfxStateCache alloc] initWithDevice:self serializer:_serializer];
-	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer);
+	// Managed buffers' CPU copies lie in heaps of their slabs where the host places them there.
+	_slabSource = std::make_unique<RgfxRegionSlabSource>(
+	    *_region, *_serializer, (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 	if (!_slabs->start())
 		os_log_error(OS_LOG_DEFAULT,

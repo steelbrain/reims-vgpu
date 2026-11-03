@@ -710,6 +710,11 @@ only where no negotiation can carry it.
 - Bit 10 is reserved for a pipeline's warm-up, and bit 11 is `SURFACE_ORDER`:
   a command buffer that uses IOSurfaces runs after the buffers of other queues
   it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below).
+- Bit 14 is `MANAGED_AT_OFFSET`: ring 0 carries `BUFFER_MANAGED_AT_OFFSET`, a
+  Managed buffer whose CPU copy the host places in a heap over host memory of
+  the sender's, so no buffer imports host memory of its own (the slabs,
+  below). A host offers it where a Managed buffer is two copies, a GPU that does
+  not share the CPU's memory. Bit 15 is reserved for heaps over guest pages.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1299,7 +1304,7 @@ pipeline between equal keys.
 
 | group | messages | `Platform` call |
 |---|---|---|
-| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
+| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
@@ -1316,9 +1321,13 @@ block the bundle holds, so its create and its free call neither the kext nor
 the host's import, and the kext's block table holds one entry per slab:
 - A Shared slab is one Placement `HEAP_OVER_HOST_MEMORY` of the buffers'
   options, hazard tracking resolved, and each buffer a `BUFFER_AT_OFFSET`
-  there, at the heap's GPU address plus its offset. A Managed slab is a plain
-  block, and each buffer a `BUFFER_OVER_HOST_MEMORY` over its own range, its CPU
-  copy. The buffer's `heap` is nil: the slab is no object of the app's.
+  there, at the heap's GPU address plus its offset. Where the device took
+  `MANAGED_AT_OFFSET`, a Managed slab is a Shared Placement heap too, and each
+  buffer a `BUFFER_MANAGED_AT_OFFSET` at an address of its own: the host's GPU
+  copy, beside a CPU copy placed in the heap at the buffer's range. Elsewhere a
+  Managed slab is a plain block, and each buffer a `BUFFER_OVER_HOST_MEMORY`
+  over its own range, its CPU copy. The buffer's `heap` is nil: the slab is no
+  object of the app's.
 - `allocatedSize` is the pages taken, 4096 for a 256-byte buffer, and contents
   and GPU addresses start a page, as both x86-64 Macs' GPUs answer (AMD 5300M,
   Intel 630, measured with `tools/shmem`). Every new buffer reads zeros: a

@@ -35,14 +35,16 @@ uint64_t powerOfTwoAtLeast(uint64_t value)
 constexpr uint32_t kStorageShift = 4;
 constexpr uint32_t kStorageMask = 0xf0;
 constexpr uint32_t kStorageShared = 0;
+constexpr uint32_t kStorageManaged = 1;
 // MTLHeapTypePlacement: the guest places every buffer in a slab's heap itself.
 constexpr int32_t kHeapTypePlacement = 1;
 } // namespace
 
 // --- the region's slabs --------------------------------------------------------------------
 
-RgfxRegionSlabSource::RgfxRegionSlabSource(RgfxRegion &region, RgfxSerializer &serializer)
-    : m_region(region), m_serializer(serializer)
+RgfxRegionSlabSource::RgfxRegionSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
+                                           bool managedAtOffset)
+    : m_region(region), m_serializer(serializer), m_managedAtOffset(managedAtOffset)
 {
 }
 
@@ -53,7 +55,8 @@ uint64_t RgfxRegionSlabSource::capacity() const
 
 bool RgfxRegionSlabSource::heaped(uint32_t options) const
 {
-	return ((options & kStorageMask) >> kStorageShift) == kStorageShared;
+	const uint32_t storage = (options & kStorageMask) >> kStorageShift;
+	return storage == kStorageShared || (storage == kStorageManaged && m_managedAtOffset);
 }
 
 bool RgfxRegionSlabSource::take(uint64_t size, Memory *out)
@@ -75,8 +78,10 @@ void RgfxRegionSlabSource::give(const Memory &memory)
 
 bool RgfxRegionSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)
 {
+	// A Managed class's heap holds its buffers' CPU copies: Shared, of the class's cache mode
+	// and hazard tracking.
 	RgfxCreated created = m_serializer.createHeapOverHostMemory(
-	    memory.size, options, kHeapTypePlacement, memory.regionOffset);
+	    memory.size, options & ~kStorageMask, kHeapTypePlacement, memory.regionOffset);
 	if (created.obj_id == 0 || m_serializer.refused(created))
 		return false; // no address left, or the device never got it
 	out->objId = created.obj_id;
@@ -93,6 +98,17 @@ void RgfxRegionSlabSource::dropHeap(const Heap &heap)
 bool RgfxRegionSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset,
                                       uint64_t length, uint32_t options, Made *out)
 {
+	if (heap.objId != 0 && ((options & kStorageMask) >> kStorageShift) == kStorageManaged) {
+		// At an address of its own; its CPU copy is placed in the heap at the offset.
+		RgfxCreated created = m_serializer.createBufferManagedAtOffset(heap.objId, offset, length,
+		                                                               options);
+		if (created.obj_id == 0 || m_serializer.refused(created))
+			return false;
+		out->objId = created.obj_id;
+		out->gpuAddress = created.gpu_address;
+		out->ownsAddress = true;
+		return true;
+	}
 	if (heap.objId != 0) {
 		// At the heap's address plus the offset, where the host places it in the heap it pinned.
 		RgfxCreated created = m_serializer.createBufferAtOffset(heap.objId, offset, length, options);

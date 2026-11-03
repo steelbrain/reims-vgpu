@@ -441,6 +441,86 @@ void test_device_buffers_take_pages_of_slabs()
 	drainRing(fx.ring);
 }
 
+// Where the device took RGFX_FEATURE_MANAGED_AT_OFFSET, a Managed buffer's slab is a Shared heap
+// over its block, of the buffers' cache mode and hazard tracking, and each buffer a
+// BUFFER_MANAGED_AT_OFFSET at an address of its own, its CPU copy its pages of the heap: the host
+// imports no memory per buffer. Its ranges post as before; its free destroys it and gives its
+// address back, and the pages go back to the slab.
+void test_managed_buffers_place_their_cpu_copies_in_heaps()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource source(region, fx.ser, true);
+	RgfxSlabs slabs(source);
+	auto make = [&](NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferForDeviceWithLength:length
+		                                     options:options
+		                                       bytes:nullptr
+		                                   maxLength:0
+		                                       slabs:&slabs
+		                                      device:nil
+		                                  serializer:&fx.ser];
+	};
+	uint64_t firstId = 0;
+	@autoreleasepool {
+		const MTLResourceOptions managed = MTLResourceStorageModeManaged;
+		RgfxBuffer *a = make(256, managed);
+		RgfxBuffer *b = make(0x1800, managed | MTLResourceCPUCacheModeWriteCombined);
+		RgfxBuffer *c = make(0x1000, managed);
+		CHECK(a != nil && b != nil && c != nil);
+		CHECK(a.storageMode == MTLStorageModeManaged && a.allocatedSize == 0x1000);
+		auto heap = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		CHECK(heap.options == static_cast<uint32_t>(MTLResourceHazardTrackingModeTracked) &&
+		      heap.heap_type == 1);
+		auto ma = expectMessage<RgfxBufferManagedAtOffset>(fx.ring, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
+		CHECK(ma.obj_id == a.rgfxObjId && ma.heap_obj_id == heap.obj_id && ma.offset == 0 &&
+		      ma.length == 256 && ma.options == static_cast<uint32_t>(managed));
+		CHECK(ma.gpu_address == a.gpuAddress && ma.gpu_address != 0);
+		CHECK(heap.region_offset + ma.offset ==
+		      static_cast<uint64_t>(static_cast<uint8_t *>([a contents]) - mem.data()));
+		// Another cache mode is another class, with a heap of its own.
+		auto wcHeap =
+		    expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		CHECK(wcHeap.options == static_cast<uint32_t>(MTLResourceCPUCacheModeWriteCombined |
+		                                              MTLResourceHazardTrackingModeTracked));
+		auto mb = expectMessage<RgfxBufferManagedAtOffset>(fx.ring, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
+		CHECK(mb.heap_obj_id == wcHeap.obj_id && mb.offset == 0 && mb.length == 0x1800);
+		auto mc = expectMessage<RgfxBufferManagedAtOffset>(fx.ring, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
+		CHECK(mc.heap_obj_id == heap.obj_id && mc.offset == 0x1000 && mc.length == 0x1000);
+		CHECK(c.gpuAddress != a.gpuAddress && c.gpuAddress != heap.gpu_address + 0x1000);
+		// A range the CPU wrote posts as for any Managed buffer.
+		static_cast<uint8_t *>([c contents])[8] = 0x5a;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		[c didModifyRange:NSMakeRange(8, 1)];
+#pragma clang diagnostic pop
+		auto range =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range.obj_id == c.rgfxObjId && range.location == 8 && range.length == 1);
+		firstId = a.rgfxObjId;
+		drainRing(fx.ring);
+	}
+	// All three went: their destroys, and their pages back in the slabs.
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	bool destroyed = false;
+	while (fx.ring.next(&h, &bytes)) {
+		RgfxObjectDestroy d = {};
+		if (h.type == RGFX_CMD_OBJECT_DESTROY && bytes.size() == sizeof(d)) {
+			std::memcpy(&d, bytes.data(), sizeof(d));
+			destroyed = destroyed || d.obj_id == firstId;
+		}
+	}
+	CHECK(destroyed && slabs.stats().usedBytes == 0);
+	// Without the feature, a Managed buffer is a BUFFER_OVER_HOST_MEMORY over its range.
+	RgfxRegionSlabSource plain(region, fx.ser);
+	CHECK(!plain.heaped(MTLResourceStorageModeManaged) &&
+	      plain.heaped(MTLResourceStorageModeShared) &&
+	      source.heaped(MTLResourceStorageModeManaged) &&
+	      !source.heaped(MTLResourceStorageModePrivate));
+}
+
 // The device's heaps answer as Metal's (measured on the M3 Max, macOS 27.0.1, plain and under
 // MTL_DEBUG_LAYER: every mode and type made at maxBufferLength, nil a 16 KiB page past it): a
 // Shared one lies over a zeroed block of the region in Metal's 16 KiB pages, its buffers the
@@ -9875,6 +9955,7 @@ int main(int argc, char **argv)
 		test_private_buffer_has_no_contents();
 		test_device_buffers_answer_as_metal();
 		test_device_buffers_take_pages_of_slabs();
+		test_managed_buffers_place_their_cpu_copies_in_heaps();
 		test_device_heaps_answer_as_metal();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
