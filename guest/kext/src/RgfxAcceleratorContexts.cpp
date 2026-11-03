@@ -63,9 +63,11 @@ namespace {
 // The most blocks handed out at once.
 constexpr UInt32 kMaxBlocks = 16384;
 // The blocks' reserve for WindowServer (RgfxBlockTable): the last bytes of the region and the last
-// entries of the table, which no other process is given. Sized from what WindowServer holds at
-// the display's 4K mode, measured: see the commit that set it.
-constexpr UInt64 kWindowServerReserveBytes = 96ull << 20;
+// entries of the table, which no other process is given. Sized from what WindowServer held on an
+// RTX 5080 host at the display's 3840x2400 mode, measured: 134 MiB at most (at login), 118 to
+// 126 MiB as five apps opened, in 110 to 366 blocks; so the reserve holds a WindowServer started
+// again with a fifth to spare, and three times its blocks.
+constexpr UInt64 kWindowServerReserveBytes = 160ull << 20;
 constexpr UInt32 kWindowServerReserveEntries = 1024;
 // The most command queues watched at once, over every client (RgfxQueueLimits.hpp).
 constexpr UInt32 kMaxWatched = kRgfxMaxWatchedQueues;

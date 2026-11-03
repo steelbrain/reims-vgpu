@@ -673,7 +673,7 @@ published before its queue's thread took it.
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process
 holds much, so neither does the kext. The one process whose refusal would stall
-every other is the compositor. So the last 96 MiB of the blocks' room and the
+every other is the compositor. So the last 160 MiB of the blocks' room and the
 last 1024 of the table's 16384 entries go only to WindowServer's blocks
 (`RgfxBlockTable`'s reserve). WindowServer takes the first gap from the start
 like any process, and reaches into the reserve only once the rest is full; any
@@ -682,7 +682,10 @@ watched rings, the last 64 are WindowServer's alone in the same way, past room
 for one process's 2048 queues beside as many of the others'
 (`RgfxQueueLimits.hpp`). The kext logs the most
 WindowServer's blocks and queues came to, which is what the reserve is sized
-from.
+from: on an RTX 5080 host at the display's 3840x2400 mode, WindowServer held
+134 MiB at most, at login, and 118 to 126 MiB in 110 to 366 blocks as five apps
+opened, with 2 queues (measured). A larger display, or a second one,
+needs the reserve measured again.
 
 The kext knows WindowServer's client by two tests at its open: the opening
 process is named `WindowServer`, and it holds the entitlement
