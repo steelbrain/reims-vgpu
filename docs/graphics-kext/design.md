@@ -1687,10 +1687,11 @@ structs and `Platform` calls). The reims-graphics crate stays the transport
 walk and commit. Each context's objects are in a table of their own, each
 message is carried out on a decoder of its own, and every lock is held for a
 short section (the list is in `crates/reims-vgpu/src/graphics/decode/mod.rs`).
-Ring 0 goes on while a queue walks, and so does every other queue. Under the
-single lock this replaces, the decoder's lock was held from a command buffer's
-take to its commit, so each other message came wholly before the take or wholly
-after the commit. Each outcome the new design allows is one of those two:
+Ring 0 goes on while a queue walks, and so does every other queue, and the
+queue's own later buffers are walked beside it. Under the single lock this
+replaces, the decoder's lock was held from a command buffer's take to its
+commit, so each other message came wholly before the take or wholly after the
+commit. Each outcome the new design allows is one of those two:
 - **Objects.** A command buffer names objects as its context's table was when
   its first lookup (its queue, at its begin) took its view of the table. A
   create, destroy or close carried out on another thread after that is not
@@ -1760,6 +1761,55 @@ after the commit. Each outcome the new design allows is one of those two:
   wait for a walk, as the lock did. Tested by `a_reset_during_a_walk_comes_after_it`
   and `a_reset_drops_every_object_the_guest_made` (`graphics/tests.rs`), and
   by the decoder's fuzz (`decode/fuzz.rs`).
+- **A queue's own order.** A queue's service thread (or a doorbell's) begins
+  each of its command buffers in the order the guest published them and hands
+  the walk and the commit to the queue's lane (`decode/lane.rs`), whose threads
+  walk several at once, so one process's busy queue is not bound to one
+  thread. Under the lock a queue's next buffer was taken after the commit of
+  the one before it. Here each buffer gets its turn in its queue's lane at its
+  begin, before anything of it can fail, and its commit, its stand-in's commit
+  and the failure posted at once for it wait for every turn before its own, so
+  they come in the order the buffers were taken, as under the lock. A walk
+  encodes into its own command buffer, which the platform runs in commit order:
+  Apple's Metal guide lets a queue's buffers be encoded on several threads and
+  run in the order they are committed, and metal2vulkan resolves barriers,
+  layouts and fences at submit, in commit order. Four things a buffer does
+  before its commit are seen beyond it, and each keeps the lock's order:
+  - its hold of its queue: a buffer that waits for an event, or for the
+    host's fill of a device cache, holds its queue from its begin, not its
+    commit, so a buffer after it that asks for its `CB_SUBMITTED` is answered
+    at its scheduling, as behind one already committed;
+  - a video encoder's work, which its session starts as it is walked: a buffer
+    that holds one is walked only in its turn;
+  - its signal of its queue's surface timeline ("Surface order"), and the
+    release that stands in for one of a buffer that does not run: each is
+    decided in the buffer's turn, after its walk, since the order reads a
+    queue's buffer taken past a seqno as every buffer up to it taken, and a
+    waiter that saw a later buffer taken while an earlier one still walked
+    would wait for nothing;
+  - its answer at its take, posted at its begin, before the buffers before it
+    on its queue commit: everything the guest sends after the answer is
+    committed after the buffer (its ticket), which commits after them, so
+    nothing sent later sees the difference, and those buffers are `Committed`
+    or `Scheduled` at the answer by a race, as Metal's are.
+
+  A turn passes as its buffer's work ends, and a buffer waits only for turns
+  and tickets of buffers begun before it. A lane's threads take its jobs in
+  the order they came, and every lane with work has a thread of its own, so
+  the oldest unfinished buffer of each lane is on a thread, and so is the
+  oldest of the device: the waits end, by induction on the begin order. A
+  lane's own thread goes after a second with no job; a job that comes while
+  every thread of the lane is busy gets another, up to four a lane, only where
+  the device-wide budget of twice the host's cores has one free, which a lane
+  never waits for. So 2048 busy queues hold one thread each and the budget's
+  at most. Tested through the device by
+  `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
+  `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`
+  and `a_video_buffer_is_walked_in_its_turn` (`graphics/tests.rs`), and by the
+  lane's `a_turn_waits_for_every_turn_before_it`,
+  `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
+  `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order` and
+  `busy_lanes_hold_one_thread_each_and_the_budget_s`.
 - **What still waits on ring 0's thread:** a range message, for its own
   context's answered buffers; a download, a release or a block named again, for
   that block's writers; a present's fill, for that block's users; and the

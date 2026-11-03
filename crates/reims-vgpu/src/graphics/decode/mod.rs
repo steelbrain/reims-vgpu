@@ -140,6 +140,7 @@ mod compute;
 #[cfg(test)]
 mod fuzz;
 mod icb;
+mod lane;
 mod library;
 mod managed;
 mod render;
@@ -158,6 +159,8 @@ pub(crate) mod worker;
 
 pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
 
+pub(crate) use cmdbuf::Begun;
+use lane::{Lane, Turn};
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
 #[cfg(test)]
@@ -467,6 +470,8 @@ pub(crate) struct Shared<P: Platform> {
     /// The queues' surface timelines, which order command buffers of different queues over the
     /// IOSurfaces they share ([`surface_order`]).
     surface_order: Mutex<surface_order::SurfaceOrder<P>>,
+    /// The budget of the queues' lanes' extra threads ([`lane`]).
+    lanes: Arc<lane::Budget>,
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
     #[cfg(test)]
     walk_hook: Mutex<Option<WalkHook>>,
@@ -533,6 +538,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The command buffer's ticket in the commit order, where it was answered at its take; given
     /// back with the handle, after its commit or its stand-in's.
     ticket: RefCell<Option<Ticket>>,
+    /// The command buffer's turn in its queue's lane ([`lane`]), from its begin; it passes with
+    /// the handle, once the buffer's commit, stand-in or failure is done.
+    turn: RefCell<Option<Turn>>,
     /// The device caches a doorbell's take found ready and counted the buffer among the users of
     /// ([`Caches::hold_ready`]), for its begin.
     held_caches: RefCell<Option<surface_cache::Held<P>>>,
@@ -567,6 +575,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
+            lanes: lane::Budget::of_host(),
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             region,
@@ -587,6 +596,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             try_only: false,
             mark: Cell::new(None),
             ticket: RefCell::new(None),
+            turn: RefCell::new(None),
             held_caches: RefCell::new(None),
             drain: RefCell::new(None),
             order_waits: RefCell::new(Vec::new()),
@@ -616,6 +626,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.views.get_mut().clear();
         self.mark.set(None);
         self.ticket.get_mut().take();
+        self.turn.get_mut().take();
         self.held_caches.get_mut().take();
         self.drain.get_mut().take();
         self.order_waits.get_mut().clear();
@@ -1450,10 +1461,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Some(queue) => {
                         let mut entry = Entry::of(ObjHandle::CommandQueue(queue));
                         let order = self.shared.surface_order.lock().marks(m.obj_id);
-                        entry.queue = Some(QueueCounts {
-                            order,
-                            ..QueueCounts::default()
-                        });
+                        let lane = Lane::new(m.obj_id, Arc::clone(&self.shared.lanes));
+                        entry.queue = Some(QueueCounts::on(lane, order));
                         self.store(m.obj_id, entry);
                         Ok(Ok(()))
                     }

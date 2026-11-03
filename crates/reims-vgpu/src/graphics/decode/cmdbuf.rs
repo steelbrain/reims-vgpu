@@ -41,13 +41,15 @@
 //! **A take on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may be
 //! taken on the thread of the guest's doorbell write instead (`reims_graphics`'s
 //! `Device::mmio_write_taking`), where nothing need be waited for there
-//! ([`GraphicsDecoder::submits_at_take`]): it is begun there ([`GraphicsDecoder::begin_command_buffer`],
-//! which makes its command buffer and fills no device cache, trying each lock it takes), its
-//! `CB_SUBMITTED` posted there once its ticket in the commit order is issued, and its decoder
-//! carried to its queue's service thread, which walks and commits it
-//! ([`GraphicsDecoder::finish_command_buffer`]). A queue's command buffers made
-//! and not completed are counted ([`InFlight`]), so the platform's `commandBuffer`, which waits
-//! while a queue holds 64, does not wait on that thread.
+//! ([`GraphicsDecoder::submits_at_take`], which tries its turn in its queue's lane too): it is
+//! begun there ([`GraphicsDecoder::begin_command_buffer`], which makes its command buffer and
+//! fills no device cache, trying each lock it takes), its `CB_SUBMITTED` posted there once its
+//! ticket in the commit order is issued, and its decoder carried to its queue's service thread,
+//! which hands its walk and commit to the queue's lane ([`GraphicsDecoder::finish_command_buffer`],
+//! [`super::lane`]) as it hands those of every buffer it begins itself
+//! ([`GraphicsDecoder::begin_taken`]). A queue's command buffers made and not completed are
+//! counted ([`InFlight`]), so the platform's `commandBuffer`, which waits while a queue holds 64,
+//! does not wait on that thread.
 //!
 //! **Two kinds of failure.** A message or op that will not parse structurally — a
 //! short message, a bad `len`, an op body too short for a header — is a protocol
@@ -99,6 +101,7 @@ use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
 
 use super::super::completion::{cb_complete, cb_failed};
+use super::lane::{Lane, Turn};
 use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
@@ -256,6 +259,9 @@ pub(crate) struct Begun<P: Platform> {
     behind: bool,
     /// Its context's drain.
     drain: Option<Arc<Drain>>,
+    /// It holds a video encoder, so it is walked in its turn: its session's work starts as it is
+    /// walked, and so in its queue's order.
+    ordered: bool,
 }
 
 impl<P: Platform> Begun<P> {
@@ -267,14 +273,12 @@ impl<P: Platform> Begun<P> {
     }
 }
 
-/// Commits `cb`, counted in its queue's hold first where it is `held`.
+/// Commits `cb`, which holds its queue where it is `held` (counted since its begin), letting the
+/// queue go where the commit fails.
 fn commit_holding<C: CommandBuffer<P>, P: Platform>(
     cb: &C,
     held: Option<&Held>,
 ) -> RaiseResult<()> {
-    if let Some(held) = held {
-        held.queue.fetch_add(1, Ordering::AcqRel);
-    }
     let committed = cb.commit(ON);
     if committed.is_err()
         && let Some(held) = held
@@ -284,8 +288,8 @@ fn commit_holding<C: CommandBuffer<P>, P: Platform>(
     committed
 }
 
-/// A committed command buffer that waits for an event, counted in its queue's hold
-/// ([`GraphicsDecoder`]'s `held_queues`) until it is scheduled, or else finishes.
+/// A command buffer that waits for an event, counted in its queue's hold ([`QueueCounts`]'s
+/// `held`) from its begin until it is scheduled, or else finishes, or goes uncommitted.
 struct Held {
     /// Its queue's count of such buffers not yet scheduled.
     queue: Arc<AtomicUsize>,
@@ -299,6 +303,13 @@ impl Held {
         if !self.released.swap(true, Ordering::AcqRel) {
             self.queue.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+}
+
+impl Drop for Held {
+    /// A buffer never committed, or whose handlers went unrun, lets its queue go.
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -328,13 +339,17 @@ fn submission_handler(
     }))
 }
 
-/// Whether the queue whose counts are `counts` is held, a buffer of it that waits for an event not
-/// yet scheduled; and, where the buffer to commit `waits` for an event (the host's fill of a device
-/// cache among them), its own hold of the queue, which keeps it and the queue's later buffers from
-/// being submitted before it is scheduled, as Metal submits a queue's buffers in order.
+/// Whether the queue whose counts are `counts` is held, a buffer of it begun before that waits for
+/// an event and is not yet scheduled; and, where the buffer begun now `waits` for an event (the
+/// host's fill of a device cache among them), its own hold of the queue, counted from now, which
+/// keeps it and the queue's later buffers from being submitted before it is scheduled, as Metal
+/// submits a queue's buffers in order. It is counted at the buffer's begin, not its commit, so a
+/// buffer of the queue begun before this one commits (its lane walks several at once,
+/// [`super::lane`]) is behind it, as one begun after its commit is.
 fn hold(counts: &QueueCounts, waits: bool) -> (bool, Option<Arc<Held>>) {
     let behind = counts.held.load(Ordering::Acquire) > 0;
     let held = waits.then(|| {
+        counts.held.fetch_add(1, Ordering::AcqRel);
         Arc::new(Held {
             queue: Arc::clone(&counts.held),
             released: AtomicBool::new(false),
@@ -377,6 +392,8 @@ struct Take {
     asks: bool,
     /// The buffers of other queues its first `SURFACE_ORDER` names, where it holds one.
     order: Option<Vec<RgfxSurfaceOrderWait>>,
+    /// The stream holds a video encoder, whose session's work starts as it is walked.
+    video: bool,
 }
 
 /// What the host takes of the op stream `ops` ([`Take`]). The scan stops at an op it cannot step
@@ -406,6 +423,7 @@ fn take(mut ops: &[u8]) -> Take {
                     .collect();
                 out.order = Some(waits);
             }
+            RGFX_OP_ENCODER_BEGIN_VIDEO => out.video = true,
             _ => {}
         }
         ops = &ops[len..];
@@ -549,11 +567,85 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return false;
             }
         }
+        // Its turn in its queue's lane, tried here, so its begin takes no lock it need wait for; a
+        // take not made lets the turn go at once.
+        let Some(turn) = self.turn_on(counts) else {
+            return false;
+        };
         let Some(held) = self.surface_caches.hold_ready(&take.uses) else {
             return false;
         };
+        *self.turn.borrow_mut() = turn;
         *self.held_caches.borrow_mut() = Some(held);
         true
+    }
+
+    /// The command buffer's turn in the lane of the queue whose counts are `counts`
+    /// ([`super::lane`]): `Some(None)` where the queue has no lane, `None` where only tried and
+    /// the lane is busy.
+    fn turn_on(&self, counts: &QueueCounts) -> Option<Option<Turn>> {
+        match &counts.lane {
+            Some(lane) => lane.turn(self.try_only).map(Some),
+            None => Some(None),
+        }
+    }
+
+    /// Begins the `COMMAND_BUFFER` `message` a queue's service thread takes off the ring of the
+    /// queue `queue`, as [`Self::decode_command_buffer`] carries it out up to its walk, which
+    /// [`Self::finish_command_buffer`] does on the queue's lane ([`super::lane`]). Its turn in the
+    /// lane is taken first, after its drain and before anything of it can fail, so its commit,
+    /// its stand-in's or the failure posted for it comes in the order the queue's buffers were
+    /// taken; a context whose work is refused gets [`DecodeError::ContextFailed`], as `decode`
+    /// answers it; and where it gets its `CB_SUBMITTED` at its take, that is posted here, once its
+    /// ticket in the commit order is issued.
+    pub(crate) fn begin_taken(
+        &mut self,
+        device: &P::Device,
+        message: &[u8],
+        queue: Option<u64>,
+    ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
+        self.end_message();
+        let drain = self.command_buffer_drain();
+        if let Some(counts) = queue.and_then(|queue| self.queue_counts(queue))
+            && let Some(turn) = self.turn_on(counts)
+        {
+            *self.turn.borrow_mut() = turn;
+        }
+        if self.context_failed() {
+            return Ok(Err(DecodeError::ContextFailed));
+        }
+        let begun = match self.begin_command_buffer(device, message, drain, true)? {
+            Ok(begun) => begun,
+            Err(e) => return Ok(Err(e)),
+        };
+        if let Some(submitted) = begun.submitted_at_take() {
+            self.issue_ticket(false);
+            submitted.post();
+        }
+        Ok(Ok(begun))
+    }
+
+    /// Waits, with no lock held, for the turns in its queue's lane before the command buffer's
+    /// (one taken before it), where it has one ([`super::lane`]).
+    pub(crate) fn wait_turn(&self) {
+        if let Some(turn) = self.turn.borrow().as_ref() {
+            turn.wait();
+        }
+    }
+
+    /// The lane of the command buffer's queue, where it was given a turn there.
+    pub(crate) fn lane(&self) -> Option<Arc<Lane>> {
+        self.turn
+            .borrow()
+            .as_ref()
+            .map(|turn| Arc::clone(turn.lane()))
+    }
+
+    /// The command buffer's turn in its queue's lane, taken out of the handle, so the caller lets
+    /// go of the rest of what the message holds and keeps its place in its queue's order (a
+    /// failure it posts after).
+    pub(crate) fn take_turn(&mut self) -> Option<Turn> {
+        self.turn.get_mut().take()
     }
 
     /// Begins the `COMMAND_BUFFER` `message`, whose completion handler will hold `drain`: opens a
@@ -583,17 +675,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         // The queue the buffer runs on; a missing or wrong-kind queue is a
         // message-level bad reference (the op stream has not started).
-        let cb = {
-            let Some(ObjHandle::CommandQueue(queue)) = self.named(m.queue_obj_id) else {
-                return Ok(Err(DecodeError::BadReference));
-            };
-            match queue.command_buffer(ON)? {
-                Some(cb) => cb,
-                None => return Ok(Err(DecodeError::Refused)),
-            }
+        let Some(ObjHandle::CommandQueue(queue)) = self.named(m.queue_obj_id) else {
+            return Ok(Err(DecodeError::BadReference));
         };
         let Some(counts) = self.queue_counts(m.queue_obj_id) else {
             return Ok(Err(DecodeError::BadReference));
+        };
+        let Some(cb) = queue.command_buffer(ON)? else {
+            return Ok(Err(DecodeError::Refused));
         };
         let in_flight = InFlight::new(&counts.in_flight);
         let take = take(ops);
@@ -630,6 +719,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             held,
             behind,
             drain,
+            ordered: take.video,
         }))
     }
 
@@ -656,6 +746,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             submitted,
             held,
             drain,
+            ordered,
             ..
         } = begun;
         let Some(ops) = read::<RgfxCommandBuffer>(message).and_then(|m| ops_of(message, &m)) else {
@@ -664,9 +755,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
         let mut events = EventOps::default();
+        if ordered {
+            self.wait_turn();
+        }
         if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
             return Ok(Err(e));
         }
+        // After the buffers of its queue taken before it ([`super::lane`]): its signal of its
+        // queue's surface timeline is decided in its ring's order ([`Self::order_signal`]).
+        self.wait_turn();
         let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, order, &cb)?;
         // Register the submission and completion paths and commit: no scheduled or completed
         // handler, so the platform posts the buffer's records from the threads that submit it
@@ -761,6 +858,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .queue_counts(queue_obj_id)
                 .map(|c| Arc::clone(&c.order));
             let queue = queue.as_ref();
+            self.wait_turn();
             self.order_release(device, queue_obj_id, marks.as_deref(), seqno, names, queue)?;
             return Ok(false);
         }
@@ -774,6 +872,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let Some(cb) = queue.command_buffer(ON)? else {
             let marks = Some(&*counts.order);
+            self.wait_turn();
             self.order_release(device, queue_obj_id, marks, seqno, names, Some(queue))?;
             return Ok(false);
         };
@@ -801,6 +900,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let held = Arc::clone(held);
             cb.add_submission_handler(ON, Box::new(move || held.release()))?;
         }
+        // In its queue's order ([`super::lane`]): its signal, and its commit.
+        self.wait_turn();
         let signalled =
             self.order_signal(device, queue_obj_id, &counts.order, seqno, names, &cb)?;
         let handler = self.completed_handler(
@@ -825,7 +926,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// surface timeline as it ends where it `names` the op or a buffer of another queue waits
     /// past what the queue signalled ([`super::surface_order::SurfaceOrder::signal`]); what its
     /// completed handler then calls. One that holds no op and is waited for by none takes no lock
-    /// ([`Marks::quiet`]).
+    /// ([`Marks::quiet`]). Called in the buffer's turn in its queue's lane ([`super::lane`]), as
+    /// [`Self::order_release`] is, so a queue's buffers note themselves taken in their ring's
+    /// order whatever order their walks end in: the order reads a buffer taken past a seqno as
+    /// every buffer up to it taken ([`super::surface_order`]).
     fn order_signal(
         &self,
         device: &P::Device,

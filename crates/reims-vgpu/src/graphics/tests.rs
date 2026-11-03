@@ -1765,6 +1765,8 @@ type GateState = Arc<(
 
 struct WalkGate {
     state: GateState,
+    /// The ops walked past the gate once a walk took it: other walks' while it is shut.
+    passed: Arc<AtomicU32>,
 }
 
 impl WalkGate {
@@ -1774,7 +1776,8 @@ impl WalkGate {
             reims_vgpu_core::sync::Mutex::new((false, false, false)),
             reims_vgpu_core::sync::Condvar::new(),
         ));
-        let hook = Arc::clone(&state);
+        let passed = Arc::new(AtomicU32::new(0));
+        let (hook, past) = (Arc::clone(&state), Arc::clone(&passed));
         device
             .control
             .decoder()
@@ -1782,7 +1785,11 @@ impl WalkGate {
                 let (lock, moved) = &*hook;
                 let mut s = lock.lock();
                 // (taken by a walk, the walk stopped at it, open)
-                if index != 0 || s.0 {
+                if s.0 {
+                    past.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                if index != 0 {
                     return;
                 }
                 s.0 = true;
@@ -1792,7 +1799,19 @@ impl WalkGate {
                     moved.wait(&mut s);
                 }
             })));
-        WalkGate { state }
+        WalkGate { state, passed }
+    }
+
+    /// Waits, about 3 s at most, for `n` ops to be walked past the gate once a walk took it;
+    /// whether they were.
+    fn passed(&self, n: u32) -> bool {
+        for _ in 0..3000 {
+            if self.passed.load(Ordering::SeqCst) >= n {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 
     /// Waits, about 3 s at most, for a walk to stop at the gate; whether one did.
@@ -2175,6 +2194,177 @@ fn a_queue_s_buffer_runs_beside_another_queue_s_walk() {
     assert!(complete_until_event(&platform, &mut first), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&first.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+}
+
+/// A command buffer with the ops `ops`, each a tag and its body, on queue `queue_obj_id`.
+fn command_buffer_of(queue_obj_id: u64, cb_obj_id: u64, ops: &[(u16, &[u8])]) -> Vec<u8> {
+    use reims_graphics::ops::RgfxOpHeader;
+
+    let mut stream = Vec::new();
+    for &(tag, body) in ops {
+        let header = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: (8 + body.len()) as u32,
+        };
+        stream.extend_from_slice(header.as_bytes());
+        stream.extend_from_slice(body);
+    }
+    let mut bytes = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        queue_obj_id,
+        cb_obj_id,
+        op_bytes: stream.len() as u64,
+    }
+    .as_bytes()
+    .to_vec();
+    bytes.extend(stream);
+    bytes
+}
+
+/// A headless device with queue 1 of process 1 made, its ring, and the process's sampler 4.
+fn one_queue(
+    raised: &Arc<AtomicU32>,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    Guest,
+    QueueRing,
+) {
+    const RING_DATA: u32 = 0x1_0000;
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    let (device, platform) = headless_on(raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let rings = (SUBMIT_OFF, COMPLETE_OFF);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, rings, RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    (device, platform, guest, ring)
+}
+
+/// Two command buffers of one queue are walked at once, and committed in the order they came
+/// (`decode`'s `lane`): the second, sent while the first's walk is stopped at the gate, is walked
+/// whole beside it, and committed only once the first is. They complete in that order
+#[test]
+fn a_queue_s_buffers_are_walked_at_once_and_committed_in_order() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::on(&device);
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the first walk did not start");
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 101, obj(1, 4)));
+    assert!(
+        gate.passed(3),
+        "the second buffer was not walked beside the first"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "the second was committed before the first"
+    );
+    gate.open();
+    committed(&platform, 2);
+    for cb in [100, 101] {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+}
+
+/// A command buffer that asks for its `CB_SUBMITTED`, sent behind one of its queue that waits for
+/// an event and is still being walked, is answered at its scheduling, after that one's, not at its
+/// take: the waiting one holds its queue from its begin, as it would from its commit had it been
+/// carried out whole first (the fake platform schedules each buffer at its commit)
+#[test]
+fn a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling() {
+    use reims_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, mut ring) = one_queue(&raised);
+    guest.send(&device, shared_event_create(obj(1, 7), 0));
+    let wait = RgfxOpEvent {
+        event_obj_id: obj(1, 7),
+        value: 1,
+    };
+    let gate = WalkGate::on(&device);
+    let waits = command_buffer_of(obj(1, 1), 100, &[(RGFX_OP_WAIT_EVENT, wait.as_bytes())]);
+    ring.send(&device, waits);
+    assert!(gate.reached(), "the first walk did not start");
+    ring.send(&device, asking(obj(1, 1), 101));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !ring.has_event(),
+        "answered while the buffer before it is walked"
+    );
+    gate.open();
+    committed(&platform, 2);
+    let bytes = ring.event().expect("a CB_SUBMITTED");
+    let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+    assert_eq!(
+        (posted.header.r#type, posted.cb_obj_id),
+        (RGFX_EVT_CB_SUBMITTED, 101)
+    );
+    assert_eq!(
+        ring.scheduled.first().map(|&(_, cb)| cb),
+        Some(100),
+        "the one before it was scheduled first"
+    );
+}
+
+/// A command buffer that holds a video encoder is walked in its turn, after the buffers of its
+/// queue before it, not beside them: its session's work starts as it is walked. Here its walk
+/// waits for the stopped first buffer, then faults at the encoder (its process holds no session),
+/// and its failure comes after the first's completion
+#[test]
+fn a_video_buffer_is_walked_in_its_turn() {
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
+        RgfxOpVideoPass,
+    };
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::on(&device);
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the first walk did not start");
+    let pass = RgfxOpVideoPass {
+        session_obj_id: obj(1, 9),
+    };
+    let video = command_buffer_of(
+        obj(1, 1),
+        101,
+        &[
+            (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            (RGFX_OP_ENCODER_END, &[]),
+            (RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()),
+        ],
+    );
+    ring.send(&device, video);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        gate.passed.load(Ordering::SeqCst),
+        0,
+        "the video buffer was walked beside the first"
+    );
+    gate.open();
+    assert!(gate.passed(2), "the video buffer was not walked");
+    for (cb, ok) in [(100, true), (101, false)] {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status == RGFX_CB_OK), (cb, ok));
+    }
 }
 
 /// An argument layout query on ring 0 writes the platform's layout into the sender's block and is

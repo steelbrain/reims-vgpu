@@ -38,15 +38,17 @@ use reims_vgpu_core::collections::hasher::KeyBuild;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
+use super::lane::Lane;
 use super::managed::ManagedCopy;
 use super::video::PlanePlace;
 use super::{Drain, ObjHandle, drop_refused};
 
-/// A command queue's counts of the host's command buffers made on it ([`super::cmdbuf`]).
-#[derive(Clone, Default)]
+/// A command queue's counts of the host's command buffers made on it ([`super::cmdbuf`]), and its
+/// lane ([`super::lane`]), which closes as the queue's entry goes.
+#[derive(Default)]
 pub(crate) struct QueueCounts {
-    /// How many of its command buffers that wait for an event are not yet scheduled. A buffer
-    /// committed behind one is not submitted until it is, as Metal's is not.
+    /// How many of its command buffers that wait for an event are begun and not yet scheduled. A
+    /// buffer committed behind one is not submitted until it is, as Metal's is not.
     pub(crate) held: Arc<AtomicUsize>,
     /// How many command buffers the host made on it have not completed (a take on a doorbell's
     /// thread).
@@ -54,6 +56,30 @@ pub(crate) struct QueueCounts {
     /// Its marks in the surface order, which a command buffer that holds no op reads and writes
     /// with no lock ([`super::surface_order::Marks`]).
     pub(crate) order: Arc<super::surface_order::Marks>,
+    /// Where its command buffers' walks and commits run, each in its turn; `None` for a queue
+    /// whose buffers are carried out whole where they are taken (the decoder's own tests).
+    pub(crate) lane: Option<Arc<Lane>>,
+}
+
+impl QueueCounts {
+    /// A queue's counts, its command buffers carried out on `lane`, its marks in the surface order
+    /// `order`.
+    pub(crate) fn on(lane: Arc<Lane>, order: Arc<super::surface_order::Marks>) -> QueueCounts {
+        QueueCounts {
+            held: Arc::default(),
+            in_flight: Arc::default(),
+            order,
+            lane: Some(lane),
+        }
+    }
+}
+
+impl Drop for QueueCounts {
+    fn drop(&mut self) {
+        if let Some(lane) = &self.lane {
+            lane.close();
+        }
+    }
 }
 
 /// One object of a context's, as made. Its fields drop in their order: a `Managed` object's CPU

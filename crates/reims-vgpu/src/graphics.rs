@@ -28,7 +28,8 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
+use parking_lot::lock_api::ArcRwLockReadGuard;
+use parking_lot::{RawRwLock, RwLock};
 use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
@@ -73,7 +74,7 @@ use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::worker::{Unsettled, Worker};
 use crate::graphics::decode::{
-    CompletionSink, DecodeError, Decoders, FailedContexts, GraphicsDecoder, LibraryJob,
+    Begun, CompletionSink, DecodeError, Decoders, FailedContexts, GraphicsDecoder, LibraryJob,
     LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, Sinks,
     SubmittedSink, compile_refusing, complete, make_library, refused_reply, refusing,
 };
@@ -706,9 +707,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ///
     /// A pipeline or library create is made on the compile pool instead
     /// ([`Self::start_pipeline`], [`Self::start_library`]), and a command buffer that names a
-    /// pipeline still compiling waits for it first (`compile`). An indirect command buffer's
-    /// create is made on the ICB thread ([`Self::start_icb`]), and the destroy of one still being
-    /// made waits for it. A library lookup is answered here ([`Self::lookup_library`]).
+    /// pipeline still compiling waits for it first (`compile`), and is then begun here and walked
+    /// and committed on its queue's lane ([`Self::begin_command_buffer`]). An indirect command
+    /// buffer's create is made on the ICB thread ([`Self::start_icb`]), and the destroy of one
+    /// still being made waits for it. A library lookup is answered here
+    /// ([`Self::lookup_library`]).
     fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
         match r#type {
@@ -740,7 +743,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.start_icb(poster, message);
                 return;
             }
-            RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
+            RGFX_CMD_COMMAND_BUFFER => {
+                self.pending.wait_for_command_buffer(message);
+                if !foreign_queue(poster, message) {
+                    self.begin_command_buffer(poster, message);
+                    return;
+                }
+            }
             RGFX_CMD_ICB_WRITE => self.pending.wait_for_icb_write(message),
             // The destroy of an indirect command buffer still being made (the kext destroys
             // behind a create it stopped waiting for, after a minute, or one made for a context
@@ -892,19 +901,90 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
+    /// A `COMMAND_BUFFER` `message` of the process's own queue, which `poster` posts onto, on the
+    /// queue's service thread ([`Self::handle_stage3`]): begun here, its turn in its queue's lane
+    /// taken first and its `CB_SUBMITTED` posted where it gets it at its take
+    /// ([`GraphicsDecoder::begin_taken`]), then walked and committed on the lane, in its turn
+    /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile.
+    fn begin_command_buffer(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+        entry::run(|_| {
+            // Held to the end of the buffer's work, on its lane ([`Self::reset_gate`]).
+            let carried = self.reset_gate.read_arc();
+            // Of a queue the device's reset ended, which the decoder's reset dropped, or is to
+            // drop: nothing of it is carried out, and nothing is owed.
+            if poster.stale() {
+                return;
+            }
+            let mut decoder =
+                (self.decoders).sender(Some(sender_context(poster, message)), self.sinks(poster));
+            let begun =
+                refusing(|| decoder.begin_taken(&self.device, message, poster.queue_obj_id()));
+            self.carry_out(decoder, begun, carried, poster.clone(), message.to_vec());
+        });
+    }
+
+    /// The rest of the `COMMAND_BUFFER` `message`'s work once it is begun (`begun`, on `decoder`),
+    /// on its queue's lane where it took a turn there ([`GraphicsDecoder::lane`]), else here: it
+    /// is walked and committed in its turn ([`GraphicsDecoder::finish_command_buffer`]), stood in
+    /// for where it was not carried out, and reported through `poster` as
+    /// [`Self::handle_stage3`] reports a message, its failure posted in its turn too. The decoder
+    /// lets go of what the message holds, and `carried` of the reset gate, before the report,
+    /// which may wait for room on the ring.
+    fn carry_out(
+        self: &Arc<Self>,
+        decoder: GraphicsDecoder<P>,
+        begun: RaiseResult<Result<Begun<P>, DecodeError>>,
+        carried: ArcRwLockReadGuard<RawRwLock, ()>,
+        poster: CompletionPoster,
+        message: Vec<u8>,
+    ) {
+        let lane = decoder.lane();
+        let control = Arc::clone(self);
+        let job = move || {
+            entry::run(|_| {
+                let mut decoder = decoder;
+                let outcome = match begun {
+                    Ok(Ok(begun)) => {
+                        refusing(|| decoder.finish_command_buffer(&control.device, &message, begun))
+                    }
+                    Ok(Err(e)) => Ok(Err(e)),
+                    Err(raise) => Err(raise),
+                };
+                let stood_in = !matches!(outcome, Ok(Ok(())))
+                    && matches!(
+                        refusing(|| decoder.stand_in_for_failed(&control.device, &message)),
+                        Ok(true)
+                    );
+                // A failure posted below comes after the commits of the buffers before it.
+                if !matches!(outcome, Ok(Ok(()))) && !stood_in {
+                    decoder.wait_turn();
+                }
+                let turn = decoder.take_turn();
+                drop(decoder);
+                drop(carried);
+                control.report(&poster, &message, outcome, stood_in);
+                drop(turn);
+            });
+        };
+        match lane {
+            Some(lane) => lane.run(Box::new(job)),
+            None => job(),
+        }
+    }
+
     /// [`Host::take_command_buffer`]: takes the `COMMAND_BUFFER` `message` of the queue `poster`
     /// posts onto, on a doorbell's thread, where it gets its `CB_SUBMITTED` at its take
     /// ([`GraphicsDecoder::submits_at_take`]) and nothing need be waited for: it runs on that
     /// queue, every lock of the decoder's it takes is free, each tried, and no pipeline it names is
-    /// still compiling. It is begun here, its command buffer made and its sinks pointed at the
-    /// queue's ring, as [`Self::handle_stage3`] begins it, and its decoder is carried to the
-    /// queue's service thread with the rest of its work, which walks and commits it, then reports
-    /// a failure as `handle_stage3` does. Its `CB_SUBMITTED` is posted here, waiting for nothing,
-    /// once its ticket in the commit order is issued, which the guest's later buffers are
-    /// committed after (`decode`'s `sequencer`); else by the service thread before the walk. A
-    /// buffer the platform refused at its make gets none, and its failure on the service thread.
-    /// A take that is not made lets go of what it took, under locks each held for a short section
-    /// only.
+    /// still compiling. It is begun here, its turn in its queue's lane taken, its command buffer
+    /// made and its sinks pointed at the queue's ring, as [`Self::begin_command_buffer`] begins
+    /// it, and its decoder is carried to the queue's service thread with the rest of its work,
+    /// which the thread hands to the lane ([`Self::carry_out`]). Its `CB_SUBMITTED` is posted
+    /// here, waiting for nothing, once its ticket in the commit order is issued, which the guest's
+    /// later buffers are committed after (`decode`'s `sequencer`); else by the service thread
+    /// before it hands the rest over. A buffer the platform refused at its make gets none, and its
+    /// failure in its turn. A take that is not made lets go of what it took, its turn among them,
+    /// under locks each held for a short section only.
     fn take_command_buffer(
         self: &Arc<Self>,
         poster: &CompletionPoster,
@@ -949,21 +1029,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     decoder.issue_ticket(false);
                     submitted.post();
                 }
-                let outcome = match begun {
-                    Ok(Ok(begun)) => {
-                        refusing(|| decoder.finish_command_buffer(&control.device, &message, begun))
-                    }
-                    Ok(Err(e)) => Ok(Err(e)),
-                    Err(raise) => Err(raise),
-                };
-                let stood_in = !matches!(outcome, Ok(Ok(())))
-                    && matches!(
-                        refusing(|| decoder.stand_in_for_failed(&control.device, &message)),
-                        Ok(true)
-                    );
-                drop(decoder);
-                drop(carried);
-                control.report(&poster, &message, outcome, stood_in);
+                control.carry_out(decoder, begun, carried, poster, message);
             });
         });
         Some(Taken { post, rest })
