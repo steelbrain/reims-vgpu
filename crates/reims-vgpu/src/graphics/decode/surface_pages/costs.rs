@@ -149,6 +149,7 @@ fn surface_runs(rng: &mut XorShift, ram: u64, length: u64, run: u64) -> Vec<Rgfx
 struct Step(Vec<Duration>);
 
 impl Step {
+    #[allow(clippy::disallowed_methods)] // a measurement of real platforms: the wall clock's time
     fn time<T>(&mut self, f: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let out = f();

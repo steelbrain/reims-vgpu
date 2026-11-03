@@ -2482,7 +2482,10 @@ pub(crate) mod tests {
         let second = HostPtr::from_addr(at.addr() + 0x1000);
         assert!(vm.protect_max(second, PAGE, VmProt::READ).is_ok());
         let checked = buffer();
-        assert!(queried() > before, "a twin, not vouched for: the runtime asked");
+        assert!(
+            queried() > before,
+            "a twin, not vouched for: the runtime asked"
+        );
         drop(checked);
         assert!(vm.deallocate(at, 2 * PAGE).is_success());
     }
