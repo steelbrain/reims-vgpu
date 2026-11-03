@@ -637,6 +637,8 @@ sit in BAR0 from 0x800.
 | 0x024 | `DRIVER_FEATURES_LO` | RW | feature bits 0-31 the guest's driver takes; reads back the ones the host took ("Negotiated features", below) |
 | 0x028 | `DRIVER_FEATURES_HI` | RW | feature bits 32-63, likewise |
 | 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
+| 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without the feature |
+| 0x034 | `DEFERRED_BUDGET_HI` | RO | its high 32 bits |
 
 **The wire's version.** `VERSION` reads `RGFX_VERSION`
 (`crates/reims-graphics/src/wire.rs`), the version of the wire the host
@@ -744,6 +746,11 @@ only where no negotiation can carry it.
 - Bit 18 is `COMMIT_ORDER`: a command buffer is committed after the buffers of
   its process's other queues it names (`RGFX_OP_COMMIT_ORDER`; "Commit order",
   below).
+- Bit 19 is `SURFACE_DEFERRED`, which means nothing without `SURFACE_CACHE`:
+  a fresh cached surface only the GPU touches gets no guest pages until a CPU
+  lock needs them (`RGFX_SURFACE_PAGES_DEFERRED` and `_ATTACH`; `wire.rs`). A
+  host offers it where it offers `SURFACE_CACHE`, with its budget in
+  `DEFERRED_BUDGET_LO` and `_HI`.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

@@ -59,8 +59,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 /// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
-/// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`] and [`RGFX_FEATURE_COMMIT_ORDER`]).
-/// Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`] and
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`]). Bits 9 and 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -161,6 +161,14 @@ pub const RGFX_FEATURE_ICB_SLOTS: u32 = 1 << 17;
 /// the platform after the buffers of its process's other queues posted before it, as Metal orders a
 /// tracked resource across queues by commit.
 pub const RGFX_FEATURE_COMMIT_ORDER: u32 = 1 << 18;
+/// `FEATURES_LO` bit 19, `SURFACE_DEFERRED`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`], and which means nothing without
+/// [`RGFX_FEATURE_SURFACE_CACHE`]: a `SURFACE_PAGES` may carry [`RGFX_SURFACE_PAGES_DEFERRED`], a
+/// cached block whose surface has no pages yet, its contents in the device cache alone, and a later
+/// one [`RGFX_SURFACE_PAGES_ATTACH`], which names its pages. The host offers it where it offers
+/// `SURFACE_CACHE`, and says in [`RGFX_REG_DEFERRED_BUDGET_LO`] how many bytes of its GPU's memory
+/// such caches may hold.
+pub const RGFX_FEATURE_SURFACE_DEFERRED: u32 = 1 << 19;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -182,6 +190,16 @@ pub const RGFX_REG_DRIVER_FEATURES_HI: u32 = 0x028;
 /// for room ([`RGFX_FEATURE_CONSUMED_DOORBELL`]). The host does not handle it yet: it reads 0 and
 /// ignores a write, as at any offset it does not know.
 pub const RGFX_REG_CONSUMED: u32 = 0x02c;
+/// `DEFERRED_BUDGET_LO`, RO: the bytes of the host GPU's memory the device caches of deferred
+/// blocks ([`RGFX_FEATURE_SURFACE_DEFERRED`]) may hold at once, held and dormant, its low 32 bits:
+/// a quarter of the budget of the GPU's device-local memory (`VK_EXT_memory_budget`'s heap budget
+/// where the device has it, else a quarter of the heap's size), read once at the device's start
+/// and the same for its life, so the kext's one read at its start holds. The kext defers no block
+/// past it, and lets dormant deferred blocks go past half of it. It reads 0 where the host does
+/// not offer the feature, as at any offset a host does not know.
+pub const RGFX_REG_DEFERRED_BUDGET_LO: u32 = 0x030;
+/// `DEFERRED_BUDGET_HI`, RO: [`RGFX_REG_DEFERRED_BUDGET_LO`]'s high 32 bits.
+pub const RGFX_REG_DEFERRED_BUDGET_HI: u32 = 0x034;
 /// What `MAGIC` reads: "RGFX", little-endian.
 pub const RGFX_MAGIC: u32 = 0x5846_4752;
 /// What `VERSION` reads: the wire's version, which every change a guest built before it would
@@ -602,6 +620,14 @@ pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
 /// device has [`RGFX_FEATURE_SURFACE_CACHE`], an [`RgfxSurfacePagesCache`] may follow the message
 /// at [`RGFX_SURFACE_PAGES_CACHE_OFFSET`], whose [`RGFX_SURFACE_PAGES_CACHED`] gives the block a
 /// device cache.
+///
+/// Where the guest took [`RGFX_FEATURE_SURFACE_DEFERRED`], a cached block may be deferred
+/// ([`RGFX_SURFACE_PAGES_DEFERRED`]): its message has `run_count` 0, and the host makes its device
+/// cache, zeros, with no view, and answers [`RGFX_STATUS_OK`], or [`RGFX_STATUS_REFUSED`] where it
+/// made no cache, and the kext then names the block's pages as above. The kext keeps the surface's
+/// pages unwired meanwhile. Its first CPU lock that needs the pages posts a second `SURFACE_PAGES`
+/// of the block, [`RGFX_SURFACE_PAGES_ATTACH`], with the runs, and the host takes them for the
+/// cache, which keeps its bytes and the CPU's generation it holds.
 pub const RGFX_CMD_SURFACE_PAGES: u32 = 0x2f6;
 /// `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
 /// device has [`RGFX_FEATURE_SURFACE_CACHE`]: a CPU lock of the IOSurface whose cached block is at
@@ -1269,6 +1295,22 @@ pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
 /// its view stays out of the host's surface-view cache. The block holds the runs alone, of pages
 /// the kext wired for the block's context, and the host takes no device cache for it.
 pub const RGFX_SURFACE_PAGES_PRIVATE: u32 = 1 << 1;
+/// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_CACHED`], where the guest took
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`]: the block's surface has no pages yet (a fresh surface no CPU
+/// lock and no other device has touched), and its contents live in the device cache alone, as a
+/// GPU of its own memory keeps a surface only the GPU uses. The message has `run_count` 0; the
+/// host makes the cache, fills it with zeros before any use, holds the CPU's generation 0, and
+/// makes no view and watches no pages. Its `BLOCK_RELEASE` copies nothing, there being no pages
+/// (the kext names them first where the surface still lives). Answered [`RGFX_STATUS_REFUSED`]
+/// where the host made no cache (its GPU's memory, or its budget, is spent).
+pub const RGFX_SURFACE_PAGES_DEFERRED: u32 = 1 << 2;
+/// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_CACHED`]: the pages of a deferred
+/// block ([`RGFX_SURFACE_PAGES_DEFERRED`]), which the kext wired at the surface's first CPU lock
+/// that needs them, in `run_count` runs as for any block. The host takes them for the block's
+/// cache, which keeps its bytes, the CPU's generation it holds and whether a buffer wrote it since,
+/// so the `SURFACE_DOWNLOAD` that follows copies what the GPU wrote. Answered
+/// [`RGFX_STATUS_INVALID_ARGUMENT`] for a block with no deferred cache.
+pub const RGFX_SURFACE_PAGES_ATTACH: u32 = 1 << 3;
 
 /// What a `SURFACE_PAGES` says of its block's device cache, after the [`RgfxSurfacePages`] at
 /// [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
@@ -1277,7 +1319,8 @@ pub const RGFX_SURFACE_PAGES_PRIVATE: u32 = 1 << 1;
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
 pub struct RgfxSurfacePagesCache {
-    /// `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`] and [`RGFX_SURFACE_PAGES_PRIVATE`].
+    /// `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`], [`RGFX_SURFACE_PAGES_PRIVATE`],
+    /// [`RGFX_SURFACE_PAGES_DEFERRED`] and [`RGFX_SURFACE_PAGES_ATTACH`].
     pub flags: u32,
     /// Zero.
     pub reserved_04: u32,
