@@ -38,6 +38,15 @@ void installHooks(KernelPatcher &patcher);
 
 // Run once at boot: wait for the Data volume, then install/replace the bundle
 // in kernel context if missing or different. No-op in the installer/Recovery.
+// It publishes the pass on IOResources as kInstallDoneKey: false from its start,
+// true once the pass has ended, on every path, so the accelerator registers
+// only for a bundle the pass has finished with (RgfxAccelerator.cpp, "the
+// bundle").
 void startInstaller();
+
+// The IOResources property the install pass publishes (above); the
+// accelerator's kRgfxGateInstallDoneKey (RgfxBundlePaths.hpp), kept in step by
+// hand.
+static constexpr const char *kInstallDoneKey = "RgfxGateInstallDone";
 
 } // namespace rgfxgate

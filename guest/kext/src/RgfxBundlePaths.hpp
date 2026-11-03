@@ -3,7 +3,8 @@
  * (RgfxAccelerator.cpp, "the bundle"): the executable Metal loads, and the marker
  * the bundle's package carries for the wire's version it speaks
  * (guest/bundle/Makefile, `package`), both under /Library/GPUBundles/NAME.bundle,
- * NAME the accelerator's MetalPluginName.
+ * NAME the accelerator's MetalPluginName; and when what it finds there counts,
+ * given RgfxGate's install pass.
  *
  * The bundle maps the region and speaks the messages, so it must be of the
  * kext's wire version (design.md, "The wire's version"). The kext registers the
@@ -41,6 +42,30 @@ inline bool rgfxBundlePaths(const char *name, unsigned version, RgfxBundlePaths 
 	                      version);
 	return executable >= 0 && static_cast<size_t>(executable) < sizeof(paths->executable) &&
 	       marker >= 0 && static_cast<size_t>(marker) < sizeof(paths->marker);
+}
+
+// The IOResources property RgfxGate publishes for its install pass (guest/rgfxgate, RgfxGate.hpp's
+// kInstallDoneKey, kept in step by hand): false from the pass's start, true once it has ended. A
+// guest without RgfxGate has none.
+#define kRgfxGateInstallDoneKey "RgfxGateInstallDone"
+
+// RgfxGate's install pass, as its property gives it.
+enum RgfxGatePass : unsigned {
+	// No property: no RgfxGate, or one older than the property.
+	kRgfxGateAbsent,
+	// The pass is under way.
+	kRgfxGateInstalling,
+	// The pass has ended.
+	kRgfxGateDone,
+};
+
+// Whether the accelerator registers for what a check finds: its own bundle on disk (`ours`, the
+// executable with this kext's marker), and no install pass of RgfxGate's under way. A pass under
+// way may be about to rewrite the bundle under the marker an older pass left (an update that keeps
+// the wire version), so a bundle found then does not count.
+inline bool rgfxBundleRegisters(RgfxGatePass gate, bool ours)
+{
+	return gate != kRgfxGateInstalling && ours;
 }
 
 #endif // RGFX_BUNDLE_PATHS_HPP_

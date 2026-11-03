@@ -12,11 +12,14 @@
 // place. The writes are admitted by the vnode hooks (RgfxGateHooks.cpp) only
 // while gInstalling is set on this thread and the target is under the bundle
 // path; the tag, the unlock and the marker drop run below the MAC layer, as the
-// directory creates do. In the installer/Recovery the kext does nothing.
+// directory creates do. In the installer/Recovery the kext does nothing. The
+// pass is published on IOResources from its start to its end (RgfxGate.hpp), and
+// the accelerator registers only once it has ended.
 #include <Headers/kern_file.hpp>
 #include <Headers/kern_util.hpp>
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOService.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/thread_act.h>
@@ -371,6 +374,12 @@ static void doInstall() {
 	       ok ? "complete" : "FAILED");
 }
 
+// Publishes the install pass on IOResources (RgfxGate.hpp): `done` false while
+// it runs, true once it has ended.
+static void publishPass(bool done) {
+	IOService::publishResource(kInstallDoneKey, done ? kOSBooleanTrue : kOSBooleanFalse);
+}
+
 static void installEntry(void *, wait_result_t) {
 	// Wait for the Data volume to mount, then install. /Library/Preferences only
 	// exists once Data is up, so waiting on it (rather than /Library, a firmlink
@@ -398,17 +407,21 @@ static void installEntry(void *, wait_result_t) {
 		doInstall();
 	else
 		SYSLOG("rgfxgate", "Data volume never appeared; no install");
+	publishPass(true);
 	if (ready)
 		keepVideoPreference();
 	thread_terminate(current_thread());
 }
 
 void startInstaller() {
+	publishPass(false);
 	thread_t t = nullptr;
 	if (kernel_thread_start(installEntry, nullptr, &t) == KERN_SUCCESS)
 		thread_deallocate(t);
-	else
+	else {
 		SYSLOG("rgfxgate", "could not start install thread");
+		publishPass(true);
+	}
 }
 
 } // namespace rgfxgate

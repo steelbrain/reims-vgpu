@@ -42,6 +42,14 @@ int main()
 	std::string fits(80, 'f');
 	CHECK(rgfxBundlePaths(fits.c_str(), 4294967295u, &paths));
 	CHECK(std::strstr(paths.marker, "wire-version-4294967295") != nullptr);
+	// What counts on disk, given RgfxGate's pass: the bundle, once no pass is under way.
+	CHECK(rgfxBundleRegisters(kRgfxGateAbsent, true));
+	CHECK(rgfxBundleRegisters(kRgfxGateDone, true));
+	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, true));
+	CHECK(!rgfxBundleRegisters(kRgfxGateAbsent, false));
+	CHECK(!rgfxBundleRegisters(kRgfxGateDone, false));
+	CHECK(!rgfxBundleRegisters(kRgfxGateInstalling, false));
+	CHECK(!std::strcmp(kRgfxGateInstallDoneKey, "RgfxGateInstallDone"));
 	std::printf("bundle_paths_test: OK (%d checks)\n", checks);
 	return 0;
 }

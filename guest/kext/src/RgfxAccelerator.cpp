@@ -52,11 +52,23 @@ OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
 // kext's RGFX_VERSION counts as the bundle on disk. A bundle of another version is left as if
 // there were none, so WindowServer composites in software: a bundle that refused to make a
 // device under a registered accelerator would leave WindowServer aborting, as with no bundle.
+//
+// Where RgfxGate installs the bundle, nothing on disk counts while its install pass is under way
+// (rgfxBundleRegisters): an update that keeps the wire version finds the old bundle and its
+// marker before the pass drops the marker and rewrites the files. The pass publishes itself on
+// IOResources (kRgfxGateInstallDoneKey), and the check looks again until it has ended. The
+// settling connection waits up to kGatePassWaitMs for a pass under way; one still under way then
+// leaves the accelerator unregistered for the boot. Without RgfxGate there is no property, and
+// the check registers for what it finds.
 namespace {
 // How often the check repeats until the bundle is found or WindowServer settles it.
 constexpr UInt32 kBundleCheckMs = 100;
 // How long the settling connection waits for a registration in flight to finish.
 constexpr UInt32 kBundleRegisterWaitMs = 5000;
+// How long the settling connection waits for RgfxGate's install pass to end, and how often it
+// looks.
+constexpr UInt32 kGatePassWaitMs = 5000;
+constexpr UInt32 kGatePassLookMs = 10;
 
 enum : UInt32 {
 	// The check repeats.
@@ -128,6 +140,19 @@ bool onDisk(const char *path, vfs_context_t context)
 	return !error;
 }
 
+// RgfxGate's install pass, from its property on IOResources (above).
+RgfxGatePass gatePass()
+{
+	IOService *resources = IOService::getResourceService();
+	OSObject *value = resources ? resources->copyProperty(kRgfxGateInstallDoneKey) : nullptr;
+	OSBoolean *done = OSDynamicCast(OSBoolean, value);
+	RgfxGatePass pass = !done ? kRgfxGateAbsent
+	                          : done->isTrue() ? kRgfxGateDone : kRgfxGateInstalling;
+	if (value)
+		value->release();
+	return pass;
+}
+
 // Which bundle is on disk (above); none before the root file system is mounted.
 BundleFound bundleOnDisk()
 {
@@ -169,7 +194,10 @@ void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 	IOLockLock(bundle.lock);
 	bundle.running = true;
 	IOLockUnlock(bundle.lock);
-	bool found = bundleOnDisk() == kBundleOurs;
+	// The pass first: once it has ended, the disk holds what it left.
+	const RgfxGatePass gate = gatePass();
+	bool found = rgfxBundleRegisters(gate, gate != kRgfxGateInstalling &&
+	                                           bundleOnDisk() == kBundleOurs);
 	IOLockLock(bundle.lock);
 	bool watching = bundle.state == kBundleWatching;
 	if (watching && found)
@@ -219,12 +247,21 @@ bool RgfxAccelerator::watchBundle()
 void RgfxAccelerator::settleBundle()
 {
 	if (bundleState() == kBundleWatching) {
-		BundleFound found = bundleOnDisk();
-		if (found == kBundleOurs) {
+		RgfxGatePass gate = gatePass();
+		for (UInt32 waited = 0; gate == kRgfxGateInstalling && waited < kGatePassWaitMs;
+		     waited += kGatePassLookMs) {
+			IOSleep(kGatePassLookMs);
+			gate = gatePass();
+		}
+		BundleFound found = gate == kRgfxGateInstalling ? kBundleAbsent : bundleOnDisk();
+		if (rgfxBundleRegisters(gate, found == kBundleOurs)) {
 			if (leaveWatching(kBundleRegistering))
 				registerAccelerator(this, " as WindowServer opens the display");
 		} else if (leaveWatching(kBundleSettled)) {
-			if (found == kBundleOtherVersion)
+			if (gate == kRgfxGateInstalling)
+				IOLog("RgfxAccelerator: RgfxGate's install pass has not ended as WindowServer "
+				      "opens the display: not registered this boot\n");
+			else if (found == kBundleOtherVersion)
 				IOLog("RgfxAccelerator: the bundle at %s is not of wire version %u (no %s) as "
 				      "WindowServer opens the display: not registered this boot. The bundle, the "
 				      "kext and the host must come from one build.\n",
