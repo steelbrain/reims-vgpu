@@ -42,3 +42,22 @@ static inline bool rgfx_path_under(const char *path, const char *prefix) {
 	char c = path[pl];
 	return c == '\0' || c == '/';
 }
+
+// out = path immediately followed by suffix, NUL-terminated; true only when the
+// whole thing (with its terminator) fits in cap, and nothing is written when it
+// does not. The install forms the staging sibling of the bundle path this way
+// (".../NAME.bundle" + ".new"): it writes the new tree there and renames it over
+// the live bundle, so a reader sees the whole old tree or the whole new one,
+// never a half-written one (RgfxGateInstall.cpp).
+static inline bool rgfx_sibling_path(const char *path, const char *suffix,
+                                     char *out, size_t cap) {
+	if (path == NULL || suffix == NULL || out == NULL || cap == 0)
+		return false;
+	size_t pl = strlen(path), sl = strlen(suffix);
+	if (pl + sl + 1 > cap)
+		return false;
+	memcpy(out, path, pl);
+	memcpy(out + pl, suffix, sl);
+	out[pl + sl] = '\0';
+	return true;
+}

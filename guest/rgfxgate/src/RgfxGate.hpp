@@ -49,4 +49,12 @@ void startInstaller();
 // hand.
 static constexpr const char *kInstallDoneKey = "RgfxGateInstallDone";
 
+// Rename `from` onto `to` below the vn_* MAC layer (RgfxGateInstall.cpp). With
+// swap, both must exist and are exchanged atomically (VFS_RENAME_SWAP);
+// otherwise `from` replaces `to`, which need not exist. Returns success. The
+// install uses it to swap the staged bundle into place; the AppleGVA preference
+// writer uses it to replace the plist atomically.
+bool rgfxRenameNode(const char *from, const char *to, bool swap,
+                    vfs_context_t ctx);
+
 } // namespace rgfxgate

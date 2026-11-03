@@ -43,6 +43,30 @@ int main() {
 	assert(!rgfx_path_under(nullptr, root));
 	assert(!rgfx_path_under("/Library/GPUBundles", ""));
 
+	// --- staging sibling path -----------------------------------------------
+	const char *bundle = "/Library/GPUBundles/reims-graphics.bundle";
+	char buf[64];
+	// The sibling is the bundle path with the suffix appended, under the same
+	// container, so the install's writes to it are admitted and the rename
+	// stays on one volume.
+	assert(rgfx_sibling_path(bundle, ".new", buf, sizeof(buf)));
+	assert(strcmp(buf, "/Library/GPUBundles/reims-graphics.bundle.new") == 0);
+	assert(rgfx_path_under(buf, root));
+	// An exact fit (path + suffix + terminator == cap) is written.
+	char tight[46]; // strlen(bundle)=41, +".new"=45, +'\0'=46
+	assert(rgfx_sibling_path(bundle, ".new", tight, sizeof(tight)));
+	assert(strcmp(tight, "/Library/GPUBundles/reims-graphics.bundle.new") == 0);
+	// One byte short leaves the buffer untouched and reports failure.
+	char small[45];
+	small[0] = 'Z';
+	assert(!rgfx_sibling_path(bundle, ".new", small, sizeof(small)));
+	assert(small[0] == 'Z');
+	// Null arguments and a zero cap are refused.
+	assert(!rgfx_sibling_path(nullptr, ".new", buf, sizeof(buf)));
+	assert(!rgfx_sibling_path(bundle, nullptr, buf, sizeof(buf)));
+	assert(!rgfx_sibling_path(bundle, ".new", nullptr, sizeof(buf)));
+	assert(!rgfx_sibling_path(bundle, ".new", buf, 0));
+
 	printf("rgfxgate match_test: all assertions passed\n");
 	return 0;
 }

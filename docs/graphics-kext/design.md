@@ -1569,17 +1569,25 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
 - **Bundle updates.** The marker beside the executable (below, "Registration
   waits for the bundle") carries the kext's wire version, and the bundle is the
   kext's own payload, so a newer kext whose executable or wire version differs
-  replaces the installed bundle in place: it drops the marker first (so a
-  half-written bundle never registers), clears the storage class and restricted
-  flag off the existing tree so the writes land, rewrites the files and the
-  marker last, then re-tags. A bundle that is byte-current but untagged — staged
-  by a tool under relaxed SIP and then first seen on a SIP-on boot — is detected
-  and tagged without a rewrite. The test is the bundle directory's storage
-  class and restricted flag together: a bundle copied into the restricted
-  container is given the flag but not the class, and the class is what Metal
-  reads. Userspace cannot remove the class even with SIP off, so only the kext
-  writes or clears it. A current, tagged bundle is left as it is, and the boot
-  writes nothing.
+  replaces the installed bundle. The replacement is atomic: the whole new tree
+  is built and tagged in a sibling staging directory (`NAME.bundle.new`), then
+  put in place with a single rename — an existing bundle is exchanged with it
+  (`VNOP_RENAMEX`, `VFS_RENAME_SWAP`) and the old tree, swapped aside, dropped;
+  where there is none the staged tree is moved in. A reader (WindowServer, a
+  Metal helper) therefore sees either the whole old bundle or the whole new
+  one, never a half-written one, so an upgrade that keeps the wire version
+  cannot leave a torn executable mid-boot (the "RgfxGate rewrite race"). The
+  container is never unlocked, so SIP is not widened around it even mid-upgrade.
+  A bundle that is byte-current but untagged — staged by a tool under relaxed
+  SIP and then first seen on a SIP-on boot — is detected and tagged in place
+  without a rewrite. The test is the bundle directory's storage class and
+  restricted flag together: a bundle copied into the restricted container is
+  given the flag but not the class, and the class is what Metal reads.
+  Userspace cannot remove the class even with SIP off, so only the kext writes
+  or clears it. A current, tagged bundle is left as it is, and the boot writes
+  nothing. The accelerator, in turn, registers only once RgfxGate has signalled
+  that its install pass has ended, so it never registers against a tree
+  mid-swap.
 - **Device class.** The bundle's device subclasses Apple's private IOAccel
   Metal base class and conforms to `<MTLDevice, MTLDeviceSPI>`; entry
   `-initWithAcceleratorPort:` (may return `nil` to decline). The base fills the

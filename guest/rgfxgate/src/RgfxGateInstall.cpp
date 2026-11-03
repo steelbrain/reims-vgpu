@@ -2,19 +2,23 @@
 // accelerator looks for a GPU bundle, the kext writes its embedded
 // reims-graphics.bundle to /Library/GPUBundles in kernel context and gives the
 // tree the SIP rootless storage class a stock host carries there, so the Metal
-// loader trusts it (RgfxGate.hpp). It writes the executable before the
-// wire-version marker the accelerator keys on, so a half-written bundle never
-// registers, and creates the container first if the Data volume lacks it.
-// Later boots are no-ops once the bundle is current and tagged. A newer kext
-// whose embedded executable differs replaces the bundle: it unlocks the tagged
-// tree, drops the marker, then rewrites and re-tags. A bundle that is current
-// but untagged -- staged under relaxed SIP, then booted SIP-on -- is tagged in
-// place. The writes are admitted by the vnode hooks (RgfxGateHooks.cpp) only
-// while gInstalling is set on this thread and the target is under the bundle
-// path; the tag, the unlock and the marker drop run below the MAC layer, as the
-// directory creates do. In the installer/Recovery the kext does nothing. The
-// pass is published on IOResources from its start to its end (RgfxGate.hpp), and
-// the accelerator registers only once it has ended.
+// loader trusts it (RgfxGate.hpp). The write is atomic: the whole tree is built
+// and tagged in a sibling staging directory (NAME.bundle.new), then renamed
+// over the live bundle, so a reader sees either the whole old tree or the whole
+// new one, never a half-written one. The container is created first if the Data
+// volume lacks it. Later boots are no-ops once the bundle is current and
+// tagged. A newer kext whose embedded executable differs -- even at the same
+// wire version -- replaces the bundle the same way: the staged tree is swapped
+// in with a single rename (VNOP_RENAMEX, exchanging it with the live tree) and
+// the old tree, swapped aside, is dropped. The container is never unlocked, so
+// SIP is relaxed for nothing even mid-upgrade. A bundle that is current but
+// untagged -- staged under relaxed SIP, then booted SIP-on -- is tagged in
+// place without a rewrite. The staging writes are admitted by the vnode hooks
+// (RgfxGateHooks.cpp) only while gInstalling is set on this thread and the
+// target is under the bundle path; the tags, the renames and the removes run
+// below the MAC layer, as the directory creates do. In the installer/Recovery
+// the kext does nothing. The pass is published on IOResources from its start to
+// its end (RgfxGate.hpp), and the accelerator registers only once it has ended.
 #include <Headers/kern_file.hpp>
 #include <Headers/kern_util.hpp>
 
@@ -32,6 +36,7 @@
 #include "RgfxGate.hpp"
 #include "RgfxGatePayload.h"
 #include "RgfxGatePrefs.hpp"
+#include "rgfx_match.h"
 
 // MacKernelSDK omits these VNOP prototypes; they are exported BSD KPIs, as
 // VNOP_MKDIR is.
@@ -39,6 +44,13 @@ extern "C" int VNOP_MKDIR(vnode_t, vnode_t *, struct componentname *,
                           struct vnode_attr *, vfs_context_t);
 extern "C" int VNOP_REMOVE(vnode_t, vnode_t, struct componentname *, int,
                            vfs_context_t);
+extern "C" int VNOP_RMDIR(vnode_t, vnode_t, struct componentname *,
+                          vfs_context_t);
+extern "C" int VNOP_RENAME(vnode_t, vnode_t, struct componentname *, vnode_t,
+                           vnode_t, struct componentname *, vfs_context_t);
+extern "C" int VNOP_RENAMEX(vnode_t, vnode_t, struct componentname *, vnode_t,
+                            vnode_t, struct componentname *, vfs_rename_flags_t,
+                            vfs_context_t);
 extern "C" int VNOP_REMOVEXATTR(vnode_t, const char *, int, vfs_context_t);
 
 namespace rgfxgate {
@@ -51,6 +63,42 @@ static void joinPath(char *out, size_t cap, const char *a, const char *b) {
 		n += strlcpy(out + n, "/", cap - n);
 	if (n < cap)
 		strlcpy(out + n, b, cap - n);
+}
+
+// Look up the parent directory of `path` and fill `cn` (a componentname with
+// the given nameiop) with its leaf; `leafbuf` (leafcap bytes) backs the name
+// and must outlive the VNOP call. Returns the parent vnode, which the caller
+// puts, or nullptr. Shared by the rename and rmdir helpers, which call the
+// VNOP KPIs directly, below the vn_* MAC layer, as the directory creates do.
+static vnode_t parentAndLeaf(const char *path, uint32_t nameiop,
+                             struct componentname *cn, char *leafbuf,
+                             size_t leafcap, vfs_context_t ctx) {
+	const char *slash = nullptr;
+	for (const char *q = path; *q; q++)
+		if (*q == '/')
+			slash = q;
+	if (slash == nullptr || slash == path)
+		return nullptr;
+	size_t plen = (size_t)(slash - path);
+	char parent[1024];
+	if (plen >= sizeof(parent))
+		return nullptr;
+	memcpy(parent, path, plen);
+	parent[plen] = '\0';
+	const char *leaf = slash + 1;
+	if (strlcpy(leafbuf, leaf, leafcap) >= leafcap)
+		return nullptr;
+	vnode_t dvp = nullptr;
+	if (vnode_lookup(parent, 0, &dvp, ctx) != 0)
+		return nullptr;
+	bzero(cn, sizeof(*cn));
+	cn->cn_nameiop = nameiop;
+	cn->cn_flags = 0;
+	cn->cn_pnbuf = leafbuf;
+	cn->cn_pnlen = (int)strlen(leafbuf);
+	cn->cn_nameptr = leafbuf;
+	cn->cn_namelen = (int)strlen(leafbuf);
+	return dvp;
 }
 
 // Create one directory by full path if it is not already there. Returns true
@@ -140,9 +188,9 @@ static bool installNeeded(vfs_context_t ctx) {
 	return false;
 }
 
-static bool writeOne(const PayloadFile *f, vfs_context_t ctx) {
+static bool writeOne(const char *root, const PayloadFile *f, vfs_context_t ctx) {
 	char path[1024];
-	joinPath(path, sizeof(path), kBundlePath, f->rel);
+	joinPath(path, sizeof(path), root, f->rel);
 	int cmode = f->is_exec ? 0755 : 0644;
 	int err = FileIO::writeBufferToFile(path, (void *)(uintptr_t)f->data, f->size,
 	                                    O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, cmode);
@@ -189,20 +237,21 @@ static void tagRootless(const char *path, vfs_context_t ctx) {
 	vnode_put(vp);
 }
 
-// Tag the installed tree and its container, deepest path first so a directory's
-// restricted flag is set only after everything inside it is already tagged.
-static void tagInstalledTree(vfs_context_t ctx) {
+// Tag one tree (files, then directories deepest first, then its own root) with
+// the GPU-bundle storage class and restricted flag. The root is tagged last, so
+// a tagged root means a tagged tree. The container is tagged separately: it is
+// never unlocked, so an upgrade does not widen SIP around it.
+static void tagTree(const char *root, vfs_context_t ctx) {
 	char p[1024];
 	for (uint32_t i = 0; i < kFileCount; i++) {
-		joinPath(p, sizeof(p), kBundlePath, kFiles[i].rel);
+		joinPath(p, sizeof(p), root, kFiles[i].rel);
 		tagRootless(p, ctx);
 	}
 	for (uint32_t i = kDirCount; i-- > 0;) {
-		joinPath(p, sizeof(p), kBundlePath, kDirs[i]);
+		joinPath(p, sizeof(p), root, kDirs[i]);
 		tagRootless(p, ctx);
 	}
-	tagRootless(kBundlePath, ctx);
-	tagRootless(kContainerPath, ctx);
+	tagRootless(root, ctx);
 }
 
 // True if the bundle directory carries both the storage class and the
@@ -252,22 +301,6 @@ static void clearRootless(const char *path, vfs_context_t ctx) {
 	vnode_put(vp);
 }
 
-// Unlock the whole tagged tree before an upgrade, shallowest path first so a
-// directory is cleared before the entries under it that it protects.
-static void clearInstalledTree(vfs_context_t ctx) {
-	char p[1024];
-	clearRootless(kContainerPath, ctx);
-	clearRootless(kBundlePath, ctx);
-	for (uint32_t i = 0; i < kDirCount; i++) {
-		joinPath(p, sizeof(p), kBundlePath, kDirs[i]);
-		clearRootless(p, ctx);
-	}
-	for (uint32_t i = 0; i < kFileCount; i++) {
-		joinPath(p, sizeof(p), kBundlePath, kFiles[i].rel);
-		clearRootless(p, ctx);
-	}
-}
-
 // Unlink one file by full path, below the MAC layer as the directory creates
 // use VNOP_MKDIR. Already absent counts as success.
 static void removeFile(const char *path, vfs_context_t ctx) {
@@ -303,6 +336,149 @@ static void removeFile(const char *path, vfs_context_t ctx) {
 	vnode_put(vp);
 }
 
+// Remove one empty directory by full path, below the MAC layer as removeFile
+// unlinks files. Non-empty or absent is left as it is (best effort).
+static void removeDir(const char *path, vfs_context_t ctx) {
+	vnode_t vp = nullptr;
+	if (vnode_lookup(path, 0, &vp, ctx) != 0)
+		return;
+	char leaf[256];
+	struct componentname cn;
+	vnode_t dvp = parentAndLeaf(path, DELETE, &cn, leaf, sizeof(leaf), ctx);
+	if (dvp != nullptr) {
+		VNOP_RMDIR(dvp, vp, &cn, ctx);
+		vnode_put(dvp);
+	}
+	vnode_put(vp);
+}
+
+// Rename `from` onto `to`, below the vn_* MAC layer as the directory creates
+// use VNOP_MKDIR, so the container's restricted flag does not block it. With
+// swap (both ends must exist), the two are exchanged atomically
+// (VFS_RENAME_SWAP): a reader of `to` always sees one whole tree, never a
+// half-swapped one. Without swap, `from` replaces `to`, which need not exist.
+// Shared with the AppleGVA preference's atomic write (RgfxGatePrefs.cpp).
+bool rgfxRenameNode(const char *from, const char *to, bool swap,
+                    vfs_context_t ctx) {
+	vnode_t fvp = nullptr;
+	if (vnode_lookup(from, 0, &fvp, ctx) != 0)
+		return false; // nothing to rename
+	vnode_t tvp = nullptr;
+	if (vnode_lookup(to, 0, &tvp, ctx) != 0)
+		tvp = nullptr; // target absent: a plain rename into a free name
+	bool ok = false;
+	if (!(swap && tvp == nullptr)) {
+		char fleaf[256], tleaf[256];
+		struct componentname fcn, tcn;
+		vnode_t fdvp = parentAndLeaf(from, RENAME, &fcn, fleaf, sizeof(fleaf), ctx);
+		vnode_t tdvp = parentAndLeaf(to, RENAME, &tcn, tleaf, sizeof(tleaf), ctx);
+		if (fdvp != nullptr && tdvp != nullptr) {
+			int err = swap ? VNOP_RENAMEX(fdvp, fvp, &fcn, tdvp, tvp, &tcn,
+			                              VFS_RENAME_SWAP, ctx)
+			               : VNOP_RENAME(fdvp, fvp, &fcn, tdvp, tvp, &tcn, ctx);
+			ok = err == 0;
+			if (!ok)
+				SYSLOG("rgfxgate", "rename %s -> %s failed (%d)", from, to, err);
+		}
+		if (tdvp)
+			vnode_put(tdvp);
+		if (fdvp)
+			vnode_put(fdvp);
+	}
+	if (tvp)
+		vnode_put(tvp);
+	vnode_put(fvp);
+	return ok;
+}
+
+// Remove a staged or swapped-out tree rooted at `root`: unlock and unlink its
+// files, then its directories deepest first, then the root. The payload layout
+// (kFiles/kDirs) is the layout we ever stage, so a tree of our own build is
+// cleared whole; a tree from a differing older build may leave entries this
+// kext does not know, and its root rmdir then fails -- clutter, not a brick,
+// swept the next time an install stages here. Best effort throughout.
+static void removeTree(const char *root, vfs_context_t ctx) {
+	char p[1024];
+	for (uint32_t i = 0; i < kFileCount; i++) {
+		joinPath(p, sizeof(p), root, kFiles[i].rel);
+		clearRootless(p, ctx);
+		removeFile(p, ctx);
+	}
+	for (uint32_t i = kDirCount; i-- > 0;) {
+		joinPath(p, sizeof(p), root, kDirs[i]);
+		clearRootless(p, ctx);
+		removeDir(p, ctx);
+	}
+	clearRootless(root, ctx);
+	removeDir(root, ctx);
+}
+
+// Build the whole bundle tree under `root` (the staging sibling) and write its
+// files: directories first, then the non-executable, non-marker files, the
+// executable, and the wire-version marker last. The order does not matter in
+// staging (nothing reads it), but it mirrors the tag order.
+static bool stageTree(const char *root, vfs_context_t ctx) {
+	if (!ensureDir(root, ctx))
+		return false;
+	char p[1024];
+	for (uint32_t i = 0; i < kDirCount; i++) {
+		joinPath(p, sizeof(p), root, kDirs[i]);
+		if (!ensureDir(p, ctx))
+			return false;
+	}
+	bool ok = true;
+	for (uint32_t i = 0; ok && i < kFileCount; i++)
+		if (!kFiles[i].is_exec && !kFiles[i].is_marker)
+			ok = writeOne(root, &kFiles[i], ctx);
+	for (uint32_t i = 0; ok && i < kFileCount; i++)
+		if (kFiles[i].is_exec)
+			ok = writeOne(root, &kFiles[i], ctx);
+	for (uint32_t i = 0; ok && i < kFileCount; i++)
+		if (kFiles[i].is_marker)
+			ok = writeOne(root, &kFiles[i], ctx);
+	return ok;
+}
+
+// The sibling staging directory's suffix: NAME.bundle.new beside NAME.bundle,
+// under the same container, so its writes are admitted (installWriteAllowed)
+// and its rename onto the bundle stays on one volume.
+static const char kStageSuffix[] = ".new";
+
+// Install or replace the bundle atomically. Build and tag the whole tree in the
+// staging sibling, then put it in place with one rename: a live bundle is
+// exchanged with it (VFS_RENAME_SWAP) and the old tree dropped, and where there
+// is none the staged tree is moved in. A reader never sees a half-written
+// bundle, so an upgrade that keeps the wire version (the rewrite race) can no
+// longer brick the boot. The container is created if the Data volume lacks it
+// and is never unlocked. Returns whether the bundle is in place afterwards.
+static bool installBundle(vfs_context_t ctx) {
+	char stageRoot[1024];
+	if (!rgfx_sibling_path(kBundlePath, kStageSuffix, stageRoot, sizeof(stageRoot))) {
+		SYSLOG("rgfxgate", "staging path too long; no install");
+		return false;
+	}
+	bool ok = ensureDir(kContainerPath, ctx);
+	// Clear a staging tree a crashed earlier install may have left.
+	removeTree(stageRoot, ctx);
+	if (ok)
+		ok = stageTree(stageRoot, ctx);
+	if (ok)
+		tagTree(stageRoot, ctx);
+	if (ok) {
+		vnode_t live = nullptr;
+		bool haveLive = vnode_lookup(kBundlePath, 0, &live, ctx) == 0;
+		if (haveLive)
+			vnode_put(live);
+		ok = rgfxRenameNode(stageRoot, kBundlePath, haveLive, ctx);
+	}
+	// On a swap the old tree is now at stageRoot; on a move it is gone; on a
+	// failure the staged tree is still there. One sweep clears whichever remains.
+	removeTree(stageRoot, ctx);
+	// The container carries the class on every install (it may be freshly made).
+	tagRootless(kContainerPath, ctx);
+	return ok;
+}
+
 static void doInstall() {
 	vfs_context_t ctx = vfs_context_create(nullptr);
 	if (ctx == nullptr)
@@ -326,46 +502,20 @@ static void doInstall() {
 	gInstallThread = current_thread();
 	gInstalling = true;
 
-	// Create the container if the Data volume lacks it, then the bundle tree.
-	bool ok = ensureDir(kContainerPath, ctx) && ensureDir(kBundlePath, ctx);
-	for (uint32_t i = 0; ok && i < kDirCount; i++) {
-		char d[1024];
-		joinPath(d, sizeof(d), kBundlePath, kDirs[i]);
-		ok = ensureDir(d, ctx);
-	}
-
-	if (ok && needWrite) {
-		// A newer executable replaces an existing one: unlock our own tagged
-		// tree first, then drop the marker so a half-written bundle never
-		// registers while the files are rewritten.
-		if (tagged)
-			clearInstalledTree(ctx);
-		char marker[1024];
-		joinPath(marker, sizeof(marker), kBundlePath, kMarkerRel);
-		removeFile(marker, ctx);
-		// Non-executable, non-marker files first; then the executable; the
-		// wire-version marker last, so the accelerator never sees a partial bundle.
-		for (uint32_t i = 0; ok && i < kFileCount; i++)
-			if (!kFiles[i].is_exec && !kFiles[i].is_marker)
-				ok = writeOne(&kFiles[i], ctx);
-		for (uint32_t i = 0; ok && i < kFileCount; i++)
-			if (kFiles[i].is_exec)
-				ok = writeOne(&kFiles[i], ctx);
-		for (uint32_t i = 0; ok && i < kFileCount; i++)
-			if (kFiles[i].is_marker)
-				ok = writeOne(&kFiles[i], ctx);
-	}
-
-	// Tag the tree with the GPU-bundle storage class so the stock Metal loader
-	// trusts it with SIP on: after a (re)write, or in place for a current but
-	// untagged bundle.
-	if (ok)
-		tagInstalledTree(ctx);
-	else
-		// The container is the system's, classed on every install: give it its
-		// tags back even when our own tree failed to write, so an update that
-		// unlocked it never leaves it open.
+	bool ok;
+	if (needWrite) {
+		// Stage the whole tree and swap it over the live bundle atomically, so a
+		// reader never sees a half-written one.
+		ok = installBundle(ctx);
+	} else {
+		// The bundle is byte-current but untagged (staged under relaxed SIP,
+		// then first seen SIP-on): tag it in place, with no rewrite and no
+		// window, so the stock Metal loader trusts it.
+		ensureDir(kContainerPath, ctx);
+		tagTree(kBundlePath, ctx);
 		tagRootless(kContainerPath, ctx);
+		ok = true;
+	}
 
 	gInstalling = false;
 	gInstallThread = nullptr;
