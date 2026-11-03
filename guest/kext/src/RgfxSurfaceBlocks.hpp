@@ -28,6 +28,15 @@
 // of its own memory keeps a surface's copy past the textures over it. The dormant blocks are
 // let go past kRgfxDormantMaxBlocks of them or a byte cap the caller sets (rgfxSurfaceOverCaps),
 // those of volatile surfaces first, then the oldest, and for the causes RgfxDormantCause names.
+//
+// A cached block in place may be deferred (RGFX_SURFACE_PAGES_DEFERRED): its surface had no
+// pages at its first ask, a fresh surface only the GPU has touched, and the host's device cache
+// alone holds its bytes until a CPU lock names its pages (RgfxSurfaceCaches.hpp). Its entry has
+// no runs, so its key is its surface, the IOSurface object (rgfxSurfaceFindDeferred), which an
+// ask looks up by the IOSurfaceID it gives in its own task, and its holders hold no wired pages.
+// It stays keyed so for its life, its pages named or not. Its bytes count against the device's
+// budget for such caches (rgfxSurfaceDeferFits), held and dormant, until it goes, and a dormant
+// one's against half of it (rgfxSurfaceOverDeferredCap) rather than the cap of wired pages.
 // The caller holds the accelerator's lock around every call. Header-only and free of the
 // kernel's headers, so its native test (tests/surface_blocks_test.cpp) builds it as the kext
 // does.
@@ -95,6 +104,9 @@ struct RgfxSurfaceEntry {
 	// A dormant block whose surface was made volatile (RgfxSurfaceCaches.hpp): the first of
 	// them to go.
 	bool purgeable;
+	// A deferred block (rgfxSurfaceDefer): `surface`, retained, is its key, from its ask on, and
+	// `runCount` is 0.
+	bool deferred;
 };
 
 struct RgfxSurfaceTable {
@@ -105,6 +117,10 @@ struct RgfxSurfaceTable {
 	uint32_t dormantCount = 0;
 	uint64_t dormantBytes = 0;
 	uint64_t dormantSeq = 0;
+	// The deferred entries' bytes, held and dormant, and the dormant ones', which dormantBytes
+	// does not count: their pages are not wired.
+	uint64_t deferredBytes = 0;
+	uint64_t dormantDeferredBytes = 0;
 };
 
 // The most dormant blocks kept at once.
@@ -140,6 +156,8 @@ enum RgfxDormantCause : uint32_t {
 	kRgfxDormantNoSpace,
 	// An ask of its pages it does not answer: by another device cache, or in the other mode.
 	kRgfxDormantStale,
+	// A deferred one, past half the device's budget for deferred blocks' caches, the oldest.
+	kRgfxDormantDeferredBytes,
 	kRgfxDormantCauses,
 };
 
@@ -200,6 +218,17 @@ inline bool rgfxSurfacePending(const RgfxSurfaceTable &t, const RgfxPageRun *run
 			return true;
 	}
 	return false;
+}
+
+// The deferred entry of `surface` (an IOSurface, opaque here), pending or not, or -1.
+inline int32_t rgfxSurfaceFindDeferred(const RgfxSurfaceTable &t, const void *surface)
+{
+	for (uint32_t i = 0; i < t.capacity && surface != nullptr; i++) {
+		const RgfxSurfaceEntry &e = t.entries[i];
+		if (e.used && e.deferred && e.surface == surface)
+			return static_cast<int32_t>(i);
+	}
+	return -1;
 }
 
 // The entry of the block at `offset`, or -1.
@@ -328,7 +357,7 @@ inline void rgfxSurfaceSleep(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
 	e.dormant = true;
 	e.dormantSeq = ++t.dormantSeq;
 	t.dormantCount++;
-	t.dormantBytes += e.length;
+	(e.deferred ? t.dormantDeferredBytes : t.dormantBytes) += e.length;
 }
 
 // The entry is dormant no more: held again, or let go.
@@ -340,7 +369,49 @@ inline void rgfxSurfaceWake(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
 	e.dormantSeq = 0;
 	e.purgeable = false;
 	t.dormantCount--;
-	t.dormantBytes -= e.length;
+	(e.deferred ? t.dormantDeferredBytes : t.dormantBytes) -= e.length;
+}
+
+// The new entry's block is deferred, keyed by its surface (`e.surface`, set by the caller), its
+// `length` bytes counted against the budget.
+inline void rgfxSurfaceDefer(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
+{
+	if (e.deferred)
+		return;
+	e.deferred = true;
+	t.deferredBytes += e.length;
+}
+
+// The pending entry is deferred no more: its pages were named at its ask after all (its
+// surface was not fresh, or the host refused the deferral), in the `count` runs of `runs`,
+// which are its key from here on.
+inline void rgfxSurfaceUndefer(RgfxSurfaceTable &t, RgfxSurfaceEntry &e, RgfxPageRun *runs,
+                               uint32_t count)
+{
+	if (e.deferred) {
+		e.deferred = false;
+		t.deferredBytes -= e.length;
+	}
+	e.runs = runs;
+	e.runCount = count;
+}
+
+// Whether a new deferred block of `length` bytes fits the device's budget for deferred blocks'
+// caches, `budget` bytes (DEFERRED_BUDGET_LO and _HI), beside those of the deferred blocks there
+// are: a budget of 0 defers none.
+inline bool rgfxSurfaceDeferFits(const RgfxSurfaceTable &t, uint64_t length, uint64_t budget)
+{
+	return budget != 0 && length <= budget && t.deferredBytes <= budget - length;
+}
+
+// The bytes an in-place block of a plane of `length` bytes keeps for its runs past the part its
+// holders map: one run a page at most, in whole pages. A deferred block keeps that much, its
+// runs unknown until they are named.
+inline uint64_t rgfxSurfaceRunRoom(uint64_t length)
+{
+	const uint64_t pages = (length + kRgfxSurfacePage - 1) / kRgfxSurfacePage;
+	const uint64_t bytes = pages * sizeof(RgfxPageRun);
+	return (bytes + kRgfxSurfacePage - 1) / kRgfxSurfacePage * kRgfxSurfacePage;
 }
 
 // Whether a dormant entry is held again by an ask whose surface's device cache is `cache`, and
@@ -352,14 +423,14 @@ inline bool rgfxSurfaceRevives(const RgfxSurfaceEntry &e, const void *cache, boo
 }
 
 // The dormant entry to go first, or -1: the oldest of those whose surfaces are volatile, else
-// the oldest. One still pending, its last holder's BLOCK_UNSHARE not yet posted, is not let go,
-// so no BLOCK_RELEASE overtakes that.
-inline int32_t rgfxSurfaceOldestDormant(const RgfxSurfaceTable &t)
+// the oldest; of the deferred ones alone where `deferredOnly`. One still pending, its last
+// holder's BLOCK_UNSHARE not yet posted, is not let go, so no BLOCK_RELEASE overtakes that.
+inline int32_t rgfxSurfaceOldestDormant(const RgfxSurfaceTable &t, bool deferredOnly = false)
 {
 	int32_t oldest = -1;
 	for (uint32_t i = 0; i < t.capacity; i++) {
 		const RgfxSurfaceEntry &e = t.entries[i];
-		if (!e.used || !e.dormant || e.pending)
+		if (!e.used || !e.dormant || e.pending || (deferredOnly && !e.deferred))
 			continue;
 		const RgfxSurfaceEntry *o = oldest < 0 ? nullptr : &t.entries[oldest];
 		if (o == nullptr || (e.purgeable && !o->purgeable) ||
@@ -381,6 +452,17 @@ inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
 	else
 		return -1;
 	return rgfxSurfaceOldestDormant(t);
+}
+
+// The dormant deferred entry to let go while their bytes pass `maxBytes`, half the device's
+// budget for deferred blocks' caches: the first of them to go; -1 within it.
+inline int32_t rgfxSurfaceOverDeferredCap(const RgfxSurfaceTable &t, uint64_t maxBytes,
+                                          RgfxDormantCause *why)
+{
+	if (t.dormantDeferredBytes <= maxBytes)
+		return -1;
+	*why = kRgfxDormantDeferredBytes;
+	return rgfxSurfaceOldestDormant(t, true);
 }
 
 // What an ask whose new block found no room in the region does next. Before its first wait
@@ -421,6 +503,8 @@ inline int32_t rgfxSurfaceDormantMeeting(const RgfxSurfaceTable &t, const RgfxPa
 inline void rgfxSurfaceClear(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
 {
 	rgfxSurfaceWake(t, e);
+	if (e.deferred)
+		t.deferredBytes -= e.length;
 	e = RgfxSurfaceEntry{};
 }
 

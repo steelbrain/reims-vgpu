@@ -8,6 +8,11 @@
 // goes, never named by that key again, or once its surface turns purgeable.
 // A cached surface's clients are written where its header holds them, clamped to 32 bits, and
 // nothing is written for a surface not cached or one with no header.
+// A deferred block's locks go on while its ask reads the surface and wait for the host's answer;
+// then a read-write lock, or a read-only one after a GPU write, names its pages once, the others
+// waiting, and a read-only lock of a block the GPU never wrote names none. A dormant deferred
+// block stays at a client's going while others are left; its release names its pages first only
+// where the GPU wrote it and the surface lives past the kext's three references.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -195,6 +200,134 @@ void room()
 	check(rgfxCacheAdd(t, key, key << 12, static_cast<uint32_t>(key)) == nullptr,
 	      "past them, none");
 }
+// A deferred block: gating, deferring, deferred, attached.
+void deferral()
+{
+	RgfxCachedSurface entries[3] = {};
+	RgfxCacheTable t = {entries, 0, 3};
+	uint64_t offset = 0, mark = 0;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	check(c != nullptr && c->deferral == kRgfxCacheNotDeferred && rgfxCacheWired(*c),
+	      "a cached surface's pages are named at its ask, its memory wired");
+	check(!rgfxCacheGated(t, kSurface), "one not gating is not gated");
+	c->deferral = kRgfxCacheGating;
+	check(!rgfxCacheWired(*c), "a gating one's memory is not wired");
+
+	// Its ask reads the surface: a lock meanwhile goes on, its seed the gate's to read.
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheGoOn &&
+	          rgfxCacheReadWriteLock(t, kSurface) == 1,
+	      "a read-write lock while the ask reads the surface goes on, its generation moved");
+	check(rgfxCacheGated(t, kSurface) && c->deferral == kRgfxCacheDeferring,
+	      "the surface was fresh");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheWait &&
+	          rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheWait,
+	      "the deferral not answered, locks wait");
+	rgfxCacheSettled(t, kSurface, true);
+	check(c->deferral == kRgfxCacheDeferred && !rgfxCacheWired(*c), "deferred, no pages");
+
+	// A read-only lock of a block the GPU never wrote names no pages.
+	check(rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheGoOn &&
+	          c->deferral == kRgfxCacheDeferred,
+	      "a read-only lock of an unwritten one attaches nothing");
+	// A read-write one names them, once: the others wait; an attach not answered leaves them to
+	// name again.
+	offset = 0;
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          offset == kBlock && c->deferral == kRgfxCacheAttaching,
+	      "a read-write lock attaches its pages");
+	check(!rgfxCacheWired(*c), "not wired while the attach is asked");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheWait &&
+	          rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheWait,
+	      "the other locks wait for it");
+	rgfxCacheAttached(t, kSurface, false);
+	check(c->deferral == kRgfxCacheDeferred, "an attach not answered OK names them again later");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach,
+	      "the next read-write lock asks again");
+	rgfxCacheAttached(t, kSurface, true);
+	check(c->deferral == kRgfxCacheAttached && rgfxCacheWired(*c), "attached, its memory wired");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheGoOn,
+	      "then a lock goes on as for any block");
+	rgfxCacheAttached(t, kSurface, false);
+	check(c->deferral == kRgfxCacheAttached, "an answer with no attach asked changes nothing");
+
+	// Another, the GPU writes it: a read-only lock attaches, then downloads.
+	RgfxCachedSurface *d = rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId);
+	d->deferral = kRgfxCacheDeferred;
+	check(rgfxCacheNoteWrite(t, kOther), "the GPU writes the other");
+	check(rgfxCacheNext(t, kOther, &offset, &mark) == kRgfxCacheAttach && offset == kOtherBlock,
+	      "a read-only lock after a GPU write attaches its pages");
+	rgfxCacheAttached(t, kOther, true);
+	check(rgfxCacheNext(t, kOther, &offset, &mark) == kRgfxCacheDownload && mark == 1,
+	      "then downloads what the GPU wrote");
+	rgfxCacheDownloaded(t, kOther, mark, true);
+	check(rgfxCacheNext(t, kOther, &offset, &mark) == kRgfxCacheGoOn, "and goes on");
+
+	// Refused, or not fresh: its pages named at the ask after all.
+	RgfxCachedSurface *r = rgfxCacheAdd(t, kNotCached, 0xc0000, 44);
+	r->deferral = kRgfxCacheGating;
+	rgfxCacheSettled(t, kNotCached, false);
+	check(r->deferral == kRgfxCacheNotDeferred && rgfxCacheWired(*r),
+	      "a surface not fresh is not deferred");
+	r->deferral = kRgfxCacheDeferring;
+	rgfxCacheSettled(t, kNotCached, false);
+	check(r->deferral == kRgfxCacheNotDeferred, "nor one whose deferral the host refused");
+	rgfxCacheSettled(t, kNotCached, true);
+	check(r->deferral == kRgfxCacheNotDeferred, "an answer after it changes nothing");
+}
+
+// Op 5 keeps a dormant deferred block while clients are left, and its release names its pages
+// only where the GPU wrote it and the surface lives on.
+void deferredRelease()
+{
+	// The kext's own references of a surface at a release: the table's, the device cache's and
+	// the release thread's.
+	static_assert(kRgfxSurfaceTableRef == 1 && kRgfxSurfaceDeviceCacheRef == 1 &&
+	                  kRgfxSurfaceReleaseRef == 1,
+	              "one reference each");
+	check(kRgfxSurfaceKextRefs == 3, "the kext holds three references of a surface it releases");
+
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	bool purgeable = false;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	check(rgfxCacheSleep(t, kSurface, true, &purgeable), "a deferred block dormant");
+	check(!rgfxCachePurged(t, kSurface, 1) && c->letGo == kRgfxCacheKept,
+	      "a client going with one left keeps it");
+	check(rgfxCachePurged(t, kSurface, 0) && c->letGo == kRgfxDormantPurged,
+	      "the last client's going lets it go");
+	RgfxCachedSurface *a = rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId);
+	a->deferral = kRgfxCacheAttached;
+	check(rgfxCacheSleep(t, kOther, true, &purgeable) && rgfxCachePurged(t, kOther, 2),
+	      "an attached one goes at any client's going, as any block");
+
+	// Its release: not yet releasing, nothing to do.
+	check(rgfxCacheReleaseNext(t, kBlock, 1, 9) == kRgfxCacheReleaseAsIs, "not released yet");
+	int surfaceObject = 0;
+	void *map = nullptr, *wire = nullptr;
+	check(!rgfxCacheLetGo(t, kSurface, true, &surfaceObject, &map, &wire), "released");
+	check(rgfxCacheReleaseNext(t, kBlock, 1, 9) == kRgfxCacheReleaseAsIs,
+	      "the GPU never wrote it: its pages are fresh, nothing to copy");
+	check(rgfxCacheNoteWrite(t, kSurface), "the GPU wrote it");
+	check(rgfxCacheReleaseNext(t, kBlock, 0, kRgfxSurfaceKextRefs) == kRgfxCacheReleaseAsIs &&
+	          c->deferral == kRgfxCacheDeferred,
+	      "held by the kext alone: nothing reads its pages");
+	check(rgfxCacheReleaseNext(t, kBlock, 0, kRgfxSurfaceKextRefs + 1) ==
+	              kRgfxCacheReleaseAttach &&
+	          c->deferral == kRgfxCacheAttaching,
+	      "with no client but a reference past the kext's (a port), its pages are named");
+	check(rgfxCacheReleaseNext(t, kBlock, 0, kRgfxSurfaceKextRefs + 1) == kRgfxCacheReleaseWait,
+	      "while they are named, the release waits");
+	uint64_t offset = 0, mark = 0;
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheWait,
+	      "and a lock waits for the release");
+	rgfxCacheAttached(t, kSurface, true);
+	check(rgfxCacheReleaseNext(t, kBlock, 1, 9) == kRgfxCacheReleaseAsIs,
+	      "attached, it goes as any block, its release copying the cache");
+	c->deferral = kRgfxCacheDeferred;
+	check(rgfxCacheReleaseNext(t, kBlock, 1, kRgfxSurfaceKextRefs) == kRgfxCacheReleaseAttach,
+	      "a client left names them too");
+}
 } // namespace
 
 int main()
@@ -297,6 +430,8 @@ int main()
 	dormancy();
 	clients();
 	room();
+	deferral();
+	deferredRelease();
 	std::printf("surface_caches_test: OK (%d checks)\n", checks);
 	return 0;
 }

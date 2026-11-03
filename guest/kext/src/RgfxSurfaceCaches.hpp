@@ -32,6 +32,18 @@
 //     A surface made volatile keeps its dormant block, the first of them to go under the caps
 //     (RgfxSurfaceBlocks.hpp), as IOSurfaceRef.h lets a volatile surface's contents be
 //     discarded; made nonvolatile again (op 6, or op 7), it is neither.
+//   - A deferred block (RgfxSurfaceBlocks.hpp) has no pages until a lock needs them: the kext
+//     holds its surface's memory retained, not wired. Its ask reads the surface's seed and its
+//     resident pages once its device cache and control function are made (kRgfxCacheGating),
+//     and a lock goes on then as for any block: its seed moves, and the ask names the pages.
+//     Found fresh, a lock waits for the host's answer to the deferral (kRgfxCacheDeferring).
+//     Deferred, a read-write lock, or a read-only one of a surface the GPU wrote, attaches the
+//     pages first (RGFX_SURFACE_PAGES_ATTACH), one lock at a time, the others waiting; then it
+//     goes on as for any block, a download among it. A read-only lock of a surface the GPU never
+//     wrote attaches nothing: a fresh page reads as zeros, as the cache does. A dormant one is
+//     kept at a client's going (op 5) while other clients are left; its release, where the GPU
+//     wrote it and the surface lives past the kext's own references, attaches its pages first,
+//     so the release copies the cache into them (rgfxCacheReleaseNext); else nothing reads them.
 // A wait that does not end in kWaitMs goes on, as a lock waiting for a write does.
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
@@ -45,6 +57,24 @@
 #include <stdint.h>
 
 #include "RgfxSurfaceBlocks.hpp"
+
+// Where a cached surface's block stands with its pages (RgfxSurfaceBlocks.hpp's deferred
+// blocks).
+enum RgfxCacheDeferral : uint32_t {
+	// Its pages were named at its ask, as every block's not deferred.
+	kRgfxCacheNotDeferred = 0,
+	// Its ask reads the surface's seed and pages, to defer it or name them: a lock goes on as
+	// for a block not deferred.
+	kRgfxCacheGating,
+	// The surface was fresh, and the host has not answered the deferral: a lock waits.
+	kRgfxCacheDeferring,
+	// Deferred: no pages named yet.
+	kRgfxCacheDeferred,
+	// A lock, or the release, is naming its pages: the others wait.
+	kRgfxCacheAttaching,
+	// Its pages were named after its ask: as a block not deferred.
+	kRgfxCacheAttached,
+};
 
 // One cached surface.
 struct RgfxCachedSurface {
@@ -82,6 +112,14 @@ struct RgfxCachedSurface {
 	// this table's `surface` after the let-go, while this entry lives: opaque here.
 	volatile uint32_t *clientsAt;
 	const void *object;
+	// Its pages (RgfxCacheDeferral): `wire` holds the surface's memory retained but not prepared
+	// while the block is deferred (rgfxCacheWired), and an attach prepares it. The block's
+	// context, the bytes its holders map and the plane's bytes: what an attach's SURFACE_PAGES
+	// names.
+	RgfxCacheDeferral deferral;
+	uint32_t context;
+	uint64_t size;
+	uint64_t length;
 };
 
 // RgfxCachedSurface::letGo where nothing asks the dormant block to go.
@@ -138,6 +176,13 @@ inline RgfxCachedSurface *rgfxCacheAdd(RgfxCacheTable &t, uint64_t key, uint64_t
 	c.surfaceId = surfaceId;
 	c.letGo = kRgfxCacheKept;
 	return &c;
+}
+
+// Whether `c`'s `wire` is prepared: every block's but a deferred one's before its pages are
+// named, whose memory is only retained, and which the caller then releases unprepared.
+inline bool rgfxCacheWired(const RgfxCachedSurface &c)
+{
+	return c.deferral == kRgfxCacheNotDeferred || c.deferral == kRgfxCacheAttached;
 }
 
 // Takes `c` out of the table: its mapping and its wired memory, which the caller lets go, in
@@ -242,12 +287,15 @@ inline bool rgfxCacheNoteClients(RgfxCacheTable &t, uint64_t key, int64_t client
 	return true;
 }
 
-// Surface `key`'s device cache was purged (op 5): a dormant block of it is to be let go. True
-// where one is, not asked to go before.
-inline bool rgfxCachePurged(RgfxCacheTable &t, uint64_t key)
+// Surface `key`'s device cache was purged (op 5), `clients` of the surface left: a dormant block
+// of it is to be let go, but a deferred one whose pages are not named while a client is left,
+// whose cache alone holds its bytes. True where one is, not asked to go before.
+inline bool rgfxCachePurged(RgfxCacheTable &t, uint64_t key, int64_t clients = 0)
 {
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr || !c->dormant || c->letGo != kRgfxCacheKept)
+		return false;
+	if (c->deferral == kRgfxCacheDeferred && clients > 0)
 		return false;
 	c->letGo = kRgfxDormantPurged;
 	return true;
@@ -322,16 +370,28 @@ enum RgfxCacheStep {
 	// Asks the download of the block at `*offset` and waits for its answer, then calls
 	// rgfxCacheDownloaded with `*mark`.
 	kRgfxCacheDownload,
+	// Names the deferred block's pages (RGFX_SURFACE_PAGES_ATTACH) and waits for the answer, then
+	// calls rgfxCacheAttached.
+	kRgfxCacheAttach,
 };
 
+// A lock, read-write where `readWrite`.
 inline RgfxCacheStep rgfxCacheNext(RgfxCacheTable &t, uint64_t key, uint64_t *offset,
-                                   uint64_t *mark)
+                                   uint64_t *mark, bool readWrite = false)
 {
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr)
 		return kRgfxCacheGoOn;
-	if (c->downloading || c->releasing)
+	if (c->downloading || c->releasing || c->deferral == kRgfxCacheDeferring ||
+	    c->deferral == kRgfxCacheAttaching)
 		return kRgfxCacheWait;
+	if (c->deferral == kRgfxCacheDeferred) {
+		if (!readWrite && c->writes == c->copied)
+			return kRgfxCacheGoOn;
+		c->deferral = kRgfxCacheAttaching;
+		*offset = c->offset;
+		return kRgfxCacheAttach;
+	}
 	if (c->writes == c->copied)
 		return kRgfxCacheGoOn;
 	c->downloading = true;
@@ -350,6 +410,76 @@ inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, 
 	c->downloading = false;
 	if (ok && mark > c->copied)
 		c->copied = mark;
+}
+
+// The attach a lock or the release asked of surface `key` (kRgfxCacheAttach) was answered, OK
+// where `ok`: its pages are the cache's from here on, or are still to name.
+inline void rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, bool ok)
+{
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c != nullptr && c->deferral == kRgfxCacheAttaching)
+		c->deferral = ok ? kRgfxCacheAttached : kRgfxCacheDeferred;
+}
+
+// The ask of surface `key`'s deferred block read the surface fresh: it asks the host to defer
+// the block, and locks wait for the answer. False where the surface is not gating.
+inline bool rgfxCacheGated(RgfxCacheTable &t, uint64_t key)
+{
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr || c->deferral != kRgfxCacheGating)
+		return false;
+	c->deferral = kRgfxCacheDeferring;
+	return true;
+}
+
+// The host answered the ask of surface `key`'s block: deferred where `deferred`, else its pages
+// were named at the ask (its surface not fresh, or the deferral refused), `wire` prepared.
+inline void rgfxCacheSettled(RgfxCacheTable &t, uint64_t key, bool deferred)
+{
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c != nullptr && (c->deferral == kRgfxCacheGating || c->deferral == kRgfxCacheDeferring))
+		c->deferral = deferred ? kRgfxCacheDeferred : kRgfxCacheNotDeferred;
+}
+
+// The references of a surface the kext holds itself as its release thread looks at a deferred
+// block's release: the table's, which the block's entry handed it at the let-go
+// (rgfxCacheLetGo); the device cache's, the kext holding the cache, which IOSurface's
+// IOSurfaceDeviceCache::init retains its surface for (IOSurface 393.5.8); and the release
+// thread's own, taken to read the surface (rgfxCacheReleasingSurface). A surface retained past
+// these lives on: a process's client, a mach port or an XPC object holds it, and may read it.
+constexpr int32_t kRgfxSurfaceTableRef = 1;
+constexpr int32_t kRgfxSurfaceDeviceCacheRef = 1;
+constexpr int32_t kRgfxSurfaceReleaseRef = 1;
+constexpr int32_t kRgfxSurfaceKextRefs =
+    kRgfxSurfaceTableRef + kRgfxSurfaceDeviceCacheRef + kRgfxSurfaceReleaseRef;
+
+// What the release of the cached block at `offset` does before its BLOCK_RELEASE goes, its
+// surface having `clients` clients and `retains` references (IOSurface's counts, read out of
+// the lock).
+enum RgfxCacheReleaseStep {
+	// Goes as it is: a block not deferred, or attached, whose release copies the cache into its
+	// pages; or a deferred one the GPU never wrote, or that nothing but the kext holds, whose
+	// pages nothing reads.
+	kRgfxCacheReleaseAsIs,
+	// Waits: a lock is naming its pages.
+	kRgfxCacheReleaseWait,
+	// Names its pages (kRgfxCacheAttach), so the release copies what the GPU wrote into them.
+	kRgfxCacheReleaseAttach,
+};
+
+inline RgfxCacheReleaseStep rgfxCacheReleaseNext(RgfxCacheTable &t, uint64_t offset,
+                                                 int32_t clients, int32_t retains)
+{
+	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	if (c == nullptr || !c->releasing)
+		return kRgfxCacheReleaseAsIs;
+	if (c->deferral == kRgfxCacheAttaching)
+		return kRgfxCacheReleaseWait;
+	if (c->deferral != kRgfxCacheDeferred || c->writes == c->copied ||
+	    (clients <= 0 && retains <= kRgfxSurfaceKextRefs))
+		return kRgfxCacheReleaseAsIs;
+	c->deferral = kRgfxCacheAttaching;
+	return kRgfxCacheReleaseAttach;
 }
 
 // A read-write CPU lock of surface `key` goes on: its CPU generation moves. The new generation,

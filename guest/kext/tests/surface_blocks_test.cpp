@@ -2,7 +2,9 @@
 // alone, each client holds it once however often it asks, the hold ends with the client's last
 // let-go, the block with its last holder's, and only a holder's span is named. A dormant block is
 // held again only by its own device cache, live, and the dormant blocks past their caps go
-// oldest first.
+// oldest first. A deferred block is found by its surface alone, never by pages, counts against
+// the device's budget while it lives and against half of it while dormant, and keeps room for
+// one run a page of its whole allocation, every plane's.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
@@ -137,8 +139,116 @@ void dormancy()
 }
 } // namespace
 
+// Deferred blocks (RGFX_SURFACE_PAGES_DEFERRED): keyed by their surface, budgeted, capped.
+void deferred()
+{
+	RgfxSurfaceEntry entries[4] = {};
+	RgfxSurfaceTable t = {entries, 4};
+	RgfxPageRun runs[2];
+	// A two-plane surface's allocation (NV12 at 1920x1080: 2073600 bytes of luma and 1036800 of
+	// chroma, page aligned), and a 4K BGRA one's.
+	constexpr uint64_t kTwoPlanes = 3112960, kBgra4k = 3840ull * 2160 * 4;
+	constexpr uint64_t kBudget = 64ull << 20;
+	char surfaceA = 0, surfaceB = 0;
+	check(rgfxSurfaceDeferFits(t, kTwoPlanes, kBudget), "a budget with room defers");
+	check(!rgfxSurfaceDeferFits(t, kTwoPlanes, 0), "a budget of 0 defers none");
+	check(!rgfxSurfaceDeferFits(t, kBudget + 1, kBudget), "nor a block past the budget");
+
+	// Made deferred: no runs, its surface its key, its bytes counted.
+	RgfxSurfaceEntry &d = entries[0];
+	d.used = true;
+	d.offset = 0x200000;
+	d.size = 0x1000;
+	d.inPlace = d.pending = d.cached = true;
+	d.length = kTwoPlanes;
+	d.surface = &surfaceA;
+	rgfxSurfaceDefer(t, d);
+	rgfxSurfaceDefer(t, d);
+	check(d.deferred && d.runCount == 0 && t.deferredBytes == kTwoPlanes,
+	      "a deferred block counts its whole allocation once");
+	check(rgfxSurfaceFindDeferred(t, &surfaceA) == 0, "found by its surface, pending or not");
+	check(rgfxSurfaceFindDeferred(t, &surfaceB) == -1 && rgfxSurfaceFindDeferred(t, nullptr) == -1,
+	      "and by no other");
+	RgfxPageRun page = {0x40000, kTwoPlanes};
+	bool differs = true;
+	check(rgfxSurfaceFind(t, &page, 1, kTwoPlanes, 0x1000, true, &differs) == -1 && !differs,
+	      "never by pages");
+	check(!rgfxSurfacePending(t, &page, 1) && rgfxSurfaceDormantMeeting(t, &page, 1) == -1,
+	      "nor waited for or met by an ask of pages");
+	check(!rgfxSurfaceDeferFits(t, kBudget - kTwoPlanes + 1, kBudget) &&
+	          rgfxSurfaceDeferFits(t, kBudget - kTwoPlanes, kBudget),
+	      "the budget counts the blocks deferred");
+
+	// Its runs' room: one run a page of the whole allocation, whole pages.
+	check(rgfxSurfaceRunRoom(kTwoPlanes) == 3 * kRgfxSurfacePage,
+	      "760 pages of two planes keep 760 runs' room, 3 pages");
+	check(rgfxSurfaceRunRoom(kBgra4k) == 32 * kRgfxSurfacePage,
+	      "a 4K surface's 8100 runs, 32 pages");
+	check(rgfxSurfaceRunRoom(kRgfxSurfacePage) == kRgfxSurfacePage, "one page's run, a page");
+
+	// Dormant: counted against the deferred cap, not the wired pages' bytes.
+	d.pending = false;
+	rgfxSurfaceSleep(t, d);
+	check(t.dormantCount == 1 && t.dormantBytes == 0 && t.dormantDeferredBytes == kTwoPlanes,
+	      "a dormant deferred block's bytes are not wired");
+	RgfxDormantCause why = kRgfxDormantCauses;
+	check(rgfxSurfaceOverCaps(t, 0, &why) == -1, "the wired pages' cap passes it by");
+	check(rgfxSurfaceOverDeferredCap(t, kTwoPlanes, &why) == -1, "within the deferred cap");
+
+	// An older dormant block not deferred, and a newer deferred one: past the deferred cap the
+	// oldest deferred goes, never the other.
+	RgfxSurfaceEntry &old = cachedEntry(t, 1, &runs[0], 0x10000, 0x4000, &cacheA);
+	rgfxSurfaceSleep(t, old);
+	old.dormantSeq = 0;
+	RgfxSurfaceEntry &e = entries[2];
+	e = d;
+	e.offset = 0x300000;
+	e.length = kBgra4k;
+	e.surface = &surfaceB;
+	e.deferred = e.dormant = false;
+	rgfxSurfaceDefer(t, e);
+	rgfxSurfaceSleep(t, e);
+	check(t.deferredBytes == kTwoPlanes + kBgra4k &&
+	          t.dormantDeferredBytes == kTwoPlanes + kBgra4k && t.dormantBytes == 0x4000,
+	      "each counted where it belongs");
+	check(rgfxSurfaceOldestDormant(t) == 1 && rgfxSurfaceOldestDormant(t, true) == 0,
+	      "the oldest of all, and of the deferred");
+	check(rgfxSurfaceOverDeferredCap(t, kBgra4k, &why) == 0 && why == kRgfxDormantDeferredBytes,
+	      "past half the budget, the oldest deferred goes");
+	check(rgfxSurfaceOverCaps(t, 0x4000, &why) == -1, "the wired cap still holds");
+	rgfxSurfaceClear(t, d);
+	check(t.deferredBytes == kBgra4k && t.dormantDeferredBytes == kBgra4k && t.dormantCount == 2,
+	      "a deferred block let go leaves both counts");
+	check(rgfxSurfaceOverDeferredCap(t, kBgra4k, &why) == -1, "and the cap holds again");
+
+	// Held again: its bytes leave the dormant count, not the budget's.
+	rgfxSurfaceWake(t, e);
+	check(t.deferredBytes == kBgra4k && t.dormantDeferredBytes == 0 && t.dormantCount == 1,
+	      "a deferred block held again");
+
+	// Undeferred at its ask (not fresh, or refused): keyed by its runs from then on.
+	RgfxSurfaceEntry &u = entries[3];
+	u = RgfxSurfaceEntry{};
+	u.used = u.inPlace = u.pending = true;
+	u.offset = 0x400000;
+	u.size = 0x1000;
+	u.length = 0x2000;
+	u.surface = &surfaceA;
+	rgfxSurfaceDefer(t, u);
+	runs[1] = {0x80000, 0x2000};
+	rgfxSurfaceUndefer(t, u, &runs[1], 1);
+	check(!u.deferred && u.runCount == 1 && t.deferredBytes == kBgra4k,
+	      "its bytes leave the budget");
+	check(rgfxSurfaceFindDeferred(t, &surfaceA) == -1 &&
+	          rgfxSurfaceFind(t, &runs[1], 1, 0x2000, 0x1000, true, &differs) == 3,
+	      "found by its pages, not its surface");
+	rgfxSurfaceClear(t, u);
+	check(t.deferredBytes == kBgra4k, "and its let-go counts nothing twice");
+}
+
 int main()
 {
+	deferred();
 	dormancy();
 	RgfxSurfaceEntry entries[4] = {};
 	RgfxSurfaceTable t = {entries, 4};
