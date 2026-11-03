@@ -11,6 +11,7 @@
 #include "RgfxAcceleratorUserClient.hpp"
 #include "ReimsGraphics.hpp"
 #include "RgfxRegionSpans.hpp"
+#include "RgfxSubmitGate.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -144,16 +145,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodQueueDestroy: {
 		if (a->scalarInputCount != 1)
 			return kIOReturnBadArgument;
-		IOLockLock(queueLock);
-		for (UInt32 i = 0; i < queueCount; i++) {
-			if (queues[i] == in[0]) {
-				owner->unwatchQueue(this, in[0]);
-				owner->closeQueue(in[0]);
-				queues[i] = queues[--queueCount];
-				break;
-			}
-		}
-		IOLockUnlock(queueLock);
+		destroyQueueIfTracked(in[0]);
 		return kIOReturnSuccess;
 	}
 	case kRgfxAccelMethodSubmit:
@@ -271,11 +263,22 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	memcpy(&type, message, sizeof(type));
 	memcpy(&objId, message + kObjIdOffset, sizeof(objId));
 	// Creates and destroys of the client's own objects only: QUEUE_CREATE goes through its own
-	// selector (its rings are checked), CONTEXT_CLOSE is the kext's.
+	// selector (its rings are checked), CONTEXT_CLOSE is the kext's (RgfxSubmitGate.hpp).
 	if (r == kIOReturnSuccess &&
-	    (type <= RGFX_CMD_QUEUE_CREATE || type >= RGFX_CMD_CONTEXT_CLOSE ||
-	     (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context))
+	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context))
 		r = kIOReturnBadArgument;
+	// An OBJECT_DESTROY of one of the client's command queues is the one accepted message that
+	// changes the kext's own tracking: the kext watches the queue's completion ring and lists it.
+	// Route it the way QUEUE_DESTROY goes (stop watching, drop it, post the destroy once), so the
+	// kext never keeps watching a queue the host has torn down, nor scans a completion ring whose
+	// block the client then frees and another process takes. A destroy of any other object names
+	// one only the host tracks, and is posted as it is.
+	if (r == kIOReturnSuccess && rgfxSubmitRoutesQueueDestroy(type) && destroyQueueIfTracked(objId)) {
+		IOFree(message, size);
+		a->scalarOutput[0] = 0;
+		a->structureOutputSize = 0;
+		return kIOReturnSuccess;
+	}
 	// The region the message names lies in the client's own blocks: a process places its heaps,
 	// buffers and library chunks in no one else's memory, nor in the rings or the scanout. Each
 	// block stays pinned until the message is posted and answered, so none is freed, and given
@@ -349,6 +352,25 @@ bool RgfxAcceleratorUserClient::ownsQueue(UInt64 queue)
 		owns = queues[i] == queue;
 	IOLockUnlock(queueLock);
 	return owns;
+}
+
+bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
+{
+	bool found = false;
+	// The whole find, unwatch, close and remove under the queue lock, which QUEUE_CREATE watches
+	// and lists a queue under, so a create of this id cannot slip between the check and the post.
+	IOLockLock(queueLock);
+	for (UInt32 i = 0; i < queueCount; i++) {
+		if (queues[i] == objId) {
+			owner->unwatchQueue(this, objId);
+			owner->closeQueue(objId);
+			queues[i] = queues[--queueCount];
+			found = true;
+			break;
+		}
+	}
+	IOLockUnlock(queueLock);
+	return found;
 }
 
 // kRgfxAccelMethodSurfaceWrites (RgfxAccelerator.hpp): the surfaces a command buffer of one of the

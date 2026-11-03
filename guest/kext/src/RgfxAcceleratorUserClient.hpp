@@ -89,6 +89,12 @@ private:
 	// one of the client's open ones.
 	IOReturn surfaceWritesMethod(IOExternalMethodArguments *arguments);
 	bool ownsQueue(UInt64 queue);
+	// Ends one of the client's command queues `objId` the way kRgfxAccelMethodQueueDestroy does
+	// (stop watching its completion ring, drop it from queues[], post its destroy), under the
+	// queue lock; false where `objId` is not one of the client's queues. QUEUE_DESTROY and a
+	// queue's OBJECT_DESTROY posted through submit both go through it, so the kext never keeps
+	// watching a queue the host has torn down.
+	bool destroyQueueIfTracked(UInt64 objId);
 
 	static const UInt32 kMaxQueues = 256;
 	// The most bytes one kRgfxAccelMethodSurfaceWrites names: 1024 surfaces.
