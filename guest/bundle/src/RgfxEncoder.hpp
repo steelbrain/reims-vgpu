@@ -499,6 +499,13 @@ public:
 	}
 	/// The uses recorded so far, which the caller now holds.
 	std::vector<std::shared_ptr<void>> takeSurfaceUses() { return std::move(m_surfaceUses); }
+	/// Records that the command buffer uses the IOSurface view `shadow`, a copy of the surface's
+	/// pages, which its commit syncs from them where a CPU wrote them since (the Metal shell's
+	/// RgfxSurfaceShadow, opaque here; its caller notes each once a command buffer, by
+	/// keepStamp). Held until taken.
+	void noteSurfaceSync(std::shared_ptr<void> shadow) { m_surfaceSyncs.push_back(std::move(shadow)); }
+	/// The copies recorded so far, which the caller now holds.
+	std::vector<std::shared_ptr<void>> takeSurfaceSyncs() { return std::move(m_surfaceSyncs); }
 	/// Asks the host for the buffer's submission (`RGFX_OP_SUBMITTED`, where the device has
 	/// RGFX_FEATURE_CB_SUBMITTED): it posts RGFX_EVT_CB_SUBMITTED ahead of the buffer's other
 	/// records.
@@ -647,6 +654,7 @@ private:
 	uint64_t m_keepStamp;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;
 	std::vector<std::shared_ptr<void>> m_surfaceUses;
+	std::vector<std::shared_ptr<void>> m_surfaceSyncs;
 	std::vector<RgfxShadowUse> m_shadowUses;
 	void (*m_keep)(void *, const void *) = nullptr;
 	void *m_keepContext = nullptr;

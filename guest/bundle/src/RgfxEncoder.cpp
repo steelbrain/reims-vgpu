@@ -1790,5 +1790,6 @@ void RgfxEncoder::appendSegment(RgfxEncoder &segment, uint32_t reset,
 	segment.m_cur = segment.m_ops;
 	appendAll(m_surfaceWrites, segment.m_surfaceWrites);
 	appendAll(m_surfaceUses, segment.m_surfaceUses);
+	appendAll(m_surfaceSyncs, segment.m_surfaceSyncs);
 	appendAll(m_shadowUses, segment.m_shadowUses);
 }

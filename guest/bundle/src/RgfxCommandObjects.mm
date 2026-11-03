@@ -1415,7 +1415,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
 	// completion.
-	rgfxIOSurfaceSyncBeforeCommit();
+	rgfxIOSurfaceSyncBeforeCommit(_encoder);
 	_surfaceWrites = _encoder->takeSurfaceWrites();
 	// The cached surfaces it uses are named before its first encoder, each with the CPU's
 	// generation of it as of this commit, so the host fills each one's device cache first where

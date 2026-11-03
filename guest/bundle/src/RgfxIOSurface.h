@@ -136,9 +136,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 NS_ASSUME_NONNULL_END
 
-/// Before a commit: syncs every copy this process uses from the surface's pages, where the
-/// surface's seed moved since any holder synced it (a view in place needs none).
-void rgfxIOSurfaceSyncBeforeCommit(void);
+/// Before a commit: syncs each copy the command buffer of `enc` uses or writes (as its encoders
+/// named them, rgfxIOSurfaceNoteUse and rgfxIOSurfaceNoteWrite) from the surface's pages, where
+/// the surface's seed moved since any holder synced it (a view in place needs none). A copy the
+/// buffer does not name is synced at the commit of one that does: Metal has a function reach a
+/// resource only through a binding, an attachment, a blit, or useResource for one an argument
+/// buffer names, and each of those names it.
+void rgfxIOSurfaceSyncBeforeCommit(RgfxEncoder *_Nonnull enc);
 
 /// While one lives on a thread, a surface's block that the thread's texture makes in place asks a
 /// device cache whatever the surface's planes and format: for a video decoder's outputs, whose
@@ -162,13 +166,14 @@ void rgfxIOSurfaceKeepFlush(void);
 void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
 
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
-/// over an IOSurface or a view of one, through any views (otherwise nothing).
+/// over an IOSurface or a view of one, through any views (otherwise nothing), and, where its
+/// view is a copy, that its commit syncs it (rgfxIOSurfaceSyncBeforeCommit).
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, __unsafe_unretained id _Nullable texture);
 
 /// Records on `enc` that its command buffer uses `resource`, when `resource` is a texture over an
-/// IOSurface whose shared block is cached (a device cache on the host), or a view of one, once a
-/// command buffer; otherwise nothing, and nothing at all while no such texture lives in the
-/// process.
+/// IOSurface or a view of one: once a command buffer where its shared block is cached (a device
+/// cache on the host, rgfxIOSurfaceNameUses), and where its view is a copy, that its commit
+/// syncs it (rgfxIOSurfaceSyncBeforeCommit); otherwise nothing.
 void rgfxIOSurfaceNoteUse(RgfxEncoder *_Nullable enc, __unsafe_unretained id _Nullable resource);
 
 /// At a commit, before the command buffer is posted: names in `enc`'s op stream, before its

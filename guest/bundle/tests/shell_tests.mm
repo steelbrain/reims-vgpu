@@ -146,6 +146,7 @@
 uint64_t nextDestroyed(TestRing &ring);
 bool ringEmpty(TestRing &ring);
 void drainRing(TestRing &ring);
+void syncAsCommitted(std::initializer_list<id> textures);
 
 namespace {
 
@@ -5691,6 +5692,18 @@ uint64_t nextDestroyed(TestRing &ring)
 	return expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY).obj_id;
 }
 
+// What a commit syncs of the IOSurface views (rgfxIOSurfaceSyncBeforeCommit) for a command
+// buffer whose encoders named `textures`.
+void syncAsCommitted(std::initializer_list<id> textures)
+{
+	TestRing ring(0x1000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	RgfxEncoder enc(writer, 1, 2);
+	for (id t : textures)
+		rgfxIOSurfaceNoteUse(&enc, t);
+	rgfxIOSurfaceSyncBeforeCommit(&enc);
+}
+
 bool ringEmpty(TestRing &ring)
 {
 	RgfxMsgHeader h = {};
@@ -7187,10 +7200,15 @@ void test_iosurface_shared_block()
 	@autoreleasepool {
 		RgfxIOSurfaceTexture *t = texture(second);
 		CHECK(t != nil && blockIs(0xaaaaaaaa));
-		rgfxIOSurfaceSyncBeforeCommit();
+		syncAsCommitted({t});
 		CHECK(blockIs(0xaaaaaaaa));
 		fill(second, 0x66666666);
-		rgfxIOSurfaceSyncBeforeCommit();
+		// A commit that names no view of the surface leaves it; one that names a view syncs it.
+		syncAsCommitted({});
+		CHECK(blockIs(0xaaaaaaaa));
+		id<MTLTexture> view = [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+		CHECK(view != nil);
+		syncAsCommitted({view});
 		CHECK(blockIs(0x66666666) && headerSeed() == IOSurfaceGetSeed(second));
 		drainRing(fx.ring);
 	}
@@ -8181,7 +8199,7 @@ void test_iosurface_in_place()
 		IOSurfaceLock(flat, 0, nullptr);
 		pixels[5] = 0x77;
 		IOSurfaceUnlock(flat, 0, nullptr);
-		rgfxIOSurfaceSyncBeforeCommit();
+		syncAsCommitted({t});
 		CHECK(blockLeft());
 
 		// The texture's CPU access is the surface's pages.

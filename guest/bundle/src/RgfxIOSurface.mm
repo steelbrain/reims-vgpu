@@ -421,10 +421,11 @@ struct RgfxSurfaceShadow {
 	bool inPlace = false;       // the GPU uses the surface's pages; the block holds no copy
 	bool cached = false;        // in place, and its GPU copy is the host's device cache
 	std::atomic<bool> keepVolatile{false}; // a texture over it set it volatile or empty: unkept
-	// The keep stamp (RgfxEncoder::keepStamp) of the command buffer that last named the view as
-	// used (a cached one, rgfxIOSurfaceNoteUse): each command buffer names it once. Relaxed: a
-	// lost write only names it once more.
+	// The keep stamps (RgfxEncoder::keepStamp) of the command buffers that last named the view
+	// as used (a cached one, rgfxIOSurfaceNoteUse) and as synced at its commit (a copy): each
+	// command buffer names it once. Relaxed: a lost write only names it once more.
 	std::atomic<uint64_t> usedBy{0};
+	std::atomic<uint64_t> syncedBy{0};
 	uint64_t serial = 0;        // the shared block's
 	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the planes' rows of a copy
 	uint32_t seed = 0;          // this process's own block: the seed when it last matched
@@ -1270,25 +1271,10 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 
 @end
 
-void rgfxIOSurfaceSyncBeforeCommit(void)
+void rgfxIOSurfaceSyncBeforeCommit(RgfxEncoder *enc)
 {
-	std::vector<std::shared_ptr<RgfxSurfaceShadow>> live;
-	{
-		Registry &r = registry();
-		std::lock_guard<std::mutex> g(r.lock);
-		for (auto it = r.shadows.begin(); it != r.shadows.end();) {
-			std::shared_ptr<RgfxSurfaceShadow> s = it->second.lock();
-			if (s == nullptr) {
-				it = r.shadows.erase(it);
-				continue;
-			}
-			live.push_back(std::move(s));
-			++it;
-		}
-	}
-	for (const auto &s : live) {
-		s->uploadIfChanged();
-	}
+	for (const std::shared_ptr<void> &p : enc->takeSurfaceSyncs())
+		static_cast<RgfxSurfaceShadow *>(p.get())->uploadIfChanged();
 }
 
 RgfxAskCachedScope::RgfxAskCachedScope()
@@ -1312,21 +1298,36 @@ static const std::shared_ptr<RgfxSurfaceShadow> *rgfxSurfaceView(__unsafe_unreta
 	return root != nil ? &rgfxShadowOfRoot(root) : nullptr;
 }
 
+// Records on `enc`, once its command buffer, that its commit syncs `view` where it is a copy.
+static void rgfxNoteSync(RgfxEncoder *enc, const std::shared_ptr<RgfxSurfaceShadow> &view)
+{
+	if (view->inPlace)
+		return;
+	const uint64_t stamp = enc->keepStamp();
+	if (view->syncedBy.load(std::memory_order_relaxed) == stamp)
+		return;
+	view->syncedBy.store(stamp, std::memory_order_relaxed);
+	enc->noteSurfaceSync(view);
+}
+
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, __unsafe_unretained id texture)
 {
 	if (enc == nullptr)
 		return;
-	if (const std::shared_ptr<RgfxSurfaceShadow> *view = rgfxSurfaceView(texture))
+	if (const std::shared_ptr<RgfxSurfaceShadow> *view = rgfxSurfaceView(texture)) {
 		enc->noteSurfaceWrite(*view);
+		rgfxNoteSync(enc, *view);
+	}
 }
 
 void rgfxIOSurfaceNoteUse(RgfxEncoder *enc, __unsafe_unretained id resource)
 {
-	if (enc == nullptr || gCachedLive.load(std::memory_order_relaxed) == 0)
+	if (enc == nullptr)
 		return;
 	const std::shared_ptr<RgfxSurfaceShadow> *view = rgfxSurfaceView(resource);
 	if (view == nullptr)
 		return;
+	rgfxNoteSync(enc, *view);
 	const uint64_t stamp = enc->keepStamp();
 	if ((*view)->cached && (*view)->usedBy.load(std::memory_order_relaxed) != stamp) {
 		(*view)->usedBy.store(stamp, std::memory_order_relaxed);
