@@ -535,6 +535,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The drain of the message's context, taken at its command buffer's begin
     /// ([`Self::command_buffer_drain`]).
     drain: RefCell<Option<Arc<Drain>>>,
+    /// The waits its command buffer makes for buffers of other queues, taken at its begin, for
+    /// the work the host starts off it ([`Self::wait_for_order_on_cpu`]).
+    order_waits: RefCell<Vec<surface_order::OrderWait<P>>>,
 }
 
 /// What the tests call after each op of a command buffer's walk, with its index, but for the
@@ -582,6 +585,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ticket: RefCell::new(None),
             held_caches: RefCell::new(None),
             drain: RefCell::new(None),
+            order_waits: RefCell::new(Vec::new()),
         }
     }
 
@@ -610,6 +614,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.ticket.get_mut().take();
         self.held_caches.get_mut().take();
         self.drain.get_mut().take();
+        self.order_waits.get_mut().clear();
     }
 
     /// The guest's RAM, through which an IOSurface's own pages are mapped for its GPU view

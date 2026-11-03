@@ -549,15 +549,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .surface_caches
                 .before(device, &cb, &take.uses, may_fill)?,
         };
-        // The buffers of other queues it runs after, on the GPU (`surface_order`).
+        // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
+        // off it (`surface_order`).
         let order_waits = match &take.order {
             Some(waits) if may_fill => {
                 (self.shared.surface_order.lock()).before(device, m.queue_obj_id, &cb, waits)?
             }
-            _ => false,
+            _ => Vec::new(),
         };
+        let order_held = !order_waits.is_empty();
+        *self.order_waits.borrow_mut() = order_waits;
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
-        let (behind, held) = hold(counts, fill_waits || take.waits || order_waits);
+        let (behind, held) = hold(counts, fill_waits || take.waits || order_held);
         Ok(Ok(Begun {
             queue_obj_id: m.queue_obj_id,
             cb_obj_id: m.cb_obj_id,
@@ -1745,6 +1748,108 @@ mod tests {
             .find(|c| c.sel == "encodeWaitForEvent:value:")
             .unwrap();
         assert_eq!(wait.args.get(1), Some(&Arg::U64(1)));
+    }
+
+    /// A video decode of a command buffer that waits for a buffer of another queue starts once
+    /// that buffer has finished: the session's work runs on a queue of its own, which the command
+    /// buffer's GPU wait does not hold, so the host waits on the CPU first. A decode whose named
+    /// buffer has finished starts at once.
+    #[test]
+    fn a_video_decode_waits_for_the_buffers_its_command_buffer_runs_after() {
+        use reims_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
+
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let other = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 9,
+            ..RgfxQueueCreate::default()
+        };
+        let session = RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 40,
+            codec: RGFX_VIDEO_CODEC_H264,
+            direction: RGFX_VIDEO_DECODE,
+        };
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        for m in [other.as_bytes(), session.as_bytes(), buffer.as_bytes()] {
+            assert_eq!(dec.decode(&device, m).unwrap(), Ok(()));
+        }
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let order = |waits: &[(u64, u64)]| {
+            let mut body = Vec::new();
+            for &(queue_obj_id, seqno) in waits {
+                let w = RgfxSurfaceOrderWait {
+                    queue_obj_id,
+                    seqno,
+                };
+                body.extend_from_slice(w.as_bytes());
+            }
+            op(RGFX_OP_SURFACE_ORDER, &body)
+        };
+
+        // Queue 9's buffer at seqno 5, which reads the surface, committed and not finished.
+        let mut read = command_buffer_message(200, 5, &order(&[]));
+        let queue = std::mem::offset_of!(RgfxCommandBuffer, queue_obj_id);
+        read[queue..queue + 8].copy_from_slice(&9u64.to_le_bytes());
+        assert_eq!(dec.decode(&device, &read).unwrap(), Ok(()));
+
+        // Queue 1's decode into the surface names it.
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 16,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            ..RgfxVideoOpDecodeH264::default()
+        };
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = order(&[(9, 5)]);
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()));
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(100, 1, &ops);
+        let mut walker = dec.sender(None, super::super::Sinks::default());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                seen.decodes.lock().is_empty(),
+                "the decode waits for the read"
+            );
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(seen.decodes.lock().len(), 1);
+
+        // Named again once finished: no wait.
+        let message = command_buffer_message(101, 2, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(seen.decodes.lock().len(), 2);
     }
 
     /// A video output whose surface's block has a device cache is handed to the session as in

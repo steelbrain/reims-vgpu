@@ -7,7 +7,10 @@
 //! which starts it at once, as the host takes the committed buffer, after the session's earlier
 //! work; the buffer's later work, and its completion, wait for the session's shared event to
 //! reach the value the work signals once done. The work does not wait for the buffer's earlier
-//! encoders: the guest's video driver encodes none before it.
+//! encoders: the guest's video driver encodes none before it. It does wait for the buffers of
+//! other queues the command buffer runs after (its `SURFACE_ORDER`), on the CPU, as the session's
+//! queue is not the command buffer's ([`super::surface_order`]): a decode whose output another
+//! process still reads lands once the read is done.
 
 use std::sync::Arc;
 
@@ -190,6 +193,9 @@ pub(super) fn decode_op<P: Platform>(
                     cached: chroma_cache.is_some(),
                 },
             };
+            // After the buffers of other queues its command buffer runs after: the reads of the
+            // output it would land over among them.
+            objs.wait_for_order_on_cpu();
             let done = session.decode_h264(&decode)?;
             cb.encode_wait(Some(EventRef::Shared(session.event())), done)?;
             Ok(true)

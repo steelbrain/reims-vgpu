@@ -1505,12 +1505,28 @@ committed in. The bundle names the order instead, as it commits:
   whose order is its ring's. A queue the host does not hold, or a seqno past
   every one the queue's ring has published, names no buffer and waits for
   nothing.
+- Work the host starts off a buffer's own GPU timeline waits for the same
+  buffers on the CPU first: a video session's decode runs on a queue of its own
+  as the host walks the buffer, so its output lands only after the reads and
+  writes of other queues the buffer names.
 - What will not signal is signalled for it: a buffer stood in for signals from
   its stand-in, and one with no stand-in from a command buffer of its own on its
   queue. A queue's destroy, or its context's close, signals the last value a
   buffer waits for of it. A buffer the host has taken that holds no
   `SURFACE_ORDER` signals where another queue's buffer waits past what the
   queue has signalled.
+
+Measured on the lane's RTX 5080 laptop host with a macOS 26.6.1 guest, one boot
+each of the effort's tip before the order (18fd065e5) and with it: the sweep's
+`video.h264.reader`, an AVAssetReader of frames VTDecoderXPCService decodes, failed
+35 of 40 runs, then none of 40; vlprobe's AVAssetReader of 420v frames read
+another frame than its sample's in 96 of 100 runs (39 an earlier one, 56 a
+later one), then in none of 100. A CPU lock needs nothing more: on the MBP16's
+AMD 5300M and Intel 630 (macOS 26.7.1), once a command buffer that writes a
+surface is scheduled, every lock of the surface waits for it, read-only or
+read-write, in its process or another, and then reads what it wrote; a lock
+taken before the buffer is scheduled may not wait. The kext's locks wait for the
+writes named from the commit on, which is inside that.
 
 **Left for later** (extends the same op families, not the transport):
 command-buffer/queue descriptors and `errorOptions`; labels and debug groups

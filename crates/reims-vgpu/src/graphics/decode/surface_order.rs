@@ -35,6 +35,11 @@
 //!   for a queue that makes no command buffer, and may release a waiter before that queue's last
 //!   work ends.
 //!
+//! - **Work the host starts off the command buffer waits too.** A video session's decode runs on
+//!   a queue of its own as the host walks the buffer, so the buffer's GPU waits do not hold it:
+//!   the host waits for the same buffers on the CPU first ([`OrderWait`]), so a decode's output
+//!   lands after the reads of other queues committed before it, as any other write does.
+//!
 //! The order's state is the decoder's `surface_order` lock, a leaf: held while a buffer's waits
 //! and signal are encoded, never across a platform call that may wait. A command buffer made only
 //! to signal ([`Release`]) is made and committed after the lock is let go of.
@@ -145,6 +150,26 @@ impl<P: Platform> Release<P> {
     }
 }
 
+/// A wait of a command buffer for a buffer of another queue ([`SurfaceOrder::before`]), kept for
+/// the work the host starts for the command buffer off it: a video session's decode
+/// ([`super::GraphicsDecoder::wait_for_order_on_cpu`]).
+pub(crate) struct OrderWait<P: Platform> {
+    event: P::SharedEvent,
+    value: u64,
+    marks: Arc<Marks>,
+}
+
+impl<P: Platform> OrderWait<P> {
+    /// Waits on the CPU, at most `milliseconds`, for the buffer waited for to finish; whether it
+    /// did.
+    fn wait(&self, milliseconds: u64) -> bool {
+        self.marks.done.load(Ordering::Acquire) >= self.value
+            || self
+                .event
+                .wait_until_signaled_value(self.value, milliseconds)
+    }
+}
+
 /// What the order did, for the log ([`SurfaceOrder::counts`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OrderCounts {
@@ -252,14 +277,14 @@ impl<P: Platform> SurfaceOrder<P> {
     }
 
     /// Makes `cb`, a command buffer of queue `queue` that holds the op, wait on the GPU for each
-    /// buffer of `waits` not yet finished (the module doc); whether it waits for one.
+    /// buffer of `waits` not yet finished (the module doc); the waits it made, one a queue.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
         queue: u64,
         cb: &P::CommandBuffer,
         waits: &[RgfxSurfaceOrderWait],
-    ) -> RaiseResult<bool> {
+    ) -> RaiseResult<Vec<OrderWait<P>>> {
         self.counts.buffers += 1;
         if self.counts.buffers.is_multiple_of(LOGGED_EVERY) {
             let c = self.counts;
@@ -320,13 +345,22 @@ impl<P: Platform> SurfaceOrder<P> {
                 None => targets.push((q, target)),
             }
         }
+        let mut made = Vec::with_capacity(targets.len());
         for &(q, value) in &targets {
-            if let Some(event) = self.queues.get(&q).and_then(|q| q.event.as_ref()) {
+            let Some(named) = self.queues.get(&q) else {
+                continue;
+            };
+            if let Some(event) = named.event.as_ref() {
                 cb.encode_wait(Some(EventRef::Shared(event)), value)?;
                 self.counts.waits += 1;
+                made.push(OrderWait {
+                    event: event.clone_ref(),
+                    value,
+                    marks: Arc::clone(&named.marks),
+                });
             }
         }
-        Ok(!targets.is_empty())
+        Ok(made)
     }
 
     /// Notes queue `queue`'s buffer at `seqno` taken, and has `cb`, its command buffer or its
@@ -465,6 +499,32 @@ impl<P: Platform> SurfaceOrder<P> {
                 ],
             )
         })
+    }
+}
+
+/// How long the host waits on the CPU, for each buffer of another queue a command buffer waits
+/// for, before work it starts off the command buffer: as long as a decode waits for its output's
+/// device cache to be filled.
+const CPU_WAIT_MS: u64 = 2000;
+
+impl<P: Platform> super::GraphicsDecoder<P> {
+    /// Before the host starts work for the command buffer being walked off it, on a queue its
+    /// GPU waits do not hold (a video session's decode): waits on the CPU for the buffers of other
+    /// queues it waits for ([`OrderWait`]), at most [`CPU_WAIT_MS`] each, once a command buffer. One
+    /// still not finished then is logged, and the work goes on.
+    pub(super) fn wait_for_order_on_cpu(&self) {
+        let waits = std::mem::take(&mut *self.order_waits.borrow_mut());
+        for w in &waits {
+            if !w.wait(CPU_WAIT_MS) {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "surface order: work started off a command buffer waited {CPU_WAIT_MS} ms on \
+                     the CPU for a buffer of another queue at {}, which has not finished; it goes \
+                     on",
+                    w.value
+                );
+            }
+        }
     }
 }
 
