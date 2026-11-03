@@ -1130,9 +1130,16 @@ the kext right behind it, so a retry under a new id leaves nothing behind.
 **A block outlives what lies in it.** A region block is given out again only
 once the host has said that nothing of it is in use. A process's free marks the
 block freed: from then on no message of the process can name it, and no one can
-take it. The free returns at once, as Metal's releases never block. A thread
-call of the kext's own then posts the block's `BLOCK_RELEASE` on ring 0, behind
-every message the process posted before the free, and waits for the answer.
+take it. The free returns at once, as Metal's releases never block. The kext's
+one release worker, a thread call that runs one at a time, then posts the
+block's `BLOCK_RELEASE` on ring 0, behind every message the process posted
+before the free. It posts every freed block's release, 16 under one hold of the
+ring's lock with one doorbell at most, up to 256 in flight, and returns without
+waiting. Each release has an entry of its own, which the work loop finds by
+seqno when its answer comes and then runs the worker to retire it. Answers come
+in whatever order the contexts' work finishes, so a slow context holds back
+only its own blocks, and a storm of frees waits for each context's work once,
+not once a release. A full table leaves the rest freed until entries retire.
 The host refuses the release at once where an object it holds lies in the
 block: a buffer or heap over host memory, or a buffer, texture or heap placed
 in one, which keeps its parent's span after the parent's destroy. It also

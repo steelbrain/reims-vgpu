@@ -1,0 +1,131 @@
+// The native test of RgfxReleaseTable.hpp: releases in flight are answered in any order, an answer
+// that comes before its entry is marked posted still finds it, and one not answered in time is
+// retired as unanswered.
+#include "RgfxReleaseTable.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+int checks = 0;
+
+void check(bool ok, const char *what)
+{
+	checks++;
+	if (!ok) {
+		std::fprintf(stderr, "release_table_test: FAILED: %s\n", what);
+		std::exit(1);
+	}
+}
+
+struct Table {
+	RgfxReleaseEntry entries[4] = {};
+	RgfxReleaseTable t = {entries, 4, 0};
+};
+
+// Reserves an entry for the block at `offset`, posts it as seqno `seqno` at `now`.
+int32_t post(Table &x, uint64_t offset, uint64_t seqno, uint64_t now)
+{
+	const int32_t at = rgfxReleaseReserve(x.t);
+	if (at < 0)
+		return at;
+	x.entries[at].offset = offset;
+	x.entries[at].seqno = seqno;
+	rgfxReleasePosted(x.t, static_cast<uint32_t>(at), now);
+	return at;
+}
+} // namespace
+
+int main()
+{
+	constexpr uint64_t kTimeout = 1000;
+	{
+		// Three releases in flight, answered last first.
+		Table x;
+		check(post(x, 0x1000, 11, 10) >= 0 && post(x, 0x2000, 12, 10) >= 0 &&
+		          post(x, 0x3000, 13, 10) >= 0,
+		      "three releases posted");
+		check(x.t.inFlight == 3, "all three in flight");
+		RgfxReleaseEntry e;
+		bool answered = false;
+		check(!rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered), "none done yet");
+		check(rgfxReleaseAnswer(x.t, 13, 0), "the last posted answered first");
+		check(rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered) && answered &&
+		          e.offset == 0x3000 && e.status == 0,
+		      "and retired first, the others still waiting");
+		check(!rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered), "the others are not done");
+		check(rgfxReleaseAnswer(x.t, 11, 2) && rgfxReleaseAnswer(x.t, 12, 0),
+		      "the first two answered, one refused");
+		bool sawRefused = false, sawOk = false;
+		while (rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered)) {
+			check(answered, "an answered release");
+			sawRefused |= e.offset == 0x1000 && e.status == 2;
+			sawOk |= e.offset == 0x2000 && e.status == 0;
+		}
+		check(sawRefused && sawOk, "each answer its own release's");
+		check(x.t.inFlight == 0, "nothing in flight");
+	}
+	{
+		// The answer comes before the poster marks the entry posted: the post wrote the seqno
+		// before the message was published.
+		Table x;
+		const int32_t at = rgfxReleaseReserve(x.t);
+		x.entries[at].offset = 0x5000;
+		x.entries[at].seqno = 21;
+		check(rgfxReleaseAnswer(x.t, 21, 0), "an answer to a release still posting");
+		rgfxReleasePosted(x.t, static_cast<uint32_t>(at), 30);
+		check(x.entries[at].state == kRgfxReleaseAnswered, "stays answered once marked posted");
+		RgfxReleaseEntry e;
+		bool answered = false;
+		check(rgfxReleaseTakeDone(x.t, 30, kTimeout, &e, &answered) && answered &&
+		          e.offset == 0x5000,
+		      "and is retired");
+	}
+	{
+		// What is not a release in flight is not taken.
+		Table x;
+		post(x, 0x1000, 31, 10);
+		check(!rgfxReleaseAnswer(x.t, 0, 0), "seqno 0 names none");
+		check(!rgfxReleaseAnswer(x.t, 99, 0), "another message's answer is not a release's");
+		check(rgfxReleaseAnswer(x.t, 31, 0), "its own is");
+		check(!rgfxReleaseAnswer(x.t, 31, 0), "a second answer to it is not taken");
+		const int32_t at = rgfxReleaseReserve(x.t);
+		check(!rgfxReleaseAnswer(x.t, 0, 0), "a reserved entry has no seqno to answer");
+		rgfxReleaseUnposted(x.t, static_cast<uint32_t>(at));
+		check(x.t.inFlight == 1, "an entry not posted is free again");
+	}
+	{
+		// Not answered in time: retired unanswered, the oldest first in the timer's eyes.
+		Table x;
+		post(x, 0x1000, 41, 100);
+		post(x, 0x2000, 42, 500);
+		check(rgfxReleaseOldest(x.t) == 100, "the oldest waiting");
+		RgfxReleaseEntry e;
+		bool answered = true;
+		check(!rgfxReleaseTakeDone(x.t, 100 + kTimeout - 1, kTimeout, &e, &answered),
+		      "not before its time");
+		check(rgfxReleaseTakeDone(x.t, 100 + kTimeout, kTimeout, &e, &answered) && !answered &&
+		          e.offset == 0x1000,
+		      "retired unanswered at its time");
+		check(rgfxReleaseOldest(x.t) == 500, "the next oldest");
+		check(!rgfxReleaseAnswer(x.t, 41, 0), "a late answer finds nothing");
+		check(rgfxReleaseAnswer(x.t, 42, 0) &&
+		          rgfxReleaseTakeDone(x.t, 600, kTimeout, &e, &answered) && answered,
+		      "an answered release goes before its time");
+		check(rgfxReleaseOldest(x.t) == 0, "none waiting");
+	}
+	{
+		// A full table reserves nothing until an entry is retired.
+		Table x;
+		for (uint64_t i = 0; i < 4; i++)
+			check(post(x, 0x1000 * (i + 1), 50 + i, 10) >= 0, "a release posted");
+		check(rgfxReleaseReserve(x.t) < 0, "the table is full");
+		check(rgfxReleaseAnswer(x.t, 52, 0), "one answered");
+		RgfxReleaseEntry e;
+		bool answered = false;
+		check(rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered), "and retired");
+		check(rgfxReleaseReserve(x.t) >= 0, "which frees an entry");
+	}
+	std::printf("release_table_test: OK (%d checks)\n", checks);
+	return 0;
+}

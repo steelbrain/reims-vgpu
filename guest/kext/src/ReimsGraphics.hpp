@@ -173,6 +173,18 @@ public:
 	typedef void (*QueueInterruptHook)(OSObject *target);
 	void setQueueInterrupt(OSObject *target, QueueInterruptHook hook);
 
+	// The accelerator's block releases, which no thread waits for. postReleases puts `count`
+	// BLOCK_RELEASEs on the control ring in order, as many at a time as fit, under one hold of
+	// its lock and with one doorbell at most, waiting for room as post does; it writes each one's
+	// seqno into *waiterSeqnos[i] before the message is published, and counts those posted in
+	// *posted, which is `count` on success. setReleaseAnswer names the accelerator (retained) and
+	// its hook, which the work loop calls with each COMPLETE no lifecycle waiter takes, before the
+	// display's; the hook answers whether the seqno was a release of its own. nullptr clears it.
+	typedef bool (*ReleaseAnswerHook)(OSObject *target, UInt64 seqno, UInt32 status);
+	void setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook);
+	IOReturn postReleases(const RgfxBlockRelease *releases, UInt32 count,
+	                      UInt64 *const *waiterSeqnos, UInt32 *posted);
+
 	// The accelerator's object lifecycle (a create or destroy, QUEUE_CREATE, CONTEXT_CLOSE) on
 	// the control ring: `message` is the whole message in kernel memory, at most
 	// kLifecycleMessageMax bytes, whose header is stamped here with `type`, its size and the
@@ -271,6 +283,11 @@ private:
 	             UInt64 *waiterSeqno = nullptr);
 	IOReturn post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
 	              UInt64 *waiterSeqno = nullptr);
+	// tryPost's halves, submitLock held: writeLocked writes one message where it fits, and
+	// publishLocked publishes what was written.
+	bool writeLocked(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
+	                 UInt64 *waiterSeqno);
+	void publishLocked();
 	IOReturn command(UInt32 type, const void *message, UInt32 size);
 	void kickWorkLoop();
 
@@ -348,9 +365,11 @@ private:
 	RgfxPipeClients<OSObject *, kMaxPipeClients> pipes;
 	PipeVblankHook pipeVblankHook;
 	PipePresentHook pipePresentHook;
-	// The accelerator (retained) and its queue-interrupt hook.
+	// The accelerator (retained) and its queue-interrupt hook; and, the same, its release hook.
 	OSObject *queueTarget;
 	QueueInterruptHook queueHook;
+	OSObject *releaseTarget;
+	ReleaseAnswerHook releaseHook;
 
 	// The work loop's alone: what SET_VBLANK last asked, the refreshes' times, and a display
 	// refresh after DISPLAY_CHANGED, waiting to be sent or answered.

@@ -52,6 +52,7 @@
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxLatency.hpp"
+#include "RgfxReleaseTable.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -95,6 +96,11 @@ constexpr UInt32 kDormantRoomMs = 100;
 constexpr UInt32 kDormantRoomBlocks = 16;
 // How often the releases' line is logged at most.
 constexpr UInt32 kReleaseLogMs = 10000;
+// The most BLOCK_RELEASEs in flight at once (RgfxReleaseTable.hpp): 40 bytes each on ring 0,
+// under a third of its 32 KiB.
+constexpr UInt32 kMaxReleases = 256;
+// The releases posted under one hold of the ring's lock, with one doorbell at most.
+constexpr UInt32 kReleaseBatch = 16;
 
 UInt64 alignUp(UInt64 value, UInt64 align)
 {
@@ -223,10 +229,89 @@ void noteReserve();
 void noteReleases();
 void unwire(void *pages);
 
-// The release thread call: lets go of the dormant blocks their surfaces asked to go
-// (reapDormant), then posts each freed block's BLOCK_RELEASE in turn and waits for its answer
-// here, never on the freeing thread. OK gives the block out again; a refusal, or no answer in
-// time, keeps it until its owner's close is answered.
+// The releases in flight (RgfxReleaseTable.hpp), made at the first context's open, under
+// releaseLock, which the work loop takes to hand an answer over; and the timer that runs the
+// worker once the oldest release waited kReleaseAnswerMs.
+IOLock *releaseLock = nullptr;
+RgfxReleaseTable releaseTable = {nullptr, 0, 0};
+thread_call_t releaseTimer = nullptr;
+bool releaseHooked = false;
+
+// The framebuffer's work loop hands each COMPLETE no lifecycle waiter takes here first: an
+// answer to a release in flight is recorded, and the worker runs to retire it.
+bool releaseAnswered(OSObject *, UInt64 seqno, UInt32 status)
+{
+	IOLock *lock = __atomic_load_n(&releaseLock, __ATOMIC_ACQUIRE);
+	if (!lock)
+		return false;
+	IOLockLock(lock);
+	const bool mine = rgfxReleaseAnswer(releaseTable, seqno, status);
+	IOLockUnlock(lock);
+	if (mine)
+		thread_call_enter(releaseCall);
+	return mine;
+}
+
+void releaseTimerFired(thread_call_param_t, thread_call_param_t)
+{
+	thread_call_enter(releaseCall);
+}
+
+// A release done with: answered OK, the block goes out again; refused, or not answered in time,
+// or never posted, it is kept until a context close (rgfxBlockReleased).
+void finishRelease(const RgfxReleaseEntry &e, bool answered)
+{
+	const bool ok = answered && e.status == RGFX_STATUS_OK;
+	// A cached block's pages hold its cache now, or never will: its surface's locks go on,
+	// before the block can be anyone else's.
+	rgfxSurfaceCacheReleased(e.offset);
+	IOLockLock(contextLock);
+	if (e.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
+		dormantStats.unread++;
+		dormantStats.unreadWritten += e.written;
+		dormantStats.changes++;
+	}
+	void *wired = nullptr;
+	rgfxBlockReleased(blockTable, e.offset, e.serial, ok, &wired);
+	rgfxLatencyAdd(releaseStats.latency, nanosSince(e.freedAt, mach_absolute_time()));
+	releaseStats.kept += !ok;
+	// A new block waiting for the region's room looks again.
+	IOLockWakeup(contextLock, &surfaceTable, false);
+	IOLockUnlock(contextLock);
+	// The device no longer maps an in-place block's pages once it has answered OK: unwire them,
+	// out of the lock.
+	unwire(wired);
+	if (!ok)
+		IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
+		      e.context, e.offset, e.size,
+		      answered ? "the device refused its release" : "its release was not answered");
+}
+
+// Retires every release answered, or waiting past kReleaseAnswerMs.
+void retireReleases()
+{
+	uint64_t timeout = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kReleaseAnswerMs) * 1000000ull, &timeout);
+	for (;;) {
+		RgfxReleaseEntry e;
+		bool answered = false;
+		IOLockLock(releaseLock);
+		const bool any =
+		    rgfxReleaseTakeDone(releaseTable, mach_absolute_time(), timeout, &e, &answered);
+		IOLockUnlock(releaseLock);
+		if (!any)
+			return;
+		finishRelease(e, answered);
+	}
+}
+
+// The release thread call, the guest's one (THREAD_CALL_OPTIONS_ONCE): lets go of the dormant
+// blocks their surfaces asked to go (reapDormant); retires the releases answered; then posts
+// each freed block's BLOCK_RELEASE on ring 0, kReleaseBatch at a time with one doorbell at most,
+// as many as the release table holds, and returns without waiting for any. The work loop hands
+// each answer to its entry, in whatever order the contexts' command buffers finish, and runs the
+// worker again to retire it; so releases posted together wait for their contexts' drains at
+// once, and a slow context holds back only its own blocks. Never on the freeing thread.
 void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
@@ -239,62 +324,114 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 	reapDormant();
 	IOLockUnlock(contextLock);
 	noteDormant();
-	for (;;) {
-		RgfxBlock block;
-		IOLockLock(contextLock);
-		bool any = rgfxBlockNextRelease(blockTable, &block);
-		if (any && !releaseStats.inFlightMost)
-			releaseStats.inFlightMost = 1;
-		IOLockUnlock(contextLock);
-		if (!any) {
-			noteReleases();
-			return;
+	// The answers come through the framebuffer's work loop: name this worker's hook there
+	// before the first release is posted.
+	if (!releaseHooked) {
+		if (ReimsGraphics *fb = accel->copyFramebuffer()) {
+			fb->setReleaseAnswer(accel, &releaseAnswered);
+			fb->release();
+			releaseHooked = true;
 		}
-		RgfxBlockRelease release = {};
-		release.context = block.context;
-		release.offset = block.offset;
-		release.size = block.size;
-		// A cached surface with no client left has no process to read its pages, the kext's
-		// reference the last but IOSurface's own (the display pipe names a surface by its ID and
-		// holds none): its cache's writes need not reach them. Its clients are read here, out of
-		// every lock, as at a block's sleep.
-		bool written = false;
-		if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
-			release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
-			surface->release();
-		}
-		RgfxComplete answer = {};
-		UInt32 length = 0;
-		IOReturn r = accel->postLifecycle(RGFX_CMD_BLOCK_RELEASE, &release, sizeof(release),
-		                                  RGFX_EVT_COMPLETE, &answer, sizeof(answer), &length,
-		                                  nullptr, kReleaseAnswerMs);
-		bool ok = r == kIOReturnSuccess && length >= sizeof(answer) &&
-		          answer.status == RGFX_STATUS_OK;
-		// A cached block's pages hold its cache now, or never will: its surface's locks go on,
-		// before the block can be anyone else's.
-		rgfxSurfaceCacheReleased(block.offset);
-		IOLockLock(contextLock);
-		if (release.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
-			dormantStats.unread++;
-			dormantStats.unreadWritten += written;
-			dormantStats.changes++;
-		}
-		void *wired = nullptr;
-		rgfxBlockReleased(blockTable, block.offset, block.serial, ok, &wired);
-		rgfxLatencyAdd(releaseStats.latency, nanosSince(block.freedAt, mach_absolute_time()));
-		releaseStats.kept += !ok;
-		// A new block waiting for the region's room looks again.
-		IOLockWakeup(contextLock, &surfaceTable, false);
-		IOLockUnlock(contextLock);
-		// The device no longer maps an in-place block's pages once it has answered OK: unwire
-		// them, out of the lock.
-		unwire(wired);
-		if (!ok)
-			IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
-			      block.context, block.offset, block.size,
-			      r == kIOReturnSuccess ? "the device refused its release"
-			                            : "its release was not answered");
 	}
+	retireReleases();
+	for (bool more = true; more;) {
+		// A batch of freed blocks, each in an entry of its own, posted at once.
+		RgfxBlockRelease batch[kReleaseBatch];
+		UInt64 *seqnos[kReleaseBatch];
+		int32_t at[kReleaseBatch];
+		UInt32 n = 0;
+		while (n < kReleaseBatch) {
+			IOLockLock(releaseLock);
+			at[n] = rgfxReleaseReserve(releaseTable);
+			IOLockUnlock(releaseLock);
+			// A full table: the answers that free its entries run the worker again.
+			if (at[n] < 0) {
+				more = false;
+				break;
+			}
+			RgfxReleaseEntry &e = releaseTable.entries[at[n]];
+			RgfxBlock block;
+			IOLockLock(contextLock);
+			const bool any = rgfxBlockNextRelease(blockTable, &block);
+			IOLockUnlock(contextLock);
+			if (!any) {
+				IOLockLock(releaseLock);
+				rgfxReleaseUnposted(releaseTable, static_cast<uint32_t>(at[n]));
+				IOLockUnlock(releaseLock);
+				more = false;
+				break;
+			}
+			RgfxBlockRelease &release = batch[n];
+			release = {};
+			release.context = block.context;
+			release.offset = block.offset;
+			release.size = block.size;
+			// A cached surface with no client left has no process to read its pages, the
+			// kext's reference the last but IOSurface's own (the display pipe names a surface
+			// by its ID and holds none): its cache's writes need not reach them. Its clients
+			// are read here, out of every lock, as at a block's sleep.
+			bool written = false;
+			if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
+				release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
+				surface->release();
+			}
+			IOLockLock(releaseLock);
+			e.offset = block.offset;
+			e.serial = block.serial;
+			e.size = block.size;
+			e.context = block.context;
+			e.freedAt = block.freedAt;
+			e.flags = release.flags;
+			e.written = written;
+			IOLockUnlock(releaseLock);
+			seqnos[n] = &e.seqno;
+			n++;
+		}
+		if (!n)
+			break;
+		// Each post writes its entry's seqno before the message is published, so an answer that
+		// comes before the entry is marked posted finds it.
+		UInt32 posted = 0;
+		ReimsGraphics *fb = accel->copyFramebuffer();
+		if (fb) {
+			fb->postReleases(batch, n, seqnos, &posted);
+			fb->release();
+		}
+		RgfxReleaseEntry unposted[kReleaseBatch];
+		IOLockLock(releaseLock);
+		const uint64_t now = mach_absolute_time();
+		for (UInt32 i = 0; i < n; i++) {
+			if (i < posted) {
+				rgfxReleasePosted(releaseTable, static_cast<uint32_t>(at[i]), now);
+			} else {
+				unposted[i] = releaseTable.entries[at[i]];
+				rgfxReleaseUnposted(releaseTable, static_cast<uint32_t>(at[i]));
+			}
+		}
+		const UInt32 inFlight = releaseTable.inFlight;
+		IOLockUnlock(releaseLock);
+		IOLockLock(contextLock);
+		if (inFlight > releaseStats.inFlightMost)
+			releaseStats.inFlightMost = inFlight;
+		IOLockUnlock(contextLock);
+		// Not on the ring: kept, as an unanswered release is.
+		for (UInt32 i = posted; i < n; i++)
+			finishRelease(unposted[i], false);
+		if (posted < n)
+			more = false;
+	}
+	// What was answered while this run posted, and a timer for the oldest still waiting.
+	retireReleases();
+	IOLockLock(releaseLock);
+	const uint64_t oldest = rgfxReleaseOldest(releaseTable);
+	IOLockUnlock(releaseLock);
+	if (oldest) {
+		uint64_t timeout = 0;
+		nanoseconds_to_absolutetime(static_cast<uint64_t>(kReleaseAnswerMs) * 1000000ull,
+		                            &timeout);
+		thread_call_enter_delayed(releaseTimer, oldest + timeout);
+	}
+	noteReleases();
 }
 } // namespace
 
@@ -320,15 +457,24 @@ bool RgfxAccelerator::startContexts()
 	// loop that delivers its answers, so the one worker never starves that loop.
 	thread_call_t call = thread_call_allocate_with_options(
 	    releaseFreedBlocks, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+	// The releases in flight, and the timer for the oldest's answer.
+	IOLock *rlock = IOLockAlloc();
+	RgfxReleaseEntry *releases =
+	    static_cast<RgfxReleaseEntry *>(IOMalloc(sizeof(RgfxReleaseEntry) * kMaxReleases));
+	thread_call_t timer = thread_call_allocate(releaseTimerFired, nullptr);
 	RgfxBlock *expected = nullptr;
-	if (lock && wlock && table && rings && call &&
+	if (lock && wlock && table && rings && call && rlock && releases && timer &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
 	                                __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
 		bzero(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
+		bzero(releases, sizeof(RgfxReleaseEntry) * kMaxReleases);
 		watched = rings;
 		watchLock = wlock;
 		releaseCall = call;
+		releaseTable = {releases, kMaxReleases, 0};
+		releaseTimer = timer;
+		__atomic_store_n(&releaseLock, rlock, __ATOMIC_RELEASE);
 		const UInt32 features = readRegister(RGFX_REG_FEATURES_LO);
 		surfacePages = (features & RGFX_FEATURE_SURFACE_PAGES) != 0;
 		surfaceCache = surfacePages && (features & RGFX_FEATURE_SURFACE_CACHE) != 0;
@@ -361,6 +507,12 @@ bool RgfxAccelerator::startContexts()
 		IOFree(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
 	if (call)
 		thread_call_free(call);
+	if (rlock)
+		IOLockFree(rlock);
+	if (releases)
+		IOFree(releases, sizeof(RgfxReleaseEntry) * kMaxReleases);
+	if (timer)
+		thread_call_free(timer);
 	// Another opener is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		IOSleep(1);

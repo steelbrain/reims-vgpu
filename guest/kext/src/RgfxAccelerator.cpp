@@ -402,9 +402,11 @@ void RgfxAccelerator::stop(IOService *provider)
 		IOLockUnlock(bundle.lock);
 		thread_call_free(bundle.call);
 	}
-	// The framebuffer stops calling queueInterrupt (and lets this accelerator go).
+	// The framebuffer stops calling queueInterrupt and the release hook (and lets this
+	// accelerator go).
 	if (ReimsGraphics *fb = copyFramebuffer()) {
 		fb->setQueueInterrupt(nullptr, nullptr);
+		fb->setReleaseAnswer(nullptr, nullptr);
 		fb->release();
 	}
 	super::stop(provider);

@@ -158,18 +158,27 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt6
 {
 	if (size < kHeaderBytes || size % kMsgAlign || size > kLifecycleMessageMax || !ready)
 		return false;
+	IOSimpleLockLock(submitLock);
+	const bool written = writeLocked(type, message, size, seqno, waiterSeqno);
+	if (written)
+		publishLocked();
+	IOSimpleLockUnlock(submitLock);
+	return written;
+}
+
+// Writes one command at the producer's place if it fits, submitLock held, without publishing
+// it: false where the ring has no room for it.
+bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
+                                UInt64 *waiterSeqno)
+{
 	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
 	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
-
-	IOSimpleLockLock(submitLock);
 	UInt64 used = produced - load64(header + kRingConsumer);
 	UInt32 offset = static_cast<UInt32>(produced) & kRingMask;
 	UInt32 tail = kRingBytes - offset;
 	UInt32 pad = tail < size ? tail : 0;
-	if (used > kRingBytes || kRingBytes - used < static_cast<UInt64>(pad) + size) {
-		IOSimpleLockUnlock(submitLock);
+	if (used > kRingBytes || kRingBytes - used < static_cast<UInt64>(pad) + size)
 		return false;
-	}
 	if (pad) {
 		// A message never wraps: type 0 pads to the ring's end. When 8
 		// bytes are left, they hold its type and size alone.
@@ -198,15 +207,20 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt6
 		dst[i] = w;
 	}
 	produced += size;
+	if (seqno)
+		*seqno = s;
+	return true;
+}
+
+// Publishes what writeLocked wrote, submitLock held: the doorbell rings only when the host's
+// consumer sleeps.
+void ReimsGraphics::publishLocked()
+{
+	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
 	store64(header + kRingProducer, produced);
 	fullFence();
 	if (load32(header + kRingConsumerIdle) == 1)
 		writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
-	IOSimpleLockUnlock(submitLock);
-
-	if (seqno)
-		*seqno = s;
-	return true;
 }
 
 // Puts one command on ring 0, waiting for space: thread context only.
@@ -462,6 +476,19 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		if (answerLifecycle(type, seqno, payload, size))
 			return;
 		UInt32 status = size >= sizeof(uint32_t) ? field32(payload, 0) : kStatusUnreadable;
+		// A block release's, which no thread waits for: the accelerator's.
+		IOSimpleLockLock(interruptLock);
+		OSObject *releases = releaseTarget;
+		ReleaseAnswerHook releasesHook = releaseHook;
+		if (releases)
+			releases->retain();
+		IOSimpleLockUnlock(interruptLock);
+		if (releases) {
+			const bool released = releasesHook(releases, seqno, status);
+			releases->release();
+			if (released)
+				return;
+		}
 		answer(seqno, status);
 		// Every pipe client: the one whose transaction this answers takes it, at the time of
 		// the refresh the host answered in.
@@ -1121,6 +1148,7 @@ void ReimsGraphics::free()
 		clients[i]->release();
 	}
 	OSSafeReleaseNULL(queueTarget);
+	OSSafeReleaseNULL(releaseTarget);
 	super::free();
 }
 
@@ -2036,6 +2064,55 @@ void ReimsGraphics::setQueueInterrupt(OSObject *target, QueueInterruptHook hook)
 	IOSimpleLockUnlock(interruptLock);
 	if (old)
 		old->release();
+}
+
+void ReimsGraphics::setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook)
+{
+	if (!hook)
+		target = nullptr;
+	if (target)
+		target->retain();
+	IOSimpleLockLock(interruptLock);
+	OSObject *old = releaseTarget;
+	releaseTarget = target;
+	releaseHook = target ? hook : nullptr;
+	IOSimpleLockUnlock(interruptLock);
+	if (old)
+		old->release();
+}
+
+IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 count,
+                                     UInt64 *const *waiterSeqnos, UInt32 *posted)
+{
+	static_assert(sizeof(RgfxBlockRelease) % kMsgAlign == 0 &&
+	                  sizeof(RgfxBlockRelease) <= kLifecycleMessageMax,
+	              "a release is not a whole message");
+	*posted = 0;
+	for (UInt32 waited = 0; *posted < count;) {
+		if (!ready)
+			return kIOReturnNotReady;
+		// As many as fit, under one hold of the ring's lock and with one doorbell at most.
+		UInt32 n = 0;
+		IOSimpleLockLock(submitLock);
+		while (*posted + n < count &&
+		       writeLocked(RGFX_CMD_BLOCK_RELEASE, &releases[*posted + n], sizeof(*releases),
+		                   nullptr, waiterSeqnos[*posted + n]))
+			n++;
+		if (n)
+			publishLocked();
+		IOSimpleLockUnlock(submitLock);
+		*posted += n;
+		if (*posted == count)
+			break;
+		if (waited >= kPostTimeoutMs) {
+			IOLog("ReimsGraphics: command %u: the control ring stayed full\n",
+			      RGFX_CMD_BLOCK_RELEASE);
+			return kIOReturnTimeout;
+		}
+		IOSleep(1);
+		waited++;
+	}
+	return kIOReturnSuccess;
 }
 
 void ReimsGraphics::setPipeVblankEnabled(OSObject *client, bool enabled)
