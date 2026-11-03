@@ -29,7 +29,8 @@
 # LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
 # PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
 # load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
-# (the host's REIMS_VGPU_LOG filter, default info).
+# (the host's REIMS_VGPU_LOG filter, default info). A probe boot (probe-batch.sh) sets PROBES,
+# PROBE_RESULTS and PROBE_TIP in place of PHASES and CORPUS (msi-probes.sh says what they are).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
 . "$R/boot.env"
@@ -112,8 +113,11 @@ finish() {
 }
 trap finish EXIT
 
+# A probe boot (PROBES) runs msi-probes.sh in place of guest-run.sh, with no corpus.
+needs=("$PAYLOAD/guest-run.sh" "$CORPUS/MANIFEST")
+[[ -n ${PROBES:-} ]] && needs=("$PAYLOAD/bench" "$(dirname "$0")/msi-probes.sh")
 for f in "$QEMU" "$(dirname "$QEMU")/qemu-bundle/usr/local/share/qemu/efi-virtio.rom" "$ROM" "$OC" "$DISK" \
-  "$PAYLOAD/guest-run.sh" "$CORPUS/MANIFEST" "$RGK_RUN/rgk-boot2.sh"; do
+  "${needs[@]}" "$RGK_RUN/rgk-boot2.sh"; do
   [[ -s $f ]] || { log "BOOT_FAIL missing $f"; exit 2; }
 done
 log "boot $TAG ($([[ ${EXCLUSIVE:-1} == 1 ]] && echo exclusive || echo shared)): QEMU $QEMU, ROM $ROM, OC $OC"
@@ -281,7 +285,7 @@ copy_failed_state() {
 copied=0
 for try in 1 2 3; do
   G "rm -rf ~/lane-gate" && Gcp "$PAYLOAD" "$GUEST_USER@127.0.0.1:lane-gate" &&
-    Gcp "$CORPUS" "$GUEST_USER@127.0.0.1:lane-gate/corpus" && { copied=1; break; }
+    { [[ -n ${PROBES:-} ]] || Gcp "$CORPUS" "$GUEST_USER@127.0.0.1:lane-gate/corpus"; } && { copied=1; break; }
   log "copying the payload into the guest failed (try $try): $(ssh_state)"
   sleep 15
 done
@@ -320,6 +324,15 @@ if command -v nvidia-smi > /dev/null; then
 fi
 # The host's load beside the measurements (other work on the host shares its CPU and memory).
 kv load_start "$(cut -d' ' -f1 /proc/loadavg)"
+# A probe boot: the round's probes back to back (msi-probes.sh), and nothing of the gate's run.
+if [[ -n ${PROBES:-} ]]; then
+  log "probes: $(ls "$PROBES" | tr '\n' ' ')$(left) s left"
+  PROBES=$PROBES PROBE_RESULTS=$PROBE_RESULTS PROBE_TIP=$PROBE_TIP DEADLINE=$(( T0 + HOLD_S - 20 )) B=$B R=$R \
+    PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS bash "$(dirname "$0")/msi-probes.sh" 2>&1 | tee -a "$R/boot.log"
+  kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
+  log "probes done"
+  exit 0
+fi
 log "guest run: ${PHASES:-all phases}, $(left) s left"
 ts() { perl -MTime::HiRes=time -ne '$| = 1; printf "%.3f %s", time, $_'; }
 guest_rc=0
