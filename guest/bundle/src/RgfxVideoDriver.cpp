@@ -8,16 +8,18 @@
  * AVD_CreateAVDAccelerator for a table of sixteen entry points. It does so in
  * VTDecoderXPCService and VTEncoderXPCService, one of each per client process.
  *
- * The driver decodes H.264 on the host's hardware, where the host's video caps list it
- * (RgfxVideoChannel.hpp). The capability block lists a video engine and a graphics engine, the
- * H.264 decode pipeline (head, decode, frame transfer) and frame processing; the entry points
- * answer AppleGVA's questions (the bitstream alignment, the frames' layout, the capability
+ * The driver decodes H.264 and HEVC on the host's hardware, each where the host's video caps
+ * list it (RgfxVideoChannel.hpp), HEVC in the profiles they list: Main into NV12, Main 10 into
+ * P010. The capability block lists a video engine and a graphics engine, each codec's decode
+ * pipeline (head, decode, frame transfer) and frame processing; the entry points answer
+ * AppleGVA's questions (the bitstream alignment, the frames' layout, the capability
  * parameters), hand out bitstream buffers of whole pages, open a host session per decode
  * context, and send each decode command to it as a command buffer of the session's queue, its
  * access unit copied out of AppleGVA's buffer, with the SPS and PPS written back out of
- * AppleGVA's records where they changed (RgfxVideoH264.hpp). A command's token is answered done
- * once its command buffer completed, which is once the picture is in the output surface. The host keeps the decoded
- * picture buffer itself, from the stream: AppleGVA's commands name no references.
+ * AppleGVA's records where they changed (RgfxVideoH264.hpp, RgfxVideoH265.hpp). A command's
+ * token is answered done once its command buffer completed, which is once the picture is in
+ * the output surface. The host keeps the decoded picture buffer itself, from the stream:
+ * AppleGVA's commands name no references.
  *
  * AppleGVA hands this driver a session only where it picks the AMD driver for the flow: on a
  * board without an Intel GPU, or with com.apple.AppleGVA's gvaForceAMDKE set.
@@ -34,11 +36,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <initializer_list>
 #include <mutex>
 #include <vector>
 
 #include "RgfxVideoChannel.hpp"
 #include "RgfxVideoH264.hpp"
+#include "RgfxVideoH265.hpp"
 
 namespace {
 
@@ -130,9 +134,10 @@ enum : uint32_t {
 	kFunctionPipeline = 0x80,
 };
 constexpr uint64_t kCodecH264 = 0x8;
+constexpr uint64_t kCodecHevc = 0x800;
 
 Function &addFunction(CapabilityBlock &b, uint32_t function_id, uint64_t sub_id, uint32_t in,
-		      uint32_t out, uint32_t engine = kVideoEngine)
+		      std::initializer_list<uint32_t> outs, uint32_t engine = kVideoEngine)
 {
 	Function &f = b.function[b.function_count];
 	f.function_id = function_id;
@@ -142,10 +147,21 @@ Function &addFunction(CapabilityBlock &b, uint32_t function_id, uint64_t sub_id,
 	f.field_20 = kEngineBudget;
 	f.input_count = 1;
 	f.inputs[0] = {in, 1};
-	f.output_count = 1;
-	f.outputs[0] = {out, 1};
+	for (uint32_t out : outs)
+		f.outputs[f.output_count++] = {out, 1};
 	b.function_list[b.function_count++] = &f;
 	return f;
+}
+
+// A decoder as AppleGVA looks it up: a pipeline head, whose next is the decode of `codec`, a
+// bitstream in and frames of `outs` out, whose next is a transfer of its frames.
+void addDecoder(CapabilityBlock &b, uint64_t codec, std::initializer_list<uint32_t> outs)
+{
+	Function &head = addFunction(b, kFunctionPipeline, 1, 'rawb', {'rawb'});
+	Function &decode = addFunction(b, kFunctionDecode, codec, 'rawb', outs);
+	Function &transfer = addFunction(b, kFunctionTransfer, 1, 'NV12', {'NV12'});
+	head.next = &decode;
+	decode.next = &transfer;
 }
 
 void fillCapabilities(CapabilityBlock &b)
@@ -161,17 +177,24 @@ void fillCapabilities(CapabilityBlock &b)
 	b.engine_list[1] = &b.engine[1];
 	b.engine_count = 2;
 	b.engines = b.engine_list;
-	// H.264 decode, where the host's hardware takes it: the pipeline head, the decode, the
-	// transfer of its frames.
-	if (rgfx::video::hostCodec(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE)) {
-		Function &head = addFunction(b, kFunctionPipeline, 1, 'rawb', 'rawb');
-		Function &decode = addFunction(b, kFunctionDecode, kCodecH264, 'rawb', 'NV12');
-		Function &transfer = addFunction(b, kFunctionTransfer, 1, 'NV12', 'NV12');
-		head.next = &decode;
-		decode.next = &transfer;
+	// H.264 decode, where the host's hardware takes it, into NV12.
+	if (rgfx::video::hostCodec(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE))
+		addDecoder(b, kCodecH264, {'NV12'});
+	// HEVC decode, where the host's hardware takes it: Main into NV12 (video or full range),
+	// Main 10 into P010 ('x420', 'xf20').
+	if (const RgfxVideoCodecCaps *hevc =
+	        rgfx::video::hostCodec(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE)) {
+		const bool main = (hevc->profiles & RGFX_VIDEO_HEVC_MAIN) != 0;
+		const bool main10 = (hevc->profiles & RGFX_VIDEO_HEVC_MAIN_10) != 0;
+		if (main && main10)
+			addDecoder(b, kCodecHevc, {'NV12', 'x420', '420f', 'xf20'});
+		else if (main)
+			addDecoder(b, kCodecHevc, {'NV12', '420f'});
+		else if (main10)
+			addDecoder(b, kCodecHevc, {'x420', 'xf20'});
 	}
 	// Frame processing on the graphics engine.
-	addFunction(b, kFunctionProcess, 0x10, 'NV12', 'NV12', kGraphicsEngine);
+	addFunction(b, kFunctionProcess, 0x10, 'NV12', {'NV12'}, kGraphicsEngine);
 	b.functions = b.function_list;
 }
 
@@ -401,6 +424,27 @@ bool bitstreamBuffer(uint32_t pool, uint32_t index, const uint8_t **bytes, size_
 	return false;
 }
 
+// The buffer of index `index` of the pool AppleGVA names an HEVC picture's slice segments in,
+// which they name by index alone: the pool of type 0, else the one pool there is.
+bool hevcBitstreamBuffer(uint32_t index, const uint8_t **bytes, size_t *size)
+{
+	if (bitstreamBuffer(0, index, bytes, size))
+		return true;
+	std::lock_guard<std::mutex> hold(g_poolLock);
+	const BitstreamBuffers *only = nullptr;
+	for (const BitstreamBuffers &b : g_pools)
+		if (b.count) {
+			if (only)
+				return false;
+			only = &b;
+		}
+	if (!only || index >= only->count)
+		return false;
+	*bytes = only->buffers[index];
+	*size = only->bytes;
+	return true;
+}
+
 void freePool(BitstreamBuffers &b)
 {
 	for (uint32_t i = 0; i < b.count; i++)
@@ -446,9 +490,98 @@ void notSent(std::atomic<bool> &said, const char *why)
 		os_log_error(OS_LOG_DEFAULT, "RGFX: video: a picture not sent: %{public}s", why);
 }
 
-// Commits the picture `c` decodes on its context's session: its work on the host, or null
+// The surface AppleGVA decodes command `c`'s picture into.
+IOSurfaceRef outputSurface(const Command *c)
+{
+	const uint8_t *out = (const uint8_t *)u64At(c->output, 0x20);
+	return out ? (IOSurfaceRef)u64At(out, 0x10) : nullptr;
+}
+
+// The surface AppleGVA decodes an HEVC picture into. An HEVC decode command carries no output on
+// the command (c->output is null and there is no following transfer command, unlike H.264); the
+// output frame is named in the decode's parameters, in AppleGVA's own decoded-picture record. The
+// record pointer is at P+0x10, its current frame at the record's +0x08 (`field_08`), and that
+// frame's global IOSurface id at the frame's +0x88 (`field_88`). Measured on the RTX 5080
+// (2026-11-03): the id there is the IOSurface VideoToolbox hands back for the picture (picture 0
+// -> id 7, picture 1 -> id 27, matching the decoder's output). The returned surface is retained;
+// the caller releases it.
+IOSurfaceRef hevcOutputSurface(const uint8_t *P)
+{
+	const uint8_t *record = (const uint8_t *)u64At(P, 0x10);
+	if (!record)
+		return nullptr;
+	const uint8_t *frame = (const uint8_t *)u64At(record, 0x08);
+	if (!frame)
+		return nullptr;
+	return IOSurfaceLookup(u32At(frame, 0x88));
+}
+
+// Commits `sets` and the access unit at `bytes` on `context`'s session, into `output`, the sets
+// sent only where they changed since the session's last: the work on the host, or null.
+void *commitPicture(Context *context, std::vector<uint8_t> &sets, const uint8_t *bytes,
+                    size_t size, IOSurfaceRef output)
+{
+	const bool changed = sets != context->sent;
+	rgfx::video::Decode d = {};
+	d.bytes = bytes;
+	d.size = size;
+	d.parameterSets = changed ? sets.data() : nullptr;
+	d.parameterSetsSize = changed ? (uint32_t)sets.size() : 0;
+	d.output = output;
+	void *work = rgfx::video::decode(context->session, d);
+	if (work && changed)
+		context->sent = std::move(sets);
+	if (!work) {
+		static std::atomic<bool> said;
+		notSent(said, "no texture over its output, or no command buffer");
+	}
+	return work;
+}
+
+// Commits the HEVC picture `c` decodes on its context's session: its work on the host, or null
+// where it could not be sent. Its slice segments lie one after another in one bitstream buffer,
+// each named by a record of the picture's.
+void *decodeHevcPicture(const Command *c)
+{
+	Context *context = (Context *)c->context;
+	const uint8_t *P = c->parameters;
+	if (!context || !context->session || !P)
+		return nullptr;
+	constexpr size_t kSliceRecord = 0x328;
+	const uint32_t slices = u32At(P, 0x28);
+	const uint8_t *records = (const uint8_t *)u64At(P, 0x30);
+	const uint8_t *bytes;
+	size_t bufferBytes;
+	if (!slices || !records || !hevcBitstreamBuffer(u32At(records, 0x8), &bytes, &bufferBytes))
+		return nullptr;
+	uint64_t first = UINT64_MAX, end = 0;
+	for (uint32_t i = 0; i < slices; i++) {
+		const uint8_t *r = records + i * kSliceRecord;
+		const uint64_t offset = u32At(r, 0x10), size = u32At(r, 0x18);
+		first = offset < first ? offset : first;
+		end = offset + size > end ? offset + size : end;
+	}
+	if (end > bufferBytes || first >= end)
+		return nullptr;
+	std::vector<uint8_t> sets;
+	const auto *sps = (const rgfx::video::h265::Sps *)u64At(P, 0x18);
+	const auto *pps = (const rgfx::video::h265::Pps *)u64At(P, 0x20);
+	if (!sps || !pps || !rgfx::video::h265::writeSps(*sps, sets) ||
+	    !rgfx::video::h265::writePps(*pps, sets)) {
+		static std::atomic<bool> said;
+		notSent(said, "its parameter sets are refused");
+		return nullptr;
+	}
+	IOSurfaceRef output = hevcOutputSurface(P);
+	void *work = commitPicture(context, sets, bytes + first, end - first, output);
+	if (output)
+		CFRelease(output);
+	return work;
+}
+
+// Commits the H.264 picture `c` decodes on its context's session: its work on the host, or null
 // where it could not be sent.
-void *decodePicture(const Command *c)
+void *decodeH264Picture(const Command *c)
 {
 	Context *context = (Context *)c->context;
 	const uint8_t *P = c->parameters;
@@ -482,22 +615,16 @@ void *decodePicture(const Command *c)
 		notSent(said, "its parameter sets are refused");
 		return nullptr;
 	}
-	const bool changed = sets != context->sent;
-	rgfx::video::DecodeH264 d = {};
-	d.bytes = bytes + first;
-	d.size = end - first;
-	d.parameterSets = changed ? sets.data() : nullptr;
-	d.parameterSetsSize = changed ? (uint32_t)sets.size() : 0;
-	const uint8_t *out = (const uint8_t *)u64At(c->output, 0x20);
-	d.output = out ? (IOSurfaceRef)u64At(out, 0x10) : nullptr;
-	void *work = rgfx::video::decodeH264(context->session, d);
-	if (work && changed)
-		context->sent = std::move(sets);
-	if (!work) {
-		static std::atomic<bool> said;
-		notSent(said, "no texture over its output, or no command buffer");
-	}
-	return work;
+	return commitPicture(context, sets, bytes + first, end - first, outputSurface(c));
+}
+
+// Commits the picture `c` decodes, of its context's codec.
+void *decodePicture(const Command *c)
+{
+	const Context *context = (const Context *)c->context;
+	if (!context)
+		return nullptr;
+	return context->sub_id == kCodecHevc ? decodeHevcPicture(c) : decodeH264Picture(c);
 }
 
 uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
@@ -518,9 +645,12 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			Context *context = fi ? new Context{fi->function_id, fi->sub_id, fi->width,
 							    fi->height, nullptr, {}}
 					      : nullptr;
-			if (context && fi->function_id == kFunctionDecode && fi->sub_id == kCodecH264) {
-				context->session =
-				    rgfx::video::openSession(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE);
+			const uint32_t codec = !context || fi->function_id != kFunctionDecode ? 0
+			                       : fi->sub_id == kCodecH264                       ? RGFX_VIDEO_CODEC_H264
+			                       : fi->sub_id == kCodecHevc                       ? RGFX_VIDEO_CODEC_HEVC
+			                                                                        : 0;
+			if (codec != 0) {
+				context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
 				if (!context->session) {
 					for (uint32_t j = 0; j < i; j++) {
 						Context *made = (Context *)ci->info->contexts[j];
@@ -606,9 +736,24 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		PixelRequirement *r = (PixelRequirement *)a1;
 		if (!r || !r->widths || !r->heights || !r->pitches || !r->alignments)
 			return kBadArgument;
-		if (r->fourcc != 'NV12' || r->planes != 2)
+		// Two planes, of a byte a sample (NV12) or two (P010).
+		uint32_t sampleBytes;
+		switch (r->fourcc) {
+		case 'NV12':
+		case '420v':
+		case '420f':
+			sampleBytes = 1;
+			break;
+		case 'x420':
+		case 'xf20':
+			sampleBytes = 2;
+			break;
+		default:
 			return kUnsupportedFormat;
-		uint32_t height = alignUp(r->height, 16), pitch = alignUp(r->width, 0x100);
+		}
+		if (r->planes != 2)
+			return kUnsupportedFormat;
+		uint32_t height = alignUp(r->height, 16), pitch = alignUp(r->width * sampleBytes, 0x100);
 		r->widths[0] = r->width;
 		r->heights[0] = height;
 		r->widths[1] = r->width / 2;

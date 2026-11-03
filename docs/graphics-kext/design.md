@@ -483,11 +483,13 @@ Stages:
     lists only Apple-signed plug-ins.
     - **Identity:** the accelerator's personality names the bundle,
       `reims-graphics`, as the video driver, with `IOVARendererID` 0x1020004,
-      the AMD Navi family's, and `IOGVACodec`, which gates the H.264
-      decoder; the bundle exports the two entry points beside its Metal
-      device (`guest/bundle/src/RgfxVideoDriver.cpp`). AppleGVA drives an
-      AMD driver through high-level commands (picture parameters and slice
-      data; rate-control settings), which map onto Vulkan Video.
+      the AMD Navi family's, and `IOGVACodec`; the bundle exports the two
+      entry points beside its Metal device
+      (`guest/bundle/src/RgfxVideoDriver.cpp`). AppleGVA drives an AMD driver
+      through high-level commands (picture parameters and slice data;
+      rate-control settings), which map onto Vulkan Video. The driver decodes
+      H.264 and HEVC, each where the host's caps list it; HEVC in the profiles
+      they list (Main into NV12, Main 10 into P010).
     - **Routing:** AppleGVA hands a session to the AMD driver only on the
       Macs without an Intel GPU, or where `com.apple.AppleGVA`'s
       `gvaForceAMDKE` is set; elsewhere, an iMac20,1 among them, it looks for
@@ -520,13 +522,34 @@ Stages:
     - **The wire:** a video session is an object of the device's
       (`VIDEO_SESSION_CREATE`), with a command queue of the driver's; each
       picture is a command buffer of that queue holding one video encoder,
-      whose op (`RGFX_OP_VIDEO_DECODE_H264`, the 0x4xxx group) names the
-      bitstream buffer and range, the SPS and PPS NAL units where they
-      changed, and textures over the output surface's two planes. The host
-      decodes on its Vulkan Video decode queue and has the command buffer wait
-      for the decode on the session's shared event, so the buffer completes,
-      and AppleGVA's token is answered done, once the picture is in the
-      surface. Encode is to take the same path.
+      whose op (`RGFX_OP_VIDEO_DECODE_H264` or `RGFX_OP_VIDEO_DECODE_H265`,
+      the 0x4xxx group) names the bitstream buffer and range, the parameter
+      sets where they changed (H.264's SPS and PPS; HEVC's SPS and PPS, the
+      host making the VPS from the SPS), and textures over the output
+      surface's two planes. The host decodes on its Vulkan Video decode queue
+      and has the command buffer wait for the decode on the session's shared
+      event, so the buffer completes, and AppleGVA's token is answered done,
+      once the picture is in the surface. For HEVC the driver writes the
+      parameter sets from AppleGVA's parsed form, as for H.264
+      (`guest/bundle/src/RgfxVideoH265.cpp`): each short-term reference
+      picture set by its pictures, each scaling list and, where the stream's
+      random access skips a leading picture, no output for it. AppleGVA
+      holds a set the SPS predicts from another by its pictures as well,
+      derived, so the driver writes every set by its pictures, a predicted
+      one too (measured on the guest with a stream of 25 sets in its SPS, 22
+      of them predicted). Encode is to take the same path.
+    - **The HEVC output surface is named in the parameters, not on the
+      command.** An H.264 decode arrives as a pipeline whose transfer command
+      carries the output surface; an HEVC decode is a bare decode command with
+      no output on it and no transfer command. AppleGVA names the output frame
+      in its own decoded-picture record instead: the record pointer at the
+      parameters' `+0x10`, its current frame at the record's `+0x08`, and that
+      frame's global IOSurface id at the frame's `+0x88`. The driver looks the
+      surface up there (`guest/bundle/src/RgfxVideoDriver.cpp`,
+      `hevcOutputSurface`; measured on the guest with the RTX 5080: the id is
+      that of the IOSurface VideoToolbox hands back for the picture, 7 for
+      picture 0 and 27 for picture 1, and an IDR with no references resolves
+      there too).
     - **Bitstreams:** AppleGVA asks for one bitstream buffer and writes the
       next access unit into it as soon as a picture is scheduled, without
       waiting for the decode that reads it. The driver copies each access

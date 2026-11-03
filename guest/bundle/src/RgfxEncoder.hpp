@@ -181,6 +181,10 @@ public:
 	/// SPS and PPS NAL units at `parameterSets` (none where `size` is 0), padded to whole words.
 	void videoDecodeH264(const RgfxVideoOpDecodeH264 &body, const uint8_t *parameterSets,
 	                     uint32_t size);
+	/// Decodes an HEVC access unit (RGFX_OP_VIDEO_DECODE_H265), as videoDecodeH264 does: `body`
+	/// then the `size` bytes of parameter sets at `parameterSets`, padded to whole words.
+	void videoDecodeH265(const RgfxVideoOpDecodeH265 &body, const uint8_t *parameterSets,
+	                     uint32_t size);
 
 	// --- render ops (RGFX_OP_RENDER_*, group 1) --------------------------------
 
@@ -672,6 +676,10 @@ private:
 	void moveToHeap(size_t size);
 	// Gives back the block the builder holds, if any.
 	void giveBackBlock();
+	// A video decode op of `tag`: its header, the `n` bytes of its body at `body`, then the
+	// `size` bytes of parameter sets at `parameterSets`, padded with zeros to whole words.
+	void appendVideoDecode(uint16_t tag, const void *body, size_t n, const uint8_t *parameterSets,
+	                       uint32_t size);
 
 	struct Named {
 		const void *object;

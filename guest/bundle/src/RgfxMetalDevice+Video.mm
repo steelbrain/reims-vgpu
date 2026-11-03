@@ -46,6 +46,8 @@ struct rgfx::video::Session {
 	RgfxMetalDevice *device;
 	id<MTLCommandQueue> queue;
 	uint64_t objId;
+	// RGFX_VIDEO_CODEC_*.
+	uint32_t codec;
 	std::mutex lock;
 	// The textures over each output surface's two planes, by IOSurfaceID, and when each was
 	// last used.
@@ -102,6 +104,7 @@ rgfx::video::Session *rgfx::video::openSession(uint32_t codec, uint32_t directio
 	session->device = device;
 	session->queue = queue;
 	session->objId = created.obj_id;
+	session->codec = codec;
 	return session;
 }
 
@@ -149,20 +152,39 @@ id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_
 	return [device newTextureWithDescriptor:desc iosurface:surface plane:plane];
 }
 
-// What the host reads an H.264 access unit in place at (RgfxVideoCodecCaps::bitstream_alignment):
-// from a buffer's start, its length a multiple of it.
-size_t bitstreamAlignment()
+// What the host reads an access unit of `codec` in place at
+// (RgfxVideoCodecCaps::bitstream_alignment): from a buffer's start, its length a multiple of it.
+size_t bitstreamAlignment(uint32_t codec)
 {
-	const RgfxVideoCodecCaps *caps =
-	    rgfx::video::hostCodec(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE);
+	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE);
 	const size_t alignment = caps ? caps->bitstream_alignment : 1;
 	return alignment != 0 && (alignment & (alignment - 1)) == 0 ? alignment : 1;
+}
+
+// The formats of the planes of an output surface of `format` a decode of `codec` lands in:
+// false for a format it lands in none of.
+bool planeFormats(uint32_t codec, OSType format, MTLPixelFormat *luma, MTLPixelFormat *chroma)
+{
+	switch (format) {
+	case '420v':
+	case '420f':
+		*luma = MTLPixelFormatR8Unorm;
+		*chroma = MTLPixelFormatRG8Unorm;
+		return true;
+	case 'x420':
+	case 'xf20':
+		*luma = MTLPixelFormatR16Unorm;
+		*chroma = MTLPixelFormatRG16Unorm;
+		return codec == RGFX_VIDEO_CODEC_HEVC;
+	default:
+		return false;
+	}
 }
 
 // `decode`'s access unit copied into the next of `session`'s bitstream buffers, from its first
 // start code and padded with zeros to the host's alignment: the buffer, and the bytes the host
 // reads; nil where the device made no buffer. The caller holds the session's submit lock.
-id<MTLBuffer> copyAccessUnit(rgfx::video::Session *session, const rgfx::video::DecodeH264 &decode,
+id<MTLBuffer> copyAccessUnit(rgfx::video::Session *session, const rgfx::video::Decode &decode,
                              size_t *size)
 {
 	// Zero bytes before the first 3-byte start code are the byte stream's, no NAL unit's.
@@ -171,7 +193,7 @@ id<MTLBuffer> copyAccessUnit(rgfx::video::Session *session, const rgfx::video::D
 	       decode.bytes[lead + 2] == 0)
 		lead++;
 	const size_t bytes = decode.size - lead;
-	const size_t alignment = bitstreamAlignment();
+	const size_t alignment = bitstreamAlignment(session->codec);
 	const size_t padded = (bytes + alignment - 1) & ~(alignment - 1);
 	auto &slot = session->bitstreams[session->nextBitstream++ % kBitstreams];
 	[slot.reader waitUntilCompleted];
@@ -196,13 +218,15 @@ id<MTLBuffer> copyAccessUnit(rgfx::video::Session *session, const rgfx::video::D
 
 } // namespace
 
-void *rgfx::video::decodeH264(Session *session, const DecodeH264 &decode)
+void *rgfx::video::decode(Session *session, const Decode &decode)
 {
 	if (session == nullptr || decode.bytes == nullptr || decode.size == 0 ||
 	    decode.output == nullptr)
 		return nullptr;
-	const OSType format = IOSurfaceGetPixelFormat(decode.output);
-	if ((format != '420v' && format != '420f') || IOSurfaceGetPlaneCount(decode.output) != 2)
+	MTLPixelFormat lumaFormat, chromaFormat;
+	if (!planeFormats(session->codec, IOSurfaceGetPixelFormat(decode.output), &lumaFormat,
+	                  &chromaFormat) ||
+	    IOSurfaceGetPlaneCount(decode.output) != 2)
 		return nullptr;
 	id<MTLTexture> luma, chroma;
 	{
@@ -219,8 +243,8 @@ void *rgfx::video::decodeH264(Session *session, const DecodeH264 &decode)
 				session->outputs.erase(oldest);
 			}
 			Session::Output output;
-			output.luma = planeTexture(session->device, decode.output, 0, MTLPixelFormatR8Unorm);
-			output.chroma = planeTexture(session->device, decode.output, 1, MTLPixelFormatRG8Unorm);
+			output.luma = planeTexture(session->device, decode.output, 0, lumaFormat);
+			output.chroma = planeTexture(session->device, decode.output, 1, chromaFormat);
 			if (output.luma == nil || output.chroma == nil)
 				return nullptr;
 			it = session->outputs.emplace(id, output).first;
@@ -237,14 +261,12 @@ void *rgfx::video::decodeH264(Session *session, const DecodeH264 &decode)
 	id<MTLBuffer> bitstream = copyAccessUnit(session, decode, &size);
 	if (bitstream == nil)
 		return nullptr;
-	RgfxVideoOpDecodeH264 body = {};
-	body.bitstream_offset = 0;
-	body.bitstream_size = size;
 	[(RgfxCmdBuffer *)cb rgfxEncodeVideoSession:session->objId
-	                                 decodeH264:&body
+	                                      codec:session->codec
 	                              parameterSets:decode.parameterSets
 	                                       size:decode.parameterSetsSize
 	                                  bitstream:bitstream
+	                                    ofBytes:size
 	                                       luma:luma
 	                                     chroma:chroma];
 	[cb commit];

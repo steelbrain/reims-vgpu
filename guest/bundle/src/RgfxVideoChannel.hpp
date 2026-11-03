@@ -44,11 +44,12 @@ void closeSession(Session *session);
 /// Lets go of the textures `session` made over output surfaces, so the surfaces can go.
 void forgetOutputs(Session *session);
 
-/// One H.264 access unit to decode: its slices' NAL units in Annex-B form, `size` bytes at
-/// `bytes`, after the SPS and PPS NAL units at `parameterSets` where they changed
-/// (`parameterSetsSize` bytes, 0 for none), into the two-plane surface `output`. The call
-/// copies the bytes: the caller may write them again once it returns.
-struct DecodeH264 {
+/// One access unit to decode, of its session's codec: its slices' NAL units in Annex-B form,
+/// `size` bytes at `bytes`, after the parameter sets at `parameterSets` where they changed
+/// (H.264's SPS and PPS, HEVC's SPS and PPS; `parameterSetsSize` bytes, 0 for none), into the
+/// two-plane surface `output`: NV12's ('420v', '420f'), or, for HEVC of 10 bits, P010's ('x420',
+/// 'xf20'). The call copies the bytes: the caller may write them again once it returns.
+struct Decode {
 	const uint8_t *bytes;
 	size_t size;
 	const uint8_t *parameterSets;
@@ -57,8 +58,9 @@ struct DecodeH264 {
 };
 
 /// Commits the decode on `session`'s queue: a token for its completion, null where it was not
-/// encoded (a surface no texture lies over, or no command buffer).
-void *decodeH264(Session *session, const DecodeH264 &decode);
+/// encoded (a surface of no format the codec lands in, a surface no texture lies over, or no
+/// command buffer).
+void *decode(Session *session, const Decode &decode);
 
 /// Where the work `token` names is: 0 running, 1 done, -1 failed.
 int tokenStatus(void *token);

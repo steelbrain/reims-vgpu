@@ -1319,21 +1319,35 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 }
 
 - (void)rgfxEncodeVideoSession:(uint64_t)session
-                    decodeH264:(const RgfxVideoOpDecodeH264 *)body
+                         codec:(uint32_t)codec
                  parameterSets:(const uint8_t *)parameterSets
                           size:(uint32_t)size
                      bitstream:(id<MTLBuffer>)bitstream
+                       ofBytes:(uint64_t)bytes
                           luma:(id<MTLTexture>)luma
                         chroma:(id<MTLTexture>)chroma
 {
 	_encoder->beginVideoPass(session);
-	RgfxVideoOpDecodeH264 b = *body;
-	b.bitstream_buffer_obj_id = rgfxReads(_encoder, bitstream);
+	const uint64_t bitstreamId = rgfxReads(_encoder, bitstream);
 	rgfxIOSurfaceNoteWrite(_encoder, luma);
 	rgfxIOSurfaceNoteWrite(_encoder, chroma);
-	b.luma_texture_obj_id = rgfxWrites(_encoder, luma);
-	b.chroma_texture_obj_id = rgfxWrites(_encoder, chroma);
-	_encoder->videoDecodeH264(b, parameterSets, size);
+	const uint64_t lumaId = rgfxWrites(_encoder, luma);
+	const uint64_t chromaId = rgfxWrites(_encoder, chroma);
+	if (codec == RGFX_VIDEO_CODEC_HEVC) {
+		RgfxVideoOpDecodeH265 b = {};
+		b.bitstream_buffer_obj_id = bitstreamId;
+		b.bitstream_size = bytes;
+		b.luma_texture_obj_id = lumaId;
+		b.chroma_texture_obj_id = chromaId;
+		_encoder->videoDecodeH265(b, parameterSets, size);
+	} else {
+		RgfxVideoOpDecodeH264 b = {};
+		b.bitstream_buffer_obj_id = bitstreamId;
+		b.bitstream_size = bytes;
+		b.luma_texture_obj_id = lumaId;
+		b.chroma_texture_obj_id = chromaId;
+		_encoder->videoDecodeH264(b, parameterSets, size);
+	}
 	_encoder->endEncoder();
 }
 

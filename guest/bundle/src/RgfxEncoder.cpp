@@ -320,15 +320,30 @@ void RgfxEncoder::videoDecodeH264(const RgfxVideoOpDecodeH264 &body, const uint8
 	RgfxVideoOpDecodeH264 b = body;
 	b.parameter_sets_size = size;
 	b.reserved_2c = 0;
+	appendVideoDecode(RGFX_OP_VIDEO_DECODE_H264, &b, sizeof(b), parameterSets, size);
+}
+
+void RgfxEncoder::videoDecodeH265(const RgfxVideoOpDecodeH265 &body, const uint8_t *parameterSets,
+                                  uint32_t size)
+{
+	RgfxVideoOpDecodeH265 b = body;
+	b.parameter_sets_size = size;
+	b.reserved_2c = 0;
+	appendVideoDecode(RGFX_OP_VIDEO_DECODE_H265, &b, sizeof(b), parameterSets, size);
+}
+
+void RgfxEncoder::appendVideoDecode(uint16_t tag, const void *body, size_t n,
+                                    const uint8_t *parameterSets, uint32_t size)
+{
 	const size_t padded = (static_cast<size_t>(size) + 7) & ~static_cast<size_t>(7);
-	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(b) + padded;
+	const size_t len = RGFX_OP_BODY_OFFSET + n + padded;
 	uint8_t *at = reserve(len);
-	putHeader(at, RGFX_OP_VIDEO_DECODE_H264, len);
+	putHeader(at, tag, len);
 	at += RGFX_OP_BODY_OFFSET;
-	std::memcpy(at, &b, sizeof(b));
+	std::memcpy(at, body, n);
 	if (size != 0)
-		std::memcpy(at + sizeof(b), parameterSets, size);
-	std::memset(at + sizeof(b) + size, 0, padded - size);
+		std::memcpy(at + n, parameterSets, size);
+	std::memset(at + n + size, 0, padded - size);
 }
 
 void RgfxEncoder::endEncoder()

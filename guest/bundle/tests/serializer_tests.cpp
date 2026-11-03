@@ -1464,7 +1464,7 @@ bool forwardTo(void *context, const void *message, uint32_t size, uint64_t *out_
 }
 
 // A video command buffer: the video encoder's begin names its session, and a decode's
-// parameter sets follow its body, padded to whole words.
+// parameter sets follow its body, padded to whole words; HEVC's decode op is laid out the same.
 void test_video_command_buffer()
 {
 	TestRing ring(0x8000);
@@ -1482,6 +1482,13 @@ void test_video_command_buffer()
 	const uint8_t sets[11] = {0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68};
 	enc.videoDecodeH264(d, sets, sizeof(sets));
 	enc.videoDecodeH264(d, nullptr, 0);
+	RgfxVideoOpDecodeH265 e = {};
+	e.bitstream_buffer_obj_id = 8;
+	e.bitstream_size = 512;
+	e.luma_texture_obj_id = 9;
+	e.chroma_texture_obj_id = 10;
+	const uint8_t hevcSets[18] = {0, 0, 0, 1, 0x42, 1, 1, 1, 0, 0, 0, 1, 0x44, 1, 0xc1, 0x72, 0xb4, 0x62};
+	enc.videoDecodeH265(e, hevcSets, sizeof(hevcSets));
 	enc.endEncoder();
 	uint64_t seqno = 0;
 	CHECK(enc.finish(&seqno));
@@ -1524,6 +1531,21 @@ void test_video_command_buffer()
 	CHECK(oh.len == RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET);
 	std::memcpy(&got, op + RGFX_OP_BODY_OFFSET, sizeof(got));
 	CHECK(got.parameter_sets_size == 0);
+	op += oh.len;
+
+	// HEVC's op: its own tag, the same layout.
+	std::memcpy(&oh, op, sizeof(oh));
+	CHECK(oh.tag == RGFX_OP_VIDEO_DECODE_H265);
+	CHECK(oh.len == RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET + 24);
+	RgfxVideoOpDecodeH265 hevc = {};
+	std::memcpy(&hevc, op + RGFX_OP_BODY_OFFSET, sizeof(hevc));
+	CHECK(hevc.bitstream_buffer_obj_id == 8 && hevc.bitstream_offset == 0 &&
+	      hevc.bitstream_size == 512 && hevc.luma_texture_obj_id == 9 &&
+	      hevc.chroma_texture_obj_id == 10 && hevc.parameter_sets_size == sizeof(hevcSets));
+	tail = op + RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET;
+	CHECK(std::memcmp(tail, hevcSets, sizeof(hevcSets)) == 0);
+	for (size_t i = sizeof(hevcSets); i < 24; i++)
+		CHECK(tail[i] == 0);
 	op += oh.len;
 
 	std::memcpy(&oh, op, sizeof(oh));

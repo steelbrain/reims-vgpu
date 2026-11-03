@@ -24,8 +24,8 @@
 #                   (tests/inherited_tests.mm), the protocol members' check against
 #                   their register (x86_64, under Rosetta, which loads the bundle:
 #                   tests/protocol_members_tests.mm, tests/protocol_members.txt), and the
-#                   video driver's H.264 parameter-set check (x86_64, under Rosetta,
-#                   tests/video_h264_tests.cpp).
+#                   video driver's H.264 and HEVC parameter-set checks (x86_64, under
+#                   Rosetta, tests/video_h264_tests.cpp, tests/video_h265_tests.cpp).
 #   make bundle     compile + bundle-link the whole x86_64 loadable bundle, device
 #                   shell included (links clean with -undefined dynamic_lookup; it
 #                   only needs to COMPILE off the guest, not run).
@@ -112,7 +112,7 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
-VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp
+VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp src/RgfxVideoH265.cpp
 VIDEO_OBJ_ARCH = $(VIDEO_SRCS:src/%.cpp=$(BUILD)/obj/$(ARCH)/core/%.o)
 # The whole Metal shell (ObjC++): wrappers + the device. Goes in the bundle. Globbed
 # so each later slice's wrappers + category are picked up with no Makefile edit.
@@ -135,6 +135,7 @@ SHELL_TESTBIN = $(BUILD)/shell_tests
 INHERIT_TESTBIN = $(BUILD)/inherited_tests
 MEMBERS_TESTBIN = $(BUILD)/protocol_members_tests
 VIDEO_TESTBIN = $(BUILD)/video_h264_tests
+VIDEO_H265_TESTBIN = $(BUILD)/video_h265_tests
 BUNDLEBIN     = $(BUILD)/reims-graphics.bundle
 
 all: $(CORE_OBJ_ARCH)
@@ -252,8 +253,16 @@ $(VIDEO_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o tests/video_h264_tes
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(BUILD)/obj/$(ARCH)/core/RgfxVideoH264.o \
 		tests/video_h264_tests.cpp -o $@
 
+# --- the video driver's HEVC parameter-set check (x86_64, Rosetta) ----------
+
+$(VIDEO_H265_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH265.o tests/video_h265_tests.cpp \
+	tests/video_h265_cases.hpp $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(BUILD)/obj/$(ARCH)/core/RgfxVideoH265.o \
+		tests/video_h265_tests.cpp -o $@
+
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) \
-	$(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(BUNDLEBIN)
+	$(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
@@ -261,6 +270,7 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(S
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
+	arch -$(ARCH) $(VIDEO_H265_TESTBIN)
 	bash tests/bundle_files_check.sh $(BUNDLEBIN)
 
 # --- the wire round trip against the host's library (native arch, this Mac's GPU) ----------
