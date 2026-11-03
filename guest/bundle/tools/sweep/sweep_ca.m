@@ -8,12 +8,19 @@
 //       of one colour (anti-aliased edges differ between the two), the mean over every pixel;
 //   ca.gradient, ca.contents
 //       a CAGradientLayer, every pixel compared; a layer whose contents are the smooth pattern
-//       scaled to 192 x 192, compared inside its edges.
+//       scaled to 192 x 192, compared inside its edges;
+//   ca.heic.grid, ca.heic.grid.cropped
+//       the structured pattern as an HEIC of a grid of tiles, 2048 x 1536 (whole tiles) and
+//       2000 x 1400 (tiles past the right and bottom edges), drawn as a layer's contents at its
+//       own size into a target of that size, against ImageIO's decode into a bitmap, compared as
+//       the flat cases are.
 // Tolerances (sweep.m): the starting values hold for every case. The worst of the reference
 // runs: the flat cases 0/0.10, ca.gradient 15/8.51 (all three alike, the starting value's own
-// measure), ca.contents 1/0.33 (stock).
+// measure), ca.contents 1/0.33 (stock), ca.heic.grid 1/5.28 and ca.heic.grid.cropped 1/5.33 (the
+// AMD and the Intel GPU alike).
 #import "sweep.h"
 
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 
 enum { kSide = 256 };
@@ -32,12 +39,13 @@ static CALayer *rootLayer(void)
 	return root;
 }
 
-static SweepPixels *onDevice(CALayer *root, NSString **why)
+// `root` rendered on the device into a `w` x `h` target; nil with `*why` where it is not.
+static SweepPixels *onDevice(CALayer *root, size_t w, size_t h, NSString **why)
 {
 	id<MTLDevice> dev = sweepDevice();
 	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-	                                                                             width:kSide
-	                                                                            height:kSide
+	                                                                             width:w
+	                                                                            height:h
 	                                                                         mipmapped:NO];
 	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 	d.storageMode = MTLStorageModeManaged;
@@ -57,7 +65,7 @@ static SweepPixels *onDevice(CALayer *root, NSString **why)
 	[CATransaction begin];
 	[CATransaction setDisableActions:YES];
 	r.layer = root;
-	r.bounds = CGRectMake(0, 0, kSide, kSide);
+	r.bounds = CGRectMake(0, 0, w, h);
 	[CATransaction commit];
 	[CATransaction flush];
 	[r beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
@@ -76,11 +84,11 @@ static SweepPixels *onDevice(CALayer *root, NSString **why)
 	}
 	// A layer's origin is its bottom left, the texture's first row the layer's bottom one: the
 	// rows are turned over, top first as the bitmap's, and BGRA made RGBA.
-	SweepPixels *raw = [SweepPixels width:kSide height:kSide], *p = [SweepPixels width:kSide height:kSide];
-	[tex getBytes:raw.bytes bytesPerRow:kSide * 4 fromRegion:MTLRegionMake2D(0, 0, kSide, kSide) mipmapLevel:0];
-	for (size_t y = 0; y < kSide; y++)
-		for (size_t x = 0; x < kSide; x++) {
-			const uint8_t *s = [raw at:x y:kSide - 1 - y];
+	SweepPixels *raw = [SweepPixels width:w height:h], *p = [SweepPixels width:w height:h];
+	[tex getBytes:raw.bytes bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+	for (size_t y = 0; y < h; y++)
+		for (size_t x = 0; x < w; x++) {
+			const uint8_t *s = [raw at:x y:h - 1 - y];
 			uint8_t *d = [p at:x y:y];
 			d[0] = s[2], d[1] = s[1], d[2] = s[0], d[3] = s[3];
 		}
@@ -109,13 +117,105 @@ static void caCase(NSString *name, SweepTol tol, bool flat, CGRect rect, void (^
 		[CATransaction commit];
 		[CATransaction flush];
 		NSString *why = nil;
-		SweepPixels *got = onDevice(root, &why);
+		SweepPixels *got = onDevice(root, kSide, kSide, &why);
 		if (got == nil)
 			return [SweepResult fail:why];
 		SweepPixels *want = onCPU(root);
 		if (sweepOneColour(got, CGRectNull) && !sweepOneColour(want, CGRectNull))
 			return [SweepResult fail:@"the device's rendering is of one colour"];
 		return flat ? sweepCompareFlat(got, want, 3) : sweepCompare(got, want, rect, 3);
+	});
+}
+
+// The items of type `type` an HEIF file's item info lists: each 'infe' box (version 2 or 3) whose
+// item_type is `type`. A crude walk, for the cases' own files: it looks for the box's name and
+// reads the type where version 2 (16-bit item ID) or 3 (32-bit) puts it.
+static int heifItems(NSData *file, const char *type)
+{
+	const uint8_t *b = file.bytes;
+	const size_t n = file.length;
+	int count = 0;
+	for (size_t i = 4; i + 20 <= n; i++) {
+		if (memcmp(b + i, "infe", 4) != 0)
+			continue;
+		const uint8_t version = b[i + 4];
+		const size_t at = i + 4 + 4 + (version == 3 ? 4 : 2) + 2;
+		if ((version == 2 || version == 3) && at + 4 <= n && memcmp(b + at, type, 4) == 0)
+			count++;
+	}
+	return count;
+}
+
+// The image in `file` as ImageIO decodes it: at once, into a bitmap, or, `lazy`, where it is first
+// drawn.
+static CGImageRef heifImage(NSData *file, bool lazy) CF_RETURNS_RETAINED
+{
+	CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)file, NULL);
+	if (src == NULL)
+		return NULL;
+	NSDictionary *now = @{(id)kCGImageSourceShouldCacheImmediately : @YES};
+	CGImageRef image = CGImageSourceCreateImageAtIndex(src, 0, lazy ? NULL : (__bridge CFDictionaryRef)now);
+	CFRelease(src);
+	return image;
+}
+
+// A case of a still HEIF `w` x `h`, which ImageIO encodes as a grid of tiles, as a layer's
+// contents at its own size: Core Animation has it decoded into an IOSurface, its tiles laid into
+// one canvas by VideoToolbox's tile decoder where the hardware decoder offers it, and draws the
+// surface's YCbCr. Compared with the same file decoded by ImageIO on the CPU into a bitmap, as
+// the flat cases are, the max away from the pattern's edges, where the two upsample chroma
+// differently. Each tile in its place: a tile drawn elsewhere, or none (YCbCr zero, green), moves
+// the mean by tens of levels. The max's starting value is the lossy codecs' (sweep_imageio.m).
+static void heicGridCase(NSString *name, SweepTol tol, size_t w, size_t h)
+{
+	sweepCase(name, tol, ^SweepResult * {
+		CGImageRef pattern = [sweepPattern(w, h, SweepStructured) newImage];
+		NSMutableData *file = [NSMutableData data];
+		CGImageDestinationRef dst =
+		    CGImageDestinationCreateWithData((__bridge CFMutableDataRef)file, CFSTR("public.heic"), 1, NULL);
+		bool encoded = false;
+		if (dst != NULL) {
+			CGImageDestinationAddImage(dst, pattern,
+			                           (__bridge CFDictionaryRef) @{(id)kCGImageDestinationLossyCompressionQuality : @0.9});
+			encoded = CGImageDestinationFinalize(dst);
+			CFRelease(dst);
+		}
+		CGImageRelease(pattern);
+		if (!encoded)
+			return [SweepResult skip:@"ImageIO encodes no HEIC here"];
+		const int grids = heifItems(file, "grid"), tiles = heifItems(file, "hvc1");
+		if (grids != 1 || tiles < 2)
+			return [SweepResult fail:[NSString stringWithFormat:@"the HEIC is no grid: %d grid items, %d tiles", grids, tiles]];
+		CGImageRef cpu = heifImage(file, false), lazy = heifImage(file, true);
+		SweepPixels *want = [SweepPixels ofImage:cpu];
+		if (cpu != NULL)
+			CGImageRelease(cpu);
+		if (want == nil || lazy == NULL) {
+			if (lazy != NULL)
+				CGImageRelease(lazy);
+			return [SweepResult fail:@"ImageIO decoded no image of the HEIC"];
+		}
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		CALayer *root = [CALayer layer];
+		root.frame = CGRectMake(0, 0, w, h);
+		root.backgroundColor = colour(40, 60, 90, 1);
+		root.opaque = YES;
+		CALayer *l = [CALayer layer];
+		l.frame = root.bounds;
+		l.contents = (__bridge id)lazy;
+		CGImageRelease(lazy);
+		l.contentsGravity = kCAGravityResize;
+		[root addSublayer:l];
+		[CATransaction commit];
+		[CATransaction flush];
+		NSString *why = nil;
+		SweepPixels *got = onDevice(root, w, h, &why);
+		if (got == nil)
+			return [SweepResult fail:why];
+		SweepResult *r = sweepCompareFlat(got, want, 3);
+		r.note = [NSString stringWithFormat:@"%d tiles", tiles];
+		return r;
 	});
 }
 
@@ -205,4 +305,9 @@ void sweepCoreAnimation(void)
 		l.minificationFilter = kCAFilterLinear;
 		[root addSublayer:l];
 	});
+	// A still HEIF of a grid of tiles, as Photos' and an asset catalog's large images are, as a
+	// layer's contents at its own size (heicGridCase): of whole tiles, and of tiles that reach
+	// past the canvas's right and bottom edges.
+	heicGridCase(@"ca.heic.grid", (SweepTol){48, 8}, 2048, 1536);
+	heicGridCase(@"ca.heic.grid.cropped", (SweepTol){48, 8}, 2000, 1400);
 }
