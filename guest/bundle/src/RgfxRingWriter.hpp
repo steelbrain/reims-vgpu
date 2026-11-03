@@ -48,6 +48,18 @@ constexpr uint32_t kRgfxNoAnswer = 0xffff'ffffu;
 typedef bool (*RgfxForward)(void *context, const void *message, uint32_t size,
                             uint64_t *out_seqno, uint32_t *out_status);
 
+/// Hands a pipeline create equal to one the device accepted before to the kext as RgfxForward
+/// does, asking it not to wait for the answer (the accelerator's deferred submit). True once
+/// posted, `*out_seqno` its seqno. `*out_deferred` says whether its answer comes later
+/// (RgfxAwaitAnswer); where the kext kept no room for it, it was answered as any create, the answer
+/// handed on as RgfxForward hands its answers, and `*out_deferred` is false.
+typedef bool (*RgfxForwardDeferred)(void *context, const void *message, uint32_t size,
+                                    uint64_t *out_seqno, bool *out_deferred);
+
+/// Takes the answers the kext keeps for the process's deferred creates, waiting first for the one
+/// at `seqno`, and hands each on (to the process's lifecycle reader): false where none came.
+typedef bool (*RgfxAwaitAnswer)(void *context, uint64_t seqno);
+
 class RgfxRingWriter {
 public:
 	/// A writer over the ring whose header is at `ring_base`, with a byte ring
@@ -74,6 +86,26 @@ public:
 	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	             uint32_t *out_status = nullptr,
 	             const std::function<void(uint64_t)> &beforePublish = {});
+
+	/// Where a forwarding writer posts a known pipeline create (RgfxForwardDeferred) and takes
+	/// its answer (RgfxAwaitAnswer), both called with `context`: the kext's deferred submit,
+	/// where it has one.
+	void setDeferred(RgfxForwardDeferred post, RgfxAwaitAnswer await, void *context);
+
+	/// Posts a pipeline create equal to one the device accepted before, as tryPost does, without
+	/// waiting for its answer where the route keeps answers for later: `*out_deferred` whether
+	/// its answer comes later (RgfxAwaitAnswer). With no deferred post (setDeferred), or where
+	/// the kext kept no room for the answer, it is posted and answered as tryPost's.
+	bool tryPostKnown(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
+	                  bool *out_deferred);
+
+	/// Takes the answers the route keeps for the process's deferred creates, waiting for the one
+	/// at `seqno` (RgfxAwaitAnswer): false where the route keeps none.
+	bool awaitAnswer(uint64_t seqno);
+
+	/// Whether the route keeps answers for later (setDeferred), so a known pipeline create need
+	/// not wait.
+	bool defers() const { return m_forward != nullptr && m_deferredPost != nullptr; }
 
 	/// Whether post() places a message of `size` bytes: a valid size of at most half the
 	/// byte ring, so the pad to the ring's end before it never keeps it out of an empty ring.
@@ -102,6 +134,9 @@ private:
 	void *m_doorbellContext;
 	RgfxForward m_forward;
 	void *m_forwardContext;
+	RgfxForwardDeferred m_deferredPost = nullptr;
+	RgfxAwaitAnswer m_await = nullptr;
+	void *m_deferredContext = nullptr;
 
 	std::mutex m_lock;
 	uint64_t m_produced;

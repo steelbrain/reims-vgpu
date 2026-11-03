@@ -30,6 +30,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "RgfxKnownPipelines.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRingWriter.hpp"
 #include "reims_graphics_wire.h"
@@ -148,6 +149,21 @@ struct RgfxCreated {
 	uint64_t seqno;
 	bool posted;
 	uint32_t status;
+};
+
+/// A pipeline create's post against the process's known pipelines (RgfxKnownPipelines): where
+/// the route defers answers (RgfxRingWriter::defers), the create is keyed, and one whose key is
+/// known is posted without waiting for its answer.
+struct RgfxPipelinePost {
+	/// In: the process's known pipelines; null keys nothing, and every create waits.
+	RgfxKnownPipelines *known = nullptr;
+	/// Out: whether the create was keyed, and its key, under which its answer is learnt.
+	bool keyed = false;
+	RgfxPipelineKey key = {};
+	/// Out: whether it was posted without waiting, its own answer to come later; `reflection`
+	/// is then the equal create's, which the new state takes at once.
+	bool deferred = false;
+	RgfxPipelineReflection reflection = {};
 };
 
 class RgfxSerializer {
@@ -372,11 +388,18 @@ public:
 	/// carrying the returned `seqno`, read off the queue's completion ring (the
 	/// reply-ring reader is a later transport piece; `RgfxCreated::seqno` is the
 	/// key the reply is matched by). `posted` is false when the message does not
-	/// fit the ring.
-	RgfxCreated createRenderPipeline(const RgfxRenderPipelineParams &params);
+	/// fit the ring. With `post`, the create is posted against the known pipelines
+	/// (RgfxPipelinePost).
+	RgfxCreated createRenderPipeline(const RgfxRenderPipelineParams &params,
+	                                 RgfxPipelinePost *post = nullptr);
 
 	/// A compute pipeline from `params`, answered as createRenderPipeline is.
-	RgfxCreated createComputePipeline(const RgfxComputePipelineParams &params);
+	RgfxCreated createComputePipeline(const RgfxComputePipelineParams &params,
+	                                  RgfxPipelinePost *post = nullptr);
+
+	/// Takes the answers the route keeps for the process's deferred pipeline creates, waiting
+	/// first for the one at `seqno` (RgfxRingWriter::awaitAnswer): false where it keeps none.
+	bool awaitAnswer(uint64_t seqno) { return m_control.awaitAnswer(seqno); }
 
 	// --- sync objects ---------------------------------------------------------
 

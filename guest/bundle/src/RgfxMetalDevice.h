@@ -56,6 +56,9 @@
 #include "RgfxObjectModel.hpp"
 
 #ifdef __cplusplus
+#include <memory>
+
+class RgfxKnownPipelines;
 class RgfxSerializer;
 class RgfxRegion;
 class RgfxReplyReader;
@@ -77,6 +80,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// The resource/create serialiser (null where the wire handshake failed).
 - (nullable RgfxSerializer *)serializer;
+
+/// The pipeline creates the device accepted for this process (RgfxKnownPipelines), against which
+/// an equal create is posted without waiting: null where the kext keeps no answers for later
+/// (its feature word lacks kRgfxKextFeatureDeferredAnswers), so every create waits.
+- (std::shared_ptr<RgfxKnownPipelines>)knownPipelines;
 
 /// The per-device id space (object ids, GPU addresses, resource ids).
 - (RgfxIdSpace *)ids;

@@ -27,6 +27,7 @@
 
 class RgfxSerializer;
 class RgfxReplyReader;
+class RgfxKnownPipelines;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -43,6 +44,21 @@ NS_ASSUME_NONNULL_BEGIN
                                                 serializer:(nullable RgfxSerializer *)serializer
                                                      error:(__autoreleasing NSError *_Nullable *_Nullable)
                                                                error;
+
+#ifdef __cplusplus
+/// As renderPipelineStateWithDescriptor:device:serializer:error:, posted against `known`, the
+/// device's known pipelines (null: none). A descriptor equal to one the device accepted for this
+/// process is posted without waiting for its answer: the state takes that one's reflection at
+/// once, and its gpuResourceID waits at its first read for its own answer. The first create of
+/// each descriptor is answered as any, and its answer kept in `known` once the device accepted it
+/// (rgfxRegisterWithReplyReader:).
++ (nullable instancetype)renderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
+                                                    device:(nullable id<MTLDevice>)device
+                                                serializer:(nullable RgfxSerializer *)serializer
+                                                     known:(std::shared_ptr<RgfxKnownPipelines>)known
+                                                     error:(__autoreleasing NSError *_Nullable *_Nullable)
+                                                               error;
+#endif
 
 /// Designated initialiser: wraps an already-posted create. `objId` and `seqno` are
 /// the create's; `label` is kept locally (diagnostics).
@@ -67,8 +83,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader;
 
 /// Whether the host answered the create with a refusal (RGFX_PIPELINE_REFUSED): it made no
-/// pipeline, so the device's creators answer nil and an NSError, as Metal's do.
+/// pipeline, so the device's creators answer nil and an NSError, as Metal's do. NO for a create
+/// posted without waiting (rgfxDeferred), whose answer comes after.
 @property(nonatomic, readonly) BOOL rgfxRefused;
+
+/// Whether the create was posted without waiting for its answer, its descriptor equal to one the
+/// device accepted for this process.
+@property(nonatomic, readonly) BOOL rgfxDeferred;
 
 #ifdef __cplusplus
 /// The arguments of the pipeline's vertex and fragment functions, as their library read them

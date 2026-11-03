@@ -490,7 +490,10 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 
 // `state`, or nil and an NSError where the host refused its create: the kext hands the create's
 // reply back before the create returns, so a refusal is known here, as Metal's creators know
-// theirs.
+// theirs. A create whose descriptor equals one the device accepted for this process is posted
+// without waiting (RgfxKnownPipelines.hpp): the device refuses it only where the platform cannot
+// make the new state's own pipeline, which shows at its gpuResourceID and in the command buffers
+// that name it (docs/graphics-kext/design.md, "Known pipeline creates").
 template <typename State>
 static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 {
@@ -523,6 +526,7 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:descriptor
 	                                                        device:self
 	                                                    serializer:[self serializer]
+	                                                         known:[self knownPipelines]
 	                                                         error:error];
 	[state rgfxRegisterWithReplyReader:[self replyReader]];
 	return rgfxUnlessRefused(state, error);
@@ -593,6 +597,7 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	    [RgfxComputePipelineState computePipelineStateWithFunction:function
 	                                                        device:self
 	                                                    serializer:[self serializer]
+	                                                         known:[self knownPipelines]
 	                                                         error:error];
 	[state rgfxRegisterWithReplyReader:[self replyReader]];
 	return rgfxUnlessRefused(state, error);
@@ -617,6 +622,7 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	    [RgfxComputePipelineState computePipelineStateWithDescriptor:descriptor
 	                                                          device:self
 	                                                      serializer:[self serializer]
+	                                                           known:[self knownPipelines]
 	                                                           error:error];
 	[state rgfxRegisterWithReplyReader:[self replyReader]];
 	return rgfxUnlessRefused(state, error);

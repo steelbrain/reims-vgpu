@@ -73,6 +73,38 @@ RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint3
 {
 }
 
+void RgfxRingWriter::setDeferred(RgfxForwardDeferred post, RgfxAwaitAnswer await, void *context)
+{
+	m_deferredPost = post;
+	m_await = await;
+	m_deferredContext = context;
+}
+
+bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t size,
+                                  uint64_t *out_seqno, bool *out_deferred)
+{
+	*out_deferred = false;
+	if (!defers())
+		return tryPost(type, message, size, out_seqno);
+	if (size < kHeaderBytes || size % kMsgAlign != 0 || size > m_dataSize)
+		return false;
+	std::unique_ptr<uint8_t[]> buf(new uint8_t[size]);
+	std::memcpy(buf.get(), message, size);
+	RgfxMsgHeader header = { type, size, 0 };
+	std::memcpy(buf.get(), &header, sizeof(header));
+	uint64_t seqno = 0;
+	if (!m_deferredPost(m_deferredContext, buf.get(), size, &seqno, out_deferred))
+		return false;
+	if (out_seqno)
+		*out_seqno = seqno;
+	return true;
+}
+
+bool RgfxRingWriter::awaitAnswer(uint64_t seqno)
+{
+	return m_await != nullptr && m_await(m_deferredContext, seqno);
+}
+
 bool RgfxRingWriter::fits(uint32_t size) const
 {
 	if (size < kHeaderBytes || size % kMsgAlign != 0)

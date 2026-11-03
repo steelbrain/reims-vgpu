@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "RgfxCompletionThread.hpp"
+#include "RgfxKnownPipelines.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
@@ -42,11 +43,112 @@ namespace {
 // half the control ring.
 constexpr uint32_t kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 
-// What the lifecycle's forward reaches: the user client, and the reader its replies go to.
+// What the lifecycle's forward reaches: the user client, and the reader its replies go to. A
+// pipeline create posted without waiting (rgfxKextSubmitDeferred) has its answer kept by the
+// kext until the process takes it (rgfxKextAwaitAnswer, rgfxKextDrainAnswers), one take at a
+// time (`takeLock`), so a thread that waits for an answer another is handing on waits for that.
 struct RgfxKextLink {
 	io_connect_t conn;
 	RgfxReplyReader *reader;
+	std::mutex takeLock;
+	std::atomic<uint32_t> deferredPosts{0};
 };
+
+// The answers to deferred creates one take carries at most: an inline struct out (4 KiB).
+constexpr size_t kAnswersMax = 4096;
+// Every this many deferred posts, the answers the process has not asked for are taken, so they
+// never hold the kext's slots (64 a context) while the process makes more.
+constexpr uint32_t kDrainEvery = 32;
+
+// Takes the answers the kext keeps for the process's deferred creates, after waiting for the one
+// at `waitFor` (0: none), and hands each to the lifecycle reader: how many came. With `link`'s
+// take lock held.
+uint32_t rgfxKextTakeAnswers(RgfxKextLink *link, uint64_t waitFor)
+{
+	uint8_t answers[kAnswersMax];
+	size_t size = sizeof(answers);
+	uint64_t count = 0;
+	uint32_t outCount = 1;
+	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodTakeAnswers, &waitFor, 1, nullptr, 0,
+	                        &count, &outCount, answers, &size) != KERN_SUCCESS)
+		return 0;
+	for (size_t at = 0; at + sizeof(RgfxMsgHeader) <= size;) {
+		RgfxMsgHeader header = {};
+		std::memcpy(&header, answers + at, sizeof(header));
+		if (header.size < sizeof(header) || header.size > size - at)
+			break;
+		if (link->reader)
+			link->reader->deliver(answers + at, header.size);
+		at += header.size;
+	}
+	return static_cast<uint32_t>(count);
+}
+
+// Takes every answer the kext keeps for the process, waiting first for the one at `waitFor`.
+void rgfxKextTakeAll(RgfxKextLink *link, uint64_t waitFor)
+{
+	while (rgfxKextTakeAnswers(link, waitFor) != 0)
+		waitFor = 0;
+}
+
+// The answers no one asked for, taken where no other take runs (a waiter takes them then).
+void rgfxKextDrainAnswers(RgfxKextLink *link)
+{
+	std::unique_lock<std::mutex> take(link->takeLock, std::try_to_lock);
+	if (take.owns_lock())
+		rgfxKextTakeAll(link, 0);
+}
+
+// The control ring's deferred post (RgfxRingWriter::setDeferred): a pipeline create equal to one
+// the device accepted, posted with kRgfxSubmitDeferred, which returns once it is posted. Where the
+// kext kept no slot for its answer, it posted and answered it as any create, and the answer goes
+// to the reader as rgfxKextSubmit's.
+bool rgfxKextSubmitDeferred(void *context, const void *message, uint32_t size,
+                            uint64_t *out_seqno, bool *out_deferred)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	const uint64_t flags = kRgfxSubmitDeferred;
+	uint64_t seqno = 0;
+	uint32_t outCount = 1;
+	uint8_t reply[128];
+	size_t replySize = sizeof(reply);
+	kern_return_t kr = IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmit, &flags, 1, message,
+	                                       size, &seqno, &outCount, reply, &replySize);
+	if (kr != KERN_SUCCESS)
+		return false;
+	*out_seqno = seqno;
+	*out_deferred = replySize == 0;
+	if (!*out_deferred) {
+		if (replySize >= sizeof(RgfxMsgHeader) && link->reader)
+			link->reader->deliver(reply, static_cast<uint32_t>(replySize));
+		// Every slot was held: the answers no one asked for free them.
+		rgfxKextDrainAnswers(link);
+	} else if (link->deferredPosts.fetch_add(1, std::memory_order_relaxed) % kDrainEvery ==
+	           kDrainEvery - 1) {
+		rgfxKextDrainAnswers(link);
+	}
+	return true;
+}
+
+// The control ring's answer wait (RgfxRingWriter::setDeferred): every answer the kext keeps for
+// the process, after the one at `seqno`, handed to the reader. True once taken; whether the one
+// at `seqno` came is its state's to see.
+bool rgfxKextAwaitAnswer(void *context, uint64_t seqno)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	std::lock_guard<std::mutex> take(link->takeLock);
+	rgfxKextTakeAll(link, seqno);
+	return true;
+}
+
+// Whether the kext keeps a deferred pipeline create's answer for later: its feature word
+// (wire-v3's Features, 0x10f) has kRgfxKextFeatureDeferredAnswers. Until the bundle reads that
+// word, no kext is taken to.
+bool rgfxKextDefersAnswers(const RgfxCaps &caps)
+{
+	(void)caps;
+	return false;
+}
 
 // The serializer's lifecycle route: the kext posts the message on the control ring, stamping
 // its seqno, and hands back the answer the device owes it: a pipeline create's reflection, which
@@ -316,6 +418,7 @@ RGFX_LOG_UNRECOGNIZED
 	RgfxReplyReader *_replyReader; // the lifecycle's replies, from the kext; null until the handshake
 	std::unique_ptr<RgfxCompletionThread> _completions; // the queues' completions; null until then
 	RgfxKextLink _link;          // the lifecycle's route to the kext
+	std::shared_ptr<RgfxKnownPipelines> _knownPipelines; // null where the kext defers no answers
 	std::vector<std::unique_ptr<RgfxRingWriter>> _queueRings; // owned queue submit-ring writers
 	std::mutex _queueRingsLock;  // queues are made and end on any thread
 	io_connect_t _conn;          // our accelerator user client (BAR-2 region map + doorbell)
@@ -433,6 +536,12 @@ RGFX_LOG_UNRECOGNIZED
 	_link.conn = _conn;
 	_link.reader = _replyReader;
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
+	// A pipeline create equal to one the device accepted is posted without waiting, where the
+	// kext keeps its answer for later (RgfxKnownPipelines.hpp).
+	if (rgfxKextDefersAnswers(_caps)) {
+		_controlRing->setDeferred(&rgfxKextSubmitDeferred, &rgfxKextAwaitAnswer, &_link);
+		_knownPipelines = std::make_shared<RgfxKnownPipelines>();
+	}
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
@@ -452,6 +561,11 @@ RGFX_LOG_UNRECOGNIZED
 - (RgfxSerializer *)serializer
 {
 	return _serializer;
+}
+
+- (std::shared_ptr<RgfxKnownPipelines>)knownPipelines
+{
+	return _knownPipelines;
 }
 
 - (RgfxIdSpace *)ids

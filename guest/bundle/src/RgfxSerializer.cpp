@@ -674,9 +674,25 @@ uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs
 	return append(records.data(), count * sizeof(RgfxLinkedFunction));
 }
 
+// Posts the pipeline create of `type`, the `size` bytes at `message`, on `control` into `out`,
+// against `post`'s known pipelines where it has some and the route defers answers.
+void postPipeline(RgfxRingWriter &control, uint32_t type, const uint8_t *message, uint32_t size,
+                  RgfxCreated &out, RgfxPipelinePost *post)
+{
+	if (post != nullptr && post->known != nullptr && control.defers()) {
+		post->key = RgfxKnownPipelines::keyOf(type, message, size);
+		post->keyed = true;
+		if (post->known->find(post->key, &post->reflection)) {
+			out.posted = control.tryPostKnown(type, message, size, &out.seqno, &post->deferred);
+			return;
+		}
+	}
+	out.posted = control.tryPost(type, message, size, &out.seqno);
+}
 } // namespace
 
-RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p)
+RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p,
+                                                 RgfxPipelinePost *post)
 {
 	RgfxCreated out = {};
 	out.obj_id = m_ids.allocObjId();
@@ -750,12 +766,13 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	out.posted = m_control.tryPost(RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
-	                               static_cast<uint32_t>(total), &out.seqno);
+	postPipeline(m_control, RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
+	             static_cast<uint32_t>(total), out, post);
 	return out;
 }
 
-RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParams &p)
+RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParams &p,
+                                                  RgfxPipelinePost *post)
 {
 	RgfxCreated out = {};
 	out.obj_id = m_ids.allocObjId();
@@ -805,8 +822,8 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	out.posted = m_control.tryPost(RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
-	                               static_cast<uint32_t>(total), &out.seqno);
+	postPipeline(m_control, RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
+	             static_cast<uint32_t>(total), out, post);
 	return out;
 }
 

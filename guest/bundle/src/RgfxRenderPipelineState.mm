@@ -11,6 +11,7 @@
 #import "RgfxFunction.h"
 #import "RgfxMetalError.h"
 
+#include "RgfxKnownPipelines.hpp"
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -18,6 +19,10 @@
 // so the lambda in rgfxRegisterWithReplyReader: sees its signature.
 @interface RgfxRenderPipelineState ()
 - (void)rgfxFillReflection:(const RgfxPipelineReflection *)r;
+// A create posted without waiting takes `known`, the equal create's reflection, at once, and
+// later its own answer.
+- (void)rgfxTakeKnown:(const RgfxPipelineReflection &)known;
+- (void)rgfxTakeAnswer:(const RgfxPipelineReflection *)r;
 @end
 
 namespace {
@@ -74,6 +79,12 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	// Its functions' arguments; null where unknown.
 	std::shared_ptr<const RgfxAirFunction> _vertexAir;
 	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
+	// A keyed create's key, and the known pipelines its answer is kept in once accepted, until
+	// it registers; a create posted without waiting has its own answer to wait for.
+	std::shared_ptr<RgfxKnownPipelines> _known;
+	RgfxPipelineKey _key;
+	BOOL _deferred;
+	RgfxPipelineAnswer _answer;
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -86,6 +97,19 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 + (instancetype)renderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
                                            device:(id<MTLDevice>)device
                                        serializer:(RgfxSerializer *)serializer
+                                            error:(__autoreleasing NSError **)error
+{
+	return [self renderPipelineStateWithDescriptor:descriptor
+	                                        device:device
+	                                    serializer:serializer
+	                                         known:nullptr
+	                                         error:error];
+}
+
++ (instancetype)renderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
+                                           device:(id<MTLDevice>)device
+                                       serializer:(RgfxSerializer *)serializer
+                                            known:(std::shared_ptr<RgfxKnownPipelines>)known
                                             error:(__autoreleasing NSError **)error
 {
 	if (serializer == nullptr) {
@@ -224,7 +248,9 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	p.vertex_attributes = attributes.empty() ? nullptr : attributes.data();
 	p.vertex_attribute_count = static_cast<uint32_t>(attributes.size());
 
-	RgfxCreated created = serializer->createRenderPipeline(p);
+	RgfxPipelinePost post;
+	post.known = known.get();
+	RgfxCreated created = serializer->createRenderPipeline(p, &post);
 	if (!created.posted) {
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorRingFull,
@@ -242,8 +268,29 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
 		state->_vertexAir = stageArguments(descriptor.vertexFunction);
 		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
+		if (post.deferred) {
+			[state rgfxTakeKnown:post.reflection];
+		} else if (post.keyed) {
+			state->_known = known;
+			state->_key = post.key;
+		}
 	}
 	return state;
+}
+
+- (void)rgfxTakeKnown:(const RgfxPipelineReflection &)known
+{
+	_reflection = known;
+	_reflection.header.seqno = _seqno;
+	_reflection.obj_id = self.rgfxObjId;
+	_reflection.gpu_resource_id = 0; // its own, which gpuResourceID waits for
+	_haveReflection = YES;
+	_deferred = YES;
+}
+
+- (BOOL)rgfxDeferred
+{
+	return _deferred;
 }
 
 - (std::shared_ptr<const RgfxAirFunction>)rgfxVertexAirFunction
@@ -283,12 +330,37 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	// Weak capture: if the caller releases this state before its reflection arrives,
 	// the one-shot handler is a no-op (the reflection is then moot).
 	__weak RgfxRenderPipelineState *weakSelf = self;
-	reader->expectReflection(_seqno, [weakSelf](const RgfxPipelineReflection &r) {
+	if (_deferred) {
+		// Its own answer: the resource ID gpuResourceID waits for.
+		reader->expectReflection(_seqno, [weakSelf](const RgfxPipelineReflection &r) {
+			RgfxRenderPipelineState *strongSelf = weakSelf;
+			if (strongSelf != nil)
+				[strongSelf rgfxTakeAnswer:&r];
+		});
+		return;
+	}
+	// A keyed create's answer is kept once the device accepted it, so equal creates need not wait.
+	std::shared_ptr<RgfxKnownPipelines> known = std::move(_known);
+	const RgfxPipelineKey key = _key;
+	reader->expectReflection(_seqno, [weakSelf, known, key](const RgfxPipelineReflection &r) {
+		if (known)
+			known->learn(key, r);
 		RgfxRenderPipelineState *strongSelf = weakSelf;
 		if (strongSelf != nil) {
 			[strongSelf rgfxFillReflection:&r];
 		}
 	});
+}
+
+// A create posted without waiting: its own answer, whose resource ID gpuResourceID answers. A
+// refusal (the platform could not make the pipeline, its descriptor though equal to an accepted
+// one's) shows only there, as 0, and in the command buffers that name it.
+- (void)rgfxTakeAnswer:(const RgfxPipelineReflection *)r
+{
+	_answer.take(*r);
+	if (r->status != RGFX_PIPELINE_OK)
+		NSLog(@"RGFX: the device refused render pipeline %llu, made as an equal one it accepted",
+		      static_cast<unsigned long long>(self.rgfxObjId));
 }
 
 // Stores the host's reflection; the getters below then report it.
@@ -335,6 +407,14 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 
 - (MTLResourceID)gpuResourceID
 {
+	if (_deferred) {
+		RgfxSerializer *serializer = [self serializer];
+		const uint64_t seqno = _seqno;
+		return (MTLResourceID){ _answer.resourceId([serializer, seqno] {
+			if (serializer != nullptr)
+				serializer->awaitAnswer(seqno);
+		}) };
+	}
 	if (_haveReflection) {
 		return (MTLResourceID){ _reflection.gpu_resource_id };
 	}

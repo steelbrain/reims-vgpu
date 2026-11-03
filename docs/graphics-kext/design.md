@@ -1185,6 +1185,38 @@ block for the reply, which carries the reflection the guest needs
 (`threadExecutionWidth`, max total threads per threadgroup, static threadgroup
 memory) — m2v's "take state answers from the created pipeline".
 
+**Known pipeline creates.** A pipeline create whose message equals, in every
+byte but its header and object id, one the device accepted for the same
+process does not wait for its reply (the bundle's `RgfxKnownPipelines.hpp`).
+It is posted with Submit's `kRgfxSubmitDeferred` flag, and its state takes the
+earlier create's reflection at once. Its `gpuResourceID`, the one value the
+host gives each create alone, waits at its first read for the create's own
+reply, which the kext keeps until the process takes it (`TakeAnswers`). The
+process also takes the replies no one asked for every 32 such posts. Each
+create is still a new object with its own resource ID, as Metal's equal
+creates are. The first create of each message waits as before, so a refusal is
+still known at the create. A refusal is never kept, so its equal create waits
+again. Where the kext has no slot left (64 per process, 256 in all), the create
+waits as any. The bundle posts this way only where the kext's feature word
+has `kRgfxKextFeatureDeferredAnswers`.
+
+Every reason the host refuses a pipeline create is either impossible for an
+equal create or known to the process when it posts:
+- its object id is new;
+- its libraries are held by its functions;
+- its bytes are the accepted create's;
+- the platform's pipeline resource IDs are not refused (measured to
+  1,000,000);
+- the ring and the context are checked by the kext before it posts;
+- a failed context still carries out pipeline creates ("Guest input the host
+  refuses", above).
+
+One reason stays: the platform running out of memory at the new state's own
+`VkPipeline` link. That refusal shows at the state's first `gpuResourceID`
+(as 0) and in the command buffers that name it, which fail on the host, instead
+of at the create. This gap closes once the Vulkan runtime shares one linked
+pipeline between equal keys.
+
 | group | messages | `Platform` call |
 |---|---|---|
 | memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
