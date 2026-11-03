@@ -338,6 +338,21 @@ impl<P: Platform> SurfaceViews<P> {
         }))
     }
 
+    /// `SURFACE_PAGES` of a deferred block (`RGFX_SURFACE_PAGES_DEFERRED`), which has no pages
+    /// yet, and so no view: any view the block had goes, once the lock is let go, on this thread.
+    /// False where the device was reset since `settle` began it.
+    pub(crate) fn deferred(views: &Mutex<SurfaceViews<P>>, block: u64, settle: &Settle) -> bool {
+        let old = {
+            let mut v = views.lock();
+            if v.resets != settle.resets {
+                return false;
+            }
+            (v.by_block.remove(&block), v.private.remove(&block))
+        };
+        drop(old);
+        true
+    }
+
     /// `SURFACE_PAGES` of a pages block (`RGFX_SURFACE_PAGES_PRIVATE`, the module doc): `runs`,
     /// checked and in guest RAM, for the block `pages` names, in place of any view it had; its
     /// view is made at its first `BUFFER_OVER_PAGES` ([`Self::private_view`]). What the block
@@ -819,18 +834,27 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             return Ok(Err(super::DecodeError::BadReference));
         }
         self.settle_surface(m.block_offset);
-        let Some(view) = self.shared.surface_views.lock().view_for(&m) else {
-            return Ok(Err(super::DecodeError::Refused));
-        };
+        let view = self.shared.surface_views.lock().view_for(&m);
         // A block with a device cache: the buffer is the cache, over the surface's bytes in the
-        // pages' layout (`surface_cache`).
-        let cache = (self.surface_caches.lock().buffer(m.block_offset)).map(|c| c.clone_ref());
-        let buffer = match cache {
-            Some(cache) => cache,
-            None => match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
-                Some(buffer) => buffer,
-                None => return Ok(Err(super::DecodeError::Refused)),
-            },
+        // pages' layout (`surface_cache`). A deferred block whose pages are not named has its
+        // cache and no view.
+        let cache = {
+            let caches = self.surface_caches.lock();
+            match &view {
+                Some(_) => caches.buffer(m.block_offset),
+                None => caches.deferred_buffer(&m),
+            }
+            .map(|c| c.clone_ref())
+        };
+        let buffer = match (cache, view) {
+            (Some(cache), _) => cache,
+            (None, Some(view)) => {
+                match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
+                    Some(buffer) => buffer,
+                    None => return Ok(Err(super::DecodeError::Refused)),
+                }
+            }
+            (None, None) => return Ok(Err(super::DecodeError::Refused)),
         };
         let span = Some((m.block_offset, m.block_size));
         let entry = super::tables::Entry::of(super::ObjHandle::Buffer(buffer)).over(span);

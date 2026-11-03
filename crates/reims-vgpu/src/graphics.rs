@@ -43,13 +43,13 @@ use reims_graphics::wire::{
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_ICB_SLOTS,
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
-    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
-    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
-    RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
+    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
+    RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -157,6 +157,17 @@ pub struct GraphicsConfig {
     pub memory_map: Option<MemoryMap>,
 }
 
+/// The bytes of the host GPU's memory deferred blocks' device caches may hold, which
+/// `DEFERRED_BUDGET_LO` and `_HI` read, of a device offering `features` on a GPU whose own memory's
+/// budget is `own_memory` ([`GpuDevice::own_memory_budget`]): a quarter of it, as the wire gives
+/// it (`RGFX_REG_DEFERRED_BUDGET_LO`); 0 without `SURFACE_DEFERRED`.
+fn deferred_budget(features: u64, own_memory: u64) -> u64 {
+    if features & u64::from(RGFX_FEATURE_SURFACE_DEFERRED) == 0 {
+        return 0;
+    }
+    own_memory / 4
+}
+
 /// The mode a display offers before its window has a size, and without a window.
 const FALLBACK_MODE: Mode = Mode {
     width: 1920,
@@ -255,8 +266,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
                     (true, true) => in_place,
-                    (true, false) => in_place | u64::from(RGFX_FEATURE_SURFACE_CACHE),
+                    // A host that keeps caches keeps fresh surfaces in them alone where the kext
+                    // defers their pages.
+                    (true, false) => {
+                        in_place
+                            | u64::from(RGFX_FEATURE_SURFACE_CACHE)
+                            | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
+                    }
                 };
+            let deferred_budget = deferred_budget(features, gpu_device.own_memory_budget());
+            decoder.set_deferred_budget(deferred_budget);
             // The processes read the features from the device info, as no register is theirs.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
@@ -309,6 +328,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
                 features,
+                deferred_budget,
                 control: Arc::clone(&control),
             });
             let (window, screen): (Option<WindowLink>, Box<dyn Screen>) = match config.window {
@@ -1657,6 +1677,9 @@ struct CallbackHost<P: ApiPlatform> {
     /// The `RGFX_FEATURE_*` the decoder carries out, fixed at the device's make: the guest reads
     /// them on a vCPU, which takes no lock of the decoder's.
     features: u64,
+    /// The deferred blocks' budget ([`deferred_budget`]), read once at the device's make, so the
+    /// kext's one read holds.
+    deferred_budget: u64,
     /// The stage-3 decoder, fed the stage-3 messages of ring 0 and of the queues' rings.
     control: Arc<GraphicsControl<P>>,
 }
@@ -1710,6 +1733,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn features(&self) -> u64 {
         self.features
+    }
+
+    fn deferred_budget(&self) -> u64 {
+        self.deferred_budget
     }
 
     fn surface_pages(

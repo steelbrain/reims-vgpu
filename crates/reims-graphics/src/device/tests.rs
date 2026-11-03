@@ -447,6 +447,9 @@ fn the_registers_read_as_the_wire_says() {
     );
     assert_eq!(read(RGFX_REG_REGION_SIZE_HI), (REGION_SIZE >> 32) as u32);
     assert_eq!(read(RGFX_REG_DOORBELL), 0);
+    // No `SURFACE_DEFERRED`, so no budget.
+    assert_eq!(read(RGFX_REG_DEFERRED_BUDGET_LO), 0);
+    assert_eq!(read(RGFX_REG_DEFERRED_BUDGET_HI), 0);
     assert_eq!(rig.device.region_size(), REGION_SIZE);
     rig.start();
     assert_eq!(read(RGFX_REG_STATUS), 1);
@@ -2010,6 +2013,49 @@ fn control_completion_posts_from_several_threads_land_whole() {
         poster.join().unwrap();
     }
     assert_eq!(next, [EACH; THREADS as usize]);
+}
+
+/// A host that offers `SURFACE_DEFERRED` reads its budget in `DEFERRED_BUDGET_LO` and `_HI`, the
+/// same before the driver is ready, after and across a reset, and the driver may take the bit
+#[test]
+fn the_deferred_budget_reads_as_the_host_gives_it() {
+    struct Budget;
+    impl Host for Budget {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+            false
+        }
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED)
+        }
+        fn deferred_budget(&self) -> u64 {
+            0x1_2345_6000
+        }
+    }
+    let rig = Rig::with_host(Box::new(Budget));
+    let read = |offset: u32| rig.device.mmio_read(offset.into());
+    let budget = || {
+        (
+            read(RGFX_REG_DEFERRED_BUDGET_LO),
+            read(RGFX_REG_DEFERRED_BUDGET_HI),
+        )
+    };
+    assert_eq!(budget(), (0x2345_6000, 1));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_LO.into(),
+        RGFX_FEATURE_SURFACE_DEFERRED,
+    );
+    assert_eq!(
+        read(RGFX_REG_DRIVER_FEATURES_LO),
+        RGFX_FEATURE_SURFACE_DEFERRED
+    );
+    rig.start();
+    assert_eq!(budget(), (0x2345_6000, 1));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(budget(), (0x2345_6000, 1));
 }
 
 /// The device's feature bits are its host's; a `SURFACE_PAGES` hands the host the runs it lists

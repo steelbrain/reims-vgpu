@@ -202,7 +202,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 18.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 19.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -219,7 +219,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_HEAP_OVER_PAGES
     | RGFX_FEATURE_SUBMIT_ROOM
     | RGFX_FEATURE_ICB_SLOTS
-    | RGFX_FEATURE_COMMIT_ORDER) as u64;
+    | RGFX_FEATURE_COMMIT_ORDER
+    | RGFX_FEATURE_SURFACE_DEFERRED) as u64;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -335,6 +336,14 @@ pub trait Host: Send + Sync + 'static {
         0
     }
 
+    /// The bytes of the host GPU's memory the device caches of deferred blocks may hold
+    /// ([`RGFX_FEATURE_SURFACE_DEFERRED`]), which `DEFERRED_BUDGET_LO` and `_HI` read: the same
+    /// for the device's life, so the kext's one read at its start holds, and 0 where the host
+    /// does not offer the feature. The default is 0.
+    fn deferred_budget(&self) -> u64 {
+        0
+    }
+
     /// `SURFACE_PAGES`: the guest RAM runs of the IOSurface whose shared block `pages` names,
     /// read out of the block, before its first `BLOCK_SHARE`. The host maps them as one view for
     /// the block's `BUFFER_OVER_SURFACE_PAGES` buffers, until the block's `BLOCK_RELEASE`, where
@@ -342,8 +351,10 @@ pub trait Host: Send + Sync + 'static {
     /// [`RGFX_STATUS_REFUSED`], with no view. `flags` are the message's `RGFX_SURFACE_PAGES_*`
     /// ([`RgfxSurfacePagesCache::flags`], 0 for a message without them):
     /// [`RGFX_SURFACE_PAGES_CACHED`], where a host that carries out
-    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are; and
-    /// [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a
+    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are, and
+    /// with it [`RGFX_SURFACE_PAGES_DEFERRED`], no runs and a cache of zeros alone, or
+    /// [`RGFX_SURFACE_PAGES_ATTACH`], the runs of such a block's pages
+    /// ([`RGFX_FEATURE_SURFACE_DEFERRED`]); and [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a
     /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
     /// buffers alone. The host gives `answer` from any thread once it has carried the message
     /// out, and carries out every later message that names the block as if after it. Called on
@@ -786,6 +797,10 @@ impl Device {
             }
             RGFX_REG_REGION_SIZE_LO => (size & 0xffff_ffff) as u32,
             RGFX_REG_REGION_SIZE_HI => (size >> 32) as u32,
+            RGFX_REG_DEFERRED_BUDGET_LO => {
+                (self.shared.host.deferred_budget() & 0xffff_ffff) as u32
+            }
+            RGFX_REG_DEFERRED_BUDGET_HI => (self.shared.host.deferred_budget() >> 32) as u32,
             _ => 0,
         }
     }

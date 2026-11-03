@@ -4942,6 +4942,9 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_COMMIT_ORDER
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
+    // The fake's GPU shares the CPU's memory: no caches, so no deferred blocks and no budget.
+    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
+    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
     assert_eq!(
@@ -4954,6 +4957,22 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_ICB_SLOTS
             | RGFX_FEATURE_COMMIT_ORDER
     );
+    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
+    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
+}
+
+/// The deferred blocks' budget is a quarter of the GPU's own memory's where the device offers
+/// `SURFACE_DEFERRED`, and 0 where it does not
+#[test]
+fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
+    let deferred = u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED);
+    assert_eq!(super::deferred_budget(deferred, 16 << 30), 4 << 30);
+    assert_eq!(
+        super::deferred_budget(deferred, 0xcf5c_2c000),
+        0xcf5c_2c000 / 4
+    );
+    let cached = u64::from(RGFX_FEATURE_SURFACE_CACHE);
+    assert_eq!(super::deferred_budget(cached, 16 << 30), 0);
 }
 
 /// What the poison-fill tests write over the guest's memory before the host answers into it: a

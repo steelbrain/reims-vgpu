@@ -32,6 +32,19 @@
 //!   are watched: a write over them makes the cache's next use fill it whatever its generation,
 //!   and a download or a release before that copies nothing, the pages being newer than the
 //!   cache.
+//! - **Deferred blocks.** Where the guest took `RGFX_FEATURE_SURFACE_DEFERRED`, the kext names a
+//!   fresh surface only the GPU has touched with no pages
+//!   ([`RGFX_SURFACE_PAGES_DEFERRED`](reims_graphics::wire::RGFX_SURFACE_PAGES_DEFERRED)), as a
+//!   GPU of its own memory keeps such a surface in that memory alone: its cache is made as zeros,
+//!   on the transfer queue before any use, at the CPU's generation 0, with no pages to fill from,
+//!   download into or watch. The kext names the pages at the first CPU lock that needs them
+//!   ([`RGFX_SURFACE_PAGES_ATTACH`](reims_graphics::wire::RGFX_SURFACE_PAGES_ATTACH)), and the
+//!   cache takes them as they are, keeping its bytes, its generation and whether a buffer wrote
+//!   it, so the download that follows copies what the GPU wrote. A release of a block whose pages
+//!   were never named copies nothing. Such caches hold at most the device's budget of them
+//!   (`DEFERRED_BUDGET_LO`), from their make to their release, named or not; a block past it, or
+//!   one whose cache the platform does not make, is refused with no cache, and the kext names its
+//!   pages instead.
 //!
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
 //! it, and a GPU use after a read-write lock sees the CPU's writes. A CPU write made without a
@@ -61,10 +74,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use reims_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+use reims_graphics::wire::RgfxBufferOverSurfacePages;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
+use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
@@ -86,8 +101,9 @@ pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
 pub(crate) struct SurfaceCache<P: Platform> {
     /// The cache: a Private buffer of the surface's bytes, which the block's buffers are.
     device: P::Buffer,
-    /// A Shared buffer over the surface's own pages, the other end of each copy.
-    pages: P::Buffer,
+    /// A Shared buffer over the surface's own pages, the other end of each copy; `None` for a
+    /// deferred block whose pages the kext has not named yet.
+    pages: Option<P::Buffer>,
     /// The surface's bytes.
     length: u64,
     /// The CPU's generation of the surface the cache holds; `None` until its first fill.
@@ -99,6 +115,10 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Each queue whose command buffers used the cache since its last copy, with the value of the
     /// queue's end event the latest of them signals.
     users: HashMap<u64, u64>,
+    /// Where the block was deferred, the block's size its `SURFACE_PAGES` gave, which a
+    /// `BUFFER_OVER_SURFACE_PAGES` is checked against while the block has no view: its cache
+    /// counts against the deferred budget until it goes, its pages named or not.
+    deferred: Option<u64>,
 }
 
 /// The host's transfer queue, on which every copy runs, and the event its fills signal.
@@ -204,6 +224,12 @@ pub(crate) struct CacheCounts {
     /// Releases of a written cache whose surface had no client left
     /// (`RGFX_BLOCK_RELEASE_NO_CLIENT`), copied into the pages all the same.
     pub(crate) unread: u64,
+    /// Deferred blocks' caches made, and refused (past the budget, or not made); deferred blocks
+    /// whose pages were named; and those released with their pages never named.
+    pub(crate) deferred: u64,
+    pub(crate) deferred_refused: u64,
+    pub(crate) attached: u64,
+    pub(crate) unattached: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and whether a device of the host wrote
@@ -262,6 +288,10 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     next_writer: u64,
     /// What a fill tells as it finishes, the [`Caches`]' own, kept across [`Caches::set_on`].
     on_fill_done: Arc<OnceLock<FillHook>>,
+    /// The bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`), kept
+    /// across [`Caches::set_on`], and the bytes they hold.
+    deferred_budget: u64,
+    deferred_bytes: u64,
 }
 
 /// The command buffers begun and not finished that use one block's cache.
@@ -305,6 +335,8 @@ impl<P: Platform> SurfaceCaches<P> {
             deferred: HashMap::new(),
             next_writer: 0,
             on_fill_done,
+            deferred_budget: 0,
+            deferred_bytes: 0,
         }
     }
 
@@ -360,12 +392,13 @@ impl<P: Platform> SurfaceCaches<P> {
             block,
             SurfaceCache {
                 device: cache,
-                pages,
+                pages: Some(pages),
                 length,
                 generation: None,
                 written: false,
                 filled_at: 0,
                 users: HashMap::new(),
+                deferred: None,
             },
         );
         let pages = Pages {
@@ -375,6 +408,157 @@ impl<P: Platform> SurfaceCaches<P> {
         self.watched.0.lock().insert(block, pages);
         self.counts.made += 1;
         Ok(true)
+    }
+
+    /// A cache of zeros for the deferred block at `block` (the module doc), of `length` bytes,
+    /// at the CPU's generation 0, its block `block_size` bytes: zeroed on the transfer queue,
+    /// whose fill every use of it waits for. `Ok(false)`, with no cache, where the device keeps
+    /// none, the deferred caches' budget has no room for it, or the platform made no buffer or
+    /// no transfer queue for it. A cache the block had goes first, as at a release
+    /// ([`SurfaceCaches::released`]).
+    pub(crate) fn make_deferred(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        length: u64,
+        block_size: u64,
+    ) -> RaiseResult<bool> {
+        if !self.on {
+            return Ok(false);
+        }
+        if self.by_block.contains_key(&block) {
+            self.released(device, block, false, Box::new(|| {}))?;
+        }
+        let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
+        let made = if length <= room {
+            device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?
+        } else {
+            None
+        };
+        let zeroed = match &made {
+            Some(cache) => self.zero(device, cache, length)?,
+            None => None,
+        };
+        let (Some(cache), Some(filled_at)) = (made, zeroed) else {
+            self.counts.deferred_refused += 1;
+            return Ok(false);
+        };
+        self.by_block.insert(
+            block,
+            SurfaceCache {
+                device: cache,
+                pages: None,
+                length,
+                generation: Some(0),
+                written: false,
+                filled_at,
+                users: HashMap::new(),
+                deferred: Some(block_size),
+            },
+        );
+        self.deferred_bytes += length;
+        self.counts.made += 1;
+        self.counts.deferred += 1;
+        Ok(true)
+    }
+
+    /// Fills `length` bytes of `cache` with zeros on the transfer queue: the transfer event's
+    /// value at which it is done, `None` where the platform made no queue, command buffer or
+    /// encoder for it.
+    fn zero(
+        &mut self,
+        device: &P::Device,
+        cache: &P::Buffer,
+        length: u64,
+    ) -> RaiseResult<Option<u64>> {
+        if !self.make_transfer(device)? {
+            return Ok(None);
+        }
+        let Some(transfer) = self.transfer.as_mut() else {
+            return Ok(None);
+        };
+        let Some(cb) = transfer.queue.command_buffer(ON)? else {
+            return Ok(None);
+        };
+        let Some(blit) = cb.blit_encoder(ON)? else {
+            return Ok(None);
+        };
+        let range = NsRange::new(0, length);
+        blit.encode(
+            ON,
+            BlitCmd::FillBuffer {
+                buffer: cache,
+                range,
+                value: 0,
+            },
+        )?;
+        blit.encode(ON, BlitCmd::EndEncoding)?;
+        transfer.signalled += 1;
+        let value = transfer.signalled;
+        cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
+        let fills = Arc::clone(&transfer.fills);
+        cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| fills.finished(value)))?;
+        cb.commit(ON)?;
+        Ok(Some(value))
+    }
+
+    /// The pages of the deferred block at `block`, which `view` maps and whose host addresses in
+    /// the guest's RAM are `host_pages` ([`Self::make`]), taken for its cache, which keeps its
+    /// bytes, its generation and whether a buffer wrote it: `Some(true)`; `Some(false)` where the
+    /// view is shorter than the cache or the platform made no buffer over it, the block keeping
+    /// none; `None` where the block has no deferred cache whose pages are not named.
+    pub(crate) fn attach(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        view: &Arc<SurfaceView<P>>,
+        host_pages: Vec<Range<u64>>,
+    ) -> RaiseResult<Option<bool>> {
+        let Some(length) = self.unattached(block) else {
+            return Ok(None);
+        };
+        if view.length() < length {
+            return Ok(Some(false));
+        }
+        let Some(pages) = buffer_over(device, view, 0, length, 0, None)? else {
+            return Ok(Some(false));
+        };
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            cache.pages = Some(pages);
+        }
+        let pages = Pages {
+            runs: host_pages,
+            written: false,
+        };
+        self.watched.0.lock().insert(block, pages);
+        self.counts.attached += 1;
+        Ok(Some(true))
+    }
+
+    /// The bytes of the deferred block at `block`'s cache, where its pages are not named yet.
+    pub(crate) fn unattached(&self, block: u64) -> Option<u64> {
+        (self.by_block.get(&block))
+            .filter(|c| c.deferred.is_some() && c.pages.is_none())
+            .map(|c| c.length)
+    }
+
+    /// The cache of the deferred block `m` names, which has no view while its pages are not
+    /// named, where the block's size holds the `m.block_size` bytes `m` names and the cache at
+    /// least `m.length` bytes, as a view's are checked ([`super::surface_pages::SurfaceViews::view_for`]).
+    pub(crate) fn deferred_buffer(&self, m: &RgfxBufferOverSurfacePages) -> Option<&P::Buffer> {
+        (self.by_block.get(&m.block_offset))
+            .filter(|c| {
+                c.pages.is_none()
+                    && c.deferred.is_some_and(|size| m.block_size <= size)
+                    && m.length != 0
+                    && m.length <= c.length
+            })
+            .map(|c| &c.device)
+    }
+
+    /// Sets the bytes deferred blocks' caches may hold at once.
+    pub(crate) fn set_deferred_budget(&mut self, budget: u64) {
+        self.deferred_budget = budget;
     }
 
     /// The cache of the block at `block`, which its buffers are.
@@ -587,11 +771,16 @@ impl<P: Platform> SurfaceCaches<P> {
         else {
             return Ok(());
         };
+        // A deferred block's pages, not named yet, hold nothing the cache does not: the CPU has
+        // not locked the surface for writing.
+        let Some(pages) = &cache.pages else {
+            return Ok(());
+        };
         let Some(cb) = transfer.queue.command_buffer(ON)? else {
             return Ok(());
         };
         wait_for_users::<P>(&cb, &self.ends, cache)?;
-        copy::<P>(&cb, &cache.pages, &cache.device, cache.length)?;
+        copy::<P>(&cb, pages, &cache.device, cache.length)?;
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
@@ -652,6 +841,13 @@ impl<P: Platform> SurfaceCaches<P> {
             done();
             return Ok(());
         }
+        if self.unattached(block).is_some() {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: a SURFACE_DOWNLOAD of a deferred block whose \
+                 pages are not named; nothing is copied"
+            );
+        }
         self.write_back(device, block, done)
     }
 
@@ -678,6 +874,12 @@ impl<P: Platform> SurfaceCaches<P> {
             self.write_back(device, block, done)?;
         }
         let gone = self.by_block.remove(&block);
+        if let Some(cache) = gone.as_ref().filter(|c| c.deferred.is_some()) {
+            self.deferred_bytes = self.deferred_bytes.saturating_sub(cache.length);
+            if cache.pages.is_none() {
+                self.counts.unattached += 1;
+            }
+        }
         self.watched.0.lock().remove(&block);
         Ok(gone)
     }
@@ -705,7 +907,8 @@ impl<P: Platform> SurfaceCaches<P> {
         block: u64,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
-        if !self.make_transfer(device)? {
+        // A deferred block whose pages are not named has nowhere to copy to.
+        if self.unattached(block).is_some() || !self.make_transfer(device)? {
             done();
             return Ok(());
         }
@@ -714,14 +917,14 @@ impl<P: Platform> SurfaceCaches<P> {
             done();
             return Ok(());
         };
-        let Some(cb) = transfer.queue.command_buffer(ON)? else {
+        let (Some(pages), Some(cb)) = (&cache.pages, transfer.queue.command_buffer(ON)?) else {
             done();
             return Ok(());
         };
         wait_for_users::<P>(&cb, &self.ends, cache)?;
-        copy::<P>(&cb, &cache.device, &cache.pages, cache.length)?;
+        copy::<P>(&cb, &cache.device, pages, cache.length)?;
         // The buffers live until the copy is done, past the cache's own end at a release.
-        let held = (cache.device.clone_ref(), cache.pages.clone_ref());
+        let held = (cache.device.clone_ref(), pages.clone_ref());
         cb.add_completed_handler(
             ON,
             Box::new(move |_: CompletedInfo| {
@@ -773,6 +976,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let caches = std::mem::take(&mut self.by_block);
         let ends = std::mem::take(&mut self.ends);
         self.deferred.clear();
+        self.deferred_bytes = 0;
         self.watched.0.lock().clear();
         if let Err(refusal) = refusals::refusing(move || drop((caches, ends))) {
             log::warn!(
@@ -884,9 +1088,19 @@ impl<P: Platform> Caches<P> {
         self.moved.notify_all();
     }
 
-    /// Starts again with no caches; `on` keeps them where the kext asks.
+    /// Starts again with no caches; `on` keeps them where the kext asks. The deferred caches'
+    /// budget stays.
     pub(crate) fn set_on(&self, on: bool) {
-        *self.state.lock() = SurfaceCaches::new(on, Arc::clone(&self.on_fill_done));
+        let mut state = self.state.lock();
+        let budget = state.deferred_budget;
+        *state = SurfaceCaches::new(on, Arc::clone(&self.on_fill_done));
+        state.deferred_budget = budget;
+    }
+
+    /// Sets the bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`,
+    /// read once at its start); 0, as at the caches' make, defers none.
+    pub(crate) fn set_deferred_budget(&self, budget: u64) {
+        self.state.lock().set_deferred_budget(budget);
     }
 
     /// Waits, letting the lock go meanwhile, while a command buffer begun and not finished uses
@@ -1112,6 +1326,32 @@ impl<P: Platform> Caches<P> {
         state.make(device, block, view, host_pages)
     }
 
+    /// A cache of zeros for the deferred block at `block` ([`SurfaceCaches::make_deferred`]),
+    /// after every command buffer begun and not finished that may write the cache it had.
+    pub(crate) fn make_deferred(
+        &self,
+        device: &P::Device,
+        block: u64,
+        length: u64,
+        block_size: u64,
+    ) -> RaiseResult<bool> {
+        let mut state = self.state.lock();
+        self.wait_users(&mut state, block, true);
+        state.make_deferred(device, block, length, block_size)
+    }
+
+    /// The deferred block at `block`'s pages taken for its cache ([`SurfaceCaches::attach`]),
+    /// which copies nothing, so waits for no command buffer.
+    pub(crate) fn attach(
+        &self,
+        device: &P::Device,
+        block: u64,
+        view: &Arc<SurfaceView<P>>,
+        host_pages: Vec<Range<u64>>,
+    ) -> RaiseResult<Option<bool>> {
+        self.state.lock().attach(device, block, view, host_pages)
+    }
+
     /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be done,
     /// `timeout` at most, with no lock held, woken by the fill's completed handler: for work the
     /// host starts outside a command buffer that writes the cache, which a command buffer's wait
@@ -1170,16 +1410,17 @@ mod tests {
         RgfxOpHeader,
     };
     use reims_graphics::wire::{
-        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_OK, RgfxMsgHeader,
-        RgfxQueueCreate,
+        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_INVALID_ARGUMENT,
+        RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
+        RGFX_SURFACE_PAGES_DEFERRED, RgfxMsgHeader, RgfxQueueCreate,
     };
     use reims_vgpu_core::num::ToU64 as _;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
-    use super::super::no_raise;
     use super::super::surface_pages::tests::{BLOCK, RAM, Rig, rig};
+    use super::super::{DecodeError, no_raise};
     use super::*;
 
     const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
@@ -1195,18 +1436,7 @@ mod tests {
             r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
             RGFX_STATUS_OK
         );
-        for obj_id in [1, 2] {
-            let queue = RgfxQueueCreate {
-                header: RgfxMsgHeader {
-                    r#type: RGFX_CMD_QUEUE_CREATE,
-                    size: size_of::<RgfxQueueCreate>() as u32,
-                    seqno: 0,
-                },
-                obj_id,
-                ..RgfxQueueCreate::default()
-            };
-            assert_eq!(r.dec.decode(&r.device, queue.as_bytes()).unwrap(), Ok(()));
-        }
+        queues(&mut r);
         r
     }
 
@@ -1886,5 +2116,259 @@ mod tests {
         let calls = r.p.call_log().since(mark);
         assert!(copies(&calls).is_empty());
         assert!(events(&calls, SIGNAL).is_empty());
+    }
+
+    /// `fillBuffer:range:value:`.
+    const FILL: &str = "fillBuffer:range:value:";
+
+    /// A `SURFACE_PAGES` of the deferred block at `block`, of `length` bytes and no runs; its
+    /// answer.
+    fn defer(r: &mut Rig, block: u64, length: u64) -> u32 {
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        r.pages_flagged(block, 0, &[], length, flags)
+    }
+
+    /// A `SURFACE_PAGES` naming the pages of the deferred block at `block`, `runs` as
+    /// [`Rig::pages`]'s, from context `context`; its answer.
+    fn attach(r: &mut Rig, block: u64, context: u32, runs: &[(u64, u64)], length: u64) -> u32 {
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_ATTACH;
+        r.pages_flagged(block, context, runs, length, flags)
+    }
+
+    /// A rig of [`rig`]'s with a deferred budget of `budget` pages, and command queues 1 and 2.
+    fn deferring(budget: u64) -> Rig {
+        let mut r = rig(8);
+        r.dec.set_deferred_budget(budget * r.page);
+        queues(&mut r);
+        r
+    }
+
+    /// Command queues 1 and 2.
+    fn queues(r: &mut Rig) {
+        for obj_id in [1, 2] {
+            let queue = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: size_of::<RgfxQueueCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                ..RgfxQueueCreate::default()
+            };
+            assert_eq!(r.dec.decode(&r.device, queue.as_bytes()).unwrap(), Ok(()));
+        }
+    }
+
+    /// `SURFACE_DOWNLOAD` of the block at `block`, and whether it was answered.
+    fn download(r: &Rig, block: u64) -> Arc<AtomicBool> {
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.surface_download(
+            &r.device,
+            block,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
+        done
+    }
+
+    /// `BLOCK_RELEASE` of the block at `block`, and whether it was answered.
+    fn release(r: &Rig, block: u64) -> Arc<AtomicBool> {
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.block_released(
+            &r.device,
+            block,
+            false,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
+        done
+    }
+
+    /// A deferred block gets a device cache and no view: the cache is zeroed on the transfer
+    /// queue, which a use waits for, at the CPU's generation 0, so a use of generation 0 fills
+    /// nothing; its buffers are the cache. Its release, its pages never named, copies nothing
+    #[test]
+    fn a_deferred_block_is_a_cache_of_zeros_with_no_pages() {
+        let mut r = deferring(8);
+        let page = r.page;
+        let mark = r.p.call_log().mark();
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
+        let calls = r.p.call_log().since(mark);
+        let cache = cache_id(&r);
+        let zeroed: Vec<&Call> = calls.iter().filter(|c| c.sel == FILL).collect();
+        assert_eq!(zeroed.len(), 1);
+        assert_eq!(zeroed[0].args[0].as_obj().map(|o| o.0), Some(cache));
+        assert_eq!(zeroed[0].args[1], Arg::val(&NsRange::new(0, 2 * page)));
+        assert_eq!(zeroed[0].args[2], Arg::U8(0));
+        let zero_done = events(&calls, SIGNAL);
+        assert_eq!(zero_done.len(), 1, "the zeroing signals the transfer event");
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
+        assert_eq!(r.dec.caches().counts().deferred, 1);
+        assert_eq!(r.dec.caches().unattached(BLOCK), Some(2 * page));
+
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        assert!(
+            r.p.call_log().sels_since(mark).is_empty(),
+            "no buffer made: it is the cache"
+        );
+        assert_eq!(
+            r.buffer(11, BLOCK, 3 * page),
+            Err(DecodeError::Refused),
+            "past the cache"
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        assert!(copies(&calls).is_empty(), "nothing to fill from");
+        assert_eq!(events(&calls, WAIT), zero_done, "after the zeroing");
+
+        let mark = r.p.call_log().mark();
+        let released = release(&r, BLOCK);
+        assert!(released.load(Ordering::SeqCst), "at once");
+        assert!(copies(&r.p.call_log().since(mark)).is_empty(), "no pages");
+        assert_eq!(r.dec.caches().len(), 0);
+        assert_eq!(r.dec.caches().counts().unattached, 1);
+    }
+
+    /// A deferred block's pages, named at the first CPU lock that needs them and from any
+    /// context, are taken for its cache, which keeps its bytes and its generation: a use of
+    /// generation 0 still fills nothing, and the download that follows copies the GPU's write
+    /// from the same cache into the pages. A use after a CPU write's lock then fills the cache
+    /// from them, as any cache's
+    #[test]
+    fn a_deferred_blocks_pages_keep_its_bytes_and_generation() {
+        let mut r = deferring(8);
+        let page = r.page;
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            attach(&mut r, BLOCK, 7, &[(1, 2)], 2 * page),
+            RGFX_STATUS_OK
+        );
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "nothing copied"
+        );
+        assert_eq!(cache_id(&r), cache, "the same cache");
+        assert_eq!(r.dec.caches().unattached(BLOCK), None);
+        assert_eq!(r.dec.caches().counts().attached, 1);
+        assert_eq!(r.dec.views_of_surfaces().len().0, 1, "its view");
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x101, &[(BLOCK, 0, false)]);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "generation 0 still"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let out = copies(&r.p.call_log().since(mark));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, cache, "the GPU's write, out of the cache");
+        assert_ne!(out[0].1, cache);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, false)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled, vec![(out[0].1, cache)], "from the pages");
+    }
+
+    /// Pages named for a block with no deferred cache whose pages are not named (none, one
+    /// with pages, or a deferred one named already) are an invalid argument, and make no view
+    /// and change no cache; so is a message with both flags, a deferred block's without `CACHED`
+    /// or with runs
+    #[test]
+    fn a_stray_attach_is_an_invalid_argument() {
+        let mut r = deferring(8);
+        let page = r.page;
+        let invalid = RGFX_STATUS_INVALID_ARGUMENT;
+        assert_eq!(attach(&mut r, BLOCK, 0, &[(1, 2)], 2 * page), invalid);
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0));
+        assert_eq!(r.dec.caches().len(), 0);
+
+        let other = BLOCK + 0x8000;
+        assert_eq!(r.pages_cached(other, &[(3, 1)], page, true), RGFX_STATUS_OK);
+        let cache = r.dec.caches().buffer(other).map(Arg::obj);
+        assert_eq!(attach(&mut r, other, 0, &[(4, 1)], page), invalid);
+        assert_eq!(r.dec.caches().buffer(other).map(Arg::obj), cache);
+
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
+        assert_eq!(
+            attach(&mut r, BLOCK, 0, &[(1, 2)], 2 * page),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            attach(&mut r, BLOCK, 0, &[(5, 2)], 2 * page),
+            invalid,
+            "named already"
+        );
+
+        let both =
+            RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED | RGFX_SURFACE_PAGES_ATTACH;
+        let third = BLOCK + 0x10000;
+        assert_eq!(r.pages_flagged(third, 0, &[], page, both), invalid);
+        assert_eq!(
+            r.pages_flagged(third, 0, &[], page, RGFX_SURFACE_PAGES_DEFERRED),
+            invalid
+        );
+        let deferred = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        assert_eq!(
+            r.pages_flagged(third, 0, &[(6, 1)], page, deferred),
+            invalid
+        );
+        assert!(!r.dec.caches().has(third));
+    }
+
+    /// A deferred block the budget has no room for, or whose cache the platform does not make,
+    /// or on a device that keeps no caches, is refused and leaves nothing behind, so the kext's
+    /// `SURFACE_PAGES` of its pages that follows makes its cache as any block's. A release gives
+    /// its room back
+    #[test]
+    fn a_deferred_block_not_made_is_refused_with_nothing_left() {
+        use reims_vgpu_core::testkit::Step;
+        let mut r = deferring(3);
+        let page = r.page;
+        let refused = RGFX_STATUS_REFUSED;
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
+        let other = BLOCK + 0x8000;
+        assert_eq!(defer(&mut r, other, 2 * page), refused, "past the budget");
+        assert!(!r.dec.caches().has(other));
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0));
+        assert_eq!(
+            r.pages_cached(other, &[(3, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(other), "named as any block");
+        assert_eq!(r.dec.caches().unattached(other), None);
+
+        assert!(release(&r, BLOCK).load(Ordering::SeqCst));
+        let third = BLOCK + 0x10000;
+        r.p.script().push("newBufferWithLength:options:", Step::Nil);
+        assert_eq!(defer(&mut r, third, 2 * page), refused, "no buffer");
+        assert!(!r.dec.caches().has(third));
+        assert_eq!(
+            defer(&mut r, third, 2 * page),
+            RGFX_STATUS_OK,
+            "the room is back"
+        );
+        assert_eq!(r.dec.caches().counts().deferred_refused, 2);
+
+        let fourth = BLOCK + 0x18000;
+        r.dec.set_unified_memory(true);
+        r.dec.set_deferred_budget(8 * page);
+        assert_eq!(defer(&mut r, fourth, page), refused, "no caches");
+        let mut none = deferring(0);
+        assert_eq!(defer(&mut none, BLOCK, page), refused, "no budget");
     }
 }
