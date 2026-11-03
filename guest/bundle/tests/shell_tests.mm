@@ -3530,6 +3530,80 @@ void test_parallel_render_encoder()
 	CHECK(begins == 1 && ends == 1); // one pass, one begin/end though two sub-encoders
 }
 
+// Metal runs a parallel pass's sub-encoders in the order they were made, whatever order their
+// commands were encoded in, and each starts from the default state (measured on the M3 Max, macOS
+// 27: a sub-encoder made second and encoded first draws last; a 1x1 scissor set in the first does
+// not clip the second's draw). Here the second sub-encoder is encoded first: its draw (vertex
+// start 3) must follow the first's (vertex start 0) in the stream, and the first's scissor must
+// not reach the second's draw.
+void test_parallel_sub_encoders_run_in_creation_order()
+{
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing submit(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	RgfxCommandQueue *queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+	                                                  submitOffset:0
+	                                                completeOffset:0
+	                                              completeDataSize:0
+	                                                           ids:&ids
+	                                                      maxCount:0
+	                                                        device:nil
+	                                                    serializer:&ser];
+	(void)expectQueueCreate(control);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = handle(42);
+	id<MTLParallelRenderCommandEncoder> penc = [cb parallelRenderCommandEncoderWithDescriptor:rp];
+	id<MTLRenderCommandEncoder> first = [penc renderCommandEncoder];
+	id<MTLRenderCommandEncoder> second = [penc renderCommandEncoder];
+	[second setRenderPipelineState:handle(7)];
+	[second drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:3 vertexCount:3];
+	[second endEncoding];
+	[first setRenderPipelineState:handle(7)];
+	[first setScissorRect:(MTLScissorRect){0, 0, 1, 1}];
+	[first drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[first endEncoding];
+	[penc endEncoding];
+	[cb commit];
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(submit.next(&h, &bytes));
+	RgfxCommandBuffer cbh = {};
+	std::memcpy(&cbh, bytes.data(), sizeof(cbh));
+	OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cbh.op_bytes);
+	std::vector<uint64_t> starts;
+	bool scissored = false, scissoredBeforeSecond = false;
+	while (!walk.done()) {
+		uint16_t tag = 0;
+		uint32_t len = 0;
+		const uint8_t *body = nullptr;
+		size_t body_len = 0;
+		CHECK(walk.next(&tag, &len, &body, &body_len));
+		if (tag == RGFX_OP_RENDER_SET_SCISSOR_RECT) {
+			RgfxOpSetScissorRect r = {};
+			std::memcpy(&r, body, sizeof(r));
+			scissored = r.width == 1 && r.height == 1;
+		}
+		if (tag == RGFX_OP_RENDER_DRAW_PRIMITIVES) {
+			RgfxOpDrawPrimitives d = {};
+			std::memcpy(&d, body, sizeof(d));
+			starts.push_back(d.vertex_start);
+			if (d.vertex_start == 3)
+				scissoredBeforeSecond = scissored;
+		}
+	}
+	CHECK(starts.size() == 2);
+	CHECK(starts.size() == 2 && starts[0] == 0 && starts[1] == 3); // creation order
+	CHECK(!scissoredBeforeSecond); // the first's scissor does not clip the second's draw
+}
+
 // A queue must have a route, an id space and a ring.
 void test_queue_guards()
 {
@@ -9083,6 +9157,7 @@ int main(int argc, char **argv)
 		test_library_members_as_metal();
 		test_command_graph();
 		test_parallel_render_encoder();
+		test_parallel_sub_encoders_run_in_creation_order();
 		test_queue_guards();
 		test_refused_queue_create_is_nil();
 		test_region_allocator();
