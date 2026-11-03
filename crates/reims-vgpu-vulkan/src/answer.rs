@@ -119,6 +119,7 @@
 //! layout, `heap-texture-block-compressed-layout`, dies.
 
 use std::cell::{Cell, RefCell};
+use std::ptr::NonNull;
 
 use metal2vulkan_runtime as rt;
 use metal2vulkan_runtime::Error;
@@ -1556,9 +1557,10 @@ thread_local! {
     /// A notice of [`DIES`] the runtime announced on this thread inside a call here, which the
     /// call dies at once it returns: read only where [`Calls::pending`] says it is there.
     static PENDING: RefCell<Option<rt::DegradeNotice>> = const { RefCell::new(None) };
-    /// The kinds of [`HEARD`] the runtime announced on this thread inside the innermost
-    /// [`hearing`], where one runs.
-    static HEARING: RefCell<Option<Vec<rt::Degradation>>> = const { RefCell::new(None) };
+    /// The list of the innermost [`hearing`] this thread runs, where one runs: the kinds of
+    /// [`HEARD`] the runtime announced on this thread inside it. The list lies on the hearing's
+    /// stack, and the hearing puts back the one outside it before it reads its own.
+    static HEARING: Cell<Option<NonNull<Vec<rt::Degradation>>>> = const { Cell::new(None) };
     /// Whether this thread runs an [`unheard`] call.
     static UNHEARD: Cell<bool> = const { Cell::new(false) };
 }
@@ -1653,18 +1655,18 @@ pub fn relayed_counts() -> Vec<(rt::Degradation, u64)> {
 /// inside it, in order, each as many times as announced.
 pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
     /// Puts back the outer hearing on drop, an unwinding call's included.
-    struct Restore(Option<Option<Vec<rt::Degradation>>>);
+    struct Restore(Option<NonNull<Vec<rt::Degradation>>>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            if let Some(outer) = self.0.take() {
-                HEARING.with(|h| *h.borrow_mut() = outer);
-            }
+            HEARING.with(|h| h.set(self.0));
         }
     }
-    let mut restore = Restore(Some(HEARING.with(|h| h.replace(Some(Vec::new())))));
-    let out = call();
-    let heard = HEARING.with(|h| h.replace(restore.0.take().flatten()));
-    (out, heard.unwrap_or_default())
+    let mut heard = Vec::new();
+    let out = {
+        let _outer = Restore(HEARING.with(|h| h.replace(Some(NonNull::from(&mut heard)))));
+        call()
+    };
+    (out, heard)
 }
 
 /// Runs `call`, a probe of the device's own outside any guest's work (`crate::os`'s
@@ -1823,12 +1825,12 @@ pub fn notice(message: &rt::DebugMessage) {
         }
     }
     if !DIES.contains(&notice.degradation) {
-        if HEARD.contains(&notice.degradation) {
-            HEARING.with(|h| {
-                if let Some(heard) = h.borrow_mut().as_mut() {
-                    heard.push(notice.degradation);
-                }
-            });
+        if HEARD.contains(&notice.degradation)
+            && let Some(mut heard) = HEARING.with(Cell::get)
+        {
+            // SAFETY: the list of the innermost hearing this thread runs, on its stack until it
+            // puts back the one outside it, and read by it only after that.
+            unsafe { heard.as_mut() }.push(notice.degradation);
         }
         #[cfg(test)]
         RELAYED.lock().push(notice.degradation);
