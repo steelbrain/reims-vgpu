@@ -125,11 +125,16 @@ const ROOM_POLL: Duration = Duration::from_millis(1);
 /// Where the posts onto one full completion ring wait for room, each on the thread that posts
 /// it. The guest makes room by moving the ring's consumer count, a write to the region that
 /// wakes nothing, so a waiting post looks again after the device's poll ([`ROOM_POLL`]); what
-/// the host does see wakes it at once: the ring's doorbell (a guest process takes its queue's
-/// completions on the thread that submits while its rings are full, then rings the queue's
-/// doorbell for what it submits; ring 0's, rung through [`Device::mmio_write`] or the host's
-/// doorbell file, which wakes the control thread), the device's reset, the queue's end and the
-/// device's.
+/// the host does see wakes it at once: the device's reset, the queue's end and the device's, and
+/// the ring's doorbell, which the guest rings for what it publishes while the ring's consumer
+/// sleeps (`consumer_idle`; the bundle also once as it finds a queue's submission ring full). So a
+/// queue's doorbell wakes a post of a GPU thread's when the process submits again, and ring 0's,
+/// rung through [`Device::mmio_write`] or the host's doorbell file, a post of a thread other than
+/// the control thread (a compile's reflection, an answer given on a GPU thread) when the kext posts
+/// while the control thread sleeps. The guest's take of a full ring rings nothing, so the control
+/// thread's own post, and any post while its ring's consumer is awake, looks again only at the
+/// poll. The wake for that take is the wire's version 3 `CONSUMED` doorbell, which the guest
+/// writes after it takes from a ring the host waits on.
 #[derive(Default)]
 struct Room {
     /// Moved on at each wake, so a wake between a post's look and its wait ends the wait.
