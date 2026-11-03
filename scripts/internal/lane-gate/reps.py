@@ -20,9 +20,11 @@ separated (nothing where every one has some, or where the host sampled no clocks
 import re
 import sys
 
-# Between the modes msi's 5080 shows under load: 2392 to 2805 MHz high, 1.2 to 1.5 GHz under the
-# power cap, and 1.75 to 2.38 GHz in P4 from idle.
-CORE_MIN_MHZ = 2400
+# Above the power cap's 1.2 to 1.5 GHz on msi's 5080, and below the high mode's clock, which depends
+# on the case: about 130 W holds frag.alu at 2.0 to 2.3 GHz (2160p at 464 to 481 fps, against 301 to
+# 354 under the cap), and frag.fill at 2.79 GHz. Readings at 1.9 to 2.3 GHz under alu gave the same
+# rate (11-03), so the readings there say nothing finer. P4 from idle reads 1.75 to 2.38 GHz.
+CORE_MIN_MHZ = 2000
 # nvidia-smi's clocks change only about every half second under load (the driver's update): a span
 # is judged on the readings around it, from the one before it to those half a second after it.
 LAG_S = 0.5
