@@ -1556,8 +1556,12 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   nothing. The unsigned bundle's executable still has to pass library
   validation when WindowServer and the Metal helpers map it; the same kext
   answers the library-validation, mmap and signature MAC checks for our bundle
-  by its code-directory hash alone, leaving every other binary's signing rules
-  untouched. No boot-args and no SIP relaxation are involved — the guest boots
+  by its code-directory hash, leaving every other binary's signing rules
+  untouched. The signature check, the wall that gates the other two, also
+  requires the executable's path to be under `/Library/GPUBundles`, so the
+  exemption follows the installed bundle and a byte-identical copy of it placed
+  elsewhere is not trusted — the same pinning the install writes carry. No
+  boot-args and no SIP relaxation are involved — the guest boots
   with SIP fully enabled (measured on msi, x86-64 macOS 26.6.1: desktop
   composites on our Metal device and Safari WebGL renders, `csrutil` enabled).
   `/Library/GPUBundles` itself comes with every install: the data-volume

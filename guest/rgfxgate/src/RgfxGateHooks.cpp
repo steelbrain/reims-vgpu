@@ -41,18 +41,27 @@ bool cdhashIsOurs(void *fg, uint64_t offset) {
 extern "C" thread_t current_thread(void);
 extern "C" int vn_getpath(struct vnode *vp, char *pathbuf, int *len);
 
-// True on exactly our install thread while an install is in flight, for a
-// vnode (a directory being created in, or a file being written) under
-// /Library/GPUBundles. The gInstalling short-circuit keeps the common path
-// (every open/create/truncate in the system) a single load.
-static bool installWriteAllowed(vnode_t vp) {
-	if (!gInstalling || current_thread() != gInstallThread || vp == nullptr)
+// True when vp's path is under /Library/GPUBundles. Used to pin both the
+// install writes and the signature-trust exemption to the installed bundle's
+// own directory, so neither is granted anywhere else on the system.
+static bool vnodeUnderBundles(vnode_t vp) {
+	if (vp == nullptr)
 		return false;
 	char path[1024];
 	int len = (int)sizeof(path);
 	if (vn_getpath(vp, path, &len) != 0)
 		return false;
 	return rgfx_path_under(path, kGpuBundlesDir);
+}
+
+// True on exactly our install thread while an install is in flight, for a
+// vnode (a directory being created in, or a file being written) under
+// /Library/GPUBundles. The gInstalling short-circuit keeps the common path
+// (every open/create/truncate in the system) a single load.
+static bool installWriteAllowed(vnode_t vp) {
+	if (!gInstalling || current_thread() != gInstallThread)
+		return false;
+	return vnodeUnderBundles(vp);
 }
 
 // --- library validation (wall B) ------------------------------------------
@@ -89,6 +98,13 @@ static int wrapMmap(void *cred, void *fg, int prot, int flags,
 // it (return 0). We set no flags: CS_VALID is already on from the code
 // directory, and the library-validation exception is wrapLibVal's, so the blob
 // stays non-platform, team-less -- just a trusted ad-hoc signature, no more.
+// The exemption is pinned to the path as well as the cdhash: only our bundle's
+// own executable under /Library/GPUBundles is trusted, so a byte-identical copy
+// of it placed anywhere else is not, exactly as the install writes are pinned
+// to that directory (installWriteAllowed). Since the signature wall gates
+// library validation and the executable mapping, a copy elsewhere fails here
+// and never reaches wrapLibVal or wrapMmap, which need no path check of their
+// own.
 using t_vsig = int (*)(vnode_t, void *, void *, unsigned int *, unsigned int *,
                        int, unsigned int);
 static t_vsig orgVSig;
@@ -98,7 +114,8 @@ static int wrapVSig(vnode_t vp, void *cs_blob, void *imgp, unsigned int *cs_flag
 	if (r == 0)
 		return 0; // already trusted; leave everything to the real policies
 	const uint8_t *cd = (gCsblobGetCdhash && cs_blob) ? gCsblobGetCdhash(cs_blob) : nullptr;
-	if (cd && rgfx_cdhash_allowed(cd, kRgfxCDHashLen, kAllowed, kAllowedCount))
+	if (cd && rgfx_cdhash_allowed(cd, kRgfxCDHashLen, kAllowed, kAllowedCount) &&
+	    vnodeUnderBundles(vp))
 		return 0; // trust our bundle's own ad-hoc signature, nothing more
 	return r;
 }
