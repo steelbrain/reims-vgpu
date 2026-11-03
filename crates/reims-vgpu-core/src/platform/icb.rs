@@ -24,6 +24,11 @@ pub trait IndirectCommandBuffer<P: Platform>: Handle {
     -> RaiseResult<Option<P::IndirectComputeCommand>>;
     /// sel: indirectRenderCommandAtIndex:
     fn render_command(&self, command_index: u64) -> RaiseResult<Option<P::IndirectRenderCommand>>;
+    /// sel: resetWithRange:
+    /// Commands `location..location + length`, inside the size, as a fresh buffer's: one call
+    /// for the range, whose cost is the platform's for the commands it clears. Only the graphics
+    /// lane sends it, for its guest's `resetWithRange:`.
+    fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()>;
     /// sel: resourceIndex SPI
     fn resource_index(&self) -> u64;
     /// sel: size

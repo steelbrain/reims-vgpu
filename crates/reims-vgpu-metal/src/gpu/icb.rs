@@ -5,6 +5,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLIndirectCommandBuffer, MTLIndirectComputeCommand, MTLIndirectRenderCommand, MTLPrimitiveType,
 };
@@ -66,6 +67,15 @@ impl reims_vgpu_core::platform::icb::IndirectCommandBuffer<MetalPlatform> for Me
             icb.indirectRenderCommandAtIndex_or_nil(command_index)
         })
         .map(|c| c.map(Obj::from_retained))
+    }
+    /// `resetWithRange:`, a raise inside Metal the caller's to catch, as the commands' setters'.
+    fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()> {
+        let icb = self.get();
+        let range = NSRange::new(location.to_usize(), length.to_usize());
+        // SAFETY: the caller passes a range inside the buffer's size (the trait's contract).
+        msg::send("resetWithRange:", Policy::Caught, || unsafe {
+            icb.resetWithRange(range)
+        })
     }
     /// `resourceIndex` (SPI).
     fn resource_index(&self) -> u64 {

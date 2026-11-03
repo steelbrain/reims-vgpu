@@ -246,17 +246,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         let op = rec.op;
         let index = u64::from(rec.command_index);
         if op == RGFX_ICB_OP_RENDER_RESET_RANGE || op == RGFX_ICB_OP_COMPUTE_RESET_RANGE {
+            // The guest's `resetWithRange:`, one platform call for the commands of the range
+            // inside the size: its cost is the platform's for the commands it clears, not a
+            // command taken and reset one at a time.
             let r: RgfxIcbRange = body(op, bytes)?;
             let stop = index.saturating_add(r.length.into()).min(size);
             *command = Command::None;
-            for i in index..stop {
-                if op == RGFX_ICB_OP_RENDER_RESET_RANGE {
-                    if let Some(c) = icb.render_command(i)? {
-                        c.encode(IcbRenderCmd::Reset)?;
-                    }
-                } else if let Some(c) = icb.compute_command(i)? {
-                    c.encode(IcbComputeCmd::Reset)?;
-                }
+            if index < stop {
+                icb.reset_with_range(index, stop - index)?;
             }
             return Ok(Ok(()));
         }
@@ -705,7 +702,7 @@ mod tests {
 
     /// Every render record drives its setter on its command, in the order the guest made them,
     /// with its objects resolved and its counts widened; consecutive records of one command take
-    /// it once; a reset of a range resets each command in it, up to the buffer's size.
+    /// it once; a reset of a range is one call for the commands of it inside the buffer's size.
     #[test]
     fn render_records_drive_their_setters_in_order() {
         let (p, mut dec) = setup();
@@ -902,10 +899,7 @@ mod tests {
                 ("clearBarrier", vec![]),
                 at(4),
                 ("reset", vec![]),
-                at(6),
-                ("reset", vec![]),
-                at(7),
-                ("reset", vec![]),
+                ("resetWithRange:", vec![Arg::U64(6), Arg::U64(2)]),
             ]
         );
     }
@@ -1054,10 +1048,61 @@ mod tests {
                 ("clearBarrier", vec![]),
                 at(5),
                 ("reset", vec![]),
-                at(0),
-                ("reset", vec![]),
+                ("resetWithRange:", vec![Arg::U64(0), Arg::U64(1)]),
             ]
         );
+    }
+
+    /// A reset of a range is one platform call for the range inside the buffer's size, however
+    /// many commands it spans: no command is taken from the buffer for it, and the commands made
+    /// before it lose what they were set. One at or past the size makes no call.
+    #[test]
+    fn a_reset_of_a_range_is_one_call_whatever_its_length() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        const BIG: u64 = 50 + 7;
+        const COUNT: u32 = 1 << 24;
+        let m = create(BIG, 2, RENDER_TYPES, COUNT.into());
+        assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        dec.end_message();
+        let range = |index, length| {
+            record(
+                RGFX_ICB_OP_RENDER_RESET_RANGE,
+                index,
+                &RgfxIcbRange {
+                    length,
+                    reserved_04: 0,
+                },
+            )
+        };
+        let records = [
+            bare(RGFX_ICB_OP_RENDER_SET_BARRIER, 5),
+            bare(RGFX_ICB_OP_RENDER_SET_BARRIER, COUNT - 1),
+            range(0, u32::MAX),
+            range(COUNT, 4),
+        ];
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &write(BIG, &records)).unwrap(), Ok(()));
+        let at = |i| ("indirectRenderCommandAtIndex:", vec![Arg::U64(i)]);
+        assert_eq!(
+            calls(&p, mark),
+            vec![
+                at(5),
+                ("setBarrier", vec![]),
+                at(u64::from(COUNT - 1)),
+                ("setBarrier", vec![]),
+                (
+                    "resetWithRange:",
+                    vec![Arg::U64(0), Arg::U64(COUNT.into())]
+                ),
+            ]
+        );
+        let Some(ObjHandle::Icb(icb)) = dec.named(BIG) else {
+            panic!("no indirect command buffer under {BIG}");
+        };
+        for i in [5, u64::from(COUNT - 1)] {
+            assert!(!icb.render_command(i).unwrap().unwrap().has_barrier());
+        }
     }
 
     /// A record the host cannot carry out is skipped alone: one naming a buffer the sender does

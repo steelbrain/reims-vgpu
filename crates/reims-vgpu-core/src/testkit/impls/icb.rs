@@ -117,6 +117,28 @@ impl IndirectCommandBuffer<FakePlatform> for Fk<kind::Icb> {
         )
     }
 
+    /// One call for the range: the commands made so far inside it lose what they were set, as
+    /// a command's `reset` leaves one, each reached once, whatever the range's length.
+    fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()> {
+        self.act(
+            Policy::Caught,
+            "resetWithRange:",
+            vec![Arg::U64(location), Arg::U64(length)],
+        )?;
+        let range = location..location.saturating_add(length);
+        for (_, index, child) in self.children() {
+            if !range.contains(&index) {
+                continue;
+            }
+            if let Some(c) = child.cast::<kind::IndirectRenderCommand>() {
+                command(&c, |m| *m = IcbCommandModel::default());
+            } else if let Some(c) = child.cast::<kind::IndirectComputeCommand>() {
+                command(&c, |m| *m = IcbCommandModel::default());
+            }
+        }
+        Ok(())
+    }
+
     fn resource_index(&self) -> u64 {
         self.resource_index_value()
     }

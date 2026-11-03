@@ -832,6 +832,15 @@ impl<K: Kind> Fk<K> {
         s.children.push((key, index, h));
     }
 
+    /// Every child, its key and index with it, in the order they were made.
+    pub fn children(&self) -> Vec<(&'static str, u64, AnyHandle)> {
+        self.state()
+            .children
+            .iter()
+            .map(|(k, i, h)| (*k, *i, h.clone_ref()))
+            .collect()
+    }
+
     /// The child `key[index]`, if set or made.
     pub fn get_child(&self, key: &'static str, index: u64) -> Option<AnyHandle> {
         self.state()

@@ -692,6 +692,26 @@ impl IcbObject {
         });
     }
 
+    /// Commands `range` were reset on the CPU at once: each as [`rewritten`](Self::rewritten)
+    /// leaves one, in one pass over what the sides hold, not one per command.
+    fn rewritten_range(&self, range: Range<u64>) {
+        let n = plain(|| self.raw.size());
+        plain(|| {
+            let mut sides = self.sides.lock();
+            sides
+                .corrupted
+                .retain(|&at| !range.contains(&u64::from(at)));
+            sides.copied_lengths.retain(|&place| {
+                !(range.contains(&(place / LENGTHS_A_COMMAND))
+                    && matches!(place % LENGTHS_A_COMMAND, 36 | 37))
+            });
+            if !self.inherits.pipeline && !range.is_empty() {
+                let words = Tail::pipeline(n, range.start).start..Tail::pipeline(n, range.end).start;
+                sides.tail.clear(words);
+            }
+        });
+    }
+
     /// A setter of command `index` wrote the words `words` gives of a buffer of its size, as
     /// Metal's does and the runtime's does not ([`Tail`]).
     fn words_set(&self, index: u32, words: fn(u64, u64) -> Range<u64>) {
@@ -1073,6 +1093,18 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
             index: command_index.low_u32(),
             raw,
         })))
+    }
+
+    /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
+    /// size as Metal's validation does (a death: core passes one inside it); then the commands'
+    /// sides as a CPU reset leaves them ([`IcbObject::rewritten_range`]).
+    fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()> {
+        let range = location..location.saturating_add(length);
+        send("resetWithRange:", Policy::Dies, || {
+            self.raw.reset_with_range(range.clone())
+        })?;
+        self.rewritten_range(range);
+        Ok(())
     }
 
     /// Metal's `resourceIndex` of an indirect command buffer is its `gpuResourceID` (measured,
@@ -2092,6 +2124,105 @@ mod tests {
         .unwrap();
         c.encode(IcbComputeCmd::Reset).unwrap();
         assert_eq!(c.pipeline_state_unique_identifier(), 0);
+    }
+
+    /// Executes command 0 of `icb`, `resident` made resident for reading and writing, in a
+    /// command buffer of its own, which completes with no error.
+    fn execute_first(d: &VulkanDevice, icb: &VulkanIcb, resident: &[Option<ResourceRef<'_, VulkanPlatform>>]) {
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            ComputeCmd::UseResources {
+                resources: resident,
+                usage: 3,
+            },
+            ComputeCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: icb,
+                execution_range: NsRange::new(0, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
+    }
+
+    /// Command 0 of a buffer of `size` dispatches `add_one` of `input` into `out`.
+    fn add_into(
+        d: &VulkanDevice,
+        size: u64,
+        out: &VulkanBuffer,
+        input: &VulkanBuffer,
+    ) -> (VulkanIcb, VulkanComputePipeline) {
+        let pipeline = icb_pipeline(d);
+        let desc = IcbDesc {
+            command_types: 0x40,
+            max_kernel_buffer_bind_count: 2,
+            ..IcbDesc::default()
+        };
+        let icb = make::<VulkanPlatform>(d, &desc, size);
+        let c = icb.compute_command(0).unwrap().unwrap();
+        for cmd in [
+            IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: Some(&pipeline),
+            },
+            IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(out),
+                offset: 0,
+                index: 0,
+            },
+            IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(input),
+                offset: 0,
+                index: 1,
+            },
+            IcbComputeCmd::ConcurrentDispatchThreads {
+                threads_per_grid: MtlSize::new(4, 1, 1),
+                threads_per_threadgroup: MtlSize::new(4, 1, 1),
+            },
+        ] {
+            c.encode(cmd).unwrap();
+        }
+        (icb, pipeline)
+    }
+
+    /// A CPU reset of a range, one call however many commands it spans, leaves each command of it
+    /// fresh, as a command's reset leaves one: of 2^20 commands, command 0 dispatches nothing
+    /// after it, and its getters read a fresh command's
+    #[test]
+    fn a_cpu_reset_of_a_range_leaves_its_commands_fresh() {
+        let d = dev();
+        let input = holding(&d, &[10, 20, 30, 40]);
+        let out = holding(&d, &[0; 4]);
+        let (icb, _pipeline) = add_into(&d, 1 << 20, &out, &input);
+        let resident = [
+            Some(ResourceRef::Buffer(&input)),
+            Some(ResourceRef::Buffer(&out)),
+            Some(ResourceRef::Icb(&icb)),
+        ];
+        execute_first(&d, &icb, &resident);
+        assert_eq!(words(&out), [11, 21, 31, 41]);
+        icb.reset_with_range(0, 1 << 20).unwrap();
+        let reset = icb.compute_command(0).unwrap().unwrap();
+        assert_eq!(
+            (
+                reset.command_type(),
+                reset.pipeline_state_unique_identifier(),
+                reset.has_barrier()
+            ),
+            (0, 0, false)
+        );
+        let out_again = holding(&d, &[0; 4]);
+        let resident = [
+            Some(ResourceRef::Buffer(&input)),
+            Some(ResourceRef::Buffer(&out_again)),
+            Some(ResourceRef::Icb(&icb)),
+        ];
+        execute_first(&d, &icb, &resident);
+        assert_eq!(words(&out_again), [0; 4]);
     }
 
     /// The tests' kernels that encode indirect commands, which `build.rs` compiled from
