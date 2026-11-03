@@ -1762,12 +1762,14 @@ after the commit. Each outcome the new design allows is one of those two:
   by the decoder's fuzz (`decode/fuzz.rs`).
 - **What still waits on ring 0's thread:** a range message, for its own
   context's answered buffers; a download, a release or a block named again, for
-  that block's writers; a present's fill, for that block's users; a context's
-  close, whose queues `reims_graphics` fences, each waiting for the message its
-  service thread is carrying out; and the device's reset, for every message in
-  flight. A doorbell's take tries every
-  lock it takes; a take not made lets go of what it took, under locks each held
-  for a short section only.
+  that block's writers; a present's fill, for that block's users; and the
+  device's reset, for every message in flight. A context's close waits for no
+  walk: `reims_graphics` fences each of its queues, which waits only for a take
+  of the queue's submission ring or a post onto its completion ring under way,
+  and the close is answered once its buffers have finished
+  (`a_close_during_a_walk_holds_up_nothing_on_ring_0`). A doorbell's take tries
+  every lock it takes; a take not made lets go of what it took, under locks each
+  held for a short section only.
 
 ## Stage 3 guest stack (from the prior-art study)
 

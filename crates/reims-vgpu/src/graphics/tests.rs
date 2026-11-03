@@ -1968,9 +1968,9 @@ fn ring_0_is_carried_out_while_a_walk_is_in_flight() {
     assert_ne!(failed.status, RGFX_CB_OK);
 }
 
-/// A close of a context whose command buffer's walk is in flight ends its queues once the walk
-/// is done (`reims_graphics`'s fence of each), drops its objects, and is answered once the
-/// buffer's completion handler has run
+/// A close of a context whose command buffer's walk is in flight ends its queues, drops its
+/// objects, and is answered once the buffer's completion handler has run: the walk, which goes on
+/// naming the objects, commits after the close, on a queue that posts nothing more
 #[test]
 fn a_close_during_a_walk_is_answered_after_the_buffer() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -2016,6 +2016,55 @@ fn a_close_during_a_walk_is_answered_after_the_buffer() {
         (close, RGFX_STATUS_OK)
     );
     assert_eq!(device.decoder_object_count(), 0, "the close dropped them");
+}
+
+/// A close of a context whose command buffer's walk is in flight holds up nothing on ring 0:
+/// the close is carried out at once (its objects leave the table, the walk keeps naming them),
+/// and the ring-0 message after it is answered while the walk is still stopped.
+#[test]
+fn a_close_during_a_walk_holds_up_nothing_on_ring_0() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        create_queue(&device, &mut guest, 2, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(2, 4)),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
+    ring.send(&device, sampler_command_buffer(obj(2, 1), 100, obj(2, 4)));
+    assert!(gate.reached(), "the walk did not start");
+    guest.send(&device, context_close(2));
+    // Another context's create after the close, answered with the walk still stopped.
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(3, 4)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the close was not carried out: only context 3's sampler is left"
+    );
+    let commits = platform.call_log().count("commit");
+    gate.open();
+    for _ in 0..3000 {
+        if platform.call_log().count("commit") > commits {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    platform.world().complete_all(CompleteOn::Caller);
+    let bytes = guest.event().expect("the close's COMPLETE");
+    let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+    assert_eq!(complete.status, RGFX_STATUS_OK);
 }
 
 /// A reset while a command buffer's walk is in flight comes after the walk, as one under a lock
