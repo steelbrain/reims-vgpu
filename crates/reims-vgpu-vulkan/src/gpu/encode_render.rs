@@ -258,9 +258,7 @@ use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
-use crate::answer::{
-    Policy, decide, get, metal_aborts, plain, plain_at, refused, send, unrepresentable,
-};
+use crate::answer::{Policy, decide, get, metal_aborts, plain, plain_at, refused, unrepresentable};
 use crate::gpu::command::VulkanCommandBuffer;
 use crate::gpu::command::executions::{Execution, Points};
 use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
@@ -1988,7 +1986,26 @@ impl VulkanRenderEncoder {
     /// Runs `call` on the open encoder for `sel`: a refusal dies at the send, naming the
     /// runtime's error, as Metal raises at none of these commands.
     fn run(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
-        send(sel, Policy::Dies, || self.encoder.with(sel, |e| call(e)))
+        let mut refusal = None;
+        self.sent(sel, call, &mut refusal);
+        refusal.map_or(Ok(()), |e| decide(sel, Policy::Dies, e))
+    }
+
+    /// Runs `call` on the open encoder for `sel` as [`crate::answer::send`] runs it (a
+    /// degradation of [`crate::answer::DIES`] announced inside it dies at `sel`), and leaves its
+    /// refusal, where it has one, in `refusal`, for the caller to decide as `send` does next. A
+    /// command the runtime takes moves no result out through the calls around it: the runtime's
+    /// error is 112 bytes, and moving its `Result` out of each call around the runtime's took
+    /// most of their time (measured on msi's RTX 5080 under `draws.10k`: 61% of the samples in
+    /// `inside`, 70% in `hearing` and 82% in `send` were those moves).
+    fn sent(&self, sel: &'static str, call: Call<'_>, refusal: &mut Option<rt::Error>) {
+        plain_at(sel, || {
+            self.encoder.with(sel, |e| {
+                if let Err(e) = call(e) {
+                    *refusal = Some(e);
+                }
+            });
+        });
     }
 
     /// Dies at `sel`, a draw or an execution of indirect commands that is not empty, in a pass
@@ -2091,7 +2108,9 @@ impl VulkanRenderEncoder {
     /// past the bound ([`half_apart`]). An execution's commands announce it at the commit,
     /// outside the call.
     fn binds(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
-        let (drawn, heard) = crate::answer::hearing(|| self.run(sel, call));
+        let mut refusal = None;
+        let ((), heard) = crate::answer::hearing(|| self.sent(sel, call, &mut refusal));
+        let drawn = refusal.map_or(Ok(()), |e| decide(sel, Policy::Dies, e));
         if heard.contains(&rt::Degradation::HalfOutputPrecision)
             && let Some(apart) = plain(|| self.drawing.lock().borrow().marks.half_apart)
         {
