@@ -624,9 +624,10 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(
 	    *_region, *_serializer, (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps are the process's own superpages, wired into pages
-	// blocks the host makes heaps over, where the region has a pages block source (above) and
-	// the device took HEAP_OVER_PAGES; else, and where the kernel has no superpage, the region's.
+	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own
+	// superpages, wired into pages blocks the host makes heaps or buffers over, where the region
+	// has a pages block source (above) and the device took HEAP_OVER_PAGES; else, and where the
+	// kernel has no superpage, the region's.
 	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
 		memory.superpages = &rgfxSuperpages;

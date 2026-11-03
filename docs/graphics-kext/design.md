@@ -1406,10 +1406,12 @@ the host's import, and the kext's block table holds one entry per slab:
   of 2 MiB is the process's own memory instead: a 2 MiB superpage
   (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, tagged `VM_MEMORY_IOACCELERATOR`), one run
   of guest RAM, wired into a pages block and made one `HEAP_OVER_PAGES`, its
-  buffers placed in it as in a region slab's heap. A larger dedicated slab,
-  which would be more than one run, is the region's, as is a slab where the
-  kernel has no superpage to give (no contiguous 2 MiB free, or the wire
-  budget spent) or the kext gives no pages block. A slab let go
+  buffers placed in it as in a region slab's heap. A larger dedicated Shared
+  slab is superpages too, more than one run, with no heap: its one buffer is a
+  `BUFFER_OVER_PAGES` over the block's view. A larger Managed slab is the
+  region's, as is a slab where the kernel has no superpage to give (no
+  contiguous 2 MiB free, or the wire budget spent) or the kext gives no pages
+  block. A slab let go
   destroys its heap, releases its pages block (the kext answers once the host
   let go of it, and unwires the pages), then deallocates its pages. On the
   RTX 5080 a heap over a run of guest RAM took 13.4 us and a 4 KiB buffer

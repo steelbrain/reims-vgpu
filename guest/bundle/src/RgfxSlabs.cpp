@@ -142,12 +142,26 @@ RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &ser
 {
 }
 
+bool RgfxPagesSlabSource::serves(uint32_t options, uint64_t size) const
+{
+	// One superpage for any heaped class; more, which are more than one run, only for a Shared
+	// buffer of its own, which BUFFER_OVER_PAGES makes over the view.
+	const bool shared = ((options & kStorageMask) >> kStorageShift) == kStorageShared;
+	return heaped(options) && (size == kUnit || shared);
+}
+
+bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) const
+{
+	return memory.size == kUnit && heaped(options);
+}
+
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
-	// One superpage, one run of guest RAM, which the host makes a heap over; where the kernel has
-	// none to give (no contiguous 2 MiB free, or the wire budget spent), the region's slab.
+	// Superpages, each one run of guest RAM; where the kernel has none to give (no contiguous
+	// 2 MiB free, or the wire budget spent), the region's slab.
 	uint8_t *bytes = nullptr;
-	if (size != kUnit || m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS)
+	if (size == 0 || size % kUnit != 0 ||
+	    m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS)
 		return false;
 	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
 	if (!block.ok) {
@@ -180,6 +194,23 @@ bool RgfxPagesSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap 
 		return false; // no address left, or the device never got it
 	out->objId = created.obj_id;
 	out->gpuAddress = created.gpu_address;
+	return true;
+}
+
+bool RgfxPagesSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset,
+                                     uint64_t length, uint32_t options, Made *out)
+{
+	if (heap.objId != 0)
+		return RgfxRegionSlabSource::makeBuffer(memory, heap, offset, length, options, out);
+	// A dedicated slab of more than one superpage (offset 0): a Shared buffer over the block's
+	// view, at an address picked for it.
+	RgfxCreated created = m_serializer.createBufferOverPages(length, options, memory.regionOffset,
+	                                                         memory.blockSize, offset);
+	if (created.obj_id == 0 || m_serializer.refused(created))
+		return false;
+	out->objId = created.obj_id;
+	out->gpuAddress = created.gpu_address + offset;
+	out->ownsAddress = true;
 	return true;
 }
 
@@ -330,7 +361,7 @@ RgfxSlabs::Slab *RgfxSlabs::makeSlab(RgfxSlabSource &source, uint64_t size, uint
 	if (!source.take(size, &memory))
 		return nullptr;
 	RgfxSlabSource::Heap heap;
-	if (source.heaped(options) && !source.makeHeap(memory, options, &heap)) {
+	if (source.heapedSlab(memory, options) && !source.makeHeap(memory, options, &heap)) {
 		source.give(memory);
 		*refused = true; // the device never got the heap: no smaller slab gets one either
 		return nullptr;
@@ -436,10 +467,11 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		uint64_t ask = dedicated ? least : want;
 		bool refused = false;
 		auto fromEither = [&]() -> Slab * {
-			if (first != nullptr && first->serves(options)) {
+			const uint64_t firstSize =
+			    first != nullptr ? roundUp(dedicated ? size : ask, first->unit()) : 0;
+			if (first != nullptr && first->serves(options, firstSize)) {
 				bool firstRefused = false; // the region's slab is asked all the same
-				Slab *slab = makeSlab(*first, roundUp(dedicated ? size : ask, first->unit()),
-				                      options, dedicated, &firstRefused);
+				Slab *slab = makeSlab(*first, firstSize, options, dedicated, &firstRefused);
 				if (slab != nullptr)
 					return slab;
 			}
