@@ -18,6 +18,7 @@ Mac where it shows the gap. What they found is in
 | `oracle_source` | what a runtime source compile makes (`newLibraryWithSource:options:error:`): the library, its bytes (a `.metallib` of AIR) and its errors, through the device's public selector, its Metal base class's, and that class's compiler-task form, which reaches Metal's compiler service without the device's `compiler` |
 | `oracle_ycbcr` | what a two-plane Y'CbCr texture (`MTLPixelFormat` 500) over plane 0 of a 420v or 420f surface reads, by the surface's `kIOSurfaceYCbCrMatrix` (709, 601 or none, set by CoreVideo or on the surface), or whether Metal refuses it |
 | `oracle_ca_ycbcr` | which matrix CoreAnimation (a CARenderer drawing the surface as a layer's contents into a texture of the device) and VideoToolbox (`VTPixelTransferSession` to 32BGRA) convert an `x420` or `420v` surface by, tagged 709, 601 or untagged |
+| `oracle_sampler` | what a sampler's `lodBias` and `reductionMode` do to its samples, by the LOD's source (`level()`, `gradient2d()`, a fragment's implicit LOD) and the mip filter, and the device's SPI answers about them |
 
 Each probe picks its device by a substring of its name from `MTLCopyAllDevices` (`AMD`,
 `Intel`, `Apple`). It never calls `MTLCreateSystemDefaultDevice`, which switches a dual-GPU

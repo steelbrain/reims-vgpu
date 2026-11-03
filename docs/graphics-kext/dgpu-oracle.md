@@ -9,7 +9,7 @@ stricter than the M3's, guests may rely on it.
 
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
-`oracle_errors`, `oracle_source`, `oracle_ycbcr` and `oracle_ca_ycbcr`.
+`oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr` and `oracle_sampler`.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -531,6 +531,47 @@ matrices, on all three. *(class 3 for a tagged frame: all three convert ITU_R_70
 as our lane shows the aerial; class 2 for VideoToolbox's untagged `x420`.)* On the lane the
 guest's own frameworks convert, by the tag our surfaces keep as set, so the lane has no answer of
 its own to change.
+
+## Q14: sampler `lodBias` and `reductionMode`
+
+Probe: `oracle_sampler DEVICE` (11-03). A 256 x 256 RGBA16Float texture of 9 levels, level i
+holding i everywhere, so a linear-mip sample's R is the LOD the sampler used. It is sampled with
+`lodBias` 0, +1, -0.5 and +2.5 at LOD 0, 2 and 3.25, from an explicit `level()`, a `gradient2d()`
+and a fragment shader's implicit LOD. Then a 2 x 2 RGBA16Float texture of 2 levels (level 0 R =
+[0.1 0.9; 0.3 0.7] and G = [0.8 0.2; 0.6 0.4], level 1 R 0.05 and G 0.95), sampled with each
+`reductionMode` under linear min and mag filters. Both properties are new in macOS 26, and the
+lane's wire 2 does not carry them.
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `supportsSamplerReductionMode`, `samplerReductionModeSupport` (SPI) | 1, 2 | 1, 2 | 0, 0 |
+| `supportsExtendedSamplerLODBiasRange` (SPI) | 0 | 0 | 0 |
+| `lodBias` | the LOD used is clamp(LOD + bias, 0, 8), from `level()`, `gradient2d()` and a fragment's LOD alike | the same | no effect; Metal's validation layer accepts it |
+| min and max at the small texture's centre, LOD 0 | (0.1, 0.2) and (0.9, 0.8) | the same | the weighted average, (0.5, 0.5); under the validation layer the sampler's create ends the process: "Use of minimum or maximum reductionMode requires device support" |
+| min and max at LOD 0.5, linear mip filter | across both levels: (0.05, 0.2) and (0.9, 0.95) | the same | the weighted average |
+| min and max with a nearest mip filter | reduced within the level read | the same | the weighted average |
+| at one texel's centre (weight 1) | that texel in every mode: texels of weight zero do not count | the same | the same |
+| a nearest-mip LOD of exactly .5 | rounds up | up in compute, down in a fragment | down |
+| the fraction of a linear-mip LOD of 3.25 | 3.1875 | 3.0 in compute, 3.2461 in a fragment | 3.25 from `level()`, 3.2422 otherwise |
+
+- **`lodBias`** *(class 1; class 3 for an explicit LOD)*. The header documents the bias "when
+  sampling from a texture". It says only the LOD clamps are ignored for an explicit LOD. Both x86
+  GPUs add the bias to `level()` too. The lane applies it to every LOD source.
+  - The M3 lacks the feature (metal2vulkan's family table: Apple10 only). A host on an Apple9 GPU
+    cannot carry it, which is a ledger gap.
+- **`reductionMode`** *(class 1, though both x86 GPUs diverge from the docs)*. The header says the
+  sampler ignores the mode when the mip filter is nearest or none, or the min or mag filter is
+  nearest. Both x86 GPUs reduce with a nearest mip filter anyway.
+  - Decided: the documented rule, kept until a boot shows a guest relying on the x86 GPUs'
+    behaviour. The host passes the mode only where all three filters are linear.
+- **The answers** *(class 4)*. A yes that samples the weighted average is outside the envelope.
+  So the guest answers the x86 GPUs' 2 and yes only where the host realizes min and max, and the
+  M3's 0 and no elsewhere.
+- **The rounding at exactly .5 and the LOD's fraction** *(class 2)*. The three GPUs differ, so the
+  host takes its own GPU's.
+
+Wire 2 drops both properties, so the lane samples with Metal's defaults (bias 0, the weighted
+average). The next wire change carries them in a tail of the sampler's create.
 
 ## The display's colour against the stock lane: deliberate divergences
 

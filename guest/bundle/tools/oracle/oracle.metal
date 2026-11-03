@@ -135,3 +135,38 @@ kernel void ycbcr_read(texture2d<float, access::read> t [[texture(0)]],
 	uint2 at = uint2((i & 1) ? 48 : 16, (i & 2) ? 48 : 16);
 	out[i] = t.read(at);
 }
+
+// oracle_sampler: params[i].x picks the LOD's source (0: level(params[i].y); 1: gradient2d whose
+// LOD is params[i].y), params[i].zw is the coordinate; out[i] is the sample.
+kernel void sampler_probe(texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                          constant float4 *params [[buffer(0)]], device float4 *out [[buffer(1)]],
+                          uint i [[thread_position_in_grid]])
+{
+	float4 p = params[i];
+	float g = exp2(p.y) / float(t.get_width());
+	if (p.x == 0.0)
+		out[i] = t.sample(s, p.zw, level(p.y));
+	else
+		out[i] = t.sample(s, p.zw, gradient2d(float2(g, 0.0), float2(0.0, g)));
+}
+
+struct SamplerVOut {
+	float4 pos [[position]];
+};
+
+// A triangle covering the target.
+vertex SamplerVOut sampler_vs(uint v [[vertex_id]])
+{
+	float2 c = float2((v << 1) & 2, v & 2);
+	SamplerVOut o;
+	o.pos = float4(c * 2.0 - 1.0, 0.0, 1.0);
+	return o;
+}
+
+// Implicit LOD: the coordinate steps exp2(lod) / width a pixel in x and in y.
+fragment float4 sampler_fs(SamplerVOut in [[stage_in]], texture2d<float> t [[texture(0)]],
+                           sampler s [[sampler(0)]], constant float &lod [[buffer(0)]])
+{
+	float k = exp2(lod) / float(t.get_width());
+	return t.sample(s, in.pos.xy * k);
+}
