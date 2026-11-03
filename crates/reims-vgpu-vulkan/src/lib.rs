@@ -33,5 +33,6 @@ pub mod platform;
 pub(crate) mod records;
 pub mod remap;
 pub mod swapchain;
+pub(crate) mod work_log;
 
 pub use platform::{Obj, VulkanPlatform};
