@@ -31,6 +31,13 @@ namespace rgfx::video {
 /// or the host's hardware lacks the codec.
 const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction);
 
+/// The least alignment, in bytes, of the first byte and the row pitch of each plane of an output
+/// surface of samples of `sampleBytes` bytes (1: NV12, 2: P010): the larger of the alignment the
+/// process's device takes for a linear texture of each plane's format, as the textures the decode
+/// lands through are, and the 4 bytes of the host's copy into the planes. 0 where the process has
+/// no device of ours, or for another sample size.
+uint32_t outputPlaneAlignment(uint32_t sampleBytes);
+
 /// A session on the host, its queue, and the textures it made over output surfaces.
 struct Session;
 

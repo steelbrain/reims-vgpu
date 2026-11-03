@@ -211,8 +211,8 @@ namespace rgfx::video {
 
 struct Session : FakeSession {};
 
-// A host of H.264 decode and HEVC decode of Main and Main 10, of pictures of 144x144 to 8192x8192,
-// so the capability block lists every decoder the driver has.
+// A host of H.264 decode and HEVC decode of Main and Main 10, of pictures of 144x144 to 8192x8192
+// read in place at 256 bytes, so the capability block lists every decoder the driver has.
 const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 {
 	static RgfxVideoCodecCaps h264 = {}, hevc = {};
@@ -225,11 +225,17 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 	for (RgfxVideoCodecCaps *c : {&h264, &hevc}) {
 		c->min_size[0] = c->min_size[1] = 144;
 		c->max_size[0] = c->max_size[1] = 8192;
+		c->bitstream_alignment = 256;
 	}
+	h264.formats = RGFX_VIDEO_FORMAT_NV12;
+	hevc.formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
 	if (direction != RGFX_VIDEO_DECODE)
 		return nullptr;
 	return codec == RGFX_VIDEO_CODEC_H264 ? &h264 : codec == RGFX_VIDEO_CODEC_HEVC ? &hevc : nullptr;
 }
+
+// A device whose linear textures of the planes' formats take 64 bytes.
+uint32_t outputPlaneAlignment(uint32_t sampleBytes) { return sampleBytes == 1 || sampleBytes == 2 ? 64 : 0; }
 
 Session *openSession(uint32_t, uint32_t)
 {
@@ -430,6 +436,47 @@ void checkUnsentDecode()
 	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
 }
 
+// The answers are the host's: each bitstream alignment its decoders' (256), and a frame's planes
+// as its copy lands a picture, luma of the frame's size and chroma of half in whole pairs, at the
+// device's linear texture alignment (64), one pitch for both, unpadded.
+void checkLayoutFromHost()
+{
+	BitstreamRequirement br = {};
+	br.function_id = kFunctionDecode;
+	br.sub_id = (uint32_t)kCodecHevc;
+	br.size = 0x100000;
+	br.format = {'rawb', 1};
+	CHECK(call(kGetBitstreamBufferInfo, &br) == kOk, "GetBitstreamBufferInfo");
+	for (uint32_t a : br.alignment)
+		CHECK(a == 256, "a bitstream alignment of %u, not the host's 256", a);
+	struct Want {
+		uint32_t fourcc, width, height, chromaWidth, chromaHeight, pitch;
+	};
+	for (const Want &w : {Want{'NV12', 1920, 1080, 960, 540, 1920}, Want{'NV12', 1367, 767, 684, 384, 1408},
+	                      Want{'x420', 1367, 767, 684, 384, 2752}, Want{'420f', 1, 1, 1, 1, 64}}) {
+		uint32_t widths[2] = {}, heights[2] = {}, pitches[2] = {}, alignments[2] = {};
+		PixelRequirement pr = {};
+		pr.function_id = kFunctionDecode;
+		pr.sub_id = (uint32_t)kCodecHevc;
+		pr.width = w.width;
+		pr.height = w.height;
+		pr.fourcc = w.fourcc;
+		pr.planes = 2;
+		pr.widths = widths;
+		pr.heights = heights;
+		pr.pitches = pitches;
+		pr.alignments = alignments;
+		CHECK(call(kGetPixelBufferInfo, &pr) == kOk, "GetPixelBufferInfo of %.4s", (const char *)&w.fourcc);
+		CHECK(widths[0] == w.width && heights[0] == w.height && widths[1] == w.chromaWidth &&
+		          heights[1] == w.chromaHeight,
+		      "%.4s %ux%u: planes %ux%u and %ux%u", (const char *)&w.fourcc, w.width, w.height, widths[0],
+		      heights[0], widths[1], heights[1]);
+		for (int p = 0; p < 2; p++)
+			CHECK(pitches[p] == w.pitch && alignments[p] == 64, "%.4s %ux%u plane %d: pitch %u alignment %u",
+			      (const char *)&w.fourcc, w.width, w.height, p, pitches[p], alignments[p]);
+	}
+}
+
 // Get/SetContextParameter's records.
 struct ContextParam {
 	uint32_t function_id;
@@ -450,8 +497,9 @@ struct ContextParamList {
 	ContextParam *params;
 };
 
-// Each decoder's tile parameter (0xb) is answered whole, with no alignment or size 0, as AMD's
-// driver answers it; a parameter the driver does not know is left as it came.
+// Each decoder's tile parameter (0xb) is answered whole, from the host decoder's caps, with no
+// alignment or size 0; a parameter the driver does not know is left as it came, as AMD's driver
+// leaves it.
 void checkTileInfo()
 {
 	for (uint64_t codec : {kCodecH264, kCodecHevc}) {
@@ -462,9 +510,9 @@ void checkTileInfo()
 		ContextParamList list = {1, 0, &param};
 		CHECK(call(kGetContextParameter, &list) == kOk, "the tile parameter of 0x%llx refused",
 		      (unsigned long long)codec);
-		// The stand-in host takes pictures of 144x144 to 8192x8192 (as NVDEC's HEVC decoder),
-		// so the least tile is the host's and the largest the oracles' bound.
-		const uint32_t want[7] = {32, 2, 4096, 144, 144, 4096, codec == kCodecHevc ? 4320u : 2304u};
+		// The stand-in host's: tiles of 144x144 to 8192x8192, placed in whole chroma pairs, in a
+		// canvas whose row is at most its widest, 8192 samples of 2 bytes for HEVC's P010.
+		const uint32_t want[7] = {2, 2, codec == kCodecHevc ? 16384u : 8192u, 144, 144, 8192, 8192};
 		for (int i = 0; i < 7; i++)
 			CHECK(tile[i] == want[i], "codec 0x%llx: tile field %d is %u, not %u",
 			      (unsigned long long)codec, i, tile[i], want[i]);
@@ -497,8 +545,8 @@ const CapabilityBlock *capabilities()
 // limit, each listed function's availability, all six alignments of each function's bitstream
 // buffers, and every plane's size, pitch and alignment of each format a function puts out, at
 // sizes even, odd and least. A layout the driver does not answer whole (a format it does not
-// put out, a plane count other than two, a frame under 2 samples a side) is refused and leaves
-// the record as it was.
+// put out, a plane count other than two, an empty frame) is refused and leaves the record as it
+// was.
 void checkNoZeroAnswers()
 {
 	const CapabilityBlock *b = capabilities();
@@ -532,7 +580,7 @@ void checkNoZeroAnswers()
 			const uint32_t fourcc = fn.outputs[o].fourcc;
 			if (fourcc == 'rawb')
 				continue;
-			static const uint32_t kSizes[][2] = {{1920, 1080}, {1367, 767}, {2, 2}};
+			static const uint32_t kSizes[][2] = {{1920, 1080}, {1367, 767}, {1, 1}};
 			for (const uint32_t *size : kSizes) {
 				uint32_t widths[2] = {}, heights[2] = {}, pitches[2] = {}, alignments[2] = {};
 				PixelRequirement pr = {};
@@ -561,7 +609,7 @@ void checkNoZeroAnswers()
 	};
 	for (const Refused &r : {Refused{'BGRA', 1, 512, 512}, Refused{'L008', 1, 512, 512},
 	                         Refused{'NV12', 3, 512, 512}, Refused{'NV12', 2, 0, 512},
-	                         Refused{'x420', 2, 512, 0}, Refused{'NV12', 2, 1, 1}}) {
+	                         Refused{'x420', 2, 512, 0}}) {
 		uint32_t widths[4], heights[4], pitches[4], alignments[4];
 		for (uint32_t *a : {widths, heights, pitches, alignments})
 			for (int k = 0; k < 4; k++)
@@ -599,6 +647,7 @@ int main()
 	checkUnsentDecode();
 	checkNoZeroAnswers();
 	checkTileInfo();
+	checkLayoutFromHost();
 	std::printf("video_driver_tests: %d checks passed\n", g_checks);
 	return 0;
 }

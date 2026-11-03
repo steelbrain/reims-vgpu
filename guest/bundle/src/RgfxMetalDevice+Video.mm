@@ -86,6 +86,24 @@ const RgfxVideoCodecCaps *rgfx::video::hostCodec(uint32_t codec, uint32_t direct
 	return nullptr;
 }
 
+uint32_t rgfx::video::outputPlaneAlignment(uint32_t sampleBytes)
+{
+	RgfxMetalDevice *device = processDevice();
+	if (device == nil || (sampleBytes != 1 && sampleBytes != 2))
+		return 0;
+	const MTLPixelFormat luma = sampleBytes == 1 ? MTLPixelFormatR8Unorm : MTLPixelFormatR16Unorm;
+	const MTLPixelFormat chroma = sampleBytes == 1 ? MTLPixelFormatRG8Unorm : MTLPixelFormatRG16Unorm;
+	// The host's copy into the planes writes from offsets of whole 4 bytes, as Vulkan's copies on
+	// a queue that neither draws nor computes take them (BufferPlanes in the video crate).
+	NSUInteger alignment = 4;
+	for (MTLPixelFormat format : {luma, chroma}) {
+		const NSUInteger a = [device minimumLinearTextureAlignmentForPixelFormat:format];
+		if (a > alignment)
+			alignment = a;
+	}
+	return alignment <= UINT32_MAX ? (uint32_t)alignment : 0;
+}
+
 rgfx::video::Session *rgfx::video::openSession(uint32_t codec, uint32_t direction)
 {
 	if (hostCodec(codec, direction) == nullptr)

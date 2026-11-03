@@ -250,8 +250,8 @@ struct ContextDelete {
 };
 
 // GetBitstreamBufferInfo: AppleGVA rounds its buffers' size up to the largest alignment any
-// matching function answers. It reads six alignments; the driver answers each, none 0, as
-// AppleGVA may divide by any of them.
+// matching function answers. It reads six alignments; the driver answers each with the host
+// decoder's, none 0, as AppleGVA may divide by any of them.
 struct BitstreamRequirement {
 	uint32_t function_id;
 	uint32_t sub_id;
@@ -275,9 +275,10 @@ struct BitstreamPool {
 };
 static_assert(offsetof(BitstreamPool, addresses) == 0x18, "bitstream pool layout");
 
-// GetPixelBufferInfo: the driver answers each plane's size, row pitch and alignment, and
-// AppleGVA makes its frames' IOSurfaces so. Each answer is whole, none 0, as AppleGVA may divide
-// by any of them; a request the driver does not answer whole is refused, its record untouched.
+// GetPixelBufferInfo: the driver answers each plane's size, row pitch and alignment, as the host
+// lands a picture, and AppleGVA makes its frames' IOSurfaces so. Each answer is whole, none 0, as
+// AppleGVA may divide by any of them; a request the driver does not answer whole is refused, its
+// record untouched.
 struct PixelRequirement {
 	uint32_t function_id;
 	uint32_t sub_id;
@@ -385,9 +386,7 @@ struct ContextParamList {
 // session only where max_canvas_row_bytes is not 0, and CMPhoto, above it, divides by the
 // alignments: an HEIC decode died of SIGFPE in CMPhotoDecompressionContainerCreateImageForIndex
 // while the parameter was answered success with nothing written (measured on the RTX 5080 host,
-// 2026-11-03). Each tile is decoded into a frame of its own, of the tile's size, which
-// VideoToolbox then lays in the canvas (measured there: a 4096x4096 image's 64 tiles of 512 went
-// through four 512x512 frames), so the canvas asks nothing of the host.
+// 2026-11-03).
 constexpr uint32_t kParamTileInfo = 0xb;
 
 struct TileInfo {
@@ -400,25 +399,25 @@ struct TileInfo {
 	uint32_t max_height;
 };
 
-// The tile parameter of a decoder of `codec`. The dGPU oracles answer differently (macOS
-// 26.7.1, 2026-11-03): AMD's Radeon Pro 5300M {32, 2, 4096, 64, 64, 4096, 4320} for HEVC and
-// {..., 4096, 2304} for H.264, Intel's UHD 630 {128, 64, 131072, 16, 16, 8192, 8192} for HEVC.
-// So each field is the bound both allow, the alignments, canvas and largest tile AMD's, the
-// least tile Intel's, held to the pictures the host's decoder takes (its caps' least and largest).
-TileInfo tileInfo(uint64_t codec)
+// The tile parameter of the host's decoder of `codec` (RGFX_VIDEO_CODEC_*), from its caps, into
+// `out`; false where the host has no such decoder. A tile is a picture the host decodes, of the
+// sizes it takes (its caps' least and largest coded size), and it lands in a frame of its own,
+// cropped to that frame's origin, which VideoToolbox then lays in the canvas (measured on the RTX
+// 5080 host: a 4096x4096 image's 64 tiles of 512 went through four 512x512 frames). So a tile's
+// place and size in the canvas need only its whole chroma samples, 2 by 2 in 4:2:0, and the
+// canvas's row is at most the widest the host writes: its largest width, in samples of the
+// widest format it puts out.
+bool tileInfo(uint32_t codec, TileInfo *out)
 {
-	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(
-	    codec == kCodecHevc ? RGFX_VIDEO_CODEC_HEVC : RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE);
-	const uint32_t oracleMax[2] = {4096, codec == kCodecHevc ? 4320u : 2304u};
-	uint32_t least[2], most[2];
-	for (int i = 0; i < 2; i++) {
-		const uint32_t hostMin = caps ? caps->min_size[i] : 0, hostMax = caps ? caps->max_size[i] : 0;
-		least[i] = hostMin > 16 ? hostMin : 16;
-		most[i] = hostMax && hostMax < oracleMax[i] ? hostMax : oracleMax[i];
-		if (most[i] < least[i])
-			most[i] = least[i];
-	}
-	return {32, 2, 4096, least[0], least[1], most[0], most[1]};
+	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE);
+	if (!caps || !caps->max_size[0] || !caps->max_size[1])
+		return false;
+	const uint32_t sampleBytes = caps->formats & RGFX_VIDEO_FORMAT_P010 ? 2 : 1;
+	const uint32_t least[2] = {caps->min_size[0] ? caps->min_size[0] : 1,
+	                           caps->min_size[1] ? caps->min_size[1] : 1};
+	*out = {2, 2, caps->max_size[0] * sampleBytes, least[0], least[1], caps->max_size[0],
+	        caps->max_size[1]};
+	return true;
 }
 
 struct FunctionAvailable {
@@ -563,11 +562,23 @@ uint64_t g_seqno;
 constexpr uint32_t kOk = 0, kUnsupported = 1, kUnsupportedFormat = 3, kBadArgument = 5,
 		   kNoMemory = 7;
 
-uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
-
-// The alignment of every bitstream buffer and frame plane the driver answers: 256 bytes, the
-// host's bitstream alignment and row pitch.
-constexpr uint32_t kAlignment = 0x100;
+// The alignment the host's decoder of AppleGVA's function sub-ID `sub` reads an access unit in
+// place at (RgfxVideoCodecCaps::bitstream_alignment), the larger of the two decoders' for a
+// function of neither; 1 where the host answers none.
+uint32_t bitstreamAlignment(uint64_t sub)
+{
+	uint32_t alignment = 1;
+	for (uint32_t codec : {RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC}) {
+		const bool its = (codec == RGFX_VIDEO_CODEC_H264 && sub == kCodecH264) ||
+		                 (codec == RGFX_VIDEO_CODEC_HEVC && sub == kCodecHevc);
+		if ((sub == kCodecH264 || sub == kCodecHevc) && !its)
+			continue;
+		const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE);
+		if (caps && caps->bitstream_alignment > alignment)
+			alignment = caps->bitstream_alignment;
+	}
+	return alignment;
+}
 
 // The largest frame side the driver answers a layout for, past any the host decodes, so that a
 // plane's pitch and size stay within 32 bits.
@@ -820,8 +831,9 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		BitstreamRequirement *r = (BitstreamRequirement *)a1;
 		if (!r)
 			return kBadArgument;
-		for (uint32_t &alignment : r->alignment)
-			alignment = kAlignment;
+		const uint32_t alignment = bitstreamAlignment(r->sub_id);
+		for (uint32_t &a : r->alignment)
+			a = alignment;
 		return kOk;
 	}
 	case 5: { // AllocateBitstreamBufferPool
@@ -886,17 +898,26 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		}
 		if (r->planes != 2)
 			return kUnsupportedFormat;
-		// A frame under 2 samples a side would have a chroma plane of none.
-		if (r->width < 2 || r->height < 2 || r->width > kMaxFrameSide || r->height > kMaxFrameSide)
+		if (r->width == 0 || r->height == 0 || r->width > kMaxFrameSide || r->height > kMaxFrameSide)
 			return kBadArgument;
-		uint32_t height = alignUp(r->height, 16), pitch = alignUp(r->width * sampleBytes, kAlignment);
+		// What the host's copy writes, a picture's crop at each plane's origin: luma of the
+		// frame's size, chroma of half, in whole pairs; each plane's first byte and pitch at the
+		// alignment its texture and the copy take, one pitch for both planes.
+		const uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
+		if (alignment == 0)
+			return kUnsupported;
+		const uint32_t chromaWidth = (r->width + 1) / 2, chromaHeight = (r->height + 1) / 2;
+		const uint32_t row = r->width * sampleBytes > chromaWidth * 2 * sampleBytes
+		                         ? r->width * sampleBytes
+		                         : chromaWidth * 2 * sampleBytes;
+		const uint32_t pitch = (row + alignment - 1) / alignment * alignment;
 		r->widths[0] = r->width;
-		r->heights[0] = height;
-		r->widths[1] = r->width / 2;
-		r->heights[1] = height / 2;
+		r->heights[0] = r->height;
+		r->widths[1] = chromaWidth;
+		r->heights[1] = chromaHeight;
 		for (int p = 0; p < 2; p++) {
 			r->pitches[p] = pitch;
-			r->alignments[p] = kAlignment;
+			r->alignments[p] = alignment;
 		}
 		return kOk;
 	}
@@ -1005,9 +1026,13 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			return kBadArgument;
 		for (uint32_t i = 0; i < l->count; i++) {
 			ContextParam &param = l->params[i];
+			const uint32_t codec = param.sub_id == kCodecH264   ? RGFX_VIDEO_CODEC_H264
+			                       : param.sub_id == kCodecHevc ? RGFX_VIDEO_CODEC_HEVC
+			                                                    : 0;
+			TileInfo tile;
 			if (param.function_id == kFunctionDecode && param.id == kParamTileInfo && param.data &&
-			    (param.sub_id == kCodecH264 || param.sub_id == kCodecHevc))
-				*(TileInfo *)param.data = tileInfo(param.sub_id);
+			    codec && tileInfo(codec, &tile))
+				*(TileInfo *)param.data = tile;
 		}
 		return kOk;
 	}
