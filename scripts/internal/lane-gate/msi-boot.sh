@@ -222,6 +222,24 @@ touch "$R/.start"
 # seconds after the desktop is up, where the Dock has settled (below). The scanout's reader runs as
 # root, for /proc/PID/mem.
 CAPPIDS=()
+# The hang catcher from QEMU's start (CATCH_FROM_BOOT=1, msi-hang-catch.py --from-boot): a boot's
+# own restart or silence before the desktop; it writes R/hang/, and the probes use it as theirs.
+HCPID=
+if [[ ${CATCH_FROM_BOOT:-0} == 1 ]]; then
+  mkdir -p "$R/hang"
+  ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
+    qp=
+    while sleep 0.2; do  # this boot's QEMU and its SSH port
+      [[ $B/qemu.pid -nt $R/.start && -s $B/port ]] || continue
+      qp=$(cat "$B/qemu.pid" 2> /dev/null)
+      [[ $(cat "/proc/$qp/comm" 2> /dev/null) == qemu-system-x86* ]] && break
+    done
+    exec python3 -I "$(dirname "$0")/msi-hang-catch.py" --from-boot --boot-dir "$B" --pid "$qp" \
+      --port "$(tr -dc 0-9 < "$B/port")" --out "$R/hang" --user "$GUEST_USER" --password "$GUEST_PASS"
+  ) > "$R/hang.log" 2>&1 &
+  HCPID=$!
+  CAPPIDS+=($HCPID)
+fi
 if [[ ${CAPTURE:-0} == 1 ]]; then
   rm -rf "$R/capture" && mkdir -p "$R/capture"
   ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
@@ -521,6 +539,7 @@ stalls() {
 if [[ -n ${PROBES:-} ]]; then
   log "probes: $(ls "$PROBES" | tr '\n' ' ')$(left) s left"
   PROBES=$PROBES PROBE_RESULTS=$PROBE_RESULTS PROBE_TIP=$PROBE_TIP QEMU_PID=$P DEADLINE=$(( T0 + HOLD_S - 20 )) B=$B R=$R \
+    HANG_CATCH_PID=$HCPID \
     PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS bash "$(dirname "$0")/msi-probes.sh" 2>&1 | tee -a "$R/boot.log"
   kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
   log "probes done"

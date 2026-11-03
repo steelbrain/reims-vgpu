@@ -145,7 +145,10 @@ shots() {
 }
 settled=0 hung= HC=
 HANG_CATCH=${HANG_CATCH:-$(dirname "$0")/msi-hang-catch.py}
-if [[ -z ${FAKE_GUEST:-} && -f $HANG_CATCH && -n ${QEMU_PID:-} && -n ${R:-} ]]; then
+if [[ -n ${HANG_CATCH_PID:-} ]]; then  # the boot's own, from QEMU's start (CATCH_FROM_BOOT)
+  HC=$HANG_CATCH_PID
+  log "the hang catcher: the boot's, from QEMU's start, pid $HC, into $R/hang"
+elif [[ -z ${FAKE_GUEST:-} && -f $HANG_CATCH && -n ${QEMU_PID:-} && -n ${R:-} ]]; then
   mkdir -p "$R/hang"
   python3 -I "$HANG_CATCH" --boot-dir "$B" --pid "$QEMU_PID" --port "$PORT" --out "$R/hang" \
     --user "$GUEST_USER" --password "$GUEST_PASS" > "$R/hang.log" 2>&1 &

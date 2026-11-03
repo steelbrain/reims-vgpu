@@ -23,7 +23,7 @@
 # was skipped. One not reached in a round's hold stays queued for the next.
 #
 #   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
-#                  [--exclude NAME,...] [--hold S]
+#                  [--exclude NAME,...] [--hold S] [--catch-from-boot]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -37,7 +37,9 @@
 # at info,reims_graphics=trace,reims_vgpu::graphics=debug; a round with --capture runs with no
 # probe too. --first NAME,... has the round consider those probes first, in that order, before the
 # others oldest first, and --only NAME,... takes those alone, in that order; --exclude NAME,...
-# leaves those in the queue (a probe that must come last in its own round); --hold S sets the
+# leaves those in the queue (a probe that must come last in its own round); --catch-from-boot
+# starts the hang catcher with QEMU (msi-boot.sh's CATCH_FROM_BOOT), for a restart or a silence
+# before the desktop, and runs with no probe too; --hold S sets the
 # round's hold (config.sh's HOLD_S) for this round. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
@@ -45,7 +47,7 @@
 set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
-force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude=
+force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0
 while (($#)); do
   a=$1
   shift
@@ -56,6 +58,7 @@ while (($#)); do
     --first) first=${1:?--first NAME,...}; shift ;;
     --only) first=${1:?--only NAME,...} only=1; shift ;;
     --exclude) exclude=${1?--exclude NAME,...}; shift ;;
+    --catch-from-boot) from_boot=1 force=1 ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
@@ -173,7 +176,7 @@ if (( !dry && !force )) && (( n < WAIT_N )) && (( ${oldest:-0} < WAIT_S )); then
   echo "probe-batch: no round (a round runs at $WAIT_N waiting or the oldest at $(( WAIT_S / 60 )) min, or with --force)"
   exit 0
 fi
-((${#take[@]} || capture)) || { echo "probe-batch: nothing to run"; exit 0; }
+((${#take[@]} || capture || from_boot)) || { echo "probe-batch: nothing to run"; exit 0; }
 
 # The round: its probes leave the queue for its directory, and those it does not reach go back.
 ROUND=$(date +%Y%m%d-%H%M%S)
@@ -213,6 +216,7 @@ LOCK_WAIT_S=${LOCK_WAIT_S:-10800}
 DRAG=0
 HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")
 CAPTURE=$capture
+CATCH_FROM_BOOT=$from_boot
 PROBES=$RD/probes
 PROBE_RESULTS=$RES
 PROBE_TIP=$PUB

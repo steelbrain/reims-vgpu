@@ -4,7 +4,7 @@ beside the round's probes) for a guest hang and, at one, records what the vCPUs 
 panics and restarts is told apart from one that hangs.
 
   msi-hang-catch.py --boot-dir B --pid QEMU_PID --port PORT --out DIR
-                    [--user U] [--password P] [--catches 2] [--log B/launch.log]
+                    [--user U] [--password P] [--catches 2] [--log B/launch.log] [--from-boot]
 
 Runs beside the probes until QEMU exits. Every 2 s it reads QEMU's CPU time (/proc/PID/stat) and
 the host log's size; every 10 s it tries the guest's SSH (`true`, 5 s connect, 15 s in all). A hang
@@ -38,6 +38,12 @@ is the restart, not a hang: no catch is taken for it. Once SSH answers again it 
 DIR/reboot-N/: guest-info.txt again (the kexts load at new addresses) and the panic reports the
 guest wrote since (/Library/Logs/DiagnosticReports/*.panic changed in the last 30 minutes, as
 root; asked again every 10 s for 3 minutes, as the guest writes them a while after its desktop).
+
+--from-boot (msi-boot.sh's CATCH_FROM_BOOT, started with QEMU): the boot itself is watched too. A
+second hand-off to the kernel on the serial console is a restart (REBOOT, before SSH has
+answered), and once the kext has started (the host's first "the device was reset") and before
+the host's first present, the host log silent 10 s is a hang ("before the desktop"), caught as
+above.
 """
 import argparse
 import json
@@ -422,6 +428,7 @@ def main():
     p.add_argument("--password", default="aneesiqbal")
     p.add_argument("--catches", type=int, default=2)
     p.add_argument("--log")
+    p.add_argument("--from-boot", action="store_true")
     args = p.parse_args()
     args.log = args.log or os.path.join(args.boot_dir, "launch.log")
     os.makedirs(args.out, exist_ok=True)
@@ -465,9 +472,6 @@ def main():
             if state["ssh_fail"]:
                 ev("SSH answers again, after %d failures in a row" % state["ssh_fail"])
             state["ssh_fail"] = 0
-            if state["fetch"]:
-                state["fetch"] = False
-                after_reboot(state["reboots"])
             if not state["ssh_ok"]:
                 ev("SSH answers")
             state["ssh_ok"] = True
@@ -477,6 +481,9 @@ def main():
                 with open(os.path.join(args.out, "guest-info.txt"), "w") as f:
                     f.write(info)
                 ev("guest-info.txt written (rc %d)" % rc2)
+            if state["fetch"]:
+                state["fetch"] = False
+                after_reboot(state["reboots"])
         elif state["ssh_ok"]:
             state["ssh_fail"] += 1
             ev("SSH failed (%d in a row): %s" % (state["ssh_fail"], text.strip()[-160:]))
@@ -503,6 +510,34 @@ def main():
         offsets[path] += cut
         return data[:cut]
     caught, last_catch = 0, 0.0
+    # --from-boot: the boot's own markers, read from the start.
+    boot = {"off": 0, "kext": False, "present": False, "handoffs": 0}
+
+    def boot_scan():
+        try:
+            with open(args.log, "rb") as f:
+                f.seek(boot["off"])
+                data = f.read()
+        except OSError:
+            data = b""
+        cut = data.rfind(b"\n") + 1
+        boot["off"] += cut
+        data = data[:cut]
+        if b"the device was reset" in data:
+            boot["kext"] = True
+        if b"PRESENT_SURFACE of transaction" in data or b"the display shows IOSurface" in data:
+            if not boot["present"]:
+                ev("the host's first present")
+            boot["present"] = True
+        try:
+            n = open(serial, "rb").read().count(b"HANDOFF TO XNU")
+        except OSError:
+            n = 0
+        if n > boot["handoffs"]:
+            if boot["handoffs"] >= 1:
+                return "hand-off to the kernel %d on the serial console" % n
+            boot["handoffs"] = n
+        return None
     while True:
         t = now()
         ticks = proc_ticks(args.pid)
@@ -518,6 +553,15 @@ def main():
             size = log_size
         if size != log_size:
             log_size, log_at = size, t
+        if args.from_boot:
+            again = boot_scan()
+            if again:
+                boot["handoffs"] += 1
+                boot["kext"], boot["present"] = False, False
+                state["reboots"] += 1
+                state["reboot_at"] = t
+                state["fetch"] = True
+                ev("REBOOT %d: %s, before the desktop" % (state["reboots"], again))
         if state["ssh_ok"]:
             m = re.search(rb"^(\S+) .*the device was reset", new_text(args.log), re.M)
             b = re.search(rb"BdsDxe: loading|HANDOFF TO XNU", new_text(serial))
@@ -539,6 +583,9 @@ def main():
                     state["ssh_fail"], state["reboots"]))
         elif state["ssh_fail"] >= 2:
             why = "SSH failed %d times in a row" % state["ssh_fail"]
+        elif args.from_boot and boot["kext"] and not boot["present"] and t - log_at >= 10:
+            why = "before the desktop: the host log silent %.0f s after the kext started, QEMU at %.1f CPUs" % (
+                t - log_at, rate)
         elif t - log_at >= 15 and rate >= 5.0 and len(hist) >= 5:
             why = "host log silent %.0f s, QEMU at %.1f CPUs" % (t - log_at, rate)
         if why and caught < args.catches and t - last_catch >= 60:
