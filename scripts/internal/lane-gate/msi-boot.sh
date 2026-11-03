@@ -222,6 +222,42 @@ touch "$R/.start"
 # seconds after the desktop is up, where the Dock has settled (below). The scanout's reader runs as
 # root, for /proc/PID/mem.
 CAPPIDS=()
+# A cold pipeline cache (COLD_CACHE=KEY) and a command at QEMU's start (QEMU_HOOK_B64): QEMU runs
+# under a wrapper that rgk-boot2.sh's run.sh execs with the GPU lock (fd 9) held. It sets the
+# host's cache entry KEY aside, starts the hook (with no lock), runs QEMU as its child, and once
+# QEMU has stopped removes the entry QEMU made and puts KEY back, the lock still held.
+if [[ -n ${COLD_CACHE:-} || -n ${QEMU_HOOK_B64:-} ]]; then
+  hook=$(printf '%s' "${QEMU_HOOK_B64:-}" | base64 -d)
+  {
+    echo '#!/bin/bash'
+    echo "C=$HOME/.cache/reims-vgpu-vulkan/v1/${COLD_CACHE:-}"
+    echo "A=$HOME/.cache/reims-vgpu-vulkan/v1/.lane-gate-aside-${COLD_CACHE:-}"
+    echo "COLD=${COLD_CACHE:+1}"
+    echo "REAL=$(printf '%q' "$QEMU")"
+    echo "HOOK=$(printf '%q' "$hook")"
+    echo "R=$(printf '%q' "$R")"
+    cat << 'WRAP'
+say() { echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z) lane-gate qemu wrapper: $*"; }
+if [[ -n $COLD ]]; then
+  [[ -e $A && ! -e $C ]] && mv "$A" "$C" && say "put back an earlier boot's $A"
+  if [[ -e $A ]]; then say "$A is there already: the cache stays warm"; COLD=
+  elif [[ -e $C ]]; then mv "$C" "$A" && say "the pipeline cache entry set aside: $C"
+  else say "no pipeline cache entry $C: cold already"; COLD=; fi
+fi
+"$REAL" "$@" &
+q=$!
+if [[ -n $HOOK ]]; then
+  ( exec 6>&- 7>&- 8>&- 9>&-; sleep 0.5; h=${HOOK//\{PID\}/$q}; h=${h//\{DIR\}/$R}; say "hook: $h"; eval "$h" ) &
+fi
+trap 'kill $q 2> /dev/null' TERM INT HUP
+while kill -0 "$q" 2> /dev/null; do wait "$q"; rc=$?; done
+if [[ -n $COLD ]]; then rm -rf "$C"; mv "$A" "$C" && say "the pipeline cache entry put back: $C"; fi
+exit ${rc:-0}
+WRAP
+  } > "$R/qemu-wrap.sh"
+  chmod +x "$R/qemu-wrap.sh"
+  QEMU=$R/qemu-wrap.sh
+fi
 # The hang catcher from QEMU's start (CATCH_FROM_BOOT=1, msi-hang-catch.py --from-boot): a boot's
 # own restart or silence before the desktop; it writes R/hang/, and the probes use it as theirs.
 HCPID=

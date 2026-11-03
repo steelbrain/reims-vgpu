@@ -43,7 +43,8 @@ root; asked again every 10 s for 3 minutes, as the guest writes them a while aft
 second hand-off to the kernel on the serial console is a restart (REBOOT, before SSH has
 answered), and once the kext has started (the host's first "the device was reset") and before
 the host's first present, the host log silent 10 s is a hang ("before the desktop"), caught as
-above.
+above; until that present, QEMU's screen every 5 s (QMP screendump, boot-screens/SECONDS.png, the
+seconds since the catcher started).
 """
 import argparse
 import json
@@ -510,7 +511,18 @@ def main():
         offsets[path] += cut
         return data[:cut]
     caught, last_catch = 0, 0.0
-    # --from-boot: the boot's own markers, read from the start.
+    # --from-boot: the boot's own markers, read from the start, and its screens until the present.
+    t_start, last_screen = now(), 0.0
+
+    def screendump():
+        d = os.path.join(args.out, "boot-screens")
+        os.makedirs(d, exist_ok=True)
+        try:
+            q = Qmp(os.path.join(args.boot_dir, "qmp.sock"), lambda s: None, timeout=5)
+            q.cmd("screendump", filename=os.path.join(d, "%05.1f.png" % (now() - t_start)), format="png")
+            q.close()
+        except Exception as e:  # noqa: BLE001 - a screen that fails is left out
+            ev("screendump: %s" % e)
     boot = {"off": 0, "kext": False, "present": False, "handoffs": 0}
 
     def boot_scan():
@@ -553,6 +565,10 @@ def main():
             size = log_size
         if size != log_size:
             log_size, log_at = size, t
+        if args.from_boot and not boot["present"] and t - last_screen >= 5 and os.path.exists(
+                os.path.join(args.boot_dir, "qmp.sock")):
+            last_screen = t
+            screendump()
         if args.from_boot:
             again = boot_scan()
             if again:
