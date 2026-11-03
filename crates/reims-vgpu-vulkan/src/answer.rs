@@ -1692,6 +1692,7 @@ pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
 /// this thread before it ([`notice`]). A call that unwinds, a death inside it, lets its notice
 /// go: the death that unwinds it is the call's, and the thread's next call here must not die of
 /// a notice of this one.
+#[inline]
 fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
     /// Leaves the call on drop, an unwinding one included, whose notice it drops.
     struct Leave<'a> {
@@ -1720,15 +1721,23 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
             out
         };
         if let Some(notice) = take_pending(calls) {
-            let call = sel.unwrap_or(notice.degradation.code());
-            if census::on() {
-                census::selector(notice.degradation, call);
-            } else {
-                degraded(call, &notice);
-            }
+            noticed_inside(sel, &notice);
         }
         out
     })
+}
+
+/// What [`inside`] does with `notice`, a degradation of [`DIES`] announced inside its call of
+/// `sel`: out of line, as nearly every call announces none.
+#[cold]
+#[inline(never)]
+fn noticed_inside(sel: Option<&'static str>, notice: &rt::DegradeNotice) {
+    let call = sel.unwrap_or(notice.degradation.code());
+    if census::on() {
+        census::selector(notice.degradation, call);
+    } else {
+        degraded(call, notice);
+    }
 }
 
 /// The kinds of [`DIES`] that die by default too, not only in strict mode, as the guest or the

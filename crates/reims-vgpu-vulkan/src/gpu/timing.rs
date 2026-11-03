@@ -167,10 +167,19 @@ pub const DISPATCH_LATER: &str =
 /// Runs the encoder command `sel`'s runtime call `call`, and when the lines are on and it takes
 /// [`SLOW_CALL`] or more, writes its wall time on the encoding thread, naming the
 /// `uniqueIdentifier` of the pipeline state the encoder set last, if any (0 is none).
+#[inline]
 pub fn encoder_call<T>(sel: &str, pipeline: &AtomicU64, call: impl FnOnce() -> T) -> T {
     if !on() {
         return call();
     }
+    timed_encoder_call(sel, pipeline, call)
+}
+
+/// [`encoder_call`] with the lines on: out of line, as they are a diagnostic most runs leave
+/// off.
+#[cold]
+#[inline(never)]
+fn timed_encoder_call<T>(sel: &str, pipeline: &AtomicU64, call: impl FnOnce() -> T) -> T {
     let start = now();
     let out = call();
     let elapsed = elapsed_since(start);
