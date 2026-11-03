@@ -242,15 +242,43 @@ if [[ -n $T_QEMU ]]; then
 fi
 
 # Right after login the guest's SSH can miss its banner timeout while the desktop's apps start: a
-# copy is tried three times, 15 s apart.
+# copy is tried three times, 15 s apart. After a failed try, where it stopped: whether QEMU's main
+# loop (which also runs its user network) answers QMP, and whether the guest's SSH sends its banner
+# through the forwarded port.
+ssh_state() {
+  local q c
+  q=$(printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"query-status"}' |
+    timeout 5 socat - "UNIX-CONNECT:$B/qmp.sock" 2> /dev/null | grep -o '"status": *"[a-z-]*"' | head -1)
+  # The kernel completes a connect to QEMU's forwarded port whatever QEMU does: a banner that does
+  # not come is the guest's where QMP answers (the main loop, which runs the user network, is up).
+  c=$(timeout 10 python3 -I -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3)
+s.settimeout(5)
+try:
+    b = s.recv(40)
+except OSError:
+    b = b""
+print("connected, " + ("banner " + b.decode(errors="replace").strip() if b else "no banner in 5 s"))' "$PORT" 2> /dev/null)
+  echo "QMP ${q:+answers ($q)}${q:-silent for 5 s}; TCP to the SSH port: ${c:-connect failed}"
+}
+# Where a copy failed for good: the serial port's last lines, and the longest gaps between the
+# guest's library lookups (its processes launching) in the last three minutes of QEMU's log.
+copy_failed_state() {
+  log "serial tail: $(tail -3 "$B/serial.log" 2> /dev/null | tr -dc '[:print:]\n' | tr '\n' '|')"
+  local since; since=$(date -d '-3 min' +%Y-%m-%dT%H:%M:%S)
+  log "library lookup gaps since $since: $(grep 'library lookup' "$B/launch.log" | cut -c1-23 | awk -v s="$since" '$1 >= s' |
+    while read -r t; do date -d "$t" +%s.%N; done | awk 'NR > 1 { g = $1 - p; if (g > 5) printf "%.0f s at %s, ", g, strftime("%T", p) } { p = $1 }
+      END { if (NR == 0) printf "no lookups"; else printf "last at %s", strftime("%T", p) }')"
+}
 copied=0
 for try in 1 2 3; do
   G "rm -rf ~/lane-gate" && Gcp "$PAYLOAD" "$GUEST_USER@127.0.0.1:lane-gate" &&
     Gcp "$CORPUS" "$GUEST_USER@127.0.0.1:lane-gate/corpus" && { copied=1; break; }
-  log "copying the payload into the guest failed (try $try)"
+  log "copying the payload into the guest failed (try $try): $(ssh_state)"
   sleep 15
 done
-((copied)) || { log "BOOT_FAIL copying the payload into the guest"; exit 6; }
+((copied)) || { copy_failed_state; log "BOOT_FAIL copying the payload into the guest"; exit 6; }
 kv payload_tries "$try"
 log "payload copied"
 
