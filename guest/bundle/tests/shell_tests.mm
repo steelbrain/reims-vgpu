@@ -9084,8 +9084,8 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *luma = overPlane(surface, MTLPixelFormatR16Unorm, 64, 48, 0);
 		CHECK(luma != nil && src.asked == 2 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == base && src.length == allocBytes(surface) && src.size == 0x1000);
-		// Two planes: not asked cached.
-		CHECK(src.surfaceId == IOSurfaceGetID(surface) && !src.cacheable);
+		// Two planes: asked cached, as every surface is.
+		CHECK(src.surfaceId == IOSurfaceGetID(surface) && src.cacheable);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.block_offset == src.offset && buffer.length == allocBytes(surface));
@@ -9715,8 +9715,9 @@ void test_iosurface_in_place_core_image_set()
 }
 
 // A surface whose block the kext made cached, its GPU copy in a device cache on the host
-// (RgfxIOSurface.h): only surfaces of one plane and no YCbCr are asked cached, and a block is
-// cached as the kext answers, whoever made it. A command buffer names each cached surface it uses
+// (RgfxIOSurface.h): every surface is asked cached, of any planes and format, but a video
+// decoder's output made under RgfxAskUncachedScope, and a block is cached as the kext answers,
+// whoever made it. A command buffer names each cached surface it uses
 // before its first encoder, once, with the CPU generation the block's header holds at its commit
 // and whether it writes the surface (RGFX_OP_SURFACE_USE): a bound texture, an attachment, a
 // blit's source or destination, a resource it uses; views name their surface. A buffer that uses
@@ -9869,14 +9870,14 @@ void test_iosurface_cached()
 		rgfxIOSurfaceKeepFlush(); // the views kept past their textures go too
 		drainRing(control);
 
-		// A 4:2:2 YCbCr surface of one plane is not asked cached, and one the kext answers not
+		// A 4:2:2 YCbCr surface of one plane is asked cached too, and one the kext answers not
 		// cached is named by no buffer.
 		src.answerCached = false;
 		RgfxIOSurfaceTexture *video = overSurface(CVPixelBufferGetIOSurface(yuv),
 		                                          MTLTextureUsageShaderRead);
-		CHECK(video != nil && !src.cacheable);
-		// A video decoder's output, its plane's texture made under RgfxAskCachedScope: asked
-		// cached, though it has two planes of YCbCr; and one made after the scope is not.
+		CHECK(video != nil && src.cacheable);
+		// A video decoder's output, its plane's texture made under RgfxAskUncachedScope: not asked
+		// cached; and one of two planes of YCbCr made after the scope is.
 		auto lumaOf = [&](CVPixelBufferRef pb) {
 			MTLTextureDescriptor *td =
 			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
@@ -9894,11 +9895,11 @@ void test_iosurface_cached()
 		CVPixelBufferRef decoded = pixelBuffer(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
 		CVPixelBufferRef other = pixelBuffer(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
 		{
-			RgfxAskCachedScope ask;
-			CHECK(lumaOf(decoded) != nil && src.cacheable &&
+			RgfxAskUncachedScope ask;
+			CHECK(lumaOf(decoded) != nil && !src.cacheable &&
 			      src.surfaceId == IOSurfaceGetID(CVPixelBufferGetIOSurface(decoded)));
 		}
-		CHECK(lumaOf(other) != nil && !src.cacheable &&
+		CHECK(lumaOf(other) != nil && src.cacheable &&
 		      src.surfaceId == IOSurfaceGetID(CVPixelBufferGetIOSurface(other)));
 		CVPixelBufferRelease(decoded); // the views hold their surfaces
 		CVPixelBufferRelease(other);

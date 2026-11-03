@@ -161,8 +161,8 @@ uint64_t outputKey(IOSurfaceRef surface, uint32_t x, uint32_t y)
 
 // A texture of `format` over `surface`'s plane `plane`: of the plane's size, or, `width` by
 // `height` from `origin` in it (a tile's place in its canvas, in the plane's elements), where
-// `width` is not 0; over the surface's device cache where the host lands pictures there and the
-// texture makes the surface's block.
+// `width` is not 0; over the surface's device cache where the host lands pictures there, and over
+// its pages where it does not and the texture makes the surface's block.
 id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_t plane,
                             MTLPixelFormat format, MTLOrigin origin, size_t width, size_t height)
 {
@@ -185,9 +185,9 @@ id<MTLTexture> planeTexture(RgfxMetalDevice *device, IOSurfaceRef surface, size_
 		                                        serializer:[device serializer]];
 	};
 	const RgfxVideoCaps *caps = [device videoCaps];
-	if ((caps->flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED) == 0)
+	if ((caps->flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED) != 0)
 		return make();
-	RgfxAskCachedScope ask;
+	RgfxAskUncachedScope ask;
 	return make();
 }
 

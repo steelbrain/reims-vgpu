@@ -395,15 +395,18 @@ Stages:
         wrote since its last copy copies nothing; and a host whose GPU shares
         the CPU's memory keeps no cache, its surfaces in place as above.
       - *Which surfaces are cached:* the guest's choice, and the host's
-        invalidation. The bundle asks a block in place cached for a surface
-        of one plane and no YCbCr, by IOSurface's description of its pixel
-        format: the windows, layers and drawables the guest's compositors and
-        apps draw, which the CPU and the GPU write. Video frames, of two
-        planes or YCbCr, stay uncached, sparing the fills a host-side video
-        device's writes would cost, but for the outputs of the bundle's own
-        video driver where the host lands its pictures in the caches
-        (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`, item 16): their textures ask under
-        `RgfxAskCachedScope`. Correctness does not rest on that choice:
+        invalidation. The bundle asks every block in place cached, of any
+        planes and format, as a GPU of its own memory keeps a copy of each
+        surface it uses: the windows, layers and drawables the guest's
+        compositors and apps draw, and video frames, which the GPU writes as
+        a decode's output or a conversion's destination. Measured on the RTX
+        5080: VideoToolbox's 10-to-8-bit conversion of a 1080p frame into a
+        420v surface not cached takes 4.8 ms of the GPU, its writes crossing
+        the bus into the pages. The outputs of the bundle's own video driver
+        ask no cache where the host lands no picture in one (no
+        `RGFX_VIDEO_CAPS_OUTPUT_CACHED`, item 16), its decode writing their
+        pages: their textures ask under `RgfxAskUncachedScope`. Correctness
+        does not rest on that choice:
         a surface a host-side device writes (the M2 scaler, the VideoToolbox
         decoder) may be cached all the same, and the host invalidates the
         cache of a block whose pages such a device wrote, so the next
@@ -583,8 +586,9 @@ Stages:
       surface's planes, and nothing else copies a frame on the GPU.
       AppleGVA's surfaces lie in place (§14, measured on the guest with the
       RTX 5080). On a GPU of its own memory, the host says
-      `RGFX_VIDEO_CAPS_OUTPUT_CACHED` in the video caps, the driver asks each
-      output surface's block cached (item 14, *Which surfaces are cached*),
+      `RGFX_VIDEO_CAPS_OUTPUT_CACHED` in the video caps, each output
+      surface's block is cached as every surface's is (item 14, *Which
+      surfaces are cached*; without the flag the driver asks them uncached),
       and the copy writes the surface's device cache, within the GPU's
       memory, on the queue the runtime reserves for the decoders (family 0
       on the RTX 5080), which no runtime work runs on, so the copy waits for

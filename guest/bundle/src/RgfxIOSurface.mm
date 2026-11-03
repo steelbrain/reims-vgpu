@@ -264,26 +264,6 @@ uint32_t ycbcrMatrix(IOSurfaceRef s)
 	return code;
 }
 
-/// Whether `s` holds YCbCr, by IOSurface's description of its pixel format: its chroma is
-/// subsampled, or a component of its plane 0 is luma or chroma. CoreVideo's surfaces carry the
-/// description, and one made without it counts as no YCbCr (measured on the M3 Max under macOS
-/// 27: CoreVideo's 2vuy and yuvs are 4:2:2, its v308 and y416 have a luma component, its BGRA
-/// none; IOSurfaceCreate's 2vuy, with no description, answers neither).
-bool holdsYCbCr(IOSurfaceRef s)
-{
-	const IOSurfaceSubsampling sub = IOSurfaceGetSubsampling(s);
-	if (sub != kIOSurfaceSubsamplingUnknown && sub != kIOSurfaceSubsamplingNone)
-		return true;
-	const size_t n = IOSurfaceGetNumberOfComponentsOfPlane(s, 0);
-	for (size_t c = 0; c < n; c++) {
-		const IOSurfaceComponentName name = IOSurfaceGetNameOfComponentOfPlane(s, 0, c);
-		if (name == kIOSurfaceComponentNameLuma || name == kIOSurfaceComponentNameChromaRed ||
-		    name == kIOSurfaceComponentNameChromaBlue)
-			return true;
-	}
-	return false;
-}
-
 /// The process's copies between surfaces' pages and the GPU's view of them, by direction: a
 /// diagnostic, an os_log line (info) at most every kCopyReportNs while copies run.
 struct CopyCount {
@@ -305,8 +285,8 @@ std::atomic<uint64_t> gCachedLive{0};
 /// The process names its command buffers' order over IOSurfaces (rgfxIOSurfaceSetOrder): every
 /// surface a buffer uses is noted, and its commit names the buffers of other queues it runs after.
 std::atomic<bool> gSurfaceOrder{false};
-/// The RgfxAskCachedScopes alive on this thread.
-thread_local unsigned tAskCached = 0;
+/// The RgfxAskUncachedScopes alive on this thread.
+thread_local unsigned tAskUncached = 0;
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
 std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
@@ -779,13 +759,12 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		} else if (!placeInPlace(surface, &own, region->surfacePagesAlignment(), &notInPlace)) {
 			countView(gCopiedAlignment);
 		} else {
-			// The bundle asks a device cache for surfaces of one plane and no YCbCr: those the
-			// guest's compositors and apps draw. Other video frames, of two planes or YCbCr,
-			// stay uncached, as host-side video devices may write their pages (design.md, "The
-			// device cache"), but for the outputs of the bundle's own video decoder, which the
-			// host lands in their caches (RgfxAskCachedScope).
-			const bool cacheable = tAskCached > 0 ||
-			                       (IOSurfaceGetPlaneCount(surface) <= 1 && !holdsYCbCr(surface));
+			// The bundle asks a device cache for every surface, of any planes and format, as a
+			// GPU of its own memory keeps a copy of each surface it uses: a video frame the GPU
+			// writes stays in its memory as a window does (design.md, "The device cache"). The
+			// outputs of the bundle's own video decoder ask none where the host lands no picture
+			// in a cache (RgfxAskUncachedScope), its decode writing their pages.
+			const bool cacheable = tAskUncached == 0;
 			RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesRefused;
 			sharedBlock = region->acquireSurfacePages(IOSurfaceGetBaseAddress(surface), ownLength,
 			                                          ownSize, surfaceId, cacheable, &answer);
@@ -1467,14 +1446,14 @@ void rgfxIOSurfaceSyncBeforeCommit(RgfxEncoder *enc)
 		static_cast<RgfxSurfaceShadow *>(p.get())->uploadIfChanged();
 }
 
-RgfxAskCachedScope::RgfxAskCachedScope()
+RgfxAskUncachedScope::RgfxAskUncachedScope()
 {
-	tAskCached++;
+	tAskUncached++;
 }
 
-RgfxAskCachedScope::~RgfxAskCachedScope()
+RgfxAskUncachedScope::~RgfxAskUncachedScope()
 {
-	tAskCached--;
+	tAskUncached--;
 }
 
 // The view of the texture over an IOSurface that `resource` is, or views through any views (the

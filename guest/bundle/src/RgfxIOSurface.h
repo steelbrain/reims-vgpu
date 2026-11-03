@@ -26,8 +26,10 @@
  * RgfxCaps::linearTextureAlignment), and every plane lies within the allocation. In place, a
  * surface takes one page of the region however large it is.
  *
- * In place, a surface of one plane and no YCbCr is asked cached: where the host's GPU has memory
- * of its own (RGFX_FEATURE_SURFACE_CACHE), the kext makes the block cached, and the host keeps
+ * In place, a surface is asked cached, of any planes and format, but for a video decoder's
+ * output where the host lands no picture in a device cache (RgfxAskUncachedScope): where the
+ * host's GPU has memory of its own (RGFX_FEATURE_SURFACE_CACHE), the kext makes the block
+ * cached, and the host keeps
  * the surface's GPU copy there, a device cache, apart from its pages (docs/graphics-kext/
  * design.md, Decided 14, "The device cache"). The pages and the cache meet at IOSurface's locks,
  * which the kext serves, and at the commit of each command buffer that uses the surface, which
@@ -168,17 +170,16 @@ NS_ASSUME_NONNULL_END
 /// buffer names, and each of those names it.
 void rgfxIOSurfaceSyncBeforeCommit(RgfxEncoder *_Nonnull enc);
 
-/// While one lives on a thread, a surface's block that the thread's texture makes in place asks a
-/// device cache whatever the surface's planes and format: for a video decoder's outputs, whose
-/// pictures the host lands in the cache where its video caps say so
-/// (RGFX_VIDEO_CAPS_OUTPUT_CACHED), so they cross to the pages only at a CPU lock. A block
-/// another holder made keeps the mode that holder's ask gave it.
-class RgfxAskCachedScope {
+/// While one lives on a thread, a surface's block that the thread's texture makes in place asks
+/// no device cache: for a video decoder's outputs where the host's video caps do not say it lands
+/// pictures in device caches (RGFX_VIDEO_CAPS_OUTPUT_CACHED), so the host's decode writes the
+/// surface's pages. A block another holder made keeps the mode that holder's ask gave it.
+class RgfxAskUncachedScope {
 public:
-	RgfxAskCachedScope();
-	~RgfxAskCachedScope();
-	RgfxAskCachedScope(const RgfxAskCachedScope &) = delete;
-	RgfxAskCachedScope &operator=(const RgfxAskCachedScope &) = delete;
+	RgfxAskUncachedScope();
+	~RgfxAskUncachedScope();
+	RgfxAskUncachedScope(const RgfxAskUncachedScope &) = delete;
+	RgfxAskUncachedScope &operator=(const RgfxAskUncachedScope &) = delete;
 };
 
 /// Lets go of every view the keep holds (the views in place kept past their textures,
