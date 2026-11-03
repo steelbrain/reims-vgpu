@@ -251,6 +251,7 @@ include = [
     "RgfxStencilDescriptor",
     "RgfxSurfaceFacts",
     "RgfxSurfaceDownload",
+    "RgfxSurfaceOrderWait",
     "RgfxSurfacePages",
     "RgfxSurfacePagesCache",
     "RgfxSurfaceWriter",

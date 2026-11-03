@@ -93,6 +93,18 @@
 // [`RGFX_OP_SUBMITTED`]. No host offers the feature yet.
 #define RGFX_OP_SCHEDULED_WANTED 11
 
+// Op `SURFACE_ORDER` (as many [`RgfxSurfaceOrderWait`]s as its `len` holds, none among them),
+// where the guest took [`RGFX_FEATURE_SURFACE_ORDER`](crate::wire::RGFX_FEATURE_SURFACE_ORDER):
+// the command buffer uses IOSurfaces, and runs after each command buffer of another queue its body
+// names, as a Mac's GPU orders a process's access to an IOSurface after another's committed
+// before it where one of them writes. Before its first encoder, once. The bundle names, as it
+// commits, each surface's writers (`RgfxSurfaceWriters`) of other queues, and where the buffer
+// writes the surface its readers too; the buffer's own queue and seqno then go in the surface's
+// record for the buffers committed after it. The host makes the buffer wait on the GPU for each
+// named buffer that has not finished, and has the buffer signal its own queue's order as it ends,
+// for the buffers that name it.
+#define RGFX_OP_SURFACE_ORDER 12
+
 // [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 #define RGFX_SURFACE_USE_WRITES (1 << 0)
 
@@ -727,7 +739,8 @@
 // `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
 // [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 // guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
-// [`RGFX_FEATURE_QUEUE_VECTORS`]). Bit 9 is reserved.
+// [`RGFX_FEATURE_QUEUE_VECTORS`], and [`RGFX_FEATURE_SURFACE_ORDER`]). Bits 9 and 10 are
+// reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -785,6 +798,13 @@
 // `FEATURES_LO` bit 8, `QUEUE_VECTORS`: the device has an MSI-X vector for each context slot
 // after vector 0, and a queue's completion ring raises its context's. No host offers it yet.
 #define RGFX_FEATURE_QUEUE_VECTORS (1 << 8)
+
+// `FEATURES_LO` bit 11, `SURFACE_ORDER`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: the host decodes
+// [`RGFX_OP_SURFACE_ORDER`](crate::ops::RGFX_OP_SURFACE_ORDER), so a command buffer that uses an
+// IOSurface runs after the buffers of other queues committed before it that use the surface,
+// where one of the two writes it. No host offers it yet.
+#define RGFX_FEATURE_SURFACE_ORDER (1 << 11)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -4844,6 +4864,15 @@ typedef struct {
   // The surface's shared block's region offset.
   uint64_t block_offset;
 } RgfxSurfaceDownload;
+
+// One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after: the one at `seqno` on the
+// submission ring of queue `queue_obj_id`, and the queue's buffers before it.
+typedef struct {
+  // The queue's id.
+  uint64_t queue_obj_id;
+  // The buffer's `seqno` on the queue's submission ring.
+  uint64_t seqno;
+} RgfxSurfaceOrderWait;
 
 // `SURFACE_PAGES`: the guest RAM of the IOSurface whose shared block is the `block_size` bytes
 // at `block_offset`, made for context `context`: `run_count` [`RgfxPageRun`]s at region offset

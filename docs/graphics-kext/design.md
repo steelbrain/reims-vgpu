@@ -658,6 +658,9 @@ only where no negotiation can carry it.
   reserved. No host offers one of them yet, the kext takes none, and the host
   carries out no queue flag: each lands with its feature, which says what it
   changes.
+- Bit 10 is reserved for a pipeline's warm-up, and bit 11 is `SURFACE_ORDER`:
+  a command buffer that uses IOSurfaces runs after the buffers of other queues
+  it names (`RGFX_OP_SURFACE_ORDER`; "Surface order", below).
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1468,6 +1471,44 @@ not yet committed stays `Committed` and unposted, and the commit that readies
 the front posts every ready buffer behind it, in order, on its own thread. An
 enqueued buffer let go uncommitted stays, holding back the buffers after it,
 as Metal's does.
+
+**Surface order**, where the guest took `SURFACE_ORDER` (`FEATURES_LO` bit 11).
+On a Mac, a GPU access to an IOSurface committed after another process's
+pending GPU access to it runs after that access, where either writes:
+read after write, write after read and write after write. Accesses to other
+surfaces are not ordered (measured on the MBP16's AMD 5300M, macOS 26.7.1: a
+blit of the surface committed just after another process committed a 212 ms
+pass over it waited for the pass in all three cases, and read or left what
+the order says; a blit of another surface took 2.4-4 ms; the Intel 630
+runs one process's work at a time, so it orders all of it). Queues and
+processes here reach the host on rings of their own, which the host takes
+apart, so the order the host takes buffers in is not the order they were
+committed in. The bundle names the order instead, as it commits:
+- Each surface's shared block holds its writers (`RgfxSurfaceWriters`, one
+  slot a queue: its latest buffer that writes the surface) and, after them, its
+  readers (the same record, the latest buffer of each queue that only reads
+  it), which only the bundles read.
+- A commit of a buffer that uses surfaces reads, for each, the writers of
+  other queues, and where the buffer writes the surface the readers too, and
+  names each queue once, at its highest seqno, in one `SURFACE_ORDER` op before
+  its first encoder. Once the buffer is on its queue's ring it raises its own
+  queue's slot: a writer's for a surface it writes, else a reader's.
+- So each buffer named was posted before the commit that names it read the
+  slots: the buffers' waits run from later commits to earlier ones, and cannot
+  meet in a cycle.
+- The host keeps each queue's surface timeline, a shared event. A buffer that
+  holds `SURFACE_ORDER` signals its queue's to its seqno as it ends, and waits
+  first, on the GPU, for each named queue's to reach the seqno named, except
+  where the host has seen that buffer finish, or the queue is the buffer's own,
+  whose order is its ring's. A queue the host does not hold, or a seqno past
+  every one the queue's ring has published, names no buffer and waits for
+  nothing.
+- What will not signal is signalled for it: a buffer stood in for signals from
+  its stand-in, and one with no stand-in from a command buffer of its own on its
+  queue. A queue's destroy, or its context's close, signals the last value a
+  buffer waits for of it. A buffer the host has taken that holds no
+  `SURFACE_ORDER` signals where another queue's buffer waits past what the
+  queue has signalled.
 
 **Left for later** (extends the same op families, not the transport):
 command-buffer/queue descriptors and `errorOptions`; labels and debug groups

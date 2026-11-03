@@ -116,6 +116,17 @@ pub const RGFX_OP_QUEUE_BARRIER: u16 = 0x000a;
 /// the command buffer's `CB_SCHEDULED` raises the ring's vector. Anywhere in the stream, once, as
 /// [`RGFX_OP_SUBMITTED`]. No host offers the feature yet.
 pub const RGFX_OP_SCHEDULED_WANTED: u16 = 0x000b;
+/// Op `SURFACE_ORDER` (as many [`RgfxSurfaceOrderWait`]s as its `len` holds, none among them),
+/// where the guest took [`RGFX_FEATURE_SURFACE_ORDER`](crate::wire::RGFX_FEATURE_SURFACE_ORDER):
+/// the command buffer uses IOSurfaces, and runs after each command buffer of another queue its body
+/// names, as a Mac's GPU orders a process's access to an IOSurface after another's committed
+/// before it where one of them writes. Before its first encoder, once. The bundle names, as it
+/// commits, each surface's writers (`RgfxSurfaceWriters`) of other queues, and where the buffer
+/// writes the surface its readers too; the buffer's own queue and seqno then go in the surface's
+/// record for the buffers committed after it. The host makes the buffer wait on the GPU for each
+/// named buffer that has not finished, and has the buffer signal its own queue's order as it ends,
+/// for the buffers that name it.
+pub const RGFX_OP_SURFACE_ORDER: u16 = 0x000c;
 
 /// [`RgfxOpSurfaceUse::flags`]: the command buffer may write the surface.
 pub const RGFX_SURFACE_USE_WRITES: u32 = 1 << 0;
@@ -157,6 +168,19 @@ pub struct RgfxOpQueueBarrier {
     pub after_stages: u64,
     /// The stages of the work after the barrier that wait.
     pub before_stages: u64,
+}
+
+/// One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after: the one at `seqno` on the
+/// submission ring of queue `queue_obj_id`, and the queue's buffers before it.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSurfaceOrderWait {
+    /// The queue's id.
+    pub queue_obj_id: u64,
+    /// The buffer's `seqno` on the queue's submission ring.
+    pub seqno: u64,
 }
 
 /// The body of [`RGFX_OP_SIGNAL_EVENT`] and [`RGFX_OP_WAIT_EVENT`].
@@ -438,6 +462,8 @@ const _: () = {
     assert!(size_of::<RgfxOpHeader>() + size_of::<RgfxOpQueueBarrier>() == 24);
     assert!(op_group(RGFX_OP_QUEUE_BARRIER) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SCHEDULED_WANTED) == RGFX_OP_GROUP_FRAMING);
+    assert!(op_group(RGFX_OP_SURFACE_ORDER) == RGFX_OP_GROUP_FRAMING);
+    assert!(size_of::<RgfxSurfaceOrderWait>() == 16);
     assert!(op_group(RGFX_OP_ENCODER_BEGIN_VIDEO) == RGFX_OP_GROUP_FRAMING);
     assert!(op_group(RGFX_OP_SURFACE_USE) == RGFX_OP_GROUP_FRAMING);
     // Each group's tag range maps to its own `op_group`.
