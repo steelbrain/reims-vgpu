@@ -585,17 +585,17 @@ const fn level(level_idc: u8, max_luma_ps: u64, max_luma_sr: u64, max_br: u64) -
 
 /// What a stream needs of its level.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LevelNeeds {
+pub struct LevelNeeds {
     /// The width in luma samples.
-    pub(crate) width: u32,
+    pub width: u32,
     /// The height in luma samples.
-    pub(crate) height: u32,
+    pub height: u32,
     /// Pictures a second.
-    pub(crate) frames_per_second: f64,
+    pub frames_per_second: f64,
     /// The peak bitrate, if bounded.
-    pub(crate) bits_per_second: Option<u32>,
+    pub bits_per_second: Option<u32>,
     /// `sps_max_dec_pic_buffering_minus1 + 1`.
-    pub(crate) dpb_pictures: u32,
+    pub dpb_pictures: u32,
 }
 
 impl LevelNeeds {
@@ -642,7 +642,7 @@ impl LevelNeeds {
 }
 
 /// The lowest Main tier level that fits, or why none does.
-pub(crate) fn choose_level(needs: &LevelNeeds) -> Result<u8, Unsupported> {
+pub fn choose_level(needs: &LevelNeeds) -> Result<u8, Unsupported> {
     LEVELS
         .iter()
         .find(|level| needs.fits(level))
