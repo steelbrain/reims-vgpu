@@ -1565,22 +1565,44 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_encoder->signalEvent(obj, value);
 }
 
+// A drawable's present, as MTLCommandBuffer.h describes it: `present` runs once this buffer is
+// scheduled, from a scheduled handler added now, and only where the buffer has not failed by
+// then, so the window server takes the frame as its work goes to the GPU. The drawable (a
+// CAMetalLayer's) is then the layer's next frame: its presented handlers report the refresh that
+// showed it, or 0 where a later frame took its place, and the layer gives it back to
+// nextDrawable once the display is done with it. The block keeps the drawable until it runs.
+- (void)rgfxPresent:(id<MTLDrawable>)drawable with:(void (^)(id<MTLDrawable>))present
+{
+	if (drawable == nil)
+		return;
+	[self addScheduledHandler:^(id<MTLCommandBuffer> cb) {
+		if (cb.error == nil)
+			present(drawable);
+	}];
+}
+
 - (void)presentDrawable:(id<MTLDrawable>)drawable
 {
-	// The present path is a later piece (documented stub).
-	(void)drawable;
+	[self rgfxPresent:drawable
+	             with:^(id<MTLDrawable> d) {
+		             [d present];
+	             }];
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime
 {
-	(void)drawable;
-	(void)presentationTime;
+	[self rgfxPresent:drawable
+	             with:^(id<MTLDrawable> d) {
+		             [d presentAtTime:presentationTime];
+	             }];
 }
 
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration
 {
-	(void)drawable;
-	(void)duration;
+	[self rgfxPresent:drawable
+	             with:^(id<MTLDrawable> d) {
+		             [d presentAfterMinimumDuration:duration];
+	             }];
 }
 
 // --- MTLCommandBuffer state --------------------------------------------------

@@ -92,6 +92,56 @@
 
 @implementation TestHandle
 @end
+
+// A drawable that records how it was presented: "now", "at T" or "after D", in order.
+@interface TestDrawable : NSObject <MTLDrawable>
+@property(nonatomic) NSMutableArray<NSString *> *presents;
+@end
+
+@implementation TestDrawable
+- (instancetype)init
+{
+	if ((self = [super init]))
+		_presents = [NSMutableArray array];
+	return self;
+}
+- (void)present
+{
+	@synchronized(self) {
+		[_presents addObject:@"now"];
+	}
+}
+- (void)presentAtTime:(CFTimeInterval)presentationTime
+{
+	@synchronized(self) {
+		[_presents addObject:[NSString stringWithFormat:@"at %g", presentationTime]];
+	}
+}
+- (void)presentAfterMinimumDuration:(CFTimeInterval)duration
+{
+	@synchronized(self) {
+		[_presents addObject:[NSString stringWithFormat:@"after %g", duration]];
+	}
+}
+- (void)addPresentedHandler:(MTLDrawablePresentedHandler)block
+{
+	(void)block;
+}
+- (CFTimeInterval)presentedTime
+{
+	return 0;
+}
+- (NSUInteger)drawableID
+{
+	return 1;
+}
+- (NSArray<NSString *> *)seen
+{
+	@synchronized(self) {
+		return [_presents copy];
+	}
+}
+@end
 // The control ring's helpers (below), which the tests in the namespace use too.
 uint64_t nextDestroyed(TestRing &ring);
 bool ringEmpty(TestRing &ring);
@@ -4507,6 +4557,47 @@ void test_scheduled_before_completion()
 	CHECK(failed.status == MTLCommandBufferStatusError);
 	CHECK(![f.queue sharedReplyReader]->awaitingScheduled(s2));
 	CHECK(scheduledRuns == 1);
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// A drawable's present rides its command buffer's scheduling, as MTLCommandBuffer.h describes:
+// presentDrawable: and its variants present nothing at the call or the commit, and present the
+// drawable once, by the variant's own call, when the buffer is scheduled (its CB_SCHEDULED). A
+// nil drawable adds nothing.
+void test_present_drawable()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+
+	TestDrawable *now = [TestDrawable new], *at = [TestDrawable new], *after = [TestDrawable new];
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	[cb presentDrawable:now];
+	[cb presentDrawable:at atTime:12.5];
+	[cb presentDrawable:after afterMinimumDuration:0.25];
+	id<MTLDrawable> none = nil;
+	[cb presentDrawable:none];
+	CHECK(now.seen.count == 0 && at.seen.count == 0 && after.seen.count == 0);
+	[cb commit];
+	uint64_t seqno = f.nextSeqno();
+	CHECK(seqno != 0);
+	CHECK(now.seen.count == 0 && at.seen.count == 0 && after.seen.count == 0); // not yet scheduled
+	RgfxCbScheduled scheduled = cbScheduled(seqno, ((RgfxResource *)cb).rgfxObjId);
+	hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+	[cb waitUntilScheduled];
+	CHECK([now.seen isEqualToArray:@[ @"now" ]]);
+	CHECK([at.seen isEqualToArray:@[ @"at 12.5" ]]);
+	CHECK([after.seen isEqualToArray:@[ @"after 0.25" ]]);
+	RgfxCbComplete done = cbComplete(seqno, ((RgfxResource *)cb).rgfxObjId);
+	hostPost(f.completion, *kext, &done, sizeof(done));
+	[cb waitUntilCompleted];
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	CHECK(now.seen.count == 1 && at.seen.count == 1 && after.seen.count == 1); // once each
 	kext->close();
 	CHECK(eventually([&] { return !thread.running(); }));
 	}
@@ -8944,6 +9035,7 @@ int main(int argc, char **argv)
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();
 		test_scheduled_before_completion();
+		test_present_drawable();
 		test_submitted_before_scheduled();
 		test_wait_until_scheduled_pumps();
 		test_completion_thread_stops();

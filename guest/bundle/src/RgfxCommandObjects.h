@@ -34,8 +34,8 @@
  * (RgfxCompletionThread) takes it, whether or not anything waits for the buffer;
  * `waitUntilCompleted` blocks until the thread has run the handlers, and takes the ring
  * itself only where no thread drives it (a unit test) or inside a handler.
- * `presentDrawable:` and the command-buffer-scope event ops wait on their own later
- * pieces (see the .mm).
+ * `presentDrawable:` and its variants present the drawable from a scheduled handler,
+ * unless the buffer failed by then (see the .mm).
  *
  * Our own ObjC++; the only Apple names are the real Metal protocols these conform to.
  */
