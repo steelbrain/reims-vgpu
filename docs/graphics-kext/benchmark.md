@@ -65,27 +65,39 @@ from a 20 s run (`-m 20 -v`) in each lane, with repetitions split by the per-sec
 - `frag.fill.2160p`: 156 of 161 and 159 of 160 (~2770 MHz);
 - `frag.alu.1080p`: mostly before the ramp in both lanes, so it is a low-clock number.
 
-The hold is the driver's P4 state. Measured 2026-11-03 with nvidia-smi sampling every 100 ms on
-the host, and its 1 s samples during the boots above:
-- **What P4 is.** Core at 1222 to 1447 MHz, memory at 9001 MHz and 31 to 55 W, with the SM 98 to
-  100% busy. P0 runs the core at 2767 to 2805 MHz and memory at 14001 MHz, at 107 to 120 W.
-- **What started it.** In a cold start sampled every 100 ms, the hold began 0.5 s after a
-  136.65 W spike over the part's 115 W cap, which nvidia-smi gave the "SW power cap" reason. It
-  lasted 6 s at 99 to 100% use before the driver went to P0. In the boots it lasted 1 to 8 s.
-- **No VM is needed.** That cold start was a host process with no VM. It ran the frame cases on
-  the Vulkan platform and made their targets as the decoder makes a guest's.
-- **What P4 costs.**
-  - `frag.fill.2160p` runs 125 to 134 Gpix/s in P4 and 255 at P0.
-  - `frag.alu.2160p` runs 256 to 303 fps in P4 and 485 to 493 at P0.
-  - Fill at P0 was the same whatever the target's image: fresh or recycled, at any offset in a
-    pooled block, in a block of its own, or without the usages the runtime adds where they are
-    free.
+The hold is the driver's power-capped state. Measured 2026-11-03 with nvidia-smi sampling every
+100 ms on the host, and its 1 s samples during the boots above:
+- **What it is.**
+  - The core clock is held at 1207 to 1477 MHz while the SM is 90 to 100% busy, at 31 to 103 W.
+  - Memory runs at 9001 MHz (the driver's P4), and nvidia-smi gives the "SW power cap" reason.
+    The part's cap is 115 W.
+  - Outside it, the core runs at 2.1 to 2.8 GHz under the same load.
+- **When it comes.**
+  - Started from idle, 2 of 8 host processes went into it 2.1 to 2.4 s into the load and stayed
+    6.0 to 6.8 s. In the other 6, the driver's P4 kept the core at 1755 to 2377 MHz.
+  - Under sustained load it came in each of 3 runs. It began 10.2 to 10.7 s into the load and
+    lasted 11 to 12 s.
+  - In the boots it lasted 1 to 8 s, at 1425 to 1447 MHz and 31 to 33 W.
+- **No VM is needed.** Those host processes ran no VM. They ran the frame cases on the Vulkan
+  platform and made their targets as the decoder makes a guest's.
+- **What it costs.** Both frame cases follow the core clock, not the memory clock.
+  - `frag.fill.2160p` runs:
+    - 769 to 858 fps (102 to 114 Gpix/s) at 1215 to 1267 MHz;
+    - about 1000 fps (134 Gpix/s) at 1425 to 1447 MHz in the boots;
+    - 1910 to 1950 fps (254 to 259 Gpix/s) at 2767 to 2782 MHz, with memory at 9001, 11001 or
+      14001 MHz alike.
+  - `frag.alu.2160p` runs 254 to 303 fps at 1215 to 1477 MHz, and 470 to 503 at 2.1 to 2.8 GHz.
+  - At the high clock, fill was the same whatever the target's image: fresh or recycled, at any
+    offset in a pooled block, in a block of its own, or without the usages the runtime adds
+    where they are free.
 - **What a 3 s case shows.**
-  - A case of 3 s (`-m 3`) lands in either state, depending on whether the hold has ended.
+  - A case of 3 s (`-m 3`) lands in either state.
   - In the boots that ran the three frame cases in a row for 3 s each, the `frag.alu` cases ran
-    at P4's rates in every sample. `frag.fill.2160p` landed in either state.
-  - Both lanes show it: ours at 132.76 (P4 throughout), 134.23 (P4 for 8 s) and 255.63 Gpix/s
-    (P0); paravirt at 257 (P4 for 1 s), 133.67 (P4 for 8 s) and 255.
+    at the low clock's rates in every sample. `frag.fill.2160p` landed in either state.
+  - Both lanes show it: ours at 132.76 (low clock throughout), 134.23 (low for 8 s) and 255.63
+    Gpix/s (high); paravirt at 257 (low for 1 s), 133.67 (low for 8 s) and 255.
+  - A warm-up does not avoid it. After 12 s of load, the fill case started inside the low clock
+    in 3 of 3 runs. Only the core clock sampled during a repetition says which state it ran in.
 
 ## Results
 
