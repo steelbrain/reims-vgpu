@@ -176,8 +176,9 @@ inline void *rgfxCacheReleasingSurface(RgfxCacheTable &t, uint64_t offset, bool 
 }
 
 // The flags of a cached block's BLOCK_RELEASE, its surface having `clients` clients left
-// (IOSurface's count, read as the release is posted): none, and no process can read its pages,
-// which the host then need not copy the cache into (RGFX_BLOCK_RELEASE_NO_CLIENT).
+// (IOSurface's count, read as the release is posted): none, RGFX_BLOCK_RELEASE_NO_CLIENT, which
+// the host only counts, copying the cache into the pages all the same (a mach port or an XPC
+// object holds a surface with no client, and whoever looks it up from one reads its pages).
 inline uint32_t rgfxCacheReleaseFlags(int32_t clients)
 {
 	return clients == 0 ? RGFX_BLOCK_RELEASE_NO_CLIENT : 0;

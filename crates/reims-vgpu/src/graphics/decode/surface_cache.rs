@@ -20,7 +20,9 @@
 //! - **Download.** The pages are written from the cache only at a `SURFACE_DOWNLOAD` (a CPU lock
 //!   after a GPU write), at the block's `BLOCK_RELEASE` and where the kext names the block's pages
 //!   again (`SURFACE_PAGES`), and only where a buffer that may write the surface was committed
-//!   since the cache was last copied either way.
+//!   since the cache was last copied either way. A release copies whether or not the surface has
+//!   a client left (`RGFX_BLOCK_RELEASE_NO_CLIENT` changes nothing): a mach port or an XPC object
+//!   holds a surface with no client, and the process that looks it up from one reads its pages.
 //! - **Order.** Fills and downloads run on the host's own transfer queue, in the order they are
 //!   asked, each after every command buffer that used the cache before it: each such buffer
 //!   signals its queue's end event as it ends, and the copy waits for the latest value of each
@@ -194,7 +196,8 @@ pub(crate) struct CacheCounts {
     /// Fills a device of the host's write over the pages asked, and downloads and releases of a
     /// written cache it kept from copying.
     pub(crate) host_writes: u64,
-    /// Releases of a written cache not copied, as no process could read the pages.
+    /// Releases of a written cache whose surface had no client left
+    /// (`RGFX_BLOCK_RELEASE_NO_CLIENT`), copied into the pages all the same.
     pub(crate) unread: u64,
 }
 
@@ -648,9 +651,11 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The block at `block` went (its `BLOCK_RELEASE`): its cache goes once the pages hold what a
-    /// buffer wrote of it, unless a device of the host wrote them since its last fill, or no
-    /// process can read them (`unread`: its surface has no client left); `done` then, at once
-    /// where nothing is to copy.
+    /// buffer wrote of it, unless a device of the host wrote them since its last fill; `done`
+    /// then, at once where nothing is to copy. A release whose surface had no client left
+    /// (`unread`, `RGFX_BLOCK_RELEASE_NO_CLIENT`) copies too: a surface with no client can still
+    /// be looked up again, from a mach port or an XPC object that holds it (how one process hands
+    /// a surface it drew to another), and the process that looks it up then reads the pages.
     pub(crate) fn released(
         &mut self,
         device: &P::Device,
@@ -660,10 +665,10 @@ impl<P: Platform> SurfaceCaches<P> {
     ) -> RaiseResult<()> {
         if !self.written_since_host(block) {
             done();
-        } else if unread {
-            self.counts.unread += 1;
-            done();
         } else {
+            if unread {
+                self.counts.unread += 1;
+            }
             self.write_back(device, block, done)?;
         }
         self.by_block.remove(&block);
@@ -1531,13 +1536,51 @@ mod tests {
         assert_eq!(r.dec.caches().counts().downloads, 1);
     }
 
-    /// A release of a written cache whose surface no process can read (its `BLOCK_RELEASE`'s
-    /// `RGFX_BLOCK_RELEASE_NO_CLIENT`) copies nothing and is done at once; the cache goes all the
-    /// same
+    /// A release of a written cache whose surface had no client left (its `BLOCK_RELEASE`'s
+    /// `RGFX_BLOCK_RELEASE_NO_CLIENT`) still copies the cache into the pages, and is done once
+    /// the copy is: a mach port or an XPC object holds such a surface, and the process that
+    /// looks it up reads the pages, or fills a new block's cache from them. Dropping the cache
+    /// there left the pages as they were before the GPU's write: a Dock icon showed the bytes the
+    /// pages held before (another app's icon) until it was drawn again
     #[test]
-    fn an_unread_release_copies_nothing() {
+    fn a_release_with_no_client_left_copies_what_was_written() {
         let mut r = cached();
+        let cache = cache_id(&r);
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let released = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&released);
+        let mark = r.p.call_log().mark();
+        r.dec.block_released(
+            &r.device,
+            BLOCK,
+            true,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
+        let copied = copies(&r.p.call_log().since(mark));
+        assert_eq!(copied.len(), 1, "the written cache is copied back");
+        assert_eq!(
+            copied[0].0, cache,
+            "out of the device cache, into the pages"
+        );
+        assert_eq!(r.dec.caches().len(), 0, "the cache goes with the block");
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the release waits for the copy"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(released.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.downloads, counts.unread), (1, 1));
+    }
+
+    /// A release with no client left of a cache nothing wrote copies nothing, as any release of
+    /// one does, and counts nothing
+    #[test]
+    fn a_release_with_no_client_left_of_an_unwritten_cache_copies_nothing() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
         r.p.world().complete_all(CompleteOn::Caller);
         let released = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&released);
@@ -1551,9 +1594,8 @@ mod tests {
         );
         assert!(released.load(Ordering::SeqCst), "done at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
-        assert_eq!(r.dec.caches().len(), 0);
         let counts = r.dec.caches().counts();
-        assert_eq!((counts.downloads, counts.unread), (0, 1));
+        assert_eq!((counts.downloads, counts.unread), (0, 0));
     }
 
     /// A block named again over the same pages keeps its cache, which its next use fills again;

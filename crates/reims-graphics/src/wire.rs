@@ -550,7 +550,7 @@ pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 /// has finished. Posted after every message the process posted before its free, and nothing the
 /// process posts after it can name the block. A block over an IOSurface's pages with a device
 /// cache has the cache copied into the pages first, where a command buffer wrote it since the last
-/// copy, unless [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says no process can read them.
+/// copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
 pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
 /// `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
 /// `context` the region block of `size` bytes at `offset`. Posted before the process learns of the
@@ -1196,9 +1196,11 @@ pub struct RgfxBlockRelease {
     pub size: u64,
 }
 
-/// [`RgfxBlockRelease::flags`]: the block's IOSurface has no client left, no process holding it,
-/// so no reader of its pages: the host drops the block's device cache with it, rather than
-/// copying what command buffers wrote of it into the pages first. Without it the host copies.
+/// [`RgfxBlockRelease::flags`]: the block's IOSurface had no client left, no process holding it,
+/// as the release was posted. The host copies the block's device cache into the pages all the
+/// same, and only counts it: a surface with no client can still be looked up again, from a mach
+/// port or an XPC object that holds it (how one process hands a surface it drew to another), and
+/// the process that looks it up reads the pages.
 pub const RGFX_BLOCK_RELEASE_NO_CLIENT: u32 = 1 << 0;
 
 /// A run of an IOSurface's guest RAM, which `SURFACE_PAGES` lists: `length` bytes at guest

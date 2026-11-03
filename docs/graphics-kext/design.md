@@ -447,9 +447,13 @@ Stages:
         into the pages where a buffer wrote it since the last copy, and a
         lock waits for the answer; the kext releases the device cache, then
         the surface, then unwires the memory. Where the surface has no
-        client left as the release is posted, no process can read its pages,
-        and the release says so (`RGFX_BLOCK_RELEASE_NO_CLIENT`): the host
-        drops the cache uncopied. The kext logs the dormant
+        client left as the release is posted, the release says so
+        (`RGFX_BLOCK_RELEASE_NO_CLIENT`), and the host copies all the same,
+        counting it: a mach port or an XPC object holds a surface with no
+        client, and a process that looks the surface up from one reads its
+        pages (a Dock icon showed another app's icon, the bytes its pages
+        held before the GPU drew it, while the host dropped such a cache
+        uncopied). The kext logs the dormant
         blocks' count and the let-gos by cause. Op 6, which IOSurface calls
         as a surface turns nonvolatile again, is answered as the AMD's driver
         does (a byte set to 0xff), so IOSurface answers the old state

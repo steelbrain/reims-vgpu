@@ -180,14 +180,14 @@ struct DormantStats {
 	UInt64 revived;
 	UInt64 letGo[kRgfxDormantCauses];
 	// Let go as their surface's cache was purged (op 5, a client of the surface going) with a
-	// cache the GPU wrote since its last copy: the host copies it into the pages, unless no
-	// client of the surface is left as the release is posted (`unread`).
+	// cache the GPU wrote since its last copy: the host copies it into the pages, whether or not
+	// a client of the surface is left as the release is posted (`unread`).
 	UInt64 purgedWritten;
 	// Let go past a cap, a table entry or the region's room, of a surface made volatile.
 	UInt64 volatileFirst;
 	// Blocks of cached surfaces released with no client of the surface left
 	// (RGFX_BLOCK_RELEASE_NO_CLIENT), and of them those whose cache a buffer wrote since its
-	// last copy, which the host then does not copy into the pages.
+	// last copy, which the host copies into the pages all the same.
 	UInt64 unread;
 	UInt64 unreadWritten;
 	UInt64 changes;
@@ -379,10 +379,11 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 			release.context = block.context;
 			release.offset = block.offset;
 			release.size = block.size;
-			// A cached surface with no client left has no process to read its pages, the
-			// kext's reference the last but IOSurface's own (the display pipe names a surface
-			// by its ID and holds none): its cache's writes need not reach them. Its clients
-			// are read here, out of every lock, as at a block's sleep.
+			// A cached surface with no client left is flagged so (RGFX_BLOCK_RELEASE_NO_CLIENT),
+			// which the host only counts: it copies the cache into the pages all the same, as a
+			// mach port or an XPC object holds a surface with no client, and the process that
+			// looks it up from one reads its pages. Its clients are read here, out of every
+			// lock, as at a block's sleep.
 			bool written = false;
 			if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
 				release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
