@@ -308,7 +308,8 @@ impl<S: SurfaceSource> Accelerator for VulkanH264<S> {
             })
             .collect();
         let used: Vec<i32> = references.iter().map(|&(slot, _)| slot).collect();
-        let setup_slot = free_slot(&used, session.slots())
+        let setup_slot = session
+            .free_slot(&used)
             .ok_or_else(|| Error::Unsupported("no DPB slot is free".into()))?;
 
         let mut picture_info = picture_info(params, slices);
@@ -443,12 +444,6 @@ fn renumber(
     u16::try_from(last).unwrap_or(u16::MAX)
 }
 
-/// The least slot below `max` that no reference holds.
-fn free_slot(used: &[i32], max: u32) -> Option<i32> {
-    let max = i32::try_from(max).unwrap_or(i32::MAX);
-    (0..max).find(|slot| !used.contains(slot))
-}
-
 /// A reference's std information: a frame, short-term with its
 /// `FrameNum` or long-term with its `LongTermFrameIdx`, and its order
 /// counts.
@@ -557,13 +552,6 @@ mod tests {
         let mut references = [short_term(65535), short_term(2)];
         assert_eq!(renumber(3, 16, &mut references), 65535);
         assert_eq!(numbers(&references), [65531, 65534]);
-    }
-
-    #[test]
-    fn a_picture_takes_the_least_slot_no_reference_holds() {
-        assert_eq!(free_slot(&[], 17), Some(0));
-        assert_eq!(free_slot(&[0, 1, 3], 17), Some(2));
-        assert_eq!(free_slot(&[0, 1], 2), None);
     }
 
     #[test]

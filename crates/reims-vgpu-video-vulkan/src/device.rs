@@ -452,6 +452,48 @@ impl VideoDevice {
         self.unified_layouts
     }
 
+    /// Whether `physical_device` lists `VK_KHR_unified_image_layouts` and
+    /// reports both its features, `unifiedImageLayouts` and
+    /// `unifiedImageLayoutsVideo`: for an owner that enables them where
+    /// the device has them, what [`RawDevice::unified_image_layouts_video`]
+    /// then is.
+    pub fn reports_unified_image_layouts_video(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> bool {
+        // SAFETY: the physical device is the instance's.
+        let listed = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .is_ok_and(|extensions| {
+                extensions.iter().any(|extension| {
+                    extension.extension_name_as_c_str() == Ok(UNIFIED_IMAGE_LAYOUTS)
+                })
+            });
+        if !listed {
+            return false;
+        }
+        let mut unified = UnifiedImageLayoutsFeatures::new(false);
+        let mut features = vk::PhysicalDeviceFeatures2 {
+            p_next: std::ptr::from_mut(&mut unified).cast(),
+            ..vk::PhysicalDeviceFeatures2::default()
+        };
+        // SAFETY: as above; the device lists the extension whose structure
+        // is chained, which lives and is writable through the call.
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+        unified.unified_image_layouts == vk::TRUE && unified.unified_image_layouts_video == vk::TRUE
+    }
+
+    /// Whether a session's decodes run beside the copies out of earlier
+    /// pictures: where decoded images stay in `GENERAL`
+    /// ([`Self::unified_image_layouts`]), so that a copy changes no layout
+    /// a decode reads, and the copies run on a queue of the decoders' own.
+    /// A decode then waits only for the copies out of the images it
+    /// writes, and the batch that ends a decode's work for its owner
+    /// ([`Self::signal_after_decode`]) goes on the copy queue. Elsewhere
+    /// each decode waits for the copy before it.
+    pub fn overlaps_copies(&self) -> bool {
+        self.unified_layouts && matches!(self.copy_queue, CopyQueue::Own(_))
+    }
+
     /// The codec operations decoders on it decode: `DECODE_H264`, with
     /// `DECODE_H265` where the device was made for it.
     pub fn codecs(&self) -> vk::VideoCodecOperationFlagsKHR {
@@ -566,6 +608,25 @@ impl VideoDevice {
             .wait_semaphore_infos(waits)
             .signal_semaphore_infos(signals)];
         self.submit_decode(&submits)
+    }
+
+    /// Submits a batch of no work that waits for `waits` and then signals
+    /// `signals`, as [`Self::signal_on_decode_queue`] does, on the queue
+    /// whose work ends a decoder's: the copy queue where decodes run beside
+    /// the copies ([`Self::overlaps_copies`]), so that a wait for a copy's
+    /// value holds no later decode back, else the decode queue.
+    pub fn signal_after_decode(
+        &self,
+        waits: &[vk::SemaphoreSubmitInfo<'_>],
+        signals: &[vk::SemaphoreSubmitInfo<'_>],
+    ) -> Result<(), Error> {
+        if !self.overlaps_copies() {
+            return self.signal_on_decode_queue(waits, signals);
+        }
+        let submits = [vk::SubmitInfo2::default()
+            .wait_semaphore_infos(waits)
+            .signal_semaphore_infos(signals)];
+        self.submit_copy(&submits, vk::Fence::null())
     }
 
     /// Submits to the copy queue, with `fence`.

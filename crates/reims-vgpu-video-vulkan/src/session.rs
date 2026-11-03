@@ -9,9 +9,9 @@
 //! profile's format (NV12, or P010 at 10 bits), so that a
 //! reference is never an output: a guest recycles an output once it has
 //! shown it, whether or not the picture is still a reference. Each decode
-//! sets up the least slot no reference holds, and takes its picture from
-//! `UNDEFINED`. With unified layouts every DPB picture stays in `GENERAL`;
-//! without, in `VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR`.
+//! sets up a slot no reference holds ([`CopyOrder::free_slot`]), and takes
+//! its picture from `UNDEFINED`. With unified layouts every DPB picture
+//! stays in `GENERAL`; without, in `VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR`.
 //!
 //! **Outputs.** Where the device decodes into an output beside the DPB
 //! picture (`DPB_AND_OUTPUT_DISTINCT`), the decode writes an output image.
@@ -21,9 +21,21 @@
 //! its DPB picture where the two coincide, else out of the session's
 //! scratch image, which the decode writes. A copy runs in the decode's own
 //! command buffer where the decode family copies, else on the copy queue
-//! behind the decode's value, signalling the next, which the following
-//! decode waits for before it writes an image again. Every output image is
+//! behind the decode's value, signalling the next. Every output image is
 //! left in `GENERAL`.
+//!
+//! **Order.** A later decode may write the image a copy on the copy queue
+//! reads ([`CopyOrder`]). Where decodes overlap copies
+//! ([`VideoDevice::overlaps_copies`]: unified layouts, so that no copy
+//! changes the layout of a picture a decode reads, and copies on a queue of
+//! the decoders' own), a decode waits only for the last copy out of the
+//! image it writes, sets up the free slot copied out of longest ago, in a
+//! session of one more slot where the device has it, and so runs while the
+//! copy before it does. As the timeline's values must be signalled in
+//! their order, a decode's value is then signalled by a batch of no work
+//! after it on the decode queue, which waits for the copy before it too.
+//! Elsewhere each decode waits for the last copy, and sets up the least
+//! free slot.
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -329,13 +341,114 @@ pub(crate) fn buffer_regions(
     ]
 }
 
-/// What a copy reads: an image of the session's, in `layout`, which it
-/// returns to where `restore` says.
+/// What a copy reads: an image of the session's, `read`, in `layout`,
+/// which it returns to where `restore` says.
 #[derive(Clone, Copy)]
 struct CopySource {
     image: vk::Image,
+    read: CopyRead,
     layout: vk::ImageLayout,
     restore: bool,
+}
+
+/// What a copy out on the copy queue reads: a DPB slot's picture, or the
+/// scratch image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyRead {
+    Slot(i32),
+    Scratch,
+}
+
+/// How a session's decodes are ordered against the copies out on the copy
+/// queue, by the values of the session's timeline those copies signal
+/// (the module doc). Where decodes overlap copies
+/// ([`VideoDevice::overlaps_copies`]), a decode waits only for the last
+/// copy out of the image it writes, sets up the free slot whose last copy
+/// is the oldest, and has its value signalled after the copy before it,
+/// so that the timeline's values are signalled in their order though a
+/// decode may end before the copy before it. Elsewhere each decode waits
+/// for the last copy, and sets up the least free slot.
+#[derive(Debug)]
+pub(crate) struct CopyOrder {
+    overlap: bool,
+    /// The value the last copy signals; 0 before one.
+    last: u64,
+    /// By slot: the value the last copy out of its picture signals; 0
+    /// before one.
+    slots: Vec<u64>,
+    /// The scratch image's.
+    scratch: u64,
+}
+
+impl CopyOrder {
+    /// The order of a session of `slots` DPB slots, its decodes overlapping
+    /// its copies where `overlap`.
+    pub(crate) fn new(overlap: bool, slots: u32) -> Self {
+        Self {
+            overlap,
+            last: 0,
+            slots: vec![0; usize::try_from(slots).unwrap_or(0)],
+            scratch: 0,
+        }
+    }
+
+    /// The value a decode waits for before it starts, 0 for none: one that
+    /// sets up `slot`, and writes the scratch image where `scratch`.
+    pub(crate) fn before_decode(&self, slot: i32, scratch: bool) -> u64 {
+        if !self.overlap {
+            return self.last;
+        }
+        let slot = usize::try_from(slot)
+            .ok()
+            .and_then(|slot| self.slots.get(slot))
+            .copied()
+            // A slot past the session's is refused before it is submitted.
+            .unwrap_or(self.last);
+        if scratch {
+            slot.max(self.scratch)
+        } else {
+            slot
+        }
+    }
+
+    /// The value a decode's own value is signalled after, in a batch of its
+    /// own: the last copy's, where decodes overlap copies and one was
+    /// submitted; `None` where the decode's submission signals it.
+    pub(crate) fn before_signal(&self) -> Option<u64> {
+        (self.overlap && self.last > 0).then_some(self.last)
+    }
+
+    /// A copy out of `read` was submitted, signalling `landed`.
+    pub(crate) fn copied(&mut self, read: CopyRead, landed: u64) {
+        self.last = landed;
+        match read {
+            CopyRead::Scratch => self.scratch = landed,
+            CopyRead::Slot(slot) => {
+                if let Some(at) = usize::try_from(slot)
+                    .ok()
+                    .and_then(|slot| self.slots.get_mut(slot))
+                {
+                    *at = landed;
+                }
+            }
+        }
+    }
+
+    /// The slot a decode sets up whose references hold `used`: the least
+    /// free one, or, where decodes overlap copies, the free one whose last
+    /// copy is the oldest (the least of those). `None` where every slot is
+    /// held.
+    pub(crate) fn free_slot(&self, used: &[i32]) -> Option<i32> {
+        let free = (0i32..)
+            .zip(&self.slots)
+            .filter(|(slot, _)| !used.contains(slot));
+        if self.overlap {
+            free.min_by_key(|&(_, &copied)| copied)
+                .map(|(slot, _)| slot)
+        } else {
+            free.map(|(slot, _)| slot).next()
+        }
+    }
 }
 
 /// One stream's session, its parameters object a `P`.
@@ -363,9 +476,8 @@ pub(crate) struct Session<P: SessionParameters> {
     /// The copy queue's, where copies run on it rather than the decode
     /// queue.
     copy_pool: vk::CommandPool,
-    /// The value the last copy on the copy queue signals, which the next
-    /// decode waits for; 0 before one.
-    last_copy: u64,
+    /// The copies out on the copy queue that each decode waits for.
+    order: CopyOrder,
     /// Submissions whose work may be in flight, oldest first.
     busy: VecDeque<Submission>,
     /// Submissions whose work is done.
@@ -505,7 +617,10 @@ enum After {
 impl<P: SessionParameters> Session<P> {
     /// A session for frames of `extent` whose stream holds `references`
     /// references at most, of `caps`'s profile: a DPB slot for each
-    /// reference and one for the picture being decoded.
+    /// reference and one for the picture being decoded, and, where its
+    /// decodes overlap its copies ([`VideoDevice::overlaps_copies`]) and the
+    /// device has the slot, one more, so that a picture no later one
+    /// references leaves a slot free beside its own while it is copied out.
     pub(crate) fn new(
         device: &Arc<VideoDevice>,
         timeline: &Arc<Timeline>,
@@ -513,12 +628,16 @@ impl<P: SessionParameters> Session<P> {
         extent: vk::Extent2D,
         references: u32,
     ) -> Result<Self, Error> {
-        let slots = references.saturating_add(1);
+        let mut slots = references.saturating_add(1);
         if slots > caps.max_dpb_slots || references > caps.max_active_reference_pictures {
             return Err(Error::Unsupported(format!(
                 "{references} references: the device has {} DPB slots and {} active references",
                 caps.max_dpb_slots, caps.max_active_reference_pictures
             )));
+        }
+        let overlap = device.overlaps_copies();
+        if overlap && slots < caps.max_dpb_slots {
+            slots += 1;
         }
         let mut session = Self {
             device: Arc::clone(device),
@@ -534,7 +653,7 @@ impl<P: SessionParameters> Session<P> {
             reset: false,
             pool: vk::CommandPool::null(),
             copy_pool: vk::CommandPool::null(),
-            last_copy: 0,
+            order: CopyOrder::new(overlap, slots),
             busy: VecDeque::new(),
             free: Vec::new(),
         };
@@ -581,6 +700,12 @@ impl<P: SessionParameters> Session<P> {
     /// The DPB slots the session has.
     pub(crate) fn slots(&self) -> u32 {
         u32::try_from(self.dpb.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The slot a picture whose references hold `used` is set up in
+    /// ([`CopyOrder::free_slot`]); `None` where every slot is held.
+    pub(crate) fn free_slot(&self, used: &[i32]) -> Option<i32> {
+        self.order.free_slot(used)
     }
 
     /// The parameters object a picture needs: the one the session has,
@@ -803,6 +928,7 @@ impl<P: SessionParameters> Session<P> {
                     .ok_or_else(|| Error::Unsupported("no scratch image".into()))?;
                 let source = CopySource {
                     image: scratch.image,
+                    read: CopyRead::Scratch,
                     layout: decode_output_layout,
                     restore: false,
                 };
@@ -811,6 +937,7 @@ impl<P: SessionParameters> Session<P> {
             (false, _) => {
                 let source = CopySource {
                     image: setup_image,
+                    read: CopyRead::Slot(decode.setup_slot),
                     layout: dpb_layout,
                     restore: true,
                 };
@@ -966,23 +1093,20 @@ impl<P: SessionParameters> Session<P> {
         unsafe { device.end_command_buffer(command) }.named("vkEndCommandBuffer")?;
 
         // A copy on the copy queue may still read an image this decode
-        // writes again.
+        // writes again ([`CopyOrder`]).
         let value = self.timeline.next();
+        let writes_scratch = copy.is_some_and(|source| source.read == CopyRead::Scratch);
+        let before = self.order.before_decode(decode.setup_slot, writes_scratch);
         let waits = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.timeline.semaphore())
-            .value(self.last_copy)
+            .value(before)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let waits = if self.last_copy > 0 {
-            &waits[..]
-        } else {
-            &[][..]
-        };
+        let waits = if before > 0 { &waits[..] } else { &[][..] };
         submit(
             &self.device,
             &self.timeline,
-            submission.command,
-            waits,
-            value,
+            (submission.command, waits),
+            (value, self.order.before_signal()),
             Queue::Decode,
         )?;
         self.reset = true;
@@ -1004,12 +1128,11 @@ impl<P: SessionParameters> Session<P> {
         submit(
             &self.device,
             &self.timeline,
-            copy,
-            &waits,
-            landed,
+            (copy, &waits),
+            (landed, None),
             Queue::Copy,
         )?;
-        self.last_copy = landed;
+        self.order.copied(source.read, landed);
         Ok(landed)
     }
 
@@ -1346,27 +1469,48 @@ enum Queue {
 }
 
 /// Submits `command` to `queue` after `waits`, signalling the timeline's
-/// `value`, which it records as submitted.
+/// `value`, which it records as submitted: in the command's own batch, or,
+/// where `after` names a value of the timeline, in a batch of no work
+/// after it that waits for that value too, so that `value` is signalled
+/// after `after` ([`CopyOrder::before_signal`]).
 fn submit(
     device: &VideoDevice,
     timeline: &Timeline,
-    command: vk::CommandBuffer,
-    waits: &[vk::SemaphoreSubmitInfo<'_>],
-    value: u64,
+    (command, waits): (vk::CommandBuffer, &[vk::SemaphoreSubmitInfo<'_>]),
+    (value, after): (u64, Option<u64>),
     queue: Queue,
 ) -> Result<(), Error> {
     let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
-    let signals = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(timeline.semaphore())
-        .value(value)
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let submits = [vk::SubmitInfo2::default()
+    let signal = |value| {
+        [vk::SemaphoreSubmitInfo::default()
+            .semaphore(timeline.semaphore())
+            .value(value)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+    };
+    let signals = signal(value);
+    let after = after.map(signal);
+    let work = vk::SubmitInfo2::default()
         .command_buffer_infos(&commands)
-        .wait_semaphore_infos(waits)
-        .signal_semaphore_infos(&signals)];
+        .wait_semaphore_infos(waits);
+    let (one, two);
+    let submits: &[vk::SubmitInfo2<'_>] = match &after {
+        None => {
+            one = [work.signal_semaphore_infos(&signals)];
+            &one
+        }
+        Some(after) => {
+            two = [
+                work,
+                vk::SubmitInfo2::default()
+                    .wait_semaphore_infos(after)
+                    .signal_semaphore_infos(&signals),
+            ];
+            &two
+        }
+    };
     match queue {
-        Queue::Decode => device.submit_decode(&submits)?,
-        Queue::Copy => device.submit_copy(&submits, vk::Fence::null())?,
+        Queue::Decode => device.submit_decode(submits)?,
+        Queue::Copy => device.submit_copy(submits, vk::Fence::null())?,
     }
     timeline.submitted(value);
     Ok(())
@@ -1593,5 +1737,213 @@ mod tests {
         assert_eq!(range, 23);
         // An alignment of 0 is taken as 1.
         assert_eq!(slice_layout(&slices, 0).unwrap().1, 23);
+    }
+
+    #[test]
+    fn a_picture_takes_the_least_slot_no_reference_holds_where_decodes_wait_for_copies() {
+        assert_eq!(CopyOrder::new(false, 17).free_slot(&[]), Some(0));
+        assert_eq!(CopyOrder::new(false, 17).free_slot(&[0, 1, 3]), Some(2));
+        assert_eq!(CopyOrder::new(false, 2).free_slot(&[0, 1]), None);
+        // Whatever the copies: each decode waits for the last.
+        let mut order = CopyOrder::new(false, 4);
+        order.copied(CopyRead::Slot(0), 2);
+        order.copied(CopyRead::Slot(1), 4);
+        assert_eq!(order.free_slot(&[1]), Some(0));
+        assert_eq!(
+            (order.before_decode(2, false), order.before_signal()),
+            (4, None)
+        );
+    }
+
+    #[test]
+    fn where_decodes_overlap_copies_a_decode_waits_for_what_reads_its_images() {
+        let mut order = CopyOrder::new(true, 4);
+        assert_eq!(
+            (order.before_decode(0, true), order.before_signal()),
+            (0, None)
+        );
+        order.copied(CopyRead::Slot(0), 2);
+        order.copied(CopyRead::Slot(1), 4);
+        order.copied(CopyRead::Scratch, 6);
+        assert_eq!(order.before_decode(0, false), 2);
+        assert_eq!(order.before_decode(2, false), 0);
+        assert_eq!(order.before_decode(2, true), 6);
+        assert_eq!(order.before_signal(), Some(6));
+        // The free slot copied out of longest ago, the least of those.
+        assert_eq!(order.free_slot(&[]), Some(2));
+        assert_eq!(order.free_slot(&[2, 3]), Some(0));
+        assert_eq!(order.free_slot(&[0, 2, 3]), Some(1));
+        assert_eq!(order.free_slot(&[0, 1, 2, 3]), None);
+    }
+
+    /// Work on a fake GPU's queue.
+    #[derive(Clone, Copy)]
+    enum Work {
+        Decode(i32),
+        Copy(i32),
+        Nothing,
+    }
+
+    /// A batch on a fake GPU's queue: its work and how many ticks it
+    /// takes, the timeline value it waits for (0: none) and the one it
+    /// signals.
+    #[derive(Clone, Copy)]
+    struct Batch {
+        work: Work,
+        ticks: u64,
+        wait: u64,
+        signal: Option<u64>,
+    }
+
+    /// What a stream's decodes did on a fake GPU.
+    #[derive(Debug, Default, PartialEq)]
+    struct Run {
+        /// Ticks the decode queue sat between one decode's end and the
+        /// next one's start.
+        idle: u64,
+        /// Signals of a value the timeline was already past, which Vulkan
+        /// forbids.
+        out_of_order: usize,
+        /// Decodes that started on a slot a copy still read.
+        overwritten: usize,
+    }
+
+    /// Twelve pictures, every third a reference that the next two
+    /// references keep, each set up as `CopyOrder` chooses on a session
+    /// of two references' slots and one more (and the overlapping
+    /// session's extra slot), submitted as `record_and_submit` submits
+    /// them, a decode's value signalled after the copy before it only
+    /// where `in_order`, run on a fake GPU: a decode queue and a copy
+    /// queue that each start their next batch once the batch before it
+    /// ended and the timeline is at its wait. A decode takes 10 ticks and
+    /// picture `i`'s copy `copy_ticks(i)`.
+    fn run(overlap: bool, in_order: bool, copy_ticks: impl Fn(usize) -> u64) -> Run {
+        let mut order = CopyOrder::new(overlap, 3 + u32::from(overlap));
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        let mut next = 1;
+        let mut held: Vec<i32> = Vec::new();
+        for i in 0..12 {
+            let slot = order.free_slot(&held).unwrap();
+            let value = next;
+            let after = order.before_signal().filter(|_| in_order);
+            queues[0].push_back(Batch {
+                work: Work::Decode(slot),
+                ticks: 10,
+                wait: order.before_decode(slot, false),
+                signal: if after.is_some() { None } else { Some(value) },
+            });
+            if let Some(after) = after {
+                queues[0].push_back(Batch {
+                    work: Work::Nothing,
+                    ticks: 0,
+                    wait: after,
+                    signal: Some(value),
+                });
+            }
+            let landed = value + 1;
+            next = landed + 1;
+            queues[1].push_back(Batch {
+                work: Work::Copy(slot),
+                ticks: copy_ticks(i),
+                wait: value,
+                signal: Some(landed),
+            });
+            order.copied(CopyRead::Slot(slot), landed);
+            if i % 3 == 0 {
+                held.push(slot);
+                if held.len() > 2 {
+                    held.remove(0);
+                }
+            }
+        }
+
+        let mut run = Run::default();
+        let mut timeline = 0;
+        let signal = |timeline: &mut u64, run: &mut Run, value: Option<u64>| {
+            if let Some(value) = value {
+                if value <= *timeline {
+                    run.out_of_order += 1;
+                } else {
+                    *timeline = value;
+                }
+            }
+        };
+        let mut busy: [Option<(Batch, u64)>; 2] = [None, None];
+        let mut reading: Vec<i32> = Vec::new();
+        let mut decoded_at: Option<u64> = None;
+        for tick in 0..10_000 {
+            for running in &mut busy {
+                if let Some((batch, end)) = *running
+                    && end == tick
+                {
+                    signal(&mut timeline, &mut run, batch.signal);
+                    match batch.work {
+                        Work::Decode(_) => decoded_at = Some(tick),
+                        Work::Copy(slot) => reading.retain(|&s| s != slot),
+                        Work::Nothing => {}
+                    }
+                    *running = None;
+                }
+            }
+            // A batch of no work ends as it starts.
+            let mut started = true;
+            while started {
+                started = false;
+                for (queue, running) in busy.iter_mut().enumerate() {
+                    let Some(&batch) = queues[queue].front() else {
+                        continue;
+                    };
+                    if running.is_some() || batch.wait > timeline {
+                        continue;
+                    }
+                    queues[queue].pop_front();
+                    started = true;
+                    match batch.work {
+                        Work::Decode(slot) => {
+                            run.overwritten += usize::from(reading.contains(&slot));
+                            run.idle += decoded_at.map_or(0, |at| tick - at);
+                        }
+                        Work::Copy(slot) => reading.push(slot),
+                        Work::Nothing => {}
+                    }
+                    if batch.ticks == 0 {
+                        signal(&mut timeline, &mut run, batch.signal);
+                    } else {
+                        *running = Some((batch, tick + batch.ticks));
+                    }
+                }
+            }
+            if busy.iter().all(Option::is_none) && queues.iter().all(VecDeque::is_empty) {
+                return run;
+            }
+        }
+        panic!("the fake GPU's queues hung");
+    }
+
+    #[test]
+    fn where_decodes_overlap_copies_the_decode_queue_never_waits_for_a_copy() {
+        // Each decode waits for the copy before it: the copy's 3 ticks
+        // between each two decodes.
+        let waiting = Run {
+            idle: 3 * 11,
+            ..Run::default()
+        };
+        assert_eq!(run(false, true, |_| 3), waiting);
+        // Overlapping, none: no decode sets up a slot a copy reads.
+        assert_eq!(run(true, true, |_| 3), Run::default());
+    }
+
+    #[test]
+    fn where_decodes_overlap_copies_the_timeline_is_signalled_in_order() {
+        // A copy slower than the next decode (picture 4's): the decode
+        // after it waits for its value to be signalled after the copy's,
+        // and none sets up a slot the copy still reads.
+        let slow = |i| if i == 4 { 25 } else { 3 };
+        let overlapped = run(true, true, slow);
+        assert_eq!((overlapped.out_of_order, overlapped.overwritten), (0, 0));
+        assert!(overlapped.idle > 0);
+        // Had the decode signalled its own value, the timeline would have
+        // been signalled out of order.
+        assert!(run(true, false, slow).out_of_order > 0);
     }
 }

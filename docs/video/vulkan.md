@@ -97,8 +97,10 @@ P010 (`VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16`) for Main 10,
 optimally tiled, their extent the coded size rounded up to the profile's
 `pictureAccessGranularity`, with the stream's
 profile in a `VkVideoProfileListInfoKHR`. Each decode sets up the least
-slot no reference holds, its DPB picture taken from `UNDEFINED`; with
-unified layouts every DPB picture stays in `GENERAL`, else in
+slot no reference holds, or, where decodes overlap copies (Synchronization,
+below), the free slot copied out of longest ago, in a session of one more
+slot where the device has it. Its DPB picture is taken from `UNDEFINED`.
+With unified layouts every DPB picture stays in `GENERAL`, else in
 `VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR`.
 
 Each picture lands in an output its `SurfaceSource` gives
@@ -231,7 +233,17 @@ padded to its size alignment, else the slices are copied.
 Each decode signals the decoder's timeline semaphore with the next value.
 A copy on the copy queue waits for its decode's value and signals the
 next, and the decode after it waits for that copy, since it may set the
-same DPB picture up again. A picture names the value after which its
+same DPB picture up again. Where the device keeps decoded images in one
+layout (`unifiedImageLayoutsVideo`) and the copies run on a queue of the
+decoders' own (`VideoDevice::overlaps_copies`), no copy changes a layout a
+decode reads, so a decode waits only for the last copy out of the DPB
+picture (or scratch image) it writes, and runs while the copy before it
+does. The timeline's values must still be signalled in their order, so
+the decode's own value is then signalled by a batch of no work after it on
+the decode queue that also waits for the copy before it, and a caller's
+signal after a decode (`VideoDevice::signal_after_decode`) goes on the copy
+queue, behind the copy, rather than hold the decode queue's next decode
+back. A picture names the value after which its
 output holds it (`Picture::value`): its decode's where the decode or a
 copy in its own command buffer writes the output, its copy's where the
 copy queue does. On a lent queue, which the owner's own work also runs

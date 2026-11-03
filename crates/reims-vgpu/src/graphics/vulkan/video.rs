@@ -40,10 +40,18 @@
 //!     the planes are held.
 //! - **Order.** A decode starts as the host takes the command buffer that encodes it, after the
 //!   session's earlier decodes on the same queue. The session's shared event, which the command
-//!   buffer waits for, is then signalled by a submission of no work on the decode queue that
-//!   waits for the decode ([`VideoDevice::signal_on_decode_queue`]), its signal reserved with the
+//!   buffer waits for, is then signalled by a submission of no work that waits for the decode
+//!   and its copy out ([`VideoDevice::signal_after_decode`]), its signal reserved with the
 //!   runtime (`SharedEvent::reserve_vk_signal`); where that submission fails, the host signals
 //!   it, so the command buffer goes on.
+//! - **Decodes beside copies.** Where the device has `VK_KHR_unified_image_layouts`'s
+//!   `unifiedImageLayoutsVideo`, which the platform enables where it is there
+//!   (`VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION`), the decoders keep their pictures in `GENERAL`;
+//!   with the copies on the reserved queue, a decode then waits only for the copy out of the DPB
+//!   picture it sets up again, and the event's signal goes on the reserved queue behind the
+//!   copy, so the decode queue runs the next decode while a picture is copied out
+//!   ([`VideoDevice::overlaps_copies`]). Elsewhere each decode waits for the copy before it, and
+//!   the signal goes on the decode queue.
 
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
@@ -70,7 +78,9 @@ use reims_vgpu_video_vulkan::{
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 use reims_vgpu_vulkan::gpu::event::VulkanSharedEvent;
-use reims_vgpu_vulkan::platform::{VIDEO_DECODE_EXTENSIONS, VIDEO_DECODE_H265_EXTENSION};
+use reims_vgpu_vulkan::platform::{
+    VIDEO_DECODE_EXTENSIONS, VIDEO_DECODE_H265_EXTENSION, VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION,
+};
 
 use crate::graphics::decode::{
     GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane, op_fault,
@@ -223,7 +233,14 @@ impl DeviceVideo {
             copy_family: reserved.map_or(queue.family, |reserved| reserved.family),
             copy_queue: reserved.map_or(queue.queue, |reserved| reserved.queue),
             graphics_family: handles.queue_family,
-            unified_image_layouts_video: false,
+            // The platform enables the extension, and its video feature where the device has it,
+            // wherever it is there.
+            unified_image_layouts_video: raw
+                .enables_extension(VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION)
+                && VideoDevice::reports_unified_image_layouts_video(
+                    handles.instance,
+                    handles.physical_device,
+                ),
         };
         let caches = reserved.is_some() || lent.is_some();
         let copy_queue = match (reserved, &lent) {
@@ -265,10 +282,17 @@ impl DeviceVideo {
         let h265 = h265_capabilities(&video);
         log::info!(
             "hardware video: H.264{} decode on {}, queue family {}, its pictures copied out on \
-             {copy_queue}, family {copy_family}",
+             {copy_queue}, family {copy_family}{}",
             if h265.is_empty() { "" } else { " and HEVC" },
             video.name(),
-            queue.family
+            queue.family,
+            if video.overlaps_copies() {
+                ", beside the decodes (unified image layouts)"
+            } else if video.unified_image_layouts() {
+                " (unified image layouts)"
+            } else {
+                ""
+            }
         );
         Some(Self {
             video,
@@ -620,7 +644,7 @@ impl DecodeSession {
             waits.push(wait(semaphore, after));
         }
         let signals = [wait(semaphore, counter)];
-        let Err(error) = self.video.video.signal_on_decode_queue(&waits, &signals) else {
+        let Err(error) = self.video.video.signal_after_decode(&waits, &signals) else {
             return Ok(());
         };
         log::error!("hardware video: the event's signal was not submitted ({error})");

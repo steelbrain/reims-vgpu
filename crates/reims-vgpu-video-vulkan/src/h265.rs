@@ -18,9 +18,12 @@
 //! current one or one kept for later pictures (`RefPicSetStFoll`,
 //! `RefPicSetLtFoll`), goes to the decode as a reference with the slot its
 //! decode set up, so that it keeps its slot while it is a reference; the
-//! picture takes the least slot none of them holds. The session has the
-//! DPB's `sps_max_dec_pic_buffering_minus1 + 1` slots, which the codec
-//! crate holds the set's pictures beside the current one to (C.5.2.2).
+//! picture takes a slot none of them holds, the session's choice
+//! (`Session::free_slot`: the least, or, where decodes overlap copies, the
+//! one copied out of longest ago). The session has the DPB's
+//! `sps_max_dec_pic_buffering_minus1 + 1` slots, which the codec crate
+//! holds the set's pictures beside the current one to (C.5.2.2), and one
+//! more where decodes overlap copies and the device has it.
 //! A picture held only for output is no reference and holds no slot: its
 //! output was written when it was decoded.
 
@@ -333,7 +336,12 @@ impl<S: SurfaceSource> Accelerator for VulkanH265<S> {
                 "an H.265 picture in another session".into(),
             ));
         };
-        let plan = plan(params, |p: &Self::Picture| p.slot(), session.slots())?;
+        let mut plan = plan(params, |p: &Self::Picture| p.slot(), session.slots())?;
+        // The session's choice among the slots no reference holds, which is
+        // the plan's own where its decodes wait for every copy.
+        plan.setup_slot = session
+            .free_slot(&plan.reference_slots)
+            .ok_or_else(|| Error::Unsupported("no DPB slot is free".into()))?;
         let (sps, pps) = (params.sps, params.pps);
         let parameters = session.parameters(
             |sets| sets.holds(sps, pps),
