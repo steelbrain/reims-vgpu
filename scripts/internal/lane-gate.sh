@@ -282,8 +282,12 @@ do_ship() {  # the gate's own scripts, which the host's steps run
   # run a boot used in the last two hours (a detached bench leg may still wait its turn).
   msi "mkdir -p '$MR/bin' && ls -1dt '$MSI_GATE/runs'/*/ | tail -n +6 | while read -r d; do
     [ -n \"\$(find \"\$d\" -mmin -120 -print -quit)\" ] || rm -rf \"\$d\"; done"
+  # Each script replaces the old one by a rename, never in place: a detached bench leg may be
+  # running the old one, and bash reads a script as it runs it.
+  msi "rm -rf '$MR/bin/.incoming' && mkdir -p '$MR/bin/.incoming'"
   scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-publish.sh" \
-    "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/"
+    "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
+  msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
 }
 do_corpus() {  # the decode streams, copied once from the configured source
   local names
@@ -377,6 +381,8 @@ do_boot() {
   if [[ $mode == bench ]]; then
     excl=1 hold=$HOLD_S ph="info idle bench present decodefps final" pres=10
   fi
+  # The guest runner and its files as the gate has them now (a resumed run keeps its tools).
+  cp "$L/guest/"* "$ART/payload/"
   msi "rm -rf '$out' && mkdir -p '$out' && { [ -d '$MR/payload' ] || exit 0; rm -rf '$MR/payload'; }"
   scp -q -r "$ART/payload" "$MSI:$MR/payload"
   msi "cat > '$out/boot.env'" << EOF

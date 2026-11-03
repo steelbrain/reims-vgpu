@@ -237,8 +237,10 @@ class Run:
             self.litem("host.same-boot-accel", "PASS" if kv["first_boot_accel"] == "1" else "FAIL",
                       "our Metal device on the first boot" if kv["first_boot_accel"] == "1"
                       else "no Metal device of ours until a reboot")
-        # The guest's capture of its screen at the end (a failed capture is the guest's own item).
-        if "desktop_colours" in kv:
+        # The guest's screenshot of its screen at the end (msi-boot.sh).
+        if kv.get("desktop_capture") == "none":
+            self.litem("guest.desktop-capture", "FAIL", "the guest saved no screenshot for Command-Shift-3")
+        elif "desktop_colours" in kv:
             colours = int(kv["desktop_colours"] or 0)
             top = float(kv.get("desktop_top_share", "1") or 1)
             self.litem("guest.desktop-capture", "PASS" if colours >= 64 and top <= 0.5 else "FAIL",

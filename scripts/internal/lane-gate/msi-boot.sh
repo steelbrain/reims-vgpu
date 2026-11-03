@@ -170,14 +170,31 @@ timeout "$(( $(left) - 40 ))" sshpass -p "$GUEST_PASS" ssh -n -p "$PORT" "${SOPT
 kv guest_rc "${PIPESTATUS[0]}"
 log "guest run done"
 
-# The guest's own capture of its screen (guest-run.sh's final phase): QEMU's screendump shows only
-# its placeholder, since reims-graphics-pci's frames go to the library's window.
+# The screen as WindowServer composed it, read back by the guest: the screenshot a person takes
+# with Command-Shift-3, the keys sent over QMP to the guest's keyboard. The system's screenshot
+# needs no screen-recording grant, which the lane's SIP-on guests cannot give a tool run over SSH,
+# and QEMU's screendump shows nothing of reims-graphics-pci, whose frames go to the library's
+# window.
 rm -f "$R/desktop.png"
-if Gcp "$GUEST_USER@127.0.0.1:lane-gate/desktop.png" "$R/desktop.png" 2> /dev/null && [[ -s $R/desktop.png ]]; then
+G 'defaults write com.apple.screencapture show-thumbnail -bool false; touch ~/lane-gate/.before-shot' 2> /dev/null
+sleep 2
+printf '%s\n' '{"execute":"qmp_capabilities"}' \
+  '{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"meta_l"},{"type":"qcode","data":"shift"},{"type":"qcode","data":"3"}],"hold-time":200}}' |
+  timeout 10 socat - "UNIX-CONNECT:$B/qmp.sock" > /dev/null 2>&1
+shot=
+for _ in $(seq 1 15); do
+  sleep 2
+  shot=$(G 'find ~/Desktop -maxdepth 1 -name "*.png" -newer ~/lane-gate/.before-shot | head -1' 2> /dev/null)
+  [[ -n $shot ]] && break
+done
+if [[ -n $shot ]] && sleep 1 && G "cp \"$shot\" ~/lane-gate/desktop.png" && Gcp "$GUEST_USER@127.0.0.1:lane-gate/desktop.png" "$R/desktop.png" &&
+  [[ -s $R/desktop.png ]]; then
   kv desktop_colours "$(magick "$R/desktop.png" -format %k info: 2> /dev/null || echo 0)"
   # The share of the pixels the commonest colour covers: a white or blank capture is one colour.
   kv desktop_top_share "$(magick "$R/desktop.png" -format %c histogram:info:- 2> /dev/null |
     awk '{n = $1 + 0; t += n; if (n > m) m = n} END {printf "%.3f", t ? m / t : 1}')"
   magick "$R/desktop.png" -resize 25% "$R/desktop.png" 2> /dev/null || true
+else
+  kv desktop_capture none
 fi
 exit 0
