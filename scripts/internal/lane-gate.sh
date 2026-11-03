@@ -225,6 +225,12 @@ reached() {
   [[ -n $base_sha ]] || return 0
   local changed
   changed=$(git -C "$SRC" diff --name-only "$base_sha" "$sha" -- crates xtask | awk -F/ '$1 == "xtask" {print "xtask"; next} {print $2}' | sort -u)
+  # The workspace's manifest, lock and toolchain (a pin move among them) reach every package.
+  if ! git -C "$SRC" diff --quiet "$base_sha" "$sha" -- Cargo.toml Cargo.lock rust-toolchain.toml .cargo; then
+    (cd "$TREE" && cargo metadata --no-deps --format-version 1) |
+      python3 -I -c 'import json, sys; print(" ".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))'
+    return 0
+  fi
   [[ -n $changed ]] || return 0
   (cd "$TREE" && cargo metadata --no-deps --format-version 1) | python3 -I -c '
 import json, sys
