@@ -4,7 +4,8 @@
 #
 #   scripts/internal/lane-gate.sh [--record] [--baseline SHA] [--resume [RUNID]] [--image PATH]
 #                                 [--host DIR] [--load DUTY] [--skip mac|boot] [--phases "PHASE..."]
-#                                 [--bench-phases "PHASE..."] [--no-bench | --wait-bench] [--publish] [REV]
+#                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--no-bench | --wait-bench]
+#                                 [--publish] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
@@ -24,6 +25,8 @@
 #   --phases      the correctness boot's guest-run.sh phases (default: info sweep decode webgl
 #                 present final)
 #   --bench-phases  the bench boot's (default: info webgl present idle bench decodefps final)
+#   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot): a tag the
+#                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -81,7 +84,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= rev=HEAD bench=detach publish=0
+record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= rev=HEAD bench=detach publish=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -93,6 +96,7 @@ while (($#)); do
     --bench-phases) bench_phases=$2; shift ;;
     --skip) skip="$skip $2"; shift ;;
     --phases) phases=$2; shift ;;
+    --boot-tag) boot_tag=$2; shift ;;
     --no-bench) bench=no ;;
     --wait-bench) bench=wait ;;
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
@@ -471,7 +475,7 @@ QEMU=${host_dir:-$MR}/qemu-system-x86_64
 ROM=${host_dir:-$MR}/ReimsGraphics.rom
 OC=$oc
 DISK=$MSI_DISK
-TAG=gate-$runid-$mode
+TAG=$([[ $mode == boot && -n $boot_tag ]] && echo "$boot_tag" || echo "gate-$runid-$mode")
 PAYLOAD=$MR/payload
 CORPUS=$MSI_GATE/corpus
 GUEST_USER=$GUEST_USER
