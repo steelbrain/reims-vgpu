@@ -100,12 +100,13 @@ public:
 	void setBlockSource(AllocFn alloc, ReleaseFn release, void *context);
 
 	/// What the process keeps for reuse and can give back where the kext has no room: `reclaim`
-	/// lets go of such blocks (the buffers' empty and cached slabs, RgfxSlabs.hpp) and answers
-	/// whether it let any go, and allocate() then asks the block source once more, so a block is
-	/// refused only where the process holds nothing it could give back. The surface sources'
-	/// refusals are not asked again: theirs also answer how the kext shares a surface, and
-	/// their callers fall back to allocate(). Called with `context` from the thread that asks,
-	/// holding no lock of the region's.
+	/// lets go of such blocks (the buffers' empty and cached slabs, RgfxSlabs.hpp, and the
+	/// IOSurface views the keep holds, RgfxIOSurface.h) and answers whether it let any go, and
+	/// allocate() then asks the block source once more, so a block is refused only where the
+	/// process holds nothing it could give back; so does acquireSurfacePages where the kext had
+	/// no room (kPagesNoRoom). The surface sources' other refusals are not asked again: theirs
+	/// also answer how the kext shares a surface, and their callers fall back to allocate().
+	/// Called with `context` from the thread that asks, holding no lock of the region's.
 	typedef bool (*ReclaimFn)(void *context);
 	void setReclaim(ReclaimFn reclaim, void *context);
 
@@ -140,8 +141,11 @@ public:
 		kPagesGiven = 0,
 		// The device does not use surfaces' pages in place, or refused this surface's.
 		kPagesUnsupported,
-		// No block: another holder of the surface copies it, or the kext had no room.
+		// No block: another holder of the surface copies it.
 		kPagesRefused,
+		// No block: the kext had no room for it, in the region or its table, even once the
+		// process gave back what it keeps (setReclaim).
+		kPagesNoRoom,
 	};
 
 	/// Where surfaces' shared blocks in place come from (RgfxIOSurface.h): `acquire` answers the

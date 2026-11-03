@@ -97,10 +97,14 @@ RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint6
 	SurfaceBlock out = {};
 	uint64_t offset = 0, serial = 0;
 	bool fresh = false, cached = false;
-	*answer = m_pagesAcquire == nullptr
-	              ? kPagesUnsupported
-	              : m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable,
-	                               &offset, &serial, &fresh, &cached);
+	auto ask = [&] {
+		return m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable, &offset,
+		                      &serial, &fresh, &cached);
+	};
+	*answer = m_pagesAcquire == nullptr ? kPagesUnsupported : ask();
+	if (*answer == kPagesNoRoom && reclaimed()) {
+		*answer = ask();
+	}
 	if (*answer != kPagesGiven) {
 		return out; // block.ok == false
 	}

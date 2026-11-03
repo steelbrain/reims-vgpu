@@ -209,10 +209,15 @@ bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offse
 	       KERN_SUCCESS;
 }
 
-// The device's slabs, as RgfxRegion's reclaim; `context` is the RgfxSlabs.
-bool rgfxSlabsReclaim(void *context)
+// What the process keeps for reuse, as RgfxRegion's reclaim; `context` is the RgfxSlabs: the
+// slabs' empty and cached blocks, and the IOSurface views the keep holds, a cache that costs no
+// refusal (a texture over one of their surfaces then asks the kext for its block, as with no
+// keep).
+bool rgfxRegionReclaim(void *context)
 {
-	return static_cast<RgfxSlabs *>(context)->reclaim();
+	const bool slabs = static_cast<RgfxSlabs *>(context)->reclaim();
+	const bool views = rgfxIOSurfaceKeepReclaim();
+	return slabs || views;
 }
 
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
@@ -279,8 +284,9 @@ bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uin
 // block every process that holds the surface gets, found by the whole allocation it maps at
 // `base`, the device's GPU using those pages, and cached where the kext made it so (six inputs,
 // the surface's IOSurfaceID and whether it may be cached; a fifth output). Unsupported where the
-// device lacks the feature or refused the pages; refused for any other answer, among them a
-// kext that takes fewer inputs.
+// device lacks the feature or refused the pages; no room where the kext had none, in the region
+// (kIOReturnNoSpace) or its tables (kIOReturnNoResources); refused for any other answer, among
+// them a kext that takes fewer inputs.
 RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
                                              uint64_t size, uint32_t surfaceId, bool cacheable,
                                              uint64_t *offset, uint64_t *serial, bool *fresh,
@@ -295,6 +301,8 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, ui
 	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6, out, &outCount);
 	if (kr == kIOReturnUnsupported)
 		return RgfxRegion::kPagesUnsupported;
+	if (kr == kIOReturnNoSpace || kr == kIOReturnNoResources)
+		return RgfxRegion::kPagesNoRoom;
 	if (kr != KERN_SUCCESS || outCount != 5)
 		return RgfxRegion::kPagesRefused;
 	if (out[1] != size) {
@@ -641,7 +649,7 @@ RGFX_LOG_UNRECOGNIZED
 		os_log_error(OS_LOG_DEFAULT,
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");
 	// A block the kext has no room for is asked again once the slabs the process keeps went.
-	_region->setReclaim(&rgfxSlabsReclaim, _slabs.get());
+	_region->setReclaim(&rgfxRegionReclaim, _slabs.get());
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {

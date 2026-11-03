@@ -185,6 +185,11 @@ public:
 /// RgfxIOSurface.mm): at the process's memory pressure, and for the tests.
 void rgfxIOSurfaceKeepFlush(void);
 
+/// Lets go of every view the keep holds, the least recently textured first, those another
+/// process's hold of their surface keeps among them: the region's reclaim, where the kext has no
+/// room for a block (RgfxRegion::setReclaim). True where it let any go.
+bool rgfxIOSurfaceKeepReclaim(void);
+
 /// Lets go of the views the keep holds that are due to go at `nowNs` (CLOCK_UPTIME_RAW): the
 /// keep's own sweep, and the tests' passing of its time.
 void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);

@@ -802,6 +802,9 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 			} else if (answer == RgfxRegion::kPagesUnsupported) {
 				countView(gCopiedUnsupported);
 				notInPlace = "the device uses no surface in place, or refused its pages";
+			} else if (answer == RgfxRegion::kPagesNoRoom) {
+				countView(gCopiedRefused);
+				notInPlace = "the kext had no room for its block in place";
 			} else {
 				countView(gCopiedRefused);
 				notInPlace = "the kext gave no block in place";
@@ -982,7 +985,8 @@ namespace {
 // kKeepNs. The process's commitAndWaitUntilSubmitted calls count no composites: WindowServer makes
 // about three a composite (measured on that boot). The keep holds at most kKeepMaxViews views and
 // kKeepMaxBytes of their surfaces, the least recently textured let go first, lets go of all of
-// them at the process's memory pressure, and keeps none a texture over it set volatile or empty
+// them at the process's memory pressure and where the kext has no room for a block (the region's
+// reclaim, rgfxIOSurfaceKeepReclaim), and keeps none a texture over it set volatile or empty
 // (setPurgeableState:). A kept view holds its surface (CFRetain) as a texture over it does, so
 // its IOSurfaceID names no other surface, and its block, so the kext keeps the process's wire of
 // the surface's pages as for a live texture: the pages the host maps are the surface's while the
@@ -1000,7 +1004,9 @@ namespace {
 // each view the last hold of the surface in its process, until their caps let them go. A view of
 // WindowServer's that another process's kept view alone holds goes once that keep lets go; while
 // another process holds the surface of every view WindowServer keeps, its sweep comes kKeepHeldNs
-// apart, not kKeepNs.
+// apart, not kKeepNs. Such views go at the region's reclaim as every kept view does, so the keep
+// costs no block a refusal: a texture over one of their surfaces then asks the kext for its block
+// again.
 constexpr size_t kKeepMaxViews = 8;
 constexpr uint64_t kKeepMaxBytes = 256ull << 20;
 constexpr uint64_t kKeepNs = 50ull * 1000 * 1000;
@@ -1168,6 +1174,21 @@ void keepView(const std::shared_ptr<RgfxSurfaceShadow> &view)
 void rgfxIOSurfaceKeepFlush(void)
 {
 	sweep(0, true);
+}
+
+bool rgfxIOSurfaceKeepReclaim(void)
+{
+	Keep &k = keep();
+	std::vector<std::shared_ptr<RgfxSurfaceShadow>> gone;
+	{
+		std::lock_guard<std::mutex> g(k.lock);
+		expire(k, 0, true, &gone);
+	}
+	// The views die here, the least recently textured first, each giving its block back.
+	const bool any = !gone.empty();
+	for (auto &view : gone)
+		view.reset();
+	return any;
 }
 
 void rgfxIOSurfaceKeepSweepAt(uint64_t now)

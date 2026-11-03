@@ -9146,7 +9146,8 @@ void test_iosurface_in_place()
 // goes back once the keep lets the view go: past its time, at a flush (the process's memory
 // pressure), past the keep's count of views, or at once where a texture over it was set
 // volatile. In WindowServer it also stays while another process holds its surface, by the kext's
-// count of the surface's clients. A kept view leaves the surface's use count alone.
+// count of the surface's clients, and goes all the same where the kext has no room for a block.
+// A kept view leaves the surface's use count alone.
 void test_iosurface_keep()
 {
 	Fixture fx;
@@ -9160,11 +9161,19 @@ void test_iosurface_keep()
 		int asked = 0;
 		bool cached = false; // whether the blocks it gives are cached
 		std::vector<uint64_t> released;
+		// The kext's room: none until `roomAt` blocks are back, where `full`.
+		bool full = false;
+		size_t roomAt = 0;
+		int noRoom = 0;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
 		                                     bool, uint64_t *offset, uint64_t *serial,
 		                                     bool *fresh, bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
+			if (src->full && src->released.size() < src->roomAt) {
+				src->noRoom++;
+				return RgfxRegion::kPagesNoRoom;
+			}
 			// A block of its own for each ask.
 			*offset = RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * static_cast<uint64_t>(src->asked);
 			src->asked++;
@@ -9382,6 +9391,42 @@ void test_iosurface_keep()
 	CHECK(gone == nullptr);
 	if (gone != nullptr)
 		CFRelease(gone);
+
+	// WindowServer at the region's limit: where the kext has no room for a block, the region's
+	// reclaim lets go of every kept view, the least recently textured first, those another
+	// process's hold keeps among them, and the ask is made once more and given its block.
+	rgfxIOSurfaceKeepCountClients(true);
+	region.setReclaim([](void *) { return rgfxIOSurfaceKeepReclaim(); }, nullptr);
+	const uint64_t eBlock = RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * 17;
+	const uint64_t fBlock = RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * 18;
+	IOSurfaceRef e = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	IOSurfaceRef f = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(e != nullptr && f != nullptr);
+	@autoreleasepool {
+		CHECK(over(e) != nil && over(f) != nil && src.asked == 19);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	*clientsAt(eBlock) = 2;
+	*clientsAt(fBlock) = 2;
+	CFRelease(e);
+	CFRelease(f);
+	rgfxIOSurfaceKeepSweepAt(made + 1500 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 17);
+	src.full = true;
+	src.roomAt = 19;
+	IOSurfaceRef g = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(g != nullptr);
+	@autoreleasepool {
+		CHECK(over(g) != nil);
+	}
+	drainRing(fx.ring);
+	CHECK(src.noRoom == 1 && src.asked == 20);
+	CHECK(src.released.size() == 19 && src.released[17] == eBlock && src.released[18] == fBlock);
+	src.full = false;
+	region.setReclaim(nullptr, nullptr);
+	rgfxIOSurfaceKeepCountClients(false);
+	CFRelease(g);
 	src.cached = false;
 	CFRelease(a);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
