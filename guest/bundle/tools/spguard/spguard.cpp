@@ -20,7 +20,8 @@
 //                 mapped).
 //   new.room.MIB  rgfxTakeSuperpages of MIB MiB with room for them: its answer and time, the
 //                 entries the range holds (one a superpage, each 2 MiB and tagged), the guard
-//                 exceptions; then the same bytes in car 8's one call, for its time.
+//                 exceptions; then the same bytes in car 8's one call: its answer, time and guard
+//                 exceptions.
 //   fatal.old     a child with the VM guard fatal (VM_DELIVER | VM_FATAL, WebKit's GPU process's)
 //                 and no port of its own makes the old.anywhere call: how it ended.
 //   fatal.new     the same child making the new.short call: how it ended.
@@ -363,16 +364,18 @@ void newRoom(uint64_t mib)
 		describeRange(reinterpret_cast<uintptr_t>(bytes), size, &entries, &twoMiB, &resident);
 		rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
 	}
+	const std::string newSeen = seenSince(from);
+	const int oldFrom = g_seenCount.load();
 	mach_vm_address_t at = 0;
 	t = nowUs();
 	const int oldKr = oldCall(size, &at, false);
 	const double oldUs = nowUs() - t;
 	if (oldKr == KERN_SUCCESS)
 		mach_vm_deallocate(mach_task_self(), at, size);
-	printf("spg: new.room.%llu kr=%d us=%.0f entries=%llu each_2mib_tagged=%d resident=%d "
-	       "old_kr=%d old_us=%.0f%s\n",
+	printf("spg: new.room.%llu kr=%d us=%.0f entries=%llu each_2mib_tagged=%d resident=%d%s | "
+	       "old_kr=%d old_us=%.0f old%s\n",
 	       (unsigned long long)mib, kr, us, (unsigned long long)entries, twoMiB ? 1 : 0,
-	       resident ? 1 : 0, oldKr, oldUs, seenSince(from).c_str());
+	       resident ? 1 : 0, newSeen.c_str(), oldKr, oldUs, seenSince(oldFrom).c_str());
 }
 
 void fatalChild(bool useNew)
