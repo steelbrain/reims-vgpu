@@ -6739,6 +6739,106 @@ mod tests {
         }
     }
 
+    /// What a `SAMPLER_CREATE` costs the host, through the decoder as the guest's waited create
+    /// reaches it ([`GraphicsDecoder::sampler_state`]), with 1, 64 and 1000 of the context's
+    /// samplers alive, and its `OBJECT_DESTROY` after it, so as many stay alive: each create a
+    /// descriptor of its own, as the bundle's state cache sends one only for a descriptor it has
+    /// not made. A measurement, run by hand (`--run-ignored only --no-capture`); it prints the
+    /// mean, median and 99th percentile of each. `RVG_SAMPLER_BENCH_LIVE` (comma-separated) sets
+    /// other live counts.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn sampler_create_cost<P: crate::platform::ApiPlatform>() {
+        use reims_vgpu_core::platform::os::Clock as _;
+        let (mut dec, device) = surface_decoder::<P>();
+        let platform = P::process();
+        let now = || platform.clock().now_mono();
+        let create = |obj_id, lod_max: f32| RgfxSamplerCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SAMPLER_CREATE,
+                size: size_of::<RgfxSamplerCreate>() as u32,
+                seqno: 1,
+            },
+            obj_id,
+            min_filter: 1,
+            mag_filter: 1,
+            max_anisotropy: 1,
+            flags: 0b001,
+            lod_max_clamp_bits: lod_max.to_bits(),
+            ..RgfxSamplerCreate::default()
+        };
+        let destroy = |obj_id| RgfxObjectDestroy {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<RgfxObjectDestroy>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+        };
+        let stats = |mut us: Vec<f64>| {
+            us.sort_by(f64::total_cmp);
+            let mean = us.iter().sum::<f64>() / us.len() as f64;
+            (mean, us[us.len() / 2], us[us.len() * 99 / 100])
+        };
+        let mut lod = 1000.0f32;
+        let mut next = 1u64;
+        let mut alive = std::collections::VecDeque::new();
+        const ROUNDS: usize = 2000;
+        let counts: Vec<usize> = std::env::var("RVG_SAMPLER_BENCH_LIVE")
+            .map(|v| v.split(',').map(|n| n.trim().parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![1, 64, 1000]);
+        for live in counts {
+            while alive.len() < live {
+                lod -= 0.25;
+                let answer = dec.sampler_state(&device, create(context_obj(next), lod).as_bytes());
+                assert_eq!(answer.unwrap().unwrap().status, RGFX_STATUS_OK);
+                dec.end_message();
+                alive.push_back(next);
+                next += 1;
+            }
+            let (mut made, mut dropped) = (Vec::new(), Vec::new());
+            for _ in 0..ROUNDS {
+                lod -= 0.25;
+                let message = create(context_obj(next), lod);
+                let t0 = now();
+                let answer = dec.sampler_state(&device, message.as_bytes());
+                let t1 = now();
+                assert_eq!(answer.unwrap().unwrap().status, RGFX_STATUS_OK);
+                dec.end_message();
+                alive.push_back(next);
+                next += 1;
+                let gone = destroy(context_obj(alive.pop_front().unwrap()));
+                let t2 = now();
+                assert_eq!(dec.decode(&device, gone.as_bytes()).unwrap(), Ok(()));
+                let t3 = now();
+                dec.end_message();
+                made.push(t1.saturating_duration_since(t0).as_secs_f64() * 1e6);
+                dropped.push(t3.saturating_duration_since(t2).as_secs_f64() * 1e6);
+            }
+            let (m, p50, p99) = stats(made);
+            let (dm, dp50, dp99) = stats(dropped);
+            println!(
+                "sampler_create_cost: {live} alive: create {m:.2} us (p50 {p50:.2}, p99 {p99:.2}), \
+                 destroy {dm:.2} us (p50 {dp50:.2}, p99 {dp99:.2}), {ROUNDS} rounds"
+            );
+        }
+    }
+
+    /// [`sampler_create_cost`] on the Vulkan platform.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn on_vulkan_sampler_create_cost_by_live_samplers() {
+        sampler_create_cost::<reims_vgpu_vulkan::VulkanPlatform>();
+    }
+
+    /// [`sampler_create_cost`] on Metal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn on_metal_sampler_create_cost_by_live_samplers() {
+        sampler_create_cost::<reims_vgpu_metal::MetalPlatform>();
+    }
+
     /// On Metal, a texture of 505 over plane 0 of a real 'x420' surface of BT.2020 holding the
     /// bundle's copy's bytes, at its planes' offsets and rows, samples through a linear sampler
     /// as recorded ([`METAL_505`]), every alpha 1. Through the decoder the Metal platform refuses
