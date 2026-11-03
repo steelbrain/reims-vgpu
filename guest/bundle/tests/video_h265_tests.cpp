@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "RgfxVideoH265.hpp"
+#include "RgfxVideoStatus.hpp"
 
 using namespace rgfx::video::h265;
 
@@ -261,6 +262,30 @@ void checkRefusals()
 	CHECK(!writePps(p, out) && out.size() == 2, "16 default references taken");
 }
 
+// What the driver answers AppleGVA for a decode it could not complete (RgfxVideoStatus.hpp): the
+// schedule of a command it did not send fails, and so does a session's next schedule after a
+// failure on the host, the one answer AppleGVA reports; a decoded or still-running command is
+// answered as it always was.
+void checkStatus()
+{
+	using rgfx::video::queryReport;
+	using rgfx::video::QueryReport;
+	using rgfx::video::scheduleFails;
+
+	QueryReport r = queryReport(0);
+	CHECK(r.status == rgfx::video::kStatusRunning && !r.hostFailed, "a running command");
+	r = queryReport(1);
+	CHECK(r.status == rgfx::video::kStatusDone && !r.hostFailed, "a decoded command");
+	r = queryReport(-1);
+	CHECK(r.status == rgfx::video::kStatusDone && r.hostFailed, "a failure on the host");
+
+	CHECK(!scheduleFails(true, false), "a sent command fails its schedule");
+	CHECK(scheduleFails(false, false), "a command not sent is scheduled");
+	CHECK(scheduleFails(true, true), "a schedule after a failure on the host succeeds");
+	CHECK(scheduleFails(false, true), "a command not sent after a failure is scheduled");
+	CHECK(rgfx::video::kNotSent != 0, "the schedule's failure is no success");
+}
+
 } // namespace
 
 int main()
@@ -269,6 +294,7 @@ int main()
 		checkCase(make());
 	checkEscapes();
 	checkRefusals();
+	checkStatus();
 	std::printf("video_h265_tests: %d checks passed over %zu streams\n", g_checks, kCases.size());
 	return 0;
 }

@@ -550,6 +550,19 @@ Stages:
       that of the IOSurface VideoToolbox hands back for the picture, 7 for
       picture 0 and 27 for picture 1, and an IDR with no references resolves
       there too).
+    - **A decode the driver cannot complete is a decode error, never a silent
+      success.** AppleGVA reports a decode error only when scheduling the
+      command fails: a schedule that answers 5 reaches the client as
+      `kVTVideoDecoderMalfunctionErr` (-12911). It ignores every failure a
+      status query can answer, a detail word, a failed query call, and the
+      statuses 0 and 3 alike, and takes the picture for decoded (measured on
+      the guest with the RTX 5080). So a command the driver cannot resolve or
+      send (no output surface, refused parameter sets, no command buffer)
+      fails its own schedule, and logs one line. A failure the host reports
+      for a picture the driver sent is known only when the picture's status
+      is queried: the driver marks its session, and the session's next
+      schedule fails, one picture late (`guest/bundle/src/RgfxVideoStatus.hpp`,
+      `queryReport` and `scheduleFails`).
     - **Bitstreams:** AppleGVA asks for one bitstream buffer and writes the
       next access unit into it as soon as a picture is scheduled, without
       waiting for the decode that reads it. The driver copies each access
