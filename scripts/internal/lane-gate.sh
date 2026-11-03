@@ -27,6 +27,8 @@
 #   --bench-phases  the bench boot's (default: info webgl present idle bench decodefps final)
 #   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot): a tag the
 #                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
+#   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
+#                 info,reims_graphics::room=debug to count a path's debug records
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -84,7 +86,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= rev=HEAD bench=detach publish=0
+record=0 base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= rev=HEAD bench=detach publish=0
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -97,6 +99,7 @@ while (($#)); do
     --skip) skip="$skip $2"; shift ;;
     --phases) phases=$2; shift ;;
     --boot-tag) boot_tag=$2; shift ;;
+    --host-log) host_log=$2; shift ;;
     --no-bench) bench=no ;;
     --wait-bench) bench=wait ;;
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
@@ -490,6 +493,7 @@ LOCK_WAIT_S=${LOCK_WAIT_S:-3600}
 PHASES="$ph"
 PRESENT_S=$pres
 LOAD=$([[ $mode == bench ]] && echo "$load")
+HOST_LOG=$([[ $mode == boot ]] && echo "${host_log:-info}" || echo info)
 EOF
   set +e
   msi "bash '$MR/bin/msi-boot.sh' '$out'"

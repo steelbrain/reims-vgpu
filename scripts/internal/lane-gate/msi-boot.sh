@@ -28,7 +28,8 @@
 # GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
 # LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
 # PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
-# load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none).
+# load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
+# (the host's REIMS_VGPU_LOG filter, default info).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
 . "$R/boot.env"
@@ -87,6 +88,12 @@ finish() {
   rm -f "$R/watchdog.pid"
   if [[ -f $B/launch.log ]]; then
     kv fatal_lines "$(grep -c 'reims-vgpu: fatal' "$B/launch.log")"
+    # The host's records of paths a tip adds: queues made unshared (RGFX_QUEUE_UNSHARED),
+    # SUBMIT_ROOM records posted (reims_graphics::room at debug, HOST_LOG), and ICB_SLOTS messages
+    # whose runs were not all carried out.
+    kv queues_unshared "$(grep -c 'made unshared' "$B/launch.log")"
+    kv submit_room_posted "$(grep -c 'SUBMIT_ROOM posted' "$B/launch.log")"
+    kv icb_slots_refused "$(grep -c 'ICB_SLOTS of .* not carried out' "$B/launch.log")"
     # A measured boot's hold of host quiet: HOST_QUIET where no build ran beside QEMU, HOST_NOT_QUIET
     # where the wait for running builds ran out (rgk-boot2.sh); none for a shared boot.
     case $(grep -m1 -o -E 'HOST_(NOT_)?QUIET' "$B/launch.log") in
@@ -154,7 +161,7 @@ touch "$R/.start"
 TIMES=$!
 # rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
 out=$(env -u PORT "${excl[@]}" RGK_SLOT_WAIT="${LOCK_WAIT_S:-3600}" QEMU="$QEMU" ROM="$ROM" \
-  REIMS_VGPU_LOG=info bash "$RGK_RUN/rgk-boot2.sh" "$TAG" "$OC" "$DISK" 2>&1)
+  REIMS_VGPU_LOG="${HOST_LOG:-info}" bash "$RGK_RUN/rgk-boot2.sh" "$TAG" "$OC" "$DISK" 2>&1)
 T_SSH=$(date +%s.%N | cut -c1-14)
 kill "$TIMES" 2> /dev/null
 echo "$out" >> "$R/boot.log"

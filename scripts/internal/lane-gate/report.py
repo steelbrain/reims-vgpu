@@ -201,6 +201,12 @@ class Run:
             elif body.startswith("GATE item "):
                 parts = body.split(" ", 4)
                 self.litem("guest." + parts[2], parts[3], parts[4] if len(parts) > 4 else "")
+                if parts[2] == "features" and len(parts) > 4:
+                    # The bits the kext took, by number (FEATURES_LO's: SUBMIT_ROOM is 16, ICB_SLOTS 17).
+                    m2 = re.search(r"RgfxFeaturesTaken = (\d+)", parts[4])
+                    if m2:
+                        bits = [str(b) for b in range(64) if int(m2.group(1)) >> b & 1]
+                        self.items[self.ip + "guest.features"]["detail"] += " (bits taken: " + ",".join(bits) + ")"
                 if parts[2] == "metal-device" and len(parts) > 4:
                     m2 = re.search(r'device "([^"]+)"', parts[4])
                     self.metal_device = m2.group(1) if m2 else None
@@ -381,7 +387,8 @@ class Run:
         # desktop), and the host's state beside the measurements.
         for k in ("turn_wait_s", "quiet_wait_s", "gpu_wait_s", "lock_wait_s", "first_present_s", "kernel_s",
                   "windowserver_s", "loginwindow_s", "dock_s", "boot_ssh_s", "desktop_s", "hold_s",
-                  "load_start", "load_end", "load_duty", "host_quiet"):
+                  "load_start", "load_end", "load_duty", "host_quiet", "queues_unshared",
+                  "submit_room_posted", "icb_slots_refused"):
             if re.fullmatch(r"[0-9]+(\.[0-9]*)?", kv.get(k, "")):
                 self.lmetric("host." + k, float(kv[k]))
         fatal = int(kv.get("fatal_lines", "-1") or -1) + max(0, int(kv.get("serial_fatal_lines", "0") or 0))
