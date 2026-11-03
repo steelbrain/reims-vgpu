@@ -234,13 +234,19 @@ private:
 		bool enabled;
 	};
 
-	// Recent answers (COMPLETE and DISPLAYS) by seqno, for the waiting
-	// threads. A waiter may look after its answer has come.
-	struct Answer {
+	// A thread waiting in command() for a display-control message's answer (a COMPLETE or a
+	// DISPLAYS), keyed by seqno as the lifecycle waiters are. A burst of PRESENT_SURFACE
+	// completions, which also answer on the control ring, then matches no waiter and is dropped,
+	// rather than evicting a control answer from a fixed ring before its thread reads it. Free
+	// while `waiting` is false; `seqno` is 0 until the message is on the ring, then the answer's
+	// thread fills `status`, sets `done`, and wakes this waiter alone.
+	struct ControlWaiter {
 		UInt64 seqno;
 		UInt32 status;
+		bool waiting;
+		bool done;
 	};
-	static constexpr UInt32 kAnswers = 16;
+	static constexpr UInt32 kControlWaiters = 8;
 
 	// A thread waiting for a lifecycle message's answer: free while replyType is 0; its seqno
 	// is 0 until the message is on the ring.
@@ -317,8 +323,7 @@ private:
 	// set, and the scanout's owner (its task referenced, its connection retained).
 	IOLock *stateLock;
 	RgfxScanoutOwner scanoutOwner;
-	Answer answers[kAnswers];
-	UInt32 nextAnswer;
+	ControlWaiter controlWaiters[kControlWaiters];
 	LifecycleWaiter lifecycleWaiters[kLifecycleWaiters];
 	bool haveDisplay;
 	UInt32 displayId;

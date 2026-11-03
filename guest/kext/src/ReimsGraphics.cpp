@@ -225,38 +225,59 @@ IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt
 	}
 }
 
-// Sends a command and waits for its answer, COMPLETE or DISPLAYS, which the
+// Sends a display-control command and waits for its answer, COMPLETE or DISPLAYS, which the
 // work loop hands over: thread context only, never on the work loop.
 IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 {
-	UInt64 seqno = 0;
-	IOReturn r = post(type, message, size, &seqno);
-	if (r != kIOReturnSuccess)
-		return r;
-
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kAnswerTimeoutMs, kMillisecondScale, &deadline);
-	UInt32 status = 0;
-	bool found = false;
+	// Take a waiter first, so the answer finds this thread by seqno once the message is on the
+	// ring; a free one frees up with the shared array as its event.
+	ControlWaiter *w = nullptr;
 	IOLockLock(stateLock);
-	while (!found) {
-		for (UInt32 i = 0; i < kAnswers && !found; i++) {
-			if (answers[i].seqno == seqno) {
-				status = answers[i].status;
-				found = true;
-			}
+	while (!w) {
+		for (UInt32 i = 0; i < kControlWaiters && !w; i++) {
+			if (!controlWaiters[i].waiting)
+				w = &controlWaiters[i];
 		}
-		if (!found && IOLockSleepDeadline(stateLock, answers, deadline, THREAD_UNINT) == THREAD_TIMED_OUT)
+		if (!w && IOLockSleepDeadline(stateLock, controlWaiters, deadline, THREAD_UNINT) ==
+		              THREAD_TIMED_OUT)
 			break;
 	}
+	if (!w) {
+		IOLockUnlock(stateLock);
+		IOLog("ReimsGraphics: command %u: every control waiter is taken\n", type);
+		return kIOReturnBusy;
+	}
+	w->waiting = true;
+	w->seqno = 0;
+	w->status = 0;
+	w->done = false;
 	IOLockUnlock(stateLock);
 
-	if (!found) {
-		IOLog("ReimsGraphics: command %u (seqno %llu): no answer\n", type, seqno);
+	UInt64 s = 0;
+	IOReturn r = post(type, message, size, &s, &w->seqno);
+	IOLockLock(stateLock);
+	while (r == kIOReturnSuccess && !w->done) {
+		if (IOLockSleepDeadline(stateLock, &w->done, deadline, THREAD_UNINT) ==
+		    THREAD_TIMED_OUT && !w->done)
+			r = kIOReturnTimeout;
+	}
+	UInt32 status = w->status;
+	w->waiting = false;
+	w->seqno = 0;
+	// A slot freed: the free event is the shared array, the slot seekers'.
+	IOLockWakeup(stateLock, controlWaiters, false);
+	IOLockUnlock(stateLock);
+
+	if (r == kIOReturnTimeout) {
+		IOLog("ReimsGraphics: command %u (seqno %llu): no answer\n", type, s);
 		return kIOReturnTimeout;
 	}
+	if (r != kIOReturnSuccess)
+		return r;
 	if (status != 0) {
-		IOLog("ReimsGraphics: command %u (seqno %llu): status %u\n", type, seqno, status);
+		IOLog("ReimsGraphics: command %u (seqno %llu): status %u\n", type, s, status);
 		return kIOReturnError;
 	}
 	return kIOReturnSuccess;
@@ -542,12 +563,24 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 	return found;
 }
 
+// Hands a display-control answer (a COMPLETE or a DISPLAYS) to its command() thread, matched by
+// seqno. A COMPLETE no command() waits for (a PRESENT_SURFACE's, which the pipe clients take
+// instead) matches no waiter and is dropped.
 void ReimsGraphics::answer(UInt64 seqno, UInt32 status)
 {
+	if (seqno == 0)
+		return;
 	IOLockLock(stateLock);
-	answers[nextAnswer % kAnswers] = {seqno, status};
-	nextAnswer++;
-	IOLockWakeup(stateLock, answers, false);
+	for (UInt32 i = 0; i < kControlWaiters; i++) {
+		ControlWaiter &w = controlWaiters[i];
+		if (w.waiting && !w.done && __atomic_load_n(&w.seqno, __ATOMIC_ACQUIRE) == seqno) {
+			w.status = status;
+			w.done = true;
+			// Only the thread this answer is for: its own `done` event, one thread.
+			IOLockWakeup(stateLock, &w.done, true);
+			break;
+		}
+	}
 	IOLockUnlock(stateLock);
 }
 
