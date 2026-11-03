@@ -59,8 +59,15 @@ MAC_STEPS = {"kext-check", "kext-test", "bundle-test", "bundle-files", "rgfxgate
 # The informational metrics a report shows beside the gated ones.
 SHOWN = [r"present\..*\.(dropped|wait_ms_p50|gap_ms_max)", r"qemu_cpu\..*", r"composites_s\..*",
          r"(shared\.)?(drag\..*|gfx_cpu\.drag\..*|qemu_cpu\.drag\..*)",
-         r"host\.(boot_ssh_s|desktop_s|hold_s|lock_wait_s)", r"bench\.draws\.10k\.encode_ms",
+         r"host\..*", r"bench\.draws\.10k\.encode_ms", r"(pstate|core_mhz|mem_mhz)\.bench\..*",
          r"shared\.(host\..*|webgl\.raf_fps|present\..*\.presented_fps|composites_s\.present\.fullscreen)"]
+
+
+def pstate_of(metrics, name):
+    """The power state (its P number) a bench metric's case ran in, where the run sampled it."""
+    if not name.startswith("bench."):
+        return None
+    return metrics.get("pstate.bench." + name[len("bench."):].rsplit(".", 1)[0])
 
 
 def gated(name):
@@ -134,6 +141,7 @@ class Run:
                 self.host(d)
                 self.drag(d)
                 self.video(d)
+                self.clocks(d)
         self.ip, self.mp = "", ""
         self.cargo(r)
         return self
@@ -156,6 +164,7 @@ class Run:
     def guest(self, text):
         self.phases = {}
         self.video_offer, self.metal_device = None, None
+        self.case_window = {}  # a bench case's host times: its "# start" line and its result's
         crashes, crash_lines = None, []
         for line in text.splitlines():
             m = re.match(r"([0-9.]+) (.*)$", line)
@@ -199,8 +208,12 @@ class Run:
                     self.litem("sweep." + m2.group(1), m2.group(2).replace("OK", "PASS"), m2.group(3))
                 elif re.match(r"sweep: \d+ OK", body):
                     self.lmetric("sweep.cases", sum(int(x) for x in re.findall(r"(\d+) [A-Z]+", body)))
+            elif body.startswith("# start "):
+                self.case_window[body[len("# start "):].strip()] = [t, None]
             elif body.startswith("bench: "):
                 m2 = re.match(r"bench: (\S+) (OK|FAIL|SKIP|NOTRUN)\s*(.*)$", body)
+                if m2 and m2.group(1) in self.case_window:
+                    self.case_window[m2.group(1)][1] = t
                 if m2:
                     self.litem("bench." + m2.group(1), {"OK": "PASS"}.get(m2.group(2), m2.group(2)), m2.group(3)[:200])
                     if m2.group(2) == "OK":
@@ -236,6 +249,37 @@ class Run:
         for p, (a, b) in self.phases.items():
             if a is None or b is None:
                 self.litem("phase." + p, "FAIL", "started but did not end (a hang the alarm or the hold cut)")
+
+    def clocks(self, d):
+        """The GPU's power state and clocks over each bench case (gpu-clocks.txt, the host's
+        nvidia-smi four times a second): the state most samples in the case's span show, as metric
+        pstate.bench.CASE (its P number), with the median core and memory clocks."""
+        rows = []
+        for line in read(os.path.join(d, "gpu-clocks.txt")).splitlines():
+            f = line.split()
+            if len(f) >= 4 and re.fullmatch(r"P[0-9]+", f[1]):
+                try:
+                    rows.append((float(f[0]), int(f[1][1:]), float(f[2]), float(f[3])))
+                except ValueError:
+                    pass
+        if not rows:
+            return
+        for case, (a, b) in self.case_window.items():
+            if b is None:
+                continue
+            span = [r for r in rows if a <= r[0] <= b]
+            if not span:
+                continue
+            states = [r[1] for r in span]
+            ps = max(set(states), key=states.count)
+            core = statistics.median(r[2] for r in span)
+            mem = statistics.median(r[3] for r in span)
+            self.lmetric(f"pstate.bench.{case}", ps)
+            self.lmetric(f"core_mhz.bench.{case}", core)
+            self.lmetric(f"mem_mhz.bench.{case}", mem)
+            it = self.items.get(self.ip + "bench." + case)
+            if it:
+                it["detail"] = f"[P{ps} {core:.0f}/{mem:.0f} MHz] " + it["detail"]
 
     def video(self, d):
         """Each decode SKIP (decode_md5's: VideoToolbox finds no hardware decoder for the stream's
@@ -387,6 +431,12 @@ def median_baseline(bdir):
     ref["metrics_best"] = {}
     for n in names:
         vals = [r["metrics"][n] for r in runs if n in r["metrics"]]
+        # A bench number is the median of the samples taken at P0, where any sample says its state.
+        p0 = [r["metrics"][n] for r in runs if n in r["metrics"] and pstate_of(r["metrics"], n) == 0]
+        if any(pstate_of(r["metrics"], n) is not None for r in runs if n in r["metrics"]):
+            vals = p0
+        if not vals:
+            continue
         ref["metrics"][n] = statistics.median(vals)
         ref["metrics_best"][n] = max(vals)
     return ref
@@ -438,6 +488,9 @@ def noise_from(bdirs_root):
             continue
         for n in set().union(*(r["metrics"] for r in runs)):
             vals = [r["metrics"][n] for r in runs if n in r["metrics"]]
+            # A bench number's band comes only from samples whose case ran at P0.
+            if n.startswith("bench."):
+                vals = [r["metrics"][n] for r in runs if n in r["metrics"] and pstate_of(r["metrics"], n) == 0]
             if len(vals) < 2 or bimodal(n):
                 continue
             med = statistics.median(vals)
@@ -544,7 +597,12 @@ def compare(run, base, noise):
             bv = base.get("metrics_best", {}).get(name, bv)
         rel = (v - bv) / abs(bv) if bv else 0.0
         verdict = ""
-        if bi and bv and bi[1] <= v / bv <= bi[2]:
+        ps = pstate_of(cur["metrics"], name)
+        if ps is not None and ps != 0:
+            verdict = f"KNOWN-pstate: its case ran at P{ps}"
+            items["metric." + name] = {"status": "KNOWN", "detail": f"{v:g}: its case ran at P{ps} (the driver's hold "
+                                       "after a power-cap event), not compared"}
+        elif bi and bv and bi[1] <= v / bv <= bi[2]:
             verdict = f"KNOWN-bimodal: its slow mode ({bi[3]} owns it)"
             items["metric." + name] = {"status": "KNOWN", "detail": f"{v:g} against the fast mode's {bv:g}: the slow mode, which {bi[3]} owns"}
         elif g and tool_changed(name, run.meta, base["meta"]):

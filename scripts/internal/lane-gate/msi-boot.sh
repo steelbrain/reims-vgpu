@@ -19,6 +19,8 @@
 #                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
 #   gpuload.log   where LOAD is set: the fixed GPU load's duty each second, and over its run
+#   gpu-clocks.txt  the GPU's power state and clocks four times a second over the guest's run and
+#                 the drags: "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W"
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
 # GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
@@ -54,6 +56,16 @@ stop_qemu() {
   P=
 }
 B=$RGK_RUN/boots/$TAG
+# The GPU's power state and clocks beside the measurements, four times a second (nvidia-smi, where
+# the host has it): "EPOCH PSTATE CORE_MHZ MEM_MHZ POWER_W". The driver holds a lower state (P4)
+# for seconds after a power-cap event, at about half the core and memory clocks, so each number
+# is read beside the state it ran in.
+CLOCKPID=
+stop_clocks() {  # the sampler's pipeline, nvidia-smi among it, then the sampler
+  [[ -n $CLOCKPID ]] || return 0
+  kill $(ps -o pid= --ppid "$CLOCKPID") "$CLOCKPID" 2> /dev/null
+  CLOCKPID=
+}
 LOADPID=
 stop_load() {
   [[ -n $LOADPID ]] || return 0
@@ -64,6 +76,7 @@ stop_load() {
   log "fixed GPU load stopped: $(tail -1 "$R/gpuload.log")"
 }
 finish() {
+  stop_clocks
   stop_load
   stop_qemu
   [[ -n ${SAMPLER:-} ]] && kill "$SAMPLER" 2> /dev/null
@@ -256,6 +269,12 @@ if [[ -n $GL ]]; then
     { log "BOOT_FAIL gpuload did not start: $(tail -2 "$R/gpuload.log" | tr '\n' ' ')"; exit 8; }
   log "fixed GPU load: $(head -1 "$R/gpuload.log")"
 fi
+if command -v nvidia-smi > /dev/null; then
+  ( closefds; exec > "$R/gpu-clocks.txt" 2> /dev/null
+    timeout "$(left)" nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,power.draw --format=csv,noheader,nounits -lms 250 |
+      while IFS=', ' read -r ps gr mem pw; do echo "$(date +%s.%N | cut -c1-14) $ps $gr $mem $pw"; done ) &
+  CLOCKPID=$!
+fi
 # The host's load beside the measurements (other work on the host shares its CPU and memory).
 kv load_start "$(cut -d' ' -f1 /proc/loadavg)"
 log "guest run: ${PHASES:-all phases}, $(left) s left"
@@ -276,6 +295,7 @@ if [[ ${DRAG:-1} == 1 ]] && (( $(left) > 150 )); then
 fi
 kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
 stop_load
+stop_clocks
 
 # The screen as WindowServer composed it, read back by the guest: the screenshot a person takes
 # with Command-Shift-3, the keys sent over QMP to the guest's keyboard. The system's screenshot

@@ -123,12 +123,13 @@ run_memory() {
 run_idle() { sleep 10; }
 
 run_bench() {
-	# The 5080's clocks ramp only after up to 8 s of full load: warm the GPU first, so the cases
-	# run at the clocks they reach.
-	limit 60 ./bench -r 1 -m 8 frag.alu.2160p > "$D/bench-warm.txt" 2>&1
-	limit 300 ./bench -m 3 2>&1 | grep -E '^bench: |^# start'
+	# The 5080 holds a lower power state (P4: about half the core and memory clocks) for 1-8 s after
+	# a power-cap event, even under full load: 12 s of full load first, so the cases start at P0.
+	# The lines pass as they come, so the host can read the GPU's state beside each case.
+	limit 60 ./bench -r 1 -m 12 frag.alu.2160p > "$D/bench-warm.txt" 2>&1
+	limit 300 ./bench -m 3 2>&1 | grep --line-buffered -E '^bench: |^# start'
 	echo "rc bench ${PIPESTATUS[0]}"
-	gui perl -e 'alarm shift @ARGV; exec @ARGV' 60 "$D/bench" -t 10 onscreen 2>&1 | grep -E '^bench: |^# start'
+	gui perl -e 'alarm shift @ARGV; exec @ARGV' 60 "$D/bench" -t 10 onscreen 2>&1 | grep --line-buffered -E '^bench: |^# start'
 }
 
 # present_probe full-screen, then in a 1280 x 800 window, each its own sub-phase, so the host's

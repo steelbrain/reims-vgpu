@@ -490,7 +490,7 @@ EOF
   set -e
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
-  for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv gpuload.log serial.log desktop.png drag.txt drag.log; do
+  for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log; do
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
@@ -545,6 +545,9 @@ report() {
 # The bench leg alone: what a detached leg runs, after its run's verdict.
 if [[ $bench == only ]]; then
   say "lane-gate bench leg: ${sha:0:12}, run $runid"
+  # The lane host's scripts as the gate has them now: the leg may start long after its run shipped.
+  rm -f "$RUN/steps/ship.ok"
+  step ship do_ship || die "the lane host's scripts could not be shipped"
   rm -f "$RUN/steps/bench.ok" "$RUN/steps/bench.fail"
   echo bench >> "$RUN/ran"
   step bench do_boot bench || true
