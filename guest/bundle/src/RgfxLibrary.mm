@@ -17,8 +17,10 @@
 #import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
 
+#include <array>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <unistd.h>
@@ -359,9 +361,58 @@ RGFX_LOG_UNRECOGNIZED
 
 @end
 
+namespace {
+
+// A .metallib's function list as readMetallibFunctions reads it: `readable` where the bytes were
+// a readable .metallib.
+struct FunctionTable {
+	std::vector<MetallibFunction> functions;
+	bool readable = false;
+};
+
+// The most function tables the process keeps by content key (functionTableOf).
+constexpr size_t kKeptFunctionTables = 512;
+
+// The function table of the `length` bytes at `bytes`, whose content key is `key` (32 bytes, or
+// null for bytes with none): read from them, or, for a key the process read before, the table read
+// then, shared. A key covers the function list and its metadata (RgfxLibraryKey.hpp), so bytes of
+// one key have one table; a framework library a process loads again (MPSImage's, 1,837 functions:
+// measured 4.4 to 5.1 ms a load, the cost following the function count) is not read again. The
+// first kKeptFunctionTables keys are kept for the process's life.
+std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_t length,
+                                                     const uint8_t *key)
+{
+	auto read = [&] {
+		auto table = std::make_shared<FunctionTable>();
+		table->readable = readMetallibFunctions(bytes, length, table->functions);
+		return std::shared_ptr<const FunctionTable>(std::move(table));
+	};
+	if (key == nullptr)
+		return read();
+	typedef std::array<uint8_t, 32> Key;
+	static std::mutex lock;
+	// Never destroyed: a library may be made or freed on any thread while the process exits.
+	static auto *kept = new std::map<Key, std::shared_ptr<const FunctionTable>>();
+	Key k;
+	std::memcpy(k.data(), key, k.size());
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		auto found = kept->find(k);
+		if (found != kept->end())
+			return found->second;
+	}
+	std::shared_ptr<const FunctionTable> table = read();
+	std::lock_guard<std::mutex> hold(lock);
+	if (kept->size() < kKeptFunctionTables)
+		return kept->emplace(k, table).first->second;
+	return table;
+}
+
+} // namespace
+
 @implementation RgfxLibrary {
-	std::vector<MetallibFunction> _functions; // the .metallib's function list
-	BOOL _haveFunctionTable;                  // the bytes were a readable .metallib
+	// The .metallib's function list, shared by every library of its content key (functionTableOf).
+	std::shared_ptr<const FunctionTable> _table;
 	std::mutex _shadowLock;                   // guards the three below
 	dispatch_data_t _source;                  // the bytes, kept for the shadow
 	RgfxShadowMaker _shadowMaker;
@@ -390,18 +441,24 @@ static bool rgfxMade(uint32_t status)
 	return status == RGFX_STATUS_OK || status == kRgfxNoAnswer;
 }
 
-// The library `objId` over `bytes`, its function table read from them.
+// The library `objId` over `bytes`, of content key `key` (32 bytes, or null), its function table
+// read from them, or the one the process read for that key (functionTableOf).
 + (instancetype)rgfxLibraryWithObjId:(RgfxObjId)objId
                                bytes:(const void *)bytes
                               length:(NSUInteger)length
+                                 key:(const uint8_t *)key
                               device:(id<MTLDevice>)device
                           serializer:(RgfxSerializer *)serializer
 {
 	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
 	if (lib != nil)
-		lib->_haveFunctionTable =
-		    readMetallibFunctions(static_cast<const uint8_t *>(bytes), length, lib->_functions);
+		lib->_table = functionTableOf(static_cast<const uint8_t *>(bytes), length, key);
 	return lib;
+}
+
+- (const void *)rgfxFunctionTable
+{
+	return _table.get();
 }
 
 + (instancetype)libraryWithData:(const void *)bytes
@@ -425,6 +482,7 @@ static bool rgfxMade(uint32_t status)
 	return [self rgfxLibraryWithObjId:created.obj_id
 	                            bytes:bytes
 	                           length:length
+	                              key:key
 	                           device:device
 	                       serializer:serializer];
 }
@@ -443,6 +501,7 @@ static bool rgfxMade(uint32_t status)
 	return [self rgfxLibraryWithObjId:found.obj_id
 	                            bytes:bytes
 	                           length:length
+	                              key:key
 	                           device:device
 	                       serializer:serializer];
 }
@@ -468,6 +527,7 @@ static bool rgfxMade(uint32_t status)
 	return [self rgfxLibraryWithObjId:objId
 	                            bytes:bytes
 	                           length:length
+	                              key:key
 	                           device:device
 	                       serializer:serializer];
 }
@@ -478,7 +538,7 @@ static bool rgfxMade(uint32_t status)
 	const char *n = name.UTF8String;
 	if (n == nullptr)
 		return nullptr;
-	for (const MetallibFunction &f : _functions) {
+	for (const MetallibFunction &f : _table->functions) {
 		if (f.name == n)
 			return &f;
 	}
@@ -494,7 +554,7 @@ static bool rgfxMade(uint32_t status)
 		return nil;
 	}
 	const MetallibFunction *entry = nullptr;
-	if (_haveFunctionTable) {
+	if (_table->readable) {
 		entry = [self rgfxEntryNamed:name];
 		if (entry == nullptr)
 			return nil;
@@ -670,8 +730,8 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 {
 	if (error)
 		*error = nil;
-	const MetallibFunction *entry = _haveFunctionTable ? [self rgfxEntryNamed:name] : nullptr;
-	if (name == nil || (_haveFunctionTable && entry == nullptr)) {
+	const MetallibFunction *entry = _table->readable ? [self rgfxEntryNamed:name] : nullptr;
+	if (name == nil || (_table->readable && entry == nullptr)) {
 		if (error)
 			*error = rgfxFunctionNotFound(name);
 		return nil;
@@ -763,8 +823,9 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 {
 	// The .metallib's function list but its extern functions, as Metal lists it; empty for raw
 	// AIR, whose functions callers name directly by string.
-	NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:_functions.size()];
-	for (const MetallibFunction &f : _functions) {
+	NSMutableArray<NSString *> *names =
+	    [NSMutableArray arrayWithCapacity:_table->functions.size()];
+	for (const MetallibFunction &f : _table->functions) {
 		if (f.type != kRgfxFunctionTypeExtern)
 			[names addObject:[NSString stringWithUTF8String:f.name.c_str()]];
 	}

@@ -1622,6 +1622,46 @@ void test_library_key()
 	CHECK(!rgfxLibraryKey(other.data(), 0x40, key));
 }
 
+// A file's library key is found once for the file's identity: a load of the same identity takes
+// the key found before without reading the bytes, and an identity a rewrite changes (its size,
+// its times to the nanosecond, its inode) reads them again.
+void test_library_key_of_file()
+{
+	std::vector<uint8_t> lib = syntheticMetallib();
+	std::vector<uint8_t> other = syntheticMetallib();
+	other[0x75] ^= 0xff;
+	uint8_t libKey[32] = {}, otherKey[32] = {}, key[32] = {};
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), libKey));
+	CHECK(rgfxLibraryKey(other.data(), other.size(), otherKey));
+	CHECK(std::memcmp(libKey, otherKey, 32) != 0);
+	const RgfxFileIdentity file = { 0x1001, 0x77, lib.size(), 1700000000, 5, 1700000000, 6 };
+	CHECK(rgfxLibraryKeyOfFile(file, lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, libKey, 32) == 0);
+	// The same identity: the key found before, whatever the bytes now hold.
+	CHECK(rgfxLibraryKeyOfFile(file, other.data(), other.size(), key));
+	CHECK(std::memcmp(key, libKey, 32) == 0);
+	// Each change a rewrite makes: the bytes keyed again.
+	for (int field = 0; field < 4; field++) {
+		RgfxFileIdentity rewritten = file;
+		if (field == 0)
+			rewritten.modified_ns++;
+		else if (field == 1)
+			rewritten.changed_ns++;
+		else if (field == 2)
+			rewritten.inode++;
+		else
+			rewritten.device++;
+		CHECK(rgfxLibraryKeyOfFile(rewritten, other.data(), other.size(), key));
+		CHECK(std::memcmp(key, otherKey, 32) == 0);
+	}
+	// Bytes that are no .metallib have no key, and none is kept for them.
+	const RgfxFileIdentity notLib = { 0x1002, 0x78, 4, 1, 2, 3, 4 };
+	const uint8_t junk[4] = { 1, 2, 3, 4 };
+	CHECK(!rgfxLibraryKeyOfFile(notLib, junk, sizeof(junk), key));
+	CHECK(rgfxLibraryKeyOfFile(notLib, lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, libKey, 32) == 0);
+}
+
 // Keyed library messages through the kext's route: the create carries its key and hands back the
 // device's answer; a lookup is one LIBRARY_LOOKUP of its own, answered; a streamed library's
 // chunks carry the key and its answer.
@@ -2138,6 +2178,7 @@ int main()
 	test_render_pass_sample_positions();
 	test_forwarded_lifecycle();
 	test_library_key();
+	test_library_key_of_file();
 	test_keyed_library_messages();
 	test_heap_ranges();
 	test_heap_texture_size_query();

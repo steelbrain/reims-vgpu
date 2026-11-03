@@ -1249,6 +1249,39 @@ std::vector<uint8_t> nextMessage(TestRing &ring, uint32_t type)
 
 // A library create forwards its bytes unchanged (RGFX_CMD_LIBRARY_CREATE), and the
 // library vends a function by name as a guest-side RgfxFunction (no wire message).
+// Libraries made from bytes of one content key share one function table, read once for the
+// process (a framework library loaded again is not read again); bytes with no key read their own.
+void test_libraries_of_one_key_share_their_function_table()
+{
+	Fixture fx;
+	std::vector<uint8_t> metallib(0x30, 0);
+	std::memcpy(metallib.data(), "MTLB", 4);
+	metallib[0x18] = 0x30; // the function list's offset: one of no functions, at the end
+	metallib.resize(0x34, 0);
+	uint8_t key[32] = {};
+	key[0] = 0x5a;
+	key[31] = 0xa5;
+	auto make = [&](const uint8_t *k) {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:metallib.data()
+		                                        length:metallib.size()
+		                                           key:k
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+		return lib;
+	};
+	RgfxLibrary *first = make(key);
+	RgfxLibrary *again = make(key);
+	RgfxLibrary *unkeyed = make(nullptr);
+	CHECK(first != nil && again != nil && unkeyed != nil);
+	CHECK([first rgfxFunctionTable] != nullptr);
+	CHECK([again rgfxFunctionTable] == [first rgfxFunctionTable]);
+	CHECK([unkeyed rgfxFunctionTable] != [first rgfxFunctionTable]);
+	CHECK(first.functionNames.count == 0 && again.functionNames.count == 0);
+}
+
 void test_library_and_function_routing()
 {
 	Fixture fx;
@@ -9513,6 +9546,7 @@ int main(int argc, char **argv)
 		test_heap_routing_and_suballoc();
 		test_resource_guards();
 		test_library_and_function_routing();
+		test_libraries_of_one_key_share_their_function_table();
 		test_render_pipeline_routing();
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();

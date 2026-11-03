@@ -21,4 +21,30 @@ constexpr char kRgfxLibraryKeyPrefix[] = "rgfx-library-v1";
 /// that are no .metallib (no "MTLB" magic) or whose section does not lie inside them.
 bool rgfxLibraryKey(const uint8_t *bytes, size_t length, uint8_t key[32]);
 
+/// A file's identity, as stat(2) gives it: its device and inode, its size, and its modification
+/// and status-change times to the nanosecond, each of which a rewrite of the file changes.
+struct RgfxFileIdentity {
+	uint64_t device;
+	uint64_t inode;
+	uint64_t size;
+	int64_t modified_s;
+	int64_t modified_ns;
+	int64_t changed_s;
+	int64_t changed_ns;
+
+	bool operator<(const RgfxFileIdentity &o) const;
+	bool operator==(const RgfxFileIdentity &o) const;
+};
+
+/// rgfxLibraryKey of the `length` bytes at `bytes`, read from the file whose identity was `file`
+/// both before and after the read: the key the process found before for that identity, with no
+/// byte read, else rgfxLibraryKey's, kept for it (the first kRgfxKeptFileKeys identities, for the
+/// process's life). So a library a process loads again from a file (newLibraryWithURL:) is not
+/// hashed again, and a file rewritten since is.
+bool rgfxLibraryKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
+                          uint8_t key[32]);
+
+/// The most file identities rgfxLibraryKeyOfFile keeps.
+constexpr size_t kRgfxKeptFileKeys = 1024;
+
 #endif // RGFX_LIBRARY_KEY_HPP_

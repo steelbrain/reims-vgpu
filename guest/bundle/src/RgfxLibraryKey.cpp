@@ -5,7 +5,11 @@
 
 #include <CommonCrypto/CommonDigest.h>
 
+#include <array>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 namespace {
 
@@ -49,5 +53,52 @@ bool rgfxLibraryKey(const uint8_t *bytes, size_t length, uint8_t key[32])
 	update(ctx, bytes, static_cast<size_t>(at));
 	update(ctx, bytes + at + size, static_cast<size_t>(length - at - size));
 	CC_SHA256_Final(key, &ctx);
+	return true;
+}
+
+namespace {
+
+std::tuple<uint64_t, uint64_t, uint64_t, int64_t, int64_t, int64_t, int64_t>
+fields(const RgfxFileIdentity &f)
+{
+	return std::make_tuple(f.device, f.inode, f.size, f.modified_s, f.modified_ns, f.changed_s,
+	                       f.changed_ns);
+}
+
+} // namespace
+
+bool RgfxFileIdentity::operator<(const RgfxFileIdentity &o) const
+{
+	return fields(*this) < fields(o);
+}
+
+bool RgfxFileIdentity::operator==(const RgfxFileIdentity &o) const
+{
+	return fields(*this) == fields(o);
+}
+
+bool rgfxLibraryKeyOfFile(const RgfxFileIdentity &file, const uint8_t *bytes, size_t length,
+                          uint8_t key[32])
+{
+	typedef std::array<uint8_t, 32> Key;
+	static std::mutex lock;
+	// Never destroyed: a library may be loaded on any thread while the process exits.
+	static auto *kept = new std::map<RgfxFileIdentity, Key>();
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		auto found = kept->find(file);
+		if (found != kept->end()) {
+			std::memcpy(key, found->second.data(), 32);
+			return true;
+		}
+	}
+	if (!rgfxLibraryKey(bytes, length, key))
+		return false;
+	std::lock_guard<std::mutex> hold(lock);
+	if (kept->size() < kRgfxKeptFileKeys) {
+		Key k;
+		std::memcpy(k.data(), key, k.size());
+		kept->emplace(file, k);
+	}
 	return true;
 }

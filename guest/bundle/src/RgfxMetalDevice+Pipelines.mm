@@ -19,6 +19,7 @@
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 @implementation RgfxMetalDevice (Pipelines)
@@ -48,6 +49,19 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	length = static_cast<NSUInteger>(size);
 }
 
+// The identity of the file at `path` (RgfxFileIdentity); false where it has none.
+bool fileIdentity(const char *path, RgfxFileIdentity &out)
+{
+	struct stat st = {};
+	if (path == nullptr || stat(path, &st) != 0)
+		return false;
+	out = RgfxFileIdentity{ static_cast<uint64_t>(st.st_dev),     static_cast<uint64_t>(st.st_ino),
+	                        static_cast<uint64_t>(st.st_size),    st.st_mtimespec.tv_sec,
+	                        st.st_mtimespec.tv_nsec,              st.st_ctimespec.tv_sec,
+	                        st.st_ctimespec.tv_nsec };
+	return true;
+}
+
 } // namespace
 
 // Every library-from-bytes entry point funnels through here. A .metallib (or a fat file's AIR
@@ -55,8 +69,11 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 // process with no bytes sent; otherwise the bytes go as one LIBRARY_CREATE (waiting for room
 // while the ring is momentarily full) or stream through region blocks, with the key, and the
 // device's answer is waited for, so a library it refuses is nil and an NSError here, as Metal's.
+// Bytes read from a file whose identity is `file` (null for none) take the key the process found
+// for that identity before, if any (rgfxLibraryKeyOfFile).
 - (nullable id<MTLLibrary>)rgfxLibraryWithBytes:(const void *)bytes
                                          length:(NSUInteger)length
+                                           file:(const RgfxFileIdentity *)file
                                           error:(__autoreleasing NSError **)error
 {
 	selectAirSlice(bytes, length);
@@ -67,7 +84,9 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 		return nil;
 	}
 	uint8_t key[32];
-	const bool keyed = rgfxLibraryKey(static_cast<const uint8_t *>(bytes), length, key);
+	const uint8_t *p = static_cast<const uint8_t *>(bytes);
+	const bool keyed = file != nullptr ? rgfxLibraryKeyOfFile(*file, p, length, key)
+	                                   : rgfxLibraryKey(p, length, key);
 	if (keyed) {
 		id<MTLLibrary> found = [RgfxLibrary libraryFoundWithKey:key
 		                                                  bytes:bytes
@@ -137,7 +156,7 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	const void *bytes = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(data, &bytes, &size);
-	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:bytes length:size error:error];
+	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:bytes length:size file:nullptr error:error];
 	[self rgfxKeepSource:map ofLibrary:lib];
 	return lib;
 }
@@ -339,8 +358,13 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 	return [super newLibraryWithDAG:dag functions:shadows error:error];
 }
 
+// A file's library is keyed by the file's identity where it is the same before and after the
+// read (rgfxLibraryKeyOfFile), so a framework's library loaded again is not hashed again.
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
+	const char *path = url.isFileURL ? url.fileSystemRepresentation : nullptr;
+	RgfxFileIdentity before = {}, after = {};
+	const bool identified = fileIdentity(path, before);
 	NSError *readError = nil;
 	NSData *data = url ? [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe
 	                                             error:&readError]
@@ -351,7 +375,12 @@ void selectAirSlice(const void *&bytes, NSUInteger &length)
 			                                    @"newLibraryWithURL: could not read URL");
 		return nil;
 	}
-	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:data.bytes length:data.length error:error];
+	const bool same = identified && fileIdentity(path, after) && after == before &&
+	                  after.size == data.length;
+	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:data.bytes
+	                                         length:data.length
+	                                           file:same ? &before : nullptr
+	                                          error:error];
 	dispatch_data_t source = dispatch_data_create(data.bytes, data.length, nil, ^{
 		(void)data;
 	});

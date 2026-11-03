@@ -59,6 +59,10 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 /// which Metal does not serialize.
 - (void)rgfxSetMadeFromURL;
 
+/// The function table the library reads its functions from: one object for every library of the
+/// process made from bytes of one content key (tests).
+- (const void *)rgfxFunctionTable;
+
 /// The private MTLLibrary members MPS and Core Image call, as Metal answers them (measured: macOS
 /// 27): nil for the bitcode of a library made from bytes, and its shadow's for one Metal's link or
 /// stitching made; and the library written to `url` by its shadow, or Metal's refusal of one made
