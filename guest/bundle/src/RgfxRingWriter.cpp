@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <os/log.h>
 #include <thread>
 
 namespace {
@@ -23,6 +24,9 @@ constexpr uint32_t kProducerWaiting = __builtin_offsetof(RgfxRingHeader, produce
 // How long a post waits for the host's room record at most where a completion thread takes it,
 // before it looks again: a backstop only.
 constexpr uint32_t kRoomBackstopUs = 20000;
+
+// How often a writer's room line is logged at most, while its posts sleep for room.
+constexpr uint64_t kSleepsLogNs = 1000000000;
 
 // A message's header is 16 bytes; sizes are a multiple of 8.
 constexpr uint32_t kHeaderBytes = sizeof(RgfxMsgHeader);
@@ -149,11 +153,34 @@ bool RgfxRingWriter::post(uint32_t type, const void *message, uint32_t size, uin
 		if (whileWaiting)
 			whileWaiting();
 		sleepUs = sleepUs == 0 ? 20 : std::min<uint32_t>(sleepUs * 2, 1000);
+		const auto from = std::chrono::steady_clock::now();
+		bool byRecord = false;
 		if (m_room)
-			m_room->waitPast(seen, std::chrono::microseconds(whileWaiting ? sleepUs : kRoomBackstopUs));
+			byRecord = m_room->waitPast(
+			    seen, std::chrono::microseconds(whileWaiting ? sleepUs : kRoomBackstopUs));
 		else
 			std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+		noteSleep(from, byRecord);
 	}
+}
+
+void RgfxRingWriter::noteSleep(std::chrono::steady_clock::time_point from, bool byRecord)
+{
+	const auto to = std::chrono::steady_clock::now();
+	const auto ns = [](std::chrono::steady_clock::duration d) {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+	};
+	RgfxRingRoomSleeps seen;
+	{
+		std::lock_guard<std::mutex> hold(m_sleepsLock);
+		if (!m_sleeps.note(ns(to - from), byRecord, ns(to.time_since_epoch()), kSleepsLogNs))
+			return;
+		seen = m_sleeps;
+	}
+	os_log(OS_LOG_DEFAULT,
+	       "RGFX: ring %u room: %llu sleeps (%llu ended by a SUBMIT_ROOM record), %llu us asleep "
+	       "in all, %llu us at most",
+	       m_ringId, seen.sleeps, seen.woken, seen.sleptNs / 1000, seen.mostNs / 1000);
 }
 
 bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,

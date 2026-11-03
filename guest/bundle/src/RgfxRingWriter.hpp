@@ -153,7 +153,14 @@ private:
 	RgfxAwaitAnswer m_await = nullptr;
 	void *m_deferredContext = nullptr;
 
+	// Counts one sleep of post's from `from` (byRecord: a room record ended it), and logs the
+	// counts at the first sleep and then at most every second.
+	void noteSleep(std::chrono::steady_clock::time_point from, bool byRecord);
+
 	std::shared_ptr<RgfxRingRoomEvents> m_room; // setRoomEvents'
+	// The posts' sleeps for room, under m_sleepsLock, logged at most every second (post).
+	std::mutex m_sleepsLock;
+	RgfxRingRoomSleeps m_sleeps;
 
 	std::mutex m_lock;
 	uint64_t m_produced;

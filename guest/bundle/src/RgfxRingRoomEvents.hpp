@@ -50,4 +50,31 @@ private:
 	uint64_t m_count = 0;
 };
 
+/// What a writer's sleeps for room came to, for its log line (RgfxRingWriter::post): the sleeps,
+/// those a room record ended, and their time, in all and at most. The caller serialises.
+struct RgfxRingRoomSleeps {
+	uint64_t sleeps = 0;
+	uint64_t woken = 0;
+	uint64_t sleptNs = 0;
+	uint64_t mostNs = 0;
+	// When the last line was logged, in nanoseconds; 0 before the first.
+	uint64_t loggedNs = 0;
+
+	/// Counts one sleep of `ns`, `woken` where a room record ended it: whether the counts are
+	/// logged now, at the first sleep and then at most every `intervalNs` (`nowNs` on the same
+	/// clock as loggedNs).
+	bool note(uint64_t ns, bool byRecord, uint64_t nowNs, uint64_t intervalNs)
+	{
+		sleeps++;
+		woken += byRecord ? 1 : 0;
+		sleptNs += ns;
+		if (ns > mostNs)
+			mostNs = ns;
+		if (loggedNs != 0 && nowNs - loggedNs < intervalNs)
+			return false;
+		loggedNs = nowNs != 0 ? nowNs : 1;
+		return true;
+	}
+};
+
 #endif // RGFX_RING_ROOM_EVENTS_HPP_
