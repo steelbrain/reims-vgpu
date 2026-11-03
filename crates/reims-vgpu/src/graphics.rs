@@ -33,16 +33,17 @@ use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
-    RGFX_VIDEO_CAPS_VERSION, RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxEventSignalled, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
+    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
+    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_ORDER,
+    RGFX_FEATURE_SURFACE_PAGES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
+    RgfxBlockRelease, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled,
+    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
     RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
@@ -212,8 +213,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks. Every
             // host answers a command buffer's ask for its submission, and orders command buffers
             // of different queues over the IOSurfaces they share where the guest names the order.
+            // Both platforms make indirect command buffers, so every host decodes their messages.
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
+                | u64::from(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS)
                 | match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
                     (true, true) => u64::from(RGFX_FEATURE_SURFACE_PAGES),
@@ -712,7 +715,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.create_sampler(poster, message);
                 return;
             }
+            RGFX_CMD_ICB_CREATE => {
+                self.create_icb(poster, message);
+                return;
+            }
             RGFX_CMD_COMMAND_BUFFER => self.pending.wait_for_command_buffer(message),
+            RGFX_CMD_ICB_WRITE => self.pending.wait_for_icb_write(message),
             _ => {}
         }
         entry::run(|_| {
@@ -1065,6 +1073,39 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             );
         }
         poster.post(answer.as_bytes());
+    }
+
+    /// An indirect command buffer's create from ring 0, answered at once through `poster` with
+    /// its `gpuResourceID` (`ICB_STATE`), which the guest's buffer answers and its argument
+    /// buffers hold, so a kernel encoding through one reaches this buffer: the id the platform
+    /// numbers it by. The buffer is stored under its id before the answer. A create the platform
+    /// raises at is answered refused, as one it refuses.
+    fn create_icb(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer = entry::run(|_| refusing(|| decoder.icb_state(&self.device, message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "an indirect command buffer create (type {ty:#x}, seqno {seqno}, object \
+                 {obj_id:#x}) faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxIcbState {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_ICB_STATE,
+                        size: size_of::<RgfxIcbState>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxIcbState::default()
+                })
+        });
+        if let Some(answer) = answer {
+            poster.post(answer.as_bytes());
+        }
     }
 
     /// An argument buffer's layout from ring 0, answered at once: written into the sender's

@@ -34,6 +34,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use reims_graphics::icb::{
+    RGFX_ICB_OP_COMPUTE_PIPELINE, RGFX_ICB_OP_RENDER_PIPELINE, RgfxIcbObject, RgfxIcbRecord,
+};
 use reims_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
 };
@@ -43,7 +46,7 @@ use reims_graphics::ops::render::{
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_BODY_OFFSET, RgfxCommandBuffer, RgfxOpHeader,
 };
-use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbWrite};
 use reims_vgpu_core::platform::os::clock::MonoTime;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 use zerocopy::FromBytes;
@@ -505,6 +508,48 @@ impl Pending {
             self.done.wait(&mut ids);
         }
     }
+}
+
+impl Pending {
+    /// Waits until no pipeline the `ICB_WRITE` `message`'s records set is pending.
+    pub(crate) fn wait_for_icb_write(&self, message: &[u8]) {
+        let mut ids = self.ids.lock();
+        if ids.is_empty() {
+            return;
+        }
+        let named = icb_write_pipelines(message);
+        while named.iter().any(|id| ids.contains_key(id)) {
+            self.done.wait(&mut ids);
+        }
+    }
+}
+
+/// The pipelines an `ICB_WRITE` message's records set, nil left out. The walk stops at a record
+/// it cannot step past, as the decoder does.
+pub(crate) fn icb_write_pipelines(message: &[u8]) -> Vec<u64> {
+    let mut named = Vec::new();
+    let Ok((write, _)) = RgfxIcbWrite::read_from_prefix(message) else {
+        return named;
+    };
+    let end = (write.header.size as usize).min(message.len());
+    let mut at = size_of::<RgfxIcbWrite>();
+    while let Some(rest) = message.get(at..end) {
+        let Ok((rec, body)) = RgfxIcbRecord::read_from_prefix(rest) else {
+            break;
+        };
+        let len = usize::from(rec.size);
+        if len < size_of::<RgfxIcbRecord>() || len % 8 != 0 || len > rest.len() {
+            break;
+        }
+        if (rec.op == RGFX_ICB_OP_RENDER_PIPELINE || rec.op == RGFX_ICB_OP_COMPUTE_PIPELINE)
+            && let Ok((pipeline, _)) = RgfxIcbObject::read_from_prefix(body)
+            && pipeline.obj_id != 0
+        {
+            named.push(pipeline.obj_id);
+        }
+        at += len;
+    }
+    named
 }
 
 /// The pipelines a `COMMAND_BUFFER` message's ops name: each `SET_RENDER_PIPELINE_STATE` and

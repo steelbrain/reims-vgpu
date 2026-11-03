@@ -4028,8 +4028,9 @@ fn a_failed_context_s_pipeline_creates_are_carried_out() {
 
 /// With a memory map the device carries out `SURFACE_PAGES` where the host's page is the
 /// guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does. Every device answers
-/// a command buffer's ask for its submission (`CB_SUBMITTED`) and orders command buffers over the
-/// IOSurfaces they share (`SURFACE_ORDER`)
+/// a command buffer's ask for its submission (`CB_SUBMITTED`), orders command buffers over the
+/// IOSurfaces they share (`SURFACE_ORDER`) and makes indirect command buffers
+/// (`INDIRECT_COMMAND_BUFFERS`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -4061,14 +4062,18 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     };
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
-        want | RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_SURFACE_ORDER
+        want | RGFX_FEATURE_CB_SUBMITTED
+            | RGFX_FEATURE_SURFACE_ORDER
+            | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
-        RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_SURFACE_ORDER
+        RGFX_FEATURE_CB_SUBMITTED
+            | RGFX_FEATURE_SURFACE_ORDER
+            | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
     );
 }
 
@@ -4624,5 +4629,204 @@ fn a_library_made_across_a_reset_is_not_in_the_new_device_s_cache() {
         ),
         RGFX_STATUS_NOT_FOUND,
         "the rebooted guest's lookup hits a library made for the guest before"
+    );
+}
+
+/// Indirect command buffers through the rings: the device offers them, a create on ring 0 is
+/// answered with the platform's `gpuResourceID`, and a command buffer posted after an `ICB_WRITE`
+/// executes the commands it wrote: the write's setters reach the platform's buffer before the
+/// buffer's execute, and the buffer completes.
+#[test]
+fn an_icb_is_made_written_and_executed_through_the_rings() {
+    use reims_graphics::icb::{
+        RGFX_ICB_OP_DISPATCH_THREADGROUPS, RGFX_ICB_OP_KERNEL_BUFFER, RgfxIcbBuffer,
+        RgfxIcbDispatch, RgfxIcbRecord,
+    };
+    use reims_graphics::ops::compute::{
+        RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RgfxComputeOpExecuteCommandsInBuffer,
+    };
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    assert_ne!(
+        device.mmio_read(RGFX_REG_FEATURES_LO.into()) & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+        0,
+        "the host offers indirect command buffers"
+    );
+    device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_LO.into(),
+        RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    );
+    assert_ne!(
+        device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into())
+            & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+        0,
+        "the guest may take them"
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let context = 3;
+    let queue = obj(context, 1);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            0
+        ),
+        RGFX_STATUS_OK
+    );
+    let buffer = obj(context, 2);
+    guest.send(
+        &device,
+        RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: buffer,
+            length: 4096,
+            ..RgfxBufferCreate::default()
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let icb = obj(context, 50);
+    guest.send(
+        &device,
+        RgfxIcbCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_ICB_CREATE,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: icb,
+            max_command_count: 4,
+            command_types: 0x20,
+            max_kernel_buffer_bind_count: 1,
+            ..RgfxIcbCreate::default()
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    let bytes = next_event(&mut guest, RGFX_EVT_ICB_STATE);
+    let state = RgfxIcbState::read_from_bytes(&bytes).unwrap();
+    assert_eq!(
+        (state.header.seqno, state.status),
+        (guest.seqno, RGFX_STATUS_OK)
+    );
+    assert_ne!(state.gpu_resource_id, 0);
+
+    // The CPU's encodes of command 1: its kernel buffer, then its dispatch.
+    let record = |op: u16, body: &[u8]| {
+        let mut r = RgfxIcbRecord {
+            op,
+            size: (8 + body.len()) as u16,
+            command_index: 1,
+        }
+        .as_bytes()
+        .to_vec();
+        r.extend_from_slice(body);
+        r
+    };
+    let mut write = RgfxIcbWrite {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_ICB_WRITE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: icb,
+    }
+    .as_bytes()
+    .to_vec();
+    write.extend(record(
+        RGFX_ICB_OP_KERNEL_BUFFER,
+        RgfxIcbBuffer {
+            obj_id: buffer,
+            offset: 64,
+            index: 0,
+            reserved_14: 0,
+        }
+        .as_bytes(),
+    ));
+    write.extend(record(
+        RGFX_ICB_OP_DISPATCH_THREADGROUPS,
+        RgfxIcbDispatch {
+            grid: [1, 1, 1],
+            threadgroup: [32, 1, 1],
+        }
+        .as_bytes(),
+    ));
+    guest.send(&device, write);
+
+    // A command buffer that executes commands 0 to 3, posted after the write.
+    let op = |tag: u16, body: &[u8]| {
+        let mut bytes = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: (8 + body.len()) as u32,
+        }
+        .as_bytes()
+        .to_vec();
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let mut ops = op(
+        RGFX_OP_ENCODER_BEGIN_COMPUTE,
+        RgfxComputePassDesc::default().as_bytes(),
+    );
+    ops.extend(op(
+        RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER,
+        RgfxComputeOpExecuteCommandsInBuffer {
+            indirect_command_buffer_obj_id: icb,
+            location: 0,
+            length: 4,
+        }
+        .as_bytes(),
+    ));
+    ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+    let mut cb = RgfxCommandBuffer {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER,
+            size: 0,
+            seqno: 0,
+        },
+        queue_obj_id: queue,
+        cb_obj_id: 100,
+        op_bytes: ops.len() as u64,
+    }
+    .as_bytes()
+    .to_vec();
+    cb.extend(ops);
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    ring.arm();
+    ring.send(&device, cb);
+    assert!(
+        complete_until_event(&platform, &mut ring),
+        "the buffer never completed"
+    );
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+
+    let sels = platform.call_log().sels_since(0);
+    let at = |sel: &str| {
+        sels.iter()
+            .position(|s| *s == sel)
+            .unwrap_or_else(|| panic!("no {sel} in {sels:?}"))
+    };
+    assert!(at("setKernelBuffer:offset:atIndex:") < at("executeCommandsInBuffer:withRange:"));
+    assert!(
+        at("concurrentDispatchThreadgroups:threadsPerThreadgroup:")
+            < at("executeCommandsInBuffer:withRange:")
     );
 }

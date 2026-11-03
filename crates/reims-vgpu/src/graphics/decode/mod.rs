@@ -78,36 +78,36 @@ use reims_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION,
-    RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
-    RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
-    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
-    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
-    RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP, RGFX_LINKED_PRIVATE_FUNCTIONS,
-    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
-    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
-    RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
-    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_RESOURCE_ID_LIMIT, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_YCBCR_MATRIX_DCI_P3,
-    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
-    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
-    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled,
-    RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
-    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
-    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
-    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
-    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
+    RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
+    RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
+    RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
+    RGFX_LINKED_BINARY_FUNCTIONS, RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP,
+    RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
+    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
+    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET,
+    RGFX_SURFACE_NO_WRITERS, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
+    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
+    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
+    RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate,
+    RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
+    RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
+    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk,
+    RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue,
+    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter,
+    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
@@ -138,6 +138,7 @@ mod cmdbuf;
 mod compute;
 #[cfg(test)]
 mod fuzz;
+mod icb;
 mod library;
 mod managed;
 mod render;
@@ -392,10 +393,8 @@ enum ObjHandle<P: Platform> {
     Heap(P::Heap),
     RenderPipeline(P::RenderPipeline),
     ComputePipeline(P::ComputePipeline),
-    // No create makes an indirect command buffer yet (the guest produces one on a queue, an op
-    // the first slice does not emit), so this is matched by `require_indirect_command_buffer` but
-    // not yet constructed; kept whole for when that op lands (project rule "Unread is not dead").
-    #[allow(dead_code)]
+    /// An indirect command buffer ([`RGFX_CMD_ICB_CREATE`]), which `ICB_WRITE`s encode into and
+    /// command buffers execute, copy, optimize and reset.
     Icb(P::Icb),
     /// A video session ([`RGFX_CMD_VIDEO_SESSION_CREATE`]), which its command buffers' video
     /// encoders name.
@@ -1444,6 +1443,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.decode_library(device, message)
             }
             RGFX_CMD_SAMPLER_CREATE => self.make_sampler(device, message),
+            RGFX_CMD_ICB_CREATE => Ok(self.new_icb(device, message)?.map(|_| ())),
+            RGFX_CMD_ICB_WRITE => self.icb_write(message),
             RGFX_CMD_DEPTH_STENCIL_CREATE => {
                 let Some(m) = read::<RgfxDepthStencilCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -4857,7 +4858,7 @@ mod tests {
     }
 
     /// A decoder of a fake platform, its reflection replies, and library 1 made.
-    fn pipeline_decoder() -> (
+    pub(super) fn pipeline_decoder() -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
         Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
@@ -4923,7 +4924,7 @@ mod tests {
     /// `fragment`, its `fmain`, carrying a descriptor that sets every field to a value of its own:
     /// three colour attachments, a vertex descriptor of two layouts and three attributes, depth
     /// Depth32Float, stencil Stencil8, 4 samples, every flag, topology triangle, amplification 2.
-    fn whole_render_create(obj_id: u64, fragment: bool) -> Vec<u8> {
+    pub(super) fn whole_render_create(obj_id: u64, fragment: bool) -> Vec<u8> {
         let head = size_of::<RgfxRenderPipelineCreate>();
         let layouts = [
             RgfxVertexBufferLayout {
@@ -5332,7 +5333,7 @@ mod tests {
     }
 
     /// A compute create of library 1's `cmain`, with no field past its function set.
-    fn compute_create(obj_id: u64) -> Vec<u8> {
+    pub(super) fn compute_create(obj_id: u64) -> Vec<u8> {
         let head = size_of::<RgfxComputePipelineCreate>() as u32;
         let name = b"cmain".as_slice();
         let total = (head as usize + name.len()).next_multiple_of(8);
