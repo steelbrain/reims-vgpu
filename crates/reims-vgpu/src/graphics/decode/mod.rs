@@ -77,7 +77,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
@@ -486,6 +486,10 @@ pub(crate) struct Shared<P: Platform> {
     platform: Arc<P>,
     /// Each context's state, by id, made at its first create and dropped at its close.
     contexts: Mutex<HashMap<u32, Arc<Context<P>>>>,
+    /// The last drains of the contexts closed (`CONTEXT_CLOSE`), by context, while their command
+    /// buffers may still run: a later drain of such a context, a release the kext posted behind
+    /// its close, ends after it ([`GraphicsDecoder::drain_context`]).
+    closed: Mutex<HashMap<u32, Weak<Drain>>>,
     /// The shared blocks a holder let go of (`BLOCK_UNSHARE`), by offset, until their release:
     /// each one's drain ends once every command buffer such a holder began before its unshare has
     /// finished, and gives the release's answer ([`GraphicsDecoder::block_unshared`]).
@@ -673,6 +677,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
             contexts: Mutex::new(HashMap::new()),
+            closed: Mutex::default(),
             unshared: Mutex::default(),
             surfaces: Mutex::default(),
             video: OnceLock::new(),
@@ -1489,8 +1494,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         contexts.dedup();
         let dropped = contexts.iter().map(|&c| self.drop_context(c)).sum();
         *shared.surfaces.lock() = SurfaceNames::default();
-        // Their drains go with them, and the unshared blocks' with the blocks: the answers
-        // waiting on those are owed to no one.
+        // Their drains go with them, those of the contexts closed and of the unshared blocks too:
+        // the answers waiting on those are owed to no one.
+        shared.closed.lock().clear();
         shared.unshared.lock().clear();
         let states = std::mem::take(&mut *shared.contexts.lock());
         if let Err(refusal) = refusals::refusing(move || drop(states)) {
@@ -2367,7 +2373,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// with no lock held: the answer goes then where no buffer is in flight, else on the GPU
     /// thread of the last to finish. `closed` ends the context's drains and its state (its
     /// `CONTEXT_CLOSE`); else a new one begins for its later buffers, held by this one
-    /// ([`Drain`]).
+    /// ([`Drain`]). A drain of a context closed before, whose close's drain has not ended (a
+    /// release the kext posted behind the close), gives `answer` only once that one has ended
+    /// too.
     pub(crate) fn drain_context(
         &self,
         context: u32,
@@ -2376,15 +2384,33 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> Arc<Drain> {
         let drain = if closed {
             let state = self.shared.contexts.lock().remove(&context);
-            state.map(|state| std::mem::take(&mut *state.drain.lock()))
+            let drain: Arc<Drain> = state
+                .map(|state| std::mem::take(&mut *state.drain.lock()))
+                .unwrap_or_default();
+            let mut gone = self.shared.closed.lock();
+            gone.retain(|_, d| d.strong_count() > 0);
+            gone.insert(context, Arc::downgrade(&drain));
+            drain
         } else {
             let state = self.context_made(context);
             let mut current = state.drain.lock();
             let next = Arc::new(Drain::default());
             *current.later.lock() = Some(Arc::clone(&next));
-            Some(std::mem::replace(&mut *current, next))
-        }
-        .unwrap_or_default();
+            std::mem::replace(&mut *current, next)
+        };
+        let closing = if closed {
+            None
+        } else {
+            self.shared.closed.lock().get(&context).cloned()
+        };
+        let answer = match closing {
+            // At the drain's end: where the close's drain has not ended, its end gives it.
+            Some(closing) => Box::new(move || match closing.upgrade() {
+                Some(close) => close.answers.lock().push(answer),
+                None => answer(),
+            }),
+            None => answer,
+        };
         drain.answers.lock().push(answer);
         drain
     }

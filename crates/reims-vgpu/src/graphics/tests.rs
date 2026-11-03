@@ -3555,6 +3555,46 @@ fn a_close_waits_for_a_buffer_committed_before_an_earlier_release() {
     assert_eq!(answer_of(&mut guest, close), RGFX_STATUS_OK);
 }
 
+/// A release the kext posted behind its context's close waits for the context's command buffer
+/// still in flight, as the close does: the kext gives the block out again at its answer
+#[test]
+fn a_release_behind_a_close_waits_for_the_close_s_buffers() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    let held = committed(&platform, 1)[0];
+
+    guest.send(&device, context_close(1));
+    let close = guest.seqno;
+    guest.send(&device, block_release(1, BLOCK, 0x1_0000));
+    let release = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "answered with a buffer of the closed context in flight"
+    );
+    let world = platform.world();
+    assert!(world.complete(
+        held,
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    assert_eq!(answer_of(&mut guest, close), RGFX_STATUS_OK);
+    assert_eq!(answer_of(&mut guest, release), RGFX_STATUS_OK);
+}
+
 /// A shared block's release waits for the command buffer an earlier holder committed before its
 /// `BLOCK_UNSHARE`, still in flight, as for the releasing context's own: the kext unwired the
 /// earlier holder's pages at its unshare and gives the block's memory back at the release's
