@@ -57,6 +57,7 @@ use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::memory::mapping::Mapping;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::device::GpuDevice as _;
+use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
@@ -125,6 +126,41 @@ pub(crate) struct ViewCounts {
     /// Pages blocks' views made (`RGFX_SURFACE_PAGES_PRIVATE`), each at its block's first
     /// `BUFFER_OVER_PAGES`, which `made` does not count.
     pub(crate) private: u64,
+}
+
+/// How a surface's runs lie in guest RAM, for the log: each run takes a kernel mapping of its own
+/// in the view, so their count is the view's cost.
+struct Layout {
+    runs: usize,
+    /// Runs of one host page.
+    single: usize,
+    /// Runs that end where the run before them starts: the guest's pages laid out downwards.
+    downwards: usize,
+    /// The longest run's bytes.
+    longest: u64,
+}
+
+impl Layout {
+    fn of(runs: &[RgfxPageRun], page: u64) -> Layout {
+        Layout {
+            runs: runs.len(),
+            single: runs.iter().filter(|r| r.length == page).count(),
+            downwards: (runs.windows(2))
+                .filter(|w| w[1].address.checked_add(w[1].length) == Some(w[0].address))
+                .count(),
+            longest: runs.iter().map(|r| r.length).max().unwrap_or(0),
+        }
+    }
+}
+
+impl std::fmt::Display for Layout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} runs ({} of one page, {} right below the run before, the longest {:#x} bytes)",
+            self.runs, self.single, self.downwards, self.longest
+        )
+    }
 }
 
 /// A view the cache keeps, with the buffer that holds the runtime's import of its pages.
@@ -358,13 +394,26 @@ impl<P: Platform> SurfaceViews<P> {
             self.counts.reused += 1;
             return Ok(Ok(view));
         }
+        let clock = platform.clock();
+        let start = clock.now_mono();
         let view = match self.mapped(&key, pages.length) {
             Ok(view) => view,
             Err(why) => return Ok(Err(why)),
         };
+        let mapped = clock.now_mono();
         let Some(import) = buffer_over(device, &view, 0, view.length(), 0, None)? else {
             return Ok(Err(PagesRefusal::NoBuffer));
         };
+        let imported = clock.now_mono();
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "the block at {:#x}: a view of {:#x} bytes in {}; mapped in {} us, imported in {} us",
+            pages.block_offset,
+            pages.length,
+            Layout::of(runs, GUEST_PAGE),
+            mapped.saturating_duration_since(start).as_micros(),
+            imported.saturating_duration_since(mapped).as_micros()
+        );
         self.counts.made += 1;
         self.cache.push_back(Cached {
             runs: key,

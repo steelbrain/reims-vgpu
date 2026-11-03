@@ -116,6 +116,7 @@ use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::SharedEvent;
+use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
 };
@@ -720,6 +721,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         runs: &[RgfxPageRun],
         flags: u32,
     ) -> u32 {
+        let clock = self.platform.clock();
+        let start = clock.now_mono();
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let made = {
             let mut views = self.shared.surface_views.lock();
@@ -760,6 +763,21 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_STATUS_REFUSED
             }
         };
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "SURFACE_PAGES of the block at {:#x} ({:#x} bytes, {} runs{}): {status} in {} us",
+            pages.block_offset,
+            pages.length,
+            runs.len(),
+            if private {
+                ", a pages block"
+            } else if flags & RGFX_SURFACE_PAGES_CACHED != 0 {
+                ", cached"
+            } else {
+                ""
+            },
+            clock.now_mono().saturating_duration_since(start).as_micros()
+        );
         let c = self.shared.surface_views.lock().counts();
         if (c.made + c.reused + c.bad_runs + c.not_mapped + c.private)
             .is_multiple_of(VIEWS_LOGGED_EVERY)
