@@ -2367,6 +2367,96 @@ fn a_video_buffer_is_walked_in_its_turn() {
     }
 }
 
+/// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of
+/// another queue that names the first of two buffers, sent while the first is still walked and
+/// the second, which holds no `SURFACE_ORDER`, has been walked whole beside it, waits on the GPU
+/// for the first's signal, which comes once the first is walked. Had the second noted itself
+/// taken at its walk's end, the order would read the first as taken with no signal and the
+/// buffer would wait for nothing
+#[test]
+fn a_buffer_named_while_its_queue_s_later_buffer_is_walked_first_is_waited_for() {
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
+        RgfxSurfaceOrderWait,
+    };
+
+    const WAIT: &str = "encodeWaitForEvent:value:";
+    const SIGNAL: &str = "encodeSignalEvent:value:";
+    const RING_DATA: u32 = 0x1_0000;
+    let at = |mut message: Vec<u8>, seqno: u64| {
+        message[8..16].copy_from_slice(&seqno.to_le_bytes());
+        message
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, mut first) = one_queue(&raised);
+    let rings = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+    );
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 2, rings, RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    let mut second = QueueRing::new(&device, rings.0, rings.1, u64::from(RING_DATA));
+    let gate = WalkGate::on(&device);
+    // Queue 1's buffer at seqno 1 names the op (it uses a shared surface); it stops at the gate.
+    let named = command_buffer_of(
+        obj(1, 1),
+        100,
+        &[
+            (RGFX_OP_SURFACE_ORDER, &[]),
+            (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            (RGFX_OP_ENCODER_END, &[]),
+        ],
+    );
+    first.send(&device, at(named, 1));
+    assert!(gate.reached(), "the first walk did not start");
+    // Its buffer at seqno 2 holds no op, and is walked whole beside it.
+    first.send(
+        &device,
+        at(sampler_command_buffer(obj(1, 1), 101, obj(1, 4)), 2),
+    );
+    assert!(gate.passed(3), "the second buffer was not walked");
+    std::thread::sleep(Duration::from_millis(50));
+    // Queue 2's buffer names queue 1's at seqno 1.
+    let mark = platform.call_log().mark();
+    let wait = RgfxSurfaceOrderWait {
+        queue_obj_id: obj(1, 1),
+        seqno: 1,
+    };
+    let waiting = command_buffer_of(obj(1, 2), 200, &[(RGFX_OP_SURFACE_ORDER, wait.as_bytes())]);
+    second.send(&device, at(waiting, 1));
+    committed(&platform, 1);
+    assert_eq!(
+        platform
+            .call_log()
+            .sels_since(mark)
+            .iter()
+            .filter(|&&s| s == WAIT)
+            .count(),
+        1,
+        "the buffer named does not wait for queue 1's buffer"
+    );
+    let mark = platform.call_log().mark();
+    gate.open();
+    committed(&platform, 3);
+    assert!(
+        platform.call_log().sels_since(mark).contains(&SIGNAL),
+        "queue 1's named buffer did not signal its timeline"
+    );
+    for cb in [100, 101] {
+        assert!(complete_until_event(&platform, &mut first), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&first.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+    assert!(
+        complete_until_event(&platform, &mut second),
+        "no completion"
+    );
+    let done = RgfxCbComplete::read_from_bytes(&second.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (200, RGFX_CB_OK));
+}
+
 /// An argument layout query on ring 0 writes the platform's layout into the sender's block and is
 /// answered by a `COMPLETE` at its seqno, making no object; one whose block is another process's
 /// is refused, with nothing written
