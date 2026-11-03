@@ -877,7 +877,6 @@ mod tests {
                 size_bytes: 0x2_0000,
                 options: 0,
                 heap_type: 1,
-                ..RgfxHeapOverHostMemory::default()
             }),
             Ok(())
         );
