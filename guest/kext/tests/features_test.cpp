@@ -42,8 +42,9 @@ constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CON
 // command buffers over IOSurfaces and places its Managed buffers' CPU copies in its heaps, neither
 // of which needs anything of the kext, makes indirect command buffers, whose creates and writes,
 // as records or as slots, the kext admits, makes its slabs' heaps over pages blocks, whose blocks
-// the kext checks, and a full submission ring's post waits for the host's room record; the kext
-// makes WindowServer's queues unshared, which needs nothing of the bundle.
+// the kext checks, a full submission ring's post waits for the host's room record, and each post
+// names the buffers of the process's other queues posted before it, which needs nothing of the
+// kext; the kext makes WindowServer's queues unshared, which needs nothing of the bundle.
 constexpr uint64_t kPages = RGFX_FEATURE_PAGES_BUFFERS;
 constexpr uint64_t kOrder = RGFX_FEATURE_SURFACE_ORDER;
 constexpr uint64_t kIcb = RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS;
@@ -52,8 +53,9 @@ constexpr uint64_t kManaged = RGFX_FEATURE_MANAGED_AT_OFFSET;
 constexpr uint64_t kHeaps = RGFX_FEATURE_HEAP_OVER_PAGES;
 constexpr uint64_t kRoom = RGFX_FEATURE_SUBMIT_ROOM;
 constexpr uint64_t kSlots = RGFX_FEATURE_ICB_SLOTS;
+constexpr uint64_t kCommits = RGFX_FEATURE_COMMIT_ORDER;
 constexpr uint64_t kCarried =
-    kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom | kSlots;
+    kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom | kSlots | kCommits;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -61,11 +63,11 @@ constexpr uint64_t kNew = kNotCarried | kCarried;
 int main()
 {
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
-	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM
-	// and ICB_SLOTS, and writes each only where offered.
+	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
+	// ICB_SLOTS and COMMIT_ORDER, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
-	      "HEAP_OVER_PAGES, SUBMIT_ROOM and ICB slots from bit 3");
+	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots and COMMIT_ORDER from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -76,6 +78,12 @@ int main()
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kRoom) == kRoom,
 	      "SUBMIT_ROOM offered, written");
 	check(RGFX_FEATURE_ICB_SLOTS == (1u << 17), "ICB_SLOTS is bit 17");
+	check(RGFX_FEATURE_COMMIT_ORDER == (1u << 18), "COMMIT_ORDER is bit 18");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kCommits) == kCommits,
+	      "COMMIT_ORDER offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCommits, kCommits) ==
+	          (kRgfxOfferedFeatures | kCommits),
+	      "COMMIT_ORDER taken is in the word");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

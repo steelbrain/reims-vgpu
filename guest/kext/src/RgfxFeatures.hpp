@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out eight:
+// its bundle carry out nine:
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
@@ -33,7 +33,10 @@
 //  - ICB_SLOTS (bit 17), meaningful only with bit 12: the bundle writes its indirect command
 //    buffers' CPU encodes as slots in its region blocks and posts ICB_SLOTS, a write into an
 //    object made that the kext admits as any (rgfxSubmitAdmitted), its obj_id the first run's
-//    buffer.
+//    buffer;
+//  - COMMIT_ORDER (bit 18): the bundle names, as it posts a command buffer, the latest buffer each
+//    other queue of its process posted since (design.md, "Commit order"), which needs nothing of
+//    the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -59,7 +62,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_SURFACE_ORDER |
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_UNSHARED_QUEUES |
     RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
-    RGFX_FEATURE_ICB_SLOTS;
+    RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
