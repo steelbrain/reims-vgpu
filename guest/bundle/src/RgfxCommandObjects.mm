@@ -59,7 +59,6 @@
 #include <mutex>
 #include <vector>
 
-#include "RgfxCompletionThread.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
@@ -101,11 +100,6 @@ RGFX_LOG_UNRECOGNIZED
 @end
 
 namespace {
-
-/// How many command buffers' completions this thread is delivering (their handlers run
-/// inside): a waitUntilCompleted there takes the ring itself, as the thread that would
-/// otherwise deliver may be this one.
-thread_local int t_delivering = 0;
 
 /// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first 16, then
 /// every power of two, so a frame loop's stays visible without flooding the log.
@@ -452,6 +446,8 @@ struct RgfxBarrierSlot {
 - (void)rgfxNoteMessageBytes:(uint64_t)bytes;
 /// The next encoder's barrier fence, of the fences the queue made with itself.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
+/// Runs `record` on the queue's completion queue, behind the records before it, or here.
+- (void)rgfxDeliver:(dispatch_block_t)record here:(BOOL)here;
 @end
 
 @implementation RgfxCommandQueue {
@@ -465,7 +461,14 @@ struct RgfxBarrierSlot {
 	std::shared_ptr<RgfxReplyReader> _ownedReader; // adoptReplyReader:'s per-queue completion reader
 	std::function<void()> _release;                // rgfxSetRelease:'s, run at the queue's end
 	dispatch_queue_t _submissionQueue; // kept for -submissionQueue (setSubmissionQueue: SPI)
-	dispatch_queue_t _completionQueue; // kept for -completionQueue (setCompletionQueue: SPI)
+	// Where its command buffers' records run (rgfxDeliver:): the queue setCompletionQueue: gave,
+	// under `_completionQueueLock`, else the serial queue of its own it is made with.
+	std::mutex _completionQueueLock;
+	dispatch_queue_t _completionQueue;
+	dispatch_queue_t _ownCompletionQueue;
+	// The records handed to a dispatch queue and not yet run: while there are any, a record the
+	// taker of the ring could run itself goes behind them instead.
+	std::atomic<uint32_t> _deliveriesInFlight;
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
 	unsigned short _gpuPriorityOffset; // and the offsets and background priority with it
 	NSUInteger _backgroundGpuPriority;
@@ -513,6 +516,14 @@ struct RgfxBarrierSlot {
 		q->_ids = ids;
 		q->_maxCount = maxCount != 0 ? maxCount : 64;
 		q->_slots = dispatch_semaphore_create(static_cast<long>(q->_maxCount));
+		// Its command buffers' handlers run on a serial queue of its own, as Metal's do where no
+		// completion queue is set: Metal's has this label and user-interactive QoS, one queue's
+		// handlers run one at a time and two queues' at once (measured on the M3 Max, an AMD
+		// 5300M and an Intel 630).
+		q->_ownCompletionQueue = dispatch_queue_create(
+		    "com.Metal.CompletionQueueDispatch",
+		    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE,
+		                                            0));
 		// Its barrier fences (QUEUE BARRIERS), made with it, so every encoder takes one.
 		NSMutableArray<RgfxFence *> *fences = [NSMutableArray array];
 		for (uint32_t i = 0; i < kRgfxBarrierFences; i++) {
@@ -563,17 +574,17 @@ struct RgfxBarrierSlot {
 }
 
 // Takes one of the queue's slots, blocking while every one is held, as Metal's -commandBuffer
-// does. The completion thread gives them back as it delivers; where it does not drive the ring
-// (a unit test, or its thread has ended), or this is the delivering thread (a handler making a
-// buffer), the ring is taken here meanwhile.
+// does. The completion thread gives each back as it takes the buffer's completion off the ring,
+// before its handlers run, so a handler that makes a buffer never waits for handlers behind it;
+// where no thread drives the ring (a unit test, or its thread has ended), the ring is taken here
+// meanwhile.
 - (void)rgfxTakeSlot
 {
 	if (dispatch_semaphore_wait(_slots, DISPATCH_TIME_NOW) == 0)
 		return;
 	RgfxReplyReader *reader = self.replyReader;
-	bool delivering = t_delivering > 0 || RgfxCompletionThread::onCurrentThread();
 	for (;;) {
-		if (reader->driven() && !delivering) {
+		if (reader->driven()) {
 			if (dispatch_semaphore_wait(_slots, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
 				return;
 			continue;
@@ -727,9 +738,11 @@ struct RgfxBarrierSlot {
 
 // --- dispatch queues and priority (MTLCommandQueue SPI WindowServer sets) -----------
 // WindowServer hands its queues the dispatch queues Metal is to run submission and
-// completion work on, and a GPU priority. Our queue submits on the caller's thread and
-// completes on the process's completion thread, and the host schedules every queue alike,
-// so each is kept and answered back, and changes nothing the queue does.
+// completion work on, and a GPU priority. The completion queue is where the queue's command
+// buffers' scheduled and completed handlers run from then on, as Metal runs them there (measured
+// on the M3 Max, an AMD 5300M and an Intel 630). Our queue submits on the caller's thread, and
+// the host schedules every queue alike, so the submission queue and the priorities are kept and
+// answered back, and change nothing the queue does.
 
 - (void)setSubmissionQueue:(dispatch_queue_t)queue
 {
@@ -743,12 +756,38 @@ struct RgfxBarrierSlot {
 
 - (void)setCompletionQueue:(dispatch_queue_t)queue
 {
+	std::lock_guard<std::mutex> hold(_completionQueueLock);
 	_completionQueue = queue;
 }
 
 - (dispatch_queue_t)completionQueue
 {
+	std::lock_guard<std::mutex> hold(_completionQueueLock);
 	return _completionQueue;
+}
+
+// Runs one of its command buffers' records (the buffer's scheduling or completion, with its
+// handlers) behind every record handed over before it, on the queue's completion queue: the one
+// setCompletionQueue: gave, else its own serial queue. Where `here` (no completion thread drives
+// the ring, so the thread that took it off delivers) and nothing waits on a dispatch queue, it
+// runs at once on this thread instead.
+- (void)rgfxDeliver:(dispatch_block_t)record here:(BOOL)here
+{
+	if (here && _deliveriesInFlight.load(std::memory_order_acquire) == 0) {
+		record();
+		return;
+	}
+	dispatch_queue_t target = nil;
+	{
+		std::lock_guard<std::mutex> hold(_completionQueueLock);
+		target = _completionQueue != nil ? _completionQueue : _ownCompletionQueue;
+	}
+	_deliveriesInFlight.fetch_add(1, std::memory_order_acq_rel);
+	RgfxCommandQueue *queue = self; // kept until the record has run
+	dispatch_async(target, ^{
+		record();
+		queue->_deliveriesInFlight.fetch_sub(1, std::memory_order_acq_rel);
+	});
 }
 
 // The runtime's setter answers whether the priority was taken (`c24@0:8Q16`): it always is.
@@ -837,6 +876,7 @@ struct RgfxBarrierSlot {
 // The delivery entries the reader's handlers call (defined below); declared here so the
 // lambdas in `commit` see their signatures.
 @interface RgfxCmdBuffer ()
+- (void)rgfxHostDone:(const RgfxCbComplete *)msg;
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg;
 - (void)rgfxReachScheduled;
 - (void)rgfxReachSubmitted;
@@ -973,8 +1013,10 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
 	// Where its encoders' inline bytes go: chunks of the queue's upload pool, given back once
-	// the host has completed the buffer (RgfxUploads.h). The encoders share it.
+	// the host has completed the buffer (RgfxUploads.h). The encoders share it. `_uploadsFailed`:
+	// some found no chunk, noted as they go back (rgfxHostDone:).
 	std::shared_ptr<RgfxUploadArena> _uploads;
+	bool _uploadsFailed;
 	uint64_t _traceId; // globalTraceObjectID
 }
 
@@ -1194,6 +1236,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// lands (as Metal retains an in-flight command buffer); the reader removes the one-shot
 	// handler when it fires. Without a reader the status stays Committed and the handlers
 	// are held.
+	//
+	// What the host is done with goes back on the thread that takes a record off the ring:
+	// the buffer is submitted (commitAndWaitUntilSubmitted returns), and at its completion its
+	// queue's slot, its message's block and its inline bytes' chunks go back and its times are
+	// known, whatever handlers of the queue still run. What the app sees, its write-backs, its
+	// status, its handlers and its waiters, goes in ring order to its queue's completion queue
+	// (rgfxDeliver:here:), where Metal runs its handlers. Where no thread drives the ring, the
+	// thread that took it off runs that too.
 	RgfxCommandQueue *queue = _queue;
 	_reader = queue.replyReader;
 	std::function<void(uint64_t)> expect;
@@ -1215,27 +1265,36 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		const bool asks = _waitsSubmitted && queue.asksSubmitted;
 		if (asks)
 			_encoder->appendSubmitted();
-		expect = [reader, strongSelf, asks](uint64_t seqno) {
+		expect = [reader, strongSelf, queue, asks](uint64_t seqno) {
 			if (asks) {
 				reader->expectSubmitted(seqno, [strongSelf](const RgfxCbSubmitted &) {
 					[strongSelf rgfxReachSubmitted];
 				});
 			}
-			reader->expectScheduled(seqno, [strongSelf](const RgfxCbScheduled &) {
-				@autoreleasepool {
-					[strongSelf rgfxReachScheduled];
+			reader->expectScheduled(seqno, [strongSelf, queue, reader](const RgfxCbScheduled &) {
+				[strongSelf rgfxReachSubmitted];
+				[queue rgfxDeliver:^{
+					@autoreleasepool {
+						[strongSelf rgfxReachScheduled];
+					}
 				}
+				              here:!reader->driven()];
 			});
-			reader->expectCompletion(seqno, [strongSelf](const RgfxCbComplete &m) {
-				@autoreleasepool {
-					[strongSelf rgfxDeliverCompletion:&m];
+			reader->expectCompletion(seqno, [strongSelf, queue, reader](const RgfxCbComplete &m) {
+				[strongSelf rgfxHostDone:&m];
+				const RgfxCbComplete msg = m;
+				[queue rgfxDeliver:^{
+					@autoreleasepool {
+						[strongSelf rgfxDeliverCompletion:&msg];
+					}
 				}
+				              here:!reader->driven()];
 			});
 		};
-		// While the ring is full: where nothing else takes the queue's completions (this is
-		// the delivering thread, or no thread drives the ring), take them here, as the host
-		// may be waiting for room on the completion ring before it takes more.
-		if (t_delivering > 0 || RgfxCompletionThread::onCurrentThread() || !reader->driven())
+		// While the ring is full: where no thread drives the ring, take the queue's
+		// completions here, as the host may be waiting for room on the completion ring before
+		// it takes more. A driving thread takes them whatever handlers run.
+		if (!reader->driven())
 			whileWaiting = [reader] { reader->pump(); };
 	}
 
@@ -1280,11 +1339,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		failed.status = RGFX_CB_INTERNAL;
 		failed.error_code = MTLCommandBufferErrorOutOfMemory;
 		RgfxCmdBuffer *strongSelf = self;
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+		[self rgfxHostDone:&failed];
+		[queue rgfxDeliver:^{
 			@autoreleasepool {
 				[strongSelf rgfxDeliverCompletion:&failed];
 			}
-		});
+		}
+		              here:NO];
 	}
 }
 
@@ -1336,18 +1397,38 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:code userInfo:nil];
 }
 
-// Delivers the host's completion for this command buffer, on the thread that took it off
-// the ring (the completion thread, or a waiter where none drives the ring): records any
-// error, flips the status, then fires the scheduled then the completed handlers (in the
-// order added) with this buffer, and lets the waiters go. We have no separate scheduled
-// signal, so the scheduled handlers fire here too (a completed buffer was scheduled).
+// What the host is done with at the buffer's completion, on the thread that took it off the
+// ring, before its record goes to the queue's completion queue: it is submitted where it was
+// not yet (its CB_COMPLETE stands for both); the queue's slot goes back, so a handler that makes
+// the next buffer never waits for handlers behind it; its message's block and its inline bytes'
+// chunks go back, whether some found none noted for its status; and its times are taken.
+- (void)rgfxHostDone:(const RgfxCbComplete *)msg
+{
+	[self rgfxReachSubmitted];
+	_uploadsFailed = _uploads != nullptr && _uploads->failed();
+	if (_uploads != nullptr) {
+		_uploads->giveBack();
+	}
+	// The host read the message out of its block before it ran the buffer.
+	if (_bodyPool != nullptr) {
+		_bodyPool->giveBack(_body);
+		_bodyPool = nullptr;
+	}
+	[self rgfxGiveSlotBack];
+	[self rgfxNoteGPUTimes:msg];
+}
+
+// Delivers the host's completion for this command buffer, on its queue's completion queue (or on
+// the thread that took it off the ring, where no thread drives it), after rgfxHostDone: and
+// behind the queue's earlier records: writes back what it wrote, flips the status (recording any
+// error), fires the completed handlers in the order added with this buffer, and lets the waiters
+// go. Its scheduled handlers run first where its CB_SCHEDULED did not come.
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg
 {
 	// A completed buffer was scheduled: where its CB_SCHEDULED did not come first (the host
-	// could not carry it out), it is submitted and scheduled here, its scheduled handlers run
-	// before anything of its completion.
+	// could not carry it out), it is scheduled here, its scheduled handlers run before anything
+	// of its completion.
 	[self rgfxReachScheduled];
-	t_delivering++;
 	// The surfaces this buffer wrote hold its results before anyone sees it complete.
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
@@ -1360,22 +1441,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
 		shadow->writeBack();
 	_shadowWrites.clear();
-	// The host is done with the inline bytes: their chunks go back to the queue's pool. A
-	// buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
-	const bool uploadsFailed = _uploads != nullptr && _uploads->failed();
-	if (_uploads != nullptr) {
-		_uploads->giveBack();
-	}
-	// The host read the message out of its block before it ran the buffer.
-	if (_bodyPool != nullptr) {
-		_bodyPool->giveBack(_body);
-		_bodyPool = nullptr;
-	}
-	// The queue's slot goes back before the handlers run, so one that makes the next buffer
-	// does not wait for its own.
-	[self rgfxGiveSlotBack];
-	[self rgfxNoteGPUTimes:msg];
-	if (msg->status == RGFX_CB_OK && uploadsFailed) {
+	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
+	if (msg->status == RGFX_CB_OK && _uploadsFailed) {
 		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
 		NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
 		      @"device's memory; it fails as out of memory");
@@ -1396,15 +1463,15 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// What it kept goes after its handlers, which may still name it, and before its waiters
 	// wake, as Metal's buffer lets its retained references go.
 	_kept.clear();
-	t_delivering--;
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
 }
 
 // The buffer is scheduled (its CB_SCHEDULED, or its completion where none came first), once:
-// on the thread that took it off the ring, it is submitted (commitAndWaitUntilSubmitted
-// returns), becomes Scheduled where it was Committed, runs its scheduled handlers in the order
-// added, then lets waitUntilScheduled return. Metal's commitAndWaitUntilSubmitted returns before
+// on its queue's completion queue, behind the queue's earlier records, it is submitted where it
+// was not yet, becomes Scheduled where it was Committed, runs its scheduled handlers in the order
+// added, then lets waitUntilScheduled return. The thread that took the record off the ring made
+// it submitted already (commitAndWaitUntilSubmitted returns whatever handlers run). Metal's commitAndWaitUntilSubmitted returns before
 // the scheduled handlers run, and Metal makes the buffer Scheduled only once every wait of it is
 // satisfied, which the host's platform does too before it posts CB_SCHEDULED (measured on the
 // M3 Max, macOS 27: on an idle queue the call returns with the buffer Committed and its
@@ -1418,12 +1485,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	[self rgfxReachSubmitted];
 	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
 	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
-	t_delivering++;
 	for (MTLCommandBufferHandler block in _scheduledHandlers) {
 		block(self);
 	}
 	[_scheduledHandlers removeAllObjects];
-	t_delivering--;
 	_scheduledRan.store(true);
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
 		dispatch_group_leave(_scheduled);
@@ -1519,20 +1584,22 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	[self rgfxWaitFor:_done reached:nullptr];
 }
 
-// Blocks until `group` is left, which the thread that delivers the buffer's records does once
-// `*reached` holds (the buffer's completion, for a null `reached`). Without a reader (a unit
-// test without one, or before commit) there is nothing to wait on, so this returns at once.
+// Blocks until `group` is left, which the buffer's record does on its queue's completion queue
+// once `*reached` holds (the buffer's completion, for a null `reached`) and its handlers have run,
+// as Metal's waits return only after the handlers (measured on the M3 Max, an AMD 5300M and an
+// Intel 630). So a wait on the queue's completion queue for a buffer of that queue, a handler's
+// for a later buffer of its queue or for its own buffer, waits for good, as Metal's does on all
+// three. Where no thread drives the ring (a unit test, or its thread has ended), the ring is taken
+// here meanwhile. Without a reader (a unit test without one, or before commit) there is nothing to
+// wait on, so this returns at once.
 - (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached
 {
 	if (_reader == nullptr || group == nil) {
 		return;
 	}
 	auto done = [self, reached] { return reached != nullptr ? reached->load() : [self rgfxFinished]; };
-	// Inside a completion's handlers, the delivering thread is this one: the group would
-	// never be left, so the ring is taken here.
-	bool delivering = t_delivering > 0 || RgfxCompletionThread::onCurrentThread();
 	while (!done()) {
-		if (_reader->driven() && !delivering) {
+		if (_reader->driven()) {
 			// The completion thread takes the ring. A thread that ends (the process's
 			// context gone) leaves the reader undriven, so look again each second.
 			if (dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
@@ -1541,9 +1608,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		}
 		_reader->pump();
 	}
-	// There, perhaps on another thread that is still running the handlers.
-	if (!delivering)
-		dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+	// There, perhaps on the completion queue that is still running the handlers.
+	dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 }
 
 // The event of a command buffer's event op, which the buffer keeps while it runs: its id, or 0

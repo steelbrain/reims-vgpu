@@ -33,8 +33,10 @@
  * pumps, arms the ring (armAndCheck: `armed` set, so the host raises the vector for its
  * next completion) and sleeps in the kext until the vector shows a record for it. While
  * a reader is driven() the thread is its only consumer; an undriven one (no thread, or
- * its thread has ended) is pumped by the waiters in waitUntilCompleted. The reader is
- * testable off the guest by feeding ring bytes and calling pump().
+ * its thread has ended) is pumped by the waiters in waitUntilCompleted. A command buffer's
+ * handlers registered here hand its records on to its queue's completion queue
+ * (RgfxCommandObjects.h, COMPLETION), so what runs on the pumping thread is short. The
+ * reader is testable off the guest by feeding ring bytes and calling pump().
  *
  * THREADING. Registration (the expect / addEventListener calls) runs on the app's threads while
  * the completion thread pumps; one lock guards the registries and the consume cursor. A

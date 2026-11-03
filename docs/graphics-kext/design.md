@@ -1311,12 +1311,24 @@ It sleeps in the kext (user-client selector `0x107`, an interruptible wait on a
 per-client wake count it passes back), and each pass it drains every queue's
 ring, arms it, fences and looks again. A completion posted while it works shows
 in the count or in its last look, so none is missed and nothing polls. The
-thread runs each command buffer's scheduled handlers at its `CB_SCHEDULED`
-(or at its `CB_COMPLETE` where none came first) and its completed handlers at
-its `CB_COMPLETE`, in ring order, whether or not anything waits.
-`commitAndWaitUntilSubmitted`, `waitUntilScheduled` and `waitUntilCompleted`
-wait for the thread to have got that far. It takes the ring itself only inside
-a handler, or once the thread has ended (its context closed).
+thread takes each command buffer's records whether or not anything waits, and
+runs no handler. At a `CB_SUBMITTED` or `CB_SCHEDULED` the buffer is submitted
+there, and at its `CB_COMPLETE` what the host is done with goes back: the
+queue's slot, the message's block and the inline bytes' chunks. The rest runs
+on the queue's completion queue, in ring order: the dispatch queue
+`setCompletionQueue:` gave (WindowServer sets one), or a serial queue of the
+queue's own, labelled `com.Metal.CompletionQueueDispatch` at user-interactive
+QoS. That is where Metal runs a queue's handlers: one queue's one at a time,
+two queues' at once (measured on the M3 Max, an AMD 5300M and an Intel 630).
+The scheduling makes the buffer `Scheduled` and runs its scheduled handlers,
+and the completion runs its write-backs, its status, its completed handlers
+and its waiters. `waitUntilScheduled` and `waitUntilCompleted` return once
+the handlers have run, as Metal's do. A wait for a buffer of a queue from that
+queue's completion queue, a handler's for its own buffer or a later buffer of
+its queue, waits for good, as Metal's does on all three GPUs; a wait for
+another queue's buffer is released. `commitAndWaitUntilSubmitted` returns at
+the submission, whatever handlers run. Waiters take the ring themselves only
+once the thread has ended (its context closed), and then run the records too.
 
 **Left for later** (extends the same op families, not the transport): enqueue
 ordering held in the decoder; command-buffer/queue descriptors and

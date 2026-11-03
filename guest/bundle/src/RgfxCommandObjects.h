@@ -28,12 +28,17 @@
  * into both the unit test and the bundle.
  *
  * COMPLETION. `commit` registers the buffer's submission seqno with its queue's
- * completion-ring reader (RgfxReplyReader). When the host's RGFX_EVT_CB_COMPLETE for
- * it is taken off the ring, the buffer's status flips and its scheduled then completed
- * handlers run, in the ring's order. The process's completion thread
- * (RgfxCompletionThread) takes it, whether or not anything waits for the buffer;
- * `waitUntilCompleted` blocks until the thread has run the handlers, and takes the ring
- * itself only where no thread drives it (a unit test) or inside a handler.
+ * completion-ring reader (RgfxReplyReader). The process's completion thread
+ * (RgfxCompletionThread) takes the host's RGFX_EVT_CB_SCHEDULED and RGFX_EVT_CB_COMPLETE
+ * off the ring, whether or not anything waits for the buffer: there the buffer is
+ * submitted, and at its completion what the host is done with goes back (the queue's
+ * slot, its message's block, its inline bytes' chunks). Its record then runs on the
+ * queue's completion queue, the dispatch queue setCompletionQueue: gave or a serial queue
+ * of the queue's own, behind the queue's earlier records, as Metal runs its handlers:
+ * the write-backs, the status, the scheduled then completed handlers, the waiters.
+ * `waitUntilCompleted` blocks until the record has run the handlers, as Metal's does, and
+ * takes the ring itself only where no thread drives it (a unit test, or its thread has
+ * ended), where the taker runs the record too.
  * `presentDrawable:` and its variants present the drawable from a scheduled handler,
  * unless the buffer failed by then (see the .mm).
  *

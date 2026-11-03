@@ -4329,9 +4329,10 @@ void test_reply_reader_arm()
 	CHECK(reader.driven());
 }
 
-// With nobody waiting, the completion thread runs each command buffer's scheduled then
-// completed handlers as the host posts its completion, in the ring's order, on its own
-// thread, and leaves the ring drained and armed.
+// With nobody waiting, the completion thread takes each command buffer's records as the host
+// posts them, and the buffer's scheduled then completed handlers run in the ring's order on the
+// queue's own completion queue (com.Metal.CompletionQueueDispatch, as Metal's), not on the
+// thread; the ring is left drained and armed.
 void test_completion_thread_runs_handlers()
 {
 	@autoreleasepool {
@@ -4361,13 +4362,17 @@ void test_completion_thread_runs_handlers()
 			(void)done;
 			std::lock_guard<std::mutex> hold(*orderLock);
 			orderLog->push_back("s" + n);
-			if (!RgfxCompletionThread::onCurrentThread())
+			if (RgfxCompletionThread::onCurrentThread() ||
+			    std::strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
+			                "com.Metal.CompletionQueueDispatch") != 0)
 				offThread++;
 		}];
 		[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
 			std::lock_guard<std::mutex> hold(*orderLock);
 			orderLog->push_back("c" + n + (done.status == MTLCommandBufferStatusCompleted ? "" : "!"));
-			if (!RgfxCompletionThread::onCurrentThread())
+			if (RgfxCompletionThread::onCurrentThread() ||
+			    std::strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
+			                "com.Metal.CompletionQueueDispatch") != 0)
 				offThread++;
 			if (n == "2")
 				dispatch_semaphore_signal(last);
@@ -4441,31 +4446,9 @@ void test_wait_with_the_completion_thread()
 	[cb waitUntilCompleted];
 	CHECK(fired.load() == 1); // and only once
 
-	// A handler waiting for a later buffer, on the completion thread: it takes the ring
-	// itself, so neither hangs.
-	id<MTLCommandBuffer> first = [f.queue commandBuffer];
-	id<MTLCommandBuffer> second = [f.queue commandBuffer];
-	std::atomic<int> nested{0};
-	std::atomic<int> *nestedp = &nested;
-	dispatch_semaphore_t both = dispatch_semaphore_create(0);
-	[first addCompletedHandler:^(id<MTLCommandBuffer> done) {
-		(void)done;
-		[second waitUntilCompleted];
-		*nestedp = second.status == MTLCommandBufferStatusCompleted ? 1 : 2;
-		dispatch_semaphore_signal(both);
-	}];
-	[first commit];
-	uint64_t s1 = f.nextSeqno();
-	[second commit];
-	uint64_t s2 = f.nextSeqno();
-	RgfxCbComplete d1 = cbComplete(s1, ((RgfxResource *)first).rgfxObjId);
-	hostPost(f.completion, *kext, &d1, sizeof(d1));
-	std::this_thread::sleep_for(std::chrono::milliseconds(20));
-	RgfxCbComplete d2 = cbComplete(s2, ((RgfxResource *)second).rgfxObjId);
-	hostPost(f.completion, *kext, &d2, sizeof(d2));
-	CHECK(dispatch_semaphore_wait(both, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0);
-	CHECK(nested.load() == 1);
-	[second waitUntilCompleted];
+	// A handler waiting for a later buffer of its own queue waits for good, as Metal's does on
+	// the M3 Max, an AMD 5300M and an Intel 630; one waiting for another queue's buffer is
+	// released (tests/queue_tests.mm).
 	kext->close();
 	CHECK(eventually([&] { return !thread.running(); }));
 	}
@@ -4698,6 +4681,11 @@ void test_submitted_before_scheduled()
 	host.join();
 	uint64_t s2 = taken.load();
 	CHECK(asked.load() == 1);
+	// Submitted as the completion thread takes the CB_SCHEDULED; Scheduled once its record has
+	// run on the queue's completion queue, which may be after the call returns, as Metal's may.
+	CHECK(second.status == MTLCommandBufferStatusCommitted ||
+	      second.status == MTLCommandBufferStatusScheduled);
+	[second waitUntilScheduled];
 	CHECK(second.status == MTLCommandBufferStatusScheduled);
 	CHECK(![f.queue sharedReplyReader]->awaitingSubmitted(s2));
 	RgfxCbComplete d2 = cbComplete(s2, secondId);

@@ -7,14 +7,16 @@
  * watches the process's rings: on the vector's interrupt it wakes the process's waiter for
  * every ring that holds records the process has not taken (kRgfxAccelMethodWaitCompletions).
  * This thread is that waiter. Each pass it drains every queue's reader (RgfxReplyReader::
- * pump, which runs the buffers' handlers in ring order), arms each ring and looks at it
- * again, and only then sleeps in the kext with the wake count it last saw, so a completion
- * posted during the pass returns the sleep at once and none is lost.
+ * pump, which hands each buffer's records in ring order to its queue's completion queue,
+ * where its handlers run), arms each ring and looks at it again, and only then sleeps in the
+ * kext with the wake count it last saw, so a completion posted during the pass returns the
+ * sleep at once and none is lost. It runs no handler, so a handler that waits holds back no
+ * other queue's completions, and the host never waits on it for room on a ring.
  *
  * While the thread drives a reader, it is the reader's only consumer: a command buffer's
- * waitUntilCompleted blocks until the thread delivers its completion, and pumps the ring
- * itself only on this thread (a handler waiting for another buffer) or once the thread has
- * ended (the process's context is gone).
+ * waitUntilCompleted blocks until the buffer's record has run on its queue's completion
+ * queue, and pumps the ring itself only once the thread has ended (the process's context is
+ * gone).
  *
  * Our own C++; the kext call is the caller's (WaitFn), so the thread is tested off the guest.
  */
