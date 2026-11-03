@@ -635,8 +635,6 @@ void RgfxAcceleratorUserClient::releaseContext()
 		break;
 	case RgfxAccelerator::kCloseLate:
 		accel->parkClose(this, late);
-		accel->keepBlocks(this);
-		accel->dropSurfaceBlocks(this, false);
 		break;
 	case RgfxAccelerator::kCloseRefused:
 		accel->keepIdChunks(this);

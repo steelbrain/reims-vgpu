@@ -374,8 +374,9 @@ void retireReleases()
 
 // Lets go of what each late close answered held, its token's, as the closing thread lets go of a
 // close answered in time (RgfxAcceleratorUserClient::releaseContext): answered OK, the device
-// maps none of the context's resource ids or GPU addresses to an object, so its resource-id
-// chunks go and its units are given back; refused, they are kept from use for good.
+// holds nothing of the context, so its resource-id chunks, its blocks (their wired pages
+// unwired) and its holds of shared blocks go, its units are given back, and the releases it
+// refused are posted again; refused, they are kept from use for good.
 void retireCloses(RgfxAccelerator *accel)
 {
 	for (;;) {
@@ -390,11 +391,16 @@ void retireCloses(RgfxAccelerator *accel)
 		const bool ok = c.status == RGFX_STATUS_OK;
 		if (ok) {
 			accel->freeIdChunks(token);
+			accel->freeBlocks(token);
+			accel->dropSurfaceBlocks(token, true);
 			IOLockLock(contextLock);
 			rgfxContextSlotsGive(slots, c.firstUnit, c.units);
 			IOLockUnlock(contextLock);
+			accel->retryRefusedBlocks();
 		} else {
 			accel->keepIdChunks(token);
+			accel->keepBlocks(token);
+			accel->dropSurfaceBlocks(token, false);
 		}
 		IOLockLock(releaseLock);
 		rgfxCloseRetired(closeTable, at);
@@ -734,14 +740,16 @@ void RgfxAccelerator::parkClose(const void *client, int32_t late)
 	const void *token = rgfxCloseToken(closeTable, static_cast<uint32_t>(late));
 	IOLockLock(contextLock);
 	const uint32_t ids = rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, client, token);
+	const uint32_t held = rgfxBlockHand(blockTable, client, token);
+	const uint32_t holds = rgfxSurfaceHand(surfaceTable, client, token);
 	IOLockUnlock(contextLock);
 	IOLockLock(releaseLock);
 	const bool answered = rgfxClosePark(closeTable, static_cast<uint32_t>(late));
 	const uint32_t pending = rgfxCloseLateCount(closeTable);
 	IOLockUnlock(releaseLock);
-	IOLog("RgfxAccelerator: context %u's late close holds %u resource-id chunks for its answer "
-	      "(%u closes late)\n",
-	      closeTable.entries[late].context, ids, pending);
+	IOLog("RgfxAccelerator: context %u's late close holds %u blocks, %u holds of shared blocks "
+	      "and %u resource-id chunks for its answer (%u closes late)\n",
+	      closeTable.entries[late].context, held, holds, ids, pending);
 	if (answered)
 		thread_call_enter(releaseCall);
 }

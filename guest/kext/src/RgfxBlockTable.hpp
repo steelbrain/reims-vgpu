@@ -425,6 +425,28 @@ inline uint32_t rgfxBlockFreeOwner(RgfxBlockTable &t, const void *owner)
 	return freed;
 }
 
+// `owner`'s close was not answered in time: its blocks, in whatever state, are `to`'s, a late
+// close's token (RgfxCloseTable.hpp), until the answer lets them go as an answer in time would
+// (rgfxBlockTakeWired, rgfxBlockFreeOwner). None is given out again meanwhile. None is released
+// either, a freed one or a refused one: the device would take a release posted behind the close
+// with the context gone, so its answer would not wait for the context's buffers. A releasing one,
+// posted before the close, goes at its answer as before. How many.
+inline uint32_t rgfxBlockHand(RgfxBlockTable &t, const void *from, const void *to)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; from != nullptr && i < t.count; i++) {
+		RgfxBlock &b = t.blocks[i];
+		if (b.owner != from)
+			continue;
+		b.owner = to;
+		if (b.state == kRgfxBlockFreed)
+			b.state = kRgfxBlockKept;
+		b.refused = false;
+		n++;
+	}
+	return n;
+}
+
 // `owner`'s close was not answered: the device may still use its blocks, so none is given out
 // again, save a releasing one the device still answers OK. How many are kept.
 inline uint32_t rgfxBlockKeepOwner(RgfxBlockTable &t, const void *owner)

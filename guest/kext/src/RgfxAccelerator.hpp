@@ -232,17 +232,15 @@ public:
 		// the caller keeps the rest from use (keepIdChunks, keepBlocks, dropSurfaceBlocks not
 		// closed).
 		kCloseRefused,
-		// Not answered in kCloseAnswerMs: the caller hands the resource-id chunks to the close
-		// (parkClose with `*late`), whose answer, however late, lets go of them and the units as
-		// one in time does, and keeps the blocks from use (keepBlocks, dropSurfaceBlocks not
-		// closed).
+		// Not answered in kCloseAnswerMs: the caller hands the rest to the close (parkClose
+		// with `*late`), whose answer, however late, lets go of all of it as one in time does.
 		kCloseLate,
 	};
 	CloseAnswer closeContext(UInt32 context, UInt32 first, UInt32 units, int32_t *late);
-	// A late close's holdings: the client's resource-id chunks are the close's own (its token's,
-	// RgfxCloseTable.hpp) from here on, none of them anyone else's, until its answer lets go of
-	// them on the release thread. Never answered, they stay the device's for good, as its units
-	// do.
+	// A late close's holdings: the client's resource-id chunks, blocks and holds of shared
+	// surface blocks are the close's own (its token's, RgfxCloseTable.hpp) from here on, none of
+	// them anyone else's, until its answer lets go of them on the release thread. Never answered,
+	// they stay the device's for good, as its units do.
 	void parkClose(const void *client, int32_t late);
 	// Chunks of the texture resource ids, each owned by `owner` for context `context` and posted
 	// to the device (RESOURCE_ID_CHUNK) before takeIdChunk returns its first id; the owner's are

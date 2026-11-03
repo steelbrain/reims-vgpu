@@ -1379,10 +1379,12 @@ meanwhile fails busy, so no block changes hands between the check and the
 host's carrying out of the message. A context's close is answered under the
 same rule, after its objects are dropped and its queues' threads are past
 their rings, and the kext frees the process's blocks only on that answer. A
-close that is not answered keeps them from use for good. It keeps the
-context's GPU address units and resource-id chunks from every other context
-until its answer comes, however late, since the host may map them to the
-context's objects until then; the late answer gives them back.
+close not answered in 10 s keeps everything the process held from every other
+process until its answer comes, however late: its blocks with their wired
+pages, its holds of shared blocks, its GPU address units and its resource-id
+chunks, which the host may still use or map to the context's objects. None of
+its blocks is released meanwhile. The late answer lets go of all of it as an
+answer in time does. A close never answered, or refused, keeps it for good.
 
 **Handles and addresses.** Every guest Metal object has a 64-bit `ObjId` the
 guest picks, unique per device; the host keeps an `ObjId` → `Platform` handle

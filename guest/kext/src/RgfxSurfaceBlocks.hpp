@@ -283,6 +283,26 @@ inline RgfxSurfaceLetGo rgfxSurfaceLetGo(RgfxSurfaceEntry &e, const void *client
 	return kRgfxSurfaceLetGoNotHeld;
 }
 
+// `from`'s close was not answered in time: its holds, each with its context, asks and wired pages,
+// are `to`'s, a late close's token (RgfxCloseTable.hpp), until the answer lets them go as an
+// answer in time would (rgfxSurfaceLetGo with `all`). How many.
+inline uint32_t rgfxSurfaceHand(RgfxSurfaceTable &t, const void *from, const void *to)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; from != nullptr && t.entries && i < t.capacity; i++) {
+		RgfxSurfaceEntry &e = t.entries[i];
+		if (!e.used)
+			continue;
+		for (uint32_t h = 0; h < e.holdCount; h++) {
+			if (e.holds[h].client == from) {
+				e.holds[h].client = to;
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
 // Whether `client` holds an entry's block that holds the `length` bytes at `offset`.
 inline bool rgfxSurfaceHeldBy(const RgfxSurfaceTable &t, const void *client, uint64_t offset,
                               uint64_t length)
