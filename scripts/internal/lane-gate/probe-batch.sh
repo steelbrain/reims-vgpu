@@ -9,8 +9,10 @@
 #            password, for sudo) in its environment. What it prints is its result; what it leaves in
 #            ./out/ is copied back.
 #   budget   the most seconds it may run, 1 to 180: the guest kills its process group there.
-#   tip      the commit it is valid for, full or short: a probe for another tip than the published
-#            one is skipped, and its results say so.
+#   tip      the commit it is valid for, full or short (9 characters or more): a round boots one
+#            tip, the newest published one or an earlier published tip (its image and host still on
+#            the lane host, tip-host/SHORT and loader-fix/oc-sipon-SHORT.qcow2), and a probe for a
+#            tip with no published build is skipped, its results saying so.
 #   shots    (optional, any content) run.sh may take the guest's own screenshots: `bash
 #            ~/probes/.shot.sh LABEL` leaves out/shot-LABEL.png (Command-Shift-3, sent by the host;
 #            exit 1 where none came in 20 s), as screencapture over SSH cannot
@@ -22,10 +24,11 @@
 #
 #   probe-batch.sh [--force] [--list] [--dry-run]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
-# (after each gate). It takes the probes oldest first while their budgets fit the hold, boots the
-# published tip once through msi-boot.sh (an exclusive request: the GPU alone, in the host's
-# turnstile, the host quiet; the gate's one request on the host while it runs), waits for the
-# host's load to settle under 4, runs them back to back and powers the guest off. --list shows the
+# (after each gate). Its tip is the oldest probe's that is published. It takes the probes for that
+# tip oldest first while their budgets fit the hold (those for other published tips wait for their
+# own round), boots the tip once through msi-boot.sh (an exclusive request: the GPU alone, in the
+# host's turnstile, the host quiet; the gate's one request on the host while it runs), waits for
+# the host's load to settle under 4, runs them back to back and powers the guest off. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
 # with three example probes, one of them for another tip.
@@ -89,17 +92,41 @@ queue=$(msi "mkdir -p '$Q' '$RES'; cd '$Q' && now=\$(date +%s) && for d in */; d
   done | sort -rn")
 n=$(printf '%s' "$queue" | grep -c . || true)
 oldest=$(printf '%s\n' "$queue" | awk 'NR == 1 { print $1 + 0 }')
-# What a round takes: the probes for the published tip, oldest first, while their budgets fit;
-# the others are skipped (their results say why).
+# The published tips: the newest (published-last), and those whose image and host the lane host
+# still has. A probe's tip resolves to one of them by its first 9 characters.
+pubs=$(msi "cd '$MSI_RGK_RUN' && for d in tip-host/*/; do d=\${d%/}; s=\${d#tip-host/}
+  [ -x \"\$d/qemu-system-x86_64\" ] && [ -f \"loader-fix/oc-sipon-\$s.qcow2\" ] && echo \"\$s\"; done" 2> /dev/null || true)
+((dry)) && pubs=$SHORT
+published() {  # TIP: its published short name, or nothing
+  local t=$1
+  (( ${#t} >= 9 )) || { [[ -n $t && $PUB == "$t"* ]] && echo "$SHORT"; return; }
+  grep -x -F "${t:0:9}" <<< "$pubs" || { [[ ${t:0:9} == "$SHORT" ]] && echo "$SHORT"; } || true
+}
+# The round's tip: the oldest probe's that is published.
+RT=
+while read -r age budget tip name; do
+  [[ -n ${name:-} ]] || continue
+  RT=$(published "${tip:-}")
+  [[ -n $RT ]] && break
+done <<< "$queue"
+RT=${RT:-$SHORT}
+if [[ $RT != "$SHORT" ]]; then
+  PUB=$(git -C "$L" rev-parse --verify -q "$RT^{commit}" 2> /dev/null || echo "$RT")
+  SHORT=$RT
+fi
+# What a round takes: the probes for its tip, oldest first, while their budgets fit; those for a
+# tip with no published build are skipped (their results say why); the others wait.
 take=() fit=0
 while read -r age budget tip name; do
   [[ -n ${name:-} ]] || continue
-  if [[ -z ${tip:-} || ( $PUB != "$tip"* && $tip != "$PUB"* ) ]]; then take+=("$name"); continue; fi
+  t=$(published "${tip:-}")
+  [[ -z $t ]] && { take+=("$name"); continue; }
+  [[ $t == "$SHORT" ]] || continue
   (( fit + ${budget:-180} + 15 <= FIT_S )) || continue
   fit=$(( fit + ${budget:-180} + 15 ))
   take+=("$name")
 done <<< "$queue"
-echo "probe-batch: $n waiting (oldest $(( ${oldest:-0} / 60 )) min); published tip $SHORT; a round takes: ${take[*]:-none} ($fit s of $FIT_S)"
+echo "probe-batch: $n waiting (oldest $(( ${oldest:-0} / 60 )) min); the round's tip $SHORT; a round takes: ${take[*]:-none} ($fit s of $FIT_S)"
 ((list)) && { printf '%s\n' "$queue" | sed '/^$/d; s/^/  /'; exit 0; }
 if (( !dry && !force )) && (( n < WAIT_N )) && (( ${oldest:-0} < WAIT_S )); then
   echo "probe-batch: no round (a round runs at $WAIT_N waiting or the oldest at $(( WAIT_S / 60 )) min, or with --force)"
@@ -118,8 +145,11 @@ if ((dry)); then
     R='$RD' bash '$RD/bin/msi-probes.sh'"
 else
   # The gate's scripts the boot runs, and the tip's bench for its check of our Metal device.
+  # The tip's bench (the boot's check of our Metal device), else the newest gate run's.
   run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1)
-  [[ -x $run/artifacts/payload/bench ]] || { echo "probe-batch: no gate run of $SHORT with its bench" >&2; exit 1; }
+  [[ -x $run/artifacts/payload/bench ]] || run=$(ls -1dt "$GH/runs/"*/ 2> /dev/null | while read -r d; do
+    [[ -x ${d}artifacts/payload/bench ]] && { echo "${d%/}"; break; }; done)
+  [[ -x $run/artifacts/payload/bench ]] || { echo "probe-batch: no gate run with its bench" >&2; exit 1; }
   put "$run/artifacts/payload/bench" "$RD/payload/"
   put "$L/msi-boot.sh" "$RD/bin/"
   msi "cat > '$RD/boot.env'" << EOF
