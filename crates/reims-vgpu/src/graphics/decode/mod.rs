@@ -2231,8 +2231,8 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Removes what `obj_id` names (an `OBJECT_DESTROY`): its CPU copy and then its object are let
     /// go of, each in a refusal scope ([`drop_refused`]), at once, or where a view taken before
-    /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten. An
-    /// object over a block with a surface view is let go of on the surface worker, where it may
+    /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten. A
+    /// buffer over a block with a surface view is let go of on the surface worker, where it may
     /// be the last hold of the view's import or mapping ([`surface_pages`]).
     fn remove(&self, obj_id: u64) {
         let Some(context) = self.context_state(context_of(obj_id)) else {
@@ -2249,8 +2249,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 span,
                 ..
             } = removed.into_entry();
-            let over_view =
-                span.is_some_and(|(block, _)| self.shared.surface_views.lock().holds(block));
+            // A buffer only: a texture's drop gives back the resource id the guest picked, which
+            // its next texture may take at once.
+            let over_view = matches!(handle, ObjHandle::Buffer(_))
+                && span.is_some_and(|(block, _)| self.shared.surface_views.lock().holds(block));
             if over_view {
                 self.shared
                     .surface_worker

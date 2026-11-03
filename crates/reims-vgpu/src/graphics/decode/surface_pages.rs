@@ -54,8 +54,8 @@
 //! `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only checks its runs, is carried out
 //! there too, in its order with the rest. The guest's kext names a block only after the answer, so in its order nothing
 //! waits. What lets a view go is dropped on the worker too, where it may be the last hold of an
-//! import or a mapping: a buffer or texture over a view at its `OBJECT_DESTROY`, and a block's
-//! view and device cache at its `BLOCK_RELEASE`.
+//! import or a mapping: a buffer over a view at its `OBJECT_DESTROY`, and a block's view and
+//! device cache at its `BLOCK_RELEASE`.
 //!
 //! [`Worker`]: super::worker::Worker
 //! [`Unsettled`]: super::worker::Unsettled
