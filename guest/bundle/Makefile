@@ -34,6 +34,9 @@
 #   make bench      the GPU benchmark (tools/bench), build/bench-x86_64; ARCH=arm64 for an
 #                   Apple-silicon Mac.
 #   make res        what resources cost (tools/res), build/res-x86_64; ARCH=arm64 likewise.
+#   make submit-probe
+#                   a command buffer's fixed cost and latency (tools/submit_probe.m),
+#                   build/submit_probe-x86_64; ARCH=arm64 likewise.
 #   make reflection-check
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
@@ -362,6 +365,19 @@ $(RESBIN): tools/res/res.m Makefile
 		-Wall -Wextra -Werror -Wno-unused-parameter tools/res/res.m -framework Foundation \
 		-framework Metal -framework IOSurface -o $@
 
+# --- the command buffer's fixed cost and latency (tools/submit_probe.m says what each case does) --
+# One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
+# run on a real device, never in `make test`.
+SUBMITBIN = $(BUILD)/submit_probe-$(ARCH)
+
+submit-probe: $(SUBMITBIN)
+
+$(SUBMITBIN): tools/submit_probe.m Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter tools/submit_probe.m -framework Foundation \
+		-framework Metal -o $@
+
 # --- the stitchable reflection's check against Metal's own (tools/reflection_check.mm) ---------
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`: it compares with Metal's own compiler's answers.
@@ -379,4 +395,4 @@ $(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArgume
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench res reflection-check peer-test peer-test-build clean
+.PHONY: all test bundle package sweep bench res submit-probe reflection-check peer-test peer-test-build clean
