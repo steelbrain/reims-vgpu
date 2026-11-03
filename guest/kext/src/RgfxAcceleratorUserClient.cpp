@@ -127,9 +127,10 @@ enum {
 };
 static const uint32_t kRgfxIOGPUConfigSize = 64;
 static const uint32_t kRgfxIOGPUDeviceInfoSize = 536;
-// The configuration's working-set budget (at 0x10). Its shared-memory size (at 0x20) is the
-// region's: BAR 2's size, from the device.
-static const uint64_t kRgfxWorkingSetBytes = 8ull << 30;
+// The configuration's dedicatedMemorySize (its u64 at 0x10, which the guest's Metal device
+// answers) is the host's working set where its GPU has memory of its own, else 0
+// (RgfxMemorySize.hpp). Its shared-memory size (at 0x20) is the region's: BAR 2's size, from the
+// device.
 
 // Copy a reply into the method's struct-output, whether IOKit provided an inline buffer or an
 // output memory descriptor, and report the exact length written.
@@ -153,7 +154,9 @@ IOReturn RgfxAcceleratorUserClient::deviceMethod(uint32_t selector,
 {
 	if (selector == kRgfxIOGPUSelConfig) {
 		uint8_t config[kRgfxIOGPUConfigSize] = {};
-		*reinterpret_cast<uint64_t *>(config + 0x10) = kRgfxWorkingSetBytes;
+		RgfxMemorySize memory;
+		if (owner && owner->readMemorySize(&memory))
+			*reinterpret_cast<uint64_t *>(config + 0x10) = memory.dedicatedBytes;
 		*reinterpret_cast<uint64_t *>(config + 0x20) = owner ? owner->getRegionSize() : 0;
 		return rgfxWriteStructOut(arguments, config, sizeof(config));
 	}

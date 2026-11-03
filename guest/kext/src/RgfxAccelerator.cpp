@@ -315,6 +315,16 @@ bool RgfxAccelerator::start(IOService *provider)
 	// The accelerator's index, the one the framebuffer names it by (ReimsGraphics' IOAccelIndex):
 	// IOPresentment reads it here, before registerService, to match the display to this GPU.
 	setProperty(kIOAccelIndexKey, 0ull, 32);
+	// The GPU's memory, as a Mac's GPU states it (RgfxMemorySize.hpp): VRAM,totalMB on the PCI
+	// device, where system_profiler reads a discrete GPU's, and on the accelerator, where an
+	// Intel GPU states it. A host that gave no working set has none stated.
+	{
+		RgfxMemorySize memory;
+		if (readMemorySize(&memory) && memory.vramMB) {
+			pci->setProperty("VRAM,totalMB", memory.vramMB, 32);
+			setProperty("VRAM,totalMB", memory.vramMB, 32);
+		}
+	}
 	// Name this accelerator on the framebuffer, if it has started already (else the display
 	// pipe's first association does).
 	OSSafeReleaseNULL(fb);
@@ -501,6 +511,27 @@ IODeviceMemory *RgfxAccelerator::copyRegion() const
 	if (region)
 		region->retain();
 	return region;
+}
+
+bool RgfxAccelerator::readMemorySize(RgfxMemorySize *out) const
+{
+	if (!region)
+		return false;
+	// The device info's pages that hold the two answers, mapped into the kernel write-back as
+	// the user client's device info is: the region is BAR memory, which a physical copy does not
+	// read.
+	const UInt64 first = RGFX_DEVICE_INFO_OFFSET + kRgfxMemorySizeFirst;
+	const UInt64 page = first & ~0xfffull;
+	const UInt64 length =
+	    ((RGFX_DEVICE_INFO_OFFSET + kRgfxMemorySizeEnd + 0xfffull) & ~0xfffull) - page;
+	IOMemoryMap *map = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache | kIOMapReadOnly, page, length);
+	if (!map)
+		return false;
+	*out = rgfxMemorySizeFrom(reinterpret_cast<const uint8_t *>(map->getVirtualAddress()) +
+	                          (first - page));
+	map->release();
+	return true;
 }
 
 void RgfxAccelerator::ringDoorbell(UInt32 ringId)

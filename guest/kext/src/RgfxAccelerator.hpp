@@ -52,6 +52,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 
 #include "RgfxBlockTable.hpp"
+#include "RgfxMemorySize.hpp"
 #include "reims_graphics_wire.h"
 
 // OUR user-client protocol (not Apple's IOGPU ABI). The bundle's wire handshake opens the
@@ -266,6 +267,9 @@ public:
 	void ringDoorbell(UInt32 ringId);
 	// BAR 2's size, as the device's REGION_SIZE registers give it (no more than the BAR's).
 	UInt64 getRegionSize() const { return regionSize; }
+	// The GPU memory the guest is told of, from the host's device info (RgfxMemorySize.hpp):
+	// false where the region is not mapped.
+	bool readMemorySize(RgfxMemorySize *out) const;
 
 	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
 	// before it has started. The first lookup that finds it names this accelerator on it
