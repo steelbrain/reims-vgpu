@@ -498,6 +498,19 @@ Stages:
       other byte kept, and a binary or unreadable one is left and logged.
       AppleGVA reads it from the next service start (measured on the guest,
       macOS 26.6.1).
+    - **The GPU is named GFX0.** AppleGVA's video routing finds the GPU by
+      the name real AMD Macs give its PCI device, `GFX0`. HEVC needs it: the
+      accelerator names its IOPCIDevice provider `GFX0` in `start`, before
+      `registerService`, and without that name `VTDecompressionSessionCreate`
+      refuses every HEVC stream with −12913 and the driver is never called.
+      H.264 decodes either way, and the `IOGVACodec` string makes no
+      difference (measured on the msi 5080, 2026-11-03: three boots with the
+      provider's default name refused HEVC with −12913; a fourth that changed
+      only the provider's name to `GFX0` decoded every frame, H.264 still
+      working). Where a device already carries the name (a renamer such as
+      WhateverGreen, or a second GPU), the name is left as it was and that is
+      logged, so two are never published
+      (`guest/kext/src/RgfxAccelerator.cpp`, `nameProviderForVideo`).
     - **Capabilities are the host's:** the block lists the engines and, per
       codec and direction, a function record (its ID, sub-ID, input format
       `rawb` for a bitstream or `NV12` for frames, and output formats), from

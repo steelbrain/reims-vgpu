@@ -579,20 +579,10 @@ IOReturn RgfxAcceleratorUserClient::deviceInfoMethod(IOExternalMethodArguments *
 	if (a->scalarInputCount != 0 || a->scalarOutputCount != 0 || a->structureInputSize != 0 ||
 	    (outSize != sizeof(RgfxDeviceInfo) && outSize != size))
 		return kIOReturnBadArgument;
-	IODeviceMemory *region = owner->copyRegion();
-	if (!region)
-		return kIOReturnNotReady;
-	// Its pages, mapped into the kernel write-back as the framebuffer maps the rings: the
-	// region is BAR memory, which a physical copy does not read.
-	const UInt64 page = RGFX_DEVICE_INFO_OFFSET & ~0xfffull;
-	const UInt64 length = ((RGFX_DEVICE_INFO_OFFSET + outSize + 0xfffull) & ~0xfffull) - page;
-	IOMemoryMap *map = region->createMappingInTask(
-	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache | kIOMapReadOnly, page, length);
-	region->release();
+	const void *info = nullptr;
+	IOMemoryMap *map = owner->mapDeviceInfo(outSize, &info);
 	if (!map)
 		return kIOReturnNoResources;
-	const void *info =
-	    reinterpret_cast<const UInt8 *>(map->getVirtualAddress()) + (RGFX_DEVICE_INFO_OFFSET - page);
 	// The descriptor where there is one: the inline buffer is there too, but holds less.
 	IOReturn r = kIOReturnSuccess;
 	if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {

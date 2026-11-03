@@ -19,6 +19,7 @@
 #include "RgfxBundlePaths.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxTrace.hpp"
+#include "RgfxVideoCodecs.hpp"
 
 #define super IOAccelerator
 OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
@@ -372,6 +373,10 @@ bool RgfxAccelerator::start(IOService *provider)
 			setProperty("VRAM,totalMB", memory.vramMB, 32);
 		}
 	}
+	nameProviderForVideo();
+	// AppleGVA reads the video codecs off this service once Metal's matching sees it, after
+	// registerService.
+	publishVideoCodecs();
 	// Name this accelerator on the framebuffer, if it has started already (else the display
 	// pipe's first association does).
 	OSSafeReleaseNULL(fb);
@@ -581,6 +586,89 @@ bool RgfxAccelerator::readMemorySize(RgfxMemorySize *out) const
 	                          (first - page));
 	map->release();
 	return true;
+}
+
+IOMemoryMap *RgfxAccelerator::mapDeviceInfo(UInt64 size, const void **info) const
+{
+	if (!region)
+		return nullptr;
+	// Its pages, mapped into the kernel write-back as the framebuffer maps the rings: the
+	// region is BAR memory, which a physical copy does not read.
+	const UInt64 page = RGFX_DEVICE_INFO_OFFSET & ~0xfffull;
+	const UInt64 length = ((RGFX_DEVICE_INFO_OFFSET + size + 0xfffull) & ~0xfffull) - page;
+	IOMemoryMap *map = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache | kIOMapReadOnly, page, length);
+	if (map)
+		*info = reinterpret_cast<const UInt8 *>(map->getVirtualAddress()) +
+		        (RGFX_DEVICE_INFO_OFFSET - page);
+	return map;
+}
+
+void RgfxAccelerator::nameProviderForVideo()
+{
+	// AppleGVA's hardware video routes to its vendor driver through the GPU it finds by the
+	// name real AMD Macs give the GPU's PCI device, GFX0 (on an iMac20,1 with
+	// forceOfflineRenderer it looks for GFX0/IGPU). HEVC decode needs it: without it
+	// VTDecompressionSessionCreate refuses every HEVC stream with -12913 and our driver is
+	// never called, while H.264 decodes all the same and the IOGVACodec name makes no
+	// difference (measured on the msi 5080, 2026-11-03: three boots with the provider's
+	// default name refused HEVC, a fourth that only named it GFX0 decoded every frame). So
+	// the provider is named GFX0, as the hardware does, before registerService lets any
+	// AppleGVA lookup see it. Where another device already carries the name (a renamer like
+	// WhateverGreen, or a second GPU), the name is left as it was, so two GFX0s are never
+	// published.
+	if (OSDictionary *match = IOService::nameMatching("GFX0")) {
+		IOService *existing = IOService::copyMatchingService(match);
+		match->release();
+		if (existing) {
+			IOLog("RgfxAccelerator: a device is already named GFX0; leaving the provider named %s\n",
+			      pci->getName());
+			existing->release();
+			return;
+		}
+	}
+	pci->setName("GFX0");
+}
+
+void RgfxAccelerator::publishVideoCodecs()
+{
+	static_assert(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + sizeof(RgfxDeviceInfo),
+	              "the video caps follow the device info");
+	const void *info = nullptr;
+	IOMemoryMap *map = mapDeviceInfo(sizeof(RgfxDeviceInfo) + sizeof(RgfxVideoCaps), &info);
+	if (!map)
+		return;
+	RgfxVideoCaps caps;
+	memcpy(&caps, reinterpret_cast<const UInt8 *>(info) + sizeof(RgfxDeviceInfo), sizeof(caps));
+	map->release();
+	RgfxHevcDecode hevc;
+	if (!rgfxHevcDecode(caps, &hevc))
+		return;
+	OSArray *profiles = OSArray::withCapacity(hevc.count);
+	OSDictionary *details = OSDictionary::withCapacity(hevc.count);
+	OSDictionary *capabilities = OSDictionary::withCapacity(2);
+	OSNumber *level = OSNumber::withNumber(hevc.maxLevel, 32);
+	OSDictionary *profileDetail = OSDictionary::withCapacity(1);
+	bool made = profiles && details && capabilities && level && profileDetail &&
+	            profileDetail->setObject("VTMaxDecodeLevel", level);
+	for (uint32_t i = 0; made && i < hevc.count; i++) {
+		char key[4];
+		snprintf(key, sizeof key, "%u", hevc.profiles[i]);
+		OSNumber *profile = OSNumber::withNumber(hevc.profiles[i], 32);
+		made = profile && profiles->setObject(profile) && details->setObject(key, profileDetail);
+		OSSafeReleaseNULL(profile);
+	}
+	if (made && capabilities->setObject("VTSupportedProfileArray", profiles) &&
+	    capabilities->setObject("VTPerProfileDetails", details)) {
+		setProperty("IOGVAHEVCDecode", "1");
+		setProperty("IOGVAHEVCDecodeCapabilities", capabilities);
+		IOLog("RgfxAccelerator: HEVC decode, %u profiles, level %u\n", hevc.count, hevc.maxLevel);
+	}
+	OSSafeReleaseNULL(profileDetail);
+	OSSafeReleaseNULL(level);
+	OSSafeReleaseNULL(capabilities);
+	OSSafeReleaseNULL(details);
+	OSSafeReleaseNULL(profiles);
 }
 
 void RgfxAccelerator::ringDoorbell(UInt32 ringId)

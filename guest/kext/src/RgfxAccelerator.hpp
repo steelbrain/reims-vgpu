@@ -172,6 +172,10 @@ public:
 	// client's task (retained for the caller), and the doorbell write that wakes the
 	// host's consumer of ring `ringId`.
 	IODeviceMemory *copyRegion() const;
+	// The region's first `size` bytes from RGFX_DEVICE_INFO_OFFSET (the device info, and the
+	// video caps after it), mapped read-only into the kernel: the map, which the caller
+	// releases, with *info its first byte; null where it cannot be mapped.
+	IOMemoryMap *mapDeviceInfo(UInt64 size, const void **info) const;
 	void ringDoorbell(UInt32 ringId);
 	// BAR 2's size, as the device's REGION_SIZE registers give it (no more than the BAR's).
 	UInt64 getRegionSize() const { return regionSize; }
@@ -361,6 +365,12 @@ private:
 	void teardown();
 	// Starts the bundle's check (settleBundle); false where it cannot.
 	bool watchBundle();
+	// Names the GPU's PCI provider GFX0, as AMD Macs do, so AppleGVA's video routing finds it
+	// (its definition says what breaks without it); a no-op where another device is named GFX0.
+	void nameProviderForVideo();
+	// Publishes the host's hardware video that AppleGVA reads from the accelerator, from the
+	// video caps the host wrote (RgfxVideoCodecs.hpp): HEVC decode, where the host has it.
+	void publishVideoCodecs();
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
 	// `offset`, and posted for context `context`, its block cached where `cached`; true where
