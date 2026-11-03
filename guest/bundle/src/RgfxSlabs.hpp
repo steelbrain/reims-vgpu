@@ -4,12 +4,14 @@
  *
  * A buffer takes no block of the kext's and no host object of its own memory: it takes a range
  * of a slab, a larger piece of memory this allocator holds, and lies there at the range's offset.
- * What a slab is and how the host sees it is its source's (RgfxSlabSource): today a block of the
- * device region (RgfxRegionSlabSource), whose Shared slabs are each one placement heap over host
- * memory (HEAP_OVER_HOST_MEMORY) with every buffer a BUFFER_AT_OFFSET in it, and whose Managed
- * slabs are plain blocks with each buffer a BUFFER_OVER_HOST_MEMORY over its own range of the
- * block, its CPU copy. So a create is a take from a free list and one post on ring 0, and a free a
- * give back: neither calls the kext, and the region's block table holds one entry per slab.
+ * What a slab is and how the host sees it is its source's (RgfxSlabSource): a block of the device
+ * region (RgfxRegionSlabSource), whose Shared slabs are each one placement heap over host memory
+ * (HEAP_OVER_HOST_MEMORY) with every buffer a BUFFER_AT_OFFSET in it, and whose Managed slabs are
+ * plain blocks with each buffer a BUFFER_OVER_HOST_MEMORY over its own range of the block, its CPU
+ * copy; or a superpage of the process's own (RgfxPagesSlabSource), one heap over its guest RAM
+ * (HEAP_OVER_PAGES) with its buffers placed in it the same way. So a create is a take from a
+ * free list and one post on ring 0, and a free a give back: neither calls the kext, and the
+ * region's block table holds one entry per slab.
  *
  * What the buffers answer, as both x86-64 Macs' GPUs (AMD 5300M, Intel 630) agree (measured with
  * tools/shmem's align and zero cases): a buffer takes whole 4 KiB pages (kGranule; allocatedSize
@@ -41,10 +43,15 @@
  * once. Every buffer in a slab had its destroy posted before its range came back, so the heap's
  * destroy follows theirs.
  *
+ * THE SOURCES. A new slab comes from the first source where one is set (setFirst), at its unit,
+ * and from the region's source only where the first has no memory for it; a slab keeps the source
+ * it came from, which makes its buffers and takes it back, and its cache's cap is a sixteenth of
+ * that source's capacity.
+ *
  * THE FALLBACKS, in order, where a buffer finds no room in its class's slabs: a new slab; then,
- * once the source had no memory for one, the process's own empty and cached slabs let go and a
- * new slab asked again; then, for a small buffer, slabs half as large down to the buffer's own
- * rounded size. Only where the source has no memory even for that is the answer nil: the region
+ * once the sources had no memory for one, the process's own empty and cached slabs let go and a
+ * new slab asked again; then, for a small buffer, region slabs half as large down to the buffer's
+ * own rounded size. Only where no source has memory even for that is the answer nil: the region
  * is full. (Where the kext's block source places blocks, WindowServer's asks may take its
  * reserve.) A slab whose heap the device never got (the kext's submit refused it) is nil at once.
  *
@@ -55,6 +62,7 @@
 #ifndef RGFX_SLABS_HPP_
 #define RGFX_SLABS_HPP_
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <map>
@@ -78,6 +86,7 @@ public:
 		uint64_t size = 0;
 		uint64_t regionOffset = 0;
 		bool zeroed = false;
+		uint64_t blockSize = 0; // a pages block's size, for a source of the process's own pages
 	};
 
 	/// The host's object over a slab of a class whose buffers are placed in it (heaped): its
@@ -99,6 +108,10 @@ public:
 
 	/// What a slab's size is a whole multiple of (a power of two).
 	virtual uint64_t unit() const = 0;
+
+	/// Whether this source makes slabs for buffers of `options` at all: a first source that does
+	/// not leaves their class to the region's (RgfxSlabs::setFirst).
+	virtual bool serves(uint32_t options) const { return true; }
 
 	/// The most bytes this source's slabs could ever hold, which sizes the cache of slabs.
 	virtual uint64_t capacity() const = 0;
@@ -150,10 +163,51 @@ public:
 	/// Metal's page, which a heap over host memory is made of.
 	static constexpr uint64_t kUnit = 0x4000;
 
-private:
+protected:
 	RgfxRegion &m_region;
 	RgfxSerializer &m_serializer;
 	bool m_managedAtOffset;
+};
+
+/// The process's own memory a source of pages slabs takes from the kernel: calls the device wires
+/// (RgfxMetalDevice: mach_vm_allocate) and the tests fake.
+struct RgfxPagesMemory {
+	void *context = nullptr;
+	/// `size` bytes of 2 MiB superpages, zeroed and wired: 0 (KERN_SUCCESS), or the kernel's
+	/// refusal, KERN_NO_SPACE where no contiguous 2 MiB is free and KERN_RESOURCE_SHORTAGE past the
+	/// user wire budget.
+	int (*superpages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
+	/// Gives back what superpages made.
+	void (*unmap)(void *context, uint8_t *bytes, uint64_t size) = nullptr;
+};
+
+/// Slabs of the process's own pages: each one 2 MiB superpage, one run of guest RAM, wired into a
+/// pages block of the kext's (RgfxRegion::acquirePages; RGFX_FEATURE_PAGES_BUFFERS) that the host
+/// makes a heap over (HEAP_OVER_PAGES; RGFX_FEATURE_HEAP_OVER_PAGES), its buffers placed there as
+/// in a region slab's heap, so their memory is the guest's RAM, not the device region's. Only the
+/// classes whose buffers lie in heaps, and only slabs of one superpage, which are one run: a
+/// larger dedicated slab, and a slab where the kernel has no superpage to give or the kext no
+/// pages block, are the region's. A slab goes with its heap's destroy, then its block's release
+/// (the kext's Free, which waits for the device's answer), then its pages.
+class RgfxPagesSlabSource : public RgfxRegionSlabSource {
+public:
+	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
+	                    const RgfxPagesMemory &memory, uint64_t capacity,
+	                    bool managedAtOffset = false);
+
+	uint64_t unit() const override { return kUnit; }
+	bool serves(uint32_t options) const override { return heaped(options); }
+	uint64_t capacity() const override { return m_capacity; }
+	bool take(uint64_t size, Memory *out) override;
+	void give(const Memory &memory) override;
+	bool makeHeap(const Memory &memory, uint32_t options, Heap *out) override;
+
+	/// A superpage, and the one size of slab this source makes.
+	static constexpr uint64_t kUnit = 2ull << 20;
+
+private:
+	RgfxPagesMemory m_memory;
+	uint64_t m_capacity;
 };
 
 class RgfxSlabs {
@@ -177,9 +231,15 @@ public:
 		uint64_t dirtyBytes = 0;   // free bytes not yet zeroed
 		uint64_t dooming = 0;      // slabs let go whose drop has not run yet
 		uint64_t usedBytes = 0;    // bytes taken by buffers
+		uint64_t firstSlabs = 0;   // of the slabs, those the first source made
 	};
 
+	/// Slabs of `source`: the region's, which RgfxRegion::setReclaim asks to give room back.
 	explicit RgfxSlabs(RgfxSlabSource &source);
+
+	/// A source asked before the region's for every new slab (THE SOURCES), or null for none. Set
+	/// before any take.
+	void setFirst(RgfxSlabSource *first);
 
 	/// Stops the background thread. Gives nothing back: the slabs' memory and heaps go with the
 	/// process's context, as its other blocks do.
@@ -246,6 +306,7 @@ private:
 	};
 
 	struct Slab {
+		RgfxSlabSource *source = nullptr; // the source it came from, which takes it back
 		RgfxSlabSource::Memory memory;
 		RgfxSlabSource::Heap heap;
 		uint32_t options = 0;
@@ -270,10 +331,13 @@ private:
 		unsigned empty = 0;
 	};
 
-	/// A new slab of `size` bytes for buffers of `options`, through the source; null where it
-	/// gave none, with `*refused` set where it gave the memory but the device never got its heap.
+	/// A new slab of `size` bytes for buffers of `options`, through `source`; null where it gave
+	/// none, with `*refused` set where it gave the memory but the device never got its heap.
 	/// Called without the lock.
-	Slab *makeSlab(uint64_t size, uint32_t options, bool dedicated, bool *refused);
+	Slab *makeSlab(RgfxSlabSource &source, uint64_t size, uint32_t options, bool dedicated,
+	               bool *refused);
+	/// The bytes of the cached slabs of `source`. Caller holds the lock.
+	uint64_t cachedBytesOf(const RgfxSlabSource *source) const;
 	/// Takes `size` bytes of `slab` at its first fit, zeroing past `keep` what was dirty: the
 	/// pieces to zero go in `*zero`. Caller holds the lock.
 	bool takeIn(Slab *slab, uint64_t size, uint64_t keep,
@@ -300,6 +364,7 @@ private:
 	uint64_t nowMs() const;
 
 	RgfxSlabSource &m_source;
+	RgfxSlabSource *m_first = nullptr;
 	std::mutex m_lock;
 	std::condition_variable m_wake;
 	std::map<uint32_t, Class> m_classes;

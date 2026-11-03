@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
 #include <os/log.h>
@@ -326,6 +328,25 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 	return true;
 }
 
+// The pages source's memory (RgfxPagesMemory), tagged as the GPU's, so vmmap and footprint file
+// it where Metal's own memory shows: a 2 MiB superpage, zeroed and wired, one run of RAM.
+int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
+{
+	mach_vm_address_t at = 0;
+	const kern_return_t kr =
+	    mach_vm_allocate(mach_task_self(), &at, size,
+	                     VM_FLAGS_ANYWHERE | VM_FLAGS_SUPERPAGE_SIZE_2MB |
+	                         VM_MAKE_TAG(VM_MEMORY_IOACCELERATOR));
+	if (kr == KERN_SUCCESS)
+		*bytes = reinterpret_cast<uint8_t *>(at);
+	return kr;
+}
+
+void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
+{
+	mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(bytes), size);
+}
+
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
@@ -452,8 +473,10 @@ RGFX_LOG_UNRECOGNIZED
 	mach_vm_size_t _mapSize;     // the window's size, the region's
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
-	// The region's slabs Shared and Managed buffers lie in, and their source; null until then.
+	// The slabs Shared and Managed buffers lie in, and their sources: the region's, and the
+	// process's own pages before it where the host maps them; null until then.
 	std::unique_ptr<RgfxRegionSlabSource> _slabSource;
+	std::unique_ptr<RgfxPagesSlabSource> _pagesSource;
 	std::unique_ptr<RgfxSlabs> _slabs;
 }
 
@@ -601,6 +624,18 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(
 	    *_region, *_serializer, (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
+	// The slabs whose buffers lie in heaps are the process's own superpages, wired into pages
+	// blocks the host makes heaps over, where the region has a pages block source (above) and
+	// the device took HEAP_OVER_PAGES; else, and where the kernel has no superpage, the region's.
+	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
+		RgfxPagesMemory memory;
+		memory.superpages = &rgfxSuperpages;
+		memory.unmap = &rgfxUnmapPages;
+		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
+		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
+		    (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0);
+		_slabs->setFirst(_pagesSource.get());
+	}
 	if (!_slabs->start())
 		os_log_error(OS_LOG_DEFAULT,
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");

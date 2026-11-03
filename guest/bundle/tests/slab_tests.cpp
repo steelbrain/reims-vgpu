@@ -4,6 +4,8 @@
  * (serializer_tests.cpp calls rgfxSlabTests; guest/bundle/Makefile `test`). No Metal.
  */
 
+#include <mach/kern_return.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -11,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,8 +36,9 @@ constexpr uint32_t kSharedUntracked = 0x100; // Shared, default cache, Untracked
 constexpr uint32_t kManaged = 0x210;         // Managed, Tracked
 constexpr uint64_t kMiB = 1ull << 20;
 
-// Memory of the test's own, handed out first fit in 16 KiB units, every byte 0xee as it first
-// comes, with a log of what the allocator asked of it, in order.
+// Memory of the test's own, handed out first fit in units of `unitBytes` (16 KiB, as the region's),
+// every byte 0xee as it first comes, with a log of what the allocator asked of it, in order. Its
+// Shared classes are heaped where `heapedClasses`, as the region's are.
 struct Source : RgfxSlabSource {
 	std::vector<uint8_t> raw;
 	uint8_t *base; // raw's first byte at a 16 KiB boundary
@@ -42,20 +46,26 @@ struct Source : RgfxSlabSource {
 	RgfxHeapRanges free;
 	uint64_t gpu = 0x100000000ull;
 	uint64_t nextObj = 1;
+	uint64_t unitBytes;
 	bool refuseHeaps = false;
 	bool zeroed = false;
+	bool heapedClasses = true;
 	std::mutex lock;
 	std::vector<std::string> log;
 	uint64_t takes = 0, refusedTakes = 0, gives = 0, heaps = 0, heapDrops = 0;
 
-	explicit Source(uint64_t size) : raw(size + 0x4000, 0xee), bytes(size), free(size)
+	explicit Source(uint64_t size, uint64_t unit = 0x4000)
+	    : raw(size + 0x4000, 0xee), bytes(size), free(size), unitBytes(unit)
 	{
 		base = raw.data() + (0x4000 - reinterpret_cast<uintptr_t>(raw.data()) % 0x4000) % 0x4000;
 	}
 
-	uint64_t unit() const override { return 0x4000; }
+	uint64_t unit() const override { return unitBytes; }
 	uint64_t capacity() const override { return bytes; }
-	bool heaped(uint32_t options) const override { return ((options >> 4) & 0xf) == 0; }
+	bool heaped(uint32_t options) const override
+	{
+		return heapedClasses && ((options >> 4) & 0xf) == 0;
+	}
 	bool take(uint64_t size, Memory *out) override
 	{
 		std::lock_guard<std::mutex> hold(lock);
@@ -468,6 +478,76 @@ void test_slab_fallbacks()
 	}
 }
 
+// With a first source (the process's own guest RAM: 2 MiB units, no heaps, zeroed pages), a new
+// slab comes from it at its unit while it has memory, small and dedicated ones alike, and its
+// buffers are its own; once it has none, the region's source makes the slab, heaped as its classes
+// are. A slab goes back to the source it came from, and a cached one past a sixteenth of its own
+// source's capacity goes at once. Where both refuse, the process's empty slabs go and the first
+// source is asked again first.
+void test_slab_first_source()
+{
+	{
+		Source region(64 * kMiB);
+		Source pages(8 * kMiB, 2 * kMiB);
+		pages.heapedClasses = false;
+		pages.zeroed = true;
+		RgfxSlabs slabs(region);
+		slabs.setFirst(&pages);
+		RgfxSlabs::Range a, b, big, c;
+		CHECK(slabs.take(0x1000, kShared, 0, &a) && pages.takes == 1 && region.takes == 0);
+		CHECK(pages.logEnds({"take 2097152"})); // the unit, though a class's first slab is 128 KiB
+		RgfxSlabSource::Made made;
+		CHECK(slabs.makeBuffer(a, 0x1000, kShared, &made) && made.ownsAddress && pages.heaps == 0);
+		std::vector<RgfxSlabs::Range> fill(511);
+		for (auto &r : fill)
+			CHECK(slabs.take(0x1000, kShared, 0, &r) && r.slab == a.slab);
+		CHECK(slabs.take(0x1000, kShared, 0, &b) && b.slab != a.slab && pages.takes == 2);
+		CHECK(allBytes(b.contents, b.size, 0) && slabs.stats().dirtyBytes == 0);
+		// A dedicated 3 MiB buffer takes two units, the source's last.
+		CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.size == 3 * kMiB);
+		CHECK(pages.takes == 3 && pages.logEnds({"take 4194304"}));
+		// The pages are full: the region's source makes the next slab, with its heap.
+		CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c));
+		CHECK(pages.logEnds({"refuse 2097152"}) && region.takes == 1 && region.heaps == 1);
+		CHECK(slabs.makeBuffer(c, 0x1000, kSharedUntracked, &made) && !made.ownsAddress);
+		RgfxSlabs::Stats st = slabs.stats();
+		CHECK(st.slabs == 4 && st.firstSlabs == 3);
+		// The dedicated slab is past a sixteenth of the pages (512 KiB): it goes back to them at
+		// once, and the region's source gives nothing.
+		slabs.give(big);
+		CHECK(pages.gives == 1 && pages.logEnds({"give 4194304"}) && region.gives == 0);
+		CHECK(slabs.stats().cachedSlabs == 0);
+		slabs.give(c);
+		slabs.give(b);
+		for (auto &r : fill)
+			slabs.give(r);
+		slabs.give(a);
+		CHECK(region.gives == 0 && slabs.stats().emptySlabs == 3);
+	}
+	{
+		Source region(0x20000); // one 128 KiB slab
+		Source pages(4 * kMiB, 2 * kMiB);
+		pages.heapedClasses = false;
+		RgfxSlabs slabs(region);
+		slabs.setFirst(&pages);
+		RgfxSlabs::Range a, b, c, d;
+		CHECK(slabs.take(0x1000, kShared, 0, &a));
+		CHECK(slabs.take(0x1000, kSharedUntracked, 0, &b) && pages.takes == 2);
+		CHECK(slabs.take(0x1000, kManaged, 0, &c) && region.takes == 1);
+		slabs.give(a); // kept, empty
+		// A fourth class (Shared, write-combined): both refuse, the empty slab goes, and the pages
+		// make the slab.
+		pages.log.clear();
+		CHECK(slabs.take(0x1000, kShared | 0x1, 0, &d));
+		CHECK(pages.gives == 1 && pages.takes == 3 && region.refusedTakes >= 1);
+		CHECK(pages.log == std::vector<std::string>({"refuse 2097152", "give 2097152",
+		                                             "take 2097152"}));
+		slabs.give(d);
+		slabs.give(c);
+		slabs.give(b);
+	}
+}
+
 // With the background thread, a freed slab goes and freed bytes are zeroed on it, and buffers
 // made and freed on several threads at once never share a byte.
 void test_slab_thread()
@@ -681,6 +761,222 @@ void test_region_reclaims_slabs()
 	CHECK(!slabs.take(16 * kMiB, kShared, 0, &none));
 }
 
+// A kext of the test's own for the pages source: region blocks and pages blocks (16 KiB, which
+// hold the runs) first fit from one room past the floor, each release logged.
+struct PagesKext {
+	RgfxHeapRanges free;
+	std::map<uint64_t, uint64_t> blocks; // region blocks, by offset
+	std::set<uint64_t> pages;            // pages blocks, by offset
+	std::vector<std::string> *log;
+	bool refusePages = false;
+	const void *lastAddress = nullptr;
+	uint64_t lastLength = 0;
+	bool lastWritable = false;
+
+	PagesKext(uint64_t size, std::vector<std::string> *events) : free(size), log(events) {}
+	static bool alloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		PagesKext *k = static_cast<PagesKext *>(context);
+		if (!k->free.take(size, align, offset))
+			return false;
+		*offset += RGFX_ALLOCATIONS_OFFSET;
+		k->blocks[*offset] = size;
+		return true;
+	}
+	static bool pagesBlock(void *context, const void *address, uint64_t length, bool writable,
+	                       uint64_t *offset, uint64_t *size)
+	{
+		PagesKext *k = static_cast<PagesKext *>(context);
+		k->lastAddress = address;
+		k->lastLength = length;
+		k->lastWritable = writable;
+		if (k->refusePages || !k->free.take(0x4000, 0x4000, offset))
+			return false;
+		*offset += RGFX_ALLOCATIONS_OFFSET;
+		*size = 0x4000;
+		k->pages.insert(*offset);
+		return true;
+	}
+	static void release(void *context, uint64_t offset)
+	{
+		PagesKext *k = static_cast<PagesKext *>(context);
+		if (k->pages.erase(offset) != 0) {
+			k->free.give(offset - RGFX_ALLOCATIONS_OFFSET, 0x4000);
+			k->log->push_back("release pages");
+			return;
+		}
+		auto it = k->blocks.find(offset);
+		if (it == k->blocks.end())
+			return;
+		k->free.give(offset - RGFX_ALLOCATIONS_OFFSET, it->second);
+		k->blocks.erase(it);
+	}
+};
+
+// The kernel's memory for the pages source: `superpagesLeft` superpages of contiguous room, then
+// KERN_NO_SPACE; past the wire budget (`budgetSpent`), KERN_RESOURCE_SHORTAGE.
+struct PagesVm {
+	std::map<uint8_t *, std::vector<uint8_t>> held;
+	uint64_t superpagesLeft = 0;
+	bool budgetSpent = false;
+	std::vector<std::string> *log;
+
+	explicit PagesVm(std::vector<std::string> *events) : log(events) {}
+	static int superpages(void *context, uint64_t size, uint8_t **bytes)
+	{
+		PagesVm *vm = static_cast<PagesVm *>(context);
+		const std::string what = "superpages " + std::to_string(size);
+		if (vm->budgetSpent || size / (2 * kMiB) > vm->superpagesLeft) {
+			vm->log->push_back(what + " refused");
+			return vm->budgetSpent ? KERN_RESOURCE_SHORTAGE : KERN_NO_SPACE;
+		}
+		vm->superpagesLeft -= size / (2 * kMiB);
+		vm->log->push_back(what);
+		std::vector<uint8_t> memory(size, 0);
+		*bytes = memory.data();
+		vm->held[*bytes] = std::move(memory);
+		return KERN_SUCCESS;
+	}
+	static void unmap(void *context, uint8_t *bytes, uint64_t size)
+	{
+		PagesVm *vm = static_cast<PagesVm *>(context);
+		vm->held.erase(bytes);
+		vm->superpagesLeft += size / (2 * kMiB);
+		vm->log->push_back("unmap " + std::to_string(size));
+	}
+};
+
+bool endsWith(const std::vector<std::string> &log, const std::vector<std::string> &want)
+{
+	return log.size() >= want.size() && std::equal(want.begin(), want.end(), log.end() - want.size());
+}
+
+// The process's own pages as the first source: a heaped class's slab is one 2 MiB superpage
+// wired into a pages block of the kext's, made one HEAP_OVER_PAGES its buffers are placed in
+// (BUFFER_AT_OFFSET, and BUFFER_MANAGED_AT_OFFSET where the device took MANAGED_AT_OFFSET). A
+// dedicated slab larger than a superpage, a kernel with no superpage to give (no contiguous
+// 2 MiB, or the wire budget spent), and a kext that gives no block (the superpage given back) are
+// the region's slabs, as are Managed buffers without MANAGED_AT_OFFSET. A slab's heap is
+// destroyed, then its block released, then its pages go.
+void test_pages_slab_source()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext kext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
+	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
+	PagesVm vm(&log);
+	vm.superpagesLeft = 3;
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.superpages = &PagesVm::superpages;
+	calls.unmap = &PagesVm::unmap;
+	RgfxRegionSlabSource regionSource(region, ser);
+	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
+	CHECK(pages.unit() == 2 * kMiB && pages.heaped(kShared) && !pages.heaped(kManaged));
+	CHECK(pages.serves(kShared) && pages.serves(kSharedUntracked) && !pages.serves(kManaged));
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pages);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+
+	RgfxSlabs::Range a, b;
+	CHECK(slabs.take(256, kShared, 0, &a) && a.offset == 0 && a.size == 0x1000);
+	CHECK(log == std::vector<std::string>({"superpages 2097152"}) && kext.pages.size() == 1);
+	CHECK(kext.lastAddress == a.contents && kext.lastLength == 2 * kMiB && kext.lastWritable);
+	const uint64_t block = *kext.pages.begin();
+	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
+	CHECK(heap.block_offset == block && heap.block_size == 0x4000);
+	CHECK(heap.size_bytes == 2 * kMiB && heap.options == kShared && heap.heap_type == 1);
+	CHECK(heap.gpu_address != 0);
+	CHECK(slabs.take(0x3000, kShared, 0, &b) && b.slab == a.slab && b.offset == 0x1000);
+	CHECK(allBytes(b.contents, b.size, 0));
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(b, 0x2800, kShared, &made));
+	auto at = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0x1000 && at.length == 0x2800);
+	CHECK(made.objId == at.obj_id && made.gpuAddress == heap.gpu_address + 0x1000);
+	CHECK(!made.ownsAddress);
+	// A dedicated buffer of up to a superpage takes one of its own; a larger one, which would be
+	// more than one run, the region's slab.
+	RgfxSlabs::Range one, big;
+	CHECK(slabs.take(3 * kMiB / 2, kShared, 0, &one) && one.size == 3 * kMiB / 2);
+	CHECK(endsWith(log, {"superpages 2097152"}) && kext.pages.size() == 2);
+	CHECK(expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES).size_bytes == 2 * kMiB);
+	const size_t asked = log.size();
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.size == 3 * kMiB);
+	CHECK(log.size() == asked && kext.pages.size() == 2);
+	CHECK(expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY).size_bytes ==
+	      3 * kMiB);
+	// Managed, with no MANAGED_AT_OFFSET: the region's slab, unasked.
+	RgfxSlabs::Range m;
+	CHECK(slabs.take(0x1000, kManaged, 0, &m) && slabs.makeBuffer(m, 0x1000, kManaged, &made));
+	CHECK(log.size() == asked);
+	CHECK(expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY).length ==
+	      0x1000);
+	// The last superpage, then none: the region's heaped slab.
+	RgfxSlabs::Range c, d;
+	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c) && endsWith(log, {"superpages 2097152"}));
+	CHECK(slabs.take(0x1000, kShared | 0x1, 0, &d));
+	CHECK(endsWith(log, {"superpages 2097152 refused"}));
+	while (ring.next(&h, &bytes)) {
+	}
+	CHECK(h.type == RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+	CHECK(slabs.stats().slabs == 6 && slabs.stats().firstSlabs == 3);
+	// Past the wire budget: the region's slab.
+	vm.budgetSpent = true;
+	RgfxSlabs::Range e;
+	CHECK(slabs.take(0x1000, kSharedUntracked | 0x1, 0, &e));
+	CHECK(endsWith(log, {"superpages 2097152 refused"}) && slabs.stats().firstSlabs == 3);
+	vm.budgetSpent = false;
+	// No block from the kext: the superpage goes back, and the region's slab.
+	slabs.give(c);
+	CHECK(slabs.reclaim());
+	kext.refusePages = true;
+	log.clear();
+	RgfxSlabs::Range f;
+	CHECK(slabs.take(0x1000, kSharedUntracked | 0x2, 0, &f));
+	CHECK(log == std::vector<std::string>({"superpages 2097152", "unmap 2097152"}));
+	kext.refusePages = false;
+	while (ring.next(&h, &bytes)) {
+	}
+	// Every slab let go: each heap destroyed, its pages block released, then its pages.
+	for (RgfxSlabs::Range *r : {&a, &b, &one, &big, &m, &d, &e, &f})
+		slabs.give(*r);
+	log.clear();
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && kext.pages.empty() && vm.held.empty());
+	CHECK(log == std::vector<std::string>(
+	                 {"release pages", "unmap 2097152", "release pages", "unmap 2097152"}));
+	int destroys = 0;
+	while (ring.next(&h, &bytes))
+		destroys += h.type == RGFX_CMD_OBJECT_DESTROY;
+	CHECK(destroys == 6); // every slab's heap but the Managed one's plain block
+
+	// With MANAGED_AT_OFFSET, a Managed slab is a superpage too, its buffers' CPU copies placed
+	// in its heap.
+	RgfxPagesSlabSource managed(region, ser, calls, 16ull << 30, true);
+	CHECK(managed.serves(kManaged) && managed.heaped(kManaged));
+	RgfxRegionSlabSource managedRegion(region, ser, true);
+	RgfxSlabs both(managedRegion);
+	both.setFirst(&managed);
+	RgfxSlabs::Range g;
+	CHECK(both.take(0x1000, kManaged, 0, &g) && endsWith(log, {"superpages 2097152"}));
+	auto mheap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
+	CHECK(mheap.options == kShared && mheap.size_bytes == 2 * kMiB);
+	CHECK(both.makeBuffer(g, 0x800, kManaged, &made));
+	auto mat = expectMessage<RgfxBufferManagedAtOffset>(ring, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
+	CHECK(mat.heap_obj_id == mheap.obj_id && mat.offset == 0 && mat.length == 0x800);
+	CHECK(made.ownsAddress && made.gpuAddress == mat.gpu_address);
+	both.give(g);
+	CHECK(both.reclaim() && kext.pages.empty() && vm.held.empty());
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -693,7 +989,9 @@ void rgfxSlabTests()
 	test_slab_idle_empty_slabs_go();
 	test_slab_dedicated_cache();
 	test_slab_fallbacks();
+	test_slab_first_source();
 	test_slab_thread();
 	test_region_slab_source();
 	test_region_reclaims_slabs();
+	test_pages_slab_source();
 }

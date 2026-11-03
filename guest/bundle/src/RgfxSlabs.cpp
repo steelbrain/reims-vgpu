@@ -5,6 +5,8 @@
 
 #include "RgfxSlabs.hpp"
 
+#include <mach/kern_return.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -130,6 +132,57 @@ bool RgfxRegionSlabSource::makeBuffer(const Memory &memory, const Heap &heap, ui
 	return true;
 }
 
+// --- the process's own pages -----------------------------------------------------------------
+
+RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
+                                         const RgfxPagesMemory &memory, uint64_t capacity,
+                                         bool managedAtOffset)
+    : RgfxRegionSlabSource(region, serializer, managedAtOffset), m_memory(memory),
+      m_capacity(capacity)
+{
+}
+
+bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
+{
+	// One superpage, one run of guest RAM, which the host makes a heap over; where the kernel has
+	// none to give (no contiguous 2 MiB free, or the wire budget spent), the region's slab.
+	uint8_t *bytes = nullptr;
+	if (size != kUnit || m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS)
+		return false;
+	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
+	if (!block.ok) {
+		m_memory.unmap(m_memory.context, bytes, size);
+		return false;
+	}
+	out->bytes = bytes;
+	out->size = size;
+	out->regionOffset = block.offset;
+	out->blockSize = block.size;
+	out->zeroed = true; // fresh pages of the kernel's
+	return true;
+}
+
+void RgfxPagesSlabSource::give(const Memory &memory)
+{
+	// The block's release first: the kext answers once the device has let go of it, and unwires
+	// the pages.
+	m_region.release(memory.regionOffset);
+	m_memory.unmap(m_memory.context, memory.bytes, memory.size);
+}
+
+bool RgfxPagesSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)
+{
+	// As a region slab's: Shared, of the class's cache mode and hazard tracking.
+	RgfxCreated created = m_serializer.createHeapOverPages(
+	    memory.size, options & ~kStorageMask, kHeapTypePlacement, memory.regionOffset,
+	    memory.blockSize);
+	if (created.obj_id == 0 || m_serializer.refused(created))
+		return false; // no address left, or the device never got it
+	out->objId = created.obj_id;
+	out->gpuAddress = created.gpu_address;
+	return true;
+}
+
 // --- runs ----------------------------------------------------------------------------------
 
 void RgfxSlabs::Runs::add(uint64_t at, uint64_t length)
@@ -216,6 +269,12 @@ RgfxSlabs::RgfxSlabs(RgfxSlabSource &source) : m_source(source)
 {
 }
 
+void RgfxSlabs::setFirst(RgfxSlabSource *first)
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	m_first = first;
+}
+
 RgfxSlabs::~RgfxSlabs()
 {
 	{
@@ -264,19 +323,20 @@ RgfxSlabs::Class &RgfxSlabs::classOf(uint32_t options)
 	return m_classes[options];
 }
 
-RgfxSlabs::Slab *RgfxSlabs::makeSlab(uint64_t size, uint32_t options, bool dedicated,
-                                     bool *refused)
+RgfxSlabs::Slab *RgfxSlabs::makeSlab(RgfxSlabSource &source, uint64_t size, uint32_t options,
+                                     bool dedicated, bool *refused)
 {
 	RgfxSlabSource::Memory memory;
-	if (!m_source.take(size, &memory))
+	if (!source.take(size, &memory))
 		return nullptr;
 	RgfxSlabSource::Heap heap;
-	if (m_source.heaped(options) && !m_source.makeHeap(memory, options, &heap)) {
-		m_source.give(memory);
+	if (source.heaped(options) && !source.makeHeap(memory, options, &heap)) {
+		source.give(memory);
 		*refused = true; // the device never got the heap: no smaller slab gets one either
 		return nullptr;
 	}
 	Slab *slab = new Slab;
+	slab->source = &source;
 	slab->memory = memory;
 	slab->heap = heap;
 	slab->options = options;
@@ -314,7 +374,13 @@ bool RgfxSlabs::takeIn(Slab *slab, uint64_t size, uint64_t keep,
 
 bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *out)
 {
-	if (length == 0 || length > UINT64_MAX - m_source.unit())
+	RgfxSlabSource *first = nullptr;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		first = m_first;
+	}
+	const uint64_t widest = std::max(m_source.unit(), first != nullptr ? first->unit() : 0);
+	if (length == 0 || length > UINT64_MAX - widest)
 		return false;
 	const uint64_t size = roundUp(length, kGranule);
 	keep = std::min(keep, size);
@@ -329,9 +395,9 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		std::lock_guard<std::mutex> hold(m_lock);
 		if (dedicated) {
 			// The smallest cached slab of the class that holds it, and no more than twice it.
-			const uint64_t need = roundUp(size, unit);
 			Slab *best = nullptr;
 			for (Slab *slab : m_cached) {
+				const uint64_t need = roundUp(size, slab->source->unit());
 				if (slab->options == options && slab->zeroing == 0 && slab->memory.size >= need &&
 				    slab->memory.size / 2 <= need &&
 				    (best == nullptr || slab->memory.size < best->memory.size))
@@ -363,19 +429,30 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		}
 	}
 	if (in == nullptr) {
-		// A new slab; once the source refused one, the process's own room given back and the slab
-		// asked again; then, for a small buffer, slabs half as large down to the buffer's size.
+		// A new slab, from the first source at its unit, else the region's; once both refused
+		// one, the process's own room given back and the slab asked again; then, for a small
+		// buffer, region slabs half as large down to the buffer's size.
 		const uint64_t least = roundUp(size, unit);
 		uint64_t ask = dedicated ? least : want;
 		bool refused = false;
-		Slab *made = makeSlab(ask, options, dedicated, &refused);
+		auto fromEither = [&]() -> Slab * {
+			if (first != nullptr && first->serves(options)) {
+				bool firstRefused = false; // the region's slab is asked all the same
+				Slab *slab = makeSlab(*first, roundUp(dedicated ? size : ask, first->unit()),
+				                      options, dedicated, &firstRefused);
+				if (slab != nullptr)
+					return slab;
+			}
+			return makeSlab(m_source, ask, options, dedicated, &refused);
+		};
+		Slab *made = fromEither();
 		if (made == nullptr && !refused) {
 			dropDoomed(true);
-			made = makeSlab(ask, options, dedicated, &refused);
+			made = fromEither();
 		}
 		while (made == nullptr && !refused && !dedicated && ask > least) {
 			ask = std::max(roundUp(ask / 2, unit), least);
-			made = makeSlab(ask, options, dedicated, &refused);
+			made = makeSlab(m_source, ask, options, dedicated, &refused);
 		}
 		if (made == nullptr)
 			return false; // the source has no room for it
@@ -412,7 +489,7 @@ bool RgfxSlabs::makeBuffer(const Range &range, uint64_t length, uint32_t options
                            RgfxSlabSource::Made *out)
 {
 	const Slab *slab = static_cast<const Slab *>(range.slab);
-	return m_source.makeBuffer(slab->memory, slab->heap, range.offset, length, options, out);
+	return slab->source->makeBuffer(slab->memory, slab->heap, range.offset, length, options, out);
 }
 
 void RgfxSlabs::uncache(Slab *slab)
@@ -455,13 +532,16 @@ void RgfxSlabs::give(const Range &range)
 		slab->used -= range.size;
 		m_dirtySlabs.insert(slab);
 		if (slab->dedicated) {
-			// Cached for a later buffer, the oldest let go past a sixteenth of the source.
+			// Cached for a later buffer, the oldest of its source's let go past a sixteenth of the
+			// source.
 			slab->idleSince = nowMs();
 			m_cached.push_back(slab);
 			m_cachedBytes += slab->memory.size;
-			const uint64_t cap = m_source.capacity() / 16;
-			while (m_cachedBytes > cap && !m_cached.empty())
-				doom(m_cached.front());
+			const RgfxSlabSource *source = slab->source;
+			const uint64_t cap = source->capacity() / 16;
+			while (cachedBytesOf(source) > cap)
+				doom(*std::find_if(m_cached.begin(), m_cached.end(),
+				                   [source](const Slab *s) { return s->source == source; }));
 		} else {
 			Class &cls = classOf(slab->options);
 			cls.open.insert(slab);
@@ -485,9 +565,19 @@ void RgfxSlabs::give(const Range &range)
 void RgfxSlabs::drop(Slab *slab)
 {
 	if (slab->heap.objId != 0)
-		m_source.dropHeap(slab->heap);
-	m_source.give(slab->memory);
+		slab->source->dropHeap(slab->heap);
+	slab->source->give(slab->memory);
 	delete slab;
+}
+
+uint64_t RgfxSlabs::cachedBytesOf(const RgfxSlabSource *source) const
+{
+	uint64_t bytes = 0;
+	for (const Slab *slab : m_cached) {
+		if (slab->source == source)
+			bytes += slab->memory.size;
+	}
+	return bytes;
 }
 
 bool RgfxSlabs::reclaim()
@@ -660,6 +750,8 @@ RgfxSlabs::Stats RgfxSlabs::stats()
 		out.usedBytes += slab->used;
 		if (!slab->dedicated && slab->used == 0 && !slab->doomed)
 			out.emptySlabs++;
+		if (m_first != nullptr && slab->source == m_first)
+			out.firstSlabs++;
 	}
 	out.cachedSlabs = m_cached.size();
 	out.cachedBytes = m_cachedBytes;

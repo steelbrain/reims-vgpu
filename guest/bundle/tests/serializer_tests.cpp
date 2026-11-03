@@ -564,7 +564,8 @@ void test_creates_with_no_address_post_nothing()
 	RgfxCreated bh = ser.createBufferOverHostMemory(past, 0, 0x50000);
 	RgfxCreated bp = ser.createBufferOverPages(past, 0, 0x60000, 0x1000, 0x123);
 	RgfxCreated wraps = ser.createBufferOverPages(UINT64_MAX - 0x100, 0, 0x60000, 0x1000, 0x123);
-	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps})
+	RgfxCreated hp = ser.createHeapOverPages(past, 0, 1, 0x60000, 0x4000);
+	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, hp})
 		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0);
 	RgfxMsgHeader header = {};
 	std::vector<uint8_t> bytes;
@@ -630,6 +631,17 @@ void test_lifecycle_messages()
 	CHECK(bpm.offset == 0x123 && bpm.length == 0x3000 && bpm.reserved_44 == 0);
 	RgfxCreated next = ser.createBuffer(0x1000, 0);
 	CHECK(next.gpu_address >= bp.gpu_address + RgfxIdSpace::addressSpan(0x3123));
+	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
+
+	// A slab's heap over a pages block's guest RAM, at an address of its size.
+	RgfxCreated slab = ser.createHeapOverPages(0x200000, 0x200, 1, 0x60000, 0x4000);
+	CHECK(slab.posted && slab.gpu_address % RgfxIdSpace::kAddressGranule == 0);
+	auto slabm = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
+	CHECK(slabm.obj_id == slab.obj_id && slabm.gpu_address == slab.gpu_address);
+	CHECK(slabm.block_offset == 0x60000 && slabm.block_size == 0x4000 && slabm.options == 0x200);
+	CHECK(slabm.size_bytes == 0x200000 && slabm.heap_type == 1);
+	RgfxCreated after = ser.createBuffer(0x1000, 0);
+	CHECK(after.gpu_address >= slab.gpu_address + RgfxIdSpace::addressSpan(0x200000));
 	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
 
 	RgfxCreated bo = ser.createBufferAtOffset(h.obj_id, 0x100, 0x200, 0);

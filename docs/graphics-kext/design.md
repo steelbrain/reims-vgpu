@@ -720,7 +720,12 @@ only where no negotiation can carry it.
   Managed buffer whose CPU copy the host places in a heap over host memory of
   the sender's, so no buffer imports host memory of its own (the slabs,
   below). A host offers it where a Managed buffer is two copies, a GPU that does
-  not share the CPU's memory. Bit 15 is reserved for heaps over guest pages.
+  not share the CPU's memory.
+- Bit 15 is `HEAP_OVER_PAGES`: ring 0 carries `HEAP_OVER_PAGES`, a heap over
+  the one run of guest RAM a pages block of the sender's holds, made over the
+  host's mapping of the guest's RAM rather than the block's view, so the
+  buffers placed in it cost what those of a heap over host memory do. A host
+  offers it with `PAGES_BUFFERS`.
 - Bit 16 is `SUBMIT_ROOM`: a guest producer that finds a submission ring full
   stores 1 in the ring's `producer_waiting`, fences, and looks once more before
   it waits. After each take that moves the ring's `consumer`, the host fences
@@ -1360,7 +1365,7 @@ pipeline between equal keys.
 
 | group | messages | `Platform` call |
 |---|---|---|
-| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
+| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `HEAP_OVER_PAGES`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
@@ -1396,11 +1401,26 @@ the host's import, and the kext's block table holds one entry per slab:
   holds only the slabs its buffers lie in. A slab let go destroys its heap,
   then frees its block on the background thread, so no buffer's free waits
   for a `BLOCK_RELEASE`.
-- Where the region has no block for a new slab, the process's own empty and
-  cached slabs go first, then smaller slabs are tried down to the buffer's
-  size; nil only past that. Any other block of the process's the kext has no
-  room for (a texture's CPU copy, a heap, an upload chunk, an IOSurface's
-  block) is asked again once those slabs went (`RgfxRegion::setReclaim`).
+- Where the host maps a process's own pages (`PAGES_BUFFERS`, and the kext's
+  `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
+  of 2 MiB is the process's own memory instead: a 2 MiB superpage
+  (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, tagged `VM_MEMORY_IOACCELERATOR`), one run
+  of guest RAM, wired into a pages block and made one `HEAP_OVER_PAGES`, its
+  buffers placed in it as in a region slab's heap. A larger dedicated slab,
+  which would be more than one run, is the region's, as is a slab where the
+  kernel has no superpage to give (no contiguous 2 MiB free, or the wire
+  budget spent) or the kext gives no pages block. A slab let go
+  destroys its heap, releases its pages block (the kext answers once the host
+  let go of it, and unwires the pages), then deallocates its pages. On the
+  RTX 5080 a heap over a run of guest RAM took 13.4 us and a 4 KiB buffer
+  placed in it 1.93 us, where a no-copy buffer over a block's view took
+  65-75 us, an import of its own (`slab_heap_costs`, `slab_nocopy_costs`).
+- Where no source has memory for a new slab, the process's own empty and
+  cached slabs go first, then smaller region slabs are tried down to the
+  buffer's size; nil only past that. Any other block of the process's the
+  kext has no room for (a texture's CPU copy, a heap, an upload chunk, an
+  IOSurface's block) is asked again once those slabs went
+  (`RgfxRegion::setReclaim`).
 
 The host makes an `Automatic` heap a `Placement` heap: the guest places what
 the heap makes itself, as Metal's Automatic heap places it (lowest free offset

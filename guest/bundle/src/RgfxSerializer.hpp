@@ -259,6 +259,13 @@ public:
 	                                     uint64_t region_offset,
 	                                     uint64_t align = kDefaultAddressAlign);
 
+	/// A Shared heap over the guest RAM of the pages block of `block_size` bytes at
+	/// `block_offset`, whose pages are one run (HEAP_OVER_PAGES, where the device took
+	/// RGFX_FEATURE_HEAP_OVER_PAGES).
+	RgfxCreated createHeapOverPages(uint64_t size_bytes, uint32_t options, int32_t heap_type,
+	                                uint64_t block_offset, uint64_t block_size,
+	                                uint64_t align = kDefaultAddressAlign);
+
 	// --- buffers --------------------------------------------------------------
 
 	/// A device buffer of `length` bytes at a picked GPU address.
