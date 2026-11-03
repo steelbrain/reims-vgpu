@@ -781,10 +781,15 @@ newer kext, and a newer bundle on an older kext takes the 2 TiB it hands
 out. Runs go round-robin, so a run given back is the last one the next
 contexts take, and the last 32 units free go to WindowServer alone, as the
 blocks' and queues' reserves do. The host knows none of this: it pins each
-address as given. Sized from what a desktop uses (measured on the RTX 5080
-host, a6e722f47): 17 processes held a context on an idle desktop and 57 once
-39 apps were open, where the 32 slots of 2 TiB the kext had before refused the
-33rd process and every later one. Past the last run, `OpenContext` answers
+address as given. Sized from what a desktop uses, measured on the RTX 5080 host
+(a6e722f47's host and guest, macOS 26.6.1): 17 processes held a context on an
+idle desktop and 74 with 42 apps and 7 WebGL and WebGPU pages open, where the
+32 slots of 2 TiB the kext had before refused the 33rd process and every later
+one. The most GPU addresses one process held at once was WindowServer's 204 MiB
+(in 1525 picks of `RgfxIdSpace::addressSpan`), the largest single pick 35 MiB,
+and the furthest any process's picks went into its range 1.5 GiB (they go
+forward and come round only at its end), so a 64 GiB unit holds the busiest
+process's addresses over 300 times. Past the last run, `OpenContext` answers
 `kIOReturnNoResources`, and the bundle answers no device in that process
 (`initWithAcceleratorPort:` answers nil), which every Metal client handles,
 where a device whose every create answered nil stopped the frameworks that make
