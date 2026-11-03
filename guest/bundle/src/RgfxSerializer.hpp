@@ -276,6 +276,14 @@ public:
 	RgfxCreated createBufferOverSurfacePages(uint64_t length, uint32_t options,
 	                                         uint64_t block_offset, uint64_t block_size);
 
+	/// A Shared buffer of `length` bytes at `offset` in the view of the pages block of
+	/// `block_size` bytes at `block_offset` (RgfxRegion::acquirePages), `offset` the app
+	/// pointer's in its first page, at a GPU address that keeps it, as Metal's no-copy buffer's
+	/// address keeps its pointer's offset in its page. The answer's `gpu_address` is the address
+	/// picked, given back through releaseAddress; the buffer's is that plus `offset`.
+	RgfxCreated createBufferOverPages(uint64_t length, uint32_t options, uint64_t block_offset,
+	                                  uint64_t block_size, uint64_t offset);
+
 	/// A buffer at `offset` in the heap `heap`.
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);

@@ -140,6 +140,30 @@ void RgfxRegion::retireSurfaceWrites(uint64_t queue, uint64_t seqno)
 	}
 }
 
+void RgfxRegion::setPagesBlockSource(PagesBlockFn acquire, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_pagesBlock = acquire;
+	m_pagesBlockContext = context;
+}
+
+RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable)
+{
+	Block out = {};
+	uint64_t offset = 0, size = 0;
+	if (m_pagesBlock == nullptr ||
+	    !m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size))
+		return out; // ok == false
+	if (offset < m_floor || offset > m_size || size > m_size - offset) {
+		release(offset);
+		return out;
+	}
+	out.offset = offset;
+	out.size = size;
+	out.ok = true;
+	return out;
+}
+
 void RgfxRegion::releaseSurface(uint64_t offset)
 {
 	if (m_surfaceRelease != nullptr) {

@@ -33,6 +33,7 @@
 
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
 #include "rgfx_argument_reply.hpp"
@@ -560,7 +561,9 @@ void test_creates_with_no_address_post_nothing()
 	RgfxCreated hh = ser.createHeapOverHostMemory(past, 0, 1, 0x40000);
 	RgfxCreated b = ser.createBuffer(past, 0);
 	RgfxCreated bh = ser.createBufferOverHostMemory(past, 0, 0x50000);
-	for (const RgfxCreated &c : {h, hh, b, bh})
+	RgfxCreated bp = ser.createBufferOverPages(past, 0, 0x60000, 0x1000, 0x123);
+	RgfxCreated wraps = ser.createBufferOverPages(UINT64_MAX - 0x100, 0, 0x60000, 0x1000, 0x123);
+	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps})
 		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0);
 	RgfxMsgHeader header = {};
 	std::vector<uint8_t> bytes;
@@ -615,6 +618,18 @@ void test_lifecycle_messages()
 	CHECK(bh.posted);
 	auto bhm = expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
 	CHECK(bhm.obj_id == bh.obj_id && bhm.region_offset == 0x50000 && bhm.length == 0x800);
+
+	// Over a pages block, at the pointer's offset in its page: the pick holds the span from the
+	// page's start, and the buffer's address keeps the offset.
+	RgfxCreated bp = ser.createBufferOverPages(0x3000, 0, 0x60000, 0x1000, 0x123);
+	CHECK(bp.posted && bp.gpu_address % RgfxIdSpace::kAddressGranule == 0);
+	auto bpm = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(bpm.obj_id == bp.obj_id && bpm.gpu_address == bp.gpu_address + 0x123);
+	CHECK(bpm.block_offset == 0x60000 && bpm.block_size == 0x1000);
+	CHECK(bpm.offset == 0x123 && bpm.length == 0x3000 && bpm.reserved_44 == 0);
+	RgfxCreated next = ser.createBuffer(0x1000, 0);
+	CHECK(next.gpu_address >= bp.gpu_address + RgfxIdSpace::addressSpan(0x3123));
+	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
 
 	RgfxCreated bo = ser.createBufferAtOffset(h.obj_id, 0x100, 0x200, 0);
 	CHECK(bo.posted && bo.gpu_address == 0); // derived host-side from the heap
@@ -2278,10 +2293,57 @@ void test_argument_layout_parse()
 	CHECK(RgfxArgLayout::parse(probe.data(), probe.size()) == nullptr);
 }
 
+// A region's pages blocks (RgfxRegion::acquirePages): none without a source; with one, the
+// block it gives, its address, bytes and writability as asked, and no pointer, as the process
+// never maps one; a block the region does not hold goes back through the block source, and is
+// none.
+void test_region_pages_blocks()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x10000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	int marker = 0;
+	CHECK(!region.hasPagesBlocks() && !region.acquirePages(&marker, 4, true).ok);
+	struct Source {
+		const void *address = nullptr;
+		uint64_t length = 0;
+		bool writable = false;
+		uint64_t offset = 0;
+		std::vector<uint64_t> released;
+		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		                  uint64_t *offset, uint64_t *size)
+		{
+			Source *s = static_cast<Source *>(c);
+			s->address = address;
+			s->length = length;
+			s->writable = writable;
+			*offset = s->offset;
+			*size = 0x1000;
+			return true;
+		}
+		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setPagesBlockSource(&Source::block, &src);
+	CHECK(region.hasPagesBlocks());
+	src.offset = RGFX_ALLOCATIONS_OFFSET + 0x4000;
+	RgfxRegion::Block b = region.acquirePages(&marker, 0x4000, true);
+	CHECK(b.ok && b.offset == src.offset && b.size == 0x1000 && b.ptr == nullptr);
+	CHECK(src.address == &marker && src.length == 0x4000 && src.writable);
+	CHECK(src.released.empty());
+	src.offset = mem.size() - 0x800;
+	CHECK(!region.acquirePages(&marker, 0x4000, false).ok && !src.writable);
+	CHECK(src.released.size() == 1 && src.released[0] == mem.size() - 0x800);
+}
+
 int main()
 {
 	test_id_space();
 	test_obj_ids_are_given_once();
+	test_region_pages_blocks();
 	test_address_picks();
 	test_resource_id_chunks();
 	test_caps();

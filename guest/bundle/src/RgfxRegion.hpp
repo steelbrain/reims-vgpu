@@ -190,6 +190,24 @@ public:
 	SurfaceBlock acquireSurfacePages(const void *base, uint64_t length, uint64_t size,
 	                                 uint32_t surfaceId, bool cacheable, PagesAnswer *answer);
 
+	/// Where pages blocks come from (the kext's PagesBlock, RGFX_FEATURE_PAGES_BUFFERS): `acquire`
+	/// answers the block of the runs of the pages that hold the `length` bytes at `address` in the
+	/// process, which the kext wires for the block's life and the device maps in place from the
+	/// first of them, where the memory is `writable`: its region offset and size, or false where
+	/// it gives none. Its blocks go back through the block source's release (release()). Called
+	/// with `context`, from any thread.
+	typedef bool (*PagesBlockFn)(void *context, const void *address, uint64_t length,
+	                             bool writable, uint64_t *offset, uint64_t *size);
+	void setPagesBlockSource(PagesBlockFn acquire, void *context);
+
+	/// Whether a pages block source is set.
+	bool hasPagesBlocks() const { return m_pagesBlock != nullptr; }
+
+	/// The pages block of the `length` bytes at `address` (PagesBlockFn): `ok` false without a
+	/// pages block source, or where it gives none. Its `ptr` is null: the process never maps a
+	/// pages block, which holds the device's runs alone.
+	Block acquirePages(const void *address, uint64_t length, bool writable);
+
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).
 	RingPair allocateRingPair(uint32_t submit_data_size, uint32_t complete_data_size);
@@ -232,6 +250,8 @@ private:
 	SurfacePagesFn m_pagesAcquire = nullptr; // the surface pages source, where set (the kext)
 	uint64_t m_pagesAlignment = 0;
 	void *m_pagesContext = nullptr;
+	PagesBlockFn m_pagesBlock = nullptr; // the pages block source, where set (the kext)
+	void *m_pagesBlockContext = nullptr;
 	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
 	SurfaceRetireFn m_writesRetire = nullptr;
 	void *m_writesContext = nullptr;

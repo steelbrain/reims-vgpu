@@ -307,6 +307,25 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, ui
 	return RgfxRegion::kPagesGiven;
 }
 
+// The region's pages block source (RgfxRegion::setPagesBlockSource): the kext's pages block of
+// the process's own memory (kRgfxAccelMethodPagesBlock), false where it makes none, for any
+// reason, and the memory then takes a shadow.
+bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, bool writable,
+                        uint64_t *offset, uint64_t *size)
+{
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in[3] = {reinterpret_cast<uintptr_t>(address), length, writable ? 1u : 0u};
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodPagesBlock, in, 3, out, &outCount);
+	if (kr != KERN_SUCCESS || outCount != 2)
+		return false;
+	*offset = out[0];
+	*size = out[1];
+	return true;
+}
+
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
@@ -555,6 +574,11 @@ RGFX_LOG_UNRECOGNIZED
 	_region->setSurfacePagesSource(&rgfxKextSurfacePages, _caps.linearTextureAlignment(),
 	                               connContext);
 	_region->setSurfaceWriteSource(&rgfxKextSurfaceWrites, &rgfxKextSurfaceRetire, connContext);
+	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
+	// host took the feature that maps them.
+	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&
+	    (_caps.features() & RGFX_FEATURE_PAGES_BUFFERS) != 0)
+		_region->setPagesBlockSource(&rgfxKextPagesBlock, connContext);
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).

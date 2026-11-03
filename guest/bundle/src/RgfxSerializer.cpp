@@ -338,6 +338,32 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createBufferOverPages(uint64_t length, uint32_t options,
+                                                  uint64_t block_offset, uint64_t block_size,
+                                                  uint64_t offset)
+{
+	RgfxCreated out = {};
+	// The pick holds the span from the page the buffer starts in. No address left for it: no
+	// object, as Metal answers one it cannot place.
+	if (length > UINT64_MAX - offset)
+		return out;
+	out.gpu_address = m_ids.allocAddress(length + offset, kDefaultAddressAlign);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxBufferOverPages msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address + offset;
+	msg.block_offset = block_offset;
+	msg.block_size = block_size;
+	msg.offset = offset;
+	msg.length = length;
+	msg.options = options;
+	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_OVER_PAGES, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
                                                  uint32_t options)
 {
