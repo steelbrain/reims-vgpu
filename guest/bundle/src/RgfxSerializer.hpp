@@ -37,6 +37,8 @@
 #include "RgfxRingWriter.hpp"
 #include "reims_graphics_wire.h"
 
+class RgfxIcbSlotTable;
+
 /// A sampler's state, as MTLSamplerDescriptor gives it. The LOD clamps are
 /// floats here; the serialiser stores their bits on the wire (so it stays
 /// all-integer), as RgfxSamplerCreate asks.
@@ -446,10 +448,32 @@ public:
 	/// message would pass the largest the control ring takes, when that message goes at once.
 	void icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const void *body, uint16_t size);
 
-	/// Posts every waiting record (ICB_WRITE, one message for each buffer's run of records), so
-	/// the device carries them out before any command buffer the process posts after this
-	/// returns. One load where none waits.
+	/// Posts every waiting write: the slots written since the last flush (ICB_SLOTS, their runs,
+	/// RgfxIcbSlotTable.hpp), then the records (ICB_WRITE, one message for each buffer's run of
+	/// records), so the device carries them out before any command buffer the process posts after
+	/// this returns. One load where none waits.
 	RgfxIcbFlush flushIcbWrites();
+
+	/// The slots `slots` were written since the last flush: they go on the list the next flush
+	/// takes, once a flush cycle (as their `pending` flag turns on).
+	void icbSlotsPending(RgfxIcbSlotTable *slots);
+
+	/// Posts what `slots` were written since the last flush, now, ahead of the records that
+	/// follow: their buffer turned to records (RgfxIcbSlotTable::toRecords).
+	void flushIcbSlots(RgfxIcbSlotTable *slots);
+
+	/// `slots` go, their buffer's destroy posted: off the list, and their bytes given back.
+	void forgetIcbSlots(RgfxIcbSlotTable *slots);
+
+	/// The most bytes of slots the process's buffers hold together: under a tenth of the region
+	/// room an app has (about 400 MiB), so slots never starve its Shared buffers. A buffer whose
+	/// slots would pass it takes records.
+	static constexpr uint64_t kIcbSlotBytes = 32ull << 20;
+
+	/// Room for `bytes` more of slots inside kIcbSlotBytes: taken, where it fits.
+	bool reserveIcbSlotBytes(uint64_t bytes);
+	/// Gives back `bytes` reserveIcbSlotBytes took.
+	void releaseIcbSlotBytes(uint64_t bytes);
 
 	// --- video ----------------------------------------------------------------
 
@@ -502,8 +526,18 @@ private:
 	std::mutex m_icbLock;
 	std::atomic<bool> m_icbPending{false};
 	std::vector<IcbMessage> m_icbMessages;
+	// The slots written since the last flush, under m_icbLock (icbSlotsPending), and the bytes
+	// of slots the process's buffers hold.
+	std::vector<RgfxIcbSlotTable *> m_icbSlots;
+	std::atomic<uint64_t> m_icbSlotBytes{0};
+	// The largest message the control ring takes: a forwarding writer's whole size, a ring's
+	// half (RgfxRingWriter::fits).
+	uint32_t icbMessageCap() const;
 	// Posts `message` (under m_icbLock), adding to `*flush`.
 	void postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush);
+	// Posts `runs` as ICB_SLOTS, as few as the ring's cap allows (under m_icbLock), adding to
+	// `*flush` where given.
+	void postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxIcbFlush *flush);
 };
 
 #endif // RGFX_SERIALIZER_HPP_

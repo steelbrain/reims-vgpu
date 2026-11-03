@@ -5,6 +5,9 @@
 
 #include "RgfxSerializer.hpp"
 
+#include "RgfxIcbSlotTable.hpp"
+
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -602,10 +605,7 @@ void RgfxSerializer::icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const
                                uint16_t size)
 {
 	const uint32_t recordBytes = sizeof(RgfxIcbRecord) + size;
-	// The largest message the control ring takes: a forwarding writer's whole size, a ring's
-	// half (RgfxRingWriter::fits).
-	const uint32_t cap =
-	    m_control.fits(m_control.dataSize()) ? m_control.dataSize() : m_control.dataSize() / 2;
+	const uint32_t cap = icbMessageCap();
 	std::lock_guard<std::mutex> lock(m_icbLock);
 	// The buffer's run of records, most often the last one begun.
 	IcbMessage *message = nullptr;
@@ -635,6 +635,11 @@ void RgfxSerializer::icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const
 	m_icbPending.store(true, std::memory_order_release);
 }
 
+uint32_t RgfxSerializer::icbMessageCap() const
+{
+	return m_control.fits(m_control.dataSize()) ? m_control.dataSize() : m_control.dataSize() / 2;
+}
+
 void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
 {
 	if (message.bytes.size() <= sizeof(RgfxIcbWrite))
@@ -660,19 +665,101 @@ void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
 	}
 }
 
+void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxIcbFlush *flush)
+{
+	const uint32_t cap = icbMessageCap();
+	const size_t most = (cap - sizeof(RgfxIcbSlots)) / sizeof(RgfxIcbSlotRun);
+	std::vector<uint8_t> bytes;
+	for (size_t at = 0; at < runs.size(); at += most) {
+		const size_t n = std::min(most, runs.size() - at);
+		RgfxIcbSlots head = {};
+		head.obj_id = runs[at].icb_obj_id;
+		head.run_count = static_cast<uint32_t>(n);
+		const uint32_t size = static_cast<uint32_t>(sizeof(head) + n * sizeof(RgfxIcbSlotRun));
+		bytes.resize(size);
+		std::memcpy(bytes.data(), &head, sizeof(head));
+		std::memcpy(bytes.data() + sizeof(head), &runs[at], n * sizeof(RgfxIcbSlotRun));
+		const auto start = std::chrono::steady_clock::now();
+		if (!m_control.tryPost(RGFX_CMD_ICB_SLOTS, bytes.data(), size, nullptr)) {
+			// As a lost ICB_WRITE: the commands keep what they had.
+			std::fprintf(stderr, "RGFX: ICB_SLOTS of %zu runs was not posted\n", n);
+		}
+		if (flush != nullptr) {
+			flush->messages++;
+			flush->bytes += size;
+			flush->nanoseconds += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - start)
+			        .count());
+		}
+	}
+}
+
 RgfxIcbFlush RgfxSerializer::flushIcbWrites()
 {
 	RgfxIcbFlush flush = {};
 	if (!m_icbPending.load(std::memory_order_acquire))
 		return flush;
-	// The posts are made under the lock, so a flush that finds records pending returns only once
-	// they are on the ring, whichever thread posts them.
+	// The posts are made under the lock, so a flush that finds writes pending returns only once
+	// they are on the ring, whichever thread posts them. Each table's flag is cleared before its
+	// chunks are taken, so a write after the take puts it on the list again (RgfxIcbSlotTable.hpp).
 	std::lock_guard<std::mutex> lock(m_icbLock);
+	if (!m_icbSlots.empty()) {
+		std::vector<RgfxIcbSlotRun> runs;
+		for (RgfxIcbSlotTable *slots : m_icbSlots) {
+			slots->pending.store(false, std::memory_order_seq_cst);
+			slots->takeRuns(runs);
+		}
+		m_icbSlots.clear();
+		postIcbSlots(runs, &flush);
+	}
 	for (IcbMessage &message : m_icbMessages)
 		postIcbMessage(message, &flush);
 	m_icbMessages.clear();
 	m_icbPending.store(false, std::memory_order_release);
 	return flush;
+}
+
+void RgfxSerializer::icbSlotsPending(RgfxIcbSlotTable *slots)
+{
+	std::lock_guard<std::mutex> lock(m_icbLock);
+	if (slots->pending.exchange(true, std::memory_order_seq_cst))
+		return;
+	m_icbSlots.push_back(slots);
+	m_icbPending.store(true, std::memory_order_release);
+}
+
+void RgfxSerializer::flushIcbSlots(RgfxIcbSlotTable *slots)
+{
+	std::lock_guard<std::mutex> lock(m_icbLock);
+	std::vector<RgfxIcbSlotRun> runs;
+	slots->takeRuns(runs);
+	postIcbSlots(runs, nullptr);
+}
+
+void RgfxSerializer::forgetIcbSlots(RgfxIcbSlotTable *slots)
+{
+	{
+		std::lock_guard<std::mutex> lock(m_icbLock);
+		m_icbSlots.erase(std::remove(m_icbSlots.begin(), m_icbSlots.end(), slots),
+		                 m_icbSlots.end());
+	}
+	releaseIcbSlotBytes(slots->bytes());
+}
+
+bool RgfxSerializer::reserveIcbSlotBytes(uint64_t bytes)
+{
+	uint64_t held = m_icbSlotBytes.load(std::memory_order_relaxed);
+	do {
+		if (bytes > kIcbSlotBytes - held)
+			return false;
+	} while (!m_icbSlotBytes.compare_exchange_weak(held, held + bytes, std::memory_order_relaxed));
+	return true;
+}
+
+void RgfxSerializer::releaseIcbSlotBytes(uint64_t bytes)
+{
+	m_icbSlotBytes.fetch_sub(bytes, std::memory_order_relaxed);
 }
 
 RgfxCreated RgfxSerializer::createDepthStencil(uint32_t depth_compare, bool depth_write_enabled,

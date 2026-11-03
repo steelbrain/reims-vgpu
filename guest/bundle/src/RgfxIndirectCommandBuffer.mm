@@ -12,7 +12,11 @@
 #include <objc/message.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 
+#include "RgfxIcbSlotTable.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
 namespace {
@@ -95,9 +99,12 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	return [(RgfxIndirectCommandBuffer *)icb rgfxClampRange:range];
 }
 
+// Each command names its buffer's slots where it writes them (RgfxIcbSlotTable.hpp), which the
+// buffer, held by the command, keeps.
 @interface RgfxIndirectRenderCommand () {
 @package
 	RgfxIndirectCommandBuffer *_icb;
+	RgfxIcbSlotTable *_slots;
 	uint32_t _index;
 }
 @end
@@ -105,6 +112,7 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 @interface RgfxIndirectComputeCommand () {
 @package
 	RgfxIndirectCommandBuffer *_icb;
+	RgfxIcbSlotTable *_slots;
 	uint32_t _index;
 }
 @end
@@ -114,13 +122,36 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	MTLResourceOptions _options;
 	uint64_t _types;
 	uint64_t _resourceId; // the host's answer; 0 where none came (a create on a test's ring)
+	// Slots: the region they are placed in (null where the device took no ICB_SLOTS), their
+	// kind and bindings, and their stride, 0 where the buffer takes records; made at the first
+	// CPU encode (rgfxSlots), under _slotLock.
+	RgfxRegion *_slotRegion;
+	uint16_t _slotKind;
+	uint32_t _slotA, _slotB;
+	std::atomic<uint32_t> _slotStride;
+	std::atomic<RgfxIcbSlotTable *> _slots;
+	uint64_t _slotBlock;
+	std::mutex _slotLock;
 }
 
 // The host drops the buffer as the app lets it go, after any command buffer that names it (each
-// keeps it while it runs), and after the records waiting for it (RgfxSerializer::destroy).
+// keeps it while it runs), and after the writes waiting for it (RgfxSerializer::destroy), its
+// slots' among them; the slots' block goes back after the destroy.
 - (void)dealloc
 {
-	[self rgfxRetireThen:nullptr];
+	RgfxIcbSlotTable *slots = _slots.load(std::memory_order_acquire);
+	if (slots == nullptr) {
+		[self rgfxRetireThen:nullptr];
+		return;
+	}
+	RgfxSerializer *serializer = _serializer;
+	RgfxRegion *region = _slotRegion;
+	const uint64_t block = _slotBlock;
+	[self rgfxRetireThen:[serializer, region, slots, block] {
+		serializer->forgetIcbSlots(slots);
+		delete slots;
+		region->release(block);
+	}];
 }
 
 + (instancetype)icbWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
@@ -128,6 +159,21 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
                           options:(MTLResourceOptions)options
                            device:(id<MTLDevice>)device
                        serializer:(RgfxSerializer *)serializer
+{
+	return [self icbWithDescriptor:descriptor
+	               maxCommandCount:maxCount
+	                       options:options
+	                        device:device
+	                    serializer:serializer
+	                   slotsRegion:nullptr];
+}
+
++ (instancetype)icbWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
+                  maxCommandCount:(NSUInteger)maxCount
+                          options:(MTLResourceOptions)options
+                           device:(id<MTLDevice>)device
+                       serializer:(RgfxSerializer *)serializer
+                      slotsRegion:(RgfxRegion *)region
 {
 	// Every Mac ends the process here, before anything else of the call (measured: an assertion
 	// and SIGABRT on the AMD 5300M and the Intel 630, a trap on the M3 Max).
@@ -156,8 +202,64 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 		icb->_options = options;
 		icb->_types = descriptor.commandTypes;
 		icb->_resourceId = created.resource_id;
+		[icb rgfxPlanSlots:descriptor region:region];
 	}
 	return icb;
+}
+
+// Whether the buffer takes slots, and of what shape: where `region` is given, its commands are
+// of one kind, its bindings fit a slot and its slots fit kMaxBytes. Else records.
+- (void)rgfxPlanSlots:(MTLIndirectCommandBufferDescriptor *)d region:(RgfxRegion *)region
+{
+	_slotRegion = region;
+	_slotStride.store(0, std::memory_order_relaxed);
+	if (region == nullptr || _size == 0 || _size > UINT32_MAX)
+		return;
+	if ((_types & ~kRenderTypes) == 0) {
+		_slotKind = RGFX_ICB_SLOTS_RENDER;
+		_slotA = u32(std::min<NSUInteger>(d.maxVertexBufferBindCount, UINT32_MAX));
+		_slotB = u32(std::min<NSUInteger>(d.maxFragmentBufferBindCount, UINT32_MAX));
+	} else if ((_types & ~kComputeTypes) == 0) {
+		_slotKind = RGFX_ICB_SLOTS_COMPUTE;
+		_slotA = u32(std::min<NSUInteger>(d.maxKernelBufferBindCount, UINT32_MAX));
+		_slotB = u32(std::min<NSUInteger>(d.maxKernelThreadgroupMemoryBindCount, UINT32_MAX));
+	} else {
+		return;
+	}
+	const uint32_t stride = RgfxIcbSlotTable::strideFor(_slotKind, _slotA, _slotB);
+	if (stride != 0 && uint64_t(_size) * stride <= RgfxIcbSlotTable::kMaxBytes)
+		_slotStride.store(stride, std::memory_order_relaxed);
+}
+
+// The buffer's slots, made at the first call that may write them, zeroed: null where it takes
+// records (rgfxPlanSlots:, or where the process's slots or the region have no room for them).
+- (RgfxIcbSlotTable *)rgfxSlots
+{
+	RgfxIcbSlotTable *slots = _slots.load(std::memory_order_acquire);
+	if (slots != nullptr || _slotStride.load(std::memory_order_relaxed) == 0)
+		return slots;
+	std::lock_guard<std::mutex> lock(_slotLock);
+	slots = _slots.load(std::memory_order_relaxed);
+	const uint32_t stride = _slotStride.load(std::memory_order_relaxed);
+	if (slots != nullptr || stride == 0)
+		return slots;
+	const uint64_t bytes = uint64_t(_size) * stride;
+	if (!_serializer->reserveIcbSlotBytes(bytes)) {
+		_slotStride.store(0, std::memory_order_relaxed);
+		return nullptr;
+	}
+	const RgfxRegion::Block block = _slotRegion->allocate(bytes);
+	if (!block.ok) {
+		_serializer->releaseIcbSlotBytes(bytes);
+		_slotStride.store(0, std::memory_order_relaxed);
+		return nullptr;
+	}
+	std::memset(const_cast<uint8_t *>(block.ptr), 0, bytes);
+	slots = new RgfxIcbSlotTable(_serializer, _objId, _slotKind, _slotA, _slotB, u32(_size), stride,
+	                         block.ptr, block.offset);
+	_slotBlock = block.offset;
+	_slots.store(slots, std::memory_order_release);
+	return slots;
 }
 
 - (NSRange)rgfxClampRange:(NSRange)range
@@ -181,13 +283,18 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	return rid;
 }
 
-// Every command of the range loses what it was given, on the host's buffer: a reset of each
-// kind of command the buffer has.
+// Every command of the range loses what it was given, on the host's buffer: in its slots, or a
+// reset of each kind of command the buffer has.
 - (void)resetWithRange:(NSRange)range
 {
 	range = [self rgfxClampRange:range];
 	if (_serializer == nullptr || range.length == 0)
 		return;
+	RgfxIcbSlotTable *slots = [self rgfxSlots];
+	if (slots != nullptr && slots->active()) {
+		slots->resetRange(u32(range.location), u32(range.length));
+		return;
+	}
 	const RgfxIcbRange body = {u32(range.length), 0};
 	if (_types & kRenderTypes) {
 		_serializer->icbRecord(_objId, RGFX_ICB_OP_RENDER_RESET_RANGE, u32(range.location), &body,
@@ -206,6 +313,7 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 		return nil;
 	RgfxIndirectRenderCommand *c = [RgfxIndirectRenderCommand new];
 	c->_icb = self;
+	c->_slots = [self rgfxSlots];
 	c->_index = u32(commandIndex);
 	return c;
 }
@@ -217,6 +325,7 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 		return nil;
 	RgfxIndirectComputeCommand *c = [RgfxIndirectComputeCommand new];
 	c->_icb = self;
+	c->_slots = [self rgfxSlots];
 	c->_index = u32(commandIndex);
 	return c;
 }
@@ -283,10 +392,6 @@ inline void bare(RgfxIndirectCommandBuffer *icb, uint16_t op, uint32_t index)
 		s->icbRecord(icb->_objId, op, index, nullptr, 0);
 }
 
-inline RgfxIcbBuffer bufferBody(id<MTLBuffer> b, NSUInteger offset, NSUInteger index)
-{
-	return {RgfxResourceId(b), offset, u32(index), 0};
-}
 
 inline RgfxIcbDrawPatches patches(NSUInteger controlPoints, NSUInteger start, NSUInteger count,
                                   id<MTLBuffer> patchIndexBuffer, NSUInteger patchIndexOffset,
@@ -314,23 +419,54 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
 	        {u32(threadgroup.width), u32(threadgroup.height), u32(threadgroup.depth)}};
 }
 
+// The command's slots where its buffer still writes them, else null: the call is a record.
+inline RgfxIcbSlotTable *live(RgfxIcbSlotTable *slots)
+{
+	return slots != nullptr && slots->active() ? slots : nullptr;
+}
+
+// A draw or a dispatch, `op` with `body`, on `index` of `icb`: into its slot, or a record.
+template <typename T>
+inline void action(RgfxIndirectCommandBuffer *icb, RgfxIcbSlotTable *slots, uint16_t op,
+                   uint32_t index, const T &body)
+{
+	if (RgfxIcbSlotTable *s = live(slots)) {
+		s->setAction(index, op, &body, sizeof(body));
+		return;
+	}
+	record(icb, op, index, body);
+}
+
 } // namespace
 
 @implementation RgfxIndirectRenderCommand
 
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipelineState
 {
-	record(_icb, RGFX_ICB_OP_RENDER_PIPELINE, _index, RgfxIcbObject{RgfxResourceId(pipelineState)});
+	const uint64_t pipeline = RgfxResourceId(pipelineState);
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setPipeline(_index, pipeline);
+		return;
+	}
+	record(_icb, RGFX_ICB_OP_RENDER_PIPELINE, _index, RgfxIcbObject{pipeline});
 }
 
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	record(_icb, RGFX_ICB_OP_VERTEX_BUFFER, _index, bufferBody(buffer, offset, index));
+	const uint64_t b = RgfxResourceId(buffer);
+	RgfxIcbSlotTable *s = live(_slots);
+	if (s != nullptr && s->setBuffer(_index, index, b, offset, 0, false))
+		return;
+	record(_icb, RGFX_ICB_OP_VERTEX_BUFFER, _index, RgfxIcbBuffer{b, offset, u32(index), 0});
 }
 
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	record(_icb, RGFX_ICB_OP_FRAGMENT_BUFFER, _index, bufferBody(buffer, offset, index));
+	const uint64_t b = RgfxResourceId(buffer);
+	RgfxIcbSlotTable *s = live(_slots);
+	if (s != nullptr && s->setFragmentBuffer(_index, index, b, offset))
+		return;
+	record(_icb, RGFX_ICB_OP_FRAGMENT_BUFFER, _index, RgfxIcbBuffer{b, offset, u32(index), 0});
 }
 
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer
@@ -338,7 +474,11 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
         attributeStride:(NSUInteger)stride
                 atIndex:(NSUInteger)index
 {
-	const RgfxIcbBufferStride body = {RgfxResourceId(buffer), offset, stride, u32(index), 0};
+	const uint64_t b = RgfxResourceId(buffer);
+	RgfxIcbSlotTable *s = live(_slots);
+	if (s != nullptr && s->setBuffer(_index, index, b, offset, stride, true))
+		return;
+	const RgfxIcbBufferStride body = {b, offset, stride, u32(index), 0};
 	record(_icb, RGFX_ICB_OP_VERTEX_BUFFER_STRIDE, _index, body);
 }
 
@@ -353,7 +493,7 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
             tessellationFactorBufferOffset:(NSUInteger)offset
     tessellationFactorBufferInstanceStride:(NSUInteger)instanceStride
 {
-	record(_icb, RGFX_ICB_OP_DRAW_PATCHES, _index,
+	action(_icb, _slots, RGFX_ICB_OP_DRAW_PATCHES, _index,
 	       patches(numberOfPatchControlPoints, patchStart, patchCount, patchIndexBuffer,
 	               patchIndexBufferOffset, instanceCount, baseInstance, buffer, offset,
 	               instanceStride));
@@ -378,7 +518,7 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
 	                       instanceStride);
 	body.control_point_index_buffer_obj_id = RgfxResourceId(controlPointIndexBuffer);
 	body.control_point_index_buffer_offset = controlPointIndexBufferOffset;
-	record(_icb, RGFX_ICB_OP_DRAW_INDEXED_PATCHES, _index, body);
+	action(_icb, _slots, RGFX_ICB_OP_DRAW_INDEXED_PATCHES, _index, body);
 }
 
 - (void)drawPrimitives:(MTLPrimitiveType)primitiveType
@@ -389,7 +529,7 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
 {
 	const RgfxIcbDraw body = {static_cast<uint32_t>(primitiveType), u32(vertexStart),
 	                          u32(vertexCount), u32(instanceCount), u32(baseInstance), 0};
-	record(_icb, RGFX_ICB_OP_DRAW, _index, body);
+	action(_icb, _slots, RGFX_ICB_OP_DRAW, _index, body);
 }
 
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)primitiveType
@@ -410,23 +550,35 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
 	body.index_buffer_offset = indexBufferOffset;
 	body.base_vertex = static_cast<int32_t>(baseVertex);
 	body.base_instance = u32(baseInstance);
-	record(_icb, RGFX_ICB_OP_DRAW_INDEXED, _index, body);
+	action(_icb, _slots, RGFX_ICB_OP_DRAW_INDEXED, _index, body);
 }
 
 // Sent on to the host's buffer, as the M3 Max takes them (the AMD 5300M faults, the Intel 630
 // raises an unrecognized selector).
 - (void)setBarrier
 {
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setBarrier(_index, true);
+		return;
+	}
 	bare(_icb, RGFX_ICB_OP_RENDER_SET_BARRIER, _index);
 }
 
 - (void)clearBarrier
 {
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setBarrier(_index, false);
+		return;
+	}
 	bare(_icb, RGFX_ICB_OP_RENDER_CLEAR_BARRIER, _index);
 }
 
 - (void)reset
 {
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->reset(_index);
+		return;
+	}
 	bare(_icb, RGFX_ICB_OP_RENDER_RESET, _index);
 }
 
@@ -500,12 +652,21 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)pipelineState
 {
-	record(_icb, RGFX_ICB_OP_COMPUTE_PIPELINE, _index, RgfxIcbObject{RgfxResourceId(pipelineState)});
+	const uint64_t pipeline = RgfxResourceId(pipelineState);
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setPipeline(_index, pipeline);
+		return;
+	}
+	record(_icb, RGFX_ICB_OP_COMPUTE_PIPELINE, _index, RgfxIcbObject{pipeline});
 }
 
 - (void)setKernelBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	record(_icb, RGFX_ICB_OP_KERNEL_BUFFER, _index, bufferBody(buffer, offset, index));
+	const uint64_t b = RgfxResourceId(buffer);
+	RgfxIcbSlotTable *s = live(_slots);
+	if (s != nullptr && s->setBuffer(_index, index, b, offset, 0, false))
+		return;
+	record(_icb, RGFX_ICB_OP_KERNEL_BUFFER, _index, RgfxIcbBuffer{b, offset, u32(index), 0});
 }
 
 - (void)setKernelBuffer:(id<MTLBuffer>)buffer
@@ -513,46 +674,70 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
         attributeStride:(NSUInteger)stride
                 atIndex:(NSUInteger)index
 {
-	const RgfxIcbBufferStride body = {RgfxResourceId(buffer), offset, stride, u32(index), 0};
+	const uint64_t b = RgfxResourceId(buffer);
+	RgfxIcbSlotTable *s = live(_slots);
+	if (s != nullptr && s->setBuffer(_index, index, b, offset, stride, true))
+		return;
+	const RgfxIcbBufferStride body = {b, offset, stride, u32(index), 0};
 	record(_icb, RGFX_ICB_OP_KERNEL_BUFFER_STRIDE, _index, body);
 }
 
 - (void)concurrentDispatchThreadgroups:(MTLSize)threadgroupsPerGrid
                  threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
 {
-	record(_icb, RGFX_ICB_OP_DISPATCH_THREADGROUPS, _index,
+	action(_icb, _slots, RGFX_ICB_OP_DISPATCH_THREADGROUPS, _index,
 	       dispatch(threadgroupsPerGrid, threadsPerThreadgroup));
 }
 
 - (void)concurrentDispatchThreads:(MTLSize)threadsPerGrid
             threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup
 {
-	record(_icb, RGFX_ICB_OP_DISPATCH_THREADS, _index,
+	action(_icb, _slots, RGFX_ICB_OP_DISPATCH_THREADS, _index,
 	       dispatch(threadsPerGrid, threadsPerThreadgroup));
 }
 
 - (void)setBarrier
 {
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setBarrier(_index, true);
+		return;
+	}
 	bare(_icb, RGFX_ICB_OP_COMPUTE_SET_BARRIER, _index);
 }
 
 - (void)clearBarrier
 {
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setBarrier(_index, false);
+		return;
+	}
 	bare(_icb, RGFX_ICB_OP_COMPUTE_CLEAR_BARRIER, _index);
 }
 
 - (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height
 {
-	record(_icb, RGFX_ICB_OP_IMAGEBLOCK, _index, RgfxIcbImageblock{u32(width), u32(height)});
+	const RgfxIcbImageblock body = {u32(width), u32(height)};
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setImageblock(_index, body);
+		return;
+	}
+	record(_icb, RGFX_ICB_OP_IMAGEBLOCK, _index, body);
 }
 
 - (void)reset
 {
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->reset(_index);
+		return;
+	}
 	bare(_icb, RGFX_ICB_OP_COMPUTE_RESET, _index);
 }
 
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {
+	RgfxIcbSlotTable *s = live(_slots);
+	if (s != nullptr && s->setThreadgroupMemory(_index, index, u32(length)))
+		return;
 	record(_icb, RGFX_ICB_OP_THREADGROUP_MEMORY, _index,
 	       RgfxIcbThreadgroupMemory{u32(length), u32(index)});
 }
@@ -562,6 +747,10 @@ inline RgfxIcbDispatch dispatch(MTLSize grid, MTLSize threadgroup)
 	const RgfxIcbRegion body = {
 	    {u32(region.origin.x), u32(region.origin.y), u32(region.origin.z)},
 	    {u32(region.size.width), u32(region.size.height), u32(region.size.depth)}};
+	if (RgfxIcbSlotTable *s = live(_slots)) {
+		s->setStageIn(_index, body);
+		return;
+	}
 	record(_icb, RGFX_ICB_OP_STAGE_IN_REGION, _index, body);
 }
 

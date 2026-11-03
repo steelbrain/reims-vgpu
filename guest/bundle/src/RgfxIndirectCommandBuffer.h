@@ -6,12 +6,16 @@
  * Made by `+icbWithDescriptor:...`, which carries the descriptor in an ICB_CREATE through the
  * serialiser and waits for the host's ICB_STATE: the host makes the one copy of the buffer, on
  * its own GPU, and numbers it (`gpuResourceID`, which an argument buffer holds, so a kernel
- * encoding through one reaches it). The guest keeps no commands: each CPU encode, a setter or a
- * draw on a command, is a record the serialiser sends to the host's buffer (ICB_WRITE) before
- * the next command buffer the process posts, so a command buffer sees every encode made before
- * its commit, as on every Mac (measured: M3 Max, AMD 5300M, Intel 630; docs in
- * crates/reims-graphics/src/icb.rs). GPU encodes, executes, copies, resets and optimizes in a
- * command buffer reach the host's buffer through the command buffer's ops.
+ * encoding through one reaches it). The guest keeps no commands of its own: each CPU encode, a
+ * setter or a draw on a command, reaches the host's buffer before the next command buffer the
+ * process posts, so a command buffer sees every encode made before its commit, as on every Mac
+ * (measured: M3 Max, AMD 5300M, Intel 630; docs in crates/reims-graphics/src/icb.rs). Where the
+ * device took ICB_SLOTS, an encode is written into the command's slot in a block of the
+ * process's region, as a GPU's driver writes a command's record, and the flush before a commit
+ * names the commands written (RgfxIcbSlotTable.hpp); else, and for a buffer whose shape a slot does
+ * not hold, it is a record the serialiser sends (ICB_WRITE). GPU encodes, executes, copies,
+ * resets and optimizes in a command buffer reach the host's buffer through the command buffer's
+ * ops.
  *
  * What the buffer and its commands answer, measured on the AMD 5300M and the Intel 630 (macOS
  * 26.7.1) and the M3 Max (macOS 27.0.1), and where they differ, the lane's choice:
@@ -40,6 +44,7 @@
 
 #ifdef __cplusplus
 #include "reims_graphics_wire.h" // RgfxIcbCreate
+class RgfxRegion;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -56,14 +61,24 @@ NS_ASSUME_NONNULL_BEGIN
                                     device:(nullable id<MTLDevice>)device
                                 serializer:(nullable RgfxSerializer *)serializer;
 
+/// As icbWithDescriptor:maxCommandCount:options:device:serializer:, the CPU's encodes written as
+/// slots in a block of `region` where it is given (the device took ICB_SLOTS) and the buffer's
+/// shape takes them (RgfxIcbSlotTable.hpp), else as records.
++ (nullable instancetype)icbWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
+                           maxCommandCount:(NSUInteger)maxCount
+                                   options:(MTLResourceOptions)options
+                                    device:(nullable id<MTLDevice>)device
+                                serializer:(nullable RgfxSerializer *)serializer
+                               slotsRegion:(nullable RgfxRegion *)region;
+
 /// `range` within the buffer's commands: its location at most `size`, its length at most what
 /// is left from there. Executes, resets, copies and optimizes name only commands it has.
 - (NSRange)rgfxClampRange:(NSRange)range;
 
 @end
 
-/// A render command of an RgfxIndirectCommandBuffer: each setter and draw a record to the
-/// host's buffer.
+/// A render command of an RgfxIndirectCommandBuffer: each setter and draw written into its slot,
+/// or a record to the host's buffer.
 @interface RgfxIndirectRenderCommand : NSObject <MTLIndirectRenderCommand>
 @end
 

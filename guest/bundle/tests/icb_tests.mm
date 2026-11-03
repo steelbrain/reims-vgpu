@@ -17,7 +17,9 @@
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxUnsupported.h"
 
+#include "RgfxIcbSlotTable.hpp"
 #include "RgfxObjectModel.hpp"
+#include "RgfxRegion.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
@@ -76,6 +78,62 @@ struct Fixture {
 		                                            options:options
 		                                             device:nil
 		                                         serializer:&ser];
+	}
+
+	// As make, its CPU encodes as slots in blocks of `region` where its shape takes them.
+	RgfxIndirectCommandBuffer *makeSlots(MTLIndirectCommandBufferDescriptor *d, NSUInteger count,
+	                                     RgfxRegion &region)
+	{
+		return [RgfxIndirectCommandBuffer icbWithDescriptor:d
+		                                    maxCommandCount:count
+		                                            options:0
+		                                             device:nil
+		                                         serializer:&ser
+		                                        slotsRegion:&region];
+	}
+};
+
+// A region whose blocks a stand-in kext places from the floor, its bytes 0xee until a block's
+// owner writes them, and the blocks live.
+struct SlotRegion {
+	std::vector<uint8_t> mem;
+	RgfxRegion region;
+	uint64_t next = RGFX_ALLOCATIONS_OFFSET;
+	std::vector<uint64_t> live;
+
+	explicit SlotRegion(uint64_t bytes)
+	    : mem(RGFX_ALLOCATIONS_OFFSET + bytes, 0xee), region(mem.data(), mem.size())
+	{
+		region.setBlockSource(&SlotRegion::alloc, &SlotRegion::release, this);
+	}
+	static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		SlotRegion *r = static_cast<SlotRegion *>(c);
+		const uint64_t at = (r->next + align - 1) & ~(align - 1);
+		if (at + size > r->mem.size())
+			return false;
+		r->next = at + size;
+		r->live.push_back(at);
+		*offset = at;
+		return true;
+	}
+	static void release(void *c, uint64_t offset)
+	{
+		std::vector<uint64_t> &live = static_cast<SlotRegion *>(c)->live;
+		for (auto it = live.begin(); it != live.end(); ++it) {
+			if (*it == offset) {
+				live.erase(it);
+				return;
+			}
+		}
+		CHECK(false); // a block released twice, or never placed
+	}
+	// The `T` at region offset `offset`.
+	template <typename T> T at(uint64_t offset) const
+	{
+		T v;
+		std::memcpy(&v, mem.data() + offset, sizeof(v));
+		return v;
 	}
 };
 
@@ -145,6 +203,22 @@ std::vector<Record> nextWrite(TestRing &ring, RgfxObjId icb, uint32_t *size = nu
 		at += r.size;
 	}
 	return out;
+}
+
+// The next message on `ring`, which must be an ICB_SLOTS: its runs, in order.
+std::vector<RgfxIcbSlotRun> nextSlots(TestRing &ring)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_ICB_SLOTS && bytes.size() >= sizeof(RgfxIcbSlots));
+	RgfxIcbSlots head;
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(bytes.size() == sizeof(head) + head.run_count * sizeof(RgfxIcbSlotRun));
+	std::vector<RgfxIcbSlotRun> runs(head.run_count);
+	std::memcpy(runs.data(), bytes.data() + sizeof(head), runs.size() * sizeof(RgfxIcbSlotRun));
+	CHECK(runs.empty() || head.obj_id == runs[0].icb_obj_id);
+	return runs;
 }
 
 // --- the create ------------------------------------------------------------------------
@@ -610,6 +684,295 @@ void test_ranges_are_clamped()
 	drainRing(fx.ring);
 }
 
+
+// --- slots ------------------------------------------------------------------------------
+
+// The bytes of a render slot of renderDescriptor()'s shape (2 vertex buffers, 1 fragment
+// buffer), and of a compute slot of computeDescriptor()'s (2 kernel buffers, 31 threadgroup
+// memory lengths).
+constexpr uint64_t kRenderSlot = sizeof(RgfxIcbRenderSlot) + 3 * sizeof(RgfxIcbSlotBuffer);
+constexpr uint64_t kComputeSlot = sizeof(RgfxIcbComputeSlot) + 2 * sizeof(RgfxIcbSlotBuffer) + 128;
+
+// Where the device took ICB_SLOTS, a buffer's slots are placed at its first command lookup,
+// zeroed, and each encode is written into its command's slot as the wire lays it out (each
+// field, then its bit), posting nothing; the flush names the written commands as runs of 64-
+// command chunks in one ICB_SLOTS, and the next flush names only what was written since.
+void test_slots_hold_the_encodes()
+{
+	Fixture fx;
+	SlotRegion sr(1 << 20);
+	@autoreleasepool {
+		RgfxIndirectCommandBuffer *icb = fx.makeSlots(renderDescriptor(), 200, sr.region);
+		CHECK(icb != nil && sr.live.empty()); // no block until a command is looked up
+		RgfxBuffer *pso = buffer(0x70), *vb = buffer(0x71), *fb = buffer(0x72), *ib = buffer(0x73);
+		id<MTLIndirectRenderCommand> c = [icb indirectRenderCommandAtIndex:0];
+		CHECK(sr.live.size() == 1);
+		const uint64_t block = sr.live[0];
+		for (uint64_t i = 0; i < 200 * kRenderSlot; i++)
+			CHECK(sr.mem[block + i] == 0);
+		[c setRenderPipelineState:(id<MTLRenderPipelineState>)pso];
+		[c setVertexBuffer:vb offset:16 atIndex:1];
+		[c setVertexBuffer:vb offset:8 attributeStride:24 atIndex:0];
+		[c setFragmentBuffer:fb offset:32 atIndex:0];
+		[c drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+		              indexCount:6
+		               indexType:MTLIndexTypeUInt32
+		             indexBuffer:ib
+		       indexBufferOffset:64
+		           instanceCount:2
+		              baseVertex:-4
+		            baseInstance:1];
+		[c setBarrier];
+		[[icb indirectRenderCommandAtIndex:130] drawPrimitives:MTLPrimitiveTypePoint
+		                                           vertexStart:3
+		                                           vertexCount:5
+		                                         instanceCount:1
+		                                          baseInstance:0];
+		CHECK(ringEmpty(fx.ring)); // nothing posted while encoding
+
+		const RgfxIcbRenderSlot s = sr.at<RgfxIcbRenderSlot>(block);
+		CHECK(s.mask == (RGFX_ICB_SLOT_PIPELINE | RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BARRIER |
+		                 RGFX_ICB_SLOT_BUFFER_0 | RGFX_ICB_SLOT_BUFFER_0 << 1));
+		CHECK(s.mask_b == 1 && s.pipeline == 0x70 && s.op == RGFX_ICB_OP_DRAW_INDEXED &&
+		      s.barrier == 1 && s.strided == 1);
+		const uint64_t bindings = block + sizeof(RgfxIcbRenderSlot);
+		const RgfxIcbSlotBuffer v0 = sr.at<RgfxIcbSlotBuffer>(bindings);
+		const RgfxIcbSlotBuffer v1 = sr.at<RgfxIcbSlotBuffer>(bindings + 24);
+		const RgfxIcbSlotBuffer f0 = sr.at<RgfxIcbSlotBuffer>(bindings + 48);
+		CHECK(v0.obj_id == 0x71 && v0.offset == 8 && v0.stride == 24);
+		CHECK(v1.obj_id == 0x71 && v1.offset == 16 && v1.stride == 0);
+		CHECK(f0.obj_id == 0x72 && f0.offset == 32);
+		RgfxIcbDrawIndexed d;
+		std::memcpy(&d, s.action, sizeof(d));
+		CHECK(d.primitive_type == MTLPrimitiveTypeTriangle && d.index_count == 6 &&
+		      d.index_type == MTLIndexTypeUInt32 && d.instance_count == 2 &&
+		      d.index_buffer_obj_id == 0x73 && d.index_buffer_offset == 64 &&
+		      d.base_vertex == -4 && d.base_instance == 1);
+		uint8_t past[72 - sizeof(d)];
+		std::memcpy(past, reinterpret_cast<const uint8_t *>(s.action) + sizeof(d), sizeof(past));
+		for (uint8_t b : past)
+			CHECK(b == 0);
+		const RgfxIcbRenderSlot t = sr.at<RgfxIcbRenderSlot>(block + 130 * kRenderSlot);
+		RgfxIcbDraw draw;
+		std::memcpy(&draw, t.action, sizeof(draw));
+		CHECK(t.mask == RGFX_ICB_SLOT_ACTION && t.op == RGFX_ICB_OP_DRAW &&
+		      draw.vertex_start == 3 && draw.vertex_count == 5);
+
+		const RgfxIcbFlush flush = fx.ser.flushIcbWrites();
+		CHECK(flush.messages == 1);
+		std::vector<RgfxIcbSlotRun> runs = nextSlots(fx.ring);
+		CHECK(runs.size() == 2 && ringEmpty(fx.ring));
+		for (const RgfxIcbSlotRun &r : runs) {
+			CHECK(r.icb_obj_id == icb.rgfxObjId && r.slot_bytes == kRenderSlot &&
+			      r.kind == RGFX_ICB_SLOTS_RENDER && r.bindings_a == 2 && r.bindings_b == 1);
+			CHECK(r.region_offset == block + r.first_command * kRenderSlot);
+		}
+		CHECK(runs[0].first_command == 0 && runs[0].command_count == 64);
+		CHECK(runs[1].first_command == 128 && runs[1].command_count == 64);
+		CHECK(fx.ser.flushIcbWrites().messages == 0 && ringEmpty(fx.ring));
+
+		// Written again: only its chunk; the last chunk ends at the size.
+		[c setFragmentBuffer:vb offset:0 atIndex:0];
+		[[icb indirectRenderCommandAtIndex:199] setBarrier];
+		fx.ser.flushIcbWrites();
+		runs = nextSlots(fx.ring);
+		CHECK(runs.size() == 2 && runs[0].first_command == 0 && runs[0].command_count == 64 &&
+		      runs[1].first_command == 192 && runs[1].command_count == 8);
+	}
+	drainRing(fx.ring);
+}
+
+// A compute slot holds each field of its command, as a render slot does.
+void test_compute_slots_hold_the_encodes()
+{
+	Fixture fx;
+	SlotRegion sr(1 << 20);
+	@autoreleasepool {
+		RgfxIndirectCommandBuffer *icb = fx.makeSlots(computeDescriptor(), 4, sr.region);
+		RgfxBuffer *pso = buffer(0x70), *kb = buffer(0x71);
+		id<MTLIndirectComputeCommand> c = [icb indirectComputeCommandAtIndex:2];
+		const uint64_t block = sr.live.at(0) + 2 * kComputeSlot;
+		[c setComputePipelineState:(id<MTLComputePipelineState>)pso];
+		[c setKernelBuffer:kb offset:8 atIndex:0];
+		[c setKernelBuffer:kb offset:16 attributeStride:12 atIndex:1];
+		[c setThreadgroupMemoryLength:256 atIndex:1];
+		[c setThreadgroupMemoryLength:64 atIndex:30];
+		[c setStageInRegion:MTLRegionMake3D(1, 2, 3, 4, 5, 6)];
+		[c setImageblockWidth:16 height:8];
+		[c concurrentDispatchThreads:MTLSizeMake(64, 2, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+		[c clearBarrier];
+		CHECK(ringEmpty(fx.ring));
+		const RgfxIcbComputeSlot s = sr.at<RgfxIcbComputeSlot>(block);
+		CHECK(s.mask == (RGFX_ICB_SLOT_PIPELINE | RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BARRIER |
+		                 RGFX_ICB_SLOT_STAGE_IN | RGFX_ICB_SLOT_IMAGEBLOCK |
+		                 RGFX_ICB_SLOT_BUFFER_0 | RGFX_ICB_SLOT_BUFFER_0 << 1));
+		CHECK(s.mask_b == ((1ull << 1) | (1ull << 30)) && s.pipeline == 0x70 &&
+		      s.op == RGFX_ICB_OP_DISPATCH_THREADS && s.barrier == 0 && s.strided == 2);
+		CHECK(s.dispatch.grid[0] == 64 && s.dispatch.grid[1] == 2 && s.dispatch.threadgroup[0] == 32);
+		CHECK(s.stage_in.origin[2] == 3 && s.stage_in.size[0] == 4 && s.imageblock.width == 16 &&
+		      s.imageblock.height == 8);
+		const uint64_t bindings = block + sizeof(RgfxIcbComputeSlot);
+		const RgfxIcbSlotBuffer k0 = sr.at<RgfxIcbSlotBuffer>(bindings);
+		const RgfxIcbSlotBuffer k1 = sr.at<RgfxIcbSlotBuffer>(bindings + 24);
+		CHECK(k0.obj_id == 0x71 && k0.offset == 8 && k1.offset == 16 && k1.stride == 12);
+		CHECK(sr.at<uint32_t>(bindings + 48 + 4) == 256 && sr.at<uint32_t>(bindings + 48 + 120) == 64);
+		fx.ser.flushIcbWrites();
+		std::vector<RgfxIcbSlotRun> runs = nextSlots(fx.ring);
+		CHECK(runs.size() == 1 && runs[0].first_command == 0 && runs[0].command_count == 4 &&
+		      runs[0].kind == RGFX_ICB_SLOTS_COMPUTE && runs[0].slot_bytes == kComputeSlot &&
+		      runs[0].bindings_a == 2 && runs[0].bindings_b == 31);
+	}
+	drainRing(fx.ring);
+}
+
+// A command's reset leaves its slot the reset alone, so what was set before it goes and what is
+// set after it follows it; a reset of a range leaves each slot of it the range reset alone.
+void test_a_reset_in_a_slot()
+{
+	Fixture fx;
+	SlotRegion sr(1 << 20);
+	@autoreleasepool {
+		RgfxIndirectCommandBuffer *icb = fx.makeSlots(renderDescriptor(), 200, sr.region);
+		RgfxBuffer *pso = buffer(0x70), *vb = buffer(0x71);
+		id<MTLIndirectRenderCommand> c = [icb indirectRenderCommandAtIndex:3];
+		const uint64_t block = sr.live.at(0);
+		[c setRenderPipelineState:(id<MTLRenderPipelineState>)pso];
+		[c setFragmentBuffer:vb offset:0 atIndex:0];
+		[c reset];
+		[c setVertexBuffer:vb offset:0 atIndex:0];
+		RgfxIcbRenderSlot s = sr.at<RgfxIcbRenderSlot>(block + 3 * kRenderSlot);
+		CHECK(s.mask == (RGFX_ICB_SLOT_RESET | RGFX_ICB_SLOT_BUFFER_0) && s.mask_b == 0);
+		[[icb indirectRenderCommandAtIndex:61] setFragmentBuffer:vb offset:0 atIndex:0];
+		[icb resetWithRange:NSMakeRange(60, 10)];
+		for (uint64_t i = 60; i < 70; i++) {
+			s = sr.at<RgfxIcbRenderSlot>(block + i * kRenderSlot);
+			CHECK(s.mask == RGFX_ICB_SLOT_RESET_RANGE && s.mask_b == 0);
+		}
+		CHECK(sr.at<uint64_t>(block + 70 * kRenderSlot) == 0);
+		[icb resetWithRange:NSMakeRange(190, 100)]; // clamped to the size
+		CHECK(sr.at<uint64_t>(block + 199 * kRenderSlot) == RGFX_ICB_SLOT_RESET_RANGE);
+		CHECK(ringEmpty(fx.ring));
+		fx.ser.flushIcbWrites();
+		std::vector<RgfxIcbSlotRun> runs = nextSlots(fx.ring);
+		// Chunks 0 to 3 written, the last ending at the size: one run.
+		CHECK(runs.size() == 1 && runs[0].first_command == 0 && runs[0].command_count == 200);
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
+// A call a slot cannot hold (a binding past the slot's count) turns the buffer to records for
+// good: its written slots are posted at once, ahead of the record, which waits for the flush,
+// and every later encode is a record.
+void test_slots_turn_to_records()
+{
+	Fixture fx;
+	SlotRegion sr(1 << 20);
+	@autoreleasepool {
+		RgfxIndirectCommandBuffer *icb = fx.makeSlots(renderDescriptor(), 8, sr.region);
+		RgfxBuffer *pso = buffer(0x70), *vb = buffer(0x71);
+		id<MTLIndirectRenderCommand> c = [icb indirectRenderCommandAtIndex:0];
+		const uint64_t block = sr.live.at(0);
+		[c setRenderPipelineState:(id<MTLRenderPipelineState>)pso];
+		CHECK(ringEmpty(fx.ring));
+		[c setVertexBuffer:vb offset:4 atIndex:5];
+		std::vector<RgfxIcbSlotRun> runs = nextSlots(fx.ring);
+		CHECK(runs.size() == 1 && runs[0].first_command == 0 && runs[0].command_count == 8);
+		CHECK(ringEmpty(fx.ring));
+		[[icb indirectRenderCommandAtIndex:1] setRenderPipelineState:(id<MTLRenderPipelineState>)pso];
+		[c reset];
+		[icb resetWithRange:NSMakeRange(2, 2)];
+		CHECK(sr.at<uint64_t>(block) == RGFX_ICB_SLOT_PIPELINE &&
+		      sr.at<uint64_t>(block + kRenderSlot) == 0 &&
+		      sr.at<uint64_t>(block + 2 * kRenderSlot) == 0); // the slots are left as they were
+		fx.ser.flushIcbWrites();
+		std::vector<Record> r = nextWrite(fx.ring, icb.rgfxObjId);
+		CHECK(r.size() == 4 && r[0].op == RGFX_ICB_OP_VERTEX_BUFFER && r[0].index == 0 &&
+		      r[0].as<RgfxIcbBuffer>().index == 5 && r[1].op == RGFX_ICB_OP_RENDER_PIPELINE &&
+		      r[1].index == 1 && r[2].op == RGFX_ICB_OP_RENDER_RESET &&
+		      r[3].op == RGFX_ICB_OP_RENDER_RESET_RANGE && r[3].index == 2);
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
+// Whether `icb` writes slots: a draw on command 0 posts an ICB_SLOTS at the flush, not an
+// ICB_WRITE (the destroys of buffers let go before it are passed over).
+bool writesSlots(Fixture &fx, RgfxIndirectCommandBuffer *icb)
+{
+	drainRing(fx.ring);
+	[[icb indirectRenderCommandAtIndex:0] drawPrimitives:MTLPrimitiveTypePoint
+	                                         vertexStart:0
+	                                         vertexCount:1
+	                                       instanceCount:1
+	                                        baseInstance:0];
+	fx.ser.flushIcbWrites();
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	int slots = 0, writes = 0;
+	while (fx.ring.next(&h, &bytes)) {
+		slots += h.type == RGFX_CMD_ICB_SLOTS;
+		writes += h.type == RGFX_CMD_ICB_WRITE;
+	}
+	CHECK(slots + writes == 1);
+	return slots == 1;
+}
+
+// A buffer takes slots only where the device took them, its commands are of one kind, its
+// bindings fit a slot, its slots fit RgfxIcbSlotTable::kMaxBytes and the process's slots fit
+// RgfxSerializer::kIcbSlotBytes; else records. A buffer's destroy posts its slots first, then
+// the destroy, and its block and bytes go back.
+void test_which_buffers_take_slots()
+{
+	Fixture fx;
+	SlotRegion sr(48ull << 20);
+	@autoreleasepool {
+		CHECK(!writesSlots(fx, fx.make(renderDescriptor(), 8)));
+		CHECK(writesSlots(fx, fx.makeSlots(renderDescriptor(), 8, sr.region)));
+		MTLIndirectCommandBufferDescriptor *both = renderDescriptor();
+		both.commandTypes |= MTLIndirectCommandTypeConcurrentDispatch;
+		CHECK(!writesSlots(fx, fx.makeSlots(both, 8, sr.region)));
+		MTLIndirectCommandBufferDescriptor *wide = renderDescriptor();
+		wide.maxVertexBufferBindCount = 33;
+		CHECK(!writesSlots(fx, fx.makeSlots(wide, 8, sr.region)));
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CHECK(sr.live.empty());
+	const NSUInteger most = RgfxIcbSlotTable::kMaxBytes / kRenderSlot;
+	@autoreleasepool {
+		CHECK(!writesSlots(fx, fx.makeSlots(renderDescriptor(), most + 1, sr.region)));
+		NSMutableArray *held = [NSMutableArray array];
+		for (int i = 0; i < 4; i++) {
+			RgfxIndirectCommandBuffer *icb = fx.makeSlots(renderDescriptor(), most, sr.region);
+			CHECK(writesSlots(fx, icb));
+			[held addObject:icb];
+		}
+		CHECK(sr.live.size() == 4);
+		// The process's slots are full: the fifth takes records.
+		CHECK(!writesSlots(fx, fx.makeSlots(renderDescriptor(), most, sr.region)));
+		drainRing(fx.ring);
+		// One goes: its slots first, then its destroy; its block and bytes back.
+		RgfxObjId gone = 0;
+		@autoreleasepool {
+			RgfxIndirectCommandBuffer *last = held.lastObject;
+			gone = last.rgfxObjId;
+			[[last indirectRenderCommandAtIndex:5] setBarrier];
+			[held removeLastObject];
+		}
+		std::vector<RgfxIcbSlotRun> runs = nextSlots(fx.ring);
+		CHECK(runs.size() == 1 && runs[0].icb_obj_id == gone);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(fx.ring.next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY);
+		CHECK(sr.live.size() == 3);
+		CHECK(writesSlots(fx, fx.makeSlots(renderDescriptor(), most, sr.region)));
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CHECK(sr.live.empty());
+}
+
 } // namespace
 
 void rgfxIcbTests()
@@ -624,4 +987,9 @@ void rgfxIcbTests()
 	test_a_full_message_goes_at_once();
 	test_a_commit_posts_the_records_first();
 	test_ranges_are_clamped();
+	test_slots_hold_the_encodes();
+	test_compute_slots_hold_the_encodes();
+	test_a_reset_in_a_slot();
+	test_slots_turn_to_records();
+	test_which_buffers_take_slots();
 }

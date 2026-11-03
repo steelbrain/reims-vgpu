@@ -111,7 +111,7 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp \
 	src/RgfxCompletionThread.cpp src/RgfxFunctionConstants.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp \
-	src/RgfxSlabs.cpp
+	src/RgfxSlabs.cpp src/RgfxIcbSlotTable.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
 VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp src/RgfxVideoH265.cpp

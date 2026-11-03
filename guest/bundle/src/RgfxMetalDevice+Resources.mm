@@ -202,11 +202,14 @@
 		RGFX_UNSUPPORTED("indirect command buffers (the host offers none)");
 		return nil;
 	}
+	// Slots where the host takes them, in blocks of the process's region.
+	const bool slots = ([self caps]->features() & RGFX_FEATURE_ICB_SLOTS) != 0;
 	return [RgfxIndirectCommandBuffer icbWithDescriptor:descriptor
 	                                    maxCommandCount:maxCount
 	                                            options:options
 	                                             device:self
-	                                         serializer:[self serializer]];
+	                                         serializer:[self serializer]
+	                                        slotsRegion:slots ? [self region] : nullptr];
 }
 
 // --- heaps -------------------------------------------------------------------
