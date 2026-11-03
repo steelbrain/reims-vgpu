@@ -642,35 +642,38 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         );
         // No buffer lies over the block's surface view any more: it goes with the block, and its
         // device cache once the surface's pages hold what was written of it, which the answer
-        // waits for.
+        // waits for. The copy is made once the buffers still walked that may write the cache
+        // have finished, on the last one's thread: the control thread goes on.
         let held = Arc::clone(&drain);
         let unread = release.flags & RGFX_BLOCK_RELEASE_NO_CLIENT != 0;
-        let released = entry::run(|_| {
+        let offset = release.offset;
+        entry::run(|_| {
             decoder.block_released(
                 &self.device,
-                release.offset,
+                offset,
                 unread,
                 Box::new(move || drop(held)),
-            )
-        });
-        if let Err(raise) = released {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "the block at {:#x}: the platform raised at its device cache's write back \
-                 ({raise:?})",
-                release.offset
+                Box::new(move |raise| {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the block at {offset:#x}: the platform raised at its device cache's \
+                         write back ({raise:?})"
+                    );
+                }),
             );
-        }
+        });
         drop(decoder);
         drop(drain);
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: answered once the surface's pages hold its
-    /// device cache ([`GraphicsDecoder::surface_download`]).
+    /// device cache ([`GraphicsDecoder::surface_download`]), which is copied once the buffers
+    /// still walked that may write it have finished, on the last one's thread: the control
+    /// thread goes on.
     fn download_surface(&self, block: u64, answer: CompleteAnswer) {
         let answer = Arc::new(Mutex::new(Some(answer)));
-        let give = Arc::clone(&answer);
-        let done = entry::run(|_| {
+        let (give, refuse) = (Arc::clone(&answer), answer);
+        entry::run(|_| {
             self.decoder().surface_download(
                 &self.device,
                 block,
@@ -679,18 +682,18 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                         answer.answer(RGFX_STATUS_OK);
                     }
                 }),
-            )
-        });
-        if let Err(raise) = done {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "the block at {block:#x}: the platform raised at its device cache's download \
-                 ({raise:?})"
+                Box::new(move |raise| {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the block at {block:#x}: the platform raised at its device cache's \
+                         download ({raise:?})"
+                    );
+                    if let Some(answer) = refuse.lock().take() {
+                        answer.answer(RGFX_STATUS_REFUSED);
+                    }
+                }),
             );
-            if let Some(answer) = answer.lock().take() {
-                answer.answer(RGFX_STATUS_REFUSED);
-            }
-        }
+        });
     }
 
     /// Carries out one stage-3 message under a library entry: from ring 0 an object-lifecycle create

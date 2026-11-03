@@ -52,8 +52,8 @@
 //! color attachment of the pass is linear; elsewhere it renders through a stand-in copied within
 //! the GPU's memory. Neither is measured on a discrete RADV or ANV device yet.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,9 +64,10 @@ use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedI
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
 
+use super::refusing;
 use super::surface_pages::{SurfaceView, buffer_over};
 use crate::device_writes::{self, Watcher};
 
@@ -179,14 +180,34 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     pending: HashMap<u64, Users>,
     /// By block: the fills of its cache waiting for those command buffers to finish.
     filling: HashMap<u64, usize>,
+    /// By block: the copies out of its cache asked of the control thread (a download, a release)
+    /// that wait for the command buffers that may write it begun before each was asked, in the
+    /// order they were asked ([`Caches::after_writers`]).
+    deferred: HashMap<u64, VecDeque<Deferred<P>>>,
+    /// The number the next use that may write a cache is counted under.
+    next_writer: u64,
 }
 
 /// The command buffers begun and not finished that use one block's cache.
 #[derive(Default)]
 struct Users {
     users: usize,
-    /// Those that may write it.
-    writers: usize,
+    /// Those that may write it, by the number each was counted under, oldest first.
+    writers: BTreeSet<u64>,
+}
+
+/// A command buffer's count among a block's users ([`SurfaceCaches::hold`]): the block, and the
+/// number of its write, where it may write it.
+type Count = (u64, Option<u64>);
+
+/// A copy out of a block's cache, made on the caches ([`Caches::after_writers`]).
+type CopyOut<P> = Box<dyn FnOnce(&mut SurfaceCaches<P>) + Send>;
+
+/// A copy out of a block's cache waiting for the buffers that may write it ([`Caches::after_writers`]).
+struct Deferred<P: Platform> {
+    /// It waits for every write counted below this number.
+    upto: u64,
+    run: CopyOut<P>,
 }
 
 impl<P: Platform> SurfaceCaches<P> {
@@ -204,6 +225,8 @@ impl<P: Platform> SurfaceCaches<P> {
             counts: CacheCounts::default(),
             pending: HashMap::new(),
             filling: HashMap::new(),
+            deferred: HashMap::new(),
+            next_writer: 0,
         }
     }
 
@@ -372,16 +395,64 @@ impl<P: Platform> SurfaceCaches<P> {
     fn pending(&self, block: u64, writers: bool) -> usize {
         self.pending
             .get(&block)
-            .map_or(0, |u| if writers { u.writers } else { u.users })
+            .map_or(0, |u| if writers { u.writers.len() } else { u.users })
     }
 
     /// Counts a command buffer's uses `blocks` (each block, and whether it may write it) among
-    /// those begun and not finished.
-    fn hold(&mut self, blocks: &[(u64, bool)]) {
+    /// those begun and not finished: its counts, each write under a number of its own.
+    fn hold(&mut self, blocks: &[(u64, bool)]) -> Vec<Count> {
+        let mut counts = Vec::with_capacity(blocks.len());
         for &(block, writes) in blocks {
             let users = self.pending.entry(block).or_default();
             users.users += 1;
-            users.writers += usize::from(writes);
+            let write = writes.then(|| {
+                let number = self.next_writer;
+                self.next_writer += 1;
+                users.writers.insert(number);
+                number
+            });
+            counts.push((block, write));
+        }
+        counts
+    }
+
+    /// Whether a copy out of the block at `block`'s cache waits for the buffers that may write it.
+    fn deferring(&self, block: u64) -> bool {
+        self.deferred.contains_key(&block)
+    }
+
+    /// Runs `op` on the caches once every command buffer begun and not finished that may write
+    /// the block at `block`'s cache has finished, and after the copies out of it deferred before
+    /// it: at once where none is, else in the finish of the last of them
+    /// ([`Self::run_deferred`]).
+    fn after_writers(&mut self, block: u64, op: CopyOut<P>) {
+        if self.pending(block, true) == 0 && !self.deferring(block) {
+            op(self);
+            return;
+        }
+        let upto = self.next_writer;
+        (self.deferred.entry(block).or_default()).push_back(Deferred { upto, run: op });
+    }
+
+    /// Runs the copies out of the block at `block`'s cache whose writers have all finished, in
+    /// the order they were asked.
+    fn run_deferred(&mut self, block: u64) {
+        loop {
+            let oldest = (self.pending.get(&block)).and_then(|u| u.writers.first().copied());
+            let Some(queue) = self.deferred.get_mut(&block) else {
+                return;
+            };
+            if (queue.front()).is_some_and(|op| oldest.is_some_and(|number| number < op.upto)) {
+                return;
+            }
+            let Some(op) = queue.pop_front() else {
+                self.deferred.remove(&block);
+                return;
+            };
+            if queue.is_empty() {
+                self.deferred.remove(&block);
+            }
+            (op.run)(self);
         }
     }
 
@@ -395,15 +466,21 @@ impl<P: Platform> SurfaceCaches<P> {
         }
     }
 
-    /// The command buffer whose uses are `blocks` is finished: it leaves their counts.
-    fn unhold(&mut self, blocks: &[(u64, bool)]) {
-        for &(block, writes) in blocks {
+    /// The command buffer whose counts are `counts` is finished: it leaves them, and the copies
+    /// out of their caches that waited for it alone run ([`Self::run_deferred`]).
+    fn unhold(&mut self, counts: &[Count]) {
+        for &(block, write) in counts {
             if let Some(users) = self.pending.get_mut(&block) {
                 users.users = users.users.saturating_sub(1);
-                users.writers = users.writers.saturating_sub(usize::from(writes));
+                if let Some(number) = write {
+                    users.writers.remove(&number);
+                }
                 if users.users == 0 {
                     self.pending.remove(&block);
                 }
+            }
+            if write.is_some() {
+                self.run_deferred(block);
             }
         }
     }
@@ -634,10 +711,13 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// The device's reset: every block's cache goes uncopied, as its surface's pages are the
     /// rebooted guest's again, and so do the queues' end events, each buffer and event let go of
-    /// in a refusal scope. The host's transfer queue stays, and so do the counts.
+    /// in a refusal scope, and every copy out of a cache still deferred is dropped unmade, its
+    /// answer owed to no one (no command buffer is begun across the reset, so none waits). The
+    /// host's transfer queue stays, and so do the counts.
     pub(crate) fn reset(&mut self) {
         let caches = std::mem::take(&mut self.by_block);
         let ends = std::mem::take(&mut self.ends);
+        self.deferred.clear();
         self.watched.0.lock().clear();
         if let Err(refusal) = refusals::refusing(move || drop((caches, ends))) {
             log::warn!(
@@ -663,13 +743,19 @@ impl<P: Platform> SurfaceCaches<P> {
 ///   command buffer begun and not finished that uses the cache, and a later command buffer's use
 ///   of the cache waits for a fill waiting so, so fills are not held off for good.
 /// - **A copy out of a cache** (a download, a release, the block's pages named again) waits for
-///   every one of them that may write it.
+///   every one of them that may write it. A download and a release, which the control thread
+///   asks for and are answered when their copy is done, do not wait there: each is made in the
+///   finish of the last buffer that may write the cache begun before it was asked
+///   ([`Caches::after_writers`]), in the order they were asked, and a command buffer begun after
+///   it waits at its begin until it is made. The block's pages named again, which the buffers
+///   over the block made on the control thread after it lie over, waits there.
 ///
 /// So a copy comes before or after each such buffer's whole use, as under one lock, and the
 /// queues' end events order it on the GPU after the buffers committed before it
 /// ([`SurfaceCaches::after`]). A command buffer counts its blocks in their order, and waits only
-/// for a block past every block it counts, so no two wait for each other. The waits hold no lock
-/// (the cache's lock is let go while they wait).
+/// for a block past every block it counts (a fill or a copy out of it waits only for the buffers
+/// begun before it, which wait for no block past them), so no two wait for each other. The waits
+/// hold no lock (the cache's lock is let go while they wait).
 pub(crate) struct Caches<P: Platform> {
     state: Mutex<SurfaceCaches<P>>,
     moved: Condvar,
@@ -683,8 +769,8 @@ pub(crate) type Held<P> = (Vec<u64>, Option<Uses<P>>);
 /// ([`Caches::finish`]) or its drop.
 pub(crate) struct Uses<P: Platform> {
     caches: Arc<Caches<P>>,
-    /// Each block, and whether the buffer may write it.
-    blocks: Vec<(u64, bool)>,
+    /// Each block, and the number of its write where the buffer may write it.
+    blocks: Vec<Count>,
 }
 
 impl<P: Platform> Drop for Uses<P> {
@@ -781,6 +867,11 @@ impl<P: Platform> Caches<P> {
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
         for u in &picked {
             let block = u.block_offset;
+            // After the copies out of the cache asked before this begin, which wait only for the
+            // buffers begun before them ([`Self::after_writers`]).
+            while state.deferring(block) {
+                self.moved.wait(&mut state);
+            }
             // A fill waits for the block's users, and a use behind a fill waiting for it; what
             // the use needs is read again after each wait.
             loop {
@@ -801,9 +892,8 @@ impl<P: Platform> Caches<P> {
             }
             let outcome = state.before_one(device, cb, u, may_fill);
             // Counted at once, so a later fill of the block waits for this buffer.
-            state.hold(&[(block, u.flags & RGFX_SURFACE_USE_WRITES != 0)]);
-            held.blocks
-                .push((block, u.flags & RGFX_SURFACE_USE_WRITES != 0));
+            let counted = state.hold(&[(block, u.flags & RGFX_SURFACE_USE_WRITES != 0)]);
+            held.blocks.extend(counted);
             match outcome {
                 Ok(w) => waits |= w,
                 Err(raise) => {
@@ -821,7 +911,7 @@ impl<P: Platform> Caches<P> {
     /// so command buffer `cb`'s count among their users where so: taken without waiting for the
     /// lock (`None` where it is busy, or the buffer must wait). Each cache holds its use's
     /// generation or a newer one, no device of the host wrote its pages since its last fill, its
-    /// last fill is done, and no fill of it waits.
+    /// last fill is done, and no fill of it, nor copy out of it, waits.
     pub(crate) fn hold_ready(self: &Arc<Self>, uses: &[RgfxOpSurfaceUse]) -> Option<Held<P>> {
         if uses.is_empty() {
             return Some((Vec::new(), None));
@@ -829,9 +919,9 @@ impl<P: Platform> Caches<P> {
         let mut state = self.state.try_lock()?;
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
         if !state.ready(&picked)
-            || picked
-                .iter()
-                .any(|u| state.filling.contains_key(&u.block_offset))
+            || picked.iter().any(|u| {
+                state.filling.contains_key(&u.block_offset) || state.deferring(u.block_offset)
+            })
         {
             return None;
         }
@@ -846,7 +936,7 @@ impl<P: Platform> Caches<P> {
                 cache.written = true;
             }
         }
-        state.hold(&blocks);
+        let blocks = state.hold(&blocks);
         drop(state);
         let used = blocks.iter().map(|&(b, _)| b).collect();
         let held = Uses {
@@ -906,20 +996,68 @@ impl<P: Platform> Caches<P> {
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block` ([`SurfaceCaches::download`]), after every
-    /// command buffer begun and not finished that may write it.
+    /// command buffer begun and not finished that may write it, waiting for none
+    /// ([`Self::after_writers`]): `done` once the pages hold the cache, or `failed` where the
+    /// platform raised at the copy.
     pub(crate) fn download(
         &self,
         device: &P::Device,
         block: u64,
         done: Box<dyn FnOnce() + Send>,
-    ) -> RaiseResult<()> {
-        let mut state = self.state.lock();
-        self.wait_users(&mut state, block, true);
-        state.download(device, block, done)
+        failed: Box<dyn FnOnce(Raise) + Send>,
+    ) {
+        let device = device.clone_ref();
+        self.after_writers(
+            block,
+            Box::new(move |state| {
+                if let Err(raise) = refusing(|| state.download(&device, block, done)) {
+                    failed(raise);
+                }
+            }),
+        );
     }
 
-    /// The block at `block` went ([`SurfaceCaches::released`]), after every command buffer begun
-    /// and not finished that may write its cache.
+    /// The block at `block` went, its `BLOCK_RELEASE` ([`SurfaceCaches::released`]), after every
+    /// command buffer begun and not finished that may write its cache, waiting for none
+    /// ([`Self::after_writers`]): `done` once the pages hold the cache, or `failed` where the
+    /// platform raised at the copy. Nothing names the block until it is answered: the kext gives
+    /// it out again only then.
+    pub(crate) fn release(
+        &self,
+        device: &P::Device,
+        block: u64,
+        unread: bool,
+        done: Box<dyn FnOnce() + Send>,
+        failed: Box<dyn FnOnce(Raise) + Send>,
+    ) {
+        let device = device.clone_ref();
+        self.after_writers(
+            block,
+            Box::new(move |state| {
+                if let Err(raise) = refusing(|| state.released(&device, block, unread, done)) {
+                    failed(raise);
+                }
+            }),
+        );
+    }
+
+    /// Runs `op` on the caches once every command buffer begun and not finished that may write
+    /// the block at `block`'s cache has finished, after the copies out of it asked before: here
+    /// where none is, else in the last one's finish, on its thread, waiting for nothing here. A
+    /// command buffer begun meanwhile that uses the cache waits at its begin until `op` has run
+    /// ([`Self::before`]), as one begun after the copy, which the control thread made before
+    /// going on, waited for it.
+    fn after_writers(&self, block: u64, op: CopyOut<P>) {
+        let mut state = self.state.lock();
+        state.after_writers(block, op);
+        drop(state);
+        self.moved.notify_all();
+    }
+
+    /// The block at `block` named again without a cache, or over other pages, loses it
+    /// ([`SurfaceCaches::released`]), after every command buffer begun and not finished that may
+    /// write it, waiting for them here: the buffers made over the block after it lie over its
+    /// pages.
     pub(crate) fn released(
         &self,
         device: &P::Device,
@@ -1024,6 +1162,7 @@ mod tests {
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
+    use super::super::no_raise;
     use super::super::surface_pages::tests::{BLOCK, RAM, Rig, rig};
     use super::*;
 
@@ -1287,13 +1426,12 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&done);
         let mark = r.p.call_log().mark();
-        r.dec
-            .surface_download(
-                &r.device,
-                BLOCK,
-                Box::new(move || set.store(true, Ordering::SeqCst)),
-            )
-            .unwrap();
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
         let calls = r.p.call_log().since(mark);
         let mut waited = events(&calls, WAIT);
         waited.sort_unstable();
@@ -1318,13 +1456,12 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&done);
         let mark = r.p.call_log().mark();
-        r.dec
-            .surface_download(
-                &r.device,
-                BLOCK,
-                Box::new(move || set.store(true, Ordering::SeqCst)),
-            )
-            .unwrap();
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
         assert!(done.load(Ordering::SeqCst), "at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
         assert_eq!(r.dec.caches().counts().clean, 1);
@@ -1332,14 +1469,13 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&released);
         let mark = r.p.call_log().mark();
-        r.dec
-            .block_released(
-                &r.device,
-                BLOCK,
-                false,
-                Box::new(move || set.store(true, Ordering::SeqCst)),
-            )
-            .unwrap();
+        r.dec.block_released(
+            &r.device,
+            BLOCK,
+            false,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1);
         assert_eq!(r.dec.caches().len(), 0);
         assert!(!released.load(Ordering::SeqCst));
@@ -1359,14 +1495,13 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&released);
         let mark = r.p.call_log().mark();
-        r.dec
-            .block_released(
-                &r.device,
-                BLOCK,
-                true,
-                Box::new(move || set.store(true, Ordering::SeqCst)),
-            )
-            .unwrap();
+        r.dec.block_released(
+            &r.device,
+            BLOCK,
+            true,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
         assert!(released.load(Ordering::SeqCst), "done at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
         assert_eq!(r.dec.caches().len(), 0);
@@ -1519,6 +1654,84 @@ mod tests {
         );
     }
 
+    /// A download and a release asked while a command buffer that may write the cache is begun
+    /// and not finished are not waited for where they are asked: each is made, in the order
+    /// asked, in that buffer's finish, after its commit, and a buffer begun meanwhile that uses
+    /// the cache waits for them at its begin, and a doorbell's take does not count it. Here the
+    /// download copies the buffer's write out, and the release then has nothing more to copy:
+    /// the cache goes, and the buffer begun after it finds none
+    #[test]
+    fn a_copy_out_of_a_cache_is_made_as_its_writers_finish() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let writer = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 1)[0]
+        }];
+        let (used, _, uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &writes, true)
+            .unwrap();
+        let downloaded = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let mark = r.p.call_log().mark();
+        let set = Arc::clone(&downloaded);
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
+        let set = Arc::clone(&released);
+        r.dec.block_released(
+            &r.device,
+            BLOCK,
+            false,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "copied while the writer is begun"
+        );
+        assert!(!downloaded.load(Ordering::SeqCst) && !released.load(Ordering::SeqCst));
+        assert!(
+            r.dec
+                .surface_caches
+                .hold_ready(&reading(BLOCK, 1))
+                .is_none(),
+            "a take counted behind the copies"
+        );
+        let caches = Arc::clone(&r.dec.surface_caches);
+        let later = queue.command_buffer(ON).unwrap().unwrap();
+        std::thread::scope(|scope| {
+            let begin = scope.spawn(|| {
+                (caches.before(&r.device, &later, &reading(BLOCK, 1), true))
+                    .map(|(_, _, uses)| uses.is_some())
+                    .map_err(|_| ())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!begin.is_finished(), "begun before the copies were made");
+            (r.dec.surface_caches)
+                .finish(&r.device, 1, &writer, uses.unwrap(), &used, || {
+                    writer.commit(ON)
+                })
+                .unwrap();
+            assert_eq!(begin.join().unwrap(), Ok(false), "the cache was released");
+        });
+        let calls = r.p.call_log().since(mark);
+        let commit = calls.iter().position(|c| c.sel == "commit").unwrap();
+        let copied = calls.iter().position(|c| c.sel == COPY).unwrap();
+        assert!(commit < copied, "copied after the writer's commit");
+        assert_eq!(copies(&calls).len(), 1, "the download's copy alone");
+        assert!(released.load(Ordering::SeqCst), "nothing more to copy");
+        assert_eq!(r.dec.caches().len(), 0);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+    }
+
     /// A device of the host's write over a cache's pages has the cache's next use fill it again,
     /// though of the generation it holds, and once; a write beside them does nothing. A cache a
     /// buffer wrote is not copied over such a write, at a download or at a release
@@ -1546,13 +1759,12 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&done);
         let mark = r.p.call_log().mark();
-        r.dec
-            .surface_download(
-                &r.device,
-                BLOCK,
-                Box::new(move || set.store(true, Ordering::SeqCst)),
-            )
-            .unwrap();
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
         assert!(done.load(Ordering::SeqCst), "answered at once");
         assert!(
             copies(&r.p.call_log().since(mark)).is_empty(),
@@ -1572,14 +1784,13 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let set = Arc::clone(&released);
         let mark = r.p.call_log().mark();
-        r.dec
-            .block_released(
-                &r.device,
-                BLOCK,
-                false,
-                Box::new(move || set.store(true, Ordering::SeqCst)),
-            )
-            .unwrap();
+        r.dec.block_released(
+            &r.device,
+            BLOCK,
+            false,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
         assert!(released.load(Ordering::SeqCst), "done at once");
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
         let counts = r.dec.caches().counts();

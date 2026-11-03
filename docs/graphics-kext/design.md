@@ -1742,10 +1742,22 @@ commit. Each outcome the new design allows is one of those two:
   block it uses from its begin to its commit. A fill waits for every user, and
   a copy out of a cache (a download, a release, the block named again) for every
   user that may write it, so each copy comes before a user's begin or after its
-  commit, as under the lock. A buffer counts its blocks in block order, and one
-  past its begin waits for nothing a fill holds, so the waits end. Tested by
-  `a_fill_waits_for_the_buffers_using_the_cache` and
-  `two_queues_take_one_fill_and_a_download_waits_for_both` (`surface_cache`).
+  commit, as under the lock. A download and a release do not wait on ring 0's
+  thread: each is made in the finish of the last buffer that may write the
+  cache begun before it was asked, after that buffer's commit, in the order
+  they were asked, and answered once its copy is done, as before. A buffer
+  begun after one was asked waits at its begin until it is made, as under the
+  lock it would have been begun after it (a doorbell's take does not count it),
+  and nothing of ring 0's names the block meanwhile that a copy changes: a
+  download leaves the block's buffers as they are, and the kext names a
+  released block again only once its release is answered. The block named
+  again still waits there, as the buffers ring 0 makes over the block after it
+  lie over what it leaves. A buffer counts its blocks in block order, a copy
+  waits only for buffers begun before it, and one past its begin waits for
+  nothing a fill or a copy holds, so the waits end. Tested by
+  `a_fill_waits_for_the_buffers_using_the_cache`,
+  `two_queues_take_one_fill_and_a_download_waits_for_both` and
+  `a_copy_out_of_a_cache_is_made_as_its_writers_finish` (`surface_cache`).
 - **The device's reset.** A reset ends every queue at once and is passed to
   the host on the control thread, before anything the guest publishes after
   it. Under the lock, the host's reset waited for the message holding the lock,
@@ -1811,9 +1823,9 @@ commit. Each outcome the new design allows is one of those two:
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order` and
   `busy_lanes_hold_one_thread_each_and_the_budget_s`.
 - **What still waits on ring 0's thread:** a range message, for its own
-  context's answered buffers; a download, a release or a block named again, for
-  that block's writers; a present's fill, for that block's users; and the
-  device's reset, for every message in flight. A context's close waits for no
+  context's answered buffers; a block named again, for that block's writers; a
+  present's fill, for that block's users; and the device's reset, for every
+  message in flight. A context's close waits for no
   walk: `reims_graphics` fences each of its queues, which waits only for a take
   of the queue's submission ring or a post onto its completion ring under way,
   and the close is answered once its buffers have finished

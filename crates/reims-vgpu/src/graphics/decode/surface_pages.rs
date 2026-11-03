@@ -381,7 +381,7 @@ pub(super) mod tests {
     use reims_vgpu_core::testkit::{FakePlatform, GuestRam};
     use zerocopy::IntoBytes;
 
-    use super::super::{DecodeError, GraphicsDecoder};
+    use super::super::{DecodeError, GraphicsDecoder, no_raise};
     use super::*;
 
     /// The processes' blocks start here.
@@ -536,8 +536,7 @@ pub(super) mod tests {
         );
         // The buffer holds the view after the block's release.
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()))
-            .unwrap();
+            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
         assert_eq!(r.buffer(13, BLOCK, page), Err(DecodeError::Refused));
         assert!(
             Arc::strong_count(&view) > 2,
@@ -560,8 +559,7 @@ pub(super) mod tests {
         assert_eq!(r.pages(BLOCK, &[(3, 1), (0, 1)], 2 * page), RGFX_STATUS_OK);
         let first = r.view(BLOCK);
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()))
-            .unwrap();
+            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
         let mark = r.p.call_log().mark();
         assert_eq!(
             r.pages(BLOCK + 0x8000, &[(3, 1), (0, 1)], 2 * page),
@@ -581,9 +579,13 @@ pub(super) mod tests {
             assert_eq!(r.pages(BLOCK, &[(10 + i, 1)], page), RGFX_STATUS_OK);
         }
         assert_eq!(r.dec.views_of_surfaces().len().1, CACHED_VIEWS);
-        r.dec
-            .block_released(&r.device, BLOCK + 0x8000, false, Box::new(|| ()))
-            .unwrap();
+        r.dec.block_released(
+            &r.device,
+            BLOCK + 0x8000,
+            false,
+            Box::new(|| ()),
+            no_raise(),
+        );
         assert_eq!(
             Arc::strong_count(&first),
             1,

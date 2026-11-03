@@ -761,31 +761,35 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: its device cache written into the surface's
-    /// pages, after every command buffer that used it ([`surface_cache`]); `done` once the pages
-    /// hold it, at once where the block has no cache or nothing wrote it since its last copy.
+    /// pages, after every command buffer that used it ([`surface_cache`]), with no wait here for
+    /// one still walked; `done` once the pages hold it, at once where the block has no cache or
+    /// nothing wrote it since its last copy, or `failed` where the platform raised at the copy.
     pub(crate) fn surface_download(
         &self,
         device: &P::Device,
         block: u64,
         done: Box<dyn FnOnce() + Send>,
-    ) -> RaiseResult<()> {
-        self.surface_caches.download(device, block, done)
+        failed: Box<dyn FnOnce(Raise) + Send>,
+    ) {
+        self.surface_caches.download(device, block, done, failed);
     }
 
     /// The block at `offset` was released: its surface view, if any, goes once the buffers over
     /// it have, and its device cache once the pages hold what a command buffer wrote of it, or at
     /// once where no process can read them (`unread`,
-    /// [`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT));
-    /// `done` then ([`surface_cache`]).
+    /// [`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT)), with
+    /// no wait here for a buffer still walked; `done` then, or `failed` where the platform raised
+    /// at the copy ([`surface_cache`]).
     pub(crate) fn block_released(
         &self,
         device: &P::Device,
         offset: u64,
         unread: bool,
         done: Box<dyn FnOnce() + Send>,
-    ) -> RaiseResult<()> {
+        failed: Box<dyn FnOnce(Raise) + Send>,
+    ) {
         self.shared.surface_views.lock().released(offset);
-        self.surface_caches.released(device, offset, unread, done)
+        (self.surface_caches).release(device, offset, unread, done, failed);
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
@@ -2968,6 +2972,12 @@ fn refused_release(id: u64, refusal: &refusals::Refusal) {
         target: "reims_vgpu::graphics",
         "object {id:#x} was let go of, and its release was refused: {refusal}"
     );
+}
+
+/// A copy's `failed` that fails the test: the platform raised at it.
+#[cfg(test)]
+pub(crate) fn no_raise() -> Box<dyn FnOnce(Raise) + Send> {
+    Box::new(|raise| panic!("the platform raised at the copy: {raise:?}"))
 }
 
 /// `op`, one guest op of the lane's, inside the refusal scope ([`refusals::refusing`]): a death
