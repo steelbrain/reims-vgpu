@@ -22,7 +22,8 @@
 //! guest's record of its surface names (`RgfxSurfaceWriters`), whatever the host has taken. A
 //! download waits for the buffers that used the surface's device cache before it was taken, so a
 //! buffer posted after it that writes the surface, but taken before it, is among them, as one
-//! posted before it is: the guest writes a surface a CPU lock holds only racing the lock. Every
+//! posted before it is: the guest writes a surface a CPU lock holds only racing the lock
+//! (`a_command_buffer_is_handed_over_before_a_download_published_ahead_of_it`). Every
 //! buffer waits for a message of any other type, and for one too short to hold its field: the
 //! host refuses either, and the order is as it was.
 //!

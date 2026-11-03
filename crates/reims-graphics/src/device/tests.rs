@@ -968,6 +968,10 @@ impl Host for QueueTestHost {
         self.closed.lock().push(context);
         answer.answer(RGFX_STATUS_OK);
     }
+    fn surface_download(&self, _block_offset: u64, answer: crate::device::CompleteAnswer) {
+        self.handed.lock().push(RGFX_CMD_SURFACE_DOWNLOAD);
+        answer.answer(RGFX_STATUS_OK);
+    }
     fn stage3_message(&self, completion: &crate::device::CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         self.handed.lock().push(header.r#type);
@@ -1621,6 +1625,57 @@ fn a_command_buffer_waits_for_its_process_s_creates_behind_another_s() {
             RGFX_CMD_BUFFER_CREATE,
             RGFX_CMD_SAMPLER_CREATE,
             RGFX_CMD_COMMAND_BUFFER
+        ]
+    );
+}
+
+/// A command buffer waits for no `SURFACE_DOWNLOAD`: one published after a download, behind another
+/// process's create the control thread is still in, is handed to the host before the download.
+/// So a buffer that writes the surface and is taken first is among the users the download waits
+/// for, as one published before it is; only a guest that writes a surface while racing its CPU
+/// lock of it can tell.
+#[test]
+fn a_command_buffer_is_handed_over_before_a_download_published_ahead_of_it() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    wait_queue_idle(&rig);
+
+    seen.gate.store(false, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
+    seen.wait("the buffer create never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE)
+    });
+    rig.send(
+        RgfxSurfaceDownload {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SURFACE_DOWNLOAD,
+                size: 0,
+                seqno: 0,
+            },
+            block_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000,
+        }
+        .as_bytes()
+        .to_vec(),
+    );
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    let done = first_queue_completion(&rig).expect("held up by the download");
+    assert_eq!(done.cb_obj_id, 100);
+    seen.gate.store(true, Ordering::SeqCst);
+    seen.wait("the download never reached the host", |seen| {
+        seen.handed.lock().last() == Some(&RGFX_CMD_SURFACE_DOWNLOAD)
+    });
+    assert_eq!(
+        *seen.handed.lock(),
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_COMMAND_BUFFER,
+            RGFX_CMD_SURFACE_DOWNLOAD
         ]
     );
 }
