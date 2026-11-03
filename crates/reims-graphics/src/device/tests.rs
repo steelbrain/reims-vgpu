@@ -1940,3 +1940,6 @@ fn a_taking_write_starts_and_resets_as_a_plain_one() {
         RGFX_STATUS_RESET
     );
 }
+
+/// The wire round trip with a fake peer (`peer.rs`).
+mod peer;
