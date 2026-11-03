@@ -31,6 +31,11 @@ draws, upload, readback, present timing, drags, decode, WebGL) are tagged, compa
 and in no band; a baseline's median leaves them out too. Exit 0 when every item passes and no
 gated metric regressed, 1 when one failed, 2 when a part did not run (an incomplete run passes
 nothing).
+
+A boot's numbers are TAINTED where tainted/LEG in the run's directory (LEG boot or bench) holds
+why, such as someone using the guest while it measured: they are shown, compared with nothing
+and left out of every baseline and band; its items and its host's counts still decide. Record
+the run again (--record) once the file is written.
 """
 import datetime
 import json
@@ -83,6 +88,14 @@ def host_tagged(metrics, name):
     metric is not GPU-bound. The correctness boot's (shared.) are never gated."""
     return metrics.get("host.host_quiet") == 0 and not name.startswith(("shared.", "host.", "step_s.", "pstate.", "core_mhz.", "mem_mhz.", "clock_")) \
         and not gpu_bound(name)
+
+
+def tainted(metrics, name):
+    """Whether a metric is from a boot whose numbers are tainted (tainted/LEG): any of its numbers
+    but its host's counts and waits."""
+    leg = "boot" if name.startswith("shared.") else "bench"
+    return metrics.get("taint." + leg) == 1 and not name.startswith(
+        ("host.", "shared.host.", "taint.", "step_s."))
 
 
 def clock_ok_of(metrics, name):
@@ -159,7 +172,13 @@ class Run:
         legs = [(os.path.join(r, "boot"), "", "shared."), (os.path.join(r, "bench"), "perf.", "")]
         if os.path.exists(os.path.join(r, "guest.log")):
             legs = [(r, "", "")]
+        self.taint = {}
         for d, self.ip, self.mp in legs:
+            why = read(os.path.join(self.path, "tainted", os.path.basename(d))).strip()
+            if why and os.path.exists(os.path.join(d, "guest.log")):
+                leg = os.path.basename(d) if d != r else "bench"
+                self.taint[leg] = why
+                self.metrics["taint." + leg] = 1
             if os.path.exists(os.path.join(d, "guest.log")):
                 self.guest(read(os.path.join(d, "guest.log")))
                 self.host(d)
@@ -551,9 +570,12 @@ def median_baseline(bdir):
     ref["metrics_best"] = {}
     for n in names:
         # A HOST_NOT_QUIET sample's numbers other than the GPU-bound ones are left out.
-        vals = [r["metrics"][n] for r in runs if n in r["metrics"] and not host_tagged(r["metrics"], n)]
+        # A tainted boot's numbers are left out (tainted/LEG).
+        vals = [r["metrics"][n] for r in runs if n in r["metrics"] and not host_tagged(r["metrics"], n)
+                and not tainted(r["metrics"], n)]
         # A bench number is the median of the samples at the high clock, where any sample says its clock.
-        clocked = [r["metrics"] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n) is not None]
+        clocked = [r["metrics"] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n) is not None
+                   and not tainted(r["metrics"], n)]
         if clocked:
             vals = [x[n] for x in clocked if clock_ok_of(x, n)]
         if not vals:
@@ -610,10 +632,11 @@ def noise_from(bdirs_root):
         if len(runs) < 2:
             continue
         for n in set().union(*(r["metrics"] for r in runs)):
+            mine = [r for r in runs if n in r["metrics"] and not tainted(r["metrics"], n)]
             if gpu_bound(n):
-                vals = [r["metrics"][n] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n)]
+                vals = [r["metrics"][n] for r in mine if clock_ok_of(r["metrics"], n)]
             else:
-                vals = [r["metrics"][n] for r in runs if n in r["metrics"] and r["metrics"].get("host.host_quiet") == 1]
+                vals = [r["metrics"][n] for r in mine if r["metrics"].get("host.host_quiet") == 1]
             if len(vals) < 2 or (bimodal(n) and not gpu_bound(n)):
                 continue
             med = statistics.median(vals)
@@ -719,7 +742,8 @@ def compare(run, base, noise):
         clock = cur["metrics"].get("core_mhz.bench." + name[len("bench."):].rsplit(".", 1)[0]) if gpu_bound(name) else None
         at = f"@{clock:.0f} MHz  " if clock is not None else ""
         if name not in bm:
-            mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)  {at}".rstrip())
+            mark = "TAINTED, not compared" if tainted(cur["metrics"], name) else ""
+            mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)  {at}{mark}".rstrip())
             continue
         bv = bm[name]
         bi = bimodal(name) if clock_ok_of(cur["metrics"], name) is None else None
@@ -727,7 +751,12 @@ def compare(run, base, noise):
             bv = base.get("metrics_best", {}).get(name, bv)
         rel = (v - bv) / abs(bv) if bv else 0.0
         verdict = ""
-        if host_tagged(cur["metrics"], name):
+        if tainted(cur["metrics"], name):
+            leg = "boot" if name.startswith("shared.") else "bench"
+            verdict = f"TAINTED: {getattr(run, 'taint', {}).get(leg, 'tainted')}, not compared"
+            if g:
+                items.pop("metric." + name, None)
+        elif host_tagged(cur["metrics"], name):
             verdict = "tagged HOST_NOT_QUIET: a build ran beside the boot, not compared"
         elif clock_ok_of(cur["metrics"], name) is False:
             case = name[len("bench."):].rsplit(".", 1)[0]
