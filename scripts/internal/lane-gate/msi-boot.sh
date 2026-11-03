@@ -171,8 +171,17 @@ desktop || { log "BOOT_FAIL no desktop (WindowServer, Dock, Finder) in 3 min"; e
 kv desktop_s "$(( $(date +%s) - T0 ))"
 log "desktop up"
 
-G "rm -rf ~/lane-gate" && Gcp "$PAYLOAD" "$GUEST_USER@127.0.0.1:lane-gate" && Gcp "$CORPUS" "$GUEST_USER@127.0.0.1:lane-gate/corpus" ||
-  { log "BOOT_FAIL copying the payload into the guest"; exit 6; }
+# Right after login the guest's SSH can miss its banner timeout while the desktop's apps start: a
+# copy is tried three times, 15 s apart.
+copied=0
+for try in 1 2 3; do
+  G "rm -rf ~/lane-gate" && Gcp "$PAYLOAD" "$GUEST_USER@127.0.0.1:lane-gate" &&
+    Gcp "$CORPUS" "$GUEST_USER@127.0.0.1:lane-gate/corpus" && { copied=1; break; }
+  log "copying the payload into the guest failed (try $try)"
+  sleep 15
+done
+((copied)) || { log "BOOT_FAIL copying the payload into the guest"; exit 6; }
+kv payload_tries "$try"
 log "payload copied"
 
 # RgfxGate installs the bundle at the first boot, and the accelerator registers for it the same
