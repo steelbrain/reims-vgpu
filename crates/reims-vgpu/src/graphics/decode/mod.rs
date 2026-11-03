@@ -104,6 +104,8 @@ mod argument;
 mod blit;
 mod cmdbuf;
 mod compute;
+#[cfg(test)]
+mod fuzz;
 mod library;
 mod managed;
 mod render;
