@@ -24,7 +24,7 @@
 #
 #   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
 #                  [--exclude NAME,...] [--hold S] [--catch-from-boot] [--host-tip SHA] [--image-tip SHA]
-#                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD]
+#                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -47,7 +47,8 @@
 # boot's GPU lock (msi-boot.sh's COLD_CACHE); --qemu-hook CMD runs CMD on the lane host when QEMU
 # starts, {PID} its pid and {DIR} the round's directory (QEMU_HOOK); --pre-qemu CMD runs CMD on
 # the lane host under the GPU lock just before QEMU starts, its output in the round's
-# pre-qemu.txt (PRE_QEMU); --hold S sets the
+# pre-qemu.txt (PRE_QEMU); --log-add FILTER adds FILTER's directives to the round's host log filter
+# (as reims_vgpu_vulkan::icb_writes=debug, a target that is off by default); --hold S sets the
 # round's hold (config.sh's HOLD_S) for this round. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
@@ -56,7 +57,7 @@ set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
-cold_cache= qemu_hook= pre_qemu=
+cold_cache= qemu_hook= pre_qemu= log_add=
 while (($#)); do
   a=$1
   shift
@@ -73,6 +74,7 @@ while (($#)); do
     --cold-cache) cold_cache=$(tr -dc 0-9a-f <<< "${1:?--cold-cache KEY}"); shift ;;
     --qemu-hook) qemu_hook=${1:?--qemu-hook CMD}; shift ;;
     --pre-qemu) pre_qemu=${1:?--pre-qemu CMD}; shift ;;
+    --log-add) log_add=${1:?--log-add FILTER}; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
@@ -238,7 +240,7 @@ EXCLUSIVE=1
 HOLD_S=$HOLD_S
 LOCK_WAIT_S=${LOCK_WAIT_S:-10800}
 DRAG=0
-HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")
+HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")${log_add:+,$log_add}
 CAPTURE=$capture
 CATCH_FROM_BOOT=$from_boot
 COLD_CACHE=$cold_cache
