@@ -209,13 +209,17 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	return _unspecialised ?: @{};
 }
 
+// A vertex function's attributes, and a kernel's stage-in attributes, which Metal reads from the
+// function's reflection: the bundle reads none of it from the library, so it answers nil, logged.
 - (NSArray<MTLVertexAttribute *> *)vertexAttributes
 {
-	return nil; // reflection the shell does not read (see functionConstantsDictionary)
+	RGFX_UNSUPPORTED("a function's vertex attributes (its reflection is not read)");
+	return nil;
 }
 
 - (NSArray<MTLAttribute *> *)stageInputAttributes
 {
+	RGFX_UNSUPPORTED("a function's stage-in attributes (its reflection is not read)");
 	return nil;
 }
 

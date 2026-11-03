@@ -3,6 +3,7 @@
  */
 
 #import "RgfxSharedEvent.h"
+#import "RgfxUnsupported.h"
 #import "RgfxInterop.h"
 #import "RgfxMetalPrivate.h"
 
@@ -206,9 +207,10 @@ RGFX_LOG_UNRECOGNIZED
 
 - (MTLSharedEventHandle *)newSharedEventHandle
 {
-	// A shared-event handle is the cross-process token used to rebuild the event in
-	// another process; minting one needs the host transport that backs it. Until
-	// that lands this returns nil (a documented stub, a later transport piece).
+	// A shared-event handle is the cross-process token another process rebuilds the event from
+	// (newSharedEventWithHandle:). The wire has no event one context makes and another uses, so
+	// none is minted, and the ask is logged.
+	RGFX_UNSUPPORTED("shared event handles (an event shared across processes)");
 	return nil;
 }
 

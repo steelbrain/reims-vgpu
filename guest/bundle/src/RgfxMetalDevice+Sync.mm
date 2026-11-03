@@ -38,12 +38,11 @@
 
 - (id<MTLSharedEvent>)newSharedEventWithHandle:(MTLSharedEventHandle *)sharedEventHandle
 {
-	// Importing a shared event from another process's handle needs the host
-	// transport that resolves the handle to a host event; that is a later transport
-	// piece (paired with RgfxSharedEvent's -newSharedEventHandle stub). Until it
-	// lands this declines the import. FOLLOW-UP: resolve the handle through the host
-	// and wrap the event it names.
+	// A handle names another process's event, which the wire has no way to share (no event
+	// one context makes and another uses; RgfxSharedEvent's newSharedEventHandle mints none),
+	// so the import is declined, and logged.
 	(void)sharedEventHandle;
+	RGFX_UNSUPPORTED("shared event handles (an event shared across processes)");
 	return nil;
 }
 

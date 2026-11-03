@@ -746,9 +746,12 @@ RGFX_LOG_UNRECOGNIZED
 	return static_cast<uint32_t>(_caps.size(kRgfxSizePeerCount));
 }
 
+// The bytes the device has allocated for this process. The bundle keeps no count of its
+// allocations, so it answers 0, as a device that has made nothing does, and logs the ask.
 - (NSUInteger)currentAllocatedSize
 {
-	return 0; // no allocation accounting yet
+	RGFX_UNSUPPORTED("the device's allocation count (answers 0)");
+	return 0;
 }
 
 - (uint64_t)recommendedMaxWorkingSetSize

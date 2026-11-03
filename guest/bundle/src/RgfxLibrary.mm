@@ -674,7 +674,10 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 	} else {
 		// No table to resolve against (bytes that are no .metallib, or an entry whose
 		// metadata did not read): the values set by index, as set; the host checks them
-		// against the function. Values set by name need the table, and are not carried.
+		// against the function. Values set by name need the table, and are not carried,
+		// which is logged.
+		if (!byName.empty())
+			RGFX_UNSUPPORTED("function constants set by name, in a library whose table did not read");
 		for (const auto &[index, v] : byIndex) {
 			if (v.bytes.empty())
 				continue;

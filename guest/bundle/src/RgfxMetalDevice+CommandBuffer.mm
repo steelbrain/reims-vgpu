@@ -45,9 +45,9 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	RgfxSerializer *ser = [self serializer];
 	RgfxRegion *region = [self region];
 	if (ser == nullptr || region == nullptr) {
-		// No region mapped yet (the wire handshake is a later piece), so there is no
-		// ring to place and the queue cannot be stood up from the device. The unit
-		// test drives the factory directly with a fixture region (RgfxCommandObjects.h).
+		// A device whose region did not map (its wire handshake failed) has no ring to
+		// place, so no queue stands up. The unit test drives the factory directly with a
+		// fixture region (RgfxCommandObjects.h).
 		return nil;
 	}
 

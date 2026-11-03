@@ -66,15 +66,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxMetalDevice : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI, RgfxRegionHolder>
 
-/// Metal's entry point: `[super initWithAcceleratorPort:]` identifies the GPU, then
-/// (stub, until the region/ring transport lands) we would map the device region,
-/// read the caps blob, and stand up the submission rings. May return nil to
-/// decline a process, as Apple's base allows.
+/// Metal's entry point: `[super initWithAcceleratorPort:]` identifies the GPU, then the
+/// wire handshake maps the process's window of the device region, reads the caps blob, and
+/// stands up the device's rings (the .mm). May return nil to decline a process, as Apple's
+/// base allows.
 - (nullable instancetype)initWithAcceleratorPort:(mach_port_t)port;
 
 // --- accessors the category slices route through -----------------------------
 
-/// The resource/create serialiser (null until the ring transport is wired).
+/// The resource/create serialiser (null where the wire handshake failed).
 - (nullable RgfxSerializer *)serializer;
 
 /// The per-device id space (object ids, GPU addresses, resource ids).
