@@ -258,6 +258,14 @@ public:
 	uint64_t registryId() const { return m_info.registry_id; }
 	/// FEATURES_LO's low byte (RGFX_FEATURE_*), as the host wrote it; 0 from an older host.
 	uint8_t featuresLo() const { return m_valid ? m_info.features_lo : 0; }
+	/// Takes the kext's answer to the feature-word call (the accelerator's Features selector):
+	/// `kr` its return, 0 for success, and `word` the word. A kext older than the call answers
+	/// kIOReturnUnsupported; on that, or any failure, the word is `featuresLo()`'s bits 0 to 2,
+	/// the ones the host acts on as it offers them.
+	void takeFeatures(int kr, uint64_t word);
+	/// The RGFX_FEATURE_* bits this process works by: bits 0 to 2 as the host offers them, and
+	/// from bit 3 the ones the kext took for its bundle (takeFeatures); 0 before takeFeatures.
+	uint64_t features() const { return m_features; }
 	/// `gpuCoreCount`, or 0 when the host does not answer it.
 	uint64_t gpuCoreCount() const { return m_info.gpu_core_count; }
 	/// `maxThreadsPerThreadgroup`'s `dim` (0 = width, 1 = height, 2 = depth).
@@ -274,6 +282,7 @@ public:
 
 private:
 	bool m_valid;
+	uint64_t m_features;
 	RgfxDeviceInfo m_info;
 	char m_name[RGFX_DEVICE_NAME_LEN + 1];
 	char m_architectureName[RGFX_DEVICE_ARCHITECTURE_NAME_LEN + 1];

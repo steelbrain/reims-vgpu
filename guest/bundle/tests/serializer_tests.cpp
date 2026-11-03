@@ -10,6 +10,7 @@
  * first failure.
  */
 
+#include <IOKit/IOReturn.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -278,6 +279,50 @@ void test_resource_id_chunks()
 	CHECK(again.posted && again.resource_id == 1 + 9 * chunk + 3);
 	auto am = expectMessage<RgfxTextureCreate>(ring, RGFX_CMD_TEXTURE_CREATE);
 	CHECK(am.resource_id == again.resource_id && am.obj_id == again.obj_id);
+}
+
+// The feature word: the kext's where it answers the call, and the blob's bits 0 to 2 where it
+// answers kIOReturnUnsupported (a kext older than the call) or fails otherwise.
+// The negotiation's records as the bundle compiles them (wire.rs asserts the same).
+static_assert(RGFX_REG_DRIVER_FEATURES_LO == 0x024 && RGFX_REG_DRIVER_FEATURES_HI == 0x028,
+              "DRIVER_FEATURES");
+static_assert(offsetof(RgfxRingHeader, producer_waiting) == 0x10, "producer_waiting");
+static_assert(offsetof(RgfxRingHeader, raise_all) == 0xc4, "raise_all");
+static_assert(RGFX_QUEUE_CREATE_FLAGS_OFFSET == sizeof(RgfxQueueCreate) &&
+                  sizeof(RgfxQueueCreateFlags) == 8,
+              "QUEUE_CREATE's tail");
+static_assert(sizeof(RgfxOpHeader) + sizeof(RgfxOpQueueBarrier) == 24, "QUEUE_BARRIER");
+static_assert(RGFX_SAMPLER_CREATE_EXT_OFFSET == sizeof(RgfxSamplerCreate) &&
+                  sizeof(RgfxSamplerCreateExt) == 8,
+              "SAMPLER_CREATE's tail");
+static_assert(sizeof(RgfxCommandBufferPart) == 56, "COMMAND_BUFFER_PART");
+static_assert(sizeof(RgfxBufferOverPages) == 72, "BUFFER_OVER_PAGES");
+static_assert(offsetof(RgfxDeviceInfo, features_lo) == 0x451 &&
+                  offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452,
+              "the device info's feature and reduction bytes");
+
+void test_caps_features()
+{
+	RgfxCaps caps;
+	caps.takeFeatures(kIOReturnUnsupported, 0);
+	CHECK(caps.features() == 0); // no blob: nothing
+
+	RgfxDeviceInfo info = {};
+	info.version = RGFX_DEVICE_INFO_VERSION;
+	info.features_lo = RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED |
+	                   RGFX_FEATURE_QUIET_SCHEDULED; // bit 3 offered, but taken by no kext
+	CHECK(caps.load(info));
+	CHECK(caps.features() == 0); // nothing before the probe
+	caps.takeFeatures(kIOReturnUnsupported, 0xffff);
+	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
+	caps.takeFeatures(kIOReturnBadArgument, 0xffff);
+	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
+	// A kext that answers gives the word as it is, bits from 3 and 32 among them.
+	const uint64_t word = RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_CB_PARTS | (1ull << 40);
+	caps.takeFeatures(KERN_SUCCESS, word);
+	CHECK(caps.features() == word);
+	caps.takeFeatures(KERN_SUCCESS, 0);
+	CHECK(caps.features() == 0);
 }
 
 void test_caps()
@@ -2076,6 +2121,7 @@ int main()
 	test_caps();
 	test_spi_features();
 	test_family_names();
+	test_caps_features();
 	test_archive_file();
 	test_lifecycle_messages();
 	test_creates_with_no_address_post_nothing();

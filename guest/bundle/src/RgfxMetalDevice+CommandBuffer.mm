@@ -105,7 +105,7 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	// Its command buffers that commitAndWaitUntilSubmitted commits ask for their submission
 	// where the host answers it.
 	const RgfxCaps *caps = [self caps];
-	queue.asksSubmitted = caps != nullptr && (caps->featuresLo() & RGFX_FEATURE_CB_SUBMITTED) != 0;
+	queue.asksSubmitted = caps != nullptr && (caps->features() & RGFX_FEATURE_CB_SUBMITTED) != 0;
 	// The process's completion thread takes the ring's completions from now on, whether or
 	// not anything waits for them.
 	if (RgfxCompletionThread *completions = [self completionThread])

@@ -436,6 +436,15 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
 		rgfxDiag("RGFX: caps blob not read (kr=0x%x) or invalid; using defaults\n", kr);
+	// The feature word, from the kext; a kext older than the call leaves the blob's bits 0 to 2
+	// (RgfxCaps::takeFeatures).
+	uint64_t features = 0;
+	uint32_t featuresCount = 1;
+	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, &features,
+	                               &featuresCount);
+	if (kr == KERN_SUCCESS && featuresCount != 1)
+		kr = kIOReturnBadArgument;
+	_caps.takeFeatures(kr, features);
 
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers
