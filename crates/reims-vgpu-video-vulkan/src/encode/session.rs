@@ -36,10 +36,10 @@ use ash::vk::native::{
 };
 
 use crate::device::VideoDevice;
+use crate::encode::Settings;
 use crate::encode::caps::{EncodeCapabilities, EncodeCodec};
 use crate::encode::frame::QuerySlot;
 use crate::encode::io::{BitstreamBuffer, SourcePicture};
-use crate::encode::Settings;
 use crate::encode::rate::RatePlan;
 use crate::error::{Error, Named};
 use crate::params::Parameters;

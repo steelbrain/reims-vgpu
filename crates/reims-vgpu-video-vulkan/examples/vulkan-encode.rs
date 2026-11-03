@@ -653,10 +653,7 @@ impl Images {
     /// The next frame from `input`, uploaded into a free image: the source,
     /// and the semaphore value the encode waits for. `None` at the input's
     /// end.
-    fn next(
-        &mut self,
-        input: &mut impl Read,
-    ) -> Result<Option<Upload>, String> {
+    fn next(&mut self, input: &mut impl Read) -> Result<Option<Upload>, String> {
         let slot = self.slots.take().ok_or("every source image is in use")?;
         let frame_size = self.frame.0 + self.frame.1;
         let (image, _, buffer, command) = self.images[slot];
