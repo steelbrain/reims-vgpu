@@ -142,9 +142,44 @@ run_present() {
 	phase present.windowed end
 }
 
+# A new crash report's path and summary (ips-summary.js), among the reports not in BEFORE.
+crash_since() {
+	local r f
+	for r in $(reports | comm -13 "$1" -); do
+		for f in "/Library/Logs/DiagnosticReports/$r" "$HOME/Library/Logs/DiagnosticReports/$r"; do
+			[ -f "$f" ] && { echo "$r: $(limit 20 osascript -l JavaScript "$D/ips-summary.js" "$f" 2>&1 | head -c 600)"; return; }
+		done
+	done
+}
+
+# The sweep, all its cases in one process. Where that process dies in a case, each case it did not
+# reach runs in a process of its own, in the order of the last full sweep (sweep-cases.txt, which
+# the gate keeps): a crash fails its own case, with its crash report's frames, and no other.
 run_sweep() {
-	limit 420 ./sweep 2>&1 | grep '^sweep: '
-	echo "rc sweep ${PIPESTATUS[0]}"
+	reports > "$D/reports-sweep.txt"
+	limit 420 ./sweep 2>&1 | grep '^sweep: ' | tee "$D/sweep.out"
+	local rc=${PIPESTATUS[0]}
+	echo "rc sweep $rc"
+	if grep -q -E '^sweep: [0-9]+ OK, ' "$D/sweep.out"; then
+		echo "GATE sweep-order $(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/sweep.out" | grep -v -x -E 'device|[0-9]+' | tr '\n' ' ')"
+	elif [ -s sweep-cases.txt ]; then
+		local c r done_
+		done_=$(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/sweep.out")
+		for c in $(cat sweep-cases.txt); do
+			echo "$done_" | grep -q -x -F "$c" && continue
+			reports > "$D/reports-case.txt"
+			limit 120 ./sweep "$c" 2>&1 | grep "^sweep: $c " > "$D/case.out"
+			r=${PIPESTATUS[0]}
+			if [ -s "$D/case.out" ]; then
+				cat "$D/case.out"
+			else
+				echo "sweep: $c FAIL crashed (rc $r): $(crash_since "$D/reports-case.txt")"
+			fi
+			done_="$done_
+$(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/case.out")"
+		done
+		echo "GATE sweep-resumed after rc $rc"
+	fi
 	# The bundle writes no file of its own: no /tmp/rgfx-*.log after every Metal process the sweep ran.
 	local logs; logs=$(ls /tmp/rgfx-*.log 2>/dev/null | tr '\n' ' ')
 	if [ -z "$logs" ]; then item no-tmp-files PASS "no /tmp/rgfx-*.log after the sweep"; else item no-tmp-files FAIL "$logs"; fi

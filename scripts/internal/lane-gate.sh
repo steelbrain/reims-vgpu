@@ -459,8 +459,11 @@ do_boot() {
     # WebGL's frame rate and present_probe's answers first: the quickest read of a tip's frame pace.
     excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10
   fi
-  # The guest runner and its files as the gate has them now (a resumed run keeps its tools).
+  # The guest runner and its files as the gate has them now (a resumed run keeps its tools), and
+  # the sweep's case order from its last full run (guest-run.sh runs the cases a crash cut off one
+  # by one in that order).
   cp "$L/guest/"* "$ART/payload/"
+  [[ ! -s $GH/sweep-cases.txt ]] || cp "$GH/sweep-cases.txt" "$ART/payload/"
   msi "rm -rf '$out' && mkdir -p '$out' && { [ -d '$MR/payload' ] || exit 0; rm -rf '$MR/payload'; }"
   scp -q -r "$ART/payload" "$MSI:$MR/payload"
   msi "cat > '$out/boot.env'" << EOF
@@ -491,6 +494,10 @@ EOF
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
+  # A sweep that ran whole leaves its case order for the next boot's.
+  local order
+  order=$(sed -n 's/^[0-9.]* GATE sweep-order //p' "$RES/$mode/guest.log" 2> /dev/null | head -1)
+  [[ -z $order ]] || printf '%s\n' $order > "$GH/sweep-cases.txt"
   return $rc
 }
 
