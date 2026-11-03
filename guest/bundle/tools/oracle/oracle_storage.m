@@ -13,12 +13,25 @@
 //                 and read by the CPU (getBytes:)
 //   lintex MODE   a linear BGRA8 texture over a Shared (MODE shared) or Managed (managed) buffer:
 //                 CPU writes to the buffer seen by the GPU's reads of the texture, and a render
-//                 pass's clear of the texture seen in the buffer
+//                 pass's clear of the texture seen in the buffer, and replaceRegion: of the texture
+//                 (whole, then a corner after a CPU write to the buffer) seen by the GPU
+//   argenc MODE   an argument encoder's setBuffer: and setTexture: into a Shared (MODE shared) or
+//                 Managed (managed) argument buffer: the GPU's copy of the bytes against the CPU's,
+//                 with and without the app's didModifyRange:
+//   nocopy        a no-copy Managed buffer over the app's pages and a linear texture over it: CPU
+//                 writes to the pages with and without didModifyRange:, seen by the GPU or not
+//   didmodify MODE  a linear texture (the SPI form) over a Managed buffer, of newBufferWithLength:
+//                 (MODE length) or no-copy (nocopy): CPU writes seen by the GPU with no call and
+//                 after the texture's didModifyData (SPI), as CoreAnimation calls it
+//   linalign      the offsets and row pitches a texture over a Shared or Managed buffer takes, by
+//                 the public form, the linear SPI and the tiled SPI: made or nil for each
 //   spin          a Shared buffer the CPU writes while one GPU thread polls it (atomic and plain
 //                 loads), and one the GPU writes step by step while the CPU polls it
 // A buffer's bytes print as runs, "A[0,4096)" or "B[0,256) A[256,4096)", each letter a byte.
 // Build: see README.md.
 #import "oracle_common.h"
+#import <objc/message.h>
+#include <mach/mach.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -380,6 +393,261 @@ static void case_lintex(const char *mode)
 		[b didModifyRange:NSMakeRange(0, b.length)];
 	tex_view(t, w, h, g, sizeof g);
 	line("CPU D (+didModify if Managed); GPU sees texture", g, 0);
+	NSMutableData *e = [NSMutableData dataWithLength:(size_t)w * 4 * h];
+	memset(e.mutableBytes, 'E', e.length);
+	[t replaceRegion:MTLRegionMake2D(0, 0, w, h)
+	     mipmapLevel:0
+	       withBytes:e.bytes
+	     bytesPerRow:(NSUInteger)w * 4];
+	tex_view(t, w, h, g, sizeof g);
+	line("replaceRegion E of the texture, nothing else; GPU sees texture", g, 0);
+	runs(b.contents, b.length, c, sizeof c);
+	line("  CPU sees buffer", c, 0);
+	memset(b.contents, 'G', b.length);
+	memset(e.mutableBytes, 'F', e.length);
+	[t replaceRegion:MTLRegionMake2D(0, 0, 16, 1)
+	     mipmapLevel:0
+	       withBytes:e.bytes
+	     bytesPerRow:(NSUInteger)w * 4];
+	tex_view(t, w, h, g, sizeof g);
+	line("CPU G to the buffer, then replaceRegion F of a 16x1 corner; GPU sees", g, 0);
+}
+
+// The GPU's copy of `b`'s first `n` bytes against the CPU's: "same as the CPU's" or the GPU's runs.
+static void gpu_against_cpu(id<MTLBuffer> b, size_t n, char *out, size_t cap)
+{
+	id<MTLBuffer> rb = [D newBufferWithLength:n options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromBuffer:b sourceOffset:0 toBuffer:rb destinationOffset:0 size:n];
+	[e endEncoding];
+	oracle_commit_wait(cb, NULL, NULL);
+	if (!memcmp(rb.contents, b.contents, n)) {
+		snprintf(out, cap, "same as the CPU's");
+		return;
+	}
+	char r[160];
+	runs(rb.contents, n, r, sizeof r);
+	snprintf(out, cap, "differs: %s", r);
+}
+
+static void case_argenc(const char *mode)
+{
+	char g[200];
+	MTLResourceOptions opt = !strcmp(mode, "managed") ? MTLResourceStorageModeManaged
+	                                                   : MTLResourceStorageModeShared;
+	printf("case argenc %s: an argument encoder writing a %s argument buffer\n", mode, mode);
+	MTLArgumentDescriptor *p = [MTLArgumentDescriptor argumentDescriptor];
+	p.dataType = MTLDataTypePointer;
+	p.index = 0;
+	MTLArgumentDescriptor *t = [MTLArgumentDescriptor argumentDescriptor];
+	t.dataType = MTLDataTypeTexture;
+	t.textureType = MTLTextureType2D;
+	t.index = 1;
+	id<MTLArgumentEncoder> enc = [D newArgumentEncoderWithArguments:@[ p, t ]];
+	if (!enc) {
+		line("argument encoder", "nil", 0);
+		return;
+	}
+	const size_t n = (enc.encodedLength + 255) / 256 * 256;
+	id<MTLBuffer> ab = [D newBufferWithLength:n options:opt];
+	memset(ab.contents, 0, n);
+	if (opt == MTLResourceStorageModeManaged)
+		[ab didModifyRange:NSMakeRange(0, n)];
+	gpu_against_cpu(ab, n, g, sizeof g);
+	line("zeroed (+didModify if Managed); GPU's bytes", g, 0);
+	id<MTLBuffer> x = [D newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:16
+	                                                      height:16
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> tex = [D newTextureWithDescriptor:td];
+	[enc setArgumentBuffer:ab offset:0];
+	[enc setBuffer:x offset:0 atIndex:0];
+	[enc setTexture:tex atIndex:1];
+	gpu_against_cpu(ab, n, g, sizeof g);
+	line("setBuffer: + setTexture:, nothing else; GPU's bytes", g, 0);
+	if (opt == MTLResourceStorageModeManaged) {
+		[ab didModifyRange:NSMakeRange(0, n)];
+		gpu_against_cpu(ab, n, g, sizeof g);
+		line("  then didModifyRange: of the buffer; GPU's bytes", g, 0);
+	}
+}
+
+// A no-copy Managed buffer over the app's pages, and a linear texture over it as WindowServer makes
+// one (BGRA8 468 x 36 at offset 0x100, rows 0x780 apart, in 0x11000 bytes): CPU writes to the
+// app's memory with no call, seen by the GPU's reads of the buffer and of the texture or not.
+static void case_nocopy(void)
+{
+	char g[200];
+	const size_t n = 0x11000, offset = 0x100, bpr = 0x780;
+	const int w = 468, h = 36;
+	printf("case nocopy: a no-copy Managed buffer of %zu bytes and a linear texture over it\n", n);
+	vm_address_t at = 0;
+	if (vm_allocate(mach_task_self(), &at, n, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+		line("vm_allocate", "failed", 0);
+		return;
+	}
+	uint8_t *p = (uint8_t *)at;
+	memset(p, 'A', n);
+	id<MTLBuffer> b = [D newBufferWithBytesNoCopy:p
+	                                       length:n
+	                                      options:MTLResourceStorageModeManaged
+	                                  deallocator:nil];
+	line("made", !b ? "nil" : b.contents == p ? "buffer, contents the app's pages" : "buffer, contents elsewhere", 0);
+	if (!b)
+		return;
+	printf("  storageMode %lu\n", (unsigned long)b.storageMode);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	td.storageMode = b.storageMode;
+	td.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> t = [b newTextureWithDescriptor:td offset:offset bytesPerRow:bpr];
+	line("linear texture", t ? "made" : "nil", 0);
+	gpu_view(b, n, g, sizeof g);
+	line("CPU A before the make; GPU sees buffer", g, 0);
+	if (t) {
+		tex_view(t, w, h, g, sizeof g);
+		line("  GPU sees texture", g, 0);
+	}
+	memset(p, 'B', n);
+	gpu_view(b, n, g, sizeof g);
+	line("CPU B to the pages, no didModifyRange; GPU sees buffer", g, 0);
+	if (t) {
+		tex_view(t, w, h, g, sizeof g);
+		line("  GPU sees texture", g, 0);
+	}
+	usleep(200000);
+	gpu_view(b, n, g, sizeof g);
+	line("  200 ms later; GPU sees buffer", g, 0);
+	memset(p, 'C', n);
+	[b didModifyRange:NSMakeRange(0, n)];
+	gpu_view(b, n, g, sizeof g);
+	line("CPU C + didModifyRange all; GPU sees buffer", g, 0);
+	if (t) {
+		tex_view(t, w, h, g, sizeof g);
+		line("  GPU sees texture", g, 0);
+	}
+}
+
+// didModifyData (SPI) of a texture over a buffer, as CoreAnimation calls it on an image texture it
+// reuses once the CPU redrew the image's bytes: a linear texture (newLinearTextureWithDescriptor:
+// offset:bytesPerRow:bytesPerImage:, SPI) of 468 x 36 BGRA8 at offset 0x100, rows 0x800 apart
+// (the AMD's 256-byte alignment), over a Managed buffer of 0x13000 bytes, made by
+// newBufferWithLength: (MODE length) or over the app's pages (nocopy); CPU writes seen by the GPU's
+// reads of the texture with no call, and after didModifyData.
+static void case_didmodify(const char *mode)
+{
+	char g[200];
+	const size_t n = 0x13000, offset = 0x100, bpr = 0x800;
+	const int w = 468, h = 36;
+	printf("case didmodify %s: a linear texture over a Managed buffer, and didModifyData\n", mode);
+	id<MTLBuffer> b;
+	if (!strcmp(mode, "nocopy")) {
+		vm_address_t at = 0;
+		if (vm_allocate(mach_task_self(), &at, n, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+			return;
+		b = [D newBufferWithBytesNoCopy:(void *)at
+		                         length:n
+		                        options:MTLResourceStorageModeManaged
+		                    deallocator:nil];
+	} else {
+		b = [D newBufferWithLength:n options:MTLResourceStorageModeManaged];
+	}
+	SEL lin = NSSelectorFromString(@"newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+	if (!b || ![(id)b respondsToSelector:lin]) {
+		line("buffer, or its linear texture SPI", "none", 0);
+		return;
+	}
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModeManaged;
+	td.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> t = ((id(*)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+	    b, lin, td, offset, bpr, bpr * h);
+	line("linear texture", t ? "made" : "nil", 0);
+	if (!t)
+		return;
+	SEL dmd = NSSelectorFromString(@"didModifyData");
+	printf("  texture storage %lu, answers didModifyData: %s\n", (unsigned long)t.storageMode,
+	       [(id)t respondsToSelector:dmd] ? "yes" : "no");
+	uint8_t *p = b.contents;
+	memset(p, 'A', n);
+	[b didModifyRange:NSMakeRange(0, n)];
+	tex_view(t, w, h, g, sizeof g);
+	line("CPU A + didModifyRange; GPU sees texture", g, 0);
+	memset(p, 'B', n);
+	tex_view(t, w, h, g, sizeof g);
+	line("CPU B, no call; GPU sees texture", g, 0);
+	if ([(id)t respondsToSelector:dmd]) {
+		((void (*)(id, SEL))objc_msgSend)(t, dmd);
+		tex_view(t, w, h, g, sizeof g);
+		line("  then didModifyData; GPU sees texture", g, 0);
+		gpu_view(b, n, g, sizeof g);
+		line("  and the buffer", g, 0);
+	}
+}
+
+// Which offsets and row pitches a texture over a buffer takes: 468 x 36 BGRA8 over a buffer of
+// 0x12000 bytes, by the public form (newTextureWithDescriptor:offset:bytesPerRow:), the linear
+// SPI (newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:) and the tiled SPI
+// (newTiledTextureWithDescriptor:offset:bytesPerRow:, a Managed descriptor over a Shared buffer),
+// over Shared and Managed buffers: "made" or "nil" for each. Where Metal's validation asserts
+// instead (the Intel's), the case ends there.
+static void case_linalign(void)
+{
+	printf("case linalign: the offsets and pitches a texture over a buffer takes\n");
+	const int w = 468, h = 36;
+	const NSUInteger offsets[] = {0, 0x40, 0x100}, pitches[] = {1872, 1920, 2048};
+	SEL lin = NSSelectorFromString(@"newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+	SEL tiled = NSSelectorFromString(@"newTiledTextureWithDescriptor:offset:bytesPerRow:");
+	for (int form = 0; form < 3; form++) {
+		for (int managed = 0; managed < 2; managed++) {
+			if (form == 2 && managed)
+				continue; // a tiled texture's buffer is Shared
+			id<MTLBuffer> b = [D newBufferWithLength:0x12000
+			                                 options:managed ? MTLResourceStorageModeManaged
+			                                                 : MTLResourceStorageModeShared];
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                                                       width:w
+			                                                      height:h
+			                                                   mipmapped:NO];
+			td.storageMode = form == 2 || managed ? MTLStorageModeManaged : MTLStorageModeShared;
+			td.usage = MTLTextureUsageShaderRead;
+			char out[200];
+			size_t o = 0;
+			for (int i = 0; i < 3; i++) {
+				for (int j = 0; j < 3; j++) {
+					id t = nil;
+					if (form == 0)
+						t = [b newTextureWithDescriptor:td offset:offsets[i] bytesPerRow:pitches[j]];
+					else if ([(id)b respondsToSelector:form == 1 ? lin : tiled])
+						t = form == 1 ? ((id(*)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger))
+						                     objc_msgSend)(b, lin, td, offsets[i], pitches[j],
+						                                   pitches[j] * h)
+						              : ((id(*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(
+						                    b, tiled, td, offsets[i], pitches[j]);
+					o += snprintf(out + o, sizeof out - o, "%s@%lx/%lu:%s", o ? " " : "",
+					              (unsigned long)offsets[i], (unsigned long)pitches[j],
+					              t ? "made" : "nil");
+				}
+			}
+			char step[80];
+			snprintf(step, sizeof step, "%s over %s",
+			         form == 0 ? "public" : form == 1 ? "linear SPI" : "tiled SPI",
+			         managed ? "Managed" : "Shared");
+			printf("  %-22s %s\n", step, out);
+		}
+	}
 }
 
 static id<MTLComputePipelineState> pipeline(id<MTLLibrary> lib, const char *name)
@@ -487,6 +755,14 @@ static int run_case(int argc, char **argv)
 		case_shtex();
 	else if (!strcmp(c, "lintex"))
 		case_lintex(argc > 1 ? argv[1] : "shared");
+	else if (!strcmp(c, "linalign"))
+		case_linalign();
+	else if (!strcmp(c, "didmodify"))
+		case_didmodify(argc > 1 ? argv[1] : "length");
+	else if (!strcmp(c, "nocopy"))
+		case_nocopy();
+	else if (!strcmp(c, "argenc"))
+		case_argenc(argc > 1 ? argv[1] : "shared");
 	else if (!strcmp(c, "spin"))
 		case_spin();
 	else {
@@ -518,7 +794,9 @@ int main(int argc, char **argv)
 	D = nil;
 	static const char *const all[][2] = {
 	    {"mbuf", "4096"}, {"mbuf", "67108864"}, {"mtex", NULL}, {"shtex", NULL},
-	    {"lintex", "shared"}, {"lintex", "managed"}, {"spin", NULL},
+	    {"lintex", "shared"}, {"lintex", "managed"}, {"argenc", "shared"},
+	    {"argenc", "managed"}, {"nocopy", NULL}, {"didmodify", "length"},
+	    {"didmodify", "nocopy"}, {"linalign", NULL}, {"spin", NULL},
 	};
 	size_t n = sizeof all / sizeof all[0];
 	for (size_t i = 0; i < n; i++) {

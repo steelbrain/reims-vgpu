@@ -10,7 +10,7 @@ Mac where it shows the gap. What they found is in
 | probe | answers |
 |---|---|
 | `oracle_iosurface` | when a texture over an IOSurface sees CPU writes, and when the surface's pages see GPU writes, with and without `IOSurfaceLock`, in one process and across two; the cost of each sync |
-| `oracle_storage` | Managed buffers and textures with and without `didModifyRange:` / `synchronizeResource:`; Shared textures; linear textures over Shared and Managed buffers; Shared buffers written while the GPU runs |
+| `oracle_storage` | Managed buffers and textures with and without `didModifyRange:` / `synchronizeResource:`; Shared textures; linear textures over Shared and Managed buffers, their `replaceRegion:` and `didModifyData` among them, and the offsets and pitches each form of a texture over a buffer takes; no-copy Managed buffers; argument encoders writing Shared and Managed argument buffers; Shared buffers written while the GPU runs |
 | `oracle_passes` | what load and store actions (`DontCare`, `Clear`) leave in color, depth, stencil and MSAA attachments; memoryless textures, framebuffer fetch, raster order groups and tile pipelines |
 | `oracle_cmdbuf` | the order the device keeps for tracked and untracked resources, fences, barriers and command buffers; scheduled and completed timing, handler threads and order, GPU times, asynchronous pipeline creators |
 | `oracle_caps` | limits, feature answers (public and the SPI getters core reads) and per-pixel-format answers |
