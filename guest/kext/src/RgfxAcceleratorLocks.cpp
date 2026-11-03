@@ -17,11 +17,13 @@
  * mode (a pending read holds no lock), and does nothing at ops 0 and 3: once a write retires, the
  * surface's pages hold the GPU's results, the device's own for a surface drawn in place, else the
  * process's write-back. It looks at the device's completed seqno of each queue with a pending
- * write in place every millisecond, and at once when the device raises its vector or a process
- * retires writes. A lock still waiting after kWaitMs goes on, with an "RGFX: WARN" line naming
- * the surface and the task: a write that never retires (a host that never completes the buffer,
- * or a process that locks a surface its own later buffer writes from the thread that would
- * retire it) holds no lock for good.
+ * write in place when the device raises its vector or a process retires writes (the bundle
+ * retires a buffer that writes only surfaces in place as it takes the buffer's completion), and
+ * at most every kBackstopMs where nothing wakes it. A wake that comes while it looks has it look
+ * again, so it sleeps through none. A lock still waiting after kWaitMs goes on, with an
+ * "RGFX: WARN" line naming the surface and the task: a write that never retires (a host that
+ * never completes the buffer, or a process that locks a surface its own later buffer writes from
+ * the thread that would retire it) holds no lock for good.
  *
  * A surface whose block has a device cache on the host (RgfxSurfaceCaches.hpp) has its cache made
  * with the block, and the control function does more at op 2, once no write is pending: where
@@ -51,9 +53,10 @@ namespace {
 // The most pending writes kept at once (a surface's per queue), and the most queues with any.
 constexpr UInt32 kMaxUses = 4096;
 constexpr UInt32 kMaxQueues = kRgfxMaxWatchedQueues;
-// How long a lock waits before it goes on, and how often it looks at the device's completions.
+// How long a lock waits before it goes on, and how long it sleeps at most between looks at the
+// device's completions where no wake comes.
 constexpr UInt32 kWaitMs = 2000;
-constexpr UInt32 kPollUs = 1000;
+constexpr UInt32 kBackstopMs = 20;
 // The most queues one surface's lock looks at the completions of.
 constexpr UInt32 kMaxLookedAt = 16;
 // The most cached surfaces at once (kRgfxCachedMaxSurfaces: every shared block in place may be
@@ -91,9 +94,11 @@ struct LockState {
 	// Under `lock`: surfaces left uncached as the table had no room, the first kNoRoomLogged
 	// logged.
 	uint64_t noRoom;
+	// Under `lock`: the waiting locks' wakes so far (wakeLocked).
+	uint64_t wakes;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0};
 
 bool startLocks()
 {
@@ -195,6 +200,9 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	bool gaveUp = false;
 	IOLockLock(state.lock);
 	while (rgfxLockWaits(state.table, key)) {
+		// The wakes so far: one that comes while the completions are read, out of the lock, has
+		// the lock look again rather than sleep through it.
+		const uint64_t woken = state.wakes;
 		// The device's completions of the queues writing the surface in place.
 		uint64_t queues[kMaxLookedAt];
 		uint32_t n = rgfxLockPendingQueues(state.table, key, true, queues, kMaxLookedAt,
@@ -215,9 +223,11 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			gaveUp = true;
 			break;
 		}
-		uint64_t tick = 0;
-		clock_interval_to_deadline(kPollUs, kMicrosecondScale, &tick);
-		IOLockSleepDeadline(state.lock, &state.table, tick < deadline ? tick : deadline,
+		if (state.wakes != woken)
+			continue;
+		uint64_t backstop = 0;
+		clock_interval_to_deadline(kBackstopMs, kMillisecondScale, &backstop);
+		IOLockSleepDeadline(state.lock, &state.table, backstop < deadline ? backstop : deadline,
 		                    THREAD_UNINT);
 	}
 	// A cached surface: the pages take what the GPU wrote, one lock asking at a time, and a
@@ -267,9 +277,10 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	}
 }
 
-// Wakes the waiting locks. Under state.lock.
+// Wakes the waiting locks, and counts the wake for a lock looking meanwhile. Under state.lock.
 void wakeLocked()
 {
+	state.wakes++;
 	IOLockWakeup(state.lock, &state.table, false);
 }
 } // namespace
