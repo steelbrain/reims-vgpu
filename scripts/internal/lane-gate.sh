@@ -274,10 +274,22 @@ print(f"{total} tests run, {len(fails)} failed")
 EOF
   # A GPU test that fails under the check's load runs once more alone (AGENTS.md, Checking a
   # change): passing alone, it is not a failure, and the report names it as load-sensitive.
+  # A known failure (the baseline's, or MAC_KNOWN_FAILS) is not run again: it fails as known.
   : > "$RES/cargo-alone.txt"
-  local bin name rest=()
+  local bin name rest=() known=$GH/baselines/LAST/runs
+  local knownlist
+  knownlist=$( { cat "${MAC_KNOWN_FAILS:-/dev/null}" 2> /dev/null
+    python3 -I -c 'import json, os, sys
+d = sys.argv[1]
+for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+    for t in json.load(open(os.path.join(d, f))).get("cargo_fails") or []:
+        print(t)' "$known" 2> /dev/null; } | awk '{print $NF}' | sort -u)
   while read -r bin name; do
     [[ -n $name ]] || continue
+    if grep -q -x -F "$name" <<< "$knownlist"; then
+      rest+=("$bin $name")
+      continue
+    fi
     if "$SRC/scripts/internal/gpu-locks.sh" -- cargo nextest run "${pkgs[@]}" --features "$feats" \
       -E "binary_id($bin) & test(=$name)" > "$RES/cargo-alone.log" 2>&1; then
       echo "$bin $name" >> "$RES/cargo-alone.txt"
