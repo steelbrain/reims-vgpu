@@ -77,6 +77,11 @@ struct RgfxCachedSurface {
 	void *map;
 	void *wire;
 	void *surface;
+	// Where the kext writes the surface's clients for the processes (the header's
+	// kRgfxSurfaceClientsOffset), and the surface, whose reference the block's entry holds, or
+	// this table's `surface` after the let-go, while this entry lives: opaque here.
+	volatile uint32_t *clientsAt;
+	const void *object;
 };
 
 // RgfxCachedSurface::letGo where nothing asks the dormant block to go.
@@ -220,6 +225,22 @@ inline bool rgfxCacheSleep(RgfxCacheTable &t, uint64_t key, bool dormant, bool *
 constexpr uint64_t kRgfxPurgeableNonVolatile = 2;
 constexpr uint64_t kRgfxPurgeableVolatile = 3;
 constexpr uint64_t kRgfxPurgeableEmpty = 4;
+
+// Surface `key` has `clients` processes holding it now, as a block of it is cached or as one
+// goes (op 5): written into its block's header for the processes, which keep a texture's view of
+// a surface another process holds (the bundle's keep). A count below 0 is written as 0, and one
+// past 32 bits as their most. True where the surface is cached and the count was written.
+inline bool rgfxCacheNoteClients(RgfxCacheTable &t, uint64_t key, int64_t clients)
+{
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr || c->clientsAt == nullptr)
+		return false;
+	const uint32_t n = clients < 0              ? 0u
+	                   : clients > 0xffffffffll ? 0xffffffffu
+	                                            : static_cast<uint32_t>(clients);
+	__atomic_store_n(c->clientsAt, n, __ATOMIC_RELEASE);
+	return true;
+}
 
 // Surface `key`'s device cache was purged (op 5): a dormant block of it is to be let go. True
 // where one is, not asked to go before.

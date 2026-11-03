@@ -379,16 +379,21 @@ void countView(std::atomic<uint64_t> &c)
 /// block made again holds an older one's bytes until its first holder writes it); for a cached
 /// block in place, the surface's CPU generation, which the kext writes at each read-write CPU
 /// lock of the surface (its kRgfxSurfaceCpuGenOffset) and each command buffer that uses the
-/// surface names (rgfxIOSurfaceUses).
+/// surface names (rgfxIOSurfaceUses), and how many processes hold the surface, which the kext
+/// writes as it caches the block, as a process holds the block again and as each client of the
+/// surface goes (its kRgfxSurfaceClientsOffset; 0 where it wrote none), which WindowServer's keep
+/// reads.
 struct RgfxSurfaceHeader {
 	uint64_t serial;
 	uint32_t seed;
-	uint32_t reserved;
+	uint32_t clients;
 	uint64_t cpuGen;
 };
 
 static_assert(offsetof(RgfxSurfaceHeader, cpuGen) == kRgfxSurfaceCpuGenOffset,
               "where the kext writes the CPU generation");
+static_assert(offsetof(RgfxSurfaceHeader, clients) == kRgfxSurfaceClientsOffset,
+              "where the kext writes the surface's clients");
 
 static_assert(sizeof(RgfxSurfaceHeader) % alignof(RgfxSurfaceWriters) == 0,
               "the writers follow the header, aligned");
@@ -983,6 +988,19 @@ namespace {
 // the surface's pages as for a live texture: the pages the host maps are the surface's while the
 // view is kept, and a texture made over it again is as one made while the last still lived. The
 // surface's use count is never touched, so IOSurfaceIsInUse answers as before.
+//
+// WindowServer's keep also keeps a view of a cached block while another process holds its surface,
+// by the kext's count of the surface's clients in the block's header (past WindowServer's own
+// one), and lets it go as above once the count is down to WindowServer alone. WindowServer lets a
+// layer's contents go as the next ones replace them, and takes them again when they come back: a
+// ring of three 3840x2054 buffers turning at 30 Hz came back every 99 ms, and each texture asked
+// the kext for the block again, 0.46 to 0.58 ms a frame, while the views went 50 ms past their
+// textures (measured on the RTX 5080 boot). The other processes keep by their own holds alone:
+// two processes that each kept a view while the other held the surface would keep each other's,
+// each view the last hold of the surface in its process, until their caps let them go. A view of
+// WindowServer's that another process's kept view alone holds goes once that keep lets go; while
+// another process holds the surface of every view WindowServer keeps, its sweep comes kKeepHeldNs
+// apart, not kKeepNs.
 constexpr size_t kKeepMaxViews = 8;
 constexpr uint64_t kKeepMaxBytes = 256ull << 20;
 constexpr uint64_t kKeepNs = 50ull * 1000 * 1000;
@@ -991,7 +1009,7 @@ constexpr uint64_t kKeepHeldNs = 1000ull * 1000 * 1000;
 struct Kept {
 	std::shared_ptr<RgfxSurfaceShadow> view;
 	uint64_t until = 0;     // nowNs() at which it goes where the view alone holds its surface
-	uint64_t heldUntil = 0; // nowNs() at which it goes all the same
+	uint64_t heldUntil = 0; // nowNs() at which it goes all the same, unless heldElsewhere
 	uint64_t bytes = 0;     // its surface's
 };
 
@@ -1000,6 +1018,41 @@ struct Kept {
 bool viewAloneHolds(const RgfxSurfaceShadow &view)
 {
 	return CFGetRetainCount(view.surface) <= 1;
+}
+
+/// Whether the keep keeps a cached block's view while another process holds its surface: in
+/// WindowServer, or as the tests set it (rgfxIOSurfaceKeepCountClients); -1 until first asked.
+std::atomic<int> gCountsClients{-1};
+
+bool countsClients()
+{
+	int on = gCountsClients.load(std::memory_order_relaxed);
+	if (on < 0) {
+		const char *name = getprogname();
+		on = name != nullptr && strcmp(name, "WindowServer") == 0;
+		int unset = -1;
+		if (!gCountsClients.compare_exchange_strong(unset, on, std::memory_order_relaxed))
+			on = unset;
+	}
+	return on != 0;
+}
+
+/// Whether another process holds `view`'s surface, where the keep counts them: the kext's count
+/// of its clients in the block's header (RgfxSurfaceHeader::clients) is past this process's one.
+/// A block not cached has no count.
+bool heldElsewhere(const RgfxSurfaceShadow &view)
+{
+	return countsClients() && view.cached && view.header != nullptr &&
+	       __atomic_load_n(&view.header->clients, __ATOMIC_ACQUIRE) > 1;
+}
+
+/// Whether `kept` is due to go at `now` (the keep).
+bool keepDue(const Kept &kept, uint64_t now)
+{
+	const RgfxSurfaceShadow &view = *kept.view;
+	if (heldElsewhere(view))
+		return false;
+	return now >= kept.heldUntil || (now >= kept.until && viewAloneHolds(view));
 }
 
 struct Keep {
@@ -1020,8 +1073,7 @@ Keep &keep()
 void expire(Keep &k, uint64_t now, bool all, std::vector<std::shared_ptr<RgfxSurfaceShadow>> *gone)
 {
 	for (auto it = k.views.begin(); it != k.views.end();) {
-		if (all || now >= it->heldUntil || (now >= it->until && viewAloneHolds(*it->view)) ||
-		    it->view->keepVolatile.load(std::memory_order_relaxed)) {
+		if (all || keepDue(*it, now) || it->view->keepVolatile.load(std::memory_order_relaxed)) {
 			k.bytes -= it->bytes;
 			gone->push_back(std::move(it->view));
 			it = k.views.erase(it);
@@ -1043,14 +1095,18 @@ void sweep(uint64_t now, bool all)
 	}
 }
 
-/// Schedules a sweep kKeepNs on, where `k` (locked) holds views and none is due: a process that
-/// stops making textures lets its kept views go all the same.
+/// Schedules a sweep kKeepNs on, where `k` (locked) holds views and none is due, or kKeepHeldNs
+/// on where another process holds the surface of every view it holds: a process that stops making
+/// textures lets its kept views go all the same.
 void armSweep(Keep &k)
 {
 	if (k.sweeping || k.views.empty())
 		return;
 	k.sweeping = true;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(kKeepNs)),
+	const bool allElsewhere = std::all_of(k.views.begin(), k.views.end(),
+	                                      [](const Kept &e) { return heldElsewhere(*e.view); });
+	const uint64_t in = allElsewhere ? kKeepHeldNs : kKeepNs;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(in)),
 	               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		Keep &kk = keep();
 		std::vector<std::shared_ptr<RgfxSurfaceShadow>> gone;
@@ -1117,6 +1173,11 @@ void rgfxIOSurfaceKeepFlush(void)
 void rgfxIOSurfaceKeepSweepAt(uint64_t now)
 {
 	sweep(now, false);
+}
+
+void rgfxIOSurfaceKeepCountClients(bool on)
+{
+	gCountsClients.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
 @interface RgfxIOSurfaceTexture ()

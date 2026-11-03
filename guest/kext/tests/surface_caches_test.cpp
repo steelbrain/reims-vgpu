@@ -6,6 +6,8 @@
 // released, which the table holds until the answer.
 // A dormant block keeps its generation and its downloads, and is let go once its device cache
 // goes, never named by that key again, or once its surface turns purgeable.
+// A cached surface's clients are written where its header holds them, clamped to 32 bits, and
+// nothing is written for a surface not cached or one with no header.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -146,6 +148,27 @@ void dormancy()
 	      "made nonvolatile, it sleeps");
 }
 
+// A cached surface's clients go where its header holds them, clamped to 32 bits; a surface not
+// cached, or one with no header, writes none.
+void clients()
+{
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	volatile uint32_t header = 0;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	check(c != nullptr && c->clientsAt == nullptr && c->object == nullptr,
+	      "a cached surface starts with no header for its clients");
+	check(!rgfxCacheNoteClients(t, kSurface, 2) && header == 0, "nothing written with no header");
+	c->clientsAt = &header;
+	check(rgfxCacheNoteClients(t, kSurface, 2) && header == 2, "two processes hold it");
+	check(rgfxCacheNoteClients(t, kSurface, 1) && header == 1, "one went");
+	check(rgfxCacheNoteClients(t, kSurface, -1) && header == 0, "below 0 is 0");
+	check(rgfxCacheNoteClients(t, kSurface, 1ll << 40) && header == 0xffffffffu,
+	      "past 32 bits, their most");
+	check(!rgfxCacheNoteClients(t, kNotCached, 3) && header == 0xffffffffu,
+	      "a surface not cached writes nothing");
+}
+
 // The table the kext sizes (kRgfxCachedMaxSurfaces) has a state for every block the surface table
 // holds, the dormant ones at their cap among them, and for as many again released and not yet
 // answered: a new surface past the dormant cap is still cached.
@@ -272,6 +295,7 @@ int main()
 	      "a block let go with no release lets the cache, the surface and the wiring go at once");
 
 	dormancy();
+	clients();
 	room();
 	std::printf("surface_caches_test: OK (%d checks)\n", checks);
 	return 0;

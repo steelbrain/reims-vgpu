@@ -189,6 +189,10 @@ void rgfxIOSurfaceKeepFlush(void);
 /// keep's own sweep, and the tests' passing of its time.
 void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
 
+/// Whether the keep keeps a cached block's view while another process holds its surface, as
+/// WindowServer's does (RgfxIOSurface.mm): for the tests.
+void rgfxIOSurfaceKeepCountClients(bool on);
+
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
 /// over an IOSurface or a view of one, through any views (otherwise nothing), and, where its
 /// view is a copy, that its commit syncs it (rgfxIOSurfaceSyncBeforeCommit).

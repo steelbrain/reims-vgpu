@@ -1285,6 +1285,9 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		}
 		if (revived)
 			noteDormant();
+		// The asker holds the surface: the processes see its clients counted anew.
+		if (posted == kIOReturnSuccess && block->cached)
+			rgfxSurfaceCacheNoteClients(block->offset);
 		return posted;
 	}
 	if (made != kRgfxBlockOk) {

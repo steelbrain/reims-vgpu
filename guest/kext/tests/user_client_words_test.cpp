@@ -124,6 +124,7 @@ static void protocol()
 		CHECK(context[i] == context[i - 1] + 1);
 	CHECK(context[sizeof(context) / sizeof(context[0]) - 1] == kRgfxAccelMethodContextLast);
 	CHECK(kRgfxSurfaceCpuGenOffset == 16);
+	CHECK(kRgfxSurfaceClientsOffset == 12);
 }
 
 // The features call and the kext's own feature bits, as design.md's registry gives them out:

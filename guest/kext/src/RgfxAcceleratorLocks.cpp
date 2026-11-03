@@ -182,8 +182,17 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	if (op == 5 || op == 6 || op == 7) {
 		// The cache was purged (a client of the surface went), or the surface made empty: a
 		// dormant block of it goes, on the release thread, never in this call. Made volatile,
-		// or nonvolatile again, the release thread marks it.
+		// or nonvolatile again, the release thread marks it. A client gone, the processes see
+		// the surface's clients left (the bundle's keep): IOSurface counts the client out before
+		// it calls op 5 (RgfxIOSurfaceKPI.hpp).
 		IOLockLock(state.lock);
+		if (op == 5) {
+			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
+			if (c != nullptr && c->object != nullptr) {
+				const auto *surface = static_cast<const OSObject *>(c->object);
+				rgfxCacheNoteClients(state.caches, key, rgfxIOSurfaceClientCount(surface));
+			}
+		}
 		const bool look = op == 5   ? rgfxCachePurged(state.caches, key)
 		                  : op == 6 ? rgfxCacheUnpurged(state.caches, key)
 		                            : rgfxCachePurgeable(state.caches, key, a);
@@ -414,6 +423,11 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		c->genAt = genAt;
 		c->map = header;
 		c->wire = wire;
+		c->clientsAt = reinterpret_cast<volatile uint32_t *>(header->getVirtualAddress() +
+		                                                     kRgfxSurfaceClientsOffset);
+		c->object = surface;
+		rgfxCacheNoteClients(state.caches, key,
+		                     rgfxIOSurfaceClientCount(static_cast<const OSObject *>(surface)));
 	}
 	IOLockUnlock(state.lock);
 	if (why) {
@@ -422,6 +436,18 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		unwireSurface(wire);
 	}
 	return c != nullptr;
+}
+
+void rgfxSurfaceCacheNoteClients(UInt64 offset)
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
+	if (c != nullptr && c->object != nullptr)
+		rgfxCacheNoteClients(state.caches, c->key,
+		                     rgfxIOSurfaceClientCount(static_cast<const OSObject *>(c->object)));
+	IOLockUnlock(state.lock);
 }
 
 UInt64 rgfxSurfaceCacheNoRoom()

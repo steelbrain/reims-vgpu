@@ -104,12 +104,17 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing);
 // The surface `surface` of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID
 // `surfaceId`, has its block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page
 // mapped at `header`, which the kext keeps (and releases once the surface is cached no more) to
-// write its CPU generation at `genOffset`, 0 from here. The surface's memory is wired until
-// then. Where the surface's previous block is cached still, its release unanswered, waits for
-// the answer first, as a lock does. False, `header` the caller's and the table as it was, where
-// it cannot be.
+// write its CPU generation at `genOffset`, 0 from here, and its clients at
+// kRgfxSurfaceClientsOffset, its count now from here (rgfxCacheNoteClients). The surface's
+// memory is wired until then. Where the surface's previous block is cached still, its release
+// unanswered, waits for the answer first, as a lock does. False, `header` the caller's and the
+// table as it was, where it cannot be.
 bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
                          IOMemoryMap *header, UInt32 genOffset);
+// The cached block at `offset` was held again by a process, which holds its surface: the
+// surface's clients written into the block's header anew (rgfxCacheNoteClients). Takes the
+// locks' lock alone.
+void rgfxSurfaceCacheNoteClients(UInt64 offset);
 // The cached surface of device cache `cache` has its block dormant (RgfxSurfaceBlocks.hpp), or
 // held again: false where it is not cached, made empty (it does not sleep), or, held again,
 // where it is to be let go. `*purgeable` where the surface is volatile.

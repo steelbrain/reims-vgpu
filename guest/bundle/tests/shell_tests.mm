@@ -54,6 +54,7 @@
 
 #include "RgfxHeapSizes.hpp"
 #include "RgfxSlabs.hpp"
+#include "../../kext/src/RgfxUserClientABI.hpp"
 
 #include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
@@ -9144,7 +9145,8 @@ void test_iosurface_in_place()
 // a texture made over the same surface soon after asks the kext for nothing, and the view's block
 // goes back once the keep lets the view go: past its time, at a flush (the process's memory
 // pressure), past the keep's count of views, or at once where a texture over it was set
-// volatile. A kept view leaves the surface's use count alone.
+// volatile. In WindowServer it also stays while another process holds its surface, by the kext's
+// count of the surface's clients. A kept view leaves the surface's use count alone.
 void test_iosurface_keep()
 {
 	Fixture fx;
@@ -9156,6 +9158,7 @@ void test_iosurface_keep()
 	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
 	struct Source {
 		int asked = 0;
+		bool cached = false; // whether the blocks it gives are cached
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
 		                                     bool, uint64_t *offset, uint64_t *serial,
@@ -9167,7 +9170,7 @@ void test_iosurface_keep()
 			src->asked++;
 			*serial = 9;
 			*fresh = true;
-			*cached = false;
+			*cached = src->cached;
 			return RgfxRegion::kPagesGiven;
 		}
 		static bool acquire(void *, const void *, uint64_t, uint64_t, uint64_t *, uint64_t *,
@@ -9314,6 +9317,72 @@ void test_iosurface_keep()
 	CHECK(gone == nullptr);
 	if (gone != nullptr)
 		CFRelease(gone);
+
+	// WindowServer's keep (set here) keeps a cached block's view while another process holds its
+	// surface, by the kext's count of the surface's clients in the block's header: past a second,
+	// and a texture over it then asks nothing, though it comes back long past the 50 ms keep; once
+	// the count is down to this process, the view goes kKeepNs past its texture, the surface with
+	// it.
+	rgfxIOSurfaceKeepCountClients(true);
+	src.cached = true;
+	auto clientsAt = [&](uint64_t block) {
+		return reinterpret_cast<volatile uint32_t *>(mem.data() + block +
+		                                             kRgfxSurfaceClientsOffset);
+	};
+	IOSurfaceRef c = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(c != nullptr);
+	const IOSurfaceID cId = IOSurfaceGetID(c);
+	const uint64_t cBlock = RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * 15;
+	@autoreleasepool {
+		CHECK(over(c) != nil && src.asked == 16);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	*clientsAt(cBlock) = 2;
+	CHECK(CFGetRetainCount(c) == 2);
+	CFRelease(c);
+	rgfxIOSurfaceKeepSweepAt(made + 1500 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 15);
+	@autoreleasepool {
+		CHECK(over(c) != nil && src.asked == 16);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	rgfxIOSurfaceKeepSweepAt(made + 5000 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 15);
+	*clientsAt(cBlock) = 1;
+	rgfxIOSurfaceKeepSweepAt(made + 10 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 15);
+	rgfxIOSurfaceKeepSweepAt(made + 200 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 16 && src.released.back() == cBlock);
+	gone = IOSurfaceLookup(cId);
+	CHECK(gone == nullptr);
+	if (gone != nullptr)
+		CFRelease(gone);
+
+	// Another process's keep reads no count: its view goes kKeepNs past its texture once the
+	// view alone holds the surface in the process, though another process holds it too.
+	rgfxIOSurfaceKeepCountClients(false);
+	IOSurfaceRef d = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(d != nullptr);
+	const IOSurfaceID dId = IOSurfaceGetID(d);
+	const uint64_t dBlock = RGFX_ALLOCATIONS_OFFSET + 0x40000 + 0x1000 * 16;
+	@autoreleasepool {
+		CHECK(over(d) != nil && src.asked == 17);
+		made = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	}
+	*clientsAt(dBlock) = 2;
+	CFRelease(d);
+	rgfxIOSurfaceKeepSweepAt(made + 200 * ms);
+	drainRing(fx.ring);
+	CHECK(src.released.size() == 17 && src.released.back() == dBlock);
+	gone = IOSurfaceLookup(dId);
+	CHECK(gone == nullptr);
+	if (gone != nullptr)
+		CFRelease(gone);
+	src.cached = false;
 	CFRelease(a);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }

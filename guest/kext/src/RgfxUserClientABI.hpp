@@ -100,8 +100,9 @@ enum {
 	// Six inputs, in place, add the surface's IOSurfaceID and whether the process may have its
 	// GPU copy kept in a device cache (1: one plane, no YCbCr): where the device has
 	// RGFX_FEATURE_SURFACE_CACHE, the block that ask makes is cached (RgfxSurfaceCaches.hpp), and
-	// its header holds the surface's CPU generation at kRgfxSurfaceCpuGenOffset. A fifth output,
-	// where asked, is 1 where the block is cached, else 0.
+	// its header holds the surface's CPU generation at kRgfxSurfaceCpuGenOffset and its clients at
+	// kRgfxSurfaceClientsOffset. A fifth output, where asked, is 1 where the block is cached, else
+	// 0.
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
 	// once no process holds it, through its BLOCK_RELEASE.
@@ -187,8 +188,12 @@ enum {
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext
-// writes at each read-write CPU lock (the bundle's RgfxSurfaceHeader::cpuGen).
+// writes at each read-write CPU lock (the bundle's RgfxSurfaceHeader::cpuGen), and its clients,
+// a 32-bit count of the processes that hold the surface (IOSurface's client retain count), which
+// the kext writes as it caches the block, as a process holds the block again and as each client
+// goes; 0 where no count was written.
 enum {
+	kRgfxSurfaceClientsOffset = 12,
 	kRgfxSurfaceCpuGenOffset = 16,
 };
 
