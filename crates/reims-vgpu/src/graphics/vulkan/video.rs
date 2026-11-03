@@ -19,11 +19,15 @@
 //!   - On a GPU of its own memory, the surface's block has a device cache, which the guest's
 //!     video driver asks for (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`): the picture lands there, in the
 //!     runtime's buffer itself, and crosses the bus only at a CPU lock, as the cache's download.
-//!     The runtime shares its buffers with its own queues' families alone, so the copy runs on
-//!     the `VkQueue` of a runtime command queue of the decoders' own, which the runtime lends
-//!     for each submission ([`RuntimeQueue`]). Logical queues share `VkQueue`s, so the decoders
-//!     submit each copy there once the host sees its decode done, with no wait on the GPU that
-//!     would hold a guest's work behind the decode. Measured on an RTX 5080 Laptop GPU: a 4K
+//!     The runtime shares its buffers with its own queues' families alone, so the copy runs on a
+//!     queue of those families: the one the runtime reserves for the decoders
+//!     (`DeviceHandles::reserved_queues`, which the platform's options ask for), where no runtime
+//!     work runs, so each copy is submitted with its decode and waits for it on the GPU. On a
+//!     device with no queue to spare for it, the copy runs on the `VkQueue` of a runtime command
+//!     queue of the decoders' own, which the runtime lends for each submission
+//!     ([`RuntimeQueue`]). Logical queues share `VkQueue`s, so the decoders submit each copy
+//!     there once the host sees its decode done, with no wait on the GPU that would hold a
+//!     guest's work behind the decode. Measured on an RTX 5080 Laptop GPU: a 4K
 //!     picture lands there in 100 us of the GPU (1080p in 27), where the decode queue copies it
 //!     within the GPU's memory in 180 to 215, and into the pages across PCIe in 3.5 ms, as the
 //!     link idles down under a load of decodes alone; a CPU lock of the surface then downloads it
@@ -106,16 +110,18 @@ struct DeviceVideo {
     video: Arc<VideoDevice>,
     /// What it answers for each H.264 profile it decodes.
     h264: Vec<H264Capabilities>,
-    /// Whether the decoders copy pictures out on a runtime queue ([`RuntimeQueue`]), which
-    /// writes the runtime's buffers, an IOSurface's device cache among them.
+    /// Whether the decoders copy pictures out on a queue of the runtime's families (the
+    /// reserved queue, or a lent one: [`RuntimeQueue`]), which writes the runtime's buffers, an
+    /// IOSurface's device cache among them.
     caches: bool,
     /// The runtime's device, whose handles `video` uses.
     device: VulkanDevice,
 }
 
 /// The `VkQueue` of a runtime command queue of the decoders' own, which the decoders copy
-/// pictures out on, lent by the runtime for each submission (`CommandQueue::with_vk_queue`): of
-/// a family the runtime's buffers are shared with. No command buffer is made on this queue, but
+/// pictures out on where the device reserved no queue for them, lent by the runtime for each
+/// submission (`CommandQueue::with_vk_queue`): of a family the runtime's buffers are shared
+/// with. No command buffer is made on this queue, but
 /// logical queues share `VkQueue`s, so the runtime's work for the guest may run there too: each
 /// copy is submitted once the host sees its decode done, and waits for nothing on the GPU.
 struct RuntimeQueue {
@@ -153,14 +159,18 @@ impl DeviceVideo {
             log::info!("hardware video: the device does not enable {missing:?}");
             return None;
         }
-        // On a GPU of its own memory, a runtime queue for the copies out, which reach the
-        // runtime's buffers.
+        // On a GPU of its own memory, a queue of the runtime's families for the copies out,
+        // which reach the runtime's buffers: the reserved one, else a lent one.
         let unified = device
             .identity_caps()
             .flags
             .has_unified_memory
             .unwrap_or(false);
-        let lent = (!unified)
+        let reserved = (!unified)
+            .then(|| handles.reserved_queues.first())
+            .flatten()
+            .filter(|reserved| handles.queue_families.contains(&reserved.family));
+        let lent = (!unified && reserved.is_none())
             .then(|| match raw.new_command_queue() {
                 Ok(queue) => {
                     // SAFETY: the closure only reads the family; it submits nothing.
@@ -185,7 +195,7 @@ impl DeviceVideo {
             .ok()
             .and_then(|family| families.get(family))
             .is_some_and(|family| family.queue_flags.intersects(copies));
-        if lent.is_none() && !decode_copies {
+        if reserved.is_none() && lent.is_none() && !decode_copies {
             log::info!(
                 "hardware video: the video-decode family {} copies nothing, which a picture's \
                  landing in a surface's planes takes",
@@ -201,18 +211,26 @@ impl DeviceVideo {
             device: handles.device.clone(),
             decode_family: queue.family,
             decode_queue: queue.queue,
-            copy_family: queue.family,
-            copy_queue: queue.queue,
+            copy_family: reserved.map_or(queue.family, |reserved| reserved.family),
+            copy_queue: reserved.map_or(queue.queue, |reserved| reserved.queue),
             graphics_family: handles.queue_family,
             unified_image_layouts_video: false,
         };
-        let caches = lent.is_some();
-        let copy_family = lent.as_ref().map_or(queue.family, |lent| lent.family);
+        let caches = reserved.is_some() || lent.is_some();
+        let copy_queue = match (reserved, &lent) {
+            (Some(_), _) => "the reserved queue",
+            (None, Some(_)) => "a lent queue",
+            (None, None) => "the decode queue",
+        };
+        let copy_family = (reserved.map(|reserved| reserved.family))
+            .or(lent.as_ref().map(|lent| lent.family))
+            .unwrap_or(queue.family);
         // SAFETY: the handles are the runtime's device's, made as `RawDevice` says (the video
         // extensions and synchronization2 checked above, timeline semaphores the runtime's own
         // events use), and live while `device` holds the device, which outlives `video`; the
-        // decode queue is submitted to by `video`'s decoders alone, and a lent queue is the
-        // device's, of its family.
+        // decode queue and the reserved queue are submitted to by `video`'s decoders alone (the
+        // runtime never submits to either, and this device's one video makes the only decoders
+        // on them), and a lent queue is the device's, of its family.
         let video = unsafe {
             match lent {
                 Some(lent) => VideoDevice::from_raw_copying_on(
@@ -240,7 +258,7 @@ impl DeviceVideo {
         }
         log::info!(
             "hardware video: H.264 decode on {}, queue family {}, its pictures copied out on \
-             family {copy_family}",
+             {copy_queue}, family {copy_family}",
             video.name(),
             queue.family
         );

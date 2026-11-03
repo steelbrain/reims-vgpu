@@ -270,13 +270,24 @@ pub const VIDEO_DECODE_EXTENSIONS: [&std::ffi::CStr; 4] = [
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
 /// those below the least severity the log takes ([`crate::answer::least_severity`]), and a
 /// video-decode queue of the caller's, with the extensions its decodes use where the device has
-/// them ([`VIDEO_DECODE_EXTENSIONS`]). One set, so the runtime keeps one device per physical
-/// device across `open_device` and every other open.
+/// them ([`VIDEO_DECODE_EXTENSIONS`]), and one queue of the runtime's own families reserved for
+/// the caller. One set, so the runtime keeps one device per physical device across
+/// `open_device` and every other open.
 ///
 /// **The video-decode queue** is the reims-graphics device's hardware video's (reims-vgpu's
 /// `platform::vulkan::graphics_video`), which alone submits to it. A device without a
 /// video-decode family is made all the same, with no such queue, and so is one without the
 /// extensions.
+///
+/// **The reserved queue** is that video's too: it copies decoded pictures out into the
+/// runtime's buffers there, an IOSurface's device cache among them, waiting for each decode on
+/// the GPU, since no runtime work ever runs on it. The runtime takes it off the end of its
+/// round robin, past the queues presenting keeps: on a device whose graphics family has no
+/// queue to spare (MoltenVK's, lavapipe's, a Radeon's single graphics queue) it reserves none,
+/// says so once at info level, and the copies go on a runtime command queue's `VkQueue`
+/// instead. The options are one set for every device, so a device without a video-decode
+/// family that has one to spare reserves it all the same, unused: measured on an RTX 5080
+/// Laptop GPU, whose graphics family has 16 queues, the round robin goes from 14 to 13.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
@@ -340,6 +351,7 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
         options.extra_queues = vec![ash::vk::QueueFlags::VIDEO_DECODE_KHR];
+        options.reserved_queues = 1;
         options.optional_device_extensions = (VIDEO_DECODE_EXTENSIONS.iter())
             .map(|&name| name.to_owned())
             .collect();

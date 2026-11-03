@@ -64,9 +64,12 @@ them. A device handed over decodes H.264 alone (`VideoDevice::from_raw`),
 or the codecs its owner enabled (`VideoDevice::from_raw_with_codecs`),
 copying out on the copy queue it names, or on a queue of the owner's that
 the owner lends for each submission (`VideoDevice::from_raw_copying_on`,
-a `LentQueue`): reims-vgpu lends a metal2vulkan command queue's, whose
+a `LentQueue`). On a GPU of its own memory, reims-vgpu names the queue
+metal2vulkan reserves for it (`DeviceOptions::reserved_queues`), of a
 family the runtime's buffers, an IOSurface's device cache among them, are
-shared with;
+shared with, which no runtime work runs on; on a device with no queue to
+spare (a Radeon's single graphics queue) it lends a metal2vulkan command
+queue's, of such a family;
 `h265_capabilities` answers nothing for a device without H.265. Where no
 device decodes H.264 it says why, device by device (on a Mac: the loader is not found,
 or MoltenVK has no video queue).
