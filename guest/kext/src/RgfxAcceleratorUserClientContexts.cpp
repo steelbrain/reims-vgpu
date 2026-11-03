@@ -237,7 +237,13 @@ static bool lastLibraryChunk(const UInt8 *message, UInt64 size)
 // a library create's or lookup's COMPLETE, an argument layout's COMPLETE.
 IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 {
-	if (!hasContext || a->scalarOutputCount != 1)
+	// The context as it is now, read under the queue lock that releaseContext closes it under,
+	// to tell after the post whether it closed meanwhile (rgfxSubmitDestroysBehind).
+	IOLockLock(queueLock);
+	const bool open = hasContext;
+	const UInt32 ctx = context;
+	IOLockUnlock(queueLock);
+	if (!open || a->scalarOutputCount != 1)
 		return kIOReturnBadArgument;
 	IOMemoryDescriptor *desc = a->structureInputDescriptor;
 	UInt64 size = desc ? desc->getLength() : a->structureInputSize;
@@ -265,7 +271,7 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	// Creates and destroys of the client's own objects only: QUEUE_CREATE goes through its own
 	// selector (its rings are checked), CONTEXT_CLOSE is the kext's (RgfxSubmitGate.hpp).
 	if (r == kIOReturnSuccess &&
-	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context))
+	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx))
 		r = kIOReturnBadArgument;
 	// An OBJECT_DESTROY of one of the client's command queues is the one accepted message that
 	// changes the kext's own tracking: the kext watches the queue's completion ring and lists it.
@@ -313,17 +319,23 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
 	UInt32 replyLength = 0;
 	UInt64 seqno = 0;
-	if (r == kIOReturnSuccess)
+	const bool checked = r == kIOReturnSuccess;
+	if (checked)
 		r = owner->postLifecycle(type, message, static_cast<UInt32>(size), replyType, reply,
 		                         sizeof(reply), &replyLength, &seqno, kReflectionMs);
 	IOFree(message, size);
-	const bool makes = type != RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN &&
-	                   type != RGFX_CMD_ARGUMENT_LAYOUT;
-	if (r == kIOReturnTimeout && makes) {
-		// Posted, but not answered in time: the client takes the create as failed, and may make
-		// it again under a new id. Destroy this one, so the device keeps nothing of it: the
-		// destroy follows the create on the ring, and cancels it where it is still being made.
-		// A query (a heap texture size, an argument layout) makes nothing, so nothing follows it.
+	// Posted where postLifecycle answered or timed out waiting for the answer. Whether the context
+	// closed since the check: its CONTEXT_CLOSE may then have gone before this create, which the
+	// device's close then never dropped.
+	const bool posted = checked && (r == kIOReturnSuccess || r == kIOReturnTimeout);
+	IOLockLock(queueLock);
+	const bool closedSince = !hasContext || context != ctx;
+	IOLockUnlock(queueLock);
+	if (rgfxSubmitDestroysBehind(type, posted, r == kIOReturnTimeout, closedSince)) {
+		// Not answered in time (the client takes the create as failed, and may make it again
+		// under a new id), or made for a context that has closed: destroy it, so the device keeps
+		// nothing of it. The destroy follows the create on the ring, and cancels it where it is
+		// still being made. A query or a write into an object makes nothing, so nothing follows.
 		RgfxObjectDestroy destroy = {};
 		destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
 		destroy.obj_id = objId;

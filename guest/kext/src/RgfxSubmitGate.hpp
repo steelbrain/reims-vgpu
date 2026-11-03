@@ -17,6 +17,11 @@
 // type that touches kext-tracked state, its entry here (and submit_gate_test) is where it is
 // caught.
 //
+// Submit takes no lock across its post (a pipeline create waits up to a minute for its answer),
+// so a thread in a submit may post its create after another thread's close of the client posted
+// the context's CONTEXT_CLOSE, which the device answers having dropped every object of the
+// context then. rgfxSubmitDestroysBehind says when the submit follows its create with a destroy.
+//
 // Header-only and free of the kernel's headers, so its native test (tests/submit_gate_test.cpp)
 // builds it as the kext does.
 //
@@ -39,6 +44,55 @@ inline bool rgfxSubmitAdmitted(uint32_t type)
 inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 {
 	return type == RGFX_CMD_OBJECT_DESTROY;
+}
+
+// Whether a message of an accepted `type` makes a host object under its obj_id, which an
+// OBJECT_DESTROY of that id drops. The destroy, the queries (a heap texture's size, an argument
+// layout) and the writes into an object already made (a Managed range or region, a shared
+// event's value) make none. A type the wire does not name makes none: the device refuses it.
+inline bool rgfxSubmitMakes(uint32_t type)
+{
+	switch (type) {
+	case RGFX_CMD_HEAP_CREATE:
+	case RGFX_CMD_HEAP_OVER_HOST_MEMORY:
+	case RGFX_CMD_BUFFER_CREATE:
+	case RGFX_CMD_BUFFER_OVER_HOST_MEMORY:
+	case RGFX_CMD_BUFFER_AT_OFFSET:
+	case RGFX_CMD_TEXTURE_CREATE:
+	case RGFX_CMD_TEXTURE_FROM_BUFFER:
+	case RGFX_CMD_TEXTURE_FROM_IOSURFACE:
+	case RGFX_CMD_SAMPLER_CREATE:
+	case RGFX_CMD_DEPTH_STENCIL_CREATE:
+	case RGFX_CMD_LIBRARY_CREATE:
+	case RGFX_CMD_RENDER_PIPELINE_CREATE:
+	case RGFX_CMD_COMPUTE_PIPELINE_CREATE:
+	case RGFX_CMD_EVENT_CREATE:
+	case RGFX_CMD_SHARED_EVENT_CREATE:
+	case RGFX_CMD_FENCE_CREATE:
+	case RGFX_CMD_LIBRARY_FROM_REGION:
+	case RGFX_CMD_LIBRARY_LOOKUP:
+	case RGFX_CMD_MANAGED_TEXTURE_CREATE:
+	case RGFX_CMD_TEXTURE_VIEW:
+	case RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER:
+	case RGFX_CMD_BUFFER_OVER_SURFACE_PAGES:
+	case RGFX_CMD_VIDEO_SESSION_CREATE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// Whether a submitted message of `type`, `posted` on the control ring, must be followed by an
+// OBJECT_DESTROY of its obj_id, so the device keeps nothing of it: where it makes an object
+// (rgfxSubmitMakes) and either its answer did not come in time (`timedOut`: the client takes the
+// create as failed and may make it again under a new id), or the client's context closed between
+// the submit's check and now (`closedSince`): a create posted after its context's CONTEXT_CLOSE
+// is one the device's close never dropped. The destroy follows the create on the ring, which the
+// device carries out in order, and context ids are never reused, so it drops that object alone;
+// where the create came before the close after all, it finds nothing, which is no error.
+inline bool rgfxSubmitDestroysBehind(uint32_t type, bool posted, bool timedOut, bool closedSince)
+{
+	return posted && rgfxSubmitMakes(type) && (timedOut || closedSince);
 }
 
 #endif // RGFX_SUBMIT_GATE_HPP_
