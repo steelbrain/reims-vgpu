@@ -24,9 +24,11 @@
 #
 #   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
-# (after each gate). Its tip is the oldest probe's that is published. It takes the probes for that
-# tip oldest first while their budgets fit the hold (those for other published tips wait for their
-# own round; --tip SHA picks the round's tip, a published one), boots the tip once through msi-boot.sh (an exclusive request: the GPU alone, in the
+# (after each gate). Its tip is the newest published one (published-last) where a probe waits for
+# it, else the oldest probe's that is still published. It takes the probes for that tip oldest
+# first while their budgets fit the hold (those for other published tips wait for their own round;
+# --tip SHA picks the round's tip, a published one), boots the tip once through msi-boot.sh (an
+# exclusive request: the GPU alone, in the
 # host's turnstile, the host quiet; the gate's one request on the host while it runs), waits for
 # the host's load to settle under 4, runs them back to back and powers the guest off. --capture
 # also captures the boot as the gate's --capture-boot does (msi-boot.sh's CAPTURE: its scanout,
@@ -111,13 +113,19 @@ published() {  # TIP: its published short name, or nothing
   (( ${#t} >= 9 )) || { [[ -n $t && $PUB == "$t"* ]] && echo "$SHORT"; return; }
   grep -x -F "${t:0:9}" <<< "$pubs" || { [[ ${t:0:9} == "$SHORT" ]] && echo "$SHORT"; } || true
 }
-# The round's tip: the oldest probe's that is published.
+# The round's tip: the newest published one where a probe waits for it, else the oldest probe's
+# that is still published.
 RT=
 while read -r age budget tip name; do
-  [[ -n ${name:-} ]] || continue
-  RT=$(published "${tip:-}")
-  [[ -n $RT ]] && break
+  [[ -n ${name:-} && $(published "${tip:-}") == "$SHORT" ]] && { RT=$SHORT; break; }
 done <<< "$queue"
+if [[ -z $RT ]]; then
+  while read -r age budget tip name; do
+    [[ -n ${name:-} ]] || continue
+    RT=$(published "${tip:-}")
+    [[ -n $RT ]] && break
+  done <<< "$queue"
+fi
 RT=${RT:-$SHORT}
 if [[ -n $want_tip ]]; then
   RT=$(published "$want_tip")
