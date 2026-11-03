@@ -65,6 +65,28 @@ from a 20 s run (`-m 20 -v`) in each lane, with repetitions split by the per-sec
 - `frag.fill.2160p`: 156 of 161 and 159 of 160 (~2770 MHz);
 - `frag.alu.1080p`: mostly before the ramp in both lanes, so it is a low-clock number.
 
+The hold is the driver's P4 state. Measured 2026-11-03 with nvidia-smi sampling every 100 ms on
+the host, and its 1 s samples during the boots above:
+- **What P4 is.** Core at 1222 to 1447 MHz, memory at 9001 MHz and 31 to 55 W, with the SM 98 to
+  100% busy. P0 runs the core at 2767 to 2805 MHz and memory at 14001 MHz, at 107 to 120 W.
+- **What started it.** In a cold start sampled every 100 ms, the hold began 0.5 s after a
+  136.65 W spike over the part's 115 W cap, which nvidia-smi gave the "SW power cap" reason. It
+  lasted 6 s at 99 to 100% use before the driver went to P0. In the boots it lasted 1 to 8 s.
+- **No VM is needed.** That cold start was a host process with no VM. It ran the frame cases on
+  the Vulkan platform and made their targets as the decoder makes a guest's.
+- **What P4 costs.**
+  - `frag.fill.2160p` runs 125 to 134 Gpix/s in P4 and 255 at P0.
+  - `frag.alu.2160p` runs 256 to 303 fps in P4 and 485 to 493 at P0.
+  - Fill at P0 was the same whatever the target's image: fresh or recycled, at any offset in a
+    pooled block, in a block of its own, or without the usages the runtime adds where they are
+    free.
+- **What a 3 s case shows.**
+  - A case of 3 s (`-m 3`) lands in either state, depending on whether the hold has ended.
+  - In the boots that ran the three frame cases in a row for 3 s each, the `frag.alu` cases ran
+    at P4's rates in every sample. `frag.fill.2160p` landed in either state.
+  - Both lanes show it: ours at 132.76 (P4 throughout), 134.23 (P4 for 8 s) and 255.63 Gpix/s
+    (P0); paravirt at 257 (P4 for 1 s), 133.67 (P4 for 8 s) and 255.
+
 ## Results
 
 Higher is better everywhere. Ratios are ours over paravirt. QEMU CPU, SM and clock are the
