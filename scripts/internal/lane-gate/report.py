@@ -5,6 +5,8 @@ with a baseline, and writes results.json and report.txt into the run.
     report.py RUN [--baseline DIR] [--noise FILE] [--history FILE]
     report.py --record RUN BASELINES          adds RUN as a sample of its commit's baseline
     report.py --noise-from BASELINES FILE     the noise band from every baseline with 2+ samples
+    report.py --reidle BASELINES RUN...       RUN's recorded qemu_cpu.idle read from 2 s into the
+                                              phase (runs from before the guest settled it)
 
 A run's directory holds:
   steps/NAME.ok | NAME.fail     each step's result (the first line: its seconds), NAME.log
@@ -143,8 +145,9 @@ def local_epoch(stamp):
 
 
 class Run:
-    def __init__(self, path):
+    def __init__(self, path, idle_skip_s=0):
         self.path = path
+        self.idle_skip_s = idle_skip_s
         self.items = {}
         self.metrics = {}
         self.meta = json.loads(read(os.path.join(path, "meta.json"), "{}"))
@@ -538,6 +541,10 @@ class Run:
         for name, (a, b) in getattr(self, "phases", {}).items():
             if a is None or b is None or b - a < 1:
                 continue
+            # A run from before the guest settled its idle phase (guest-run.sh, IDLE_SETTLE_S)
+            # counted the phase before's teardown in its first second: --reidle reads it from 2 s.
+            if name == "idle":
+                a += self.idle_skip_s
             n = sum(1 for u in updates if a <= u <= b)
             self.lmetric("composites_s." + name, round(n / (b - a), 2))
             inside = [c for c in cpu if a <= c[0] <= b]
@@ -1011,6 +1018,25 @@ def main(argv):
         with open(os.path.join(d, res["meta"]["runid"] + ".json"), "w") as f:
             json.dump(res, f, indent=1, sort_keys=True)
         print(f"recorded {res['meta']['runid']} as a sample of baseline {sha[:12]}")
+        return 0
+    if argv[:1] == ["--reidle"]:
+        # report.py --reidle BASELINES RUN...: each RUN's recorded sample with qemu_cpu.idle read
+        # from 2 s into the phase, as a run whose guest settled before it (guest-run.sh) reads it.
+        root = argv[1]
+        for path in argv[2:]:
+            run = Run(path, idle_skip_s=2).parse()
+            sha, runid = run.meta["sha"], run.meta["runid"]
+            p = os.path.join(root, sha, "runs", runid + ".json")
+            sample = json.loads(read(p, "{}") or "{}")
+            if "qemu_cpu.idle" not in run.metrics or "metrics" not in sample:
+                print(f"{runid}: no idle phase or no recorded sample, left as it was")
+                continue
+            was = sample["metrics"].get("qemu_cpu.idle")
+            sample["metrics"]["qemu_cpu.idle"] = run.metrics["qemu_cpu.idle"]
+            with open(p + ".new", "w") as f:
+                json.dump(sample, f, indent=1, sort_keys=True)
+            os.replace(p + ".new", p)
+            print(f"{runid}: qemu_cpu.idle {was} -> {run.metrics['qemu_cpu.idle']} (from 2 s into the phase)")
         return 0
     if argv[:1] == ["--noise-from"]:
         dev = noise_from(argv[1])

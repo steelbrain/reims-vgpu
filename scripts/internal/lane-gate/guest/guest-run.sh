@@ -26,6 +26,8 @@ D=${1:?usage: guest-run.sh DIR [PHASE...]}
 shift
 cd "$D" || exit 2
 PHASES=${*:-info idle bench present sweep decode webgl final}
+# The seconds the guest waits before its idle phase opens (the phase loop, below).
+IDLE_SETTLE_S=2
 : "${GATE_PASS:?GATE_PASS must hold the password of the user}"
 ME=$(id -un) UIDN=$(id -u)
 
@@ -295,6 +297,9 @@ run_final() {
 }
 
 for p in $PHASES; do
+	# The idle phase opens once the phase before it has settled: an app that ended (present_probe's
+	# teardown) takes 77-145% of a CPU for about a second after, which the idle window would count.
+	[ "$p" = idle ] && sleep "$IDLE_SETTLE_S"
 	phase "$p" start
 	"run_$p"
 	phase "$p" end
