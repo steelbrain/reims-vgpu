@@ -36,8 +36,8 @@
 #   hang/           where it failed and the guest's SSH no longer answers: msi-hang.py's snapshot
 #                   of the guest, taken before QEMU is stopped (QEMU's threads, every vCPU's
 #                   registers and stack, the scanout; the scanout alone where the hang catcher
-#                   below took the rest); the probes after it are not reached (they go back to
-#                   the queue)
+#                   below took the rest); unless the guest answers again within 3 minutes (it
+#                   restarted), the probes after it are not reached (they go back to the queue)
 # The hang catcher (HANG_CATCH, default ~/.cache/s1-hang-msi/hang-catch.py, where it is there)
 # watches the boot while the probes run and writes R/hang/ (watch.txt, guest-info.txt, catch-N/ at
 # a hang: its docstring says what); the round waits for a catch it started before QEMU stops.
@@ -214,11 +214,20 @@ for p in $(in_order); do
     awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f\n", b - a }' > "$out/wall_s"
     # A probe that failed where the guest's SSH no longer answers: the guest's state, now.
     if [[ $(cat "$out/rc") != 0 && -z ${FAKE_GUEST:-} ]] && ! alive && ! alive; then
-      hung=$name
       log "$name: the guest's SSH no longer answers: the hang snapshot"
       catch_wait 45
       python3 -I "$(dirname "$0")/msi-hang.py" "${QEMU_PID:-0}" "$B" "$out/hang" "$([[ -n $HC ]] && echo scanout)" > /dev/null 2>&1
       sed 's/^/  hang: /' "$out/hang/hang.log" 2> /dev/null
+      # A guest that panicked restarts and answers again (about 2 minutes): the probes go on in
+      # it. One that does not stays hung, and the probes after it are not reached.
+      back=0
+      for (( k = 0; k < 18; k++ )); do alive && { back=1; break; }; sleep 10; done
+      if ((back)); then
+        log "$name: the guest answers again (restarted): the probes go on"
+      else
+        hung=$name
+        log "$name: the guest still does not answer: the probes after it are not reached"
+      fi
     else
       G "test -d ~/probes/$name/out" 2> /dev/null && Gget "probes/$name/out" "$out/out" 2> /dev/null
     fi
