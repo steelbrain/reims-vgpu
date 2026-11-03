@@ -1,7 +1,7 @@
 // submit_probe: the fixed cost and the latency of a command buffer on a Metal device, and of a
 // shared event's signal, to compare a guest's GPU lane with real Macs. No shaders: a "tiny"
 // command buffer is one blit filling 16 bytes of a Shared buffer, an "empty" one has no encoder.
-//   submit_probe [-d NAME] [-t SECONDS] [-g MICROSECONDS] [-n THREADS] [-v] [-l] [CASE...]
+//   submit_probe [-d NAME] [-t SECONDS] [-g MICROSECONDS] [-n THREADS] [-q QUEUES] [-v] [-l] [CASE...]
 //     -d NAME   the first of MTLCopyAllDevices whose name holds NAME; the default is
 //               MTLCreateSystemDefaultDevice (on a dual-GPU MacBook pass -d, which keeps the
 //               display where it is).
@@ -9,6 +9,8 @@
 //     -g US     the idle gap before each command buffer of the .idle cases and before each
 //               signal of the event cases (default 2000).
 //     -n MAX    the most threads of the mt cases (default 8; they run 2, 4 and 8, up to MAX).
+//     -q N      makes N more queues first, each with one command buffer run through it, and keeps
+//               them idle for the whole run: what a device with many quiet queues costs the cases.
 //     -v        two more lines a case: "# top" with the 8 largest samples of its first
 //               distribution (each with when it was taken, seconds into the case, and the
 //               wall-clock time), and "# hist" with its log2 histogram in microseconds.
@@ -73,6 +75,7 @@ static NSArray<NSString *> *gPatterns;
 static double gSeconds = 3;
 static double gGapUs = 2000;
 static int gMaxThreads = 8;
+static int gIdleQueues;
 static BOOL gVerbose;
 static double gNsPerTick;
 
@@ -858,6 +861,8 @@ int main(int argc, char **argv)
 				gGapUs = atof(argv[++i]);
 			else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc)
 				gMaxThreads = atoi(argv[++i]);
+			else if (strcmp(argv[i], "-q") == 0 && i + 1 < argc)
+				gIdleQueues = atoi(argv[++i]);
 			else if (strcmp(argv[i], "-l") == 0)
 				list = YES;
 			else if (strcmp(argv[i], "-v") == 0)
@@ -904,6 +909,24 @@ int main(int argc, char **argv)
 		       gSeconds, gGapUs);
 		pthread_t t;
 		pthread_create(&t, NULL, watchdog, NULL);
+		NSMutableArray<id<MTLCommandQueue>> *idle = [NSMutableArray array];
+		if (gIdleQueues > 0) {
+			id<MTLBuffer> buf = newShared();
+			double q0 = nowUs();
+			for (int i = 0; i < gIdleQueues; i++) {
+				@autoreleasepool {
+					id<MTLCommandQueue> q = [gDevice newCommandQueue];
+					if (q == nil)
+						break;
+					[idle addObject:q];
+					id<MTLCommandBuffer> cb = makeBuffer(q, buf, YES, i);
+					[cb commit];
+					[cb waitUntilCompleted];
+				}
+			}
+			printf("submit_probe: %lu idle queues made in %.0f ms\n", (unsigned long)idle.count,
+			       (nowUs() - q0) / 1e3);
+		}
 
 		runCase(@"rate.commit.empty", ^{ return commitRate(NO); });
 		runCase(@"rate.commit.tiny", ^{ return commitRate(YES); });
