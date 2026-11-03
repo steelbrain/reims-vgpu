@@ -863,7 +863,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let take = take(ops);
         // Each block it uses as its `SURFACE_PAGES` left it ([`super::surface_pages`]).
         for u in &take.uses {
-            self.shared.unsettled.wait(u.block_offset);
+            self.settle_surface(u.block_offset);
         }
         let (used, fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts

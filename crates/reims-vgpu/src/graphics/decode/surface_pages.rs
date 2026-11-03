@@ -766,13 +766,35 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Result<(), super::DecodeError>> {
+        let clock = self.platform.clock();
+        let start = clock.now_mono();
+        let made = self.over_surface_pages(device, message);
+        if let Some(m) = super::read::<RgfxBufferOverSurfacePages>(message) {
+            log::debug!(
+                target: "reims_vgpu::graphics::surface_pages",
+                "BUFFER_OVER_SURFACE_PAGES of the block at {:#x} ({:#x} bytes): {} in {} us",
+                m.block_offset,
+                m.length,
+                if matches!(made, Ok(Ok(()))) { "made" } else { "not made" },
+                clock.now_mono().saturating_duration_since(start).as_micros()
+            );
+        }
+        made
+    }
+
+    /// [`Self::buffer_over_surface_pages`], untimed.
+    fn over_surface_pages(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), super::DecodeError>> {
         let Some(m) = super::read::<RgfxBufferOverSurfacePages>(message) else {
             return Ok(Err(super::DecodeError::Malformed));
         };
         if !self.in_own_block(m.block_offset, m.block_size) {
             return Ok(Err(super::DecodeError::BadReference));
         }
-        self.shared.unsettled.wait(m.block_offset);
+        self.settle_surface(m.block_offset);
         let Some(view) = self.shared.surface_views.lock().view_for(&m) else {
             return Ok(Err(super::DecodeError::Refused));
         };
@@ -813,7 +835,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             return Ok(Err(super::DecodeError::BadReference));
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
-        self.shared.unsettled.wait(m.block_offset);
+        self.settle_surface(m.block_offset);
         let view = (self.shared.surface_views.lock()).private_view(
             device,
             m.block_offset,
@@ -857,7 +879,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             return Ok(Err(super::DecodeError::BadReference));
         }
         // Its block's `SURFACE_PAGES` is carried out on the surface worker.
-        self.shared.unsettled.wait(m.block_offset);
+        self.settle_surface(m.block_offset);
         let ram = (self.shared.surface_views.lock()).private_ram(
             m.block_offset,
             m.block_size,

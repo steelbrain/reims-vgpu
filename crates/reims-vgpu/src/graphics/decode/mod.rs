@@ -935,7 +935,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        self.shared.unsettled.wait(block);
+        self.settle_surface(block);
         self.surface_caches.download(device, block, done, failed);
     }
 
@@ -954,7 +954,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        self.shared.unsettled.wait(offset);
+        self.settle_surface(offset);
         let gone = self.shared.surface_views.lock().released(offset);
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, gone);
@@ -983,7 +983,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         });
         match block {
             Some(block) => {
-                self.shared.unsettled.wait(block);
+                self.settle_surface(block);
                 self.surface_caches.fill_now(device, block, generation)
             }
             None => Ok(None),
@@ -1220,8 +1220,25 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Waits for the block at `block` to be as its `SURFACE_PAGES` left it, where one is being
     /// carried out ([`worker::Unsettled`]); true.
     pub(crate) fn surface_settled(&self, block: u64) -> bool {
-        self.shared.unsettled.wait(block);
+        self.settle_surface(block);
         true
+    }
+
+    /// Waits for the block at `block` to be as its `SURFACE_PAGES` left it, where the surface
+    /// worker is still carrying one out ([`worker::Unsettled`]), and logs the wait: the guest's
+    /// kext names a block only once it is answered, so a wait is a message the guest posted before.
+    fn settle_surface(&self, block: u64) {
+        if !self.shared.unsettled.any(std::iter::once(block)) {
+            return;
+        }
+        let clock = self.platform.clock();
+        let start = clock.now_mono();
+        self.shared.unsettled.wait(block);
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "a message naming the block at {block:#x} waited {} us for its SURFACE_PAGES",
+            clock.now_mono().saturating_duration_since(start).as_micros()
+        );
     }
 
     /// The surface worker (for the tests).
@@ -2002,7 +2019,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 let span = self.span_of(m.buffer_obj_id);
                 if let Some((at, _)) = span {
-                    self.shared.unsettled.wait(at);
+                    self.settle_surface(at);
                 }
                 // Over a device cache, a Private buffer, the texture is Private too, as Metal
                 // makes a texture over a buffer in the buffer's storage mode; the guest's own
