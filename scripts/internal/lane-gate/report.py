@@ -64,7 +64,7 @@ GATED = [
     (r"decode\.[a-z0-9]+\.[A-Za-z0-9._-]+\.fps", 1, 0.08),
     (r"webgl\.raf_fps", 1, 0.03),
     (r"composites_s\.present\.fullscreen", 1, 0.05),
-    (r"qemu_cpu\.(idle|present\.fullscreen)", -1, 0.25),
+    (r"qemu_cpu\.(idle|present\.fullscreen|webgl)", -1, 0.25),
     (r"drag\.(plain|glass)\.composites_s", 1, 0.10),
 ]
 NOISE_K = 2.0
