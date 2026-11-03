@@ -9,10 +9,12 @@
 //!   libraries the records name), once, in the order first made. The file is appended to and
 //!   never rewritten; past [`CAPACITY`] bytes nothing more is appended.
 //! - **Warmed.** Each device the process adopts hands the file's records to the runtime's
-//!   `Device::warm` ([`warm`]), from a thread of its own (`reims-vgpu-warm`), which reads the
-//!   file, so the device's open waits for no read. The runtime's pass makes their translations
-//!   and driver records on a thread of the device's, its makings below every other making of the
-//!   process, and changes no answer: no state, identifier or resource ID the guest sees. So a
+//!   `Device::warm` ([`warm`]), with an explicit budget ([`WARM_BUDGET`]), from a thread of its
+//!   own (`reims-vgpu-warm`), which reads the file, so the device's open waits for no read. The
+//!   runtime's pass makes their translations and driver records on a thread of the device's, its
+//!   makings below every other making of the process, and changes no answer: no state,
+//!   identifier or resource ID the guest sees. Once the pass's counts reach the records handed
+//!   (`Device::warm_statistics`), one info line says what became of them ([`summary`]). So a
 //!   guest's first creations of the states an earlier process made find them made, after a host
 //!   restart, and after an update of the runtime, whose translations of the earlier build's the
 //!   shader cache keeps apart (a record holds a descriptor, never a translation).
@@ -45,6 +47,9 @@ pub(crate) const CAPACITY: u64 = 64 << 20;
 /// The driver's pipeline cache data one warm pass may add, in bytes (`Device::warm`'s budget):
 /// more than a macOS guest's login and built-in apps make, so the pass reaches every record.
 pub(crate) const WARM_BUDGET: u64 = 4 << 30;
+
+/// How often the warm thread looks whether the runtime's pass has ended.
+const WARM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The start of each frame of the records file.
 pub(crate) const MAGIC: u32 = u32::from_le_bytes(*b"RVGR");
@@ -218,8 +223,53 @@ pub(crate) fn warm(device: &rt::Device, path: PathBuf) {
                 records.len(),
                 path.display()
             );
+            let handed = records.len() as u64;
             device.warm(records, WARM_BUDGET);
+            // The pass runs on the runtime's thread and says nothing when it ends: its counts
+            // reach the records handed then. The device lives as long as the process
+            // (`gpu::device::adopt` keeps it), so holding it here holds nothing longer.
+            let mut polls = 0u64;
+            loop {
+                let statistics = device.warm_statistics();
+                if let Some(line) = summary(&statistics, handed) {
+                    log::info!(
+                        target: "reims_vgpu_vulkan::records",
+                        "{line}, within {:.2} s",
+                        (polls * WARM_POLL.as_millis() as u64) as f64 / 1000.0
+                    );
+                    return;
+                }
+                polls += 1;
+                std::thread::sleep(WARM_POLL);
+            }
         });
+}
+
+/// What a warm pass of `handed` records made of them, once its counts add up to them (each record
+/// warmed, translated only, failed, unread, not warmable or not run, by `statistics`); `None`
+/// while the pass runs.
+pub(crate) fn summary(statistics: &rt::WarmStatistics, handed: u64) -> Option<String> {
+    let s = statistics;
+    let ended = s.records_warmed
+        + s.records_translated
+        + s.records_failed
+        + s.records_unread
+        + s.records_not_warmable
+        + s.records_not_run;
+    (ended >= handed).then(|| {
+        format!(
+            "warmed {handed} pipeline records: {} made, {} translated only, {} failed, {} unread, \
+             {} not warmable, {} not run (the budget spent or the process ending); {} bytes of \
+             driver pipeline data added",
+            s.records_warmed,
+            s.records_translated,
+            s.records_failed,
+            s.records_unread,
+            s.records_not_warmable,
+            s.records_not_run,
+            s.pipeline_bytes
+        )
+    })
 }
 
 #[cfg(test)]
@@ -246,6 +296,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The pass's line comes once every record handed is counted, and names each count
+    #[test]
+    fn the_pass_is_summed_up_once_every_record_is_counted() {
+        let mut s = rt::WarmStatistics::default();
+        s.records_warmed = 300;
+        s.records_translated = 2;
+        s.records_unread = 1;
+        assert_eq!(summary(&s, 312), None);
+        s.records_failed = 4;
+        s.records_not_warmable = 1;
+        s.records_not_run = 4;
+        s.pipeline_bytes = 1 << 20;
+        let line = summary(&s, 312).unwrap();
+        assert_eq!(
+            line,
+            "warmed 312 pipeline records: 300 made, 2 translated only, 4 failed, 1 unread, 1 not \
+             warmable, 4 not run (the budget spent or the process ending); 1048576 bytes of \
+             driver pipeline data added"
+        );
     }
 
     /// The records file lies beside the hosts' shader cache directory, under `HOME`, not in it:
