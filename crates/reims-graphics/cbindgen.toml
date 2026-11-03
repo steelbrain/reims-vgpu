@@ -254,6 +254,7 @@ include = [
     "RgfxRenderPassDesc",
     "RgfxRenderPassSamplePositions",
     "RgfxRenderPassStencilAttachment",
+    "RgfxRenderPassVisibility",
     "RgfxRenderPipelineCreate",
     "RgfxResourceBinding",
     "RgfxResourceIdChunk",

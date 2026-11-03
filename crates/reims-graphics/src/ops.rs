@@ -68,7 +68,8 @@ pub const RGFX_OP_GROUP_VIDEO: u16 = 0x4;
 
 /// Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
 /// describes (an [`RgfxRenderPassDesc`] then its `color_count`
-/// [`RgfxRenderPassColorAttachment`] records). Holds the encoder until
+/// [`RgfxRenderPassColorAttachment`] records, then the [`RgfxRenderPassSamplePositions`] and
+/// the [`RgfxRenderPassVisibility`] its flags name, in that order). Holds the encoder until
 /// [`RGFX_OP_ENCODER_END`].
 pub const RGFX_OP_ENCODER_BEGIN_RENDER: u16 = 0x0001;
 /// Op `ENCODER_BEGIN_COMPUTE`: open a compute encoder for the pass the op's body
@@ -258,6 +259,12 @@ pub const RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT: u32 = 1 << 2;
 pub const RGFX_PASS_FLAG_SAMPLE_POSITIONS: u32 = 1 << 3;
 /// The most sample positions a pass holds: Metal's largest sample count.
 pub const RGFX_PASS_MAX_SAMPLE_POSITIONS: u32 = 16;
+/// A pass's visibility result buffer (`visibilityResultBuffer`) and its
+/// `visibilityResultType` follow its colour attachment records and its sample positions, as one
+/// [`RgfxRenderPassVisibility`]. A host that does not know the flag takes the pass without the
+/// buffer, so its `setVisibilityResultMode:offset:` of a mode fails the command buffer, as
+/// before the flag.
+pub const RGFX_PASS_FLAG_VISIBILITY_RESULT: u32 = 1 << 4;
 
 /// One colour attachment of a render pass (`colorAttachments[i]`). Absent (sets
 /// nothing) when `texture_obj_id` is 0.
@@ -414,6 +421,23 @@ pub struct RgfxRenderPassSamplePositions {
     pub position_bits: [[u32; 2]; RGFX_PASS_MAX_SAMPLE_POSITIONS as usize],
 }
 
+/// A pass's visibility result buffer, after its colour attachment records and its sample
+/// positions where the pass's flags hold [`RGFX_PASS_FLAG_VISIBILITY_RESULT`].
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxRenderPassVisibility {
+    /// The buffer each `setVisibilityResultMode:offset:` of a mode writes its 64-bit result
+    /// into, at its offset: a buffer of the sender's.
+    pub buffer_obj_id: u64,
+    /// `MTLVisibilityResultType` (`visibilityResultType`, macOS 26): 0 `Reset`, 1 `Accumulate`;
+    /// the host refuses any other value.
+    pub result_type: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_0c: u32,
+}
+
 /// The body of an `ENCODER_BEGIN_COMPUTE` op: the compute pass's properties.
 #[repr(C)]
 #[derive(
@@ -455,6 +479,7 @@ const _: () = {
     assert!(size_of::<RgfxRenderPassDesc>() == 152);
     assert!(RGFX_RENDER_PASS_COLOR_OFFSET as usize == size_of::<RgfxRenderPassDesc>());
     assert!(size_of::<RgfxRenderPassSamplePositions>() == 136);
+    assert!(size_of::<RgfxRenderPassVisibility>() == 16);
     assert!(size_of::<RgfxComputePassDesc>() == 8);
     assert!(size_of::<RgfxOpEvent>() == 16);
     assert!(size_of::<RgfxOpSurfaceUse>() == 24);
@@ -554,6 +579,16 @@ mod tests {
         assert_eq!(
             RgfxRenderPassColorAttachment::read_from_bytes(color.as_bytes()).unwrap(),
             color
+        );
+
+        let visibility = RgfxRenderPassVisibility {
+            buffer_obj_id: 9,
+            result_type: 1,
+            reserved_0c: 0,
+        };
+        assert_eq!(
+            RgfxRenderPassVisibility::read_from_bytes(visibility.as_bytes()).unwrap(),
+            visibility
         );
 
         let pass = RgfxComputePassDesc {

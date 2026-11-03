@@ -72,10 +72,11 @@ use reims_graphics::ops::{
     RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER, RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT,
     RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
     RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RT_ARRAY_LENGTH,
-    RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_MAX_SAMPLE_POSITIONS,
-    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
-    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
-    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxSurfaceOrderWait, op_group,
+    RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS, RGFX_PASS_FLAG_VISIBILITY_RESULT,
+    RGFX_PASS_MAX_SAMPLE_POSITIONS, RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer,
+    RgfxComputePassDesc, RgfxOpEvent, RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass,
+    RgfxRenderPassColorAttachment, RgfxRenderPassDesc, RgfxRenderPassSamplePositions,
+    RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
 };
 use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
@@ -91,6 +92,7 @@ use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
+use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
     ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
@@ -452,7 +454,8 @@ fn signalling(handler: CompletedHandler, signalled: Option<Signalled>) -> Comple
 /// The encoder the walk currently holds open, one at a time, between an
 /// `ENCODER_BEGIN_*` and the matching `ENCODER_END`.
 enum OpenEncoder<P: Platform> {
-    Render(P::RenderEncoder),
+    /// A render encoder, and what its ops' checks read of its pass.
+    Render(P::RenderEncoder, render::PassFacts),
     Compute(P::ComputeEncoder),
     Blit(P::BlitEncoder),
     /// A video encoder: its session's work, placed in the command buffer itself.
@@ -1126,12 +1129,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             match op_group(tag) {
                 RGFX_OP_GROUP_FRAMING => self.framing_op(tag, body, cb, encoder, events)?,
                 RGFX_OP_GROUP_RENDER => {
-                    let Some(OpenEncoder::Render(enc)) = encoder.as_ref() else {
+                    let Some(OpenEncoder::Render(enc, pass)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "render"));
                     };
                     // This op and the render ops after it, up to the first of another group,
                     // one run of the encoder's ([`RenderEncoder::encoding`]).
-                    match enc.encoding(|| self.render_ops(ops, enc))? {
+                    match enc.encoding(|| self.render_ops(ops, enc, pass))? {
                         Ok(rest) => ops = rest,
                         Err(e) => return Ok(Err(e)),
                     }
@@ -1179,13 +1182,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(Ok(()))
     }
 
-    /// The render ops at the start of `ops`, on `enc`, up to the first op of another group or
-    /// the stream's end: what is left of `ops`, or a malformed op's error, each as [`Self::walk`]
-    /// answers it at that op.
+    /// The render ops at the start of `ops`, on `enc`, whose pass `pass` describes, up to the
+    /// first op of another group or the stream's end: what is left of `ops`, or a malformed op's
+    /// error, each as [`Self::walk`] answers it at that op.
     fn render_ops<'o>(
         &self,
         mut ops: &'o [u8],
         enc: &P::RenderEncoder,
+        pass: &render::PassFacts,
     ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
         while !ops.is_empty() {
             let Some((tag, body, len)) = next_op(ops) else {
@@ -1194,7 +1198,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             if op_group(tag) != RGFX_OP_GROUP_RENDER {
                 break;
             }
-            if !render::decode_op(tag, body, self, enc, ON)? {
+            if !render::decode_op(tag, body, self, enc, pass, ON)? {
                 return Err(unknown_op(tag));
             }
             ops = &ops[len..];
@@ -1216,14 +1220,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         match tag {
             RGFX_OP_ENCODER_BEGIN_RENDER => {
                 already_open(encoder, "ENCODER_BEGIN_RENDER")?;
-                let pass = self.build_render_pass(body, |count| {
+                let (pass, facts) = self.build_render_pass(body, |count| {
                     cb.device()
                         .is_some_and(|d| makes_sample_count(&d.caps(), count))
                 })?;
                 let enc = cb
                     .render_encoder(ON, &pass)?
                     .ok_or_else(|| op_fault("the render encoder was nil"))?;
-                *encoder = Some(OpenEncoder::Render(enc));
+                *encoder = Some(OpenEncoder::Render(enc, facts));
             }
             RGFX_OP_ENCODER_BEGIN_COMPUTE => {
                 already_open(encoder, "ENCODER_BEGIN_COMPUTE")?;
@@ -1250,7 +1254,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ));
             }
             RGFX_OP_ENCODER_END => match encoder.take() {
-                Some(OpenEncoder::Render(enc)) => enc.encode(ON, RenderCmd::EndEncoding)?,
+                Some(OpenEncoder::Render(enc, _)) => enc.encode(ON, RenderCmd::EndEncoding)?,
                 Some(OpenEncoder::Compute(enc)) => enc.encode(ON, ComputeCmd::EndEncoding)?,
                 Some(OpenEncoder::Blit(enc)) => enc.encode(ON, BlitCmd::EndEncoding)?,
                 Some(OpenEncoder::Video(_)) => {}
@@ -1288,16 +1292,17 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Builds a `P::RenderPassDescriptor` from an `ENCODER_BEGIN_RENDER` op's body
     /// (an [`RgfxRenderPassDesc`] then its `color_count`
-    /// [`RgfxRenderPassColorAttachment`] records, and its sample positions where its flag says
-    /// so). A body too short faults; a reference to a texture the host does not hold faults
-    /// through the resolution API; and so do sample positions Metal does not take
+    /// [`RgfxRenderPassColorAttachment`] records, then its sample positions and its visibility
+    /// result buffer where its flags say so), with what the pass's render ops' checks read of
+    /// it. A body too short faults; a reference to a texture or a buffer the host does not
+    /// hold faults through the resolution API; and so do sample positions Metal does not take
     /// ([`sample_positions_taken`]), of which `makes` answers whether the device makes textures
-    /// of their count.
+    /// of their count, and so does a visibility result type Metal does not define.
     fn build_render_pass(
         &self,
         body: &[u8],
         makes: impl Fn(u32) -> bool,
-    ) -> RaiseResult<P::RenderPassDescriptor> {
+    ) -> RaiseResult<(P::RenderPassDescriptor, render::PassFacts)> {
         let (desc, _) = RgfxRenderPassDesc::read_from_prefix(body).map_err(|_| {
             op_fault("ENCODER_BEGIN_RENDER: body too short for the pass descriptor")
         })?;
@@ -1348,9 +1353,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             pass.set_color_attachment(ON, i as u64, &aset)?;
         }
 
-        // The pass's sample positions, after the colour records.
+        // The pass's sample positions, after the colour records, then its visibility result
+        // buffer.
+        let mut off = color_start + desc.color_count as usize * stride;
         if desc.flags & RGFX_PASS_FLAG_SAMPLE_POSITIONS != 0 {
-            let off = color_start + desc.color_count as usize * stride;
             let p = body
                 .get(off..off + size_of::<RgfxRenderPassSamplePositions>())
                 .and_then(|s| RgfxRenderPassSamplePositions::read_from_bytes(s).ok())
@@ -1371,6 +1377,30 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ));
             }
             pass.set_sample_positions(&positions)?;
+            off += size_of::<RgfxRenderPassSamplePositions>();
+        }
+        let mut facts = render::PassFacts::default();
+        if desc.flags & RGFX_PASS_FLAG_VISIBILITY_RESULT != 0 {
+            let v = body
+                .get(off..off + size_of::<RgfxRenderPassVisibility>())
+                .and_then(|s| RgfxRenderPassVisibility::read_from_bytes(s).ok())
+                .ok_or_else(|| {
+                    op_fault("ENCODER_BEGIN_RENDER: no whole visibility result buffer record")
+                })?;
+            // `MTLVisibilityResultTypeReset` and `Accumulate`.
+            if v.result_type > 1 {
+                return Err(op_fault(format_args!(
+                    "ENCODER_BEGIN_RENDER: visibility result type {}, which Metal does not define",
+                    v.result_type
+                )));
+            }
+            let buffer = self.require_buffer(v.buffer_obj_id)?;
+            facts.visibility_length = Some(buffer.length());
+            pass.set_pass(&PassSet {
+                visibility_result_buffer: Some(Some(buffer)),
+                visibility_result_type: Some(u64::from(v.result_type)),
+                ..PassSet::default()
+            });
         }
 
         if desc.depth.texture_obj_id != 0 {
@@ -1417,7 +1447,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             pass.set_stencil_attachment(&sset);
         }
 
-        Ok(pass)
+        Ok((pass, facts))
     }
 }
 
@@ -1439,7 +1469,7 @@ fn event_signalled(obj_id: u64, value: u64) -> RgfxEventSignalled {
 
 fn end_abandoned<P: Platform>(open: OpenEncoder<P>) {
     let _ = refusing(|| match open {
-        OpenEncoder::Render(enc) => enc.encode(ON, RenderCmd::EndEncoding),
+        OpenEncoder::Render(enc, _) => enc.encode(ON, RenderCmd::EndEncoding),
         OpenEncoder::Compute(enc) => enc.encode(ON, ComputeCmd::EndEncoding),
         OpenEncoder::Blit(enc) => enc.encode(ON, BlitCmd::EndEncoding),
         OpenEncoder::Video(_) => Ok(()),
@@ -1510,9 +1540,10 @@ mod tests {
         RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES, RGFX_OP_RENDER_DRAW_PRIMITIVES,
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
         RGFX_OP_RENDER_SET_SCISSOR_RECT, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
-        RGFX_OP_RENDER_SET_VIEWPORT, RgfxOpDrawIndexedPrimitives, RgfxOpDrawPrimitives,
-        RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetScissorRect,
-        RgfxOpSetVertexBuffer, RgfxOpSetViewport,
+        RGFX_OP_RENDER_SET_VIEWPORT, RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE,
+        RgfxOpDrawIndexedPrimitives, RgfxOpDrawPrimitives, RgfxOpSetFragmentTexture,
+        RgfxOpSetRenderPipelineState, RgfxOpSetScissorRect, RgfxOpSetVertexBuffer,
+        RgfxOpSetViewport, RgfxOpSetVisibilityResultMode,
     };
     use reims_graphics::ops::video::{
         RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
@@ -3034,9 +3065,10 @@ mod tests {
     #[test]
     fn a_render_pass_is_built_from_the_wire_schema() {
         let (_p, dec) = setup();
-        let pass = dec
+        let (pass, facts) = dec
             .build_render_pass(&begin_render_body(), |_| true)
             .unwrap();
+        assert_eq!(facts.visibility_length, None);
         assert_eq!(
             pass.color_attachment_state(0).unwrap(),
             AttachmentState {
@@ -3076,7 +3108,7 @@ mod tests {
             body.extend_from_slice(p.as_bytes());
             body
         };
-        let pass = dec.build_render_pass(&with(&positions), |_| true).unwrap();
+        let (pass, _) = dec.build_render_pass(&with(&positions), |_| true).unwrap();
         let set = pass.with_model(|m: &PassModel| m.sample_positions.clone());
         assert_eq!(
             set,
@@ -3088,7 +3120,7 @@ mod tests {
                 },
             ])
         );
-        let plain = dec
+        let (plain, _) = dec
             .build_render_pass(&begin_render_body(), |_| true)
             .unwrap();
         assert_eq!(
@@ -3118,6 +3150,213 @@ mod tests {
         }
         positions.count = RGFX_PASS_MAX_SAMPLE_POSITIONS + 1;
         assert!(dec.build_render_pass(&with(&positions), |_| true).is_err());
+    }
+
+    /// [`begin_render_body`] with a visibility result record of buffer `buffer_obj_id` and
+    /// `result_type` after its colour record, and its sample positions before it where
+    /// `positions` is given.
+    fn begin_render_with_visibility(
+        buffer_obj_id: u64,
+        result_type: u32,
+        positions: Option<&RgfxRenderPassSamplePositions>,
+    ) -> Vec<u8> {
+        let plain = begin_render_body();
+        let mut head = RgfxRenderPassDesc::read_from_prefix(&plain).unwrap().0;
+        head.flags |= RGFX_PASS_FLAG_VISIBILITY_RESULT;
+        let mut body = Vec::new();
+        if let Some(p) = positions {
+            head.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
+            body.extend_from_slice(p.as_bytes());
+        }
+        let visibility = RgfxRenderPassVisibility {
+            buffer_obj_id,
+            result_type,
+            reserved_0c: 0,
+        };
+        body.extend_from_slice(visibility.as_bytes());
+        let mut out = head.as_bytes().to_vec();
+        out.extend_from_slice(&plain[RGFX_RENDER_PASS_COLOR_OFFSET as usize..]);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A pass's visibility result buffer and its type, after its colour records and its sample
+    /// positions, are set on the platform's pass, and the pass's ops learn the buffer's length;
+    /// a pass whose flag says so but carries no whole record faults, and so does one naming a
+    /// buffer the host does not hold, or a type Metal does not define. One without the flag sets
+    /// neither.
+    #[test]
+    fn a_render_pass_takes_its_visibility_result_buffer() {
+        use reims_vgpu_core::testkit::impls::descriptor::PassModel;
+        let (_p, dec) = setup();
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(2) else {
+            panic!("no buffer 2");
+        };
+        let id = buffer.id();
+        let mut positions = RgfxRenderPassSamplePositions {
+            count: 2,
+            ..RgfxRenderPassSamplePositions::default()
+        };
+        positions.position_bits[0] = [0.25f32.to_bits(), 0.25f32.to_bits()];
+        positions.position_bits[1] = [0.75f32.to_bits(), 0.75f32.to_bits()];
+        for (result_type, positions) in [(0, None), (1, Some(&positions))] {
+            let body = begin_render_with_visibility(2, result_type, positions);
+            let (pass, facts) = dec.build_render_pass(&body, |_| true).unwrap();
+            assert_eq!(facts.visibility_length, Some(65536));
+            let set = pass.with_model(|m: &PassModel| {
+                (
+                    m.visibility_result_buffer_id(),
+                    m.visibility_result_type,
+                    m.sample_positions.as_ref().map(Vec::len),
+                )
+            });
+            assert_eq!(
+                set,
+                (Some(id), Some(u64::from(result_type)), positions.map(|_| 2))
+            );
+        }
+        let (plain, facts) = dec
+            .build_render_pass(&begin_render_body(), |_| true)
+            .unwrap();
+        assert_eq!(facts.visibility_length, None);
+        assert_eq!(
+            plain.with_model(|m: &PassModel| (
+                m.visibility_result_buffer_id(),
+                m.visibility_result_type
+            )),
+            (None, None)
+        );
+        let whole = begin_render_with_visibility(2, 0, None);
+        assert!(
+            dec.build_render_pass(&whole[..whole.len() - 4], |_| true)
+                .is_err()
+        );
+        let unheld = begin_render_with_visibility(0x99, 0, None);
+        assert!(dec.build_render_pass(&unheld, |_| true).is_err());
+        let texture = begin_render_with_visibility(4, 0, None);
+        assert!(dec.build_render_pass(&texture, |_| true).is_err());
+        let undefined = begin_render_with_visibility(2, 2, None);
+        assert!(dec.build_render_pass(&undefined, |_| true).is_err());
+    }
+
+    /// A `BUFFER_CREATE` of buffer `obj_id`, `length` bytes.
+    fn buffer_of_length(obj_id: u64, length: u64) -> RgfxBufferCreate {
+        RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            length,
+            ..RgfxBufferCreate::default()
+        }
+    }
+
+    /// A `SET_VISIBILITY_RESULT_MODE` op of `mode` at `offset`.
+    fn visibility_mode(mode: u64, offset: u64) -> Vec<u8> {
+        op(
+            RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE,
+            RgfxOpSetVisibilityResultMode { mode, offset }.as_bytes(),
+        )
+    }
+
+    /// A pass over a visibility result buffer sends each mode and offset the guest sets, in both
+    /// modes, through to `Disabled`, with each draw between them, the last 8 bytes of the buffer
+    /// among them; a mode at an offset whose 8 bytes run past the buffer's end is refused at
+    /// its op and fails the command buffer, and so is a mode in a pass with no buffer, where
+    /// plain Metal's process ends. `Disabled` is taken at any offset, with a buffer or none.
+    #[test]
+    fn a_pass_s_visibility_modes_reach_the_platform_within_its_buffer() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        assert_eq!(
+            dec.decode(&device, buffer_of_length(6, 16).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        let draw = || {
+            op(
+                RGFX_OP_RENDER_DRAW_PRIMITIVES,
+                RgfxOpDrawPrimitives {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                }
+                .as_bytes(),
+            )
+        };
+        let pass = |modes: &[(u64, u64)], buffer: Option<u64>| {
+            let begin = match buffer {
+                Some(id) => begin_render_with_visibility(id, 0, None),
+                None => begin_render_body(),
+            };
+            let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin);
+            for &(mode, offset) in modes {
+                ops.extend(visibility_mode(mode, offset));
+                ops.extend(draw());
+            }
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+            ops
+        };
+        let sent = |mark| -> Vec<Vec<Arg>> {
+            p.call_log()
+                .since(mark)
+                .into_iter()
+                .filter(|c| c.sel == "setVisibilityResultMode:offset:")
+                .map(|c| c.args)
+                .collect()
+        };
+
+        let modes = [(2, 0), (1, 8), (0, 0)];
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(110, 1, &pass(&modes, Some(6)));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let want: Vec<Vec<Arg>> = modes
+            .iter()
+            .map(|&(m, o)| vec![Arg::U64(m), Arg::U64(o)])
+            .collect();
+        assert_eq!(sent(mark), want);
+        let sels = p.call_log().sels_since(mark);
+        let draws = sels
+            .iter()
+            .filter(|s| **s == "drawPrimitives:vertexStart:vertexCount:")
+            .count();
+        assert_eq!(draws, 3);
+
+        for (n, (modes, buffer)) in [
+            (&[(2, 8), (1, 16)][..], Some(6)),
+            (&[(1, 9)][..], Some(6)),
+            (&[(2, u64::MAX - 3)][..], Some(6)),
+            (&[(1, 0)][..], None),
+            (&[(2, 0)][..], None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mark = p.call_log().mark();
+            let message =
+                command_buffer_message(120 + n as u64, 2 + n as u64, &pass(modes, buffer));
+            assert!(
+                refusing(|| dec.decode(&device, &message)).is_err(),
+                "{modes:?} over {buffer:?}"
+            );
+            // Every mode before the refused one was sent; the refused one never was.
+            assert_eq!(
+                sent(mark).len(),
+                modes.len() - 1,
+                "{modes:?} over {buffer:?}"
+            );
+            assert!(
+                !p.call_log().sels_since(mark).contains(&"commit"),
+                "{modes:?} over {buffer:?}"
+            );
+        }
+
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(130, 9, &pass(&[(0, 1000), (0, 3)], None));
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(sent(mark).len(), 2);
     }
 
     /// An unknown op in the stream faults the exec (a raise), after the encoder has

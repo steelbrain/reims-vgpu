@@ -239,6 +239,8 @@ macro_rules! shared_attachment_props {
 pub struct PassModel {
     /// `visibilityResultBuffer`.
     pub visibility_result_buffer: Option<Option<AnyHandle>>,
+    /// `visibilityResultType`.
+    pub visibility_result_type: Option<u64>,
     /// `renderTargetArrayLength`.
     pub render_target_array_length: Option<u64>,
     /// `renderTargetWidth`.
@@ -323,6 +325,7 @@ impl RenderPassDescriptor<FakePlatform> for Fk<kind::RenderPassDescriptor> {
             if let Some(b) = held(s.visibility_result_buffer) {
                 p.visibility_result_buffer = Some(b);
             }
+            p.visibility_result_type = s.visibility_result_type.or(p.visibility_result_type);
             p.render_target_array_length = s
                 .render_target_array_length
                 .or(p.render_target_array_length);

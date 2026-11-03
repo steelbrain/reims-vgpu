@@ -138,7 +138,8 @@
 
 // Op `ENCODER_BEGIN_RENDER`: open a render encoder for the pass the op's body
 // describes (an [`RgfxRenderPassDesc`] then its `color_count`
-// [`RgfxRenderPassColorAttachment`] records). Holds the encoder until
+// [`RgfxRenderPassColorAttachment`] records, then the [`RgfxRenderPassSamplePositions`] and
+// the [`RgfxRenderPassVisibility`] its flags name, in that order). Holds the encoder until
 // [`RGFX_OP_ENCODER_END`].
 #define RGFX_OP_ENCODER_BEGIN_RENDER 1
 
@@ -233,6 +234,13 @@
 
 // The most sample positions a pass holds: Metal's largest sample count.
 #define RGFX_PASS_MAX_SAMPLE_POSITIONS 16
+
+// A pass's visibility result buffer (`visibilityResultBuffer`) and its
+// `visibilityResultType` follow its colour attachment records and its sample positions, as one
+// [`RgfxRenderPassVisibility`]. A host that does not know the flag takes the pass without the
+// buffer, so its `setVisibilityResultMode:offset:` of a mode fails the command buffer, as
+// before the flag.
+#define RGFX_PASS_FLAG_VISIBILITY_RESULT (1 << 4)
 
 // Where the colour attachment array starts in an `ENCODER_BEGIN_RENDER` op's
 // body: right after the fixed [`RgfxRenderPassDesc`].
@@ -5127,6 +5135,19 @@ typedef struct {
   // Each position's `x` then `y`, as `f32` bits.
   uint32_t position_bits[RGFX_PASS_MAX_SAMPLE_POSITIONS][2];
 } RgfxRenderPassSamplePositions;
+
+// A pass's visibility result buffer, after its colour attachment records and its sample
+// positions where the pass's flags hold [`RGFX_PASS_FLAG_VISIBILITY_RESULT`].
+typedef struct {
+  // The buffer each `setVisibilityResultMode:offset:` of a mode writes its 64-bit result
+  // into, at its offset: a buffer of the sender's.
+  uint64_t buffer_obj_id;
+  // `MTLVisibilityResultType` (`visibilityResultType`, macOS 26): 0 `Reset`, 1 `Accumulate`;
+  // the host refuses any other value.
+  uint32_t result_type;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_0c;
+} RgfxRenderPassVisibility;
 
 // `RENDER_PIPELINE_CREATE`: a render pipeline from a descriptor, answered by
 // [`RgfxPipelineReflection`] on the queue's completion ring with this create's

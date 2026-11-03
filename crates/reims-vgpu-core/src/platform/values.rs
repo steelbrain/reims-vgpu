@@ -694,12 +694,15 @@ macro_rules! set_struct_impls {
 }
 
 /// The render pass descriptor's own properties, each sent when set (`Some(None)` sends nil).
-/// Order: visibility result buffer, render target array length, width and height, default raster
-/// and colour sample counts, rasterization rate map, imageblock sample length, threadgroup memory
-/// length, tile width and height.
+/// Order: visibility result buffer and type, render target array length, width and height,
+/// default raster and colour sample counts, rasterization rate map, imageblock sample length,
+/// threadgroup memory length, tile width and height.
 #[allow(missing_docs)] // each field is its setter's argument, named after it
 pub struct PassSet<'a, P: Platform> {
     pub visibility_result_buffer: Option<Option<&'a P::Buffer>>,
+    /// `setVisibilityResultType:` (macOS 26): `MTLVisibilityResultType`, 0 `Reset`, 1
+    /// `Accumulate`.
+    pub visibility_result_type: Option<u64>,
     pub render_target_array_length: Option<u64>,
     pub render_target_width: Option<u64>,
     pub render_target_height: Option<u64>,
@@ -714,7 +717,7 @@ pub struct PassSet<'a, P: Platform> {
 }
 
 set_struct_impls!(PassSet { visibility_result_buffer, rasterization_rate_map } {
-    render_target_array_length, render_target_width, render_target_height,
+    visibility_result_type, render_target_array_length, render_target_width, render_target_height,
     default_raster_sample_count, default_color_sample_count, imageblock_sample_length,
     threadgroup_memory_length, tile_width, tile_height
 });

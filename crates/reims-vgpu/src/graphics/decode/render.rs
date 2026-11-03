@@ -168,17 +168,49 @@ fn resolve_heaps<'a, P: Platform>(
     es.iter().map(|e| objs.get_heap(e.heap_obj_id)).collect()
 }
 
+/// What the render ops' checks read of the open encoder's pass, which its
+/// `ENCODER_BEGIN_RENDER` describes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PassFacts {
+    /// The length of the pass's visibility result buffer, `None` where it has none.
+    pub(crate) visibility_length: Option<u64>,
+}
+
+/// The bytes of one visibility result.
+const VISIBILITY_RESULT_BYTES: u64 = 8;
+
+/// Whether `setVisibilityResultMode:offset:` of `mode` at `offset` is refused in a pass `pass`
+/// describes, and why: a mode other than `Disabled` in a pass without a visibility result
+/// buffer, where plain Metal's process ends (SIGSEGV; metal2vulkan's measurement on the M3 Max,
+/// macOS 27.0.1), or one whose 8 bytes run past the buffer's length, which the GPU would write
+/// outside the buffer and which only Metal's validation stops. `Disabled` writes nothing at its
+/// offset on the AMD Radeon Pro 5300M and the Intel UHD 630 under macOS 26.7.1 (measured), so
+/// any offset is taken, with a buffer or none.
+fn visibility_refused(pass: &PassFacts, mode: u64, offset: u64) -> Option<&'static str> {
+    if mode == 0 {
+        return None;
+    }
+    match pass.visibility_length {
+        None => Some("a visibility result mode in a pass with no visibility result buffer"),
+        Some(length) => offset
+            .checked_add(VISIBILITY_RESULT_BYTES)
+            .is_none_or(|end| end > length)
+            .then_some("a visibility result offset whose 8 bytes run past the buffer's end"),
+    }
+}
+
 /// Decodes one render-encoder op: `tag` its op, `payload` its body (the bytes
 /// after the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves
-/// object references, `enc` is the open render encoder, and `on` says how an
-/// encode's raise is taken. `Ok(true)` when the op was handled, `Ok(false)` for an
-/// unknown tag (the walk then faults); a platform raise or a bad reference
-/// propagates as `Err`.
+/// object references, `enc` is the open render encoder, `pass` what its ops' checks read of
+/// its pass, and `on` says how an encode's raise is taken. `Ok(true)` when the op was handled,
+/// `Ok(false)` for an unknown tag (the walk then faults); a platform raise, a bad reference or
+/// an op the pass refuses propagates as `Err`.
 pub(crate) fn decode_op<P: Platform>(
     tag: u16,
     payload: &[u8],
     objs: &GraphicsDecoder<P>,
     enc: &P::RenderEncoder,
+    pass: &PassFacts,
     on: OnFault,
 ) -> RaiseResult<bool> {
     match tag {
@@ -669,6 +701,12 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE => {
             let m: RgfxOpSetVisibilityResultMode = body(tag, payload)?;
+            if let Some(why) = visibility_refused(pass, m.mode, m.offset) {
+                return Err(op_fault(format_args!(
+                    "setVisibilityResultMode:offset: of mode {} at {}: {why}",
+                    m.mode, m.offset
+                )));
+            }
             enc.encode(
                 on,
                 RenderCmd::SetVisibilityResultMode {
@@ -1373,6 +1411,16 @@ mod tests {
 
     /// The op decode's fault policy, as the walk passes it.
     const ON: OnFault = OnFault::Return;
+
+    /// A pass without a visibility result buffer.
+    const NO_PASS: PassFacts = PassFacts {
+        visibility_length: None,
+    };
+
+    /// A pass whose visibility result buffer holds two results.
+    const TWO_RESULTS: PassFacts = PassFacts {
+        visibility_length: Some(16),
+    };
 
     type Fp = FakePlatform;
 
@@ -2367,7 +2415,7 @@ mod tests {
         let mut expected = Vec::new();
         for (tag, body, sel) in &entries {
             assert!(
-                decode_op(*tag, body, &dec, &enc, ON).unwrap(),
+                decode_op(*tag, body, &dec, &enc, &TWO_RESULTS, ON).unwrap(),
                 "op {tag:#06x} ({sel}) was not handled",
             );
             expected.push(*sel);
@@ -2406,7 +2454,17 @@ mod tests {
             ],
         );
         let mark = p.call_log().mark();
-        assert!(decode_op(RGFX_OP_RENDER_SET_VERTEX_BUFFERS, &body, &dec, &enc, ON).unwrap());
+        assert!(
+            decode_op(
+                RGFX_OP_RENDER_SET_VERTEX_BUFFERS,
+                &body,
+                &dec,
+                &enc,
+                &NO_PASS,
+                ON
+            )
+            .unwrap()
+        );
 
         let vertex_id = dec.get_buffer(BUF_VERTEX).unwrap().unwrap().id();
         let calls = p.call_log().since(mark);
@@ -2456,7 +2514,17 @@ mod tests {
             ],
         );
         let mark = p.call_log().mark();
-        assert!(decode_op(RGFX_OP_RENDER_USE_RESOURCES, &body, &dec, &enc, ON).unwrap());
+        assert!(
+            decode_op(
+                RGFX_OP_RENDER_USE_RESOURCES,
+                &body,
+                &dec,
+                &enc,
+                &NO_PASS,
+                ON
+            )
+            .unwrap()
+        );
 
         let buf_id = dec.get_buffer(BUF_VERTEX).unwrap().unwrap().id();
         let tex_id = dec.get_texture(TEX_A).unwrap().unwrap().id();
@@ -2473,6 +2541,43 @@ mod tests {
         );
     }
 
+    /// `setVisibilityResultMode:offset:` of `Boolean` or `Counting` is sent where its 8 bytes lie
+    /// in the pass's visibility result buffer, the last 8 among them, and refused, nothing sent,
+    /// past the buffer's end (an offset whose end overflows among them) or in a pass with no
+    /// buffer; `Disabled` is sent at any offset, with a buffer or none
+    #[test]
+    fn a_visibility_mode_is_refused_past_its_buffer() {
+        let (p, dec) = setup();
+        let (_cb, enc) = encoder(&p);
+        let set = |pass: &PassFacts, mode: u64, offset: u64| {
+            let mark = p.call_log().mark();
+            let body = RgfxOpSetVisibilityResultMode { mode, offset };
+            let r = decode_op(
+                RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE,
+                body.as_bytes(),
+                &dec,
+                &enc,
+                pass,
+                ON,
+            );
+            let sent = p.call_log().sels_since(mark) == ["setVisibilityResultMode:offset:"];
+            assert_eq!(r.is_ok(), sent, "mode {mode} at {offset}");
+            sent
+        };
+        for mode in [1, 2] {
+            assert!(set(&TWO_RESULTS, mode, 0));
+            assert!(set(&TWO_RESULTS, mode, 8));
+            assert!(!set(&TWO_RESULTS, mode, 9));
+            assert!(!set(&TWO_RESULTS, mode, 16));
+            assert!(!set(&TWO_RESULTS, mode, u64::MAX - 3));
+            assert!(!set(&NO_PASS, mode, 0));
+        }
+        for offset in [0, 16, u64::MAX] {
+            assert!(set(&TWO_RESULTS, 0, offset));
+            assert!(set(&NO_PASS, 0, offset));
+        }
+    }
+
     /// A body too short for its op faults the exec, and no command is sent.
     #[test]
     fn a_short_body_faults() {
@@ -2487,6 +2592,7 @@ mod tests {
                 &short,
                 &dec,
                 &enc,
+                &NO_PASS,
                 ON
             )
             .is_err()
@@ -2510,6 +2616,7 @@ mod tests {
                 &claims_two,
                 &dec,
                 &enc,
+                &NO_PASS,
                 ON
             )
             .is_err()
@@ -2535,6 +2642,7 @@ mod tests {
                 indirect.as_bytes(),
                 &dec,
                 &enc,
+                &NO_PASS,
                 ON,
             )
             .is_err()
@@ -2550,6 +2658,7 @@ mod tests {
                 fence.as_bytes(),
                 &dec,
                 &enc,
+                &NO_PASS,
                 ON
             )
             .is_err()
@@ -2565,7 +2674,17 @@ mod tests {
             }
             .as_bytes()],
         );
-        assert!(decode_op(RGFX_OP_RENDER_USE_RESOURCES, &bad_res, &dec, &enc, ON).is_err());
+        assert!(
+            decode_op(
+                RGFX_OP_RENDER_USE_RESOURCES,
+                &bad_res,
+                &dec,
+                &enc,
+                &NO_PASS,
+                ON
+            )
+            .is_err()
+        );
 
         // An unknown resource kind also faults.
         let bad_kind = tailed(
@@ -2577,7 +2696,17 @@ mod tests {
             }
             .as_bytes()],
         );
-        assert!(decode_op(RGFX_OP_RENDER_USE_RESOURCES, &bad_kind, &dec, &enc, ON).is_err());
+        assert!(
+            decode_op(
+                RGFX_OP_RENDER_USE_RESOURCES,
+                &bad_kind,
+                &dec,
+                &enc,
+                &NO_PASS,
+                ON
+            )
+            .is_err()
+        );
     }
 
     /// A tag the render decoder does not know is unhandled (the walk then faults).
@@ -2585,6 +2714,6 @@ mod tests {
     fn an_unknown_tag_is_not_handled() {
         let (p, dec) = setup();
         let (_cb, enc) = encoder(&p);
-        assert!(!decode_op(0x1fff, &[], &dec, &enc, ON).unwrap());
+        assert!(!decode_op(0x1fff, &[], &dec, &enc, &NO_PASS, ON).unwrap());
     }
 }

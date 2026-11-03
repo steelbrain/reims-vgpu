@@ -1145,9 +1145,11 @@ pub fn apply_texture(desc: &TextureDesc, d: &MetalTextureDescriptor) {
 }
 
 /// Makes a render pass descriptor hold `set`, each property sent when set. Order: visibility
-/// result buffer, render target array length, width and height, default raster and colour
-/// sample counts, rasterization rate map, imageblock sample length, threadgroup memory length,
-/// tile width and height.
+/// result buffer and type, render target array length, width and height, default raster and
+/// colour sample counts, rasterization rate map, imageblock sample length, threadgroup memory
+/// length, tile width and height. The type's setter is macOS 26's: only a type other than
+/// `Reset`, every descriptor's own, is sent, and only where the descriptor answers the setter,
+/// so a host before macOS 26 resets each pass's results, as it does whatever the type.
 fn apply_pass(set: &PassSet<'_, MetalPlatform>, d: &MetalRenderPassDescriptor) {
     let o = d.get();
     if let Some(buffer) = set.visibility_result_buffer {
@@ -1155,6 +1157,17 @@ fn apply_pass(set: &PassSet<'_, MetalPlatform>, d: &MetalRenderPassDescriptor) {
         msg::get("setVisibilityResultBuffer:", || {
             o.setVisibilityResultBuffer(buffer)
         });
+    }
+    if let Some(t) = set.visibility_result_type.filter(|&t| t != 0)
+        && msg::get("respondsToSelector:", || {
+            objc2_foundation::NSObjectProtocol::respondsToSelector(
+                o,
+                objc2::sel!(setVisibilityResultType:),
+            )
+        })
+    {
+        let t = MTLVisibilityResultType(isize::try_from(t).unwrap_or(isize::MAX));
+        msg::get("setVisibilityResultType:", || o.setVisibilityResultType(t));
     }
     if let Some(v) = set.render_target_array_length {
         let n = v.to_usize();
@@ -2097,6 +2110,7 @@ mod tests {
         let d: MetalRenderPassDescriptor = Obj::from_retained(MTLRenderPassDescriptor::new());
         d.set_pass(&PassSet {
             visibility_result_buffer: Some(Some(&k.buffer)),
+            visibility_result_type: Some(1),
             render_target_array_length: Some(2),
             render_target_width: Some(64),
             render_target_height: Some(32),
@@ -2110,6 +2124,7 @@ mod tests {
         });
         let o = obj(&d);
         for (sel, v) in [
+            ("visibilityResultType", 1),
             ("renderTargetArrayLength", 2),
             ("renderTargetWidth", 64),
             ("renderTargetHeight", 32),

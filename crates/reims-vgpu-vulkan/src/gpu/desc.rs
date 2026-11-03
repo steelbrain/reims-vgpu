@@ -998,9 +998,10 @@ fn attachment_state(
 /// The runtime's descriptor is a value of Metal's defaults, which each typed set changes in core's
 /// order. Each property is Metal's raw value as the runtime holds it: one it does not define (a
 /// load or store action, store action options, a resolve filter) is kept raw, as Metal's setter
-/// takes it, and the encoder's creation dies at it, where Metal asserts ([`RawPass`]). One of the
-/// pass's properties is kept nowhere: `defaultColorSampleCount` (SPI), which on this host
-/// changes nothing a pass shows ([`RenderPassDescriptor::set_pass`]).
+/// takes it, and the encoder's creation dies at it, where Metal asserts ([`RawPass`]). Two of the
+/// pass's properties are kept nowhere: `defaultColorSampleCount` (SPI), which on this host
+/// changes nothing a pass shows, and `visibilityResultType`, whose `Accumulate` the runtime does
+/// not build ([`RenderPassDescriptor::set_pass`]).
 impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
     /// Kept as set: the encoder's creation checks them against the pass, where Metal's
     /// assertions stop a count or a coordinate it does not take.
@@ -1018,6 +1019,21 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
         if let Some(b) = set.visibility_result_buffer {
             d.visibility_result_buffer = b.map(|b| b.raw.clone());
             plain(|| self.sources.lock().visibility = b.map(Handle::clone_ref));
+        }
+        // `setVisibilityResultType:` is kept nowhere: the runtime has no accumulation, so a pass
+        // of `Accumulate` resets its results as one of `Reset` does, as the AMD Radeon Pro
+        // 5300M and the Intel UHD 630 do under macOS 26.7.1, where the M3 Max under macOS 27
+        // adds a `Counting` result to the word's and ORs a `Boolean` one into it (measured), as
+        // Metal's docs promise. Accumulating is the runtime's to build.
+        if set.visibility_result_type.is_some_and(|t| t != 0) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    target: "reims_vgpu_vulkan::gpu",
+                    "a render pass of visibilityResultType Accumulate: the runtime resets its \
+                     visibility results"
+                );
+            }
         }
         if let Some(v) = set.render_target_array_length {
             d.render_target_array_length = v;
