@@ -262,6 +262,50 @@ fn message(rng: &mut Rng) -> Vec<u8> {
     m
 }
 
+/// `from`, a message the decoder carried out earlier in the case, mutated: one to four of its words
+/// fuzzed (its header's among them, its type with them), its type another, or its end cut or
+/// grown, so the creates the decoder took lead to messages over the objects they made and to the
+/// edges of the values it took.
+fn mutated(rng: &mut Rng, from: &[u8]) -> Vec<u8> {
+    let mut m = from.to_vec();
+    match rng.below(4) {
+        0 => {
+            let t = message_type(rng);
+            m[..4].copy_from_slice(&t.to_le_bytes());
+        }
+        1 => {
+            let keep = rng.below(m.len() as u64 / 8 + 1) as usize * 8;
+            m.truncate(keep.max(size_of::<RgfxMsgHeader>()));
+            let more = rng.below(8) as usize;
+            m.extend(words(rng, more));
+            let size = m.len() as u32;
+            m[4..8].copy_from_slice(&size.to_le_bytes());
+        }
+        _ => {
+            for _ in 0..1 + rng.below(4) {
+                let at = rng.below(m.len() as u64 / 8) as usize * 8;
+                let w = if rng.one_in(2) {
+                    word(rng)
+                } else {
+                    // A nearby value: an off-by-one, a doubling, a sign flip.
+                    let old = u64::from_le_bytes(m[at..at + 8].try_into().unwrap());
+                    match rng.below(4) {
+                        0 => old.wrapping_add(1),
+                        1 => old.wrapping_sub(1),
+                        2 => old.wrapping_mul(2),
+                        _ => old ^ (1 << 31),
+                    }
+                };
+                // Mostly the low half alone, since many fields are 32 bits wide.
+                let bytes = w.to_le_bytes();
+                let n = if rng.one_in(2) { 4 } else { 8 };
+                m[at..at + n].copy_from_slice(&bytes[..n]);
+            }
+        }
+    }
+    m
+}
+
 /// The highest tag each op group decodes: framing, render, compute, blit, video.
 const LAST_TAG: [u16; 5] = [0x0009, 0x104f, 0x201d, 0x3019, 0x4000];
 
@@ -450,8 +494,8 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Every message a context sends the decoder, in sequences of up to 24 over its objects, is
-/// answered with a result: none panics
+/// Every message a context sends the decoder, in sequences of up to 48 over its objects, half of
+/// them mutated from those it carried out before, is answered with a result: none panics
 #[test]
 fn no_message_a_context_sends_ends_the_host() {
     let (seed, cases) = run("messages", 384);
@@ -461,8 +505,15 @@ fn no_message_a_context_sends_ends_the_host() {
         let mut rng = Rng(case_seed);
         let (p, mut dec, _) = setup();
         let device = p.device();
-        for i in 0..1 + rng.below(24) {
-            let m = message(&mut rng);
+        // The case's messages the decoder carried out, which later ones are mutated from.
+        let mut taken: Vec<Vec<u8>> = Vec::new();
+        for i in 0..1 + rng.below(48) {
+            let m = if !taken.is_empty() && rng.one_in(2) {
+                let from = rng.below(taken.len() as u64) as usize;
+                mutated(&mut rng, &taken[from])
+            } else {
+                message(&mut rng)
+            };
             let input = Input {
                 case,
                 case_seed,
@@ -473,6 +524,9 @@ fn no_message_a_context_sends_ends_the_host() {
             let outcome = refusing(|| dec.decode(&device, &m));
             drop(input);
             outcomes.add(u32::from_le_bytes(m[..4].try_into().unwrap()), &outcome);
+            if matches!(outcome, Ok(Ok(()))) && m.len() >= size_of::<RgfxMsgHeader>() + 8 {
+                taken.push(m);
+            }
         }
     }
     outcomes.print("messages");
