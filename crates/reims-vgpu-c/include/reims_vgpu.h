@@ -973,9 +973,12 @@ typedef uint32_t RvgScalerOutcome;
 // (`reims-vgpu.graphics-control`), a lane that carries out a guest process's control messages
 // (`reims-vgpu.graphics-context-<n>`) or its presents (`reims-vgpu.graphics-presents`), its
 // refresh thread (`reims-vgpu.graphics-refresh`), a command queue's service thread
-// (`reims-vgpu.graphics-queue-<id>`), a pipeline compile's thread
-// (`reims-vgpu.graphics-compile-<n>`), or the platform's thread that runs a command buffer's
-// scheduled or completed handler; or the host's own, inside rvg_graphics_device_mmio_write_taking.
+// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads, which walk and commit its
+// command buffers (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
+// (`reims-vgpu.graphics-compile-<n>`), the thread that makes IOSurfaces' and pages blocks' views
+// (`reims-vgpu.graphics-surfaces`), the thread that makes indirect command buffers
+// (`reims-vgpu.icb-create`), or the platform's thread that runs a command buffer's scheduled or
+// completed handler; or the host's own, inside rvg_graphics_device_mmio_write_taking.
 // Never inside another call of the host's into the library. The library may hold locks of its
 // own around it (docs/api.md section 5 names them), but none that a function it may call waits
 // for, directly or through a thread of the library's, so it may call them at once. It may wait
