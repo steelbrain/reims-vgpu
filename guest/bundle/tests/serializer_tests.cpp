@@ -1797,12 +1797,28 @@ void test_heap_texture_size_query()
 	std::vector<uint8_t> bytes;
 	CHECK(!ring.next(&h, &bytes));
 
+	// An equal shape is answered as the device answered it, with no second ask.
 	asker.status = RGFX_STATUS_REFUSED;
+	RgfxTextureDescriptor same = desc;
 	size = align = 1;
-	CHECK(!ser.heapTextureSizeAndAlign(desc, &size, &align) && size == 1 && align == 1);
-	CHECK(asker.asked.obj_id != first);
+	CHECK(ser.heapTextureSizeAndAlign(same, &size, &align));
+	CHECK(size == 264192 && align == 128 && asker.calls == 1);
+
+	// Another shape is asked; a refusal answers nothing and is asked again.
+	RgfxTextureDescriptor other = desc;
+	other.width = 512;
+	size = align = 1;
+	CHECK(!ser.heapTextureSizeAndAlign(other, &size, &align) && size == 1 && align == 1);
+	CHECK(asker.asked.obj_id != first && asker.calls == 2);
+	CHECK(asker.asked.desc.width == 512);
 	asker.answers = false;
-	CHECK(!ser.heapTextureSizeAndAlign(desc, &size, &align) && asker.calls == 3);
+	CHECK(!ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 3);
+	asker.answers = true;
+	asker.status = RGFX_STATUS_OK;
+	CHECK(ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 4);
+	CHECK(ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 4);
+	other.usage = 1;
+	CHECK(ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 5);
 }
 
 // A no-copy buffer's block and the app's memory (RgfxMemoryShadow): the block starts as the

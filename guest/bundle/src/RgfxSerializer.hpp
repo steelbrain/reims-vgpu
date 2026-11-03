@@ -24,8 +24,11 @@
 #ifndef RGFX_SERIALIZER_HPP_
 #define RGFX_SERIALIZER_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 #include "RgfxObjectModel.hpp"
 #include "RgfxRingWriter.hpp"
@@ -193,7 +196,8 @@ public:
 	/// The size and alignment the host's device gives a texture of shape `desc` in a heap
 	/// (HEAP_TEXTURE_SIZE_AND_ALIGN, under a new id that names nothing): true with them in
 	/// `*size` and `*align` where the device answered, false where no answer came back or the
-	/// device refused the shape.
+	/// device refused the shape. The host's device answers a shape alike each time, so each
+	/// answered shape is asked once and its answer kept; a refused one is asked again.
 	bool heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, uint64_t *size,
 	                             uint64_t *align);
 
@@ -413,6 +417,18 @@ private:
 	void *m_queueCloseContext = nullptr;
 	AskFn m_ask = nullptr;
 	void *m_askContext = nullptr;
+
+	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.
+	typedef std::array<uint8_t, sizeof(RgfxTextureDescriptor)> SizeKey;
+	struct SizeKeyHash {
+		size_t operator()(const SizeKey &key) const;
+	};
+	struct SizeAnswer {
+		uint64_t size;
+		uint64_t align;
+	};
+	std::mutex m_sizesLock;
+	std::unordered_map<SizeKey, SizeAnswer, SizeKeyHash> m_sizes;
 };
 
 #endif // RGFX_SERIALIZER_HPP_

@@ -72,11 +72,38 @@ void RgfxSerializer::setAsker(AskFn ask, void *context)
 	m_askContext = context;
 }
 
+size_t RgfxSerializer::SizeKeyHash::operator()(const SizeKey &key) const
+{
+	uint64_t h = 1469598103934665603ull; // FNV-1a
+	for (uint8_t b : key) {
+		h ^= b;
+		h *= 1099511628211ull;
+	}
+	return static_cast<size_t>(h);
+}
+
+namespace {
+// The most shapes heapTextureSizeAndAlign keeps answers of; past it they are dropped and asked
+// again. An app sizes a few shapes, over and over.
+constexpr size_t kKeptSizes = 4096;
+} // namespace
+
 bool RgfxSerializer::heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, uint64_t *size,
                                              uint64_t *align)
 {
 	if (m_ask == nullptr)
 		return false;
+	SizeKey key;
+	std::memcpy(key.data(), &desc, sizeof(desc));
+	{
+		std::lock_guard<std::mutex> guard(m_sizesLock);
+		auto it = m_sizes.find(key);
+		if (it != m_sizes.end()) {
+			*size = it->second.size;
+			*align = it->second.align;
+			return true;
+		}
+	}
 	RgfxHeapTextureSizeAndAlign msg = {};
 	msg.header.type = RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN;
 	msg.header.size = sizeof(msg);
@@ -90,6 +117,10 @@ bool RgfxSerializer::heapTextureSizeAndAlign(const RgfxTextureDescriptor &desc, 
 		return false;
 	*size = answer.size;
 	*align = answer.align;
+	std::lock_guard<std::mutex> guard(m_sizesLock);
+	if (m_sizes.size() >= kKeptSizes)
+		m_sizes.clear();
+	m_sizes[key] = {answer.size, answer.align};
 	return true;
 }
 
