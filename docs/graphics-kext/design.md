@@ -678,8 +678,9 @@ last 1024 of the table's 16384 entries go only to WindowServer's blocks
 (`RgfxBlockTable`'s reserve). WindowServer takes the first gap from the start
 like any process, and reaches into the reserve only once the rest is full; any
 other process is refused at the reserve's edge, as at the region's end. Of the
-watched rings, the last 64 past one process's 2048 queues are WindowServer's
-alone in the same way (`RgfxQueueLimits.hpp`). The kext logs the most
+watched rings, the last 64 are WindowServer's alone in the same way, past room
+for one process's 2048 queues beside as many of the others'
+(`RgfxQueueLimits.hpp`). The kext logs the most
 WindowServer's blocks and queues came to, which is what the reserve is sized
 from.
 
