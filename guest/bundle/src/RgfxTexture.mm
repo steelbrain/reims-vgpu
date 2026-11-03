@@ -286,6 +286,21 @@ constexpr uint32_t kRgfxDefaultSwizzle = 0x05040302;
 constexpr uint64_t kRgfxSwizzledViewUsage =
     MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | 0x4000 | 0x10000;
 
+// What a texture made with MTLTextureUsageUnknown answers for its usage: ShaderRead, ShaderWrite,
+// RenderTarget and PixelFormatView, 0x17, private, shared or over an IOSurface, its views and a
+// CAMetalLayer drawable of a layer with framebufferOnly NO too (measured on the M3 Max under
+// macOS 27.0.1, and the AMD 5300M and the Intel UHD 630 under 26.7.1). The wire carries the
+// usage the descriptor gave, 0 among them, which the host's platform takes as Metal does.
+constexpr uint64_t kRgfxUnknownUsageAnswer = MTLTextureUsageShaderRead |
+                                             MTLTextureUsageShaderWrite |
+                                             MTLTextureUsageRenderTarget |
+                                             MTLTextureUsagePixelFormatView;
+
+uint64_t rgfxAnsweredUsage(uint64_t usage)
+{
+	return usage == MTLTextureUsageUnknown ? kRgfxUnknownUsageAnswer : usage;
+}
+
 uint32_t rgfxPackSwizzle(MTLTextureSwizzleChannels sw)
 {
 	return static_cast<uint32_t>(sw.red) | (static_cast<uint32_t>(sw.green) << 8) |
@@ -839,7 +854,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 
 - (MTLTextureUsage)usage
 {
-	return static_cast<MTLTextureUsage>(_desc.usage);
+	return static_cast<MTLTextureUsage>(rgfxAnsweredUsage(_desc.usage));
 }
 
 - (MTLTextureSwizzleChannels)swizzle
@@ -985,12 +1000,14 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	desc.array_length =
 	    static_cast<uint32_t>(subrange ? rgfxArrayLengthOf(type, slices.length) : self.arrayLength);
 	desc.sample_count = static_cast<uint32_t>(self.sampleCount);
-	uint64_t usage = self.usage;
+	// The texture's usage as its descriptor gave it, 0 included, so the view's wire usage is
+	// its texture's; a swizzled view keeps part of what the texture answers.
+	uint64_t usage = _desc.usage;
 	uint32_t packed = rgfxPackSwizzle(self.swizzle);
 	if (swizzled) {
 		packed = rgfxPackSwizzle(swizzle);
 		if (packed != kRgfxDefaultSwizzle) {
-			usage &= kRgfxSwizzledViewUsage;
+			usage = rgfxAnsweredUsage(usage) & kRgfxSwizzledViewUsage;
 		}
 	}
 	desc.usage = static_cast<uint32_t>(usage);

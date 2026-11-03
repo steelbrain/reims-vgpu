@@ -6802,6 +6802,66 @@ void test_texture_framebuffer_only()
 	}
 }
 
+// A texture made with MTLTextureUsageUnknown answers usage 0x17, as Metal's do (measured on the
+// M3 Max, the AMD 5300M and the Intel UHD 630), its views too, and its create carries the 0 the
+// descriptor gave; a swizzled view keeps 0x11 of it, as of a texture made with 0x17.
+void test_texture_unknown_usage()
+{
+	Fixture fx;
+	@autoreleasepool {
+		for (MTLStorageMode storage : {MTLStorageModePrivate, MTLStorageModeShared}) {
+			// The pool ends the texture and its views before the ring is drained, so the next
+			// create is the ring's next message.
+			@autoreleasepool {
+			MTLTextureDescriptor *desc =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                                                       width:16
+			                                                      height:16
+			                                                   mipmapped:NO];
+			desc.usage = MTLTextureUsageUnknown;
+			desc.storageMode = storage;
+			RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+			                                                 heap:RGFX_OBJ_NONE
+			                                           heapOffset:0
+			                                               device:nil
+			                                           serializer:&fx.ser];
+			CHECK(tex != nil && tex.usage == 0x17);
+			auto made = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+			CHECK(made.obj_id == tex.rgfxObjId && made.desc.usage == 0);
+			id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+			CHECK(view != nil && view.usage == 0x17);
+			id<MTLTexture> swizzled = [tex
+			    newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                      textureType:MTLTextureType2D
+			                           levels:NSMakeRange(0, 1)
+			                           slices:NSMakeRange(0, 1)
+			                          swizzle:MTLTextureSwizzleChannelsMake(
+			                                      MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+			                                      MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+			CHECK(swizzled != nil && (swizzled.usage & 0xff) == 0x11);
+			}
+			drainRing(fx.ring);
+		}
+		// A usage the descriptor names is answered as given.
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		desc.usage = MTLTextureUsageRenderTarget;
+		desc.storageMode = MTLStorageModePrivate;
+		RgfxTexture *rt = [RgfxTexture textureWithDescriptor:desc
+		                                                heap:RGFX_OBJ_NONE
+		                                          heapOffset:0
+		                                              device:nil
+		                                          serializer:&fx.ser];
+		CHECK(rt != nil && rt.usage == MTLTextureUsageRenderTarget);
+		CHECK([rt newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB].usage ==
+		      MTLTextureUsageRenderTarget);
+		drainRing(fx.ring);
+	}
+}
+
 // A texture's views (RGFX_CMD_TEXTURE_VIEW): each form posts its view of the texture with the
 // fields it names, and the view answers its own shape and its texture's memory, as Metal's do
 // (measured on the M3 Max under macOS 27.0.1). A view Metal makes none of, or asserts at,
@@ -9445,6 +9505,7 @@ int main(int argc, char **argv)
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_views();
 		test_texture_framebuffer_only();
+		test_texture_unknown_usage();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();
 		test_sampler_routing();
