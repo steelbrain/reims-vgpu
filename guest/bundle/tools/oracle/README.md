@@ -19,6 +19,7 @@ Mac where it shows the gap. What they found is in
 | `oracle_ycbcr` | what a two-plane Y'CbCr texture (`MTLPixelFormat` 500) over plane 0 of a 420v or 420f surface reads, by the surface's `kIOSurfaceYCbCrMatrix` (709, 601 or none, set by CoreVideo or on the surface), or whether Metal refuses it |
 | `oracle_ca_ycbcr` | which matrix CoreAnimation (a CARenderer drawing the surface as a layer's contents into a texture of the device) and VideoToolbox (`VTPixelTransferSession` to 32BGRA) convert an `x420` or `420v` surface by, tagged 709, 601 or untagged |
 | `oracle_sampler` | what a sampler's `lodBias` and `reductionMode` do to its samples, by the LOD's source (`level()`, `gradient2d()`, a fragment's implicit LOD) and the mip filter, and the device's SPI answers about them |
+| `oracle_order` | when a command buffer that runs after another queue's or another process's pending access to the same IOSurface is answered submitted (`commitAndWaitUntilSubmitted`), scheduled and completed, and whether the GPU ran it after that access |
 
 Each probe picks its device by a substring of its name from `MTLCopyAllDevices` (`AMD`,
 `Intel`, `Apple`). It never calls `MTLCreateSystemDefaultDevice`, which switches a dual-GPU
