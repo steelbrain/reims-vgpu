@@ -912,6 +912,15 @@ void RgfxAccelerator::freeBlocks(const void *owner)
 		IOLog("RgfxAccelerator: %u blocks freed\n", freed);
 }
 
+void RgfxAccelerator::holdBlocks(const void *owner)
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	rgfxBlockHand(blockTable, owner, owner);
+	IOLockUnlock(contextLock);
+}
+
 void RgfxAccelerator::keepBlocks(const void *owner)
 {
 	if (!contextLock)

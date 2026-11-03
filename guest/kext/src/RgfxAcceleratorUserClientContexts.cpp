@@ -623,6 +623,7 @@ void RgfxAcceleratorUserClient::releaseContext()
 	// nothing of it, maps none of its resource ids or GPU addresses to an object, and the
 	// context's command buffers have finished. A close answered late lets go of it then.
 	int32_t late = -1;
+	accel->holdBlocks(this);
 	const RgfxAccelerator::CloseAnswer closed =
 	    accel->closeContext(context, firstUnit, units, &late);
 	// Its deferred creates' answers, taken by no one now; a waiter for one returns.

@@ -268,6 +268,11 @@ public:
 	                    UInt64 address, UInt64 length, bool writable, UInt64 *offset,
 	                    UInt64 *size);
 	void freeBlocks(const void *owner);
+	// Before the owner's close is posted: none of its blocks is released from here on, a freed
+	// or a refused one included, so no release of its comes behind the close, which the device
+	// would take with the context gone and answer without waiting for its buffers. The close's
+	// answer lets go of them (freeBlocks), or hands them on (parkClose).
+	void holdBlocks(const void *owner);
 	void keepBlocks(const void *owner);
 	// Pins the owner's live block that holds the `length` bytes at `offset`, for a create that
 	// names them, until unpinBlock: false where no block of the owner's does.

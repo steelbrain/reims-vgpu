@@ -289,6 +289,29 @@ int main()
 		check(rgfxBlockRetryRefused(x.t) == 0, "no refused blocks are left");
 	}
 	{
+		// Before a client's close is posted its blocks are held: a freed one is not released, a
+		// refused one not posted again by another context's close, and a releasing one goes at its
+		// answer as before; the close's answer frees them all.
+		Table x;
+		uint64_t live = 0, freed = 0, refused = 0, releasing = 0;
+		uint64_t *const made[] = {&live, &freed, &refused, &releasing};
+		for (uint64_t *at : made)
+			check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, at) == kRgfxBlockOk, "a block");
+		RgfxBlock rel, posted;
+		rgfxBlockFree(x.t, a, refused);
+		check(rgfxBlockNextRelease(x.t, &rel) && rel.offset == refused, "posted");
+		rgfxBlockReleased(x.t, refused, rel.serial, false);
+		rgfxBlockFree(x.t, a, releasing);
+		check(rgfxBlockNextRelease(x.t, &posted) && posted.offset == releasing, "posted too");
+		rgfxBlockFree(x.t, a, freed);
+		check(rgfxBlockHand(x.t, a, a) == 4, "the client's four blocks held for its close");
+		check(!rgfxBlockNextRelease(x.t, &rel), "its freed block is not released behind the close");
+		check(rgfxBlockRetryRefused(x.t) == 0, "nor its refused one posted again by another close");
+		rgfxBlockReleased(x.t, releasing, posted.serial, true);
+		check(rgfxBlockIndex(x.t, releasing) < 0, "a release posted before goes at its answer");
+		check(rgfxBlockFreeOwner(x.t, a) == 3 && x.t.count == 0, "the close's answer frees the rest");
+	}
+	{
 		// A cached surface block kept instead of released (a create in flight names it) holds the
 		// cache's wiring of its pages where it holds none of a holder's: the device may still map
 		// them in place, and no answer ever hands the wiring back, however many come.

@@ -1378,8 +1378,10 @@ answered, and a free of it
 meanwhile fails busy, so no block changes hands between the check and the
 host's carrying out of the message. A context's close is answered under the
 same rule, after its objects are dropped and its queues' threads are past
-their rings, and the kext frees the process's blocks only on that answer. A
-close not answered in 10 s keeps everything the process held from every other
+their rings, and the kext frees the process's blocks only on that answer. None
+of them is released from the close's post on: the host takes a release behind
+the close with the context gone, and would answer it without waiting for the
+context's buffers. A close not answered in 10 s keeps everything the process held from every other
 process until its answer comes, however late: its blocks with their wired
 pages, its holds of shared blocks, its GPU address units and its resource-id
 chunks, which the host may still use or map to the context's objects. None of
