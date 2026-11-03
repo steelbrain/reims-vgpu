@@ -15,10 +15,10 @@
 #   host.txt      "KEY VALUE" lines: the wait for the GPU, boot and desktop times (from QEMU's
 #                 start), the fatal count, the screendump's colours, how long the hold was
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
-# writes an overlay), PORT (the first SSH port it tries), TAG, PAYLOAD (the guest's directory:
-# guest-run.sh and its tools), CORPUS, GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts:
-# rgk-boot2.sh), EXCLUSIVE, HOLD_S, LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and
-# the GPU, each), PHASES and PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S).
+# writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
+# GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
+# LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
+# PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
 . "$R/boot.env"
@@ -91,32 +91,13 @@ if [[ ${EXCLUSIVE:-1} == 1 ]]; then
 fi
 excl=()
 [[ ${EXCLUSIVE:-1} == 1 ]] && excl=(RGK_EXCLUSIVE=1 "RGK_EXCLUSIVE_MAX=$HOLD_S")
-# The host's VMs pick their SSH ports themselves: the boot takes the first port from PORT up, in
-# steps of 2, that nothing listens on and no boot has locked (rgk-boot2.sh's ports/PORT.lock). A
-# boot that takes it while this one waits for the GPU makes rgk-boot2.sh refuse it (PORT_BUSY):
-# then the boot tries again on the next free one, at most 3 times.
-free_port() {
-  local q
-  for q in $(seq "$1" 2 $(( $1 + 40 ))); do
-    ss -Hltn "sport = :$q" | grep -q . && continue
-    ( flock -n 8 ) 8> "$RGK_RUN/ports/$q.lock" 2> /dev/null || continue
-    echo "$q"
-    return 0
-  done
-  return 1
-}
-mkdir -p "$RGK_RUN/ports"
-for attempt in 1 2 3; do
-  PORT=$(free_port "$PORT") || { log "BOOT_FAIL no free port from $PORT"; exit 4; }
-  log "port $PORT"
-  out=$(env "${excl[@]}" RGK_SLOT_WAIT="${LOCK_WAIT_S:-3600}" QEMU="$QEMU" ROM="$ROM" PORT="$PORT" \
-    REIMS_VGPU_LOG=info bash "$RGK_RUN/rgk-boot2.sh" "$TAG" "$OC" "$DISK" 2>&1)
-  echo "$out" >> "$R/boot.log"
-  [[ $out == *PORT_BUSY* && $attempt -lt 3 ]] || break
-  log "port $PORT was taken: trying another"
-  PORT=$((PORT + 2))
-done
-kv port "$PORT"
+# rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
+out=$(env -u PORT "${excl[@]}" RGK_SLOT_WAIT="${LOCK_WAIT_S:-3600}" QEMU="$QEMU" ROM="$ROM" \
+  REIMS_VGPU_LOG=info bash "$RGK_RUN/rgk-boot2.sh" "$TAG" "$OC" "$DISK" 2>&1)
+echo "$out" >> "$R/boot.log"
+PORT=$(echo "$out" | awk '$1 == "PORT" && $2 ~ /^[0-9]+$/ {print $2; exit}')
+[[ -n $PORT ]] || PORT=$(cat "$B/port" 2> /dev/null)
+kv port "${PORT:-none}"
 P=$(cat "$B/qemu.pid" 2> /dev/null)
 [[ -n $P && $(cat "/proc/$P/comm" 2> /dev/null) == qemu-system-x86* ]] || P=
 # The hold began when QEMU started, holding the lock.

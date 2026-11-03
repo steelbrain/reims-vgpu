@@ -345,13 +345,13 @@ image_leg() {
 
 # --- the boot ---------------------------------------------------------------------------------
 
-# do_boot boot|bench: the correctness boot, shared, or the bench boot, the GPU alone. Each has
-# its own port, so a run's detached bench leg never meets the next run's correctness boot.
+# do_boot boot|bench: the correctness boot, shared, or the bench boot, the GPU alone. rgk-boot2.sh
+# picks each boot's SSH port.
 do_boot() {
-  local mode=$1 oc=${image:-$MR/oc.qcow2} out=$MR/out-$1 port=$GATE_PORT excl=0 hold=${HOLD_SHARED_S:-1200}
+  local mode=$1 oc=${image:-$MR/oc.qcow2} out=$MR/out-$1 excl=0 hold=${HOLD_SHARED_S:-1200}
   local ph=${phases:-info sweep decode webgl present final} pres=5
   if [[ $mode == bench ]]; then
-    port=$((GATE_PORT + 1)) excl=1 hold=$HOLD_S ph="info idle bench present decodefps final" pres=10
+    excl=1 hold=$HOLD_S ph="info idle bench present decodefps final" pres=10
   fi
   msi "rm -rf '$out' && mkdir -p '$out' && { [ -d '$MR/payload' ] || exit 0; rm -rf '$MR/payload'; }"
   scp -q -r "$ART/payload" "$MSI:$MR/payload"
@@ -360,7 +360,6 @@ QEMU=$MR/qemu-system-x86_64
 ROM=$MR/ReimsGraphics.rom
 OC=$oc
 DISK=$MSI_DISK
-PORT=$port
 TAG=gate-$runid-$mode
 PAYLOAD=$MR/payload
 CORPUS=$MSI_GATE/corpus
