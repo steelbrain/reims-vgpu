@@ -6,10 +6,14 @@
 //! guest or the host's platform sees.
 //!
 //! One thread per decoder, started at the first watch, takes the buffers in commit order, each at
-//! its deadline on the platform's clock, and ends with the decoder ([`WaitWatch`]'s drop).
+//! its deadline on the platform's clock, and ends with the decoder ([`WaitWatch`]'s drop). The
+//! deadlines are in the queue's order, so a watch wakes the thread only where the queue was empty:
+//! otherwise the thread already sleeps until an earlier deadline, and takes the new buffer after.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
@@ -89,6 +93,9 @@ struct Shared<P: Platform> {
     platform: Arc<P>,
     state: Mutex<State>,
     wake: Condvar,
+    /// The watches that woke the thread.
+    #[cfg(test)]
+    woken: AtomicU32,
 }
 
 #[derive(Default)]
@@ -116,6 +123,8 @@ impl<P: Platform> WaitWatch<P> {
                 platform,
                 state: Mutex::new(State::default()),
                 wake: Condvar::new(),
+                #[cfg(test)]
+                woken: AtomicU32::new(0),
             }),
         }
     }
@@ -137,13 +146,15 @@ impl<P: Platform> WaitWatch<P> {
             state: AtomicU8::new(RUNNING),
             logged: AtomicBool::new(false),
         });
+        let mut state = self.shared.state.lock();
+        // Read under the lock, so the queue's deadlines are in its order.
         let deadline = self
             .shared
             .platform
             .clock()
             .now_mono()
             .saturating_add(WAIT_LOGGED_AFTER);
-        let mut state = self.shared.state.lock();
+        let wakes = state.queue.is_empty();
         state.queue.push_back((deadline, Arc::clone(&buffer)));
         if !state.started {
             let shared = Arc::clone(&self.shared);
@@ -157,7 +168,11 @@ impl<P: Platform> WaitWatch<P> {
             }
         }
         drop(state);
-        self.shared.wake.notify_one();
+        if wakes {
+            #[cfg(test)]
+            self.shared.woken.fetch_add(1, Ordering::SeqCst);
+            self.shared.wake.notify_one();
+        }
         buffer
     }
 }
@@ -251,6 +266,29 @@ mod tests {
         assert!(!later.was_logged());
         waiting.finished();
         assert!(waiting.was_logged());
+    }
+
+    /// A watch wakes the thread only where its queue was empty: one behind others needs it no
+    /// sooner than the deadline it sleeps until. Each is still logged at its own deadline.
+    #[test]
+    fn a_watch_wakes_the_thread_only_onto_an_empty_queue() {
+        let p = Arc::new(FakePlatform::new());
+        let watch = WaitWatch::new(Arc::clone(&p));
+        let first = watch.watch(1, 1, None, vec![(6, 1)]);
+        let behind: Vec<_> = (2..10)
+            .map(|n| watch.watch(n, n, None, vec![(6, n)]))
+            .collect();
+        assert_eq!(watch.shared.woken.load(Ordering::SeqCst), 1);
+        p.virtual_clock().advance(WAIT_LOGGED_AFTER);
+        assert!(eventually(
+            || first.was_logged() && behind.iter().all(|b| b.was_logged())
+        ));
+        assert!(eventually(|| watch.shared.state.lock().queue.is_empty()));
+        // The queue emptied: the next watch wakes the thread again.
+        let after = watch.watch(10, 10, None, vec![(6, 10)]);
+        assert_eq!(watch.shared.woken.load(Ordering::SeqCst), 2);
+        p.virtual_clock().advance(WAIT_LOGGED_AFTER);
+        assert!(eventually(|| after.was_logged()));
     }
 
     /// The decoder's watch ends its thread when it goes.
