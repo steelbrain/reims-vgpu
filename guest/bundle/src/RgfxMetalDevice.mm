@@ -34,6 +34,7 @@
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxSlabs.hpp"
 
 // The accelerator's user-client protocol, the kext's own header: its type, its selectors and
 // the kext's own feature bits.
@@ -426,6 +427,9 @@ RGFX_LOG_UNRECOGNIZED
 	mach_vm_size_t _mapSize;     // the window's size, the region's
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
+	// The region's slabs Shared and Managed buffers lie in, and their source; null until then.
+	std::unique_ptr<RgfxRegionSlabSource> _slabSource;
+	std::unique_ptr<RgfxSlabs> _slabs;
 }
 
 RGFX_LOG_UNRECOGNIZED
@@ -549,6 +553,10 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
 	_stateCache = [[RgfxStateCache alloc] initWithDevice:self serializer:_serializer];
+	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer);
+	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
+	if (!_slabs->start())
+		rgfxDiag("RGFX: no slab thread; creates zero and frees let slabs go themselves\n");
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
@@ -593,6 +601,11 @@ RGFX_LOG_UNRECOGNIZED
 - (RgfxRegion *)region
 {
 	return _region;
+}
+
+- (RgfxSlabs *)slabs
+{
+	return _slabs.get();
 }
 
 // A texture over a legacy IOAccel surface, which is how WindowServer's CoreDisplay reaches the

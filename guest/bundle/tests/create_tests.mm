@@ -29,6 +29,7 @@
 #include "RgfxRegion.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxSlabs.hpp"
 #include "reims_graphics_wire.h"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks
 
@@ -115,15 +116,19 @@ MTLTextureDescriptor *texture2D(MTLStorageMode storage)
 	return td;
 }
 
-// A device buffer, a Shared one over a region block and one over a surface's pages: each nil, the
-// block back in the region and the caller's deallocator unrun (it is the caller's to run then).
+// A device buffer, a Shared one in a slab of the region and one over a surface's pages: each nil,
+// what it took back where it came from, and the caller's deallocator unrun (it is the caller's to
+// run then). A Shared buffer whose slab's heap the device never got gives the slab's block back;
+// one whose own create it never got gives its range back to a slab the class keeps.
 void test_refused_buffer_create_is_nil()
 {
 	Refusing &r = *new Refusing();
 	Blocks &b = *new Blocks(0x100000);
+	RgfxRegionSlabSource &source = *new RgfxRegionSlabSource(b.region, r.ser);
+	RgfxSlabs &slabs = *new RgfxSlabs(source);
 	static uint8_t pages[0x1000];
 	@autoreleasepool {
-		r.allow = 3; // taken: each is made
+		r.allow = 4; // taken: each is made
 		CHECK([RgfxBuffer bufferWithLength:0x1000
 		                           options:MTLResourceStorageModePrivate
 		                            device:nil
@@ -132,7 +137,7 @@ void test_refused_buffer_create_is_nil()
 		                                    options:MTLResourceStorageModeShared
 		                                      bytes:nullptr
 		                                  maxLength:0
-		                                     region:&b.region
+		                                      slabs:&slabs
 		                                     device:nil
 		                                 serializer:&r.ser] != nil);
 		CHECK([RgfxBuffer bufferOverSurfacePagesWithContents:pages
@@ -144,10 +149,13 @@ void test_refused_buffer_create_is_nil()
 		                                              device:nil
 		                                          serializer:&r.ser] != nil);
 		CHECK(r.taken == std::vector<uint32_t>({RGFX_CMD_BUFFER_CREATE,
-		                                        RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+		                                        RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+		                                        RGFX_CMD_BUFFER_AT_OFFSET,
 		                                        RGFX_CMD_BUFFER_OVER_SURFACE_PAGES}));
 	}
-	CHECK(b.live.empty());
+	// The class keeps its slab, empty, for its next buffer.
+	CHECK(b.live.size() == 1 && slabs.stats().emptySlabs == 1);
+	RgfxSlabs &fresh = *new RgfxSlabs(source);
 	@autoreleasepool {
 		CHECK([RgfxBuffer bufferWithLength:0x1000
 		                           options:MTLResourceStorageModePrivate
@@ -157,10 +165,18 @@ void test_refused_buffer_create_is_nil()
 		                                    options:MTLResourceStorageModeShared
 		                                      bytes:nullptr
 		                                  maxLength:0
-		                                     region:&b.region
+		                                      slabs:&slabs
 		                                     device:nil
 		                                 serializer:&r.ser] == nil);
-		CHECK(b.live.empty());
+		CHECK(slabs.stats().usedBytes == 0);
+		CHECK([RgfxBuffer bufferForDeviceWithLength:0x1000
+		                                    options:MTLResourceStorageModeShared
+		                                      bytes:nullptr
+		                                  maxLength:0
+		                                      slabs:&fresh
+		                                     device:nil
+		                                 serializer:&r.ser] == nil);
+		CHECK(b.live.size() == 1 && fresh.stats().slabs == 0);
 		__block int letGo = 0;
 		CHECK([RgfxBuffer bufferOverSurfacePagesWithContents:pages
 		                                         blockOffset:RGFX_ALLOCATIONS_OFFSET
@@ -174,7 +190,7 @@ void test_refused_buffer_create_is_nil()
 		                                          serializer:&r.ser] == nil);
 		CHECK(letGo == 0);
 	}
-	CHECK(r.taken.size() == 3);
+	CHECK(r.taken.size() == 4);
 }
 
 // A device heap and a Shared one over a region block are nil, the block back; a buffer at an offset

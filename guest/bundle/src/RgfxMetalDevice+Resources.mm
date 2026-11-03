@@ -25,14 +25,14 @@
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
-	// A Shared buffer over a block of the device region, which the host sees in place, a Managed
+	// A Shared buffer in a slab of the device region, which the host sees in place, a Managed
 	// one with its CPU copy there, a Private one the GPU's alone; none where Metal makes none, nor
 	// where the region has no room (RgfxBuffer.h).
 	return [RgfxBuffer bufferForDeviceWithLength:length
 	                                     options:options
 	                                       bytes:nullptr
 	                                   maxLength:[self maxBufferLength]
-	                                      region:[self region]
+	                                       slabs:[self slabs]
 	                                      device:self
 	                                  serializer:[self serializer]];
 }
@@ -41,7 +41,7 @@
                              length:(NSUInteger)length
                             options:(MTLResourceOptions)options
 {
-	// As newBufferWithLength:options:, its block seeded with the bytes; none for a Private one,
+	// As newBufferWithLength:options:, its range seeded with the bytes; none for a Private one,
 	// whose bytes Metal's validation refuses, nor for no bytes at all, which Metal's validation
 	// refuses too and its copy faults at (measured on the M3 Max).
 	if (pointer == nullptr)
@@ -50,7 +50,7 @@
 	                                     options:options
 	                                       bytes:pointer
 	                                   maxLength:[self maxBufferLength]
-	                                      region:[self region]
+	                                       slabs:[self slabs]
 	                                      device:self
 	                                  serializer:[self serializer]];
 }

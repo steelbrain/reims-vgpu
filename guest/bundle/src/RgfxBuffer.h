@@ -28,6 +28,7 @@
 class RgfxMemoryShadow;
 class RgfxRegion;
 class RgfxSerializer;
+class RgfxSlabs;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -76,13 +77,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 #ifdef __cplusplus
 /// The buffer `newBufferWithLength:options:` (`bytes` null) and
-/// `newBufferWithBytes:length:options:` make: a Shared one over a block of `region`, which the
-/// host sees in place, a Managed one with its CPU copy there, and a Private one the GPU's alone,
-/// its contents NULL. A block's bytes are `length` bytes from `bytes`, or zeros.
+/// `newBufferWithBytes:length:options:` make: a Shared one in a range of a slab of `slabs`, which
+/// the host sees in place, a Managed one with its CPU copy there (RgfxSlabs.hpp), and a Private
+/// one the GPU's alone, its contents NULL. The range is whole 4 KiB pages, page aligned; its
+/// bytes are `length` bytes from `bytes`, then zeros.
 ///
 /// Nil where Metal makes none (measured on the M3 Max, macOS 27, in every storage mode, with
 /// bytes and without): for a length of 0 and for one past `maxLength` (the device's
-/// maxBufferLength; 0 holds none back). Nil too where `region` has no room for a Shared or
+/// maxBufferLength; 0 holds none back). Nil too where `slabs` has no room for a Shared or
 /// Managed one, as Metal answers a buffer it cannot place, never memory the GPU does not see;
 /// and for bytes with a mode whose contents the CPU never reaches (Private), which Metal's
 /// validation refuses.
@@ -90,7 +92,7 @@ NS_ASSUME_NONNULL_BEGIN
                                            options:(MTLResourceOptions)options
                                              bytes:(nullable const void *)bytes
                                          maxLength:(NSUInteger)maxLength
-                                            region:(nullable RgfxRegion *)region
+                                             slabs:(nullable RgfxSlabs *)slabs
                                             device:(nullable id<MTLDevice>)device
                                         serializer:(nullable RgfxSerializer *)serializer;
 

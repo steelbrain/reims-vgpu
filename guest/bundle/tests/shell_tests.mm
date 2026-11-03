@@ -52,6 +52,7 @@
 #import "RgfxUploads.h"
 
 #include "RgfxHeapSizes.hpp"
+#include "RgfxSlabs.hpp"
 
 #include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
@@ -283,23 +284,25 @@ void test_private_buffer_has_no_contents()
 	}
 }
 
-// The device's buffers answer as Metal's (measured on the M3 Max, macOS 27): a Shared one lies
-// over a block of the region with the bytes given (or zeros), a Managed one's CPU copy too, and
-// a Private one has no contents. None of 0 bytes or past maxBufferLength, in any mode; none
-// where the region has no room for a Shared or Managed one (no device buffer the host would
-// never see); none for bytes with a Private one. A refusal posts nothing.
+// The device's buffers answer as Metal's (measured on the M3 Max, macOS 27): a Shared one lies in
+// a slab of the region with the bytes given (or zeros), a Managed one's CPU copy too, and a
+// Private one has no contents. None of 0 bytes or past maxBufferLength, in any mode; none where
+// the region has no room for a Shared or Managed one (no device buffer the host would never see);
+// none for bytes with a Private one. A refusal posts nothing.
 void test_device_buffers_answer_as_metal()
 {
 	Fixture fx;
-	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x10000, 0xee);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x80000, 0xee);
 	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource source(region, fx.ser);
+	RgfxSlabs slabs(source);
 	auto make = [&](NSUInteger length, MTLResourceOptions options, const void *bytes,
-	                NSUInteger maxLength, RgfxRegion *in) {
+	                NSUInteger maxLength, RgfxSlabs *in) {
 		return [RgfxBuffer bufferForDeviceWithLength:length
 		                                     options:options
 		                                       bytes:bytes
 		                                   maxLength:maxLength
-		                                      region:in
+		                                       slabs:in
 		                                      device:nil
 		                                  serializer:&fx.ser];
 	};
@@ -313,26 +316,34 @@ void test_device_buffers_answer_as_metal()
 		for (size_t i = 0; i < sizeof(pattern); i++)
 			pattern[i] = static_cast<uint8_t>(i * 3 + 1);
 		RgfxBuffer *shared = make(sizeof(pattern), MTLResourceStorageModeShared, pattern, 0x2000,
-		                          &region);
+		                          &slabs);
 		CHECK(shared != nil && shared.length == sizeof(pattern));
 		uint8_t *at = static_cast<uint8_t *>([shared contents]);
 		CHECK(at >= mem.data() + RGFX_ALLOCATIONS_OFFSET && at < mem.data() + mem.size());
 		CHECK(std::memcmp(at, pattern, sizeof(pattern)) == 0);
-		auto over = expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
-		CHECK(over.obj_id == shared.rgfxObjId && over.length == sizeof(pattern));
-		CHECK(over.region_offset == static_cast<uint64_t>(at - mem.data()));
+		// Its page past the bytes reads zero, whatever the region held there.
+		CHECK(at[sizeof(pattern)] == 0 && at[0xfff] == 0);
+		auto heap = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		auto placed = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(placed.obj_id == shared.rgfxObjId && placed.length == sizeof(pattern) &&
+		      placed.heap_obj_id == heap.obj_id);
+		CHECK(heap.region_offset + placed.offset == static_cast<uint64_t>(at - mem.data()));
+		CHECK(shared.gpuAddress == heap.gpu_address + placed.offset);
 
-		RgfxBuffer *managed = make(0x1000, MTLResourceStorageModeManaged, nullptr, 0x2000, &region);
+		RgfxBuffer *managed = make(0x1000, MTLResourceStorageModeManaged, nullptr, 0x2000, &slabs);
 		CHECK(managed != nil && managed.storageMode == MTLStorageModeManaged);
 		CHECK(static_cast<uint8_t *>([managed contents])[0] == 0 &&
 		      static_cast<uint8_t *>([managed contents])[0xfff] == 0);
-		(void)expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		auto over = expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(over.obj_id == managed.rgfxObjId &&
+		      over.region_offset ==
+		          static_cast<uint64_t>(static_cast<uint8_t *>([managed contents]) - mem.data()));
 
-		RgfxBuffer *priv = make(0x1000, MTLResourceStorageModePrivate, nullptr, 0x2000, &region);
+		RgfxBuffer *priv = make(0x1000, MTLResourceStorageModePrivate, nullptr, 0x2000, &slabs);
 		CHECK(priv != nil && [priv contents] == nullptr);
 		(void)expectMessage<RgfxBufferCreate>(fx.ring, RGFX_CMD_BUFFER_CREATE);
 		// No limit known: none held back.
-		RgfxBuffer *unlimited = make(0x3000, MTLResourceStorageModePrivate, nullptr, 0, &region);
+		RgfxBuffer *unlimited = make(0x3000, MTLResourceStorageModePrivate, nullptr, 0, &slabs);
 		CHECK(unlimited != nil);
 		(void)expectMessage<RgfxBufferCreate>(fx.ring, RGFX_CMD_BUFFER_CREATE);
 		CHECK(nothingPosted());
@@ -341,21 +352,90 @@ void test_device_buffers_answer_as_metal()
 			                                 MTLResourceStorageModeManaged,
 			                                 MTLResourceStorageModePrivate };
 		for (MTLResourceOptions mode : modes) {
-			CHECK(make(0, mode, nullptr, 0x2000, &region) == nil);
-			CHECK(make(0x2001, mode, nullptr, 0x2000, &region) == nil);
+			CHECK(make(0, mode, nullptr, 0x2000, &slabs) == nil);
+			CHECK(make(0x2001, mode, nullptr, 0x2000, &slabs) == nil);
 		}
-		// Bytes for a Private buffer; a Shared or Managed one with no region, or too large for
-		// what it has left.
-		CHECK(make(0x100, MTLResourceStorageModePrivate, pattern, 0x2000, &region) == nil);
+		// Bytes for a Private buffer; a Shared or Managed one with no slabs, or too large for
+		// what the region has left.
+		CHECK(make(0x100, MTLResourceStorageModePrivate, pattern, 0x2000, &slabs) == nil);
 		CHECK(make(0x100, MTLResourceStorageModeShared, nullptr, 0x2000, nullptr) == nil);
-		CHECK(make(0x20000, MTLResourceStorageModeShared, nullptr, 0, &region) == nil);
-		CHECK(make(0x20000, MTLResourceStorageModeManaged, pattern, 0, &region) == nil);
+		CHECK(make(0x80000, MTLResourceStorageModeShared, nullptr, 0, &slabs) == nil);
+		CHECK(make(0x200000, MTLResourceStorageModeManaged, pattern, 0, &slabs) == nil);
 		CHECK(nothingPosted());
 	} // the buffers go while the region lives
 	std::vector<uint8_t> drain;
 	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {
 	}
+}
+
+// What a device buffer in a slab answers, as both x86-64 Macs' GPUs agree (measured, AMD 5300M and
+// Intel 630): its contents and GPU address a page apart from the next, its heap none. A buffer made over a freed one's pages reads zeros, and the freed one's destroy comes
+// before the new one's create; its pages go back to its slab, not to the region.
+void test_device_buffers_take_pages_of_slabs()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource source(region, fx.ser);
+	RgfxSlabs slabs(source);
+	auto make = [&](NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferForDeviceWithLength:length
+		                                     options:options
+		                                       bytes:nullptr
+		                                   maxLength:0
+		                                       slabs:&slabs
+		                                      device:nil
+		                                  serializer:&fx.ser];
+	};
+	uint64_t firstId = 0;
+	@autoreleasepool {
+		NSMutableArray<RgfxBuffer *> *held = [NSMutableArray array];
+		for (int i = 0; i < 64; i++)
+			[held addObject:make(256, MTLResourceStorageModeShared)];
+		for (NSUInteger i = 0; i < held.count; i++) {
+			RgfxBuffer *b = held[i];
+			CHECK(b.length == 256 && b.heap == nil && b.heapOffset == 0);
+			CHECK(reinterpret_cast<uintptr_t>([b contents]) % 0x1000 == 0 && b.gpuAddress % 0x1000 == 0);
+			if (i > 0 && i < 32) {
+				CHECK(b.gpuAddress == held[i - 1].gpuAddress + 0x1000);
+				CHECK(static_cast<uint8_t *>([b contents]) ==
+				      static_cast<uint8_t *>([held[i - 1] contents]) + 0x1000);
+			}
+			// Metal's default hazard tracking for a buffer: Tracked.
+			CHECK(b.resourceOptions == MTLResourceHazardTrackingModeTracked);
+		}
+		CHECK(make(0x10000, MTLResourceStorageModeShared) != nil);
+		CHECK(make(0x10001, MTLResourceStorageModeShared) != nil);
+		RgfxBuffer *mib = make(0x100001, MTLResourceStorageModeManaged);
+		CHECK(mib != nil && mib.length == 0x100001);
+		uint8_t *first = static_cast<uint8_t *>([held[0] contents]);
+		firstId = held[0].rgfxObjId;
+		std::memset(first, 0xa5, 256);
+		drainRing(fx.ring);
+		[held removeObjectAtIndex:0];
+	}
+	@autoreleasepool {
+		// The first buffer's destroy, then a buffer over its page, zeroed.
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		bool destroyed = false;
+		while (fx.ring.next(&h, &bytes)) {
+			RgfxObjectDestroy d = {};
+			if (h.type == RGFX_CMD_OBJECT_DESTROY && bytes.size() == sizeof(d)) {
+				std::memcpy(&d, bytes.data(), sizeof(d));
+				destroyed = destroyed || d.obj_id == firstId;
+			}
+		}
+		CHECK(destroyed);
+		CHECK(slabs.stats().usedBytes == 0 && slabs.stats().slabs >= 2);
+		RgfxBuffer *again = make(0x1000, MTLResourceStorageModeShared);
+		CHECK(again != nil && static_cast<uint8_t *>([again contents])[0] == 0 &&
+		      static_cast<uint8_t *>([again contents])[255] == 0);
+		auto placed = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(placed.offset == 0);
+	}
+	drainRing(fx.ring);
 }
 
 // The device's heaps answer as Metal's (measured on the M3 Max, macOS 27.0.1, plain and under
@@ -9774,6 +9854,7 @@ int main(int argc, char **argv)
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
 		test_device_buffers_answer_as_metal();
+		test_device_buffers_take_pages_of_slabs();
 		test_device_heaps_answer_as_metal();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();

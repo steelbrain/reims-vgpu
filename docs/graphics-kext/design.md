@@ -1282,6 +1282,29 @@ pipeline between equal keys.
 `*_OVER_HOST_MEMORY` map guest region blocks (Shared) and the host builds a
 placement heap/buffer over them.
 
+**Shared and Managed buffers lie in slabs** (`guest/bundle/src/RgfxSlabs.hpp`).
+A device buffer of either mode takes whole 4 KiB pages of a slab, a region
+block the bundle holds, so its create and its free call neither the kext nor
+the host's import, and the kext's block table holds one entry per slab:
+- A Shared slab is one Placement `HEAP_OVER_HOST_MEMORY` of the buffers'
+  options, hazard tracking resolved, and each buffer a `BUFFER_AT_OFFSET`
+  there, at the heap's GPU address plus its offset. A Managed slab is a plain
+  block, and each buffer a `BUFFER_OVER_HOST_MEMORY` over its own range, its CPU
+  copy. The buffer's `heap` is nil: the slab is no object of the app's.
+- Contents and GPU addresses start a page, as both x86-64 Macs' GPUs answer
+  (AMD 5300M, Intel 630, measured with `tools/shmem`). Every new buffer reads
+  zeros: a create zeroes what of its range is dirty, and a background thread
+  zeroes freed ranges first.
+- A buffer up to 1 MiB shares a slab of its class, the slabs growing from
+  128 KiB to 2 MiB; a larger one takes a slab of its own, which is cached for
+  reuse at offset 0 once freed (a sixteenth of the region at most, 2 s idle).
+- A class keeps two empty slabs. A slab let go destroys its heap, then frees
+  its block on the background thread, so no buffer's free waits for a
+  `BLOCK_RELEASE`.
+- Where the region has no block for a new slab, the process's own empty and
+  cached slabs go first, then smaller slabs are tried down to the buffer's
+  size; nil only past that.
+
 The host makes an `Automatic` heap a `Placement` heap: the guest places what
 the heap makes itself, as Metal's Automatic heap places it (lowest free offset
 at the resource's alignment; `guest/bundle/src/RgfxHeapRanges.hpp`), a buffer

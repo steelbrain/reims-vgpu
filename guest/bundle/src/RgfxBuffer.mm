@@ -19,6 +19,7 @@
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxSlabs.hpp"
 
 namespace {
 /// Whether this process maps every byte of [p, p + length) readable, and in `*writable` whether
@@ -174,7 +175,7 @@ bool rgfxCpuStorage(MTLResourceOptions options)
                                   options:(MTLResourceOptions)options
                                     bytes:(const void *)bytes
                                 maxLength:(NSUInteger)maxLength
-                                   region:(RgfxRegion *)region
+                                    slabs:(RgfxSlabs *)slabs
                                    device:(id<MTLDevice>)device
                                serializer:(RgfxSerializer *)serializer
 {
@@ -186,27 +187,33 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 			return nil;
 		return [RgfxBuffer bufferWithLength:length options:options device:device serializer:serializer];
 	}
-	if (region == nullptr || serializer == nullptr)
+	if (slabs == nullptr || serializer == nullptr)
 		return nil;
-	RgfxRegion::Block block = region->allocate(length);
-	if (!block.ok)
+	// Buffers share a slab where the host's would share a heap: of one storage, CPU cache and
+	// hazard tracking mode, a Default one resolved as Metal resolves a buffer's.
+	const uint32_t resolved = static_cast<uint32_t>(
+	    RgfxResolveHazardTracking(options, MTLResourceHazardTrackingModeTracked));
+	RgfxSlabs::Range range;
+	if (!slabs->take(length, resolved, bytes != nullptr ? length : 0, &range))
 		return nil;
-	void *contents = const_cast<uint8_t *>(block.ptr);
 	if (bytes != nullptr)
-		std::memcpy(contents, bytes, length);
-	else
-		std::memset(contents, 0, length);
-	// The block goes back to the region once the host has dropped the buffer.
-	const uint64_t offset = block.offset;
-	RgfxBuffer *buffer = [RgfxBuffer bufferOverHostMemoryWithContents:contents
-	                                                     regionOffset:offset
-	                                                           length:length
-	                                                          options:options
-	                                                      deallocator:^{ region->release(offset); }
-	                                                           device:device
-	                                                       serializer:serializer];
-	if (buffer == nil)
-		region->release(offset); // no buffer lies over the block
+		std::memcpy(range.contents, bytes, length);
+	RgfxSlabSource::Made made;
+	if (!slabs->makeBuffer(range, length, static_cast<uint32_t>(options), &made)) {
+		slabs->give(range); // no buffer lies over the range
+		return nil;
+	}
+	// The range goes back to its slab once the host has dropped the buffer.
+	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:made.objId
+	                                            gpuAddress:made.gpuAddress
+	                                                length:length
+	                                               options:options
+	                                              contents:range.contents
+	                                           deallocator:^{ slabs->give(range); }
+	                                                device:device
+	                                            serializer:serializer];
+	if (buffer != nil)
+		buffer->_ownsAddress = made.ownsAddress;
 	return buffer;
 }
 
@@ -587,8 +594,9 @@ RGFX_RESOURCE_SPI
 
 // The size of the allocation the buffer lies in: its heap's, or its own, as Metal's (measured on
 // the M3 Max under macOS 27: a 1 MiB buffer answers its size, one in a heap the heap's; Metal
-// suballocates small buffers from 128 KiB pools, which answer the pool's size, and the device
-// makes no pools).
+// suballocates small buffers from 128 KiB pools, which answer the pool's size). The slabs the
+// device's buffers lie in are the host's objects and none of the app's, so a buffer answers its
+// own size.
 - (uint64_t)resourceSize
 {
 	id<MTLHeap> heap = self.heap;

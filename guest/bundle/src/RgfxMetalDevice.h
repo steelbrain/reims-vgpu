@@ -64,6 +64,7 @@ class RgfxRegion;
 class RgfxReplyReader;
 class RgfxRingWriter;
 class RgfxCompletionThread;
+class RgfxSlabs;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -106,6 +107,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// piece); the resource and command-queue slices fall back to their non-region path
 /// (or nil) while it is null.
 - (nullable RgfxRegion *)region;
+
+/// The slabs of the region the device's Shared and Managed buffers lie in (RgfxSlabs). Null
+/// until the wire handshake maps the region.
+- (nullable RgfxSlabs *)slabs;
 
 /// The reader of the control completion ring (RgfxReplyReader): command-buffer
 /// completions, pipeline reflections and shared-event signals. Null until the

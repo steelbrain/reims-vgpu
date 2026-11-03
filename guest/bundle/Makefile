@@ -110,7 +110,8 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxSerializer.cpp src/RgfxEncoder.cpp src/RgfxWireLayout.cpp \
 	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp \
 	src/RgfxCompletionThread.cpp src/RgfxFunctionConstants.cpp \
-	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp
+	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp \
+	src/RgfxSlabs.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
 VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp src/RgfxVideoH265.cpp
@@ -166,9 +167,11 @@ $(patsubst src/%.mm,$(BUILD)/obj/$(ARCH)/shell/%.o,$(wildcard src/RgfxMetalDevic
 
 # --- the serialiser check (x86_64, Rosetta) ----------------------------------
 
-$(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp $(HEADERS) $(TESTHEADERS) Makefile
+$(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp tests/slab_tests.cpp $(HEADERS) \
+	$(TESTHEADERS) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(CORE_OBJ_ARCH) tests/serializer_tests.cpp -o $@
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(CORE_OBJ_ARCH) tests/serializer_tests.cpp \
+		tests/slab_tests.cpp -o $@
 
 # --- the Metal-shell wrapper/routing check (native arch) ---------------------
 # The NSObject wrappers + serialiser core + the routing test; no device shell.
