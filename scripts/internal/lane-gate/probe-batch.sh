@@ -23,7 +23,7 @@
 # was skipped. One not reached in a round's hold stays queued for the next.
 #
 #   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
-#                  [--exclude NAME,...] [--hold S] [--catch-from-boot]
+#                  [--exclude NAME,...] [--hold S] [--catch-from-boot] [--host-tip SHA] [--image-tip SHA]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -39,7 +39,9 @@
 # others oldest first, and --only NAME,... takes those alone, in that order; --exclude NAME,...
 # leaves those in the queue (a probe that must come last in its own round); --catch-from-boot
 # starts the hang catcher with QEMU (msi-boot.sh's CATCH_FROM_BOOT), for a restart or a silence
-# before the desktop, and runs with no probe too; --hold S sets the
+# before the desktop, and runs with no probe too; --host-tip and --image-tip boot another
+# published tip's host build (QEMU and ROM) or image instead of the round's (a one-variable
+# control); --hold S sets the
 # round's hold (config.sh's HOLD_S) for this round. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
@@ -47,7 +49,7 @@
 set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
-force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0
+force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
 while (($#)); do
   a=$1
   shift
@@ -59,6 +61,8 @@ while (($#)); do
     --only) first=${1:?--only NAME,...} only=1; shift ;;
     --exclude) exclude=${1?--exclude NAME,...}; shift ;;
     --catch-from-boot) from_boot=1 force=1 ;;
+    --host-tip) host_tip=${1:?--host-tip SHA}; shift ;;
+    --image-tip) image_tip=${1:?--image-tip SHA}; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
@@ -153,6 +157,16 @@ if [[ -n $want_tip ]]; then
   RT=$(published "$want_tip")
   [[ -n $RT ]] || { echo "probe-batch: $want_tip has no published image and host on the lane host" >&2; exit 2; }
 fi
+# A control's host build or image: another published tip's.
+HOST_SHORT=$RT IMAGE_SHORT=$RT
+if [[ -n $host_tip ]]; then
+  HOST_SHORT=$(published "$host_tip")
+  [[ -n $HOST_SHORT ]] || { echo "probe-batch: --host-tip $host_tip is not published on the lane host" >&2; exit 2; }
+fi
+if [[ -n $image_tip ]]; then
+  IMAGE_SHORT=$(published "$image_tip")
+  [[ -n $IMAGE_SHORT ]] || { echo "probe-batch: --image-tip $image_tip is not published on the lane host" >&2; exit 2; }
+fi
 if [[ $RT != "$SHORT" ]]; then
   PUB=$(git -C "$L" rev-parse --verify -q "$RT^{commit}" 2> /dev/null || echo "$RT")
   SHORT=$RT
@@ -170,7 +184,7 @@ while read -r age budget tip name; do
   fit=$(( fit + ${budget:-180} + 15 ))
   take+=("$name")
 done <<< "$queue"
-echo "probe-batch: $n waiting (oldest $(( ${oldest:-0} / 60 )) min); the round's tip $SHORT; a round takes: ${take[*]:-none} ($fit s of $FIT_S)"
+echo "probe-batch: $n waiting (oldest $(( ${oldest:-0} / 60 )) min); the round's tip $SHORT$([[ $HOST_SHORT$IMAGE_SHORT != "$SHORT$SHORT" ]] && echo " (host $HOST_SHORT, image $IMAGE_SHORT)"); a round takes: ${take[*]:-none} ($fit s of $FIT_S)"
 ((list)) && { printf '%s\n' "$queue" | sed '/^$/d; s/^/  /'; exit 0; }
 if (( !dry && !force )) && (( n < WAIT_N )) && (( ${oldest:-0} < WAIT_S )); then
   echo "probe-batch: no round (a round runs at $WAIT_N waiting or the oldest at $(( WAIT_S / 60 )) min, or with --force)"
@@ -200,9 +214,9 @@ else
   put "$run/artifacts/payload/bench" "$RD/payload/"
   put "$L/msi-boot.sh" "$RD/bin/"
   msi "cat > '$RD/boot.env'" << EOF
-QEMU=$MSI_RGK_RUN/tip-host/$SHORT/qemu-system-x86_64
-ROM=$MSI_RGK_RUN/tip-host/$SHORT/ReimsGraphics.rom
-OC=$MSI_RGK_RUN/loader-fix/oc-sipon-$SHORT.qcow2
+QEMU=$MSI_RGK_RUN/tip-host/$HOST_SHORT/qemu-system-x86_64
+ROM=$MSI_RGK_RUN/tip-host/$HOST_SHORT/ReimsGraphics.rom
+OC=$MSI_RGK_RUN/loader-fix/oc-sipon-$IMAGE_SHORT.qcow2
 DISK=$MSI_DISK
 TAG=probes-$ROUND
 PAYLOAD=$RD/payload
