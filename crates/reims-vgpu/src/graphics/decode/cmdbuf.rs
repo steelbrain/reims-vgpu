@@ -2511,8 +2511,8 @@ mod tests {
     }
 
     impl GraphicsVideoSession<FakePlatform> for FakeSession {
-        fn event(&self) -> &<FakePlatform as Platform>::SharedEvent {
-            &self.event
+        fn event(&self) -> reims_vgpu_core::platform::event::EventRef<'_, FakePlatform> {
+            reims_vgpu_core::platform::event::EventRef::Shared(&self.event)
         }
 
         fn codec(&self) -> u32 {

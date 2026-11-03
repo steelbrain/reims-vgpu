@@ -39,11 +39,13 @@
 //!     shares the CPU's memory. The write is bracketed for the dirty log ([`host_write`]) while
 //!     the planes are held.
 //! - **Order.** A decode starts as the host takes the command buffer that encodes it, after the
-//!   session's earlier decodes on the same queue. The session's shared event, which the command
-//!   buffer waits for, is then signalled by a submission of no work that waits for the decode
-//!   and its copy out ([`VideoDevice::signal_after_decode`]), its signal reserved with the
-//!   runtime (`SharedEvent::reserve_vk_signal`); where that submission fails, the host signals
-//!   it, so the command buffer goes on.
+//!   session's earlier decodes on the same queue. The session's event, which the command buffer
+//!   waits for, is then signalled by a submission of no work that waits for the decode and its
+//!   copy out ([`VideoDevice::signal_after_decode`]), its signal reserved with the runtime
+//!   (`reserve_vk_signal`); where that submission fails, the host signals it, so the command
+//!   buffer goes on. The event is plain where the decoders' own queues carry the decodes and the
+//!   copies, so the command buffer's wait goes to its `VkQueue` with it; shared where the copies
+//!   go to a lent queue, so the runtime holds the wait on the host ([`EventKind`]).
 //! - **Decodes beside copies.** Where the device has `VK_KHR_unified_image_layouts`'s
 //!   `unifiedImageLayoutsVideo`, which the platform enables where it is there
 //!   (`VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION`), the decoders keep their pictures in `GENERAL`;
@@ -66,8 +68,9 @@ use reims_graphics::wire::{
 use reims_vgpu_core::memory::dirty::host_write;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
+use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::raise::{Raise, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video_vulkan::{
     BufferPlanes, Capabilities, Error as VideoError, H264Capabilities, H264Decoder, H264Profile,
@@ -77,7 +80,7 @@ use reims_vgpu_video_vulkan::{
 };
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
-use reims_vgpu_vulkan::gpu::event::VulkanSharedEvent;
+use reims_vgpu_vulkan::gpu::event::{VulkanEvent, VulkanSharedEvent};
 use reims_vgpu_vulkan::platform::{
     VIDEO_DECODE_EXTENSIONS, VIDEO_DECODE_H265_EXTENSION, VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION,
 };
@@ -131,6 +134,8 @@ struct DeviceVideo {
     /// reserved queue, or a lent one: [`RuntimeQueue`]), which writes the runtime's buffers, an
     /// IOSurface's device cache among them.
     caches: bool,
+    /// The kind of event its sessions signal, by where the copies out go ([`EventKind::of`]).
+    events: EventKind,
     /// The runtime's device, whose handles `video` uses.
     device: VulkanDevice,
 }
@@ -243,6 +248,7 @@ impl DeviceVideo {
                 ),
         };
         let caches = reserved.is_some() || lent.is_some();
+        let events = EventKind::of(lent.is_some());
         let copy_queue = match (reserved, &lent) {
             (Some(_), _) => "the reserved queue",
             (None, Some(_)) => "a lent queue",
@@ -299,6 +305,7 @@ impl DeviceVideo {
             h264,
             h265,
             caches,
+            events,
             device: device.clone_ref(),
         })
     }
@@ -577,14 +584,116 @@ fn skipped_is_none<T>(decoded: Result<T, VideoError>) -> Result<(), VideoError> 
     }
 }
 
+/// The kind of event a device's decode sessions signal ([`SessionEvent`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventKind {
+    /// A plain event (`newEvent`): the runtime submits a command buffer's wait for its value to the
+    /// command buffer's `VkQueue`, before the signal's submission where need be
+    /// (`Event::reserve_vk_signal`).
+    Plain,
+    /// A shared event (`newSharedEvent`): the runtime holds a command buffer's wait for its value on
+    /// the host until the signal landed (`SharedEvent::reserve_vk_signal`).
+    Shared,
+}
+
+impl EventKind {
+    /// The kind for a device whose decoders copy pictures out on a lent queue (`lent`), or on
+    /// their own queues.
+    ///
+    /// A command buffer waiting for a plain event's value may be submitted before the signal, so
+    /// the signal's submission must depend on no command buffer of the runtime's: it waits for
+    /// none's completion and sits behind none on a `VkQueue` (the runtime's word). It waits for the
+    /// decode and the copy out. On the decode queue and the reserved queue those depend on none:
+    /// the queues are the decoders' alone, and each decode and copy waits only for the decoder's
+    /// own work. A lent queue's `VkQueue` is a runtime command queue's, which the runtime's command
+    /// buffers share ([`RuntimeQueue`]): a guest's command buffer waiting for the event there would
+    /// hold the copy out behind it, and so the signal, for good. There the event is shared.
+    fn of(lent: bool) -> Self {
+        if lent { Self::Shared } else { Self::Plain }
+    }
+}
+
+/// The event a session's decodes signal, of its device's kind ([`EventKind`]).
+enum SessionEvent {
+    Plain(VulkanEvent),
+    Shared(VulkanSharedEvent),
+}
+
+impl SessionEvent {
+    /// A new event of `kind`, on `video`'s device; `None` where the device makes none.
+    fn new(video: &DeviceVideo, kind: EventKind) -> Option<Self> {
+        match kind {
+            EventKind::Plain => {
+                (video.device.new_event(OnFault::Return).ok().flatten()).map(Self::Plain)
+            }
+            EventKind::Shared => video.device.new_shared_event().map(Self::Shared),
+        }
+    }
+
+    /// The runtime's reservation of a signal of `value` for a submission of ours.
+    ///
+    /// # Safety
+    ///
+    /// The runtime's `reserve_vk_signal` of the event's kind; for a plain event, the signal's
+    /// submission depends on no command buffer of the runtime's ([`EventKind::of`]).
+    unsafe fn reserve_vk_signal(&self, value: u64) -> Result<rt::VkEventSignal, rt::Error> {
+        // SAFETY: the caller's.
+        unsafe {
+            match self {
+                Self::Plain(event) => event.reserve_vk_signal(value),
+                Self::Shared(event) => event.reserve_vk_signal(value),
+            }
+        }
+    }
+
+    /// The event's timeline semaphore.
+    ///
+    /// # Safety
+    ///
+    /// The runtime's `vk_semaphore` of the event's kind.
+    unsafe fn vk_semaphore(&self) -> vk::Semaphore {
+        // SAFETY: the caller's.
+        unsafe {
+            match self {
+                Self::Plain(event) => event.vk_semaphore(),
+                Self::Shared(event) => event.vk_semaphore(),
+            }
+        }
+    }
+
+    /// Whether the event's value reached `value` within `timeout`. A plain event has no host
+    /// wait: its timeline semaphore is waited for, to the signal the runtime says reaches the
+    /// value.
+    fn landed(&self, video: &VideoDevice, value: u64, timeout: Duration) -> bool {
+        match self {
+            Self::Shared(event) => event.wait_until_signaled_value(value, timeout),
+            Self::Plain(event) => match event.vk_wait(value) {
+                rt::VkEventWait::Reached => true,
+                rt::VkEventWait::Counter(counter) => {
+                    // SAFETY: the semaphore is only waited for, while the session holds the event.
+                    let semaphores = [unsafe { event.vk_semaphore() }];
+                    let values = [counter];
+                    let info = vk::SemaphoreWaitInfo::default()
+                        .semaphores(&semaphores)
+                        .values(&values);
+                    let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+                    // SAFETY: the semaphore is the device's, a timeline semaphore.
+                    unsafe { video.device().wait_semaphores(&info, nanos) }.is_ok()
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
 /// A decode session, of one codec.
 struct DecodeSession {
     /// The decoder, and the counts it is driven by; dropped first.
     state: Mutex<DecodeState>,
     /// The output of the decode being taken ([`GuestOutputs`]).
     next: Arc<Mutex<Option<Output>>>,
-    /// The shared event each decode signals.
-    event: VulkanSharedEvent,
+    /// The event each decode signals.
+    event: SessionEvent,
     /// The device, held while the decoder lives.
     video: Arc<DeviceVideo>,
 }
@@ -603,7 +712,7 @@ impl DecodeSession {
         video: &Arc<DeviceVideo>,
         (decoder, next): (CodecDecoder, Arc<Mutex<Option<Output>>>),
     ) -> Option<Self> {
-        let event = video.device.new_shared_event()?;
+        let event = SessionEvent::new(video, video.events)?;
         Some(Self {
             state: Mutex::new(DecodeState {
                 decoder,
@@ -675,8 +784,11 @@ impl DecodeSession {
 }
 
 impl GraphicsVideoSession<VulkanPlatform> for DecodeSession {
-    fn event(&self) -> &VulkanSharedEvent {
-        &self.event
+    fn event(&self) -> EventRef<'_, VulkanPlatform> {
+        match &self.event {
+            SessionEvent::Plain(event) => EventRef::Event(event),
+            SessionEvent::Shared(event) => EventRef::Shared(event),
+        }
     }
 
     fn codec(&self) -> u32 {
@@ -703,7 +815,7 @@ impl Drop for DecodeSession {
     fn drop(&mut self) {
         // The decoder's semaphore goes with it: the last signal, which waits for it, lands first.
         let last = self.state.lock().signalled;
-        if last > 0 && !self.event.wait_until_signaled_value(last, TEARDOWN_WAIT) {
+        if last > 0 && !self.event.landed(&self.video.video, last, TEARDOWN_WAIT) {
             log::error!("hardware video: a session's last signal did not land");
         }
     }
@@ -977,6 +1089,16 @@ mod tests {
         assert_eq!(caps.formats, RGFX_VIDEO_FORMAT_NV12);
         assert_eq!(caps.max_level, 186);
         assert!(h265_caps(&[]).is_none());
+    }
+
+    /// A session's event is plain where the decoders copy out on their own queues, whose signal
+    /// then depends on no command buffer of the runtime's, and shared where they copy out on a
+    /// lent queue, a `VkQueue` the runtime's command buffers share, which a plain event's wait
+    /// submitted ahead of the copy would hold for good
+    #[test]
+    fn a_session_s_event_is_shared_only_where_its_copies_go_to_a_lent_queue() {
+        assert_eq!(EventKind::of(false), EventKind::Plain);
+        assert_eq!(EventKind::of(true), EventKind::Shared);
     }
 
     /// H.264's caps list each profile some device profile decodes a stream of: a device of High

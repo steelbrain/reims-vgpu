@@ -103,10 +103,10 @@ impl<P: Platform> Drop for SessionHold<P> {
     }
 }
 
-/// A video session: each picture's work, started in order, and the shared event it signals.
+/// A video session: each picture's work, started in order, and the event it signals.
 pub trait GraphicsVideoSession<P: Platform>: Send + Sync {
-    /// The shared event the session's work signals, which command buffers wait for.
-    fn event(&self) -> &P::SharedEvent;
+    /// The event the session's work signals, which command buffers wait for: plain or shared.
+    fn event(&self) -> EventRef<'_, P>;
 
     /// The codec of its access units (`RGFX_VIDEO_CODEC_*`).
     fn codec(&self) -> u32;
@@ -324,7 +324,7 @@ pub(super) fn decode_op<P: Platform>(
     // output it would land over among them.
     objs.wait_for_order_on_cpu();
     let done = session.decode(&decode)?;
-    cb.encode_wait(Some(EventRef::Shared(session.event())), done)?;
+    cb.encode_wait(Some(session.event()), done)?;
     Ok(true)
 }
 
