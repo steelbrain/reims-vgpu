@@ -104,21 +104,32 @@ def give_back(paths):
 def scanout(pid, t_end):
     from compression import zstd  # Python 3.14
 
-    blocks = qmp({"execute": "human-monitor-command", "arguments": {"command-line": "info ramblock"}})[0]
-    text = blocks.get("return", "")
-    log("ramblocks:\n" + text)
-    # "Block Name  PSize  Offset  Used  Total  HVA  RO": the device's allocations block, its four
-    # hexadecimal fields offset, used, total and the host's address.
-    hva = name = None
-    for line in text.splitlines():
-        f = line.split()
-        hexes = [int(x, 16) for x in f[1:] if x.startswith("0x")]
-        if f and len(hexes) >= 4 and re.search(r"reims.*alloc|alloc.*reims", f[0], re.I):
-            name, total, hva = f[0], hexes[2], hexes[3]
+    blocks, tree = (r.get("return", "") for r in qmp(
+        {"execute": "human-monitor-command", "arguments": {"command-line": "info ramblock"}},
+        {"execute": "human-monitor-command", "arguments": {"command-line": "info mtree"}}))
+    log("ramblocks:\n" + blocks)
+    # The allocations are a RAM pointer region (memory_region_init_ram_ptr), whose RAM block has
+    # no name in "info ramblock": it is the nameless block of the region's size, which "info
+    # mtree" states ("START-END (prio P, ram): reims-graphics-pci.allocations").
+    size = None
+    for line in tree.splitlines():
+        m = re.search(r"([0-9a-f]+)-([0-9a-f]+) \(prio [-0-9]+, ram\): reims-graphics-pci\.allocations$", line.strip())
+        if m:
+            size = int(m.group(2), 16) - int(m.group(1), 16) + 1
             break
-    if hva is None:
-        log("no reims-graphics-pci allocations block in info ramblock")
-        return "frames=0 distinct=0 why=no-allocations-block"
+    # "Block Name  PSize  Offset  Used  Total  HVA  RO": a nameless block's line starts with its
+    # page size; its four hexadecimal fields are offset, used, total and the host's address.
+    found = []
+    for line in blocks.splitlines():
+        f = line.split()
+        hexes = [int(x, 16) for x in f if x.startswith("0x")]
+        if len(hexes) >= 4 and f[0][:1].isdigit() and hexes[1] == size:
+            found.append((hexes[2], hexes[3]))
+    if len(found) != 1:
+        log(f"the allocations region is {size} bytes (info mtree); nameless RAM blocks of that size: {len(found)}")
+        return f"frames=0 distinct=0 why=allocations-block-{'unsized' if size is None else len(found)}"
+    total, hva = found[0]
+    name = f"reims-graphics-pci.allocations({size:#x})"
     w, h = (int(x) for x in os.environ.get("CAPTURE_MODE", "3840x2400").split("x"))
     stride = (w * 4 + 255) & ~255
     first, rows = h // 3, (2 * h) // 3 - h // 3
@@ -208,6 +219,7 @@ def shots(pid, t_end):
     return f"sent={n} failed={fails}"
 
 
+give_back([C])  # its stop file is the user's to write
 pid = qemu()
 if pid is None:
     result = "frames=0 why=no-qemu"
