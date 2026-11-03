@@ -27,7 +27,5 @@ mod ring;
 mod wake;
 pub mod wire;
 
-pub use device::{
-    CompleteAnswer, CompletionPoster, Device, Host, PresentAnswer, REGION_SIZE, Taken,
-};
+pub use device::{CompleteAnswer, CompletionPoster, Device, Host, PresentAnswer, REGION_SIZE};
 pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};

@@ -493,15 +493,12 @@ impl Pending {
     }
 
     /// Whether no pipeline the command buffer `message` names is pending, answered waiting for
-    /// nothing: false where another thread holds the table.
+    /// nothing and allocating nothing: false where another thread holds the table.
     pub(crate) fn none_named_by(&self, message: &[u8]) -> bool {
         let Some(ids) = self.ids.try_lock() else {
             return false;
         };
-        ids.is_empty()
-            || !named_pipelines(message)
-                .iter()
-                .any(|id| ids.contains_key(id))
+        ids.is_empty() || !pipelines_named(message).any(|id| ids.contains_key(&id))
     }
 
     /// Waits until no pipeline the command buffer `message` names is pending.
@@ -632,44 +629,50 @@ pub(crate) fn icb_write_pipelines(message: &[u8]) -> Vec<u64> {
 /// `SET_COMPUTE_PIPELINE_STATE`'s, nil left out. The walk stops at an op it cannot step past; the
 /// decoder refuses such a stream itself.
 pub(crate) fn named_pipelines(message: &[u8]) -> Vec<u64> {
-    let mut named = Vec::new();
-    let Ok((cb, _)) = RgfxCommandBuffer::read_from_prefix(message) else {
-        return named;
-    };
-    let start = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
-    let end = usize::try_from(cb.op_bytes)
+    pipelines_named(message).collect()
+}
+
+/// [`named_pipelines`], read in place, allocating nothing.
+fn pipelines_named(message: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    let end = RgfxCommandBuffer::read_from_prefix(message)
         .ok()
-        .and_then(|n| start.checked_add(n))
-        .map_or(message.len(), |end| end.min(message.len()));
-    let mut at = start;
-    while let Some(op) = message.get(at..end) {
-        let Ok((header, _)) = RgfxOpHeader::read_from_prefix(op) else {
-            break;
-        };
-        let len = header.len as usize;
-        if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > op.len() {
-            break;
-        }
-        let body = &op[RGFX_OP_BODY_OFFSET as usize..len];
-        let pipeline = match header.tag {
-            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => {
-                RgfxOpSetRenderPipelineState::read_from_prefix(body)
-                    .ok()
-                    .map(|(m, _)| m.pipeline_obj_id)
+        .map(|(cb, _)| {
+            let start = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
+            usize::try_from(cb.op_bytes)
+                .ok()
+                .and_then(|n| start.checked_add(n))
+                .map_or(message.len(), |end| end.min(message.len()))
+        });
+    let mut at = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
+    std::iter::from_fn(move || {
+        let end = end?;
+        loop {
+            let op = message.get(at..end)?;
+            let (header, _) = RgfxOpHeader::read_from_prefix(op).ok()?;
+            let len = header.len as usize;
+            if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > op.len() {
+                return None;
             }
-            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
-                RgfxComputeOpSetComputePipelineState::read_from_prefix(body)
-                    .ok()
-                    .map(|(m, _)| m.pipeline_obj_id)
+            let body = &op[RGFX_OP_BODY_OFFSET as usize..len];
+            at += len;
+            let pipeline = match header.tag {
+                RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => {
+                    RgfxOpSetRenderPipelineState::read_from_prefix(body)
+                        .ok()
+                        .map(|(m, _)| m.pipeline_obj_id)
+                }
+                RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
+                    RgfxComputeOpSetComputePipelineState::read_from_prefix(body)
+                        .ok()
+                        .map(|(m, _)| m.pipeline_obj_id)
+                }
+                _ => None,
+            };
+            if let Some(id) = pipeline.filter(|&id| id != 0) {
+                return Some(id);
             }
-            _ => None,
-        };
-        if let Some(id) = pipeline.filter(|&id| id != 0) {
-            named.push(id);
         }
-        at += len;
-    }
-    named
+    })
 }
 
 #[cfg(test)]

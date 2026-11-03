@@ -38,18 +38,21 @@
 //! too. Either way it goes once, ahead of the buffer's `CB_SCHEDULED` and `CB_COMPLETE`
 //! ([`Submitted`]).
 //!
-//! **A take on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may be
-//! taken on the thread of the guest's doorbell write instead (`reims_graphics`'s
-//! `Device::mmio_write_taking`), where nothing need be waited for there
-//! ([`GraphicsDecoder::submits_at_take`], which tries its turn in its queue's lane too): it is
-//! begun there ([`GraphicsDecoder::begin_command_buffer`], which makes its command buffer and
-//! fills no device cache, trying each lock it takes), its `CB_SUBMITTED` posted there once its
-//! ticket in the commit order is issued, and its decoder carried to its queue's service thread,
-//! which hands its walk and commit to the queue's lane ([`GraphicsDecoder::finish_command_buffer`],
-//! [`super::lane`]) as it hands those of every buffer it begins itself
-//! ([`GraphicsDecoder::begin_taken`]). A queue's command buffers made and not completed are
-//! counted ([`InFlight`]), so the platform's `commandBuffer`, which waits while a queue holds 64,
-//! does not wait on that thread.
+//! **An answer on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may
+//! get it on the thread of the guest's doorbell write instead, before its queue's service thread
+//! takes it off its ring (`reims_graphics`'s `Device::mmio_write_taking`), where nothing need be
+//! waited for or allocated there ([`Decoders::answer_at_doorbell`]): it uses no device cache,
+//! and every lock the answer takes is tried. Its turn in its queue's lane and its ticket in the
+//! commit order are taken there, in the order its begin would take them, and kept on its queue
+//! with its mark in that order ([`Answered`]), then its `CB_SUBMITTED` is posted. Its begin, on
+//! the service thread, takes them in place of its own ([`GraphicsDecoder::begin_taken`]), makes
+//! its command buffer and hands its walk and commit to the lane as it does any buffer's, and
+//! posts no second `CB_SUBMITTED`; so its commit, and every commit it orders, comes where it
+//! would had the answer been posted at its begin. One never begun (its queue gone, the device
+//! reset) lets them go with its queue's entry. A queue's command buffers made and not completed
+//! are counted ([`InFlight`]), and one is answered there only while its queue holds fewer than
+//! [`TAKE_IN_FLIGHT_MAX`], so the platform's `commandBuffer`, which waits while a queue holds 64,
+//! does not wait at its begin.
 //!
 //! **Two kinds of failure.** A message or op that will not parse structurally — a
 //! short message, a bad `len`, an op body too short for a header — is a protocol
@@ -104,12 +107,13 @@ use zerocopy::FromBytes;
 
 use super::super::completion::{cb_complete, cb_failed};
 use super::lane::{Lane, Turn};
+use super::sequencer::Ticket;
 use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
-    DecodeError, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, ScheduledSink,
-    SubmittedSink, blit, compute, op_fault, read, refusing, render, video,
+    DecodeError, Decoders, Drain, GraphicsDecoder, GraphicsVideoSession, ObjHandle, ScheduledSink,
+    SubmittedSink, blit, compute, context_of, op_fault, read, refusing, render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -126,9 +130,10 @@ struct EventOps {
     waits: Vec<(u64, u64)>,
 }
 
-/// A command buffer's `CB_SUBMITTED`, posted once: by the first of the host's take of it (for a
-/// buffer that waits for nothing), the buffer's submission handler and its completion handler,
-/// each of which posts it ahead of its own record, so it comes before them on the ring.
+/// A command buffer's `CB_SUBMITTED`, posted once: by the first of the answer on a doorbell's
+/// thread ([`Answered`]) or the host's take of it (for a buffer that waits for nothing), the
+/// buffer's submission handler and its completion handler, each of which posts it ahead of its
+/// own record, so it comes before them on the ring.
 pub(crate) struct Submitted {
     sink: SubmittedSink,
     record: RgfxCbSubmitted,
@@ -143,18 +148,6 @@ impl Submitted {
         if !*posted {
             (self.sink)(self.record);
             *posted = true;
-        }
-    }
-
-    /// Posts the record through `post` unless it is posted already or being posted, waiting for
-    /// nothing: `post` posts it waiting for nothing and answers whether it did, and where it did
-    /// not, a later [`Self::post`] posts it.
-    pub(crate) fn try_post(&self, post: impl FnOnce(&RgfxCbSubmitted) -> bool) {
-        let Some(mut posted) = self.posted.try_lock() else {
-            return;
-        };
-        if !*posted {
-            *posted = post(&self.record);
         }
     }
 }
@@ -188,8 +181,8 @@ impl Scheduled {
     }
 }
 
-/// The most command buffers a queue may hold made and not completed for its next to be taken on
-/// a doorbell's thread ([`GraphicsDecoder::submits_at_take`]): Metal's `commandBuffer`, and the
+/// The most command buffers a queue may hold made and not completed for its next to be answered
+/// on a doorbell's thread ([`Decoders::answer_at_doorbell`]): Metal's `commandBuffer`, and the
 /// Vulkan platform's, wait while a queue holds 64, and a buffer leaves the count as its completion
 /// handler ends, which may come before the platform lets its place go.
 const TAKE_IN_FLIGHT_MAX: usize = 48;
@@ -438,6 +431,197 @@ fn names_order(ops: &[u8]) -> bool {
     take(ops).order.is_some()
 }
 
+/// Each op of the op stream `ops`, in stream order: its tag and its body, read in place. It stops
+/// at an op it cannot step past, as the walk does.
+fn op_bodies(mut ops: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    std::iter::from_fn(move || {
+        let h = read::<RgfxOpHeader>(ops)?;
+        let len = h.len as usize;
+        if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
+            return None;
+        }
+        let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
+        ops = &ops[len..];
+        Some((h.tag, body))
+    })
+}
+
+/// What an answer on a doorbell's thread reads of a command buffer's op stream, in place and
+/// allocating nothing, as [`take`] reads it: whether it asks for its `CB_SUBMITTED` and waits for
+/// an event, its first `SURFACE_ORDER`'s body, and the blocks its `SURFACE_USE` ops name.
+struct Glance<'o> {
+    ops: &'o [u8],
+    asks: bool,
+    waits: bool,
+    order: Option<&'o [u8]>,
+}
+
+impl<'o> Glance<'o> {
+    /// What the answer reads of `ops`.
+    fn of(ops: &'o [u8]) -> Self {
+        let mut glance = Glance {
+            ops,
+            asks: false,
+            waits: false,
+            order: None,
+        };
+        for (tag, body) in op_bodies(ops) {
+            match tag {
+                RGFX_OP_WAIT_EVENT => glance.waits = true,
+                RGFX_OP_SUBMITTED => glance.asks = true,
+                RGFX_OP_SURFACE_ORDER if glance.order.is_none() => glance.order = Some(body),
+                _ => {}
+            }
+        }
+        glance
+    }
+
+    /// The blocks the stream's `SURFACE_USE` ops name, in stream order.
+    fn used_blocks(&self) -> impl Iterator<Item = u64> + 'o {
+        (op_bodies(self.ops))
+            .filter(|&(tag, _)| tag == RGFX_OP_SURFACE_USE)
+            .filter_map(|(_, body)| RgfxOpSurfaceUse::read_from_prefix(body).ok())
+            .map(|(op, _)| op.block_offset)
+    }
+
+    /// The buffers of other queues its first `SURFACE_ORDER` names.
+    fn order_waits(body: &'o [u8]) -> impl Iterator<Item = RgfxSurfaceOrderWait> + 'o {
+        let (waits, _) = body.as_chunks::<{ size_of::<RgfxSurfaceOrderWait>() }>();
+        (waits.iter()).filter_map(|w| RgfxSurfaceOrderWait::read_from_bytes(w).ok())
+    }
+}
+
+/// A command buffer answered `CB_SUBMITTED` on a doorbell's thread before its queue's service
+/// thread took it ([`Decoders::answer_at_doorbell`]), kept on its queue until its begin takes it
+/// ([`GraphicsDecoder::begin_taken`]): what the answer took for it in the orders its begin keeps.
+/// Let go of unbegun (its queue's entry gone, the device reset), its turn passes and its ticket
+/// is given back.
+pub(crate) struct Answered {
+    /// Its message's seqno, and the guest's id of the buffer.
+    seqno: u64,
+    cb_obj_id: u64,
+    /// The device's resets at the answer ([`super::FailedContexts::resets`]): one from before a
+    /// reset is not taken.
+    resets: u64,
+    /// The commit order's mark at the answer: every ticket issued before its own.
+    mark: u64,
+    /// Its context's range messages that came before the answer, where any was still to be
+    /// carried out ([`super::sequencer::Sequencer::ranges_asked`]).
+    ranges: Option<u64>,
+    /// Its ticket in the commit order, issued before its `CB_SUBMITTED` was posted.
+    ticket: Ticket,
+    /// Its turn in its queue's lane, where the queue has one.
+    turn: Option<Turn>,
+    /// Its `CB_SUBMITTED` was posted; else the queue's ring was busy or full, and its begin posts
+    /// it.
+    posted: bool,
+}
+
+impl<P: Platform> Decoders<P> {
+    /// Answers the `COMMAND_BUFFER` `message`, of `context`'s, at the head of its queue's ring,
+    /// `CB_SUBMITTED` on a doorbell's thread, before its queue's service thread takes it (the
+    /// module doc), where it gets that at its take ([`Begun::submitted_at_take`]) with nothing
+    /// waited for or allocated on the way: its context's work is not refused, it names a command
+    /// queue of its context, it asks for its `CB_SUBMITTED` and waits for no event, it uses no
+    /// device cache ([`super::surface_cache`]) and waits for no buffer of another queue
+    /// ([`super::surface_order`]), no buffer before it holds its queue, its queue holds fewer than
+    /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed and no answered buffer not yet
+    /// begun, and each lock it takes is free, each tried. Its turn in its queue's lane and its
+    /// ticket in the commit order are taken together, or neither, and kept on its queue
+    /// ([`Answered`]), and the answer is posted through `post`, which waits for nothing and answers
+    /// whether it posted it. False, with nothing taken, where it is not answered.
+    pub(crate) fn answer_at_doorbell(
+        &self,
+        context: u32,
+        message: &[u8],
+        post: impl FnOnce(&RgfxCbSubmitted) -> bool,
+    ) -> bool {
+        let shared = &*self.0;
+        let Some(m) = read::<RgfxCommandBuffer>(message) else {
+            return false;
+        };
+        let Some(ops) = ops_of(message, &m) else {
+            return false;
+        };
+        let glance = Glance::of(ops);
+        if !glance.asks
+            || glance.waits
+            || context_of(m.queue_obj_id) != context
+            || shared.failed.try_has(context) != Some(false)
+            || shared.surface_caches.none_cached(glance.used_blocks()) != Some(true)
+        {
+            return false;
+        }
+        if let Some(body) = glance.order {
+            let Some(order) = shared.surface_order.try_lock() else {
+                return false;
+            };
+            if !order.ready(m.queue_obj_id, Glance::order_waits(body)) {
+                return false;
+            }
+        }
+        let Some(ranges) = shared.sequencer.ranges_asked(context, true) else {
+            return false;
+        };
+        // The context's table as it is now, no view taken (a view's taking allocates), with the
+        // contexts' lock held, so the context is not let go of here.
+        let Some(contexts) = shared.contexts.try_lock() else {
+            return false;
+        };
+        let Some(state) = contexts.get(&context) else {
+            return false;
+        };
+        let answered = state.try_with_live(m.queue_obj_id, |entry| {
+            let (ObjHandle::CommandQueue(_), Some(counts)) = (&entry.handle, &entry.queue) else {
+                return false;
+            };
+            if counts.held.load(Ordering::Acquire) != 0
+                || counts.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
+            {
+                return false;
+            }
+            let Some(mut slot) = counts.answered.try_lock() else {
+                return false;
+            };
+            if slot.is_some() {
+                return false;
+            }
+            let issue = || shared.sequencer.issue_marked(context);
+            let (turn, (mark, ticket)) = match &counts.lane {
+                Some(lane) => match lane.try_turn_with(issue) {
+                    Some((turn, issued)) => (Some(turn), issued),
+                    None => return false,
+                },
+                None => match issue() {
+                    Some(issued) => (None, issued),
+                    None => return false,
+                },
+            };
+            let record = RgfxCbSubmitted {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_EVT_CB_SUBMITTED,
+                    size: size_of::<RgfxCbSubmitted>() as u32,
+                    seqno: m.header.seqno,
+                },
+                cb_obj_id: m.cb_obj_id,
+            };
+            let posted = post(&record);
+            *slot = Some(Answered {
+                seqno: m.header.seqno,
+                cb_obj_id: m.cb_obj_id,
+                resets: shared.failed.resets(),
+                mark,
+                ranges,
+                ticket,
+                turn,
+                posted,
+            });
+            true
+        });
+        answered == Some(true)
+    }
+}
+
 /// `handler`, which first lets the buffer's queue's surface timeline know it finished, where it
 /// `signalled` it ([`super::surface_order`]), so a buffer decoded once its completion is posted
 /// waits for nothing of it.
@@ -502,7 +686,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         message: &[u8],
         drain: Option<Arc<Drain>>,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let begun = match self.begin_command_buffer(device, message, drain, true)? {
+        let begun = match self.begin_command_buffer(device, message, drain)? {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
@@ -511,94 +695,38 @@ impl<P: Platform> GraphicsDecoder<P> {
         // the commit order is issued first, so a buffer the guest sends after the answer is
         // committed after this one ([`super::sequencer`]).
         if let Some(submitted) = begun.submitted_at_take() {
-            self.issue_ticket(false);
+            self.issue_ticket();
             submitted.post();
         }
         self.finish_command_buffer(device, message, begun)
     }
 
     /// Issues the message's command buffer its ticket in the commit order, before its
-    /// `CB_SUBMITTED` is posted at its take ([`super::sequencer`]); where `try_only`, false where
-    /// the order is busy, and the caller posts the answer from a thread that may wait.
-    pub(crate) fn issue_ticket(&self, try_only: bool) -> bool {
+    /// `CB_SUBMITTED` is posted at its take ([`super::sequencer`]), where it holds none yet (one
+    /// answered on a doorbell's thread holds the answer's).
+    fn issue_ticket(&self) {
         if self.ticket.borrow().is_some() {
-            return true;
+            return;
         }
-        let Some(ticket) = self.shared.sequencer.issue(self.context, try_only) else {
-            return false;
-        };
-        *self.ticket.borrow_mut() = Some(ticket);
-        true
-    }
-
-    /// Whether the `COMMAND_BUFFER` `message`, of the current context, gets its `CB_SUBMITTED` at
-    /// its take ([`Begun::submitted_at_take`]) with nothing waited for on the way, so a doorbell's
-    /// thread may begin it, filling no device cache: its context's work is not refused, it names
-    /// a command queue of its context, asks for its `CB_SUBMITTED` (with a sink to post it on) and
-    /// waits for no event, no buffer before it holds its queue, the device caches it uses need no
-    /// fill and no wait for one ([`super::surface_cache`]), it waits for no buffer of another
-    /// queue ([`super::surface_order`], its lock only tried), and its queue holds fewer than
-    /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed, so the platform's
-    /// `commandBuffer` does not wait. Where so, the buffer is counted among the users of those
-    /// caches, as its begin would count it ([`super::surface_cache::Caches::hold_ready`]).
-    pub(crate) fn submits_at_take(&self, message: &[u8]) -> bool {
-        let Some(m) = read::<RgfxCommandBuffer>(message) else {
-            return false;
-        };
-        let Some(ops) = ops_of(message, &m) else {
-            return false;
-        };
-        if self.context_failed() || self.sinks.submitted.is_none() {
-            return false;
-        }
-        let Some(counts) = self.queue_counts(m.queue_obj_id) else {
-            return false;
-        };
-        let take = take(ops);
-        if !take.asks
-            || take.waits
-            || counts.held.load(Ordering::Acquire) != 0
-            || counts.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
-        {
-            return false;
-        }
-        if let Some(waits) = &take.order {
-            let Some(order) = self.shared.surface_order.try_lock() else {
-                return false;
-            };
-            if !order.ready(m.queue_obj_id, waits) {
-                return false;
-            }
-        }
-        // Its context's range messages before it, and its turn in its queue's lane, tried here,
-        // so its begin takes no lock it need wait for; a take not made lets the turn go at once.
-        let asked = match self.context {
-            Some(context) => match self.shared.sequencer.ranges_asked(context, true) {
-                Some(asked) => asked,
-                None => return false,
-            },
-            None => None,
-        };
-        let Some(turn) = self.turn_on(counts) else {
-            return false;
-        };
-        let Some(held) = self.surface_caches.hold_ready(&take.uses) else {
-            return false;
-        };
-        *self.turn.borrow_mut() = turn;
-        *self.held_caches.borrow_mut() = Some(held);
-        self.ranges.set(Some(asked));
-        true
+        *self.ticket.borrow_mut() = self.shared.sequencer.issue(self.context, false);
     }
 
     /// The command buffer's turn in the lane of the queue whose counts are `counts`
-    /// ([`super::lane`]): `Some(None)` where the queue has no lane, `None` where only tried and
-    /// the lane is busy.
-    fn turn_on(&self, counts: &QueueCounts) -> Option<Option<Turn>> {
-        match &counts.lane {
-            Some(lane) => lane.turn(self.try_only).map(Some),
-            None => Some(None),
-        }
+    /// ([`super::lane`]), where the queue has one.
+    fn turn_on(counts: &QueueCounts) -> Option<Turn> {
+        counts.lane.as_ref().and_then(|lane| lane.turn(false))
+    }
+
+    /// What the answer on a doorbell's thread took for the `COMMAND_BUFFER` `message` of the
+    /// queue whose counts are `counts`, where it answered it ([`Answered`]), taken off the queue.
+    /// One kept for another buffer, or from before a reset of the device, is let go of: the
+    /// answer is of the buffer at the head of its queue's ring, so no buffer of the queue is begun
+    /// between it and its begin.
+    fn answered_for(&self, counts: &QueueCounts, message: &[u8]) -> Option<Answered> {
+        let answered = counts.answered.lock().take()?;
+        let m = read::<RgfxCommandBuffer>(message)?;
+        let same = m.header.seqno == answered.seqno && m.cb_obj_id == answered.cb_obj_id;
+        (same && answered.resets == self.shared.failed.resets()).then_some(answered)
     }
 
     /// Begins the `COMMAND_BUFFER` `message` a queue's service thread takes off the ring of the
@@ -606,9 +734,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// [`Self::finish_command_buffer`] does on the queue's lane ([`super::lane`]). Its turn in the
     /// lane is taken first, after its drain and before anything of it can fail, so its commit,
     /// its stand-in's or the failure posted for it comes in the order the queue's buffers were
-    /// taken; a context whose work is refused gets [`DecodeError::ContextFailed`], as `decode`
-    /// answers it; and where it gets its `CB_SUBMITTED` at its take, that is posted here, once its
-    /// ticket in the commit order is issued.
+    /// taken: the turn, the mark and the ticket the answer on a doorbell's thread took for it,
+    /// where it was answered there ([`Answered`]). A context whose work is refused gets
+    /// [`DecodeError::ContextFailed`], as `decode` answers it; and where it gets its
+    /// `CB_SUBMITTED` at its take, that is posted here, once its ticket in the commit order is
+    /// issued, unless the answer posted it.
     pub(crate) fn begin_taken(
         &mut self,
         device: &P::Device,
@@ -617,20 +747,27 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
         self.end_message();
         let drain = self.command_buffer_drain();
-        if let Some(counts) = queue.and_then(|queue| self.queue_counts(queue))
-            && let Some(turn) = self.turn_on(counts)
-        {
-            *self.turn.borrow_mut() = turn;
+        if let Some(counts) = queue.and_then(|queue| self.queue_counts(queue)) {
+            match self.answered_for(counts, message) {
+                Some(answered) => {
+                    self.mark.set(Some(answered.mark));
+                    self.ranges.set(Some(answered.ranges));
+                    *self.ticket.borrow_mut() = Some(answered.ticket);
+                    *self.turn.borrow_mut() = answered.turn;
+                    self.posted_at_doorbell.set(answered.posted);
+                }
+                None => *self.turn.borrow_mut() = Self::turn_on(counts),
+            }
         }
         if self.context_failed() {
             return Ok(Err(DecodeError::ContextFailed));
         }
-        let begun = match self.begin_command_buffer(device, message, drain, true)? {
+        let begun = match self.begin_command_buffer(device, message, drain)? {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
         if let Some(submitted) = begun.submitted_at_take() {
-            self.issue_ticket(false);
+            self.issue_ticket();
             submitted.post();
         }
         Ok(Ok(begun))
@@ -661,17 +798,14 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Begins the `COMMAND_BUFFER` `message`, whose completion handler will hold `drain`: opens a
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
-    /// (filling each that holds an older generation, where `may_fill`; a doorbell's thread, which
-    /// checked [`Self::submits_at_take`], fills none), has it wait on the GPU for the buffers of
-    /// other queues its `SURFACE_ORDER` names that have not finished (where `may_fill`: the
-    /// doorbell's take found none), and makes its `CB_SUBMITTED` and its hold of its queue
-    /// ([`Begun`]).
+    /// (filling each that holds an older generation), has it wait on the GPU for the buffers of
+    /// other queues its `SURFACE_ORDER` names that have not finished, and makes its
+    /// `CB_SUBMITTED` and its hold of its queue ([`Begun`]).
     pub(crate) fn begin_command_buffer(
         &self,
         device: &P::Device,
         message: &[u8],
         drain: Option<Arc<Drain>>,
-        may_fill: bool,
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
         // It is committed after every buffer answered `CB_SUBMITTED` before now, and after its
         // context's range messages that came before now.
@@ -704,20 +838,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let in_flight = InFlight::new(&counts.in_flight);
         let take = take(ops);
-        let held_caches = self.held_caches.borrow_mut().take();
-        let (used, fill_waits, uses) = match held_caches {
-            Some((used, uses)) => (used, false, uses),
-            None => self
-                .surface_caches
-                .before(device, &cb, &take.uses, may_fill)?,
-        };
+        let (used, fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`).
         let order_waits = match &take.order {
-            Some(waits) if may_fill => {
+            Some(waits) => {
                 (self.shared.surface_order.lock()).before(device, m.queue_obj_id, &cb, waits)?
             }
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         let order_held = !order_waits.is_empty();
         *self.order_waits.borrow_mut() = order_waits;
@@ -822,7 +950,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The `CB_SUBMITTED` of command buffer `cb_obj_id`, at `seqno`, where it `asks` for one and
-    /// there is a sink.
+    /// there is a sink: posted already where the answer on a doorbell's thread posted it.
     fn submitted(&self, cb_obj_id: u64, seqno: u64, asks: bool) -> Option<Arc<Submitted>> {
         let sink = self.sinks.submitted.clone().filter(|_| asks)?;
         Some(Arc::new(Submitted {
@@ -835,7 +963,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 },
                 cb_obj_id,
             },
-            posted: Mutex::new(false),
+            posted: Mutex::new(self.posted_at_doorbell.get()),
         }))
     }
 
@@ -2678,63 +2806,98 @@ mod tests {
         command_buffer_message(cb_obj_id, seqno, &ops)
     }
 
-    /// A buffer may be taken on a doorbell's thread only where it gets its `CB_SUBMITTED` at its
-    /// take and need wait for nothing: not without the ask or a sink to post it on, not where it
-    /// waits for an event or a buffer before it holds its queue, not on a queue its context does
-    /// not hold, not while its queue holds [`TAKE_IN_FLIGHT_MAX`] command buffers made and not
-    /// completed, and not once its context failed.
+    /// Answers `message`, of context 0's, on a doorbell's thread through `dec`'s decoders, each
+    /// record it posts pushed onto `posted`, where `posts`, as the queue's ring takes it; whether
+    /// it was answered.
+    fn answer(
+        dec: &GraphicsDecoder<FakePlatform>,
+        message: &[u8],
+        posted: &Posted,
+        posts: bool,
+    ) -> bool {
+        let posted = Arc::clone(posted);
+        dec.decoders().answer_at_doorbell(0, message, move |m| {
+            if posts {
+                (posted.lock()).push((m.header.r#type, m.cb_obj_id, m.header.seqno));
+            }
+            posts
+        })
+    }
+
+    /// What the answer on a doorbell's thread kept on queue 1, let go of; whether there was any.
+    fn let_go_of_answer(dec: &GraphicsDecoder<FakePlatform>) -> bool {
+        let counts = dec.queue_counts(1).unwrap();
+        let answered = counts.answered.lock().take();
+        answered.is_some()
+    }
+
+    /// A buffer is answered on a doorbell's thread only where it gets its `CB_SUBMITTED` at its
+    /// take and need wait for nothing: not without the ask, not where it waits for an event or a
+    /// buffer before it holds its queue, not on a queue its context does not hold, not while its
+    /// queue holds [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed or an answered
+    /// buffer not yet begun, and not once its context failed. Where it is, its `CB_SUBMITTED` is
+    /// posted there, and what the answer took is kept on its queue; where it is not, nothing is.
     #[test]
-    fn a_buffer_submits_at_its_take_only_where_it_need_wait_for_nothing() {
-        let (_, dec) = setup();
-        assert!(!dec.submits_at_take(&asking(170, 100)), "no sink");
-        let (p, mut dec, _posted) = posting(false);
+    fn a_buffer_is_answered_at_the_doorbell_only_where_it_need_wait_for_nothing() {
+        let (p, mut dec, posted) = posting(false);
         let device = p.device();
         create_events(&p, &mut dec, 0);
-        assert!(dec.submits_at_take(&asking(170, 100)));
+        let answered = |dec: &GraphicsDecoder<FakePlatform>, message: &[u8]| {
+            let before = posted.lock().len();
+            let yes = answer(dec, message, &posted, true);
+            assert_eq!(posted.lock().len(), before + usize::from(yes));
+            assert_eq!(
+                let_go_of_answer(dec),
+                yes,
+                "kept on its queue where answered"
+            );
+            yes
+        };
+        assert!(answered(&dec, &asking(170, 100)));
+        assert_eq!(
+            posted.lock().last(),
+            Some(&(RGFX_EVT_CB_SUBMITTED, 170, 100))
+        );
         let plain = command_buffer_message(171, 101, &render_ops());
-        assert!(!dec.submits_at_take(&plain), "no ask");
+        assert!(!answered(&dec, &plain), "no ask");
         let mut waits = event_op(RGFX_OP_WAIT_EVENT, 7, 1);
         waits.extend(op(RGFX_OP_SUBMITTED, &[]));
         let waits = command_buffer_message(172, 102, &waits);
-        assert!(!dec.submits_at_take(&waits), "waits for an event");
-        // A buffer of queue 1 that waits, not yet scheduled (the fake schedules each at its
-        // commit), holds the queue.
+        assert!(!answered(&dec, &waits), "waits for an event");
+        // A buffer of queue 1 that waits, not yet scheduled, holds the queue.
         let held = Arc::clone(&dec.queue_counts(1).unwrap().held);
         held.fetch_add(1, Ordering::AcqRel);
-        assert!(
-            !dec.submits_at_take(&asking(173, 103)),
-            "behind a held buffer"
-        );
+        assert!(!answered(&dec, &asking(173, 103)), "behind a held buffer");
         held.fetch_sub(1, Ordering::AcqRel);
-        assert!(dec.submits_at_take(&asking(173, 103)));
-        dec.set_context(Some(9));
-        assert!(
-            !dec.submits_at_take(&asking(174, 104)),
-            "another context's queue"
-        );
-        dec.set_context(Some(0));
-        assert!(dec.submits_at_take(&asking(174, 104)));
+        assert!(answered(&dec, &asking(173, 103)));
+        let other = dec
+            .decoders()
+            .answer_at_doorbell(9, &asking(174, 104), |_| true);
+        assert!(!other, "another context's queue");
         for cb in 0..TAKE_IN_FLIGHT_MAX as u64 {
             let message = command_buffer_message(200 + cb, 200 + cb, &render_ops());
             assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
         }
-        assert!(!dec.submits_at_take(&asking(175, 105)), "its queue is full");
+        assert!(!answered(&dec, &asking(175, 105)), "its queue is full");
         p.world().complete_all(CompleteOn::Caller);
-        assert!(dec.submits_at_take(&asking(175, 105)));
+        posted.lock().clear();
+        assert!(answer(&dec, &asking(175, 105), &posted, true));
+        assert!(
+            !answer(&dec, &asking(176, 106), &posted, true),
+            "an answered buffer not yet begun"
+        );
+        assert!(let_go_of_answer(&dec));
         let failed = dec.failed_contexts();
         assert!(failed.fail(0, failed.resets()));
-        assert!(
-            !dec.submits_at_take(&asking(175, 105)),
-            "its context failed"
-        );
+        assert!(!answered(&dec, &asking(177, 107)), "its context failed");
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 175, 105)]);
     }
 
-    /// A buffer taken on a doorbell's thread, begun there, with only its command buffer made, and
-    /// finished later, makes the calls a decode makes, and posts its `CB_SUBMITTED` once: the
-    /// doorbell's thread's post, waiting for nothing, leaves it where the ring is busy, the post
-    /// before the walk makes it, and the scheduled and completed handlers make none.
+    /// A buffer answered on a doorbell's thread calls nothing of the platform's there, and its
+    /// begin takes what the answer took: it makes the calls a decode makes, and gets its
+    /// `CB_SUBMITTED` once, the answer's, or its begin's where the answer found the ring busy.
     #[test]
-    fn a_buffer_taken_on_a_doorbell_s_thread_is_carried_out_as_one_decoded() {
+    fn a_buffer_answered_at_the_doorbell_is_carried_out_as_one_decoded() {
         let (p, mut dec, posted) = posting(true);
         let device = p.device();
         let mark = p.call_log().mark();
@@ -2743,34 +2906,176 @@ mod tests {
         p.world().complete_all(CompleteOn::Caller);
         posted.lock().clear();
 
-        let message = asking(181, 111);
-        assert!(dec.submits_at_take(&message));
-        let mark = p.call_log().mark();
-        let drain = dec.command_buffer_drain();
+        for (cb, seqno, posts) in [(181, 111, true), (182, 112, false)] {
+            let message = asking(cb, seqno);
+            let mark = p.call_log().mark();
+            assert!(answer(&dec, &message, &posted, posts));
+            assert!(p.call_log().sels_since(mark).is_empty(), "a platform call");
+            let begun = dec
+                .begin_taken(&device, &message, Some(1))
+                .unwrap()
+                .unwrap();
+            assert!(!let_go_of_answer(&dec), "the begin took the answer");
+            assert_eq!(
+                dec.finish_command_buffer(&device, &message, begun).unwrap(),
+                Ok(())
+            );
+            assert_eq!(p.call_log().sels_since(mark), decoded);
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                *posted.lock(),
+                [
+                    (RGFX_EVT_CB_SUBMITTED, cb, seqno),
+                    (RGFX_EVT_CB_SCHEDULED, cb, seqno),
+                    (RGFX_EVT_CB_COMPLETE, cb, seqno)
+                ],
+                "the answer posted it: {posts}"
+            );
+            posted.lock().clear();
+        }
+    }
+
+    /// What an answer on a doorbell's thread took is let go of where the buffer is never begun
+    /// after it: with its queue's entry at the decoder's reset, its ticket given back, so a buffer
+    /// begun after the reset is not held up by it; and, where the answer outlived a reset of the
+    /// device, at the buffer's begin, which takes it not.
+    #[test]
+    fn a_reset_between_an_answer_and_its_begin_lets_the_answer_go() {
+        let (_p, mut dec, posted) = posting(false);
+        let sequencer = Arc::clone(&dec.shared.sequencer);
+        assert!(answer(&dec, &asking(190, 120), &posted, true));
+        assert_eq!(sequencer.out(), 1, "the answer's ticket");
+        dec.end_message();
+        dec.reset();
+        assert_eq!(sequencer.out(), 0, "let go of with the queue's entry");
+
+        let (p, mut dec, posted) = posting(false);
+        let device = p.device();
+        let sequencer = Arc::clone(&dec.shared.sequencer);
+        assert!(answer(&dec, &asking(191, 121), &posted, true));
+        dec.failed_contexts().forget_all();
         let begun = dec
-            .begin_command_buffer(&device, &message, drain, false)
+            .begin_taken(&device, &asking(191, 121), Some(1))
             .unwrap()
             .unwrap();
-        assert_eq!(p.call_log().sels_since(mark), ["commandBuffer"]);
-        let submitted = Arc::clone(begun.submitted_at_take().unwrap());
-        submitted.try_post(|_| false);
-        assert!(posted.lock().is_empty(), "the ring was busy");
-        submitted.post();
-        submitted.try_post(|_| panic!("posted twice"));
+        assert!(!let_go_of_answer(&dec), "taken off its queue");
         assert_eq!(
-            dec.finish_command_buffer(&device, &message, begun).unwrap(),
+            sequencer.out(),
+            1,
+            "the begin's own ticket, not the answer's"
+        );
+        assert_eq!(
+            dec.finish_command_buffer(&device, &asking(191, 121), begun)
+                .unwrap(),
             Ok(())
         );
-        assert_eq!(p.call_log().sels_since(mark), decoded);
+        assert_eq!(sequencer.out(), 0);
+    }
+
+    /// A command buffer begun after another's answer on a doorbell's thread, on another queue, is
+    /// committed after the answered buffer, which is begun only after it: the answer's ticket in
+    /// the commit order holds it, as the ticket of one answered at its begin would.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    #[test]
+    fn a_buffer_begun_after_an_answer_is_committed_after_the_answered_buffer() {
+        let (p, mut dec, posted) = posting(false);
+        let device = p.device();
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let sinks = dec.sinks.clone();
+        let mut first = dec.sender(Some(0), sinks.clone());
+        let mut second = dec.sender(Some(0), sinks);
+        let asked = asking(100, 1);
+        assert!(answer(&first, &asked, &posted, true));
+        let later = command_buffer_on(6, 200, &render_ops());
+        let commits = || {
+            p.call_log()
+                .calls_to("commit")
+                .into_iter()
+                .filter_map(|c| c.thread)
+                .filter(|t| t == "first" || t == "second")
+                .collect::<Vec<_>>()
+        };
+        std::thread::scope(|scope| {
+            let b = std::thread::Builder::new()
+                .name("second".into())
+                .spawn_scoped(scope, || second.decode(&p.device(), &later).unwrap())
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(commits().is_empty(), "committed before the answered buffer");
+            let a = std::thread::Builder::new()
+                .name("first".into())
+                .spawn_scoped(scope, || {
+                    let device = p.device();
+                    let begun = first.begin_taken(&device, &asked, Some(1)).unwrap();
+                    first.finish_command_buffer(&device, &asked, begun.unwrap())
+                })
+                .unwrap();
+            assert_eq!(a.join().unwrap().unwrap(), Ok(()));
+            assert_eq!(b.join().unwrap(), Ok(()));
+        });
+        assert_eq!(commits(), ["first", "second"]);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 100, 1)]);
+        drop(dec);
+    }
+
+    /// A buffer answered on a doorbell's thread whose command buffer the platform then refuses at
+    /// its begin fails in its turn: its stand-in commits after the buffer begun before it on its
+    /// queue, and its failure comes after that buffer's completion.
+    #[test]
+    fn a_refused_make_after_an_answer_fails_in_turn() {
+        use reims_vgpu_core::testkit::script::Step;
+
+        let (p, mut dec, posted) = posting(false);
+        let device = p.device();
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&failed);
+        dec.set_completion_sink(Arc::new(move |m| {
+            seen.lock().push((m.cb_obj_id, m.status));
+        }));
+        let first = command_buffer_message(193, 123, &render_ops());
+        let begun = dec.begin_taken(&device, &first, Some(1)).unwrap().unwrap();
+        let mut later = dec.decoders().sender(None, dec.sinks.clone());
+        assert!(answer(&later, &asking(194, 124), &posted, true));
+        p.script().push("commandBuffer", Step::Nil);
+        let refused = later
+            .begin_taken(&device, &asking(194, 124), Some(1))
+            .unwrap();
+        assert!(matches!(refused, Err(DecodeError::Refused)));
+        let stand_in = {
+            let p = Arc::clone(&p);
+            move || {
+                let stood_in = later.stand_in_for_failed(&p.device(), &asking(194, 124));
+                // Its ticket given back after its stand-in's commit, as the lane's job lets go
+                // of its decoder.
+                drop(later);
+                stood_in.map_err(|_| ())
+            }
+        };
+        std::thread::scope(|scope| {
+            let stand_in = scope.spawn(stand_in);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!stand_in.is_finished(), "stood in before its turn");
+            assert_eq!(
+                dec.finish_command_buffer(&device, &first, begun).unwrap(),
+                Ok(())
+            );
+            dec.end_message();
+            assert_eq!(stand_in.join().unwrap(), Ok(true));
+        });
         p.world().complete_all(CompleteOn::Caller);
-        assert_eq!(
-            *posted.lock(),
-            [
-                (RGFX_EVT_CB_SUBMITTED, 181, 111),
-                (RGFX_EVT_CB_SCHEDULED, 181, 111),
-                (RGFX_EVT_CB_COMPLETE, 181, 111)
-            ]
-        );
+        let failed = failed.lock();
+        assert_eq!(failed.iter().map(|f| f.0).collect::<Vec<_>>(), [193, 194]);
+        assert_ne!(failed[1].1, RGFX_CB_OK, "the answered buffer failed");
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 194, 124)]);
     }
 
     /// A `COMMAND_BUFFER` message for queue `queue_obj_id`, command buffer `cb_obj_id`, carrying

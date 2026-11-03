@@ -32,6 +32,13 @@
 #[cfg(all(target_os = "linux", not(feature = "vulkan")))]
 compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
 
+/// The unit tests' allocator, which counts a thread's allocations where a test asks.
+#[cfg(test)]
+mod counted;
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: counted::Counted = counted::Counted;
+
 mod device;
 mod device_writes;
 pub mod dirty;

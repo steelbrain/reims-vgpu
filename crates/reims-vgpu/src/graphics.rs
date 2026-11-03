@@ -51,7 +51,7 @@ use reims_graphics::wire::{
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
-    Screen, Taken,
+    Screen,
 };
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
@@ -116,11 +116,13 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// that a function of the device's waits for, directly or through a thread of the library's, so
 /// they may call it at once. `scanout_written` runs with no lock of the library's held.
 /// `raise_interrupt` may run under these: a command queue's claim on its next message, on the
-/// queue's service thread; the device caches' lock, with the download's answer slot, at a
-/// `SURFACE_DOWNLOAD` answered at once; a command buffer's `CB_SUBMITTED` latch, wherever that is
-/// posted; and the presents' queue, at a present answered at once with no window. No function of
-/// the device takes any of them, and `mmio_write_taking` only tries the claim and the decoder's
-/// locks.
+/// queue's service thread and inside `mmio_write_taking`; there, at a command buffer's
+/// `CB_SUBMITTED` answered on the calling thread, the decoder's contexts' lock, the buffer's
+/// context's table read, its queue's answer slot and the reset gate read; the device caches'
+/// lock, with the download's answer slot, at a `SURFACE_DOWNLOAD` answered at once; a command
+/// buffer's `CB_SUBMITTED` latch, wherever that is posted; and the presents' queue, at a present
+/// answered at once with no window. No function of the device takes any of them, and
+/// `mmio_write_taking` only tries the claim and the decoder's locks.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
@@ -353,10 +355,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| self.device.mmio_write(offset, value));
     }
 
-    /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring may take the queue's
-    /// next command buffer on the calling thread and post its `CB_SUBMITTED` there, calling
-    /// `raise_interrupt` inside this call (`reims-graphics`'s `Device::mmio_write_taking`). It
-    /// waits for no lock but the queues' table, as `mmio_write`'s doorbell does.
+    /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring may answer the
+    /// queue's next command buffer on the calling thread, posting its `CB_SUBMITTED` there and
+    /// calling `raise_interrupt` inside this call (`reims-graphics`'s `Device::mmio_write_taking`),
+    /// allocating nothing; the queue's thread then takes it as it takes any. It waits for no lock
+    /// but the queues' table, as `mmio_write`'s doorbell does.
     pub fn mmio_write_taking(&self, offset: u64, value: u32) {
         entry::run(|_| self.device.mmio_write_taking(offset, value));
     }
@@ -390,8 +393,8 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
 /// neither ring 0 nor another queue. A command buffer's completion, which runs on a GPU thread of
 /// its own, never touches the decoder: it only posts through the queue's poster.
 struct GraphicsControl<P: ApiPlatform> {
-    /// The decoder's state, which each message's decoder is made over; a doorbell's thread's take
-    /// carries its decoder to the queue's service thread ([`Self::take_command_buffer`]).
+    /// The decoder's state, which each message's decoder is made over, and which a doorbell's
+    /// thread's answer reads with no decoder made ([`Self::answer_command_buffer`]).
     decoders: Decoders<P>,
     /// The GPU device it drives.
     device: P::Device,
@@ -996,67 +999,30 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
-    /// [`Host::take_command_buffer`]: takes the `COMMAND_BUFFER` `message` of the queue `poster`
-    /// posts onto, on a doorbell's thread, where it gets its `CB_SUBMITTED` at its take
-    /// ([`GraphicsDecoder::submits_at_take`]) and nothing need be waited for: it runs on that
-    /// queue, every lock of the decoder's it takes is free, each tried, and no pipeline it names is
-    /// still compiling. It is begun here, its turn in its queue's lane taken, its command buffer
-    /// made and its sinks pointed at the queue's ring, as [`Self::begin_command_buffer`] begins
-    /// it, and its decoder is carried to the queue's service thread with the rest of its work,
-    /// which the thread hands to the lane ([`Self::carry_out`]). Its `CB_SUBMITTED` is posted
-    /// here, waiting for nothing, once its ticket in the commit order is issued, which the guest's
-    /// later buffers are committed after (`decode`'s `sequencer`); else by the service thread
-    /// before it hands the rest over. A buffer the platform refused at its make gets none, and its
-    /// failure in its turn. A take that is not made lets go of what it took, its turn among them,
-    /// under locks each held for a short section only.
-    fn take_command_buffer(
-        self: &Arc<Self>,
-        poster: &CompletionPoster,
-        message: &[u8],
-    ) -> Option<Taken> {
+    /// [`Host::answer_command_buffer`]: answers the `COMMAND_BUFFER` `message` at the head of the
+    /// ring of the queue `poster` posts onto `CB_SUBMITTED`, on a doorbell's thread, before the
+    /// queue's service thread takes it, where it gets that at its take and nothing need be waited
+    /// for or allocated (`decode`'s [`Decoders::answer_at_doorbell`]): it runs on that queue, no
+    /// reset is under way, every lock it takes is free, each tried, and no pipeline it names is
+    /// still compiling. Its `CB_SUBMITTED` is posted through `poster` waiting for nothing, once
+    /// its turn in its queue's lane and its ticket in the commit order are taken, which its begin
+    /// on the service thread takes in their place ([`Self::begin_command_buffer`]), so the
+    /// guest's later buffers are committed after it as they would be had it been answered there.
+    fn answer_command_buffer(&self, poster: &CompletionPoster, message: &[u8]) -> bool {
         if foreign_queue(poster, message) || !self.pending.none_named_by(message) {
-            return None;
+            return false;
         }
-        // Held to the end of the buffer's work, on the service thread ([`Self::reset_gate`]).
-        let carried = self.reset_gate.try_read_arc()?;
-        if poster.stale() {
-            return None;
-        }
-        let mut decoder =
-            (self.decoders).sender(Some(sender_context(poster, message)), self.sinks(poster));
-        decoder.set_try_only(true);
-        // Its drain before its view of the table, as a buffer the service thread takes.
-        let drain = decoder.command_buffer_drain()?;
-        if !decoder.submits_at_take(message) {
-            return None;
-        }
-        let begun =
-            refusing(|| decoder.begin_command_buffer(&self.device, message, Some(drain), false));
-        let submitted = match &begun {
-            Ok(Ok(begun)) => begun.submitted_at_take().cloned(),
-            _ => None,
+        // No reset under way: the decoder's reset lets go of what the answer keeps on the queue.
+        let Some(_gate) = self.reset_gate.try_read() else {
+            return false;
         };
-        // Its answer is posted here only once its ticket is issued.
-        let issued = submitted.is_some() && decoder.issue_ticket(true);
-        let post = submitted.clone().filter(|_| issued).map(|submitted| {
-            let poster = poster.clone();
-            Box::new(move || {
-                submitted.try_post(|record| poster.try_post(record.as_bytes()));
-            }) as Box<dyn FnOnce() + Send>
-        });
-        let (control, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        let rest = Box::new(move || {
-            entry::run(|_| {
-                let mut decoder = decoder;
-                decoder.set_try_only(false);
-                if let Some(submitted) = &submitted {
-                    decoder.issue_ticket(false);
-                    submitted.post();
-                }
-                control.carry_out(decoder, begun, carried, poster, message);
-            });
-        });
-        Some(Taken { post, rest })
+        if poster.stale() {
+            return false;
+        }
+        let context = sender_context(poster, message);
+        (self.decoders).answer_at_doorbell(context, message, |record| {
+            poster.try_post(record.as_bytes())
+        })
     }
 
     /// A pipeline create from ring 0: prepared here, on the control thread, with the decoder's
@@ -1482,8 +1448,8 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.control.handle_stage3(completion, message);
     }
 
-    fn take_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> Option<Taken> {
-        self.control.take_command_buffer(completion, message)
+    fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {
+        self.control.answer_command_buffer(completion, message)
     }
 }
 

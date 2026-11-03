@@ -263,9 +263,13 @@ impl<P: Platform> SurfaceOrder<P> {
 
     /// Whether a buffer of queue `queue` that names `waits` waits for none of them on the GPU, so
     /// it may be submitted as it is taken: each names its own queue, a queue the host does not
-    /// hold, or a buffer the host has seen finish.
-    pub(crate) fn ready(&self, queue: u64, waits: &[RgfxSurfaceOrderWait]) -> bool {
-        waits.iter().all(|w| {
+    /// hold, or a buffer the host has seen finish. Allocates nothing.
+    pub(crate) fn ready(
+        &self,
+        queue: u64,
+        mut waits: impl Iterator<Item = RgfxSurfaceOrderWait>,
+    ) -> bool {
+        waits.all(|w| {
             if w.queue_obj_id == queue || w.queue_obj_id == 0 || w.seqno == 0 {
                 return true;
             }
@@ -853,8 +857,9 @@ mod tests {
         assert!(events(&r.p.call_log().since(mark), SIGNAL).is_empty());
     }
 
-    /// A buffer a doorbell's thread would take is submitted at its take only where it waits for
-    /// no buffer of another queue: each it names is of its own queue, of no queue, or finished
+    /// A buffer a doorbell's thread would answer is submitted at its take only where it waits
+    /// for no buffer of another queue: each it names is of its own queue, of no queue, or
+    /// finished
     #[test]
     fn a_buffer_that_waits_is_not_submitted_as_it_is_taken() {
         let mut r = rig();
@@ -865,7 +870,11 @@ mod tests {
                     seqno,
                 })
                 .collect();
-            r.dec.shared.surface_order.lock().ready(B, &waits)
+            r.dec
+                .shared
+                .surface_order
+                .lock()
+                .ready(B, waits.iter().copied())
         };
         assert!(ready(
             &r,

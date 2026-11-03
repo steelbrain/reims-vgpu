@@ -205,6 +205,56 @@ impl Consumer {
     /// [`Self::next`], with the pads before the message skipped but the message itself left on
     /// the ring, for [`Self::take`].
     pub(crate) fn peek(&mut self, region: &Region) -> Result<Option<Message>, Broken> {
+        let Some(header) = self.peek_header(region)? else {
+            return Ok(None);
+        };
+        let broken = Broken::Size {
+            at: self.count,
+            size: header.size,
+        };
+        let Some(bytes) = region.read(self.at.data_at(self.count), header.size as usize) else {
+            return Err(broken);
+        };
+        // The header as copied with the rest, which the guest leaves as it published it.
+        match RgfxMsgHeader::read_from_prefix(&bytes) {
+            Ok((copied, _)) if copied.size == header.size => Ok(Some(Message {
+                header: copied,
+                bytes,
+            })),
+            _ => Err(broken),
+        }
+    }
+
+    /// [`Self::peek`], allocating nothing: the next message's header, and its bytes copied into
+    /// the start of `out` where they fit (its `size` at most `out`'s length); where they do not,
+    /// the header alone, with `out` left as it was.
+    pub(crate) fn peek_into(
+        &mut self,
+        region: &Region,
+        out: &mut [u8],
+    ) -> Result<Option<RgfxMsgHeader>, Broken> {
+        let Some(header) = self.peek_header(region)? else {
+            return Ok(None);
+        };
+        let Some(out) = out.get_mut(..header.size as usize) else {
+            return Ok(Some(header));
+        };
+        let broken = Broken::Size {
+            at: self.count,
+            size: header.size,
+        };
+        if !region.read_into(self.at.data_at(self.count), out) {
+            return Err(broken);
+        }
+        match RgfxMsgHeader::read_from_prefix(out) {
+            Ok((copied, _)) if copied.size == header.size => Ok(Some(copied)),
+            _ => Err(broken),
+        }
+    }
+
+    /// The header of the next message, with the pads before it skipped (taken), the message
+    /// itself left on the ring; its `size` checked against the ring and what the guest published.
+    fn peek_header(&mut self, region: &Region) -> Result<Option<RgfxMsgHeader>, Broken> {
         loop {
             let ahead = self.published(region)?;
             if ahead == 0 {
@@ -217,7 +267,7 @@ impl Consumer {
             };
             // A published message has at least its `type` and `size`, which fit before the end:
             // the bytes left there are a multiple of 8.
-            let Some(start) = region.read(self.at.data_at(self.count), 8) else {
+            let Some(start) = region.read_array::<8>(self.at.data_at(self.count)) else {
                 return Err(broken(0));
             };
             let r#type = u32::from_le_bytes([start[0], start[1], start[2], start[3]]);
@@ -235,13 +285,15 @@ impl Consumer {
                 self.consume(region, size64);
                 continue;
             }
-            let Some(bytes) = region.read(self.at.data_at(self.count), size as usize) else {
+            let Some(head) =
+                region.read_array::<{ HEADER_SIZE as usize }>(self.at.data_at(self.count))
+            else {
                 return Err(broken(size));
             };
-            let Ok((header, _)) = RgfxMsgHeader::read_from_prefix(&bytes) else {
+            let Ok(header) = RgfxMsgHeader::read_from_bytes(&head) else {
                 return Err(broken(size));
             };
-            return Ok(Some(Message { header, bytes }));
+            return Ok(Some(header));
         }
     }
 
@@ -254,7 +306,7 @@ impl Consumer {
         let mut walked = 0u64;
         while walked < ahead {
             let at = self.count.wrapping_add(walked);
-            let start = region.read(self.at.data_at(at), 8)?;
+            let start = region.read_array::<8>(self.at.data_at(at))?;
             let r#type = u32::from_le_bytes([start[0], start[1], start[2], start[3]]);
             let size = u64::from(u32::from_le_bytes([start[4], start[5], start[6], start[7]]));
             let least = if r#type == RGFX_MSG_PAD {
@@ -269,8 +321,8 @@ impl Consumer {
                 break;
             }
             if r#type != RGFX_MSG_PAD {
-                let seqno = region.read(self.at.data_at(at) + 8, 8)?;
-                let seqno = u64::from_le_bytes(seqno.try_into().ok()?);
+                let seqno = region.read_array::<8>(self.at.data_at(at) + 8)?;
+                let seqno = u64::from_le_bytes(seqno);
                 highest = highest.max(Some(seqno));
             }
             walked += size;
@@ -299,7 +351,7 @@ impl Consumer {
             if walked == most {
                 return Walked::Most(at);
             }
-            let Some(start) = region.read(self.at.data_at(at), 8) else {
+            let Some(start) = region.read_array::<8>(self.at.data_at(at)) else {
                 return Walked::Broken(at);
             };
             let r#type = u32::from_le_bytes([start[0], start[1], start[2], start[3]]);
@@ -314,9 +366,8 @@ impl Consumer {
             }
             if r#type != RGFX_MSG_PAD {
                 let field = (size >= HEADER_SIZE + 8)
-                    .then(|| region.read(self.at.data_at(at) + HEADER_SIZE, 8))
+                    .then(|| region.read_array::<8>(self.at.data_at(at) + HEADER_SIZE))
                     .flatten()
-                    .and_then(|bytes| bytes.try_into().ok())
                     .map(u64::from_le_bytes);
                 walked += 1;
                 visit(at + size, r#type, field);

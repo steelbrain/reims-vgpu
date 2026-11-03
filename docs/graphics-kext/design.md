@@ -836,7 +836,7 @@ a buffer behind another process's backlog on ring 0 is decoded at once.
 Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 `a_command_buffer_waits_for_its_process_s_creates_behind_another_s`,
 `a_command_buffer_waits_for_another_process_s_messages_before_its_share` and
-`a_doorbell_write_takes_a_command_buffer_behind_another_process_s_create`.
+`a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
 
 **WindowServer's reserve.** The blocks have no per-process cap: Metal on a Mac
 refuses an allocation only when memory runs out, never because another process
@@ -1578,7 +1578,9 @@ and a bundle sends it only where the bit is set, which it reads in the device in
 - Loose (what "submitted" means on the host): Metal answers once it has submitted the buffer;
   ours once the host has taken the message, before it encodes the buffer on its platform, which
   the guest cannot tell apart, as nothing the guest sends after the answer is carried out
-  before that commit.
+  before that commit. Where nothing need be waited for, the answer comes earlier still: on the
+  guest's vCPU, inside its doorbell write, before the queue's thread takes the buffer
+  ("The answer at the doorbell", below).
 - Inside the envelope (a fault): a buffer whose ops the host cannot carry out after it was
   answered fails at its `CB_COMPLETE`, as Metal reports a command buffer's errors at its
   completion, not at its commit.
@@ -1756,8 +1758,9 @@ commit. Each outcome the new design allows is one of those two:
   `a_queue_s_buffer_runs_beside_another_queue_s_walk` (`graphics/tests.rs`).
 - **The commit order.** A buffer answered `CB_SUBMITTED` at its take holds a
   ticket, issued before the answer is posted, until it is committed (or its
-  stand-in is). Every command buffer notes the tickets issued at its begin and
-  is committed only once each is given back. A buffer the guest sends after an
+  stand-in is); one answered at its doorbell holds the answer's. Every command
+  buffer notes the tickets issued at its begin and is committed only once each
+  is given back. A buffer the guest sends after an
   answer is begun after its ticket, so it is committed after the answered
   buffer, as under the lock the answered buffer held through its commit. A
   buffer begun before the answer does not wait: the guest sent it with no
@@ -1798,7 +1801,7 @@ commit. Each outcome the new design allows is one of those two:
   cache begun before it was asked, after that buffer's commit, in the order
   they were asked, and answered once its copy is done, as before. A buffer
   begun after one was asked waits at its begin until it is made, as under the
-  lock it would have been begun after it (a doorbell's take does not count it),
+  lock it would have been begun after it,
   and nothing of ring 0's names the block meanwhile that a copy changes: a
   download leaves the block's buffers as they are, and the kext names a
   released block again only once its release is answered. The block named
@@ -1824,8 +1827,8 @@ commit. Each outcome the new design allows is one of those two:
   wait for a walk, as the lock did. Tested by `a_reset_during_a_walk_comes_after_it`
   and `a_reset_drops_every_object_the_guest_made` (`graphics/tests.rs`), and
   by the decoder's fuzz (`decode/fuzz.rs`).
-- **A queue's own order.** A queue's service thread (or a doorbell's) begins
-  each of its command buffers in the order the guest published them and hands
+- **A queue's own order.** A queue's service thread begins each of its
+  command buffers in the order the guest published them and hands
   the walk and the commit to the queue's lane (`decode/lane.rs`), whose threads
   walk several at once, so one process's busy queue is not bound to one
   thread. Under the lock a queue's next buffer was taken after the commit of
@@ -1882,8 +1885,37 @@ commit. Each outcome the new design allows is one of those two:
   of the queue's submission ring or a post onto its completion ring under way,
   and the close is answered once its buffers have finished
   (`a_close_during_a_walk_holds_up_nothing_on_ring_0`). A doorbell's take tries
-  every lock it takes; a take not made lets go of what it took, under locks each
-  held for a short section only.
+  every lock it takes, and takes nothing it would have to let go of.
+- **The answer at the doorbell.** A queue's doorbell write, on the guest's
+  vCPU, may answer `CB_SUBMITTED` to the buffer at the head of the queue's ring
+  before the queue's thread wakes to take it (`reims_graphics`'s
+  `Device::mmio_write_taking`), where the buffer would get it at its take and
+  nothing need be waited for or allocated: the vCPU copies the message onto its
+  stack, reads its ops where they lie, and tries every lock it takes. A buffer
+  that uses a device cache, waits for an event or another queue's buffer, sits
+  behind a held buffer, or finds a lock busy is left to the queue's thread, as
+  before. The answer takes the buffer's turn in its queue's lane and its ticket
+  in the commit order together, with its mark (every ticket issued before its
+  own), keeps them on the queue (`cmdbuf`'s `Answered`), and posts the record.
+  The queue's thread then takes the buffer without waiting for ring 0 again
+  (the vCPU found ring 0 carried out as far as the buffer waits for), and its
+  begin takes the turn, the mark and the ticket in place of its own, so its
+  commit and every commit it orders come where they would had it been answered
+  at its begin. Its later messages on ring 0 wait for nothing more of it than
+  before. A buffer never begun after its answer (its queue gone, the device
+  reset) lets them go with its queue's entry, and a buffer the platform refuses
+  at its begin fails in its turn. The vCPU allocates nothing: the platform's
+  command buffer and every other allocation are made on the queue's thread.
+  Tested by `a_doorbell_s_answer_allocates_nothing` and
+  `a_doorbell_write_answers_a_command_buffer_on_its_thread`
+  (`graphics/tests.rs`), the `cmdbuf` tests
+  `a_buffer_is_answered_at_the_doorbell_only_where_it_need_wait_for_nothing`,
+  `a_buffer_answered_at_the_doorbell_is_carried_out_as_one_decoded`,
+  `a_buffer_begun_after_an_answer_is_committed_after_the_answered_buffer`,
+  `a_reset_between_an_answer_and_its_begin_lets_the_answer_go` and
+  `a_refused_make_after_an_answer_fails_in_turn`, the decoder's fuzz
+  (`an_answer_at_the_doorbell_keeps_the_order_of_a_take`), and the device's
+  `an_answered_command_buffer_waits_for_no_later_ring_0_message`.
 
 ## Stage 3 guest stack (from the prior-art study)
 

@@ -535,9 +535,6 @@ pub struct GraphicsDecoder<P: Platform> {
     context: Option<u32>,
     /// The message's views of the tables it named objects in, one a context.
     views: RefCell<Vec<View<P>>>,
-    /// The message is carried out on a thread that waits for no lock (a doorbell's): each lock is
-    /// tried, and a busy one makes the message not taken there.
-    try_only: bool,
     /// The commit order's mark at the command buffer's begin ([`Sequencer::mark`]).
     mark: Cell<Option<u64>>,
     /// The range messages of its context that came before the command buffer's begin, which it is
@@ -550,9 +547,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The command buffer's turn in its queue's lane ([`lane`]), from its begin; it passes with
     /// the handle, once the buffer's commit, stand-in or failure is done.
     turn: RefCell<Option<Turn>>,
-    /// The device caches a doorbell's take found ready and counted the buffer among the users of
-    /// ([`Caches::hold_ready`]), for its begin.
-    held_caches: RefCell<Option<surface_cache::Held<P>>>,
+    /// The command buffer's `CB_SUBMITTED` was posted on a doorbell's thread before its begin
+    /// ([`cmdbuf::Answered`]).
+    posted_at_doorbell: Cell<bool>,
     /// The drain of the message's context, taken at its command buffer's begin
     /// ([`Self::command_buffer_drain`]).
     drain: RefCell<Option<Arc<Drain>>>,
@@ -654,12 +651,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             sinks,
             context,
             views: RefCell::new(Vec::new()),
-            try_only: false,
             mark: Cell::new(None),
             ranges: Cell::new(None),
             ticket: RefCell::new(None),
             turn: RefCell::new(None),
-            held_caches: RefCell::new(None),
+            posted_at_doorbell: Cell::new(false),
             drain: RefCell::new(None),
             order_waits: RefCell::new(Vec::new()),
             recent: Recent::new(),
@@ -678,11 +674,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         Decoders(Arc::clone(&self.shared))
     }
 
-    /// Whether the message is carried out waiting for no lock (a doorbell's take): each is tried.
-    pub(crate) fn set_try_only(&mut self, try_only: bool) {
-        self.try_only = try_only;
-    }
-
     /// Ends the message carried out on this handle: what it named is let go of, and its place in
     /// the commit order given back.
     pub(crate) fn end_message(&mut self) {
@@ -692,7 +683,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.ranges.set(None);
         self.ticket.get_mut().take();
         self.turn.get_mut().take();
-        self.held_caches.get_mut().take();
+        self.posted_at_doorbell.set(false);
         self.drain.get_mut().take();
         self.order_waits.get_mut().clear();
     }
@@ -983,16 +974,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Whether the current context's work failed off its op's thread ([`FailedContexts`]), so
-    /// its later work is refused. Where only tried and its lock is busy, as failed: the message is
-    /// not taken there.
+    /// its later work is refused.
     pub(super) fn context_failed(&self) -> bool {
-        self.context.is_some_and(|context| {
-            if self.try_only {
-                self.shared.failed.try_has(context).unwrap_or(true)
-            } else {
-                self.shared.failed.has(context)
-            }
-        })
+        (self.context).is_some_and(|context| self.shared.failed.has(context))
     }
 
     /// Whether `obj_id` is the current context's to name (any where none is set).
@@ -1001,15 +985,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             .is_none_or(|context| obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context))
     }
 
-    /// The state of context `context`, where it has any; `None` too where only tried and the
-    /// contexts' lock is busy.
+    /// The state of context `context`, where it has any.
     fn context_state(&self, context: u32) -> Option<Arc<Context<P>>> {
-        let contexts = if self.try_only {
-            self.shared.contexts.try_lock()?
-        } else {
-            self.shared.contexts.lock()
-        };
-        contexts.get(&context).cloned()
+        self.shared.contexts.lock().get(&context).cloned()
     }
 
     /// The state of context `context`, made where it has none.
@@ -1025,8 +1003,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The entry of `obj_id` the message sees (its view of the object's context's table, taken
     /// at its first naming of an object there where not before; [`tables`]), where it is the
     /// current context's to name: a process names only its own objects, and an id of another's
-    /// resolves to nothing (a bad reference where it is named). `None` too where only tried and a
-    /// lock is busy.
+    /// resolves to nothing (a bad reference where it is named).
     fn entry(&self, obj_id: u64) -> Option<&Entry<P>> {
         if let Some(at) = self.recent.get(obj_id) {
             // SAFETY: an entry a view of `views` found below, which the view lends for its own
@@ -1042,13 +1019,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             views
                 .iter()
                 .find(|v| v.context().id == context)
-                .map(|v| v.get(obj_id, self.try_only).map(std::ptr::from_ref))
+                .map(|v| v.get(obj_id).map(std::ptr::from_ref))
         };
         let found = match found {
             Some(found) => found,
             None => {
-                let view = View::take(self.context_state(context)?, self.try_only)?;
-                let found = view.get(obj_id, self.try_only).map(std::ptr::from_ref);
+                let view = View::take(self.context_state(context)?);
+                let found = view.get(obj_id).map(std::ptr::from_ref);
                 self.views.borrow_mut().push(view);
                 found
             }
@@ -2019,19 +1996,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// handler has run. It is taken once a message, before the message's view of the context's
     /// table, so a drain begun after that view was taken waits for the buffer
     /// ([`Self::drain_context`]); a stand-in for the buffer holds the same. `None` with no
-    /// context, or where only tried and a lock is busy.
+    /// context.
     pub(crate) fn command_buffer_drain(&self) -> Option<Arc<Drain>> {
         if let Some(drain) = self.drain.borrow().as_ref() {
             return Some(Arc::clone(drain));
         }
         let context = self.context?;
-        let drain = if self.try_only {
-            let state = self.context_state(context)?;
-            Arc::clone(&*state.drain.try_lock()?)
-        } else {
-            let state = self.context_made(context);
-            Arc::clone(&*state.drain.lock())
-        };
+        let drain = Arc::clone(&*self.context_made(context).drain.lock());
         *self.drain.borrow_mut() = Some(Arc::clone(&drain));
         Some(drain)
     }

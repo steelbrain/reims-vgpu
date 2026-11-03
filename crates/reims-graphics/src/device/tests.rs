@@ -2,6 +2,7 @@
 //! ring, rings the doorbell, and reads the completion ring, with a host that records its
 //! interrupts and a screen that records what it is told.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
@@ -2035,10 +2036,17 @@ fn surface_pages_hand_the_host_their_runs() {
 /// What a [`TakingHost`] records, and what it is set to do.
 #[derive(Default)]
 struct Taking {
-    /// Take command buffers on a doorbell's thread ([`Host::take_command_buffer`]).
+    /// Answer command buffers on a doorbell's thread ([`Host::answer_command_buffer`]).
     takes: AtomicBool,
+    /// Each command buffer answered on a doorbell's thread, by seqno: whether its `CB_SUBMITTED`
+    /// was posted there.
+    answered: Mutex<HashMap<u64, bool>>,
     /// While set, a `BUFFER_CREATE` or a `COMMAND_BUFFER` handed to the host waits.
     shut: AtomicBool,
+    /// While set, a `BUFFER_CREATE` handed to the host waits.
+    hold_creates: AtomicBool,
+    /// Called inside the next answer on a doorbell's thread.
+    on_answer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Each raise: its vector, and the name of the thread it ran on.
     raised: Mutex<Vec<(u32, Option<String>)>>,
     /// The types of the messages handed to [`Host::stage3_message`], in order.
@@ -2048,8 +2056,9 @@ struct Taking {
 }
 
 /// A host whose command buffers post a `CB_SUBMITTED` and then a `CB_COMPLETE`, as the decoder's
-/// do, and which takes them on a doorbell's thread where it is set to: the `CB_SUBMITTED` posted
-/// there, the rest carried out on the queue's thread.
+/// do, and which answers them on a doorbell's thread where it is set to: the `CB_SUBMITTED`
+/// posted there, the buffer carried out on the queue's thread, which posts the `CB_SUBMITTED`
+/// where the doorbell's thread did not.
 struct TakingHost(Arc<Taking>);
 
 /// The calling thread's name.
@@ -2103,35 +2112,32 @@ impl Host for TakingHost {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        while header.r#type == RGFX_CMD_BUFFER_CREATE && self.0.hold_creates.load(Ordering::SeqCst)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if header.r#type == RGFX_CMD_COMMAND_BUFFER {
             let (cb, _) = RgfxCommandBuffer::read_from_prefix(message).unwrap();
-            completion.post(cb_submitted(header.seqno, cb.cb_obj_id).as_bytes());
+            if self.0.answered.lock().get(&header.seqno) != Some(&true) {
+                completion.post(cb_submitted(header.seqno, cb.cb_obj_id).as_bytes());
+            }
             self.0.carried.lock().push((cb.cb_obj_id, thread_name()));
             completion.post(cb_complete(header.seqno, cb.cb_obj_id).as_bytes());
         }
     }
-    fn take_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> Option<Taken> {
+    fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {
         if !self.0.takes.load(Ordering::SeqCst) {
-            return None;
+            return false;
         }
         let (cb, _) = RgfxCommandBuffer::read_from_prefix(message).unwrap();
-        let (seqno, id) = (cb.header.seqno, cb.cb_obj_id);
-        let posted = Arc::new(AtomicBool::new(false));
-        let (poster, posted_here) = (completion.clone(), Arc::clone(&posted));
-        let (rest_poster, taking) = (completion.clone(), Arc::clone(&self.0));
-        Some(Taken {
-            post: Some(Box::new(move || {
-                let done = poster.try_post(cb_submitted(seqno, id).as_bytes());
-                posted_here.store(done, Ordering::SeqCst);
-            })),
-            rest: Box::new(move || {
-                if !posted.load(Ordering::SeqCst) {
-                    rest_poster.post(cb_submitted(seqno, id).as_bytes());
-                }
-                taking.carried.lock().push((id, thread_name()));
-                rest_poster.post(cb_complete(seqno, id).as_bytes());
-            }),
-        })
+        let seqno = cb.header.seqno;
+        let posted = completion.try_post(cb_submitted(seqno, cb.cb_obj_id).as_bytes());
+        let first = self.0.answered.lock().insert(seqno, posted).is_none();
+        assert!(first, "buffer {seqno} was answered twice");
+        if let Some(hook) = self.0.on_answer.lock().take() {
+            hook();
+        }
+        true
     }
 }
 
@@ -2203,12 +2209,13 @@ fn taking_rig(taking: &Arc<Taking>, queue: u64) -> Rig {
     rig
 }
 
-/// A doorbell write through `mmio_write_taking` takes the queue's next command buffer on the
+/// A doorbell write through `mmio_write_taking` answers the queue's next command buffer on the
 /// writing thread: its `CB_SUBMITTED` is on the queue's completion ring, its vector raised on
-/// that thread, before the write returns; the rest of it is carried out on the queue's thread,
-/// which then takes the buffer published after it, so the queue's events keep its order.
+/// that thread, before the write returns; the buffer stays on the ring, and the queue's thread
+/// takes it and carries it out, then the buffer published after it, so the queue's events keep
+/// its order.
 #[test]
-fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
+fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
     let taking = Arc::new(Taking::default());
     taking.takes.store(true, Ordering::SeqCst);
@@ -2250,18 +2257,73 @@ fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
             .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-"))),
         "both carried out on the queue's thread: {carried:?}"
     );
-    // The first was taken on the doorbell's thread, the second handed over as usual.
+    // Both handed over on the queue's thread, the first answered before.
     assert_eq!(
         *taking.handed.lock(),
-        vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
+        vec![
+            RGFX_CMD_QUEUE_CREATE,
+            RGFX_CMD_COMMAND_BUFFER,
+            RGFX_CMD_COMMAND_BUFFER
+        ]
     );
+    assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
 }
 
-/// A doorbell write through `mmio_write_taking` leaves the buffer on the ring for the queue's
-/// thread where the host does not take it, where the queue's thread holds a message of the
-/// queue's, and where a ring-0 message of its process's published before it is not yet carried
-/// out: the queue's thread hands it to the host as it hands any, in the queue's order and after
-/// the ring-0 message.
+/// A command buffer answered on a doorbell's thread is handed over by its queue's thread without
+/// waiting for ring 0 again: a create of its process's published after the answer, which the
+/// host is still carrying out, does not hold it up, as the doorbell's thread found every ring-0
+/// message the buffer waits for carried out.
+#[test]
+fn an_answered_command_buffer_waits_for_no_later_ring_0_message() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let mut rig = taking_rig(&taking, QUEUE);
+    taking.hold_creates.store(true, Ordering::SeqCst);
+    // The create, published on ring 0 inside the answer: after it, and before the queue's thread
+    // takes the buffer.
+    let mut create = object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1);
+    let seqno = rig.seqno + 1;
+    create[8..16].copy_from_slice(&seqno.to_le_bytes());
+    set_size_of(&mut create);
+    let data = u64::from(RGFX_CONTROL_RING_DATA_SIZE);
+    let at = RGFX_CONTROL_SUBMIT_OFFSET + 256 + rig.produced % data;
+    let produced = rig.produced + create.len() as u64;
+    let region = Arc::clone(&rig.device.shared.region);
+    *taking.on_answer.lock() = Some(Box::new(move || {
+        region.write(at, &create);
+        (region.atomic_u64(RGFX_CONTROL_SUBMIT_OFFSET)).store(produced, Ordering::SeqCst);
+    }));
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
+    (rig.produced, rig.seqno) = (produced, seqno);
+    rig.device
+        .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    let created = |taking: &Taking| taking.handed.lock().contains(&RGFX_CMD_BUFFER_CREATE);
+    for _ in 0..2000 {
+        if created(&taking) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(created(&taking), "the create never reached the host");
+    assert_eq!(
+        queue_events(&rig, 2),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+        ],
+        "carried out while the create is held"
+    );
+    taking.hold_creates.store(false, Ordering::SeqCst);
+}
+
+/// A doorbell write through `mmio_write_taking` leaves the buffer to the queue's thread where the
+/// host does not answer it, where the queue's thread holds a message of the queue's, and where a
+/// ring-0 message of its process's published before it is not yet carried out: the queue's thread
+/// hands it to the host as it hands any, in the queue's order and after the ring-0 message.
 #[test]
 fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
@@ -2277,7 +2339,7 @@ fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
         );
     };
 
-    // The host does not take it.
+    // The host does not answer it.
     let taking = Arc::new(Taking::default());
     let rig = taking_rig(&taking, QUEUE);
     publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
@@ -2359,16 +2421,16 @@ fn a_doorbell_write_leaves_a_command_buffer_to_its_queue_s_thread() {
     );
 }
 
-/// A doorbell write through `mmio_write_taking` takes a command buffer on its thread while the
+/// A doorbell write through `mmio_write_taking` answers a command buffer on its thread while the
 /// control thread is still in another process's create published before it.
 #[test]
-fn a_doorbell_write_takes_a_command_buffer_behind_another_process_s_create() {
+fn a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create() {
     const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
     const OTHER: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
     let taking = Arc::new(Taking::default());
     taking.takes.store(true, Ordering::SeqCst);
     let mut rig = taking_rig(&taking, QUEUE);
-    taking.shut.store(true, Ordering::SeqCst);
+    taking.hold_creates.store(true, Ordering::SeqCst);
     rig.send(object_message(RGFX_CMD_BUFFER_CREATE, OTHER));
     let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
     for _ in 0..2000 {
@@ -2387,7 +2449,7 @@ fn a_doorbell_write_takes_a_command_buffer_behind_another_process_s_create() {
         "the CB_SUBMITTED is posted before the doorbell write returns"
     );
     assert_eq!(queue_events(&rig, 2).len(), 2);
-    taking.shut.store(false, Ordering::SeqCst);
+    taking.hold_creates.store(false, Ordering::SeqCst);
 }
 
 /// `mmio_write_taking` writes every register but `DOORBELL` as `mmio_write` does.

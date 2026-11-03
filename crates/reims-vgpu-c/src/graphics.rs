@@ -377,16 +377,16 @@ pub unsafe extern "C" fn rvg_graphics_device_mmio_write(
 }
 
 /// rvg_graphics_device_mmio_write, but a write to RVG_GRAPHICS_REG_DOORBELL of a command queue's
-/// ring (any value but RVG_GRAPHICS_DOORBELL_CONTROL) may take the queue's next command buffer on
-/// the calling thread, ahead of the queue's own thread, and post the event that says it is
+/// ring (any value but RVG_GRAPHICS_DOORBELL_CONTROL) may answer the queue's next command buffer
+/// on the calling thread, ahead of the queue's own thread, posting the event that says it is
 /// submitted there: raise_interrupt is then called on the calling thread, inside this call, after
 /// that event is published. The host's raise_interrupt must therefore not wait for a lock the host
-/// holds while it calls this. A buffer is taken only where nothing need be waited for (each lock
-/// the take needs is tried, and the queue's thread holds none of the queue's messages); otherwise
-/// the write wakes the queue's thread, as rvg_graphics_device_mmio_write does. What the guest sees
-/// is the same either way but for when the event comes. It waits for nothing
-/// rvg_graphics_device_mmio_write does not. On any thread, the vCPU's included. Calls back:
-/// raise_interrupt, as above.
+/// holds while it calls this. A buffer is answered only where nothing need be waited for (each
+/// lock the answer needs is tried, and the queue's thread holds none of the queue's messages), and
+/// the answer allocates nothing; the queue's thread then takes the buffer, as it takes any, and
+/// the write wakes it, as rvg_graphics_device_mmio_write does. What the guest sees is the same
+/// either way but for when the event comes. It waits for nothing rvg_graphics_device_mmio_write
+/// does not. On any thread, the vCPU's included. Calls back: raise_interrupt, as above.
 ///
 /// # Safety
 /// `device` is a live graphics device handle.

@@ -21,12 +21,15 @@
 //!   a begin's check of range messages where none waits: a device where nothing asks for
 //!   `CB_SUBMITTED` pays nothing more.
 //!
-//! A ticket is issued after its buffer's begin, so a buffer never waits for its own or a later
+//! A ticket is issued after its buffer's mark, so a buffer never waits for its own or a later
 //! one, and a buffer holding one waits only for older ones; a range message waits only for the
 //! tickets issued before it, and a buffer only for the range messages that came before its begin:
 //! the waits end.
+//!
+//! A doorbell's thread issues a ticket allocating nothing ([`Sequencer::issue`]): the order keeps
+//! room for [`TICKETS_ROOM`] tickets out from its make, and refuses one there past that.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -35,11 +38,36 @@ use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
 /// A range message's work, carried out once its context's tickets before it are given back.
 pub(crate) type RangeOp = Box<dyn FnOnce() + Send>;
 
-/// The tickets out, by number, with the context of each, and each context's range messages.
-#[derive(Default)]
+/// How many tickets out the order has room for from its make, so a doorbell's thread issues one
+/// allocating nothing.
+const TICKETS_ROOM: usize = 256;
+
+/// The tickets out, and each context's range messages.
 struct Open {
-    tickets: BTreeMap<u64, Option<u32>>,
+    /// From the oldest ticket out to the last issued, in the order issued (so by number, one
+    /// apart): each one's number, its context, and whether it is given back, as one given back
+    /// before an older one stays until that one is.
+    tickets: VecDeque<(u64, Option<u32>, bool)>,
     ranges: HashMap<u32, Ranges>,
+}
+
+impl Default for Open {
+    fn default() -> Self {
+        Open {
+            tickets: VecDeque::with_capacity(TICKETS_ROOM),
+            ranges: HashMap::new(),
+        }
+    }
+}
+
+impl Open {
+    /// The tickets out up to `mark`, each with its context.
+    fn out_through(&self, mark: u64) -> impl Iterator<Item = Option<u32>> + '_ {
+        (self.tickets.iter())
+            .take_while(move |&&(number, _, _)| number <= mark)
+            .filter(|&&(_, _, given_back)| !given_back)
+            .map(|&(_, context, _)| context)
+    }
 }
 
 /// One context's range messages ([`Sequencer::after_context`]).
@@ -86,20 +114,40 @@ impl Sequencer {
     }
 
     /// A ticket for a command buffer of `context` answered at its take; `None` where `try_only`
-    /// and the order is busy (the caller answers it from a thread that may wait).
+    /// and the order is busy, or has no room left for a ticket allocating nothing (the caller
+    /// answers it from a thread that may wait).
     pub(crate) fn issue(self: &Arc<Self>, context: Option<u32>, try_only: bool) -> Option<Ticket> {
         let mut open = if try_only {
-            self.open.try_lock()?
+            let open = self.open.try_lock()?;
+            if open.tickets.len() == open.tickets.capacity() {
+                return None;
+            }
+            open
         } else {
             self.open.lock()
         };
         let number = self.issued.load(Ordering::Acquire) + 1;
         self.issued.store(number, Ordering::Release);
-        open.tickets.insert(number, context);
+        open.tickets.push_back((number, context, false));
         Some(Ticket {
             sequencer: Arc::clone(self),
             number,
         })
+    }
+
+    /// [`Self::issue`] for a command buffer answered on a doorbell's thread, waiting for nothing
+    /// and allocating nothing, with the buffer's mark: every ticket issued before its own
+    /// ([`Self::mark`]). `None` where the order is busy or has no room left.
+    pub(crate) fn issue_marked(self: &Arc<Self>, context: u32) -> Option<(u64, Ticket)> {
+        let ticket = self.issue(Some(context), true)?;
+        Some((ticket.number - 1, ticket))
+    }
+
+    /// How many tickets are out, not yet given back (for the tests).
+    #[cfg(test)]
+    pub(crate) fn out(&self) -> usize {
+        let open = self.open.lock();
+        open.tickets.iter().filter(|t| !t.2).count()
     }
 
     /// Waits, with no lock of the caller's held, until every ticket up to `mark` is given back.
@@ -156,19 +204,21 @@ impl Sequencer {
     /// tickets are all given back, oldest first, unless another thread is carrying them out.
     fn carry_out<'s>(&'s self, mut open: MutexGuard<'s, Open>, context: u32) {
         loop {
-            let Open { tickets, ranges } = &mut *open;
-            let Some(r) = ranges.get_mut(&context) else {
+            let Some(r) = open.ranges.get(&context) else {
                 return;
             };
             if r.running {
                 return;
             }
-            let ready = r.waiting.front().is_some_and(|&(mark, _)| {
-                !(tickets.range(..=mark)).any(|(_, holder)| *holder == Some(context))
+            let ready = (r.waiting.front()).is_some_and(|&(mark, _)| {
+                !open.out_through(mark).any(|holder| holder == Some(context))
             });
             if !ready {
                 return;
             }
+            let Some(r) = open.ranges.get_mut(&context) else {
+                return;
+            };
             let Some((_, op)) = r.waiting.pop_front() else {
                 return;
             };
@@ -188,10 +238,25 @@ impl Sequencer {
     /// Ticket `number` is given back.
     fn give_back(&self, number: u64) {
         let mut open = self.open.lock();
-        let holder = open.tickets.remove(&number).flatten();
-        let through = open.tickets.first_key_value().map_or_else(
+        let at = (open.tickets.front())
+            .and_then(|&(first, _, _)| usize::try_from(number.checked_sub(first)?).ok());
+        let holder = match at.and_then(|at| open.tickets.get_mut(at)) {
+            Some(ticket) => {
+                ticket.2 = true;
+                ticket.1
+            }
+            None => None,
+        };
+        while open
+            .tickets
+            .front()
+            .is_some_and(|&(_, _, given_back)| given_back)
+        {
+            open.tickets.pop_front();
+        }
+        let through = open.tickets.front().map_or_else(
             || self.issued.load(Ordering::Acquire),
-            |(&first, _)| first - 1,
+            |&(first, _, _)| first - 1,
         );
         self.done_through.store(through, Ordering::Release);
         self.given_back.notify_all();

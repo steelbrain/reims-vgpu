@@ -59,6 +59,10 @@ pub(crate) struct QueueCounts {
     /// Where its command buffers' walks and commits run, each in its turn; `None` for a queue
     /// whose buffers are carried out whole where they are taken (the decoder's own tests).
     pub(crate) lane: Option<Arc<Lane>>,
+    /// The command buffer at the head of its ring answered on a doorbell's thread, until its
+    /// begin takes what the answer took for it ([`super::cmdbuf::Answered`]); let go of with the
+    /// queue's entry where it is never begun.
+    pub(crate) answered: Mutex<Option<super::cmdbuf::Answered>>,
 }
 
 impl QueueCounts {
@@ -70,6 +74,7 @@ impl QueueCounts {
             in_flight: Arc::default(),
             order,
             lane: Some(lane),
+            answered: Mutex::default(),
         }
     }
 }
@@ -356,6 +361,12 @@ impl<P: Platform> Context<P> {
         self.tables.read().live.get(&id).map(|o| f(o.entry()))
     }
 
+    /// [`Self::with_live`], waiting for nothing and allocating nothing (a doorbell's thread): no
+    /// view is taken. `None` where the table is busy or holds no entry of `id`.
+    pub(crate) fn try_with_live<R>(&self, id: u64, f: impl FnOnce(&Entry<P>) -> R) -> Option<R> {
+        self.tables.try_read()?.live.get(&id).map(|o| f(o.entry()))
+    }
+
     /// The ids in the table (for the tests).
     #[cfg(test)]
     pub(crate) fn ids(&self) -> Vec<u64> {
@@ -406,23 +417,19 @@ pub(crate) struct View<P: Platform> {
 unsafe impl<P: Platform> Send for View<P> where Entry<P>: Send + Sync {}
 
 impl<P: Platform> View<P> {
-    /// A view of `context`'s table, taken now; `None` where `try_only` and the table is busy.
-    pub(crate) fn take(context: Arc<Context<P>>, try_only: bool) -> Option<Self> {
+    /// A view of `context`'s table, taken now.
+    pub(crate) fn take(context: Arc<Context<P>>) -> Self {
         let at = {
-            let mut t = if try_only {
-                context.tables.try_write()?
-            } else {
-                context.tables.write()
-            };
+            let mut t = context.tables.write();
             let at = t.clock;
             *t.views.entry(at).or_default() += 1;
             at
         };
-        Some(View {
+        View {
             context,
             at,
             seen: RefCell::new(HashMap::default()),
-        })
+        }
     }
 
     /// The context viewed.
@@ -430,20 +437,13 @@ impl<P: Platform> View<P> {
         &self.context
     }
 
-    /// The entry of `id` the view sees; `None` too where `try_only` and the table is busy.
-    pub(crate) fn get(&self, id: u64, try_only: bool) -> Option<&Entry<P>> {
+    /// The entry of `id` the view sees.
+    pub(crate) fn get(&self, id: u64) -> Option<&Entry<P>> {
         let seen = self.seen.borrow().get(&id).copied();
         let found = match seen {
             Some(found) => found,
             None => {
-                let found = {
-                    let t = if try_only {
-                        self.context.tables.try_read()?
-                    } else {
-                        self.context.tables.read()
-                    };
-                    t.find(id, self.at)?
-                };
+                let found = self.context.tables.read().find(id, self.at)?;
                 self.seen.borrow_mut().insert(id, Some(found));
                 Some(found)
             }
@@ -502,21 +502,15 @@ mod tests {
         let ctx = Arc::new(Context::<FakePlatform>::new(1));
         let (_, replaced) = ctx.insert(1, Entry::of(fence(&p)));
         assert!(replaced.is_none());
-        let view = View::take(Arc::clone(&ctx), false).unwrap();
+        let view = View::take(Arc::clone(&ctx));
         assert!(
             ctx.remove(1).is_some_and(|(_, now)| now.is_none()),
             "kept for the open view"
         );
         let (_, replaced) = ctx.insert(2, Entry::of(fence(&p)));
         assert!(replaced.is_none());
-        assert!(
-            view.get(1, false).is_some(),
-            "removed after the view: found"
-        );
-        assert!(
-            view.get(2, false).is_none(),
-            "made after the view: not found"
-        );
+        assert!(view.get(1).is_some(), "removed after the view: found");
+        assert!(view.get(2).is_none(), "made after the view: not found");
         assert_eq!(ctx.gone_len(), 1);
         drop(view);
         assert_eq!(
@@ -524,9 +518,9 @@ mod tests {
             0,
             "let go of with the last view that kept it"
         );
-        let late = View::take(Arc::clone(&ctx), false).unwrap();
-        assert!(late.get(1, false).is_none());
-        assert!(late.get(2, false).is_some());
+        let late = View::take(Arc::clone(&ctx));
+        assert!(late.get(1).is_none());
+        assert!(late.get(2).is_some());
     }
 
     /// An entry removed with no view open is handed back at once, and a view taken after a
@@ -538,10 +532,10 @@ mod tests {
         ctx.insert(1, Entry::of(fence(&p)));
         assert!(ctx.remove(1).is_some_and(|(_, now)| now.is_some()));
         ctx.insert(1, Entry::of(fence(&p)));
-        let older = View::take(Arc::clone(&ctx), false).unwrap();
+        let older = View::take(Arc::clone(&ctx));
         assert!(ctx.remove(1).is_some_and(|(_, now)| now.is_none()));
-        let newer = View::take(Arc::clone(&ctx), false).unwrap();
-        assert!(newer.get(1, false).is_none());
+        let newer = View::take(Arc::clone(&ctx));
+        assert!(newer.get(1).is_none());
         drop(older);
         assert_eq!(
             ctx.gone_len(),

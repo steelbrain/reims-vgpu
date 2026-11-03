@@ -44,6 +44,11 @@ use crate::wire::*;
 /// How many contexts the index keeps before it forgets those whose messages are all carried out.
 const KEEP: usize = 16;
 
+/// How many contexts ring 0's index has room for from its make ([`Backlog::with_room`]): its
+/// [`KEEP`] and as many again as a doorbell's look reads messages, so that look adds what it reads
+/// allocating nothing ([`Backlog::room_for`]).
+const ROOM: usize = 64;
+
 /// Whose a ring-0 message is: which command buffers wait for it (the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Whose {
@@ -84,6 +89,26 @@ pub(super) struct Backlog {
 }
 
 impl Backlog {
+    /// An index with room for [`ROOM`] contexts: ring 0's.
+    pub(super) fn with_room() -> Backlog {
+        Backlog {
+            last: HashMap::with_capacity(ROOM),
+            ..Backlog::default()
+        }
+    }
+
+    /// Back to an index of nothing read, its room kept (the device's reset).
+    pub(super) fn clear(&mut self) {
+        self.read = 0;
+        self.every = 0;
+        self.last.clear();
+    }
+
+    /// Whether reading `most` more messages notes their contexts allocating nothing.
+    pub(super) fn room_for(&self, most: usize) -> bool {
+        self.last.capacity() - self.last.len() >= most
+    }
+
     /// Reads what the guest published on ring 0 since the last look, at most `most` messages of
     /// it, the control thread having carried out what lies before count `done`; false where
     /// `most` were read and more are left, which a look after it reads on.

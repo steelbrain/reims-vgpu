@@ -152,6 +152,24 @@ impl Lane {
         })
     }
 
+    /// The next turn, with what `with` makes, the two taken together, waiting for nothing: `None`,
+    /// with no turn given, where the lane's lock is busy or `with` makes nothing, so a doorbell's
+    /// thread lets go of nothing it took ([`super::cmdbuf::Answered`]).
+    pub(crate) fn try_turn_with<R>(
+        self: &Arc<Self>,
+        with: impl FnOnce() -> Option<R>,
+    ) -> Option<(Turn, R)> {
+        let mut state = self.state.try_lock()?;
+        let made = with()?;
+        let number = state.issued;
+        state.issued += 1;
+        let turn = Turn {
+            lane: Arc::clone(self),
+            number,
+        };
+        Some((turn, made))
+    }
+
     /// Runs `job` on one of the lane's threads, after the jobs that came before it have started:
     /// an idle one, else the lane's own where it has none, else one of the budget's where every
     /// thread of the lane is busy and the budget has one to spare, else the next of the lane's

@@ -221,17 +221,34 @@ impl Region {
 
     /// A copy of the `len` bytes at `offset`, or `None` where they do not lie inside the region.
     pub fn read(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        if !self.contains(offset, len as u64) {
-            return None;
-        }
         let mut out = vec![0u8; len];
-        // SAFETY: the bytes lie inside the mapping, which lives as long as `self`, and `out` is
-        // `len` bytes of the process's own; the guest's concurrent writes change only what is
-        // copied, never memory Rust owns.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.base.add(offset as usize), out.as_mut_ptr(), len);
+        self.read_into(offset, &mut out).then_some(out)
+    }
+
+    /// Copies the bytes at `offset` into `out`, allocating nothing; false, with `out` left as it
+    /// was, where they do not lie inside the region.
+    pub fn read_into(&self, offset: u64, out: &mut [u8]) -> bool {
+        if !self.contains(offset, out.len() as u64) {
+            return false;
         }
-        Some(out)
+        // SAFETY: the bytes lie inside the mapping, which lives as long as `self`, and `out` is
+        // the process's own; the guest's concurrent writes change only what is copied, never
+        // memory Rust owns.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base.add(offset as usize),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        true
+    }
+
+    /// The `N` bytes at `offset`, allocating nothing, or `None` where they do not lie inside the
+    /// region.
+    pub(crate) fn read_array<const N: usize>(&self, offset: u64) -> Option<[u8; N]> {
+        let mut out = [0u8; N];
+        self.read_into(offset, &mut out).then_some(out)
     }
 
     /// A copy of the `count` records of `stride` bytes from `offset`, each with its first `taken`

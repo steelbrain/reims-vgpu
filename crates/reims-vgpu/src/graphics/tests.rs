@@ -902,12 +902,12 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 }
 
 /// A command buffer that asks for its `CB_SUBMITTED` and need wait for nothing, rung through
-/// `mmio_write_taking`, is taken on the ringing thread: its `CB_SUBMITTED` is on its queue's
-/// completion ring, the queue's vector raised on that thread, before the write returns; its queue's
-/// thread walks and commits it, and it completes as one that thread took. One that does not ask is
-/// left to the queue's thread, and completes as before
+/// `mmio_write_taking`, is answered on the ringing thread: its `CB_SUBMITTED` is on its queue's
+/// completion ring, the queue's vector raised on that thread, before the write returns; its
+/// queue's thread takes, walks and commits it, and it completes as one that thread answered. One
+/// that does not ask is left to the queue's thread, and completes as before
 #[test]
-fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
+fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     let raised = Arc::new(super::Mutex::new(Vec::<(u32, Option<String>)>::new()));
     let platform = Arc::new(FakePlatform::new());
     let record = Arc::clone(&raised);
@@ -989,6 +989,91 @@ fn a_doorbell_write_takes_a_command_buffer_on_its_thread() {
     let done = complete(&mut ring);
     assert_eq!((done.cb_obj_id, done.status), (101, RGFX_CB_OK));
     assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+}
+
+/// A doorbell write's answer allocates nothing on the ringing thread, the guest's vCPU: each of
+/// several buffers that ask is answered inside the write, which the allocator counts, its
+/// `CB_SUBMITTED` posted and its vector raised there, then completed by its queue's thread.
+#[test]
+fn a_doorbell_s_answer_allocates_nothing() {
+    use std::sync::atomic::AtomicUsize;
+
+    let raised = Arc::new(AtomicUsize::new(0));
+    let platform = Arc::new(FakePlatform::new());
+    let count = Arc::clone(&raised);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })),
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, mut guest) = (3, Guest::new(&device));
+    let queue = obj(context, 1);
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    for cb in 100..104 {
+        // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
+        for _ in 0..2000 {
+            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
+            let idle = unsafe {
+                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
+                    .load(Ordering::SeqCst)
+            };
+            if idle == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ring.arm();
+        ring.publish(asking(queue, cb));
+        let raises = raised.load(Ordering::SeqCst);
+        let ((), allocations) = crate::counted::allocations_in(|| {
+            device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+        });
+        assert!(
+            ring.has_event(),
+            "buffer {cb} was not answered in the write"
+        );
+        assert!(
+            raised.load(Ordering::SeqCst) > raises,
+            "no raise in the write"
+        );
+        assert_eq!(allocations, 0, "the answer of buffer {cb} allocated");
+        let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!(
+            (posted.header.r#type, posted.cb_obj_id),
+            (RGFX_EVT_CB_SUBMITTED, cb)
+        );
+        for _ in 0..3000 {
+            platform.world().complete_all(CompleteOn::Caller);
+            if ring.has_event() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
 }
 
 /// The name of the thread each raise that called the device ran on, once its calls returned.

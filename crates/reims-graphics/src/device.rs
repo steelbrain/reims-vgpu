@@ -54,19 +54,21 @@
 //! host holds while it calls the device (QEMU's BQL). [`Device::mmio_write`]'s reset waits only
 //! for the message the control thread is taking, which never waits for the host.
 //!
-//! **A take on the doorbell's thread.** A `DOORBELL` write of a command queue's ring through
+//! **An answer on the doorbell's thread.** A `DOORBELL` write of a command queue's ring through
 //! [`Device::mmio_write_taking`] offers the queue's next `COMMAND_BUFFER` to the host on the
 //! writing thread (the guest's vCPU), ahead of the queue's service thread
-//! ([`Host::take_command_buffer`]). The host takes it only where it posts the buffer's
-//! `CB_SUBMITTED` at once: the post is made there, raising the queue's vector inside the call, and
-//! the rest of the buffer's work is handed to the service thread, which carries it out before it
-//! takes anything more of the queue's. The offer is made only where nothing need be waited for: no
-//! lock of the device's is held elsewhere (each is tried; the queues' table, held elsewhere, is
-//! waited for as [`Device::mmio_write`] waits for it, and no offer is made), the service thread
-//! holds no message of the queue's, at most `DOORBELL_READS` of ring 0's messages are left to
-//! read, and the control thread has carried out every ring-0 message the buffer waits for.
-//! Otherwise the buffer stays on the ring and the service thread takes it as it takes any, so the
-//! queue's events keep its order.
+//! ([`Host::answer_command_buffer`]), which the host may answer there: it posts the buffer's
+//! `CB_SUBMITTED`, raising the queue's vector inside the call. The buffer stays on the ring, and
+//! the service thread takes it next, as it takes any, and hands it to the host
+//! ([`Host::stage3_message`]) without waiting for ring 0 again: the doorbell's thread found ring 0
+//! carried out as far as the buffer waits for. The offer is made only where nothing need be
+//! waited for and nothing allocated: no lock of the device's is held elsewhere (each is tried; the
+//! queues' table, held elsewhere, is waited for as [`Device::mmio_write`] waits for it, and no
+//! offer is made), the service thread holds no message of the queue's, none answered is left for
+//! it to take, the buffer fits the thread's copy of it ([`DOORBELL_MESSAGE_MAX`]), at most
+//! `DOORBELL_READS` of ring 0's messages are left to read, and the control thread has carried out
+//! every ring-0 message the buffer waits for. Otherwise the service thread takes the buffer as it
+//! takes any, so the queue's events keep its order either way.
 //!
 //! **The end.** The last [`Device`] handle's drop ends both threads without waiting for them: each
 //! sees the end at its next wake (the control thread at once, the refresh thread within a
@@ -222,21 +224,22 @@ const COMPLETE: RingAt = RingAt {
 /// What the device asks of the host that runs it (QEMU, through the C API's callbacks). Each is
 /// called on one of the device's threads, or, for [`Host::raise_interrupt`], on the thread that
 /// posts the event it raises for; never inside a call of the host's into the device but
-/// [`Device::mmio_write_taking`], which calls [`Host::take_command_buffer`] and may raise there.
+/// [`Device::mmio_write_taking`], which calls [`Host::answer_command_buffer`] and may raise there.
 /// Each is called with no lock held that a call of the device's waits for, directly or through a
 /// thread of the device's, so each may call the device at once. Of its own the device holds only
-/// a command queue's claim on its messages, around [`Host::stage3_message`] of the queue's
-/// messages and the raises inside it, and, around [`Host::take_command_buffer`], the claim and
-/// the queue's submission ring; a call of the device's only tries either.
+/// a command queue's claim on its messages, around [`Host::stage3_message`] and
+/// [`Host::answer_command_buffer`] of the queue's messages and the raises inside them; a call of
+/// the device's only tries it.
 pub trait Host: Send + Sync + 'static {
     /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
     /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On
     /// the thread that posts it: the control, refresh or a queue's service thread, the host's
     /// inside [`Device::mmio_write_taking`], or one of the host's that holds a
     /// [`CompletionPoster`] or a [`CompleteAnswer`]. Locks may be held around it, none that a call
-    /// of the device's waits for: a queue's claim on its messages, on its service thread, and
-    /// those the host holds while it posts or answers (`reims-vgpu`'s decoder, at a command
-    /// buffer's `CB_SUBMITTED` posted as the buffer is taken).
+    /// of the device's waits for: a queue's claim on its messages, on its service thread and
+    /// inside [`Device::mmio_write_taking`], and those the host holds while it posts or answers
+    /// (`reims-vgpu`'s decoder, at a command buffer's `CB_SUBMITTED` posted as the buffer is
+    /// answered or taken).
     fn raise_interrupt(&self, vector: u32);
 
     /// Whether the guest wrote any of the `length` bytes at `offset` in the region since the last
@@ -336,16 +339,19 @@ pub trait Host: Send + Sync + 'static {
         let _ = (completion, message);
     }
 
-    /// Offers the host a `COMMAND_BUFFER` of a command queue's submission ring on the thread of
-    /// a `DOORBELL` write through [`Device::mmio_write_taking`] (the module doc), with
-    /// `completion` onto the queue's completion ring, as [`Host::stage3_message`] would be handed
-    /// it. The host takes it ([`Taken`]) where it posts the buffer's `CB_SUBMITTED` at its take,
-    /// and answers `None` otherwise, with nothing done: the queue's service thread then hands the
-    /// buffer to [`Host::stage3_message`] as it hands any. It waits for nothing: no lock held
-    /// elsewhere, no room on a ring. The default takes none.
-    fn take_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> Option<Taken> {
+    /// Offers the host the `COMMAND_BUFFER` `message` at the head of a command queue's
+    /// submission ring, on the thread of a `DOORBELL` write through [`Device::mmio_write_taking`]
+    /// (the module doc), with `completion` onto the queue's completion ring. The message stays on
+    /// the ring: the queue's service thread hands it to [`Host::stage3_message`] next, as it hands
+    /// any. The host answers it here where it may post the buffer's `CB_SUBMITTED` before then,
+    /// and posts it through `completion` waiting for nothing ([`CompletionPoster::try_post`]),
+    /// keeping what it took for the buffer for the hand-over; true where it answered it, and
+    /// false, with nothing done, otherwise. It waits for nothing (no lock held elsewhere, no room
+    /// on a ring) and allocates nothing, on the guest's vCPU. A message it answered is not
+    /// offered again; one it did not may be, at a later doorbell. The default answers none.
+    fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {
         let _ = (completion, message);
-        None
+        false
     }
 
     /// A refresh of display 0, on the refresh thread, after its `VBLANK` (while the guest has
@@ -373,35 +379,10 @@ pub trait Host: Send + Sync + 'static {
     }
 }
 
-/// A `COMMAND_BUFFER` the host took on a doorbell's thread ([`Host::take_command_buffer`]).
-pub struct Taken {
-    /// Posts the buffer's `CB_SUBMITTED` waiting for nothing ([`CompletionPoster::try_post`]),
-    /// unless `rest` posted it first: called on the doorbell's thread once the buffer is off the
-    /// ring and `rest` is handed over. `None` where the host failed the buffer at its take, which
-    /// `rest` reports as [`Host::stage3_message`] would.
-    pub post: Option<Box<dyn FnOnce() + Send>>,
-    /// The rest of the buffer's work, run on its queue's service thread before the thread takes
-    /// anything more of the queue's: the `CB_SUBMITTED` posted where `post` has not posted it,
-    /// then the buffer carried out.
-    pub rest: Box<dyn FnOnce() + Send>,
-}
-
-impl std::fmt::Debug for Taken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Taken")
-            .field("post", &self.post.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-/// The work a queue's service thread carries out before it takes anything more of the queue's:
-/// a [`Taken`]'s `rest`.
-type Handed = Box<dyn FnOnce() + Send>;
-
 /// The largest `COMMAND_BUFFER` message a doorbell's thread offers the host
-/// ([`Device::mmio_write_taking`]): it bounds the thread's copy of the message and the host's scans
-/// of its op stream.
-const TAKE_ON_DOORBELL_MAX: usize = 16 << 10;
+/// ([`Device::mmio_write_taking`]): the size of the thread's copy of the message, on its stack,
+/// and a bound on the host's scans of its op stream there.
+const DOORBELL_MESSAGE_MAX: usize = 16 << 10;
 
 /// The device.
 pub struct Device {
@@ -523,11 +504,12 @@ pub(crate) struct QueueShared {
     submit: Mutex<Submit>,
     /// The highest `seqno` of a message taken off the submission ring, 0 before one is.
     taken_seqno: AtomicU64,
-    /// Held by whoever takes the submission ring's messages and hands them over: the service
-    /// thread, from its take of a message to its hand-over, or a doorbell's thread, which tries
-    /// it and offers the host a message only where it holds it. It holds what a doorbell's thread
-    /// took ([`Taken::rest`]), which the service thread carries out first.
-    consuming: Mutex<Option<Handed>>,
+    /// Held by whoever takes the submission ring's messages or offers them to the host: the
+    /// service thread, from its take of a message to its hand-over, or a doorbell's thread, which
+    /// tries it and offers the host a message only where it holds it. It holds the `seqno` of the
+    /// message at the ring's head that the host answered on a doorbell's thread
+    /// ([`Host::answer_command_buffer`]), until the service thread takes it.
+    consuming: Mutex<Option<u64>>,
     /// The completion ring.
     complete: Mutex<Producer>,
     /// Where posts onto the completion ring wait for room.
@@ -661,7 +643,7 @@ impl Device {
             submit: Mutex::new(Submit {
                 consumer,
                 broken: false,
-                backlog: Backlog::default(),
+                backlog: Backlog::with_room(),
             }),
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
@@ -769,9 +751,10 @@ impl Device {
 
     /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring first offers the
     /// queue's next `COMMAND_BUFFER` to the host on the calling thread
-    /// ([`Host::take_command_buffer`]; the module doc): the host may post its `CB_SUBMITTED` there,
-    /// calling [`Host::raise_interrupt`] inside this call. It waits for the queues' table where it
-    /// is held, as `mmio_write` does, and for nothing else.
+    /// ([`Host::answer_command_buffer`]; the module doc): the host may post its `CB_SUBMITTED`
+    /// there, calling [`Host::raise_interrupt`] inside this call. It waits for the queues' table
+    /// where it is held, as `mmio_write` does, and for nothing else, and the offer allocates
+    /// nothing.
     pub fn mmio_write_taking(&self, offset: u64, value: u32) {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_DOORBELL => self.shared.ring_taking(u64::from(value)),
@@ -978,7 +961,7 @@ impl Shared {
         let mut completion = self.completion.lock();
         submit.consumer.reset(&self.region);
         submit.broken = false;
-        submit.backlog = Backlog::default();
+        submit.backlog.clear();
         self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
         *display = DisplayState::default();
@@ -1364,7 +1347,7 @@ impl Shared {
     }
 
     /// [`Self::ring_doorbell`], where a command queue's ring is rung, after its next message is
-    /// offered to the host on this thread ([`Self::take_on_doorbell`]). The queues' table, held
+    /// offered to the host on this thread ([`Self::answer_on_doorbell`]). The queues' table, held
     /// elsewhere, is waited for as `ring_doorbell` waits for it, and nothing is offered.
     fn ring_taking(&self, ring_id: u64) {
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
@@ -1377,68 +1360,68 @@ impl Shared {
             None => return self.ring_doorbell(ring_id),
         };
         if let Some(queue) = queue {
-            self.take_on_doorbell(&queue);
+            self.answer_on_doorbell(&queue);
             queue.rung();
         }
     }
 
     /// Offers `queue`'s next message to the host on this thread, a doorbell's (the module doc),
-    /// where it is a `COMMAND_BUFFER` of at most [`TAKE_ON_DOORBELL_MAX`] bytes, the device is
-    /// started and the queue lives, and nothing need be waited for: `queue`'s `consuming`, its
-    /// submission ring and the control submission ring are each free, at most [`DOORBELL_READS`]
-    /// of ring 0's messages are left to read, and the control thread has carried out every
-    /// ring-0 message the buffer waits for, as the service thread waits for before it hands a
-    /// buffer over. Where the host takes it, the buffer leaves the
-    /// ring, the rest of its work is handed to the service thread, and its `CB_SUBMITTED` is
-    /// posted here, before the caller wakes the service thread, which would post it first
-    /// otherwise. Where it does not, the ring is left as it was (but for pads before the message,
-    /// which carry nothing).
-    fn take_on_doorbell(&self, queue: &Arc<QueueShared>) {
+    /// where it is a `COMMAND_BUFFER` of at most [`DOORBELL_MESSAGE_MAX`] bytes, none answered is
+    /// left for the service thread to take, the device is started and the queue lives, and nothing
+    /// need be waited for: `queue`'s `consuming`, its submission ring and the control submission
+    /// ring are each free, at most
+    /// [`DOORBELL_READS`] of ring 0's messages are left to read, which ring 0's index has room for,
+    /// and the control thread has carried out every ring-0 message the buffer waits for, as the
+    /// service thread waits for before it hands a buffer over. The message stays on the ring (but
+    /// for pads before it, which carry nothing), copied onto this thread's stack for the host;
+    /// where the host answers it, the service thread, which takes it next, hands it over waiting
+    /// for ring 0 no more. Allocates nothing.
+    fn answer_on_doorbell(&self, queue: &Arc<QueueShared>) {
         let Some(mut consuming) = queue.consuming.try_lock() else {
             return;
         };
         if consuming.is_some() {
             return;
         }
-        let post = {
-            let Some(mut submit) = queue.submit.try_lock() else {
-                return;
-            };
-            if !self.started() || submit.broken || self.ending() || queue.ended() {
-                return;
-            }
-            let Ok(Some(message)) = submit.consumer.peek(&self.region) else {
-                return;
-            };
-            if message.header.r#type != RGFX_CMD_COMMAND_BUFFER
-                || message.bytes.len() > TAKE_ON_DOORBELL_MAX
-            {
-                return;
-            }
-            // The order the service thread keeps (`take_queue_messages`), read after the peek, of
-            // as much of ring 0 as a doorbell reads.
+        let Some(mut submit) = queue.submit.try_lock() else {
+            return;
+        };
+        if !self.started() || submit.broken || self.ending() || queue.ended() {
+            return;
+        }
+        let mut words = [0u64; DOORBELL_MESSAGE_MAX / 8];
+        let bytes = words.as_mut_bytes();
+        let Ok(Some(header)) = submit.consumer.peek_into(&self.region, bytes) else {
+            return;
+        };
+        let size = header.size as usize;
+        if header.r#type != RGFX_CMD_COMMAND_BUFFER || size > bytes.len() {
+            return;
+        }
+        // The order the service thread keeps (`take_queue_messages`), read after the peek, of as
+        // much of ring 0 as a doorbell reads.
+        {
             let Some(mut control) = self.submit.try_lock() else {
                 return;
             };
             let control = &mut *control;
+            if !control.backlog.room_for(DOORBELL_READS) {
+                return;
+            }
             let done = self.control_done.load(Ordering::Acquire);
             let read =
                 (control.backlog).read(&control.consumer, &self.region, done, DOORBELL_READS);
             if !read || done < control.backlog.waits_for(queue.context) {
                 return;
             }
-            let poster = self.queue_poster(queue);
-            let Some(taken) = self.host.take_command_buffer(&poster, &message.bytes) else {
-                return;
-            };
-            submit.consumer.take(&self.region, &message);
-            queue.took(message.header.seqno);
-            *consuming = Some(taken.rest);
-            taken.post
-        };
-        drop(consuming);
-        if let Some(post) = post {
-            post();
+        }
+        // The host may raise inside its answer, which waits for no lock a call of the device's
+        // waits for (a reset fences the ring): the queue's claim alone is held there, as around
+        // the service thread's hand-overs.
+        drop(submit);
+        let poster = self.queue_poster(queue);
+        if self.host.answer_command_buffer(&poster, &bytes[..size]) {
+            *consuming = Some(header.seqno);
         }
     }
 
@@ -1651,11 +1634,6 @@ impl Shared {
         // The host makes the queue's handle first, so a command buffer on it can name it.
         self.host.stage3_message(&poster, &queue.create_message());
         self.queue_loop(queue, &poster);
-        // A command buffer a doorbell's thread took is carried out, as one this thread took is.
-        let handed = queue.consuming.lock().take();
-        if let Some(rest) = handed {
-            rest();
-        }
         // A closed queue's handle goes with it (a process's other objects go at its context's
         // close). Nothing is posted for it: the queue has ended. A reset's queue's goes with the
         // host's reset ([`Host::device_reset`]).
@@ -1701,15 +1679,12 @@ impl Shared {
     }
 
     /// Takes and hands to the host every message the guest has published on `queue`'s submission
-    /// ring, while the device is started and the ring is not broken, after it carries out the
-    /// command buffer a doorbell's thread took, where one did. Each message is taken with the
-    /// ring held and handed over with only the queue's `consuming` held; the completion the host
-    /// owes is posted onto the queue's completion ring through `poster`, from the GPU's thread.
+    /// ring, while the device is started and the ring is not broken. Each message is taken with
+    /// the ring held and handed over with only the queue's `consuming` held; the completion the
+    /// host owes is posted onto the queue's completion ring through `poster`, from the GPU's
+    /// thread.
     fn take_queue_messages(&self, queue: &Arc<QueueShared>, poster: &CompletionPoster) {
         let mut consuming = queue.consuming.lock();
-        if let Some(rest) = consuming.take() {
-            rest();
-        }
         loop {
             let (next, room) = {
                 let mut submit = queue.submit.lock();
@@ -1771,8 +1746,12 @@ impl Shared {
             // registered before the buffer's ops name it. This thread only reads ring 0; it never
             // consumes it, so it keeps one consumer and its `consumer_idle` handshake is
             // untouched. It sleeps until the control thread signals a move of `control_done`, a
-            // reset or the end.
-            let waits_for = {
+            // reset or the end. A buffer the host answered on a doorbell's thread waits no more:
+            // that thread found ring 0 carried out through what the buffer waits for.
+            let answered = consuming.take() == Some(message.header.seqno);
+            let waits_for = if answered {
+                0
+            } else {
                 let mut control = self.submit.lock();
                 let control = &mut *control;
                 let done = self.control_done.load(Ordering::Acquire);

@@ -19,15 +19,17 @@
 //! it carried out (`Ok(Ok(()))`) gets exactly one completion, and one it did not gets none from the
 //! decoder (the device posts its failure: `GraphicsDevice::report`), so no buffer is answered twice
 //! or left without an answer; and a stream holding an op of a tag no group decodes is never
-//! carried out.
+//! carried out. The answer target checks that a command buffer answered on a doorbell's thread is
+//! carried out as one its queue's thread takes unanswered: the same platform calls in the same
+//! order, so the same commits, and the same outcomes and records, in the same order.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use reims_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
-    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer,
-    RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SUBMITTED, RGFX_PASS_FLAG_RT_SIZE,
+    RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
 };
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
@@ -42,7 +44,7 @@ use reims_vgpu_core::testkit::FakePlatform;
 use reims_vgpu_core::testkit::objects::CompleteOn;
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::{DecodeError, GraphicsDecoder, refusing};
+use super::{DecodeError, GraphicsDecoder, ObjHandle, refusing};
 
 /// SplitMix64 (Steele, Lea and Flood, 2014): small, fast and seedable.
 struct Rng(u64);
@@ -692,5 +694,96 @@ fn a_command_buffer_s_op_bytes_are_its_message_s_ops() {
             ops.len()
         );
         assert!(!seen.lock().contains(&("complete", cb_obj_id)));
+    }
+}
+
+/// What a run of [`an_answer_at_the_doorbell_keeps_the_order_of_a_take`]'s case saw: the
+/// platform's calls, in order; each message's outcome, in order; and what the decoder posted.
+type Run = (Vec<&'static str>, Vec<String>, Vec<(&'static str, u64)>);
+
+/// A command buffer answered on a doorbell's thread before its begin is carried out as one its
+/// queue's thread begins unanswered. Over sequences of up to eight command buffers of queue 1,
+/// half of which ask for their `CB_SUBMITTED`, with the context's other messages between them, run
+/// once with each buffer begun as the queue's thread begins it (`begin_taken`) and once with each
+/// offered to the answer first, the platform sees the same calls in the same order (so the same
+/// commits, in the same order), each message gets the same outcome, and the decoder posts the
+/// same records in the same order, each buffer's `CB_SUBMITTED` once.
+#[test]
+fn an_answer_at_the_doorbell_keeps_the_order_of_a_take() {
+    let (seed, cases) = run("answers", 256);
+    let mut answered = 0;
+    for case in cases.clone() {
+        let case_seed = mix(seed ^ case);
+        let mut run_case = |answering: bool| -> Run {
+            let mut rng = Rng(case_seed);
+            let (p, mut dec, seen) = setup();
+            p.world().set_auto_complete(Some(CompleteOn::Caller));
+            let device = p.device();
+            let from = p.call_log().mark();
+            let mut outcomes = Vec::new();
+            for i in 0..1 + rng.below(8) {
+                if rng.one_in(3) {
+                    let m = message(&mut rng);
+                    outcomes.push(format!("{:?}", refusing(|| dec.decode(&device, &m))));
+                    continue;
+                }
+                let cb_obj_id = OBJECTS + 1 + i;
+                let mut ops = op_stream(&mut rng);
+                if rng.one_in(2) {
+                    ops.extend(op(&mut rng, RGFX_OP_SUBMITTED, &[]));
+                }
+                let m = command_buffer(&mut rng, cb_obj_id, &ops);
+                let queue = RgfxCommandBuffer::read_from_prefix(&m)
+                    .unwrap()
+                    .0
+                    .queue_obj_id;
+                // A buffer runs on the queue whose ring carried it: queue 1's alone here.
+                if queue != 1 {
+                    continue;
+                }
+                if answering {
+                    let posted = Arc::clone(&seen);
+                    let yes = dec.decoders().answer_at_doorbell(CONTEXT, &m, move |r| {
+                        posted.lock().push(("submitted", r.cb_obj_id));
+                        true
+                    });
+                    answered += u64::from(yes);
+                }
+                let begun = refusing(|| dec.begin_taken(&device, &m, Some(queue)));
+                let outcome = match begun {
+                    Ok(Ok(begun)) => refusing(|| dec.finish_command_buffer(&device, &m, begun)),
+                    Ok(Err(e)) => Ok(Err(e)),
+                    Err(raise) => Err(raise),
+                };
+                let stood_in = !matches!(outcome, Ok(Ok(())))
+                    && matches!(refusing(|| dec.stand_in_for_failed(&device, &m)), Ok(true));
+                dec.end_message();
+                outcomes.push(format!("{outcome:?} {stood_in}"));
+            }
+            // What the answer kept on the queue, where its buffer was never begun, is let go of.
+            let queue_left = matches!(dec.named(1), Some(ObjHandle::CommandQueue(_)));
+            if queue_left {
+                assert!(
+                    dec.queue_counts(1).unwrap().answered.lock().is_none(),
+                    "case {case}: an answer left on the queue"
+                );
+            }
+            let seen = seen.lock().clone();
+            (p.call_log().sels_since(from), outcomes, seen)
+        };
+        let taken = run_case(false);
+        let answered_first = run_case(true);
+        assert_eq!(
+            taken, answered_first,
+            "case {case} (RGFX_FUZZ_SEED's mix {case_seed:#x}): the answer changed what the \
+             platform or the guest sees"
+        );
+    }
+    if cases.end - cases.start > 100 {
+        assert!(
+            answered > 0,
+            "no command buffer of {} cases was answered",
+            cases.end
+        );
     }
 }
