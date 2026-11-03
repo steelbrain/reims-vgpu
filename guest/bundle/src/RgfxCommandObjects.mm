@@ -456,8 +456,8 @@ struct RgfxBarrierSlot {
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 /// Runs `record` on the queue's completion queue, behind the records before it, or here.
 - (void)rgfxDeliver:(dispatch_block_t)record here:(BOOL)here;
-/// Puts `cb` last in the enqueue order, where it is not in it yet.
-- (void)rgfxEnqueue:(RgfxCmdBuffer *)cb;
+/// Puts `cb` last in the enqueue order, where it is not in it yet: whether it was not.
+- (BOOL)rgfxEnqueue:(RgfxCmdBuffer *)cb;
 /// Posts the buffers at the front of the enqueue order that are ready, in that order.
 - (void)rgfxPostReady;
 @end
@@ -683,11 +683,13 @@ struct RgfxBarrierSlot {
 // buffer after it. A commit with no enqueue before it enqueues the buffer there. So the queue
 // keeps the enqueued buffers not yet posted, oldest first, and each commit posts the ready ones
 // at the front, in order, on the one ring: its own, and those committed behind one it waited for.
-- (void)rgfxEnqueue:(RgfxCmdBuffer *)cb
+- (BOOL)rgfxEnqueue:(RgfxCmdBuffer *)cb
 {
 	std::lock_guard<std::mutex> hold(_orderLock);
-	if ([cb rgfxTakeEnqueue])
-		_order.push_back(cb);
+	if (![cb rgfxTakeEnqueue])
+		return NO;
+	_order.push_back(cb);
+	return YES;
 }
 
 - (void)rgfxPostReady
@@ -1254,10 +1256,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 // --- submission --------------------------------------------------------------
 
-// Its place in its queue's order, which it runs in (ENQUEUE ORDER, above).
+// Its place in its queue's order, which it runs in (ENQUEUE ORDER, above), once: a second
+// enqueue, or one after the commit (which enqueues), ends the process with Metal's words, as
+// Metal does on the M3 Max, an AMD 5300M and an Intel 630 (measured).
 - (void)enqueue
 {
-	[_queue rgfxEnqueue:self];
+	if (![_queue rgfxEnqueue:self])
+		RgfxMetalAssertionFailed("-[_MTLCommandBuffer enqueue]",
+		                         @"enqueue an already enqueued command buffer");
 }
 
 - (BOOL)rgfxTakeEnqueue
@@ -1277,10 +1283,14 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 - (void)commit
 {
+	// Commit is once: a second, or a commitAndWaitUntilSubmitted after it, ends the process with
+	// Metal's words, as Metal does on the M3 Max, an AMD 5300M and an Intel 630 (measured; the
+	// Intel's assertion is its completed handler's).
 	{
 		std::lock_guard<std::mutex> hold(_handlersLock);
 		if (_committed)
-			return; // commit is once
+			RgfxMetalAssertionFailed("-[IOGPUMetalCommandBuffer validate]",
+			                         @"commit an already committed command buffer");
 		_committed = YES;
 	}
 	// Not enqueued before, it is now, behind every buffer enqueued before it.

@@ -3449,8 +3449,8 @@ void test_command_graph()
 	CHECK(begins == 3 && ends == 3);
 	CHECK(walk.pos == cbh.op_bytes && cbh.op_bytes % 8 == 0);
 
-	// commit is once: a second commit posts nothing more.
-	[cb commit];
+	// The commit posted the one message; a second commit ends the process, as Metal's does
+	// (tests/queue_tests.mm).
 	RgfxMsgHeader extra = {};
 	std::vector<uint8_t> extraBytes;
 	CHECK(!submit.next(&extra, &extraBytes));

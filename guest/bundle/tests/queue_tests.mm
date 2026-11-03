@@ -730,6 +730,19 @@ void test_submitted_waits_for_the_buffers_before()
 	}
 }
 
+// A second enqueue, an enqueue after the commit and a second commit end the process at the call
+// with Metal's words, as Metal does on all three GPUs. (They used to do nothing.)
+void test_enqueue_and_commit_are_once()
+{
+	const char *enqueued = "-[_MTLCommandBuffer enqueue]: failed assertion `enqueue an already "
+	                       "enqueued command buffer'";
+	checkDies("enqueue-twice", enqueued);
+	checkDies("enqueue-after-commit", enqueued);
+	checkDies("commit-twice", "-[IOGPUMetalCommandBuffer validate]: failed assertion `commit an "
+	                          "already committed command buffer'");
+	checkDies("commit-and-wait-after-commit", "commit an already committed command buffer");
+}
+
 } // namespace
 
 int rgfxQueueDiesCase(const char *name)
@@ -738,7 +751,18 @@ int rgfxQueueDiesCase(const char *name)
 	@autoreleasepool {
 		Queue q(true);
 		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		if (std::strcmp(name, "enqueue-twice") == 0) {
+			[cb enqueue];
+			[cb enqueue];
+			return 0;
+		}
 		[cb commit];
+		if (std::strcmp(name, "enqueue-after-commit") == 0)
+			[cb enqueue];
+		if (std::strcmp(name, "commit-twice") == 0)
+			[cb commit];
+		if (std::strcmp(name, "commit-and-wait-after-commit") == 0)
+			[(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted];
 		auto late = [&](bool completedFirst, void (^add)(void)) {
 			if (completedFirst)
 				complete(q, cb);
@@ -776,4 +800,5 @@ void rgfxQueueTests(const char *self)
 	test_buffers_run_in_enqueue_order();
 	test_threads_commit_in_enqueue_order();
 	test_submitted_waits_for_the_buffers_before();
+	test_enqueue_and_commit_are_once();
 }
