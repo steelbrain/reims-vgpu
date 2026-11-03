@@ -283,14 +283,27 @@ pub trait Host: Send + Sync + 'static {
     /// `BLOCK_RELEASE`: context `release.context` freed its region block (`release.offset`,
     /// `release.size`), in which no live queue's ring lies. The host gives `answer` from any
     /// thread: [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block, else
-    /// [`RGFX_STATUS_OK`] once every command buffer of the context it had committed has finished.
-    /// The kext gives the block out again only on OK. Called on the context's lane, in ring order,
-    /// after the lanes of the other contexts that held the block have carried out what they were
-    /// handed before it.
+    /// [`RGFX_STATUS_OK`] once every command buffer of the context it had committed has finished,
+    /// and, of a shared block, every one each earlier holder had committed before its
+    /// `BLOCK_UNSHARE` ([`Host::block_unshared`]). The kext gives the block out again only on OK,
+    /// and the memory of a surface's block in place back to the guest's system. Called on the
+    /// context's lane, in ring order, after the lanes of the other contexts that held the block
+    /// have carried out what they were handed before it.
     /// The default answers OK at once, for a host with no stage-3 decoder.
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         let _ = release;
         answer.answer(RGFX_STATUS_OK);
+    }
+
+    /// `BLOCK_UNSHARE`: context `unshare.context` let go of the shared block of `unshare.size`
+    /// bytes at `unshare.offset`, which it no longer names, and the kext unwired the block's pages
+    /// in its process. The command buffers of the context's the host had committed before this
+    /// may still use the block: the host's answer to the block's `BLOCK_RELEASE`, by whichever
+    /// holder, waits for them too ([`Host::block_released`]). Called on the context's lane, in
+    /// ring order, once the region has ended the context's hold, and before the block's release.
+    /// The default does nothing, for a host with no stage-3 decoder.
+    fn block_unshared(&self, unshare: &RgfxBlockGrant) {
+        let _ = unshare;
     }
 
     /// The device was reset ([`Device::reset`], or the guest's `STATUS` 0): the host drops every
@@ -1348,7 +1361,8 @@ impl Shared {
     }
 
     /// `BLOCK_SHARE` and `BLOCK_UNSHARE`: the region keeps, or ends, the context's hold of the
-    /// shared block, where it lies in the processes' part of the region.
+    /// shared block, where it lies in the processes' part of the region; the host is told of an
+    /// unshare ([`Host::block_unshared`]).
     pub(crate) fn share_block(&self, share: &RgfxBlockGrant, holds: bool) {
         let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
         if share.offset < RGFX_CONTEXT_ALLOCATIONS_OFFSET
@@ -1366,6 +1380,7 @@ impl Shared {
             self.region.share(share.context, share.offset, share.size);
         } else {
             self.region.unshare(share.context, share.offset, share.size);
+            self.host.block_unshared(share);
         }
     }
 

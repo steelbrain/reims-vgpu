@@ -471,6 +471,10 @@ pub(crate) struct Shared<P: Platform> {
     platform: Arc<P>,
     /// Each context's state, by id, made at its first create and dropped at its close.
     contexts: Mutex<HashMap<u32, Arc<Context<P>>>>,
+    /// The shared blocks a holder let go of (`BLOCK_UNSHARE`), by offset, until their release:
+    /// each one's drain ends once every command buffer such a holder began before its unshare has
+    /// finished, and gives the release's answer ([`GraphicsDecoder::block_unshared`]).
+    unshared: Mutex<HashMap<u64, Arc<Drain>>>,
     /// The IOSurfaces' names.
     surfaces: Mutex<SurfaceNames>,
     /// The host's hardware video, which makes the video sessions; unset where it has none.
@@ -654,6 +658,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
             contexts: Mutex::new(HashMap::new()),
+            unshared: Mutex::default(),
             surfaces: Mutex::default(),
             video: OnceLock::new(),
             libraries: Mutex::new(Libraries::new()),
@@ -1472,7 +1477,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         contexts.dedup();
         let dropped = contexts.iter().map(|&c| self.drop_context(c)).sum();
         *shared.surfaces.lock() = SurfaceNames::default();
-        // Their drains go with them: the answers waiting on those are owed to no one.
+        // Their drains go with them, and the unshared blocks' with the blocks: the answers
+        // waiting on those are owed to no one.
+        shared.unshared.lock().clear();
         let states = std::mem::take(&mut *shared.contexts.lock());
         if let Err(refusal) = refusals::refusing(move || drop(states)) {
             log::warn!(
@@ -2368,6 +2375,27 @@ impl<P: Platform> GraphicsDecoder<P> {
         .unwrap_or_default();
         drain.answers.lock().push(answer);
         drain
+    }
+
+    /// `BLOCK_UNSHARE` by `context` of the shared block at `block`, which other contexts still
+    /// hold: the block's release is answered only once every command buffer the decoder began for
+    /// the context before this has finished as well ([`Self::after_unshares`]), since the kext
+    /// gives the block's memory back at that answer. The drain is returned for the caller to drop
+    /// with no lock held, as [`Self::drain_context`]'s is.
+    pub(crate) fn block_unshared(&self, context: u32, block: u64) -> Arc<Drain> {
+        let gate = Arc::clone(self.shared.unshared.lock().entry(block).or_default());
+        self.drain_context(context, false, Box::new(move || drop(gate)))
+    }
+
+    /// `answer`, the answer to the release of the block at `block`, given once every command
+    /// buffer its earlier holders began before their `BLOCK_UNSHARE` has finished too
+    /// ([`Self::block_unshared`]): `answer` itself where none let the block go.
+    pub(crate) fn after_unshares(&self, block: u64, answer: DrainAnswer) -> DrainAnswer {
+        let Some(gate) = self.shared.unshared.lock().remove(&block) else {
+            return answer;
+        };
+        gate.answers.lock().push(answer);
+        Box::new(move || drop(gate))
     }
 
     /// `RENDER_PIPELINE_CREATE` and `COMPUTE_PIPELINE_CREATE`, carried out at once: the create is

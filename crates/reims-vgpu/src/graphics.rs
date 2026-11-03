@@ -45,7 +45,7 @@ use reims_graphics::wire::{
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
     RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
     RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
     RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
@@ -659,7 +659,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// `BLOCK_RELEASE` (`Host::block_released`): refused at once where an object the decoder
     /// holds lies in the block, else answered once every command buffer of the block's context
-    /// the decoder committed has finished.
+    /// the decoder committed has finished, and every one an earlier holder's context committed
+    /// before its `BLOCK_UNSHARE` ([`Self::unshare_block`]).
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         // After the no-copy buffers being made over it, which keep it.
         self.pages_buffers.wait(release.offset);
@@ -675,11 +676,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
-        let drain = decoder.drain_context(
-            release.context,
-            false,
+        let answer = decoder.after_unshares(
+            release.offset,
             Box::new(move || answer.answer(RGFX_STATUS_OK)),
         );
+        let drain = decoder.drain_context(release.context, false, answer);
         // No buffer lies over the block's surface view any more: it goes with the block, and its
         // device cache once the surface's pages hold what was written of it, which the answer
         // waits for. The copy is made once the buffers still walked that may write the cache
@@ -703,6 +704,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             );
         });
         drop(decoder);
+        drop(drain);
+    }
+
+    /// `BLOCK_UNSHARE` (`Host::block_unshared`): the block's release, by its last holder, waits
+    /// for the command buffers the decoder committed for `unshare.context` before this, which may
+    /// still use the block ([`GraphicsDecoder::block_unshared`]).
+    fn unshare_block(&self, unshare: &RgfxBlockGrant) {
+        let drain = self
+            .decoder()
+            .block_unshared(unshare.context, unshare.offset);
         drop(drain);
     }
 
@@ -1555,6 +1566,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         self.control.release_block(release, answer);
+    }
+
+    fn block_unshared(&self, unshare: &RgfxBlockGrant) {
+        self.control.unshare_block(unshare);
     }
 
     fn device_reset(&self) {

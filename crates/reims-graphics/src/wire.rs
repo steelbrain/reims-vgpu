@@ -547,10 +547,11 @@ pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
 /// this is answered [`RGFX_EVT_COMPLETE`] with [`RGFX_STATUS_OK`]. The host answers
 /// [`RGFX_STATUS_REFUSED`] at once where an object it holds, or a live queue's ring, still lies in
 /// the block; otherwise it answers OK once every command buffer of the context it had committed
-/// has finished. Posted after every message the process posted before its free, and nothing the
-/// process posts after it can name the block. A block over an IOSurface's pages with a device
-/// cache has the cache copied into the pages first, where a command buffer wrote it since the last
-/// copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
+/// has finished, and, of a shared block, every one each earlier holder had committed before its
+/// [`RGFX_CMD_BLOCK_UNSHARE`]. Posted after every message the process posted before its free, and
+/// nothing the process posts after it can name the block. A block over an IOSurface's pages with
+/// a device cache has the cache copied into the pages first, where a command buffer wrote it since
+/// the last copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
 pub const RGFX_CMD_BLOCK_RELEASE: u32 = 0x2f2;
 /// `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
 /// `context` the region block of `size` bytes at `offset`. Posted before the process learns of the
@@ -573,7 +574,8 @@ pub const RGFX_CMD_BLOCK_SHARE: u32 = 0x2f4;
 /// no longer holds the shared block of `size` bytes at `offset`, which other contexts still hold.
 /// Posted after every message the process posted before it let the block go. Not answered. The
 /// block's last holder lets it go with a `BLOCK_RELEASE`, which ends every hold of it, and is
-/// refused while an object of any context lies in the block.
+/// refused while an object of any context lies in the block; its answer waits for the command
+/// buffers this context committed before its unshare too, which may still use the block.
 pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
 /// `SURFACE_PAGES` ([`RgfxSurfacePages`]), on ring 0 from the accelerator kext, where the device
 /// has [`RGFX_FEATURE_SURFACE_PAGES`]: the guest RAM an IOSurface's `length` bytes lie in, whose
