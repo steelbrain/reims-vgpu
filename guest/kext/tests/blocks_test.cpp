@@ -203,6 +203,80 @@ int main()
 		      "a kept block is no one's");
 		check(!rgfxBlockNextRelease(x.t, &release), "nor released");
 	}
+	{
+		// An in-place block's wired pages are held by the block until its release is answered
+		// OK, then handed back for the caller to unwire; a refused release keeps the block and
+		// is posted again after a context close.
+		Table x;
+		int pagesA = 0, pagesB = 0;
+		void *wireA = &pagesA, *wireB = &pagesB;
+		uint64_t a1 = 0, b1 = 0;
+		check(rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &a1) == kRgfxBlockOk, "a block");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &b1) == kRgfxBlockOk, "another");
+		check(x.t.blocks[rgfxBlockIndex(x.t, a1)].wired == nullptr &&
+		          !x.t.blocks[rgfxBlockIndex(x.t, a1)].refused,
+		      "a fresh block holds no wire and is not refused");
+		check(rgfxBlockSetWired(x.t, a1, wireA) && rgfxBlockSetWired(x.t, b1, wireB),
+		      "an in-place block's wire attaches");
+		check(!rgfxBlockSetWired(x.t, 0x999000, wireA), "no wire attaches to a block not there");
+
+		// The first block's release is answered OK: the block goes and hands back its wire.
+		check(rgfxBlockFree(x.t, a, a1) == kRgfxBlockOk, "a free");
+		RgfxBlock rel;
+		check(rgfxBlockNextRelease(x.t, &rel) && rel.offset == a1, "its release");
+		void *got = reinterpret_cast<void *>(0x1);
+		rgfxBlockReleased(x.t, a1, rel.serial, true, &got);
+		check(got == wireA && rgfxBlockIndex(x.t, a1) < 0, "OK hands back the wire and frees it");
+
+		// The second block's release is refused: it is kept, marked refused, and keeps its wire.
+		check(rgfxBlockFree(x.t, b, b1) == kRgfxBlockOk, "a free");
+		check(rgfxBlockNextRelease(x.t, &rel) && rel.offset == b1, "its release");
+		got = reinterpret_cast<void *>(0x1);
+		rgfxBlockReleased(x.t, b1, rel.serial, false, &got);
+		int64_t bi = rgfxBlockIndex(x.t, b1);
+		check(bi >= 0 && x.t.blocks[bi].state == kRgfxBlockKept && x.t.blocks[bi].refused &&
+		          x.t.blocks[bi].wired == wireB,
+		      "a refused release keeps the block, marks it refused and keeps its wire");
+		check(got == nullptr, "and hands back no wire");
+		check(!rgfxBlockNextRelease(x.t, &rel), "it is not posted again on its own");
+
+		// A context close posts refused releases again; this time OK frees it and hands the wire.
+		check(rgfxBlockRetryRefused(x.t) == 1, "a close posts the refused release again");
+		bi = rgfxBlockIndex(x.t, b1);
+		check(bi >= 0 && x.t.blocks[bi].state == kRgfxBlockFreed && !x.t.blocks[bi].refused,
+		      "the refused block is freed again, no longer refused");
+		check(rgfxBlockNextRelease(x.t, &rel) && rel.offset == b1, "its release once more");
+		got = reinterpret_cast<void *>(0x1);
+		rgfxBlockReleased(x.t, b1, rel.serial, true, &got);
+		check(got == wireB && rgfxBlockIndex(x.t, b1) < 0, "OK hands back the wire and frees it");
+		check(rgfxBlockRetryRefused(x.t) == 0, "no refused blocks are left");
+	}
+	{
+		// A block kept for good (a close not answered, or a create naming it) is not posted
+		// again by a later close: it is not `refused`.
+		Table x;
+		uint64_t a1 = 0, a2 = 0;
+		rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &a1);
+		rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &a2);
+		// One kept at (a shared block whose close was not answered), one kept across a close.
+		rgfxBlockKeepAt(x.t, a1);
+		check(rgfxBlockKeepOwner(x.t, a) == 1, "the owner's other block is kept across a close");
+		check(rgfxBlockRetryRefused(x.t) == 0, "neither kept-for-good block is posted again");
+
+		// But a block refused and only then kept-for-good (its owner's close not answered) is
+		// cleared of refused, so it is never posted again either.
+		uint64_t b1 = 0;
+		rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &b1);
+		rgfxBlockFree(x.t, b, b1);
+		RgfxBlock rel;
+		rgfxBlockNextRelease(x.t, &rel);
+		rgfxBlockReleased(x.t, b1, rel.serial, false);
+		check(x.t.blocks[rgfxBlockIndex(x.t, b1)].refused, "refused first");
+		check(rgfxBlockKeepOwner(x.t, b) == 1, "then its owner's close is not answered");
+		check(!x.t.blocks[rgfxBlockIndex(x.t, b1)].refused &&
+		          rgfxBlockRetryRefused(x.t) == 0,
+		      "a kept-for-good block is no longer refused");
+	}
 	std::printf("blocks_test: OK (%d checks)\n", checks);
 	return 0;
 }

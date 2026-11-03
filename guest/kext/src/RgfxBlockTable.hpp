@@ -41,6 +41,16 @@ struct RgfxBlock {
 	// Creates in flight that name the block.
 	uint32_t pins;
 	RgfxBlockState state;
+	// The device refused this block's release (an object of some context lies in it). It is
+	// kept, but posted again (rgfxBlockRetryRefused) after a context close, which may have
+	// dropped that object. A block kept for another reason (a close not answered) is not
+	// `refused`, and is never posted again.
+	bool refused;
+	// For an in-place surface block: the wired pages (an opaque kernel descriptor) the host's
+	// GPU maps in place, kept while the block is in the table so the guest cannot recycle the
+	// pages under the host's view. The caller unwires it once the block leaves the table (its
+	// release answered OK, rgfxBlockReleased). Null for a copy block or a block over no surface.
+	void *wired;
 };
 
 // A pin of one block (rgfxBlockPin), to give back with rgfxBlockUnpin.
@@ -134,6 +144,8 @@ inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint
 			b.context = context;
 			b.pins = pin ? 1 : 0;
 			b.state = kRgfxBlockLive;
+			b.refused = false;
+			b.wired = nullptr;
 			t.count++;
 			*offset = start;
 			if (pin)
@@ -204,8 +216,22 @@ inline void rgfxBlockKeepAt(RgfxBlockTable &t, uint64_t offset)
 	if (at < 0)
 		return;
 	t.blocks[at].owner = rgfxBlockNoOwner();
+	// Kept for good: never posted again (not `refused`).
+	t.blocks[at].refused = false;
 	if (t.blocks[at].state != kRgfxBlockReleasing)
 		t.blocks[at].state = kRgfxBlockKept;
+}
+
+// Attaches the wired pages of an in-place surface block to the block at `offset`, so the host's
+// in-place view cannot outlive their wiring: the caller unwires them only once the block leaves
+// the table (rgfxBlockReleased OK). True where the block is there to hold it.
+inline bool rgfxBlockSetWired(RgfxBlockTable &t, uint64_t offset, void *wired)
+{
+	int64_t at = rgfxBlockIndex(t, offset);
+	if (at < 0)
+		return false;
+	t.blocks[at].wired = wired;
+	return true;
 }
 
 inline void rgfxBlockUnpin(RgfxBlockTable &t, const RgfxBlockPin &pin)
@@ -263,17 +289,43 @@ inline bool rgfxBlockNextRelease(RgfxBlockTable &t, RgfxBlock *block)
 	return false;
 }
 
-// The device answered the release of the block at `offset` of `serial`: OK gives it out again;
-// anything else keeps it. Nothing where that block has gone since (its owner's close).
-inline void rgfxBlockReleased(RgfxBlockTable &t, uint64_t offset, uint64_t serial, bool ok)
+// The device answered the release of the block at `offset` of `serial`: OK gives it out again,
+// and hands back its wired pages in `*wired` (null where it had none) for the caller to unwire;
+// anything else keeps it, to post again after a context close (rgfxBlockRetryRefused). Nothing
+// where that block has gone since (its owner's close).
+inline void rgfxBlockReleased(RgfxBlockTable &t, uint64_t offset, uint64_t serial, bool ok,
+                              void **wired = nullptr)
 {
+	if (wired)
+		*wired = nullptr;
 	int64_t at = rgfxBlockIndex(t, offset);
 	if (at < 0 || t.blocks[at].serial != serial || t.blocks[at].state != kRgfxBlockReleasing)
 		return;
-	if (ok)
+	if (ok) {
+		if (wired)
+			*wired = t.blocks[at].wired;
 		rgfxBlockRemove(t, static_cast<uint32_t>(at));
-	else
+	} else {
 		t.blocks[at].state = kRgfxBlockKept;
+		t.blocks[at].refused = true;
+	}
+}
+
+// Posts again the release of every block kept after the device refused it (an object of some
+// context lay in it): each goes back to freed, for rgfxBlockNextRelease, since a context close
+// may have dropped that object. A block kept for good (a close not answered) is not `refused`,
+// and is left. How many are posted again.
+inline uint32_t rgfxBlockRetryRefused(RgfxBlockTable &t)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < t.count; i++) {
+		if (t.blocks[i].state == kRgfxBlockKept && t.blocks[i].refused) {
+			t.blocks[i].state = kRgfxBlockFreed;
+			t.blocks[i].refused = false;
+			n++;
+		}
+	}
+	return n;
 }
 
 // `owner`'s close was answered: the device holds nothing of its blocks, and they all go. How
@@ -302,6 +354,8 @@ inline uint32_t rgfxBlockKeepOwner(RgfxBlockTable &t, const void *owner)
 		if (b.owner != owner)
 			continue;
 		b.owner = rgfxBlockNoOwner();
+		// Kept for good: never posted again (not `refused`).
+		b.refused = false;
 		if (b.state != kRgfxBlockReleasing)
 			b.state = kRgfxBlockKept;
 		n++;

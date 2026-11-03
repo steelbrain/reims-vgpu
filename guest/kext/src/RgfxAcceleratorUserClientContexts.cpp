@@ -462,6 +462,10 @@ void RgfxAcceleratorUserClient::releaseContext()
 	accel->revokeGrants(this);
 	hasContext = false;
 	IOLockUnlock(queueLock);
+	// The device dropped this context's objects at its close: a block whose release it refused
+	// because an object lay in it may now be free to go.
+	if (closed)
+		accel->retryRefusedBlocks();
 }
 
 // kRgfxAccelMethodDeviceInfo (RgfxAccelerator.hpp): the device info the host wrote, read from

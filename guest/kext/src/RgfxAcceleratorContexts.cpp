@@ -183,6 +183,7 @@ void queueInterruptHook(OSObject *target)
 
 bool reapDormant();
 void noteDormant();
+void unwire(void *pages);
 
 // The release thread call: lets go of the dormant blocks their surfaces asked to go
 // (reapDormant), then posts each freed block's BLOCK_RELEASE in turn and waits for its answer
@@ -231,10 +232,14 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 			dormantStats.unreadWritten += written;
 			dormantStats.changes++;
 		}
-		rgfxBlockReleased(blockTable, block.offset, block.serial, ok);
+		void *wired = nullptr;
+		rgfxBlockReleased(blockTable, block.offset, block.serial, ok, &wired);
 		// A new block waiting for the region's room looks again.
 		IOLockWakeup(contextLock, &surfaceTable, false);
 		IOLockUnlock(contextLock);
+		// The device no longer maps an in-place block's pages once it has answered OK: unwire
+		// them, out of the lock.
+		unwire(wired);
 		if (!ok)
 			IOLog("RgfxAccelerator: context %u's block 0x%llx (0x%llx bytes) is kept: %s\n",
 			      block.context, block.offset, block.size,
@@ -617,7 +622,14 @@ bool writeRuns(IODeviceMemory *region, UInt64 at, const RgfxPageRun *runs, UInt3
 // BLOCK_RELEASE names `context`, or a dormant block's last holder's), or kept for good where the
 // device may still use it (`keep`, a close not answered, or a create naming it in flight), and
 // the entry goes. Under contextLock; whether a release is to be posted.
-bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
+//
+// For an in-place block the host maps the surface's own pages, so those pages stay wired as long
+// as the block is in the table, lest the guest recycle them under the host's view. `wired` is the
+// last holder's wired descriptor of them (null for a copy block, or where the caller has none):
+// it is attached to the block and unwired only once the block leaves the table (its release
+// answered OK, releaseFreedBlocks). `*kept` is then true and the caller must not unwire `wired`.
+bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nullptr,
+                bool *kept = nullptr)
 {
 	bool release = false;
 	if (!keep) {
@@ -627,6 +639,11 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep)
 	}
 	if (!release)
 		rgfxBlockKeepAt(blockTable, e.offset);
+	// The block stays in the table (freed for its release, or kept): its surface's pages stay
+	// wired until it leaves. A copy block holds no such wire.
+	bool ownedWire = e.inPlace && wired && rgfxBlockSetWired(blockTable, e.offset, wired);
+	if (kept)
+		*kept = ownedWire;
 	freeRuns(e.runs, e.runCount);
 	// Its surface's locks no longer wait for the writes named of it; a cached one's wait for
 	// its release's answer, which copies the cache into the pages.
@@ -865,6 +882,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		RgfxSurfaceHoldResult held = rgfxSurfaceHold(e, client, context, pages);
 		*block = {e.offset, e.size, e.serial, revived, e.cached};
 		IOReturn mapped = kIOReturnSuccess;
+		bool keptWire = false;
 		if (held == kRgfxSurfaceHoldNew) {
 			mapped = client->mapSpan(e.offset, e.size);
 			if (mapped != kIOReturnSuccess) {
@@ -875,14 +893,15 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 				rgfxSurfaceLetGo(e, client, true, &mine, &c);
 				client->unmapSpan(e.offset, e.size);
 				held = kRgfxSurfaceHoldFull;
-				if (!e.holdCount && letGoBlock(e, context, false))
+				if (!e.holdCount && letGoBlock(e, context, false, mine, &keptWire))
 					thread_call_enter(releaseCall);
 			}
 		}
 		IOLockUnlock(contextLock);
 		freeRuns(runs, count);
 		if (held != kRgfxSurfaceHoldNew) {
-			unwire(pages);
+			if (!keptWire)
+				unwire(pages);
 			if (mapped != kIOReturnSuccess)
 				return mapped;
 			return held == kRgfxSurfaceHoldAgain ? kIOReturnSuccess : kIOReturnNoResources;
@@ -905,10 +924,12 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			                                   : kRgfxSurfaceLetGoNotHeld;
 			if (gone != kRgfxSurfaceLetGoNotHeld)
 				client->unmapSpan(block->offset, block->size);
+			bool shareKeptWire = false;
 			if (gone == kRgfxSurfaceLetGoLast)
-				release = letGoBlock(table.entries[again], c, false);
+				release = letGoBlock(table.entries[again], c, false, mine, &shareKeptWire);
 			IOLockUnlock(contextLock);
-			unwire(mine);
+			if (!shareKeptWire)
+				unwire(mine);
 			if (release)
 				thread_call_enter(releaseCall);
 		}
@@ -974,6 +995,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	}
 	void *mine = nullptr;
 	release = false;
+	bool keptWire = false;
 	IOLockLock(contextLock);
 	rgfxBlockUnpin(blockTable, pin);
 	if (posted != kIOReturnSuccess) {
@@ -982,7 +1004,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		if (gone != kRgfxSurfaceLetGoNotHeld)
 			client->unmapSpan(offset, size);
 		if (gone == kRgfxSurfaceLetGoLast)
-			release = letGoBlock(e, c, false);
+			release = letGoBlock(e, c, false, mine, &keptWire);
 	}
 	if (inPlace) {
 		// The askers waiting for the answer find the block, or none.
@@ -991,7 +1013,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		IOLockWakeup(contextLock, &surfaceTable, false);
 	}
 	IOLockUnlock(contextLock);
-	unwire(mine);
+	if (!keptWire)
+		unwire(mine);
 	if (release)
 		thread_call_enter(releaseCall);
 	return posted;
@@ -1001,6 +1024,21 @@ void RgfxAccelerator::wakeReleases()
 {
 	if (__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		thread_call_enter(releaseCall);
+}
+
+void RgfxAccelerator::retryRefusedBlocks()
+{
+	if (!contextLock)
+		return;
+	IOLockLock(contextLock);
+	UInt32 n = rgfxBlockRetryRefused(blockTable);
+	IOLockUnlock(contextLock);
+	if (n) {
+		thread_call_enter(releaseCall);
+		IOLog("RgfxAccelerator: %u refused block release(s) posted again after a context "
+		      "close\n",
+		      n);
+	}
 }
 
 bool RgfxAccelerator::reviveSurfaceBlock(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId)
@@ -1125,12 +1163,12 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// Out of the client's window once its hold ends, before the block can be anyone else's.
 	if (gone == kRgfxSurfaceLetGoHold || gone == kRgfxSurfaceLetGoLast)
 		client->unmapSpan(offset, size);
-	bool release = false, slept = false;
+	bool release = false, slept = false, keptWire = false;
 	OSObject *sleeper = nullptr;
 	if (gone == kRgfxSurfaceLetGoLast) {
 		slept = sleepBlock(table.entries[at], context, &sleeper);
 		if (!slept)
-			release = letGoBlock(table.entries[at], context, false);
+			release = letGoBlock(table.entries[at], context, false, pages, &keptWire);
 	}
 	IOLockUnlock(contextLock);
 	if (gone == kRgfxSurfaceLetGoHold || slept) {
@@ -1144,7 +1182,10 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 	}
 	if (slept)
 		release |= wakeSlept(offset, serial, sleeper);
-	unwire(pages);
+	// An in-place block's pages stay wired until its release is answered (the block owns the
+	// wire now); else unwire the last holder's here.
+	if (!keptWire)
+		unwire(pages);
 	if (release)
 		thread_call_enter(releaseCall);
 	if (slept)
@@ -1207,12 +1248,12 @@ void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)
 		// The device ended the context's holds at its close; the last holder's block goes as
 		// its blocks go, or sleeps where cached, or is kept where the close was not answered.
 		const UInt64 offset = table.entries[i].offset, serial = table.entries[i].serial;
-		bool slept = false;
+		bool slept = false, keptWire = false;
 		OSObject *sleeper = nullptr;
 		if (gone == kRgfxSurfaceLetGoLast) {
 			slept = closed && sleepBlock(table.entries[i], context, &sleeper);
 			if (!slept)
-				release |= letGoBlock(table.entries[i], context, !closed);
+				release |= letGoBlock(table.entries[i], context, !closed, pages, &keptWire);
 		}
 		IOLockUnlock(contextLock);
 		if (gone != kRgfxSurfaceLetGoNotHeld)
@@ -1220,7 +1261,9 @@ void RgfxAccelerator::dropSurfaceBlocks(const void *client, bool closed)
 		// The device ended the hold already: no BLOCK_UNSHARE.
 		if (slept)
 			release |= wakeSlept(offset, serial, sleeper);
-		unwire(pages);
+		// An in-place block kept for its release holds the wire now; else unwire it here.
+		if (!keptWire)
+			unwire(pages);
 	}
 	if (release)
 		thread_call_enter(releaseCall);

@@ -329,6 +329,10 @@ public:
 	// A dormant block's surface asked it to go (RgfxAcceleratorLocks.cpp): the release thread
 	// lets it go (RgfxAcceleratorContexts.cpp). From any thread, under no lock of the kext's.
 	void wakeReleases();
+	// Posts again the release of every block the device refused (an object of some context lay in
+	// it): a context close may have dropped that object. Called after a context closes, from the
+	// releasing client's thread, under no lock of the kext's.
+	void retryRefusedBlocks();
 	// A CPU lock of the cached surface whose block is at `offset` follows a GPU write: the host
 	// copies its device cache into its pages (SURFACE_DOWNLOAD). True once answered OK, waiting
 	// up to `timeoutMs` (RgfxAcceleratorContexts.cpp).
