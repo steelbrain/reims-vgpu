@@ -61,7 +61,7 @@ payload BUNDLE_DIR="$S/a/reims-graphics.bundle" > /dev/null
 after=$(stat -f %Fm "$S/build/gen/RgfxGatePayload.h")
 expect "an unchanged bundle is not packed again" "$after" "$before"
 
-sleep 1 # make compares whole-second times
+# No wait: each step may fall in the payload's second, which make's file times cannot tell.
 bundle "$S/a" 2
 A2=$(cdhash "$S/a")
 [ "$A2" != "$A1" ] || { echo "payload_test: FAIL: the rebuilt bundle kept its cdhash"; exit 1; }

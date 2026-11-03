@@ -12,9 +12,10 @@
 #
 # BUNDLE_DIR is the signed bundle to embed; packaging reads its cdhash with
 # codesign and writes build/gen/RgfxGatePayload.h. The payload is made again
-# whenever the bundle it would embed changes: a file of BUNDLE_DIR newer than
-# it, or a BUNDLE_DIR other than the last (build/gen/bundle-dir holds its
-# path). A make with no BUNDLE_DIR keeps the payload made last.
+# whenever the bundle it would embed changes: a BUNDLE_DIR or a cdhash other
+# than the last packed (build/gen/bundle-dir holds both), or a file of
+# BUNDLE_DIR newer than it. A make with no BUNDLE_DIR keeps the payload made
+# last.
 
 NAME    = RgfxGate
 VERSION = 1.0.0
@@ -44,14 +45,15 @@ OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \
 all: $(KEXT)
 
 # A payload over another bundle than the one given would gate-tag a bundle that is not
-# installed, and the given one would load untagged: so the payload depends on every file of
-# BUNDLE_DIR, and on its path, which the stamp holds, rewritten only when it differs.
+# installed, and the given one would load untagged. So the payload is packed again whenever
+# BUNDLE_DIR's path and cdhash differ from those the stamp holds from the last pack, which no
+# file time decides (make compares whole seconds), and whenever a file of BUNDLE_DIR is newer.
 ifneq ($(BUNDLE_DIR),)
-$(PAYLOAD): $(BUNDLE_STAMP) $(shell find '$(BUNDLE_DIR)' -type f 2>/dev/null)
-
-$(BUNDLE_STAMP): FORCE
-	@mkdir -p $(GEN)
-	@echo '$(abspath $(BUNDLE_DIR))' | cmp -s - $@ || echo '$(abspath $(BUNDLE_DIR))' > $@
+BUNDLE_KEY := $(abspath $(BUNDLE_DIR)) $(shell codesign -dvvv '$(BUNDLE_DIR)' 2>&1 | sed -n 's/^CDHash=//p')
+$(PAYLOAD): $(shell find '$(BUNDLE_DIR)' -type f 2>/dev/null)
+ifneq ($(BUNDLE_KEY),$(shell cat '$(BUNDLE_STAMP)' 2>/dev/null))
+$(PAYLOAD): FORCE
+endif
 endif
 
 $(PAYLOAD):
@@ -59,6 +61,7 @@ $(PAYLOAD):
 	@test -d "$(DEPS)/Lilu.kext" && test -d "$(KSDK)" || bash tools/fetch-lilu.sh "$(DEPS)"
 	@mkdir -p $(GEN)
 	python3 -I tools/pack-payload.py "$(BUNDLE_DIR)" $(PAYLOAD)
+	@echo '$(BUNDLE_KEY)' > $(BUNDLE_STAMP)
 
 $(BUILD)/obj/RgfxGate.o: src/RgfxGate.cpp src/RgfxGate.hpp $(PAYLOAD)
 	@mkdir -p $(BUILD)/obj
