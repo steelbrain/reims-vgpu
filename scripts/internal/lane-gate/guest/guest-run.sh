@@ -83,6 +83,12 @@ run_info() {
 	"") echo "GATE info features none stated" ;;
 	*) item features FAIL "$feat" ;;
 	esac
+	# The codecs our accelerator offers AppleGVA: HEVC where it carries IOGVAHEVCDecode.
+	local gva; gva=$(ioreg -l -w0 -r -c RgfxAccelerator 2>/dev/null | grep -o -E '"IOGVA[A-Za-z0-9]*"' | tr -d '"' | sort -u | tr '\n' ' ')
+	case " $gva" in
+	*" IOGVAHEVCDecode "*) echo "GATE info video-offer hevc=1 keys=${gva% }" ;;
+	*) echo "GATE info video-offer hevc=0 keys=${gva% }" ;;
+	esac
 	echo "GATE info uptime $(uptime | tr -s ' ')"
 }
 

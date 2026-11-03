@@ -185,6 +185,11 @@ do_guest_build() {
   make -C guest/rgfxgate DEPS="$RGFXGATE_DEPS" BUNDLE_DIR="$TREE/guest/bundle/build/package/reims-graphics.bundle"
   cp -R guest/kext/build/ReimsGraphics.kext guest/rgfxgate/build/RgfxGate.kext "$ART/"
   cp guest/bundle/build/reims-graphics.bundle.tgz "$ART/"
+  # The codecs the candidate's device offers the guest where the host decodes them: H.264 where
+  # its bundle has the H.264 driver, HEVC where its kext states IOGVAHEVCDecode.
+  { grep -rqs RGFX_VIDEO_CODEC_H264 guest/bundle/src && echo h264
+    grep -rqs IOGVAHEVCDecode guest/kext/src && echo hevc
+    true; } > "$ART/tip-codecs.txt"
   { for f in guest/bundle/tools/sweep/*.[mh] guest/bundle/tools/bench/bench.m; do shasum "$f"; done | shasum | echo "sweep+bench $(cut -c1-16)"
     echo "present_probe $(shasum < "$(tool_src guest/bundle/tools/present_probe.m)" | cut -c1-16)"
     echo "decode_md5 $(shasum < "$(tool_src guest/bundle/tools/decode_md5.m)" | cut -c1-16)"
@@ -451,7 +456,7 @@ EOF
   set -e
   rm -rf "${RES:?}/$mode"
   mkdir -p "$RES/$mode"
-  for f in boot.log guest.log cpu.txt host-events.log host.txt serial.log desktop.png drag.txt drag.log; do
+  for f in boot.log guest.log cpu.txt host-events.log host.txt host-video.tsv serial.log desktop.png drag.txt drag.log; do
     scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
   done
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
@@ -464,9 +469,9 @@ EOF
 write_meta() {
   python3 -I - "$RUN/meta.json" "$sha" "$subject" "$runid" "${base_sha:-}" "$(sort -u "$RUN/ran" 2> /dev/null | tr '\n' ' ')" \
     "$image" "$phases" "$(( $(date +%s) - $(cat "$RUN/started") ))" "$ART/tools.txt" "${MAC_KNOWN_FAILS:-}" \
-    "${KNOWN_FAILS:-}" << 'EOF'
+    "${KNOWN_FAILS:-}" "$(cat "$ART/tip-codecs.txt" 2> /dev/null || echo unknown)" "$MSI" << 'EOF'
 import json, sys
-out, sha, subject, runid, base, ran, image, phases, wall, tools_txt, known_txt, known_items = sys.argv[1:]
+out, sha, subject, runid, base, ran, image, phases, wall, tools_txt, known_txt, known_items, codecs, host = sys.argv[1:]
 def lines(p):
     try:
         return [l.strip() for l in open(p) if l.strip()]
@@ -480,7 +485,8 @@ except (OSError, ValueError) as e:
 json.dump({"sha": sha, "subject": subject, "runid": runid, "baseline": base, "ran": ran.split(),
            "image": image, "phases": phases, "wall_s": int(wall), "tools": tools,
            "known_cargo_fails": lines(known_txt),
-           "known_fails": known_fails}, open(out, "w"), indent=1)
+           "known_fails": known_fails, "lane_host": host,
+           "tip_codecs": None if codecs == "unknown" else codecs.split()}, open(out, "w"), indent=1)
 EOF
 }
 # report: the verdict as its status (0 pass, 1 fail, 2 incomplete). It leaves errexit as it was:

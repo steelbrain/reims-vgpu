@@ -131,6 +131,7 @@ class Run:
                 self.guest(read(os.path.join(d, "guest.log")))
                 self.host(d)
                 self.drag(d)
+                self.video(d)
         self.ip, self.mp = "", ""
         self.cargo(r)
         return self
@@ -152,6 +153,7 @@ class Run:
 
     def guest(self, text):
         self.phases = {}
+        self.video_offer, self.metal_device = None, None
         crashes = None
         for line in text.splitlines():
             m = re.match(r"([0-9.]+) (.*)$", line)
@@ -164,6 +166,12 @@ class Run:
             elif body.startswith("GATE item "):
                 parts = body.split(" ", 4)
                 self.litem("guest." + parts[2], parts[3], parts[4] if len(parts) > 4 else "")
+                if parts[2] == "metal-device" and len(parts) > 4:
+                    m2 = re.search(r'device "([^"]+)"', parts[4])
+                    self.metal_device = m2.group(1) if m2 else None
+            elif body.startswith("GATE info video-offer "):
+                m2 = re.match(r"GATE info video-offer hevc=(\d)", body)
+                self.video_offer = {"hevc": m2 is not None and m2.group(1) == "1"}
             elif body.startswith("GATE crashes "):
                 crashes = body[len("GATE crashes "):].strip()
             elif body.startswith("GATE webgl "):
@@ -223,6 +231,45 @@ class Run:
         for p, (a, b) in self.phases.items():
             if a is None or b is None:
                 self.litem("phase." + p, "FAIL", "started but did not end (a hang the alarm or the hold cut)")
+
+    def video(self, d):
+        """Each decode SKIP (decode_md5's: VideoToolbox finds no hardware decoder for the stream's
+        codec) as what the gate measured: SKIP where the host's GPU has no hardware decoder for the
+        codec (host-video.tsv, Vulkan Video's decode profiles) or the candidate's device does not
+        offer the codec (meta.json's tip_codecs; for HEVC also the guest's accelerator, which
+        carries IOGVAHEVCDecode where it offers it); FAIL where both hold and VideoToolbox still
+        finds none."""
+        labels = {"h264": "H.264", "hevc": "HEVC"}
+        host = self.meta.get("lane_host") or "the lane host"
+        tip = self.meta.get("tip_codecs")
+        rows = [l.split("\t") for l in read(os.path.join(d, "host-video.tsv")).splitlines()]
+        gpu = self.metal_device
+        names = {r[0] for r in rows if len(r) == 3}
+        decodes = {}
+        for r in rows:
+            if len(r) == 3 and r[0] == gpu and r[1] != "gpu":
+                decodes.setdefault(r[1], []).append(r[2])
+        offer = self.video_offer
+        for name, it in self.items.items():
+            if not name.startswith(self.ip + "decode.") or it["status"] != "SKIP":
+                continue
+            codec = name[len(self.ip + "decode."):].split(".")[0]
+            label = labels.get(codec, codec)
+            vt = f"VideoToolbox finds no hardware {label} decoder"
+            accel = ""
+            if codec == "hevc" and offer is not None:
+                accel = "the accelerator carries " + ("IOGVAHEVCDecode" if offer["hevc"] else "no IOGVAHEVCDecode") + ", "
+            if gpu in names and codec not in decodes:
+                it["detail"] = f"{host}'s {gpu} has no hardware {label} decoder (Vulkan Video lists no {label} decode profile)"
+            elif tip is not None and codec not in tip:
+                it["detail"] = f"the device offers no {label} decoder on this tip ({accel}{vt})"
+            elif tip is None:
+                it["detail"] = f"the device offers no {label} decoder ({accel}{vt})"
+            else:
+                it["status"] = "FAIL"
+                where = (f"{host}'s {gpu} decodes {label} ({', '.join(sorted(decodes[codec]))})" if codec in decodes
+                         else f"{host}'s hardware decoders were not measured")
+                it["detail"] = f"{vt}, where this tip offers {label} and {where}; {accel.rstrip(', ') or 'no accelerator answer'}"
 
     def host(self, r):
         kv = {}

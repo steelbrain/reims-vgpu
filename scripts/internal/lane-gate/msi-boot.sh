@@ -15,6 +15,7 @@
 #   host.txt      "KEY VALUE" lines: the SSH port, the wait for the GPU, boot and desktop times
 #                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
 #                 its commonest colour (or desktop_capture none), how long the hold was
+#   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
 # GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
@@ -74,6 +75,18 @@ for f in "$QEMU" "$(dirname "$QEMU")/qemu-bundle/usr/local/share/qemu/efi-virtio
   [[ -s $f ]] || { log "BOOT_FAIL missing $f"; exit 2; }
 done
 log "boot $TAG ($([[ ${EXCLUSIVE:-1} == 1 ]] && echo exclusive || echo shared)): QEMU $QEMU, ROM $ROM, OC $OC"
+# The host GPUs' hardware decoders, as Vulkan Video lists each GPU's decode profiles (a query: no
+# GPU work): "GPU-NAME<TAB>gpu<TAB>-" for each GPU, then "GPU-NAME<TAB>CODEC<TAB>PROFILE" for each
+# profile it decodes, h264 or hevc, the profile as the Std headers name it (MAIN, MAIN_10, HIGH).
+# No file where vulkaninfo cannot answer.
+timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
+  /^GPU[0-9]+:$/ { g = $0 }
+  /^\tdeviceName / { name[g] = $2; print $2 "\tgpu\t-" }
+  /videoCodecOperation = / { op = $2 }
+  /stdProfileIdc = / && op ~ /_DECODE_H26[45]_/ {
+    p = $2; sub(/^STD_VIDEO_H26[45]_PROFILE_IDC_/, "", p)
+    print name[g] "\t" (op ~ /H265/ ? "hevc" : "h264") "\t" p }' | sort -u > "$R/host-video.tsv"
+[[ -s $R/host-video.tsv ]] || rm -f "$R/host-video.tsv"
 # The bench boot is the gate's optional part: it joins the turnstile only once nobody waits for
 # the GPU (no live marker in gpu-want-shared or gpu-want-exclusive), so it never holds up another
 # boot or measurement, and gives up after YIELD_S seconds (default 4 h).
