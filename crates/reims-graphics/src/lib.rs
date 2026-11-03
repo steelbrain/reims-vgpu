@@ -7,6 +7,8 @@
 //!   `include/reims_graphics_wire.h`, which the guest's kext and option ROM include.
 //! - [`ops`] is the command-buffer op stream in that format: the `COMMAND_BUFFER` message and the
 //!   encoder ops (begin/end, and the render, compute and blit groups) the guest serialises.
+//! - [`icb`] is the records of an `ICB_WRITE`: the CPU's encodes into an indirect command
+//!   buffer, in that format too.
 //! - [`Device`] is the host side, as the host's process runs it: the region (BAR 2), the
 //!   registers (BAR 0), the control ring's thread and the display's refresh thread, over the
 //!   host's callbacks ([`Host`]) and what shows the display ([`Screen`]). `reims-vgpu` shows it
@@ -17,6 +19,7 @@
 mod control;
 pub mod device;
 pub mod display;
+pub mod icb;
 pub mod managed;
 pub mod ops;
 pub mod region;

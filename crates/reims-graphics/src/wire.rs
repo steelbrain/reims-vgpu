@@ -55,8 +55,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
 /// [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 /// guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
-/// [`RGFX_FEATURE_QUEUE_VECTORS`], and [`RGFX_FEATURE_SURFACE_ORDER`]). Bits 9 and 10 are
-/// reserved.
+/// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`] and
+/// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]). Bits 9 and 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -110,6 +110,12 @@ pub const RGFX_FEATURE_QUEUE_VECTORS: u32 = 1 << 8;
 /// IOSurface runs after the buffers of other queues committed before it that use the surface,
 /// where one of the two writes it. Every host offers it.
 pub const RGFX_FEATURE_SURFACE_ORDER: u32 = 1 << 11;
+/// `FEATURES_LO` bit 12, `INDIRECT_COMMAND_BUFFERS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_ICB_CREATE`], answered
+/// [`RGFX_EVT_ICB_STATE`], and [`RGFX_CMD_ICB_WRITE`]. The host decodes both wherever it offers
+/// the bit; the kext takes it where it answers the create, and its bundle makes indirect command
+/// buffers only where it was taken.
+pub const RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS: u32 = 1 << 12;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -440,6 +446,21 @@ pub const RGFX_CMD_VIDEO_SESSION_CREATE: u32 = 0x21d;
 /// the guest's own pages in place. No host offers the feature yet, and a host without it refuses
 /// the message as one it does not know.
 pub const RGFX_CMD_BUFFER_OVER_PAGES: u32 = 0x21e;
+/// Command `ICB_CREATE` ([`RgfxIcbCreate`]), where the guest took
+/// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: indirect command buffer `obj_id`, made by the
+/// platform's `newIndirectCommandBufferWithDescriptor:maxCommandCount:options:` from the guest's
+/// descriptor. Answered at once by [`RGFX_EVT_ICB_STATE`], with the `gpuResourceID` the host's
+/// device numbers it by, which the guest's argument buffers hold, so a kernel that encodes
+/// through one reaches the host's buffer. `OBJECT_DESTROY` drops it.
+pub const RGFX_CMD_ICB_CREATE: u32 = 0x228;
+/// Command `ICB_WRITE` ([`RgfxIcbWrite`], then its records, [`crate::icb`]), where the guest took
+/// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: the CPU's encodes into indirect command buffer
+/// `obj_id`, one record a setter call, in call order. The host carries each out on the
+/// platform's buffer, the one copy of its commands, which the GPU's own encodes also write.
+/// Ring 0 is carried out before any command buffer the process posts after it, so a command
+/// buffer sees every encode posted before it. Not answered: a record the host cannot carry out
+/// is skipped alone.
+pub const RGFX_CMD_ICB_WRITE: u32 = 0x229;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -566,6 +587,9 @@ pub const RGFX_EVT_CB_SCHEDULED: u32 = 0x405;
 /// waits for no event, the host fills no device cache it uses first and no buffer before it on its
 /// queue waits; else once its waits are satisfied, at its scheduling.
 pub const RGFX_EVT_CB_SUBMITTED: u32 = 0x406;
+/// Event `ICB_STATE` ([`RgfxIcbState`], on the control completion ring): an `ICB_CREATE`'s
+/// answer.
+pub const RGFX_EVT_ICB_STATE: u32 = 0x407;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1517,6 +1541,118 @@ pub struct RgfxSamplerState {
     pub reserved_14: u32,
     /// `MTLSamplerState.gpuResourceID`: what an argument buffer holds of the sampler.
     pub gpu_resource_id: u64,
+}
+
+/// [`RgfxIcbCreate`] `flags`: `inheritPipelineState`.
+pub const RGFX_ICB_INHERIT_PIPELINE_STATE: u32 = 1 << 0;
+/// [`RgfxIcbCreate`] `flags`: `inheritBuffers`.
+pub const RGFX_ICB_INHERIT_BUFFERS: u32 = 1 << 1;
+/// [`RgfxIcbCreate`] `flags`: `supportRayTracing`.
+pub const RGFX_ICB_SUPPORT_RAY_TRACING: u32 = 1 << 2;
+/// [`RgfxIcbCreate`] `flags`: `supportDynamicAttributeStride`.
+pub const RGFX_ICB_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE: u32 = 1 << 3;
+/// [`RgfxIcbCreate`] `flags`: `supportColorAttachmentMapping`. The platform's descriptor has no
+/// such field: a buffer that supports it executes as any other in an encoder that maps no
+/// attachments, every encoder of the lane's.
+pub const RGFX_ICB_SUPPORT_COLOR_ATTACHMENT_MAPPING: u32 = 1 << 4;
+/// [`RgfxIcbCreate`] `flags`: `inheritDepthStencilState`.
+pub const RGFX_ICB_INHERIT_DEPTH_STENCIL_STATE: u32 = 1 << 5;
+/// [`RgfxIcbCreate`] `flags`: `inheritDepthBias`.
+pub const RGFX_ICB_INHERIT_DEPTH_BIAS: u32 = 1 << 6;
+/// [`RgfxIcbCreate`] `flags`: `inheritDepthClipMode`.
+pub const RGFX_ICB_INHERIT_DEPTH_CLIP_MODE: u32 = 1 << 7;
+/// [`RgfxIcbCreate`] `flags`: `inheritCullMode`.
+pub const RGFX_ICB_INHERIT_CULL_MODE: u32 = 1 << 8;
+/// [`RgfxIcbCreate`] `flags`: `inheritFrontFacingWinding`.
+pub const RGFX_ICB_INHERIT_FRONT_FACING_WINDING: u32 = 1 << 9;
+/// [`RgfxIcbCreate`] `flags`: `inheritTriangleFillMode`.
+pub const RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE: u32 = 1 << 10;
+/// [`RgfxIcbCreate`] `flags`: `inheritStencilReferenceValues` (SPI).
+pub const RGFX_ICB_INHERIT_STENCIL_REFERENCE_VALUES: u32 = 1 << 11;
+/// [`RgfxIcbCreate`] `flags`: `inheritDepthTestBounds` (SPI).
+pub const RGFX_ICB_INHERIT_DEPTH_TEST_BOUNDS: u32 = 1 << 12;
+/// [`RgfxIcbCreate`] `flags`: `inheritScissorRects` (SPI).
+pub const RGFX_ICB_INHERIT_SCISSOR_RECTS: u32 = 1 << 13;
+/// [`RgfxIcbCreate`] `flags`: `inheritViewports` (SPI).
+pub const RGFX_ICB_INHERIT_VIEWPORTS: u32 = 1 << 14;
+/// [`RgfxIcbCreate`] `flags`: `inheritBlendColor` (SPI).
+pub const RGFX_ICB_INHERIT_BLEND_COLOR: u32 = 1 << 15;
+
+/// `ICB_CREATE`: indirect command buffer `obj_id` of `max_command_count` commands, with
+/// `MTLResourceOptions` `options`, from the guest's `MTLIndirectCommandBufferDescriptor`: every
+/// field its answer, the SPI ones (`max_scissor_rect_count`, `max_viewport_count`,
+/// `allow_override_render_states` and the SPI inherits) where it answers them, else a fresh
+/// descriptor's (1, 1, 0 and inherited, measured on an AMD 5300M and an Intel 630).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbCreate {
+    /// [`RGFX_CMD_ICB_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// `maxCommandCount`.
+    pub max_command_count: u64,
+    /// `MTLResourceOptions`.
+    pub options: u64,
+    /// `MTLIndirectCommandType` bits.
+    pub command_types: u32,
+    /// `RGFX_ICB_*` bits.
+    pub flags: u32,
+    /// `maxVertexBufferBindCount`.
+    pub max_vertex_buffer_bind_count: u32,
+    /// `maxFragmentBufferBindCount`.
+    pub max_fragment_buffer_bind_count: u32,
+    /// `maxKernelBufferBindCount`.
+    pub max_kernel_buffer_bind_count: u32,
+    /// `maxKernelThreadgroupMemoryBindCount`.
+    pub max_kernel_threadgroup_memory_bind_count: u32,
+    /// `maxObjectBufferBindCount`.
+    pub max_object_buffer_bind_count: u32,
+    /// `maxMeshBufferBindCount`.
+    pub max_mesh_buffer_bind_count: u32,
+    /// `maxObjectThreadgroupMemoryBindCount`.
+    pub max_object_threadgroup_memory_bind_count: u32,
+    /// `maxScissorRectCount` (SPI).
+    pub max_scissor_rect_count: u32,
+    /// `maxViewportCount` (SPI).
+    pub max_viewport_count: u32,
+    /// `allowOverrideRenderStates` (SPI).
+    pub allow_override_render_states: u32,
+}
+
+/// `ICB_STATE`: an `ICB_CREATE`'s answer. `status` is [`RGFX_STATUS_OK`] with the buffer's
+/// `gpu_resource_id`, or [`RGFX_STATUS_REFUSED`] (the device made none, or the sender's context
+/// failed) or [`RGFX_STATUS_INVALID_ARGUMENT`] (the create was short), with 0. The host's device
+/// numbers its indirect command buffers itself, every process's in one space, so the guest takes
+/// the id from here rather than picking one.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbState {
+    /// [`RGFX_EVT_ICB_STATE`], with the create's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// An `RGFX_STATUS_*`.
+    pub status: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_14: u32,
+    /// `MTLIndirectCommandBuffer.gpuResourceID`: what an argument buffer holds of the buffer.
+    pub gpu_resource_id: u64,
+}
+
+/// `ICB_WRITE`: the CPU's encodes into indirect command buffer `obj_id`, the records
+/// ([`crate::icb::RgfxIcbRecord`]) that follow, to the message's `size`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxIcbWrite {
+    /// [`RGFX_CMD_ICB_WRITE`].
+    pub header: RgfxMsgHeader,
+    /// The indirect command buffer.
+    pub obj_id: u64,
 }
 
 /// `BUFFER_DID_MODIFY_RANGE`: the guest wrote `length` bytes at `location` of `Managed` buffer
@@ -2919,6 +3055,9 @@ const _: () = {
     assert!(size_of::<RgfxHeapTextureSizeAndAlign>() == 72);
     assert!(size_of::<RgfxSizeAndAlign>() == 40);
     assert!(size_of::<RgfxSamplerState>() == 32);
+    assert!(size_of::<RgfxIcbCreate>() == 88);
+    assert!(size_of::<RgfxIcbState>() == 32);
+    assert!(size_of::<RgfxIcbWrite>() == 24);
     assert!(RGFX_LIBRARY_BYTES_OFFSET as usize == size_of::<RgfxLibraryCreate>());
     assert!(size_of::<RgfxFormatAnswers>() == 64);
     assert!(size_of::<RgfxDeviceInfo>() == 1432 + 64 * RGFX_DEVICE_INFO_FORMATS);

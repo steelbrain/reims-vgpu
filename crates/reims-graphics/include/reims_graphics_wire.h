@@ -15,6 +15,81 @@
 
 #include <stdint.h>
 
+// `setRenderPipelineState:` ([`RgfxIcbObject`]).
+#define RGFX_ICB_OP_RENDER_PIPELINE 1
+
+// `setVertexBuffer:offset:atIndex:` ([`RgfxIcbBuffer`]).
+#define RGFX_ICB_OP_VERTEX_BUFFER 2
+
+// `setVertexBuffer:offset:attributeStride:atIndex:` ([`RgfxIcbBufferStride`]).
+#define RGFX_ICB_OP_VERTEX_BUFFER_STRIDE 3
+
+// `setFragmentBuffer:offset:atIndex:` ([`RgfxIcbBuffer`]).
+#define RGFX_ICB_OP_FRAGMENT_BUFFER 4
+
+// `drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:` ([`RgfxIcbDraw`]).
+#define RGFX_ICB_OP_DRAW 5
+
+// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:`
+// ([`RgfxIcbDrawIndexed`]).
+#define RGFX_ICB_OP_DRAW_INDEXED 6
+
+// `drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:tessellationFactorBuffer:tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride:`
+// ([`RgfxIcbDrawPatches`]).
+#define RGFX_ICB_OP_DRAW_PATCHES 7
+
+// `drawIndexedPatches:...` ([`RgfxIcbDrawIndexedPatches`]).
+#define RGFX_ICB_OP_DRAW_INDEXED_PATCHES 8
+
+// A render command's `setBarrier` (no body).
+#define RGFX_ICB_OP_RENDER_SET_BARRIER 9
+
+// A render command's `clearBarrier` (no body).
+#define RGFX_ICB_OP_RENDER_CLEAR_BARRIER 10
+
+// A render command's `reset` (no body).
+#define RGFX_ICB_OP_RENDER_RESET 11
+
+// `resetWithRange:` of a buffer of render commands ([`RgfxIcbRange`]): each command from
+// `command_index` reset, as its `reset` does.
+#define RGFX_ICB_OP_RENDER_RESET_RANGE 12
+
+// `setComputePipelineState:` ([`RgfxIcbObject`]).
+#define RGFX_ICB_OP_COMPUTE_PIPELINE 33
+
+// `setKernelBuffer:offset:atIndex:` ([`RgfxIcbBuffer`]).
+#define RGFX_ICB_OP_KERNEL_BUFFER 34
+
+// `setKernelBuffer:offset:attributeStride:atIndex:` ([`RgfxIcbBufferStride`]).
+#define RGFX_ICB_OP_KERNEL_BUFFER_STRIDE 35
+
+// `concurrentDispatchThreadgroups:threadsPerThreadgroup:` ([`RgfxIcbDispatch`]).
+#define RGFX_ICB_OP_DISPATCH_THREADGROUPS 36
+
+// `concurrentDispatchThreads:threadsPerThreadgroup:` ([`RgfxIcbDispatch`]).
+#define RGFX_ICB_OP_DISPATCH_THREADS 37
+
+// `setThreadgroupMemoryLength:atIndex:` ([`RgfxIcbThreadgroupMemory`]).
+#define RGFX_ICB_OP_THREADGROUP_MEMORY 38
+
+// `setStageInRegion:` ([`RgfxIcbRegion`]).
+#define RGFX_ICB_OP_STAGE_IN_REGION 39
+
+// `setImageblockWidth:height:` ([`RgfxIcbImageblock`]).
+#define RGFX_ICB_OP_IMAGEBLOCK 40
+
+// A compute command's `setBarrier` (no body).
+#define RGFX_ICB_OP_COMPUTE_SET_BARRIER 41
+
+// A compute command's `clearBarrier` (no body).
+#define RGFX_ICB_OP_COMPUTE_CLEAR_BARRIER 42
+
+// A compute command's `reset` (no body).
+#define RGFX_ICB_OP_COMPUTE_RESET 43
+
+// `resetWithRange:` of a buffer of compute commands ([`RgfxIcbRange`]).
+#define RGFX_ICB_OP_COMPUTE_RESET_RANGE 44
+
 // The framing / command-buffer group (`tag >> 12`): encoder begin and end, the command
 // buffer's own event signals and waits, and the IOSurfaces it uses whose blocks have a device
 // cache.
@@ -761,8 +836,8 @@
 // `FEATURES_LO`, RO: feature bits 0 to 31, the ones the host offers: [`RGFX_FEATURE_SURFACE_PAGES`],
 // [`RGFX_FEATURE_SURFACE_CACHE`] and [`RGFX_FEATURE_CB_SUBMITTED`], and from bit 3 the ones the
 // guest takes through [`RGFX_REG_DRIVER_FEATURES_LO`] ([`RGFX_FEATURE_QUIET_SCHEDULED`] to
-// [`RGFX_FEATURE_QUEUE_VECTORS`], and [`RGFX_FEATURE_SURFACE_ORDER`]). Bits 9 and 10 are
-// reserved.
+// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`] and
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]). Bits 9 and 10 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -827,6 +902,13 @@
 // IOSurface runs after the buffers of other queues committed before it that use the surface,
 // where one of the two writes it. Every host offers it.
 #define RGFX_FEATURE_SURFACE_ORDER (1 << 11)
+
+// `FEATURES_LO` bit 12, `INDIRECT_COMMAND_BUFFERS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_ICB_CREATE`], answered
+// [`RGFX_EVT_ICB_STATE`], and [`RGFX_CMD_ICB_WRITE`]. The host decodes both wherever it offers
+// the bit; the kext takes it where it answers the create, and its bundle makes indirect command
+// buffers only where it was taken.
+#define RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS (1 << 12)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1180,6 +1262,23 @@
 // the message as one it does not know.
 #define RGFX_CMD_BUFFER_OVER_PAGES 542
 
+// Command `ICB_CREATE` ([`RgfxIcbCreate`]), where the guest took
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: indirect command buffer `obj_id`, made by the
+// platform's `newIndirectCommandBufferWithDescriptor:maxCommandCount:options:` from the guest's
+// descriptor. Answered at once by [`RGFX_EVT_ICB_STATE`], with the `gpuResourceID` the host's
+// device numbers it by, which the guest's argument buffers hold, so a kernel that encodes
+// through one reaches the host's buffer. `OBJECT_DESTROY` drops it.
+#define RGFX_CMD_ICB_CREATE 552
+
+// Command `ICB_WRITE` ([`RgfxIcbWrite`], then its records, [`crate::icb`]), where the guest took
+// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`]: the CPU's encodes into indirect command buffer
+// `obj_id`, one record a setter call, in call order. The host carries each out on the
+// platform's buffer, the one copy of its commands, which the GPU's own encodes also write.
+// Ring 0 is carried out before any command buffer the process posts after it, so a command
+// buffer sees every encode posted before it. Not answered: a record the host cannot carry out
+// is skipped alone.
+#define RGFX_CMD_ICB_WRITE 553
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -1322,6 +1421,10 @@
 // queue waits; else once its waits are satisfied, at its scheduling.
 #define RGFX_EVT_CB_SUBMITTED 1030
 
+// Event `ICB_STATE` ([`RgfxIcbState`], on the control completion ring): an `ICB_CREATE`'s
+// answer.
+#define RGFX_EVT_ICB_STATE 1031
+
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
 
@@ -1387,6 +1490,56 @@
 // block is a process's pages block, for its `BUFFER_OVER_PAGES` buffers, not an IOSurface's, and
 // its view stays out of the host's surface-view cache. No host offers the feature yet.
 #define RGFX_SURFACE_PAGES_PRIVATE (1 << 1)
+
+// [`RgfxIcbCreate`] `flags`: `inheritPipelineState`.
+#define RGFX_ICB_INHERIT_PIPELINE_STATE (1 << 0)
+
+// [`RgfxIcbCreate`] `flags`: `inheritBuffers`.
+#define RGFX_ICB_INHERIT_BUFFERS (1 << 1)
+
+// [`RgfxIcbCreate`] `flags`: `supportRayTracing`.
+#define RGFX_ICB_SUPPORT_RAY_TRACING (1 << 2)
+
+// [`RgfxIcbCreate`] `flags`: `supportDynamicAttributeStride`.
+#define RGFX_ICB_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE (1 << 3)
+
+// [`RgfxIcbCreate`] `flags`: `supportColorAttachmentMapping`. The platform's descriptor has no
+// such field: a buffer that supports it executes as any other in an encoder that maps no
+// attachments, every encoder of the lane's.
+#define RGFX_ICB_SUPPORT_COLOR_ATTACHMENT_MAPPING (1 << 4)
+
+// [`RgfxIcbCreate`] `flags`: `inheritDepthStencilState`.
+#define RGFX_ICB_INHERIT_DEPTH_STENCIL_STATE (1 << 5)
+
+// [`RgfxIcbCreate`] `flags`: `inheritDepthBias`.
+#define RGFX_ICB_INHERIT_DEPTH_BIAS (1 << 6)
+
+// [`RgfxIcbCreate`] `flags`: `inheritDepthClipMode`.
+#define RGFX_ICB_INHERIT_DEPTH_CLIP_MODE (1 << 7)
+
+// [`RgfxIcbCreate`] `flags`: `inheritCullMode`.
+#define RGFX_ICB_INHERIT_CULL_MODE (1 << 8)
+
+// [`RgfxIcbCreate`] `flags`: `inheritFrontFacingWinding`.
+#define RGFX_ICB_INHERIT_FRONT_FACING_WINDING (1 << 9)
+
+// [`RgfxIcbCreate`] `flags`: `inheritTriangleFillMode`.
+#define RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE (1 << 10)
+
+// [`RgfxIcbCreate`] `flags`: `inheritStencilReferenceValues` (SPI).
+#define RGFX_ICB_INHERIT_STENCIL_REFERENCE_VALUES (1 << 11)
+
+// [`RgfxIcbCreate`] `flags`: `inheritDepthTestBounds` (SPI).
+#define RGFX_ICB_INHERIT_DEPTH_TEST_BOUNDS (1 << 12)
+
+// [`RgfxIcbCreate`] `flags`: `inheritScissorRects` (SPI).
+#define RGFX_ICB_INHERIT_SCISSOR_RECTS (1 << 13)
+
+// [`RgfxIcbCreate`] `flags`: `inheritViewports` (SPI).
+#define RGFX_ICB_INHERIT_VIEWPORTS (1 << 14)
+
+// [`RgfxIcbCreate`] `flags`: `inheritBlendColor` (SPI).
+#define RGFX_ICB_INHERIT_BLEND_COLOR (1 << 15)
 
 // The rows of a level of a `Managed` texture's CPU copy start at multiples of this, in bytes
 // ([`RgfxManagedTextureCreate`]).
@@ -3204,6 +3357,224 @@ typedef struct {
   RgfxTextureDescriptor desc;
 } RgfxHeapTextureSizeAndAlign;
 
+// The body of a buffer's setter.
+typedef struct {
+  // The buffer, 0 for nil.
+  uint64_t obj_id;
+  // `offset`.
+  uint64_t offset;
+  // `index`.
+  uint32_t index;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+} RgfxIcbBuffer;
+
+// The body of a buffer's setter with its attribute stride.
+typedef struct {
+  // The buffer, 0 for nil.
+  uint64_t obj_id;
+  // `offset`.
+  uint64_t offset;
+  // `attributeStride`.
+  uint64_t stride;
+  // `index`.
+  uint32_t index;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_1c;
+} RgfxIcbBufferStride;
+
+// `ICB_CREATE`: indirect command buffer `obj_id` of `max_command_count` commands, with
+// `MTLResourceOptions` `options`, from the guest's `MTLIndirectCommandBufferDescriptor`: every
+// field its answer, the SPI ones (`max_scissor_rect_count`, `max_viewport_count`,
+// `allow_override_render_states` and the SPI inherits) where it answers them, else a fresh
+// descriptor's (1, 1, 0 and inherited, measured on an AMD 5300M and an Intel 630).
+typedef struct {
+  // [`RGFX_CMD_ICB_CREATE`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // `maxCommandCount`.
+  uint64_t max_command_count;
+  // `MTLResourceOptions`.
+  uint64_t options;
+  // `MTLIndirectCommandType` bits.
+  uint32_t command_types;
+  // `RGFX_ICB_*` bits.
+  uint32_t flags;
+  // `maxVertexBufferBindCount`.
+  uint32_t max_vertex_buffer_bind_count;
+  // `maxFragmentBufferBindCount`.
+  uint32_t max_fragment_buffer_bind_count;
+  // `maxKernelBufferBindCount`.
+  uint32_t max_kernel_buffer_bind_count;
+  // `maxKernelThreadgroupMemoryBindCount`.
+  uint32_t max_kernel_threadgroup_memory_bind_count;
+  // `maxObjectBufferBindCount`.
+  uint32_t max_object_buffer_bind_count;
+  // `maxMeshBufferBindCount`.
+  uint32_t max_mesh_buffer_bind_count;
+  // `maxObjectThreadgroupMemoryBindCount`.
+  uint32_t max_object_threadgroup_memory_bind_count;
+  // `maxScissorRectCount` (SPI).
+  uint32_t max_scissor_rect_count;
+  // `maxViewportCount` (SPI).
+  uint32_t max_viewport_count;
+  // `allowOverrideRenderStates` (SPI).
+  uint32_t allow_override_render_states;
+} RgfxIcbCreate;
+
+// The body of a dispatch: the grid (threadgroups or threads), then the threadgroup's size.
+typedef struct {
+  // `threadgroupsPerGrid` or `threadsPerGrid`: width, height, depth.
+  uint32_t grid[3];
+  // `threadsPerThreadgroup`: width, height, depth.
+  uint32_t threadgroup[3];
+} RgfxIcbDispatch;
+
+// The body of [`RGFX_ICB_OP_DRAW`].
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint32_t primitive_type;
+  // `vertexStart`.
+  uint32_t vertex_start;
+  // `vertexCount`.
+  uint32_t vertex_count;
+  // `instanceCount`.
+  uint32_t instance_count;
+  // `baseInstance`.
+  uint32_t base_instance;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+} RgfxIcbDraw;
+
+// The body of [`RGFX_ICB_OP_DRAW_INDEXED`].
+typedef struct {
+  // `MTLPrimitiveType`.
+  uint32_t primitive_type;
+  // `indexCount`.
+  uint32_t index_count;
+  // `MTLIndexType`.
+  uint32_t index_type;
+  // `instanceCount`.
+  uint32_t instance_count;
+  // The index buffer, 0 for nil.
+  uint64_t index_buffer_obj_id;
+  // `indexBufferOffset`.
+  uint64_t index_buffer_offset;
+  // `baseVertex` (`NSInteger`; its low 32 bits, signed).
+  int32_t base_vertex;
+  // `baseInstance`.
+  uint32_t base_instance;
+} RgfxIcbDrawIndexed;
+
+// The body of [`RGFX_ICB_OP_DRAW_PATCHES`].
+typedef struct {
+  // `numberOfPatchControlPoints`.
+  uint32_t number_of_patch_control_points;
+  // `patchStart`.
+  uint32_t patch_start;
+  // `patchCount`.
+  uint32_t patch_count;
+  // `instanceCount`.
+  uint32_t instance_count;
+  // `baseInstance`.
+  uint32_t base_instance;
+  // `tessellationFactorBufferInstanceStride`.
+  uint32_t instance_stride;
+  // The patch index buffer, 0 for nil.
+  uint64_t patch_index_buffer_obj_id;
+  // `patchIndexBufferOffset`.
+  uint64_t patch_index_buffer_offset;
+  // The tessellation factor buffer, 0 for nil.
+  uint64_t tessellation_factor_buffer_obj_id;
+  // `tessellationFactorBufferOffset`.
+  uint64_t tessellation_factor_buffer_offset;
+} RgfxIcbDrawPatches;
+
+// The body of [`RGFX_ICB_OP_DRAW_INDEXED_PATCHES`]: a patch draw's, then its control-point
+// index buffer.
+typedef struct {
+  // The patch draw's fields.
+  RgfxIcbDrawPatches patches;
+  // The control-point index buffer, 0 for nil.
+  uint64_t control_point_index_buffer_obj_id;
+  // `controlPointIndexBufferOffset`.
+  uint64_t control_point_index_buffer_offset;
+} RgfxIcbDrawIndexedPatches;
+
+// The body of [`RGFX_ICB_OP_IMAGEBLOCK`].
+typedef struct {
+  // `width`.
+  uint32_t width;
+  // `height`.
+  uint32_t height;
+} RgfxIcbImageblock;
+
+// The body of a pipeline state's setter: the state, 0 for nil.
+typedef struct {
+  // The pipeline state.
+  uint64_t obj_id;
+} RgfxIcbObject;
+
+// The body of a reset of a range: its length (its location is the record's `command_index`).
+typedef struct {
+  // `length`.
+  uint32_t length;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_04;
+} RgfxIcbRange;
+
+// A record's header.
+typedef struct {
+  // An `RGFX_ICB_OP_*`.
+  uint16_t op;
+  // The record's bytes, this header included: a multiple of 8.
+  uint16_t size;
+  // The command the call was made on, or a reset range's location.
+  uint32_t command_index;
+} RgfxIcbRecord;
+
+// The body of [`RGFX_ICB_OP_STAGE_IN_REGION`]: `MTLRegion`'s origin, then its size.
+typedef struct {
+  // x, y, z.
+  uint32_t origin[3];
+  // width, height, depth.
+  uint32_t size[3];
+} RgfxIcbRegion;
+
+// `ICB_STATE`: an `ICB_CREATE`'s answer. `status` is [`RGFX_STATUS_OK`] with the buffer's
+// `gpu_resource_id`, or [`RGFX_STATUS_REFUSED`] (the device made none, or the sender's context
+// failed) or [`RGFX_STATUS_INVALID_ARGUMENT`] (the create was short), with 0. The host's device
+// numbers its indirect command buffers itself, every process's in one space, so the guest takes
+// the id from here rather than picking one.
+typedef struct {
+  // [`RGFX_EVT_ICB_STATE`], with the create's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // `MTLIndirectCommandBuffer.gpuResourceID`: what an argument buffer holds of the buffer.
+  uint64_t gpu_resource_id;
+} RgfxIcbState;
+
+// The body of [`RGFX_ICB_OP_THREADGROUP_MEMORY`].
+typedef struct {
+  // `length`.
+  uint32_t length;
+  // `index`.
+  uint32_t index;
+} RgfxIcbThreadgroupMemory;
+
+// `ICB_WRITE`: the CPU's encodes into indirect command buffer `obj_id`, the records
+// ([`crate::icb::RgfxIcbRecord`]) that follow, to the message's `size`.
+typedef struct {
+  // [`RGFX_CMD_ICB_WRITE`].
+  RgfxMsgHeader header;
+  // The indirect command buffer.
+  uint64_t obj_id;
+} RgfxIcbWrite;
+
 // `LIBRARY_CREATE`: a library from `byte_length` bytes of `.metallib` or AIR
 // that follow this header at [`RGFX_LIBRARY_BYTES_OFFSET`], forwarded to the
 // host unchanged. The message's `size` is `RGFX_LIBRARY_BYTES_OFFSET +
@@ -4854,6 +5225,15 @@ typedef struct {
   uint64_t align;
 } RgfxSizeAndAlign;
 
+// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose cached block is at
+// `block_offset`, copied into the surface's pages.
+typedef struct {
+  // [`RGFX_CMD_SURFACE_DOWNLOAD`].
+  RgfxMsgHeader header;
+  // The surface's shared block's region offset.
+  uint64_t block_offset;
+} RgfxSurfaceDownload;
+
 // The facts of the surface a `TEXTURE_FROM_IOSURFACE` texture lies over, as
 // the guest's IOSurface API gives them when the texture is made, after the
 // [`RgfxTextureFromIOSurface`] at [`RGFX_SURFACE_FACTS_OFFSET`]: what a texture
@@ -4884,15 +5264,6 @@ typedef struct {
   // Zero.
   uint32_t reserved_24;
 } RgfxSurfaceFacts;
-
-// `SURFACE_DOWNLOAD`: the device cache of the IOSurface whose cached block is at
-// `block_offset`, copied into the surface's pages.
-typedef struct {
-  // [`RGFX_CMD_SURFACE_DOWNLOAD`].
-  RgfxMsgHeader header;
-  // The surface's shared block's region offset.
-  uint64_t block_offset;
-} RgfxSurfaceDownload;
 
 // One command buffer an [`RGFX_OP_SURFACE_ORDER`]'s buffer runs after: the one at `seqno` on the
 // submission ring of queue `queue_obj_id`, and the queue's buffers before it.
