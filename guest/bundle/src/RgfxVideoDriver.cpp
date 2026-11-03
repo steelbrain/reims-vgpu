@@ -386,7 +386,7 @@ struct ContextParamList {
 // session only where max_canvas_row_bytes is not 0, and CMPhoto, above it, divides by the
 // alignments: an HEIC decode died of SIGFPE in CMPhotoDecompressionContainerCreateImageForIndex
 // while the parameter was answered success with nothing written (measured on the RTX 5080 host,
-// 2026-11-03).
+// 2026-11-03). So it is answered whole or refused, never success with the record as it came.
 constexpr uint32_t kParamTileInfo = 0xb;
 
 struct TileInfo {
@@ -1026,13 +1026,21 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			return kBadArgument;
 		for (uint32_t i = 0; i < l->count; i++) {
 			ContextParam &param = l->params[i];
+			// A parameter the driver does not know is left as it came, success, as AMD's driver
+			// answers it.
+			if (param.id != kParamTileInfo)
+				continue;
 			const uint32_t codec = param.sub_id == kCodecH264   ? RGFX_VIDEO_CODEC_H264
 			                       : param.sub_id == kCodecHevc ? RGFX_VIDEO_CODEC_HEVC
 			                                                    : 0;
+			// The tile parameter is refused where the driver cannot write it whole: not a
+			// decoder's, no record, or no decoder of the codec on the host (no device of ours in
+			// the process, or caps without it).
 			TileInfo tile;
-			if (param.function_id == kFunctionDecode && param.id == kParamTileInfo && param.data &&
-			    codec && tileInfo(codec, &tile))
-				*(TileInfo *)param.data = tile;
+			if (param.function_id != kFunctionDecode || !param.data || !codec ||
+			    !tileInfo(codec, &tile))
+				return kUnsupported;
+			*(TileInfo *)param.data = tile;
 		}
 		return kOk;
 	}

@@ -5,8 +5,9 @@
  * a context the driver deletes, by DeleteContexts or by a CreateContexts that fails part way,
  * takes its session with it, closed and out of the live sessions, that a decode the driver
  * cannot send fails its schedule, that no answer of the driver AppleGVA may divide by is 0 (an
- * alignment, a plane's size or pitch, a budget, a limit, a decoder's tile parameter), and that
- * each driver AppleGVA makes keeps bitstream pools of its own.
+ * alignment, a plane's size or pitch, a budget, a limit, a decoder's tile parameter), that a tile
+ * parameter it cannot write whole is refused rather than answered unwritten, and that each driver
+ * AppleGVA makes keeps bitstream pools of its own.
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the first failure.
  */
@@ -204,6 +205,9 @@ struct FakeSession {
 };
 std::vector<FakeSession *> g_opened;
 int g_opensBeforeFailure = -1;
+// Whether the stand-in host has its decoders: false answers no codec's caps, as a process with no
+// device of ours, or a host with no hardware video, does.
+bool g_hostDecodes = true;
 
 } // namespace
 
@@ -229,7 +233,7 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 	}
 	h264.formats = RGFX_VIDEO_FORMAT_NV12;
 	hevc.formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
-	if (direction != RGFX_VIDEO_DECODE)
+	if (direction != RGFX_VIDEO_DECODE || !g_hostDecodes)
 		return nullptr;
 	return codec == RGFX_VIDEO_CODEC_H264 ? &h264 : codec == RGFX_VIDEO_CODEC_HEVC ? &hevc : nullptr;
 }
@@ -531,6 +535,31 @@ void checkTileInfo()
 		CHECK(t == 0xabcd, "an unknown context parameter written");
 }
 
+// The tile parameter the driver cannot write whole is refused, its record as it came, never
+// answered success unwritten (which CMPhoto divided by): with no decoder of the codec on the host,
+// of a codec the driver has no decoder of, of a function other than decode, and with no record.
+void checkTileInfoRefused()
+{
+	uint32_t tile[8];
+	auto refused = [&](uint32_t function, uint64_t codec, void *data, const char *what) {
+		for (uint32_t &t : tile)
+			t = 0xabcd;
+		ContextParam param = {function, 0, codec, 0, 0, nullptr, kParamTileInfo, 0, data};
+		ContextParamList list = {1, 0, &param};
+		CHECK(call(kGetContextParameter, &list) == kUnsupported,
+		      "the tile parameter %s answered", what);
+		for (uint32_t t : tile)
+			CHECK(t == 0xabcd, "the tile parameter %s written", what);
+	};
+	g_hostDecodes = false;
+	refused(kFunctionDecode, kCodecH264, tile, "of H.264 with no host decoder");
+	refused(kFunctionDecode, kCodecHevc, tile, "of HEVC with no host decoder");
+	g_hostDecodes = true;
+	refused(kFunctionDecode, 0x7777, tile, "of an unknown codec");
+	refused(kFunctionDecode + 1, kCodecHevc, tile, "of another function");
+	refused(kFunctionDecode, kCodecHevc, nullptr, "with no record");
+}
+
 // The capability block, by GetDriverParameter.
 const CapabilityBlock *capabilities()
 {
@@ -647,6 +676,7 @@ int main()
 	checkUnsentDecode();
 	checkNoZeroAnswers();
 	checkTileInfo();
+	checkTileInfoRefused();
 	checkLayoutFromHost();
 	std::printf("video_driver_tests: %d checks passed\n", g_checks);
 	return 0;
