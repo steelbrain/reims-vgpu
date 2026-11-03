@@ -54,6 +54,9 @@ struct RgfxBlock {
 	// Made for a client that may take the reserve (rgfxBlockAlloc's `mayReserve`): counted in
 	// the table's reservedCount and reservedBytes while it is in the table.
 	bool reserved;
+	// When it was freed for its release (the caller's clock, 0 where not given), for the time a
+	// release takes.
+	uint64_t freedAt;
 };
 
 // A pin of one block (rgfxBlockPin), to give back with rgfxBlockUnpin.
@@ -173,6 +176,7 @@ inline RgfxBlockResult rgfxBlockAlloc(RgfxBlockTable &t, const void *owner, uint
 			b.refused = false;
 			b.wired = nullptr;
 			b.reserved = mayReserve;
+			b.freedAt = 0;
 			t.count++;
 			if (mayReserve) {
 				t.reservedCount++;
@@ -298,9 +302,10 @@ inline RgfxBlockResult rgfxBlockFreeable(const RgfxBlockTable &t, const void *ow
 	return kRgfxBlockOk;
 }
 
-// `owner` frees its live block at `offset`: it is freed, for its release to be posted. Busy while
-// a create naming it is in flight.
-inline RgfxBlockResult rgfxBlockFree(RgfxBlockTable &t, const void *owner, uint64_t offset)
+// `owner` frees its live block at `offset`, at `now`: it is freed, for its release to be posted.
+// Busy while a create naming it is in flight.
+inline RgfxBlockResult rgfxBlockFree(RgfxBlockTable &t, const void *owner, uint64_t offset,
+                                     uint64_t now = 0)
 {
 	int64_t at = rgfxBlockIndex(t, offset);
 	if (at < 0 || t.blocks[at].owner != owner || t.blocks[at].state != kRgfxBlockLive)
@@ -308,6 +313,7 @@ inline RgfxBlockResult rgfxBlockFree(RgfxBlockTable &t, const void *owner, uint6
 	if (t.blocks[at].pins)
 		return kRgfxBlockBusy;
 	t.blocks[at].state = kRgfxBlockFreed;
+	t.blocks[at].freedAt = now;
 	return kRgfxBlockOk;
 }
 
@@ -349,14 +355,15 @@ inline void rgfxBlockReleased(RgfxBlockTable &t, uint64_t offset, uint64_t seria
 // Posts again the release of every block kept after the device refused it (an object of some
 // context lay in it): each goes back to freed, for rgfxBlockNextRelease, since a context close
 // may have dropped that object. A block kept for good (a close not answered) is not `refused`,
-// and is left. How many are posted again.
-inline uint32_t rgfxBlockRetryRefused(RgfxBlockTable &t)
+// and is left. How many are posted again, freed at `now`.
+inline uint32_t rgfxBlockRetryRefused(RgfxBlockTable &t, uint64_t now = 0)
 {
 	uint32_t n = 0;
 	for (uint32_t i = 0; i < t.count; i++) {
 		if (t.blocks[i].state == kRgfxBlockKept && t.blocks[i].refused) {
 			t.blocks[i].state = kRgfxBlockFreed;
 			t.blocks[i].refused = false;
+			t.blocks[i].freedAt = now;
 			n++;
 		}
 	}

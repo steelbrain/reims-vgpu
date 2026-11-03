@@ -51,6 +51,7 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxSurfaceBlocks.hpp"
 #include "RgfxSurfaceCaches.hpp"
+#include "RgfxLatency.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -92,6 +93,8 @@ constexpr UInt32 kDormantLogMs = 10000;
 constexpr UInt32 kDormantRoomMs = 100;
 // How many dormant blocks a new block that finds no room in the region lets go.
 constexpr UInt32 kDormantRoomBlocks = 16;
+// How often the releases' line is logged at most.
+constexpr UInt32 kReleaseLogMs = 10000;
 
 UInt64 alignUp(UInt64 value, UInt64 align)
 {
@@ -176,6 +179,32 @@ struct DormantStats {
 };
 DormantStats dormantStats = {};
 
+// What the releases took, under contextLock, logged once more were answered and kReleaseLogMs
+// passed since the last line (noteReleases): from a block's free to its release's answer
+// (`latency`), and from a dormant block's ask to go to the worker's reap of it (`reapWait`, while
+// the worker is busy with releases); the releases kept, the most in flight at once, and the new
+// surface blocks that waited for the region's room and the ones that found none after.
+struct ReleaseStats {
+	RgfxLatency latency;
+	RgfxLatency reapWait;
+	UInt64 kept;
+	UInt32 inFlightMost;
+	UInt64 roomWaits;
+	UInt64 roomWaitsFailed;
+	UInt64 reapAskedAt;
+	UInt64 loggedCount;
+	UInt64 loggedAt;
+};
+ReleaseStats releaseStats = {};
+
+UInt64 nanosSince(UInt64 then, UInt64 now)
+{
+	UInt64 ns = 0;
+	if (then && now > then)
+		absolutetime_to_nanoseconds(now - then, &ns);
+	return ns;
+}
+
 UInt64 loadHeader64(const volatile UInt8 *header, UInt32 field)
 {
 	return __atomic_load_n(reinterpret_cast<const volatile UInt64 *>(header + field),
@@ -191,6 +220,7 @@ void queueInterruptHook(OSObject *target)
 bool reapDormant();
 void noteDormant();
 void noteReserve();
+void noteReleases();
 void unwire(void *pages);
 
 // The release thread call: lets go of the dormant blocks their surfaces asked to go
@@ -201,6 +231,11 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
 	IOLockLock(contextLock);
+	if (releaseStats.reapAskedAt) {
+		rgfxLatencyAdd(releaseStats.reapWait,
+		               nanosSince(releaseStats.reapAskedAt, mach_absolute_time()));
+		releaseStats.reapAskedAt = 0;
+	}
 	reapDormant();
 	IOLockUnlock(contextLock);
 	noteDormant();
@@ -208,9 +243,13 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		RgfxBlock block;
 		IOLockLock(contextLock);
 		bool any = rgfxBlockNextRelease(blockTable, &block);
+		if (any && !releaseStats.inFlightMost)
+			releaseStats.inFlightMost = 1;
 		IOLockUnlock(contextLock);
-		if (!any)
+		if (!any) {
+			noteReleases();
 			return;
+		}
 		RgfxBlockRelease release = {};
 		release.context = block.context;
 		release.offset = block.offset;
@@ -242,6 +281,8 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		}
 		void *wired = nullptr;
 		rgfxBlockReleased(blockTable, block.offset, block.serial, ok, &wired);
+		rgfxLatencyAdd(releaseStats.latency, nanosSince(block.freedAt, mach_absolute_time()));
+		releaseStats.kept += !ok;
 		// A new block waiting for the region's room looks again.
 		IOLockWakeup(contextLock, &surfaceTable, false);
 		IOLockUnlock(contextLock);
@@ -493,7 +534,7 @@ IOReturn RgfxAccelerator::freeBlock(RgfxAcceleratorUserClient *owner, UInt64 off
 	RgfxBlockResult r = rgfxBlockFreeable(blockTable, owner, offset, &size);
 	if (r == kRgfxBlockOk) {
 		owner->unmapSpan(offset, size);
-		r = rgfxBlockFree(blockTable, owner, offset);
+		r = rgfxBlockFree(blockTable, owner, offset, mach_absolute_time());
 	}
 	IOLockUnlock(contextLock);
 	if (r == kRgfxBlockBusy)
@@ -659,7 +700,7 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nu
 	if (!keep) {
 		if (!e.dormant)
 			rgfxBlockSetContext(blockTable, e.offset, context);
-		release = rgfxBlockFree(blockTable, &e, e.offset) == kRgfxBlockOk;
+		release = rgfxBlockFree(blockTable, &e, e.offset, mach_absolute_time()) == kRgfxBlockOk;
 	}
 	if (!release)
 		rgfxBlockKeepAt(blockTable, e.offset);
@@ -717,6 +758,47 @@ bool reapDormant()
 			release |= letGoDormant(i, static_cast<RgfxDormantCause>(why), written);
 	}
 	return release;
+}
+
+// Logs what the releases took (ReleaseStats), where more were answered and kReleaseLogMs passed
+// since the last line. Not under contextLock.
+void noteReleases()
+{
+	if (!contextLock)
+		return;
+	const uint64_t now = mach_absolute_time();
+	uint64_t interval = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kReleaseLogMs) * 1000000ull, &interval);
+	IOLockLock(contextLock);
+	const bool log = releaseStats.latency.count != releaseStats.loggedCount &&
+	                 now - releaseStats.loggedAt >= interval;
+	UInt64 count = 0, p50 = 0, p99 = 0, most = 0, reaps = 0, r50 = 0, r99 = 0, rmost = 0;
+	UInt64 kept = 0, waits = 0, failed = 0;
+	UInt32 inFlight = 0;
+	if (log) {
+		const ReleaseStats &s = releaseStats;
+		count = s.latency.count;
+		p50 = rgfxLatencyPercentile(s.latency, 500);
+		p99 = rgfxLatencyPercentile(s.latency, 990);
+		most = s.latency.maxNs;
+		reaps = s.reapWait.count;
+		r50 = rgfxLatencyPercentile(s.reapWait, 500);
+		r99 = rgfxLatencyPercentile(s.reapWait, 990);
+		rmost = s.reapWait.maxNs;
+		kept = s.kept;
+		inFlight = s.inFlightMost;
+		waits = s.roomWaits;
+		failed = s.roomWaitsFailed;
+		releaseStats.loggedCount = count;
+		releaseStats.loggedAt = now;
+	}
+	IOLockUnlock(contextLock);
+	if (log)
+		IOLog("RgfxAccelerator: releases: %llu answered (%llu kept), %u in flight at most; freed "
+		      "to answered p50 %llu us, p99 %llu us, max %llu us; dormant reaps %llu, waited p50 "
+		      "%llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none)\n",
+		      count, kept, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps, r50 / 1000,
+		      r99 / 1000, rmost / 1000, waits, failed);
 }
 
 // The most WindowServer's blocks came to at the last line of noteReserve. Under contextLock.
@@ -921,6 +1003,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		if (made != kRgfxBlockNoSpace || waitedForRoom || !table.dormantCount)
 			break;
 		waitedForRoom = true;
+		releaseStats.roomWaits++;
 		for (UInt32 n = 0; n < kDormantRoomBlocks; n++) {
 			const int32_t oldest = rgfxSurfaceOldestDormant(table);
 			if (oldest < 0)
@@ -934,6 +1017,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		clock_interval_to_deadline(kDormantRoomMs, kMillisecondScale, &deadline);
 		IOLockSleepDeadline(contextLock, &surfaceTable, deadline, THREAD_UNINT);
 	}
+	if (waitedForRoom && made == kRgfxBlockNoSpace)
+		releaseStats.roomWaitsFailed++;
 	if (release)
 		thread_call_enter(releaseCall);
 	if (at >= 0) {
@@ -1086,8 +1171,14 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 
 void RgfxAccelerator::wakeReleases()
 {
-	if (__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
-		thread_call_enter(releaseCall);
+	if (!__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
+		return;
+	// When the first dormant block asked to go, for the worker's reap of it (ReleaseStats).
+	IOLockLock(contextLock);
+	if (!releaseStats.reapAskedAt)
+		releaseStats.reapAskedAt = mach_absolute_time();
+	IOLockUnlock(contextLock);
+	thread_call_enter(releaseCall);
 }
 
 void RgfxAccelerator::retryRefusedBlocks()
@@ -1095,7 +1186,7 @@ void RgfxAccelerator::retryRefusedBlocks()
 	if (!contextLock)
 		return;
 	IOLockLock(contextLock);
-	UInt32 n = rgfxBlockRetryRefused(blockTable);
+	UInt32 n = rgfxBlockRetryRefused(blockTable, mach_absolute_time());
 	IOLockUnlock(contextLock);
 	if (n) {
 		thread_call_enter(releaseCall);
