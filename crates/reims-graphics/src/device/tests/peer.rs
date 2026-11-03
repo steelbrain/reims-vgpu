@@ -102,6 +102,7 @@ fn type_name(r#type: u32) -> String {
     match r#type {
         RGFX_MSG_PAD => "PAD".into(),
         RGFX_CMD_GET_DISPLAYS => "GET_DISPLAYS".into(),
+        RGFX_CMD_BLOCK_GRANT => "BLOCK_GRANT".into(),
         RGFX_CMD_QUEUE_CREATE => "QUEUE_CREATE".into(),
         RGFX_CMD_OBJECT_DESTROY => "OBJECT_DESTROY".into(),
         RGFX_CMD_CONTEXT_CLOSE => "CONTEXT_CLOSE".into(),
@@ -486,6 +487,8 @@ fn empty_command_buffer(queue: u64, cb_obj_id: u64) -> Vec<u8> {
 /// The wire-2 guest's script: what today's kext and bundle do, with every feature register
 /// left unwritten.
 /// - start, then `GET_DISPLAYS` and a command of no known type;
+/// - the rings' blocks granted to the queue's process (no answer), as the kext grants them before
+///   its first queue's create;
 /// - a queue, a buffer on it alone, then two in one post and one doorbell, which raise once;
 /// - the queue's `OBJECT_DESTROY` (no answer), seen through by the next ring-0 answer;
 /// - a second queue over the same rings, a buffer on it, then its context's `CONTEXT_CLOSE`;
@@ -508,6 +511,10 @@ fn wire2_script(guest: &mut FakeGuest) {
     assert_ne!(unknown.status, RGFX_STATUS_OK);
     guest.settle(&[]);
 
+    let span = u64::from(RGFX_RING_HEADER_SIZE + QUEUE_RING_DATA);
+    for ring in [QUEUE_SUBMIT, QUEUE_COMPLETE] {
+        guest.command_unanswered(block_message(RGFX_CMD_BLOCK_GRANT, CONTEXT, ring, span));
+    }
     let mut a = guest.create_queue(QUEUE_A, "queueA");
     guest.settle(&[&a]);
     guest.post(&mut a, vec![empty_command_buffer(QUEUE_A, 0x100)]);

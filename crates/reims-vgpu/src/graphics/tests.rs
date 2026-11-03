@@ -3952,6 +3952,10 @@ fn ring_0_s_answers_write_every_byte_they_name() {
         bytes
     };
     guest.send(&device, block_grant(1, BLOCK, 0x1000));
+    // The queue's rings lie in blocks its process holds, as the kext grants them.
+    let ring_span = u64::from(RGFX_RING_HEADER_SIZE) + 0x1_0000;
+    guest.send(&device, block_grant(1, SUBMIT_OFF, ring_span));
+    guest.send(&device, block_grant(1, COMPLETE_OFF, ring_span));
     let commands: Vec<(Vec<u8>, u32, usize)> = vec![
         (
             library_create(obj(1, 10)),
@@ -4100,10 +4104,14 @@ fn a_command_buffer_s_completion_writes_every_byte() {
     const DATA: u32 = 0x1_0000;
     let mut guest = Guest::new(&device);
     assert_eq!(
-        answered(
+        create_queue(
             &device,
             &mut guest,
-            queue_create(2, 1, SUBMIT_OFF, COMPLETE_OFF, DATA, 0)
+            2,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            DATA,
+            0
         ),
         RGFX_STATUS_OK
     );
