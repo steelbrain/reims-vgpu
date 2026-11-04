@@ -8,8 +8,12 @@
 //!
 //! - **Counted**: a command buffer made for a context's `COMMAND_BUFFER` message (its queue gave
 //!   one, whatever its walk then does), and a render encoder opened for its `ENCODER_BEGIN_RENDER`.
-//! - **Off, it costs one relaxed load a count**: [`start`] turns counting on only where the
-//!   target is enabled at debug as the first decoder is made, and makes the thread then.
+//! - **Asked for by name**: [`start`] turns counting on only where `REIMS_VGPU_LOG` names the
+//!   target itself at debug as the first decoder is made (`reims_vgpu_core::logging::names`),
+//!   and makes the thread then: a lone level, such as a bug report's `debug`, or a pair of a
+//!   target above it (`reims_vgpu=debug`) does not, as for the runtime's counts on the same
+//!   target, whose reading costs the draws they count.
+//! - **Off**, it costs one relaxed load a count.
 //! - **A line** is `graphics work over S s: context C: N command buffers, M render encoders;
 //!   ...`, the contexts in their numbers' order, each that made something since the line before.
 
@@ -23,7 +27,7 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline};
 use reims_vgpu_core::sync::Mutex;
 
-/// The log target of the lines, at debug.
+/// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::work";
 
 /// How often the thread writes a line.
@@ -81,11 +85,14 @@ fn counts() -> &'static Counts {
 }
 
 /// Turns counting on and starts the thread that writes the lines (the module docs), once, where
-/// the target is enabled at debug, its ticks on `platform`'s clock.
+/// the filter names the target at debug and its lines are written, its ticks on `platform`'s
+/// clock.
 pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        if !log::log_enabled!(target: TARGET, log::Level::Debug) {
+        if !(reims_vgpu_core::logging::names(TARGET, log::Level::Debug)
+            && log::log_enabled!(target: TARGET, log::Level::Debug))
+        {
             return;
         }
         let platform = Arc::clone(platform);

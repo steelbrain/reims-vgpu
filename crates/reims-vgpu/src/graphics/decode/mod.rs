@@ -791,7 +791,7 @@ pub(crate) type WalkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl<P: Platform> GraphicsDecoder<P> {
     /// A new decoder for `platform` over its `region`, with no objects. The first one made turns
-    /// on the contexts' counts where their log target is on ([`work`]).
+    /// on the contexts' counts where the log names their target ([`work`]).
     pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
         work::start(&platform);
         let shared = Arc::new(Shared {

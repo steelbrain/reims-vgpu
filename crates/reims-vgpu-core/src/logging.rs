@@ -13,7 +13,8 @@
 //! `REIMS_VGPU_LOG` is a level (`off`, `error`, `warn`, `info`, `debug` or `trace`), optionally
 //! followed by `,target=level` pairs: `warn,reims_vgpu_core::fifo=debug` ([`Filter::parse`]).
 //! When it is set, its filter decides which lines are written, to the hook too; when it isn't,
-//! the hook's own level does.
+//! the hook's own level does. A diagnostic whose own work costs the work it watches runs only
+//! where the variable names its target itself ([`names`]), not under a lone level.
 //!
 //! Which lines are written, and whether a line's arguments are evaluated, are diagnostics: a line
 //! evaluates its arguments only when a logger takes it, so no argument has an effect. A value a
@@ -97,6 +98,26 @@ impl Filter {
             .map(|(_, level)| *level)
             .fold(self.rest, Ord::max)
     }
+
+    /// Whether a pair names `target` itself, up to `level` or finer: a lone level does not, nor
+    /// does a pair of a target above it (`reims_vgpu` for `reims_vgpu::work`) or below it. The
+    /// last pair of `target` decides, as in [`Self::level`].
+    pub fn names(&self, target: &str, level: Level) -> bool {
+        (self.targets.iter().rev())
+            .find(|(named, _)| named == target)
+            .is_some_and(|(_, up_to)| level <= *up_to)
+    }
+}
+
+/// Whether `REIMS_VGPU_LOG` names `target` itself, up to `level` or finer ([`Filter::names`]).
+/// False where the variable is not set: a hook's level is a lone level. For a diagnostic whose
+/// own work costs the work it watches, which runs only where its target is asked for by name,
+/// not under a lone level such as a bug report's `debug`. Whether its lines are then written is
+/// still the logger's to say (`log::log_enabled!`).
+pub fn names(target: &str, level: Level) -> bool {
+    LOGGER
+        .env()
+        .is_some_and(|filter| filter.names(target, level))
 }
 
 /// Whether the filter's `prefix` covers `target`: it is `target`, or `target`'s path above a `::`.
@@ -304,6 +325,60 @@ mod tests {
         let f = Filter::parse("a=debug,a=error");
         assert_eq!(f.level("a"), LevelFilter::Error);
         assert_eq!(f.max(), LevelFilter::Debug);
+    }
+
+    /// A filter names a target only by a pair of the target itself, the last one deciding: not
+    /// by a lone level, nor by a pair of a target above or below it
+    #[test]
+    fn a_filter_names_a_target_only_by_its_own_pair() {
+        const WORK: &str = "reims_vgpu::work";
+        let names = |spec: &str| Filter::parse(spec).names(WORK, Level::Debug);
+        assert_eq!(Filter::parse("debug").level(WORK), LevelFilter::Debug);
+        assert!(
+            !names("debug"),
+            "a lone level, which writes the target's lines"
+        );
+        assert!(!names("trace"));
+        assert!(names("info,reims_vgpu::work=debug"));
+        assert!(names("reims_vgpu::work=trace"));
+        assert!(
+            !names("reims_vgpu::work=info"),
+            "named, but not up to debug"
+        );
+        assert!(!names("reims_vgpu=debug"), "a target above it");
+        assert!(!names("reims_vgpu::work::lines=debug"), "a target below it");
+        assert!(!names("reims_vgpu::works=debug"));
+        assert!(!names("reims_vgpu::work=debug,reims_vgpu::work=warn"));
+        assert!(names("reims_vgpu::work=warn,reims_vgpu::work=debug"));
+    }
+
+    /// The process names a target only where the variable's own pair does: not without the
+    /// variable, nor under a lone level or a pair above it, a hook at any level aside
+    #[test]
+    fn the_process_names_a_target_only_by_the_variables_pair() {
+        if std::env::var_os(CHILD).is_some() {
+            let named = names("reims_vgpu::work", Level::Debug);
+            let (_, hook) = recording_hook();
+            assert!(set_hook(LevelFilter::Trace, hook));
+            assert_eq!(names("reims_vgpu::work", Level::Debug), named);
+            println!("named {named}");
+            return;
+        }
+        for (env, named) in [
+            (None, false),
+            (Some("debug"), false),
+            (Some("trace"), false),
+            (Some("reims_vgpu=debug"), false),
+            (Some("info,reims_vgpu::work=debug"), true),
+        ] {
+            let out = child(
+                "logging::tests::the_process_names_a_target_only_by_the_variables_pair",
+                env,
+            );
+            assert!(out.status.success(), "{env:?}: {out:?}");
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(said.contains(&format!("named {named}")), "{env:?}: {said}");
+        }
     }
 
     /// A stderr line names the library, the level and the target

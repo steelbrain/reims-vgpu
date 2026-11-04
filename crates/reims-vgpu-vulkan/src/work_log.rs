@@ -1,11 +1,16 @@
 //! The runtime's work counts (`Device::work_counts`) in the host's log, for the lanes' benches:
 //! every [`PERIOD`] (a second, so a bench cuts each of its windows to within one), while the
-//! target [`TARGET`] is enabled at debug, one line of the counts that changed since the line
-//! before, as deltas. A diagnostic: the counts are the runtime's own, which
-//! no Metal call answers, and which lines the host writes is free under the contract.
+//! target [`TARGET`] is on at debug, one line of the counts that changed since the line before,
+//! as deltas. A diagnostic: the counts are the runtime's own, which no Metal call answers, and
+//! which lines the host writes is free under the contract.
 //!
-//! - **Off, it costs nothing.** [`start`] makes no thread unless the target is enabled at debug
-//!   as the device is adopted, and the thread reads no count while the target is off.
+//! - **Asked for by name.** [`start`] makes the thread only where `REIMS_VGPU_LOG` names the
+//!   target itself at debug as the device is adopted (`info,reims_vgpu::work=debug`, the lane
+//!   benches' filter: `reims_vgpu_core::logging::names`). A lone level, such as the `debug` a
+//!   bug report's log asks for, and a pair of a target above it (`reims_vgpu=debug`) start none,
+//!   though they write the target's lines: reading the counts costs the draws it counts (below).
+//! - **Off, it costs nothing.** No thread is made, and the thread reads no count while the
+//!   target is off.
 //! - **Every field.** The counts are a struct of the runtime's, hundreds of fields in nested
 //!   structs and arrays, which change with its commits. A line takes their `Debug` form and
 //!   flattens it into paths ([`flatten`]: `shadow_copies`, `shadow_keeps.render_cut`,
@@ -16,7 +21,9 @@
 //!   adopted, from 0, so it holds every count that is not 0. A period in which nothing changed
 //!   writes no line.
 //! - **Reading the counts** has the runtime lower the render encoders' calls it logged and has
-//!   not lowered yet (its `work_counts`), as it does before they run anyway.
+//!   not lowered yet, and settle its commits (its `work_counts`). With the thread on, the lane's
+//!   `draws.10k` ran at 0.80M draws a second, against 2.54M with it off (measured on the msi
+//!   RTX 5080, the effort's tip 14656f4d6, lane-gate's bench boots, 2026-11-04).
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -24,7 +31,7 @@ use std::time::Duration;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 
-/// The log target of the lines, at debug.
+/// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::work";
 
 /// How often the thread looks at the counts.
@@ -33,10 +40,12 @@ pub(crate) const PERIOD: Duration = Duration::from_secs(1);
 /// The counts as paths and values, in their `Debug` form's order.
 type Flat = Vec<(String, u64)>;
 
-/// Starts the thread that logs `device`'s counts (the module docs), where the target is enabled
-/// at debug.
+/// Starts the thread that logs `device`'s counts (the module docs), where the filter names the
+/// target at debug and its lines are written.
 pub(crate) fn start(device: &rt::Device) {
-    if !log::log_enabled!(target: TARGET, log::Level::Debug) {
+    if !(reims_vgpu_core::logging::names(TARGET, log::Level::Debug)
+        && log::log_enabled!(target: TARGET, log::Level::Debug))
+    {
         return;
     }
     let device = device.clone();
