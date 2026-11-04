@@ -25,6 +25,7 @@
 #   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
 #                  [--exclude NAME,...] [--hold S] [--catch-from-boot] [--host-tip SHA] [--image-tip SHA]
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
+#                  [--host-log FILTER]
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -48,7 +49,9 @@
 # starts, {PID} its pid and {DIR} the round's directory (QEMU_HOOK); --pre-qemu CMD runs CMD on
 # the lane host under the GPU lock just before QEMU starts, its output in the round's
 # pre-qemu.txt (PRE_QEMU); --log-add FILTER adds FILTER's directives to the round's host log filter
-# (as reims_vgpu_vulkan::icb_writes=debug, a target that is off by default); --hold S sets the
+# (as reims_vgpu_vulkan::icb_writes=debug, a target that is off by default); --host-log FILTER
+# replaces the round's filter (as info, for a round timed against info-level bench boots: the
+# presents' trace lines cost each op, and its probes' host.log then counts no composites); --hold S sets the
 # round's hold (config.sh's HOLD_S) for this round. --list shows the
 # queue and what a round would take. --dry-run runs a round on this machine: the lane host's
 # directories under a scratch directory and the guest a directory of it (msi-probes.sh FAKE_GUEST),
@@ -57,7 +60,7 @@ set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
-cold_cache= qemu_hook= pre_qemu= log_add=
+cold_cache= qemu_hook= pre_qemu= log_add= host_log=
 while (($#)); do
   a=$1
   shift
@@ -75,6 +78,7 @@ while (($#)); do
     --qemu-hook) qemu_hook=${1:?--qemu-hook CMD}; shift ;;
     --pre-qemu) pre_qemu=${1:?--pre-qemu CMD}; shift ;;
     --log-add) log_add=${1:?--log-add FILTER}; shift ;;
+    --host-log) host_log=${1:?--host-log FILTER}; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
@@ -91,7 +95,7 @@ WAIT_N=3 WAIT_S=2700
 # transaction", reims_graphics at trace, about 23 lines a second at 120 Hz), so a probe's host.log
 # counts composites. reims_graphics has no other trace lines; at debug it logs SUBMIT_ROOM posts
 # (reims_graphics::room). Gate and bench boots log at info.
-PROBE_HOST_LOG=info,reims_graphics=trace
+PROBE_HOST_LOG=${host_log:-info,reims_graphics=trace}
 # The hold the probes get: the boot's own time to the desktop and the device check (about 90 s),
 # the longest load settle (180 s) and a margin come first.
 FIT_S=$(( HOLD_S - 90 - 180 - 60 ))
