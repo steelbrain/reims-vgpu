@@ -1666,7 +1666,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         self.forget_context_surfaces(context);
-        self.shared.surface_views.lock().context_closed(context);
+        // Let go of with no lock held: a view may hold the last of an import of the guest's
+        // pages, which the platform may take long to let go of, and every context's surface
+        // pages take the views' lock.
+        let views = self.shared.surface_views.lock().context_closed(context);
+        if !views.is_empty()
+            && let Err(refusal) = refusals::refusing(move || drop(views))
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "context {context}'s pages blocks' views were let go of at its close, and a \
+                 release was refused: {refusal}"
+            );
+        }
         let libraries = self.shared.libraries.lock().ids_of(context);
         for id in libraries {
             if let Err(refusal) = refusals::refusing(|| self.forget_library(id)) {

@@ -6598,6 +6598,116 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
 }
 
+/// A `SURFACE_PAGES` of context `context`'s block at `block` (of [`SURFACE_BLOCK_SIZE`] bytes) of
+/// `runs`, given as (page, pages) of guest RAM, written into the block's second half here.
+fn surface_pages_of(
+    device: &GraphicsDevice<FakePlatform>,
+    context: u32,
+    block: u64,
+    page: u64,
+    runs: &[(u64, u64)],
+) -> Vec<u8> {
+    let runs: Vec<RgfxPageRun> = runs
+        .iter()
+        .map(|&(at, n)| RgfxPageRun {
+            address: SURFACE_RAM + at * page,
+            length: n * page,
+        })
+        .collect();
+    let runs_offset = block + SURFACE_BLOCK_SIZE / 2;
+    // SAFETY: the runs lie in the block, in the device's region, mapped while it lives; nothing of
+    // the host's writes them.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            runs.as_bytes().as_ptr(),
+            device.region_base().add(runs_offset as usize),
+            runs.as_bytes().len(),
+        );
+    }
+    RgfxSurfacePages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        context,
+        run_count: runs.len() as u32,
+        block_offset: block,
+        block_size: SURFACE_BLOCK_SIZE,
+        runs_offset,
+        length: runs.iter().map(|r| r.length).sum(),
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A close lets go of its pages blocks' views with no lock held. While the platform takes long
+/// to let go of a view's import of the guest's pages (held here, as a driver's unpin of them), a
+/// `SURFACE_PAGES` of another context's block is answered; the close is answered once the import
+/// is let go of.
+#[test]
+fn a_close_s_slow_release_of_a_pages_view_holds_up_no_other_context_s_pages() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
+    guest.send(&device, object_destroy(obj(1, 11)));
+    guest.send(&device, event_create(obj(1, 12)));
+    assert!(objects_become(&device, 1), "the buffer made and gone");
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    assert_eq!(worker.views_of_surfaces().counts().private, 1);
+    let world = platform.world();
+    // The buffer over the view goes once the walks and workers that saw it let it go.
+    let mut imports = world.live("MTLBuffer");
+    for _ in 0..2000 {
+        if imports.len() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        imports = world.live("MTLBuffer");
+    }
+    assert_eq!(imports.len(), 1, "the view's import alone: {imports:?}");
+    let release = HeldCall::new();
+    world.hold_at_release(imports[0], release.clone());
+    // The other context's first message, before the close: a context's first message waits for
+    // every close not yet carried out.
+    const OTHER: u64 = SURFACE_BLOCK + 0x10_0000;
+    guest.send(&device, block_grant(2, OTHER, SURFACE_BLOCK_SIZE));
+
+    guest.send(&device, context_close(1));
+    let close = guest.seqno;
+    assert!(
+        release.reached(Duration::from_secs(2)),
+        "the close let go of the view's import"
+    );
+    guest.send(&device, surface_pages_of(&device, 2, OTHER, page, &[(3, 1)]));
+    let other = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the other context's SURFACE_PAGES' answer"));
+    assert_eq!(answer, (other, RGFX_STATUS_OK));
+    assert!(guest.event_now().is_none(), "the close is not answered yet");
+
+    release.open();
+    let answer = complete_of(&guest.event().expect("the close's answer"));
+    assert_eq!(answer, (close, RGFX_STATUS_OK));
+    assert!(
+        !world.live("MTLBuffer").contains(&imports[0]),
+        "the close let go of the view's import"
+    );
+}
+
 /// A shared block's `BLOCK_RELEASE` posted behind an earlier holder's `CONTEXT_CLOSE` is carried
 /// out once the close is, every object of the holder's let go of first, where the platform takes
 /// long over one (held here); so is every later message of the releasing context's, which its

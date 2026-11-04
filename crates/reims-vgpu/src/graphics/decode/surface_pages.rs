@@ -651,27 +651,17 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// Context `context` closed: the views of its pages blocks, which the kext frees with no
-    /// `BLOCK_RELEASE` once the close is answered, go once the buffers over them have let them
-    /// go; each import let go of in a refusal scope.
-    pub(crate) fn context_closed(&mut self, context: u32) {
+    /// `BLOCK_RELEASE` once the close is answered, taken out for the caller to let go of with no
+    /// lock held. Each goes once the buffers over it have let it go.
+    pub(crate) fn context_closed(&mut self, context: u32) -> Vec<Private<P>> {
         let blocks: Vec<u64> = (self.private.iter())
             .filter(|(_, p)| p.context == context)
             .map(|(&at, _)| at)
             .collect();
-        let gone: Vec<Private<P>> = blocks
+        blocks
             .iter()
             .filter_map(|at| self.private.remove(at))
-            .collect();
-        if gone.is_empty() {
-            return;
-        }
-        if let Err(refusal) = refusals::refusing(move || drop(gone)) {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "context {context}'s pages blocks' views were let go of at its close, and a \
-                 release was refused: {refusal}"
-            );
-        }
+            .collect()
     }
 
     /// The device's reset: every block's view and every cached one go, each buffer over them
