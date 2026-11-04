@@ -40,6 +40,9 @@
 #   make submit-probe
 #                   a command buffer's fixed cost and latency (tools/submit_probe.m),
 #                   build/submit_probe-x86_64; ARCH=arm64 likewise.
+#   make upload-probe
+#                   what the CPU's uploads into Managed resources cost at WindowServer's shapes
+#                   (tools/upload_probe.m), build/upload_probe-x86_64; ARCH=arm64 likewise.
 #   make reflection-check
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
@@ -418,6 +421,19 @@ $(SUBMITBIN): tools/submit_probe.m Makefile
 		-Wall -Wextra -Werror -Wno-unused-parameter tools/submit_probe.m -framework Foundation \
 		-framework Metal -o $@
 
+# --- the uploads into Managed resources (tools/upload_probe.m says what each case measures) -------
+# One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
+# run on a real device, never in `make test`.
+UPLOADBIN = $(BUILD)/upload_probe-$(ARCH)
+
+upload-probe: $(UPLOADBIN)
+
+$(UPLOADBIN): tools/upload_probe.m Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter tools/upload_probe.m -framework Foundation \
+		-framework Metal -o $@
+
 # --- the shader and pipeline costs (tools/pipelines; pipelines.m says what each case measures) --
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`. Its source compiles in (pipelines_source.h, from
@@ -482,6 +498,6 @@ $(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArgume
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench pipelines res submit-probe reflection-check peer-test peer-test-build \
+.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe reflection-check peer-test peer-test-build \
 	spguard clean
 
