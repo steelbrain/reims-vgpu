@@ -36,8 +36,8 @@
 //!   and a context's first message, for every `CONTEXT_CLOSE` not yet carried out (whatever its
 //!   number: the kext numbers contexts at their opens, which come in another order than their
 //!   first messages): the kext frees a closed context's chunks and its slot of GPU addresses once
-//!   the close is answered, or once it gives up waiting for the answer, so a close not yet carried
-//!   out may still hold textures at the chunk's ids and buffers in the slot;
+//!   the close is answered, so a close not yet carried out may still hold textures at the chunk's
+//!   ids and buffers in the slot;
 //! - a message of context `c`'s on `c`'s lane, for each block's lane through its last
 //!   `SURFACE_PAGES` for `c` handed before it: `c`'s later messages see the block as its pages
 //!   left it, as when they shared one lane;

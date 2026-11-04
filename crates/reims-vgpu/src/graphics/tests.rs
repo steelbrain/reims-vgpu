@@ -6693,9 +6693,16 @@ fn a_close_s_slow_release_of_a_pages_view_holds_up_no_other_context_s_pages() {
         release.reached(Duration::from_secs(2)),
         "the close let go of the view's import"
     );
-    guest.send(&device, surface_pages_of(&device, 2, OTHER, page, &[(3, 1)]));
+    guest.send(
+        &device,
+        surface_pages_of(&device, 2, OTHER, page, &[(3, 1)]),
+    );
     let other = guest.seqno;
-    let answer = complete_of(&guest.event().expect("the other context's SURFACE_PAGES' answer"));
+    let answer = complete_of(
+        &guest
+            .event()
+            .expect("the other context's SURFACE_PAGES' answer"),
+    );
     assert_eq!(answer, (other, RGFX_STATUS_OK));
     assert!(guest.event_now().is_none(), "the close is not answered yet");
 
@@ -6708,13 +6715,15 @@ fn a_close_s_slow_release_of_a_pages_view_holds_up_no_other_context_s_pages() {
     );
 }
 
-/// A shared block's `BLOCK_RELEASE` posted behind an earlier holder's `CONTEXT_CLOSE` is carried
-/// out once the close is, every object of the holder's let go of first, where the platform takes
-/// long over one (held here); so is every later message of the releasing context's, which its
-/// lane carries out behind the release. A compositor that releases a surface's block an app
-/// shared with it, right after the app quits, waits out the app's close so.
+/// A shared block's `BLOCK_RELEASE` posted behind an earlier holder's `CONTEXT_CLOSE` waits only
+/// for the close to take the holder's objects out of the tables: while the platform takes long to
+/// let go of one (held here), the release is answered, and so is a later message of the releasing
+/// context's, which its lane carries out behind the release. The close is answered once the
+/// object is let go of, as the kext gives the holder's texture resource ids and GPU addresses out
+/// again at the answer. A compositor that releases a surface's block an app shared with it, right
+/// after the app quits, does not wait out the app's releases.
 #[test]
-fn a_shared_block_s_release_behind_a_holder_s_close_waits_for_the_close() {
+fn a_shared_block_s_release_behind_a_holder_s_close_waits_for_none_of_its_releases() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -6743,13 +6752,7 @@ fn a_shared_block_s_release_behind_a_holder_s_close_waits_for_the_close() {
     let block = guest.seqno;
     guest.send(&device, sampler_create(obj(2, 4)));
     let later = guest.seqno;
-    assert!(
-        quiet(&guest),
-        "answered while the holder's close let go of its objects"
-    );
-
-    release.open();
-    let mut answered: Vec<(u32, u64, u32)> = events(&mut guest, 3)
+    let answered: Vec<(u32, u64, u32)> = events(&mut guest, 2)
         .into_iter()
         .map(|(r#type, bytes)| match r#type {
             RGFX_EVT_COMPLETE => {
@@ -6762,13 +6765,68 @@ fn a_shared_block_s_release_behind_a_holder_s_close_waits_for_the_close() {
             }
         })
         .collect();
-    answered.sort_unstable_by_key(|&(_, seqno, _)| seqno);
     assert_eq!(
         answered,
         [
-            (RGFX_EVT_COMPLETE, close, RGFX_STATUS_OK),
             (RGFX_EVT_COMPLETE, block, RGFX_STATUS_OK),
             (RGFX_EVT_SAMPLER_STATE, later, RGFX_STATUS_OK),
         ]
     );
+    assert!(quiet(&guest), "the close answered before its release");
+
+    release.open();
+    let answer = complete_of(&guest.event().expect("the close's answer"));
+    assert_eq!(answer, (close, RGFX_STATUS_OK));
+}
+
+/// A reset waits for the closes before it to let go of their objects, as the guest's driver,
+/// starting again, may take the texture resource ids and GPU addresses they held at once: while
+/// the platform takes long to let go of a closed context's object (held here), the reset drops
+/// no other context's objects, and it does once the object is let go of.
+#[test]
+fn a_reset_waits_for_a_close_s_slow_release() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    let world = platform.world();
+    let samplers = world.live("MTLSamplerState");
+    assert_eq!(samplers.len(), 1, "{samplers:?}");
+    let release = HeldCall::new();
+    world.hold_at_release(samplers[0], release.clone());
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(2, 4)),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, context_close(1));
+    assert!(
+        release.reached(Duration::from_secs(2)),
+        "the close let go of the sampler"
+    );
+    assert_eq!(device.decoder_object_count(), 1, "context 2's sampler");
+
+    device.reset();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the reset went on before the close let go of its sampler"
+    );
+    release.open();
+    for _ in 0..2000 {
+        if device.decoder_object_count() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the reset left context 2's sampler"
+    );
+    assert!(world.live("MTLSamplerState").is_empty());
 }

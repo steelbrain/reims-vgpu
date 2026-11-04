@@ -856,9 +856,11 @@ on the control ring and, for a pipeline create, hands the reflection back once
 the host answers it. A queue's `QUEUE_CREATE` goes the same way, its rings
 checked to lie in the process's blocks, and is answered once the host has the
 rings. At the process's close or death the kext destroys its queues, then
-closes its context (`CONTEXT_CLOSE`: the host drops its objects, then
-answers once the context's command buffers have finished), then frees its
-chunks of resource ids and, on that answer only, its blocks. A command
+closes its context (`CONTEXT_CLOSE`: the host takes its objects out of its
+tables, lets go of them on a worker of its own, `reims-vgpu.graphics-closes-<n>`,
+and answers once it has and the context's command buffers have finished),
+then, on that answer only, frees its chunks of resource ids, its blocks and its
+slot of GPU addresses. A command
 buffer is decoded once the host has carried out every control-ring message of
 its context's published before its queue's thread took it, and has taken every
 message before those.
@@ -922,8 +924,7 @@ messages change, and only for messages published before it
   and a context's first message for every close before it, whatever the
   context's number (the kext numbers contexts at their opens, and a process
   may post its first message after one opened later): the kext frees a closed
-  context's chunks and its slot of GPU addresses once it stops waiting for the
-  close's answer;
+  context's chunks and its slot of GPU addresses once the close is answered;
 - a context's message waits for each block's lane through the context's last
   `SURFACE_PAGES` on it, and a command buffer for its context's messages on
   the blocks' lanes too, as when they shared the context's lane;
@@ -936,6 +937,13 @@ messages change, and only for messages published before it
 
 `reims_graphics`'s `device::lanes` lists every message that names a block or
 its pages by offset, and what orders each against the block's lane.
+
+A close's job on its lane is its table work: it lets go of the context's
+objects on the closes' worker (`reims-vgpu.graphics-closes-<n>`), which the
+close's answer waits for, so a message that waits for a close waits for none
+of the platform's releases (an event's took 0.4 ms on an RTX 5080 Laptop GPU,
+measured by the decoder's `close_cost`). A reset waits for the closes before it
+to have let go of theirs.
 
 Each wait is for a message published earlier, and every lane with a message
 has a thread, so the waits end. What the guest can tell apart from one thread:
@@ -954,6 +962,8 @@ and goes after a second with none, whatever other processes do. Tested by
 `an_unshared_block_s_release_waits_for_no_other_context`,
 `a_scanout_grant_waits_for_every_context_s_messages_before_it`,
 `a_chunk_or_a_new_context_waits_for_the_close_before_it`,
+`a_shared_block_s_release_behind_a_holder_s_close_waits_for_none_of_its_releases`,
+`a_reset_waits_for_a_close_s_slow_release`,
 `a_context_s_first_message_waits_for_the_close_before_it_whatever_its_number`,
 `a_sync_create_is_answered_before_its_context_s_later_messages_are_carried_out`,
 `a_context_s_answer_comes_before_one_published_ahead_of_it_by_another_context`,

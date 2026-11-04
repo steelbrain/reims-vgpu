@@ -27,6 +27,9 @@
 //!   block's, or its id's where it has none.
 //! - The ICB worker's (`reims-vgpu.icb-create-<i>`) key is the buffer's context: a process's
 //!   `ICB_CREATE`s are made in its ring order, other processes' beside them.
+//! - The closes' worker's (`reims-vgpu.graphics-closes-<i>`) key is the closed context: a
+//!   `CONTEXT_CLOSE` lets go of its objects there, and is answered after them, other processes'
+//!   closes beside it.
 //!
 //! **No job waits for another key's.** A job waits only for jobs of its own key, which were handed
 //! over before it and are done when it runs: a `BUFFER_OVER_PAGES` waits for its block's
@@ -109,8 +112,7 @@ struct Shared {
     cap_hits: AtomicU64,
     /// A thread could not be started (logged once).
     refused: AtomicBool,
-    /// Signalled as a key's last job ends (tests only).
-    #[cfg(test)]
+    /// Signalled as a key's last job ends ([`Worker::flush`]).
     done: Condvar,
     /// Holds the threads before each job while shut (tests only).
     #[cfg(test)]
@@ -180,7 +182,6 @@ impl Worker {
                 ready: Condvar::new(),
                 cap_hits: AtomicU64::new(0),
                 refused: AtomicBool::new(false),
-                #[cfg(test)]
                 done: Condvar::new(),
                 #[cfg(test)]
                 gate: Gate::default(),
@@ -255,7 +256,6 @@ impl Worker {
             } else {
                 None
             };
-            #[cfg(test)]
             if job.is_none() {
                 shared.done.notify_all();
             }
@@ -311,8 +311,8 @@ impl Worker {
         self.shared.gate.opened.notify_all();
     }
 
-    /// Waits until no job of any key waits or runs (tests only).
-    #[cfg(test)]
+    /// Waits until no job of any key waits or runs: the device's reset, for the closes' worker's
+    /// jobs before it ([`super::GraphicsDecoder::closes_let_go`]).
     pub(crate) fn flush(&self) {
         let mut state = self.shared.state.lock();
         while !state.keys.is_empty() {
@@ -348,7 +348,6 @@ fn work(shared: &Shared, index: usize) {
             if state.ended(key) {
                 state.ready.push_back(key);
             } else {
-                #[cfg(test)]
                 shared.done.notify_all();
             }
             continue;

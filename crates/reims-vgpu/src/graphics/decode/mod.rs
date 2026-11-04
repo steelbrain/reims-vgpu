@@ -524,6 +524,9 @@ pub(crate) struct Shared<P: Platform> {
     /// The threads the views are made and let go of on, a block's jobs in their order
     /// ([`worker::Worker`]), and a block's device cache at its release ([`Caches::release`]).
     surface_worker: Arc<worker::Worker>,
+    /// The thread a closed context's objects and views are let go of on, its close answered
+    /// after them ([`GraphicsDecoder::let_go_later`]).
+    close_worker: worker::Worker,
     /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
     surface_caches: Arc<Caches<P>>,
     /// The commit order `CB_SUBMITTED` promises ([`sequencer`]).
@@ -723,6 +726,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None)),
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
+            close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
@@ -1618,15 +1622,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         });
     }
 
-    /// Drops every object of context `context`: those whose id lies in its range,
-    /// `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next context's (its process closed
-    /// the device or died), its chunks of the texture resource ids and its surfaces' names. How
-    /// many objects were dropped. Each object is let go of in a refusal scope of its own
-    /// ([`drop_refused`]), so a release the platform dies at is refused, logged, and the close goes
-    /// on, and the objects before their CPU copies; one a message's view still needs goes when
-    /// that message ends ([`tables`]). The context's failure ([`FailedContexts`]) is forgotten
-    /// with it.
+    /// Drops every object of context `context` ([`Self::close_tables`]), letting go of them here
+    /// ([`Closed::let_go`]): how many objects were dropped.
     pub(crate) fn drop_context(&self, context: u32) -> usize {
+        let (dropped, closed) = self.close_tables(context);
+        closed.let_go();
+        dropped
+    }
+
+    /// Takes every object of context `context` out of the decoder's tables and names: those whose
+    /// id lies in its range, `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next
+    /// context's (its process closed the device or died), its chunks of the texture resource ids,
+    /// its surfaces' names, its libraries and its pages blocks' views, its queues ended first. How
+    /// many objects it held, and what it took out, for the caller to let go of ([`Closed`]). The
+    /// context's failure ([`FailedContexts`]) is forgotten with it.
+    pub(crate) fn close_tables(&self, context: u32) -> (usize, Closed<P>) {
         for holder in self.shared.id_chunks.lock().iter_mut() {
             if *holder == Some(context) {
                 *holder = None;
@@ -1634,6 +1644,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         self.shared.failed.forget(context);
         let mut dropped = 0;
+        let mut objects = Vec::new();
         let queues = self.shared.surface_order.lock().queues_of(context);
         if let Some(state) = self.context_state(context) {
             let (removed, count) = state.remove_all();
@@ -1649,43 +1660,45 @@ impl<P: Platform> GraphicsDecoder<P> {
                 });
                 self.queue_ended(queue, handle);
             }
-            let mut copies = Vec::new();
-            for r in removed {
-                let id = r.id();
-                let entry = r.into_entry();
-                let Entry {
-                    managed, handle, ..
-                } = entry;
-                drop_refused(id, handle);
-                if let Some(copy) = managed {
-                    copies.push((id, copy));
-                }
-            }
-            for (id, copy) in copies {
-                drop_refused(id, copy);
-            }
+            objects = removed;
         }
         self.forget_context_surfaces(context);
         // Let go of with no lock held: a view may hold the last of an import of the guest's
         // pages, which the platform may take long to let go of, and every context's surface
         // pages take the views' lock.
         let views = self.shared.surface_views.lock().context_closed(context);
-        if !views.is_empty()
-            && let Err(refusal) = refusals::refusing(move || drop(views))
-        {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "context {context}'s pages blocks' views were let go of at its close, and a \
-                 release was refused: {refusal}"
-            );
-        }
         let libraries = self.shared.libraries.lock().ids_of(context);
         for id in libraries {
             if let Err(refusal) = refusals::refusing(|| self.forget_library(id)) {
                 refused_release(id, &refusal);
             }
         }
-        dropped
+        let closed = Closed {
+            context,
+            objects,
+            views,
+        };
+        (dropped, closed)
+    }
+
+    /// Lets go of `closed` on the close worker, then of `drain`, its close's: the close's answer,
+    /// which the drain gives once its command buffers have finished too, comes once its objects
+    /// are let go of, as the kext gives the context's texture resource ids and GPU addresses out
+    /// again at the answer.
+    pub(crate) fn let_go_later(&self, closed: Closed<P>, drain: Arc<Drain>) {
+        self.shared.close_worker.submit(
+            u64::from(closed.context),
+            Box::new(move || {
+                closed.let_go();
+                drop(drain);
+            }),
+        );
+    }
+
+    /// Waits for the closes handed to the close worker before this to have let go of their
+    /// objects ([`Self::let_go_later`]).
+    pub(crate) fn closes_let_go(&self) {
+        self.shared.close_worker.flush();
     }
 
     /// The device's reset (`reims_graphics::Host::device_reset`): every context's objects dropped
@@ -3560,6 +3573,53 @@ fn bad_reference() -> Raise {
 /// [`bad_reference`], it faults the exec rather than reporting a [`DecodeError`].
 pub(crate) fn op_fault(detail: impl std::fmt::Display) -> Raise {
     Raise::foreign("rgfx.decode.op").with_detail(detail)
+}
+
+/// What a close took out of its context's tables, to let go of
+/// ([`GraphicsDecoder::close_tables`]).
+pub(crate) struct Closed<P: Platform> {
+    context: u32,
+    /// Its objects.
+    objects: Vec<tables::Removed<P>>,
+    /// Its pages blocks' views ([`surface_pages`]).
+    views: Vec<surface_pages::Private<P>>,
+}
+
+impl<P: Platform> Closed<P> {
+    /// Lets go of every object, then of their CPU copies, then of the views, each in a refusal
+    /// scope of its own ([`drop_refused`]), so a release the platform dies at is refused, logged,
+    /// and the rest go on. An object a message's view still needs goes when that message ends
+    /// ([`tables`]).
+    pub(crate) fn let_go(self) {
+        let Closed {
+            context,
+            objects,
+            views,
+        } = self;
+        let mut copies = Vec::new();
+        for r in objects {
+            let id = r.id();
+            let Entry {
+                managed, handle, ..
+            } = r.into_entry();
+            drop_refused(id, handle);
+            if let Some(copy) = managed {
+                copies.push((id, copy));
+            }
+        }
+        for (id, copy) in copies {
+            drop_refused(id, copy);
+        }
+        if !views.is_empty()
+            && let Err(refusal) = refusals::refusing(move || drop(views))
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "context {context}'s pages blocks' views were let go of at its close, and a \
+                 release was refused: {refusal}"
+            );
+        }
+    }
 }
 
 /// Lets go of `value`, what the decoder held for object `id`, in a refusal scope

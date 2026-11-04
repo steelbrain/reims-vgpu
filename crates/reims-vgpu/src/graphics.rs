@@ -732,33 +732,33 @@ impl<P: Platform> Drop for DrawnPresents<P> {
 }
 
 impl<P: ApiPlatform> GraphicsControl<P> {
-    /// Drops every object of context `context` (its process closed the device or died), and the
-    /// surfaces' entries whose objects went with them, then gives `answer` once every command
-    /// buffer of the context the decoder committed has finished: the kext then gives the
-    /// context's blocks out again.
+    /// Takes every object of context `context` (its process closed the device or died) out of
+    /// the decoder's tables, with the surfaces' entries whose objects went with them, and lets go
+    /// of them on the decoder's close worker, so the context's lane is done with the close, and
+    /// the jobs of other lanes that wait for it go on, while the platform lets them go. `answer`
+    /// is given once they are let go of and every command buffer of the context the decoder
+    /// committed has finished: the kext then gives the context's blocks, texture resource ids and
+    /// GPU addresses out again.
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
         // After its no-copy buffers being made, so none lands in the table its close empties.
         self.pages_buffers.wait(pages_context(context));
         entry::run(|_| {
-            let (dropped, drain) = {
-                let decoder = self.decoder();
-                // Its compiles first, so none stores a pipeline in the table its close empties.
-                self.pending.cancel_context(context);
-                let dropped = decoder.drop_context(context);
-                self.pool.context_closed(context);
-                self.presents.context_gone(context);
-                let drain = decoder.drain_context(
-                    context,
-                    true,
-                    Box::new(move || answer.answer(RGFX_STATUS_OK)),
-                );
-                (dropped, drain)
-            };
+            let decoder = self.decoder();
+            // Its compiles first, so none stores a pipeline in the table its close empties.
+            self.pending.cancel_context(context);
+            let (dropped, closed) = decoder.close_tables(context);
+            self.pool.context_closed(context);
+            self.presents.context_gone(context);
+            let drain = decoder.drain_context(
+                context,
+                true,
+                Box::new(move || answer.answer(RGFX_STATUS_OK)),
+            );
+            decoder.let_go_later(closed, drain);
             log::info!(
                 target: "reims_vgpu::graphics",
                 "context {context} closed: {dropped} objects dropped"
             );
-            drop(drain);
         });
     }
 
@@ -776,7 +776,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.decoders.resetting();
                 let _alone = self.reset_gate.write();
                 self.pending.reset();
-                let (contexts, dropped) = self.decoder().reset();
+                let decoder = self.decoder();
+                // After the closes before it let go of their objects, as the guest's next creates
+                // may take the texture resource ids and GPU addresses they held.
+                decoder.closes_let_go();
+                let (contexts, dropped) = decoder.reset();
                 for &context in &contexts {
                     self.pool.context_closed(context);
                 }
