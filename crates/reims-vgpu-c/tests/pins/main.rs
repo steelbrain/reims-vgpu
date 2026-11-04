@@ -17,14 +17,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The directory holding this crate's `libreims_vgpu_c.dylib` (this test binary's own).
-fn deps_dir() -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
+#[path = "../support/cdylib.rs"]
+mod cdylib;
 
 /// The crate's directory, which cargo and nextest give a test process: read at run time, so the
 /// test is the same binary in every worktree (docs/development.md, "Building through kache").
@@ -39,13 +33,13 @@ const RECORD: &str = "RVG_PINS_RECORD";
 
 /// Builds `api_pins.c` against this crate's dylib and runs it: its standard output.
 fn run_pins() -> String {
-    let dylib = deps_dir().join("libreims_vgpu_c.dylib");
+    let dylib = cdylib::dir().join(cdylib::file_name());
     assert!(dylib.exists(), "{} is missing", dylib.display());
     let dir = std::env::temp_dir().join(format!("rvg-api-pins-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("api_pins");
-    let deps = deps_dir();
+    let deps = cdylib::dir();
     let cc = Command::new("cc")
         .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "-I"])
         .arg(crate_dir().join("include"))

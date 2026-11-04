@@ -13,7 +13,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
-use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -206,20 +205,14 @@ fn every_export_runs_its_body_inside_ffi_export() {
     assert_eq!(exports, header_functions(&header));
 }
 
-/// The directory holding this crate's dynamic library (this test binary's own).
-fn deps_dir() -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
+#[path = "support/cdylib.rs"]
+mod cdylib;
 
 /// The dylib exports every function the header declares, and no other `rvg_` function: its
 /// defined external symbols, which carry a leading `_` on macOS and none on Linux
 #[test]
 fn the_dylib_exports_every_header_function() {
-    let dylib = deps_dir().join(format!("{DLL_PREFIX}reims_vgpu_c{DLL_SUFFIX}"));
+    let dylib = cdylib::dir().join(cdylib::file_name());
     assert!(dylib.exists(), "{} is missing", dylib.display());
     let out = Command::new("nm").arg("-gU").arg(&dylib).output().unwrap();
     assert!(out.status.success(), "nm: {out:?}");

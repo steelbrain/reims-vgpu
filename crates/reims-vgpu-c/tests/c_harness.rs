@@ -4,19 +4,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The directory holding this crate's dynamic library (this test binary's own).
-fn deps_dir() -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
+#[path = "support/cdylib.rs"]
+mod cdylib;
 
 /// The crate's directory, which cargo and nextest give a test process: read at run time, so the
 /// test is the same binary in every worktree (docs/development.md, "Building through kache").
@@ -28,7 +21,7 @@ fn crate_dir() -> PathBuf {
 
 /// Compiles `source` into `out`; panics with the compiler's output.
 fn compile(source: &Path, out: &Path) {
-    let deps = deps_dir();
+    let deps = cdylib::dir();
     let status = Command::new("cc")
         .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"])
         .arg("-I")
@@ -63,7 +56,7 @@ impl Drop for Harness {
 }
 
 fn harness(name: &str) -> Harness {
-    let dylib = deps_dir().join(format!("{DLL_PREFIX}reims_vgpu_c{DLL_SUFFIX}"));
+    let dylib = cdylib::dir().join(cdylib::file_name());
     assert!(dylib.exists(), "{} is missing", dylib.display());
     let dir = std::env::temp_dir().join(format!("rvg-api-harness-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
