@@ -22,6 +22,11 @@
 //               the texture into a Shared buffer, committed and waited; base_us, that command buffer
 //               with no call before it; ok, the copies that read the bytes replaced.
 //   srr.SHAPE       as rr.SHAPE, of a Shared texture.
+//   mk.SHAPE        a new Managed texture, as WindowServer makes one in place of a linear texture a
+//               device refused: make_us (newTextureWithDescriptor:), free_us (its release), and
+//               first_us, a new texture, a replaceRegion: of all of it and a command buffer that
+//               blits it into a Shared buffer, committed and waited, against base_us, that command
+//               buffer over a texture made before; checked.
 //   burst.SHAPE     BURST replaceRegion: calls, each on a Managed texture of a pool of BURST, then
 //               one command buffer that blits every one into a Shared buffer, waited: calls_us (the
 //               calls), burst_us (the calls, the commit and the wait), base_us (that command buffer
@@ -316,6 +321,63 @@ static NSString *replaceCase(const Shape *s, MTLStorageMode storage)
 	                                         st("call", &call), st("spaced", &spaced), st("e2e", &e2e),
 	                                         st("base", &base), checked - bad, checked];
 	drop(&call), drop(&spaced), drop(&e2e), drop(&base);
+	return bad ? [@"FAIL " stringByAppendingString:r] : r;
+}
+
+// A new Managed texture: made, freed, and made, filled and read (mk.SHAPE).
+static NSString *makeCase(const Shape *s)
+{
+	const NSUInteger row = s->w * s->bpp, bytes = row * s->h;
+	MTLTextureDescriptor *d = managedDesc(s);
+	id<MTLBuffer> out = [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+	uint8_t *src = malloc(bytes);
+	const MTLRegion all = MTLRegionMake2D(0, 0, s->w, s->h);
+	Samples make = {0}, freed = {0}, first = {0}, base = {0};
+	int bad = 0, checked = 0;
+	for (int i = -4; i < gOps; i++) {
+		double t0 = 0, t1 = 0;
+		@autoreleasepool {
+			t0 = now();
+			id<MTLTexture> t = [gDevice newTextureWithDescriptor:d];
+			t1 = now();
+			if (t == nil)
+				[NSException raise:@"upload" format:@"no Managed texture of %s", s->name];
+			t0 = t1 - t0;
+			t1 = now();
+			t = nil;
+		}
+		const double t2 = now();
+		if (i >= 0) {
+			add(&make, t0);
+			add(&freed, t2 - t1);
+		}
+	}
+	const int n = gOps < 100 ? gOps : 100;
+	id<MTLTexture> held = managedTexture(s);
+	for (int i = -2; i < n; i++) {
+		const uint8_t v = (uint8_t)(i * 17 + 3);
+		memset(src, v, bytes);
+		double e = 0;
+		@autoreleasepool {
+			const double t0 = now();
+			id<MTLTexture> t = [gDevice newTextureWithDescriptor:d];
+			[t replaceRegion:all mipmapLevel:0 withBytes:src bytesPerRow:row];
+			blitAll(@[ t ], s, out);
+			e = now() - t0;
+		}
+		checked++;
+		bad += !holds(out.contents, bytes, v);
+		const double b = blitAll(@[ held ], s, out);
+		if (i >= 0) {
+			add(&first, e);
+			add(&base, b);
+		}
+	}
+	free(src);
+	NSString *r = [NSString stringWithFormat:@"bytes=%lu %@ %@ %@ %@ ok=%d/%d", (unsigned long)bytes,
+	                                         st("make", &make), st("free", &freed), st("first", &first),
+	                                         st("base", &base), checked - bad, checked];
+	drop(&make), drop(&freed), drop(&first), drop(&base);
 	return bad ? [@"FAIL " stringByAppendingString:r] : r;
 }
 
@@ -630,6 +692,12 @@ int main(int argc, char **argv)
 			const Shape *s = &kShapes[i];
 			runCase([NSString stringWithFormat:@"rr.%s", s->name], ^{
 				return replaceCase(s, MTLStorageModeManaged);
+			});
+		}
+		for (size_t i = 0; i < nShapes; i++) {
+			const Shape *s = &kShapes[i];
+			runCase([NSString stringWithFormat:@"mk.%s", s->name], ^{
+				return makeCase(s);
 			});
 		}
 		for (size_t i = 0; i < nShapes; i++) {
