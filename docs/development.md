@@ -117,9 +117,9 @@ cargo xtask smoke          # a guest linked with the library as QEMU links it (m
 
 `cargo xtask check` tests with every feature but `reims-vgpu-c/vulkan`, which puts the C API on the
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
-and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run in the
-environment it was started in, incremental as cargo's dev and test profiles are, so a check run
-again after a fix rebuilds what the fix changed.
+and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run
+in the environment it was started in, incremental as cargo's dev and test profiles are, so a check
+run again after a fix rebuilds what the fix changed.
 
 #### Building through kache
 
@@ -150,6 +150,15 @@ and kache neither stores nor restores it for up to eight builds, each within 15 
 last. A compile error keeps the state. A worktree's first incremental compile of a unit imports
 compatible finished incremental state from another worktree's build of it on the host, as clones,
 so a new worktree's edits start warm (rustc 1.98 or later; read from kache 2.0.0's documentation).
+
+kache seeds only between target directories inside their worktrees, cargo's default `target/` with
+no `CARGO_TARGET_DIR`. It maps the compiler's working directory, the worktree's root, to one path
+(`-Zremap-cwd-prefix=/src`), and a target directory elsewhere puts a path of its own in the
+compiler's arguments, so each target's state is compatible with no other's. Measured on the M3 Max
+on 2026-11-03, the first edit of `reims-vgpu-core` after a build of the tree: with targets inside
+the worktrees, a second worktree's compile seeded from the first's state took 4.3 s, against 7.0 s
+for the first worktree's, which had no donor; with each target in a directory of its own under
+`~/.cache`, the two units' seed identities differed and the second took 5.7 s, against 6.0 s.
 
 A unit is shared between worktrees when nothing it is built from names the worktree's path, and a
 build script's run when nothing it writes does. So the tests find the tree at run time: they read

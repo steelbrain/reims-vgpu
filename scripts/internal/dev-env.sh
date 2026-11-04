@@ -1,5 +1,5 @@
-# The environment a developer's builds run in. Source it from the worktree's root, with the
-# worktree's own CARGO_TARGET_DIR, before each cargo command:
+# The environment a developer's builds run in. Source it from the worktree's root, which builds in
+# its own target/ (no CARGO_TARGET_DIR), before each cargo command:
 #
 #   . scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-core
 #

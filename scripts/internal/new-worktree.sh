@@ -1,7 +1,7 @@
 #!/bin/bash
 # A new worktree whose large tracked files are APFS clones of the main checkout's, so git writes
-# only the files that differ. Its builds run with its own CARGO_TARGET_DIR and the environment of
-# scripts/internal/dev-env.sh, which builds through kache where it is installed
+# only the files that differ. Its builds run in its own target/ (no CARGO_TARGET_DIR), in the
+# environment of scripts/internal/dev-env.sh, which builds through kache where it is installed
 # (docs/development.md).
 #
 #   scripts/internal/new-worktree.sh PATH BRANCH [START]

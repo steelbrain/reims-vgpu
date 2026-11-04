@@ -225,20 +225,23 @@ The suite's inputs:
     `git worktree add`. It clones the main checkout's `tests/suite`, 257 of
     the tree's 278 MiB, and git writes only the files that differ from
     START.
-- **Each worktree has its own `CARGO_TARGET_DIR`** under `~/.cache`: cargo
-  can run another tree's `xtask` from a shared one
-  ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
+- **Each worktree builds in its own `target/`**, cargo's default, with no
+  `CARGO_TARGET_DIR`; the worktree itself lives under `~/.cache`. A target
+  shared between trees runs another tree's `xtask`
+  ([docs/lessons.md](docs/lessons.md)), and kache seeds a worktree's
+  incremental state only from targets inside their worktrees
+  ([docs/development.md](docs/development.md)). Caches never go under
+  `/tmp`.
   - Build there in the environment of `scripts/internal/dev-env.sh`, sourced
     from the worktree's root before each cargo command
     (`. scripts/internal/dev-env.sh && cargo ...`): incremental, as the
     check builds, and, where `kache` (2.0.0 or later) is installed, rustc
     and build scripts through kache, a compiler cache local to the host,
     which keeps an edited unit's incremental state and seeds a new
-    worktree's from another's. A new
-    worktree's first build then compiles only what no tree on the host built
-    before (measured: `cargo xtask check`'s tests built in a second worktree
-    in 1.5 s on a Ryzen 7 7840HS and 9.5 s on the M3 Max, after a first had
-    built them).
+    worktree's from another's. A new worktree's first build then compiles
+    only what no tree on the host built before (measured: `cargo xtask
+    check`'s tests built in a second worktree in 1.5 s on a Ryzen 7 7840HS
+    and 9.5 s on the M3 Max, after a first had built them).
   - Start the target directory empty. Never build through kache in a target
     copied from a build without it: every workspace crate misses
     ([docs/lessons.md](docs/lessons.md)).
