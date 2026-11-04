@@ -24,6 +24,8 @@
 //! element's reference, and pass the encode a local `Vec` of the decoder's handles,
 //! borrowed for the op.
 
+use std::cell::Cell;
+
 // The render-op tags and body structs (`Rgfx*`): the whole render group, so a glob
 // (as the Metal platform's command impl globs `platform::render`).
 use reims_graphics::ops::render::*;
@@ -169,11 +171,14 @@ fn resolve_heaps<'a, P: Platform>(
 }
 
 /// What the render ops' checks read of the open encoder's pass, which its
-/// `ENCODER_BEGIN_RENDER` describes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `ENCODER_BEGIN_RENDER` describes, and what they keep of the ops before them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PassFacts {
     /// The length of the pass's visibility result buffer, `None` where it has none.
     pub(crate) visibility_length: Option<u64>,
+    /// The offset of the last `Counting` or `Boolean` visibility result mode the pass's ops set,
+    /// `None` before one ([`visibility_offset`]).
+    pub(crate) result_offset: Cell<Option<u64>>,
 }
 
 /// The bytes of one visibility result.
@@ -197,6 +202,25 @@ fn visibility_refused(pass: &PassFacts, mode: u64, offset: u64) -> Option<&'stat
             .is_none_or(|end| end > length)
             .then_some("a visibility result offset whose 8 bytes run past the buffer's end"),
     }
+}
+
+/// The offset `setVisibilityResultMode:offset:` of `mode` at `offset` is sent at, in the pass
+/// `pass` describes, which keeps it: a `Counting` or `Boolean` mode's own, and a `Disabled` one's
+/// own until the pass's ops set one of those, then the offset of the last such one. Once a mode
+/// was set in an encoder, draws under `Disabled` at offsets no mode was set at make the M3 Max
+/// under macOS 27 write 0 at the last of them, and at an offset a mode was set at it leaves the
+/// result there as it was (measured: 0 at 8 after `Counting` at 0, and at 24 after `Disabled` at
+/// 0 then at 24); the AMD Radeon Pro 5300M and the Intel UHD 630 under macOS 26.7.1, and
+/// metal2vulkan's runtime, write nothing at either (measured). So a draw under `Disabled` writes
+/// nothing on any host: that of a parallel pass's later sub-encoder among them, which the bundle
+/// starts at `Disabled` at 0 where the one before set a mode, and whose draws write nothing on
+/// any Mac.
+fn visibility_offset(pass: &PassFacts, mode: u64, offset: u64) -> u64 {
+    if mode != 0 {
+        pass.result_offset.set(Some(offset));
+        return offset;
+    }
+    pass.result_offset.get().unwrap_or(offset)
 }
 
 /// Decodes one render-encoder op: `tag` its op, `payload` its body (the bytes
@@ -711,7 +735,7 @@ pub(crate) fn decode_op<P: Platform>(
                 on,
                 RenderCmd::SetVisibilityResultMode {
                     mode: m.mode,
-                    offset: m.offset,
+                    offset: visibility_offset(pass, m.mode, m.offset),
                 },
             )?;
         }
@@ -1413,14 +1437,17 @@ mod tests {
     const ON: OnFault = OnFault::Return;
 
     /// A pass without a visibility result buffer.
-    const NO_PASS: PassFacts = PassFacts {
-        visibility_length: None,
-    };
+    fn no_pass() -> PassFacts {
+        PassFacts::default()
+    }
 
-    /// A pass whose visibility result buffer holds two results.
-    const TWO_RESULTS: PassFacts = PassFacts {
-        visibility_length: Some(16),
-    };
+    /// A pass whose visibility result buffer holds `n` results.
+    fn results(n: u64) -> PassFacts {
+        PassFacts {
+            visibility_length: Some(n * VISIBILITY_RESULT_BYTES),
+            ..PassFacts::default()
+        }
+    }
 
     type Fp = FakePlatform;
 
@@ -2415,7 +2442,7 @@ mod tests {
         let mut expected = Vec::new();
         for (tag, body, sel) in &entries {
             assert!(
-                decode_op(*tag, body, &dec, &enc, &TWO_RESULTS, ON).unwrap(),
+                decode_op(*tag, body, &dec, &enc, &results(2), ON).unwrap(),
                 "op {tag:#06x} ({sel}) was not handled",
             );
             expected.push(*sel);
@@ -2460,7 +2487,7 @@ mod tests {
                 &body,
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .unwrap()
@@ -2520,7 +2547,7 @@ mod tests {
                 &body,
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .unwrap()
@@ -2565,17 +2592,43 @@ mod tests {
             sent
         };
         for mode in [1, 2] {
-            assert!(set(&TWO_RESULTS, mode, 0));
-            assert!(set(&TWO_RESULTS, mode, 8));
-            assert!(!set(&TWO_RESULTS, mode, 9));
-            assert!(!set(&TWO_RESULTS, mode, 16));
-            assert!(!set(&TWO_RESULTS, mode, u64::MAX - 3));
-            assert!(!set(&NO_PASS, mode, 0));
+            assert!(set(&results(2), mode, 0));
+            assert!(set(&results(2), mode, 8));
+            assert!(!set(&results(2), mode, 9));
+            assert!(!set(&results(2), mode, 16));
+            assert!(!set(&results(2), mode, u64::MAX - 3));
+            assert!(!set(&no_pass(), mode, 0));
         }
         for offset in [0, 16, u64::MAX] {
-            assert!(set(&TWO_RESULTS, 0, offset));
-            assert!(set(&NO_PASS, 0, offset));
+            assert!(set(&results(2), 0, offset));
+            assert!(set(&no_pass(), 0, offset));
         }
+    }
+
+    /// `Disabled` is sent at its own offset until the pass's ops set `Counting` or `Boolean`, then
+    /// at the offset of the last of those, where a draw under it writes nothing on any host
+    /// ([`visibility_offset`]); `Counting` and `Boolean` at their own
+    #[test]
+    fn a_disabled_mode_after_a_counted_one_is_sent_at_its_offset() {
+        let (p, dec) = setup();
+        let (_cb, enc) = encoder(&p);
+        let pass = results(4);
+        let sent: Vec<(u64, u64)> = [(0, 24), (1, 8), (0, 0), (2, 16), (0, 24), (0, 0)]
+            .into_iter()
+            .map(|(mode, offset)| {
+                let mark = p.call_log().mark();
+                let body = RgfxOpSetVisibilityResultMode { mode, offset };
+                let tag = RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE;
+                assert!(decode_op(tag, body.as_bytes(), &dec, &enc, &pass, ON).unwrap());
+                let calls = p.call_log().since(mark);
+                assert_eq!(calls.len(), 1);
+                match calls[0].args[..] {
+                    [Arg::U64(mode), Arg::U64(offset)] => (mode, offset),
+                    ref args => panic!("{args:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(sent, [(0, 24), (1, 8), (0, 8), (2, 16), (0, 16), (0, 16)]);
     }
 
     /// A body too short for its op faults the exec, and no command is sent.
@@ -2592,7 +2645,7 @@ mod tests {
                 &short,
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .is_err()
@@ -2616,7 +2669,7 @@ mod tests {
                 &claims_two,
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .is_err()
@@ -2642,7 +2695,7 @@ mod tests {
                 indirect.as_bytes(),
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON,
             )
             .is_err()
@@ -2658,7 +2711,7 @@ mod tests {
                 fence.as_bytes(),
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .is_err()
@@ -2680,7 +2733,7 @@ mod tests {
                 &bad_res,
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .is_err()
@@ -2702,7 +2755,7 @@ mod tests {
                 &bad_kind,
                 &dec,
                 &enc,
-                &NO_PASS,
+                &no_pass(),
                 ON
             )
             .is_err()
@@ -2714,6 +2767,6 @@ mod tests {
     fn an_unknown_tag_is_not_handled() {
         let (p, dec) = setup();
         let (_cb, enc) = encoder(&p);
-        assert!(!decode_op(0x1fff, &[], &dec, &enc, &NO_PASS, ON).unwrap());
+        assert!(!decode_op(0x1fff, &[], &dec, &enc, &no_pass(), ON).unwrap());
     }
 }

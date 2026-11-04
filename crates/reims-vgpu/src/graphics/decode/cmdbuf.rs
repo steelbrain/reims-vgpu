@@ -4204,6 +4204,194 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 0x5a));
     }
 
+    /// Through the decoder on `P`: a pass over a 64-pixel square target with a visibility result
+    /// buffer of four words, each of 0xee bytes, whose ops are those of a parallel pass of two
+    /// sub-encoders as the bundle joins them, each drawing a square over the target: the first
+    /// counts its draw at 16, the second starts at `Disabled` at 0, as the bundle starts a
+    /// sub-encoder after one that set a mode, and draws; then `Disabled` at 24 and a draw. The
+    /// buffer's words once the command buffer finished.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
+    fn sub_encoders_after_a_count<P: crate::platform::ApiPlatform>() -> [u64; 4] {
+        use std::time::{Duration, Instant};
+
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::values::{RenderPipelineDesc, TextureDesc};
+
+        use super::super::draw_cost::fixture;
+        const SIDE: u64 = 64;
+        const BGRA8: u64 = 80;
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&completed);
+        dec.set_completion_sink(Arc::new(move |m| sink.lock().push(m.cb_obj_id)));
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        // The results, the square's corners and its colour.
+        for (obj_id, length) in [(10, 32), (11, 64), (12, 16)] {
+            let buffer = RgfxBufferCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_BUFFER_CREATE,
+                    size: size_of::<RgfxBufferCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                length,
+                ..RgfxBufferCreate::default()
+            };
+            assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        }
+        let fill = |obj_id: u64, bytes: &[u8]| {
+            let Some(ObjHandle::Buffer(b)) = dec.object(obj_id) else {
+                panic!("no buffer {obj_id}");
+            };
+            // SAFETY: a Shared buffer at least `bytes.len()` long, which no command uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    b.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                );
+            }
+        };
+        fill(10, &[0xee; 32]);
+        let corners: [[f32; 4]; 4] = [
+            [-1.0, -1.0, 0.5, 1.0],
+            [1.0, -1.0, 0.5, 1.0],
+            [-1.0, 1.0, 0.5, 1.0],
+            [1.0, 1.0, 0.5, 1.0],
+        ];
+        fill(11, corners.as_bytes());
+        fill(12, [1.0f32, 0.0, 0.0, 1.0].as_bytes());
+        let target = platform.texture_descriptor(&TextureDesc {
+            pixel_format: BGRA8,
+            width: SIDE,
+            height: SIDE,
+            usage: 1 | 4, // ShaderRead | RenderTarget
+            ..TextureDesc::default()
+        });
+        let target = device.new_texture(OnFault::Die, &target).unwrap().unwrap();
+        assert_eq!(dec.insert(4, ObjHandle::Texture(target)).unwrap(), Ok(()));
+        let pipeline = device
+            .new_render_pipeline_state(&RenderPipelineDesc {
+                label: None,
+                vertex: &fixture::<P>(&device, "render_vbuf"),
+                fragment: &fixture::<P>(&device, "render_color"),
+                color0_pixel_format: BGRA8,
+                blend_over: false,
+                resource_index: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dec.insert(5, ObjHandle::RenderPipeline(pipeline)).unwrap(),
+            Ok(())
+        );
+
+        let pass = RgfxRenderPassDesc {
+            color_count: 1,
+            flags: RGFX_PASS_FLAG_VISIBILITY_RESULT,
+            ..RgfxRenderPassDesc::default()
+        };
+        let color = RgfxRenderPassColorAttachment {
+            texture_obj_id: 4,
+            load_action: 2,  // Clear
+            store_action: 1, // Store
+            ..RgfxRenderPassColorAttachment::default()
+        };
+        let visibility = RgfxRenderPassVisibility {
+            buffer_obj_id: 10,
+            result_type: 0,
+            reserved_0c: 0,
+        };
+        let mut begin = pass.as_bytes().to_vec();
+        begin.extend_from_slice(color.as_bytes());
+        begin.extend_from_slice(visibility.as_bytes());
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin);
+        ops.extend(op(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RgfxOpSetRenderPipelineState { pipeline_obj_id: 5 }.as_bytes(),
+        ));
+        for (buffer_obj_id, index) in [(11, 0), (12, 1)] {
+            let bind = RgfxOpSetVertexBuffer {
+                buffer_obj_id,
+                offset: 0,
+                index,
+            };
+            ops.extend(op(RGFX_OP_RENDER_SET_VERTEX_BUFFER, bind.as_bytes()));
+        }
+        let draw = RgfxOpDrawPrimitives {
+            primitive_type: 4, // TriangleStrip
+            vertex_start: 0,
+            vertex_count: 4,
+        };
+        for (mode, offset) in [(2, 16), (0, 0), (0, 24)] {
+            let set = RgfxOpSetVisibilityResultMode { mode, offset };
+            ops.extend(op(
+                RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE,
+                set.as_bytes(),
+            ));
+            ops.extend(op(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()));
+        }
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert_eq!(
+            dec.decode(&device, &command_buffer_on(1, 20, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let start = Instant::now();
+        while !completed.lock().contains(&20) {
+            assert!(start.elapsed() < Duration::from_secs(10), "never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let Some(ObjHandle::Buffer(results)) = dec.object(10) else {
+            panic!("no buffer 10");
+        };
+        // SAFETY: a Shared buffer of 4 words, read after the command buffer that wrote it finished.
+        let words = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u64>(), 4) };
+        [words[0], words[1], words[2], words[3]]
+    }
+
+    /// On Metal, the sub-encoders' draws under `Disabled` write nothing, as every Mac's do: the
+    /// count at 16 is the square's 4096 samples, and the words at 0 and 24 keep their bytes. Sent
+    /// at those offsets, `Disabled` makes the M3 Max write 0 at 24 (measured), which
+    /// [`render::visibility_offset`] keeps it from.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_sub_encoders_after_a_count_write_nothing_under_disabled() {
+        let fill = u64::from_ne_bytes([0xee; 8]);
+        assert_eq!(
+            sub_encoders_after_a_count::<reims_vgpu_metal::MetalPlatform>(),
+            [fill, fill, 4096, fill]
+        );
+    }
+
+    /// The same on the Vulkan platform, whose runtime writes nothing under `Disabled` at any
+    /// offset.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_sub_encoders_after_a_count_write_nothing_under_disabled() {
+        let fill = u64::from_ne_bytes([0xee; 8]);
+        assert_eq!(
+            sub_encoders_after_a_count::<reims_vgpu_vulkan::VulkanPlatform>(),
+            [fill, fill, 4096, fill]
+        );
+    }
+
     /// A `BUFFER_CREATE` of `length` bytes, id `obj_id`, at `gpu_address` (0: where the host
     /// places it).
     #[cfg(feature = "vulkan")]
@@ -4525,8 +4713,9 @@ mod tests {
     }
 
     /// A pass over a visibility result buffer sends each mode and offset the guest sets, in both
-    /// modes, through to `Disabled`, with each draw between them, the last 8 bytes of the buffer
-    /// among them; a mode at an offset whose 8 bytes run past the buffer's end is refused at
+    /// modes, with each draw between them, the last 8 bytes of the buffer among them, through to
+    /// `Disabled`, sent at the last of their offsets ([`render::visibility_offset`]); a mode at an
+    /// offset whose 8 bytes run past the buffer's end is refused at
     /// its op and fails the command buffer, and so is a mode in a pass with no buffer, where
     /// plain Metal's process ends. `Disabled` is taken at any offset, with a buffer or none.
     #[test]
@@ -4575,7 +4764,7 @@ mod tests {
         let mark = p.call_log().mark();
         let message = command_buffer_message(110, 1, &pass(&modes, Some(6)));
         assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
-        let want: Vec<Vec<Arg>> = modes
+        let want: Vec<Vec<Arg>> = [(2, 0), (1, 8), (0, 8)]
             .iter()
             .map(|&(m, o)| vec![Arg::U64(m), Arg::U64(o)])
             .collect();
