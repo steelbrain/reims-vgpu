@@ -52,10 +52,11 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
 }
 
 /// A hold of a video session, the object table's or an open video encoder's. Its drop lets go of
-/// the session on the decoder's video worker (`reims-vgpu.graphics-video`), so the last hold's
-/// drop, which ends the session, runs on neither ring 0's threads nor a queue's walk, whichever
-/// lets go last: the session's `OBJECT_DESTROY` or the end of the walk of a command buffer that
-/// still had it open. A session's end waits for its last decode's signal and lets go of its
+/// the session on the decoder's video worker (`reims-vgpu.graphics-video-<i>`), under the
+/// session's id, so one session's holds are let go of in the order they drop and different
+/// sessions' beside each other, and the last hold's drop, which ends the session, runs on neither
+/// ring 0's threads nor a queue's walk, whichever lets go last: the session's `OBJECT_DESTROY` or
+/// the end of the walk of a command buffer that still had it open. A session's end waits for its last decode's signal and lets go of its
 /// pictures' memory and the hardware's session: the device's own memory, none of it the guest's.
 /// Measured on the RTX 5080 Laptop GPU host: in a guest's boot, a session whose pictures each had
 /// a bitstream buffer of their own ended in 7.0 to 10.1 ms, its last signal landed or 1.6 ms from
@@ -99,7 +100,7 @@ impl<P: Platform> Drop for SessionHold<P> {
     fn drop(&mut self) {
         // SAFETY: the drop runs once, and nothing reads the session after it.
         let session = unsafe { ManuallyDrop::take(&mut self.session) };
-        self.worker.drop_later(self.id, session);
+        self.worker.drop_later(self.id, self.id, session);
     }
 }
 

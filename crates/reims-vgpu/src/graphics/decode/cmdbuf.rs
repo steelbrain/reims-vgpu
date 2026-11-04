@@ -2431,8 +2431,7 @@ mod tests {
         assert!(seen.ended_on.lock().is_empty());
         dec.video_worker().release();
         dec.video_worker().flush();
-        let worker = Some("reims-vgpu.graphics-video".to_owned());
-        assert_eq!(*seen.ended_on.lock(), [worker]);
+        assert_ended_on_the_video_worker(&seen);
     }
 
     /// An open video encoder's hold of its session, which a walk takes at `ENCODER_BEGIN_VIDEO`,
@@ -2452,8 +2451,22 @@ mod tests {
         assert!(seen.ended_on.lock().is_empty(), "the walk's hold keeps it");
         drop(hold);
         dec.video_worker().flush();
-        let worker = Some("reims-vgpu.graphics-video".to_owned());
-        assert_eq!(*seen.ended_on.lock(), [worker]);
+        assert_ended_on_the_video_worker(&seen);
+    }
+
+    /// One session ended, on a thread of the video worker's (`reims-vgpu.graphics-video-<i>`).
+    fn assert_ended_on_the_video_worker(seen: &VideoSeen) {
+        let ended = seen.ended_on.lock();
+        let on_worker = |thread: &Option<String>| {
+            thread
+                .as_deref()
+                .and_then(|name| name.strip_prefix("reims-vgpu.graphics-video-"))
+                .is_some_and(|i| i.parse::<usize>().is_ok())
+        };
+        assert!(
+            ended.len() == 1 && on_worker(&ended[0]),
+            "the session ended on {ended:?}"
+        );
     }
 
     /// A decode a fake host's video was handed: its session's codec, its access unit (offset,

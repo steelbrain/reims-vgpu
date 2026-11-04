@@ -608,7 +608,8 @@ pub(crate) struct Shared<P: Platform> {
     /// The thread a closed context's objects and views are let go of on, its close answered
     /// after them ([`GraphicsDecoder::let_go_later`]).
     close_worker: worker::Worker,
-    /// The thread video sessions are let go of on ([`video::SessionHold`]).
+    /// The threads video sessions are let go of on, each session's holds in their order
+    /// ([`video::SessionHold`]).
     video_worker: Arc<worker::Worker>,
     /// The device caches of the blocks the kext marked cached ([`surface_cache`]).
     surface_caches: Arc<Caches<P>>,
