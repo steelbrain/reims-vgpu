@@ -934,8 +934,19 @@ def compare(run, base, noise):
         shown = g or any(re.fullmatch(rx, name) for rx in SHOWN)
         if not shown:
             continue
-        clock = cur["metrics"].get("core_mhz.bench." + name[len("bench."):].rsplit(".", 1)[0]) if gpu_bound(name) else None
-        at = f"@{clock:.0f} MHz  " if clock is not None else ""
+        # A GPU-bound row's power state and core clock, and the baseline's: the driver drops a lightly
+        # loaded GPU to P8 (405 MHz) within seconds, where its numbers read up to 8x slower, so a row
+        # that moved with its clocks reads apart from one that moved with the code.
+        case = name[len("bench."):].rsplit(".", 1)[0]
+        clock = cur["metrics"].get("core_mhz.bench." + case) if gpu_bound(name) else None
+        ps = cur["metrics"].get("pstate.bench." + case)
+        bclock, bps = bm.get("core_mhz.bench." + case), bm.get("pstate.bench." + case)
+        at = ""
+        if clock is not None:
+            at = f"@{'' if ps is None else f'P{ps:.0f} '}{clock:.0f} MHz"
+            if bclock is not None:
+                at += f" (base {'' if bps is None else f'P{bps:.0f} '}{bclock:.0f})"
+            at += "  "
         if name not in bm:
             mark = "TAINTED, not compared" if tainted(cur["metrics"], name) else ""
             mlines.append(f"  {name:48s} {v:>12.6g}   (no baseline)  {at}{mark}".rstrip())
