@@ -215,7 +215,7 @@ kache on it:
 ```toml
 [cache]
 local_only = true                   # no remote storage, no planner: nothing leaves the host
-local_max_size = "60GiB"            # the store's ceiling, kept by kache (40GiB on Linux)
+local_max_size = "100GiB"           # the store's ceiling, kept by kache (40GiB on Linux)
 daemon_idle_timeout_secs = 1800     # the daemon exits when idle
 auto_clean_orphaned_targets = false # kache never removes or rewrites a target directory
 auto_share_target_files = false
