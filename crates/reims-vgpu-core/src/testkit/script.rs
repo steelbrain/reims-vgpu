@@ -120,7 +120,7 @@ impl HeldCall {
     }
 
     /// Holds the calling thread until the test lets the call go.
-    fn hold(&self) {
+    pub(crate) fn hold(&self) {
         let (lock, moved) = &*self.state;
         let mut s = lock.lock();
         s.0 = true;

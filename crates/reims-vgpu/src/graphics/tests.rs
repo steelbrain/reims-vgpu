@@ -6597,3 +6597,68 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
     let done = RgfxCbComplete::read_from_bytes(&done.expect("a CB_COMPLETE")).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
 }
+
+/// A shared block's `BLOCK_RELEASE` posted behind an earlier holder's `CONTEXT_CLOSE` is carried
+/// out once the close is, every object of the holder's let go of first, where the platform takes
+/// long over one (held here); so is every later message of the releasing context's, which its
+/// lane carries out behind the release. A compositor that releases a surface's block an app
+/// shared with it, right after the app quits, waits out the app's close so.
+#[test]
+fn a_shared_block_s_release_behind_a_holder_s_close_waits_for_the_close() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    guest.send(&device, block_share(1, BLOCK, SIZE, true));
+    guest.send(&device, block_share(2, BLOCK, SIZE, true));
+    assert_eq!(
+        sampler_answered(&device, &mut guest, obj(1, 4)),
+        RGFX_STATUS_OK
+    );
+    let world = platform.world();
+    let samplers = world.live("MTLSamplerState");
+    assert_eq!(samplers.len(), 1, "{samplers:?}");
+    let release = HeldCall::new();
+    world.hold_at_release(samplers[0], release.clone());
+
+    guest.send(&device, context_close(1));
+    let close = guest.seqno;
+    assert!(
+        release.reached(Duration::from_secs(2)),
+        "the close let go of the sampler"
+    );
+    guest.send(&device, block_release(2, BLOCK, SIZE));
+    let block = guest.seqno;
+    guest.send(&device, sampler_create(obj(2, 4)));
+    let later = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "answered while the holder's close let go of its objects"
+    );
+
+    release.open();
+    let mut answered: Vec<(u32, u64, u32)> = events(&mut guest, 3)
+        .into_iter()
+        .map(|(r#type, bytes)| match r#type {
+            RGFX_EVT_COMPLETE => {
+                let (seqno, status) = complete_of(&bytes);
+                (r#type, seqno, status)
+            }
+            _ => {
+                let state = RgfxSamplerState::read_from_bytes(&bytes).unwrap();
+                (r#type, state.header.seqno, state.status)
+            }
+        })
+        .collect();
+    answered.sort_unstable_by_key(|&(_, seqno, _)| seqno);
+    assert_eq!(
+        answered,
+        [
+            (RGFX_EVT_COMPLETE, close, RGFX_STATUS_OK),
+            (RGFX_EVT_COMPLETE, block, RGFX_STATUS_OK),
+            (RGFX_EVT_SAMPLER_STATE, later, RGFX_STATUS_OK),
+        ]
+    );
+}

@@ -43,7 +43,7 @@ use super::impls::device::DeviceModel;
 use super::impls::icb::{IcbCommandModel, IcbModel};
 use super::impls::rate_map::{RateMapDescriptorModel, RateMapModel};
 use super::impls::resource::PipelineModel;
-use super::script::{Script, Step};
+use super::script::{HeldCall, Script, Step};
 use super::vm::FakeVm;
 use crate::host::HostPtr;
 use crate::num;
@@ -721,8 +721,9 @@ impl<K: Kind> Handle for Fk<K> {
 }
 
 impl<K: Kind> Drop for Fk<K> {
-    /// A release: logged where `K` logs its retains, and the death [`World::die_at_release`] set
-    /// for the object, where the thread is not unwinding already.
+    /// A release: logged where `K` logs its retains, then the death [`World::die_at_release`]
+    /// set for the object and the hold [`World::hold_at_release`] set for it, where the thread
+    /// is not unwinding already.
     fn drop(&mut self) {
         if K::LOG_RETAIN {
             self.obj()
@@ -734,6 +735,11 @@ impl<K: Kind> Drop for Fk<K> {
             crate::raise::Raise::platform("release")
                 .with_detail("the platform died letting go of the object")
                 .fatal();
+        }
+        if !std::thread::panicking()
+            && let Some(held) = self.obj().world.take_release_hold(self.id())
+        {
+            held.hold();
         }
     }
 }
@@ -922,6 +928,8 @@ pub struct World {
     on_new: Mutex<Vec<(TypeId, Box<dyn Any + Send>)>>,
     /// The objects whose next release dies ([`World::die_at_release`]).
     release_dies: Mutex<Vec<ObjId>>,
+    /// The objects whose next release holds its thread ([`World::hold_at_release`]).
+    release_holds: Mutex<Vec<(ObjId, HeldCall)>>,
     /// Committed command buffers whose work the platform has not taken, in commit order, while
     /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
     held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
@@ -957,6 +965,7 @@ impl World {
             library_functions: Mutex::new(Vec::new()),
             on_new: Mutex::new(Vec::new()),
             release_dies: Mutex::new(Vec::new()),
+            release_holds: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
         })
     }
@@ -1034,6 +1043,20 @@ impl World {
             }
             None => false,
         }
+    }
+
+    /// Holds the next release of a handle of object `id` on its thread until the test lets
+    /// `held` go, as a platform holds the thread that lets an object go where its driver takes
+    /// long to free the object's memory or an import of the guest's pages.
+    pub fn hold_at_release(&self, id: ObjId, held: HeldCall) {
+        self.release_holds.lock().push((id, held));
+    }
+
+    /// The hold this release of object `id` waits in ([`World::hold_at_release`]): once.
+    fn take_release_hold(&self, id: ObjId) -> Option<HeldCall> {
+        let mut holds = self.release_holds.lock();
+        let at = holds.iter().position(|(held, _)| *held == id)?;
+        Some(holds.remove(at).1)
     }
 
     /// A live object by identity (a retained, erased handle).
