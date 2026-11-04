@@ -94,6 +94,49 @@ def host_tagged(metrics, name):
         and not gpu_bound(name)
 
 
+def throttle_key(name):
+    """The window a bench boot's timing metric was measured in, as its thermal.pkg_throttle_ms.KEY
+    metric names it: a bench case (bench.CASE.*), a phase (drag.CASE.*, present.MODE.*, webgl.*,
+    decode.*, and the phase-named qemu_cpu., gfx_cpu. and composites_s. rows), or None."""
+    if name.startswith("bench."):
+        return "bench." + name[len("bench."):].rsplit(".", 1)[0]
+    for pre in ("qemu_cpu.", "gfx_cpu.", "composites_s."):
+        if name.startswith(pre):
+            return name[len(pre):]
+    m = re.match(r"(drag\.[a-z]+|present\.[a-z]+)\.", name)
+    if m:
+        return m.group(1)
+    if name.startswith("webgl."):
+        return "webgl"
+    if name.startswith("decode."):
+        return "decodefps"
+    return None
+
+
+def throttled(metrics, name):
+    """How long the host CPU's package throttled (ms) in the window a bench boot's timing metric was
+    measured in (thermal.txt, msi-boot.sh), where it did: such a row is marked and not compared, and a
+    baseline's median leaves it out. None where it did not, or where the boot sampled no heat."""
+    k = throttle_key(name)
+    v = metrics.get("thermal.pkg_throttle_ms." + k) if k else None
+    return v if v else None
+
+
+def bench_spans(guest_text):
+    """Each bench case's windows in guest.log: from its "# start CASE" line to its "bench: CASE "
+    result line, once a run (the bench phase's, and benchretry's)."""
+    spans, open_ = {}, {}
+    for line in guest_text.splitlines():
+        m = re.match(r"([0-9.]+) # start (\S+)", line)
+        if m:
+            open_[m.group(2)] = float(m.group(1))
+            continue
+        m = re.match(r"([0-9.]+) bench: (\S+) ", line)
+        if m and m.group(2) in open_:
+            spans.setdefault(m.group(2), []).append((open_.pop(m.group(2)), float(m.group(1))))
+    return spans
+
+
 def tainted(metrics, name):
     """Whether a metric is from a boot whose numbers are tainted (tainted/LEG): any of its numbers
     but its host's counts and waits."""
@@ -541,6 +584,35 @@ class Run:
             p = line.split()
             if len(p) == 4:
                 cpu.append((float(p[0]), (int(p[1]) + int(p[2])) / int(p[3])))
+        # The host CPU's heat (thermal.txt, once a second): how long its package throttled in each
+        # phase and bench case, from the sample before the window to the one after it, and its
+        # hottest reading there.
+        heat = []
+        for line in read(os.path.join(r, "thermal.txt")).splitlines():
+            p = line.split()
+            if len(p) == 6 and p[1] != "na":
+                heat.append((float(p[0]), int(p[1]), int(p[3])))
+        windows = {k: [w] for k, w in getattr(self, "phases", {}).items()}
+        for case, spans in bench_spans(getattr(self, "guest_text", "")).items():
+            windows["bench." + case] = spans
+        for line in read(os.path.join(r, "drag.txt")).splitlines():  # msi-drag.py's, timed on the host
+            m = re.match(r"drag (\S+) .*\bt0=([0-9.]+) t1=([0-9.]+)", line)
+            if m:
+                windows["drag." + m.group(1)] = [(float(m.group(2)), float(m.group(3)))]
+        for name, spans in windows.items():
+            ms, hot, seen = 0, None, False
+            for a, b in spans:
+                if a is None or b is None or not heat:
+                    continue
+                before = [h for h in heat if h[0] <= a] or heat[:1]
+                after = [h for h in heat if h[0] >= b] or heat[-1:]
+                ms += after[0][2] - before[-1][2]
+                inside = [h[1] for h in heat if before[-1][0] <= h[0] <= after[0][0]]
+                hot = max([hot or 0] + inside)
+                seen = True
+            if seen:
+                self.lmetric("thermal.pkg_throttle_ms." + name, ms)
+                self.lmetric("thermal.pkg_max_c." + name, hot)
         for name, (a, b) in getattr(self, "phases", {}).items():
             if a is None or b is None or b - a < 1:
                 continue
@@ -760,7 +832,7 @@ def median_baseline(bdir):
         # A HOST_NOT_QUIET sample's numbers other than the GPU-bound ones are left out.
         # A tainted boot's numbers are left out (tainted/LEG).
         vals = [r["metrics"][n] for r in runs if n in r["metrics"] and not host_tagged(r["metrics"], n)
-                and not tainted(r["metrics"], n)]
+                and not tainted(r["metrics"], n) and not throttled(r["metrics"], n)]
         # A bench number is the median of the samples at the high clock, where any sample says its clock.
         clocked = [r["metrics"] for r in runs if n in r["metrics"] and clock_ok_of(r["metrics"], n) is not None
                    and not tainted(r["metrics"], n)]
@@ -962,6 +1034,9 @@ def compare(run, base, noise):
             verdict = f"TAINTED: {getattr(run, 'taint', {}).get(leg, 'tainted')}, not compared"
             if g:
                 items.pop("metric." + name, None)
+        elif throttled(cur["metrics"], name):
+            verdict = (f"throttled: the CPU package throttled {throttled(cur['metrics'], name):g} ms while "
+                       f"{throttle_key(name)} ran, not compared")
         elif host_tagged(cur["metrics"], name):
             verdict = "tagged HOST_NOT_QUIET: a build ran beside the boot, not compared"
         elif clock_ok_of(cur["metrics"], name) is False:

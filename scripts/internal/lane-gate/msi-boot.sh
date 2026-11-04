@@ -10,6 +10,11 @@
 #                 bench phase left GPU-bound cases with no repetition at the GPU's high clock
 #                 (reps.py), their runs again (benchretry) before the phases after it
 #   cpu.txt       QEMU's CPU time once a second: "EPOCH UTIME_TICKS STIME_TICKS HZ"
+#   thermal.txt   the host CPU's heat once a second while QEMU runs: "EPOCH PKG_C PKG_COUNT PKG_MS
+#                 CORE_COUNT CORE_MS", the package's temperature (x86_pkg_temp) and the throttle
+#                 counters (thermal_throttle's package_ and core_throttle_count and _total_time_ms),
+#                 each the largest over the CPUs; msi's package reaches 103 C under builds and
+#                 throttles for seconds at a time, which moves CPU-bound numbers
 #   host-events.log  the host log's display updates ("the display shows IOSurface"), its
 #                 fatal, error and warning lines, and its work counts (reims_vgpu::work, where
 #                 HOST_LOG enables it), as the host logged them (local ISO times)
@@ -19,7 +24,14 @@
 #                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
 #                 its commonest colour (or desktop_capture none), how long the hold was, the
 #                 host's load average beside the measurements, and host_quiet (a measured boot's:
-#                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET)
+#                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET);
+#                 at QEMU's start the host's free memory and page cache (memfree_, memavailable_,
+#                 cached_start_mib), uptime (uptime_start_s: a fresh boot's page cache is empty),
+#                 and the package's temperature and throttle counters (pkg_temp_start_c,
+#                 pkg_throttle_count_start, pkg_throttle_ms_start, core_throttle_ms_start); at
+#                 the end the temperature and what the counters grew by during the boot
+#                 (pkg_temp_end_c, pkg_throttle_count_during, pkg_throttle_ms_during,
+#                 core_throttle_ms_during)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
 #   kernel-rgfx.log, kring.raw, kring-clock.txt   the kext's lines from the guest kernel's ring
 #                 (it logs to no log stream), the guest's boot time and clock against the host's;
@@ -52,6 +64,23 @@ START=$(date +%s)
 T0=$START
 log() { echo "$(date +%T) $*" | tee -a "$R/boot.log"; }
 kv() { echo "$1 $2" >> "$R/host.txt"; }
+# The host CPU's heat now: "PKG_C PKG_COUNT PKG_MS CORE_COUNT CORE_MS" (thermal.txt's fields, the
+# counters the largest over the CPUs), read with the shell's own read, as a sampler does it once a
+# second over 30-odd CPUs.
+thermal_now() {
+  local z t= pc=0 pm=0 cc=0 cm=0 v d
+  for z in /sys/class/thermal/thermal_zone*; do
+    read -r v < "$z/type" 2> /dev/null && [[ $v == x86_pkg_temp ]] && { read -r t < "$z/temp"; break; }
+  done
+  for d in /sys/devices/system/cpu/cpu[0-9]*/thermal_throttle; do
+    read -r v < "$d/package_throttle_count" 2> /dev/null && (( v > pc )) && pc=$v
+    read -r v < "$d/package_throttle_total_time_ms" 2> /dev/null && (( v > pm )) && pm=$v
+    read -r v < "$d/core_throttle_count" 2> /dev/null && (( v > cc )) && cc=$v
+    read -r v < "$d/core_throttle_total_time_ms" 2> /dev/null && (( v > cm )) && cm=$v
+  done
+  [[ -n $t ]] && t=$(( t / 1000 )) || t=na
+  echo "$t $pc $pm $cc $cm"
+}
 # The lane host's display as the boot met it: the lid, and each output kwin drives (kscreen-doctor
 # in the desktop session's Wayland display): "lid=closed eDP-1=3840x2400@120,scale=1.9", as KEY.
 display_state() {
@@ -145,6 +174,7 @@ finish() {
     kv xid_lines unread
   fi
   [[ -n ${SAMPLER:-} ]] && kill "$SAMPLER" 2> /dev/null
+  [[ -n ${THERMAL:-} ]] && kill "$THERMAL" 2> /dev/null
   [[ -s $R/watchdog.pid ]] && kill "$(cat "$R/watchdog.pid")" 2> /dev/null
   [[ -n ${WATCHDOG:-} ]] && kill "$WATCHDOG" 2> /dev/null
   rm -f "$R/watchdog.pid"
@@ -169,6 +199,14 @@ finish() {
     kv serial_fatal_lines "${n:-0}"
   fi
   rm -f "$B"/*.qcow2
+  if [[ -s $R/thermal-start.txt ]]; then
+    read -r _ pc0 pm0 _ cm0 < "$R/thermal-start.txt"
+    read -r t1 pc1 pm1 _ cm1 <<< "$(thermal_now)"
+    kv pkg_temp_end_c "$t1"
+    kv pkg_throttle_count_during "$(( pc1 - pc0 ))"
+    kv pkg_throttle_ms_during "$(( pm1 - pm0 ))"
+    kv core_throttle_ms_during "$(( cm1 - cm0 ))"
+  fi
   kv hold_s "$(( $(date +%s) - T0 ))"
   log "BOOT_DONE"
 }
@@ -304,7 +342,8 @@ fi
     # The host's free memory as QEMU starts (it moves a boot's time by 30 s and more where it is
     # below the guest's RAM: the runtime imports all of it at the start).
     grep -q -x GPU_HELD "$B/launch.log" && { echo "held $(date +%s.%N | cut -c1-14)"
-      grep -E '^(MemFree|MemAvailable|Cached):' /proc/meminfo > "$R/meminfo-start.txt"; break; }
+      grep -E '^(MemFree|MemAvailable|Cached):' /proc/meminfo > "$R/meminfo-start.txt"
+      thermal_now > "$R/thermal-start.txt"; cut -d' ' -f1 /proc/uptime > "$R/uptime-start.txt"; break; }
   done ) > "$R/boot-times.txt" 2> /dev/null &
 TIMES=$!
 # rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
@@ -339,6 +378,12 @@ T0=${T0%.*}
 [[ -s $R/meminfo-start.txt ]] && while read -r k v _; do
   kv "$(tr 'A-Z' 'a-z' <<< "${k%:}")_start_mib" "$(( v / 1024 ))"
 done < "$R/meminfo-start.txt"
+[[ -s $R/uptime-start.txt ]] && kv uptime_start_s "$(cut -d. -f1 "$R/uptime-start.txt")"
+if [[ -s $R/thermal-start.txt ]]; then
+  read -r t pc pm cc cm < "$R/thermal-start.txt"
+  kv pkg_temp_start_c "$t"; kv pkg_throttle_count_start "$pc"; kv pkg_throttle_ms_start "$pm"
+  kv core_throttle_ms_start "$cm"
+fi
 [[ -n $T0 ]] || T0=$START
 case $out in
 *SSH_OK*) ;;
@@ -367,6 +412,9 @@ WATCHDOG=$!
     echo "$(date +%s.%N | cut -c1-14) $(sed 's/^.*) //' "/proc/$P/stat" | awk '{print $12, $13}') $hz"; sleep 1
   done ) > "$R/cpu.txt" 2> /dev/null &
 SAMPLER=$!
+( closefds; while [[ -r /proc/$P/stat ]]; do echo "$(date +%s.%N | cut -c1-14) $(thermal_now)"; sleep 1; done ) \
+  > "$R/thermal.txt" 2> /dev/null &
+THERMAL=$!
 
 desktop() {
   for _ in $(seq 1 36); do
