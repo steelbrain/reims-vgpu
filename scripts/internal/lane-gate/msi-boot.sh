@@ -3,7 +3,8 @@
 # rgk-boot2.sh, which takes one of the host's VM slots, then the GPU lock, in its turn (the host's
 # turnstile orders shared boots and exclusive runs by arrival), and the port's lock. The
 # correctness boot (EXCLUSIVE=0) shares the GPU with other VMs; the bench boot (EXCLUSIVE=1,
-# RGK_EXCLUSIVE) holds it alone for QEMU's life. Either is stopped after HOLD_S seconds.
+# RGK_EXCLUSIVE) holds it alone for QEMU's life. Either keeps builds off the host for QEMU's life
+# (host quiet: build-quiet.sh), and is stopped after HOLD_S seconds.
 # RUNDIR holds boot.env (below), and gets the results:
 #   boot.log      what this script did, with times
 #   guest.log     guest-run.sh's output, each line after the host's time (epoch seconds); where the
@@ -23,8 +24,8 @@
 #   host.txt      "KEY VALUE" lines: the SSH port, the wait for the GPU, boot and desktop times
 #                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
 #                 its commonest colour (or desktop_capture none), how long the hold was, the
-#                 host's load average beside the measurements, and host_quiet (a measured boot's:
-#                 1 where no build ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET);
+#                 host's load average beside the measurements, and host_quiet (1 where no build
+#                 ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET);
 #                 at QEMU's start the host's free memory and page cache (memfree_, memavailable_,
 #                 cached_start_mib), uptime (uptime_start_s: a fresh boot's page cache is empty),
 #                 and the package's temperature and throttle counters (pkg_temp_start_c,
@@ -211,8 +212,8 @@ finish() {
     kv queues_unshared "$(grep -c 'made unshared' "$B/launch.log")"
     kv submit_room_posted "$(grep -c 'SUBMIT_ROOM posted' "$B/launch.log")"
     kv icb_slots_refused "$(grep -c 'ICB_SLOTS of .* not carried out' "$B/launch.log")"
-    # A measured boot's hold of host quiet: HOST_QUIET where no build ran beside QEMU, HOST_NOT_QUIET
-    # where the wait for running builds ran out (rgk-boot2.sh); none for a shared boot.
+    # The boot's hold of host quiet: HOST_QUIET where no build ran beside QEMU, HOST_NOT_QUIET where
+    # the wait for running builds ran out (rgk-boot2.sh).
     case $(grep -m1 -o -E 'HOST_(NOT_)?QUIET' "$B/launch.log") in
     HOST_QUIET) kv host_quiet 1 ;;
     HOST_NOT_QUIET) kv host_quiet 0 ;;
@@ -261,9 +262,12 @@ timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
 # The bench boot is an ordinary exclusive request: it waits its turn in the host's turnstile, in
 # arrival order, and holds the GPU alone for QEMU's life.
 excl=()
+# The correctness boot times drags, presents and WebGL frames beside other VMs: it keeps builds off
+# the host for QEMU's life as the bench boot does (RGK_QUIET).
+excl=(RGK_QUIET=1)
 [[ ${EXCLUSIVE:-1} == 1 ]] && excl=(RGK_EXCLUSIVE=1 "RGK_EXCLUSIVE_MAX=$HOLD_S")
 # Where the boot's time goes: rgk-boot2.sh writes run.sh once its turn, a VM slot and the port are
-# in hand; run.sh takes the GPU lock, then (a measured boot) waits for host quiet, its marker in
+# in hand; run.sh takes the GPU lock, then waits for host quiet, its marker in
 # quiet-want/ up meanwhile, until its HOST_QUIET or HOST_NOT_QUIET line in QEMU's log, says
 # GPU_HELD and execs QEMU, whose lines carry their times. A watch takes the times of the marker
 # and of those lines (boot-times.txt: gpu, quiet, held), and the hold counts from GPU_HELD.

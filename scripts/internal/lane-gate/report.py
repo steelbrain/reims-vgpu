@@ -88,10 +88,21 @@ def gpu_bound(name):
 
 
 def host_tagged(metrics, name):
-    """Whether a bench boot's metric is tagged: the boot ran beside a build (HOST_NOT_QUIET) and the
-    metric is not GPU-bound. The correctness boot's (shared.) are never gated."""
-    return metrics.get("host.host_quiet") == 0 and not name.startswith(("shared.", "host.", "step_s.", "pstate.", "core_mhz.", "mem_mhz.", "clock_")) \
+    """Whether a metric is tagged: its boot ran beside a build (HOST_NOT_QUIET). A bench boot's are,
+    where not GPU-bound; the correctness boot's (shared., never gated) where timed: its drags,
+    presents, WebGL frames and boot times."""
+    if name.startswith("shared."):
+        return metrics.get("shared.host.host_quiet") == 0 and not name.startswith(("shared.appload.", "shared.thermal."))
+    return metrics.get("host.host_quiet") == 0 and not name.startswith(("host.", "step_s.", "pstate.", "core_mhz.", "mem_mhz.", "clock_")) \
         and not gpu_bound(name)
+
+
+def phase_of_item(name):
+    """The correctness boot's guest-run.sh phase an item comes from, where it comes from one."""
+    if name == "guest.no-tmp-files":
+        return "sweep"
+    group = name.split(".", 1)[0]
+    return group if group in ("decode", "icb", "sweep", "webgl", "present") else None
 
 
 def throttle_key(name):
@@ -976,6 +987,11 @@ def compare(run, base, noise):
             # A boot that failed before its guest ran fails once, as step.boot (or step.bench).
             items[name] = {"status": "NOTRUN", "detail": f"step.{part} failed before it"}
             incomplete = incomplete or part != "bench"
+        elif part == "boot" and run.meta.get("phases") and phase_of_item(name) \
+                and phase_of_item(name) not in run.meta["phases"].split():
+            # --phases left the item's phase out of the correctness boot.
+            items[name] = {"status": "NOTRUN", "detail": f"its phase ({phase_of_item(name)}) was left out (--phases)"}
+            incomplete = True
         elif b["status"] == "PASS":
             items[name] = {"status": "FAIL", "detail": "missing, where the baseline passed"}
     # A failure an entry of the known-failures list matches exactly is KNOWN and decides nothing.
