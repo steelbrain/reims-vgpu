@@ -484,6 +484,13 @@ RgfxRenderTargetSize rgfxTargetSize(MTLRenderPassDescriptor *d)
 	return size;
 }
 
+/// The record of pass `d`: its colour attachments (`colors`, as many as up to its last of ours),
+/// its size, depth and stencil. Its supportColorAttachmentMapping (macOS 26) is not carried, so
+/// each fragment output lands in the attachment of its index: the device answers no Apple family,
+/// and a colour attachment map the encoder is given is logged and dropped
+/// (setColorAttachmentMap:). With it and no map, the M3 Max under macOS 27 draws so too, where
+/// the AMD Radeon Pro 5300M and the Intel UHD 630 under macOS 26.7.1 draw no colour at all
+/// (measured), and Metal's docs say neither: the lane takes the M3's.
 uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
                         std::vector<RgfxRenderPassColorAttachment> *colors)
 {

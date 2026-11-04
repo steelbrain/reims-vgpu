@@ -987,6 +987,48 @@ void test_visibility_result_buffer()
 	} // @autoreleasepool
 }
 
+// A pass that supports colour attachment mapping (macOS 26) travels as the same pass without it,
+// in render and parallel passes: each output lands in the attachment of its index, as on the M3
+// Max (fillRenderPass), and nothing is logged.
+void test_color_attachment_mapping_pass()
+{
+	if (![MTLRenderPassDescriptor instancesRespondToSelector:@selector(
+	                                  setSupportColorAttachmentMapping:)])
+		return;
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO],
+	    0x42);
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	MTLRenderPassDescriptor *mapped = onePass(target);
+	mapped.supportColorAttachmentMapping = YES;
+	[[cb renderCommandEncoderWithDescriptor:mapped] endEncoding];
+	[[cb parallelRenderCommandEncoderWithDescriptor:mapped] endEncoding];
+	[[cb renderCommandEncoderWithDescriptor:onePass(target)] endEncoding];
+	[cb commit];
+
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	const Op *plain = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 2);
+	CHECK(plain != nullptr);
+	for (uint32_t i = 0; i < 2 && plain != nullptr; i++) {
+		const Op *b = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, i);
+		CHECK(b != nullptr && b->body == plain->body);
+	}
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class],
+	                                @selector(renderCommandEncoderWithDescriptor:)));
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class],
+	                                @selector(parallelRenderCommandEncoderWithDescriptor:)));
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
 // The members of features the device answers NO for do nothing on the wire: a nil or default
 // argument is exact and not logged; any other use is logged once.
 void test_encoders_unsupported()
@@ -2065,6 +2107,7 @@ void rgfxProtocolTests()
 	test_framework_members();
 	test_sample_positions();
 	test_visibility_result_buffer();
+	test_color_attachment_mapping_pass();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();
 	test_texture_members();
