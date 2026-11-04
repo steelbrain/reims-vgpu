@@ -230,9 +230,11 @@ The suite's inputs:
   ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
   - Build there in the environment of `scripts/internal/dev-env.sh`, sourced
     from the worktree's root before each cargo command
-    (`. scripts/internal/dev-env.sh && cargo ...`): `CARGO_INCREMENTAL=0`,
-    as the check builds, and, where `kache` is installed, rustc and build
-    scripts through kache, a compiler cache local to the host. A new
+    (`. scripts/internal/dev-env.sh && cargo ...`): incremental, as the
+    check builds, and, where `kache` (2.0.0 or later) is installed, rustc
+    and build scripts through kache, a compiler cache local to the host,
+    which keeps an edited unit's incremental state and seeds a new
+    worktree's from another's. A new
     worktree's first build then compiles only what no tree on the host built
     before (measured: `cargo xtask check`'s tests built in a second worktree
     in 1.5 s on a Ryzen 7 7840HS and 9.5 s on the M3 Max, after a first had

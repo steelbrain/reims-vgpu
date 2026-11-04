@@ -117,17 +117,19 @@ cargo xtask smoke          # a guest linked with the library as QEMU links it (m
 
 `cargo xtask check` tests with every feature but `reims-vgpu-c/vulkan`, which puts the C API on the
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
-and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run
-with `CARGO_INCREMENTAL=0`: each builds once in its tree, where incremental caches would only take
-disk.
+and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run in the
+environment it was started in, incremental as cargo's dev and test profiles are, so a check run
+again after a fix rebuilds what the fix changed.
 
 #### Building through kache
 
 [kache](https://github.com/kunobi-ninja/kache) is a compiler cache: run in front of rustc, it stores
 each unit's outputs on the host, keyed by everything the unit is built from, and restores them as
 clones of the stored files (APFS clones on a Mac, reflinks on btrfs), so a worktree builds only the
-units no tree on the host built before. It is a tool on the PATH (`cargo install --locked kache`),
-never a dependency and never Cargo's configured wrapper: a host without it builds as before. A
+units no tree on the host built before. It is a tool on the PATH, version 2.0.0 or later (`cargo
+install --locked kache --version 2.0.0`, which installs `kache` and `kache-engine` together; run
+`kache daemon restart` after an upgrade), never a dependency and never Cargo's configured wrapper:
+a host without it builds as before. A
 developer's builds take it up through `scripts/internal/dev-env.sh`, sourced from the worktree's
 root before each cargo command:
 
@@ -135,9 +137,19 @@ root before each cargo command:
 . scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-core
 ```
 
-which sets `CARGO_INCREMENTAL=0` and, where `kache` is on the PATH, `RUSTC_WRAPPER=kache`,
-`KACHE_LOCAL_ONLY=1`, `KACHE_ADAPTIVE_INCREMENTAL=0` and `KACHE_BUILD_SCRIPT_HERMETIC=1`. `cargo
-xtask check` and `make` run their cargo steps in the environment they are started in.
+which, where `kache` is on the PATH, sets `RUSTC_WRAPPER=kache`, `KACHE_LOCAL_ONLY=1` and
+`KACHE_BUILD_SCRIPT_HERMETIC=1`, and leaves the build incremental (it unsets `CARGO_INCREMENTAL`).
+`cargo xtask check` and `make` run their cargo steps in the environment they are started in.
+
+Builds are incremental, and kache keeps their incremental state (`adaptive_incremental` and
+`seed_incremental` in the host's configuration, below). A unit whose inputs match an entry in the
+store is restored from it. A workspace crate or path dependency whose sources or dependencies
+changed since its last build in the same target directory (an edit, a pull, a branch switch, a
+rebase) compiles incrementally instead, with incremental state of its own in the target directory,
+and kache neither stores nor restores it for up to eight builds, each within 15 minutes of the
+last. A compile error keeps the state. A worktree's first incremental compile of a unit imports
+compatible finished incremental state from another worktree's build of it on the host, as clones,
+so a new worktree's edits start warm (rustc 1.98 or later; read from kache 2.0.0's documentation).
 
 A unit is shared between worktrees when nothing it is built from names the worktree's path, and a
 build script's run when nothing it writes does. So the tests find the tree at run time: they read
@@ -195,23 +207,24 @@ kache on it:
 [cache]
 local_only = true                   # no remote storage, no planner: nothing leaves the host
 local_max_size = "60GiB"            # the store's ceiling, kept by kache (40GiB on Linux)
-daemon_idle_timeout_secs = 1800     # a daemon some command started exits when idle
+daemon_idle_timeout_secs = 1800     # the daemon exits when idle
 auto_clean_orphaned_targets = false # kache never removes or rewrites a target directory
 auto_share_target_files = false
 auto_clean_unused_units_days = 0
 auto_clean_idle_targets_days = 0
 auto_recover_targets = false
 seed_new_targets = false            # nor copies one tree's build units into another's
-adaptive_incremental = false        # no incremental state in target directories
+adaptive_incremental = true         # a unit being edited compiles incrementally
+seed_incremental = true             # its incremental state seeded from another worktree's
 ```
 
 Never run `kache init`, which writes the wrapper into `~/.cargo/config.toml` for every project on
 the host, links compiler shims into the shell's PATH and installs a login service, nor `kache
 login`. kache's store is under `~/Library/Caches/kache` on a Mac and `~/.cache/kache` on Linux:
 `kache stats` shows its size and limit, `kache explain CRATE` why a unit missed, and removing the
-directory (with no build running) empties it. Builds through kache start no daemon, but `kache stats`
-does, with no way around it, and the daemon exits after `daemon_idle_timeout_secs` with nothing to
-do (`kache daemon stop` ends it at once); `kache doctor` and `kache explain` start none. The
+directory (with no build running) empties it. kache 2 compiles through its daemon (`kache-engine`),
+which a build through kache starts where none runs, as `kache stats` does, and which exits after
+`daemon_idle_timeout_secs` with nothing to do (`kache daemon stop` ends it at once). The
 ceiling counts what the store alone holds: evicting a file still cloned into a target directory
 frees nothing, so kache keeps it until that target directory is gone.
 
