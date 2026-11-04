@@ -1437,14 +1437,39 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// given its number again posts one after the close, which empties the context's
     /// compiles and waits for its no-copy buffers first. Nothing else makes a state.
     fn context_made(&self, context: u32) -> Arc<Context<P>> {
+        let made = self.context_made_if(context, || true);
+        made.unwrap_or_else(|| unreachable!("a state is made where `live` holds"))
+    }
+
+    /// [`Self::context_made`], for a create carried out off its context's ring order (a compile's
+    /// pipeline, an indirect command buffer made on its worker): where the context has no state,
+    /// `live` answers, under the states' lock, whether the create is still to be stored, and
+    /// where it is not, no state is made and `None` is answered. A close takes the context's
+    /// state out under that lock, after it cancelled what it overtook, so such a create, ending
+    /// after the close, makes the closed context no state again.
+    fn context_made_if(
+        &self,
+        context: u32,
+        live: impl FnOnce() -> bool,
+    ) -> Option<Arc<Context<P>>> {
         let mut contexts = self.shared.contexts.lock();
         if let Some(state) = contexts.get(&context) {
-            return Arc::clone(state);
+            return Some(Arc::clone(state));
+        }
+        if !live() {
+            return None;
         }
         self.shared.failed.reopen(context);
         let state = Arc::new(Context::new(context));
         contexts.insert(context, Arc::clone(&state));
-        state
+        Some(state)
+    }
+
+    /// Makes the context of `obj_id`, a create's object, a state where it has none, in its lane's
+    /// ring order, for a create carried out later off it ([`Self::store_late`]): a create of a
+    /// context closed before opens it again here, as one carried out at once does.
+    pub(crate) fn open_for_create(&self, obj_id: u64) {
+        drop(self.context_made(context_of(obj_id)));
     }
 
     /// Whether the current context was closed before this message came, and has made no state
@@ -2115,7 +2140,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.decode_library(device, message)
             }
             RGFX_CMD_SAMPLER_CREATE => self.make_sampler(device, message),
-            RGFX_CMD_ICB_CREATE => Ok(self.new_icb(device, message)?.map(|_| ())),
+            RGFX_CMD_ICB_CREATE => Ok(self.new_icb(device, message, false)?.map(|_| ())),
             RGFX_CMD_ICB_WRITE => self.icb_write(message),
             RGFX_CMD_ICB_SLOTS => self.icb_slots(message),
             RGFX_CMD_DEPTH_STENCIL_CREATE => {
@@ -2633,14 +2658,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         drop(replaced.map(tables::Removed::into_entry));
     }
 
-    /// [`Self::store`], where `live` answers, under the table's lock, that the object is still
-    /// to be stored.
-    fn store_if(&self, obj_id: u64, entry: Entry<P>, live: impl FnOnce() -> bool) {
-        let context = self.context_made(context_of(obj_id));
-        if let Some((at, replaced)) = context.insert_if(obj_id, entry, live) {
+    /// [`Self::store`], where `live` answers, under the states' lock where the context has no
+    /// state ([`Self::context_made_if`]) and under the table's lock, that the object is still to
+    /// be stored: one `live` refuses is let go of, and makes its context no state.
+    fn store_if(&self, obj_id: u64, entry: Entry<P>, live: impl Fn() -> bool) {
+        let Some(context) = self.context_made_if(context_of(obj_id), &live) else {
+            return;
+        };
+        if let Some((at, replaced)) = context.insert_if(obj_id, entry, &live) {
             self.saw(&context, obj_id, Some(at));
             drop(replaced.map(tables::Removed::into_entry));
         }
+    }
+
+    /// [`Self::store`], for a create its context's lane handed to a worker
+    /// ([`Self::open_for_create`] made the context's state then): where the context closed since,
+    /// it has no state, the object is let go of, and the closed context is made no state again.
+    fn store_late(&self, obj_id: u64, entry: Entry<P>) {
+        let id_context = context_of(obj_id);
+        let Some(context) =
+            self.context_made_if(id_context, || !self.shared.failed.closed(id_context))
+        else {
+            return;
+        };
+        self.forget_library(obj_id);
+        let (at, replaced) = context.insert(obj_id, entry);
+        self.saw(&context, obj_id, Some(at));
+        drop(replaced.map(tables::Removed::into_entry));
     }
 
     /// The message's own change of `obj_id` in `context`'s table: made at `at`, or removed.
@@ -2991,11 +3035,13 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// [`Self::finish_pipeline`], where `live` answers, under the lock of the table the pipeline
     /// goes in, that no destroy or close cancelled it: a destroy cancels the compile before it
-    /// removes what the id names, so the pipeline is never stored after its destroy.
+    /// removes what the id names, so the pipeline is never stored after its destroy, and a close
+    /// before it takes the context's state out, so a compile ending after its context's close
+    /// makes the closed context no state again ([`Self::store_if`]).
     pub(crate) fn finish_pipeline_if(
         &self,
         compiled: CompiledPipeline<P>,
-        live: impl FnOnce() -> bool,
+        live: impl Fn() -> bool,
     ) {
         if let Some(handle) = compiled.handle {
             self.store_if(compiled.obj_id, Entry::of(handle), live);

@@ -1477,6 +1477,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // The poster's epoch says whether the device was reset since: the settle's count of
         // resets is not read.
         let settle = self.icbs.begin(obj_id, 0, self.pool.now());
+        // Its context opened here, in ring order: a close the worker's make comes after leaves it
+        // no state to store into.
+        self.decoder().open_for_create(obj_id);
         // Behind its process's creates, beside other processes'.
         let key = u64::from(sender_context(poster, message));
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());

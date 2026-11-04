@@ -3825,6 +3825,69 @@ fn a_release_behind_a_close_waits_for_the_close_s_buffers() {
     assert_eq!(device.control.decoder().context_states(), 0);
 }
 
+/// A pipeline create whose compile its context's close cancelled (a process that quit with a
+/// create it posted without waiting still compiling) ends after the close and stores nothing: it
+/// makes the closed context no state again, as a late buffer or release does not.
+#[test]
+fn a_compile_ending_after_its_context_s_close_makes_it_no_state() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make_library(&device, &mut guest, obj(1, 10));
+    device.control.pool.hold();
+    guest.send(&device, compute_pipeline_create(obj(1, 11), obj(1, 10)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.control.decoder().context_states(), 0);
+    device.control.pool.release();
+    next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    assert_eq!(device.decoder_object_count(), 0);
+    assert_eq!(
+        device.control.decoder().context_states(),
+        0,
+        "the compile's end made the closed context a state again"
+    );
+}
+
+/// An `ICB_CREATE` made on the ICB worker after its context's close (its process died waiting
+/// for the answer, and the kext destroys behind it) stores nothing, and makes the closed context
+/// no state again.
+#[test]
+fn an_icb_made_after_its_context_s_close_makes_it_no_state() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = icb_device(&raised);
+    let mut guest = Guest::new(&device);
+    let before = device.decoder_object_count();
+    device.control.icb_worker.hold();
+    guest.send(&device, icb_create(obj(1, 50)));
+    assert_eq!(
+        answered(&device, &mut guest, context_close(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.control.decoder().context_states(), 0);
+    guest.send(&device, object_destroy(obj(1, 50)));
+    guest.send(&device, library_lookup(obj(1, 0xfff), 0, [0xee; 32]));
+    let control = Arc::clone(&device.control);
+    let opener = std::thread::Builder::new()
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            control.icb_worker.release();
+        })
+        .unwrap();
+    next_event(&mut guest, RGFX_EVT_ICB_STATE);
+    next_event(&mut guest, RGFX_EVT_COMPLETE);
+    opener.join().unwrap();
+    assert_eq!(device.decoder_object_count(), before);
+    assert_eq!(
+        device.control.decoder().context_states(),
+        0,
+        "the ICB's make made the closed context a state again"
+    );
+}
+
 /// A shared block's release waits for the command buffer an earlier holder committed before its
 /// `BLOCK_UNSHARE`, still in flight, as for the releasing context's own: the kext unwired the
 /// earlier holder's pages at its unshare and gives the block's memory back at the release's

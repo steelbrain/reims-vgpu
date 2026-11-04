@@ -139,18 +139,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         if self.context_failed() {
             return Ok(Some(answer(RGFX_STATUS_REFUSED, 0)));
         }
-        Ok(Some(match self.new_icb(device, message)? {
+        Ok(Some(match self.new_icb(device, message, true)? {
             Ok(id) => answer(RGFX_STATUS_OK, id),
             Err(DecodeError::Malformed) => answer(RGFX_STATUS_INVALID_ARGUMENT, 0),
             Err(_) => answer(RGFX_STATUS_REFUSED, 0),
         }))
     }
 
-    /// The buffer of an `ICB_CREATE`, stored under its id; its `gpuResourceID`.
+    /// The buffer of an `ICB_CREATE`, stored under its id; its `gpuResourceID`. `late` for one
+    /// made on the ICB worker, after its context's lane handed it over, which a close that came
+    /// between makes stored nowhere ([`GraphicsDecoder::store_late`]).
     pub(super) fn new_icb(
         &self,
         device: &P::Device,
         message: &[u8],
+        late: bool,
     ) -> RaiseResult<Result<u64, DecodeError>> {
         let Some(m) = read::<RgfxIcbCreate>(message) else {
             return Ok(Err(DecodeError::Malformed));
@@ -170,7 +173,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Err(DecodeError::Refused));
         };
         let id = icb.gpu_resource_id();
-        self.store(m.obj_id, Entry::of(ObjHandle::Icb(icb)));
+        let entry = Entry::of(ObjHandle::Icb(icb));
+        if late {
+            self.store_late(m.obj_id, entry);
+        } else {
+            self.store(m.obj_id, entry);
+        }
         Ok(Ok(id))
     }
 
