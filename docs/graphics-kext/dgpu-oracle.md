@@ -10,7 +10,7 @@ stricter than the M3's, guests may rely on it.
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
-`oracle_icb` and `oracle_order`.
+`oracle_icb` and `oracle_order`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -700,6 +700,44 @@ a read submitted first on its own queue may simply run first. Writes after a pen
 ordered in every round on all three, and so were reads across processes on the x86 GPUs, not on the
 M3. The lane orders all three cases on every queue pair: the read's wait is on the GPU and holds
 back no record, so the order costs the guest no time, and a guest that relies on it sees it kept.
+
+## Q17: what the CPU's uploads into textures and Managed buffers cost
+
+Probe: `upload_probe -d DEVICE` (`guest/bundle/tools/upload_probe.m`, its header says what each case
+times), 11-03, at the shapes of the linear textures WindowServer made over its buffers before the
+bundle refused the ones off the 256-byte alignment (Q3): BGRA8 128 x 32, 336 x 64 and 480 x 36, A8
+and RG8 64 x 64. The lane's column is a guest on the RTX 5080 (tip 392ce3daf), the same binary.
+Microseconds, medians:
+
+| | AMD | Intel 630 | M3 | lane (5080) |
+|---|---|---|---|---|
+| Managed `replaceRegion:` of a whole texture, the call | 1.0 to 8.5 | 0.6 to 4.7 | 1.0 to 7.5 | 2.1 to 3.5 |
+| the same, calls 2 ms apart | 10 to 33 | 7 to 17 | 6 to 19 | 13 to 20 |
+| 64 such calls on 64 textures, then one buffer that reads them, per texture over that buffer alone | +39 to +68 | +0.6 to +7.5 | +0.6 to +22 | +85 to +98 |
+| a new Managed texture: `newTextureWithDescriptor:` | 12 to 13 | 7 to 9 | 9 to 19 | 13 to 25 |
+| a new texture, filled and read by a blit, over the blit of an old one | +90 to +170 | +7.5 to +11 | +38 to +144 | +264 to +375 |
+| Shared `replaceRegion:`, the call | 0.9 to 8.5 | 0.5 to 4.7 | 0.4 to 3.2 | 340 to 420 |
+| `didModifyRange:` of 256 B to 64 KiB, the call | 0.1 | 0.1 to 0.2 | 0.0 | 1.5 to 2.1 |
+| 64 such calls, then one buffer that reads the ranges, per range (256 B and 4 KiB; 64 KiB) | +1.2; +15 | +0.1 to +0.3 | +0.1; +0.3 | +7.5 to +8.7; +33 |
+| `didModifyData` of a linear texture over a Managed buffer, the call | 0.1 | 0.1 | 0.0 | 1.4 to 2.2 |
+| `replaceRegion:` of that texture, the call | 0.6 to 4.6 | 1.1 to 5.6 | 0.3 to 1.2 | 1.7 to 3.4 |
+
+At 1024 x 1024 BGRA8 (4 MiB) a Managed `replaceRegion:` call takes 402 us on the AMD and 320 on the
+lane, a Shared one 404 and 3,541, and a new Managed texture's make 12.7 and 685: the lane's make
+zeroes the texture's CPU copy (`RgfxTexture.mm`), where the AMD's takes its pages as it uses them.
+
+So on every Mac *(class 3)* `replaceRegion:` of a Managed or a Shared texture and
+`didModifyRange:` return without waiting for the GPU: the call is a copy into memory the CPU
+holds, and the GPU's copy is made at the next commit (AMD) or the call writes the GPU's memory
+itself (Intel, M3). The AMD pays 39 to 68 us a texture for that upload inside the next buffer.
+Ours:
+- **Managed:** the call is a copy into the CPU copy and a post of `TEXTURE_REPLACE_REGION` or
+  `BUFFER_DID_MODIFY_RANGE` (about 1.5 us of it the kext's call), on par with the Macs. The host
+  carries each out on its own before the context's next buffer (`decode/managed.rs`), at 85 to
+  98 us a texture on the 5080: twice the AMD's, in metal2vulkan's `replace_region`, which submits
+  and waits for each upload (read from its code at the 392ce3daf pin).
+- **Shared:** the call is a staging blit the call waits for (`RgfxTexture.mm`, rgfxCopyRegion:),
+  hundreds of times a Mac's. The AMD's Shared texture is an unsynchronized Managed one (Q3).
 
 ## The display's colour against the stock lane: deliberate divergences
 
