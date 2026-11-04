@@ -135,6 +135,30 @@ struct Transfer<P: Platform> {
     fills: Arc<Fills>,
 }
 
+impl<P: Platform> Transfer<P> {
+    /// A transfer queue and its event, its fills telling `hook`; `None` where the platform makes
+    /// either not.
+    fn new(device: &P::Device, hook: &Arc<OnceLock<FillHook>>) -> RaiseResult<Option<Self>> {
+        let Some(queue) = device.new_command_queue_unshared() else {
+            return Ok(None);
+        };
+        let Some(event) = device.new_event(ON)? else {
+            return Ok(None);
+        };
+        Ok(Some(Transfer {
+            queue,
+            event,
+            signalled: 0,
+            fills: Arc::new(Fills {
+                done: AtomicU64::new(0),
+                lock: Mutex::new(()),
+                moved: Condvar::new(),
+                hook: Arc::clone(hook),
+            }),
+        }))
+    }
+}
+
 /// The longest a wait for a fill sleeps at once ([`Fills::wait`]): the slices count the wait's
 /// timeout with no clock read; a fill's end wakes it at once.
 const FILL_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
@@ -271,7 +295,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     on: bool,
     by_block: HashMap<u64, SurfaceCache<P>>,
     transfer: Option<Transfer<P>>,
-    /// Each command queue's end event, by the queue's id, and the last value signalled.
+    /// Each command queue's end event, by the queue's id, and the last value signalled: made with
+    /// the queue ([`Caches::queue_made`]), or at its first buffer that uses a cache where it was
+    /// not; let go of at the queue's end where no buffer signalled it ([`Self::queue_ended`]).
     ends: HashMap<u64, (P::Event, u64)>,
     /// The caches' pages, watched for the host's devices' writes while this lives.
     watched: Arc<Watched>,
@@ -943,28 +969,23 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(())
     }
 
-    /// Makes the transfer queue at its first use; whether there is one.
+    /// Makes the transfer queue where the first command queue's make did not
+    /// ([`Caches::queue_made`]); whether there is one.
     fn make_transfer(&mut self, device: &P::Device) -> RaiseResult<bool> {
         if self.transfer.is_none() {
-            let Some(queue) = device.new_command_queue_unshared() else {
-                return Ok(false);
-            };
-            let Some(event) = device.new_event(ON)? else {
-                return Ok(false);
-            };
-            self.transfer = Some(Transfer {
-                queue,
-                event,
-                signalled: 0,
-                fills: Arc::new(Fills {
-                    done: AtomicU64::new(0),
-                    lock: Mutex::new(()),
-                    moved: Condvar::new(),
-                    hook: Arc::clone(&self.on_fill_done),
-                }),
-            });
+            self.transfer = Transfer::new(device, &self.on_fill_done)?;
         }
-        Ok(true)
+        Ok(self.transfer.is_some())
+    }
+
+    /// Queue `queue` is gone: its end event, where no command buffer of it signalled it, so no
+    /// copy waits for it, to let go of. One a buffer signalled stays, for the copies that wait
+    /// for the queue's last buffers.
+    fn queue_ended(&mut self, queue: u64) -> Option<P::Event> {
+        match self.ends.entry(queue) {
+            Entry::Occupied(end) if end.get().1 == 0 => Some(end.remove().0),
+            _ => None,
+        }
     }
 
     /// The device's reset: every block's cache goes uncopied, as its surface's pages are the
@@ -1069,6 +1090,73 @@ impl<P: Platform> Caches<P> {
     /// host's presents that wait for a fill ([`Self::fill_now`]). Set once; a second is ignored.
     pub(crate) fn on_fill_done(&self, hook: FillHook) {
         let _ = self.on_fill_done.set(hook);
+    }
+
+    /// Command queue `queue` was made: where the device keeps caches, its end event is made now,
+    /// and the transfer queue too where there is none yet, each with no lock held. A command
+    /// buffer's begin and finish, under the caches' lock, then make neither
+    /// ([`SurfaceCaches::after`], [`SurfaceCaches::make_transfer`]): every other queue's buffers
+    /// that use a cache would wait for the creation, which the platform's other threads' work on
+    /// the device's memory and semaphores can stretch to milliseconds (measured on the RTX 5080
+    /// Laptop GPU host: 0.5 to 3 ms an end event at a queue's first buffer in a guest's boot,
+    /// against 0.1 ms where no other thread makes or frees the device's memory or semaphores).
+    pub(crate) fn queue_made(&self, device: &P::Device, queue: u64) -> RaiseResult<()> {
+        let (on, transfer) = {
+            let state = self.state.lock();
+            (state.on, state.transfer.is_some())
+        };
+        if !on {
+            return Ok(());
+        }
+        let mut end = device.new_event(ON)?;
+        let mut made = match transfer {
+            true => None,
+            false => Transfer::new(device, &self.on_fill_done)?,
+        };
+        {
+            let mut state = self.state.lock();
+            // Kept only where the caches are still on, and where no buffer's begin or finish made
+            // the same meanwhile; else let go of below.
+            if state.on {
+                if let Some(event) = end.take() {
+                    match state.ends.entry(queue) {
+                        Entry::Vacant(slot) => {
+                            slot.insert((event, 0));
+                        }
+                        Entry::Occupied(_) => end = Some(event),
+                    }
+                }
+                if state.transfer.is_none() {
+                    state.transfer = made.take();
+                }
+            }
+        }
+        if (end.is_some() || made.is_some())
+            && let Err(refusal) = refusals::refusing(move || drop((end, made)))
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "queue {queue:#x}'s spare end event or transfer queue was let go of, and its \
+                 release was refused: {refusal}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Command queue `queue` is gone (its destroy, or its context's close): its end event goes
+    /// where no buffer of it signalled it ([`SurfaceCaches::queue_ended`]), let go of with no
+    /// lock held. A refusal is logged.
+    pub(crate) fn queue_ended(&self, queue: u64) {
+        let Some(end) = self.state.lock().queue_ended(queue) else {
+            return;
+        };
+        if let Err(refusal) = refusals::refusing(move || drop(end)) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "queue {queue:#x}'s end event was let go of, and its release was refused: \
+                 {refusal}"
+            );
+        }
     }
 
     /// The caches, locked: for what orders nothing against command buffers' uses.
@@ -1410,9 +1498,10 @@ mod tests {
         RgfxOpHeader,
     };
     use reims_graphics::wire::{
-        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_INVALID_ARGUMENT,
-        RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
-        RGFX_SURFACE_PAGES_DEFERRED, RgfxMsgHeader, RgfxQueueCreate,
+        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+        RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+        RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
+        RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
     };
     use reims_vgpu_core::num::ToU64 as _;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
@@ -1905,15 +1994,20 @@ mod tests {
         }]
     }
 
-    /// The transfer queue is made at the first fill, once, and unshared: a present of a surface
-    /// waits for its fill
+    /// The transfer queue is made with the first command queue, once, and unshared: a present of
+    /// a surface waits for its fill. The fills make no queue
     #[test]
-    fn the_transfer_queue_is_made_unshared_at_the_first_fill() {
+    fn the_transfer_queue_is_made_unshared_with_the_first_queue() {
         use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
         let mut r = cached();
         let (unshared, plain) = (
             r.p.call_log().count(UNSHARED_QUEUE),
             r.p.call_log().count("newCommandQueue"),
+        );
+        assert_eq!(
+            (unshared, plain),
+            (1, 2),
+            "made with queue 1, beside queues 1 and 2"
         );
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
@@ -1925,8 +2019,49 @@ mod tests {
             2,
             "a second fill"
         );
-        assert_eq!(r.p.call_log().count(UNSHARED_QUEUE), unshared + 1);
+        assert_eq!(r.p.call_log().count(UNSHARED_QUEUE), unshared);
         assert_eq!(r.p.call_log().count("newCommandQueue"), plain);
+    }
+
+    /// A queue's end event is made with the queue, so its first command buffer that uses a cache
+    /// makes no event as it fills the cache and signals the end event; at the queue's destroy, the
+    /// end event goes where no buffer of it signalled it, and stays where one did, for the copies
+    /// that wait for the queue's last buffers
+    #[test]
+    fn a_queues_end_event_is_made_with_it_and_its_first_buffer_makes_none() {
+        let mut r = cached();
+        let end = |r: &Rig, queue: u64| {
+            (r.dec.caches().ends.get(&queue)).map(|(event, _)| Arg::obj(event).as_obj().unwrap().0)
+        };
+        let one = end(&r, 1).expect("queue 1's end event, made with it");
+        assert!(end(&r, 2).is_some(), "queue 2's");
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1, "a fill");
+        assert!(
+            events(&calls, SIGNAL).contains(&(one, 1)),
+            "its end event signalled"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.sel == "newEvent" || c.sel == "newSharedEvent"),
+            "no event made at the buffer"
+        );
+        for queue in [1, 2] {
+            let destroy = RgfxObjectDestroy {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_OBJECT_DESTROY,
+                    size: size_of::<RgfxObjectDestroy>() as u32,
+                    seqno: 0,
+                },
+                obj_id: queue,
+            };
+            assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        }
+        assert_eq!(end(&r, 1), Some(one), "signalled: kept");
+        assert_eq!(end(&r, 2), None, "never signalled: let go of");
     }
 
     /// A fill of a cache waits for every command buffer begun and not finished that uses it, and

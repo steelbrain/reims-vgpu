@@ -200,7 +200,8 @@ struct Queue<P: Platform> {
     /// What its ring has published, as the host gave it; `None` where it gave nothing (the
     /// decoder's own tests).
     published: Option<Published>,
-    /// Its surface timeline, made at the first buffer that signals or waits on it.
+    /// Its surface timeline, made with the queue ([`SurfaceOrder::made`]), or at the first buffer
+    /// that signals or waits on it where it was not.
     event: Option<P::SharedEvent>,
     /// The queue is gone (destroyed, or its context closed): nothing signals past `signalled`.
     ended: bool,
@@ -245,11 +246,36 @@ impl<P: Platform> SurfaceOrder<P> {
         self.counts
     }
 
-    /// The marks of queue `queue`, which the host holds from now (its create), for its table
-    /// entry.
+    /// The marks of queue `queue`, which the host holds from now where it did not (the tests'
+    /// look at a queue's marks; a create takes them from [`Self::made`]).
+    #[cfg(test)]
     pub(crate) fn marks(&mut self, queue: u64) -> Arc<Marks> {
         let q = self.queues.entry(queue).or_insert_with(Queue::new);
         Arc::clone(&q.marks)
+    }
+
+    /// Queue `queue` was made, with `timeline`, its surface timeline, made with no lock held: the
+    /// marks for its table entry, and the timeline back where the queue has one already, for the
+    /// caller to let go of with no lock held. A buffer's signal or wait then makes no event under
+    /// the order's lock, which every queue's buffers that hold the op take: the platform's other
+    /// threads' work on the device's memory and semaphores can stretch a creation to milliseconds
+    /// (measured on the RTX 5080 Laptop GPU host: 0.6 to 9.4 ms a timeline at a queue's first
+    /// buffer in a guest's boot, against 0.1 ms where no other thread makes or frees the device's
+    /// memory or semaphores).
+    pub(crate) fn made(
+        &mut self,
+        queue: u64,
+        timeline: Option<P::SharedEvent>,
+    ) -> (Arc<Marks>, Option<P::SharedEvent>) {
+        let q = self.queues.entry(queue).or_insert_with(Queue::new);
+        let spare = match q.event {
+            None => {
+                q.event = timeline;
+                None
+            }
+            Some(_) => timeline,
+        };
+        (Arc::clone(&q.marks), spare)
     }
 
     /// Queue `queue` was made, its ring's published seqnos read through `published`: a wait for
@@ -819,19 +845,15 @@ mod tests {
         assert!(events(&calls, SIGNAL).is_empty(), "nothing waits past 7");
     }
 
-    /// A buffer that holds no op waits for nothing and signals nothing, and its queue gets no
-    /// timeline; one that names a queue the host does not hold, or a seqno past every one the
-    /// named queue's ring has published, waits for nothing
+    /// A buffer that holds no op waits for nothing, signals nothing and makes nothing; one that
+    /// names a queue the host does not hold, or a seqno past every one the named queue's ring has
+    /// published, waits for nothing
     #[test]
     fn buffers_that_share_no_named_buffer_wait_for_nothing() {
         let mut r = rig();
         let mark = r.p.call_log().mark();
         let (_, calls) = r.commit(A, 1, &ops(None, &[]));
         assert!(events(&calls, WAIT).is_empty() && events(&calls, SIGNAL).is_empty());
-        assert!(
-            r.dec.shared.surface_order.lock().state(A).is_none(),
-            "no timeline"
-        );
         assert!(
             !r.p.call_log().sels_since(mark).contains(&"newSharedEvent"),
             "nothing made"
@@ -850,6 +872,30 @@ mod tests {
         );
         let c = r.dec.shared.surface_order.lock().counts();
         assert_eq!((c.named, c.stale, c.waits), (3, 2, 1));
+    }
+
+    /// A queue's timeline is made with the queue, so neither its first buffer that holds the op,
+    /// which signals it, nor a buffer of another queue that waits on it makes an event
+    #[test]
+    fn a_queues_timeline_is_made_with_it_and_no_buffer_makes_one() {
+        let mut r = rig();
+        let (a, b) = (r.event(A), r.event(B));
+        let mark = r.p.call_log().mark();
+        let (outcome, calls) = r.commit(A, 1, &ops(Some(&[]), &[]));
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            events(&calls, SIGNAL),
+            [(a, 1)],
+            "A's first buffer signals its timeline"
+        );
+        let (outcome, calls) = r.commit(B, 1, &ops(Some(&[(A, 2)]), &[]));
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(events(&calls, WAIT), [(a, 2)], "B's waits on A's timeline");
+        assert_eq!(events(&calls, SIGNAL), [(b, 1)]);
+        assert!(
+            !r.p.call_log().sels_since(mark).contains(&"newSharedEvent"),
+            "no event made at a buffer"
+        );
     }
 
     /// A buffer that is not carried out still signals what may be waited for of it: its stand-in

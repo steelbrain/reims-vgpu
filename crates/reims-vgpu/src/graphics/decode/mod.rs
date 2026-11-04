@@ -1399,10 +1399,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Queue `queue_obj_id`, whose handle is `queue` where the host still holds it, is gone (its
-    /// destroy, or its context's close): its surface timeline signals what other queues' buffers
+    /// destroy, or its context's close): its end event goes where none of its buffers signalled it
+    /// ([`Caches::queue_ended`]), and its surface timeline signals what other queues' buffers
     /// wait for of it, once the order's lock is let go of ([`surface_order::SurfaceOrder::ended`]).
     /// A refusal is logged, and the destroy goes on.
     fn queue_ended(&self, queue_obj_id: u64, queue: Option<&P::CommandQueue>) {
+        self.surface_caches.queue_ended(queue_obj_id);
         let release = self.shared.surface_order.lock().ended(queue_obj_id);
         if let Some(release) = release
             && let Err(raise) = refusing(|| release.signal(queue))
@@ -2126,8 +2128,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 match made {
                     Some(queue) => {
+                        // Its surface timeline and its device caches' end event (and the caches'
+                        // transfer queue, made with the first queue) are made here, on the queue's
+                        // own thread before its first buffer, with no lock held, rather than at
+                        // that buffer's finish under the locks every queue's buffers take
+                        // ([`surface_order::SurfaceOrder::made`], [`Caches::queue_made`]). One not
+                        // made here is made there, as before.
+                        let timeline = device.new_shared_event();
+                        if let Err(raise) = self.surface_caches.queue_made(device, m.obj_id) {
+                            log::debug!(
+                                target: "reims_vgpu::graphics",
+                                "queue {:#x}: its end event was not made with it: {raise}",
+                                m.obj_id
+                            );
+                        }
                         let mut entry = Entry::of(ObjHandle::CommandQueue(queue));
-                        let order = self.shared.surface_order.lock().marks(m.obj_id);
+                        let (order, spare) =
+                            self.shared.surface_order.lock().made(m.obj_id, timeline);
+                        if let Some(spare) = spare {
+                            drop_refused(m.obj_id, spare);
+                        }
                         let lane = Lane::new(m.obj_id, Arc::clone(&self.shared.lanes));
                         entry.queue = Some(QueueCounts::on(lane, order));
                         self.store(m.obj_id, entry);
@@ -5070,9 +5090,12 @@ mod tests {
 
         assert_eq!(dec.object_count(), 13);
         let log = p.call_log();
-        assert_eq!(log.calls_to("newEvent").len(), 1);
+        // The guest's event, and the queue's device caches' end event and the caches' transfer
+        // event, made with the queue.
+        assert_eq!(log.calls_to("newEvent").len(), 3);
         assert_eq!(log.calls_to("newFence").len(), 1);
-        assert_eq!(log.calls_to("newSharedEvent").len(), 1);
+        // The guest's shared event, and the queue's surface timeline.
+        assert_eq!(log.calls_to("newSharedEvent").len(), 2);
         assert_eq!(log.calls_to("newCommandQueue").len(), 1);
         assert_eq!(log.calls_to("newLibraryWithData:error:").len(), 1);
         assert_eq!(log.calls_to("newSamplerStateWithDescriptor:").len(), 1);
