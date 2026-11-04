@@ -361,7 +361,7 @@ impl Platform for MetalPlatform {
     /// The device of `MTLCopyAllDevices()` whose `registryID` is `registry_id` (+1), or `None`.
     /// In one process it is the instance the host's own device is.
     fn open_device(&self, registry_id: u64) -> Option<MetalDevice> {
-        let all = msg::fatal_send("MTLCopyAllDevices()", || objc2_metal::MTLCopyAllDevices());
+        let all = msg::fatal_send("MTLCopyAllDevices()", objc2_metal::MTLCopyAllDevices);
         let count = msg::value("count", || all.count());
         (0..count)
             .map(|i| msg::value("objectAtIndex:", || all.objectAtIndex(i)))

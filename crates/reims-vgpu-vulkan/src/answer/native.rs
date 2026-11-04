@@ -475,7 +475,7 @@ fn placement_in(state: u8) -> Placement {
 pub fn device_made(properties: &rt::DeviceProperties) {
     super::census::on();
     let class = class_of(properties.description.driver_id);
-    let _ = STATE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+    let _ = STATE.try_update(Ordering::AcqRel, Ordering::Acquire, |s| {
         Some(after(s, class))
     });
 }

@@ -413,8 +413,7 @@ impl DirtyLog {
     /// Ends one [`DirtyLog::close`].
     pub fn reopen(&self) {
         let _s = self.state.lock();
-        let _ =
-            (self.closed).fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_sub(1));
+        let _ = (self.closed).try_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_sub(1));
     }
 
     /// Closes the log for good and drops the host's hook: once this returns, the hook is never

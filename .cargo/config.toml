@@ -8,3 +8,16 @@ xtask = "run --package xtask --"
 # archive `cargo xtask dist` links whole (`ld -r -force_load`) registers jemalloc as the first
 # malloc zone of every host that links it, ahead of the system's.
 enable_zone_allocator = "no"
+
+# rustc's parallel front end on every compile, with as many threads as the host has cores
+# (`-Zthreads=0`), through Cargo's profile rustflags, which add to `RUSTFLAGS` rather than give way
+# to it. `test`, `debugging` and `checked` inherit it from `dev` and `release`. The toolchain is
+# nightly for this (rust-toolchain.toml).
+[unstable]
+profile-rustflags = true
+
+[profile.dev]
+rustflags = ["-Zthreads=0"]
+
+[profile.release]
+rustflags = ["-Zthreads=0"]

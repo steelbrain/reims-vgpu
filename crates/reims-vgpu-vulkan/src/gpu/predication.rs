@@ -3306,7 +3306,15 @@ mod tests {
             let c = shared(64);
             let cb = command_buffer();
             let e = compute(&cb);
-            encode_all(&e, [set(&inc), bind(&[Some(&c)], &[0]), start_while(&c, 0, 1, 1000), one()]);
+            encode_all(
+                &e,
+                [
+                    set(&inc),
+                    bind(&[Some(&c)], &[0]),
+                    start_while(&c, 0, 1, 1000),
+                    one(),
+                ],
+            );
             e.encode_end_while().unwrap();
             e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
             cb.commit(OnFault::Return).unwrap();

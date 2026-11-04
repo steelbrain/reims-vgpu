@@ -247,8 +247,8 @@ the following.
 
 - An Apple silicon Mac. Every Rust binary is arm64 (`aarch64-apple-darwin`): rustc's arm64e target
   has no pointer authentication, and its binaries crash before `main` (`rust-toolchain.toml`).
-- The toolchain `rust-toolchain.toml` pins: stable 1.98.1 with rustfmt and clippy. rustup installs
-  it on first use.
+- The toolchain `rust-toolchain.toml` pins: nightly-2026-11-03 with rustfmt and clippy, for rustc's
+  parallel front end (`-Zthreads`, in `.cargo/config.toml`). rustup installs it on first use.
 - `cargo-nextest`, which runs the tests in `cargo xtask check`
   (`cargo install --locked cargo-nextest`).
 - cbindgen 0.29.4, for `cargo xtask header` (`cargo install --locked cbindgen --version 0.29.4`).

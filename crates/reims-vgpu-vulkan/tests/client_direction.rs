@@ -20,7 +20,11 @@
 //! surface's own, and Metal's write ends the process with a bus error, where this crate's platform
 //! dies at the call.
 
-#![cfg(target_os = "macos")] // Compares with Metal, which is macOS's.
+#![cfg(target_os = "macos")]
+// Compares with Metal, which is macOS's.
+// The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
+// `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
+#![recursion_limit = "256"]
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,

@@ -14,7 +14,11 @@
 //! too. A no-copy buffer's deallocator may call the platform's Mach VM, which tells the runtime,
 //! whichever thread releases the buffer.
 
-#![cfg(target_os = "macos")] // Compares with Metal, which is macOS's.
+#![cfg(target_os = "macos")]
+// Compares with Metal, which is macOS's.
+// The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
+// `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
+#![recursion_limit = "256"]
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,

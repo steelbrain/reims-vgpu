@@ -37,6 +37,9 @@
 //! told of are made through the OS's VM alone (`os::OsVm`), which reports nothing.
 
 #![cfg(target_os = "linux")]
+// The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
+// `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
+#![recursion_limit = "256"]
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,

@@ -358,7 +358,7 @@ mod tests {
             assert!(second_form_holds_every_id(0x4000));
             assert!(!second_form_holds_every_id(0x1000));
             assert_eq!(
-                (0x1000 / TABLE_ENTRY_SIZE) * (0x1000 / Form::First.size().get()),
+                (0x1000 / TABLE_ENTRY_SIZE) * (0x1000 / Form::First.size()),
                 MAPPING_ID_COUNT
             );
         }

@@ -104,7 +104,7 @@ impl HeldMessages {
     fn take(&self, bytes: usize) -> bool {
         let charge = |counter: &AtomicUsize, amount: usize, limit: usize| {
             counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                     held.checked_add(amount).filter(|&total| total <= limit)
                 })
                 .is_ok()

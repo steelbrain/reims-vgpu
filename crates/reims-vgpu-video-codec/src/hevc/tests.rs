@@ -489,9 +489,9 @@ fn slice(sps: &SpsSpec, pps: &PpsSpec, spec: &SliceSpec) -> Vec<u8> {
                 .unwrap_or((pps.l0_default_minus1, pps.l1_default_minus1));
             if pps.lists_modification && total_curr > 1 {
                 let bits = 32 - (total_curr - 1).leading_zeros();
-                for list in 0..if b { 2 } else { 1 } {
-                    w.bit(spec.list_entries[list].is_some());
-                    for &entry in spec.list_entries[list].iter().flatten() {
+                for entries in &spec.list_entries[..if b { 2 } else { 1 }] {
+                    w.bit(entries.is_some());
+                    for &entry in entries.iter().flatten() {
                         w.u(bits, entry);
                     }
                 }

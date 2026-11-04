@@ -1,13 +1,17 @@
-# Pinned stable (architecture 2.1), measured with objc2 0.6.4. D32: the Metal platform is
-# aarch64-apple-darwin alone; the Vulkan platform builds for aarch64 and x86-64, on macOS and
-# Linux, and x86_64-unknown-linux-gnu is what ships on Linux (built there, type-checked from the
-# Mac by `cargo xtask check`). x86_64-apple-darwin runs core's tests under Rosetta, with the x86-64
-# guest's pages and instructions, on a Mac that has Rosetta (check skips them on one without).
+# A dated nightly, for rustc's parallel front end (`-Zthreads`, set in `.cargo/config.toml` through
+# Cargo's profile rustflags), the toolchain metal2vulkan's builds use too. The date is fixed so
+# every host runs one rustc, clippy and rustfmt; moving it is a deliberate step, with a full check.
+# The crates' `rust-version` (Cargo.toml) stays the stable floor clippy's `incompatible_msrv` checks
+# the standard library's items against. D32: the Metal platform is aarch64-apple-darwin alone; the
+# Vulkan platform builds for aarch64 and x86-64, on macOS and Linux, and x86_64-unknown-linux-gnu is
+# what ships on Linux (built there, type-checked from the Mac by `cargo xtask check`).
+# x86_64-apple-darwin runs core's tests under Rosetta, with the x86-64 guest's pages and
+# instructions, on a Mac that has Rosetta (check skips them on one without).
 # No Rust binary is arm64e: rustc's arm64e-apple-darwin target has no pointer authentication, and
 # its binaries, a hello world among them, crash in dyld's `_tlv_get_addr` before `main` (measured
 # 2026-09-25 with nightly-2026-09-24 on macOS 26.7). An arm64 binary still links and calls arm64e
 # code, as it calls the system's frameworks, and arm64e code calls its callbacks.
 [toolchain]
-channel = "1.98.1"
+channel = "nightly-2026-11-03"
 components = ["rustfmt", "clippy"]
 targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]

@@ -949,7 +949,9 @@ macro_rules! apply_attachment {
 
 apply_attachment!(
     /// A colour attachment's set; its own: the clear colour.
-    apply_color_attachment(ColorAttachmentSet, MetalRenderPassColorAttachment) |set, o| {
+    apply_color_attachment(ColorAttachmentSet, MetalRenderPassColorAttachment)
+        | set,
+    o | {
         if let Some(v) = set.clear_color {
             let v = v.mtl();
             msg::get("setClearColor:", || o.setClearColor(v));
@@ -959,30 +961,30 @@ apply_attachment!(
 
 apply_attachment!(
     /// The depth attachment's set; its own: the clear depth, then the resolve filter.
-    apply_depth_attachment(DepthAttachmentSet, MetalRenderPassDepthAttachment) |set, o| {
+    apply_depth_attachment(DepthAttachmentSet, MetalRenderPassDepthAttachment)
+        | set,
+    o | {
         if let Some(v) = set.clear_depth {
             msg::get("setClearDepth:", || o.setClearDepth(v));
         }
         if let Some(v) = set.depth_resolve_filter {
             let v = MTLMultisampleDepthResolveFilter(v.to_usize());
-            msg::get("setDepthResolveFilter:", || {
-                o.setDepthResolveFilter(v)
-            });
+            msg::get("setDepthResolveFilter:", || o.setDepthResolveFilter(v));
         }
     }
 );
 
 apply_attachment!(
     /// The stencil attachment's set; its own: the clear stencil, then the resolve filter.
-    apply_stencil_attachment(StencilAttachmentSet, MetalRenderPassStencilAttachment) |set, o| {
+    apply_stencil_attachment(StencilAttachmentSet, MetalRenderPassStencilAttachment)
+        | set,
+    o | {
         if let Some(v) = set.clear_stencil {
             msg::get("setClearStencil:", || o.setClearStencil(v));
         }
         if let Some(v) = set.stencil_resolve_filter {
             let v = MTLMultisampleStencilResolveFilter(v.to_usize());
-            msg::get("setStencilResolveFilter:", || {
-                o.setStencilResolveFilter(v)
-            });
+            msg::get("setStencilResolveFilter:", || o.setStencilResolveFilter(v));
         }
     }
 );

@@ -376,7 +376,7 @@ fn install_abort_report() {}
 #[cfg(unix)]
 extern "C" fn report_abort(_: i32) {
     unsafe extern "C" {
-        fn write(fd: i32, bytes: *const u8, count: usize) -> isize;
+        fn write(fd: std::ffi::c_int, bytes: *const std::ffi::c_void, count: usize) -> isize;
     }
     let name = CASE_NAME.load(Ordering::SeqCst);
     // SAFETY: null, or a name `run` leaked, which lives for ever.
@@ -395,7 +395,7 @@ extern "C" fn report_abort(_: i32) {
     let end = usize::try_from(cursor.position()).unwrap_or(0);
     // SAFETY: `end` bytes of `line` are initialised.
     unsafe {
-        write(2, line.as_ptr(), end);
+        write(2, line.as_ptr().cast(), end);
     }
 }
 

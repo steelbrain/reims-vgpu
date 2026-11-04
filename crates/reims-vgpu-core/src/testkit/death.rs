@@ -1629,11 +1629,7 @@ mod tests {
         |r| {
             let h = r.assert_hung_at("sleeping an hour");
             assert_eq!(h.thread.name(), Some("hang-body"));
-            assert!(
-                r.records()
-                    .iter()
-                    .any(|x| x.kind == RecordKind::Advanced)
-            );
+            assert!(r.records().iter().any(|x| x.kind == RecordKind::Advanced));
         }
     );
 
@@ -1844,7 +1840,10 @@ mod tests {
         another_threads_op_after_the_death_is_not_the_deaths,
         options = DYING_THREAD,
         |t| {
-            let (go, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+            let (go, done) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
             let (go2, done2) = (go.clone(), done.clone());
             named("other", move || {
                 while !go2.load(Ordering::Acquire) {
@@ -1924,7 +1923,10 @@ mod tests {
         /// the op that preceded it, not at the worker's stale op
         a_death_on_a_reused_worker_is_at_the_op_before_it,
         |t| {
-            let q = crate::rt::queue::SerialQueue::new(&crate::testkit::threads::FakeThreads::default(), "A");
+            let q = crate::rt::queue::SerialQueue::new(
+                &crate::testkit::threads::FakeThreads::default(),
+                "A",
+            );
             let done = Arc::new(AtomicBool::new(false));
             let d2 = done.clone();
             q.exec_async(move || {
@@ -1934,7 +1936,9 @@ mod tests {
             // The worker ran the first block and waits for the next.
             wait_until(|| done.load(Ordering::Acquire));
             t.op("body: submit C");
-            q.exec_async(|| crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_t"));
+            q.exec_async(|| {
+                crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_t")
+            });
             park_forever()
         },
         |r| {
@@ -1942,7 +1946,10 @@ mod tests {
             assert!(!d.thread.body, "{d:?}");
             // The reused worker's own last op is A's finished block.
             let tid = d.thread.tid;
-            assert_eq!(r.last_op_before_end(|t| t.tid == tid), Some("A: block done"));
+            assert_eq!(
+                r.last_op_before_end(|t| t.tid == tid),
+                Some("A: block done")
+            );
             assert_eq!(r.ops(), ["A: block done", "body: submit C"]);
         }
     );
@@ -1975,7 +1982,9 @@ mod tests {
             go.store(true, Ordering::Release);
             wait_until(|| finished.load(Ordering::Acquire) == 2);
             t.op("body: submit C");
-            qa.exec_async(|| crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_t"));
+            qa.exec_async(|| {
+                crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_t")
+            });
             park_forever()
         },
         |r| {
@@ -2081,7 +2090,11 @@ mod tests {
             assert!(d.thread.body, "{d:?}");
             assert_eq!(d.op.as_deref(), Some("recursing"));
             assert_eq!(d.id, None);
-            assert!(r.stderr().contains("overflowed its stack"), "{}", r.stderr());
+            assert!(
+                r.stderr().contains("overflowed its stack"),
+                "{}",
+                r.stderr()
+            );
             // std's line is one death's, and one death alone did not race.
             assert!(!d.raced, "{d:?}");
             assert_eq!(d.abort_lines.len(), 1, "{d:?}");
@@ -2151,7 +2164,10 @@ mod tests {
         #[should_panic(expected = "expected a death")]
         a_death_deferred_past_the_call_fails,
         |t| {
-            let q = crate::rt::queue::SerialQueue::new(&crate::testkit::threads::FakeThreads::default(), "Q");
+            let q = crate::rt::queue::SerialQueue::new(
+                &crate::testkit::threads::FakeThreads::default(),
+                "Q",
+            );
             t.op("body: calling");
             trace("api: called");
             q.exec_async(|| {
@@ -2260,7 +2276,9 @@ mod tests {
         two_death_lines_are_not_paired,
         |_| {
             printed_not_marked("a", "site_a", 0);
-            named("b", || crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_b"));
+            named("b", || {
+                crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_b")
+            });
             park_forever()
         },
         |r| {
@@ -2314,7 +2332,9 @@ mod tests {
                 park_forever()
             });
             wait_until(|| marked.load(Ordering::Acquire));
-            named("b", || crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_b"));
+            named("b", || {
+                crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_b")
+            });
             park_forever()
         },
         |r| {
@@ -2421,7 +2441,11 @@ mod tests {
                 crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "site_t")
             });
             t.op("body: checking");
-            assert_eq!(std::hint::black_box(1 + 1), 3, "the body's own check failed");
+            assert_eq!(
+                std::hint::black_box(1 + 1),
+                3,
+                "the body's own check failed"
+            );
         },
         |r| {
             let _ = r.assert_died_at(SITE, "body: checking");
@@ -2505,7 +2529,7 @@ mod tests {
         a_death_line_beside_a_std_abort_is_not_paired,
         |_| {
             printed_not_marked("a", "site_a", 0);
-            named("b", || a_panic_in_a_trampoline());
+            named("b", a_panic_in_a_trampoline);
             park_forever()
         },
         |r| check_a_beside_another_abort(r, "panic. aborting.")
@@ -2561,7 +2585,10 @@ mod tests {
             assert!(!d.raced, "{d:?}");
             assert_eq!((d.id.as_ref(), d.ids.len()), (None, 0), "{d:?}");
             assert_eq!(d.abort_lines.len(), 1, "{d:?}");
-            assert!(d.abort_lines[0].contains("reims-vgpu: panicked at "), "{d:?}");
+            assert!(
+                d.abort_lines[0].contains("reims-vgpu: panicked at "),
+                "{d:?}"
+            );
             assert_eq!(d.thread.name(), Some("b"));
             assert_eq!(d.op.as_deref(), Some("body: calling"));
         }

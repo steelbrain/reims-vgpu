@@ -646,7 +646,7 @@ impl Worker {
     fn take_up_frame(&self) {
         let _ = self
             .frames_queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 queued.checked_sub(1)
             });
     }
