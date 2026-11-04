@@ -31,7 +31,9 @@
 #                 pkg_throttle_count_start, pkg_throttle_ms_start, core_throttle_ms_start); at
 #                 the end the temperature and what the counters grew by during the boot
 #                 (pkg_temp_end_c, pkg_throttle_count_during, pkg_throttle_ms_during,
-#                 core_throttle_ms_during)
+#                 core_throttle_ms_during); the memory compaction counters at the start and end and
+#                 their growth (compact_stall_, compact_fail_, compact_success_start, _end and
+#                 _during, /proc/vmstat), and the free memory at the end (memfree_end_mib, ...)
 #   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
 #   kernel-rgfx.log, kring.raw, kring-clock.txt   the kext's lines from the guest kernel's ring
 #                 (it logs to no log stream), the guest's boot time and clock against the host's;
@@ -157,12 +159,35 @@ stop_load() {
   kv load_duty "$(sed -n 's/^gpuload: end duty=\([0-9.]*\).*/\1/p' "$R/gpuload.log")"
   log "fixed GPU load stopped: $(tail -1 "$R/gpuload.log")"
 }
+# The host's state at the boot's end, read before QEMU stops (its guest RAM still pinned).
+end_readings() {
+  # The host's free memory and its memory compaction at the end: the runtime pins all of the
+  # guest's RAM at the start, and a host short of free pages compacts (compact_stall: a process
+  # that waited for it), which moves a boot's times.
+  while read -r k v _; do kv "$(tr 'A-Z' 'a-z' <<< "${k%:}")_end_mib" "$(( v / 1024 ))"
+  done < <(grep -E '^(MemFree|MemAvailable|Cached):' /proc/meminfo)
+  if [[ -s $R/vmstat-start.txt ]]; then
+    while read -r k v; do
+      v0=$(awk -v k="$k" '$1 == k {print $2}' "$R/vmstat-start.txt")
+      kv "${k}_end" "$v"; [[ -n $v0 ]] && kv "${k}_during" "$(( v - v0 ))"
+    done < <(grep -E '^compact_(stall|fail|success) ' /proc/vmstat)
+  fi
+  if [[ -s $R/thermal-start.txt ]]; then
+    read -r _ pc0 pm0 _ cm0 < "$R/thermal-start.txt"
+    read -r t1 pc1 pm1 _ cm1 <<< "$(thermal_now)"
+    kv pkg_temp_end_c "$t1"
+    kv pkg_throttle_count_during "$(( pc1 - pc0 ))"
+    kv pkg_throttle_ms_during "$(( pm1 - pm0 ))"
+    kv core_throttle_ms_during "$(( cm1 - cm0 ))"
+  fi
+}
 finish() {
   local qp=$P
   [[ -n ${KRINGPID:-} ]] && kill "$KRINGPID" 2> /dev/null
   [[ -d $R/capture ]] && touch "$R/capture/stop"
   stop_clocks
   stop_load
+  end_readings
   stop_qemu
   # The NVIDIA driver's GPU errors from this script's start to now (msi-xid.sh), each with its
   # process: xid.txt, and xid_own those from this boot's QEMU, which fail the gate.
@@ -199,14 +224,6 @@ finish() {
     kv serial_fatal_lines "${n:-0}"
   fi
   rm -f "$B"/*.qcow2
-  if [[ -s $R/thermal-start.txt ]]; then
-    read -r _ pc0 pm0 _ cm0 < "$R/thermal-start.txt"
-    read -r t1 pc1 pm1 _ cm1 <<< "$(thermal_now)"
-    kv pkg_temp_end_c "$t1"
-    kv pkg_throttle_count_during "$(( pc1 - pc0 ))"
-    kv pkg_throttle_ms_during "$(( pm1 - pm0 ))"
-    kv core_throttle_ms_during "$(( cm1 - cm0 ))"
-  fi
   kv hold_s "$(( $(date +%s) - T0 ))"
   log "BOOT_DONE"
 }
@@ -343,7 +360,8 @@ fi
     # below the guest's RAM: the runtime imports all of it at the start).
     grep -q -x GPU_HELD "$B/launch.log" && { echo "held $(date +%s.%N | cut -c1-14)"
       grep -E '^(MemFree|MemAvailable|Cached):' /proc/meminfo > "$R/meminfo-start.txt"
-      thermal_now > "$R/thermal-start.txt"; cut -d' ' -f1 /proc/uptime > "$R/uptime-start.txt"; break; }
+      thermal_now > "$R/thermal-start.txt"; cut -d' ' -f1 /proc/uptime > "$R/uptime-start.txt"
+      grep -E '^compact_(stall|fail|success) ' /proc/vmstat > "$R/vmstat-start.txt"; break; }
   done ) > "$R/boot-times.txt" 2> /dev/null &
 TIMES=$!
 # rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
@@ -379,6 +397,7 @@ T0=${T0%.*}
   kv "$(tr 'A-Z' 'a-z' <<< "${k%:}")_start_mib" "$(( v / 1024 ))"
 done < "$R/meminfo-start.txt"
 [[ -s $R/uptime-start.txt ]] && kv uptime_start_s "$(cut -d. -f1 "$R/uptime-start.txt")"
+[[ -s $R/vmstat-start.txt ]] && while read -r k v; do kv "${k}_start" "$v"; done < "$R/vmstat-start.txt"
 if [[ -s $R/thermal-start.txt ]]; then
   read -r t pc pm cc cm < "$R/thermal-start.txt"
   kv pkg_temp_start_c "$t"; kv pkg_throttle_count_start "$pc"; kv pkg_throttle_ms_start "$pm"
