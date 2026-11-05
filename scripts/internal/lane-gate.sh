@@ -60,7 +60,9 @@
 #                 the gate measures and checks there, the app load's desktop still up
 #                 (lane-gate/msi-probes.sh, into the boot's post-probes/; report.py lists each as
 #                 INFO, and their fatal lines count in the boot's); the boot's hold grows by their
-#                 budgets. Given to the build (it ships DIR) and again to the --boot-only pass
+#                 budgets. Given to the build, it ships DIR; given to a --boot-only pass alone, the
+#                 pass adds DIR to the run's ship commit (a child commit) and the boot moves the
+#                 kept workspace to it (potluck --advance)
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -127,7 +129,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio= post_probes=
+record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio= post_probes= advance=
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -604,6 +606,30 @@ do_host() {
 
 # --- the boot ---------------------------------------------------------------------------------
 
+# ship_post: --post-probes on a --boot-only pass, whose build shipped none: a child of the ship
+# commit with DIR in lg/post-probes, checked out in SHIP_WT, for the boot's --advance.
+ship_post() {
+  local gd idx parent tree commit
+  [[ -n $post_probes && ! -d $SHIP_WT/lg/post-probes ]] || return 0
+  gd=$(git -C "$SRC" rev-parse --path-format=absolute --git-common-dir)
+  idx=$RUN/ship-post.index
+  rm -f "$idx"
+  parent=$(git -C "$SHIP_WT" rev-parse HEAD)
+  GIT_INDEX_FILE=$idx git --git-dir="$gd" read-tree "$parent"
+  (cd "$post_probes" && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "$RUN/post.files"
+  [[ -s $RUN/post.files ]] || { echo "ship_post: no files in $post_probes"; return 1; }
+  sed "s#^#$post_probes/#" "$RUN/post.files" | git --git-dir="$gd" hash-object -w --stdin-paths > "$RUN/post.blobs"
+  while IFS= read -r f; do if [[ -x $post_probes/$f ]]; then echo 100755; else echo 100644; fi; done < "$RUN/post.files" > "$RUN/post.modes"
+  sed 's#^#lg/post-probes/#' "$RUN/post.files" | paste -d' ' "$RUN/post.modes" "$RUN/post.blobs" - |
+    awk '{ printf "%s %s\t%s\n", $1, $2, $3 }' | GIT_INDEX_FILE=$idx git --git-dir="$gd" update-index --add --index-info
+  tree=$(GIT_INDEX_FILE=$idx git --git-dir="$gd" write-tree)
+  commit=$(git --git-dir="$gd" commit-tree "$tree" -p "$parent" -m ":construction: WIP lane-gate ship $runid: post probes (throwaway)")
+  rm -f "$idx"
+  git -C "$SHIP_WT" reset -q --hard "$commit"
+  echo "post probes: $(wc -l < "$RUN/post.files") files from $post_probes in $commit"
+  advance=1
+}
+
 # do_boot boot|bench: the correctness boot or the bench boot, each a job in the host build's
 # workspace holding the 5080 and the whole host (--exclusive). msi-launch.sh picks each boot's SSH
 # port.
@@ -652,7 +678,7 @@ POST_PROBES=$([[ $mode == boot && -n $post_probes ]] && echo "$MR/post-probes")
 POST_PROBE_TIP=$sha
 EOF
   set +e
-  pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" --exclusive --gpu "$PL_GPU" --workspace "$ws" \
+  pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" --exclusive --gpu "$PL_GPU" --workspace "$ws" ${advance:+--advance} \
     --label "lane-gate=$mode" -- bash lg/bin/msi-job.sh boot "$mode" "$(base64 < "$RUN/boot-$mode.env" | tr -d '\n')"
   local rc=$?
   set -e
@@ -739,6 +765,7 @@ if ((boot_only)); then
   [[ -f $RUN/steps/msi-build.ok && ( -n $image || -f $RUN/steps/image.ok ) ]] || die "run $runid has no host build or image"
   rm -f "$RUN/steps/boot.ok" "$RUN/steps/boot.fail"
   grep -q -x boot "$RUN/ran" 2> /dev/null || echo boot >> "$RUN/ran"
+  ship_post || die "the post probes could not be added to the ship commit"
   step boot do_boot boot || true
   set +e
   report

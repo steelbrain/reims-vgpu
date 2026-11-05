@@ -138,6 +138,8 @@ boot)
   out=$MR/out-$mode
   rm -rf "$out" "$OUT/$mode" && mkdir -p "$out" "$OUT/$mode"
   printf '%s' "$env" | base64 -d > "$out/boot.env"
+  # Post probes a boot-only pass added (lane-gate.sh --post-probes, the workspace advanced to them).
+  [[ ! -d $WS/lg/post-probes ]] || { rm -rf "$MR/post-probes"; cp -a "$WS/lg/post-probes" "$MR/post-probes"; }
   bash "$MR/bin/msi-boot.sh" "$out"
   rc=$?
   for f in boot.log guest.log cpu.txt thermal.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log xid.txt \
