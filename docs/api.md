@@ -750,7 +750,7 @@ The header's 56 functions, in its order. "May" is the header's mark "may call ba
 | 53 | `rvg_graphics_device_mmio_write` | | a 32-bit write of BAR 0's registers: STATUS, and DOORBELL where the host's ioeventfd did not take it; STATUS 0 resets the device |
 | 54 | `rvg_graphics_device_mmio_write_taking` | may | `_mmio_write`, but a DOORBELL write of a command queue's ring may answer the queue's next command buffer on the calling thread where nothing need be waited for, allocating nothing, and post its `CB_SUBMITTED` there, raising the interrupt inside the call; the queue's thread takes the buffer either way, as after `_mmio_write` |
 | 55 | `rvg_graphics_device_set_doorbell` | | the host's doorbell file for the control ring (QEMU's ioeventfd), which the device polls with its own wake |
-| 56 | `rvg_graphics_device_reset` | | the guest's bus reset, as STATUS 0: the device as one just made, every object the guest made dropped |
+| 56 | `rvg_graphics_device_reset` | | the guest's bus reset, as STATUS 0: the device as one just made, every object the guest made dropped, its display still showing its scanout |
 
 QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), its `reims-graphics-pci` seven of the graphics device's eight (all but `_mmio_write_taking`), the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 56, the scaler's process and reset after a start only where the device scales (elsewhere it checks that the start fails). What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
 

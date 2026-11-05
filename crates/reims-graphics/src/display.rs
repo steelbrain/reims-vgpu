@@ -9,7 +9,8 @@
 //! **Scanout.** `SET_SCANOUT` names the pixels the display shows, in the scanout's room of the
 //! region (`RGFX_SCANOUT_SPAN` bytes at `RGFX_ALLOCATIONS_OFFSET`, before the processes' blocks,
 //! so the display never shows a process's memory); the screen reads them in place. It shows them again at a refresh of its host screen only where the guest wrote
-//! them since ([`Screen::present`], which `refresh` calls on the host's dirty log).
+//! them since ([`Screen::present`], which `refresh` calls on the host's dirty log). A reset of the
+//! device keeps the scanout (`device`'s module doc); only `SET_SCANOUT` changes it.
 //!
 //! **Cursor.** `SET_CURSOR` copies the guest's image, premultiplied BGRA8, out of the region,
 //! and hands the screen straight-alpha RGBA ([`straight_rgba`]); `MOVE_CURSOR` tells it where the
@@ -84,7 +85,8 @@ pub trait Screen: Send + Sync + 'static {
     fn mode(&self) -> Mode;
 
     /// The guest set the pixels the display shows, or blanked it (`None`). The screen shows
-    /// them at once, and then at a refresh where the guest wrote them ([`Screen::present`]).
+    /// them at once, and then at a refresh where the guest wrote them ([`Screen::present`]),
+    /// across the device's resets, until the guest sets others.
     fn scanout(&self, scanout: Option<Scanout>);
 
     /// The guest wrote the pixels the display shows since the last refresh: the screen shows

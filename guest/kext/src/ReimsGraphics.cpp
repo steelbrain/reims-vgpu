@@ -1242,9 +1242,10 @@ void ReimsGraphics::quiesce()
 	}
 }
 
-// A start refused before it took the device leaves it unreset: a reset ends the firmware's scanout,
-// and the host's screen would keep the firmware's last frame under the boot framebuffer driver the
-// OS falls back to.
+// A start refused before it took the device leaves it unreset, writing nothing to a device whose
+// registers it may misread (design.md, "The wire's version"). One that took it resets it, and the
+// reset keeps the scanout (design.md, "Reset"), so the boot framebuffer driver the OS falls back to
+// after a failed start is still seen.
 void ReimsGraphics::teardown()
 {
 	if (registers && taken)

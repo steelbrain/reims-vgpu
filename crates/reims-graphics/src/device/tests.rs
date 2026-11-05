@@ -780,8 +780,8 @@ fn a_new_mode_is_told_with_display_changed() {
     assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 1280);
 }
 
-/// A reset stops the device, puts both rings back as new and the display with no scanout,
-/// cursor or `VBLANK`, and the guest starts again from its first command
+/// A reset stops the device, puts both rings back as new and the display with no cursor or
+/// `VBLANK`, its scanout kept, and the guest starts again from its first command
 #[test]
 fn a_reset_puts_the_device_back_as_new() {
     let mut rig = Rig::new();
@@ -793,14 +793,7 @@ fn a_reset_puts_the_device_back_as_new() {
     rig.told();
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
-    assert_eq!(
-        rig.told(),
-        [
-            Told::Scanout(None),
-            Told::Cursor(None),
-            Told::Moved(0, 0, true)
-        ]
-    );
+    assert_eq!(rig.told(), [Told::Cursor(None), Told::Moved(0, 0, true)]);
     for header in [RGFX_CONTROL_SUBMIT_OFFSET, RGFX_CONTROL_COMPLETE_OFFSET] {
         assert_eq!(rig.region().atomic_u64(header).load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -815,7 +808,15 @@ fn a_reset_puts_the_device_back_as_new() {
         .atomic_u32(RGFX_CONTROL_SUBMIT_OFFSET + 0x80)
         .load(Ordering::SeqCst);
     assert_eq!(idle, 1, "the guest rings for its first message");
-    assert_eq!(rig.device.shared.display.lock().scanout, None);
+    assert_eq!(
+        rig.device.shared.display.lock().scanout,
+        Some(Scanout {
+            width: 16,
+            height: 4,
+            stride: 64,
+            offset: RGFX_ALLOCATIONS_OFFSET,
+        })
+    );
     rig.refresh();
     (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
     rig.start();
@@ -827,6 +828,68 @@ fn a_reset_puts_the_device_back_as_new() {
         RGFX_EVT_DISPLAYS
     );
     assert!(rig.event().is_none(), "no VBLANK after the reset");
+}
+
+/// A reset keeps the display's scanout, as a display engine goes on scanning out across its
+/// GPU driver's reset: the firmware's scanout outlives the kext's reset that takes the device,
+/// its start, and its reset on the way out where it then fails, the screen told nothing, and a
+/// refresh after each shows what the guest writes there (the OS's fallback to the firmware's
+/// framebuffer). Only `SET_SCANOUT` changes it: another scanout, or none for width 0
+#[test]
+fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
+    let mut rig = Rig::new();
+    let alloc = RGFX_ALLOCATIONS_OFFSET;
+    let span = 64 * 3 + 16 * 4;
+    // The firmware's scanout.
+    rig.start();
+    rig.send(scanout(16, 4, 64, alloc));
+    rig.complete();
+    rig.told();
+    rig.written.store(true, Ordering::SeqCst);
+    let restart = |rig: &mut Rig| {
+        (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+        rig.start();
+    };
+    // The kext's take, its start and its GET_DISPLAYS, and its reset on the way out.
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    restart(&mut rig);
+    rig.send(get_displays());
+    rig.event().expect("DISPLAYS");
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert!(
+        !rig.told().iter().any(|t| matches!(t, Told::Scanout(_))),
+        "a reset told the screen of the scanout"
+    );
+    rig.asked.lock().clear();
+    rig.refresh();
+    assert_eq!(rig.told(), [Told::Present]);
+    assert_eq!(*rig.asked.lock(), [(alloc, span)]);
+
+    // The guest's next driver sets another scanout, and then blanks the display.
+    restart(&mut rig);
+    rig.send(scanout(8, 2, 64, alloc + 0x1000));
+    rig.complete();
+    rig.told();
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    rig.told();
+    rig.asked.lock().clear();
+    rig.refresh();
+    assert_eq!(rig.told(), [Told::Present]);
+    assert_eq!(*rig.asked.lock(), [(alloc + 0x1000, 64 + 8 * 4)]);
+    restart(&mut rig);
+    rig.send(scanout(0, 0, 0, 0));
+    rig.complete();
+    assert_eq!(rig.told(), [Told::Scanout(None)]);
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    rig.told();
+    rig.asked.lock().clear();
+    rig.refresh();
+    assert_eq!(rig.told(), []);
+    assert_eq!(*rig.asked.lock(), []);
 }
 
 /// The host's doorbell file wakes the control thread as a `DOORBELL` write does

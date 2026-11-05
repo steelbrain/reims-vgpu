@@ -187,6 +187,9 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     /// which feeds it the control ring's stage-3 messages; held here for the tests' look at it.
     #[cfg(any(test, feature = "testkit"))]
     control: Arc<GraphicsControl<P>>,
+    /// What the window shows, where there is one: the tests draw it.
+    #[cfg(test)]
+    shown: Option<Arc<Shown>>,
     /// The platform the decoder runs on.
     platform: PhantomData<fn() -> P>,
 }
@@ -333,10 +336,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 deferred_budget,
                 control: Arc::clone(&control),
             });
+            #[cfg(test)]
+            let mut shown = None;
             let (window, screen): (Option<WindowLink>, Box<dyn Screen>) = match config.window {
                 Some(window_config) => {
                     let (link, screen) =
                         WindowScreen::open(&platform, &region, &control.presented, window_config);
+                    #[cfg(test)]
+                    {
+                        shown = Some(Arc::clone(&screen.shown));
+                    }
                     (Some(link), Box::new(screen))
                 }
                 None => (None, Box::new(FixedScreen(FALLBACK_MODE))),
@@ -348,6 +357,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 device,
                 #[cfg(any(test, feature = "testkit"))]
                 control,
+                #[cfg(test)]
+                shown,
                 platform: PhantomData,
             })
         })
@@ -626,7 +637,7 @@ impl<P: Platform> Presented<P> {
         hold
     }
 
-    /// The device's reset: the display shows the scanout (none, after the reset) in place of any
+    /// The device's reset: the display shows the scanout, which the reset keeps, in place of any
     /// surface, whose texture is let go of in a refusal scope; the answers still owed are given
     /// as they come, and dropped, as each is of a present taken before the reset.
     fn reset(&self) {
@@ -1851,8 +1862,14 @@ impl WindowScreen {
         let first = config.mode.unwrap_or((1920, 1080));
         let window = Window::new(config, 0, reims_vgpu_window::handle::title(0));
         window.offered_mode(first.0, first.1);
-        let refresh_mhz = reims_vgpu_window::screens::screen_for_port(0)
-            .map_or(FALLBACK_MODE.refresh_mhz, |s| hz_to_mhz(s.refresh_hz));
+        // In the crate's tests the display runs at 60 Hz, asking the host for no screen: on Linux
+        // the ask starts the windows' UI thread.
+        let refresh_mhz = if cfg!(test) {
+            FALLBACK_MODE.refresh_mhz
+        } else {
+            reims_vgpu_window::screens::screen_for_port(0)
+                .map_or(FALLBACK_MODE.refresh_mhz, |s| hz_to_mhz(s.refresh_hz))
+        };
         let shown = Arc::new(Shown::default());
         if let Some(sink) = scanout_sink(platform, region, &shown, presented) {
             window.attach(sink);

@@ -691,9 +691,9 @@ bundle at all.
 Leaving the device means writing nothing to its registers or its region.
 The framebuffer's start resets the device (`STATUS` 0) only once every check
 that needs no command has passed, and resets it again on the way out only if
-it did so: a reset ends the scanout the firmware set up, and with the kext
-refused the OS drives the display through the firmware's framebuffer, which
-the host shows only while that scanout stands.
+it did so. With the kext refused, or failed after its reset, the OS drives
+the display through the firmware's framebuffer, which the host shows through
+the scanout the firmware set up: a reset keeps the scanout (Reset, below).
 
 Every change a guest built before it would misread moves `RGFX_VERSION` on by
 one, in the same commit:
@@ -1081,6 +1081,19 @@ it picks free from 1 again, every texture resource id and GPU address free
 (a range a buffer of the guest's before the reset still held would refuse the
 rebooted WindowServer's pin of it), a library lookup that misses, and VBLANK
 counts from 0. What the guest wrote in the region stays.
+
+The display keeps its scanout across a reset, as a GPU's display engine goes
+on scanning out across a reset of its driver: the host's window shows what
+the guest writes there until the guest sets another scanout or blanks it.
+The kext's start resets the device to take it, and where the start fails
+after that (the device lists no usable display, or `IOFramebuffer`'s start
+fails) it resets it again on the way out; the OS then draws into the
+firmware's framebuffer, which the firmware's scanout, kept through both
+resets, still shows. Tested by
+`a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows`
+(`reims-graphics`) and
+`a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window`
+(`graphics/tests.rs`).
 
 **Texture resource ids.** Every process's textures share the host's one
 device, whose texture ids end below 16381: Metal ends the process for a texture

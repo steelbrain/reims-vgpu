@@ -1421,6 +1421,248 @@ fn the_sink_imports_only_the_scanout_s_pages() {
     assert_eq!(platform.call_log().count(IMPORT), 3);
 }
 
+/// The regions the host's dirty log was asked about, in order.
+type Asked = Arc<Mutex<Vec<(u64, u64)>>>;
+
+/// A graphics device on the testkit's platform with a display window, whose dirty log answers
+/// every ask written, recording it in `asked`. The platform draws no sink, so the window never
+/// opens: the test draws what it shows through a sink of its own ([`windowed_draw`]).
+fn windowed(asked: &Asked) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
+    let platform = Arc::new(FakePlatform::new());
+    let asked = Arc::clone(asked);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            scanout_written: Some(Arc::new(move |offset, length| {
+                asked.lock().push((offset, length));
+                true
+            })),
+        },
+        window: Some(WindowConfig::default()),
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    (device, platform)
+}
+
+/// A sink over what `device`'s window shows, as the window's own draws it, and a drawable of
+/// `width` x `height` for it.
+fn windowed_draw(
+    device: &GraphicsDevice<FakePlatform>,
+    platform: &Arc<FakePlatform>,
+    width: u64,
+    height: u64,
+) -> (
+    sink::ScanoutDraw<FakePlatform>,
+    <FakePlatform as Platform>::Texture,
+) {
+    let shown = device.shown.as_ref().expect("a window");
+    let draw = sink::ScanoutDraw::new(
+        Arc::clone(platform),
+        &device.control.region,
+        shown,
+        &device.control.presented,
+    )
+    .unwrap();
+    let drawable = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width,
+        height,
+        usage: 4,
+        ..TextureDesc::default()
+    });
+    let drawable = platform
+        .metal_device(None)
+        .unwrap()
+        .new_texture(OnFault::Return, &drawable)
+        .unwrap()
+        .unwrap();
+    (draw, drawable)
+}
+
+/// `copyFromBuffer:...toTexture:...`, the blit of the scanout into a drawable.
+const SCANOUT_BLIT: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                            sourceSize:toTexture:destinationSlice:destinationLevel:\
+                            destinationOrigin:";
+
+/// Whether the window's next draw blits the scanout at `stride` bytes a row into `drawable`, at
+/// its whole size: what the window shows then.
+fn draws_the_scanout(
+    platform: &FakePlatform,
+    draw: &sink::ScanoutDraw<FakePlatform>,
+    drawable: &<FakePlatform as Platform>::Texture,
+    stride: u64,
+) -> bool {
+    use reims_vgpu_core::platform::resource::Texture as _;
+    let blits = platform.call_log().count(SCANOUT_BLIT);
+    let rect = reims_vgpu_window::PixelRect {
+        x: 0,
+        y: 0,
+        width: drawable.width(),
+        height: drawable.height(),
+    };
+    if draw.encode(drawable, rect).is_none() || platform.call_log().count(SCANOUT_BLIT) != blits + 1
+    {
+        return false;
+    }
+    let calls = platform.call_log().calls();
+    let blit = calls.iter().rev().find(|c| c.sel == SCANOUT_BLIT).unwrap();
+    blit.args[1..3] == [Arg::U64(0), Arg::U64(stride)]
+}
+
+/// Waits about 2 s for the refresh thread to ask the host's dirty log about `range`.
+fn asked_about(asked: &Asked, range: (u64, u64)) -> bool {
+    for _ in 0..2000 {
+        if asked.lock().contains(&range) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
+
+/// The guest's driver fails after it took the device, as the kext does where the device lists no
+/// usable display or `IOFramebuffer`'s start fails: the firmware sets its scanout, the kext resets
+/// the device to take it, starts it and asks `GET_DISPLAYS`, and resets it on the way out. The
+/// window keeps the firmware's scanout, so the frames the OS then draws into the firmware's
+/// framebuffer reach it: the refresh thread asks the host's dirty log over that scanout again,
+/// showing it where the guest wrote it, and the window's draw blits it out of the region
+#[test]
+fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
+    let asked = Asked::default();
+    let (device, platform) = windowed(&asked);
+    let (draw, drawable) = windowed_draw(&device, &platform, 64, 32);
+    let scanout = Scanout {
+        width: 64,
+        height: 32,
+        stride: 256,
+        offset: RGFX_ALLOCATIONS_OFFSET,
+    };
+    let firmware = || {
+        RgfxSetScanout {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SET_SCANOUT,
+                size: 0,
+                seqno: 0,
+            },
+            display: 0,
+            width: 64,
+            height: 32,
+            stride: 256,
+            offset: RGFX_ALLOCATIONS_OFFSET,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    let get_displays = RgfxGetDisplays {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 0,
+            seqno: 0,
+        },
+    }
+    .as_bytes()
+    .to_vec();
+
+    // The firmware's start and its mode.
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(answered(&device, &mut guest, firmware()), RGFX_STATUS_OK);
+    assert!(draws_the_scanout(&platform, &draw, &drawable, 256));
+
+    // The kext's take, its start and its list of the displays; then its failure.
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, get_displays);
+    let displays = guest.event().expect("DISPLAYS");
+    assert_eq!(
+        RgfxMsgHeader::read_from_prefix(&displays).unwrap().0.r#type,
+        RGFX_EVT_DISPLAYS
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    reset_done(&device);
+    // Past a refresh that read the scanout before the reset.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // The OS draws its next frame into the firmware's framebuffer.
+    asked.lock().clear();
+    // SAFETY: the scanout lies in the device's region, mapped while the device lives.
+    unsafe {
+        std::ptr::write_bytes(
+            device.region_base().add(RGFX_ALLOCATIONS_OFFSET as usize),
+            0x5a,
+            256 * 32,
+        );
+    }
+    assert!(
+        asked_about(&asked, (scanout.offset, scanout.span())),
+        "no refresh asked about the firmware's scanout after the failure"
+    );
+    let shown = device.shown.as_ref().unwrap();
+    assert_eq!(*shown.scanout.lock(), Some(scanout));
+    assert!(
+        draws_the_scanout(&platform, &draw, &drawable, 256),
+        "the window's draw shows nothing of the firmware's scanout"
+    );
+}
+
+/// A reset of the device while its display pipe shows a surface, as the kext's stop makes: the
+/// window lets go of the surface and shows the scanout again, as a GPU's display goes back to
+/// its framebuffer across its driver's reset, and the next present of the guest's driver shows
+/// its surface
+#[test]
+fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
+    let asked = Asked::default();
+    let (device, platform) = windowed(&asked);
+    let (draw, drawable) = windowed_draw(&device, &platform, 64, 32);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    let scanout = RgfxSetScanout {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_SCANOUT,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 64,
+        height: 32,
+        stride: 256,
+        offset: RGFX_ALLOCATIONS_OFFSET,
+    }
+    .as_bytes()
+    .to_vec();
+    assert_eq!(answered(&device, &mut guest, scanout), RGFX_STATUS_OK);
+    // With no window open, the present is answered as it is shown.
+    let status = answered(&device, &mut guest, present_surface(0x77));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    reset_done(&device);
+    for _ in 0..2000 {
+        if device.control.presented.shown().is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        device.control.presented.shown().is_none(),
+        "the surface stayed"
+    );
+    assert!(
+        draws_the_scanout(&platform, &draw, &drawable, 256),
+        "the window's draw shows nothing after the reset"
+    );
+
+    // The guest's driver starts again and presents its surface.
+    zero_ring_headers(&device, [SUBMIT, COMPLETE]);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    let status = answered(&device, &mut guest, present_surface(0x77));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+}
+
 /// The display pipe's present: a surface the decoder holds no texture over is answered invalid
 /// with nothing shown, and 0 (the scanout) is answered at once on a device with no window
 #[test]

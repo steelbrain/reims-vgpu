@@ -89,8 +89,8 @@
 //! device's function reset does: no command is taken until the guest writes `STATUS` 1, the
 //! guest's driver has taken no feature (`DRIVER_FEATURES` reads 0), both rings are as nothing
 //! had passed through them (the submission ring's `consumer_idle` 1, so the guest rings for its
-//! first message), the display has no scanout, no cursor image (and shows its cursor once it has
-//! one) and no `VBLANK`, and its refresh count is 0. Every command queue ends,
+//! first message), the display keeps its scanout (below) but has no cursor image (and shows its
+//! cursor once it has one) and no `VBLANK`, and its refresh count is 0. Every command queue ends,
 //! and once a take of its ring or a post onto it under way has finished nothing touches its rings
 //! again; no block is any process's (the kext grants them again), and the host drops everything
 //! it made for the guest's processes ([`Host::device_reset`], on the control thread before it
@@ -100,6 +100,15 @@
 //! the guest after it: its answers and events are dropped, and a queue made before it hands the
 //! host nothing more, not even its own destroy, which the host's reset stands for.
 //! What the guest wrote in its allocations stays.
+//!
+//! **The scanout across a reset.** A reset leaves the display's scanout as the last `SET_SCANOUT`
+//! set it, as a GPU's display engine goes on scanning out across a reset of its driver: the
+//! screen is told nothing, and each refresh shows the guest's writes there as before, until the
+//! guest sets another scanout or blanks it (width 0). So a guest driver that resets the device
+//! and then fails leaves the host's window showing what the guest draws next: the kext's start
+//! resets the device to take it, and where it fails after that (the device lists no usable
+//! display, `IOFramebuffer`'s start fails) it resets it again, and the OS falls back to the
+//! firmware's framebuffer, which the firmware's scanout, kept through both resets, shows.
 //!
 //! **A broken ring.** A count or a message size the protocol refuses (`ring::Broken`) is logged,
 //! and the device takes nothing more from the ring until it is reset; the guest's driver sees its
@@ -1062,7 +1071,11 @@ impl Shared {
         submit.backlog.clear();
         self.control_done.store(0, Ordering::Release);
         completion.reset(&self.region);
-        *display = DisplayState::default();
+        // The scanout stays (the module doc): the screen is told nothing of it.
+        *display = DisplayState {
+            scanout: display.scanout,
+            ..DisplayState::default()
+        };
         // With the ring held: the control thread tells the host before any message after this.
         self.reset_owed.store(true, Ordering::Release);
         drop(completion);
@@ -1086,7 +1099,6 @@ impl Shared {
         self.gate.every();
         self.room.wake();
         self.wake.wake();
-        self.screen.scanout(None);
         self.screen.cursor_image(None);
         self.screen.cursor_moved(0, 0, true);
     }
