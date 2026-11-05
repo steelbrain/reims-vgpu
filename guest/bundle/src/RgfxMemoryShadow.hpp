@@ -9,17 +9,20 @@
  * The block and the app's memory sync at two points, as the IOSurface copies do
  * (RgfxIOSurface.h):
  *   - before a commit of a command buffer that uses the buffer, from the memory: syncIn();
- *   - when a command buffer that may write it completes, before it reports completion, back to
- *     the memory: writeBack(). A write is a shader binding, a blit's destination, a fill, a
- *     synchronize, a render attachment of a texture over it, or a use with Write usage.
+ *   - when a command buffer that may write it completes, as its completion is taken off the
+ *     ring, on its queue's write-back queue, not behind the queue's earlier handlers, and before
+ *     it reports completion, back to the memory: writeBack(). A write is a shader binding, a
+ *     blit's destination, a fill, a synchronize, a render attachment of a texture over it, or a
+ *     use with Write usage.
  * Each side's bytes that moved since the two last agreed go to the other, byte by byte, so a
  * CPU write and a GPU write to different bytes both stand, whatever the order of the syncs:
  * the bytes both agreed on last are kept (`m_agreed`). Where both moved the same byte, the
  * side that syncs last wins, as a data race on Metal's shared memory has no answer either.
  *
- * Left as Metal's differs: a GPU write shows in the memory at the completion of its command
- * buffer, not as it runs (a CPU waiting on a shared event the buffer signals sees the bytes
- * as of the last completion); memory the process maps read-only is never written back.
+ * Left as Metal's differs: a GPU write shows in the memory once the completion of its command
+ * buffer is taken, not as it runs (a CPU waiting on a shared event the buffer signals sees the
+ * bytes as of the last completion taken); memory the process maps read-only is never written
+ * back.
  *
  * Header-only and free of Metal's headers, so the serializer test builds it as the bundle
  * does. Thread-safe. Our own code.

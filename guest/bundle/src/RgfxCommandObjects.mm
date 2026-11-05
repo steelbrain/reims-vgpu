@@ -1205,6 +1205,7 @@ struct RgfxBarrierSlot {
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg;
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg;
 - (void)rgfxWriteBackAndRetire:(uint64_t)seqno;
+- (void)rgfxWriteBackCopies;
 - (void)rgfxReachScheduled;
 - (void)rgfxReachSubmitted;
 - (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached;
@@ -2023,6 +2024,22 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 			});
 		}
 	}
+	// The copies it wrote that no retire waits for, of surfaces (no write named to the kext) and
+	// of app memory under no-copy buffers, go back on the write-back queue too, in the ring's
+	// order, as the completion is taken: not behind the queue's earlier handlers, so the CPU sees
+	// the GPU's writes as the buffer is done, as on Metal's shared memory. Its delivery waits for
+	// them.
+	if (_writtenBack == nil &&
+	    (!_shadowWrites.empty() ||
+	     (!_surfaceWrites.empty() && !rgfxIOSurfaceWritesInPlace(_surfaceWrites)))) {
+		dispatch_semaphore_t writtenBack = dispatch_semaphore_create(0);
+		_writtenBack = writtenBack;
+		RgfxCmdBuffer *strongSelf = self;
+		dispatch_async([_queue rgfxWriteBackQueue], ^{
+			[strongSelf rgfxWriteBackCopies];
+			dispatch_semaphore_signal(writtenBack);
+		});
+	}
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
 }
@@ -2044,12 +2061,22 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_namedRegion = nullptr;
 		_namedGone = true;
 	}
-	rgfxIOSurfaceWriteBack(_surfaceWrites);
-	_surfaceWrites.clear();
+	[self rgfxWriteBackCopies];
 	rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], seqno);
 	_surfaceWritesRegion = nullptr;
 	[_queue rgfxRetiredLate];
 	dispatch_semaphore_signal(_writtenBack);
+}
+
+// Writes back what this buffer wrote of its copies, on its queue's write-back queue: its
+// surfaces' copies, then the app memory under its no-copy buffers.
+- (void)rgfxWriteBackCopies
+{
+	rgfxIOSurfaceWriteBack(_surfaceWrites);
+	_surfaceWrites.clear();
+	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
+		shadow->writeBack();
+	_shadowWrites.clear();
 }
 
 // Delivers the host's completion for this command buffer, on its queue's completion queue (or on
@@ -2063,8 +2090,9 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// could not carry it out), it is scheduled here, its scheduled handlers run before anything
 	// of its completion.
 	[self rgfxReachScheduled];
-	// The surfaces this buffer wrote hold its results before anyone sees it complete: written
-	// back here, or on the queue's write-back queue where its take left its retire to it.
+	// The surfaces and the app memory this buffer wrote hold its results before anyone sees it
+	// complete: written back on the queue's write-back queue as its completion was taken, or
+	// here where no take did.
 	if (_writtenBack != nil)
 		dispatch_semaphore_wait(_writtenBack, DISPATCH_TIME_FOREVER);
 	rgfxIOSurfaceWriteBack(_surfaceWrites);

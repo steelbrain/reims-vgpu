@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <vector>
 
+#import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
@@ -39,6 +40,7 @@
 #include "RgfxReplyReader.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
+#include "RgfxSlabs.hpp"
 #include "reims_graphics_wire.h"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing
 
@@ -1103,6 +1105,91 @@ void test_in_place_writes_retire_at_the_take()
 	}
 }
 
+// A buffer that writes app memory under a no-copy buffer (its GPU copy a block of the region)
+// writes the copy back into the memory as its completion is taken, on its queue's write-back
+// queue, while a handler before it on the queue still holds its delivery: the CPU sees the GPU's
+// write as the buffer is done, as on Metal's shared memory, not once the handlers before it have
+// run. Its delivery, its status and its waiters come after the write-back.
+void test_no_copy_write_backs_land_at_the_take()
+{
+	@autoreleasepool {
+		Queue q(true, 3);
+		int &calls = *new int(0);
+		q.ids.setResourceIdSource(&oneIdChunk, &calls);
+		std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0);
+		RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+		RgfxRegionSlabSource &slabSource = *new RgfxRegionSlabSource(region, q.ser);
+		RgfxSlabs &slabs = *new RgfxSlabs(slabSource);
+		vm_address_t app = 0;
+		CHECK(vm_allocate(mach_task_self(), &app, 0x4000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+		uint8_t *p = reinterpret_cast<uint8_t *>(app);
+		std::memset(p, 0x11, 0x4000);
+		RgfxBuffer *b = [RgfxBuffer bufferWithBytesNoCopy:p
+		                                           length:0x4000
+		                                          options:MTLResourceStorageModeShared
+		                                      deallocator:nil
+		                                           region:&region
+		                                            slabs:&slabs
+		                                           device:nil
+		                                       serializer:&q.ser];
+		CHECK(b != nil && [b rgfxShadow] != nullptr);
+		// Its GPU copy: a range of a slab, a heap over a block of the region.
+		RgfxHeapOverHostMemory heap = {};
+		RgfxBufferAtOffset create = {};
+		{
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			bool sawHeap = false, sawBuffer = false;
+			while ((!sawHeap || !sawBuffer) && q.control.next(&h, &bytes)) {
+				if (h.type == RGFX_CMD_HEAP_OVER_HOST_MEMORY && bytes.size() == sizeof(heap)) {
+					std::memcpy(&heap, bytes.data(), sizeof(heap));
+					sawHeap = true;
+				} else if (h.type == RGFX_CMD_BUFFER_AT_OFFSET && bytes.size() == sizeof(create)) {
+					std::memcpy(&create, bytes.data(), sizeof(create));
+					sawBuffer = true;
+				}
+			}
+			CHECK(sawHeap && sawBuffer && create.obj_id == b.rgfxObjId);
+		}
+		uint8_t *block = mem.data() + heap.region_offset + create.offset;
+		CHECK(std::memcmp(block, p, 0x4000) == 0);
+		dispatch_semaphore_t held = dispatch_semaphore_create(0);
+		dispatch_semaphore_t letGo = dispatch_semaphore_create(0);
+		Driven driven({&q});
+
+		id<MTLCommandBuffer> hold = [q.queue commandBuffer];
+		[hold addCompletedHandler:^(id<MTLCommandBuffer> c) {
+			(void)c;
+			dispatch_semaphore_signal(held);
+			waitFor(letGo, 10);
+		}];
+		[hold commit];
+		const uint64_t sh = nextSeqno(q);
+		id<MTLCommandBuffer> fill = [q.queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [fill blitCommandEncoder];
+		[blit fillBuffer:b range:NSMakeRange(0x100, 0x10) value:0x77];
+		[blit endEncoding];
+		[fill commit];
+		const uint64_t sf = nextSeqno(q);
+		// What the host's fill wrote into the GPU's copy.
+		std::memset(block + 0x100, 0x77, 0x10);
+		hostComplete(q, *driven.kext, sh, hold);
+		CHECK(waitFor(held, 5) == 0);
+		hostComplete(q, *driven.kext, sf, fill);
+		bool landed = false;
+		for (int i = 0; i < 5000 && !landed; i++) {
+			landed = __atomic_load_n(&p[0x10f], __ATOMIC_ACQUIRE) == 0x77;
+			if (!landed)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		CHECK(landed && p[0x100] == 0x77 && p[0x110] == 0x11);
+		CHECK(fill.status != MTLCommandBufferStatusCompleted);
+		dispatch_semaphore_signal(letGo);
+		[fill waitUntilCompleted];
+		CHECK(fill.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
 // A command buffer let go with no completion gives back the region block its message lies in, as
 // its completion does: one encoded past what its queue's ring takes and never committed, and one
 // posted out of line on a queue whose completion ring nothing reads. Buffer after buffer reuse
@@ -1283,5 +1370,6 @@ void rgfxQueueTests(const char *self)
 	test_enqueue_and_commit_are_once();
 	test_buffers_let_go_give_their_blocks_back();
 	test_in_place_writes_retire_at_the_take();
+	test_no_copy_write_backs_land_at_the_take();
 	test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends();
 }
