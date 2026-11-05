@@ -214,6 +214,17 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Whether the CPU reads the surface back after each GPU write, and the early copy that
     /// follows from it ([`SurfaceCaches::early_copies`]).
     read_back: ReadBack,
+    /// The cache's last copy into its pages on the transfer queue ([`SurfaceCaches::write_back`]),
+    /// until it lands: a download or a release that copies nothing waits for it, as for an
+    /// early copy, and so does a use that writes the cache, on the GPU.
+    out: Option<OutCopy>,
+}
+
+/// A copy of a cache into its pages on the transfer queue ([`SurfaceCaches::write_back`]): the
+/// transfer event's value it signals as it ends, and its landing.
+struct OutCopy {
+    value: u64,
+    landing: Arc<Landing>,
 }
 
 /// What a cache knows of the CPU's reads of its surface after the GPU's writes, and its early
@@ -241,8 +252,9 @@ struct EarlyCopy {
     landing: Arc<Landing>,
 }
 
-/// An early copy until it lands: the answers waiting for it, given as the platform sees its
-/// command buffer done, and the threads waiting for it ([`Caches::wait_copied_out`]).
+/// A copy into a cache's pages until it lands (an early copy, or one on the transfer queue): the
+/// answers waiting for it, given as the platform sees its command buffer done, and the threads
+/// waiting for it ([`Caches::wait_copied_out`]).
 struct Landing {
     /// The answers waiting; `None` once it landed.
     waiting: Mutex<Option<Vec<Answer>>>,
@@ -303,6 +315,14 @@ impl Landing {
             }
         }
         true
+    }
+}
+
+/// Gives `done` once every copy of `landings` has landed: at once where none is in flight.
+fn after_landings(mut landings: Vec<Arc<Landing>>, done: Answer) {
+    match landings.pop() {
+        Some(landing) => landing.then(Box::new(move || after_landings(landings, done))),
+        None => done(),
     }
 }
 
@@ -766,6 +786,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 users: HashMap::new(),
                 deferred: None,
                 read_back: ReadBack::default(),
+                out: None,
             },
         );
         let pages = Pages {
@@ -837,6 +858,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 users: HashMap::new(),
                 deferred: Some(block_size),
                 read_back: ReadBack::default(),
+                out: None,
             },
         );
         self.deferred_bytes += length;
@@ -1064,6 +1086,14 @@ impl<P: Platform> SurfaceCaches<P> {
                 && let Some((event, _)) = self.ends.get(&copy.queue)
             {
                 cb.encode_wait(Some(EventRef::Event(event)), copy.value)?;
+            }
+            // So does a copy into the pages on the transfer queue, asked before the write: the
+            // pages take the cache as it was then.
+            if let Some(out) = &cache.out
+                && !out.landing.landed()
+                && let Some(t) = &self.transfer
+            {
+                cb.encode_wait(Some(EventRef::Event(&t.event)), out.value)?;
             }
         }
         if let Some(t) = &self.transfer
@@ -1423,6 +1453,8 @@ impl<P: Platform> SurfaceCaches<P> {
         let written = self.written_since_host(block);
         if !written || self.behind_the_cpu(block, cpu, "SURFACE_DOWNLOAD") {
             // An early copy, landed or not, holds the cache's last write: answered as it lands.
+            // So does a copy on the transfer queue not yet landed, which an earlier download whose
+            // answer the kext stopped waiting for, or a block named again, asked.
             let early = (self.by_block.get_mut(&block)).and_then(|cache| {
                 let read_back = &mut cache.read_back;
                 let copy = read_back.copy.as_ref()?;
@@ -1431,15 +1463,12 @@ impl<P: Platform> SurfaceCaches<P> {
                 }
                 Some(Arc::clone(&copy.landing))
             });
-            match early {
-                Some(landing) => landing.then(done),
-                None => {
-                    if !written && self.by_block.contains_key(&block) {
-                        self.counts.clean += 1;
-                    }
-                    done();
-                }
+            let landings: Vec<Arc<Landing>> =
+                early.into_iter().chain(self.out_copy(block)).collect();
+            if landings.is_empty() && !written && self.by_block.contains_key(&block) {
+                self.counts.clean += 1;
             }
+            after_landings(landings, done);
             return Ok(());
         }
         // The CPU reads back a write that was the only one since the cache's last copy: the next
@@ -1493,14 +1522,15 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.unheld_bytes += length;
         }
         if !written || unheld || self.behind_the_cpu(block, cpu, "BLOCK_RELEASE") {
-            // The pages are let go of once an early copy into them still in flight lands.
-            let copy = (self.by_block.get(&block))
+            // The pages are let go of once a copy into them still in flight lands: an early copy,
+            // or one on the transfer queue.
+            let early = (self.by_block.get(&block))
                 .and_then(|cache| cache.read_back.copy.as_ref())
                 .map(|copy| Arc::clone(&copy.landing));
-            match copy {
-                Some(landing) => landing.then(done),
-                None => done(),
-            }
+            after_landings(
+                early.into_iter().chain(self.out_copy(block)).collect(),
+                done,
+            );
         } else {
             if flags & RGFX_BLOCK_RELEASE_NO_CLIENT != 0 {
                 self.counts.unread += 1;
@@ -1519,6 +1549,13 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         self.watched.0.lock().remove(&block);
         Ok(gone)
+    }
+
+    /// The landing of the block's last copy into its pages on the transfer queue, where it has
+    /// not landed ([`SurfaceCache::out`]).
+    fn out_copy(&self, block: u64) -> Option<Arc<Landing>> {
+        let out = self.by_block.get(&block)?.out.as_ref()?;
+        (!out.landing.landed()).then(|| Arc::clone(&out.landing))
     }
 
     /// Whether the block's cache holds a command buffer's write the pages do not: one was
@@ -1563,7 +1600,9 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// Copies the cache of the block at `block` into the surface's pages on the transfer queue,
     /// after every command buffer that used it; `done` once the copy has finished. Where no copy
-    /// can be made `done` is given at once.
+    /// can be made `done` is given at once. The copy signals the transfer event, which a use that
+    /// writes the cache waits for on the GPU while it is in flight, and lands for the downloads and
+    /// releases that copy nothing behind it ([`SurfaceCache::out`]).
     fn write_back(
         &mut self,
         device: &P::Device,
@@ -1597,6 +1636,11 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let length = cache.length;
         let held = (cache.device.clone_ref(), view);
+        transfer.signalled += 1;
+        let value = transfer.signalled;
+        cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
+        let landing = Landing::new();
+        let lands = Arc::clone(&landing);
         match staged {
             // A copied cache's pages take the staging buffer's bytes on the host's CPU, before
             // `done`: a copy too long for the platform's thread that sees the completion.
@@ -1605,13 +1649,20 @@ impl<P: Platform> SurfaceCaches<P> {
                 Box::new(move |_: CompletedInfo| {
                     staged.done(length);
                     drop(held);
+                    lands.land();
                     done();
                 }),
             )?,
             // Else answered as the platform sees the copy done, with no handler thread woken
             // between, as an early copy's landing is; the buffers go in the completed handler.
             None => {
-                cb.add_completion_seen_handler(ON, Box::new(move |_: CompletedInfo| done()))?;
+                cb.add_completion_seen_handler(
+                    ON,
+                    Box::new(move |_: CompletedInfo| {
+                        lands.land();
+                        done();
+                    }),
+                )?;
                 cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(held)))?;
             }
         }
@@ -1623,6 +1674,7 @@ impl<P: Platform> SurfaceCaches<P> {
             // This copy is the cache's last: an early copy before it is waited for on the GPU.
             cache.read_back.writes = 0;
             cache.read_back.copy = None;
+            cache.out = Some(OutCopy { value, landing });
         }
         self.counts.downloads += 1;
         self.counts.downloaded_bytes += length;
@@ -3031,6 +3083,52 @@ mod tests {
         assert_eq!(counts.unheld_bytes, 2 * page);
     }
 
+    /// A download asked while the cache's last copy into its pages is still in flight on the
+    /// transfer queue (the kext stopped waiting for its answer, and a lock asks again) is answered
+    /// once that copy lands, not at once over pages the copy has not reached; so is a release of
+    /// the block then. A buffer that writes the cache meanwhile waits for the copy on the GPU, so
+    /// the copy takes the cache as it was asked
+    #[test]
+    fn a_download_or_release_behind_a_copy_in_flight_waits_for_it() {
+        for second in ["download", "release"] {
+            let mut r = cached();
+            use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            let mark = r.p.call_log().mark();
+            let first = download(&r, BLOCK);
+            let calls = r.p.call_log().since(mark);
+            assert_eq!(copies(&calls).len(), 1, "the first copies");
+            let signalled = events(&calls, SIGNAL);
+            assert_eq!(signalled.len(), 1, "its copy signals the transfer event");
+            assert!(!first.load(Ordering::SeqCst), "in flight");
+
+            let mark = r.p.call_log().mark();
+            let then = if second == "download" {
+                download(&r, BLOCK)
+            } else {
+                release(&r, BLOCK)
+            };
+            assert!(
+                copies(&r.p.call_log().since(mark)).is_empty(),
+                "{second}: nothing new to copy"
+            );
+            assert!(
+                !then.load(Ordering::SeqCst),
+                "{second}: waits for the copy in flight"
+            );
+            if second == "download" {
+                let mark = r.p.call_log().mark();
+                use_surfaces(&mut r, 2, 0x200, &[(BLOCK, 0, true)]);
+                assert!(
+                    events(&r.p.call_log().since(mark), WAIT).contains(&signalled[0]),
+                    "a writer waits for the copy on the GPU"
+                );
+            }
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(first.load(Ordering::SeqCst) && then.load(Ordering::SeqCst));
+        }
+    }
+
     /// A release flagged unheld behind a writer still running is decided as its copy is made, at
     /// the writer's finish: a process that took the surface again meanwhile (the kext counting
     /// it in the header) has the cache copied into the pages before the answer, which its lock
@@ -3332,7 +3430,8 @@ mod tests {
     /// asked, in that buffer's finish, after its commit, and a buffer begun meanwhile that uses
     /// the cache waits for them at its begin. Here the
     /// download copies the buffer's write out, and the release then has nothing more to copy:
-    /// the cache goes, and the buffer begun after it finds none
+    /// the cache goes, and the buffer begun after it finds none, and the release is answered as
+    /// the download's copy lands
     #[test]
     fn a_copy_out_of_a_cache_is_made_as_its_writers_finish() {
         let mut r = cached();
@@ -3398,10 +3497,13 @@ mod tests {
         let copied = calls.iter().position(|c| c.sel == COPY).unwrap();
         assert!(commit < copied, "copied after the writer's commit");
         assert_eq!(copies(&calls).len(), 1, "the download's copy alone");
-        assert!(released.load(Ordering::SeqCst), "nothing more to copy");
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "nothing more to copy: answered as the download's copy lands"
+        );
         assert_eq!(r.dec.caches().len(), 0);
         r.p.world().complete_all(CompleteOn::Caller);
-        assert!(downloaded.load(Ordering::SeqCst));
+        assert!(downloaded.load(Ordering::SeqCst) && released.load(Ordering::SeqCst));
     }
 
     /// A command buffer's commit is made with the caches' lock let go: while the platform's
