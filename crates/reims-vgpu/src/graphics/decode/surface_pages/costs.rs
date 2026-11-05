@@ -9,8 +9,8 @@
 //! The guest's RAM is what QEMU gives the device: on Linux a shared mapping of a memfd, whose file
 //! the platform's lease registers; on macOS anonymous memory. Each surface is fresh pages, as a
 //! browser's are: its runs are slots of the RAM picked at random, so no two surfaces name the same
-//! runs and the cache of views takes none. Each step is timed as ring 0's thread carries it
-//! out:
+//! runs and the cache of views takes none. Each step is timed on the thread that carries it out
+//! (the surface worker, for `SURFACE_PAGES`):
 //! - `SURFACE_PAGES`: the view (a range mapping of the runs) and the buffer over all of it, which
 //!   holds the runtime's import; for a cached block also the device cache;
 //! - `BUFFER_OVER_SURFACE_PAGES`, its `OBJECT_DESTROY`, and the block's `BLOCK_RELEASE`;
@@ -20,15 +20,32 @@
 //! `RGK_BENCH_ITERS` surfaces a case (default 40, past the cache's 32 views, so its drops are
 //! counted), `RGK_BENCH_RAM_MIB` MiB of RAM (default 768), `RGK_BENCH_THP=1` asks for huge pages
 //! of the memfd, and `RGK_BENCH_CASES` a comma list of the cases' names to run.
+//!
+//! **A pages slab's take** (`pages_take_costs_*`, run as above with `test(/pages_take_costs/)`):
+//! what each of a process's superpage slabs costs the thread that carries its messages out, as
+//! the bundle's pages slab source sends them (`RgfxPagesSlabSource`): the pages block's
+//! `SURFACE_PAGES` of its one 2 MiB run, the `HEAP_OVER_PAGES` over it and a first
+//! `BUFFER_AT_OFFSET` in the heap. The guest's next take waits for them: its `PagesBlock` call is
+//! answered after the messages before it. The RAM is fresh, as a booted guest's is where no
+//! process was yet: only each superpage's own 2 MiB are written, as the guest's zero fill writes
+//! them, just before its take, and the rest of the RAM is never touched. The superpages are taken
+//! in three orders of the RAM's 2 MiB slots: upwards, downwards and scattered. A device that takes
+//! the guest's RAM whole (the Vulkan platform on NVIDIA's driver, `os/linux/host_ram.rs`) imports
+//! it in the runtime's chunks, so this is where a take over a chunk not yet imported shows.
+//! `RGK_BENCH_TAKES` superpages an order (default 256, 512 MiB), `RGK_BENCH_RAM_MIB` the RAM
+//! (at least twice the takes'), `RGK_BENCH_TAKE_GAP_US` a pause before each take (default 0, a
+//! burst), and `RGK_BENCH_ORDERS` a comma list of the orders' names to run.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED,
-    RgfxBufferOverSurfacePages, RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun, RgfxSurfacePages,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+    RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE,
+    RgfxBufferAtOffset, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader,
+    RgfxObjectDestroy, RgfxPageRun, RgfxSurfacePages,
 };
 use reims_vgpu_core::host::PhysRange;
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
@@ -193,9 +210,10 @@ impl Drop for Ram {
     }
 }
 
-/// `length` bytes of guest RAM at [`RAM`], every page touched: a memfd's shared mapping on Linux
-/// (with huge pages asked for where `RGK_BENCH_THP=1`), anonymous memory on macOS.
-fn guest_ram(length: u64) -> Ram {
+/// `length` bytes of guest RAM at [`RAM`], every page touched where `touched`, else none: a
+/// memfd's shared mapping on Linux (with huge pages asked for where `RGK_BENCH_THP=1`), anonymous
+/// memory on macOS.
+fn guest_ram(length: u64, touched: bool) -> Ram {
     #[cfg(target_os = "linux")]
     let (at, file) = {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -244,8 +262,10 @@ fn guest_ram(length: u64) -> Ram {
         assert_ne!(at, libc::MAP_FAILED);
         (at.cast::<u8>(), ())
     };
-    // SAFETY: the mapping just made, `length` bytes, writable.
-    unsafe { std::ptr::write_bytes(at, 0x5a, length.to_usize()) };
+    if touched {
+        // SAFETY: the mapping just made, `length` bytes, writable.
+        unsafe { std::ptr::write_bytes(at, 0x5a, length.to_usize()) };
+    }
     let mut map = MemoryMap::new();
     #[cfg(target_os = "linux")]
     {
@@ -285,7 +305,7 @@ fn measure<P: ApiPlatform>(label: &str) {
     let ram_bytes = env_u64("RGK_BENCH_RAM_MIB", 768) * MIB;
     let iters = env_u64("RGK_BENCH_ITERS", 40);
     let only = std::env::var("RGK_BENCH_CASES").ok();
-    let ram = guest_ram(ram_bytes);
+    let ram = guest_ram(ram_bytes, true);
     let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
@@ -438,6 +458,158 @@ fn measure<P: ApiPlatform>(label: &str) {
     drop(ram);
 }
 
+/// A superpage: the guest's 2 MiB slab of a process's own pages.
+const SUPERPAGE: u64 = 2 * MIB;
+
+/// The orders the superpages are taken in: of the RAM's 2 MiB slots, `takes` of them.
+fn take_orders(slots: u64, takes: u64, rng: &mut XorShift) -> Vec<(&'static str, Vec<u64>)> {
+    let mut scattered: Vec<u64> = (0..slots).collect();
+    for i in 0..takes.to_usize() {
+        let j = i + (rng.next() % (slots - i.to_u64())).to_usize();
+        scattered.swap(i, j);
+    }
+    scattered.truncate(takes.to_usize());
+    vec![
+        ("upwards", (0..takes).collect()),
+        ("downwards", (slots - takes..slots).rev().collect()),
+        ("scattered", scattered),
+    ]
+}
+
+/// Measures a pages slab's takes on `platform` in each order (module docs), printing a line per
+/// step and the takes that took 5 ms or more.
+fn measure_takes<P: ApiPlatform>(label: &str) {
+    let platform = P::process();
+    let device = platform.metal_device(None).expect("a GPU device");
+    let takes = env_u64("RGK_BENCH_TAKES", 256);
+    let ram_bytes = (env_u64("RGK_BENCH_RAM_MIB", 1024) * MIB).max(2 * takes * SUPERPAGE);
+    let gap = Duration::from_micros(env_u64("RGK_BENCH_TAKE_GAP_US", 0));
+    let only = std::env::var("RGK_BENCH_ORDERS").ok();
+    let mut rng = XorShift(0x6a09_e667_f3bc_c908);
+    let orders = take_orders(ram_bytes / SUPERPAGE, takes, &mut rng);
+    eprintln!(
+        "{label}: {} MiB of fresh guest RAM, {takes} superpages an order, {} us apart",
+        ram_bytes >> 20,
+        gap.as_micros()
+    );
+    // Each block holds its one run, a page of its own.
+    let block_size = 0x2000u64;
+    for (name, slots) in orders {
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.split(',').any(|n| n == name))
+        {
+            continue;
+        }
+        // Fresh RAM, a lease and a decoder of their own an order, as a booted guest's.
+        let ram = guest_ram(ram_bytes, false);
+        let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+        let core =
+            CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+        let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
+        dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
+        let mut steps: [Step; 7] = Default::default();
+        let mut slow = Vec::new();
+        let mut made = Vec::new();
+        for (i, &slot) in slots.iter().enumerate() {
+            std::thread::sleep(gap);
+            let block = BLOCK + i.to_u64() * block_size;
+            let offset = slot * SUPERPAGE;
+            // SAFETY: the superpage's bytes, in the RAM's mapping, which nothing else uses.
+            steps[0].time(|| unsafe {
+                std::ptr::write_bytes(ram.at.add(offset.to_usize()), 0, SUPERPAGE.to_usize());
+            });
+            let pages = RgfxSurfacePages {
+                header: header(RGFX_CMD_SURFACE_PAGES),
+                context: 0,
+                run_count: 1,
+                block_offset: block,
+                block_size,
+                runs_offset: block + 0x1000,
+                length: SUPERPAGE,
+            };
+            let run = [RgfxPageRun {
+                address: RAM + offset,
+                length: SUPERPAGE,
+            }];
+            let heap = 0x1000 + 2 * i.to_u64();
+            let heap_over = RgfxHeapOverPages {
+                header: header(RGFX_CMD_HEAP_OVER_PAGES),
+                obj_id: heap,
+                gpu_address: 0,
+                block_offset: block,
+                block_size,
+                size_bytes: SUPERPAGE,
+                options: 0,
+                heap_type: 1,
+            };
+            let at = RgfxBufferAtOffset {
+                header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+                obj_id: heap + 1,
+                heap_obj_id: heap,
+                offset: 0,
+                length: 64 << 10,
+                options: 0,
+                reserved_34: 0,
+            };
+            let status = steps[1]
+                .time(|| dec.surface_pages(&device, &pages, &run, RGFX_SURFACE_PAGES_PRIVATE));
+            assert_eq!(status, RGFX_STATUS_OK, "{name}: take {i}'s SURFACE_PAGES");
+            let heaped = steps[2].time(|| dec.decode(&device, heap_over.as_bytes()));
+            assert_eq!(heaped.ok(), Some(Ok(())), "{name}: take {i}'s heap");
+            let placed = steps[3].time(|| dec.decode(&device, at.as_bytes()));
+            assert_eq!(placed.ok(), Some(Ok(())), "{name}: take {i}'s buffer");
+            let take = steps[1].0[i] + steps[2].0[i] + steps[3].0[i];
+            steps[4].0.push(take);
+            if take >= Duration::from_millis(5) {
+                slow.push((i, take));
+            }
+            made.push((block, heap));
+        }
+        for &(block, heap) in &made {
+            steps[5].time(|| {
+                for obj_id in [heap + 1, heap] {
+                    let destroy = RgfxObjectDestroy {
+                        header: header(RGFX_CMD_OBJECT_DESTROY),
+                        obj_id,
+                    };
+                    assert_eq!(dec.decode(&device, destroy.as_bytes()).ok(), Some(Ok(())));
+                }
+            });
+            steps[6].time(|| {
+                dec.block_released(&device, block, false, Box::new(|| ()), no_raise());
+            });
+        }
+        for (step, step_name) in steps.iter().zip([
+            "guest's zero fill",
+            "SURFACE_PAGES (pages block)",
+            "HEAP_OVER_PAGES",
+            "BUFFER_AT_OFFSET",
+            "take (the three)",
+            "OBJECT_DESTROY (both)",
+            "BLOCK_RELEASE",
+        ]) {
+            eprintln!("{label}: {}", step.line(name, step_name));
+        }
+        let listed: Vec<String> = (slow.iter().take(40))
+            .map(|(i, d)| format!("{i}:{:.1}", d.as_secs_f64() * 1e3))
+            .collect();
+        eprintln!(
+            "{label}: {name:<11} takes of 5 ms or more: {} of {} (take:ms) {}",
+            slow.len(),
+            slots.len(),
+            listed.join(" ")
+        );
+        dec.views_of_surfaces().reset();
+        drop(dec);
+        drop(core);
+        drop(lease);
+        drop(ram);
+    }
+}
+
 /// The range mappings alone, with no GPU device made: what a profiler of the views' own code
 /// runs, outside the GPU's locks (`RGK_BENCH_MAP_ONLY=1` with the Vulkan test).
 #[cfg(feature = "vulkan")]
@@ -447,7 +619,7 @@ fn map_only<P: ApiPlatform>(label: &str) {
     let ram_bytes = env_u64("RGK_BENCH_RAM_MIB", 768) * MIB;
     let iters = env_u64("RGK_BENCH_ITERS", 40);
     let only = std::env::var("RGK_BENCH_CASES").ok();
-    let ram = guest_ram(ram_bytes);
+    let ram = guest_ram(ram_bytes, true);
     let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
@@ -524,7 +696,7 @@ mod raw {
         let ram_bytes = env_u64("RGK_BENCH_RAM_MIB", 768) * MIB;
         let iters = env_u64("RGK_BENCH_ITERS", 40);
         let only = std::env::var("RGK_BENCH_CASES").ok();
-        let ram = guest_ram(ram_bytes);
+        let ram = guest_ram(ram_bytes, true);
         let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
         for case in cases(page) {
             if only
@@ -613,4 +785,20 @@ mod raw {
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn surface_view_costs_metal() {
     measure::<reims_vgpu_metal::MetalPlatform>("metal");
+}
+
+/// The Vulkan platform's takes of pages slabs (module docs).
+#[cfg(feature = "vulkan")]
+#[test]
+#[ignore = "a measurement: run it alone, under the GPU locks"]
+fn pages_take_costs_vulkan() {
+    measure_takes::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+}
+
+/// The Metal platform's takes of pages slabs, for comparison (module docs).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "a measurement: run it alone, under the GPU locks"]
+fn pages_take_costs_metal() {
+    measure_takes::<reims_vgpu_metal::MetalPlatform>("metal");
 }
