@@ -62,6 +62,18 @@ bool metalArchive(const uint8_t *bytes, size_t length)
 	return true;
 }
 
+// Whether the bytes are a whole .metallib: its magic, and the file size its header states (at
+// 0x10) theirs. Both x86 Macs' Metal makes an archive of one (AMD 5300M and Intel 630, macOS
+// 26.7.1: oracle_bundle archive.metallib), which holds no slice of this device's.
+bool wholeMetallib(const uint8_t *bytes, size_t length)
+{
+	if (length < 0x18 || std::memcmp(bytes, "MTLB", 4) != 0)
+		return false;
+	uint64_t size = 0;
+	std::memcpy(&size, bytes + 0x10, sizeof(size));
+	return size == length;
+}
+
 } // namespace
 
 RgfxArchiveFileKind rgfxReadArchiveFile(const uint8_t *bytes, size_t length,
@@ -97,7 +109,8 @@ RgfxArchiveFileKind rgfxReadArchiveFile(const uint8_t *bytes, size_t length,
 		sections = std::move(read);
 		return RgfxArchiveFileKind::Ours;
 	}
-	return metalArchive(bytes, length) ? RgfxArchiveFileKind::Metal : RgfxArchiveFileKind::Invalid;
+	return metalArchive(bytes, length) || wholeMetallib(bytes, length) ? RgfxArchiveFileKind::Metal
+	                                                                   : RgfxArchiveFileKind::Invalid;
 }
 
 std::vector<uint8_t> rgfxWriteArchiveFile(const std::vector<RgfxArchiveSection> &sections)

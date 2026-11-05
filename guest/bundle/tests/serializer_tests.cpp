@@ -2006,6 +2006,15 @@ void test_archive_file()
 	CHECK(rgfxReadArchiveFile(cafe, sizeof(cafe), out) == RgfxArchiveFileKind::Invalid);
 	const uint8_t other[] = {0xca, 0xfe, 0xba, 0xbf, 0, 0, 0, 1};
 	CHECK(rgfxReadArchiveFile(other, sizeof(other), out) == RgfxArchiveFileKind::Invalid);
+	// A whole .metallib: an archive of none of this device's slices, as on both x86 Macs; cut
+	// short, or of another magic, no archive.
+	uint8_t metallib[0x20] = {'M', 'T', 'L', 'B', 1, 0x80, 2, 0, 9, 0, 0, 0x81};
+	metallib[0x10] = sizeof(metallib);
+	CHECK(rgfxReadArchiveFile(metallib, sizeof(metallib), out) == RgfxArchiveFileKind::Metal);
+	CHECK(out.empty());
+	CHECK(rgfxReadArchiveFile(metallib, sizeof(metallib) - 1, out) == RgfxArchiveFileKind::Invalid);
+	metallib[3] = 'C';
+	CHECK(rgfxReadArchiveFile(metallib, sizeof(metallib), out) == RgfxArchiveFileKind::Invalid);
 }
 
 // An Automatic heap's placements, in the order Metal's took them (measured: M3 Max, macOS 27,
