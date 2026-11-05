@@ -28,6 +28,8 @@
 //   linarray MODE a linear 2D array texture over a Shared buffer, by the linear SPI (MODE spi)
 //                 or the public form (public): where each slice lies in the buffer, for the CPU's
 //                 replaceRegion: and getBytes: and for the GPU's reads
+//   lintypes FORM:TYPE  a texture of MTLTextureType TYPE over a Shared buffer by FORM (public,
+//                 spi or tiled): made, nil, or where Metal's assertion ends the process
 //   spin          a Shared buffer the CPU writes while one GPU thread polls it (atomic and plain
 //                 loads), and one the GPU writes step by step while the CPU polls it
 // A buffer's bytes print as runs, "A[0,4096)" or "B[0,256) A[256,4096)", each letter a byte.
@@ -517,6 +519,55 @@ static void case_linarray(const char *mode)
 	}
 }
 
+// A texture of type TYPE (an MTLTextureType's number) over a Shared buffer at offset 0, rows 256
+// bytes apart, by FORM: public (newTextureWithDescriptor:offset:bytesPerRow:), spi (the linear
+// SPI, bytesPerImage the rows' bytes) or tiled (the tiled SPI, from a Managed descriptor). The
+// descriptor is 64 x 4 BGRA8 (64 x 1 for a 1D type, 64 x 64 for a cube), 2 deep for 3D, 2 long
+// for an array, 4 samples for a multisample type. Made, nil, or the process ends at Metal's
+// assertion: ARG is FORM:TYPE.
+static void case_lintypes(const char *arg)
+{
+	char form[16] = "public";
+	int type = 3;
+	sscanf(arg, "%15[^:]:%d", form, &type);
+	printf("case lintypes %s:%d: a texture of type %d over a Shared buffer\n", form, type, type);
+	const MTLTextureType t = (MTLTextureType)type;
+	const bool oneD = t == MTLTextureType1D || t == MTLTextureType1DArray;
+	const bool cube = t == MTLTextureTypeCube || t == MTLTextureTypeCubeArray;
+	const bool array = t == MTLTextureType1DArray || t == MTLTextureType2DArray ||
+	                   t == MTLTextureTypeCubeArray || t == MTLTextureType2DMultisampleArray;
+	const bool ms = t == MTLTextureType2DMultisample || t == MTLTextureType2DMultisampleArray;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = t;
+	td.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	td.width = 64;
+	td.height = oneD ? 1 : cube ? 64 : 4;
+	td.depth = t == MTLTextureType3D ? 2 : 1;
+	td.arrayLength = array ? 2 : 1;
+	td.sampleCount = ms ? 4 : 1;
+	td.usage = MTLTextureUsageShaderRead | (ms ? MTLTextureUsageRenderTarget : 0);
+	const bool tiled = !strcmp(form, "tiled");
+	td.storageMode = tiled ? MTLStorageModeManaged : MTLStorageModeShared;
+	id<MTLBuffer> b = [D newBufferWithLength:0x40000 options:MTLResourceStorageModeShared];
+	SEL lin = NSSelectorFromString(@"newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+	SEL til = NSSelectorFromString(@"newTiledTextureWithDescriptor:offset:bytesPerRow:");
+	id<MTLTexture> tex = nil;
+	if (!strcmp(form, "public")) {
+		tex = [b newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+	} else if (!strcmp(form, "spi") && [(id)b respondsToSelector:lin]) {
+		tex = ((id(*)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+		    b, lin, td, 0, 256, 256 * td.height);
+	} else if (tiled && [(id)b respondsToSelector:til]) {
+		tex = ((id(*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(b, til, td, 0, 256);
+	} else {
+		line(form, "no such form", 0);
+		return;
+	}
+	char out[120];
+	snprintf(out, sizeof out, "%s, type %lu", tex ? "made" : "nil", (unsigned long)tex.textureType);
+	line(form, out, 0);
+}
+
 // The GPU's copy of `b`'s first `n` bytes against the CPU's: "same as the CPU's" or the GPU's runs.
 static void gpu_against_cpu(id<MTLBuffer> b, size_t n, char *out, size_t cap)
 {
@@ -863,6 +914,8 @@ static int run_case(int argc, char **argv)
 		case_linalign();
 	else if (!strcmp(c, "linarray"))
 		case_linarray(argc > 1 ? argv[1] : "spi");
+	else if (!strcmp(c, "lintypes"))
+		case_lintypes(argc > 1 ? argv[1] : "public:3");
 	else if (!strcmp(c, "didmodify"))
 		case_didmodify(argc > 1 ? argv[1] : "length");
 	else if (!strcmp(c, "nocopy"))
@@ -903,7 +956,7 @@ int main(int argc, char **argv)
 	    {"lintex", "shared"}, {"lintex", "managed"}, {"argenc", "shared"},
 	    {"argenc", "managed"}, {"nocopy", NULL}, {"didmodify", "length"},
 	    {"didmodify", "nocopy"}, {"linalign", NULL}, {"linarray", "spi"},
-	    {"linarray", "public"}, {"spin", NULL},
+	    {"linarray", "public"}, {"lintypes", "public:3"}, {"spin", NULL},
 	};
 	size_t n = sizeof all / sizeof all[0];
 	for (size_t i = 0; i < n; i++) {
