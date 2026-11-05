@@ -3134,7 +3134,7 @@ typedef struct {
 } RgfxComputeOpSetBufferOffsetAttributeStride;
 
 // `setBuffers:offsets:withRange:` head. `length` [`RgfxComputeBufferBinding`]
-// records follow at [`size_of`](core::mem::size_of)`::<RgfxComputeOpSetBuffers>()`.
+// records follow at [`size_of`]`::<RgfxComputeOpSetBuffers>()`.
 typedef struct {
   // The first binding index (the range's `location`).
   uint64_t location;
