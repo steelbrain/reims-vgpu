@@ -4,10 +4,10 @@
 # that holds the most of its memory run first, each with nothing else in flight; the longest
 # tests start next, so the run does not end on one that began late. Why, and what these tests
 # did to the others before, is in docs/lessons.md ("Tools and worktrees", and "The platform and
-# the runtime" for Metal's compiles). Every override but the last is the Mac's; on Linux only
-# the last applies, and nextest runs the other tests in its own order. A filter that names a
-# package or binary the workspace no longer has fails every nextest run, so a rename updates this
-# file too.
+# the runtime" for Metal's compiles). Every override but the last two is the Mac's alone; on
+# Linux only the last two apply, and nextest runs the other tests in its own order. A filter that
+# names a package or binary the workspace no longer has fails every nextest run, so a rename
+# updates this file too.
 
 # Writes that fault a Mac's GPU on purpose: opt-in (`#[ignore]`), run only for a change to what
 # they test, with `--run-ignored only`. Each fault is a GPU recovery (84 GPU events in its
@@ -55,6 +55,15 @@ filter = '''
       | test(=gpu::fill::tests::metal_tests::colors_are_the_metal_platforms_here)))
   | (binary_id(reims-vgpu-video-conformance) & test(=scaler::tests::the_reference_backend_passes_a_case_of_each_kind))
 '''
+priority = 50
+
+# The keep-awake's exit test, on every platform with the long tests: it runs 8 child processes
+# that each make a device and exit amid the keep-awake's touches. Alone the 8 took 7.4 s on msi's
+# RTX 5080; in the Vulkan crate's whole run there, beside the other test processes making their
+# devices, each took about 26 s, 211 s in all (measured 2026-11-05), so it starts early rather
+# than end the run.
+[[profile.default.overrides]]
+filter = 'binary_id(reims-vgpu-vulkan) & test(=awake::tests::an_exit_amid_touches_ends_with_its_status)'
 priority = 50
 
 # The paging discard tests (`gpu/paging_discard.rs`), on Linux with nothing else in flight. Each
