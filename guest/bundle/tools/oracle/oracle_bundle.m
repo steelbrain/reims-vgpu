@@ -1,7 +1,7 @@
 // oracle_bundle: what a Mac's Metal device answers where the guest bundle's device answered
 // otherwise (the bundle's divergences from Metal). Each case runs in a child process of its own,
 // since some end the process at Metal's assertions; the parent prints how each child ended.
-//   oracle_bundle DEVICE [CASE...]   the cases named, or every case
+//   oracle_bundle DEVICE [CASE...]   the cases (or groups) named, or every case but the groups
 // The cases, each line `CASE key=value ...`:
 //   buffers      allocatedSize of buffers of each storage mode by newBufferWithLength: and
 //                newBufferWithBytes:, of lengths 1 to 1 MiB + 1
@@ -43,8 +43,26 @@
 //                the row's 1872); linear.shortrow, the same by the buffer's linear SPI
 //   devtex.*     a 64 x 64 2D texture the device makes, usage RenderTarget: .depth.shared,
 //                .depth.managed, .stencil.managed and .depth.private, by format and storage mode
+//   texaddr      (a group) for a texture of each storage mode and shape (texaddr.MODE.SHAPE):
+//                its class, allocatedSize, the SPI gpuAddress, virtualAddress, resourceSize and
+//                allocationID (n/r where it does not answer), its gpuResourceID, a second one's,
+//                and buffers' made around them; .heap (textures in Private Automatic and
+//                Placement heaps), .buffer (over a Shared and a Managed buffer), .view (level 1 of
+//                a Shared and a Private texture), .iosurface (over a surface)
+//   texmem       (a group) texmem.MODE.SHAPE, Shared and Managed RGBA8 textures: where each texel
+//                a replaceRegion: wrote lies at the texture's virtualAddress (at=-1: not found),
+//                whether it is laid out linearly, whether getBytes: sees a CPU write there, and
+//                what a blit's GPU write leaves there
+//   nocopy.ro    (a group) .anon.MODE and .file.MODE: a no-copy buffer over read-only memory, and
+//                what a GPU read, a blit fill and a kernel's store do with it
+//   linalign     (a group) minimumLinearTextureAlignmentForPixelFormat: of raw formats 0 to 799,
+//                1000, 1023, 4096 and 65535, one child each (linalign.N)
 // Build: see README.md.
 #import "oracle_common.h"
+#import <IOSurface/IOSurface.h>
+#include <fcntl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <spawn.h>
@@ -833,6 +851,459 @@ static void device_texture(id<MTLDevice> d, const char *tag, MTLPixelFormat form
 	printf("%s texture=%s\n", tag, t ? "made" : "nil");
 }
 
+
+// --- texture addresses, read-only no-copy memory, linear alignment by raw format ----------
+
+// A no-argument SPI getter's answer, read as 64 bits (an address or a count): `*ok` is 0 where
+// the object does not answer the selector.
+static uint64_t spi_u64(id o, const char *name, int *ok)
+{
+	SEL s = sel_registerName(name);
+	if (o == nil || ![o respondsToSelector:s]) {
+		*ok = 0;
+		return 0;
+	}
+	*ok = 1;
+	return ((uint64_t(*)(id, SEL))objc_msgSend)(o, s);
+}
+
+static void print_spi(id o, const char *name)
+{
+	int ok = 0;
+	const uint64_t v = spi_u64(o, name, &ok);
+	if (ok)
+		printf(" %s=0x%llx", name, (unsigned long long)v);
+	else
+		printf(" %s=n/r", name);
+}
+
+static void describe_resource(const char *tag, const char *what, id<MTLResource> r)
+{
+	printf("%s %s class=%s", tag, what, cls(r));
+	if (r != nil) {
+		printf(" allocatedSize=%lu", (unsigned long)r.allocatedSize);
+		print_spi(r, "gpuAddress");
+		print_spi(r, "virtualAddress");
+		print_spi(r, "resourceSize");
+		print_spi(r, "allocationID");
+		if ([r conformsToProtocol:@protocol(MTLTexture)])
+			printf(" gpuResourceID=0x%llx",
+			       (unsigned long long)((id<MTLTexture>)r).gpuResourceID._impl);
+	}
+	printf("\n");
+	fflush(stdout);
+}
+
+static const MTLStorageMode kTexModes[] = {MTLStorageModePrivate, MTLStorageModeShared,
+                                           MTLStorageModeManaged};
+static const char *const kTexModeNames[] = {"private", "shared", "managed"};
+
+// The shapes texaddr.* makes: type, format, width, height, depth, levels, slices, usage.
+struct TexShape {
+	const char *name;
+	MTLTextureType type;
+	MTLPixelFormat format;
+	NSUInteger width, height, depth, levels, slices;
+	MTLTextureUsage usage;
+};
+static const struct TexShape kTexShapes[] = {
+    {"rgba8.64", MTLTextureType2D, MTLPixelFormatRGBA8Unorm, 64, 64, 1, 1, 1,
+     MTLTextureUsageShaderRead},
+    {"rgba8.256mips", MTLTextureType2D, MTLPixelFormatRGBA8Unorm, 256, 256, 1, 9, 1,
+     MTLTextureUsageShaderRead},
+    {"bgra8.1000x7", MTLTextureType2D, MTLPixelFormatBGRA8Unorm, 1000, 7, 1, 1, 1,
+     MTLTextureUsageShaderRead},
+    {"rgba8.64x3", MTLTextureType2DArray, MTLPixelFormatRGBA8Unorm, 64, 64, 1, 1, 3,
+     MTLTextureUsageShaderRead},
+    {"rgba8.3d", MTLTextureType3D, MTLPixelFormatRGBA8Unorm, 16, 16, 4, 1, 1,
+     MTLTextureUsageShaderRead},
+    {"r32f.rt", MTLTextureType2D, MTLPixelFormatR32Float, 64, 64, 1, 1, 1,
+     MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget},
+    {"rgba8.4096", MTLTextureType2D, MTLPixelFormatRGBA8Unorm, 4096, 4096, 1, 1, 1,
+     MTLTextureUsageShaderRead},
+};
+
+static id<MTLTexture> make_texture(id<MTLDevice> d, const struct TexShape *s, MTLStorageMode mode)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = s->type;
+	td.pixelFormat = s->format;
+	td.width = s->width;
+	td.height = s->height;
+	td.depth = s->depth;
+	td.mipmapLevelCount = s->levels;
+	td.arrayLength = s->slices;
+	td.storageMode = mode;
+	td.usage = s->usage;
+	return [d newTextureWithDescriptor:td];
+}
+
+// texaddr.MODE.SHAPE: the texture's address answers, and those of a Shared and a Private buffer
+// made before and after it, and of a second texture of the shape made after it.
+static void case_texaddr(id<MTLDevice> d, const char *tag, int mode, int shape)
+{
+	const struct TexShape *s = &kTexShapes[shape];
+	printf("%s shape=%s storage=%s\n", tag, s->name, kTexModeNames[mode]);
+	fflush(stdout);
+	id<MTLBuffer> before = [d newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> privBefore = [d newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+	id<MTLTexture> t = make_texture(d, s, kTexModes[mode]);
+	id<MTLTexture> t2 = make_texture(d, s, kTexModes[mode]);
+	id<MTLBuffer> after = [d newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+	describe_resource(tag, "sharedBefore", before);
+	describe_resource(tag, "privateBefore", privBefore);
+	describe_resource(tag, "texture", t);
+	describe_resource(tag, "second", t2);
+	describe_resource(tag, "sharedAfter", after);
+	int ok = 0, ok2 = 0;
+	const uint64_t a1 = spi_u64(t, "gpuAddress", &ok), a2 = spi_u64(t, "gpuAddress", &ok2);
+	if (ok)
+		printf("%s gpuAddressStable=%d gpuAddressMod4K=%llu mod64K=%llu\n", tag, a1 == a2,
+		       (unsigned long long)(a1 % 4096), (unsigned long long)(a1 % 65536));
+}
+
+// How far from `p` this process maps readable memory, in one or more regions.
+static uint64_t mapped_from(const void *p, uint64_t want)
+{
+	mach_vm_address_t at = (mach_vm_address_t)(uintptr_t)p;
+	const mach_vm_address_t end = at + want;
+	while (at < end) {
+		mach_vm_address_t base = at;
+		mach_vm_size_t size = 0;
+		vm_region_basic_info_data_64_t info;
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object = MACH_PORT_NULL;
+		if (mach_vm_region(mach_task_self(), &base, &size, VM_REGION_BASIC_INFO_64,
+		                   (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS ||
+		    base > at || !(info.protection & VM_PROT_READ))
+			break;
+		at = base + size;
+	}
+	return at > end ? want : at - (mach_vm_address_t)(uintptr_t)p;
+}
+
+static uint32_t texel_value(NSUInteger x, NSUInteger y, NSUInteger slice)
+{
+	return 0xA0000000u | ((uint32_t)slice << 20) | ((uint32_t)y << 10) | (uint32_t)x;
+}
+
+// texmem.MODE.SHAPE (RGBA8 shapes 0, 2 and 3): where each texel a replaceRegion: wrote lies in
+// the memory at the texture's virtualAddress; whether getBytes: sees a write made there; and
+// whether a blit's GPU write shows there (after synchronizeResource: for Managed storage).
+static void case_texmem(id<MTLDevice> d, const char *tag, int mode, int shape)
+{
+	const struct TexShape *s = &kTexShapes[shape];
+	printf("%s shape=%s storage=%s\n", tag, s->name, kTexModeNames[mode]);
+	fflush(stdout);
+	id<MTLTexture> t = make_texture(d, s, kTexModes[mode]);
+	describe_resource(tag, "texture", t);
+	if (t == nil)
+		return;
+	const NSUInteger w = s->width, h = s->height, slices = s->slices;
+	uint32_t *px = malloc(w * h * 4);
+	for (NSUInteger slice = 0; slice < slices; slice++) {
+		for (NSUInteger y = 0; y < h; y++)
+			for (NSUInteger x = 0; x < w; x++)
+				px[y * w + x] = texel_value(x, y, slice);
+		[t replaceRegion:MTLRegionMake2D(0, 0, w, h)
+		     mipmapLevel:0
+		           slice:slice
+		       withBytes:px
+		     bytesPerRow:w * 4
+		   bytesPerImage:0];
+	}
+	free(px);
+	int ok = 0;
+	uint8_t *va = (uint8_t *)(uintptr_t)spi_u64(t, "virtualAddress", &ok);
+	if (!ok || va == NULL) {
+		printf("%s virtualAddress=%s\n", tag, ok ? "NULL" : "n/r");
+		return;
+	}
+	int okr = 0;
+	const uint64_t resourceSize = spi_u64(t, "resourceSize", &okr);
+	const uint64_t want = t.allocatedSize > resourceSize ? t.allocatedSize : resourceSize;
+	const uint64_t span = mapped_from(va, want);
+	printf("%s virtualAddress mod4K=%llu mapped=%llu of %llu\n", tag,
+	       (unsigned long long)((uintptr_t)va % 4096), (unsigned long long)span,
+	       (unsigned long long)want);
+	int64_t *at = malloc(w * h * slices * sizeof(int64_t));
+	for (NSUInteger i = 0; i < w * h * slices; i++)
+		at[i] = -1;
+	uint64_t found = 0;
+	for (uint64_t o = 0; o + 4 <= span; o += 4) {
+		uint32_t v;
+		memcpy(&v, va + o, 4);
+		if ((v >> 28) != 0xA)
+			continue;
+		const NSUInteger x = v & 0x3ff, y = (v >> 10) & 0x3ff, slice = (v >> 20) & 0xff;
+		if (x < w && y < h && slice < slices && at[(slice * h + y) * w + x] < 0) {
+			at[(slice * h + y) * w + x] = (int64_t)o;
+			found++;
+		}
+	}
+	printf("%s found=%llu of %lu\n", tag, (unsigned long long)found,
+	       (unsigned long)(w * h * slices));
+	const NSUInteger probes[][3] = {{0, 0, 0},     {1, 0, 0},     {2, 0, 0},     {3, 0, 0},
+	                                {4, 0, 0},     {8, 0, 0},     {16, 0, 0},    {32, 0, 0},
+	                                {0, 1, 0},     {1, 1, 0},     {0, 2, 0},     {0, 4, 0},
+	                                {0, 8, 0},     {w - 1, 0, 0}, {0, h - 1, 0}, {w - 1, h - 1, 0},
+	                                {0, 0, 1},     {0, 0, 2}};
+	for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+		const NSUInteger x = probes[i][0], y = probes[i][1], slice = probes[i][2];
+		if (slice >= slices)
+			continue;
+		printf("%s texel %lu,%lu,%lu at=%lld\n", tag, (unsigned long)x, (unsigned long)y,
+		       (unsigned long)slice, (long long)at[(slice * h + y) * w + x]);
+	}
+	// Linear: every texel at base + slice * image + y * pitch + x * 4.
+	const int64_t base = at[0];
+	const int64_t pitch = h > 1 ? at[w] - base : 0;
+	const int64_t image = slices > 1 ? at[h * w] - base : 0;
+	uint64_t linear = 0;
+	for (NSUInteger slice = 0; slice < slices; slice++)
+		for (NSUInteger y = 0; y < h; y++)
+			for (NSUInteger x = 0; x < w; x++)
+				linear += at[(slice * h + y) * w + x] ==
+				          base + (int64_t)slice * image + (int64_t)y * pitch + (int64_t)x * 4;
+	printf("%s linear=%llu pitch=%lld image=%lld\n", tag, (unsigned long long)linear,
+	       (long long)pitch, (long long)image);
+	// A CPU write at texel 0,0's place, then getBytes: of it.
+	if (base >= 0) {
+		const uint32_t mark = 0x5A5A5A5Au;
+		memcpy(va + base, &mark, 4);
+		uint32_t got = 0;
+		[t getBytes:&got bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+		printf("%s cpuWriteThenGetBytes=0x%08x\n", tag, got);
+	}
+	// A GPU write of texels 0..3 of row 0, then what the memory and getBytes: hold there.
+	id<MTLBuffer> src = [d newBufferWithLength:16 options:MTLResourceStorageModeShared];
+	uint32_t *sp = src.contents;
+	for (int i = 0; i < 4; i++)
+		sp[i] = 0xC0DE0000u | (uint32_t)i;
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+	[be copyFromBuffer:src
+	           sourceOffset:0
+	      sourceBytesPerRow:16
+	    sourceBytesPerImage:16
+	             sourceSize:MTLSizeMake(4, 1, 1)
+	              toTexture:t
+	       destinationSlice:0
+	       destinationLevel:0
+	      destinationOrigin:MTLOriginMake(0, 0, 0)];
+	if (kTexModes[mode] == MTLStorageModeManaged)
+		[be synchronizeResource:t];
+	[be endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	printf("%s gpuWrite status=%ld\n", tag, (long)cb.status);
+	for (int i = 0; i < 4; i++) {
+		uint32_t m = 0, g = 0;
+		if (at[i] >= 0)
+			memcpy(&m, va + at[i], 4);
+		[t getBytes:&g bytesPerRow:4 fromRegion:MTLRegionMake2D(i, 0, 1, 1) mipmapLevel:0];
+		printf("%s gpuWrite texel %d memory=0x%08x getBytes=0x%08x\n", tag, i, m, g);
+	}
+	free(at);
+}
+
+// texaddr.heap: textures in a Private heap of each type; texaddr.buffer: textures over a Shared
+// and a Managed buffer; texaddr.view: a view of a Shared and a Private texture's level 1.
+static void case_texaddr_heap(id<MTLDevice> d, const char *tag)
+{
+	const MTLHeapType types[] = {MTLHeapTypeAutomatic, MTLHeapTypePlacement};
+	const char *names[] = {"automatic", "placement"};
+	for (int i = 0; i < 2; i++) {
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = 4u << 20;
+		hd.storageMode = MTLStorageModePrivate;
+		hd.type = types[i];
+		id<MTLHeap> heap = [d newHeapWithDescriptor:hd];
+		printf("%s %s heap=%s", tag, names[i], cls(heap));
+		print_spi(heap, "gpuAddress");
+		print_spi(heap, "virtualAddress");
+		printf("\n");
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		td.usage = MTLTextureUsageShaderRead;
+		for (int k = 0; k < 2; k++) {
+			id<MTLTexture> t = types[i] == MTLHeapTypePlacement
+			                       ? [heap newTextureWithDescriptor:td offset:65536 * (k + 1)]
+			                       : [heap newTextureWithDescriptor:td];
+			printf("%s %s texture %d heapOffset=%lu\n", tag, names[i], k,
+			       (unsigned long)t.heapOffset);
+			describe_resource(tag, names[i], t);
+		}
+	}
+}
+
+static void case_texaddr_buffer(id<MTLDevice> d, const char *tag)
+{
+	const MTLResourceOptions opts[] = {MTLResourceStorageModeShared, MTLResourceStorageModeManaged};
+	const char *names[] = {"shared", "managed"};
+	for (int i = 0; i < 2; i++) {
+		id<MTLBuffer> b = [d newBufferWithLength:1 << 20 options:opts[i]];
+		printf("%s %s buffer contents=%p", tag, names[i], b.contents);
+		print_spi(b, "gpuAddress");
+		print_spi(b, "virtualAddress");
+		printf("\n");
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = (MTLStorageMode)(opts[i] >> MTLResourceStorageModeShift);
+		td.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> t = [b newTextureWithDescriptor:td offset:4096 bytesPerRow:256];
+		describe_resource(tag, names[i], t);
+	}
+}
+
+static void case_texaddr_view(id<MTLDevice> d, const char *tag)
+{
+	for (int m = 0; m < 2; m++) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:YES];
+		td.storageMode = m == 0 ? MTLStorageModeShared : MTLStorageModePrivate;
+		td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+		id<MTLTexture> t = [d newTextureWithDescriptor:td];
+		id<MTLTexture> v = [t newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                        textureType:MTLTextureType2D
+		                                             levels:NSMakeRange(1, 1)
+		                                             slices:NSMakeRange(0, 1)];
+		describe_resource(tag, m == 0 ? "shared.parent" : "private.parent", t);
+		describe_resource(tag, m == 0 ? "shared.view" : "private.view", v);
+	}
+}
+
+static void case_texaddr_iosurface(id<MTLDevice> d, const char *tag)
+{
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @64,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModeManaged;
+	td.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td iosurface:surface plane:0];
+	printf("%s surface base=%p\n", tag, IOSurfaceGetBaseAddress(surface));
+	describe_resource(tag, "texture", t);
+	CFRelease(surface);
+}
+
+// nocopy.ro.KIND.MODE: a no-copy buffer over 4 pages the process maps read-only, anonymous
+// memory (`anon`, written, then mprotect'd) or a file mapped shared and read-only (`file`): the
+// buffer; a blit read of it; a blit fill and a kernel's store into it, each command buffer's
+// status and error; what the memory, and for the file a fresh read of it, hold after.
+static void case_nocopy_ro(id<MTLDevice> d, const char *tag, int file, MTLResourceOptions opts)
+{
+	const size_t page = (size_t)getpagesize(), len = 4 * page;
+	uint8_t *p = NULL;
+	char path[] = "/tmp/oracle_ro_XXXXXX";
+	int fd = -1;
+	if (file) {
+		fd = mkstemp(path);
+		uint8_t *bytes = malloc(len);
+		memset(bytes, 0x11, len);
+		if (fd < 0 || write(fd, bytes, len) != (ssize_t)len) {
+			printf("%s file=failed\n", tag);
+			return;
+		}
+		free(bytes);
+		p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+	} else {
+		p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+		memset(p, 0x11, len);
+		mprotect(p, len, PROT_READ);
+	}
+	printf("%s mapped=%s\n", tag, p == MAP_FAILED ? "failed" : "ok");
+	fflush(stdout);
+	if (p == MAP_FAILED)
+		return;
+	id<MTLBuffer> b = [d newBufferWithBytesNoCopy:p length:len options:opts deallocator:nil];
+	describe_resource(tag, "buffer", b);
+	if (b != nil) {
+		id<MTLCommandQueue> q = [d newCommandQueue];
+		id<MTLBuffer> dst = [d newBufferWithLength:len options:MTLResourceStorageModeShared];
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+		[be copyFromBuffer:b sourceOffset:0 toBuffer:dst destinationOffset:0 size:len];
+		[be endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		printf("%s gpuRead status=%ld error=%s first=0x%02x\n", tag, (long)cb.status,
+		       err_text(cb.error), ((uint8_t *)dst.contents)[0]);
+		fflush(stdout);
+		cb = [q commandBuffer];
+		be = [cb blitCommandEncoder];
+		[be fillBuffer:b range:NSMakeRange(0, 256) value:0x77];
+		if ((opts & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged)
+			[be synchronizeResource:b];
+		[be endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		printf("%s gpuFill status=%ld error=%s memory=0x%02x\n", tag, (long)cb.status,
+		       err_text(cb.error), p[0]);
+		fflush(stdout);
+		NSError *e = nil;
+		id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+		MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+		bool flag = false;
+		float scale = 1.0f;
+		[cv setConstantValue:&flag type:MTLDataTypeBool atIndex:0];
+		[cv setConstantValue:&scale type:MTLDataTypeFloat atIndex:1];
+		id<MTLFunction> fn = [lib newFunctionWithName:@"div_kernel" constantValues:cv error:&e];
+		id<MTLComputePipelineState> ps =
+		    fn ? [d newComputePipelineStateWithFunction:fn error:&e] : nil;
+		if (ps != nil) {
+			cb = [q commandBuffer];
+			id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+			[ce setComputePipelineState:ps];
+			[ce setBuffer:b offset:512 atIndex:0];
+			[ce dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[ce endEncoding];
+			if ((opts & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged) {
+				be = [cb blitCommandEncoder];
+				[be synchronizeResource:b];
+				[be endEncoding];
+			}
+			[cb commit];
+			[cb waitUntilCompleted];
+			uint32_t v = 0;
+			memcpy(&v, p + 512, 4);
+			printf("%s kernelStore status=%ld error=%s memory=0x%08x\n", tag, (long)cb.status,
+			       err_text(cb.error), v);
+		} else
+			printf("%s kernelStore pipeline=nil error=%s\n", tag, err_text(e));
+	}
+	if (file) {
+		uint8_t first[516] = {0};
+		int again = open(path, O_RDONLY);
+		const ssize_t n = again >= 0 ? pread(again, first, sizeof first, 0) : -1;
+		printf("%s fileAfter read=%zd byte0=0x%02x byte512=0x%02x\n", tag, n, first[0],
+		       first[512]);
+		if (again >= 0)
+			close(again);
+		close(fd);
+		unlink(path);
+	}
+}
+
 // --- the cases ----------------------------------------------------------------------------
 
 static const char *const kCases[] = {
@@ -930,7 +1401,47 @@ static int run_case(id<MTLDevice> d, const char *c)
 		device_texture(d, c, MTLPixelFormatStencil8, MTLStorageModeManaged);
 	else if (!strcmp(c, "devtex.depth.private"))
 		device_texture(d, c, MTLPixelFormatDepth32Float, MTLStorageModePrivate);
-	else {
+	else if (!strcmp(c, "texaddr.heap"))
+		case_texaddr_heap(d, c);
+	else if (!strcmp(c, "texaddr.buffer"))
+		case_texaddr_buffer(d, c);
+	else if (!strcmp(c, "texaddr.view"))
+		case_texaddr_view(d, c);
+	else if (!strcmp(c, "texaddr.iosurface"))
+		case_texaddr_iosurface(d, c);
+	else if (!strncmp(c, "texaddr.", 8) || !strncmp(c, "texmem.", 7)) {
+		const char *rest = strchr(c, '.') + 1;
+		int mode = -1, shape = -1;
+		for (int m = 0; m < 3; m++) {
+			const size_t n = strlen(kTexModeNames[m]);
+			if (!strncmp(rest, kTexModeNames[m], n) && rest[n] == '.') {
+				mode = m;
+				for (size_t k = 0; k < sizeof kTexShapes / sizeof kTexShapes[0]; k++)
+					if (!strcmp(rest + n + 1, kTexShapes[k].name))
+						shape = (int)k;
+			}
+		}
+		if (mode < 0 || shape < 0) {
+			fprintf(stderr, "no case %s\n", c);
+			return 2;
+		}
+		if (c[3] == 'a')
+			case_texaddr(d, c, mode, shape);
+		else
+			case_texmem(d, c, mode, shape);
+	} else if (!strcmp(c, "nocopy.ro.anon.shared"))
+		case_nocopy_ro(d, c, 0, MTLResourceStorageModeShared);
+	else if (!strcmp(c, "nocopy.ro.anon.managed"))
+		case_nocopy_ro(d, c, 0, MTLResourceStorageModeManaged);
+	else if (!strcmp(c, "nocopy.ro.file.shared"))
+		case_nocopy_ro(d, c, 1, MTLResourceStorageModeShared);
+	else if (!strcmp(c, "nocopy.ro.file.managed"))
+		case_nocopy_ro(d, c, 1, MTLResourceStorageModeManaged);
+	else if (!strncmp(c, "linalign.", 9)) {
+		const unsigned long f = strtoul(c + 9, NULL, 10);
+		const NSUInteger a = [d minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)f];
+		printf("linalign %lu=%lu\n", f, (unsigned long)a);
+	} else {
 		fprintf(stderr, "no case %s\n", c);
 		return 2;
 	}
@@ -954,6 +1465,45 @@ static void spawn_case(const char *dev, const char *c)
 	else
 		printf("== %s exit %d\n", c, WEXITSTATUS(st));
 	fflush(stdout);
+}
+
+// A case, or a group of them: `texaddr` (every storage mode and shape, then .heap, .buffer,
+// .view and .iosurface), `texmem` (the Shared and Managed RGBA8 shapes 0, 2 and 3), `nocopy.ro`
+// (the four kinds), `linalign` (raw formats 0 to 799 and four past them).
+static void spawn_group(const char *dev, const char *c)
+{
+	char name[96];
+	if (!strcmp(c, "texaddr")) {
+		for (int m = 0; m < 3; m++)
+			for (size_t k = 0; k < sizeof kTexShapes / sizeof kTexShapes[0]; k++) {
+				snprintf(name, sizeof name, "texaddr.%s.%s", kTexModeNames[m], kTexShapes[k].name);
+				spawn_case(dev, name);
+			}
+		spawn_case(dev, "texaddr.heap");
+		spawn_case(dev, "texaddr.buffer");
+		spawn_case(dev, "texaddr.view");
+		spawn_case(dev, "texaddr.iosurface");
+	} else if (!strcmp(c, "texmem")) {
+		const int shapes[] = {0, 2, 3};
+		for (int m = 1; m < 3; m++)
+			for (int k = 0; k < 3; k++) {
+				snprintf(name, sizeof name, "texmem.%s.%s", kTexModeNames[m],
+				         kTexShapes[shapes[k]].name);
+				spawn_case(dev, name);
+			}
+	} else if (!strcmp(c, "nocopy.ro")) {
+		spawn_case(dev, "nocopy.ro.anon.shared");
+		spawn_case(dev, "nocopy.ro.anon.managed");
+		spawn_case(dev, "nocopy.ro.file.shared");
+		spawn_case(dev, "nocopy.ro.file.managed");
+	} else if (!strcmp(c, "linalign")) {
+		const unsigned long past[] = {1000, 1023, 4096, 65535};
+		for (unsigned long f = 0; f < 800 + 4; f++) {
+			snprintf(name, sizeof name, "linalign.%lu", f < 800 ? f : past[f - 800]);
+			spawn_case(dev, name);
+		}
+	} else
+		spawn_case(dev, c);
 }
 
 int main(int argc, char **argv)
@@ -985,6 +1535,6 @@ int main(int argc, char **argv)
 			spawn_case(argv[1], kCases[i]);
 	else
 		for (int i = 2; i < argc; i++)
-			spawn_case(argv[1], argv[i]);
+			spawn_group(argv[1], argv[i]);
 	return 0;
 }

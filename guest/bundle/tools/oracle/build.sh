@@ -22,7 +22,7 @@ xcrun -sdk macosx metallib "$air" -o "$out/oracle_icb.metallib"
 rm -f "$air"
 # oracle_bundle and its libraries; a library this toolchain does not build is left out, and its
 # case says so.
-xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal -framework IOSurface \
 	-framework Foundation "$here/oracle_bundle.m" -o "$out/oracle_bundle"
 for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
