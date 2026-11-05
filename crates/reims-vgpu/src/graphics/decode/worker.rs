@@ -24,7 +24,8 @@
 //!   `SURFACE_PAGES` and a `BUFFER_OVER_PAGES` handed over (a pages block's first, or one behind
 //!   its block's or its context's still being made) are their block's, as are a released block's
 //!   views and its device cache's let-go; an over-view buffer's drop at its destroy is its
-//!   block's, or its id's where it has none.
+//!   block's, or its id's where it has none. A view's mapping, let go of there wherever the
+//!   view's last hold goes, is under a key of its own (`surface_pages::TEARDOWN`).
 //! - The ICB worker's (`reims-vgpu.icb-create-<i>`) key is the buffer's context: a process's
 //!   `ICB_CREATE`s are made in its ring order, other processes' beside them.
 //! - The closes' worker's (`reims-vgpu.graphics-closes-<i>`) key is the closed context: a

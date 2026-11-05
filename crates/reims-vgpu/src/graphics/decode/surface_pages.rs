@@ -63,7 +63,9 @@
 //! it may be the last hold of an import or a mapping: a surface's buffer
 //! (`BUFFER_OVER_SURFACE_PAGES`) at its `OBJECT_DESTROY`, and a block's views and device cache at
 //! its `BLOCK_RELEASE`. A texture and a pages block's buffer go at once, as the guest may pick
-//! their id or their GPU address again in its next message.
+//! their id or their GPU address again in its next message; where one is the last hold of a view,
+//! the view's mapping still goes on the worker ([`SurfaceView`]), as does every view's, wherever
+//! its last hold goes.
 //!
 //! [`Worker`]: super::worker::Worker
 //! [`Unsettled`]: super::worker::Unsettled
@@ -89,7 +91,7 @@ use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
 
-use super::worker::Settle;
+use super::worker::{Settle, Worker};
 
 /// The guest's page: every run is whole pages of it.
 pub(crate) const GUEST_PAGE: u64 = 4096;
@@ -100,26 +102,65 @@ pub(crate) const CACHED_VIEWS: usize = 32;
 /// The most bytes of guest pages the cache's views map, past which the oldest go.
 pub(crate) const CACHED_BYTES: u64 = 1 << 30;
 
+/// The surface worker's key of a view's teardown ([`SurfaceView`]'s drop): no block's offset,
+/// so a teardown never waits behind a block's jobs, nor they behind it, and the teardowns run
+/// one at a time, on one of the worker's threads at most.
+const TEARDOWN: u64 = u64::MAX;
+
 /// One surface's view of its guest pages, which the buffers of its blocks lie over.
+///
+/// Its last hold may go on any thread: a block's release or the cache's eviction on the surface
+/// worker, a context's close on the closes' worker, or the deallocator of a buffer over it,
+/// which the platform runs where the buffer's last release is, ring 0's thread among them (a
+/// texture's or a pages block's buffer's `OBJECT_DESTROY`, which lets go of its object at once,
+/// the module doc). So the view's mapping, whose teardown is one unmap of every run it maps, is
+/// let go of on the surface worker ([`TEARDOWN`]) wherever that is, never on the thread that let
+/// go of the view last.
 pub(crate) struct SurfaceView<P: Platform> {
-    /// The view: the runs mapped in order, `length` bytes.
-    mapping: Arc<Mapping<P>>,
-    /// The platform's hold on the guest's RAM, kept until the view's teardown.
-    _lease: Lease,
+    /// The view's first byte, and its bytes: its mapping's.
+    base: HostPtr,
+    length: u64,
+    /// The view, the runs mapped in order, and the platform's hold on the guest's RAM, kept until
+    /// the view's teardown; taken as it goes.
+    held: Option<(Arc<Mapping<P>>, Lease)>,
+    /// Where `held` is let go of; `None` where it goes where the view does (the costs' runs).
+    teardown: Option<Arc<Worker>>,
 }
 
 /// The platform's hold on the guest's RAM the views are made of.
 pub(crate) type Lease = Arc<dyn Any + Send + Sync>;
 
 impl<P: Platform> SurfaceView<P> {
+    /// The view of `mapping`, which holds `lease` until it goes, let go of on `teardown`.
+    pub(crate) fn new(
+        mapping: Arc<Mapping<P>>,
+        lease: Lease,
+        teardown: Option<Arc<Worker>>,
+    ) -> Self {
+        SurfaceView {
+            base: mapping.virtual_address(),
+            length: mapping.length(),
+            held: Some((mapping, lease)),
+            teardown,
+        }
+    }
+
     /// The view's bytes: the surface's.
     pub(crate) fn length(&self) -> u64 {
-        self.mapping.length()
+        self.length
     }
 
     /// The view's first byte.
     pub(crate) fn base(&self) -> HostPtr {
-        self.mapping.virtual_address()
+        self.base
+    }
+}
+
+impl<P: Platform> Drop for SurfaceView<P> {
+    fn drop(&mut self) {
+        if let (Some(held), Some(worker)) = (self.held.take(), self.teardown.take()) {
+            worker.drop_later(TEARDOWN, 0, held);
+        }
     }
 }
 
@@ -224,6 +265,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     /// The guest's RAM, through which the views are made, and the platform's hold on it; `None`
     /// makes none.
     memory: Option<(Arc<MemoryMap<P>>, Lease)>,
+    /// Where each view's mapping is let go of ([`SurfaceView`]): the surface worker.
+    teardown: Option<Arc<Worker>>,
     /// Each block's view, and the size of the block's part its holders map.
     by_block: HashMap<u64, (Arc<SurfaceView<P>>, u64)>,
     /// Each pages block's view, by block offset.
@@ -244,6 +287,7 @@ enum Found<P: Platform> {
     Make {
         memory: Arc<MemoryMap<P>>,
         lease: Lease,
+        teardown: Option<Arc<Worker>>,
         key: Vec<(u64, u64)>,
     },
 }
@@ -256,10 +300,14 @@ pub(crate) struct Released<P: Platform> {
 }
 
 impl<P: Platform> SurfaceViews<P> {
-    /// No views, made through `memory`.
-    pub(crate) fn new(memory: Option<(Arc<MemoryMap<P>>, Lease)>) -> Self {
+    /// No views, made through `memory`, each let go of on `teardown` ([`SurfaceView`]).
+    pub(crate) fn new(
+        memory: Option<(Arc<MemoryMap<P>>, Lease)>,
+        teardown: Option<Arc<Worker>>,
+    ) -> Self {
         SurfaceViews {
             memory,
+            teardown,
             by_block: HashMap::new(),
             private: HashMap::new(),
             cache: VecDeque::new(),
@@ -316,8 +364,15 @@ impl<P: Platform> SurfaceViews<P> {
         drop(old);
         let made = match found {
             Found::Done(view) => view,
-            Found::Make { memory, lease, key } => {
-                match make_view(platform, device, pages, runs, &memory, lease, &key)? {
+            Found::Make {
+                memory,
+                lease,
+                teardown,
+                key,
+            } => {
+                match make_view(
+                    platform, device, pages, runs, &memory, lease, teardown, &key,
+                )? {
                     Ok((view, import)) => {
                         let evicted = views.lock().keep(key, &view, import);
                         drop(evicted);
@@ -490,6 +545,7 @@ impl<P: Platform> SurfaceViews<P> {
         Found::Make {
             memory: Arc::clone(memory),
             lease: Arc::clone(lease),
+            teardown: self.teardown.clone(),
             key,
         }
     }
@@ -552,7 +608,7 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (memory, lease, runs, length) = {
+        let (memory, lease, teardown, runs, length) = {
             let mut v = views.lock();
             let Some(p) = (v.private.get(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
@@ -567,9 +623,16 @@ impl<P: Platform> SurfaceViews<P> {
                 v.refused(PagesRefusal::NoMemoryMap);
                 return Ok(None);
             };
-            (Arc::clone(memory), Arc::clone(lease), runs, length)
+            let teardown = v.teardown.clone();
+            (
+                Arc::clone(memory),
+                Arc::clone(lease),
+                teardown,
+                runs,
+                length,
+            )
         };
-        let made = match map_view(&memory, lease, &runs, length) {
+        let made = match map_view(&memory, lease, teardown, &runs, length) {
             Ok(view) => match buffer_over(device, &view, 0, view.length(), 0, None)? {
                 Some(import) => Ok((view, import)),
                 None => Err(PagesRefusal::NoBuffer),
@@ -720,10 +783,12 @@ impl<P: Platform> SurfaceViews<P> {
 /// A view just made, and the buffer over the whole of it that holds its import.
 type Made<P> = (Arc<SurfaceView<P>>, <P as Platform>::Buffer);
 
-/// A view of the runs `key` through `memory`, which holds `lease`, `length` bytes.
+/// A view of the runs `key` through `memory`, which holds `lease`, `length` bytes, let go of on
+/// `teardown`.
 fn map_view<P: Platform>(
     memory: &MemoryMap<P>,
     lease: Lease,
+    teardown: Option<Arc<Worker>>,
     key: &[(u64, u64)],
     length: u64,
 ) -> Result<Arc<SurfaceView<P>>, PagesRefusal> {
@@ -738,15 +803,13 @@ fn map_view<P: Platform>(
     let Some(mapping) = memory.new_range_mapping(&ranges, length, 0) else {
         return Err(PagesRefusal::NotMapped);
     };
-    Ok(Arc::new(SurfaceView {
-        mapping,
-        _lease: lease,
-    }))
+    Ok(Arc::new(SurfaceView::new(mapping, lease, teardown)))
 }
 
 /// The view of the runs `key` of the block `pages` names, through `memory`, which holds `lease`,
-/// with a buffer over the whole of it on `device`, which holds the runtime's import of its
-/// pages; logs what each cost.
+/// let go of on `teardown`, with a buffer over the whole of it on `device`, which holds the
+/// runtime's import of its pages; logs what each cost.
+#[allow(clippy::too_many_arguments)] // the block, its runs, and what the view is made through
 fn make_view<P: Platform>(
     platform: &P,
     device: &P::Device,
@@ -754,11 +817,12 @@ fn make_view<P: Platform>(
     runs: &[RgfxPageRun],
     memory: &MemoryMap<P>,
     lease: Lease,
+    teardown: Option<Arc<Worker>>,
     key: &[(u64, u64)],
 ) -> RaiseResult<Result<Made<P>, PagesRefusal>> {
     let clock = platform.clock();
     let start = clock.now_mono();
-    let view = match map_view(memory, lease, key, pages.length) {
+    let view = match map_view(memory, lease, teardown, key, pages.length) {
         Ok(view) => view,
         Err(why) => return Ok(Err(why)),
     };
@@ -1462,6 +1526,120 @@ pub(super) mod tests {
         r.dec.surface_worker().release();
         r.dec.surface_worker().flush();
         assert_eq!(world.live("MTLBuffer").len(), buffers - 1);
+    }
+
+    /// A view's mapping goes on the surface worker wherever its last hold goes: a texture over a
+    /// surface's buffer and a pages block's buffer, each the last hold of its view once the
+    /// buffer, the blocks and the cache let theirs go, are let go of at once at their
+    /// `OBJECT_DESTROY`, on ring 0's thread, and the views' mappings wait for the worker
+    #[test]
+    fn a_view_s_mapping_goes_on_the_worker_from_a_destroy_on_ring_0() {
+        let mut r = rig(64);
+        let page = r.page;
+        let world = Arc::clone(r.p.world());
+        r.dec.hold_resource_ids(0, 1);
+        let send = |r: &mut Rig, bytes: &[u8]| r.dec.decode(&r.device, bytes).unwrap();
+        let destroy = |obj_id| RgfxObjectDestroy {
+            header: header(RGFX_CMD_OBJECT_DESTROY),
+            obj_id,
+        };
+        // A surface's view, a buffer over it and a texture over the buffer.
+        assert_eq!(r.pages(BLOCK, &[(1, 1)], page), RGFX_STATUS_OK);
+        let surface = Arc::downgrade(&r.view(BLOCK));
+        assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
+        let texture = RgfxTextureFromBuffer {
+            header: header(RGFX_CMD_TEXTURE_FROM_BUFFER),
+            obj_id: 11,
+            resource_id: 0x41,
+            buffer_obj_id: 10,
+            offset: 0,
+            bytes_per_row: 64 * 4,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 64,
+                height: 16,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+        };
+        assert_eq!(send(&mut r, texture.as_bytes()), Ok(()));
+        // A pages block's view, which its buffer made.
+        const PAGES: u64 = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_flagged(PAGES, 0, &[(3, 1)], page, RGFX_SURFACE_PAGES_PRIVATE),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.pages_buffer(20, 0x1_0000_0000, PAGES, 0, page), Ok(()));
+        let private = Arc::downgrade(&r.private_view(PAGES));
+        // Every other hold goes: the surface's buffer, both blocks, and the cache's.
+        assert_eq!(send(&mut r, destroy(10).as_bytes()), Ok(()));
+        for block in [BLOCK, PAGES] {
+            r.dec
+                .block_released(&r.device, block, false, Box::new(|| ()), no_raise());
+        }
+        for i in 0..CACHED_VIEWS as u64 {
+            assert_eq!(
+                r.pages(BLOCK + 0x10000, &[(10 + i, 1)], page),
+                RGFX_STATUS_OK
+            );
+        }
+        r.dec.surface_worker().flush();
+        let bases = [&surface, &private].map(|v| v.upgrade().expect("the view lives").base());
+        assert_eq!(
+            surface.strong_count(),
+            1,
+            "the texture's buffer alone holds it"
+        );
+        assert_eq!(
+            private.strong_count(),
+            1,
+            "the pages block's buffer alone holds it"
+        );
+        let unmaps = |r: &Rig, mark| -> Vec<usize> {
+            (r.p.call_log().since(mark).iter())
+                .filter(|c| c.sel == "mach_vm_deallocate")
+                .filter_map(|c| match c.args[0] {
+                    Arg::Ptr(at) => Some(at),
+                    _ => None,
+                })
+                .filter(|&at| bases.iter().any(|b| b.addr() == at))
+                .collect()
+        };
+        r.dec.surface_worker().hold();
+        let mark = r.p.call_log().mark();
+        let (textures, buffers) = (
+            world.live("MTLTexture").len(),
+            world.live("MTLBuffer").len(),
+        );
+        assert_eq!(send(&mut r, destroy(11).as_bytes()), Ok(()));
+        assert_eq!(send(&mut r, destroy(20).as_bytes()), Ok(()));
+        assert_eq!(
+            world.live("MTLTexture").len(),
+            textures - 1,
+            "the texture went at once"
+        );
+        assert_eq!(
+            world.live("MTLBuffer").len(),
+            buffers - 2,
+            "so did both buffers"
+        );
+        assert_eq!((surface.strong_count(), private.strong_count()), (0, 0));
+        assert!(
+            unmaps(&r, mark).is_empty(),
+            "the mappings wait for the worker"
+        );
+        r.dec.surface_worker().release();
+        r.dec.surface_worker().flush();
+        let mut unmapped = unmaps(&r, mark);
+        unmapped.sort_unstable();
+        let mut want = bases.map(|b| b.addr());
+        want.sort_unstable();
+        assert_eq!(unmapped, want, "each view's mapping went on the worker");
     }
 
     /// A block named again, or released and its offset given to another surface, lies over its

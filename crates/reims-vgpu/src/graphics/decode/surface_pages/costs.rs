@@ -413,10 +413,7 @@ fn measure<P: ApiPlatform>(label: &str) {
                 eprintln!("{label}: {}: a range mapping refused", case.name);
                 continue;
             };
-            let view = Arc::new(SurfaceView::<P> {
-                mapping,
-                _lease: Arc::clone(&lease),
-            });
+            let view = Arc::new(SurfaceView::<P>::new(mapping, Arc::clone(&lease), None));
             let Some(import) = steps[1]
                 .time(|| buffer_over(&device, &view, 0, case.length, 0, None))
                 .expect("no raise")

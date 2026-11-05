@@ -807,7 +807,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             id_chunks: Mutex::new(vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice()),
             failed: Arc::default(),
             unified_memory: AtomicBool::new(false),
-            surface_views: Mutex::new(surface_pages::SurfaceViews::new(None)),
+            surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
@@ -903,7 +903,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         memory: Arc<MemoryMap<P>>,
         lease: Arc<dyn std::any::Any + Send + Sync>,
     ) {
-        *self.shared.surface_views.lock() = surface_pages::SurfaceViews::new(Some((memory, lease)));
+        let teardown = Some(Arc::clone(&self.shared.surface_worker));
+        *self.shared.surface_views.lock() =
+            surface_pages::SurfaceViews::new(Some((memory, lease)), teardown);
     }
 
     /// Sets the bytes deferred blocks' device caches may hold at once ([`surface_cache`], the
