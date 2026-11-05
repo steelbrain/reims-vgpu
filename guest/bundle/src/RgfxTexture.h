@@ -142,6 +142,19 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor);
 /// those the oracles answer 256 for and those no oracle measured.
 void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
 
+/// Ends the process, with Metal's words, at a view of a texture in `from`, of `fromType`,
+/// `levelCount` levels and `sliceCount` slices, that Metal's validation ends it at on the AMD 5300M
+/// and the Intel 630 under macOS 26.7.1 with no validation layer (oracle_bundle view.*): in no
+/// format (MTLPixelFormatInvalid, which the M3 Max under macOS 27.0.1 answers nil for); in a
+/// format of one texel a block of other bytes than the texture's (RGBA16Float in RGBA8Unorm); and,
+/// for a view naming its type, levels and slices (`subrange`), levels or slices past the
+/// texture's, a type of another family (a 2D texture as 3D), or a cube's slices not a multiple of
+/// six, as the M3 Max's does. It returns for any other view, among them those the oracles did not
+/// measure (empty ranges, other slice counts, compressed formats), which the bundle answers nil.
+void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64_t levelCount,
+                            uint64_t sliceCount, MTLPixelFormat format, MTLTextureType type,
+                            NSRange levels, NSRange slices, bool subrange);
+
 /// A device whose linear texture alignment the bundle's own callers ask without
 /// `minimumLinearTextureAlignmentForPixelFormat:`, which ends the process at some formats
 /// (rgfxEndAtUnalignableLinearFormat), where Metal's own creators do not.

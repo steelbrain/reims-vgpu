@@ -1111,8 +1111,79 @@ static int dies_case(const char *name)
 		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatASTC_4x4_LDR);
 	if (std::strcmp(name, "linear-alignment-d24s8") == 0)
 		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatDepth24Unorm_Stencil8);
+	// A view of test_texture_views' texture: a Private 2D array of four slices and seven levels,
+	// of usage 0x17, in RGBA8Unorm.
+	auto viewOf = [&](MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices,
+	                  bool subrange) {
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:32
+		                                                   mipmapped:YES];
+		desc.textureType = MTLTextureType2DArray;
+		desc.arrayLength = 4;
+		desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+		             MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+		desc.storageMode = MTLStorageModePrivate;
+		RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+		                                                 heap:RGFX_OBJ_NONE
+		                                           heapOffset:0
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		if (subrange)
+			(void)[tex newTextureViewWithPixelFormat:format
+			                             textureType:type
+			                                  levels:levels
+			                                  slices:slices];
+		else
+			(void)[tex newTextureViewWithPixelFormat:format];
+	};
+	const NSRange one = NSMakeRange(0, 1);
+	if (std::strcmp(name, "view-no-format") == 0)
+		viewOf(MTLPixelFormatInvalid, MTLTextureType2DArray, one, one, false);
+	if (std::strcmp(name, "view-format-class") == 0)
+		viewOf(MTLPixelFormatRG8Unorm, MTLTextureType2DArray, one, one, false);
+	if (std::strcmp(name, "view-levels") == 0)
+		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, NSMakeRange(6, 3), one, true);
+	if (std::strcmp(name, "view-slices") == 0)
+		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType2DArray, one, NSMakeRange(3, 2), true);
+	if (std::strcmp(name, "view-type") == 0)
+		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType3D, one, one, true);
+	if (std::strcmp(name, "view-cube-count") == 0)
+		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, one, NSMakeRange(0, 4), true);
 	}
 	return 0;
+}
+
+// A view ends the process with Metal's words, before the host is asked, where Metal ends it on the
+// AMD 5300M and the Intel 630 (oracle_bundle view.*): in no format, in a format of one texel a
+// block of other bytes, at levels or slices past the texture's, of a type of another family, and
+// as a cube of slices not a multiple of six.
+void test_metal_ended_views_end_the_process()
+{
+	const std::string kWhere = "_mtlValidateArgumentsForTextureViewOnDevice: failed assertion "
+	                           "`Texture Creation\n";
+	checkDies("view-no-format",
+	          (kWhere + "texture view pixelFormat (MTLPixelFormatInvalid) not castable.\nsource "
+	                    "texture pixelFormat (MTLPixelFormatRGBA8Unorm) not compatible with "
+	                    "texture view pixelFormat (MTLPixelFormatInvalid).\n'")
+	              .c_str());
+	checkDies("view-format-class",
+	          (kWhere + "source texture pixelFormat (MTLPixelFormatRGBA8Unorm) not compatible with "
+	                    "texture view pixelFormat (MTLPixelFormatRG8Unorm).\n'")
+	              .c_str());
+	checkDies("view-levels", (kWhere + "(newLevelRange.location + newLevelRange.length)(9) must "
+	                                   "be <= [texture mipmapLevelCount](7).\n'")
+	                             .c_str());
+	checkDies("view-slices",
+	          (kWhere + "(newSliceRange.location + newSliceRange.length)(5) must be <= (4).\n'")
+	              .c_str());
+	checkDies("view-type",
+	          (kWhere + "source texture textureType (MTLTextureType2DArray) not compatible with "
+	                    "texture view textureType (MTLTextureType3D).\n'")
+	              .c_str());
+	checkDies("view-cube-count",
+	          (kWhere + "newSliceRange.length(4) must be a multiple of (6).\n'").c_str());
 }
 
 // A Memoryless indirect command buffer ends the process, before the host is asked, as on the AMD
@@ -8462,34 +8533,17 @@ void test_texture_views()
 	m = expectMessage<RgfxTextureView>(fx.ring, RGFX_CMD_TEXTURE_VIEW);
 	CHECK(m.parent_obj_id == ((RgfxResource *)red).rgfxObjId);
 
-	// Views Metal makes none of, or asserts at: nil, and nothing posted.
-	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatInvalid] == nil);
-	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRG8Unorm] == nil);
+	// Views Metal asserts at where no oracle measured whether it does: nil, and nothing posted
+	// (those every x86 Mac's Metal ends the process at are test_metal_ended_views_end_the_process).
 	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatBC1_RGBA] == nil);
-	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
-	                             textureType:MTLTextureType2D
-	                                  levels:NSMakeRange(6, 3)
-	                                  slices:NSMakeRange(0, 1)] == nil);
 	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
 	                             textureType:MTLTextureType2D
 	                                  levels:NSMakeRange(0, 0)
 	                                  slices:NSMakeRange(0, 1)] == nil);
 	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
-	                             textureType:MTLTextureType2DArray
-	                                  levels:NSMakeRange(0, 1)
-	                                  slices:NSMakeRange(3, 2)] == nil);
-	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
 	                             textureType:MTLTextureType2D
 	                                  levels:NSMakeRange(0, 1)
 	                                  slices:NSMakeRange(0, 2)] == nil);
-	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
-	                             textureType:MTLTextureType3D
-	                                  levels:NSMakeRange(0, 1)
-	                                  slices:NSMakeRange(0, 1)] == nil);
-	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
-	                             textureType:MTLTextureTypeCube
-	                                  levels:NSMakeRange(0, 1)
-	                                  slices:NSMakeRange(0, 5)] == nil);
 	CHECK(ringEmpty(fx.ring));
 	// A format the bundle cannot size is the host's to refuse: posted.
 	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatR32Float] != nil);
@@ -8533,10 +8587,6 @@ void test_texture_views()
 	                                                    levels:NSMakeRange(1, 2)
 	                                                    slices:NSMakeRange(0, 1)];
 	CHECK(level1 != nil && level1.width == 8 && level1.height == 4 && level1.depth == 2);
-	CHECK([vol newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
-	                             textureType:MTLTextureType2D
-	                                  levels:NSMakeRange(0, 1)
-	                                  slices:NSMakeRange(0, 1)] == nil);
 	drainRing(fx.ring);
 
 	// A view of a texture over a buffer: the buffer's, and its CPU copies are the texture's.
@@ -12126,6 +12176,7 @@ int main(int argc, char **argv)
 		test_unalignable_linear_formats_end_the_process();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
+		test_metal_ended_views_end_the_process();
 		test_texture_framebuffer_only();
 		test_texture_unknown_usage();
 		test_view_keeps_its_texture();

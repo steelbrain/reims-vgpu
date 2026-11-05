@@ -544,6 +544,111 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
 	                                    : @"MTLPixelFormatInvalid is not supported on this device.");
 }
 
+namespace {
+
+// Metal's names of the formats of one texel a block, as its validation names them.
+const RgfxNamedFormat kTexelFormats[] = {
+    {1, "MTLPixelFormatA8Unorm"}, {10, "MTLPixelFormatR8Unorm"}, {11, "MTLPixelFormatR8Unorm_sRGB"},
+    {12, "MTLPixelFormatR8Snorm"}, {13, "MTLPixelFormatR8Uint"}, {14, "MTLPixelFormatR8Sint"},
+    {20, "MTLPixelFormatR16Unorm"}, {22, "MTLPixelFormatR16Snorm"}, {23, "MTLPixelFormatR16Uint"},
+    {24, "MTLPixelFormatR16Sint"}, {25, "MTLPixelFormatR16Float"}, {30, "MTLPixelFormatRG8Unorm"},
+    {31, "MTLPixelFormatRG8Unorm_sRGB"}, {32, "MTLPixelFormatRG8Snorm"},
+    {33, "MTLPixelFormatRG8Uint"}, {34, "MTLPixelFormatRG8Sint"}, {40, "MTLPixelFormatB5G6R5Unorm"},
+    {41, "MTLPixelFormatA1BGR5Unorm"}, {42, "MTLPixelFormatABGR4Unorm"},
+    {43, "MTLPixelFormatBGR5A1Unorm"}, {53, "MTLPixelFormatR32Uint"}, {54, "MTLPixelFormatR32Sint"},
+    {55, "MTLPixelFormatR32Float"}, {60, "MTLPixelFormatRG16Unorm"},
+    {62, "MTLPixelFormatRG16Snorm"}, {63, "MTLPixelFormatRG16Uint"}, {64, "MTLPixelFormatRG16Sint"},
+    {65, "MTLPixelFormatRG16Float"}, {70, "MTLPixelFormatRGBA8Unorm"},
+    {71, "MTLPixelFormatRGBA8Unorm_sRGB"}, {72, "MTLPixelFormatRGBA8Snorm"},
+    {73, "MTLPixelFormatRGBA8Uint"}, {74, "MTLPixelFormatRGBA8Sint"},
+    {80, "MTLPixelFormatBGRA8Unorm"}, {81, "MTLPixelFormatBGRA8Unorm_sRGB"},
+    {90, "MTLPixelFormatRGB10A2Unorm"}, {91, "MTLPixelFormatRGB10A2Uint"},
+    {92, "MTLPixelFormatRG11B10Float"}, {93, "MTLPixelFormatRGB9E5Float"},
+    {94, "MTLPixelFormatBGR10A2Unorm"}, {103, "MTLPixelFormatRG32Uint"},
+    {104, "MTLPixelFormatRG32Sint"}, {105, "MTLPixelFormatRG32Float"},
+    {110, "MTLPixelFormatRGBA16Unorm"}, {112, "MTLPixelFormatRGBA16Snorm"},
+    {113, "MTLPixelFormatRGBA16Uint"}, {114, "MTLPixelFormatRGBA16Sint"},
+    {115, "MTLPixelFormatRGBA16Float"}, {123, "MTLPixelFormatRGBA32Uint"},
+    {124, "MTLPixelFormatRGBA32Sint"}, {125, "MTLPixelFormatRGBA32Float"},
+    {552, "MTLPixelFormatBGRA10_XR"}, {553, "MTLPixelFormatBGRA10_XR_sRGB"},
+    {554, "MTLPixelFormatBGR10_XR"}, {555, "MTLPixelFormatBGR10_XR_sRGB"},
+};
+
+// Metal's name of `format`, as its validation names it, for the formats of one texel a block
+// and those of kNoMultisample.
+NSString *rgfxPixelFormatName(MTLPixelFormat format)
+{
+	if (format == MTLPixelFormatInvalid)
+		return @"MTLPixelFormatInvalid";
+	for (const RgfxNamedFormat &f : kTexelFormats)
+		if (f.format == format)
+			return @(f.name);
+	for (const RgfxNamedFormat &f : kNoMultisample)
+		if (f.format == format)
+			return @(f.name);
+	return [NSString stringWithFormat:@"MTLPixelFormat(%lu)", (unsigned long)format];
+}
+
+NSString *rgfxTextureTypeName(MTLTextureType type)
+{
+	static const char *const kNames[] = {
+	    "1D", "1DArray", "2D", "2DArray", "2DMultisample", "Cube", "CubeArray", "3D",
+	    "2DMultisampleArray", "TextureBuffer"};
+	if (type < sizeof kNames / sizeof kNames[0])
+		return [NSString stringWithFormat:@"MTLTextureType%s", kNames[type]];
+	return [NSString stringWithFormat:@"MTLTextureType(%lu)", (unsigned long)type];
+}
+
+// Whether `range` passes `count`; false for an empty one, which no oracle measured.
+bool rgfxPasses(NSRange range, uint64_t count)
+{
+	return range.length > 0 && (range.location > count || range.length > count - range.location);
+}
+
+} // namespace
+
+void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64_t levelCount,
+                            uint64_t sliceCount, MTLPixelFormat format, MTLTextureType type,
+                            NSRange levels, NSRange slices, bool subrange)
+{
+	RgfxFormatBlock a = {}, b = {};
+	NSString *rule = nil;
+	if (format == MTLPixelFormatInvalid) {
+		rule = [NSString stringWithFormat:@"texture view pixelFormat (MTLPixelFormatInvalid) not "
+		                                  @"castable.\nsource texture pixelFormat (%@) not "
+		                                  @"compatible with texture view pixelFormat "
+		                                  @"(MTLPixelFormatInvalid).\n",
+		                                  rgfxPixelFormatName(from)];
+	} else if (rgfxPixelFormatBlock(from, &a) && rgfxPixelFormatBlock(format, &b) && a.linear &&
+	           b.linear && a.bytes != b.bytes) {
+		rule = [NSString stringWithFormat:@"source texture pixelFormat (%@) not compatible with "
+		                                  @"texture view pixelFormat (%@).\n",
+		                                  rgfxPixelFormatName(from), rgfxPixelFormatName(format)];
+	} else if (subrange && rgfxPasses(levels, levelCount)) {
+		rule = [NSString stringWithFormat:@"(newLevelRange.location + newLevelRange.length)(%llu) "
+		                                  @"must be <= [texture mipmapLevelCount](%llu).\n",
+		                                  (unsigned long long)levels.location + levels.length,
+		                                  (unsigned long long)levelCount];
+	} else if (subrange && rgfxPasses(slices, sliceCount)) {
+		rule = [NSString stringWithFormat:@"(newSliceRange.location + newSliceRange.length)(%llu) "
+		                                  @"must be <= (%llu).\n",
+		                                  (unsigned long long)slices.location + slices.length,
+		                                  (unsigned long long)sliceCount];
+	} else if (subrange && rgfxViewFamily(type) != 0 && rgfxViewFamily(fromType) != 0 &&
+	           rgfxViewFamily(type) != rgfxViewFamily(fromType)) {
+		rule = [NSString stringWithFormat:@"source texture textureType (%@) not compatible with "
+		                                  @"texture view textureType (%@).\n",
+		                                  rgfxTextureTypeName(fromType), rgfxTextureTypeName(type)];
+	} else if (subrange && (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) &&
+	           slices.length > 0 && slices.length % 6 != 0) {
+		rule = [NSString stringWithFormat:@"newSliceRange.length(%lu) must be a multiple of (6).\n",
+		                                  (unsigned long)slices.length];
+	}
+	if (rule != nil)
+		RgfxMetalAssertionFailed("_mtlValidateArgumentsForTextureViewOnDevice",
+		                         [@"Texture Creation\n" stringByAppendingString:rule]);
+}
+
 @interface RgfxTexture () <RgfxMetalTextureInternals>
 @end
 
@@ -986,11 +1091,12 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 //
 // Metal ends the process at a view it does not make (a failed assertion: levels or slices
 // outside the texture, a type of another family, a format of another class), and answers nil
-// for one in no format. The bundle answers nil, sending nothing, for each of these it can tell
-// from the texture (rgfxView...), and the host refuses any other its platform does not make.
-// So it answers a view of more than one slice of a 2D array over a buffer, which Metal asserts
-// at on the M3 Max and an M4 (`sliceRange.length == 1`: read from metal2vulkan's REFUSALS.md,
-// measured there) and the host's platform ends the host's process at.
+// for one in no format on the M3 Max. The bundle ends the process where the AMD 5300M and the
+// Intel 630 measurably do (rgfxEndAtViewMetalEnds), and answers nil, sending nothing, for the
+// others it can tell from the texture (rgfxView...); the host refuses any other its platform does
+// not make. It answers nil too for a view of more than one slice of a 2D array over a buffer,
+// which Metal asserts at on the M3 Max and an M4 (`sliceRange.length == 1`: read from
+// metal2vulkan's REFUSALS.md, measured there) and the host's platform ends the host's process at.
 
 - (nullable id<MTLTexture>)rgfxViewInFormat:(MTLPixelFormat)format
                                        type:(MTLTextureType)type
@@ -1007,6 +1113,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	const MTLTextureType parentType = self.textureType;
 	const uint64_t parentLevels = self.mipmapLevelCount;
 	const uint64_t parentSlices = rgfxSlicesOf(parentType, self.arrayLength);
+	rgfxEndAtViewMetalEnds(self.pixelFormat, parentType, parentLevels, parentSlices, format, type,
+	                       levels, slices, subrange);
 	RgfxViewRefusal refusal = kViews;
 	if (format == MTLPixelFormatInvalid) {
 		refusal = kNoFormat;
