@@ -537,6 +537,68 @@ void test_texture_compression()
 	drainRing(fx.ring);
 }
 
+// A texture over an IOSurface whose GPU view is a copy reads and writes the copy on the CPU
+// (getBytes, replaceRegion), and takes the surface's CPU lock for it before the view's own lock,
+// never under it: the copy's upload's read lock, and the write lock under which a replaceRegion
+// writes the copy back to the pages. A buffer's write-back of the copy at its completion takes
+// the view's lock before the buffer's writes retire, and in the guest a CPU lock of the surface
+// waits for them in the kext, so a lock under the view's lock waited out the kext's wait.
+void test_surface_copies_lock_the_surface_first()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	@autoreleasepool {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModeShared;
+		const uint64_t before = rgfxIOSurfaceLocksUnderView();
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:d
+		                                                           iosurface:surface
+		                                                               plane:0
+		                                                              region:&region
+		                                                              device:nil
+		                                                          serializer:&fx.ser];
+		CHECK(t != nil);
+		// A replaceRegion writes the copy, then the pages under the surface's write lock.
+		const uint8_t in[4] = {1, 2, 3, 4};
+		[t replaceRegion:MTLRegionMake2D(3, 2, 1, 1) mipmapLevel:0 withBytes:in bytesPerRow:4];
+		CHECK(IOSurfaceLock(surface, kIOSurfaceLockReadOnly, nullptr) == kIOReturnSuccess);
+		const uint8_t *pages = static_cast<const uint8_t *>(IOSurfaceGetBaseAddress(surface)) +
+		                       2 * IOSurfaceGetBytesPerRow(surface) + 3 * 4;
+		CHECK(std::memcmp(pages, in, 4) == 0);
+		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
+		// A CPU write of the pages under the surface's lock moves its seed: the next read takes
+		// them into the copy, under the surface's read lock.
+		CHECK(IOSurfaceLock(surface, 0, nullptr) == kIOReturnSuccess);
+		uint8_t *row = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(surface)) +
+		               5 * IOSurfaceGetBytesPerRow(surface);
+		const uint8_t cpu[4] = {9, 8, 7, 6};
+		std::memcpy(row + 4, cpu, 4);
+		IOSurfaceUnlock(surface, 0, nullptr);
+		uint8_t out[4] = {};
+		[t getBytes:out bytesPerRow:4 fromRegion:MTLRegionMake2D(1, 5, 1, 1) mipmapLevel:0];
+		CHECK(std::memcmp(out, cpu, 4) == 0);
+		[t getBytes:out bytesPerRow:4 fromRegion:MTLRegionMake2D(3, 2, 1, 1) mipmapLevel:0];
+		CHECK(std::memcmp(out, in, 4) == 0);
+		CHECK(rgfxIOSurfaceLocksUnderView() == before);
+		t = nil;
+		CFRelease(surface);
+	}
+	drainRing(fx.ring);
+}
+
 // What a texture answers past MTLTexture, for each kind the device makes: its options resolved and
 // as asked, its GPU and CPU addresses, the allocation it lies in and that allocation's size, its
 // number among the process's textures, and the rest of the resource SPI. A view answers its
@@ -1278,6 +1340,7 @@ void rgfxResourceTests()
 	test_heap_buffers_answer_their_heap();
 	test_buffer_linear_textures();
 	test_texture_compression();
+	test_surface_copies_lock_the_surface_first();
 	test_texture_answers();
 	test_device_texture_addresses_hold_their_bytes();
 	test_sampler_answers();

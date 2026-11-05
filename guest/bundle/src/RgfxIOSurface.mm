@@ -287,6 +287,74 @@ std::atomic<uint64_t> gCachedLive{0};
 std::atomic<bool> gSurfaceOrder{false};
 /// The RgfxAskUncachedScopes alive on this thread.
 thread_local unsigned tAskUncached = 0;
+
+/// The views' locks (RgfxSurfaceShadow::lock) this thread holds, and the CPU locks of a surface
+/// taken while a thread held one (rgfxIOSurfaceLocksUnderView), which stay none: a view's lock is
+/// taken after its surface's lock, never before. A buffer's write-back at its completion takes
+/// the view's lock before the buffer's writes retire, and a CPU lock of the surface waits for
+/// them in the kext, so a surface lock taken under the view's lock waited for its own thread's
+/// lock until the kext's wait gave up, then went on without the buffer's results.
+thread_local unsigned tViewLocks = 0;
+std::atomic<uint64_t> gLocksUnderView{0};
+
+/// A view's lock, held for the scope, as the views' lock order counts it.
+class ViewLock {
+public:
+	explicit ViewLock(std::mutex &m) : m_lock(m)
+	{
+		m_lock.lock();
+		tViewLocks++;
+	}
+	~ViewLock()
+	{
+		tViewLocks--;
+		m_lock.unlock();
+	}
+	ViewLock(const ViewLock &) = delete;
+	ViewLock &operator=(const ViewLock &) = delete;
+
+private:
+	std::mutex &m_lock;
+};
+
+/// IOSurfaceLock, counted where this thread holds a view's lock (rgfxIOSurfaceLocksUnderView).
+IOReturn lockSurface(IOSurfaceRef s, IOSurfaceLockOptions options, uint32_t *seed)
+{
+	if (tViewLocks != 0)
+		gLocksUnderView.fetch_add(1, std::memory_order_relaxed);
+	return IOSurfaceLock(s, options, seed);
+}
+
+/// A CPU write lock of a surface whose GPU view is a copy (`copy`), for a write through the
+/// copy (replaceRegion), taken before the view's lock: let go by unlock(), which answers the
+/// seed its unlock leaves, or at its end. None where the view is not a copy, or the lock failed.
+class CopyWriteLock {
+public:
+	CopyWriteLock(IOSurfaceRef surface, bool copy) : m_surface(copy ? surface : nullptr)
+	{
+		if (m_surface != nullptr && lockSurface(m_surface, 0, &m_seed) != kIOReturnSuccess)
+			m_surface = nullptr;
+	}
+	~CopyWriteLock() { unlock(); }
+	CopyWriteLock(const CopyWriteLock &) = delete;
+	CopyWriteLock &operator=(const CopyWriteLock &) = delete;
+
+	bool held() const { return m_surface != nullptr; }
+
+	/// Unlocks, once: the seed the unlock leaves.
+	uint32_t unlock()
+	{
+		if (m_surface != nullptr) {
+			IOSurfaceUnlock(m_surface, 0, &m_seed);
+			m_surface = nullptr;
+		}
+		return m_seed;
+	}
+
+private:
+	IOSurfaceRef m_surface;
+	uint32_t m_seed = 0;
+};
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
 std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
@@ -652,19 +720,30 @@ struct RgfxSurfaceShadow {
 		__atomic_store_n(&header->serial, serial, __ATOMIC_RELEASE);
 	}
 
-	/// Pages -> copy, under a read lock; records the seed. Caller holds `lock`. Nothing in
-	/// place.
-	void upload()
+	/// Whether the surface's seed moved since the block last matched it, in any process that
+	/// holds the block: a CPU wrote the surface under a lock. Caller holds `lock`.
+	bool changed() const
+	{
+		uint32_t synced = 0;
+		return !syncedSeed(&synced) || IOSurfaceGetSeed(surface) != synced;
+	}
+
+	/// Pages -> copy, under a read lock of the surface taken before `lock` (the views' lock
+	/// order, ViewLock), where `always` or the seed moved (changed) as `lock` is taken; records
+	/// the seed. Caller holds neither. Nothing in place.
+	void upload(bool always)
 	{
 		if (inPlace) {
 			return;
 		}
 		uint32_t s = 0;
 		uint64_t start = nowNs();
-		if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &s) != kIOReturnSuccess) {
+		if (lockSurface(surface, kIOSurfaceLockReadOnly, &s) != kIOReturnSuccess) {
 			return;
 		}
-		for (size_t k = 0; k < planes.size(); k++) {
+		ViewLock g(lock);
+		const bool copies = always || changed();
+		for (size_t k = 0; copies && k < planes.size(); k++) {
 			const ShadowPlane &p = planes[k];
 			const uint8_t *src = planeBase(surface, k);
 			if (src != nullptr) {
@@ -672,26 +751,24 @@ struct RgfxSurfaceShadow {
 			}
 		}
 		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &s);
-		setSynced(s);
-		countCopy(gUploads, planeBytes(), start);
+		if (copies) {
+			setSynced(s);
+			countCopy(gUploads, planeBytes(), start);
+		}
 	}
 
-	/// Copy -> pages. A CPU's write (`cpu`) goes under a write lock, and records the seed the
-	/// unlock leaves, so the next commit does not read our own write back. A GPU's, at its
-	/// buffer's completion, takes no lock: a lock would wait for the buffer's own writes, which
-	/// the kext retires only after this, and the seed stays where the buffer's commit moved it,
-	/// which the copy recorded then (rgfxIOSurfaceWritesPosted). Caller holds `lock`. Nothing in
-	/// place.
-	void writeBack(bool cpu)
+	/// Copy -> pages. A GPU's write, at its buffer's completion, takes no lock: a lock would wait
+	/// for the buffer's own writes, which the kext retires only after this, and the seed stays
+	/// where the buffer's commit moved it, which the copy recorded then
+	/// (rgfxIOSurfaceWritesPosted). A CPU's write goes under the write lock `cpu` holds, taken
+	/// before `lock`, and records the seed its unlock leaves, so the next commit does not read
+	/// our own write back. Caller holds `lock`. Nothing in place.
+	void writeBack(CopyWriteLock *cpu = nullptr)
 	{
-		if (inPlace) {
+		if (inPlace || (cpu != nullptr && !cpu->held())) {
 			return;
 		}
-		uint32_t s = 0;
 		uint64_t start = nowNs();
-		if (cpu && IOSurfaceLock(surface, 0, &s) != kIOReturnSuccess) {
-			return;
-		}
 		for (size_t k = 0; k < planes.size(); k++) {
 			const ShadowPlane &p = planes[k];
 			uint8_t *dst = planeBase(surface, k);
@@ -699,9 +776,8 @@ struct RgfxSurfaceShadow {
 				copyRows(p, dst, p.shape.rowBytes, copy() + p.offset, p.pitch);
 			}
 		}
-		if (cpu) {
-			IOSurfaceUnlock(surface, 0, &s);
-			setSynced(s);
+		if (cpu != nullptr) {
+			setSynced(cpu->unlock());
 		}
 		countCopy(gWriteBacks, planeBytes(), start);
 	}
@@ -713,11 +789,13 @@ struct RgfxSurfaceShadow {
 		if (inPlace) {
 			return;
 		}
-		std::lock_guard<std::mutex> g(lock);
-		uint32_t synced = 0;
-		if (!syncedSeed(&synced) || IOSurfaceGetSeed(surface) != synced) {
-			upload();
+		{
+			ViewLock g(lock);
+			if (!changed()) {
+				return;
+			}
 		}
+		upload(false);
 	}
 
 	/// Plane `p`'s rows from `src` to `dst`, each at its pitch.
@@ -955,8 +1033,7 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 	if (shared) {
 		shadow->uploadIfChanged();
 	} else {
-		std::lock_guard<std::mutex> g(shadow->lock);
-		shadow->upload();
+		shadow->upload(true);
 	}
 	return shadow;
 }
@@ -991,7 +1068,7 @@ public:
 	    : m_surface(s.cached ? s.surface : nullptr), m_options(options)
 	{
 		if (m_surface != nullptr &&
-		    IOSurfaceLock(m_surface, m_options, &m_seed) != kIOReturnSuccess)
+		    lockSurface(m_surface, m_options, &m_seed) != kIOReturnSuccess)
 			m_surface = nullptr;
 	}
 	~CachedLock()
@@ -1469,7 +1546,7 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	// bring them into the pages first. Taken before the view's own lock, which a completion
 	// takes while the lock may wait for that completion's writes.
 	CachedLock cpu(*_shadow, kIOSurfaceLockReadOnly);
-	std::lock_guard<std::mutex> g(_shadow->lock);
+	ViewLock g(_shadow->lock);
 	const ShadowPlane &p = _shadow->planes[_plane];
 	uint64_t bpe = p.shape.bytesPerElement;
 	const uint8_t *rows = _shadow->pixels() + p.offset;
@@ -1506,9 +1583,12 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	_shadow->uploadIfChanged();
 	// A cached surface's GPU copy is the host's device cache: a read-write lock brings the
 	// GPU's writes into the pages, and has the next command buffer that uses the surface take
-	// the CPU's. Taken before the view's own lock, as in getBytes.
+	// the CPU's. Taken before the view's own lock, as in getBytes. So is a copy's write lock,
+	// under which the copy's rows go into the pages: a buffer's write-back of the copy takes the
+	// view's lock before its writes retire, which the lock waits for.
 	CachedLock cpu(*_shadow, 0);
-	std::lock_guard<std::mutex> g(_shadow->lock);
+	CopyWriteLock write(_shadow->surface, !_shadow->inPlace);
+	ViewLock g(_shadow->lock);
 	const ShadowPlane &p = _shadow->planes[_plane];
 	uint64_t bpe = p.shape.bytesPerElement;
 	uint8_t *rows = _shadow->pixels() + p.offset;
@@ -1517,7 +1597,7 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 		            static_cast<const uint8_t *>(pixelBytes) + r * bytesPerRow,
 		            region.size.width * bpe);
 	}
-	_shadow->writeBack(true);
+	_shadow->writeBack(&write);
 }
 
 - (void)replaceRegion:(MTLRegion)region
@@ -1818,7 +1898,7 @@ void rgfxIOSurfaceWritesPosted(RgfxRegion *region, const std::vector<std::shared
 		if (s->inPlace) {
 			continue;
 		}
-		std::lock_guard<std::mutex> g(s->lock);
+		ViewLock g(s->lock);
 		s->setSynced(IOSurfaceGetSeed(s->surface));
 	}
 }
@@ -1861,6 +1941,11 @@ void rgfxIOSurfaceNoteFinished(const std::vector<std::shared_ptr<void>> &writes,
 	}
 }
 
+uint64_t rgfxIOSurfaceLocksUnderView(void)
+{
+	return gLocksUnderView.load(std::memory_order_relaxed);
+}
+
 uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef surface, const char *cause, std::string *line)
 {
 	NilLog &l = nilLog();
@@ -1893,7 +1978,7 @@ void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes)
 			continue;
 		}
 		done.push_back(s);
-		std::lock_guard<std::mutex> g(s->lock);
-		s->writeBack(false);
+		ViewLock g(s->lock);
+		s->writeBack();
 	}
 }

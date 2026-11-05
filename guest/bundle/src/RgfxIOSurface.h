@@ -389,4 +389,10 @@ bool rgfxIOSurfaceWritesInPlace(const std::vector<std::shared_ptr<void>> &writes
 uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef _Nullable surface, const char *_Nonnull cause,
                              std::string *_Nonnull line);
 
+/// How many CPU locks of a surface the process took while the same thread held a view's own
+/// lock, which a view takes only after its surface's lock (for the tests): none. A buffer's
+/// write-back at its completion takes the view's lock before the buffer's writes retire, and a
+/// CPU lock of the surface waits for them in the kext, so such a lock waited out the kext's wait.
+uint64_t rgfxIOSurfaceLocksUnderView(void);
+
 #endif // RGFX_IOSURFACE_H_
