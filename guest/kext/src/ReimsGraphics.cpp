@@ -680,6 +680,16 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// (RgfxVblank); the refresh's time is the stamp in the guest's clock.
 		UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
 		UInt64 now = mach_absolute_time();
+		if (hostTime) {
+			// The host's clock, read between two of ours (RgfxVblankClock::reading): only LO's
+			// read is timed.
+			UInt32 hi = readRegister(RGFX_REG_HOST_TIME_HI);
+			UInt64 before = mach_absolute_time();
+			UInt32 lo = readRegister(RGFX_REG_HOST_TIME_LO);
+			UInt64 after = mach_absolute_time();
+			UInt32 hiAgain = readRegister(RGFX_REG_HOST_TIME_HI);
+			vblankClock.reading(before, RgfxVblankClock::hostTime(hi, lo, hiAgain), after);
+		}
 		UInt64 time = size >= 24 ? vblankClock.vblank(count,
 		                                              *reinterpret_cast<const volatile UInt64 *>(payload + 16),
 		                                              now)
@@ -1017,6 +1027,7 @@ bool ReimsGraphics::start(IOService *provider)
 	taken = false;
 	submitRoom = false;
 	displayColorTaken = false;
+	hostTime = false;
 	roomStats = {};
 	roomRecords = 0;
 
@@ -1122,6 +1133,7 @@ bool ReimsGraphics::start(IOService *provider)
 		setProperty("RgfxFeaturesTaken", took, 64);
 		submitRoom = (took & RGFX_FEATURE_SUBMIT_ROOM) != 0;
 		displayColorTaken = (took & RGFX_FEATURE_DISPLAY_COLOR) != 0;
+		hostTime = (took & RGFX_FEATURE_HOST_TIME) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);

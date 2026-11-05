@@ -407,6 +407,9 @@ private:
 	bool submitRoom;
 	// The host took DISPLAY_COLOR (displayColor), set before `ready`.
 	bool displayColorTaken;
+	// The host took HOST_TIME: each VBLANK reads the host's clock for the refreshes' times
+	// (vblankClock), set before `ready`.
+	bool hostTime;
 	// The sleeps for room (waitForRoom), under stateLock, and the SUBMIT_ROOM records the work
 	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
 	RgfxRingRoomStats roomStats;

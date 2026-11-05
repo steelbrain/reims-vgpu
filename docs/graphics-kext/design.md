@@ -791,9 +791,9 @@ only where no negotiation can carry it.
   host offers it where it offers `SURFACE_CACHE`, with its budget in
   `DEFERRED_BUDGET_LO` and `_HI`.
 - Bit 20 is `HOST_TIME`: `HOST_TIME_LO` and `_HI` read the host's monotonic
-  clock, the one `VBLANK`s are stamped on, so a guest can measure the two
-  clocks' offset rather than infer it from the `VBLANK`s' delivery. Every host
-  offers it.
+  clock, the one `VBLANK`s are stamped on, so the kext measures the two
+  clocks' offset rather than infer it from the `VBLANK`s' delivery ("Refresh
+  times", below). Every host offers it, and the kext takes it.
 - Bit 21 is `MANAGED_TEXTURE_SLABS`: a `MANAGED_TEXTURE_CREATE` may name any
   Shared buffer over the sender's memory as its CPU copy, and the host reads
   and writes the copy where the buffer's contents lie, so the bundle takes a
@@ -1293,10 +1293,18 @@ the guest moves the scanout or changes its size, so no copy is made on the way
 to the window, and no other page of the region is pinned for it. While vblank is
 enabled, the host sends `VBLANK` at each refresh of the window's screen.
 
-**Refresh times.** The host answers a `PRESENT_SURFACE` in the refresh that
-shows its surface, right after that refresh's `VBLANK`. The kext maps each
-`VBLANK`'s host time into the guest's `mach_absolute_time` by the clocks'
-offset with the shortest delivery (`guest/kext/src/RgfxVblankClock.hpp`). A
+**Refresh times.** The host stamps each `VBLANK` with its refresh's time on
+the display's grid, a period after the one before, on its monotonic clock. It
+answers a `PRESENT_SURFACE` in the refresh that shows its surface, right after
+that refresh's `VBLANK`. The kext maps each `VBLANK`'s host time into the
+guest's `mach_absolute_time` by the clocks' offset
+(`guest/kext/src/RgfxVblankClock.hpp`). Where it took `HOST_TIME`, it reads
+the host's clock at each `VBLANK`, `HOST_TIME_LO` between two reads of its
+own, and maps by the reading whose round trip bounds the offset closest, that
+bound widening by 50 ppm of the reading's age. Without the feature it maps by
+the offset with the shortest delivery, which moves with the delivery: under
+Safari's 1080p60 playback the display link's times sat 38 to 76 us rms off a
+straight line (measured), against 0 idle. A
 display pipe transaction completes with the time of the refresh it was
 answered in (or the answer's own time where no `VBLANK` came within a period),
 and a display pipe VBL request is answered once, at the next refresh, with that

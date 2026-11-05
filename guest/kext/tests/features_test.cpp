@@ -61,13 +61,14 @@ constexpr uint64_t kRoom = RGFX_FEATURE_SUBMIT_ROOM;
 constexpr uint64_t kSlots = RGFX_FEATURE_ICB_SLOTS;
 constexpr uint64_t kCommits = RGFX_FEATURE_COMMIT_ORDER;
 constexpr uint64_t kDeferred = RGFX_FEATURE_SURFACE_DEFERRED;
+constexpr uint64_t kTime = RGFX_FEATURE_HOST_TIME;
 constexpr uint64_t kTextureSlabs = RGFX_FEATURE_MANAGED_TEXTURE_SLABS;
 constexpr uint64_t kBufferSlabs = RGFX_FEATURE_MANAGED_BUFFER_SLABS;
 constexpr uint64_t kSmallIds = RGFX_FEATURE_SMALL_ID_CHUNKS;
 constexpr uint64_t kColor = RGFX_FEATURE_DISPLAY_COLOR;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
-                              kSlots | kCommits | kDeferred | kTextureSlabs | kBufferSlabs |
-                              kSmallIds | kColor;
+                              kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
+                              kBufferSlabs | kSmallIds | kColor;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -76,11 +77,11 @@ int main()
 {
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
-	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS,
-	// SMALL_ID_CHUNKS and DISPLAY_COLOR, and writes each only where offered.
+	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
+	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS and DISPLAY_COLOR, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
-	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, "
+	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS and DISPLAY_COLOR from "
 	      "bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
@@ -104,6 +105,9 @@ int main()
 	      "SURFACE_DEFERRED offered, written");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDeferred, 0) == kRgfxOfferedFeatures,
 	      "SURFACE_DEFERRED offered but not taken is not in the word");
+	check(RGFX_FEATURE_HOST_TIME == (1u << 20), "HOST_TIME is bit 20");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kTime) == kTime,
+	      "HOST_TIME offered, written");
 	check(RGFX_FEATURE_MANAGED_TEXTURE_SLABS == (1u << 21), "MANAGED_TEXTURE_SLABS is bit 21");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kTextureSlabs) == kTextureSlabs,
 	      "MANAGED_TEXTURE_SLABS offered, written");

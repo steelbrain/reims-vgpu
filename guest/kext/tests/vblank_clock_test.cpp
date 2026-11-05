@@ -1,7 +1,8 @@
 // The display's refreshes in the guest's clock (RgfxVblankClock.hpp), built natively: a refresh's
-// time is its host stamp plus the clocks' offset with the shortest delivery, never after its
-// receipt and never going back; the offset follows a drift; the period comes from the stamps;
-// and an answer taken within a period after a VBLANK is that refresh's.
+// time is its host stamp plus the clocks' offset, the held reading of the host's clock's where
+// one came (HOST_TIME), else the one with the shortest delivery, never after its receipt and never
+// going back; either offset follows a drift; the period comes from the stamps; and an answer taken
+// within a period after a VBLANK is that refresh's.
 #include <cstdio>
 
 #include "RgfxVblankClock.hpp"
@@ -93,6 +94,86 @@ static void shown()
 	CHECK(c.shownAt(receipt - 1) == receipt - 1);
 }
 
+static void hostTimeWords()
+{
+	// HI, LO, HI again: no wrap between them, a wrap before LO was read, a wrap after it.
+	CHECK(RgfxVblankClock::hostTime(1, 5, 1) == ((1ull << 32) | 5));
+	CHECK(RgfxVblankClock::hostTime(1, 5, 2) == ((2ull << 32) | 5));
+	CHECK(RgfxVblankClock::hostTime(1, 0xfffffff0u, 2) == ((1ull << 32) | 0xfffffff0u));
+}
+
+// A reading of the host's clock at host time `host`, `bound` either side of it in the guest's
+// clock, whose offset is `offset`.
+static void readAt(RgfxVblankClock &c, uint64_t host, uint64_t offset, uint64_t bound)
+{
+	c.reading(host + offset - bound, host, host + offset + bound);
+}
+
+static void readingsMapPastDelivery()
+{
+	// Deliveries of 170 us, but 20 us at every tenth refresh, as a vCPU awake for one takes it.
+	// With a reading at each VBLANK, every refresh maps by the clocks' own offset; without, the
+	// times move with the deliveries.
+	RgfxVblankClock clock, inferred;
+	uint64_t host = 1000000;
+	bool wandered = false;
+	for (uint64_t n = 1; n <= 300; n++, host += kPeriod) {
+		uint64_t receipt = host + kOffset + (n % 10 ? 170000 : 20000);
+		readAt(clock, host, kOffset, 2000);
+		CHECK(clock.vblank(n, host, receipt) == host + kOffset);
+		uint64_t t = inferred.vblank(n, host, receipt);
+		CHECK(t <= receipt);
+		if (n > 10 && t != host + kOffset + 20000)
+			wandered = true;
+	}
+	CHECK(wandered);
+}
+
+static void shortestRoundTripHolds()
+{
+	RgfxVblankClock c;
+	uint64_t host = 1000000;
+	readAt(c, host, kOffset, 1000); // 1 us either side
+	CHECK(c.vblank(1, host, host + kOffset + 90000) == host + kOffset);
+	// 1 ms later, 5 us either side and 4 us off: the held one's bound has widened by 50 ns only.
+	host += 1000000;
+	readAt(c, host, kOffset + 4000, 5000);
+	CHECK(c.vblank(2, host, host + kOffset + 90000) == host + kOffset);
+	// 101 ms after the first: its bound has widened past 5 us, so the newer reading holds.
+	host += 100000000;
+	readAt(c, host, kOffset + 3000, 5000);
+	CHECK(c.vblank(3, host, host + kOffset + 90000) == host + kOffset + 3000);
+}
+
+static void readingsFollowADrift()
+{
+	// The guest's clock gains 5 ppm on the host's (42 ns a refresh), its readings 2 or 2.5 us
+	// either side: every refresh maps within a refresh's drift of the true offset.
+	RgfxVblankClock c;
+	uint64_t host = 1000000, gained = 0;
+	for (uint64_t n = 1; n <= 1200; n++, host += kPeriod) {
+		gained = host * 5 / 1000000;
+		readAt(c, host, kOffset + gained, n % 2 ? 2000 : 2500);
+		uint64_t t = c.vblank(n, host, host + kOffset + gained + 150000);
+		CHECK(t <= host + kOffset + gained && t + 1000 >= host + kOffset + gained);
+	}
+}
+
+static void readingsNeverAfterReceipt()
+{
+	// A reading that would put the refresh after its receipt: the receipt's time.
+	RgfxVblankClock c;
+	uint64_t host = 1000000, receipt = host + kOffset + 30000;
+	readAt(c, host, kOffset + 500000, 1000);
+	CHECK(c.vblank(1, host, receipt) == receipt);
+	// A reading of 0 (the device reset) is not taken: a fresh clock maps by its delivery.
+	RgfxVblankClock fresh;
+	fresh.reading(5000, 0, 6000);
+	CHECK(fresh.vblank(1, host, receipt) == receipt);
+	CHECK(fresh.vblank(2, host + kPeriod, receipt + kPeriod - 10000) ==
+	      receipt + kPeriod - 10000);
+}
+
 int main()
 {
 	first();
@@ -100,6 +181,11 @@ int main()
 	drift();
 	neverBack();
 	shown();
+	hostTimeWords();
+	readingsMapPastDelivery();
+	shortestRoundTripHolds();
+	readingsFollowADrift();
+	readingsNeverAfterReceipt();
 	if (g_failed) {
 		std::fprintf(stderr, "vblank_clock_test: %d of %d checks failed\n", g_failed, g_checks);
 		return 1;
