@@ -1,7 +1,8 @@
 // The native test of RgfxSurfaceLocks.hpp: a lock of a surface waits for its pending writes, from
 // any task and in either mode, and for nothing a buffer only reads; a queue's writes retire in its
 // order, by the bundle's retire call, or for a surface drawn in place by the device's completion;
-// they go with their queue or the surface's key; and a surface's pending queues are found.
+// they go with their queue or the block they were named through, a surface's other blocks'
+// staying pending; and a surface's pending queues are found.
 #include "RgfxSurfaceLocks.hpp"
 
 #include <cstdio>
@@ -21,6 +22,8 @@ void check(bool ok, const char *what)
 }
 
 constexpr uint64_t kSurface = 0x1000, kOther = 0x2000;
+// Region offsets of a surface's blocks: one cached in place, and a copy of it.
+constexpr uint64_t kBlock = 0x40000, kCopyBlock = 0x80000;
 constexpr uint64_t kQueue = 7, kQueue2 = 9;
 constexpr bool kInPlace = true, kCopy = false;
 constexpr uint32_t kId = 42;
@@ -35,12 +38,12 @@ int main()
 	check(!rgfxLockWaits(t, kSurface), "nothing pending, nothing waits");
 
 	// WindowServer's buffer 1 writes a surface it draws in place.
-	check(rgfxLockNote(t, kSurface, kQueue, 1, kId, kInPlace), "a write is noted");
+	check(rgfxLockNote(t, kSurface, kQueue, 1, kId, kInPlace, kBlock), "a write is noted");
 	check(rgfxLockWaits(t, kSurface), "a lock waits for it");
 	check(!rgfxLockWaits(t, kOther), "another surface's lock does not wait");
 
 	// Buffer 2 of the same queue writes it again.
-	check(rgfxLockNote(t, kSurface, kQueue, 2, kId, kInPlace), "a second write is noted");
+	check(rgfxLockNote(t, kSurface, kQueue, 2, kId, kInPlace, kBlock), "a second write is noted");
 	check(t.useCount == 1, "one use per surface and queue");
 
 	// The device completes buffer 1: buffer 2's write holds the lock still.
@@ -55,7 +58,7 @@ int main()
 	check(!rgfxLockRetire(t, kQueue, 2), "the bundle's later retire finds nothing");
 
 	// A surface the bundle copies: the device's completion is not enough, the write-back is.
-	check(rgfxLockNote(t, kOther, kQueue, 3, kId, kCopy), "a copied surface's write is noted");
+	check(rgfxLockNote(t, kOther, kQueue, 3, kId, kCopy, kBlock), "a copied surface's write is noted");
 	check(!rgfxLockCompleted(t, kQueue, 3), "the device's completion leaves a copy's write");
 	check(rgfxLockWaits(t, kOther), "a lock of the copy waits for its write-back");
 	check(rgfxLockRetire(t, kQueue, 3), "the bundle's retire retires it");
@@ -63,17 +66,17 @@ int main()
 
 	// A completion the commit's note comes after: the write is not kept.
 	check(rgfxLockCompleted(t, kQueue, 5) == false, "a completion ahead of its note");
-	check(rgfxLockNote(t, kSurface, kQueue, 4, kId, kInPlace) && t.useCount == 0,
+	check(rgfxLockNote(t, kSurface, kQueue, 4, kId, kInPlace, kBlock) && t.useCount == 0,
 	      "a buffer the device already completed leaves no write in place");
-	check(rgfxLockNote(t, kOther, kQueue, 4, kId, kCopy) && t.useCount == 1,
+	check(rgfxLockNote(t, kOther, kQueue, 4, kId, kCopy, kBlock) && t.useCount == 1,
 	      "but a copy's write is kept until its retire");
 	check(rgfxLockRetire(t, kQueue, 4) && t.useCount == 0, "which retires it");
-	check(rgfxLockNote(t, kOther, kQueue, 4, kId, kCopy) && t.useCount == 0,
+	check(rgfxLockNote(t, kOther, kQueue, 4, kId, kCopy, kBlock) && t.useCount == 0,
 	      "a write the bundle already retired leaves nothing");
 
 	// Two queues: each retires in its own order.
-	check(rgfxLockNote(t, kSurface, kQueue, 6, kId, kInPlace), "WindowServer writes");
-	check(rgfxLockNote(t, kSurface, kQueue2, 1, kId, kInPlace), "an app writes too");
+	check(rgfxLockNote(t, kSurface, kQueue, 6, kId, kInPlace, kBlock), "WindowServer writes");
+	check(rgfxLockNote(t, kSurface, kQueue2, 1, kId, kInPlace, kBlock), "an app writes too");
 	check(t.useCount == 2, "one use per queue");
 	{
 		uint64_t qs[2] = {};
@@ -83,12 +86,12 @@ int main()
 		      "the surface's pending queues, once each");
 		check(rgfxLockPendingQueues(t, kSurface, true, qs, 1, &id) == 1,
 		      "no more queues than the room given");
-		check(rgfxLockNote(t, kOther, kQueue, 6, kId, kCopy), "a copy's write on the same queue");
+		check(rgfxLockNote(t, kOther, kQueue, 6, kId, kCopy, kBlock), "a copy's write on the same queue");
 		check(rgfxLockPendingQueues(t, kOther, true, qs, 2, &id) == 0 && id == kId,
 		      "a copy's queue is not one the device's completion retires");
 		check(rgfxLockPendingQueues(t, kOther, false, qs, 2, &id) == 1 && qs[0] == kQueue,
 		      "but it is pending");
-		check(rgfxLockForgetKey(t, kOther), "and goes with its key");
+		check(rgfxLockForgetBlock(t, kOther, kBlock), "and goes with its block");
 	}
 	check(rgfxLockRetire(t, kQueue, 6), "WindowServer's write retires");
 	check(rgfxLockWaits(t, kSurface), "the app's write holds the lock still");
@@ -100,23 +103,52 @@ int main()
 	check(!rgfxLockRetire(t, kQueue2, 1) && !rgfxLockCompleted(t, kQueue2, 1),
 	      "a gone queue's marks are not made again by a late retire");
 
-	// A surface whose key goes takes its uses with it.
-	check(rgfxLockNote(t, kOther, kQueue, 7, kId, kCopy), "a write of the other surface");
-	check(rgfxLockForgetKey(t, kOther), "the key's use goes");
-	check(!rgfxLockWaits(t, kOther), "nothing waits for a gone key");
+	// A surface's only block goes, and takes its uses with it.
+	check(rgfxLockNote(t, kOther, kQueue, 7, kId, kCopy, kBlock), "a write of the other surface");
+	check(rgfxLockForgetBlock(t, kOther, kBlock), "the block's use goes");
+	check(!rgfxLockWaits(t, kOther), "nothing waits for a gone block's writes");
 
 	// A full table keeps what it can and says so.
-	check(rgfxLockNote(t, 0x10, kQueue, 8, kId, kCopy) && rgfxLockNote(t, 0x20, kQueue, 8, kId, kCopy) &&
-	          rgfxLockNote(t, 0x30, kQueue, 8, kId, kCopy) && rgfxLockNote(t, 0x40, kQueue, 8, kId, kCopy),
+	check(rgfxLockNote(t, 0x10, kQueue, 8, kId, kCopy, kBlock) &&
+	          rgfxLockNote(t, 0x20, kQueue, 8, kId, kCopy, kBlock) &&
+	          rgfxLockNote(t, 0x30, kQueue, 8, kId, kCopy, kBlock) &&
+	          rgfxLockNote(t, 0x40, kQueue, 8, kId, kCopy, kBlock),
 	      "four uses fill the table");
-	check(!rgfxLockNote(t, 0x50, kQueue, 8, kId, kCopy), "a fifth has no room");
-	check(rgfxLockNote(t, 0x40, kQueue, 9, kId, kCopy), "a kept use still takes later buffers");
+	check(!rgfxLockNote(t, 0x50, kQueue, 8, kId, kCopy, kBlock), "a fifth has no room");
+	check(rgfxLockNote(t, 0x40, kQueue, 9, kId, kCopy, kBlock),
+	      "a kept use still takes later buffers");
 	check(rgfxLockQueue(t, 0x99, true) != nullptr && rgfxLockQueue(t, 0x98, true) == nullptr,
 	      "the queues fill too");
-	check(!rgfxLockNote(t, 0x10, 0x98, 1, kId, kCopy), "a write of a queue with no marks is not kept");
+	check(!rgfxLockNote(t, 0x10, 0x98, 1, kId, kCopy, kBlock),
+	      "a write of a queue with no marks is not kept");
 	check(rgfxLockRetire(t, kQueue, 8) && t.useCount == 1, "buffer 8's retire leaves buffer 9's");
 	check(rgfxLockWaits(t, 0x40) && !rgfxLockWaits(t, 0x10), "only the later write holds a lock");
 	check(rgfxLockRetire(t, kQueue, 9) && t.useCount == 0, "the queue's retire empties the table");
+
+	// One surface's blocks share its key: WindowServer's cached block in place, and an app's copy.
+	// Each block's let-go takes the writes named through it alone.
+	check(rgfxLockNote(t, kSurface, kQueue, 10, kId, kInPlace, kBlock),
+	      "a write through the cached block in place");
+	check(rgfxLockNote(t, kSurface, kQueue, 10, kId, kCopy, kCopyBlock),
+	      "and one through the copy, in the same buffer");
+	check(t.useCount == 2, "a use per block of the surface");
+	check(rgfxLockForgetBlock(t, kSurface, kCopyBlock), "the copy's let-go takes its write");
+	check(!rgfxLockForgetBlock(t, kSurface, kCopyBlock), "and nothing more");
+	check(rgfxLockWaits(t, kSurface), "a lock still waits for the write through the cached block");
+	{
+		uint64_t qs[1] = {};
+		uint32_t id = 0;
+		check(rgfxLockPendingQueues(t, kSurface, true, qs, 1, &id) == 1 && qs[0] == kQueue,
+		      "which the device's completion retires");
+	}
+	check(rgfxLockCompleted(t, kQueue, 10) && !rgfxLockWaits(t, kSurface), "and does");
+	check(rgfxLockNote(t, kSurface, kQueue, 11, kId, kInPlace, kBlock) &&
+	          rgfxLockNote(t, kSurface, kQueue, 11, kId, kCopy, kCopyBlock),
+	      "both blocks written again");
+	check(rgfxLockForgetBlock(t, kSurface, kBlock), "the cached block's let-go takes its write");
+	check(rgfxLockWaits(t, kSurface), "the copy's write holds the lock still");
+	check(!rgfxLockCompleted(t, kQueue, 11), "the device's completion leaves the copy's write");
+	check(rgfxLockRetire(t, kQueue, 11) && t.useCount == 0, "its write-back's retire retires it");
 
 	// Op 6 answers in the byte its second argument names, and no other op writes there.
 	uint8_t bytes[3] = {0x11, 0, 0x22};

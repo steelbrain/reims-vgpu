@@ -680,7 +680,9 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 	if (cache && __atomic_load_n(&state.lock, __ATOMIC_ACQUIRE)) {
 		IOLockLock(state.lock);
 		const uint64_t key = reinterpret_cast<uintptr_t>(cache);
-		bool wake = rgfxLockForgetKey(state.table, key);
+		// The writes named through this block go; those of the surface's other blocks, by the
+		// same device cache, stay pending, their locks waiting for them.
+		bool wake = rgfxLockForgetBlock(state.table, key, offset);
 		// A cached surface's locks wait for its block's release, the cache and the surface held
 		// until the answer (rgfxSurfaceCacheReleased), or it is cached no more. A lock naming a
 		// deferred block's pages uses its memory: that attach lets the surface go once answered,
@@ -966,7 +968,7 @@ void RgfxAccelerator::noteSurfaceWrites(RgfxAcceleratorUserClient *client, task_
 		// Noted before the cache is current, so a lock that finds it current finds the write.
 		IOLockLock(state.lock);
 		bool kept = rgfxLockNote(state.table, reinterpret_cast<uintptr_t>(cache), queue, seqno,
-		                         static_cast<uint32_t>(id), inPlace);
+		                         static_cast<uint32_t>(id), inPlace, offset);
 		// A cached surface's pages take the write at the next lock.
 		rgfxCacheNoteWrite(state.caches, reinterpret_cast<uintptr_t>(cache));
 		bool first = !kept && state.dropped++ == 0;

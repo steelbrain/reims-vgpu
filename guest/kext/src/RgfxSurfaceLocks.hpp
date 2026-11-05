@@ -18,7 +18,10 @@
 // reads from the queue's completion ring, retires its writes as well.
 //
 // A surface is named by its key, the device cache the kext made on it, which IOSurface's lock
-// calls the kext's control function with. The caller holds one lock around every call.
+// calls the kext's control function with, and a write by the key and the block it was named
+// through: one surface's blocks share its key (a copy, and one in place; a cached block in place
+// and a block of the surface uncached), and each block's let-go takes only its own writes with it,
+// the others' pending still. The caller holds one lock around every call.
 // Header-only and free of the kernel's headers, so its native test (tests/surface_locks_test.cpp)
 // builds it as the kext does.
 //
@@ -31,6 +34,8 @@
 // One queue's pending writes of one surface.
 struct RgfxLockUse {
 	uint64_t key;
+	// The block the writes were named through: its region offset.
+	uint64_t block;
 	uint64_t queue;
 	// The queue's last seqno that writes the surface.
 	uint64_t lastWrite;
@@ -93,19 +98,20 @@ inline bool rgfxLockSweep(RgfxLockTable &t, const RgfxLockQueue &q)
 }
 
 // Notes that queue `queue`'s command buffer at `seqno` writes the surface `key` (IOSurfaceID
-// `surfaceId`), drawn in place where `inPlace`. A buffer already done (its completion came first)
-// leaves nothing. False where the table has no room, and the write is not kept.
+// `surfaceId`) through the block at `block`, drawn in place where `inPlace`. A buffer already done
+// (its completion came first) leaves nothing. False where the table has no room, and the write is
+// not kept.
 inline bool rgfxLockNote(RgfxLockTable &t, uint64_t key, uint64_t queue, uint64_t seqno,
-                         uint32_t surfaceId, bool inPlace)
+                         uint32_t surfaceId, bool inPlace, uint64_t block)
 {
 	RgfxLockQueue *q = rgfxLockQueue(t, queue, true);
 	if (q == nullptr)
 		return false;
-	if (rgfxLockDone(RgfxLockUse{key, queue, seqno, surfaceId, inPlace}, *q))
+	if (rgfxLockDone(RgfxLockUse{key, block, queue, seqno, surfaceId, inPlace}, *q))
 		return true;
 	for (uint32_t i = 0; i < t.useCount; i++) {
 		RgfxLockUse &u = t.uses[i];
-		if (u.key == key && u.queue == queue) {
+		if (u.key == key && u.block == block && u.queue == queue) {
 			if (seqno > u.lastWrite)
 				u.lastWrite = seqno;
 			u.inPlace = inPlace;
@@ -114,7 +120,7 @@ inline bool rgfxLockNote(RgfxLockTable &t, uint64_t key, uint64_t queue, uint64_
 	}
 	if (t.useCount == t.useCapacity)
 		return false;
-	t.uses[t.useCount++] = {key, queue, seqno, surfaceId, inPlace};
+	t.uses[t.useCount++] = {key, block, queue, seqno, surfaceId, inPlace};
 	return true;
 }
 
@@ -162,13 +168,15 @@ inline bool rgfxLockForgetQueue(RgfxLockTable &t, uint64_t queue)
 	return any;
 }
 
-// The surface's key goes (its device cache is no longer the kext's to name): its uses go. True
-// where any went.
-inline bool rgfxLockForgetKey(RgfxLockTable &t, uint64_t key)
+// The block at `block` of surface `key` goes (its device cache's reference is no longer the
+// block's): the writes named through it go, and the writes named through the surface's other
+// blocks, which hold the same key, stay pending, their locks waiting for them. True where any
+// went.
+inline bool rgfxLockForgetBlock(RgfxLockTable &t, uint64_t key, uint64_t block)
 {
 	bool any = false;
 	for (uint32_t i = 0; i < t.useCount;) {
-		if (t.uses[i].key == key) {
+		if (t.uses[i].key == key && t.uses[i].block == block) {
 			t.uses[i] = t.uses[--t.useCount];
 			any = true;
 		} else {
