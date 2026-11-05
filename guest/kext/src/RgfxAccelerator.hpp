@@ -150,6 +150,13 @@ uint32_t rgfxSurfaceCacheLetGoOf(UInt64 offset, bool *written, bool *purgeable);
 // How many surfaces' blocks went uncached as the table of cached surfaces had no room
 // (kRgfxCachedMaxSurfaces). Takes the locks' lock alone.
 UInt64 rgfxSurfaceCacheNoRoom();
+// How many releases posted unheld (RGFX_BLOCK_RELEASE_UNHELD) and answered OK had their surface
+// taken again by a process before the answer (rgfxCacheRetaken). Takes the locks' lock alone.
+UInt64 rgfxSurfaceCacheRetaken();
+// The flags of the BLOCK_RELEASE of the cached block at `offset`, its surface `surface`
+// (rgfxSurfaceCacheReleasingSurface's), whose counts are read out of every lock and decided on
+// under the locks' lock (rgfxCacheReleaseFlags). Takes the locks' lock alone.
+uint32_t rgfxSurfaceCacheReleaseFlags(UInt64 offset, OSObject *surface);
 // The surface of the cached block at `offset` whose BLOCK_RELEASE is posted (rgfxSurfaceLocksForget
 // with `releasing`), retained for the caller, who releases it; `*written` where a buffer wrote
 // its cache since its last copy. Null where no cached surface is releasing the block.

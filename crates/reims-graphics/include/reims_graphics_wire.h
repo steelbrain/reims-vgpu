@@ -1521,7 +1521,8 @@
 // it shows: until the display pipe's next present. Posted after every message the process posted
 // before its free, and nothing the process posts after it can name the block. A block over an
 // IOSurface's pages with a device cache has the cache copied into the pages first, where a command
-// buffer wrote it since the last copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says.
+// buffer wrote it since the last copy, whatever [`RGFX_BLOCK_RELEASE_NO_CLIENT`] says, but where
+// [`RGFX_BLOCK_RELEASE_UNHELD`] says no process can read them.
 #define RGFX_CMD_BLOCK_RELEASE 754
 
 // `BLOCK_GRANT` ([`RgfxBlockGrant`]), on ring 0 from the accelerator kext: it gave context
@@ -1743,6 +1744,15 @@
 // port or an XPC object that holds it (how one process hands a surface it drew to another), and
 // the process that looks it up reads the pages.
 #define RGFX_BLOCK_RELEASE_NO_CLIENT (1 << 0)
+
+// [`RgfxBlockRelease::flags`]: besides having no client, the block's IOSurface was held by
+// nothing but the kext as the release was posted (no mach port or XPC object): no process holds
+// it to read its pages. The host drops a device cache a command buffer wrote without
+// copying it into the pages, where the block's header still counts no client of the surface as
+// the host makes its copy: the kext sets the count past 0 where a process takes the surface
+// again before the answer, and the host then copies. The kext holds the pages wired until the
+// answer all the same. A host that does not know the bit copies, as for any release.
+#define RGFX_BLOCK_RELEASE_UNHELD (1 << 1)
 
 // Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesCache`] starts: right after its
 // [`RgfxSurfacePages`]. A message whose `size` is at least

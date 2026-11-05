@@ -21,7 +21,9 @@
 // backing off from 10 ms to 320 ms, a dozen times within a lock's 2 s wait. Another block of a
 // cached surface, a copy or one uncached, leaves the cached block's entry as it goes. A new block
 // in place of a surface whose pages are still to take a released block's write-back waits for it
-// until the release is late, and so does a CPU lock of the surface.
+// until the release is late, and so does a CPU lock of the surface. A release is flagged unheld
+// only where nothing but the kext holds the surface, and a lock or a new block of it met before
+// the answer marks the header's clients for the host.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -126,9 +128,12 @@ void dormancy()
 	rgfxCacheFind(t, kOther)->writes++;
 	check(rgfxCacheReleasingSurface(t, kOtherBlock, &written) == &surfaceObject && written,
 	      "a buffer wrote its cache since: written");
-	check(rgfxCacheReleaseFlags(0) == RGFX_BLOCK_RELEASE_NO_CLIENT &&
-	          rgfxCacheReleaseFlags(1) == 0 && rgfxCacheReleaseFlags(2) == 0 &&
-	          rgfxCacheReleaseFlags(-1) == 0,
+	const int32_t ported = kRgfxSurfaceKextRefs + 1; // a mach port's reference past the kext's
+	check(rgfxCacheReleaseFlags(t, kOtherBlock, 0, ported) == RGFX_BLOCK_RELEASE_NO_CLIENT &&
+	          rgfxCacheReleaseFlags(t, kOtherBlock, 1, ported) == 0 &&
+	          rgfxCacheReleaseFlags(t, kOtherBlock, 2, ported) == 0 &&
+	          rgfxCacheReleaseFlags(t, kOtherBlock, -1, ported) == 0 &&
+	          !rgfxCacheFind(t, kOther)->unheld,
 	      "its release says no client only where the surface has none");
 	check(rgfxCacheReleased(t, kOtherBlock, &map, &wire, &held) == kOther && t.count == 1 &&
 	          rgfxCacheFind(t, kOther) == nullptr && held == &surfaceObject,
@@ -747,9 +752,96 @@ void askNaming()
 }
 } // namespace
 
+// A cached block's release is flagged unheld (RGFX_BLOCK_RELEASE_UNHELD) only where the surface
+// has no client and no reference past the kext's three, decided under the lock as a deferred
+// block's naming is; a lock or a new block of the surface met while the release is unanswered,
+// a process holding the surface again, marks the header's count of clients past 0 for the host,
+// once, and a release posted again is posted held.
+void unheldReleases()
+{
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	uint64_t offset = 0, mark = 0;
+	int surfaceObject = 0, otherObject = 0;
+	void *map = nullptr, *wire = nullptr;
+	volatile uint32_t clients = 0, otherClients = 0;
+	const int32_t kext = kRgfxSurfaceKextRefs, ported = kRgfxSurfaceKextRefs + 1;
+	const uint32_t both = RGFX_BLOCK_RELEASE_NO_CLIENT | RGFX_BLOCK_RELEASE_UNHELD;
+
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->object = &surfaceObject;
+	c->clientsAt = &clients;
+	check(rgfxCacheReleaseFlags(t, kBlock, 0, kext) == RGFX_BLOCK_RELEASE_NO_CLIENT && !c->unheld,
+	      "a block not released: no client, never unheld");
+	check(rgfxCacheNoteWrite(t, kSurface) &&
+	          !rgfxCacheBlockLetGo(t, kSurface, kBlock, true, &surfaceObject, &map, &wire, true),
+	      "the GPU wrote it, and its block goes");
+	check(rgfxCacheReleaseFlags(t, kBlock, 1, kext) == 0 && !c->unheld, "a client left: held");
+	check(rgfxCacheReleaseFlags(t, kBlock, 0, ported) == RGFX_BLOCK_RELEASE_NO_CLIENT &&
+	          !c->unheld,
+	      "no client but a port: held, no client");
+	check(rgfxCacheReleaseFlags(t, kBlock, 0, kext) == both && c->unheld,
+	      "held by the kext alone: unheld");
+	check(rgfxCacheReleaseFlags(t, kOtherBlock, 0, kext) == RGFX_BLOCK_RELEASE_NO_CLIENT,
+	      "a block no cached surface releases: no client only");
+
+	// Taken again before the answer: a lock marks the header, once, and waits for the answer.
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheWait && c->retaken &&
+	          clients == 1,
+	      "a lock of it, unanswered: the header counts a client, and it waits");
+	clients = 0;
+	check(rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheWait && clients == 0,
+	      "a second lock marks nothing more");
+	check(rgfxCacheReleaseFlags(t, kBlock, 0, kext) == RGFX_BLOCK_RELEASE_NO_CLIENT && !c->unheld,
+	      "taken again, the release posted again is held");
+
+	// A new block of a surface whose unheld release is unanswered marks its header too.
+	RgfxCachedSurface *o = rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId);
+	o->object = &otherObject;
+	o->clientsAt = &otherClients;
+	check(rgfxCacheNoteWrite(t, kOther) &&
+	          !rgfxCacheBlockLetGo(t, kOther, kOtherBlock, true, &otherObject, &map, &wire, true) &&
+	          rgfxCacheReleaseFlags(t, kOtherBlock, 0, kext) == both,
+	      "another surface's release, unheld");
+	check(rgfxCacheWritingBack(t, &otherObject) && o->retaken && otherClients == 1,
+	      "a new block of it waits for the write-back, the header counting a client");
+	otherClients = 3;
+	check(rgfxCacheWritingBack(t, &otherObject) && otherClients == 3,
+	      "a count the kext wrote stays");
+
+	// No process reads the pages before the answer, and none after it: the entry keeps them wired
+	// and the surface held until then, and only the answer hands them back, for the release
+	// thread to unwire and let go (the kernel zero-fills pages it gives out again).
+	int mapObject = 0, wireObject = 0;
+	c->map = &mapObject;
+	c->wire = &wireObject;
+	bool written = false;
+	check(rgfxCacheAtBlock(t, kBlock) == c && rgfxCacheWired(*c) &&
+	          rgfxCacheReleasingSurface(t, kBlock, &written) == &surfaceObject && written,
+	      "unanswered: the entry holds the surface and its pages, wired");
+	void *gotMap = nullptr, *gotWire = nullptr, *gotSurface = nullptr;
+	check(rgfxCacheReleased(t, kBlock, &gotMap, &gotWire, &gotSurface) == kSurface &&
+	          gotMap == &mapObject && gotWire == &wireObject && gotSurface == &surfaceObject &&
+	          rgfxCacheAtBlock(t, kBlock) == nullptr,
+	      "the answer hands the mapping, the wire and the surface back to let go");
+
+	// One posted held is taken again uncounted, and its header left as it was.
+	RgfxCachedSurface entries2[1] = {};
+	RgfxCacheTable h = {entries2, 0, 1};
+	RgfxCachedSurface *k = rgfxCacheAdd(h, kSurface, kBlock, kId);
+	volatile uint32_t heldClients = 0;
+	k->clientsAt = &heldClients;
+	check(!rgfxCacheBlockLetGo(h, kSurface, kBlock, true, &surfaceObject, &map, &wire, true) &&
+	          rgfxCacheReleaseFlags(h, kBlock, 0, ported) == RGFX_BLOCK_RELEASE_NO_CLIENT &&
+	          rgfxCacheNext(h, kSurface, &offset, &mark) == kRgfxCacheWait && k->retaken &&
+	          heldClients == 0,
+	      "a held release taken again: nothing for the host to read, nothing counted");
+}
+
 int main()
 {
 	askNaming();
+	unheldReleases();
 	RgfxCachedSurface entries[2] = {};
 	RgfxCacheTable t = {entries, 0, 2};
 	uint64_t offset = 0, mark = 0;

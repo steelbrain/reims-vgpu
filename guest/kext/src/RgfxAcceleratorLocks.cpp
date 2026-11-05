@@ -105,11 +105,14 @@ struct LockState {
 	// Under `lock`: surfaces left uncached as the table had no room, the first kNoRoomLogged
 	// logged.
 	uint64_t noRoom;
+	// Under `lock`: the releases posted unheld (RGFX_BLOCK_RELEASE_UNHELD) whose surface a
+	// process took again before their answer (rgfxCacheRetaken), counted at the answer.
+	uint64_t retaken;
 	// Under `lock`: the waiting locks' wakes so far (wakeLocked).
 	uint64_t wakes;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0};
 
 bool startLocks()
 {
@@ -883,6 +886,34 @@ UInt64 rgfxSurfaceCacheNoRoom()
 	return n;
 }
 
+UInt64 rgfxSurfaceCacheRetaken()
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return 0;
+	IOLockLock(state.lock);
+	const UInt64 n = state.retaken;
+	IOLockUnlock(state.lock);
+	return n;
+}
+
+uint32_t rgfxSurfaceCacheReleaseFlags(UInt64 offset, OSObject *surface)
+{
+	// Read out of every lock, as at a block's sleep and at a deferred block's release.
+	const int32_t clients = rgfxIOSurfaceClientCount(surface);
+	const int32_t retains = surface->getRetainCount();
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return clients == 0 ? RGFX_BLOCK_RELEASE_NO_CLIENT : 0;
+	IOLockLock(state.lock);
+	// The references read again under the lock a lock's or a new block's taking of the surface
+	// marks its entry under (rgfxCacheRetaken), the higher of the two reads deciding: a process
+	// that took the surface between the reads holds one more.
+	const int32_t again = surface->getRetainCount();
+	const uint32_t flags =
+	    rgfxCacheReleaseFlags(state.caches, offset, clients, again > retains ? again : retains);
+	IOLockUnlock(state.lock);
+	return flags;
+}
+
 void rgfxSurfaceCacheReleased(UInt64 offset, RgfxReleasedSurface *gone)
 {
 	*gone = {};
@@ -891,6 +922,8 @@ void rgfxSurfaceCacheReleased(UInt64 offset, RgfxReleasedSurface *gone)
 	IOLockLock(state.lock);
 	const RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
 	gone->wired = c == nullptr || rgfxCacheWired(*c);
+	if (c != nullptr && c->releasing && c->unheld && c->retaken)
+		state.retaken++;
 	// One cached surface at most has the block: its offset is reused only past this release.
 	gone->cache = reinterpret_cast<void *>(static_cast<uintptr_t>(
 	    rgfxCacheReleased(state.caches, offset, &gone->map, &gone->wire, &gone->surface)));

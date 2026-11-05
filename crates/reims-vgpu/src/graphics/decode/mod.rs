@@ -1064,14 +1064,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                     "IOSurface device caches: {} made; {} fills of {} MiB ({} as made), {} \
                      downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
                      downloads the host's devices' writes changed; {} written caches copied at a \
-                     release with no client left; {} copies out not made, the CPU's generation \
-                     past the cache's; {} \
+                     release with no client left; {} dropped uncopied, held by the kext alone \
+                     ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
+                     generation past the cache's; {} \
                      deferred, {} refused, {} named their pages ({} copied), {} released \
                      unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
                      refused",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
-                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.behind,
+                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.unheld,
+                    d.unheld_bytes >> 20, d.retaken, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
                     d.by_runs, d.runs_refused
@@ -1383,10 +1385,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         if !self.surface_caches.lock().has(block) {
             return;
         }
-        if let Err(raise) = self
-            .surface_caches
-            .released(device, block, false, Box::new(|| {}))
-        {
+        if let Err(raise) = self.surface_caches.released(device, block, Box::new(|| {})) {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the IOSurface block at {block:#x}: the platform raised at the copy of its device \
@@ -1429,18 +1428,20 @@ impl<P: Platform> GraphicsDecoder<P> {
         (self.surface_caches).try_download(device, block, region, done, failed)
     }
 
-    /// The block at `offset` was released: its surface view, if any, goes once the buffers over
-    /// it have, and its device cache once the pages hold what a command buffer wrote of it, where
-    /// its surface had a client left or not (`unread`,
-    /// [`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
-    /// is only counted), with no wait here for a buffer still walked; `done` then, or `failed`
+    /// The block at `offset` was released, its `RGFX_BLOCK_RELEASE_*` `flags`: its surface view,
+    /// if any, goes once the buffers over it have, and its device cache once the pages hold what
+    /// a command buffer wrote of it, whether its surface had a client left or not
+    /// ([`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
+    /// is only counted). Where nothing but the kext held the surface
+    /// ([`RGFX_BLOCK_RELEASE_UNHELD`](reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD)) the cache
+    /// goes uncopied. There is no wait here for a buffer still walked; `done` then, or `failed`
     /// where the platform raised at the copy ([`surface_cache`]). The block's holds of them are
     /// let go of on the surface worker, where either may be the last of an import or a mapping.
     pub(crate) fn block_released(
         &self,
         device: &P::Device,
         offset: u64,
-        unread: bool,
+        flags: u32,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
@@ -1452,7 +1453,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).release(device, offset, unread, region, done, failed, let_go);
+        (self.surface_caches).release(device, offset, flags, region, done, failed, let_go);
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`

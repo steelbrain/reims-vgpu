@@ -199,6 +199,11 @@ struct DormantStats {
 	// last copy, which the host copies into the pages all the same.
 	UInt64 unread;
 	UInt64 unreadWritten;
+	// Of them, those nothing but the kext held (RGFX_BLOCK_RELEASE_UNHELD), and of those the ones
+	// whose cache a buffer wrote since its last copy, which the host drops uncopied where no
+	// process took the surface again before its copy (rgfxSurfaceCacheRetaken counts those).
+	UInt64 unheld;
+	UInt64 unheldWritten;
 	// Blocks deferred (RgfxSurfaceBlocks.hpp), deferrals the host refused, and deferred blocks
 	// released with their pages never named.
 	UInt64 deferred;
@@ -340,6 +345,11 @@ void finishRelease(const RgfxReleaseEntry &e, bool answered)
 	if (e.flags & RGFX_BLOCK_RELEASE_NO_CLIENT) {
 		dormantStats.unread++;
 		dormantStats.unreadWritten += e.written;
+		dormantStats.changes++;
+	}
+	if (e.flags & RGFX_BLOCK_RELEASE_UNHELD) {
+		dormantStats.unheld++;
+		dormantStats.unheldWritten += e.written;
 		dormantStats.changes++;
 	}
 	void *wired = nullptr;
@@ -534,8 +544,10 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 			// A cached surface with no client left is flagged so (RGFX_BLOCK_RELEASE_NO_CLIENT),
 			// which the host only counts: it copies the cache into the pages all the same, as a
 			// mach port or an XPC object holds a surface with no client, and the process that
-			// looks it up from one reads its pages. Its clients are read here, out of every
-			// lock, as at a block's sleep.
+			// looks it up from one reads its pages. One that nothing but the kext holds besides
+			// is flagged RGFX_BLOCK_RELEASE_UNHELD: no process can read its pages, and the host
+			// drops a written cache uncopied (rgfxCacheReleaseFlags). Its counts are read here,
+			// out of every lock, as at a block's sleep.
 			// A deferred block's pages are named first, where the GPU wrote it and its surface
 			// lives on, so the release copies the cache into them (rgfxCacheReleaseNext): by
 			// the naming worker, whose waits for the host's answers this thread does not share.
@@ -573,7 +585,7 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 					IOLog("RgfxAccelerator: the deferred block 0x%llx's pages stay wired for "
 					      "good: its block is gone\n",
 					      block.offset);
-				release.flags = rgfxCacheReleaseFlags(rgfxIOSurfaceClientCount(surface));
+				release.flags = rgfxSurfaceCacheReleaseFlags(block.offset, surface);
 				surface->release();
 			}
 			IOLockLock(releaseLock);
@@ -1374,6 +1386,7 @@ void noteDormant()
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(kDormantLogMs) * 1000000ull, &interval);
 	// Read first, holding no other lock.
 	const UInt64 noRoom = rgfxSurfaceCacheNoRoom();
+	const UInt64 retaken = rgfxSurfaceCacheRetaken();
 	IOLockLock(contextLock);
 	const bool log = (dormantStats.changes != dormantStats.loggedChanges ||
 	                  noRoom != dormantStats.loggedNoRoom) &&
@@ -1393,17 +1406,18 @@ void noteDormant()
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
 		      "volatile), %llu asked otherwise, %llu past the deferred bytes; %llu released with "
-		      "no client left (%llu of them written, copied all the same); %llu not cached: "
-		      "no room; %llu deferred (%llu refused), %llu released with no pages named; "
-		      "%llu asks found a cached block by its surface\n",
+		      "no client left (%llu of them written, copied all the same), %llu of them held by "
+		      "the kext alone (%llu written, which the host drops uncopied; %llu taken again "
+		      "before the answer); %llu not cached: no room; %llu deferred (%llu refused), %llu "
+		      "released with no pages named; %llu asks found a cached block by its surface\n",
 		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
 		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
 		      d.letGo[kRgfxDormantNoClients],
 		      d.letGo[kRgfxDormantCount], d.letGo[kRgfxDormantBytes],
 		      d.letGo[kRgfxDormantTableFull], d.letGo[kRgfxDormantNoSpace], d.volatileFirst,
 		      d.letGo[kRgfxDormantStale], d.letGo[kRgfxDormantDeferredBytes], d.unread,
-		      d.unreadWritten, noRoom, d.deferred, d.deferredRefused, d.deferredUnattached,
-		      d.foundBySurface);
+		      d.unreadWritten, d.unheld, d.unheldWritten, retaken, noRoom, d.deferred,
+		      d.deferredRefused, d.deferredUnattached, d.foundBySurface);
 }
 
 // The last holder, of context `context`, of the cached entry `e` let it go: the block sleeps

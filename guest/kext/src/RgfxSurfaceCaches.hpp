@@ -22,6 +22,11 @@
 //     lets its cache go with it (rgfxCacheLetGo, rgfxCacheReleased). A new block of the
 //     surface in place, of any mode, waits for the answer too before it is made
 //     (rgfxCacheNewBlockStep): nothing of it may use the pages before the host's copy.
+//   - A release whose surface nothing but the kext holds (no client, no mach port or XPC object)
+//     is flagged so (RGFX_BLOCK_RELEASE_UNHELD, rgfxCacheReleaseFlags): no process holds it to
+//     read the pages, and the host drops the cache uncopied, but where the header's count of the
+//     surface's clients is past 0 as it makes its copy, which a lock or a new block of the surface
+//     met before the answer sets (rgfxCacheRetaken). The pages stay wired until the answer.
 //   - The block's last holder letting go leaves it dormant (RgfxSurfaceBlocks.hpp), and the
 //     surface cached, its memory wired and its device cache held: its locks go on as before, a
 //     download among them, and its generation moves on. Its BLOCK_RELEASE, once the dormant
@@ -102,6 +107,11 @@ struct RgfxCachedSurface {
 	bool downloading;
 	// The block's BLOCK_RELEASE is posted and not yet answered.
 	bool releasing;
+	// That release was posted RGFX_BLOCK_RELEASE_UNHELD: nothing but the kext held the surface
+	// (rgfxCacheReleaseFlags). And a lock or a new block of the surface met it releasing, a
+	// process holding the surface again (rgfxCacheRetaken).
+	bool unheld;
+	bool retaken;
 	// The block is dormant (no client holds it).
 	bool dormant;
 	// The dormant block is to be let go, and why (a RgfxDormantCause); kRgfxCacheKept for none.
@@ -258,15 +268,6 @@ inline void *rgfxCacheReleasingSurface(RgfxCacheTable &t, uint64_t offset, bool 
 	return c != nullptr && c->releasing ? c->surface : nullptr;
 }
 
-// The flags of a cached block's BLOCK_RELEASE, its surface having `clients` clients left
-// (IOSurface's count, read as the release is posted): none, RGFX_BLOCK_RELEASE_NO_CLIENT, which
-// the host only counts, copying the cache into the pages all the same (a mach port or an XPC
-// object holds a surface with no client, and whoever looks it up from one reads its pages).
-inline uint32_t rgfxCacheReleaseFlags(int32_t clients)
-{
-	return clients == 0 ? RGFX_BLOCK_RELEASE_NO_CLIENT : 0;
-}
-
 // The BLOCK_RELEASE of the block at `offset` was answered: the cached surface releasing it is
 // taken out (its mapping, wired memory and surface's reference in `*map`, `*wire` and
 // `*surface`), and its key, the device cache whose reference the caller releases now, before
@@ -394,6 +395,23 @@ inline bool rgfxCacheNoteWrite(RgfxCacheTable &t, uint64_t key)
 	return true;
 }
 
+// A CPU lock, or a new block, of the cached surface `c` met its block releasing: a process holds
+// the surface. Its release posted unheld (RGFX_BLOCK_RELEASE_UNHELD) has the header's count of
+// its clients set past 0, so the host, looking at it as it makes its copy, copies the cache into
+// the pages after all; one not yet posted is posted held. True where it was posted unheld, the
+// first time.
+inline bool rgfxCacheRetaken(RgfxCachedSurface &c)
+{
+	if (!c.releasing || c.retaken)
+		return false;
+	c.retaken = true;
+	if (!c.unheld)
+		return false;
+	if (c.clientsAt != nullptr && __atomic_load_n(c.clientsAt, __ATOMIC_ACQUIRE) == 0)
+		__atomic_store_n(c.clientsAt, 1u, __ATOMIC_RELEASE);
+	return true;
+}
+
 // What a CPU lock of surface `key` does next, once no GPU write of it is pending.
 enum RgfxCacheStep {
 	// Nothing more: the pages hold every write, or the surface is not cached.
@@ -415,6 +433,8 @@ inline RgfxCacheStep rgfxCacheNext(RgfxCacheTable &t, uint64_t key, uint64_t *of
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr)
 		return kRgfxCacheGoOn;
+	if (c->releasing)
+		rgfxCacheRetaken(*c);
 	if (c->downloading || c->releasing || c->deferral == kRgfxCacheDeferring ||
 	    c->deferral == kRgfxCacheAttaching)
 		return kRgfxCacheWait;
@@ -537,6 +557,34 @@ constexpr int32_t kRgfxSurfaceReleaseRef = 1;
 constexpr int32_t kRgfxSurfaceKextRefs =
     kRgfxSurfaceTableRef + kRgfxSurfaceDeviceCacheRef + kRgfxSurfaceReleaseRef;
 
+// The flags of the BLOCK_RELEASE of the cached block at `offset`, its surface having `clients`
+// clients and `retains` references (IOSurface's counts, read out of the lock as the release is
+// posted), decided under the lock as rgfxCacheReleasePeek decides a deferred block's naming:
+//   - RGFX_BLOCK_RELEASE_NO_CLIENT where the surface has no client, which the host only counts,
+//     copying the cache into the pages all the same (a mach port or an XPC object holds a surface
+//     with no client, and whoever looks it up from one reads its pages);
+//   - RGFX_BLOCK_RELEASE_UNHELD where, besides, nothing but the kext holds it
+//     (kRgfxSurfaceKextRefs) and no lock or new block of it met it releasing (`retaken`): no
+//     process holds it to read its pages, so the host drops a cache the GPU wrote without copying
+//     it into them, where the header's count of the surface's clients is still 0 at its copy.
+//     The kext still holds the pages wired until the answer, which nothing but the host's own
+//     copies wrote. The entry is marked `unheld`, so a process that takes the surface again
+//     before the answer has its lock or its block mark the header (rgfxCacheRetaken). Only a
+//     taking between the host's look at the header and the kext's let-go of the surface after
+//     the answer, which needs a lookup by ID of a surface no process holds, reads the pages
+//     without what the GPU last wrote, as a deferred block's unnamed release does
+//     (rgfxCacheReleasePeek).
+inline uint32_t rgfxCacheReleaseFlags(RgfxCacheTable &t, uint64_t offset, int32_t clients,
+                                      int32_t retains)
+{
+	uint32_t flags = clients == 0 ? RGFX_BLOCK_RELEASE_NO_CLIENT : 0;
+	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	if (c == nullptr || !c->releasing)
+		return flags;
+	c->unheld = !c->retaken && clients <= 0 && retains <= kRgfxSurfaceKextRefs;
+	return c->unheld ? flags | RGFX_BLOCK_RELEASE_UNHELD : flags;
+}
+
 // What the release of the cached block at `offset` does before its BLOCK_RELEASE goes, its
 // surface having `clients` clients and `retains` references (IOSurface's counts, read out of
 // the lock).
@@ -602,11 +650,14 @@ inline bool rgfxCacheReleasing(RgfxCacheTable &t, uint64_t offset)
 // host copies its cache into the pages before it answers (rgfxCacheLetGo with `releasing`). A
 // block of it kept for good, or one whose attach a let-go left in flight (`forgotten`), posts no
 // release, and leaves none to take.
-inline bool rgfxCacheWritingBack(const RgfxCacheTable &t, const void *object)
+inline bool rgfxCacheWritingBack(RgfxCacheTable &t, const void *object)
 {
 	for (uint32_t i = 0; object != nullptr && i < t.count; i++) {
-		if (t.entries[i].object == object && t.entries[i].releasing)
+		if (t.entries[i].object == object && t.entries[i].releasing) {
+			// A new block of it: a process holds the surface again (rgfxCacheRetaken).
+			rgfxCacheRetaken(t.entries[i]);
 			return true;
+		}
 	}
 	return false;
 }

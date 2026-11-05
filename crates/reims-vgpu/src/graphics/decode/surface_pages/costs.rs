@@ -384,7 +384,7 @@ fn measure<P: ApiPlatform>(label: &str) {
                 let gone = steps[2].time(|| dec.decode(&device, destroy.as_bytes()));
                 assert_eq!(gone.ok(), Some(Ok(())));
                 steps[3].time(|| {
-                    dec.block_released(&device, BLOCK, false, Box::new(|| ()), no_raise());
+                    dec.block_released(&device, BLOCK, 0, Box::new(|| ()), no_raise());
                 });
             }
             let mode = if cached { "cached" } else { "plain" };
@@ -586,7 +586,7 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
                 }
             });
             steps[6].time(|| {
-                dec.block_released(&device, block, false, Box::new(|| ()), no_raise());
+                dec.block_released(&device, block, 0, Box::new(|| ()), no_raise());
             });
         }
         for (step, step_name) in steps.iter().zip([

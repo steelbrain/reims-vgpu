@@ -36,6 +36,11 @@
 //!   since the cache was last copied either way. A release copies whether or not the surface has
 //!   a client left (`RGFX_BLOCK_RELEASE_NO_CLIENT` changes nothing): a mach port or an XPC object
 //!   holds a surface with no client, and the process that looks it up from one reads its pages.
+//!   Only a release the kext flags `RGFX_BLOCK_RELEASE_UNHELD` (no port or object held the
+//!   surface either) whose block's header still counts no client as the copy would be made
+//!   ([`CLIENTS_OFFSET`]) drops the cache uncopied: no process holds the surface to read its
+//!   pages, which the kext frees or gives out again only once the release is answered, and the
+//!   kernel zero-fills what it gives out again.
 //!   A download or a release copies nothing where, as its copy is made (at once, or in the
 //!   finish of a buffer begun before it), the CPU's generation in the block's header
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
@@ -122,7 +127,9 @@ use std::sync::{Arc, OnceLock};
 
 use reims_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
 use reims_graphics::region::Region;
-use reims_graphics::wire::RgfxBufferOverSurfacePages;
+use reims_graphics::wire::{
+    RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_BLOCK_RELEASE_UNHELD, RgfxBufferOverSurfacePages,
+};
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
@@ -164,6 +171,20 @@ const READ_BACK: u64 = u64::MAX;
 /// it in the block's header ([`CPU_GEN_OFFSET`]); `None` where the header is not in `region`.
 pub(crate) fn cpu_generation(region: &Region, block: u64) -> Option<u64> {
     region.load_u64(block.checked_add(CPU_GEN_OFFSET)?)
+}
+
+/// Where a cached block's header holds the count of its surface's clients, from the block's first
+/// byte: a `u32` the kext writes as it caches the block, as a process holds it again, as each
+/// client goes, and past 0 where a process takes the surface again while a release flagged
+/// `RGFX_BLOCK_RELEASE_UNHELD` is unanswered (the kext's `kRgfxSurfaceClientsOffset`).
+pub(crate) const CLIENTS_OFFSET: u64 = 12;
+
+/// The count of the clients of the surface whose cached block is at `block`, as the kext last
+/// wrote it in the block's header ([`CLIENTS_OFFSET`]); `None` where the header is not in
+/// `region`.
+pub(crate) fn surface_clients(region: &Region, block: u64) -> Option<u32> {
+    let bytes = region.read(block.checked_add(CLIENTS_OFFSET)?, 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// One surface's device cache.
@@ -494,6 +515,12 @@ pub(crate) struct CacheCounts {
     /// Releases of a written cache whose surface had no client left
     /// (`RGFX_BLOCK_RELEASE_NO_CLIENT`), copied into the pages all the same.
     pub(crate) unread: u64,
+    /// Releases of a written cache whose surface nothing but the kext held
+    /// (`RGFX_BLOCK_RELEASE_UNHELD`), dropped uncopied, and their bytes; and those the header
+    /// said a process took the surface again, copied.
+    pub(crate) unheld: u64,
+    pub(crate) unheld_bytes: u64,
+    pub(crate) retaken: u64,
     /// Downloads and releases of a written cache not copied, as the CPU's generation of the
     /// surface moved past the cache's ([`SurfaceCaches::behind_the_cpu`]).
     pub(crate) behind: u64,
@@ -712,7 +739,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 }
                 return Ok(true);
             }
-            self.released(device, block, false, None, Box::new(|| {}))?;
+            self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
         let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
             return Ok(false);
@@ -778,7 +805,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(false);
         }
         if self.by_block.contains_key(&block) {
-            self.released(device, block, false, None, Box::new(|| {}))?;
+            self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
         let made = if length <= room {
@@ -1428,24 +1455,37 @@ impl<P: Platform> SurfaceCaches<P> {
         self.write_back(device, block, done)
     }
 
-    /// The block at `block` went (its `BLOCK_RELEASE`): its cache goes once the pages hold what a
-    /// buffer wrote of it, unless a device of the host wrote them since its last fill, or the
-    /// CPU's generation `cpu` of the surface, as the copy is made, is past the cache's
-    /// ([`Self::behind_the_cpu`]); `done` then, at once where nothing is to copy. A release whose
-    /// surface had no client left
-    /// (`unread`, `RGFX_BLOCK_RELEASE_NO_CLIENT`) copies too: a surface with no client can still
-    /// be looked up again, from a mach port or an XPC object that holds it (how one process hands
-    /// a surface it drew to another), and the process that looks it up then reads the pages. The
-    /// cache is returned, for the caller to let go of.
+    /// The block at `block` went (its `BLOCK_RELEASE`, of `RGFX_BLOCK_RELEASE_*` `flags`): its
+    /// cache goes once the pages hold what a buffer wrote of it, unless a device of the host wrote
+    /// them since its last fill, or the CPU's generation `cpu` of the surface, as the copy is
+    /// made, is past the cache's ([`Self::behind_the_cpu`]); `done` then, at once where nothing is
+    /// to copy. A release whose surface had no client left (`RGFX_BLOCK_RELEASE_NO_CLIENT`) copies
+    /// too: a surface with no client can still be looked up again, from a mach port or an XPC
+    /// object that holds it (how one process hands a surface it drew to another), and the process
+    /// that looks it up then reads the pages. One whose surface nothing but the kext held
+    /// (`RGFX_BLOCK_RELEASE_UNHELD`) copies nothing, no process holding the surface to read the
+    /// pages, where `clients`, the count of the surface's clients in the block's header as the
+    /// copy is made, is still 0; past 0, a process took the surface again before the answer
+    /// (the kext marks it so), and the cache is copied. The cache is returned, for the caller to
+    /// let go of.
     pub(crate) fn released(
         &mut self,
         device: &P::Device,
         block: u64,
-        unread: bool,
+        flags: u32,
         cpu: Option<u64>,
+        clients: Option<u32>,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
-        if !self.written_since_host(block) || self.behind_the_cpu(block, cpu, "BLOCK_RELEASE") {
+        let written = self.written_since_host(block);
+        let flagged = flags & RGFX_BLOCK_RELEASE_UNHELD != 0;
+        let unheld = written && flagged && clients == Some(0);
+        if unheld && self.unattached(block).is_none() {
+            let length = (self.by_block.get(&block)).map_or(0, |cache| cache.length);
+            self.counts.unheld += 1;
+            self.counts.unheld_bytes += length;
+        }
+        if !written || unheld || self.behind_the_cpu(block, cpu, "BLOCK_RELEASE") {
             // The pages are let go of once an early copy into them still in flight lands.
             let copy = (self.by_block.get(&block))
                 .and_then(|cache| cache.read_back.copy.as_ref())
@@ -1455,8 +1495,11 @@ impl<P: Platform> SurfaceCaches<P> {
                 None => done(),
             }
         } else {
-            if unread {
+            if flags & RGFX_BLOCK_RELEASE_NO_CLIENT != 0 {
                 self.counts.unread += 1;
+            }
+            if flagged {
+                self.counts.retaken += 1;
             }
             self.write_back(device, block, done)?;
         }
@@ -2072,7 +2115,7 @@ impl<P: Platform> Caches<P> {
         &self,
         device: &P::Device,
         block: u64,
-        unread: bool,
+        flags: u32,
         region: Arc<Region>,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
@@ -2083,7 +2126,8 @@ impl<P: Platform> Caches<P> {
             block,
             Box::new(move |state| {
                 let cpu = cpu_generation(&region, block);
-                match refusing(|| state.released(&device, block, unread, cpu, done)) {
+                let clients = surface_clients(&region, block);
+                match refusing(|| state.released(&device, block, flags, cpu, clients, done)) {
                     Ok(Some(cache)) => let_go(cache),
                     Ok(None) => {}
                     Err(raise) => failed(raise),
@@ -2113,12 +2157,11 @@ impl<P: Platform> Caches<P> {
         &self,
         device: &P::Device,
         block: u64,
-        unread: bool,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
         let mut state = self.state.lock();
         self.wait_users(&mut state, block, true);
-        state.released(device, block, unread, None, done)
+        state.released(device, block, 0, None, None, done)
     }
 
     /// A cache for the block at `block` ([`SurfaceCaches::make`]), after every command buffer
@@ -2786,7 +2829,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             BLOCK,
-            false,
+            0,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -2816,7 +2859,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             BLOCK,
-            true,
+            RGFX_BLOCK_RELEASE_NO_CLIENT,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -2850,7 +2893,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             BLOCK,
-            true,
+            RGFX_BLOCK_RELEASE_NO_CLIENT,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -2858,6 +2901,135 @@ mod tests {
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
         let counts = r.dec.caches().counts();
         assert_eq!((counts.downloads, counts.unread), (0, 0));
+    }
+
+    /// A release of a written cache whose surface nothing but the kext held
+    /// (`RGFX_BLOCK_RELEASE_UNHELD`, the header counting no client) drops the cache uncopied and
+    /// is answered at once: no process holds the surface to read its pages, which the kext frees
+    /// or gives out again only once answered, zero-filled by the kernel. Each control copies: an
+    /// old kext's release of the same surface (no client, the bit unset), a release whose bits
+    /// the host does not know (as a host that does not know this one), and a release flagged
+    /// unheld whose header counts a client, as the kext writes it where a process took the
+    /// surface again before the host's copy
+    #[test]
+    fn an_unheld_release_drops_a_written_cache_uncopied() {
+        use reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
+        let release_written = |flags: u32, clients: u32| {
+            let mut r = cached();
+            let cache = cache_id(&r);
+            assert!(
+                r.dec
+                    .region
+                    .write(BLOCK + CLIENTS_OFFSET, &clients.to_le_bytes())
+            );
+            use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            let released = Arc::new(AtomicBool::new(false));
+            let set = Arc::clone(&released);
+            let mark = r.p.call_log().mark();
+            r.dec.block_released(
+                &r.device,
+                BLOCK,
+                flags,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+                no_raise(),
+            );
+            let copied = copies(&r.p.call_log().since(mark));
+            assert!(copied.iter().all(|&(from, _)| from == cache));
+            let at_once = released.load(Ordering::SeqCst);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(released.load(Ordering::SeqCst), "answered");
+            assert_eq!(r.dec.caches().len(), 0, "the cache goes with the block");
+            (copied.len(), at_once, r.dec.caches().counts())
+        };
+        let unheld = RGFX_BLOCK_RELEASE_NO_CLIENT | RGFX_BLOCK_RELEASE_UNHELD;
+        let (copied, at_once, counts) = release_written(unheld, 0);
+        assert_eq!(
+            (copied, at_once),
+            (0, true),
+            "dropped uncopied, answered at once"
+        );
+        assert_eq!((counts.unheld, counts.downloads, counts.retaken), (1, 0, 0));
+        assert_eq!(counts.unheld_bytes, 2 * cached().page, "the cache's bytes");
+        let (copied, at_once, counts) = release_written(RGFX_BLOCK_RELEASE_NO_CLIENT, 0);
+        assert_eq!((copied, at_once), (1, false), "an old kext's: copied");
+        assert_eq!((counts.unheld, counts.downloads, counts.unread), (0, 1, 1));
+        let (copied, _, counts) = release_written(RGFX_BLOCK_RELEASE_NO_CLIENT | 1 << 31, 0);
+        assert_eq!(
+            (copied, counts.unheld),
+            (1, 0),
+            "a bit the host does not know: copied"
+        );
+        let (copied, at_once, counts) = release_written(unheld, 1);
+        assert_eq!((copied, at_once), (1, false), "taken again: copied");
+        assert_eq!((counts.unheld, counts.retaken, counts.downloads), (0, 1, 1));
+    }
+
+    /// A release flagged unheld behind a writer still running is decided as its copy is made, at
+    /// the writer's finish: a process that took the surface again meanwhile (the kext counting
+    /// it in the header) has the cache copied into the pages before the answer, which its lock
+    /// waits for, so it reads the GPU's write; with none taken, nothing is copied
+    #[test]
+    fn an_unheld_release_copies_where_the_surface_is_taken_again_before_its_copy() {
+        use reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
+        for taken in [true, false] {
+            let mut r = cached();
+            let cache = cache_id(&r);
+            use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            let queue = r.device.new_command_queue().unwrap();
+            let writer = queue.command_buffer(ON).unwrap().unwrap();
+            let writes = [RgfxOpSurfaceUse {
+                flags: RGFX_SURFACE_USE_WRITES,
+                ..reading(BLOCK, 0)[0]
+            }];
+            let (used, _, uses) = (r.dec.surface_caches)
+                .before(&r.device, &writer, &writes)
+                .unwrap();
+            let released = Arc::new(AtomicBool::new(false));
+            let set = Arc::clone(&released);
+            let mark = r.p.call_log().mark();
+            r.dec.block_released(
+                &r.device,
+                BLOCK,
+                RGFX_BLOCK_RELEASE_NO_CLIENT | RGFX_BLOCK_RELEASE_UNHELD,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+                no_raise(),
+            );
+            assert!(!released.load(Ordering::SeqCst), "behind the writer");
+            if taken {
+                assert!(
+                    r.dec
+                        .region
+                        .write(BLOCK + CLIENTS_OFFSET, &1u32.to_le_bytes())
+                );
+            }
+            (r.dec.surface_caches)
+                .finish(&r.device, 1, None, &writer, uses.unwrap(), &used, || {
+                    writer.commit(ON)
+                })
+                .unwrap();
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(released.load(Ordering::SeqCst), "answered");
+            let copied = copies(&r.p.call_log().since(mark));
+            assert_eq!(
+                copied.len(),
+                usize::from(taken),
+                "copied only where taken again"
+            );
+            assert!(
+                copied.iter().all(|&(from, _)| from == cache),
+                "out of the cache"
+            );
+        }
+    }
+
+    /// The header's count of a surface's clients lies where the kext writes it
+    #[test]
+    fn the_clients_offset_is_the_kext_s() {
+        let abi = include_str!("../../../../../guest/kext/src/RgfxUserClientABI.hpp");
+        let line = format!("kRgfxSurfaceClientsOffset = {CLIENTS_OFFSET},");
+        assert!(abi.contains(&line), "the kext's header has no `{line}`");
     }
 
     /// A block named again over the same pages keeps its cache, which its next use fills again;
@@ -3123,7 +3295,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             BLOCK,
-            false,
+            0,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -3315,7 +3487,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             BLOCK,
-            false,
+            0,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -3760,7 +3932,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             BLOCK,
-            false,
+            0,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -3950,7 +4122,7 @@ mod tests {
         r.dec.block_released(
             &r.device,
             block,
-            false,
+            0,
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );

@@ -1477,7 +1477,7 @@ pub(super) mod tests {
         );
         // The buffer holds the view after the block's release.
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
         assert_eq!(r.buffer(13, BLOCK, page), Err(DecodeError::Refused));
         assert!(
             Arc::strong_count(&view) > 2,
@@ -1500,7 +1500,7 @@ pub(super) mod tests {
         assert_eq!(r.pages(BLOCK, &[(3, 1), (0, 1)], 2 * page), RGFX_STATUS_OK);
         let first = r.view(BLOCK);
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
         let mark = r.p.call_log().mark();
         assert_eq!(
             r.pages(BLOCK + 0x8000, &[(3, 1), (0, 1)], 2 * page),
@@ -1520,13 +1520,8 @@ pub(super) mod tests {
             assert_eq!(r.pages(BLOCK, &[(10 + i, 1)], page), RGFX_STATUS_OK);
         }
         assert_eq!(r.dec.views_of_surfaces().len().1, CACHED_VIEWS);
-        r.dec.block_released(
-            &r.device,
-            BLOCK + 0x8000,
-            false,
-            Box::new(|| ()),
-            no_raise(),
-        );
+        r.dec
+            .block_released(&r.device, BLOCK + 0x8000, 0, Box::new(|| ()), no_raise());
         // The block's hold goes on the surface worker.
         r.dec.surface_worker().flush();
         assert_eq!(
@@ -1592,7 +1587,7 @@ pub(super) mod tests {
             "the object is gone at once"
         );
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
         assert_eq!(
             Arc::strong_count(&view),
             held,
@@ -1754,7 +1749,7 @@ pub(super) mod tests {
         assert_eq!(send(&mut r, destroy(10).as_bytes()), Ok(()));
         for block in [BLOCK, PAGES] {
             r.dec
-                .block_released(&r.device, block, false, Box::new(|| ()), no_raise());
+                .block_released(&r.device, block, 0, Box::new(|| ()), no_raise());
         }
         for i in 0..CACHED_VIEWS as u64 {
             assert_eq!(
@@ -1850,7 +1845,7 @@ pub(super) mod tests {
         };
         assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
         assert_eq!(r.buffer(12, BLOCK, page), Err(DecodeError::Refused));
         assert_eq!(r.pages(BLOCK, &[(3, 1)], page), RGFX_STATUS_OK);
         let next = r.view(BLOCK);
@@ -1945,7 +1940,7 @@ pub(super) mod tests {
         assert_eq!(r.buffer(12, BLOCK, page), Err(DecodeError::Refused));
 
         r.dec
-            .block_released(&r.device, BLOCK, false, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
         assert_eq!(r.dec.views_of_surfaces().private_len(), 0);
         assert_eq!(
             r.pages_buffer(13, 0, BLOCK, 0, page),
