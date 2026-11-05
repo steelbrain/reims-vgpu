@@ -1043,6 +1043,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // After the no-copy buffers being made over the block it describes again, which see it as
         // before, and whose make on the surface worker would else wait for it, behind them there.
         self.pages_buffers.wait(pages.block_offset);
+        // After the copies of a released block's device cache into the same pages, which would
+        // land over what the new block's buffers write.
+        (self.decoder()).wait_copies_into(pages.block_offset, &runs);
         let me = Arc::clone(self);
         let job = move |settle| {
             let status = {

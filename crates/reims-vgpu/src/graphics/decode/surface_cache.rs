@@ -45,7 +45,10 @@
 //!   finish of a buffer begun before it), the CPU's generation in the block's header
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
 //!   answer, moved the generation, and let the CPU write the pages, whose writes are the newer,
-//!   as at a fill.
+//!   as at a fill. A download or a release that copies nothing is answered once a copy into the
+//!   pages still in flight lands, and a `SURFACE_PAGES` over pages a release still copies into
+//!   (the kext made a new block of the surface before the release's answer) waits for the copy
+//!   before it is carried out ([`Caches::wait_copies_into`]).
 //! - **Early copy.** A surface the CPU reads back after each GPU write (a decoder's output, or a
 //!   pixel transfer's, that its client locks each frame to read) is copied into its pages as the
 //!   write ends, not at the lock that follows it ([`SurfaceCaches::early_copies`]). Once a
@@ -227,6 +230,14 @@ struct OutCopy {
     landing: Arc<Landing>,
 }
 
+/// A copy of a cache into pages asked and not yet landed, by the pages' host addresses in the
+/// guest's RAM ([`SurfaceCaches::copies_into`]): a release's, from its ask on, as it may wait for
+/// the buffers that write the cache before it is made, or one made on the transfer queue.
+struct IntoPages {
+    runs: Vec<Range<u64>>,
+    landing: Arc<Landing>,
+}
+
 /// What a cache knows of the CPU's reads of its surface after the GPU's writes, and its early
 /// copy into the pages ([`SurfaceCaches::early_copies`]).
 #[derive(Default)]
@@ -254,7 +265,7 @@ struct EarlyCopy {
 
 /// A copy into a cache's pages until it lands (an early copy, or one on the transfer queue): the
 /// answers waiting for it, given as the platform sees its command buffer done, and the threads
-/// waiting for it ([`Caches::wait_copied_out`]).
+/// waiting for it ([`Caches::wait_copied_out`], [`Caches::wait_copies_into`]).
 struct Landing {
     /// The answers waiting; `None` once it landed.
     waiting: Mutex<Option<Vec<Answer>>>,
@@ -638,6 +649,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// across [`Caches::set_on`], and the bytes they hold.
     deferred_budget: u64,
     deferred_bytes: u64,
+    /// The copies of caches into pages asked and not yet landed ([`Self::copies_into`]), those
+    /// landed let go of as each is added.
+    into_pages: Vec<IntoPages>,
 }
 
 /// The command buffers begun and not finished that use one block's cache.
@@ -684,6 +698,7 @@ impl<P: Platform> SurfaceCaches<P> {
             on_fill_done,
             deferred_budget: 0,
             deferred_bytes: 0,
+            into_pages: Vec::new(),
         }
     }
 
@@ -1558,6 +1573,27 @@ impl<P: Platform> SurfaceCaches<P> {
         (!out.landing.landed()).then(|| Arc::clone(&out.landing))
     }
 
+    /// Notes a copy into the pages of host addresses `runs` asked and not yet landed, letting go of
+    /// those that have.
+    fn note_into(&mut self, runs: Vec<Range<u64>>, landing: &Arc<Landing>) {
+        self.into_pages.retain(|c| !c.landing.landed());
+        if !runs.is_empty() {
+            self.into_pages.push(IntoPages {
+                runs,
+                landing: Arc::clone(landing),
+            });
+        }
+    }
+
+    /// The copies of caches into pages among host addresses `runs` ([`device_writes::sorted`])
+    /// asked and not yet landed: a release's from its ask, or one on the transfer queue.
+    fn copies_into(&self, runs: &[Range<u64>]) -> Vec<Arc<Landing>> {
+        (self.into_pages.iter())
+            .filter(|c| !c.landing.landed() && device_writes::overlap(&c.runs, runs))
+            .map(|c| Arc::clone(&c.landing))
+            .collect()
+    }
+
     /// Whether the block's cache holds a command buffer's write the pages do not: one was
     /// committed since its last copy, and no device of the host wrote the pages since its last
     /// fill. Where one did, its write is the newer, and the cache's is dropped.
@@ -1602,7 +1638,8 @@ impl<P: Platform> SurfaceCaches<P> {
     /// after every command buffer that used it; `done` once the copy has finished. Where no copy
     /// can be made `done` is given at once. The copy signals the transfer event, which a use that
     /// writes the cache waits for on the GPU while it is in flight, and lands for the downloads and
-    /// releases that copy nothing behind it ([`SurfaceCache::out`]).
+    /// releases that copy nothing behind it ([`SurfaceCache::out`]), and for the `SURFACE_PAGES`
+    /// of a block over the same pages ([`Self::copies_into`]).
     fn write_back(
         &mut self,
         device: &P::Device,
@@ -1674,8 +1711,13 @@ impl<P: Platform> SurfaceCaches<P> {
             // This copy is the cache's last: an early copy before it is waited for on the GPU.
             cache.read_back.writes = 0;
             cache.read_back.copy = None;
-            cache.out = Some(OutCopy { value, landing });
+            cache.out = Some(OutCopy {
+                value,
+                landing: Arc::clone(&landing),
+            });
         }
+        let runs = (self.watched.0.lock().get(&block)).map_or_else(Vec::new, |p| p.runs.clone());
+        self.note_into(runs, &landing);
         self.counts.downloads += 1;
         self.counts.downloaded_bytes += length;
         Ok(())
@@ -2181,6 +2223,31 @@ impl<P: Platform> Caches<P> {
         let_go: Box<dyn FnOnce(SurfaceCache<P>) + Send>,
     ) {
         let device = device.clone_ref();
+        // Its copy into the pages lands with its answer, which a `SURFACE_PAGES` over the same
+        // pages waits for from here, while the copy waits for the buffers that write the cache.
+        let (done, failed) = {
+            let mut state = self.state.lock();
+            let runs = (state.by_block.contains_key(&block))
+                .then(|| (state.watched.0.lock().get(&block)).map(|p| p.runs.clone()))
+                .flatten();
+            match runs {
+                Some(runs) => {
+                    let landing = Landing::new();
+                    state.note_into(runs, &landing);
+                    let lands = Arc::clone(&landing);
+                    let done: Box<dyn FnOnce() + Send> = Box::new(move || {
+                        lands.land();
+                        done();
+                    });
+                    let failed: Box<dyn FnOnce(Raise) + Send> = Box::new(move |raise| {
+                        landing.land();
+                        failed(raise);
+                    });
+                    (done, failed)
+                }
+                None => (done, failed),
+            }
+        };
         self.after_writers(
             block,
             Box::new(move |state| {
@@ -2312,6 +2379,20 @@ impl<P: Platform> Caches<P> {
             .and_then(|cache| cache.read_back.copy.as_ref())
             .map(|copy| Arc::clone(&copy.landing));
         landing.is_none_or(|landing| landing.wait(timeout))
+    }
+
+    /// Waits, on the calling thread, for every copy of a cache into the pages of host addresses
+    /// `runs` ([`device_writes::sorted`]) asked and not yet landed
+    /// ([`SurfaceCaches::copies_into`]), each `timeout` at most, with no lock held: for a
+    /// `SURFACE_PAGES` over pages a released block's cache still copies into, whose new block's
+    /// buffers the copy would land over. True where none is left.
+    pub(crate) fn wait_copies_into(
+        &self,
+        runs: &[Range<u64>],
+        timeout: std::time::Duration,
+    ) -> bool {
+        let landings = self.state.lock().copies_into(runs);
+        landings.iter().all(|landing| landing.wait(timeout))
     }
 }
 
@@ -2480,7 +2561,7 @@ mod tests {
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
         RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
         RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
-        RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
+        RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages,
     };
     use reims_vgpu_core::testkit::FakePlatform;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
@@ -3127,6 +3208,79 @@ mod tests {
             r.p.world().complete_all(CompleteOn::Caller);
             assert!(first.load(Ordering::SeqCst) && then.load(Ordering::SeqCst));
         }
+    }
+
+    /// A `SURFACE_PAGES` of a new block over the pages of a released block whose cache is still
+    /// to be copied into them (its release waits for a buffer still walked that writes the
+    /// cache, as when the kext stopped waiting for its answer and made the new block anyway)
+    /// waits for that copy to land before it is carried out: the new block's buffers lie over the
+    /// pages, and the copy would land over what they write
+    #[test]
+    fn a_surface_pages_over_pages_a_release_still_copies_into_waits_for_it() {
+        let mut r = cached();
+        let page = r.page;
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let writer = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let (used, _, uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &writes)
+            .unwrap();
+        let released = release(&r, BLOCK);
+        assert!(!released.load(Ordering::SeqCst), "behind the writer");
+        let other = BLOCK + 0x4000;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // A decoder of its own, as a lane's is.
+            let dec = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            scope.spawn(move || {
+                let runs = [RgfxPageRun {
+                    address: RAM + page,
+                    length: 2 * page,
+                }];
+                let m = RgfxSurfacePages {
+                    header: RgfxMsgHeader {
+                        r#type: reims_graphics::wire::RGFX_CMD_SURFACE_PAGES,
+                        size: size_of::<RgfxSurfacePages>() as u32,
+                        seqno: 0,
+                    },
+                    context: 0,
+                    run_count: 1,
+                    block_offset: other,
+                    block_size: 0x2000,
+                    runs_offset: other + 0x1000,
+                    length: 2 * page,
+                };
+                tx.send(dec.surface_pages(&device, &m, &runs, 0)).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "waits for the release's copy"
+            );
+            (r.dec.surface_caches)
+                .finish(&r.device, 1, None, &writer, uses.unwrap(), &used, || {
+                    writer.commit(ON)
+                })
+                .unwrap();
+            assert!(!released.load(Ordering::SeqCst), "copied, in flight");
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "waits for the copy to land"
+            );
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(released.load(Ordering::SeqCst));
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(5)),
+                Ok(RGFX_STATUS_OK)
+            );
+        });
     }
 
     /// A release flagged unheld behind a writer still running is decided as its copy is made, at

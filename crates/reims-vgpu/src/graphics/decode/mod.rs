@@ -554,6 +554,11 @@ const VIEWS_LOGGED_EVERY: u64 = 256;
 /// same interval.
 const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a `SURFACE_PAGES` waits for a copy of a device cache into its pages still in flight
+/// ([`GraphicsDecoder::wait_copies_into`]): as long as the kext's new block over a surface's
+/// pages waits for the release of the surface's last block (its `kRgfxWriteBackWaitMs`).
+const PAGES_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Whether a `SURFACE_PAGES`, the `counted`th the views' counts hold, logs what the surface
 /// views did at `now`, the last log having been at `last`: every [`VIEWS_LOGGED_EVERY`]th, and
 /// the first [`VIEWS_LOGGED_AFTER`] or more after the last log.
@@ -995,9 +1000,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         runs: &[RgfxPageRun],
         flags: u32,
     ) -> u32 {
+        self.wait_copies_into(pages.block_offset, runs);
         let settle = self.begin_surface_pages(pages.block_offset);
         self.carry_out_surface_pages(device, pages, runs, flags, &settle)
             .unwrap_or(RGFX_STATUS_REFUSED)
+    }
+
+    /// Waits, before the `SURFACE_PAGES` of the block at `block` over `runs` is begun, for every
+    /// copy of a device cache into those pages asked and not yet landed
+    /// ([`surface_cache::Caches::wait_copies_into`]), [`PAGES_COPY_WAIT`] at most: a released
+    /// block's, which the kext's new block over a surface's pages waits for only so long (its
+    /// `kRgfxWriteBackWaitMs`) before it makes the block all the same. The new block's buffers lie
+    /// over the pages, so the copy would land over what they write. One still in flight past the
+    /// wait is logged, and the block goes on.
+    pub(crate) fn wait_copies_into(&self, block: u64, runs: &[RgfxPageRun]) {
+        if runs.is_empty() {
+            return;
+        }
+        let host = self.shared.surface_views.lock().host_runs(runs);
+        if !self.surface_caches.wait_copies_into(&host, PAGES_COPY_WAIT) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: a copy of a device cache into its pages is \
+                 still in flight after {} ms; its SURFACE_PAGES goes on, and the copy may land \
+                 over what its buffers write",
+                PAGES_COPY_WAIT.as_millis()
+            );
+        }
     }
 
     /// Begins `SURFACE_PAGES` of the block at `block`, in ring order: until the returned
