@@ -667,8 +667,8 @@ void unwireSurface(void *wire)
 }
 } // namespace
 
-void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, bool blockWired,
-                            void **wireOut)
+void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
+                            bool blockWired, void **wireOut)
 {
 	if (wireOut)
 		*wireOut = nullptr;
@@ -685,7 +685,9 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, bool blo
 		const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 		wake |= c != nullptr;
 		wired = c == nullptr || rgfxCacheWired(*c);
-		kept = !rgfxCacheLetGo(state.caches, key, releasing, surface, &map, &wire, blockWired);
+		// The cached entry is the cached block's alone: another block of the surface leaves it.
+		kept = !rgfxCacheBlockLetGo(state.caches, key, offset, releasing, surface, &map, &wire,
+		                            blockWired);
 		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);

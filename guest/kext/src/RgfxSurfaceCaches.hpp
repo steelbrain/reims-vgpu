@@ -593,4 +593,21 @@ inline bool rgfxCacheReleasing(RgfxCacheTable &t, uint64_t offset)
 	return true;
 }
 
+// The let-go of the block at `offset`, which named surface `key`'s device cache: as
+// rgfxCacheLetGo, where the surface's cached entry is this block's own. Another block of the
+// surface, a copy or one in place uncached, whose locks follow the surface by the same device
+// cache, holds no entry, and leaves the cached block's as it is: released and unanswered, its
+// memory stays wired for the host's copy into the pages; living, or with an attach in flight,
+// its locks go on. True, nothing in `*map` and `*wire`, where the caller releases its own
+// references of the cache and the surface now.
+inline bool rgfxCacheBlockLetGo(RgfxCacheTable &t, uint64_t key, uint64_t offset, bool releasing,
+                                void *surface, void **map, void **wire, bool blockWired)
+{
+	*map = *wire = nullptr;
+	const RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c != nullptr && c->offset != offset)
+		return true;
+	return rgfxCacheLetGo(t, key, releasing, surface, map, wire, blockWired);
+}
+
 #endif // RGFX_SURFACE_CACHES_HPP_
