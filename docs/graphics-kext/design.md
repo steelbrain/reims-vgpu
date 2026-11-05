@@ -1762,9 +1762,12 @@ and sends each as a placement at that offset. The heap's `usedSize` and
 process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
 Metal makes one over any range the process maps readable, at any alignment:
 malloc'd, `vm_allocate`d, read-only, or a file mapping (measured on an M3 Max,
-16 KiB and 4 KiB pages). Writable Shared memory the kext wires lies in place
-(`PagesBlock`, `BUFFER_OVER_PAGES`). Over any other memory (read-only, a Managed
-buffer's, or memory the kext or host makes no pages block of) the buffer lies
+16 KiB and 4 KiB pages). Writable Shared or Managed memory the kext wires lies
+in place (`PagesBlock`, `BUFFER_OVER_PAGES`). A Managed one is one copy on every
+host, as the Intel UHD 630's no-copy Managed buffer is (dgpu-oracle.md Q3): the
+host's buffer over the pages is a Shared one, and its `didModifyRange:` and a
+blit's synchronize of it, or of a texture over it, send nothing. Over any other
+memory (read-only, or memory the kext or host makes no pages block of) the buffer lies
 over a range of a slab of its own options, as a device buffer of them does
 ("Shared and Managed buffers lie in slabs"): the process's own superpages where
 the device takes them, so no app-sized copy lies in the region. `contents`

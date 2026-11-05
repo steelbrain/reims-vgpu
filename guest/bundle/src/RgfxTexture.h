@@ -121,6 +121,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// factory calls it on the texture it made; until then the texture answers Metal's defaults.
 - (void)rgfxTakeDescriptor:(nullable MTLTextureDescriptor *)descriptor;
 
+/// Whether the texture lies over a Managed buffer of one copy (RgfxBuffer's rgfxOneCopy), itself
+/// or as a view of one that does: a synchronize of it has nothing to bring over.
+- (BOOL)rgfxOverOneCopy;
+
 @end
 
 /// Ends the process, with Metal's words, at a descriptor Metal's texture descriptor validation

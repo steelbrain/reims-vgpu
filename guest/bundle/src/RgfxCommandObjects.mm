@@ -311,6 +311,15 @@ void rgfxNoteIcbFlush(const RgfxIcbFlush &flush)
 	}
 }
 
+/// Whether `res` is a Managed buffer of one copy, or a texture over one (RgfxBuffer's
+/// rgfxOneCopy), whose synchronize has nothing to bring over.
+bool rgfxOfOneCopy(id<MTLResource> res)
+{
+	if ([res isKindOfClass:[RgfxBuffer class]])
+		return [(RgfxBuffer *)res rgfxOneCopy];
+	return [res isKindOfClass:[RgfxTexture class]] && [(RgfxTexture *)res rgfxOverOneCopy];
+}
+
 /// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
 uint32_t rgfxResourceKind(id<MTLResource> res)
 {
@@ -4469,13 +4478,21 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	_enc->blitOptimizeIndirectCommandBuffer(rgfxNamed(_enc, indirectCommandBuffer), range.location,
 	                                        range.length);
 }
+// A Managed buffer of one copy, or a texture over one, has nothing to bring over (RgfxBuffer's
+// rgfxOneCopy): it is named as written, and nothing is sent.
 - (void)synchronizeResource:(id<MTLResource>)resource
 {
-	_enc->blitSynchronizeResource(rgfxWrites(_enc, resource), rgfxResourceKind(resource));
+	const uint64_t name = rgfxWrites(_enc, resource);
+	if (rgfxOfOneCopy(resource))
+		return;
+	_enc->blitSynchronizeResource(name, rgfxResourceKind(resource));
 }
 - (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level
 {
-	_enc->blitSynchronizeTexture(rgfxWrites(_enc, texture), slice, level);
+	const uint64_t name = rgfxWrites(_enc, texture);
+	if (rgfxOfOneCopy(texture))
+		return;
+	_enc->blitSynchronizeTexture(name, slice, level);
 }
 
 // --- unsupported: the device answers NO for these features -----------------------

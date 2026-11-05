@@ -7790,9 +7790,11 @@ void test_no_copy_buffers()
 // (RgfxBuffer.h): the buffer lies over the app's own pages, no block or shadow of its own, its
 // create a BUFFER_OVER_PAGES over the block the kext gave for exactly the app's bytes, at the
 // pointer's offset in its page, which its GPU address keeps. Its block goes back once the host
-// has dropped it, before the deallocator. Read-only memory, Managed storage, a null pointer and
-// bytes in the region never ask for a block, and a block not given, or one the region does not
-// hold, falls back to the shadow.
+// has dropped it, before the deallocator. Writable Managed memory lies there too, one copy: the
+// host's buffer a Shared one, the buffer still Managed, its didModifyRange: and a blit's
+// synchronize of it, or of a texture over it, sending nothing, where a Managed buffer's shadow
+// sends both. Read-only memory, a null pointer and bytes in the region never ask for a block, and
+// a block not given, or one the region does not hold, falls back to the shadow.
 void test_no_copy_buffers_in_place()
 {
 	@autoreleasepool {
@@ -7872,10 +7874,87 @@ void test_no_copy_buffers_in_place()
 		                              serializer:&f.ser];
 	};
 	@autoreleasepool {
-		// Never asked: Managed storage, a null pointer, bytes in the region, read-only memory.
+		// Managed, writable: in place, one copy.
 		pages.asked.clear();
-		RgfxBuffer *managed = noCopy(p, 0x1000, MTLResourceStorageModeManaged);
-		CHECK(managed != nil && [managed rgfxShadow] != nullptr);
+		const MTLResourceOptions managedOptions =
+		    MTLResourceStorageModeManaged | MTLResourceCPUCacheModeWriteCombined;
+		RgfxBuffer *managed = noCopy(p, 0x2000, managedOptions);
+		CHECK(managed != nil && [managed contents] == p && [managed rgfxShadow] == nullptr);
+		CHECK(managed.storageMode == MTLStorageModeManaged &&
+		      managed.cpuCacheMode == MTLCPUCacheModeWriteCombined);
+		CHECK(pages.asked.size() == 1 && std::get<0>(pages.asked[0]) == p &&
+		      std::get<2>(pages.asked[0]));
+		auto over = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(over.obj_id == managed.rgfxObjId && over.length == 0x2000 && over.offset == 0x123);
+		CHECK((over.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared &&
+		      (over.options & MTLResourceCPUCacheModeMask) == MTLResourceCPUCacheModeWriteCombined);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModeManaged;
+		td.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> overManaged = [managed newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+		CHECK(overManaged != nil && overManaged.storageMode == MTLStorageModeManaged);
+		drainRing(f.control);
+		[managed didModifyRange:NSMakeRange(0, 0x100)];
+		uint32_t px[4] = {1, 2, 3, 4};
+		[overManaged replaceRegion:MTLRegionMake2D(0, 1, 4, 1) mipmapLevel:0 withBytes:px
+		               bytesPerRow:16];
+		CHECK(std::memcmp(p + 256, px, sizeof px) == 0);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> sent;
+		CHECK(!f.control.next(&h, &sent)); // no BUFFER_DID_MODIFY_RANGE: one copy
+		// Read-only Managed memory keeps its shadow, a Managed buffer of two copies, whose
+		// didModifyRange: and synchronize the host carries.
+		uint8_t *roManaged = reinterpret_cast<uint8_t *>(app) + 0x38000;
+		CHECK(vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(roManaged), 0x4000,
+		                 false, VM_PROT_READ) == KERN_SUCCESS);
+		RgfxBuffer *twoCopies = noCopy(roManaged, 0x1000, MTLResourceStorageModeManaged);
+		CHECK(twoCopies != nil && [twoCopies rgfxShadow] != nullptr && pages.asked.size() == 1);
+		drainRing(f.control);
+		[twoCopies didModifyRange:NSMakeRange(0, 0x10)];
+		auto told =
+		    expectMessage<RgfxBufferDidModifyRange>(f.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(told.obj_id == twoCopies.rgfxObjId && told.length == 0x10);
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit synchronizeResource:managed];
+		[blit synchronizeResource:overManaged];
+		[blit synchronizeTexture:overManaged slice:0 level:0];
+		[blit synchronizeResource:twoCopies];
+		[blit endEncoding];
+		[cb commit];
+		CHECK(f.submit.next(&h, &sent) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCommandBuffer cbh = {};
+		std::memcpy(&cbh, sent.data(), sizeof(cbh));
+		OpWalk walk(sent.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cbh.op_bytes);
+		std::vector<uint64_t> synced;
+		while (!walk.done()) {
+			uint16_t tag = 0;
+			uint32_t len = 0;
+			const uint8_t *body = nullptr;
+			size_t bodyLength = 0;
+			CHECK(walk.next(&tag, &len, &body, &bodyLength));
+			if (tag == RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE) {
+				RgfxBlitOpSynchronizeResource m = {};
+				std::memcpy(&m, body, std::min(bodyLength, sizeof m));
+				synced.push_back(m.resource_obj_id);
+			}
+			CHECK(tag != RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE);
+		}
+		CHECK(synced.size() == 1 && synced[0] == twoCopies.rgfxObjId);
+		RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
+		CHECK(f.completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+		overManaged = nil;
+		drainRing(f.control);
+	}
+	drainRing(f.control);
+	@autoreleasepool {
+		// Never asked: a null pointer, bytes in the region, read-only memory.
+		pages.asked.clear();
 		RgfxBuffer *own = noCopy(nullptr, 0x1000, shared);
 		CHECK(own != nil && [own rgfxShadow] == nullptr);
 		RgfxRegion::Block inRegion = region.allocate(0x1000);
@@ -7909,7 +7988,7 @@ void test_no_copy_buffers_in_place()
 
 // A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
 // buffer's is (RgfxBuffer.h): with the process's superpages as the slabs' first source, the
-// copies of read-only memory and of Managed buffers lie in them, seeded from the memory, eight 4 KiB
+// copies of read-only memory, Shared and Managed, lie in them, seeded from the memory, eight 4 KiB
 // copies a page apart in one heap over one pages block, and the region gives none of them a block
 // of its own (each took one before: the region held every app-sized copy).
 void test_no_copy_shadows_lie_in_slabs()
@@ -7960,7 +8039,7 @@ void test_no_copy_shadows_lie_in_slabs()
 	uint8_t *p = reinterpret_cast<uint8_t *>(app);
 	for (size_t i = 0; i < 0x10000; i++)
 		p[i] = static_cast<uint8_t>(i * 7 + 3);
-	CHECK(vm_protect(mach_task_self(), app, 0x8000, false, VM_PROT_READ) == KERN_SUCCESS);
+	CHECK(vm_protect(mach_task_self(), app, 0xa000, false, VM_PROT_READ) == KERN_SUCCESS);
 	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
 		return [RgfxBuffer bufferWithBytesNoCopy:ptr
 		                                  length:length
@@ -7991,7 +8070,8 @@ void test_no_copy_shadows_lie_in_slabs()
 		}
 		// A Managed one's CPU copy lies in a superpage of its own class, placed in its heap.
 		RgfxBuffer *managed = noCopy(p + 0x8000, 0x2000, MTLResourceStorageModeManaged);
-		CHECK(managed != nil && [managed rgfxShadow] != nullptr && [managed rgfxShadow]->writable());
+		CHECK(managed != nil && [managed rgfxShadow] != nullptr &&
+		      ![managed rgfxShadow]->writable());
 		CHECK(vm.held.size() == 2 && blocks.allocated.size() == 2);
 		auto mheap = expectMessage<RgfxHeapOverPages>(f.control, RGFX_CMD_HEAP_OVER_PAGES);
 		auto mat =

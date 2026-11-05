@@ -1031,6 +1031,12 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	return _parent != nil ? _parent.buffer : _buffer;
 }
 
+- (BOOL)rgfxOverOneCopy
+{
+	id<MTLBuffer> buffer = self.buffer;
+	return [buffer isKindOfClass:[RgfxBuffer class]] && [(RgfxBuffer *)buffer rgfxOneCopy];
+}
+
 // The bytes the texture takes: its buffer's, for one made over a buffer (measured on the M3 Max
 // under macOS 27.0.1: a texture of four rows over buffers of 5000, 65536 and 200000 bytes
 // answers 5000, 65536 and 212992, each buffer's allocatedSize); the size its Automatic heap

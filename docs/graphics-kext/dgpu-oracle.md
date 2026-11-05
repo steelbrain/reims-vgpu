@@ -231,8 +231,9 @@ Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `argenc shared|m
   `didModifyRange:` of all of it (`RgfxTexture.mm`).
 - **A no-copy Managed buffer** (`nocopy`, 11-03) is two copies on AMD: the GPU's copy holds zeros,
   not the pages' bytes, until a `didModifyRange:`, and a CPU write with no call is never seen
-  (also 200 ms later). Ours is two copies on a discrete host too, the GPU's copy filled from the
-  pages at the create.
+  (also 200 ms later); Intel's is one copy. Ours is one copy, as Intel's, wherever the kext wires
+  the pages (`RgfxBuffer.mm`, bufferOverPagesOf), and two copies over read-only memory and where
+  it wires none, the GPU's copy filled from the pages at the create.
 - **An argument encoder writing a Managed argument buffer** (`argenc managed`, 11-03):
   `setBuffer:` and `setTexture:` reach the GPU's copy on AMD only at the app's
   `didModifyRange:`; Intel is one copy. A Shared argument buffer's writes are seen at once on

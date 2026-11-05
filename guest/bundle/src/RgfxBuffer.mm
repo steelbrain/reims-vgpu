@@ -153,6 +153,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// a buffer over pages lies past it by its pointer's offset in its page; 0 for any other,
 	// whose pick is `_gpuAddress`.
 	uint64_t _addressPick;
+	// YES for a Managed no-copy buffer over the app's own pages in place (bufferOverPagesOf): one
+	// copy, the app's memory, which the host's GPU uses as a Shared buffer's, so neither
+	// didModifyRange: nor a synchronize has anything to bring over.
+	BOOL _oneCopy;
 }
 
 + (instancetype)bufferWithLength:(NSUInteger)length
@@ -344,10 +348,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	if (pointer != nullptr && !rgfxMappedReadable(pointer, length, &writable))
 		return nil;
 	// The app's own pages in place, where the kext wires them for the buffer and the host maps
-	// them: nothing copied or synced. Read-only and Managed memory, and memory the kext or the
-	// host makes no pages block of, takes a shadow in a slab below.
-	if (pointer != nullptr && writable && region->hasPagesBlocks() &&
-	    (options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared) {
+	// them: nothing copied or synced, a Managed buffer's one copy (bufferOverPagesOf). Read-only
+	// memory, and memory the kext or the host makes no pages block of, takes a shadow in a slab
+	// below.
+	if (pointer != nullptr && writable && region->hasPagesBlocks()) {
 		RgfxBuffer *inPlace = [RgfxBuffer bufferOverPagesOf:pointer
 		                                             length:length
 		                                            options:options
@@ -410,6 +414,11 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 // A no-copy buffer over the app's own pages (bufferWithBytesNoCopy): a pages block of them, and a
 // buffer over its view at the pointer's offset in its page, which keeps the block until the host
 // has dropped the buffer. Nil where the kext gives no block, or the device never got the create.
+// A Managed one is one copy, the app's memory, as the Intel 630's no-copy Managed buffer is (the
+// GPU sees a CPU write with no didModifyRange:, and the CPU a GPU write with no synchronize;
+// docs/graphics-kext/dgpu-oracle.md, Q3; the AMD 5300M's is two copies, which Metal's contract
+// for the mode allows either way): the host's buffer over the pages is a Shared one, and the
+// buffer answers the Managed options it was asked.
 + (instancetype)bufferOverPagesOf:(void *)pointer
                            length:(NSUInteger)length
                           options:(MTLResourceOptions)options
@@ -422,7 +431,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	if (!block.ok)
 		return nil;
 	const uint64_t offset = reinterpret_cast<uintptr_t>(pointer) & (kRgfxGuestPage - 1);
-	RgfxCreated created = serializer->createBufferOverPages(length, static_cast<uint32_t>(options),
+	const bool managed = (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged;
+	const MTLResourceOptions onHost =
+	    managed ? (options & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared : options;
+	RgfxCreated created = serializer->createBufferOverPages(length, static_cast<uint32_t>(onHost),
 	                                                        block.offset, block.size, offset);
 	if (created.obj_id == 0 || serializer->refused(created)) {
 		region->release(block.offset); // no buffer lies over the block
@@ -446,8 +458,14 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	if (buffer != nil) {
 		buffer->_ownsAddress = YES;
 		buffer->_addressPick = created.gpu_address;
+		buffer->_oneCopy = managed;
 	}
 	return buffer;
+}
+
+- (BOOL)rgfxOneCopy
+{
+	return _oneCopy;
 }
 
 - (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow
@@ -607,9 +625,9 @@ RGFX_RESOURCE_SPI
 	// A Managed buffer's contents are its CPU copy, a region block: the host copies the range
 	// to the GPU's copy before any command buffer committed after this, on any queue
 	// (RGFX_CMD_BUFFER_DID_MODIFY_RANGE). A Shared or Private buffer has nothing to tell, as
-	// Metal does nothing for one.
-	if ([self storageMode] != MTLStorageModeManaged || _ownsContents || _serializer == nullptr ||
-	    range.length == 0) {
+	// Metal does nothing for one, and neither has a Managed one of one copy (rgfxOneCopy).
+	if ([self storageMode] != MTLStorageModeManaged || _ownsContents || _oneCopy ||
+	    _serializer == nullptr || range.length == 0) {
 		return;
 	}
 	// A no-copy buffer's CPU copy is the app's memory: the block takes its bytes first.
