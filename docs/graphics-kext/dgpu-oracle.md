@@ -501,6 +501,37 @@ oracle cannot be traced, being protected, so which framework reads the profile f
 measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
 the frontend makes the same bytes under either (Q10).
 
+**Types and arrays over a buffer.** Probes: `oracle_storage DEVICE lintypes FORM:TYPE`, a texture
+of one `MTLTextureType` over a Shared buffer at offset 0, rows 256 bytes apart, 64 x 4 BGRA8 (64
+x 1 for a 1D type, 64 x 64 for a cube), 2 deep for 3D, 2 long for an array, 4 samples for a
+multisample type, by the public form, the linear SPI (`newLinearTextureWithDescriptor:offset:
+bytesPerRow:bytesPerImage:`) or the tiled SPI (descriptor Managed); and `oracle_storage DEVICE
+linarray MODE`, a 2D array of 3 slices by the public form or the linear SPI, written and read
+slice by slice by the CPU and the GPU. "Asserts" means Metal's validation ends the process with
+these words in `_mtlValidateStrideTextureParameters`, each a line after "Texture Descriptor
+Validation".
+
+| form, type | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| public: 1D, 1D array, 2D array, cube, cube array | asserts "Linear texture: must be of type MTLTextureType2D, textureType (T) disallowed" | the same | the same |
+| public: 3D, 2 deep | asserts "Linear texture: must have depth == 1, depth (2) disallowed", then the type's line | asserts "Buffer texture: cannot support depth > 1." (`validateTextureDescriptor`) | as the AMD |
+| public: 2D multisample, 2D multisample array | the descriptor's validation asserts first: no multisample texture in Shared or Managed storage on this device | the same | asserts the type's line |
+| linear SPI: 1D, 1D array, cube, cube array | asserts "Linear texture: must be of type MTLTextureType2D or linear MTLTextureType2DArray, textureType (T) disallowed" | the same | the same |
+| linear SPI: 2D array | asserts "2D linear texture array is not supported." | the same | made: slice s lies s times the rows' bytes rounded up to 128 from the first, whatever `bytesPerImage` (0, the rows' bytes or 1024), for the CPU's copies and the GPU's reads alike |
+| linear SPI: 3D, 2 deep; multisample | as by the public form, the SPI's type line | the same | the same |
+| tiled SPI: 1D, 1D array, 2D array, cube, cube array, 3D | made | the same | the buffer does not answer the selector |
+| a texture buffer, 4 rows high, by any form | the descriptor's validation asserts first: 4 rows past its 1 | the same | the same, by the forms it has |
+
+*(class 3 for the type lines the three share; class 2 for the rest.)* Our stack: the public form
+and the linear SPI end the process at each type above they do not make, with the words the three
+share or, at a 3D or multisample type, the M3's, sending nothing, since the host's platform ends
+the host's process at a texture over a buffer it does not make; a texture buffer by the public
+form answers nil, logged once (not measured). The tiled SPI answers nil for every type but 2D,
+logged once, as it does for more than one level: the host does not carry the others. The linear
+SPI makes a 2D array as the M3 does *(class 2)*, its slices where the M3 lays them
+(`rgfxBufferSlicePitch`), and a view of more than one of its slices answers nil, which Metal
+asserts at on the M3 Max and an M4 (`sliceRange.length == 1`, measured by metal2vulkan).
+
 ## Q12: texture descriptors Metal's validation ends the process at
 
 Probe: a scratch probe, not kept, one case a process, with `MTL_DEBUG_LAYER` unset: a 64 x 64

@@ -1511,9 +1511,12 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 
 // The bytes from one slice of a texture over a buffer to the next in the buffer: its rows'
 // bytes, rounded up to 128 bytes. The host's linear form lays out a 2D array's slices so, whatever
-// the bytesPerImage asked, as Metal's does (measured on the M3 Max and an M4 under macOS 27 by
-// metal2vulkan, whose runtime lays them out the same: read from its linear_plan.rs). Every
-// other texture over a buffer has one slice.
+// the bytesPerImage asked, as Metal's does (measured on the M3 Max under macOS 27.0.1,
+// `oracle_storage Apple linarray spi`: the CPU's replaceRegion: and getBytes: and the GPU's
+// reads put slices of 48 bytes of rows 128 bytes apart, and of 768 bytes 768 apart, with a
+// bytesPerImage of 0, the rows' bytes or 1024; metal2vulkan's runtime lays them out the same).
+// The AMD 5300M and the Intel 630 end the process at such an array (dgpu-oracle.md, Q11). Every
+// other texture over a buffer the bundle makes has one slice.
 - (uint64_t)rgfxBufferSlicePitch
 {
 	const RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
