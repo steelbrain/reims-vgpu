@@ -1797,6 +1797,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 });
                 self.queue_ended(queue, handle);
             }
+            // A buffer answered on a doorbell's thread and never begun gives back its turn and
+            // its ticket in the commit order here, not with its queue's entry where the close
+            // worker lets go of the objects: other contexts' commits marked after the ticket wait
+            // for nothing of the closed context's. Only entries no view holds were handed back,
+            // so no begin can still take such an answer ([`tables`]).
+            for r in &removed {
+                if let Some(counts) = &r.entry().queue {
+                    drop(counts.answered.lock().take());
+                }
+            }
             objects = removed;
         }
         self.forget_context_surfaces(context);

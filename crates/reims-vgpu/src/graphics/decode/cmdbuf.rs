@@ -3580,9 +3580,9 @@ mod tests {
     }
 
     /// What an answer on a doorbell's thread took is let go of where the buffer is never begun
-    /// after it: with its queue's entry at the decoder's reset, its ticket given back, so a buffer
-    /// begun after the reset is not held up by it; and, where the answer outlived a reset of the
-    /// device, at the buffer's begin, which takes it not.
+    /// after it: at the decoder's reset, which closes its context, its ticket given back, so a
+    /// buffer begun after the reset is not held up by it; and, where the answer outlived a reset
+    /// of the device, at the buffer's begin, which takes it not.
     #[test]
     fn a_reset_between_an_answer_and_its_begin_lets_the_answer_go() {
         let (_p, mut dec, posted) = posting(false);
@@ -3591,7 +3591,7 @@ mod tests {
         assert_eq!(sequencer.out(), 1, "the answer's ticket");
         dec.end_message();
         dec.reset();
-        assert_eq!(sequencer.out(), 0, "let go of with the queue's entry");
+        assert_eq!(sequencer.out(), 0, "given back at the reset");
 
         let (p, mut dec, posted) = posting(false);
         let device = p.device();
@@ -3613,6 +3613,31 @@ mod tests {
                 .unwrap(),
             Ok(())
         );
+        assert_eq!(sequencer.out(), 0);
+    }
+
+    /// A buffer answered on a doorbell's thread whose context closes before its begin gives its
+    /// ticket in the commit order back as the close takes the context's tables out
+    /// ([`GraphicsDecoder::close_tables`]), before the close worker lets go of its objects
+    /// (`Closed::let_go`): another context's commit marked after the ticket waits for
+    /// nothing of the closed context's.
+    #[test]
+    fn a_close_gives_an_unbegun_answer_s_ticket_back_as_it_takes_the_tables() {
+        let (_p, mut dec, posted) = posting(false);
+        let sequencer = Arc::clone(&dec.shared.sequencer);
+        assert!(answer(&dec, &asking(192, 122), &posted, true));
+        assert_eq!(sequencer.out(), 1, "the answer's ticket");
+        let after = sequencer.mark();
+        dec.end_message();
+        let (dropped, closed) = dec.close_tables(0);
+        assert!(dropped > 0, "the context's objects, its queue among them");
+        assert_eq!(
+            sequencer.out(),
+            0,
+            "given back before its objects are let go of"
+        );
+        sequencer.wait_for(after);
+        closed.let_go();
         assert_eq!(sequencer.out(), 0);
     }
 

@@ -64,8 +64,9 @@ pub(crate) struct QueueCounts {
     /// whose buffers are carried out whole where they are taken (the decoder's own tests).
     pub(crate) lane: Option<Arc<Lane>>,
     /// The command buffer at the head of its ring answered on a doorbell's thread, until its
-    /// begin takes what the answer took for it ([`super::cmdbuf::Answered`]); let go of with the
-    /// queue's entry where it is never begun.
+    /// begin takes what the answer took for it ([`super::cmdbuf::Answered`]); where it is never
+    /// begun, let go of as its context's close takes the entry out
+    /// ([`super::GraphicsDecoder::close_tables`]), else with the queue's entry.
     pub(crate) answered: Mutex<Option<super::cmdbuf::Answered>>,
 }
 
