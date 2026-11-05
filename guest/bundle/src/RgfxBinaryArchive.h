@@ -35,6 +35,8 @@ extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
                                                       error:(NSError *_Nullable __autoreleasing *_Nullable)error;
 @end
 
+@class RgfxFunction;
+
 @interface RgfxBinaryArchive : NSObject <MTLBinaryArchive>
 
 /// The archive `descriptor` names on `device`, whose `architecture.name` is `architecture`: empty
@@ -65,6 +67,23 @@ extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
 /// Whether one of `archives` holds the stitched library of `descriptor`, found as Metal's archive
 /// finds one (RgfxStitchedKey).
 + (BOOL)rgfxStitched:(MTLStitchedLibraryDescriptor *)descriptor heldBy:(nullable NSArray *)archives;
+
+/// Keeps `fn`, added alone with `options` (addFunctionWithDescriptor:library:error:'s function),
+/// which rgfxMissOfFunction looks up.
+- (void)rgfxAddFunction:(RgfxFunction *)fn options:(MTLFunctionOptions)options;
+
+/// Metal's miss of `fn`, made by newFunctionWithDescriptor:error: with `options` and `archives`, as
+/// the AMD 5300M and the Intel 630 under macOS 26.7.1 answer it (oracle_bundle failmiss and
+/// failmiss2), nil where it is made: with MTLFunctionOptionFailOnBinaryArchiveMiss and an archive
+/// named, a kernel none of `archives` holds, by its constants' values too, answers
+/// MTLLibraryErrorFunctionNotFound; a visible function asked with
+/// MTLFunctionOptionCompileToBinary too, that none holds added with it,
+/// MTLLibraryErrorCompileFailure; any other function, and a visible one asked without it, is made.
+/// (A vertex and a fragment function added either way are made; neither x86 Mac was asked one
+/// absent from the archive.)
++ (nullable NSError *)rgfxMissOfFunction:(nullable RgfxFunction *)fn
+                                 options:(MTLFunctionOptions)options
+                                archives:(nullable NSArray *)archives;
 
 /// Metal's miss of a render pipeline of `descriptor` created with
 /// MTLPipelineOptionFailOnBinaryArchiveMiss: nil where its `binaryArchives` hold the key of each

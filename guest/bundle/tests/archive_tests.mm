@@ -376,6 +376,56 @@ void test_archive_keys_and_options()
 	}
 }
 
+// A function made with MTLFunctionOptionFailOnBinaryArchiveMiss and an archive misses as on the x86
+// Macs (oracle_bundle failmiss and failmiss2, AMD 5300M and Intel 630, macOS 26.7.1): a kernel the
+// archives do not hold by its name and constants' values, however it was added; a visible function
+// asked with MTLFunctionOptionCompileToBinary that was not added with it; no other function.
+void test_function_misses()
+{
+	NSError *e = nil;
+	RgfxBinaryArchive *a = archive(nil, @"arch_a", &e);
+	RgfxBinaryArchive *empty = archive(nil, @"arch_a", &e);
+	auto typed = [](RgfxFunction *f, MTLFunctionType type) {
+		[f rgfxSetFunctionType:type];
+		return f;
+	};
+	auto miss = [](RgfxFunction *f, MTLFunctionOptions options, NSArray *archives) {
+		return [RgfxBinaryArchive rgfxMissOfFunction:f options:options archives:archives];
+	};
+	RgfxFunction *kernel = typed(function(@"div_kernel", 2), MTLFunctionTypeKernel);
+	RgfxFunction *other = typed(function(@"div_kernel", 3), MTLFunctionTypeKernel);
+	RgfxFunction *visible = typed(function(@"div_visible"), MTLFunctionTypeVisible);
+	RgfxFunction *vertex = typed(function(@"div_vertex"), MTLFunctionTypeVertex);
+	[a rgfxAddFunction:kernel options:MTLFunctionOptionCompileToBinary];
+	[a rgfxAddFunction:visible options:MTLFunctionOptionNone];
+	const MTLFunctionOptions fail = MTLFunctionOptionFailOnBinaryArchiveMiss;
+	const MTLFunctionOptions binary = fail | MTLFunctionOptionCompileToBinary;
+
+	CHECK(miss(kernel, fail, @[ a ]) == nil && miss(kernel, binary, @[ a ]) == nil);
+	CHECK(miss(kernel, fail, @[ empty, a ]) == nil);
+	NSError *m = miss(other, fail, @[ a ]);
+	CHECK([m.domain isEqualToString:MTLLibraryErrorDomain] &&
+	      m.code == MTLLibraryErrorFunctionNotFound &&
+	      [m.localizedDescription
+	          isEqualToString:@"Failed to find specialized function \"div_kernel\" in binary archive"]);
+	CHECK(miss(kernel, binary, @[ empty ]).code == MTLLibraryErrorFunctionNotFound);
+	// No archive named, or no failing on a miss: made.
+	CHECK(miss(other, fail, @[]) == nil && miss(other, fail, nil) == nil);
+	CHECK(miss(other, MTLFunctionOptionCompileToBinary, @[ a ]) == nil);
+
+	CHECK(miss(visible, fail, @[ empty ]) == nil);
+	m = miss(visible, binary, @[ a ]);
+	CHECK([m.domain isEqualToString:MTLLibraryErrorDomain] &&
+	      m.code == MTLLibraryErrorCompileFailure &&
+	      [m.localizedDescription isEqualToString:@"Compilation failed: \n\nFailed to find compiled "
+	                                              @"function in binary archives."]);
+	CHECK(a.keys.count == 2);
+	[a rgfxAddFunction:visible options:MTLFunctionOptionCompileToBinary];
+	CHECK(a.keys.count == 3 && miss(visible, binary, @[ a ]) == nil);
+
+	CHECK(miss(vertex, binary, @[ empty ]) == nil && miss(nil, binary, @[ empty ]) == nil);
+}
+
 } // namespace
 
 void rgfxArchiveTests()
@@ -395,5 +445,6 @@ void rgfxArchiveTests()
 	test_archive_lookups();
 	test_archive_files();
 	test_archive_keys_and_options();
+	test_function_misses();
 	[[NSFileManager defaultManager] removeItemAtPath:g_dir error:nil];
 }

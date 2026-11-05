@@ -790,6 +790,14 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 	id<MTLFunction> fn = [self newFunctionWithName:descriptor.name
 	                                constantValues:descriptor.constantValues
 	                                         error:error];
+	NSError *miss = [RgfxBinaryArchive rgfxMissOfFunction:(RgfxFunction *)fn
+	                                              options:descriptor.options
+	                                             archives:descriptor.binaryArchives];
+	if (miss != nil) {
+		if (error)
+			*error = miss;
+		return nil;
+	}
 	[(RgfxFunction *)fn rgfxSetOptions:descriptor.options];
 	if (descriptor.specializedName.length != 0)
 		[(RgfxFunction *)fn rgfxSetSpecializedName:descriptor.specializedName];

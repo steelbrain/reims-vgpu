@@ -3250,6 +3250,25 @@ void test_function_patch_answers()
 	                                                device:nil
 	                                            serializer:&fx.ser];
 	CHECK(bare.patchType == MTLPatchTypeNone && bare.patchControlPointCount == -1);
+	// A kernel made to fail on an archive miss, from an archive that does not hold it: nil, with
+	// Metal's error (RgfxBinaryArchive's rgfxMissOfFunction); made once the archive holds it.
+	RgfxBinaryArchive *archive =
+	    [RgfxBinaryArchive archiveWithDescriptor:[MTLBinaryArchiveDescriptor new]
+	                                      device:nil
+	                                architecture:@"arch_a"
+	                                       error:nil];
+	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+	fd.name = @"plain_kernel";
+	fd.options = MTLFunctionOptionFailOnBinaryArchiveMiss;
+	fd.binaryArchives = @[ archive ];
+	NSError *err = nil;
+	CHECK([ours newFunctionWithDescriptor:fd error:&err] == nil &&
+	      err.code == MTLLibraryErrorFunctionNotFound);
+	MTLFunctionDescriptor *added = [MTLFunctionDescriptor functionDescriptor];
+	added.name = @"plain_kernel";
+	CHECK([archive addFunctionWithDescriptor:added library:ours error:&err]);
+	err = nil;
+	CHECK([ours newFunctionWithDescriptor:fd error:&err] != nil && err == nil);
 	std::vector<uint8_t> drain;
 	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {

@@ -280,6 +280,23 @@ RgfxArchiveEntry recordedKey(uint8_t kind, RgfxFunction *fn, const std::vector<u
 	return k.finish();
 }
 
+// The key of a function added alone (addFunctionWithDescriptor:library:error:), which a function
+// made with MTLFunctionOptionFailOnBinaryArchiveMiss looks up: recordedKey's, and, for a visible
+// function added with MTLFunctionOptionCompileToBinary, that it was, as a visible function added
+// without it is not found by one made with it, where a kernel is found however it was added
+// (measured on the AMD 5300M and the Intel 630 under macOS 26.7.1: oracle_bundle failmiss2).
+RgfxArchiveEntry functionKey(RgfxFunction *fn, MTLFunctionOptions options)
+{
+	RgfxArchiveKey k(kRgfxArchiveFunction);
+	addFunction(k, fn);
+	k.u32(0); // recordedKey's formats, none
+	k.u64(0); // and sample count
+	if (fn.functionType == MTLFunctionTypeVisible &&
+	    (options & MTLFunctionOptionCompileToBinary) != 0)
+		k.u32(1);
+	return k.finish();
+}
+
 template <typename Attachments> std::vector<uint64_t> formatsOf(Attachments *colors)
 {
 	std::vector<uint64_t> formats;
@@ -564,16 +581,24 @@ RGFX_LOG_UNRECOGNIZED
 			                       @"binary archive: the library is not one of this device's");
 		return NO;
 	}
-	// The library answers a name it lacks as Metal's does (MTLLibraryErrorFunctionNotFound).
+	// The library answers a name it lacks as Metal's does (MTLLibraryErrorFunctionNotFound). The
+	// function is made as it is to be kept, not looked up in the archives the descriptor names.
+	MTLFunctionDescriptor *made = [descriptor copy];
+	made.binaryArchives = nil;
 	NSError *err = nil;
-	id<MTLFunction> fn = [library newFunctionWithDescriptor:descriptor error:&err];
+	id<MTLFunction> fn = [library newFunctionWithDescriptor:made error:&err];
 	if (fn == nil) {
 		if (error)
 			*error = err;
 		return NO;
 	}
-	[self rgfxAdd:recordedKey(kRgfxArchiveFunction, (RgfxFunction *)fn, {}, 0)];
+	[self rgfxAddFunction:(RgfxFunction *)fn options:descriptor.options];
 	return YES;
+}
+
+- (void)rgfxAddFunction:(RgfxFunction *)fn options:(MTLFunctionOptions)options
+{
+	[self rgfxAdd:functionKey(fn, options)];
 }
 
 // Metal's archive adds a stitched library by stitching it on its device into the archive
@@ -688,6 +713,42 @@ static BOOL rgfxAnyHolds(NSArray *archives, const RgfxArchiveEntry &entry)
 	if (!rgfxAnyHolds(archives, vertex))
 		return miss(descriptor.vertexFunction, "render", vertex);
 	return nil;
+}
+
++ (NSError *)rgfxMissOfFunction:(RgfxFunction *)fn
+                         options:(MTLFunctionOptions)options
+                        archives:(NSArray *)archives
+{
+	if ((options & MTLFunctionOptionFailOnBinaryArchiveMiss) == 0 || archives.count == 0 ||
+	    fn == nil)
+		return nil;
+	switch (fn.functionType) {
+	case MTLFunctionTypeKernel:
+		if (rgfxAnyHolds(archives, functionKey(fn, MTLFunctionOptionNone)))
+			return nil;
+		return [NSError
+		    errorWithDomain:MTLLibraryErrorDomain
+		               code:MTLLibraryErrorFunctionNotFound
+		           userInfo:@{
+			           NSLocalizedDescriptionKey : [NSString
+			               stringWithFormat:@"Failed to find specialized function \"%@\" in binary "
+			                                @"archive",
+			                                fn.name]
+		           }];
+	case MTLFunctionTypeVisible:
+		if ((options & MTLFunctionOptionCompileToBinary) == 0 ||
+		    rgfxAnyHolds(archives, functionKey(fn, MTLFunctionOptionCompileToBinary)))
+			return nil;
+		return [NSError errorWithDomain:MTLLibraryErrorDomain
+		                           code:MTLLibraryErrorCompileFailure
+		                       userInfo:@{
+			                       NSLocalizedDescriptionKey :
+			                           @"Compilation failed: \n\nFailed to find compiled function in "
+			                           @"binary archives."
+		                       }];
+	default:
+		return nil;
+	}
 }
 
 + (NSError *)rgfxMissOfComputePipeline:(MTLComputePipelineDescriptor *)descriptor
