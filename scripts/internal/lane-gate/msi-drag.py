@@ -26,7 +26,8 @@ columns only across runs of one rule: before it, rule 1, a thread born or gone i
 counted nothing). Mission Control's numbers are over its animations: each
 from the first display update after a Control-Up to its last within 0.8 s (anim_ms their median
 length, start_ms the median wait from the key to the first update, animated those with two
-updates or more); its CPU over the whole case.
+updates or more, short_gap_pct the share of the gaps inside them under SHORT_GAP: a display held to
+60 Hz has almost none); its CPU over the whole case.
 """
 import datetime
 import json
@@ -47,6 +48,9 @@ RATE = 120  # pointer moves a second
 # How qemu_cpu and gfx_cpu are counted (Window): 2 since QEMU's own utime+stime and each graphics
 # thread's last reading; 1 before, each thread's ticks between the window's two looks.
 CPU_RULE = 2
+# A gap inside a Mission Control animation shorter than this is an update one 120 Hz refresh after
+# the one before (8.33 ms); a 60 Hz lock gives 16.7 ms gaps (mission-cadence.py's measure).
+SHORT_GAP = 0.0125
 RADIUS = 150  # points: the path spans 2 RADIUS across and 1.2 RADIUS down
 SOPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o",
          "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no", "-o", "ConnectTimeout=5",
@@ -514,7 +518,8 @@ def mission(q):
     res.update(composites_s=round(frames / span, 2) if span else 0,
                gap_p99_ms=round(1000 * gaps[min(len(gaps) - 1, int(math.ceil(0.99 * len(gaps))) - 1)], 1),
                gap_max_ms=round(1000 * gaps[-1], 1), anim_ms=round(1000 * lengths[len(lengths) // 2], 1),
-               start_ms=round(1000 * starts[len(starts) // 2], 1))
+               start_ms=round(1000 * starts[len(starts) // 2], 1),
+               short_gap_pct=round(100 * sum(1 for g in gaps if g < SHORT_GAP) / len(gaps), 1))
     return res
 
 
