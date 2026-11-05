@@ -41,6 +41,10 @@
 //    cached surface's block in place, naming its pages at the first CPU lock that needs them
 //    (RgfxSurfaceBlocks.hpp), within the budget the host gives in DEFERRED_BUDGET_LO and _HI,
 //    which needs nothing of the bundle;
+//  - HOST_TIME (bit 20): at each VBLANK the framebuffer reads the host's clock (HOST_TIME_HI, _LO
+//    and _HI again, LO's read between two of mach_absolute_time) and maps the refresh's stamp by
+//    the reading whose round trip bounds the two clocks' offset closest (RgfxVblankClock.hpp),
+//    which needs nothing of the bundle;
 //  - MANAGED_TEXTURE_SLABS (bit 21): the bundle lays its Managed textures' CPU copies in its
 //    buffers' slabs, its own pages among them, and names a slab's buffer as each copy, which needs
 //    nothing of the kext;
