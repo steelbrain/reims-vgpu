@@ -3095,6 +3095,87 @@ fn a_queue_s_buffers_are_walked_at_once_and_committed_in_order() {
     }
 }
 
+/// What a drain of small command buffers costs the device's own threads, from the first one's
+/// doorbell write to the last one's `CB_COMPLETE`, on the fake platform, whose commits and
+/// completions cost next to nothing, the queue's thread asleep before each drain: a lone buffer,
+/// and 8 committed back to back and waited for, as cbwait's drain8 commits them, each ringing its
+/// own doorbell as the bundle's commit does. Prints the median, 90th and 99th percentiles in
+/// microseconds, and how many threads the last drain's commits ran on: a measurement, run by hand
+/// (`--run-ignored only --no-capture`, in a release build).
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn a_drain_s_first_doorbell_to_its_last_cb_complete() {
+    use std::time::Instant;
+
+    const ROUNDS: usize = 1000;
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let idle = || {
+        for _ in 0..2000 {
+            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
+            let idle = unsafe {
+                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
+                    .load(Ordering::SeqCst)
+            };
+            if idle == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the queue's thread did not go idle");
+    };
+    let mut cb = 1000;
+    for buffers in [1, 8] {
+        let mut us = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            idle();
+            // A pause as the guest's between frames, so the device's threads sleep.
+            std::thread::sleep(Duration::from_micros(500));
+            ring.arm();
+            let start = Instant::now();
+            for _ in 0..buffers {
+                cb += 1;
+                ring.send(&device, sampler_command_buffer(obj(1, 1), cb, obj(1, 4)));
+            }
+            let mut done = 0;
+            while done < buffers {
+                platform.world().complete_all(CompleteOn::Caller);
+                while ring.has_event() {
+                    let bytes = ring.event().unwrap();
+                    let record = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
+                    assert_eq!(record.header.r#type, RGFX_EVT_CB_COMPLETE);
+                    assert_eq!(record.status, RGFX_CB_OK);
+                    done += 1;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "the drain stalled"
+                );
+                std::hint::spin_loop();
+            }
+            us.push(start.elapsed().as_secs_f64() * 1e6);
+            ring.scheduled.clear();
+        }
+        us.sort_by(f64::total_cmp);
+        let n = us.len();
+        let calls = platform.call_log().calls_to("commit");
+        let threads: std::collections::BTreeSet<_> = (calls.iter().rev().take(buffers))
+            .filter_map(|c| c.thread.clone())
+            .collect();
+        println!(
+            "drain of {buffers}: p50 {:.1} p90 {:.1} p99 {:.1} us, {:.1} us a buffer at p50; \
+             the last drain committed on {} thread(s) {threads:?}",
+            us[n / 2],
+            us[n * 9 / 10],
+            us[n * 99 / 100],
+            us[n / 2] / buffers as f64,
+            threads.len(),
+        );
+    }
+}
+
 /// A command buffer that asks for its `CB_SUBMITTED`, sent behind one of its queue that waits for
 /// an event and is still being walked, is answered at its scheduling, after that one's, not at its
 /// take: the waiting one holds its queue from its begin, as it would from its commit had it been
