@@ -36,7 +36,8 @@
 # ssh); the job makes every change there. --stage NAME=DIR[@TIP] adds the probe in DIR on the lane host
 # to the round as NAME, copied in by the job (its tip file TIP where given), rather than from the
 # queue; --stage-local NAME=DIR[@TIP] does the same for a probe in DIR on this machine, which the
-# round's commit carries (lg/probes/NAME; a binary of our own built for the round goes in DIR);
+# round's commit carries (lg/probes/NAME; a binary of our own built for the round goes in DIR; a
+# file DIR/.base naming a probe directory on the lane host lays DIR's files over that one's);
 # --appload runs the gate's app load (msi-appload.sh, every app and 7 Safari pages) once the
 # desktop is up, before the probes, which then run on that busy desktop (appload.txt in the
 # round's directory); --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page

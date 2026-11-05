@@ -23,6 +23,14 @@ for s in ${STAGES:-}; do
   [[ $src == @WS/* ]] && src=$WS/${src#@WS/}  # a probe the round's commit carries (--stage-local)
   rm -rf "$RD/probes/.$n.tmp" "$RD/probes/$n"
   cp -a "$src" "$RD/probes/.$n.tmp" || { echo "msi-round: no probe at $src" >&2; exit 2; }
+  # A local probe over one on this host (--stage-local DIR whose .base names it): that one, with
+  # DIR's files over it.
+  if [[ -f $RD/probes/.$n.tmp/.base ]]; then
+    b=$(cat "$RD/probes/.$n.tmp/.base")
+    rm -rf "$RD/probes/.$n.tmp"
+    cp -a "$b" "$RD/probes/.$n.tmp" || { echo "msi-round: no base probe at $b" >&2; exit 2; }
+    cp -a "$src/." "$RD/probes/.$n.tmp/" && rm -f "$RD/probes/.$n.tmp/.base"
+  fi
   [[ -z $tip ]] || echo "$tip" > "$RD/probes/.$n.tmp/tip"
   mv "$RD/probes/.$n.tmp" "$RD/probes/$n"
   staged+="$n "
