@@ -17,7 +17,7 @@ set -uo pipefail
 qpid=$1 D=$2
 here=$(cd "$(dirname "$0")" && pwd)
 log() { echo "$(date +%T.%N) $*" >> "$D/hook-c12.log"; }
-. <(grep -E '^(GUEST_USER|GUEST_PASS|PROBE_RESULTS|RGK_RUN|TAG)=' "$D/boot.env")
+eval "$(grep -E '^(GUEST_USER|GUEST_PASS|PROBE_RESULTS|RGK_RUN|TAG)=' "$D/boot.env")"
 B=$RGK_RUN/boots/$TAG
 m=$D/.hook-c12-start; touch "$m"
 SOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password
