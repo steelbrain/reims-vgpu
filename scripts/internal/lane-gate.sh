@@ -531,6 +531,7 @@ do_ship() {
   fi
   rm -rf "$qb"
   m2v=$(grep -m1 -o -E '^metal2vulkan-runtime = .*rev = "[0-9a-f]+"' "$TREE/Cargo.toml" | grep -o -E '[0-9a-f]{40}' || echo unknown)
+  echo "$m2v" > "$RUN/m2v"
   # The signed bundle RgfxGate carries, so that a fixer can build an RgfxGate of exactly the tip's.
   cdhash=$(codesign -dvvv "$TREE/guest/bundle/build/package/reims-graphics.bundle" 2>&1 | sed -n 's/^CDHash=//p')
   echo "$cdhash" > "$ART/cdhash"
@@ -585,8 +586,13 @@ host_step() {
 # The host build, the image and publishing: one job on the lane host with no GPU, its workspace
 # held for the boots.
 do_host() {
-  local rc=0 ws
-  pl_run host --timeout "${HOST_TIMEOUT:-30m}" --ram 40 --priority "$PL_PRIO" --on "node=$PL_NODE" --hold 8h --label lane-gate=build \
+  local rc=0 ws carry=() m2v
+  # The metal2vulkan pin, carried to the lane host's mirror (M2V_REPO, the local checkout, where
+  # it has the commit): a pin the public repository has no tag of yet builds there too.
+  m2v=$(cat "$RUN/m2v" 2> /dev/null || true)
+  local mr=${M2V_REPO:-$HOME/Projects/steelbrain/metal2vulkan}
+  [[ $m2v =~ ^[0-9a-f]{40}$ ]] && git -C "$mr" cat-file -e "$m2v^{commit}" 2> /dev/null && carry=(--carry "$mr@$m2v")
+  pl_run host --timeout "${HOST_TIMEOUT:-30m}" --ram 40 --priority "$PL_PRIO" --on "node=$PL_NODE" --hold 8h --label lane-gate=build ${carry[@]+"${carry[@]}"} \
     -- bash lg/bin/msi-job.sh build || rc=$?
   ws=$(pl_workspace "$(cat "$RUN/job-host")") || { echo "no workspace for job $(cat "$RUN/job-host")"; return 1; }
   echo "$ws" > "$RUN/workspace"

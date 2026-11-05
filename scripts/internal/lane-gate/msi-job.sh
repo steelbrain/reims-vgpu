@@ -95,6 +95,16 @@ do_stage() {  # the candidate's tree, and vendor/qemu's source where the host ha
   test -f "$Q/src/configure"
 }
 do_msi_build() {
+  # The metal2vulkan pin from potluck's mirror (lane-gate.sh carries it) into cargo's git
+  # databases, so cargo finds the commit without the public repository. The mirror is only read.
+  local db
+  if [[ -n ${POTLUCK_MIRROR_metal2vulkan:-} && $M2V =~ ^[0-9a-f]{40}$ ]]; then
+    for db in "$HOME"/.cargo/git/db/metal2vulkan-*; do
+      [[ -d $db ]] || continue
+      git -C "$db" fetch -q "$POTLUCK_MIRROR_metal2vulkan" "$M2V:refs/lane-gate/m2v" &&
+        git -C "$db" cat-file -e "$M2V^{commit}" && echo "metal2vulkan $M2V from the mirror into $db"
+    done
+  fi
   bash "$MR/bin/msi-build.sh" "$MSI_GATE" "$MSI_GATE/tree" "$MSI_GATE/stage" "$QC" "$MSI_QEMU_SUBPROJECTS" | tee "$OUT/msi-build.txt"
   grep -q MSI_BUILD_OK "$OUT/msi-build.txt"
   local q r
