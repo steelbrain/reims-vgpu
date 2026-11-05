@@ -15,6 +15,9 @@
 //! - a binding of one binds nil (a pipeline state is not set at all) and marks its slot
 //!   ([`Marks`]): the encoder's draws and dispatches are dropped while a slot of it is marked, and
 //!   a binding of an object the host holds, or of nil, at that slot ends the mark;
+//! - an indirect command buffer's CPU encode of one is dropped and its command reset, and that
+//!   command's later draws and dispatches are dropped until the guest resets it
+//!   ([`super::icb::Dropped`]);
 //! - an entry of a use list (`useResources:`, `useHeaps:`, a memory barrier's) is nil;
 //! - a render pass with an attachment of one, and a video encoder of one, is skipped whole;
 //! - a wait for an event of one is dropped, and a signal of a shared event of one still reaches

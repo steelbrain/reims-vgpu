@@ -12,6 +12,12 @@
 //! (the Vulkan platform ends the paravirt process where its runtime refuses a setter) is skipped
 //! alone, and the message names how many were in one warning. A record whose framing is broken
 //! ends the message there.
+//!
+//! A record that names an object whose posted create the host refused ([`super::refused`]) is
+//! dropped, and so is its command's draw or dispatch, as an encoder's draws and dispatches are
+//! dropped while a slot of it holds such an object: the command is reset, and its later draws
+//! and dispatches are dropped until the guest resets it ([`Dropped`]). Nothing else of the
+//! buffer changes, and the command buffers that execute it go on.
 
 use reims_graphics::icb::*;
 use reims_graphics::wire::{
@@ -33,10 +39,14 @@ use reims_vgpu_core::platform::icb::{
 };
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::platform::values::IcbDesc;
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::{DecodeError, Entry, GraphicsDecoder, ObjHandle, op_fault, read, refusing};
+use super::{DecodeError, Entry, GraphicsDecoder, ObjHandle, op_fault, read, refused, refusing};
 
 /// The platform's descriptor of an `ICB_CREATE`: every field the guest's descriptor answered.
 pub(super) fn icb_desc(m: &RgfxIcbCreate) -> IcbDesc {
@@ -111,6 +121,79 @@ enum Command<P: Platform> {
     Compute(u64, P::IndirectComputeCommand),
 }
 
+/// Whether `op` is a draw or a dispatch: what a command whose encode named a refused object
+/// does not do ([`Dropped`]).
+fn acts(op: u16) -> bool {
+    (RGFX_ICB_OP_DRAW..=RGFX_ICB_OP_DRAW_INDEXED_PATCHES).contains(&op)
+        || op == RGFX_ICB_OP_DISPATCH_THREADGROUPS
+        || op == RGFX_ICB_OP_DISPATCH_THREADS
+}
+
+/// Whether `op` resets its one command.
+fn resets(op: u16) -> bool {
+    op == RGFX_ICB_OP_RENDER_RESET || op == RGFX_ICB_OP_COMPUTE_RESET
+}
+
+/// The commands of an indirect command buffer whose draws and dispatches are dropped: a CPU
+/// encode of each named an object whose posted create the host refused ([`super::refused`]),
+/// which the host holds nothing of to bind. That encode is dropped and the command reset, so it
+/// draws or dispatches nothing, as an encoder's draws and dispatches are dropped while a slot of it
+/// holds such an object; its later draws and dispatches are dropped too, while its other encodes
+/// are carried out, until the guest resets the command (a reset record or slot, a reset of a
+/// range, a blit's `resetCommandsInBuffer:`) or copies another command over it
+/// (`copyIndirectCommandBuffer:`). A command the GPU encodes is not seen here. Empty in every run
+/// that refuses nothing, where each record costs one load.
+#[derive(Debug, Default)]
+pub(crate) struct Dropped {
+    /// How many commands `commands` holds, read with no lock.
+    count: AtomicUsize,
+    commands: Mutex<BTreeSet<u64>>,
+}
+
+impl Dropped {
+    /// Whether command `index`'s draws and dispatches are dropped.
+    fn holds(&self, index: u64) -> bool {
+        self.count.load(Ordering::Acquire) != 0 && self.commands.lock().contains(&index)
+    }
+
+    /// Command `index`'s draws and dispatches are dropped.
+    fn mark(&self, index: u64) {
+        let mut commands = self.commands.lock();
+        commands.insert(index);
+        self.count.store(commands.len(), Ordering::Release);
+    }
+
+    /// The commands `len` from `start`, the guest reset them, are carried out again.
+    pub(crate) fn clear(&self, start: u64, len: u64) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        let mut commands = self.commands.lock();
+        commands.retain(|&i| i < start || i >= end);
+        self.count.store(commands.len(), Ordering::Release);
+    }
+
+    /// The commands `len` from `start` that are dropped.
+    fn of(&self, start: u64, len: u64) -> Vec<u64> {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let end = start.saturating_add(len);
+        self.commands.lock().range(start..end).copied().collect()
+    }
+
+    /// `len` commands of `source` from `from` are copied over `self`'s from `to`: each copied
+    /// command is dropped where its source is, and carried out where it is not.
+    pub(crate) fn copied(&self, source: &Dropped, from: u64, to: u64, len: u64) {
+        let dropped = source.of(from, len);
+        self.clear(to, len);
+        for index in dropped {
+            self.mark(to.saturating_add(index - from));
+        }
+    }
+}
+
 impl<P: Platform> GraphicsDecoder<P> {
     /// An `ICB_CREATE`'s answer (`ICB_STATE`): the buffer made, stored under the message's id
     /// before the answer, so an `ICB_WRITE` or a command buffer of its process, which names it
@@ -170,13 +253,49 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(Err(DecodeError::Refused));
         };
         let id = icb.gpu_resource_id();
-        let entry = Entry::of(ObjHandle::Icb(icb));
+        let mut entry = Entry::of(ObjHandle::Icb(icb));
+        entry.icb_dropped = Some(Box::default());
         if late {
             self.store_late(m.obj_id, entry);
         } else {
             self.store(m.obj_id, entry);
         }
         Ok(Ok(id))
+    }
+
+    /// The indirect command buffer `obj_id` names, where it is one the current context may name,
+    /// and its dropped commands ([`Dropped`]).
+    fn icb_of(&self, obj_id: u64) -> Option<(&P::Icb, &Dropped)> {
+        let entry = self.entry(obj_id)?;
+        match (&entry.handle, entry.icb_dropped.as_deref()) {
+            (ObjHandle::Icb(icb), Some(dropped)) => Some((icb, dropped)),
+            _ => None,
+        }
+    }
+
+    /// A blit's `resetCommandsInBuffer:` of `len` commands from `start` of the buffer `obj_id`
+    /// names, as its command buffer is decoded: the guest's later encodes of them are carried out
+    /// ([`Dropped`]).
+    pub(super) fn icb_commands_reset(&self, obj_id: u64, start: u64, len: u64) {
+        if let Some((_, dropped)) = self.icb_of(obj_id) {
+            dropped.clear(start, len);
+        }
+    }
+
+    /// A blit's `copyIndirectCommandBuffer:` of `len` commands from `from` of `source` to `to` of
+    /// `destination`, as its command buffer is decoded: each copied command is dropped where its
+    /// source is ([`Dropped::copied`]).
+    pub(super) fn icb_commands_copied(
+        &self,
+        (source, from): (u64, u64),
+        (destination, to): (u64, u64),
+        len: u64,
+    ) {
+        if let (Some((_, source)), Some((_, destination))) =
+            (self.icb_of(source), self.icb_of(destination))
+        {
+            destination.copied(source, from, to, len);
+        }
     }
 
     /// An `ICB_WRITE`: each record carried out on the buffer, in order, each refused alone.
@@ -186,7 +305,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxIcbWrite>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        let Some(ObjHandle::Icb(icb)) = self.named(m.obj_id) else {
+        let Some((icb, dropped)) = self.icb_of(m.obj_id) else {
             return Ok(Err(DecodeError::BadReference));
         };
         let size = icb.size();
@@ -209,7 +328,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             let bytes = &rest[size_of::<RgfxIcbRecord>()..len];
             records += 1;
-            let why = match refusing(|| self.icb_record(icb, size, &mut command, &rec, bytes)) {
+            let record = || self.icb_record(icb, dropped, size, &mut command, &rec, bytes);
+            let why = match refusing(record) {
                 Ok(Ok(())) => None,
                 Ok(Err(e)) => {
                     // A failed lookup leaves no command to carry the next record on.
@@ -280,7 +400,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// whose slots hold a range reset alone are reset in one call.
     fn slot_run(&self, run: &RgfxIcbSlotRun, tally: &mut Tally) -> Result<(), DecodeError> {
         const CHUNK: u64 = 256;
-        let Some(ObjHandle::Icb(icb)) = self.named(run.icb_obj_id) else {
+        let Some((icb, dropped)) = self.icb_of(run.icb_obj_id) else {
             return Err(DecodeError::BadReference);
         };
         let kind = run.kind;
@@ -307,7 +427,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             // rest of the run.
             let Some(bytes) = self.take_own(run.region_offset + start * stride, stride, n, 2)
             else {
-                reset_run(icb, obj, resets.take(), tally);
+                reset_run(icb, dropped, obj, resets.take(), tally);
                 return Err(DecodeError::BadReference);
             };
             for (index, slot) in (first + start..).zip(bytes.chunks_exact(stride as usize)) {
@@ -319,18 +439,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                     resets = match resets {
                         Some((at, len)) if at + len == index => Some((at, len + 1)),
                         before => {
-                            reset_run(icb, obj, before, tally);
+                            reset_run(icb, dropped, obj, before, tally);
                             Some((index, 1))
                         }
                     };
                     continue;
                 }
-                reset_run(icb, obj, resets.take(), tally);
-                self.slot(icb, obj, kind, index, slot, (a, b), (mask, mask_b), tally);
+                reset_run(icb, dropped, obj, resets.take(), tally);
+                let at = (obj, kind, index);
+                self.slot(icb, dropped, at, slot, (a, b), (mask, mask_b), tally);
             }
             start += n;
         }
-        reset_run(icb, obj, resets, tally);
+        reset_run(icb, dropped, obj, resets, tally);
         Ok(())
     }
 
@@ -340,16 +461,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     fn slot(
         &self,
         icb: &P::Icb,
-        obj: u64,
-        kind: u16,
-        index: u64,
+        dropped: &Dropped,
+        (obj, kind, index): (u64, u16, u64),
         slot: &[u8],
         bindings: (u32, u32),
         (mask, mask_b): (u64, u64),
         tally: &mut Tally,
     ) {
         if mask & RGFX_ICB_SLOT_RESET_RANGE != 0 {
-            reset_run(icb, obj, Some((index, 1)), tally);
+            reset_run(icb, dropped, obj, Some((index, 1)), tally);
         }
         let mask = mask & !RGFX_ICB_SLOT_RESET_RANGE;
         if mask == 0 && mask_b == 0 {
@@ -358,7 +478,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         if kind == RGFX_ICB_SLOTS_RENDER {
             match refusing(|| icb.render_command(index)) {
                 Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |field| {
-                    tally.count(obj, index, refusing(|| self.render_field(&c, field)));
+                    let op = field.op();
+                    let reset = || c.encode(IcbRenderCmd::Reset);
+                    let done = refusing(|| {
+                        contain(dropped, index, op, || self.render_field(&c, field), reset)
+                    });
+                    tally.count(obj, index, done);
                 }),
                 Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
                 Err(raise) => tally.count(obj, index, Err(raise)),
@@ -366,7 +491,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         } else {
             match refusing(|| icb.compute_command(index)) {
                 Ok(Some(c)) => slot_fields(kind, slot, bindings, (mask, mask_b), |field| {
-                    tally.count(obj, index, refusing(|| self.compute_field(&c, field)));
+                    let op = field.op();
+                    let reset = || c.encode(IcbComputeCmd::Reset);
+                    let done = refusing(|| {
+                        contain(dropped, index, op, || self.compute_field(&c, field), reset)
+                    });
+                    tally.count(obj, index, done);
                 }),
                 Ok(None) => tally.count(obj, index, Ok(Err(DecodeError::Refused))),
                 Err(raise) => tally.count(obj, index, Err(raise)),
@@ -455,6 +585,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     fn icb_record(
         &self,
         icb: &P::Icb,
+        dropped: &Dropped,
         size: u64,
         command: &mut Command<P>,
         rec: &RgfxIcbRecord,
@@ -471,6 +602,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             *command = Command::None;
             if index < stop {
                 icb.reset_with_range(index, stop - index)?;
+                dropped.clear(index, stop - index);
             }
             return Ok(Ok(()));
         }
@@ -487,7 +619,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             let Command::Render(_, c) = command else {
                 unreachable!("a render command was just taken");
             };
-            self.render_record(c, op, bytes)
+            let reset = || c.encode(IcbRenderCmd::Reset);
+            contain(
+                dropped,
+                index,
+                op,
+                || self.render_record(c, op, bytes),
+                reset,
+            )
         } else if computes(op) {
             if !matches!(command, Command::Compute(i, _) if *i == index) {
                 let Some(c) = icb.compute_command(index)? else {
@@ -498,7 +637,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             let Command::Compute(_, c) = command else {
                 unreachable!("a compute command was just taken");
             };
-            self.compute_record(c, op, bytes)
+            let reset = || c.encode(IcbComputeCmd::Reset);
+            contain(
+                dropped,
+                index,
+                op,
+                || self.compute_record(c, op, bytes),
+                reset,
+            )
         } else {
             Ok(Err(DecodeError::UnknownCommand))
         }
@@ -722,15 +868,43 @@ impl Tally {
     }
 }
 
-/// The range reset `run` (its first command and its length), where there is one, in one call.
+/// The range reset `run` (its first command and its length), where there is one, in one call:
+/// the commands of it are carried out again ([`Dropped`]).
 fn reset_run<I: IndirectCommandBuffer<P>, P: Platform>(
     icb: &I,
+    dropped: &Dropped,
     obj: u64,
     run: Option<(u64, u64)>,
     tally: &mut Tally,
 ) {
     if let Some((at, len)) = run {
         tally.count(obj, at, refusing(|| icb.reset_with_range(at, len).map(Ok)));
+        dropped.clear(at, len);
+    }
+}
+
+/// `record`, an encode `op` of command `index`, as [`Dropped`] holds it: a reset of the command
+/// carries it out again; a draw or dispatch of a dropped command is dropped; an encode that names
+/// an object whose create the host refused is dropped, the command reset (`reset`) and dropped.
+fn contain(
+    dropped: &Dropped,
+    index: u64,
+    op: u16,
+    record: impl FnOnce() -> RaiseResult<Result<(), DecodeError>>,
+    reset: impl FnOnce() -> RaiseResult<()>,
+) -> RaiseResult<Result<(), DecodeError>> {
+    if resets(op) {
+        dropped.clear(index, 1);
+    } else if acts(op) && dropped.holds(index) {
+        return Ok(Ok(()));
+    }
+    match record() {
+        Err(raise) if refused::is_refused(&raise) => {
+            reset()?;
+            dropped.mark(index);
+            Ok(Ok(()))
+        }
+        done => done,
     }
 }
 
@@ -754,6 +928,16 @@ enum Field<'s> {
     Second(u32, RgfxIcbSlotBuffer),
     /// A threadgroup memory length at its index.
     Length(u32, u32),
+}
+
+impl Field<'_> {
+    /// The record op the field is carried out as: its record's, and 0 for a setter's.
+    fn op(&self) -> u16 {
+        match self {
+            Field::Record(op, _) => *op,
+            _ => 0,
+        }
+    }
 }
 
 /// Each field a slot's bits `masks` name to `field`, in a fixed order: the command's reset, its
@@ -1561,6 +1745,183 @@ mod tests {
                 "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:",
             ]
         );
+    }
+
+    /// The selectors of the commands' encodes since `mark`, and of their buffers' resets of a
+    /// range: what a test of [`Dropped`] reads.
+    fn encodes(p: &FakePlatform, mark: u64) -> Vec<&'static str> {
+        calls(p, mark)
+            .into_iter()
+            .map(|(sel, _)| sel)
+            .filter(|sel| !sel.starts_with("indirect"))
+            .collect()
+    }
+
+    /// The [`encodes`] an `ICB_WRITE` of `records` into `icb` carries out.
+    fn encodes_of(
+        p: &FakePlatform,
+        dec: &mut Dec,
+        icb: u64,
+        records: &[Vec<u8>],
+    ) -> Vec<&'static str> {
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&p.device(), &write(icb, records)).unwrap(),
+            Ok(())
+        );
+        encodes(p, mark)
+    }
+
+    const VB: &str = "setVertexBuffer:offset:atIndex:";
+    const FB: &str = "setFragmentBuffer:offset:atIndex:";
+    const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:";
+
+    /// An encode of a command that names an object whose create the host refused drops the
+    /// command's draws ([`Dropped`]): the encode is dropped and the command reset; its later
+    /// setters are carried out and its draws dropped, until the guest resets it (a reset record,
+    /// a reset of a range, a blit's reset) or copies a command over it, which a command copied
+    /// from a dropped one is not. The other commands, and a dispatch's command of a compute
+    /// buffer alike, go on as before.
+    #[test]
+    fn an_encode_naming_a_refused_object_drops_its_draws_until_a_reset() {
+        let (p, mut dec) = setup();
+        dec.refuse(99, RGFX_CMD_BUFFER_CREATE);
+        let buffer = |op, obj_id, index| {
+            record(
+                op,
+                index,
+                &RgfxIcbBuffer {
+                    obj_id,
+                    offset: 0,
+                    index: 0,
+                    reserved_14: 0,
+                },
+            )
+        };
+        let vb = |obj_id, index| buffer(RGFX_ICB_OP_VERTEX_BUFFER, obj_id, index);
+        let shape = draw(4);
+        let drawn = |index| record(RGFX_ICB_OP_DRAW, index, &shape);
+        let render = |dec: &mut Dec, records: &[Vec<u8>]| encodes_of(&p, dec, RENDER_ICB, records);
+        // Command 0 draws; command 1, whose vertex buffer was refused, is reset, keeps its later
+        // setter, and draws nothing.
+        assert_eq!(
+            render(
+                &mut dec,
+                &[
+                    vb(2, 0),
+                    drawn(0),
+                    vb(99, 1),
+                    buffer(RGFX_ICB_OP_FRAGMENT_BUFFER, 3, 1),
+                    drawn(1),
+                ]
+            ),
+            [VB, DRAW, "reset", FB]
+        );
+        // A binding of a buffer the host holds does not end it: the guest's own reset does.
+        assert_eq!(render(&mut dec, &[vb(2, 1), drawn(1)]), [VB]);
+        assert_eq!(
+            render(
+                &mut dec,
+                &[bare(RGFX_ICB_OP_RENDER_RESET, 1), vb(2, 1), drawn(1)]
+            ),
+            ["reset", VB, DRAW]
+        );
+        // So does a reset of a range holding it.
+        let range = RgfxIcbRange {
+            length: 2,
+            reserved_04: 0,
+        };
+        assert_eq!(
+            render(
+                &mut dec,
+                &[
+                    vb(99, 1),
+                    drawn(1),
+                    record(RGFX_ICB_OP_RENDER_RESET_RANGE, 0, &range),
+                    drawn(1),
+                ]
+            ),
+            ["reset", "resetWithRange:", DRAW]
+        );
+        // And a blit's reset of it, as its command buffer is decoded.
+        assert_eq!(render(&mut dec, &[vb(99, 1)]), ["reset"]);
+        dec.icb_commands_reset(RENDER_ICB, 1, 1);
+        assert_eq!(render(&mut dec, &[drawn(1)]), [DRAW]);
+        // A command copied from a dropped one is dropped; one copied from another is not.
+        assert_eq!(render(&mut dec, &[vb(99, 2)]), ["reset"]);
+        dec.icb_commands_copied((RENDER_ICB, 2), (RENDER_ICB, 5), 1);
+        assert_eq!(render(&mut dec, &[drawn(5), drawn(2)]), Vec::<&str>::new());
+        dec.icb_commands_copied((RENDER_ICB, 0), (RENDER_ICB, 5), 1);
+        assert_eq!(render(&mut dec, &[drawn(5)]), [DRAW]);
+        // A compute command's dispatch, as a render command's draw; the other command's
+        // dispatch goes on.
+        let dispatch = |index| {
+            record(
+                RGFX_ICB_OP_DISPATCH_THREADS,
+                index,
+                &RgfxIcbDispatch {
+                    grid: [64, 1, 1],
+                    threadgroup: [32, 1, 1],
+                },
+            )
+        };
+        let records = [
+            buffer(RGFX_ICB_OP_KERNEL_BUFFER, 99, 0),
+            dispatch(0),
+            buffer(RGFX_ICB_OP_KERNEL_BUFFER, 2, 1),
+            dispatch(1),
+        ];
+        assert_eq!(
+            encodes_of(&p, &mut dec, COMPUTE_ICB, &records),
+            [
+                "reset",
+                "setKernelBuffer:offset:atIndex:",
+                "concurrentDispatchThreads:threadsPerThreadgroup:"
+            ]
+        );
+    }
+
+    /// A slot's binding of an object whose create the host refused drops its command's draw as a
+    /// record's does ([`Dropped`]): the command is reset after its pipeline is set, and its
+    /// action is dropped; a slot's reset carries the command out again. The slot of another
+    /// command draws.
+    #[test]
+    fn a_slot_naming_a_refused_object_drops_its_draw_until_a_reset() {
+        let (p, mut dec, region) = slot_setup();
+        let device = p.device();
+        dec.refuse(99, RGFX_CMD_BUFFER_CREATE);
+        let b0 = RGFX_ICB_SLOT_BUFFER_0;
+        let drawing = |reset: bool| RgfxIcbRenderSlot {
+            mask: RGFX_ICB_SLOT_PIPELINE
+                | RGFX_ICB_SLOT_ACTION
+                | b0
+                | if reset { RGFX_ICB_SLOT_RESET } else { 0 },
+            pipeline: RENDER_PIPELINE,
+            op: RGFX_ICB_OP_DRAW,
+            action: action(&draw(4)),
+            ..RgfxIcbRenderSlot::default()
+        };
+        let none = RgfxIcbSlotBuffer::default();
+        let refused = [bound(99, 0, 0), none, none];
+        let held = [bound(2, 0, 0), none, none];
+        let r = SLOTS;
+        assert!(region.write(r, &render_slot(&drawing(false), refused)));
+        assert!(region.write(r + RENDER_STRIDE, &render_slot(&drawing(false), held)));
+        let message = slots(&[run(RENDER_ICB_2, RGFX_ICB_SLOTS_RENDER, r, 0, 2)]);
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let pipeline = "setRenderPipelineState:";
+        assert_eq!(encodes(&p, mark), [pipeline, "reset", pipeline, VB, DRAW]);
+        // Command 0 again, held this time: still dropped without a reset, drawn after one.
+        assert!(region.write(r, &render_slot(&drawing(false), held)));
+        let once = slots(&[run(RENDER_ICB_2, RGFX_ICB_SLOTS_RENDER, r, 0, 1)]);
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &once).unwrap(), Ok(()));
+        assert_eq!(encodes(&p, mark), [pipeline, VB]);
+        assert!(region.write(r, &render_slot(&drawing(true), held)));
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &once).unwrap(), Ok(()));
+        assert_eq!(encodes(&p, mark), ["reset", pipeline, VB, DRAW]);
     }
 
     /// A write naming no indirect command buffer of the sender's (none, or a buffer) is refused

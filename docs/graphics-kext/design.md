@@ -1407,7 +1407,10 @@ names it is dropped, never the command buffer that names it: an op that uses
 it (a copy, a fill, an indexed or indirect draw from it, a fence update or
 wait) is dropped; a binding of it binds nil and marks its slot, and the
 encoder's draws and dispatches are dropped while a slot is marked, until the
-slot is bound again; a use list's entry of it is nil; a render pass with it as
+slot is bound again; an indirect command buffer's CPU encode of it is dropped
+and its command reset, and that command's later draws and dispatches are
+dropped until the guest resets it or copies a command over it; a use list's
+entry of it is nil; a render pass with it as
 an attachment, and a video encoder of its session, are skipped whole; a wait
 for it as an event is dropped, and a signal of it as a shared event still
 reaches the guest's value; a create over it stands refused in turn. The

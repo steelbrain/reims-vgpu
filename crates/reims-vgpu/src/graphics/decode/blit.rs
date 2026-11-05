@@ -275,6 +275,11 @@ pub(crate) fn decode_op<P: Platform>(
                     destination_index: m.destination_index,
                 },
             )?;
+            objs.icb_commands_copied(
+                (m.source_obj_id, m.source_range_location),
+                (m.destination_obj_id, m.destination_index),
+                m.source_range_length,
+            );
         }
         RGFX_OP_BLIT_FILL_BUFFER => {
             let m: RgfxBlitOpFillBuffer = body(tag, payload)?;
@@ -427,6 +432,7 @@ pub(crate) fn decode_op<P: Platform>(
                     range: NsRange::new(m.range_location, m.range_length),
                 },
             )?;
+            objs.icb_commands_reset(m.icb_obj_id, m.range_location, m.range_length);
         }
         RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE => {
             let m: RgfxBlitOpSynchronizeResource = body(tag, payload)?;

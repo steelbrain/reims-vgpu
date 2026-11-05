@@ -135,6 +135,9 @@ pub(crate) struct Entry<P: Platform> {
     /// picked (the host places it): it is let go of on the surface worker
     /// ([`super::surface_pages`]).
     pub(crate) over_view: bool,
+    /// An indirect command buffer's commands whose draws and dispatches are dropped
+    /// ([`super::icb::Dropped`]); `None` for any other object.
+    pub(crate) icb_dropped: Option<Box<super::icb::Dropped>>,
     /// The table's clock at its make.
     made: u64,
 }
@@ -151,6 +154,7 @@ impl<P: Platform> Entry<P> {
             ram: None,
             bytes: None,
             over_view: false,
+            icb_dropped: None,
             made: 0,
         }
     }
