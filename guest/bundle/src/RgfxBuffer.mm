@@ -64,6 +64,50 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 	const NSUInteger mode = (options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift;
 	return mode == MTLStorageModeShared || mode == MTLStorageModeManaged;
 }
+
+/// The name Metal's assertions give a texture type, of those its linear-texture assertion names
+/// (`oracle_storage DEVICE lintypes`): nil for another.
+NSString *rgfxLinearTypeName(MTLTextureType type)
+{
+	switch (type) {
+	case MTLTextureType1D:
+		return @"MTLTextureType1D";
+	case MTLTextureType1DArray:
+		return @"MTLTextureType1DArray";
+	case MTLTextureType2DArray:
+		return @"MTLTextureType2DArray";
+	case MTLTextureType2DMultisample:
+		return @"MTLTextureType2DMultisample";
+	case MTLTextureTypeCube:
+		return @"MTLTextureTypeCube";
+	case MTLTextureTypeCubeArray:
+		return @"MTLTextureTypeCubeArray";
+	case MTLTextureType3D:
+		return @"MTLTextureType3D";
+	case MTLTextureType2DMultisampleArray:
+		return @"MTLTextureType2DMultisampleArray";
+	default:
+		return nil;
+	}
+}
+
+/// Ends the process as Metal's validation does at a texture over a buffer of a type it does not
+/// make there, `allowed` naming the types it makes ("MTLTextureType2D", or the linear SPI's
+/// "MTLTextureType2D or linear MTLTextureType2DArray"): a line for a depth other than 1, then the
+/// type's (measured on the M3 Max under macOS 27.0.1 and the AMD 5300M under macOS 26.7.1, for a
+/// 3D texture 2 deep; the Intel 630 asserts "Buffer texture: cannot support depth > 1." there).
+[[noreturn]] void rgfxLinearTypeDies(MTLTextureDescriptor *descriptor, NSString *type,
+                                     NSString *allowed)
+{
+	NSMutableString *words = [NSMutableString stringWithString:@"Texture Descriptor Validation\n"];
+	if (descriptor.depth != 1) {
+		[words appendFormat:@"Linear texture: must have depth == 1, depth (%lu) disallowed\n",
+		                    (unsigned long)descriptor.depth];
+	}
+	[words appendFormat:@"Linear texture: must be of type %@, textureType (%@) disallowed\n",
+	                    allowed, type];
+	RgfxMetalAssertionFailed("_mtlValidateStrideTextureParameters", words);
+}
 } // namespace
 
 @interface RgfxBuffer () <RgfxMetalBufferInternals>
@@ -566,9 +610,14 @@ RGFX_RESOURCE_SPI
 
 // A texture over the buffer's bytes from `offset`, rows `bytesPerRow` apart
 // (TEXTURE_FROM_BUFFER); it keeps the buffer, which its `buffer` answers. Metal ends the process
-// at a descriptor of more than one level, with these words, on the AMD, the Intel and the M3 GPU
-// alike (docs/graphics-kext/dgpu-oracle.md, Q11), and so does the bundle, sending nothing. One off
-// the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
+// at a descriptor of more than one level, and at a 1D, 1D array, 2D array, cube or cube array
+// type, with these words, on the AMD, the Intel and the M3 GPU (docs/graphics-kext/dgpu-oracle.md,
+// Q11), and so does the bundle, sending nothing: the host's platform would end the host's process
+// at the type. So it does at a 3D or multisample type, with the M3's words (rgfxLinearTypeDies);
+// the x86 GPUs end the process there too, the Intel GPU with other words at the 3D one, and both
+// at a multisample one in Shared storage before they reach its type. A texture buffer, not
+// measured, answers nil, logged once, and sends nothing. One off the device's linear texture
+// alignment is nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -579,6 +628,18 @@ RGFX_RESOURCE_SPI
 		    [NSString stringWithFormat:@"Texture Descriptor Validation\nLinear texture: cannot be "
 		                               @"mipmapped, mipmapLevelCount (%lu) disallowed\n",
 		                               (unsigned long)descriptor.mipmapLevelCount]);
+	}
+	if (descriptor != nil && descriptor.textureType != MTLTextureType2D) {
+		NSString *type = rgfxLinearTypeName(descriptor.textureType);
+		if (type != nil)
+			rgfxLinearTypeDies(descriptor, type, @"MTLTextureType2D");
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a texture over buffer 0x%llx of type %lu, not 2D, which the host does "
+			      @"not carry: answered nil",
+			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
+		}
+		return nil;
 	}
 	if (![self rgfxAtLinearAlignment:descriptor offset:offset bytesPerRow:bytesPerRow])
 		return nil;
@@ -609,7 +670,9 @@ RGFX_RESOURCE_SPI
 // rule, as it does for the linear form's. A descriptor of more than one level the AMD and the
 // Intel GPU make, level 0 over the buffer's bytes and levels 1 and up in the GPU's own memory
 // (docs/graphics-kext/dgpu-oracle.md, Q11), which the host does not carry: the bundle answers nil,
-// logged once, and sends nothing.
+// logged once, and sends nothing. So it answers a type other than 2D, which those GPUs make of
+// every type their descriptor validation passes (`oracle_storage DEVICE lintypes tiled:TYPE`, Q11)
+// and whose refusal by the host's platform ends the host's process (resource.rs, new_texture).
 - (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                          offset:(NSUInteger)offset
                                     bytesPerRow:(NSUInteger)bytesPerRow
@@ -642,6 +705,15 @@ RGFX_RESOURCE_SPI
 			      @"1 and up the host does not carry: answered nil",
 			      (unsigned long long)[self rgfxObjId],
 			      (unsigned long)descriptor.mipmapLevelCount);
+		}
+		return nil;
+	}
+	if (descriptor.textureType != MTLTextureType2D) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of type %lu, not 2D, which the host "
+			      @"does not carry: answered nil",
+			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
 		}
 		return nil;
 	}
@@ -681,11 +753,16 @@ RGFX_RESOURCE_SPI
 // makes by the same form (LINEAR_TEXTURE_FROM_BUFFER), carrying `bytesPerImage` as asked. Metal's
 // (measured on the M3 Max under macOS 27) is a texture of the buffer's bytes from the offset, rows
 // `bytesPerRow` apart, as newTextureWithDescriptor:offset:bytesPerRow: makes one, and takes a 2D
-// array too, its slices `bytesPerRow` times its height apart whatever `bytesPerImage`; it ends the
-// process, at its validation's failed assertion, for a texture of another type than 2D, 2D array
-// and texture buffer, or of more than one level, which the bundle answers nil, logged, as it
-// answers a view Metal ends the process at. One past the buffer's bytes Metal answers nil, and the
-// host refuses; one off the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
+// array too, its slices its rows' bytes rounded up to 128 apart whatever `bytesPerImage`
+// (RgfxTexture.mm, rgfxBufferSlicePitch), where the AMD and the Intel GPU end the process at the
+// array ("2D linear texture array is not supported.", dgpu-oracle.md, Q11). It ends the process,
+// at its validation's failed assertion, for a texture of another type than 2D, 2D array and
+// texture buffer: with the same words on the three GPUs for a 1D, 1D array, cube or cube array
+// type, which the bundle ends it with, and with the M3's for a 3D or multisample one
+// (rgfxLinearTypeDies, Q11). It ends it too at more than one level, which the bundle answers nil,
+// logged, as it answers a view Metal ends the process at. One past the buffer's bytes Metal
+// answers nil, and the host refuses; one off the device's linear texture alignment is nil
+// (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                           offset:(NSUInteger)offset
                                      bytesPerRow:(NSUInteger)bytesPerRow
@@ -695,9 +772,13 @@ RGFX_RESOURCE_SPI
 		return nil;
 	}
 	const MTLTextureType type = descriptor.textureType;
-	if ((type != MTLTextureType2D && type != MTLTextureType2DArray &&
-	     type != MTLTextureTypeTextureBuffer) ||
-	    descriptor.mipmapLevelCount != 1) {
+	const bool made = type == MTLTextureType2D || type == MTLTextureType2DArray ||
+	                  type == MTLTextureTypeTextureBuffer;
+	if (!made && rgfxLinearTypeName(type) != nil) {
+		rgfxLinearTypeDies(descriptor, rgfxLinearTypeName(type),
+		                   @"MTLTextureType2D or linear MTLTextureType2DArray");
+	}
+	if (!made || descriptor.mipmapLevelCount != 1) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
 			NSLog(@"RGFX: a linear texture over buffer 0x%llx of type %lu and %lu levels, which "

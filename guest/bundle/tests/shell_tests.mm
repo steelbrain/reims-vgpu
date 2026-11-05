@@ -914,6 +914,18 @@ void test_tiled_texture_over_backing()
 	CHECK([tiled newTiledTextureWithDescriptor:desc offset:tileOffset bytesPerRow:pitch] == nil);
 	CHECK(ringEmpty(fx.ring));
 	desc.mipmapLevelCount = 1;
+	// So does a type other than 2D, which the AMD and the Intel GPU make and the host does not
+	// carry over a buffer.
+	desc.textureType = MTLTextureType2DArray;
+	desc.arrayLength = 2;
+	CHECK([tiled newTiledTextureWithDescriptor:desc offset:0 bytesPerRow:pitch] == nil);
+	desc.textureType = MTLTextureType1D;
+	desc.height = 1;
+	desc.arrayLength = 1;
+	CHECK([tiled newTiledTextureWithDescriptor:desc offset:0 bytesPerRow:pitch] == nil);
+	CHECK(ringEmpty(fx.ring));
+	desc.textureType = MTLTextureType2D;
+	desc.height = 2;
 
 	// A buffer other than Shared answers nil.
 	std::vector<uint8_t> other(pitch * 6, 0);
@@ -1000,6 +1012,45 @@ static int dies_case(const char *name)
 		desc.mipmapLevelCount = 2;
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:64];
 	}
+	// buffer-texture-type-N and linear-texture-type-N: a texture of MTLTextureType N over a
+	// buffer, by the public form or the linear SPI.
+	const bool linearForm = std::strncmp(name, "linear-texture-type-", 20) == 0;
+	if (linearForm || std::strncmp(name, "buffer-texture-type-", 20) == 0) {
+		const auto type = static_cast<MTLTextureType>(std::atoi(name + 20));
+		const bool oneD = type == MTLTextureType1D || type == MTLTextureType1DArray;
+		const bool cube = type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray;
+		std::vector<uint8_t> memory(4096, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:oneD ? 1 : cube ? 16 : 4
+		                                                   mipmapped:NO];
+		desc.textureType = type;
+		desc.depth = type == MTLTextureType3D ? 2 : 1;
+		desc.arrayLength = type == MTLTextureType1DArray || type == MTLTextureType2DArray ||
+		                           type == MTLTextureTypeCubeArray ||
+		                           type == MTLTextureType2DMultisampleArray
+		                       ? 2
+		                       : 1;
+		if (type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray)
+			desc.sampleCount = 4;
+		if (linearForm) {
+			(void)[(id<RgfxMetalBufferInternals>)buf newLinearTextureWithDescriptor:desc
+			                                                                offset:0
+			                                                           bytesPerRow:64
+			                                                         bytesPerImage:256];
+		} else {
+			(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:64];
+		}
+	}
 	// A texture of a placement heap, in the format and type the case names.
 	auto heapTexture = [&](MTLPixelFormat format, NSUInteger samples) {
 		MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
@@ -1054,6 +1105,45 @@ void test_mipmapped_buffer_texture_ends_the_process()
 	checkDies("buffer-texture-levels",
 	          "_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor "
 	          "Validation\nLinear texture: cannot be mipmapped, mipmapLevelCount (2) disallowed\n'");
+}
+
+// A texture over a buffer's bytes of a type the form does not make ends the process with
+// Metal's words, before the host is sent it, whose platform would end the host's process there
+// (the bundle used to send it): by the public form, any type but 2D; by the linear SPI, any but
+// 2D, 2D array and texture buffer. The AMD, the Intel and the M3 GPU say these words at a 1D,
+// 1D array, cube or cube array type, and at a 2D array by the public form; at a 3D or multisample
+// type they are the M3's, the AMD's too at the 3D one (`oracle_storage DEVICE lintypes
+// FORM:TYPE`, docs/graphics-kext/dgpu-oracle.md, Q11).
+void test_buffer_texture_types_end_the_process()
+{
+	const struct {
+		MTLTextureType type;
+		const char *name;
+		bool linear; // the linear SPI dies at it too
+	} types[] = {{MTLTextureType1D, "MTLTextureType1D", true},
+	             {MTLTextureType1DArray, "MTLTextureType1DArray", true},
+	             {MTLTextureType2DArray, "MTLTextureType2DArray", false},
+	             {MTLTextureType2DMultisample, "MTLTextureType2DMultisample", true},
+	             {MTLTextureTypeCube, "MTLTextureTypeCube", true},
+	             {MTLTextureTypeCubeArray, "MTLTextureTypeCubeArray", true},
+	             {MTLTextureType3D, "MTLTextureType3D", true},
+	             {MTLTextureType2DMultisampleArray, "MTLTextureType2DMultisampleArray", true}};
+	for (const auto &t : types) {
+		for (const bool linear : {false, true}) {
+			if (linear && !t.linear)
+				continue;
+			const std::string dies = std::string(linear ? "linear" : "buffer") +
+			                         "-texture-type-" + std::to_string(t.type);
+			std::string words = "_mtlValidateStrideTextureParameters: failed assertion `Texture "
+			                    "Descriptor Validation\n";
+			if (t.type == MTLTextureType3D)
+				words += "Linear texture: must have depth == 1, depth (2) disallowed\n";
+			words += std::string("Linear texture: must be of type MTLTextureType2D") +
+			         (linear ? " or linear MTLTextureType2DArray" : "") + ", textureType (" +
+			         t.name + ") disallowed\n'";
+			checkDies(dies.c_str(), words.c_str());
+		}
+	}
 }
 
 // A texture Metal's descriptor validation ends the process at on every Mac (a three-channel
@@ -11877,6 +11967,7 @@ int main(int argc, char **argv)
 		test_texture_cpu_copies();
 		test_tiled_texture_over_backing();
 		test_mipmapped_buffer_texture_ends_the_process();
+		test_buffer_texture_types_end_the_process();
 		test_invalid_texture_descriptors_end_the_process();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();

@@ -327,8 +327,9 @@ void test_heap_buffers_answer_their_heap()
 
 // A linear texture is made by Metal's linear form on the host (LINEAR_TEXTURE_FROM_BUFFER), its
 // bytes per image carried as asked, a 2D array's and a texture buffer's among them, and answers
-// its buffer, offset and rows as a texture over a buffer does; a type Metal's validation ends the
-// process at, or more than one level, is nil, logged, posting nothing.
+// its buffer, offset and rows as a texture over a buffer does; more than one level is nil, logged,
+// posting nothing. (A type Metal's validation ends the process at ends it with Metal's words:
+// shell_tests.mm, test_buffer_texture_types_end_the_process.)
 void test_buffer_linear_textures()
 {
 	Fixture fx;
@@ -375,11 +376,6 @@ void test_buffer_linear_textures()
 		CHECK(texels != nil && texels.textureType == MTLTextureTypeTextureBuffer);
 
 		td.arrayLength = 1;
-		for (MTLTextureType type : {MTLTextureType3D, MTLTextureType1D, MTLTextureType1DArray,
-		                            MTLTextureTypeCube, MTLTextureType2DMultisample}) {
-			td.textureType = type;
-			CHECK(linear(td, 0, 256, 0x1000) == nil);
-		}
 		td.textureType = MTLTextureType2D;
 		td.mipmapLevelCount = 2;
 		CHECK(linear(td, 0, 256, 0) == nil);
