@@ -267,6 +267,10 @@ fn linear_samples<P: reims_vgpu_core::platform::Platform>(
 /// texture of no matrix read red 9916 into halves and 0.026306152 into floats, where Metal's
 /// reads 9920 and 0.026367188
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
     use crate::gpu::ycbcr::measure::metal::{metals, set_value};
     use crate::gpu::ycbcr::measure::{
@@ -345,6 +349,10 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
 /// state's creation would make it instead, and the draw would pool nothing.
 /// Metal makes the texture
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
     use crate::gpu::ycbcr::measure::probed_texels;
     use crate::gpu::ycbcr::measure::{Shape, desc, drawn};

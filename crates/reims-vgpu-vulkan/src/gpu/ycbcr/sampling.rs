@@ -192,6 +192,10 @@ macro_rules! family_samples {
              properties are the guest descriptor's"
         )]
         #[test]
+        #[cfg_attr(
+            target_os = "macos",
+            ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+        )]
         fn $test() {
             family_samples_as_metals($format);
         }
@@ -588,6 +592,10 @@ macro_rules! family_fragment_samples {
              ([`family_samples_in_fragments_as_metals`])"
         )]
         #[test]
+        #[cfg_attr(
+            target_os = "macos",
+            ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+        )]
         fn $test() {
             family_samples_in_fragments_as_metals($format);
         }
