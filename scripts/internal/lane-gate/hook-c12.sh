@@ -8,8 +8,12 @@
 #                        or the probe's end (its rc) (a panic's lines reach the host up to the
 #                        panic, whether or not logd wrote them). A session that ends before then is
 #                        started again once SSH answers.
-#   c12-shmem-pages      "MARK spmark.start EPOCH pid=N": spscan.py (the probe's own copy, from
-#                        the car's tree) on QEMU's RAM for guest process N, into DIR/spscan.txt.
+#   c12-shmem-pages      (SP_PROBE, default c12-shmem-pages) "MARK spmark.ready EPOCH pid=N" (once
+#                        its marks are written): spscan.py (the probe's own copy, from the car's
+#                        tree) on QEMU's RAM for guest process N, into DIR/spscan.txt.
+#   c12-hreset1..3       (HRESET_PROBES) "MARK hardreset.go": a hard reset over QMP (system_reset,
+#                        no shutdown in the guest), with QEMU's RssAnon before it and 20 s after it
+#                        in DIR/hreset.tsv.
 #   c12-scanout-restart  "MARK scanout.restart": msi-capture.py's scanout from that moment
 #                        (CAPTURE_FROM_NOW) into DIR/restart/capture/, to the host's first present
 #                        after the restart.
@@ -31,7 +35,9 @@ alive() { kill -0 "$qpid" 2> /dev/null; }
 end=$(( $(date +%s) + 7200 ))
 log "watching QEMU $qpid, round $D"
 PRED='sender == "ReimsGraphics" OR sender == "reims-graphics" OR process == "kernel"'
-s1=0 s1pid= sp=0 rs=0 S1=${S1_PROBE:-c12-s1}
+s1=0 s1pid= sp=0 rs=0 S1=${S1_PROBE:-c12-s1} SP=${SP_PROBE:-c12-shmem-pages}
+HR=${HRESET_PROBES:-c12-hreset1 c12-hreset2 c12-hreset3} hrdone=" "
+rss() { awk '$1 == "RssAnon:" {print $2}' "/proc/$qpid/status" 2> /dev/null; }
 started() { [[ $PROBE_RESULTS/$1/stdout -nt $m ]]; }
 ended() { [[ -f $PROBE_RESULTS/$1/rc && $PROBE_RESULTS/$1/rc -nt $m ]]; }
 while alive && (( $(date +%s) < end )); do
@@ -57,10 +63,10 @@ while alive && (( $(date +%s) < end )); do
   fi
   # c12-shmem-pages: spscan.py on the marked guest process.
   if ((sp == 0)); then
-    l=$(mark c12-shmem-pages 'spmark.start') && [[ $l =~ pid=([0-9]+) ]] && {
+    l=$(mark "$SP" 'spmark.ready') && [[ $l =~ pid=([0-9]+) ]] && {
       sp=1 gp=${BASH_REMATCH[1]}
-      log "spmark.start: spscan.py $qpid $gp in 5 s"
-      ( sleep 5; sudo -n python3 -I "$D/probes/c12-shmem-pages/spscan.py" "$qpid" "$gp" > "$D/spscan.txt" 2>&1
+      log "spmark.ready: spscan.py $qpid $gp"
+      ( sudo -n python3 -I "$D/probes/$SP/spscan.py" "$qpid" "$gp" > "$D/spscan.txt" 2>&1
         log "spscan.py ended $?" ) &
     }
   fi
@@ -72,6 +78,17 @@ while alive && (( $(date +%s) < end )); do
         CAPTURE_MS="${CAPTURE_MS:-100}" python3 -I "$here/msi-capture.py" scanout "$B" "$D/restart" ) &
     log "scanout.restart: the restart's scanout capture into restart/capture/ (the desktop after it: c12-after-restart's shot)"
   fi
+  # c12-hreset*: a hard reset each, once.
+  for h in $HR; do
+    [[ $hrdone == *" $h "* ]] && continue
+    mark "$h" 'hardreset.go' > /dev/null || continue
+    hrdone+="$h "
+    r0=$(rss)
+    printf '%s\n' '{"execute":"qmp_capabilities"}' '{"execute":"system_reset"}' |
+      timeout 10 socat - "UNIX-CONNECT:$B/qmp.sock" > /dev/null 2>&1
+    log "$h: system_reset (rc $?), RssAnon ${r0:-?} kB before"
+    ( sleep 20; echo "$(date +%s) $h before_kb ${r0:-?} after20s_kb $(rss)" >> "$D/hreset.tsv" ) &
+  done
   sleep 0.5
 done
 [[ -n $s1pid ]] && kill "$s1pid" 2> /dev/null
