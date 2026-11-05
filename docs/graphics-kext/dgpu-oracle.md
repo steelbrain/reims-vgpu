@@ -10,8 +10,8 @@ stricter than the M3's, guests may rely on it.
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
-`oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex` and `oracle_reflection`; the upload
-costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection` and
+`oracle_mesh`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -900,8 +900,7 @@ type as the three Macs do (`RgfxFunctionConstants.cpp`, whose test holds the mea
 The answers are the same with and without the validation layer. All three make that pipeline on
 the device (`newRenderPipelineStateWithMeshDescriptor:`); the x86 GPUs refuse only its archive
 *(class 2)*. Ours refuses every descriptor with the x86 Macs' error (`RgfxBinaryArchive.mm`). Its
-device makes no mesh pipeline (`RgfxMetalDevice+Unsupported.mm`: the wire has no mesh pipeline
-create), where all three make one *(class 4)*.
+device makes mesh pipelines where the host does (Q22).
 
 **The framebuffer's `IOFBMemorySize`.** The AMD's framebuffer publishes 268435456 (256 MiB, the
 size of its aperture), and the Intel 630's publishes none. Neither does the stock lane's paravirtual
@@ -1016,6 +1015,97 @@ constants remove is answered used *(class 4: Metal reflects the specialised code
 GPU, and on the Intel GPU only `postVertexDumpStride`, 4 less than ours on each vertex pipeline;
 on both, the one case ours does not make is `c_constants` (`k_constants`), whose binding index
 function constants compute.
+
+## Q22: mesh render pipelines and their draws
+
+Probe: `oracle_mesh DEVICE`, 11-05, each step in a child process of its own, without and with
+`MTL_DEBUG_LAYER=1`. The SPI answers are `tools/base_answers_probe.m`'s. Plain Metal unless said.
+
+**The device.** The AMD and the Intel 630 answer Metal3 and Mac2 yes and Apple7 to Apple9 no; the
+M3 answers all five yes. All three answer the SPI's `supportsMeshShaders` YES. The x86 Macs answer
+`supportsMeshShadersInICB` NO and `requiresMeshShaderEmulation` YES, and the M3 answers YES and NO.
+Ours answers the Apple families no and Metal3 and Mac2 as the host's platform does (`device_info.rs`).
+It offers `MESH_PIPELINES` where the platform answers Metal3, and then answers `supportsMeshShaders`
+YES. It leaves `supportsMeshShadersInICB` and `requiresMeshShaderEmulation` to the IOGPU base's NO
+*(class 2)*.
+
+**What a made pipeline answers.** The descriptor is oracle_mesh's, with and without an object
+function:
+
+| query | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `maxTotalThreadsPerThreadgroup`, `gpuResourceID` | 0 | 0 | 0 |
+| `maxTotalThreadsPerMeshThreadgroup` | the descriptor's, else 1024 | 1024 | the descriptor's, else 1024 |
+| `maxTotalThreadsPerObjectThreadgroup` | as the mesh stage's; 0 with no object function | 1024; 0 with no object function | as the mesh stage's; 3 with no object function |
+| `objectThreadExecutionWidth` | 32; 0 with no object function | the same | 32 |
+| `meshThreadExecutionWidth` | 32 | 32 | 32 |
+| `maxTotalThreadgroupsPerMeshGrid` | `NSUIntegerMax` | `NSUIntegerMax` | 2^20, else the descriptor's |
+| `imageblockSampleLength` | 0 | 0 | 4, and 0 without rasterization |
+| `requiredThreadsPerObjectThreadgroup`, `requiredThreadsPerMeshThreadgroup` | the descriptor's | the descriptor's | the descriptor's |
+
+All three keep the label, and make the pipeline asynchronously, off the main thread, with a nil
+reflection. With reflection options, the error form answers a reflection with one mesh binding,
+and three object bindings where the pipeline has an object function. Ours answers each limit as
+the host's platform answers it (`RgfxRenderPipelineState.mm`; on the M3, its numbers), the
+required sizes as the descriptor's *(class 3)*, and the grid's `NSUIntegerMax` where the platform's
+answer passes 32 bits *(class 2)*.
+
+**What ends the process, and what is refused.** The same with and without the validation layer,
+except where the table says so:
+
+| the descriptor | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| no mesh function | `validateWithDevice:1884: failed assertion` "Mesh Render Pipeline Descriptor Validation\nmeshFunction must not be nil.\n" | the same | the same, at line 1956 |
+| no fragment function, rasterizing | the same, "fragmentFunction must not be nil.\n" | the same | the same |
+| `supportIndirectCommandBuffers` YES | the same, "Use of mesh shader pipelines in indirect command buffers is not supported by this device.\n" | the same | made, `supportIndirectCommandBuffers` YES and a `gpuResourceID` of 1 |
+| a stage's `maxTotalThreads...` of 2048 | `CompilerError` 2, "maxThreadsPerThreadgroup pipeline descriptor value (2048) exceeds maximum supported (1024)\n" | made; it answers 1024 | refused, `AGXMetalG15X_M1` 3 |
+| `payloadMemoryLength` 16385 | `CompilerError` 2, "payloadMemoryLength property of MTLMeshRenderPipelineDescriptor (16385 bytes) exceeds maximum supported by this device (16384 bytes)" | the same | refused, `AGXMetalG15X_M1` 3 |
+| a vertex function as the mesh function, rasterizing or not | `CompilerError` 2, "RasterizationEnabled is false but the vertex shader's return type is not void" | the same | SIGSEGV |
+| an object function as the mesh function | `CompilerError` 1, "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries." | the same | refused, `AGXMetalG15X_M1` 2, the same words |
+| a mesh function as the fragment function | the same as the row above | the same | SIGSEGV |
+| a fragment function as the object function | SIGSEGV | `CompilerError` 1, the XPC words | SIGSEGV |
+| a mesh function as the object function | made | made | refused, `AGXMetalG15X_M1` 2, the XPC words |
+| `FailOnBinaryArchiveMiss`, an empty archive named | `CompilerError` 2, `Unable to find function "f_col" in binary archives. \n Expected <MTLBinaryKey: 0x…> Legacy key:\n` and 64 zeros, the fragment function named, else the mesh function | the same | refused, `AGXMetalG15X_M1` 3, its own words |
+| `FailOnBinaryArchiveMiss`, no archive named | SIGSEGV | SIGSEGV | made |
+
+The validation layer asserts at the setters for a function of another stage
+(`-[MTLMeshRenderPipelineDescriptor setMeshFunction:]:1624: failed assertion` "meshFunction
+functionType is not MTLFunctionTypeMesh.", and the same at `setObjectFunction:` and
+`setFragmentFunction:`). An x86 Mac's archive holds no mesh pipeline (Q19), so on x86 every mesh
+pipeline made with `FailOnBinaryArchiveMiss` and an archive misses.
+
+Ours keeps the three deaths, in the x86 Macs' words: they are where Metal's validation ends the
+process on x86 *(class 3 for the first two, class 2 for indirect command buffers)*
+(`RgfxRenderPipelineState.mm`, `rgfxEndAtInvalidMeshDescriptor:`). It refuses the rest before the
+host is asked, in the x86 Macs' domain and codes *(class 2)*:
+- the payload and the 5300M's maximum, in their words;
+- the archive miss in their words, without the key;
+- every function of another stage, with the validation layer's words in place of the XPC ones.
+
+The host refuses a function of another stage too, before its GPU's Metal sees it (the Metal
+platform's `wrong_mesh_stage`), since the M3's Metal ends the host's process at three of them.
+With no archive named it makes the pipeline, as the M3 does *(class 2)*.
+
+**The draws**, into a 16 x 4 target, each mesh threadgroup covering its column of the grid in
+the colour its draw names:
+
+| draw | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `drawMeshThreadgroups:` | red | red | red |
+| `drawMeshThreads:` | nothing, in every form | nothing | drawn |
+| `drawMeshThreadgroupsWithIndirectBuffer:` | red | wrong colours (a gradient) | red |
+| `drawMeshThreads:` with an object stage | nothing | drawn | drawn |
+| an object stage's `drawMeshThreadgroups:` | drawn | drawn | drawn |
+
+The documentation promises each draw *(class 1)*. Ours sends each draw to the host, and the
+host's GPU draws it.
+
+**Indirect command buffers.** All three make one of the mesh command types. On x86 no pipeline
+can be set in it, since a mesh pipeline that supports indirect command buffers ends the process
+(above). The validation layer says "MTLValidateFeatureSupport:8086: Mesh shader draws can be
+encoded into ICBs is not supported on this device". The M3 draws from one. Ours keeps the x86
+Macs' *(class 2)*: no mesh pipeline it makes supports them, so its indirect commands carry no
+mesh draw (`RgfxIndirectCommandBuffer.mm`).
 
 ## Not measured
 

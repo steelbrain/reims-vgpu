@@ -816,6 +816,15 @@ only where no negotiation can carry it.
   shows, and a present may keep the surface shown and change only the colour
   (`RGFX_PRESENT_KEEP`; "The display's colour", below). Every host offers it;
   one with no window answers its presents at once.
+- Bit 25 is `MESH_PIPELINES`: ring 0 carries `MESH_RENDER_PIPELINE_CREATE`
+  (0x22e), answered by a `PIPELINE_REFLECTION` of kind `MESH` (2) whose
+  made answer carries the state's object and mesh limits after its 80 bytes
+  (`RgfxMeshPipelineReflection`, 104 bytes in all), and command buffers carry
+  the object and mesh stages' bindings and the mesh draws (render ops
+  0x1051-0x105e). A host offers it where its GPU answers Metal3, and the kext
+  takes it. No mesh pipeline supports indirect command buffers: the bundle
+  ends the process at one that asks, as the x86 Macs' Metal does
+  (dgpu-oracle.md, Q22), so no indirect command carries a mesh draw.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1696,7 +1705,7 @@ that waits for its answer would close it, at the cost the known creates remove.
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
-| shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
+| shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `MESH_RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full`, `new_mesh_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY` | `new_event`, `new_shared_event`, `new_fence` |
 | queue | `QUEUE_CREATE` (priority, region offset, vector), `QUEUE_DESTROY` | `new_command_queue` |
 
