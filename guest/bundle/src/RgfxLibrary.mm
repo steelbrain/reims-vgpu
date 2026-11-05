@@ -76,7 +76,11 @@ uint64_t rd64(const uint8_t *p)
 // A .metallib's TYPE tag byte, as MTLFunctionType. measured: macOS 27 Metal, on
 // CoreDisplay's default.metallib (0 vertex, 1 fragment, 2 kernel), and on a Core Image
 // kernel library on macOS 27 and 26.6.1 (5, its kernels: functionType 4, which
-// `functionNames` leaves out).
+// `functionNames` leaves out); and on the AMD 5300M and Intel 630 under macOS 26.7.1, over
+// libraries Apple's compiler built from our own sources (oracle_bundle, functypes): 4 for a
+// [[visible]] and a [[stitchable]] function (Visible), 6 intersection, 7 mesh, 8 object. A
+// dynamic library's exported function is 3, at which both end the process (Metal asserts that
+// its type is no MTLFunctionType); it and any other byte answer Visible here.
 MTLFunctionType metallibStage(uint8_t t)
 {
 	switch (t) {
@@ -88,6 +92,12 @@ MTLFunctionType metallibStage(uint8_t t)
 		return MTLFunctionTypeKernel;
 	case 5:
 		return kRgfxFunctionTypeExtern;
+	case 6:
+		return MTLFunctionTypeIntersection;
+	case 7:
+		return MTLFunctionTypeMesh;
+	case 8:
+		return MTLFunctionTypeObject;
 	default:
 		return MTLFunctionTypeVisible;
 	}

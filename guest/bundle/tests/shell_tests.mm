@@ -3027,6 +3027,20 @@ void test_function_patch_answers()
 		CHECK(g != nil && g.patchType == f.patchType &&
 		      g.patchControlPointCount == f.patchControlPointCount);
 	}
+	// Each function's stage is Metal's own, those of the mesh, object and intersection stages
+	// among them (the .metallib's TYPE tag bytes 7, 8 and 6).
+	CHECK([[ours.functionNames sortedArrayUsingSelector:@selector(compare:)]
+	    isEqualToArray:[theirs.functionNames sortedArrayUsingSelector:@selector(compare:)]]);
+	for (NSString *name in theirs.functionNames) {
+		const MTLFunctionType type = [ours newFunctionWithName:name].functionType;
+		if (type != [theirs newFunctionWithName:name].functionType)
+			NSLog(@"FAIL detail: %@ answers functionType %lu", name, (unsigned long)type);
+		CHECK(type == [theirs newFunctionWithName:name].functionType);
+	}
+	CHECK([ours newFunctionWithName:@"plain_mesh"].functionType == MTLFunctionTypeMesh);
+	CHECK([ours newFunctionWithName:@"plain_object"].functionType == MTLFunctionTypeObject);
+	CHECK([ours newFunctionWithName:@"plain_intersection"].functionType ==
+	      MTLFunctionTypeIntersection);
 	// A function made apart from the library's table states no patch.
 	RgfxFunction *bare = [RgfxFunction functionWithLibrary:ours
 	                                                  name:@"patch_quad4"
