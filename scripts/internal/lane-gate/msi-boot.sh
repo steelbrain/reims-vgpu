@@ -59,9 +59,15 @@
 # APPLOAD (1: the app load after the measurements, msi-appload.sh, with the tools lane-gate.sh
 # copies into this script's appload-tools/). A probe boot (probe-batch.sh) sets PROBES,
 # PROBE_RESULTS and PROBE_TIP in place of PHASES and CORPUS (msi-probes.sh says what they are).
+# A boot of another device than ours (a stock control) sets GFX_B64 (base64 of QEMU's graphics
+# arguments, a shell fragment msi-launch.sh pastes in place of its reims-graphics-pci), QEMU_ENV
+# ("K=V ...", each exported for QEMU, {DIR} the boot's directory) and METAL_CHECK=0 (no check that
+# the guest's Metal device is ours).
 set -uo pipefail
 R=$(cd "${1:?usage: msi-boot.sh RUNDIR}" && pwd)
 . "$R/boot.env"
+if [[ -n ${GFX_B64:-} ]]; then GFX=$(printf '%s' "$GFX_B64" | base64 -d); export GFX; fi
+for kv_ in ${QEMU_ENV:-}; do export "${kv_//\{DIR\}/$R}"; done
 START=$(date +%s)
 T0=$START
 log() { echo "$(date +%T) $*" | tee -a "$R/boot.log"; }
@@ -600,7 +606,9 @@ log "kext loaded: $(tr -s ' ' < "$R/kext-load.txt" | tr '\n' ';' | cut -c1-300)"
 # RgfxGate installs the bundle at the first boot, and the accelerator registers for it the same
 # boot: a Metal device that is not ours here is a failure (the run goes on after one reboot).
 dev=$(G "perl -e 'alarm 30; exec @ARGV' ~/lane-gate/bench -l 2>/dev/null")
-if [[ $dev == *"bench: device"* && $dev != *"Apple Paravirtual"* ]]; then
+if [[ ${METAL_CHECK:-1} == 0 ]]; then
+  log "the guest's Metal device, not checked (METAL_CHECK=0): $dev"
+elif [[ $dev == *"bench: device"* && $dev != *"Apple Paravirtual"* ]]; then
   kv first_boot_accel 1
 else
   kv first_boot_accel 0

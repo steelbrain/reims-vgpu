@@ -26,6 +26,7 @@
 #                  [--exclude NAME,...] [--hold S] [--catch-from-boot] [--host-tip SHA] [--image-tip SHA]
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
 #                  [--host-log FILTER] [--stage NAME=DIR[@TIP]]... [--ram GIB] [--after CMD]
+#                  [--image PATH] [--rom PATH] [--gfx-b64 B64] [--qemu-env K=V]... [--no-metal-check]
 #
 # The round runs as a potluck job on the lane host (lane-gate/msi-round.sh), holding the 5080 and the
 # whole host (--exclusive; potluck's lease is the lock), dispatched from a throwaway commit of the
@@ -36,6 +37,10 @@
 # queue; --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page
 # cache a probe's host side fills counts too); --after CMD runs CMD on the lane host after the boot,
 # inside the job (a hook's own wait for its post-processing, say). --dry-run does not run as a job.
+# A stock control boots other devices than ours: --image PATH (an OpenCore image on the lane host,
+# only read: the boot writes an overlay), --rom PATH, --gfx-b64 B64 (base64 of QEMU's graphics
+# arguments, a shell fragment in place of reims-graphics-pci), --qemu-env K=V (exported for QEMU,
+# {DIR} the round's directory), --no-metal-check (no check that the Metal device is ours).
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -71,6 +76,7 @@ L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
 cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() ram=64 after=
+oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1
 while (($#)); do
   a=$1
   shift
@@ -93,6 +99,11 @@ while (($#)); do
     --stage) stages+=("${1:?--stage NAME=DIR[@TIP]}"); shift ;;
     --ram) ram=${1:?--ram GIB}; shift ;;
     --after) after=${1:?--after CMD}; shift ;;
+    --image) oc_path=${1:?--image PATH}; shift ;;
+    --rom) rom_path=${1:?--rom PATH}; shift ;;
+    --gfx-b64) gfx_b64=${1:?--gfx-b64 B64}; shift ;;
+    --qemu-env) qemu_env+=("${1:?--qemu-env K=V}"); shift ;;
+    --no-metal-check) metal_check=0 ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -228,10 +239,13 @@ find "$L" -maxdepth 1 -type f -exec cp -p {} "$S/lg/bin/" \;
 cp -p "$run/artifacts/payload/bench" "$S/lg/ship/payload/"
 cat > "$S/lg/boot.env" << EOF
 QEMU=$MSI_RGK_RUN/tip-host/$HOST_SHORT/qemu-system-x86_64
-ROM=$MSI_RGK_RUN/tip-host/$HOST_SHORT/ReimsGraphics.rom
-OC=$MSI_RGK_RUN/loader-fix/oc-sipon-$IMAGE_SHORT.qcow2
+ROM=${rom_path:-$MSI_RGK_RUN/tip-host/$HOST_SHORT/ReimsGraphics.rom}
+OC=${oc_path:-$MSI_RGK_RUN/loader-fix/oc-sipon-$IMAGE_SHORT.qcow2}
 DISK=$MSI_DISK
 TAG=probes-$ROUND
+GFX_B64=$gfx_b64
+QEMU_ENV="${qemu_env[*]:-}"
+METAL_CHECK=$metal_check
 PAYLOAD=$RD/payload
 CORPUS=
 GUEST_USER=$GUEST_USER
