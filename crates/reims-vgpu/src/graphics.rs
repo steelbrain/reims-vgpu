@@ -1231,8 +1231,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// this one's turn before its walk anyway.
     ///
     /// So is a short buffer, its message of [`INLINE_WALK_MAX`] bytes at most, whose commit would
-    /// wait for nothing ([`GraphicsDecoder::commits_at_once`]): its turn is next, and no buffer it
-    /// is committed after is still to be committed. Its walk takes about what the
+    /// wait for nothing ([`GraphicsDecoder::commits_at_once`]): its turn is next, and no buffer of
+    /// its process it is committed after is still to be committed. Its walk takes about what the
     /// lane thread's wake would, and its commit then follows at once, where on the lane each
     /// buffer of a drain (a guest's buffers committed back to back and waited for) paid a wake
     /// for its walk and another for the turn its commit waited on. The queue's next buffer is

@@ -1,14 +1,25 @@
 //! The order of commits that `CB_SUBMITTED` promises (docs/graphics-kext/design.md, "Submitted"):
-//! a command buffer answered as it is taken, before its walk, is committed before anything the
-//! guest sends after the answer is carried out where that could see the commit's place.
+//! a command buffer answered as it is taken, before its walk, is committed before anything its
+//! process sends after the answer is carried out where that could see the commit's place.
 //!
 //! - **Command buffers.** A buffer answered at its take holds a ticket ([`Ticket`]), issued before
 //!   its answer is posted and given back once it is committed (or its stand-in is, or neither can
-//!   be). Every command buffer marks the tickets issued as it is begun ([`Sequencer::mark`]), and
-//!   is committed only once each of them is given back ([`Sequencer::wait_for`]). A buffer the
-//!   guest sends after an answer is begun after it, so it is committed after that buffer, on any
-//!   queue of any context, as the platform orders a tracked resource by commit; a buffer begun
-//!   before the answer is not held up, as under one lock it could have been carried out first.
+//!   be), with its context. Every command buffer marks the tickets issued as it is begun
+//!   ([`Sequencer::mark`]), and is committed only once each of them of its own context is given
+//!   back ([`Sequencer::wait_for`]). A buffer the guest sends after an answer is begun after it,
+//!   so it is committed after that buffer, on any queue of the answered buffer's context, as the
+//!   platform orders a tracked resource by commit; a buffer begun before the answer is not held
+//!   up, as under one lock it could have been carried out first.
+//! - **Other contexts.** A buffer of another context waits for no ticket of this one: it cannot
+//!   name the context's objects, which are its process's alone, and Metal orders a tracked
+//!   resource by commit only within a process (docs/graphics-kext/dgpu-oracle.md, Q6). What two
+//!   processes share is an IOSurface, whose accesses the order of IOSurface accesses
+//!   (`SURFACE_ORDER`, [`super::surface_order`]) orders on the GPU, and a surface's device cache,
+//!   whose fills and copies wait for its users ([`super::surface_cache`]); neither reads the
+//!   commit order, as a Mac's order of IOSurface accesses does not (Q16). So one process's
+//!   answered buffer whose walk is long (a cold make in a draw) holds up only its own process's
+//!   later commits, as on a Mac, where each process's queues run apart. A ticket or a buffer of
+//!   no context is waited for by, and waits for, every one.
 //! - **Range messages.** `BUFFER_DID_MODIFY_RANGE` and `TEXTURE_REPLACE_REGION` of a `Managed`
 //!   object reach the platform's next submission, so one is carried out only once every ticket of
 //!   its context issued before it is given back ([`Sequencer::after_context`]): its object is its
@@ -68,6 +79,12 @@ impl Open {
             .filter(|&&(_, _, given_back)| !given_back)
             .map(|&(_, context, _)| context)
     }
+}
+
+/// Whether a command buffer of `context` is committed after a ticket of `holder`'s (the module
+/// doc): one of its own context, or either of no context.
+fn orders(context: Option<u32>, holder: Option<u32>) -> bool {
+    context.is_none() || holder.is_none() || holder == context
 }
 
 /// One context's range messages ([`Sequencer::after_context`]).
@@ -150,21 +167,29 @@ impl Sequencer {
         open.tickets.iter().filter(|t| !t.2).count()
     }
 
-    /// Waits, with no lock of the caller's held, until every ticket up to `mark` is given back.
-    pub(crate) fn wait_for(&self, mark: u64) {
+    /// Waits, with no lock of the caller's held, until every ticket up to `mark` that a command
+    /// buffer of `context` is committed after is given back: its own context's, and those of no
+    /// context (the module doc). A buffer of no context waits for every one.
+    pub(crate) fn wait_for(&self, context: Option<u32>, mark: u64) {
         if self.done_through.load(Ordering::Acquire) >= mark {
             return;
         }
         let mut open = self.open.lock();
-        while self.done_through.load(Ordering::Acquire) < mark {
+        while self.done_through.load(Ordering::Acquire) < mark
+            && open.out_through(mark).any(|holder| orders(context, holder))
+        {
             self.given_back.wait(&mut open);
         }
     }
 
-    /// Whether a command buffer marked at `mark` would be committed now, waiting for no ticket
-    /// ([`Self::wait_for`]). Waits for nothing.
-    pub(crate) fn reached(&self, mark: u64) -> bool {
-        self.done_through.load(Ordering::Acquire) >= mark
+    /// Whether a command buffer of `context` marked at `mark` would be committed now, waiting for
+    /// no ticket ([`Self::wait_for`]); `None` where the order is busy. Waits for nothing.
+    pub(crate) fn reached(&self, context: Option<u32>, mark: u64) -> Option<bool> {
+        if self.done_through.load(Ordering::Acquire) >= mark {
+            return Some(true);
+        }
+        let open = self.open.try_lock()?;
+        Some(!open.out_through(mark).any(|holder| orders(context, holder)))
     }
 
     /// Whether `asked` range messages of `context` are carried out, so a command buffer begun
@@ -309,11 +334,11 @@ mod tests {
         let ticket = s.issue(Some(1), false).unwrap();
         let after = s.mark();
         // Marked before the ticket: not held up.
-        s.wait_for(before);
+        s.wait_for(Some(1), before);
         let went = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                s.wait_for(after);
+                s.wait_for(Some(1), after);
                 went.store(true, Ordering::Release);
             });
             std::thread::sleep(Duration::from_millis(50));
@@ -334,7 +359,44 @@ mod tests {
         assert!(s.done_through.load(Ordering::Acquire) < mark);
         drop(first);
         assert_eq!(s.done_through.load(Ordering::Acquire), mark);
-        s.wait_for(mark);
+        s.wait_for(None, mark);
+    }
+
+    /// A commit waits for its own context's tickets alone: one of context 1 marked after context
+    /// 2's ticket goes at once, and one of context 2 waits for it; a ticket of no context holds
+    /// up every context's, and a buffer of no context waits for every context's ticket.
+    #[test]
+    fn a_commit_waits_for_its_own_context_s_tickets_alone() {
+        let s = Arc::new(Sequencer::default());
+        let other = s.issue(Some(2), false).unwrap();
+        let mark = s.mark();
+        // Another context's ticket: not held up.
+        s.wait_for(Some(1), mark);
+        let held_up = |context: Option<u32>, mark: u64, ticket: Ticket| {
+            let went = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    s.wait_for(context, mark);
+                    went.store(true, Ordering::Release);
+                });
+                std::thread::sleep(Duration::from_millis(50));
+                let early = went.load(Ordering::Acquire);
+                drop(ticket);
+                assert!(
+                    !early,
+                    "{context:?} went past an open ticket it is ordered after"
+                );
+            });
+            assert!(went.load(Ordering::Acquire));
+        };
+        // Its own context's ticket holds it up.
+        held_up(Some(2), mark, other);
+        // A ticket of no context holds up every context's commit.
+        let none = s.issue(None, false).unwrap();
+        held_up(Some(1), s.mark(), none);
+        // A buffer of no context waits for every context's ticket.
+        let own = s.issue(Some(3), false).unwrap();
+        held_up(None, s.mark(), own);
     }
 
     /// A range message waits for its own context's tickets alone, holding up no thread: it is

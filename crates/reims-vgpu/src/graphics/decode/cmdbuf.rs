@@ -30,12 +30,13 @@
 //! ([`Held`]), before it walks the buffer's ops ([`Take`]); a GPU wait for a buffer of another
 //! queue ([`super::surface_order`]) holds back neither its `CB_SUBMITTED` nor its `CB_SCHEDULED`,
 //! which then goes at its commit ([`Line`]), as a Mac's order of IOSurface accesses holds back no
-//! record (Q16). Its ticket in the commit order is
-//! issued first ([`super::sequencer`]), so every command buffer the guest sends after it, on any
-//! queue, is committed after the buffer's commit, and the platform orders the guest's later work
-//! after it as it orders by commit. A buffer whose walk then faults has its failure at its completion, as
-//! Metal reports a command buffer's errors. Any other buffer gets it at its scheduling, once the
-//! waits are satisfied: Metal orders a tracked resource across queues behind what it has
+//! record (Q16). Its ticket in the commit order is issued first ([`super::sequencer`]), so every
+//! command buffer its process sends after it, on any queue, is committed after the buffer's
+//! commit, and the platform orders the process's later work after it as it orders by commit;
+//! another process's buffers wait for no ticket of its, as they name none of its tracked
+//! resources. A buffer whose walk then faults has its failure at its completion, as Metal reports
+//! a command buffer's errors. Any other buffer gets it at its scheduling, once the waits are
+//! satisfied: Metal orders a tracked resource across queues behind what it has
 //! submitted, not behind a buffer its queue holds (measured on the M3 through the decoder, a
 //! later commit on another queue ran first), and the host's fills of device caches are waits
 //! too. Either way it goes once, ahead of the buffer's `CB_SCHEDULED` and `CB_COMPLETE`
@@ -1017,7 +1018,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         // Submitted at once, unless it waits (for an event, or for the host's fill of a device
         // cache) or a buffer before it on its queue does: then at its scheduling. Its ticket in
-        // the commit order is issued first, so a buffer the guest sends after the answer is
+        // the commit order is issued first, so a buffer its process sends after the answer is
         // committed after this one ([`super::sequencer`]).
         if let Some(submitted) = begun.submitted_at_take() {
             self.issue_ticket();
@@ -1122,9 +1123,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Whether the command buffer, begun, would be committed at once, waiting for nothing
-    /// ([`Self::wait_to_commit`]): its turn is next, and no buffer answered before its begin, no
-    /// range message of its context before it, and no buffer its `COMMIT_ORDER` names is still
-    /// to be committed. Waits for nothing: a lock found busy answers false.
+    /// ([`Self::wait_to_commit`]): its turn is next, and no buffer of its context answered before
+    /// its begin, no range message of its context before it, and no buffer its `COMMIT_ORDER`
+    /// names is still to be committed. Waits for nothing: a lock found busy answers false.
     pub(crate) fn commits_at_once(&self) -> bool {
         let named = (self.commit_after.borrow().iter())
             .all(|(marks, seqno)| marks.commit.reached(*seqno, Until::Committed));
@@ -1132,7 +1133,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             return false;
         }
         let sequencer = &self.shared.sequencer;
-        let tickets = (self.mark.get()).is_none_or(|mark| sequencer.reached(mark));
+        let tickets = (self.mark.get())
+            .is_none_or(|mark| sequencer.reached(self.context, mark) == Some(true));
         let ranges = match (self.context, self.ranges.get()) {
             (Some(context), Some(Some(asked))) => {
                 sequencer.ranges_done(context, asked) == Some(true)
@@ -1548,15 +1550,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Waits, with no lock held, until the command buffer may be committed: after the buffers of
-    /// its queue taken before it ([`super::lane`]), every buffer answered `CB_SUBMITTED` before
-    /// its begin, and its context's range messages that came before its begin
+    /// its queue taken before it ([`super::lane`]), every buffer of its context answered
+    /// `CB_SUBMITTED` before its begin, and its context's range messages that came before its begin
     /// ([`super::sequencer`]); then after the buffers of its process's other queues its
     /// `COMMIT_ORDER` names ([`super::commit_order`]).
     fn wait_to_commit(&self) {
         self.wait_turn();
         let sequencer = &self.shared.sequencer;
         if let Some(mark) = self.mark.get() {
-            sequencer.wait_for(mark);
+            sequencer.wait_for(self.context, mark);
         }
         if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
             sequencer.wait_for_ranges(context, asked);
@@ -3969,8 +3971,8 @@ mod tests {
     /// A buffer answered on a doorbell's thread whose context closes before its begin gives its
     /// ticket in the commit order back as the close takes the context's tables out
     /// ([`GraphicsDecoder::close_tables`]), before the close worker lets go of its objects
-    /// (`Closed::let_go`): another context's commit marked after the ticket waits for
-    /// nothing of the closed context's.
+    /// (`Closed::let_go`): a commit marked after the ticket that is ordered after every
+    /// context's, one of no context, waits for nothing of the closed context's.
     #[test]
     fn a_close_gives_an_unbegun_answer_s_ticket_back_as_it_takes_the_tables() {
         let (p, mut dec, posted) = posting(false);
@@ -3986,7 +3988,7 @@ mod tests {
             0,
             "given back before its objects are let go of"
         );
-        sequencer.wait_for(after);
+        sequencer.wait_for(None, after);
         closed.let_go();
         assert_eq!(sequencer.out(), 0);
     }

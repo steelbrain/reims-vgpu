@@ -1873,9 +1873,12 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   behind a long buffer, and not before the signal where the buffer, or one before it on its
   queue, waits for an event. A buffer committed on any queue once the call returned is ordered
   after it for a tracked resource. The host answers as it takes the buffer, once its ticket in
-  the commit order is issued, and commits every command buffer the guest sends after the
-  answer, on any queue, after that buffer's commit; a range message the guest sends after it
-  waits for that commit too ("What a walk sees", below). metal2vulkan orders by commit across
+  the commit order is issued, and commits every command buffer the buffer's process sends after
+  the answer, on any of its queues, after that buffer's commit; a range message the process
+  sends after it waits for that commit too ("What a walk sees", below). Another process's
+  buffers do not wait for it: a tracked resource is one process's, and what processes share, an
+  IOSurface, is ordered on the GPU by the order of IOSurface accesses ("Surface order", below),
+  as a Mac orders it (Q16). metal2vulkan orders by commit across
   queues, and Metal orders behind what it has submitted, which a held queue's buffers are not,
   hence the rule for a queue held by a wait. Tested through the decoder on both platforms
   (`a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
@@ -2188,15 +2191,26 @@ commit. Each outcome the new design allows is one of those two:
   ticket, issued before the answer is posted, until it is committed (or its
   stand-in is); one answered at its doorbell holds the answer's. Every command
   buffer notes the tickets issued at its begin and is committed only once each
-  is given back. A buffer the guest sends after an
+  of its own context's is given back. A buffer its process sends after an
   answer is begun after its ticket, so it is committed after the answered
   buffer, as under the lock the answered buffer held through its commit. A
   buffer begun before the answer does not wait: the guest sent it with no
-  answer in hand, so under the lock it could have been taken first. A ticket
+  answer in hand, so under the lock it could have been taken first. Another
+  context's buffer waits for no ticket of this one, though the lock held it
+  too: it names none of the context's objects, and what it shares with it, an
+  IOSurface, is ordered on the GPU (`SURFACE_ORDER`) and by the device cache's
+  users, not by commit, as a Mac orders tracked resources by commit only
+  within a process (dgpu-oracle.md, Q6 and Q16). So one process's answered
+  buffer whose walk is long (a cold make in a draw) holds up only its own
+  process's commits, where under a device-wide order every process's buffer
+  begun meanwhile, the compositor's among them, waited for it. A ticket
   is issued after its buffer's begin, and a buffer waits only for older
   tickets, so the waits end. Tested by
-  `a_buffer_sent_after_an_answer_is_committed_after_it`, and the sequencer's
-  `a_commit_waits_only_for_the_tickets_issued_before_its_begin` and
+  `a_buffer_sent_after_an_answer_is_committed_after_it`,
+  `a_held_walk_answered_its_submitted_holds_only_its_process_s_later_commits`
+  (`graphics/tests.rs`), and the sequencer's
+  `a_commit_waits_only_for_the_tickets_issued_before_its_begin`,
+  `a_commit_waits_for_its_own_context_s_tickets_alone` and
   `tickets_given_back_out_of_order_hold_through_the_oldest`.
 - **Range messages.** `BUFFER_DID_MODIFY_RANGE` and `TEXTURE_REPLACE_REGION`
   reach the platform's next submission. One is carried out once every ticket
@@ -2279,7 +2293,7 @@ commit. Each outcome the new design allows is one of those two:
     waits for no buffer of its queue, rather than handed to a lane thread that
     would first be woken or made for it (so is a short buffer, its message of
     2 KiB at most, whose commit would wait for nothing at its begin: its turn
-    next, and no buffer it is committed after still to commit;
+    next, and no buffer of its process it is committed after still to commit;
     on the lane, each buffer of a drain paid a thread's wake for its walk and
     another for the turn its commit waited on);
   - its signal of its queue's surface timeline ("Surface order"), and the
@@ -2289,7 +2303,7 @@ commit. Each outcome the new design allows is one of those two:
     waiter that saw a later buffer taken while an earlier one still walked
     would wait for nothing;
   - its answer at its take, posted at its begin, before the buffers before it
-    on its queue commit: everything the guest sends after the answer is
+    on its queue commit: everything its process sends after the answer is
     committed after the buffer (its ticket), which commits after them, so
     nothing sent later sees the difference, and those buffers are `Committed`
     or `Scheduled` at the answer by a race, as Metal's are.

@@ -2957,13 +2957,15 @@ fn a_walk_held_in_a_draw_holds_up_no_other_queue() {
 }
 
 /// A command buffer answered its `CB_SUBMITTED` whose walk is held inside the platform's draw
-/// holds up no other queue's take or begin, only the commits of the buffers begun after its
-/// answer, which come after it ([`decode::sequencer`]): another process's buffer that asks for
-/// its `CB_SUBMITTED` is answered with the draw held, and committed once the held buffer is
+/// holds up no other queue's take or begin, and only the commits of its own process's buffers
+/// begun after its answer, which come after it ([`decode::sequencer`]): with the draw held,
+/// another process's buffer that asks for its `CB_SUBMITTED` is answered, committed and
+/// completed, as no tracked resource of one process is another's; a buffer of the held
+/// process's other queue is answered, and committed once the held buffer is
 #[test]
-fn a_held_walk_answered_its_submitted_holds_only_later_commits() {
+fn a_held_walk_answered_its_submitted_holds_only_its_process_s_later_commits() {
     let raised = Arc::new(AtomicU32::new(0));
-    let (device, platform, _guest, [mut held, _, mut other]) = two_processes(&raised);
+    let (device, platform, _guest, [mut held, mut beside, mut other]) = two_processes(&raised);
     let draw = hold_next_draw(&platform);
     held.send(
         &device,
@@ -2982,18 +2984,32 @@ fn a_held_walk_answered_its_submitted_holds_only_later_commits() {
         ring_events(&platform, &mut held, 1),
         [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
     );
-    let commits = platform.call_log().count("commit");
+
+    // Another process's buffer, begun after the answer: committed with the draw held.
     other.send(&device, asking(obj(2, 1), 200));
     assert_eq!(
-        ring_events(&platform, &mut other, 1),
-        [(RGFX_EVT_CB_SUBMITTED, 200, 0)],
-        "the other process's buffer was not begun beside the held walk"
+        ring_events(&platform, &mut other, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 200, 0),
+            (RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK)),
+        ],
+        "another process's buffer waited for the held walk's commit"
+    );
+
+    // The held process's other queue's buffer, begun after the answer: answered, and committed
+    // only after the held buffer.
+    let commits = platform.call_log().count("commit");
+    beside.send(&device, asking(obj(1, 2), 300));
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 300, 0)],
+        "the held process's other queue's buffer was not begun beside the held walk"
     );
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(
         platform.call_log().count("commit"),
         commits,
-        "a buffer begun after the held one's answer was committed before it"
+        "a buffer of the held process begun after the held one's answer was committed before it"
     );
 
     draw.open();
@@ -3006,8 +3022,8 @@ fn a_held_walk_answered_its_submitted_holds_only_later_commits() {
         ]
     );
     assert_eq!(
-        ring_events(&platform, &mut other, 1),
-        [(RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK))]
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_COMPLETE, 300, u64::from(RGFX_CB_OK))]
     );
 }
 
