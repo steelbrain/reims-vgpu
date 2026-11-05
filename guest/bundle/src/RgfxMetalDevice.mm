@@ -1545,12 +1545,13 @@ RGFX_LOG_UNRECOGNIZED
 	return nil;
 }
 
-// A buffer over an IOSurface would need the surface's GPU copy (RgfxIOSurface.h) in the
-// surface's own layout, so that it aliases the surface's textures; none is made.
+// No buffer over an IOSurface, as both x86 Macs answer: the AMD 5300M and the Intel 630 under
+// macOS 26.7.1 answer nil for 64 x 64 and 100 x 7 BGRA surfaces and a two-plane 420v one
+// (oracle_bundle iosurf.buffer). So no buffer of the device lies over a surface, and each
+// answers iosurface NULL (RgfxBuffer).
 - (id<MTLBuffer>)newBufferWithIOSurface:(IOSurfaceRef)surface
 {
 	(void)surface;
-	RGFX_UNSUPPORTED("buffers over IOSurfaces");
 	return nil;
 }
 

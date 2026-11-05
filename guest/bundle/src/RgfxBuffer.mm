@@ -881,8 +881,9 @@ RGFX_RESOURCE_SPI
 	return heap != nil ? heap.size : self.allocatedSize;
 }
 
-// The device makes no buffer over an IOSurface, so the buffer lies in none, as a buffer made from
-// a length or bytes answers none (measured on the M3 Max under macOS 27).
+// The device makes no buffer over an IOSurface, as neither x86 Mac does (newBufferWithIOSurface:,
+// RgfxMetalDevice), so the buffer lies in none, as a buffer made from a length or bytes answers
+// none (measured on the M3 Max under macOS 27).
 - (IOSurfaceRef)iosurface
 {
 	return nullptr;

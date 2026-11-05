@@ -555,7 +555,7 @@ newBufferWithBytes:length:options:gpuAddress: absent %absent-as-metal
 newBufferWithBytesNoCopy:length:options:deallocator: implemented
 newBufferWithBytesNoCopy:length:options:gpuAddress:deallocator: absent %absent-as-metal
 newBufferWithDescriptor: partial buffer descriptors placing a buffer at a GPU address
-newBufferWithIOSurface: unsupported buffers over IOSurfaces
+newBufferWithIOSurface: metal no buffer over an IOSurface: the AMD 5300M and the Intel 630 answer nil for BGRA and two-plane 420v surfaces (measured, tools/oracle/oracle_bundle.m iosurf.buffer)
 newBufferWithLength:options: implemented
 newBufferWithLength:options:gpuAddress: absent %absent-as-metal
 newBufferWithLength:options:placementSparsePageSize: unsupported placement sparse buffers
