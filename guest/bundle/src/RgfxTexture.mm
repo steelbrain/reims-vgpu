@@ -525,6 +525,25 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
 	RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]", words);
 }
 
+void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
+{
+	const uint64_t f = format;
+	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	const bool compressed = in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241);
+	const bool depth = f == 250 || f == 252 || f == 253 || f == 260 || f == 261;
+	const bool lacked = f == 11 || f == 31 || in(40, 42) || in(45, 48) || in(95, 99) ||
+	                    in(120, 122) || in(160, 167) || f == 170 || f == 172 || f == 174 ||
+	                    f == 176 || in(178, 183) || in(186, 190) || in(192, 200) ||
+	                    in(204, 208) || in(210, 218) || in(222, 226) || in(228, 236) ||
+	                    f == 255 || f == 262 || f == 263 || in(552, 555);
+	if (!compressed && !depth && !lacked)
+		return;
+	RgfxMetalAssertionFailed("-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
+	                         compressed ? @"Linear textures do not support compressed pixel formats"
+	                         : depth    ? @"Linear textures do not support depth/stencil pixel formats"
+	                                    : @"MTLPixelFormatInvalid is not supported on this device.");
+}
+
 @interface RgfxTexture () <RgfxMetalTextureInternals>
 @end
 

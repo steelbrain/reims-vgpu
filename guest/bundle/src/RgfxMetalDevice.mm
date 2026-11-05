@@ -984,7 +984,17 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.textureBufferAlignment(static_cast<uint64_t>(format));
 }
 
+// 256 for every format the x86-64 Macs answer, as both answer it; Metal ends the process at the
+// others (rgfxEndAtUnalignableLinearFormat). The bundle's own callers ask
+// rgfxLinearTextureAlignmentForPixelFormat:, which ends nothing, as Metal's own texture creators
+// over a buffer do not end it there.
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	rgfxEndAtUnalignableLinearFormat(format);
+	return [self rgfxLinearTextureAlignmentForPixelFormat:format];
+}
+
+- (NSUInteger)rgfxLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
 {
 	return _caps.minimumLinearTextureAlignment(static_cast<uint64_t>(format));
 }

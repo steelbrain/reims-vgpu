@@ -1101,6 +1101,16 @@ static int dies_case(const char *name)
 		                                            device:nil
 		                                        serializer:&fx.ser];
 	}
+	if (std::strcmp(name, "linear-alignment-compressed") == 0)
+		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatBC1_RGBA);
+	if (std::strcmp(name, "linear-alignment-422") == 0)
+		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatBGRG422);
+	if (std::strcmp(name, "linear-alignment-depth") == 0)
+		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatDepth32Float);
+	if (std::strcmp(name, "linear-alignment-lacked") == 0)
+		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatASTC_4x4_LDR);
+	if (std::strcmp(name, "linear-alignment-d24s8") == 0)
+		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatDepth24Unorm_Stencil8);
 	}
 	return 0;
 }
@@ -1158,6 +1168,36 @@ void test_buffer_texture_types_end_the_process()
 			         t.name + ") disallowed\n'";
 			checkDies(dies.c_str(), words.c_str());
 		}
+	}
+}
+
+// minimumLinearTextureAlignmentForPixelFormat: ends the process with Metal's words where both x86
+// Macs' Metal does (oracle_caps formats: compressed and 4:2:2, depth and stencil, and the formats
+// the device lacks, named Invalid), and answers every other format, those of 256 and those no
+// oracle measured.
+void test_unalignable_linear_formats_end_the_process()
+{
+	const char *const kWhere = "-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]: failed "
+	                           "assertion `";
+	checkDies("linear-alignment-compressed",
+	          (std::string(kWhere) + "Linear textures do not support compressed pixel formats'")
+	              .c_str());
+	checkDies("linear-alignment-422", "Linear textures do not support compressed pixel formats'");
+	checkDies("linear-alignment-depth",
+	          (std::string(kWhere) + "Linear textures do not support depth/stencil pixel formats'")
+	              .c_str());
+	checkDies("linear-alignment-lacked",
+	          (std::string(kWhere) + "MTLPixelFormatInvalid is not supported on this device.'")
+	              .c_str());
+	checkDies("linear-alignment-d24s8", "MTLPixelFormatInvalid is not supported on this device.'");
+	const uint64_t answered[] = {1,  10, 12, 13, 14, 20, 22, 23, 24, 25, 30, 32, 33, 34, 43,  53,
+	                             54, 55, 60, 62, 63, 64, 65, 70, 71, 72, 73, 74, 80, 81, 90,  91,
+	                             92, 93, 94, 103, 104, 105, 110, 112, 113, 114, 115, 123, 124, 125,
+	                             // unmeasured: Invalid, and the Y'CbCr formats
+	                             0, 500, 501};
+	for (uint64_t f : answered) {
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f));
+		g_checks++;
 	}
 }
 
@@ -12083,6 +12123,7 @@ int main(int argc, char **argv)
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_buffer_texture_types_end_the_process();
 		test_invalid_texture_descriptors_end_the_process();
+		test_unalignable_linear_formats_end_the_process();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
 		test_texture_framebuffer_only();

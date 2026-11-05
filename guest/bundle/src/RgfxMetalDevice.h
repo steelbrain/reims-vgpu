@@ -51,6 +51,7 @@
 #import "RgfxArgumentEncoder.h" // RgfxRegionHolder
 #import "RgfxMetalPrivate.h"
 #import "RgfxStateCache.h"
+#import "RgfxTexture.h" // RgfxLinearAlignmentSource
 
 #include "RgfxCaps.hpp"
 #include "RgfxObjectModel.hpp"
@@ -70,7 +71,8 @@ class RgfxSlabs;
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface RgfxMetalDevice : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI, RgfxRegionHolder>
+@interface RgfxMetalDevice
+    : IOGPUMetalDevice <MTLDevice, MTLDeviceSPI, RgfxRegionHolder, RgfxLinearAlignmentSource>
 
 /// Metal's entry point: `[super initWithAcceleratorPort:]` identifies the GPU, then the
 /// wire handshake maps the process's window of the device region, reads the caps blob, and

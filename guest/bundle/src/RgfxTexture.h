@@ -131,6 +131,24 @@ NS_ASSUME_NONNULL_BEGIN
 /// send the host anything; it returns for any other descriptor.
 void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor);
 
+/// Ends the process, with Metal's words, where `minimumLinearTextureAlignmentForPixelFormat:` ends
+/// it on the x86-64 Macs: at each of 105 of the SDK's pixel formats, alike on the AMD 5300M and the
+/// Intel 630 under macOS 26.7.1 with no validation layer (oracle_caps formats): the
+/// block-compressed and 4:2:2 formats ("Linear textures do not support compressed pixel
+/// formats"), the depth and stencil ones ("... depth/stencil pixel formats"), and the ones the
+/// device lacks, which Metal names MTLPixelFormatInvalid (sRGB R8 and RG8, the three-channel
+/// formats, PVRTC, EAC, ETC2, ASTC, the packed 16-bit ones, D24S8 and X24S8 as the lane answers
+/// no Depth24Stencil8, Unspecialized and the XR10 formats). It returns for any other format,
+/// those the oracles answer 256 for and those no oracle measured.
+void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
+
+/// A device whose linear texture alignment the bundle's own callers ask without
+/// `minimumLinearTextureAlignmentForPixelFormat:`, which ends the process at some formats
+/// (rgfxEndAtUnalignableLinearFormat), where Metal's own creators do not.
+@protocol RgfxLinearAlignmentSource <NSObject>
+- (NSUInteger)rgfxLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+@end
+
 NS_ASSUME_NONNULL_END
 
 #endif // RGFX_TEXTURE_H_

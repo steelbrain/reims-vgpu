@@ -98,7 +98,7 @@ uint32_t rgfx::video::outputPlaneAlignment(uint32_t sampleBytes)
 	// a queue that neither draws nor computes take them (BufferPlanes in the video crate).
 	NSUInteger alignment = 4;
 	for (MTLPixelFormat format : {luma, chroma}) {
-		const NSUInteger a = [device minimumLinearTextureAlignmentForPixelFormat:format];
+		const NSUInteger a = [device rgfxLinearTextureAlignmentForPixelFormat:format];
 		if (a > alignment)
 			alignment = a;
 	}

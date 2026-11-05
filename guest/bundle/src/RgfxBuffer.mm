@@ -595,8 +595,12 @@ RGFX_RESOURCE_SPI
 {
 	if (descriptor == nil || descriptor.textureType == MTLTextureTypeTextureBuffer)
 		return YES;
+	id<MTLDevice> device = self.device;
 	const NSUInteger alignment =
-	    [self.device minimumLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat];
+	    [device respondsToSelector:@selector(rgfxLinearTextureAlignmentForPixelFormat:)]
+	        ? [(id<RgfxLinearAlignmentSource>)device
+	              rgfxLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat]
+	        : [device minimumLinearTextureAlignmentForPixelFormat:descriptor.pixelFormat];
 	if (alignment <= 1 || (offset % alignment == 0 && bytesPerRow % alignment == 0))
 		return YES;
 	os_log_debug(OS_LOG_DEFAULT,
