@@ -44,11 +44,12 @@ inline bool rgfxAskBegin(RgfxAskGate &g, bool open)
 }
 
 // An ask begun ends: true where it was the last in flight and the close waits for it, which the
-// caller then wakes.
+// caller then wakes. An end with none in flight counts nothing and wakes nothing.
 inline bool rgfxAskEnd(RgfxAskGate &g)
 {
-	if (g.inFlight)
-		g.inFlight--;
+	if (!g.inFlight)
+		return false;
+	g.inFlight--;
 	return g.closing && g.inFlight == 0;
 }
 
