@@ -744,6 +744,48 @@ Ours:
 - **Shared:** the call is a staging blit the call waits for (`RgfxTexture.mm`, rgfxCopyRegion:),
   hundreds of times a Mac's. The AMD's Shared texture is an unsynchronized Managed one (Q3).
 
+## Q18: when the CPU sees a signal from the middle of a command buffer
+
+Probe: `oracle_cmdbuf DEVICE events`, 11-05. Times are ms from the commit, medians of 10 runs
+(20 for the last row), on the 5300M and the 630 (macOS 26.7.1) and the M3 Max (macOS 27.0.1).
+A buffer runs a kernel calibrated near 100 ms alone, signals a shared event to 1 and runs a
+second such kernel (the 630's buffer of two ended at 100 ms):
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `signaledValue` first reads 1 (a thread polling it) | 101.3 | 100.5 | 90.3 |
+| `waitUntilSignaledValue:1` returns | 101.3 | 100.5 | 90.3 |
+| a listener's block for 1 runs | 101.3 | 100.9 | 90.3 |
+| `GPUEndTime` | 198.6 | 100.4 | 179.8 |
+| the completed handler runs | 198.7 | 101.0 | 179.9 |
+
+A buffer runs a kernel of half that, signals 1, waits for 2 and runs another; the CPU waits for 1
+and only then sets 2, from the waiting thread or from a listener's block for 1:
+
+| | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| the CPU sees 1 (each way) | 55.9, 56.0 | 102.1, 102.2 | 45.7, 46.7 |
+| the buffer completed, 10 of 10 each way | at 105.5, 105.5 | at 131.0, 131.1 | at 90.8, 92.1 |
+
+A buffer whose last command is the signal, after a half kernel: its listener's block runs
+within 0.03 ms of its completed handler on both x86 GPUs, before it in 16 of 20 runs on the AMD
+and 5 of 20 on the 630, and within 0.28 ms on the M3 (median 0.04), before it in 19 of 20.
+
+So Metal's CPU value, waits and listeners see a mid-buffer signal before the buffer ends, and a
+thread that waits on the CPU for it before it sets the value the same buffer waits for next goes
+on, on all three *(class 3)*. How soon is a race *(class 2)*: the AMD and the M3 see it within a
+few milliseconds of the GPU reaching it (the M3's listener 89.7 ms after `GPUStartTime`, one
+kernel's time), the 630 about 100 ms after the commit in both shapes: at the end of a buffer that
+ends by then, and some 70 ms after the GPU reached it in one that waits (its half kernel ran 25
+to 29 ms on its own). A signal at the buffer's end reaches the listener and the completed handler
+together, either first *(class 2)*.
+
+Our stack: the host posted a buffer's signals only at its end, which a buffer that waits after its
+signal for a value the CPU sets only after it saw the signal never reaches: a deadlock no Mac has
+*(class 4)*. The host now posts a signal the buffer has work after as its own event reaches the
+value, from a notification on a listener of its device's, as the AMD and the M3 do, and one at the
+buffer's end with the buffer's completion, ahead of its record (design.md, "Shared events").
+
 ## The display's colour against the stock lane: deliberate divergences
 
 Measured on a Linux host, in boots of 11-02: the stock lane's host shot of the desktop beside

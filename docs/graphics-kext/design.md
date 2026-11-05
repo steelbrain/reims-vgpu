@@ -1925,7 +1925,7 @@ CPU for a mid-buffer signal before it sets a value the same buffer waits for
 later goes on, and the buffer completes. So does ours: the host's notification
 comes as its GPU reaches the signal, as the 5300M's and the M3's do. A signal at
 the buffer's end reaches the CPU with the buffer's completion on all three, its
-listener's block within 0.03 ms of the completed handler, either one first, and
+listener's block within 0.3 ms of the completed handler, either one first, and
 ours comes ahead of the completion record. GPU waits are not affected either
 way: another buffer's `WAIT_EVENT` waits on the host's event, which the host's
 GPU signals at the point Metal's would.
