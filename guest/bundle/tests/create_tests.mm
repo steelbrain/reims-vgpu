@@ -437,6 +437,77 @@ void test_refused_state_is_not_cached()
 	}
 }
 
+// Each create that picks a GPU address gives it back where the device never got its create: a
+// device buffer, a heap of the device's and one over a region block, a buffer over a region
+// block, a texture of the device's and a Managed one (its CPU copy's buffer taken, the texture
+// refused). In a context whose addresses hold one pick, a device buffer made after the refusal
+// finds its address.
+void test_refused_create_gives_its_gpu_address_back()
+{
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 0x1000;
+	hd.storageMode = MTLStorageModePrivate;
+	hd.type = MTLHeapTypePlacement;
+	MTLHeapDescriptor *shared = [hd copy];
+	shared.storageMode = MTLStorageModeShared;
+	auto make = [&](Refusing &r, Blocks &b, int kind) -> id {
+		switch (kind) {
+		case 0:
+			return [RgfxBuffer bufferWithLength:0x1000
+			                            options:MTLResourceStorageModePrivate
+			                             device:nil
+			                         serializer:&r.ser];
+		case 1:
+			return [RgfxHeap heapWithDescriptor:hd device:nil serializer:&r.ser];
+		case 2:
+			return [RgfxHeap heapForDeviceWithDescriptor:shared
+			                                   maxLength:0
+			                                      region:&b.region
+			                                      device:nil
+			                                  serializer:&r.ser];
+		case 3:
+			return [RgfxBuffer bufferOverHostMemoryWithContents:b.mem.data() + RGFX_ALLOCATIONS_OFFSET
+			                                       regionOffset:RGFX_ALLOCATIONS_OFFSET
+			                                             length:0x1000
+			                                            options:MTLResourceStorageModeShared
+			                                        deallocator:nil
+			                                             device:nil
+			                                         serializer:&r.ser];
+		case 4:
+			return [RgfxTexture textureWithDescriptor:texture2D(MTLStorageModePrivate)
+			                                     heap:RGFX_OBJ_NONE
+			                               heapOffset:0
+			                                   device:nil
+			                               serializer:&r.ser];
+		default:
+			return [RgfxTexture managedTextureWithDescriptor:texture2D(MTLStorageModeManaged)
+			                                          region:&b.region
+			                                           slabs:nullptr
+			                                          device:nil
+			                                      serializer:&r.ser];
+		}
+	};
+	for (int kind = 0; kind < 6; kind++) {
+		Refusing &r = *new Refusing();
+		r.ids.setBases(0, RGFX_CONTEXT_VA_BASE, RgfxIdSpace::kAddressGranule);
+		Blocks &b = *new Blocks(0x100000);
+		const uint32_t messages = kind == 5 ? 2 : 1;
+		@autoreleasepool {
+			r.allow = messages - 1;
+			CHECK(make(r, b, kind) == nil);
+			CHECK(r.allow == 0 && r.taken.size() == messages - 1);
+		}
+		@autoreleasepool {
+			r.allow = 1;
+			CHECK([RgfxBuffer bufferWithLength:0x1000
+			                           options:MTLResourceStorageModePrivate
+			                            device:nil
+			                        serializer:&r.ser] != nil);
+			CHECK(r.taken.back() == RGFX_CMD_BUFFER_CREATE);
+		}
+	}
+}
+
 } // namespace
 
 void rgfxCreateTests()
@@ -451,4 +522,5 @@ void rgfxCreateTests()
 	test_refused_sampler_create_is_nil();
 	test_refused_depth_stencil_create_is_nil();
 	test_refused_state_is_not_cached();
+	test_refused_create_gives_its_gpu_address_back();
 }
