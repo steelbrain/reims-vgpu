@@ -57,7 +57,9 @@
 # load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
 # (the host's REIMS_VGPU_LOG filter, default info), CAPTURE (1: the boot capture, below), and
 # APPLOAD (1: the app load after the measurements, msi-appload.sh, with the tools lane-gate.sh
-# copies into this script's appload-tools/). A probe boot (probe-batch.sh) sets PROBES,
+# copies into this script's appload-tools/), and POST_PROBES and POST_PROBE_TIP (a gate boot's
+# probes after everything else, msi-probes.sh's PROBES and PROBE_TIP, into post-probes/; at the
+# end). A probe boot (probe-batch.sh) sets PROBES,
 # PROBE_RESULTS and PROBE_TIP in place of PHASES and CORPUS (msi-probes.sh says what they are).
 # A boot of another device than ours (a stock control) sets GFX_B64 (base64 of QEMU's graphics
 # arguments, a shell fragment msi-launch.sh pastes in place of its reims-graphics-pci), QEMU_ENV
@@ -771,5 +773,17 @@ if [[ -n $shot ]] && sleep 1 && G "cp \"$shot\" ~/lane-gate/desktop.png" && Gcp 
   magick "$R/desktop.png" -resize 25% "$R/desktop.png" 2> /dev/null || true
 else
   kv desktop_capture none
+fi
+
+# The gate's own probes last (POST_PROBES, lane-gate.sh --post-probes): after everything above,
+# on the app load's desktop, as a probe round runs them (msi-probes.sh), into post-probes/. They
+# wait at most POST_SETTLE_S (default 60) for the host's load to settle.
+if [[ -n ${POST_PROBES:-} && -d ${POST_PROBES:-} ]]; then
+  log "post probes: $(ls "$POST_PROBES" | tr '\n' ' ')$(left) s left"
+  PROBES=$POST_PROBES PROBE_RESULTS=$R/post-probes PROBE_TIP=$POST_PROBE_TIP QEMU_PID=$P \
+    DEADLINE=$(( T0 + HOLD_S - 20 )) B=$B R=$R HANG_CATCH_PID=$HCPID SETTLE_S=${POST_SETTLE_S:-60} \
+    PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS bash "$(dirname "$0")/msi-probes.sh" 2>&1 | tee -a "$R/boot.log"
+  kv post_probes_rc "${PIPESTATUS[0]}"
+  log "post probes done"
 fi
 exit 0

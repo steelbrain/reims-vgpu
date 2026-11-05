@@ -6,6 +6,7 @@
 #                 and the lane host's paths (MSI_GATE, MSI_RGK_RUN, MSI_BASE_OC, MSI_CORPUS_SRC,
 #                 MSI_CORPUS_ODD, MSI_QEMU_SUBPROJECTS, MSI_QEMU_SEED)
 #   lg/bin/       the gate's host scripts (msi-*.sh and the rest), as the gate has them
+#   lg/post-probes/  the probes the correctness boot runs last (lane-gate.sh --post-probes), if any
 #   lg/ship/      what the Mac built: payload/ (guest-run.sh and its tools), kexts/ (the loader's
 #                 kexts), RgfxGate.kext, reims-graphics.bundle.tgz, and qemu.bundle (vendor/qemu's
 #                 commits that MSI_QEMU_SEED lacks, a git bundle of refs/heads/lane-gate)
@@ -46,8 +47,9 @@ do_ship() {  # the gate's scripts and the Mac's build into the run's directory
   # run a boot used in the last two hours.
   ls -1dt "$MSI_GATE/runs"/*/ | tail -n +6 | while read -r d; do
     [[ $d == "$MR/" || -n $(find "$d" -mmin -120 -print -quit) ]] || rm -rf "$d"; done
-  rm -rf "$MR/bin" "$MR/payload" "$MR/kexts" "$MR/RgfxGate.kext"
+  rm -rf "$MR/bin" "$MR/payload" "$MR/kexts" "$MR/RgfxGate.kext" "$MR/post-probes"
   cp -a "$WS/lg/bin" "$MR/bin"
+  [[ ! -d $WS/lg/post-probes ]] || cp -a "$WS/lg/post-probes" "$MR/post-probes"  # lane-gate.sh --post-probes
   cp -a "$WS/lg/ship/payload" "$MR/payload"
   [[ ! -d $WS/lg/ship/kexts ]] || cp -a "$WS/lg/ship/kexts" "$MR/kexts"
   [[ ! -d $WS/lg/ship/RgfxGate.kext ]] || cp -a "$WS/lg/ship/RgfxGate.kext" "$MR/RgfxGate.kext"
@@ -130,7 +132,7 @@ boot)
   rc=$?
   for f in boot.log guest.log cpu.txt thermal.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log xid.txt \
     capture.txt kext-stalls.txt appload.txt appload.log kwin-reaper.txt \
-    kernel-rgfx.log drag-resize-track.txt launch.log.gz; do
+    kernel-rgfx.log drag-resize-track.txt launch.log.gz post-probes; do
     [[ ! -e $out/$f ]] || cp -a "$out/$f" "$OUT/$mode/"
   done
   echo "$rc" > "$OUT/$mode/rc"

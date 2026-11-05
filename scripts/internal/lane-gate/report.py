@@ -244,6 +244,7 @@ class Run:
                 self.drag(d)
                 self.work(d)
                 self.appload(d)
+                self.post_probes(d)
                 self.video(d)
                 self.clocks(d)
         self.ip, self.mp = "", ""
@@ -764,6 +765,23 @@ class Run:
             self.litem(f"work.{name}", "INFO",
                        f"over {span:.1f} s: WindowServer {cbs} command buffers, {encs} render encoders, "
                        f"{frames} display updates; per WS command buffer/per update: " + ", ".join(parts))
+
+    def post_probes(self, r):
+        """The correctness boot's own probes after everything else (lane-gate.sh --post-probes, in
+        post-probes/NAME/ as msi-probes.sh writes them): listed, not judged; their fatal lines
+        count in the boot's."""
+        d = os.path.join(r, "post-probes")
+        if not os.path.isdir(d):
+            return
+        for name in sorted(os.listdir(d)):
+            pd = os.path.join(d, name)
+            if not os.path.isdir(pd):
+                continue
+            status = read(os.path.join(pd, "status")).strip() or "no status"
+            rc = read(os.path.join(pd, "rc")).strip()
+            wall = read(os.path.join(pd, "wall_s")).strip()
+            detail = (f"rc {rc} in {wall} s" if status == "ran" else status) + f"; its results in {os.path.relpath(pd, self.path)}"
+            self.litem(f"post.{name}", "INFO", detail)
 
     def appload(self, r):
         """The app load (msi-appload.sh's appload.txt): every app, then 7 Safari pages. Its bar: no

@@ -55,6 +55,12 @@
 #                 --qemu-hook ({PID} QEMU's pid, {DIR} the boot's directory, whose guest.log has
 #                 guest-run.sh's lines as they come, "# start CASE" before each bench case); a
 #                 control: never --record it
+#   --post-probes DIR  run the probes in DIR (one directory each, as probe-batch.sh's: run.sh,
+#                 budget, tip; DIR/.order their order) in the correctness boot after everything
+#                 the gate measures and checks there, the app load's desktop still up
+#                 (lane-gate/msi-probes.sh, into the boot's post-probes/; report.py lists each as
+#                 INFO, and their fatal lines count in the boot's); the boot's hold grows by their
+#                 budgets. Given to the build (it ships DIR) and again to the --boot-only pass
 #   --no-bench    leave out the bench leg; --wait-bench waits for it before exiting, where by
 #                 default it runs on after the verdict, detached (its output in runs/RUNID/bench.out)
 #   --publish     REV is the lane's tip: publish its image and host build on the lane host, read-only,
@@ -121,7 +127,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio=
+record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio= post_probes=
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -142,6 +148,7 @@ while (($#)); do
     --final-cmd) final_cmd=$2; shift ;;
     --no-appload) appload=0 ;;
     --appload-info) appload_info=$2; shift ;;
+    --post-probes) post_probes=$(cd "$2" && pwd) || die "no directory $2"; shift ;;
     --no-bench) bench=no ;;
     --wait-bench) bench=wait ;;
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
@@ -496,6 +503,7 @@ do_ship() {
   # streams to check again (decode-repeat.txt, "SET STREAM N" a line), where the gate has any.
   cp -pR "$ART/payload" "$S/lg/ship/payload"
   cp -p "$L/guest/"* "$S/lg/ship/payload/"
+  [[ -z $post_probes ]] || cp -pR "$post_probes" "$S/lg/post-probes"  # --post-probes
   [[ ! -s $GH/sweep-cases.txt ]] || cp "$GH/sweep-cases.txt" "$S/lg/ship/payload/"
   rm -f "$S/lg/ship/payload/decode-repeat.txt"
   [[ ! -s $GH/decode-repeat.txt ]] || cp "$GH/decode-repeat.txt" "$S/lg/ship/payload/"
@@ -602,6 +610,13 @@ do_boot() {
     # WebGL's frame rate and present_probe's answers first: the quickest read of a tip's frame pace.
     excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10 tmo=30m
   fi
+  # --post-probes: their budgets, each with its start's settle (60 s at most) and a margin.
+  local post_s=0
+  if [[ $mode == boot && -n $post_probes ]]; then
+    post_s=$(cat "$post_probes"/*/budget 2> /dev/null | awk '{s += $1 + 90} END {print s + 120}')
+    hold=$(( hold + post_s ))
+    tmo=$(( 40 + post_s / 60 ))m
+  fi
   ws=$(cat "$RUN/workspace")
   cat > "$RUN/boot-$mode.env" << EOF
 QEMU=${host_dir:-$MR}/qemu-system-x86_64
@@ -627,6 +642,8 @@ CAPTURE=$([[ $mode == boot ]] && echo "$capture" || echo 0)
 APPLOAD=$([[ $mode == boot ]] && echo "$appload" || echo 0)
 FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_cmd" | base64 | tr -d '\n')
 QEMU_HOOK_B64=$([[ $mode == bench && -n $qemu_hook ]] && printf '%s' "$qemu_hook" | base64 | tr -d '\n')
+POST_PROBES=$([[ $mode == boot && -n $post_probes ]] && echo "$MR/post-probes")
+POST_PROBE_TIP=$sha
 EOF
   set +e
   pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" --exclusive --gpu "$PL_GPU" --workspace "$ws" \
