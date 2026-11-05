@@ -2332,6 +2332,12 @@ commit. Each outcome the new design allows is one of those two:
   order, and finds the buffer submitted already. Tested by the bundle's
   `test_submitted_at_the_doorbell_wakes_no_thread` and
   `test_reply_reader_holds_submitted` (`tests/shell_tests.mm`).
+  A buffer the doorbell leaves to the queue's thread because ring 0 is behind
+  (a create of its process's not yet carried out) is offered the same way on
+  the lane's thread whose carrying out ends the queue's thread's wait, before
+  that thread is woken (`reims_graphics`'s queue gate, its offers), so its
+  `CB_SUBMITTED` no longer waits for the queue's thread's wake
+  (`a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread`).
   Tested by `a_doorbell_s_answer_allocates_nothing` and
   `a_doorbell_write_answers_a_command_buffer_on_its_thread`
   (`graphics/tests.rs`), the `cmdbuf` tests

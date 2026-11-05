@@ -1259,10 +1259,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
-    /// [`Host::answer_command_buffer`]: answers the `COMMAND_BUFFER` `message` at the head of the
-    /// ring of the queue `poster` posts onto `CB_SUBMITTED`, on a doorbell's thread, before the
-    /// queue's service thread takes it, where it gets that at its take and nothing need be waited
-    /// for or allocated (`decode`'s [`Decoders::answer_at_doorbell`]): it runs on that queue, no
+    /// [`Host::answer_command_buffer`]: answers the `COMMAND_BUFFER` `message` of the queue
+    /// `poster` posts onto `CB_SUBMITTED`, on a doorbell's thread or on the lane's thread that ends
+    /// its queue's thread's wait for ring 0, before the queue's service thread hands it over,
+    /// where it gets that at its take and nothing need be waited for or allocated (`decode`'s
+    /// [`Decoders::answer_at_doorbell`]): it runs on that queue, no
     /// reset is under way, every lock it takes is free, each tried, no pipeline it names is still
     /// compiling, and no no-copy buffer of its context is being made on the surface worker
     /// ([`Self::start_buffer_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is posted through `poster` waiting for nothing, once

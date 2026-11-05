@@ -2730,6 +2730,70 @@ fn a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create() {
     taking.hold_creates.store(false, Ordering::SeqCst);
 }
 
+/// A command buffer behind its process's create, which the doorbell leaves to the queue's thread,
+/// is offered to the host on the context's lane's thread as the lane carries the create out,
+/// before the queue's thread wakes: its `CB_SUBMITTED` is posted and its vector raised there, and
+/// the queue's thread then hands it over as one answered, so it is answered once and its events
+/// keep their order.
+#[test]
+fn a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let taking = Arc::new(Taking::default());
+    taking.takes.store(true, Ordering::SeqCst);
+    let mut rig = taking_rig(&taking, QUEUE);
+    taking.hold_creates.store(true, Ordering::SeqCst);
+    rig.send(object_message(RGFX_CMD_BUFFER_CREATE, QUEUE + 1));
+    let created = |taking: &Taking| taking.handed.lock().last() == Some(&RGFX_CMD_BUFFER_CREATE);
+    for _ in 0..2000 {
+        if created(&taking) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(created(&taking), "the create never reached the host");
+    publish_unrung(&rig, 0, &[command_buffer(QUEUE, 100, 1)]);
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), QUEUE_SUBMIT as u32);
+    assert!(queue_events(&rig, 0).is_empty(), "answered at the doorbell");
+    // The queue's thread took it and waits at the gate for the create.
+    for _ in 0..2000 {
+        if rig.device.shared.gate.counts().1 == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        rig.device.shared.gate.counts().1,
+        1,
+        "no thread waits at the gate"
+    );
+    taking.raised.lock().clear();
+    taking.hold_creates.store(false, Ordering::SeqCst);
+    assert_eq!(
+        queue_events(&rig, 2),
+        vec![
+            (RGFX_EVT_CB_SUBMITTED, 1, 100),
+            (RGFX_EVT_CB_COMPLETE, 1, 100),
+        ]
+    );
+    assert_eq!(*taking.answered.lock(), HashMap::from([(1, true)]));
+    let raised = taking.raised.lock().clone();
+    assert_eq!(
+        raised.first(),
+        Some(&(3, Some("reims-vgpu.graphics-context-5".to_owned()))),
+        "the CB_SUBMITTED is raised on the lane's thread: {raised:?}"
+    );
+    let carried = taking.carried.lock();
+    assert_eq!(carried.len(), 1);
+    assert!(
+        carried[0]
+            .1
+            .as_deref()
+            .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-")),
+        "{carried:?}"
+    );
+}
+
 /// `mmio_write_taking` writes every register but `DOORBELL` as `mmio_write` does.
 #[test]
 fn a_taking_write_starts_and_resets_as_a_plain_one() {

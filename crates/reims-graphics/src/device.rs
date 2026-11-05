@@ -80,6 +80,14 @@
 //! waits for is carried out. Otherwise the service thread takes the buffer as it takes any, so
 //! the queue's events keep its order either way.
 //!
+//! **An answer on a lane's thread.** A buffer the service thread takes and must wait for ring 0
+//! for is filed at the queue gate with its message ([`gate`]'s offer). The lane whose move ends
+//! the wait offers it to the host on the lane's thread ([`Host::answer_command_buffer`]) before
+//! it wakes the service thread, where ring 0 is carried out as far as the buffer waits for, so
+//! the host may post its `CB_SUBMITTED` there, as on a doorbell's thread, and the queue's
+//! thread's wake no longer comes before it. The service thread hands the buffer over once no
+//! offer of it is under way, as it hands any.
+//!
 //! **The end.** The last [`Device`] handle's drop ends its threads without waiting for them: each
 //! sees the end at its next wake (the control thread and the lanes' at once, or once the message
 //! a lane carries out returns, the refresh thread within a refresh), and the last of them to let
@@ -126,7 +134,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control;
 use crate::device::backlog::Backlog;
-use crate::device::gate::{Gate, Look};
+use crate::device::gate::{Gate, Look, Offer};
 use crate::device::lanes::{Key, Lanes};
 use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
@@ -411,8 +419,9 @@ pub trait Host: Send + Sync + 'static {
 
     /// Offers the host the `COMMAND_BUFFER` `message` at the head of a command queue's
     /// submission ring, on the thread of a `DOORBELL` write through [`Device::mmio_write_taking`]
-    /// (the module doc), with `completion` onto the queue's completion ring. The message stays on
-    /// the ring: the queue's service thread hands it to [`Host::stage3_message`] next, as it hands
+    /// (the module doc), or on the lane's thread that ends the queue's service thread's wait for
+    /// ring 0 with the message taken, with `completion` onto the queue's completion ring. The
+    /// queue's service thread hands the message to [`Host::command_buffer`] next, as it hands
     /// any. The host answers it here where it may post the buffer's `CB_SUBMITTED` before then,
     /// and posts it through `completion` waiting for nothing ([`CompletionPoster::try_post`]),
     /// keeping what it took for the buffer for the hand-over; true where it answered it, and
@@ -1951,20 +1960,38 @@ impl Shared {
                 let backlog = &control.backlog;
                 (backlog.waits_for(queue.context), backlog.own(queue.context))
             };
-            self.gate.wait(|| {
-                if self.ending()
-                    || queue.ended()
-                    || self.epoch.load(Ordering::Acquire) != queue.epoch
-                {
-                    Look::Done
-                } else if self.control_done.load(Ordering::Acquire) < waits_for {
-                    Look::Count(waits_for)
-                } else if !self.lanes.through(queue.context, own) {
-                    Look::Lane(queue.context, own)
-                } else {
-                    Look::Done
-                }
+            // A buffer that waits files itself at the gate with its message, which the lane whose
+            // move ends the wait offers to the host before it wakes this thread
+            // ([`Self::answer_offered`]), as a doorbell's thread offers one that need wait for
+            // nothing; then this thread hands it over as any, and the host takes the answer
+            // there in place of its own.
+            let mut message = message;
+            let waits = self.control_done.load(Ordering::Acquire) < waits_for
+                || !self.lanes.through(queue.context, own);
+            let offer = (waits && message.header.r#type == RGFX_CMD_COMMAND_BUFFER).then(|| {
+                let bytes = std::mem::take(&mut message.bytes);
+                Arc::new(Offer::new(Arc::clone(queue), bytes, waits_for, own))
             });
+            self.gate.wait_offering(
+                || {
+                    if self.ending()
+                        || queue.ended()
+                        || self.epoch.load(Ordering::Acquire) != queue.epoch
+                    {
+                        Look::Done
+                    } else if self.control_done.load(Ordering::Acquire) < waits_for {
+                        Look::Count(waits_for)
+                    } else if !self.lanes.through(queue.context, own) {
+                        Look::Lane(queue.context, own)
+                    } else {
+                        Look::Done
+                    }
+                },
+                offer.as_ref(),
+            );
+            if let Some(offer) = &offer {
+                message.bytes = offer.withdraw();
+            }
             // A reset since the queue was made ended it: nothing more of it goes to the host.
             if self.epoch.load(Ordering::Acquire) != queue.epoch {
                 return;
@@ -1990,6 +2017,30 @@ impl Shared {
             };
             self.host.command_buffer(poster, message.bytes);
         }
+    }
+
+    /// Offers the host, on the lane's thread whose move ended its queue's thread's wait at the
+    /// gate, the `COMMAND_BUFFER` the waiting thread holds ([`Offer`]), before that thread wakes:
+    /// where ring 0 is carried out as far as the buffer waits for and the device and its queue go
+    /// on, the host may post its `CB_SUBMITTED` here ([`Host::answer_command_buffer`]), a
+    /// thread's wake sooner than its queue's thread would at its take. Whether it was offered:
+    /// not where the thread still waits for more than this lane's move.
+    fn answer_offered(&self, offer: &Offer) -> bool {
+        let queue = &offer.queue;
+        if self.control_done.load(Ordering::Acquire) < offer.waits_for
+            || !self.lanes.through(queue.context, offer.own)
+        {
+            return false;
+        }
+        if self.started()
+            && !self.ending()
+            && !queue.ended()
+            && self.epoch.load(Ordering::Acquire) == queue.epoch
+        {
+            let poster = self.queue_poster(queue);
+            self.host.answer_command_buffer(&poster, &offer.message());
+        }
+        true
     }
 
     /// The `COMMAND_BUFFER` message a `COMMAND_BUFFER_IN_REGION` `reference` on `queue`'s ring
@@ -2182,7 +2233,7 @@ fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, wait: bool) {
             None
         };
         if let Some((context, done)) = lanes.finished(key) {
-            shared.gate.carried_out(context, done);
+            (shared.gate).carried_out_offering(context, done, |offer| shared.answer_offered(offer));
         }
         if let Some(answer) = answer {
             shared.post_waiting(&answer, job.epoch);
