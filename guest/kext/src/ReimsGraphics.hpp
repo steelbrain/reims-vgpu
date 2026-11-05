@@ -178,6 +178,12 @@ public:
 	bool displayColor() const { return displayColorTaken; }
 	IOReturn postDisplayColor(UInt32 transactionId, UInt32 stage, UInt32 count,
 	                          const UInt8 *entries);
+	// A pipe client's transaction posts its colour, then its present, holding the presents lock
+	// across both, so no other client's post comes between them: the host applies the colour
+	// parts to the next present it takes, and drops a stage whose parts a present cuts short.
+	// Thread context only; the work loop never takes it.
+	void lockPresents() { IOLockLock(presentsLock); }
+	void unlockPresents() { IOLockUnlock(presentsLock); }
 	// Room on the control ring for a post that found it full (RgfxRingRoom.hpp): roomMark, read
 	// before the post's look, is the work loop's passes so far; waitForRoom sleeps until a pass
 	// after `mark` (each device interrupt makes one: the host has moved on), its backstop or
@@ -406,6 +412,8 @@ private:
 	RgfxRingRoomStats roomStats;
 	UInt64 roomRecords;
 
+	// The display pipe's presents (lockPresents), taken before stateLock where both are.
+	IOLock *presentsLock;
 	// Under stateLock: answers, the lifecycle's waiters, the display and its modes, the mode
 	// set, and the scanout's owner (its task referenced, its connection retained).
 	IOLock *stateLock;

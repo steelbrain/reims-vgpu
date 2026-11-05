@@ -25,7 +25,10 @@
  * The display's colour (RgfxPipeColor.hpp): where the host took RGFX_FEATURE_DISPLAY_COLOR,
  * selectors 5 to 7 decode their gamma table as macOS's kernel does and stage it for the begun
  * transaction, and its submit sends each staged table, and the colour matrix where its dirty mask
- * has the matrix's bit, as DISPLAY_COLOR parts before its PRESENT_SURFACE. A begin drops what the
+ * has the matrix's bit, as DISPLAY_COLOR parts before its PRESENT_SURFACE, with no other pipe
+ * client's post between them (IOPresentment opens several, and any may submit; the host applies
+ * the parts to the next present it takes, and drops a stage whose parts a present cuts short).
+ * A begin drops what the
  * transaction before it staged and never submitted. A transaction with no IOSurface that sets a
  * colour goes as a PRESENT_SURFACE that keeps the surface shown (RGFX_PRESENT_KEEP), and
  * completes when the host answers it, at the refresh that shows the colour. Where the
@@ -104,6 +107,11 @@ private:
 	void completeLocked(const Transactions::Completion &c, UInt64 time);
 	// sSubmit's transaction, submitLock held: sent to the host, or done with the one before it.
 	IOReturn submit(const UInt8 *t, UInt32 id, UInt32 planeType, UInt32 surface, UInt64 cookie);
+	// submit's posts once the transaction has room, submitLock and the framebuffer's presents
+	// lock held and `lock` not: its colour, then its present, or its completion with the one
+	// before it where it sends nothing.
+	IOReturn post(const UInt8 *t, UInt32 id, UInt32 planeType, UInt32 surface, UInt64 cookie,
+	              bool notified);
 	// submit's colour, submitLock held and `lock` not: the stages staged for transaction `id`,
 	// and the matrix where transaction `t` carries one, as DISPLAY_COLOR parts; whether any went.
 	IOReturn postColor(const UInt8 *t, UInt32 id, bool *sent);

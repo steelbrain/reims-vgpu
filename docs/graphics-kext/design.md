@@ -1306,7 +1306,9 @@ with no surface. The kext decodes the tables as macOS 26's IOAcceleratorFamily2
 does and stages each for the transaction begun (read;
 `guest/kext/src/RgfxPipeColor.hpp`, `tests/pipe_color_test.cpp`); the submit
 sends them, and the matrix where it is dirty, as `DISPLAY_COLOR` parts of at
-most 256 entries before the transaction's `PRESENT_SURFACE`, and a transaction
+most 256 entries before the transaction's `PRESENT_SURFACE`, with no other pipe
+client's post between them (the framebuffer's presents lock: IOPresentment opens
+several clients, and any may submit), and a transaction
 with no surface that sets a colour as a present that keeps the surface shown
 (`RGFX_PRESENT_KEEP`), which completes the transaction when the host answers
 it, at the refresh that shows the colour, as a surface's present does. The host

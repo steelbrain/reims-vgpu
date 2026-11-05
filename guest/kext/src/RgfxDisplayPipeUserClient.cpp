@@ -566,19 +566,32 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		      "waiters, without a notification\n",
 		      id, rd32(t, kTxnOptions));
 	}
-	// The colour the transaction sets goes first, with the lock let go: no other submit runs
-	// meanwhile (submitLock), and presented() only completes transactions, so the room stays.
+	IOLockUnlock(lock);
+	// What the transaction posts, its colour then its present, goes with no other pipe client's
+	// post between them (ReimsGraphics::lockPresents): the host stages the colour for the next
+	// present it takes, and drops a stage whose parts a present cuts short.
+	framebuffer->lockPresents();
+	const IOReturn r = post(t, id, planeType, surface, cookie, notified);
+	framebuffer->unlockPresents();
+	return r;
+}
+
+// submit's posts, submitLock and the framebuffer's presents lock held, `lock` not; the room for
+// the transaction found. No other submit runs meanwhile (submitLock), and presented() only
+// completes transactions, so the room stays.
+IOReturn RgfxDisplayPipeUserClient::post(const UInt8 *t, UInt32 id, UInt32 planeType,
+                                         UInt32 surface, UInt64 cookie, bool notified)
+{
+	// The colour the transaction sets goes first.
 	bool colored = false;
 	if (displayColor) {
-		IOLockUnlock(lock);
 		const IOReturn c = postColor(t, id, &colored);
-		IOLockLock(lock);
 		if (c != kIOReturnSuccess) {
-			IOLockUnlock(lock);
 			IOLog("RGFX pipe: transaction %u: its colour not sent: 0x%x\n", id, c);
 			return c;
 		}
 	}
+	IOLockLock(lock);
 	const RgfxPipeSends sends =
 	    rgfxPipeSends(planeType == kPlaneIOSurface && surface != 0, colored);
 	if (!rgfxPipeWaitsForAnswer(sends)) {
@@ -597,8 +610,7 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 	// Posted and recorded under the lock, so the host's answer, which the work loop hands to
 	// presented() under the same lock, finds it recorded. Where the control ring has no room, the
 	// lock is let go while the post waits for it: the work loop takes the lock at every COMPLETE,
-	// and every queue's completions wait behind its pass. No other submit runs meanwhile
-	// (submitLock), and presented() only completes transactions, so the room found above stays.
+	// and every queue's completions wait behind its pass.
 	uint64_t ringDeadline = 0;
 	clock_interval_to_deadline(5000, kMillisecondScale, &ringDeadline);
 	UInt64 seqno = 0;

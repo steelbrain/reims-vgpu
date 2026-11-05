@@ -1009,7 +1009,8 @@ bool ReimsGraphics::start(IOService *provider)
 	submitLock = IOSimpleLockAlloc();
 	interruptLock = IOSimpleLockAlloc();
 	stateLock = IOLockAlloc();
-	if (!submitLock || !interruptLock || !stateLock)
+	presentsLock = IOLockAlloc();
+	if (!submitLock || !interruptLock || !stateLock || !presentsLock)
 		return false;
 	nextSeqno = 1;
 	modeSet.reset();
@@ -1284,8 +1285,10 @@ void ReimsGraphics::free()
 		IOSimpleLockFree(interruptLock);
 	if (stateLock)
 		IOLockFree(stateLock);
+	if (presentsLock)
+		IOLockFree(presentsLock);
 	submitLock = interruptLock = nullptr;
-	stateLock = nullptr;
+	stateLock = presentsLock = nullptr;
 	const void *oldTask = nullptr, *oldClient = nullptr;
 	scanoutOwner.clear(&oldTask, &oldClient);
 	if (oldTask)
@@ -2242,10 +2245,13 @@ void ReimsGraphics::removePipe(OSObject *client)
 	client->release();
 	if (showScanout) {
 		// The last client went with a surface shown: the scanout again, so whatever draws into
-		// it next is seen. Its answer goes to no client.
+		// it next is seen. Its answer goes to no client. It comes between no transaction's
+		// colour and present (lockPresents).
 		RgfxPresentSurface p = {};
 		p.display = displayId;
+		lockPresents();
 		IOReturn r = post(RGFX_CMD_PRESENT_SURFACE, &p, sizeof(p), nullptr);
+		unlockPresents();
 		if (r != kIOReturnSuccess)
 			IOLog("ReimsGraphics: the last display pipe client went; PRESENT_SURFACE 0 not sent: "
 			      "0x%x\n", r);
