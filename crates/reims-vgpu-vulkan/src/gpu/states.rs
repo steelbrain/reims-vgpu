@@ -33,14 +33,18 @@
 //!   vertex function writing a point size under a line or triangle topology, a function Metal's
 //!   compiler itself refuses on this device, an import no dynamic library supplies, a call through
 //!   a visible-function reference no linked function resolves, and a state that supports indirect
-//!   command buffers whose functions use a direct texture or sampler argument. The rest die at the selector: an ID past Metal's limit, which ends Metal's process,
-//!   a gap of the runtime (an unspecialized function constant among them, which Metal aborts for;
-//!   and a function's SIMD-group operations in a stage the runtime does not take them in, a vertex
-//!   function's on MoltenVK, which Metal makes and for which device info's key 33 answers no,
-//!   [`crate::gpu::caps`]), and its other refusals, as Metal raises at none. Such a death's line
-//!   also names the descriptor's formats (`formats`: its colour attachments' with their write
-//!   masks, its depth and stencil, its vertex attributes'), which the runtime's error does not
-//!   carry. A binary archive miss cannot happen: core's descriptors list no archive.
+//!   command buffers whose functions use a direct texture or sampler argument. A gap of the
+//!   runtime's or the device's, where Metal makes the state (a function's SIMD-group operations
+//!   in a stage the runtime does not take them in, a vertex function's on MoltenVK, which Metal
+//!   makes and for which device info's key 33 answers no, [`crate::gpu::caps`]; a colour
+//!   attachment of a format the runtime has and does not render to there), is the runtime's
+//!   refusal as the `NSError` by default, relayed, and dies in strict mode
+//!   ([`crate::answer::relay_gap`]). The rest die at the selector: an ID past Metal's limit,
+//!   which ends Metal's process, an unspecialized function constant, which Metal aborts for, and
+//!   the runtime's other refusals, as Metal raises at none. Such a death's line, and a relayed
+//!   gap's, also names the descriptor's formats (`formats`: its colour attachments' with their
+//!   write masks, its depth and stencil, its vertex attributes'), which the runtime's error does
+//!   not carry. A binary archive miss cannot happen: core's descriptors list no archive.
 //!
 //!   Measured on the M3 Max (macOS 26.7, one case per process, plain and under `MTL_DEBUG_LAYER`):
 //!   the compute creators (both selectors), the render creator and the tile creator answer nil and
@@ -134,7 +138,9 @@
 //!   state of any descriptor these take (measured: a sampler of `maxAnisotropy` 0 or 17, of a
 //!   minimum LOD clamp past the maximum, or of border colour 3, and a depth-stencil state of the
 //!   default descriptor, each made, no exception raised), and so does the runtime of each of
-//!   those.
+//!   those. A gap of the runtime's or the device's (a sampler address mode or comparison the
+//!   device does not take) answers nil by default, relayed, and dies in strict mode
+//!   ([`crate::answer::relay_gap`]).
 //! - **Labels** are diagnostics: a pipeline state takes its descriptor's or its value's
 //!   (`PipelineOptions::label`), which no answer to the guest reads and the runtime compiles
 //!   nothing of.
@@ -162,7 +168,8 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Policy, decide, decide_describing, error_text, get_describing, plain, plain_at, unrepresentable,
+    Nil, Policy, create, decide_describing, error_text, get_describing, plain, plain_at, relay_gap,
+    unrepresentable,
 };
 use crate::gpu::desc::{VulkanRenderPipelineDescriptor, VulkanTileRenderPipelineDescriptor};
 use crate::gpu::device::{VulkanDevice, nil_pipeline_descriptor};
@@ -323,21 +330,20 @@ fn sampler_descriptor(d: &SamplerDesc) -> (SamplerDescriptor, rt::SamplerStateOp
 }
 
 /// `newSamplerStateWithDescriptor:`: a refusal dies at the selector, as Metal makes a state of
-/// any descriptor, and its process ends at an ID past its limit.
+/// any descriptor, and its process ends at an ID past its limit; but a gap of the runtime's or
+/// the device's, which by default answers nil ([`crate::answer::relay_gap`]).
 pub(crate) fn new_sampler_state(
     device: &VulkanDevice,
     desc: &SamplerDesc,
 ) -> RaiseResult<Option<VulkanSamplerState>> {
     let sel = "newSamplerStateWithDescriptor:";
     let (descriptor, options) = sampler_descriptor(desc);
-    match plain_at(sel, || {
+    let made = create(sel, Policy::Dies, Nil::Never, || {
         device
             .raw
             .new_sampler_state_with_options(&descriptor, options)
-    }) {
-        Ok(raw) => Ok(Some(sampler_state(raw))),
-        Err(e) => decide(sel, Policy::Dies, e),
-    }
+    })?;
+    Ok(made.map(sampler_state))
 }
 
 /// A face's stencil of `s`, every property set in field order.
@@ -369,7 +375,8 @@ fn stencil(s: &StencilDesc) -> StencilDescriptor {
 }
 
 /// `newDepthStencilStateWithDescriptor:`: Metal makes a state of any descriptor, and so does the
-/// runtime; a refusal dies at the selector.
+/// runtime; a refusal dies at the selector, but a gap of the runtime's or the device's, which by
+/// default answers nil ([`crate::answer::relay_gap`]).
 pub(crate) fn new_depth_stencil_state(
     device: &VulkanDevice,
     desc: &DepthStencilDesc,
@@ -388,10 +395,10 @@ pub(crate) fn new_depth_stencil_state(
     if let Some(back) = &desc.back {
         d.back_face_stencil = stencil(back);
     }
-    match plain_at(sel, || device.raw.new_depth_stencil_state(&d)) {
-        Ok(raw) => Ok(Some(Obj::new(raw))),
-        Err(e) => decide(sel, Policy::Dies, e),
-    }
+    let made = create(sel, Policy::Dies, Nil::Never, || {
+        device.raw.new_depth_stencil_state(&d)
+    })?;
+    Ok(made.map(Obj::new))
 }
 
 /// The `NSError` a pipeline creator answers for the runtime's refusal `e` of a pipeline, where
@@ -757,11 +764,13 @@ fn pipeline_options(
 }
 
 /// A pipeline creator's answer to core: the state, of the descriptor's input primitive topology
-/// `class`, the `NSError` ([`pipeline_error`]), or a death at the selector for the rest: an ID past
-/// Metal's limit, a gap of the runtime (an unspecialized function constant among them, which
-/// Metal aborts for), an answer it cannot prove ([`unproven`]: a state that supports indirect
-/// command buffers whose functions' use of a direct texture or sampler argument the compile layer
-/// refused to decide among them), and its other refusals, as Metal raises at none.
+/// `class`, the `NSError` ([`pipeline_error`]), the runtime's refusal as the `NSError` for a gap
+/// of its own or the device's, relayed by default ([`crate::answer::relay_gap`]), or a death at
+/// the selector for the rest: an ID past Metal's limit, an unspecialized function constant, which
+/// Metal aborts for, a gap in strict mode, an answer it cannot prove ([`unproven`]: a state that
+/// supports indirect command buffers whose functions' use of a direct texture or sampler argument
+/// the compile layer refused to decide among them), and its other refusals, as Metal raises at
+/// none.
 fn made(
     sel: &'static str,
     (class, descriptor): (PrimitiveTopologyClass, RenderDescriptor),
@@ -791,6 +800,7 @@ fn made(
                 rt::Error::Unproven(unproven) => {
                     self::unproven(sel, unproven, &e, &formats(&descriptor))
                 }
+                _ if relay_gap(sel, &e, Some(&formats(&descriptor))) => Ok(Err(error_text(&e))),
                 _ => decide_describing(sel, Policy::Dies, e, Some(&formats(&descriptor))),
             },
         },

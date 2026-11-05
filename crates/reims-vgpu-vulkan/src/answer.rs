@@ -14,8 +14,9 @@
 //!   no path reaches under a handler); [`plain`], a call the runtime cannot refuse.
 //! - [`create`]: a creator, where Metal answers nil: every refusal the runtime types
 //!   [`Error::Nil`], what plain Metal answers nil for, and those of [`Nil`]'s set, which the
-//!   runtime types otherwise where plain Metal was measured to answer nil, are `None`; the rest
-//!   are as [`send`] decides them.
+//!   runtime types otherwise where plain Metal was measured to answer nil, are `None`; a gap of
+//!   the runtime's or the device's is relayed as `None` ([`relay_gap`]); the rest are as [`send`]
+//!   decides them.
 //! - [`error_text`]: a runtime error where Metal hands back an `NSError`.
 //!
 //! **What the runtime refuses where Metal would go on** (`NotImplemented`, `Unsupported`,
@@ -23,6 +24,19 @@
 //! guest could catch: it is a death at the send, naming the selector and the runtime's error
 //! ([`refused`]). **A method not built yet** dies the same way ([`unbuilt`]), and so does a raw
 //! value the runtime's types cannot hold ([`unrepresentable`]).
+//!
+//! **A gap at a creator** is the exception ([`gap`], [`relay_gap`]): where the runtime refuses
+//! an object Metal makes for a feature it or the device lacks (`Unsupported`, but by a GPU
+//! family or a device Metal itself refuses it on), a piece it has not built (`NotImplemented`),
+//! an Apple-only call (`AppleOnly`) or a compile it does not support (`Compile(Unsupported)`),
+//! the creator answers nil, as Metal's does for an object it cannot make, and a pipeline or
+//! library creator hands back the runtime's refusal as its `NSError` ([`error_text`]). The guest
+//! sees the creation fail, as when Metal answers nil: Apple's framework then fails the work that
+//! names the object, and the command buffer faults. It is relayed as [`Inexact::RefusedCreate`],
+//! the first of its kind writing a line naming the refusal and every one counted, and dies in
+//! strict mode as before. Nothing here makes the missing feature: the gap stays the runtime's
+//! to close. A lost device, a Vulkan failure, an answer the runtime cannot prove and every other
+//! refusal still die at the creator.
 //!
 //! **A call Metal never returns from** parks the calling thread for good ([`hang`]), as the
 //! contract keeps a hang a hang.
@@ -286,7 +300,8 @@ pub fn unstopped_at<T>(sel: &'static str, call: impl FnOnce() -> T) -> T {
 }
 
 /// Runs `call`, a creator standing for `sel`: `None` for an [`Error::Nil`] and for the refusals
-/// `nil` names, as Metal answers nil; the rest as [`send`] decides them.
+/// `nil` names, as Metal answers nil, and for a gap the creator relays ([`relay_gap`]); the rest
+/// as [`send`] decides them.
 pub fn create<T>(
     sel: &'static str,
     policy: Policy,
@@ -298,7 +313,21 @@ pub fn create<T>(
         Ok(v) => Ok(Some(v)),
         Err(Error::Nil(_)) => Ok(None),
         Err(e) if nil.covers(&e) => Ok(None),
-        Err(e) => decide(sel, policy, e),
+        Err(e) => created_or_decided(sel, policy, e),
+    }
+}
+
+/// A creator's answer at `sel` to the runtime's refusal `e`, of a creator for which Metal answers
+/// nil for none of the runtime's refusals: `None` for a gap the creator relays ([`relay_gap`]),
+/// the rest as [`send`] decides them.
+pub fn created_or_decided<T>(
+    sel: &'static str,
+    policy: Policy,
+    e: Error,
+) -> RaiseResult<Option<T>> {
+    match relay_gap(sel, &e, None) {
+        true => Ok(None),
+        false => decide(sel, policy, e),
     }
 }
 
@@ -2300,9 +2329,10 @@ pub fn unrepresentable(sel: &'static str, what: &str) -> ! {
     dies(sel, &format!("the Vulkan runtime cannot hold {what}"))
 }
 
-/// A value this platform computes otherwise than Metal, which no runtime notice of [`DIES`]
-/// announces: relayed by default, a death in strict mode ([`inexact`]). Each kind is placed
-/// once, under a code of its own (`every_inexact_kind_is_placed_once`).
+/// A value this platform computes otherwise than Metal, or an answer it gives otherwise, which no
+/// runtime notice of [`DIES`] announces: relayed by default, a death in strict mode ([`inexact`],
+/// [`relay_gap`]). Each kind is placed once, under a code of its own
+/// (`every_inexact_kind_is_placed_once`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inexact {
     /// A `half` colour output stored past the bound its rounding was measured within, as blended
@@ -2363,11 +2393,16 @@ pub enum Inexact {
     /// Metal's carries them from a command that names no pipeline state, so the getter answers
     /// the runtime's 0 ([`crate::gpu::icb`]'s `Sides::copied_lengths`).
     IcbCopiedLength,
+    /// An object a creator asked for that the runtime refuses for a gap of its own or of the
+    /// device's, where Metal makes it ([`gap`]): answered nil, a pipeline state or a library with
+    /// the runtime's refusal as its `NSError` ([`relay_gap`]). The guest's creation fails, as
+    /// where Metal answers nil, and the work that names the object faults.
+    RefusedCreate,
 }
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
         Self::WriteRounding,
@@ -2380,6 +2415,7 @@ impl Inexact {
         Self::IcbIdentifierAfterEncoder,
         Self::IcbLengthPastTheLastCommand,
         Self::IcbCopiedLength,
+        Self::RefusedCreate,
     ];
 
     /// The kind's code, which its line names.
@@ -2397,6 +2433,7 @@ impl Inexact {
             Self::IcbIdentifierAfterEncoder => "inexact-icb-identifier-after-encoder",
             Self::IcbLengthPastTheLastCommand => "inexact-icb-length-past-last-command",
             Self::IcbCopiedLength => "inexact-icb-copied-length",
+            Self::RefusedCreate => "inexact-refused-create",
         }
     }
 }
@@ -2412,14 +2449,10 @@ static RELAYED_INEXACT: [std::sync::atomic::AtomicU64; Inexact::ALL.len()] =
 /// or the first relay's, so a relay past the first of its kind, as a draw's can be at every draw
 /// of a pass, makes none.
 pub fn inexact(sel: &'static str, kind: Inexact, what: impl FnOnce() -> String) {
-    use std::sync::atomic::Ordering;
     if strict() {
         unrepresentable(sel, &format!("{} ({})", what(), kind.code()));
     }
-    let at = Inexact::ALL.iter().position(|&k| k == kind);
-    let first = (at.and_then(|at| RELAYED_INEXACT.get(at)))
-        .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0);
-    if first {
+    if counted_first(kind) {
         let line = format!(
             "reims-vgpu: {sel}: the Vulkan runtime cannot hold {}; relayed ({}), the first of \
              its kind: REIMS_VGPU_STRICT=1 makes it a death\n",
@@ -2428,6 +2461,65 @@ pub fn inexact(sel: &'static str, kind: Inexact, what: impl FnOnce() -> String) 
         );
         let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
     }
+}
+
+/// Counts one relay of `kind` ([`inexact_counts`]): whether it is the process's first of the
+/// kind.
+fn counted_first(kind: Inexact) -> bool {
+    use std::sync::atomic::Ordering;
+    let at = Inexact::ALL.iter().position(|&k| k == kind);
+    (at.and_then(|at| RELAYED_INEXACT.get(at)))
+        .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0)
+}
+
+/// Whether the runtime's refusal `e` of an object is a gap of its own or of the device's, where
+/// Metal makes the object: a feature the device or the runtime lacks (`Unsupported`, and a
+/// compile's `Unsupported`), but one Metal itself refuses by a GPU family the device lacks or on
+/// the devices it was measured to refuse it on (`Needs::MetalGpuFamily`, `Needs::MetalRefuses`),
+/// which are Metal's refusals; a piece the runtime has not built (`NotImplemented`); and an
+/// Apple-only call it refuses (`AppleOnly`). A lost device, a Vulkan failure, no memory, an
+/// answer the runtime cannot prove ([`Error::Unproven`]), a misuse Metal refuses and the rest
+/// are not.
+pub fn gap(e: &Error) -> bool {
+    use metal2vulkan::error::{Error as Compile, Needs};
+    let metal_s =
+        |needs: &Needs| matches!(needs, Needs::MetalGpuFamily(_) | Needs::MetalRefuses(_));
+    match e {
+        Error::Unsupported(u) | Error::Compile(Compile::Unsupported(u)) => !metal_s(&u.needs),
+        Error::NotImplemented(_) | Error::AppleOnly(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether a creator relays the runtime's refusal `e` ([`relay_gap`]): a [`gap`], outside strict
+/// mode. A step that would die at the refusal before the creator decides it (the death of a
+/// pixel format the runtime refuses, [`crate::gpu::desc::format_refused`]) leaves such a
+/// refusal to the creator.
+pub fn relays_gap(e: &Error) -> bool {
+    gap(e) && !strict()
+}
+
+/// Whether the creator `sel` answers nil for the runtime's refusal `e` ([`relays_gap`]): a gap of
+/// the runtime's or the device's where Metal makes the object ([`gap`]), relayed as
+/// [`Inexact::RefusedCreate`], counted ([`inexact_counts`]) and the process's first of the kind
+/// writing a line on stderr naming the refusal and `descriptor` ([`refusal_describing`]). The
+/// creator then answers nil, a pipeline or library creator with [`error_text`] as its
+/// `NSError`. `false` in strict mode and for every other refusal, which the creator decides as
+/// before: a death at `sel`.
+pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool {
+    if !relays_gap(e) {
+        return false;
+    }
+    if counted_first(Inexact::RefusedCreate) {
+        let line = format!(
+            "reims-vgpu: {sel}: {}; answered nil, relayed ({}), the first of its kind: \
+             REIMS_VGPU_STRICT=1 makes it a death\n",
+            refusal_describing(e, descriptor),
+            Inexact::RefusedCreate.code()
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    }
+    true
 }
 
 /// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
@@ -3069,7 +3161,8 @@ mod tests {
                 | Inexact::UniqueIdentifier
                 | Inexact::IcbIdentifierAfterEncoder
                 | Inexact::IcbLengthPastTheLastCommand
-                | Inexact::IcbCopiedLength => {}
+                | Inexact::IcbCopiedLength
+                | Inexact::RefusedCreate => {}
             }
         }
     }
@@ -3449,6 +3542,84 @@ mod tests {
             create("newFence", Policy::Caught, Nil::Never, || Ok(1)),
             Ok(Some(1))
         );
+    }
+
+    /// How many times this process relayed a gap at a creator ([`Inexact::RefusedCreate`]).
+    fn refused_creates() -> u64 {
+        (inexact_counts().into_iter())
+            .find(|&(k, _)| k == Inexact::RefusedCreate)
+            .map_or(0, |(_, n)| n)
+    }
+
+    /// The gaps of the runtime's or the device's, where Metal makes the object: `Unsupported`
+    /// (the runtime's and a compile's) but by a GPU family or a device Metal refuses it on, and
+    /// `NotImplemented`; no other refusal
+    #[test]
+    fn a_gap_is_a_feature_the_runtime_or_the_device_lacks() {
+        use metal2vulkan::error::{Error as Compile, Feature, Needs, Unsupported};
+        let unsupported = Unsupported::not_implemented(Feature::Format);
+        let mut metal_s = unsupported.clone();
+        metal_s.needs = Needs::MetalGpuFamily(1009);
+        for (e, is) in [
+            (Error::Unsupported(unsupported.clone()), true),
+            (Error::Compile(Compile::Unsupported(unsupported)), true),
+            (Error::NotImplemented(RuntimeGap::Textures), true),
+            (Error::Unsupported(metal_s), false),
+            (Error::DeviceLost, false),
+            (Error::OutOfMemory(rt::MemoryKind::Device), false),
+            (invalid(), false),
+        ] {
+            assert_eq!(gap(&e), is, "{e:?}");
+        }
+    }
+
+    /// A creator answers nil by default for a gap of the runtime's or the device's (a sampler of
+    /// an address mode the device lacks, a depth-stencil state the runtime has not built, a
+    /// texture of a format it refuses), relayed and counted, and dies at its selector in strict
+    /// mode, its line the refusal's as before; any other refusal dies in either mode
+    #[test]
+    fn a_gap_at_a_creator_is_nil_by_default_and_a_death_in_strict_mode() {
+        use metal2vulkan::error::{Feature, Unsupported};
+        let gaps = [
+            (
+                "newSamplerStateWithDescriptor:",
+                Error::Unsupported(Unsupported::not_implemented(Feature::SamplerAddressMode)),
+            ),
+            (
+                "newDepthStencilStateWithDescriptor:",
+                Error::NotImplemented(RuntimeGap::IndirectRenderCommands),
+            ),
+            (
+                "newTextureWithDescriptor:",
+                Error::Unsupported(Unsupported::not_implemented(Feature::Format)),
+            ),
+        ];
+        for (sel, e) in gaps {
+            let before = refused_creates();
+            let refused = || Err::<(), _>(e.clone());
+            let made = relaxed(|| create(sel, Policy::Dies, Nil::Never, refused));
+            assert_eq!(made, Ok(None), "{sel}");
+            assert_eq!(refused_creates(), before + 1, "{sel}");
+            *LAST_LINE.lock() = None;
+            let site = catch_death(|| create(sel, Policy::Dies, Nil::Never, refused)).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+            assert_eq!(LAST_LINE.lock().take(), Some(refusal(&e)), "{sel}");
+            assert_eq!(refused_creates(), before + 1, "{sel}");
+        }
+        let before = refused_creates();
+        let site = catch_death(|| {
+            relaxed(|| {
+                create(
+                    "newTextureWithDescriptor:",
+                    Policy::Dies,
+                    Nil::Never,
+                    || Err::<(), _>(Error::DeviceLost),
+                )
+            })
+        })
+        .unwrap_err();
+        assert_eq!(site.file, "newTextureWithDescriptor:");
+        assert_eq!(refused_creates(), before);
     }
 
     /// An unbuilt method, and a value the runtime cannot hold, die naming the selector

@@ -32,12 +32,12 @@ use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Nil, Policy, create, get, hearing, metal_aborts, plain, plain_at, refused, send,
+    Nil, Policy, create, get, hearing, metal_aborts, plain, plain_at, refused, relay_gap, send,
     unrepresentable,
 };
 use crate::gpu;
 use crate::gpu::backing::{Backing, REPLACE};
-use crate::gpu::desc::{Maker, VulkanTextureDescriptor, format_refused};
+use crate::gpu::desc::{Maker, VulkanTextureDescriptor, created_format_refused};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_space::Hold;
 use crate::gpu::writes::{Reflected, Reflection};
@@ -1084,7 +1084,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             (self
                 .raw
                 .new_linear_texture(&desc, offset, bytes_per_row, bytes_per_image))
-            .map_err(|e| format_refused(sel, "a texture of", format, e))
+            .map_err(|e| created_format_refused(sel, "a texture of", format, e))
         })?
         else {
             return Ok(None);
@@ -1117,7 +1117,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         let format = fields.raw_pixel_format();
         let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
             buffer_texture_type(sel, self.raw.new_texture(&desc, offset, bytes_per_row))
-                .map_err(|e| format_refused(sel, "a texture of", format, e))
+                .map_err(|e| created_format_refused(sel, "a texture of", format, e))
         })?
         else {
             return Ok(None);
@@ -1336,10 +1336,13 @@ impl VulkanTexture {
                 let e = match padded {
                     true => {
                         let what = format!("a view in pixel format {format} of a texture of");
-                        format_refused(sel, &what, u64::from(source.as_raw()), e)
+                        created_format_refused(sel, &what, u64::from(source.as_raw()), e)
                     }
-                    false => format_refused(sel, "a view of", format, e),
+                    false => created_format_refused(sel, "a view of", format, e),
                 };
+                if relay_gap(sel, &e, None) {
+                    return Ok(None);
+                }
                 refused(sel, &e)
             }
         };
@@ -1897,7 +1900,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let made = self.raw.new_texture_at_offset(&desc, offset);
                 placed(
                     sel,
-                    made.map_err(|e| format_refused(sel, "a texture of", format, e)),
+                    made.map_err(|e| created_format_refused(sel, "a texture of", format, e)),
                 )
             })
         });
@@ -3893,6 +3896,28 @@ pub(crate) mod tests {
         assert_eq!(desc.pixel_format(), 501);
         let site = catch_death(|| dev().new_texture(OnFault::Return, &desc)).unwrap_err();
         assert_eq!(site.file, "newTextureWithDescriptor:");
+    }
+
+    /// By default the same texture is nil, relayed as a gap at its creator and counted, where
+    /// Metal makes it: the guest's creation fails, and the process goes on
+    #[test]
+    fn a_texture_gap_is_nil_by_default() {
+        use crate::answer::{Inexact, inexact_counts, relaxed};
+        let counted = || {
+            (inexact_counts().into_iter())
+                .find(|&(k, _)| k == Inexact::RefusedCreate)
+                .map_or(0, |(_, n)| n)
+        };
+        let desc = bgra(8, 8, 0);
+        desc.set_pixel_format(501);
+        let before = counted();
+        let made = relaxed(|| dev().new_texture(OnFault::Return, &desc));
+        assert!(
+            matches!(made, Ok(None)),
+            "{:?}",
+            made.as_ref().map(Option::is_some)
+        );
+        assert_eq!(counted(), before + 1);
     }
 
     /// A 64 by 16 `BGRA8Unorm` render target's descriptor, Shared, of `rotation`, `framebufferOnly`

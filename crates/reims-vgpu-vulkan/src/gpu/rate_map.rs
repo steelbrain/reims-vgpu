@@ -118,7 +118,8 @@ use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Policy, get, hearing, plain, plain_at, refused, send, unrepresentable, unstopped_at,
+    Policy, created_or_decided, get, hearing, plain, plain_at, refused, send, unrepresentable,
+    unstopped_at,
 };
 use crate::gpu::command::{Progress, VulkanCommandBuffer};
 use crate::gpu::device::VulkanDevice;
@@ -407,20 +408,25 @@ fn mutability(raw: u64) -> Mutability {
 }
 
 /// `newRasterizationRateMapWithDescriptor:`: the runtime's map of the descriptor, a mutable one
-/// not yet compiled, dying where the runtime refuses it (the module docs). Metal answers no nil
-/// here.
+/// not yet compiled, dying where the runtime refuses it (the module docs), but at a gap of the
+/// runtime's or the device's, which by default answers nil ([`crate::answer::relay_gap`]). Metal
+/// answers no nil here.
 pub(crate) fn new_map(
     device: &VulkanDevice,
     descriptor: &VulkanRateMapDescriptor,
 ) -> RaiseResult<Option<VulkanRateMap>> {
     let sel = "newRasterizationRateMapWithDescriptor:";
     let d = descriptor.compiled(sel);
-    let (made, heard) = hearing(|| {
-        send(sel, Policy::Dies, || {
-            device.raw.new_rasterization_rate_map(&d)
-        })
-    });
-    let raw = made?;
+    let (made, heard) =
+        hearing(
+            || match plain_at(sel, || device.raw.new_rasterization_rate_map(&d)) {
+                Ok(raw) => Ok(Some(raw)),
+                Err(e) => created_or_decided(sel, Policy::Dies, e),
+            },
+        );
+    let Some(raw) = made? else {
+        return Ok(None);
+    };
     let class = match descriptor.mutability {
         MUTABLE => Class::Unset,
         _ => Class::compiled(&raw, &heard),

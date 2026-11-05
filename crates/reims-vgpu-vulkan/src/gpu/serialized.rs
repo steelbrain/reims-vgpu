@@ -656,7 +656,8 @@ impl RawFormat {
     /// does, named by Metal's description. One that names no attachment, of a state that holds a
     /// format Metal describes, dies naming none, its line the descriptor's formats and blend
     /// states, `formats` ([`crate::gpu::states::formats`]): the format refused may be any
-    /// attachment's, or a function's. Any other refusal is `e`.
+    /// attachment's, or a function's. Any other refusal is `e`, and so is one the creator relays
+    /// as a gap ([`crate::answer::relays_gap`]: by default), which it answers with the `NSError`.
     pub fn refused(
         sel: &'static str,
         colors: &[Option<PixelFormat>],
@@ -665,7 +666,7 @@ impl RawFormat {
         e: rt::Error,
     ) -> rt::Error {
         use metal2vulkan::error::Attachment;
-        if !crate::gpu::desc::is_format_refusal(&e) {
+        if !crate::gpu::desc::is_format_refusal(&e) || crate::answer::relays_gap(&e) {
             return e;
         }
         let raw = |f: Option<PixelFormat>| f.map(|f| u64::from(f.as_raw()));

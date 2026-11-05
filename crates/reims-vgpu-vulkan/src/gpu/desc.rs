@@ -267,6 +267,21 @@ pub(crate) fn format_refused(sel: &'static str, what: &str, raw: u64, e: rt::Err
     e
 }
 
+/// [`format_refused`] at a creator, which relays a gap ([`crate::answer::relay_gap`]): a refusal
+/// the creator relays ([`crate::answer::relays_gap`]: by default) is `e`, which it answers nil
+/// for.
+pub(crate) fn created_format_refused(
+    sel: &'static str,
+    what: &str,
+    raw: u64,
+    e: rt::Error,
+) -> rt::Error {
+    match crate::answer::relays_gap(&e) {
+        true => e,
+        false => format_refused(sel, what, raw, e),
+    }
+}
+
 /// Whether `e` refuses a pixel format (`Unsupported`, `Feature::Format`).
 pub(crate) fn is_format_refusal(e: &rt::Error) -> bool {
     matches!(e, rt::Error::Unsupported(u) if u.feature == metal2vulkan::error::Feature::Format)

@@ -47,8 +47,8 @@ use reims_vgpu_core::rt::{BlockEnv, Hold};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Nil, Policy, RUNTIME_DOMAIN, create, decide, get, get_describing, hearing, metal_aborts, plain,
-    plain_at, send, unrepresentable,
+    Nil, Policy, RUNTIME_DOMAIN, create, created_or_decided, decide, error_text, get,
+    get_describing, hearing, metal_aborts, plain, plain_at, relay_gap, send, unrepresentable,
 };
 use crate::gpu::backing::{self, Backing, HEAP_GRANULE};
 use crate::gpu::caps;
@@ -56,7 +56,7 @@ use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
     Maker, PipelineDescriptorObject, TextureFields, VulkanComputePipelineDescriptor,
     VulkanRenderPipelineDescriptor, VulkanTextureDescriptor, VulkanTileRenderPipelineDescriptor,
-    format_refused,
+    created_format_refused, format_refused,
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventHandle};
 use crate::gpu::icb::VulkanIcb;
@@ -244,18 +244,22 @@ fn invalid_library_file() -> NsErrorText {
 }
 
 /// The runtime's refusal `e` of the pipeline creator `sel`: the `NSError` where Metal answers one
-/// ([`super::states::pipeline_error`]), else a death at the send, whose line names `descriptor`'s
-/// formats ([`super::states::compute_formats`]). An unspecialized function constant is a death,
-/// as Metal aborts for one.
+/// ([`super::states::pipeline_error`]), the runtime's refusal as the `NSError` for a gap of its
+/// own or the device's, relayed by default ([`relay_gap`]), else a death at the send, whose line
+/// names `descriptor`'s formats ([`super::states::compute_formats`]). An unspecialized function
+/// constant is a death, as Metal aborts for one.
 fn compile_error(
     sel: &'static str,
     e: rt::Error,
     descriptor: Option<&ComputePipelineDescriptor>,
 ) -> NsErrorText {
     super::states::pipeline_error(&e).unwrap_or_else(|| {
-        // Decided as a getter's refusal: none of them returns.
         let formats = descriptor.map(super::states::compute_formats);
-        get_describing(sel, formats.as_deref(), || Err(e))
+        match relay_gap(sel, &e, formats.as_deref()) {
+            true => error_text(&e),
+            // Decided as a getter's refusal: none of them returns.
+            false => get_describing(sel, formats.as_deref(), || Err(e)),
+        }
     })
 }
 
@@ -1283,7 +1287,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// A metallib only, as Metal and the runtime take: other bytes, raw AIR and a bitcode wrapper
-    /// among them, are Metal's `NSError` (testing.md section 6.18).
+    /// among them, are Metal's `NSError` (testing.md section 6.18). A gap of the runtime's or the
+    /// device's is its refusal as the `NSError`, relayed by default ([`relay_gap`]).
     fn new_library(&self, data: &[u8]) -> RaiseResult<Result<Option<VulkanLibrary>, NsErrorText>> {
         let sel = "newLibraryWithData:error:";
         let made = timing::creation(
@@ -1296,6 +1301,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                         Err(rt::Error::Compile(metal2vulkan::error::Error::InvalidInput(_))) => {
                             Ok(Err(invalid_library_file()))
                         }
+                        Err(e) if relay_gap(sel, &e, None) => Ok(Err(error_text(&e))),
                         Err(e) => Err(e),
                     }
                 })
@@ -1434,7 +1440,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let raw = fields.raw_pixel_format();
         let made = create(sel, Policy::Dies, Nil::StorageMode, || {
             (self.raw.new_shared_texture_with_range_token(&desc, token))
-                .map_err(|e| format_refused(sel, "a texture of", raw, e))
+                .map_err(|e| created_format_refused(sel, "a texture of", raw, e))
         })?;
         if made.is_some() && storage != PRIVATE {
             unrepresentable(
@@ -1467,10 +1473,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let sel = "newSharedTextureWithHandle:withResourceIndex:";
         let handle = handle.unwrap_or_else(|| unrepresentable(sel, "a nil handle"));
         let placement = rt::IdPlacement::At(rt::ResourceId(resource_index));
-        let raw = send(sel, Policy::Dies, || {
+        let made = plain_at(sel, || {
             self.raw
                 .new_shared_texture_with_handle(&handle.raw, placement)
-        })?;
+        });
+        let raw = match made {
+            Ok(raw) => raw,
+            Err(e) => return created_or_decided(sel, Policy::Dies, e),
+        };
         let usage = handle.private_usage;
         Ok(Some(self.texture_of(
             raw,
@@ -1533,7 +1543,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let token: rt::RangeToken = Box::new(Arc::clone(&space));
         let made = create(sel, Policy::Dies, Nil::Memory, || {
             (self.raw.new_texture_with_range_token(&desc, token))
-                .map_err(|e| format_refused(sel, "a texture of", raw, e))
+                .map_err(|e| created_format_refused(sel, "a texture of", raw, e))
         })?;
         if made.is_some() {
             fields.made_unprotected(sel);
@@ -2180,7 +2190,7 @@ pub(crate) fn texture_over_plane(
     let format = fields.raw_pixel_format();
     create(sel, Policy::Dies, Nil::Never, || {
         (buffer.new_texture_with_iosurface_plane(desc, plane))
-            .map_err(|e| format_refused(sel, "a texture of", format, e))
+            .map_err(|e| created_format_refused(sel, "a texture of", format, e))
     })
 }
 
@@ -3088,6 +3098,31 @@ pub(crate) mod tests {
             "newTextureWithDescriptor:iosurface:plane: format 80 MTLPixelFormatBGRA8Unorm, plane \
              0, 16x8, usage 0x1, storage 0; surface 'BGRA', 0 planes: 16x8, 64 bytes per row"
         );
+    }
+
+    /// A compute pipeline the runtime refuses for a gap of its own or of the device's is, by
+    /// default, nil and the runtime's refusal as the `NSError`, relayed; in strict mode it dies
+    /// at its selector as before. The creators' decision, without a device
+    #[test]
+    fn a_compute_pipeline_gap_is_its_nserror_by_default() {
+        use metal2vulkan::error::{Feature, Unsupported};
+        let sel = "newComputePipelineStateWithFunction:error:";
+        let e = rt::Error::Unsupported(Unsupported::not_implemented(Feature::SubgroupOperations));
+        let before = crate::answer::inexact_counts();
+        let error = crate::answer::relaxed(|| compile_error(sel, e.clone(), None));
+        assert_eq!(error, error_text(&e));
+        assert_eq!(error.domain, RUNTIME_DOMAIN);
+        let counted = |counts: Vec<(crate::answer::Inexact, u64)>| {
+            (counts.into_iter())
+                .find(|&(k, _)| k == crate::answer::Inexact::RefusedCreate)
+                .map_or(0, |(_, n)| n)
+        };
+        assert_eq!(
+            counted(crate::answer::inexact_counts()),
+            counted(before) + 1
+        );
+        let site = catch_death(|| compile_error(sel, e.clone(), None)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
     }
 
     /// A multisample texture of the padded 10-bit formats (576 to 579), which the runtime stops

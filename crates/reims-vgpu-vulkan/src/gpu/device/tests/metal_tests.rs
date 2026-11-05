@@ -2942,6 +2942,44 @@ fn raw_pipeline_formats_die_where_states_are_made() {
     }
 }
 
+/// By default the states [`raw_pipeline_formats_die_where_states_are_made`] names, which Metal
+/// makes and the runtime refuses at an attachment it has the format of, are nil and the
+/// runtime's refusal as the `NSError`, each relayed as a gap at its creator and counted: the
+/// guest's creation fails, and the process goes on
+#[test]
+fn raw_pipeline_format_gaps_are_their_nserror_by_default() {
+    use crate::answer::{Inexact, RUNTIME_DOMAIN, inexact_counts, relaxed};
+    let counted = || {
+        (inexact_counts().into_iter())
+            .find(|&(k, _)| k == Inexact::RefusedCreate)
+            .map_or(0, |(_, n)| n)
+    };
+    let d = dev();
+    for (attachment, format) in [
+        ("colour", 501),
+        ("colour", 556),
+        ("colour", 624),
+        ("depth", 651),
+        ("stencil", 652),
+    ] {
+        let before = counted();
+        let made = relaxed(|| {
+            attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format)
+                .map(|s| s.is_some())
+        });
+        let Err(error) = made else {
+            panic!("{attachment} {format}: {made:?}");
+        };
+        assert_eq!((error.domain.as_str(), error.code), (RUNTIME_DOMAIN, 0));
+        assert!(
+            error.description.contains("feature: Format"),
+            "{attachment} {format}: {}",
+            error.description
+        );
+        assert_eq!(counted(), before + 1, "{attachment} {format}");
+    }
+}
+
 /// What a draw over 16 by 16 `ARGB8Unorm` (84) does on `p`'s device `d` under the state of
 /// a serialized descriptor whose colour attachment 0 is that format, blending zero over the
 /// source colour and zero over the source alpha, adding (a multiply), of `v_plain` and

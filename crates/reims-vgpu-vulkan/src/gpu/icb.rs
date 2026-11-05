@@ -126,8 +126,8 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
-    Inexact, Policy, decide, get, hang, inexact, metal_aborts, plain, refused, send,
-    unrepresentable, unstopped_at,
+    Inexact, Policy, created_or_decided, decide, get, hang, inexact, metal_aborts, plain, plain_at,
+    refused, send, unrepresentable, unstopped_at,
 };
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
@@ -1004,7 +1004,8 @@ fn descriptor(desc: &IcbDesc) -> rt::IndirectCommandBufferDescriptor {
 /// Metal's numbers (the module docs), placed at the descriptor's resource index when its low 32
 /// bits are nonzero. Metal answers no nil here. A placement past Metal's table of IDs dies, as
 /// Metal ends its process there; so does every refusal of the runtime's, as Metal crashes at
-/// memory it cannot back. A buffer whose own ID is 2^23 or more, which plain allocation hands out
+/// memory it cannot back, but a gap of the runtime's or the device's, which by default answers
+/// nil ([`crate::answer::relay_gap`]), as core models a nil buffer. A buffer whose own ID is 2^23 or more, which plain allocation hands out
 /// past a reservation that large, the runtime makes as Metal does, at every ID below 2^31
 /// (`RECORDS_ID_LIMIT`) and any count of commands. The runtime makes what Metal makes of
 /// the descriptors its validation stops (no command types, render and compute types together,
@@ -1038,11 +1039,15 @@ pub(crate) fn new_indirect_command_buffer(
             &format!("an indirect command buffer placed at ID {id}"),
         );
     }
-    let raw = send(sel, Policy::Dies, || {
+    let made = plain_at(sel, || {
         device
             .raw
             .new_indirect_command_buffer(&d, max_count, options)
-    })?;
+    });
+    let raw = match made {
+        Ok(raw) => raw,
+        Err(e) => return created_or_decided(sel, Policy::Dies, e),
+    };
     drop(held);
     Ok(Some(Obj::new(IcbObject {
         raw,
