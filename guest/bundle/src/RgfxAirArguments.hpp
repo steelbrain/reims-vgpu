@@ -45,12 +45,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "reims_graphics_wire.h" // RgfxFunctionConstant
 
 enum class RgfxAirStage : uint8_t { Kernel, Vertex, Fragment };
 
@@ -227,9 +230,9 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 // declared under a function constant, then its kind (`air.buffer`, `air.texture`, `air.sampler`,
 // `air.indirect_buffer`, `air.thread_position_in_grid`, ...), then keys and their operands, in no
 // fixed order:
-//   `air.location_index` index count   its binding: the index (or a global the module's
-//                                      initialiser sets, for an index function constants compute)
-//                                      and how many it takes (an array's length);
+//   `air.location_index` index count   its binding: the index and how many it takes (an array's
+//                                      length), each an integer or a global the module's
+//                                      initialiser sets, for one function constants compute;
 //   `air.buffer_size` n, `air.address_space` n, `air.arg_type_size` n, `air.arg_type_align_size` n;
 //   `air.struct_type_info` !layout     its pointee's layout (below);
 //   `air.arg_type_name` "T", `air.arg_name` "n";
@@ -241,7 +244,8 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 // An entry's outputs are a node of nodes, each its kind (`air.position`, `air.vertex_output`,
 // `air.render_target`, ...) and keys, `air.arg_type_name` "T" and `air.arg_name` "n" among them.
 // A predicate's node is the global the initialiser sets, the constant's type and its name: the
-// function constant's own name where the predicate is one constant (`[[function_constant(kOn)]]`).
+// function constant's own name where the predicate is one constant (`[[function_constant(kOn)]]`),
+// the name of the constant it is an expression of (`kOn || kOff`) where it is one of several.
 // A layout is a run of members, each `[air.struct_type_info !layout] offset size arrayLength
 // "type" "name"` and, in an argument buffer's, `air.indirect_argument` and the member's own node
 // (or its first id, for a struct of members), or `air.render_target` n, `air.raster_order_group` n.
@@ -273,12 +277,18 @@ struct RgfxAirNode {
 	bool hasPosition = false;
 	uint32_t position = 0;
 	std::string kind;
-	// Declared under a function constant: the predicate's name (the constant's, where it is one).
+	// Declared under a function constant: the predicate's name (the constant's, where it is one),
+	// and the global the module's initialiser stores its value in (UINT64_MAX where it names
+	// none).
 	bool predicated = false;
 	std::string predicate;
-	// `air.location_index`: its index (`indexIsGlobal`: one function constants compute) and count.
-	bool hasLocation = false, indexIsGlobal = false;
+	uint64_t predicateGlobal = UINT64_MAX;
+	// `air.location_index`: its index and count, each an integer, or (`indexIsGlobal`,
+	// `countIsGlobal`) one function constants compute, which the module's initialiser stores in
+	// the global `indexGlobal` or `countGlobal`, the integer then 0.
+	bool hasLocation = false, indexIsGlobal = false, countIsGlobal = false;
 	uint32_t index = 0, count = 0;
+	uint64_t indexGlobal = UINT64_MAX, countGlobal = UINT64_MAX;
 	RgfxAirAccess access = RgfxAirAccess::Unknown;
 	bool hasAddressSpace = false, hasBufferSize = false, hasTypeSize = false, hasTypeAlign = false;
 	uint32_t addressSpace = 0, bufferSize = 0, typeSize = 0, typeAlign = 0;
@@ -297,17 +307,25 @@ enum class RgfxAirEntryStage : uint8_t { Kernel, Vertex, Fragment, Object, Mesh 
 
 struct RgfxAirEntry {
 	std::string name;
+	// Its function's value number in the module.
+	uint64_t function = 0;
 	RgfxAirEntryStage stage = RgfxAirEntryStage::Kernel;
 	// Its outputs (the entry's second node), in order: none for a kernel or a void function.
 	std::vector<RgfxAirOutput> outputs;
 	std::vector<RgfxAirNode> arguments;
 };
 
-// A module's entry points, and its function constants' indices by name (`air.function_constants`:
-// each the constant's global, its type, its name and its index).
+// The code of a module that declares function constants: its functions' bodies, as the reader
+// decodes them for rgfxAirSpecialise. Opaque.
+struct RgfxAirCode;
+
+// A module's entry points, its function constants' indices by name (`air.function_constants`:
+// each the constant's global, its type, its name and its index), and, where it declares function
+// constants, its code (null where the reader does not follow it).
 struct RgfxAirEntries {
 	std::vector<RgfxAirEntry> entries;
 	std::vector<std::pair<std::string, uint32_t>> constants;
+	std::shared_ptr<const RgfxAirCode> code;
 };
 
 // The entry points of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), every node
@@ -377,6 +395,46 @@ constexpr size_t kRgfxAirModuleCacheBytes = 16u << 20;
 // functions' modules through; never destroyed, as a library may be freed on any thread while the
 // process exits.
 RgfxAirModuleCache &rgfxAirModules();
+
+// --- An entry point's specialisation by its function constants' values ----------------------
+// Metal specialises a function by its constants' values before it compiles it: the module's
+// initialisers (its functions of section `air.static_init`, which store each constant's value,
+// and each value computed from constants, in a global of their own, from the constant's own
+// global of section `air.fc_initializer`) run with the values, the function's code reads those
+// globals, and code the values make unreachable or unused is removed. So which arguments the
+// specialised function uses, and the binding indices, counts and predicates function constants
+// compute, are the code's under those values (measured: an AMD Radeon Pro 5300M, an Intel UHD
+// Graphics 630 and an Apple M3 Max answer an argument read only in a branch a false constant
+// skips unused, and a buffer at `[[buffer(kIndex)]]` at the index kIndex is given; the modules
+// as LLVM's text form prints them).
+//
+// The reader decodes a module's function bodies (FUNCTION_BLOCK, of LLVM's documented records,
+// as a module of typed pointers writes them) where it declares function constants. It runs the
+// initialisers over integers and floating-point scalars: a load of a constant's global gives the
+// constant's value (none where the function has no value for it), `air.is_function_constant_
+// defined` whether it has one, `air.normalize_function_constant_predicate` 1 for a value other
+// than 0. In the entry point's body it propagates the values those globals then hold through the
+// branches, switches, selects and phis they decide (sparse conditional constant propagation), and
+// counts as used each argument a live instruction of a reachable block reads: an instruction is
+// live where it stores, writes memory by an atomic or a fence, returns, branches on a value no
+// constant decides, or calls a function that may write memory, unwind or not return (its
+// attributes' `readnone`, `readonly` or `memory`, `nounwind` and `willreturn` say), or where a
+// live instruction reads its result. Anything else the reader does not follow leaves the code
+// unread, and the AIR's own answers stand.
+struct RgfxAirSpecialisation {
+	// The integer the module's initialisers leave in each global they store one in, by the
+	// global's value number, where every value it is computed from is known.
+	std::map<uint64_t, int64_t> globals;
+	// Whether the entry point's body was followed; where it was, whether the specialised code may
+	// use each of its parameters, by position.
+	bool bodyRead = false;
+	std::vector<bool> used;
+};
+
+// The specialisation of `entry` of `module` by the `count` function constant values at `values`;
+// false where the module has no code the reader follows (`out` then empty).
+bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, const RgfxFunctionConstant *values,
+                       uint32_t count, RgfxAirSpecialisation &out);
 
 // Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
 // 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a

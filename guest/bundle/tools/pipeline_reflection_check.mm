@@ -72,6 +72,7 @@ bool entryOf(const std::string &name, RgfxAirEntries &module)
 		if (e.name == name) {
 			module.entries = {e};
 			module.constants = all.constants;
+			module.code = all.code;
 			return true;
 		}
 	}

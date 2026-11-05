@@ -479,6 +479,10 @@ struct Maker {
 			fail(@"an argument buffer's member of a kind not measured");
 			return nil;
 		}
+		if (m.indirect->indexIsGlobal || m.indirect->countIsGlobal) {
+			fail(@"an argument buffer's member at an index or of a count function constants compute");
+			return nil;
+		}
 		const RgfxAirNode &n = *m.indirect;
 		const NSUInteger rt = m.hasRenderTarget ? m.renderTarget : kNoIndex;
 		const NSUInteger rog = m.hasRasterOrderGroup ? m.rasterOrderGroup : kNoIndex;
@@ -809,6 +813,60 @@ bool predicateValue(const RgfxAirEntries &module, const std::string &name, const
 	return false;
 }
 
+// `n` as the function's constant `values` specialise it (`spec`: what rgfxAirSpecialise answered,
+// null where the module's code was not read): `kept` false where its predicate leaves it out; its
+// index and count where constants compute them; `unused` too where the specialised code does not
+// use it. False, with `*why`, where a value it needs is not known.
+bool specialise(RgfxAirNode &n, const RgfxAirSpecialisation *spec, const RgfxAirEntries &module,
+                const RgfxFunctionConstant *values, uint32_t count, bool &kept, NSString *__strong *why)
+{
+	auto global = [&](uint64_t g, int64_t &v) {
+		if (spec == nullptr)
+			return false;
+		auto it = spec->globals.find(g);
+		if (it == spec->globals.end())
+			return false;
+		v = it->second;
+		return true;
+	};
+	kept = true;
+	if (n.predicated) {
+		int64_t v = 0;
+		bool on = false;
+		if (global(n.predicateGlobal, v)) {
+			on = v != 0;
+		} else if (!predicateValue(module, n.predicate, values, count, on)) {
+			*why = [NSString stringWithFormat:@"an argument's predicate %s is no constant of the function's values",
+			                                  n.predicate.c_str()];
+			return false;
+		}
+		n.predicated = false;
+		kept = on;
+		if (!kept)
+			return true;
+	}
+	int64_t v = 0;
+	if (n.indexIsGlobal) {
+		if (!global(n.indexGlobal, v) || v < 0 || v > INT32_MAX) {
+			*why = @"an argument's binding index is computed from function constants the function has no value of";
+			return false;
+		}
+		n.index = static_cast<uint32_t>(v);
+		n.indexIsGlobal = false;
+	}
+	if (n.countIsGlobal) {
+		if (!global(n.countGlobal, v) || v < 1 || v > INT32_MAX) {
+			*why = @"an argument's count is computed from function constants the function has no value of";
+			return false;
+		}
+		n.count = static_cast<uint32_t>(v);
+		n.countIsGlobal = false;
+	}
+	if (spec != nullptr && spec->bodyRead && n.hasPosition && n.position < spec->used.size() && !spec->used[n.position])
+		n.unused = true;
+	return true;
+}
+
 // The size of a vertex function's outputs: each one's value type's (a packed size: lanes times the
 // scalar's), and nothing for a void function.
 bool outputBytes(const std::vector<RgfxAirOutput> &outputs, uint64_t &out)
@@ -897,9 +955,23 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 	Maker m{c};
 	NSMutableArray *bindings = [NSMutableArray array];
 	NSMutableArray *builtIns = [NSMutableArray array];
+	// The function as its constants' values specialise it: its nodes' indices, counts and
+	// predicates where constants compute them, and which arguments its specialised code uses.
+	RgfxAirSpecialisation spec;
+	const bool specialised = rgfxAirSpecialise(module, entry, values, count, spec);
+	std::vector<RgfxAirNode> nodes;
+	nodes.reserve(entry.arguments.size());
+	for (const RgfxAirNode &n : entry.arguments) {
+		RgfxAirNode s = n;
+		bool kept = true;
+		if (!specialise(s, specialised ? &spec : nullptr, module, values, count, kept, why))
+			return false;
+		if (kept)
+			nodes.push_back(std::move(s));
+	}
 	// The descriptor's buffers, each used where the function reads an attribute it holds.
 	std::set<uint32_t> read;
-	for (const RgfxAirNode &n : entry.arguments)
+	for (const RgfxAirNode &n : nodes)
 		if (isStageInput(n.kind) && n.hasLocation && !n.unused)
 			read.insert(n.index);
 	for (size_t i = 0; i < buffers.size(); i++) {
@@ -914,23 +986,9 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		}
 		[bindings addObject:b];
 	}
-	for (const RgfxAirNode &n : entry.arguments) {
+	for (const RgfxAirNode &n : nodes) {
 		if (isStageInput(n.kind))
 			continue;
-		if (n.predicated) {
-			bool on = false;
-			if (!predicateValue(module, n.predicate, values, count, on)) {
-				*why = [NSString stringWithFormat:@"an argument's predicate %s is no constant of the function's values",
-				                                  n.predicate.c_str()];
-				return false;
-			}
-			if (!on)
-				continue;
-		}
-		if (n.indexIsGlobal) {
-			*why = @"an argument's binding index is computed from function constants";
-			return false;
-		}
 		const bool resource = n.kind == "air.buffer" || n.kind == "air.indirect_buffer" || n.kind == "air.texture" ||
 		                      n.kind == "air.sampler" || n.kind == "air.payload";
 		if (resource) {

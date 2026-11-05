@@ -3708,9 +3708,10 @@ void test_stitched_libraries_in_archives()
 // (RGFX_ORACLE_REFLECTION): the values below are the AMD Radeon Pro 5300M's and the Intel UHD
 // Graphics 630's (macOS 26.7.1, tools/oracle/oracle_reflection.m), of Metal's own classes; options
 // that ask for none answer nil; a stage with no bindings answers an empty -...Bindings and a nil
-// -...Arguments; an argument a false constant gates is left out, and one at an index constants
-// compute makes no reflection. tools/pipeline_reflection_check.mm compares them with an x86 Mac's
-// own, getter by getter and instance variable by instance variable.
+// -...Arguments; the function's constants specialise it: an argument a false constant gates is left
+// out, one at an index constants compute is at that index, and one only code the constants remove
+// reads is not used. tools/pipeline_reflection_check.mm compares them with an x86 Mac's own, getter
+// by getter and instance variable by instance variable.
 void test_pipeline_reflection_from_air()
 {
 	Fixture fx(0x80000); // the library's bytes fit
@@ -3848,7 +3849,8 @@ void test_pipeline_reflection_from_air()
 		      ((MTLStructMember *)members[5]).argumentIndex == 6);
 	}
 
-	// Function constants: a false one's arguments are left out; an index they compute makes none.
+	// Function constants: a false one's arguments are left out, an index they compute is the
+	// index, and an argument read only where kOff is true is not used.
 	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
 	const bool on = true, off = false;
 	const int index = 5;
@@ -3859,7 +3861,10 @@ void test_pipeline_reflection_from_air()
 	CHECK(shape(ask(RgfxComputePipelineReflectionOf(predicates, nil, both), @"bindings")) == "out:0 on:0 ");
 	[values setConstantValue:&index type:MTLDataTypeInt withName:@"kIndex"];
 	id<MTLFunction> constants = [lib newFunctionWithName:@"k_constants" constantValues:values error:&err];
-	CHECK(constants != nil && RgfxComputePipelineReflectionOf(constants, nil, both) == nil);
+	NSArray *specialised = ask(RgfxComputePipelineReflectionOf(constants, nil, both), @"bindings");
+	CHECK(shape(specialised) == "out:0 on:0 onTexture:2 placed:0 readWhereOff:0- ");
+	CHECK(specialised.count == 5 && number(specialised[2], @"index") == 1 && number(specialised[3], @"index") == 5 &&
+	      number(specialised[4], @"index") == 3 && !flag(specialised[4], @"isActive"));
 
 	// A descriptor's buffers come first, named by their index, used where a read attribute is theirs.
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];

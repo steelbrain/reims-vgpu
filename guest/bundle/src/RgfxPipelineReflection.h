@@ -18,8 +18,12 @@
 //     arguments (thread_position_in_grid, vertex_id, a mesh, ...) are listed apart; a fragment
 //     function's are not listed; an empty list is none, which `-...Bindings` answers as an empty
 //     array and `-...Arguments` as nil;
-//   - an argument a false function constant gates is left out; one the AIR marks `air.arg_unused`
-//     is not used (isUsed and isActive 0);
+//   - the function is specialised by its constants' values first (RgfxAirArguments.hpp, "An entry
+//     point's specialisation"): an argument its predicate leaves out (`[[function_constant(k)]]`,
+//     of a constant or of an expression of them) is left out, one at an index or of a count
+//     constants compute is at that index and of that count, and one the AIR marks
+//     `air.arg_unused`, or the specialised code does not use, is not used (isUsed and isActive
+//     0);
 //   - a constant buffer's alignment is 32, a device or threadgroup buffer's its pointee's;
 //   - a descriptor's buffer is named `vertexBuffer.N` (`stageInBuffer.N` for a compute
 //     pipeline's), N its place among the descriptor's buffers in buffer index order (buffers 1, 4
@@ -37,12 +41,13 @@
 // before):
 //   - a function no library of ours made, or whose library kept no bytes (Core Image's link,
 //     stitching), or whose module the reader does not follow;
-//   - an argument at a binding index function constants compute, or under a predicate that is no
-//     one function constant of the function's values: Metal answers the specialised function's,
-//     which needs the module's initialiser run;
+//   - an argument at a binding index or of a count function constants compute, or under a
+//     predicate, where the function has no value of a constant it needs, or the module's code is
+//     not one the reader follows;
 //   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for.
-// An argument the AIR marks used whose only reads are in code the function's constants remove is
-// answered used, where Metal answers it unused (it reflects the specialised code).
+// Where the module's code is not one the reader follows, an argument the AIR marks used whose only
+// reads are in code the function's constants remove is answered used, where Metal answers it
+// unused (it reflects the specialised code).
 #ifndef RGFX_PIPELINE_REFLECTION_H_
 #define RGFX_PIPELINE_REFLECTION_H_
 

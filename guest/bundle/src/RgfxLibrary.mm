@@ -653,6 +653,7 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 				auto one = std::make_shared<RgfxAirEntries>();
 				one->entries.push_back(e);
 				one->constants = module->entries.constants;
+				one->code = module->entries.code;
 				entries = std::move(one);
 				break;
 			}

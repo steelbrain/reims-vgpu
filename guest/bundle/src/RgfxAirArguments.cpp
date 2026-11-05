@@ -3,28 +3,142 @@
 #include "RgfxAirArguments.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
+#include <set>
+
+// A module's code (RgfxAirArguments.hpp, "An entry point's specialisation"), as the reader decodes
+// it: the types, the global values, the constants and the function bodies, each value by its value
+// number (LLVM's: the global values in their records' order, then the module's constants, then, in
+// a body, its arguments, its own constants and its instructions' results).
+struct RgfxAirCode {
+	enum class Kind : uint8_t { Other, Void, Label, Metadata, Int, Half, Float, Double, Pointer, Function };
+	struct Type {
+		Kind kind = Kind::Other;
+		uint32_t width = 0;           // Int: its bits; Pointer: its address space
+		uint32_t pointee = UINT32_MAX; // Pointer (typed): the type it points to
+		uint32_t result = UINT32_MAX; // Function: its return type
+		std::vector<uint32_t> params; // Function: its parameters' types
+		bool vararg = false;
+	};
+	// An integer of `width` bits (the bits above it zero), or a floating-point value.
+	struct Scalar {
+		bool isFloat = false;
+		uint32_t width = 0;
+		uint64_t bits = 0;
+		double f = 0;
+	};
+	enum class Op : uint8_t {
+		Plain,  // an instruction whose result is not folded (a GEP, an alloca, a vector's, ...)
+		BinOp,  // `code` the opcode
+		UnOp,   // `code` the opcode (0: fneg)
+		Cast,   // `code` the opcode
+		Cmp,    // `code` the predicate
+		Select, // ops: true, false, condition
+		Phi,    // ops: each incoming value, `blocks` its block
+		Load,   // ops: the pointer
+		Store,  // ops: the pointer, the value
+		Freeze,
+		Call,   // ops: the callee, then the arguments that are values
+		Br,     // blocks: the target
+		CondBr, // ops: the condition; blocks: true, false
+		Switch, // ops: the condition, then each case's value; blocks: the default, then each case's
+		Ret,
+		Unreachable,
+	};
+	struct Inst {
+		Op op = Op::Plain;
+		uint32_t code = 0;
+		uint32_t result = UINT32_MAX; // its value, where it has one
+		uint32_t type = UINT32_MAX;   // its result's type, where it is known
+		bool keeps = false;           // it is live whether or not its result is read
+		std::vector<uint32_t> ops;
+		std::vector<uint32_t> blocks;
+	};
+	struct Body {
+		uint32_t function = 0;        // its function's value number
+		uint32_t first = 0, args = 0; // its first argument's value number, and how many it has
+		std::vector<std::vector<Inst>> blocks;
+		std::map<uint32_t, Scalar> constants; // its own constants that are scalars
+		std::map<uint32_t, uint32_t> casts;   // its own constants that are pointer casts: the pointer
+		uint32_t values = 0;                  // one past its last value number
+	};
+	struct Global {
+		bool function = false;
+		// A global variable: whether it is constant, its address space, its initialiser's value
+		// number (UINT64_MAX: none) and the type it holds.
+		bool constant = false;
+		uint32_t space = 0, type = UINT32_MAX;
+		uint64_t init = UINT64_MAX;
+		// A function: its type, whether it is a declaration, its attribute list (0: none), its
+		// section (0: none), and the intrinsic it is (Builtin).
+		bool proto = true;
+		uint64_t attributes = 0, section = 0;
+		uint8_t builtin = 0;
+	};
+	enum Builtin : uint8_t { kNoBuiltin, kIsDefined, kNormalize };
+	// A call's attributes: whether it may write memory, unwind or not return.
+	struct Attributes {
+		bool noWrite = false, noUnwind = false, willReturn = false;
+	};
+	std::vector<Type> types;
+	std::vector<Global> globals;
+	std::map<uint32_t, Scalar> constants; // the module's constants that are scalars
+	std::map<uint32_t, uint32_t> casts;   // the module's constants that are pointer casts: the pointer
+	std::vector<std::string> sections;    // by section number, from 1
+	std::vector<Attributes> attributes;   // by attribute list, from 1
+	std::vector<Body> bodies;
+	// The function constants' globals (`air.function_constants`): each constant's index.
+	std::map<uint64_t, uint32_t> fcGlobals;
+};
 
 namespace {
 
 // LLVM's bitstream: the abbreviation ids every block has, and the blocks and records read here.
 constexpr unsigned kEndBlock = 0, kEnterSubblock = 1, kDefineAbbrev = 2, kUnabbrevRecord = 3;
 constexpr unsigned kBlockInfo = 0;
-constexpr unsigned kModuleBlock = 8, kConstantsBlock = 11, kValueSymtabBlock = 14,
-                   kMetadataBlock = 15, kTypeBlock = 17, kStrtabBlock = 23;
+constexpr unsigned kModuleBlock = 8, kParamAttrBlock = 9, kParamAttrGroupBlock = 10, kConstantsBlock = 11,
+                   kFunctionBlock = 12, kValueSymtabBlock = 14, kMetadataBlock = 15, kTypeBlock = 17,
+                   kStrtabBlock = 23;
 // BLOCKINFO's record that names the block the abbreviations after it are for.
 constexpr unsigned kBlockInfoSetBid = 1;
 // MODULE_BLOCK's records: the version, and the global values in their value numbering's order.
-constexpr unsigned kModuleVersion = 1, kModuleGlobalVar = 7, kModuleFunction = 8,
+constexpr unsigned kModuleVersion = 1, kModuleSectionName = 5, kModuleGlobalVar = 7, kModuleFunction = 8,
                    kModuleAliasOld = 9, kModuleAlias = 14, kModuleIfunc = 15;
 // CONSTANTS_BLOCK's records: SETTYPE defines no value; NULL one of zero (an integer's 0 is
 // written so), INTEGER one of a signed VBR; every other record one value.
-constexpr unsigned kConstSetType = 1, kConstNull = 2, kConstInteger = 4;
+// FLOAT one of its bits, CE_CAST one of [opcode, type, value]; an undefined (UNDEF, POISON) or any
+// other constant is no scalar the code is folded by.
+constexpr unsigned kConstSetType = 1, kConstNull = 2, kConstInteger = 4, kConstFloat = 6, kConstCast = 11;
 // VALUE_SYMTAB_BLOCK's records with a name: [value, chars] and [value, offset, chars].
 constexpr unsigned kVstEntry = 1, kVstFnEntry = 3;
 // TYPE_BLOCK's records: every one defines a type but NUMENTRY and STRUCT_NAME.
-constexpr unsigned kTypeNumEntry = 1, kTypeVoid = 2, kTypeMetadata = 16, kTypeStructName = 19;
+constexpr unsigned kTypeNumEntry = 1, kTypeVoid = 2, kTypeFloat = 3, kTypeDouble = 4, kTypeLabel = 5,
+                   kTypeInteger = 7, kTypePointer = 8, kTypeHalf = 10, kTypeMetadata = 16,
+                   kTypeStructName = 19, kTypeFunction = 21, kTypeOpaquePointer = 25;
+// PARAMATTR_BLOCK's list of groups, and PARAMATTR_GROUP_BLOCK's group: [id, index, attributes].
+constexpr unsigned kParamAttrEntry = 2, kParamAttrGroupEntry = 3;
+// The index of a group of a function's own attributes, and the attributes read: readnone,
+// readonly, nounwind and willreturn (enum attributes) and memory (an integer one, of two bits per
+// location, the second of each a write's).
+constexpr uint64_t kFunctionAttributes = 0xFFFFFFFF;
+constexpr uint64_t kAttrNoUnwind = 18, kAttrReadNone = 20, kAttrReadOnly = 21, kAttrWillReturn = 61,
+                   kAttrMemory = 86;
+// FUNCTION_BLOCK's records (LLVMBitCodes.h's FUNC_CODE_*).
+enum : unsigned {
+	kFnDeclareBlocks = 1, kFnBinOp = 2, kFnCast = 3, kFnGepOld = 4, kFnSelect = 5, kFnExtractElt = 6,
+	kFnInsertElt = 7, kFnShuffleVec = 8, kFnCmp = 9, kFnRet = 10, kFnBr = 11, kFnSwitch = 12,
+	kFnUnreachable = 15, kFnPhi = 16, kFnAlloca = 19, kFnLoad = 20, kFnStoreOld = 24, kFnExtractVal = 26,
+	kFnInsertVal = 27, kFnCmp2 = 28, kFnVSelect = 29, kFnInboundsGepOld = 30, kFnDebugLocAgain = 33,
+	kFnCall = 34, kFnDebugLoc = 35, kFnFence = 36, kFnCmpXchgOld = 37, kFnAtomicRmwOld = 38,
+	kFnLoadAtomic = 41, kFnStoreAtomicOld = 42, kFnGep = 43, kFnStore = 44, kFnStoreAtomic = 45,
+	kFnCmpXchg = 46, kFnUnOp = 56, kFnFreeze = 58, kFnAtomicRmw = 59, kFnBlockAddrUsers = 60,
+};
+// INST_CALL's calling-convention word: its fast-math flags follow it, then its function type.
+constexpr uint64_t kCallExplicitType = 1ull << 15, kCallFmf = 1ull << 17;
+// The cast opcodes a pointer keeps its global through: bitcast and addrspacecast.
+constexpr uint64_t kCastBitcast = 11, kCastAddrSpace = 12;
 // METADATA_BLOCK's records. OLD_NODE and OLD_FN_NODE are LLVM 3.5's NODE and FN_NODE, which
 // Apple's compiler writes for macOS 10.12 (-std=macos-metal1.2): operands of type and value pairs.
 constexpr unsigned kMdStringOld = 1, kMdValue = 2, kMdNode = 3, kMdName = 4,
@@ -260,6 +374,13 @@ struct Module {
 	// The values an old node holds in place (kMdOldNode), each a kValue metadata outside the
 	// numbering: an operand naming one is kInlineValue | its place here.
 	std::vector<Md> inlineValues;
+	// The module's code, decoded where it is asked for (`wantCode`): its function bodies only where
+	// the module declares function constants. `codeBad` where something in it did not read.
+	bool wantCode = false, codeBad = false;
+	std::shared_ptr<RgfxAirCode> code;
+	// How many module-level constants there are: a body's first value number is the global
+	// values' count and this.
+	uint64_t moduleConstants = 0;
 };
 
 int64_t signedVbr(uint64_t v)
@@ -337,9 +458,19 @@ public:
 					b.skipTo(end);
 					continue;
 				}
-				if (sub == kConstantsBlock)
-					constantBase_ = m_.globals.size(), constantNext_ = 0;
-				if (!block(b, sub, subWidth, blockInfo_[sub], depth + 1))
+				if (sub == kConstantsBlock && id == kFunctionBlock) {
+					constantType_ = UINT32_MAX;
+				} else if (sub == kConstantsBlock) {
+					constantBase_ = m_.globals.size(), constantNext_ = 0, constantType_ = UINT32_MAX;
+				}
+				if (sub == kFunctionBlock && !beginBody())
+					m_.codeBad = true;
+				const bool inner = block(b, sub, subWidth, blockInfo_[sub], depth + 1);
+				if (sub == kConstantsBlock && id == kModuleBlock)
+					m_.moduleConstants = constantNext_;
+				if (sub == kFunctionBlock)
+					endBody();
+				if (!inner)
 					return false;
 				b.skipTo(end);
 				continue;
@@ -386,17 +517,28 @@ public:
 	}
 
 private:
-	// The blocks read: the module and, in it, its constants, value symbol table and metadata;
-	// the string table beside it; and BLOCKINFO wherever it is. A function's own blocks, the
-	// types and the rest are skipped.
-	static bool wanted(unsigned parent, unsigned sub)
+	// The blocks read: the module and, in it, its constants, value symbol table, metadata and
+	// types; the string table beside it; and BLOCKINFO wherever it is. Where the module's code is
+	// asked for, its attributes too, and, where it declares function constants (its metadata,
+	// which comes before them, says), its function bodies and their constants. The rest is
+	// skipped.
+	bool wanted(unsigned parent, unsigned sub) const
 	{
 		if (sub == kBlockInfo)
 			return true;
 		if (parent == ~0u)
 			return sub == kModuleBlock || sub == kStrtabBlock;
-		return parent == kModuleBlock && (sub == kConstantsBlock || sub == kValueSymtabBlock ||
-		                                  sub == kMetadataBlock || sub == kTypeBlock);
+		if (parent == kFunctionBlock)
+			return sub == kConstantsBlock && body_ != nullptr;
+		if (parent != kModuleBlock)
+			return false;
+		if (sub == kConstantsBlock || sub == kValueSymtabBlock || sub == kMetadataBlock || sub == kTypeBlock)
+			return true;
+		if (!m_.wantCode)
+			return false;
+		if (sub == kParamAttrBlock || sub == kParamAttrGroupBlock)
+			return true;
+		return sub == kFunctionBlock && m_.named.count("air.function_constants") != 0;
 	}
 
 	bool record(unsigned id, const Record &r, std::string &pendingName, bool &haveName)
@@ -425,20 +567,63 @@ private:
 				if (r.code == kModuleGlobalVar && r.ops.size() > unnamedAt)
 					g.unnamedAddr = r.ops[unnamedAt];
 				m_.globals.push_back(std::move(g));
+				if (m_.code != nullptr)
+					codeGlobal(r);
 				break;
 			}
+			case kModuleSectionName:
+				if (m_.code != nullptr)
+					m_.code->sections.push_back(chars(r.ops, 0));
+				break;
 			default:
 				break;
 			}
 			return true;
 		case kConstantsBlock:
-			if (r.code == kConstSetType)
+			if (body_ != nullptr) {
+				// A body's own constant (only bodies' blocks hold one here).
+				if (r.code == kConstSetType) {
+					constantType_ = r.ops.empty() ? UINT32_MAX : static_cast<uint32_t>(r.ops[0]);
+					return true;
+				}
+				codeConstant(r, body_->body.values, body_->body.constants, body_->body.casts);
+				body_->body.values++;
 				return true;
+			}
+			if (r.code == kConstSetType) {
+				constantType_ = r.ops.empty() ? UINT32_MAX : static_cast<uint32_t>(r.ops[0]);
+				return true;
+			}
 			if (r.code == kConstInteger && !r.ops.empty())
 				m_.integers[constantBase_ + constantNext_] = signedVbr(r.ops[0]);
 			else if (r.code == kConstNull)
 				m_.integers[constantBase_ + constantNext_] = 0;
+			if (m_.code != nullptr)
+				codeConstant(r, static_cast<uint32_t>(constantBase_ + constantNext_), m_.code->constants,
+				             m_.code->casts);
 			constantNext_++;
+			return true;
+		case kFunctionBlock:
+			if (body_ != nullptr && !instruction(r))
+				body_->ok = false;
+			return true;
+		case kParamAttrGroupBlock:
+			if (m_.code != nullptr && r.code == kParamAttrGroupEntry)
+				attributeGroup(r);
+			return true;
+		case kParamAttrBlock:
+			if (m_.code != nullptr && r.code == kParamAttrEntry) {
+				RgfxAirCode::Attributes a;
+				for (uint64_t g : r.ops) {
+					auto it = groups_.find(g);
+					if (it == groups_.end())
+						continue;
+					a.noWrite = a.noWrite || it->second.noWrite;
+					a.noUnwind = a.noUnwind || it->second.noUnwind;
+					a.willReturn = a.willReturn || it->second.willReturn;
+				}
+				m_.code->attributes.push_back(a);
+			}
 			return true;
 		case kValueSymtabBlock:
 			if ((r.code == kVstEntry && r.ops.size() >= 1) ||
@@ -456,6 +641,8 @@ private:
 			else if (r.code == kTypeVoid)
 				m_.voidType = m_.types;
 			m_.types++;
+			if (m_.code != nullptr)
+				codeType(r);
 			return true;
 		case kStrtabBlock:
 			if (r.code == kStrtabBlob && r.blob != nullptr) {
@@ -547,9 +734,518 @@ private:
 		}
 	}
 
+	// --- the module's code (Module::code) ---
+
+	// One type of the type table, in its order.
+	void codeType(const Record &r)
+	{
+		using K = RgfxAirCode::Kind;
+		RgfxAirCode::Type t;
+		const auto &o = r.ops;
+		switch (r.code) {
+		case kTypeVoid: t.kind = K::Void; break;
+		case kTypeLabel: t.kind = K::Label; break;
+		case kTypeMetadata: t.kind = K::Metadata; break;
+		case kTypeHalf: t.kind = K::Half; break;
+		case kTypeFloat: t.kind = K::Float; break;
+		case kTypeDouble: t.kind = K::Double; break;
+		case kTypeInteger:
+			if (!o.empty() && o[0] >= 1 && o[0] <= 64) {
+				t.kind = K::Int;
+				t.width = static_cast<uint32_t>(o[0]);
+			}
+			break;
+		case kTypePointer:
+			t.kind = K::Pointer;
+			t.pointee = o.empty() ? UINT32_MAX : static_cast<uint32_t>(o[0]);
+			t.width = o.size() > 1 ? static_cast<uint32_t>(o[1]) : 0;
+			break;
+		case kTypeOpaquePointer:
+			t.kind = K::Pointer;
+			t.width = o.empty() ? 0 : static_cast<uint32_t>(o[0]);
+			break;
+		case kTypeFunction:
+			if (o.size() >= 2) {
+				t.kind = K::Function;
+				t.vararg = o[0] != 0;
+				t.result = static_cast<uint32_t>(o[1]);
+				for (size_t i = 2; i < o.size(); i++)
+					t.params.push_back(static_cast<uint32_t>(o[i]));
+			}
+			break;
+		default: break;
+		}
+		m_.code->types.push_back(std::move(t));
+	}
+
+	// A global value's record (GLOBALVAR, FUNCTION, an alias), beside Module::globals' entry of it.
+	// GLOBALVAR: [type, constant | explicit type << 1 | address space << 2, initialiser + 1, ...];
+	// FUNCTION: [type, calling convention, declaration, linkage, attributes, alignment, section,
+	// ...]; each after the name's two fields in version 2.
+	void codeGlobal(const Record &r)
+	{
+		RgfxAirCode &c = *m_.code;
+		RgfxAirCode::Global g;
+		const size_t at = m_.version >= 2 ? 2 : 0;
+		const auto &o = r.ops;
+		if (r.code == kModuleGlobalVar && o.size() > at + 2) {
+			g.type = static_cast<uint32_t>(o[at]);
+			const uint64_t word = o[at + 1];
+			g.constant = (word & 1) != 0;
+			if ((word & 2) != 0)
+				g.space = static_cast<uint32_t>(word >> 2);
+			else if (g.type < c.types.size() && c.types[g.type].kind == RgfxAirCode::Kind::Pointer)
+				g.space = c.types[g.type].width; // a pointer type: the global's own
+			g.init = o[at + 2] == 0 ? UINT64_MAX : o[at + 2] - 1;
+		} else if (r.code == kModuleFunction && o.size() > at + 4) {
+			g.function = true;
+			g.type = static_cast<uint32_t>(o[at]);
+			// A function record of a pointer type: its pointee is the function's type.
+			if (g.type < c.types.size() && c.types[g.type].kind == RgfxAirCode::Kind::Pointer)
+				g.type = c.types[g.type].pointee;
+			g.proto = o[at + 2] != 0;
+			g.attributes = o[at + 4];
+			g.section = o.size() > at + 6 ? o[at + 6] : 0;
+		}
+		c.globals.push_back(g);
+	}
+
+	// A constant `v` of the module's or a body's, of type constantType_: a scalar where it is an
+	// integer, a zero or a floating-point value; a cast of a pointer (bitcast, addrspacecast)
+	// where it is one. Every other constant is left out: no value the code is folded by.
+	void codeConstant(const Record &r, uint32_t v, std::map<uint32_t, RgfxAirCode::Scalar> &scalars,
+	                  std::map<uint32_t, uint32_t> &casts)
+	{
+		using K = RgfxAirCode::Kind;
+		const RgfxAirCode &c = *m_.code;
+		if (r.code == kConstCast) {
+			if (r.ops.size() >= 3 && (r.ops[0] == kCastBitcast || r.ops[0] == kCastAddrSpace))
+				casts[v] = static_cast<uint32_t>(r.ops[2]);
+			return;
+		}
+		if (constantType_ >= c.types.size())
+			return;
+		const RgfxAirCode::Type &t = c.types[constantType_];
+		const bool isFloat = t.kind == K::Half || t.kind == K::Float || t.kind == K::Double;
+		RgfxAirCode::Scalar s;
+		s.isFloat = isFloat;
+		s.width = isFloat ? (t.kind == K::Half ? 16 : t.kind == K::Float ? 32 : 64) : t.width;
+		if (r.code == kConstNull && (t.kind == K::Int || isFloat)) {
+			scalars[v] = s;
+		} else if (r.code == kConstInteger && t.kind == K::Int && !r.ops.empty()) {
+			s.bits = static_cast<uint64_t>(signedVbr(r.ops[0]));
+			if (s.width < 64)
+				s.bits &= (1ull << s.width) - 1;
+			scalars[v] = s;
+		} else if (r.code == kConstFloat && isFloat && !r.ops.empty()) {
+			s.f = floatOf(r.ops[0], s.width);
+			scalars[v] = s;
+		}
+	}
+
+	// The value of a floating-point constant of `width` bits whose bits are `bits`.
+	static double floatOf(uint64_t bits, uint32_t width)
+	{
+		if (width == 64) {
+			double d;
+			std::memcpy(&d, &bits, sizeof(d));
+			return d;
+		}
+		if (width == 32) {
+			const uint32_t b = static_cast<uint32_t>(bits);
+			float f;
+			std::memcpy(&f, &b, sizeof(f));
+			return f;
+		}
+		// IEEE half: a sign, 5 bits of exponent, 10 of fraction.
+		const uint32_t h = static_cast<uint32_t>(bits & 0xFFFF), e = (h >> 10) & 31, m = h & 1023;
+		const double sign = (h & 0x8000) != 0 ? -1.0 : 1.0;
+		if (e == 31)
+			return m != 0 ? NAN : sign * INFINITY;
+		if (e == 0)
+			return sign * std::ldexp(static_cast<double>(m), -24);
+		return sign * std::ldexp(static_cast<double>(m | 1024), static_cast<int>(e) - 25);
+	}
+
+	// A group of attributes, where they are a function's own (the index kFunctionAttributes): its
+	// readnone, readonly and memory (whether it may write memory), nounwind and willreturn. A
+	// group of an attribute of a kind the reader does not follow is left out: none of it is read.
+	void attributeGroup(const Record &r)
+	{
+		const auto &o = r.ops;
+		if (o.size() < 2 || o[1] != kFunctionAttributes)
+			return;
+		RgfxAirCode::Attributes a;
+		for (size_t i = 2; i < o.size();) {
+			const uint64_t kind = o[i++];
+			if (kind == 0 || kind == 1) {
+				if (i >= o.size() || (kind == 1 && i + 1 >= o.size()))
+					return;
+				const uint64_t id = o[i++];
+				const uint64_t value = kind == 1 ? o[i++] : 0;
+				if (kind == 0 && (id == kAttrReadNone || id == kAttrReadOnly))
+					a.noWrite = true;
+				else if (kind == 0 && id == kAttrNoUnwind)
+					a.noUnwind = true;
+				else if (kind == 0 && id == kAttrWillReturn)
+					a.willReturn = true;
+				else if (kind == 1 && id == kAttrMemory)
+					a.noWrite = (value & 0xAAAAAAAAAAAAAAAAull) == 0;
+			} else if (kind == 3 || kind == 4) {
+				// A string attribute: its key, and its value, each ended by a 0.
+				for (int strings = kind == 4 ? 2 : 1; strings > 0; strings--) {
+					while (i < o.size() && o[i] != 0)
+						i++;
+					i++;
+				}
+			} else if (kind == 5 || kind == 6) {
+				i += kind == 6 ? 2 : 1; // a type attribute, and its type
+			} else {
+				return;
+			}
+		}
+		groups_[o[0]] = a;
+	}
+
+	// A body's FUNCTION_BLOCK begins: that of the next function record of a body (they come in
+	// the records' order). False where there is none, or its type is no function's.
+	bool beginBody()
+	{
+		RgfxAirCode &c = *m_.code;
+		while (nextBody_ < c.globals.size() && (!c.globals[nextBody_].function || c.globals[nextBody_].proto))
+			nextBody_++;
+		if (nextBody_ >= c.globals.size())
+			return false;
+		const RgfxAirCode::Global &g = c.globals[nextBody_];
+		const uint32_t function = static_cast<uint32_t>(nextBody_++);
+		if (g.type >= c.types.size() || c.types[g.type].kind != RgfxAirCode::Kind::Function)
+			return false;
+		body_ = std::make_unique<BodyRead>();
+		body_->body.function = function;
+		body_->body.first = static_cast<uint32_t>(m_.globals.size() + m_.moduleConstants);
+		body_->body.args = static_cast<uint32_t>(c.types[g.type].params.size());
+		body_->body.values = body_->body.first + body_->body.args;
+		return true;
+	}
+
+	// The body ends: kept where every record read and every block it declared ended.
+	void endBody()
+	{
+		if (body_ != nullptr && body_->ok && !body_->body.blocks.empty() &&
+		    body_->block == body_->body.blocks.size())
+			m_.code->bodies.push_back(std::move(body_->body));
+		body_.reset();
+	}
+
+	// One record of a body: an instruction, appended to its block, its result the next value
+	// number where it has one. False where it is not one the reader follows. Operands are
+	// relative to the next value number; one ahead of it (a forward reference) is followed by its
+	// type where the record does not give it otherwise.
+	bool instruction(const Record &r)
+	{
+		using Op = RgfxAirCode::Op;
+		using K = RgfxAirCode::Kind;
+		BodyRead &p = *body_;
+		const RgfxAirCode &c = *m_.code;
+		const std::vector<uint64_t> &o = r.ops;
+		const uint32_t next = p.body.values;
+		size_t i = 0;
+		// A value and, where it is ahead, its type; a value whose type the record gives.
+		auto typed = [&](uint32_t &v) {
+			if (i >= o.size())
+				return false;
+			v = next - static_cast<uint32_t>(o[i++]);
+			if (v >= next && i++ >= o.size())
+				return false;
+			return true;
+		};
+		auto plain = [&](uint32_t &v) {
+			if (i >= o.size())
+				return false;
+			v = next - static_cast<uint32_t>(o[i++]);
+			return true;
+		};
+		auto typedAll = [&](std::vector<uint32_t> &out) {
+			while (i < o.size()) {
+				uint32_t v = 0;
+				if (!typed(v))
+					return false;
+				out.push_back(v);
+			}
+			return true;
+		};
+		RgfxAirCode::Inst in;
+		bool value = true, terminator = false;
+		uint32_t a = 0, b = 0, x = 0;
+		switch (r.code) {
+		case kFnDeclareBlocks:
+			if (o.empty() || o[0] == 0 || o[0] > (1u << 20) || !p.body.blocks.empty())
+				return false;
+			p.body.blocks.resize(static_cast<size_t>(o[0]));
+			return true;
+		case kFnDebugLoc:
+		case kFnDebugLocAgain:
+		case kFnBlockAddrUsers:
+			return true;
+		case kFnBinOp:
+			if (!typed(a) || !plain(b) || i >= o.size())
+				return false;
+			in.op = Op::BinOp;
+			in.code = static_cast<uint32_t>(o[i]);
+			in.ops = {a, b};
+			break;
+		case kFnUnOp:
+			if (!typed(a) || i >= o.size())
+				return false;
+			in.op = Op::UnOp;
+			in.code = static_cast<uint32_t>(o[i]);
+			in.ops = {a};
+			break;
+		case kFnCast:
+			if (!typed(a) || i + 1 >= o.size())
+				return false;
+			in.op = Op::Cast;
+			in.type = static_cast<uint32_t>(o[i]);
+			in.code = static_cast<uint32_t>(o[i + 1]);
+			in.ops = {a};
+			break;
+		case kFnGep:
+			if (o.size() < 2)
+				return false;
+			i = 2; // inbounds, the source element's type
+			if (!typedAll(in.ops))
+				return false;
+			break;
+		case kFnGepOld:
+		case kFnInboundsGepOld:
+		case kFnExtractVal:
+			if (r.code == kFnExtractVal) {
+				if (!typed(a))
+					return false;
+				in.ops = {a}; // then its indices, literals
+			} else if (!typedAll(in.ops)) {
+				return false;
+			}
+			break;
+		case kFnInsertVal:
+			if (!typed(a) || !typed(b))
+				return false;
+			in.ops = {a, b};
+			break;
+		case kFnSelect:
+		case kFnVSelect:
+			if (!typed(a) || !plain(b) || !(r.code == kFnSelect ? plain(x) : typed(x)))
+				return false;
+			in.op = Op::Select;
+			in.ops = {a, b, x};
+			break;
+		case kFnExtractElt:
+			if (!typed(a) || !typed(b))
+				return false;
+			in.ops = {a, b};
+			break;
+		case kFnInsertElt:
+		case kFnShuffleVec:
+			if (!typed(a) || !plain(b) || !typed(x))
+				return false;
+			in.ops = {a, b, x};
+			break;
+		case kFnCmp:
+		case kFnCmp2:
+			if (!typed(a) || !plain(b) || i >= o.size())
+				return false;
+			in.op = Op::Cmp;
+			in.code = static_cast<uint32_t>(o[i]);
+			in.ops = {a, b};
+			break;
+		case kFnRet:
+			if (!typedAll(in.ops))
+				return false;
+			in.op = Op::Ret;
+			in.keeps = true;
+			value = false;
+			terminator = true;
+			break;
+		case kFnBr:
+			if (o.size() == 1) {
+				in.op = Op::Br;
+				in.blocks = {static_cast<uint32_t>(o[0])};
+			} else if (o.size() == 3) {
+				in.op = Op::CondBr;
+				in.blocks = {static_cast<uint32_t>(o[0]), static_cast<uint32_t>(o[1])};
+				i = 2;
+				if (!plain(a))
+					return false;
+				in.ops = {a};
+			} else {
+				return false;
+			}
+			value = false;
+			terminator = true;
+			break;
+		case kFnSwitch:
+			// [type, condition, default, (case's value, its block)...]; the cases' values are
+			// absolute. A record of LLVM 3.3's case ranges (its magic in the first's top bits) is
+			// not followed.
+			if (o.size() < 3 || (o.size() - 3) % 2 != 0 || (o[0] >> 16) == 0x4B5)
+				return false;
+			i = 1;
+			if (!plain(a))
+				return false;
+			in.op = Op::Switch;
+			in.ops = {a};
+			in.blocks = {static_cast<uint32_t>(o[2])};
+			for (size_t k = 3; k + 1 < o.size(); k += 2) {
+				in.ops.push_back(static_cast<uint32_t>(o[k]));
+				in.blocks.push_back(static_cast<uint32_t>(o[k + 1]));
+			}
+			value = false;
+			terminator = true;
+			break;
+		case kFnUnreachable:
+			in.op = Op::Unreachable;
+			value = false;
+			terminator = true;
+			break;
+		case kFnPhi:
+			// [type, (value, block)...], each value relative and sign-rotated; fast-math flags last
+			// where the size is even.
+			if (o.empty())
+				return false;
+			in.op = Op::Phi;
+			in.type = static_cast<uint32_t>(o[0]);
+			for (size_t k = 1; k + 1 < o.size(); k += 2) {
+				in.ops.push_back(next - static_cast<uint32_t>(signedVbr(o[k])));
+				in.blocks.push_back(static_cast<uint32_t>(o[k + 1]));
+			}
+			break;
+		case kFnAlloca:
+			break; // its size is a constant's absolute number: nothing an argument reaches
+		case kFnLoad:
+		case kFnLoadAtomic: {
+			// [pointer, type (where it is not the pointee), alignment, volatile(, ordering, scope)]
+			if (!typed(a))
+				return false;
+			const size_t rest = r.code == kFnLoad ? 2 : 4;
+			if (i + rest + 1 == o.size())
+				in.type = static_cast<uint32_t>(o[i++]);
+			else if (i + rest != o.size())
+				return false;
+			in.op = Op::Load;
+			in.ops = {a};
+			in.keeps = r.code == kFnLoadAtomic || o[i + 1] != 0;
+			break;
+		}
+		case kFnStore:
+		case kFnStoreAtomic:
+		case kFnStoreOld:
+		case kFnStoreAtomicOld:
+			if (!typed(a) || !((r.code == kFnStore || r.code == kFnStoreAtomic) ? typed(b) : plain(b)))
+				return false;
+			in.op = Op::Store;
+			in.ops = {a, b};
+			in.keeps = true;
+			value = false;
+			break;
+		case kFnFence:
+			in.keeps = true;
+			value = false;
+			break;
+		case kFnCmpXchg:
+		case kFnCmpXchgOld:
+			if (!typed(a) || !(r.code == kFnCmpXchg ? typed(b) : plain(b)) || !plain(x))
+				return false;
+			in.ops = {a, b, x};
+			in.keeps = true;
+			break;
+		case kFnAtomicRmw:
+		case kFnAtomicRmwOld:
+			if (!typed(a) || !(r.code == kFnAtomicRmw ? typed(b) : plain(b)))
+				return false;
+			in.ops = {a, b};
+			in.keeps = true;
+			break;
+		case kFnFreeze:
+			if (!typed(a))
+				return false;
+			in.op = Op::Freeze;
+			in.ops = {a};
+			break;
+		case kFnCall: {
+			// [attributes, calling convention, (fast-math flags), function type, callee, arguments]
+			if (o.size() < 3)
+				return false;
+			const uint64_t attributes = o[0], cc = o[1];
+			i = (cc & kCallFmf) != 0 ? 3 : 2;
+			if ((cc & kCallExplicitType) == 0 || i >= o.size() || o[i] >= c.types.size())
+				return false;
+			const RgfxAirCode::Type &type = c.types[static_cast<size_t>(o[i++])];
+			if (type.kind != K::Function || !typed(a))
+				return false;
+			in.op = Op::Call;
+			in.ops = {a};
+			for (uint32_t param : type.params) {
+				const K k = param < c.types.size() ? c.types[param].kind : K::Other;
+				if (k == K::Label || k == K::Metadata) {
+					i++; // a block, or metadata: no value
+					continue;
+				}
+				if (!plain(b))
+					return false;
+				in.ops.push_back(b);
+			}
+			if (i < o.size() && (!type.vararg || !typedAll(in.ops)))
+				return false;
+			if (i > o.size())
+				return false;
+			in.type = type.result;
+			value = type.result < c.types.size() && c.types[type.result].kind != K::Void;
+			// Removable where it writes no memory, does not unwind and returns, by its own
+			// attributes or its callee's.
+			RgfxAirCode::Attributes is = attributesOf(attributes);
+			if (a < c.globals.size() && c.globals[a].function) {
+				const RgfxAirCode::Attributes callee = attributesOf(c.globals[a].attributes);
+				is.noWrite = is.noWrite || callee.noWrite;
+				is.noUnwind = is.noUnwind || callee.noUnwind;
+				is.willReturn = is.willReturn || callee.willReturn;
+			}
+			in.keeps = !(is.noWrite && is.noUnwind && is.willReturn);
+			break;
+		}
+		default:
+			return false;
+		}
+		if (p.block >= p.body.blocks.size())
+			return false;
+		if (value)
+			in.result = p.body.values++;
+		p.body.blocks[p.block].push_back(std::move(in));
+		if (terminator)
+			p.block++;
+		return true;
+	}
+
+	// Attribute list `list` (1 on; 0 is none).
+	RgfxAirCode::Attributes attributesOf(uint64_t list) const
+	{
+		const auto &all = m_.code->attributes;
+		return list >= 1 && list <= all.size() ? all[static_cast<size_t>(list - 1)] : RgfxAirCode::Attributes{};
+	}
+
+	// A body being read: its block, and whether every record so far read.
+	struct BodyRead {
+		RgfxAirCode::Body body;
+		size_t block = 0;
+		bool ok = true;
+	};
+
 	Module &m_;
 	std::map<unsigned, std::vector<Abbrev>> blockInfo_;
 	uint64_t constantBase_ = 0, constantNext_ = 0;
+	uint32_t constantType_ = UINT32_MAX;
+	std::map<uint64_t, RgfxAirCode::Attributes> groups_;
+	std::unique_ptr<BodyRead> body_;
+	size_t nextBody_ = 0;
 };
 
 const Module::Md *mdAt(const Module &m, uint64_t i)
@@ -837,6 +1533,8 @@ bool readModule(const uint8_t *bitcode, size_t size, Module &m)
 	}
 	if (bitcode[0] != 'B' || bitcode[1] != 'C' || bitcode[2] != 0xC0 || bitcode[3] != 0xDE)
 		return false;
+	if (m.wantCode)
+		m.code = std::make_shared<RgfxAirCode>();
 	Reader reader(m);
 	Bits b(bitcode + 4, size - 4);
 	return reader.block(b, ~0u, 2, {}, 0);
@@ -1226,16 +1924,25 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 			if (pred == nullptr || !mdText(m, *pred, 2, out.predicate))
 				return false;
 			out.predicated = true;
+			if (!pred->ops.empty() && mdGlobalVariable(m, pred->ops[0]))
+				out.predicateGlobal = mdAt(m, pred->ops[0])->value;
 			i += 1;
 		} else if (k == "air.location_index") {
 			int64_t index = 0, count = 0;
-			if (i + 2 >= node->ops.size() || !mdInteger(m, node->ops[i + 2], count) || count < 1 ||
-			    count > INT32_MAX)
+			if (i + 2 >= node->ops.size())
 				return false;
-			if (mdGlobalVariable(m, node->ops[i + 1]))
+			if (mdGlobalVariable(m, node->ops[i + 2])) {
+				out.countIsGlobal = true;
+				out.countGlobal = mdAt(m, node->ops[i + 2])->value;
+			} else if (!mdInteger(m, node->ops[i + 2], count) || count < 1 || count > INT32_MAX) {
+				return false;
+			}
+			if (mdGlobalVariable(m, node->ops[i + 1])) {
 				out.indexIsGlobal = true;
-			else if (!mdInteger(m, node->ops[i + 1], index) || index < 0 || index > INT32_MAX)
+				out.indexGlobal = mdAt(m, node->ops[i + 1])->value;
+			} else if (!mdInteger(m, node->ops[i + 1], index) || index < 0 || index > INT32_MAX) {
 				return false;
+			}
 			out.hasLocation = true;
 			out.index = static_cast<uint32_t>(index);
 			out.count = static_cast<uint32_t>(count);
@@ -1351,6 +2058,720 @@ bool layoutOf(const Module &m, uint64_t id, unsigned depth,
 	return true;
 }
 
+
+// --- a specialisation (RgfxAirArguments.hpp, "An entry point's specialisation") --------------
+
+using Code = RgfxAirCode;
+
+// A value of the specialised code, on sparse conditional constant propagation's lattice: not yet
+// known (Top), a constant scalar, or any value (Over).
+struct Val {
+	enum Kind : uint8_t { Top, Const, Over } kind = Top;
+	Code::Scalar s;
+};
+
+Val over()
+{
+	Val v;
+	v.kind = Val::Over;
+	return v;
+}
+
+Val scalar(const Code::Scalar &s)
+{
+	Val v;
+	v.kind = Val::Const;
+	v.s = s;
+	return v;
+}
+
+Val integer(uint32_t width, uint64_t bits)
+{
+	Code::Scalar s;
+	s.width = width;
+	s.bits = width < 64 ? bits & ((1ull << width) - 1) : bits;
+	return scalar(s);
+}
+
+Val real(uint32_t width, double f)
+{
+	Code::Scalar s;
+	s.isFloat = true;
+	s.width = width;
+	s.f = width == 32 ? static_cast<double>(static_cast<float>(f)) : f;
+	return scalar(s);
+}
+
+bool same(const Val &a, const Val &b)
+{
+	if (a.kind != b.kind)
+		return false;
+	if (a.kind != Val::Const)
+		return true;
+	if (a.s.isFloat != b.s.isFloat || a.s.width != b.s.width)
+		return false;
+	return a.s.isFloat ? std::memcmp(&a.s.f, &b.s.f, sizeof(double)) == 0 : a.s.bits == b.s.bits;
+}
+
+// Raises `slot` to `v` on the lattice; whether it changed.
+bool raise(Val &slot, const Val &v)
+{
+	if (slot.kind == Val::Over || v.kind == Val::Top)
+		return false;
+	if (slot.kind == Val::Top) {
+		slot = v;
+		return true;
+	}
+	if (same(slot, v))
+		return false;
+	slot = over();
+	return true;
+}
+
+int64_t signedOf(const Code::Scalar &s)
+{
+	if (s.width == 0 || s.width >= 64)
+		return static_cast<int64_t>(s.bits);
+	const uint64_t sign = 1ull << (s.width - 1);
+	return static_cast<int64_t>((s.bits ^ sign) - sign);
+}
+
+uint32_t floatWidth(Code::Kind k)
+{
+	return k == Code::Kind::Half ? 16 : k == Code::Kind::Float ? 32 : k == Code::Kind::Double ? 64 : 0;
+}
+
+// LLVM's binary opcodes (BINOP_*), of integers and, where `isFloat`, the floating-point ones they
+// stand for (add fadd, sub fsub, mul fmul, sdiv fdiv, srem frem).
+Val binOp(uint32_t op, const Code::Scalar &a, const Code::Scalar &b)
+{
+	if (a.isFloat != b.isFloat || a.width != b.width)
+		return over();
+	if (a.isFloat) {
+		switch (op) {
+		case 0: return real(a.width, a.f + b.f);
+		case 1: return real(a.width, a.f - b.f);
+		case 2: return real(a.width, a.f * b.f);
+		case 4: return real(a.width, a.f / b.f);
+		case 6: return real(a.width, std::fmod(a.f, b.f));
+		default: return over();
+		}
+	}
+	const uint32_t w = a.width;
+	const uint64_t x = a.bits, y = b.bits;
+	const int64_t sx = signedOf(a), sy = signedOf(b);
+	switch (op) {
+	case 0: return integer(w, x + y);
+	case 1: return integer(w, x - y);
+	case 2: return integer(w, x * y);
+	case 3: return y == 0 ? over() : integer(w, x / y);
+	case 4: return y == 0 || (sy == -1 && sx == INT64_MIN) ? over() : integer(w, static_cast<uint64_t>(sx / sy));
+	case 5: return y == 0 ? over() : integer(w, x % y);
+	case 6: return y == 0 || sy == -1 ? over() : integer(w, static_cast<uint64_t>(sx % sy));
+	case 7: return y >= w ? over() : integer(w, x << y);
+	case 8: return y >= w ? over() : integer(w, x >> y);
+	case 9: return y >= w ? over() : integer(w, static_cast<uint64_t>(sx >> y));
+	case 10: return integer(w, x & y);
+	case 11: return integer(w, x | y);
+	case 12: return integer(w, x ^ y);
+	default: return over();
+	}
+}
+
+// LLVM's cast opcodes (CAST_*) to type `to`.
+Val castOp(uint32_t op, const Code::Scalar &a, const Code::Type *to)
+{
+	if (to == nullptr)
+		return over();
+	const uint32_t fw = floatWidth(to->kind);
+	const bool toInt = to->kind == Code::Kind::Int;
+	switch (op) {
+	case 0: // trunc
+	case 1: // zext
+		return toInt && !a.isFloat ? integer(to->width, a.bits) : over();
+	case 2: // sext
+		return toInt && !a.isFloat ? integer(to->width, static_cast<uint64_t>(signedOf(a))) : over();
+	case 3: // fptoui
+	case 4: // fptosi
+		if (!toInt || !a.isFloat || !std::isfinite(a.f))
+			return over();
+		return integer(to->width, op == 3 ? static_cast<uint64_t>(a.f) : static_cast<uint64_t>(static_cast<int64_t>(a.f)));
+	case 5: // uitofp
+		return fw != 0 && !a.isFloat ? real(fw, static_cast<double>(a.bits)) : over();
+	case 6: // sitofp
+		return fw != 0 && !a.isFloat ? real(fw, static_cast<double>(signedOf(a))) : over();
+	case 7: // fptrunc
+	case 8: // fpext
+		return fw != 0 && a.isFloat ? real(fw, a.f) : over();
+	default:
+		return over(); // pointers' casts, and bitcasts: no scalar folded through them
+	}
+}
+
+// LLVM's comparison predicates: FCMP_* 0 to 15, ICMP_* 32 to 41.
+Val cmpOp(uint32_t pred, const Code::Scalar &a, const Code::Scalar &b)
+{
+	if (a.isFloat != b.isFloat || a.width != b.width)
+		return over();
+	bool r = false;
+	if (a.isFloat) {
+		if (pred > 15)
+			return over();
+		const bool unordered = std::isnan(a.f) || std::isnan(b.f);
+		const bool lt = a.f < b.f, gt = a.f > b.f, eq = a.f == b.f;
+		// Bits 0 to 2 of the predicate: equal, greater, less; bit 3: true where unordered.
+		r = unordered ? (pred & 8) != 0 : ((pred & 1) != 0 && eq) || ((pred & 2) != 0 && gt) || ((pred & 4) != 0 && lt);
+	} else {
+		const uint64_t x = a.bits, y = b.bits;
+		const int64_t sx = signedOf(a), sy = signedOf(b);
+		switch (pred) {
+		case 32: r = x == y; break;
+		case 33: r = x != y; break;
+		case 34: r = x > y; break;
+		case 35: r = x >= y; break;
+		case 36: r = x < y; break;
+		case 37: r = x <= y; break;
+		case 38: r = sx > sy; break;
+		case 39: r = sx >= sy; break;
+		case 40: r = sx < sy; break;
+		case 41: r = sx <= sy; break;
+		default: return over();
+		}
+	}
+	return integer(1, r ? 1 : 0);
+}
+
+// The specialisation's evaluator over a module's code: by the `count` constant values at
+// `values`, or (`blind`) by none known, each constant any value, defined or not.
+class Specialiser {
+public:
+	Specialiser(const Code &code, const RgfxFunctionConstant *values, uint32_t count, bool blind)
+	    : c_(code), values_(values), count_(count), blind_(blind)
+	{
+	}
+
+	// Runs the initialisers (the bodies of section `air.static_init`, in their records' order):
+	// each global they store a known scalar in holds it after; one they store another value in,
+	// or that a store of theirs may reach, holds any value.
+	void initialise()
+	{
+		for (const Code::Body &body : c_.bodies) {
+			const Code::Global &g = c_.globals[body.function];
+			if (g.section == 0 || g.section > c_.sections.size() || c_.sections[g.section - 1] != "air.static_init")
+				continue;
+			if (!run(body))
+				spoil(body);
+		}
+	}
+
+	const std::map<uint64_t, Val> &memory() const { return memory_; }
+
+	// Which of `body`'s arguments the specialised code may use: false where it was not followed.
+	bool uses(const Code::Body &body, std::vector<bool> &used)
+	{
+		if (!propagate(body))
+			return false;
+		used.assign(body.args, false);
+		std::vector<std::vector<bool>> live(body.blocks.size());
+		std::vector<std::pair<uint32_t, uint32_t>> work;
+		std::map<uint32_t, std::pair<uint32_t, uint32_t>> defs; // a result's instruction
+		for (uint32_t bi = 0; bi < body.blocks.size(); bi++) {
+			live[bi].assign(body.blocks[bi].size(), false);
+			for (uint32_t k = 0; k < body.blocks[bi].size(); k++)
+				if (body.blocks[bi][k].result != UINT32_MAX)
+					defs[body.blocks[bi][k].result] = {bi, k};
+		}
+		auto mark = [&](uint32_t bi, uint32_t k) {
+			if (!live[bi][k]) {
+				live[bi][k] = true;
+				work.emplace_back(bi, k);
+			}
+		};
+		auto use = [&](uint32_t v) {
+			if (v >= body.first && v < body.first + body.args) {
+				used[v - body.first] = true;
+				return;
+			}
+			auto d = defs.find(v);
+			if (d != defs.end() && reachable_[d->second.first])
+				mark(d->second.first, d->second.second);
+		};
+		for (uint32_t bi = 0; bi < body.blocks.size(); bi++) {
+			if (!reachable_[bi])
+				continue;
+			for (uint32_t k = 0; k < body.blocks[bi].size(); k++) {
+				const Code::Inst &in = body.blocks[bi][k];
+				const bool branches = (in.op == Code::Op::CondBr || in.op == Code::Op::Switch) &&
+				                      get(body, in.ops[0]).kind != Val::Const;
+				if (in.keeps || branches)
+					mark(bi, k);
+			}
+		}
+		while (!work.empty()) {
+			const auto [bi, k] = work.back();
+			work.pop_back();
+			const Code::Inst &in = body.blocks[bi][k];
+			if (in.result != UINT32_MAX && !in.keeps && get(body, in.result).kind == Val::Const)
+				continue; // a constant: it reads nothing
+			switch (in.op) {
+			case Code::Op::Phi:
+				for (size_t i = 0; i < in.ops.size(); i++)
+					if (edges_.count({in.blocks[i], bi}) != 0)
+						use(in.ops[i]);
+				break;
+			case Code::Op::Select: {
+				const Val cond = get(body, in.ops[2]);
+				if (cond.kind == Val::Const) {
+					use(cond.s.bits != 0 ? in.ops[0] : in.ops[1]);
+				} else {
+					for (uint32_t v : in.ops)
+						use(v);
+				}
+				break;
+			}
+			case Code::Op::CondBr:
+			case Code::Op::Switch:
+				if (get(body, in.ops[0]).kind != Val::Const)
+					use(in.ops[0]);
+				break;
+			default:
+				for (uint32_t v : in.ops)
+					use(v);
+				break;
+			}
+		}
+		return true;
+	}
+
+private:
+	// The value `v` of `body`, or of the module: a constant's, an instruction's so far, any value
+	// for an argument or a global.
+	Val get(const Code::Body &body, uint32_t v) const
+	{
+		if (v >= body.first && v < body.values) {
+			if (v < body.first + body.args)
+				return over();
+			auto own = body.constants.find(v);
+			if (own != body.constants.end())
+				return scalar(own->second);
+			auto r = results_.find(v);
+			return r != results_.end() ? r->second : (isResult(v) ? Val{} : over());
+		}
+		auto k = c_.constants.find(v);
+		return k != c_.constants.end() ? scalar(k->second) : over();
+	}
+
+	bool isResult(uint32_t v) const { return resultSet_.count(v) != 0; }
+
+	// The global `v` of `body` points at, through pointer casts; false where it is no global's.
+	bool globalOf(const Code::Body &body, uint32_t v, uint64_t &out) const
+	{
+		for (int hops = 0; hops < 8; hops++) {
+			if (v < c_.globals.size()) {
+				out = v;
+				return !c_.globals[v].function;
+			}
+			auto own = body.casts.find(v);
+			if (own != body.casts.end()) {
+				v = own->second;
+				continue;
+			}
+			auto module = c_.casts.find(v);
+			if (module != c_.casts.end()) {
+				v = module->second;
+				continue;
+			}
+			auto cast = casts_.find(v);
+			if (cast != casts_.end()) {
+				v = cast->second;
+				continue;
+			}
+			return false;
+		}
+		return false;
+	}
+
+	// The value of function constant `index` as type `type` reads it; any value where the
+	// function has none.
+	Val constantValue(uint32_t index, uint32_t type) const
+	{
+		if (blind_ || type >= c_.types.size())
+			return over();
+		const Code::Type &t = c_.types[type];
+		const uint32_t fw = floatWidth(t.kind);
+		const uint32_t bits = t.kind == Code::Kind::Int ? t.width : fw;
+		if (bits == 0 || bits > 64 || (t.kind == Code::Kind::Int && bits % 8 != 0))
+			return over();
+		for (uint32_t i = 0; i < count_; i++) {
+			if (values_[i].index != index)
+				continue;
+			uint64_t raw = 0;
+			std::memcpy(&raw, values_[i].value, bits / 8);
+			if (t.kind == Code::Kind::Int)
+				return integer(bits, raw);
+			Code::Scalar s;
+			s.isFloat = true;
+			s.width = fw;
+			if (fw == 64) {
+				std::memcpy(&s.f, &raw, sizeof(double));
+			} else if (fw == 32) {
+				float f;
+				const uint32_t b = static_cast<uint32_t>(raw);
+				std::memcpy(&f, &b, sizeof(f));
+				s.f = f;
+			} else {
+				return over(); // a half constant: not folded
+			}
+			return scalar(s);
+		}
+		return over();
+	}
+
+	bool defined(uint32_t index) const
+	{
+		for (uint32_t i = 0; i < count_; i++)
+			if (values_[i].index == index)
+				return true;
+		return false;
+	}
+
+	// What a load of type `type` from `ptr` of `body` reads: a function constant's value; a
+	// constant-space global the initialisers stored a scalar in; a constant global's scalar
+	// initialiser that no initialiser stored over; else any value.
+	Val load(const Code::Body &body, uint32_t ptr, uint32_t type) const
+	{
+		uint64_t g = 0;
+		if (!globalOf(body, ptr, g))
+			return over();
+		auto fc = c_.fcGlobals.find(g);
+		if (fc != c_.fcGlobals.end())
+			return constantValue(fc->second, type);
+		auto stored = memory_.find(g);
+		if (stored != memory_.end())
+			return c_.globals[g].space == 2 ? stored->second : over();
+		const Code::Global &gv = c_.globals[g];
+		if (!gv.constant || gv.init == UINT64_MAX || gv.init > UINT32_MAX)
+			return over();
+		auto init = c_.constants.find(static_cast<uint32_t>(gv.init));
+		return init != c_.constants.end() ? scalar(init->second) : over();
+	}
+
+	// An instruction's value from its operands' (not a phi's).
+	Val eval(const Code::Body &body, const Code::Inst &in) const
+	{
+		std::vector<Val> ops;
+		ops.reserve(in.ops.size());
+		auto operand = [&](size_t i) { return get(body, in.ops[i]); };
+		switch (in.op) {
+		case Code::Op::BinOp:
+		case Code::Op::Cmp: {
+			const Val a = operand(0), b = operand(1);
+			if (a.kind == Val::Over || b.kind == Val::Over)
+				return over();
+			if (a.kind == Val::Top || b.kind == Val::Top)
+				return Val{};
+			return in.op == Code::Op::BinOp ? binOp(in.code, a.s, b.s) : cmpOp(in.code, a.s, b.s);
+		}
+		case Code::Op::UnOp: {
+			const Val a = operand(0);
+			if (a.kind != Val::Const)
+				return a;
+			return in.code == 0 && a.s.isFloat ? real(a.s.width, -a.s.f) : over();
+		}
+		case Code::Op::Cast: {
+			const Val a = operand(0);
+			if (a.kind != Val::Const)
+				return a;
+			return castOp(in.code, a.s, in.type < c_.types.size() ? &c_.types[in.type] : nullptr);
+		}
+		case Code::Op::Select: {
+			const Val cond = operand(2), t = operand(0), f = operand(1);
+			if (cond.kind == Val::Const)
+				return cond.s.bits != 0 ? t : f;
+			if (cond.kind == Val::Top)
+				return Val{};
+			Val merged;
+			raise(merged, t);
+			raise(merged, f);
+			return t.kind == Val::Top || f.kind == Val::Top ? Val{} : merged;
+		}
+		case Code::Op::Freeze:
+			return operand(0);
+		case Code::Op::Load:
+			return in.keeps ? over() : load(body, in.ops[0], in.type);
+		case Code::Op::Call: {
+			if (in.ops[0] >= c_.globals.size() || in.type >= c_.types.size() ||
+			    c_.types[in.type].kind != Code::Kind::Int)
+				return over();
+			const uint8_t builtin = c_.globals[in.ops[0]].builtin;
+			const uint32_t width = c_.types[in.type].width;
+			if (builtin == Code::kIsDefined && in.ops.size() == 2) {
+				uint64_t g = 0;
+				if (blind_ || !globalOf(body, in.ops[1], g) || c_.fcGlobals.count(g) == 0)
+					return over();
+				return integer(width, defined(c_.fcGlobals.at(g)) ? 1 : 0);
+			}
+			if (builtin == Code::kNormalize && in.ops.size() == 2) {
+				const Val a = operand(1);
+				if (a.kind != Val::Const || a.s.isFloat)
+					return a.kind == Val::Top ? Val{} : over();
+				return integer(width, a.s.bits != 0 ? 1 : 0);
+			}
+			return over();
+		}
+		default:
+			return over();
+		}
+	}
+
+	// Sparse conditional constant propagation over `body`: its values (results_), its blocks'
+	// reachability (reachable_) and the edges taken (edges_). False where it did not settle.
+	bool propagate(const Code::Body &body)
+	{
+		results_.clear();
+		resultSet_.clear();
+		casts_.clear();
+		edges_.clear();
+		reachable_.assign(body.blocks.size(), false);
+		for (const auto &block : body.blocks) {
+			for (const Code::Inst &in : block) {
+				if (in.result == UINT32_MAX)
+					continue;
+				resultSet_.insert(in.result);
+				if (in.op == Code::Op::Cast && (in.code == kCastBitcast || in.code == kCastAddrSpace))
+					casts_[in.result] = in.ops[0];
+			}
+		}
+		reachable_[0] = true;
+		std::set<uint32_t> forced; // blocks whose branch no longer waits on an unknown condition
+		for (int round = 0; round < 64; round++) {
+			bool changed = true;
+			for (int pass = 0; changed; pass++) {
+				if (pass > 10000)
+					return false;
+				changed = false;
+				for (uint32_t bi = 0; bi < body.blocks.size(); bi++) {
+					if (!reachable_[bi])
+						continue;
+					for (const Code::Inst &in : body.blocks[bi]) {
+						if (in.result != UINT32_MAX) {
+							Val v;
+							if (in.op == Code::Op::Phi) {
+								for (size_t i = 0; i < in.ops.size(); i++)
+									if (edges_.count({in.blocks[i], bi}) != 0)
+										raise(v, get(body, in.ops[i]));
+							} else {
+								v = eval(body, in);
+							}
+							changed = raise(results_[in.result], v) || changed;
+						}
+						std::vector<uint32_t> targets;
+						if (!successors(body, in, forced.count(bi) != 0, targets))
+							return false;
+						for (uint32_t t : targets) {
+							if (t >= body.blocks.size())
+								return false;
+							if (edges_.insert({bi, t}).second)
+								changed = true;
+							if (!reachable_[t])
+								reachable_[t] = changed = true;
+						}
+					}
+				}
+			}
+			// A reachable branch on a condition still unknown (one only unreachable code or an
+			// undefined value gives) takes every way.
+			bool waiting = false;
+			for (uint32_t bi = 0; bi < body.blocks.size(); bi++) {
+				if (!reachable_[bi] || body.blocks[bi].empty() || forced.count(bi) != 0)
+					continue;
+				const Code::Inst &last = body.blocks[bi].back();
+				if ((last.op == Code::Op::CondBr || last.op == Code::Op::Switch) &&
+				    get(body, last.ops[0]).kind == Val::Top) {
+					forced.insert(bi);
+					waiting = true;
+				}
+			}
+			if (!waiting)
+				return true;
+		}
+		return false;
+	}
+
+	// The blocks a terminator may go to, so far.
+	bool successors(const Code::Body &body, const Code::Inst &in, bool forced, std::vector<uint32_t> &out) const
+	{
+		switch (in.op) {
+		case Code::Op::Br:
+			out = in.blocks;
+			return true;
+		case Code::Op::CondBr:
+		case Code::Op::Switch: {
+			const Val cond = get(body, in.ops[0]);
+			if (cond.kind == Val::Over || (cond.kind == Val::Top && forced)) {
+				out = in.blocks;
+				return true;
+			}
+			if (cond.kind == Val::Top)
+				return true;
+			if (cond.s.isFloat)
+				return false;
+			if (in.op == Code::Op::CondBr) {
+				out = {in.blocks[cond.s.bits != 0 ? 0 : 1]};
+				return true;
+			}
+			for (size_t i = 1; i < in.ops.size(); i++) {
+				const Val c = get(body, in.ops[i]);
+				if (c.kind != Val::Const)
+					return false; // a case of no constant the reader knows
+				if (c.s.bits == cond.s.bits) {
+					out = {in.blocks[i]};
+					return true;
+				}
+			}
+			out = {in.blocks[0]};
+			return true;
+		}
+		default:
+			return true;
+		}
+	}
+
+	// Runs an initialiser, its stores into memory_: false where it did not run to its return.
+	bool run(const Code::Body &body)
+	{
+		results_.clear();
+		resultSet_.clear();
+		casts_.clear();
+		for (const auto &block : body.blocks)
+			for (const Code::Inst &in : block)
+				if (in.result != UINT32_MAX) {
+					resultSet_.insert(in.result);
+					if (in.op == Code::Op::Cast && (in.code == kCastBitcast || in.code == kCastAddrSpace))
+						casts_[in.result] = in.ops[0];
+				}
+		uint32_t bi = 0, from = UINT32_MAX;
+		for (int steps = 0; steps < 100000; steps++) {
+			if (bi >= body.blocks.size())
+				return false;
+			for (const Code::Inst &in : body.blocks[bi]) {
+				steps++;
+				if (in.result != UINT32_MAX) {
+					Val v = over();
+					if (in.op == Code::Op::Phi) {
+						for (size_t i = 0; i < in.ops.size(); i++)
+							if (in.blocks[i] == from)
+								v = get(body, in.ops[i]);
+					} else {
+						v = eval(body, in);
+					}
+					results_[in.result] = v.kind == Val::Top ? over() : v;
+				}
+				switch (in.op) {
+				case Code::Op::Store: {
+					uint64_t g = 0;
+					if (!globalOf(body, in.ops[0], g))
+						return false; // a store the reader cannot place
+					const Val v = get(body, in.ops[1]);
+					memory_[g] = v.kind == Val::Const ? v : over();
+					break;
+				}
+				case Code::Op::Ret:
+					return true;
+				case Code::Op::Unreachable:
+					return false;
+				case Code::Op::Br:
+				case Code::Op::CondBr:
+				case Code::Op::Switch: {
+					std::vector<uint32_t> targets;
+					if (!successors(body, in, false, targets) || targets.size() != 1)
+						return false;
+					from = bi;
+					bi = targets[0];
+					break;
+				}
+				default:
+					if (in.keeps && in.op != Code::Op::Call)
+						return false; // an atomic or a fence: not an initialiser's
+					break;
+				}
+				if (in.op == Code::Op::Br || in.op == Code::Op::CondBr || in.op == Code::Op::Switch)
+					break;
+			}
+		}
+		return false;
+	}
+
+	// An initialiser that did not run: every global it stores in holds any value.
+	void spoil(const Code::Body &body)
+	{
+		for (const auto &block : body.blocks) {
+			for (const Code::Inst &in : block) {
+				uint64_t g = 0;
+				if (in.op != Code::Op::Store)
+					continue;
+				if (globalOf(body, in.ops[0], g)) {
+					memory_[g] = over();
+				} else {
+					// A store the reader cannot place may be into any global.
+					for (uint64_t k = 0; k < c_.globals.size(); k++)
+						if (!c_.globals[k].function)
+							memory_[k] = over();
+				}
+			}
+		}
+	}
+
+	const Code &c_;
+	const RgfxFunctionConstant *values_;
+	uint32_t count_;
+	bool blind_;
+	std::map<uint64_t, Val> memory_;
+	std::map<uint32_t, Val> results_;
+	std::set<uint32_t> resultSet_;
+	std::map<uint32_t, uint32_t> casts_;
+	std::set<std::pair<uint32_t, uint32_t>> edges_;
+	std::vector<bool> reachable_;
+};
+
+// The module's code once read (Module::code), where it is one rgfxAirSpecialise can follow: its
+// function constants' globals and the intrinsics it calls found, and every initialiser's body
+// read. Null where it is not.
+std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
+{
+	if (m.code == nullptr || m.codeBad || m.code->globals.size() != m.globals.size())
+		return nullptr;
+	auto it = m.named.find("air.function_constants");
+	if (it == m.named.end() || it->second.empty())
+		return nullptr;
+	RgfxAirCode &c = *m.code;
+	for (uint64_t id : it->second) {
+		const Module::Md *node = mdNode(m, id);
+		uint32_t index = 0;
+		if (node == nullptr || node->ops.size() < 4 || !mdGlobalVariable(m, node->ops[0]) ||
+		    !mdUnsigned(m, *node, 3, index))
+			return nullptr;
+		c.fcGlobals[mdAt(m, node->ops[0])->value] = index;
+	}
+	std::set<uint32_t> bodies;
+	for (const RgfxAirCode::Body &b : c.bodies)
+		bodies.insert(b.function);
+	for (size_t v = 0; v < c.globals.size(); v++) {
+		RgfxAirCode::Global &g = c.globals[v];
+		if (!g.function)
+			continue;
+		const std::string name = globalName(m, v);
+		if (name == "air.is_function_constant_defined")
+			g.builtin = RgfxAirCode::kIsDefined;
+		else if (name.compare(0, 41, "air.normalize_function_constant_predicate") == 0)
+			g.builtin = RgfxAirCode::kNormalize;
+		const bool init = g.section >= 1 && g.section <= c.sections.size() && c.sections[g.section - 1] == "air.static_init";
+		if (init && (g.proto || bodies.count(static_cast<uint32_t>(v)) == 0))
+			return nullptr; // an initialiser of no body read: what it stores is unknown
+	}
+	return m.code;
+}
+
 // The visible functions of the module `m` (rgfxReadAirVisible).
 bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 {
@@ -1437,6 +2858,7 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 			}
 			RgfxAirEntry e;
 			e.name = globalName(m, fn->value);
+			e.function = fn->value;
 			e.stage = s.stage;
 			if (!outputsOf(m, entry->ops[1], e.outputs)) {
 				out = {};
@@ -1470,6 +2892,7 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 			out.constants.emplace_back(name, index);
 		}
 	}
+	out.code = finishCode(m);
 	return true;
 }
 
@@ -1493,18 +2916,63 @@ bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out
 {
 	out = {};
 	Module m;
+	m.wantCode = true;
 	return readModule(bitcode, size, m) && entriesOf(m, out);
+}
+
+bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, const RgfxFunctionConstant *values,
+                       uint32_t count, RgfxAirSpecialisation &out)
+{
+	out = {};
+	if (module.code == nullptr)
+		return false;
+	const RgfxAirCode &code = *module.code;
+	Specialiser s(code, values, count, false);
+	s.initialise();
+	for (const auto &[global, v] : s.memory()) {
+		if (v.kind == Val::Const && !v.s.isFloat)
+			out.globals[global] = v.s.width == 1 ? static_cast<int64_t>(v.s.bits) : signedOf(v.s);
+	}
+	// Which arguments the specialised code uses: of those the code uses whatever the constants'
+	// values (an argument the code reads none of, such as an implicit imageblock's, is the AIR's
+	// to answer), the ones it uses under these.
+	for (const RgfxAirCode::Body &body : code.bodies) {
+		if (body.function != entry.function)
+			continue;
+		Specialiser blind(code, nullptr, 0, true);
+		blind.initialise();
+		std::vector<bool> any;
+		out.bodyRead = s.uses(body, out.used) && blind.uses(body, any) && any.size() == out.used.size();
+		if (!out.bodyRead) {
+			out.used.clear();
+			break;
+		}
+		for (size_t k = 0; k < any.size(); k++)
+			out.used[k] = out.used[k] || !any[k];
+		break;
+	}
+	return true;
 }
 
 void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out)
 {
 	out = {};
+	// One read with the module's code, which the entry points' specialisation takes. A module
+	// whose code does not read answers no entry points, as rgfxReadAirEntries does, and its
+	// functions and visible functions are read again without its code.
 	Module m;
-	if (!readModule(bitcode, size, m))
+	m.wantCode = true;
+	if (readModule(bitcode, size, m)) {
+		out.functionsRead = functionsOf(m, out.functions);
+		out.visibleRead = visibleOf(m, out.visible);
+		out.entriesRead = entriesOf(m, out.entries);
 		return;
-	out.functionsRead = functionsOf(m, out.functions);
-	out.visibleRead = visibleOf(m, out.visible);
-	out.entriesRead = entriesOf(m, out.entries);
+	}
+	Module plain;
+	if (!readModule(bitcode, size, plain))
+		return;
+	out.functionsRead = functionsOf(plain, out.functions);
+	out.visibleRead = visibleOf(plain, out.visible);
 }
 
 std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size)
