@@ -416,6 +416,11 @@ void test_device_buffers_take_pages_of_slabs()
 		CHECK(make(0x10001, MTLResourceStorageModeShared).allocatedSize == 0x11000);
 		RgfxBuffer *mib = make(0x100001, MTLResourceStorageModeManaged);
 		CHECK(mib.allocatedSize == 0x101000 && mib.length == 0x100001);
+		// A Private one, the GPU's alone and in no slab, answers its length in whole pages too,
+		// as the x86 Macs do (oracle_bundle buffers).
+		CHECK(make(1, MTLResourceStorageModePrivate).allocatedSize == 0x1000);
+		CHECK(make(0x1001, MTLResourceStorageModePrivate).allocatedSize == 0x2000);
+		CHECK(make(0x10000, MTLResourceStorageModePrivate).allocatedSize == 0x10000);
 		uint8_t *first = static_cast<uint8_t *>([held[0] contents]);
 		firstId = held[0].rgfxObjId;
 		std::memset(first, 0xa5, 256);
@@ -7166,6 +7171,7 @@ void test_no_copy_buffers()
 		                                           device:nil
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] != nullptr);
+		CHECK(b.allocatedSize == 0x14000); // the pages its bytes meet, as the x86 Macs answer
 		// Its GPU copy is a range of a slab: a heap over a block, the buffer placed in it.
 		auto heap =
 		    expectMessage<RgfxHeapOverHostMemory>(f.control, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
@@ -7373,6 +7379,9 @@ void test_no_copy_buffers_in_place()
 		                                           device:nil
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] == nullptr);
+		// The pages its bytes meet, 0x123 into the first: as the x86 Macs answer (oracle_bundle
+		// nocopy.off16 answers 8192 for 4096 bytes 16 into a page).
+		CHECK(b.allocatedSize == 0x15000);
 		CHECK(pages.asked.size() == 1 && std::get<0>(pages.asked[0]) == p &&
 		      std::get<1>(pages.asked[0]) == 0x14000 && std::get<2>(pages.asked[0]));
 		CHECK(blocks.allocated.empty()); // no block of its own

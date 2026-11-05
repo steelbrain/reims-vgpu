@@ -27,6 +27,17 @@ namespace {
 /// the device's view of a block starts at the page of the buffer's first byte.
 constexpr uint64_t kRgfxGuestPage = 0x1000;
 
+// The whole 4 KiB pages `length` bytes at `pointer` lie in, which both x86-64 Macs' GPUs answer a
+// buffer's allocatedSize with (oracle_bundle buffers and nocopy.*, AMD 5300M and Intel 630, macOS
+// 26.7.1): a buffer made from a length or bytes in any storage mode answers its length rounded up
+// to a page (4096 for 1 byte, 8192 for 4097), and one made over the app's bytes the pages its
+// bytes meet (8192 for 4096 bytes 16 bytes into a page).
+NSUInteger rgfxPagesSpanned(const void *pointer, NSUInteger length)
+{
+	const uint64_t start = reinterpret_cast<uintptr_t>(pointer) & (kRgfxGuestPage - 1);
+	return static_cast<NSUInteger>((start + length + kRgfxGuestPage - 1) & ~(kRgfxGuestPage - 1));
+}
+
 /// Whether this process maps every byte of [p, p + length) readable, and in `*writable` whether
 /// it maps them all writable too.
 bool rgfxMappedReadable(const void *p, size_t length, bool *writable)
@@ -134,8 +145,9 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// A no-copy buffer over app memory outside the region: the block it lies over, the GPU's
 	// copy of `_contents` (RgfxMemoryShadow.hpp).
 	std::shared_ptr<RgfxMemoryShadow> _shadow;
-	// The bytes of its slab a device buffer takes, whole pages (RgfxSlabs); 0 for any other,
-	// which takes its length.
+	// The bytes allocatedSize answers: the whole pages a device buffer's range of its slab takes
+	// (RgfxSlabs), a Private one's length takes, or a no-copy one's bytes meet; 0 for any other,
+	// which answers its length.
 	NSUInteger _allocatedSize;
 	// The GPU address the create picked, which goes back after the destroy where `_ownsAddress`:
 	// a buffer over pages lies past it by its pointer's offset in its page; 0 for any other,
@@ -241,7 +253,11 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 		// The GPU's alone: no bytes reach it from here.
 		if (bytes != nullptr)
 			return nil;
-		return [RgfxBuffer bufferWithLength:length options:options device:device serializer:serializer];
+		RgfxBuffer *buffer =
+		    [RgfxBuffer bufferWithLength:length options:options device:device serializer:serializer];
+		if (buffer != nil)
+			buffer->_allocatedSize = rgfxPagesSpanned(nullptr, length);
+		return buffer;
 	}
 	if (slabs == nullptr || serializer == nullptr)
 		return nil;
@@ -283,6 +299,29 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
                                 slabs:(RgfxSlabs *)slabs
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer
+{
+	RgfxBuffer *buffer = [RgfxBuffer bufferOverBytes:pointer
+	                                          length:length
+	                                         options:options
+	                                     deallocator:deallocator
+	                                          region:region
+	                                           slabs:slabs
+	                                          device:device
+	                                      serializer:serializer];
+	if (buffer != nil)
+		buffer->_allocatedSize = rgfxPagesSpanned(buffer->_contents, length);
+	return buffer;
+}
+
+// bufferWithBytesNoCopy's buffer, before it answers its allocatedSize.
++ (instancetype)bufferOverBytes:(void *)pointer
+                         length:(NSUInteger)length
+                        options:(MTLResourceOptions)options
+                    deallocator:(void (^)(void *, NSUInteger))deallocator
+                         region:(RgfxRegion *)region
+                          slabs:(RgfxSlabs *)slabs
+                         device:(id<MTLDevice>)device
+                     serializer:(RgfxSerializer *)serializer
 {
 	if (length == 0 || !rgfxCpuStorage(options) || region == nullptr || slabs == nullptr ||
 	    serializer == nullptr)
@@ -495,9 +534,10 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	return _length;
 }
 
-// The bytes the buffer takes: a device buffer's range of its slab, whole 4 KiB pages, as both
-// x86-64 Macs' GPUs answer (4096 for a 256-byte Shared buffer, measured: AMD 5300M, Intel 630;
-// the M3 Max packs small buffers and answers 256); any other its length.
+// The bytes the buffer takes, whole 4 KiB pages, as both x86-64 Macs' GPUs answer
+// (rgfxPagesSpanned; the M3 Max packs small buffers and answers 256 for a 256-byte one): a device
+// buffer's range of its slab, a Private one's length rounded up, a no-copy one's pages; any other
+// its length.
 - (NSUInteger)allocatedSize
 {
 	return _allocatedSize != 0 ? _allocatedSize : _length;
