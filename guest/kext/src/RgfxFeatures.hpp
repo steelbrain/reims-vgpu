@@ -43,7 +43,11 @@
 //    which needs nothing of the bundle;
 //  - MANAGED_TEXTURE_SLABS (bit 21): the bundle lays its Managed textures' CPU copies in its
 //    buffers' slabs, its own pages among them, and names a slab's buffer as each copy, which needs
-//    nothing of the kext.
+//    nothing of the kext;
+//  - DISPLAY_COLOR (bit 24): the display pipe takes its gamma selectors (5 to 7) and sends each
+//    transaction's gamma tables and colour matrix as DISPLAY_COLOR parts before its present, a
+//    transaction that sets only a colour as a present that keeps the surface shown
+//    (RgfxPipeColor.hpp), which needs nothing of the bundle.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -70,7 +74,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_UNSHARED_QUEUES |
     RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
     RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS;
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS | RGFX_FEATURE_DISPLAY_COLOR;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

@@ -62,8 +62,9 @@ constexpr uint64_t kSlots = RGFX_FEATURE_ICB_SLOTS;
 constexpr uint64_t kCommits = RGFX_FEATURE_COMMIT_ORDER;
 constexpr uint64_t kDeferred = RGFX_FEATURE_SURFACE_DEFERRED;
 constexpr uint64_t kTextureSlabs = RGFX_FEATURE_MANAGED_TEXTURE_SLABS;
+constexpr uint64_t kColor = RGFX_FEATURE_DISPLAY_COLOR;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
-                              kSlots | kCommits | kDeferred | kTextureSlabs;
+                              kSlots | kCommits | kDeferred | kTextureSlabs | kColor;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -72,12 +73,12 @@ int main()
 {
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
-	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED and MANAGED_TEXTURE_SLABS, and writes each only
-	// where offered.
+	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, MANAGED_TEXTURE_SLABS and DISPLAY_COLOR, and writes
+	// each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
-	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED and "
-	      "MANAGED_TEXTURE_SLABS from bit 3");
+	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, "
+	      "MANAGED_TEXTURE_SLABS and DISPLAY_COLOR from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -105,6 +106,11 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kTextureSlabs, kTextureSlabs) ==
 	          (kRgfxOfferedFeatures | kTextureSlabs),
 	      "MANAGED_TEXTURE_SLABS taken is in the word");
+	check(RGFX_FEATURE_DISPLAY_COLOR == (1u << 24), "DISPLAY_COLOR is bit 24");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kColor) == kColor,
+	      "DISPLAY_COLOR offered, written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
+	      "DISPLAY_COLOR not offered, not written");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

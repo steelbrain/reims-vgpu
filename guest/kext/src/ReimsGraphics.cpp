@@ -6,6 +6,7 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
 #include "RgfxFeatures.hpp"
+#include "RgfxPipeColor.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOUserClient.h>
@@ -1013,6 +1014,7 @@ bool ReimsGraphics::start(IOService *provider)
 	modeSet.reset();
 	taken = false;
 	submitRoom = false;
+	displayColorTaken = false;
 	roomStats = {};
 	roomRecords = 0;
 
@@ -1117,6 +1119,7 @@ bool ReimsGraphics::start(IOService *provider)
 		setProperty("RgfxFeaturesWanted", wanted, 64);
 		setProperty("RgfxFeaturesTaken", took, 64);
 		submitRoom = (took & RGFX_FEATURE_SUBMIT_ROOM) != 0;
+		displayColorTaken = (took & RGFX_FEATURE_DISPLAY_COLOR) != 0;
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
@@ -2139,7 +2142,8 @@ IOReturn ReimsGraphics::setInterruptState(void *interruptRef, UInt32 state)
 
 // MARK: - The display pipe
 
-IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno)
+IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt32 flags,
+                                   UInt64 *seqno)
 {
 	// A surface whose GPU copy is the host's device cache carries its CPU generation, so the
 	// display shows what the CPU wrote under its read-write locks too.
@@ -2152,16 +2156,36 @@ IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt
 	p.present.display = displayId;
 	p.present.iosurface_id = surfaceId;
 	p.present.transaction_id = transactionId;
-	const bool cached = rgfxSurfaceCacheGeneration(surfaceId, &p.gen.cpu_gen);
+	p.present.flags = flags;
+	const bool kept = (flags & RGFX_PRESENT_KEEP) != 0;
+	const bool cached = !kept && rgfxSurfaceCacheGeneration(surfaceId, &p.gen.cpu_gen);
 	// Never waits for room: the caller does, with its lock let go (waitForRoom).
 	IOReturn r = kIOReturnSuccess;
 	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno))
 		r = ready ? kIOReturnNoSpace : kIOReturnNotReady;
-	if (r == kIOReturnSuccess) {
+	if (r == kIOReturnSuccess && !kept) {
 		IOSimpleLockLock(interruptLock);
 		pipes.shows(surfaceId);
 		IOSimpleLockUnlock(interruptLock);
 	}
+	return r;
+}
+
+IOReturn ReimsGraphics::postDisplayColor(UInt32 transactionId, UInt32 stage, UInt32 count,
+                                         const UInt8 *entries)
+{
+	static_assert(kRgfxColorPartMax <= kLifecycleMessageMax, "a part fits a control message");
+	UInt8 *part = static_cast<UInt8 *>(IOMalloc(kRgfxColorPartMax));
+	if (!part)
+		return kIOReturnNoMemory;
+	IOReturn r = kIOReturnSuccess;
+	const UInt32 parts = rgfxColorPartCount(count);
+	for (UInt32 k = 0; k < parts && r == kIOReturnSuccess; k++) {
+		const UInt32 size =
+		    rgfxColorPart(part, displayId, transactionId, stage, count, entries, k);
+		r = post(RGFX_CMD_DISPLAY_COLOR, part, size, nullptr);
+	}
+	IOFree(part, kRgfxColorPartMax);
 	return r;
 }
 

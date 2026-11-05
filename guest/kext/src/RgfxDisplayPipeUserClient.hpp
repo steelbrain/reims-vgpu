@@ -13,10 +13,22 @@
  *   2  capabilities, a serialized dictionary              struct out variable
  *   3  notification registration (VBL or transaction)     struct in 24, asynchronous
  *   4  begin a transaction -> its id                      scalar out 1
- *   7  (no arguments)                                     accepted, logged
+ *   5  plane gamma table                                  struct in variable
+ *   6  gamma table before the colour matrix               struct in variable
+ *   7  gamma table after the colour matrix                struct in variable
  *   8  submit a transaction                               struct in 280
  *   9  wait for a transaction                             struct in 12
- * Every other selector is refused as unsupported and logged.
+ * Every other selector is refused as unsupported and logged: 10 and 11 (the pipe's linearization
+ * before its matrix and gamma after it, in a configuration format unread here), 12 (a surface
+ * copy) and 13 (triage), which no WindowServer seen calls.
+ *
+ * The display's colour (RgfxPipeColor.hpp): where the host took RGFX_FEATURE_DISPLAY_COLOR,
+ * selectors 5 to 7 decode their gamma table as macOS's kernel does and stage it for the begun
+ * transaction, and its submit sends each staged table, and the colour matrix where its dirty mask
+ * has the matrix's bit, as DISPLAY_COLOR parts before its PRESENT_SURFACE. A begin drops what the
+ * transaction before it staged and never submitted. A transaction with no IOSurface that sets a
+ * colour goes as a PRESENT_SURFACE that keeps the surface shown (RGFX_PRESENT_KEEP). Where the
+ * host did not take the feature, 5 and 6 are refused as unsupported, and 7 takes no structure.
  *
  * A submitted transaction's plane 0, where it is an IOSurface, goes to the host on the control
  * ring as PRESENT_SURFACE through the framebuffer (ReimsGraphics owns that ring), and submit
@@ -80,6 +92,7 @@ private:
 	static IOReturn sRequestNotify(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sBegin(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sSeven(OSObject *target, void *reference, IOExternalMethodArguments *a);
+	static IOReturn sGamma(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sSubmit(OSObject *target, void *reference, IOExternalMethodArguments *a);
 	static IOReturn sWait(OSObject *target, void *reference, IOExternalMethodArguments *a);
 
@@ -90,6 +103,11 @@ private:
 	void completeLocked(const Transactions::Completion &c, UInt64 time);
 	// sSubmit's transaction, submitLock held: sent to the host, or done with the one before it.
 	IOReturn submit(const UInt8 *t, UInt32 id, UInt32 planeType, UInt32 surface, UInt64 cookie);
+	// submit's colour, submitLock held and `lock` not: the stages staged for transaction `id`,
+	// and the matrix where transaction `t` carries one, as DISPLAY_COLOR parts; whether any went.
+	IOReturn postColor(const UInt8 *t, UInt32 id, bool *sent);
+	// Lets go of the gamma tables staged (dropStaged: those of a transaction not submitted).
+	void dropStaged();
 	void sendVbl(UInt64 time, UInt64 next);
 
 	void releaseRegistrations();
@@ -122,6 +140,21 @@ private:
 	UInt32 logged;
 	UInt32 unnotifiedLogged;
 	Transactions transactions;
+
+	// A gamma table staged (selectors 5 to 7): its entries, 16 bytes each, in a buffer of
+	// `count` entries (nullptr for none, the stage off), and whether the transaction set it.
+	struct GammaStage {
+		UInt8 *entries;
+		UInt32 count;
+		bool set;
+	};
+	// Under lock: the host took RGFX_FEATURE_DISPLAY_COLOR (read at the association), the
+	// transaction the stages are staged for, the stages (plane 0's, before and after the
+	// matrix), and the colour calls logged.
+	bool displayColor;
+	UInt32 stagedFor;
+	GammaStage staged[3];
+	UInt32 colorLogged;
 };
 
 #endif // RGFX_DISPLAY_PIPE_USER_CLIENT_HPP_

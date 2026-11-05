@@ -1269,6 +1269,28 @@ answered in (or the answer's own time where no `VBLANK` came within a period),
 and a display pipe VBL request is answered once, at the next refresh, with that
 refresh's time and the next one's.
 
+**The display's colour.** A Mac's display pipe applies colour stages to what it
+shows: plane 0's gamma table (selector 5), the pipe's gamma table before its
+colour matrix (6), the matrix, which rides the transaction at 0xb0 with dirty
+bit 0x40, and the pipe's gamma table after the matrix (7). CGDisplayFade,
+Night Shift and ColorSync's calibration set them; WindowServer's boot fade is
+a run of transactions about 16 to 30 ms apart that each set only selector 7's
+table, with no surface. The kext decodes the tables as macOS 26's
+IOAcceleratorFamily2 does and stages each for the transaction begun (read;
+`guest/kext/src/RgfxPipeColor.hpp`, `tests/pipe_color_test.cpp`); the submit
+sends them, and the matrix where it is dirty, as `DISPLAY_COLOR` parts of at
+most 256 entries before the transaction's `PRESENT_SURFACE`, and a transaction
+with no surface that sets a colour as a present that keeps the surface shown
+(`RGFX_PRESENT_KEEP`). The host stages the parts on the presents' lane and the
+present it accepts next applies them, with the frame it shows; each stage keeps
+its table until a transaction sets it again, and the device's reset turns them
+all off. While any stage is on, the window draws the display through them
+(`crates/reims-vgpu/src/graphics/color.rs`, `sink.rs`), each table interpolated
+linearly between its entries (how a Mac's display engine samples between them
+is not measured). Selectors 10 and 11 (the pipe's linearization before the
+matrix and its gamma after it, in IOPresentment's configuration format), 12
+(a surface copy) and 13 (triage) stay refused: no WindowServer seen calls them.
+
 **The display pipe's notification words.** The kext answers a pipe client with
 asynchronous results whose words IOAccelerator's notification callbacks read
 (`guest/kext/src/RgfxDisplayPipeUserClient.cpp`, `completeLocked` and `sendVbl`,

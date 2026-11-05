@@ -7,6 +7,7 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
+#include "RgfxPipeColor.hpp"
 #include "RgfxPipeNotifications.hpp"
 
 #include <IOKit/IOLib.h>
@@ -61,6 +62,9 @@ constexpr UInt32 kLogFirst = 48;
 constexpr UInt32 kLogEvery = 600;
 // The transactions with no cookie logged, per client.
 constexpr UInt32 kLogUnnotified = 8;
+// The colour calls logged in full (header fields, first and last entries), per client; after
+// that, every kLogEvery-th.
+constexpr UInt32 kLogColor = 32;
 
 inline UInt32 rd32(const UInt8 *p, UInt32 off)
 {
@@ -111,6 +115,11 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	logged = 0;
 	unnotifiedLogged = 0;
 	transactions = Transactions();
+	displayColor = false;
+	stagedFor = 0;
+	for (GammaStage &g : staged)
+		g = {};
+	colorLogged = 0;
 	return lock != nullptr && submitLock != nullptr;
 }
 
@@ -138,6 +147,7 @@ IOReturn RgfxDisplayPipeUserClient::clientClose()
 
 void RgfxDisplayPipeUserClient::free()
 {
+	dropStaged();
 	OSSafeReleaseNULL(framebuffer);
 	if (lock)
 		IOLockFree(lock);
@@ -164,6 +174,18 @@ void RgfxDisplayPipeUserClient::releaseRegistrations()
 		releaseAsyncReference64(vblRequests[i].reference);
 	vblWaiting = 0;
 	IOLockUnlock(lock);
+}
+
+// Lets go of the gamma tables staged, with `lock` not held: free, before the client exists, and
+// sBegin, after it moved them out under the lock.
+void RgfxDisplayPipeUserClient::dropStaged()
+{
+	for (GammaStage &g : staged) {
+		if (g.entries)
+			IOFree(g.entries, static_cast<vm_size_t>(g.count) * kRgfxGammaEntrySize);
+		g = {};
+	}
+	stagedFor = 0;
 }
 
 // MARK: - Dispatch
@@ -194,11 +216,16 @@ IOReturn RgfxDisplayPipeUserClient::externalMethod(uint32_t selector,
 		      arguments->structureOutputDescriptor ? arguments->structureOutputDescriptorSize : 0,
 		      arguments->asyncWakePort != MACH_PORT_NULL ? 1u : 0u);
 	}
-	if (selector >= 10 || !methods[selector].function) {
+	// The gamma selectors, where the host shows the display's colour (RgfxPipeColor.hpp).
+	static const IOExternalMethodDispatch gamma = {
+		&RgfxDisplayPipeUserClient::sGamma, 0, kIOUCVariableStructureSize, 0, 0
+	};
+	const bool color = rgfxGammaSlot(selector) >= 0 && displayColor;
+	if (!color && (selector >= 10 || !methods[selector].function)) {
 		IOLog("RGFX pipe: selector %u is not supported\n", selector);
 		return kIOReturnUnsupported;
 	}
-	dispatch = const_cast<IOExternalMethodDispatch *>(&methods[selector]);
+	dispatch = const_cast<IOExternalMethodDispatch *>(color ? &gamma : &methods[selector]);
 	return super::externalMethod(selector, arguments, dispatch, this, reference);
 }
 
@@ -231,6 +258,7 @@ IOReturn RgfxDisplayPipeUserClient::sAssociate(OSObject *target, void *,
 	}
 	OSSafeReleaseNULL(self->framebuffer);
 	self->framebuffer = fb;
+	self->displayColor = fb->displayColor();
 	self->associated = true;
 	if (!fb->addPipe(self, &RgfxDisplayPipeUserClient::vblankHook,
 	                 &RgfxDisplayPipeUserClient::presentHook)) {
@@ -365,12 +393,23 @@ IOReturn RgfxDisplayPipeUserClient::sBegin(OSObject *target, void *, IOExternalM
 	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, target);
 	if (!self || !self->associated)
 		return kIOReturnNotAttached;
+	// What the transaction begun before staged, never submitted, goes (RgfxPipeColor.hpp).
+	GammaStage dropped[3];
 	IOLockLock(self->lock);
 	if (++self->nextTransaction == 0)
 		self->nextTransaction = 1;
 	self->begun = self->nextTransaction;
 	a->scalarOutput[0] = self->begun;
+	for (UInt32 i = 0; i < 3; i++) {
+		dropped[i] = self->staged[i];
+		self->staged[i] = {};
+	}
+	self->stagedFor = 0;
 	IOLockUnlock(self->lock);
+	for (GammaStage &g : dropped) {
+		if (g.entries)
+			IOFree(g.entries, static_cast<vm_size_t>(g.count) * kRgfxGammaEntrySize);
+	}
 	return kIOReturnSuccess;
 }
 
@@ -380,6 +419,89 @@ IOReturn RgfxDisplayPipeUserClient::sSeven(OSObject *target, void *, IOExternalM
 	if (!self || !self->associated)
 		return kIOReturnNotAttached;
 	return kIOReturnSuccess;
+}
+
+// Selectors 5 to 7, where the host took the feature: the gamma table, decoded as macOS's kernel
+// decodes it, staged for the begun transaction (RgfxPipeColor.hpp). The structure comes inline
+// or as a descriptor, which is mapped read-only (kIOReturnVMError where it cannot be).
+IOReturn RgfxDisplayPipeUserClient::sGamma(OSObject *target, void *, IOExternalMethodArguments *a)
+{
+	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, target);
+	if (!self || !self->associated)
+		return kIOReturnNotAttached;
+	const int slot = rgfxGammaSlot(a->selector);
+	if (slot < 0)
+		return kIOReturnBadArgument;
+	IOMemoryMap *map = nullptr;
+	const UInt8 *in = nullptr;
+	UInt64 size = 0;
+	if (a->structureInput) {
+		in = static_cast<const UInt8 *>(a->structureInput);
+		size = a->structureInputSize;
+	} else if (a->structureInputDescriptor) {
+		map = a->structureInputDescriptor->map(kIOMapReadOnly);
+		if (!map)
+			return kIOReturnVMError;
+		in = reinterpret_cast<const UInt8 *>(map->getVirtualAddress());
+		size = map->getLength();
+	}
+	RgfxGammaArgs args = {};
+	if (!rgfxGammaDecode(in, size, &args)) {
+		OSSafeReleaseNULL(map);
+		if (self->colorLogged < kLogColor) {
+			self->colorLogged++;
+			IOLog("RGFX pipe: gamma selector %u: %llu bytes, refused\n", a->selector, size);
+		}
+		return kIOReturnBadArgument;
+	}
+	// Copied before the lock: up to 2 MiB, which the work loop never waits behind.
+	const UInt8 *from = in + kRgfxGammaHeaderSize;
+	const vm_size_t bytes = static_cast<vm_size_t>(args.count) * kRgfxGammaEntrySize;
+	UInt8 *entries = nullptr;
+	if (args.count) {
+		entries = static_cast<UInt8 *>(IOMalloc(bytes));
+		if (!entries) {
+			OSSafeReleaseNULL(map);
+			return kIOReturnNoMemory;
+		}
+		memcpy(entries, from, bytes);
+	}
+	OSSafeReleaseNULL(map);
+
+	IOLockLock(self->lock);
+	const UInt32 begun = self->begun;
+	const RgfxGammaAction action = rgfxGammaAction(a->selector, args, begun);
+	GammaStage old = {};
+	if (action == RgfxGammaAction::Stage) {
+		// The begin before it let go of anything staged for another transaction.
+		self->stagedFor = begun;
+		old = self->staged[slot];
+		self->staged[slot] = {entries, args.count, true};
+		entries = nullptr;
+	}
+	const bool log = self->colorLogged < kLogColor || (begun && begun % kLogEvery == 0);
+	if (self->colorLogged < kLogColor)
+		self->colorLogged++;
+	IOLockUnlock(self->lock);
+	if (log) {
+		const UInt8 *last = args.count ? from + bytes - kRgfxGammaEntrySize : from;
+		IOLog("RGFX pipe: gamma selector %u transaction %u (begun %u) plane %u entries %u "
+		      "field_0c %x field_10 %08x field_14 %08x: %s; first %08x %08x %08x last %08x %08x "
+		      "%08x\n",
+		      a->selector, args.transaction, begun, args.plane, args.count, args.field_0c,
+		      args.field_10, args.field_14,
+		      action == RgfxGammaAction::Stage    ? "staged"
+		      : action == RgfxGammaAction::Ignore ? "not shown"
+		                                          : "refused",
+		      args.count ? rgfxColorRead32(from, 0) : 0, args.count ? rgfxColorRead32(from, 4) : 0,
+		      args.count ? rgfxColorRead32(from, 8) : 0, args.count ? rgfxColorRead32(last, 0) : 0,
+		      args.count ? rgfxColorRead32(last, 4) : 0, args.count ? rgfxColorRead32(last, 8) : 0);
+	}
+	if (entries)
+		IOFree(entries, bytes);
+	if (old.entries)
+		IOFree(old.entries, static_cast<vm_size_t>(old.count) * kRgfxGammaEntrySize);
+	return action == RgfxGammaAction::BadArgument ? kIOReturnBadArgument : kIOReturnSuccess;
 }
 
 IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternalMethodArguments *a)
@@ -441,7 +563,22 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		      "waiters, without a notification\n",
 		      id, rd32(t, kTxnOptions));
 	}
-	if (planeType != kPlaneIOSurface || surface == 0) {
+	// The colour the transaction sets goes first, with the lock let go: no other submit runs
+	// meanwhile (submitLock), and presented() only completes transactions, so the room stays.
+	bool colored = false;
+	if (displayColor) {
+		IOLockUnlock(lock);
+		const IOReturn c = postColor(t, id, &colored);
+		IOLockLock(lock);
+		if (c != kIOReturnSuccess) {
+			IOLockUnlock(lock);
+			IOLog("RGFX pipe: transaction %u: its colour not sent: 0x%x\n", id, c);
+			return c;
+		}
+	}
+	const RgfxPipeSends sends =
+	    rgfxPipeSends(planeType == kPlaneIOSurface && surface != 0, colored);
+	if (sends == RgfxPipeSends::Nothing) {
 		// Nothing for the host to show: the display keeps its surface, and the transaction is
 		// done with the last one before it (at once where none is outstanding).
 		Transactions::Completion now = {};
@@ -450,6 +587,10 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		IOLockUnlock(lock);
 		return kIOReturnSuccess;
 	}
+	// A transaction that sets only a colour keeps the surface shown (RGFX_PRESENT_KEEP).
+	const bool kept = sends == RgfxPipeSends::Keep;
+	const UInt32 present = kept ? 0 : surface;
+	const UInt32 flags = kept ? RGFX_PRESENT_KEEP : 0;
 	// Posted and recorded under the lock, so the host's answer, which the work loop hands to
 	// presented() under the same lock, finds it recorded. Where the control ring has no room, the
 	// lock is let go while the post waits for it: the work loop takes the lock at every COMPLETE,
@@ -461,11 +602,11 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 	IOReturn r = kIOReturnSuccess;
 	for (;;) {
 		const UInt64 mark = framebuffer->roomMark();
-		r = framebuffer->postPresent(surface, id, &seqno);
+		r = framebuffer->postPresent(present, id, flags, &seqno);
 		if (r != kIOReturnNoSpace)
 			break;
 		if (framebuffer->askForRoom() &&
-		    (r = framebuffer->postPresent(surface, id, &seqno)) != kIOReturnNoSpace)
+		    (r = framebuffer->postPresent(present, id, flags, &seqno)) != kIOReturnNoSpace)
 			break;
 		IOLockUnlock(lock);
 		const bool more = framebuffer->waitForRoom(mark, ringDeadline);
@@ -480,9 +621,65 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
 		return r;
 	}
+	if (!rgfxPipeWaitsForAnswer(sends)) {
+		// Done with the transaction before it, or at once, as one with nothing to show.
+		Transactions::Completion now = {};
+		if (transactions.nothingToShow(id, cookie, notified, &now))
+			completeLocked(now, mach_absolute_time());
+		IOLockUnlock(lock);
+		return kIOReturnSuccess;
+	}
 	transactions.sent(seqno, id, cookie, notified);
 	IOLockUnlock(lock);
 	return kIOReturnSuccess;
+}
+
+// The colour transaction `id` sets (RgfxPipeColor.hpp), submitLock held and `lock` not: the
+// gamma tables staged for it, then the matrix where its dirty mask has the matrix's bit, each as
+// DISPLAY_COLOR parts; `*sent` says whether any went.
+IOReturn RgfxDisplayPipeUserClient::postColor(const UInt8 *t, UInt32 id, bool *sent)
+{
+	GammaStage taken[3] = {};
+	IOLockLock(lock);
+	if (stagedFor == id) {
+		for (UInt32 i = 0; i < 3; i++) {
+			taken[i] = staged[i];
+			staged[i] = {};
+		}
+		stagedFor = 0;
+	}
+	IOLockUnlock(lock);
+	IOReturn r = kIOReturnSuccess;
+	*sent = false;
+	for (UInt32 i = 0; i < 3 && r == kIOReturnSuccess; i++) {
+		if (!taken[i].set)
+			continue;
+		r = framebuffer->postDisplayColor(id, rgfxGammaSlotStage(static_cast<int>(i)),
+		                                  taken[i].count, taken[i].entries);
+		*sent = true;
+	}
+	const UInt64 dirty = rd64(t, kTxnDirty);
+	if (r == kIOReturnSuccess && (dirty & kRgfxDirtyMatrix)) {
+		r = framebuffer->postDisplayColor(id, RGFX_COLOR_MATRIX, kRgfxMatrixRows,
+		                                  t + kRgfxTxnMatrix);
+		*sent = true;
+		if (colorLogged < kLogColor || id % kLogEvery == 0) {
+			colorLogged += colorLogged < kLogColor ? 1 : 0;
+			IOLog("RGFX pipe: transaction %u: colour matrix %08x %08x %08x %08x / %08x %08x %08x "
+			      "%08x / %08x %08x %08x %08x\n",
+			      id, rd32(t, kRgfxTxnMatrix), rd32(t, kRgfxTxnMatrix + 4),
+			      rd32(t, kRgfxTxnMatrix + 8), rd32(t, kRgfxTxnMatrix + 12),
+			      rd32(t, kRgfxTxnMatrix + 16), rd32(t, kRgfxTxnMatrix + 20),
+			      rd32(t, kRgfxTxnMatrix + 24), rd32(t, kRgfxTxnMatrix + 28),
+			      rd32(t, kRgfxTxnMatrix + 32), rd32(t, kRgfxTxnMatrix + 36),
+			      rd32(t, kRgfxTxnMatrix + 40), rd32(t, kRgfxTxnMatrix + 44));
+		}
+	}
+	for (GammaStage &g : taken) {
+		if (g.entries)
+			IOFree(g.entries, static_cast<vm_size_t>(g.count) * kRgfxGammaEntrySize);
+	}
+	return r;
 }
 
 IOReturn RgfxDisplayPipeUserClient::sWait(OSObject *target, void *, IOExternalMethodArguments *a)

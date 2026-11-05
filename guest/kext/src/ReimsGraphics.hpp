@@ -166,7 +166,17 @@ public:
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
-	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt64 *seqno);
+	// `flags` RGFX_PRESENT_KEEP, with `surfaceId` 0, keeps what the display shows: the present
+	// shows only the colour posted before it.
+	IOReturn postPresent(UInt32 surfaceId, UInt32 transactionId, UInt32 flags, UInt64 *seqno);
+	// The display pipe's colour (RgfxPipeColor.hpp): displayColor is whether the host took
+	// RGFX_FEATURE_DISPLAY_COLOR; postDisplayColor puts stage `stage`'s `count` entries (16
+	// bytes each at `entries`) for transaction `transactionId` on the control ring as
+	// DISPLAY_COLOR parts, in order, each waiting for room as post does: thread context only,
+	// with no lock of the work loop's held. The host stages them for the next PRESENT_SURFACE.
+	bool displayColor() const { return displayColorTaken; }
+	IOReturn postDisplayColor(UInt32 transactionId, UInt32 stage, UInt32 count,
+	                          const UInt8 *entries);
 	// Room on the control ring for a post that found it full (RgfxRingRoom.hpp): roomMark, read
 	// before the post's look, is the work loop's passes so far; waitForRoom sleeps until a pass
 	// after `mark` (each device interrupt makes one: the host has moved on), its backstop or
@@ -388,6 +398,8 @@ private:
 	RgfxRingRoom room;
 	// The host took SUBMIT_ROOM (askForRoom), set before `ready`.
 	bool submitRoom;
+	// The host took DISPLAY_COLOR (displayColor), set before `ready`.
+	bool displayColorTaken;
 	// The sleeps for room (waitForRoom), under stateLock, and the SUBMIT_ROOM records the work
 	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
 	RgfxRingRoomStats roomStats;
