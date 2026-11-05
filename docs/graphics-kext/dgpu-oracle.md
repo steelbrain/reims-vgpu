@@ -10,7 +10,8 @@ stricter than the M3's, guests may rely on it.
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
-`oracle_icb` and `oracle_order`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_icb`, `oracle_order` and `oracle_names`; the upload costs (Q17) are
+`guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -777,6 +778,46 @@ ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside i
   the shift between the two lanes' guest captures, which the display pipe's gamma does not reach
   (Q13). CoreAnimation and VideoToolbox convert such a frame by BT.709 on the AMD, the Intel 630
   and the M3 *(class 3)*: ours is the Macs' answer, and the stock lane's BT.601 is its own.
+
+## Q19: the words of two refusals, and the framebuffer's memory size
+
+Probe: `oracle_names DEVICE [constants|archive]`, 11-05, each step in a child process of its own,
+without and with `MTL_DEBUG_LAYER=1`; the framebuffer's properties are `ioreg`'s.
+
+**A function constant given a value of another type.** A kernel with `constant int k
+[[function_constant(0)]]` is made with a value of each of the 95 `MTLDataType` values at index 0.
+On all three, only `MTLDataTypeInt` makes the function, and every other value is refused with
+`MTLLibraryErrorDomain` code 3, whose description names the value's type by the SDK's name
+(`MTLDataTypeFloat2x2`, `MTLDataTypeTexture`, `MTLDataTypeBFloat4`) *(class 3)*. The sentence around
+the names is each OS's own *(class 2)*:
+
+| | the description |
+|---|---|
+| AMD, Intel 630 (macOS 26.7.1) | "Constant k (0) is of type MTLDataTypeInt but value found has type MTLDataTypeFloat" |
+| M3 (macOS 27.0.1) | "Function f: constant k (0) is of type MTLDataTypeInt but value found has type MTLDataTypeFloat" |
+
+A `bfloat` function constant does not compile on any of them ("type 'bfloat' is not valid for
+attribute 'function_constant'"). Ours gives the M3's sentence (`RgfxLibrary.mm`), and names each
+type as the three Macs do (`RgfxFunctionConstants.cpp`, whose test holds the measured names).
+
+**A mesh pipeline added to a binary archive** (`addMeshRenderPipelineFunctionsWithDescriptor:error:`):
+
+| the descriptor | AMD, Intel 630 | M3 |
+|---|---|---|
+| no mesh function: no function, a fragment function or an object function | NO, `MTLBinaryArchiveDomain` code 3 (`MTLBinaryArchiveErrorCompilationFailure`), "Compiling mesh pipelines for binary archives is not supported!" | Metal's descriptor validation asserts ("meshFunction must not be nil.", and "fragmentFunction must not be nil." where it has none), and the process ends |
+| a mesh function and a fragment function, the pipeline an app adds | the same | YES, no error: the archive records it |
+
+The answers are the same with and without the validation layer. All three make that pipeline on
+the device (`newRenderPipelineStateWithMeshDescriptor:`); the x86 GPUs refuse only its archive
+*(class 2)*. Ours refuses every descriptor with the x86 Macs' error (`RgfxBinaryArchive.mm`). Its
+device makes no mesh pipeline (`RgfxMetalDevice+Unsupported.mm`: the wire has no mesh pipeline
+create), where all three make one *(class 4)*.
+
+**The framebuffer's `IOFBMemorySize`.** The AMD's framebuffer publishes 268435456 (256 MiB, the
+size of its aperture), and the Intel 630's publishes none. Neither does the stock lane's paravirtual
+framebuffer, in a macOS 26 x86 guest. Ours publishes none until the scanout's owner sets a new mode,
+and then the size of its scanout's room (`ReimsGraphics.cpp`, getVRAMRange). Both answers are inside
+the envelope *(class 2)*.
 
 ## Not measured
 
