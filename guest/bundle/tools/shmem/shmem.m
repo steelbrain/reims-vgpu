@@ -17,8 +17,8 @@
 //                (and synchronizes a Managed one), and the CPU reads both back: bad = the buffers
 //                whose words are not what was written, and the command buffer's error.
 //     -touch     the CPU writes one byte a page of each buffer as it is made.
-//     -nofree    hold and align cases keep their buffers for the process's life, which its exit
-//                frees through the context's close: no free per buffer.
+//     -nofree    hold, keep and align cases keep their objects for the process's life, which its
+//                exit frees through the context's close: no free per object.
 //     -rounds N  the rounds of a zero case (default 200).
 // The cases:
 //   info                 the device's answers and the system's memory and wire limits.
@@ -28,6 +28,15 @@
 //                        first and the last tenth, then the footprint, wired and
 //                        currentAllocatedSize deltas (MiB) after the makes, after the use, and
 //                        after all are freed, and the free time.
+//   keep.KIND.SIZE       objects of KIND and SIZE bytes made and held until nil or a limit, as a
+//                        hold case does: n, bytes, stop, make_us p50/p99/max, footprint and wired
+//                        deltas; then, with -check, bad = the objects whose bytes read wrong, and
+//                        the free. KIND is mtex, a Managed 2D RGBA8 texture of side
+//                        sqrt(SIZE / 4) (-check: replaceRegion: of one texel of each and getBytes:
+//                        back); ronocopy, a Shared no-copy buffer over SIZE bytes the process maps
+//                        read-only, its words written first (-check: one command buffer copies
+//                        each one's first word out, which must be the word written); or mnocopy, a
+//                        Managed no-copy buffer over writable bytes (-check as ronocopy).
 //   max.MODE             one buffer of maxBufferLength, and one of a page more: ok or nil, us.
 //   zero.MODE.SIZE       -rounds rounds of a make, a check that every 64th byte reads zero, a fill of
 //                        0xa5, a free: dirty = the makes that read a byte not zero.
@@ -53,6 +62,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -373,6 +383,167 @@ static void hold(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint6
 	free(tail);
 }
 
+// One object of a keep case's KIND and `size` bytes, or nil; `i` names it, for its bytes.
+static id makeKept(id<MTLDevice> d, NSString *kind, uint64_t size, NSUInteger i)
+{
+	if ([kind isEqualToString:@"mtex"]) {
+#if TARGET_OS_OSX
+		const NSUInteger side = (NSUInteger)sqrt((double)(size / 4));
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:side
+		                                                      height:side
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModeManaged;
+		return [d newTextureWithDescriptor:desc];
+#else
+		return nil;
+#endif
+	}
+	const BOOL readOnly = [kind isEqualToString:@"ronocopy"];
+	MTLResourceOptions opts = MTLResourceStorageModeShared;
+#if TARGET_OS_OSX
+	if ([kind isEqualToString:@"mnocopy"])
+		opts = MTLResourceStorageModeManaged;
+#endif
+	const uint64_t page = pageBytes(), length = (size + page - 1) / page * page;
+	mach_vm_address_t at = 0;
+	if (mach_vm_allocate(mach_task_self(), &at, length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+		return nil;
+	uint32_t *words = (uint32_t *)(uintptr_t)at;
+	for (uint64_t o = 0; o < length / 4; o += page / 4)
+		words[o] = (uint32_t)i ^ 0xc0ffee00u;
+	if (readOnly)
+		mach_vm_protect(mach_task_self(), at, length, FALSE, VM_PROT_READ);
+	id<MTLBuffer> b = [d newBufferWithBytesNoCopy:words
+	                                       length:length
+	                                      options:opts
+	                                  deallocator:^(void *p, NSUInteger n) {
+		                                  mach_vm_deallocate(mach_task_self(),
+		                                                     (mach_vm_address_t)(uintptr_t)p, n);
+	                                  }];
+	if (b == nil)
+		mach_vm_deallocate(mach_task_self(), at, length);
+	return b;
+}
+
+// Whether each of `held` (at most 65,536 of them, spread evenly) reads its bytes back: a texel
+// replaced and read for a texture, its first word copied out by the GPU for a buffer.
+static unsigned checkKept(id<MTLDevice> d, NSArray *held, NSString **err)
+{
+	unsigned bad = 0;
+	const NSUInteger step = held.count > 65536 ? (held.count + 65535) / 65536 : 1;
+	if ([held.firstObject conformsToProtocol:@protocol(MTLTexture)]) {
+		for (NSUInteger i = 0; i < held.count; i += step) {
+			id<MTLTexture> t = held[i];
+			const uint32_t texel = (uint32_t)i ^ 0xc0ffee00u;
+			uint32_t back = 0;
+			[t replaceRegion:MTLRegionMake2D(t.width - 1, t.height - 1, 1, 1)
+			     mipmapLevel:0
+			       withBytes:&texel
+			     bytesPerRow:4];
+			[t getBytes:&back
+			    bytesPerRow:4
+			     fromRegion:MTLRegionMake2D(t.width - 1, t.height - 1, 1, 1)
+			    mipmapLevel:0];
+			bad += back != texel;
+		}
+		return bad;
+	}
+	const NSUInteger n = (held.count + step - 1) / step;
+	id<MTLBuffer> out = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+	if (out == nil) {
+		*err = @"no out buffer";
+		return (unsigned)n;
+	}
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+	for (NSUInteger i = 0, k = 0; i < held.count; i += step, k++)
+		[b copyFromBuffer:held[i] sourceOffset:0 toBuffer:out destinationOffset:k * 4 size:4];
+	[b endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted)
+		*err = [NSString stringWithFormat:@"status %ld %@", (long)cb.status,
+		                                  cb.error.localizedDescription];
+	const uint32_t *words = (const uint32_t *)out.contents;
+	for (NSUInteger i = 0, k = 0; i < held.count; i += step, k++)
+		bad += words[k] != ((uint32_t)i ^ 0xc0ffee00u);
+	return bad;
+}
+
+// keep.KIND.SIZE: objects of KIND made and held until nil or a limit (the header).
+static void keepCase(id<MTLDevice> d, NSString *name, NSString *kind, uint64_t size)
+{
+	const uint64_t cap = (uint64_t)(gCapGiB * 1073741824.0);
+	const uint64_t guard = (uint64_t)(gGuardGiB * 1073741824.0);
+	unsigned long maxN = gCount;
+	if (cap / size < maxN)
+		maxN = cap / size;
+	double *lat = calloc(maxN + 1, sizeof *lat);
+	NSMutableArray *held = [NSMutableArray arrayWithCapacity:maxN];
+	const uint64_t f0 = footprint(), w0 = wiredBytes();
+	const char *stop = "cap";
+	unsigned long n = 0;
+	const double start = nowUs();
+	for (;;) {
+		if (n >= maxN) {
+			stop = n >= gCount ? "count" : "cap";
+			break;
+		}
+		if (nowUs() - start > gTimeS * 1e6) {
+			stop = "time";
+			break;
+		}
+		if ((n & 63) == 0 && availBytes() < guard) {
+			stop = "guard";
+			break;
+		}
+		id o;
+		double t0, t1;
+		@autoreleasepool {
+			t0 = nowUs();
+			o = makeKept(d, kind, size, n);
+			t1 = nowUs();
+		}
+		if (o == nil) {
+			stop = "nil";
+			break;
+		}
+		lat[n++] = t1 - t0;
+		[held addObject:o];
+	}
+	const uint64_t f1 = footprint(), w1 = wiredBytes();
+	double p50 = quant(lat, n, 0.5), p99 = quant(lat, n, 0.99), mx = n ? lat[n - 1] : 0;
+	printf("shm: %s n=%lu bytes=%.1fMiB stop=%s make_us=%.1f make_p99=%.1f make_max=%.1f "
+	       "make_s=%.2f footprint=%+.1fMiB wired=%+.1fMiB\n",
+	       name.UTF8String, n, mib((int64_t)(n * size)), stop, p50, p99, mx,
+	       (nowUs() - start) / 1e6, mib((int64_t)(f1 - f0)), mib((int64_t)(w1 - w0)));
+	fflush(stdout);
+	if (gCheck && n) {
+		NSString *err = nil;
+		const unsigned bad = checkKept(d, held, &err);
+		printf("shm: %s.check objects=%lu bad=%u%s%s\n", name.UTF8String, n, bad,
+		       err ? " err=" : "", err ? err.UTF8String : "");
+		fflush(stdout);
+	}
+	free(lat);
+	if (gNoFree) {
+		// Kept for the process's life: its exit frees them through the context's close.
+		CFBridgingRetain(held);
+		printf("shm: %s.free skipped (-nofree)\n", name.UTF8String);
+		return;
+	}
+	double tf = nowUs();
+	[held removeAllObjects];
+	tf = nowUs() - tf;
+	usleep(200000);
+	printf("shm: %s.free all_ms=%.1f footprint=%+.1fMiB wired=%+.1fMiB\n", name.UTF8String,
+	       tf / 1000, mib((int64_t)(footprint() - f0)), mib((int64_t)(wiredBytes() - w0)));
+	fflush(stdout);
+}
+
 static void bwCase(id<MTLDevice> d, NSString *name, MTLResourceOptions opts, uint64_t size)
 {
 	uint64_t count = (64ull << 20) / size;
@@ -677,6 +848,11 @@ int main(int argc, const char **argv)
 					MTLResourceOptions o = modeOf(p[1], &ok);
 					if (ok)
 						hold(d, c, o, sizeOf(p[2]));
+				} else if (p.count == 3 && [p[0] isEqualToString:@"keep"]) {
+					ok = [p[1] isEqualToString:@"mtex"] || [p[1] isEqualToString:@"ronocopy"] ||
+					     [p[1] isEqualToString:@"mnocopy"];
+					if (ok)
+						keepCase(d, c, p[1], sizeOf(p[2]));
 				} else if (p.count == 3 && [p[0] isEqualToString:@"bw"]) {
 					MTLResourceOptions o = modeOf(p[1], &ok);
 					if (ok)
