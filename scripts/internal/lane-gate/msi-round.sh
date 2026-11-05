@@ -20,6 +20,7 @@ staged=" "
 for s in ${STAGES:-}; do
   n=${s%%=*} r=${s#*=}
   src=${r%@*} tip=${r##*@}
+  [[ $src == @WS/* ]] && src=$WS/${src#@WS/}  # a probe the round's commit carries (--stage-local)
   rm -rf "$RD/probes/.$n.tmp" "$RD/probes/$n"
   cp -a "$src" "$RD/probes/.$n.tmp" || { echo "msi-round: no probe at $src" >&2; exit 2; }
   [[ -z $tip ]] || echo "$tip" > "$RD/probes/.$n.tmp/tip"
@@ -32,9 +33,14 @@ for p in $TAKE; do
   mv "$Q/$p" "$RD/probes/" || echo "msi-round: $p is not in the queue"
 done
 printf '%s\n' $TAKE > "$RD/probes/.order"
-for f in msi-probes.sh msi-xid.sh msi-capture.py msi-hang.py msi-hang-catch.py msi-boot.sh msi-launch.sh; do
-  cp -p "$WS/lg/bin/$f" "$RD/bin/"
-done
+# The gate's host scripts, the hooks among them ({DIR}/bin/NAME in a --qemu-hook).
+cp -p "$WS"/lg/bin/* "$RD/bin/"
+# The app load's tools (boot.env APPLOAD=1), as rgk-ctx-slots has them now on the lane host.
+if grep -q '^APPLOAD=1' "$WS/lg/boot.env"; then
+  a=${APPLOAD_TOOLS:-$HOME/.cache/rgk-ctx-slots-msi/appload/tools}
+  rm -rf "$RD/bin/appload-tools"
+  [[ -f $a/analyze-load.py ]] && cp -r --reflink=auto "$a" "$RD/bin/appload-tools" || echo "msi-round: no app load tools in $a"
+fi
 cp -p "$WS/lg/ship/payload/bench" "$RD/payload/"
 cp "$WS/lg/boot.env" "$RD/boot.env"
 bash "$RD/bin/msi-boot.sh" "$RD" || echo "probe-batch: the boot ended $? (its log: $RD/boot.log)"

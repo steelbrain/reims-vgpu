@@ -27,6 +27,7 @@
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
 #                  [--host-log FILTER] [--stage NAME=DIR[@TIP]]... [--ram GIB] [--after CMD]
 #                  [--image PATH] [--rom PATH] [--gfx-b64 B64] [--qemu-env K=V]... [--no-metal-check]
+#                  [--stage-local NAME=DIR[@TIP]]... [--appload]
 #
 # The round runs as a potluck job on the lane host (lane-gate/msi-round.sh), holding the 5080 and the
 # whole host (--exclusive; potluck's lease is the lock), dispatched from a throwaway commit of the
@@ -34,7 +35,11 @@
 # round's boot.env. This script only reads the lane host's state (its queue and published tips, over
 # ssh); the job makes every change there. --stage NAME=DIR[@TIP] adds the probe in DIR on the lane host
 # to the round as NAME, copied in by the job (its tip file TIP where given), rather than from the
-# queue; --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page
+# queue; --stage-local NAME=DIR[@TIP] does the same for a probe in DIR on this machine, which the
+# round's commit carries (lg/probes/NAME; a binary of our own built for the round goes in DIR);
+# --appload runs the gate's app load (msi-appload.sh, every app and 7 Safari pages) once the
+# desktop is up, before the probes, which then run on that busy desktop (appload.txt in the
+# round's directory); --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page
 # cache a probe's host side fills counts too); --after CMD runs CMD on the lane host after the boot,
 # inside the job (a hook's own wait for its post-processing, say). --dry-run does not run as a job.
 # A stock control boots other devices than ours: --image PATH (an OpenCore image on the lane host,
@@ -75,8 +80,8 @@ set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
-cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() ram=64 after=
-oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1
+cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() lstages=() ram=64 after=
+oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0
 while (($#)); do
   a=$1
   shift
@@ -97,6 +102,8 @@ while (($#)); do
     --host-log) host_log=${1:?--host-log FILTER}; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
     --stage) stages+=("${1:?--stage NAME=DIR[@TIP]}"); shift ;;
+    --stage-local) lstages+=("${1:?--stage-local NAME=DIR[@TIP]}"); shift ;;
+    --appload) appload=1 ;;
     --ram) ram=${1:?--ram GIB}; shift ;;
     --after) after=${1:?--after CMD}; shift ;;
     --image) oc_path=${1:?--image PATH}; shift ;;
@@ -148,6 +155,17 @@ for st_ in ${stages[@]+"${stages[@]}"}; do
   stip=${stip:-$st0}
   queue=$(printf '%s\n%s\n' "$queue" "0 ${sb:-180} $stip $sn" | sed '/^$/d')
   stage_specs+=("$sn=$sdir@$stip")
+done
+# The probes on this machine (--stage-local), carried in the round's commit (lg/probes/NAME).
+for st_ in ${lstages[@]+"${lstages[@]}"}; do
+  sn=${st_%%=*} sr=${st_#*=} stip=
+  sdir=${sr%@*}
+  [[ $sr == *@* ]] && stip=${sr##*@}
+  [[ -f $sdir/run.sh ]] || { echo "probe-batch: no probe in $sdir" >&2; exit 2; }
+  sb=$(tr -dc 0-9 < "$sdir/budget" 2> /dev/null || true)
+  stip=${stip:-$(tr -dc 0-9a-f < "$sdir/tip" 2> /dev/null || true)}
+  queue=$(printf '%s\n%s\n' "$queue" "0 ${sb:-180} $stip $sn" | sed '/^$/d')
+  stage_specs+=("$sn=@WS/lg/probes/$sn@$stip")
 done
 queue_all=$queue
 [[ -n $exclude ]] &&  # --exclude: those stay queued
@@ -206,6 +224,7 @@ fi
 # What a round takes: the probes for its tip, oldest first, while their budgets fit; those for a
 # tip with no published build are skipped (their results say why); the others wait.
 ((capture)) && FIT_S=$(( FIT_S - 90 ))
+((appload)) && FIT_S=$(( FIT_S - 480 ))  # the app load's time (msi-boot.sh's APPLOAD_NEED_S)
 take=() fit=0
 while read -r age budget tip name; do
   [[ -n ${name:-} ]] || continue
@@ -240,6 +259,11 @@ S=$(mktemp -d /tmp/lg-round.XXXXXX)
 mkdir -p "$S/lg/bin" "$S/lg/ship/payload"
 find "$L" -maxdepth 1 -type f -exec cp -p {} "$S/lg/bin/" \;
 cp -p "$run/artifacts/payload/bench" "$S/lg/ship/payload/"
+for st_ in ${lstages[@]+"${lstages[@]}"}; do
+  sn=${st_%%=*} sr=${st_#*=}
+  mkdir -p "$S/lg/probes"
+  cp -pR "${sr%@*}" "$S/lg/probes/$sn"
+done
 cat > "$S/lg/boot.env" << EOF
 QEMU=$MSI_RGK_RUN/tip-host/$HOST_SHORT/qemu-system-x86_64
 ROM=${rom_path:-$MSI_RGK_RUN/tip-host/$HOST_SHORT/ReimsGraphics.rom}
@@ -257,6 +281,7 @@ RGK_RUN=$MSI_RGK_RUN
 EXCLUSIVE=1
 HOLD_S=$HOLD_S
 DRAG=0
+APPLOAD=$appload
 HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")${log_add:+,$log_add}
 CAPTURE=$capture
 CATCH_FROM_BOOT=$from_boot

@@ -660,8 +660,26 @@ stalls() {
     kv block_stalls unread
   fi
 }
+# The app load (APPLOAD=1, msi-appload.sh): rgk-ctx-slots' busy desktop on this boot, after the
+# measurements (a probe boot's: before its probes, which then run on that desktop), as it leaves
+# every app open; where the hold has room for it (about 6 minutes). appload.txt holds its numbers
+# (msi-appload.sh), appload/ the rest.
+app_load() {
+  if (( $(left) > ${APPLOAD_NEED_S:-480} )) && [[ -f $(dirname "$0")/appload-tools/analyze-load.py ]]; then
+    log "app load"
+    PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS B=$B TOOLS="$(dirname "$0")/appload-tools" \
+      timeout "$(( $(left) - 60 ))" bash "$(dirname "$0")/msi-appload.sh" "$R/appload" > "$R/appload.log" 2>&1
+    kv appload_rc $?
+    cp -f "$R/appload/appload.txt" "$R/appload.txt" 2> /dev/null
+    log "app load done: $(tr '\n' ' ' < "$R/appload.txt" 2> /dev/null)"
+  else
+    kv appload_rc "skipped: $(left) s of the hold left, or no tools"
+    log "app load skipped: $(left) s of the hold left"
+  fi
+}
 # A probe boot: the round's probes back to back (msi-probes.sh), and nothing of the gate's run.
 if [[ -n ${PROBES:-} ]]; then
+  [[ ${APPLOAD:-0} == 1 ]] && app_load
   log "probes: $(ls "$PROBES" | tr '\n' ' ')$(left) s left"
   PROBES=$PROBES PROBE_RESULTS=$PROBE_RESULTS PROBE_TIP=$PROBE_TIP QEMU_PID=$P DEADLINE=$(( T0 + HOLD_S - 20 )) B=$B R=$R \
     HANG_CATCH_PID=$HCPID \
@@ -714,22 +732,8 @@ if [[ ${DRAG:-1} == 1 ]] && (( $(left) > 150 )); then
   log "window drags done"
 fi
 
-# The app load (APPLOAD=1, msi-appload.sh): rgk-ctx-slots' busy desktop on this boot, after the
-# measurements, as it leaves every app open; where the hold has room for it (about 6 minutes).
-# appload.txt holds its numbers (msi-appload.sh), appload/ the rest.
-if [[ ${APPLOAD:-0} == 1 ]]; then
-  if (( $(left) > ${APPLOAD_NEED_S:-480} )) && [[ -f $(dirname "$0")/appload-tools/analyze-load.py ]]; then
-    log "app load"
-    PORT=$PORT GUEST_USER=$GUEST_USER GUEST_PASS=$GUEST_PASS B=$B TOOLS="$(dirname "$0")/appload-tools" \
-      timeout "$(( $(left) - 60 ))" bash "$(dirname "$0")/msi-appload.sh" "$R/appload" > "$R/appload.log" 2>&1
-    kv appload_rc $?
-    cp -f "$R/appload/appload.txt" "$R/appload.txt" 2> /dev/null
-    log "app load done: $(tr '\n' ' ' < "$R/appload.txt" 2> /dev/null)"
-  else
-    kv appload_rc "skipped: $(left) s of the hold left, or no tools"
-    log "app load skipped: $(left) s of the hold left"
-  fi
-fi
+# The app load (app_load, above), after the measurements.
+[[ ${APPLOAD:-0} == 1 ]] && app_load
 kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
 stop_load
 stop_clocks
