@@ -163,6 +163,8 @@ mod compute;
 mod draw_cost;
 #[cfg(test)]
 mod fuzz;
+#[cfg(test)]
+mod handler_cost;
 mod icb;
 #[cfg(test)]
 mod icb_slots_cost;
