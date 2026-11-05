@@ -80,13 +80,15 @@ mod tests {
     type Tex = Retained<ProtocolObject<dyn MTLTexture>>;
     type Dev = ProtocolObject<dyn MTLDevice>;
 
-    /// The display's and the blits' five entry points.
-    const FUNCTIONS: [&str; 5] = [
+    /// The display's and the blits' seven entry points.
+    const FUNCTIONS: [&str; 7] = [
         "BlitInRGB_2P_XR10_A8",
         "BlitOutRGB_2P_XR10_A8",
         "displayPresentVertex",
         "displayPresentFragment",
         "displayPresentFragmentWithGammaTableAndColorMatrix",
+        "displayPipeColorFragment",
+        "displayPipeColorScanoutFragment",
     ];
 
     /// The 2P XR10 A8 pixel format (not public), its plane views' formats, and the XR10
@@ -314,9 +316,9 @@ mod tests {
         [p[2], p[1], p[0], p[3]]
     }
 
-    /// The source compiles on this host's Metal, with the five entry points
+    /// The source compiles on this host's Metal, with the seven entry points
     #[test]
-    fn the_source_compiles_with_the_five_functions() {
+    fn the_source_compiles_with_the_seven_functions() {
         let lib = shader_library(&device());
         for f in FUNCTIONS {
             assert!(
@@ -553,5 +555,368 @@ mod tests {
         for (i, (got, sent)) in out[plane..].chunks(4).zip(alpha.chunks(4)).enumerate() {
             assert_eq!(got, [sent[1]; 4], "alpha texel {i}");
         }
+    }
+
+    /// The display pipe's colour (`displayPipeColorFragment`'s buffers): the matrix's rows, or
+    /// `None` for none, and the three gamma tables, plane 0's, before the matrix and after it.
+    struct PipeColor<'a> {
+        matrix: Option<[[f32; 4]; 3]>,
+        tables: [&'a [[f32; 4]]; 3],
+    }
+
+    /// A gamma table of `n` entries, entry `k` the colour `f(k / (n - 1))` in each channel.
+    fn curve(n: u16, f: impl Fn(f32) -> [f32; 3]) -> Vec<[f32; 4]> {
+        (0..n)
+            .map(|k| {
+                let [r, g, b] = f(f32::from(k) / f32::from(n - 1));
+                [r, g, b, 0.0]
+            })
+            .collect()
+    }
+
+    /// A table as the shader samples it: entry `k` at `k / (n - 1)`, linear between, the input
+    /// clamped; nothing for none.
+    fn lookup(table: &[[f32; 4]], v: [f32; 3]) -> [f32; 3] {
+        let n = table.len();
+        match n {
+            0 => v,
+            1 => [table[0][0], table[0][1], table[0][2]],
+            _ => std::array::from_fn(|c| {
+                #[expect(clippy::as_conversions, reason = "table lengths far below 2^24")]
+                let x = v[c].clamp(0.0, 1.0) * (n - 1) as f32;
+                #[expect(clippy::as_conversions, reason = "x is in [0, n - 1]")]
+                let i = (x as usize).min(n - 2);
+                #[expect(clippy::as_conversions, reason = "i is below 2^24")]
+                let t = x - i as f32;
+                table[i][c] + (table[i + 1][c] - table[i][c]) * t
+            }),
+        }
+    }
+
+    /// What the pipe's colour gives for a pixel of `px`, as `reims-vgpu`'s `graphics/color.rs`
+    /// describes it, on unorm8's scale before its rounding.
+    fn model(color: &PipeColor<'_>, px: [f32; 3]) -> [f32; 3] {
+        let v = lookup(color.tables[0], px);
+        let v = lookup(color.tables[1], v);
+        let v = match color.matrix {
+            Some(m) => {
+                std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] + m[i][3])
+            }
+            None => v,
+        };
+        let v = lookup(color.tables[2], v);
+        v.map(|c| c.clamp(0.0, 1.0) * 255.0)
+    }
+
+    /// Draws through `color` with `fragment` into a BGRA8 target of `w` x `h`, cleared to opaque
+    /// black, over `viewport` (x, y, width, height; the whole target for `None`), as the window's
+    /// sink does (`reims-vgpu`'s `graphics/sink.rs`), `bind` binding what the fragment reads. The
+    /// target's pixels, as BGRA.
+    fn color_pass(
+        d: &MetalDevice,
+        (w, h): (usize, usize),
+        fragment: &str,
+        color: &PipeColor<'_>,
+        viewport: Option<[f64; 4]>,
+        bind: impl FnOnce(&ProtocolObject<dyn objc2_metal::MTLRenderCommandEncoder>),
+    ) -> Vec<[u8; 4]> {
+        let lib = shader_library(d);
+        let dst = texture(d.get(), MTLPixelFormat::BGRA8Unorm, w, h);
+        let pd = MTLRenderPipelineDescriptor::new();
+        pd.setVertexFunction(Some(&function(&lib, "displayPresentVertex")));
+        pd.setFragmentFunction(Some(&function(&lib, fragment)));
+        // SAFETY: attachment 0 exists.
+        unsafe {
+            pd.colorAttachments()
+                .objectAtIndexedSubscript(0)
+                .setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        }
+        let pipeline = MTLDevice::newRenderPipelineStateWithDescriptor_error(d.get(), &pd).unwrap();
+        let mut properties: Vec<u8> = color
+            .matrix
+            .unwrap_or([[0.0; 4]; 3])
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let counts = [
+            color.tables[0].len(),
+            color.tables[1].len(),
+            if color.matrix.is_some() { 3 } else { 0 },
+            color.tables[2].len(),
+        ];
+        for count in counts {
+            properties.extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        }
+        assert_eq!(properties.len(), 64);
+        let properties = shared_buffer(d, &properties);
+        let tables = color.tables.map(|t| {
+            let bytes: Vec<u8> = t.iter().flatten().flat_map(|f| f.to_le_bytes()).collect();
+            shared_buffer(d, if bytes.is_empty() { &[0; 16] } else { &bytes })
+        });
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        // SAFETY: attachment 0 of a fresh pass descriptor.
+        unsafe {
+            let a = pass.colorAttachments().objectAtIndexedSubscript(0);
+            a.setTexture(Some(&dst));
+            a.setLoadAction(MTLLoadAction::Clear);
+            a.setClearColor(objc2_metal::MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            });
+            a.setStoreAction(MTLStoreAction::Store);
+        }
+        let q = d.get().newCommandQueue().unwrap();
+        let cb = q.commandBuffer().unwrap();
+        let enc = cb.renderCommandEncoderWithDescriptor(&pass).unwrap();
+        enc.setRenderPipelineState(&pipeline);
+        if let Some([x, y, vw, vh]) = viewport {
+            enc.setViewport(objc2_metal::MTLViewport {
+                originX: x,
+                originY: y,
+                width: vw,
+                height: vh,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+        }
+        // SAFETY: the bytes outlive the encoder's copy; the buffers live past the wait; the
+        // indices are the shaders'.
+        unsafe {
+            enc.setVertexBytes_length_atIndex(
+                NonNull::new(POS.as_ptr().cast_mut().cast()).unwrap(),
+                size_of_val(&POS),
+                0,
+            );
+            enc.setVertexBytes_length_atIndex(
+                NonNull::new(TEX.as_ptr().cast_mut().cast()).unwrap(),
+                size_of_val(&TEX),
+                1,
+            );
+            enc.setFragmentBuffer_offset_atIndex(Some(&properties), 0, 0);
+            for (i, t) in tables.iter().enumerate() {
+                enc.setFragmentBuffer_offset_atIndex(Some(t), 0, i + 1);
+            }
+        }
+        bind(&enc);
+        // SAFETY: the pipeline's buffers and textures are bound.
+        unsafe {
+            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        download(&dst, w, h, w * 4)
+    }
+
+    /// A shared buffer holding `bytes`.
+    fn shared_buffer(
+        d: &MetalDevice,
+        bytes: &[u8],
+    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>> {
+        let b = d
+            .get()
+            .newBufferWithLength_options(bytes.len(), MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // SAFETY: the buffer holds `bytes.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                b.contents().as_ptr().cast(),
+                bytes.len(),
+            );
+        }
+        b
+    }
+
+    /// Draws `frame` through `color` into a BGRA8 target of the frame's size, with the surface's
+    /// colour function. The target's pixels, as BGRA.
+    fn pipe_color(d: &MetalDevice, frame: &Tex, color: &PipeColor<'_>) -> Vec<[u8; 4]> {
+        let size = (frame.width(), frame.height());
+        color_pass(d, size, "displayPipeColorFragment", color, None, |enc| {
+            // SAFETY: a live texture at the index the fragment reads.
+            unsafe { enc.setFragmentTexture_atIndex(Some(frame), 0) };
+        })
+    }
+
+    /// The scanout's colour function reads the guest's BGRA8 pixels in place from its buffer:
+    /// its first pixel past a word offset, its rows a stride apart, drawn one target pixel each
+    /// at the viewport's corner; outside the viewport the target keeps its clear
+    #[test]
+    fn the_pipe_colour_reads_the_scanout_in_place() {
+        let d = device();
+        let (w, h) = (8, 4);
+        // A 5 x 3 scanout, rows of 7 words, its first pixel at word 3, drawn at (2, 1).
+        let (sw, sh, stride, first) = (5, 3, 7, 3);
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let x = u8::try_from(x).unwrap();
+            let y = u8::try_from(y).unwrap();
+            // B, G, R, A in memory.
+            [x * 40, y * 100, 255 - x * 30, 0x11]
+        };
+        let mut bytes = vec![0xeeu8; (first + stride * sh) * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let at = (first + y * stride + x) * 4;
+                bytes[at..at + 4].copy_from_slice(&pixel(x, y));
+            }
+        }
+        let scanout = shared_buffer(&d, &bytes);
+        let words: [u32; 4] = [2, 1, 7, 3];
+        let at: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let at = shared_buffer(&d, &at);
+        let identity = [[0.0; 4], [1.0, 1.0, 1.0, 0.0]];
+        // Red and blue swapped by the matrix: the unpacking's order shows.
+        let color = PipeColor {
+            matrix: Some([
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ]),
+            tables: [&[], &[], &identity],
+        };
+        let out = color_pass(
+            &d,
+            (w, h),
+            "displayPipeColorScanoutFragment",
+            &color,
+            Some([2.0, 1.0, 5.0, 3.0]),
+            |enc| {
+                // SAFETY: live buffers at the indices the fragment reads.
+                unsafe {
+                    enc.setFragmentBuffer_offset_atIndex(Some(&scanout), 0, 4);
+                    enc.setFragmentBuffer_offset_atIndex(Some(&at), 0, 5);
+                }
+            },
+        );
+        for y in 0..h {
+            for x in 0..w {
+                let got = out[y * w + x];
+                let want = if (2..2 + sw).contains(&x) && (1..1 + sh).contains(&y) {
+                    let [b, g, r, _] = pixel(x - 2, y - 1);
+                    // Swapped: the target's blue is the scanout's red.
+                    [r, g, b, 0xff]
+                } else {
+                    [0, 0, 0, 0xff]
+                };
+                assert_eq!(got, want, "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    /// With every stage off the colour's draw is the copy, opaque; a post-matrix table of two
+    /// entries interpolates linearly between them; one of one entry is that entry everywhere
+    #[test]
+    fn the_pipe_colour_interpolates_its_tables() {
+        let d = device();
+        let px = [[0x80, 0x00, 0xff, 0x10], [0xff, 0x40, 0x00, 0x20]];
+        let frame = rgba8_frame(&d, &px, 2, 1);
+        let off = PipeColor {
+            matrix: None,
+            tables: [&[], &[], &[]],
+        };
+        let out: Vec<[u8; 4]> = pipe_color(&d, &frame, &off).into_iter().map(bgra).collect();
+        assert_eq!(
+            out,
+            vec![[0x80, 0x00, 0xff, 0xff], [0xff, 0x40, 0x00, 0xff]]
+        );
+
+        // Red to 0.6, green to a quarter, blue whole: 0.6 of 0x80 is 76.8, of 0xff 153.
+        let post = [[0.0; 4], [0.6, 0.25, 1.0, 0.0]];
+        let halves = PipeColor {
+            matrix: None,
+            tables: [&[], &[], &post],
+        };
+        let out: Vec<[u8; 4]> = pipe_color(&d, &frame, &halves)
+            .into_iter()
+            .map(bgra)
+            .collect();
+        assert_eq!(
+            out,
+            vec![[0x4d, 0x00, 0xff, 0xff], [0x99, 0x10, 0x00, 0xff]]
+        );
+
+        // 0.25 is 63.75.
+        let one = [[0.0, 1.0, 0.25, 0.0]];
+        let constant = PipeColor {
+            matrix: None,
+            tables: [&[], &one, &[]],
+        };
+        let out: Vec<[u8; 4]> = pipe_color(&d, &frame, &constant)
+            .into_iter()
+            .map(bgra)
+            .collect();
+        assert_eq!(out, vec![[0x00, 0xff, 0x40, 0xff]; 2]);
+    }
+
+    /// The stages apply in the pipe's order, plane 0's table, the table before the matrix, the
+    /// matrix by rows, the table after it, each table's input clamped to [0, 1]: within one step
+    /// of the model's rounding, for every red and green level
+    #[test]
+    fn the_pipe_colour_applies_its_stages_in_order() {
+        let d = device();
+        let (w, h) = (256, 2);
+        let px: Vec<[u8; 4]> = (0..w * h)
+            .map(|i| {
+                let i = u8::try_from(i % 256).unwrap();
+                [i, 255 - i, i / 2, 0xff]
+            })
+            .collect();
+        let frame = rgba8_frame(&d, &px, w, h);
+        let plane = curve(1024, |x| [1.0 - x, x, x]);
+        let pre = curve(256, |x| [x * x, x.sqrt(), x]);
+        let post = curve(4096, |x| {
+            let g = x.powf(1.0 / 2.2);
+            [g, g * 0.9, g * 0.8]
+        });
+        // Blue and red swapped, green scaled with an offset; a row's sum past 1 is clamped by the
+        // table after it.
+        let matrix = [
+            [0.0, 0.0, 1.0, 0.0],
+            [0.25, 0.75, 0.0, 0.125],
+            [1.0, 0.25, 0.0, -0.1],
+        ];
+        let color = PipeColor {
+            matrix: Some(matrix),
+            tables: [&plane, &pre, &post],
+        };
+        let out: Vec<[u8; 4]> = pipe_color(&d, &frame, &color)
+            .into_iter()
+            .map(bgra)
+            .collect();
+        for (i, (o, p)) in out.iter().zip(&px).enumerate() {
+            let want = model(&color, [p[0], p[1], p[2]].map(|c| f32::from(c) / 255.0));
+            for c in 0..3 {
+                assert!(
+                    (f32::from(o[c]) - want[c]).abs() <= 1.0,
+                    "pixel {i} channel {c}: {o:?}, the model's {want:?}"
+                );
+            }
+            assert_eq!(o[3], 0xff);
+        }
+        // The order shows: plane 0's table inverts red first, so the darkest red comes out
+        // brightest in blue.
+        let (dark, bright) = (out[0], out[255]);
+        assert!(dark[2] > bright[2], "{dark:?} {bright:?}");
+    }
+
+    /// A half-float frame's components outside [0, 1] are clamped at each table's input, not
+    /// extended
+    #[test]
+    fn the_pipe_colour_clamps_each_tables_input() {
+        let d = device();
+        let t = texture(d.get(), MTLPixelFormat::RGBA16Float, 1, 1);
+        // -0.25, 1.5, 0.5 as half floats.
+        upload(&t, &[[0xb400u16, 0x3e00, 0x3800, 0x3c00]], 1, 1, 8, 0);
+        let table = [[0.2, 0.2, 0.2, 0.0], [0.6, 0.6, 0.6, 0.0]];
+        let color = PipeColor {
+            matrix: None,
+            tables: [&[], &table, &[]],
+        };
+        let out: Vec<[u8; 4]> = pipe_color(&d, &t, &color).into_iter().map(bgra).collect();
+        // 0.2 is 51, 0.6 153, 0.4 102.
+        assert_eq!(out, vec![[0x33, 0x99, 0x66, 0xff]]);
     }
 }

@@ -82,6 +82,91 @@ fragment float4 displayPresentFragmentWithGammaTableAndColorMatrix(
     return float4(properties.color_matrix * float4(looked_up, 1.0f), 1.0f);
 }
 
+// ---- The graphics device's display pipe colour ----
+
+// The display pipe's colour (reims-vgpu's graphics/color.rs, written by graphics/sink.rs): the
+// matrix stage's three rows as the guest's transaction carries them, then each stage's entry
+// count, 0 where the stage is off.
+struct DisplayPipeColor {
+    float4 matrix[3];
+    uint plane_count;
+    uint pre_count;
+    uint matrix_count;
+    uint post_count;
+};
+
+static_assert(sizeof(DisplayPipeColor) == 64, "the colour buffer's length");
+
+// `v` through a gamma stage of `n` entries, each channel by its own: entry k is the output at
+// input k / (n - 1), linear between entries, the input clamped to [0, 1]. A stage of no entries
+// passes `v` through; one of one entry is that entry everywhere.
+static float3 display_pipe_gamma(device const float4 *table, uint n, float3 v) {
+    if (n == 0) {
+        return v;
+    }
+    if (n == 1) {
+        return table[0].rgb;
+    }
+    float3 x = clamp(v, 0.0f, 1.0f) * float(n - 1);
+    float3 out;
+    for (uint c = 0; c < 3; c++) {
+        uint i = min(uint(x[c]), n - 2);
+        out[c] = mix(table[i][c], table[i + 1][c], x[c] - float(i));
+    }
+    return out;
+}
+
+// `v` through the display pipe's stages, in order: plane 0's gamma, the pre-gamma, the colour
+// matrix (output c = row c's first three . the colour, plus its fourth), the post-gamma.
+static float3 display_pipe_color(float3 v, constant DisplayPipeColor &color,
+                                 device const float4 *plane_gamma, device const float4 *pre_gamma,
+                                 device const float4 *post_gamma) {
+    v = display_pipe_gamma(plane_gamma, color.plane_count, v);
+    v = display_pipe_gamma(pre_gamma, color.pre_count, v);
+    if (color.matrix_count == 3) {
+        v = float3(dot(color.matrix[0].xyz, v) + color.matrix[0].w,
+                   dot(color.matrix[1].xyz, v) + color.matrix[1].w,
+                   dot(color.matrix[2].xyz, v) + color.matrix[2].w);
+    }
+    return display_pipe_gamma(post_gamma, color.post_count, v);
+}
+
+// A presented frame through the display pipe's colour. Alpha is 1, whatever the frame holds.
+fragment float4 displayPipeColorFragment(PresentVertex in [[stage_in]],
+                                         texture2d<float> frame [[texture(0)]],
+                                         constant DisplayPipeColor &color [[buffer(0)]],
+                                         device const float4 *plane_gamma [[buffer(1)]],
+                                         device const float4 *pre_gamma [[buffer(2)]],
+                                         device const float4 *post_gamma [[buffer(3)]]) {
+    float3 v = frame.sample(frame_sampler, in.tex).rgb;
+    return float4(display_pipe_color(v, color, plane_gamma, pre_gamma, post_gamma), 1.0f);
+}
+
+// Where the guest's scanout lies (graphics/sink.rs): the drawable pixel its top left is drawn
+// at, its bytes per row, and where its first pixel is in the buffer, both in 4-byte words.
+struct DisplayPipeScanout {
+    uint2 origin;
+    uint stride;
+    uint first;
+};
+
+static_assert(sizeof(DisplayPipeScanout) == 16, "the scanout's buffer length");
+
+// The guest's scanout, read in place from its buffer (BGRA8, one pixel of the drawable per pixel
+// of the scanout), through the display pipe's colour. Alpha is 1, whatever the scanout holds.
+fragment float4 displayPipeColorScanoutFragment(PresentVertex in [[stage_in]],
+                                                constant DisplayPipeColor &color [[buffer(0)]],
+                                                device const float4 *plane_gamma [[buffer(1)]],
+                                                device const float4 *pre_gamma [[buffer(2)]],
+                                                device const float4 *post_gamma [[buffer(3)]],
+                                                device const uchar4 *scanout [[buffer(4)]],
+                                                constant DisplayPipeScanout &at [[buffer(5)]]) {
+    uint2 p = uint2(in.position.xy) - at.origin;
+    uchar4 bgra = scanout[at.first + p.y * at.stride + p.x];
+    float3 v = float3(bgra.z, bgra.y, bgra.x) / 255.0f;
+    return float4(display_pipe_color(v, color, plane_gamma, pre_gamma, post_gamma), 1.0f);
+}
+
 // ---- XR10 two-plane textures (pixel formats 550 and 551) ----
 //
 // The guest's texture is two planes: colour, viewed as BGR10_XR (or its sRGB form), and alpha,
