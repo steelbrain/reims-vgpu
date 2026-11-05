@@ -313,4 +313,29 @@ struct RgfxConnectChange {
 	}
 };
 
+// The framebuffer's calls that name a mode and a depth.
+enum class RgfxModeCall {
+	PixelInformation,
+	ModeInformation,
+	TimingInformation,
+	SetMode,
+	SetStartupMode,
+};
+
+// IOReturn's kIOReturnError and kIOReturnUnsupportedMode, which the kext checks against
+// IOReturn.h.
+constexpr uint32_t kRgfxIOReturnError = 0xe00002bc;
+constexpr uint32_t kRgfxIOReturnUnsupportedMode = 0xe00002e6;
+
+// What `call` answers for a mode the framebuffer does not list, or a depth past its one (0), as
+// Apple's paravirtual framebuffer answers each (AppleParavirtFramebuffer, macOS 26.7.1, read from
+// its code): the pixel information kIOReturnUnsupportedMode, as for an aperture other than the
+// system's, and the others kIOReturnError. Apple's lists its modes as 0 to its count - 1, and
+// WindowServer asks the pixel information of mode 0, which this framebuffer's IDs never are.
+inline uint32_t rgfxNoSuchModeStatus(RgfxModeCall call)
+{
+	return call == RgfxModeCall::PixelInformation ? kRgfxIOReturnUnsupportedMode
+	                                              : kRgfxIOReturnError;
+}
+
 #endif // RGFX_DISPLAY_MODES_HPP_

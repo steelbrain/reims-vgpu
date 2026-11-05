@@ -30,6 +30,15 @@ constexpr UInt32 kHeaderBytes = sizeof(RgfxMsgHeader);
 // A message's size is a multiple of this.
 constexpr UInt32 kMsgAlign = 8;
 
+// What a call naming a mode or depth the framebuffer does not hold answers (RgfxDisplayModes.hpp).
+static_assert(kRgfxIOReturnError == static_cast<uint32_t>(kIOReturnError) &&
+                  kRgfxIOReturnUnsupportedMode == static_cast<uint32_t>(kIOReturnUnsupportedMode),
+              "RgfxDisplayModes.hpp's statuses are IOReturn's");
+IOReturn noSuchMode(RgfxModeCall call)
+{
+	return static_cast<IOReturn>(rgfxNoSuchModeStatus(call));
+}
+
 // The ring header's fields, by their offset in it (each in a 64-byte line).
 constexpr UInt32 kRingProducer = __builtin_offsetof(RgfxRingHeader, producer);
 constexpr UInt32 kRingConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
@@ -1394,8 +1403,10 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	IOLockUnlock(stateLock);
 	FBTRACE(48, "getInformationForDisplayMode %d: %s %ux%u", static_cast<int>(displayMode),
 	        ok ? "ok" : "UNKNOWN", ok ? m.width : 0, ok ? m.height : 0);
-	if (!ok || !info)
+	if (!info)
 		return kIOReturnBadArgument;
+	if (!ok)
+		return noSuchMode(RgfxModeCall::ModeInformation);
 	bzero(info, sizeof(*info));
 	info->nominalWidth = m.width;
 	info->nominalHeight = m.height;
@@ -1418,13 +1429,13 @@ IOReturn ReimsGraphics::getPixelInformation(IODisplayModeID displayMode, IOIndex
 	FBTRACE(48, "getPixelInformation mode %d depth %d aperture %d", static_cast<int>(displayMode),
 	        static_cast<int>(depth), static_cast<int>(aperture));
 	if (depth != 0 || aperture != kIOFBSystemAperture || !pixelInfo)
-		return kIOReturnUnsupportedMode;
+		return noSuchMode(RgfxModeCall::PixelInformation);
 	Mode m;
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	IOLockUnlock(stateLock);
 	if (!ok)
-		return kIOReturnBadArgument;
+		return noSuchMode(RgfxModeCall::PixelInformation);
 	// 32-bit BGRA8: little-endian 0x00RRGGBB words.
 	bzero(pixelInfo, sizeof(*pixelInfo));
 	pixelInfo->bytesPerRow = strideFor(m.width);
@@ -1458,12 +1469,12 @@ IOReturn ReimsGraphics::setDisplayMode(IODisplayModeID displayMode, IOIndex dept
 {
 	FBTRACE(16, "setDisplayMode %d depth %d", static_cast<int>(displayMode), static_cast<int>(depth));
 	if (depth != 0)
-		return kIOReturnUnsupportedMode;
+		return noSuchMode(RgfxModeCall::SetMode);
 	Mode m;
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	IOLockUnlock(stateLock);
-	return ok ? setScanout(m) : kIOReturnBadArgument;
+	return ok ? setScanout(m) : noSuchMode(RgfxModeCall::SetMode);
 }
 
 IOReturn ReimsGraphics::getStartupDisplayMode(IODisplayModeID *displayMode, IOIndex *depth)
@@ -1484,14 +1495,14 @@ IOReturn ReimsGraphics::setStartupDisplayMode(IODisplayModeID displayMode, IOInd
 	FBTRACE(16, "setStartupDisplayMode %d depth %d", static_cast<int>(displayMode),
 	        static_cast<int>(depth));
 	if (depth != 0)
-		return kIOReturnUnsupportedMode;
+		return noSuchMode(RgfxModeCall::SetStartupMode);
 	Mode m;
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	if (ok)
 		modeSet.startupId = displayMode;
 	IOLockUnlock(stateLock);
-	return ok ? kIOReturnSuccess : kIOReturnBadArgument;
+	return ok ? kIOReturnSuccess : noSuchMode(RgfxModeCall::SetStartupMode);
 }
 
 // Each mode is a fixed-rate panel's, with the timing its EDID entry gives.
@@ -1508,8 +1519,10 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	IOLockUnlock(stateLock);
 	FBTRACE(48, "getTimingInfoForDisplayMode %d: %s%s, flags in 0x%x", static_cast<int>(displayMode),
 	        ok ? "ok" : "UNKNOWN", p ? " programmed" : "", info ? static_cast<unsigned>(info->flags) : 0);
-	if (!ok || !info)
+	if (!info)
 		return kIOReturnBadArgument;
+	if (!ok)
+		return noSuchMode(RgfxModeCall::TimingInformation);
 	if (p) {
 		// A programmed timing is no standard one: it is given back as the OS gave it.
 		bzero(info, sizeof(*info));

@@ -184,6 +184,25 @@ void idsStayWithTheirModes()
 	check(m.take(both, 2, 0), "listed again");
 	check(m.modes[1].id == window, "the mode set's mode takes back its ID");
 }
+
+// A mode or depth the framebuffer does not hold is answered as Apple's paravirtual framebuffer
+// answers it: kIOReturnUnsupportedMode for the pixel information, kIOReturnError elsewhere.
+void anUnknownModeIsAnsweredAsApplesFramebufferDoes()
+{
+	check(rgfxNoSuchModeStatus(RgfxModeCall::PixelInformation) == 0xe00002e6u,
+	      "the pixel information of no mode: kIOReturnUnsupportedMode");
+	check(rgfxNoSuchModeStatus(RgfxModeCall::ModeInformation) == 0xe00002bcu,
+	      "the mode information of no mode: kIOReturnError");
+	check(rgfxNoSuchModeStatus(RgfxModeCall::TimingInformation) == 0xe00002bcu,
+	      "the timing information of no mode: kIOReturnError");
+	check(rgfxNoSuchModeStatus(RgfxModeCall::SetMode) == 0xe00002bcu,
+	      "setting no mode: kIOReturnError");
+	check(rgfxNoSuchModeStatus(RgfxModeCall::SetStartupMode) == 0xe00002bcu,
+	      "setting no startup mode: kIOReturnError");
+	Modes m = started(kWindow);
+	RgfxMode none;
+	check(!m.modeFor(0, &none), "mode 0, which WindowServer asks about, is none of ours");
+}
 } // namespace
 
 int main()
@@ -192,6 +211,7 @@ int main()
 	aChangeBetweenTheCurrentModeAndTheList();
 	aChangeAfterTheStartupModeIsSet();
 	idsStayWithTheirModes();
+	anUnknownModeIsAnsweredAsApplesFramebufferDoes();
 	std::printf("display_modes_test: OK (%d checks)\n", checks);
 	return 0;
 }
