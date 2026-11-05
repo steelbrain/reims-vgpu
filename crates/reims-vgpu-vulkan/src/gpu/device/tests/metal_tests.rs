@@ -3291,20 +3291,30 @@ fn b3a8(size: (u64, u64), rows: (u64, u64), seed: u64) -> crate::os::OsSurface {
     noisy_surface(&b3a8_spec(size, rows), seed)
 }
 
+/// How [`read_through_another`] orders its two blits: in two encoders of one command buffer, or
+/// in command buffers of two queues, the read's committed first and waiting for an event the
+/// write's signals after its blit.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    OneCommandBuffer,
+    EventAcrossQueues,
+}
+
 /// What a texture over `surface` (a 'BGRA' one of `size`) reads where another texture over the
-/// same surface was written in the encoder before, on `p`'s device `d`: a blit of `texels` into
-/// the first texture, then, in a second blit encoder of the same command buffer, a blit of the
-/// second texture's texels into a buffer, whose bytes are answered once the command buffer
-/// completed. The two textures are made first, as a guest makes two over one surface.
+/// same surface was written before it, on `p`'s device `d`: a blit of `texels` into the first
+/// texture, then a blit of the second texture's texels into a buffer, ordered as `order` says,
+/// the buffer's bytes answered once both command buffers completed. The two textures are made
+/// first, as a guest makes two over one surface.
 fn read_through_another<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
     p: &P,
     d: &P::Device,
     surface: &crate::os::OsSurface,
-    (width, height): (u64, u64),
+    ((width, height), order): ((u64, u64), Order),
     texels: &[u8],
 ) -> Vec<u8> {
     use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
     use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_core::platform::event::EventRef;
     use reims_vgpu_core::platform::resource::Buffer as _;
     use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize};
     let desc = p.texture_descriptor(&reims_vgpu_core::platform::values::TextureDesc {
@@ -3318,7 +3328,7 @@ fn read_through_another<P: reims_vgpu_core::platform::Platform<Surface = crate::
     let written = (d.new_texture_on_surface(&desc, Some(surface), 0))
         .unwrap()
         .unwrap();
-    let read = (d.new_texture_on_surface(&desc, Some(surface), 0))
+    let reader = (d.new_texture_on_surface(&desc, Some(surface), 0))
         .unwrap()
         .unwrap();
     let length = u64::try_from(texels.len()).unwrap();
@@ -3333,40 +3343,64 @@ fn read_through_another<P: reims_vgpu_core::platform::Platform<Surface = crate::
         std::ptr::copy_nonoverlapping(texels.as_ptr(), up.contents().as_ptr(), texels.len());
     }
     let (size, origin) = (MtlSize::new(width, height, 1), MtlOrigin::new(0, 0, 0));
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let blits = [
-        BlitCmd::CopyBufferToTexture {
-            source_buffer: &up,
-            source_offset: 0,
-            source_bytes_per_row: width * 4,
-            source_bytes_per_image: length,
-            source_size: size,
-            destination_texture: &written,
-            destination_slice: 0,
-            destination_level: 0,
-            destination_origin: origin,
-        },
-        BlitCmd::CopyTextureToBuffer {
-            source_texture: &read,
-            source_slice: 0,
-            source_level: 0,
-            source_origin: origin,
-            source_size: size,
-            destination_buffer: &down,
-            destination_offset: 0,
-            destination_bytes_per_row: width * 4,
-            destination_bytes_per_image: length,
-        },
-    ];
-    for blit in blits {
+    let write = BlitCmd::CopyBufferToTexture {
+        source_buffer: &up,
+        source_offset: 0,
+        source_bytes_per_row: width * 4,
+        source_bytes_per_image: length,
+        source_size: size,
+        destination_texture: &written,
+        destination_slice: 0,
+        destination_level: 0,
+        destination_origin: origin,
+    };
+    let read = BlitCmd::CopyTextureToBuffer {
+        source_texture: &reader,
+        source_slice: 0,
+        source_level: 0,
+        source_origin: origin,
+        source_size: size,
+        destination_buffer: &down,
+        destination_offset: 0,
+        destination_bytes_per_row: width * 4,
+        destination_bytes_per_image: length,
+    };
+    let blit = |cb: &P::CommandBuffer, cmd| {
         let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-        e.encode(OnFault::Die, blit).unwrap();
+        e.encode(OnFault::Die, cmd).unwrap();
         e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    };
+    let q = d.new_command_queue().unwrap();
+    let cbs = match order {
+        Order::OneCommandBuffer => {
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            blit(&cb, write);
+            blit(&cb, read);
+            cb.commit(OnFault::Die).unwrap();
+            vec![cb]
+        }
+        Order::EventAcrossQueues => {
+            let event = d.new_event(OnFault::Die).unwrap().unwrap();
+            let other = d.new_command_queue().unwrap();
+            let reading = other.command_buffer(OnFault::Die).unwrap().unwrap();
+            reading
+                .encode_wait(Some(EventRef::Event(&event)), 1)
+                .unwrap();
+            blit(&reading, read);
+            reading.commit(OnFault::Die).unwrap();
+            let writing = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            blit(&writing, write);
+            writing
+                .encode_signal(Some(EventRef::Event(&event)), 1)
+                .unwrap();
+            writing.commit(OnFault::Die).unwrap();
+            vec![writing, reading]
+        }
+    };
+    for cb in &cbs {
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.error(), None);
     }
-    cb.commit(OnFault::Die).unwrap();
-    cb.wait_until_completed(OnFault::Die).unwrap();
-    assert_eq!(cb.error(), None);
     // SAFETY: the buffer's `length` bytes, read once the command buffer that wrote them completed.
     unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), texels.len()) }.to_vec()
 }
@@ -3381,7 +3415,8 @@ fn surface_texels() -> ((u64, u64), Vec<u8>) {
 }
 
 /// A texture over a surface reads what a blit through another texture over the same surface
-/// wrote in the encoder before, in one command buffer, as Metal's does: two textures over one
+/// wrote before it, as Metal's does, in a later encoder of one command buffer and in a command
+/// buffer of another queue that waits for an event the write signals: two textures over one
 /// surface are one memory, which the runtime imports once for both, the surface over pages of
 /// the host's as a guest's mapper makes it
 #[test]
@@ -3393,16 +3428,18 @@ fn a_texture_over_a_surface_reads_another_ones_writes_as_metals() {
     let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let p = crate::platform::tests::platform();
     let (size, texels) = surface_texels();
-    let (theirs, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
-    let metals = read_through_another(&mp, &md, &theirs, size, &texels);
-    assert!(metals == texels, "Metal's");
-    drop(theirs);
-    free(pages, length);
-    let (ours, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
-    let read = read_through_another(&p, &dev(), &ours, size, &texels);
-    assert!(read == metals, "in place");
-    drop(ours);
-    free(pages, length);
+    for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
+        let (theirs, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
+        let metals = read_through_another(&mp, &md, &theirs, (size, order), &texels);
+        assert!(metals == texels, "{order:?}: Metal's");
+        drop(theirs);
+        free(pages, length);
+        let (ours, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
+        let read = read_through_another(&p, &dev(), &ours, (size, order), &texels);
+        assert!(read == metals, "{order:?}: in place");
+        drop(ours);
+        free(pages, length);
+    }
 }
 
 /// [`a_texture_over_a_surface_reads_another_ones_writes_as_metals`] where every import is
@@ -3423,23 +3460,35 @@ fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
     let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let p = crate::platform::tests::platform();
     let (size, texels) = surface_texels();
-    let (theirs, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
-    let metals = read_through_another(&mp, &md, &theirs, size, &texels);
-    drop(theirs);
-    free(pages, length);
     let copies = || {
         (crate::answer::relayed_counts().into_iter())
             .find(|(kind, _)| *kind == rt::Degradation::CopiedHostPages)
             .map_or(0, |(_, n)| n)
     };
-    let before = copies();
-    let (ours, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
-    let read = crate::answer::relaxed(|| {
-        crate::os::refusing_imports(|| read_through_another(&p, &dev(), &ours, size, &texels))
-    });
-    assert!(copies() > before, "the runtime copied the surface's pages");
-    let stale = read.iter().zip(&metals).filter(|(a, b)| a != b).count();
-    assert_eq!(stale, 0, "of {} bytes, as Metal's", metals.len());
-    drop(ours);
-    free(pages, length);
+    let mut stale = Vec::new();
+    for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
+        let (theirs, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
+        let metals = read_through_another(&mp, &md, &theirs, (size, order), &texels);
+        drop(theirs);
+        free(pages, length);
+        let before = copies();
+        let (ours, pages, length) = bgra_surface_over_at(size.0, size.1, 0);
+        let read = crate::answer::relaxed(|| {
+            crate::os::refusing_imports(|| {
+                read_through_another(&p, &dev(), &ours, (size, order), &texels)
+            })
+        });
+        assert!(
+            copies() > before,
+            "{order:?}: the runtime copied the surface's pages"
+        );
+        let differ = read.iter().zip(&metals).filter(|(a, b)| a != b).count();
+        stale.push((order, differ, metals.len()));
+        drop(ours);
+        free(pages, length);
+    }
+    assert!(
+        stale.iter().all(|&(_, differ, _)| differ == 0),
+        "bytes that differ from Metal's, of all: {stale:?}"
+    );
 }
