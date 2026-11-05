@@ -55,6 +55,8 @@
 //                what a blit's GPU write leaves there
 //   nocopy.ro    (a group) .anon.MODE and .file.MODE: a no-copy buffer over read-only memory, and
 //                what a GPU read, a blit fill and a kernel's store do with it
+//   nocopy.copies  a no-copy Managed buffer over writable memory: whether a GPU read sees a CPU
+//                write made with no didModifyRange:, and the CPU a blit's write with no synchronize
 //   linalign     (a group) minimumLinearTextureAlignmentForPixelFormat: of raw formats 0 to 799,
 //                1000, 1023, 4096 and 65535, one child each (linalign.N)
 // Build: see README.md.
@@ -1206,6 +1208,46 @@ static void case_texaddr_iosurface(id<MTLDevice> d, const char *tag)
 	CFRelease(surface);
 }
 
+// nocopy.copies: a no-copy Managed buffer over 4 writable pages of 0x11: a CPU write of 0x22 to
+// byte 0 with no didModifyRange:, then a blit copy of the buffer out (what the GPU read); a blit
+// fill of 0x77 into bytes 256 to 511, waited on, with no synchronize (what the memory holds), then
+// with one.
+static void case_nocopy_copies(id<MTLDevice> d, const char *tag)
+{
+	const size_t page = (size_t)getpagesize(), len = 4 * page;
+	uint8_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+	memset(p, 0x11, len);
+	id<MTLBuffer> b = [d newBufferWithBytesNoCopy:p
+	                                       length:len
+	                                      options:MTLResourceStorageModeManaged
+	                                  deallocator:nil];
+	describe_resource(tag, "buffer", b);
+	if (b == nil)
+		return;
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLBuffer> dst = [d newBufferWithLength:len options:MTLResourceStorageModeShared];
+	p[0] = 0x22;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+	[be copyFromBuffer:b sourceOffset:0 toBuffer:dst destinationOffset:0 size:len];
+	[be endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	printf("%s cpuWriteNoCall gpuRead byte0=0x%02x byte1=0x%02x\n", tag,
+	       ((uint8_t *)dst.contents)[0], ((uint8_t *)dst.contents)[1]);
+	for (int sync = 0; sync < 2; sync++) {
+		cb = [q commandBuffer];
+		be = [cb blitCommandEncoder];
+		[be fillBuffer:b range:NSMakeRange(256, 256) value:(uint8_t)(0x77 + sync)];
+		if (sync)
+			[be synchronizeResource:b];
+		[be endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		printf("%s gpuFill synchronize=%d memory=0x%02x\n", tag, sync, p[256]);
+	}
+}
+
 // nocopy.ro.KIND.MODE: a no-copy buffer over 4 pages the process maps read-only, anonymous
 // memory (`anon`, written, then mprotect'd) or a file mapped shared and read-only (`file`): the
 // buffer; a blit read of it; a blit fill and a kernel's store into it, each command buffer's
@@ -1437,6 +1479,8 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_nocopy_ro(d, c, 1, MTLResourceStorageModeShared);
 	else if (!strcmp(c, "nocopy.ro.file.managed"))
 		case_nocopy_ro(d, c, 1, MTLResourceStorageModeManaged);
+	else if (!strcmp(c, "nocopy.copies"))
+		case_nocopy_copies(d, c);
 	else if (!strncmp(c, "linalign.", 9)) {
 		const unsigned long f = strtoul(c + 9, NULL, 10);
 		const NSUInteger a = [d minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)f];
