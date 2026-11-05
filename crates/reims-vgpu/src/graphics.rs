@@ -718,7 +718,10 @@ impl<P: Platform> Presented<P> {
     /// The device's reset: the display shows the scanout, which the reset keeps, in place of any
     /// surface, whose texture is let go of in a refusal scope, with every colour stage off; the
     /// answers still owed are given as they come, and dropped, as each is of a present taken
-    /// before the reset.
+    /// before the reset. The scanout is the guest's own pixels, still in the region, but the
+    /// colour is what the transactions of a display pipe the reset ended set: kept, a reset in the
+    /// middle of a fade would leave the window black, with no transaction left to undo it. The
+    /// guest's next transaction that sets a stage sets it again.
     fn reset(&self) {
         {
             let mut color = self.color.lock();

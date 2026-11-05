@@ -1285,13 +1285,15 @@ with no surface that sets a colour as a present that keeps the surface shown
 it, at the refresh that shows the colour, as a surface's present does. The host
 stages the parts on the presents' lane and the present it accepts next applies
 them, with the frame it shows; each stage keeps its table until a transaction
-sets it again, and the device's reset turns them all off. While any stage is
-on, the window draws the display through them
-(`crates/reims-vgpu/src/graphics/color.rs`, `sink.rs`), each table interpolated
-linearly between its entries (how a Mac's display engine samples between them
-is not measured). Selectors 10 and 11 (the pipe's linearization before the
-matrix and its gamma after it, in IOPresentment's configuration format), 12 (a
-surface copy) and 13 (triage) stay refused: no WindowServer seen calls them.
+sets it again, and the device's reset turns them all off, though it keeps the
+scanout: kept, a reset in the middle of a fade would leave the window black,
+with no transaction left to undo it. While any stage is on, the window draws
+the display through them (`crates/reims-vgpu/src/graphics/color.rs`,
+`sink.rs`), each table interpolated linearly between its entries (how a Mac's
+display engine samples between them is not measured). Selectors 10 and 11 (the
+pipe's linearization before the matrix and its gamma after it, in
+IOPresentment's configuration format), 12 (a surface copy) and 13 (triage) stay
+refused: no WindowServer seen calls them.
 
 **The display pipe's notification words.** The kext answers a pipe client with
 asynchronous results whose words IOAccelerator's notification callbacks read

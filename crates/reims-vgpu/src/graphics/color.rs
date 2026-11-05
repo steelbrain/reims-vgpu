@@ -3,7 +3,9 @@
 //! [`RgfxDisplayColor`]). Four stages apply in order, after the surface's own colour: plane 0's
 //! gamma table, the pipe's gamma table before its colour matrix, the colour matrix, and the gamma
 //! table after it. Each is off (it passes its input through) until a transaction sets it, and keeps
-//! its table until one sets it again, as a display engine keeps its LUTs across flips.
+//! its table until one sets it again, as a display engine keeps its LUTs across flips. The
+//! device's reset turns every stage off, though it keeps the scanout (`Presented::reset` says
+//! why).
 //!
 //! **Staging.** The kext posts a transaction's stages as `DISPLAY_COLOR` parts on the presents'
 //! lane, then the transaction's present. [`ColorStaging`] puts each stage's parts together, in
