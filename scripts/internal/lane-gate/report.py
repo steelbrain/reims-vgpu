@@ -294,6 +294,13 @@ class Run:
             elif body.startswith("GATE info video-offer "):
                 m2 = re.match(r"GATE info video-offer hevc=(\d)", body)
                 self.video_offer = {"hevc": m2 is not None and m2.group(1) == "1"}
+            elif body.startswith("GATE info boot-crashes "):
+                # The crash reports written during boot and login (guest-run.sh's run_info): listed,
+                # not judged, since the desktop-up baseline of guest.crash-reports already holds them.
+                boot = body[len("GATE info boot-crashes "):].split()
+                boot = [] if boot == ["none"] else boot
+                self.litem("guest.boot-crash-reports", "INFO",
+                           f"{len(boot)} written during boot and login" + (": " + " ".join(boot) if boot else ""))
             elif body.startswith("GATE crashes "):
                 crashes = body[len("GATE crashes "):].strip()
             elif body.startswith("GATE crash "):

@@ -44,6 +44,16 @@ wspid() { pgrep -x WindowServer | head -1; }
 
 run_info() {
 	reports > "$D/reports-before.txt"
+	# The crash reports written since the guest booted, during boot and login: reports-before.txt,
+	# taken once the desktop is up, already holds them, so "GATE crashes" never shows them. Listed
+	# for the report (an INFO item), not judged.
+	local bt f boot_new=
+	bt=$(sysctl -n kern.boottime | sed 's/.* sec = \([0-9]*\),.*/\1/')
+	for f in /Library/Logs/DiagnosticReports/* "$HOME"/Library/Logs/DiagnosticReports/*; do
+		case $f in *.ips|*.panic) ;; *) continue ;; esac
+		[[ -f $f ]] && (( $(stat -f %m "$f") >= bt )) && boot_new+="${f##*/} "
+	done
+	echo "GATE info boot-crashes ${boot_new:-none}"
 	wspid > "$D/ws-pid.txt"
 	echo "GATE info os $(sw_vers -productVersion) $(sw_vers -buildVersion)"
 	local csr; csr=$(csrutil status 2>&1)
