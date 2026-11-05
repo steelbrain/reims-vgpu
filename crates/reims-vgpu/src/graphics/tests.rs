@@ -3027,6 +3027,101 @@ fn a_held_walk_answered_its_submitted_holds_only_its_process_s_later_commits() {
     );
 }
 
+/// Two processes that share a surface stay in the order of IOSurface accesses with no wait for
+/// each other's commits (`decode`'s `sequencer`, `surface_order`): process 1's buffer that writes
+/// a surface, answered its `CB_SUBMITTED` and held in its walk, and process 2's buffer that reads
+/// the surface after it, naming it in its `SURFACE_ORDER` as the bundle does. The reader is
+/// committed with the writer still walking, and waits on the GPU for the writer's queue's surface
+/// timeline to reach the writer's seqno, the signal the writer's commit carries once its walk
+/// ends: the GPU runs the write first, as a Mac orders such accesses on the GPU alone
+/// (docs/graphics-kext/dgpu-oracle.md, Q16), though the reader reached the platform first. A write
+/// after another process's answered read is the same to the host: the bundle names the reader's
+/// queue and seqno from the surface's reader slots, and the host waits for a named buffer
+/// whichever slot named it
+#[test]
+fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
+        RgfxSurfaceOrderWait,
+    };
+
+    const WAIT: &str = "encodeWaitForEvent:value:";
+    const SIGNAL: &str = "encodeSignalEvent:value:";
+    let at = |mut message: Vec<u8>, seqno: u64| {
+        message[8..16].copy_from_slice(&seqno.to_le_bytes());
+        message
+    };
+    let events = |calls: &[reims_vgpu_core::testkit::calllog::Call], sel: &str| {
+        (calls.iter())
+            .filter(|c| c.sel == sel)
+            .map(|c| (c.args[0].as_obj(), c.args[1].as_u64()))
+            .collect::<Vec<_>>()
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut writer, _, mut reader]) = two_processes(&raised);
+    let gate = WalkGate::on(&device);
+    // Process 1's writer, at seqno 1: it holds the order (it writes a shared surface) and asks
+    // for its submission; it stops at the gate.
+    let write = command_buffer_of(
+        obj(1, 1),
+        100,
+        &[
+            (RGFX_OP_SURFACE_ORDER, &[]),
+            (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            (RGFX_OP_ENCODER_END, &[]),
+        ],
+    );
+    writer.send(&device, at(with_ask(write), 1));
+    assert!(gate.reached(), "the writer's walk did not start");
+    assert_eq!(
+        ring_events(&platform, &mut writer, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
+    );
+
+    // Process 2's reader names the writer's queue at its seqno: committed and completed with the
+    // writer's walk held, its commit carrying the GPU wait.
+    let mark = platform.call_log().mark();
+    let wait = RgfxSurfaceOrderWait {
+        queue_obj_id: obj(1, 1),
+        seqno: 1,
+    };
+    let read = command_buffer_of(
+        obj(2, 1),
+        200,
+        &[
+            (RGFX_OP_SURFACE_ORDER, wait.as_bytes()),
+            (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            (RGFX_OP_ENCODER_END, &[]),
+        ],
+    );
+    reader.send(&device, at(read, 1));
+    assert_eq!(
+        ring_events(&platform, &mut reader, 1),
+        [(RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK))],
+        "the reader waited for the writer's commit"
+    );
+    let waits = events(&platform.call_log().since(mark), WAIT);
+    assert_eq!(
+        waits.len(),
+        1,
+        "the reader does not wait for the writer: {waits:?}"
+    );
+    assert_eq!(waits[0].1, Some(1), "the reader waits for another seqno");
+
+    // The writer's commit signals that timeline to that value.
+    let mark = platform.call_log().mark();
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut writer, 1),
+        [(RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK))]
+    );
+    let signals = events(&platform.call_log().since(mark), SIGNAL);
+    assert!(
+        signals.contains(&waits[0]),
+        "the writer does not signal what the reader waits for: {signals:?} against {waits:?}"
+    );
+}
+
 /// A command buffer with the ops `ops`, each a tag and its body, on queue `queue_obj_id`.
 fn command_buffer_of(queue_obj_id: u64, cb_obj_id: u64, ops: &[(u16, &[u8])]) -> Vec<u8> {
     use reims_graphics::ops::RgfxOpHeader;
