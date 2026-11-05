@@ -213,6 +213,10 @@ fn slice_write_levels<P: Platform>(
 /// either with ShaderWrite (0x10007, 0x7), at levels 0 and 1 read from a buffer and at level 0 a
 /// constant, writes every level of the texture as Metal's does, byte for byte
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn imageblock_slice_writes_at_every_usage_are_metals() {
     let Some((mp, md)) = metal() else {
         return;

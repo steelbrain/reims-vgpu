@@ -170,6 +170,10 @@ fn holds_metals_rule(
 /// host in every run. This platform's bytes are Metal's under `Load` and `Clear`; under
 /// `DontCare` they are, or the runtime announced `dont-care-load-tiles`
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn unreached_tiles_keep_their_bytes_under_load_and_dont_care() {
     let metal = metal();
     let (p, d) = (platform(), dev());

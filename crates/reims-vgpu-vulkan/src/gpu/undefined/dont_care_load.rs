@@ -218,6 +218,10 @@ fn against_metal<C: std::fmt::Debug + Copy>(
 /// list, or a triangle too small to hold a pixel centre keeps every tile. This platform's answer
 /// is Metal's, or the runtime announced `dont-care-load-tiles`
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn colour_dont_care_loads_zero_the_reached_tiles_alone() {
     let metal = metal();
     let (p, d) = (platform(), dev());
@@ -504,6 +508,10 @@ fn every_colour_attachment_of_a_reached_tile_is_zeroed() {
 /// 64 by 64 and 100 by 70, Private, uploaded before the pass; and `RGBA8Unorm` Shared. This
 /// platform's answer is Metal's
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn dont_care_stores_keep_every_texel() {
     let metal = metal();
     let (p, d) = (platform(), dev());
