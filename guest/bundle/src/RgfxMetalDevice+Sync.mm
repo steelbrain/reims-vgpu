@@ -47,25 +47,21 @@
 }
 
 // The creators with options (measured: _MTLDevice's on macOS 27's x86-64 slice, `@24@0:8q16`
-// each). What the options ask for no header states; on the M3 Max, options 0, 1 and 2 each answer
-// an event of the class the form without options answers. So options 0 answers that form's event,
-// and any other is refused, logged, rather than answered by an event that ignores it.
+// each). What the options ask for no header states; the AMD 5300M and the Intel 630 answer an
+// event of the form without options for every options value, and a shared event for options 0
+// and 1, nil for any other (RgfxEvent.h, RgfxSharedEvent.h).
 - (id<MTLEvent>)newEventWithOptions:(NSInteger)options
 {
-	if (options != 0) {
-		RGFX_UNSUPPORTED("events with options");
-		return nil;
-	}
-	return [self newEvent];
+	return [RgfxEvent eventWithOptions:options device:self serializer:[self serializer]];
 }
 
 - (id<MTLSharedEvent>)newSharedEventWithOptions:(NSInteger)options
 {
-	if (options != 0) {
-		RGFX_UNSUPPORTED("shared events with options");
-		return nil;
-	}
-	return [self newSharedEvent];
+	RgfxSharedEvent *event = [RgfxSharedEvent sharedEventWithOptions:options
+	                                                          device:self
+	                                                      serializer:[self serializer]];
+	[event rgfxRegisterWithReplyReader:[self replyReader]];
+	return event;
 }
 
 // A shared event over a Mach port (measured: _MTLDevice's, `@20@0:8I16`): as one from another

@@ -48,6 +48,14 @@ NS_ASSUME_NONNULL_BEGIN
                                              device:(nullable id<MTLDevice>)device
                                          serializer:(nullable RgfxSerializer *)serializer;
 
+/// The shared event the device's `newSharedEventWithOptions:` (SPI) answers: one of the form
+/// without options for options 0 and 1, and nil for any other, as the AMD 5300M and the Intel 630
+/// answer (measured under macOS 26.7.1, oracle_bundle events: options 2, 3, 4, 8 and 16 nil).
+/// What the options mean no header states.
++ (nullable instancetype)sharedEventWithOptions:(NSInteger)options
+                                         device:(nullable id<MTLDevice>)device
+                                     serializer:(nullable RgfxSerializer *)serializer;
+
 /// Registers with `reader` for the host's RGFX_EVT_EVENT_SIGNALLED for this event's
 /// obj_id: each one raises the value and fires the notifyListener blocks it reached.
 /// The listener is removed on dealloc. The Sync device slice calls this after the create; a unit

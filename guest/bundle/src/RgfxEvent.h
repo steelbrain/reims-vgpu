@@ -42,6 +42,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// The host finished a command buffer that signalled the event to `value`.
 - (void)rgfxNoteSignalled:(uint64_t)value;
 
+/// The event the device's `newEventWithOptions:` (SPI) answers: one of the form without options,
+/// whatever `options` is, as the AMD 5300M and the Intel 630 answer for options 0 to 16 (measured
+/// under macOS 26.7.1, oracle_bundle events: the class newEvent answers, every time).
++ (nullable instancetype)eventWithOptions:(NSInteger)options
+                                   device:(nullable id<MTLDevice>)device
+                               serializer:(nullable RgfxSerializer *)serializer;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -666,6 +666,21 @@ void test_event_routing()
 
 	// A null route declines the create (an event must reach the host).
 	CHECK([RgfxEvent eventWithDevice:nil serializer:nullptr] == nil);
+
+	// The creators with options (SPI) answer as the x86 Macs' do: an event for any options, a
+	// shared event for options 0 and 1 and nil, with nothing sent, for any other.
+	for (NSInteger options : {0, 1, 2, 3, 16}) {
+		RgfxEvent *withOptions = [RgfxEvent eventWithOptions:options device:nil serializer:&fx.ser];
+		CHECK(withOptions != nil);
+		expectMessage<RgfxObjectCreate>(fx.ring, RGFX_CMD_EVENT_CREATE);
+	}
+	for (NSInteger options : {0, 1}) {
+		CHECK([RgfxSharedEvent sharedEventWithOptions:options device:nil serializer:&fx.ser] != nil);
+		expectMessage<RgfxSharedEventCreate>(fx.ring, RGFX_CMD_SHARED_EVENT_CREATE);
+	}
+	for (NSInteger options : {2, 3, 4, 8, 16})
+		CHECK([RgfxSharedEvent sharedEventWithOptions:options device:nil serializer:&fx.ser] == nil);
+	CHECK(!fx.ring.next(&extra, &extraBytes));
 }
 
 // A fence wrapper's create routes one RGFX_CMD_FENCE_CREATE, same shape as an

@@ -19,6 +19,14 @@
 	[self rgfxRetireThen:nullptr];
 }
 
++ (instancetype)eventWithOptions:(NSInteger)options
+                         device:(id<MTLDevice>)device
+                     serializer:(RgfxSerializer *)serializer
+{
+	(void)options;
+	return [self eventWithDevice:device serializer:serializer];
+}
+
 + (instancetype)eventWithDevice:(id<MTLDevice>)device serializer:(RgfxSerializer *)serializer
 {
 	if (serializer == nullptr) {

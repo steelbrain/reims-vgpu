@@ -42,6 +42,15 @@ RGFX_LOG_UNRECOGNIZED
 	uint64_t _traceId; // globalTraceObjectID
 }
 
++ (instancetype)sharedEventWithOptions:(NSInteger)options
+                               device:(id<MTLDevice>)device
+                           serializer:(RgfxSerializer *)serializer
+{
+	if (options != 0 && options != 1)
+		return nil;
+	return [self sharedEventWithInitialValue:0 device:device serializer:serializer];
+}
+
 + (instancetype)sharedEventWithInitialValue:(uint64_t)initialValue
                                      device:(id<MTLDevice>)device
                                  serializer:(RgfxSerializer *)serializer
