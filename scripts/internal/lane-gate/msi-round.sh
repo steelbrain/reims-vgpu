@@ -80,6 +80,7 @@ for p in $TAKE; do
 done
 if [[ -n ${AFTER_B64:-} ]]; then
   after=$(printf '%s' "$AFTER_B64" | base64 -d)
+  after=${after//\{DIR\}/$RD}  # {DIR}: the round's directory, as in a --qemu-hook
   echo "after the boot: $after"
   ( eval "$after" ) > "$RD/after.txt" 2>&1
   echo "after the boot: exit $? (its output: $RD/after.txt)"

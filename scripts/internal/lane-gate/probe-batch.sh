@@ -27,7 +27,7 @@
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
 #                  [--host-log FILTER] [--stage NAME=DIR[@TIP]]... [--ram GIB] [--after CMD]
 #                  [--image PATH] [--rom PATH] [--gfx-b64 B64] [--qemu-env K=V]... [--no-metal-check]
-#                  [--stage-local NAME=DIR[@TIP]]... [--appload] [--kring-s S]
+#                  [--stage-local NAME=DIR[@TIP]]... [--appload] [--kring-s S] [--bin FILE]...
 #
 # The round runs as a potluck job on the lane host (lane-gate/msi-round.sh), holding the 5080 and the
 # whole host (--exclusive; potluck's lease is the lock), dispatched from a throwaway commit of the
@@ -39,7 +39,8 @@
 # round's commit carries (lg/probes/NAME; a binary of our own built for the round goes in DIR; a
 # file DIR/.base naming a probe directory on the lane host lays DIR's files over that one's, and
 # DIR/.extra's "SOURCE RELATIVE-PATH" lines copy more of the lane host's files in);
-# --kring-s S takes the kext's lines from the guest's kernel ring every S seconds (default 5) in a
+# --bin FILE adds FILE (a lane's host script on this machine) to the round's host scripts, so a hook
+# or --after can run it as {DIR}/bin/NAME; --kring-s S takes the kext's lines from the guest's kernel ring every S seconds (default 5) in a
 # captured round; --appload runs the gate's app load (msi-appload.sh, every app and 7 Safari pages) once the
 # desktop is up, before the probes, which then run on that busy desktop (appload.txt in the
 # round's directory); --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page
@@ -84,7 +85,7 @@ L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
 cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() lstages=() ram=64 after=
-oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0 kring_s=
+oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0 kring_s= bins=()
 while (($#)); do
   a=$1
   shift
@@ -108,6 +109,7 @@ while (($#)); do
     --stage-local) lstages+=("${1:?--stage-local NAME=DIR[@TIP]}"); shift ;;
     --appload) appload=1 ;;
     --kring-s) kring_s=${1:?--kring-s S}; shift ;;
+    --bin) bins+=("${1:?--bin FILE}"); shift ;;
     --ram) ram=${1:?--ram GIB}; shift ;;
     --after) after=${1:?--after CMD}; shift ;;
     --image) oc_path=${1:?--image PATH}; shift ;;
@@ -262,6 +264,7 @@ run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1 || true)
 S=$(mktemp -d /tmp/lg-round.XXXXXX)
 mkdir -p "$S/lg/bin" "$S/lg/ship/payload"
 find "$L" -maxdepth 1 -type f -exec cp -p {} "$S/lg/bin/" \;
+for b in ${bins[@]+"${bins[@]}"}; do cp -p "$b" "$S/lg/bin/" || { echo "probe-batch: no $b" >&2; exit 2; }; done
 cp -p "$run/artifacts/payload/bench" "$S/lg/ship/payload/"
 for st_ in ${lstages[@]+"${lstages[@]}"}; do
   sn=${st_%%=*} sr=${st_#*=}
