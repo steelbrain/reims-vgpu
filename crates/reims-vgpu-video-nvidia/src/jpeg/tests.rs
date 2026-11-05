@@ -485,9 +485,18 @@ fn grey_writes_neutral_chroma_and_bgra_is_opaque() {
     );
 }
 
+/// nvJPEG's hardware decoder opens on the first NVIDIA GPU and decodes its trial image. libnvjpeg
+/// is a CUDA toolkit library, which the driver does not install: where it does not load, the
+/// backend has no JPEG engine (`open_backend`), and the test says so and checks nothing.
 #[test]
 #[ignore = "needs an NVIDIA GPU and libnvjpeg: run on the NVIDIA host"]
 fn the_hardware_decoder_opens_and_decodes_its_trial_image() {
+    if let Err(error) = Nvjpeg::get()
+        && error.symbol.is_none()
+    {
+        eprintln!("libnvjpeg does not load ({error}): skipped");
+        return;
+    }
     let gpu = match Gpu::open(&GpuSelector::First) {
         Ok(gpu) => Arc::new(gpu),
         Err(error) => unreachable!("an NVIDIA GPU: {error}"),
