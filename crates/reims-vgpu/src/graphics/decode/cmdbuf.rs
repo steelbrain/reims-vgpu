@@ -96,7 +96,6 @@ use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_core::platform::command::{
@@ -112,6 +111,7 @@ use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
     ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
+use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;

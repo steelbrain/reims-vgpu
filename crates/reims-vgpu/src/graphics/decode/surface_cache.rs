@@ -2939,7 +2939,9 @@ mod tests {
         // finishes.
         set_gen(&r, 1);
         (r.dec.surface_caches)
-            .finish(&r.device, 1, None, &writer, uses, &used, || writer.commit(ON))
+            .finish(&r.device, 1, None, &writer, uses, &used, || {
+                writer.commit(ON)
+            })
             .unwrap();
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst), "answered");
@@ -2961,7 +2963,9 @@ mod tests {
         let released = release(&r, BLOCK);
         set_gen(&r, 2);
         (r.dec.surface_caches)
-            .finish(&r.device, 1, None, &writer, uses, &used, || writer.commit(ON))
+            .finish(&r.device, 1, None, &writer, uses, &used, || {
+                writer.commit(ON)
+            })
             .unwrap();
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst), "answered");
