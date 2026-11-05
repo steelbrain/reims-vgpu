@@ -6395,6 +6395,7 @@ void test_managed_texture_reads_on_unified_memory()
 			desc.storageMode = MTLStorageModeManaged;
 			RgfxTexture *tex = [RgfxTexture managedTextureWithDescriptor:desc
 			                                                      region:&region
+			                                                       slabs:nullptr
 			                                                      device:(id<MTLDevice>)device
 			                                                  serializer:&fx.ser];
 			CHECK(tex != nil);
