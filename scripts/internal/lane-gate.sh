@@ -7,7 +7,7 @@
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
 #                                 [--no-appload] [--no-bench | --wait-bench] [--qemu-hook CMD]
 #                                 [--bench-host-log FILTER]
-#                                 [--publish | --probe-tip] [REV]
+#                                 [--publish | --probe-tip] [--keep-workspace] [--boot-only] [--priority N] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
@@ -64,6 +64,11 @@
 #   --probe-tip   publish REV's image and host build as --publish does, always, for probes tipped at
 #                 it (a fix's proof), without making it the lane's tip: published-last stays, so a
 #                 probe round's tip stays the lane's (probe-batch.sh --tip SHA runs a round on REV)
+#   --keep-workspace  keep the run's potluck workspace, worktree and branch at its end (a run built
+#                 with --skip boot, to boot later with --resume --boot-only)
+#   --boot-only   the correctness boot of a resumed run alone, in its kept workspace, taking no lock
+#                 (as a bench leg), so two runs' boots can be queued back to back
+#   --priority N  the potluck jobs' priority (default 3, a --landed car's 4)
 #
 # What it runs: the Mac builds the guest's side, and the lane host runs the rest as potluck jobs
 # (potluck's lease is the lock), dispatched from a throwaway commit of the run's own (do_ship):
@@ -109,14 +114,14 @@ die() { echo "lane-gate: $*" >&2; exit 2; }
 # One gate at a time: lockf holds $GH/lock for the run, and refuses at once when another holds it.
 # A bench leg (--bench-only) takes no lock: it waits its turn on the lane host beside later gates.
 mkdir -p "$GH/runs" "$GH/baselines"
-if [[ -z ${LANE_GATE_LOCKED:-} && " $* " != *" --bench-only "* ]]; then
+if [[ -z ${LANE_GATE_LOCKED:-} && " $* " != *" --bench-only "* && " $* " != *" --boot-only "* ]]; then
   export LANE_GATE_LOCKED=1
   exec lockf -t 0 "$GH/lock" "$0" "$@"
 fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0
+record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio=
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -142,6 +147,9 @@ while (($#)); do
     --bench-only) bench=only ;;  # the bench leg of a resumed run alone (what the detached leg runs)
     --publish) publish=1 ;;
     --probe-tip) publish=1 probe_tip=1 ;;
+    --keep-workspace) keep_ws=1 ;;
+    --boot-only) boot_only=1 ;;
+    --priority) prio=$2; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) die "unknown option $1" ;;
     *) rev=$1 ;;
@@ -421,7 +429,7 @@ SHIP_BRANCH=steelbrain/lane-gate-ship-$runid
 PL_NODE=${POTLUCK_MSI_NODE:-msi-laptop}
 PL_GPU=${POTLUCK_MSI_GPU:-5080}
 # A landed car's checks go ahead of other waiting jobs (a car's checks go first on msi).
-PL_PRIO=$( ((landed)) && echo 4 || echo 3)
+PL_PRIO=${prio:-$( ((landed)) && echo 4 || echo 3)}
 
 # pl_run NAME DISPATCH-OPTION...: dispatches a job from the run's worktree, waits for it with its
 # output, and leaves the job's id in RUN/job-NAME; its status is the job's exit.
@@ -699,6 +707,23 @@ if [[ $bench == only ]]; then
   exit 0
 fi
 
+# The correctness boot alone, of a run built before with --keep-workspace (--resume --boot-only).
+if ((boot_only)); then
+  say "lane-gate boot leg: ${sha:0:12}, run $runid"
+  [[ -s $RUN/workspace && -d $SHIP_WT ]] || die "run $runid has no workspace or no $SHIP_WT: its boot cannot run"
+  [[ -f $RUN/steps/msi-build.ok && ( -n $image || -f $RUN/steps/image.ok ) ]] || die "run $runid has no host build or image"
+  rm -f "$RUN/steps/boot.ok" "$RUN/steps/boot.fail"
+  grep -q -x boot "$RUN/ran" 2> /dev/null || echo boot >> "$RUN/ran"
+  step boot do_boot boot || true
+  set +e
+  report
+  verdict=$?
+  set -e
+  ((keep_ws)) || pl_cleanup
+  say "lane-gate boot leg: report $RUN/report.txt; $(( $(date +%s) - T0 )) s"
+  exit $verdict
+fi
+
 say "lane-gate: ${sha:0:12} ($subject), run $runid${BASE:+, baseline ${base_sha:0:12}}"
 # The Mac's checks take the Mac's GPU lock, which potluck's lease replaced: until they run as
 # potluck jobs, a gate leaves them out.
@@ -777,7 +802,7 @@ if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped b
       exec nohup "$0" "${again[@]}" "$sha" > "$RUN/bench.out" 2>&1 < /dev/null ) &
     say "lane-gate: the bench leg runs on detached; its output: $RUN/bench.out"
   fi
-else
+elif ((!keep_ws)); then
   pl_cleanup
 fi
 exit $verdict
