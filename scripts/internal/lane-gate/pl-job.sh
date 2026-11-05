@@ -8,8 +8,9 @@
 # holds the gate's host scripts (lg/bin/msi-launch.sh is the gate's VM launch, for a lane's own boot
 # script: LAUNCH=$PWD/lg/bin/msi-launch.sh), waits for it with its output, brings the workspace's
 # results/ back (--keep results) into LANE_GATE_HOME/pljobs/NAME/, and removes the workspace, the
-# worktree and the branch. DISPATCH-OPTIONs go to potluck dispatch as they are (--timeout is required; --exclusive
-# --gpu 5080 for a boot); --on node=msi-laptop is added. Exits with the job's exit.
+# worktree and the branch. DISPATCH-OPTIONs go to potluck dispatch as they are (--timeout is
+# required; --exclusive --gpu 5080 for a boot); --on node=msi-laptop is added. Exits with the job's
+# exit.
 set -uo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
