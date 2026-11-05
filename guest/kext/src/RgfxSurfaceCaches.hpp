@@ -19,7 +19,9 @@
 //     the kext, and the surface's memory wired, so the host's copy lands in pages that are
 //     still the surface's, past the holders' own wiring, which ends at their let-go: never
 //     pages the guest has purged, paged out or given to another; a block that is not cached
-//     lets its cache go with it (rgfxCacheLetGo, rgfxCacheReleased).
+//     lets its cache go with it (rgfxCacheLetGo, rgfxCacheReleased). A new block of the
+//     surface in place, of any mode, waits for the answer too before it is made
+//     (rgfxCacheNewBlockStep): nothing of it may use the pages before the host's copy.
 //   - The block's last holder letting go leaves it dormant (RgfxSurfaceBlocks.hpp), and the
 //     surface cached, its memory wired and its device cache held: its locks go on as before, a
 //     download among them, and its generation moves on. Its BLOCK_RELEASE, once the dormant
@@ -591,6 +593,49 @@ inline bool rgfxCacheReleasing(RgfxCacheTable &t, uint64_t offset)
 		return false;
 	c->releasing = true;
 	return true;
+}
+
+// Whether the pages of surface `object` (the IOSurface, opaque here) are still to take a
+// write-back: a cached block of it went, its BLOCK_RELEASE posted and not yet answered OK, and the
+// host copies its cache into the pages before it answers (rgfxCacheLetGo with `releasing`). A
+// block of it kept for good, or one whose attach a let-go left in flight (`forgotten`), posts no
+// release, and leaves none to take.
+inline bool rgfxCacheWritingBack(const RgfxCacheTable &t, const void *object)
+{
+	for (uint32_t i = 0; object != nullptr && i < t.count; i++) {
+		if (t.entries[i].object == object && t.entries[i].releasing)
+			return true;
+	}
+	return false;
+}
+
+// How long a new block of a surface whose pages are still to take a write-back
+// (rgfxCacheWritingBack) waits for it: as long as the kext waits for a BLOCK_RELEASE's answer
+// before it counts the release late (RgfxAcceleratorContexts.cpp's kReleaseAnswerMs). The host
+// answers once the buffers that used the cache have finished and its copy is done, which takes
+// seconds where those buffers wait behind other work on the host's GPU.
+constexpr uint64_t kRgfxWriteBackWaitMs = 10000;
+
+// What an ask that would make a new block in place of a surface does, `waitedMs` into its wait,
+// where the surface's pages are still to take a write-back (`writingBack`). Nothing of the new
+// block may come before that copy over the same pages: a cache filled from them before it reads
+// older bytes, and the GPU's writes to them in place, or a new cache's download, are overwritten
+// by it. So every such ask waits for it, cached, uncached or deferred.
+enum RgfxNewBlockStep : uint32_t {
+	// No write-back is pending: the block is made.
+	kRgfxNewBlockMake = 0,
+	// The ask waits for the release's answer.
+	kRgfxNewBlockWait,
+	// The release is late (kRgfxWriteBackWaitMs): the block is made all the same, logged, as a
+	// CPU lock goes on past its wait.
+	kRgfxNewBlockLate,
+};
+
+inline RgfxNewBlockStep rgfxCacheNewBlockStep(bool writingBack, uint64_t waitedMs)
+{
+	if (!writingBack)
+		return kRgfxNewBlockMake;
+	return waitedMs < kRgfxWriteBackWaitMs ? kRgfxNewBlockWait : kRgfxNewBlockLate;
 }
 
 // The let-go of the block at `offset`, which named surface `key`'s device cache: as

@@ -231,6 +231,10 @@ struct ReleaseStats {
 	UInt32 inFlightMost;
 	UInt64 roomWaits;
 	UInt64 roomWaitsFailed;
+	// The new surface blocks that waited for their surface's write-back, and the ones that went
+	// on with it still pending.
+	UInt64 writeBackWaits;
+	UInt64 writeBackLate;
 	UInt64 reapAskedAt;
 	UInt64 loggedCount;
 	UInt64 loggedAt;
@@ -1285,7 +1289,7 @@ void noteReleases()
 	const bool log = releaseStats.latency.count != releaseStats.loggedCount &&
 	                 now - releaseStats.loggedAt >= interval;
 	UInt64 count = 0, p50 = 0, p99 = 0, most = 0, reaps = 0, r50 = 0, r99 = 0, rmost = 0;
-	UInt64 kept = 0, late = 0, waits = 0, failed = 0;
+	UInt64 kept = 0, late = 0, waits = 0, failed = 0, writeBacks = 0, writeBacksLate = 0;
 	UInt32 inFlight = 0;
 	if (log) {
 		const ReleaseStats &s = releaseStats;
@@ -1302,6 +1306,8 @@ void noteReleases()
 		inFlight = s.inFlightMost;
 		waits = s.roomWaits;
 		failed = s.roomWaitsFailed;
+		writeBacks = s.writeBackWaits;
+		writeBacksLate = s.writeBackLate;
 		releaseStats.loggedCount = count;
 		releaseStats.loggedAt = now;
 	}
@@ -1309,9 +1315,10 @@ void noteReleases()
 	if (log)
 		IOLog("RgfxAccelerator: releases: %llu answered (%llu kept, %llu late), %u in flight at "
 		      "most; freed to answered p50 %llu us, p99 %llu us, max %llu us; dormant reaps %llu, "
-		      "waited p50 %llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none)\n",
+		      "waited p50 %llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none); "
+		      "write-back waits %llu (%llu late)\n",
 		      count, kept, late, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps,
-		      r50 / 1000, r99 / 1000, rmost / 1000, waits, failed);
+		      r50 / 1000, r99 / 1000, rmost / 1000, waits, failed, writeBacks, writeBacksLate);
 }
 
 // The most WindowServer's blocks came to at the last line of noteReserve. Under contextLock.
@@ -1464,18 +1471,20 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			table = {made, kMaxSurfaceBlocks};
 		}
 	}
-	// The asker's IOSurface, where a block of it may be deferred (RgfxSurfaceBlocks.hpp): a
-	// deferred block of it is the ask's, found by it whatever the asker's pages, and a fresh one
-	// may be deferred, where cacheable and within the device's budget. Neither wires the asker's
-	// pages: the kext wires them only where neither holds. Released once the ask is done, but a
-	// new deferred entry's, which keeps it.
+	// The asker's IOSurface, where the device caches surfaces: a new block of it waits for its
+	// pages' write-back (rgfxSurfaceCacheWritingBack). Where a block of it may be deferred
+	// (RgfxSurfaceBlocks.hpp), a deferred block of it is the ask's, found by it whatever the
+	// asker's pages, and a fresh one may be deferred, where cacheable and within the device's
+	// budget. Neither wires the asker's pages: the kext wires them only where neither holds.
+	// Released once the ask is done, but a new deferred entry's, which keeps it.
 	struct SurfaceRef {
 		OSObject *object = nullptr;
 		~SurfaceRef() { OSSafeReleaseNULL(object); }
 	} asker;
 	bool defer = false, deferredFound = false;
-	if (inPlace && surfaceId && deferredBudget && table.entries) {
+	if (inPlace && surfaceId && (surfaceCache || deferredBudget) && table.entries)
 		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
+	if (asker.object && deferredBudget) {
 		int32_t d = -1;
 		while (asker.object && (d = rgfxSurfaceFindDeferred(table, asker.object)) >= 0 &&
 		       table.entries[d].pending)
@@ -1496,6 +1505,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	bool differs = false, revived = false, release = false, waitedForRoom = false;
 	// Until when a new block waits for the region's room, once dormant blocks went for it.
 	uint64_t roomDeadline = 0;
+	// When a new block began to wait for its surface's write-back, and whether it went on past
+	// its wait (rgfxCacheNewBlockStep).
+	uint64_t writeBackFrom = 0;
+	bool writeBackLate = false;
 	int32_t at = -1, slot = -1;
 	RgfxBlockPin pin = {};
 	UInt64 offset = 0, total = 0;
@@ -1561,6 +1574,33 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			}
 			if (at >= 0 || differs || !table.entries)
 				break;
+			// A new block in place of a surface whose previous block's release is unanswered
+			// waits for it: the host copies that block's cache into the pages first, before
+			// anything of this block may use them. Then the ask looks again, its surface fresh or
+			// not, found by its pages or not.
+			const RgfxNewBlockStep writeBack = rgfxCacheNewBlockStep(
+			    inPlace && !writeBackLate && rgfxSurfaceCacheWritingBack(asker.object),
+			    nanosSince(writeBackFrom, mach_absolute_time()) / 1000000);
+			if (writeBack == kRgfxNewBlockWait) {
+				if (!writeBackFrom) {
+					writeBackFrom = mach_absolute_time();
+					releaseStats.writeBackWaits++;
+				}
+				// Its release posted first, where this ask let its block go.
+				if (release)
+					thread_call_enter(releaseCall);
+				release = false;
+				uint64_t until = 0;
+				nanoseconds_to_absolutetime(kRgfxWriteBackWaitMs * 1000000ull, &until);
+				IOLockUnlock(contextLock);
+				rgfxSurfaceCacheAwaitWriteBack(asker.object, writeBackFrom + until);
+				IOLockLock(contextLock);
+				continue;
+			}
+			if (writeBack == kRgfxNewBlockLate) {
+				writeBackLate = true;
+				releaseStats.writeBackLate++;
+			}
 			// A new block in place holds the runs past the part the processes map, whole pages
 			// of them; a deferred one room for one run a page of the plane.
 			const UInt64 runBytes = sizeof(RgfxPageRun) * static_cast<UInt64>(count);
@@ -1731,6 +1771,11 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		return mapped;
 	}
 	IOLockUnlock(contextLock);
+	if (writeBackLate)
+		IOLog("RGFX: WARN: IOSurface %u's new block 0x%llx goes on after %llu ms with its previous "
+		      "block's release unanswered: the host's copy of that block's cache into the pages "
+		      "may land over this block's\n",
+		      surfaceId, offset, kRgfxWriteBackWaitMs);
 	// The device learns of the block before any process does; it is pinned until then, so no
 	// release overtakes the share. A block in place first hands the device its surface's pages,
 	// and goes as a share not posted goes where the device maps none of them: the process makes

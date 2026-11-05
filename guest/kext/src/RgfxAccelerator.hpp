@@ -118,11 +118,19 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 // mapped at `header`, which the kext keeps (and releases once the surface is cached no more) to
 // write its CPU generation at `genOffset`, 0 from here, and its clients at
 // kRgfxSurfaceClientsOffset, its count now from here (rgfxCacheNoteClients). The surface's
-// memory is wired until then. Where the surface's previous block is cached still, its release
-// unanswered, waits for the answer first, as a lock does. False, `header` the caller's and the
-// table as it was, where it cannot be.
+// memory is wired until then. Where the surface's previous block is cached still, a let-go's
+// attach of its pages in flight, waits for the answer first, as a lock does; a previous block's
+// release unanswered is the ask's to wait for (rgfxSurfaceCacheAwaitWriteBack), and goes on at
+// once. False, `header` the caller's and the table as it was, where it cannot be.
 bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
                          IOMemoryMap *header, UInt32 genOffset);
+// Whether the pages of IOSurface `surface` are still to take a write-back: a cached block of it
+// went, and the host copies its cache into them before it answers the block's release
+// (rgfxCacheWritingBack). Takes the locks' lock alone, which may be under the contexts' lock.
+bool rgfxSurfaceCacheWritingBack(OSObject *surface);
+// Waits, holding no lock of the kext's, until the pages of IOSurface `surface` took their
+// write-back, or until `deadline` (mach absolute time).
+void rgfxSurfaceCacheAwaitWriteBack(OSObject *surface, uint64_t deadline);
 // The cached block at `offset` was held again by a process, which holds its surface: the
 // surface's clients written into the block's header anew (rgfxCacheNoteClients). Takes the
 // locks' lock alone.

@@ -512,8 +512,11 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	IOLockLock(state.lock);
-	// As rgfxSurfaceCacheAdd: the surface's previous block's release is answered first.
-	while (rgfxCacheFind(state.caches, key) && mach_absolute_time() < deadline)
+	// As rgfxSurfaceCacheAdd: the surface's previous block's attach in flight is answered first,
+	// and its release unanswered was the ask's to wait for.
+	for (const RgfxCachedSurface *previous;
+	     (previous = rgfxCacheFind(state.caches, key)) != nullptr && !previous->releasing &&
+	     mach_absolute_time() < deadline;)
 		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
 	const bool previous = rgfxCacheFind(state.caches, key) != nullptr;
 	RgfxCachedSurface *c = previous ? nullptr : rgfxCacheAdd(state.caches, key, offset, surfaceId);
@@ -734,9 +737,12 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	IOLockLock(state.lock);
 	// IOSurface gives a surface one device cache, so the surface's previous block may still be
-	// in the table, its release unanswered: the copy into the pages the answer waits for comes
-	// before this block's locks.
-	while (rgfxCacheFind(state.caches, key) && mach_absolute_time() < deadline)
+	// in the table: a let-go's attach of its pages in flight, whose answer lets it go, is waited
+	// for. One whose release is unanswered was the ask's to wait for, before it made this block
+	// (rgfxSurfaceCacheAwaitWriteBack): the release is late, and this block goes on uncached.
+	for (const RgfxCachedSurface *previous;
+	     (previous = rgfxCacheFind(state.caches, key)) != nullptr && !previous->releasing &&
+	     mach_absolute_time() < deadline;)
 		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
 	const char *why = nullptr;
 	RgfxCachedSurface *c = nullptr;
@@ -764,6 +770,28 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		unwireSurface(wire);
 	}
 	return c != nullptr;
+}
+
+bool rgfxSurfaceCacheWritingBack(OSObject *surface)
+{
+	if (!surface || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return false;
+	IOLockLock(state.lock);
+	const bool writing = rgfxCacheWritingBack(state.caches, surface);
+	IOLockUnlock(state.lock);
+	return writing;
+}
+
+void rgfxSurfaceCacheAwaitWriteBack(OSObject *surface, uint64_t deadline)
+{
+	if (!surface || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	// The release's answer takes the cached surface out and wakes the locks' sleepers
+	// (rgfxSurfaceCacheReleased).
+	IOLockLock(state.lock);
+	while (rgfxCacheWritingBack(state.caches, surface) && mach_absolute_time() < deadline)
+		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+	IOLockUnlock(state.lock);
 }
 
 void rgfxSurfaceCacheNoteClients(UInt64 offset)

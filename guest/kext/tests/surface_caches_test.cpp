@@ -19,7 +19,9 @@
 // go while an attach is in flight, has that attach keep the pages' wiring where it named them.
 // A naming not taken leaves the block deferred, so the lock, or the release, names it again,
 // backing off from 10 ms to 320 ms, a dozen times within a lock's 2 s wait. Another block of a
-// cached surface, a copy or one uncached, leaves the cached block's entry as it goes.
+// cached surface, a copy or one uncached, leaves the cached block's entry as it goes. A new block
+// in place of a surface whose pages are still to take a released block's write-back waits for it
+// until the release is late.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -629,6 +631,64 @@ void otherBlocks()
 	      "a block of a surface not cached lets its references go");
 }
 
+// A new block in place of a surface whose cached block went, its release unanswered, waits for
+// the host's copy of that block's cache into the pages, past a lock's 2 s, until the release is
+// late; then it goes on. A block kept for good, or one let go with its attach in flight, posts no
+// release and leaves nothing to wait for; nor does another surface's release.
+void writeBack()
+{
+	RgfxCachedSurface entries[3] = {};
+	RgfxCacheTable t = {entries, 0, 3};
+	uint64_t offset = 0, mark = 0;
+	int surfaceObject = 0, otherObject = 0;
+	void *map = nullptr, *wire = nullptr, *held = nullptr;
+	bool purgeable = false;
+
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->object = &surfaceObject;
+	check(!rgfxCacheWritingBack(t, &surfaceObject), "a held cached block: no write-back pending");
+	check(rgfxCacheSleep(t, kSurface, true, &purgeable) &&
+	          !rgfxCacheWritingBack(t, &surfaceObject),
+	      "nor a dormant one");
+	check(rgfxCacheNoteWrite(t, kSurface) &&
+	          !rgfxCacheBlockLetGo(t, kSurface, kBlock, true, &surfaceObject, &map, &wire, true),
+	      "the GPU wrote it, and its block goes, its release posted");
+	check(rgfxCacheWritingBack(t, &surfaceObject), "its pages are still to take the write-back");
+	check(!rgfxCacheWritingBack(t, &otherObject) && !rgfxCacheWritingBack(t, nullptr),
+	      "another surface's pages are not");
+	check(rgfxCacheNewBlockStep(true, 0) == kRgfxNewBlockWait, "a new block of it waits");
+	check(rgfxCacheNewBlockStep(true, 2000) == kRgfxNewBlockWait,
+	      "past a lock's 2 s, still: the release is answered once the buffers that used the cache "
+	      "finish");
+	check(rgfxCacheNewBlockStep(true, kRgfxWriteBackWaitMs - 1) == kRgfxNewBlockWait &&
+	          kRgfxWriteBackWaitMs == 10000,
+	      "until the release is late, as the kext counts it");
+	check(rgfxCacheNewBlockStep(true, kRgfxWriteBackWaitMs) == kRgfxNewBlockLate,
+	      "then it goes on, logged");
+	check(rgfxCacheNewBlockStep(false, 0) == kRgfxNewBlockMake &&
+	          rgfxCacheNewBlockStep(false, kRgfxWriteBackWaitMs) == kRgfxNewBlockMake,
+	      "with no write-back pending, it is made");
+	check(rgfxCacheReleased(t, kBlock, &map, &wire, &held) == kSurface &&
+	          !rgfxCacheWritingBack(t, &surfaceObject),
+	      "the release answered, the pages hold the cache: the new block is made");
+
+	// Kept for good: no release, nothing to wait for.
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->object = &surfaceObject;
+	check(rgfxCacheBlockLetGo(t, kSurface, kBlock, false, &surfaceObject, &map, &wire, true) &&
+	          !rgfxCacheWritingBack(t, &surfaceObject),
+	      "a block kept for good posts no release");
+	// Kept for good with an attach in flight: the attach lets it go, and posts no release.
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->object = &surfaceObject;
+	c->deferral = kRgfxCacheDeferred;
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach,
+	      "a lock names a deferred block's pages");
+	check(!rgfxCacheBlockLetGo(t, kSurface, kBlock, false, &surfaceObject, &map, &wire, true) &&
+	          c->forgotten && !rgfxCacheWritingBack(t, &surfaceObject),
+	      "its block kept for good meanwhile: nothing to wait for");
+}
+
 // A block whose ask names its pages after all (deferSurfaceBlock): each wiring taken is let go
 // once, by its cache or by the asker's hold, cached or not, whatever the naming's outcome.
 void askNaming()
@@ -769,6 +829,7 @@ int main()
 	attachRetry();
 	unanswered();
 	otherBlocks();
+	writeBack();
 	std::printf("surface_caches_test: OK (%d checks)\n", checks);
 	return 0;
 }
