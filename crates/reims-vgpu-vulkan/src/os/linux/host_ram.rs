@@ -263,6 +263,11 @@ mod tests {
     /// fill through each reaches the RAM. A device that takes views through dma-bufs is handed no
     /// RAM, and its buffers import their pages as before. Either way the bytes are the GPU's. The
     /// flag is the process's, which nextest runs this test alone in.
+    ///
+    /// The runtime's own thread imports the RAM's first chunk as the device is handed the RAM,
+    /// ahead of any object over it, and a buffer made before that import ends is bound in an
+    /// import of its own run, waiting for none (metal2vulkan's `host_ram.rs`, "No object waits
+    /// for a chunk"). So the test waits for the chunk's import before it makes the buffers.
     #[test]
     fn a_buffer_over_one_run_of_the_ram_is_bound_in_its_chunk() {
         let device = dev();
@@ -282,6 +287,15 @@ mod tests {
         };
         assert_ne!(start, libc::MAP_FAILED);
         let at = start.addr().to_u64();
+        let counts = || {
+            let c = device.raw.work_counts();
+            (
+                c.host_ram_chunks_imported,
+                c.chunk_bound_buffers_made,
+                c.run_bound_buffers_made,
+            )
+        };
+        let before = counts();
         let lease = lease_guest_memory(
             [GuestRamFile {
                 host: at,
@@ -292,16 +306,20 @@ mod tests {
             }],
             None,
         );
-        let counts = || {
-            let c = device.raw.work_counts();
-            (
-                c.host_ram_chunks_imported,
-                c.chunk_bound_buffers_made,
-                c.host_pointer_imports_made,
-                c.copied_heaps_made,
-            )
-        };
-        let before = counts();
+        if imports_need_files() {
+            // The RAM is one chunk (8 MiB): the runtime's thread is given 20 s to import it.
+            let imported = (0..4000).any(|_| {
+                let done = counts().0 > before.0;
+                if !done {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                done
+            });
+            assert!(
+                imported,
+                "the runtime's thread imported no chunk of the RAM"
+            );
+        }
         let over = |offset: u64, length: u64| {
             // SAFETY: pages of the test's RAM, mapped until after the buffer is dropped.
             let bytes =
@@ -312,10 +330,11 @@ mod tests {
         };
         let a = over(MIB, 2 * PAGE);
         let b = over(3 * MIB, PAGE);
-        let made = (counts().0 - before.0, counts().1 - before.1);
+        let now = counts();
+        let made = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
         match imports_need_files() {
-            true => assert_eq!(made, (1, 2), "bound in one chunk"),
-            false => assert_eq!(made, (0, 0), "no RAM handed"),
+            true => assert_eq!(made, (1, 2, 0), "bound in one chunk"),
+            false => assert_eq!(made, (0, 0, 0), "no RAM handed"),
         }
         let q = device.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
