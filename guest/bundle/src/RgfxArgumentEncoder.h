@@ -68,7 +68,9 @@ NS_ASSUME_NONNULL_BEGIN
                                  serializer:(nullable RgfxSerializer *)serializer;
 
 /// The encoder of the argument buffer `function` takes at `bufferIndex`, laid out as
-/// encoderOfArguments: lays out; nil where the function takes none there.
+/// encoderOfArguments: lays out; nil where the host answers none. Where the function's AIR
+/// declares a plain buffer there, an encoder of no arguments, 0 bytes long, and where it declares
+/// no buffer there, the end of the process with Metal's words, as both x86 Macs answer.
 + (nullable instancetype)encoderOfFunction:(RgfxFunction *)function
                                bufferIndex:(NSUInteger)bufferIndex
                                     region:(nullable RgfxRegion *)region

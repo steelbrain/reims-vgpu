@@ -2093,6 +2093,15 @@ void test_argument_encoders_of_bindings()
 	// A plain buffer's binding: none, and nothing asked.
 	CHECK([RgfxArgumentEncoder encoderOfBinding:plain region:&region device:nil serializer:&ser] == nil);
 	CHECK(asker.asked.size() == 1);
+	// The function's encoders at its plain buffers, 0 and 1: of no arguments, 0 bytes long, as
+	// both x86 Macs make (oracle_bundle argbuf.index.1), and nothing asked.
+	RgfxFunction *everyAccess = (RgfxFunction *)[lib newFunctionWithName:@"every_access"];
+	CHECK(everyAccess != nil && [everyAccess rgfxAirFunction] != nullptr);
+	for (NSUInteger index : {NSUInteger(0), NSUInteger(1)}) {
+		id<MTLArgumentEncoder> none = [everyAccess newArgumentEncoderWithBufferIndex:index];
+		CHECK(none != nil && none.encodedLength == 0 && none.alignment == 1);
+	}
+	CHECK(asker.asked.size() == 1);
 
 	// A binding the device did not answer: descriptors of its struct's members, by their indices.
 	id<MTLLibrary> metals = [metal newLibraryWithData:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{

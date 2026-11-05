@@ -1466,6 +1466,29 @@ static int dies_case(const char *name)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, one, NSMakeRange(0, 4), true);
 	if (std::strcmp(name, "function-array-empty") == 0)
 		(void)[RgfxFunctionArrayLibrary libraryOfFunctions:@[] device:nil error:nullptr];
+	// An encoder of tests/air_arguments.metal's every_access at buffer index 5, where it takes
+	// no buffer.
+	if (std::strcmp(name, "encoder-no-buffer") == 0) {
+		const char *path = getenv("RGFX_AIR_ARGUMENTS");
+		NSData *bytes = path != nullptr ? [NSData dataWithContentsOfFile:@(path)] : nil;
+		Fixture big(0x40000);
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+		                                         length:bytes.length
+		                                            key:nullptr
+		                                         device:nil
+		                                     serializer:&big.ser
+		                                         status:&status];
+		[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			     (void)bytes;
+		     })
+		       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			       return nil;
+		       }];
+		RgfxFunction *fn = (RgfxFunction *)[lib newFunctionWithName:@"every_access"];
+		if ([fn rgfxAirFunction] != nullptr)
+			(void)[fn newArgumentEncoderWithBufferIndex:5];
+	}
 	}
 	return 0;
 }
@@ -1499,6 +1522,16 @@ void test_metal_ended_views_end_the_process()
 	              .c_str());
 	checkDies("view-cube-count",
 	          (kWhere + "newSliceRange.length(4) must be a multiple of (6).\n'").c_str());
+}
+
+// A function's encoder at a buffer index where its AIR declares no buffer ends the process with
+// Metal's words, before the host is asked, as on the AMD 5300M and the Intel 630 (oracle_bundle
+// argbuf.index.5).
+void test_function_encoder_of_no_buffer_ends_the_process()
+{
+	checkDies("encoder-no-buffer",
+	          "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:functionReflection:]: "
+	          "failed assertion `bufferIndex 5 does not identify an argument buffer'");
 }
 
 // A Memoryless indirect command buffer ends the process, before the host is asked, as on the AMD
@@ -13259,6 +13292,7 @@ int main(int argc, char **argv)
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
 		test_metal_ended_views_end_the_process();
+		test_function_encoder_of_no_buffer_ends_the_process();
 		test_texture_framebuffer_only();
 		test_texture_unknown_usage();
 		test_view_keeps_its_texture();

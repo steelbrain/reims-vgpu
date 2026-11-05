@@ -5,6 +5,7 @@
 #import "RgfxArgumentEncoder.h"
 
 #import "RgfxFunction.h"
+#import "RgfxMetalError.h"
 #import "RgfxUnsupported.h"
 
 #include <cstring>
@@ -92,6 +93,30 @@ RgfxFunction *notedFunction(id binding)
 {
 	std::lock_guard<std::mutex> hold(g_bindingsLock);
 	return g_bindings != nil ? [g_bindings objectForKey:binding] : nil;
+}
+
+/// What a function's AIR declares at a buffer index.
+enum class BufferAt { Unknown, None, Plain, ArgumentBuffer };
+
+/// What `function`'s AIR arguments declare at buffer index `index`: an argument buffer, a plain
+/// buffer, or no buffer; Unknown where its AIR was not read, or a buffer's index is an expression
+/// of function constants, which may land there.
+BufferAt bufferAt(RgfxFunction *function, NSUInteger index)
+{
+	std::shared_ptr<const RgfxAirFunction> air = [function rgfxAirFunction];
+	if (!air)
+		return BufferAt::Unknown;
+	BufferAt at = BufferAt::None;
+	for (const RgfxAirArgument &a : air->arguments) {
+		if (a.kind != RgfxAirKind::Buffer && a.kind != RgfxAirKind::IndirectBuffer)
+			continue;
+		if (a.anyIndex)
+			return BufferAt::Unknown;
+		if (index < a.index || index - a.index >= (a.count != 0 ? a.count : 1))
+			continue;
+		at = a.kind == RgfxAirKind::IndirectBuffer ? BufferAt::ArgumentBuffer : BufferAt::Plain;
+	}
+	return at;
 }
 
 } // namespace
@@ -190,6 +215,22 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
                            device:(id<MTLDevice>)device
                        serializer:(RgfxSerializer *)serializer
 {
+	// Where the function's AIR declares no buffer at the index, both x86 Macs end the process
+	// with these words, and where it declares a plain one, both make an encoder of no arguments,
+	// 0 bytes long (the AMD 5300M and the Intel 630 under macOS 26.7.1: oracle_bundle
+	// argbuf.index.5 and .1). Only an argument buffer's layout is the host's.
+	switch (bufferAt(function, bufferIndex)) {
+	case BufferAt::None:
+		RgfxMetalAssertionFailed(
+		    "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:functionReflection:]",
+		    [NSString stringWithFormat:@"bufferIndex %lu does not identify an argument buffer",
+		                               static_cast<unsigned long>(bufferIndex)]);
+	case BufferAt::Plain:
+		return [[self alloc] initWithLayout:nullptr device:device serializer:serializer];
+	case BufferAt::Unknown:
+	case BufferAt::ArgumentBuffer:
+		break;
+	}
 	if (region == nullptr || serializer == nullptr || bufferIndex > UINT32_MAX ||
 	    function.rgfxLibraryObjId == RGFX_OBJ_NONE) {
 		NSLog(@"RGFX: newArgumentEncoderWithBufferIndex:%lu: no encoder: no device region or "
