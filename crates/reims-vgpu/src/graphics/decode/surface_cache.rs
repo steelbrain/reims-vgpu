@@ -390,7 +390,7 @@ const FILL_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(10
 /// What is told as a fill finishes: the host's presents that wait for one ([`FillWait`]).
 pub(crate) type FillHook = Arc<dyn Fn() + Send + Sync>;
 
-/// How far the transfer queue's fills have finished: raised by each fill's completed handler,
+/// How far the transfer queue's fills have finished: raised as the platform sees each fill done,
 /// which wakes the threads waiting for one ([`Caches::wait_filled`]) and then tells the hook.
 struct Fills {
     /// The highest transfer value whose fill has finished.
@@ -800,7 +800,11 @@ impl<P: Platform> SurfaceCaches<P> {
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
         let fills = Arc::clone(&transfer.fills);
-        cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| fills.finished(value)))?;
+        // Told as the platform sees the fill done, with no handler thread woken between.
+        cb.add_completion_seen_handler(
+            ON,
+            Box::new(move |_: CompletedInfo| fills.finished(value)),
+        )?;
         cb.commit(ON)?;
         Ok(Some(value))
     }
@@ -1254,7 +1258,12 @@ impl<P: Platform> SurfaceCaches<P> {
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
         let fills = Arc::clone(&transfer.fills);
-        cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| fills.finished(value)))?;
+        // Told as the platform sees the fill done, with no handler thread woken between: the
+        // presents and decodes waiting for it go on then.
+        cb.add_completion_seen_handler(
+            ON,
+            Box::new(move |_: CompletedInfo| fills.finished(value)),
+        )?;
         cb.commit(ON)?;
         let length = cache.length;
         if let Some(cache) = self.by_block.get_mut(&block) {
@@ -1462,17 +1471,24 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let length = cache.length;
         let held = (cache.device.clone_ref(), view);
-        cb.add_completed_handler(
-            ON,
-            Box::new(move |_: CompletedInfo| {
-                // A copied cache's pages take the staging buffer's bytes, before `done`.
-                if let Some(staged) = staged {
+        match staged {
+            // A copied cache's pages take the staging buffer's bytes on the host's CPU, before
+            // `done`: a copy too long for the platform's thread that sees the completion.
+            Some(staged) => cb.add_completed_handler(
+                ON,
+                Box::new(move |_: CompletedInfo| {
                     staged.done(length);
-                }
-                drop(held);
-                done();
-            }),
-        )?;
+                    drop(held);
+                    done();
+                }),
+            )?,
+            // Else answered as the platform sees the copy done, with no handler thread woken
+            // between, as an early copy's landing is; the buffers go in the completed handler.
+            None => {
+                cb.add_completion_seen_handler(ON, Box::new(move |_: CompletedInfo| done()))?;
+                cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(held)))?;
+            }
+        }
         cb.commit(ON)?;
         let length = cache.length;
         if let Some(cache) = self.by_block.get_mut(&block) {
@@ -2047,7 +2063,7 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be done,
-    /// `timeout` at most, with no lock held, woken by the fill's completed handler: for work the
+    /// `timeout` at most, with no lock held, woken as the platform sees the fill done: for work the
     /// host starts outside a command buffer that writes the cache, which a command buffer's wait
     /// does not order. True where it is done, or the block has no cache or no fill.
     pub(crate) fn wait_filled(&self, block: u64, timeout: std::time::Duration) -> bool {
@@ -4458,6 +4474,45 @@ mod tests {
             copies(&r.p.call_log().since(mark)).len(),
             1,
             "in its finish"
+        );
+        assert!(!done.load(Ordering::SeqCst));
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// The handlers added to the command buffer of the `nth` commit in `calls`, in order.
+    fn handlers_of_commit(calls: &[Call], nth: usize) -> Vec<&'static str> {
+        let commit = (calls.iter())
+            .filter(|c| c.sel == "commit")
+            .nth(nth)
+            .unwrap();
+        (calls.iter())
+            .filter(|c| c.obj == commit.obj && c.seq < commit.seq)
+            .map(|c| c.sel)
+            .filter(|sel| ["addCompletionSeenHandler", "addCompletedHandler:"].contains(sel))
+            .collect()
+    }
+
+    /// A download's copy is answered, and a fill's waiters told, as the platform sees its
+    /// command buffer done, by a completion-seen handler, with no handler thread woken between
+    /// on a platform that has one; the completed handler only lets go of the copy's buffers
+    #[test]
+    fn a_copy_s_answer_goes_as_the_platform_sees_it_done() {
+        let mut r = cached();
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1, "a fill, then the writer");
+        assert_eq!(handlers_of_commit(&calls, 0), ["addCompletionSeenHandler"]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1);
+        assert_eq!(
+            handlers_of_commit(&calls, 0),
+            ["addCompletionSeenHandler", "addCompletedHandler:"]
         );
         assert!(!done.load(Ordering::SeqCst));
         r.p.world().complete_all(CompleteOn::Caller);

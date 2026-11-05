@@ -139,7 +139,9 @@ impl<P: Platform> Release<P> {
         match cb {
             Some(cb) => {
                 cb.encode_signal(Some(EventRef::Shared(&event)), value)?;
-                cb.add_completed_handler(
+                // Raised as the platform sees the signal's buffer done, with no handler thread
+                // woken between.
+                cb.add_completion_seen_handler(
                     ON,
                     Box::new(move |_: CompletedInfo| {
                         marks.done.fetch_max(value, Ordering::AcqRel);
