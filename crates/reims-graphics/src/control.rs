@@ -137,10 +137,28 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         RGFX_CMD_BLOCK_RELEASE => match read::<RgfxBlockRelease>(message) {
             // Whatever the answer, the block is no longer its process's to name.
             Some(release) => {
-                shared.region.revoke(release.offset);
+                let holders = shared.region.revoke(release.offset);
                 if shared.rings_in(release.offset, release.size) {
                     Some(complete(seqno, RGFX_STATUS_REFUSED))
                 } else {
+                    // Another holder of a shared block whose BLOCK_UNSHARE has not come is let go
+                    // of here as by it, so the release waits for that context's command buffers
+                    // too: the kext posts an unshare out of its lock, so another holder's last
+                    // let-go may post the block's release first, and gives the block's memory
+                    // back at this answer.
+                    for context in holders.into_iter().filter(|&c| c != release.context) {
+                        shared.host.block_unshared(&RgfxBlockGrant {
+                            header: RgfxMsgHeader {
+                                r#type: RGFX_CMD_BLOCK_UNSHARE,
+                                size: size_of::<RgfxBlockGrant>() as u32,
+                                seqno: 0,
+                            },
+                            context,
+                            offset: release.offset,
+                            size: release.size,
+                            ..RgfxBlockGrant::default()
+                        });
+                    }
                     shared
                         .host
                         .block_released(&release, shared.complete_answer(seqno, epoch));

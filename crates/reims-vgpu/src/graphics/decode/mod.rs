@@ -2989,7 +2989,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// `BLOCK_UNSHARE` by `context` of the shared block at `block`, which other contexts still
-    /// hold: the block's release is answered only once every command buffer the decoder began for
+    /// hold, or its hold's end at its close or at the block's release where its unshare had not
+    /// come: the block's release is answered only once every command buffer the decoder began for
     /// the context before this has finished as well ([`Self::after_unshares`]), since the kext
     /// gives the block's memory back at that answer. The drain is returned for the caller to drop
     /// with no lock held, as [`Self::drain_context`]'s is.

@@ -134,18 +134,22 @@ impl Region {
     }
 
     /// Context `context` no longer holds the shared block of `size` bytes at `offset`
-    /// (`BLOCK_UNSHARE`); its other holders keep it. Nothing where no such block is shared.
-    pub fn unshare(&self, context: u32, offset: u64, size: u64) {
+    /// (`BLOCK_UNSHARE`); its other holders keep it. Whether it held it: not where no such block
+    /// is shared, nor where the hold ended already, at the block's release or the context's
+    /// close, which the kext's unshare may come behind.
+    pub fn unshare(&self, context: u32, offset: u64, size: u64) -> bool {
         let mut blocks = self.blocks.lock();
-        if let Some(held) = blocks.get_mut(&offset)
-            && held.shared
-            && held.size == size
-        {
-            held.holders.retain(|&c| c != context);
-            if held.holders.is_empty() {
-                blocks.remove(&offset);
-            }
+        let Some(held) = blocks.get_mut(&offset) else {
+            return false;
+        };
+        if !held.shared || held.size != size || !held.holders.contains(&context) {
+            return false;
         }
+        held.holders.retain(|&c| c != context);
+        if held.holders.is_empty() {
+            blocks.remove(&offset);
+        }
+        true
     }
 
     /// Drops every block that meets the `size` bytes at `offset`.
@@ -155,18 +159,32 @@ impl Region {
     }
 
     /// The block at `offset` is no longer anyone's to name (`BLOCK_RELEASE`): its holder's, or
-    /// every holder's of a shared one.
-    pub fn revoke(&self, offset: u64) {
-        self.blocks.lock().remove(&offset);
+    /// every holder's of a shared one. The contexts that held it, none where no block lies there.
+    pub fn revoke(&self, offset: u64) -> Vec<u32> {
+        self.blocks
+            .lock()
+            .remove(&offset)
+            .map(|held| held.holders)
+            .unwrap_or_default()
     }
 
     /// No block is context `context`'s any more (`CONTEXT_CLOSE`): a block only it holds goes,
-    /// and a shared block's other holders keep it.
-    pub fn revoke_context(&self, context: u32) {
-        self.blocks.lock().retain(|_, held| {
+    /// and a shared block's other holders keep it. The shared blocks it held that others still
+    /// hold, each as its offset and size.
+    pub fn revoke_context(&self, context: u32) -> Vec<(u64, u64)> {
+        let mut kept = Vec::new();
+        self.blocks.lock().retain(|&at, held| {
+            let before = held.holders.len();
             held.holders.retain(|&c| c != context);
-            !held.holders.is_empty()
+            if held.holders.is_empty() {
+                return false;
+            }
+            if held.holders.len() != before {
+                kept.push((at, held.size));
+            }
+            true
         });
+        kept
     }
 
     /// No block is anyone's any more (the device's reset): the kext grants them again.
@@ -453,25 +471,28 @@ mod tests {
         assert!(!region.held_by(3, 0x1_0000, 0x10));
         assert!(!region.held_by(2, 0x1_1000, 0x1001));
         // One holder lets it go; the other keeps it.
-        region.unshare(1, 0x1_0000, 0x2000);
+        assert!(region.unshare(1, 0x1_0000, 0x2000));
         assert!(!region.held_by(1, 0x1_0000, 0x10));
         assert!(region.held_by(2, 0x1_0000, 0x10));
-        // An unshare of another size, or of a granted block, changes nothing.
+        // An unshare of another size, or of a granted block, or by a context no longer holding
+        // it, changes nothing.
         region.grant(4, 0x4_0000, 0x1000);
-        region.unshare(4, 0x4_0000, 0x1000);
-        region.unshare(2, 0x1_0000, 0x1000);
+        assert!(!region.unshare(4, 0x4_0000, 0x1000));
+        assert!(!region.unshare(2, 0x1_0000, 0x1000));
+        assert!(!region.unshare(1, 0x1_0000, 0x2000));
         assert!(region.held_by(4, 0x4_0000, 0x1000));
         assert!(region.held_by(2, 0x1_0000, 0x10));
         // A context's close ends its holds; the block goes with its last holder.
         region.share(3, 0x1_0000, 0x2000);
-        region.revoke_context(2);
+        assert_eq!(region.revoke_context(2), [(0x1_0000, 0x2000)]);
         assert!(!region.held_by(2, 0x1_0000, 0x10));
         assert!(region.held_by(3, 0x1_0000, 0x10));
         // Its release ends every hold.
         region.share(5, 0x1_0000, 0x2000);
-        region.revoke(0x1_0000);
+        assert_eq!(region.revoke(0x1_0000), [3, 5]);
         assert!(!region.held_by(3, 0x1_0000, 0x10));
         assert!(!region.held_by(5, 0x1_0000, 0x10));
+        assert_eq!(region.revoke(0x1_0000), [] as [u32; 0]);
         // A share over a granted block, or a grant over a shared one, takes the span.
         region.share(6, 0x4_0000, 0x1000);
         assert!(!region.held_by(4, 0x4_0000, 0x10));
@@ -486,6 +507,26 @@ mod tests {
         region.share(2, 0x8_0000, 0x2000);
         assert!(!region.held_by(1, 0x8_0000, 0x10));
         assert!(region.held_by(2, 0x8_1000, 0x1000));
+    }
+
+    /// A context's close names the shared blocks it held that others still hold, and only
+    /// those: not a block it alone held, which goes with it, nor one it never held.
+    #[test]
+    fn a_close_names_the_shared_blocks_its_context_leaves_to_others() {
+        let region = Region::new(1 << 20).unwrap();
+        region.share(1, 0x1_0000, 0x2000);
+        region.share(2, 0x1_0000, 0x2000);
+        region.share(1, 0x2_0000, 0x1000);
+        region.share(3, 0x3_0000, 0x1000);
+        region.share(2, 0x3_0000, 0x1000);
+        region.grant(1, 0x4_0000, 0x1000);
+        assert_eq!(region.revoke_context(1), [(0x1_0000, 0x2000)]);
+        assert!(!region.held_by(1, 0x2_0000, 0x10));
+        assert!(!region.held_by(1, 0x4_0000, 0x10));
+        assert!(region.held_by(2, 0x1_0000, 0x10));
+        assert_eq!(region.revoke_context(1), []);
+        assert_eq!(region.revoke_context(2), [(0x3_0000, 0x1000)]);
+        assert_eq!(region.revoke(0x1_0000), [] as [u32; 0]);
     }
 
     /// The process's peak resident size in bytes: `ru_maxrss` is in bytes on macOS and in KiB

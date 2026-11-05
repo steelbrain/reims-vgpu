@@ -821,8 +821,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// `BLOCK_RELEASE` (`Host::block_released`): refused at once where an object the decoder
     /// holds lies in the block, else answered once every command buffer of the block's context
-    /// the decoder committed has finished, every one an earlier holder's context committed
-    /// before its `BLOCK_UNSHARE` ([`Self::unshare_block`]), and once the display no longer shows
+    /// the decoder committed has finished, every one another holder's context committed before
+    /// its `BLOCK_UNSHARE`, its close, or the release where neither came first, which the device
+    /// hands on as an unshare ([`Self::unshare_block`]), and once the display no longer shows
     /// or draws a surface's texture over the block ([`DisplayHold`]).
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         // After the no-copy buffers being made over it, which keep it.

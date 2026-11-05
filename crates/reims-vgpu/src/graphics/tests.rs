@@ -4439,6 +4439,119 @@ fn a_shared_block_s_release_waits_for_an_earlier_holder_s_buffers() {
     assert_eq!(status, RGFX_STATUS_OK);
 }
 
+/// A shared block's release waits for the command buffer of a holder whose `BLOCK_UNSHARE` has not
+/// come, still in flight: the kext posts an unshare out of its lock, so another holder's last
+/// let-go may post the block's release first, and gives the block's memory back at the release's
+/// answer. The unshare that comes after the release holds back no later release at the offset.
+#[test]
+fn a_shared_block_s_release_waits_for_a_holder_whose_unshare_has_not_come() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    guest.send(&device, block_share(1, BLOCK, SIZE, true));
+    guest.send(&device, block_share(2, BLOCK, SIZE, true));
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    let held = committed(&platform, 1)[0];
+
+    guest.send(&device, block_release(2, BLOCK, SIZE));
+    let release = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "the release was answered with a buffer of a holder in flight whose unshare had not come"
+    );
+    let world = platform.world();
+    assert!(world.complete(
+        held,
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    assert_eq!(answer_of(&mut guest, release), RGFX_STATUS_OK);
+
+    // The holder's unshare comes now, with another buffer of its in flight: a later block at the
+    // offset, one context's alone, is released without waiting for it.
+    ring.send(&device, command_buffer(obj(1, 1), 101));
+    let later = committed(&platform, 1)[0];
+    guest.send(&device, block_share(1, BLOCK, SIZE, false));
+    guest.send(&device, block_share(2, BLOCK, SIZE, true));
+    let status = answered(&device, &mut guest, block_release(2, BLOCK, SIZE));
+    assert_eq!(
+        status, RGFX_STATUS_OK,
+        "the late unshare held back a later release at its offset"
+    );
+    assert!(world.complete(
+        later,
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+}
+
+/// A shared block's release by its other holder waits for the command buffer of a holder whose
+/// close is not yet answered, still in flight: the kext may let go of the closing context's wire
+/// of the block's pages before the close is answered (a close it took for refused), and gives the
+/// block's memory back at the release's answer.
+#[test]
+fn a_shared_block_s_release_waits_for_a_closing_holder_s_buffers() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    guest.send(&device, block_share(1, BLOCK, SIZE, true));
+    guest.send(&device, block_share(2, BLOCK, SIZE, true));
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    let held = committed(&platform, 1)[0];
+
+    guest.send(&device, context_close(1));
+    let close = guest.seqno;
+    guest.send(&device, block_release(2, BLOCK, SIZE));
+    let release = guest.seqno;
+    assert!(
+        quiet(&guest),
+        "the close or the release was answered with a buffer of the closing holder in flight"
+    );
+    let world = platform.world();
+    assert!(world.complete(
+        held,
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    let mut answers: Vec<(u64, u32)> = (0..2)
+        .map(|_| {
+            let bytes = next_event(&mut guest, RGFX_EVT_COMPLETE);
+            let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+            (complete.header.seqno, complete.status)
+        })
+        .collect();
+    answers.sort_unstable();
+    assert_eq!(
+        answers,
+        [(close, RGFX_STATUS_OK), (release, RGFX_STATUS_OK)]
+    );
+}
+
 /// A block a live queue's ring lies in is not released; once the queue is destroyed, it is
 #[test]
 fn a_queue_s_rings_keep_their_block() {

@@ -1511,9 +1511,13 @@ block: a buffer or heap over host memory, or a buffer, texture or heap placed
 in one, which keeps its parent's span after the parent's destroy. It also
 refuses one where a live queue's ring lies in the block. Otherwise it answers
 OK once every command buffer the context committed before the release has run
-its completion handler, and, for a shared block, every one each earlier holder
-committed before its `BLOCK_UNSHARE`: the kext unwired that holder's pages at
-its unshare, and gives the surface's memory back at the answer. It also waits
+its completion handler, and, for a shared block, every one each other holder
+committed before its `BLOCK_UNSHARE`, before its close, or before the release
+itself where neither came first: the kext unwired that holder's pages at its
+unshare, or at a close it took for refused, and gives the surface's memory back
+at the answer. The kext posts an unshare out of its lock, so another holder's
+release can come first, and the host then takes the release as that holder's
+unshare too; the unshare that follows is not counted again. It also waits
 while the host's display holds a surface's texture over the block, as a
 compositor holds the IOSurface it shows: from the surface's present until the
 display pipe's next present (or the device's reset), and each window draw of

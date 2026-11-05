@@ -302,10 +302,12 @@ pub trait Host: Send + Sync + 'static {
     /// `release.size`), in which no live queue's ring lies. The host gives `answer` from any
     /// thread: [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block, else
     /// [`RGFX_STATUS_OK`] once every command buffer of the context it had committed has finished,
-    /// and, of a shared block, every one each earlier holder had committed before its
-    /// `BLOCK_UNSHARE` ([`Host::block_unshared`]), and once the host's display no longer reads
-    /// a surface's texture over the block. The kext gives the block out again only on OK,
-    /// and the memory of a surface's block in place back to the guest's system. Called on the
+    /// and, of a shared block, every one each other holder had committed before its
+    /// `BLOCK_UNSHARE`, its close, or this release where neither came first, each of which the
+    /// device hands the host as an unshare first ([`Host::block_unshared`]), and once the host's
+    /// display no longer reads a surface's texture over the block. The kext gives the block out
+    /// again only on OK, and the memory of a surface's block in place back to the guest's
+    /// system. Called on the
     /// context's lane, in ring order, after the lanes of the other contexts that held the block,
     /// and the block's own lane, have carried out what they were handed before it.
     /// The default answers OK at once, for a host with no stage-3 decoder.
@@ -318,8 +320,12 @@ pub trait Host: Send + Sync + 'static {
     /// bytes at `unshare.offset`, which it no longer names, and the kext unwired the block's pages
     /// in its process. The command buffers of the context's the host had committed before this
     /// may still use the block: the host's answer to the block's `BLOCK_RELEASE`, by whichever
-    /// holder, waits for them too ([`Host::block_released`]). Called on the context's lane, in
-    /// ring order, once the region has ended the context's hold, and before the block's release.
+    /// holder, waits for them too ([`Host::block_released`]). Called once the region has ended
+    /// the context's hold, and before the block's release: on the context's lane, in ring order,
+    /// for its unshare and its close, and on the releasing context's lane for a holder whose
+    /// unshare comes after the release, once that holder's lane has carried out what it was
+    /// handed before the release. Never twice for one hold: an unshare that comes after the
+    /// release or the close is not handed on.
     /// The default does nothing, for a host with no stage-3 decoder.
     fn block_unshared(&self, unshare: &RgfxBlockGrant) {
         let _ = unshare;
@@ -1396,7 +1402,24 @@ impl Shared {
         if !ended.is_empty() {
             self.gate.every();
         }
-        self.region.revoke_context(context);
+        // A shared block it held with others is let go of as by its BLOCK_UNSHARE, so the
+        // block's release, by whichever holder is last, waits for the context's command buffers
+        // as well: the kext may let go of the context's wire of the block's pages before this
+        // close is answered (a close it took for refused), and the other holders' wires go at
+        // that release's answer.
+        for (offset, size) in self.region.revoke_context(context) {
+            self.host.block_unshared(&RgfxBlockGrant {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_BLOCK_UNSHARE,
+                    size: size_of::<RgfxBlockGrant>() as u32,
+                    seqno: 0,
+                },
+                context,
+                offset,
+                size,
+                ..RgfxBlockGrant::default()
+            });
+        }
         self.host.context_closed(context, answer);
         log::info!(target: "reims_graphics", "context {context} closed");
     }
@@ -1442,8 +1465,10 @@ impl Shared {
         }
         if holds {
             self.region.share(share.context, share.offset, share.size);
-        } else {
-            self.region.unshare(share.context, share.offset, share.size);
+        } else if self.region.unshare(share.context, share.offset, share.size) {
+            // Only where it ended a hold: one the block's release or the context's close ended
+            // first let the host wait for the context's buffers there already, and the block's
+            // offset may be another block's by now.
             self.host.block_unshared(share);
         }
     }

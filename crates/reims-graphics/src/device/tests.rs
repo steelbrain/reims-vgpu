@@ -1610,6 +1610,119 @@ fn a_shared_block_is_held_by_each_context_it_is_shared_with() {
     assert!(!rig.region().held_by(6, BLOCK, 0x1000));
 }
 
+/// A host that records the holds it is told end ([`Host::block_unshared`]), the releases and the
+/// closes, in order, each as its message type, context and offset (0 for a close).
+#[derive(Clone, Default)]
+struct HoldsHost {
+    seen: Arc<Mutex<Vec<(u32, u32, u64)>>>,
+}
+
+impl Host for HoldsHost {
+    fn raise_interrupt(&self, _vector: u32) {}
+    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+        false
+    }
+    fn context_closed(&self, context: u32, answer: CompleteAnswer) {
+        self.seen.lock().push((RGFX_CMD_CONTEXT_CLOSE, context, 0));
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        (self.seen.lock()).push((RGFX_CMD_BLOCK_RELEASE, release.context, release.offset));
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn block_unshared(&self, unshare: &RgfxBlockGrant) {
+        (self.seen.lock()).push((RGFX_CMD_BLOCK_UNSHARE, unshare.context, unshare.offset));
+    }
+}
+
+/// The host learns that each holder of a shared block let it go before the block's release, by
+/// whatever came first of its `BLOCK_UNSHARE`, its close and the release, so the release's answer
+/// waits for every holder's command buffers: the kext posts an unshare out of its lock, so another
+/// holder's release may overtake it, and may let go of a closing context's wire before the close
+/// is answered. Once only: an unshare behind the release or the close is not handed on.
+#[test]
+fn every_holder_s_end_is_told_before_its_shared_block_s_release() {
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x40_0000;
+    const OTHER: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x80_0000;
+    const ALONE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0xc0_0000;
+    let host = HoldsHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.start();
+    fn sync(rig: &mut Rig) {
+        let seqno = rig.send(context_close(99));
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+        rig.lanes_done();
+    }
+    for context in [5, 6] {
+        rig.send(block_message(
+            RGFX_CMD_BLOCK_SHARE,
+            context,
+            BLOCK,
+            0x2_0000,
+        ));
+    }
+    // 6's release overtakes 5's unshare.
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 6, BLOCK, 0x2_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.send(block_message(RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK, 0x2_0000));
+    sync(&mut rig);
+    assert_eq!(
+        std::mem::take(&mut *host.seen.lock()),
+        [
+            (RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK),
+            (RGFX_CMD_BLOCK_RELEASE, 6, BLOCK),
+            (RGFX_CMD_CONTEXT_CLOSE, 99, 0),
+        ],
+        "a holder's end after the release, or none before it"
+    );
+
+    // 7 closes holding a block 8 holds too, and one it alone holds; its unshare comes behind
+    // the close.
+    for context in [7, 8] {
+        rig.send(block_message(
+            RGFX_CMD_BLOCK_SHARE,
+            context,
+            OTHER,
+            0x1_0000,
+        ));
+    }
+    rig.send(block_message(RGFX_CMD_BLOCK_SHARE, 7, ALONE, 0x1_0000));
+    let seqno = rig.send(context_close(7));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.send(block_message(RGFX_CMD_BLOCK_UNSHARE, 7, OTHER, 0x1_0000));
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 8, OTHER, 0x1_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        std::mem::take(&mut *host.seen.lock()),
+        [
+            (RGFX_CMD_BLOCK_UNSHARE, 7, OTHER),
+            (RGFX_CMD_CONTEXT_CLOSE, 7, 0),
+            (RGFX_CMD_BLOCK_RELEASE, 8, OTHER),
+        ],
+        "a closed holder's end not told before the block's release, or told twice"
+    );
+
+    // An unshare in time is told once, and the release by the last holder after it tells none.
+    for context in [5, 6] {
+        rig.send(block_message(
+            RGFX_CMD_BLOCK_SHARE,
+            context,
+            BLOCK,
+            0x2_0000,
+        ));
+    }
+    rig.send(block_message(RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK, 0x2_0000));
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 6, BLOCK, 0x2_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        std::mem::take(&mut *host.seen.lock()),
+        [
+            (RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK),
+            (RGFX_CMD_BLOCK_RELEASE, 6, BLOCK),
+        ]
+    );
+}
+
 /// A `BLOCK_GRANT`, `BLOCK_SHARE`, `BLOCK_UNSHARE` or `BLOCK_RELEASE` (their layouts are one) of
 /// `type` for `context`'s block of `size` bytes at `offset`.
 fn block_message(r#type: u32, context: u32, offset: u64, size: u64) -> Vec<u8> {
