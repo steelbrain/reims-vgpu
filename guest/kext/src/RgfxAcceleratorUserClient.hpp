@@ -24,6 +24,7 @@
 #include <IOKit/IOUserClient.h>
 
 #include "RgfxAccelerator.hpp"
+#include "RgfxAskGate.hpp"
 #include "RgfxQueueLimits.hpp"
 
 class IOBufferMemoryDescriptor;
@@ -86,6 +87,21 @@ private:
 	IOReturn takeAnswersMethod(IOExternalMethodArguments *arguments);
 	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
+	// An ask the close must not overtake begins (RgfxAskGate.hpp): false where the context is not
+	// open or its close has begun, else `*ctx` is the context it asks for. endAsk ends one begun,
+	// waking the close where it was the last. Under no lock; each takes listLock.
+	bool beginAsk(UInt32 *ctx);
+	void endAsk();
+	// An ask begun, ended as it goes out of scope.
+	struct Ask {
+		RgfxAcceleratorUserClient *client;
+		bool begun;
+		~Ask()
+		{
+			if (begun)
+				client->endAsk();
+		}
+	};
 	// Makes the window at the context's open; closeWindow lets it go, every span in it with it,
 	// at the release, before the context's blocks go.
 	IOReturn openWindow();
@@ -107,11 +123,17 @@ private:
 	// The most bytes one kRgfxAccelMethodSurfaceWrites names: 1024 surfaces.
 	static const UInt64 kMaxSurfaceWritesBytes = (3 + 2 * 1024) * sizeof(UInt64);
 	// The context and the queues, changed under both locks: queueLock is held across what
-	// changes them (a context's open and release, a queue's create and destroy) and across a
-	// surface block's ask and a resource id chunk's, which a close must not overtake, each of
-	// which may wait for the device. listLock is held only to read or write these fields, so the
+	// changes them (a context's open and release, a queue's create and destroy), each of which
+	// may wait for the device. listLock is held only to read or write these fields, so the
 	// process's submits, its commits' surface writes and its completions' retires, which only read
 	// them, never wait behind another thread's wait for the device.
+	//
+	// The asks a close must not overtake (a surface's block, a pages block, a block, a chunk of
+	// resource ids, a queue, the scanout's grant) are counted under listLock (`asks`,
+	// RgfxAskGate.hpp) and run beside each other, under no lock of the client's but a queue's
+	// create, which takes queueLock among the queue creates and destroys for the queue list. The
+	// close waits for those in flight before it takes queueLock, and none begins after.
+	RgfxAskGate asks;
 	bool hasContext;
 	UInt32 context;
 	// The context's run of units of GPU addresses (RgfxContextSlots.hpp): its first unit and

@@ -63,6 +63,8 @@ struct RgfxSurfaceHold {
 	// The client's wired pages of the plane (a kernel memory descriptor, opaque here), which the
 	// caller unwires once the hold ends.
 	void *pages;
+	// The hold is new and its BLOCK_SHARE not yet posted (rgfxSurfaceSharing).
+	bool sharing;
 };
 
 // A plane's shared block, where `used`.
@@ -272,8 +274,32 @@ inline RgfxSurfaceHoldResult rgfxSurfaceHold(RgfxSurfaceEntry &e, const void *cl
 	}
 	if (e.holdCount == kRgfxSurfaceHolders)
 		return kRgfxSurfaceHoldFull;
-	e.holds[e.holdCount++] = {client, context, 1, pages};
+	e.holds[e.holdCount++] = {client, context, 1, pages, true};
 	return kRgfxSurfaceHoldNew;
+}
+
+// Whether `client`'s hold of the entry's block is new, its BLOCK_SHARE not yet posted: the
+// client's asks run beside each other (RgfxAskGate.hpp), and another of them waits for the share
+// before it holds the block again, so none returns a block the device does not yet let the
+// client's context name. A new block's maker posts its first share while the entry is pending,
+// which every other ask waits for anyway.
+inline bool rgfxSurfaceSharing(const RgfxSurfaceEntry &e, const void *client)
+{
+	for (uint32_t i = 0; i < e.holdCount; i++) {
+		if (e.holds[i].client == client)
+			return e.holds[i].sharing;
+	}
+	return false;
+}
+
+// `client`'s new hold of the entry's block had its BLOCK_SHARE posted: its other asks hold the
+// block again from here.
+inline void rgfxSurfaceShared(RgfxSurfaceEntry &e, const void *client)
+{
+	for (uint32_t i = 0; i < e.holdCount; i++) {
+		if (e.holds[i].client == client)
+			e.holds[i].sharing = false;
+	}
 }
 
 enum RgfxSurfaceLetGo {

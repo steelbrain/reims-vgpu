@@ -50,6 +50,7 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 		IOLog("RgfxAccelerator: WindowServer's client, whose blocks may take the reserve\n");
 	owner = nullptr;
 	ucType = type;
+	asks = {};
 	hasContext = false;
 	context = 0;
 	firstUnit = 0;

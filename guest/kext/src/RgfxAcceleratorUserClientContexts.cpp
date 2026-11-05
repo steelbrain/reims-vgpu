@@ -17,6 +17,7 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <kern/clock.h>
 #include <sys/proc.h>
 
 namespace {
@@ -42,6 +43,14 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (a->scalarOutputCount != 5 && !spanAsked)
 			return kIOReturnBadArgument;
 		IOLockLock(queueLock);
+		// None once the client's close has begun.
+		IOLockLock(listLock);
+		const bool closing = asks.closing;
+		IOLockUnlock(listLock);
+		if (closing) {
+			IOLockUnlock(queueLock);
+			return kIOReturnNotOpen;
+		}
 		if (!hasContext) {
 			// The window first: a context with no window is never opened.
 			UInt32 opened = 0, openedFirst = 0, openedUnits = 0;
@@ -87,21 +96,25 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodResourceIds: {
 		if (a->scalarOutputCount != 1)
 			return kIOReturnBadArgument;
-		// Under the queue lock, so a chunk is never taken for a context releaseContext has
-		// closed: no grant follows its CONTEXT_CLOSE, and no chunk outlives its freeIdChunks.
-		IOLockLock(queueLock);
+		// An ask, so a chunk is never taken for a context releaseContext has closed: no grant
+		// follows its CONTEXT_CLOSE, and no chunk outlives its freeIdChunks.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
 		UInt64 first = 0;
-		IOReturn r = hasContext ? owner->takeIdChunk(this, context, &first)
-		                        : kIOReturnBadArgument;
-		IOLockUnlock(queueLock);
+		IOReturn r = ask.begun ? owner->takeIdChunk(this, ctx, &first) : kIOReturnBadArgument;
 		out[0] = first;
 		return r;
 	}
 	case kRgfxAccelMethodAlloc: {
-		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1 || !hasContext)
+		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1)
+			return kIOReturnBadArgument;
+		// An ask, so no block is made for a context releaseContext has closed.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
+		if (!ask.begun)
 			return kIOReturnBadArgument;
 		UInt64 offset = 0;
-		IOReturn r = owner->allocBlock(this, context, in[0], in[1], &offset);
+		IOReturn r = owner->allocBlock(this, ctx, in[0], in[1], &offset);
 		out[0] = offset;
 		return r;
 	}
@@ -115,10 +128,14 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		// feature (rgfxQueueFlagsSent), whatever the process asked: the second output answers only
 		// what it asked for and was granted.
 		const bool flagged = a->scalarInputCount == 7;
-		if ((a->scalarInputCount != 6 && !flagged) || a->scalarOutputCount != (flagged ? 2u : 1u) ||
-		    !hasContext)
+		if ((a->scalarInputCount != 6 && !flagged) || a->scalarOutputCount != (flagged ? 2u : 1u))
 			return kIOReturnBadArgument;
 		if (flagged && in[6] > UINT32_MAX)
+			return kIOReturnBadArgument;
+		// An ask, so no queue is made or watched for a context releaseContext has closed.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
+		if (!ask.begun)
 			return kIOReturnBadArgument;
 		const uint64_t word = owner->featureWord();
 		const UInt32 granted = flagged ? rgfxQueueFlagsGranted(static_cast<uint32_t>(in[6]), word) : 0;
@@ -133,7 +150,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		// The queue's id is in the context's range, and each of its rings lies in one of the
 		// client's own blocks, so a process names nothing of another's. The blocks stay pinned
 		// until the device has answered the create, so neither is freed under it.
-		if ((open.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) != context)
+		if ((open.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx)
 			return kIOReturnBadArgument;
 		RgfxBlockPin pins[2];
 		if (!owner->pinRange(this, open.submit_offset,
@@ -150,6 +167,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			owner->unpinBlock(pins[0]);
 			owner->unpinBlock(pins[1]);
 		};
+		// Under the queue lock among the client's queue creates and destroys: the list's room is
+		// taken and filled under one hold, and a destroy of this id waits for the create.
 		IOLockLock(queueLock);
 		if (!rgfxQueueAdmitted(queueCount)) {
 			IOLockUnlock(queueLock);
@@ -196,13 +215,18 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodWaitCompletions:
 		return waitCompletionsMethod(a);
 	case kRgfxAccelMethodSurfaceScanout: {
-		if (a->scalarInputCount != 2 || a->scalarOutputCount != 5 || !hasContext)
+		if (a->scalarInputCount != 2 || a->scalarOutputCount != 5)
 			return kIOReturnBadArgument;
 		// The surface's one buffer.
 		if (in[0] == 0 || in[0] > UINT32_MAX || in[1] != 0)
 			return kIOReturnBadArgument;
+		// An ask, so no grant outlives the close's revokeGrants.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
+		if (!ask.begun)
+			return kIOReturnBadArgument;
 		RgfxAccelerator::Scanout scanout = {};
-		IOReturn r = owner->grantSurfaceScanout(this, context, task, static_cast<UInt32>(in[0]),
+		IOReturn r = owner->grantSurfaceScanout(this, ctx, task, static_cast<UInt32>(in[0]),
 		                                        &scanout);
 		if (r != kIOReturnSuccess)
 			return r;
@@ -228,15 +252,14 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 			return kIOReturnBadArgument;
 		const uint32_t surfaceId = inputs == 6 ? static_cast<uint32_t>(in[4]) : 0;
 		const bool cacheable = inputs == 6 && in[5] != 0;
-		// Under the queue lock, so no hold is made for a context releaseContext has closed:
-		// every hold of the client's goes in its dropSurfaceBlocks.
-		IOLockLock(queueLock);
+		// An ask, so no hold is made for a context releaseContext has closed: every hold of the
+		// client's goes in its dropSurfaceBlocks.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
 		RgfxAccelerator::SurfaceBlock block = {};
-		IOReturn r = hasContext ? owner->acquireSurfaceBlock(this, context, task, in[0], in[1],
-		                                                     in[2], inPlace, surfaceId,
-		                                                     cacheable, &block)
-		                        : kIOReturnBadArgument;
-		IOLockUnlock(queueLock);
+		IOReturn r = ask.begun ? owner->acquireSurfaceBlock(this, ctx, task, in[0], in[1], in[2],
+		                                                    inPlace, surfaceId, cacheable, &block)
+		                       : kIOReturnBadArgument;
 		if (r != kIOReturnSuccess)
 			return r;
 		out[0] = block.offset;
@@ -254,14 +277,14 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodPagesBlock: {
 		if (a->scalarInputCount != 3 || a->scalarOutputCount != 2 || in[2] > 1)
 			return kIOReturnBadArgument;
-		// Under the queue lock, so no pages block is made for a context releaseContext has
-		// closed: every block of the client's goes after its close.
-		IOLockLock(queueLock);
+		// An ask, so no pages block is made for a context releaseContext has closed: every block
+		// of the client's goes after its close.
+		UInt32 ctx = 0;
+		Ask ask = {this, beginAsk(&ctx)};
 		UInt64 offset = 0, size = 0;
-		IOReturn r = hasContext ? owner->pagesBlock(this, context, task, in[0], in[1], in[2] != 0,
-		                                            &offset, &size)
-		                        : kIOReturnBadArgument;
-		IOLockUnlock(queueLock);
+		IOReturn r = ask.begun ? owner->pagesBlock(this, ctx, task, in[0], in[1], in[2] != 0,
+		                                           &offset, &size)
+		                       : kIOReturnBadArgument;
 		if (r != kIOReturnSuccess)
 			return r;
 		out[0] = offset;
@@ -481,7 +504,7 @@ bool RgfxAcceleratorUserClient::destroyQueueIfTracked(UInt64 objId)
 {
 	// The destroy of any other object (most of them, posted through submit) is told at once from
 	// the list: an id neither listed nor in the making is none of the client's queues, and
-	// waits for no create or surface ask under the queue lock.
+	// waits for no create under the queue lock.
 	IOLockLock(listLock);
 	bool tracked = objId != 0 && objId == creatingQueue;
 	for (UInt32 i = 0; i < queueCount && !tracked; i++)
@@ -586,6 +609,23 @@ void RgfxAcceleratorUserClient::wakeCompletions()
 	IOLockUnlock(completionLock);
 }
 
+bool RgfxAcceleratorUserClient::beginAsk(UInt32 *ctx)
+{
+	IOLockLock(listLock);
+	const bool begun = rgfxAskBegin(asks, hasContext);
+	*ctx = context;
+	IOLockUnlock(listLock);
+	return begun;
+}
+
+void RgfxAcceleratorUserClient::endAsk()
+{
+	IOLockLock(listLock);
+	if (rgfxAskEnd(asks))
+		IOLockWakeup(listLock, &asks, false);
+	IOLockUnlock(listLock);
+}
+
 void RgfxAcceleratorUserClient::releaseContext()
 {
 	if (!queueLock)
@@ -595,6 +635,24 @@ void RgfxAcceleratorUserClient::releaseContext()
 	completionsClosed = true;
 	IOLockWakeup(completionLock, &completionCount, false);
 	IOLockUnlock(completionLock);
+	// The asks in flight end first, and none begins from here (RgfxAskGate.hpp): what each made
+	// is the context's, which the close lets go of below. Out of the queue lock, which a queue's
+	// create, one of them, takes.
+	IOLockLock(listLock);
+	const uint64_t drainFrom = mach_absolute_time();
+	const UInt32 inFlight = rgfxAskClose(asks);
+	while (!rgfxAskDrained(asks))
+		IOLockSleep(listLock, &asks, THREAD_UNINT);
+	const UInt32 most = asks.most, asked = context;
+	const bool opened = hasContext;
+	IOLockUnlock(listLock);
+	if (opened && (inFlight || most > 1)) {
+		uint64_t ns = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time() - drainFrom, &ns);
+		IOLog("RgfxAccelerator: context %u: %u asks at once at most; its close waited %llu us "
+		      "for %u in flight\n",
+		      asked, most, ns / 1000, inFlight);
+	}
 	IOLockLock(queueLock);
 	// Closed to the readers first, before its CONTEXT_CLOSE is posted: a submit that finds it
 	// open posts behind the close only to find it closed after (rgfxSubmitDestroysBehind), and

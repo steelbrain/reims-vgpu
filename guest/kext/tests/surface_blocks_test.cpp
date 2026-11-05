@@ -5,7 +5,8 @@
 // oldest first. A deferred block is found by its surface alone, never by pages, counts against
 // the device's budget while it lives and against half of it while dormant, and keeps room for
 // one run a page of its whole allocation, every plane's. Pages a SURFACE_PAGES named and the
-// host never answered for stay wired.
+// host never answered for stay wired. A client's new hold makes its other asks wait until its
+// share is posted.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
@@ -274,11 +275,38 @@ void naming()
 	      "never answered: kept wired, the host free to take them yet");
 }
 
+// A client's asks run beside each other (RgfxAskGate.hpp): a new hold's BLOCK_SHARE is posted
+// out of the lock, and another ask of the same client waits for it before it holds the block
+// again, so no ask returns a block the device does not yet let the client's context name.
+void sharing()
+{
+	int a = 0, b = 0, pagesA = 0, pagesB = 0;
+	RgfxSurfaceEntry e = {};
+	e.used = true;
+	check(!rgfxSurfaceSharing(e, &a), "a block no one holds is no one's to share");
+	check(rgfxSurfaceHold(e, &a, 1, &pagesA) == kRgfxSurfaceHoldNew && rgfxSurfaceSharing(e, &a),
+	      "a's new hold: its share not yet posted, a's other asks wait for it");
+	check(!rgfxSurfaceSharing(e, &b), "another client's asks do not");
+	check(rgfxSurfaceHold(e, &b, 2, &pagesB) == kRgfxSurfaceHoldNew && rgfxSurfaceSharing(e, &b),
+	      "b's own new hold shares on its own");
+	rgfxSurfaceShared(e, &a);
+	check(!rgfxSurfaceSharing(e, &a) && rgfxSurfaceSharing(e, &b),
+	      "a's share posted: a's asks hold it again, b's still wait for b's");
+	check(rgfxSurfaceHold(e, &a, 1, &pagesA) == kRgfxSurfaceHoldAgain && !rgfxSurfaceSharing(e, &a),
+	      "a's next ask holds it again, sharing nothing");
+	void *pages = nullptr;
+	uint32_t context = 0;
+	check(rgfxSurfaceLetGo(e, &b, true, &pages, &context) == kRgfxSurfaceLetGoHold &&
+	          !rgfxSurfaceSharing(e, &b),
+	      "b's share failed and its hold went: b's other asks find the block no longer b's");
+}
+
 int main()
 {
 	naming();
 	deferred();
 	dormancy();
+	sharing();
 	RgfxSurfaceEntry entries[4] = {};
 	RgfxSurfaceTable t = {entries, 4};
 	RgfxPageRun plane[2] = {{0x10000, 0x3000}, {0x40000, 0x1000}};

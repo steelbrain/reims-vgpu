@@ -1539,6 +1539,12 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 					differs = true;
 					break;
 				}
+				// Held new by another of the client's asks, its share not yet posted: held again
+				// once it is (rgfxSurfaceSharing).
+				if (rgfxSurfaceSharing(de, client)) {
+					IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
+					continue;
+				}
 				if (de.dormant) {
 					revived = reviveDeferredBlock(de, surfaceId);
 					if (!revived) {
@@ -1570,6 +1576,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			    at < 0 && differs ? rgfxSurfaceDormantMeeting(table, runs, count) : -1;
 			if (meeting >= 0) {
 				release |= letGoDormant(static_cast<UInt32>(meeting), kRgfxDormantStale);
+				continue;
+			}
+			if (at >= 0 && rgfxSurfaceSharing(table.entries[at], client)) {
+				IOLockSleep(contextLock, &surfaceTable, THREAD_UNINT);
 				continue;
 			}
 			if (at >= 0 || differs || !table.entries)
@@ -1697,27 +1707,33 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		share.size = block->size;
 		IOReturn posted = postLifecycle(RGFX_CMD_BLOCK_SHARE, &share, sizeof(share), 0, nullptr,
 		                                0, nullptr, nullptr, 0);
-		if (posted != kIOReturnSuccess) {
+		// The client's other asks of the block, waiting for the share (rgfxSurfaceSharing), hold
+		// it again, or find it no longer held.
+		void *mine = nullptr;
+		UInt32 c = 0;
+		bool shareKeptWire = false;
+		IOLockLock(contextLock);
+		release = false;
+		const int32_t again = rgfxSurfaceAt(table, block->offset);
+		if (posted == kIOReturnSuccess) {
+			if (again >= 0)
+				rgfxSurfaceShared(table.entries[again], client);
+		} else {
 			// No hold the device was not told of: let it go again.
-			void *mine = nullptr;
-			UInt32 c = 0;
-			IOLockLock(contextLock);
-			release = false;
-			int32_t again = rgfxSurfaceAt(table, block->offset);
 			RgfxSurfaceLetGo gone = again >= 0 ? rgfxSurfaceLetGo(table.entries[again], client,
 			                                                      true, &mine, &c)
 			                                   : kRgfxSurfaceLetGoNotHeld;
 			if (gone != kRgfxSurfaceLetGoNotHeld)
 				client->unmapSpan(block->offset, block->size);
-			bool shareKeptWire = false;
 			if (gone == kRgfxSurfaceLetGoLast)
 				release = letGoBlock(table.entries[again], c, false, mine, &shareKeptWire);
-			IOLockUnlock(contextLock);
-			if (!shareKeptWire)
-				unwire(mine);
-			if (release)
-				thread_call_enter(releaseCall);
 		}
+		IOLockWakeup(contextLock, &surfaceTable, false);
+		IOLockUnlock(contextLock);
+		if (!shareKeptWire)
+			unwire(mine);
+		if (release)
+			thread_call_enter(releaseCall);
 		if (revived)
 			noteDormant();
 		// The asker holds the surface: the processes see its clients counted anew.
@@ -1817,12 +1833,14 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		if (gone == kRgfxSurfaceLetGoLast)
 			release = letGoBlock(e, c, false, mine, &keptWire);
 	}
-	if (inPlace) {
-		// The askers waiting for the answer find the block, or none.
-		if (e.used && e.offset == offset && e.serial == pin.serial)
+	// The askers waiting for the answer, or for the asker's share (rgfxSurfaceSharing), find the
+	// block, or none.
+	if (e.used && e.offset == offset && e.serial == pin.serial) {
+		if (inPlace)
 			e.pending = false;
-		IOLockWakeup(contextLock, &surfaceTable, false);
+		rgfxSurfaceShared(e, client);
 	}
+	IOLockWakeup(contextLock, &surfaceTable, false);
 	IOLockUnlock(contextLock);
 	if (!keptWire)
 		unwire(mine);
@@ -1929,11 +1947,11 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 {
 	// The entry is pending until the device answers its pages, so no other asker reads it. Nor
 	// does anything let it go meanwhile, so `e` is this block's still under the contexts' lock
-	// taken again: its hold is the asker's alone, which a release refuses while it is pending;
-	// the asker's client's close takes the client's queue lock, which the ask holds throughout
-	// (RgfxAcceleratorUserClient's surface-block selector); and the dormant blocks' let-gos pass
-	// over it. None of this rests on IOKit ordering a close after a call in flight: the user
-	// client sets no IOUserClientDefaultLocking.
+	// taken again: its hold is the asker's alone, which a release refuses while it is pending,
+	// and another ask, of any client, waits for; the asker's client's close waits for the
+	// client's asks in flight, this one among them, before it lets go of anything (RgfxAskGate.hpp);
+	// and the dormant blocks' let-gos pass over it. None of this rests on IOKit ordering a close
+	// after a call in flight: the user client sets no IOUserClientDefaultLocking.
 	OSObject *surface = static_cast<OSObject *>(e.surface);
 	const UInt64 offset = e.offset, size = e.size, length = e.length;
 	// The header's page, where the kext writes the surface's CPU generation for the processes.
