@@ -4580,7 +4580,8 @@ fn write_writers(device: &GraphicsDevice<FakePlatform>, at: u64, writers: &[(u64
 fn presents_waiting(device: &GraphicsDevice<FakePlatform>, n: usize) {
     assert!(
         eventually(|| device.control.presents.waiting() == n),
-        "{n} presents were not waiting"
+        "{n} presents were not waiting, but {}",
+        device.control.presents.waiting()
     );
 }
 
