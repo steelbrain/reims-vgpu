@@ -28,13 +28,18 @@
 //!     block where the blit encoder runs them ([`GraphicsDecoder::synchronize_managed`]), so the
 //!     CPU sees it once the command buffer completes.
 //!
-//! A shape the platform cannot make in place takes the two copies on any GPU. On a GPU that shares
-//! the CPU's memory the guest's CPU reads of such a texture (`getBytes:`) then take its GPU copy,
-//! copied on the device: there Metal's CPU reads of a `Managed` texture see the GPU's writes with
-//! no synchronize (the Intel UHD 630 and the M3, docs/graphics-kext/dgpu-oracle.md Q2). The
-//! bundle knows the shape alone ([`in_place_shape`], its `rgfxManagedLiesOverCopy`), so a texture
-//! of that shape whose texture over its buffer the platform refuses, two copies too, reads its
-//! CPU copy, as the last synchronize left it.
+//! A shape the platform cannot make in place takes the two copies on any GPU: more than one level,
+//! a cube, a 3D texture, a block-compressed format. No creator of a texture over a buffer makes
+//! one, Metal's included, so the GPU's copy cannot be the CPU copy's linear bytes. The CPU copy
+//! stays there: without it an upload (`replaceRegion:`) would be a staging blit the call waits for,
+//! as a `Shared` texture's is, 340 to 420 us a call on the lane where a `Managed` one's is 2 to 4
+//! (docs/graphics-kext/dgpu-oracle.md Q17). On a GPU that shares the CPU's memory the guest's CPU
+//! reads of such a texture (`getBytes:`) take its GPU copy, copied on the device: there Metal's
+//! CPU reads of a `Managed` texture see the GPU's writes with no synchronize (the Intel UHD 630
+//! and the M3, dgpu-oracle.md Q2). The bundle knows the shape alone ([`in_place_shape`], its
+//! `rgfxManagedLiesOverCopy`), so a texture of that shape whose texture over its buffer the
+//! platform refuses, two copies too, reads its CPU copy, as the last synchronize left it; that is
+//! logged.
 //!
 //! **Where the platform refuses a GPU's copy** (its memory is full), the object is one copy over
 //! its block, as on a GPU that shares the CPU's memory, and the GPU reads and writes the guest's
@@ -73,6 +78,11 @@ const STORAGE_MODE_SHIFT: u32 = 4;
 const STORAGE_MODE_MASK: u64 = 0xf << STORAGE_MODE_SHIFT;
 /// `MTLTextureType2D`.
 const TEXTURE_TYPE_2D: u32 = 2;
+/// `MTLTextureType2DArray`.
+const TEXTURE_TYPE_2D_ARRAY: u32 = 3;
+// The linear SPI lays a 2D array's slices at their rows' bytes rounded up to 128, which a CPU
+// copy's slices are where every row is a multiple of 128 ([`in_place_shape`]).
+const _: () = assert!(reims_graphics::wire::RGFX_MANAGED_ROW_ALIGN.is_multiple_of(128));
 /// `MTLTextureType3D`.
 const TEXTURE_TYPE_3D: u64 = 7;
 
@@ -104,14 +114,43 @@ pub(crate) struct ManagedCopy<P: Platform> {
 }
 
 /// Whether a texture over a buffer can have the shape `create` names: a one-level, one-sample 2D
-/// texture of a pixel format the guest calls linear.
+/// texture or 2D array of a pixel format the guest calls linear, the shapes the platform's two
+/// creators over a buffer make (`newTextureWithDescriptor:offset:bytesPerRow:` a 2D texture, the
+/// linear SPI a 2D array too). Neither makes a texture of more than one level, a cube, a 3D
+/// texture or one of a block-compressed format, as Metal's do not.
 fn in_place_shape(create: &RgfxManagedTextureCreate) -> bool {
     let d = &create.desc;
+    let shaped = match d.texture_type {
+        TEXTURE_TYPE_2D => d.array_length <= 1,
+        TEXTURE_TYPE_2D_ARRAY => true,
+        _ => false,
+    };
     create.flags & RGFX_MANAGED_TEXTURE_LINEAR != 0
-        && d.texture_type == TEXTURE_TYPE_2D
+        && shaped
         && d.mipmap_level_count == 1
         && d.sample_count <= 1
-        && d.array_length <= 1
+}
+
+/// Logs, the first time, a `Managed` texture of a shape that lies over its CPU copy on a GPU that
+/// shares the CPU's memory, whose texture over its CPU copy's buffer the platform refused: it is
+/// two copies, and the guest, which knows the shape alone, reads its CPU copy, which shows the
+/// GPU's writes only after a `synchronizeTexture:` (the module doc).
+fn log_two_copies_on_unified_memory(create: &RgfxManagedTextureCreate) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let d = &create.desc;
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "Managed texture {:#x} ({}x{}, {} slices, format {}): the platform made no texture \
+             over its CPU copy on unified memory, so it is two copies, and the guest's getBytes: \
+             of it reads the GPU's writes only after a synchronizeTexture: (logged once)",
+            create.obj_id,
+            d.width,
+            d.height,
+            d.array_length,
+            d.pixel_format
+        );
+    }
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
@@ -605,13 +644,28 @@ impl<P: Platform> GraphicsDecoder<P> {
             let mut over = desc;
             over.resource_options = Some(shared(u64::from(m.desc.options)));
             let descriptor = this.platform.texture_descriptor(&over);
-            let row = layout.levels().first().map_or(0, |l| l.bytes_per_row);
-            cpu.new_texture(OnFault::Return, &descriptor, 0, row)
+            let Some(level) = layout.levels().first() else {
+                return Ok(None);
+            };
+            // A 2D array by the linear SPI, which lays each slice at its rows' bytes rounded up
+            // to 128 (`RgfxTexture.mm`'s rgfxBufferSlicePitch, measured on the M3 Max; the
+            // Vulkan platform's runtime alike): the layout's slices, whose rows are multiples of
+            // 256 bytes.
+            match m.desc.texture_type {
+                TEXTURE_TYPE_2D_ARRAY => cpu.new_linear_texture(
+                    &descriptor,
+                    0,
+                    level.bytes_per_row,
+                    level.bytes_per_slice,
+                ),
+                _ => cpu.new_texture(OnFault::Return, &descriptor, 0, level.bytes_per_row),
+            }
         };
-        if self.unified()
-            && let Some(texture) = in_place(self)?
-        {
-            return self.store_managed_texture(m.obj_id, texture, span, bytes, None, layout);
+        if self.unified() && in_place_shape(&m) {
+            if let Some(texture) = in_place(self)? {
+                return self.store_managed_texture(m.obj_id, texture, span, bytes, None, layout);
+            }
+            log_two_copies_on_unified_memory(&m);
         }
         let descriptor = self.platform.texture_descriptor(&desc);
         if let Some(texture) = device.new_texture(OnFault::Return, &descriptor)? {
@@ -1820,6 +1874,55 @@ mod tests {
         );
     }
 
+    /// On unified memory a one-level `Managed` 2D array lies over its CPU copy too, by the linear
+    /// SPI, its slices at the layout's: rows of 256 bytes, each slice its rows' bytes after the
+    /// one before. Its regions and synchronize copy nothing; a mipmapped array is two copies.
+    #[test]
+    fn a_managed_2d_array_on_unified_memory_lies_over_its_block() {
+        let mut r = rig(true);
+        let at = BLOCKS + 0x1_0000;
+        let array = |levels| RgfxTextureDescriptor {
+            texture_type: 3,
+            array_length: 3,
+            ..rgba(48, 16, levels)
+        };
+        assert_eq!(r.buffer(20, at, 0x1_0000, 0), Ok(()));
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.texture(21, 20, array(1)), Ok(()));
+        let creates: Vec<_> = (r.p.call_log().since(mark).into_iter())
+            .filter(|c| c.sel.starts_with("new"))
+            .collect();
+        assert_eq!(
+            creates.iter().map(|c| c.sel).collect::<Vec<_>>(),
+            ["newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:"]
+        );
+        assert_eq!(
+            creates[0].args[1..],
+            [Arg::U64(0), Arg::U64(256), Arg::U64(256 * 16)]
+        );
+        assert!(r.dec.managed_copy(21).unwrap().cpu.is_none());
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.replaced(21, 0, 2, [0, 0, 0], [48, 16, 1]), Ok(()));
+        assert_eq!(
+            r.replaced(21, 0, 3, [0, 0, 0], [48, 16, 1]),
+            Err(DecodeError::Malformed)
+        );
+        assert!(r.synchronize_texture(21, 2, 0).unwrap());
+        assert_eq!(
+            r.p.call_log().sels_since(mark),
+            ["synchronizeTexture:slice:level:"]
+        );
+
+        assert_eq!(r.buffer(30, at + 0x2_0000, 0x1_0000, 0), Ok(()));
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.texture(31, 30, array(2)), Ok(()));
+        assert_eq!(
+            made(r.p.call_log().sels_since(mark)),
+            ["newTextureWithDescriptor:"]
+        );
+        assert!(r.dec.managed_copy(31).unwrap().cpu.is_some());
+    }
+
     /// Where the platform refuses a `Managed` buffer's GPU copy on a GPU of its own memory, as
     /// Vulkan's out of device memory, the buffer is one copy, as on unified memory: a no-copy
     /// buffer of its options over its block at the guest's address, whose range messages and
@@ -2018,5 +2121,195 @@ mod tests {
             Err(DecodeError::Refused)
         );
         assert!(r.dec.named(31).is_none());
+    }
+
+    /// What a one-level `Managed` 2D array of 3 slices of 48 x 16 RGBA8 texels shows on `P` on
+    /// unified memory, made by the decoder over its CPU copy in a region block: each texel's bytes
+    /// in the copy name its slice, row and column. In order: slice 2 read back by a blit (the GPU
+    /// reads the copy where its layout puts the slice: rows 256 bytes apart, slices 16 rows), and
+    /// the copy after a blit wrote 0x5a into slice 1 and synchronized it, as a guest does (the GPU
+    /// writes it there, slices 0 and 2 kept).
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn managed_array_in_place_on<P: crate::platform::ApiPlatform>() -> (Vec<u8>, Vec<u8>) {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_core::platform::resource::Buffer as _;
+
+        const W: u64 = 48;
+        const H: u64 = 16;
+        const ROW: u64 = 256;
+        const SLICE: u64 = ROW * H;
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
+        let size = BLOCKS + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(Region::new(size as usize).unwrap());
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
+        dec.set_unified_memory(true);
+        dec.hold_resource_ids(0, 0);
+        let at = BLOCKS + 0x1_0000;
+        let copy = |offset: u64| region.base().wrapping_add((at + offset) as usize);
+        for (s, y, x) in
+            (0..3).flat_map(|s| (0..H).flat_map(move |y| (0..W).map(move |x| (s, y, x))))
+        {
+            let texel = [s as u8, y as u8, x as u8, 0xa5];
+            // SAFETY: inside the region's block the buffer below lies over, which no command
+            // uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(texel.as_ptr(), copy(s * SLICE + y * ROW + x * 4), 4)
+            };
+        }
+        let send = |dec: &mut GraphicsDecoder<P>, bytes: &[u8]| {
+            assert_eq!(dec.decode(&device, bytes).unwrap(), Ok(()));
+        };
+        let buffer = RgfxBufferOverHostMemory {
+            header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
+            obj_id: 20,
+            gpu_address: 0,
+            region_offset: at,
+            length: 3 * SLICE,
+            options: 0,
+            ..RgfxBufferOverHostMemory::default()
+        };
+        send(&mut dec, buffer.as_bytes());
+        let texture = RgfxManagedTextureCreate {
+            header: header(RGFX_CMD_MANAGED_TEXTURE_CREATE),
+            obj_id: 21,
+            gpu_address: 0,
+            resource_id: 21,
+            cpu_buffer_obj_id: 20,
+            bytes_per_block: 4,
+            block_width: 1,
+            block_height: 1,
+            flags: RGFX_MANAGED_TEXTURE_LINEAR,
+            desc: RgfxTextureDescriptor {
+                texture_type: 3,
+                array_length: 3,
+                ..rgba(W as u32, H as u32, 1)
+            },
+        };
+        send(&mut dec, texture.as_bytes());
+        assert!(
+            dec.managed_copy(21).unwrap().cpu.is_none(),
+            "over its CPU copy"
+        );
+        let Some(ObjHandle::Texture(t)) = dec.named(21) else {
+            panic!("no texture 21");
+        };
+        let queue = device.new_command_queue().unwrap();
+        let run = |cmds: Vec<BlitCmd<'_, P>>| {
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for cmd in cmds {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let shared = || {
+            device
+                .new_buffer_of_length(OnFault::Return, W * H * 4, 0)
+                .unwrap()
+                .unwrap()
+        };
+        let out = shared();
+        let whole = MtlSize::new(W, H, 1);
+        run(vec![BlitCmd::CopyTextureToBuffer {
+            source_texture: t,
+            source_slice: 2,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: whole,
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: W * 4,
+            destination_bytes_per_image: W * H * 4,
+        }]);
+        // SAFETY: a Shared buffer's bytes, read after the blit completed.
+        let read = unsafe {
+            std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (W * H * 4) as usize)
+        }
+        .to_vec();
+        let fill = shared();
+        // SAFETY: a Shared buffer of `W * H * 4` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::write_bytes(fill.contents().as_ptr::<u8>(), 0x5a, (W * H * 4) as usize)
+        };
+        // The guest's synchronizeTexture: of the slice after the write, which the platform's own
+        // takes for a texture over its CPU copy (`synchronize_managed`).
+        run(vec![
+            BlitCmd::CopyBufferToTexture {
+                source_buffer: &fill,
+                source_offset: 0,
+                source_bytes_per_row: W * 4,
+                source_bytes_per_image: W * H * 4,
+                source_size: whole,
+                destination_texture: t,
+                destination_slice: 1,
+                destination_level: 0,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            },
+            BlitCmd::SynchronizeTexture {
+                texture: t,
+                slice: 1,
+                level: 0,
+            },
+        ]);
+        // SAFETY: the region's block, which the blit's writes finished.
+        let after =
+            unsafe { std::slice::from_raw_parts(copy(0).cast_const(), (3 * SLICE) as usize) }
+                .to_vec();
+        (read, after)
+    }
+
+    /// Checks [`managed_array_in_place_on`]'s answers against the layout.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn check_managed_array_in_place((read, after): (Vec<u8>, Vec<u8>)) {
+        let (w, h, row, slice) = (48usize, 16usize, 256usize, 256 * 16usize);
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * w + x) * 4;
+                assert_eq!(
+                    read[at..at + 4],
+                    [2, y as u8, x as u8, 0xa5],
+                    "slice 2 ({x}, {y})"
+                );
+            }
+        }
+        for s in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let at = s * slice + y * row + x * 4;
+                    let want = match s {
+                        1 => [0x5a; 4],
+                        _ => [s as u8, y as u8, x as u8, 0xa5],
+                    };
+                    assert_eq!(after[at..at + 4], want, "the copy's slice {s} ({x}, {y})");
+                }
+            }
+        }
+    }
+
+    /// On Metal a one-level `Managed` 2D array on unified memory lies over its CPU copy where the
+    /// layout puts its slices: the GPU reads and writes the copy's bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_managed_2d_array_lies_over_its_cpu_copy() {
+        check_managed_array_in_place(
+            managed_array_in_place_on::<reims_vgpu_metal::MetalPlatform>(),
+        );
+    }
+
+    /// As on Metal ([`on_metal_a_managed_2d_array_lies_over_its_cpu_copy`]), on the Vulkan
+    /// platform.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_managed_2d_array_lies_over_its_cpu_copy() {
+        check_managed_array_in_place(
+            managed_array_in_place_on::<reims_vgpu_vulkan::VulkanPlatform>(),
+        );
     }
 }

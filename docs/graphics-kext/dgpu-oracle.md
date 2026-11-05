@@ -182,10 +182,11 @@ Probe: `oracle_storage DEVICE mbuf 4096|67108864` and `mtex`.
 Our stack: on a discrete host Managed resources are two copies. `didModifyRange:` copies exactly
 the named range to the GPU copy, ordered before the next commit; `synchronizeResource:` copies
 back inside the blit encoder; `replaceRegion:` uploads its region (decode/managed.rs). On a
-unified host they are one copy, as on Intel, but for a texture of a shape no texture over a
-buffer has (more than one level or slice, multisampled, or of a block-compressed format): it
-keeps two copies there too, and the bundle's `getBytes:` of it reads its GPU copy, copied on the
-device, so the GPU's writes show with no synchronize, as on Intel. **Relaxation: none.** AMD is
+unified host they are one copy, as on Intel, a one-level 2D array by the linear SPI among them,
+but for a texture of a shape no texture over a buffer has (more than one level, a cube or 3D
+texture, multisampled, or of a block-compressed format): it keeps two copies there too, and the
+bundle's `getBytes:` of it reads its GPU copy, copied on the device, so the GPU's writes show
+with no synchronize, as on Intel. **Relaxation: none.** AMD is
 looser than Metal in one way that costs us nothing: it uploads more than the named range when the
 GPU copy is clean, so an app with a short `didModifyRange:` works on AMD, where ours uploads the
 range alone.

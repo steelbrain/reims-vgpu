@@ -7680,12 +7680,13 @@ void test_managed_texture_cpu_copy()
 
 // On a GPU that shares the CPU's memory, Metal's CPU reads of a Managed texture see the GPU's
 // writes with no synchronize (the Intel 630 and the M3, dgpu-oracle.md Q2). One the host keeps in
-// two copies there (any shape but one level, one sample, 2D, of a linear format) answers getBytes:
-// from its GPU copy, copied on the device, and not from its CPU copy; its replaceRegion: still
-// writes the CPU copy and posts the region, with no device copy. One the host lays over its CPU
-// copy, and any on a GPU of its own memory, reads its CPU copy, and answers it as its
-// virtualAddress: a CPU write there is what getBytes: answers next, and posts nothing, as on both
-// x86 Macs (oracle_bundle texmem); the one reading its GPU copy answers NULL.
+// two copies there (any shape but one level, one sample, a 2D texture or 2D array, of a linear
+// format) answers getBytes: from its GPU copy, copied on the device, and not from its CPU copy;
+// its replaceRegion: still writes the CPU copy and posts the region, with no device copy. One the
+// host lays over its CPU copy, a one-level 2D array among them, and any on a GPU of its own
+// memory, reads its CPU copy, and answers it as its virtualAddress: a CPU write there is what
+// getBytes: answers next, and posts nothing, as on both x86 Macs (oracle_bundle texmem); the one
+// reading its GPU copy answers NULL.
 void test_managed_texture_reads_on_unified_memory()
 {
 	Fixture fx;
@@ -7698,8 +7699,8 @@ void test_managed_texture_reads_on_unified_memory()
 		bool readsGpuCopy;
 	};
 	const Case cases[] = {
-	    {YES, 3, 1, true}, {YES, 1, 2, true},  {YES, 1, 1, false},
-	    {NO, 3, 1, false}, {NO, 1, 1, false},
+	    {YES, 3, 1, true},  {YES, 3, 2, true}, {YES, 1, 2, false}, {YES, 1, 1, false},
+	    {NO, 3, 1, false},  {NO, 1, 2, false}, {NO, 1, 1, false},
 	};
 	for (const Case &c : cases) {
 		drainRing(fx.ring); // the last case's destroys

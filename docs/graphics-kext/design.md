@@ -1796,12 +1796,17 @@ process's own superpages where the device takes them, so no app-sized copy
 lies in the region. The host decides the form from the platform's answer of whether the GPU
 shares the CPU's memory:
 - **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
-  and a one-level 2D texture of a linear format a texture over its block's
-  Shared buffer; the range messages are checked and do nothing more. A texture
-  of any other shape is two copies, as below, and the guest's `getBytes:` of
-  it reads its GPU copy, copied on the device: on a GPU that shares the CPU's
-  memory Metal's CPU reads of a Managed texture see the GPU's writes with no
-  synchronize (the Intel UHD 630 and the M3, dgpu-oracle.md Q2).
+  and a one-level 2D texture or 2D array of a linear format a texture over its
+  block's Shared buffer (an array by the linear SPI, whose slices lie as the
+  layout's); the range messages are checked and do nothing more. A texture of
+  any other shape (more levels, a cube, a 3D texture, a block-compressed
+  format) is two copies, as below: no texture over a buffer has its shape, and
+  without the CPU copy an upload would be a staging blit the call waits for,
+  hundreds of times a Managed one's (dgpu-oracle.md Q17). The guest's
+  `getBytes:` of it reads its GPU copy, copied on the device: on a GPU that
+  shares the CPU's memory Metal's CPU reads of a Managed texture see the GPU's
+  writes with no synchronize (the Intel UHD 630 and the M3, dgpu-oracle.md
+  Q2).
 - **Otherwise:** two copies. The object the command buffers name is the
   platform's own Managed buffer (at the guest's address) or texture, and the
   block sits beside it as a Shared buffer.
