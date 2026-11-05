@@ -16,10 +16,18 @@
 //! the archive installed: any other global it defines, or a class that keeps an SDL name, fails
 //! the build. The dylib needs no localizing: rustc exports the C API's functions alone.
 //!
-//! Two things the build must make sure of for that:
+//! Three things the build must make sure of for that:
 //! - SDL's build script reruns when SDL's sources change, never when its C flags do. So `dist`
 //!   records the flags SDL was last built with for the profile (`sdl-cflags-<profile>` beside the
 //!   object), and drops SDL's build first (`cargo clean -p sdl3-sys`) where they differ.
+//! - kache, where a developer's builds run through it (`scripts/internal/dev-env.sh`), caches a
+//!   build script's run by the inputs Cargo reruns it for (kache 2.0.0, `src/build_script.rs`),
+//!   and SDL's script declares none of the flags. So the run SDL built again would be served from
+//!   one with no flags, of any target directory on the host: a dev dist then left SDL's common
+//!   symbols global, its objects built for the SDK's macOS (**measured** on the M3 Max). The
+//!   build turns kache's build-script cache off (`KACHE_BUILD_SCRIPT_CACHE=0`, an `[env]` entry
+//!   that the rustc wrapper and the scripts see), so its scripts run as without kache, and a run
+//!   with the library's flags is not served to another build either.
 //! - Clang makes a global that C declares with no value a common symbol, which `ld -r` leaves
 //!   global: SDL is built with `-fno-common`.
 //!
@@ -88,9 +96,9 @@ fn shadowing_cflags(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
 }
 
 /// The `cargo build` arguments: `reims-vgpu-c`'s libraries (cdylib and staticlib) in the profile,
-/// on the platform, for [`DEPLOYMENT_TARGET`], with SDL's C flags ([`sdl_cflags`]): each an
-/// `[env]` entry, which rustc and every build script see, and which a value set in the
-/// environment overrides.
+/// on the platform, for [`DEPLOYMENT_TARGET`], with SDL's C flags ([`sdl_cflags`]) and kache's
+/// build-script cache off ([`KACHE_BUILD_SCRIPT_CACHE`]): each an `[env]` entry, which rustc, its
+/// wrapper and every build script see, and which a value set in the environment overrides.
 pub fn cargo_args(o: &Options) -> Vec<String> {
     let mut args = vec!["build".to_owned()];
     args.extend(c_api_args(o));
@@ -100,8 +108,15 @@ pub fn cargo_args(o: &Options) -> Vec<String> {
     ));
     args.push("--config".to_owned());
     args.push(format!("env.{TARGET_CFLAGS}=\"{}\"", sdl_cflags()));
+    args.push("--config".to_owned());
+    args.push(format!("env.{KACHE_BUILD_SCRIPT_CACHE}=\"0\""));
     args
 }
+
+/// The variable that, `0`, turns kache's build-script cache off (module doc): kache then installs
+/// no launcher in front of a script it compiles, and runs a script it installed one for as Cargo
+/// would. Unread where the build does not run through kache.
+const KACHE_BUILD_SCRIPT_CACHE: &str = "KACHE_BUILD_SCRIPT_CACHE";
 
 /// The C flags SDL's build takes: a `-D` for each of its Objective-C names, giving it
 /// [`SDL_OBJC_PREFIX`], and `-fno-common`, as `ld -r` leaves a common symbol (a global SDL
@@ -363,9 +378,11 @@ mod tests {
     }
 
     /// The `--config` entry that renames SDL's Objective-C names.
+    /// SDL's C flags, then kache's build-script cache off, as `cargo_args` ends.
     fn renames() -> String {
         format!(
-            "--config env.CFLAGS_aarch64_apple_darwin=\"{}\"",
+            "--config env.CFLAGS_aarch64_apple_darwin=\"{}\" \
+             --config env.KACHE_BUILD_SCRIPT_CACHE=\"0\"",
             sdl_cflags()
         )
     }
