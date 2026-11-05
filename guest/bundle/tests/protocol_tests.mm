@@ -2251,6 +2251,47 @@ void test_heap_sizes()
 	CHECK(rgfxHeapFormatBlock(160).width == 8 && rgfxHeapFormatBlock(0xffff).bytes == 16);
 }
 
+// The IOSurfaceAllocSize the device answers for a texture (copyIOSurfaceSharedTextureProperties:):
+// its linear rows of blocks at the host's alignment, through every level, slice and depth image.
+// A 64 x 64 BGRA8 texture and a two-element array of them take what both x86 Macs answer (16384
+// and 32768: oracle_bundle props2).
+void test_surface_texture_alloc_sizes()
+{
+	struct Shape {
+		uint32_t format, type;
+		uint64_t w, h, d;
+		uint32_t levels;
+		uint64_t array, samples, align, size;
+	};
+	const Shape shapes[] = {
+	    {80, 2, 64, 64, 1, 1, 1, 1, 256, 16384},   // BGRA8Unorm, as both x86 Macs
+	    {80, 3, 64, 64, 1, 1, 2, 1, 256, 32768},   // an array of two, as both x86 Macs
+	    {80, 2, 100, 30, 1, 1, 1, 1, 256, 15360},  // rows of 400 bytes at 512
+	    {80, 2, 100, 30, 1, 1, 1, 1, 16, 12000},   // at 16, rows of 400
+	    {80, 2, 1, 1, 1, 1, 1, 1, 256, 256},       // one texel, one row
+	    {10, 2, 17, 9, 1, 1, 1, 1, 256, 2304},     // R8Unorm
+	    {130, 2, 64, 64, 1, 1, 1, 1, 256, 4096},   // BC1: 16 rows of 16 blocks of 8 bytes
+	    {80, 2, 64, 64, 1, 7, 1, 1, 256, 32512},   // mipmapped: 127 rows of 256
+	    {10, 7, 16, 16, 4, 1, 1, 1, 256, 16384},   // R8Unorm 3D: four images
+	    {10, 7, 16, 16, 4, 2, 1, 1, 256, 20480},   // and a second level, of two images of 8 rows
+	    {70, 5, 16, 16, 1, 1, 1, 1, 256, 24576},   // RGBA8Unorm cube: six faces
+	    {252, 4, 32, 32, 1, 1, 1, 4, 256, 32768},  // Depth32Float, four samples
+	};
+	for (const Shape &t : shapes) {
+		uint64_t size = 1;
+		CHECK(rgfxSurfaceTextureAllocSize(t.format, t.type, t.w, t.h, t.d, t.levels, t.array,
+		                                  t.samples, t.align, &size));
+		CHECK(size == t.size);
+	}
+	uint64_t none = 1;
+	CHECK(!rgfxSurfaceTextureAllocSize(80, 2, 0, 16, 1, 1, 1, 1, 256, &none) && none == 0);
+	CHECK(!rgfxSurfaceTextureAllocSize(80, 2, 16, 16, 1, 0, 1, 1, 256, &none));
+	CHECK(!rgfxSurfaceTextureAllocSize(80, 2, 16, 16, 1, 1, 1, 1, 0, &none));
+	CHECK(!rgfxSurfaceTextureAllocSize(125, 3, 1ull << 40, 1ull << 40, 1, 1, 1ull << 20, 1, 256,
+	                                   &none));
+	CHECK(none == 0);
+}
+
 } // namespace
 
 void rgfxProtocolTests()
@@ -2280,5 +2321,6 @@ void rgfxProtocolTests()
 	test_sampler_resource_ids();
 	test_shared_event_wait();
 	test_heap_sizes();
+	test_surface_texture_alloc_sizes();
 	test_queue_barriers();
 }

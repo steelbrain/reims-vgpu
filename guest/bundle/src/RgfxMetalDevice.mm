@@ -17,6 +17,7 @@
 #import "RgfxUnsupported.h"
 
 #include <IOKit/IOKitLib.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 
@@ -32,6 +33,7 @@
 
 #include "RgfxCommitOrder.hpp"
 #include "RgfxCompletionThread.hpp"
+#include "RgfxHeapSizes.hpp"
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxReplyReader.hpp"
@@ -1535,14 +1537,31 @@ RGFX_LOG_UNRECOGNIZED
 	                            sparsePageSize:sparsePageSize];
 }
 
-// Metal answers, for a texture descriptor, the IOSurface properties a surface backing it needs
-// in its own layout (its allocation size and compression mode); this device has no such
-// layout size to give.
+// The IOSurface properties a surface backing a texture of `descriptor` needs, which SkyLight
+// adds its own to: a mutable dictionary of its IOSurfaceAllocSize, the bytes the texture takes
+// in the device's layout, as Metal answers in its own. The AMD 5300M and the Intel 630 under
+// macOS 26.7.1 answer each a mutable dictionary of IOSurfaceAllocSize and keys of their drivers'
+// own (kAMDMTL_*, kIntel*), which only their textures read: AMD's size its GPU's layout's, at a
+// page; Intel's the texture's linear rows, with no padding past them (oracle_bundle iosurf.props
+// and props2: 18 shapes, formats, usages, mipmaps and arrays). The device's textures read a
+// surface's rows in place where they are multiples of the host's linear alignment
+// (RgfxIOSurface.h), so its size is the texture's linear rows at that alignment
+// (rgfxSurfaceTextureAllocSize). nil for no descriptor, or one no texture has.
 - (NSDictionary *)copyIOSurfaceSharedTextureProperties:(MTLTextureDescriptor *)descriptor
 {
-	(void)descriptor;
-	RGFX_UNSUPPORTED("IOSurface properties for a texture (no layout size on the wire)");
-	return nil;
+	if (descriptor == nil)
+		return nil;
+	const uint64_t align = _caps.linearTextureAlignment();
+	uint64_t size = 0;
+	if (!rgfxSurfaceTextureAllocSize(static_cast<uint32_t>(descriptor.pixelFormat),
+	                                 static_cast<uint32_t>(descriptor.textureType), descriptor.width,
+	                                 descriptor.height, descriptor.depth,
+	                                 static_cast<uint32_t>(descriptor.mipmapLevelCount),
+	                                 descriptor.arrayLength, descriptor.sampleCount,
+	                                 align != 0 ? align : 256, &size))
+		return nil;
+	return [NSMutableDictionary dictionaryWithObject:@(size)
+	                                          forKey:(__bridge NSString *)kIOSurfaceAllocSize];
 }
 
 // No buffer over an IOSurface, as both x86 Macs answer: the AMD 5300M and the Intel 630 under

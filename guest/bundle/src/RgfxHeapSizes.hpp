@@ -23,6 +23,9 @@
  *   textures most (a 1x1 texture takes 16 KiB). The host's own answer replaces it once the wire
  *   carries the query.
  *
+ * It also answers the size an IOSurface takes for a texture over it (rgfxSurfaceTextureAllocSize,
+ * copyIOSurfaceSharedTextureProperties:'s IOSurfaceAllocSize).
+ *
  * Header-only and free of Metal's headers, so the tests build it as the bundle does. Our own
  * code.
  */
@@ -143,6 +146,47 @@ inline bool rgfxHeapTextureBound(uint32_t format, uint32_t type, uint64_t width,
 	    __builtin_mul_overflow(slice, slices, &total))
 		return false;
 	out->size = total;
+	return true;
+}
+
+/// The bytes an IOSurface holds for a texture of `format` and `MTLTextureType` `type`, `width` x
+/// `height` x `depth` texels, `levels` mipmap levels, `arrayLength` elements and `samples`
+/// samples, laid out as the device's textures over a surface read one, linear: every level in
+/// order, each its slices (array elements, six faces a cube) and samples, each slice its images
+/// (the level's depth for a 3D texture, else one), each image its rows of blocks (the block of
+/// rgfxHeapFormatBlock), each row's bytes at a multiple of `rowAlign` (the host's linear texture
+/// alignment, which a surface's rows meet for the device to use its pages in place). False for a descriptor no texture has (a 0 dimension or count), or past 2^64.
+inline bool rgfxSurfaceTextureAllocSize(uint32_t format, uint32_t type, uint64_t width,
+                                        uint64_t height, uint64_t depth, uint32_t levels,
+                                        uint64_t arrayLength, uint64_t samples, uint64_t rowAlign,
+                                        uint64_t *out)
+{
+	using rgfx_heap_detail::alignUp;
+	*out = 0;
+	if (width == 0 || height == 0 || depth == 0 || levels == 0 || levels > 32 ||
+	    arrayLength == 0 || samples == 0 || rowAlign == 0)
+		return false;
+	const RgfxFormatBlock block = rgfxHeapFormatBlock(format);
+	const bool threeD = type == 7;
+	const bool cube = type == 5 || type == 6;
+	uint64_t slices = 0, total = 0;
+	if (__builtin_mul_overflow(arrayLength, cube ? 6 : 1, &slices) ||
+	    __builtin_mul_overflow(slices, samples, &slices))
+		return false;
+	for (uint32_t l = 0; l < levels; l++) {
+		const uint64_t w = (width >> l) ? (width >> l) : 1;
+		const uint64_t h = (height >> l) ? (height >> l) : 1;
+		const uint64_t d = threeD ? ((depth >> l) ? (depth >> l) : 1) : 1;
+		uint64_t row = 0, level = 0;
+		if (__builtin_mul_overflow((w + block.width - 1) / block.width, block.bytes, &row) ||
+		    !alignUp(row, rowAlign, &row) ||
+		    __builtin_mul_overflow(row, (h + block.height - 1) / block.height, &level) ||
+		    __builtin_mul_overflow(level, d, &level) ||
+		    __builtin_mul_overflow(level, slices, &level) ||
+		    __builtin_add_overflow(total, level, &total))
+			return false;
+	}
+	*out = total;
 	return true;
 }
 

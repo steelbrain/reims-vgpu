@@ -394,7 +394,7 @@ compileVisibleFunction:withDescriptor:error: unsupported function pointers
 compilerPropagatesThreadPriority: base %base-creator
 convertSparsePixelRegions:toTileRegions:withTileSize:alignmentMode:numRegions: base %base-spi
 convertSparseTileRegions:toPixelRegions:withTileSize:numRegions: base %base-spi
-copyIOSurfaceSharedTextureProperties: unsupported IOSurface properties for a texture (no layout size on the wire)
+copyIOSurfaceSharedTextureProperties: implemented
 counterSets base %base-spi
 currentAllocatedSize unsupported the device's allocation count (answers 0)
 currentCommandQueueCount base %base-spi
