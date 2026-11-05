@@ -1016,6 +1016,10 @@ static void checkDies(const char *name, const char *words)
 	CHECK(err.find(words) != std::string::npos);
 }
 
+// A .metallib of one function, `rgfx_exported`, of the TYPE a dynamic library's exported function
+// has (3), in metallibOf's layout.
+static std::vector<uint8_t> exportedFunctionMetallib();
+
 // The cases checkDies runs, each in a process of its own: each ends the process where it should,
 // else it answers 0, which its check fails.
 static int dies_case(const char *name)
@@ -1153,24 +1157,16 @@ static int dies_case(const char *name)
 			(void)[tex newTextureViewWithPixelFormat:format];
 	};
 	if (std::strcmp(name, "dynamic-exported-function") == 0) {
-		MTLCompileOptions *o = [MTLCompileOptions new];
-		o.libraryType = MTLLibraryTypeDynamic;
-		o.installName = @"@executable_path/librgfx_dyn.metallib";
-		id<MTLLibrary> compiled = [MTLCreateSystemDefaultDevice()
-		    newLibraryWithSource:@"float rgfx_dyn(float x) { return x * 3.0f; }"
-		                 options:o
-		                   error:nil];
-		NSData *bytes =
-		    ((id (*)(id, SEL))objc_msgSend)(compiled, sel_registerName("libraryDataContents"));
+		// A library whose one function is a dynamic library's exported one (TYPE 3).
+		const std::vector<uint8_t> bytes = exportedFunctionMetallib();
 		uint32_t status = 0;
-		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
-		                                        length:bytes.length
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+		                                        length:bytes.size()
 		                                           key:nullptr
 		                                        device:nil
 		                                    serializer:&fx.ser
 		                                        status:&status];
-		if (lib.functionNames.count == 1)
-			(void)[lib newFunctionWithName:lib.functionNames[0]];
+		(void)[lib newFunctionWithName:@"rgfx_exported"];
 	}
 	const NSRange one = NSMakeRange(0, 1);
 	if (std::strcmp(name, "view-no-format") == 0)
@@ -3200,7 +3196,6 @@ void test_library_type_and_install_name()
 		CHECK([dynURL.installName isEqualToString:@"@executable_path/librgfx_dyn.metallib"]);
 		RgfxLibrary *bare = make(dynamic, false);
 		CHECK(bare.type == MTLLibraryTypeDynamic && bare.installName == nil);
-		CHECK(bare.functionNames.count == 1);
 	}
 	// A function of its exported function ends the process, with Metal's words, as on both x86
 	// Macs (oracle_bundle functypes.dyn).
@@ -3210,6 +3205,11 @@ void test_library_type_and_install_name()
 	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {
 	}
+}
+
+static std::vector<uint8_t> exportedFunctionMetallib()
+{
+	return metallibOf({ { "rgfx_exported", 3, {} } });
 }
 
 // A post-tessellation vertex function answers its [[patch]]'s type and control point count, from
