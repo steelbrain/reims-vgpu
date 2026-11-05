@@ -451,6 +451,13 @@ pl_run() {
   echo "potluck job $job"
   (cd "$SHIP_WT" && potluck wait "$job")
 }
+# pl_kept NAME PATH DEST [WS]: what job NAME brought back of PATH with its --keep (potluck's
+# jobs/JOB/keep/, the workspace's layout), copied to DEST; else, where WS is given, PATH from that
+# held workspace (potluck cp), for a job that ended without its keep; fails where neither has it.
+pl_kept() {
+  local k=${POTLUCK_STATE:-$HOME/.local/state/potluck}/jobs/$(cat "$RUN/job-$1")/keep/$2
+  if [[ -e $k ]]; then cp -R "$k" "$3"; else [[ -n ${4:-} ]] && potluck cp "$4:$2" "$3"; fi
+}
 # pl_workspace JOB: the job's workspace.
 pl_workspace() {
   potluck status --json | python3 -I -c '
@@ -595,12 +602,12 @@ do_host() {
   local mr=${M2V_REPO:-$HOME/Projects/steelbrain/metal2vulkan}
   [[ $m2v =~ ^[0-9a-f]{40}$ ]] && git -C "$mr" cat-file -e "$m2v^{commit}" 2> /dev/null && carry=(--carry "$mr@$m2v")
   pl_run host --timeout "${HOST_TIMEOUT:-30m}" --ram 40 --priority "$PL_PRIO" --on "node=$PL_NODE" --hold 8h --label lane-gate=build ${carry[@]+"${carry[@]}"} \
-    -- bash lg/bin/msi-job.sh build || rc=$?
+    --keep lg-out/steps --keep lg-out/msi-build.txt -- bash lg/bin/msi-job.sh build || rc=$?
   ws=$(pl_workspace "$(cat "$RUN/job-host")") || { echo "no workspace for job $(cat "$RUN/job-host")"; return 1; }
   echo "$ws" > "$RUN/workspace"
   rm -rf "$RUN/host-steps"
-  potluck cp "$ws:lg-out/steps" "$RUN/host-steps" || return 1
-  potluck cp "$ws:lg-out/msi-build.txt" "$RES/msi-build.txt" 2> /dev/null || true
+  pl_kept host lg-out/steps "$RUN/host-steps" "$ws" || return 1
+  pl_kept host lg-out/msi-build.txt "$RES/msi-build.txt" "$ws" 2> /dev/null || true
   return $rc
 }
 
@@ -679,11 +686,11 @@ POST_PROBE_TIP=$sha
 EOF
   set +e
   pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" --exclusive --gpu "$PL_GPU" --workspace "$ws" ${advance:+--advance} \
-    --label "lane-gate=$mode" -- bash lg/bin/msi-job.sh boot "$mode" "$(base64 < "$RUN/boot-$mode.env" | tr -d '\n')"
+    --label "lane-gate=$mode" --keep "lg-out/$mode" -- bash lg/bin/msi-job.sh boot "$mode" "$(base64 < "$RUN/boot-$mode.env" | tr -d '\n')"
   local rc=$?
   set -e
   rm -rf "${RES:?}/$mode"
-  potluck cp "$ws:lg-out/$mode" "$RES/$mode" || mkdir -p "$RES/$mode"
+  pl_kept "$mode" "lg-out/$mode" "$RES/$mode" "$ws" || mkdir -p "$RES/$mode"
   [[ ! -s $RES/$mode/rc ]] || rc=$(cat "$RES/$mode/rc")
   rm -f "$RES/$mode/rc"
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
