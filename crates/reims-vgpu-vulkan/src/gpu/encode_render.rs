@@ -7697,6 +7697,8 @@ pub(crate) mod tests {
         assert_eq!(site.file, "setViewport:");
     }
 
+    mod many_passes;
+
     #[cfg(target_os = "macos")]
     pub(crate) mod metal_tests;
 }
