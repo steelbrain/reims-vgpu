@@ -23,6 +23,7 @@
 //!
 //! Every public method runs as an entry ([`crate::entry`]).
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -943,7 +944,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// buffer's create is made on the ICB worker ([`Self::start_icb`]), and the destroy of one
     /// still being made waits for it. A library lookup is answered here
     /// ([`Self::lookup_library`]).
-    fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+    ///
+    /// `bytes` is the message, borrowed, or the device's own copy of a command buffer's
+    /// ([`Host::command_buffer`]), which goes to the buffer's lane as it is.
+    fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, bytes: Cow<'_, [u8]>) {
+        let message: &[u8] = &bytes;
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
         if r#type == RGFX_CMD_BUFFER_OVER_PAGES && self.start_buffer_over_pages(poster, message) {
             return;
@@ -984,7 +989,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             RGFX_CMD_COMMAND_BUFFER => {
                 self.pending.wait_for_command_buffer(message);
                 if !foreign_queue(poster, message) {
-                    self.begin_command_buffer(poster, message);
+                    self.begin_command_buffer(poster, bytes.into_owned());
                     return;
                 }
             }
@@ -1156,8 +1161,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// queue's service thread ([`Self::handle_stage3`]): begun here, its turn in its queue's lane
     /// taken first and its `CB_SUBMITTED` posted where it gets it at its take
     /// ([`GraphicsDecoder::begin_taken`]), then walked and committed on the lane, in its turn
-    /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile.
-    fn begin_command_buffer(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
+    /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile, `message`
+    /// going there as it is.
+    fn begin_command_buffer(self: &Arc<Self>, poster: &CompletionPoster, message: Vec<u8>) {
         entry::run(|_| {
             // Held to the end of the buffer's work, on its lane ([`Self::reset_gate`]).
             let carried = self.reset_gate.read_arc();
@@ -1167,10 +1173,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 return;
             }
             let mut decoder =
-                (self.decoders).sender(Some(sender_context(poster, message)), self.sinks(poster));
+                (self.decoders).sender(Some(sender_context(poster, &message)), self.sinks(poster));
             let begun =
-                refusing(|| decoder.begin_taken(&self.device, message, poster.queue_obj_id()));
-            self.carry_out(decoder, begun, carried, poster.clone(), message.to_vec());
+                refusing(|| decoder.begin_taken(&self.device, &message, poster.queue_obj_id()));
+            self.carry_out(decoder, begun, carried, poster.clone(), message);
         });
     }
 
@@ -1773,7 +1779,12 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
-        self.control.handle_stage3(completion, message);
+        self.control
+            .handle_stage3(completion, Cow::Borrowed(message));
+    }
+
+    fn command_buffer(&self, completion: &CompletionPoster, message: Vec<u8>) {
+        self.control.handle_stage3(completion, Cow::Owned(message));
     }
 
     fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {

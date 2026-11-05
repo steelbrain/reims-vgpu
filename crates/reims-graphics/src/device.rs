@@ -384,9 +384,9 @@ pub trait Host: Send + Sync + 'static {
     }
 
     /// Hands a stage-3 message to the host's decoder: from ring 0, on its context's lane, an
-    /// object-lifecycle create or destroy; from a command queue's own submission ring, on its
-    /// service thread, a `COMMAND_BUFFER` (after the queue's `QUEUE_CREATE`, which the device
-    /// hands over first, and before its `OBJECT_DESTROY`). Each ring's messages come whole, in the
+    /// object-lifecycle create or destroy; for a command queue, on its service thread, its
+    /// `QUEUE_CREATE` first and its `OBJECT_DESTROY` last, its `COMMAND_BUFFER`s between them
+    /// coming through [`Host::command_buffer`]. Each ring's messages come whole, in the
     /// order the guest published them (ring 0's, each context's in that order, on one thread at a
     /// time), with `completion` to post what the host owes onto that
     /// ring's completion ring (a pipeline's reflection on the control one, a buffer's
@@ -397,6 +397,16 @@ pub trait Host: Send + Sync + 'static {
     /// default does nothing, for a host with no stage-3 decoder.
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let _ = (completion, message);
+    }
+
+    /// Hands a `COMMAND_BUFFER` from a command queue's own submission ring, or from the block a
+    /// `COMMAND_BUFFER_IN_REGION` there names, to the host's decoder, on the queue's service
+    /// thread, as [`Host::stage3_message`] hands a message: `message` is the copy the device took
+    /// of it out of the region (the region's module doc), which the host keeps for as long as it
+    /// carries the buffer out (on a thread of its own, after this returns), so it copies the
+    /// message no more. The default hands it to [`Host::stage3_message`].
+    fn command_buffer(&self, completion: &CompletionPoster, message: Vec<u8>) {
+        self.stage3_message(completion, &message);
     }
 
     /// Offers the host the `COMMAND_BUFFER` `message` at the head of a command queue's
@@ -1961,7 +1971,7 @@ impl Shared {
             } else {
                 message
             };
-            self.host.stage3_message(poster, &message.bytes);
+            self.host.command_buffer(poster, message.bytes);
         }
     }
 

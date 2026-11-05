@@ -163,3 +163,51 @@ fn a_first_version_graphics_config_makes_a_device() {
         rvg_graphics_device_release(device);
     }
 }
+
+/// What the queue's service thread spends copying an out-of-line command buffer's message of each
+/// length, under the allocator the library ships with (this crate's global one): the copy out of
+/// its block (`Region::read_held`, the one copy the host makes), and that copy copied once more,
+/// as the hand-off to the buffer's lane did before it kept the device's copy
+/// (`reims_vgpu::graphics`, `Host::command_buffer`). Prints each one's p50 over 200 rounds from
+/// the same block, and the second copy's share.
+#[test]
+#[ignore = "a measurement, run by hand in a release build: prints a command buffer's copy cost"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn command_buffer_copy_cost() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use reims_graphics::region::Region;
+    use reims_graphics::wire::RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const SPAN: usize = 8 << 20;
+    let region = Region::new(BLOCK as usize + SPAN).unwrap();
+    region.grant(1, BLOCK, SPAN as u64);
+    assert!(region.write(BLOCK, &vec![0x5a; SPAN]));
+    let p50 = |f: &dyn Fn() -> usize| {
+        let mut us: Vec<f64> = (0..200)
+            .map(|_| {
+                let t0 = Instant::now();
+                black_box(f());
+                t0.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        us[us.len() / 2]
+    };
+    for len in [32usize << 10, 64 << 10, 256 << 10, 1 << 20, 5 << 20] {
+        let one = p50(&|| region.read_held(1, BLOCK, len).unwrap().len());
+        let two = p50(&|| {
+            let copy = region.read_held(1, BLOCK, len).unwrap();
+            black_box(copy.to_vec()).len()
+        });
+        println!(
+            "command_buffer_copy_cost: {} KiB: one copy p50 {one:.1} us, two {two:.1} us \
+             (the second {:.1} us, {:.0}%)",
+            len >> 10,
+            two - one,
+            100.0 * (two - one) / two
+        );
+    }
+}

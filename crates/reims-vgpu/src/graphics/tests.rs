@@ -922,6 +922,92 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     assert!(gone, "the queue's destroy never ended it");
 }
 
+/// A command buffer too large for its queue's ring, whose whole message lies in a block of its
+/// process's (`COMMAND_BUFFER_IN_REGION`), is copied out of the block once, by the queue's service
+/// thread, and walked and committed from that copy on its lane: no thread makes a second copy of
+/// its message's length on the way, and it completes as one from the ring does.
+#[test]
+fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
+    use reims_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RgfxOpHeader};
+
+    let platform = Arc::new(FakePlatform::new());
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, mut guest) = (3, Guest::new(&device));
+    let queue = obj(context, 1);
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
+        ),
+        RGFX_STATUS_OK
+    );
+
+    // The buffer's message: 4099 empty blit encoders, larger than the ring, of a length nothing
+    // else allocates. The kext granted its block to the queue's process before the buffer.
+    let mut message = command_buffer(queue, 100);
+    for tag in [RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END].repeat(4099) {
+        let op = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: 8,
+        };
+        message.extend_from_slice(op.as_bytes());
+    }
+    let len = message.len();
+    assert!(len > RING_DATA as usize);
+    let op_bytes = (len - RGFX_COMMAND_BUFFER_OPS_OFFSET as usize) as u64;
+    message[RGFX_COMMAND_BUFFER_OPS_OFFSET as usize - 8..RGFX_COMMAND_BUFFER_OPS_OFFSET as usize]
+        .copy_from_slice(&op_bytes.to_le_bytes());
+    message[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    guest.send(&device, block_grant(context, BLOCK, 0x2_0000));
+    // SAFETY: the block lies inside the device's region, mapped at its base while the device
+    // lives, and nothing else writes it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            message.as_ptr(),
+            device.region_base().add(BLOCK as usize),
+            len,
+        );
+    }
+    let reference = RgfxCommandBufferInRegion {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_COMMAND_BUFFER_IN_REGION,
+            size: size_of::<RgfxCommandBufferInRegion>() as u32,
+            seqno: 0,
+        },
+        region_offset: BLOCK,
+        byte_length: len as u64,
+    };
+
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    let (completed, copies) = crate::counted::allocations_of(len, || {
+        ring.send(&device, reference.as_bytes().to_vec());
+        complete_until_event(&platform, &mut ring)
+    });
+    assert!(completed, "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+    assert_eq!(copies, 1, "copies of the {len}-byte message");
+}
+
 /// A command buffer that asks for its `CB_SUBMITTED` and need wait for nothing, rung through
 /// `mmio_write_taking`, is answered on the ringing thread: its `CB_SUBMITTED` is on its queue's
 /// completion ring, the queue's vector raised on that thread, before the write returns; its

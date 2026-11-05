@@ -1727,7 +1727,11 @@ from its queue's pool, and the ring carries a `COMMAND_BUFFER_IN_REGION`
   ops, so the commit posts the block with no copy.
 
 The queue's service thread copies the message out of the block once, as it
-does a ring's, with the reference's seqno, and the bundle gives the block back
+does a ring's, with the reference's seqno, and the host walks and commits the
+buffer from that copy, on its lane, copying it no more. It does not read the
+block in place: the process may write its block at any time, and what the host
+checked must stay what it carries out (the region's rule, `region.rs`). The
+bundle gives the block back
 to the queue's pool when the buffer completes. The pool keeps every block given
 back and reuses the smallest that holds the next message, so of each size a
 queue makes blocks only up to the most of its buffers in flight at once, and a

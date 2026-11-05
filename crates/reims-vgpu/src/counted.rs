@@ -1,9 +1,11 @@
 //! The unit tests' allocator: the system's, counting the allocations a thread makes while it asks
 //! ([`allocations_in`]), so a test holds a path to allocating nothing (a doorbell's answer, on the
-//! guest's vCPU, `graphics`).
+//! guest's vCPU, `graphics`), and every thread's allocations of one size ([`allocations_of`]), so
+//! a test counts the copies the device's own threads make of a message of that length.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// The system's allocator, counted.
 pub(crate) struct Counted;
@@ -15,33 +17,42 @@ thread_local! {
     static COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Counts an allocation of this thread's, where it counts them.
-fn count() {
+/// The size [`allocations_of`] counts, on every thread; 0 while it counts none.
+static SIZED: AtomicUsize = AtomicUsize::new(0);
+/// The allocations of that size counted.
+static SIZED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts an allocation of `size` bytes: this thread's, where it counts them, and any thread's of
+/// the size [`allocations_of`] counts.
+fn count(size: usize) {
     // `try_with`: a thread's own counters may be gone as it exits.
     let _ = COUNTING.try_with(|on| {
         if on.get() {
             let _ = COUNT.try_with(|n| n.set(n.get() + 1));
         }
     });
+    if size != 0 && SIZED.load(Ordering::Relaxed) == size {
+        SIZED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: each call is the system allocator's, as asked; the count touches only this thread's
 // constant thread-locals, which allocate nothing.
 unsafe impl GlobalAlloc for Counted {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
+        count(layout.size());
         // SAFETY: as the caller's.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        count();
+        count(layout.size());
         // SAFETY: as the caller's.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count();
+        count(new_size);
         // SAFETY: as the caller's.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -59,6 +70,18 @@ pub(crate) fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     let made = f();
     COUNTING.with(|on| on.set(false));
     (made, COUNT.with(Cell::get))
+}
+
+/// What `f` makes, and how many allocations of exactly `size` bytes (not 0) every thread made
+/// while it ran: the copies of a message of that length the device's threads make for it, where
+/// nothing else allocates that size. One count at a time.
+pub(crate) fn allocations_of<R>(size: usize, f: impl FnOnce() -> R) -> (R, u64) {
+    assert_ne!(size, 0);
+    SIZED_COUNT.store(0, Ordering::SeqCst);
+    SIZED.store(size, Ordering::SeqCst);
+    let made = f();
+    SIZED.store(0, Ordering::SeqCst);
+    (made, SIZED_COUNT.load(Ordering::SeqCst))
 }
 
 #[cfg(test)]
