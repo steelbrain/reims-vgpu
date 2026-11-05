@@ -578,7 +578,7 @@ host_step() {
 # held for the boots.
 do_host() {
   local rc=0 ws
-  pl_run host --timeout 2h --ram 40 --priority "$PL_PRIO" --on "node=$PL_NODE" --hold 8h --label lane-gate=build \
+  pl_run host --timeout "${HOST_TIMEOUT:-30m}" --ram 40 --priority "$PL_PRIO" --on "node=$PL_NODE" --hold 8h --label lane-gate=build \
     -- bash lg/bin/msi-job.sh build || rc=$?
   ws=$(pl_workspace "$(cat "$RUN/job-host")") || { echo "no workspace for job $(cat "$RUN/job-host")"; return 1; }
   echo "$ws" > "$RUN/workspace"
@@ -595,10 +595,12 @@ do_host() {
 # port.
 do_boot() {
   local mode=$1 oc=${image:-$MR/oc.qcow2} out=$MR/out-$1 excl=0 hold=${HOLD_SHARED_S:-1200}
-  local ph=${phases:-info sweep decode icb webgl present final} pres=5 ws tmo=75m
+  # Each job's limit near its own time (about 1.5 times): potluck reserves an exclusive job's start
+  # at the latest limit among the jobs running on its machine.
+  local ph=${phases:-info sweep decode icb webgl present final} pres=5 ws tmo=40m
   if [[ $mode == bench ]]; then
     # WebGL's frame rate and present_probe's answers first: the quickest read of a tip's frame pace.
-    excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10 tmo=50m
+    excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10 tmo=30m
   fi
   ws=$(cat "$RUN/workspace")
   cat > "$RUN/boot-$mode.env" << EOF

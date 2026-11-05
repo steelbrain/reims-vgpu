@@ -257,8 +257,10 @@ commit=$(cd "$L" && bash "$L/ship-commit.sh" "$S" "$(git -C "$L" rev-parse HEAD)
   ":construction: WIP lane-gate probe round $ROUND (throwaway)")
 rm -rf "$S"
 echo "probe-batch: round $ROUND from $commit on $branch"
-# The job's limit: the hold and the boot's own time, and 40 minutes more for --after.
-tmo=$(( (HOLD_S + 1800) / 60 + ${after:+40} + 0 ))
+# The job's limit, near its own time (potluck reserves an exclusive job's start at the latest limit
+# among the jobs running on its machine): the hold, the boot's own time and its waits for quiet and
+# the cool-down (12 minutes), and 40 minutes more for --after.
+tmo=$(( (HOLD_S + 720) / 60 + ${after:+40} + 0 ))
 out=$(cd "$wt" && potluck dispatch --json --timeout "${tmo}m" --ram "$ram" --exclusive --gpu "${POTLUCK_MSI_GPU:-5080}" \
   --on "node=${POTLUCK_MSI_NODE:-msi-laptop}" --label lane-gate=round -- bash lg/bin/msi-round.sh) ||
   { echo "probe-batch: potluck dispatch: $out" >&2; exit 1; }
