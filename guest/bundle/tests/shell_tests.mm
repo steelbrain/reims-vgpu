@@ -1143,6 +1143,26 @@ static int dies_case(const char *name)
 		else
 			(void)[tex newTextureViewWithPixelFormat:format];
 	};
+	if (std::strcmp(name, "dynamic-exported-function") == 0) {
+		MTLCompileOptions *o = [MTLCompileOptions new];
+		o.libraryType = MTLLibraryTypeDynamic;
+		o.installName = @"@executable_path/librgfx_dyn.metallib";
+		id<MTLLibrary> compiled = [MTLCreateSystemDefaultDevice()
+		    newLibraryWithSource:@"float rgfx_dyn(float x) { return x * 3.0f; }"
+		                 options:o
+		                   error:nil];
+		NSData *bytes =
+		    ((id (*)(id, SEL))objc_msgSend)(compiled, sel_registerName("libraryDataContents"));
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+		                                        length:bytes.length
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		if (lib.functionNames.count == 1)
+			(void)[lib newFunctionWithName:lib.functionNames[0]];
+	}
 	const NSRange one = NSMakeRange(0, 1);
 	if (std::strcmp(name, "view-no-format") == 0)
 		viewOf(MTLPixelFormatInvalid, MTLTextureType2DArray, one, one, false);
@@ -3171,7 +3191,12 @@ void test_library_type_and_install_name()
 		CHECK([dynURL.installName isEqualToString:@"@executable_path/librgfx_dyn.metallib"]);
 		RgfxLibrary *bare = make(dynamic, false);
 		CHECK(bare.type == MTLLibraryTypeDynamic && bare.installName == nil);
+		CHECK(bare.functionNames.count == 1);
 	}
+	// A function of its exported function ends the process, with Metal's words, as on both x86
+	// Macs (oracle_bundle functypes.dyn).
+	checkDies("dynamic-exported-function", "validateMTLFunctionType: failed assertion `type is "
+	                                       "not a valid MTLFunctionType.'");
 	std::vector<uint8_t> drain;
 	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {

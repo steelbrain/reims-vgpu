@@ -50,6 +50,7 @@ struct MetallibFunction {
 	bool haveConstants = false;
 	uint8_t tess = 0; // the TESS tag of a post-tessellation vertex function (rgfxPatchOf)
 	bool hasTess = false;
+	bool exported = false; // a dynamic library's exported function: TYPE 3 (metallibStage)
 };
 
 uint16_t rd16(const uint8_t *p)
@@ -79,8 +80,9 @@ uint64_t rd64(const uint8_t *p)
 // `functionNames` leaves out); and on the AMD 5300M and Intel 630 under macOS 26.7.1, over
 // libraries Apple's compiler built from our own sources (oracle_bundle, functypes): 4 for a
 // [[visible]] and a [[stitchable]] function (Visible), 6 intersection, 7 mesh, 8 object. A
-// dynamic library's exported function is 3, at which both end the process (Metal asserts that
-// its type is no MTLFunctionType); it and any other byte answer Visible here.
+// dynamic library's exported function is 3, which both end the process at as a function is made
+// of it (validateMTLFunctionType's assertion, oracle_bundle functypes.dyn), as the bundle does
+// (rgfxFunctionNamed); it and any other byte answer Visible here.
 MTLFunctionType metallibStage(uint8_t t)
 {
 	switch (t) {
@@ -152,8 +154,10 @@ bool readMetallibFunctions(const uint8_t *p, size_t n, std::vector<MetallibFunct
 				return false;
 			if (std::memcmp(p + t, "NAME", 4) == 0)
 				f.name.assign(reinterpret_cast<const char *>(data), strnlen(reinterpret_cast<const char *>(data), size));
-			else if (std::memcmp(p + t, "TYPE", 4) == 0 && size >= 1)
+			else if (std::memcmp(p + t, "TYPE", 4) == 0 && size >= 1) {
 				f.type = metallibStage(data[0]);
+				f.exported = data[0] == 3;
+			}
 			else if (std::memcmp(p + t, "HASH", 4) == 0 && size == sizeof(f.hash)) {
 				std::memcpy(f.hash, data, sizeof(f.hash));
 				f.hasHash = true;
@@ -510,6 +514,11 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 		entry = [self rgfxEntryNamed:name];
 		if (entry == nullptr)
 			return nil;
+		// A dynamic library's exported function, of no MTLFunctionType: the x86 Macs' Metal ends
+		// the process making a function of it (AMD 5300M and Intel 630, macOS 26.7.1).
+		if (entry->exported)
+			RgfxMetalAssertionFailed("validateMTLFunctionType",
+			                         @"type is not a valid MTLFunctionType.");
 	} else {
 		genuine = [self rgfxGenuineNamed:name haveShadow:&haveShadow];
 		if (haveShadow && genuine == nil)
