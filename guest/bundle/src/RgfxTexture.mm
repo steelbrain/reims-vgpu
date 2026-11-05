@@ -407,7 +407,16 @@ bool rgfxViewFormatsMayMatch(MTLPixelFormat from, MTLPixelFormat to)
 }
 
 // Why the bundle answers a view nil without asking the host, each logged once.
-enum RgfxViewRefusal { kNoFormat, kFormatClass, kLevels, kSlices, kTypeFamily, kSliceCount, kViews };
+enum RgfxViewRefusal {
+	kNoFormat,
+	kFormatClass,
+	kLevels,
+	kSlices,
+	kTypeFamily,
+	kSliceCount,
+	kBufferSlices,
+	kViews
+};
 
 // Metal's name of each format no multisample texture has, as its validation names it: the
 // compressed formats (BC, PVRTC, EAC and ETC2, ASTC), the 4:2:2 ones, and Unspecialized.
@@ -960,6 +969,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // outside the texture, a type of another family, a format of another class), and answers nil
 // for one in no format. The bundle answers nil, sending nothing, for each of these it can tell
 // from the texture (rgfxView...), and the host refuses any other its platform does not make.
+// So it answers a view of more than one slice of a 2D array over a buffer, which Metal asserts
+// at on the M3 Max and an M4 (`sliceRange.length == 1`: read from metal2vulkan's REFUSALS.md,
+// measured there) and the host's platform ends the host's process at.
 
 - (nullable id<MTLTexture>)rgfxViewInFormat:(MTLPixelFormat)format
                                        type:(MTLTextureType)type
@@ -992,13 +1004,16 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		refusal = kTypeFamily;
 	} else if (subrange && !rgfxViewTakesSlices(type, slices.length)) {
 		refusal = kSliceCount;
+	} else if ((subrange ? slices.length : parentSlices) > 1 && self.buffer != nil) {
+		refusal = kBufferSlices;
 	}
 	if (refusal != kViews) {
 		static std::atomic<bool> logged[kViews];
 		static NSString *const what[kViews] = {
 		    @"in no pixel format", @"in a pixel format of another class",
 		    @"of levels outside it", @"of slices outside it", @"of a type of another family",
-		    @"of a slice count its type does not take"};
+		    @"of a slice count its type does not take",
+		    @"of more than one slice of an array over a buffer"};
 		if (!logged[refusal].exchange(true)) {
 			NSLog(@"RGFX: a view of texture 0x%llx (format %lu, type %lu) %@ (format %lu, type "
 			      @"%lu): answered nil",

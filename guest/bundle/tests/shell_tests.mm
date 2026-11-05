@@ -6195,8 +6195,9 @@ void test_buffer_texture_replace_region_tells_the_host()
 // replaceRegion: and getBytes: of each slice of a linear 2D array over a buffer reach that slice's
 // rows in the buffer, each slice its rows' bytes rounded up to 128 after the one before, whatever
 // the bytesPerImage the texture was made with, as the host lays the array out; through a view of
-// its later slices too. Over a Managed buffer, the host is told the slice's span. A slice past the
-// array copies nothing.
+// one of its slices too, where a view of more than one is nil, sending nothing (Metal asserts at
+// it). Over a Managed buffer, the host is told the slice's span. A slice past the array copies
+// nothing.
 void test_buffer_texture_slices()
 {
 	Fixture fx;
@@ -6266,11 +6267,18 @@ void test_buffer_texture_slices()
 	// Nothing lies between the slices' rows.
 	CHECK(bytes[offset + 3 * pitch] == 0 && bytes[offset + slicePitch - 1] == 0);
 
-	// A view of slices 1 and 2: its slice 1 is the array's slice 2.
+	// A view of slices 1 and 2, or of all three, is nil and sends nothing.
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                             textureType:MTLTextureType2DArray
+	                                  levels:NSMakeRange(0, 1)
+	                                  slices:NSMakeRange(1, 2)] == nil);
+	CHECK([tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm] == nil);
+	CHECK(ringEmpty(fx.ring));
+	// A view of slice 2 alone: its slice 0 is the array's slice 2.
 	id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
-	                                             textureType:MTLTextureType2DArray
+	                                             textureType:MTLTextureType2D
 	                                                  levels:NSMakeRange(0, 1)
-	                                                  slices:NSMakeRange(1, 2)];
+	                                                  slices:NSMakeRange(2, 1)];
 	CHECK(view != nil);
 	drainRing(fx.ring);
 	uint8_t out[16] = {};
@@ -6279,11 +6287,11 @@ void test_buffer_texture_slices()
 	    bytesPerImage:16
 	       fromRegion:written
 	      mipmapLevel:0
-	            slice:1];
+	            slice:0];
 	CHECK(std::memcmp(out, in, sizeof in) == 0); // slice 2's, written last
 	std::memset(in, 0xee, sizeof in);
 	[view replaceRegion:written mipmapLevel:0 slice:0 withBytes:in bytesPerRow:8 bytesPerImage:16];
-	CHECK(bytes[offset + slicePitch + pitch + 4] == 0xee);
+	CHECK(bytes[offset + 2 * slicePitch + pitch + 4] == 0xee);
 	drainRing(fx.ring);
 
 	// Past the array: nothing is copied or posted.
