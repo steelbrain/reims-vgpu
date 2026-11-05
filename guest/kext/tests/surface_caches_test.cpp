@@ -14,7 +14,8 @@
 // block stays at a client's going while others are left; its release names its pages first only
 // where the GPU wrote it and the surface lives past the kext's three references. A block let go
 // while an attach is in flight hands the let-go to that attach, waiting for nothing. A naming the
-// host never answers leaves its pages wired.
+// host never answers leaves its pages wired. A block whose ask names its pages after all lets go
+// of each wiring it took once, cached or not.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -438,10 +439,42 @@ void unanswered()
 	check(rgfxCacheReleaseNext(t, 0xc0000, 1, 9) == kRgfxCacheReleaseAsIs,
 	      "and its release names no pages");
 }
+
+// A block whose ask names its pages after all (deferSurfaceBlock): each wiring taken is let go
+// once, by its cache or by the asker's hold, cached or not, whatever the naming's outcome.
+void askNaming()
+{
+	const RgfxPagesNaming namings[] = {kRgfxPagesNamed, kRgfxPagesNotNamed,
+	                                   kRgfxPagesUnanswered};
+	const bool cachedness[] = {false, true};
+	for (const bool cached : cachedness) {
+		for (const RgfxPagesNaming naming : namings) {
+			RgfxCachedSurface entries[1] = {};
+			RgfxCacheTable t = {entries, 0, 1};
+			// The naming's wiring, which it keeps but where the host answered it took none; the
+			// hold's own, where named.
+			const bool again = naming == kRgfxPagesNamed && rgfxAskHoldWiresAgain(cached, naming);
+			const int taken = (rgfxPagesNamingWired(naming) ? 1 : 0) + (again ? 1 : 0);
+			// The cache's, at its entry's removal, where its settle leaves it wired; the hold's,
+			// where it holds the pages: named, or not answered.
+			int letGo = 0;
+			if (cached) {
+				RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+				c->deferral = kRgfxCacheGating;
+				rgfxCacheSettled(t, kSurface, naming != kRgfxPagesNamed);
+				letGo += rgfxCacheWired(*c) ? 1 : 0;
+			}
+			letGo += naming != kRgfxPagesNotNamed ? 1 : 0;
+			check(taken == letGo, cached ? "a cached block's ask lets go of each wiring once"
+			                             : "an uncached block's ask lets go of each wiring once");
+		}
+	}
+}
 } // namespace
 
 int main()
 {
+	askNaming();
 	RgfxCachedSurface entries[2] = {};
 	RgfxCacheTable t = {entries, 0, 2};
 	uint64_t offset = 0, mark = 0;

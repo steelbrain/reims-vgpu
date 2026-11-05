@@ -1891,9 +1891,12 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 		OSSafeReleaseNULL(uncached);
 		return false;
 	}
+	// The hold's wiring: the naming's where no cache keeps that, else one of its own
+	// (rgfxAskHoldWiresAgain).
 	IOMemoryDescriptor *held = memory;
 	held->retain();
-	if (held->prepare(kIODirectionOutIn) != kIOReturnSuccess)
+	if (rgfxAskHoldWiresAgain(*cached, naming) &&
+	    held->prepare(kIODirectionOutIn) != kIOReturnSuccess)
 		OSSafeReleaseNULL(held);
 	IOLockLock(contextLock);
 	rgfxSurfaceUndefer(surfaceTable, e, runs, count);

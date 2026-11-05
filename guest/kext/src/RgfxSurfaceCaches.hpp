@@ -475,6 +475,17 @@ inline void rgfxCacheSettled(RgfxCacheTable &t, uint64_t key, bool deferred)
 		c->deferral = deferred ? kRgfxCacheDeferred : kRgfxCacheNotDeferred;
 }
 
+// Whether the asker's hold of a block whose ask named its pages after all (its surface not fresh,
+// the deferral refused, or no device cache: deferSurfaceBlock), `naming` the outcome, wires
+// them again for itself, the block cached where `cached`. The naming's own wiring
+// (rgfxPagesNamingWired) is its cache's where named, which the settle leaves wired
+// (rgfxCacheSettled, rgfxCacheWired), so the hold takes a second; else the hold takes the
+// naming's, which nothing else would let go.
+inline bool rgfxAskHoldWiresAgain(bool cached, RgfxPagesNaming naming)
+{
+	return cached && naming == kRgfxPagesNamed;
+}
+
 // The references of a surface the kext holds itself as its release thread looks at a deferred
 // block's release: the table's, which the block's entry handed it at the let-go
 // (rgfxCacheLetGo); the device cache's, the kext holding the cache, which IOSurface's
