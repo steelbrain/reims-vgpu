@@ -58,11 +58,31 @@ struct RgfxAirArgument {
 	bool anyIndex;
 };
 
-// One entry point: its name, stage and binding arguments, in the module's order.
+// One function constant a module declares. The module lists them in the named metadata
+// `air.function_constants`: one node per constant, of the global its value is read from, the
+// name of its type (`bool`, `float4`, `ushort2`, ...: a scalar's, or a vector's of two to four),
+// its name and its index (`[[function_constant(index)]]`). It is required where that global is
+// `unnamed_addr`; the global of one the function tests with `is_function_constant_defined` is not.
+// A .metallib's module of one function lists that function's constants, those its `CNST` tag
+// lists (RgfxFunctionConstants.hpp), and none where it has no CNST tag (measured: the 46,563
+// functions of macOS 27's frameworks' .metallibs on the M3 Max, 6,615 of them with constants:
+// each constant of the same name, index and type in both, required in CNST for each of the 25,275
+// whose global is `unnamed_addr` and for none of the 7,108 others).
+struct RgfxAirConstant {
+	std::string name;
+	uint32_t type = 0; // MTLDataType
+	uint32_t index = 0;
+	bool required = false;
+};
+
+// One entry point: its name, stage and binding arguments, in the module's order, and the function
+// constants its module declares (`constantsRead` false where they did not read).
 struct RgfxAirFunction {
 	std::string name;
 	RgfxAirStage stage;
 	std::vector<RgfxAirArgument> arguments;
+	std::vector<RgfxAirConstant> constants;
+	bool constantsRead = false;
 };
 
 // The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header).
@@ -172,6 +192,9 @@ struct RgfxAirVisible {
 	// Its arguments' names (empty for an unnamed one) and types, in their order.
 	std::vector<std::string> argumentNames;
 	std::vector<RgfxAirType> argumentTypes;
+	// The function constants its module declares, as RgfxAirFunction's.
+	std::vector<RgfxAirConstant> constants;
+	bool constantsRead = false;
 };
 
 // The visible functions of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), in

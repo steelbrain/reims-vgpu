@@ -3,8 +3,8 @@
 // without a written texture, a function constant, arguments declared under function constants,
 // binding indices function constants set, a vertex function's and a kernel's stage input, a
 // function table and an acceleration structure, threadgroup memory, and a function of no texture;
-// and stitchable functions of every kind of type in their signatures. Built into a .metallib by
-// Apple's Metal compiler at test time; never committed.
+// stitchable functions of every kind of type in their signatures; and function constants of
+// several types. Built into a .metallib by Apple's Metal compiler at test time; never committed.
 #include <metal_raytracing>
 #include <metal_stdlib>
 using namespace metal;
@@ -390,3 +390,22 @@ struct SigPointees {
 // An acceleration structure: Metal's own reflection of a signature that holds one ends the
 // process, so the device answers none.
 [[stitchable]] float sig_acceleration(instance_acceleration_structure s, float x) { return x; }
+
+// Function constants of several types, vectors among them, and one the kernel tests with
+// is_function_constant_defined, which is not required; a visible function that reads one.
+constant float4 kTint [[function_constant(20)]];
+constant ushort2 kSteps [[function_constant(21)]];
+constant bool3 kMask [[function_constant(22)]];
+constant half kGain [[function_constant(23)]];
+constant int kOptional [[function_constant(24)]];
+constant bool kHasOptional = is_function_constant_defined(kOptional);
+
+kernel void every_constant(device float *out [[buffer(0)]], uint g [[thread_position_in_grid]])
+{
+	float v = kTint.x + float(kSteps.y) + (kMask.z ? 1.0f : 0.0f) + float(kGain);
+	if (kHasOptional)
+		v += float(kOptional);
+	out[g] = v;
+}
+
+[[visible]] float tinted(float x) { return x * kTint.y; }

@@ -3189,7 +3189,7 @@ void test_stitchable_reflection_from_air()
 		CHECK([fn rgfxShadow] == nil); // no shadow made to answer them
 		compared++;
 	}
-	CHECK(compared == 17);
+	CHECK(compared == 18);
 
 	// Field by field, what Core Image reads among them: the return's data type, and each
 	// argument's name, binding type, and type's data type and name.

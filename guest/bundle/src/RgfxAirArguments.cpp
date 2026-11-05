@@ -29,6 +29,8 @@ constexpr unsigned kMdStringOld = 1, kMdValue = 2, kMdNode = 3, kMdName = 4,
                    kMdGlobalDeclAttachment = 36, kMdIndexOffset = 38, kMdIndex = 39;
 // STRTAB_BLOCK's one record: the blob.
 constexpr unsigned kStrtabBlob = 1;
+// A GLOBALVAR's unnamed_addr field for `unnamed_addr` (0 is none, 2 `local_unnamed_addr`).
+constexpr uint64_t kUnnamedAddr = 1;
 
 // Reads bits from a byte array, least significant first, as LLVM writes them.
 class Bits {
@@ -228,6 +230,8 @@ struct Module {
 		bool function = false;
 		uint64_t strtabOffset = 0, strtabSize = 0;
 		std::string name;
+		// A global variable's unnamed_addr: 0 none, kUnnamedAddr, or 2 local_unnamed_addr.
+		uint64_t unnamedAddr = 0;
 	};
 	std::vector<Global> globals;
 	// The module's integer constants, by value number.
@@ -403,6 +407,11 @@ private:
 					g.strtabOffset = r.ops[0];
 					g.strtabSize = r.ops[1];
 				}
+				// GLOBALVAR: [type, isconst, initid, linkage, alignment, section, visibility,
+				// threadlocal, unnamed_addr, ...], after the name's two fields in version 2.
+				const size_t unnamedAt = m_.version >= 2 ? 10 : 8;
+				if (r.code == kModuleGlobalVar && r.ops.size() > unnamedAt)
+					g.unnamedAddr = r.ops[unnamedAt];
 				m_.globals.push_back(std::move(g));
 				break;
 			}
@@ -1042,6 +1051,59 @@ bool visibleFunction(const Module &m, uint64_t id, RgfxAirVisible &out)
 	return true;
 }
 
+// MTLDataType of a function constant's type name: a scalar's, or a vector's of two to four of
+// them, which MTLDataType numbers after its scalar's.
+bool constantType(const std::string &s, uint32_t &type)
+{
+	static const struct {
+		const char *name;
+		uint32_t type;
+	} kScalars[] = {{"float", 3},  {"half", 16},   {"int", 29},  {"uint", 33},
+	                {"short", 37}, {"ushort", 41}, {"char", 45}, {"uchar", 49},
+	                {"bool", 53},  {"long", 81},   {"ulong", 85}};
+	for (const auto &k : kScalars) {
+		const size_t n = std::strlen(k.name);
+		if (s.compare(0, n, k.name) != 0)
+			continue;
+		if (s.size() == n) {
+			type = k.type;
+			return true;
+		}
+		if (s.size() == n + 1 && s[n] >= '2' && s[n] <= '4') {
+			type = k.type + static_cast<uint32_t>(s[n] - '1');
+			return true;
+		}
+	}
+	return false;
+}
+
+// The function constants of the module (`air.function_constants`): false where a node does not
+// read, `out` then empty.
+bool readConstants(const Module &m, std::vector<RgfxAirConstant> &out)
+{
+	out.clear();
+	auto it = m.named.find("air.function_constants");
+	if (it == m.named.end())
+		return true;
+	for (uint64_t id : it->second) {
+		const Module::Md *node = mdNode(m, id);
+		const bool whole = node != nullptr && node->ops.size() >= 4;
+		const std::string *type = whole ? mdString(m, node->ops[1]) : nullptr;
+		const std::string *name = whole ? mdString(m, node->ops[2]) : nullptr;
+		RgfxAirConstant c;
+		if (!whole || !mdGlobalVariable(m, node->ops[0]) || type == nullptr || name == nullptr ||
+		    !constantType(*type, c.type) || !mdUnsigned(m, *node, 3, c.index)) {
+			out.clear();
+			return false;
+		}
+		c.name = *name;
+		const uint64_t global = mdAt(m, node->ops[0])->value;
+		c.required = m.globals[static_cast<size_t>(global)].unnamedAddr == kUnnamedAddr;
+		out.push_back(std::move(c));
+	}
+	return true;
+}
+
 } // namespace
 
 bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out)
@@ -1053,12 +1115,16 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 	auto it = m.named.find("air.visible");
 	if (it == m.named.end())
 		return true;
+	std::vector<RgfxAirConstant> constants;
+	const bool constantsRead = readConstants(m, constants);
 	for (uint64_t id : it->second) {
 		RgfxAirVisible v;
 		if (!visibleFunction(m, id, v)) {
 			out.clear();
 			return false;
 		}
+		v.constants = constants;
+		v.constantsRead = constantsRead;
 		if (v.signature != RgfxAirVisible::Signature::Read) {
 			v.returnsVoid = false;
 			v.returnType = {};
@@ -1082,6 +1148,8 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 	} kStages[] = {{"air.kernel", RgfxAirStage::Kernel},
 	               {"air.vertex", RgfxAirStage::Vertex},
 	               {"air.fragment", RgfxAirStage::Fragment}};
+	std::vector<RgfxAirConstant> constants;
+	const bool constantsRead = readConstants(m, constants);
 	for (const auto &s : kStages) {
 		auto it = m.named.find(s.name);
 		if (it == m.named.end())
@@ -1092,6 +1160,8 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 				out.clear();
 				return false;
 			}
+			f.constants = constants;
+			f.constantsRead = constantsRead;
 			out.push_back(std::move(f));
 		}
 	}

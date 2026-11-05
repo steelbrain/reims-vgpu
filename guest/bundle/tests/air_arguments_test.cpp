@@ -3,9 +3,11 @@
 // every entry point's binding arguments, kind, index, count and access, as the source declares
 // them, those under function constants among them; which texture bindings each may write; no
 // answer for a binding of a kind the reader does not know; each stitchable function's signature,
-// type by type, and an unknown one where it has a type the reader does not know; and no answer,
-// nor a crash, for bytes that are not such a module.
+// type by type, and an unknown one where it has a type the reader does not know; each module's
+// function constants, as its function's CNST tag lists them; and no answer, nor a crash, for bytes
+// that are not such a module.
 #include "RgfxAirArguments.hpp"
+#include "RgfxFunctionConstants.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -66,6 +68,52 @@ RgfxAirVisible visible(const std::vector<uint8_t> &lib, const std::string &name)
 	check(rgfxReadAirVisible(bitcode, size, fns), name + ": its module is read");
 	check(fns.size() == 1 && fns[0].name == name, name + ": its module's one visible function is it");
 	return fns.empty() ? RgfxAirVisible{} : fns[0];
+}
+
+// The functions of the library's function list: each one's name and the offset of its public
+// metadata (its OFFT tag's first field), as RgfxLibrary.mm reads the list.
+struct Listed {
+	std::string name;
+	uint64_t publicOffset = 0;
+};
+
+std::vector<Listed> listed(const std::vector<uint8_t> &lib)
+{
+	auto rd = [&](uint64_t at, size_t n) {
+		uint64_t v = 0;
+		if (at <= lib.size() && n <= lib.size() - at)
+			std::memcpy(&v, lib.data() + at, n);
+		return v;
+	};
+	std::vector<Listed> out;
+	uint64_t q = rd(0x18, 8);
+	const uint64_t count = rd(q, 4);
+	q += 4;
+	for (uint64_t i = 0; i < count && q < lib.size(); i++) {
+		const uint64_t end = q + rd(q, 4);
+		Listed f;
+		for (uint64_t t = q + 4; t + 6 <= end && std::memcmp(lib.data() + t, "ENDT", 4) != 0;) {
+			const uint64_t n = rd(t + 4, 2);
+			if (std::memcmp(lib.data() + t, "NAME", 4) == 0)
+				f.name.assign(reinterpret_cast<const char *>(lib.data() + t + 6),
+				              strnlen(reinterpret_cast<const char *>(lib.data() + t + 6), n));
+			else if (std::memcmp(lib.data() + t, "OFFT", 4) == 0)
+				f.publicOffset = rd(t + 6, 8);
+			t += 6 + n;
+		}
+		out.push_back(f);
+		q = end;
+	}
+	return out;
+}
+
+bool hasConstant(const std::vector<RgfxAirConstant> &cs, const char *name, uint32_t type,
+                 uint32_t index, bool required)
+{
+	for (const RgfxAirConstant &c : cs)
+		if (c.name == name)
+			return c.type == type && c.index == index && c.required == required;
+	return false;
 }
 
 using Kind = RgfxAirType::Kind;
@@ -632,6 +680,55 @@ int main()
 		check(still.signature == RgfxAirVisible::Signature::Read && isPair(still.returnType),
 		      "sig_struct is still read beside it");
 	}
+
+	// Each module's function constants: every_constant's five, of their types (MTLDataType) and
+	// indices, the one it tests with is_function_constant_defined not required; every_access's
+	// one; none for a function of none; the visible tinted's one.
+	const RgfxAirFunction constants = entry(lib, "every_constant");
+	check(constants.constantsRead && constants.constants.size() == 5 &&
+	          hasConstant(constants.constants, "kTint", 6, 20, true) &&
+	          hasConstant(constants.constants, "kSteps", 42, 21, true) &&
+	          hasConstant(constants.constants, "kMask", 55, 22, true) &&
+	          hasConstant(constants.constants, "kGain", 16, 23, true) &&
+	          hasConstant(constants.constants, "kOptional", 29, 24, false),
+	      "every_constant: its five constants");
+	check(all.constantsRead && all.constants.size() == 1 &&
+	          hasConstant(all.constants, "kScale", 53, 0, true),
+	      "every_access: kScale");
+	check(none.constantsRead && none.constants.empty(), "no_texture: no constants");
+	const RgfxAirVisible tinted = visible(lib, "tinted");
+	check(tinted.constantsRead && tinted.constants.size() == 1 &&
+	          hasConstant(tinted.constants, "kTint", 6, 20, true),
+	      "tinted: kTint");
+	// Every function's, as its CNST tag lists them: the same names, types, indices and flags.
+	size_t compared = 0, withConstants = 0;
+	for (const Listed &f : listed(lib)) {
+		std::vector<RgfxConstantDecl> cnst;
+		check(rgfxReadConstantTable(lib.data(), lib.size(), f.publicOffset, cnst),
+		      f.name + ": its CNST tag reads");
+		const uint8_t *bc = nullptr;
+		size_t bcSize = 0;
+		check(rgfxMetallibBitcode(lib.data(), lib.size(), f.name, &bc, &bcSize),
+		      f.name + ": its bitcode");
+		std::vector<RgfxAirFunction> fns;
+		std::vector<RgfxAirVisible> vis;
+		const std::vector<RgfxAirConstant> *air = nullptr;
+		if (rgfxReadAirFunctions(bc, bcSize, fns) && fns.size() == 1 && fns[0].constantsRead)
+			air = &fns[0].constants;
+		else if (rgfxReadAirVisible(bc, bcSize, vis) && vis.size() == 1 && vis[0].constantsRead)
+			air = &vis[0].constants;
+		if (air == nullptr)
+			continue; // a module the reader does not follow (sig_acceleration's among them)
+		compared++;
+		withConstants += air->empty() ? 0 : 1;
+		bool same = air->size() == cnst.size();
+		for (const RgfxConstantDecl &d : cnst)
+			same = same && hasConstant(*air, d.name.c_str(), d.type, d.index, d.required);
+		check(same, f.name + ": its module's constants are its CNST tag's");
+	}
+	check(compared >= 10 && withConstants >= 5,
+	      "every function's constants compared (" + std::to_string(compared) + ", " +
+	          std::to_string(withConstants) + " with constants)");
 
 	// Bytes that are not such a module: none answers, and none crashes the reader.
 	check(rgfxMetallibBitcode(lib.data(), lib.size(), "every_access", &bitcode, &size),

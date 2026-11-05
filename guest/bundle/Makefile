@@ -223,7 +223,8 @@ $(PATCH_LIB): tests/patch.metal Makefile
 
 # --- the AIR argument reader's check (x86_64, Rosetta) ------------------------
 # The reader (src/RgfxAirArguments.*) over a .metallib Apple's Metal compiler builds here from
-# tests/air_arguments.metal, never committed.
+# tests/air_arguments.metal, never committed; its function constants against the library's CNST
+# tags (src/RgfxFunctionConstants.*).
 AIR_LIB = $(BUILD)/air_arguments.metallib
 
 $(AIR_LIB): tests/air_arguments.metal Makefile
@@ -232,10 +233,12 @@ $(AIR_LIB): tests/air_arguments.metal Makefile
 		-o $(BUILD)/air_arguments.air
 	xcrun -sdk macosx metallib $(BUILD)/air_arguments.air -o $@
 
-$(AIR_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxAirArguments.o tests/air_arguments_test.cpp $(HEADERS) Makefile
+AIR_TESTOBJS = $(BUILD)/obj/$(ARCH)/core/RgfxAirArguments.o \
+	$(BUILD)/obj/$(ARCH)/core/RgfxFunctionConstants.o
+
+$(AIR_TESTBIN): $(AIR_TESTOBJS) tests/air_arguments_test.cpp $(HEADERS) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(BUILD)/obj/$(ARCH)/core/RgfxAirArguments.o \
-		tests/air_arguments_test.cpp -o $@
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(AIR_TESTOBJS) tests/air_arguments_test.cpp -o $@
 
 # --- the device's base-class check (x86_64, Rosetta) --------------------------
 # Loads the bundle and checks, at run time, that every creator of the device's base classes is
