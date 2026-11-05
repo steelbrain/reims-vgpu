@@ -154,6 +154,8 @@ mod blit;
 mod close_cost;
 mod cmdbuf;
 mod commit_order;
+#[cfg(test)]
+mod composite_cost;
 mod compute;
 #[cfg(test)]
 mod draw_cost;
@@ -1731,6 +1733,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn walk_hook(&self) -> Option<WalkHook> {
         self.shared.walk_hook.lock().clone()
+    }
+
+    /// Has the walks commit a part of a buffer once it took `after` ([`Self::split_after`]), or
+    /// [`split::SPLIT_AFTER`] where `None` (for the tests and the benches).
+    #[cfg(test)]
+    pub(crate) fn set_split_after(&self, after: Option<std::time::Duration>) {
+        *self.shared.split_after.lock() = after;
     }
 
     /// How long a part of a command buffer is walked, at least, before the walk commits it
