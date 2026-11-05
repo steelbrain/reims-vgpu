@@ -1778,10 +1778,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The CPU's encodes into indirect command buffers go first, on the control ring, which the
 	// host carries out before any later command buffer of the process: the buffer sees every
 	// encode made before its commit, as on every Mac.
+	// So do the destroys the kext refused before (RgfxSerializer::destroy), which free what their
+	// objects lay over once posted.
 	if (RgfxSerializer *serializer = [queue serializer]) {
 		const RgfxIcbFlush flush = serializer->flushIcbWrites();
 		if (flush.messages != 0)
 			rgfxNoteIcbFlush(flush);
+		serializer->postWaitingDestroys();
 	}
 	// Held: it waits on an event not at its value as far as this process knows, or is posted
 	// behind a held buffer of its queue. Metal submits such a buffer only once it is scheduled,

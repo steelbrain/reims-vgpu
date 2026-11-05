@@ -111,9 +111,11 @@ NS_ASSUME_NONNULL_BEGIN
 #ifdef __cplusplus
 /// For a wrapper's dealloc: drops the object's host handle (OBJECT_DESTROY), then runs `after`
 /// (when set), which gives back what the host object lay over: its region block, its resource
-/// id; then the bytes of its Automatic heap it still holds go back. A command buffer that names
-/// the object keeps its wrapper until it completes, so no buffer in flight names a dropped
-/// object. Without a serialiser there is no host object.
+/// id; then the bytes of its Automatic heap it still holds go back. Where the destroy waits (the
+/// kext refused it), they go back once a later destroy or commit posts it
+/// (RgfxSerializer::destroy). A command buffer that names the object keeps its wrapper until it
+/// completes, so no buffer in flight names a dropped object. Without a serialiser there is no
+/// host object.
 - (void)rgfxRetireThen:(std::function<void()>)after;
 #endif
 

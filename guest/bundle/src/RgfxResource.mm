@@ -117,10 +117,13 @@ bool RgfxIsResourceClassSlow(__unsafe_unretained id obj, uintptr_t cls)
 		[rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
 		return;
 	}
-	serializer->destroy(_objId);
-	if (after)
-		after();
-	[rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
+	// Once the destroy is on the ring, which may be later where the kext refuses it now
+	// (RgfxSerializer::destroy): the host holds the object until then.
+	serializer->destroy(_objId, [after = std::move(after), rangeHeap, rangeOffset, rangeSize] {
+		if (after)
+			after();
+		[rangeHeap rgfxGiveRangeAt:rangeOffset size:rangeSize];
+	});
 }
 
 - (void)rgfxHoldHeapRange:(uint64_t)offset size:(uint64_t)size

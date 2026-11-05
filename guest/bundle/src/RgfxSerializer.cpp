@@ -1147,12 +1147,62 @@ RgfxCreated RgfxSerializer::createVideoSession(uint32_t codec, uint32_t directio
 	return out;
 }
 
-bool RgfxSerializer::destroy(RgfxObjId obj_id)
+bool RgfxSerializer::postDestroy(RgfxObjId obj_id)
+{
+	RgfxObjectDestroy msg = {};
+	msg.obj_id = obj_id;
+	return m_control.tryPost(RGFX_CMD_OBJECT_DESTROY, &msg, sizeof(msg), nullptr);
+}
+
+bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after)
 {
 	// A waiting record may name the object (a pipeline or a buffer the app lets go after
 	// encoding it), so the records go first.
 	flushIcbWrites();
-	RgfxObjectDestroy msg = {};
-	msg.obj_id = obj_id;
-	return m_control.tryPost(RGFX_CMD_OBJECT_DESTROY, &msg, sizeof(msg), nullptr);
+	// With none waiting, it goes at once; else behind those waiting, which go first.
+	const bool behind = m_destroysWaiting.load(std::memory_order_acquire);
+	if (!behind && postDestroy(obj_id)) {
+		if (after)
+			after();
+		return true;
+	}
+	{
+		std::lock_guard<std::mutex> lock(m_destroyLock);
+		m_destroys.push_back({obj_id, std::move(after)});
+		m_destroysWaiting.store(true, std::memory_order_release);
+	}
+	if (behind)
+		return postWaitingDestroys();
+	// Refused just now: it waits for the next destroy or commit.
+	static std::atomic<bool> logged{false};
+	if (!logged.exchange(true))
+		std::fprintf(stderr,
+		             "RGFX: the destroy of 0x%llx was not posted: it waits, and what the object "
+		             "lies over stays the host's, until a later destroy or commit posts it\n",
+		             static_cast<unsigned long long>(obj_id));
+	return false;
+}
+
+bool RgfxSerializer::postWaitingDestroys()
+{
+	if (!m_destroysWaiting.load(std::memory_order_acquire))
+		return true;
+	for (;;) {
+		WaitingDestroy posted;
+		{
+			std::lock_guard<std::mutex> lock(m_destroyLock);
+			if (m_destroys.empty()) {
+				m_destroysWaiting.store(false, std::memory_order_release);
+				return true;
+			}
+			if (!postDestroy(m_destroys.front().obj))
+				return false;
+			posted = std::move(m_destroys.front());
+			m_destroys.pop_front();
+		}
+		// Out of the lock: what it gives back may let go of more objects, whose destroys come
+		// here.
+		if (posted.after)
+			posted.after();
+	}
 }

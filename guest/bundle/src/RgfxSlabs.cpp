@@ -93,8 +93,10 @@ bool RgfxRegionSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap
 
 void RgfxRegionSlabSource::dropHeap(const Heap &heap)
 {
-	m_serializer.destroy(heap.objId);
-	m_serializer.releaseAddress(heap.gpuAddress);
+	// Its address goes back once the destroy is on the ring (RgfxSerializer::destroy).
+	RgfxSerializer &serializer = m_serializer;
+	const uint64_t address = heap.gpuAddress;
+	m_serializer.destroy(heap.objId, [&serializer, address] { serializer.releaseAddress(address); });
 }
 
 bool RgfxRegionSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset,

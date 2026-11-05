@@ -28,6 +28,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -500,8 +502,19 @@ public:
 
 	/// Drops the host handle for `obj_id` (an object of any kind, a queue
 	/// included: the host handle table knows the kind), after the waiting ICB records, which may
-	/// name it. Returns whether the message reached the ring.
-	bool destroy(RgfxObjId obj_id);
+	/// name it, then runs `after` (when set): what the host object lay over (its GPU address, its
+	/// resource id, its heap's bytes) goes back once the host is told to drop it. Where the
+	/// destroy does not reach the ring (the kext refused it, as it does where its control ring
+	/// stays full), the host still holds the object: the destroy and its `after` wait, behind any
+	/// destroy waiting before them, and go out at the next destroy() or postWaitingDestroys(), so
+	/// nothing reuses what the object lay over until the host has dropped it. Returns whether
+	/// this destroy reached the ring now.
+	bool destroy(RgfxObjId obj_id, std::function<void()> after = {});
+
+	/// Posts the destroys waiting (destroy()), in the order they were made, each one's `after`
+	/// run once it is on the ring, until one is refused again. One load where none waits.
+	/// Returns whether none waits now.
+	bool postWaitingDestroys();
 
 	/// The default alignment for a picked GPU address when the caller names none.
 	/// The caller passes a caps-derived alignment where Metal demands one; this
@@ -529,6 +542,19 @@ private:
 	};
 	std::mutex m_sizesLock;
 	std::unordered_map<SizeKey, SizeAnswer, SizeKeyHash> m_sizes;
+
+	// The destroys the ring did not take (destroy()), in the order they were made, under
+	// m_destroyLock, each posted under it so they reach the ring in that order; m_destroysWaiting
+	// says whether any waits.
+	struct WaitingDestroy {
+		RgfxObjId obj;
+		std::function<void()> after;
+	};
+	std::mutex m_destroyLock;
+	std::atomic<bool> m_destroysWaiting{false};
+	std::deque<WaitingDestroy> m_destroys;
+	// Posts OBJECT_DESTROY of `obj_id`: whether it reached the ring.
+	bool postDestroy(RgfxObjId obj_id);
 
 	// The ICB records waiting for flushIcbWrites(), under m_icbLock: one ICB_WRITE message for
 	// each buffer's run of records, in the order the runs began. m_icbPending is set as a record

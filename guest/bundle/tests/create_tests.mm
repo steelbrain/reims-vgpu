@@ -38,13 +38,15 @@ void rgfxCreateTests();
 namespace {
 
 // A device that takes the next `allow` messages and refuses every one after, as the kext's
-// submit does past a limit, though it takes every destroy: a serialiser over a control ring that
-// forwards each message. Never freed: objects a test lets go post their destroys through it
-// after the test.
+// submit does past a limit, though it takes every destroy while `refuseDestroys` is false: a
+// serialiser over a control ring that forwards each message. Never freed: objects a test lets go
+// post their destroys through it after the test.
 struct Refusing {
 	uint32_t allow = 0;
 	uint64_t seqno = 0;
-	std::vector<uint32_t> taken; // the types of the messages taken but destroys, in order
+	bool refuseDestroys = false;
+	std::vector<uint32_t> taken;   // the types of the messages taken but destroys, in order
+	std::vector<uint64_t> destroyed; // the objects of the destroys taken, in order
 	RgfxIdSpace &ids = *new RgfxIdSpace();
 	RgfxRingWriter &control = *new RgfxRingWriter(&Refusing::forward, this, 0x1000);
 	RgfxSerializer &ser = *new RgfxSerializer(control, ids);
@@ -62,6 +64,12 @@ struct Refusing {
 				return false;
 			r->allow--;
 			r->taken.push_back(h.type);
+		} else {
+			if (r->refuseDestroys)
+				return false;
+			RgfxObjectDestroy d = {};
+			std::memcpy(&d, message, sizeof(d));
+			r->destroyed.push_back(d.obj_id);
 		}
 		*seqno = ++r->seqno;
 		return true;
@@ -508,6 +516,70 @@ void test_refused_create_gives_its_gpu_address_back()
 	}
 }
 
+// A destroy the device never gets waits, and what its object lay over stays held: in a context
+// whose addresses hold one pick, a device buffer let go while destroys are refused leaves no
+// address to the next buffer, nor a texture let go its resource id, while they wait; a commit's
+// post of the waiting destroys (postWaitingDestroys) refused again keeps them waiting; once the
+// device takes destroys, the next destroy posts them first, in the order they were made, and
+// both go back.
+void test_refused_destroy_waits()
+{
+	Refusing &r = *new Refusing();
+	r.ids.setBases(0, RGFX_CONTEXT_VA_BASE, RgfxIdSpace::kAddressGranule);
+	auto buffer = [&] {
+		return [RgfxBuffer bufferWithLength:0x1000
+		                            options:MTLResourceStorageModePrivate
+		                             device:nil
+		                         serializer:&r.ser];
+	};
+	const uint64_t resourceId = r.ids.allocResourceId();
+	r.ids.freeResourceId(resourceId);
+	RgfxBuffer *b = nil;
+	RgfxTexture *t = nil;
+	r.allow = 8;
+	@autoreleasepool {
+		b = buffer();
+		t = [RgfxTexture textureWithDescriptor:texture2D(MTLStorageModePrivate)
+		                                  heap:RGFX_OBJ_NONE
+		                            heapOffset:0
+		                                device:nil
+		                            serializer:&r.ser];
+	}
+	CHECK(b != nil && t != nil);
+	const uint64_t bufferObj = b.rgfxObjId, textureObj = t.rgfxObjId;
+	CHECK(r.ser.postWaitingDestroys()); // none waits
+	r.refuseDestroys = true;
+	@autoreleasepool {
+		t = nil;
+	}
+	@autoreleasepool {
+		b = nil;
+	}
+	CHECK(r.destroyed.empty());
+	@autoreleasepool {
+		CHECK(buffer() == nil); // no address: the first buffer's is held
+	}
+	const uint64_t next = r.ids.allocResourceId();
+	CHECK(next != resourceId); // held too
+	r.ids.freeResourceId(next);
+	CHECK(!r.ser.postWaitingDestroys() && r.destroyed.empty());
+
+	r.refuseDestroys = false;
+	uint64_t eventObj = 0;
+	@autoreleasepool {
+		RgfxEvent *event = [RgfxEvent eventWithDevice:nil serializer:&r.ser];
+		CHECK(event != nil);
+		eventObj = event.rgfxObjId;
+	}
+	CHECK(r.destroyed == std::vector<uint64_t>({textureObj, bufferObj, eventObj}));
+	CHECK(r.ser.postWaitingDestroys());
+	CHECK(r.ids.allocResourceId() == resourceId);
+	r.ids.freeResourceId(resourceId);
+	@autoreleasepool {
+		CHECK(buffer() != nil);
+	}
+}
+
 } // namespace
 
 void rgfxCreateTests()
@@ -523,4 +595,5 @@ void rgfxCreateTests()
 	test_refused_depth_stencil_create_is_nil();
 	test_refused_state_is_not_cached();
 	test_refused_create_gives_its_gpu_address_back();
+	test_refused_destroy_waits();
 }
