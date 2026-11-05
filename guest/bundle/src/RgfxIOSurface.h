@@ -97,7 +97,11 @@
  * writes: the writers of each surface it uses, and the readers of each it writes, as the blocks
  * name them at its post (rgfxIOSurfaceNameOrder). Once posted it raises its own queue's slot, a
  * writer's or a reader's, so a post after it names it. A process
- * empties its reader slots as it does its writer slots.
+ * empties its reader slots as it does its writer slots. Where a record has no slot left for the
+ * queue, a slot of this process's that names a buffer of another of its queues, one the buffer
+ * runs after as its post named it, is given to it, and a read with no reader slot is named among
+ * the writers, which every later buffer that uses the surface names; only where every slot of
+ * both is another process's, or names a buffer it does not run after, is an access not named.
  *
  * IOSurface's use count is left as it is: Metal neither raises it nor reads it for GPU work
  * over a surface (measured, an M3 Max under macOS 27: IOSurfaceGetUseCount stays 0 and
@@ -240,10 +244,12 @@ std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
 /// its queue to be committed: a buffer committed behind one not yet committed runs after the
 /// accesses of other queues posted meanwhile, as it would on a Mac. The answer is the surfaces it
 /// only reads, whose readers it raises once posted (rgfxIOSurfaceNoteRead); empty without the
-/// order.
+/// order. `named` is set to the buffers the op names, which its naming of its accesses takes
+/// (rgfxIOSurfaceNoteCommitted, rgfxIOSurfaceNoteRead); empty without the order.
 std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameOrder(
     RgfxEncoder *_Nonnull enc, const std::vector<std::shared_ptr<void>> &writes,
-    const std::vector<std::shared_ptr<void>> &uses, uint64_t queueObjId);
+    const std::vector<std::shared_ptr<void>> &uses, uint64_t queueObjId,
+    std::vector<RgfxSurfaceOrderWait> *_Nonnull named);
 
 /// Whether the process names its command buffers' order over IOSurfaces: where the device's
 /// feature word holds RGFX_FEATURE_SURFACE_ORDER, as the device is made.
@@ -342,9 +348,12 @@ void rgfxIOSurfaceRetire(RgfxRegion *_Nonnull region, uint64_t queueObjId, uint6
 /// Once a command buffer is posted at seqno `seqno` on queue `queue` (whose id is `queueObjId`),
 /// and, held, scheduled: names it among the readers of each view in `reads`
 /// (rgfxIOSurfaceNameOrder's answer), so a later post of another queue's buffer that writes the
-/// surface runs after it.
+/// surface runs after it; where a view's readers have no slot left, among its writers. `named`
+/// is what its post's order named (rgfxIOSurfaceNameOrder): a slot of this process's whose
+/// buffer it runs after may be given to it where none is left.
 void rgfxIOSurfaceNoteRead(const std::vector<std::shared_ptr<void>> &reads, id _Nonnull queue,
-                           uint64_t queueObjId, uint64_t seqno);
+                           uint64_t queueObjId, uint64_t seqno,
+                           const std::vector<RgfxSurfaceOrderWait> &named);
 
 /// Once the host has finished queue `queueObjId`'s buffer at `seqno`, and its accesses are named
 /// (rgfxIOSurfaceNoteCommitted, rgfxIOSurfaceNoteRead): empties the queue's slots, of the writers
@@ -357,8 +366,11 @@ void rgfxIOSurfaceNoteFinished(const std::vector<std::shared_ptr<void>> &writes,
 /// Once a command buffer is posted at seqno `seqno` on queue `queue` (whose id is
 /// `queueObjId`), and, held, scheduled: names it among the writers of each copy in `writes`
 /// (taken from its encoder), once each, so a present of the surface after this waits for it.
+/// `named` is what its post's order named (rgfxIOSurfaceNameOrder): a writer slot of this
+/// process's whose buffer it runs after may be given to it where none is left.
 void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes, id _Nonnull queue,
-                                uint64_t queueObjId, uint64_t seqno);
+                                uint64_t queueObjId, uint64_t seqno,
+                                const std::vector<RgfxSurfaceOrderWait> &named);
 
 /// At a command buffer's completion: writes each copy in `writes` (taken from its
 /// encoder) back to its surface's pages, once each (a view in place needs none). It takes no

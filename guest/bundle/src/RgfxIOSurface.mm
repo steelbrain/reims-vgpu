@@ -422,11 +422,15 @@ struct RgfxSurfaceShadow {
 
 	~RgfxSurfaceShadow();
 
-	/// Names the buffer at `seqno` on `queue` (id `queueId`) among the copy's writers.
-	void noteWriter(id queue, uint64_t queueId, uint64_t seqno)
+	/// Names the buffer at `seqno` on `queue` (id `queueId`) among the copy's writers, which
+	/// ran after the buffers `named` (its post's SURFACE_ORDER, rgfxIOSurfaceNameOrder). Where no
+	/// slot is left, it takes one of this process's whose buffer it runs after (takeOver).
+	void noteWriter(id queue, uint64_t queueId, uint64_t seqno,
+	                const std::vector<RgfxSurfaceOrderWait> &named)
 	{
 		std::lock_guard<std::mutex> g(writersLock);
-		if (!noteIn(writers, slotQueue, slotOwner, queue, queueId, seqno)) {
+		if (!noteIn(writers, slotQueue, slotOwner, queue, queueId, seqno) &&
+		    !takeOver(writers, slotQueue, slotOwner, queue, queueId, seqno, named)) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
 				NSLog(@"RGFX: IOSurface %u: no writer slot left for queue 0x%llx: a present of "
@@ -436,18 +440,55 @@ struct RgfxSurfaceShadow {
 		}
 	}
 
-	/// Names the buffer at `seqno` on `queue` (id `queueId`) among the copy's readers.
-	void noteReader(id queue, uint64_t queueId, uint64_t seqno)
+	/// Names the buffer at `seqno` on `queue` (id `queueId`) among the copy's readers, which
+	/// ran after the buffers `named` (rgfxIOSurfaceNameOrder). Where no reader slot is left, it
+	/// is named among the writers instead, whose every slot a later buffer that uses the surface
+	/// names, a write as a read would: in the queue's writer slot, a free one, or one of this
+	/// process's whose buffer it runs after (takeOver). A read named so is waited for by a later
+	/// read too, and by a present, which is later than a Mac would and never sooner.
+	void noteReader(id queue, uint64_t queueId, uint64_t seqno,
+	                const std::vector<RgfxSurfaceOrderWait> &named)
 	{
 		std::lock_guard<std::mutex> g(writersLock);
-		if (!noteIn(readers, readerQueue, readerOwner, queue, queueId, seqno)) {
-			static std::atomic<bool> logged{false};
-			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: IOSurface %u: no reader slot left for queue 0x%llx: a later write "
-				      @"of the surface by another queue may not wait for its reads",
-				      surfaceId, (unsigned long long)queueId);
-			}
+		if (noteIn(readers, readerQueue, readerOwner, queue, queueId, seqno))
+			return;
+		if (writers != nullptr &&
+		    (noteIn(writers, slotQueue, slotOwner, queue, queueId, seqno) ||
+		     takeOver(writers, slotQueue, slotOwner, queue, queueId, seqno, named)))
+			return;
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: IOSurface %u: no reader or writer slot left for queue 0x%llx: a later "
+			      @"write of the surface by another queue may not wait for its reads",
+			      surfaceId, (unsigned long long)queueId);
 		}
+	}
+
+	/// Where `queue` finds no slot of `rec` (noteIn): gives it a slot of this process's that
+	/// names a buffer of another of its queues which the buffer at `seqno` runs after on the GPU,
+	/// its post having named that queue at the slot's seqno or later (`named`): a buffer that
+	/// names the slot from then on runs after both, as it would have run after each. A slot of
+	/// another process's is never written here, and one raised past what `named` holds is kept.
+	/// False where none is. Under writersLock.
+	static bool takeOver(RgfxSurfaceWriters *rec, uint64_t (&queues)[RGFX_SURFACE_WRITER_SLOTS],
+	                     __weak id (&owners)[RGFX_SURFACE_WRITER_SLOTS], id queue,
+	                     uint64_t queueId, uint64_t seqno,
+	                     const std::vector<RgfxSurfaceOrderWait> &named)
+	{
+		for (uint32_t i = 0; i < RGFX_SURFACE_WRITER_SLOTS; i++) {
+			const uint64_t holder = queues[i];
+			if (holder == 0 || holder == queueId)
+				continue;
+			// Only this process writes the slot.
+			const uint64_t held = __atomic_load_n(&rec->writers[i].seqno, __ATOMIC_RELAXED);
+			auto it = std::find_if(named.begin(), named.end(),
+			                       [holder](const auto &w) { return w.queue_obj_id == holder; });
+			if (it == named.end() || it->seqno < held)
+				continue;
+			give(rec, queues, owners, i, queue, queueId, seqno);
+			return true;
+		}
+		return false;
 	}
 
 	/// Raises `queue`'s slot of `rec` to `seqno`: the slot it holds, else one of ours whose queue
@@ -1625,9 +1666,11 @@ std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
 
 std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameOrder(
     RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes,
-    const std::vector<std::shared_ptr<void>> &uses, uint64_t queueObjId)
+    const std::vector<std::shared_ptr<void>> &uses, uint64_t queueObjId,
+    std::vector<RgfxSurfaceOrderWait> *named)
 {
 	std::vector<std::shared_ptr<void>> reads;
+	named->clear();
 	if (!gSurfaceOrder.load(std::memory_order_relaxed) || (uses.empty() && writes.empty()))
 		return reads;
 	// The buffers of other queues it runs after, as the surfaces' blocks name them now: of each
@@ -1654,6 +1697,7 @@ std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameOrder(
 		reads.push_back(u);
 	}
 	enc->prependSurfaceOrder(waits.data(), waits.size());
+	*named = std::move(waits);
 	return reads;
 }
 
@@ -1785,7 +1829,8 @@ void rgfxIOSurfaceRetire(RgfxRegion *region, uint64_t queueObjId, uint64_t seqno
 }
 
 void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes, id queue,
-                                uint64_t queueObjId, uint64_t seqno)
+                                uint64_t queueObjId, uint64_t seqno,
+                                const std::vector<RgfxSurfaceOrderWait> &named)
 {
 	std::vector<RgfxSurfaceShadow *> done;
 	for (const auto &w : writes) {
@@ -1794,15 +1839,16 @@ void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes
 			continue;
 		}
 		done.push_back(s);
-		s->noteWriter(queue, queueObjId, seqno);
+		s->noteWriter(queue, queueObjId, seqno, named);
 	}
 }
 
 void rgfxIOSurfaceNoteRead(const std::vector<std::shared_ptr<void>> &reads, id queue,
-                           uint64_t queueObjId, uint64_t seqno)
+                           uint64_t queueObjId, uint64_t seqno,
+                           const std::vector<RgfxSurfaceOrderWait> &named)
 {
 	for (const auto &r : reads)
-		static_cast<RgfxSurfaceShadow *>(r.get())->noteReader(queue, queueObjId, seqno);
+		static_cast<RgfxSurfaceShadow *>(r.get())->noteReader(queue, queueObjId, seqno, named);
 }
 
 void rgfxIOSurfaceNoteFinished(const std::vector<std::shared_ptr<void>> &writes,

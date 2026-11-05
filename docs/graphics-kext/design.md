@@ -2107,11 +2107,17 @@ committed in. The bundle names the order instead, as it posts each buffer:
 - A slot names a buffer only while it runs: once the host has finished it, and
   its post has named it, its process empties the slot where no later buffer of
   the queue raised it, as a buffer that named it would wait for nothing. Four
-  slots of each record are shared by every process's queues, so a fifth queue
-  finds one only once a buffer another holds has finished; one that finds none
-  is not named (its process logs it once), so a later write of the surface by
-  another queue waits for none of that queue's reads, nor a present or a read
-  for its writes.
+  slots of each record are shared by every process's queues. A queue that finds
+  none free takes one of its process's that names a buffer of another of its
+  queues which its own buffer runs after, its post having named that buffer:
+  whatever names the slot from then on runs after both. A read that finds no
+  reader slot is named among the writers instead (its queue's writer slot, a
+  free one, or one taken so), which every later buffer that uses the surface
+  names: a later read, and a present, then wait for it too, later than a Mac
+  would and never sooner. Only an access whose record holds every slot for
+  other processes' queues, or for buffers it does not run after, is not named
+  (its process logs it once), so a later write of the surface by another queue
+  waits for none of that queue's reads, nor a present or a read for its writes.
 - The post of a buffer that uses surfaces, just before it goes on its queue's
   ring, reads, for each, the writers of other queues, and where the buffer
   writes the surface the readers too, and names each queue once, at its highest

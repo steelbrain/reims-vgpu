@@ -1377,6 +1377,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	std::mutex _namedLock;
 	std::vector<std::shared_ptr<void>> _namedWrites;
 	std::vector<std::shared_ptr<void>> _namedReads;
+	// The buffers of other queues its post's order named (rgfxIOSurfaceNameOrder), which it runs
+	// after: where a record has no slot left for it, one of this process's naming one of them is.
+	std::vector<RgfxSurfaceOrderWait> _namedOrder;
 	RgfxRegion *_namedRegion;
 	bool _namedGone;
 	// The events it waits on, each with its value, and the plain events it signals: whether a
@@ -1720,7 +1723,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// the surfaces' blocks name them now, as it goes on its ring: a Mac orders a buffer's
 	// accesses at its submission, which waits for the buffers enqueued before it on its queue to
 	// be committed (rgfxIOSurfaceNameOrder).
-	_surfaceReads = rgfxIOSurfaceNameOrder(_encoder, _surfaceWrites, _surfaceUses, queue.rgfxObjId);
+	std::vector<RgfxSurfaceOrderWait> order;
+	_surfaceReads =
+	    rgfxIOSurfaceNameOrder(_encoder, _surfaceWrites, _surfaceUses, queue.rgfxObjId, &order);
 	_surfaceUses.clear();
 	// The copies it writes, named among their writers once it is posted: its completion may
 	// clear _surfaceWrites by then.
@@ -1814,6 +1819,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 			if (!_namedGone) {
 				_namedWrites = std::move(written);
 				_namedReads = std::move(read);
+				_namedOrder = std::move(order);
 				_namedRegion = writesRegion;
 			}
 		}
@@ -1942,9 +1948,9 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	const uint64_t queueId = queue.rgfxObjId;
 	std::lock_guard<std::mutex> g(_namedLock);
 	if (!_namedWrites.empty())
-		rgfxIOSurfaceNoteCommitted(_namedWrites, queue, queueId, _seqno);
+		rgfxIOSurfaceNoteCommitted(_namedWrites, queue, queueId, _seqno, _namedOrder);
 	if (!_namedReads.empty())
-		rgfxIOSurfaceNoteRead(_namedReads, queue, queueId, _seqno);
+		rgfxIOSurfaceNoteRead(_namedReads, queue, queueId, _seqno, _namedOrder);
 	if (_namedRegion != nullptr) {
 		rgfxIOSurfaceWritesPosted(_namedRegion, _namedWrites, queueId, _seqno);
 		_writesNamed.store(true, std::memory_order_release);
@@ -2030,6 +2036,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		std::lock_guard<std::mutex> g(_namedLock);
 		_namedWrites.clear();
 		_namedReads.clear();
+		_namedOrder.clear();
 		_namedRegion = nullptr;
 		_namedGone = true;
 	}
@@ -2063,6 +2070,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		std::lock_guard<std::mutex> g(_namedLock);
 		_namedWrites.clear();
 		_namedReads.clear();
+		_namedOrder.clear();
 		_namedRegion = nullptr;
 		_namedGone = true;
 	}
