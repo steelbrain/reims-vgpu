@@ -64,7 +64,7 @@ int main()
 	    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
 	    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_VIDEO_SESSION_CREATE,
 	    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
-	    RGFX_CMD_HEAP_OVER_PAGES,
+	    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_MANAGED_BUFFER_CREATE,
 	};
 	const uint32_t makesNone[] = {
 	    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_TEXTURE_REPLACE_REGION,
@@ -83,7 +83,7 @@ int main()
 		for (uint32_t t : makesNone)
 			listed |= t == type;
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
-		    type == RGFX_CMD_HEAP_OVER_PAGES)
+		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE)
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");

@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out eleven:
+// its bundle carry out thirteen:
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
@@ -44,6 +44,10 @@
 //  - MANAGED_TEXTURE_SLABS (bit 21): the bundle lays its Managed textures' CPU copies in its
 //    buffers' slabs, its own pages among them, and names a slab's buffer as each copy, which needs
 //    nothing of the kext;
+//  - MANAGED_BUFFER_SLABS (bit 22): the bundle lays its Managed buffers' CPU copies in its Shared
+//    buffers' slabs, its own pages among them, and names a slab's buffer as each copy
+//    (MANAGED_BUFFER_CREATE, which Submit posts as it posts MANAGED_TEXTURE_CREATE), which needs
+//    nothing more of the kext;
 //  - DISPLAY_COLOR (bit 24): the display pipe takes its gamma selectors (5 to 7) and sends each
 //    transaction's gamma tables and colour matrix as DISPLAY_COLOR parts before its present, a
 //    transaction that sets only a colour as a present that keeps the surface shown
@@ -74,7 +78,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_UNSHARED_QUEUES |
     RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
     RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS | RGFX_FEATURE_DISPLAY_COLOR;
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS | RGFX_FEATURE_MANAGED_BUFFER_SLABS |
+    RGFX_FEATURE_DISPLAY_COLOR;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
