@@ -517,9 +517,11 @@ pub(crate) struct CacheCounts {
     /// Releases of a written cache whose surface had no client left
     /// (`RGFX_BLOCK_RELEASE_NO_CLIENT`), copied into the pages all the same.
     pub(crate) unread: u64,
-    /// Releases of a written cache whose surface nothing but the kext held
-    /// (`RGFX_BLOCK_RELEASE_UNHELD`), dropped uncopied, and their bytes; and those the header
-    /// said a process took the surface again, copied.
+    /// Releases whose surface nothing but the kext held (`RGFX_BLOCK_RELEASE_UNHELD`), every one,
+    /// as the kext counts them; of them, those of a written cache, dropped uncopied (its pages
+    /// named or not), and their bytes; and those the header said a process took the surface
+    /// again, copied.
+    pub(crate) unheld_released: u64,
     pub(crate) unheld: u64,
     pub(crate) unheld_bytes: u64,
     pub(crate) retaken: u64,
@@ -1482,7 +1484,10 @@ impl<P: Platform> SurfaceCaches<P> {
         let written = self.written_since_host(block);
         let flagged = flags & RGFX_BLOCK_RELEASE_UNHELD != 0;
         let unheld = written && flagged && clients == Some(0);
-        if unheld && self.unattached(block).is_none() {
+        if flagged {
+            self.counts.unheld_released += 1;
+        }
+        if unheld {
             let length = (self.by_block.get(&block)).map_or(0, |cache| cache.length);
             self.counts.unheld += 1;
             self.counts.unheld_bytes += length;
@@ -2953,9 +2958,11 @@ mod tests {
         );
         assert_eq!((counts.unheld, counts.downloads, counts.retaken), (1, 0, 0));
         assert_eq!(counts.unheld_bytes, 2 * cached().page, "the cache's bytes");
+        assert_eq!(counts.unheld_released, 1);
         let (copied, at_once, counts) = release_written(RGFX_BLOCK_RELEASE_NO_CLIENT, 0);
         assert_eq!((copied, at_once), (1, false), "an old kext's: copied");
         assert_eq!((counts.unheld, counts.downloads, counts.unread), (0, 1, 1));
+        assert_eq!(counts.unheld_released, 0);
         let (copied, _, counts) = release_written(RGFX_BLOCK_RELEASE_NO_CLIENT | 1 << 31, 0);
         assert_eq!(
             (copied, counts.unheld),
@@ -2965,6 +2972,63 @@ mod tests {
         let (copied, at_once, counts) = release_written(unheld, 1);
         assert_eq!((copied, at_once), (1, false), "taken again: copied");
         assert_eq!((counts.unheld, counts.retaken, counts.downloads), (0, 1, 1));
+        assert_eq!(
+            counts.unheld_released, 1,
+            "counted among the unheld all the same"
+        );
+    }
+
+    /// Every release the kext flags unheld is counted, as the kext counts them, so the two logs'
+    /// counts of them agree: of a cache nothing wrote, which drops nothing, and of a deferred
+    /// block's written cache whose pages were never named, which drops the GPU's write uncopied as
+    /// an attached cache's is, and counts among the drops and their bytes
+    #[test]
+    fn every_unheld_release_is_counted_and_every_written_one_dropped() {
+        use reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
+        let unheld = RGFX_BLOCK_RELEASE_NO_CLIENT | RGFX_BLOCK_RELEASE_UNHELD;
+        let released = |r: &Rig| {
+            let done = Arc::new(AtomicBool::new(false));
+            let set = Arc::clone(&done);
+            r.dec.block_released(
+                &r.device,
+                BLOCK,
+                unheld,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+                no_raise(),
+            );
+            done
+        };
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(released(&r).load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.unheld_released, counts.unheld, counts.downloads),
+            (1, 0, 0),
+            "unwritten: counted, nothing dropped"
+        );
+
+        let mut r = deferring(8);
+        let page = r.page;
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
+        assert!(
+            r.dec
+                .region
+                .write(BLOCK + CLIENTS_OFFSET, &0u32.to_le_bytes())
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert!(released(&r).load(Ordering::SeqCst), "at once");
+        assert!(copies(&r.p.call_log().since(mark)).is_empty(), "no pages");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.unheld_released, counts.unheld, counts.unattached),
+            (1, 1, 1),
+            "a written cache never named: dropped uncopied"
+        );
+        assert_eq!(counts.unheld_bytes, 2 * page);
     }
 
     /// A release flagged unheld behind a writer still running is decided as its copy is made, at

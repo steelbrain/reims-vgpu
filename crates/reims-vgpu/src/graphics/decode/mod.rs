@@ -1111,16 +1111,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                     "IOSurface device caches: {} made; {} fills of {} MiB ({} as made), {} \
                      downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
                      downloads the host's devices' writes changed; {} written caches copied at a \
-                     release with no client left; {} dropped uncopied, held by the kext alone \
-                     ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
+                     release with no client left; {} released held by the kext alone, as the \
+                     kext counts them: {} of them written since their last copy, dropped \
+                     uncopied ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
                      generation past the cache's; {} \
                      deferred, {} refused, {} named their pages ({} copied), {} released \
                      unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
                      refused",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
-                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.unheld,
-                    d.unheld_bytes >> 20, d.retaken, d.behind,
+                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
+                    d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
                     d.by_runs, d.runs_refused

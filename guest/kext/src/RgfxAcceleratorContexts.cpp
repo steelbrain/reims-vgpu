@@ -195,13 +195,16 @@ struct DormantStats {
 	// Let go past a cap, a table entry or the region's room, of a surface made volatile.
 	UInt64 volatileFirst;
 	// Blocks of cached surfaces released with no client of the surface left
-	// (RGFX_BLOCK_RELEASE_NO_CLIENT), and of them those whose cache a buffer wrote since its
-	// last copy, which the host copies into the pages all the same.
+	// (RGFX_BLOCK_RELEASE_NO_CLIENT), and of them those with GPU writes named that no lock's
+	// download copied: the host copies the cache into the pages all the same where it holds a
+	// write the pages do not (an early copy, or a device of the host, may have put it there).
 	UInt64 unread;
 	UInt64 unreadWritten;
-	// Of them, those nothing but the kext held (RGFX_BLOCK_RELEASE_UNHELD), and of those the ones
-	// whose cache a buffer wrote since its last copy, which the host drops uncopied where no
-	// process took the surface again before its copy (rgfxSurfaceCacheRetaken counts those).
+	// Of them, those nothing but the kext held (RGFX_BLOCK_RELEASE_UNHELD), every one, which the
+	// host counts too, the same set; and of those the ones with GPU writes named that no lock's
+	// download copied, at least as many as the host drops uncopied: it drops a cache that holds
+	// a write its pages do not, where no process took the surface again before its copy
+	// (rgfxSurfaceCacheRetaken counts those).
 	UInt64 unheld;
 	UInt64 unheldWritten;
 	// Blocks deferred (RgfxSurfaceBlocks.hpp), deferrals the host refused, and deferred blocks
@@ -1406,9 +1409,10 @@ void noteDormant()
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
 		      "volatile), %llu asked otherwise, %llu past the deferred bytes; %llu released with "
-		      "no client left (%llu of them written, copied all the same), %llu of them held by "
-		      "the kext alone (%llu written, which the host drops uncopied; %llu taken again "
-		      "before the answer); %llu not cached: no room; %llu deferred (%llu refused), %llu "
+		      "no client left (%llu with GPU writes no download copied), %llu of them held by "
+		      "the kext alone, as the host counts them (%llu with GPU writes no download copied; "
+		      "%llu taken again before the answer); %llu not cached: no room; %llu deferred "
+		      "(%llu refused), %llu "
 		      "released with no pages named; %llu asks found a cached block by its surface\n",
 		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
 		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
