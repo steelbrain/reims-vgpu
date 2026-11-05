@@ -250,6 +250,50 @@ pub const RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS: u16 = 0x104f;
 /// host without it faults the buffer at the op, as at any tag it does not know.
 pub const RGFX_OP_RENDER_RESET_STATE: u16 = 0x1050;
 
+// The object and mesh stages' bindings and the mesh draws, where the guest took
+// [`RGFX_FEATURE_MESH_PIPELINES`](crate::wire::RGFX_FEATURE_MESH_PIPELINES): a host without the
+// feature faults the buffer at each, as at any tag it does not know.
+
+/// Op `SET_OBJECT_BUFFERS` ([`RgfxOpSetObjectBuffers`]): `setObjectBuffers:offsets:withRange:`,
+/// and `setObjectBuffer:offset:atIndex:` as a range of one.
+pub const RGFX_OP_RENDER_SET_OBJECT_BUFFERS: u16 = 0x1051;
+/// Op `SET_MESH_BUFFERS` ([`RgfxOpSetMeshBuffers`]): `setMeshBuffers:offsets:withRange:`, and
+/// `setMeshBuffer:offset:atIndex:` as a range of one.
+pub const RGFX_OP_RENDER_SET_MESH_BUFFERS: u16 = 0x1052;
+/// Op `SET_OBJECT_BUFFER_OFFSET` ([`RgfxOpSetObjectBufferOffset`]):
+/// `setObjectBufferOffset:atIndex:`.
+pub const RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET: u16 = 0x1053;
+/// Op `SET_MESH_BUFFER_OFFSET` ([`RgfxOpSetMeshBufferOffset`]): `setMeshBufferOffset:atIndex:`.
+pub const RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET: u16 = 0x1054;
+/// Op `SET_OBJECT_TEXTURES` ([`RgfxOpSetObjectTextures`]): `setObjectTextures:withRange:`.
+pub const RGFX_OP_RENDER_SET_OBJECT_TEXTURES: u16 = 0x1055;
+/// Op `SET_MESH_TEXTURES` ([`RgfxOpSetMeshTextures`]): `setMeshTextures:withRange:`.
+pub const RGFX_OP_RENDER_SET_MESH_TEXTURES: u16 = 0x1056;
+/// Op `SET_OBJECT_SAMPLER_STATES` ([`RgfxOpSetObjectSamplerStates`]):
+/// `setObjectSamplerStates:withRange:`.
+pub const RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES: u16 = 0x1057;
+/// Op `SET_MESH_SAMPLER_STATES` ([`RgfxOpSetMeshSamplerStates`]):
+/// `setMeshSamplerStates:withRange:`.
+pub const RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES: u16 = 0x1058;
+/// Op `SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetObjectSamplerStatesLodClamps`]):
+/// `setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+pub const RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS: u16 = 0x1059;
+/// Op `SET_MESH_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetMeshSamplerStatesLodClamps`]):
+/// `setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+pub const RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS: u16 = 0x105a;
+/// Op `SET_OBJECT_THREADGROUP_MEMORY_LENGTH` ([`RgfxOpSetObjectThreadgroupMemoryLength`]):
+/// `setObjectThreadgroupMemoryLength:atIndex:`.
+pub const RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH: u16 = 0x105b;
+/// Op `DRAW_MESH_THREADGROUPS` ([`RgfxOpDrawMeshThreadgroups`]):
+/// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+pub const RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS: u16 = 0x105c;
+/// Op `DRAW_MESH_THREADS` ([`RgfxOpDrawMeshThreads`]):
+/// `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+pub const RGFX_OP_RENDER_DRAW_MESH_THREADS: u16 = 0x105d;
+/// Op `DRAW_MESH_THREADGROUPS_INDIRECT` ([`RgfxOpDrawMeshThreadgroupsIndirect`]):
+/// `drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+pub const RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT: u16 = 0x105e;
+
 // The resource-kind tags are shared across the encoder groups (defined once in the parent
 // module) so the guest-facing ABI has a single numbering.
 pub use super::{
@@ -1558,6 +1602,196 @@ pub struct RgfxOpUseResourcesStages {
     pub stages: u64,
 }
 
+// ---- The object and mesh stages and the mesh draws. ----
+
+/// `setObjectBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`] records follow at
+/// `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetObjectBuffers {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxBufferBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setMeshBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`] records follow at
+/// `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetMeshBuffers {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxBufferBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setObjectBufferOffset:atIndex:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetObjectBufferOffset {
+    /// The new offset.
+    pub offset: u64,
+    /// The buffer binding index.
+    pub index: u64,
+}
+
+/// `setMeshBufferOffset:atIndex:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetMeshBufferOffset {
+    /// The new offset.
+    pub offset: u64,
+    /// The buffer binding index.
+    pub index: u64,
+}
+
+/// `setObjectTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records follow at
+/// `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetObjectTextures {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxTextureBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setMeshTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records follow at
+/// `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetMeshTextures {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxTextureBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setObjectSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`] records follow at
+/// `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetObjectSamplerStates {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxSamplerBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setMeshSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`] records follow at
+/// `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetMeshSamplerStates {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxSamplerBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+/// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetObjectSamplerStatesLodClamps {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+/// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetMeshSamplerStatesLodClamps {
+    /// `range.location`: the first binding index.
+    pub range_location: u64,
+    /// `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+    pub range_length: u64,
+}
+
+/// `setObjectThreadgroupMemoryLength:atIndex:`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpSetObjectThreadgroupMemoryLength {
+    /// The threadgroup memory length.
+    pub length: u64,
+    /// The binding index.
+    pub index: u64,
+}
+
+/// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`. The `MTLSize`
+/// fields are `NSUInteger`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpDrawMeshThreadgroups {
+    /// `threadgroupsPerGrid`: width, height and depth.
+    pub threadgroups_per_grid: [u64; 3],
+    /// `threadsPerObjectThreadgroup`: width, height and depth.
+    pub threads_per_object_threadgroup: [u64; 3],
+    /// `threadsPerMeshThreadgroup`: width, height and depth.
+    pub threads_per_mesh_threadgroup: [u64; 3],
+}
+
+/// `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`. The `MTLSize` fields
+/// are `NSUInteger`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpDrawMeshThreads {
+    /// `threadsPerGrid`: width, height and depth.
+    pub threads_per_grid: [u64; 3],
+    /// `threadsPerObjectThreadgroup`: width, height and depth.
+    pub threads_per_object_threadgroup: [u64; 3],
+    /// `threadsPerMeshThreadgroup`: width, height and depth.
+    pub threads_per_mesh_threadgroup: [u64; 3],
+}
+
+/// `drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+/// The indirect buffer holds an `MTLDispatchThreadgroupsIndirectArguments`; nil (0) faults the
+/// buffer at the op.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxOpDrawMeshThreadgroupsIndirect {
+    /// The indirect buffer.
+    pub indirect_buffer_obj_id: u64,
+    /// The indirect arguments' offset in it.
+    pub indirect_buffer_offset: u64,
+    /// `threadsPerObjectThreadgroup`: width, height and depth.
+    pub threads_per_object_threadgroup: [u64; 3],
+    /// `threadsPerMeshThreadgroup`: width, height and depth.
+    pub threads_per_mesh_threadgroup: [u64; 3],
+}
+
 // The render ops' layout.
 const _: () = {
     use core::mem::size_of;
@@ -1669,6 +1903,27 @@ const _: () = {
     );
     assert!(RGFX_OP_RENDER_SET_DEPTH_STORE_ACTION_OPTIONS == 0x104f);
     assert!(super::op_group(RGFX_OP_RENDER_RESET_STATE) == super::RGFX_OP_GROUP_RENDER);
+    assert!(size_of::<RgfxOpSetObjectBuffers>() == 16);
+    assert!(size_of::<RgfxOpSetMeshBuffers>() == 16);
+    assert!(size_of::<RgfxOpSetObjectBufferOffset>() == 16);
+    assert!(size_of::<RgfxOpSetMeshBufferOffset>() == 16);
+    assert!(size_of::<RgfxOpSetObjectTextures>() == 16);
+    assert!(size_of::<RgfxOpSetMeshTextures>() == 16);
+    assert!(size_of::<RgfxOpSetObjectSamplerStates>() == 16);
+    assert!(size_of::<RgfxOpSetMeshSamplerStates>() == 16);
+    assert!(size_of::<RgfxOpSetObjectSamplerStatesLodClamps>() == 16);
+    assert!(size_of::<RgfxOpSetMeshSamplerStatesLodClamps>() == 16);
+    assert!(size_of::<RgfxOpSetObjectThreadgroupMemoryLength>() == 16);
+    assert!(size_of::<RgfxOpDrawMeshThreadgroups>() == 72);
+    assert!(size_of::<RgfxOpDrawMeshThreads>() == 72);
+    assert!(size_of::<RgfxOpDrawMeshThreadgroupsIndirect>() == 64);
+    // The mesh stages' tags follow RESET_STATE in a run of their own.
+    assert!(RGFX_OP_RENDER_SET_OBJECT_BUFFERS == RGFX_OP_RENDER_RESET_STATE + 1);
+    assert!(RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT == 0x105e);
+    assert!(
+        super::op_group(RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT)
+            == super::RGFX_OP_GROUP_RENDER
+    );
 };
 
 #[cfg(test)]
@@ -1714,6 +1969,25 @@ mod tests {
             RgfxOpDrawIndexedPrimitives::read_from_bytes(di.as_bytes()).unwrap(),
             di
         );
+
+        let mesh = RgfxOpDrawMeshThreadgroupsIndirect {
+            indirect_buffer_obj_id: 3,
+            indirect_buffer_offset: 16,
+            threads_per_object_threadgroup: [2, 1, 1],
+            threads_per_mesh_threadgroup: [4, 1, 1],
+        };
+        assert_eq!(
+            RgfxOpDrawMeshThreadgroupsIndirect::read_from_bytes(mesh.as_bytes()).unwrap(),
+            mesh
+        );
+        let threads = RgfxOpDrawMeshThreads {
+            threads_per_grid: [10, 1, 1],
+            threads_per_object_threadgroup: [1, 1, 1],
+            threads_per_mesh_threadgroup: [4, 1, 1],
+        };
+        // The three sizes lie in the op's order, each width first.
+        assert_eq!(&threads.as_bytes()[..8], &10u64.to_le_bytes());
+        assert_eq!(&threads.as_bytes()[48..56], &4u64.to_le_bytes());
     }
 
     /// A scalar, a signed, a float-bits and a bool-bearing op round-trip.

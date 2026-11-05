@@ -810,6 +810,59 @@
 // host without it faults the buffer at the op, as at any tag it does not know.
 #define RGFX_OP_RENDER_RESET_STATE 4176
 
+// Op `SET_OBJECT_BUFFERS` ([`RgfxOpSetObjectBuffers`]): `setObjectBuffers:offsets:withRange:`,
+// and `setObjectBuffer:offset:atIndex:` as a range of one.
+#define RGFX_OP_RENDER_SET_OBJECT_BUFFERS 4177
+
+// Op `SET_MESH_BUFFERS` ([`RgfxOpSetMeshBuffers`]): `setMeshBuffers:offsets:withRange:`, and
+// `setMeshBuffer:offset:atIndex:` as a range of one.
+#define RGFX_OP_RENDER_SET_MESH_BUFFERS 4178
+
+// Op `SET_OBJECT_BUFFER_OFFSET` ([`RgfxOpSetObjectBufferOffset`]):
+// `setObjectBufferOffset:atIndex:`.
+#define RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET 4179
+
+// Op `SET_MESH_BUFFER_OFFSET` ([`RgfxOpSetMeshBufferOffset`]): `setMeshBufferOffset:atIndex:`.
+#define RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET 4180
+
+// Op `SET_OBJECT_TEXTURES` ([`RgfxOpSetObjectTextures`]): `setObjectTextures:withRange:`.
+#define RGFX_OP_RENDER_SET_OBJECT_TEXTURES 4181
+
+// Op `SET_MESH_TEXTURES` ([`RgfxOpSetMeshTextures`]): `setMeshTextures:withRange:`.
+#define RGFX_OP_RENDER_SET_MESH_TEXTURES 4182
+
+// Op `SET_OBJECT_SAMPLER_STATES` ([`RgfxOpSetObjectSamplerStates`]):
+// `setObjectSamplerStates:withRange:`.
+#define RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES 4183
+
+// Op `SET_MESH_SAMPLER_STATES` ([`RgfxOpSetMeshSamplerStates`]):
+// `setMeshSamplerStates:withRange:`.
+#define RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES 4184
+
+// Op `SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetObjectSamplerStatesLodClamps`]):
+// `setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+#define RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS 4185
+
+// Op `SET_MESH_SAMPLER_STATES_LOD_CLAMPS` ([`RgfxOpSetMeshSamplerStatesLodClamps`]):
+// `setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:`.
+#define RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS 4186
+
+// Op `SET_OBJECT_THREADGROUP_MEMORY_LENGTH` ([`RgfxOpSetObjectThreadgroupMemoryLength`]):
+// `setObjectThreadgroupMemoryLength:atIndex:`.
+#define RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH 4187
+
+// Op `DRAW_MESH_THREADGROUPS` ([`RgfxOpDrawMeshThreadgroups`]):
+// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+#define RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS 4188
+
+// Op `DRAW_MESH_THREADS` ([`RgfxOpDrawMeshThreads`]):
+// `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+#define RGFX_OP_RENDER_DRAW_MESH_THREADS 4189
+
+// Op `DRAW_MESH_THREADGROUPS_INDIRECT` ([`RgfxOpDrawMeshThreadgroupsIndirect`]):
+// `drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+#define RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT 4190
+
 // Op `DECODE_H264` ([`RgfxVideoOpDecodeH264`], then its parameter sets): decode one H.264
 // access unit into an IOSurface of two planes, NV12's (`'420v'` or `'420f'`).
 //
@@ -894,7 +947,8 @@
 // [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
 // [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
 // [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
-// [`RGFX_FEATURE_SMALL_ID_CHUNKS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
+// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`] and
+// [`RGFX_FEATURE_MESH_PIPELINES`]). Bits 9 and 10 are
 // reserved.
 #define RGFX_REG_FEATURES_LO 8
 
@@ -1063,6 +1117,17 @@
 // `PRESENT_SURFACE` may carry [`RGFX_PRESENT_KEEP`], the present of a transaction that shows no
 // new surface. Every host offers it; one with no window answers its presents at once.
 #define RGFX_FEATURE_DISPLAY_COLOR (1 << 24)
+
+// `FEATURES_LO` bit 25, `MESH_PIPELINES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_MESH_RENDER_PIPELINE_CREATE`],
+// answered by a [`RgfxPipelineReflection`] of [`RGFX_PIPELINE_KIND_MESH`], and command buffers
+// carry the object and mesh stages' bindings and the mesh draws
+// ([`RGFX_OP_RENDER_SET_OBJECT_BUFFERS`](crate::ops::render::RGFX_OP_RENDER_SET_OBJECT_BUFFERS)
+// to [`RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT`](crate::ops::render::RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT)).
+// A host without it refuses the create as one it does not know, and faults a buffer at those
+// ops. Every host offers it; where the host's platform makes no mesh pipeline, the create is
+// refused as one the platform refused.
+#define RGFX_FEATURE_MESH_PIPELINES (1 << 25)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1507,6 +1572,14 @@
 // is the first bytes of a `Shared` buffer over the guest's memory the sender holds. A host
 // without the feature refuses the message as one it does not know. Not answered.
 #define RGFX_CMD_MANAGED_BUFFER_CREATE 557
+
+// Command `MESH_RENDER_PIPELINE_CREATE` ([`RgfxMeshRenderPipelineCreate`]), where the guest took
+// [`RGFX_FEATURE_MESH_PIPELINES`]: a mesh render pipeline from a descriptor
+// (`newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`), answered by
+// [`RGFX_EVT_PIPELINE_REFLECTION`] of [`RGFX_PIPELINE_KIND_MESH`] with its mesh tail
+// ([`RgfxMeshPipelineReflection`]). `OBJECT_DESTROY` drops it, as a render pipeline. A host
+// without the feature refuses the message as one it does not know.
+#define RGFX_CMD_MESH_RENDER_PIPELINE_CREATE 558
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -2081,6 +2154,13 @@
 // A pipeline reflection reply's kind: a compute pipeline.
 #define RGFX_PIPELINE_KIND_COMPUTE 1
 
+// A pipeline reflection reply's kind: a mesh render pipeline
+// ([`RGFX_CMD_MESH_RENDER_PIPELINE_CREATE`]). A reply of this kind whose `status` is
+// [`RGFX_PIPELINE_OK`] carries an [`RgfxMeshPipelineReflection`] at
+// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`], and its header's `size` says so; a refusal is the
+// plain reply.
+#define RGFX_PIPELINE_KIND_MESH 2
+
 // [`RgfxPipelineReflection`] `flags`: the state supports indirect command
 // buffers (`supportIndirectCommandBuffers`).
 #define RGFX_PIPELINE_REFLECT_SUPPORT_ICB (1 << 0)
@@ -2101,6 +2181,14 @@
 
 // [`RgfxRenderPipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
 #define RGFX_RENDER_PIPELINE_SUPPORT_ICB (1 << 3)
+
+// [`RgfxMeshRenderPipelineCreate`] `flags`, beside the `RGFX_RENDER_PIPELINE_*` ones:
+// `objectThreadgroupSizeIsMultipleOfThreadExecutionWidth`.
+#define RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH (1 << 4)
+
+// [`RgfxMeshRenderPipelineCreate`] `flags`:
+// `meshThreadgroupSizeIsMultipleOfThreadExecutionWidth`.
+#define RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH (1 << 5)
 
 // [`RgfxComputePipelineCreate`] `flags`:
 // `threadGroupSizeIsMultipleOfThreadExecutionWidth`.
@@ -2124,6 +2212,10 @@
 // [`RgfxLinkedFunction`] `list`: one of `MTLLinkedFunctions.groups`, the group its
 // `group_*` name.
 #define RGFX_LINKED_GROUP 3
+
+// Where a [`RGFX_PIPELINE_KIND_MESH`] reply's [`RgfxMeshPipelineReflection`] starts: right after
+// its [`RgfxPipelineReflection`].
+#define RGFX_PIPELINE_REFLECTION_MESH_OFFSET 80
 
 // One `MTLArgumentDescriptor` of an [`RgfxArgumentLayoutQuery`]; each enum is its Metal raw
 // value.
@@ -4296,6 +4388,117 @@ typedef struct {
   RgfxTextureDescriptor desc;
 } RgfxManagedTextureCreate;
 
+// The mesh stages' answers a made mesh render pipeline's reply carries after its
+// [`RgfxPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: the state's own
+// queries, as the host's platform answers them.
+typedef struct {
+  // `maxTotalThreadsPerObjectThreadgroup`.
+  uint32_t max_total_threads_per_object_threadgroup;
+  // `maxTotalThreadsPerMeshThreadgroup`.
+  uint32_t max_total_threads_per_mesh_threadgroup;
+  // `objectThreadExecutionWidth`.
+  uint32_t object_thread_execution_width;
+  // `meshThreadExecutionWidth`.
+  uint32_t mesh_thread_execution_width;
+  // `maxTotalThreadgroupsPerMeshGrid`, `u32::MAX` for any value past it (the x86 Macs answer
+  // `NSUIntegerMax`).
+  uint32_t max_total_threadgroups_per_mesh_grid;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+} RgfxMeshPipelineReflection;
+
+// `MESH_RENDER_PIPELINE_CREATE`: a mesh render pipeline from a descriptor
+// (`MTLMeshRenderPipelineDescriptor`), answered by [`RgfxPipelineReflection`] of
+// [`RGFX_PIPELINE_KIND_MESH`] with this create's `seqno`.
+//
+// The object, mesh and fragment functions are each named as a render pipeline's are
+// ([`RgfxRenderPipelineCreate`]): a library `obj_id` (0, with a name of 0 bytes, for no
+// function), an entry-point name in the message tail and a run of [`RgfxFunctionConstant`] in the
+// tail; each stage's linked functions (`objectLinkedFunctions`, `meshLinkedFunctions`,
+// `fragmentLinkedFunctions`) are runs of [`RgfxLinkedFunction`]. The colour attachments are
+// inline, `color_attachment_count` of them in use. The optional `label` is tail bytes. The
+// whole message's `size` is the fixed head plus the tail, rounded up to a multiple of 8.
+typedef struct {
+  // [`RGFX_CMD_MESH_RENDER_PIPELINE_CREATE`].
+  RgfxMsgHeader header;
+  // The new pipeline's guest-picked id.
+  uint64_t obj_id;
+  // The library the object function comes from; 0 for no object function.
+  uint64_t object_library_obj_id;
+  // The library the mesh function comes from; 0 for no mesh function.
+  uint64_t mesh_library_obj_id;
+  // The library the fragment function comes from; 0 for no fragment function.
+  uint64_t fragment_library_obj_id;
+  // The object entry-point name's byte offset from the message start.
+  uint32_t object_name_offset;
+  // The object entry-point name's length in bytes.
+  uint32_t object_name_len;
+  // The mesh entry-point name's byte offset from the message start.
+  uint32_t mesh_name_offset;
+  // The mesh entry-point name's length in bytes.
+  uint32_t mesh_name_len;
+  // The fragment entry-point name's byte offset from the message start.
+  uint32_t fragment_name_offset;
+  // The fragment entry-point name's length in bytes.
+  uint32_t fragment_name_len;
+  // The pipeline label's byte offset from the message start (0-length: none).
+  uint32_t label_offset;
+  // The pipeline label's length in bytes; 0 for no label.
+  uint32_t label_len;
+  // The object function constants' byte offset from the message start.
+  uint32_t object_constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the object function.
+  uint32_t object_constant_count;
+  // The mesh function constants' byte offset from the message start.
+  uint32_t mesh_constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the mesh function.
+  uint32_t mesh_constant_count;
+  // The fragment function constants' byte offset from the message start.
+  uint32_t fragment_constants_offset;
+  // The number of [`RgfxFunctionConstant`] for the fragment function.
+  uint32_t fragment_constant_count;
+  // The object stage's linked functions' byte offset from the message start.
+  uint32_t object_linked_offset;
+  // The number of [`RgfxLinkedFunction`] the object stage links.
+  uint32_t object_linked_count;
+  // The mesh stage's linked functions' byte offset from the message start.
+  uint32_t mesh_linked_offset;
+  // The number of [`RgfxLinkedFunction`] the mesh stage links.
+  uint32_t mesh_linked_count;
+  // The fragment stage's linked functions' byte offset from the message start.
+  uint32_t fragment_linked_offset;
+  // The number of [`RgfxLinkedFunction`] the fragment stage links.
+  uint32_t fragment_linked_count;
+  // `rasterSampleCount`.
+  uint32_t raster_sample_count;
+  // The colour attachments in use, up to 8 (the length of `colors`).
+  uint32_t color_attachment_count;
+  // `depthAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+  uint32_t depth_pixel_format;
+  // `stencilAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+  uint32_t stencil_pixel_format;
+  // The `RGFX_RENDER_PIPELINE_*` flags it has (`alphaToCoverageEnabled`, `alphaToOneEnabled`,
+  // `rasterizationEnabled`, `supportIndirectCommandBuffers`) and the `RGFX_MESH_PIPELINE_*`
+  // ones.
+  uint32_t flags;
+  // `maxTotalThreadsPerObjectThreadgroup`; 0 leaves Metal's.
+  uint32_t max_total_threads_per_object_threadgroup;
+  // `maxTotalThreadsPerMeshThreadgroup`; 0 leaves Metal's.
+  uint32_t max_total_threads_per_mesh_threadgroup;
+  // `maxTotalThreadgroupsPerMeshGrid`; 0 leaves Metal's.
+  uint32_t max_total_threadgroups_per_mesh_grid;
+  // `payloadMemoryLength`; 0 leaves Metal's.
+  uint32_t payload_memory_length;
+  // `maxVertexAmplificationCount`.
+  uint32_t max_vertex_amplification_count;
+  // `requiredThreadsPerObjectThreadgroup`, width, height and depth; all 0 for none.
+  uint32_t required_threads_per_object_threadgroup[3];
+  // `requiredThreadsPerMeshThreadgroup`, width, height and depth; all 0 for none.
+  uint32_t required_threads_per_mesh_threadgroup[3];
+  // The eight colour attachments; `color_attachment_count` are in use, the rest zeroed.
+  RgfxColorAttachmentDesc colors[8];
+} RgfxMeshRenderPipelineCreate;
+
 // One mode of a display in a `DISPLAYS` message.
 typedef struct {
   // Pixels a row.
@@ -4510,6 +4713,42 @@ typedef struct {
   // The instances to draw.
   uint64_t instance_count;
 } RgfxOpDrawIndexedPrimitivesInstances;
+
+// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`. The `MTLSize`
+// fields are `NSUInteger`.
+typedef struct {
+  // `threadgroupsPerGrid`: width, height and depth.
+  uint64_t threadgroups_per_grid[3];
+  // `threadsPerObjectThreadgroup`: width, height and depth.
+  uint64_t threads_per_object_threadgroup[3];
+  // `threadsPerMeshThreadgroup`: width, height and depth.
+  uint64_t threads_per_mesh_threadgroup[3];
+} RgfxOpDrawMeshThreadgroups;
+
+// `drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+// The indirect buffer holds an `MTLDispatchThreadgroupsIndirectArguments`; nil (0) faults the
+// buffer at the op.
+typedef struct {
+  // The indirect buffer.
+  uint64_t indirect_buffer_obj_id;
+  // The indirect arguments' offset in it.
+  uint64_t indirect_buffer_offset;
+  // `threadsPerObjectThreadgroup`: width, height and depth.
+  uint64_t threads_per_object_threadgroup[3];
+  // `threadsPerMeshThreadgroup`: width, height and depth.
+  uint64_t threads_per_mesh_threadgroup[3];
+} RgfxOpDrawMeshThreadgroupsIndirect;
+
+// `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`. The `MTLSize` fields
+// are `NSUInteger`.
+typedef struct {
+  // `threadsPerGrid`: width, height and depth.
+  uint64_t threads_per_grid[3];
+  // `threadsPerObjectThreadgroup`: width, height and depth.
+  uint64_t threads_per_object_threadgroup[3];
+  // `threadsPerMeshThreadgroup`: width, height and depth.
+  uint64_t threads_per_mesh_threadgroup[3];
+} RgfxOpDrawMeshThreads;
 
 // `drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:`.
 // The patch index buffer may be nil (`0`).
@@ -4839,6 +5078,102 @@ typedef struct {
   // Pads to a multiple of 8; 0.
   uint32_t reserved_04;
 } RgfxOpSetLineWidth;
+
+// `setMeshBufferOffset:atIndex:`.
+typedef struct {
+  // The new offset.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetMeshBufferOffset;
+
+// `setMeshBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxBufferBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetMeshBuffers;
+
+// `setMeshSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetMeshSamplerStates;
+
+// `setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetMeshSamplerStatesLodClamps;
+
+// `setMeshTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxTextureBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetMeshTextures;
+
+// `setObjectBufferOffset:atIndex:`.
+typedef struct {
+  // The new offset.
+  uint64_t offset;
+  // The buffer binding index.
+  uint64_t index;
+} RgfxOpSetObjectBufferOffset;
+
+// `setObjectBuffers:offsets:withRange:`. `range.length` [`RgfxBufferBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxBufferBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetObjectBuffers;
+
+// `setObjectSamplerStates:withRange:`. `range.length` [`RgfxSamplerBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetObjectSamplerStates;
+
+// `setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:`. `range.length`
+// [`RgfxSamplerLodBinding`] records follow at `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxSamplerLodBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetObjectSamplerStatesLodClamps;
+
+// `setObjectTextures:withRange:`. `range.length` [`RgfxTextureBinding`] records follow at
+// `size_of::<Self>()`.
+typedef struct {
+  // `range.location`: the first binding index.
+  uint64_t range_location;
+  // `range.length`: the [`RgfxTextureBinding`] records that follow.
+  uint64_t range_length;
+} RgfxOpSetObjectTextures;
+
+// `setObjectThreadgroupMemoryLength:atIndex:`.
+typedef struct {
+  // The threadgroup memory length.
+  uint64_t length;
+  // The binding index.
+  uint64_t index;
+} RgfxOpSetObjectThreadgroupMemoryLength;
 
 // `setPointSize:` (SPI). The size travels as its `f32` bits.
 typedef struct {

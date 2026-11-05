@@ -62,7 +62,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
 /// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
 /// [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
-/// [`RGFX_FEATURE_SMALL_ID_CHUNKS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
+/// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`] and
+/// [`RGFX_FEATURE_MESH_PIPELINES`]). Bits 9 and 10 are
 /// reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -207,6 +208,16 @@ pub const RGFX_FEATURE_SMALL_ID_CHUNKS: u32 = 1 << 23;
 /// `PRESENT_SURFACE` may carry [`RGFX_PRESENT_KEEP`], the present of a transaction that shows no
 /// new surface. Every host offers it; one with no window answers its presents at once.
 pub const RGFX_FEATURE_DISPLAY_COLOR: u32 = 1 << 24;
+/// `FEATURES_LO` bit 25, `MESH_PIPELINES`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_MESH_RENDER_PIPELINE_CREATE`],
+/// answered by a [`RgfxPipelineReflection`] of [`RGFX_PIPELINE_KIND_MESH`], and command buffers
+/// carry the object and mesh stages' bindings and the mesh draws
+/// ([`RGFX_OP_RENDER_SET_OBJECT_BUFFERS`](crate::ops::render::RGFX_OP_RENDER_SET_OBJECT_BUFFERS)
+/// to [`RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT`](crate::ops::render::RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT)).
+/// A host without it refuses the create as one it does not know, and faults a buffer at those
+/// ops. Every host offers it; where the host's platform makes no mesh pipeline, the create is
+/// refused as one the platform refused.
+pub const RGFX_FEATURE_MESH_PIPELINES: u32 = 1 << 25;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -616,6 +627,13 @@ pub const RGFX_CMD_ICB_SLOTS: u32 = 0x22c;
 /// is the first bytes of a `Shared` buffer over the guest's memory the sender holds. A host
 /// without the feature refuses the message as one it does not know. Not answered.
 pub const RGFX_CMD_MANAGED_BUFFER_CREATE: u32 = 0x22d;
+/// Command `MESH_RENDER_PIPELINE_CREATE` ([`RgfxMeshRenderPipelineCreate`]), where the guest took
+/// [`RGFX_FEATURE_MESH_PIPELINES`]: a mesh render pipeline from a descriptor
+/// (`newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`), answered by
+/// [`RGFX_EVT_PIPELINE_REFLECTION`] of [`RGFX_PIPELINE_KIND_MESH`] with its mesh tail
+/// ([`RgfxMeshPipelineReflection`]). `OBJECT_DESTROY` drops it, as a render pipeline. A host
+/// without the feature refuses the message as one it does not know.
+pub const RGFX_CMD_MESH_RENDER_PIPELINE_CREATE: u32 = 0x22e;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -3117,6 +3135,12 @@ pub const RGFX_PIPELINE_REFUSED: u32 = 1;
 pub const RGFX_PIPELINE_KIND_RENDER: u32 = 0;
 /// A pipeline reflection reply's kind: a compute pipeline.
 pub const RGFX_PIPELINE_KIND_COMPUTE: u32 = 1;
+/// A pipeline reflection reply's kind: a mesh render pipeline
+/// ([`RGFX_CMD_MESH_RENDER_PIPELINE_CREATE`]). A reply of this kind whose `status` is
+/// [`RGFX_PIPELINE_OK`] carries an [`RgfxMeshPipelineReflection`] at
+/// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`], and its header's `size` says so; a refusal is the
+/// plain reply.
+pub const RGFX_PIPELINE_KIND_MESH: u32 = 2;
 
 /// [`RgfxPipelineReflection`] `flags`: the state supports indirect command
 /// buffers (`supportIndirectCommandBuffers`).
@@ -3134,6 +3158,13 @@ pub const RGFX_RENDER_PIPELINE_ALPHA_TO_ONE: u32 = 1 << 1;
 pub const RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED: u32 = 1 << 2;
 /// [`RgfxRenderPipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
 pub const RGFX_RENDER_PIPELINE_SUPPORT_ICB: u32 = 1 << 3;
+
+/// [`RgfxMeshRenderPipelineCreate`] `flags`, beside the `RGFX_RENDER_PIPELINE_*` ones:
+/// `objectThreadgroupSizeIsMultipleOfThreadExecutionWidth`.
+pub const RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH: u32 = 1 << 4;
+/// [`RgfxMeshRenderPipelineCreate`] `flags`:
+/// `meshThreadgroupSizeIsMultipleOfThreadExecutionWidth`.
+pub const RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH: u32 = 1 << 5;
 
 /// [`RgfxComputePipelineCreate`] `flags`:
 /// `threadGroupSizeIsMultipleOfThreadExecutionWidth`.
@@ -3420,6 +3451,129 @@ pub struct RgfxComputePipelineCreate {
     pub reserved_5c: u32,
 }
 
+/// `MESH_RENDER_PIPELINE_CREATE`: a mesh render pipeline from a descriptor
+/// (`MTLMeshRenderPipelineDescriptor`), answered by [`RgfxPipelineReflection`] of
+/// [`RGFX_PIPELINE_KIND_MESH`] with this create's `seqno`.
+///
+/// The object, mesh and fragment functions are each named as a render pipeline's are
+/// ([`RgfxRenderPipelineCreate`]): a library `obj_id` (0, with a name of 0 bytes, for no
+/// function), an entry-point name in the message tail and a run of [`RgfxFunctionConstant`] in the
+/// tail; each stage's linked functions (`objectLinkedFunctions`, `meshLinkedFunctions`,
+/// `fragmentLinkedFunctions`) are runs of [`RgfxLinkedFunction`]. The colour attachments are
+/// inline, `color_attachment_count` of them in use. The optional `label` is tail bytes. The
+/// whole message's `size` is the fixed head plus the tail, rounded up to a multiple of 8.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxMeshRenderPipelineCreate {
+    /// [`RGFX_CMD_MESH_RENDER_PIPELINE_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new pipeline's guest-picked id.
+    pub obj_id: u64,
+    /// The library the object function comes from; 0 for no object function.
+    pub object_library_obj_id: u64,
+    /// The library the mesh function comes from; 0 for no mesh function.
+    pub mesh_library_obj_id: u64,
+    /// The library the fragment function comes from; 0 for no fragment function.
+    pub fragment_library_obj_id: u64,
+    /// The object entry-point name's byte offset from the message start.
+    pub object_name_offset: u32,
+    /// The object entry-point name's length in bytes.
+    pub object_name_len: u32,
+    /// The mesh entry-point name's byte offset from the message start.
+    pub mesh_name_offset: u32,
+    /// The mesh entry-point name's length in bytes.
+    pub mesh_name_len: u32,
+    /// The fragment entry-point name's byte offset from the message start.
+    pub fragment_name_offset: u32,
+    /// The fragment entry-point name's length in bytes.
+    pub fragment_name_len: u32,
+    /// The pipeline label's byte offset from the message start (0-length: none).
+    pub label_offset: u32,
+    /// The pipeline label's length in bytes; 0 for no label.
+    pub label_len: u32,
+    /// The object function constants' byte offset from the message start.
+    pub object_constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the object function.
+    pub object_constant_count: u32,
+    /// The mesh function constants' byte offset from the message start.
+    pub mesh_constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the mesh function.
+    pub mesh_constant_count: u32,
+    /// The fragment function constants' byte offset from the message start.
+    pub fragment_constants_offset: u32,
+    /// The number of [`RgfxFunctionConstant`] for the fragment function.
+    pub fragment_constant_count: u32,
+    /// The object stage's linked functions' byte offset from the message start.
+    pub object_linked_offset: u32,
+    /// The number of [`RgfxLinkedFunction`] the object stage links.
+    pub object_linked_count: u32,
+    /// The mesh stage's linked functions' byte offset from the message start.
+    pub mesh_linked_offset: u32,
+    /// The number of [`RgfxLinkedFunction`] the mesh stage links.
+    pub mesh_linked_count: u32,
+    /// The fragment stage's linked functions' byte offset from the message start.
+    pub fragment_linked_offset: u32,
+    /// The number of [`RgfxLinkedFunction`] the fragment stage links.
+    pub fragment_linked_count: u32,
+    /// `rasterSampleCount`.
+    pub raster_sample_count: u32,
+    /// The colour attachments in use, up to 8 (the length of `colors`).
+    pub color_attachment_count: u32,
+    /// `depthAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+    pub depth_pixel_format: u32,
+    /// `stencilAttachmentPixelFormat` (`MTLPixelFormat`; 0 for none).
+    pub stencil_pixel_format: u32,
+    /// The `RGFX_RENDER_PIPELINE_*` flags it has (`alphaToCoverageEnabled`, `alphaToOneEnabled`,
+    /// `rasterizationEnabled`, `supportIndirectCommandBuffers`) and the `RGFX_MESH_PIPELINE_*`
+    /// ones.
+    pub flags: u32,
+    /// `maxTotalThreadsPerObjectThreadgroup`; 0 leaves Metal's.
+    pub max_total_threads_per_object_threadgroup: u32,
+    /// `maxTotalThreadsPerMeshThreadgroup`; 0 leaves Metal's.
+    pub max_total_threads_per_mesh_threadgroup: u32,
+    /// `maxTotalThreadgroupsPerMeshGrid`; 0 leaves Metal's.
+    pub max_total_threadgroups_per_mesh_grid: u32,
+    /// `payloadMemoryLength`; 0 leaves Metal's.
+    pub payload_memory_length: u32,
+    /// `maxVertexAmplificationCount`.
+    pub max_vertex_amplification_count: u32,
+    /// `requiredThreadsPerObjectThreadgroup`, width, height and depth; all 0 for none.
+    pub required_threads_per_object_threadgroup: [u32; 3],
+    /// `requiredThreadsPerMeshThreadgroup`, width, height and depth; all 0 for none.
+    pub required_threads_per_mesh_threadgroup: [u32; 3],
+    /// The eight colour attachments; `color_attachment_count` are in use, the rest zeroed.
+    pub colors: [RgfxColorAttachmentDesc; 8],
+}
+
+/// Where a [`RGFX_PIPELINE_KIND_MESH`] reply's [`RgfxMeshPipelineReflection`] starts: right after
+/// its [`RgfxPipelineReflection`].
+pub const RGFX_PIPELINE_REFLECTION_MESH_OFFSET: u32 = 80;
+
+/// The mesh stages' answers a made mesh render pipeline's reply carries after its
+/// [`RgfxPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: the state's own
+/// queries, as the host's platform answers them.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxMeshPipelineReflection {
+    /// `maxTotalThreadsPerObjectThreadgroup`.
+    pub max_total_threads_per_object_threadgroup: u32,
+    /// `maxTotalThreadsPerMeshThreadgroup`.
+    pub max_total_threads_per_mesh_threadgroup: u32,
+    /// `objectThreadExecutionWidth`.
+    pub object_thread_execution_width: u32,
+    /// `meshThreadExecutionWidth`.
+    pub mesh_thread_execution_width: u32,
+    /// `maxTotalThreadgroupsPerMeshGrid`, `u32::MAX` for any value past it (the x86 Macs answer
+    /// `NSUIntegerMax`).
+    pub max_total_threadgroups_per_mesh_grid: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_14: u32,
+}
+
 /// `PIPELINE_REFLECTION`: a pipeline create's answer, with the pipeline state's
 /// own queries (the host platform exposes no per-argument binding reflection, so
 /// the argument tables Metal's `MTLRenderPipelineReflection` would carry are not
@@ -3550,6 +3704,10 @@ const _: () = {
     assert!(core::mem::offset_of!(RgfxRenderPipelineCreate, colors) == 128);
     assert!(size_of::<RgfxComputePipelineCreate>() == 96);
     assert!(size_of::<RgfxPipelineReflection>() == 80);
+    assert!(size_of::<RgfxMeshRenderPipelineCreate>() == 512);
+    assert!(core::mem::offset_of!(RgfxMeshRenderPipelineCreate, colors) == 192);
+    assert!(RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize == size_of::<RgfxPipelineReflection>());
+    assert!(size_of::<RgfxMeshPipelineReflection>() == 24);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
     assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_VBLANK);
@@ -3830,6 +3988,57 @@ mod tests {
         assert_eq!(
             RgfxPipelineReflection::read_from_bytes(reflection.as_bytes()).unwrap(),
             reflection
+        );
+
+        // A mesh create head, its colours at their offset, and its reply with the mesh tail.
+        let mesh = RgfxMeshRenderPipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+                size: size_of::<RgfxMeshRenderPipelineCreate>() as u32,
+                seqno: 11,
+            },
+            obj_id: 0x32,
+            mesh_library_obj_id: 0x10,
+            mesh_name_offset: size_of::<RgfxMeshRenderPipelineCreate>() as u32,
+            mesh_name_len: 4,
+            flags: RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED
+                | RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH,
+            max_total_threads_per_mesh_threadgroup: 128,
+            required_threads_per_mesh_threadgroup: [4, 1, 1],
+            color_attachment_count: 1,
+            colors: core::array::from_fn(|i| RgfxColorAttachmentDesc {
+                pixel_format: if i == 0 { 80 } else { 0 },
+                ..RgfxColorAttachmentDesc::default()
+            }),
+            ..RgfxMeshRenderPipelineCreate::default()
+        };
+        let bytes = mesh.as_bytes();
+        assert_eq!(&bytes[192..196], &80u32.to_le_bytes());
+        assert_eq!(
+            RgfxMeshRenderPipelineCreate::read_from_bytes(bytes).unwrap(),
+            mesh
+        );
+        let tail = RgfxMeshPipelineReflection {
+            max_total_threads_per_object_threadgroup: 1024,
+            max_total_threads_per_mesh_threadgroup: 128,
+            object_thread_execution_width: 32,
+            mesh_thread_execution_width: 32,
+            max_total_threadgroups_per_mesh_grid: 1024,
+            reserved_14: 0,
+        };
+        let mut reply = RgfxPipelineReflection {
+            kind: RGFX_PIPELINE_KIND_MESH,
+            ..reflection
+        };
+        reply.header.size = RGFX_PIPELINE_REFLECTION_MESH_OFFSET + size_of_val(&tail) as u32;
+        let mut msg = reply.as_bytes().to_vec();
+        msg.extend_from_slice(tail.as_bytes());
+        assert_eq!(msg.len(), 104);
+        let (head, rest) = RgfxPipelineReflection::read_from_prefix(&msg).unwrap();
+        assert_eq!(head, reply);
+        assert_eq!(
+            RgfxMeshPipelineReflection::read_from_bytes(rest).unwrap(),
+            tail
         );
     }
 }
