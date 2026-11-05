@@ -1665,7 +1665,11 @@ region block of its process's, which the guest maps, and the host decides the
 form from the platform's answer of whether the GPU shares the CPU's memory:
 - **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
   and a one-level 2D texture of a linear format a texture over its block's
-  Shared buffer; the range messages are checked and do nothing more.
+  Shared buffer; the range messages are checked and do nothing more. A texture
+  of any other shape is two copies, as below, and the guest's `getBytes:` of
+  it reads its GPU copy, copied on the device: on a GPU that shares the CPU's
+  memory Metal's CPU reads of a Managed texture see the GPU's writes with no
+  synchronize (the Intel UHD 630 and the M3, dgpu-oracle.md Q2).
 - **Otherwise:** two copies. The object the command buffers name is the
   platform's own Managed buffer (at the guest's address) or texture, and the
   block sits beside it as a Shared buffer.
@@ -1691,7 +1695,8 @@ form from the platform's answer of whether the GPU shares the CPU's memory:
   `guest/bundle/src/RgfxManagedLayout.hpp`): levels in order, then slices,
   images and rows of blocks, each row rounded up to 256 bytes.
 - In the guest, `replaceRegion:` and `getBytes:` are memcpys of the block, and
-  `replaceRegion:` posts its region; neither waits for the host. A format the
+  `replaceRegion:` posts its region; neither waits for the host, but for the
+  `getBytes:` of a two-copy texture on shared memory, above. A format the
   layout has no block for (depth, stencil, PVRTC, three-component) keeps no CPU
   copy.
 - Until the device's identity answers carry `hasUnifiedMemory`, the host takes

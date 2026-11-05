@@ -96,6 +96,17 @@ inline bool rgfxPixelFormatBlock(uint32_t format, RgfxFormatBlock *out)
 	return false;
 }
 
+/// Whether the host lays a Managed texture of `desc`, of a format of block `block`, over its CPU
+/// copy on a GPU that shares the CPU's memory: a one-level, one-sample 2D texture of a format a
+/// texture over a buffer can have, as the host's in_place_shape asks
+/// (crates/reims-vgpu/src/graphics/decode/managed.rs). Any other shape is two copies there too.
+inline bool rgfxManagedLiesOverCopy(const RgfxTextureDescriptor &desc,
+                                    const RgfxFormatBlock &block)
+{
+	return block.linear && desc.texture_type == 2 /* MTLTextureType2D */ &&
+	       desc.mipmap_level_count == 1 && desc.sample_count <= 1 && desc.array_length <= 1;
+}
+
 /// Where one level of a CPU copy lies.
 struct RgfxManagedLevel {
 	uint64_t offset;   // of its first slice

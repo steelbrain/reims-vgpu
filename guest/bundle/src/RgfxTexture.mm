@@ -528,6 +528,9 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
 	RgfxBuffer *_managedCpu;
 	uint8_t *_managedBytes;
 	std::unique_ptr<RgfxManagedLayout> _managedLayout;
+	// A Managed texture the host keeps in two copies on a GPU that shares the CPU's memory: its
+	// getBytes: reads the GPU's copy on the device (rgfxManagedGetBytes:).
+	BOOL _managedReadsGpuCopy;
 	// The buffer a texture made over one lies in (kept), its offset and bytes per row.
 	id<MTLBuffer> _buffer;
 	uint64_t _bufferOffset;
@@ -604,6 +607,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		t->_managedCpu = cpu;
 		t->_managedBytes = bytes;
 		t->_managedLayout = std::move(layout);
+		t->_managedReadsGpuCopy =
+		    [device hasUnifiedMemory] && !rgfxManagedLiesOverCopy(desc, block);
 		[t rgfxTakeDescriptor:descriptor];
 	}
 	return t;
@@ -1208,7 +1213,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // --- CPU access ----------------------------------------------------------------
 //
 // Each form dispatches on the texture's storage: a Managed texture with a CPU copy reads and
-// writes the copy (rgfxManaged...), with no round trip; any other is copied on the device
+// writes the copy (rgfxManaged...), with no round trip, but for the reads of one the host keeps
+// in two copies on a GPU that shares the CPU's memory; any other is copied on the device
 // (rgfxCopyRegion:, below), or refused where the CPU cannot reach it.
 
 /// The bytes of the texels of `region` of `level` and `slice` in the CPU copy, copied to or from
@@ -1287,7 +1293,11 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 }
 
 /// getBytes: of a Managed texture: the CPU copy read, as the GPU left it at the last
-/// synchronize the process waited for. False for a texture with no CPU copy.
+/// synchronize the process waited for. False for a texture with no CPU copy, and for one the host
+/// keeps in two copies on a GPU that shares the CPU's memory (_managedReadsGpuCopy), whose read
+/// goes to the GPU's copy on the device: there Metal's CPU reads of a Managed texture see the
+/// GPU's writes with no synchronize (the Intel 630 and the M3, docs/graphics-kext/dgpu-oracle.md
+/// Q2), and its replaceRegion: reaches that copy before any later command buffer.
 - (BOOL)rgfxManagedGetBytes:(void *)bytes
                 bytesPerRow:(NSUInteger)bytesPerRow
               bytesPerImage:(NSUInteger)bytesPerImage
@@ -1295,6 +1305,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
                       level:(NSUInteger)level
                       slice:(NSUInteger)slice
 {
+	if (_managedReadsGpuCopy) {
+		return NO;
+	}
 	uint64_t at = 0;
 	return [self rgfxManagedCopy:region
 	                       level:level

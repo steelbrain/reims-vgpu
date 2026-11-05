@@ -6318,6 +6318,110 @@ void test_managed_texture_cpu_copy()
 	}
 }
 
+// A device that answers whether its GPU shares the CPU's memory, and makes no queue and no
+// buffer: a CPU copy through it (rgfxCopyRegion:) asks for its queue, counted here, and copies
+// nothing.
+@interface RgfxUnifiedAnswerDevice : NSObject
+@property(nonatomic) BOOL unified;
+@property(nonatomic) NSUInteger queuesAsked;
+- (BOOL)hasUnifiedMemory;
+- (id<MTLCommandQueue>)newCommandQueue;
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options;
+@end
+@implementation RgfxUnifiedAnswerDevice
+- (BOOL)hasUnifiedMemory
+{
+	return _unified;
+}
+- (id<MTLCommandQueue>)newCommandQueue
+{
+	_queuesAsked++;
+	return nil;
+}
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	return nil;
+}
+@end
+
+// On a GPU that shares the CPU's memory, Metal's CPU reads of a Managed texture see the GPU's
+// writes with no synchronize (the Intel 630 and the M3, dgpu-oracle.md Q2). One the host keeps in
+// two copies there (any shape but one level, one sample, 2D, of a linear format) answers getBytes:
+// from its GPU copy, copied on the device, and not from its CPU copy; its replaceRegion: still
+// writes the CPU copy and posts the region, with no device copy. One the host lays over its CPU
+// copy, and any on a GPU of its own memory, reads its CPU copy.
+void test_managed_texture_reads_on_unified_memory()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Case {
+		BOOL unified;
+		NSUInteger levels;
+		NSUInteger arrayLength;
+		bool readsGpuCopy;
+	};
+	const Case cases[] = {
+	    {YES, 3, 1, true}, {YES, 1, 2, true},  {YES, 1, 1, false},
+	    {NO, 3, 1, false}, {NO, 1, 1, false},
+	};
+	for (const Case &c : cases) {
+		drainRing(fx.ring); // the last case's destroys
+		@autoreleasepool {
+			RgfxUnifiedAnswerDevice *device = [RgfxUnifiedAnswerDevice new];
+			device.unified = c.unified;
+			MTLTextureDescriptor *desc =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			                                                       width:64
+			                                                      height:16
+			                                                   mipmapped:c.levels > 1];
+			desc.mipmapLevelCount = c.levels;
+			if (c.arrayLength > 1) {
+				desc.textureType = MTLTextureType2DArray;
+				desc.arrayLength = c.arrayLength;
+			}
+			desc.storageMode = MTLStorageModeManaged;
+			RgfxTexture *tex = [RgfxTexture managedTextureWithDescriptor:desc
+			                                                      region:&region
+			                                                      device:(id<MTLDevice>)device
+			                                                  serializer:&fx.ser];
+			CHECK(tex != nil);
+			auto cpu =
+			    expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+			(void)expectMessage<RgfxManagedTextureCreate>(fx.ring,
+			                                              RGFX_CMD_MANAGED_TEXTURE_CREATE);
+			uint8_t *copy = mem.data() + cpu.region_offset;
+
+			// replaceRegion: writes the CPU copy and posts its region, on every GPU.
+			const uint8_t pixel[4] = {1, 2, 3, 4};
+			[tex replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+			       mipmapLevel:0
+			         withBytes:pixel
+			       bytesPerRow:4];
+			CHECK(std::memcmp(copy, pixel, 4) == 0);
+			(void)expectMessage<RgfxTextureReplaceRegion>(fx.ring,
+			                                              RGFX_CMD_TEXTURE_REPLACE_REGION);
+			CHECK(device.queuesAsked == 0);
+
+			// getBytes: of the pixel the CPU copy holds.
+			uint8_t back[4] = {};
+			[tex getBytes:back bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+			if (c.readsGpuCopy) {
+				// On the device, which here copies nothing back.
+				CHECK(device.queuesAsked == 1);
+				CHECK(back[0] == 0 && back[3] == 0);
+			} else {
+				CHECK(device.queuesAsked == 0);
+				CHECK(std::memcmp(back, pixel, 4) == 0);
+			}
+			RgfxMsgHeader extra = {};
+			std::vector<uint8_t> extraBytes;
+			CHECK(!fx.ring.next(&extra, &extraBytes)); // neither read posts a message
+		}
+	}
+	drainRing(fx.ring);
+}
+
 // --- host objects go as the app lets them go ----------------------------------------------
 
 // The obj_id of the OBJECT_DESTROY next on `ring`.
@@ -10859,6 +10963,7 @@ int main(int argc, char **argv)
 		test_buffer_texture_did_modify_data_tells_the_host();
 		test_buffer_texture_linear_alignment();
 		test_managed_texture_cpu_copy();
+		test_managed_texture_reads_on_unified_memory();
 		test_objects_destroyed_as_let_go();
 		test_function_keeps_its_library();
 		test_heap_outlives_its_resources();

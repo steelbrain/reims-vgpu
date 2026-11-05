@@ -23,8 +23,13 @@
 //!     block where the blit encoder runs them ([`GraphicsDecoder::synchronize_managed`]), so the
 //!     CPU sees it once the command buffer completes.
 //!
-//! A shape the platform cannot make in place takes the two copies on any GPU: they hold Metal's
-//! contract everywhere.
+//! A shape the platform cannot make in place takes the two copies on any GPU. On a GPU that shares
+//! the CPU's memory the guest's CPU reads of such a texture (`getBytes:`) then take its GPU copy,
+//! copied on the device: there Metal's CPU reads of a `Managed` texture see the GPU's writes with
+//! no synchronize (the Intel UHD 630 and the M3, docs/graphics-kext/dgpu-oracle.md Q2). The
+//! bundle knows the shape alone ([`in_place_shape`], its `rgfxManagedLiesOverCopy`), so a texture
+//! of that shape whose texture over its buffer the platform refuses, two copies too, reads its
+//! CPU copy, as the last synchronize left it.
 //!
 //! **Where the platform refuses a GPU's copy** (its memory is full), the object is one copy over
 //! its block, as on a GPU that shares the CPU's memory, and the GPU reads and writes the guest's
