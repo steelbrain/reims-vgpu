@@ -245,7 +245,13 @@ impl Guest {
 
     /// Publishes `command` on the submission ring (its `seqno` the next, its `size` its length)
     /// and rings the doorbell.
-    fn send<P: ApiPlatform>(&mut self, device: &GraphicsDevice<P>, mut command: Vec<u8>) {
+    fn send<P: ApiPlatform>(&mut self, device: &GraphicsDevice<P>, command: Vec<u8>) {
+        self.publish(command);
+        device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    }
+
+    /// [`Self::send`], with no doorbell rung.
+    fn publish(&mut self, mut command: Vec<u8>) {
         self.seqno += 1;
         command[8..16].copy_from_slice(&self.seqno.to_le_bytes());
         let len = command.len() as u32;
@@ -265,7 +271,40 @@ impl Guest {
             self.produced += command.len() as u64;
             self.store_u64(RGFX_CONTROL_SUBMIT_OFFSET as usize, self.produced);
         }
-        device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    }
+
+    /// Whether the control thread has `consumer_idle` set: it sleeps, or is about to.
+    fn control_idle(&self) -> bool {
+        // SAFETY: as the helpers above; `consumer_idle` is at 0x80 of the submission ring.
+        unsafe {
+            AtomicU32::from_ptr(
+                self.base
+                    .add(RGFX_CONTROL_SUBMIT_OFFSET as usize + 0x80)
+                    .cast(),
+            )
+            .load(Ordering::SeqCst)
+                == 1
+        }
+    }
+
+    /// Arms the control completion ring: the next record raises the control vector.
+    fn arm(&self) {
+        // SAFETY: as the helpers above; `armed` is at 0xc0 of the completion ring.
+        unsafe {
+            AtomicU32::from_ptr(
+                self.base
+                    .add(RGFX_CONTROL_COMPLETE_OFFSET as usize + 0xc0)
+                    .cast(),
+            )
+            .store(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the completion ring holds an event not taken yet.
+    fn event_waiting(&self) -> bool {
+        // SAFETY: as the helpers above.
+        let produced = unsafe { self.load_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize) };
+        produced != self.consumed
     }
 
     /// The next completion-ring event where one is there now; else `None`, waiting for none.
@@ -1292,6 +1331,92 @@ fn a_doorbell_s_answer_allocates_nothing() {
     }
     let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
+}
+
+/// A landed download's answer at its ring-0 doorbell (`mmio_write_taking`) neither allocates nor
+/// frees on the ringing thread, the guest's vCPU: each of four downloads of a block with no device
+/// cache, whose pages hold it, is answered inside the write, its `COMPLETE` posted and the control
+/// vector raised on that thread. The write answers only where the control thread sleeps with
+/// nothing in flight, which `consumer_idle` does not show alone (the thread sets it before it
+/// sleeps): a download the write left is answered by the control thread, and the next is rung,
+/// up to 64.
+#[test]
+fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
+
+    thread_local! {
+        /// Set while this thread rings the doorbell.
+        static RINGING: Cell<bool> = const { Cell::new(false) };
+    }
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let here = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&here);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |_| {
+                if RINGING.with(Cell::get) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let download = RgfxSurfaceDownload {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_DOWNLOAD,
+            size: 0,
+            seqno: 0,
+        },
+        block_offset: BLOCK,
+    };
+    let mut answered = 0;
+    for _ in 0..64 {
+        if answered == 4 {
+            break;
+        }
+        assert!(
+            eventually(|| guest.control_idle()),
+            "the control thread never slept"
+        );
+        guest.arm();
+        guest.publish(download.as_bytes().to_vec());
+        let raised = here.load(Ordering::SeqCst);
+        let ((), calls) = crate::counted::allocator_calls_in(|| {
+            RINGING.with(|r| r.set(true));
+            device.mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+            RINGING.with(|r| r.set(false));
+        });
+        if here.load(Ordering::SeqCst) > raised {
+            assert!(guest.event_waiting(), "raised with no answer");
+            assert_eq!(
+                calls,
+                (0, 0),
+                "the answer of download {} called the allocator (allocations, frees)",
+                guest.seqno
+            );
+            answered += 1;
+        }
+        let bytes = guest.event().expect("an answer");
+        let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            (
+                complete.header.r#type,
+                complete.header.seqno,
+                complete.status
+            ),
+            (RGFX_EVT_COMPLETE, guest.seqno, RGFX_STATUS_OK)
+        );
+    }
+    assert_eq!(
+        answered, 4,
+        "the writes answered {answered} downloads of 64"
+    );
 }
 
 /// What a lone command buffer that asks for its `CB_SUBMITTED` costs from its doorbell write to
@@ -4100,19 +4225,23 @@ fn a_drain_s_first_doorbell_to_its_last_cb_complete() {
 
 /// What a CPU lock's `SURFACE_DOWNLOAD` costs the device from its doorbell to its `COMPLETE`
 /// where the surface's pages already hold its cache (a decoder's output whose early copy has
-/// landed, or a cache nothing wrote): the control thread's wake and take, a block lane's wake
-/// where the download goes to the lane, and the answer, with the device's threads asleep before
-/// each, as between a client's frames. The fake platform's GPU shares the CPU's memory, so the
-/// block has no cache and the host answers at once, as it does a landed copy. Printed as p50,
-/// p90 and p99 in microseconds over 2000 downloads, after 100 to warm up: a measurement, run by
-/// hand (`--run-ignored only --no-capture`, in a release build).
+/// landed, or a cache nothing wrote), with the device's threads asleep before each, as between a
+/// client's frames: rung by `mmio_write`, the control thread's wake and take, a block lane's wake
+/// where the download goes to the lane, and the answer; rung by `mmio_write_taking`, the answer
+/// on the ringing thread inside the write where it is answered there, else as by `mmio_write`
+/// (how many were, it prints). The fake platform's GPU shares the CPU's memory, so the
+/// block has no cache and the host answers at once, as it does a landed copy. The two writes
+/// take turns, [`SIDE_ROUNDS`] rounds of 1000 downloads each after 100 to warm up, so a load
+/// on the host falls on both: each round's p50, p90 and p99 in microseconds are printed, then
+/// each write's median of its rounds' p50s and their spread. A measurement, run by hand
+/// (`--run-ignored only --no-capture`, in a release build).
 #[test]
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
 fn a_landed_download_s_doorbell_to_its_answer() {
     use std::time::Instant;
 
-    const ROUNDS: usize = 2000;
+    const ROUNDS: usize = 1000;
     const WARM: usize = 100;
     const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
     let raised = Arc::new(AtomicU32::new(0));
@@ -4127,42 +4256,76 @@ fn a_landed_download_s_doorbell_to_its_answer() {
         },
         block_offset: BLOCK,
     };
-    let mut us = Vec::with_capacity(ROUNDS);
-    for round in 0..WARM + ROUNDS {
-        // A pause as between a client's frames, so the device's threads sleep.
-        std::thread::sleep(Duration::from_millis(2));
-        let start = Instant::now();
-        guest.send(&device, download.as_bytes().to_vec());
-        let bytes = loop {
-            if let Some(bytes) = guest.event_now() {
-                break bytes;
+    let writes = [("mmio_write", false), ("mmio_write_taking", true)];
+    let mut p50s: [Vec<f64>; 2] = Default::default();
+    for side_round in 0..SIDE_ROUNDS {
+        // Each round in turn order and its reverse, so neither write always goes first.
+        let order = if side_round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for side in order {
+            let (write, taking) = writes[side];
+            let mut us = Vec::with_capacity(ROUNDS);
+            let mut inside = 0;
+            for round in 0..WARM + ROUNDS {
+                // A pause as between a client's frames, so the device's threads sleep.
+                std::thread::sleep(Duration::from_millis(2));
+                let start = Instant::now();
+                guest.publish(download.as_bytes().to_vec());
+                if taking {
+                    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+                    if round >= WARM && guest.event_waiting() {
+                        inside += 1;
+                    }
+                } else {
+                    device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+                }
+                let bytes = loop {
+                    if let Some(bytes) = guest.event_now() {
+                        break bytes;
+                    }
+                    assert!(
+                        start.elapsed() < Duration::from_secs(2),
+                        "the download went unanswered"
+                    );
+                    std::hint::spin_loop();
+                };
+                let elapsed = start.elapsed();
+                let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+                assert_eq!(
+                    (complete.header.r#type, complete.status),
+                    (RGFX_EVT_COMPLETE, RGFX_STATUS_OK)
+                );
+                if round >= WARM {
+                    us.push(elapsed.as_secs_f64() * 1e6);
+                }
             }
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "the download went unanswered"
+            us.sort_by(f64::total_cmp);
+            let n = us.len();
+            p50s[side].push(us[n / 2]);
+            println!(
+                "landed download, doorbell ({write}) to COMPLETE, round {side_round}: p50 {:.1} \
+                 p90 {:.1} p99 {:.1} max {:.1} us; answered inside the write {inside} of {ROUNDS}",
+                us[n / 2],
+                us[n * 9 / 10],
+                us[n * 99 / 100],
+                us[n - 1],
             );
-            std::hint::spin_loop();
-        };
-        let elapsed = start.elapsed();
-        let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
-        assert_eq!(
-            (complete.header.r#type, complete.status),
-            (RGFX_EVT_COMPLETE, RGFX_STATUS_OK)
-        );
-        if round >= WARM {
-            us.push(elapsed.as_secs_f64() * 1e6);
         }
     }
-    us.sort_by(f64::total_cmp);
-    let n = us.len();
-    println!(
-        "landed download, doorbell to COMPLETE: p50 {:.1} p90 {:.1} p99 {:.1} max {:.1} us",
-        us[n / 2],
-        us[n * 9 / 10],
-        us[n * 99 / 100],
-        us[n - 1],
-    );
+    for (side, (write, _)) in writes.iter().enumerate() {
+        let mut rounds = p50s[side].clone();
+        rounds.sort_by(f64::total_cmp);
+        println!(
+            "landed download, doorbell ({write}) to COMPLETE: median of {SIDE_ROUNDS} rounds' p50 \
+             {:.1} us, spread {:.1} to {:.1} us",
+            rounds[rounds.len() / 2],
+            rounds[0],
+            rounds[rounds.len() - 1],
+        );
+    }
 }
+
+/// How many rounds each side of a before-and-after measurement takes, in turns.
+const SIDE_ROUNDS: usize = 5;
 
 /// A command buffer that asks for its `CB_SUBMITTED`, sent behind one of its queue that waits for
 /// an event and is still being walked, is answered at its scheduling, after that one's, not at its

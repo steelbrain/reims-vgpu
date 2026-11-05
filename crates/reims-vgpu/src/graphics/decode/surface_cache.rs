@@ -304,6 +304,11 @@ impl Landing {
         self.waiting.lock().is_none()
     }
 
+    /// [`Self::landed`], its lock tried: `None` where it is held.
+    fn try_landed(&self) -> Option<bool> {
+        Some(self.waiting.try_lock()?.is_none())
+    }
+
     /// Gives `done` once the copy landed: here where it has.
     fn then(&self, done: Answer) {
         let mut waiting = self.waiting.lock();
@@ -2025,6 +2030,41 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(self.last_fill(block))
     }
 
+    /// Whether a `SURFACE_DOWNLOAD` of the block at `block` asked now is carried out at once with
+    /// nothing to copy and nothing to wait for ([`Self::download`] after [`Self::after_writers`]):
+    /// no command buffer begun and not finished may write its cache, no copy out of it waits for
+    /// one, and it has no cache, or one no command buffer wrote since its last copy whose last
+    /// early copy, if any, and last copy on the transfer queue, if any, have landed (their locks
+    /// tried). Where so, the download's counts are kept as `download` keeps them; where not,
+    /// nothing is changed, and a cache a command buffer wrote is left to `download`, whatever a
+    /// device of the host wrote of its pages. Allocates and frees nothing.
+    fn downloaded_now(&mut self, block: u64) -> bool {
+        if self.pending(block, true) > 0 || self.deferring(block) {
+            return false;
+        }
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return true;
+        };
+        if cache.written
+            || (cache.out.as_ref()).is_some_and(|out| out.landing.try_landed() != Some(true))
+        {
+            return false;
+        }
+        let read_back = &mut cache.read_back;
+        match read_back.copy.as_ref() {
+            Some(copy) => {
+                if copy.landing.try_landed() != Some(true) {
+                    return false;
+                }
+                if std::mem::take(&mut read_back.unread) {
+                    self.counts.early_read += 1;
+                }
+            }
+            None => self.counts.clean += 1,
+        }
+        true
+    }
+
     /// `SURFACE_DOWNLOAD` of the block at `block`: the pages written from its cache, after every
     /// command buffer that used it, where one that may write it was committed since its last copy,
     /// no device of the host wrote the pages since its last fill, and the CPU's generation `cpu`
@@ -2916,6 +2956,22 @@ impl<P: Platform> Caches<P> {
         drop(state);
         self.moved.notify_all();
         true
+    }
+
+    /// [`Self::try_download`] on a doorbell's thread, the guest's vCPU: whether the download is
+    /// carried out at once with nothing to copy and nothing to wait for
+    /// ([`SurfaceCaches::downloaded_now`]), the caches' lock tried, which the caller then answers.
+    /// Allocates and frees nothing.
+    pub(crate) fn try_downloaded(&self, block: u64) -> bool {
+        let Some(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        let done = state.downloaded_now(block);
+        drop(state);
+        if done {
+            self.moved.notify_all();
+        }
+        done
     }
 
     /// The block at `block` went, its `BLOCK_RELEASE` ([`SurfaceCaches::released`]), after every

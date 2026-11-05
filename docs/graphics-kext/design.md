@@ -2714,6 +2714,19 @@ commit. Each outcome the new design allows is one of those two:
   and the close is answered once its buffers have finished
   (`a_close_during_a_walk_holds_up_nothing_on_ring_0`). A doorbell's take tries
   every lock it takes, and takes nothing it would have to let go of.
+- **A landed download at ring 0's doorbell.** A write of ring 0's doorbell
+  through `Device::mmio_write_taking` takes ring 0's next message on the
+  writing thread and answers it there where it is a `SURFACE_DOWNLOAD` the
+  host has carried out already (`Host::surface_downloaded`: the block has no
+  device cache, or one nothing wrote since its last copy, whose early copy has
+  landed), the control thread sleeps with every answer of what it took posted,
+  the block's lane has nothing left, and the control completion ring has room;
+  each lock is tried, and nothing is allocated or freed. The `COMPLETE` is
+  posted and the control vector raised before the write returns, so a CPU
+  lock of a decoder's output whose copy has landed no longer waits for the
+  control thread's wake. QEMU takes ring 0's doorbell with an ioeventfd,
+  whose file the control thread polls, so under QEMU this applies only once
+  `reims-graphics-pci` sends that write through `_mmio_write_taking` too.
 - **The answer at the doorbell.** A queue's doorbell write, on the guest's
   vCPU, may answer `CB_SUBMITTED` to the buffer at the head of the queue's ring
   before the queue's thread wakes to take it (`reims_graphics`'s

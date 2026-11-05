@@ -932,6 +932,18 @@ pub(crate) struct Answered {
 }
 
 impl<P: Platform> Decoders<P> {
+    /// A `SURFACE_DOWNLOAD` of the block at `block` on a doorbell's thread, the guest's vCPU
+    /// (`reims_graphics::Host::surface_downloaded`): whether it is carried out already, its
+    /// `SURFACE_PAGES` settled ([`super::worker::Unsettled`]) and the caches answering it at once
+    /// with nothing to copy and nothing to wait for ([`super::surface_cache`]), as
+    /// [`super::GraphicsDecoder::try_surface_download`] would; each lock tried. Allocates and
+    /// frees nothing.
+    pub(crate) fn downloaded_at_doorbell(&self, block: u64) -> bool {
+        let shared = &*self.0;
+        shared.unsettled.try_any(std::iter::once(block)) == Some(false)
+            && shared.surface_caches.try_downloaded(block)
+    }
+
     /// Answers the `COMMAND_BUFFER` `message`, of `context`'s, at the head of its queue's ring,
     /// `CB_SUBMITTED` on a doorbell's thread, before its queue's service thread takes it (the
     /// module doc), where it gets that at its take ([`Begun::submitted_at_take`]) with nothing

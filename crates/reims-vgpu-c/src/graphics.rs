@@ -392,9 +392,14 @@ pub unsafe extern "C" fn rvg_graphics_device_mmio_write(
 /// holds while it calls this. A buffer is answered only where nothing need be waited for (each
 /// lock the answer needs is tried, and the queue's thread holds none of the queue's messages), and
 /// the answer allocates nothing; the queue's thread then takes the buffer, as it takes any, and
-/// the write wakes it, as rvg_graphics_device_mmio_write does. What the guest sees is the same
-/// either way but for when the event comes. It waits for nothing rvg_graphics_device_mmio_write
-/// does not. On any thread, the vCPU's included. Calls back: raise_interrupt, as above.
+/// the write wakes it, as rvg_graphics_device_mmio_write does. A write of
+/// RVG_GRAPHICS_DOORBELL_CONTROL may likewise take the control ring's next message on the calling
+/// thread and answer it there, raising the interrupt inside the call, where it is a surface
+/// download whose pages hold the surface's GPU copy already and the control thread sleeps with
+/// every earlier message carried out (each lock tried, nothing allocated); else the control
+/// thread takes it. What the guest sees is the same either way but for when the event comes. It
+/// waits for nothing rvg_graphics_device_mmio_write does not. On any thread, the vCPU's included.
+/// Calls back: raise_interrupt, as above.
 ///
 /// # Safety
 /// `device` is a live graphics device handle.

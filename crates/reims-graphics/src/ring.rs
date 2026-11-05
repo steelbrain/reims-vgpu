@@ -383,6 +383,11 @@ impl Consumer {
         self.consume(region, u64::from(message.header.size));
     }
 
+    /// [`Self::take`] of the message whose `header` [`Self::peek_into`] answered last.
+    pub(crate) fn take_header(&mut self, region: &Region, header: &RgfxMsgHeader) {
+        self.consume(region, u64::from(header.size));
+    }
+
     /// Moves the host's count on by `size` and publishes it: the guest may write those bytes
     /// again.
     fn consume(&mut self, region: &Region, size: u64) {
@@ -524,6 +529,23 @@ impl Producer {
     pub(crate) fn reset(&mut self, region: &Region) {
         self.count = 0;
         self.at.initialize(region, false);
+    }
+
+    /// Whether [`Self::post`] of a message of `len` bytes would find room now, a pad to the
+    /// ring's end included: false too where the guest's count is out of reach. The guest only
+    /// makes more room, so a post that follows with no other post between finds it.
+    pub(crate) fn has_room(&self, region: &Region, len: usize) -> bool {
+        let guest = region
+            .atomic_u64(self.at.header + CONSUMER)
+            .load(Ordering::Acquire);
+        let used = self.count.wrapping_sub(guest);
+        let Some(free) = self.at.data_size.checked_sub(used) else {
+            return false;
+        };
+        let len = len as u64;
+        let left = self.at.left_to_end(self.count);
+        let pad = if left < len { left } else { 0 };
+        pad + len <= free
     }
 
     /// Writes `message` (its header first, its `size` its length, a multiple of 8, at least 16

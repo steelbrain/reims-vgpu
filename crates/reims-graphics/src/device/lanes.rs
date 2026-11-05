@@ -637,6 +637,11 @@ impl Lanes {
         self.state.lock().busy_through(key).is_none()
     }
 
+    /// [`Self::lane_idle`], the lanes' lock tried: `None` where it is held.
+    pub(super) fn try_lane_idle(&self, key: Key) -> Option<bool> {
+        Some(self.state.try_lock()?.busy_through(key).is_none())
+    }
+
     /// Ring 0's thread `index`, which [`Self::hand`] asked for to serve the lane `key`, could not
     /// be started: the lane has no thread after all, and its jobs are carried out by whoever calls
     /// [`Self::next`] with no thread's index.

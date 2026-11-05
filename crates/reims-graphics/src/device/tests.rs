@@ -3257,6 +3257,11 @@ struct OrderSeen {
     here: Arc<AtomicBool>,
     /// The thread each download was carried out on, in order.
     downloaded_on: Arc<Mutex<Vec<Option<String>>>>,
+    /// While set, the host has carried out a download offered on a doorbell's thread already
+    /// ([`Host::surface_downloaded`]); else it leaves each to the control thread.
+    at_doorbell: Arc<AtomicBool>,
+    /// While set, a download the control thread offers waits there, the thread awake.
+    hold_here: Arc<AtomicBool>,
 }
 
 impl OrderSeen {
@@ -3277,6 +3282,8 @@ impl OrderSeen {
             region: Arc::clone(&self.region),
             here: Arc::clone(&self.here),
             downloaded_on: Arc::clone(&self.downloaded_on),
+            at_doorbell: Arc::clone(&self.at_doorbell),
+            hold_here: Arc::clone(&self.hold_here),
         };
         let rig = Rig::with_host(Box::new(host));
         let _ = self.region.set(Arc::clone(&rig.device.shared.region));
@@ -3367,6 +3374,8 @@ struct OrderHost {
     region: Arc<OnceLock<Arc<Region>>>,
     here: Arc<AtomicBool>,
     downloaded_on: Arc<Mutex<Vec<Option<String>>>>,
+    at_doorbell: Arc<AtomicBool>,
+    hold_here: Arc<AtomicBool>,
 }
 
 /// What an [`OrderHost`] records as a held `BUFFER_CREATE` ends.
@@ -3423,8 +3432,20 @@ impl Host for OrderHost {
         if !self.here.load(Ordering::SeqCst) {
             return Err(answer);
         }
+        while self.hold_here.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.surface_download(block_offset, answer);
         Ok(())
+    }
+    fn surface_downloaded(&self, _block_offset: u64) -> bool {
+        if !self.at_doorbell.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.record(RGFX_CMD_SURFACE_DOWNLOAD);
+        let thread = std::thread::current().name().map(str::to_owned);
+        self.downloaded_on.lock().push(thread);
+        true
     }
     fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
         self.record(RGFX_CMD_PRESENT_SURFACE);
@@ -4013,6 +4034,132 @@ fn a_download_behind_its_block_s_pages_on_the_lane_is_carried_out_after_them_the
         ],
         "the other block's on the control thread, then this block's on its lane"
     );
+}
+
+/// Waits about 2 s for the control thread to sleep with nothing in flight (`Submit::asleep`).
+fn wait_control_asleep(rig: &Rig) {
+    for _ in 0..2000 {
+        if rig.device.shared.submit.lock().asleep {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the control thread did not go to sleep");
+}
+
+/// Publishes `command` on the control ring, its seqno the next, without a doorbell: the seqno.
+fn publish_next(rig: &mut Rig, mut command: Vec<u8>) -> u64 {
+    rig.seqno += 1;
+    command[8..16].copy_from_slice(&rig.seqno.to_le_bytes());
+    set_size_of(&mut command);
+    rig.publish(&command);
+    rig.seqno
+}
+
+/// Whether the control completion ring holds a record the guest has not taken.
+fn answer_waiting(rig: &Rig) -> bool {
+    rig.region()
+        .atomic_u64(RGFX_CONTROL_COMPLETE_OFFSET)
+        .load(Ordering::SeqCst)
+        != rig.consumed
+}
+
+/// A ring-0 doorbell write through `mmio_write_taking` answers a download at the ring's head on
+/// the writing thread, where the host has carried it out already and the control thread sleeps:
+/// its `COMPLETE` is on the completion ring before the write returns, and ring 0's count moves
+/// past it, so the control thread takes the message after it next, in order;
+/// a plain `mmio_write` of the doorbell leaves it to the control thread
+#[test]
+fn a_landed_download_is_answered_on_its_doorbell_s_thread() {
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    seen.at_doorbell.store(true, Ordering::SeqCst);
+    let mut rig = seen.rig();
+    let pages = rig.send(surface_pages_message(5, BLOCK, RGFX_SURFACE_PAGES_CACHED));
+    assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
+    wait_block_lane_idle(&rig, BLOCK);
+    wait_control_asleep(&rig);
+    let download = publish_next(&mut rig, download_message(BLOCK));
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    assert!(answer_waiting(&rig), "no answer when the write returned");
+    assert_eq!(rig.complete(), (download, RGFX_STATUS_OK));
+    assert_eq!(*seen.downloaded_on.lock(), [thread_name()]);
+    let through = rig
+        .region()
+        .atomic_u64(RGFX_CONTROL_SUBMIT_OFFSET + 0x40)
+        .load(Ordering::SeqCst);
+    assert_eq!(through, rig.produced, "ring 0's count is past the download");
+    // The next message goes to the control thread, in order, and so does a download rung by the
+    // plain write.
+    let present = rig.send(present(0));
+    assert_eq!(rig.complete(), (present, RGFX_STATUS_OK));
+    wait_control_asleep(&rig);
+    let plain = publish_next(&mut rig, download_message(BLOCK));
+    rig.device
+        .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    assert_eq!(rig.complete(), (plain, RGFX_STATUS_OK));
+    assert_eq!(seen.count(RGFX_CMD_SURFACE_DOWNLOAD), 2);
+    assert_ne!(seen.downloaded_on.lock()[1], thread_name());
+}
+
+/// A ring-0 doorbell's thread takes no download the control thread must take: one the host has
+/// not carried out yet goes to the control thread; so does one behind another message at the
+/// ring's head; and one published while the control thread is awake, carrying out a download it
+/// was offered, waits for it, though the host would answer it at the doorbell
+#[test]
+fn a_doorbell_s_thread_leaves_a_download_the_control_thread_must_take() {
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    seen.here.store(true, Ordering::SeqCst);
+    let mut rig = seen.rig();
+    let control = Some("reims-vgpu.graphics-control".to_owned());
+
+    // Not carried out yet.
+    wait_control_asleep(&rig);
+    let first = publish_next(&mut rig, download_message(BLOCK));
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    assert_eq!(rig.complete(), (first, RGFX_STATUS_OK));
+    assert_eq!(*seen.downloaded_on.lock(), std::slice::from_ref(&control));
+
+    // Behind a present at the head.
+    seen.at_doorbell.store(true, Ordering::SeqCst);
+    wait_control_asleep(&rig);
+    let shown = publish_next(&mut rig, present(0));
+    let behind = publish_next(&mut rig, download_message(BLOCK));
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    let answers = [rig.complete(), rig.complete()];
+    assert!(answers.contains(&(shown, RGFX_STATUS_OK)), "{answers:?}");
+    assert!(answers.contains(&(behind, RGFX_STATUS_OK)), "{answers:?}");
+    assert_eq!(seen.downloaded_on.lock().last(), Some(&control));
+
+    // The control thread awake in a download it was offered: the next waits for it.
+    seen.at_doorbell.store(false, Ordering::SeqCst);
+    seen.hold_here.store(true, Ordering::SeqCst);
+    wait_control_asleep(&rig);
+    let held = rig.send(download_message(BLOCK));
+    for _ in 0..2000 {
+        if !rig.device.shared.submit.lock().asleep {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    settle();
+    seen.at_doorbell.store(true, Ordering::SeqCst);
+    let next = publish_next(&mut rig, download_message(BLOCK));
+    rig.device
+        .mmio_write_taking(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    assert!(
+        !answer_waiting(&rig),
+        "answered while the control thread held one before it"
+    );
+    seen.hold_here.store(false, Ordering::SeqCst);
+    assert_eq!(rig.complete(), (held, RGFX_STATUS_OK));
+    assert_eq!(rig.complete(), (next, RGFX_STATUS_OK));
+    let on = seen.downloaded_on.lock();
+    assert_eq!(on[on.len() - 2..], [control.clone(), control]);
 }
 
 /// Each message that reads what a block's lane makes of the block waits for the lane through its

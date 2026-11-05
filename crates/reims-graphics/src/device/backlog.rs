@@ -163,6 +163,12 @@ impl Backlog {
         self.last.get(&context).copied().unwrap_or(0)
     }
 
+    /// [`Self::took`] of a message that is no one's ([`Whose::NoOne`]: a display command or a
+    /// download), through count `through`.
+    pub(super) fn took_unowned(&mut self, through: u64) {
+        self.read = self.read.max(through);
+    }
+
     /// The control thread took `message`, through count `through`: read here where no look
     /// read it.
     pub(super) fn took(&mut self, message: &Message, through: u64) {

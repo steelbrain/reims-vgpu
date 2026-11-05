@@ -485,8 +485,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring may answer the
     /// queue's next command buffer on the calling thread, posting its `CB_SUBMITTED` there and
     /// calling `raise_interrupt` inside this call (`reims-graphics`'s `Device::mmio_write_taking`),
-    /// allocating nothing; the queue's thread then takes it as it takes any. It waits for no lock
-    /// but the queues' table, as `mmio_write`'s doorbell does.
+    /// allocating nothing; the queue's thread then takes it as it takes any. A write of ring 0's
+    /// may take and answer the control ring's next message there, where it is a
+    /// `SURFACE_DOWNLOAD` whose pages hold the surface's device cache already
+    /// ([`GraphicsControl::downloaded_at_doorbell`]), allocating nothing either. It waits for no
+    /// lock but the queues' table, as `mmio_write`'s doorbell does.
     pub fn mmio_write_taking(&self, offset: u64, value: u32) {
         entry::run(|_| self.device.mmio_write_taking(offset, value));
     }
@@ -1106,6 +1109,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         // Untouched where left: the answers were dropped ungiven.
         answer.lock().take().map_or(Ok(()), Err)
+    }
+
+    /// [`Self::try_download_surface`] on a doorbell's thread, the guest's vCPU
+    /// ([`Host::surface_downloaded`]): whether the download of the block at `block` is carried
+    /// out already, nothing to copy or wait for ([`Decoders::downloaded_at_doorbell`]), with no
+    /// reset under way (the reset gate tried). Allocates and frees nothing.
+    fn downloaded_at_doorbell(&self, block: u64) -> bool {
+        let Some(_gate) = self.reset_gate.try_read() else {
+            return false;
+        };
+        self.decoders.downloaded_at_doorbell(block)
     }
 
     /// Carries out one stage-3 message under a library entry: from ring 0 an object-lifecycle create
@@ -2099,6 +2113,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         answer: CompleteAnswer,
     ) -> Result<(), CompleteAnswer> {
         self.control.try_download_surface(block_offset, answer)
+    }
+
+    fn surface_downloaded(&self, block_offset: u64) -> bool {
+        self.control.downloaded_at_doorbell(block_offset)
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {

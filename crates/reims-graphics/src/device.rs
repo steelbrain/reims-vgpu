@@ -95,6 +95,17 @@
 //! rings for a buffer it publishes during the walk, which it does only for a ring marked idle,
 //! and the doorbell's write answers it there.
 //!
+//! A `DOORBELL` write of ring 0 through [`Device::mmio_write_taking`] answers ring 0's next
+//! message on the writing thread where it is a `SURFACE_DOWNLOAD` the host has carried out
+//! already ([`Host::surface_downloaded`]: a CPU lock of a surface whose pages hold its device
+//! cache, a decoder's output whose early copy has landed, or a cache nothing wrote), and the
+//! control thread sleeps with every answer of what it took posted: the doorbell's thread takes
+//! the download, posts its `COMPLETE` and raises the control vector, so the lock's answer no
+//! longer waits for the control thread's wake. In every other case, and where any lock it tries
+//! is held, the control thread takes the message as it takes any. A host whose ring-0 doorbell
+//! is a file the control thread polls (QEMU's ioeventfd, [`Device::set_doorbell`]) never calls
+//! the write for it, and so never answers there.
+//!
 //! **An answer on a lane's thread.** A buffer the service thread takes and must wait for ring 0
 //! for is filed at the queue gate with its message ([`gate`]'s offer). The lane whose move ends
 //! the wait offers it to the host on the lane's thread ([`Host::answer_command_buffer`]) before
@@ -282,12 +293,14 @@ const COMPLETE: RingAt = RingAt {
 /// What the device asks of the host that runs it (QEMU, through the C API's callbacks). Each is
 /// called on one of the device's threads, or, for [`Host::raise_interrupt`], on the thread that
 /// posts the event it raises for; never inside a call of the host's into the device but
-/// [`Device::mmio_write_taking`], which calls [`Host::answer_command_buffer`] and may raise there.
-/// Each is called with no lock held that a call of the device's waits for, directly or through a
-/// thread of the device's, so each may call the device at once. Of its own the device holds only
-/// a command queue's claim on its messages, around [`Host::stage3_message`] and
-/// [`Host::answer_command_buffer`] of the queue's messages and the raises inside them; a call of
-/// the device's only tries it.
+/// [`Device::mmio_write_taking`], which calls [`Host::answer_command_buffer`] and
+/// [`Host::surface_downloaded`] and may raise there. Each is called with no lock held that a call
+/// of the device's waits for, directly or through a thread of the device's, so each may call the
+/// device at once, but [`Host::surface_downloaded`], which waits for nothing and calls nothing
+/// of the device's: it is asked with the control rings' locks held (a reset waits for the
+/// submission ring's). Of its own the device holds otherwise only a command queue's claim on its
+/// messages, around [`Host::stage3_message`] and [`Host::answer_command_buffer`] of the queue's
+/// messages and the raises inside them; a call of the device's only tries it.
 pub trait Host: Send + Sync + 'static {
     /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
     /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On
@@ -435,6 +448,21 @@ pub trait Host: Send + Sync + 'static {
     ) -> Result<(), CompleteAnswer> {
         let _ = block_offset;
         Err(answer)
+    }
+
+    /// A `SURFACE_DOWNLOAD` of the block at `block_offset`, at ring 0's head, offered on the
+    /// thread of a `DOORBELL` write of ring 0 through [`Device::mmio_write_taking`] (the guest's
+    /// vCPU), where the device would hand it to [`Host::try_surface_download`] next: the control
+    /// thread sleeps with every message before it carried out, and the block's lane has nothing
+    /// left. Whether the surface's pages hold its device cache already, so the download is
+    /// carried out with nothing to copy and nothing to wait for; where so, the host does here
+    /// what that download does, and the device answers it ([`RGFX_STATUS_OK`]) on this thread.
+    /// Where not, nothing is done, and the control thread takes the download as it takes any. It
+    /// waits for nothing (each lock tried) and allocates and frees nothing. The default carries
+    /// out none.
+    fn surface_downloaded(&self, block_offset: u64) -> bool {
+        let _ = block_offset;
+        false
     }
 
     /// Hands a stage-3 message to the host's decoder: from ring 0, on its context's lane, an
@@ -812,6 +840,11 @@ struct Submit {
     /// Ring 0's messages, by whose each is, for the command buffers' waits ([`Backlog`]); empty
     /// on a queue's ring.
     backlog: Backlog,
+    /// Ring 0's: the control thread sleeps with nothing in flight, every answer of what it took
+    /// posted, from its look that found the ring empty to its wake (`control_thread`): a
+    /// doorbell's thread may then take the ring's next message ([`Shared::download_on_doorbell`]).
+    /// False on a queue's ring.
+    asleep: bool,
 }
 
 /// The display, as the guest has set it, and what the device has told it.
@@ -872,6 +905,7 @@ impl Device {
                 consumer,
                 broken: false,
                 backlog: Backlog::with_room(),
+                asleep: false,
             }),
             display: Mutex::new(DisplayState::default()),
             completion: Mutex::new(producer),
@@ -1005,9 +1039,12 @@ impl Device {
     /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring first offers the
     /// queue's next `COMMAND_BUFFER` to the host on the calling thread
     /// ([`Host::answer_command_buffer`]; the module doc): the host may post its `CB_SUBMITTED`
-    /// there, calling [`Host::raise_interrupt`] inside this call. It waits for the queues' table
-    /// where it is held, as `mmio_write` does, and for nothing else, and the offer allocates
-    /// nothing.
+    /// there, calling [`Host::raise_interrupt`] inside this call. A write of ring 0's
+    /// (`RGFX_CONTROL_RING_ID`) first answers the ring's next message there where it is a
+    /// `SURFACE_DOWNLOAD` the host has carried out already ([`Host::surface_downloaded`]),
+    /// posting its `COMPLETE` and raising the control vector inside this call. It waits for the
+    /// queues' table where it is held, as `mmio_write` does, and for nothing else, and the offer
+    /// allocates nothing.
     pub fn mmio_write_taking(&self, offset: u64, value: u32) {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_DOORBELL => self.shared.ring_taking(u64::from(value)),
@@ -1365,13 +1402,14 @@ impl Shared {
             self.take_messages();
             // Asleep with `consumer_idle` set only while the device takes the ring.
             let (idle, epoch) = {
-                let submit = self.submit.lock();
+                let mut submit = self.submit.lock();
                 let epoch = self.epoch.load(Ordering::Acquire);
                 if !self.started() || submit.broken {
                     (false, epoch)
                 } else if submit.consumer.sleep_or_pending(&self.region) {
                     continue;
                 } else {
+                    submit.asleep = true;
                     (true, epoch)
                 }
             };
@@ -1385,7 +1423,8 @@ impl Shared {
             // rings for its first message: that stands. The reset moves the count before it takes
             // the ring, so one that has not yet set the ring up sets it after this.
             if idle {
-                let submit = self.submit.lock();
+                let mut submit = self.submit.lock();
+                submit.asleep = false;
                 if self.epoch.load(Ordering::Acquire) == epoch {
                     submit.consumer.awake(&self.region);
                 }
@@ -1795,11 +1834,14 @@ impl Shared {
         }
     }
 
-    /// [`Self::ring_doorbell`], where a command queue's ring is rung, after its next message is
-    /// offered to the host on this thread ([`Self::answer_on_doorbell`]). The queues' table, held
-    /// elsewhere, is waited for as `ring_doorbell` waits for it, and nothing is offered.
+    /// [`Self::ring_doorbell`], after the rung ring's next message is offered to the host on this
+    /// thread: a command queue's ([`Self::answer_on_doorbell`]), or ring 0's, where it is a
+    /// `SURFACE_DOWNLOAD` the host has carried out already ([`Self::download_on_doorbell`]).
+    /// The queues' table, held elsewhere, is waited for as `ring_doorbell` waits for it, and
+    /// nothing is offered.
     fn ring_taking(&self, ring_id: u64) {
         if ring_id == u64::from(RGFX_CONTROL_RING_ID) {
+            self.download_on_doorbell();
             self.wake.wake();
             self.room.wake();
             return;
@@ -1832,6 +1874,82 @@ impl Shared {
         let submit = queue.submit.lock();
         if !queue.ended() {
             submit.consumer.awake(&self.region);
+        }
+    }
+
+    /// Takes ring 0's next message on this thread, a doorbell's (the module doc), and answers it
+    /// here, where it is a `SURFACE_DOWNLOAD` the host has carried out already
+    /// ([`Host::surface_downloaded`]): its `COMPLETE` is posted, and the control vector raised
+    /// with no lock held, before the doorbell write returns. Only where nothing need be waited
+    /// for, and in ring 0's order, as the control thread would take it ([`Self::download_here`]):
+    /// the device is started, not reset since the host was last told, and the ring not broken;
+    /// the control thread sleeps with every answer of what it took posted (`asleep`), so the
+    /// download is the next message after all it carried out, and no answer of its comes after
+    /// this one; the block's lane has nothing left; the control completion ring has room; and
+    /// each lock is tried, the control submission ring's, the completion ring's and the lanes'.
+    /// Otherwise the message stays, and the control thread, which the write wakes, takes it as
+    /// it takes any. No buffer waits for a download's count (`backlog`: a download is no
+    /// buffer's), so the queue gate is not told of it. Allocates and frees nothing.
+    fn download_on_doorbell(&self) {
+        let raise = {
+            let Some(mut submit) = self.submit.try_lock() else {
+                return;
+            };
+            if !submit.asleep
+                || !self.started()
+                || submit.broken
+                || self.ending()
+                || self.reset_owed.load(Ordering::Acquire)
+            {
+                return;
+            }
+            let epoch = self.epoch.load(Ordering::Acquire);
+            let mut words = [0u64; size_of::<RgfxSurfaceDownload>().div_ceil(8)];
+            let bytes = words.as_mut_bytes();
+            let Ok(Some(header)) = submit.consumer.peek_into(&self.region, bytes) else {
+                return;
+            };
+            if header.r#type != RGFX_CMD_SURFACE_DOWNLOAD || header.size as usize > bytes.len() {
+                return;
+            }
+            let Ok((download, _)) = RgfxSurfaceDownload::read_from_prefix(bytes) else {
+                return;
+            };
+            if self.lanes.try_lane_idle(Key::Block(download.block_offset)) != Some(true) {
+                return;
+            }
+            let Some(mut completion) = self.completion.try_lock() else {
+                return;
+            };
+            // As a post checks it (`post_on`): a reset under way drops the answer.
+            if self.epoch.load(Ordering::Acquire) != epoch || !self.started() {
+                return;
+            }
+            let answer = RgfxComplete {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_EVT_COMPLETE,
+                    size: size_of::<RgfxComplete>() as u32,
+                    seqno: header.seqno,
+                },
+                status: RGFX_STATUS_OK,
+                reserved_14: 0,
+            };
+            if !completion.has_room(&self.region, answer.as_bytes().len())
+                || !self.host.surface_downloaded(download.block_offset)
+            {
+                return;
+            }
+            submit.consumer.take_header(&self.region, &header);
+            let through = submit.consumer.consumed();
+            submit.backlog.took_unowned(through);
+            self.control_done.store(through, Ordering::Release);
+            match completion.post(&self.region, answer.as_bytes()) {
+                Posted::Yes { raise } => raise,
+                Posted::NoRoom | Posted::Broken(_) => false,
+            }
+        };
+        if raise {
+            self.host.raise_interrupt(RGFX_CONTROL_VECTOR);
         }
     }
 
@@ -2017,6 +2135,7 @@ impl Shared {
                 consumer,
                 broken: false,
                 backlog: Backlog::default(),
+                asleep: false,
             }),
             taken_seqno: AtomicU64::new(0),
             consuming: Mutex::new(None),
