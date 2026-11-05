@@ -169,22 +169,20 @@ impl Region {
     }
 
     /// No block is context `context`'s any more (`CONTEXT_CLOSE`): a block only it holds goes,
-    /// and a shared block's other holders keep it. The shared blocks it held that others still
-    /// hold, each as its offset and size.
+    /// and a shared block's other holders keep it. The shared blocks it held, each as its offset
+    /// and size, those it alone held among them: another context's share of one may not have
+    /// been carried out yet, as it runs on that context's lane.
     pub fn revoke_context(&self, context: u32) -> Vec<(u64, u64)> {
-        let mut kept = Vec::new();
+        let mut shared = Vec::new();
         self.blocks.lock().retain(|&at, held| {
             let before = held.holders.len();
             held.holders.retain(|&c| c != context);
-            if held.holders.is_empty() {
-                return false;
+            if held.shared && held.holders.len() != before {
+                shared.push((at, held.size));
             }
-            if held.holders.len() != before {
-                kept.push((at, held.size));
-            }
-            true
+            !held.holders.is_empty()
         });
-        kept
+        shared
     }
 
     /// No block is anyone's any more (the device's reset): the kext grants them again.
@@ -509,10 +507,11 @@ mod tests {
         assert!(region.held_by(2, 0x8_1000, 0x1000));
     }
 
-    /// A context's close names the shared blocks it held that others still hold, and only
-    /// those: not a block it alone held, which goes with it, nor one it never held.
+    /// A context's close names every shared block it held, those it alone held too, whose other
+    /// holders' shares may still be on their lanes; not a granted block, which only its own
+    /// context names, nor one it never held.
     #[test]
-    fn a_close_names_the_shared_blocks_its_context_leaves_to_others() {
+    fn a_close_names_every_shared_block_its_context_held() {
         let region = Region::new(1 << 20).unwrap();
         region.share(1, 0x1_0000, 0x2000);
         region.share(2, 0x1_0000, 0x2000);
@@ -520,13 +519,20 @@ mod tests {
         region.share(3, 0x3_0000, 0x1000);
         region.share(2, 0x3_0000, 0x1000);
         region.grant(1, 0x4_0000, 0x1000);
-        assert_eq!(region.revoke_context(1), [(0x1_0000, 0x2000)]);
+        assert_eq!(
+            region.revoke_context(1),
+            [(0x1_0000, 0x2000), (0x2_0000, 0x1000)]
+        );
         assert!(!region.held_by(1, 0x2_0000, 0x10));
         assert!(!region.held_by(1, 0x4_0000, 0x10));
         assert!(region.held_by(2, 0x1_0000, 0x10));
         assert_eq!(region.revoke_context(1), []);
-        assert_eq!(region.revoke_context(2), [(0x3_0000, 0x1000)]);
+        assert_eq!(
+            region.revoke_context(2),
+            [(0x1_0000, 0x2000), (0x3_0000, 0x1000)]
+        );
         assert_eq!(region.revoke(0x1_0000), [] as [u32; 0]);
+        assert_eq!(region.revoke(0x3_0000), [3]);
     }
 
     /// The process's peak resident size in bytes: `ru_maxrss` is in bytes on macOS and in KiB

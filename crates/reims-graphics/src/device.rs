@@ -1420,11 +1420,12 @@ impl Shared {
         if !ended.is_empty() {
             self.gate.every();
         }
-        // A shared block it held with others is let go of as by its BLOCK_UNSHARE, so the
-        // block's release, by whichever holder is last, waits for the context's command buffers
-        // as well: the kext may let go of the context's wire of the block's pages before this
-        // close is answered (a close it took for refused), and the other holders' wires go at
-        // that release's answer.
+        // Every shared block it held is let go of as by its BLOCK_UNSHARE, so the block's
+        // release, by whichever holder is last, waits for the context's command buffers as well:
+        // the kext may let go of the context's wire of the block's pages before this close is
+        // answered (a close it took for refused), and the other holders' wires go at that
+        // release's answer. Those it alone held too: another holder's BLOCK_SHARE runs on that
+        // holder's lane, which the close does not wait for, so it may come after this.
         for (offset, size) in self.region.revoke_context(context) {
             self.host.block_unshared(&RgfxBlockGrant {
                 header: RgfxMsgHeader {

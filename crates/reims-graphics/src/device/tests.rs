@@ -1741,6 +1741,29 @@ fn a_shared_block_is_held_by_each_context_it_is_shared_with() {
 #[derive(Clone, Default)]
 struct HoldsHost {
     seen: Arc<Mutex<Vec<(u32, u32, u64)>>>,
+    /// While set, a `BUFFER_CREATE` the host carries out waits: its context's lane is in it.
+    hold: Arc<AtomicBool>,
+    /// Set once such a create is being carried out.
+    holding: Arc<AtomicBool>,
+}
+
+impl HoldsHost {
+    /// Holds `context`'s lane in a buffer create until [`Self::hold`] is cleared, and waits for
+    /// the host to be in it.
+    fn hold_lane(&self, rig: &mut Rig, context: u32) {
+        self.hold.store(true, Ordering::SeqCst);
+        rig.send(object_message(
+            RGFX_CMD_BUFFER_CREATE,
+            (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 0xfff,
+        ));
+        for _ in 0..2000 {
+            if self.holding.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the create was not carried out");
+    }
 }
 
 impl Host for HoldsHost {
@@ -1758,6 +1781,15 @@ impl Host for HoldsHost {
     }
     fn block_unshared(&self, unshare: &RgfxBlockGrant) {
         (self.seen.lock()).push((RGFX_CMD_BLOCK_UNSHARE, unshare.context, unshare.offset));
+    }
+    fn stage3_message(&self, _completion: &CompletionPoster, message: &[u8]) {
+        let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
+        if header.r#type == RGFX_CMD_BUFFER_CREATE {
+            self.holding.store(true, Ordering::SeqCst);
+            while self.hold.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -1822,6 +1854,7 @@ fn every_holder_s_end_is_told_before_its_shared_block_s_release() {
         std::mem::take(&mut *host.seen.lock()),
         [
             (RGFX_CMD_BLOCK_UNSHARE, 7, OTHER),
+            (RGFX_CMD_BLOCK_UNSHARE, 7, ALONE),
             (RGFX_CMD_CONTEXT_CLOSE, 7, 0),
             (RGFX_CMD_BLOCK_RELEASE, 8, OTHER),
         ],
@@ -1846,6 +1879,43 @@ fn every_holder_s_end_is_told_before_its_shared_block_s_release() {
             (RGFX_CMD_BLOCK_UNSHARE, 5, BLOCK),
             (RGFX_CMD_BLOCK_RELEASE, 6, BLOCK),
         ]
+    );
+}
+
+/// A close tells the end of its context's hold of every shared block it held, whether or not
+/// another holder's `BLOCK_SHARE` was carried out before it: another context's share runs on that
+/// context's lane, which a close does not wait for, so a close may find its context the block's
+/// only holder while a later holder's share is still on its way, and that holder's release must
+/// still wait for the closed context's command buffers.
+#[test]
+fn a_close_tells_its_hold_s_end_before_another_holder_s_share_is_carried_out() {
+    const OTHER: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x80_0000;
+    let host = HoldsHost::default();
+    let mut rig = Rig::with_host(Box::new(host.clone()));
+    rig.start();
+    // 8's share of the block waits on its lane, behind a create the host holds.
+    host.hold_lane(&mut rig, 8);
+    for context in [7, 8] {
+        rig.send(block_message(
+            RGFX_CMD_BLOCK_SHARE,
+            context,
+            OTHER,
+            0x1_0000,
+        ));
+    }
+    let seqno = rig.send(context_close(7));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    host.hold.store(false, Ordering::SeqCst);
+    let seqno = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, 8, OTHER, 0x1_0000));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        std::mem::take(&mut *host.seen.lock()),
+        [
+            (RGFX_CMD_BLOCK_UNSHARE, 7, OTHER),
+            (RGFX_CMD_CONTEXT_CLOSE, 7, 0),
+            (RGFX_CMD_BLOCK_RELEASE, 8, OTHER),
+        ],
+        "a close that overtook another holder's share did not tell its hold's end"
     );
 }
 
