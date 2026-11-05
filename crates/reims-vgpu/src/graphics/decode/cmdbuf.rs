@@ -329,6 +329,10 @@ fn ops_of<'m>(message: &'m [u8], m: &RgfxCommandBuffer) -> Option<&'m [u8]> {
 pub(crate) struct Begun<P: Platform> {
     /// The queue it runs on.
     queue_obj_id: u64,
+    /// That queue, where it holds a video encoder and uses a device cache: a decoder's output,
+    /// which its client may lock to read each picture, is copied into its pages behind it there
+    /// ([`super::surface_cache::Caches::finish`]).
+    queue: Option<P::CommandQueue>,
     /// The guest's id of the buffer.
     cb_obj_id: u64,
     /// Its message's seqno.
@@ -1088,6 +1092,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let (behind, held) = hold(counts, fill_waits || take.waits);
         Ok(Ok(Begun {
             queue_obj_id: m.queue_obj_id,
+            queue: (take.video && uses.is_some()).then(|| queue.clone_ref()),
             cb_obj_id: m.cb_obj_id,
             seqno: m.header.seqno,
             cb,
@@ -1118,6 +1123,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<(), DecodeError>> {
         let Begun {
             queue_obj_id,
+            queue,
             cb_obj_id,
             seqno,
             cb,
@@ -1194,10 +1200,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         match uses {
             // Its end event signalled for the caches' later copies, and committed, under their
             // lock ([`super::surface_cache::Caches::finish`]).
-            Some(uses) => {
-                self.surface_caches
-                    .finish(device, queue_obj_id, &cb, uses, &used, commit)?
-            }
+            Some(uses) => self.surface_caches.finish(
+                device,
+                queue_obj_id,
+                queue.as_ref(),
+                &cb,
+                uses,
+                &used,
+                commit,
+            )?,
             None => commit()?,
         }
         // Committed: a buffer behind it in the commit order goes on.
@@ -2924,12 +2935,11 @@ mod tests {
         );
     }
 
-    /// A video output whose surface's block has a device cache is handed to the session as in
-    /// the cache, which each buffer over the block is, once the cache's fill is done.
-    #[test]
-    fn a_video_output_in_a_cached_block_is_in_its_cache() {
+    /// A rig whose block at `BLOCK` is a cached IOSurface of two pages, with command queue 1, the
+    /// bitstream buffer 2, the H.264 session 40 of a fake host's video, buffer 6 over the block
+    /// and textures 7 and 8 over its planes; and what the video is handed.
+    fn cached_video() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
         use super::super::surface_pages::tests::{BLOCK, rig};
-        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
         use reims_graphics::wire::RGFX_STATUS_OK;
 
         let mut r = rig(8);
@@ -2981,43 +2991,157 @@ mod tests {
         ] {
             assert_eq!(r.dec.decode(&r.device, t.as_bytes()).unwrap(), Ok(()));
         }
+        (r, seen)
+    }
+
+    /// The `COMMAND_BUFFER` `cb_obj_id` at `seqno` on queue 1 of [`cached_video`]'s rig, which
+    /// writes its block at generation 0 and, where it `decodes`, decodes into its planes on
+    /// session 40.
+    fn writes_cached_video(cb_obj_id: u64, seqno: u64, decodes: bool) -> Vec<u8> {
+        use super::super::surface_pages::tests::BLOCK;
+        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+
         let surface_use = RgfxOpSurfaceUse {
             block_offset: BLOCK,
             cpu_gen: 0,
             flags: RGFX_SURFACE_USE_WRITES,
             reserved_14: 0,
         };
+        let mut ops = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
+        if decodes {
+            let decode = RgfxVideoOpDecodeH264 {
+                bitstream_buffer_obj_id: 2,
+                bitstream_offset: 0,
+                bitstream_size: 100,
+                luma_texture_obj_id: 7,
+                chroma_texture_obj_id: 8,
+                ..RgfxVideoOpDecodeH264::default()
+            };
+            let pass = RgfxOpVideoPass { session_obj_id: 40 };
+            ops.extend(op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()));
+            ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        }
+        command_buffer_message(cb_obj_id, seqno, &ops)
+    }
+
+    /// A video output whose surface's block has a device cache is handed to the session as in
+    /// the cache, which each buffer over the block is, once the cache's fill is done.
+    #[test]
+    fn a_video_output_in_a_cached_block_is_in_its_cache() {
+        let (mut r, seen) = cached_video();
         // The first use fills the cache; the decode's buffer, of the same generation, fills
         // nothing, and its decode finds the fill done.
-        let first = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
         assert_eq!(
             r.dec
-                .decode(&r.device, &command_buffer_message(100, 1, &first))
+                .decode(&r.device, &writes_cached_video(100, 1, false))
                 .unwrap(),
             Ok(())
         );
         r.p.world().complete_all(CompleteOn::Caller);
-        let decode = RgfxVideoOpDecodeH264 {
-            bitstream_buffer_obj_id: 2,
-            bitstream_offset: 0,
-            bitstream_size: 100,
-            luma_texture_obj_id: 7,
-            chroma_texture_obj_id: 8,
-            ..RgfxVideoOpDecodeH264::default()
-        };
-        let pass = RgfxOpVideoPass { session_obj_id: 40 };
-        let mut ops = op(RGFX_OP_SURFACE_USE, surface_use.as_bytes());
-        ops.extend(op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()));
-        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
-        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
         assert_eq!(
             r.dec
-                .decode(&r.device, &command_buffer_message(101, 2, &ops))
+                .decode(&r.device, &writes_cached_video(101, 2, true))
                 .unwrap(),
             Ok(())
         );
         assert_eq!(*seen.cached.lock(), [[true, true]]);
         assert_eq!(r.dec.caches().counts().fills, 1);
+    }
+
+    /// A decoder's output that its client locks to read each picture is copied into its pages
+    /// behind the next decode into it, by a command buffer of the host's committed on the
+    /// decode's own queue right after it, and the lock's download that follows copies nothing
+    /// more, answered once that copy lands. A command buffer that writes the surface and holds no
+    /// video encoder is followed by no such copy: its lock downloads as before
+    #[test]
+    fn a_decode_read_back_is_copied_out_behind_the_next_decode() {
+        use super::super::surface_pages::tests::{BLOCK, Rig};
+        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
+        use std::sync::atomic::AtomicBool;
+
+        const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
+        /// The source of each copy since `mark`.
+        fn copied_since(r: &Rig, mark: u64) -> Vec<u64> {
+            (r.p.call_log().since(mark).iter())
+                .filter(|c| c.sel == COPY)
+                .map(|c| c.args[0].as_obj().map_or(0, |o| o.0))
+                .collect()
+        }
+        /// A `SURFACE_DOWNLOAD` of the block, and whether it was answered.
+        fn download(r: &Rig) -> Arc<AtomicBool> {
+            let done = Arc::new(AtomicBool::new(false));
+            let set = Arc::clone(&done);
+            r.dec.surface_download(
+                &r.device,
+                BLOCK,
+                Box::new(move || set.store(true, Ordering::SeqCst)),
+                super::super::no_raise(),
+            );
+            done
+        }
+        /// Carries out `message`.
+        fn run(r: &mut Rig, message: Vec<u8>) {
+            assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        }
+        let (mut r, _seen) = cached_video();
+        let cache = Arg::obj(r.dec.caches().buffer(BLOCK).unwrap())
+            .as_obj()
+            .unwrap()
+            .0;
+
+        // A read fills the cache first, so the decodes find it filled.
+        let read = RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen: 0,
+            flags: 0,
+            reserved_14: 0,
+        };
+        let read = op(RGFX_OP_SURFACE_USE, read.as_bytes());
+        run(&mut r, command_buffer_message(99, 1, &read));
+        r.p.world().complete_all(CompleteOn::Caller);
+        run(&mut r, writes_cached_video(100, 2, true));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let done = download(&r);
+        assert_eq!(
+            copied_since(&r, mark),
+            [cache],
+            "the lock downloads the first"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        let mark = r.p.call_log().mark();
+        run(&mut r, writes_cached_video(101, 3, true));
+        let calls = r.p.call_log().since(mark);
+        let commits: Vec<usize> = (calls.iter().enumerate())
+            .filter(|(_, c)| c.sel == "commit")
+            .map(|(i, _)| i)
+            .collect();
+        let copy = calls.iter().position(|c| c.sel == COPY);
+        assert_eq!(
+            copied_since(&r, mark),
+            [cache],
+            "copied out behind the decode"
+        );
+        assert!(commits.len() == 2 && copy.is_some_and(|at| commits[0] < at && at < commits[1]));
+        let mark = r.p.call_log().mark();
+        let done = download(&r);
+        assert!(copied_since(&r, mark).is_empty(), "nothing more");
+        assert!(!done.load(Ordering::SeqCst), "answered as the copy lands");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        let mark = r.p.call_log().mark();
+        run(&mut r, writes_cached_video(102, 4, false));
+        assert!(copied_since(&r, mark).is_empty(), "no copy behind it");
+        r.p.world().complete_all(CompleteOn::Caller);
+        let done = download(&r);
+        assert_eq!(copied_since(&r, mark), [cache], "its lock downloads");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(r.dec.caches().counts().early, 1);
     }
 
     /// A command buffer opens a render encoder for its pass, sends each reference

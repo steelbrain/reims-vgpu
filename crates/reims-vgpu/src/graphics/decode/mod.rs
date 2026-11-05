@@ -995,10 +995,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                      writes changed; {} written caches copied at a release with no client \
                      left; {} copies out not made, the CPU's generation past the cache's; {} \
                      deferred, {} refused, {} named their pages ({} copied), {} released \
-                     unnamed",
+                     unnamed; {} early copies of {} MiB, {} downloads they answered, {} unread",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.behind,
-                    d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached
+                    d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
+                    d.early, d.early_bytes >> 20, d.early_read, d.early_unread
                 );
             }
         }

@@ -374,13 +374,19 @@ Stages:
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
       committed since the last copy (`reims-vgpu`'s
-      `graphics/decode/surface_cache.rs`). A write the host's own devices
-      make into the pages (a video device's frame, in a CPU lend or by a
-      device of the host) moves no count: the host watches each cache's
-      pages, and such a write has the cache's next use fill it whatever the
-      count, and keeps a download or a release before that from copying the
-      cache over the write (`reims-vgpu`'s `device_writes.rs`). Each choice,
-      by what real GPUs show (M3, AMD and Intel Macs):
+      `graphics/decode/surface_cache.rs`). The one exception is a decoder's
+      output the CPU reads back: once a download copied a write that was the
+      only one since the cache's last copy, the next command buffer that
+      holds a video encoder and is again the surface's only writer is
+      followed on its own queue by a copy of the host's into the pages, which
+      starts as the decode ends, and the lock's download is answered as that
+      copy lands; a write no download followed stops it. A write the host's
+      own devices make into the pages (a video device's frame, in a CPU lend
+      or by a device of the host) moves no count: the host watches each
+      cache's pages, and such a write has the cache's next use fill it
+      whatever the count, and keeps a download or a release before that from
+      copying the cache over the write (`reims-vgpu`'s `device_writes.rs`).
+      Each choice, by what real GPUs show (M3, AMD and Intel Macs):
       - *Contract, where all agree:* a CPU lock after a GPU write sees it,
         and a GPU use after a read-write lock sees the CPU's writes; the
         seed moves at a read-write lock (not at its unlock), not at a

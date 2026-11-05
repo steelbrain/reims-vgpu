@@ -20,8 +20,9 @@
 //!   is the one GPU copy a picture costs where the device's DPB pictures and outputs coincide.
 //!   - On a GPU of its own memory, the surface's block has a device cache, which the guest's
 //!     video driver asks for (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`): the picture lands there, in the
-//!     runtime's buffer itself, and crosses the bus only at a CPU lock, as the cache's download.
-//!     The runtime shares its buffers with its own queues' families alone, so the copy runs on a
+//!     runtime's buffer itself, and crosses the bus only where the CPU reads it: at a CPU lock,
+//!     as the cache's download, or, for an output the CPU reads back after each picture, behind
+//!     the decode's command buffer (`surface_cache`, "Early copy"). The runtime shares its buffers with its own queues' families alone, so the copy runs on a
 //!     queue of those families: the one the runtime reserves for the decoders
 //!     (`DeviceHandles::reserved_queues`, which the platform's options ask for), where no runtime
 //!     work runs, so each copy is submitted with its decode and waits for it on the GPU. On a

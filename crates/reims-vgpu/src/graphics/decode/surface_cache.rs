@@ -34,6 +34,17 @@
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
 //!   answer, moved the generation, and let the CPU write the pages, whose writes are the newer,
 //!   as at a fill.
+//! - **Early copy.** A decoder's output that the CPU reads back after each picture (a client
+//!   that locks each frame to read it) is copied into its pages as the decode ends, not at the
+//!   lock that follows it ([`SurfaceCaches::early_copies`]). Once a download copied a write that
+//!   was the only one since the cache's last copy, the block reads back, and each later writer
+//!   that holds a video encoder and is again the only one has a command buffer of the host's
+//!   committed on its own queue right behind it, which copies the cache into the pages; the
+//!   download that follows is answered as that copy lands. A write that no download followed
+//!   ends it, until a download copies again. Other writers' queues take no such copy, as one
+//!   would hold their later work behind it (a window server drawing into a surface that another
+//!   process captures), and their downloads go as before; so does a download of pages the host
+//!   copies through the CPU, the copy running only where the pages lie in a buffer.
 //! - **Order.** Fills and downloads run on the host's own transfer queue, in the order they are
 //!   asked, each after every command buffer that used the cache before it: each such buffer
 //!   signals its queue's end event as it ends, and the copy waits for the latest value of each
@@ -152,6 +163,99 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// `BUFFER_OVER_SURFACE_PAGES` is checked against while the block has no view: its cache
     /// counts against the deferred budget until it goes, its pages named or not.
     deferred: Option<u64>,
+    /// Whether the CPU reads the surface back after each GPU write, and the early copy that
+    /// follows from it ([`SurfaceCaches::early_copies`]).
+    read_back: ReadBack,
+}
+
+/// What a cache knows of the CPU's reads of its surface after the GPU's writes, and its early
+/// copy into the pages ([`SurfaceCaches::early_copies`]).
+#[derive(Default)]
+struct ReadBack {
+    /// Uses that may write the cache counted since it was last copied into its pages: by a
+    /// download, a release or an early copy.
+    writes: u32,
+    /// A download copied a write that was the only one since the cache's last copy: each later
+    /// writer that is again the only one is copied out as it ends.
+    on: bool,
+    /// An early copy that no download has asked for since.
+    unread: bool,
+    /// The last early copy, which a download or a release of the cache nothing wrote since waits
+    /// for, and a use that writes the cache waits for, until it lands.
+    copy: Option<EarlyCopy>,
+}
+
+/// An early copy of a cache into its pages: a command buffer of the host's on the queue of the
+/// writer it follows, which signals that queue's end event at `value`.
+struct EarlyCopy {
+    queue: u64,
+    value: u64,
+    landing: Arc<Landing>,
+}
+
+/// An early copy until it lands: the answers waiting for it, given as the platform sees its
+/// command buffer done, and the threads waiting for it ([`Caches::wait_copied_out`]).
+struct Landing {
+    /// The answers waiting; `None` once it landed.
+    waiting: Mutex<Option<Vec<Answer>>>,
+    landed: Condvar,
+}
+
+/// An answer waiting for an early copy to land.
+type Answer = Box<dyn FnOnce() + Send>;
+
+impl Landing {
+    /// A copy in flight.
+    fn new() -> Arc<Self> {
+        Arc::new(Landing {
+            waiting: Mutex::new(Some(Vec::new())),
+            landed: Condvar::new(),
+        })
+    }
+
+    /// Whether the copy landed.
+    fn landed(&self) -> bool {
+        self.waiting.lock().is_none()
+    }
+
+    /// Gives `done` once the copy landed: here where it has.
+    fn then(&self, done: Answer) {
+        let mut waiting = self.waiting.lock();
+        match waiting.as_mut() {
+            Some(answers) => answers.push(done),
+            None => {
+                drop(waiting);
+                done();
+            }
+        }
+    }
+
+    /// The copy landed: the threads waiting are woken, and the answers given.
+    fn land(&self) {
+        let answers = self.waiting.lock().take();
+        self.landed.notify_all();
+        for done in answers.into_iter().flatten() {
+            done();
+        }
+    }
+
+    /// Waits for the copy to land, about `timeout` at most, in slices of at most
+    /// [`FILL_WAIT_SLICE`] each woken at once by its landing, as a fill's wait does
+    /// ([`Fills::wait`]); whether it landed.
+    fn wait(&self, timeout: std::time::Duration) -> bool {
+        let slice = FILL_WAIT_SLICE.min(timeout);
+        let mut slices = (timeout.as_micros() / slice.as_micros().max(1)).max(1);
+        let mut waiting = self.waiting.lock();
+        while waiting.is_some() {
+            if slices == 0 {
+                return false;
+            }
+            if self.landed.wait_for(&mut waiting, slice).timed_out() {
+                slices -= 1;
+            }
+        }
+        true
+    }
 }
 
 /// A cache's other end: the surface's pages.
@@ -355,6 +459,14 @@ pub(crate) struct CacheCounts {
     /// Of them, pages the host made no view of, or no buffer over, copied instead.
     pub(crate) attached_copied: u64,
     pub(crate) unattached: u64,
+    /// Early copies of caches into their pages, behind a writer of a surface that reads back
+    /// ([`SurfaceCaches::early_copies`]), and their bytes.
+    pub(crate) early: u64,
+    pub(crate) early_bytes: u64,
+    /// Downloads that an early copy answered, and early copies that no download followed before
+    /// the next write, each of which ended its block's reading back.
+    pub(crate) early_read: u64,
+    pub(crate) early_unread: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and whether a device of the host wrote
@@ -526,6 +638,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 filled_at: 0,
                 users: HashMap::new(),
                 deferred: None,
+                read_back: ReadBack::default(),
             },
         );
         let pages = Pages {
@@ -581,6 +694,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 filled_at,
                 users: HashMap::new(),
                 deferred: Some(block_size),
+                read_back: ReadBack::default(),
             },
         );
         self.deferred_bytes += length;
@@ -782,6 +896,22 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         if u.flags & RGFX_SURFACE_USE_WRITES != 0 {
             cache.written = true;
+            let read_back = &mut cache.read_back;
+            read_back.writes = read_back.writes.saturating_add(1);
+            // An early copy that no download followed: the surface no longer reads back.
+            if std::mem::take(&mut read_back.unread) {
+                read_back.on = false;
+                self.counts.early_unread += 1;
+            }
+            // An early copy still reading the cache: the write waits for it on the GPU, as for a
+            // buffer of another queue (a decode, whose picture lands off the buffer, waits for it
+            // on the CPU, [`Caches::wait_copied_out`]).
+            if let Some(copy) = &read_back.copy
+                && !copy.landing.landed()
+                && let Some((event, _)) = self.ends.get(&copy.queue)
+            {
+                cb.encode_wait(Some(EventRef::Event(event)), copy.value)?;
+            }
         }
         if let Some(t) = &self.transfer
             && !t.fills.reached(cache.filled_at)
@@ -916,6 +1046,89 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(())
     }
 
+    /// The early copies behind command buffer `writer`, just committed on queue `queue`, whose
+    /// counts among the caches' users are `counts` (the module doc): each cache it may write
+    /// whose surface reads back ([`ReadBack`]), where its write is the only one since the cache's
+    /// last copy and no device of the host wrote the pages since its last fill, is copied into
+    /// its pages by a command buffer of the host's committed on `on`, the writer's own queue,
+    /// right behind it, so the copy starts as the writer's work ends, waiting for nothing else.
+    /// That buffer signals the queue's end event next, which later copies of the cache wait for;
+    /// the cache's write is then the pages', once the copy lands ([`Landing`]).
+    fn early_copies(
+        &mut self,
+        queue: u64,
+        on: &P::CommandQueue,
+        counts: &[Count],
+    ) -> RaiseResult<()> {
+        for &(block, write) in counts {
+            if write.is_none() || self.watched.written(block) {
+                continue;
+            }
+            let (Some(cache), Some((event, value))) =
+                (self.by_block.get(&block), self.ends.get(&queue))
+            else {
+                continue;
+            };
+            let read_back = &cache.read_back;
+            if !read_back.on || read_back.writes != 1 || !cache.written {
+                continue;
+            }
+            // Pages in a buffer alone: a deferred block's not named yet have none, and copied
+            // pages ([`CachePages::Copied`]) take no early copy.
+            let Some(CachePages::View(pages)) = &cache.pages else {
+                continue;
+            };
+            let Some(cb) = on.command_buffer(ON)? else {
+                continue;
+            };
+            let Some(blit) = cb.blit_encoder(ON)? else {
+                continue;
+            };
+            blit.encode(
+                ON,
+                BlitCmd::CopyBufferToBuffer {
+                    source_buffer: Some(&cache.device),
+                    source_offset: 0,
+                    destination_buffer: Some(pages),
+                    destination_offset: 0,
+                    size: cache.length,
+                },
+            )?;
+            blit.encode(ON, BlitCmd::EndEncoding)?;
+            let landing = Landing::new();
+            // The answers waiting go as the platform sees the copy done, on its thread, with no
+            // wake of a handler thread between; the buffers live until its completed handler,
+            // past the cache's own end at a release.
+            let lands = Arc::clone(&landing);
+            cb.add_completion_seen_handler(ON, Box::new(move |_: CompletedInfo| lands.land()))?;
+            let held = (cache.device.clone_ref(), pages.clone_ref());
+            cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(held)))?;
+            // The queue's next end value, the queue's once the buffer is committed.
+            let next = value + 1;
+            cb.encode_signal(Some(EventRef::Event(event)), next)?;
+            cb.commit(ON)?;
+            let length = cache.length;
+            if let Some((_, value)) = self.ends.get_mut(&queue) {
+                *value = next;
+            }
+            if let Some(cache) = self.by_block.get_mut(&block) {
+                cache.written = false;
+                cache.users.insert(queue, next);
+                let read_back = &mut cache.read_back;
+                read_back.writes = 0;
+                read_back.unread = true;
+                read_back.copy = Some(EarlyCopy {
+                    queue,
+                    value: next,
+                    landing,
+                });
+            }
+            self.counts.early += 1;
+            self.counts.early_bytes += length;
+        }
+        Ok(())
+    }
+
     /// Fills the cache of the block at `block` from the surface's pages, as of CPU generation
     /// `generation` or the newer one it holds, on the transfer queue, after every command buffer
     /// that used it before.
@@ -995,11 +1208,32 @@ impl<P: Platform> SurfaceCaches<P> {
     ) -> RaiseResult<()> {
         let written = self.written_since_host(block);
         if !written || self.behind_the_cpu(block, cpu, "SURFACE_DOWNLOAD") {
-            if !written && self.by_block.contains_key(&block) {
-                self.counts.clean += 1;
+            // An early copy, landed or not, holds the cache's last write: answered as it lands.
+            let early = (self.by_block.get_mut(&block)).and_then(|cache| {
+                let read_back = &mut cache.read_back;
+                let copy = read_back.copy.as_ref()?;
+                if std::mem::take(&mut read_back.unread) {
+                    self.counts.early_read += 1;
+                }
+                Some(Arc::clone(&copy.landing))
+            });
+            match early {
+                Some(landing) => landing.then(done),
+                None => {
+                    if !written && self.by_block.contains_key(&block) {
+                        self.counts.clean += 1;
+                    }
+                    done();
+                }
             }
-            done();
             return Ok(());
+        }
+        // The CPU reads back a write that was the only one since the cache's last copy: the next
+        // such writer is copied out as it ends ([`Self::early_copies`]).
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            let read_back = &mut cache.read_back;
+            read_back.on = read_back.writes == 1;
+            read_back.unread = false;
         }
         if self.unattached(block).is_some() {
             log::warn!(
@@ -1029,7 +1263,14 @@ impl<P: Platform> SurfaceCaches<P> {
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
         if !self.written_since_host(block) || self.behind_the_cpu(block, cpu, "BLOCK_RELEASE") {
-            done();
+            // The pages are let go of once an early copy into them still in flight lands.
+            let copy = (self.by_block.get(&block))
+                .and_then(|cache| cache.read_back.copy.as_ref())
+                .map(|copy| Arc::clone(&copy.landing));
+            match copy {
+                Some(landing) => landing.then(done),
+                None => done(),
+            }
         } else {
             if unread {
                 self.counts.unread += 1;
@@ -1147,6 +1388,9 @@ impl<P: Platform> SurfaceCaches<P> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.written = false;
             cache.users.clear();
+            // This copy is the cache's last: an early copy before it is waited for on the GPU.
+            cache.read_back.writes = 0;
+            cache.read_back.copy = None;
         }
         self.counts.downloads += 1;
         self.counts.downloaded_bytes += length;
@@ -1463,11 +1707,19 @@ impl<P: Platform> Caches<P> {
 
     /// Ends command buffer `cb` of queue `queue`, which `uses` counted among the users of the
     /// caches of `used` ([`SurfaceCaches::after`]), and `commit`s it, with the lock held, so a
-    /// later copy finds its end event's value committed; then it leaves their users.
+    /// later copy finds its end event's value committed; then commits the early copies behind it
+    /// on `on`, its queue, where it has one ([`SurfaceCaches::early_copies`]), and it leaves
+    /// their users. An early copy the platform refuses is logged and left unmade: the cache stays
+    /// written, for the download that follows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the buffer's queue, as the guest and the platform name it, and its counts"
+    )]
     pub(crate) fn finish(
         &self,
         device: &P::Device,
         queue: u64,
+        on: Option<&P::CommandQueue>,
         cb: &P::CommandBuffer,
         mut uses: Uses<P>,
         used: &[u64],
@@ -1475,6 +1727,16 @@ impl<P: Platform> Caches<P> {
     ) -> RaiseResult<()> {
         let mut state = self.state.lock();
         let done = state.after(device, queue, cb, used).and_then(|()| commit());
+        if done.is_ok()
+            && let Some(on) = on
+            && let Err(raise) = refusing(|| state.early_copies(queue, on, &uses.blocks))
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "queue {queue:#x}: the platform raised at an early copy of a device cache into \
+                 its pages ({raise:?}); the lock that follows downloads it"
+            );
+        }
         state.unhold(&uses.blocks);
         uses.blocks.clear();
         drop(state);
@@ -1649,6 +1911,18 @@ impl<P: Platform> Caches<P> {
             return true;
         };
         fill.fills.wait(fill.value, timeout)
+    }
+
+    /// Waits, on the calling thread, for an early copy of the block at `block`'s cache into its
+    /// pages still in flight to land ([`SurfaceCaches::early_copies`]), `timeout` at most, with
+    /// no lock held, woken as it lands: for work the host starts outside a command buffer that
+    /// writes the cache, which a command buffer's wait does not order, so the copy never reads
+    /// what it writes. True where it landed, or the block has no cache or no copy in flight.
+    pub(crate) fn wait_copied_out(&self, block: u64, timeout: std::time::Duration) -> bool {
+        let landing = (self.state.lock().by_block.get(&block))
+            .and_then(|cache| cache.read_back.copy.as_ref())
+            .map(|copy| Arc::clone(&copy.landing));
+        landing.is_none_or(|landing| landing.wait(timeout))
     }
 }
 
@@ -2384,9 +2658,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(!begin.is_finished(), "begun before the copies were made");
             (r.dec.surface_caches)
-                .finish(&r.device, 1, &writer, uses.unwrap(), &used, || {
-                    writer.commit(ON)
-                })
+                .finish(
+                    &r.device,
+                    1,
+                    Some(&queue),
+                    &writer,
+                    uses.unwrap(),
+                    &used,
+                    || writer.commit(ON),
+                )
                 .unwrap();
             assert_eq!(begin.join().unwrap(), Ok(false), "the cache was released");
         });
@@ -3022,5 +3302,219 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
         assert_eq!(r.dec.caches().len(), 0);
+    }
+
+    /// The platform's command queue.
+    type Queue = <FakePlatform as Platform>::CommandQueue;
+
+    /// A command buffer on `queue`, of id `id`, that writes `BLOCK` at generation 0, begun and
+    /// finished on the caches as the decoder does one that holds a video encoder: its queue is
+    /// handed to [`Caches::finish`], for the early copies behind it.
+    fn decode_into(r: &Rig, id: u64, queue: &Queue) {
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let caches = &r.dec.surface_caches;
+        let (used, _, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        (caches.finish(
+            &r.device,
+            id,
+            Some(queue),
+            &cb,
+            uses.unwrap(),
+            &used,
+            || cb.commit(ON),
+        ))
+        .unwrap();
+    }
+
+    /// [`decode_into`], its completion, then a download: whether that was answered once done,
+    /// and the copies it made. The surface is read back after the write.
+    fn decode_then_lock(r: &Rig, id: u64, queue: &Queue) -> (bool, Vec<(u64, u64)>) {
+        decode_into(r, id, queue);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let done = download(r, BLOCK);
+        let copied = copies(&r.p.call_log().since(mark));
+        r.p.world().complete_all(CompleteOn::Caller);
+        (done.load(Ordering::SeqCst), copied)
+    }
+
+    /// A surface whose decoded picture the CPU locks to read (a decoder's output, read by its
+    /// client) is copied into its pages as the next decode into it ends, not at the lock after
+    /// it: the decode is followed on its own queue by a command buffer of the host's, committed
+    /// right behind it, which copies the cache into the pages and signals the queue's end event
+    /// next; the download that follows copies nothing more and is answered once that copy lands
+    #[test]
+    fn a_surface_read_back_is_copied_out_behind_its_next_writer() {
+        let r = cached();
+        let cache = cache_id(&r);
+        let queue = r.device.new_command_queue().unwrap();
+        let (answered, copied) = decode_then_lock(&r, 7, &queue);
+        assert!(answered);
+        assert_eq!(copied.len(), 1, "the lock's download copies");
+        let pages = copied[0].1;
+        assert_eq!(copied[0].0, cache);
+
+        let mark = r.p.call_log().mark();
+        decode_into(&r, 7, &queue);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            copies(&calls),
+            [(cache, pages)],
+            "copied out behind the writer"
+        );
+        let commits: Vec<usize> = (calls.iter().enumerate())
+            .filter(|(_, c)| c.sel == "commit")
+            .map(|(i, _)| i)
+            .collect();
+        let copy = calls.iter().position(|c| c.sel == COPY).unwrap();
+        assert_eq!(commits.len(), 2, "the writer, then the copy");
+        assert!(commits[0] < copy && copy < commits[1]);
+        let signals = events(&calls, SIGNAL);
+        assert_eq!(signals.len(), 2);
+        assert_eq!(
+            signals[1],
+            (signals[0].0, signals[0].1 + 1),
+            "the queue's end, next"
+        );
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "nothing more"
+        );
+        assert!(!done.load(Ordering::SeqCst), "answered as the copy lands");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (
+                counts.downloads,
+                counts.early,
+                counts.early_read,
+                counts.early_unread
+            ),
+            (1, 1, 1, 0)
+        );
+        assert!(
+            download(&r, BLOCK).load(Ordering::SeqCst),
+            "and at once after"
+        );
+    }
+
+    /// Only a write that was the only one since the cache's last copy, read back, starts the
+    /// early copies; a write that no download followed ends them, and the lock after it
+    /// downloads as before, which starts them again. A writer whose queue the decoder does not
+    /// hand over (one that holds no video encoder) takes none
+    #[test]
+    fn a_write_no_lock_followed_ends_the_early_copies() {
+        let mut r = cached();
+        let queue = r.device.new_command_queue().unwrap();
+        // Two writes, then the lock: no reading back.
+        use_surfaces(&mut r, 2, 0x200, &[(BLOCK, 0, true)]);
+        let (_, copied) = decode_then_lock(&r, 7, &queue);
+        assert_eq!(copied.len(), 1);
+        let mark = r.p.call_log().mark();
+        decode_into(&r, 7, &queue);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "not read back"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let (_, copied) = decode_then_lock(&r, 7, &queue);
+        assert_eq!(copied.len(), 1, "two writes since the last copy");
+
+        // One write, then the lock: the next write is copied out early, but not a writer that
+        // holds no video encoder.
+        let (_, copied) = decode_then_lock(&r, 7, &queue);
+        assert_eq!(copied.len(), 1);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x201, &[(BLOCK, 0, true)]);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "no video encoder"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let done = download(&r, BLOCK);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            1,
+            "its lock downloads"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        let mark = r.p.call_log().mark();
+        decode_into(&r, 7, &queue);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "early");
+        r.p.world().complete_all(CompleteOn::Caller);
+        // No lock reads that write: the next one is not copied out, and its lock downloads.
+        let mark = r.p.call_log().mark();
+        let (answered, copied) = decode_then_lock(&r, 7, &queue);
+        assert!(answered);
+        let all = copies(&r.p.call_log().since(mark));
+        assert_eq!(
+            (all.len(), copied.len()),
+            (1, 1),
+            "the lock's download alone"
+        );
+        assert_eq!(r.dec.caches().counts().early_unread, 1);
+        let mark = r.p.call_log().mark();
+        decode_into(&r, 7, &queue);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "early again");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.dec.caches().counts().early, 2);
+    }
+
+    /// An early copy still in flight is waited for: a release of the cache, which nothing wrote
+    /// since, is answered as it lands, copying nothing; a writer of another queue waits for it on
+    /// the GPU, at the copy's end value; and the host's own work on the cache (a decode's
+    /// picture) waits for it on the CPU
+    #[test]
+    fn an_early_copy_in_flight_is_waited_for() {
+        let mut r = cached();
+        let queue = r.device.new_command_queue().unwrap();
+        decode_then_lock(&r, 7, &queue);
+        let mark = r.p.call_log().mark();
+        decode_into(&r, 7, &queue);
+        let early = events(&r.p.call_log().since(mark), SIGNAL)[1];
+        let wait = std::time::Duration::from_millis(20);
+        assert!(
+            !r.dec.surface_caches.wait_copied_out(BLOCK, wait),
+            "in flight"
+        );
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x200, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(events(&calls, WAIT), [early], "after the copy, on the GPU");
+        assert!(copies(&calls).is_empty());
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(r.dec.surface_caches.wait_copied_out(BLOCK, wait), "landed");
+
+        // The lock after that write downloads it, the only one since the early copy: read back
+        // again, and an early copy in flight at the release.
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        decode_into(&r, 7, &queue);
+        let mark = r.p.call_log().mark();
+        let released = release(&r, BLOCK);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "nothing more"
+        );
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "answered as the copy lands"
+        );
+        assert_eq!(r.dec.caches().len(), 0);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(released.load(Ordering::SeqCst));
     }
 }

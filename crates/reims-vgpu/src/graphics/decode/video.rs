@@ -289,11 +289,20 @@ pub(super) fn decode_op<P: Platform>(
     // An output in a device cache the host is filling for this buffer (a CPU wrote the
     // surface since): the picture lands once the fill is done, so the fill's older bytes
     // never land over it.
+    // So too an output whose last picture the host is still copying into the surface's pages
+    // (an early copy, its surface read back): the picture lands once the copy is done, so the
+    // copy never reads it.
     for block in luma_cache.into_iter().chain(chroma_cache) {
         if !objs.surface_caches.wait_filled(block, FILL_WAIT) {
             return Err(op_fault(format_args!(
                 "video op {tag:#06x}: its output's device cache was not filled within \
                  {FILL_WAIT:?}"
+            )));
+        }
+        if !objs.surface_caches.wait_copied_out(block, FILL_WAIT) {
+            return Err(op_fault(format_args!(
+                "video op {tag:#06x}: its output's last picture was not copied into its pages \
+                 within {FILL_WAIT:?}"
             )));
         }
     }
