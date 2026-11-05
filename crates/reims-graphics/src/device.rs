@@ -7,7 +7,7 @@
 //! doorbell (the host's `ioeventfd`, or a `DOORBELL` write through [`Device::mmio_write`]) or by
 //! the guest's `STATUS`, it takes every message the guest has published, answers each on the
 //! completion ring, then sleeps with the ring's `consumer_idle` handshake (`ring`). While the
-//! completion ring has no room, it waits for the guest to take more ([`Room`]), and takes no
+//! completion ring has no room, it waits for the guest to take more (`Room`), and takes no
 //! command meanwhile. The guest's kexts are its sole producer, under one lock: the framebuffer's
 //! display commands, and the object lifecycle the accelerator posts for the guest's processes
 //! (creates and destroys, `QUEUE_CREATE`, `CONTEXT_CLOSE`), which the control thread hands, with
@@ -23,7 +23,7 @@
 //! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
 //! ([`Screen::mode`]): at each refresh it asks the host whether the guest wrote the scanout
 //! ([`Host::scanout_written`]) and has the screen show it where it did, sends `VBLANK` while the
-//! guest has it on, stamped with the refresh's time on its grid ([`RefreshGrid`]) as a panel's
+//! guest has it on, stamped with the refresh's time on its grid (`RefreshGrid`) as a panel's
 //! hardware stamps its vblank (dropping one the completion ring has no room for), sends
 //! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told, and then
 //! tells the host of the refresh ([`Host::refreshed`]), which answers there the presents the
@@ -75,7 +75,7 @@
 //! waited for and nothing allocated: no lock of the device's is held elsewhere (each is tried; the
 //! queues' table, held elsewhere, is waited for as [`Device::mmio_write`] waits for it, and no
 //! offer is made), the service thread holds no message of the queue's, none answered is left for
-//! it to take, the buffer fits the thread's copy of it ([`DOORBELL_MESSAGE_MAX`]), at most
+//! it to take, the buffer fits the thread's copy of it (`DOORBELL_MESSAGE_MAX`), at most
 //! `DOORBELL_READS` of ring 0's messages are left to read, and every ring-0 message the buffer
 //! waits for is carried out. Otherwise the service thread takes the buffer as it takes any, so
 //! the queue's events keep its order either way.
@@ -939,7 +939,7 @@ impl CompleteAnswer {
 /// message came from: a command queue's (the decoder's command-buffer completions for buffers
 /// submitted on that queue, which the GPU raises on a thread of its own), or the control one (a
 /// pipeline create's reflection). It writes the message and raises the ring's MSI-X vector where
-/// the guest armed it, through that ring's [`Producer`]. It holds weak references to the device
+/// the guest armed it, through that ring's `Producer`. It holds weak references to the device
 /// and the queue, so it keeps neither alive; a post after the device has ended, after the queue is
 /// destroyed, or after a reset that came since the message it posts for was taken (since the
 /// queue was made, for a queue's), is dropped.

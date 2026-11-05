@@ -160,7 +160,7 @@ pub struct RgfxComputeOpSetBufferOffsetAttributeStride {
 }
 
 /// `setBuffers:offsets:withRange:` head. `length` [`RgfxComputeBufferBinding`]
-/// records follow at [`size_of`](core::mem::size_of)`::<RgfxComputeOpSetBuffers>()`.
+/// records follow at [`size_of`]`::<RgfxComputeOpSetBuffers>()`.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
