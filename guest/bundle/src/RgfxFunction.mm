@@ -201,14 +201,10 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 - (MTLFunctionType)functionType
 {
 	if (_haveType)
-		return _type; // the .metallib's TYPE tag for this entry point
-	// DOCUMENTED PLACEHOLDER. A function's stage (vertex/fragment/kernel) is known
-	// only to the AIR the host compiles, and the guest shell never parses the
-	// metallib; the wire carries no per-function reflection (a pipeline create
-	// names the function by stage through its position in the descriptor). Until a
-	// function-reflection reply lands, this answers a fixed placeholder rather than
-	// fabricating per-function the host's answer. Callers that need the real stage
-	// read it from the pipeline, not the function. (Follow-up in the report.)
+		return _type; // the .metallib's TYPE tag, or its library's shadow's answer
+	// A function of a library whose function list did not read and that has no shadow to ask
+	// (RgfxLibrary): nothing on the guest tells its stage, and a pipeline create names the
+	// function by its place in the descriptor, so this answers Vertex.
 	return MTLFunctionTypeVertex;
 }
 

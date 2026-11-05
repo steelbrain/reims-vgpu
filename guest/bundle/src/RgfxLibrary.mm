@@ -17,6 +17,7 @@
 #import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <map>
@@ -454,8 +455,24 @@ static bool rgfxMade(uint32_t status)
 	return nullptr;
 }
 
-// Vends `name` specialised by `constants`: nil when the library's function table
-// does not hold it (as Metal answers a missing name).
+// Metal's own function `name` of the library's shadow, for a library whose function list did not
+// read (bytes this reader does not follow, which the host and Metal took): the shadow, Metal's
+// own library over the same bytes, answers which functions the library holds and what each is.
+// nil where the list read, where there is no shadow, or where the shadow holds no such function;
+// `*haveShadow` says whether there is one to ask.
+- (nullable id<MTLFunction>)rgfxGenuineNamed:(NSString *)name haveShadow:(BOOL *)haveShadow
+{
+	*haveShadow = NO;
+	if (_table->readable || name == nil)
+		return nil;
+	id<MTLLibrary> shadow = [self rgfxShadow];
+	*haveShadow = shadow != nil;
+	return [shadow newFunctionWithName:name];
+}
+
+// Vends `name` specialised by `constants`: nil when the library's function table, or for a
+// library whose table did not read its shadow, does not hold it (as Metal answers a missing
+// name).
 - (nullable id<MTLFunction>)rgfxFunctionNamed:(NSString *)name
                                     constants:(const std::vector<RgfxFunctionConstant> &)constants
 {
@@ -463,9 +480,15 @@ static bool rgfxMade(uint32_t status)
 		return nil;
 	}
 	const MetallibFunction *entry = nullptr;
+	BOOL haveShadow = NO;
+	id<MTLFunction> genuine = nil;
 	if (_table->readable) {
 		entry = [self rgfxEntryNamed:name];
 		if (entry == nullptr)
+			return nil;
+	} else {
+		genuine = [self rgfxGenuineNamed:name haveShadow:&haveShadow];
+		if (haveShadow && genuine == nil)
 			return nil;
 	}
 	RgfxFunction *fn = [RgfxFunction functionWithLibrary:self
@@ -489,6 +512,9 @@ static bool rgfxMade(uint32_t status)
 			[fn rgfxSetAirFunction:[self rgfxAirFunctionNamed:entry->name]];
 		else if (entry->type == MTLFunctionTypeVisible)
 			[fn rgfxSetAirVisible:[self rgfxAirVisibleNamed:entry->name]];
+	} else if (genuine != nil) {
+		[fn rgfxSetFunctionType:genuine.functionType];
+		[fn rgfxSetPatchType:genuine.patchType controlPointCount:genuine.patchControlPointCount];
 	}
 	return fn;
 }
@@ -629,6 +655,11 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 			declared[c.name] = c;
 		}
 		[fn rgfxSetUnspecialisedConstants:declared];
+	} else if (fn != nil && !_table->readable) {
+		// Where the table did not read, the shadow's function declares them.
+		BOOL haveShadow = NO;
+		id<MTLFunction> genuine = [self rgfxGenuineNamed:functionName haveShadow:&haveShadow];
+		[fn rgfxSetUnspecialisedConstants:genuine.functionConstantsDictionary];
 	}
 	return fn;
 }
@@ -649,11 +680,37 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 	std::map<std::string, RgfxConstantValue> byName;
 	readConstantValues(constantValues, byIndex, byName);
 	std::vector<RgfxFunctionConstant> constants;
-	if (entry != nullptr && entry->haveConstants) {
+	// The function's constants: its table entry's, or, where the table did not read, those its
+	// shadow's function declares (Metal's own over the same bytes), in index order.
+	const std::vector<RgfxConstantDecl> *decls =
+	    entry != nullptr && entry->haveConstants ? &entry->constants : nullptr;
+	std::vector<RgfxConstantDecl> declaredByShadow;
+	if (!_table->readable) {
+		BOOL haveShadow = NO;
+		id<MTLFunction> genuine = [self rgfxGenuineNamed:name haveShadow:&haveShadow];
+		if (haveShadow && genuine == nil) {
+			if (error)
+				*error = rgfxFunctionNotFound(name);
+			return nil;
+		}
+		if (genuine != nil) {
+			for (MTLFunctionConstant *c in genuine.functionConstantsDictionary.allValues) {
+				declaredByShadow.push_back(RgfxConstantDecl{
+				    c.name.UTF8String ?: "", static_cast<uint32_t>(c.type),
+				    static_cast<uint32_t>(c.index), c.required ? true : false});
+			}
+			std::sort(declaredByShadow.begin(), declaredByShadow.end(),
+			          [](const RgfxConstantDecl &a, const RgfxConstantDecl &b) {
+				          return a.index < b.index;
+			          });
+			decls = &declaredByShadow;
+		}
+	}
+	if (decls != nullptr) {
 		// The values resolved against the function's own constants, as Metal resolves them.
 		RgfxConstantMismatch mismatch;
-		if (!rgfxResolveConstants(entry->constants, byIndex, byName, constants, &mismatch)) {
-			const RgfxConstantDecl &d = entry->constants[mismatch.decl];
+		if (!rgfxResolveConstants(*decls, byIndex, byName, constants, &mismatch)) {
+			const RgfxConstantDecl &d = (*decls)[mismatch.decl];
 			NSString *what = [NSString
 			    stringWithFormat:@"Function %@: constant %s (%u) is of type %s but value found has type %s",
 			                     name, d.name.c_str(), d.index, rgfxDataTypeName(d.type).c_str(),
@@ -665,10 +722,10 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 			return nil;
 		}
 	} else {
-		// No table to resolve against (bytes that are no .metallib, or an entry whose
-		// metadata did not read): the values set by index, as set; the host checks them
-		// against the function. Values set by name need the table, and are not carried,
-		// which is logged.
+		// Nothing to resolve against (a table that did not read and no shadow, or an entry
+		// whose metadata did not read): the values set by index, as set; the host checks them
+		// against the function. Values set by name need the constants' names, and are not
+		// carried, which is logged.
 		if (!byName.empty())
 			RGFX_UNSUPPORTED("function constants set by name, in a library whose table did not read");
 		for (const auto &[index, v] : byIndex) {
@@ -730,8 +787,10 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 
 - (NSArray<NSString *> *)functionNames
 {
-	// The .metallib's function list but its extern functions, as Metal lists it; empty for raw
-	// AIR, whose functions callers name directly by string.
+	// The .metallib's function list but its extern functions, as Metal lists it; for bytes whose
+	// list did not read, the shadow's, Metal's own over them (none where there is no shadow).
+	if (!_table->readable)
+		return [[self rgfxShadow] functionNames] ?: @[];
 	NSMutableArray<NSString *> *names =
 	    [NSMutableArray arrayWithCapacity:_table->functions.size()];
 	for (const MetallibFunction &f : _table->functions) {

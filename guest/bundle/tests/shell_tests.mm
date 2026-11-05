@@ -2811,6 +2811,91 @@ void test_function_members_from_shadow()
 	}
 }
 
+// A library whose function list does not read (bytes this reader does not follow, which the host
+// took) answers from its shadow, Metal's own library over the same bytes: its function names, nil
+// for a name the shadow lacks, each function's type and patch, its declared constants, and values
+// set by name resolved against them, a value of another type failing as Metal's does. With no
+// shadow, its functions still answer the placeholder stage.
+void test_unread_function_list_answers_from_shadow()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	id<MTLLibrary> genuine =
+	    [metal newLibraryWithData:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		           (void)bytes;
+	           })
+	                        error:nil];
+	CHECK(genuine != nil);
+	// Bytes whose function list does not read: the .metallib with its list's offset past its end.
+	NSMutableData *unread = [bytes mutableCopy];
+	const uint64_t past = unread.length + 1;
+	std::memcpy(static_cast<uint8_t *>(unread.mutableBytes) + 0x18, &past, sizeof(past));
+	auto make = [&]() {
+		uint32_t status = 0;
+		return [RgfxLibrary libraryWithData:unread.bytes
+		                             length:unread.length
+		                                key:nullptr
+		                             device:nil
+		                         serializer:&fx.ser
+		                             status:&status];
+	};
+	RgfxLibrary *lib = make();
+	CHECK(lib != nil);
+	[lib rgfxAdoptShadow:genuine];
+	NSArray *names = [[lib functionNames] sortedArrayUsingSelector:@selector(compare:)];
+	CHECK([names isEqualToArray:[genuine.functionNames sortedArrayUsingSelector:@selector(compare:)]]);
+	CHECK([names containsObject:@"no_texture"]);
+	CHECK([lib newFunctionWithName:@"no_texture"].functionType == MTLFunctionTypeKernel);
+	CHECK([lib newFunctionWithName:@"reads_in_vertex"].functionType == MTLFunctionTypeVertex);
+	CHECK([lib newFunctionWithName:@"writes_in_fragment"].functionType == MTLFunctionTypeFragment);
+	CHECK([lib newFunctionWithName:@"no_such_function"] == nil);
+	NSError *err = nil;
+	CHECK([lib newFunctionWithName:@"no_such_function" constantValues:[MTLFunctionConstantValues new]
+	                          error:&err] == nil &&
+	      err.code == MTLLibraryErrorFunctionNotFound);
+	CHECK([lib newFunctionWithName:@"no_texture"].patchControlPointCount == -1);
+
+	// every_access declares kScale (index 0, bool), as Metal's own function does.
+	id<MTLFunction> unspecialised = [lib newFunctionWithName:@"every_access"];
+	MTLFunctionConstant *declared = unspecialised.functionConstantsDictionary[@"kScale"];
+	MTLFunctionConstant *metals =
+	    [genuine newFunctionWithName:@"every_access"].functionConstantsDictionary[@"kScale"];
+	CHECK(unspecialised.functionConstantsDictionary.count == 1 && declared.index == 0 &&
+	      declared.type == MTLDataTypeBool && metals != nil && declared.required == metals.required);
+	MTLFunctionConstantValues *byName = [MTLFunctionConstantValues new];
+	bool yes = true;
+	[byName setConstantValue:&yes type:MTLDataTypeBool withName:@"kScale"];
+	err = nil;
+	RgfxFunction *fn = (RgfxFunction *)[lib newFunctionWithName:@"every_access"
+	                                             constantValues:byName
+	                                                      error:&err];
+	CHECK(fn != nil && err == nil && [fn rgfxConstantCount] == 1);
+	if ([fn rgfxConstantCount] == 1) {
+		const RgfxFunctionConstant &c = [fn rgfxConstants][0];
+		CHECK(c.index == 0 && c.data_type == MTLDataTypeBool && c.value[0] == 1);
+	}
+	float wrong = 1.0f;
+	MTLFunctionConstantValues *mistyped = [MTLFunctionConstantValues new];
+	[mistyped setConstantValue:&wrong type:MTLDataTypeFloat withName:@"kScale"];
+	err = nil;
+	CHECK([lib newFunctionWithName:@"every_access" constantValues:mistyped error:&err] == nil &&
+	      err.code == MTLLibraryErrorCompileFailure);
+
+	// With no shadow there is nothing to ask: a function of any name, of the placeholder stage.
+	RgfxLibrary *alone = make();
+	CHECK([alone functionNames].count == 0);
+	CHECK([alone newFunctionWithName:@"no_texture"].functionType == MTLFunctionTypeVertex);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A library made from bytes answers nil for its bitcode, as Metal's, and is written by its shadow
 // as the bytes it was made from, with Foundation's error for a URL it cannot write; one made from
 // a URL is refused with Metal's error, and one with no shadow is refused, logged. (Metal's answers
@@ -11995,6 +12080,7 @@ int main(int argc, char **argv)
 		test_source_compiles_through_metals_frontend();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
+		test_unread_function_list_answers_from_shadow();
 		test_stitchable_reflection_from_air();
 		test_library_members_as_metal();
 		test_command_graph();
