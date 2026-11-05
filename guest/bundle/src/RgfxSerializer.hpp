@@ -109,6 +109,37 @@ struct RgfxRenderPipelineParams {
 	uint32_t fragment_linked_count;
 };
 
+/// A mesh render pipeline's descriptor, as MTLMeshRenderPipelineDescriptor gives it, in plain
+/// fields the serialiser packs into RgfxMeshRenderPipelineCreate: the object and fragment
+/// functions may name none (library 0, null name); `colors[0..color_attachment_count)` are in use;
+/// each stage's linked functions may be null when their counts are 0; `label` may be null. A
+/// maximum, payload length or required size of 0 leaves Metal's.
+struct RgfxMeshRenderPipelineParams {
+	RgfxFunctionRef object;
+	RgfxFunctionRef mesh;
+	RgfxFunctionRef fragment;
+	const char *label;
+	uint32_t raster_sample_count;
+	uint32_t color_attachment_count; // <= 8
+	RgfxColorAttachmentDesc colors[8];
+	uint32_t depth_pixel_format;
+	uint32_t stencil_pixel_format;
+	uint32_t flags; // RGFX_RENDER_PIPELINE_* and RGFX_MESH_PIPELINE_*
+	uint32_t max_total_threads_per_object_threadgroup;
+	uint32_t max_total_threads_per_mesh_threadgroup;
+	uint32_t max_total_threadgroups_per_mesh_grid;
+	uint32_t payload_memory_length;
+	uint32_t max_vertex_amplification_count;
+	uint32_t required_threads_per_object_threadgroup[3];
+	uint32_t required_threads_per_mesh_threadgroup[3];
+	const RgfxLinkedFunctionRef *object_linked;
+	uint32_t object_linked_count;
+	const RgfxLinkedFunctionRef *mesh_linked;
+	uint32_t mesh_linked_count;
+	const RgfxLinkedFunctionRef *fragment_linked;
+	uint32_t fragment_linked_count;
+};
+
 /// A compute pipeline's descriptor in plain fields the serialiser packs into
 /// RgfxComputePipelineCreate. The stage-input descriptor's `layouts` and
 /// `attributes` (their step functions MTLStepFunction, their formats
@@ -436,6 +467,11 @@ public:
 	/// (RgfxPipelinePost).
 	RgfxCreated createRenderPipeline(const RgfxRenderPipelineParams &params,
 	                                 RgfxPipelinePost *post = nullptr);
+
+	/// A mesh render pipeline from `params` (RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, where the
+	/// host makes mesh pipelines: RGFX_FEATURE_MESH_PIPELINES), answered as createRenderPipeline
+	/// is, the mesh stages' limits after the reflection. Every create waits for its answer.
+	RgfxCreated createMeshRenderPipeline(const RgfxMeshRenderPipelineParams &params);
 
 	/// A compute pipeline from `params`, answered as createRenderPipeline is.
 	RgfxCreated createComputePipeline(const RgfxComputePipelineParams &params,

@@ -987,6 +987,141 @@ void test_pipeline_messages()
 	CHECK(back.thread_execution_width == 32);
 }
 
+// A mesh render pipeline's create: its three functions and label in the tail, its colours, flags,
+// limits and required sizes in its head; and its answer, the reflection with the mesh stages'
+// limits after it, which the reply reader hands over whole, as it does a render pipeline's without.
+void test_mesh_pipeline_messages()
+{
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, nullptr, nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	RgfxFunctionConstant k = {};
+	k.index = 3;
+	k.data_type = 29;
+	RgfxMeshRenderPipelineParams mp = {};
+	mp.object.library = 11;
+	mp.object.entry_point = "omain";
+	mp.mesh.library = 12;
+	mp.mesh.entry_point = "mesh_main";
+	mp.mesh.constants = &k;
+	mp.mesh.constant_count = 1;
+	mp.fragment.library = 12;
+	mp.fragment.entry_point = "fmain";
+	mp.label = "meshes";
+	mp.raster_sample_count = 4;
+	mp.color_attachment_count = 2;
+	mp.colors[1].pixel_format = 80;
+	mp.colors[1].write_mask = 0xf;
+	mp.depth_pixel_format = 252;
+	mp.flags = RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED |
+	           RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH;
+	mp.max_total_threads_per_object_threadgroup = 64;
+	mp.max_total_threads_per_mesh_threadgroup = 32;
+	mp.max_total_threadgroups_per_mesh_grid = 8;
+	mp.payload_memory_length = 256;
+	mp.required_threads_per_object_threadgroup[0] = 2;
+	mp.required_threads_per_mesh_threadgroup[0] = 4;
+	mp.required_threads_per_mesh_threadgroup[2] = 1;
+
+	RgfxCreated r = ser.createMeshRenderPipeline(mp);
+	CHECK(r.posted);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE);
+	CHECK(h.size == bytes.size() && h.size % 8 == 0);
+	CHECK(h.seqno == r.seqno && r.seqno == 1); // the first message on the ring
+	RgfxMeshRenderPipelineCreate mc;
+	std::memcpy(&mc, bytes.data(), sizeof(mc));
+	CHECK(mc.obj_id == r.obj_id);
+	CHECK(mc.object_library_obj_id == 11 && mc.mesh_library_obj_id == 12 &&
+	      mc.fragment_library_obj_id == 12);
+	CHECK(mc.object_name_len == 5);
+	CHECK(std::memcmp(bytes.data() + mc.object_name_offset, "omain", 5) == 0);
+	CHECK(mc.mesh_name_len == 9);
+	CHECK(std::memcmp(bytes.data() + mc.mesh_name_offset, "mesh_main", 9) == 0);
+	CHECK(mc.fragment_name_len == 5);
+	CHECK(std::memcmp(bytes.data() + mc.fragment_name_offset, "fmain", 5) == 0);
+	CHECK(mc.label_len == 6);
+	CHECK(std::memcmp(bytes.data() + mc.label_offset, "meshes", 6) == 0);
+	CHECK(mc.object_constant_count == 0 && mc.mesh_constant_count == 1 &&
+	      mc.fragment_constant_count == 0);
+	RgfxFunctionConstant gotK;
+	std::memcpy(&gotK, bytes.data() + mc.mesh_constants_offset, sizeof(gotK));
+	CHECK(gotK.index == 3 && gotK.data_type == 29);
+	CHECK(mc.object_linked_count == 0 && mc.mesh_linked_count == 0 &&
+	      mc.fragment_linked_count == 0);
+	CHECK(mc.raster_sample_count == 4 && mc.color_attachment_count == 2);
+	CHECK(mc.colors[0].pixel_format == 0 && mc.colors[1].pixel_format == 80);
+	CHECK(mc.depth_pixel_format == 252 && mc.stencil_pixel_format == 0);
+	CHECK(mc.flags == (RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED |
+	                   RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH));
+	CHECK(mc.max_total_threads_per_object_threadgroup == 64);
+	CHECK(mc.max_total_threads_per_mesh_threadgroup == 32);
+	CHECK(mc.max_total_threadgroups_per_mesh_grid == 8);
+	CHECK(mc.payload_memory_length == 256);
+	CHECK(mc.required_threads_per_object_threadgroup[0] == 2);
+	CHECK(mc.required_threads_per_mesh_threadgroup[0] == 4 &&
+	      mc.required_threads_per_mesh_threadgroup[1] == 0 &&
+	      mc.required_threads_per_mesh_threadgroup[2] == 1);
+
+	// The answer: 104 bytes, the mesh stages' limits at RGFX_PIPELINE_REFLECTION_MESH_OFFSET.
+	CHECK(sizeof(RgfxPipelineReflection) == RGFX_PIPELINE_REFLECTION_MESH_OFFSET);
+	uint8_t answer[sizeof(RgfxPipelineReflection) + sizeof(RgfxMeshPipelineReflection)] = {};
+	CHECK(sizeof(answer) == 104);
+	RgfxPipelineReflection refl = {};
+	refl.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	refl.header.size = sizeof(answer);
+	refl.header.seqno = 21;
+	refl.obj_id = r.obj_id;
+	refl.status = RGFX_PIPELINE_OK;
+	refl.kind = RGFX_PIPELINE_KIND_MESH;
+	RgfxMeshPipelineReflection limits = {};
+	limits.max_total_threads_per_object_threadgroup = 64;
+	limits.max_total_threads_per_mesh_threadgroup = 32;
+	limits.object_thread_execution_width = 32;
+	limits.mesh_thread_execution_width = 32;
+	limits.max_total_threadgroups_per_mesh_grid = UINT32_MAX;
+	std::memcpy(answer, &refl, sizeof(refl));
+	std::memcpy(answer + RGFX_PIPELINE_REFLECTION_MESH_OFFSET, &limits, sizeof(limits));
+
+	RgfxReplyReader reader;
+	RgfxPipelineReply got = {};
+	reader.expectReflection(21, [&got](const RgfxPipelineReply &m) { got = m; });
+	reader.deliver(answer, sizeof(answer));
+	CHECK(got.obj_id == r.obj_id && got.kind == RGFX_PIPELINE_KIND_MESH);
+	CHECK(got.hasMesh);
+	CHECK(std::memcmp(&got.mesh, &limits, sizeof(limits)) == 0);
+
+	// Before its handler, kept whole too.
+	refl.header.seqno = 22;
+	std::memcpy(answer, &refl, sizeof(refl));
+	reader.deliver(answer, sizeof(answer));
+	got = {};
+	reader.expectReflection(22, [&got](const RgfxPipelineReply &m) { got = m; });
+	CHECK(got.hasMesh && got.mesh.max_total_threadgroups_per_mesh_grid == UINT32_MAX);
+
+	// A refusal carries no limits, and neither does a render pipeline's answer.
+	refl.header.size = sizeof(refl);
+	refl.header.seqno = 23;
+	refl.status = RGFX_PIPELINE_REFUSED;
+	reader.deliver(&refl, sizeof(refl));
+	got = {};
+	reader.expectReflection(23, [&got](const RgfxPipelineReply &m) { got = m; });
+	CHECK(got.status == RGFX_PIPELINE_REFUSED && !got.hasMesh);
+	refl.header.size = sizeof(answer);
+	refl.header.seqno = 24;
+	refl.status = RGFX_PIPELINE_OK;
+	refl.kind = RGFX_PIPELINE_KIND_RENDER;
+	std::memcpy(answer, &refl, sizeof(refl));
+	reader.deliver(answer, sizeof(answer));
+	got = {};
+	reader.expectReflection(24, [&got](const RgfxPipelineReply &m) { got = m; });
+	CHECK(got.kind == RGFX_PIPELINE_KIND_RENDER && !got.hasMesh);
+}
+
 void test_ring_wrap_and_no_room()
 {
 	// A small ring so a message must pad to the end and wrap.
@@ -1062,6 +1197,136 @@ struct OpWalk {
 
 // `tag >> 12`, the op's group, as the host splits it.
 uint16_t opGroup(uint16_t tag) { return static_cast<uint16_t>(tag >> 12); }
+
+// The object and mesh stages' ops and the mesh draws, each in its own body.
+void test_mesh_ops()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+	RgfxRenderPassDesc pass = {};
+	RgfxRenderPassColorAttachment color = {};
+	color.texture_obj_id = 4;
+	enc.beginRenderPass(pass, &color, 1);
+	RgfxBufferBinding b = {};
+	b.buffer_obj_id = 9;
+	b.offset = 16;
+	enc.renderSetObjectBuffers(2, &b, 1);
+	enc.renderSetMeshBuffers(3, &b, 1);
+	enc.renderSetObjectBufferOffset(32, 2);
+	enc.renderSetMeshBufferOffset(48, 3);
+	RgfxTextureBinding t = {};
+	t.texture_obj_id = 5;
+	enc.renderSetObjectTextures(1, &t, 1);
+	enc.renderSetMeshTextures(0, &t, 1);
+	RgfxSamplerBinding sb = {};
+	sb.sampler_obj_id = 6;
+	enc.renderSetObjectSamplerStates(0, &sb, 1);
+	enc.renderSetMeshSamplerStates(1, &sb, 1);
+	RgfxSamplerLodBinding lb = {};
+	lb.sampler_obj_id = 7;
+	enc.renderSetObjectSamplerStatesLodClamps(2, &lb, 1);
+	enc.renderSetMeshSamplerStatesLodClamps(3, &lb, 1);
+	enc.renderSetObjectThreadgroupMemoryLength(256, 0);
+	const uint64_t grid[3] = {4, 2, 1};
+	const uint64_t object[3] = {32, 1, 1};
+	const uint64_t mesh[3] = {64, 1, 1};
+	enc.renderDrawMeshThreadgroups(grid, object, mesh);
+	enc.renderDrawMeshThreads(grid, object, mesh);
+	enc.renderDrawMeshThreadgroupsIndirect(9, 24, object, mesh);
+	enc.endEncoder();
+	uint64_t seqno = 0;
+	CHECK(enc.finish(&seqno));
+
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	RgfxCommandBuffer cb = {};
+	std::memcpy(&cb, bytes.data(), sizeof(cb));
+	OpWalk walk(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes);
+	uint16_t tag = 0, flags = 0;
+	uint32_t len = 0;
+	const uint8_t *body = nullptr;
+	size_t body_len = 0;
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_BEGIN_RENDER);
+
+	// The ranged sets: a range head, then the entries.
+	struct Ranged {
+		uint16_t tag;
+		uint64_t location;
+		size_t entry;
+		const void *first;
+	};
+	const Ranged ranged[] = {
+	    {RGFX_OP_RENDER_SET_OBJECT_BUFFERS, 2, sizeof(b), &b},
+	    {RGFX_OP_RENDER_SET_MESH_BUFFERS, 3, sizeof(b), &b},
+	};
+	for (const Ranged &want : ranged) {
+		CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == want.tag);
+		RgfxOpSetObjectBuffers head = {};
+		CHECK(body_len == sizeof(head) + want.entry);
+		std::memcpy(&head, body, sizeof(head));
+		CHECK(head.range_location == want.location && head.range_length == 1);
+		CHECK(std::memcmp(body + sizeof(head), want.first, want.entry) == 0);
+	}
+	const uint16_t offsets[] = {RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET,
+	                            RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET};
+	const uint64_t offsetValues[][2] = {{32, 2}, {48, 3}};
+	for (int i = 0; i < 2; i++) {
+		CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == offsets[i]);
+		RgfxOpSetMeshBufferOffset o = {};
+		CHECK(body_len == sizeof(o));
+		std::memcpy(&o, body, sizeof(o));
+		CHECK(o.offset == offsetValues[i][0] && o.index == offsetValues[i][1]);
+	}
+	const Ranged more[] = {
+	    {RGFX_OP_RENDER_SET_OBJECT_TEXTURES, 1, sizeof(t), &t},
+	    {RGFX_OP_RENDER_SET_MESH_TEXTURES, 0, sizeof(t), &t},
+	    {RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES, 0, sizeof(sb), &sb},
+	    {RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES, 1, sizeof(sb), &sb},
+	    {RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS, 2, sizeof(lb), &lb},
+	    {RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS, 3, sizeof(lb), &lb},
+	};
+	for (const Ranged &want : more) {
+		CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == want.tag);
+		uint64_t head[2] = {};
+		CHECK(body_len == sizeof(head) + want.entry);
+		std::memcpy(head, body, sizeof(head));
+		CHECK(head[0] == want.location && head[1] == 1);
+		CHECK(std::memcmp(body + sizeof(head), want.first, want.entry) == 0);
+	}
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) &&
+	      tag == RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH);
+	RgfxOpSetObjectThreadgroupMemoryLength tml = {};
+	CHECK(body_len == sizeof(tml));
+	std::memcpy(&tml, body, sizeof(tml));
+	CHECK(tml.length == 256 && tml.index == 0);
+
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) &&
+	      tag == RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS);
+	RgfxOpDrawMeshThreadgroups tg = {};
+	CHECK(body_len == sizeof(tg));
+	std::memcpy(&tg, body, sizeof(tg));
+	CHECK(tg.threadgroups_per_grid[0] == 4 && tg.threadgroups_per_grid[1] == 2 &&
+	      tg.threadgroups_per_grid[2] == 1);
+	CHECK(tg.threads_per_object_threadgroup[0] == 32 && tg.threads_per_mesh_threadgroup[0] == 64);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_RENDER_DRAW_MESH_THREADS);
+	RgfxOpDrawMeshThreads th = {};
+	CHECK(body_len == sizeof(th));
+	std::memcpy(&th, body, sizeof(th));
+	CHECK(th.threads_per_grid[0] == 4 && th.threads_per_mesh_threadgroup[0] == 64);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) &&
+	      tag == RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT);
+	RgfxOpDrawMeshThreadgroupsIndirect ind = {};
+	CHECK(body_len == sizeof(ind));
+	std::memcpy(&ind, body, sizeof(ind));
+	CHECK(ind.indirect_buffer_obj_id == 9 && ind.indirect_buffer_offset == 24);
+	CHECK(ind.threads_per_object_threadgroup[0] == 32 && ind.threads_per_mesh_threadgroup[0] == 64);
+	CHECK(walk.next(&tag, &flags, &len, &body, &body_len) && tag == RGFX_OP_ENCODER_END);
+	CHECK(walk.done());
+}
 
 // post() waits while the ring is full, ringing the doorbell and calling its hook, until the
 // host takes room; a message over half the ring does not fit() and is refused at once; and
@@ -2560,6 +2825,8 @@ int main()
 	test_creates_with_no_address_post_nothing();
 	test_library_message();
 	test_pipeline_messages();
+	test_mesh_pipeline_messages();
+	test_mesh_ops();
 	test_ring_wrap_and_no_room();
 	test_ring_post_waits_for_room();
 	test_ring_post_waits_for_the_room_record();

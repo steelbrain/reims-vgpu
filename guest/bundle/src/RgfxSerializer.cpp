@@ -1054,6 +1054,93 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createMeshRenderPipeline(const RgfxMeshRenderPipelineParams &p)
+{
+	RgfxCreated out = {};
+	out.obj_id = m_ids.allocObjId();
+
+	// The functions, label, constants and linked functions go in the message tail, each addressed
+	// by a byte offset from the message start, as a render pipeline's.
+	const uint32_t head = sizeof(RgfxMeshRenderPipelineCreate);
+	std::vector<uint8_t> tail;
+	auto append = [&](const void *data, size_t n) -> uint32_t {
+		uint32_t off = static_cast<uint32_t>(head + tail.size());
+		if (n) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			tail.insert(tail.end(), b, b + n);
+		}
+		return off;
+	};
+	auto nameLen = [](const char *s) -> uint32_t {
+		return s ? static_cast<uint32_t>(std::strlen(s)) : 0;
+	};
+
+	RgfxMeshRenderPipelineCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.object_library_obj_id = p.object.library;
+	msg.mesh_library_obj_id = p.mesh.library;
+	msg.fragment_library_obj_id = p.fragment.library;
+	uint32_t olen = nameLen(p.object.entry_point);
+	msg.object_name_offset = append(p.object.entry_point, olen);
+	msg.object_name_len = olen;
+	uint32_t mlen = nameLen(p.mesh.entry_point);
+	msg.mesh_name_offset = append(p.mesh.entry_point, mlen);
+	msg.mesh_name_len = mlen;
+	uint32_t flen = nameLen(p.fragment.entry_point);
+	msg.fragment_name_offset = append(p.fragment.entry_point, flen);
+	msg.fragment_name_len = flen;
+	uint32_t llen = nameLen(p.label);
+	msg.label_offset = append(p.label, llen);
+	msg.label_len = llen;
+	msg.object_constants_offset =
+	    append(p.object.constants, p.object.constant_count * sizeof(RgfxFunctionConstant));
+	msg.object_constant_count = p.object.constant_count;
+	msg.mesh_constants_offset =
+	    append(p.mesh.constants, p.mesh.constant_count * sizeof(RgfxFunctionConstant));
+	msg.mesh_constant_count = p.mesh.constant_count;
+	msg.fragment_constants_offset =
+	    append(p.fragment.constants, p.fragment.constant_count * sizeof(RgfxFunctionConstant));
+	msg.fragment_constant_count = p.fragment.constant_count;
+	msg.object_linked_offset = appendLinkedFunctions(append, p.object_linked, p.object_linked_count);
+	msg.object_linked_count = p.object_linked_count;
+	msg.mesh_linked_offset = appendLinkedFunctions(append, p.mesh_linked, p.mesh_linked_count);
+	msg.mesh_linked_count = p.mesh_linked_count;
+	msg.fragment_linked_offset =
+	    appendLinkedFunctions(append, p.fragment_linked, p.fragment_linked_count);
+	msg.fragment_linked_count = p.fragment_linked_count;
+
+	msg.raster_sample_count = p.raster_sample_count;
+	uint32_t ncolor = p.color_attachment_count > 8 ? 8 : p.color_attachment_count;
+	msg.color_attachment_count = ncolor;
+	for (uint32_t i = 0; i < ncolor; i++)
+		msg.colors[i] = p.colors[i];
+	msg.depth_pixel_format = p.depth_pixel_format;
+	msg.stencil_pixel_format = p.stencil_pixel_format;
+	msg.flags = p.flags;
+	msg.max_total_threads_per_object_threadgroup = p.max_total_threads_per_object_threadgroup;
+	msg.max_total_threads_per_mesh_threadgroup = p.max_total_threads_per_mesh_threadgroup;
+	msg.max_total_threadgroups_per_mesh_grid = p.max_total_threadgroups_per_mesh_grid;
+	msg.payload_memory_length = p.payload_memory_length;
+	msg.max_vertex_amplification_count = p.max_vertex_amplification_count;
+	for (int i = 0; i < 3; i++) {
+		msg.required_threads_per_object_threadgroup[i] = p.required_threads_per_object_threadgroup[i];
+		msg.required_threads_per_mesh_threadgroup[i] = p.required_threads_per_mesh_threadgroup[i];
+	}
+
+	uint64_t total = roundUp8(head + tail.size());
+	if (total > m_control.dataSize() || total > UINT32_MAX) {
+		out.posted = false;
+		return out;
+	}
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	if (!tail.empty())
+		std::memcpy(buf.data() + head, tail.data(), tail.size());
+	postPipeline(m_control, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, buf.data(),
+	             static_cast<uint32_t>(total), out, nullptr);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParams &p,
                                                   RgfxPipelinePost *post)
 {

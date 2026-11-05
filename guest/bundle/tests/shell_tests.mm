@@ -1259,6 +1259,61 @@ static const uint64_t kTwoPlaneFormats[] = {500, 502, 503, 505, 506, 507, 508, 5
                                             520, 522, 523, 525, 526, 527, 528, 529, 530,
                                             540, 541, 542, 543, 544, 545, 550, 551};
 
+std::vector<uint8_t> nextMessage(TestRing &ring, uint32_t type); // below
+
+// A library of the mesh pipeline tests' functions (named as oracle_mesh's), with its create read
+// off the ring.
+static RgfxLibrary *meshLibrary(Fixture &fx)
+{
+	const uint8_t libBytes[] = {5, 6, 7, 8};
+	uint32_t libStatus = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	return lib;
+}
+
+// `lib`'s function `name`, of the stage `type`, as its function list would tell it.
+static id<MTLFunction> stageFunction(RgfxLibrary *lib, NSString *name, MTLFunctionType type)
+{
+	RgfxFunction *f = (RgfxFunction *)[lib newFunctionWithName:name];
+	[f rgfxSetFunctionType:type];
+	return f;
+}
+
+// oracle_mesh's mesh pipeline with an object stage: o_fn, m_payload and f_col, one BGRA8 target.
+static MTLMeshRenderPipelineDescriptor *meshDescriptor(RgfxLibrary *lib)
+{
+	MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+	m.objectFunction = stageFunction(lib, @"o_fn", MTLFunctionTypeObject);
+	m.meshFunction = stageFunction(lib, @"m_payload", MTLFunctionTypeMesh);
+	m.fragmentFunction = stageFunction(lib, @"f_col", MTLFunctionTypeFragment);
+	m.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	return m;
+}
+
+// Whether `size` is `w` x `h` x `d`.
+static bool sizeIs(MTLSize size, NSUInteger w, NSUInteger h, NSUInteger d)
+{
+	return size.width == w && size.height == h && size.depth == d;
+}
+
+// Makes a mesh pipeline state of `m` on `fx`, as the device's creators do (1024 threads a
+// threadgroup at most, the device's).
+static RgfxRenderPipelineState *meshState(Fixture &fx, MTLMeshRenderPipelineDescriptor *m,
+                                          NSError **error)
+{
+	return [RgfxRenderPipelineState meshRenderPipelineStateWithDescriptor:m
+	                                                               device:nil
+	                                                           serializer:&fx.ser
+	                                                      maxTotalThreads:1024
+	                                                                error:error];
+}
+
 // The cases checkDies runs, each in a process of its own: each ends the process where it should,
 // else it answers 0, which its check fails.
 static int dies_case(const char *name)
@@ -1460,6 +1515,18 @@ static int dies_case(const char *name)
 		                                                   mipmapped:NO];
 		desc.storageMode = MTLStorageModeManaged;
 		rgfxEndAtInvalidTextureDescriptor(desc);
+	}
+	if (std::strncmp(name, "mesh-", 5) == 0) {
+		MTLMeshRenderPipelineDescriptor *m = meshDescriptor(meshLibrary(fx));
+		if (std::strcmp(name, "mesh-icb") == 0)
+			m.supportIndirectCommandBuffers = YES;
+		else if (std::strcmp(name, "mesh-no-mesh") == 0)
+			m.meshFunction = nil;
+		else if (std::strcmp(name, "mesh-no-fragment") == 0)
+			m.fragmentFunction = nil;
+		else
+			return 0;
+		(void)meshState(fx, m, nullptr);
 	}
 	const NSRange one = NSMakeRange(0, 1);
 	if (std::strcmp(name, "view-no-format") == 0)
@@ -2071,6 +2138,8 @@ std::vector<uint8_t> nextMessage(TestRing &ring, uint32_t type)
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(ring.next(&h, &bytes));
+	if (h.type != type)
+		std::fprintf(stderr, "nextMessage: message type %#x, not %#x\n", h.type, type);
 	CHECK(h.type == type);
 	return bytes;
 }
@@ -2323,6 +2392,225 @@ void test_render_pipeline_routing()
 	                                                        error:&err2];
 	CHECK(noRoute == nil);
 	CHECK(err2 != nil);
+}
+
+// A mesh render pipeline create maps the MTLMeshRenderPipelineDescriptor into the wire: its three
+// functions and label in the tail, its colours, flags, maxima, payload and required sizes in its
+// head. Its answer's mesh limits are what the state answers, NSUIntegerMax for the wire's highest
+// grid; the sizes its descriptor required it answers as Metal's do (oracle_mesh required).
+void test_mesh_pipeline_routing()
+{
+	Fixture fx;
+	RgfxLibrary *lib = meshLibrary(fx);
+	MTLMeshRenderPipelineDescriptor *m = meshDescriptor(lib);
+	m.label = @"meshes";
+	m.rasterSampleCount = 4;
+	m.colorAttachments[2].pixelFormat = MTLPixelFormatRGBA16Float;
+	m.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	m.maxTotalThreadsPerObjectThreadgroup = 64;
+	m.maxTotalThreadsPerMeshThreadgroup = 32;
+	m.maxTotalThreadgroupsPerMeshGrid = 8;
+	m.payloadMemoryLength = 256;
+	m.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = YES;
+	m.requiredThreadsPerObjectThreadgroup = MTLSizeMake(2, 1, 1);
+	m.requiredThreadsPerMeshThreadgroup = MTLSizeMake(4, 1, 1);
+	m.meshLinkedFunctions.functions = @[ [lib newFunctionWithName:@"mlink"] ];
+	// The descriptor whose supportIndirectCommandBuffers YES ends the process
+	// (test_invalid_mesh_descriptors_end_the_process) makes its pipeline with NO.
+	m.supportIndirectCommandBuffers = NO;
+
+	NSError *err = nil;
+	RgfxRenderPipelineState *ps = meshState(fx, m, &err);
+	CHECK(ps != nil && err == nil);
+	CHECK(![ps rgfxDeferred]);
+	CHECK([ps.label isEqualToString:@"meshes"]);
+	auto bytes = nextMessage(fx.ring, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE);
+	RgfxMeshRenderPipelineCreate head;
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(head.obj_id == ps.rgfxObjId);
+	CHECK(head.object_library_obj_id == lib.rgfxObjId && head.mesh_library_obj_id == lib.rgfxObjId &&
+	      head.fragment_library_obj_id == lib.rgfxObjId);
+	CHECK(head.object_name_len == 4 &&
+	      std::memcmp(bytes.data() + head.object_name_offset, "o_fn", 4) == 0);
+	CHECK(head.mesh_name_len == 9 &&
+	      std::memcmp(bytes.data() + head.mesh_name_offset, "m_payload", 9) == 0);
+	CHECK(head.fragment_name_len == 5 &&
+	      std::memcmp(bytes.data() + head.fragment_name_offset, "f_col", 5) == 0);
+	CHECK(head.label_len == 6 && std::memcmp(bytes.data() + head.label_offset, "meshes", 6) == 0);
+	CHECK(head.object_linked_count == 0 && head.mesh_linked_count == 1 &&
+	      head.fragment_linked_count == 0);
+	CHECK(head.raster_sample_count == 4 && head.color_attachment_count == 3);
+	CHECK(head.colors[0].pixel_format == static_cast<uint32_t>(MTLPixelFormatBGRA8Unorm));
+	CHECK(head.colors[1].pixel_format == 0);
+	CHECK(head.colors[2].pixel_format == static_cast<uint32_t>(MTLPixelFormatRGBA16Float));
+	CHECK(head.depth_pixel_format == static_cast<uint32_t>(MTLPixelFormatDepth32Float));
+	CHECK(head.flags == (RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED |
+	                     RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH));
+	CHECK(head.max_total_threads_per_object_threadgroup == 64 &&
+	      head.max_total_threads_per_mesh_threadgroup == 32 &&
+	      head.max_total_threadgroups_per_mesh_grid == 8 && head.payload_memory_length == 256);
+	CHECK(head.required_threads_per_object_threadgroup[0] == 2 &&
+	      head.required_threads_per_object_threadgroup[1] == 1 &&
+	      head.required_threads_per_mesh_threadgroup[0] == 4);
+
+	// Before its answer it answers no mesh limits; after it, the host's.
+	CHECK(ps.maxTotalThreadsPerObjectThreadgroup == 0 && ps.maxTotalThreadgroupsPerMeshGrid == 0);
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	[ps rgfxRegisterWithReplyReader:&reader];
+	uint8_t answer[sizeof(RgfxPipelineReflection) + sizeof(RgfxMeshPipelineReflection)] = {};
+	RgfxPipelineReflection refl = {};
+	refl.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	refl.header.size = sizeof(answer);
+	refl.header.seqno = ps.rgfxSeqno;
+	refl.obj_id = ps.rgfxObjId;
+	refl.status = RGFX_PIPELINE_OK;
+	refl.kind = RGFX_PIPELINE_KIND_MESH;
+	RgfxMeshPipelineReflection limits = {};
+	limits.max_total_threads_per_object_threadgroup = 64;
+	limits.max_total_threads_per_mesh_threadgroup = 32;
+	limits.object_thread_execution_width = 32;
+	limits.mesh_thread_execution_width = 16;
+	limits.max_total_threadgroups_per_mesh_grid = UINT32_MAX;
+	std::memcpy(answer, &refl, sizeof(refl));
+	std::memcpy(answer + RGFX_PIPELINE_REFLECTION_MESH_OFFSET, &limits, sizeof(limits));
+	CHECK(completion.postFromHost(answer, sizeof(answer)));
+	CHECK(reader.pump() == 1);
+	CHECK(![ps rgfxRefused]);
+	CHECK(ps.maxTotalThreadsPerThreadgroup == 0);
+	CHECK(ps.maxTotalThreadsPerObjectThreadgroup == 64);
+	CHECK(ps.maxTotalThreadsPerMeshThreadgroup == 32);
+	CHECK(ps.objectThreadExecutionWidth == 32 && ps.meshThreadExecutionWidth == 16);
+	CHECK(ps.maxTotalThreadgroupsPerMeshGrid == NSUIntegerMax);
+	CHECK(sizeIs(ps.requiredThreadsPerObjectThreadgroup, 2, 1, 1));
+	CHECK(sizeIs(ps.requiredThreadsPerMeshThreadgroup, 4, 1, 1));
+	// A member a compute pipeline declares, which Metal's render pipelines answer too.
+	CHECK(sizeIs(((id<MTLComputePipelineState>)ps).requiredThreadsPerThreadgroup, 0, 0, 0));
+	CHECK(!ps.supportIndirectCommandBuffers);
+	CHECK([ps rgfxObjectAirFunction] == nullptr && [ps rgfxMeshAirFunction] == nullptr); // unread
+
+	// A pipeline without an object stage or rasterization makes too, naming no object or
+	// fragment function; a render pipeline has no object or mesh stage.
+	m = meshDescriptor(lib);
+	m.objectFunction = nil;
+	m.fragmentFunction = nil;
+	m.rasterizationEnabled = NO;
+	ps = meshState(fx, m, &err);
+	CHECK(ps != nil && err == nil);
+	bytes = nextMessage(fx.ring, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE);
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(head.object_library_obj_id == 0 && head.object_name_len == 0);
+	CHECK(head.fragment_library_obj_id == 0 && head.fragment_name_len == 0);
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED) == 0);
+	CHECK([ps rgfxObjectAirFunction] != nullptr && [ps rgfxObjectAirFunction]->arguments.empty());
+
+	// No serialiser route is a refusal with an error, which posts nothing (the states let go
+	// above post their destroys first).
+	drainRing(fx.ring);
+	CHECK([RgfxRenderPipelineState meshRenderPipelineStateWithDescriptor:meshDescriptor(lib)
+	                                                               device:nil
+	                                                           serializer:nullptr
+	                                                      maxTotalThreads:1024
+	                                                                error:&err] == nil);
+	CHECK(err != nil);
+	CHECK(ringEmpty(fx.ring));
+}
+
+// A mesh pipeline Metal refuses is refused before the host is asked, in the x86 Macs' compiler's
+// domain and codes (oracle_mesh, the AMD 5300M and the Intel 630, macOS 26.7.1): a stage function
+// of another stage's type, a payload past 16 KiB, a stage's maximum of threads past the device's.
+// A refusal of the host is nil and an NSError too.
+void test_mesh_pipeline_refusals()
+{
+	Fixture fx;
+	RgfxLibrary *lib = meshLibrary(fx);
+	auto refused = [&](MTLMeshRenderPipelineDescriptor *m, NSInteger code, NSString *words) {
+		NSError *err = nil;
+		const bool none = meshState(fx, m, &err) == nil;
+		const bool as = err != nil && [err.domain isEqualToString:@"CompilerError"] &&
+		                err.code == code && [err.localizedDescription isEqualToString:words];
+		if (!as)
+			NSLog(@"refused as %@", err);
+		return none && as && ringEmpty(fx.ring);
+	};
+	MTLMeshRenderPipelineDescriptor *m = meshDescriptor(lib);
+	m.meshFunction = stageFunction(lib, @"v_plain", MTLFunctionTypeVertex);
+	CHECK(refused(m, 2,
+	              @"RasterizationEnabled is false but the vertex shader's return type is not void"));
+	m = meshDescriptor(lib);
+	m.meshFunction = stageFunction(lib, @"o_fn", MTLFunctionTypeObject);
+	CHECK(refused(m, 1, @"meshFunction functionType is not MTLFunctionTypeMesh."));
+	m = meshDescriptor(lib);
+	m.objectFunction = stageFunction(lib, @"m_plain", MTLFunctionTypeMesh);
+	CHECK(refused(m, 1, @"objectFunction functionType is not MTLFunctionTypeObject."));
+	m = meshDescriptor(lib);
+	m.objectFunction = stageFunction(lib, @"f_col", MTLFunctionTypeFragment);
+	CHECK(refused(m, 1, @"objectFunction functionType is not MTLFunctionTypeObject."));
+	m = meshDescriptor(lib);
+	m.fragmentFunction = stageFunction(lib, @"m_plain", MTLFunctionTypeMesh);
+	CHECK(refused(m, 1, @"fragmentFunction functionType is not MTLFunctionTypeFragment."));
+	m = meshDescriptor(lib);
+	m.payloadMemoryLength = 16385;
+	CHECK(refused(m, 2,
+	              @"payloadMemoryLength property of MTLMeshRenderPipelineDescriptor (16385 bytes) "
+	              @"exceeds maximum supported by this device (16384 bytes)"));
+	m = meshDescriptor(lib);
+	m.maxTotalThreadsPerMeshThreadgroup = 2048;
+	CHECK(refused(m, 2,
+	              @"maxThreadsPerThreadgroup pipeline descriptor value (2048) exceeds maximum "
+	              @"supported (1024)\n"));
+	m = meshDescriptor(lib);
+	m.maxTotalThreadsPerObjectThreadgroup = 1025;
+	CHECK(refused(m, 2,
+	              @"maxThreadsPerThreadgroup pipeline descriptor value (1025) exceeds maximum "
+	              @"supported (1024)\n"));
+
+	// At the limits, and with functions whose stage the library did not tell, it is made.
+	m = meshDescriptor(lib);
+	m.payloadMemoryLength = 16384;
+	m.maxTotalThreadsPerMeshThreadgroup = 1024;
+	NSError *err = nil;
+	RgfxRenderPipelineState *ps = meshState(fx, m, &err);
+	CHECK(ps != nil && err == nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE);
+	m.meshFunction = [lib newFunctionWithName:@"untold"];
+	CHECK(meshState(fx, m, &err) != nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE);
+
+	// The host refused it: nil and an NSError at the device's creators (rgfxRefused). The state
+	// let go above may have posted its destroy.
+	drainRing(fx.ring);
+	ps = meshState(fx, meshDescriptor(lib), &err);
+	(void)nextMessage(fx.ring, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE);
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	[ps rgfxRegisterWithReplyReader:&reader];
+	RgfxPipelineReflection no = {};
+	no.header.type = RGFX_EVT_PIPELINE_REFLECTION;
+	no.header.size = sizeof(no);
+	no.header.seqno = ps.rgfxSeqno;
+	no.obj_id = ps.rgfxObjId;
+	no.status = RGFX_PIPELINE_REFUSED;
+	no.kind = RGFX_PIPELINE_KIND_MESH;
+	CHECK(completion.postFromHost(&no, sizeof(no)));
+	CHECK(reader.pump() == 1);
+	CHECK([ps rgfxRefused]);
+	CHECK(ps.maxTotalThreadsPerMeshThreadgroup == 0);
+}
+
+// A mesh pipeline's descriptor ends the process with Metal's words where Metal's validation ends
+// it (oracle_mesh, plain Metal): with supportIndirectCommandBuffers YES, as on the AMD 5300M and
+// the Intel 630 (the same descriptor with NO makes its pipeline: test_mesh_pipeline_routing), and
+// with no mesh function, or no fragment function while it rasterizes, as on every Mac.
+void test_invalid_mesh_descriptors_end_the_process()
+{
+	const std::string kWhere =
+	    "validateWithDevice:1884: failed assertion `Mesh Render Pipeline Descriptor Validation\n";
+	checkDies("mesh-icb", (kWhere + "Use of mesh shader pipelines in indirect command buffers is "
+	                                "not supported by this device.\n'")
+	                          .c_str());
+	checkDies("mesh-no-mesh", (kWhere + "meshFunction must not be nil.\n'").c_str());
+	checkDies("mesh-no-fragment", (kWhere + "fragmentFunction must not be nil.\n'").c_str());
 }
 
 // A compute pipeline create maps the function (and the descriptor knobs) into the
@@ -6014,6 +6302,62 @@ static std::vector<std::pair<uint16_t, std::vector<uint8_t>>> postedOps(TestRing
 		ops.push_back({tag, std::vector<uint8_t>(body, body + body_len)});
 	}
 	return ops;
+}
+
+// A render encoder sends the object and mesh stages' commands and the mesh draws where the host
+// makes mesh pipelines, and drops them elsewhere (an encoder of no device, a unit test's, makes
+// none until told).
+void test_mesh_commands_follow_the_host()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = handle(42);
+		auto encode = [&](BOOL meshes) {
+			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+			id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+			if (meshes)
+				[(RgfxRenderCommandEncoder *)e rgfxSetMeshPipelines:YES];
+			// The range form: a dropped setObjectBuffer:offset:atIndex: would be logged for the
+			// process, which test_encoders_unsupported checks a nil one is not.
+			id<MTLBuffer> objectBuffers[1] = {handle(10)};
+			NSUInteger objectOffsets[1] = {16};
+			[e setObjectBuffers:objectBuffers offsets:objectOffsets withRange:NSMakeRange(1, 1)];
+			[e setMeshTexture:handle(11) atIndex:0];
+			[e setMeshSamplerState:handle(12) atIndex:2];
+			[e setObjectThreadgroupMemoryLength:256 atIndex:0];
+			[e drawMeshThreadgroups:MTLSizeMake(4, 1, 1)
+			    threadsPerObjectThreadgroup:MTLSizeMake(32, 1, 1)
+			      threadsPerMeshThreadgroup:MTLSizeMake(64, 1, 1)];
+			[e drawMeshThreads:MTLSizeMake(128, 1, 1)
+			    threadsPerObjectThreadgroup:MTLSizeMake(32, 1, 1)
+			      threadsPerMeshThreadgroup:MTLSizeMake(64, 1, 1)];
+			[e drawMeshThreadgroupsWithIndirectBuffer:handle(13)
+			                     indirectBufferOffset:8
+			              threadsPerObjectThreadgroup:MTLSizeMake(32, 1, 1)
+			                threadsPerMeshThreadgroup:MTLSizeMake(64, 1, 1)];
+			[e endEncoding];
+			[cb commit];
+			drainRing(f.control);
+			std::vector<uint16_t> tags;
+			for (const auto &op : postedOps(f.submit))
+				if (op.first >= RGFX_OP_RENDER_SET_OBJECT_BUFFERS &&
+				    op.first <= RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT)
+					tags.push_back(op.first);
+			return tags;
+		};
+		CHECK(encode(NO).empty());
+		const std::vector<uint16_t> want = {
+		    RGFX_OP_RENDER_SET_OBJECT_BUFFERS,
+		    RGFX_OP_RENDER_SET_MESH_TEXTURES,
+		    RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES,
+		    RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH,
+		    RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS,
+		    RGFX_OP_RENDER_DRAW_MESH_THREADS,
+		    RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT,
+		};
+		CHECK(encode(YES) == want);
+	}
 }
 
 // Metal starts each sub-encoder of a parallel pass from the default state (MTLRenderCommandEncoder.h;
@@ -13555,6 +13899,9 @@ int main(int argc, char **argv)
 		test_library_and_function_routing();
 		test_libraries_of_one_key_share_their_function_table();
 		test_render_pipeline_routing();
+		test_mesh_pipeline_routing();
+		test_mesh_pipeline_refusals();
+		test_invalid_mesh_descriptors_end_the_process();
 		test_compute_pipeline_routing();
 		test_function_constants_resolve_as_metal();
 		test_async_creators_return_before_their_handlers();
@@ -13589,6 +13936,7 @@ int main(int argc, char **argv)
 		test_command_buffer_event_ops();
 		test_message_reserve();
 		test_parallel_sub_encoders_start_from_defaults();
+		test_mesh_commands_follow_the_host();
 		test_parallel_sub_encoders_on_threads();
 		test_command_buffer_keeps_once();
 		test_resource_ids();

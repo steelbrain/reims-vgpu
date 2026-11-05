@@ -105,6 +105,10 @@ RGFX_LOG_UNRECOGNIZED
 
 namespace {
 
+// What a mesh command answers where the host makes no mesh pipeline (RGFX_FEATURE_MESH_PIPELINES):
+// no mesh pipeline can be made, so it draws nothing.
+constexpr const char *kNoMeshes = "mesh shading (the host makes no mesh pipeline)";
+
 /// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first 16, then
 /// every power of two, so a frame loop's stays visible without flooding the log.
 bool logEventOp(std::atomic<uint64_t> &count, uint64_t *n)
@@ -2533,15 +2537,23 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	BOOL _barrierWaited;                         // a barrier has waited for the earlier encoders
 	RgfxSurfaceBindings _vertexSurfaces;         // the textures over IOSurfaces bound, by stage
 	RgfxSurfaceBindings _fragmentSurfaces;
+	RgfxSurfaceBindings _objectSurfaces;
+	RgfxSurfaceBindings _meshSurfaces;
 	// The pipeline's functions' arguments, by stage.
 	std::shared_ptr<const RgfxAirFunction> _vertexAir;
 	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
+	std::shared_ptr<const RgfxAirFunction> _objectAir;
+	std::shared_ptr<const RgfxAirFunction> _meshAir;
+	// Whether the host makes mesh pipelines, so the object and mesh stages' commands are sent.
+	BOOL _meshes;
 }
 
 - (void)rgfxNoteDrawWrites
 {
 	_vertexSurfaces.noteWrites(_enc, _vertexAir.get());
 	_fragmentSurfaces.noteWrites(_enc, _fragmentAir.get());
+	_objectSurfaces.noteWrites(_enc, _objectAir.get());
+	_meshSurfaces.noteWrites(_enc, _meshAir.get());
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -2572,6 +2584,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_emitEnd = emitEnd;
 		_device = device;
 		_traceId = RgfxNextTraceObjectId();
+		_meshes = [(id)device respondsToSelector:@selector(rgfxMakesMeshPipelines)] &&
+		          [(id<RgfxMeshPipelineDevice>)device rgfxMakesMeshPipelines];
 	}
 	return self;
 }
@@ -2642,6 +2656,8 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	_vertexSurfaces.clear();
 	_fragmentSurfaces.clear();
+	_objectSurfaces.clear();
+	_meshSurfaces.clear();
 	// Last: the buffer may go with it, and its RgfxEncoder with it.
 	_commandBufferHold = nil;
 }
@@ -2653,14 +2669,21 @@ RGFX_LOG_UNRECOGNIZED
 	if (pipelineState != _pipeline) {
 		_pipeline = pipelineState;
 		if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]]) {
-			_vertexAir = [(RgfxRenderPipelineState *)pipelineState rgfxVertexAirFunction];
-			_fragmentAir = [(RgfxRenderPipelineState *)pipelineState rgfxFragmentAirFunction];
+			RgfxRenderPipelineState *state = (RgfxRenderPipelineState *)pipelineState;
+			_vertexAir = [state rgfxVertexAirFunction];
+			_fragmentAir = [state rgfxFragmentAirFunction];
+			_objectAir = [state rgfxObjectAirFunction];
+			_meshAir = [state rgfxMeshAirFunction];
 		} else {
 			_vertexAir = nullptr;
 			_fragmentAir = nullptr;
+			_objectAir = nullptr;
+			_meshAir = nullptr;
 		}
 		_vertexSurfaces.pipelineChanged();
 		_fragmentSurfaces.pipelineChanged();
+		_objectSurfaces.pipelineChanged();
+		_meshSurfaces.pipelineChanged();
 	}
 	_enc->renderSetRenderPipelineState(rgfxNamed(_enc, pipelineState));
 }
@@ -3243,6 +3266,8 @@ RGFX_LOG_UNRECOGNIZED
 	e.kind = rgfxResourceKind(resource);
 	rgfxNoteResident(_vertexSurfaces, resource, usage);
 	rgfxNoteResident(_fragmentSurfaces, resource, usage);
+	rgfxNoteResident(_objectSurfaces, resource, usage);
+	rgfxNoteResident(_meshSurfaces, resource, usage);
 	_enc->renderUseResources(&e, 1, static_cast<uint64_t>(usage));
 }
 - (void)useResources:(const id<MTLResource> __nonnull[__nonnull])resources
@@ -3255,6 +3280,8 @@ RGFX_LOG_UNRECOGNIZED
 		r[i].kind = rgfxResourceKind(resources[i]);
 		rgfxNoteResident(_vertexSurfaces, resources[i], usage);
 		rgfxNoteResident(_fragmentSurfaces, resources[i], usage);
+		rgfxNoteResident(_objectSurfaces, resources[i], usage);
+		rgfxNoteResident(_meshSurfaces, resources[i], usage);
 	}
 	_enc->renderUseResources(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
 	                         static_cast<uint64_t>(usage));
@@ -3270,6 +3297,10 @@ RGFX_LOG_UNRECOGNIZED
 		rgfxNoteResident(_vertexSurfaces, resource, usage);
 	if (stages & MTLRenderStageFragment)
 		rgfxNoteResident(_fragmentSurfaces, resource, usage);
+	if (stages & MTLRenderStageObject)
+		rgfxNoteResident(_objectSurfaces, resource, usage);
+	if (stages & MTLRenderStageMesh)
+		rgfxNoteResident(_meshSurfaces, resource, usage);
 	_enc->renderUseResourcesStages(&e, 1, static_cast<uint64_t>(usage),
 	                               static_cast<uint64_t>(stages));
 }
@@ -3286,6 +3317,10 @@ RGFX_LOG_UNRECOGNIZED
 			rgfxNoteResident(_vertexSurfaces, resources[i], usage);
 		if (stages & MTLRenderStageFragment)
 			rgfxNoteResident(_fragmentSurfaces, resources[i], usage);
+		if (stages & MTLRenderStageObject)
+			rgfxNoteResident(_objectSurfaces, resources[i], usage);
+		if (stages & MTLRenderStageMesh)
+			rgfxNoteResident(_meshSurfaces, resources[i], usage);
 	}
 	_enc->renderUseResourcesStages(r.empty() ? nullptr : r.data(), static_cast<uint32_t>(count),
 	                               static_cast<uint64_t>(usage), static_cast<uint64_t>(stages));
@@ -3459,146 +3494,354 @@ RGFX_LOG_UNRECOGNIZED
 	RGFX_UNSUPPORTED("counter sampling");
 }
 
-// Mesh shading: no mesh pipeline can be made (newRenderPipelineStateWithMeshDescriptor:), so
-// these draw nothing.
+// --- mesh shading ----------------------------------------------------------------------------
+// The object and mesh stages' bindings and the mesh draws, where the host makes mesh pipelines
+// (RGFX_FEATURE_MESH_PIPELINES; `_meshes`). Where it makes none, no mesh pipeline can be made
+// (newRenderPipelineStateWithMeshDescriptor: refuses), so these draw nothing, and a host without
+// the feature is sent none of them. A mesh draw notes the writes of the object, mesh and fragment
+// stages' bound IOSurface textures, as a vertex draw notes its stages' (rgfxNoteDrawWrites).
+
 - (void)drawMeshThreadgroups:(MTLSize)threadgroupsPerGrid
     threadsPerObjectThreadgroup:(MTLSize)threadsPerObjectThreadgroup
       threadsPerMeshThreadgroup:(MTLSize)threadsPerMeshThreadgroup
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	[self rgfxNoteDrawWrites];
+	const uint64_t grid[3] = {threadgroupsPerGrid.width, threadgroupsPerGrid.height,
+	                          threadgroupsPerGrid.depth};
+	const uint64_t object[3] = {threadsPerObjectThreadgroup.width,
+	                            threadsPerObjectThreadgroup.height,
+	                            threadsPerObjectThreadgroup.depth};
+	const uint64_t mesh[3] = {threadsPerMeshThreadgroup.width, threadsPerMeshThreadgroup.height,
+	                          threadsPerMeshThreadgroup.depth};
+	_enc->renderDrawMeshThreadgroups(grid, object, mesh);
 }
 - (void)drawMeshThreads:(MTLSize)threadsPerGrid
     threadsPerObjectThreadgroup:(MTLSize)threadsPerObjectThreadgroup
       threadsPerMeshThreadgroup:(MTLSize)threadsPerMeshThreadgroup
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	[self rgfxNoteDrawWrites];
+	const uint64_t grid[3] = {threadsPerGrid.width, threadsPerGrid.height, threadsPerGrid.depth};
+	const uint64_t object[3] = {threadsPerObjectThreadgroup.width,
+	                            threadsPerObjectThreadgroup.height,
+	                            threadsPerObjectThreadgroup.depth};
+	const uint64_t mesh[3] = {threadsPerMeshThreadgroup.width, threadsPerMeshThreadgroup.height,
+	                          threadsPerMeshThreadgroup.depth};
+	_enc->renderDrawMeshThreads(grid, object, mesh);
 }
 - (void)drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
                           indirectBufferOffset:(NSUInteger)indirectBufferOffset
                    threadsPerObjectThreadgroup:(MTLSize)threadsPerObjectThreadgroup
                      threadsPerMeshThreadgroup:(MTLSize)threadsPerMeshThreadgroup
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	[self rgfxNoteDrawWrites];
+	const uint64_t object[3] = {threadsPerObjectThreadgroup.width,
+	                            threadsPerObjectThreadgroup.height,
+	                            threadsPerObjectThreadgroup.depth};
+	const uint64_t mesh[3] = {threadsPerMeshThreadgroup.width, threadsPerMeshThreadgroup.height,
+	                          threadsPerMeshThreadgroup.depth};
+	_enc->renderDrawMeshThreadgroupsIndirect(rgfxReads(_enc, indirectBuffer), indirectBufferOffset,
+	                                         object, mesh);
 }
 
 - (void)setObjectBuffer:(nullable id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	if (buffer != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (buffer != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	RgfxBufferBinding e = {};
+	e.buffer_obj_id = rgfxBinds(_enc, buffer);
+	e.offset = offset;
+	_enc->renderSetObjectBuffers(index, &e, 1);
 }
 - (void)setObjectBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	_enc->renderSetObjectBufferOffset(offset, index);
 }
 - (void)setObjectBuffers:(const id<MTLBuffer> __nullable[__nonnull])buffers
                 offsets:(const NSUInteger[__nonnull])offsets
               withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxBufferBinding> b(range.length);
+	for (NSUInteger i = 0; i < range.length; i++) {
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
+		b[i].offset = offsets[i];
+	}
+	_enc->renderSetObjectBuffers(range.location, b.empty() ? nullptr : b.data(),
+	                             static_cast<uint32_t>(range.length));
 }
 - (void)setObjectBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setObjectBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setObjectSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
-	if (sampler != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (sampler != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	RgfxSamplerBinding e = {};
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
+	_enc->renderSetObjectSamplerStates(index, &e, 1);
 }
 - (void)setObjectSamplerState:(nullable id<MTLSamplerState>)sampler
                   lodMinClamp:(float)lodMinClamp
                   lodMaxClamp:(float)lodMaxClamp
                       atIndex:(NSUInteger)index
 {
-	if (sampler != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (sampler != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	RgfxSamplerLodBinding e = {};
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
+	std::memcpy(&e.lod_min_clamp_bits, &lodMinClamp, 4);
+	std::memcpy(&e.lod_max_clamp_bits, &lodMaxClamp, 4);
+	_enc->renderSetObjectSamplerStatesLodClamps(index, &e, 1);
 }
 - (void)setObjectSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
                   lodMinClamps:(const float[__nonnull])lodMinClamps
                   lodMaxClamps:(const float[__nonnull])lodMaxClamps
                      withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxSamplerLodBinding> b(range.length);
+	for (NSUInteger i = 0; i < range.length; i++) {
+		b[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
+		std::memcpy(&b[i].lod_min_clamp_bits, &lodMinClamps[i], 4);
+		std::memcpy(&b[i].lod_max_clamp_bits, &lodMaxClamps[i], 4);
+	}
+	_enc->renderSetObjectSamplerStatesLodClamps(range.location, b.empty() ? nullptr : b.data(),
+	                                            static_cast<uint32_t>(range.length));
 }
 - (void)setObjectSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
                      withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxSamplerBinding> b(range.length);
+	for (NSUInteger i = 0; i < range.length; i++)
+		b[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
+	_enc->renderSetObjectSamplerStates(range.location, b.empty() ? nullptr : b.data(),
+	                                   static_cast<uint32_t>(range.length));
 }
 - (void)setObjectTexture:(nullable id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	if (texture != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (texture != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	bool overSurface = false;
+	RgfxTextureBinding e = {};
+	e.texture_obj_id = rgfxBinds(_enc, texture, &overSurface);
+	_objectSurfaces.bind(index, texture, overSurface);
+	_enc->renderSetObjectTextures(index, &e, 1);
 }
 - (void)setObjectTextures:(const id<MTLTexture> __nullable[__nonnull])textures withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxTextureBinding> t(range.length);
+	for (NSUInteger i = 0; i < range.length; i++) {
+		bool overSurface = false;
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i], &overSurface);
+		_objectSurfaces.bind(range.location + i, textures[i], overSurface);
+	}
+	_enc->renderSetObjectTextures(range.location, t.empty() ? nullptr : t.data(),
+	                              static_cast<uint32_t>(range.length));
 }
 - (void)setMeshBuffer:(nullable id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	if (buffer != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (buffer != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	RgfxBufferBinding e = {};
+	e.buffer_obj_id = rgfxBinds(_enc, buffer);
+	e.offset = offset;
+	_enc->renderSetMeshBuffers(index, &e, 1);
 }
 - (void)setMeshBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	_enc->renderSetMeshBufferOffset(offset, index);
 }
 - (void)setMeshBuffers:(const id<MTLBuffer> __nullable[__nonnull])buffers
                 offsets:(const NSUInteger[__nonnull])offsets
               withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxBufferBinding> b(range.length);
+	for (NSUInteger i = 0; i < range.length; i++) {
+		b[i].buffer_obj_id = rgfxBinds(_enc, buffers[i]);
+		b[i].offset = offsets[i];
+	}
+	_enc->renderSetMeshBuffers(range.location, b.empty() ? nullptr : b.data(),
+	                           static_cast<uint32_t>(range.length));
 }
 - (void)setMeshBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	__unsafe_unretained id<MTLBuffer> buffer = nil;
+	uint64_t offset = 0;
+	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+		[self setMeshBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setMeshSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
-	if (sampler != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (sampler != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	RgfxSamplerBinding e = {};
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
+	_enc->renderSetMeshSamplerStates(index, &e, 1);
 }
 - (void)setMeshSamplerState:(nullable id<MTLSamplerState>)sampler
                   lodMinClamp:(float)lodMinClamp
                   lodMaxClamp:(float)lodMaxClamp
                       atIndex:(NSUInteger)index
 {
-	if (sampler != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (sampler != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	RgfxSamplerLodBinding e = {};
+	e.sampler_obj_id = rgfxNamed(_enc, sampler);
+	std::memcpy(&e.lod_min_clamp_bits, &lodMinClamp, 4);
+	std::memcpy(&e.lod_max_clamp_bits, &lodMaxClamp, 4);
+	_enc->renderSetMeshSamplerStatesLodClamps(index, &e, 1);
 }
 - (void)setMeshSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
                   lodMinClamps:(const float[__nonnull])lodMinClamps
                   lodMaxClamps:(const float[__nonnull])lodMaxClamps
                      withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxSamplerLodBinding> b(range.length);
+	for (NSUInteger i = 0; i < range.length; i++) {
+		b[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
+		std::memcpy(&b[i].lod_min_clamp_bits, &lodMinClamps[i], 4);
+		std::memcpy(&b[i].lod_max_clamp_bits, &lodMaxClamps[i], 4);
+	}
+	_enc->renderSetMeshSamplerStatesLodClamps(range.location, b.empty() ? nullptr : b.data(),
+	                                          static_cast<uint32_t>(range.length));
 }
 - (void)setMeshSamplerStates:(const id<MTLSamplerState> __nullable[__nonnull])samplers
                      withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxSamplerBinding> b(range.length);
+	for (NSUInteger i = 0; i < range.length; i++)
+		b[i].sampler_obj_id = rgfxNamed(_enc, samplers[i]);
+	_enc->renderSetMeshSamplerStates(range.location, b.empty() ? nullptr : b.data(),
+	                                 static_cast<uint32_t>(range.length));
 }
 - (void)setMeshTexture:(nullable id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
-	if (texture != nil)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (texture != nil)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	bool overSurface = false;
+	RgfxTextureBinding e = {};
+	e.texture_obj_id = rgfxBinds(_enc, texture, &overSurface);
+	_meshSurfaces.bind(index, texture, overSurface);
+	_enc->renderSetMeshTextures(index, &e, 1);
 }
 - (void)setMeshTextures:(const id<MTLTexture> __nullable[__nonnull])textures withRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		if (range.length != 0)
+			RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	std::vector<RgfxTextureBinding> t(range.length);
+	for (NSUInteger i = 0; i < range.length; i++) {
+		bool overSurface = false;
+		t[i].texture_obj_id = rgfxBinds(_enc, textures[i], &overSurface);
+		_meshSurfaces.bind(range.location + i, textures[i], overSurface);
+	}
+	_enc->renderSetMeshTextures(range.location, t.empty() ? nullptr : t.data(),
+	                            static_cast<uint32_t>(range.length));
 }
 
 - (void)setObjectThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {
-	RGFX_UNSUPPORTED("mesh shading");
+	if (!_meshes) {
+		RGFX_UNSUPPORTED(kNoMeshes);
+		return;
+	}
+	_enc->renderSetObjectThreadgroupMemoryLength(length, index);
+}
+
+- (void)rgfxSetMeshPipelines:(BOOL)meshes
+{
+	_meshes = meshes;
 }
 
 // Ray tracing and function tables: the device makes no acceleration structure, intersection

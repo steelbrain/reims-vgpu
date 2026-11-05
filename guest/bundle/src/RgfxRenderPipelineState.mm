@@ -18,7 +18,7 @@
 // The reflection-fill entry the reader's handler calls (defined below); declared here
 // so the lambda in rgfxRegisterWithReplyReader: sees its signature.
 @interface RgfxRenderPipelineState ()
-- (void)rgfxFillReflection:(const RgfxPipelineReflection *)r;
+- (void)rgfxFillReflection:(const RgfxPipelineReply *)r;
 // A create posted without waiting takes `known`, the equal create's reflection, at once, and
 // later its own answer.
 - (void)rgfxTakeKnown:(const RgfxPipelineReflection &)known;
@@ -65,6 +65,127 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	return [(RgfxFunction *)fn rgfxAirFunction];
 }
 
+/// Fills `colors` from a descriptor's colour attachments, whose array has no count either: one is
+/// in use when its pixel format is not Invalid. Metal supports up to 8 (the wire's
+/// RgfxColorAttachmentDesc colors[8]). Answers the count, the highest in-use index + 1, so a sparse
+/// set keeps its slots.
+uint32_t fillColors(MTLRenderPipelineColorAttachmentDescriptorArray *attachments,
+                    RgfxColorAttachmentDesc (&colors)[8])
+{
+	uint32_t ncolor = 0;
+	for (uint32_t i = 0; i < 8; i++) {
+		MTLRenderPipelineColorAttachmentDescriptor *ca = attachments[i];
+		if (ca.pixelFormat == MTLPixelFormatInvalid) {
+			continue;
+		}
+		RgfxColorAttachmentDesc &d = colors[i];
+		d.pixel_format = static_cast<uint32_t>(ca.pixelFormat);
+		d.blending_enabled = ca.isBlendingEnabled ? 1 : 0;
+		d.source_rgb_blend_factor = static_cast<uint32_t>(ca.sourceRGBBlendFactor);
+		d.destination_rgb_blend_factor = static_cast<uint32_t>(ca.destinationRGBBlendFactor);
+		d.rgb_blend_operation = static_cast<uint32_t>(ca.rgbBlendOperation);
+		d.source_alpha_blend_factor = static_cast<uint32_t>(ca.sourceAlphaBlendFactor);
+		d.destination_alpha_blend_factor = static_cast<uint32_t>(ca.destinationAlphaBlendFactor);
+		d.alpha_blend_operation = static_cast<uint32_t>(ca.alphaBlendOperation);
+		d.write_mask = static_cast<uint32_t>(ca.writeMask);
+		ncolor = i + 1;
+	}
+	return ncolor;
+}
+
+// --- mesh render pipelines ------------------------------------------------------------
+// Metal's refusals of a mesh render pipeline's descriptor are its compiler's, in its domain
+// (measured: guest/bundle/tools/oracle/oracle_mesh on the AMD Radeon Pro 5300M and the Intel UHD
+// Graphics 630, macOS 26.7.1, the x86 Macs the device imitates).
+NSErrorDomain const kCompilerErrorDomain = @"CompilerError";
+
+// The largest payload an object function may pass its mesh threadgroups, in bytes: every Mac's
+// (measured: oracle_mesh payload-big, refused at 16385 on the 5300M, the 630 and the M3 Max).
+constexpr NSUInteger kMaxMeshPayload = 16384;
+
+NSError *compilerError(NSInteger code, NSString *words)
+{
+	return [NSError errorWithDomain:kCompilerErrorDomain
+	                           code:code
+	                       userInfo:@{NSLocalizedDescriptionKey : words}];
+}
+
+/// Whether the library told the type of `fn`, one of the device's functions or nil, and if so
+/// that type in `type`.
+bool knownType(id<MTLFunction> fn, MTLFunctionType &type)
+{
+	if (fn == nil || ![(id)fn isKindOfClass:[RgfxFunction class]] ||
+	    ![(RgfxFunction *)fn rgfxFunctionTypeKnown])
+		return false;
+	type = fn.functionType;
+	return true;
+}
+
+/// Metal's refusal of a stage function of another stage's type, nil where each function has its
+/// stage's type, or one its library did not tell (oracle_mesh vertex-as-mesh, vertex-as-mesh-norast,
+/// object-as-mesh, mesh-as-fragment, fragment-as-object and mesh-as-object). The x86 Macs refuse a
+/// vertex function as the mesh function with code 2 and the words below, and another as the mesh
+/// function or another than a fragment function as the fragment function with code 1 and the words
+/// of a compiler that crashed ("Compilation failed due to an interrupted connection:
+/// XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries."), which here are
+/// those of Metal's validation layer instead. As the object function, a fragment function is
+/// refused so on the 630 and ends the process with SIGSEGV on the 5300M, and a mesh function is
+/// made on both and refused so on the M3 Max: refused, as the host refuses each of these before its
+/// GPU's Metal sees them (the M3 Max's ends the process with SIGSEGV at a fragment function as the
+/// object function, a mesh function as the fragment function, and a vertex function as the mesh
+/// function).
+NSError *wrongStageError(MTLMeshRenderPipelineDescriptor *descriptor)
+{
+	MTLFunctionType t = MTLFunctionTypeVertex;
+	if (knownType(descriptor.meshFunction, t) && t != MTLFunctionTypeMesh) {
+		if (t == MTLFunctionTypeVertex)
+			return compilerError(2, @"RasterizationEnabled is false but the vertex shader's return "
+			                        @"type is not void");
+		return compilerError(1, @"meshFunction functionType is not MTLFunctionTypeMesh.");
+	}
+	if (knownType(descriptor.objectFunction, t) && t != MTLFunctionTypeObject)
+		return compilerError(1, @"objectFunction functionType is not MTLFunctionTypeObject.");
+	if (knownType(descriptor.fragmentFunction, t) && t != MTLFunctionTypeFragment)
+		return compilerError(1, @"fragmentFunction functionType is not MTLFunctionTypeFragment.");
+	return nil;
+}
+
+/// Metal's refusal of a limit past the device's, nil where none is: a payload past 16 KiB, in the
+/// x86 Macs' words, and a stage's maximum of threads in a threadgroup past `maxTotalThreads`, in
+/// the 5300M's (oracle_mesh payload-big, mesh-2048 and object-2048; the 630 makes the latter and
+/// answers 1024, the M3 Max refuses it).
+NSError *limitError(MTLMeshRenderPipelineDescriptor *descriptor, NSUInteger maxTotalThreads)
+{
+	if (descriptor.payloadMemoryLength > kMaxMeshPayload)
+		return compilerError(
+		    2, [NSString stringWithFormat:@"payloadMemoryLength property of "
+		                                  @"MTLMeshRenderPipelineDescriptor (%lu bytes) exceeds "
+		                                  @"maximum supported by this device (%lu bytes)",
+		                                  static_cast<unsigned long>(descriptor.payloadMemoryLength),
+		                                  static_cast<unsigned long>(kMaxMeshPayload)]);
+	for (NSUInteger most : {descriptor.maxTotalThreadsPerObjectThreadgroup,
+	                        descriptor.maxTotalThreadsPerMeshThreadgroup})
+		if (most > maxTotalThreads)
+			return compilerError(
+			    2, [NSString stringWithFormat:@"maxThreadsPerThreadgroup pipeline descriptor value "
+			                                  @"(%lu) exceeds maximum supported (%lu)\n",
+			                                  static_cast<unsigned long>(most),
+			                                  static_cast<unsigned long>(maxTotalThreads)]);
+	return nil;
+}
+
+uint32_t wire32(NSUInteger v)
+{
+	return v > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(v);
+}
+
+void fillSize(uint32_t (&out)[3], MTLSize size)
+{
+	out[0] = wire32(size.width);
+	out[1] = wire32(size.height);
+	out[2] = wire32(size.depth);
+}
+
 } // namespace
 
 @implementation RgfxRenderPipelineState {
@@ -79,6 +200,16 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	// Its functions' arguments; null where unknown.
 	std::shared_ptr<const RgfxAirFunction> _vertexAir;
 	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
+	// A mesh render pipeline's: its object and mesh functions' arguments (none for a vertex and
+	// fragment pipeline), whether it has an object function, the sizes its descriptor required,
+	// and the stages' limits its answer carried (`_haveMeshLimits`).
+	BOOL _mesh;
+	std::shared_ptr<const RgfxAirFunction> _objectAir;
+	std::shared_ptr<const RgfxAirFunction> _meshAir;
+	MTLSize _requiredObject;
+	MTLSize _requiredMesh;
+	RgfxMeshPipelineReflection _meshLimits;
+	BOOL _haveMeshLimits;
 	// A keyed create's key, and the known pipelines its answer is kept in once accepted, until
 	// it registers; a create posted without waiting has its own answer to wait for.
 	std::shared_ptr<RgfxKnownPipelines> _known;
@@ -172,29 +303,7 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 
 	p.raster_sample_count = static_cast<uint32_t>(descriptor.rasterSampleCount);
 
-	// Colour attachments: the descriptor's array has no count either; a colour
-	// attachment is in use when its pixel format is not Invalid. Metal supports up
-	// to 8 (the wire's RgfxColorAttachmentDesc colors[8]).
-	uint32_t ncolor = 0;
-	for (uint32_t i = 0; i < 8; i++) {
-		MTLRenderPipelineColorAttachmentDescriptor *ca = descriptor.colorAttachments[i];
-		if (ca.pixelFormat == MTLPixelFormatInvalid) {
-			continue;
-		}
-		RgfxColorAttachmentDesc &d = p.colors[i];
-		d.pixel_format = static_cast<uint32_t>(ca.pixelFormat);
-		d.blending_enabled = ca.isBlendingEnabled ? 1 : 0;
-		d.source_rgb_blend_factor = static_cast<uint32_t>(ca.sourceRGBBlendFactor);
-		d.destination_rgb_blend_factor = static_cast<uint32_t>(ca.destinationRGBBlendFactor);
-		d.rgb_blend_operation = static_cast<uint32_t>(ca.rgbBlendOperation);
-		d.source_alpha_blend_factor = static_cast<uint32_t>(ca.sourceAlphaBlendFactor);
-		d.destination_alpha_blend_factor = static_cast<uint32_t>(ca.destinationAlphaBlendFactor);
-		d.alpha_blend_operation = static_cast<uint32_t>(ca.alphaBlendOperation);
-		d.write_mask = static_cast<uint32_t>(ca.writeMask);
-		// The count is the highest in-use index + 1, so a sparse set keeps its slots.
-		ncolor = i + 1;
-	}
-	p.color_attachment_count = ncolor;
+	p.color_attachment_count = fillColors(descriptor.colorAttachments, p.colors);
 
 	p.depth_pixel_format = static_cast<uint32_t>(descriptor.depthAttachmentPixelFormat);
 	p.stencil_pixel_format = static_cast<uint32_t>(descriptor.stencilAttachmentPixelFormat);
@@ -278,6 +387,170 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	return state;
 }
 
+// Ends the process where Metal's validation of a mesh render pipeline's descriptor does, with its
+// words (measured: guest/bundle/tools/oracle/oracle_mesh, plain Metal, no validation layer, on the
+// AMD Radeon Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1 (25G241), and the M3 Max
+// under macOS 27.0.1 (26A434)):
+// - no mesh function, on all three: "validateWithDevice:1884: failed assertion `Mesh Render
+//   Pipeline Descriptor Validation\nmeshFunction must not be nil.\n'" (1956 on the M3 Max);
+// - no fragment function while rasterization is enabled, on all three: "...\nfragmentFunction
+//   must not be nil.\n'";
+// - supportIndirectCommandBuffers YES, on the 5300M and the 630: "validateWithDevice:1884: failed
+//   assertion `Mesh Render Pipeline Descriptor Validation\nUse of mesh shader pipelines in
+//   indirect command buffers is not supported by this device.\n'". The M3 Max makes that
+//   pipeline; the device imitates the x86 Macs, whose families claim no mesh draws in indirect
+//   command buffers either (supportsFamily: answers NO for Apple7 to Apple9 on them, and on the
+//   device).
+// Metal's message lists each failed check; its order where several fail is not measured.
++ (void)rgfxEndAtInvalidMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+{
+	NSMutableString *failed = [NSMutableString string];
+	if (descriptor.meshFunction == nil)
+		[failed appendString:@"meshFunction must not be nil.\n"];
+	if (descriptor.fragmentFunction == nil && descriptor.isRasterizationEnabled)
+		[failed appendString:@"fragmentFunction must not be nil.\n"];
+	if (descriptor.supportIndirectCommandBuffers)
+		[failed appendString:@"Use of mesh shader pipelines in indirect command buffers is not "
+		                     @"supported by this device.\n"];
+	if (failed.length != 0)
+		RgfxMetalAssertionFailed(
+		    "validateWithDevice:1884",
+		    [@"Mesh Render Pipeline Descriptor Validation\n" stringByAppendingString:failed]);
+}
+
++ (instancetype)meshRenderPipelineStateWithDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+                                               device:(id<MTLDevice>)device
+                                           serializer:(RgfxSerializer *)serializer
+                                      maxTotalThreads:(NSUInteger)maxTotalThreads
+                                                error:(__autoreleasing NSError **)error
+{
+	[self rgfxEndAtInvalidMeshDescriptor:descriptor];
+	if (serializer == nullptr) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorNoRoute, @"render pipeline: no serialiser route");
+		return nil;
+	}
+
+	NSError *unspecialised =
+	    [RgfxFunction rgfxUnspecialisedError:descriptor.objectFunction role:@"objectFunction"]
+	        ?: [RgfxFunction rgfxUnspecialisedError:descriptor.meshFunction role:@"meshFunction"]
+	        ?: [RgfxFunction rgfxUnspecialisedError:descriptor.fragmentFunction
+	                                           role:@"fragmentFunction"];
+	if (unspecialised != nil) {
+		if (error)
+			*error = unspecialised;
+		return nil;
+	}
+
+	RgfxMeshRenderPipelineParams p = {};
+	id<MTLFunction> foreign = nil;
+	if (!fillFunctionRef(p.object, descriptor.objectFunction))
+		foreign = descriptor.objectFunction;
+	else if (!fillFunctionRef(p.mesh, descriptor.meshFunction))
+		foreign = descriptor.meshFunction;
+	else if (!fillFunctionRef(p.fragment, descriptor.fragmentFunction))
+		foreign = descriptor.fragmentFunction;
+	if (foreign != nil) {
+		NSString *msg = [NSString
+		    stringWithFormat:@"render pipeline: function %@ (%@) is not from a library of this device",
+		                     foreign.name, NSStringFromClass([(id)foreign class])];
+		NSLog(@"RGFX: %@", msg);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
+		return nil;
+	}
+
+	NSError *refusal = wrongStageError(descriptor) ?: limitError(descriptor, maxTotalThreads);
+	if (refusal != nil) {
+		if (error)
+			*error = refusal;
+		return nil;
+	}
+
+	RgfxLinkedFunctionList objectLinked, meshLinked, fragmentLinked;
+	id<MTLFunction> foreignLinked =
+	    RgfxCollectLinkedFunctions(descriptor.objectLinkedFunctions, objectLinked);
+	if (foreignLinked == nil)
+		foreignLinked = RgfxCollectLinkedFunctions(descriptor.meshLinkedFunctions, meshLinked);
+	if (foreignLinked == nil)
+		foreignLinked = RgfxCollectLinkedFunctions(descriptor.fragmentLinkedFunctions, fragmentLinked);
+	if (foreignLinked != nil) {
+		NSString *msg = [NSString
+		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
+		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
+		NSLog(@"RGFX: %@", msg);
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
+		return nil;
+	}
+	p.object_linked = objectLinked.refs.empty() ? nullptr : objectLinked.refs.data();
+	p.object_linked_count = static_cast<uint32_t>(objectLinked.refs.size());
+	p.mesh_linked = meshLinked.refs.empty() ? nullptr : meshLinked.refs.data();
+	p.mesh_linked_count = static_cast<uint32_t>(meshLinked.refs.size());
+	p.fragment_linked = fragmentLinked.refs.empty() ? nullptr : fragmentLinked.refs.data();
+	p.fragment_linked_count = static_cast<uint32_t>(fragmentLinked.refs.size());
+
+	std::string label;
+	if (descriptor.label != nil && descriptor.label.UTF8String != nullptr) {
+		label = descriptor.label.UTF8String;
+		p.label = label.c_str();
+	}
+
+	p.raster_sample_count = static_cast<uint32_t>(descriptor.rasterSampleCount);
+	p.color_attachment_count = fillColors(descriptor.colorAttachments, p.colors);
+	p.depth_pixel_format = static_cast<uint32_t>(descriptor.depthAttachmentPixelFormat);
+	p.stencil_pixel_format = static_cast<uint32_t>(descriptor.stencilAttachmentPixelFormat);
+
+	uint32_t flags = 0;
+	if (descriptor.isAlphaToCoverageEnabled)
+		flags |= RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE;
+	if (descriptor.isAlphaToOneEnabled)
+		flags |= RGFX_RENDER_PIPELINE_ALPHA_TO_ONE;
+	if (descriptor.isRasterizationEnabled)
+		flags |= RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
+	if (descriptor.supportIndirectCommandBuffers)
+		flags |= RGFX_RENDER_PIPELINE_SUPPORT_ICB;
+	if (descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth)
+		flags |= RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH;
+	if (descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth)
+		flags |= RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH;
+	p.flags = flags;
+	p.max_total_threads_per_object_threadgroup =
+	    wire32(descriptor.maxTotalThreadsPerObjectThreadgroup);
+	p.max_total_threads_per_mesh_threadgroup = wire32(descriptor.maxTotalThreadsPerMeshThreadgroup);
+	p.max_total_threadgroups_per_mesh_grid = wire32(descriptor.maxTotalThreadgroupsPerMeshGrid);
+	p.payload_memory_length = wire32(descriptor.payloadMemoryLength);
+	p.max_vertex_amplification_count = wire32(descriptor.maxVertexAmplificationCount);
+	fillSize(p.required_threads_per_object_threadgroup, descriptor.requiredThreadsPerObjectThreadgroup);
+	fillSize(p.required_threads_per_mesh_threadgroup, descriptor.requiredThreadsPerMeshThreadgroup);
+
+	RgfxCreated created = serializer->createMeshRenderPipeline(p);
+	if (!created.posted) {
+		if (error)
+			*error = RgfxMakeError(RgfxMetalErrorRingFull,
+			                       @"render pipeline: create did not fit the ring");
+		return nil;
+	}
+	if (error)
+		*error = nil;
+	RgfxRenderPipelineState *state = [[RgfxRenderPipelineState alloc] initWithObjId:created.obj_id
+	                                                                          seqno:created.seqno
+	                                                                          label:descriptor.label
+	                                                                         device:device
+	                                                                     serializer:serializer];
+	if (state != nil) {
+		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+		state->_mesh = YES;
+		state->_objectAir = stageArguments(descriptor.objectFunction);
+		state->_meshAir = stageArguments(descriptor.meshFunction);
+		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
+		state->_vertexAir = stageArguments(nil);
+		state->_requiredObject = descriptor.requiredThreadsPerObjectThreadgroup;
+		state->_requiredMesh = descriptor.requiredThreadsPerMeshThreadgroup;
+	}
+	return state;
+}
+
 - (void)rgfxTakeKnown:(const RgfxPipelineReflection &)known
 {
 	_reflection = known;
@@ -301,6 +574,16 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 - (std::shared_ptr<const RgfxAirFunction>)rgfxFragmentAirFunction
 {
 	return _fragmentAir;
+}
+
+- (std::shared_ptr<const RgfxAirFunction>)rgfxObjectAirFunction
+{
+	return _mesh ? _objectAir : stageArguments(nil);
+}
+
+- (std::shared_ptr<const RgfxAirFunction>)rgfxMeshAirFunction
+{
+	return _mesh ? _meshAir : stageArguments(nil);
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -342,7 +625,7 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	// A keyed create's answer is kept once the device accepted it, so equal creates need not wait.
 	std::shared_ptr<RgfxKnownPipelines> known = std::move(_known);
 	const RgfxPipelineKey key = _key;
-	reader->expectReflection(_seqno, [weakSelf, known, key](const RgfxPipelineReflection &r) {
+	reader->expectReflection(_seqno, [weakSelf, known, key](const RgfxPipelineReply &r) {
 		if (known)
 			known->learn(key, r);
 		RgfxRenderPipelineState *strongSelf = weakSelf;
@@ -363,11 +646,16 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 		      static_cast<unsigned long long>(self.rgfxObjId));
 }
 
-// Stores the host's reflection; the getters below then report it.
-- (void)rgfxFillReflection:(const RgfxPipelineReflection *)r
+// Stores the host's reflection, and a mesh render pipeline's limits after it; the getters below
+// then report them.
+- (void)rgfxFillReflection:(const RgfxPipelineReply *)r
 {
 	_reflection = *r;
 	_haveReflection = YES;
+	if (r->hasMesh) {
+		_meshLimits = r->mesh;
+		_haveMeshLimits = YES;
+	}
 }
 
 - (BOOL)rgfxRefused
@@ -457,8 +745,8 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)self));
 }
 
-// Metal answers {0, 0, 0} and 0 for a vertex and fragment pipeline, the only kind the device
-// makes.
+// Metal answers {0, 0, 0} and 0 for a vertex and fragment pipeline, and for a mesh render pipeline
+// (measured: oracle_mesh on the 5300M, the 630 and the M3 Max, `tg`).
 - (MTLSize)requiredThreadsPerThreadgroup
 {
 	return MTLSizeMake(0, 0, 0);
@@ -469,33 +757,41 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 	return 0;
 }
 
-// --- the mesh, object and tile stages a vertex/fragment pipeline has none of ------------
-// The device makes no mesh or tile pipeline (newRenderPipelineStateWithMeshDescriptor: and
-// ...TileDescriptor: answer nil), and Metal answers 0 for a pipeline without the stage.
+// --- the mesh and object stages ------------------------------------------------------------
+// A mesh render pipeline answers its stages' limits as the host's platform answered them, which its
+// create's answer carries (the x86 Macs answer `maxTotalThreadgroupsPerMeshGrid` NSUIntegerMax, the
+// wire's highest value; measured: oracle_mesh), and the threadgroup sizes its descriptor required,
+// as Metal's do. Metal answers 0 for a pipeline without the stage, as a vertex and fragment
+// pipeline is. The device makes no tile pipeline (newRenderPipelineStateWithTileDescriptor:
+// answers nil).
 
 - (NSUInteger)maxTotalThreadsPerObjectThreadgroup
 {
-	return 0;
+	return _haveMeshLimits ? _meshLimits.max_total_threads_per_object_threadgroup : 0;
 }
 
 - (NSUInteger)maxTotalThreadsPerMeshThreadgroup
 {
-	return 0;
+	return _haveMeshLimits ? _meshLimits.max_total_threads_per_mesh_threadgroup : 0;
 }
 
 - (NSUInteger)objectThreadExecutionWidth
 {
-	return 0;
+	return _haveMeshLimits ? _meshLimits.object_thread_execution_width : 0;
 }
 
 - (NSUInteger)meshThreadExecutionWidth
 {
-	return 0;
+	return _haveMeshLimits ? _meshLimits.mesh_thread_execution_width : 0;
 }
 
 - (NSUInteger)maxTotalThreadgroupsPerMeshGrid
 {
-	return 0;
+	if (!_haveMeshLimits)
+		return 0;
+	if (_meshLimits.max_total_threadgroups_per_mesh_grid == UINT32_MAX)
+		return NSUIntegerMax;
+	return _meshLimits.max_total_threadgroups_per_mesh_grid;
 }
 
 - (MTLSize)requiredThreadsPerTileThreadgroup
@@ -505,12 +801,12 @@ std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 
 - (MTLSize)requiredThreadsPerObjectThreadgroup
 {
-	return MTLSizeMake(0, 0, 0);
+	return _mesh ? _requiredObject : MTLSizeMake(0, 0, 0);
 }
 
 - (MTLSize)requiredThreadsPerMeshThreadgroup
 {
-	return MTLSizeMake(0, 0, 0);
+	return _mesh ? _requiredMesh : MTLSizeMake(0, 0, 0);
 }
 
 // --- not on the wire ------------------------------------------------------------------

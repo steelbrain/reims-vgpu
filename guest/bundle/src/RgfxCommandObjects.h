@@ -205,17 +205,28 @@ NS_ASSUME_NONNULL_BEGIN
 
 // --- the encoders ------------------------------------------------------------
 
+/// A device that says whether its host makes mesh pipelines (RGFX_FEATURE_MESH_PIPELINES), and so
+/// takes the object and mesh stages' commands.
+@protocol RgfxMeshPipelineDevice
+- (BOOL)rgfxMakesMeshPipelines;
+@end
+
 /// A render command encoder: each selector forwards to the matching RgfxEncoder
 /// render op. The pass framing (RGFX_OP_ENCODER_BEGIN_RENDER) is written by the
 /// command buffer when it vends the encoder; `endEncoding` writes RGFX_OP_ENCODER_END
 /// — unless this encoder belongs to a parallel render encoder, which owns the framing.
 @interface RgfxRenderCommandEncoder : NSObject <MTLRenderCommandEncoder>
 /// `enc` is the command buffer's RgfxEncoder (borrowed); `emitEnd` is NO for a
-/// sub-encoder of a parallel render encoder (the parallel encoder writes the END).
+/// sub-encoder of a parallel render encoder (the parallel encoder writes the END). The object
+/// and mesh stages' commands are sent where `device` makes mesh pipelines
+/// (RgfxMeshPipelineDevice), and dropped elsewhere.
 - (instancetype)initWithEncoder:(RgfxEncoder *)enc
                         emitEnd:(BOOL)emitEnd
                          device:(nullable id<MTLDevice>)device NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
+/// Whether the object and mesh stages' commands are sent, as the device answers at the encoder's
+/// making (a unit test's encoder has no device).
+- (void)rgfxSetMeshPipelines:(BOOL)meshes;
 @end
 
 /// A compute command encoder: each selector forwards to the matching RgfxEncoder

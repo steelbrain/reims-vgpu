@@ -34,7 +34,10 @@ constexpr uint64_t kComputeTypes =
 constexpr uint64_t kCommandBytes = 64;
 constexpr uint64_t kPageBytes = 4096;
 
-constexpr const char *kMesh = "mesh shading (no mesh pipeline create on the wire)";
+// No mesh render pipeline the device makes can be used in an indirect command buffer: its
+// creators end the process at one that supports them, as the x86 Macs' Metal does (measured:
+// guest/bundle/tools/oracle/oracle_mesh on the AMD 5300M and the Intel 630, macOS 26.7.1).
+constexpr const char *kMesh = "mesh shading in indirect command buffers (no mesh pipeline supports them)";
 
 // The SPI member `name` of `d` where it answers it, else `fallback`.
 NSUInteger spi(MTLIndirectCommandBufferDescriptor *d, const char *name, NSUInteger fallback)
@@ -582,7 +585,7 @@ inline void action(RgfxIndirectCommandBuffer *icb, RgfxIcbSlotTable *slots, uint
 	bare(_icb, RGFX_ICB_OP_RENDER_RESET, _index);
 }
 
-// --- mesh commands: the device makes no mesh pipeline, so none of these can draw ------------
+// --- mesh commands: no mesh pipeline supports indirect command buffers, so none of these draws -
 
 - (void)setObjectThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {

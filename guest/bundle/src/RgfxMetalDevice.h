@@ -105,6 +105,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// region's caps blob is read.
 - (const RgfxCaps *)caps;
 
+/// Whether the host makes mesh render pipelines and draws them: the caps' features hold
+/// RGFX_FEATURE_MESH_PIPELINES (RgfxMeshPipelineDevice, which the render encoders ask).
+- (BOOL)rgfxMakesMeshPipelines;
+
 /// The host's video codecs, as the video caps the host wrote say (RgfxVideoCaps): no codec
 /// where the host wrote none or the kext does not read them.
 - (const RgfxVideoCaps *)videoCaps;

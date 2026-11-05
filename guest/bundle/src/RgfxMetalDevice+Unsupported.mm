@@ -89,33 +89,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	});
 }
 
-- (id<MTLRenderPipelineState>)
-    newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
-                                     options:(MTLPipelineOption)options
-                                  reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection
-                                       error:(NSError **)error
-{
-	if (reflection)
-		*reflection = nil;
-	RGFX_UNSUPPORTED_ERROR(error, "mesh pipelines (no mesh pipeline create on the wire)");
-	return nil;
-}
-
-- (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
-                                         options:(MTLPipelineOption)options
-                               completionHandler:
-                                   (MTLNewRenderPipelineStateWithReflectionCompletionHandler)
-                                       completionHandler
-{
-	NSError *error = nil;
-	RGFX_UNSUPPORTED_ERROR(&error, "mesh pipelines (no mesh pipeline create on the wire)");
-	completionHandler = [completionHandler copy];
-	RgfxRunCreation(^{
-		if (completionHandler)
-			completionHandler(nil, nil, error);
-	});
-}
-
 // --- resources the device does not make -----------------------------------------------
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length
@@ -272,27 +245,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 // objects or OpenGL state, none of which the device has, and answer nil without an error; so
 // each answers as the bundle's other unsupported members do. tests/inherited_tests.mm keeps every
 // base-class creator either answered by the device or in its list of those left to the base.
-
-// Mesh pipelines without options (`@32@0:8@16^@24`, `v32@0:8@16@?24`), refused as the forms with
-// options are, above.
-- (id<MTLRenderPipelineState>)newRenderPipelineStateWithMeshDescriptor:
-                                  (MTLMeshRenderPipelineDescriptor *)descriptor
-                                                                 error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR(error, "mesh pipelines (no mesh pipeline create on the wire)");
-	return nil;
-}
-
-- (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
-                               completionHandler:(id)completionHandler
-{
-	NSError *error = nil;
-	RGFX_UNSUPPORTED_ERROR(&error, "mesh pipelines (no mesh pipeline create on the wire)");
-	completionHandler = [completionHandler copy];
-	RgfxRunCreation(^{
-		RgfxCallCreationHandler(completionHandler, nil, error, _cmd);
-	});
-}
 
 // Ray tracing: acceleration structures over a buffer (`@32@0:8@16Q24`, `@40@0:8@16Q24Q32`), of a
 // size at a resource index (`@32@0:8Q16Q24`) or with a descriptor (`@32@0:8Q16@24`), and

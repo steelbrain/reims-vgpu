@@ -78,6 +78,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// function list. A function made without it answers the placeholder stage.
 - (void)rgfxSetFunctionType:(MTLFunctionType)type;
 
+/// Whether the library told the function's stage (rgfxSetFunctionType:): where it did not,
+/// `functionType` answers the placeholder stage.
+- (BOOL)rgfxFunctionTypeKnown;
+
 /// Sets the options `options` answers: those of the descriptor the function was made
 /// from (`newFunctionWithDescriptor:`). A function made by name answers none.
 - (void)rgfxSetOptions:(MTLFunctionOptions)options;

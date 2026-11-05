@@ -18,13 +18,10 @@
 %no-sparse the device makes no sparse buffers or textures (their creators are RGFX_UNSUPPORTED), so no resource of it has a sparse tier, tiles or a mip tail
 %pipeline-reflection Metal answers nil for a pipeline a device makes, reflection asked for or not (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
 %no-validation the device validates no shader, and Metal answers MTLShaderValidationDisabled for a pipeline made without validation (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
-%no-mesh the device makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED), and Metal answers 0 for a render pipeline with no object or mesh stage (measured: M3 Max)
-%no-mesh-width the device makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED); for a render pipeline with no object or mesh stage the AMD and Intel devices answer 0, the M3 its SIMD width, 32 (measured), so 0 lies within what Metal answers
 %absent-as-metal none of Metal's own devices answers it either (measured with respondsToSelector:, M3 Max on macOS 27 and the AMD 5300M and Intel 630 on macOS 26.7.1), so a caller that sends it to any device checks first
 %base-creator left to the base, as tests/inherited_tests.mm lists, with why
 %base-spi an MTLDeviceSPI query, setter or tool hook the IOGPU base answers from its own state; the device answers every member of MTLDevice itself. tools/base_answers_probe.m compares what the base answers on this device with Metal's own devices (aud-tests-04)
 %spi-unverified an MTLDeviceSPI feature query the M3 Max, the AMD 5300M and the Intel UHD 630 all answer YES (measured, tools/base_answers_probe.m), and the IOGPU base answers NO here: what it gates, and whether the lane carries that, is not established, so the base's NO stands until it is (aud-tests-04)
-%spi-no-mesh the IOGPU base answers NO, the lane's answer: it makes no mesh or object pipelines (mesh shading is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-ray-tracing the IOGPU base answers NO, the lane's answer: it makes no acceleration structures (ray tracing is RGFX_UNSUPPORTED, and supportsRaytracing answers the host's NO), where Metal's devices answer YES
 %icb-render-states the macOS 26 render states of an indirect command: the AMD 5300M and the Intel 630 raise an unrecognized selector for each, answering respondsToSelector: YES (measured, tools/oracle/oracle_icb.m), and so does the command (the M3 Max raises an API-not-supported exception)
 %spi-no-counters the IOGPU base answers NO, the lane's answer: it samples no counters (counter sampling is RGFX_UNSUPPORTED, and counterSets is nil), where Metal's devices answer YES
@@ -335,8 +332,8 @@ setThreadgroupMemoryLength:atIndex: implemented
 clearBarrier implemented
 drawIndexedPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:controlPointIndexBuffer:controlPointIndexBufferOffset:instanceCount:baseInstance:tessellationFactorBuffer:tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride: implemented
 drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance: implemented
-drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading (no mesh pipeline create on the wire)
-drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading (no mesh pipeline create on the wire)
+drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading in indirect command buffers (no mesh pipeline supports them)
+drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading in indirect command buffers (no mesh pipeline supports them)
 drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance:tessellationFactorBuffer:tessellationFactorBufferOffset:tessellationFactorBufferInstanceStride: implemented
 drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance: implemented
 reset implemented
@@ -347,9 +344,9 @@ setDepthClipMode: metal %icb-render-states
 setDepthStencilState: metal %icb-render-states
 setFragmentBuffer:offset:atIndex: implemented
 setFrontFacingWinding: metal %icb-render-states
-setMeshBuffer:offset:atIndex: unsupported mesh shading (no mesh pipeline create on the wire)
-setObjectBuffer:offset:atIndex: unsupported mesh shading (no mesh pipeline create on the wire)
-setObjectThreadgroupMemoryLength:atIndex: unsupported mesh shading (no mesh pipeline create on the wire)
+setMeshBuffer:offset:atIndex: unsupported mesh shading in indirect command buffers (no mesh pipeline supports them)
+setObjectBuffer:offset:atIndex: unsupported mesh shading in indirect command buffers (no mesh pipeline supports them)
+setObjectThreadgroupMemoryLength:atIndex: unsupported mesh shading in indirect command buffers (no mesh pipeline supports them)
 setRenderPipelineState: implemented
 setTriangleFillMode: metal %icb-render-states
 setVertexBuffer:offset:atIndex: implemented
@@ -660,10 +657,10 @@ newRenderPipelineStateWithDescriptor:completionHandler: implemented
 newRenderPipelineStateWithDescriptor:error: implemented
 newRenderPipelineStateWithDescriptor:options:completionHandler: implemented
 newRenderPipelineStateWithDescriptor:options:reflection:error: implemented
-newRenderPipelineStateWithMeshDescriptor:completionHandler: partial mesh pipelines (no mesh pipeline create on the wire)
-newRenderPipelineStateWithMeshDescriptor:error: unsupported mesh pipelines (no mesh pipeline create on the wire)
-newRenderPipelineStateWithMeshDescriptor:options:completionHandler: partial mesh pipelines (no mesh pipeline create on the wire)
-newRenderPipelineStateWithMeshDescriptor:options:reflection:error: partial mesh pipelines (no mesh pipeline create on the wire)
+newRenderPipelineStateWithMeshDescriptor:completionHandler: implemented
+newRenderPipelineStateWithMeshDescriptor:error: implemented
+newRenderPipelineStateWithMeshDescriptor:options:completionHandler: implemented
+newRenderPipelineStateWithMeshDescriptor:options:reflection:error: implemented
 newRenderPipelineStateWithTileDescriptor:completionHandler: implemented
 newRenderPipelineStateWithTileDescriptor:error: implemented
 newRenderPipelineStateWithTileDescriptor:options:completionHandler: partial tile pipelines (no tile pipeline create on the wire)
@@ -707,7 +704,7 @@ registryID implemented
 requiredLinearTextureBytesPerRowForDescriptor: base %base-spi
 requiresBFloat16Emulation base %base-spi
 requiresLegacyCompilerProcessesCount base %base-spi
-requiresMeshShaderEmulation base %base-spi
+requiresMeshShaderEmulation base the IOGPU base answers NO, as the M3 Max does (the AMD 5300M and the Intel 630 answer YES; measured, tools/base_answers_probe.m): the host's GPU draws mesh shaders, and the device emulates none
 requiresRaytracingEmulation base %base-spi
 reserveGPUAddressRange: absent %absent-as-metal
 reserveResourceIndicesForResourceType:indices:indexCount: metal Metal's writes nothing to indices (types 0, 1 and 2 tried; measured, the effort's selector-sweep.md row 49)
@@ -870,8 +867,8 @@ supportsMachineLearningCommandEncoders base %base-spi
 supportsMemoryOrderAtomics base %base-spi
 supportsMemorylessRenderTargets base %base-spi
 supportsMeshRenderDynamicLibraries base %base-spi
-supportsMeshShaders base %spi-no-mesh
-supportsMeshShadersInICB base %base-spi
+supportsMeshShaders implemented
+supportsMeshShadersInICB base the IOGPU base answers NO, as the AMD 5300M and the Intel 630 do (the M3 Max answers YES; measured, tools/base_answers_probe.m): no mesh pipeline of the device supports indirect command buffers
 supportsMipLevelsSmallerThanBlockSize base %spi-unverified
 supportsMirrorClampToEdgeSamplerMode implemented
 supportsMultiPlaneTensors base %base-spi
@@ -1034,9 +1031,9 @@ drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset: implem
 drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount: implemented
 drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance: implemented
 drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset: implemented
-drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading
-drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading
-drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: unsupported mesh shading
+drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: partial mesh shading (the host makes no mesh pipeline)
+drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: partial mesh shading (the host makes no mesh pipeline)
+drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup: partial mesh shading (the host makes no mesh pipeline)
 drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset: implemented
 drawPatches:patchStart:patchCount:patchIndexBuffer:patchIndexBufferOffset:instanceCount:baseInstance: implemented
 drawPrimitives:indirectBuffer:indirectBufferOffset: implemented
@@ -1081,27 +1078,27 @@ setFragmentVisibleFunctionTable:atBufferIndex: partial function pointers
 setFragmentVisibleFunctionTables:withBufferRange: partial function pointers
 setFrontFacingWinding: implemented
 setLabel: implemented
-setMeshBuffer:offset:atIndex: partial mesh shading
-setMeshBufferOffset:atIndex: unsupported mesh shading
-setMeshBuffers:offsets:withRange: partial mesh shading
-setMeshBytes:length:atIndex: unsupported mesh shading
-setMeshSamplerState:atIndex: partial mesh shading
-setMeshSamplerState:lodMinClamp:lodMaxClamp:atIndex: partial mesh shading
-setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange: partial mesh shading
-setMeshSamplerStates:withRange: partial mesh shading
-setMeshTexture:atIndex: partial mesh shading
-setMeshTextures:withRange: partial mesh shading
-setObjectBuffer:offset:atIndex: partial mesh shading
-setObjectBufferOffset:atIndex: unsupported mesh shading
-setObjectBuffers:offsets:withRange: partial mesh shading
-setObjectBytes:length:atIndex: unsupported mesh shading
-setObjectSamplerState:atIndex: partial mesh shading
-setObjectSamplerState:lodMinClamp:lodMaxClamp:atIndex: partial mesh shading
-setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange: partial mesh shading
-setObjectSamplerStates:withRange: partial mesh shading
-setObjectTexture:atIndex: partial mesh shading
-setObjectTextures:withRange: partial mesh shading
-setObjectThreadgroupMemoryLength:atIndex: unsupported mesh shading
+setMeshBuffer:offset:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setMeshBufferOffset:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setMeshBuffers:offsets:withRange: partial mesh shading (the host makes no mesh pipeline)
+setMeshBytes:length:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setMeshSamplerState:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setMeshSamplerState:lodMinClamp:lodMaxClamp:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange: partial mesh shading (the host makes no mesh pipeline)
+setMeshSamplerStates:withRange: partial mesh shading (the host makes no mesh pipeline)
+setMeshTexture:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setMeshTextures:withRange: partial mesh shading (the host makes no mesh pipeline)
+setObjectBuffer:offset:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setObjectBufferOffset:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setObjectBuffers:offsets:withRange: partial mesh shading (the host makes no mesh pipeline)
+setObjectBytes:length:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setObjectSamplerState:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setObjectSamplerState:lodMinClamp:lodMaxClamp:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange: partial mesh shading (the host makes no mesh pipeline)
+setObjectSamplerStates:withRange: partial mesh shading (the host makes no mesh pipeline)
+setObjectTexture:atIndex: partial mesh shading (the host makes no mesh pipeline)
+setObjectTextures:withRange: partial mesh shading (the host makes no mesh pipeline)
+setObjectThreadgroupMemoryLength:atIndex: partial mesh shading (the host makes no mesh pipeline)
 setRenderPipelineState: implemented
 setScissorRect: implemented
 setScissorRects:count: implemented
@@ -1173,20 +1170,20 @@ functionHandleWithName:stage: unsupported function pointers
 gpuResourceID implemented
 imageblockMemoryLengthForDimensions: unsupported imageblock memory queries (not in the host's reflection)
 imageblockSampleLength implemented
-maxTotalThreadgroupsPerMeshGrid metal %no-mesh
-maxTotalThreadsPerMeshThreadgroup metal %no-mesh
-maxTotalThreadsPerObjectThreadgroup metal %no-mesh
+maxTotalThreadgroupsPerMeshGrid implemented
+maxTotalThreadsPerMeshThreadgroup implemented
+maxTotalThreadsPerObjectThreadgroup implemented
 maxTotalThreadsPerThreadgroup implemented
-meshThreadExecutionWidth metal %no-mesh-width
+meshThreadExecutionWidth implemented
 newIntersectionFunctionTableWithDescriptor:stage: unsupported ray tracing
 newRenderPipelineDescriptorForSpecialization unsupported Metal 4 pipeline specialization
 newRenderPipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
 newRenderPipelineStateWithBinaryFunctions:error: unsupported binary functions
 newVisibleFunctionTableWithDescriptor:stage: unsupported function pointers
-objectThreadExecutionWidth metal %no-mesh-width
+objectThreadExecutionWidth implemented
 reflection metal %pipeline-reflection
-requiredThreadsPerMeshThreadgroup metal %no-mesh
-requiredThreadsPerObjectThreadgroup metal %no-mesh
+requiredThreadsPerMeshThreadgroup implemented
+requiredThreadsPerObjectThreadgroup implemented
 requiredThreadsPerTileThreadgroup metal the device makes no tile pipelines (their creators are RGFX_UNSUPPORTED); Metal answers 0, 0, 0 for a render pipeline with no tile function (measured: M3 Max)
 shaderValidation metal %no-validation
 supportIndirectCommandBuffers implemented

@@ -426,6 +426,35 @@ void test_function_misses()
 	CHECK(miss(vertex, binary, @[ empty ]) == nil && miss(nil, binary, @[ empty ]) == nil);
 }
 
+// A mesh pipeline created with MTLPipelineOptionFailOnBinaryArchiveMiss misses in every archive,
+// which holds none, naming its fragment function, or its mesh function where it has none, in the
+// x86 Macs' compiler's domain and words (oracle_mesh archive-miss*); with no archive named it is no
+// miss.
+void test_mesh_pipeline_misses()
+{
+	NSError *e = nil;
+	RgfxBinaryArchive *a = archive(nil, @"arch_a", &e);
+	MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+	m.objectFunction = function(@"o_fn");
+	m.meshFunction = function(@"m_payload");
+	m.fragmentFunction = function(@"f_col");
+	m.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	CHECK([RgfxBinaryArchive rgfxMissOfMeshRenderPipeline:m] == nil);
+	m.binaryArchives = @[];
+	CHECK([RgfxBinaryArchive rgfxMissOfMeshRenderPipeline:m] == nil);
+	m.binaryArchives = @[ a ];
+	auto isMeshMiss = [](NSError *miss, NSString *name) {
+		NSString *words =
+		    [NSString stringWithFormat:@"Unable to find function \"%@\" in binary archives. \n ", name];
+		return miss != nil && [miss.domain isEqualToString:@"CompilerError"] && miss.code == 2 &&
+		       [miss.localizedDescription isEqualToString:words];
+	};
+	CHECK(isMeshMiss([RgfxBinaryArchive rgfxMissOfMeshRenderPipeline:m], @"f_col"));
+	m.fragmentFunction = nil;
+	m.rasterizationEnabled = NO;
+	CHECK(isMeshMiss([RgfxBinaryArchive rgfxMissOfMeshRenderPipeline:m], @"m_payload"));
+}
+
 } // namespace
 
 void rgfxArchiveTests()
@@ -446,5 +475,6 @@ void rgfxArchiveTests()
 	test_archive_files();
 	test_archive_keys_and_options();
 	test_function_misses();
+	test_mesh_pipeline_misses();
 	[[NSFileManager defaultManager] removeItemAtPath:g_dir error:nil];
 }

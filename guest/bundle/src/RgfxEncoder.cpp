@@ -1141,6 +1141,153 @@ void RgfxEncoder::renderSetTileSamplerStatesLodClamps(uint64_t range_location,
 	              sizeof(RgfxSamplerLodBinding));
 }
 
+void RgfxEncoder::renderSetObjectBuffers(uint64_t range_location, const RgfxBufferBinding *bindings,
+                                         uint32_t count)
+{
+	RgfxOpSetObjectBuffers h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_OBJECT_BUFFERS, &h, sizeof(h), bindings, count,
+	              sizeof(RgfxBufferBinding));
+}
+
+void RgfxEncoder::renderSetObjectBufferOffset(uint64_t offset, uint64_t index)
+{
+	RgfxOpSetObjectBufferOffset b = {};
+	b.offset = offset;
+	b.index = index;
+	appendOp(RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET, &b, sizeof(b));
+}
+
+void RgfxEncoder::renderSetObjectTextures(uint64_t range_location, const RgfxTextureBinding *textures,
+                                          uint32_t count)
+{
+	RgfxOpSetObjectTextures h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_OBJECT_TEXTURES, &h, sizeof(h), textures, count,
+	              sizeof(RgfxTextureBinding));
+}
+
+void RgfxEncoder::renderSetObjectSamplerStates(uint64_t range_location,
+                                               const RgfxSamplerBinding *samplers, uint32_t count)
+{
+	RgfxOpSetObjectSamplerStates h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES, &h, sizeof(h), samplers, count,
+	              sizeof(RgfxSamplerBinding));
+}
+
+void RgfxEncoder::renderSetObjectSamplerStatesLodClamps(uint64_t range_location,
+                                                        const RgfxSamplerLodBinding *samplers,
+                                                      uint32_t count)
+{
+	RgfxOpSetObjectSamplerStatesLodClamps h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS, &h, sizeof(h), samplers,
+	              count, sizeof(RgfxSamplerLodBinding));
+}
+
+void RgfxEncoder::renderSetMeshBuffers(uint64_t range_location, const RgfxBufferBinding *bindings,
+                                       uint32_t count)
+{
+	RgfxOpSetMeshBuffers h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_MESH_BUFFERS, &h, sizeof(h), bindings, count,
+	              sizeof(RgfxBufferBinding));
+}
+
+void RgfxEncoder::renderSetMeshBufferOffset(uint64_t offset, uint64_t index)
+{
+	RgfxOpSetMeshBufferOffset b = {};
+	b.offset = offset;
+	b.index = index;
+	appendOp(RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET, &b, sizeof(b));
+}
+
+void RgfxEncoder::renderSetMeshTextures(uint64_t range_location, const RgfxTextureBinding *textures,
+                                        uint32_t count)
+{
+	RgfxOpSetMeshTextures h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_MESH_TEXTURES, &h, sizeof(h), textures, count,
+	              sizeof(RgfxTextureBinding));
+}
+
+void RgfxEncoder::renderSetMeshSamplerStates(uint64_t range_location,
+                                             const RgfxSamplerBinding *samplers, uint32_t count)
+{
+	RgfxOpSetMeshSamplerStates h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES, &h, sizeof(h), samplers, count,
+	              sizeof(RgfxSamplerBinding));
+}
+
+void RgfxEncoder::renderSetMeshSamplerStatesLodClamps(uint64_t range_location,
+                                                      const RgfxSamplerLodBinding *samplers,
+                                                      uint32_t count)
+{
+	RgfxOpSetMeshSamplerStatesLodClamps h = {};
+	h.range_location = range_location;
+	h.range_length = count;
+	appendArrayOp(RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS, &h, sizeof(h), samplers,
+	              count, sizeof(RgfxSamplerLodBinding));
+}
+
+void RgfxEncoder::renderSetObjectThreadgroupMemoryLength(uint64_t length, uint64_t index)
+{
+	RgfxOpSetObjectThreadgroupMemoryLength b = {};
+	b.length = length;
+	b.index = index;
+	appendOp(RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH, &b, sizeof(b));
+}
+
+void RgfxEncoder::renderDrawMeshThreadgroups(const uint64_t threadgroups_per_grid[3],
+                                             const uint64_t threads_per_object_threadgroup[3],
+                                             const uint64_t threads_per_mesh_threadgroup[3])
+{
+	RgfxOpDrawMeshThreadgroups b = {};
+	std::memcpy(b.threadgroups_per_grid, threadgroups_per_grid, sizeof(b.threadgroups_per_grid));
+	std::memcpy(b.threads_per_object_threadgroup, threads_per_object_threadgroup,
+	            sizeof(b.threads_per_object_threadgroup));
+	std::memcpy(b.threads_per_mesh_threadgroup, threads_per_mesh_threadgroup,
+	            sizeof(b.threads_per_mesh_threadgroup));
+	appendOp(RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS, &b, sizeof(b));
+}
+
+void RgfxEncoder::renderDrawMeshThreads(const uint64_t threads_per_grid[3],
+                                        const uint64_t threads_per_object_threadgroup[3],
+                                        const uint64_t threads_per_mesh_threadgroup[3])
+{
+	RgfxOpDrawMeshThreads b = {};
+	std::memcpy(b.threads_per_grid, threads_per_grid, sizeof(b.threads_per_grid));
+	std::memcpy(b.threads_per_object_threadgroup, threads_per_object_threadgroup,
+	            sizeof(b.threads_per_object_threadgroup));
+	std::memcpy(b.threads_per_mesh_threadgroup, threads_per_mesh_threadgroup,
+	            sizeof(b.threads_per_mesh_threadgroup));
+	appendOp(RGFX_OP_RENDER_DRAW_MESH_THREADS, &b, sizeof(b));
+}
+
+void RgfxEncoder::renderDrawMeshThreadgroupsIndirect(RgfxObjId indirect_buffer,
+                                                     uint64_t indirect_buffer_offset,
+                                                     const uint64_t threads_per_object_threadgroup[3],
+                                                     const uint64_t threads_per_mesh_threadgroup[3])
+{
+	RgfxOpDrawMeshThreadgroupsIndirect b = {};
+	b.indirect_buffer_obj_id = indirect_buffer;
+	b.indirect_buffer_offset = indirect_buffer_offset;
+	std::memcpy(b.threads_per_object_threadgroup, threads_per_object_threadgroup,
+	            sizeof(b.threads_per_object_threadgroup));
+	std::memcpy(b.threads_per_mesh_threadgroup, threads_per_mesh_threadgroup,
+	            sizeof(b.threads_per_mesh_threadgroup));
+	appendOp(RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT, &b, sizeof(b));
+}
+
 void RgfxEncoder::renderSetScissorRects(const RgfxScissorRectElem *rects, uint32_t count)
 {
 	m_renderStateSet |= kRgfxRenderStateScissor;

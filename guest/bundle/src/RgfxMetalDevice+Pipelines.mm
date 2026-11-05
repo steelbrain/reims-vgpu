@@ -661,6 +661,105 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	});
 }
 
+// --- mesh render pipelines ---------------------------------------------------
+
+// Every mesh render pipeline entry point funnels through here: Metal's validation first, then the
+// host's feature (a host without RGFX_FEATURE_MESH_PIPELINES makes none), the archive miss, and the
+// create, which always waits for its answer. Its state answers as a render pipeline's, and its
+// object and mesh stages' limits as the host's platform answered them.
+- (nullable id<MTLRenderPipelineState>)
+    rgfxMeshRenderPipelineForDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+                                options:(MTLPipelineOption)options
+                                  error:(__autoreleasing NSError **)error
+{
+	[RgfxRenderPipelineState rgfxEndAtInvalidMeshDescriptor:descriptor];
+	if (![self rgfxMakesMeshPipelines]) {
+		RGFX_UNSUPPORTED_ERROR(error, "mesh pipelines (the host makes none)");
+		return nil;
+	}
+	if ((options & MTLPipelineOptionFailOnBinaryArchiveMiss) != 0) {
+		NSError *miss = [RgfxBinaryArchive rgfxMissOfMeshRenderPipeline:descriptor];
+		if (miss != nil) {
+			if (error)
+				*error = miss;
+			return nil;
+		}
+	}
+	RgfxRenderPipelineState *state = [RgfxRenderPipelineState
+	    meshRenderPipelineStateWithDescriptor:descriptor
+	                                   device:self
+	                               serializer:[self serializer]
+	                          maxTotalThreads:[self maxThreadsPerThreadgroup].width
+	                                    error:error];
+	[state rgfxRegisterWithReplyReader:[self replyReader]];
+	return rgfxUnlessRefused(state, error);
+}
+
+- (id<MTLRenderPipelineState>)
+    newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+                                     options:(MTLPipelineOption)options
+                                  reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection
+                                       error:(__autoreleasing NSError **)error
+{
+	id<MTLRenderPipelineState> state = [self rgfxMeshRenderPipelineForDescriptor:descriptor
+	                                                                     options:options
+	                                                                       error:error];
+	if (reflection)
+		*reflection = state != nil ? RgfxMeshPipelineReflectionOf(descriptor.objectFunction, descriptor.meshFunction,
+		                                                          descriptor.fragmentFunction, options)
+		                           : nil;
+	return state;
+}
+
+- (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+                                         options:(MTLPipelineOption)options
+                               completionHandler:
+                                   (MTLNewRenderPipelineStateWithReflectionCompletionHandler)
+                                       completionHandler
+{
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLRenderPipelineState> state = [self rgfxMeshRenderPipelineForDescriptor:descriptor
+		                                                                     options:options
+		                                                                       error:&err];
+		if (completionHandler)
+			completionHandler(state,
+			                  state != nil ? RgfxMeshPipelineReflectionOf(descriptor.objectFunction,
+			                                                              descriptor.meshFunction,
+			                                                              descriptor.fragmentFunction, options)
+			                               : nil,
+			                  err);
+	});
+}
+
+// The forms without options that IOGPUMetalDevice and _MTLDevice implement and no header declares
+// (`@32@0:8@16^@24`, `v32@0:8@16@?24`, measured with their type encodings on macOS 27's x86-64
+// slice and on the guest's macOS 26): the forms with no option.
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithMeshDescriptor:
+                                  (MTLMeshRenderPipelineDescriptor *)descriptor
+                                                                 error:(__autoreleasing NSError **)error
+{
+	return [self rgfxMeshRenderPipelineForDescriptor:descriptor
+	                                         options:MTLPipelineOptionNone
+	                                           error:error];
+}
+
+- (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+                               completionHandler:(id)completionHandler
+{
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLRenderPipelineState> state = [self rgfxMeshRenderPipelineForDescriptor:descriptor
+		                                                                     options:MTLPipelineOptionNone
+		                                                                       error:&err];
+		RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+	});
+}
+
 // --- compute pipelines -------------------------------------------------------
 
 // Creates a compute pipeline state (from a function or a descriptor) and registers it

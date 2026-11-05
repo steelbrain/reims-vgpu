@@ -330,6 +330,36 @@ public:
 	                                             uint32_t count);
 	void renderSetTileSamplerStatesLodClamps(uint64_t range_location,
 	                                         const RgfxSamplerLodBinding *samplers, uint32_t count);
+	void renderSetObjectBuffers(uint64_t range_location, const RgfxBufferBinding *bindings,
+	                            uint32_t count);
+	void renderSetObjectBufferOffset(uint64_t offset, uint64_t index);
+	void renderSetObjectTextures(uint64_t range_location, const RgfxTextureBinding *textures,
+	                             uint32_t count);
+	void renderSetObjectSamplerStates(uint64_t range_location, const RgfxSamplerBinding *samplers,
+	                                  uint32_t count);
+	void renderSetObjectSamplerStatesLodClamps(uint64_t range_location,
+	                                           const RgfxSamplerLodBinding *samplers, uint32_t count);
+	void renderSetMeshBuffers(uint64_t range_location, const RgfxBufferBinding *bindings,
+	                          uint32_t count);
+	void renderSetMeshBufferOffset(uint64_t offset, uint64_t index);
+	void renderSetMeshTextures(uint64_t range_location, const RgfxTextureBinding *textures,
+	                           uint32_t count);
+	void renderSetMeshSamplerStates(uint64_t range_location, const RgfxSamplerBinding *samplers,
+	                                uint32_t count);
+	void renderSetMeshSamplerStatesLodClamps(uint64_t range_location,
+	                                         const RgfxSamplerLodBinding *samplers, uint32_t count);
+	void renderSetObjectThreadgroupMemoryLength(uint64_t length, uint64_t index);
+	/// The mesh draws: each size is width, height and depth.
+	void renderDrawMeshThreadgroups(const uint64_t threadgroups_per_grid[3],
+	                                const uint64_t threads_per_object_threadgroup[3],
+	                                const uint64_t threads_per_mesh_threadgroup[3]);
+	void renderDrawMeshThreads(const uint64_t threads_per_grid[3],
+	                           const uint64_t threads_per_object_threadgroup[3],
+	                           const uint64_t threads_per_mesh_threadgroup[3]);
+	void renderDrawMeshThreadgroupsIndirect(RgfxObjId indirect_buffer,
+	                                        uint64_t indirect_buffer_offset,
+	                                        const uint64_t threads_per_object_threadgroup[3],
+	                                        const uint64_t threads_per_mesh_threadgroup[3]);
 	void renderSetScissorRects(const RgfxScissorRectElem *rects, uint32_t count);
 	void renderSetViewports(const RgfxViewportElem *viewports, uint32_t count);
 	void renderSetVertexAmplificationCount(const RgfxViewMapping *mappings, uint32_t count);

@@ -63,6 +63,19 @@
 #include "RgfxRingRoomEvents.hpp"
 #include "reims_graphics_wire.h"
 
+/// A pipeline create's answer: its RGFX_EVT_PIPELINE_REFLECTION record, and the mesh stages'
+/// limits a made mesh render pipeline's answer carries after it
+/// (RGFX_PIPELINE_REFLECTION_MESH_OFFSET), zeros where the answer carries none.
+struct RgfxPipelineReply : RgfxPipelineReflection {
+	RgfxMeshPipelineReflection mesh;
+	/// Whether the answer carried the mesh stages' limits.
+	bool hasMesh;
+
+	/// The answer of the `size` bytes at `message`, a whole RGFX_EVT_PIPELINE_REFLECTION of at
+	/// least sizeof(RgfxPipelineReflection) bytes; the limits where it holds them.
+	static RgfxPipelineReply of(const void *message, uint32_t size);
+};
+
 class RgfxReplyReader {
 public:
 	/// A command buffer's completion handler, invoked once with the whole message.
@@ -72,7 +85,7 @@ public:
 	/// A command buffer's submitted handler, invoked once with the whole message.
 	typedef std::function<void(const RgfxCbSubmitted &)> SubmittedHandler;
 	/// A pipeline create's reflection handler, invoked once with the whole message.
-	typedef std::function<void(const RgfxPipelineReflection &)> ReflectionHandler;
+	typedef std::function<void(const RgfxPipelineReply &)> ReflectionHandler;
 	/// A shared event's listener, invoked on every EVENT_SIGNALLED for its obj_id.
 	typedef std::function<void(const RgfxEventSignalled &)> EventHandler;
 
@@ -201,7 +214,7 @@ private:
 	std::unordered_map<uint64_t, ScheduledHandler> m_scheduled;
 	std::unordered_map<uint64_t, SubmittedHandler> m_submitted;
 	std::unordered_map<uint64_t, ReflectionHandler> m_reflections;
-	std::unordered_map<uint64_t, RgfxPipelineReflection> m_earlyReflections;
+	std::unordered_map<uint64_t, RgfxPipelineReply> m_earlyReflections;
 	std::unordered_map<uint64_t, EventListener> m_eventListeners;
 	uint64_t m_nextToken;
 	RgfxReplyReader *m_eventsTo = nullptr; // setEventsTo: borrowed

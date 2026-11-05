@@ -7,7 +7,9 @@
  * the queue's completion ring, matched by the create's `seqno` — but the reply-ring
  * reader is a LATER transport piece, so the wrapper holds objId + seqno and its
  * reflection getters (maxTotalThreadsPerThreadgroup, gpuResourceID, …) answer
- * documented placeholders until that reader lands.
+ * documented placeholders until that reader lands. A mesh render pipeline
+ * (MTLMeshRenderPipelineDescriptor, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE) is one of these too:
+ * its answer carries its object and mesh stages' limits after the reflection.
  *
  * Our own ObjC++: it conforms to MTLRenderPipelineState but subclasses only NSObject
  * (via RgfxResource), so it instantiates and is unit-tested on the Mac.
@@ -58,6 +60,27 @@ NS_ASSUME_NONNULL_BEGIN
                                                      known:(std::shared_ptr<RgfxKnownPipelines>)known
                                                      error:(__autoreleasing NSError *_Nullable *_Nullable)
                                                                error;
+
+/// Ends the process where Metal's validation of a mesh render pipeline's descriptor does, with its
+/// words: no mesh function, no fragment function while rasterization is enabled, and
+/// supportIndirectCommandBuffers, which the x86 Macs' Metal makes no mesh pipeline of.
+/// meshRenderPipelineStateWithDescriptor: calls it first; the device's creators, before they ask
+/// whether the host makes mesh pipelines.
++ (void)rgfxEndAtInvalidMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor;
+
+/// Creates a mesh render pipeline state from `descriptor`, mapping it into
+/// RgfxMeshRenderPipelineParams and serialising an RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, whose
+/// answer it waits for. `maxTotalThreads` is the device's most threads in a threadgroup. On
+/// failure returns nil and, when `error` is non-null, sets it: as
+/// renderPipelineStateWithDescriptor:device:serializer:error:, and Metal's refusal of a stage
+/// function of the wrong type, of a maximum above `maxTotalThreads` and of a payload above 16 KiB.
+/// It ends the process first where Metal's validation does (rgfxEndAtInvalidMeshDescriptor:).
++ (nullable instancetype)meshRenderPipelineStateWithDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+                                                        device:(nullable id<MTLDevice>)device
+                                                    serializer:(nullable RgfxSerializer *)serializer
+                                               maxTotalThreads:(NSUInteger)maxTotalThreads
+                                                         error:(__autoreleasing NSError *_Nullable *_Nullable)
+                                                                   error;
 #endif
 
 /// Designated initialiser: wraps an already-posted create. `objId` and `seqno` are
@@ -97,6 +120,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// function has none; null where they are unknown.
 - (std::shared_ptr<const RgfxAirFunction>)rgfxVertexAirFunction;
 - (std::shared_ptr<const RgfxAirFunction>)rgfxFragmentAirFunction;
+/// The same, of a mesh render pipeline's object and mesh functions: none for a vertex and
+/// fragment pipeline, which has neither stage.
+- (std::shared_ptr<const RgfxAirFunction>)rgfxObjectAirFunction;
+- (std::shared_ptr<const RgfxAirFunction>)rgfxMeshAirFunction;
 #endif
 
 @end

@@ -133,6 +133,11 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	_haveType = YES;
 }
 
+- (BOOL)rgfxFunctionTypeKnown
+{
+	return _haveType;
+}
+
 - (void)rgfxSetPatchType:(MTLPatchType)type controlPointCount:(NSInteger)count
 {
 	_patchType = type;

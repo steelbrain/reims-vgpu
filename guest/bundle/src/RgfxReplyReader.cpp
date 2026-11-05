@@ -75,9 +75,22 @@ RgfxReplyReader::RgfxReplyReader()
 {
 }
 
+RgfxPipelineReply RgfxPipelineReply::of(const void *message, uint32_t size)
+{
+	RgfxPipelineReply r = {};
+	std::memcpy(static_cast<RgfxPipelineReflection *>(&r), message, sizeof(RgfxPipelineReflection));
+	if (r.kind == RGFX_PIPELINE_KIND_MESH &&
+	    size >= RGFX_PIPELINE_REFLECTION_MESH_OFFSET + sizeof(RgfxMeshPipelineReflection)) {
+		std::memcpy(&r.mesh, static_cast<const uint8_t *>(message) + RGFX_PIPELINE_REFLECTION_MESH_OFFSET,
+		            sizeof(r.mesh));
+		r.hasMesh = true;
+	}
+	return r;
+}
+
 void RgfxReplyReader::expectReflection(uint64_t seqno, ReflectionHandler handler)
 {
-	RgfxPipelineReflection early = {};
+	RgfxPipelineReply early = {};
 	{
 		std::lock_guard<std::mutex> guard(m_lock);
 		auto it = m_earlyReflections.find(seqno);
@@ -93,10 +106,9 @@ void RgfxReplyReader::expectReflection(uint64_t seqno, ReflectionHandler handler
 
 void RgfxReplyReader::deliver(const void *message, uint32_t size)
 {
-	RgfxPipelineReflection msg = {};
-	if (size < sizeof(msg))
+	if (size < sizeof(RgfxPipelineReflection))
 		return;
-	std::memcpy(&msg, message, sizeof(msg));
+	const RgfxPipelineReply msg = RgfxPipelineReply::of(message, size);
 	if (msg.header.type != RGFX_EVT_PIPELINE_REFLECTION)
 		return;
 	ReflectionHandler handler;
@@ -331,9 +343,11 @@ uint32_t RgfxReplyReader::pump()
 				break;
 			}
 			case RGFX_EVT_PIPELINE_REFLECTION: {
-				RgfxPipelineReflection msg = {};
-				if (size >= sizeof(msg)) {
-					readBytes(m_data, offset, &msg, sizeof(msg));
+				if (size >= sizeof(RgfxPipelineReflection)) {
+					uint8_t whole[sizeof(RgfxPipelineReflection) + sizeof(RgfxMeshPipelineReflection)] = {};
+					const uint32_t n = size < sizeof(whole) ? size : static_cast<uint32_t>(sizeof(whole));
+					readBytes(m_data, offset, whole, n);
+					const RgfxPipelineReply msg = RgfxPipelineReply::of(whole, n);
 					auto it = m_reflections.find(msg.header.seqno);
 					if (it != m_reflections.end()) {
 						ReflectionHandler handler = std::move(it->second);

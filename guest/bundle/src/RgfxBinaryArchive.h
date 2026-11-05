@@ -93,6 +93,13 @@ extern NSErrorDomain const RgfxBinaryArchiveMissDomain;
 /// The same, of a compute pipeline of `descriptor`.
 + (nullable NSError *)rgfxMissOfComputePipeline:(MTLComputePipelineDescriptor *)descriptor;
 
+/// Metal's miss of a mesh render pipeline of `descriptor` created with
+/// MTLPipelineOptionFailOnBinaryArchiveMiss, nil where it names no archive or a function of
+/// another device: an archive holds no mesh pipeline (addMeshRenderPipelineFunctionsWithDescriptor:
+/// refuses every one, as the x86 Macs' archives do), so every other create misses, naming its
+/// fragment function, or its mesh function where it has none.
++ (nullable NSError *)rgfxMissOfMeshRenderPipeline:(MTLMeshRenderPipelineDescriptor *)descriptor;
+
 @end
 
 NS_ASSUME_NONNULL_END

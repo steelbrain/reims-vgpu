@@ -560,7 +560,8 @@ RGFX_LOG_UNRECOGNIZED
 
 // A mesh pipeline: refused, with or without its functions, as an x86 Mac's archive refuses every
 // one (measured: guest/bundle/tools/oracle/oracle_names on the AMD Radeon Pro 5300M and the Intel
-// UHD Graphics 630, macOS 26.7.1). The device makes no mesh pipeline either.
+// UHD Graphics 630, macOS 26.7.1). So a mesh pipeline created with
+// MTLPipelineOptionFailOnBinaryArchiveMiss misses in every archive (rgfxMissOfMeshRenderPipeline:).
 - (BOOL)addMeshRenderPipelineFunctionsWithDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
                                                error:(__autoreleasing NSError **)error
 {
@@ -749,6 +750,27 @@ static BOOL rgfxAnyHolds(NSArray *archives, const RgfxArchiveEntry &entry)
 	default:
 		return nil;
 	}
+}
+
+// The x86 Macs' miss, in their compiler's domain and words, without the key they name: an
+// `MTLBinaryKey` of zeros, which no archive of theirs holds (measured: oracle_mesh archive-miss,
+// archive-miss-norast, archive-miss-object and archive-miss-object-norast on the 5300M and the
+// 630, macOS 26.7.1: CompilerError 2, `Unable to find function "f_col" in binary archives. \n
+// Expected <MTLBinaryKey: 0x…> Legacy key:\n<64 zeros> Single SHA256 \n `). With no archive
+// named, the 5300M and the 630 end the process with SIGSEGV and the M3 Max makes the pipeline;
+// the device makes it.
++ (NSError *)rgfxMissOfMeshRenderPipeline:(MTLMeshRenderPipelineDescriptor *)descriptor
+{
+	if (descriptor.binaryArchives.count == 0 || descriptor.meshFunction == nil ||
+	    !ours(descriptor.objectFunction) || !ours(descriptor.meshFunction) ||
+	    !ours(descriptor.fragmentFunction))
+		return nil;
+	id<MTLFunction> named = descriptor.fragmentFunction ?: descriptor.meshFunction;
+	NSString *what = [NSString
+	    stringWithFormat:@"Unable to find function \"%@\" in binary archives. \n ", named.name];
+	return [NSError errorWithDomain:@"CompilerError"
+	                           code:2
+	                       userInfo:@{NSLocalizedDescriptionKey : what}];
 }
 
 + (NSError *)rgfxMissOfComputePipeline:(MTLComputePipelineDescriptor *)descriptor
