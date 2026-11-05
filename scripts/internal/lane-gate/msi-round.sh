@@ -31,6 +31,15 @@ for s in ${STAGES:-}; do
     cp -a "$b" "$RD/probes/.$n.tmp" || { echo "msi-round: no base probe at $b" >&2; exit 2; }
     cp -a "$src/." "$RD/probes/.$n.tmp/" && rm -f "$RD/probes/.$n.tmp/.base"
   fi
+  # More files from this host (DIR/.extra, "SOURCE RELATIVE-PATH" a line).
+  if [[ -f $RD/probes/.$n.tmp/.extra ]]; then
+    while read -r xs xd; do
+      [[ -n $xs && -n $xd ]] || continue
+      mkdir -p "$(dirname "$RD/probes/.$n.tmp/$xd")"
+      cp -a --reflink=auto "$xs" "$RD/probes/.$n.tmp/$xd" || { echo "msi-round: no $xs for $n" >&2; exit 2; }
+    done < "$RD/probes/.$n.tmp/.extra"
+    rm -f "$RD/probes/.$n.tmp/.extra"
+  fi
   [[ -z $tip ]] || echo "$tip" > "$RD/probes/.$n.tmp/tip"
   mv "$RD/probes/.$n.tmp" "$RD/probes/$n"
   staged+="$n "
