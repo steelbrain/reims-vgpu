@@ -29,6 +29,11 @@
 //!   since the cache was last copied either way. A release copies whether or not the surface has
 //!   a client left (`RGFX_BLOCK_RELEASE_NO_CLIENT` changes nothing): a mach port or an XPC object
 //!   holds a surface with no client, and the process that looks it up from one reads its pages.
+//!   A download or a release copies nothing where, as its copy is made (at once, or in the
+//!   finish of a buffer begun before it), the CPU's generation in the block's header
+//!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
+//!   answer, moved the generation, and let the CPU write the pages, whose writes are the newer,
+//!   as at a fill.
 //! - **Order.** Fills and downloads run on the host's own transfer queue, in the order they are
 //!   asked, each after every command buffer that used the cache before it: each such buffer
 //!   signals its queue's end event as it ends, and the copy waits for the latest value of each
@@ -85,6 +90,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use reims_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+use reims_graphics::region::Region;
 use reims_graphics::wire::RgfxBufferOverSurfacePages;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
@@ -112,6 +118,17 @@ pub(crate) const STORAGE_PRIVATE: u64 = 2 << 4;
 const STORAGE_SHARED: u64 = 0;
 /// `MTLResourceStorageModeMask`.
 pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
+
+/// Where a cached block's header holds its surface's CPU generation, from the block's first
+/// byte: a `u64` the kext writes at each read-write lock, and stores 0 in as it caches the block
+/// (the kext's `kRgfxSurfaceCpuGenOffset`, which the processes read for `RGFX_OP_SURFACE_USE`).
+pub(crate) const CPU_GEN_OFFSET: u64 = 16;
+
+/// The CPU's generation of the surface whose cached block is at `block`, as the kext last wrote
+/// it in the block's header ([`CPU_GEN_OFFSET`]); `None` where the header is not in `region`.
+pub(crate) fn cpu_generation(region: &Region, block: u64) -> Option<u64> {
+    region.load_u64(block.checked_add(CPU_GEN_OFFSET)?)
+}
 
 /// One surface's device cache.
 pub(crate) struct SurfaceCache<P: Platform> {
@@ -327,6 +344,9 @@ pub(crate) struct CacheCounts {
     /// Releases of a written cache whose surface had no client left
     /// (`RGFX_BLOCK_RELEASE_NO_CLIENT`), copied into the pages all the same.
     pub(crate) unread: u64,
+    /// Downloads and releases of a written cache not copied, as the CPU's generation of the
+    /// surface moved past the cache's ([`SurfaceCaches::behind_the_cpu`]).
+    pub(crate) behind: u64,
     /// Deferred blocks' caches made, and refused (past the budget, or not made); deferred blocks
     /// whose pages were named; and those released with their pages never named.
     pub(crate) deferred: u64,
@@ -487,7 +507,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 }
                 return Ok(true);
             }
-            self.released(device, block, false, Box::new(|| {}))?;
+            self.released(device, block, false, None, Box::new(|| {}))?;
         }
         let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
             return Ok(false);
@@ -534,7 +554,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(false);
         }
         if self.by_block.contains_key(&block) {
-            self.released(device, block, false, Box::new(|| {}))?;
+            self.released(device, block, false, None, Box::new(|| {}))?;
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
         let made = if length <= room {
@@ -962,18 +982,20 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// `SURFACE_DOWNLOAD` of the block at `block`: the pages written from its cache, after every
-    /// command buffer that used it, where one that may write it was committed since its last copy
-    /// and no device of the host wrote the pages since its last fill; `done` once the pages hold
-    /// it, at once where nothing is to copy.
+    /// command buffer that used it, where one that may write it was committed since its last copy,
+    /// no device of the host wrote the pages since its last fill, and the CPU's generation `cpu`
+    /// of the surface, as the copy is made, is not past the cache's ([`Self::behind_the_cpu`]);
+    /// `done` once the pages hold it, at once where nothing is to copy.
     pub(crate) fn download(
         &mut self,
         device: &P::Device,
         block: u64,
+        cpu: Option<u64>,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<()> {
         let written = self.written_since_host(block);
-        if !written {
-            if self.by_block.contains_key(&block) {
+        if !written || self.behind_the_cpu(block, cpu, "SURFACE_DOWNLOAD") {
+            if !written && self.by_block.contains_key(&block) {
                 self.counts.clean += 1;
             }
             done();
@@ -990,8 +1012,10 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The block at `block` went (its `BLOCK_RELEASE`): its cache goes once the pages hold what a
-    /// buffer wrote of it, unless a device of the host wrote them since its last fill; `done`
-    /// then, at once where nothing is to copy. A release whose surface had no client left
+    /// buffer wrote of it, unless a device of the host wrote them since its last fill, or the
+    /// CPU's generation `cpu` of the surface, as the copy is made, is past the cache's
+    /// ([`Self::behind_the_cpu`]); `done` then, at once where nothing is to copy. A release whose
+    /// surface had no client left
     /// (`unread`, `RGFX_BLOCK_RELEASE_NO_CLIENT`) copies too: a surface with no client can still
     /// be looked up again, from a mach port or an XPC object that holds it (how one process hands
     /// a surface it drew to another), and the process that looks it up then reads the pages. The
@@ -1001,9 +1025,10 @@ impl<P: Platform> SurfaceCaches<P> {
         device: &P::Device,
         block: u64,
         unread: bool,
+        cpu: Option<u64>,
         done: Box<dyn FnOnce() + Send>,
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
-        if !self.written_since_host(block) {
+        if !self.written_since_host(block) || self.behind_the_cpu(block, cpu, "BLOCK_RELEASE") {
             done();
         } else {
             if unread {
@@ -1034,6 +1059,32 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.host_writes += 1;
         }
         cache.written
+    }
+
+    /// Whether the CPU's generation `cpu` of the surface whose block is at `block`, read from the
+    /// block's header as a copy out of its cache is made (`message`'s), is past the cache's: then
+    /// a read-write lock moved it that this copy never ordered (it gave up waiting for the copy's
+    /// answer, the kext's `kDownloadAnswerMs`, or for the block's release, and went on), and the
+    /// pages hold the CPU's writes under that lock, which the copy would land over. They are
+    /// newer than what the cache holds, as for a fill ([`Self::needs_fill`]), so nothing is
+    /// copied: the next use fills the cache from them. Counted and logged; false where the block
+    /// has no cache or its header was not read.
+    fn behind_the_cpu(&mut self, block: u64, cpu: Option<u64>, message: &str) -> bool {
+        let (Some(cache), Some(cpu)) = (self.by_block.get(&block), cpu) else {
+            return false;
+        };
+        let held = cache.generation.unwrap_or(0);
+        if held >= cpu {
+            return false;
+        }
+        self.counts.behind += 1;
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "the IOSurface block at {block:#x}: a {message} of its device cache, of CPU \
+             generation {held}, copies nothing: the CPU's generation moved to {cpu} under a lock \
+             that did not wait for the copy"
+        );
+        true
     }
 
     /// Copies the cache of the block at `block` into the surface's pages on the transfer queue,
@@ -1462,6 +1513,7 @@ impl<P: Platform> Caches<P> {
         &self,
         device: &P::Device,
         block: u64,
+        region: Arc<Region>,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
@@ -1469,7 +1521,8 @@ impl<P: Platform> Caches<P> {
         self.after_writers(
             block,
             Box::new(move |state| {
-                if let Err(raise) = refusing(|| state.download(&device, block, done)) {
+                let cpu = cpu_generation(&region, block);
+                if let Err(raise) = refusing(|| state.download(&device, block, cpu, done)) {
                     failed(raise);
                 }
             }),
@@ -1482,11 +1535,13 @@ impl<P: Platform> Caches<P> {
     /// platform raised at the copy, and the cache handed to `let_go`, which lets go of it on a
     /// thread of its own, with no lock of the caches' held. Nothing names the block until it is
     /// answered: the kext gives it out again only then.
+    #[allow(clippy::too_many_arguments)] // the release, its answers, and what the copy reads
     pub(crate) fn release(
         &self,
         device: &P::Device,
         block: u64,
         unread: bool,
+        region: Arc<Region>,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
         let_go: Box<dyn FnOnce(SurfaceCache<P>) + Send>,
@@ -1495,7 +1550,8 @@ impl<P: Platform> Caches<P> {
         self.after_writers(
             block,
             Box::new(move |state| {
-                match refusing(|| state.released(&device, block, unread, done)) {
+                let cpu = cpu_generation(&region, block);
+                match refusing(|| state.released(&device, block, unread, cpu, done)) {
                     Ok(Some(cache)) => let_go(cache),
                     Ok(None) => {}
                     Err(raise) => failed(raise),
@@ -1530,7 +1586,7 @@ impl<P: Platform> Caches<P> {
     ) -> RaiseResult<Option<SurfaceCache<P>>> {
         let mut state = self.state.lock();
         self.wait_users(&mut state, block, true);
-        state.released(device, block, unread, done)
+        state.released(device, block, unread, None, done)
     }
 
     /// A cache for the block at `block` ([`SurfaceCaches::make`]), after every command buffer
@@ -2458,6 +2514,123 @@ mod tests {
             [(cache, pages)],
             "still written"
         );
+    }
+
+    /// A copy out of a cache that waited for a writer begun before it is not made where the CPU's
+    /// generation moved past the cache's meanwhile: the kext's read-write lock gave up waiting for
+    /// its answer (2 s), moved the generation and let the CPU write the pages, which the copy
+    /// would land over. The download and the release made at the writer's finish copy nothing,
+    /// and are answered; the next use of the newer generation fills the cache from the pages. One
+    /// whose generation did not move copies, as before
+    #[test]
+    fn a_copy_out_after_the_cpu_s_generation_moved_copies_nothing() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        let at = BLOCK + CPU_GEN_OFFSET;
+        let set_gen = |r: &Rig, generation: u64| {
+            assert!(r.dec.region.write(at, &generation.to_le_bytes()));
+        };
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        // A writer of generation 0, begun and not finished (its walk held up, past the kext's
+        // wait for the download's answer).
+        let begin_writer = |r: &Rig| {
+            let queue = r.device.new_command_queue().unwrap();
+            let writer = queue.command_buffer(ON).unwrap().unwrap();
+            let writes = [RgfxOpSurfaceUse {
+                flags: RGFX_SURFACE_USE_WRITES,
+                ..reading(BLOCK, 0)[0]
+            }];
+            let (used, _, uses) = (r.dec.surface_caches)
+                .before(&r.device, &writer, &writes)
+                .unwrap();
+            (writer, used, uses.unwrap())
+        };
+        let (writer, used, uses) = begin_writer(&r);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        // The lock gives up, moves the generation, and the CPU writes the pages; then the writer
+        // finishes.
+        set_gen(&r, 1);
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, &writer, uses, &used, || writer.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst), "answered");
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "the download copied over the CPU's writes"
+        );
+        assert_eq!(r.dec.caches().counts().behind, 1);
+        // The next use, of generation 1, fills the cache from the pages.
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, true)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].1, cache, "into the cache");
+        r.p.world().complete_all(CompleteOn::Caller);
+        // A release behind a writer, the generation moved meanwhile: nothing is copied.
+        let (writer, used, uses) = begin_writer(&r);
+        let mark = r.p.call_log().mark();
+        let released = release(&r, BLOCK);
+        set_gen(&r, 2);
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, &writer, uses, &used, || writer.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(released.load(Ordering::SeqCst), "answered");
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "the release copied over the CPU's writes"
+        );
+        assert_eq!(r.dec.caches().counts().behind, 2);
+        assert_eq!(r.dec.caches().len(), 0, "the cache went");
+    }
+
+    /// The control of [`a_copy_out_after_the_cpu_s_generation_moved_copies_nothing`]: a download
+    /// behind a writer, the CPU's generation in the block's header still the cache's, copies the
+    /// cache into the pages at the writer's finish
+    #[test]
+    fn a_copy_out_of_the_cache_s_generation_copies() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        assert!(
+            r.dec
+                .region
+                .write(BLOCK + CPU_GEN_OFFSET, &1u64.to_le_bytes())
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let writer = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 1)[0]
+        }];
+        let (used, _, uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &writes)
+            .unwrap();
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, &writer, uses.unwrap(), &used, || {
+                writer.commit(ON)
+            })
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        let copied = copies(&r.p.call_log().since(mark));
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].0, cache, "out of the cache");
+        assert_eq!(r.dec.caches().counts().behind, 0);
+    }
+
+    /// The CPU generation's place in a cached block's header is the kext's
+    #[test]
+    fn the_cpu_generation_s_offset_is_the_kext_s() {
+        let abi = include_str!("../../../../../guest/kext/src/RgfxUserClientABI.hpp");
+        let line = format!("kRgfxSurfaceCpuGenOffset = {CPU_GEN_OFFSET},");
+        assert!(abi.contains(&line), "the kext's header has no `{line}`");
     }
 
     /// A use of a block with no cache does nothing

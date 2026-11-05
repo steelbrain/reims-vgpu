@@ -327,6 +327,13 @@ impl Region {
         true
     }
 
+    /// The `u64` the guest keeps at `offset`, read atomically (`Acquire`), as the guest writes it;
+    /// `None` where it is not 8-aligned and inside the region.
+    pub fn load_u64(&self, offset: u64) -> Option<u64> {
+        (offset.is_multiple_of(8) && self.contains(offset, 8))
+            .then(|| self.atomic_u64(offset).load(Ordering::Acquire))
+    }
+
     /// The `u64` at `offset`, which is 8-aligned and inside the region, as an atomic.
     pub(crate) fn atomic_u64(&self, offset: u64) -> &AtomicU64 {
         assert!(

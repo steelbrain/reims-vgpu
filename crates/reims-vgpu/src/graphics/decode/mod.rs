@@ -1035,11 +1035,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                     "IOSurface device caches: {} made; {} fills of {} MiB, {} downloads of {} MiB, \
                      {} asked of a cache nothing wrote; {} fills or downloads the host's devices' \
                      writes changed; {} written caches copied at a release with no client \
-                     left; {} deferred, {} refused, {} named their pages ({} copied), {} \
-                     released unnamed",
+                     left; {} copies out not made, the CPU's generation past the cache's; {} \
+                     deferred, {} refused, {} named their pages ({} copied), {} released \
+                     unnamed",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
-                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.deferred,
-                    d.deferred_refused, d.attached, d.attached_copied, d.unattached
+                    d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.behind,
+                    d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached
                 );
             }
         }
@@ -1312,7 +1313,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
         self.settle_surface(block);
-        self.surface_caches.download(device, block, done, failed);
+        let region = Arc::clone(&self.shared.region);
+        (self.surface_caches).download(device, block, region, done, failed);
     }
 
     /// The block at `offset` was released: its surface view, if any, goes once the buffers over
@@ -1337,7 +1339,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
-        (self.surface_caches).release(device, offset, unread, done, failed, let_go);
+        let region = Arc::clone(&self.shared.region);
+        (self.surface_caches).release(device, offset, unread, region, done, failed, let_go);
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
