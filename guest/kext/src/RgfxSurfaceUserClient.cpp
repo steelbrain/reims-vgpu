@@ -31,15 +31,23 @@ bool readRegion(const IOExternalMethodArguments *a, IOAccelBounds *bounds)
 	return bounds->w > 0 && bounds->h > 0;
 }
 
-// A lock's answer, into the method's structure output.
+// A lock's answer, into the method's structure output: inline, or through its descriptor, which
+// is over the caller's memory, not wired, so prepared for the write and completed after it.
 IOReturn writeLockInfo(IOExternalMethodArguments *a, const IOAccelSurfaceInformation &info)
 {
-	if (a->structureOutput)
+	if (a->structureOutput) {
 		memcpy(a->structureOutput, &info, sizeof(info));
-	else if (a->structureOutputDescriptor)
-		a->structureOutputDescriptor->writeBytes(0, &info, sizeof(info));
-	else
+	} else if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {
+		IOReturn r = desc->prepare(kIODirectionIn);
+		if (r != kIOReturnSuccess)
+			return r;
+		const bool written = desc->writeBytes(0, &info, sizeof(info)) == sizeof(info);
+		desc->complete(kIODirectionIn);
+		if (!written)
+			return kIOReturnBadArgument;
+	} else {
 		return kIOReturnBadArgument;
+	}
 	a->structureOutputSize = sizeof(info);
 	return kIOReturnSuccess;
 }

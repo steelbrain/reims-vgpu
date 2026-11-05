@@ -155,15 +155,22 @@ IOReturn RgfxAcceleratorUserClient::doorbellMethod(OSObject *target, void *,
 // (kRgfxIOGPUDeviceUserClientType), and the two calls it makes there: RgfxIOGPUReplies.hpp.
 
 // Copy a reply into the method's struct-output, whether IOKit provided an inline buffer or an
-// output memory descriptor, and report the exact length written.
+// output memory descriptor, and report the exact length written. The descriptor is over the
+// caller's memory, not wired: it is prepared for the write and completed after it.
 static IOReturn rgfxWriteStructOut(IOExternalMethodArguments *a, const void *buf, uint32_t len)
 {
 	if (a->structureOutputSize < len)
 		return kIOReturnBadArgument;
 	if (a->structureOutput) {
 		memcpy(a->structureOutput, buf, len);
-	} else if (a->structureOutputDescriptor) {
-		a->structureOutputDescriptor->writeBytes(0, buf, len);
+	} else if (IOMemoryDescriptor *desc = a->structureOutputDescriptor) {
+		IOReturn r = desc->prepare(kIODirectionIn);
+		if (r != kIOReturnSuccess)
+			return r;
+		const bool written = desc->writeBytes(0, buf, len) == len;
+		desc->complete(kIODirectionIn);
+		if (!written)
+			return kIOReturnBadArgument;
 	} else {
 		return kIOReturnBadArgument;
 	}

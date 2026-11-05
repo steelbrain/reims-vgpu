@@ -81,15 +81,18 @@ inline UInt64 rd64(const UInt8 *p, UInt32 off)
 }
 
 // The structure input of `a`, at least `size` bytes, inline or through its descriptor (copied
-// into `buf`); nullptr where it is shorter.
+// into `buf`); nullptr where it is shorter, or its memory cannot be wired. The descriptor is over
+// the caller's memory, not wired: it is prepared for the read and completed after it.
 const UInt8 *structIn(IOExternalMethodArguments *a, UInt8 *buf, UInt32 size)
 {
 	if (a->structureInput && a->structureInputSize >= size)
 		return static_cast<const UInt8 *>(a->structureInput);
-	if (a->structureInputDescriptor && a->structureInputDescriptor->getLength() >= size &&
-	    a->structureInputDescriptor->readBytes(0, buf, size) == size)
-		return buf;
-	return nullptr;
+	IOMemoryDescriptor *desc = a->structureInputDescriptor;
+	if (!desc || desc->getLength() < size || desc->prepare(kIODirectionOut) != kIOReturnSuccess)
+		return nullptr;
+	const bool read = desc->readBytes(0, buf, size) == size;
+	desc->complete(kIODirectionOut);
+	return read ? buf : nullptr;
 }
 
 } // namespace
