@@ -1121,6 +1121,27 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.turn.borrow().as_ref().is_none_or(Turn::is_next)
     }
 
+    /// Whether the command buffer, begun, would be committed at once, waiting for nothing
+    /// ([`Self::wait_to_commit`]): its turn is next, and no buffer answered before its begin, no
+    /// range message of its context before it, and no buffer its `COMMIT_ORDER` names is still
+    /// to be committed. Waits for nothing: a lock found busy answers false.
+    pub(crate) fn commits_at_once(&self) -> bool {
+        let named = (self.commit_after.borrow().iter())
+            .all(|(marks, seqno)| marks.commit.reached(*seqno, Until::Committed));
+        if !self.turn_is_next() || !named {
+            return false;
+        }
+        let sequencer = &self.shared.sequencer;
+        let tickets = (self.mark.get()).is_none_or(|mark| sequencer.reached(mark));
+        let ranges = match (self.context, self.ranges.get()) {
+            (Some(context), Some(Some(asked))) => {
+                sequencer.ranges_done(context, asked) == Some(true)
+            }
+            _ => true,
+        };
+        tickets && ranges
+    }
+
     /// The lane of the command buffer's queue, where it was given a turn there.
     pub(crate) fn lane(&self) -> Option<Arc<Lane>> {
         self.turn

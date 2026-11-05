@@ -2277,7 +2277,11 @@ commit. Each outcome the new design allows is one of those two:
     that holds one is walked only in its turn, and one whose turn is next at
     its begin is walked and committed on the service thread itself, where it
     waits for no buffer of its queue, rather than handed to a lane thread that
-    would first be woken or made for it;
+    would first be woken or made for it (so is a short buffer, its message of
+    2 KiB at most, whose commit would wait for nothing at its begin: its turn
+    next, and no buffer it is committed after still to commit;
+    on the lane, each buffer of a drain paid a thread's wake for its walk and
+    another for the turn its commit waited on);
   - its signal of its queue's surface timeline ("Surface order"), and the
     release that stands in for one of a buffer that does not run: each is
     decided in the buffer's turn, after its walk, since the order reads a

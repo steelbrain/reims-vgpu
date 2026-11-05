@@ -2358,8 +2358,11 @@ struct WalkGate {
 }
 
 impl WalkGate {
-    /// The gate, set on `device`'s decoder: the first walk to reach it stops there.
+    /// The gate, set on `device`'s decoder: the first walk to reach it stops there. A walk held
+    /// at it stands for a long one, so every buffer goes to its queue's lane, as a long one does
+    /// (`GraphicsControl::carry_out`).
     fn on(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
+        device.control.inline_walk_max.store(0, Ordering::Relaxed);
         let state = Arc::new((
             reims_vgpu_core::sync::Mutex::new((false, false, false)),
             reims_vgpu_core::sync::Condvar::new(),
@@ -3313,6 +3316,116 @@ fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
             "a lone video buffer walked on {name:?}"
         );
     }
+}
+
+/// The names of the threads that walk command buffers on `device`, one a walk, in the order
+/// their walks began.
+fn walk_threads(
+    device: &GraphicsDevice<FakePlatform>,
+) -> Arc<reims_vgpu_core::sync::Mutex<Vec<String>>> {
+    let threads = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&threads);
+    device
+        .control
+        .decoder()
+        .set_walk_hook(Some(Arc::new(move |index: usize| {
+            if index == 0 {
+                let name = std::thread::current().name().map(str::to_owned);
+                seen.lock().push(name.unwrap_or_default());
+            }
+        })));
+    threads
+}
+
+/// A short command buffer whose commit would wait for nothing is walked and committed on its
+/// queue's service thread, not handed to a lane thread that would first be woken: here 8 sent
+/// back to back, as a guest's drain. A long one goes to its queue's lane, so the queue's next
+/// buffers are taken beside its walk, and so does a short one whose commit would wait: here
+/// behind its process's buffer on another queue answered its `CB_SUBMITTED` and still walked
+#[test]
+fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread() {
+    use reims_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let threads = walk_threads(&device);
+    for cb in 100..108 {
+        ring.send(&device, sampler_command_buffer(obj(1, 1), cb, obj(1, 4)));
+    }
+    for cb in 100..108 {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+    // A long one: past the bound of ops, empty blit passes.
+    let passes: Vec<(u16, &[u8])> = (0..200)
+        .flat_map(|_| {
+            [
+                (RGFX_OP_ENCODER_BEGIN_BLIT, &[][..]),
+                (RGFX_OP_ENCODER_END, &[][..]),
+            ]
+        })
+        .collect();
+    let long = command_buffer_of(obj(1, 1), 108, &passes);
+    assert!(long.len() > super::INLINE_WALK_MAX);
+    ring.send(&device, long);
+    assert!(complete_until_event(&platform, &mut ring), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (108, RGFX_CB_OK));
+    let walked = threads.lock().clone();
+    assert_eq!(walked.len(), 9, "walks seen: {walked:?}");
+    for name in &walked[..8] {
+        assert!(
+            name.starts_with("reims-vgpu.graphics-queue-"),
+            "a short buffer walked on {name:?}"
+        );
+    }
+    assert!(
+        walked[8].starts_with("reims-vgpu.graphics-lane-"),
+        "a long buffer walked on {:?}",
+        walked[8]
+    );
+
+    // A short one behind its process's answered buffer still walked on another queue.
+    let (device, platform, _guest, [mut held, mut beside, _]) = two_processes(&raised);
+    let draw = hold_next_draw(&platform);
+    held.send(
+        &device,
+        with_ask(render_command_buffer(
+            obj(1, 1),
+            100,
+            obj(1, 11),
+            obj(1, 20),
+        )),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+    assert_eq!(
+        ring_events(&platform, &mut held, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
+    );
+    let threads = walk_threads(&device);
+    beside.send(&device, sampler_command_buffer(obj(1, 2), 300, obj(1, 4)));
+    for _ in 0..3000 {
+        if !threads.lock().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_COMPLETE, 300, u64::from(RGFX_CB_OK))]
+    );
+    let walked = threads.lock().clone();
+    assert_eq!(walked.len(), 1, "walks seen: {walked:?}");
+    assert!(
+        walked[0].starts_with("reims-vgpu.graphics-lane-"),
+        "a buffer whose commit waits walked on {:?}",
+        walked[0]
+    );
 }
 
 /// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of

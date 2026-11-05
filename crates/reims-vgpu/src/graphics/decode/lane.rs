@@ -6,8 +6,9 @@
 //!   in the order the guest published them, and hands the rest of its work to the lane
 //!   ([`Lane::run`]): its walk, its commit, its stand-in or the failure posted for it. The lane's
 //!   threads take the jobs in the order they came. A buffer walked in its turn (one that holds a
-//!   video encoder) whose turn is next ([`Turn::is_next`]) is carried out on the service thread
-//!   instead, as it waits there for nothing (`graphics.rs`'s `carry_out`).
+//!   video encoder) whose turn is next ([`Turn::is_next`]), and a short buffer whose commit would
+//!   wait for nothing, are carried out on the service thread instead, as each waits there for
+//!   nothing (`graphics.rs`'s `carry_out`).
 //! - **Threads.** A lane with work has one thread of its own, made as a job comes and none is
 //!   running, which goes once it has had no job for [`IDLE`]. A job that comes while every thread
 //!   of the lane is busy may get the lane another, up to [`LANE_THREADS`] in all, where the

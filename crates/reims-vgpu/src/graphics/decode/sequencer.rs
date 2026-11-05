@@ -161,6 +161,20 @@ impl Sequencer {
         }
     }
 
+    /// Whether a command buffer marked at `mark` would be committed now, waiting for no ticket
+    /// ([`Self::wait_for`]). Waits for nothing.
+    pub(crate) fn reached(&self, mark: u64) -> bool {
+        self.done_through.load(Ordering::Acquire) >= mark
+    }
+
+    /// Whether `asked` range messages of `context` are carried out, so a command buffer begun
+    /// after them waits for none ([`Self::wait_for_ranges`]); `None` where the order is busy.
+    /// Waits for nothing.
+    pub(crate) fn ranges_done(&self, context: u32, asked: u64) -> Option<bool> {
+        let open = self.open.try_lock()?;
+        Some(open.ranges.get(&context).is_none_or(|r| r.done >= asked))
+    }
+
     /// Carries out `op`, a range message of `context`'s, once every ticket of `context` issued
     /// before now is given back, after the context's range messages before it: here where none
     /// is out, else where the last of them is given back, on that thread, waiting for nothing

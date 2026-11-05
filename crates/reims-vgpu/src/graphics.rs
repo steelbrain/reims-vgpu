@@ -26,7 +26,7 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::lock_api::ArcRwLockReadGuard;
@@ -332,6 +332,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 icbs: Arc::default(),
                 pages_buffers: Arc::default(),
                 reset_gate: Arc::default(),
+                inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
             });
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
@@ -489,7 +490,19 @@ struct GraphicsControl<P: ApiPlatform> {
     /// own messages are carried out in order with the reset: the device tells the host of it, on
     /// its control thread, once every message a lane began before it has returned.
     reset_gate: Arc<RwLock<()>>,
+    /// The longest `COMMAND_BUFFER` message, in bytes, carried out on its queue's service thread
+    /// where it would wait for nothing ([`Self::carry_out`]): [`INLINE_WALK_MAX`]; the tests that
+    /// hold a walk to stand for a long one set it to 0, as a long buffer goes to its lane.
+    inline_walk_max: AtomicUsize,
 }
+
+/// The longest `COMMAND_BUFFER` message, in bytes, that is walked and committed on its queue's
+/// service thread where its commit would wait for nothing ([`GraphicsControl::carry_out`]): a
+/// few dozen ops, whose walk takes about what a lane thread's wake does (about 2 us an op on the
+/// Vulkan platform on an RTX 5080 laptop host, against 80 to 90 us a wake there), so a longer
+/// buffer, a compositor's frame, goes to its lane and the queue's next buffers are taken beside
+/// its walk.
+const INLINE_WALK_MAX: usize = 2048;
 
 /// The display's hold of the region block a surface's texture lies over, as a compositor holds
 /// the IOSurface it shows: made as the present is taken ([`Presented::hold`]), and held by the
@@ -1216,6 +1229,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// next buffer is begun once it is committed; on the video driver's
     /// queues, a session's own each, that one holds a video encoder too and would have waited for
     /// this one's turn before its walk anyway.
+    ///
+    /// So is a short buffer, its message of [`INLINE_WALK_MAX`] bytes at most, whose commit would
+    /// wait for nothing ([`GraphicsDecoder::commits_at_once`]): its turn is next, and no buffer it
+    /// is committed after is still to be committed. Its walk takes about what the
+    /// lane thread's wake would, and its commit then follows at once, where on the lane each
+    /// buffer of a drain (a guest's buffers committed back to back and waited for) paid a wake
+    /// for its walk and another for the turn its commit waited on. The queue's next buffer is
+    /// begun once it is committed, a walk of a few dozen ops later; a buffer the guest asked
+    /// `CB_SUBMITTED` of meanwhile is answered on its doorbell's thread where it waits for
+    /// nothing, as before.
     fn carry_out(
         self: &Arc<Self>,
         decoder: GraphicsDecoder<P>,
@@ -1225,7 +1248,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         message: Vec<u8>,
     ) {
         let lane = decoder.lane();
-        let here = matches!(&begun, Ok(Ok(b)) if b.ordered()) && decoder.turn_is_next();
+        let here = match &begun {
+            Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
+            Ok(Ok(_)) => {
+                message.len() <= self.inline_walk_max.load(Ordering::Relaxed)
+                    && decoder.commits_at_once()
+            }
+            _ => false,
+        };
         let control = Arc::clone(self);
         let job = move || {
             entry::run(|_| {
