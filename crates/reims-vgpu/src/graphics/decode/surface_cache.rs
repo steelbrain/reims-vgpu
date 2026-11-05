@@ -3357,6 +3357,7 @@ mod tests {
         assert_eq!(r.dec.caches().unattached(BLOCK), Some(length));
         // The platform makes no buffer over the pages' view (`buffer_over`).
         r.p.script().push("newBufferWithDescriptor:", Step::Nil);
+        let attached = r.p.call_log().mark();
         assert_eq!(
             attach(&mut r, BLOCK, 0, &[(1, 2)], length),
             RGFX_STATUS_OK,
@@ -3365,6 +3366,13 @@ mod tests {
         assert_eq!(r.dec.caches().unattached(BLOCK), None);
         assert_eq!(r.dec.caches().counts().attached_copied, 1);
         assert_eq!(cache_id(&r), cache, "the same cache");
+        // The view no buffer was made over goes, and its mapping with it on the surface worker
+        // (`SurfaceView`'s drop): done before the next mark, which it would land after.
+        r.dec.surface_worker().flush();
+        assert!(
+            r.p.call_log().sels_since(attached).contains(&"mach_vm_deallocate"),
+            "the view's mapping is let go of"
+        );
         let mark = r.p.call_log().mark();
         assert_eq!(r.buffer(0x300, BLOCK, length), Ok(()));
         assert!(
