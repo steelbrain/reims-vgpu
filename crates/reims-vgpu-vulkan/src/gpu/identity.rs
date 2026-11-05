@@ -15,6 +15,9 @@
 //! - **the device's Vulkan memory heaps**, for `recommendedMaxWorkingSetSize`, which the runtime
 //!   does not answer: the sum of the device-local heaps, the memory the GPU reaches at its own
 //!   speed, as Metal answers on a Mac of a discrete GPU from its VRAM;
+//! - **the device's Vulkan limits**, for `maxArgumentBufferSamplerCount`, which the runtime does
+//!   not answer: the most sampler states an argument buffer can name at once
+//!   ([`argument_buffer_sampler_count`]);
 //! - **Metal's documented relations**:
 //!   - a family the platform claims claims the families it contains (`implied`): each Apple
 //!     family every Apple family before it, Apple1 Common1, Apple3 Common2, Apple5 Common3, and
@@ -31,7 +34,8 @@
 //! `locationNumber`, `maxTransferRate`, the peer group, `maxArgumentBufferSamplerCount`,
 //! `maximumConcurrentCompilationTaskCount`, `architecture.name`, `supportsPrimitiveMotionBlur`,
 //! `supportsPlacementSparse`, `supportsCounterSampling:` and `recommendedMaxWorkingSetSize`: each
-//! is `None` here (the working set the heaps' sum), and a query of the runtime's to come.
+//! is `None` here (the working set the heaps' sum, the sampler count the limits'), and a query of
+//! the runtime's to come.
 //! `supports32BitMSAA` and `supportsPullModelInterpolation` are the runtime's answers; a gap in the
 //! latter is `None`.
 
@@ -249,6 +253,34 @@ pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
         .fold(0u64, |sum, (_, budget)| sum.saturating_add(budget))
 }
 
+/// `maxArgumentBufferSamplerCount` of `device`: how many sampler states an argument buffer can
+/// name at once. The runtime puts every live sampler state in the element of a set-1 sampler
+/// array its resource ID gives, which an argument buffer's sampler reads; it sizes that array by
+/// the least of the profile's `maxDescriptorSetUpdateAfterBindSamplers` and
+/// `maxPerStageDescriptorUpdateAfterBindSamplers`, and a state past it reads the neutral sampler
+/// (metal2vulkan's `sampler.rs`, `Degradation::UnlistedArgumentSampler`). It refuses a sampler
+/// state past `maxSamplerAllocationCount` live ones (`SamplerCount`). So the answer is the least
+/// of the three, the host GPU's own count, where Metal answers 500000 on an M3 Max and 2048 on an
+/// AMD Radeon Pro 5300M and an Intel UHD Graphics 630 (macOS 26.7.1; docs/graphics-kext/
+/// dgpu-oracle.md, Q9).
+fn argument_buffer_sampler_count(device: &rt::Device) -> u64 {
+    let limits = device.compile_device().profile().limits();
+    // SAFETY: the instance and physical device are the runtime's, read only, while `device`
+    // lives.
+    let allocations = unsafe {
+        let raw = device.raw();
+        raw.instance
+            .get_physical_device_properties(raw.physical_device)
+            .limits
+            .max_sampler_allocation_count
+    };
+    let least = limits
+        .max_descriptor_set_update_after_bind_samplers
+        .min(limits.max_per_stage_descriptor_update_after_bind_samplers)
+        .min(allocations);
+    u64::from(least)
+}
+
 /// `architecture.name` of a device of PCI vendor `vendor` and device `device` whose driver
 /// keys its compiled pipelines by `pipeline_cache`: `vulkan_VVVV_DDDD_` and the key in hex.
 ///
@@ -335,6 +367,7 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
         sizes: IdentitySizes {
             recommended_max_working_set_size: Some(device_local_bytes(device)),
             max_buffer_length: Some(props.max_buffer_length),
+            max_argument_buffer_sampler_count: Some(argument_buffer_sampler_count(device)),
             argument_buffers_support: Some(u64::from(props.argument_buffers_support.as_raw())),
             read_write_texture_support: Some(u64::from(props.read_write_texture_support.as_raw())),
             sparse_tile_size_in_bytes: Some(device.sparse_tile_size_in_bytes()),
@@ -482,6 +515,30 @@ mod tests {
                 .is_some_and(|bytes| bytes > 0)
         );
         assert_eq!(identity.flags.is_low_power, None);
+        // The sampler states an argument buffer names: the least of the limits that bound the
+        // runtime's sampler array and its live samplers, so never none.
+        let limits = d.raw.compile_device().profile().limits();
+        // SAFETY: the instance and physical device are the runtime's, read only, while `d` lives.
+        let allocations = unsafe {
+            let raw = d.raw.raw();
+            raw.instance
+                .get_physical_device_properties(raw.physical_device)
+                .limits
+                .max_sampler_allocation_count
+        };
+        let samplers = identity.sizes.max_argument_buffer_sampler_count.unwrap();
+        assert!(samplers > 0);
+        assert!(samplers <= u64::from(allocations));
+        assert!(samplers <= u64::from(limits.max_descriptor_set_update_after_bind_samplers));
+        assert!(samplers <= u64::from(limits.max_per_stage_descriptor_update_after_bind_samplers));
+        assert!(
+            [
+                allocations,
+                limits.max_descriptor_set_update_after_bind_samplers,
+                limits.max_per_stage_descriptor_update_after_bind_samplers,
+            ]
+            .contains(&u32::try_from(samplers).unwrap())
+        );
         // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB,
         // as Metal answers on the M3 Max; a format Metal asserts on (BC1_RGBA, 130) has none.
         let bgra8 = identity.formats.iter().find(|f| f.format == 80).unwrap();
