@@ -8,6 +8,7 @@
 #import "RgfxUnsupported.h"
 
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "RgfxRegion.hpp"
@@ -82,7 +83,58 @@ uint64_t resourceId(MTLResourceID id)
 	return id._impl;
 }
 
+/// The functions the device's reflections of buffer bindings were noted for, by binding, each
+/// held while its binding lives.
+std::mutex g_bindingsLock;
+NSMapTable<id, RgfxFunction *> *g_bindings;
+
+RgfxFunction *notedFunction(id binding)
+{
+	std::lock_guard<std::mutex> hold(g_bindingsLock);
+	return g_bindings != nil ? [g_bindings objectForKey:binding] : nil;
+}
+
 } // namespace
+
+void RgfxNoteArgumentBinding(id<MTLBinding> binding, RgfxFunction *function)
+{
+	if (binding == nil || function == nil)
+		return;
+	std::lock_guard<std::mutex> hold(g_bindingsLock);
+	if (g_bindings == nil)
+		g_bindings = [NSMapTable weakToStrongObjectsMapTable];
+	[g_bindings setObject:function forKey:binding];
+}
+
+NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type)
+{
+	NSMutableArray<MTLArgumentDescriptor *> *out = [NSMutableArray array];
+	for (MTLStructMember *m in type.members) {
+		MTLArgumentDescriptor *d = [MTLArgumentDescriptor argumentDescriptor];
+		d.index = m.argumentIndex;
+		MTLDataType t = m.dataType;
+		MTLTextureReferenceType *texture = m.textureReferenceType;
+		MTLPointerType *pointer = m.pointerType;
+		if (t == MTLDataTypeArray) {
+			MTLArrayType *a = m.arrayType;
+			d.arrayLength = a.arrayLength;
+			t = a.elementType;
+			texture = a.elementTextureReferenceType;
+			pointer = a.elementPointerType;
+		}
+		if (t == MTLDataTypeStruct || t == MTLDataTypeArray)
+			return nil;
+		d.dataType = t;
+		if (t == MTLDataTypeTexture && texture != nil) {
+			d.textureType = texture.textureType;
+			d.access = texture.access;
+		} else if (t == MTLDataTypePointer && pointer != nil) {
+			d.access = pointer.access;
+		}
+		[out addObject:d];
+	}
+	return out;
+}
 
 @implementation RgfxArgumentEncoder {
 	std::shared_ptr<const RgfxArgLayout> _layout;
@@ -161,6 +213,31 @@ uint64_t resourceId(MTLResourceID id)
 		return nil;
 	}
 	return [[self alloc] initWithLayout:layout device:device serializer:serializer];
+}
+
++ (instancetype)encoderOfBinding:(id<MTLBufferBinding>)binding
+                          region:(RgfxRegion *)region
+                          device:(id<MTLDevice>)device
+                      serializer:(RgfxSerializer *)serializer
+{
+	if (binding == nil || binding.type != MTLBindingTypeBuffer ||
+	    ![(id)binding conformsToProtocol:@protocol(MTLBufferBinding)] ||
+	    binding.bufferDataType != MTLDataTypeStruct || !binding.bufferPointerType.elementIsArgumentBuffer)
+		return nil; // no argument buffer: the AMD 5300M answers nil (oracle_bundle argbuf.binding.plain)
+	if (RgfxFunction *function = notedFunction(binding))
+		return [self encoderOfFunction:function
+		                   bufferIndex:binding.index
+		                        region:region
+		                        device:device
+		                    serializer:serializer];
+	NSArray<MTLArgumentDescriptor *> *arguments = RgfxDescriptorsOfArguments(binding.bufferStructType);
+	if (arguments == nil) {
+		NSLog(@"RGFX: newArgumentEncoderWithBufferBinding: %@: no encoder: a member is a struct, "
+		      @"which no argument descriptor names",
+		      binding.name);
+		return nil;
+	}
+	return [self encoderOfArguments:arguments region:region device:device serializer:serializer];
 }
 
 - (std::shared_ptr<const RgfxArgLayout>)rgfxLayout

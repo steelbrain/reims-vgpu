@@ -6,6 +6,7 @@
  */
 
 #import "RgfxLibrary.h"
+#import "RgfxArgumentEncoder.h"
 #import "RgfxBlockCall.h"
 #import "RgfxUnsupported.h"
 
@@ -1042,12 +1043,25 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 
 // A function's reflection: the shadow's, Metal's own of the same function, where the library
 // keeps its source (Core Image reflects its kernels so; measured: macOS 26.6.1). With no shadow it
-// would need the host's per-argument bindings, which no reply carries.
+// would need the host's per-argument bindings, which no reply carries. Its buffer bindings are
+// noted as the function's (RgfxNoteArgumentBinding), so an encoder of one is the function's.
 - (MTLFunctionReflection *)reflectionForFunctionWithName:(NSString *)functionName
 {
 	id<MTLLibrary> shadow = [self rgfxShadow];
-	if ([shadow respondsToSelector:@selector(reflectionForFunctionWithName:)])
-		return [shadow reflectionForFunctionWithName:functionName];
+	if ([shadow respondsToSelector:@selector(reflectionForFunctionWithName:)]) {
+		MTLFunctionReflection *reflection = [shadow reflectionForFunctionWithName:functionName];
+		id<MTLFunction> function = nil;
+		for (id<MTLBinding> binding in reflection.bindings) {
+			if (binding.type != MTLBindingTypeBuffer)
+				continue;
+			if (function == nil)
+				function = [self newFunctionWithName:functionName];
+			if (![(id)function isKindOfClass:[RgfxFunction class]])
+				break;
+			RgfxNoteArgumentBinding(binding, (RgfxFunction *)function);
+		}
+		return reflection;
+	}
 	RGFX_UNSUPPORTED("function reflection (the host sends no argument bindings)");
 	return nil;
 }

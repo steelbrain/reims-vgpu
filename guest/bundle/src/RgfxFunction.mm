@@ -451,15 +451,37 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	                                   serializer:[self serializer]];
 }
 
-// The argument's reflection is not on the wire: the encoder comes back without it.
+// The encoder with the buffer's reflection: the binding of that buffer index in the function's
+// reflection, which its library answers from Metal's own over the same bytes, as both x86 Macs
+// answer one there, an MTLBufferBindingInternal (oracle_bundle argbuf.reflection: the AMD 5300M
+// and the Intel 630 under macOS 26.7.1). Their arrays' strides answer 0 there and the size of an
+// element in the library's reflection, which this answers. nil, logged, where the library keeps
+// no source to reflect.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
                                                  reflection:(MTLAutoreleasedArgument *)reflection
 {
-	if (reflection) {
-		*reflection = nil;
-		RGFX_UNSUPPORTED("an argument buffer's reflection (no argument reflection on the wire)");
+	id<MTLArgumentEncoder> encoder = [self newArgumentEncoderWithBufferIndex:bufferIndex];
+	if (reflection)
+		*reflection = encoder != nil ? [self rgfxArgumentOfBufferAtIndex:bufferIndex] : nil;
+	return encoder;
+}
+
+- (MTLArgument *)rgfxArgumentOfBufferAtIndex:(NSUInteger)bufferIndex
+{
+	RgfxResource *library = [self rgfxLibrary];
+	const char *entry = [self rgfxEntryPointUTF8];
+	NSString *name = entry != nullptr ? @(entry) : nil;
+	if (name != nil && [library respondsToSelector:@selector(reflectionForFunctionWithName:)]) {
+		MTLFunctionReflection *reflection =
+		    [(id<MTLLibrary>)library reflectionForFunctionWithName:name];
+		for (id<MTLBinding> binding in reflection.bindings) {
+			if (binding.type == MTLBindingTypeBuffer && binding.index == bufferIndex &&
+			    [(id)binding isKindOfClass:[MTLArgument class]])
+				return (MTLArgument *)binding;
+		}
 	}
-	return [self newArgumentEncoderWithBufferIndex:bufferIndex];
+	RGFX_UNSUPPORTED("an argument buffer's reflection, where the function's library has none");
+	return nil;
 }
 
 @end

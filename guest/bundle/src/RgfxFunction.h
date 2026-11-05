@@ -125,6 +125,10 @@ typedef struct {
 
 /// The library the function was made from; nil where it was made without one.
 - (nullable RgfxResource *)rgfxLibrary;
+/// The reflection of the buffer the function takes at `bufferIndex`: that binding of its library's
+/// reflection of it (newArgumentEncoderWithBufferIndex:reflection:); nil, logged, where there is
+/// none.
+- (nullable MTLArgument *)rgfxArgumentOfBufferAtIndex:(NSUInteger)bufferIndex;
 
 #ifdef __cplusplus
 /// Sets the entry point's binding arguments, as its AIR module declares them: the library reads

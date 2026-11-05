@@ -918,6 +918,18 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	                                    serializer:[self serializer]];
 }
 
+// The encoder of the argument buffer a buffer binding describes, as both x86 Macs make one (the
+// AMD 5300M and the Intel 630 under macOS 26.7.1: oracle_bundle argbuf.binding.lib, the same
+// encoder as the function's own of that buffer); nil for a binding of no argument buffer, as the
+// AMD answers (argbuf.binding.plain). RgfxArgumentEncoder.h says how it is laid out.
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)bufferBinding
+{
+	return [RgfxArgumentEncoder encoderOfBinding:bufferBinding
+	                                      region:[self region]
+	                                      device:self
+	                                  serializer:[self serializer]];
+}
+
 // The same with the encoder's struct type answered through `structType` (measured: _MTLDevice's on
 // macOS 27's x86-64 slice, `@32@0:8@16^@24`; the M3 Max answers its encoder and an
 // MTLStructTypeInternal). The device has no argument reflection, so it answers nil there.

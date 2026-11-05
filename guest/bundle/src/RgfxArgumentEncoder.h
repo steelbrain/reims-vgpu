@@ -17,9 +17,15 @@
  * (plain Metal's process ends there). constantDataAtIndex: answers the place itself.
  *
  * A sampler's word is the resource id the host's device numbered it by (RgfxSampler.h). What the
- * device makes no object of (indirect command buffers, acceleration structures, function tables)
- * only nil reaches, which writes 0. A depth/stencil state has no resource id on the wire, so its
- * arguments keep the bytes the buffer holds, and log their first use (RgfxUnsupported.h).
+ * device makes no object of (acceleration structures, function tables) only nil reaches, which
+ * writes 0. A depth/stencil state has no resource id, as on the x86 Macs: setting one raises an
+ * unrecognized selector at its gpuResourceID (RgfxDepthStencilState.h).
+ *
+ * An encoder of a buffer binding (newArgumentEncoderWithBufferBinding:) is laid out as Metal lays
+ * one out, from the argument buffer the binding describes: the function's own encoder where the
+ * binding is one of the device's reflections of a function's buffer (RgfxNoteArgumentBinding), as
+ * both x86 Macs answer the same encoder for a function's buffer and for its library's reflection
+ * of it; otherwise the encoder of descriptors of the binding's struct members.
  *
  * Our own ObjC++: it conforms to MTLArgumentEncoder but subclasses only NSObject (via
  * RgfxResource), so it instantiates and is unit-tested on the Mac.
@@ -69,11 +75,29 @@ NS_ASSUME_NONNULL_BEGIN
                                     device:(nullable id<MTLDevice>)device
                                 serializer:(nullable RgfxSerializer *)serializer;
 
+/// The encoder of the argument buffer `binding` describes: the encoder of the function's buffer
+/// it was noted for (RgfxNoteArgumentBinding), or of descriptors of its struct's members; nil, as
+/// the AMD 5300M answers, where the binding is not of an argument buffer, and nil, logged, where
+/// a member is of a type no descriptor names (a struct).
++ (nullable instancetype)encoderOfBinding:(id<MTLBufferBinding>)binding
+                                   region:(nullable RgfxRegion *)region
+                                   device:(nullable id<MTLDevice>)device
+                               serializer:(nullable RgfxSerializer *)serializer;
+
 /// The layout the encoder writes by.
 @property(nonatomic, readonly) std::shared_ptr<const RgfxArgLayout> rgfxLayout;
 #endif
 
 @end
+
+/// Notes `binding`, a reflection the device answers of a buffer `function` takes, so an encoder of
+/// it is the function's own encoder of that buffer (encoderOfBinding:). Held while the binding
+/// lives.
+void RgfxNoteArgumentBinding(id<MTLBinding> binding, RgfxFunction *function);
+
+/// The descriptors of the members of an argument buffer's struct type, as a binding's encoder
+/// takes them (encoderOfBinding:); nil where a member is of a type no descriptor names.
+NSArray<MTLArgumentDescriptor *> *_Nullable RgfxDescriptorsOfArguments(MTLStructType *type);
 
 /// What holds the device's region: the device answers it, so a function's encoder finds the
 /// block its layout is written into.

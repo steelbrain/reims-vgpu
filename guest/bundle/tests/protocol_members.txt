@@ -256,7 +256,7 @@ functionConstantsDictionary implemented
 functionType implemented
 name implemented
 newArgumentEncoderWithBufferIndex: implemented
-newArgumentEncoderWithBufferIndex:reflection: partial an argument buffer's reflection (no argument reflection on the wire)
+newArgumentEncoderWithBufferIndex:reflection: implemented
 options implemented
 patchControlPointCount implemented
 patchType implemented
@@ -545,7 +545,7 @@ newAccelerationStructureWithSize:resourceIndex: unsupported ray tracing
 newAccelerationStructureWithSize:withDescriptor: unsupported ray tracing
 newArchiveWithURL:error: unsupported the Metal 4 API
 newArgumentEncoderWithArguments: implemented
-newArgumentEncoderWithBufferBinding: unsupported argument encoders (no argument-buffer layout on the wire)
+newArgumentEncoderWithBufferBinding: implemented
 newArgumentEncoderWithLayout: unsupported argument buffers of a layout object
 newArgumentTableWithDescriptor:error: unsupported the Metal 4 API
 newBinaryArchiveWithDescriptor:error: implemented

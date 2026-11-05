@@ -60,16 +60,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
-// --- argument encoders --------------------------------------------------------------
-
-// No argument-buffer layout on the wire: no encoder, which apps and Metal's own frameworks check,
-// rather than one that lays out nothing.
-- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)bufferBinding
-{
-	RGFX_UNSUPPORTED("argument encoders (no argument-buffer layout on the wire)");
-	return nil;
-}
-
 // --- pipelines the wire does not create -----------------------------------------------
 
 - (id<MTLRenderPipelineState>)
