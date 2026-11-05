@@ -1158,6 +1158,199 @@ bool readConstants(const Module &m, std::vector<RgfxAirConstant> &out)
 	return true;
 }
 
+// --- whole nodes, for a pipeline's reflection ----------------------------------------------
+
+// A string operand of a node.
+bool mdText(const Module &m, const Module::Md &node, size_t i, std::string &out)
+{
+	const std::string *s = i < node.ops.size() ? mdString(m, node.ops[i]) : nullptr;
+	if (s == nullptr)
+		return false;
+	out = *s;
+	return true;
+}
+
+bool layoutOf(const Module &m, uint64_t id, unsigned depth,
+              std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
+              std::shared_ptr<const std::vector<RgfxAirMember>> &out);
+
+// The node `id` of outputs (a vertex function's, a mesh's vertex or primitive data): each a node of
+// its kind, then keys, `air.arg_type_name` and `air.arg_name` among them, whose other operands
+// (a render target's or a vertex output's numbers, `generated(...)` names) reflection does not
+// read. False where it is not a node of such nodes.
+bool outputsOf(const Module &m, uint64_t id, std::vector<RgfxAirOutput> &out)
+{
+	const Module::Md *list = mdNode(m, id);
+	if (list == nullptr)
+		return false;
+	for (uint64_t o : list->ops) {
+		const Module::Md *node = mdNode(m, o);
+		RgfxAirOutput output;
+		if (node == nullptr || !mdText(m, *node, 0, output.kind))
+			return false;
+		for (size_t i = 1; i + 1 < node->ops.size(); i++) {
+			const std::string *key = mdString(m, node->ops[i]);
+			if (key != nullptr && (*key == "air.arg_type_name" || *key == "air.arg_name") &&
+			    mdText(m, *node, i + 1, *key == "air.arg_name" ? output.name : output.typeName))
+				i++;
+		}
+		out.push_back(std::move(output));
+	}
+	return true;
+}
+
+// The node `id` whole (RgfxAirArguments.hpp, "An entry point's nodes, whole"): false where an
+// operand is not of the form its key takes.
+bool wholeNode(const Module &m, uint64_t id, unsigned depth,
+               std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
+{
+	const Module::Md *node = mdNode(m, id);
+	if (node == nullptr || depth > 8)
+		return false;
+	size_t i = 0;
+	int64_t position = 0;
+	if (!node->ops.empty() && mdInteger(m, node->ops[0], position)) {
+		if (position < 0 || position > INT32_MAX)
+			return false;
+		out.hasPosition = true;
+		out.position = static_cast<uint32_t>(position);
+		i = 1;
+	}
+	for (; i < node->ops.size(); i++) {
+		const std::string *key = mdString(m, node->ops[i]);
+		if (key == nullptr)
+			return false; // an operand no key takes
+		const std::string &k = *key;
+		if (k == "air.function_constant") {
+			const Module::Md *pred = i + 1 < node->ops.size() ? mdNode(m, node->ops[i + 1]) : nullptr;
+			if (pred == nullptr || !mdText(m, *pred, 2, out.predicate))
+				return false;
+			out.predicated = true;
+			i += 1;
+		} else if (k == "air.location_index") {
+			int64_t index = 0, count = 0;
+			if (i + 2 >= node->ops.size() || !mdInteger(m, node->ops[i + 2], count) || count < 1 ||
+			    count > INT32_MAX)
+				return false;
+			if (mdGlobalVariable(m, node->ops[i + 1]))
+				out.indexIsGlobal = true;
+			else if (!mdInteger(m, node->ops[i + 1], index) || index < 0 || index > INT32_MAX)
+				return false;
+			out.hasLocation = true;
+			out.index = static_cast<uint32_t>(index);
+			out.count = static_cast<uint32_t>(count);
+			i += 2;
+		} else if (k == "air.buffer_size" || k == "air.address_space" || k == "air.arg_type_size" ||
+		           k == "air.arg_type_align_size") {
+			uint32_t v = 0;
+			if (!mdUnsigned(m, *node, i + 1, v))
+				return false;
+			if (k == "air.buffer_size")
+				out.hasBufferSize = true, out.bufferSize = v;
+			else if (k == "air.address_space")
+				out.hasAddressSpace = true, out.addressSpace = v;
+			else if (k == "air.arg_type_size")
+				out.hasTypeSize = true, out.typeSize = v;
+			else
+				out.hasTypeAlign = true, out.typeAlign = v;
+			i += 1;
+		} else if (k == "air.struct_type_info") {
+			if (i + 1 >= node->ops.size() || !layoutOf(m, node->ops[i + 1], depth + 1, layouts, out.layout))
+				return false;
+			i += 1;
+		} else if (k == "air.arg_type_name" || k == "air.arg_name") {
+			if (!mdText(m, *node, i + 1, k == "air.arg_name" ? out.name : out.typeName))
+				return false;
+			i += 1;
+		} else if (k == "air.arg_unused") {
+			out.unused = true;
+		} else if (accessOf(k) != RgfxAirAccess::Unknown) {
+			out.access = accessOf(k);
+		} else if (k == "air.mesh" && out.kind.empty()) {
+			out.kind = k;
+			const Module::Md *info = i + 1 < node->ops.size() ? mdNode(m, node->ops[i + 1]) : nullptr;
+			std::string tag;
+			if (info == nullptr || !mdText(m, *info, 0, tag) || tag != "air.mesh_type_info" || info->ops.size() < 6 ||
+			    !outputsOf(m, info->ops[1], out.meshVertexData) || !outputsOf(m, info->ops[2], out.meshPrimitiveData) ||
+			    !mdUnsigned(m, *info, 3, out.meshVertices) || !mdUnsigned(m, *info, 4, out.meshPrimitives) ||
+			    !mdText(m, *info, 5, out.meshTopology))
+				return false;
+			out.hasMesh = true;
+			i += 1;
+		} else if (out.kind.empty()) {
+			out.kind = k;
+		} else {
+			// What else a node of a stage input, an output or an interpolated input says (its
+			// interpolation, `generated(...)` names): nothing reflection answers.
+			continue;
+		}
+	}
+	return !out.kind.empty();
+}
+
+// The layout node `id`: its members, each read once a module (`layouts`).
+bool layoutOf(const Module &m, uint64_t id, unsigned depth,
+              std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
+              std::shared_ptr<const std::vector<RgfxAirMember>> &out)
+{
+	auto known = layouts.find(id);
+	if (known != layouts.end()) {
+		out = known->second;
+		return out != nullptr;
+	}
+	layouts[id] = nullptr; // a layout that holds itself reads as none
+	const Module::Md *node = mdNode(m, id);
+	if (node == nullptr || depth > 8)
+		return false;
+	auto members = std::make_shared<std::vector<RgfxAirMember>>();
+	for (size_t i = 0; i < node->ops.size();) {
+		RgfxAirMember member;
+		const std::string *lead = mdString(m, node->ops[i]);
+		if (lead != nullptr && *lead == "air.struct_type_info") {
+			if (i + 1 >= node->ops.size() || !layoutOf(m, node->ops[i + 1], depth + 1, layouts, member.layout))
+				return false;
+			i += 2;
+		}
+		if (!mdUnsigned(m, *node, i, member.offset) || !mdUnsigned(m, *node, i + 1, member.size) ||
+		    !mdUnsigned(m, *node, i + 2, member.arrayLength) || !mdText(m, *node, i + 3, member.typeName) ||
+		    !mdText(m, *node, i + 4, member.name))
+			return false;
+		i += 5;
+		while (i < node->ops.size()) {
+			const std::string *key = mdString(m, node->ops[i]);
+			if (key == nullptr || i + 1 >= node->ops.size())
+				break;
+			if (*key == "air.indirect_argument") {
+				if (mdNode(m, node->ops[i + 1]) != nullptr) {
+					auto arg = std::make_shared<RgfxAirNode>();
+					if (!wholeNode(m, node->ops[i + 1], depth + 1, layouts, *arg))
+						return false;
+					member.indirect = std::move(arg);
+				} else if (mdUnsigned(m, *node, i + 1, member.firstId)) {
+					member.hasFirstId = true;
+				} else {
+					return false;
+				}
+			} else if (*key == "air.render_target") {
+				if (!mdUnsigned(m, *node, i + 1, member.renderTarget))
+					return false;
+				member.hasRenderTarget = true;
+			} else if (*key == "air.raster_order_group") {
+				if (!mdUnsigned(m, *node, i + 1, member.rasterOrderGroup))
+					return false;
+				member.hasRasterOrderGroup = true;
+			} else {
+				break; // the next member's `air.struct_type_info`
+			}
+			i += 2;
+		}
+		members->push_back(std::move(member));
+	}
+	out = members;
+	layouts[id] = out;
+	return true;
+}
+
 } // namespace
 
 bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out)
@@ -1217,6 +1410,72 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 			f.constants = constants;
 			f.constantsRead = constantsRead;
 			out.push_back(std::move(f));
+		}
+	}
+	return true;
+}
+
+bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out)
+{
+	out = {};
+	Module m;
+	if (!readModule(bitcode, size, m))
+		return false;
+	static const struct {
+		const char *name;
+		RgfxAirEntryStage stage;
+	} kStages[] = {{"air.kernel", RgfxAirEntryStage::Kernel}, {"air.vertex", RgfxAirEntryStage::Vertex},
+	               {"air.fragment", RgfxAirEntryStage::Fragment}, {"air.object", RgfxAirEntryStage::Object},
+	               {"air.mesh", RgfxAirEntryStage::Mesh}};
+	std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> layouts;
+	for (const auto &s : kStages) {
+		auto it = m.named.find(s.name);
+		if (it == m.named.end())
+			continue;
+		for (uint64_t id : it->second) {
+			const Module::Md *entry = mdAt(m, id);
+			const Module::Md *fn = entry != nullptr && entry->kind == Module::Md::kNode && entry->ops.size() >= 3
+			                           ? mdAt(m, entry->ops[0])
+			                           : nullptr;
+			const Module::Md *args = fn != nullptr ? mdNode(m, entry->ops[2]) : nullptr;
+			if (fn == nullptr || fn->kind != Module::Md::kValue || args == nullptr ||
+			    fn->value >= m.globals.size() || !m.globals[static_cast<size_t>(fn->value)].function) {
+				out = {};
+				return false;
+			}
+			RgfxAirEntry e;
+			e.name = globalName(m, fn->value);
+			e.stage = s.stage;
+			if (!outputsOf(m, entry->ops[1], e.outputs)) {
+				out = {};
+				return false;
+			}
+			for (uint64_t a : args->ops) {
+				RgfxAirNode n;
+				if (!wholeNode(m, a, 0, layouts, n)) {
+					out = {};
+					return false;
+				}
+				e.arguments.push_back(std::move(n));
+			}
+			if (e.name.empty()) {
+				out = {};
+				return false;
+			}
+			out.entries.push_back(std::move(e));
+		}
+	}
+	auto constants = m.named.find("air.function_constants");
+	if (constants != m.named.end()) {
+		for (uint64_t id : constants->second) {
+			const Module::Md *c = mdNode(m, id);
+			std::string name;
+			uint32_t index = 0;
+			if (c == nullptr || !mdText(m, *c, 2, name) || !mdUnsigned(m, *c, 3, index)) {
+				out = {};
+				return false;
+			}
+			out.constants.emplace_back(name, index);
 		}
 	}
 	return true;

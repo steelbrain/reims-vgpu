@@ -241,6 +241,17 @@ $(AIR_LIB): tests/air_arguments.metal Makefile
 		-o $(BUILD)/air_arguments.air
 	xcrun -sdk macosx metallib $(BUILD)/air_arguments.air -o $@
 
+# Pipelines' reflection (src/RgfxPipelineReflection.*) over the oracle probe's library
+# (tools/oracle/oracle_reflection.metal), built for macOS 26 and Metal 3.0 as build.sh builds it,
+# whose pipelines' reflection the x86 Macs' answers were measured over; never committed.
+ORACLE_REFLECTION_LIB = $(BUILD)/oracle_reflection.metallib
+
+$(ORACLE_REFLECTION_LIB): tools/oracle/oracle_reflection.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=26.0 tools/oracle/oracle_reflection.metal \
+		-o $(BUILD)/oracle_reflection.air
+	xcrun -sdk macosx metallib $(BUILD)/oracle_reflection.air -o $@
+
 # The same reader over modules built for macOS 10.12, of LLVM 3.5's metadata nodes
 # (tests/air_arguments_old.metal).
 AIR_OLD_LIB = $(BUILD)/air_arguments_old.metallib
@@ -301,11 +312,12 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp $(HEADER
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp \
 		-framework IOSurface -framework CoreFoundation -o $@
 
-test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $(SHELL_TESTBIN) \
-	$(CI_KERNEL) $(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) \
-	$(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
+test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
+	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) \
+	$(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
-	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) arch -$(ARCH) $(AIR_TESTBIN)
+	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
+		RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)

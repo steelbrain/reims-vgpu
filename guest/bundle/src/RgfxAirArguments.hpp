@@ -44,6 +44,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -213,6 +214,102 @@ struct RgfxAirVisible {
 // The visible functions of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), in
 // `air.visible`'s order. False where it is not one the reader can follow; `out` then holds nothing.
 bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out);
+
+// --- An entry point's nodes, whole, for its pipeline's reflection -----------------------------
+// Each argument node of an entry point (`air.kernel`, `air.vertex`, `air.fragment`, `air.object`,
+// `air.mesh`), as its metadata states it (measured: the modules Apple's Metal compiler builds from
+// tools/oracle/oracle_reflection.metal, macOS 27.2 SDK, as LLVM's text form prints them). A node
+// is its parameter's position, then `air.function_constant` and its predicate's node where it is
+// declared under a function constant, then its kind (`air.buffer`, `air.texture`, `air.sampler`,
+// `air.indirect_buffer`, `air.thread_position_in_grid`, ...), then keys and their operands, in no
+// fixed order:
+//   `air.location_index` index count   its binding: the index (or a global the module's
+//                                      initialiser sets, for an index function constants compute)
+//                                      and how many it takes (an array's length);
+//   `air.buffer_size` n, `air.address_space` n, `air.arg_type_size` n, `air.arg_type_align_size` n;
+//   `air.struct_type_info` !layout     its pointee's layout (below);
+//   `air.arg_type_name` "T", `air.arg_name` "n";
+//   `air.read`, `air.write`, `air.read_write`, `air.sample`: its access;
+//   `air.arg_unused`: the function never references it;
+//   `air.mesh` !info: a mesh function's mesh, its `air.mesh_type_info` node of its vertex and
+//   primitive data (each a node of outputs, below), its vertex and primitive counts and its
+//   topology (`air.triangle`, ...).
+// An entry's outputs are a node of nodes, each its kind (`air.position`, `air.vertex_output`,
+// `air.render_target`, ...) and keys, `air.arg_type_name` "T" and `air.arg_name` "n" among them.
+// A predicate's node is the global the initialiser sets, the constant's type and its name: the
+// function constant's own name where the predicate is one constant (`[[function_constant(kOn)]]`).
+// A layout is a run of members, each `[air.struct_type_info !layout] offset size arrayLength
+// "type" "name"` and, in an argument buffer's, `air.indirect_argument` and the member's own node
+// (or its first id, for a struct of members), or `air.render_target` n, `air.raster_order_group` n.
+
+struct RgfxAirNode;
+
+// One output of a vertex function (its outputs' node), or one member of a mesh's vertex or
+// primitive data: its kind (`air.position`, `air.vertex_output`, `air.mesh_vertex_data`,
+// `air.render_target`, ...), its type's name and its name (empty where it has none).
+struct RgfxAirOutput {
+	std::string kind, typeName, name;
+};
+
+struct RgfxAirMember {
+	uint32_t offset = 0, size = 0, arrayLength = 0;
+	std::string typeName, name;
+	// `air.struct_type_info` ahead of it: its own type's layout.
+	std::shared_ptr<const std::vector<RgfxAirMember>> layout;
+	// `air.indirect_argument`: an argument buffer's member's node, or its first id where the
+	// member is a struct of members (`hasFirstId`).
+	std::shared_ptr<const RgfxAirNode> indirect;
+	bool hasFirstId = false;
+	uint32_t firstId = 0;
+	bool hasRenderTarget = false, hasRasterOrderGroup = false;
+	uint32_t renderTarget = 0, rasterOrderGroup = 0;
+};
+
+struct RgfxAirNode {
+	bool hasPosition = false;
+	uint32_t position = 0;
+	std::string kind;
+	// Declared under a function constant: the predicate's name (the constant's, where it is one).
+	bool predicated = false;
+	std::string predicate;
+	// `air.location_index`: its index (`indexIsGlobal`: one function constants compute) and count.
+	bool hasLocation = false, indexIsGlobal = false;
+	uint32_t index = 0, count = 0;
+	RgfxAirAccess access = RgfxAirAccess::Unknown;
+	bool hasAddressSpace = false, hasBufferSize = false, hasTypeSize = false, hasTypeAlign = false;
+	uint32_t addressSpace = 0, bufferSize = 0, typeSize = 0, typeAlign = 0;
+	std::string typeName, name;
+	bool unused = false;
+	std::shared_ptr<const std::vector<RgfxAirMember>> layout;
+	// `air.mesh`: its vertex and primitive data, its vertex and primitive counts and its topology's
+	// name.
+	bool hasMesh = false;
+	std::vector<RgfxAirOutput> meshVertexData, meshPrimitiveData;
+	uint32_t meshVertices = 0, meshPrimitives = 0;
+	std::string meshTopology;
+};
+
+enum class RgfxAirEntryStage : uint8_t { Kernel, Vertex, Fragment, Object, Mesh };
+
+struct RgfxAirEntry {
+	std::string name;
+	RgfxAirEntryStage stage = RgfxAirEntryStage::Kernel;
+	// Its outputs (the entry's second node), in order: none for a kernel or a void function.
+	std::vector<RgfxAirOutput> outputs;
+	std::vector<RgfxAirNode> arguments;
+};
+
+// A module's entry points, and its function constants' indices by name (`air.function_constants`:
+// each the constant's global, its type, its name and its index).
+struct RgfxAirEntries {
+	std::vector<RgfxAirEntry> entries;
+	std::vector<std::pair<std::string, uint32_t>> constants;
+};
+
+// The entry points of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), every node
+// of each whole. False where it is not one the reader can follow, or a node or layout is not one
+// it knows the form of; `out` then holds nothing.
+bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out);
 
 // Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
 // 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a

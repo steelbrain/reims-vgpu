@@ -5,8 +5,10 @@
 // answer for a binding of a kind the reader does not know; each stitchable function's signature,
 // type by type, and an unknown one where it has a type the reader does not know; each module's
 // function constants, as its function's CNST tag lists them; the same over the .metallib built
-// from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); and no answer, nor
-// a crash, for bytes that are not such a module.
+// from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); every node of an
+// entry point whole (rgfxReadAirEntries), over the oracle probe's library (RGFX_ORACLE_REFLECTION,
+// built from tools/oracle/oracle_reflection.metal); and no answer, nor a crash, for bytes that are
+// not such a module.
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 
@@ -872,6 +874,123 @@ int main()
 			read++;
 	}
 	check(true, "4000 spoilt modules' signatures read without a crash (" + std::to_string(read) + " answered)");
+
+	// Every node of an entry point whole, for its pipeline's reflection (rgfxReadAirEntries), over
+	// tools/oracle/oracle_reflection.metal's library (RGFX_ORACLE_REFLECTION).
+	const char *oraclePath = std::getenv("RGFX_ORACLE_REFLECTION");
+	check(oraclePath != nullptr, "RGFX_ORACLE_REFLECTION names the oracle probe's library");
+	const std::vector<uint8_t> oracle = readFile(oraclePath);
+	auto entriesOf = [&](const std::string &name) {
+		const uint8_t *bc = nullptr;
+		size_t n = 0;
+		RgfxAirEntries e;
+		check(rgfxMetallibBitcode(oracle.data(), oracle.size(), name, &bc, &n) && rgfxReadAirEntries(bc, n, e),
+		      name + ": its nodes are read");
+		RgfxAirEntries one;
+		for (const RgfxAirEntry &x : e.entries)
+			if (x.name == name)
+				one.entries.push_back(x);
+		one.constants = e.constants;
+		check(one.entries.size() == 1, name + ": its module declares it");
+		return one;
+	};
+	{
+		const RgfxAirEntries basic = entriesOf("k_basic");
+		const RgfxAirEntry &k = basic.entries.at(0);
+		check(k.stage == RgfxAirEntryStage::Kernel && k.arguments.size() == 11 && k.outputs.empty(),
+		      "k_basic: a kernel of 11 nodes");
+		const RgfxAirNode &params = k.arguments.at(1);
+		check(params.kind == "air.buffer" && params.name == "params" && params.typeName == "Params" &&
+		          params.hasLocation && params.index == 1 && params.count == 1 && params.addressSpace == 2 &&
+		          params.typeSize == 192 && params.typeAlign == 16 && params.access == RgfxAirAccess::Read,
+		      "k_basic: params, a constant Params at buffer 1");
+		check(params.layout != nullptr && params.layout->size() == 12, "k_basic: Params's 12 members");
+		if (params.layout != nullptr && params.layout->size() == 12) {
+			const RgfxAirMember &counts = params.layout->at(6), &inner = params.layout->at(7);
+			check(counts.name == "counts" && counts.typeName == "int" && counts.offset == 52 && counts.size == 4 &&
+			          counts.arrayLength == 3 && counts.layout == nullptr,
+			      "k_basic: counts, an int[3] at 52");
+			check(inner.name == "inner" && inner.layout != nullptr && inner.layout->size() == 2 &&
+			          inner.layout->at(1).typeName == "int2",
+			      "k_basic: inner, an Inner of its own layout");
+		}
+		check(k.arguments.at(3).kind == "air.texture" && k.arguments.at(3).typeName == "texture2d<float, read>" &&
+		          k.arguments.at(6).access == RgfxAirAccess::ReadWrite,
+		      "k_basic: its textures' types and access");
+		check(k.arguments.at(8).addressSpace == 3 && k.arguments.at(9).kind == "air.thread_position_in_grid" &&
+		          k.arguments.at(9).typeName == "uint2" && !k.arguments.at(9).hasLocation,
+		      "k_basic: threadgroup memory, then its built-ins");
+		const RgfxAirEntry unused = entriesOf("k_unused").entries.at(0);
+		check(!unused.arguments.at(0).unused && unused.arguments.at(1).unused && unused.arguments.at(5).unused &&
+		          !unused.arguments.at(6).unused,
+		      "k_unused: air.arg_unused on the arguments it never references");
+		const RgfxAirEntries constants = entriesOf("k_constants");
+		const RgfxAirEntry &kc = constants.entries.at(0);
+		check(constants.constants.size() == 3 && constants.constants[0].first == "kOn" &&
+		          constants.constants[2].first == "kIndex" && constants.constants[2].second == 2,
+		      "k_constants: the module's three constants by index");
+		check(!kc.arguments.at(0).predicated && kc.arguments.at(1).predicated && kc.arguments.at(1).predicate == "kOn" &&
+		          kc.arguments.at(2).predicate == "kOff" && kc.arguments.at(5).indexIsGlobal &&
+		          !kc.arguments.at(6).indexIsGlobal,
+		      "k_constants: its predicates by constant, and the index kIndex computes");
+		const RgfxAirEntry ab = entriesOf("k_argument_buffer").entries.at(0);
+		const RgfxAirNode &members = ab.arguments.at(0);
+		check(members.kind == "air.indirect_buffer" && members.layout != nullptr && members.layout->size() == 7,
+		      "k_argument_buffer: an argument buffer of 7 members");
+		if (members.layout != nullptr && members.layout->size() == 7) {
+			const RgfxAirMember &textures = members.layout->at(4), &inner = members.layout->at(5);
+			check(textures.indirect != nullptr && textures.indirect->kind == "air.texture" &&
+			          textures.indirect->index == 4 && textures.indirect->count == 2,
+			      "k_argument_buffer: an array of 2 textures at id 4");
+			check(inner.indirect != nullptr && inner.indirect->kind == "air.buffer" && inner.indirect->index == 6 &&
+			          inner.indirect->addressSpace == 2 && inner.indirect->layout != nullptr,
+			      "k_argument_buffer: a constant Inner pointer at id 6");
+			check(members.layout->at(3).indirect != nullptr &&
+			          members.layout->at(3).indirect->kind == "air.indirect_constant",
+			      "k_argument_buffer: a constant member");
+		}
+		const RgfxAirEntry vb = entriesOf("v_buffers").entries.at(0);
+		check(vb.stage == RgfxAirEntryStage::Vertex && vb.outputs.size() == 2 && vb.outputs[0].kind == "air.position" &&
+		          vb.outputs[0].typeName == "float4" && vb.outputs[1].kind == "air.vertex_output" &&
+		          vb.outputs[1].typeName == "float2" && vb.outputs[1].name == "uv",
+		      "v_buffers: its outputs, a position and uv");
+		const RgfxAirEntry vs = entriesOf("v_stage_in").entries.at(0);
+		check(vs.arguments.at(2).kind == "air.vertex_input" && vs.arguments.at(2).index == 2 && vs.arguments.at(2).unused,
+		      "v_stage_in: an attribute it never reads");
+		const RgfxAirEntry ft = entriesOf("f_targets").entries.at(0);
+		check(ft.stage == RgfxAirEntryStage::Fragment && ft.outputs.size() == 2 &&
+		          ft.outputs[1].kind == "air.render_target" && ft.outputs[1].typeName == "half4",
+		      "f_targets: its render targets");
+		const RgfxAirEntry mp = entriesOf("m_payload").entries.at(0);
+		const RgfxAirNode &output = mp.arguments.at(0);
+		check(mp.stage == RgfxAirEntryStage::Mesh && output.kind == "air.mesh" && output.hasMesh &&
+		          output.meshVertices == 3 && output.meshPrimitives == 1 && output.meshTopology == "air.triangle" &&
+		          output.meshVertexData.size() == 2 && output.meshVertexData[1].typeName == "float2" &&
+		          output.meshPrimitiveData.empty(),
+		      "m_payload: its mesh's data, counts and topology");
+		check(mp.arguments.at(1).kind == "air.payload" && mp.arguments.at(1).layout != nullptr &&
+		          entriesOf("o_payload").entries.at(0).stage == RgfxAirEntryStage::Object,
+		      "o_payload and m_payload: their payload");
+		check(entriesOf("k_nothing").entries.at(0).arguments.empty(), "k_nothing: no nodes");
+		// Spoilt modules: none crashes the reader.
+		const uint8_t *bc = nullptr;
+		size_t n = 0;
+		check(rgfxMetallibBitcode(oracle.data(), oracle.size(), "k_argument_buffer", &bc, &n), "a module to spoil");
+		const std::vector<uint8_t> goodEntries(bc, bc + n);
+		RgfxAirEntries spoiltEntries;
+		read = 0;
+		for (int round = 0; round < 4000; round++) {
+			std::vector<uint8_t> spoilt = goodEntries;
+			for (int k2 = 0; k2 < 1 + round % 4; k2++) {
+				seed = seed * 1103515245u + 12345u;
+				spoilt[(seed >> 8) % spoilt.size()] ^= static_cast<uint8_t>(1u << ((seed >> 4) & 7));
+			}
+			const size_t cut = round % 7 == 0 ? (seed >> 3) % spoilt.size() : spoilt.size();
+			if (rgfxReadAirEntries(spoilt.data(), cut, spoiltEntries))
+				read++;
+		}
+		check(true, "4000 spoilt modules' nodes read without a crash (" + std::to_string(read) + " answered)");
+	}
 
 	std::printf("air_arguments_test: OK (%d checks)\n", checks);
 	return 0;
