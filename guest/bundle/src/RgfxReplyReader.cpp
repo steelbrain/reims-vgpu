@@ -183,6 +183,41 @@ bool RgfxReplyReader::armAndCheck()
 	return producer != m_consumed;
 }
 
+bool RgfxReplyReader::holdsSubmitted(uint64_t seqno)
+{
+	if (m_header == nullptr)
+		return false;
+	std::lock_guard<std::mutex> guard(m_lock);
+	if (m_closed)
+		return false;
+	// The records from the consumer count to `producer` are the guest's until it takes them,
+	// so the host writes none of their bytes while this reads them; the count moves only under
+	// the lock, which this holds.
+	const uint64_t producer = load64(m_header + kProducer);
+	uint64_t at = m_consumed;
+	for (uint32_t looked = 0; at != producer && looked < kLookRecords; looked++) {
+		const uint32_t offset = static_cast<uint32_t>(at) & m_mask;
+		uint8_t head[8];
+		readBytes(m_data, offset, head, sizeof(head));
+		uint32_t type = 0;
+		uint32_t size = 0;
+		std::memcpy(&type, head, 4);
+		std::memcpy(&size, head + 4, 4);
+		const uint32_t least = type == RGFX_MSG_PAD ? kPadBytes : kHeaderBytes;
+		if (size % kMsgAlign != 0 || size < least || size > m_dataSize)
+			return false;
+		if (type == RGFX_EVT_CB_SUBMITTED || type == RGFX_EVT_CB_SCHEDULED ||
+		    type == RGFX_EVT_CB_COMPLETE) {
+			RgfxMsgHeader header = {};
+			readBytes(m_data, offset, &header, sizeof(header));
+			if (header.seqno == seqno)
+				return true;
+		}
+		at += size;
+	}
+	return false;
+}
+
 void RgfxReplyReader::close()
 {
 	std::lock_guard<std::mutex> guard(m_lock);

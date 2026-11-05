@@ -147,6 +147,18 @@ public:
 	/// not taken: true means pump again before sleeping. False for a ringless reader.
 	bool armAndCheck();
 
+	/// Whether the ring holds, among the records not yet taken, the host's word that the command
+	/// buffer submitted at `seqno` is submitted: its RGFX_EVT_CB_SUBMITTED, or the CB_SCHEDULED
+	/// or CB_COMPLETE that stands for one. Reads at most kLookRecords records past the consumer
+	/// count and takes none, so the ring's consumer still takes each in ring order and runs its
+	/// handler. A host that answers a buffer on its doorbell's thread has posted the record
+	/// before the doorbell write returns, so the thread that posted the buffer finds it here
+	/// with no wake of the completion thread (RgfxCmdBuffer's rgfxPost).
+	bool holdsSubmitted(uint64_t seqno);
+
+	/// The most records holdsSubmitted reads.
+	static constexpr uint32_t kLookRecords = 64;
+
 	/// Stops reading the ring for good: pump() and armAndCheck() touch it no more, so its
 	/// block can go back to the region (the queue's end) though the completion thread still
 	/// holds the reader.

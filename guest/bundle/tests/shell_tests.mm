@@ -5330,6 +5330,162 @@ void test_submitted_before_scheduled()
 	}
 }
 
+// A host that answers on the doorbell's thread: the doorbell write takes the buffer off the
+// submission ring and posts its CB_SUBMITTED before it returns, as the host's post does (the
+// record published, `armed` read and cleared), but the vector's wake of the completion thread
+// comes only `lateMs` later, from a thread of its own, as an interrupt still on its way.
+struct DoorbellAnswer {
+	TestRing *submit = nullptr;
+	TestRing *completion = nullptr;
+	FakeKext *kext = nullptr;
+	uint64_t cbObjId = 0;
+	int lateMs = 0;
+	std::atomic<uint64_t> seqno{0};
+	std::atomic<int> answered{0};
+	std::thread late;
+
+	static void ring(void *context, uint32_t)
+	{
+		DoorbellAnswer *d = static_cast<DoorbellAnswer *>(context);
+		if (d->submit == nullptr)
+			return;
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		if (!d->submit->next(&h, &bytes) || h.type != RGFX_CMD_COMMAND_BUFFER ||
+		    submittedOps(bytes) != 1)
+			return;
+		d->seqno.store(h.seqno);
+		RgfxCbSubmitted submitted = cbSubmitted(h.seqno, d->cbObjId);
+		CHECK(d->completion->postFromHost(&submitted, sizeof(submitted)));
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		uint32_t *armed = reinterpret_cast<uint32_t *>(
+		    d->completion->mem.data() + __builtin_offsetof(RgfxRingHeader, armed));
+		const bool raise = __atomic_exchange_n(armed, 0u, __ATOMIC_SEQ_CST) == 1;
+		d->answered.fetch_add(1);
+		FakeKext *kext = d->kext;
+		const int ms = d->lateMs;
+		d->late = std::thread([kext, ms, raise] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+			if (raise)
+				kext->wake();
+		});
+	}
+};
+
+// A buffer the host answered on its doorbell's thread: commitAndWaitUntilSubmitted finds its
+// CB_SUBMITTED on the ring after its post and returns, the buffer submitted and still Committed,
+// without waiting for the completion thread's wake, which comes 400 ms later; the record is
+// still on the ring at the return. The completion thread then takes it, and the buffer's
+// scheduling and completion run as before. A buffer the doorbell does not answer waits for the
+// thread as before.
+void test_submitted_at_the_doorbell_wakes_no_thread()
+{
+	@autoreleasepool {
+	DoorbellAnswer *door = new DoorbellAnswer();
+	QueueFixture f(0x8000, 0, &DoorbellAnswer::ring, door);
+	f.queue.asksSubmitted = YES;
+	FakeKext *kext = new FakeKext();
+	door->completion = &f.completion;
+	door->kext = kext;
+	door->lateMs = 400;
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	std::shared_ptr<RgfxReplyReader> reader = [f.queue sharedReplyReader];
+	thread.add(reader);
+	CHECK(eventually([&] { return ringArmed(f.completion) == 1 && kext->waitCount() >= 1; }));
+
+	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+	door->cbObjId = ((RgfxResource *)cb).rgfxObjId;
+	door->submit = &f.submit;
+	auto start = std::chrono::steady_clock::now();
+	CHECK([(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted]);
+	auto took = std::chrono::steady_clock::now() - start;
+	const uint64_t seqno = door->seqno.load();
+	CHECK(door->answered.load() == 1);
+	CHECK(seqno != 0);
+	CHECK(took < std::chrono::milliseconds(200));
+	// Returned with the record still on the ring, untaken: the completion thread is asleep.
+	CHECK(reader->awaitingSubmitted(seqno));
+	CHECK(cb.status == MTLCommandBufferStatusCommitted);
+	// The late wake: the thread takes the record, which finds the buffer submitted.
+	door->late.join();
+	CHECK(eventually([&] { return !reader->awaitingSubmitted(seqno); }));
+	RgfxCbScheduled scheduled = cbScheduled(seqno, door->cbObjId);
+	hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+	[cb waitUntilScheduled];
+	CHECK(cb.status == MTLCommandBufferStatusScheduled);
+	RgfxCbComplete done = cbComplete(seqno, door->cbObjId);
+	hostPost(f.completion, *kext, &done, sizeof(done));
+	[cb waitUntilCompleted];
+	CHECK(cb.status == MTLCommandBufferStatusCompleted);
+
+	// Not answered at its doorbell: the call returns at the CB_SUBMITTED the completion thread
+	// takes.
+	door->submit = nullptr;
+	id<MTLCommandBuffer> second = [f.queue commandBuffer];
+	uint64_t secondId = ((RgfxResource *)second).rgfxObjId;
+	std::atomic<uint64_t> taken{0};
+	std::atomic<int> asked{-1};
+	std::thread host = hostAnswers(&f.submit, &f.completion, kext, secondId, RGFX_EVT_CB_SUBMITTED,
+	                               &taken, &asked);
+	start = std::chrono::steady_clock::now();
+	CHECK([(id<MTLCommandBufferSPI>)second commitAndWaitUntilSubmitted]);
+	CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(25));
+	host.join();
+	CHECK(asked.load() == 1);
+	CHECK(!reader->awaitingSubmitted(taken.load()));
+	RgfxCbComplete d2 = cbComplete(taken.load(), secondId);
+	hostPost(f.completion, *kext, &d2, sizeof(d2));
+	[second waitUntilCompleted];
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// The reader's look for a buffer's submission reads the records not yet taken, takes none, and
+// reads a CB_SCHEDULED or CB_COMPLETE as one: only its own seqno's, past the pads, and none of a
+// closed ring.
+void test_reply_reader_holds_submitted()
+{
+	TestRing ring(0x200);
+	RgfxReplyReader reader(ring.base(), ring.dataSize);
+	CHECK(!reader.holdsSubmitted(1));
+	RgfxCbComplete other = cbComplete(1, 50);
+	CHECK(ring.postFromHost(&other, sizeof(other)));
+	CHECK(reader.holdsSubmitted(1));
+	CHECK(!reader.holdsSubmitted(2));
+	RgfxCbSubmitted submitted = cbSubmitted(2, 51);
+	CHECK(ring.postFromHost(&submitted, sizeof(submitted)));
+	CHECK(reader.holdsSubmitted(2));
+	CHECK(!reader.holdsSubmitted(3));
+	int fired = 0;
+	reader.expectSubmitted(2, [&fired](const RgfxCbSubmitted &) { fired++; });
+	CHECK(reader.awaitingSubmitted(2));
+	// Taken by the pump, in order, the handler run there and not at the look.
+	CHECK(fired == 0);
+	CHECK(reader.pump() == 1);
+	CHECK(fired == 1);
+	CHECK(!reader.holdsSubmitted(2));
+	// Past the ring's end: records taken until fewer bytes than a record's are left before it,
+	// so the next record follows the host's pad there.
+	for (;;) {
+		const uint32_t left =
+		    ring.dataSize - (static_cast<uint32_t>(ring.produced) & (ring.dataSize - 1));
+		if (left < sizeof(RgfxCbScheduled))
+			break;
+		RgfxCbScheduled filler = cbScheduled(9, 59);
+		CHECK(ring.postFromHost(&filler, sizeof(filler)));
+		CHECK(reader.pump() == 0);
+	}
+	RgfxCbScheduled wrapped = cbScheduled(3, 52);
+	CHECK(ring.postFromHost(&wrapped, sizeof(wrapped)));
+	CHECK((ring.produced & (ring.dataSize - 1)) == sizeof(wrapped));
+	CHECK(reader.holdsSubmitted(3));
+	CHECK(!reader.holdsSubmitted(4));
+	reader.close();
+	CHECK(!reader.holdsSubmitted(3));
+}
+
 // Without a completion thread, waitUntilScheduled takes the ring itself and returns at the
 // buffer's CB_SCHEDULED, before its completion.
 void test_wait_until_scheduled_pumps()
@@ -11655,11 +11811,13 @@ int main(int argc, char **argv)
 		test_command_buffer_keeps_once();
 		test_resource_ids();
 		test_reply_reader_arm();
+		test_reply_reader_holds_submitted();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();
 		test_scheduled_before_completion();
 		test_present_drawable();
 		test_submitted_before_scheduled();
+		test_submitted_at_the_doorbell_wakes_no_thread();
 		test_wait_until_scheduled_pumps();
 		test_completion_thread_stops();
 		test_uncompleted_buffer_releases();

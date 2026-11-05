@@ -2323,6 +2323,15 @@ commit. Each outcome the new design allows is one of those two:
   at its begin fails in its turn. The vCPU neither allocates nor frees, as
   the library's allocator may purge pages in either call: the platform's
   command buffer and every other allocation are made on the queue's thread.
+  The answer is on the queue's completion ring before the doorbell write
+  returns, so the bundle's post looks for it there as the write returns
+  (`RgfxReplyReader::holdsSubmitted`, which takes no record): a buffer
+  answered at its doorbell is submitted there, and
+  `commitAndWaitUntilSubmitted` returns with no interrupt and no wake of the
+  completion thread on its way. That thread takes the record later, in ring
+  order, and finds the buffer submitted already. Tested by the bundle's
+  `test_submitted_at_the_doorbell_wakes_no_thread` and
+  `test_reply_reader_holds_submitted` (`tests/shell_tests.mm`).
   Tested by `a_doorbell_s_answer_allocates_nothing` and
   `a_doorbell_write_answers_a_command_buffer_on_its_thread`
   (`graphics/tests.rs`), the `cmdbuf` tests

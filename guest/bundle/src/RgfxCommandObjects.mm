@@ -1796,6 +1796,13 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// The CPU's part ends here, posted or not; the completion may already have come.
 	CFTimeInterval unset = 0;
 	_kernelEnd.compare_exchange_strong(unset, rgfxHostTime());
+	// A host that answers the buffer on its doorbell's thread posted its CB_SUBMITTED before
+	// the doorbell write in the post returned. Where that record is on the ring, the buffer is
+	// submitted from here, after everything above that a submitted buffer is held to, so
+	// commitAndWaitUntilSubmitted returns with no wake of the completion thread, whose take of
+	// the record then finds the buffer submitted already.
+	if (posted && _asksSubmitted && _reader != nullptr && _reader->holdsSubmitted(_seqno))
+		[self rgfxReachSubmitted];
 	if (!posted) {
 		// No block for it: the buffer fails as Metal's does when memory runs out, and its
 		// handlers run off the committing thread.
