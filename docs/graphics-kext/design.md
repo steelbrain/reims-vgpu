@@ -1553,11 +1553,19 @@ equal create or known to the process when it posts:
 - a failed context still carries out pipeline creates ("Guest input the host
   refuses", above).
 
-One reason stays: the platform running out of memory at the new state's own
-`VkPipeline` link. That refusal shows at the state's first `gpuResourceID`
-(as 0) and in the command buffers that name it, which fail on the host, instead
-of at the create. This gap closes once the Vulkan runtime shares one linked
-pipeline between equal keys.
+One reason stays: the platform failing to make again what an equal create
+needs (read from metal2vulkan's code at the pinned commit). The Vulkan runtime
+gives a state of an equal descriptor the live variant of an earlier state (its
+shader modules, layouts and `VkPipeline`s) with no driver call, or the objects
+of one among the last 16 it released, and the `VkPipeline` it begins at a
+create never refuses the create. Where no such variant is left, the create
+makes the variant's objects again, which can fail for want of memory; where
+the runtime's memo of compiled pipelines has let the pipeline go and its shader
+cache misses, it compiles it again, under a compile attempt's 20-second
+deadline. That refusal shows at the state's first `gpuResourceID` (as 0) and
+in the command buffers that name it, which fail on the host, instead of at the
+create. Only a create that waits for its answer would close it, at the cost
+the known creates remove.
 
 | group | messages | `Platform` call |
 |---|---|---|
