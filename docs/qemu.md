@@ -363,7 +363,9 @@ is its transport:
   2 GiB there, BAR 2 gets no address and the kext finds no region
   (docs/graphics-kext/design.md, the region; `REGION_SIZE` in
   `crates/reims-graphics/src/device.rs`). `reims-ctl`'s VMs do not have the
-  device, so a host that adds it adds the option too.
+  device, so a host that adds it adds the option too. Where it does not, the
+  device's realize warns, naming the option: on a PC machine (one with the
+  `max-ram-below-4g` property) with RAM at 1 GiB.
 
 `CONFIG_REIMS_GRAPHICS` is set for every target when the library is found,
 not only the HVF and KVM targets `MAC_PVG` is limited to. A Mac builds it
