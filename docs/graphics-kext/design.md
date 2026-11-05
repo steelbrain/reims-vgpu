@@ -1980,13 +1980,16 @@ the order says; a blit of another surface took 2.4-4 ms; the Intel 630
 runs one process's work at a time, so it orders all of it). Queues and
 processes here reach the host on rings of their own, which the host takes
 apart, so the order the host takes buffers in is not the order they were
-committed in. The bundle names the order instead, as it commits:
+committed in. The bundle names the order instead, as it posts each buffer:
 - Each surface's shared block holds its writers (`RgfxSurfaceWriters`, one
   slot a queue: its latest buffer that writes the surface) and, after them
   where the block's last page has room, its readers (the same record, the
   latest buffer of each queue that only reads it), which only the bundles read.
-  A copy whose writers end within 64 bytes of a page's end has no readers, and
-  a write of it waits for no read.
+  A copy whose writers end within 64 bytes of a page's end would have no
+  readers, and a write of it would wait for no read; no block the bundle lays
+  out is such. A copy's planes start and end on 256 bytes, so its header, its
+  writers and its readers (152 bytes) fit in the page its planes end in, and a
+  block in place holds the header and the slots alone, from its start.
 - The post of a buffer that uses surfaces, just before it goes on its queue's
   ring, reads, for each, the writers of other queues, and where the buffer
   writes the surface the readers too, and names each queue once, at its highest
