@@ -227,6 +227,13 @@ $(PATCH_LIB): tests/patch.metal Makefile
 # tests/air_arguments.metal, never committed; its function constants against the library's CNST
 # tags (src/RgfxFunctionConstants.*).
 AIR_LIB = $(BUILD)/air_arguments.metallib
+# The same library built for macOS 26, whose functions Metal's library reflection answers
+# (tests/protocol_tests.mm, test_argument_encoders_of_bindings).
+AIR_REFLECTED = $(BUILD)/air_arguments_reflected.metallib
+
+$(AIR_REFLECTED): tests/air_arguments.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -std=metal3.1 -mmacosx-version-min=26.0 tests/air_arguments.metal -o $@
 
 $(AIR_LIB): tests/air_arguments.metal Makefile
 	@mkdir -p $(@D)
@@ -294,13 +301,13 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp $(HEADER
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp \
 		-framework IOSurface -framework CoreFoundation -o $@
 
-test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) \
-	$(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) \
+test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $(SHELL_TESTBIN) \
+	$(CI_KERNEL) $(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) \
 	$(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
-		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
+		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)

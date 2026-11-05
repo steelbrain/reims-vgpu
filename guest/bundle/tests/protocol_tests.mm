@@ -2027,19 +2027,23 @@ void test_argument_encoder_query()
 }
 
 // An encoder of a buffer binding (newArgumentEncoderWithBufferBinding:) and an encoder's
-// reflection, over every_access of tests/air_arguments.metal and its library's reflection, Metal's
-// own over the same bytes: a binding of the library's reflection is the function's own encoder,
-// asked of the host by the function, as both x86 Macs answer the same encoder for the two; a
-// binding the device did not answer (Metal's own pipeline reflection here) is laid out from
-// descriptors of its struct's members; a plain buffer's binding has none, as the AMD answers. The
-// reflection out is the library reflection's binding of that buffer.
+// reflection, over every_access of tests/air_arguments.metal: a binding noted as a function's (as
+// the library's reflection notes each of its own) is the function's own encoder, asked of the host
+// by the function, as both x86 Macs answer the same encoder for the two; a binding the device did
+// not answer (Metal's own pipeline reflection here) is laid out from descriptors of its struct's
+// members; a plain buffer's binding has none, as the AMD answers; a function's encoder at a plain
+// buffer has no arguments, asked of nobody. The library's reflection is Metal's own over the same
+// bytes, its buffer bindings noted, and an encoder's reflection out is its binding of the buffer.
+// Metal reflects a library built for macOS 26 (RGFX_AIR_REFLECTED); where it reflects none, the
+// device answers none too, which is all that is checked of it.
 void test_argument_encoders_of_bindings()
 {
 	const char *path = getenv("RGFX_AIR_ARGUMENTS");
-	CHECK(path != nullptr);
-	if (path == nullptr)
+	const char *reflectedPath = getenv("RGFX_AIR_REFLECTED");
+	CHECK(path != nullptr && reflectedPath != nullptr);
+	if (path == nullptr || reflectedPath == nullptr)
 		return;
-	TestRing control(0x40000);
+	TestRing control(0x80000); // a library's bytes fit, 259 KiB built for macOS 26
 	control.setConsumerIdle(1);
 	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
 	                      TestRing::doorbell, nullptr);
@@ -2055,55 +2059,29 @@ void test_argument_encoders_of_bindings()
 	ser.setAsker(&RegionAsker::ask, &asker);
 	@autoreleasepool {
 	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto ours = [&](NSData *bytes) {
+		uint32_t status = 0;
+		RgfxLibrary *l = [RgfxLibrary libraryWithData:bytes.bytes
+		                                       length:bytes.length
+		                                          key:nullptr
+		                                       device:nil
+		                                   serializer:&ser
+		                                       status:&status];
+		[l rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			   (void)bytes;
+		   })
+		     shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+			     return [metal newLibraryWithData:d error:nil];
+		     }];
+		return l;
+	};
 	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
-	uint32_t status = 0;
-	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
-	                                         length:bytes.length
-	                                            key:nullptr
-	                                         device:nil
-	                                     serializer:&ser
-	                                         status:&status];
+	RgfxLibrary *lib = ours(bytes);
 	CHECK(lib != nil);
-	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
-		     (void)bytes;
-	     })
-	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
-		       return [metal newLibraryWithData:d error:nil];
-	       }];
-	MTLFunctionReflection *reflection = [lib reflectionForFunctionWithName:@"every_access"];
-	id<MTLBufferBinding> argumentBuffer = nil, plain = nil;
-	for (id<MTLBinding> b in reflection.bindings) {
-		if (b.type == MTLBindingTypeBuffer && b.index == 2)
-			argumentBuffer = (id<MTLBufferBinding>)b;
-		if (b.type == MTLBindingTypeBuffer && b.index == 0)
-			plain = (id<MTLBufferBinding>)b;
-	}
-	CHECK(argumentBuffer != nil && plain != nil);
-	CHECK(argumentBuffer.bufferPointerType.elementIsArgumentBuffer);
-
-	// The library's binding: the function's own encoder of buffer 2.
-	RgfxArgumentEncoder *enc = [RgfxArgumentEncoder encoderOfBinding:argumentBuffer
-	                                                           region:&region
-	                                                           device:nil
-	                                                       serializer:&ser];
-	CHECK(enc != nil && enc.encodedLength == 64 && asker.asked.size() == 1);
-	CHECK(asker.asked.back().source == RGFX_ARGUMENT_SOURCE_FUNCTION);
-	CHECK(asker.asked.back().buffer_index == 2 && asker.asked.back().library_obj_id == lib.rgfxObjId);
-	CHECK(asker.names.back() == "every_access" && blocks.live == 0);
-	// A plain buffer's binding: none, and nothing asked.
-	CHECK([RgfxArgumentEncoder encoderOfBinding:plain region:&region device:nil serializer:&ser] == nil);
-	CHECK(asker.asked.size() == 1);
-	// The function's encoders at its plain buffers, 0 and 1: of no arguments, 0 bytes long, as
-	// both x86 Macs make (oracle_bundle argbuf.index.1), and nothing asked.
 	RgfxFunction *everyAccess = (RgfxFunction *)[lib newFunctionWithName:@"every_access"];
 	CHECK(everyAccess != nil && [everyAccess rgfxAirFunction] != nullptr);
-	for (NSUInteger index : {NSUInteger(0), NSUInteger(1)}) {
-		id<MTLArgumentEncoder> none = [everyAccess newArgumentEncoderWithBufferIndex:index];
-		CHECK(none != nil && none.encodedLength == 0 && none.alignment == 1);
-	}
-	CHECK(asker.asked.size() == 1);
 
-	// A binding the device did not answer: descriptors of its struct's members, by their indices.
+	// Metal's own pipeline over the function, whose reflection's bindings the device did not answer.
 	id<MTLLibrary> metals = [metal newLibraryWithData:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
 		                                  (void)bytes;
 	                                  })
@@ -2112,46 +2090,102 @@ void test_argument_encoders_of_bindings()
 	bool scale = true;
 	[values setConstantValue:&scale type:MTLDataTypeBool atIndex:0];
 	id<MTLFunction> metalsFunction = [metals newFunctionWithName:@"every_access" constantValues:values error:nil];
-	MTLComputePipelineReflection *pipelineReflection = nil;
-	id<MTLComputePipelineState> pipeline =
-	    [metal newComputePipelineStateWithFunction:metalsFunction
-	                                       options:MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo
-	                                    reflection:&pipelineReflection
-	                                         error:nil];
-	CHECK(pipeline != nil);
-	id<MTLBufferBinding> foreign = nil;
-	for (id<MTLBinding> b in pipelineReflection.bindings)
-		if (b.type == MTLBindingTypeBuffer && b.index == 2)
-			foreign = (id<MTLBufferBinding>)b;
-	CHECK(foreign != nil);
-	NSArray<MTLArgumentDescriptor *> *descriptors = RgfxDescriptorsOfArguments(foreign.bufferStructType);
+	auto pipelineBuffer = [&](NSUInteger index) -> id<MTLBufferBinding> {
+		MTLComputePipelineReflection *pipelineReflection = nil;
+		id<MTLComputePipelineState> pipeline =
+		    [metal newComputePipelineStateWithFunction:metalsFunction
+		                                       options:MTLPipelineOptionBindingInfo |
+		                                               MTLPipelineOptionBufferTypeInfo
+		                                    reflection:&pipelineReflection
+		                                         error:nil];
+		CHECK(pipeline != nil);
+		for (id<MTLBinding> b in pipelineReflection.bindings)
+			if (b.type == MTLBindingTypeBuffer && b.index == index)
+				return (id<MTLBufferBinding>)b;
+		return nil;
+	};
+	id<MTLBufferBinding> argumentBuffer = pipelineBuffer(2), plain = pipelineBuffer(0);
+	CHECK(argumentBuffer != nil && plain != nil);
+	CHECK(argumentBuffer.bufferPointerType.elementIsArgumentBuffer);
+
+	// A binding the device did not answer: descriptors of its struct's members, by their indices.
+	NSArray<MTLArgumentDescriptor *> *descriptors =
+	    RgfxDescriptorsOfArguments(argumentBuffer.bufferStructType);
 	CHECK(descriptors.count == 2);
 	CHECK(descriptors[0].index == 0 && descriptors[0].dataType == MTLDataTypeTexture &&
 	      descriptors[0].textureType == MTLTextureType2D &&
 	      descriptors[0].access == MTLBindingAccessWriteOnly);
 	CHECK(descriptors[1].index == 1 && descriptors[1].dataType == MTLDataTypePointer);
-	enc = [RgfxArgumentEncoder encoderOfBinding:foreign region:&region device:nil serializer:&ser];
-	CHECK(enc != nil && asker.asked.size() == 2);
+	RgfxArgumentEncoder *enc = [RgfxArgumentEncoder encoderOfBinding:argumentBuffer
+	                                                           region:&region
+	                                                           device:nil
+	                                                       serializer:&ser];
+	CHECK(enc != nil && asker.asked.size() == 1);
 	CHECK(asker.asked.back().source == RGFX_ARGUMENT_SOURCE_DESCRIPTORS && asker.asked.back().count == 2);
 
-	// The reflection out: the library reflection's binding of the buffer.
-	id<MTLFunction> fn = [lib newFunctionWithName:@"every_access"];
-	CHECK([(id)fn isKindOfClass:[RgfxFunction class]]);
-	enc = [RgfxArgumentEncoder encoderOfFunction:(RgfxFunction *)fn
-	                                 bufferIndex:2
-	                                      region:&region
-	                                      device:nil
-	                                  serializer:&ser];
-	CHECK(enc != nil);
-	MTLArgument *of2 = [(RgfxFunction *)fn rgfxArgumentOfBufferAtIndex:2];
-	CHECK(of2 != nil && [of2.name isEqualToString:argumentBuffer.name] && of2.index == 2 &&
-	      of2.type == MTLArgumentTypeBuffer && of2.bufferDataType == MTLDataTypeStruct);
-	CHECK([(RgfxFunction *)fn rgfxArgumentOfBufferAtIndex:7] == nil);
-	} // @autoreleasepool
+	// The same binding noted as the function's: the function's own encoder of buffer 2.
+	RgfxNoteArgumentBinding(argumentBuffer, everyAccess);
+	enc = [RgfxArgumentEncoder encoderOfBinding:argumentBuffer
+	                                     region:&region
+	                                     device:nil
+	                                 serializer:&ser];
+	CHECK(enc != nil && enc.encodedLength == 64 && asker.asked.size() == 2);
+	CHECK(asker.asked.back().source == RGFX_ARGUMENT_SOURCE_FUNCTION);
+	CHECK(asker.asked.back().buffer_index == 2 && asker.asked.back().library_obj_id == lib.rgfxObjId);
+	CHECK(asker.names.back() == "every_access" && blocks.live == 0);
+	// A plain buffer's binding: none, and nothing asked.
+	CHECK([RgfxArgumentEncoder encoderOfBinding:plain region:&region device:nil serializer:&ser] == nil);
+	CHECK(asker.asked.size() == 2);
+	// The function's encoders at its plain buffers, 0 and 1: of no arguments, 0 bytes long, as
+	// both x86 Macs make (oracle_bundle argbuf.index.1), and nothing asked.
+	for (NSUInteger index : {NSUInteger(0), NSUInteger(1)}) {
+		id<MTLArgumentEncoder> none = [everyAccess newArgumentEncoderWithBufferIndex:index];
+		CHECK(none != nil && none.encodedLength == 0 && none.alignment == 1);
+	}
+	CHECK(asker.asked.size() == 2);
+
+	// The library's reflection, Metal's own, its argument buffers' bindings noted as the
+	// function's; an encoder's reflection out, its binding of the buffer.
+	NSData *reflectedBytes = [NSData dataWithContentsOfFile:@(reflectedPath)];
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> drained;
+	while (control.next(&h, &drained)) { // the first library's create, for room for this one's
+	}
+	RgfxLibrary *reflected = ours(reflectedBytes);
+	CHECK(reflected != nil);
+	MTLFunctionReflection *reflection = [reflected reflectionForFunctionWithName:@"every_access"];
+	MTLFunctionReflection *metalsReflection =
+	    [[reflected rgfxShadow] reflectionForFunctionWithName:@"every_access"];
+	CHECK((reflection == nil) == (metalsReflection == nil) &&
+	      reflection.bindings.count == metalsReflection.bindings.count);
+	id<MTLBufferBinding> reflectedBuffer = nil;
+	for (id<MTLBinding> b in reflection.bindings)
+		if (b.type == MTLBindingTypeBuffer && b.index == 2)
+			reflectedBuffer = (id<MTLBufferBinding>)b;
+	fprintf(stderr, "test_argument_encoders_of_bindings: Metal reflects %lu bindings%s\n",
+	        static_cast<unsigned long>(reflection.bindings.count),
+	        reflectedBuffer != nil ? ", buffer 2 among them" : "");
+	const size_t asked = asker.asked.size();
+	if (reflectedBuffer.bufferPointerType.elementIsArgumentBuffer) {
+		enc = [RgfxArgumentEncoder encoderOfBinding:reflectedBuffer
+		                                     region:&region
+		                                     device:nil
+		                                 serializer:&ser];
+		CHECK(enc != nil && asker.asked.size() == asked + 1);
+		CHECK(asker.asked.back().source == RGFX_ARGUMENT_SOURCE_FUNCTION &&
+		      asker.asked.back().buffer_index == 2 &&
+		      asker.asked.back().library_obj_id == reflected.rgfxObjId);
+	}
+	RgfxFunction *fn = (RgfxFunction *)[reflected newFunctionWithName:@"every_access"];
+	MTLArgument *of2 = [fn rgfxArgumentOfBufferAtIndex:2];
+	CHECK((of2 == nil) ==
+	      (reflectedBuffer == nil || ![(id)reflectedBuffer isKindOfClass:[MTLArgument class]]));
+	CHECK(of2 == nil || ([of2.name isEqualToString:reflectedBuffer.name] && of2.index == 2 &&
+	                     of2.type == MTLArgumentTypeBuffer && of2.bufferDataType == MTLDataTypeStruct));
+	CHECK([fn rgfxArgumentOfBufferAtIndex:7] == nil);
 	while (control.next(&h, &drained)) {
 	}
+	} // @autoreleasepool
 }
 
 // waitUntilSignaledValue:timeoutMS: answers YES at once for a value reached, NO once the
