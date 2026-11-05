@@ -350,7 +350,13 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	// The app's own pages in place, where the kext wires them for the buffer and the host maps
 	// them: nothing copied or synced, a Managed buffer's one copy (bufferOverPagesOf). Read-only
 	// memory, and memory the kext or the host makes no pages block of, takes a shadow in a slab
-	// below.
+	// below. Read-only memory stays out of place: Metal makes the buffer, its GPU reads see the
+	// memory, and its blit fills and kernel stores complete with their writes dropped, the memory
+	// and a file mapped under it unchanged (the AMD 5300M and the Intel UHD 630 under macOS 26.7.1,
+	// oracle_bundle nocopy.ro; the M3, docs/accuracy-ledger.md `read-only-pages-written`). The
+	// host's buffer over a pages block takes the GPU's writes (BUFFER_OVER_PAGES has no read-only
+	// form), so in place they would reach pages the process maps read-only, a file's among them;
+	// the shadow never writes back to read-only memory, which drops them as Metal does.
 	if (pointer != nullptr && writable && region->hasPagesBlocks()) {
 		RgfxBuffer *inPlace = [RgfxBuffer bufferOverPagesOf:pointer
 		                                             length:length
