@@ -290,16 +290,6 @@ pub trait Host: Send + Sync + 'static {
         answer.answer(RGFX_STATUS_OK);
     }
 
-    /// Whether the host refuses context `context`'s new work: its work failed off its op's thread
-    /// (the host's stage-3 decoder failed it), and only its destroys and its close are carried
-    /// out. A `QUEUE_CREATE` of such a context is refused ([`RGFX_STATUS_REFUSED`]) and makes no
-    /// rings. Called on the context's lane. The default refuses nothing, for a host with no
-    /// stage-3 decoder.
-    fn context_refused(&self, context: u32) -> bool {
-        let _ = context;
-        false
-    }
-
     /// `BLOCK_RELEASE`: context `release.context` freed its region block (`release.offset`,
     /// `release.size`), in which no live queue's ring lies. The host gives `answer` from any
     /// thread: [`RGFX_STATUS_REFUSED`] at once where an object it holds lies in the block, else
@@ -1685,7 +1675,6 @@ impl Shared {
     /// driver took and the ring parameters are valid; the status its `COMPLETE` carries. Waits for no thread of the device's and
     /// nothing of the host's.
     pub(crate) fn create_queue(&self, q: &RgfxQueueCreate, flags: u32, epoch: u64) -> u32 {
-        let context = (q.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32;
         let refused_flags = flags & !self.queue_flags_allowed();
         if refused_flags != 0 {
             log::warn!(
@@ -1694,13 +1683,6 @@ impl Shared {
                  carry out or whose feature the driver did not take, so it is refused", q.obj_id
             );
             return RGFX_STATUS_INVALID_ARGUMENT;
-        }
-        if self.host.context_refused(context) {
-            log::warn!(
-                target: "reims_graphics",
-                "queue {:#x}: its context {context} failed, so it is refused", q.obj_id
-            );
-            return RGFX_STATUS_REFUSED;
         }
         let Some((submit_at, complete_at)) = self.validate_rings(q) else {
             log::warn!(

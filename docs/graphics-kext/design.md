@@ -1331,8 +1331,8 @@ internal-error `CB_COMPLETE`. So a buffer that names a pipeline the host
 refused, or anything else it does not hold, fails after the buffers committed
 before it, and nothing waiting for one of its events, a later buffer on the
 GPU or a guest thread, waits for good. Where there is no stand-in (a message
-too short to name its queue, a queue the process does not hold, a context
-whose work is refused), the error status is posted at once. Nothing in
+too short to name its queue, a queue the process does not hold), the error
+status is posted at once. Nothing in
 this lane ends the offending context or its process on malformed input. The
 host runs each op in a refusal scope (`reims_vgpu_core::raise::refusals`): a
 death at a platform call, where the platform refuses a create or an encode and
@@ -1344,14 +1344,13 @@ Work an op registers to run on another thread takes the op's scope with it
 read of the buffer, and itself, in the scope of the decode that added it. A
 death in that read (a failure no Metal answer matches, which the Vulkan
 platform reads on the runtime's thread) fails the command buffer, whose
-`CB_COMPLETE` is an internal error, and fails its context: the host refuses
-the context's later command buffers, creates (its queues' and samplers'
-among them), library lookups and heap-size and argument-layout queries at
-once, carries out its destroys and its pipeline creates, and forgets the
-failure at its close. A pipeline create is carried out because the bundle
-posts a create equal to one the device accepted before without waiting for
-its answer, so the create must not be refused for a failure its process
-cannot know of when it posts. A release the
+`CB_COMPLETE` is an internal error (`MTLCommandBufferErrorInternal`), and
+nothing else: the context's later command buffers, creates and queries are
+carried out as any context's. On a Mac a GPU error fails the command buffers
+it strikes, WindowServer's among them, and their processes' later buffers run
+(docs/lessons.md, the test that faults the GPU, **measured** on macOS 27.0.1),
+so a failed buffer of WindowServer's leaves its later frames to be carried
+out, and the display goes on. A release the
 platform dies at (at a destroy, a context's close, or the display's swap of
 the texture it shows) is refused alone, and the destroy or the close is
 carried out whole. So is each of the Vulkan platform's releases of what a
@@ -1568,8 +1567,8 @@ equal create or known to the process when it posts:
 - the platform's pipeline resource IDs are not refused (measured to
   1,000,000);
 - the ring and the context are checked by the kext before it posts;
-- a failed context still carries out pipeline creates ("Guest input the host
-  refuses", above).
+- a command buffer's failure fails no other work of its context ("Guest input
+  the host refuses", above).
 
 One reason stays: the platform failing to make again what an equal create
 needs (read from metal2vulkan's code at the pinned commit). The Vulkan runtime

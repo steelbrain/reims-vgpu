@@ -161,10 +161,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxArgumentLayoutQuery>(message) else {
             return Ok((seqno, RGFX_STATUS_INVALID_ARGUMENT));
         };
-        // A failed context's later work is refused ([`super::FailedContexts`]).
-        if self.context_failed() {
-            return Ok((seqno, RGFX_STATUS_REFUSED));
-        }
         if !m.reply_offset.is_multiple_of(8)
             || m.reply_length < 8
             || !self.in_own_block(m.reply_offset, m.reply_length)

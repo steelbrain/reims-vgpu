@@ -524,10 +524,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             let seqno = read::<RgfxMsgHeader>(message).map(|h| h.seqno);
             return (seqno, RGFX_STATUS_INVALID_ARGUMENT);
         };
-        // A failed context's later work is refused ([`super::FailedContexts`]).
-        if self.context_failed() {
-            return (Some(m.header.seqno), RGFX_STATUS_REFUSED);
-        }
         let mut libraries = self.shared.libraries.lock();
         let Some(library) = libraries.cache.take(&m.key, m.slice_size) else {
             return (Some(m.header.seqno), RGFX_STATUS_NOT_FOUND);
@@ -580,11 +576,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             _ => return refused(DecodeError::Malformed, None),
         };
-        // A failed context's later work is refused ([`super::FailedContexts`]): its chunks are
-        // taken and acked as any, so its process goes on, and the library they make is refused.
-        if self.context_failed() {
-            return refused(DecodeError::ContextFailed, Some(seqno));
-        }
         let slot = LibrarySlot::new();
         let resets = {
             let mut libraries = self.shared.libraries.lock();

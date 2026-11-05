@@ -1321,30 +1321,6 @@ fn a_command_buffer_published_before_its_queue_create_completes() {
     );
 }
 
-/// A `QUEUE_CREATE` of a context the host refuses (its work failed off its op's thread) is
-/// refused and makes no rings; another context's is made
-#[test]
-fn a_refused_context_s_queue_create_makes_no_rings() {
-    struct Refusing;
-    impl Host for Refusing {
-        fn raise_interrupt(&self, _vector: u32) {}
-        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-            false
-        }
-        fn context_refused(&self, context: u32) -> bool {
-            context == 7
-        }
-    }
-    let mut rig = Rig::with_host(Box::new(Refusing));
-    rig.start();
-    let seqno = send_queue_create(&mut rig, (7 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1);
-    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_REFUSED));
-    assert_eq!(rig.device.queue_count(), 0);
-    let seqno = send_queue_create(&mut rig, (8 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1);
-    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
-    assert_eq!(rig.device.queue_count(), 1);
-}
-
 /// A `QUEUE_CREATE` is refused, making no rings, where either ring lies whole in no block its
 /// process holds: in no block, in another process's, or across two of its own; with each ring in
 /// one of its own blocks, it is made

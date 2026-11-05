@@ -899,8 +899,9 @@ mod tests {
     }
 
     /// A buffer that is not carried out still signals what may be waited for of it: its stand-in
-    /// does; with none (its process's work is refused), a command buffer of its own on its queue
-    /// does; and where its queue makes no command buffer, the timeline is set on the CPU
+    /// does; with none (its queue made no command buffer for it or its stand-in), a command
+    /// buffer of its own on its queue does; and where its queue makes no command buffer, the
+    /// timeline is set on the CPU
     #[test]
     fn a_buffer_not_carried_out_still_signals() {
         let mut r = rig();
@@ -917,13 +918,13 @@ mod tests {
         assert!(outcome.is_err());
         assert_eq!(events(&calls, SIGNAL), [(a, 9)], "the stand-in signals");
 
-        // Process 1's work is refused from here.
-        let resets = r.dec.shared.failed.resets();
-        assert!(r.dec.shared.failed.fail(1, resets));
         let (_, calls) = r.commit(B, 2, &ops(Some(&[(A, 10)]), &[]));
         assert_eq!(events(&calls, WAIT), [(a, 10)]);
+        // Its queue makes no command buffer for the buffer, nor for its stand-in.
+        r.p.script().push("commandBuffer", Step::Nil);
+        r.p.script().push("commandBuffer", Step::Nil);
         let (outcome, calls) = r.commit(A, 10, &ops(Some(&[]), &[]));
-        assert_eq!(outcome, Err(DecodeError::ContextFailed));
+        assert_eq!(outcome, Err(DecodeError::Refused));
         assert_eq!(
             events(&calls, SIGNAL),
             [(a, 10)],
@@ -931,7 +932,9 @@ mod tests {
         );
         assert!(calls.iter().any(|c| c.sel == "commit"));
 
-        r.p.script().push("commandBuffer", Step::Nil);
+        for _ in 0..3 {
+            r.p.script().push("commandBuffer", Step::Nil);
+        }
         let (_, calls) = r.commit(A, 11, &ops(Some(&[]), &[]));
         assert!(events(&calls, SIGNAL).is_empty());
         let set: Vec<(u64, u64)> = (calls.iter())

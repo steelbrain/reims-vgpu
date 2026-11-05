@@ -79,9 +79,9 @@ use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::worker::{Unsettled, Worker};
 use crate::graphics::decode::{
-    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, FailedContexts, GraphicsDecoder,
-    LibraryJob, LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink,
-    Sinks, SubmittedSink, SurfacePresent, compile_refusing, complete, make_library, refused_reply,
+    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, LibraryJob,
+    LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, Sinks,
+    SubmittedSink, SurfacePresent, compile_refusing, complete, make_library, refused_reply,
     refusing,
 };
 use crate::graphics::device_info::device_info;
@@ -321,7 +321,6 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
             }));
             let control = Arc::new(GraphicsControl {
-                failed: decoder.failed_contexts(),
                 decoders: decoder.decoders(),
                 device: gpu_device,
                 presents,
@@ -471,9 +470,6 @@ struct GraphicsControl<P: ApiPlatform> {
     /// yet made ([`Self::start_buffer_over_pages`]): by their context ([`pages_context`]), and by
     /// their pages block's offset.
     pages_buffers: Arc<Unsettled>,
-    /// The decoder's failed contexts, which the device asks of at a `QUEUE_CREATE`
-    /// (`Host::context_refused`).
-    failed: Arc<FailedContexts>,
     /// What the device's reset waits for ([`Self::reset`]): held shared by each message carried
     /// out off ring 0's threads, a queue's command buffer, create or destroy, from before it
     /// asks whether its poster is stale to its end, by each compile's and library make's store,
@@ -1753,10 +1749,6 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
         self.control.close_context(context, answer);
-    }
-
-    fn context_refused(&self, context: u32) -> bool {
-        self.control.failed.has(context)
     }
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {

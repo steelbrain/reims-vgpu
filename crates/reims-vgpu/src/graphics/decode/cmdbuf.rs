@@ -94,6 +94,7 @@ use reims_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
 };
+use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_core::platform::command::{
@@ -109,7 +110,6 @@ use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
 use reims_vgpu_core::platform::values::{
     ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
-use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::FromBytes;
@@ -635,7 +635,7 @@ pub(crate) struct Answered {
     /// Its message's seqno, and the guest's id of the buffer.
     seqno: u64,
     cb_obj_id: u64,
-    /// The device's resets at the answer ([`super::FailedContexts::resets`]): one from before a
+    /// The device's resets at the answer ([`super::ClosedContexts::resets`]): one from before a
     /// reset is not taken.
     resets: u64,
     /// The commit order's mark at the answer: every ticket issued before its own.
@@ -690,7 +690,6 @@ impl<P: Platform> Decoders<P> {
         if !glance.asks
             || glance.waits
             || context_of(m.queue_obj_id) != context
-            || shared.failed.try_has(context) != Some(false)
             || shared.surface_caches.none_cached(glance.used_blocks()) != Some(true)
             || shared.unsettled.try_any(glance.used_blocks()) != Some(false)
         {
@@ -764,7 +763,7 @@ impl<P: Platform> Decoders<P> {
             *slot = Some(Answered {
                 seqno: m.header.seqno,
                 cb_obj_id: m.cb_obj_id,
-                resets: shared.failed.resets(),
+                resets: shared.closed.resets(),
                 mark,
                 ranges,
                 ticket,
@@ -913,7 +912,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let answered = counts.answered.lock().take()?;
         let m = read::<RgfxCommandBuffer>(message)?;
         let same = m.header.seqno == answered.seqno && m.cb_obj_id == answered.cb_obj_id;
-        (same && answered.resets == self.shared.failed.resets()).then_some(answered)
+        (same && answered.resets == self.shared.closed.resets()).then_some(answered)
     }
 
     /// Begins the `COMMAND_BUFFER` `message` a queue's service thread takes off the ring of the
@@ -922,9 +921,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// lane is taken first, after its drain and before anything of it can fail, so its commit,
     /// its stand-in's or the failure posted for it comes in the order the queue's buffers were
     /// taken: the turn, the mark and the ticket the answer on a doorbell's thread took for it,
-    /// where it was answered there ([`Answered`]). A context whose work is refused gets
-    /// [`DecodeError::ContextFailed`], as `decode` answers it, and one closed before the buffer
-    /// came [`DecodeError::ContextClosed`], with no turn taken; and where it gets its
+    /// where it was answered there ([`Answered`]). A context closed before the buffer came gets
+    /// [`DecodeError::ContextClosed`], with no turn taken; and where it gets its
     /// `CB_SUBMITTED` at its take, that is posted here, once its ticket in the commit order is
     /// issued, unless the answer posted it.
     pub(crate) fn begin_taken(
@@ -954,10 +952,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             if let Some(h) = read::<RgfxMsgHeader>(message) {
                 *self.committed.borrow_mut() = Some((Arc::clone(&counts.order), h.seqno));
             }
-        }
-        if self.context_failed() {
-            self.note_begun();
-            return Ok(Err(DecodeError::ContextFailed));
         }
         let begun = self.begin_command_buffer(device, message, drain);
         // However far its begin got, a buffer that names it waits for it no more before its own
@@ -1240,8 +1234,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// the failure comes in its queue's order, once the buffers committed before it finish, and
     /// nothing waiting for one of its values, on the GPU or in the guest, waits for good.
     /// `Ok(false)` where there is none, and the caller posts the failure at once: a message too
-    /// short to name its queue, a queue the process does not hold or that makes no command
-    /// buffer, and a context whose work is refused ([`Self::context_failed`]).
+    /// short to name its queue, and a queue the process does not hold or that makes no command
+    /// buffer.
     pub(crate) fn stand_in_for_failed(
         &self,
         device: &P::Device,
@@ -1259,19 +1253,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         // (`surface_order`).
         let names = names_order(ops);
         let (queue_obj_id, seqno) = (m.queue_obj_id, m.header.seqno);
-        if self.context_failed() {
-            let queue = match self.named(queue_obj_id) {
-                Some(ObjHandle::CommandQueue(queue)) => Some(queue.clone_ref()),
-                _ => None,
-            };
-            let marks = self
-                .queue_counts(queue_obj_id)
-                .map(|c| Arc::clone(&c.order));
-            let queue = queue.as_ref();
-            self.wait_turn();
-            self.order_release(device, queue_obj_id, marks.as_deref(), seqno, names, queue)?;
-            return Ok(false);
-        }
         // The buffer's context's drain, held until the stand-in's completion handler has run.
         let drain = self.command_buffer_drain();
         let Some(ObjHandle::CommandQueue(queue)) = self.named(queue_obj_id) else {
@@ -1435,8 +1416,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> CompletedHandler {
         let sink = self.sinks.completion.clone();
         let signal_sink = self.sinks.signal.clone();
-        let (failed, context) = (Arc::clone(&self.shared.failed), self.context);
-        let resets = failed.resets();
+        let context = self.context;
         let signals = events.signals;
         let watched = (!events.waits.is_empty()).then(|| {
             self.shared
@@ -1445,16 +1425,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         });
         Box::new(move |info: CompletedInfo| {
             // The platform refused the buffer's completion on its own thread (a death in its
-            // read, in the scope this decode carried there): the buffer fails, and so does its
-            // context, whose later work is refused until its close.
-            if info.is_refused()
-                && let Some(context) = context
-                && failed.fail(context, resets)
-            {
-                log::warn!(
+            // read, in the scope this decode carried there, which logs the death at WARN):
+            // the buffer fails, as one a GPU error strikes on a Mac does, and its context's later
+            // work is carried out, as that process's later buffers run (docs/lessons.md).
+            if info.is_refused() {
+                log::debug!(
                     target: "reims_vgpu::graphics",
-                    "context {context}'s command buffer {cb_obj_id:#x} (seqno {seqno}) failed \
-                     off its op's thread: the context's later work is refused until its close"
+                    "command buffer {cb_obj_id:#x} (seqno {seqno}) failed off its op's thread: \
+                     it fails, and its context goes on"
                 );
             }
             if let Some(waiting) = &watched {
@@ -2046,6 +2024,7 @@ mod tests {
         RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxSharedEventSetValue,
         RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
+    use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
     use reims_vgpu_core::platform::values::AttachmentState;
     use reims_vgpu_core::sync::Mutex;
@@ -3428,8 +3407,8 @@ mod tests {
     /// not where it waits for an event or a
     /// buffer before it holds its queue, not on a queue its context does not hold, not while its
     /// queue holds [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed or an answered
-    /// buffer not yet begun, and not once its context failed. Where it is, its `CB_SUBMITTED` is
-    /// posted there, and what the answer took is kept on its queue; where it is not, nothing is.
+    /// buffer not yet begun. Where it is, its `CB_SUBMITTED` is posted there, and what the answer
+    /// took is kept on its queue; where it is not, nothing is.
     #[test]
     fn a_buffer_is_answered_at_the_doorbell_only_where_it_need_wait_for_nothing() {
         let (p, mut dec, posted) = posting(false);
@@ -3499,9 +3478,6 @@ mod tests {
             "an answered buffer not yet begun"
         );
         assert!(let_go_of_answer(&dec));
-        let failed = dec.failed_contexts();
-        assert!(failed.fail(0, failed.resets()));
-        assert!(!answered(&dec, &asking(177, 107)), "its context failed");
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 175, 105)]);
     }
 
@@ -3597,7 +3573,7 @@ mod tests {
         let device = p.device();
         let sequencer = Arc::clone(&dec.shared.sequencer);
         assert!(answer(&dec, &asking(191, 121), &posted, true));
-        dec.failed_contexts().forget_all();
+        dec.shared.closed.forget_all();
         let begun = dec
             .begin_taken(&device, &asking(191, 121), Some(1))
             .unwrap()
@@ -5369,8 +5345,7 @@ mod tests {
     /// A context's close leaves the decoder no state of it, whatever comes after: a command buffer
     /// handed over after the close (taken off its ring before it) is refused unrun, as a closed
     /// context's, and makes it none; a drain begun after the close (a release the kext posted
-    /// behind it) makes none, and ends after the close's own; and a failure of a buffer of the
-    /// context's after the close marks nothing.
+    /// behind it) makes none, and ends after the close's own.
     #[test]
     fn a_closed_context_s_late_arrivals_make_no_state() {
         let (p, dec) = setup();
@@ -5405,12 +5380,6 @@ mod tests {
             Err(DecodeError::ContextClosed)
         ));
         taken.end_message();
-        let failed = ring0.failed_contexts();
-        assert!(
-            !failed.fail(0, failed.resets()),
-            "the closed context was marked failed"
-        );
-        assert!(!failed.has(0));
         assert_eq!(
             ring0.context_states(),
             0,

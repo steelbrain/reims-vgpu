@@ -115,7 +115,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// An `ICB_CREATE`'s answer (`ICB_STATE`): the buffer made, stored under the message's id
     /// before the answer, so an `ICB_WRITE` or a command buffer of its process, which names it
     /// only after the answer, finds it; with its `gpuResourceID`. [`RGFX_STATUS_REFUSED`] with
-    /// 0 where the sender's context failed or the platform makes none, and
+    /// 0 where the platform makes none, and
     /// [`RGFX_STATUS_INVALID_ARGUMENT`] for a short create. `None` for a message too short to
     /// carry its seqno, which no one can be answered by.
     pub(crate) fn icb_state(
@@ -136,9 +136,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             reserved_14: 0,
             gpu_resource_id,
         };
-        if self.context_failed() {
-            return Ok(Some(answer(RGFX_STATUS_REFUSED, 0)));
-        }
         Ok(Some(match self.new_icb(device, message, true)? {
             Ok(id) => answer(RGFX_STATUS_OK, id),
             Err(DecodeError::Malformed) => answer(RGFX_STATUS_INVALID_ARGUMENT, 0),
@@ -1025,7 +1022,7 @@ mod tests {
 
     /// A create carries the guest's whole descriptor to the platform's creator and is answered
     /// with the buffer's `gpuResourceID`, the buffer stored before the answer; a refused one with
-    /// 0, a short one invalid, and a failed context's refused, storing nothing.
+    /// 0, and a short one invalid, storing nothing.
     #[test]
     fn a_create_carries_its_descriptor_and_answers_the_platforms_id() {
         let (p, mut dec, _) = pipeline_decoder();
@@ -1093,18 +1090,6 @@ mod tests {
             (7, RGFX_STATUS_INVALID_ARGUMENT)
         );
         assert!(dec.icb_state(&device, &[0u8; 8]).unwrap().is_none());
-        dec.set_context(Some(0));
-        let contexts = dec.failed_contexts();
-        assert!(contexts.fail(0, contexts.resets()));
-        let failed = dec
-            .icb_state(&device, create(25, 9, RENDER_TYPES, 4).as_bytes())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (failed.header.seqno, failed.status, failed.gpu_resource_id),
-            (9, RGFX_STATUS_REFUSED, 0)
-        );
-        assert!(dec.named(25).is_none());
     }
 
     /// Every render record drives its setter on its command, in the order the guest made them,

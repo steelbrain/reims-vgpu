@@ -65,7 +65,7 @@
 //! - `unsettled` ([`worker::Unsettled`]), the blocks whose `SURFACE_PAGES` the surface
 //!   worker has yet to carry out, taken alone; a message that names one waits for it holding no
 //!   lock here, nor the reset gate alone (the worker takes the gate shared, recursively).
-//! - the commit order ([`sequencer`]), and the contexts that failed ([`FailedContexts`]).
+//! - the commit order ([`sequencer`]), and the contexts closed ([`ClosedContexts`]).
 //! - `surface_order` ([`surface_order::SurfaceOrder`]), the queues' surface timelines: a leaf,
 //!   taken under no other lock and holding none, by a command buffer that holds `SURFACE_ORDER`
 //!   (or is waited for) while its waits and its signal are encoded, and at a queue's make and end.
@@ -75,9 +75,9 @@
 //! compiled pipeline is stored); and `surface_views` before `surface_caches`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use reims_graphics::region::Region;
@@ -269,81 +269,37 @@ impl Drop for Drain {
     }
 }
 
-/// The contexts whose work failed off its op's thread: a command buffer's completion the
+/// The contexts closed since the device's reset, and the resets so far. What comes to the
+/// decoder for a closed context makes it no state (a command buffer taken off its ring before
+/// the close and handed over after it, a release the kext posted behind the close), but a create
+/// of its own, as of a process given its number again, which opens it again ([`Self::reopen`]).
+/// The resets tell an answer given on a doorbell's thread before a reset from one after it
+/// ([`cmdbuf::Answered`]): the rebooted guest's processes take the same context numbers again,
+/// from 1.
+///
+/// No context is failed for a failure of its work: a command buffer whose completion the
 /// platform refused on its own thread ([`CompletedInfo::refused`]), where the paravirt device ends
-/// the process. The decoder refuses each one's later work, its command buffers and creates, until
-/// its close: only its destroys and its pipeline creates are carried out
-/// (docs/graphics-kext/design.md, "Guest input the host refuses"). A pipeline create is the one
-/// create a process posts without waiting for its answer, where the device accepted an equal one
-/// before (the bundle's known pipelines), so it is answered as the device would answer it in any
-/// context, never refused for a failure its process cannot know of when it posts. Shared with the
-/// command buffers' completed handlers, which mark a context.
-/// A handler marks one only where no reset of the device came since its buffer's decode: a buffer
-/// of the guest before a reboot may finish after it, and the rebooted guest's processes take the
-/// same context numbers again, from 1. Nor does it mark a context closed since: the closed
-/// contexts are kept too ([`Self::close`]), and what comes to the decoder for one after its close
-/// makes it no state (a command buffer taken off its ring before the close and handed over after
-/// it, a release the kext posted behind the close), but a create of its own, as of a process
-/// given its number again, which opens it again ([`Self::reopen`]).
+/// the process, fails alone, as a buffer Metal could not run does, and its process's later work
+/// is carried out (docs/graphics-kext/design.md, "Guest input the host refuses").
 ///
 /// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
 #[derive(Default)]
-pub(crate) struct FailedContexts {
-    failed: Mutex<HashSet<u32>>,
-    /// The contexts closed since the device's reset, taken under `failed`'s lock.
+pub(crate) struct ClosedContexts {
+    /// The contexts closed since the device's reset.
     closed: Mutex<Runs>,
-    /// How many there are, read without the lock: none, in every run that refuses nothing.
-    count: AtomicUsize,
-    /// The device's resets so far ([`Self::forget_all`]), changed under `failed`'s lock.
+    /// The device's resets so far ([`Self::forget_all`]), changed under `closed`'s lock.
     resets: AtomicU64,
 }
 
-impl FailedContexts {
-    /// The device's resets so far, which a command buffer's completed handler takes at the
-    /// buffer's decode, for its [`Self::fail`].
+impl ClosedContexts {
+    /// The device's resets so far.
     pub(crate) fn resets(&self) -> u64 {
         self.resets.load(Ordering::Acquire)
     }
 
-    /// Marks `context` failed, for a command buffer decoded after `resets` resets
-    /// ([`Self::resets`]); nothing where the device was reset since. True where it was not yet.
-    pub(crate) fn fail(&self, context: u32, resets: u64) -> bool {
-        let mut failed = self.failed.lock();
-        if self.resets.load(Ordering::Acquire) != resets || self.closed.lock().contains(context) {
-            return false;
-        }
-        let new = failed.insert(context);
-        self.count.store(failed.len(), Ordering::Release);
-        new
-    }
-
-    /// Whether `context` failed.
-    pub(crate) fn has(&self, context: u32) -> bool {
-        self.count.load(Ordering::Acquire) != 0 && self.failed.lock().contains(&context)
-    }
-
-    /// Whether `context` failed, waiting for no lock: `None` where its lock is busy.
-    fn try_has(&self, context: u32) -> Option<bool> {
-        if self.count.load(Ordering::Acquire) == 0 {
-            return Some(false);
-        }
-        Some(self.failed.try_lock()?.contains(&context))
-    }
-
-    /// Forgets `context`, at its close.
-    fn forget(&self, context: u32) {
-        let mut failed = self.failed.lock();
-        failed.remove(&context);
-        self.count.store(failed.len(), Ordering::Release);
-    }
-
-    /// `context` closed (its `CONTEXT_CLOSE`): forgotten, and kept closed until the device's
-    /// reset.
+    /// `context` closed (its `CONTEXT_CLOSE`): kept closed until the device's reset.
     fn close(&self, context: u32) {
-        let mut failed = self.failed.lock();
-        failed.remove(&context);
         self.closed.lock().insert(context);
-        self.count.store(failed.len(), Ordering::Release);
     }
 
     /// Whether `context` closed since the device's reset, and was not opened again since.
@@ -354,16 +310,13 @@ impl FailedContexts {
     /// `context`, closed before, is opened again: a create of its own came (a process given its
     /// number again).
     fn reopen(&self, context: u32) {
-        let _failed = self.failed.lock();
         self.closed.lock().remove(context);
     }
 
-    /// Forgets every context, and every close, at the device's reset, and counts the reset.
+    /// Forgets every close at the device's reset, and counts the reset.
     fn forget_all(&self) {
-        let mut failed = self.failed.lock();
-        failed.clear();
-        self.closed.lock().clear();
-        self.count.store(0, Ordering::Release);
+        let mut closed = self.closed.lock();
+        closed.clear();
         self.resets.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -418,14 +371,12 @@ impl Runs {
 
 /// A `SAMPLER_CREATE`'s answer (`SAMPLER_STATE`): the sampler made, handed to `keep` with the
 /// message's id, and its `gpuResourceID`, the id the platform numbers it by, which the guest's
-/// sampler answers and its argument buffers hold; [`RGFX_STATUS_REFUSED`] with 0 where `failed`
-/// (the sender's context failed: its later work is refused, [`FailedContexts`]) or the platform
-/// makes none, and [`RGFX_STATUS_INVALID_ARGUMENT`] for a short create. `None` for a message too
-/// short to carry its seqno, which no one can be answered by.
+/// sampler answers and its argument buffers hold; [`RGFX_STATUS_REFUSED`] with 0 where the
+/// platform makes none, and [`RGFX_STATUS_INVALID_ARGUMENT`] for a short create. `None` for a
+/// message too short to carry its seqno, which no one can be answered by.
 fn sampler_answer<P: Platform>(
     device: &P::Device,
     message: &[u8],
-    failed: bool,
     keep: impl FnOnce(u64, P::SamplerState),
 ) -> RaiseResult<Option<RgfxSamplerState>> {
     let Some(header) = read::<RgfxMsgHeader>(message) else {
@@ -441,9 +392,6 @@ fn sampler_answer<P: Platform>(
         reserved_14: 0,
         gpu_resource_id,
     };
-    if failed {
-        return Ok(Some(answer(RGFX_STATUS_REFUSED, 0)));
-    }
     Ok(Some(match new_sampler::<P>(device, message)? {
         Ok((obj_id, sampler)) => {
             let id = sampler.gpu_resource_id();
@@ -531,9 +479,6 @@ pub enum DecodeError {
     /// context's. The platform is not called, so no id the host's Metal ends the
     /// process for reaches it.
     BadResourceId,
-    /// The message's context failed off its op's thread ([`FailedContexts`]): its later work is
-    /// refused.
-    ContextFailed,
     /// The command buffer's context was closed before the buffer came to the decoder (taken off
     /// its queue's ring before the close, handed over after it): nothing of it is carried out,
     /// and nothing is owed, its queue having ended at the close.
@@ -593,8 +538,8 @@ pub(crate) struct Shared<P: Platform> {
     /// The watch over command buffers that wait on events, which logs the ones that wait long
     /// (diagnostics only: [`waits`]).
     waits: waits::WaitWatch<P>,
-    /// The contexts whose work failed off its op's thread, whose later work is refused.
-    failed: Arc<FailedContexts>,
+    /// The contexts closed since the device's reset, and the resets ([`ClosedContexts`]).
+    closed: ClosedContexts,
     /// Whether a `Managed` resource is one copy, over its block
     /// ([`GraphicsDecoder::set_unified_memory`]).
     unified_memory: AtomicBool,
@@ -805,7 +750,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             video: OnceLock::new(),
             libraries: Mutex::new(Libraries::new()),
             id_chunks: Mutex::new(vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice()),
-            failed: Arc::default(),
+            closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
             unsettled: Arc::default(),
@@ -1421,11 +1366,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.context = context;
     }
 
-    /// The contexts whose work failed off its op's thread, shared ([`FailedContexts`]).
-    pub(crate) fn failed_contexts(&self) -> Arc<FailedContexts> {
-        Arc::clone(&self.shared.failed)
-    }
-
     /// Queue `queue` was made, its ring's published seqnos read through `published`: a buffer of
     /// another queue that names one of its buffers past them waits for nothing
     /// ([`surface_order`]).
@@ -1455,12 +1395,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// Whether the current context's work failed off its op's thread ([`FailedContexts`]), so
-    /// its later work is refused.
-    pub(super) fn context_failed(&self) -> bool {
-        (self.context).is_some_and(|context| self.shared.failed.has(context))
-    }
-
     /// Whether `obj_id` is the current context's to name (any where none is set).
     fn owned(&self, obj_id: u64) -> bool {
         self.context
@@ -1473,7 +1407,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The state of context `context`, for a create of its own, made where it has none. A create
-    /// of a context closed before opens it again ([`FailedContexts::reopen`]): only a process
+    /// of a context closed before opens it again ([`ClosedContexts::reopen`]): only a process
     /// given its number again posts one after the close, which empties the context's
     /// compiles and waits for its no-copy buffers first. Nothing else makes a state.
     fn context_made(&self, context: u32) -> Arc<Context<P>> {
@@ -1499,7 +1433,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         if !live() {
             return None;
         }
-        self.shared.failed.reopen(context);
+        self.shared.closed.reopen(context);
         let state = Arc::new(Context::new(context));
         contexts.insert(context, Arc::clone(&state));
         Some(state)
@@ -1516,7 +1450,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// since: what of it needs a state is owed nothing ([`DecodeError::ContextClosed`]).
     fn context_closed(&self) -> bool {
         self.context.is_some_and(|context| {
-            self.context_state(context).is_none() && self.shared.failed.closed(context)
+            self.context_state(context).is_none() && self.shared.closed.closed(context)
         })
     }
 
@@ -1809,15 +1743,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// id lies in its range, `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next
     /// context's (its process closed the device or died), its chunks of the texture resource ids,
     /// its surfaces' names, its libraries and its pages blocks' views, its queues ended first. How
-    /// many objects it held, and what it took out, for the caller to let go of ([`Closed`]). The
-    /// context's failure ([`FailedContexts`]) is forgotten with it.
+    /// many objects it held, and what it took out, for the caller to let go of ([`Closed`]).
     pub(crate) fn close_tables(&self, context: u32) -> (usize, Closed<P>) {
         for holder in self.shared.id_chunks.lock().iter_mut() {
             if *holder == Some(context) {
                 *holder = None;
             }
         }
-        self.shared.failed.forget(context);
         let mut dropped = 0;
         let mut objects = Vec::new();
         let queues = self.shared.surface_order.lock().queues_of(context);
@@ -1891,7 +1823,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// keeps beside them for the guest's processes: the surfaces' names, the libraries' chunks,
     /// makes and cache, the blocks' views of their surfaces' pages and their device caches
     /// (dropped uncopied: the pages are the rebooted guest's again), the queues' counts, and every
-    /// context's failure, chunks of the texture resource ids and drains (their answers are owed
+    /// context's close, chunks of the texture resource ids and drains (their answers are owed
     /// to no one). Each release is made in a refusal scope. The decoder then holds what one just
     /// made holds, so a texture's resource id and a sampler's are free for the guest's next use,
     /// as on a new device. The contexts dropped, in order, and how many objects went.
@@ -1920,7 +1852,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                  refused: {refusal}"
             );
         }
-        shared.failed.forget_all();
+        shared.closed.forget_all();
         let cache = shared.libraries.lock().take_cache();
         if let Err(refusal) = refusals::refusing(move || drop(cache)) {
             log::warn!(
@@ -1966,8 +1898,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         device: &P::Device,
         message: &[u8],
     ) -> RaiseResult<Option<RgfxSamplerState>> {
-        let failed = self.context_failed();
-        sampler_answer::<P>(device, message, failed, |obj_id, sampler| {
+        sampler_answer::<P>(device, message, |obj_id, sampler| {
             self.store(obj_id, Entry::of(ObjHandle::Sampler(sampler)));
         })
     }
@@ -2009,10 +1940,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxHeapTextureSizeAndAlign>(message) else {
             return Some(answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0));
         };
-        // A failed context's later work is refused ([`FailedContexts`]).
-        if self.context_failed() {
-            return Some(answer(RGFX_STATUS_REFUSED, 0, 0));
-        }
         // The shape alone: a texture's resource index is no part of its size.
         let desc = TextureDesc {
             resource_index: None,
@@ -2053,17 +1980,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(header) = read::<RgfxMsgHeader>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        // A failed context's later work is refused: only its destroys and its pipeline creates
-        // are carried out ([`FailedContexts`]).
-        let carried = matches!(
-            header.r#type,
-            RGFX_CMD_OBJECT_DESTROY
-                | RGFX_CMD_RENDER_PIPELINE_CREATE
-                | RGFX_CMD_COMPUTE_PIPELINE_CREATE
-        );
-        if !carried && self.context_failed() {
-            return Ok(Err(DecodeError::ContextFailed));
-        }
         match header.r#type {
             RGFX_CMD_OBJECT_DESTROY => {
                 let Some(m) = read::<RgfxObjectDestroy>(message) else {
@@ -2771,7 +2687,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     fn store_late(&self, obj_id: u64, entry: Entry<P>) {
         let id_context = context_of(obj_id);
         let Some(context) =
-            self.context_made_if(id_context, || !self.shared.failed.closed(id_context))
+            self.context_made_if(id_context, || !self.shared.closed.closed(id_context))
         else {
             return;
         };
@@ -2886,7 +2802,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .map(|state| std::mem::take(&mut *state.drain.lock()))
                     .unwrap_or_default();
                 // Under the states' lock, so no state is made for it after this.
-                self.shared.failed.close(context);
+                self.shared.closed.close(context);
                 let mut closing = self.shared.closing.lock();
                 closing.retain(|_, d| d.strong_count() > 0);
                 closing.insert(context, Arc::downgrade(&drain));
@@ -4676,8 +4592,8 @@ mod tests {
 
     /// A sampler create is answered with the sampler's `gpuResourceID`, the id the platform
     /// numbers it by, at the create's seqno, the sampler stored under its id first; a create the
-    /// platform makes nothing of is refused with 0 and stores nothing, one of a failed context is
-    /// refused with 0, and a short one is an invalid argument.
+    /// platform makes nothing of is refused with 0 and stores nothing, and a short one is an
+    /// invalid argument.
     #[test]
     fn a_sampler_create_answers_the_platforms_id() {
         let p = Arc::new(FakePlatform::new());
@@ -4745,19 +4661,6 @@ mod tests {
             (7, RGFX_STATUS_INVALID_ARGUMENT)
         );
         assert!(dec.sampler_state(&device, &[0u8; 8]).unwrap().is_none());
-        // A failed context's create is refused, and stores nothing.
-        dec.set_context(Some(0));
-        let contexts = dec.failed_contexts();
-        assert!(contexts.fail(0, contexts.resets()));
-        let failed = dec
-            .sampler_state(&device, create(25, 9).as_bytes())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (failed.header.seqno, failed.status, failed.gpu_resource_id),
-            (9, RGFX_STATUS_REFUSED, 0)
-        );
-        assert!(dec.named(25).is_none());
     }
 
     /// A heap texture size query is answered at its seqno with the device's size and alignment

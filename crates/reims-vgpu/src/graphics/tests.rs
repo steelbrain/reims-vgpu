@@ -5242,12 +5242,12 @@ fn a_present_shows_the_latest_texture_over_its_surface() {
 
 /// The platform dying at its read of a finished command buffer on its own thread (a failure it has
 /// no answer of Metal's for), which ends the process on the paravirt device, fails that command
-/// buffer and its context: the buffer's completion is an internal error, the context's later
-/// command buffers and creates (its sampler creates among them) are refused at once, its
-/// destroys are carried out, another context's work goes on, and once the context closes its
-/// number is fresh for the next process
+/// buffer alone, as a GPU error on Metal fails the buffer it struck: its completion is an internal
+/// error, and its context's later work is carried out as any context's, its command buffers,
+/// its creates (its sampler creates and its queue creates among them) and its destroys, as is
+/// another context's
 #[test]
-fn a_completion_the_platform_refuses_fails_its_context() {
+fn a_completion_the_platform_refuses_fails_that_command_buffer_alone() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -5292,16 +5292,16 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     let failed = ring3.event().expect("the failed buffer's completion");
     let failed = RgfxCbComplete::read_from_bytes(&failed).unwrap();
     assert_eq!((failed.cb_obj_id, failed.status), (100, RGFX_CB_INTERNAL));
-
-    // The context's later command buffer is refused at once, unrun, and so is its create.
-    ring3.send(&device, command_buffer(obj(3, 1), 101));
-    let refused = ring3.event().expect("the refused buffer's completion");
-    let refused = RgfxCbComplete::read_from_bytes(&refused).unwrap();
-    assert_eq!((refused.cb_obj_id, refused.status), (101, RGFX_CB_INTERNAL));
     // Its error is `MTLCommandBufferErrorInternal`, which the guest's buffer reports, never 0.
-    assert_eq!(refused.error_code, 1);
-    assert!(platform.world().committed().is_empty(), "the buffer ran");
-    guest.send(&device, event_create(obj(3, 6)));
+    assert_eq!(failed.error_code, 1);
+
+    // The context's later command buffer runs.
+    ring3.send(&device, command_buffer(obj(3, 1), 101));
+    assert!(complete_until_event(&platform, &mut ring3), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring3.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (101, RGFX_CB_OK));
+
+    // Its creates are carried out: a sampler's, answered with its id, and a queue's.
     let sampler = RgfxSamplerCreate {
         header: RgfxMsgHeader {
             r#type: RGFX_CMD_SAMPLER_CREATE,
@@ -5317,38 +5317,16 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     let answer = guest.event().expect("the sampler create's SAMPLER_STATE");
     let answer = RgfxSamplerState::read_from_bytes(&answer).unwrap();
     assert_eq!(
-        (answer.header.seqno, answer.status, answer.gpu_resource_id),
-        (guest.seqno, RGFX_STATUS_REFUSED, 0)
+        (answer.header.seqno, answer.status),
+        (guest.seqno, RGFX_STATUS_OK)
     );
+    assert_ne!(answer.gpu_resource_id, 0);
     assert_eq!(
         platform
             .call_log()
             .calls_to("newSamplerStateWithDescriptor:")
             .len(),
-        0
-    );
-    carried_out_of(&device, &mut guest, 3);
-    assert_eq!(
-        device.decoder_object_count(),
-        3,
-        "the two queues and context 3's first event"
-    );
-
-    // Another context's work goes on.
-    ring4.send(&device, command_buffer(obj(4, 1), 200));
-    assert!(complete_until_event(&platform, &mut ring4), "no completion");
-    let done = RgfxCbComplete::read_from_bytes(&ring4.event().unwrap()).unwrap();
-    assert_eq!((done.cb_obj_id, done.status), (200, RGFX_CB_OK));
-
-    // The failed context's destroys are carried out.
-    guest.send(&device, object_destroy(obj(3, 5)));
-    carried_out_of(&device, &mut guest, 3);
-    assert_eq!(device.decoder_object_count(), 2, "the event destroyed");
-
-    // Closed, the context's number is fresh: the next process given it runs its work.
-    assert_eq!(
-        answered(&device, &mut guest, context_close(3)),
-        RGFX_STATUS_OK
+        1
     );
     assert_eq!(
         create_queue(
@@ -5367,6 +5345,22 @@ fn a_completion_the_platform_refuses_fails_its_context() {
     assert!(complete_until_event(&platform, &mut next), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&next.event().unwrap()).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (300, RGFX_CB_OK));
+
+    // Another context's work goes on.
+    ring4.send(&device, command_buffer(obj(4, 1), 200));
+    assert!(complete_until_event(&platform, &mut ring4), "no completion");
+    let done = RgfxCbComplete::read_from_bytes(&ring4.event().unwrap()).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (200, RGFX_CB_OK));
+
+    // Its destroys are carried out.
+    let before = device.decoder_object_count();
+    guest.send(&device, object_destroy(obj(3, 5)));
+    carried_out_of(&device, &mut guest, 3);
+    assert_eq!(
+        device.decoder_object_count(),
+        before - 1,
+        "the event destroyed"
+    );
 }
 
 /// The platform dying as it lets go of an object, at the object's destroy or at its context's
@@ -5408,181 +5402,6 @@ fn a_release_the_platform_dies_at_is_refused() {
     guest.send(&device, event_create(obj(3, 4)));
     carried_out_of(&device, &mut guest, 3);
     assert_eq!(device.decoder_object_count(), 1);
-}
-
-/// Fails context `context` as the platform does off its op's thread: makes its queue 1 over
-/// `submit` and `complete`, runs command buffer 100 on it, and completes the buffer with a read
-/// that dies ([`World::complete_dying_read`]), taking its failed completion.
-///
-/// [`World::complete_dying_read`]: reims_vgpu_core::testkit::objects::World::complete_dying_read
-fn fail_context(
-    device: &GraphicsDevice<FakePlatform>,
-    platform: &FakePlatform,
-    guest: &mut Guest,
-    context: u32,
-    (submit, complete): (u64, u64),
-) {
-    const RING_DATA: u32 = 0x1_0000;
-    assert_eq!(
-        create_queue(device, guest, context, 1, (submit, complete), RING_DATA, 0),
-        RGFX_STATUS_OK
-    );
-    let mut ring = QueueRing::new(device, submit, complete, u64::from(RING_DATA));
-    ring.send(device, command_buffer(obj(context, 1), 100));
-    let cb = committed(platform, 1)[0];
-    assert!(platform.world().complete_dying_read(
-        cb,
-        "a failure none of Metal's",
-        CompleteOn::Thread
-    ));
-    let failed = ring.event().expect("the failed buffer's completion");
-    let failed = RgfxCbComplete::read_from_bytes(&failed).unwrap();
-    assert_eq!((failed.cb_obj_id, failed.status), (100, RGFX_CB_INTERNAL));
-}
-
-/// A failed context's queue creates and queries are refused as its other work is: a
-/// `QUEUE_CREATE` makes no rings, and a heap texture size query and an argument layout query are
-/// answered refused, the platform not asked and nothing written; another context's are answered
-#[test]
-fn a_failed_context_s_queues_and_queries_are_refused() {
-    let raised = Arc::new(AtomicU32::new(0));
-    let (device, platform) = headless_on(&raised);
-    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    let mut guest = Guest::new(&device);
-    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
-    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
-    const NEXT_SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000;
-    const NEXT_COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000;
-    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
-    const OTHER_BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
-    const SIZE: u64 = 0x1000;
-    fail_context(&device, &platform, &mut guest, 3, (SUBMIT, COMPLETE));
-
-    // The queue create.
-    assert_eq!(
-        create_queue(
-            &device,
-            &mut guest,
-            3,
-            2,
-            (NEXT_SUBMIT, NEXT_COMPLETE),
-            0x1_0000,
-            0
-        ),
-        RGFX_STATUS_REFUSED
-    );
-    assert_eq!(
-        device.graphics_queue_count(),
-        1,
-        "the refused queue's rings"
-    );
-
-    // The heap texture size query.
-    let size = |obj_id: u64| {
-        RgfxHeapTextureSizeAndAlign {
-            header: RgfxMsgHeader {
-                r#type: RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
-                size: 0,
-                seqno: 0,
-            },
-            obj_id,
-            desc: RgfxTextureDescriptor {
-                pixel_format: 80,
-                texture_type: 2,
-                width: 256,
-                height: 128,
-                depth: 1,
-                mipmap_level_count: 1,
-                array_length: 1,
-                sample_count: 1,
-                ..RgfxTextureDescriptor::default()
-            },
-        }
-        .as_bytes()
-        .to_vec()
-    };
-    let sizes = || {
-        platform
-            .call_log()
-            .calls_to("heapTextureSizeAndAlignWithDescriptor:")
-            .len()
-    };
-    guest.send(&device, size(obj(3, 8)));
-    let answer = RgfxSizeAndAlign::read_from_bytes(&guest.event().unwrap()).unwrap();
-    assert_eq!(
-        (answer.status, answer.size, answer.align),
-        (RGFX_STATUS_REFUSED, 0, 0)
-    );
-    assert_eq!(sizes(), 0);
-    guest.send(&device, size(obj(4, 8)));
-    let answer = RgfxSizeAndAlign::read_from_bytes(&guest.event().unwrap()).unwrap();
-    assert_eq!(answer.status, RGFX_STATUS_OK);
-    assert_eq!(sizes(), 1);
-
-    // The argument layout query.
-    guest.send(&device, block_grant(3, BLOCK, SIZE));
-    guest.send(&device, block_grant(4, OTHER_BLOCK, SIZE));
-    let descriptor = RgfxArgumentDescriptor {
-        data_type: 60, // MTLDataTypePointer
-        index: 0,
-        ..RgfxArgumentDescriptor::default()
-    };
-    let layout = |obj_id: u64, reply_offset: u64| {
-        let mut bytes = RgfxArgumentLayoutQuery {
-            header: RgfxMsgHeader {
-                r#type: RGFX_CMD_ARGUMENT_LAYOUT,
-                size: 0,
-                seqno: 0,
-            },
-            obj_id,
-            reply_offset,
-            reply_length: SIZE,
-            source: RGFX_ARGUMENT_SOURCE_DESCRIPTORS,
-            count: 1,
-            descriptors_offset: size_of::<RgfxArgumentLayoutQuery>() as u32,
-            ..RgfxArgumentLayoutQuery::default()
-        }
-        .as_bytes()
-        .to_vec();
-        bytes.extend_from_slice(descriptor.as_bytes());
-        bytes
-    };
-    guest.send(&device, layout(obj(3, 9), BLOCK));
-    let seqno = guest.seqno;
-    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_REFUSED);
-    // SAFETY: as `Guest`'s helpers; the block lies in the region.
-    assert_eq!(unsafe { guest.load_u64(BLOCK as usize) }, 0, "written");
-    guest.send(&device, layout(obj(4, 9), OTHER_BLOCK));
-    let seqno = guest.seqno;
-    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
-}
-
-/// A failed context's pipeline creates are carried out as any context's are: its render and
-/// compute creates are answered with their reflections and their pipelines stored, as its process,
-/// which posts a create equal to one the device made before without waiting for the answer, takes
-/// them; its other creates stay refused
-#[test]
-fn a_failed_context_s_pipeline_creates_are_carried_out() {
-    let raised = Arc::new(AtomicU32::new(0));
-    let (device, platform) = headless_on(&raised);
-    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
-    let mut guest = Guest::new(&device);
-    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
-    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
-    make_library(&device, &mut guest, obj(3, 10));
-    fail_context(&device, &platform, &mut guest, 3, (SUBMIT, COMPLETE));
-    let before = device.decoder_object_count();
-    guest.send(&device, render_pipeline_create(obj(3, 11), obj(3, 10)));
-    expect_reflection(&mut guest, obj(3, 11), RGFX_PIPELINE_OK);
-    guest.send(&device, compute_pipeline_create(obj(3, 12), obj(3, 10)));
-    expect_reflection(&mut guest, obj(3, 12), RGFX_PIPELINE_OK);
-    assert_eq!(device.decoder_object_count(), before + 2, "both pipelines");
-    // Its library create is still refused.
-    assert_ne!(
-        answered(&device, &mut guest, library_create(obj(3, 13))),
-        RGFX_STATUS_OK
-    );
-    assert_eq!(device.decoder_object_count(), before + 2);
 }
 
 /// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS` and
