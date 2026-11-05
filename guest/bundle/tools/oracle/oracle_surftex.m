@@ -2,7 +2,8 @@
 // an IOSurface, which it answers nil for, and at which Metal ends the process, by the
 // descriptor's type, size, depth, array length, levels, samples, pixel format, usage, storage,
 // CPU cache and hazard tracking modes and swizzle, and by the surface's OSType, planes and the
-// plane asked for. No Metal validation layer is asked for: what a guest's process meets.
+// plane asked for, and every two-plane format. No Metal validation layer is asked for: what a
+// guest's process meets.
 //   oracle_surftex DEVICE              every case, each in a child process of its own
 //   oracle_surftex DEVICE --case N     case N alone (what the children run)
 //   oracle_surftex DEVICE --list       the cases, one a line, without running them
@@ -257,6 +258,34 @@ static const struct Case kCases[] = {
        MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, kDefault, kDefault, kDefault, 0),
     CU("420v.p0.ycbcr.64x63.rt", k420v, 0, (MTLPixelFormat)500, 64, 63,
        MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, kDefault, kDefault, kDefault, 0),
+    // The third round: every two-plane format over the luma plane, and 500 over the chroma one.
+    C("420v.p0.fmt502", k420v, 0, (MTLPixelFormat)502, 64, 64),
+    C("420v.p0.fmt503", k420v, 0, (MTLPixelFormat)503, 64, 64),
+    C("420v.p0.fmt505", k420v, 0, (MTLPixelFormat)505, 64, 64),
+    C("420v.p0.fmt506", k420v, 0, (MTLPixelFormat)506, 64, 64),
+    C("420v.p0.fmt507", k420v, 0, (MTLPixelFormat)507, 64, 64),
+    C("420v.p0.fmt508", k420v, 0, (MTLPixelFormat)508, 64, 64),
+    C("420v.p0.fmt509", k420v, 0, (MTLPixelFormat)509, 64, 64),
+    C("420v.p0.fmt510", k420v, 0, (MTLPixelFormat)510, 64, 64),
+    C("420v.p0.fmt520", k420v, 0, (MTLPixelFormat)520, 64, 64),
+    C("420v.p0.fmt522", k420v, 0, (MTLPixelFormat)522, 64, 64),
+    C("420v.p0.fmt523", k420v, 0, (MTLPixelFormat)523, 64, 64),
+    C("420v.p0.fmt525", k420v, 0, (MTLPixelFormat)525, 64, 64),
+    C("420v.p0.fmt526", k420v, 0, (MTLPixelFormat)526, 64, 64),
+    C("420v.p0.fmt527", k420v, 0, (MTLPixelFormat)527, 64, 64),
+    C("420v.p0.fmt528", k420v, 0, (MTLPixelFormat)528, 64, 64),
+    C("420v.p0.fmt529", k420v, 0, (MTLPixelFormat)529, 64, 64),
+    C("420v.p0.fmt530", k420v, 0, (MTLPixelFormat)530, 64, 64),
+    C("420v.p0.fmt540", k420v, 0, (MTLPixelFormat)540, 64, 64),
+    C("420v.p0.fmt541", k420v, 0, (MTLPixelFormat)541, 64, 64),
+    C("420v.p0.fmt542", k420v, 0, (MTLPixelFormat)542, 64, 64),
+    C("420v.p0.fmt543", k420v, 0, (MTLPixelFormat)543, 64, 64),
+    C("420v.p0.fmt544", k420v, 0, (MTLPixelFormat)544, 64, 64),
+    C("420v.p0.fmt545", k420v, 0, (MTLPixelFormat)545, 64, 64),
+    C("420v.p0.fmt550", k420v, 0, (MTLPixelFormat)550, 64, 64),
+    C("420v.p0.fmt551", k420v, 0, (MTLPixelFormat)551, 64, 64),
+    C("420v.p1.fmt500", k420v, 1, (MTLPixelFormat)500, 32, 32),
+    C("bgra1.fmt500", kBGRA1, 0, (MTLPixelFormat)500, 64, 64),
 };
 enum { kCaseCount = sizeof kCases / sizeof kCases[0] };
 
