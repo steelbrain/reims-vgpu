@@ -404,6 +404,43 @@ guest, under KVM:
 - `profile-997` on the guest's eight vCPUs adds about 30% of a host core to
   QEMU's CPU time.
 
+### fbt probes in the guest's kexts
+
+`dtrace -l -P fbt -m com.steelbrain.ReimsGraphics` lists no probes. The
+guest's kernel decides that, not the kext's build. **Read** from xnu's
+public source (its main branch, `bsd/dev/dtrace` and
+`libkern/c++/OSKext.cpp`, not checked against macOS 26's):
+- While SIP restricts dtrace (`CSR_ALLOW_UNRESTRICTED_DTRACE` not allowed),
+  the kernel makes no fbt probe in any module
+  (`dtrace_fbt_probes_restricted`). The lane's guests run with SIP on, so
+  fbt needs an image whose `csr-active-config` allows dtrace.
+- OpenCore injects our kext into the Boot kernel collection
+  ([docs/graphics-kext/design.md](graphics-kext/design.md), item 13). For a
+  Boot-collection kext, the kernel defers fbt's probes to the dtrace command,
+  which sends the symbols it finds for the kext's UUID
+  (`dtrace_module_loaded`). It makes them from the kext's own symbol table
+  at its load only where the kext's `Info.plist` sets
+  `OSBundleForceDTraceInit`, which `OSKext::registerWithDTrace` ignores for a
+  Boot-collection kext unless the guest boots with `keepsyms=1`. From that
+  table fbt takes only global functions.
+
+**Inferred**, not measured: the dtrace command finds Apple's Boot-collection
+kexts in the collection on the guest's disk, but OpenCore injects ours only
+into the copy in memory, and no file on the guest's disk has its UUID.
+
+**Measured** on the kext as `make -C guest/kext` builds it: its symbol table
+keeps every function (398 symbols in `__text`, 324 of them global), it has an
+`LC_UUID`, and 384 of the 392 functions `otool -tv` lists (314 of the 319
+global ones) start with `push %rbp; mov %rsp,%rbp`, the prologue fbt patches
+on x86-64. `keepsyms=1` alone, which the lane's trace images of 11-01 had in
+their boot-args beside `csr-active-config` 0x7f, does not change where the
+probes' symbols come from (above).
+
+So an image for tracing our kext sets three things: a `csr-active-config`
+that allows dtrace, `keepsyms=1`, and `OSBundleForceDTraceInit` (true) in the
+`Info.plist` of the ReimsGraphics.kext that OpenCore injects. Whether that
+gives our global functions their probes is not yet measured.
+
 ## apple-gfx on reims-vgpu
 
 `vendor/qemu`'s `apple-gfx` is three C files, `hw/display/apple-gfx.c`,
