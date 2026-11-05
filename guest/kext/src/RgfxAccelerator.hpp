@@ -215,13 +215,18 @@ enum RgfxReleaseAttach {
 	// block's release is answered OK, so the block takes a wire of them
 	// (rgfxSurfaceCacheHostPages).
 	kRgfxReleaseAttached,
+	// Nothing yet, asked with `name` false: its pages are to be named first, or a lock is naming
+	// them, each waiting on the host's answer. The release thread hands the release to the
+	// naming worker, which asks again with `name` true (RgfxReleaseTable.hpp).
+	kRgfxReleaseNameFirst,
 };
-// The release thread is to post the BLOCK_RELEASE of the cached block at `offset`, of surface
-// `surface` (retained by the caller): a deferred block's pages are named first where the GPU
-// wrote it and the surface lives past the kext's own references (rgfxCacheReleaseNext). Under no
-// lock of the kext's.
+// The BLOCK_RELEASE of the cached block at `offset`, of surface `surface` (retained by the
+// caller), is to be posted: a deferred block's pages are named first where the GPU wrote it and
+// the surface lives past the kext's own references (rgfxCacheReleaseNext), and a lock's naming
+// in flight is waited for, where `name`; else neither is, and kRgfxReleaseNameFirst says one is
+// owed. Under no lock of the kext's.
 RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset,
-                                                OSObject *surface);
+                                                OSObject *surface, bool name);
 // The pages of the deferred block of device cache `cache`, or else of the block at `offset`,
 // where the host may map them (rgfxCacheHostPages): its surface's memory, retained and wired once
 // more for the block to hold until its release is answered OK; else null. Takes the locks' lock

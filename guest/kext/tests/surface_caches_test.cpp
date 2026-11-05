@@ -320,12 +320,20 @@ void deferredRelease()
 	check(rgfxCacheReleaseNext(t, kBlock, 0, kRgfxSurfaceKextRefs) == kRgfxCacheReleaseAsIs &&
 	          c->deferral == kRgfxCacheDeferred,
 	      "held by the kext alone: nothing reads its pages");
+	check(rgfxCacheReleasePeek(t, kBlock, 0, kRgfxSurfaceKextRefs) == kRgfxCacheReleaseAsIs &&
+	          rgfxCacheReleasePeek(t, kBlock, 0, kRgfxSurfaceKextRefs + 1) ==
+	              kRgfxCacheReleaseAttach &&
+	          c->deferral == kRgfxCacheDeferred,
+	      "the release thread's look answers as the release would, and changes nothing");
 	check(rgfxCacheReleaseNext(t, kBlock, 0, kRgfxSurfaceKextRefs + 1) ==
 	              kRgfxCacheReleaseAttach &&
 	          c->deferral == kRgfxCacheAttaching,
 	      "with no client but a reference past the kext's (a port), its pages are named");
 	check(rgfxCacheReleaseNext(t, kBlock, 0, kRgfxSurfaceKextRefs + 1) == kRgfxCacheReleaseWait,
 	      "while they are named, the release waits");
+	check(rgfxCacheReleasePeek(t, kBlock, 0, kRgfxSurfaceKextRefs + 1) == kRgfxCacheReleaseWait &&
+	          c->deferral == kRgfxCacheAttaching,
+	      "and a look then says it waits: the release thread hands it to the naming worker");
 	uint64_t offset = 0, mark = 0;
 	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheWait,
 	      "and a lock waits for the release");

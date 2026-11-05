@@ -41,7 +41,8 @@
  * and one after it calls the control function, which waits for the host's answer to the
  * deferral, then names the block's pages before it goes on (SURFACE_PAGES with ATTACH), one lock
  * at a time and under no lock of the contexts'. Its release names them first where the GPU wrote
- * it and its surface lives on (rgfxSurfaceCacheReleaseAttach).
+ * it and its surface lives on (rgfxSurfaceCacheReleaseAttach), on the naming worker, never the
+ * release thread, which goes on with the other releases meanwhile (RgfxReleaseTable.hpp).
  *
  * Our own code; it names SDK-public IOKit calls and IOSurface's interface (RgfxIOSurfaceKPI.hpp).
  */
@@ -575,7 +576,7 @@ void rgfxSurfaceCacheSettle(void *cache, bool deferred)
 }
 
 RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset,
-                                                OSObject *surface)
+                                                OSObject *surface, bool name)
 {
 	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		return kRgfxReleaseAsIs;
@@ -583,6 +584,18 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 	const int32_t clients = rgfxIOSurfaceClientCount(surface);
 	const int32_t retains = surface->getRetainCount();
 	RgfxReleaseAttach did = kRgfxReleaseAsIs;
+	if (!name) {
+		IOLockLock(state.lock);
+		const RgfxCacheReleaseStep step =
+		    rgfxCacheReleasePeek(state.caches, offset, clients, retains);
+		const RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
+		if (step != kRgfxCacheReleaseAsIs)
+			did = kRgfxReleaseNameFirst;
+		else if (c != nullptr && c->deferral == kRgfxCacheDeferred)
+			did = kRgfxReleaseUnattached;
+		IOLockUnlock(state.lock);
+		return did;
+	}
 	// A naming not taken is made again, as a lock's is, until the locks' wait ends: past it the
 	// release goes with the pages unnamed, what the GPU wrote not copied into them.
 	uint64_t deadline = 0;

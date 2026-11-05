@@ -270,6 +270,8 @@ bool releaseAnswered(OSObject *, UInt64 seqno, UInt32 status);
 IOLock *releaseLock = nullptr;
 RgfxReleaseTable releaseTable = {nullptr, 0, 0};
 thread_call_t releaseTimer = nullptr;
+// The thread call that names deferred blocks' pages before their releases (nameReleases).
+thread_call_t namingCall = nullptr;
 bool releaseHooked = false;
 
 // The closes in flight (RgfxCloseTable.hpp), under releaseLock: their answers come through the
@@ -424,13 +426,43 @@ void retireCloses(RgfxAccelerator *accel)
 	}
 }
 
+// The naming thread call (THREAD_CALL_OPTIONS_ONCE, one at a time): names the pages of each
+// deferred block the release worker handed it (kRgfxReleaseNaming), one after another, waiting
+// for the host's answer, or for a lock's naming in flight (rgfxSurfaceCacheReleaseAttach), and
+// hands each back to the release worker to post (kRgfxReleaseNamed). The release worker goes on
+// with the other releases meanwhile.
+void nameReleases(thread_call_param_t accelerator, thread_call_param_t)
+{
+	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
+	for (;;) {
+		IOLockLock(releaseLock);
+		const int32_t at = rgfxReleaseNextNaming(releaseTable);
+		const UInt64 offset = at >= 0 ? releaseTable.entries[at].offset : 0;
+		IOLockUnlock(releaseLock);
+		if (at < 0)
+			return;
+		RgfxReleaseAttach attach = kRgfxReleaseAsIs;
+		bool written = false;
+		if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(offset, &written)) {
+			attach = rgfxSurfaceCacheReleaseAttach(accel, offset, surface, true);
+			surface->release();
+		}
+		IOLockLock(releaseLock);
+		rgfxReleaseNamed(releaseTable, static_cast<uint32_t>(at), attach);
+		IOLockUnlock(releaseLock);
+		thread_call_enter(releaseCall);
+	}
+}
+
 // The release thread call, the guest's one (THREAD_CALL_OPTIONS_ONCE): lets go of the dormant
 // blocks their surfaces asked to go (reapDormant); retires the releases answered; then posts
 // each freed block's BLOCK_RELEASE on ring 0, kReleaseBatch at a time with one doorbell at most,
 // as many as the release table holds, and returns without waiting for any. The work loop hands
 // each answer to its entry, in whatever order the contexts' command buffers finish, and runs the
 // worker again to retire it; so releases posted together wait for their contexts' drains at
-// once, and a slow context holds back only its own blocks. Never on the freeing thread.
+// once, and a slow context holds back only its own blocks. A deferred block whose pages are
+// named first goes to the naming worker (nameReleases), which waits for the host's answers, and
+// is posted once named. Never on the freeing thread.
 void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
@@ -456,8 +488,22 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 		int32_t at[kReleaseBatch];
 		UInt32 n = 0;
 		while (n < kReleaseBatch) {
+			// A release whose block's pages the naming worker named goes first, its entry
+			// holding its block; else a new entry, for the next freed block.
 			IOLockLock(releaseLock);
-			at[n] = rgfxReleaseReserve(releaseTable);
+			const int32_t named = rgfxReleaseTakeNamed(releaseTable);
+			at[n] = named >= 0 ? named : rgfxReleaseReserve(releaseTable);
+			RgfxBlock block = {};
+			RgfxReleaseAttach attach = kRgfxReleaseAsIs;
+			if (named >= 0) {
+				const RgfxReleaseEntry &was = releaseTable.entries[named];
+				block.offset = was.offset;
+				block.serial = was.serial;
+				block.size = was.size;
+				block.context = was.context;
+				block.freedAt = was.freedAt;
+				attach = static_cast<RgfxReleaseAttach>(was.attach);
+			}
 			IOLockUnlock(releaseLock);
 			// A full table: the answers that free its entries run the worker again.
 			if (at[n] < 0) {
@@ -465,16 +511,17 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 				break;
 			}
 			RgfxReleaseEntry &e = releaseTable.entries[at[n]];
-			RgfxBlock block;
-			IOLockLock(contextLock);
-			const bool any = rgfxBlockNextRelease(blockTable, &block);
-			IOLockUnlock(contextLock);
-			if (!any) {
-				IOLockLock(releaseLock);
-				rgfxReleaseUnposted(releaseTable, static_cast<uint32_t>(at[n]));
-				IOLockUnlock(releaseLock);
-				more = false;
-				break;
+			if (named < 0) {
+				IOLockLock(contextLock);
+				const bool any = rgfxBlockNextRelease(blockTable, &block);
+				IOLockUnlock(contextLock);
+				if (!any) {
+					IOLockLock(releaseLock);
+					rgfxReleaseUnposted(releaseTable, static_cast<uint32_t>(at[n]));
+					IOLockUnlock(releaseLock);
+					more = false;
+					break;
+				}
 			}
 			RgfxBlockRelease &release = batch[n];
 			release = {};
@@ -487,11 +534,25 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 			// looks it up from one reads its pages. Its clients are read here, out of every
 			// lock, as at a block's sleep.
 			// A deferred block's pages are named first, where the GPU wrote it and its surface
-			// lives on, so the release copies the cache into them (rgfxCacheReleaseNext).
+			// lives on, so the release copies the cache into them (rgfxCacheReleaseNext): by
+			// the naming worker, whose waits for the host's answers this thread does not share.
 			bool written = false;
 			if (OSObject *surface = rgfxSurfaceCacheReleasingSurface(block.offset, &written)) {
-				const RgfxReleaseAttach attach =
-				    rgfxSurfaceCacheReleaseAttach(accel, block.offset, surface);
+				if (named < 0)
+					attach = rgfxSurfaceCacheReleaseAttach(accel, block.offset, surface, false);
+				if (attach == kRgfxReleaseNameFirst) {
+					surface->release();
+					IOLockLock(releaseLock);
+					e.offset = block.offset;
+					e.serial = block.serial;
+					e.size = block.size;
+					e.context = block.context;
+					e.freedAt = block.freedAt;
+					rgfxReleaseNaming(releaseTable, static_cast<uint32_t>(at[n]));
+					IOLockUnlock(releaseLock);
+					thread_call_enter(namingCall);
+					continue;
+				}
 				// Pages the host may map now: the block holds them wired until its release is
 				// answered OK, whatever becomes of its cache.
 				IOMemoryDescriptor *hostPages = attach == kRgfxReleaseAttached
@@ -594,13 +655,16 @@ bool RgfxAccelerator::startContexts()
 	// loop that delivers its answers, so the one worker never starves that loop.
 	thread_call_t call = thread_call_allocate_with_options(
 	    releaseFreedBlocks, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+	// One naming worker at a time, as the release worker, for the releases that name pages.
+	thread_call_t naming = thread_call_allocate_with_options(
+	    nameReleases, this, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
 	// The releases in flight, and the timer for the oldest's answer.
 	IOLock *rlock = IOLockAlloc();
 	RgfxReleaseEntry *releases =
 	    static_cast<RgfxReleaseEntry *>(IOMalloc(sizeof(RgfxReleaseEntry) * kMaxReleases));
 	thread_call_t timer = thread_call_allocate(releaseTimerFired, nullptr);
 	RgfxBlock *expected = nullptr;
-	if (lock && wlock && table && rings && call && rlock && releases && timer &&
+	if (lock && wlock && table && rings && call && naming && rlock && releases && timer &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
 	                                __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
@@ -609,6 +673,7 @@ bool RgfxAccelerator::startContexts()
 		watched = rings;
 		watchLock = wlock;
 		releaseCall = call;
+		namingCall = naming;
 		releaseTable = {releases, kMaxReleases, 0};
 		releaseTimer = timer;
 		__atomic_store_n(&releaseLock, rlock, __ATOMIC_RELEASE);
@@ -673,6 +738,8 @@ bool RgfxAccelerator::startContexts()
 		IOFree(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
 	if (call)
 		thread_call_free(call);
+	if (naming)
+		thread_call_free(naming);
 	if (rlock)
 		IOLockFree(rlock);
 	if (releases)

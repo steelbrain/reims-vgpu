@@ -1,6 +1,8 @@
 // The native test of RgfxReleaseTable.hpp: releases in flight are answered in any order, an answer
 // that comes before its entry is marked posted still finds it, and one not answered in time is
-// told of once and stays in flight, holding its block, until its answer retires it.
+// told of once and stays in flight, holding its block, until its answer retires it. A release
+// whose block's pages are named first waits off the ring, holding its entry and its block, while
+// the others are posted, answered and retired, and is posted once named.
 #include "RgfxReleaseTable.hpp"
 
 #include <cstdio>
@@ -151,6 +153,51 @@ int main()
 		bool answered = false;
 		check(rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered), "and retired");
 		check(rgfxReleaseReserve(x.t) >= 0, "which frees an entry");
+	}
+	{
+		// A release whose deferred block's pages are named first is handed to the naming worker:
+		// no answer, lateness or timer looks at it, and the releases after it go on.
+		Table x;
+		const int32_t naming = rgfxReleaseReserve(x.t);
+		check(naming >= 0, "an entry reserved for a block whose pages are named first");
+		x.entries[naming].offset = 0x5000;
+		x.entries[naming].serial = 7;
+		check(rgfxReleaseNextNaming(x.t) < 0, "nothing to name before it is handed over");
+		rgfxReleaseNaming(x.t, static_cast<uint32_t>(naming));
+		check(rgfxReleaseNextNaming(x.t) == naming, "the naming worker finds it");
+		check(rgfxReleaseTakeNamed(x.t) < 0, "not named yet: the release worker posts nothing");
+		check(!rgfxReleaseAnswer(x.t, 0, 0), "no seqno: no answer finds it");
+		const int32_t other = post(x, 0x6000, 61, 10);
+		check(other >= 0 && other != naming, "the next block's release is posted meanwhile");
+		check(rgfxReleaseOldest(x.t) == 10, "the timer is the posted release's alone");
+		RgfxReleaseEntry e;
+		bool answered = false;
+		check(rgfxReleaseTakeDone(x.t, 10 + kTimeout, kTimeout, &e, &answered) && !answered &&
+		          e.offset == 0x6000,
+		      "the posted one is late, the naming one never");
+		check(!rgfxReleaseTakeDone(x.t, 10 + 100 * kTimeout, kTimeout, &e, &answered),
+		      "however long the naming takes");
+		check(rgfxReleaseAnswer(x.t, 61, 0) &&
+		          rgfxReleaseTakeDone(x.t, 20, kTimeout, &e, &answered) && answered &&
+		          e.offset == 0x6000,
+		      "and the posted one is answered and retired while the naming waits");
+		check(x.t.inFlight == 1 && x.entries[naming].state == kRgfxReleaseNaming,
+		      "the naming one holds its entry");
+		rgfxReleaseNamed(x.t, static_cast<uint32_t>(naming), 2);
+		check(rgfxReleaseNextNaming(x.t) < 0, "named: nothing left to name");
+		check(rgfxReleaseTakeNamed(x.t) == naming && x.entries[naming].attach == 2 &&
+		          x.entries[naming].offset == 0x5000 && x.entries[naming].serial == 7 &&
+		          x.entries[naming].state == kRgfxReleasePosting,
+		      "the release worker takes it back, posting, with its block and what the naming did");
+		check(rgfxReleaseTakeNamed(x.t) < 0, "once");
+		x.entries[naming].seqno = 62;
+		rgfxReleasePosted(x.t, static_cast<uint32_t>(naming), 30);
+		check(rgfxReleaseAnswer(x.t, 62, 0) &&
+		          rgfxReleaseTakeDone(x.t, 40, kTimeout, &e, &answered) && answered &&
+		          e.offset == 0x5000 && x.t.inFlight == 0,
+		      "then it is posted, answered and retired as any other");
+		rgfxReleaseNamed(x.t, static_cast<uint32_t>(naming), 1);
+		check(rgfxReleaseTakeNamed(x.t) < 0, "a naming done for an entry not naming is not taken");
 	}
 	std::printf("release_table_test: OK (%d checks)\n", checks);
 	return 0;

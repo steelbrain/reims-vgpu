@@ -19,6 +19,13 @@
 // entry before the message is published (ReimsGraphics::tryPost's `waiterSeqno`), so an answer
 // that comes before the poster marks the entry posted still finds it.
 //
+// A deferred block whose pages are named before its release (RgfxAcceleratorLocks.cpp,
+// rgfxSurfaceCacheReleaseAttach) waits for the host's answer to that naming, or for a lock's
+// naming in flight: its entry, reserved and holding the block, is handed to the naming worker
+// (kRgfxReleaseNaming), and the release worker goes on with the next block. Once the naming is
+// done (kRgfxReleaseNamed), the release worker posts it as any other. So a slow naming holds
+// back only the releases that name pages, never the others or the region's room they free.
+//
 // Header-only and free of the kernel's headers, so its native test (tests/release_table_test.cpp)
 // builds it as the kext does.
 //
@@ -38,6 +45,11 @@ enum RgfxReleaseState : uint8_t {
 	kRgfxReleaseLate,
 	// Answered, `status` the device's, to be retired.
 	kRgfxReleaseAnswered,
+	// Reserved and holding its block, whose deferred pages the naming worker names before the
+	// release is posted: not on the ring, so no answer, lateness or timer looks at it.
+	kRgfxReleaseNaming,
+	// Its pages' naming done (`attach`): its release is the release worker's to post.
+	kRgfxReleaseNamed,
 };
 
 struct RgfxReleaseEntry {
@@ -54,6 +66,8 @@ struct RgfxReleaseEntry {
 	uint32_t status;
 	// The release's flags, and whether its surface's cache was written since its last copy.
 	uint32_t flags;
+	// What the naming of its block's pages did (the kext's RgfxReleaseAttach), once named.
+	uint32_t attach;
 	bool written;
 	RgfxReleaseState state;
 };
@@ -96,6 +110,48 @@ inline void rgfxReleaseUnposted(RgfxReleaseTable &t, uint32_t i)
 		t.entries[i].state = kRgfxReleaseFree;
 		t.inFlight--;
 	}
+}
+
+// Entry `i`, reserved and holding its block, has its block's deferred pages named before its
+// release is posted, by the naming worker (rgfxReleaseNextNaming).
+inline void rgfxReleaseNaming(RgfxReleaseTable &t, uint32_t i)
+{
+	if (t.entries[i].state == kRgfxReleasePosting)
+		t.entries[i].state = kRgfxReleaseNaming;
+}
+
+// The first entry whose block's pages are to be named, or -1 where none is: the naming worker,
+// one at a time, names it, then marks it named.
+inline int32_t rgfxReleaseNextNaming(const RgfxReleaseTable &t)
+{
+	for (uint32_t i = 0; i < t.capacity; i++) {
+		if (t.entries[i].state == kRgfxReleaseNaming)
+			return static_cast<int32_t>(i);
+	}
+	return -1;
+}
+
+// The naming of entry `i`'s block's pages is done, `attach` what it did: its release is to be
+// posted.
+inline void rgfxReleaseNamed(RgfxReleaseTable &t, uint32_t i, uint32_t attach)
+{
+	if (t.entries[i].state == kRgfxReleaseNaming) {
+		t.entries[i].attach = attach;
+		t.entries[i].state = kRgfxReleaseNamed;
+	}
+}
+
+// An entry whose block's pages are named, posting again, for the release worker to post: its
+// index, or -1 where none is.
+inline int32_t rgfxReleaseTakeNamed(RgfxReleaseTable &t)
+{
+	for (uint32_t i = 0; i < t.capacity; i++) {
+		if (t.entries[i].state == kRgfxReleaseNamed) {
+			t.entries[i].state = kRgfxReleasePosting;
+			return static_cast<int32_t>(i);
+		}
+	}
+	return -1;
 }
 
 // The device answered the message of `seqno` with `status`: true where it is a release in the

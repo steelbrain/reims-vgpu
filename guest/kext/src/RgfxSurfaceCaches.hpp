@@ -547,10 +547,12 @@ enum RgfxCacheReleaseStep {
 	kRgfxCacheReleaseAttach,
 };
 
-inline RgfxCacheReleaseStep rgfxCacheReleaseNext(RgfxCacheTable &t, uint64_t offset,
+// What rgfxCacheReleaseNext would answer, with nothing changed: for the release thread, which
+// hands a release that waits or names to the naming worker, and goes on with the next.
+inline RgfxCacheReleaseStep rgfxCacheReleasePeek(RgfxCacheTable &t, uint64_t offset,
                                                  int32_t clients, int32_t retains)
 {
-	RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
+	const RgfxCachedSurface *c = rgfxCacheAtBlock(t, offset);
 	if (c == nullptr || !c->releasing)
 		return kRgfxCacheReleaseAsIs;
 	if (c->deferral == kRgfxCacheAttaching)
@@ -558,8 +560,16 @@ inline RgfxCacheReleaseStep rgfxCacheReleaseNext(RgfxCacheTable &t, uint64_t off
 	if (c->deferral != kRgfxCacheDeferred || c->writes == c->copied ||
 	    (clients <= 0 && retains <= kRgfxSurfaceKextRefs))
 		return kRgfxCacheReleaseAsIs;
-	c->deferral = kRgfxCacheAttaching;
 	return kRgfxCacheReleaseAttach;
+}
+
+inline RgfxCacheReleaseStep rgfxCacheReleaseNext(RgfxCacheTable &t, uint64_t offset,
+                                                 int32_t clients, int32_t retains)
+{
+	const RgfxCacheReleaseStep step = rgfxCacheReleasePeek(t, offset, clients, retains);
+	if (step == kRgfxCacheReleaseAttach)
+		rgfxCacheAtBlock(t, offset)->deferral = kRgfxCacheAttaching;
+	return step;
 }
 
 // A read-write CPU lock of surface `key` goes on: its CPU generation moves. The new generation,
