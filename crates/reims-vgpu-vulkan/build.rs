@@ -32,9 +32,10 @@
 //! that read and write a colour attachment's imageblock cells, `src/gpu/tile_edges.metal`, into
 //! `$OUT_DIR/tile_edges.metallib`, the tests' Core Image kernel, `src/gpu/ci_kernel.metal`,
 //! compiled as Core Image compiles one (`-fcikernel`, then `metallib -cikernel`) into
-//! `$OUT_DIR/ci_kernel.metallib`, and those that import a symbol from a dynamic library,
-//! `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]), and the shell tests'
-//! stitchable functions, `guest/bundle/tests/stitchable.metal`, into
+//! `$OUT_DIR/ci_kernel.metallib`, the tests' mesh render pipelines' functions,
+//! `src/gpu/mesh.metal`, into `$OUT_DIR/mesh.metallib`, and those that import a symbol from a
+//! dynamic library, `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]), and
+//! the shell tests' stitchable functions, `guest/bundle/tests/stitchable.metal`, into
 //! `$OUT_DIR/stitchable.metallib`, with the library Metal's stitcher makes of them into
 //! `$OUT_DIR/stitched.metallib` ([`stitched`]): the runtime makes libraries of metallibs, not of
 //! source. The two commands compile with the language Metal 4.0
@@ -92,7 +93,7 @@ const STITCH_TOOL: [&str; 6] = [
 ];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 22] = [
+const TEST_LIBRARIES: [&str; 23] = [
     "predication",
     "no_draw",
     "icb_encode",
@@ -115,6 +116,7 @@ const TEST_LIBRARIES: [&str; 22] = [
     "argument_probe",
     "linked_caller",
     "linked_callee",
+    "mesh",
 ];
 
 /// The files [`imports`] makes.

@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
+use metal2vulkan::pipeline::{MeshPipelineDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
 
@@ -103,6 +103,23 @@ pub fn render_stages(d: &RenderPipelineDescriptor) -> String {
         Some(fragment) => format!("vertex {}, fragment {}", stage(&d.vertex), stage(fragment)),
         None => format!("vertex {}, no fragment function", stage(&d.vertex)),
     }
+}
+
+/// A mesh render descriptor's stages as a line names them.
+pub fn mesh_stages(d: &MeshPipelineDescriptor) -> String {
+    let object = d
+        .object
+        .as_ref()
+        .map_or("no object function".to_owned(), |o| {
+            format!("object {}", stage(o))
+        });
+    let fragment = d
+        .fragment
+        .as_ref()
+        .map_or("no fragment function".to_owned(), |f| {
+            format!("fragment {}", stage(f))
+        });
+    format!("{object}, mesh {}, {fragment}", stage(&d.mesh))
 }
 
 /// A made state as a line names it, by its `uniqueIdentifier`.

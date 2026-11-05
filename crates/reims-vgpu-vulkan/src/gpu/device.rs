@@ -2105,15 +2105,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         super::states::new_render_pipeline_state_full(self, desc)
     }
 
-    /// Dies at the send: this platform makes no mesh pipeline yet.
+    /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it
+    /// finds wrong, and a payload past Metal's, are the `NSError`; every other refusal dies at
+    /// the send ([`super::states::new_mesh_render_pipeline_state_full`]).
     fn new_mesh_render_pipeline_state_full(
         &self,
-        _desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+        desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
     ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
-        crate::answer::unrepresentable(
-            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
-            "a mesh render pipeline",
-        )
+        super::states::new_mesh_render_pipeline_state_full(self, desc)
     }
 
     /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it

@@ -16,7 +16,8 @@ use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType, TextureUsage};
 use metal2vulkan::pipeline::{
-    ComputePipelineDescriptor, RenderPipelineDescriptor, TileRenderPipelineDescriptor,
+    ComputePipelineDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
+    TileRenderPipelineDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
@@ -925,6 +926,54 @@ pub enum RenderDescriptor {
     Render(Box<RenderPipelineDescriptor>),
     /// A tile pipeline's.
     Tile(Box<TileRenderPipelineDescriptor>),
+    /// A mesh render pipeline's, with what the state answers of the guest's values the runtime's
+    /// descriptor does not hold.
+    Mesh(Box<MeshDescriptor>),
+}
+
+/// A mesh render pipeline state's descriptor: the runtime's, and the state's own answers.
+#[derive(Debug, Clone)]
+pub struct MeshDescriptor {
+    /// The runtime's descriptor the state was made of.
+    pub descriptor: MeshPipelineDescriptor,
+    /// What the state answers, and holds its draws to, of the guest's descriptor
+    /// ([`MeshAnswers`]).
+    pub answers: MeshAnswers,
+}
+
+/// What a mesh render pipeline state answers of its stages' limits, and what its draws are held
+/// to, from the guest's descriptor values the runtime's `MeshPipelineDescriptor` does not hold
+/// (`crate::gpu::states::mesh_answers` decides each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshAnswers {
+    /// Whether the state has an object function: its draws' threads per object threadgroup are
+    /// held to the object stage's limits only then, as Metal ignores them without one.
+    pub object: bool,
+    /// `maxTotalThreadsPerObjectThreadgroup`: 0 without an object function.
+    pub object_threads: u64,
+    /// `maxTotalThreadsPerMeshThreadgroup`.
+    pub mesh_threads: u64,
+    /// `objectThreadExecutionWidth`: 0 without an object function.
+    pub object_width: u64,
+    /// `meshThreadExecutionWidth`.
+    pub mesh_width: u64,
+    /// `maxTotalThreadgroupsPerMeshGrid`.
+    pub grid: u64,
+    /// The object and mesh stages' maxima the guest's descriptor set (0 for one it left), and
+    /// their required threadgroup sizes (`None` for none): a draw of a threadgroup past a
+    /// maximum set, or of another size than a required one, dies
+    /// (`crate::gpu::encode_render`'s `threads_held`).
+    pub held: [MeshStageHeld; 2],
+}
+
+/// What one stage of a mesh render pipeline state holds its draws' threadgroups to
+/// ([`MeshAnswers::held`]): the object stage's first, then the mesh stage's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshStageHeld {
+    /// The descriptor's maximum threads per threadgroup; 0 where it set none.
+    pub max: u64,
+    /// The descriptor's required threadgroup size; `None` where it set none.
+    pub required: Option<MtlSize>,
 }
 
 /// `id<MTLRenderPipelineState>`.
@@ -952,6 +1001,16 @@ pub(crate) fn render_pipeline_of(
         reflection: Reflection::new(descriptor.map(Reflected::Render)),
         drawn: std::sync::OnceLock::new(),
     })
+}
+
+impl RenderPipelineObject {
+    /// What a mesh render pipeline state answers ([`MeshAnswers`]); `None` for any other state.
+    pub(crate) fn mesh_answers(&self) -> Option<&MeshAnswers> {
+        match self.reflection.descriptor() {
+            Some(Reflected::Render(RenderDescriptor::Mesh(m))) => Some(&m.answers),
+            _ => None,
+        }
+    }
 }
 
 /// A runtime shared texture handle.
@@ -2128,29 +2187,30 @@ impl RenderPipeline for VulkanRenderPipeline {
         u64::from(plain(|| self.raw.max_total_threads_per_threadgroup()))
     }
 
-    /// 0: this platform makes no mesh pipeline yet.
+    /// A mesh render pipeline state's answer, which its creation decided
+    /// (`crate::gpu::states::mesh_answers`); 0 for any other state, as Metal's answers.
     fn max_total_threads_per_object_threadgroup(&self) -> u64 {
-        0
+        self.mesh_answers().map_or(0, |m| m.object_threads)
     }
 
-    /// 0: this platform makes no mesh pipeline yet.
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
     fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
-        0
+        self.mesh_answers().map_or(0, |m| m.mesh_threads)
     }
 
-    /// 0: this platform makes no mesh pipeline yet.
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
     fn object_thread_execution_width(&self) -> u64 {
-        0
+        self.mesh_answers().map_or(0, |m| m.object_width)
     }
 
-    /// 0: this platform makes no mesh pipeline yet.
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
     fn mesh_thread_execution_width(&self) -> u64 {
-        0
+        self.mesh_answers().map_or(0, |m| m.mesh_width)
     }
 
-    /// 0: this platform makes no mesh pipeline yet.
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
     fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
-        0
+        self.mesh_answers().map_or(0, |m| m.grid)
     }
 
     fn resource_index(&self) -> u64 {

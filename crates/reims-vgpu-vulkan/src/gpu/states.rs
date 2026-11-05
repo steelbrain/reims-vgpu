@@ -1,6 +1,6 @@
 //! The render family's state objects, made from core's values and the translator's descriptors:
-//! sampler states, depth-stencil states and render pipeline states (`GpuDevice`'s creators of
-//! them call here).
+//! sampler states, depth-stencil states, render pipeline states and mesh render pipeline states
+//! (`GpuDevice`'s creators of them call here).
 //!
 //! - **A value's raw properties** become the runtime's types in the value's order, each named by
 //!   its setter: a raw value no Metal enumerator is dies at that setter
@@ -152,17 +152,18 @@ use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::PrimitiveTopologyClass;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunctions,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunctions, MeshPipelineDescriptor,
     RenderPipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
     StageInputLayoutDescriptor, StageSource, TileRenderPipelineDescriptor,
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
-use reims_vgpu_core::platform::types::NsErrorText;
+use reims_vgpu_core::platform::types::{MtlSize, NsErrorText};
 use reims_vgpu_core::platform::values::{
-    ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
-    LinkedFunctionsDesc, RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
+    ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
+    FullRenderPipelineDesc, LinkedFunctionsDesc, RenderPipelineDesc, SamplerDesc, StageInputDesc,
+    StencilDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
@@ -175,8 +176,9 @@ use crate::gpu::desc::{VulkanRenderPipelineDescriptor, VulkanTileRenderPipelineD
 use crate::gpu::device::{VulkanDevice, nil_pipeline_descriptor};
 use crate::gpu::metal_value;
 use crate::gpu::resource::{
-    RenderDescriptor, RenderPipelineObject, VulkanDepthStencilState, VulkanFunction,
-    VulkanRenderPipeline, VulkanSamplerState, render_pipeline_of, sampler_state,
+    MeshAnswers, MeshDescriptor, MeshStageHeld, RenderDescriptor, RenderPipelineObject,
+    VulkanDepthStencilState, VulkanFunction, VulkanRenderPipeline, VulkanSamplerState,
+    render_pipeline_of, sampler_state,
 };
 use crate::gpu::serialized;
 use crate::gpu::timing;
@@ -598,6 +600,258 @@ pub(crate) fn new_render_pipeline_state_full(
     )
 }
 
+/// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:` of the whole value `desc`,
+/// the graphics lane's, with no options and no reflection: its object, mesh and fragment
+/// functions, each with the functions its stage links, its colour attachments, its depth and
+/// stencil formats, its raster sample count, alpha-to-coverage, alpha-to-one, rasterization and
+/// indirect command buffer support are the runtime descriptor's own, and its label the options'.
+/// What the runtime's descriptor does not hold is the state's own ([`mesh_answers`]): the
+/// stages' maxima, the grid's maximum and the required threadgroup sizes, which its getters
+/// answer and its draws are held to. The execution-width promises are the guest's promise to
+/// Metal's compiler, which changes nothing a draw that keeps them draws: they are not carried.
+/// The payload length is not carried either: the runtime sizes the payload by the object and
+/// mesh functions' own payload types, the larger of the two, which is what Metal reads and
+/// writes of a function that reaches its payload through its type. A length past 16384 bytes is
+/// Metal's `NSError` ([`payload_refused`]). The maximum vertex amplification count is not
+/// carried: the runtime draws a mesh pipeline's draws at one amplification, which a descriptor
+/// of any maximum draws, and refuses a draw under a count past 1, which dies there. A raw value
+/// the runtime has no enumerator of dies at the send ([`metal_value`]); so does the compile's
+/// refusal where Metal answers no `NSError` ([`made`]): among them, on a device with
+/// `VK_EXT_mesh_shader` but without `taskShader`, an object function
+/// (`Unsupported{MeshShading}`). A device without `VK_EXT_mesh_shader` (MoltenVK among them)
+/// makes the state, its object and mesh functions run as compute work the runtime draws the
+/// records of (`emulated-mesh-draws`). The lane calls it inside its refusal scope.
+pub(crate) fn new_mesh_render_pipeline_state_full(
+    device: &VulkanDevice,
+    desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+    let sel = "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:";
+    if let Some(refusal) = wrong_mesh_stage(sel, desc) {
+        return Err(refusal);
+    }
+    if desc.payload_memory_length > METAL_PAYLOAD_BYTES {
+        return Err(payload_refused(desc.payload_memory_length));
+    }
+    let stage = |f: &VulkanFunction, linked| {
+        StageSource::Function(
+            f.function_descriptor()
+                .with_linked(linked_functions(linked)),
+        )
+    };
+    let mut d = MeshPipelineDescriptor::new(stage(desc.mesh, &desc.mesh_linked));
+    d.object = desc.object.map(|f| stage(f, &desc.object_linked));
+    d.fragment = desc.fragment.map(|f| stage(f, &desc.fragment_linked));
+    for (index, c) in &desc.colors {
+        let slot = usize::try_from(*index)
+            .ok()
+            .and_then(|i| d.color_attachments.get_mut(i))
+            .unwrap_or_else(|| unrepresentable(sel, &format!("colour attachment {index}")));
+        *slot = full_color_attachment(sel, c);
+    }
+    d.depth_format = optional_format(sel, desc.depth_pixel_format);
+    d.stencil_format = optional_format(sel, desc.stencil_pixel_format);
+    d.raster_sample_count = count(sel, "raster sample count", desc.raster_sample_count);
+    d.alpha_to_coverage = desc.alpha_to_coverage;
+    d.alpha_to_one = desc.alpha_to_one;
+    d.rasterization_enabled = desc.rasterization_enabled;
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    let answers = mesh_answers(device, desc);
+    let mut options = rt::PipelineOptions::default();
+    options.label = desc.label.map(str::to_owned);
+    timing::creation(
+        sel,
+        timing::RENDER_LATER,
+        || {
+            let state = plain_at(sel, || {
+                device.raw.new_mesh_render_pipeline_state(&d, &options)
+            });
+            let descriptor = RenderDescriptor::Mesh(Box::new(MeshDescriptor {
+                descriptor: d.clone(),
+                answers,
+            }));
+            let class = PrimitiveTopologyClass::Unspecified;
+            match made(sel, (class, descriptor), state) {
+                Ok(answer) => answer,
+                Err(raise) => raise.fatal(),
+            }
+        },
+        || timing::mesh_stages(&d),
+        |made| timing::answer(made, |s| timing::state(s.unique_identifier())),
+    )
+}
+
+/// The refusal of a mesh render pipeline whose stage function is of another stage's type, as the
+/// Metal platform refuses it before Metal sees the descriptor (`reims-vgpu-metal`'s
+/// `wrong_mesh_stage`): Metal on the M3 Max (macOS 27.0.1) ends the process with SIGSEGV at a
+/// vertex function as the mesh function, a mesh function as the fragment function and a fragment
+/// function as the object function, and refuses an object function as the mesh function and a
+/// mesh function as the object function (measured by the graphics lane's `oracle_mesh`). A
+/// guest's input never ends the host, so each is refused in the compiler's domain: code 2 for a
+/// vertex function as the mesh function, code 1 for the rest, the mesh function's type asked
+/// first, then the object function's, then the fragment function's, so both platforms answer
+/// one descriptor alike. A function whose type the runtime does not answer
+/// ([`rt::Function::function_type`]'s refusal) is left to the runtime's creation.
+fn wrong_mesh_stage(
+    sel: &'static str,
+    desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+) -> Option<NsErrorText> {
+    use metal2vulkan::metal::FunctionType;
+    let stage = |f: &VulkanFunction| plain_at(sel, || f.function_type()).ok();
+    let refusal = |code: i64, description: &str| NsErrorText {
+        domain: "CompilerError".to_owned(),
+        code,
+        description: description.to_owned(),
+    };
+    let mesh = stage(desc.mesh);
+    if mesh == Some(FunctionType::Vertex) {
+        return Some(refusal(
+            2,
+            "RasterizationEnabled is false but the vertex shader's return type is not void",
+        ));
+    }
+    if mesh.is_some_and(|t| t != FunctionType::Mesh) {
+        return Some(refusal(
+            1,
+            "meshFunction functionType is not MTLFunctionTypeMesh.",
+        ));
+    }
+    let not = |f: Option<&VulkanFunction>, wanted| f.and_then(stage).is_some_and(|t| t != wanted);
+    if not(desc.object, FunctionType::Object) {
+        return Some(refusal(
+            1,
+            "objectFunction functionType is not MTLFunctionTypeObject.",
+        ));
+    }
+    if not(desc.fragment, FunctionType::Fragment) {
+        return Some(refusal(
+            1,
+            "fragmentFunction functionType is not MTLFunctionTypeFragment.",
+        ));
+    }
+    None
+}
+
+/// The most bytes of payload Metal makes a mesh render pipeline state of
+/// (`payloadMemoryLength`): past it the M3 Max (macOS 27.0.1), the AMD 5300M and the Intel 630
+/// (macOS 26.7.1) answer nil and an `NSError`, of 16385 bytes (`oracle_mesh make`'s
+/// `payload-big`), and make one of 256.
+const METAL_PAYLOAD_BYTES: u64 = 16384;
+
+/// The `NSError` of a mesh render pipeline whose payload length, `length`, is past
+/// [`METAL_PAYLOAD_BYTES`]: the M3 Max's code ([`METAL_REFUSES`]) and text, in the runtime's
+/// domain, as the compile's refusals are ([`pipeline_error`]). The AMD and the Intel 630 answer
+/// code 2 and text of their own; core reads only the description.
+fn payload_refused(length: u64) -> NsErrorText {
+    NsErrorText {
+        domain: crate::answer::RUNTIME_DOMAIN.to_owned(),
+        code: METAL_REFUSES,
+        description: format!(
+            "Object shader payload size ({length}) exceeds the maximum payload size allowed \
+             ({METAL_PAYLOAD_BYTES})"
+        ),
+    }
+}
+
+/// Metal's most threads of an object or mesh threadgroup: what
+/// `maxTotalThreadsPerObjectThreadgroup` and `maxTotalThreadsPerMeshThreadgroup` answer for a
+/// descriptor that sets no maximum, on the M3 Max, the AMD 5300M and the Intel 630
+/// (`oracle_mesh make`'s `object`). A threadgroup past
+/// it draws nothing on plain Metal, and the runtime's (`render/mesh.rs`).
+const METAL_THREADGROUP_THREADS: u64 = 1024;
+
+/// What `maxTotalThreadgroupsPerMeshGrid` answers on the M3 Max (macOS 27.0.1) for a descriptor
+/// that sets no maximum, or sets this (`oracle_mesh make`'s `plain` and `grid-big`): one past the
+/// mesh grid an object function may launch there, and on the runtime's devices, which launch none
+/// past `metal2vulkan::bind::METAL_MESH_GRID_TOTAL` threadgroups (Metal's, measured on the M3 Max).
+const METAL_MESH_GRID: u64 = 1 << 20;
+
+/// The most threads this device runs an object (`object`) or a mesh threadgroup of: Metal's
+/// ([`METAL_THREADGROUP_THREADS`]), within the device's own limit for the stage, which the runtime
+/// refuses a draw past (`Unsupported{MeshShading}` naming it): `maxTaskWorkGroupInvocations` or
+/// `maxMeshWorkGroupInvocations` where the device runs the stages natively (`VK_EXT_mesh_shader`
+/// and `meshShader` enabled), else `maxComputeWorkGroupInvocations`, as the runtime runs both
+/// stages as compute work there (`lower::mesh::emulates`, read).
+pub(crate) fn stage_threads(device: &VulkanDevice, object: bool) -> u64 {
+    use metal2vulkan::device::{VkExtension, VkFeature};
+    let profile = device.raw.compile_device().profile();
+    let (enabled, limits) = (profile.enabled(), profile.limits());
+    let native = enabled.extensions.contains(&VkExtension::ExtMeshShader)
+        && enabled.features.contains(&VkFeature::MeshShader);
+    let limit = match (native, object) {
+        (true, true) => limits.mesh.max_task_work_group_invocations,
+        (true, false) => limits.mesh.max_mesh_work_group_invocations,
+        (false, _) => limits.max_compute_work_group_invocations,
+    };
+    u64::from(limit).min(METAL_THREADGROUP_THREADS)
+}
+
+/// What a mesh render pipeline state of `desc` answers on `device`, and holds its draws to
+/// ([`MeshAnswers`]), of the values the runtime's descriptor does not hold. The answers describe
+/// the device, so they are this device's, where Metal's three measured GPUs differ (`oracle_mesh
+/// make`: the M3 Max on macOS 27.0.1, the AMD 5300M and the Intel 630 on macOS 26.7.1):
+/// - `maxTotalThreadsPerObjectThreadgroup` and `maxTotalThreadsPerMeshThreadgroup`: the
+///   descriptor's maximum where it sets one, else Metal's 1024, within the most this device runs
+///   a threadgroup of the stage with ([`stage_threads`]); the object stage's 0 without an object
+///   function. The M3 and the AMD answer 1024 for a stage whose maximum is not set and the
+///   descriptor's where it is (64, 32 and 100 measured), and the AMD 0 for the object stage
+///   without an object function, where the M3 answers 3; the Intel 630 answers 1024 whatever is
+///   set, and 0 without an object function. A maximum past 1024 is made, as the Intel 630 makes
+///   it, answering 1024, where the M3 and the AMD answer nil and an `NSError`: they differ, and
+///   a draw within the state's answer draws as Metal's either way.
+/// - `objectThreadExecutionWidth` and `meshThreadExecutionWidth`: 32, the width of the
+///   simdgroups the runtime gives object and mesh functions, as it gives a kernel
+///   (`metal_properties().thread_execution_width`), which all three answer; the object stage's 0
+///   without an object function, as the AMD and the Intel 630 answer (the M3 answers 32).
+/// - `maxTotalThreadgroupsPerMeshGrid`: the descriptor's maximum where it sets one, else
+///   [`METAL_MESH_GRID`], as the M3 answers (8 where it set 8); the AMD and the Intel 630 answer
+///   `NSUIntegerMax` whatever is set. The runtime holds no maximum of the descriptor's: an object
+///   function's grid past it, which Metal's answer is unmeasured for, launches as one within it.
+///
+/// The descriptor's maxima and required sizes are also what its draws are held to
+/// ([`MeshAnswers::held`]).
+fn mesh_answers(
+    device: &VulkanDevice,
+    desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+) -> MeshAnswers {
+    let object = desc.object.is_some();
+    let threads = |max: u64, of_object| {
+        let limit = stage_threads(device, of_object);
+        if max == 0 { limit } else { max.min(limit) }
+    };
+    let width = u64::from(plain(|| {
+        device
+            .raw
+            .compile_device()
+            .metal_properties()
+            .thread_execution_width
+    }));
+    let required = |s: MtlSize| (s != MtlSize::new(0, 0, 0)).then_some(s);
+    MeshAnswers {
+        object,
+        object_threads: match object {
+            true => threads(desc.max_total_threads_per_object_threadgroup, true),
+            false => 0,
+        },
+        mesh_threads: threads(desc.max_total_threads_per_mesh_threadgroup, false),
+        object_width: if object { width } else { 0 },
+        mesh_width: width,
+        grid: match desc.max_total_threadgroups_per_mesh_grid {
+            0 => METAL_MESH_GRID,
+            max => max,
+        },
+        held: [
+            MeshStageHeld {
+                max: desc.max_total_threads_per_object_threadgroup,
+                required: required(desc.required_threads_per_object_threadgroup),
+            },
+            MeshStageHeld {
+                max: desc.max_total_threads_per_mesh_threadgroup,
+                required: required(desc.required_threads_per_mesh_threadgroup),
+            },
+        ],
+    }
+}
+
 /// The runtime's linked functions of a whole value's: each function as a stage links it, with its
 /// constant values, under its specialized name where it was made with one, and precompiled where
 /// it was made compiled to a binary.
@@ -842,6 +1096,7 @@ pub(crate) fn formats(d: &RenderDescriptor) -> String {
     match d {
         RenderDescriptor::Render(d) => render_formats(d),
         RenderDescriptor::Tile(d) => tile_formats(d),
+        RenderDescriptor::Mesh(m) => mesh_formats(&m.descriptor),
     }
 }
 
@@ -860,29 +1115,10 @@ fn listed(items: Vec<String>, none: &str) -> String {
     format!("the descriptor's formats: {items}")
 }
 
-/// A render descriptor's formats, by index: each colour attachment's pixel format, its blend
-/// state ([`blend_state`]) and write mask, the depth and stencil formats, and its vertex
-/// descriptor's attribute formats.
+/// A render descriptor's formats, by index: its attachments' ([`attachment_formats`]), then its
+/// vertex descriptor's attribute formats.
 pub(crate) fn render_formats(d: &RenderPipelineDescriptor) -> String {
-    let format = |f: metal2vulkan::metal::PixelFormat| named(f.as_raw(), f.name());
-    let mut items: Vec<String> = (d.color_attachments.iter().enumerate())
-        .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-        .map(|(i, c)| {
-            let (format, mask) = (format(c.pixel_format), c.write_mask.as_raw());
-            let blend = blend_state(c);
-            format!("colour {i} {format} {blend} write mask {mask:#x}")
-        })
-        .collect();
-    if items.is_empty() {
-        items.push("no colour attachments".to_owned());
-    }
-    items.push(
-        d.depth_format
-            .map_or("no depth".to_owned(), |f| format!("depth {}", format(f))),
-    );
-    items.push(d.stencil_format.map_or("no stencil".to_owned(), |f| {
-        format!("stencil {}", format(f))
-    }));
+    let mut items = attachment_formats(&d.color_attachments, d.depth_format, d.stencil_format);
     match &d.vertex_descriptor {
         None => items.push("no vertex descriptor".to_owned()),
         Some(v) if v.attributes.is_empty() => items.push("no vertex attributes".to_owned()),
@@ -894,6 +1130,40 @@ pub(crate) fn render_formats(d: &RenderPipelineDescriptor) -> String {
         })),
     }
     listed(items, "")
+}
+
+/// A mesh render descriptor's formats, by index: its attachments' ([`attachment_formats`]).
+pub(crate) fn mesh_formats(d: &MeshPipelineDescriptor) -> String {
+    listed(
+        attachment_formats(&d.color_attachments, d.depth_format, d.stencil_format),
+        "",
+    )
+}
+
+/// A drawing descriptor's attachments' formats, by index: each colour attachment's pixel
+/// format, its blend state ([`blend_state`]) and write mask, then the depth and stencil formats.
+fn attachment_formats(
+    colors: &[Option<ColorAttachmentDescriptor>],
+    depth: Option<metal2vulkan::metal::PixelFormat>,
+    stencil: Option<metal2vulkan::metal::PixelFormat>,
+) -> Vec<String> {
+    let format = |f: metal2vulkan::metal::PixelFormat| named(f.as_raw(), f.name());
+    let mut items: Vec<String> = (colors.iter().enumerate())
+        .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+        .map(|(i, c)| {
+            let (format, mask) = (format(c.pixel_format), c.write_mask.as_raw());
+            let blend = blend_state(c);
+            format!("colour {i} {format} {blend} write mask {mask:#x}")
+        })
+        .collect();
+    if items.is_empty() {
+        items.push("no colour attachments".to_owned());
+    }
+    items.push(depth.map_or("no depth".to_owned(), |f| format!("depth {}", format(f))));
+    items.push(stencil.map_or("no stencil".to_owned(), |f| {
+        format!("stencil {}", format(f))
+    }));
+    items
 }
 
 /// A colour attachment's blend state as a death's line names it: whether it blends, then its rgb

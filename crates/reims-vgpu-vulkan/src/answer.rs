@@ -2128,9 +2128,10 @@ pub fn decide_describing<T>(
     }
 }
 
-/// The domain of every `NSError` this platform answers: Metal's is its driver's name, which
-/// differs between GPU families, and only core's log line reads it
-/// ([`crate::gpu::states`]' module docs).
+/// The domain of every `NSError` this platform answers but a mesh render pipeline's of a stage
+/// function of another stage's type, which is the compiler's, as on the Metal platform
+/// (`crate::gpu::states::wrong_mesh_stage`): Metal's is its driver's name, which differs between
+/// GPU families, and only core's log line reads it ([`crate::gpu::states`]' module docs).
 pub const RUNTIME_DOMAIN: &str = "metal2vulkan-runtime";
 
 /// The runtime's error as the `NSError` Metal hands back for a creator with an `error:`

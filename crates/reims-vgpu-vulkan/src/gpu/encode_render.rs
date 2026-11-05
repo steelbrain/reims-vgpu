@@ -198,6 +198,20 @@
 //!   `useHeaps:count:` or `useHeaps:count:stages:` is skipped too: Metal's encoder goes on past
 //!   one and the draw after it runs (measured on an M3 Max under macOS 27.0.1, without API
 //!   validation, which asserts at it).
+//! - **Mesh draws** (`drawMeshThreadgroups:`, `drawMeshThreads:` and their indirect form, of a
+//!   state of `newRenderPipelineStateWithMeshDescriptor:`) and the object and mesh stages'
+//!   setters go to the runtime's encoder, which draws them as Metal does, on a device without
+//!   `VK_EXT_mesh_shader` (MoltenVK) as compute stages whose records a vertex stage draws
+//!   (`emulated-mesh-draws`, relayed). A grid with a zero axis draws nothing on either, and its
+//!   draw takes nothing else here. A draw of an object or mesh threadgroup larger than the
+//!   state's maximum for its stage, or of another size than the one the state requires, dies at
+//!   the draw: Metal's validation stops it, and plain Metal's draw there is not measured
+//!   ([`threads_held`]). What a mesh draw may write through the buffers and textures bound to its
+//!   object and mesh stages is accounted for as a vertex or tile draw's is ([`Reach`]), a store
+//!   into a buffer on a surface whose GPU writes never reach its memory as a tile function's,
+//!   which nothing measured. `useHeaps:count:` and `useResources:count:usage:` reach the vertex
+//!   and fragment stages only, as below: what they reach of a mesh draw's stages on Metal is not
+//!   measured.
 //! - **Executing an indirect command buffer** runs its draws, with the encoder's render state, as
 //!   their records stand when the command buffer is committed, or, for a buffer the GPU may have
 //!   written (a blit wrote it, or an encoder made it resident for writing), once the work before
@@ -247,13 +261,13 @@ use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, ResourceUsage, TextureType, TriangleFillMode, Winding,
 };
-use metal2vulkan::pipeline::RenderPipelineDescriptor;
+use metal2vulkan::pipeline::ColorAttachmentDescriptor;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::blit::ResourceRef;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw, encode_each};
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
-use reims_vgpu_core::platform::types::{MtlScissorRect, MtlViewport, NsRange};
+use reims_vgpu_core::platform::types::{MtlScissorRect, MtlSize, MtlViewport, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
@@ -265,15 +279,17 @@ use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::rate_map::Class;
-use crate::gpu::resource::{RenderDescriptor, VulkanBuffer, VulkanTexture};
+use crate::gpu::resource::{MeshAnswers, RenderDescriptor, VulkanBuffer, VulkanTexture};
 use crate::gpu::writes::{
-    Bound, FRAGMENT, Kept, Reflected, Reflection, Slot, TILE, VERTEX, Whether,
+    Bound, DRAWING_STAGES, FRAGMENT, Kept, MESH, OBJECT, RENDER_STAGES, Reflected, Reflection,
+    Slot, TILE, VERTEX, Whether,
 };
 use crate::gpu::{listed, metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
 
-/// The first colour attachment of `d` that the state's fragment function writes (`written`, the
-/// runtime's `fragment_color_outputs`), and its format, where a `half` colour output stores a
+/// The first of a drawing descriptor's colour attachments, `colors`, that the state's fragment
+/// function writes (`written`, the runtime's `fragment_color_outputs`), a render or a mesh render
+/// pipeline state's alike, and its format, where a `half` colour output stores a
 /// value further from Metal's than the bound the runtime's rounding of it is relayed within (one
 /// code of a unorm, snorm or packed float channel, one unit in
 /// the last place of a 16-bit float channel, a 32-bit float channel's own value). The runtime
@@ -306,7 +322,10 @@ use crate::platform::{Obj, VulkanPlatform};
 /// `OneMinusSourceAlpha` stores Metal's bits in `RGBA16Float`, `RG16Float` and `RGBA32Float`, but
 /// not in `R16Float`). The extended-range formats die of `extended-range-blend-source` first when
 /// blended. A factor left to a specialization counts as one that reads the source.
-fn half_apart(d: &RenderPipelineDescriptor, written: &[u32]) -> Option<(usize, PixelFormat)> {
+fn half_apart(
+    colors: &[Option<ColorAttachmentDescriptor>],
+    written: &[u32],
+) -> Option<(usize, PixelFormat)> {
     use metal2vulkan::metal::{BlendFactor as F, BlendOperation as O};
     let reads_the_source = |f: F| {
         matches!(
@@ -326,7 +345,7 @@ fn half_apart(d: &RenderPipelineDescriptor, written: &[u32]) -> Option<(usize, P
     let constant = |f: F| matches!(f, F::Zero | F::One);
     written.iter().find_map(|&i| {
         let i = usize::try_from(i).ok()?;
-        let c = d.color_attachments.get(i)?.as_ref()?;
+        let c = colors.get(i)?.as_ref()?;
         let channels = [
             (
                 c.source_rgb_blend_factor,
@@ -438,38 +457,49 @@ pub struct RenderEncoderObject {
 /// set reads none of it again.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StateFacts {
-    /// Whether its vertex function writes any memory, and its fragment and tile functions write
-    /// textures (the runtime's `vertex_writes_memory`, `fragment_writes_textures` and
-    /// `tile_writes_textures`), in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order ([`Reach::set`]).
-    writes: [bool; 3],
+    /// Whether its vertex function writes any memory, its fragment, tile and object functions
+    /// write textures, and its mesh function writes any memory (the runtime's
+    /// `vertex_writes_memory`, `fragment_writes_textures`, `tile_writes_textures`,
+    /// `object_writes_textures`, and `vertex_writes_memory` again, which answers a mesh render
+    /// pipeline state's mesh function's), in [`VERTEX`] to [`MESH`] order ([`Reach::set`]). A
+    /// stage the state has no function of writes nothing.
+    writes: [bool; RENDER_STAGES],
     /// [`Marks::points_sized`].
     points_sized: bool,
     /// Whether it can encode indirect commands (the runtime's `can_encode_indirect_commands`).
     encodes: bool,
     /// [`Marks::half_apart`].
     half_apart: Option<(usize, PixelFormat)>,
+    /// [`Marks::mesh`].
+    mesh: Option<MeshAnswers>,
 }
 
 impl StateFacts {
     /// What `state` tells.
     fn of(state: &crate::gpu::resource::RenderPipelineObject) -> StateFacts {
         let raw = &state.raw;
-        let apart = match state.reflection.descriptor() {
-            Some(Reflected::Render(RenderDescriptor::Render(d))) => {
-                half_apart(d, &plain(|| raw.fragment_color_outputs()))
+        let colors = match state.reflection.descriptor() {
+            Some(Reflected::Render(RenderDescriptor::Render(d))) => Some(&d.color_attachments),
+            Some(Reflected::Render(RenderDescriptor::Mesh(m))) => {
+                Some(&m.descriptor.color_attachments)
             }
             _ => None,
         };
+        let apart = colors.and_then(|c| half_apart(c, &plain(|| raw.fragment_color_outputs())));
+        let mesh = state.mesh_answers().copied();
         plain(|| StateFacts {
             writes: [
-                raw.vertex_writes_memory(),
+                mesh.is_none() && raw.vertex_writes_memory(),
                 raw.fragment_writes_textures(),
                 raw.tile_writes_textures(),
+                raw.object_writes_textures(),
+                mesh.is_some() && raw.vertex_writes_memory(),
             ],
             points_sized: raw.writes_point_size()
                 || state.input_primitive_topology == PrimitiveTopologyClass::Point,
             encodes: raw.can_encode_indirect_commands(),
             half_apart: apart,
+            mesh,
         })
     }
 }
@@ -525,6 +555,9 @@ struct Marks {
     /// The colour attachment of the pipeline state set, and its format, where a `half` colour
     /// output of its fragment function stores a value past the bound ([`half_apart`]).
     half_apart: Option<(usize, PixelFormat)>,
+    /// What the pipeline state set, a mesh render pipeline state, holds its draws' threadgroups
+    /// to ([`threads_held`]); `None` for any other state.
+    mesh: Option<MeshAnswers>,
 }
 
 /// The amplification count `setVertexAmplificationMode:value:` sets, where it was measured (the
@@ -547,6 +580,14 @@ enum Shape {
     Primitives(rt::DrawPrimitiveType),
     /// Patches, over a control-point index buffer or not.
     Patches,
+    /// A mesh draw, of its threads per object and per mesh threadgroup, directly or from
+    /// indirect arguments.
+    Mesh {
+        /// Its threads per object threadgroup.
+        object: MtlSize,
+        /// Its threads per mesh threadgroup.
+        mesh: MtlSize,
+    },
 }
 
 /// Whether a store action resolves, or may (`Unknown`, which the encoder decides).
@@ -1282,7 +1323,7 @@ fn answers_nil(d: &rt::RenderPassDescriptor) -> bool {
 /// which a draw may write through ([`Reach`]): a slot's object read as it is bound
 /// ([`crate::gpu::writes::buffer_bind`], [`crate::gpu::writes::texture_bind`]).
 enum Bind<'a> {
-    /// A buffer bound to a stage ([`VERTEX`], [`FRAGMENT`], [`TILE`]) at a slot.
+    /// A buffer bound to a stage ([`VERTEX`] to [`MESH`]) at a slot.
     Buffer(usize, u64, Option<&'a VulkanBuffer>),
     /// A texture bound to a stage at a slot.
     Texture(usize, u64, Option<&'a VulkanTexture>),
@@ -1310,6 +1351,16 @@ fn binds<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Option<Bind<'a>> {
             range,
             ..
         } => Bind::Buffers(FRAGMENT, range.location, list),
+        RenderCmd::SetObjectBuffers {
+            buffers: list,
+            range,
+            ..
+        } => Bind::Buffers(OBJECT, range.location, list),
+        RenderCmd::SetMeshBuffers {
+            buffers: list,
+            range,
+            ..
+        } => Bind::Buffers(MESH, range.location, list),
         RenderCmd::SetTileBuffers {
             buffers: list,
             range,
@@ -1330,6 +1381,14 @@ fn binds<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Option<Bind<'a>> {
             textures: list,
             range,
         } => Bind::Textures(FRAGMENT, range.location, list),
+        RenderCmd::SetObjectTextures {
+            textures: list,
+            range,
+        } => Bind::Textures(OBJECT, range.location, list),
+        RenderCmd::SetMeshTextures {
+            textures: list,
+            range,
+        } => Bind::Textures(MESH, range.location, list),
         RenderCmd::SetTileTextures {
             textures: list,
             range,
@@ -1371,10 +1430,10 @@ fn binds<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Option<Bind<'a>> {
 /// resources resident before each draw holds them once.
 #[derive(Debug, Default)]
 struct Reach {
-    /// Each stage's buffers by slot, in [`VERTEX`], [`FRAGMENT`] and [`TILE`] order.
-    buffers: [BTreeMap<u64, Bound>; 3],
+    /// Each stage's buffers by slot, in [`VERTEX`] to [`MESH`] order.
+    buffers: [BTreeMap<u64, Bound>; RENDER_STAGES],
     /// Each stage's textures by slot.
-    textures: [BTreeMap<u64, Bound>; 3],
+    textures: [BTreeMap<u64, Bound>; RENDER_STAGES],
     /// The textures made resident with write usage, each distinct one once, in the order first
     /// made resident.
     used_textures: Vec<Bound>,
@@ -1386,9 +1445,9 @@ struct Reach {
     visibility: Kept,
     /// The reflection of the pipeline state set, which this holds as Metal's encoder holds the
     /// state, and whether its functions write textures, which tells which texture slots they
-    /// may write where its slot writes cannot: the vertex function's where it writes any memory,
-    /// and the fragment and tile functions' where they write textures.
-    pipeline: Option<(Arc<Reflection>, [bool; 3])>,
+    /// may write where its slot writes cannot: the vertex and mesh functions' where they write
+    /// any memory, and the fragment, tile and object functions' where they write textures.
+    pipeline: Option<(Arc<Reflection>, [bool; RENDER_STAGES])>,
 }
 
 /// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
@@ -1469,7 +1528,7 @@ impl Reach {
 
     /// The pipeline state of `reflection` set, whose functions write as `writes` says
     /// ([`StateFacts::writes`]).
-    fn set(&mut self, reflection: &Arc<Reflection>, writes: [bool; 3]) {
+    fn set(&mut self, reflection: &Arc<Reflection>, writes: [bool; RENDER_STAGES]) {
         self.pipeline = Some((Arc::clone(reflection), writes));
     }
 
@@ -1482,13 +1541,15 @@ impl Reach {
             && self.used_buffers.is_empty()
     }
 
-    /// Whether a texture bound or made resident for writing, or a buffer bound to the tile
-    /// stage, lies on a surface whose GPU writes never reach its memory
+    /// Whether a texture bound or made resident for writing, or a buffer bound to the tile,
+    /// object or mesh stage, lies on a surface whose GPU writes never reach its memory
     /// ([`crate::os::gpu_read_only`]), or is a texture whose writes the runtime refuses. A vertex
     /// or fragment function's stores into a buffer on one are dropped, as on Metal, and are sent
-    /// ([`crate::os::dropped_write`]).
+    /// ([`crate::os::dropped_write`]); an object or mesh function's, which nothing measured, are
+    /// not, as a tile function's.
     fn unsent_dropped(&self) -> bool {
-        let bound = (self.textures.iter().chain([&self.buffers[TILE]])).flat_map(BTreeMap::values);
+        let unsent_buffers = [TILE, OBJECT, MESH].map(|stage| &self.buffers[stage]);
+        let bound = (self.textures.iter().chain(unsent_buffers)).flat_map(BTreeMap::values);
         bound.chain(&self.used_textures).any(unsendable)
     }
 
@@ -1497,12 +1558,13 @@ impl Reach {
     /// reach its memory, or into a texture whose writes the runtime refuses ([`unsendable`],
     /// [`VulkanRenderEncoder::issues`]): the textures made resident with write usage, then the
     /// textures bound at the slots the pipeline state's functions write, and, but for an
-    /// execution, whose commands run no tile function, the buffers bound at the slots the tile
-    /// function writes.
+    /// execution, whose commands run no tile, object or mesh function, the buffers bound at the
+    /// slots those functions write.
     fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
         let used = (self.used_textures.iter()).filter(|m| unsendable(m));
         let mut written: Vec<_> = used.map(|m| (Whether::Writes, m.clone())).collect();
-        let buffers = [false, false, inherits.is_none()];
+        let own = inherits.is_none();
+        let buffers = [false, false, own, own, own];
         written.extend(self.at_slots(inherits, buffers, unsendable));
         written
     }
@@ -1512,46 +1574,48 @@ impl Reach {
     /// read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture or buffer
     /// made resident with write usage, and, as [`Self::at_slots`] reads them, a texture bound at
     /// a slot a function writes and a buffer bound at one, of every stage, but for an execution,
-    /// whose commands run no tile function and take the encoder's buffers only where they inherit
-    /// them. `None` where it writes none.
+    /// whose commands run no tile, object or mesh function and take the encoder's buffers only
+    /// where they inherit them. `None` where it writes none.
     fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
         let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
         if used.any(|m| m.kept.holds()) {
             return Some(Whether::Writes);
         }
-        let buffers = inherits.is_none_or(|i| i.buffers);
-        let slots = self.at_slots(inherits, [buffers, buffers, inherits.is_none()], |m| {
+        let (buffers, own) = (inherits.is_none_or(|i| i.buffers), inherits.is_none());
+        let slots = self.at_slots(inherits, [buffers, buffers, own, own, own], |m| {
             m.kept.holds()
         });
         slots.into_iter().map(|(w, _)| w).find(Whether::holds)
     }
 
-    /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at
-    /// the stages' slots of the objects `wanted` picks, one entry an object, with whether it
-    /// does: the textures bound at the slots the pipeline state's functions may store through,
-    /// by its slot writes, and the buffers too at the stages `buffers` names, in [`VERTEX`],
-    /// [`FRAGMENT`] and [`TILE`] order. Only a slot they answer the function cannot store
-    /// through is unwritten: a read-only buffer's bind at one draws, whatever else the function
-    /// declares. Where they cannot tell, for the state or for a slot an undetermined argument may
-    /// cover, a function may write the buffer slot, as a kernel may, a vertex function that
-    /// writes memory the texture slot, and a fragment or tile function that writes textures the
-    /// texture slot. A vertex function that writes no memory, by the runtime's translation of it
-    /// (its `vertex_writes_memory`), writes no slot of its stage, whatever its slot writes answer
-    /// of an argument: they answer that a `device` pointer that is not `const` may be stored
-    /// through, stored through or not. An execution whose commands run pipeline states of their
-    /// own, which no reflection here tells, writes every bound buffer it takes, and no bound
-    /// texture: Metal makes no state that supports indirect command buffers of a function with a
-    /// texture argument, and such commands reach a texture only through an argument buffer, whose
-    /// textures are made resident. Measured on the M3 Max (macOS 26.7):
-    /// `supportIndirectCommandBuffers` with a vertex, fragment or kernel function taking a
-    /// texture to read, sample or write answers no state ("Fragment shader cannot be used with
-    /// indirect command buffers"), with one taking buffers or an argument buffer of a texture a
-    /// state; an execution that inherits a state made without it, of such a function, faults
-    /// its command buffer (`PageFault`), the texture bound unwritten.
+    /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at the
+    /// stages' slots of the objects `wanted` picks, one entry an object, with whether it does: the
+    /// textures bound at the slots the pipeline state's functions may store through, by its slot
+    /// writes, and the buffers too at the stages `buffers` names, in [`VERTEX`] to [`MESH`] order,
+    /// of the stages the state has functions of ([`Reflection::stages`]: a mesh render pipeline
+    /// state's object, mesh and fragment stages, any other's vertex, fragment and tile stages).
+    /// Only a slot they answer the function cannot store through is unwritten: a read-only buffer's
+    /// bind at one draws, whatever else the function declares. Where they cannot tell, for the
+    /// state or for a slot an undetermined argument may cover, a function may write the buffer
+    /// slot, as a kernel may, a vertex or mesh function that writes memory the texture slot, and a
+    /// fragment, tile or object function that writes textures the texture slot. A vertex or mesh
+    /// function that writes no memory, by the runtime's translation of it (its
+    /// `vertex_writes_memory`), writes no slot of its stage, whatever its slot writes answer of an
+    /// argument: they answer that a `device` pointer that is not `const` may be stored through,
+    /// stored through or not. An execution whose commands run pipeline states of their own, which
+    /// no reflection here tells, writes every bound buffer it takes, and no bound texture: Metal
+    /// makes no state that supports indirect command buffers of a function with a texture argument,
+    /// and such commands reach a texture only through an argument buffer, whose textures are made
+    /// resident. Measured on the M3 Max (macOS 26.7): `supportIndirectCommandBuffers` with a
+    /// vertex, fragment or kernel function taking a texture to read, sample or write answers no
+    /// state ("Fragment shader cannot be used with indirect command buffers"), with one taking
+    /// buffers or an argument buffer of a texture a state; an execution that inherits a state made
+    /// without it, of such a function, faults its command buffer (`PageFault`), the texture bound
+    /// unwritten.
     fn at_slots(
         &self,
         inherits: Option<Inherits>,
-        buffers: [bool; 3],
+        buffers: [bool; RENDER_STAGES],
         wanted: fn(&Bound) -> bool,
     ) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
@@ -1563,8 +1627,9 @@ impl Reach {
                 None => return written,
             },
         };
-        for stage in [VERTEX, FRAGMENT, TILE] {
-            if stage == VERTEX && state.is_some_and(|(_, facts)| !facts[VERTEX]) {
+        let stages = state.map_or(DRAWING_STAGES, |(reflection, _)| reflection.stages());
+        for &stage in stages {
+            if matches!(stage, VERTEX | MESH) && state.is_some_and(|(_, facts)| !facts[stage]) {
                 continue;
             }
             let at = |texture: bool, slot: u64| match state {
@@ -2167,17 +2232,18 @@ impl VulkanRenderEncoder {
 
     /// What a draw `sel` of `shape` asks of what the encoder holds, `held`, after its pipeline
     /// state ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment,
-    /// empty or not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch or
-    /// instance, the pass's rate map ([`Self::layered`]), its points ([`sized`]), what it may
-    /// write ([`Self::issues`]) and the indirect commands its state may encode
-    /// ([`Self::encodes`]). A draw over indices of the platform's own asks it too
-    /// ([`Self::primitives`]).
+    /// empty or not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch,
+    /// instance or threadgroup, the pass's rate map ([`Self::layered`]), its points ([`sized`]),
+    /// a mesh draw's threadgroups ([`threads_held`]), what it may write ([`Self::issues`]) and
+    /// the indirect commands its state may encode ([`Self::encodes`]). A draw over indices of the
+    /// platform's own asks it too ([`Self::primitives`]).
     fn drawn(&self, sel: &'static str, shape: Shape, empty: bool, held: &Held) {
         self.bfloat_drawn(sel);
         if !empty {
             self.layered(sel);
             stop_if_task_ended();
             sized(sel, shape, held.marks);
+            threads_held(sel, shape, held.marks);
             self.issues(sel, None);
             stop_if_task_ended();
             if held.encodes {
@@ -2432,6 +2498,75 @@ fn sized(sel: &'static str, shape: Shape, m: Marks) {
     if points && m.pipeline && !m.points_sized {
         unrepresentable(sel, UNSIZED_POINTS);
     }
+}
+
+/// Dies at a mesh draw `sel` of `shape` whose threadgroups the mesh render pipeline state set
+/// does not hold to, by the encoder's marks `m` ([`MeshAnswers::held`]): a threadgroup of more
+/// threads than the maximum the state's descriptor set for its stage (Metal's validation stops
+/// it: "threadsPerMeshThreadgroup (1025 x 1 x 1 = 1025) cannot exceed
+/// maxTotalThreadsPerMeshThreadgroup (1024)", the runtime's measurement), or of another size
+/// than the one the descriptor requires, which plain Metal's draws of are unmeasured, and the
+/// runtime, whose descriptor holds neither, would draw as within them. The object stage's are
+/// asked only of a state with an object function: Metal takes the draw's threads per object
+/// threadgroup only then. A threadgroup of no thread draws nothing, as does one past Metal's
+/// 1024, which the runtime draws nothing of as plain Metal does (`render/mesh.rs`): neither is
+/// asked.
+fn threads_held(sel: &'static str, shape: Shape, m: Marks) {
+    let (Shape::Mesh { object, mesh }, Some(answers)) = (shape, m.mesh) else {
+        return;
+    };
+    let stages = [
+        ("object", object, answers.held[0]),
+        ("mesh", mesh, answers.held[1]),
+    ];
+    for (stage, threads, held) in stages {
+        if stage == "object" && !answers.object {
+            continue;
+        }
+        let total = (threads.width)
+            .saturating_mul(threads.height)
+            .saturating_mul(threads.depth);
+        if total == 0 || total > METAL_MESH_THREADGROUP {
+            continue;
+        }
+        let MtlSize {
+            width,
+            height,
+            depth,
+        } = threads;
+        if held.max != 0 && total > held.max {
+            unrepresentable(
+                sel,
+                &format!(
+                    "a {stage} threadgroup of {width} x {height} x {depth} threads, past the \
+                     {} its pipeline state's descriptor sets as its maximum, which Metal's \
+                     validation stops and plain Metal's draw of is unmeasured",
+                    held.max
+                ),
+            );
+        }
+        if let Some(r) = held.required.filter(|r| *r != threads) {
+            unrepresentable(
+                sel,
+                &format!(
+                    "a {stage} threadgroup of {width} x {height} x {depth} threads, where its \
+                     pipeline state's descriptor requires {} x {} x {}, which plain Metal's draw \
+                     of is unmeasured",
+                    r.width, r.height, r.depth
+                ),
+            );
+        }
+    }
+}
+
+/// Metal's most threads of an object or mesh threadgroup: past it plain Metal draws nothing, as
+/// the runtime does (`render/mesh.rs`, measured).
+const METAL_MESH_THREADGROUP: u64 = 1024;
+
+/// Whether a mesh draw's grid, of threadgroups or of threads, `grid`, has an axis of none, which
+/// draws nothing on Metal, and on the runtime, with any state (`render/mesh.rs`, measured).
+fn empty_grid(grid: MtlSize) -> bool {
+    grid.width == 0 || grid.height == 0 || grid.depth == 0
 }
 
 /// [`VulkanRenderEncoder::marked`], by the encoder's marks `m`.
@@ -3003,21 +3138,149 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             // Metal draws alike at every point size on this host, and a vertex function's
             // `[[point_size]]` decides a point's: it encodes nothing.
             RenderCmd::SetPointSize { .. } => self.encoder.nothing(sel),
-            RenderCmd::DrawMeshThreadgroups { .. }
-            | RenderCmd::DrawMeshThreadgroupsIndirect { .. }
-            | RenderCmd::DrawMeshThreads { .. }
-            | RenderCmd::SetMeshBufferOffset { .. }
-            | RenderCmd::SetMeshBuffers { .. }
-            | RenderCmd::SetMeshSamplerStatesLodClamps { .. }
-            | RenderCmd::SetMeshSamplerStates { .. }
-            | RenderCmd::SetMeshTextures { .. }
-            | RenderCmd::SetObjectBufferOffset { .. }
-            | RenderCmd::SetObjectBuffers { .. }
-            | RenderCmd::SetObjectSamplerStatesLodClamps { .. }
-            | RenderCmd::SetObjectSamplerStates { .. }
-            | RenderCmd::SetObjectTextures { .. }
-            | RenderCmd::SetObjectThreadgroupMemoryLength { .. } => {
-                unrepresentable(sel, "a mesh or object stage command")
+            // A mesh draw draws as a draw of primitives does ([`Self::draw`]), its threadgroups
+            // held to its state's ([`threads_held`]); one of a grid with an axis of none draws
+            // nothing, as on Metal. The runtime draws it as Metal does, or refuses it, which dies
+            // (`render/mesh.rs`): with a state that is not a mesh render pipeline's, among them,
+            // which stops Metal.
+            RenderCmd::DrawMeshThreadgroups {
+                threadgroups_per_grid,
+                threads_per_object_threadgroup: object,
+                threads_per_mesh_threadgroup: mesh,
+            } => {
+                let shape = Shape::Mesh { object, mesh };
+                let empty = empty_grid(threadgroups_per_grid);
+                let grid = size(threadgroups_per_grid);
+                self.draw(sel, (Some((shape, ())), empty), |e, ()| {
+                    e.draw_mesh_threadgroups(grid, size(object), size(mesh))
+                })
+            }
+            RenderCmd::DrawMeshThreads {
+                threads_per_grid,
+                threads_per_object_threadgroup: object,
+                threads_per_mesh_threadgroup: mesh,
+            } => {
+                let shape = Shape::Mesh { object, mesh };
+                let empty = empty_grid(threads_per_grid);
+                let grid = size(threads_per_grid);
+                self.draw(sel, (Some((shape, ())), empty), |e, ()| {
+                    e.draw_mesh_threads(grid, size(object), size(mesh))
+                })
+            }
+            RenderCmd::DrawMeshThreadgroupsIndirect {
+                indirect_buffer,
+                indirect_buffer_offset,
+                threads_per_object_threadgroup: object,
+                threads_per_mesh_threadgroup: mesh,
+            } => {
+                let shape = Shape::Mesh { object, mesh };
+                self.draw(sel, (Some((shape, ())), false), |e, ()| {
+                    e.draw_mesh_threadgroups_indirect(
+                        &indirect_buffer.raw,
+                        indirect_buffer_offset,
+                        size(object),
+                        size(mesh),
+                    )
+                })
+            }
+            RenderCmd::SetMeshBufferOffset { offset, index } => {
+                let index = small(sel, index);
+                encoded(&mut |e| e.set_mesh_buffer_offset(offset, index))
+            }
+            RenderCmd::SetMeshBuffers {
+                buffers: list,
+                offsets,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                let (_, offsets) = ranged(sel, range, offsets);
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_mesh_buffers(list, offsets, at))
+                })
+            }
+            RenderCmd::SetMeshSamplerStatesLodClamps {
+                samplers: list,
+                lod_min_clamps,
+                lod_max_clamps,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                let (_, min) = ranged(sel, range, lod_min_clamps);
+                let (_, max) = ranged(sel, range, lod_max_clamps);
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_mesh_sampler_states(list, Some((min, max)), at))
+                })
+            }
+            RenderCmd::SetMeshSamplerStates {
+                samplers: list,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_mesh_sampler_states(list, None, at))
+                })
+            }
+            RenderCmd::SetMeshTextures {
+                textures: list,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_mesh_textures(list, at))
+                })
+            }
+            RenderCmd::SetObjectBufferOffset { offset, index } => {
+                let index = small(sel, index);
+                encoded(&mut |e| e.set_object_buffer_offset(offset, index))
+            }
+            RenderCmd::SetObjectBuffers {
+                buffers: list,
+                offsets,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                let (_, offsets) = ranged(sel, range, offsets);
+                buffers(list, |list| {
+                    encoded(&mut |e| e.set_object_buffers(list, offsets, at))
+                })
+            }
+            RenderCmd::SetObjectSamplerStatesLodClamps {
+                samplers: list,
+                lod_min_clamps,
+                lod_max_clamps,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                let (_, min) = ranged(sel, range, lod_min_clamps);
+                let (_, max) = ranged(sel, range, lod_max_clamps);
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_object_sampler_states(list, Some((min, max)), at))
+                })
+            }
+            RenderCmd::SetObjectSamplerStates {
+                samplers: list,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                samplers(list, |list| {
+                    encoded(&mut |e| e.set_object_sampler_states(list, None, at))
+                })
+            }
+            RenderCmd::SetObjectTextures {
+                textures: list,
+                range,
+            } => {
+                let (at, list) = ranged(sel, range, list);
+                textures(sel, list, |list| {
+                    encoded(&mut |e| e.set_object_textures(list, at))
+                })
+            }
+            // The length the object function's `[[threadgroup(index)]]` argument takes in the
+            // encoder's later mesh draws, which the runtime checks at each draw against the
+            // device's workgroup memory for the stage.
+            RenderCmd::SetObjectThreadgroupMemoryLength { length, index } => {
+                let (length, index) = (small(sel, length), small(sel, index));
+                encoded(&mut |e| e.set_object_threadgroup_memory_length(length, index))
             }
             // Metal's indexed strips restart at the index set, until the encoder ends, and
             // nothing else changes (the module docs), as the runtime's do.
@@ -3057,6 +3320,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         m.pipeline = true;
                         m.points_sized = f.points_sized;
                         m.half_apart = f.half_apart;
+                        m.mesh = f.mesh;
                     });
                     Ok(())
                 }
@@ -7718,6 +7982,8 @@ pub(crate) mod tests {
     }
 
     mod many_passes;
+
+    mod mesh;
 
     #[cfg(target_os = "macos")]
     pub(crate) mod metal_tests;

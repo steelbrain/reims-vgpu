@@ -543,14 +543,28 @@ pub const VERTEX: usize = 0;
 pub const FRAGMENT: usize = 1;
 /// The tile function's.
 pub const TILE: usize = 2;
+/// A mesh render pipeline state's object function's.
+pub const OBJECT: usize = 3;
+/// A mesh render pipeline state's mesh function's.
+pub const MESH: usize = 4;
+/// How many render stages [`Reflection::slots`] answers for: [`VERTEX`] to [`MESH`].
+pub const RENDER_STAGES: usize = 5;
+
+/// The stages of a render or tile pipeline state whose functions bind slots, in the order a
+/// draw's writes are asked ([`Reflection::stages`]); also those of a state no reflection here
+/// tells, as an execution's own states.
+pub(crate) const DRAWING_STAGES: &[usize] = &[VERTEX, FRAGMENT, TILE];
+
+/// The stages of a mesh render pipeline state, in pipeline order.
+const MESH_STAGES: &[usize] = &[OBJECT, MESH, FRAGMENT];
 
 /// The descriptor a pipeline state was made of, whose slot writes tell its functions' [`Slots`].
 #[derive(Debug)]
 pub enum Reflected {
     /// A compute pipeline state's: its kernel's.
     Compute(Box<ComputePipelineDescriptor>),
-    /// A render or tile pipeline state's: its vertex, fragment and tile functions', in that
-    /// order ([`VERTEX`]).
+    /// A render, tile or mesh render pipeline state's: its vertex, fragment, tile, object and
+    /// mesh functions', in that order ([`VERTEX`] to [`MESH`]).
     Render(RenderDescriptor),
 }
 
@@ -580,11 +594,12 @@ impl Reflection {
     }
 
     /// Each function's [`Slots`]: a compute state's kernel's alone, a render state's vertex,
-    /// fragment and tile functions' ([`VERTEX`]); `Err` naming why the runtime answers none, for
-    /// a state of no guest descriptor's, or where it cannot decode or specialize a function,
-    /// which it refuses alone: a function whose argument types Metal's reflection is unmeasured
-    /// for still answers, where its reflection is refused. A render state with rasterization off
-    /// runs no fragment function, whose slots it writes none of, though its descriptor keeps the
+    /// fragment, tile, object and mesh functions' ([`VERTEX`] to [`MESH`]), none for a stage the
+    /// state has no function of; `Err` naming why the runtime answers none, for a state of no
+    /// guest descriptor's, or where it cannot decode or specialize a function, which it refuses
+    /// alone: a function whose argument types Metal's reflection is unmeasured for still answers,
+    /// where its reflection is refused. A render or mesh render state with rasterization off runs
+    /// no fragment function, whose slots it writes none of, though its descriptor keeps the
     /// function (`crate::gpu::serialized`).
     pub fn slots(&self) -> Result<&[Slots], &str> {
         let read = self.slots.get_or_init(|| {
@@ -600,6 +615,10 @@ impl Reflection {
                             (plain(|| d.slot_writes(&budget)), d.rasterization_enabled)
                         }
                         RenderDescriptor::Tile(d) => (plain(|| d.slot_writes(&budget)), true),
+                        RenderDescriptor::Mesh(m) => (
+                            plain(|| m.descriptor.slot_writes(&budget)),
+                            m.descriptor.rasterization_enabled,
+                        ),
                     };
                     writes
                         .map(|w| {
@@ -611,6 +630,8 @@ impl Reflection {
                                 Slots::of(w.vertex_slots()),
                                 fragment,
                                 Slots::of(w.tile_slots()),
+                                Slots::of(w.object_slots()),
+                                Slots::of(w.mesh_slots()),
                             ]
                         })
                         .map_err(|e| e.to_string())
@@ -618,6 +639,18 @@ impl Reflection {
             }
         });
         read.as_deref().map_err(String::as_str)
+    }
+
+    /// The render stages whose functions may store through what a draw binds at their slots, in
+    /// the order a draw's writes are asked: a mesh render pipeline state's object, mesh and
+    /// fragment stages ([`OBJECT`], [`MESH`], [`FRAGMENT`]), which take none of the vertex and
+    /// tile stages' binds; any other state's vertex, fragment and tile stages, as a state of no
+    /// guest descriptor's.
+    pub fn stages(&self) -> &'static [usize] {
+        match &self.descriptor {
+            Some(Reflected::Render(RenderDescriptor::Mesh(_))) => MESH_STAGES,
+            _ => DRAWING_STAGES,
+        }
     }
 
     /// Whether the function of `s` may store through its slot; `Err` naming why the runtime
