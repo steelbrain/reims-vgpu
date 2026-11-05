@@ -4474,13 +4474,21 @@ pub(crate) mod tests {
             let n = usize::try_from(w * h * texel).unwrap();
             // SAFETY: a Shared buffer's bytes, read after the blit completed.
             let bytes = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) };
-            // 0.25, 0.5, 0.75 and 1.0: BGRA8Unorm's bytes, and RGBA16Float's halves.
+            // 0.25, 0.5, 0.75 and 1.0: BGRA8Unorm's bytes, and RGBA16Float's halves. BGRA8's
+            // 0.5 is a tie of its codes (127.5), which a device not held to Metal's codes may
+            // store as either neighbour ([`ties_as_metals`]).
             let cleared: &[u8] = match format {
                 BGRA8 => &[0xbf, 0x80, 0x40, 0xff],
                 _ => &[0x00, 0x34, 0x00, 0x38, 0x00, 0x3a, 0x00, 0x3c],
             };
+            let tie: &[u8] = match format {
+                BGRA8 if !ties_as_metals(&d) => &[0xbf, 0x7f, 0x40, 0xff],
+                _ => cleared,
+            };
             assert!(
-                bytes.chunks(cleared.len()).all(|t| t == cleared),
+                bytes
+                    .chunks(cleared.len())
+                    .all(|t| t == cleared || t == tie),
                 "{format}"
             );
         }
@@ -4675,6 +4683,17 @@ pub(crate) mod tests {
         )
     }
 
+    /// Whether `d` stores Metal's code at a tie of a unorm format's codes, as every Mac does
+    /// (measured: M3 Max, AMD 5300M, Intel 630, in `BGRA8Unorm` and `RGBA8Unorm`): a device the
+    /// runtime holds to Metal's codes (`VkProperty::MetalColorWrites`, MoltenVK on Apple's
+    /// GPUs). Any other stores either neighbour by its own conversion (0x7f for 0.5 on an RTX
+    /// 5080), which the runtime records as `device-color-conversion`
+    /// (`PrecisionNote::DeviceColorConversion`)
+    pub(crate) fn ties_as_metals(d: &crate::gpu::device::VulkanDevice) -> bool {
+        (d.raw.compile_device().profile().enabled().properties)
+            .contains(&metal2vulkan::device::VkProperty::MetalColorWrites)
+    }
+
     /// [`memoryless_slot_pass`]'s lines on Metal, by its fragment function (measured on the M3
     /// Max, macOS 27.0.1, `memoryless_slots_fail_as_metals`): `tri_frag`, which uses no texture,
     /// draws and completes; `render_ftex`, which samples slot 0, fails the command buffer with
@@ -4694,11 +4713,19 @@ pub(crate) mod tests {
     /// A memoryless texture bound at a fragment slot is taken, as plain Metal takes it, and fails
     /// the command buffer only where the draw's function uses the slot, as Metal's
     /// ([`METALS_MEMORYLESS_SLOT`])
+    ///
+    /// `tri_frag`'s green, 0.5, is a tie of `BGRA8Unorm`'s codes, which a device not held to
+    /// Metal's codes may store as 0x7f ([`ties_as_metals`])
     #[test]
     fn a_memoryless_texture_at_a_fragment_slot_fails_only_a_draw_that_uses_it() {
         let (p, d) = (platform(), dev());
         for (fragment, metals) in METALS_MEMORYLESS_SLOT {
-            assert_eq!(memoryless_slot_pass(&p, &d, fragment), metals, "{fragment}");
+            let got = memoryless_slot_pass(&p, &d, fragment);
+            let tie = metals.replace("texel [40, 80,", "texel [40, 7f,");
+            assert!(
+                got == metals || (!ties_as_metals(&d) && got == tie),
+                "{fragment}: {got}"
+            );
         }
     }
 
@@ -6755,9 +6782,11 @@ pub(crate) mod tests {
             texels[1], plain[1]
         );
         assert_eq!(texels, plain);
-        let metals = (d.raw.compile_device().profile().enabled().properties)
-            .contains(&metal2vulkan::device::VkProperty::MetalColorWrites);
-        let greens: &[u8] = if metals { &[0x80] } else { &[0x7f, 0x80] };
+        let greens: &[u8] = if ties_as_metals(&d) {
+            &[0x80]
+        } else {
+            &[0x7f, 0x80]
+        };
         for texel in texels.chunks(4) {
             assert!(
                 texel[0] == 0x40 && greens.contains(&texel[1]) && texel[2..] == [0xff, 0xff],
