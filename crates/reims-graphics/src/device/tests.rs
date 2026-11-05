@@ -3531,6 +3531,44 @@ fn a_context_s_later_messages_wait_for_its_pages_on_the_block_s_lane() {
     );
 }
 
+/// A lane behind a block's held pages is woken once, by their carrying out: never by the jobs other
+/// processes' lanes finish meanwhile, which move nothing it waits for.
+#[test]
+fn a_lane_behind_a_block_s_pages_is_woken_only_by_their_carrying_out() {
+    const MAKER: u32 = 6;
+    const OTHER: u32 = 4;
+    const OTHERS: usize = 20;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let obj = |context: u32, n: u64| (u64::from(context) << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    seen.hold_pages(&mut rig, MAKER, BLOCK);
+    rig.send(object_message(RGFX_CMD_SAMPLER_CREATE, obj(MAKER, 1)));
+    let lanes = Arc::clone(&rig.device.shared.lanes);
+    let blocked = || lanes.blocked(Key::Context(MAKER));
+    for _ in 0..2000 {
+        if blocked().0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (waits, before) = blocked();
+    assert!(waits, "the maker's lane never waited for its pages");
+    for n in 0..OTHERS as u64 {
+        rig.send(object_message(RGFX_CMD_EVENT_CREATE, obj(OTHER, n + 1)));
+    }
+    seen.wait_for(RGFX_CMD_EVENT_CREATE, OTHERS);
+    settle();
+    assert_eq!(
+        blocked(),
+        (true, before),
+        "another process's {OTHERS} jobs woke the lane behind the pages"
+    );
+    seen.release_pages();
+    seen.wait_for(RGFX_CMD_SAMPLER_CREATE, 1);
+    assert_eq!(blocked(), (false, before + 1));
+}
+
 /// A block's `SURFACE_PAGES` waits for its context's messages published before it that name the
 /// block, which its context's lane is still behind; not for one over another block, nor for the
 /// lane's other messages.

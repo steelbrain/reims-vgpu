@@ -256,13 +256,22 @@ struct State {
     /// for (its `SURFACE_PAGES`), by context, then ring 0's count through each, then block.
     pending: BTreeSet<(u32, u64, u64)>,
     /// The lanes whose thread waits for other lanes to carry out the jobs its first job waits
-    /// for.
+    /// for: each is woken once they have ([`Lanes::finished`]).
     blocked: HashSet<Key>,
     /// The device ended.
     ended: bool,
+    /// How many times a blocked lane was woken (the tests).
+    #[cfg(test)]
+    woken: u64,
 }
 
 impl State {
+    /// Whether `job` can begin: every lane it waits for is through its edge, or it was taken
+    /// before the last reset, which drops it.
+    fn ready(&self, job: &Job) -> bool {
+        job.epoch != self.epoch || job.after.iter().all(|&(k, t)| self.through(k, t))
+    }
+
     /// Every lane's wake.
     fn wakes(&self) -> Vec<Arc<Condvar>> {
         (self.lanes.values())
@@ -546,9 +555,7 @@ impl Lanes {
             let lane = state.lanes.get(&key)?;
             let wake = Arc::clone(&lane.wake);
             let ready = match lane.jobs.front() {
-                Some((job, _)) => {
-                    job.epoch != epoch || job.after.iter().all(|&(k, t)| state.through(k, t))
-                }
+                Some((job, _)) => state.ready(job),
                 None => {
                     let gone = !wait || wake.wait_for(&mut state, IDLE).timed_out();
                     let empty = state
@@ -604,9 +611,18 @@ impl Lanes {
                     }),
             };
             let done = context.map(|context| (context, state.context_done(context)));
-            let blocked = (state.blocked.iter())
-                .filter_map(|k| state.lanes.get(k).map(|lane| Arc::clone(&lane.wake)))
+            // Only the blocked lanes this job let go: a lane waits for other lanes' jobs handed
+            // before its own, and only their carrying out moves what it waits for. A device of
+            // many processes may hold many blocked lanes while other lanes finish jobs.
+            let blocked: Vec<Arc<Condvar>> = (state.blocked.iter())
+                .filter_map(|k| state.lanes.get(k))
+                .filter(|lane| lane.jobs.front().is_none_or(|(job, _)| state.ready(job)))
+                .map(|lane| Arc::clone(&lane.wake))
                 .collect();
+            #[cfg(test)]
+            {
+                state.woken += blocked.len() as u64;
+            }
             (blocked, done)
         };
         for wake in blocked {
@@ -675,7 +691,6 @@ impl Lanes {
         self.moved.notify_all();
     }
 
-    /// Whether no lane has a job not yet carried out (the tests).
     /// Whether the lane `key` has a thread (the tests).
     #[cfg(test)]
     pub(super) fn served(&self, key: Key) -> bool {
@@ -686,6 +701,15 @@ impl Lanes {
             .is_some_and(|lane| lane.served)
     }
 
+    /// Whether the lane `key`'s thread waits for other lanes' jobs, and how many times a blocked
+    /// lane has been woken (the tests).
+    #[cfg(test)]
+    pub(super) fn blocked(&self, key: Key) -> (bool, u64) {
+        let state = self.state.lock();
+        (state.blocked.contains(&key), state.woken)
+    }
+
+    /// Whether no lane has a job not yet carried out (the tests).
     #[cfg(test)]
     pub(super) fn idle(&self) -> bool {
         let state = self.state.lock();
