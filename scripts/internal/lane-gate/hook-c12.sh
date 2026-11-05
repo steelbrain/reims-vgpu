@@ -3,7 +3,7 @@
 # host's side of three probes, each started by a MARK line in that probe's stdout (one newer than
 # this hook: msi-probes.sh makes a probe's results afresh when it starts it).
 #   c12-s1               (S1_PROBE, default c12-s1) from the probe's start (its stdout, or "MARK
-#                        s1.start"): the guest's `log stream` of the kernel's and our kext's and
+#                        s1.start"): the guest's `/usr/bin/log stream` (the login shell is zsh, whose builtin `log` takes no arguments) of the kernel's and our kext's and
 #                        bundle's lines, over SSH, into DIR/s1-guest-stream.log, until "MARK s1.end"
 #                        or the probe's end (its rc) (a panic's lines reach the host up to the
 #                        panic, whether or not logd wrote them). A session that ends before then is
@@ -55,7 +55,7 @@ while alive && (( $(date +%s) < end )); do
       if [[ -n $p ]] && timeout 10 sshpass -p "$GUEST_PASS" ssh -p "$p" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" true < /dev/null 2> /dev/null; then
         echo "=== $(date +%s.%N) stream starts" >> "$D/s1-guest-stream.log"
         sshpass -p "$GUEST_PASS" ssh -p "$p" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
-          "log stream --style compact --level debug --predicate '$PRED'" < /dev/null >> "$D/s1-guest-stream.log" 2>&1 &
+          "/usr/bin/log stream --style compact --level debug --predicate '$PRED'" < /dev/null >> "$D/s1-guest-stream.log" 2>&1 &
         s1pid=$!
         log "stream $s1pid started"
       fi
