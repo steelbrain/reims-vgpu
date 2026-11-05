@@ -224,8 +224,9 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key)
 	const bool ok = naming == kRgfxPagesNamed;
 	IOLockLock(state.lock);
 	void *map = nullptr, *wire = nullptr, *surface = nullptr;
+	bool keepWired = false;
 	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(
-	    rgfxCacheAttached(state.caches, key, naming, &map, &wire, &surface)));
+	    rgfxCacheAttached(state.caches, key, naming, &map, &wire, &surface, &keepWired)));
 	wakeLocked();
 	if (cache) {
 		// Its block went meanwhile (rgfxCacheLetGo): the let-go is this attach's, out of the
@@ -237,7 +238,14 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key)
 		cache->release();
 		if (surface)
 			static_cast<OSObject *>(surface)->release();
-		letGoMemory(wire, rgfxPagesNamingWired(naming));
+		// A block kept for good with no wire of its own: the host may map the pages through it
+		// for good, so the memory stays wired, and held, as an unanswered naming's does.
+		if (keepWired)
+			IOLog("RgfxAccelerator: IOSurface %u's deferred block 0x%llx's pages stay wired for "
+			      "good: its block is kept, and named them as it went\n",
+			      surfaceId, offset);
+		else
+			letGoMemory(wire, rgfxPagesNamingWired(naming));
 		IOLockLock(state.lock);
 	}
 	if (!ok)
@@ -606,7 +614,8 @@ void unwireSurface(void *wire)
 }
 } // namespace
 
-void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, void **wireOut)
+void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, bool blockWired,
+                            void **wireOut)
 {
 	if (wireOut)
 		*wireOut = nullptr;
@@ -623,7 +632,7 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, void **w
 		const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 		wake |= c != nullptr;
 		wired = c == nullptr || rgfxCacheWired(*c);
-		kept = !rgfxCacheLetGo(state.caches, key, releasing, surface, &map, &wire);
+		kept = !rgfxCacheLetGo(state.caches, key, releasing, surface, &map, &wire, blockWired);
 		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);

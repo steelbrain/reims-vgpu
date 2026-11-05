@@ -1149,7 +1149,8 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nu
 	// wiring, the last holder's, or where it gave none (a dormant block's, kept as a create in
 	// flight names it), the cache's, so they never go back to macOS while it is in the table.
 	void *cacheWire = nullptr;
-	rgfxSurfaceLocksForget(e.cache, e.surface, e.cached && release, &cacheWire);
+	const bool blockWired = ownedWire || hostPages != nullptr;
+	rgfxSurfaceLocksForget(e.cache, e.surface, e.cached && release, blockWired, &cacheWire);
 	if (cacheWire && !rgfxBlockHoldWire(blockTable, e.offset, cacheWire))
 		unwire(cacheWire);
 	rgfxSurfaceClear(surfaceTable, e);

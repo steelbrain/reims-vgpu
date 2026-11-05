@@ -127,6 +127,10 @@ struct RgfxCachedSurface {
 	// The block went, not released, while a lock or the release named its pages: the attach
 	// lets the surface go once answered (rgfxCacheAttached), so the let-go waits for no host.
 	bool forgotten;
+	// That block, kept for good, took no wire of the pages of its own (its let-go read them
+	// unnamed, before the attach began): the attach keeps its wiring of them for good where it
+	// named them, as the host may map them through a block that never goes.
+	bool keepWire;
 };
 
 // RgfxCachedSurface::letGo where nothing asks the dormant block to go.
@@ -217,8 +221,11 @@ inline void rgfxCacheRemove(RgfxCacheTable &t, RgfxCachedSurface *c, void **map,
 // cache's reference and the surface's, `surface`, now; false where the table keeps both for the
 // answer (rgfxCacheReleased), or, where an attach of a deferred block's pages is in flight, for
 // that attach to let go once answered (rgfxCacheAttached): the let-go never waits for the host.
+// `blockWired`: the block keeps a wire of the surface's pages of its own while it is in the
+// table. Decided here, in the same hold as the attach's state: a block kept for good without
+// one, whose attach is in flight, has the attach keep the pages wired (`keepWire`).
 inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void *surface,
-                           void **map, void **wire)
+                           void **map, void **wire, bool blockWired)
 {
 	*map = *wire = nullptr;
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
@@ -227,6 +234,7 @@ inline bool rgfxCacheLetGo(RgfxCacheTable &t, uint64_t key, bool releasing, void
 	if (releasing || c->deferral == kRgfxCacheAttaching) {
 		c->releasing = releasing;
 		c->forgotten = !releasing;
+		c->keepWire = !releasing && !blockWired;
 		c->surface = surface;
 		return false;
 	}
@@ -436,12 +444,17 @@ inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, 
 // host's (kRgfxCacheAttachLate). Where its block went meanwhile (`forgotten`), the surface is
 // taken out (its mapping, its memory, wired where rgfxPagesNamingWired, and the surface's
 // reference in `*map`, `*wire` and `*surface`) and its key returned, the device cache whose
-// reference the caller releases, then the surface's; else 0. Such a block took a wire of its own
-// as it went (rgfxCacheHostPages), so the host's pages outlive the cache's.
+// reference the caller releases, then the surface's; else 0. A block that took a wire of its own
+// as it went (rgfxCacheHostPages) holds the host's pages past the cache's; one kept for good that
+// took none (`keepWire`) has the caller keep the memory's wiring for good where the naming wired
+// it (`*keepWired`): neither unwired nor released, as the host may map the pages for good.
 inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, RgfxPagesNaming naming,
-                                  void **map, void **wire, void **surface)
+                                  void **map, void **wire, void **surface,
+                                  bool *keepWired = nullptr)
 {
 	*map = *wire = *surface = nullptr;
+	if (keepWired)
+		*keepWired = false;
 	RgfxCachedSurface *c = rgfxCacheFind(t, key);
 	if (c == nullptr || c->deferral != kRgfxCacheAttaching)
 		return 0;
@@ -450,6 +463,8 @@ inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, RgfxPagesNami
 	                                               : kRgfxCacheDeferred;
 	if (!c->forgotten)
 		return 0;
+	if (keepWired)
+		*keepWired = c->keepWire && rgfxPagesNamingWired(naming);
 	*surface = c->surface;
 	rgfxCacheRemove(t, c, map, wire);
 	return key;

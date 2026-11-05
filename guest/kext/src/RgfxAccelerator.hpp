@@ -105,8 +105,12 @@ class ReimsGraphics;
 // is answered, which lets it go: the call waits for no host. A surface that goes takes the wiring
 // of its memory with it, unless `wire` is given: that wiring is then the caller's (`*wire`, null
 // where the surface was not cached, or its memory was never wired), to hand to a block the device
-// may still map in place, or to unwire.
-void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, void **wire = nullptr);
+// may still map in place, or to unwire. `blockWired`: the block keeps a wire of the surface's
+// pages of its own while it is in the table; decided in the same hold of the locks' state as the
+// attach in flight, a block kept for good without one has that attach keep its pages' wiring for
+// good (rgfxCacheLetGo).
+void rgfxSurfaceLocksForget(void *cache, void *surface, bool releasing, bool blockWired,
+                            void **wire = nullptr);
 // The surface `surface` of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID
 // `surfaceId`, has its block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page
 // mapped at `header`, which the kext keeps (and releases once the surface is cached no more) to
