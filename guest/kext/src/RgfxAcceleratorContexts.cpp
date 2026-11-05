@@ -1901,7 +1901,8 @@ bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t su
 		static_cast<OSObject *>(surface)->release();
 		return false;
 	}
-	// The entry is pending until the device answers its pages, so no other asker reads these.
+	// The entry is pending until the device answers its pages, so no other asker reads these,
+	// and nothing lets it go meanwhile (deferSurfaceBlock).
 	IOLockLock(contextLock);
 	e.surface = surface;
 	e.cache = cache;
@@ -1926,7 +1927,13 @@ bool RgfxAccelerator::reviveDeferredBlock(RgfxSurfaceEntry &e, uint32_t surfaceI
 bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId,
                                         UInt64 total, bool *cached)
 {
-	// The entry is pending until the device answers its pages, so no other asker reads it.
+	// The entry is pending until the device answers its pages, so no other asker reads it. Nor
+	// does anything let it go meanwhile, so `e` is this block's still under the contexts' lock
+	// taken again: its hold is the asker's alone, which a release refuses while it is pending;
+	// the asker's client's close takes the client's queue lock, which the ask holds throughout
+	// (RgfxAcceleratorUserClient's surface-block selector); and the dormant blocks' let-gos pass
+	// over it. None of this rests on IOKit ordering a close after a call in flight: the user
+	// client sets no IOUserClientDefaultLocking.
 	OSObject *surface = static_cast<OSObject *>(e.surface);
 	const UInt64 offset = e.offset, size = e.size, length = e.length;
 	// The header's page, where the kext writes the surface's CPU generation for the processes.
