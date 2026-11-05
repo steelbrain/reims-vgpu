@@ -227,7 +227,35 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
 pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>, _logged: bool) -> rt::HostMemory {
     // SAFETY: the caller's.
-    unsafe { rt::HostMemory::new(at) }
+    let memory = unsafe { rt::HostMemory::new(at) };
+    #[cfg(test)]
+    if REFUSING_IMPORTS.with(std::cell::Cell::get) {
+        return memory.with_import_gate(std::sync::Arc::new(|_| false));
+    }
+    memory
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's imports carry a gate that refuses them ([`refusing_imports`]).
+    static REFUSING_IMPORTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `call` with every import [`host_memory`] makes on this thread refused at a gate of its
+/// own, so the runtime makes each buffer, heap or rebind over a copy of the pages, as Linux's
+/// views' gate has it past the headroom of their budget (`os/linux/import.rs`): the copies'
+/// coherence, on a host whose imports never fail.
+#[cfg(test)]
+pub(crate) fn refusing_imports<T>(call: impl FnOnce() -> T) -> T {
+    /// Puts back the outer setting on drop, an unwinding call's included.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSING_IMPORTS.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(REFUSING_IMPORTS.with(|r| r.replace(true)));
+    call()
 }
 
 /// [`host_memory`]: on macOS the runtime asks nothing of the pages' permissions, so a vouch

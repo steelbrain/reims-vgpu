@@ -66,6 +66,10 @@ pub(crate) use host_os::{PAGE, mapped, writable};
 pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
+/// Runs a test's calls with their imports refused, so the runtime copies the pages, on macOS
+/// (`os/macos.rs`).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::refusing_imports;
 pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
 /// The loader's instance extensions, read in one call where they fit (`wsi.rs`), for
 /// `crate::host_gpus`'s own instances.
