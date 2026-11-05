@@ -22,7 +22,9 @@
 //!   downloaded, and the download comes before the fill. A commit on one thread racing a lock of
 //!   the surface on another, which IOSurface leaves undefined, can name its write after the lock
 //!   looked: its write is in no download, and the fill of the newer generation copies the
-//!   pages, the CPU's writes, over it.
+//!   pages, the CPU's writes, over it. On a block that reads back (Early copy, below), the
+//!   write's early copy lands in the pages whenever the GPU runs it, among the CPU's writes, as
+//!   a GPU's write lands where the GPU shares the CPU's memory, and the fill waits for it.
 //! - **Download.** The pages are written from the cache only at a `SURFACE_DOWNLOAD` (a CPU lock
 //!   after a GPU write), at the block's `BLOCK_RELEASE` and where the kext names the block's pages
 //!   again (`SURFACE_PAGES`), and only where a buffer that may write the surface was committed
@@ -34,17 +36,19 @@
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
 //!   answer, moved the generation, and let the CPU write the pages, whose writes are the newer,
 //!   as at a fill.
-//! - **Early copy.** A decoder's output that the CPU reads back after each picture (a client
-//!   that locks each frame to read it) is copied into its pages as the decode ends, not at the
-//!   lock that follows it ([`SurfaceCaches::early_copies`]). Once a download copied a write that
-//!   was the only one since the cache's last copy, the block reads back, and each later writer
-//!   that holds a video encoder and is again the only one has a command buffer of the host's
-//!   committed on its own queue right behind it, which copies the cache into the pages; the
-//!   download that follows is answered as that copy lands. A write that no download followed
-//!   ends it, until a download copies again. Other writers' queues take no such copy, as one
-//!   would hold their later work behind it (a window server drawing into a surface that another
-//!   process captures), and their downloads go as before; so does a download of pages the host
-//!   copies through the CPU, the copy running only where the pages lie in a buffer.
+//! - **Early copy.** A surface the CPU reads back after each GPU write (a decoder's output, or a
+//!   pixel transfer's, that its client locks each frame to read) is copied into its pages as the
+//!   write ends, not at the lock that follows it ([`SurfaceCaches::early_copies`]). Once a
+//!   download copied a write that was the only one since the cache's last copy, the block reads
+//!   back, and each later writer that is again the only one is followed by a command buffer of
+//!   the host's that copies the cache into the pages; the download that follows is answered as
+//!   that copy lands. A writer that holds a video encoder has it committed on its own queue right
+//!   behind it. Any other writer's goes on the host's read-back queue, waiting on the GPU for the
+//!   writer's end, as one on the writer's queue would hold its later work behind it (a window
+//!   server drawing into a surface that another process captures). A write that no download
+//!   followed ends it, until a download copies again; so a surface locked now and then takes at
+//!   most one copy no lock asked for. A download of pages the host copies through the CPU goes as
+//!   before, the copy running only where the pages lie in a buffer.
 //! - **Order.** Fills and downloads run on the host's own transfer queue, in the order they are
 //!   asked, each after every command buffer that used the cache before it: each such buffer
 //!   signals its queue's end event as it ends, and the copy waits for the latest value of each
@@ -145,6 +149,11 @@ pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
 /// byte: a `u64` the kext writes at each read-write lock, and stores 0 in as it caches the block
 /// (the kext's `kRgfxSurfaceCpuGenOffset`, which the processes read for `RGFX_OP_SURFACE_USE`).
 pub(crate) const CPU_GEN_OFFSET: u64 = 16;
+
+/// The key the host's read-back queue's end event is kept under among the command queues' end
+/// events ([`SurfaceCaches::early_copies`]): an id no guest queue takes, as a context's object
+/// ids count up from 1 and never reach 2^40 - 1 (`RGFX_CONTEXT_OBJ_ID_SHIFT`).
+const READ_BACK: u64 = u64::MAX;
 
 /// The CPU's generation of the surface whose cached block is at `block`, as the kext last wrote
 /// it in the block's header ([`CPU_GEN_OFFSET`]); `None` where the header is not in `region`.
@@ -352,6 +361,11 @@ struct Transfer<P: Platform> {
     ///
     /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
     queue: P::CommandQueue,
+    /// The early copies behind writers that hold no video encoder
+    /// ([`SurfaceCaches::early_copies`]), apart from the fills, so neither waits behind the
+    /// other's writers; it signals the end event the caches keep under [`READ_BACK`]. `None`
+    /// where the platform makes no queue: those writers take no early copy.
+    read_back: Option<P::CommandQueue>,
     event: P::Event,
     /// The last value a copy signals.
     signalled: u64,
@@ -371,6 +385,7 @@ impl<P: Platform> Transfer<P> {
         };
         Ok(Some(Transfer {
             queue,
+            read_back: device.new_command_queue(),
             event,
             signalled: 0,
             fills: Arc::new(Fills {
@@ -491,6 +506,8 @@ pub(crate) struct CacheCounts {
     /// ([`SurfaceCaches::early_copies`]), and their bytes.
     pub(crate) early: u64,
     pub(crate) early_bytes: u64,
+    /// Of them, copies behind a writer that held no video encoder, on the host's read-back queue.
+    pub(crate) early_aside: u64,
     /// Downloads that an early copy answered, and early copies that no download followed before
     /// the next write, each of which ended its block's reading back.
     pub(crate) early_read: u64,
@@ -1135,24 +1152,45 @@ impl<P: Platform> SurfaceCaches<P> {
     /// counts among the caches' users are `counts` (the module doc): each cache it may write
     /// whose surface reads back ([`ReadBack`]), where its write is the only one since the cache's
     /// last copy and no device of the host wrote the pages since its last fill, is copied into
-    /// its pages by a command buffer of the host's committed on `on`, the writer's own queue,
-    /// right behind it, so the copy starts as the writer's work ends, waiting for nothing else.
-    /// That buffer signals the queue's end event next, which later copies of the cache wait for;
-    /// the cache's write is then the pages', once the copy lands ([`Landing`]).
+    /// its pages by a command buffer of the host's. Where the writer holds a video encoder that
+    /// buffer is committed on `on`, the writer's own queue, right behind it, so the copy starts as
+    /// the writer's work ends, waiting for nothing else, and signals that queue's end event next.
+    /// Any other writer's is committed on the host's read-back queue ([`Transfer::read_back`]),
+    /// waiting on the GPU for the writer's end value, so the writer's queue goes on behind the
+    /// writer, and signals the read-back queue's end event ([`READ_BACK`]). Later copies of the
+    /// cache wait for that value, and so does a later writer; the cache's write is the pages'
+    /// once the copy lands ([`Landing`]).
     fn early_copies(
         &mut self,
         queue: u64,
-        on: &P::CommandQueue,
+        on: Option<&P::CommandQueue>,
         counts: &[Count],
     ) -> RaiseResult<()> {
+        // The copies' queue, the end event they signal, and the writer's end it waits for there.
+        let (copies_on, signals) = match on {
+            Some(on) => (on, queue),
+            None => match self.transfer.as_ref().and_then(|t| t.read_back.as_ref()) {
+                Some(read_back) => (read_back, READ_BACK),
+                None => return Ok(()),
+            },
+        };
         for &(block, write) in counts {
             if write.is_none() || self.watched.written(block) {
                 continue;
             }
             let (Some(cache), Some((event, value))) =
-                (self.by_block.get(&block), self.ends.get(&queue))
+                (self.by_block.get(&block), self.ends.get(&signals))
             else {
                 continue;
+            };
+            // Off the writer's queue, the copy waits for the writer's end, which it signalled.
+            let after = if signals == queue {
+                None
+            } else {
+                match self.ends.get(&queue) {
+                    Some((writer, end)) => Some((writer, *end)),
+                    None => continue,
+                }
             };
             let read_back = &cache.read_back;
             if !read_back.on || read_back.writes != 1 || !cache.written {
@@ -1165,9 +1203,12 @@ impl<P: Platform> SurfaceCaches<P> {
                 Some(CachePages::Runs { .. }) => None,
                 Some(CachePages::Copied(_)) | None => continue,
             };
-            let Some(cb) = on.command_buffer(ON)? else {
+            let Some(cb) = copies_on.command_buffer(ON)? else {
                 continue;
             };
+            if let Some((writer, end)) = after {
+                cb.encode_wait(Some(EventRef::Event(writer)), end)?;
+            }
             let Some(blit) = cb.blit_encoder(ON)? else {
                 continue;
             };
@@ -1209,23 +1250,26 @@ impl<P: Platform> SurfaceCaches<P> {
             cb.encode_signal(Some(EventRef::Event(event)), next)?;
             cb.commit(ON)?;
             let length = cache.length;
-            if let Some((_, value)) = self.ends.get_mut(&queue) {
+            if let Some((_, value)) = self.ends.get_mut(&signals) {
                 *value = next;
             }
             if let Some(cache) = self.by_block.get_mut(&block) {
                 cache.written = false;
-                cache.users.insert(queue, next);
+                cache.users.insert(signals, next);
                 let read_back = &mut cache.read_back;
                 read_back.writes = 0;
                 read_back.unread = true;
                 read_back.copy = Some(EarlyCopy {
-                    queue,
+                    queue: signals,
                     value: next,
                     landing,
                 });
             }
             self.counts.early += 1;
             self.counts.early_bytes += length;
+            if signals == READ_BACK {
+                self.counts.early_aside += 1;
+            }
         }
         Ok(())
     }
@@ -1636,9 +1680,13 @@ impl<P: Platform> Caches<P> {
     /// Laptop GPU host: 0.5 to 3 ms an end event at a queue's first buffer in a guest's boot,
     /// against 0.1 ms where no other thread makes or frees the device's memory or semaphores).
     pub(crate) fn queue_made(&self, device: &P::Device, queue: u64) -> RaiseResult<()> {
-        let (on, transfer) = {
+        let (on, transfer, read_back) = {
             let state = self.state.lock();
-            (state.on, state.transfer.is_some())
+            (
+                state.on,
+                state.transfer.is_some(),
+                state.ends.contains_key(&READ_BACK),
+            )
         };
         if !on {
             return Ok(());
@@ -1648,17 +1696,24 @@ impl<P: Platform> Caches<P> {
             true => None,
             false => Transfer::new(device, &self.on_fill_done)?,
         };
+        // The read-back queue's end event, made again after a reset let go of it.
+        let mut read_back_end = match read_back {
+            true => None,
+            false => device.new_event(ON)?,
+        };
         {
             let mut state = self.state.lock();
             // Kept only where the caches are still on, and where no buffer's begin or finish made
             // the same meanwhile; else let go of below.
             if state.on {
-                if let Some(event) = end.take() {
-                    match state.ends.entry(queue) {
-                        Entry::Vacant(slot) => {
-                            slot.insert((event, 0));
+                for (key, made_end) in [(queue, &mut end), (READ_BACK, &mut read_back_end)] {
+                    if let Some(event) = made_end.take() {
+                        match state.ends.entry(key) {
+                            Entry::Vacant(slot) => {
+                                slot.insert((event, 0));
+                            }
+                            Entry::Occupied(_) => *made_end = Some(event),
                         }
-                        Entry::Occupied(_) => end = Some(event),
                     }
                 }
                 if state.transfer.is_none() {
@@ -1666,8 +1721,8 @@ impl<P: Platform> Caches<P> {
                 }
             }
         }
-        if (end.is_some() || made.is_some())
-            && let Err(refusal) = refusals::refusing(move || drop((end, made)))
+        if (end.is_some() || made.is_some() || read_back_end.is_some())
+            && let Err(refusal) = refusals::refusing(move || drop((end, made, read_back_end)))
         {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -1856,7 +1911,6 @@ impl<P: Platform> Caches<P> {
         let done = signalled.and_then(|()| commit());
         let mut state = self.state.lock();
         if done.is_ok()
-            && let Some(on) = on
             && let Err(raise) = refusing(|| state.early_copies(queue, on, &uses.blocks))
         {
             log::warn!(
@@ -2745,7 +2799,8 @@ mod tests {
     }
 
     /// The transfer queue is made with the first command queue, once, and unshared: a present of
-    /// a surface waits for its fill. The fills make no queue
+    /// a surface waits for its fill. The read-back queue is made with it, plain. The fills make no
+    /// queue
     #[test]
     fn the_transfer_queue_is_made_unshared_with_the_first_queue() {
         use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
@@ -2756,8 +2811,8 @@ mod tests {
         );
         assert_eq!(
             (unshared, plain),
-            (1, 2),
-            "made with queue 1, beside queues 1 and 2"
+            (1, 3),
+            "made with queue 1, beside queues 1 and 2 and the read-back queue"
         );
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
@@ -3094,11 +3149,15 @@ mod tests {
     /// generation's fill: the lock's download copies it out of the cache, and the fill, after it
     /// on the transfer queue, copies the pages and the CPU's writes back in. A write the kext did
     /// not download before the lock (a commit racing the lock on another thread) is filled over,
-    /// the CPU's writes winning, and the cache, still written, is copied out at its next download
+    /// the CPU's writes winning, and the cache, still written, is copied out at its next download.
+    /// Two writes come before the first download, so the block does not read back: one that does
+    /// takes the raced write's early copy, which the fill waits for
+    /// (`a_read_back_queue_s_copy_in_flight_holds_the_next_writer`)
     #[test]
     fn a_newer_generation_fills_after_the_download_of_a_write() {
         let mut r = cached();
         let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x0ff, &[(BLOCK, 0, true)]);
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
@@ -4275,7 +4334,8 @@ mod tests {
     /// Only a write that was the only one since the cache's last copy, read back, starts the
     /// early copies; a write that no download followed ends them, and the lock after it
     /// downloads as before, which starts them again. A writer whose queue the decoder does not
-    /// hand over (one that holds no video encoder) takes none
+    /// hand over (one that holds no video encoder) takes its copy on the host's read-back queue,
+    /// which waits there on the GPU for the writer's end
     #[test]
     fn a_write_no_lock_followed_ends_the_early_copies() {
         let mut r = cached();
@@ -4294,25 +4354,29 @@ mod tests {
         let (_, copied) = decode_then_lock(&r, 7, &queue);
         assert_eq!(copied.len(), 1, "two writes since the last copy");
 
-        // One write, then the lock: the next write is copied out early, but not a writer that
-        // holds no video encoder.
+        // One write, then the lock: the next write is copied out early, a writer that holds no
+        // video encoder on the read-back queue, after the writer's end; its lock copies nothing
+        // more.
         let (_, copied) = decode_then_lock(&r, 7, &queue);
         assert_eq!(copied.len(), 1);
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 2, 0x201, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1, "copied out on the read-back queue");
+        let writer = events(&calls, SIGNAL)[0];
+        assert!(
+            events(&calls, WAIT).contains(&writer),
+            "after the writer's end, on the GPU"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
         assert!(
             copies(&r.p.call_log().since(mark)).is_empty(),
-            "no video encoder"
+            "its lock copies nothing more"
         );
-        r.p.world().complete_all(CompleteOn::Caller);
-        let done = download(&r, BLOCK);
-        assert_eq!(
-            copies(&r.p.call_log().since(mark)).len(),
-            1,
-            "its lock downloads"
-        );
-        r.p.world().complete_all(CompleteOn::Caller);
         assert!(done.load(Ordering::SeqCst));
+        assert_eq!(r.dec.caches().counts().early_aside, 1);
         let mark = r.p.call_log().mark();
         decode_into(&r, 7, &queue);
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "early");
@@ -4332,7 +4396,41 @@ mod tests {
         decode_into(&r, 7, &queue);
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "early again");
         r.p.world().complete_all(CompleteOn::Caller);
-        assert_eq!(r.dec.caches().counts().early, 2);
+        assert_eq!(r.dec.caches().counts().early, 3);
+    }
+
+    /// An early copy on the host's read-back queue still in flight holds the cache's next writer
+    /// on the GPU, one on the first writer's own queue too, at the copy's end value, and a fill
+    /// of a newer generation waits for it there as well
+    #[test]
+    fn a_read_back_queue_s_copy_in_flight_holds_the_next_writer() {
+        let mut r = cached();
+        use_surfaces(&mut r, 2, 0x200, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let done = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x201, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1, "copied out early");
+        let copied = events(&calls, SIGNAL)[1];
+        assert_eq!(copied.1, 1, "the read-back queue's first copy");
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x202, &[(BLOCK, 0, true)]);
+        let calls = r.p.call_log().since(mark);
+        assert!(events(&calls, WAIT).contains(&copied), "the writer waits");
+        assert!(
+            copies(&calls).is_empty(),
+            "read by no lock: no copy behind it"
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x203, &[(BLOCK, 1, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls).len(), 1, "a fill");
+        assert!(events(&calls, WAIT).contains(&copied), "the fill waits");
+        r.p.world().complete_all(CompleteOn::Caller);
     }
 
     /// An early copy still in flight is waited for: a release of the cache, which nothing wrote
@@ -4435,8 +4533,10 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(done.load(Ordering::SeqCst));
 
-        // A writer with no video encoder, finished: the download would copy now.
+        // Two writes, the first copied out early and read by no lock, so the second is not: the
+        // download would copy now.
         use_surfaces(&mut r, 2, 0x200, &[(BLOCK, 0, true)]);
+        use_surfaces(&mut r, 2, 0x201, &[(BLOCK, 0, true)]);
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
         let (asked, done) = try_download(&r, BLOCK);

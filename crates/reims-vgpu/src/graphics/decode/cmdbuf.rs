@@ -3380,7 +3380,8 @@ mod tests {
     /// behind the next decode into it, by a command buffer of the host's committed on the
     /// decode's own queue right after it, and the lock's download that follows copies nothing
     /// more, answered once that copy lands. A command buffer that writes the surface and holds no
-    /// video encoder is followed by no such copy: its lock downloads as before
+    /// video encoder has its copy on the host's read-back queue instead, so its own queue is not
+    /// held behind it, and its lock too copies nothing more
     #[test]
     fn a_decode_read_back_is_copied_out_behind_the_next_decode() {
         use super::super::surface_pages::tests::{BLOCK, Rig};
@@ -3462,13 +3463,21 @@ mod tests {
 
         let mark = r.p.call_log().mark();
         run(&mut r, writes_cached_video(102, 4, false));
-        assert!(copied_since(&r, mark).is_empty(), "no copy behind it");
+        assert_eq!(
+            copied_since(&r, mark),
+            [cache],
+            "copied out on the read-back queue"
+        );
         r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
         let done = download(&r);
-        assert_eq!(copied_since(&r, mark), [cache], "its lock downloads");
-        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(
+            copied_since(&r, mark).is_empty(),
+            "its lock copies nothing more"
+        );
         assert!(done.load(Ordering::SeqCst));
-        assert_eq!(r.dec.caches().counts().early, 1);
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.early, counts.early_aside), (2, 1));
     }
 
     /// A command buffer opens a render encoder for its pass, sends each reference

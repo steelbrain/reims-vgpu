@@ -1066,13 +1066,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                      writes changed; {} written caches copied at a release with no client \
                      left; {} copies out not made, the CPU's generation past the cache's; {} \
                      deferred, {} refused, {} named their pages ({} copied), {} released \
-                     unnamed; {} early copies of {} MiB, {} downloads they answered, {} unread; \
-                     {} copy by runs, {} copies by runs refused",
+                     unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
+                     downloads they answered, {} unread; {} copy by runs, {} copies by runs \
+                     refused",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
-                    d.early, d.early_bytes >> 20, d.early_read, d.early_unread, d.by_runs,
-                    d.runs_refused
+                    d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
+                    d.by_runs, d.runs_refused
                 );
             }
         }
@@ -4858,8 +4859,9 @@ mod tests {
     /// A queue create whose tail holds `RGFX_QUEUE_UNSHARED` makes the platform's unshared queue,
     /// and one without it (no tail, a tail of none, or of other flags) the plain `newCommandQueue`,
     /// each stored under its id, and then its surface timeline and its device caches' end event,
-    /// the first queue's followed by the caches' transfer queue, unshared, and its event. A queue
-    /// the platform makes nothing of, either way, is refused, and stores and makes nothing more.
+    /// the first queue's followed by the caches' transfer queue, unshared, and its event, and their
+    /// read-back queue, plain, and its end event. A queue the platform makes nothing of, either
+    /// way, is refused, and stores and makes nothing more.
     #[test]
     fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
         use reims_graphics::wire::{
@@ -4912,7 +4914,7 @@ mod tests {
 
         let unshared = Some(RGFX_QUEUE_UNSHARED);
         let mut first = made(UNSHARED_QUEUE);
-        first.extend([UNSHARED_QUEUE, "newEvent"]);
+        first.extend([UNSHARED_QUEUE, "newEvent", "newCommandQueue", "newEvent"]);
         assert_eq!(decode(&mut dec, &create(1, unshared)), (Ok(()), first));
         let both = Some(RGFX_QUEUE_UNSHARED | RGFX_QUEUE_QUIET_SCHEDULED);
         assert_eq!(
@@ -5592,13 +5594,14 @@ mod tests {
 
         assert_eq!(dec.object_count(), 13);
         let log = p.call_log();
-        // The guest's event, and the queue's device caches' end event and the caches' transfer
-        // event, made with the queue.
-        assert_eq!(log.calls_to("newEvent").len(), 3);
+        // The guest's event, and the queue's device caches' end event, the caches' transfer
+        // event and their read-back queue's end event, made with the queue.
+        assert_eq!(log.calls_to("newEvent").len(), 4);
         assert_eq!(log.calls_to("newFence").len(), 1);
         // The guest's shared event, and the queue's surface timeline.
         assert_eq!(log.calls_to("newSharedEvent").len(), 2);
-        assert_eq!(log.calls_to("newCommandQueue").len(), 1);
+        // The guest's queue, and the caches' read-back queue, made with it.
+        assert_eq!(log.calls_to("newCommandQueue").len(), 2);
         assert_eq!(log.calls_to("newLibraryWithData:error:").len(), 1);
         assert_eq!(log.calls_to("newSamplerStateWithDescriptor:").len(), 1);
         assert_eq!(log.calls_to("newDepthStencilStateWithDescriptor:").len(), 1);

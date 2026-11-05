@@ -374,13 +374,15 @@ Stages:
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
       committed since the last copy (`reims-vgpu`'s
-      `graphics/decode/surface_cache.rs`). The one exception is a decoder's
-      output the CPU reads back: once a download copied a write that was the
-      only one since the cache's last copy, the next command buffer that
-      holds a video encoder and is again the surface's only writer is
-      followed on its own queue by a copy of the host's into the pages, which
-      starts as the decode ends, and the lock's download is answered as that
-      copy lands; a write no download followed stops it. A write the host's
+      `graphics/decode/surface_cache.rs`). The one exception is a surface the
+      CPU reads back after each GPU write: once a download copied a write that
+      was the only one since the cache's last copy, the next command buffer
+      that is again the surface's only writer is followed by a copy of the
+      host's into the pages, which starts as the write ends, and the lock's
+      download is answered as that copy lands; a write no download followed
+      stops it. A writer that holds a video encoder has the copy on its own
+      queue; any other's goes on the host's read-back queue, waiting on the
+      GPU for the writer, so the writer's queue goes on behind it. A write the host's
       own devices make into the pages (a video device's frame, in a CPU lend
       or by a device of the host) moves no count: the host watches each
       cache's pages, and such a write has the cache's next use fill it
