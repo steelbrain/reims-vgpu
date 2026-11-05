@@ -1662,9 +1662,13 @@ and sends each as a placement at that offset. The heap's `usedSize` and
 process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
 Metal makes one over any range the process maps readable, at any alignment:
 malloc'd, `vm_allocate`d, read-only, or a file mapping (measured on an M3 Max,
-16 KiB and 4 KiB pages). Over such memory the buffer lies over a block of its
-own, and `contents` stays the app's pointer, since the host reaches guest RAM
-only for IOSurfaces' pages (Decided 5). The block syncs with the memory as the IOSurface copies do
+16 KiB and 4 KiB pages). Writable Shared memory the kext wires lies in place
+(`PagesBlock`, `BUFFER_OVER_PAGES`). Over any other memory (read-only, a Managed
+buffer's, or memory the kext or host makes no pages block of) the buffer lies
+over a range of a slab of its own options, as a device buffer of them does
+("Shared and Managed buffers lie in slabs"): the process's own superpages where
+the device takes them, so no app-sized copy lies in the region. `contents`
+stays the app's pointer. The range syncs with the memory as the IOSurface copies do
 (Decided 14): from the memory before the commit of each command buffer that uses
 the buffer, and back to it as one that may write it completes, before its
 completion is reported. Each side's bytes that moved since the two last agreed go

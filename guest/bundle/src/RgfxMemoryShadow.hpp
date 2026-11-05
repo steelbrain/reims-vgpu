@@ -1,9 +1,10 @@
 /*
  * RgfxMemoryShadow: the GPU's copy of app memory a no-copy buffer wraps
  * (`newBufferWithBytesNoCopy:length:options:deallocator:` over memory outside the device
- * region: malloc'd, vm_allocate'd, a file mapping). The host GPU reaches only the region's
- * blocks (docs/graphics-kext/design.md, Decided 5), so the buffer lies over a block of its
- * own, and `contents` stays the app's pointer, as Metal's does.
+ * region that the host does not use in place: read-only, a Managed buffer's, or memory the kext
+ * or the host makes no pages block of). The buffer lies over a range of a slab of its own
+ * (RgfxSlabs.hpp, RgfxBuffer.h), the block here, and `contents` stays the app's pointer, as
+ * Metal's does.
  *
  * The block and the app's memory sync at two points, as the IOSurface copies do
  * (RgfxIOSurface.h):

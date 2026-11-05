@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <tuple>
 
 #import "RgfxBuffer.h"
@@ -5927,6 +5929,9 @@ void test_buffer_texture_replace_region_tells_the_host()
 	Fixture fx;
 	std::vector<uint8_t> mem(0x800000, 0);
 	RgfxRegion region(mem.data(), mem.size());
+	// A no-copy buffer's GPU copy is a range of a slab of the region's.
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
 	const NSUInteger length = 0x2000, offset = 0x100, pitch = 0x100;
 	MTLTextureDescriptor *desc =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -6013,6 +6018,7 @@ void test_buffer_texture_replace_region_tells_the_host()
 		                                               options:MTLResourceStorageModeManaged
 		                                           deallocator:nil
 		                                                region:&region
+		                                                 slabs:&slabs
 		                                                device:nil
 		                                            serializer:&fx.ser];
 		CHECK(noCopy != nil && [noCopy contents] == p && [noCopy rgfxShadow] != nullptr);
@@ -6140,6 +6146,9 @@ void test_buffer_texture_did_modify_data_tells_the_host()
 	Fixture fx;
 	std::vector<uint8_t> mem(0x800000, 0);
 	RgfxRegion region(mem.data(), mem.size());
+	// A no-copy buffer's GPU copy is a range of a slab of the region's.
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
 	const NSUInteger length = 0x2000, offset = 0x100, pitch = 0x100;
 	MTLTextureDescriptor *desc =
 	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -6215,6 +6224,7 @@ void test_buffer_texture_did_modify_data_tells_the_host()
 		                                               options:MTLResourceStorageModeManaged
 		                                           deallocator:nil
 		                                                region:&region
+		                                                 slabs:&slabs
 		                                                device:nil
 		                                            serializer:&fx.ser];
 		CHECK(noCopy != nil && [noCopy contents] == p);
@@ -6472,6 +6482,8 @@ void test_no_copy_buffers()
 	(void)expectQueueCreate(f.control);
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
 	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource slabSource(region, f.ser);
+	RgfxSlabs slabs(slabSource);
 	const MTLResourceOptions shared = MTLResourceStorageModeShared;
 	vm_address_t app = 0;
 	CHECK(vm_allocate(mach_task_self(), &app, 0x40000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
@@ -6501,14 +6513,18 @@ void test_no_copy_buffers()
 			                                      freedLog->count++;
 		                                      }
 		                                           region:&region
+		                                            slabs:&slabs
 		                                           device:nil
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] != nullptr);
-		auto create =
-		    expectMessage<RgfxBufferOverHostMemory>(f.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
-		CHECK(create.obj_id == b.rgfxObjId && create.length == 0x14000);
-		CHECK(create.region_offset >= region.floor());
-		block = mem.data() + create.region_offset;
+		// Its GPU copy is a range of a slab: a heap over a block, the buffer placed in it.
+		auto heap =
+		    expectMessage<RgfxHeapOverHostMemory>(f.control, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		auto create = expectMessage<RgfxBufferAtOffset>(f.control, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(create.obj_id == b.rgfxObjId && create.length == 0x14000 &&
+		      create.heap_obj_id == heap.obj_id && b.gpuAddress == heap.gpu_address + create.offset);
+		CHECK(heap.region_offset >= region.floor());
+		block = mem.data() + heap.region_offset + create.offset;
 		CHECK(std::memcmp(block, p, 0x14000) == 0);
 
 		// A writing command buffer: the CPU's bytes go in at the commit.
@@ -6587,6 +6603,7 @@ void test_no_copy_buffers()
 		                                 options:options
 		                             deallocator:nil
 		                                  region:&region
+		                                   slabs:&slabs
 		                                  device:nil
 		                              serializer:&f.ser];
 	};
@@ -6629,6 +6646,7 @@ void test_no_copy_buffers()
 				                                        nullFreed->store(q);
 			                                        }
 			                                             region:&region
+			                                              slabs:&slabs
 			                                             device:nil
 			                                         serializer:&f.ser];
 			CHECK(own != nil && [own rgfxShadow] == nullptr &&
@@ -6667,6 +6685,8 @@ void test_no_copy_buffers_in_place()
 	RgfxRegion region(mem.data(), mem.size());
 	BlockLog blocks;
 	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, f.ser);
+	RgfxSlabs slabs(slabSource);
 	struct Pages {
 		std::vector<std::tuple<const void *, uint64_t, bool>> asked;
 		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x100000;
@@ -6700,6 +6720,7 @@ void test_no_copy_buffers_in_place()
 			                                      freed->fetch_add(1);
 		                                      }
 		                                           region:&region
+		                                            slabs:&slabs
 		                                           device:nil
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] == nullptr);
@@ -6726,6 +6747,7 @@ void test_no_copy_buffers_in_place()
 		                                 options:options
 		                             deallocator:nil
 		                                  region:&region
+		                                   slabs:&slabs
 		                                  device:nil
 		                              serializer:&f.ser];
 	};
@@ -6765,6 +6787,111 @@ void test_no_copy_buffers_in_place()
 }
 
 
+// A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
+// buffer's is (RgfxBuffer.h): with the process's superpages as the slabs' first source, the
+// copies of read-only memory and of Managed buffers lie in them, seeded from the memory, eight 4 KiB
+// copies a page apart in one heap over one pages block, and the region gives none of them a block
+// of its own (each took one before: the region held every app-sized copy).
+void test_no_copy_shadows_lie_in_slabs()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	// The kernel's superpages, zeroed, and the kext's pages blocks of them, each a block of the
+	// region's a page long.
+	struct Vm {
+		std::map<uint8_t *, std::unique_ptr<uint8_t[]>> held;
+		std::vector<const void *> wired;
+		BlockLog *blocks = nullptr;
+		static int superpages(void *c, uint64_t size, uint8_t **bytes)
+		{
+			std::unique_ptr<uint8_t[]> memory(new uint8_t[size]());
+			*bytes = memory.get();
+			static_cast<Vm *>(c)->held[*bytes] = std::move(memory);
+			return KERN_SUCCESS;
+		}
+		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
+		static bool block(void *c, const void *address, uint64_t, bool, uint64_t *offset,
+		                  uint64_t *size)
+		{
+			Vm *vm = static_cast<Vm *>(c);
+			vm->wired.push_back(address);
+			*size = 0x1000;
+			return BlockLog::alloc(vm->blocks, 0x1000, 0x1000, offset);
+		}
+	} vm;
+	vm.blocks = &blocks;
+	region.setPagesBlockSource(&Vm::block, &vm);
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.superpages = &Vm::superpages;
+	calls.unmap = &Vm::unmap;
+	// As a device that took MANAGED_AT_OFFSET and HEAP_OVER_PAGES makes them.
+	RgfxRegionSlabSource regionSource(region, f.ser, true);
+	RgfxPagesSlabSource pagesSource(region, f.ser, calls, 16ull << 30, true);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pagesSource);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	for (size_t i = 0; i < 0x10000; i++)
+		p[i] = static_cast<uint8_t>(i * 7 + 3);
+	CHECK(vm_protect(mach_task_self(), app, 0x8000, false, VM_PROT_READ) == KERN_SUCCESS);
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	@autoreleasepool {
+		NSMutableArray<RgfxBuffer *> *held = [NSMutableArray array];
+		for (int i = 0; i < 8; i++) {
+			RgfxBuffer *b = noCopy(p + i * 0x1000, 0x1000, MTLResourceStorageModeShared);
+			CHECK(b != nil && [b contents] == p + i * 0x1000 && [b rgfxShadow] != nullptr &&
+			      ![b rgfxShadow]->writable());
+			[held addObject:b];
+		}
+		CHECK(vm.held.size() == 1 && vm.wired.size() == 1 && blocks.allocated.size() == 1);
+		uint8_t *superpage = vm.held.begin()->first;
+		auto heap = expectMessage<RgfxHeapOverPages>(f.control, RGFX_CMD_HEAP_OVER_PAGES);
+		CHECK(heap.block_offset == blocks.allocated[0] && heap.size_bytes == 2ull << 20);
+		for (int i = 0; i < 8; i++) {
+			auto at = expectMessage<RgfxBufferAtOffset>(f.control, RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(at.obj_id == held[i].rgfxObjId && at.heap_obj_id == heap.obj_id &&
+			      at.offset == static_cast<uint64_t>(i) * 0x1000 && at.length == 0x1000);
+			CHECK(std::memcmp(superpage + at.offset, p + i * 0x1000, 0x1000) == 0);
+		}
+		// A Managed one's CPU copy lies in a superpage of its own class, placed in its heap.
+		RgfxBuffer *managed = noCopy(p + 0x8000, 0x2000, MTLResourceStorageModeManaged);
+		CHECK(managed != nil && [managed rgfxShadow] != nullptr && [managed rgfxShadow]->writable());
+		CHECK(vm.held.size() == 2 && blocks.allocated.size() == 2);
+		auto mheap = expectMessage<RgfxHeapOverPages>(f.control, RGFX_CMD_HEAP_OVER_PAGES);
+		auto mat =
+		    expectMessage<RgfxBufferManagedAtOffset>(f.control, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
+		CHECK(mat.obj_id == managed.rgfxObjId && mat.heap_obj_id == mheap.obj_id &&
+		      mat.offset == 0 && mat.length == 0x2000);
+		uint8_t *copy = nullptr;
+		for (auto &h : vm.held)
+			if (h.first != superpage)
+				copy = h.first;
+		CHECK(copy != nullptr && std::memcmp(copy, p + 0x8000, 0x2000) == 0);
+		// The region's only blocks are the two pages blocks.
+		CHECK(blocks.allocated.size() == vm.wired.size());
+	}
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 // A no-copy buffer bound to a shader is one the command buffer may write, so its completion
 // writes it back; a texture over it is one only where its usage has ShaderWrite. A bound buffer
 // with no copy of app memory notes nothing beside them. One used to read is written back where a
@@ -6776,6 +6903,8 @@ void test_binds_note_shadow_writes()
 	(void)expectQueueCreate(f.control);
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
 	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource slabSource(region, f.ser);
+	RgfxSlabs slabs(slabSource);
 	const MTLResourceOptions shared = MTLResourceStorageModeShared;
 	vm_address_t app = 0;
 	CHECK(vm_allocate(mach_task_self(), &app, 0x20000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
@@ -6793,12 +6922,15 @@ void test_binds_note_shadow_writes()
 		                                          options:shared
 		                                      deallocator:nil
 		                                           region:&region
+		                                            slabs:&slabs
 		                                           device:nil
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b rgfxShadow] != nullptr);
-		auto create =
-		    expectMessage<RgfxBufferOverHostMemory>(f.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
-		uint8_t *block = mem.data() + create.region_offset;
+		auto heap =
+		    expectMessage<RgfxHeapOverHostMemory>(f.control, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		auto create = expectMessage<RgfxBufferAtOffset>(f.control, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(create.obj_id == b.rgfxObjId && create.heap_obj_id == heap.obj_id);
+		uint8_t *block = mem.data() + heap.region_offset + create.offset;
 		RgfxRegion::Block other = region.allocate(0x1000);
 		RgfxBuffer *plain = [RgfxBuffer bufferOverHostMemoryWithContents:const_cast<uint8_t *>(other.ptr)
 		                                                    regionOffset:other.offset
@@ -10996,6 +11128,7 @@ int main(int argc, char **argv)
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
 		test_no_copy_buffers_in_place();
+		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();
 		rgfxProtocolTests(); // tests/protocol_tests.mm

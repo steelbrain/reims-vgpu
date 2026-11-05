@@ -61,13 +61,14 @@
                                   options:(MTLResourceOptions)options
                               deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	// Over the caller's bytes in place where they lie in a block of ours, else over a block of
-	// their own synced with them (RgfxBuffer.h).
+	// Over the caller's bytes in place where they lie in a block of ours or the kext wires their
+	// pages, else over a range of a slab synced with them (RgfxBuffer.h).
 	return [RgfxBuffer bufferWithBytesNoCopy:pointer
 	                                  length:length
 	                                 options:options
 	                             deallocator:deallocator
 	                                  region:[self region]
+	                                   slabs:[self slabs]
 	                                  device:self
 	                              serializer:[self serializer]];
 }

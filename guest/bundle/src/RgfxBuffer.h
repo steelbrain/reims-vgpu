@@ -102,21 +102,24 @@ NS_ASSUME_NONNULL_BEGIN
 /// process's) the host sees in place. Shared bytes the process may write, where `region` has
 /// pages blocks (RgfxRegion::acquirePages), the host sees in place too: the kext wires their
 /// pages for the buffer's life, and the buffer's GPU address keeps the pointer's offset in its
-/// page. Any others, and those the kext or the host makes no pages block of, get a block of
-/// their own, the GPU's copy, synced with them at the command buffers that use the buffer
-/// (RgfxMemoryShadow.hpp). A null `pointer` is a buffer with contents of its own, zeroed, whose
+/// page. Any others, and those the kext or the host makes no pages block of, get a range of a
+/// slab of `slabs` as a device buffer of their options does (RgfxSlabs.hpp), the GPU's copy,
+/// synced with them at the command buffers that use the buffer (RgfxMemoryShadow.hpp): the
+/// process's own pages where the device takes them, the region's only where the kernel has none.
+/// A null `pointer` is a buffer with contents of its own, zeroed, in such a range, whose
 /// deallocator gets null.
 ///
 /// What Metal makes, as measured (M3 Max, macOS 27, 16 KiB and, under Rosetta, 4 KiB pages):
 /// any pointer and length, at any alignment, over memory the process maps readable: malloc'd,
 /// vm_allocate'd, read-only, or a shared or private file mapping, and two buffers over the same
 /// or overlapping bytes. Nil for a length of 0 and for a range not wholly mapped; Private
-/// storage fails an assertion, where this answers nil. Nil also where `region` has no room.
+/// storage fails an assertion, where this answers nil. Nil also where no slab has room.
 + (nullable instancetype)bufferWithBytesNoCopy:(nullable void *)pointer
                                         length:(NSUInteger)length
                                        options:(MTLResourceOptions)options
                                    deallocator:(nullable void (^)(void *_Nullable, NSUInteger))deallocator
                                         region:(nullable RgfxRegion *)region
+                                         slabs:(nullable RgfxSlabs *)slabs
                                         device:(nullable id<MTLDevice>)device
                                     serializer:(nullable RgfxSerializer *)serializer;
 

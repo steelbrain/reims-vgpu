@@ -236,10 +236,12 @@ bool rgfxCpuStorage(MTLResourceOptions options)
                               options:(MTLResourceOptions)options
                           deallocator:(void (^)(void *, NSUInteger))deallocator
                                region:(RgfxRegion *)region
+                                slabs:(RgfxSlabs *)slabs
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer
 {
-	if (length == 0 || !rgfxCpuStorage(options) || region == nullptr || serializer == nullptr)
+	if (length == 0 || !rgfxCpuStorage(options) || region == nullptr || slabs == nullptr ||
+	    serializer == nullptr)
 		return nil;
 	void (^appDeallocator)(void *, NSUInteger) = [deallocator copy];
 	// Bytes already in a block of the process's: the host sees them in place.
@@ -260,7 +262,7 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 		return nil;
 	// The app's own pages in place, where the kext wires them for the buffer and the host maps
 	// them: nothing copied or synced. Read-only and Managed memory, and memory the kext or the
-	// host makes no pages block of, takes a shadow below.
+	// host makes no pages block of, takes a shadow in a slab below.
 	if (pointer != nullptr && writable && region->hasPagesBlocks() &&
 	    (options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared) {
 		RgfxBuffer *inPlace = [RgfxBuffer bufferOverPagesOf:pointer
@@ -273,41 +275,51 @@ bool rgfxCpuStorage(MTLResourceOptions options)
 		if (inPlace != nil)
 			return inPlace;
 	}
-	RgfxRegion::Block block = region->allocate(length);
-	if (!block.ok)
+	// The GPU's copy is a range of a slab, as a device buffer of these options takes
+	// (RgfxSlabs.hpp): the process's own pages where the device takes them, so the region holds
+	// no app-sized copy. The shadow writes all of it from the memory, so only a null pointer's is
+	// zeroed.
+	const uint32_t resolved = static_cast<uint32_t>(
+	    RgfxResolveHazardTracking(options, MTLResourceHazardTrackingModeTracked));
+	RgfxSlabs::Range range;
+	if (!slabs->take(length, resolved, pointer != nullptr ? length : 0, &range))
 		return nil;
-	uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+	uint8_t *bytes = range.contents;
 	std::shared_ptr<RgfxMemoryShadow> shadow;
 	void *contents = pointer;
 	if (pointer != nullptr) {
 		shadow = std::make_shared<RgfxMemoryShadow>(pointer, bytes, length, writable);
 		if (!shadow->ok()) {
-			region->release(block.offset);
+			slabs->give(range);
 			return nil;
 		}
 	} else {
-		// No memory of the caller's: the block is the buffer's contents, as Metal's buffer
-		// has memory of its own.
-		std::memset(bytes, 0, length);
+		// No memory of the caller's: the range is the buffer's contents, as Metal's buffer has
+		// memory of its own.
 		contents = bytes;
 	}
-	// The block goes back once the host has dropped the buffer, then the caller's memory.
-	const uint64_t offset = block.offset;
-	RgfxBuffer *buffer = [RgfxBuffer bufferOverHostMemoryWithContents:contents
-	                                                     regionOffset:offset
-	                                                           length:length
-	                                                          options:options
-	                                                      deallocator:^{
-		                                                      region->release(offset);
-		                                                      if (appDeallocator != nil)
-			                                                      appDeallocator(pointer, length);
-	                                                      }
-	                                                           device:device
-	                                                       serializer:serializer];
-	if (buffer == nil) {
-		region->release(offset); // no buffer lies over the block
+	RgfxSlabSource::Made made;
+	if (!slabs->makeBuffer(range, length, static_cast<uint32_t>(options), &made)) {
+		slabs->give(range); // no buffer lies over the range
 		return nil;
 	}
+	// The range goes back to its slab once the host has dropped the buffer, then the caller's
+	// memory.
+	RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:made.objId
+	                                            gpuAddress:made.gpuAddress
+	                                                length:length
+	                                               options:options
+	                                              contents:contents
+	                                           deallocator:^{
+		                                           slabs->give(range);
+		                                           if (appDeallocator != nil)
+			                                           appDeallocator(pointer, length);
+	                                           }
+	                                                device:device
+	                                            serializer:serializer];
+	if (buffer == nil)
+		return nil;
+	buffer->_ownsAddress = made.ownsAddress;
 	buffer->_shadow = std::move(shadow);
 	return buffer;
 }
