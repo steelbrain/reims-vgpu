@@ -17,7 +17,8 @@
 #   make            build the serialiser objects (x86_64, the guest's arch)
 #   make test       build + run the checks: the serialiser check (x86_64, under
 #                   Rosetta), the AIR argument reader's check (x86_64, under Rosetta,
-#                   over a .metallib built from tests/air_arguments.metal), the
+#                   over .metallibs built from tests/air_arguments.metal and
+#                   tests/air_arguments_old.metal), the
 #                   Metal-shell wrapper/routing check (this Mac's native arch; the
 #                   device shell is not in its binary), and the device's base-class
 #                   check (x86_64, under Rosetta), which loads the bundle
@@ -233,6 +234,16 @@ $(AIR_LIB): tests/air_arguments.metal Makefile
 		-o $(BUILD)/air_arguments.air
 	xcrun -sdk macosx metallib $(BUILD)/air_arguments.air -o $@
 
+# The same reader over modules built for macOS 10.12, of LLVM 3.5's metadata nodes
+# (tests/air_arguments_old.metal).
+AIR_OLD_LIB = $(BUILD)/air_arguments_old.metallib
+
+$(AIR_OLD_LIB): tests/air_arguments_old.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=macos-metal1.2 -mmacosx-version-min=10.12 \
+		tests/air_arguments_old.metal -o $(BUILD)/air_arguments_old.air
+	xcrun -sdk macosx metallib $(BUILD)/air_arguments_old.air -o $@
+
 AIR_TESTOBJS = $(BUILD)/obj/$(ARCH)/core/RgfxAirArguments.o \
 	$(BUILD)/obj/$(ARCH)/core/RgfxFunctionConstants.o
 
@@ -283,11 +294,11 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp $(HEADER
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp \
 		-framework IOSurface -framework CoreFoundation -o $@
 
-test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) \
-	$(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) \
-	$(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
+test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(SHELL_TESTBIN) $(CI_KERNEL) \
+	$(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) \
+	$(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
-	RGFX_AIR_ARGUMENTS=$(AIR_LIB) arch -$(ARCH) $(AIR_TESTBIN)
+	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
 		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)

@@ -4,8 +4,9 @@
 // them, those under function constants among them; which texture bindings each may write; no
 // answer for a binding of a kind the reader does not know; each stitchable function's signature,
 // type by type, and an unknown one where it has a type the reader does not know; each module's
-// function constants, as its function's CNST tag lists them; and no answer, nor a crash, for bytes
-// that are not such a module.
+// function constants, as its function's CNST tag lists them; the same over the .metallib built
+// from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); and no answer, nor
+// a crash, for bytes that are not such a module.
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -117,6 +119,38 @@ bool hasConstant(const std::vector<RgfxAirConstant> &cs, const char *name, uint3
 		if (c.name == name)
 			return c.type == type && c.index == index && c.required == required;
 	return false;
+}
+
+// Every function's constants in its module, as its CNST tag lists them: the same names, types,
+// indices and flags. Answers how many functions it compared, and how many of them have constants.
+std::pair<size_t, size_t> constantsAsCnst(const std::vector<uint8_t> &lib)
+{
+	size_t compared = 0, withConstants = 0;
+	for (const Listed &f : listed(lib)) {
+		std::vector<RgfxConstantDecl> cnst;
+		check(rgfxReadConstantTable(lib.data(), lib.size(), f.publicOffset, cnst),
+		      f.name + ": its CNST tag reads");
+		const uint8_t *bc = nullptr;
+		size_t bcSize = 0;
+		check(rgfxMetallibBitcode(lib.data(), lib.size(), f.name, &bc, &bcSize),
+		      f.name + ": its bitcode");
+		std::vector<RgfxAirFunction> fns;
+		std::vector<RgfxAirVisible> vis;
+		const std::vector<RgfxAirConstant> *air = nullptr;
+		if (rgfxReadAirFunctions(bc, bcSize, fns) && fns.size() == 1 && fns[0].constantsRead)
+			air = &fns[0].constants;
+		else if (rgfxReadAirVisible(bc, bcSize, vis) && vis.size() == 1 && vis[0].constantsRead)
+			air = &vis[0].constants;
+		if (air == nullptr)
+			continue; // a module the reader does not follow (sig_acceleration's among them)
+		compared++;
+		withConstants += air->empty() ? 0 : 1;
+		bool same = air->size() == cnst.size();
+		for (const RgfxConstantDecl &d : cnst)
+			same = same && hasConstant(*air, d.name.c_str(), d.type, d.index, d.required);
+		check(same, f.name + ": its module's constants are its CNST tag's");
+	}
+	return {compared, withConstants};
 }
 
 using Kind = RgfxAirType::Kind;
@@ -759,35 +793,48 @@ int main()
 	check(tinted.constantsRead && tinted.constants.size() == 1 &&
 	          hasConstant(tinted.constants, "kTint", 6, 20, true),
 	      "tinted: kTint");
-	// Every function's, as its CNST tag lists them: the same names, types, indices and flags.
-	size_t compared = 0, withConstants = 0;
-	for (const Listed &f : listed(lib)) {
-		std::vector<RgfxConstantDecl> cnst;
-		check(rgfxReadConstantTable(lib.data(), lib.size(), f.publicOffset, cnst),
-		      f.name + ": its CNST tag reads");
-		const uint8_t *bc = nullptr;
-		size_t bcSize = 0;
-		check(rgfxMetallibBitcode(lib.data(), lib.size(), f.name, &bc, &bcSize),
-		      f.name + ": its bitcode");
-		std::vector<RgfxAirFunction> fns;
-		std::vector<RgfxAirVisible> vis;
-		const std::vector<RgfxAirConstant> *air = nullptr;
-		if (rgfxReadAirFunctions(bc, bcSize, fns) && fns.size() == 1 && fns[0].constantsRead)
-			air = &fns[0].constants;
-		else if (rgfxReadAirVisible(bc, bcSize, vis) && vis.size() == 1 && vis[0].constantsRead)
-			air = &vis[0].constants;
-		if (air == nullptr)
-			continue; // a module the reader does not follow (sig_acceleration's among them)
-		compared++;
-		withConstants += air->empty() ? 0 : 1;
-		bool same = air->size() == cnst.size();
-		for (const RgfxConstantDecl &d : cnst)
-			same = same && hasConstant(*air, d.name.c_str(), d.type, d.index, d.required);
-		check(same, f.name + ": its module's constants are its CNST tag's");
+	// Every function's, as its CNST tag lists them.
+	const auto compared = constantsAsCnst(lib);
+	check(compared.first >= 10 && compared.second >= 5,
+	      "every function's constants compared (" + std::to_string(compared.first) + ", " +
+	          std::to_string(compared.second) + " with constants)");
+
+	// Modules built for macOS 10.12, of LLVM 3.5's metadata nodes: each entry point's arguments,
+	// and its constants as its CNST tag lists them.
+	{
+		const char *oldPath = std::getenv("RGFX_AIR_ARGUMENTS_OLD");
+		check(oldPath != nullptr, "RGFX_AIR_ARGUMENTS_OLD names the older test library");
+		const std::vector<uint8_t> old = readFile(oldPath);
+		check(old.size() > 0x58, "the older test library is read");
+		const RgfxAirFunction oldAll = entry(old, "old_every_access");
+		check(oldAll.stage == RgfxAirStage::Kernel && oldAll.arguments.size() == 6,
+		      "old_every_access: its six binding arguments");
+		expect(oldAll, RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, "access::read at texture 0");
+		expect(oldAll, RgfxAirKind::Texture, 1, 1, RgfxAirAccess::Sample, "a sampled texture at 1");
+		expect(oldAll, RgfxAirKind::Texture, 2, 1, RgfxAirAccess::Write, "access::write at 2");
+		expect(oldAll, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::ReadWrite, "a device buffer at 0");
+		expect(oldAll, RgfxAirKind::Buffer, 1, 1, RgfxAirAccess::Read, "a constant at buffer 1");
+		expect(oldAll, RgfxAirKind::Sampler, 0, 1, RgfxAirAccess::Unknown, "a sampler at 0");
+		check(rgfxAirWritesTexture(oldAll, 2) && !rgfxAirWritesTexture(oldAll, 0) &&
+		          !rgfxAirWritesTexture(oldAll, 1),
+		      "old_every_access writes texture 2 alone");
+		check(oldAll.constantsRead && oldAll.constants.size() == 2 &&
+		          hasConstant(oldAll.constants, "kOldScale", 53, 0, true) &&
+		          hasConstant(oldAll.constants, "kOldOptional", 29, 1, false),
+		      "old_every_access: kOldScale, and kOldOptional not required");
+		const RgfxAirFunction oldVertex = entry(old, "old_vertex");
+		check(oldVertex.stage == RgfxAirStage::Vertex && oldVertex.arguments.size() == 1,
+		      "old_vertex: a vertex function of one texture");
+		expect(oldVertex, RgfxAirKind::Texture, 4, 1, RgfxAirAccess::Sample, "a sampled texture at 4");
+		const RgfxAirFunction oldFragment = entry(old, "old_fragment");
+		check(oldFragment.stage == RgfxAirStage::Fragment && rgfxAirWritesTexture(oldFragment, 5) &&
+		          !rgfxAirWritesTexture(oldFragment, 0),
+		      "old_fragment writes texture 5 alone");
+		const auto oldCompared = constantsAsCnst(old);
+		check(oldCompared.first == 3 && oldCompared.second == 1,
+		      "the older functions' constants compared (" + std::to_string(oldCompared.first) +
+		          ", " + std::to_string(oldCompared.second) + " with constants)");
 	}
-	check(compared >= 10 && withConstants >= 5,
-	      "every function's constants compared (" + std::to_string(compared) + ", " +
-	          std::to_string(withConstants) + " with constants)");
 
 	// Bytes that are not such a module: none answers, and none crashes the reader.
 	check(rgfxMetallibBitcode(lib.data(), lib.size(), "every_access", &bitcode, &size),

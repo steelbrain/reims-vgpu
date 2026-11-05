@@ -12,7 +12,7 @@ namespace {
 constexpr unsigned kEndBlock = 0, kEnterSubblock = 1, kDefineAbbrev = 2, kUnabbrevRecord = 3;
 constexpr unsigned kBlockInfo = 0;
 constexpr unsigned kModuleBlock = 8, kConstantsBlock = 11, kValueSymtabBlock = 14,
-                   kMetadataBlock = 15, kStrtabBlock = 23;
+                   kMetadataBlock = 15, kTypeBlock = 17, kStrtabBlock = 23;
 // BLOCKINFO's record that names the block the abbreviations after it are for.
 constexpr unsigned kBlockInfoSetBid = 1;
 // MODULE_BLOCK's records: the version, and the global values in their value numbering's order.
@@ -23,14 +23,21 @@ constexpr unsigned kModuleVersion = 1, kModuleGlobalVar = 7, kModuleFunction = 8
 constexpr unsigned kConstSetType = 1, kConstNull = 2, kConstInteger = 4;
 // VALUE_SYMTAB_BLOCK's records with a name: [value, chars] and [value, offset, chars].
 constexpr unsigned kVstEntry = 1, kVstFnEntry = 3;
-// METADATA_BLOCK's records.
+// TYPE_BLOCK's records: every one defines a type but NUMENTRY and STRUCT_NAME.
+constexpr unsigned kTypeNumEntry = 1, kTypeVoid = 2, kTypeMetadata = 16, kTypeStructName = 19;
+// METADATA_BLOCK's records. OLD_NODE and OLD_FN_NODE are LLVM 3.5's NODE and FN_NODE, which
+// Apple's compiler writes for macOS 10.12 (-std=macos-metal1.2): operands of type and value pairs.
 constexpr unsigned kMdStringOld = 1, kMdValue = 2, kMdNode = 3, kMdName = 4,
-                   kMdDistinctNode = 5, kMdKind = 6, kMdNamedNode = 10, kMdStrings = 35,
+                   kMdDistinctNode = 5, kMdKind = 6, kMdOldNode = 8, kMdOldFnNode = 9,
+                   kMdNamedNode = 10, kMdStrings = 35,
                    kMdGlobalDeclAttachment = 36, kMdIndexOffset = 38, kMdIndex = 39;
 // STRTAB_BLOCK's one record: the blob.
 constexpr unsigned kStrtabBlob = 1;
 // A GLOBALVAR's unnamed_addr field for `unnamed_addr` (0 is none, 2 `local_unnamed_addr`).
 constexpr uint64_t kUnnamedAddr = 1;
+// The tag of a node's operand that names a value an old node holds in place (Module), past any
+// metadata's number; UINT64_MAX, none, has both top bits.
+constexpr uint64_t kInlineValue = 1ull << 62;
 
 // Reads bits from a byte array, least significant first, as LLVM writes them.
 class Bits {
@@ -248,6 +255,11 @@ struct Module {
 	std::vector<Md> md;
 	// The named metadata the entry points are listed in.
 	std::map<std::string, std::vector<uint64_t>> named;
+	// The type table's numbers of the metadata and void types, and how many types it has.
+	uint64_t types = 0, metadataType = UINT64_MAX, voidType = UINT64_MAX;
+	// The values an old node holds in place (kMdOldNode), each a kValue metadata outside the
+	// numbering: an operand naming one is kInlineValue | its place here.
+	std::vector<Md> inlineValues;
 };
 
 int64_t signedVbr(uint64_t v)
@@ -384,7 +396,7 @@ private:
 		if (parent == ~0u)
 			return sub == kModuleBlock || sub == kStrtabBlock;
 		return parent == kModuleBlock && (sub == kConstantsBlock || sub == kValueSymtabBlock ||
-		                                  sub == kMetadataBlock);
+		                                  sub == kMetadataBlock || sub == kTypeBlock);
 	}
 
 	bool record(unsigned id, const Record &r, std::string &pendingName, bool &haveName)
@@ -436,6 +448,15 @@ private:
 					m_.globals[v].name = chars(r.ops, r.code == kVstEntry ? 1 : 2);
 			}
 			return true;
+		case kTypeBlock:
+			if (r.code == kTypeNumEntry || r.code == kTypeStructName)
+				return true;
+			if (r.code == kTypeMetadata)
+				m_.metadataType = m_.types;
+			else if (r.code == kTypeVoid)
+				m_.voidType = m_.types;
+			m_.types++;
+			return true;
 		case kStrtabBlock:
 			if (r.code == kStrtabBlob && r.blob != nullptr) {
 				m_.strtab = r.blob;
@@ -480,6 +501,31 @@ private:
 			m_.md.push_back(std::move(n));
 			return true;
 		}
+		case kMdOldNode:
+		case kMdOldFnNode: {
+			// Each operand a type's number and a value's: a metadata's number where the type is
+			// metadata, none where it is void, else a value, held in place.
+			if (r.ops.size() % 2 != 0)
+				return false;
+			Module::Md n;
+			n.kind = Module::Md::kNode;
+			for (size_t i = 0; i < r.ops.size(); i += 2) {
+				const uint64_t type = r.ops[i], value = r.ops[i + 1];
+				if (type == m_.metadataType) {
+					n.ops.push_back(value);
+				} else if (type == m_.voidType) {
+					n.ops.push_back(UINT64_MAX);
+				} else {
+					Module::Md v;
+					v.kind = Module::Md::kValue;
+					v.value = value;
+					n.ops.push_back(kInlineValue | m_.inlineValues.size());
+					m_.inlineValues.push_back(std::move(v));
+				}
+			}
+			m_.md.push_back(std::move(n));
+			return true;
+		}
 		case kMdName:
 			pendingName = chars(r.ops, 0);
 			haveName = true;
@@ -508,6 +554,10 @@ private:
 
 const Module::Md *mdAt(const Module &m, uint64_t i)
 {
+	if ((i >> 62) == (kInlineValue >> 62)) {
+		const uint64_t at = i & ~kInlineValue;
+		return at < m.inlineValues.size() ? &m.inlineValues[static_cast<size_t>(at)] : nullptr;
+	}
 	return i < m.md.size() ? &m.md[static_cast<size_t>(i)] : nullptr;
 }
 

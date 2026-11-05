@@ -28,6 +28,10 @@
 // modules on the M3 Max, where 709 entry points bind one (Metal Performance Shaders' kernels
 // among them).
 //
+// A module built for macOS 10.12 (-std=macos-metal1.2) holds LLVM 3.5's metadata nodes, each
+// operand a type and a value: a metadata where the type is metadata, else a value in place of a
+// METADATA_VALUE (tests/air_arguments_old.metal).
+//
 // The reader is LLVM's bitstream format (its documented container: abbreviations, blocks and
 // records) over the module's blocks that carry the above: the module's global values and its
 // string table (the functions' names), its constants (the integers), and its metadata. It skips
