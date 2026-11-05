@@ -74,8 +74,8 @@ struct RgfxArchiveSection {
 enum class RgfxArchiveFileKind {
 	/// This device's format: its sections were read.
 	Ours,
-	/// A Metal archive (a fat file of GPU slices, magic 0xcbfebabe, each slice inside the file):
-	/// none of its slices is this device's.
+	/// A Metal archive (a fat file of GPU slices, magic 0xcbfebabe or 0xcafebabe, at least one
+	/// slice and each inside the file): none of its slices is this device's.
 	Metal,
 	/// Neither, or one cut short: Metal's "has an invalid format".
 	Invalid,

@@ -1995,6 +1995,17 @@ void test_archive_file()
 	CHECK(rgfxReadArchiveFile(fat, sizeof(fat), out) == RgfxArchiveFileKind::Metal);
 	CHECK(rgfxReadArchiveFile(fat, sizeof(fat) - 1, out) == RgfxArchiveFileKind::Invalid);
 	CHECK(rgfxReadArchiveFile(fat, 8, out) == RgfxArchiveFileKind::Invalid);
+	// The same of the fat magic 0xcafebabe, as Metal reads a framework's binary.metallib; of no
+	// slices, no archive.
+	uint8_t cafe[sizeof(fat)];
+	std::memcpy(cafe, fat, sizeof(fat));
+	cafe[0] = 0xca;
+	CHECK(rgfxReadArchiveFile(cafe, sizeof(cafe), out) == RgfxArchiveFileKind::Metal);
+	CHECK(rgfxReadArchiveFile(cafe, sizeof(cafe) - 1, out) == RgfxArchiveFileKind::Invalid);
+	cafe[7] = 0;
+	CHECK(rgfxReadArchiveFile(cafe, sizeof(cafe), out) == RgfxArchiveFileKind::Invalid);
+	const uint8_t other[] = {0xca, 0xfe, 0xba, 0xbf, 0, 0, 0, 1};
+	CHECK(rgfxReadArchiveFile(other, sizeof(other), out) == RgfxArchiveFileKind::Invalid);
 }
 
 // An Automatic heap's placements, in the order Metal's took them (measured: M3 Max, macOS 27,

@@ -314,6 +314,15 @@ void test_archive_files()
 	             @"a", @"compute"));
 	CHECK(![metal serializeToURL:at(@"metal-out.bin") error:&e]);
 	CHECK(isArchiveError(e, MTLBinaryArchiveErrorCompilationFailure, @"Nothing to serialize"));
+	// A fat file of the magic 0xcafebabe (a framework's binary.metallib) is one too.
+	std::vector<uint8_t> cafe = fat;
+	cafe[0] = 0xca;
+	[[NSData dataWithBytes:cafe.data() length:cafe.size()] writeToURL:at(@"cafe.bin") atomically:NO];
+	RgfxBinaryArchive *universal = archive(at(@"cafe.bin"), @"arch_a", &e);
+	CHECK(universal != nil && e == nil);
+	CHECK(universal.keys.count == 0);
+	CHECK(isMiss([RgfxBinaryArchive rgfxMissOfComputePipeline:compute(function(@"a"), @[ universal ])],
+	             @"a", @"compute"));
 	// Cut short, it is no archive.
 	[[NSData dataWithBytes:fat.data() length:fat.size() - 2] writeToURL:at(@"cut.bin") atomically:NO];
 	CHECK(archive(at(@"cut.bin"), @"arch_a", &e) == nil);

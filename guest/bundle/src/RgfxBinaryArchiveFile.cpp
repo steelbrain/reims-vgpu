@@ -7,9 +7,14 @@ namespace {
 
 constexpr char kMagic[8] = {'R', 'G', 'F', 'X', 'B', 'A', 'R', '1'};
 
-// Metal's archive: a fat header, big-endian, of this magic and its slice count, then a 20-byte
-// record per slice (CPU type, subtype, offset, size, alignment).
+// Metal's archive: a fat header, big-endian, of its magic and its slice count, then a 20-byte
+// record per slice (CPU type, subtype, offset, size, alignment). Metal writes 0xcbfebabe; it reads
+// the fat files of 0xcafebabe alike, as archives of other GPUs' slices (measured on the AMD 5300M
+// and Intel 630 under macOS 26.7.1, oracle_bundle archive.*: IconRendering's binary.metallib, 18
+// slices of CPU type 0x01000013, and an archive the device wrote with its magic changed, each an
+// archive of no keys with no error; a file of no slices is "an invalid format").
 constexpr uint32_t kMetalMagic = 0xcbfebabe;
+constexpr uint32_t kFatMagic = 0xcafebabe;
 constexpr size_t kMetalSliceBytes = 20;
 
 uint32_t be32(const uint8_t *p)
@@ -43,7 +48,7 @@ void put32(std::vector<uint8_t> &out, uint32_t v)
 // Whether the bytes are a Metal archive whose every slice lies inside them.
 bool metalArchive(const uint8_t *bytes, size_t length)
 {
-	if (length < 8 || be32(bytes) != kMetalMagic)
+	if (length < 8 || (be32(bytes) != kMetalMagic && be32(bytes) != kFatMagic))
 		return false;
 	const uint32_t slices = be32(bytes + 4);
 	if (slices == 0 || (length - 8) / kMetalSliceBytes < slices)
