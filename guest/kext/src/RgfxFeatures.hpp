@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out nine:
+// its bundle carry out eleven:
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
@@ -40,7 +40,10 @@
 //  - SURFACE_DEFERRED (bit 19), meaningful only with SURFACE_CACHE: the kext defers a fresh
 //    cached surface's block in place, naming its pages at the first CPU lock that needs them
 //    (RgfxSurfaceBlocks.hpp), within the budget the host gives in DEFERRED_BUDGET_LO and _HI,
-//    which needs nothing of the bundle.
+//    which needs nothing of the bundle;
+//  - MANAGED_TEXTURE_SLABS (bit 21): the bundle lays its Managed textures' CPU copies in its
+//    buffers' slabs, its own pages among them, and names a slab's buffer as each copy, which needs
+//    nothing of the kext.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -66,7 +69,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_SURFACE_ORDER |
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS | RGFX_FEATURE_UNSHARED_QUEUES |
     RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
-    RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED;
+    RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
