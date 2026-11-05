@@ -212,7 +212,7 @@ struct Shared {
     watches: Mutex<Vec<Watched>>,
     /// The ranges resolved so far, each with its segments, the latest last (module docs,
     /// "Resolved once").
-    resolved: Mutex<Vec<(Range<u64>, Arc<[Segment]>)>>,
+    resolved: Mutex<Vec<Kept>>,
     /// How many times the backing table was asked for the import's bytes.
     #[cfg(test)]
     resolutions: AtomicU64,
@@ -221,6 +221,9 @@ struct Shared {
 /// The ranges of an import whose segments are kept (module docs, "Resolved once"): the oldest
 /// goes when another is resolved.
 const RESOLVED_KEPT: usize = 4;
+
+/// A range of an import, resolved, and its segments.
+type Kept = (Range<u64>, Arc<[Segment]>);
 
 impl Shared {
     fn new(log: Arc<DirtyLog>, at: u64) -> Shared {
