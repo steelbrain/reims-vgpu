@@ -1987,13 +1987,19 @@ committed in. The bundle names the order instead, as it commits:
   latest buffer of each queue that only reads it), which only the bundles read.
   A copy whose writers end within 64 bytes of a page's end has no readers, and
   a write of it waits for no read.
-- A commit of a buffer that uses surfaces reads, for each, the writers of
-  other queues, and where the buffer writes the surface the readers too, and
-  names each queue once, at its highest seqno, in one `SURFACE_ORDER` op before
-  its first encoder. Once the buffer is on its queue's ring it raises its own
-  queue's slot: a writer's for a surface it writes, else a reader's.
-- So each buffer named was posted before the commit that names it read the
-  slots: the buffers' waits run from later commits to earlier ones, and cannot
+- The post of a buffer that uses surfaces, just before it goes on its queue's
+  ring, reads, for each, the writers of other queues, and where the buffer
+  writes the surface the readers too, and names each queue once, at its highest
+  seqno, in one `SURFACE_ORDER` op before its first encoder. Once the buffer is
+  on its queue's ring it raises its own queue's slot: a writer's for a surface
+  it writes, else a reader's. The post, not the commit, is where Metal submits
+  the buffer: a buffer committed behind one enqueued before it and not yet
+  committed is submitted once that one is, as Metal's enqueue order has it, and
+  goes on its ring here then, so it runs after the accesses of other queues
+  submitted meanwhile (read from Metal's enqueue order; no oracle has measured
+  a held buffer's surface order).
+- So each buffer named was posted before the post that names it read the
+  slots: the buffers' waits run from later posts to earlier ones, and cannot
   meet in a cycle.
 - The host keeps each queue's surface timeline, a shared event. A buffer that
   holds `SURFACE_ORDER` signals its queue's to its seqno as it ends, and waits

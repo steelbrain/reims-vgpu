@@ -8909,15 +8909,16 @@ void test_commit_order_names_no_cycle()
 	}
 }
 
-// A process that names its command buffers' order (rgfxIOSurfaceSetOrder; RgfxIOSurface.h): a
-// commit of a buffer that uses a surface names, once and before its first other op
+// A process that names its command buffers' order (rgfxIOSurfaceSetOrder; RgfxIOSurface.h): the
+// post of a buffer that uses a surface names, once and before its first other op
 // (RGFX_OP_SURFACE_ORDER), the buffers of other queues it runs after, as the surface's block names
-// them at the commit: of a surface it only reads, the writers; of one it writes, the writers and
+// them at the post: of a surface it only reads, the writers; of one it writes, the writers and
 // the readers; each queue once, at its highest seqno; never its own queue, nor a slot whose seqno
 // is 0. Once posted, a buffer that only reads the surface raises its queue's reader slot, and one
 // that writes it its writer slot. A surface named by no other queue gives the op with no wait; a
 // surface no buffer of another queue used names nothing of the other's; a buffer that uses no
 // surface carries no op, and nor does any buffer without the order, whose reads raise no slot.
+// A buffer committed behind one not yet committed names them as it is posted, after that one.
 // A block made for this process starts with no readers, whatever it held.
 void test_iosurface_order()
 {
@@ -8973,8 +8974,8 @@ void test_iosurface_order()
 		bool order = false;
 		Waits waits;
 	};
-	auto commit = [&](id<MTLCommandBuffer> cb) {
-		[cb commit];
+	// The next buffer on the queues' ring, as posted.
+	auto posted = [&]() {
 		RgfxMsgHeader h = {};
 		std::vector<uint8_t> bytes;
 		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
@@ -9003,6 +9004,10 @@ void test_iosurface_order()
 		}
 		drainRing(control);
 		return out;
+	};
+	auto commit = [&](id<MTLCommandBuffer> cb) {
+		[cb commit];
+		return posted();
 	};
 	auto sorted = [](Waits w) {
 		std::sort(w.begin(), w.end());
@@ -9057,7 +9062,7 @@ void test_iosurface_order()
 	CHECK(buffer != nil);
 	drainRing(control);
 	// A buffer of `q` that reads `t` (a blit from it), and one that writes it (an attachment).
-	auto read = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
+	auto reading = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
 		id<MTLCommandBuffer> cb = [q commandBuffer];
 		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
 		[be copyFromTexture:t
@@ -9070,8 +9075,9 @@ void test_iosurface_order()
 		  destinationBytesPerRow:64
 		destinationBytesPerImage:64 * 16];
 		[be endEncoding];
-		return commit(cb);
+		return cb;
 	};
+	auto read = [&](RgfxCommandQueue *q, id<MTLTexture> t) { return commit(reading(q, t)); };
 	auto write = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
 		id<MTLCommandBuffer> cb = [q commandBuffer];
 		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -9141,10 +9147,32 @@ void test_iosurface_order()
 		[be endEncoding];
 		CHECK(!commit(cb).order);
 
+		// A buffer committed behind one enqueued before it and not yet committed names its
+		// order as it is posted, once that one is: a write of another queue posted meanwhile is
+		// among what it runs after, and names none of it.
+		id<MTLCommandBuffer> ahead = [a commandBuffer];
+		[ahead enqueue];
+		id<MTLCommandBuffer> held = reading(a, t);
+		[held commit];
+		{
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			CHECK(!submit.next(&h, &bytes));
+		}
+		Committed w4 = write(b, t);
+		CHECK(w4.order && w4.waits == sorted({Slot(kOtherWriter.first, 20), kOtherReader,
+		                                       Slot(a.rgfxObjId, r4.seqno)}));
+		[ahead commit];
+		CHECK(!posted().order);
+		Committed r7 = posted();
+		CHECK(r7.order && r7.waits == sorted({Slot(kOtherWriter.first, 15),
+		                                       Slot(b.rgfxObjId, w4.seqno)}));
+		CHECK(slot(readers, 0) == Slot(a.rgfxObjId, r7.seqno));
+
 		// Without the order: no op, and a read raises no reader slot.
 		rgfxIOSurfaceSetOrder(false);
 		Committed r6 = read(a, t);
-		CHECK(!r6.order && slot(readers, 0) == Slot(a.rgfxObjId, r4.seqno));
+		CHECK(!r6.order && slot(readers, 0) == Slot(a.rgfxObjId, r7.seqno));
 		CHECK(!write(b, t).order);
 		rgfxIOSurfaceSetOrder(true);
 		drainRing(control);

@@ -1535,46 +1535,50 @@ static void nameSlots(const RgfxSurfaceWriters *rec, uint64_t own,
 }
 
 std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
-    RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes, uint64_t queueObjId)
+    RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes)
 {
-	const std::vector<std::shared_ptr<void>> uses = enc->takeSurfaceUses();
+	std::vector<std::shared_ptr<void>> uses = enc->takeSurfaceUses();
+	if (gCachedLive.load(std::memory_order_relaxed) == 0)
+		return uses;
+	std::vector<RgfxSurfaceShadow *> named;
+	std::vector<RgfxOpSurfaceUse> ops;
+	auto name = [&](const std::shared_ptr<void> &p, bool writes) {
+		auto *s = static_cast<RgfxSurfaceShadow *>(p.get());
+		if (!s->cached)
+			return;
+		auto it = std::find(named.begin(), named.end(), s);
+		if (it != named.end()) {
+			if (writes)
+				ops[it - named.begin()].flags |= RGFX_SURFACE_USE_WRITES;
+			return;
+		}
+		named.push_back(s);
+		RgfxOpSurfaceUse op = {};
+		op.block_offset = s->block.offset;
+		// As the kext left it at the surface's last read-write CPU lock, in any process.
+		op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
+		op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
+		ops.push_back(op);
+	};
+	for (const auto &w : writes)
+		name(w, true);
+	for (const auto &u : uses)
+		name(u, false);
+	if (!ops.empty())
+		enc->prependSurfaceUses(ops.data(), ops.size());
+	return uses;
+}
+
+std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameOrder(
+    RgfxEncoder *enc, const std::vector<std::shared_ptr<void>> &writes,
+    const std::vector<std::shared_ptr<void>> &uses, uint64_t queueObjId)
+{
 	std::vector<std::shared_ptr<void>> reads;
-	const bool order = gSurfaceOrder.load(std::memory_order_relaxed);
-	if (gCachedLive.load(std::memory_order_relaxed) == 0 && !order)
-		return reads;
-	if (gCachedLive.load(std::memory_order_relaxed) != 0) {
-		std::vector<RgfxSurfaceShadow *> named;
-		std::vector<RgfxOpSurfaceUse> ops;
-		auto name = [&](const std::shared_ptr<void> &p, bool writes) {
-			auto *s = static_cast<RgfxSurfaceShadow *>(p.get());
-			if (!s->cached)
-				return;
-			auto it = std::find(named.begin(), named.end(), s);
-			if (it != named.end()) {
-				if (writes)
-					ops[it - named.begin()].flags |= RGFX_SURFACE_USE_WRITES;
-				return;
-			}
-			named.push_back(s);
-			RgfxOpSurfaceUse op = {};
-			op.block_offset = s->block.offset;
-			// As the kext left it at the surface's last read-write CPU lock, in any process.
-			op.cpu_gen = __atomic_load_n(&s->header->cpuGen, __ATOMIC_ACQUIRE);
-			op.flags = writes ? RGFX_SURFACE_USE_WRITES : 0;
-			ops.push_back(op);
-		};
-		for (const auto &w : writes)
-			name(w, true);
-		for (const auto &u : uses)
-			name(u, false);
-		if (!ops.empty())
-			enc->prependSurfaceUses(ops.data(), ops.size());
-	}
-	if (!order || (uses.empty() && writes.empty()))
+	if (!gSurfaceOrder.load(std::memory_order_relaxed) || (uses.empty() && writes.empty()))
 		return reads;
 	// The buffers of other queues it runs after, as the surfaces' blocks name them now: of each
 	// surface it writes, the writers and the readers; of each it only reads, the writers. Each
-	// was posted before its slot named it, so before this commit.
+	// was posted before its slot named it, so before this post.
 	std::vector<RgfxSurfaceShadow *> seen;
 	std::vector<RgfxSurfaceOrderWait> waits;
 	for (const auto &w : writes) {

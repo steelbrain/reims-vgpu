@@ -557,7 +557,7 @@ RGFX_LOG_UNRECOGNIZED
 		kr = kIOReturnBadArgument;
 	_caps.takeFeatures(kr, features[0], features[1]);
 	// Where the host orders command buffers of different queues over the surfaces they share,
-	// this process names each one's order (rgfxIOSurfaceNameUses).
+	// this process names each one's order (rgfxIOSurfaceNameOrder).
 	rgfxIOSurfaceSetOrder((_caps.features() & RGFX_FEATURE_SURFACE_ORDER) != 0);
 	// Where the host commits in the order the process's queues put their buffers on their rings,
 	// each queue takes part in it (newCommandQueue; RgfxCommitOrder.hpp).

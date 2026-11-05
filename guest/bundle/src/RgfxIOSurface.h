@@ -86,11 +86,12 @@
  * Where the process names its command buffers' order (RGFX_FEATURE_SURFACE_ORDER in the
  * device's feature word; docs/graphics-kext/design.md, "Surface order"), the readers follow the
  * writers, where the block has room past them: the same record, each queue's latest buffer that
- * only reads the view, which only the bundles read. A commit of a buffer that uses surfaces names
- * the buffers of other queues it runs after (rgfxIOSurfaceNameUses), as a Mac's GPU orders a
+ * only reads the view, which only the bundles read. The post of a buffer that uses surfaces names
+ * the buffers of other queues it runs after (rgfxIOSurfaceNameOrder), as a Mac's GPU orders a
  * process's access to an IOSurface after another's committed before it where one of the two
- * writes: the writers of each surface it uses, and the readers of each it writes. Once posted it
- * raises its own queue's slot, a writer's or a reader's, so a commit after it names it. A process
+ * writes: the writers of each surface it uses, and the readers of each it writes, as the blocks
+ * name them at its post (rgfxIOSurfaceNameOrder). Once posted it raises its own queue's slot, a
+ * writer's or a reader's, so a post after it names it. A process
  * empties its reader slots as it does its writer slots.
  *
  * IOSurface's use count is left as it is: Metal neither raises it nor reads it for GPU work
@@ -211,22 +212,30 @@ void rgfxIOSurfaceNoteWrite(RgfxEncoder *_Nullable enc, __unsafe_unretained id _
 /// (rgfxIOSurfaceSyncBeforeCommit); otherwise nothing.
 void rgfxIOSurfaceNoteUse(RgfxEncoder *_Nullable enc, __unsafe_unretained id _Nullable resource);
 
-/// At a commit, before the command buffer of queue `queueObjId` is posted: names in `enc`'s op
-/// stream, before its first encoder, each cached surface the buffer uses (rgfxIOSurfaceNoteUse)
-/// or writes (`writes`, taken from `enc`), once each (RGFX_OP_SURFACE_USE): its block, its CPU
-/// generation as the kext left it at the surface's last read-write lock, and whether the buffer
-/// writes it. The host fills the surface's device cache from its pages before the buffer's work
-/// where the cache holds an older generation.
-///
-/// Where the process names its buffers' order (rgfxIOSurfaceSetOrder) and the buffer uses a
-/// surface, it also names, once (RGFX_OP_SURFACE_ORDER), the buffers of other queues it runs
-/// after: each queue once, at its highest seqno, of the writers of every surface it uses, and the
-/// readers of every surface it writes, as the blocks hold them now. The answer is the surfaces it
+/// At a commit: names in `enc`'s op stream, before its first encoder, each cached surface the
+/// buffer uses (rgfxIOSurfaceNoteUse) or writes (`writes`, taken from `enc`), once each
+/// (RGFX_OP_SURFACE_USE): its block, its CPU generation as the kext left it at the surface's last
+/// read-write lock, and whether the buffer writes it. The host fills the surface's device cache
+/// from its pages before the buffer's work where the cache holds an older generation. The answer
+/// is every surface the buffer uses, taken from `enc`, for its post to name its order by
+/// (rgfxIOSurfaceNameOrder).
+std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
+    RgfxEncoder *_Nonnull enc, const std::vector<std::shared_ptr<void>> &writes);
+
+/// At the post of the command buffer of queue `queueObjId`, just before it goes on its ring:
+/// where the process names its buffers' order (rgfxIOSurfaceSetOrder) and the buffer uses or
+/// writes a surface (`uses`, rgfxIOSurfaceNameUses' answer, and `writes`), names in `enc`'s op
+/// stream, once (RGFX_OP_SURFACE_ORDER), the buffers of other queues it runs after: each queue
+/// once, at its highest seqno, of the writers of every surface it uses, and the readers of every
+/// surface it writes, as the blocks hold them now. The post is where the kext gets the buffer, as
+/// a Mac's kernel gets it at its submission, which waits for every buffer enqueued before it on
+/// its queue to be committed: a buffer committed behind one not yet committed runs after the
+/// accesses of other queues posted meanwhile, as it would on a Mac. The answer is the surfaces it
 /// only reads, whose readers it raises once posted (rgfxIOSurfaceNoteRead); empty without the
 /// order.
-std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameUses(
+std::vector<std::shared_ptr<void>> rgfxIOSurfaceNameOrder(
     RgfxEncoder *_Nonnull enc, const std::vector<std::shared_ptr<void>> &writes,
-    uint64_t queueObjId);
+    const std::vector<std::shared_ptr<void>> &uses, uint64_t queueObjId);
 
 /// Whether the process names its command buffers' order over IOSurfaces: where the device's
 /// feature word holds RGFX_FEATURE_SURFACE_ORDER, as the device is made.
@@ -322,8 +331,8 @@ void rgfxIOSurfaceWritesPosted(RgfxRegion *_Nonnull region,
 void rgfxIOSurfaceRetire(RgfxRegion *_Nonnull region, uint64_t queueObjId, uint64_t seqno);
 
 /// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is `queueObjId`):
-/// names it among the readers of each view in `reads` (rgfxIOSurfaceNameUses' answer), where its
-/// block holds readers, so a later commit of another queue's buffer that writes the surface runs
+/// names it among the readers of each view in `reads` (rgfxIOSurfaceNameOrder's answer), where its
+/// block holds readers, so a later post of another queue's buffer that writes the surface runs
 /// after it.
 void rgfxIOSurfaceNoteRead(const std::vector<std::shared_ptr<void>> &reads, id _Nonnull queue,
                            uint64_t queueObjId, uint64_t seqno);
