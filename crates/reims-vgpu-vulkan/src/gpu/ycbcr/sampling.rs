@@ -1072,6 +1072,10 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
 /// whose texel it converts by a rounding Metal's may not be. This platform's IDs are taken
 /// without that read, Metal's with it
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records native-half-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn the_guests_id_is_metals() {
     use reims_vgpu_core::platform::event::SharedEvent as _;
     fn ids<P: Platform<Surface = OsSurface>>(

@@ -2150,6 +2150,10 @@ fn held_reads_die<R>(
 /// read of one of their `_sRGB` twins, and of a `BGRA10_XR` texture under a swizzle, each naming
 /// the runtime's refusal, `ArgumentBufferTextures`
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records native-half-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn extended_range_textures_an_argument_buffer_holds_read_as_metals() {
     /// A 16 by 16 texture of `format` holding `bytes`: over a Shared buffer where `over`, else of
     /// `options` ([`Gpu::texture`]).

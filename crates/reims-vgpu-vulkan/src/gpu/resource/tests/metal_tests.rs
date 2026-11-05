@@ -3265,6 +3265,10 @@ fn holds_as_metals(cases: &[(Beside, &[(i64, i32)])]) {
 /// know and whose texel it converts by a rounding Metal's may not be. Metal's side of it runs
 /// first
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records native-half-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn nothing_beside_a_command_buffer_holds_a_surface() {
     let none = [(1, 0); 3];
     let handled = [(2, 0), (2, 0), (1, 0), (1, 0), (1, 0)];
