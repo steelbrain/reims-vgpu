@@ -10,6 +10,10 @@
 //! With the `vulkan` feature, `vulkan_platform` is the process's `VulkanPlatform`, made the
 //! same way on its first use: the only platform on Linux.
 
+// The docs name macOS's platform, which other OSes have none of: their links resolve, and are
+// checked, on macOS.
+#![cfg_attr(not(target_os = "macos"), allow(rustdoc::broken_intra_doc_links))]
+
 use std::sync::{Arc, Once, OnceLock};
 
 use reims_vgpu_core::platform::os::Preferences;

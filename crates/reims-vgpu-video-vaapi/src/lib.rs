@@ -21,6 +21,10 @@
 //! - [`open_backend`], Linux's, is all three on one render node as core's
 //!   `Backend`, which is what the video device and the glue take.
 
+// The crate doc names this crate's Linux items, which other OSes have none of: its links
+// resolve, and are checked, on Linux.
+#![cfg_attr(not(target_os = "linux"), allow(rustdoc::broken_intra_doc_links))]
+
 pub use reims_vgpu_video_codec::av1;
 pub use reims_vgpu_video_codec::encode;
 pub use reims_vgpu_video_codec::h264;

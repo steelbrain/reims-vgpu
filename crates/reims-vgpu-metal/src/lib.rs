@@ -7,6 +7,9 @@
 //!
 //! Metal is macOS's: on any other OS the crate is empty, so that the workspace builds there.
 
+// The crate doc names this crate's macOS items, which other OSes have none of: its links
+// resolve, and are checked, on macOS.
+#![cfg_attr(not(target_os = "macos"), allow(rustdoc::broken_intra_doc_links))]
 #![cfg(target_os = "macos")]
 
 pub mod gpu;

@@ -14,6 +14,9 @@
 //! Everything here is macOS's alone: on any other host the crate builds
 //! and offers nothing.
 
+// The crate doc names this crate's macOS items, which other OSes have none of: its links
+// resolve, and are checked, on macOS.
+#![cfg_attr(not(target_os = "macos"), allow(rustdoc::broken_intra_doc_links))]
 // Every unsafe block says why it is sound: the crate is FFI, in the
 // library's process, where a fault ends the guest's VM.
 #![deny(clippy::undocumented_unsafe_blocks)]
