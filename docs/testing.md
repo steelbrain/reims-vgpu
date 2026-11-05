@@ -2745,13 +2745,19 @@ strings follow the entries, and a value gives their offset from the blob's
 start; an array is a u32 count then u32 offsets. A function is written as its
 `functionRef` (u32), which Metal resolves through the context's
 `functionWithFunctionRef:`; the device's context resolves it as an
-object-list reference. A failed lookup resolves to nil, except one whose entry
-is empty (type 0), which raises the function lookup's failure: the exec faults
-("function lookup failed") rather than reaching Metal's abort on a nil
-function. A guest empties a task's entries when the process that owns it
-ends, without waiting for the execs that process queued, so an exec the host
-runs after that end can meet them (`resources/manager/resolver.rs`,
-`interplay_lifetime_held_pipeline_function_retyped`).
+object-list reference. A failed lookup resolves to nil, except two, which raise
+the function lookup's failure: the exec faults ("function lookup failed")
+rather than reaching Metal's abort on a nil function (`resources/manager/resolver.rs`).
+- One whose entry is empty (type 0). A guest empties a task's entries when the
+  process that owns it ends, without waiting for the execs that process
+  queued, so an exec the host runs after that end can meet them
+  (`interplay_lifetime_held_pipeline_function_retyped`).
+- One whose IR sits over a hole in the task's page table. A guest commits a
+  buffer's pages as it prepares a command buffer that lists the buffer, so a
+  hole is IR the guest has not mapped, and nothing is cached: a lookup once the
+  guest has mapped it makes the function (docs/qemu.md, "x86-64 macOS guests:
+  WebGPU render bundles"; `mutgap_svc_function_over_hole`). IR the task cannot
+  otherwise copy (past the task's end, or ending at it) is still nil to Metal.
 
 | blob | bytes (`<K>` = a function ref, u32 LE) |
 |---|---|
@@ -4040,7 +4046,7 @@ found or the code shows, that no expected file holds.
 | blocks setup: a map that finds its run block full among 128 blocks, while an emptied block stays after the others (runs added before an empty block all go to the block before it) and the runs' total is not a multiple of 240 | `compact` packs the blocks from the front, leaves the last non-empty one short with the empty one after it, and asserts `to_steal != 0`: host death at the map | **measured**, `mutgap_mem_tracker_compact_empty_block` |
 | blocks setup: a run block of 240 runs (239 single-page runs and one of three pages), an unmap inside the three-page run, which splits it in place to 241 runs, then a map into the block | `RunBlock::split` keeps `old_count - half` runs, 121 and 121 of 241, and asserts that they add up: host death at the map | **measured**, `mutgap2_res_tracker_split_odd_death` (`mutgap2_res_tracker_split_adjacent` is the even control: 240 runs split into two of 120) |
 | a guest version below 10 using object type 11 or 15 in-process | assert `mapperIOSurfaces`: host death. The service checks no feature, and a type 15 buffer works there | **measured** for type 15 in the map setup, `mutgap_svc_mapper_below_v10`; type 11 **read** |
-| a malformed serialized pipeline descriptor (garbage, truncated to 1 or 5 bytes), a function ref resolving to nil (ref 0, a wrong type, a short record or header, data outside the task, commandType 14, an empty, truncated or two-function library), an unspecialized function constant, a render descriptor with a nil vertex function or a buffer as its vertex function | abort inside Metal: host death in every setup | **measured**, `compute_death_blob_*`, `compute_death_function_*`, `render_objects_malformed_*`. A function ref whose entry is empty (type 0) is not among them: it raises, and the exec faults (section 6.18, `interplay_lifetime_held_pipeline_function_retyped`) |
+| a malformed serialized pipeline descriptor (garbage, truncated to 1 or 5 bytes), a function ref resolving to nil (ref 0, a wrong type, a short record or header, data outside the task, commandType 14, an empty, truncated or two-function library), an unspecialized function constant, a render descriptor with a nil vertex function or a buffer as its vertex function | abort inside Metal: host death in every setup | **measured**, `compute_death_blob_*`, `compute_death_function_*`, `render_objects_malformed_*`. A function ref whose entry is empty (type 0), or whose IR sits over a hole in the task's page table, is not among them: it raises, and the exec faults (section 6.18, `interplay_lifetime_held_pipeline_function_retyped`, `mutgap_svc_function_over_hole`) |
 | DispatchThreadgroupsIndirect or DispatchThreadsIndirect with indirect buffer ref 0 | nil reaches Metal: host death in every setup | **measured**, `compute_death_threadgroups_indirect_nil`, `compute_death_threads_indirect_nil` |
 | a protection envelope with options 1 around a compute pass | Metal aborts opening the encoder: host death in every setup | **measured**, `compute_death_protection_options`; options 2 and all ones only fault (`compute_err_protected_encoder`, whose docstring says 3 dies too: not locked) |
 | a second encoder over an open one (a carried decoder reused), an encoder left open at commit, a protection envelope while a carried encoder is open | Metal asserts: host death in every setup | **measured**, `compute_death_second_encoder`, `exec_carried_compute_reopened` and `_isolate`, `render_segments_open_twice`, `exec_open_encoder_at_commit` and `_isolate`, `render_segments_open_last`, `exec_protection_envelope_open_encoder` (section 6.13) |

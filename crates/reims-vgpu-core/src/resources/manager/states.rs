@@ -104,7 +104,7 @@ state_kind! {
 state_kind! {
     /// The functions: released last of the manager's caches, after its lookup.
     Functions: Function in functions,
-    |m, hold, _, entry, cursor, _| function::create(hold, m, entry, cursor)
+    |m, hold, reference, entry, cursor, _| function::create(hold, m, reference, entry, cursor)
 }
 
 state_kind! {

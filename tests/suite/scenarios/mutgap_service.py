@@ -11,6 +11,7 @@ import struct
 from pgtest import abi
 from pgtest.abi import PAGE
 from pgtest.compute_objects import Compute as C, Rig, function_record
+from pgtest.covgap_svc_util import point, punch
 from pgtest.registry import scenario
 from pgtest.resources_build import (RGBA8Unorm, RTask, b_copy_buf_buf, b_copy_tex_buf, b_fill_buf, buffer_rec,
                                     desc1, simple_dim, texture_rec)
@@ -170,6 +171,34 @@ def mutgap_svc_function_across_pages():
         return va + PAGE - 0x100
     return function_case("mutgap_svc_function_across_pages", mutgap_svc_function_across_pages.__doc__,
                          place, fault=False)
+
+
+@scenario
+def mutgap_svc_function_over_hole():
+    """A function whose metallib sits on a task page the guest made a hole
+    (its leaf 0) after the task was installed: IR the guest has not mapped
+    yet. The exec's pipeline names the function; copying its IR
+    walks into the hole, and the function's lookup raises ("function lookup
+    failed"), so the exec faults in every setup, where a nil function would
+    have Metal abort building the pipeline (contrast
+    mutgap_svc_function_at_task_end). Nothing is cached: once the guest
+    points the leaf back at its page, the same exec makes the function and
+    the pipeline, and double_gid writes out[gid] = 2 gid for 4 threads."""
+    r = Rig("mutgap_svc_function_over_hole", mutgap_svc_function_over_hole.__doc__, pages=64)
+    out, out_va = r.buffer()
+    va = r.t.reserve(PAGE)
+    n = r.s.mem_file(r.t.gpa(va), KERNEL)
+    fn = r.raw(abi.T_FUNCTION, function_record(va, n))
+    pso = r.pipeline(fn)
+    r.ready()
+    vpn = va // PAGE
+    punch(r.t, vpn)
+    dispatch = (C.set_pipeline(pso), C.set_buffers(0, [(out, 0)]), C.dispatch_threads((4, 1, 1), (4, 1, 1)))
+    r.compute(*dispatch, fault=True, label="the function's IR over a hole")
+    point(r.t, vpn, r.s.pfn(r.t.data + vpn))
+    r.compute(*dispatch, label="the function's IR mapped again")
+    r.dump(out_va, 0x20, "out")
+    return r.end()
 
 
 @scenario

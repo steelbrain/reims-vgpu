@@ -842,6 +842,77 @@ mod tests {
         }
     }
 
+    /// A function whose IR sits over a hole in the task's page table, IR the guest has not
+    /// mapped: the resolver's lookup raises the function lookup's failure, where a nil function
+    /// would reach Metal and end the process, and makes the function once the guest maps the page
+    #[test]
+    fn a_function_over_a_hole_raises_its_lookup_until_the_page_is_mapped() {
+        use crate::raise::RaiseId;
+        use crate::resources::manager::create::function::ObjectFunction;
+        use crate::resources::manager::records::OperationHeader;
+        use crate::resources::manager::resolver::function_with_function_ref;
+        use crate::resources::manager::{ObjectKind, RaiseKind as ManagerRaise};
+        use crate::testkit::platform::FAKE_REGISTRY_ID;
+        use zerocopy::IntoBytes;
+
+        let mut entries = rw_pages(4);
+        entries[2] = 0;
+        let tx = fixture(1, &entries);
+        // entry 1 at task offset 12: a function whose 20-byte record is at task offset 0x100
+        tx.ram
+            .write_u32(page_pa(ROOT_PAGE) + ROOT_OBJECT_LIST_LENGTH, 24);
+        tx.ram.write_u32(page_pa(DATA_PAGE) + 12, 6 | (20 << 8));
+        tx.ram.write_u64(page_pa(DATA_PAGE) + 16, 0x100);
+        let ir_offset = 2 * PAGE + 0x10;
+        let function = ObjectFunction {
+            offset: ir_offset,
+            length: 4,
+        };
+        let header = OperationHeader {
+            command_type: 15,
+            field4: 0,
+        };
+        tx.ram
+            .write(page_pa(DATA_PAGE) + 0x100, function.as_bytes());
+        tx.ram.write(page_pa(DATA_PAGE) + 0x10c, header.as_bytes());
+        tx.ram.write(page_pa(DATA_PAGE + 2) + 0x10, &[9, 8, 7, 6]);
+        assert_eq!(
+            handshake_with(&tx, ROOT_PAGE, TASK_LEN, FAKE_REGISTRY_ID, true),
+            vec![(1, pid())]
+        );
+        tx.task.ensure_object_list_mapped(Hold::NONE).unwrap();
+        let (_, manager, _) = tx.task.parts();
+        // The resource manager's lines, which `Lines` leaves out
+        let capture = crate::testkit::logs::capture();
+        let raised = function_with_function_ref(Hold::NONE, &manager, 1)
+            .err()
+            .unwrap();
+        assert_eq!(
+            raised.id(),
+            RaiseId::Manager(ManagerRaise::Lookup(ObjectKind::Function))
+        );
+        let want = format!(
+            "function 1 not made: its IR, 0x4 bytes at task offset {ir_offset:#x}, is not \
+             mapped: a hole in the page table"
+        );
+        let lines: Vec<String> = capture.take().into_iter().map(|(_, _, m)| m).collect();
+        assert!(lines.contains(&want), "{want}: {lines:?}");
+        assert!(!tx.sels().contains(&"newLibraryWithData:error:"));
+        // the guest maps the page: the next lookup makes the function from its IR
+        tx.ram.write_u32(page_pa(PT_PAGE) + 8, (DATA_PAGE + 2) | W);
+        tx.p.world().set_library_functions(vec!["main0".to_owned()]);
+        assert!(
+            function_with_function_ref(Hold::NONE, &manager, 1)
+                .unwrap()
+                .is_some()
+        );
+        let made = tx.p.call_log().calls_to("newLibraryWithData:error:");
+        assert_eq!(
+            made.last().unwrap().args,
+            vec![crate::testkit::calllog::Arg::Bytes(vec![9, 8, 7, 6])]
+        );
+    }
+
     /// A failed read is logged with the byte of the copy where the page's bytes would have
     /// gone, and the copy goes on
     #[test]

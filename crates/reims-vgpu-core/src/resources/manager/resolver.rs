@@ -5,13 +5,17 @@
 //! The resolver's context object is the metal crate's, one per pipeline-descriptor send,
 //! holding [`function_with_function_ref`] as its resolver.
 //!
-//! A failed lookup is nil to Metal, as Apple's framework answers it, except a function whose
-//! entry is empty (type 0), which raises the function lookup's failure: Metal aborts on a nil
-//! vertex or compute function, and the raise faults the exec instead, as every other failed
-//! lookup of the decode does (`interplay_lifetime_held_pipeline_function_retyped`). A guest
-//! empties a task's entries when the process that owns it ends, without waiting for the execs
-//! that process queued, so an exec the host runs late makes its pipelines from empty entries
-//! (x86-64 macOS 26 guests' icon services, docs/qemu.md).
+//! A failed lookup is nil to Metal, as Apple's framework answers it, except two, which raise the
+//! function lookup's failure: Metal aborts on a nil vertex or compute function, and the raise
+//! faults the exec instead, as every other failed lookup of the decode does.
+//! - A function whose entry is empty (type 0)
+//!   (`interplay_lifetime_held_pipeline_function_retyped`). A guest empties a task's entries when
+//!   the process that owns it ends, without waiting for the execs that process queued, so an
+//!   exec the host runs late makes its pipelines from empty entries (x86-64 macOS 26 guests'
+//!   icon services, docs/qemu.md).
+//! - A function whose IR sits over a hole in the task's page table, IR the guest has not
+//!   mapped, which its creator raises (`create/function.rs`, `mutgap_svc_function_over_hole`;
+//!   docs/qemu.md, "x86-64 macOS guests: WebGPU render bundles").
 
 use crate::num::Truncate;
 use crate::platform::Platform;
@@ -22,7 +26,8 @@ use crate::rt::Hold;
 
 /// The function `function_ref` names: its low 32 bits are the reference. A lookup error is
 /// logged and nil to Metal, unless the reference's entry is empty, which raises the function
-/// lookup's failure; a raise from the lookup (a task cursor or a creator raising) is `Err` too.
+/// lookup's failure; a raise from the lookup (a task cursor, or a creator raising, as one does
+/// for IR over a hole) is `Err` too.
 /// The platform carries an `Err` through Metal's frames to the caller's handler.
 pub fn function_with_function_ref<P: Platform>(
     hold: Hold<'_>,

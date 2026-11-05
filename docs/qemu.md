@@ -1210,6 +1210,38 @@ Without the key, the aborts also fault the GPU. **Measured** with macOS
 reims-ctl counts these faults' lines in QEMU's log, and from the third tells
 the user to set the key from Recovery.
 
+### x86-64 macOS guests: WebGPU render bundles
+
+**Measured** with a macOS 26 guest on an RTX 5080 Laptop GPU host: opening
+Safari's WebGPU renderBundles sample ended QEMU. The host read the records
+of a render pipeline's two functions, could not copy either function's IR
+("the function's IR is not in task memory", which did not yet say why),
+handed Metal both as nil, and Metal ended the process at a render
+descriptor with no vertex function. In the 9.5 s before it the guest sent
+no exec (67), and the host committed no command buffer in the last 4.5 s;
+the guest sent 1,700 to 2,900 info indirects (69) and 1,000 to 2,000
+DiscardResources (63) a second, and the host's trace ends 0.14 ms after the
+last info indirect.
+
+**Read**, from the guest's Metal driver and kext:
+- A render pipeline holds its vertex and fragment functions' IR buffers.
+  Every command stream that names the pipeline adds those buffers to its
+  resource list: a render encoder's setRenderPipelineState, and an info
+  encoder's queries of the pipeline.
+- The kext commits a listed buffer's pages to the task's page table as it
+  prepares the stream's resource list.
+
+So why the copy failed is not settled: IR whose pages the guest had not yet
+committed, or a range past the task's end. The host now logs which. IR over
+a hole raises the function lookup's failure ("function N not made: its IR
+... is not mapped: a hole in the page table"), so the exec or info faults
+where Metal would end the process, as for an empty entry (section 6.18 of
+docs/testing.md, `mutgap_svc_function_over_hole`). Nothing is cached, so a
+lookup once the guest has mapped the IR makes the function. IR past the
+task's end is still nil to Metal, as Apple's framework answers it
+(`compute_death_function_data_out_of_range`, measured). Whether the sample
+draws with this is not yet measured.
+
 ### x86-64 macOS guests: thumbnail extensions
 
 On an x86-64 macOS 26 guest, Quick Look's image and video thumbnail
