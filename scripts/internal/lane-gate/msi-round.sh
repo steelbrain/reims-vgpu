@@ -50,6 +50,12 @@ for p in $TAKE; do
   [[ $staged == *" $p "* ]] && continue
   mv "$Q/$p" "$RD/probes/" || echo "msi-round: $p is not in the queue"
 done
+# The round's probes' results from an earlier round go now, not at each probe's start
+# (msi-probes.sh): a QEMU hook starts with QEMU and reads PROBE_RESULTS/NAME/stdout for its probe's
+# MARK, and the last round's stdout of a probe of the same name holds it already (round
+# 20261105-111520: the hook ran before the guest was up, and the probe's start removed what it
+# wrote). Each earlier round keeps its own copy in R/probe-results.
+for p in $TAKE; do rm -rf "${RES:?}/$p"; done
 printf '%s\n' $TAKE > "$RD/probes/.order"
 # The gate's host scripts, the hooks among them ({DIR}/bin/NAME in a --qemu-hook).
 cp -p "$WS"/lg/bin/* "$RD/bin/"
