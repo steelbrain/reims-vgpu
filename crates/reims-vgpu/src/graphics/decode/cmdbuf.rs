@@ -1232,7 +1232,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Stands in for the `COMMAND_BUFFER` `message` the decoder could not carry out (refused, or
-    /// faulted at an op: a draw with a pipeline the host refused among them), as a buffer Metal
+    /// faulted at an op: one naming an object its process does not hold among them; what names
+    /// an object whose create the host refused is dropped instead, [`refused`]), as a buffer Metal
     /// could not run still finishes: a command buffer on its queue holding the buffer's event ops
     /// alone, each wait and signal of an event its process holds, in stream order. Its completion
     /// posts the shared event values signalled and then the buffer's failure ([`cb_failed`]), so

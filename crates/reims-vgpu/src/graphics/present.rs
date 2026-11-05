@@ -19,8 +19,9 @@
 //! wrong never holds its display's presents. A failed buffer finishes as a completed one does
 //! (its `CB_COMPLETE` carries the failure). A queue's completions, posted in its order, say how far
 //! it has finished; a failure the host posts at once instead, ahead of buffers before it that may
-//! still run (one it neither carried out nor stood in for: a failed context's later buffers among
-//! them), finishes that buffer alone. A queue's destroy, or its context's close, drops what the
+//! still run (one it neither carried out nor stood in for: a buffer of a queue its process does
+//! not hold, or one whose queue made no command buffer for it or its stand-in), finishes that
+//! buffer alone. A queue's destroy, or its context's close, drops what the
 //! presents wait for of it: no buffer of it will finish.
 //!
 //! A present of a surface whose device cache holds an older CPU generation than the present's
