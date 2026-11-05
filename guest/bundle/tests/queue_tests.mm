@@ -30,6 +30,7 @@
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxResource.h"
+#import "RgfxSharedEvent.h"
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxObjectModel.hpp"
@@ -1118,6 +1119,74 @@ int rgfxQueueDiesCase(const char *name)
 	return 0;
 }
 
+// A command buffer's signal of a shared event that the host posts while the buffer runs, ahead of
+// its CB_SCHEDULED, reaches the process through the completion thread: a thread waiting on the
+// CPU for it wakes while the buffer is still Committed, and the value it then sets goes to the
+// host (SHARED_EVENT_SET_VALUE), which lets the buffer's later wait for that value go; the buffer
+// then completes. Metal's CPU sees such a signal while the buffer runs, and the pattern ends on
+// all three GPUs (docs/graphics-kext/dgpu-oracle.md, Q18).
+void test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:0
+		                                                             device:nil
+		                                                         serializer:&q.ser];
+		CHECK(ev != nil);
+		[ev rgfxRegisterWithReplyReader:[q.queue sharedReplyReader].get()];
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		[[cb blitCommandEncoder] endEncoding];
+		[cb encodeSignalEvent:ev value:1];
+		[cb encodeWaitForEvent:ev value:2];
+		[[cb blitCommandEncoder] endEncoding];
+		[cb commit];
+		const uint64_t seqno = nextSeqno(q);
+
+		// The app's thread: it waits for 1, then sets 2.
+		std::atomic<int> woke{0};
+		std::atomic<long> statusAtWake{-1};
+		std::thread app([ev, cb, &woke, &statusAtWake] {
+			const BOOL got = [ev waitUntilSignaledValue:1 timeoutMS:5000];
+			statusAtWake = static_cast<long>(cb.status);
+			woke = got ? 1 : -1;
+			ev.signaledValue = 2;
+		});
+		// The host's GPU reaches the signal: its value goes ahead of any record of the buffer's.
+		RgfxEventSignalled sig = {};
+		sig.header.type = RGFX_EVT_EVENT_SIGNALLED;
+		sig.header.size = sizeof(sig);
+		sig.obj_id = ev.rgfxObjId;
+		sig.value = 1;
+		hostPost(q.completion, *driven.kext, &sig, sizeof(sig));
+		// The set comes on the control ring.
+		bool set = false;
+		for (int i = 0; i < 5000 && !set; i++) {
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			while (!set && q.control.next(&h, &bytes)) {
+				RgfxSharedEventSetValue m = {};
+				if (h.type == RGFX_CMD_SHARED_EVENT_SET_VALUE && bytes.size() >= sizeof(m)) {
+					std::memcpy(&m, bytes.data(), sizeof(m));
+					set = m.obj_id == ev.rgfxObjId && m.value == 2;
+				}
+			}
+			if (!set)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		app.join();
+		CHECK(woke == 1);
+		CHECK(statusAtWake == static_cast<long>(MTLCommandBufferStatusCommitted));
+		CHECK(set);
+		CHECK(ev.signaledValue == 2);
+		// The host's wait is let go: the buffer is scheduled and completes.
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
 void rgfxQueueTests(const char *self)
 {
 	g_self = self;
@@ -1134,4 +1203,5 @@ void rgfxQueueTests(const char *self)
 	test_enqueue_and_commit_are_once();
 	test_buffers_let_go_give_their_blocks_back();
 	test_in_place_writes_retire_at_the_take();
+	test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends();
 }
