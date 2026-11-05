@@ -409,6 +409,16 @@ impl<P: Platform> Context<P> {
         })
     }
 
+    /// Calls `f` with each entry the table holds now, with its id, under its read lock: what a
+    /// close does with every object while a view open on the table still keeps what
+    /// [`Self::remove_all`] retires out of its answer.
+    pub(crate) fn for_each_live(&self, mut f: impl FnMut(u64, &Entry<P>)) {
+        let t = self.tables.read();
+        for (&id, owned) in &t.live {
+            f(id, owned.entry());
+        }
+    }
+
     /// What `f` makes of `id`'s entry as the table holds it now, under its read lock.
     pub(crate) fn with_live<R>(&self, id: u64, f: impl FnOnce(&Entry<P>) -> R) -> Option<R> {
         self.tables.read().live.get(&id).map(|o| f(o.entry()))

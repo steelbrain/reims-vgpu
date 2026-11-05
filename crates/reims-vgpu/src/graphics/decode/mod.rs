@@ -1766,8 +1766,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Takes every object of context `context` out of the decoder's tables and names: those whose
     /// id lies in its range, `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next
     /// context's (its process closed the device or died), its chunks of the texture resource ids,
-    /// its surfaces' names, its libraries and its pages blocks' views, its queues ended first and
-    /// its events then set past every value ([`Self::release_events`]). How many objects it held,
+    /// its surfaces' names, its libraries and its pages blocks' views: its events set past every
+    /// value first ([`Self::release_events`]), and its queues ended. How many objects it held,
     /// and what it took out, for the caller to let go of ([`Closed`]).
     pub(crate) fn close_tables(&self, device: &P::Device, context: u32) -> (usize, Closed<P>) {
         for holder in self.shared.id_chunks.lock().iter_mut() {
@@ -1779,6 +1779,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let mut objects = Vec::new();
         let queues = self.shared.surface_order.lock().queues_of(context);
         if let Some(state) = self.context_state(context) {
+            // Its events first, while its table holds them: a view open on it, a walk's, keeps
+            // what the removal retires out of its answer until the view closes.
+            self.release_events(device, &state);
             let (removed, count) = state.remove_all();
             dropped = count;
             // Its queues end first, each signalling on its own host queue where it is let go of
@@ -1802,7 +1805,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                     drop(counts.answered.lock().take());
                 }
             }
-            self.release_events(device, context, &removed);
             objects = removed;
         }
         self.forget_context_surfaces(context);
@@ -1824,34 +1826,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         (dropped, closed)
     }
 
-    /// Context `context` is gone, its close or the device's reset, and with it everything that
-    /// could set or signal its events: no event of the guest's crosses processes, and its queues
+    /// A context is gone, at its close or the device's reset, and with it everything that could
+    /// set or signal its events: no event of the guest's crosses processes, and its queues
     /// have ended. A command buffer of its that waits for one of their values not yet reached
     /// would wait for good, holding its queue, every object it names, the GPU addresses its
     /// buffers pin among them, and its context's drain, which the close's answer waits for.
-    /// So each event of `removed` is set past every value: a shared event on the CPU, and the
-    /// plain events, which only a command buffer signals, by one command buffer on the decoder's
-    /// own queue ([`Shared::release_queue`]), which no buffer of the guest's holds up. A
-    /// refusal is logged, and the close goes on.
-    fn release_events(&self, device: &P::Device, context: u32, removed: &[tables::Removed<P>]) {
-        let mut plain = Vec::new();
-        for r in removed {
-            match &r.entry().handle {
-                ObjHandle::SharedEvent(event) => {
-                    if let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX)) {
-                        log::warn!(
-                            target: "reims_vgpu::graphics",
-                            "context {context}'s shared event {:#x} was not set past every value \
-                             at its close: {raise}",
-                            r.id()
-                        );
-                    }
+    /// So each event the context's table `state` holds is set past every value, before the
+    /// close takes it out, as a view a walk holds open keeps what is taken out from the close:
+    /// a shared event on the CPU, and the plain events, which only a command buffer signals, by
+    /// one command buffer on the decoder's own queue ([`Shared::release_queue`]), which no
+    /// buffer of the guest's holds up. A refusal is logged, and the close goes on.
+    fn release_events(&self, device: &P::Device, state: &tables::Context<P>) {
+        let context = state.id;
+        let mut plain = 0usize;
+        state.for_each_live(|id, entry| match &entry.handle {
+            ObjHandle::SharedEvent(event) => {
+                if let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX)) {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "context {context}'s shared event {id:#x} was not set past every value at \
+                         its close: {raise}"
+                    );
                 }
-                ObjHandle::Event(event) => plain.push(event),
-                _ => {}
             }
-        }
-        if plain.is_empty() {
+            ObjHandle::Event(_) => plain += 1,
+            _ => {}
+        });
+        if plain == 0 {
             return;
         }
         let signalled = refusing(|| {
@@ -1863,9 +1864,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             }) else {
                 return Ok(false);
             };
-            for &event in &plain {
-                cb.encode_signal(Some(EventRef::Event(event)), u64::MAX)?;
-            }
+            let mut encoded = Ok(());
+            state.for_each_live(|_, entry| {
+                if let ObjHandle::Event(event) = &entry.handle
+                    && encoded.is_ok()
+                {
+                    encoded = cb.encode_signal(Some(EventRef::Event(event)), u64::MAX);
+                }
+            });
+            encoded?;
             cb.commit(OnFault::Return)?;
             Ok(true)
         });
@@ -1873,15 +1880,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(true) => {}
             Ok(false) => log::warn!(
                 target: "reims_vgpu::graphics",
-                "context {context}'s {} events were not signalled past every value at its close: \
-                 the platform made no command buffer",
-                plain.len()
+                "context {context}'s {plain} events were not signalled past every value at its \
+                 close: the platform made no command buffer"
             ),
             Err(raise) => log::warn!(
                 target: "reims_vgpu::graphics",
-                "context {context}'s {} events were not signalled past every value at its close: \
-                 {raise}",
-                plain.len()
+                "context {context}'s {plain} events were not signalled past every value at its \
+                 close: {raise}"
             ),
         }
     }
@@ -5055,6 +5060,8 @@ mod tests {
             id_of(&dec, obj(2, 2)),
         );
 
+        // The lookups above hold views of the contexts' tables open, as a walk does: the close
+        // sets the events all the same, though the views keep the entries taken out.
         let mark = p.call_log().mark();
         assert_eq!(dec.drop_context(&device, 1), 4);
         let calls = p.call_log().since(mark);
