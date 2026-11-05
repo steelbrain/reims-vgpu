@@ -25,6 +25,9 @@
 //                 after the texture's didModifyData (SPI), as CoreAnimation calls it
 //   linalign      the offsets and row pitches a texture over a Shared or Managed buffer takes, by
 //                 the public form, the linear SPI and the tiled SPI: made or nil for each
+//   linarray MODE a linear 2D array texture over a Shared buffer, by the linear SPI (MODE spi)
+//                 or the public form (public): where each slice lies in the buffer, for the CPU's
+//                 replaceRegion: and getBytes: and for the GPU's reads
 //   spin          a Shared buffer the CPU writes while one GPU thread polls it (atomic and plain
 //                 loads), and one the GPU writes step by step while the CPU polls it
 // A buffer's bytes print as runs, "A[0,4096)" or "B[0,256) A[256,4096)", each letter a byte.
@@ -413,6 +416,107 @@ static void case_lintex(const char *mode)
 	line("CPU G to the buffer, then replaceRegion F of a 16x1 corner; GPU sees", g, 0);
 }
 
+// A linear 2D array texture over a Shared buffer, of 3 BGRA8 slices of W x 3 at offset 0, rows
+// BPR bytes apart: by the linear SPI (MODE spi) with each bytesPerImage of 0, BPR x 3 and 1024,
+// or by the public form (MODE public). For each texture made: where replaceRegion: of each whole
+// slice (A, B, C) lands in the buffer, what the GPU reads of each slice (a blit of it into a
+// Shared buffer), and what getBytes: reads of each after the CPU writes the buffer's bytes at
+// slice pitch BPR x 3 (X, Y, Z). Two shapes: W 64 (BPR 256) and W 4 (BPR 16).
+static void case_linarray(const char *mode)
+{
+	printf("case linarray %s: a linear 2D array of 3 BGRA8 slices over a Shared buffer\n", mode);
+	SEL lin = NSSelectorFromString(@"newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+	const bool spi = !strcmp(mode, "spi");
+	const int h = 3, slices = 3;
+	const int widths[] = {64, 4};
+	for (int k = 0; k < 2; k++) {
+		const int w = widths[k];
+		const NSUInteger bpr = (NSUInteger)w * 4;
+		const NSUInteger images[] = {0, bpr * h, 1024};
+		for (int i = 0; i < (spi ? 3 : 1); i++) {
+			id<MTLBuffer> b = [D newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                                                       width:w
+			                                                      height:h
+			                                                   mipmapped:NO];
+			td.textureType = MTLTextureType2DArray;
+			td.arrayLength = slices;
+			td.storageMode = MTLStorageModeShared;
+			td.usage = MTLTextureUsageShaderRead;
+			char step[100];
+			snprintf(step, sizeof step, "%s W %d BPR %lu bytesPerImage %lu", mode, w,
+			         (unsigned long)bpr, (unsigned long)images[i]);
+			id<MTLTexture> t = nil;
+			if (!spi)
+				t = [b newTextureWithDescriptor:td offset:0 bytesPerRow:bpr];
+			else if ([(id)b respondsToSelector:lin])
+				t = ((id(*)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+				    b, lin, td, 0, bpr, images[i]);
+			else {
+				line(step, "no linear SPI", 0);
+				return;
+			}
+			char out[200];
+			snprintf(out, sizeof out, "%s, type %lu, arrayLength %lu", t ? "made" : "nil",
+			         (unsigned long)t.textureType, (unsigned long)t.arrayLength);
+			line(step, out, 0);
+			if (!t)
+				continue;
+			memset(b.contents, 0, b.length);
+			NSMutableData *d = [NSMutableData dataWithLength:bpr * h];
+			for (int s = 0; s < slices; s++) {
+				memset(d.mutableBytes, 'A' + s, d.length);
+				[t replaceRegion:MTLRegionMake3D(0, 0, 0, w, h, 1)
+				     mipmapLevel:0
+				           slice:s
+				       withBytes:d.bytes
+				     bytesPerRow:bpr
+				   bytesPerImage:bpr * h];
+			}
+			runs(b.contents, 0x1000, out, sizeof out);
+			line("  replaceRegion slices A B C; CPU sees buffer", out, 0);
+			size_t o = 0;
+			for (int s = 0; s < slices; s++) {
+				id<MTLBuffer> rb = [D newBufferWithLength:bpr * h
+				                                  options:MTLResourceStorageModeShared];
+				id<MTLCommandBuffer> cb = [Q commandBuffer];
+				id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+				[e copyFromTexture:t
+				             sourceSlice:s
+				             sourceLevel:0
+				            sourceOrigin:MTLOriginMake(0, 0, 0)
+				              sourceSize:MTLSizeMake(w, h, 1)
+				                toBuffer:rb
+				       destinationOffset:0
+				  destinationBytesPerRow:bpr
+				destinationBytesPerImage:bpr * h];
+				[e endEncoding];
+				oracle_commit_wait(cb, NULL, NULL);
+				char r[80];
+				runs(rb.contents, bpr * h, r, sizeof r);
+				o += snprintf(out + o, sizeof out - o, "%s%d:%s", s ? " " : "", s, r);
+			}
+			line("  GPU reads each slice", out, 0);
+			for (int s = 0; s < slices; s++)
+				memset((uint8_t *)b.contents + (size_t)s * bpr * h, 'X' + s, bpr * h);
+			o = 0;
+			for (int s = 0; s < slices; s++) {
+				[t getBytes:d.mutableBytes
+				      bytesPerRow:bpr
+				    bytesPerImage:bpr * h
+				       fromRegion:MTLRegionMake3D(0, 0, 0, w, h, 1)
+				      mipmapLevel:0
+				            slice:s];
+				char r[80];
+				runs(d.bytes, d.length, r, sizeof r);
+				o += snprintf(out + o, sizeof out - o, "%s%d:%s", s ? " " : "", s, r);
+			}
+			line("  CPU X Y Z at BPR x 3 apart; getBytes of each slice", out, 0);
+		}
+	}
+}
+
 // The GPU's copy of `b`'s first `n` bytes against the CPU's: "same as the CPU's" or the GPU's runs.
 static void gpu_against_cpu(id<MTLBuffer> b, size_t n, char *out, size_t cap)
 {
@@ -757,6 +861,8 @@ static int run_case(int argc, char **argv)
 		case_lintex(argc > 1 ? argv[1] : "shared");
 	else if (!strcmp(c, "linalign"))
 		case_linalign();
+	else if (!strcmp(c, "linarray"))
+		case_linarray(argc > 1 ? argv[1] : "spi");
 	else if (!strcmp(c, "didmodify"))
 		case_didmodify(argc > 1 ? argv[1] : "length");
 	else if (!strcmp(c, "nocopy"))
@@ -796,7 +902,8 @@ int main(int argc, char **argv)
 	    {"mbuf", "4096"}, {"mbuf", "67108864"}, {"mtex", NULL}, {"shtex", NULL},
 	    {"lintex", "shared"}, {"lintex", "managed"}, {"argenc", "shared"},
 	    {"argenc", "managed"}, {"nocopy", NULL}, {"didmodify", "length"},
-	    {"didmodify", "nocopy"}, {"linalign", NULL}, {"spin", NULL},
+	    {"didmodify", "nocopy"}, {"linalign", NULL}, {"linarray", "spi"},
+	    {"linarray", "public"}, {"spin", NULL},
 	};
 	size_t n = sizeof all / sizeof all[0];
 	for (size_t i = 0; i < n; i++) {
