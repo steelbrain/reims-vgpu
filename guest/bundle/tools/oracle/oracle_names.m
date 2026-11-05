@@ -8,8 +8,10 @@
 //               BFloat value and with a Float one.
 //   archive     a binary archive's addMeshRenderPipelineFunctionsWithDescriptor: with no mesh
 //               function: with no function at all, with a fragment function, and with an object
-//               function. Run it with MTL_DEBUG_LAYER=1 too: where Metal's validation asserts,
-//               its words are on stderr, which the line after the step's says it died.
+//               function; then with a mesh function and a fragment function, the pipeline an
+//               app adds, and whether the device makes that pipeline. Run it with
+//               MTL_DEBUG_LAYER=1 too: where Metal's validation asserts, its words are on
+//               stderr, which the line after the step's says it died.
 // Each step prints `case.step: made=0|1 error=DOMAIN/CODE "description"`; a step whose child
 // died says how. Build: see README.md.
 #import "oracle_common.h"
@@ -119,7 +121,24 @@ static void step_archive(const char *variant)
 	}
 	MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
 	m.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-	if (strcmp(variant, "nothing") != 0) {
+	if (!strcmp(variant, "mesh")) {
+		NSString *src =
+		    @"#include <metal_stdlib>\n"
+		    @"using namespace metal;\n"
+		    @"struct V { float4 p [[position]]; };\n"
+		    @"using M = metal::mesh<V, void, 3, 1, topology::triangle>;\n"
+		    @"[[mesh]] void msh(M m, uint t [[thread_index_in_threadgroup]]) {\n"
+		    @"  if (t == 0) { m.set_primitive_count(1); m.set_index(0, 0); m.set_index(1, 1); "
+		    @"m.set_index(2, 2); }\n"
+		    @"  if (t < 3) { V v; v.p = float4(float(t), 0, 0, 1); m.set_vertex(t, v); }\n"
+		    @"}\n"
+		    @"fragment float4 frag(V in [[stage_in]]) { return in.p; }\n";
+		id<MTLLibrary> lib = library(src, MTLLanguageVersion3_0);
+		if (!lib)
+			return;
+		m.meshFunction = [lib newFunctionWithName:@"msh"];
+		m.fragmentFunction = [lib newFunctionWithName:@"frag"];
+	} else if (strcmp(variant, "nothing") != 0) {
 		NSString *src = @"#include <metal_stdlib>\n"
 		                @"using namespace metal;\n"
 		                @"struct P { float4 p [[position]]; };\n"
@@ -141,6 +160,16 @@ static void step_archive(const char *variant)
 	} @catch (NSException *x) {
 		printf("archive.%s: threw %s \"%s\"\n", variant, x.name.UTF8String,
 		       x.reason.UTF8String);
+	}
+	// Whether the device makes the pipeline itself.
+	if (!strcmp(variant, "mesh")) {
+		e = nil;
+		id<MTLRenderPipelineState> p = [D newRenderPipelineStateWithMeshDescriptor:m
+		                                                                   options:MTLPipelineOptionNone
+		                                                                reflection:nil
+		                                                                     error:&e];
+		printf("archive.mesh pipeline: made=%d", p != nil);
+		print_error(e);
 	}
 }
 
@@ -197,6 +226,7 @@ int main(int argc, char **argv)
 		run_child(argv[0], argv[1], "archive", "nothing");
 		run_child(argv[0], argv[1], "archive", "fragment");
 		run_child(argv[0], argv[1], "archive", "object");
+		run_child(argv[0], argv[1], "archive", "mesh");
 	}
 	return 0;
 }

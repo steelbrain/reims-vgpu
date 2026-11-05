@@ -20,7 +20,7 @@ Mac where it shows the gap. What they found is in
 | `oracle_ca_ycbcr` | which matrix CoreAnimation (a CARenderer drawing the surface as a layer's contents into a texture of the device) and VideoToolbox (`VTPixelTransferSession` to 32BGRA) convert an `x420` or `420v` surface by, tagged 709, 601 or untagged |
 | `oracle_sampler` | what a sampler's `lodBias` and `reductionMode` do to its samples, by the LOD's source (`level()`, `gradient2d()`, a fragment's implicit LOD) and the mip filter, and the device's SPI answers about them |
 | `oracle_order` | when a command buffer that runs after another queue's or another process's pending access to the same IOSurface is answered submitted (`commitAndWaitUntilSubmitted`), scheduled and completed, and whether the GPU ran it after that access |
-| `oracle_names` | the words Metal gives where a function is made with a constant value of another type, for every `MTLDataType` (a bfloat constant's among them), and where a binary archive's mesh-pipeline add has no mesh function |
+| `oracle_names` | the words Metal gives where a function is made with a constant value of another type, for every `MTLDataType` (a bfloat constant's among them), and what a binary archive answers for a mesh pipeline added to it, with no mesh function and with one |
 
 Each probe picks its device by a substring of its name from `MTLCopyAllDevices` (`AMD`,
 `Intel`, `Apple`). It never calls `MTLCreateSystemDefaultDevice`, which switches a dual-GPU
