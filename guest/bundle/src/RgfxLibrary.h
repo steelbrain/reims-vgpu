@@ -113,6 +113,27 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 
 @end
 
+/// A library of the functions given (newLibraryWithFunctionArray:error:, SPI), as both x86 Macs
+/// make one (the AMD 5300M and the Intel 630 under macOS 26.7.1: oracle_bundle libforms2 and
+/// libforms3). It holds the functions themselves, and nothing on the host: it answers each by its
+/// name, the very object given, whatever constants or descriptor ask for it, and its names in the
+/// reverse of the order given. It is executable, with no install name, label, reflection or
+/// extern functions, and serializes nothing, with Metal's words.
+@interface RgfxFunctionArrayLibrary : RgfxResource <MTLLibrary>
+
+/// The library of `functions`; nil and Metal's error where two share a name, and the end of the
+/// process with Metal's words where there are none.
++ (nullable instancetype)libraryOfFunctions:(nullable NSArray<id<MTLFunction>> *)functions
+                                     device:(nullable id<MTLDevice>)device
+                                      error:(NSError *_Nullable __autoreleasing *_Nullable)error;
+
+/// The private MTLLibrary members the probe asks (oracle_bundle libforms3): no extern functions
+/// (nil), and no file written, with Metal's refusal.
+- (nullable NSArray<NSString *> *)externFunctionNames;
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError *_Nullable __autoreleasing *_Nullable)error;
+
+@end
+
 /// Each of `functions` as Metal's own links take it (Core Image's link and stitching): an
 /// RgfxFunction as its shadow (its library's shadow's function of its entry point, where it has
 /// none yet), any other function as it is. nil, with `*error`, where an RgfxFunction has no shadow:

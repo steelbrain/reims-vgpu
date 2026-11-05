@@ -1464,6 +1464,8 @@ static int dies_case(const char *name)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType3D, one, one, true);
 	if (std::strcmp(name, "view-cube-count") == 0)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, one, NSMakeRange(0, 4), true);
+	if (std::strcmp(name, "function-array-empty") == 0)
+		(void)[RgfxFunctionArrayLibrary libraryOfFunctions:@[] device:nil error:nullptr];
 	}
 	return 0;
 }
@@ -2798,21 +2800,20 @@ IMP baseForm(SEL sel)
 	           : nullptr;
 }
 
-// A library of a function array (newLibraryWithFunctionArray:error:, SPI) is Metal's own over the
-// functions' shadows, made ours as the device makes it (RgfxLinkOverShadows over the base class's
-// form): ours over the bytes Metal's library answers, which go to the host as an app's .metallib,
-// with Metal's functions and Metal's library as its shadow, and no error.
-void test_function_array_library_over_shadows()
+// A library of a function array (newLibraryWithFunctionArray:error:, SPI) holds the functions
+// given, as both x86 Macs make it (oracle_bundle libforms2 and libforms3): each by its name, the
+// very object given, whatever constants or descriptor ask for it, Metal's error for a name it
+// lacks, its names in the reverse of the order given; executable, with no install name, label,
+// reflection or extern functions, serializing nothing; and nothing sent to the host. Two functions
+// of one name make none, with Metal's words.
+void test_function_array_library_holds_the_functions()
 {
 	Fixture fx(0x40000); // the library's bytes fit
 	const char *path = getenv("RGFX_STITCHABLE");
-	SEL sel = sel_registerName("newLibraryWithFunctionArray:error:");
-	IMP array = baseForm(sel);
-	CHECK(path != nullptr && array != nullptr);
-	if (path == nullptr || array == nullptr)
+	CHECK(path != nullptr);
+	if (path == nullptr)
 		return;
 	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
-	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
 	uint32_t status = 0;
 	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
 	                                         length:bytes.length
@@ -2820,62 +2821,56 @@ void test_function_array_library_over_shadows()
 	                                         device:nil
 	                                     serializer:&fx.ser
 	                                         status:&status];
-	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
-		     (void)bytes;
-	     })
-	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
-		       return [metal newLibraryWithData:d error:nil];
-	       }];
 	id<MTLFunction> add = [lib newFunctionWithName:@"stitch_add"];
 	id<MTLFunction> mul = [lib newFunctionWithName:@"stitch_mul"];
+	CHECK(add != nil && mul != nil);
 	std::vector<uint8_t> drain;
 	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {
 	}
-	__block NSArray<id<MTLFunction>> *given = nil;
-	__block id<MTLLibrary> metals = nil;
-	__block NSData *made = nil;
-	RgfxSerializer *ser = &fx.ser;
 	NSError *err = nil;
-	id<MTLLibrary> ours = RgfxLinkOverShadows(
-	    @[ add, mul ],
-	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError **e) {
-		    given = shadows;
-		    metals = ((id(*)(id, SEL, NSArray *, NSError **))array)(metal, sel, shadows, e);
-		    return metals;
-	    },
-	    ^id<MTLLibrary>(dispatch_data_t data, NSError **) {
-		    const void *p = nullptr;
-		    size_t n = 0;
-		    dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
-		    made = [NSData dataWithBytes:p length:n];
-		    uint32_t st = 0;
-		    RgfxLibrary *l = [RgfxLibrary libraryWithData:p
-		                                           length:n
-		                                              key:nullptr
-		                                           device:nil
-		                                       serializer:ser
-		                                           status:&st];
-		    (void)map;
-		    return l;
-	    },
-	    &err);
-	CHECK(err == nil && metals != nil);
-	CHECK(given.count == 2 && given[0] == [(RgfxFunction *)add rgfxShadow] &&
-	      given[1] == [(RgfxFunction *)mul rgfxShadow] && given[0] != nil);
-	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]] && [(RgfxLibrary *)ours rgfxShadow] == metals);
-	NSArray<NSString *> *names = [ours.functionNames sortedArrayUsingSelector:@selector(compare:)];
-	CHECK([names isEqualToArray:[metals.functionNames sortedArrayUsingSelector:@selector(compare:)]]);
-	CHECK([names containsObject:@"stitch_add"] && [names containsObject:@"stitch_mul"]);
-	CHECK([ours newFunctionWithName:@"stitch_add"].functionType ==
-	      [metals newFunctionWithName:@"stitch_add"].functionType);
-	NSData *metalsBytes = [(id<RgfxMetalLibraryInternals>)metals libraryDataContents];
-	CHECK(made.length > 0 && [made isEqualToData:metalsBytes]);
-	auto msg = nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
-	RgfxLibraryCreate head;
-	std::memcpy(&head, msg.data(), sizeof(head));
-	CHECK(head.obj_id == [(RgfxLibrary *)ours rgfxObjId] && head.byte_length == made.length);
-	CHECK(std::memcmp(msg.data() + RGFX_LIBRARY_BYTES_OFFSET, made.bytes, made.length) == 0);
+	RgfxFunctionArrayLibrary *ours = [RgfxFunctionArrayLibrary libraryOfFunctions:@[ add, mul ]
+	                                                                       device:nil
+	                                                                        error:&err];
+	CHECK(ours != nil && err == nil);
+	CHECK([ours.functionNames isEqualToArray:(@[ @"stitch_mul", @"stitch_add" ])]);
+	CHECK([ours newFunctionWithName:@"stitch_add"] == add);
+	CHECK([ours newFunctionWithName:@"stitch_mul"] == mul && [ours newFunctionWithName:@"nope"] == nil);
+	CHECK([ours newFunctionWithName:@"stitch_mul"
+	                 constantValues:[MTLFunctionConstantValues new]
+	                          error:&err] == mul &&
+	      err == nil);
+	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+	fd.name = @"stitch_add";
+	CHECK([ours newFunctionWithDescriptor:fd error:&err] == add && err == nil);
+	auto notFound = [](NSError *e) {
+		return [e.domain isEqualToString:MTLLibraryErrorDomain] &&
+		       e.code == MTLLibraryErrorFunctionNotFound &&
+		       [e.localizedDescription isEqualToString:@"Function nope was not found in the library"];
+	};
+	fd.name = @"nope";
+	CHECK([ours newFunctionWithDescriptor:fd error:&err] == nil && notFound(err));
+	err = nil;
+	CHECK([ours newFunctionWithName:@"nope" constantValues:[MTLFunctionConstantValues new] error:&err] ==
+	          nil &&
+	      notFound(err));
+	CHECK([ours reflectionForFunctionWithName:@"stitch_add"] == nil);
+	CHECK(ours.type == MTLLibraryTypeExecutable && ours.installName == nil && ours.label == nil);
+	CHECK([ours externFunctionNames] == nil);
+	err = nil;
+	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
+	                                        stringByAppendingPathComponent:@"rgfx-array.metallib"]];
+	CHECK(![ours serializeToURL:url error:&err]);
+	CHECK(err.code == MTLLibraryErrorUnsupported &&
+	      [err.localizedDescription isEqualToString:@"MTLLibrary is not formatted as a MetalLib file."]);
+	err = nil;
+	CHECK([RgfxFunctionArrayLibrary libraryOfFunctions:(@[ add, add ]) device:nil error:&err] == nil);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorUnsupported &&
+	      [err.localizedDescription isEqualToString:@"function names must be unique"]);
+	CHECK(!fx.ring.next(&h, &drain));
+	checkDies("function-array-empty",
+	          "-[_MTLDevice(MTLDeviceInternal) newLibraryWithFunctionArray:error:]: failed "
+	          "assertion `Array must not be emty'");
 }
 
 // The library of a Metal package and of an MPS graph package (SPI) is Metal's own reading of the
@@ -13286,7 +13281,7 @@ int main(int argc, char **argv)
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();
 		test_source_compiles_through_metals_frontend();
-		test_function_array_library_over_shadows();
+		test_function_array_library_holds_the_functions();
 		test_package_libraries_answer_metals_refusals();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();

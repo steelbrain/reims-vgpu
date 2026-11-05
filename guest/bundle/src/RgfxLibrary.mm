@@ -1178,3 +1178,163 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 		[(RgfxBinaryArchive *)destination rgfxAddStitched:descriptor];
 	return lib;
 }
+
+// --- libraries of a function array -----------------------------------------------------------
+
+@implementation RgfxFunctionArrayLibrary {
+	NSArray<id<MTLFunction>> *_functions; // in the order given
+}
+
++ (instancetype)libraryOfFunctions:(NSArray<id<MTLFunction>> *)functions
+                            device:(id<MTLDevice>)device
+                             error:(__autoreleasing NSError **)error
+{
+	if (functions.count == 0)
+		RgfxMetalAssertionFailed("-[_MTLDevice(MTLDeviceInternal) newLibraryWithFunctionArray:error:]",
+		                         @"Array must not be emty");
+	NSMutableSet<NSString *> *names = [NSMutableSet setWithCapacity:functions.count];
+	for (id<MTLFunction> fn in functions) {
+		NSString *name = fn.name ?: @"";
+		if ([names containsObject:name]) {
+			if (error)
+				*error = [NSError errorWithDomain:MTLLibraryErrorDomain
+				                             code:MTLLibraryErrorUnsupported
+				                         userInfo:@{NSLocalizedDescriptionKey : @"function names must be unique"}];
+			return nil;
+		}
+		[names addObject:name];
+	}
+	RgfxFunctionArrayLibrary *lib = [[self alloc] initWithObjId:RGFX_OBJ_NONE
+	                                                     device:device
+	                                                 serializer:nullptr];
+	lib->_functions = [functions copy];
+	return lib;
+}
+
+- (id<MTLFunction>)rgfxGiven:(NSString *)name
+{
+	for (id<MTLFunction> fn in _functions)
+		if ([fn.name isEqualToString:name])
+			return fn;
+	return nil;
+}
+
+- (id<MTLFunction>)rgfxGiven:(NSString *)name error:(__autoreleasing NSError **)error
+{
+	id<MTLFunction> fn = [self rgfxGiven:name];
+	if (fn == nil && error)
+		*error = rgfxFunctionNotFound(name);
+	return fn;
+}
+
+- (NSArray<NSString *> *)functionNames
+{
+	NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:_functions.count];
+	for (id<MTLFunction> fn in _functions.reverseObjectEnumerator)
+		[names addObject:fn.name ?: @""];
+	return names;
+}
+
+- (id<MTLFunction>)newFunctionWithName:(NSString *)functionName
+{
+	return [self rgfxGiven:functionName];
+}
+
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+                        constantValues:(MTLFunctionConstantValues *)constantValues
+                                 error:(__autoreleasing NSError **)error
+{
+	(void)constantValues;
+	return [self rgfxGiven:name error:error];
+}
+
+- (void)newFunctionWithName:(NSString *)name
+             constantValues:(MTLFunctionConstantValues *)constantValues
+          completionHandler:(void (^)(id<MTLFunction> _Nullable, NSError *_Nullable))completionHandler
+{
+	name = [name copy];
+	constantValues = [constantValues copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLFunction> fn = [self newFunctionWithName:name constantValues:constantValues error:&err];
+		if (completionHandler)
+			completionHandler(fn, err);
+	});
+}
+
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor
+                                       error:(__autoreleasing NSError **)error
+{
+	return [self rgfxGiven:descriptor.name error:error];
+}
+
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor
+                completionHandler:(void (^)(id<MTLFunction> _Nullable, NSError *_Nullable))completionHandler
+{
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLFunction> fn = [self newFunctionWithDescriptor:descriptor error:&err];
+		if (completionHandler)
+			completionHandler(fn, err);
+	});
+}
+
+// Intersection functions are ray tracing's, which the device does not support, as RgfxLibrary's.
+- (id<MTLFunction>)newIntersectionFunctionWithDescriptor:(MTLIntersectionFunctionDescriptor *)descriptor
+                                                   error:(__autoreleasing NSError **)error
+{
+	RGFX_UNSUPPORTED_ERROR_IN(error, "ray tracing", MTLLibraryErrorDomain,
+	                          MTLLibraryErrorUnsupported);
+	return nil;
+}
+
+- (void)newIntersectionFunctionWithDescriptor:(MTLIntersectionFunctionDescriptor *)descriptor
+                            completionHandler:(void (^)(id<MTLFunction> _Nullable,
+                                                        NSError *_Nullable))completionHandler
+{
+	descriptor = [descriptor copy];
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		NSError *err = nil;
+		id<MTLFunction> fn = [self newIntersectionFunctionWithDescriptor:descriptor error:&err];
+		if (completionHandler)
+			completionHandler(fn, err);
+	});
+}
+
+- (MTLFunctionReflection *)reflectionForFunctionWithName:(NSString *)functionName
+{
+	(void)functionName;
+	return nil;
+}
+
+- (MTLLibraryType)type
+{
+	return MTLLibraryTypeExecutable;
+}
+
+- (NSString *)installName
+{
+	return nil;
+}
+
+- (NSArray<NSString *> *)externFunctionNames
+{
+	return nil;
+}
+
+- (BOOL)serializeToURL:(NSURL *)url error:(__autoreleasing NSError **)error
+{
+	(void)url;
+	if (error)
+		*error = [NSError
+		    errorWithDomain:MTLLibraryErrorDomain
+		               code:MTLLibraryErrorUnsupported
+		           userInfo:@{NSLocalizedDescriptionKey : @"MTLLibrary is not formatted as a MetalLib file."}];
+	return NO;
+}
+
+@end

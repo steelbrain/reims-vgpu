@@ -488,33 +488,12 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 
 // --- libraries of a function array and of packages ---------------------------
 
-// A library of the visible and stitchable functions given (newLibraryWithFunctionArray:error:,
-// SPI): Metal's own over the functions' shadows, made ours (RgfxLinkOverShadows), as both x86 Macs
-// make one (the AMD 5300M and the Intel 630 under macOS 26.7.1: oracle_bundle libforms, a library
-// of div_visible, and one of div_stitchable). Metal's assertion at an empty array is its own.
+// A library of the functions given (newLibraryWithFunctionArray:error:, SPI), which holds them
+// themselves, as both x86 Macs make one (RgfxFunctionArrayLibrary).
 - (id<MTLLibrary>)newLibraryWithFunctionArray:(NSArray<id<MTLFunction>> *)functions
                                         error:(__autoreleasing NSError **)error
 {
-	if (![IOGPUMetalDevice instancesRespondToSelector:_cmd]) {
-		RGFX_UNSUPPORTED_ERROR_IN(error, "libraries of a function array", MTLLibraryErrorDomain,
-		                          MTLLibraryErrorUnsupported);
-		return nil;
-	}
-	return RgfxLinkOverShadows(
-	    functions,
-	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
-		    return [self rgfxMetalLibraryOfFunctions:shadows error:e];
-	    },
-	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
-		    return [self newLibraryWithData:data error:e];
-	    },
-	    error);
-}
-
-- (id<MTLLibrary>)rgfxMetalLibraryOfFunctions:(NSArray<id<MTLFunction>> *)shadows
-                                        error:(__autoreleasing NSError **)error
-{
-	return [super newLibraryWithFunctionArray:shadows error:error];
+	return [RgfxFunctionArrayLibrary libraryOfFunctions:functions device:self error:error];
 }
 
 // The library of a Metal package and of an MPS graph package: Metal's own reading of the package,

@@ -263,6 +263,19 @@ patchType implemented
 stageInputAttributes unsupported a function's stage-in attributes (its reflection is not read)
 vertexAttributes unsupported a function's vertex attributes (its reflection is not read)
 
+[RgfxFunctionArrayLibrary]
+functionNames implemented
+installName metal a function array's library has no install name: both x86 Macs answer nil (measured, tools/oracle/oracle_bundle.m libforms2)
+newFunctionWithDescriptor:completionHandler: implemented
+newFunctionWithDescriptor:error: implemented
+newFunctionWithName: implemented
+newFunctionWithName:constantValues:completionHandler: implemented
+newFunctionWithName:constantValues:error: implemented
+newIntersectionFunctionWithDescriptor:completionHandler: implemented
+newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
+reflectionForFunctionWithName: metal a function array's library reflects no function: both x86 Macs answer nil (measured, tools/oracle/oracle_bundle.m libforms3)
+type metal a function array's library is executable: both x86 Macs answer MTLLibraryTypeExecutable (measured, tools/oracle/oracle_bundle.m libforms2)
+
 [RgfxHeap]
 allocatedSize implemented
 cpuCacheMode implemented
