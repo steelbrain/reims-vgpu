@@ -4504,8 +4504,9 @@ mod tests {
 
     /// A queue create whose tail holds `RGFX_QUEUE_UNSHARED` makes the platform's unshared queue,
     /// and one without it (no tail, a tail of none, or of other flags) the plain `newCommandQueue`,
-    /// each stored under its id. A queue the platform makes nothing of, either way, is refused and
-    /// stores nothing.
+    /// each stored under its id, and then its surface timeline and its device caches' end event,
+    /// the first queue's followed by the caches' transfer queue, unshared, and its event. A queue
+    /// the platform makes nothing of, either way, is refused, and stores and makes nothing more.
     #[test]
     fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
         use reims_graphics::wire::{
@@ -4552,17 +4553,18 @@ mod tests {
             let calls: Vec<&str> = p.call_log().since(mark).iter().map(|c| c.sel).collect();
             (outcome, calls)
         };
-        let plain = vec!["newCommandQueue"];
+        // A made queue's calls: the queue, its surface timeline and its end event.
+        let made = |queue: &'static str| vec![queue, "newSharedEvent", "newEvent"];
+        let plain = made("newCommandQueue");
 
         let unshared = Some(RGFX_QUEUE_UNSHARED);
-        assert_eq!(
-            decode(&mut dec, &create(1, unshared)),
-            (Ok(()), vec![UNSHARED_QUEUE])
-        );
+        let mut first = made(UNSHARED_QUEUE);
+        first.extend([UNSHARED_QUEUE, "newEvent"]);
+        assert_eq!(decode(&mut dec, &create(1, unshared)), (Ok(()), first));
         let both = Some(RGFX_QUEUE_UNSHARED | RGFX_QUEUE_QUIET_SCHEDULED);
         assert_eq!(
             decode(&mut dec, &create(2, both)),
-            (Ok(()), vec![UNSHARED_QUEUE])
+            (Ok(()), made(UNSHARED_QUEUE))
         );
         assert_eq!(decode(&mut dec, &create(3, None)), (Ok(()), plain.clone()));
         assert_eq!(
@@ -4570,7 +4572,7 @@ mod tests {
             (Ok(()), plain.clone())
         );
         let quiet = Some(RGFX_QUEUE_QUIET_SCHEDULED);
-        assert_eq!(decode(&mut dec, &create(5, quiet)), (Ok(()), plain.clone()));
+        assert_eq!(decode(&mut dec, &create(5, quiet)), (Ok(()), plain));
         for obj_id in 1..=5 {
             assert!(
                 matches!(dec.named(obj_id), Some(ObjHandle::CommandQueue(_))),
@@ -4578,7 +4580,7 @@ mod tests {
             );
         }
 
-        // Each call's nil refuses its create.
+        // Each call's nil refuses its create, before any event is made.
         p.script().push(UNSHARED_QUEUE, Step::Nil);
         assert_eq!(
             decode(&mut dec, &create(6, unshared)),
@@ -4587,7 +4589,7 @@ mod tests {
         p.script().push("newCommandQueue", Step::Nil);
         assert_eq!(
             decode(&mut dec, &create(7, None)),
-            (Err(DecodeError::Refused), plain)
+            (Err(DecodeError::Refused), vec!["newCommandQueue"])
         );
         assert!(dec.named(6).is_none() && dec.named(7).is_none());
     }
