@@ -557,14 +557,14 @@ bool rgfxDeviceLacks(uint64_t f)
 	       in(228, 236) || f == 255 || f == 262 || f == 263 || in(552, 555);
 }
 
-// The two-plane Y'CbCr formats of 4:2:0 or 4:2:2 chroma: YCBCR8_420_2P, YCBCR8_422_2P,
-// YCBCR10_420_2P, YCBCR10_422_2P and their packed and sRGB twins, and RGB8_420_2P, RGB8_422_2P,
-// RGB10_420_2P and RGB10_422_2P.
-bool rgfxChromaPairs(uint64_t f)
+// The two-plane formats: the Y'CbCr ones (YCBCR8_420_2P, YCBCR8_422_2P, YCBCR8_444_2P, the 10-bit
+// ones, their packed and sRGB twins, and the RGB8 and RGB10 ones of 4:2:0, 4:2:2 and 4:4:4
+// chroma), and RGB10A8_2P_XR10 and its sRGB twin.
+bool rgfxTwoPlaneFormat(uint64_t f)
 {
-	return f == 500 || f == 502 || f == 505 || f == 506 || f == 508 || f == 509 || f == 520 ||
-	       f == 522 || f == 525 || f == 526 || f == 528 || f == 529 || f == 540 || f == 541 ||
-	       f == 543 || f == 544;
+	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	return f == 500 || in(502, 503) || in(505, 510) || f == 520 || in(522, 523) ||
+	       in(525, 530) || in(540, 545) || in(550, 551);
 }
 
 // The depth, stencil and depth-stencil formats, and the bytes of a texel of each.
@@ -743,15 +743,10 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 	    type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
 	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
 	// The descriptor's own validation, as at every texture creator. The x86 Macs lack the
-	// two-plane Y'CbCr formats and end at every texture of one as an invalid format (Q13), where
-	// the lane makes them as the M3 Max does; but not a render target of one of 4:2:0 or 4:2:2
-	// chroma at an odd width or height, which neither the M3 nor the host makes, so the process
-	// ends there with the x86 Macs' words (oracle_surftex 420v.p0.ycbcr.*.rt, Q20).
-	const bool oddChromaTarget = rgfxChromaPairs(format) &&
-	                             (descriptor.usage & MTLTextureUsageRenderTarget) != 0 &&
-	                             (width % 2 != 0 || height % 2 != 0);
+	// two-plane formats too, and end at a texture of one over any surface or plane as an invalid
+	// format (oracle_surftex, Q13 and Q20).
 	NSMutableString *rules = [NSMutableString string];
-	if (format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) || oddChromaTarget)
+	if (format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) || rgfxTwoPlaneFormat(format))
 		[rules appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n", ull(format)];
 	if (width == 0)
 		[rules appendString:@"MTLTextureDescriptor has width of zero.\n"];

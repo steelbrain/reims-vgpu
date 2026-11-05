@@ -159,14 +159,12 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
 /// rgfxEndAtInvalidTextureDescriptor, and at a format the device lacks, a width or height of 0, a
 /// depth, array length or sample count above 1 its type does not allow, a multisample texture of
 /// 1 sample or in Shared or Managed storage, Memoryless storage, a 4:2:2 format of an odd width,
-/// and a render target of a two-plane Y'CbCr format of 4:2:0 or 4:2:2 chroma at an odd width or
-/// height (the x86 Macs end at every texture of those formats as an invalid one; the lane makes
-/// the others as the M3 Max does, Q13). Then over a surface without planes: at a type other than
-/// 2D or TextureBuffer, a depth other than 1, more than one level, rows wider than the surface's
-/// bytesPerRow (a compressed or 4:2:2 format's counted in its blocks), a depth or stencil
-/// format, a plane other than 0, and more rows than the surface's. The device's creator calls it
-/// before it sends the host anything; it returns for any other texture, which the creator makes,
-/// or answers nil for (RgfxIOSurfaceTexture).
+/// and every two-plane format, Y'CbCr or extended-range, which the x86 Macs lack (Q13). Then over
+/// a surface without planes: at a type other than 2D or TextureBuffer, a depth other than 1, more
+/// than one level, rows wider than the surface's bytesPerRow (a compressed or 4:2:2 format's
+/// counted in its blocks), a depth or stencil format, a plane other than 0, and more rows than
+/// the surface's. The device's creator calls it before it sends the host anything; it returns for
+/// any other texture, which the creator makes, or answers nil for (RgfxIOSurfaceTexture).
 void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
                                     NSUInteger plane);
 

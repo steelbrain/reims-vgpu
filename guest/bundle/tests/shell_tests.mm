@@ -1177,9 +1177,11 @@ static const SurfaceCase kSurfaceCases[] = {
      kManaged, nullptr},
     {"surface-wide-rows-made", kWideRows, 0, MTLPixelFormatBGRA8Unorm, k2D, 128, 64, 1, 1, 1, 1,
      kManaged, nullptr},
-    // The two-plane Y'CbCr formats, which the lane makes as the M3 Max does (Q13).
-    {"surface-made-ycbcr", kFlat, 0, static_cast<MTLPixelFormat>(500), k2D, 64, 64, 1, 1, 1, 1,
-     kManaged, nullptr},
+    {"surface-plane-422", kOnePlane, 0, MTLPixelFormatGBGR422, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    // A two-plane Y'CbCr format, which the x86 Macs lack (Q13), over a surface without planes.
+    {"surface-ycbcr-flat", kFlat, 0, static_cast<MTLPixelFormat>(500), k2D, 64, 64, 1, 1, 1, 1,
+     kManaged, RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (500).\n'"},
 };
 #undef RGFX_VALIDATE
 #undef RGFX_STRIDE
@@ -1229,9 +1231,10 @@ static MTLTextureDescriptor *descriptorOf(const SurfaceCase &c)
 	return td;
 }
 
-// A YCBCR8_420_2P texture `w` x `h` over plane 0 of a 64 x 64 '420v' CVPixelBuffer, a render
-// target where `target` says, through rgfxEndAtInvalidSurfaceTexture.
-static void ycbcrTarget(unsigned w, unsigned h, bool target)
+// A texture of `format`, of a two-plane Y'CbCr format or another, over plane `plane` of a
+// 64 x 64 '420v' CVPixelBuffer and of the plane's size, as a render target where `target` says,
+// through rgfxEndAtInvalidSurfaceTexture.
+static void overYCbCrPlane(uint64_t format, size_t plane, bool target)
 {
 	CVPixelBufferRef pb = nullptr;
 	NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
@@ -1239,15 +1242,21 @@ static void ycbcrTarget(unsigned w, unsigned h, bool target)
 	                          &pb) == kCVReturnSuccess);
 	IOSurfaceRef surface = CVPixelBufferGetIOSurface(pb);
 	CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == 2);
-	MTLTextureDescriptor *d =
-	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(500)
-	                                                       width:w
-	                                                      height:h
-	                                                   mipmapped:NO];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor
+	    texture2DDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(format)
+	                                 width:IOSurfaceGetWidthOfPlane(surface, plane)
+	                                height:IOSurfaceGetHeightOfPlane(surface, plane)
+	                             mipmapped:NO];
 	d.usage = MTLTextureUsageShaderRead | (target ? MTLTextureUsageRenderTarget : 0);
-	rgfxEndAtInvalidSurfaceTexture(d, surface, 0);
+	rgfxEndAtInvalidSurfaceTexture(d, surface, plane);
 	CVPixelBufferRelease(pb);
 }
+
+// The two-plane formats (RgfxTexture.mm, rgfxTwoPlaneFormat): the Y'CbCr ones and the
+// extended-range ones.
+static const uint64_t kTwoPlaneFormats[] = {500, 502, 503, 505, 506, 507, 508, 509, 510,
+                                            520, 522, 523, 525, 526, 527, 528, 529, 530,
+                                            540, 541, 542, 543, 544, 545, 550, 551};
 
 // The cases checkDies runs, each in a process of its own: each ends the process where it should,
 // else it answers 0, which its check fails.
@@ -1263,9 +1272,9 @@ static int dies_case(const char *name)
 		rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface, c.plane);
 		CFRelease(surface);
 	}
-	unsigned w = 0, h = 0;
-	if (std::sscanf(name, "surface-ycbcr-target-%ux%u", &w, &h) == 2)
-		ycbcrTarget(w, h, true);
+	unsigned format = 0, plane = 0;
+	if (std::sscanf(name, "surface-two-plane-%u-plane-%u", &format, &plane) == 2)
+		overYCbCrPlane(format, plane, plane == 0);
 	if (std::strcmp(name, "buffer-texture-levels") == 0) {
 		std::vector<uint8_t> memory(4096, 0);
 		RgfxBuffer *buf =
@@ -1719,17 +1728,22 @@ void test_invalid_surface_textures_end_the_process()
 		g_checks++;
 		CFRelease(surface);
 	}
-	// A render target of a two-plane Y'CbCr format at an odd width or height, which the x86 Macs
-	// end at as they end at every texture of the format, and the M3 Max and the host make none
-	// of; the others the lane makes as the M3 does (Q13).
-	const char *const kYCbCr = "-[MTLTextureDescriptorInternal validateWithDevice:]: failed "
-	                           "assertion `Texture Descriptor Validation\nMTLTextureDescriptor has "
-	                           "invalid pixelFormat (500).\n'";
-	checkDies("surface-ycbcr-target-63x63", kYCbCr);
-	checkDies("surface-ycbcr-target-63x64", kYCbCr);
-	checkDies("surface-ycbcr-target-64x63", kYCbCr);
-	ycbcrTarget(64, 64, true);
-	ycbcrTarget(63, 63, false);
+	// Every two-plane format over the luma plane, as a render target, and 500 over the chroma
+	// plane, ends as a format the x86 Macs lack (oracle_surftex, Q13); a plane's own formats and
+	// the one-plane 4:2:2 ones pass.
+	for (uint64_t f : kTwoPlaneFormats) {
+		const std::string words =
+		    "-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion `Texture "
+		    "Descriptor Validation\nMTLTextureDescriptor has invalid pixelFormat (" +
+		    std::to_string(f) + ").\n'";
+		checkDies(("surface-two-plane-" + std::to_string(f) + "-plane-0").c_str(), words.c_str());
+	}
+	checkDies("surface-two-plane-500-plane-1", "MTLTextureDescriptor has invalid pixelFormat "
+	                                           "(500).\n'");
+	overYCbCrPlane(MTLPixelFormatR8Unorm, 0, true);
+	overYCbCrPlane(MTLPixelFormatRG8Unorm, 1, false);
+	overYCbCrPlane(MTLPixelFormatGBGR422, 0, true);
+	overYCbCrPlane(MTLPixelFormatBGRG422, 0, false);
 	g_checks++;
 }
 

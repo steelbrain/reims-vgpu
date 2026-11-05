@@ -292,7 +292,9 @@ Stages:
       (the kext's, found by plane 0's pages; "Processes name only their
       own"), so one process's GPU writes reach another's GPU with no copy, and
       a texture over one plane that reads another (a two-plane YCbCr texture
-      over plane 0 reads plane 1's chroma) finds both in one buffer. In
+      over plane 0 would read plane 1's chroma; the bundle ends the process
+      at one, as the x86 Macs do, dgpu-oracle.md Q13) finds both in one
+      buffer. In
       either mode, its `TEXTURE_FROM_IOSURFACE` carries the surface's facts
       (`RgfxSurfaceFacts`: OSType, planes, size, plane 1's place, YCbCr
       matrix), which the host's surface creator reads as Metal reads the

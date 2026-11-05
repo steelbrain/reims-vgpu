@@ -573,10 +573,21 @@ quadrant's middle. Each case runs in a child process.
 | the texture | the process ends at the create: "MTLTextureDescriptor has invalid pixelFormat (500)." | the same | made |
 | what it reads | | | the codes converted by the surface's range and matrix, within one level on every channel: BT.709 under ITU_R_709_2, BT.601 under ITU_R_601_4 and with no matrix |
 
-The surface reads back the matrix as set, by either route, on all three. *(class 2: the
-two-plane Y'CbCr formats are the M3's alone; a guest that made one on an x86 Mac would end its
-process.)* Our stack makes them as the M3 does (the host's surface creator converts by the
-surface's facts, `RgfxSurfaceFacts`).
+The surface reads back the matrix as set, by either route, on all three.
+
+*(class 3 for this lane; reversed 11-05.)* Both x86 Macs end the process at every two-plane
+texture: oracle_surftex (Q20) measured "MTLTextureDescriptor has invalid pixelFormat (N)." at each
+two-plane Y'CbCr format (500, 502, 503, 505 to 510, 520, 522, 523, 525 to 530, 540 to 545) and at
+the extended-range RGB10A8_2P_XR10 and its sRGB twin (550, 551), over a 420v surface's planes, a
+one-plane surface and a surface without planes. Until 11-05 the lane read the formats as the M3's
+alone *(class 2)* and made them as the M3 does. The lane imitates the x86 dGPU Macs, so where both
+agree their answer is the contract, and the M3's making is outside the lane's envelope: the
+device's creator now ends the process at each with the x86 Macs' words, before the host is sent
+anything (`rgfxEndAtInvalidSurfaceTexture`, RgfxTexture.h). The surface facts a texture's create
+carries (`RgfxSurfaceFacts`) and the host's conversion by them stay; no texture on the lane
+reaches the conversion. No code of the bundle makes such a texture (its video decoder lands
+pictures through R8, RG8, R16 and RG16 textures over the planes), and boot ycc4 below traced no
+guest process making one; a boot is the check of what the guest's frameworks choose.
 
 Where the guest meets Y'CbCr on the desktop (boot ycc4, 11-02, with the bundle's texture creates
 traced): the default wallpaper is an aerial, a 3840 x 2160 frame of OSType `x420` (10-bit 4:2:0,
@@ -900,7 +911,7 @@ inside the envelope *(class 2)*.
 
 ## Q20: which textures over an IOSurface Metal makes, answers nil for, or ends the process at
 
-Probe: `oracle_surftex DEVICE`, 11-05, each of its 151 cases in a child process of its own, with
+Probe: `oracle_surftex DEVICE`, 11-05, each of its 178 cases in a child process of its own, with
 `MTL_DEBUG_LAYER` unset. `newTextureWithDescriptor:iosurface:plane:` over a 64 x 64 surface:
 `'BGRA'`, `'RGhA'` and `'L008'` made without planes (`IOSurfaceCreate`, as WindowServer's
 surfaces are), `'BGRA'` of one plane, `'BGRA'` without planes of 512-byte rows, and a `420v`
@@ -913,7 +924,7 @@ assertion lists every rule of one step a descriptor breaks, a line each. There a
 
 | step | what ends the process there (AMD and Intel 630) | M3 |
 |---|---|---|
-| the descriptor's validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, over every surface | a width or height of 0; a format the device lacks, named by number ("has invalid pixelFormat (40)": B5G6R5, BGRA10_XR, BGR10_XR, Invalid, and the two-plane Y'CbCr 500); a depth, array length or sample count above 1 that the type does not allow, the type named ("requests a depth of 2 but the texture type MTLTextureType2DArray requires that depth is 1"); a multisample texture of one sample, or in Shared or Managed storage; Memoryless storage; a depth or stencil format in Shared or Managed storage; a 4:2:2 format of an odd width ("MTLPixelFormat422 requires even width.") | the same, but it makes B5G6R5, BGR10_XR, the Y'CbCr formats (Q13) and Memoryless textures, and passes multisample ones in Managed storage on to the next step |
+| the descriptor's validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, over every surface | a width or height of 0; a format the device lacks, named by number ("has invalid pixelFormat (40)": B5G6R5, BGRA10_XR, BGR10_XR, Invalid, and every two-plane format, Y'CbCr or extended-range, over any plane); a depth, array length or sample count above 1 that the type does not allow, the type named ("requests a depth of 2 but the texture type MTLTextureType2DArray requires that depth is 1"); a multisample texture of one sample, or in Shared or Managed storage; Memoryless storage; a depth or stencil format in Shared or Managed storage; a 4:2:2 format of an odd width ("MTLPixelFormat422 requires even width.") | the same, but it makes B5G6R5, BGR10_XR, every two-plane format (Q13) and Memoryless textures, and passes multisample ones in Managed storage on to the next step |
 | the surface's rows, `_mtlValidateStrideTextureParameters`, over a surface without planes | a type other than 2D or TextureBuffer; a depth other than 1; more than one level; rows of a format of one texel a block wider than the surface's `bytesPerRow` ("bytesPerRow (256) must be greater or equal to (260) bytes"); a depth or stencil format ("cannot create compressed, depth, or stencil textures", though BC1 and BC7 pass) | the same, in the same words |
 | the texture's place, `-[MTLIOAccelTexture initWithDevice:descriptor:iosurface:plane:...]`, over a surface without planes | a plane other than 0 ("IOSurface is non-planar, but plane 2 specified"); a compressed format's rows, in blocks, wider than the surface's ("Descriptor rowBytes (264) > IOSurface rowBytes (256)" at BC1 132 wide); more rows than the surface's, a compressed format's in texels ("Descriptor height*arrayLength > IOSurface height") | the same, `IOGPUMetalTexture`'s |
 
@@ -938,11 +949,8 @@ What our stack does:
 - *(class 3)* The device's creator ends the process at every rule the x86 Macs end it at, with
   their words, before it sends the host anything (`rgfxEndAtInvalidSurfaceTexture`,
   RgfxTexture.h). The bundle had sent each of these to the host, posted, and answered a texture;
-  the host refused most, and the guest's command buffers naming the texture then failed.
-- The two-plane Y'CbCr formats stay the M3's (Q13), but for a render target of 4:2:0 or 4:2:2
-  chroma at an odd width or height. The x86 Macs end at it, as at every texture of the formats
-  ("invalid pixelFormat (500)."), and neither the M3 (nil) nor the host makes one, so the process
-  ends there with the x86 Macs' words.
+  the host refused most, and the guest's command buffers naming the texture then failed. That
+  includes every two-plane format, which the lane made as the M3 does until 11-05 (Q13).
 - *(outside the envelope, the host's limit)* A block-compressed format over a surface answers
   nil (`RgfxIOSurfaceTexture`). Both x86 Macs make it wherever its rows fit, but the host makes no
   texture of one over a surface's rows (metal2vulkan's `NotLinear`), and a texture the host then
