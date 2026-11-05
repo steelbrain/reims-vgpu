@@ -6360,8 +6360,8 @@ mod tests {
             .count()
     }
 
-    /// What a test's sink was posted, in order.
-    type Posted<T> = Arc<Mutex<Vec<T>>>;
+    /// What a sink of [`splitting`]'s was handed, in order.
+    type Sunk<T> = Arc<Mutex<Vec<T>>>;
 
     /// A decoder of [`setup`]'s, its messages of context 0, on a platform that splits command
     /// buffers, whose clock moves on [`SPLIT_AFTER`] after each op a walk carries out, so every
@@ -6369,8 +6369,8 @@ mod tests {
     fn splitting() -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
-        Posted<(u32, u64, u32)>,
-        Posted<RgfxCbComplete>,
+        Sunk<(u32, u64, u32)>,
+        Sunk<RgfxCbComplete>,
     ) {
         let (p, mut dec) = setup();
         dec.set_context(Some(0));
