@@ -60,8 +60,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 /// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 /// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
-/// [`RGFX_FEATURE_SURFACE_DEFERRED`] and [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`]). Bits 9 and 10
-/// are reserved.
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`] and
+/// [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -180,6 +180,12 @@ pub const RGFX_FEATURE_SURFACE_DEFERRED: u32 = 1 << 19;
 /// buffer's span, which holds the copy only where the buffer lies over its own block. Every host
 /// offers it.
 pub const RGFX_FEATURE_MANAGED_TEXTURE_SLABS: u32 = 1 << 21;
+/// `FEATURES_LO` bit 24, `DISPLAY_COLOR`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_DISPLAY_COLOR`], the colour stages a
+/// display pipe transaction sets (its gamma tables and its colour matrix), and a
+/// `PRESENT_SURFACE` may carry [`RGFX_PRESENT_KEEP`], the present of a transaction that shows no
+/// new surface. Every host offers it; one with no window answers its presents at once.
+pub const RGFX_FEATURE_DISPLAY_COLOR: u32 = 1 << 24;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -361,6 +367,9 @@ pub const RGFX_CMD_MOVE_CURSOR: u32 = 4;
 pub const RGFX_CMD_SET_VBLANK: u32 = 5;
 /// Command `PRESENT_SURFACE` ([`RgfxPresentSurface`]): answered by [`RGFX_EVT_COMPLETE`].
 pub const RGFX_CMD_PRESENT_SURFACE: u32 = 6;
+/// Command `DISPLAY_COLOR` ([`RgfxDisplayColor`]), where the guest took
+/// [`RGFX_FEATURE_DISPLAY_COLOR`]: not answered.
+pub const RGFX_CMD_DISPLAY_COLOR: u32 = 7;
 /// Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 pub const RGFX_EVT_COMPLETE: u32 = 0x100;
 /// Event `DISPLAYS` ([`RgfxDisplays`]): `GET_DISPLAYS`'s answer, with its `seqno`.
@@ -854,9 +863,16 @@ pub struct RgfxPresentSurface {
     pub iosurface_id: u32,
     /// The display pipe's transaction ID, for the host's log.
     pub transaction_id: u32,
-    /// Pads the message to a multiple of 8; 0.
-    pub reserved_1c: u32,
+    /// [`RGFX_PRESENT_KEEP`], where the guest took [`RGFX_FEATURE_DISPLAY_COLOR`]; 0 otherwise.
+    /// A present with any other bit is refused [`RGFX_STATUS_INVALID_ARGUMENT`].
+    pub flags: u32,
 }
+
+/// [`RgfxPresentSurface::flags`]: the display keeps what it shows, a surface or the scanout, and
+/// `iosurface_id` is 0. The present changes only the colour the `DISPLAY_COLOR`s before it staged,
+/// and is answered as any present is, once the display shows it. One with a nonzero
+/// `iosurface_id` is refused [`RGFX_STATUS_INVALID_ARGUMENT`].
+pub const RGFX_PRESENT_KEEP: u32 = 1 << 0;
 
 /// Where a `PRESENT_SURFACE` message's [`RgfxPresentSurfaceGen`] starts: right after its
 /// [`RgfxPresentSurface`]. A message whose `size` is at least
@@ -874,6 +890,75 @@ pub const RGFX_PRESENT_SURFACE_GEN_OFFSET: u32 = 32;
 pub struct RgfxPresentSurfaceGen {
     /// The kext's count of the surface's read-write CPU locks.
     pub cpu_gen: u64,
+}
+
+/// [`RgfxDisplayColor::stage`]: plane 0's gamma table, the display pipe's
+/// `IOAccelDisplayPlaneGammaTable`, the first stage.
+pub const RGFX_COLOR_PLANE_GAMMA: u32 = 0;
+/// [`RgfxDisplayColor::stage`]: the pipe's gamma table before its colour matrix
+/// (`TransactionSetPipePreGammaTable`), the second stage.
+pub const RGFX_COLOR_PRE_GAMMA: u32 = 1;
+/// [`RgfxDisplayColor::stage`]: the pipe's colour matrix (`TransactionSetPipeColorMatrix`), the
+/// third stage: three entries, the transaction's twelve floats as it carries them, a row each:
+/// output channel `i` is `entry[i][0] * red + entry[i][1] * green + entry[i][2] * blue +
+/// entry[i][3]`.
+pub const RGFX_COLOR_MATRIX: u32 = 2;
+/// [`RgfxDisplayColor::stage`]: the pipe's gamma table after its colour matrix
+/// (`TransactionSetPipePostGammaTable`), the last stage.
+pub const RGFX_COLOR_POST_GAMMA: u32 = 3;
+/// The most entries one `DISPLAY_COLOR` message carries.
+pub const RGFX_COLOR_PART_ENTRIES: u32 = 256;
+/// The most entries a stage's table holds: the display pipe's own limit.
+pub const RGFX_COLOR_MAX_ENTRIES: u32 = 0x20000;
+
+/// `DISPLAY_COLOR`: part of one colour stage of display `display`, set by display pipe
+/// transaction `transaction_id`: the `part_entries` [`RgfxColorEntry`]s that follow the message's
+/// fields, entries `first_entry` on of the stage's `entry_count`. A stage's parts come in order,
+/// the first at entry 0; a stage of 0 entries is off (it passes its input through). The host
+/// stages each stage whole, and the next `PRESENT_SURFACE` it accepts sets the stages staged
+/// since the last one, as the display shows that present (a refused one leaves them staged): a
+/// stage no `DISPLAY_COLOR` sets keeps its table. A gamma stage's entry `k` of `n` is the output
+/// at input `k / (n - 1)`, its `x`, `y` and `z` red, green and blue; the host interpolates
+/// between entries, and clamps its input to [0, 1]. The stages apply in their order, after the
+/// surface's own colour: plane gamma, pre-gamma, matrix, post-gamma. A part out of order, past
+/// `RGFX_COLOR_MAX_ENTRIES` or of more than `RGFX_COLOR_PART_ENTRIES` entries, or a matrix of
+/// other than 3 or 0 entries, drops its stage's staged parts, and the stage keeps its table. A
+/// present that comes before all of a stage's parts drops them too. Not answered.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxDisplayColor {
+    /// [`RGFX_CMD_DISPLAY_COLOR`].
+    pub header: RgfxMsgHeader,
+    /// The display's id.
+    pub display: u32,
+    /// The display pipe's transaction ID, for the host's log.
+    pub transaction_id: u32,
+    /// An `RGFX_COLOR_*` stage.
+    pub stage: u32,
+    /// The stage's entries in all.
+    pub entry_count: u32,
+    /// This part's first entry.
+    pub first_entry: u32,
+    /// The entries this part carries, after the message's fields.
+    pub part_entries: u32,
+}
+
+/// One entry of a [`RgfxDisplayColor`] stage: four `f32`s, as bits.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxColorEntry {
+    /// The first `f32`, as bits: a gamma entry's red.
+    pub x: u32,
+    /// The second, as bits: green.
+    pub y: u32,
+    /// The third, as bits: blue.
+    pub z: u32,
+    /// The fourth, as bits: unused by a gamma entry.
+    pub w: u32,
 }
 
 /// `COMPLETE`: a command's answer.
@@ -984,6 +1069,8 @@ const _: () = {
     assert!(size_of::<RgfxMoveCursor>() == 32);
     assert!(size_of::<RgfxSetVblank>() == 24);
     assert!(size_of::<RgfxPresentSurface>() == 32);
+    assert!(size_of::<RgfxDisplayColor>() == 40);
+    assert!(size_of::<RgfxColorEntry>() == 16);
     assert!(size_of::<RgfxComplete>() == 24);
     assert!(offset_of!(RgfxDisplays, count) + 4 == RGFX_DISPLAYS_ENTRIES_OFFSET as usize);
     assert!(size_of::<RgfxDisplayEntry>() == 16);

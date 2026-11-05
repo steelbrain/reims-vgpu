@@ -791,6 +791,11 @@ only where no negotiation can carry it.
   and writes the copy where the buffer's contents lie, so the bundle takes a
   Managed texture's CPU copy from its slabs ("Managed storage", below). Every
   host offers it, and the kext takes it.
+- Bit 24 is `DISPLAY_COLOR`: the guest sends the display pipe's gamma tables
+  and colour matrix as `DISPLAY_COLOR` parts, which the next `PRESENT_SURFACE`
+  shows, and a present may keep the surface shown and change only the colour
+  (`RGFX_PRESENT_KEEP`; "The display's colour", below). Every host offers it;
+  one with no window answers its presents at once.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -888,7 +893,7 @@ after the surface's `SURFACE_PAGES` was answered: what the buffer reads of the
 surface the host made there, and the buffer names none of the other process's
 objects, so it waits for its own context's share and for none of the other
 process's messages. Shared events and textures do not cross processes. A
-display command (`GET_DISPLAYS` to `PRESENT_SURFACE`) or a `SURFACE_DOWNLOAD`
+display command (`GET_DISPLAYS` to `DISPLAY_COLOR`) or a `SURFACE_DOWNLOAD`
 holds up no buffer: none reads what they make. A present waits for the writers
 the guest's record of its surface names, whatever the host has taken. A
 download waits for the buffers that used the surface's device cache before it
@@ -909,8 +914,9 @@ and `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
 out only the display commands itself. It hands each context's messages, in ring
 order, to that context's lane, a thread of its own
 (`reims-vgpu.graphics-context-<n>`, made as a message comes to a lane with
-none, gone after 1 s with none), every `PRESENT_SURFACE` to the presents'
-lane (`reims-vgpu.graphics-presents`), and every `SURFACE_PAGES` and
+none, gone after 1 s with none), every `PRESENT_SURFACE` and
+`DISPLAY_COLOR` to the presents' lane (`reims-vgpu.graphics-presents`), in
+ring order, and every `SURFACE_PAGES` and
 `SURFACE_DOWNLOAD` to the lane of the block it names
 (`reims-vgpu.graphics-block-<offset>`), whichever process posted it and for
 whichever context, so a block's pages handed over from another process's CPU

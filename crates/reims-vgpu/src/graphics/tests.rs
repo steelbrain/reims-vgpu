@@ -1822,7 +1822,7 @@ fn a_present_needs_the_surface_s_texture() {
             display: 0,
             iosurface_id: id,
             transaction_id: 1,
-            reserved_1c: 0,
+            flags: 0,
         }
         .as_bytes()
         .to_vec()
@@ -5631,7 +5631,7 @@ fn present_surface(id: u32) -> Vec<u8> {
         display: 0,
         iosurface_id: id,
         transaction_id: 1,
-        reserved_1c: 0,
+        flags: 0,
     }
     .as_bytes()
     .to_vec()

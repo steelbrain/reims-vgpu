@@ -5,11 +5,11 @@
 //! **Lanes.** The control thread takes ring 0 in ring order, as before, and hands each
 //! `SURFACE_PAGES` and `SURFACE_DOWNLOAD` to the lane of the block it names, each other
 //! object-lifecycle message of a context's ([`backlog`](super::backlog)'s `Whose::Context`) to
-//! the context's lane, and each `PRESENT_SURFACE` to the presents' lane. A lane carries its jobs
-//! out one at a time, in the order they were handed, on a thread made as a job comes to a lane
-//! with none, which goes once the lane has had no job for [`IDLE`]. The control thread carries
-//! the rest out itself: the display commands, and a message no lane is for, which the host
-//! refuses.
+//! the context's lane, and each `PRESENT_SURFACE`, with the `DISPLAY_COLOR`s that stage its
+//! colour, to the presents' lane. A lane carries its jobs out one at a time, in the order they
+//! were handed, on a thread made as a job comes to a lane with none, which goes once the lane has
+//! had no job for [`IDLE`]. The control thread carries the rest out itself: the display commands,
+//! and a message no lane is for, which the host refuses.
 //!
 //! A block's lane keeps the messages that make and copy what the host holds of the block's pages
 //! (its view and device cache) in ring order, whichever process posted them and for whichever
@@ -111,7 +111,8 @@ pub(super) const IDLE: Duration = Duration::from_secs(1);
 pub(super) enum Key {
     /// A context's: its object-lifecycle messages but those of a block's lane.
     Context(u32),
-    /// The presents': every `PRESENT_SURFACE`, in ring order.
+    /// The presents': every `PRESENT_SURFACE`, and every `DISPLAY_COLOR`, which stages the
+    /// colour of the present after it, in ring order.
     Presents,
     /// The block's at this region offset: every `SURFACE_PAGES` and `SURFACE_DOWNLOAD` of it, in
     /// ring order.
@@ -121,11 +122,11 @@ pub(super) enum Key {
 impl Key {
     /// The lane `message` is handed to, where one is: a block's for a `SURFACE_PAGES` or a
     /// `SURFACE_DOWNLOAD` long enough to name it, a context's for its other object-lifecycle
-    /// messages, the presents' for a `PRESENT_SURFACE`; `None` for what the control thread
-    /// carries out itself.
+    /// messages, the presents' for a `PRESENT_SURFACE` or a `DISPLAY_COLOR`; `None` for what the
+    /// control thread carries out itself.
     pub(super) fn of(message: &Message) -> Option<Key> {
         match message.header.r#type {
-            RGFX_CMD_PRESENT_SURFACE => return Some(Key::Presents),
+            RGFX_CMD_PRESENT_SURFACE | RGFX_CMD_DISPLAY_COLOR => return Some(Key::Presents),
             RGFX_CMD_SURFACE_PAGES | RGFX_CMD_SURFACE_DOWNLOAD => {
                 if let Some(block) = block_of(message) {
                     return Some(Key::Block(block));
@@ -449,6 +450,10 @@ impl State {
         message: &Message,
         surface_textures: impl FnOnce(u32) -> Vec<u64>,
     ) -> Vec<(Key, u64)> {
+        // A `DISPLAY_COLOR` waits for nothing but the presents' lane's order.
+        if message.header.r#type != RGFX_CMD_PRESENT_SURFACE {
+            return Vec::new();
+        }
         let Some(present) = read::<RgfxPresentSurface>(message) else {
             return Vec::new();
         };

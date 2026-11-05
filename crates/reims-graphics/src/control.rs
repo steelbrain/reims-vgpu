@@ -46,20 +46,25 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
 /// Whether `message` is carried out with no ring held ([`unheld`]): the object lifecycle the
 /// accelerator kext posts on ring 0 (every stage-3 type from `QUEUE_CREATE` below
 /// `COMMAND_BUFFER`), and `PRESENT_SURFACE`, which the host may answer at once, raising the
-/// interrupt, or carry out under locks of its own.
+/// interrupt, or carry out under locks of its own, with the `DISPLAY_COLOR`s that stage its
+/// colour, which ride the presents' lane with it.
 pub(crate) fn is_unheld(message: &Message) -> bool {
     (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_COMMAND_BUFFER).contains(&message.header.r#type)
         || message.header.r#type == RGFX_CMD_PRESENT_SURFACE
+        || message.header.r#type == RGFX_CMD_DISPLAY_COLOR
 }
 
 /// Carries out one message [`is_unheld`] names, with no ring held, taken at reset count `epoch`:
 /// what answers it, or `None` for one the host answers itself or not at all. The answers the host
 /// gives are at `epoch`, so they are dropped where a reset came after the message was taken.
 pub(crate) fn unheld(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
-    if message.header.r#type == RGFX_CMD_PRESENT_SURFACE {
-        present(shared, message, epoch)
-    } else {
-        lifecycle(shared, message, epoch)
+    match message.header.r#type {
+        RGFX_CMD_PRESENT_SURFACE => present(shared, message, epoch),
+        RGFX_CMD_DISPLAY_COLOR => {
+            display_color(shared, message);
+            None
+        }
+        _ => lifecycle(shared, message, epoch),
     }
 }
 
@@ -319,7 +324,25 @@ fn set_cursor(shared: &Shared, command: &RgfxSetCursor) -> u32 {
 fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
     let seqno = message.header.seqno;
     let status = match read::<RgfxPresentSurface>(message) {
+        // A bit the wire does not name, or a kept present that names a surface.
+        Some(command)
+            if command.flags & !RGFX_PRESENT_KEEP != 0
+                || (command.flags & RGFX_PRESENT_KEEP != 0 && command.iosurface_id != 0) =>
+        {
+            RGFX_STATUS_INVALID_ARGUMENT
+        }
         Some(command) if command.display == 0 => {
+            if command.flags & RGFX_PRESENT_KEEP != 0 {
+                log::trace!(
+                    target: "reims_graphics",
+                    "PRESENT_SURFACE of transaction {}: the display keeps what it shows",
+                    command.transaction_id
+                );
+                shared
+                    .host
+                    .present_keep(shared.complete_answer(seqno, epoch));
+                return None;
+            }
             let generation =
                 read_at::<RgfxPresentSurfaceGen>(message, RGFX_PRESENT_SURFACE_GEN_OFFSET)
                     .map(|g| g.cpu_gen);
@@ -330,6 +353,45 @@ fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
         None => RGFX_STATUS_INVALID_ARGUMENT,
     };
     Some(complete(seqno, status))
+}
+
+/// `DISPLAY_COLOR`, on the presents' lane: its fields and entries to the host, which stages them
+/// (`Host::display_color`). Not answered: one for another display, or shorter than the entries it
+/// names, or naming more than [`RGFX_COLOR_PART_ENTRIES`], is logged and dropped.
+fn display_color(shared: &Shared, message: &Message) {
+    let Some(color) = read::<RgfxDisplayColor>(message) else {
+        log::warn!(target: "reims_graphics", "a DISPLAY_COLOR shorter than its fields was dropped");
+        return;
+    };
+    let fields = size_of::<RgfxDisplayColor>();
+    let entries = (color.part_entries <= RGFX_COLOR_PART_ENTRIES)
+        .then(|| {
+            const ENTRY: usize = size_of::<RgfxColorEntry>();
+            let length = color.part_entries as usize * ENTRY;
+            let bytes = message.bytes.get(fields..fields.checked_add(length)?)?;
+            let (entries, _) = bytes.as_chunks::<ENTRY>();
+            entries
+                .iter()
+                .map(|entry| RgfxColorEntry::read_from_bytes(entry).ok())
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
+    match entries {
+        Some(entries) if color.display == 0 => shared.host.display_color(&color, &entries),
+        Some(_) => log::warn!(
+            target: "reims_graphics",
+            "a DISPLAY_COLOR of display {} (transaction {}) was dropped: there is no such display",
+            color.display,
+            color.transaction_id
+        ),
+        None => log::warn!(
+            target: "reims_graphics",
+            "a DISPLAY_COLOR of transaction {} naming {} entries was dropped: the message does \
+             not carry them, or they are past {RGFX_COLOR_PART_ENTRIES}",
+            color.transaction_id,
+            color.part_entries
+        ),
+    }
 }
 
 /// `PRESENT_SURFACE` on display 0: the host answers once it shows the surface, or refuses it

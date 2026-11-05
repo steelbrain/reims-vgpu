@@ -51,6 +51,20 @@ impl Screen for TestScreen {
 /// The surfaces a host was asked to show, each with the CPU generation its present carried.
 type Presented = Arc<Mutex<Vec<(u32, Option<u64>)>>>;
 
+/// What a host was handed on the presents' lane, in order: a present of a surface, a kept
+/// present, and a colour part (its stage, first entry, entries carried and the first's red).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    Present(u32),
+    Keep,
+    Color {
+        stage: u32,
+        first: u32,
+        entries: usize,
+        red: u32,
+    },
+}
+
 /// A host that counts its interrupts and answers whether the scanout was written as the test
 /// sets it.
 struct TestHost {
@@ -59,6 +73,7 @@ struct TestHost {
     asked: Arc<Mutex<Vec<(u64, u64)>>>,
     presented: Presented,
     refreshes: Arc<AtomicU32>,
+    seen: Arc<Mutex<Vec<Seen>>>,
 }
 
 /// The one IOSurface the test host holds a texture over.
@@ -78,10 +93,23 @@ impl Host for TestHost {
     }
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         self.presented.lock().push((iosurface_id, generation));
+        self.seen.lock().push(Seen::Present(iosurface_id));
         answer.answer(if iosurface_id == 0 || iosurface_id == HELD_SURFACE {
             RGFX_STATUS_OK
         } else {
             RGFX_STATUS_INVALID_ARGUMENT
+        });
+    }
+    fn present_keep(&self, answer: PresentAnswer) {
+        self.seen.lock().push(Seen::Keep);
+        answer.answer(RGFX_STATUS_OK);
+    }
+    fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
+        self.seen.lock().push(Seen::Color {
+            stage: color.stage,
+            first: color.first_entry,
+            entries: entries.len(),
+            red: entries.first().map_or(0, |e| e.x),
         });
     }
 }
@@ -97,6 +125,8 @@ struct Rig {
     presented: Presented,
     /// The refreshes the host was told of.
     refreshes: Arc<AtomicU32>,
+    /// What the host was handed on the presents' lane.
+    seen: Arc<Mutex<Vec<Seen>>>,
     /// The guest's count of the submission ring.
     produced: u64,
     /// The guest's count of the completion ring.
@@ -117,12 +147,14 @@ impl Rig {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let presented = Arc::new(Mutex::new(Vec::new()));
         let refreshes = Arc::new(AtomicU32::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let host = TestHost {
             interrupts: Arc::clone(&interrupts),
             written: Arc::clone(&written),
             asked: Arc::clone(&asked),
             presented: Arc::clone(&presented),
             refreshes: Arc::clone(&refreshes),
+            seen: Arc::clone(&seen),
         };
         let mut rig = Rig::with_host(Box::new(host));
         rig.interrupts = interrupts;
@@ -130,6 +162,7 @@ impl Rig {
         rig.asked = asked;
         rig.presented = presented;
         rig.refreshes = refreshes;
+        rig.seen = seen;
         rig
     }
 
@@ -160,6 +193,7 @@ impl Rig {
             asked,
             presented,
             refreshes: Arc::new(AtomicU32::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
             produced: 0,
             consumed: 0,
             seqno: 0,
@@ -342,9 +376,101 @@ fn present_surface(display: u32, iosurface_id: u32) -> Vec<u8> {
         display,
         iosurface_id,
         transaction_id: 9,
-        reserved_1c: 0,
+        flags: 0,
     };
     c.as_bytes().to_vec()
+}
+
+/// A `PRESENT_SURFACE` of display 0 with `flags`.
+fn present_with_flags(iosurface_id: u32, flags: u32) -> Vec<u8> {
+    let mut c = RgfxPresentSurface::read_from_bytes(&present_surface(0, iosurface_id)).unwrap();
+    c.flags = flags;
+    c.as_bytes().to_vec()
+}
+
+/// A `DISPLAY_COLOR` of `display`'s `stage`, entries `first` on of `count`, carrying `part`
+/// entries, entry `k`'s red `first + k` as bits.
+fn display_color(display: u32, stage: u32, count: u32, first: u32, part: u32) -> Vec<u8> {
+    let c = RgfxDisplayColor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_DISPLAY_COLOR,
+            ..Default::default()
+        },
+        display,
+        transaction_id: 9,
+        stage,
+        entry_count: count,
+        first_entry: first,
+        part_entries: part,
+    };
+    let mut bytes = c.as_bytes().to_vec();
+    for k in 0..part {
+        let entry = RgfxColorEntry {
+            x: first + k,
+            ..Default::default()
+        };
+        bytes.extend_from_slice(entry.as_bytes());
+    }
+    bytes
+}
+
+/// A table's `DISPLAY_COLOR`s reach the host in ring order, unanswered, on the presents' lane
+/// before the present after them, and a kept present (`RGFX_PRESENT_KEEP`) is the host's
+/// `present_keep`, answered with its word, as a present of a surface is.
+#[test]
+fn display_colors_reach_the_host_before_the_present_after_them() {
+    let mut rig = Rig::new();
+    rig.start();
+    rig.send(display_color(0, RGFX_COLOR_POST_GAMMA, 300, 0, 256));
+    rig.send(display_color(0, RGFX_COLOR_POST_GAMMA, 300, 256, 44));
+    let seqno = rig.send(present_with_flags(0, RGFX_PRESENT_KEEP));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    rig.send(display_color(0, RGFX_COLOR_MATRIX, 3, 0, 3));
+    let seqno = rig.send(present_surface(0, HELD_SURFACE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    let color = |stage, first, entries| Seen::Color {
+        stage,
+        first,
+        entries,
+        red: first,
+    };
+    assert_eq!(
+        *rig.seen.lock(),
+        [
+            color(RGFX_COLOR_POST_GAMMA, 0, 256),
+            color(RGFX_COLOR_POST_GAMMA, 256, 44),
+            Seen::Keep,
+            color(RGFX_COLOR_MATRIX, 0, 3),
+            Seen::Present(HELD_SURFACE),
+        ]
+    );
+}
+
+/// A kept present that names a surface, and a present with a flag the wire does not name, are
+/// refused before the host is asked; a `DISPLAY_COLOR` of another display, one shorter than the
+/// entries it names, and one naming more than a part may carry, are dropped unanswered.
+#[test]
+fn malformed_colors_and_kept_presents_are_refused() {
+    let mut rig = Rig::new();
+    rig.start();
+    let seqno = rig.send(present_with_flags(HELD_SURFACE, RGFX_PRESENT_KEEP));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    let seqno = rig.send(present_with_flags(0, 1 << 1));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    rig.send(display_color(1, RGFX_COLOR_POST_GAMMA, 2, 0, 2));
+    let mut short = display_color(0, RGFX_COLOR_POST_GAMMA, 2, 0, 2);
+    short.truncate(size_of::<RgfxDisplayColor>() + size_of::<RgfxColorEntry>());
+    rig.send(short);
+    rig.send(display_color(
+        0,
+        RGFX_COLOR_POST_GAMMA,
+        1024,
+        0,
+        RGFX_COLOR_PART_ENTRIES + 1,
+    ));
+    let seqno = rig.send(present_with_flags(0, RGFX_PRESENT_KEEP));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(*rig.seen.lock(), [Seen::Keep]);
 }
 
 /// `PRESENT_SURFACE` hands display 0's surface to the host and answers whether it shows it: a

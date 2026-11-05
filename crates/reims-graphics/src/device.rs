@@ -220,7 +220,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8, 11 to 19 and 21.
+/// `RGFX_FEATURE_*`, bits 0 to 8, 11 to 19, 21 and 24.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -239,7 +239,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_ICB_SLOTS
     | RGFX_FEATURE_COMMIT_ORDER
     | RGFX_FEATURE_SURFACE_DEFERRED
-    | RGFX_FEATURE_MANAGED_TEXTURE_SLABS) as u64;
+    | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
+    | RGFX_FEATURE_DISPLAY_COLOR) as u64;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -474,6 +475,23 @@ pub trait Host: Send + Sync + 'static {
         } else {
             RGFX_STATUS_INVALID_ARGUMENT
         });
+    }
+
+    /// A present that keeps what display 0 shows (`PRESENT_SURFACE` with [`RGFX_PRESENT_KEEP`]),
+    /// on the presents' lane, in ring order: the colour staged since the last present
+    /// ([`Host::display_color`]) applies as the display shows it, and `answer` is given then, as
+    /// [`Host::present_surface`] gives its. The default answers [`RGFX_STATUS_OK`] at once.
+    fn present_keep(&self, answer: PresentAnswer) {
+        answer.answer(RGFX_STATUS_OK);
+    }
+
+    /// Part of one colour stage of display 0 (`DISPLAY_COLOR`), its fields and the entries it
+    /// carries, on the presents' lane, in ring order with the presents: the host stages it, and
+    /// the next present ([`Host::present_surface`], [`Host::present_keep`]) sets the stages staged
+    /// whole, as the display shows that present. Not answered. The default drops it, for a host
+    /// with no window.
+    fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
+        let _ = (color, entries);
     }
 }
 
