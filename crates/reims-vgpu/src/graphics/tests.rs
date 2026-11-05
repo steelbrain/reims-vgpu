@@ -4755,6 +4755,45 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert_eq!(device.control.pool.favoured(), None);
 }
 
+/// A failure the host posts at once, ahead of the buffers before it on its queue, says nothing of
+/// them: a present waiting for the earlier buffer that wrote its surface still waits for that
+/// buffer to finish, and is shown only then
+#[test]
+fn a_later_buffer_failed_at_once_shows_no_present_of_an_earlier_writer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    // Buffer 4 draws the surface; buffer 5, on the same ring, names a queue that is not the
+    // ring's, so the host neither carries it out nor stands in for it, and fails it at once.
+    ring.publish(command_buffer_at(obj(1, 1), 100, 4));
+    ring.publish(command_buffer_at(obj(1, 9), 101, 5));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 4)]);
+    guest.send(&device, present_surface(0x77));
+    presents_waiting(&device, 1);
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT as u32);
+    let ids = committed(&platform, 1);
+    let failed =
+        RgfxCbComplete::read_from_bytes(&ring.event().expect("buffer 5's failure")).unwrap();
+    assert_eq!((failed.cb_obj_id, failed.header.seqno), (101, 5));
+    assert_ne!(failed.status, RGFX_CB_OK);
+    presents_waiting(&device, 1);
+    assert!(quiet(&guest), "answered before buffer 4 finished");
+    assert_eq!(shown_width(&device), None, "shown before buffer 4 finished");
+
+    // Buffer 4 finishes: the surface shows, and the present is answered.
+    let world = platform.world();
+    assert!(world.complete(
+        ids[0],
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    presents_waiting(&device, 0);
+}
+
 /// A presented surface's block is given back only once the display is done with it, as a
 /// compositor holds the IOSurface it shows: its release, after the texture's and its buffer's
 /// destroys, waits while the display shows the texture, and then while a window draw of it (a

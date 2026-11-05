@@ -17,8 +17,11 @@
 //! before it names it a writer, so a writer whose seqno is past every seqno its queue's ring has
 //! published when the present comes names no buffer, and holds nothing: a seqno the guest wrote
 //! wrong never holds its display's presents. A failed buffer finishes as a completed one does
-//! (its `CB_COMPLETE` carries the failure). A queue's destroy, or its context's close, drops what
-//! the presents wait for of it: no buffer of it will finish.
+//! (its `CB_COMPLETE` carries the failure). A queue's completions, posted in its order, say how far
+//! it has finished; a failure the host posts at once instead, ahead of buffers before it that may
+//! still run (one it neither carried out nor stood in for: a failed context's later buffers among
+//! them), finishes that buffer alone. A queue's destroy, or its context's close, drops what the
+//! presents wait for of it: no buffer of it will finish.
 //!
 //! A present of a surface whose device cache holds an older CPU generation than the present's
 //! waits too for the fill the host commits for it on taking the present (`decode/surface_cache.rs`):
@@ -57,7 +60,7 @@
 //! copy, and the window showed that newer frame, then the older one it had presented between,
 //! then the newer again.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
@@ -80,8 +83,15 @@ pub(crate) struct PresentQueue<P: Platform> {
 
 /// [`PresentQueue`]'s state.
 struct State<P: Platform> {
-    /// By queue id: the highest seqno of a `CB_COMPLETE` the host has posted on its ring.
+    /// By queue id: the highest seqno of a `CB_COMPLETE` the host has posted on its ring in the
+    /// queue's order, each after those of the buffers before it ([`PresentQueue::finished`]),
+    /// so every buffer at or below it has finished.
     finished: HashMap<u64, u64>,
+    /// By queue id: the seqnos past `finished`'s whose failure the host posted at once, ahead of
+    /// buffers before them that may still run ([`PresentQueue::failed_at_once`]): each is
+    /// finished, and says nothing of the buffers before it. They go as `finished` passes them, or
+    /// with their queue.
+    apart: HashMap<u64, BTreeSet<u64>>,
     /// The presents not yet shown, oldest first.
     waiting: VecDeque<Waiting<P>>,
     /// By queue id: the poster onto its completion ring, through which what its submission ring
@@ -109,6 +119,7 @@ impl<P: Platform> PresentQueue<P> {
             presented,
             state: Mutex::new(State {
                 finished: HashMap::new(),
+                apart: HashMap::new(),
                 waiting: VecDeque::new(),
                 queues: HashMap::new(),
             }),
@@ -160,10 +171,13 @@ impl<P: Platform> PresentQueue<P> {
     }
 
     /// The host posted the `CB_COMPLETE` of the command buffer at `seqno` on queue `queue`'s ring,
-    /// through `poster`. A buffer of a queue the device's reset ended counts for nothing: the
-    /// rebooted guest's queue may take the same id, its seqnos from the start. The poster is
-    /// looked at with the state held, which the reset takes once the queue has ended
-    /// ([`Self::reset`]), so no buffer of the queue counts after the reset.
+    /// through `poster`, in the queue's order: in its completion handler, the queue's buffers
+    /// finishing in the order they were committed, so those before it have finished too (a
+    /// failure posted out of that order is [`Self::failed_at_once`]'s). A buffer of a queue the
+    /// device's reset ended counts for nothing: the rebooted guest's queue may take the same id,
+    /// its seqnos from the start. The poster is looked at with the state held, which the reset
+    /// takes once the queue has ended ([`Self::reset`]), so no buffer of the queue counts after
+    /// the reset.
     pub(crate) fn finished(&self, queue: u64, seqno: u64, poster: &CompletionPoster) {
         let mut state = self.state.lock();
         if poster.stale() {
@@ -171,6 +185,37 @@ impl<P: Platform> PresentQueue<P> {
         }
         let done = state.finished.entry(queue).or_insert(0);
         *done = (*done).max(seqno);
+        let done = *done;
+        if let Some(apart) = state.apart.get_mut(&queue) {
+            apart.retain(|&s| s > done);
+            if apart.is_empty() {
+                state.apart.remove(&queue);
+            }
+        }
+        if !state.waiting.is_empty() {
+            let gone = self.show_ready(&mut state);
+            drop(state);
+            drop(gone);
+        }
+    }
+
+    /// The host posted the failure of the command buffer at `seqno` on queue `queue`'s ring,
+    /// through `poster`, at once, out of the queue's order (a buffer it neither carried out nor
+    /// stood in for): that buffer has finished, and the buffers before it may still run, so a
+    /// present waiting for one of them still waits ([`Self::finished`] for the rest).
+    pub(crate) fn failed_at_once(&self, queue: u64, seqno: u64, poster: &CompletionPoster) {
+        let mut state = self.state.lock();
+        if poster.stale() {
+            return;
+        }
+        if state
+            .finished
+            .get(&queue)
+            .is_some_and(|&done| done >= seqno)
+        {
+            return;
+        }
+        state.apart.entry(queue).or_default().insert(seqno);
         if !state.waiting.is_empty() {
             let gone = self.show_ready(&mut state);
             drop(state);
@@ -231,6 +276,7 @@ impl<P: Platform> PresentQueue<P> {
         let waiting = {
             let mut state = self.state.lock();
             state.finished.clear();
+            state.apart.clear();
             state.queues.clear();
             std::mem::take(&mut state.waiting)
         };
@@ -248,6 +294,7 @@ impl<P: Platform> PresentQueue<P> {
     fn forget(&self, gone: impl Fn(u64) -> bool) {
         let mut state = self.state.lock();
         state.finished.retain(|&q, _| !gone(q));
+        state.apart.retain(|&q, _| !gone(q));
         for waiting in &mut state.waiting {
             waiting.writers.retain(|w| !gone(w.queue_obj_id));
         }
@@ -266,10 +313,9 @@ impl<P: Platform> PresentQueue<P> {
             let ready = state.waiting.front().is_some_and(|front| {
                 front.fill.as_ref().is_none_or(FillWait::done)
                     && front.writers.iter().all(|w| {
-                        state
-                            .finished
-                            .get(&w.queue_obj_id)
-                            .is_some_and(|&done| done >= w.seqno)
+                        let queue = &w.queue_obj_id;
+                        (state.finished.get(queue)).is_some_and(|&done| done >= w.seqno)
+                            || (state.apart.get(queue)).is_some_and(|a| a.contains(&w.seqno))
                     })
             });
             if !ready {

@@ -1688,8 +1688,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             return;
         };
         poster.post(cb_failed(cb.cb_obj_id, header.seqno).as_bytes());
+        // Ahead of the buffers before it, which may still run: it finishes alone.
         if let Some(queue) = poster.queue_obj_id() {
-            self.presents.finished(queue, header.seqno, poster);
+            self.presents.failed_at_once(queue, header.seqno, poster);
         }
     }
 }
