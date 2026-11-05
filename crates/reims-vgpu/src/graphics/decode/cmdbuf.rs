@@ -1328,8 +1328,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         // messages before it ([`Self::wait_to_commit`]).
         self.wait_to_commit();
         match uses {
-            // Its end event signalled for the caches' later copies, and committed, under their
-            // lock ([`super::surface_cache::Caches::finish`]).
+            // Its end event signalled for the caches' later copies under their lock, committed
+            // with it let go, still among their users, and then the early copies behind it on its
+            // queue ([`super::surface_cache::Caches::finish`]).
             Some(uses) => self.surface_caches.finish(
                 device,
                 queue_obj_id,

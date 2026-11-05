@@ -61,8 +61,9 @@
 //! - `id_chunks`: the texture resource ids' chunks, on ring 0.
 //! - `surface_views`, then `surface_caches` ([`surface_cache::Caches`]), the blocks' views of
 //!   their surfaces' pages and their device caches. A command buffer that uses a cache holds the
-//!   caches' lock from its end's signal through its commit, never across its walk; a download
-//!   with nothing to copy is answered under it. A view's mapping and import are made with
+//!   caches' lock for its end's signal, never across its walk or its commit, and counts among the
+//!   caches' users until its commit returns; a download with nothing to copy is answered under
+//!   it. A view's mapping and import are made with
 //!   neither held ([`surface_pages::SurfaceViews::surface_pages`]).
 //! - `unsettled` ([`worker::Unsettled`]), the blocks whose `SURFACE_PAGES` the surface
 //!   worker has yet to carry out, taken alone; a message that names one waits for it holding no

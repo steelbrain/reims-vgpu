@@ -1706,11 +1706,31 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Ends command buffer `cb` of queue `queue`, which `uses` counted among the users of the
-    /// caches of `used` ([`SurfaceCaches::after`]), and `commit`s it, with the lock held, so a
-    /// later copy finds its end event's value committed; then commits the early copies behind it
-    /// on `on`, its queue, where it has one ([`SurfaceCaches::early_copies`]), and it leaves
-    /// their users. An early copy the platform refuses is logged and left unmade: the cache stays
-    /// written, for the download that follows.
+    /// caches of `used` ([`SurfaceCaches::after`]), and `commit`s it with the lock let go; then,
+    /// with the lock taken again and the buffer still among their users, commits the early copies
+    /// behind it on `on`, its queue, where it has one ([`SurfaceCaches::early_copies`]), and it
+    /// leaves their users. An early copy the platform refuses is logged and left unmade: the
+    /// cache stays written, for the download that follows.
+    ///
+    /// The platform's commit call can take milliseconds (a long buffer's recording, a driver's
+    /// submit), and under the caches' one lock every other queue's begin of a buffer that uses a
+    /// cache waited for it, and so did a doorbell's look at the caches, a present's fill and
+    /// ring 0's copies. What a copy needs of the buffer still holds with the lock let go: the
+    /// buffer counts among the blocks' users until it leaves them here, after its commit and its
+    /// early copies, so a fill of one of them, a copy out after a writer, a block named again and
+    /// a present's fill wait for both. A copy out of a block the buffer only reads, asked
+    /// meanwhile, may be committed first, waiting on the GPU for the buffer's end event's value,
+    /// as a wait for a signal committed later on another queue does: Metal's GPU waits for it,
+    /// and metal2vulkan's scheduler holds the copy until the signal is submitted (its
+    /// `event_timeline.rs`, "What the scheduler knows"). Neither copy writes what the buffer uses,
+    /// so no order by commit crosses that wait. The queue's later buffers sign their end values
+    /// after it, as each is finished after its commit in turn.
+    ///
+    /// An early copy needs nothing more of the lock: it is committed on the buffer's own queue
+    /// right behind the buffer, as the queue's next buffer is committed only once this one has
+    /// finished, and only this queue's finish moves the queue's end value. A writer of the block
+    /// begun meanwhile on another queue counts a second write, so the block takes no early copy
+    /// and its download copies it, as where that writer began before the buffer's commit.
     #[expect(
         clippy::too_many_arguments,
         reason = "the buffer's queue, as the guest and the platform name it, and its counts"
@@ -1725,8 +1745,9 @@ impl<P: Platform> Caches<P> {
         used: &[u64],
         commit: impl FnOnce() -> RaiseResult<()>,
     ) -> RaiseResult<()> {
+        let signalled = self.state.lock().after(device, queue, cb, used);
+        let done = signalled.and_then(|()| commit());
         let mut state = self.state.lock();
-        let done = state.after(device, queue, cb, used).and_then(|()| commit());
         if done.is_ok()
             && let Some(on) = on
             && let Err(raise) = refusing(|| state.early_copies(queue, on, &uses.blocks))
@@ -2682,6 +2703,90 @@ mod tests {
         assert!(downloaded.load(Ordering::SeqCst));
     }
 
+    /// A command buffer's commit is made with the caches' lock let go: while the platform's
+    /// commit call takes, another buffer that uses the cache is begun and the doorbell's look at
+    /// the caches is answered; a download asked meanwhile, behind the committing buffer's write,
+    /// is still made after the commit, and so is a fill, as the buffer counts among the cache's
+    /// users until its commit returns
+    #[test]
+    fn a_commit_is_made_with_the_caches_lock_let_go() {
+        let mut r = cached();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let writer = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 1)[0]
+        }];
+        let (used, _, uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &writes)
+            .unwrap();
+        let caches = Arc::clone(&r.dec.surface_caches);
+        let reader = queue.command_buffer(ON).unwrap().unwrap();
+        let filler = queue.command_buffer(ON).unwrap().unwrap();
+        let mark = r.p.call_log().mark();
+        let (in_commit, committing) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let (go, wait_go) = std::sync::mpsc::channel::<()>();
+            let finish = scope.spawn(|| {
+                let writer = &writer;
+                caches
+                    .finish(&r.device, 1, None, writer, uses.unwrap(), &used, move || {
+                        in_commit.send(()).unwrap();
+                        let _ = wait_go.recv();
+                        writer.commit(ON)
+                    })
+                    .map_err(|_| ())
+            });
+            committing.recv().unwrap();
+            let begin = scope.spawn(|| {
+                (caches.before(&r.device, &reader, &reading(BLOCK, 1)))
+                    .map(|(_, _, uses)| uses.is_some())
+                    .map_err(|_| ())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                begin.is_finished(),
+                "a begin waited for another buffer's commit"
+            );
+            assert_eq!(begin.join().unwrap(), Ok(true));
+            assert_eq!(
+                caches.none_cached([BLOCK].into_iter()),
+                Some(false),
+                "the doorbell's look found the caches' lock held"
+            );
+            let downloaded = download(&r, BLOCK);
+            let fill = scope.spawn(|| {
+                (caches.before(&r.device, &filler, &reading(BLOCK, 2)))
+                    .map(|_| ())
+                    .map_err(|_| ())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!fill.is_finished(), "filled under the committing buffer");
+            assert!(
+                !downloaded.load(Ordering::SeqCst),
+                "downloaded before the commit"
+            );
+            assert!(
+                copies(&r.p.call_log().since(mark)).is_empty(),
+                "copied while the writer commits"
+            );
+            go.send(()).unwrap();
+            assert!(finish.join().unwrap().is_ok());
+            assert!(fill.join().unwrap().is_ok());
+        });
+        let calls = r.p.call_log().since(mark);
+        let commit = calls.iter().position(|c| c.sel == "commit").unwrap();
+        let copied = calls.iter().position(|c| c.sel == COPY).unwrap();
+        assert!(commit < copied, "copied after the writer's commit");
+        assert_eq!(
+            copies(&calls).len(),
+            2,
+            "the download's copy and the fill's"
+        );
+    }
+
     /// A device of the host's write over a cache's pages has the cache's next use fill it again,
     /// though of the generation it holds, and once; a write beside them does nothing. A cache a
     /// buffer wrote is not copied over such a write, at a download or at a release
@@ -3404,6 +3509,69 @@ mod tests {
         assert!(
             download(&r, BLOCK).load(Ordering::SeqCst),
             "and at once after"
+        );
+    }
+
+    /// A download of a read-back surface asked while its writer is committed, with the caches'
+    /// lock let go, waits for the writer, still among the cache's users, and so for the early
+    /// copy made behind it once the commit has returned: the download copies nothing of its own
+    /// and is answered as that copy lands ([`Caches::finish`])
+    #[test]
+    fn a_download_asked_during_a_read_back_writer_s_commit_waits_for_its_early_copy() {
+        let r = cached();
+        let cache = cache_id(&r);
+        let queue = r.device.new_command_queue().unwrap();
+        let (answered, copied) = decode_then_lock(&r, 7, &queue);
+        assert!(answered);
+        assert_eq!(copied.len(), 1, "the lock's download copies");
+        let pages = copied[0].1;
+
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let caches = &r.dec.surface_caches;
+        let (used, _, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        let mark = r.p.call_log().mark();
+        let (in_commit, committing) = std::sync::mpsc::channel();
+        let done = std::thread::scope(|scope| {
+            let (go, wait_go) = std::sync::mpsc::channel::<()>();
+            let finish = scope.spawn(|| {
+                let (cb, queue) = (&cb, &queue);
+                caches
+                    .finish(&r.device, 7, Some(queue), cb, uses.unwrap(), &used, move || {
+                        in_commit.send(()).unwrap();
+                        let _ = wait_go.recv();
+                        cb.commit(ON)
+                    })
+                    .map_err(|_| ())
+            });
+            committing.recv().unwrap();
+            let asked = scope.spawn(|| download(&r, BLOCK));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                asked.is_finished(),
+                "a download waited for the writer's commit"
+            );
+            let done = asked.join().unwrap();
+            assert!(
+                !done.load(Ordering::SeqCst),
+                "answered before the writer's commit"
+            );
+            drop(go);
+            assert_eq!(finish.join().unwrap(), Ok(()));
+            done
+        });
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(copies(&calls), [(cache, pages)], "the early copy alone");
+        assert!(!done.load(Ordering::SeqCst), "answered as the copy lands");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.downloads, counts.early, counts.early_read),
+            (1, 1, 1)
         );
     }
 
