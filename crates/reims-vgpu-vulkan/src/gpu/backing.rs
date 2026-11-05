@@ -776,9 +776,12 @@ struct Open {
     /// is one exchange, so a commit and a close's letting go never both pass unseen.
     state: AtomicU8,
     /// Its submissions the runtime submitted, until it closes: each decided and noted under this
-    /// lock ([`Opened::submit`]), which a detach reads them under ([`in_flight`]). It holds the
-    /// command buffer, which holds its check, which holds this: the close takes it.
-    submitted: Mutex<Option<Submitted>>,
+    /// lock ([`Opened::submit`]), which a detach reads them under ([`in_flight`]), a note for
+    /// each part of it the platform committed apart ([`Opened::next_part`]). A note holds its
+    /// part's command buffer, which holds its check, which holds this: the part's close takes it.
+    submitted: Mutex<Vec<Submitted>>,
+    /// The places of its parts not yet closed ([`Opened`]): it closes with the last.
+    parts: AtomicUsize,
 }
 
 /// [`Open::state`]: open, not committed.
@@ -806,6 +809,8 @@ impl Open {
 /// ([`rt::Submission::encoders`]).
 #[derive(Debug)]
 struct Submitted {
+    /// Which part of the command buffer it is, the first 0 ([`Opened::next_part`]).
+    part: usize,
     cb: rt::CommandBuffer,
     encoders: Vec<std::ops::Range<usize>>,
     /// The count of [`MADE`] as its latest submission was checked: it took no object made since.
@@ -871,7 +876,8 @@ impl Registry {
             number: state.number(),
             task,
             state: AtomicU8::new(OPEN),
-            submitted: Mutex::new(None),
+            submitted: Mutex::new(Vec::new()),
+            parts: AtomicUsize::new(1),
         });
         state.open.insert(open.number, Arc::clone(&open));
         open
@@ -980,11 +986,12 @@ impl Registry {
         let open: Vec<Arc<Open>> = self.state.lock().open.values().cloned().collect();
         // Read under each command buffer's lock, without the registry's.
         open.iter()
-            .filter_map(|open| {
+            .flat_map(|open| {
                 let submitted = open.submitted.lock();
-                (submitted.as_ref())
+                (submitted.iter())
                     .filter(|s| s.made > made)
                     .map(|s| (s.cb.clone(), s.encoders.clone()))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -992,21 +999,41 @@ impl Registry {
 
 /// A command buffer's place in the sequence of [`Detached`], where it was made, open until it
 /// drops: when the command buffer is released uncommitted, when it commits with no check, or
-/// when it completes, as the runtime then drops its check ([`submission_check`]).
+/// when it completes, as the runtime then drops its check ([`submission_check`]). The parts of
+/// a command buffer the platform commits apart share its place, each open until it closes so,
+/// and the place until the last of them closes ([`Opened::next_part`]).
 #[derive(Debug)]
-pub(crate) struct Opened(Arc<Open>);
+pub(crate) struct Opened {
+    open: Arc<Open>,
+    /// Which part of its command buffer it is the place of, the first 0.
+    part: usize,
+}
 
 impl Opened {
     /// The place of a command buffer made now, by the isolated task whose code runs, if one is.
     pub(crate) fn new() -> Opened {
         let task = TaskLife::current().map(|task| Arc::downgrade(&task));
-        Opened(DETACHED.open(task))
+        Opened {
+            open: DETACHED.open(task),
+            part: 0,
+        }
+    }
+
+    /// The place of the command buffer's next part, which goes on from this one's
+    /// (`CommandBuffer::split`): the same place, as the parts are one command buffer of Metal's,
+    /// whose submissions fail by the objects released detached since the first part was made.
+    pub(crate) fn next_part(&self) -> Opened {
+        self.open.parts.fetch_add(1, Ordering::SeqCst);
+        Opened {
+            open: Arc::clone(&self.open),
+            part: self.part + 1,
+        }
     }
 
     /// The command buffer commits now: open until it completed, whatever its task does
     /// ([`Registry::commit`]).
     pub(crate) fn commit(self) -> Opened {
-        DETACHED.commit(&self.0);
+        DETACHED.commit(&self.open);
         self
     }
 
@@ -1020,17 +1047,25 @@ impl Opened {
     /// nothing and holds no handle.
     fn submit(&self, submission: &rt::Submission<'_>) -> Option<NonZeroU64> {
         let objects = MADE.load(Ordering::SeqCst);
-        let number = self.0.number;
-        let mut submitted = self.0.submitted.lock();
+        let number = self.open.number;
+        let mut submitted = self.open.submitted.lock();
         if DETACHED.any(number) && submission.uses(&DETACHED.failing(number)) {
             return NonZeroU64::new(DETACHED_USE);
         }
         DETACHED.noted.fetch_max(objects, Ordering::SeqCst);
-        let noted = submitted.get_or_insert_with(|| Submitted {
-            cb: submission.command_buffer().clone(),
-            encoders: Vec::new(),
-            made: objects,
-        });
+        let at = match submitted.iter().position(|s| s.part == self.part) {
+            Some(at) => at,
+            None => {
+                submitted.push(Submitted {
+                    part: self.part,
+                    cb: submission.command_buffer().clone(),
+                    encoders: Vec::new(),
+                    made: objects,
+                });
+                submitted.len() - 1
+            }
+        };
+        let noted = &mut submitted[at];
         noted.encoders.push(submission.encoders());
         noted.made = noted.made.max(objects);
         None
@@ -1038,11 +1073,17 @@ impl Opened {
 }
 
 impl Drop for Opened {
+    /// Its part closes, its note let go of; the last part's close closes the place.
     fn drop(&mut self) {
-        let open = DETACHED.closed(self.0.number);
+        let last = self.open.parts.fetch_sub(1, Ordering::SeqCst) == 1;
+        let open = last.then(|| DETACHED.closed(self.open.number));
         // Let go of without the registry's lock: it holds the command buffer, whose last handle
         // it may be.
-        let submitted = self.0.submitted.lock().take();
+        let submitted = {
+            let mut submitted = self.open.submitted.lock();
+            let at = submitted.iter().position(|s| s.part == self.part);
+            at.map(|at| submitted.swap_remove(at))
+        };
         drop((submitted, open));
     }
 }
@@ -1051,7 +1092,7 @@ impl Drop for Opened {
 /// or one released detached since it was made ([`Detached::failing`]). Asked of the runtime
 /// (`rt::CommandBuffer::uses`) only where an object could fail it.
 pub(crate) fn uses_detached(cb: &rt::CommandBuffer, opened: &Opened) -> bool {
-    let number = opened.0.number;
+    let number = opened.open.number;
     DETACHED.any(number) && cb.uses(&DETACHED.failing(number))
 }
 
@@ -1724,6 +1765,31 @@ mod tests {
 
     fn address(at: HostPtr) -> u64 {
         u64::try_from(at.addr()).unwrap()
+    }
+
+    /// A command buffer's parts share its place among the releases of detached objects, which
+    /// stays open until the last of them closes, whichever closes first
+    #[test]
+    fn a_command_buffer_s_parts_share_its_place_until_the_last_closes() {
+        let open = |number| DETACHED.state.lock().open.contains_key(&number);
+        for first_closes_first in [true, false] {
+            let first = Opened::new();
+            let second = first.next_part();
+            let third = second.next_part();
+            let number = first.open.number;
+            assert_eq!((second.open.number, third.open.number), (number, number));
+            assert_eq!((second.part, third.part), (1, 2));
+            let (early, late) = if first_closes_first {
+                (first, third)
+            } else {
+                (third, first)
+            };
+            drop(early);
+            drop(second);
+            assert!(open(number), "closed with a part still open");
+            drop(late);
+            assert!(!open(number), "open once its parts closed");
+        }
     }
 
     /// Host-contiguous ranges make one run, as core cuts its runs at two pages; the ranges'

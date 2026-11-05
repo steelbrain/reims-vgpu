@@ -1201,6 +1201,12 @@ impl Predication {
             device: device.clone_ref(),
         })
     }
+
+    /// Whether a unit of compute encoders is open: one began since its last end, and a compute
+    /// encoder after it would go on in it.
+    pub(crate) fn in_unit(&self) -> bool {
+        self.unit.lock().first_type.is_some()
+    }
 }
 
 /// The state of a command buffer's current unit, and of its open compute encoder.

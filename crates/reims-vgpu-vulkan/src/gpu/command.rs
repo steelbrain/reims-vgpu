@@ -19,6 +19,20 @@
 //!   their commands moves once its blits ran ([`crate::gpu::icb`]). A completed handler of this
 //!   platform's keeps it, added the first time an encoder needs it, so before the handlers core
 //!   adds once it has encoded.
+//! - **A command buffer in parts** (`split`, which the graphics lane's walk asks for at an
+//!   encoder's end, `reims-vgpu`'s `decode/split.rs`): the work encoded so far is committed as
+//!   `commit` commits it, and a command buffer of the same queue goes on from it. The next part
+//!   takes the buffer's place among the releases of detached objects ([`Opened::next_part`]), so
+//!   its submissions fail by what the whole buffer's would, and numbers its runtime encoders from
+//!   0, as the runtime counts a command buffer's. The parts run in their commit order on the
+//!   queue, as one buffer's encoders do. The buffer is kept whole, `split` answering `None`, where
+//!   a part would answer otherwise than the whole ([`CommandBufferObject::splits`]): with an
+//!   encoder open; with a way Metal's GPU fails it from an encoder on, every encoder after it
+//!   running nothing (a [`Failing`], a draw of primitive type 9), which a later part would run;
+//!   with protection options set; with an execution of an indirect command buffer whose commands
+//!   its commit reads, or progress kept to its completion; with a unit of command predication
+//!   open, which a later compute encoder would go on; and with an event signalled as it is
+//!   scheduled.
 //! - **The records of an indirect command buffer an execution runs** are checked by the runtime
 //!   as they stand at commit, or, where the GPU may have written them, once the work before the
 //!   execution completed. A refusal at commit dies there naming the runtime's refusal, and says
@@ -284,6 +298,9 @@ pub struct CommandBufferObject {
     /// The executions of indirect command buffers whose commands its commit reads, each with its
     /// encoder's place ([`CommandBufferObject::checked_at_commit`]).
     executions: Mutex<Vec<(usize, executions::Execution)>>,
+    /// Whether it signals an event as it is scheduled (`encodeSignalEventScheduled:value:`),
+    /// which keeps it whole ([`CommandBufferObject::splits`]).
+    signals_scheduled: AtomicBool,
 }
 
 /// The submission handler of a command buffer that holds work for Metal's tiler
@@ -410,6 +427,31 @@ impl CommandBufferObject {
             signals: false,
         });
         (at, None)
+    }
+
+    /// Whether its work encoded so far may be committed as a part of it (`split`, the module
+    /// docs' "A command buffer in parts"): no encoder open; none of the ways Metal's GPU fails
+    /// it for what its encoders did, nor a draw of primitive type 9, which fail it from an
+    /// encoder on, every one after it running nothing; no protection options set; no execution
+    /// of an indirect command buffer whose commands its commit reads, and no progress kept to
+    /// its completion (a rate map's reset, an indirect command buffer's numbers); no unit of
+    /// command predication open, which a later compute encoder would go on; and no event
+    /// signalled as it is scheduled. Not committed.
+    fn splits(&self) -> bool {
+        plain(|| {
+            self.open_encoders.load(Ordering::SeqCst) == 0
+                && self.failing.lock().is_empty()
+                && self.type_9.lock().is_empty()
+                && {
+                    let protection = self.protection.lock();
+                    protection.options == 0 && !protection.used
+                }
+                && self.executions.lock().is_empty()
+                && self.progress.lock().is_none()
+                && !self.predication.in_unit()
+                && !self.signals_scheduled.load(Ordering::SeqCst)
+                && self.opened.lock().is_some()
+        })
     }
 
     /// Records `failing`, which its commit fails it with ([`CommandBufferObject::failure`]).
@@ -934,6 +976,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
+            signals_scheduled: AtomicBool::new(false),
         })))
     }
 
@@ -1410,6 +1453,42 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         Some(self.device.clone_ref())
     }
 
+    /// Commits the work encoded so far as it is committed at `commit`, and answers a command
+    /// buffer of its queue that goes on from it (the module docs' "A command buffer in parts"),
+    /// where it may be split ([`CommandBufferObject::splits`]); `None` otherwise, the command
+    /// buffer as it was. The next part takes the command buffer's place among the releases of
+    /// detached objects ([`Opened::next_part`]), so its submissions fail by what the whole
+    /// buffer's would. Its make waits while the queue holds 64 uncompleted command buffers, as
+    /// `commandBuffer` does: the caller leaves room.
+    fn split(&self, on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
+        if !self.splits() {
+            return Ok(None);
+        }
+        let Some(opened) = plain(|| self.opened.lock().as_ref().map(Opened::next_part)) else {
+            return Ok(None);
+        };
+        let raw = waiting("commandBuffer", || {
+            self.raw.command_queue().command_buffer()
+        })?;
+        let next = Obj::new(CommandBufferObject {
+            raw,
+            device: self.device.clone_ref(),
+            open_encoders: Arc::default(),
+            progress: Mutex::new(None),
+            predication: Predication::new(&self.device),
+            opened: Mutex::new(Some(opened)),
+            made: AtomicUsize::new(0),
+            failing: Mutex::new(Vec::new()),
+            type_9: Mutex::new(Vec::new()),
+            protection: Mutex::new(Protection::default()),
+            tiler: AtomicBool::new(false),
+            executions: Mutex::new(Vec::new()),
+            signals_scheduled: AtomicBool::new(false),
+        });
+        self.commit(on)?;
+        Ok(Some(next))
+    }
+
     fn encode_signal(
         &self,
         event: Option<EventRef<'_, VulkanPlatform>>,
@@ -1441,6 +1520,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         value: u64,
     ) -> RaiseResult<()> {
         let sel = "encodeSignalEventScheduled:value:";
+        self.signals_scheduled.store(true, Ordering::SeqCst);
         let traced = signal_event_scheduled.map_or(0, event_id);
         // evsched: command buffer, event, value
         trace_event_id("evsched", &self.raw, traced, value);
@@ -2737,6 +2817,49 @@ mod tests {
         let after = filled(&cb, 0x7c);
         assert_eq!(completed(&cb), (4, None), "options 2, then 0");
         assert_eq!(sixteen(&after), vec![0x7c; 16]);
+    }
+
+    /// A command buffer split at an encoder's end commits its work so far as a part, as its
+    /// commit does, and goes on in a command buffer of its queue, whose work runs after it; it
+    /// is kept whole, uncommitted, where a part would answer otherwise than the whole: under
+    /// protection options, which fail it from an encoder on, and with an event signalled as it
+    /// is scheduled
+    #[test]
+    fn a_split_commits_a_part_where_the_parts_answer_as_the_whole() {
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let cb = buffer(&q);
+        let first = filled(&cb, 0x5a);
+        let next = cb.split(OnFault::Return).unwrap().expect("a part");
+        assert!(
+            cb.status().0 >= CommandBufferStatus::COMMITTED.0,
+            "the part committed"
+        );
+        let second = filled(&next, 0x6b);
+        assert_eq!(completed(&next), (4, None));
+        assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
+        assert_eq!(
+            (sixteen(&first), sixteen(&second)),
+            (vec![0x5a; 16], vec![0x6b; 16])
+        );
+        let cb = buffer(&q);
+        cb.set_protection_options(OnFault::Return, 2).unwrap();
+        let _under = filled(&cb, 0x6b);
+        assert!(
+            cb.split(OnFault::Return).unwrap().is_none(),
+            "failed from an encoder"
+        );
+        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
+        assert_eq!(completed(&cb), (5, Some(16)));
+        let cb = buffer(&q);
+        let event = d.new_shared_event().unwrap();
+        cb.encode_signal_when_scheduled(Some(&event), 1).unwrap();
+        assert!(
+            cb.split(OnFault::Return).unwrap().is_none(),
+            "a scheduled signal"
+        );
+        assert_eq!(completed(&cb), (4, None));
+        assert_eq!(event.signaled_value(), 1);
     }
 
     /// Under protection options 1, 3 and 7 a compute or render encoder's creation dies, and so
