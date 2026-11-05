@@ -2007,6 +2007,7 @@ mod tests {
         RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
         RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
     };
+    use reims_vgpu_core::testkit::FakePlatform;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
@@ -2833,7 +2834,7 @@ mod tests {
         // finishes.
         set_gen(&r, 1);
         (r.dec.surface_caches)
-            .finish(&r.device, 1, &writer, uses, &used, || writer.commit(ON))
+            .finish(&r.device, 1, None, &writer, uses, &used, || writer.commit(ON))
             .unwrap();
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst), "answered");
@@ -2855,7 +2856,7 @@ mod tests {
         let released = release(&r, BLOCK);
         set_gen(&r, 2);
         (r.dec.surface_caches)
-            .finish(&r.device, 1, &writer, uses, &used, || writer.commit(ON))
+            .finish(&r.device, 1, None, &writer, uses, &used, || writer.commit(ON))
             .unwrap();
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst), "answered");
@@ -2893,7 +2894,7 @@ mod tests {
         let mark = r.p.call_log().mark();
         let downloaded = download(&r, BLOCK);
         (r.dec.surface_caches)
-            .finish(&r.device, 1, &writer, uses.unwrap(), &used, || {
+            .finish(&r.device, 1, None, &writer, uses.unwrap(), &used, || {
                 writer.commit(ON)
             })
             .unwrap();
