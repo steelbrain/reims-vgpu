@@ -2661,6 +2661,8 @@ struct WalkGate {
     state: GateState,
     /// The ops walked past the gate once a walk took it: other walks' while it is shut.
     passed: Arc<AtomicU32>,
+    /// The name of the thread whose walk took the gate, once one did.
+    taken_on: Arc<super::Mutex<Option<String>>>,
 }
 
 impl WalkGate {
@@ -2669,12 +2671,23 @@ impl WalkGate {
     /// (`GraphicsControl::carry_out`).
     fn on(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
         device.control.inline_walk_max.store(0, Ordering::Relaxed);
+        WalkGate::in_place(device)
+    }
+
+    /// The gate, set on `device`'s decoder with each buffer carried out where it would be: a
+    /// short buffer whose commit would wait for nothing stops there on its queue's service thread.
+    fn in_place(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
         let state = Arc::new((
             reims_vgpu_core::sync::Mutex::new((false, false, false)),
             reims_vgpu_core::sync::Condvar::new(),
         ));
         let passed = Arc::new(AtomicU32::new(0));
-        let (hook, past) = (Arc::clone(&state), Arc::clone(&passed));
+        let taken_on = Arc::new(super::Mutex::new(None));
+        let (hook, past, on) = (
+            Arc::clone(&state),
+            Arc::clone(&passed),
+            Arc::clone(&taken_on),
+        );
         device
             .control
             .decoder()
@@ -2689,6 +2702,7 @@ impl WalkGate {
                 if index != 0 {
                     return;
                 }
+                *on.lock() = std::thread::current().name().map(str::to_owned);
                 s.0 = true;
                 s.1 = true;
                 moved.notify_all();
@@ -2696,7 +2710,16 @@ impl WalkGate {
                     moved.wait(&mut s);
                 }
             })));
-        WalkGate { state, passed }
+        WalkGate {
+            state,
+            passed,
+            taken_on,
+        }
+    }
+
+    /// The name of the thread whose walk took the gate, once one did.
+    fn taken_on(&self) -> Option<String> {
+        self.taken_on.lock().clone()
     }
 
     /// Waits, about 3 s at most, for `n` ops to be walked past the gate once a walk took it;
@@ -4014,6 +4037,82 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
         "a buffer whose commit waits walked on {:?}",
         walked[0]
     );
+}
+
+/// A command buffer that asks for its `CB_SUBMITTED` behind a short buffer its queue's service
+/// thread walks is answered before that walk ends, as behind one a lane's thread walks: rung for
+/// through `mmio_write_taking` during the walk, inside the write; and published before the
+/// service thread took the buffer before it, by that thread, before the walk. Each completes
+/// after the buffer before it. The service thread held its claim on the queue's messages through
+/// the walk, so the write answered nothing and the buffer was answered only at its take, after
+/// the walk and the commit before it: a guest's `commitAndWaitUntilSubmitted` behind a buffer
+/// of fills waited for them
+#[test]
+fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let ok = u64::from(RGFX_CB_OK);
+    // Rung for during the walk.
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::in_place(&device);
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the short buffer's walk did not start");
+    let walked_on = gate.taken_on().unwrap_or_default();
+    assert!(
+        walked_on.starts_with("reims-vgpu.graphics-queue-"),
+        "the short buffer walked on {walked_on:?}"
+    );
+    ring.publish(asking(obj(1, 1), 101));
+    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), ring.submit_off as u32);
+    assert!(
+        ring.has_event(),
+        "the write did not answer the buffer behind the walk"
+    );
+    let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(
+        (posted.header.r#type, posted.cb_obj_id),
+        (RGFX_EVT_CB_SUBMITTED, 101)
+    );
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut ring, 2),
+        [
+            (RGFX_EVT_CB_COMPLETE, 100, ok),
+            (RGFX_EVT_CB_COMPLETE, 101, ok)
+        ]
+    );
+    assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+
+    // Published, and rung for, before the service thread took the buffer before it.
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::in_place(&device);
+    wait_idle(&device, ring.submit_off);
+    ring.publish(sampler_command_buffer(obj(1, 1), 200, obj(1, 4)));
+    ring.publish(asking(obj(1, 1), 201));
+    device.mmio_write(RGFX_REG_DOORBELL.into(), ring.submit_off as u32);
+    assert!(gate.reached(), "the short buffer's walk did not start");
+    let walked_on = gate.taken_on().unwrap_or_default();
+    assert!(
+        walked_on.starts_with("reims-vgpu.graphics-queue-"),
+        "the short buffer walked on {walked_on:?}"
+    );
+    assert!(
+        ring.has_event(),
+        "the buffer behind the walk was not answered before it"
+    );
+    let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+    assert_eq!(
+        (posted.header.r#type, posted.cb_obj_id),
+        (RGFX_EVT_CB_SUBMITTED, 201)
+    );
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut ring, 2),
+        [
+            (RGFX_EVT_CB_COMPLETE, 200, ok),
+            (RGFX_EVT_CB_COMPLETE, 201, ok)
+        ]
+    );
+    assert_eq!(ring.scheduled, [(0, 200), (0, 201)]);
 }
 
 /// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of

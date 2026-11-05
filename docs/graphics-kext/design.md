@@ -2418,7 +2418,15 @@ commit. Each outcome the new design allows is one of those two:
     2 KiB at most, whose commit would wait for nothing at its begin: its turn
     next, and no buffer of its process it is committed after still to commit;
     on the lane, each buffer of a drain paid a thread's wake for its walk and
-    another for the turn its commit waited on);
+    another for the turn its commit waited on). Such a buffer lets go of its
+    queue's claim on its ring's messages once it is begun, and the service
+    thread offers the queue's next buffer to the host there, as a doorbell's
+    thread does, so a buffer that asks for its `CB_SUBMITTED` behind it is
+    answered before the walk, or at its own doorbell during it, as behind a
+    walk on a lane thread. Held through the walk, the claim kept the doorbell
+    from answering, and a guest's `commitAndWaitUntilSubmitted` behind a
+    buffer of fills waited for that walk and its commit (tested by
+    `a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends`);
   - its signal of its queue's surface timeline ("Surface order"), and the
     release that stands in for one of a buffer that does not run: each is
     decided in the buffer's turn, after its walk, since the order reads a

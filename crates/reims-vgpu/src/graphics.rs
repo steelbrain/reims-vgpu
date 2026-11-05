@@ -58,7 +58,8 @@ use reims_graphics::wire::{
     RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, Scanout, Screen,
+    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
+    Screen,
 };
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
@@ -1105,8 +1106,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ([`Self::lookup_library`]).
     ///
     /// `bytes` is the message, borrowed, or the device's own copy of a command buffer's
-    /// ([`Host::command_buffer`]), which goes to the buffer's lane as it is.
-    fn handle_stage3(self: &Arc<Self>, poster: &CompletionPoster, bytes: Cow<'_, [u8]>) {
+    /// ([`Host::command_buffer`]), which goes to the buffer's lane as it is, with `claim`, its
+    /// queue's claim on its messages, which a buffer carried out here lets go once begun
+    /// ([`Self::carry_out`]).
+    fn handle_stage3(
+        self: &Arc<Self>,
+        poster: &CompletionPoster,
+        bytes: Cow<'_, [u8]>,
+        claim: Option<&mut QueueClaim<'_>>,
+    ) {
         let message: &[u8] = &bytes;
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
         if r#type == RGFX_CMD_BUFFER_OVER_PAGES && self.start_buffer_over_pages(poster, message) {
@@ -1148,7 +1156,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             RGFX_CMD_COMMAND_BUFFER => {
                 self.pending.wait_for_command_buffer(message);
                 if !foreign_queue(poster, message) {
-                    self.begin_command_buffer(poster, bytes.into_owned());
+                    self.begin_command_buffer(poster, bytes.into_owned(), claim);
                     return;
                 }
             }
@@ -1310,7 +1318,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ([`GraphicsDecoder::begin_taken`]), then walked and committed on the lane, in its turn
     /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile, `message`
     /// going there as it is.
-    fn begin_command_buffer(self: &Arc<Self>, poster: &CompletionPoster, message: Vec<u8>) {
+    fn begin_command_buffer(
+        self: &Arc<Self>,
+        poster: &CompletionPoster,
+        message: Vec<u8>,
+        claim: Option<&mut QueueClaim<'_>>,
+    ) {
         entry::run(|_| {
             // Held to the end of the buffer's work, on its lane ([`Self::reset_gate`]).
             let carried = self.reset_gate.read_arc();
@@ -1323,7 +1336,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 (self.decoders).sender(Some(sender_context(poster, &message)), self.sinks(poster));
             let begun =
                 refusing(|| decoder.begin_taken(&self.device, &message, poster.queue_obj_id()));
-            self.carry_out(decoder, begun, carried, poster.clone(), message);
+            self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
 
@@ -1349,9 +1362,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// lane thread's wake would, and its commit then follows at once, where on the lane each
     /// buffer of a drain (a guest's buffers committed back to back and waited for) paid a wake
     /// for its walk and another for the turn its commit waited on. The queue's next buffer is
-    /// begun once it is committed, a walk of a few dozen ops later; a buffer the guest asked
-    /// `CB_SUBMITTED` of meanwhile is answered on its doorbell's thread where it waits for
-    /// nothing, as before.
+    /// begun once it is committed, a walk of a few dozen ops later.
+    ///
+    /// A buffer carried out here lets its queue's `claim` go first, once begun
+    /// ([`QueueClaim::let_go`]): a buffer the guest published behind it and asked `CB_SUBMITTED`
+    /// of is offered to the host then, and one rung for during the walk at its doorbell, each
+    /// answered where it waits for nothing, as while a lane's thread walks the one before it.
+    /// Held through the walk, the claim kept the doorbell from answering it, and the answer came
+    /// only at the service thread's take after the walk and the commit: measured on the RTX
+    /// 5080 laptop host, a guest's `commitAndWaitUntilSubmitted` of a tiny buffer behind one of
+    /// fills took 32-36 µs at the median and 70-240 at the 90th percentile, against 18 and
+    /// 27-35 with that walk on the lane.
     fn carry_out(
         self: &Arc<Self>,
         decoder: GraphicsDecoder<P>,
@@ -1359,8 +1380,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         carried: ArcRwLockReadGuard<RawRwLock, ()>,
         poster: CompletionPoster,
         message: Vec<u8>,
+        claim: Option<&mut QueueClaim<'_>>,
     ) {
         let lane = decoder.lane();
+        let begun_whole = matches!(&begun, Ok(Ok(_)));
         let here = match &begun {
             Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
             Ok(Ok(_)) => {
@@ -1399,7 +1422,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         };
         match lane {
             Some(lane) if !here => lane.run(Box::new(job)),
-            _ => job(),
+            _ => {
+                // Begun, its place among the queue's buffers taken: the queue's next buffer may
+                // be answered while this one is walked here, as while a lane's thread walks it.
+                if let Some(claim) = claim.filter(|_| begun_whole) {
+                    claim.let_go();
+                }
+                job();
+            }
         }
     }
 
@@ -1997,15 +2027,20 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         self.control
-            .handle_stage3(completion, Cow::Borrowed(message));
+            .handle_stage3(completion, Cow::Borrowed(message), None);
     }
 
     fn queue_made(&self, completion: &CompletionPoster) {
         self.control.queue_made(completion);
     }
 
-    fn command_buffer(&self, completion: &CompletionPoster, message: Vec<u8>) {
-        self.control.handle_stage3(completion, Cow::Owned(message));
+    fn command_buffer(
+        &self,
+        completion: &CompletionPoster,
+        message: Vec<u8>,
+        claim: &mut QueueClaim<'_>,
+    ) {
+        (self.control).handle_stage3(completion, Cow::Owned(message), Some(claim));
     }
 
     fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {

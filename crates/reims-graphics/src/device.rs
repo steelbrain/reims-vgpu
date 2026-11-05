@@ -83,7 +83,11 @@
 //! it to take, the buffer fits the thread's copy of it (`DOORBELL_MESSAGE_MAX`), at most
 //! `DOORBELL_READS` of ring 0's messages are left to read, and every ring-0 message the buffer
 //! waits for is carried out. Otherwise the service thread takes the buffer as it takes any, so
-//! the queue's events keep its order either way.
+//! the queue's events keep its order either way. The service thread's hold on the queue's
+//! messages lasts through the host's begin of the buffer it hands over, which places that buffer
+//! among the queue's ([`QueueClaim`]): a host that then walks and commits the buffer on that
+//! thread lets the hold go first, and offers the queue's next buffer there, as a doorbell's
+//! thread does, so a buffer rung for meanwhile is answered before that walk, not after it.
 //!
 //! **An answer on a lane's thread.** A buffer the service thread takes and must wait for ring 0
 //! for is filed at the queue gate with its message ([`gate`]'s offer). The lane whose move ends
@@ -459,8 +463,18 @@ pub trait Host: Send + Sync + 'static {
     /// thread, as [`Host::stage3_message`] hands a message: `message` is the copy the device took
     /// of it out of the region (the region's module doc), which the host keeps for as long as it
     /// carries the buffer out (on a thread of its own, after this returns), so it copies the
-    /// message no more. The default hands it to [`Host::stage3_message`].
-    fn command_buffer(&self, completion: &CompletionPoster, message: Vec<u8>) {
+    /// message no more. `claim` is the queue's claim on its ring's messages, held into the call:
+    /// a host that carries out more of the buffer here than its begin, which places it among the
+    /// queue's buffers, lets it go first ([`QueueClaim::let_go`]), so the queue's next buffer is
+    /// answered meanwhile as it would be with that work on a thread of the host's. The default
+    /// hands the message to [`Host::stage3_message`], the claim held.
+    fn command_buffer(
+        &self,
+        completion: &CompletionPoster,
+        message: Vec<u8>,
+        claim: &mut QueueClaim<'_>,
+    ) {
+        let _ = claim;
         self.stage3_message(completion, &message);
     }
 
@@ -672,9 +686,10 @@ pub(crate) struct QueueShared {
     /// The highest `seqno` of a message taken off the submission ring, 0 before one is.
     taken_seqno: AtomicU64,
     /// Held by whoever takes the submission ring's messages or offers them to the host: the
-    /// service thread, from its take of a message to its hand-over, or a doorbell's thread, which
-    /// tries it and offers the host a message only where it holds it. It holds the `seqno` of the
-    /// message at the ring's head that the host answered on a doorbell's thread
+    /// service thread, from its take of a message to its hand-over, or to the host's begin of a
+    /// command buffer where the host lets it go there ([`QueueClaim`]), or a doorbell's thread,
+    /// which tries it and offers the host a message only where it holds it. It holds the `seqno`
+    /// of the message at the ring's head that the host answered on a doorbell's thread
     /// ([`Host::answer_command_buffer`]), until the service thread takes it.
     consuming: Mutex<Option<u64>>,
     /// The completion ring.
@@ -989,6 +1004,42 @@ impl std::fmt::Debug for CompleteAnswer {
         f.debug_struct("CompleteAnswer")
             .field("seqno", &self.seqno)
             .finish_non_exhaustive()
+    }
+}
+
+/// A command queue's claim on its submission ring's messages, which its service thread holds as
+/// it hands a `COMMAND_BUFFER` to the host ([`Host::command_buffer`]). While it is held no
+/// doorbell's thread offers the host the queue's next message
+/// ([`Device::mmio_write_taking`]), so the next buffer is not answered ahead of the one handed
+/// over, which takes its place among the queue's buffers at its begin. A host that carries out
+/// more of the buffer on the service thread than its begin (its walk and its commit) lets the
+/// claim go once it is begun ([`Self::let_go`]): the queue's next buffer may then be answered
+/// as it would be with that work on another thread, at its doorbell or here.
+pub struct QueueClaim<'a> {
+    /// The device's shared state.
+    shared: &'a Shared,
+    /// The queue whose messages it claims.
+    queue: &'a Arc<QueueShared>,
+    /// The queue's `consuming`, until the claim is let go.
+    held: Option<MutexGuard<'a, Option<u64>>>,
+}
+
+impl<'a> QueueClaim<'a> {
+    /// Lets go of the claim, then offers the queue's next message to the host on this thread as a
+    /// doorbell's thread does ([`Host::answer_command_buffer`]): a buffer the guest published and
+    /// rang for before the claim was let go, and now waits for its `CB_SUBMITTED`, is answered
+    /// here where it need wait for nothing, not after the work this thread carries out next. A
+    /// doorbell rung afterwards offers its buffer itself. Once let go, it stays so for the call.
+    pub fn let_go(&mut self) {
+        if self.held.take().is_some() {
+            self.shared.answer_on_doorbell(self.queue);
+        }
+    }
+
+    /// The queue's `consuming` again, taken where the claim was let go.
+    fn retake(self) -> MutexGuard<'a, Option<u64>> {
+        let QueueClaim { queue, held, .. } = self;
+        held.unwrap_or_else(|| queue.consuming.lock())
     }
 }
 
@@ -1994,9 +2045,9 @@ impl Shared {
 
     /// Takes and hands to the host every message the guest has published on `queue`'s submission
     /// ring, while the device is started and the ring is not broken. Each message is taken with
-    /// the ring held and handed over with only the queue's `consuming` held; the completion the
-    /// host owes is posted onto the queue's completion ring through `poster`, from the GPU's
-    /// thread.
+    /// the ring held and handed over with only the queue's `consuming` held, which the host may
+    /// let go once a `COMMAND_BUFFER` is begun ([`QueueClaim`]); the completion the host owes is
+    /// posted onto the queue's completion ring through `poster`, from the GPU's thread.
     fn take_queue_messages(&self, queue: &Arc<QueueShared>, poster: &CompletionPoster) {
         let mut consuming = queue.consuming.lock();
         loop {
@@ -2135,7 +2186,15 @@ impl Shared {
             } else {
                 message
             };
-            self.host.command_buffer(poster, message.bytes);
+            // The host may let the claim go once the buffer is begun ([`QueueClaim`]); a buffer
+            // a doorbell's thread answered meanwhile is the ring's next, which this takes next.
+            let mut claim = QueueClaim {
+                shared: self,
+                queue,
+                held: Some(consuming),
+            };
+            self.host.command_buffer(poster, message.bytes, &mut claim);
+            consuming = claim.retake();
         }
     }
 
