@@ -804,9 +804,14 @@ class Run:
                    (f": {kv.get('crash_names', '')}{note}" if n else ""))
         ws = {k: num(k) for k in ("ws_blocks", "ws_kib", "ws_max_blocks", "ws_max_kib", "ws_reserve_mib")}
         if ws["ws_blocks"] is not None:
-            self.litem("appload.windowserver", "PASS",
+            # Its peak against the kext's reserve for it: over the reserve, WindowServer's blocks come
+            # from the shared pool the other processes draw on.
+            over = (ws["ws_max_kib"] is not None and ws["ws_reserve_mib"] is not None
+                    and ws["ws_max_kib"] > ws["ws_reserve_mib"] * 1024)
+            self.litem("appload.windowserver", miss if over else "PASS",
                        f"WindowServer holds {ws['ws_blocks']} blocks, {ws['ws_kib'] / 1024:.1f} MiB (at most "
-                       f"{ws['ws_max_blocks']}, {ws['ws_max_kib'] / 1024:.1f} MiB) of its {ws['ws_reserve_mib']} MiB reserve")
+                       f"{ws['ws_max_blocks']}, {ws['ws_max_kib'] / 1024:.1f} MiB) of its {ws['ws_reserve_mib']} MiB reserve"
+                       + (f": its peak is {ws['ws_max_kib'] / 1024 - ws['ws_reserve_mib']:.1f} MiB over it{note}" if over else ""))
             self.lmetric("appload.ws_blocks", ws["ws_blocks"])
             self.lmetric("appload.ws_mib", round(ws["ws_kib"] / 1024, 1))
             self.lmetric("appload.ws_max_mib", round(ws["ws_max_kib"] / 1024, 1))
