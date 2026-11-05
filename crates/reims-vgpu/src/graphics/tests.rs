@@ -3447,17 +3447,34 @@ fn answer_of(guest: &mut Guest, seqno: u64) -> u32 {
     complete.status
 }
 
-/// Waits about 2 s for the platform to hold `n` committed command buffers not yet completed;
-/// their ids, in commit order.
-fn committed(platform: &FakePlatform, n: usize) -> Vec<ObjId> {
-    for _ in 0..2000 {
-        let ids = platform.world().committed();
-        if ids.len() == n {
-            return ids;
+/// How many times [`eventually`] polls, a millisecond's sleep apart, for a state the device's
+/// own threads reach: at least a minute, since a loaded host starves those threads for seconds
+/// (a present's wait was not seen within 2,000 polls, 2.2 s and 3.3 s, on msi beside other
+/// lanes' builds, where the test passes in under 0.4 s alone). A test that passes polls only
+/// until the state holds.
+const PATIENCE: u32 = 60_000;
+
+/// Polls `done` until it holds, [`PATIENCE`] times at most: whether it held.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..PATIENCE {
+        if done() {
+            return true;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    panic!("{n} command buffers were not committed");
+    done()
+}
+
+/// Waits ([`eventually`]) for the platform to hold `n` committed command buffers not yet
+/// completed; their ids, in commit order.
+fn committed(platform: &FakePlatform, n: usize) -> Vec<ObjId> {
+    let mut ids = Vec::new();
+    let held = eventually(|| {
+        ids = platform.world().committed();
+        ids.len() == n
+    });
+    assert!(held, "{n} command buffers were not committed");
+    ids
 }
 
 /// A block is given out again only once nothing the host holds lies in it: its release is refused
@@ -4542,15 +4559,12 @@ fn write_writers(device: &GraphicsDevice<FakePlatform>, at: u64, writers: &[(u64
     }
 }
 
-/// Waits about 2 s for `n` presents to wait for their writers.
+/// Waits ([`eventually`]) for `n` presents to wait for their writers.
 fn presents_waiting(device: &GraphicsDevice<FakePlatform>, n: usize) {
-    for _ in 0..2000 {
-        if device.control.presents.waiting() == n {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("{n} presents were not waiting");
+    assert!(
+        eventually(|| device.control.presents.waiting() == n),
+        "{n} presents were not waiting"
+    );
 }
 
 /// The width of the texture the display shows; `None` for the scanout.
