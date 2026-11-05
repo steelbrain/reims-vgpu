@@ -229,9 +229,10 @@ fi
 ROUND=$(date +%Y%m%d-%H%M%S)
 RD=$MSI_GATE/probes/$ROUND
 # The tip's bench (the boot's check of our Metal device), else the newest gate run's.
-run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1)
+# (|| true: a tip no gate built, such as a lane's probe-only host, has no run; set -e must not end us.)
+run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1 || true)
 [[ -x $run/artifacts/payload/bench ]] || run=$(ls -1dt "$GH/runs/"*/ 2> /dev/null | while read -r d; do
-  [[ -x ${d}artifacts/payload/bench ]] && { echo "${d%/}"; break; }; done)
+  [[ -x ${d}artifacts/payload/bench ]] && { echo "${d%/}"; break; }; done || true)
 [[ -x $run/artifacts/payload/bench ]] || { echo "probe-batch: no gate run with its bench" >&2; exit 1; }
 S=$(mktemp -d /tmp/lg-round.XXXXXX)
 mkdir -p "$S/lg/bin" "$S/lg/ship/payload"
