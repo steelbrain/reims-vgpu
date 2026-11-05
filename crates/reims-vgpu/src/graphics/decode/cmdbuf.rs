@@ -6363,15 +6363,20 @@ mod tests {
     /// What a sink of [`splitting`]'s was handed, in order.
     type Sunk<T> = Arc<Mutex<Vec<T>>>;
 
+    /// A decoder that splits command buffers, and what its sinks were handed ([`splitting`]).
+    struct Split {
+        p: Arc<FakePlatform>,
+        dec: GraphicsDecoder<FakePlatform>,
+        /// Each `CB_SCHEDULED` and `CB_COMPLETE`: its type, its command buffer and its status.
+        posted: Sunk<(u32, u64, u32)>,
+        /// Each `CB_COMPLETE` whole.
+        records: Sunk<RgfxCbComplete>,
+    }
+
     /// A decoder of [`setup`]'s, its messages of context 0, on a platform that splits command
     /// buffers, whose clock moves on [`SPLIT_AFTER`] after each op a walk carries out, so every
     /// encoder's end may end a part; and the records it posts.
-    fn splitting() -> (
-        Arc<FakePlatform>,
-        GraphicsDecoder<FakePlatform>,
-        Sunk<(u32, u64, u32)>,
-        Sunk<RgfxCbComplete>,
-    ) {
+    fn splitting() -> Split {
         let (p, mut dec) = setup();
         dec.set_context(Some(0));
         p.world().split_command_buffers();
@@ -6395,7 +6400,12 @@ mod tests {
                 .push((m.header.r#type, m.cb_obj_id, m.status));
             complete.lock().push(m);
         }));
-        (p, dec, posted, records)
+        Split {
+            p,
+            dec,
+            posted,
+            records,
+        }
     }
 
     /// A command buffer of three render passes walked long is committed in three parts as it is
@@ -6405,7 +6415,12 @@ mod tests {
     #[test]
     fn a_buffer_walked_long_is_committed_in_parts_with_one_outcome() {
         use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
-        let (p, mut dec, posted, records) = splitting();
+        let Split {
+            p,
+            mut dec,
+            posted,
+            records,
+        } = splitting();
         let device = p.device();
         let ops = [render_ops(), render_ops(), render_ops()].concat();
         let message = command_buffer_message(300, 30, &ops);
@@ -6498,7 +6513,7 @@ mod tests {
             "a platform that keeps it whole"
         );
 
-        let (p, mut dec, _, _) = splitting();
+        let Split { p, mut dec, .. } = splitting();
         let device = p.device();
         let ticket = Arc::new(Mutex::new(dec.shared.sequencer.issue(Some(0), false)));
         let last = hooked(&ops) - 1;
@@ -6521,7 +6536,7 @@ mod tests {
     /// is walked but committed only after its last part; one of another context is not held.
     #[test]
     fn another_queue_s_commit_waits_for_a_buffer_s_last_part() {
-        let (p, mut dec, _, _) = splitting();
+        let Split { p, mut dec, .. } = splitting();
         let device = p.device();
         let queue = RgfxQueueCreate {
             header: RgfxMsgHeader {
@@ -6589,7 +6604,9 @@ mod tests {
     /// completion alone, as one whose walk faults whole; its context's gate is let go.
     #[test]
     fn a_walk_that_faults_after_a_part_fails_at_its_stand_in() {
-        let (p, mut dec, posted, _) = splitting();
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
         let device = p.device();
         let mut ops = [render_ops(), render_ops()].concat();
         // A draw with no open encoder faults the walk.
@@ -6642,7 +6659,9 @@ mod tests {
     #[test]
     fn a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut() {
         use reims_vgpu_core::platform::types::CommandBufferStatus;
-        let (p, mut dec, posted, _) = splitting();
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
         let device = p.device();
         create_events(&p, &mut dec, 0);
         let signals = Arc::clone(&posted);
@@ -6710,7 +6729,9 @@ mod tests {
     /// refused: the skipped encoder made nothing, and the buffer's parts complete as one buffer.
     #[test]
     fn a_split_after_a_skipped_encoder_answers_as_the_whole() {
-        let (p, mut dec, posted, _) = splitting();
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
         let device = p.device();
         dec.refuse(9, RGFX_CMD_TEXTURE_CREATE);
         // The reference render ops, their pass's colour attachment texture 9.
