@@ -4,7 +4,7 @@
 //!
 //! - `lib/libreims_vgpu.a`, and the shared library beside it, built from `reims-vgpu-c`, the
 //!   crate of the C API: `lib/libreims_vgpu.dylib` on macOS, `lib/libreims_vgpu.so` on Linux.
-//!   How each OS builds and names them is its own module's: [`macos`], [`linux`].
+//!   How each OS builds and names them is its own module's: `macos`, `linux`.
 //! - `include/reims_vgpu.h`, the committed header.
 //! - `lib/pkgconfig/reims-vgpu.pc`. Its `Libs.private` names every library a static link of the
 //!   archive needs; its `optionrom` variable names the ROM below.

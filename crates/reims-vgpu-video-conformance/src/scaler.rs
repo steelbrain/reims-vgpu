@@ -23,9 +23,9 @@
 //! passes.
 //!
 //! Before the cases, `siting` lines give the chroma kernels the backend's
-//! conversions have, measured as [`siting`] says; and `map` lines where
+//! conversions have, measured as [`siting`](mod@siting) says; and `map` lines where
 //! its scales take their pixels from, beside where the plan's alignment
-//! puts them ([`mapping`]).
+//! puts them ([`mapping`](mod@mapping)).
 //!
 //! Lines start with a word to grep: `caps`, `siting`, `map`, `case`,
 //! `engines`, `bench`, `result`. The engines line is the GPU driver's

@@ -48,6 +48,8 @@
 //!
 //! A shared event's value only rises (docs/graphics-kext/design.md, "Shared events"), so a second
 //! signal of a value is harmless.
+//!
+//! [`RGFX_OP_SURFACE_ORDER`]: reims_graphics::ops::RGFX_OP_SURFACE_ORDER
 
 use std::collections::HashMap;
 use std::sync::Arc;

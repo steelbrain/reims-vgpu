@@ -519,7 +519,7 @@ pub fn device_made(properties: &rt::DeviceProperties) {
     });
 }
 
-/// The process's placement, but a test's own on its thread ([`as_native`]).
+/// The process's placement, but a test's own on its thread (the tests' `as_native`).
 pub fn placement() -> Placement {
     #[cfg(test)]
     if let Some(placement) = TEST_PLACEMENT.with(std::cell::Cell::get) {

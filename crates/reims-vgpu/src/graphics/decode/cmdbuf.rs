@@ -15,7 +15,7 @@
 //! **Events.** `SIGNAL_EVENT` and `WAIT_EVENT` come between encoders, as Metal's
 //! `encodeSignalEvent:value:` and `encodeWaitForEvent:value:` do, and name an event
 //! or a shared event. The value a buffer signals a shared event to goes to the guest
-//! ([`RgfxEventSignalled`](reims_graphics::wire::RgfxEventSignalled)) as the host's event
+//! ([`RgfxEventSignalled`]) as the host's event
 //! reaches it, where the buffer runs more work after the signal, else once the buffer
 //! finishes, and always ahead of its completion record ([`Signals`]); a buffer that
 //! waits is watched, and named in the log where it waits long ([`super::waits`]).

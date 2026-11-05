@@ -5,7 +5,7 @@
 //! The functions and keys are looked up at run time with `dlsym`, not
 //! linked, so that the backend still loads on an older macOS, which has no
 //! motion estimation to offer. Each function's type is declared once,
-//! through [`looked_up!`], which records its C spelling for the header
+//! through `looked_up!` (below), which records its C spelling for the header
 //! check in `ffi.rs`, as `declare!` does for the linked ones.
 //!
 //! The session's output handler is a block; `macos/motion.rs` makes one,
@@ -26,7 +26,7 @@ pub(crate) type VTMotionEstimationFrameFlags = u32;
 /// `VTMotionEstimationInfoFlags`: a `uint32_t` set.
 pub(crate) type VTMotionEstimationInfoFlags = u32;
 /// `VTMotionEstimationOutputHandler`: a block, here a pointer to a
-/// [`HandlerBlock`].
+/// `HandlerBlock` (`macos/motion.rs`).
 pub(crate) type VTMotionEstimationOutputHandler = *mut c_void;
 
 /// Declares each looked-up function's type under the function's own name,

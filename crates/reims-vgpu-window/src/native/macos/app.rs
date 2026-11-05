@@ -1,7 +1,7 @@
 //! The application the windows belong to: its start, once per process, its menu, and its end.
 //!
 //! **The start** ([`start`]), at the first window's attach, is posted to the main run loop alone
-//! ([`main_thread`](super::main_thread)), and runs there:
+//! ([`main_thread`]), and runs there:
 //! - when the host already made an `NSApplication`, the windows just open in it. Unless it is
 //!   ours, a local event monitor stands in for our `sendEvent:` (below);
 //! - otherwise [`ReimsApplication`] becomes the shared application, with our delegate, and

@@ -10,7 +10,7 @@
 //!   ([`SourcePicture`]). The CPU copies no frame.
 //! - **Bitstreams** go straight into a buffer the caller's
 //!   [`BitstreamSource`] gives for each picture, imported host pages among
-//!   them ([`ImportedBitstream`]); the parameter sets go there too, in front
+//!   them ([`ImportedBitstream`](io::ImportedBitstream)); the parameter sets go there too, in front
 //!   of each IDR picture, where they are asked for in-band
 //!   ([`ParameterSetMode::InBand`]), and are always the encoder's to read
 //!   ([`H264Encoder::parameter_sets`], [`H264Encoder::avcc`]).
@@ -21,7 +21,7 @@
 //!   ([`Vbv`]), at a quality level of the device's.
 //! - **Frames** come out in decode order ([`EncodedFrame`]): each with its
 //!   type, order count and `frame_num`, the timeline value after which its
-//!   bitstream is there, and what the device says it wrote ([`Feedback`]).
+//!   bitstream is there, and what the device says it wrote ([`Feedback`](frame::Feedback)).
 
 pub(crate) mod caps;
 pub(crate) mod device;

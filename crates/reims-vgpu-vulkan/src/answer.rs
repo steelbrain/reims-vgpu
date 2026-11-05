@@ -55,7 +55,7 @@
 //! naming the notice, and a notice announced on a thread outside every call here (the runtime's
 //! scheduler thread, at a host step) dies where it is announced. Where a kind's docs below say it
 //! dies, they say what strict mode does. This crate's tests run strict, as each asserts the
-//! deaths ([`relaxed`] runs a call under the default).
+//! deaths (the tests' `relaxed` runs a call under the default).
 //!
 //! **A difference this platform finds itself** ([`Inexact`], [`inexact`]): a value it computes
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
@@ -1631,7 +1631,7 @@ fn depth() -> u32 {
 /// Whether this process dies at a difference from Metal's answer it could go on past: a
 /// degradation of [`DIES`] or one of [`Inexact`] (the module's docs). `REIMS_VGPU_STRICT` set to
 /// `1`, read once per process, turns it on; by default the process relays them and goes on. A
-/// test of this crate runs strict, but where [`relaxed`] runs it on its thread.
+/// test of this crate runs strict, but where the tests' `relaxed` runs it on its thread.
 pub fn strict() -> bool {
     #[cfg(test)]
     if let Some(strict) = TEST_STRICT.with(Cell::get) {
@@ -1640,7 +1640,7 @@ pub fn strict() -> bool {
     strict_process()
 }
 
-/// [`strict`] as the process is set, whatever a test's thread runs under ([`relaxed`]).
+/// [`strict`] as the process is set, whatever a test's thread runs under (the tests' `relaxed`).
 pub(crate) fn strict_process() -> bool {
     static STRICT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         cfg!(test) || std::env::var_os("REIMS_VGPU_STRICT").is_some_and(|v| v == "1")
@@ -1686,7 +1686,7 @@ fn count_relayed(kind: rt::Degradation) -> bool {
 
 /// Each kind of [`DIES`] this process relayed outside strict mode, with how many times the runtime
 /// announced it: once per device by default, but in census mode or in a strict process whose
-/// thread runs [`relaxed`] ([`crate::platform`]'s `announced_each`).
+/// thread runs the tests' `relaxed` ([`crate::platform`]'s `announced_each`).
 pub fn relayed_counts() -> Vec<(rt::Degradation, u64)> {
     use std::sync::atomic::Ordering;
     (DIES.iter().zip(&RELAYED_DIES))

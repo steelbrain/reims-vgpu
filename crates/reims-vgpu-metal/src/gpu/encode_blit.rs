@@ -31,7 +31,7 @@ impl reims_vgpu_core::platform::blit::BlitEncoder<MetalPlatform> for MetalBlitEn
         Ok(false)
     }
 
-    /// Never, as [`Self::copy_from_guest_ram`].
+    /// Never, as `copy_from_guest_ram` above.
     fn copy_to_guest_ram(
         &self,
         _on: OnFault,

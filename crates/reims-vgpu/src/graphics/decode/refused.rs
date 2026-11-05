@@ -9,7 +9,7 @@
 //! of its context's table like any object's, until its destroy, the id's next create, the
 //! context's close or the device's reset), and what names it is dropped, never the command
 //! buffer that names it:
-//! - a resolver that meets one answers [`reference`], a raise of its own, which the command
+//! - a resolver that meets one answers [`reference()`], a raise of its own, which the command
 //!   buffer's walk takes at the op ([`is_refused`]): an op that uses the object itself (a copy, a
 //!   fill, an indirect or indexed draw from it, a fence update or wait) is dropped;
 //! - a binding of one binds nil (a pipeline state is not set at all) and marks its slot
@@ -49,7 +49,7 @@ use reims_vgpu_core::raise::{Origin, Raise, RaiseResult};
 
 use super::read;
 
-/// The site of [`reference`]'s raise.
+/// The site of [`reference()`]'s raise.
 const SITE: &str = "rgfx.decode.refused";
 
 /// What an id whose posted create the host refused stands for: the create's message type, and
@@ -88,7 +88,7 @@ impl Refused {
         }
     }
 
-    /// The raise of a resolver that met it, named by `obj_id` ([`reference`]).
+    /// The raise of a resolver that met it, named by `obj_id` ([`reference()`]).
     pub(crate) fn reference(&self, obj_id: u64) -> Raise {
         self.used(obj_id);
         reference(obj_id)
@@ -104,7 +104,7 @@ pub(crate) fn reference(obj_id: u64) -> Raise {
     ))
 }
 
-/// Whether `raise` is a resolver's of an object whose create the host refused ([`reference`]).
+/// Whether `raise` is a resolver's of an object whose create the host refused ([`reference()`]).
 pub(crate) fn is_refused(raise: &Raise) -> bool {
     raise.origin() == Origin::Boundary(SITE)
 }

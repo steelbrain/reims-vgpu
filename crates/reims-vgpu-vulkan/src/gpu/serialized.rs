@@ -508,7 +508,7 @@ const RESOLVE_MEASURED: [u32; 2] = [2, 4];
 
 /// Whether a state of `samples` samples resolves its half-float attachments as Metal's at
 /// [`NEAREST_EVEN`]: one sample (0 is taken as one), or a count of [`RESOLVE_MEASURED`]; under the
-/// tests, also a count [`RESOLVE_PROBED`] holds, for the probe that measures it.
+/// tests, also a count `RESOLVE_PROBED` holds, for the probe that measures it.
 fn resolve_measured(samples: u32) -> bool {
     #[cfg(test)]
     if RESOLVE_PROBED.load(std::sync::atomic::Ordering::Relaxed) == samples {

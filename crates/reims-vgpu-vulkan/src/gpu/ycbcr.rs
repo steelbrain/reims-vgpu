@@ -1,6 +1,6 @@
 //! The two-plane YCbCr pixel formats, which Metal makes textures of over an IOSurface's planes
 //! alone. A texture descriptor holds each as the runtime's format, and every creator but the one
-//! over a surface answers it as Metal does ([`answer`]); 505 and 543 were measured first. One harness measures them (`measure.rs`: the tests' surfaces of each OSType's
+//! over a surface answers it as Metal does; 505 and 543 were measured first. One harness measures them (`measure.rs`: the tests' surfaces of each OSType's
 //! layout, and the probes that read a texture of any of the formats on Metal and here), and the
 //! tests compare the runtime's textures of each format it reads with Metal's (`sampling.rs`).
 //!
@@ -11,8 +11,8 @@
 //!   (the runtime's, [`crate::gpu::format_info`]);
 //! - `newTextureWithDescriptor:`, a buffer's `newTextureWithDescriptor:offset:bytesPerRow:` and
 //!   `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`, and a placement heap's
-//!   `newTextureWithDescriptor:offset:` answer nil for every descriptor their validation passes
-//!   ([`answer`]): 1D, 1D array, 2D, 2D array, 3D, cube, cube array and texture buffer types, at
+//!   `newTextureWithDescriptor:offset:` answer nil for every descriptor their validation passes:
+//!   1D, 1D array, 2D, 2D array, 3D, cube, cube array and texture buffer types, at
 //!   sizes from 1 by 1 to the largest, with every level count the size takes, in every storage
 //!   mode, of every usage but `ShaderAtomic`, swizzled without `ShaderWrite` or `RenderTarget`
 //!   usage or with `writeSwizzleEnabled`, `framebufferOnly`, and rotated 2 or 4 with
@@ -268,7 +268,7 @@ pub fn twin_view(source: u64, view: u64) -> bool {
 /// Whether `pf`, a format the runtime has, is one of the two-plane YCbCr and RGB formats Metal
 /// makes textures of over an IOSurface's planes alone (the runtime's `ycbcr_format`, 69 of them,
 /// the formats here among them): Metal answers a descriptor of one as it answers one of 505's
-/// from every other creator ([`answer`]).
+/// from every other creator (the module's docs).
 pub fn two_plane(pf: PixelFormat) -> bool {
     metal2vulkan::metal::format::ycbcr_format(pf).is_some()
 }

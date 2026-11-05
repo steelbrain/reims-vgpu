@@ -1,7 +1,7 @@
 //! The scaler device's kernels on the Vulkan platform: the metal crate's `scaler.metal`, which
 //! `build.rs` compiled with fast math off into `$OUT_DIR/scaler.metallib`, made on the runtime's
 //! system default device, the one the library's GPU device draws on (the loader's pin included,
-//! [`crate::host_gpus`]). reims-vgpu's scaler backend works out each dispatch's kernel,
+//! `crate::host_gpus` on Linux). reims-vgpu's scaler backend works out each dispatch's kernel,
 //! parameters and taps from a transform's plan; this makes the buffers it binds, encodes its
 //! dispatches in one command buffer of a queue of its own, in order, each after the one before (a
 //! serial encoder, which the runtime orders with the barriers their buffers need), and says when

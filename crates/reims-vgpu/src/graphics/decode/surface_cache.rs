@@ -118,6 +118,8 @@
 //! tiling as a color attachment, and on NVIDIA under `VK_NV_linear_color_attachment` where every
 //! color attachment of the pass is linear; elsewhere it renders through a stand-in copied within
 //! the GPU's memory. Neither is measured on a discrete RADV or ANV device yet.
+//!
+//! [`RGFX_SURFACE_PAGES_CACHED`]: reims_graphics::wire::RGFX_SURFACE_PAGES_CACHED
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};

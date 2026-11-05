@@ -2096,7 +2096,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it
-    /// finds wrong is the `NSError`, every other refusal dies at the send ([`compile_error`]).
+    /// finds wrong is the `NSError`, every other refusal dies at the send ([`compile_error()`]).
     fn new_compute_pipeline_state_full(
         &self,
         desc: &FullComputePipelineDesc<'_, VulkanPlatform>,

@@ -221,6 +221,8 @@ impl<G: Gpu> ScalerBackend for GpuScalerBackend<G> {
 
 /// The capabilities: the four classes of [`ScalerFormat`], each both ways, Apple's sides from
 /// `smallest`, and Apple's ratios.
+///
+/// [`ScalerFormat`]: reims_vgpu_video_core::scaler::format::ScalerFormat
 fn capabilities(smallest: u32) -> Capabilities {
     Capabilities {
         // No hardware revision of Apple's describes this scaler, and nothing reads it: 0, ours.

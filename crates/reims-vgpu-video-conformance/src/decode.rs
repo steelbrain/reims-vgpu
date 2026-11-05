@@ -24,7 +24,7 @@
 //! few threads of their own, so that the run's rate is the host's and not
 //! the hash's. Its buffers come from a pool, as a guest's pixel buffer pool
 //! lends the same ones again; a buffer back in the pool is filled with
-//! [`POISON`] first, so that a frame the host leaves partly unwritten
+//! `POISON` first, so that a frame the host leaves partly unwritten
 //! still hashes wrong.
 //!
 //! The messages, holds and time go to stderr.
@@ -158,7 +158,7 @@ mod stand_in {
     /// mapping ID, as a guest's pool lends its IOSurfaces: the guest maps
     /// each once, and the host's mapping of it lives as long as it does.
     /// Its pages lie as a guest's do where the host can have them so
-    /// ([`GuestPages`]), and are lent to a backend's device then.
+    /// (`GuestPages`, off macOS), and are lent to a backend's device then.
     struct Storage {
         mapping_id: u64,
         len: usize,

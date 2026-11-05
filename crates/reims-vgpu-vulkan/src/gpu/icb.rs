@@ -286,7 +286,7 @@ pub struct IcbObject {
     /// ([`OverrunShape::of`]).
     pub(crate) overrun_shape: Option<OverrunShape>,
     /// How many committed command buffers that have not ended execute it as their commit read
-    /// its records ([`crate::gpu::command::executions::reads`]).
+    /// its records (the `reads` of [`crate::gpu::command::executions`]).
     pub(crate) readers: Arc<AtomicUsize>,
 }
 

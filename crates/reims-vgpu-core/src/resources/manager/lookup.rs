@@ -2,7 +2,7 @@
 //!
 //! [`ManagerLookup`] holds its manager unretained. Each typed getter is the manager's lookup;
 //! on a lookup error it logs the error and raises
-//! [`RaiseKind::Lookup`](super::RaiseKind::Lookup). The untyped resource lookup answers nil
+//! [`RaiseKind::Lookup`]. The untyped resource lookup answers nil
 //! instead, and the writable cursor lookup null.
 //!
 //! [`ManagerLookup::get_resource_raising_empty`] is the untyped lookup for the one list whose nil

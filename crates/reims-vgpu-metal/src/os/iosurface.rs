@@ -5,7 +5,7 @@
 //! spec becomes an `NSMutableDictionary`, key by key in the spec's order, with these `NSNumber`
 //! constructors (`numberWithUnsignedLongLong:` for `u64`, `numberWithUnsignedInt:` for `u32`,
 //! `numberWithUnsignedChar:` for the component arrays). Each Foundation send is a
-//! [`value`](crate::msg::value) send, which dies at the send if it raises.
+//! [`value`] send, which dies at the send if it raises.
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;

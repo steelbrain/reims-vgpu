@@ -1416,14 +1416,14 @@ pub fn run(
 }
 
 /// A test whose body dies: `death_test!(name, |t| body, |r| check)`. The body runs in a child
-/// process ([`run`](crate::testkit::death::run)) where a death aborts as in production. The parent
+/// process ([`run`]) where a death aborts as in production. The parent
 /// asserts a death before the body returned, with nothing recorded after it on any thread, then
-/// runs `check` on the [`Report`](crate::testkit::death::Report).
+/// runs `check` on the [`Report`].
 ///
 /// `death_test!(name, options = Options { .. }, |t| body, |r| check)` runs it with other
-/// [`Options`](crate::testkit::death::Options): a test with a thread that records freely beside
+/// [`Options`]: a test with a thread that records freely beside
 /// the death judges "nothing after" on the dying thread alone
-/// ([`After::DyingThread`](crate::testkit::death::After::DyingThread)).
+/// ([`After::DyingThread`]).
 #[macro_export]
 macro_rules! death_test {
     ($(#[$meta:meta])* $name:ident, options = $opts:expr, $body:expr, $check:expr $(,)?) => {

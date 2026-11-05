@@ -545,9 +545,9 @@ fn alive(id: u32) -> bool {
 
 /// `IOSurfaceCreate` and `[[IOSurface alloc] initWithProperties:]`: the metal crate's. A surface
 /// made over the guest's pages, or at an offset into its allocation, is recorded with them
-/// ([`surface_memory`], [`surface_offset`]), and with whether the GPU's writes through it reach
-/// them ([`gpu_read_only`]); every lookup of it answers the record too. Each surface made here
-/// drops the record of a surface gone that had its ID.
+/// ([`crate::os::surface_memory`], [`crate::os::surface_offset`]), and with whether the GPU's
+/// writes through it reach them ([`crate::os::gpu_read_only`]); every lookup of it answers the
+/// record too. Each surface made here drops the record of a surface gone that had its ID.
 #[derive(Debug, Default)]
 pub struct VulkanSurfaces(MetalSurfaces);
 

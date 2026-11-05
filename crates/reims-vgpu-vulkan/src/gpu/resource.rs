@@ -937,8 +937,8 @@ pub(crate) fn render_pipeline(raw: rt::RenderPipelineState) -> VulkanRenderPipel
     render_pipeline_of(raw, PrimitiveTopologyClass::Unspecified, None)
 }
 
-/// [`render_pipeline`] of `descriptor`, where one made it, whose `inputPrimitiveTopology` is
-/// `input_primitive_topology`.
+/// The handle of a state a creator made, with the runtime's identifier of it, and `descriptor`,
+/// where one made it, whose `inputPrimitiveTopology` is `input_primitive_topology`.
 pub(crate) fn render_pipeline_of(
     raw: rt::RenderPipelineState,
     input_primitive_topology: PrimitiveTopologyClass,
@@ -1569,10 +1569,11 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// The runtime reads `pixel_bytes` in place, through their pointer ([`guest_bytes`]), each
     /// byte once. Refused as Metal's validation refuses a region outside the level, rows that do
     /// not cover it, or a Private texture. One of a texture over memory the runtime imports
-    /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only()`]),
-    /// dies: the runtime writes through the twin, which reaches the pages, where Metal's CPU
-    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]). A surface's
-    /// reads a copy of them first ([`host_bytes`]), which it writes row by row.
+    /// through a writable twin of read-only pages, but a surface's
+    /// ([`TextureObject::gpu_read_only()`]), dies: the runtime writes through the twin, which
+    /// reaches the pages, where Metal's CPU writes through their read-only mapping
+    /// ([`crate::gpu::writes::kept_write`]). A surface's reads a copy of them first
+    /// ([`host_bytes`]), which it writes row by row.
     fn replace_region(
         &self,
         region: MtlRegion,

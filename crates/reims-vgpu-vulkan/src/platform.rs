@@ -318,8 +318,8 @@ pub const VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION: &std::ffi::CStr = c"VK_KHR_uni
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
 /// call here hears ([`crate::answer::HEARD`]) and those that die by default
 /// ([`crate::answer::DIES_BY_DEFAULT`]), `CopiedHostPages`, which the device's probe of its imports
-/// may meet unheard as it is made ([`crate::answer::unheard`]), and every other kind of
-/// [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
+/// may meet unheard as it is made ([`crate::answer`]'s `unheard`, on Linux), and every other kind
+/// of [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
 /// each occurrence. Elsewhere the
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
 /// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,

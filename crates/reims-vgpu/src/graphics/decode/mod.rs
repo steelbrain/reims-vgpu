@@ -680,8 +680,8 @@ struct SurfaceNames {
 /// The stage-3 decoder: a handle on the device's [`Shared`] state through which one message is
 /// carried out, with the message's sender and the sinks its records go to. It holds what the
 /// message named (its views of its contexts' tables, [`tables::View`]) until it drops, or until
-/// a new message begins on it ([`Self::set_context`], [`Self::decode`]), and a command buffer's
-/// place in the commit order ([`sequencer`]).
+/// a new message begins on it ([`Self::decode`]) or it ends ([`Self::end_message`]), and a command
+/// buffer's place in the commit order ([`sequencer`]).
 pub struct GraphicsDecoder<P: Platform> {
     shared: Arc<Shared<P>>,
     /// The platform, as [`Shared`]'s.
@@ -934,6 +934,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
+    ///
+    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
     pub(crate) fn surface_pages_available(&self) -> bool {
         self.shared.surface_views.lock().available(&self.platform)
     }

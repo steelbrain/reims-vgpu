@@ -179,7 +179,7 @@ impl fmt::Display for Gpu {
 }
 
 /// What the choice asks of the host: its GPUs, and a backend's open on one. Linux's is
-/// [`LinuxHost`]; the tests bring stand-ins.
+/// `LinuxHost`; the tests bring stand-ins.
 pub(crate) trait Host {
     /// The GPU the library's GPU device runs on; `None` where the Vulkan runtime makes no device.
     fn gpu_device(&self) -> Option<Gpu>;

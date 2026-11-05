@@ -208,8 +208,8 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// A platform may answer blocks of its own around the host's, to learn of the host's mapping
     /// work. Each calls the host's block once per call, with the same arguments, and answers its
     /// answer; holds no other block, so the host sees the blocks' `destroy` callbacks in the order
-    /// it does ([`crate::host::callbacks`]); and a nil block stays nil. The answer's other blocks
-    /// are not read.
+    /// it does (the `callbacks` module of [`crate::host`]); and a nil block stays nil. The answer's
+    /// other blocks are not read.
     fn host_blocks(&self, blocks: HostBlocks) -> HostBlocks {
         blocks
     }

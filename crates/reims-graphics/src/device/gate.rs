@@ -7,9 +7,9 @@
 //! once that holds: the control thread's move to count `done` wakes the threads waiting for a
 //! count at or below `done` ([`Gate::counted`]), and a context's lane carrying its messages out
 //! through count `done` wakes that context's threads waiting for its lane through a count at or
-//! below `done` ([`Gate::carried_out`]). So a thread is woken at most twice for a buffer, whatever
-//! the other processes' messages, where one wake for every waiting thread at each message any
-//! thread took or carried out woke each of a device's waiting queues at every message.
+//! below `done` ([`Gate::carried_out_offering`]). So a thread is woken at most twice for a buffer,
+//! whatever the other processes' messages, where one wake for every waiting thread at each message
+//! any thread took or carried out woke each of a device's waiting queues at every message.
 //!
 //! A thread checks what it waits for with the gate's lock held and files itself under it, and
 //! whoever moves the count or the lane does so before it takes the lock to wake, so no wake is
@@ -163,16 +163,16 @@ pub(super) enum Look {
 }
 
 impl Gate {
-    /// Waits until `look` finds nothing more to wait for, looking again at each wake, each time
-    /// with the gate's lock held.
+    /// [`Self::wait_offering`] with nothing offered: the tests' wait.
     #[cfg(test)]
     pub(super) fn wait(&self, look: impl FnMut() -> Look) {
         self.wait_offering(look, None);
     }
 
-    /// [`Self::wait`], filed with `offer`, the buffer the waiting thread holds, which the lane
-    /// whose move ends the wait may offer to the host before it wakes the thread (the module
-    /// doc). The thread withdraws it once this returns ([`Offer::withdraw`]).
+    /// Waits until `look` finds nothing more to wait for, looking again at each wake, each time
+    /// with the gate's lock held, filed with `offer`, the buffer the waiting thread holds, which
+    /// the lane whose move ends the wait may offer to the host before it wakes the thread (the
+    /// module doc). The thread withdraws it once this returns ([`Offer::withdraw`]).
     pub(super) fn wait_offering(&self, mut look: impl FnMut() -> Look, offer: Option<&Arc<Offer>>) {
         let wake = Arc::new(Condvar::new());
         let file = || File {
@@ -230,19 +230,19 @@ impl Gate {
         Self::wake(&mut state, due.into_values().map(|file| file.wake));
     }
 
-    /// Context `context`'s lane has carried out the context's messages through count `done`
-    /// ([`Lanes::finished`](super::lanes::Lanes::finished)): its threads waiting for the lane
-    /// through a count at or below it look again.
+    /// [`Self::carried_out_offering`] offering nothing: the tests' move of a lane.
     #[cfg(test)]
     pub(super) fn carried_out(&self, context: u32, done: u64) {
         self.carried_out_offering(context, done, |_| false);
     }
 
-    /// [`Self::carried_out`], on the lane's thread: the buffer each thread it wakes files is
-    /// handed to `offer` first, with the gate's lock let go, as the host's answer may raise the
-    /// interrupt, and the raise call the device; then each thread is woken. `offer` answers
-    /// whether it offered the buffer to the host, which it does once at most, and only where
-    /// nothing more is waited for; one it did not offer stays open for a later waker.
+    /// Context `context`'s lane has carried out the context's messages through count `done`
+    /// ([`Lanes::finished`](super::lanes::Lanes::finished)): its threads waiting for the lane
+    /// through a count at or below it look again. On the lane's thread: the buffer each thread
+    /// it wakes files is handed to `offer` first, with the gate's lock let go, as the host's answer
+    /// may raise the interrupt, and the raise call the device; then each thread is woken. `offer`
+    /// answers whether it offered the buffer to the host, which it does once at most, and only
+    /// where nothing more is waited for; one it did not offer stays open for a later waker.
     pub(super) fn carried_out_offering(
         &self,
         context: u32,

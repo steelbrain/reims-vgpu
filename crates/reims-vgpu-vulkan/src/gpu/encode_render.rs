@@ -118,7 +118,7 @@
 //!     whatever the setter set: most draws draw nothing, and some draw a few of the points, or a
 //!     box whose size changes from one run to the next (the unspecified, line and triangle
 //!     classes, 6 runs each in two processes). So a draw of points there dies, direct, over
-//!     indices or from indirect arguments, but one of no vertices ([`VulkanRenderEncoder::sized`]);
+//!     indices or from indirect arguments, but one of no vertices ([`sized()`]);
 //!     and so does an execution's, at the commit, which reads its commands' records as the
 //!     runtime runs them: under a state its commands inherit, or each command's own
 //!     ([`crate::gpu::states::points_sized`]), or one released since. An execution of a buffer
@@ -1239,7 +1239,7 @@ pub(crate) fn open(
 /// The colour attachment of the pass `d` of a bfloat format (`R16Bfloat`, `RG16Bfloat`,
 /// `RGBA16Bfloat`) that the pass loads (`Load`) and stores (any store action but `DontCare`), if
 /// any, named: a draw (of anything, or of nothing), an execution of render commands or a tile
-/// dispatch in the pass dies ([`RenderEncoderObject::bfloat_drawn`]), where Metal's draws. The
+/// dispatch in the pass dies ([`VulkanRenderEncoder::bfloat_drawn`]), where Metal's draws. The
 /// runtime draws into a bfloat attachment, and the pass keeps the codes its draws do not write,
 /// the device's own load and store, where Metal's tile store writes each code of the tiles a
 /// draw's primitives reach back through `half` (NaNs to `0x7fc0`; the runtime's measurement on an
@@ -1805,7 +1805,7 @@ const VARYING_RATES_TILES: &str = "a tile dispatch in a pass of a rasterization 
      rates vary, which Metal is not measured at (rasterization-rate-map)";
 
 /// The line of a draw's death, direct or an execution's command, of points under a state whose
-/// points Metal sizes none of ([`VulkanRenderEncoder::sized`]).
+/// points Metal sizes none of ([`sized()`]).
 pub(crate) const UNSIZED_POINTS: &str = "points under a vertex function that writes no \
      [[point_size]], outside the point input primitive topology class, whose points Metal does \
      not size: most such draws draw nothing, and some a box whose size changes from one run to \
@@ -2102,7 +2102,7 @@ impl VulkanRenderEncoder {
     /// A draw `sel` of `shape` with the pipeline state set: one after a nil state dies, as Metal
     /// crashes there ([`Self::pipelined`]), and so does one in a pass that loads and stores a
     /// bfloat colour attachment, empty or not ([`Self::bfloat_drawn`]). So do one of points
-    /// Metal sizes none of ([`Self::sized`]) and one the private setters leave no exact form of
+    /// Metal sizes none of ([`sized()`]) and one the private setters leave no exact form of
     /// ([`Self::marked`]), unless it is `empty`, of no primitive, patch or instance, which
     /// Metal draws nothing of whatever they left; `None` for one Metal completes without
     /// drawing, which encodes nothing.

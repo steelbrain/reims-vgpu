@@ -5,8 +5,9 @@
 //!
 //! Core asks for capabilities when the guest lists decoders, opens a
 //! decoder when the guest starts a decode session, and copies each frame
-//! into the guest's pixel buffer through [`DecodedFrame::copy_to`]. Frames
-//! come out in decode order, as VideoToolbox's own decoders emit them.
+//! into the guest's pixel buffer through [`DecodedFrame::read_back`] and
+//! [`FrameReadBack::copy_to`]. Frames come out in decode order, as
+//! VideoToolbox's own decoders emit them.
 
 mod av1_session;
 mod vp9_session;

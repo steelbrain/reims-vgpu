@@ -33,7 +33,7 @@
 //!   Metal does not define, [`crate::gpu::desc`]), and the formats' own: none takes `ShaderAtomic`
 //!   usage ("is not a valid format to be used with texture atomics"); `AnyDepth` and `AnyStencil`
 //!   take no 1D, 1D array, 3D, texture buffer or multisample type ("depth/stencil pixel formats
-//!   require texture type of MTLTextureType2D[Array] or MTLTextureTypeCube[Array]", "does not
+//!   require texture type of MTLTextureType2D\[Array\] or MTLTextureTypeCube\[Array\]", "does not
 //!   support multisample textures"); `Unspecialized` takes no multisample type; `RGBA16Float_XR`
 //!   takes both, of 2 or 4 samples, as a format Metal makes multisample textures of does;
 //! - the runtime answers each of those creators and the size query as Metal does, its nil and its 0

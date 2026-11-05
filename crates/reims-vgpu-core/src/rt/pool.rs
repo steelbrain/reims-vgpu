@@ -26,7 +26,7 @@ thread_local! {
     static TEST_NATIVE: Cell<Option<NativePool>> = const { Cell::new(None) };
 }
 
-/// The thread's real pool: a test's recording one ([`test_native`]), else the platform's.
+/// The thread's real pool: a test's recording one (the tests' `test_native`), else the platform's.
 pub(crate) fn native() -> Option<NativePool> {
     #[cfg(test)]
     if let Some(n) = TEST_NATIVE.with(Cell::get) {

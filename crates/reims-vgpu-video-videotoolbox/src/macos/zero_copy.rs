@@ -297,7 +297,7 @@ pub(crate) fn write(
     write_into(source, target, lent, &IoSurface::of(lent), transfer)
 }
 
-/// [`write`] into `destination`, `lent`'s surface as the writer reads it.
+/// [`write()`] into `destination`, `lent`'s surface as the writer reads it.
 pub(crate) fn write_into(
     source: &Source<'_>,
     target: &GuestTarget<'_>,

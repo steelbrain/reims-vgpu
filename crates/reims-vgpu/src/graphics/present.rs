@@ -60,6 +60,8 @@
 //! of a draw still running on the GPU; the compositor's next frame then landed in it under the
 //! copy, and the window showed that newer frame, then the older one it had presented between,
 //! then the newer again.
+//!
+//! [`RgfxSurfaceWriters`]: reims_graphics::wire::RgfxSurfaceWriters
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
