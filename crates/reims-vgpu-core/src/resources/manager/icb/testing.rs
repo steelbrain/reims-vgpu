@@ -23,6 +23,7 @@ use crate::raise::RaiseResult;
 use crate::raise::death::DeathSite;
 use crate::raise::{OnFault, Raise};
 use crate::resources::icb::{IndirectCommandBufferFlags, IndirectCommandLayout};
+use crate::resources::manager::lookup::NoData;
 use crate::resources::manager::records::{
     IndirectCommandBufferBind, OperationHeader, ResourceAndOffset,
 };
@@ -76,6 +77,8 @@ pub(crate) struct FakeOps {
     pub dev: Fk<kind::Device>,
     pub calls: RefCell<Vec<String>>,
     pub data: Option<Vec<u8>>,
+    /// Why `get_data` gives nothing while `data` is `None`.
+    pub no_data: NoData,
     pub register: Result<(), String>,
     pub buffers: Vec<(u32, Lookup<Fk<kind::Buffer>>)>,
     pub renders: Vec<(u32, Lookup<Fk<kind::RenderPipeline>>)>,
@@ -97,6 +100,10 @@ impl FakeOps {
             dev,
             calls: RefCell::new(Vec::new()),
             data: None,
+            no_data: NoData {
+                hole: false,
+                why: "no data".to_owned(),
+            },
             register: Ok(()),
             buffers: Vec::new(),
             renders: Vec::new(),
@@ -264,9 +271,9 @@ impl ManagerOps<FakePlatform> for FakeOps {
             .map(|(_, f)| f.clone_ref()))
     }
 
-    fn get_data(&self, _hold: Hold<'_>, offset: u64, length: u64) -> Option<Vec<u8>> {
+    fn get_data(&self, _hold: Hold<'_>, offset: u64, length: u64) -> Result<Vec<u8>, NoData> {
         self.note(format!("get_data({offset:#x}, {length:#x})"));
-        self.data.clone()
+        self.data.clone().ok_or_else(|| self.no_data.clone())
     }
 
     fn register_pipeline(&self, identifier: u64, reference: u32) -> Result<(), String> {

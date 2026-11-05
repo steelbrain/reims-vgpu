@@ -28,8 +28,8 @@ use crate::deserializer::texture_descriptor::{
 use crate::guest::records::{APV_PAGE_SIZE, ObjectEntry};
 use crate::memory::cursor::{Cursor, WritableCursor};
 use crate::platform::Platform;
-use crate::raise::Raise;
 use crate::raise::RaiseResult;
+use crate::raise::{Raise, RaiseId};
 use crate::resources::manager::records::{ObjectBuffer, ObjectCpuBuffer};
 use crate::resources::manager::states::{
     ComputePipelineStates, DepthStencilStates, Fences, Functions, RasterizationRateMaps,
@@ -328,6 +328,37 @@ impl<P: Platform> ManagerLookup<P> {
     }
 }
 
+/// Why a copy of task memory ([`ResourceManager::get_data`]) gave no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoData {
+    /// The copy's page-table walk met a hole: a page of the range that the task's page table
+    /// does not map.
+    pub hole: bool,
+    /// What refused the copy, for the log: the raise's detail, or that the task is gone or gave
+    /// nothing.
+    pub why: String,
+}
+
+impl NoData {
+    /// What `raised`, the copy's raise, says.
+    fn raised(raised: &Raise) -> NoData {
+        let why = match raised.exception() {
+            "" => raised.id().to_string(),
+            detail => detail.to_owned(),
+        };
+        NoData {
+            hole: raised.id() == RaiseId::Memory(crate::memory::RaiseKind::WalkHole),
+            why,
+        }
+    }
+}
+
+impl std::fmt::Display for NoData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 impl<P: Platform> ResourceManager<P> {
     /// The object list's entry at `index`.
     pub fn get_object_entry(&self, index: u32) -> Result<ObjectEntry, String> {
@@ -335,21 +366,28 @@ impl<P: Platform> ResourceManager<P> {
     }
 
     /// A copy of `length` bytes of task memory at `offset`; a raise, a gone task or no data is
-    /// `None`.
+    /// [`NoData`], which says which.
     ///
     /// The read is a landing frame of its own inside the handler ([`Held::raising`]): what its
     /// guest reads hold (the page-table read's device handle) is released when it returns, and
     /// on a raise goes on with the raise to the enclosing holder, where the handler drops it.
-    pub fn get_data(&self, hold: Hold<'_>, offset: u64, length: u64) -> Option<Vec<u8>> {
+    pub fn get_data(&self, hold: Hold<'_>, offset: u64, length: u64) -> Result<Vec<u8>, NoData> {
         let copied = Held::raising(|held| match self.task.upgrade() {
-            Some(task) => task.data_from_virtual_offset(Hold::of(held), offset, length),
-            None => Ok(None),
+            Some(task) => task
+                .data_from_virtual_offset(Hold::of(held), offset, length)
+                .map(|data| data.ok_or("the task gave no data")),
+            None => Ok(Err("the task is gone")),
         });
         match copied {
-            Ok(data) => data,
+            Ok(Ok(data)) => Ok(data),
+            Ok(Err(why)) => Err(NoData {
+                hole: false,
+                why: why.to_owned(),
+            }),
             Err(raised) => {
+                let missing = NoData::raised(&raised);
                 hold.land(raised);
-                None
+                Err(missing)
             }
         }
     }
@@ -690,6 +728,13 @@ mod tests {
     mod get_data {
         use super::*;
 
+        fn no_data(why: &str) -> Result<Vec<u8>, NoData> {
+            Err(NoData {
+                hole: false,
+                why: why.to_owned(),
+            })
+        }
+
         #[test]
         fn returns_the_task_s_data() {
             let fx = Fx::new(&entries3(), Placement::Off);
@@ -697,7 +742,7 @@ mod tests {
                 "data_from_virtual_offset",
                 Step::value(Some(vec![1u8, 2, 3])),
             );
-            assert_eq!(fx.m.get_data(Hold::NONE, 0x10, 3), Some(vec![1, 2, 3]));
+            assert_eq!(fx.m.get_data(Hold::NONE, 0x10, 3), Ok(vec![1, 2, 3]));
             assert_eq!(
                 fx.log().calls_to("data_from_virtual_offset")[0].args,
                 vec![Arg::U64(0x10), Arg::U64(3)]
@@ -705,23 +750,52 @@ mod tests {
         }
 
         #[test]
-        fn a_raise_answers_nil() {
+        fn a_raise_is_no_data_with_its_detail() {
             let fx = Fx::new(&entries3(), Placement::Off);
             fx.platform.script().push(
                 "data_from_virtual_offset",
                 Step::raise("NSRangeException", "x"),
             );
             // No outer handler: the read's own takes it.
-            assert_eq!(fx.m.get_data(Hold::NONE, 0, 1), None);
+            assert_eq!(fx.m.get_data(Hold::NONE, 0, 1), no_data("x"));
         }
 
         #[test]
-        fn a_gone_task_is_nil() {
+        fn a_task_that_gives_nothing_is_no_data() {
+            let fx = Fx::new(&entries3(), Placement::Off);
+            assert_eq!(
+                fx.m.get_data(Hold::NONE, 0, 1),
+                no_data("the task gave no data")
+            );
+        }
+
+        #[test]
+        fn a_gone_task_is_no_data() {
             let Fx {
                 m, task, task_dyn, ..
             } = Fx::new(&entries3(), Placement::Off);
             drop((task, task_dyn));
-            assert_eq!(m.get_data(Hold::NONE, 0, 1), None);
+            assert_eq!(m.get_data(Hold::NONE, 0, 1), no_data("the task is gone"));
+        }
+
+        /// A raise of the page-table walk's hole is a hole; every other raise, and a raise
+        /// with no detail (named by its id), is not.
+        #[test]
+        fn only_the_walk_s_hole_is_a_hole() {
+            use crate::memory::RaiseKind as Memory;
+            use crate::raise::OnFault;
+            let hole = Memory::WalkHole.raise(OnFault::Return, "a hole in the page table");
+            assert_eq!(
+                NoData::raised(&hole),
+                NoData {
+                    hole: true,
+                    why: "a hole in the page table".to_owned()
+                }
+            );
+            let root = Memory::WalkRootUnread.raise(OnFault::Return, "unread");
+            assert!(!NoData::raised(&root).hole);
+            let bare = Raise::new(RaiseId::Memory(Memory::WalkHole));
+            assert_eq!(NoData::raised(&bare).why, "memory.walk.hole");
         }
 
         /// The read is a holder, not a pool: what Metal hands back `+0` inside it stays in the
@@ -735,14 +809,14 @@ mod tests {
                 .push("data_from_virtual_offset", Step::value(Some(vec![7u8])));
             with_test_native(|| {
                 let outer = Pool::push(&*fx.platform);
-                assert_eq!(fx.m.get_data(Hold::NONE, 0, 1), Some(vec![7]));
+                assert_eq!(fx.m.get_data(Hold::NONE, 0, 1), Ok(vec![7]));
                 assert_eq!(events(), vec!["push 0x100"]);
                 drop(outer);
                 assert_eq!(events(), vec!["pop 0x100"]);
             });
         }
 
-        /// The task's raise answers nil and leaves no pool pushed: the enclosing unit's pop
+        /// The task's raise is no data and leaves no pool pushed: the enclosing unit's pop
         /// is the only one.
         #[test]
         fn a_raise_leaves_no_pool_of_its_own() {
@@ -754,7 +828,7 @@ mod tests {
             );
             with_test_native(|| {
                 let outer = Pool::push(&*fx.platform);
-                assert_eq!(fx.m.get_data(Hold::NONE, 0, 1), None);
+                assert!(fx.m.get_data(Hold::NONE, 0, 1).is_err());
                 assert_eq!(events(), vec!["push 0x100"]);
                 drop(outer);
                 assert_eq!(events(), vec!["pop 0x100"]);

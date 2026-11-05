@@ -94,8 +94,15 @@ pub(crate) fn create<P: Platform, M: ManagerOps<P>>(
             .map_err(|e| format!("command header not readable: {e}"))
     );
     // The IR is copied before the command type is checked
-    let Some(data) = m.get_data(hold, function.offset, u64::from(function.length)) else {
-        return Ok(Err("the function's IR is not in task memory".to_owned()));
+    let (offset, length) = (function.offset, function.length);
+    let data = match m.get_data(hold, offset, u64::from(length)) {
+        Ok(data) => data,
+        Err(missing) => {
+            return Ok(Err(format!(
+                "the function's IR, {length:#x} bytes at task offset {offset:#x}, is not in \
+                 task memory: {missing}"
+            )));
+        }
     };
     if header.command_type != NEW_FUNCTION_WITH_IR {
         let ct = header.command_type;
@@ -166,7 +173,10 @@ mod tests {
         fn the_data_is_copied_before_the_command_type_is_checked() {
             let mut o = FakeOps::new();
             let e = make(&o, 6, &record(0x40, 4, 3)).unwrap_err();
-            assert_eq!(e, "the function's IR is not in task memory");
+            assert_eq!(
+                e,
+                "the function's IR, 0x4 bytes at task offset 0x40, is not in task memory: no data"
+            );
             assert_eq!(o.calls(), vec!["get_data(0x40, 0x4)"]);
             o.data = Some(vec![1, 2, 3, 4]);
             let e = make(&o, 6, &record(0x40, 4, 3)).unwrap_err();

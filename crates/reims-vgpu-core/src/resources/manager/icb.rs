@@ -59,6 +59,7 @@ use crate::raise::death::DeathSite;
 use crate::resources::icb::{IcbResource, IndirectCommandBufferFlags, IndirectCommandLayout};
 use crate::resources::manager::ResourceManager;
 use crate::resources::manager::create::Resources;
+use crate::resources::manager::lookup::NoData;
 use crate::resources::manager::records::ResourceAndOffset;
 use crate::resources::manager::states::ComputePipelineStates;
 use crate::resources::manager::states::RenderPipelineStates;
@@ -191,8 +192,8 @@ pub(crate) trait ManagerOps<P: Platform>: IcbWalkOps<P> {
         hold: Hold<'_>,
         function_ref: u64,
     ) -> RaiseResult<Option<P::Function>>;
-    /// A copy of task memory; `None` when there is none.
-    fn get_data(&self, hold: Hold<'_>, offset: u64, length: u64) -> Option<Vec<u8>>;
+    /// A copy of task memory, or why there is none.
+    fn get_data(&self, hold: Hold<'_>, offset: u64, length: u64) -> Result<Vec<u8>, NoData>;
     /// Registers a pipeline's identifier for its reference.
     fn register_pipeline(&self, identifier: u64, reference: u32) -> Result<(), String>;
     /// An ICB resource over `icb` for the manager's task, unretained.
@@ -301,7 +302,7 @@ impl<P: Platform> ManagerOps<P> for ResourceManager<P> {
         crate::resources::manager::resolver::function_with_function_ref(hold, self, function_ref)
     }
 
-    fn get_data(&self, hold: Hold<'_>, offset: u64, length: u64) -> Option<Vec<u8>> {
+    fn get_data(&self, hold: Hold<'_>, offset: u64, length: u64) -> Result<Vec<u8>, NoData> {
         ResourceManager::get_data(self, hold, offset, length)
     }
 
