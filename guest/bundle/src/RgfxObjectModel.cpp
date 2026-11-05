@@ -29,38 +29,50 @@ RgfxObjId RgfxIdSpace::allocObjId()
 	return m_nextObjId.fetch_add(1, std::memory_order_relaxed);
 }
 
+// A small chunk's free ids fit its 16-bit mask.
+static_assert(RGFX_RESOURCE_ID_SMALL_CHUNK == 16, "a small chunk is 16 ids");
+static_assert(RGFX_RESOURCE_ID_CHUNK % RGFX_RESOURCE_ID_SMALL_CHUNK == 0,
+              "a chunk is whole small chunks");
+
 uint64_t RgfxIdSpace::allocResourceId()
 {
 	std::lock_guard<std::mutex> hold(m_idsLock);
 	for (uint32_t k : m_chunks) {
 		if (m_freeIds[k] != 0) {
-			const unsigned bit = static_cast<unsigned>(__builtin_ctzll(m_freeIds[k]));
-			m_freeIds[k] &= m_freeIds[k] - 1;
-			return 1 + uint64_t{k} * RGFX_RESOURCE_ID_CHUNK + bit;
+			const unsigned bit = static_cast<unsigned>(__builtin_ctz(m_freeIds[k]));
+			m_freeIds[k] = static_cast<uint16_t>(m_freeIds[k] & (m_freeIds[k] - 1));
+			return 1 + uint64_t{k} * RGFX_RESOURCE_ID_SMALL_CHUNK + bit;
 		}
 	}
 	// Every id the process holds is in use: one more chunk. The source is called
 	// with the lock held, so two threads that run out at once take one chunk.
+	const uint64_t pool = uint64_t{RGFX_RESOURCE_ID_SMALL_CHUNKS} * RGFX_RESOURCE_ID_SMALL_CHUNK;
+	const uint64_t size = m_chunkIds;
 	uint64_t first = 0;
 	if (m_chunkSource != nullptr) {
 		if (!m_chunkSource(m_chunkSourceContext, &first))
 			return 0;
 	} else {
-		if (m_nextLocalChunk == RGFX_RESOURCE_ID_CHUNKS)
+		if ((uint64_t{m_nextLocalChunk} + 1) * size > pool)
 			return 0;
-		first = 1 + uint64_t{m_nextLocalChunk++} * RGFX_RESOURCE_ID_CHUNK;
+		first = 1 + uint64_t{m_nextLocalChunk++} * size;
 	}
-	// A chunk the pool does not hold, or one held already, is no chunk.
-	if (first == 0 || (first - 1) % RGFX_RESOURCE_ID_CHUNK != 0 ||
-	    (first - 1) / RGFX_RESOURCE_ID_CHUNK >= RGFX_RESOURCE_ID_CHUNKS)
+	// A chunk the pool does not hold, or one with an id held already, is no chunk.
+	if (first == 0 || (first - 1) % size != 0 || first - 1 > pool - size)
 		return 0;
-	const uint32_t k = static_cast<uint32_t>((first - 1) / RGFX_RESOURCE_ID_CHUNK);
-	if (m_heldChunks[k])
-		return 0;
-	m_heldChunks[k] = true;
-	m_chunks.push_back(k);
+	const uint32_t k0 = static_cast<uint32_t>((first - 1) / RGFX_RESOURCE_ID_SMALL_CHUNK);
+	const uint32_t n = static_cast<uint32_t>(size / RGFX_RESOURCE_ID_SMALL_CHUNK);
+	for (uint32_t i = 0; i < n; i++) {
+		if (m_heldChunks[k0 + i])
+			return 0;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		m_heldChunks[k0 + i] = true;
+		m_chunks.push_back(k0 + i);
+		m_freeIds[k0 + i] = 0xffff;
+	}
 	// Every id but the first, which is the caller's.
-	m_freeIds[k] = ~uint64_t{0} << 1;
+	m_freeIds[k0] = 0xfffe;
 	return first;
 }
 
@@ -68,17 +80,22 @@ void RgfxIdSpace::freeResourceId(uint64_t id)
 {
 	if (id == 0)
 		return;
-	const uint64_t k = (id - 1) / RGFX_RESOURCE_ID_CHUNK;
+	const uint64_t k = (id - 1) / RGFX_RESOURCE_ID_SMALL_CHUNK;
 	std::lock_guard<std::mutex> hold(m_idsLock);
-	if (k < RGFX_RESOURCE_ID_CHUNKS && m_heldChunks[k])
-		m_freeIds[k] |= uint64_t{1} << ((id - 1) % RGFX_RESOURCE_ID_CHUNK);
+	if (k < RGFX_RESOURCE_ID_SMALL_CHUNKS && m_heldChunks[k])
+		m_freeIds[k] = static_cast<uint16_t>(
+		    m_freeIds[k] | (1u << ((id - 1) % RGFX_RESOURCE_ID_SMALL_CHUNK)));
 }
 
-void RgfxIdSpace::setResourceIdSource(ResourceIdChunkFn source, void *context)
+void RgfxIdSpace::setResourceIdSource(ResourceIdChunkFn source, void *context, uint64_t chunk_ids)
 {
 	std::lock_guard<std::mutex> hold(m_idsLock);
 	m_chunkSource = source;
 	m_chunkSourceContext = context;
+	// A size that is not whole small chunks, or more than a chunk, is a chunk's.
+	const bool whole = chunk_ids != 0 && chunk_ids % RGFX_RESOURCE_ID_SMALL_CHUNK == 0 &&
+	                   chunk_ids <= RGFX_RESOURCE_ID_CHUNK;
+	m_chunkIds = whole ? chunk_ids : RGFX_RESOURCE_ID_CHUNK;
 }
 
 uint64_t RgfxIdSpace::addressSpan(uint64_t size)

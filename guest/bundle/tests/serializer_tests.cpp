@@ -186,6 +186,82 @@ bool fakeChunk(void *context, uint64_t *first_id)
 	return true;
 }
 
+// The kext's small chunks (RGFX_FEATURE_SMALL_ID_CHUNKS): 16 ids each, from the same pool as
+// the chunks of 64, a chunk of 64 being four small ones, so a process takes no more ids than
+// its textures need, 16 at a time.
+void test_small_resource_id_chunks()
+{
+	const uint64_t small = RGFX_RESOURCE_ID_SMALL_CHUNK;
+	CHECK(small == 16 && RGFX_RESOURCE_ID_SMALL_CHUNKS * small ==
+	                         RGFX_RESOURCE_ID_CHUNKS * RGFX_RESOURCE_ID_CHUNK);
+
+	// Small chunks 29 (ids 465 to 480), then 3 (ids 49 to 64), then none.
+	FakeChunks f;
+	f.firsts = {1 + 29 * small, 1 + 3 * small};
+	RgfxIdSpace ids;
+	ids.setResourceIdSource(&fakeChunk, &f, small);
+	for (uint64_t id = 465; id <= 480; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(f.calls == 1);
+	ids.freeResourceId(470);
+	CHECK(ids.allocResourceId() == 470);
+	CHECK(f.calls == 1);
+	CHECK(ids.allocResourceId() == 49);
+	CHECK(f.calls == 2);
+	for (uint64_t id = 50; id <= 64; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(ids.allocResourceId() == 0);
+	CHECK(f.calls == 3);
+	// An id next to a held small chunk, in no chunk the process holds, is ignored.
+	ids.freeResourceId(481);
+	ids.freeResourceId(48);
+	CHECK(ids.allocResourceId() == 0);
+	ids.freeResourceId(64);
+	CHECK(ids.allocResourceId() == 64);
+
+	// A small chunk that is not one (not a small chunk's first id, past the pool), or one
+	// held already, gives no id; the pool's last is one.
+	FakeChunks bad;
+	const uint64_t last = 1 + (RGFX_RESOURCE_ID_SMALL_CHUNKS - 1) * small;
+	bad.firsts = {2 + 4 * small, last + small, last, last};
+	RgfxIdSpace badIds;
+	badIds.setResourceIdSource(&fakeChunk, &bad, small);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == last);
+	for (uint64_t i = 1; i < small; i++)
+		CHECK(badIds.allocResourceId() == last + i);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(last + small - 1 == RGFX_RESOURCE_ID_CHUNKS * RGFX_RESOURCE_ID_CHUNK);
+
+	// Chunks of 64 are four small chunks each: a source of 64 whose first id is a small
+	// chunk's but not a chunk's is no chunk, and a chunk of 64 over a small chunk held
+	// already is none.
+	FakeChunks smallFirst;
+	smallFirst.firsts = {1 + 5 * small};
+	FakeChunks mixed;
+	mixed.firsts = {1 + 5 * small, 1 + 64, 1 + 2 * 64};
+	RgfxIdSpace mixedIds;
+	mixedIds.setResourceIdSource(&fakeChunk, &smallFirst, small);
+	for (uint64_t id = 81; id <= 96; id++)
+		CHECK(mixedIds.allocResourceId() == id);
+	mixedIds.setResourceIdSource(&fakeChunk, &mixed);
+	CHECK(mixedIds.allocResourceId() == 0);
+	CHECK(mixedIds.allocResourceId() == 0);
+	CHECK(mixedIds.allocResourceId() == 129);
+	for (uint64_t id = 130; id <= 192; id++)
+		CHECK(mixedIds.allocResourceId() == id);
+	CHECK(mixed.calls == 3);
+
+	// With no source, chunks of 16 hand out the whole pool in order, as chunks of 64 do.
+	RgfxIdSpace local;
+	local.setResourceIdSource(nullptr, nullptr, small);
+	const uint64_t poolIds = RGFX_RESOURCE_ID_SMALL_CHUNKS * small;
+	for (uint64_t id = 1; id <= poolIds; id++)
+		CHECK(local.allocResourceId() == id);
+	CHECK(local.allocResourceId() == 0);
+}
+
 void test_resource_id_chunks()
 {
 	const uint64_t chunk = RGFX_RESOURCE_ID_CHUNK;
@@ -2463,6 +2539,7 @@ int main()
 	test_region_pages_blocks();
 	test_address_picks();
 	test_resource_id_chunks();
+	test_small_resource_id_chunks();
 	test_caps();
 	test_spi_features();
 	test_family_names();

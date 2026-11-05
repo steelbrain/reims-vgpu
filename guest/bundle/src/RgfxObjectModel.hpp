@@ -19,10 +19,11 @@
  * so the host has long let the old pin go. Both start at the context's bases,
  * which the accelerator kext hands out. Texture resource ids are shared
  * by every process on the host's one device, whose ids end below
- * RGFX_RESOURCE_ID_LIMIT, so they come in chunks of RGFX_RESOURCE_ID_CHUNK the
- * kext hands out on demand from one pool for the guest, and an id goes back to
- * the process's chunks when its texture goes: Metal gives a texture's id back
- * as the texture goes too.
+ * RGFX_RESOURCE_ID_LIMIT, so they come in chunks the kext hands out on demand
+ * from one pool for the guest (of RGFX_RESOURCE_ID_SMALL_CHUNK ids where it
+ * took RGFX_FEATURE_SMALL_ID_CHUNKS, else RGFX_RESOURCE_ID_CHUNK), and an id
+ * goes back to the process's chunks when its texture goes: Metal gives a
+ * texture's id back as the texture goes too.
  *
  * This is our own code: it knows nothing of Apple's Metal SPI. The Metal device
  * shell (built later) allocates an ObjId per object it creates and stores it on
@@ -53,9 +54,9 @@ static const RgfxObjId RGFX_OBJ_NONE = 0;
 class RgfxIdSpace {
 public:
 	/// A source of chunks of texture resource ids: it hands `*first_id`, the
-	/// first id of a chunk of RGFX_RESOURCE_ID_CHUNK the process holds from now
-	/// on (the accelerator kext's), or answers false where none is left. Called
-	/// with `context`.
+	/// first id of a chunk of the source's size (setResourceIdSource) the
+	/// process holds from now on (the accelerator kext's), or answers false
+	/// where none is left. Called with `context`.
 	typedef bool (*ResourceIdChunkFn)(void *context, uint64_t *first_id);
 
 	/// A space whose GPU addresses are the `address_span` bytes from
@@ -77,8 +78,12 @@ public:
 	/// texture is gone. 0, and an id of no chunk the process holds, are ignored.
 	void freeResourceId(uint64_t id);
 
-	/// Where new chunks of texture resource ids come from from now on.
-	void setResourceIdSource(ResourceIdChunkFn source, void *context);
+	/// Where new chunks of texture resource ids come from from now on, each of
+	/// `chunk_ids` ids: RGFX_RESOURCE_ID_SMALL_CHUNK, or RGFX_RESOURCE_ID_CHUNK.
+	/// A chunk whose first id is not a multiple of its size past 1, or that
+	/// holds an id the process holds or one past the pool, is no chunk.
+	void setResourceIdSource(ResourceIdChunkFn source, void *context,
+	                         uint64_t chunk_ids = RGFX_RESOURCE_ID_CHUNK);
 
 	/// The GPU address of an object of `size` bytes the host pins there, aligned up
 	/// to `align` (a power of two, at least 1) and to a kAddressGranule. Each pick
@@ -132,15 +137,18 @@ private:
 	// Whether a pick found no room, which is logged once.
 	bool m_addressesFull = false;
 
-	// The texture resource ids, under m_idsLock: the chunks the process holds,
-	// by index (chunk k holds ids 1 + k * 64 to 64 + k * 64), in the order taken,
-	// and each chunk's free ids, bit i for its id 1 + k * 64 + i.
+	// The texture resource ids, under m_idsLock, by small chunk (small chunk k
+	// holds ids 1 + k * 16 to 16 + k * 16; a chunk of 64 is four): those the
+	// process holds, in the order taken, and each one's free ids, bit i for its
+	// id 1 + k * 16 + i.
 	std::mutex m_idsLock;
 	std::vector<uint32_t> m_chunks;
-	uint64_t m_freeIds[RGFX_RESOURCE_ID_CHUNKS] = {};
-	bool m_heldChunks[RGFX_RESOURCE_ID_CHUNKS] = {};
+	uint16_t m_freeIds[RGFX_RESOURCE_ID_SMALL_CHUNKS] = {};
+	bool m_heldChunks[RGFX_RESOURCE_ID_SMALL_CHUNKS] = {};
 	ResourceIdChunkFn m_chunkSource = nullptr;
 	void *m_chunkSourceContext = nullptr;
+	// How many ids each chunk from the source holds, or the pool's, with none.
+	uint64_t m_chunkIds = RGFX_RESOURCE_ID_CHUNK;
 	// With no source: the next chunk of the pool.
 	uint32_t m_nextLocalChunk = 0;
 };

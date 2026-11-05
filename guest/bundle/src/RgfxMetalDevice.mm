@@ -600,7 +600,12 @@ RGFX_LOG_UNRECOGNIZED
 	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
 	_ids.setBases(ctx[1], ctx[2], ctx[5]);
 	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
-	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext);
+	// The kext's chunks are of RGFX_RESOURCE_ID_SMALL_CHUNK ids where it took
+	// RGFX_FEATURE_SMALL_ID_CHUNKS (RgfxUserClientABI.hpp, kRgfxAccelMethodResourceIds).
+	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext,
+	                         (_caps.features() & RGFX_FEATURE_SMALL_ID_CHUNKS) != 0
+	                             ? RGFX_RESOURCE_ID_SMALL_CHUNK
+	                             : RGFX_RESOURCE_ID_CHUNK);
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
 	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
