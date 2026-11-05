@@ -304,7 +304,12 @@ impl<P: Platform> Tables<P> {
     fn retire(&mut self, id: u64, owned: Owned<P>) -> Option<Removed<P>> {
         self.clock += 1;
         let removed = Removed { id, owned };
-        if self.views.range(removed.owned.entry().seen..).next().is_none() {
+        if self
+            .views
+            .range(removed.owned.entry().seen..)
+            .next()
+            .is_none()
+        {
             return Some(removed);
         }
         self.gone.push((removed, self.clock));
@@ -321,11 +326,15 @@ impl<P: Platform> Tables<P> {
                 .collect();
         }
         let views = &self.views;
-        let (keep, out): (Vec<_>, Vec<_>) = std::mem::take(&mut self.gone)
-            .into_iter()
-            .partition(|(r, removed_at)| {
-                views.range(r.owned.entry().seen..*removed_at).next().is_some()
-            });
+        let (keep, out): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.gone)
+                .into_iter()
+                .partition(|(r, removed_at)| {
+                    views
+                        .range(r.owned.entry().seen..*removed_at)
+                        .next()
+                        .is_some()
+                });
         self.gone = keep;
         out.into_iter().map(|(r, _)| r).collect()
     }
@@ -656,9 +665,15 @@ mod tests {
             next += 4;
             drop(frame);
         }
-        assert!(old.get(0).is_some(), "removed after the old view: still found");
+        assert!(
+            old.get(0).is_some(),
+            "removed after the old view: still found"
+        );
         assert!(old.get(1).is_some(), "live, made before the old view");
-        assert!(old.get(next - 1).is_none(), "made after the old view: not found");
+        assert!(
+            old.get(next - 1).is_none(),
+            "made after the old view: not found"
+        );
         assert_eq!(
             ctx.gone_len(),
             1,
@@ -694,6 +709,7 @@ mod tests {
     /// through every kept entry).
     #[test]
     #[ignore = "a bench: run it by name"]
+    #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
     fn gone_cost_with_an_old_view_open() {
         let p = FakePlatform::new();
         let ctx = Arc::new(Context::<FakePlatform>::new(1));

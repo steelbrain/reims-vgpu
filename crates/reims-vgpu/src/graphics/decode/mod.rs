@@ -3040,7 +3040,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(context) = self.context_made_if(context_of(obj_id), &live) else {
             return;
         };
-        if let Some((at, replaced)) = context.insert_if(obj_id, entry, self.view_at(&context), &live) {
+        if let Some((at, replaced)) =
+            context.insert_if(obj_id, entry, self.view_at(&context), &live)
+        {
             self.saw(&context, obj_id, Some(at));
             drop(replaced.map(tables::Removed::into_entry));
         }
