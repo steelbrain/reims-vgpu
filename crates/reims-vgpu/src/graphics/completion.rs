@@ -5,8 +5,13 @@
 //! error boundary the metal2vulkan lane measured): page fault, timeout (a GPU
 //! hang), internal (an innocent recovery victim), access revoked (a queue's
 //! submissions ignored after its second fault) and invalid resource. Every
-//! other `MTLCommandBufferError` is reported as a generic internal error, with
-//! the raw code kept for diagnostics.
+//! other code of Metal's `MTLCommandBufferError` (not permitted, out of memory,
+//! memoryless, device removed, stack overflow) is reported as a generic
+//! internal status with its own code, which the guest's error carries. An error
+//! Metal never gives a failed buffer (another domain's, `None`'s code 0, or a
+//! code `MTLCommandBufferError` does not name) is Metal's internal error, "an
+//! internal error that doesn't fit into the other categories" (Metal's
+//! `MTLCommandBuffer.h`), with `MTLCommandBufferErrorInternal`'s code.
 //!
 //! The host emits [`cb_complete`] from the decoder's completion sink once a
 //! submitted command buffer's work lands, and [`cb_failed`] when the host could
@@ -26,27 +31,58 @@ const MTL_CB_ERROR_TIMEOUT: i64 = 2;
 const MTL_CB_ERROR_PAGE_FAULT: i64 = 3;
 /// `MTLCommandBufferErrorAccessRevoked`.
 const MTL_CB_ERROR_ACCESS_REVOKED: i64 = 4;
+/// `MTLCommandBufferErrorNotPermitted`.
+const MTL_CB_ERROR_NOT_PERMITTED: i64 = 7;
+/// `MTLCommandBufferErrorOutOfMemory`.
+const MTL_CB_ERROR_OUT_OF_MEMORY: i64 = 8;
 /// `MTLCommandBufferErrorInvalidResource`.
 const MTL_CB_ERROR_INVALID_RESOURCE: i64 = 9;
+/// `MTLCommandBufferErrorMemoryless`.
+const MTL_CB_ERROR_MEMORYLESS: i64 = 10;
+/// `MTLCommandBufferErrorDeviceRemoved`.
+const MTL_CB_ERROR_DEVICE_REMOVED: i64 = 11;
+/// `MTLCommandBufferErrorStackOverflow`.
+const MTL_CB_ERROR_STACK_OVERFLOW: i64 = 12;
+/// `MTLCommandBufferErrorDomain`, the domain of every error Metal gives a failed command buffer.
+const MTL_CB_ERROR_DOMAIN: &str = "MTLCommandBufferErrorDomain";
 
-/// The `RGFX_CB_*` status and the raw error code for a finished command buffer:
-/// `None` is success, `Some` the host's command-buffer error. An error whose
-/// code is not one of the mapped boundary cases is a generic internal error; the
-/// raw `MTLCommandBufferError` code always travels in the second value for
-/// diagnostics.
+/// The `RGFX_CB_*` status and the `MTLCommandBufferError` code for a finished command buffer:
+/// `None` is success, `Some` the host's command-buffer error. An error of Metal's domain and
+/// one of its codes keeps the code, its status that of its boundary case or a generic internal
+/// one; any other error is `MTLCommandBufferErrorInternal`, as Metal reports a failure that
+/// fits none of its codes.
 fn cb_status(error: Option<&NsErrorText>) -> (u32, u32) {
     let Some(e) = error else {
         return (RGFX_CB_OK, 0);
     };
     let status = match e.code {
-        MTL_CB_ERROR_PAGE_FAULT => RGFX_CB_PAGE_FAULT,
-        MTL_CB_ERROR_TIMEOUT => RGFX_CB_TIMEOUT,
-        MTL_CB_ERROR_INTERNAL => RGFX_CB_INTERNAL,
-        MTL_CB_ERROR_ACCESS_REVOKED => RGFX_CB_ACCESS_REVOKED,
-        MTL_CB_ERROR_INVALID_RESOURCE => RGFX_CB_INVALID_RESOURCE,
-        _ => RGFX_CB_INTERNAL,
+        _ if e.domain != MTL_CB_ERROR_DOMAIN => None,
+        MTL_CB_ERROR_PAGE_FAULT => Some(RGFX_CB_PAGE_FAULT),
+        MTL_CB_ERROR_TIMEOUT => Some(RGFX_CB_TIMEOUT),
+        MTL_CB_ERROR_INTERNAL => Some(RGFX_CB_INTERNAL),
+        MTL_CB_ERROR_ACCESS_REVOKED => Some(RGFX_CB_ACCESS_REVOKED),
+        MTL_CB_ERROR_INVALID_RESOURCE => Some(RGFX_CB_INVALID_RESOURCE),
+        MTL_CB_ERROR_NOT_PERMITTED
+        | MTL_CB_ERROR_OUT_OF_MEMORY
+        | MTL_CB_ERROR_MEMORYLESS
+        | MTL_CB_ERROR_DEVICE_REMOVED
+        | MTL_CB_ERROR_STACK_OVERFLOW => Some(RGFX_CB_INTERNAL),
+        _ => None,
     };
-    (status, e.code as u32)
+    match status {
+        // Each of Metal's codes fits in a u32.
+        Some(status) => (status, e.code as u32),
+        None => {
+            log::debug!(
+                target: "reims_vgpu::graphics",
+                "a command buffer failed with {} code {}, which Metal never gives one: it fails \
+                 as Metal's internal error",
+                e.domain,
+                e.code
+            );
+            (RGFX_CB_INTERNAL, MTL_CB_ERROR_INTERNAL as u32)
+        }
+    }
 }
 
 /// The completion message for the command buffer `cb_obj_id` finished at
@@ -158,12 +194,48 @@ mod tests {
         );
     }
 
-    /// An error outside the boundary cases (here out of memory, 8) is a generic
-    /// internal error, and keeps its raw code for diagnostics.
+    /// Metal's codes outside the boundary cases (not permitted, out of memory, memoryless, device
+    /// removed, stack overflow) are a generic internal status, and keep their own code, which the
+    /// guest's error carries.
     #[test]
-    fn an_unmapped_error_is_internal() {
-        let m = cb_complete(1, 1, 0, 0, Some(&cb_error(8)));
-        assert_eq!(m.status, RGFX_CB_INTERNAL);
-        assert_eq!(m.error_code, 8);
+    fn metal_s_other_codes_are_internal_with_their_own_code() {
+        for code in [
+            MTL_CB_ERROR_NOT_PERMITTED,
+            MTL_CB_ERROR_OUT_OF_MEMORY,
+            MTL_CB_ERROR_MEMORYLESS,
+            MTL_CB_ERROR_DEVICE_REMOVED,
+            MTL_CB_ERROR_STACK_OVERFLOW,
+        ] {
+            let m = cb_complete(1, 1, 0, 0, Some(&cb_error(code)));
+            assert_eq!((m.status, m.error_code), (RGFX_CB_INTERNAL, code as u32));
+        }
+    }
+
+    /// An error Metal never gives a failed command buffer is Metal's internal error, with
+    /// `MTLCommandBufferErrorInternal`'s code: another domain's (whatever its code, one of
+    /// Metal's among them), `MTLCommandBufferErrorNone`'s 0, and codes `MTLCommandBufferError`
+    /// does not name, negative or past `u32` among them.
+    #[test]
+    fn an_error_metal_never_gives_is_metal_s_internal_error() {
+        let other = |domain: &str, code| NsErrorText {
+            domain: domain.to_owned(),
+            code,
+            description: String::new(),
+        };
+        let internal = (RGFX_CB_INTERNAL, MTL_CB_ERROR_INTERNAL as u32);
+        for e in [
+            other("NSPOSIXErrorDomain", 3),
+            other("IOGPUCommandQueueErrorDomain", 9),
+            other("", 2),
+            cb_error(0),
+            cb_error(5),
+            cb_error(6),
+            cb_error(13),
+            cb_error(-1),
+            cb_error(1 << 40),
+        ] {
+            let m = cb_complete(1, 1, 0, 0, Some(&e));
+            assert_eq!((m.status, m.error_code), internal, "{e:?}");
+        }
     }
 }
