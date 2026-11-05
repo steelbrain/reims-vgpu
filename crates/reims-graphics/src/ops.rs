@@ -81,7 +81,8 @@ pub const RGFX_OP_ENCODER_BEGIN_BLIT: u16 = 0x0003;
 pub const RGFX_OP_ENCODER_END: u16 = 0x0004;
 /// Op `SIGNAL_EVENT` ([`RgfxOpEvent`]): `encodeSignalEvent:value:`, between encoders. The event is
 /// an `id<MTLEvent>` or an `id<MTLSharedEvent>`; a shared one's signal is posted to the guest as
-/// [`RgfxEventSignalled`](crate::wire::RgfxEventSignalled) once the buffer finishes.
+/// [`RgfxEventSignalled`](crate::wire::RgfxEventSignalled) as the host's event reaches it, where
+/// the buffer has work after it, else once the buffer finishes.
 pub const RGFX_OP_SIGNAL_EVENT: u16 = 0x0005;
 /// Op `WAIT_EVENT` ([`RgfxOpEvent`]): `encodeWaitForEvent:value:`, between encoders: the work
 /// after it waits until the event reaches `value`.

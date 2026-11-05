@@ -2208,8 +2208,9 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
 {
 	// The host signals it once the work encoded before this is done; a shared event's value
-	// reaches this process once the buffer finishes, ahead of its completion
-	// (RGFX_EVT_EVENT_SIGNALLED, which its queue's reader hands to the device's).
+	// reaches this process as the host's event reaches it, where the buffer has work after this,
+	// else once the buffer finishes, and always ahead of its completion (RGFX_EVT_EVENT_SIGNALLED,
+	// which its queue's reader hands to the device's).
 	uint64_t obj = [self rgfxEventOf:event op:"encodeSignalEvent" value:value];
 	if (obj != 0 && _encoder != nullptr) {
 		_encoder->signalEvent(obj, value);

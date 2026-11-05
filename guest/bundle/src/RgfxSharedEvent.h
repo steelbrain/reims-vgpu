@@ -13,8 +13,9 @@
  * THE VALUE LIVES HOST-SIDE. The host's event is the one command buffers wait on and
  * signal (RGFX_OP_WAIT_EVENT / RGFX_OP_SIGNAL_EVENT). This process keeps the value as it
  * knows it: a CPU set goes to the host (RGFX_CMD_SHARED_EVENT_SET_VALUE) and raises it
- * here, and a command buffer's signal raises it once the host posts RGFX_EVT_EVENT_SIGNALLED,
- * when the buffer finishes, ahead of its completion. It only rises, as Metal's does. The
+ * here, and a command buffer's signal raises it once the host posts RGFX_EVT_EVENT_SIGNALLED:
+ * as the host's event reaches the value where the buffer has work after the signal, else when
+ * the buffer finishes, and ahead of its completion. It only rises, as Metal's does. The
  * notifyListener blocks fire on their listener's queue with the value they were registered
  * at, as Metal's do.
  *

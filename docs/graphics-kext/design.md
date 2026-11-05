@@ -1897,25 +1897,38 @@ leaves it). A CPU `setSignaledValue:` posts `SHARED_EVENT_SET_VALUE` on the
 control ring, which sets the host's (so its GPU waits are released), and raises
 the bundle's value. A command buffer's signal of a shared event reaches the
 process as `EVENT_SIGNALLED` (`ObjId`, value), which the host posts on the
-buffer's queue completion ring once the buffer finishes, ahead of its
-`CB_COMPLETE`, whatever its outcome. The queue's reader hands it to the
-device's, where the process's shared events listen. `notifyListener:` blocks
-run on their listener's queue with the value they were registered at, at once
-where the value has reached it, as Metal's do (measured). A shared event made at
-another value is set to it on the host after its create.
+buffer's queue completion ring, once for each signal, ahead of the buffer's
+`CB_COMPLETE` and whatever its outcome. Where the buffer has more work after the
+signal (an encoder, or a wait for an event), the host posts it as its own event
+reaches the value: it asks its platform for a notification at that value, on one
+listener of the device's (`notifyListener:atValue:block:` on Metal; on the
+Vulkan platform the runtime sees the value rise as the batch that ends at the
+signal finishes), which may come while the buffer runs, or while it waits to be
+scheduled. A signal at the buffer's end, and any no notification posted, go
+with the buffer's completion; so does a signal of a shared event whose create
+the host refused, wherever it lies ("Guest input the host refuses"): the host
+holds no event to watch for it, and the walk runs ahead of the GPU, so a post
+there could come before the buffer's earlier work is done. So a thread that
+waits on the CPU for such a mid-buffer signal before it sets a value the buffer
+waits for later waits for good, the one case where ours deadlocks where Metal's
+goes on (below). The queue's reader hands each to the device's, where the
+process's shared events listen. `notifyListener:` blocks run on their listener's queue with the value
+they were registered at, at once where the value has reached it, as Metal's do
+(measured). A shared event made at another value is set to it on the host after
+its create.
 
-The difference from Metal: Metal's signal lands where the GPU reaches it in the
-buffer, and its CPU value and listeners move then; here the process sees it only
-once the whole buffer has finished. GPU waits are not affected: another buffer's
-`WAIT_EVENT` waits on the host's event, which the host's GPU signals at the
-point Metal's would. A guest thread that waits on the CPU for a signal from the
-middle of a command buffer (`waitUntilSignaledValue:`, a listener) sees it as
-late as the buffer's end. That is never a hang, since the buffer's end comes,
-but it is later where the buffer runs on after its signal: work it would have
-overlapped with the rest of the buffer starts after it instead. A wait for a
-signal that only comes after the waiting thread does something else is the case
-it changes: a thread that waits for a mid-buffer signal before it sets a value
-the same buffer waits for later deadlocks here, where Metal's would not.
+Metal's CPU sees a signal from the middle of a buffer while the buffer runs
+(docs/graphics-kext/dgpu-oracle.md, Q18): on the 5300M and the M3 within a few
+milliseconds of the GPU reaching it, on the 630 about 100 ms after the commit,
+which is later where the buffer runs on. On all three, a thread that waits on the
+CPU for a mid-buffer signal before it sets a value the same buffer waits for
+later goes on, and the buffer completes. So does ours: the host's notification
+comes as its GPU reaches the signal, as the 5300M's and the M3's do. A signal at
+the buffer's end reaches the CPU with the buffer's completion on all three, its
+listener's block within 0.03 ms of the completed handler, either one first, and
+ours comes ahead of the completion record. GPU waits are not affected either
+way: another buffer's `WAIT_EVENT` waits on the host's event, which the host's
+GPU signals at the point Metal's would.
 
 A command buffer that waits on an event is watched: one not finished 5 s after
 its commit is named in the log at WARN, with each event and value it waits for,

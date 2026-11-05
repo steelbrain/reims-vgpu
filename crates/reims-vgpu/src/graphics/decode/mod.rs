@@ -580,6 +580,9 @@ pub(crate) struct Shared<P: Platform> {
     release_queue: OnceLock<Option<P::CommandQueue>>,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
+    /// The listener the command buffers' notifications of the values they signal run on, made at
+    /// the first ([`Shared::listener`]).
+    listener: OnceLock<P::SharedEventListener>,
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
     #[cfg(test)]
     walk_hook: Mutex<Option<WalkHook>>,
@@ -588,6 +591,17 @@ pub(crate) struct Shared<P: Platform> {
     /// objects live; declared last so the contexts drop before it (a buffer
     /// also keeps its own clone alive in its no-copy deallocator).
     region: Arc<Region>,
+}
+
+impl<P: Platform> Shared<P> {
+    /// The device's one listener, which the notifications of the values command buffers signal
+    /// their shared events to run on, one after another (`cmdbuf.rs`, `Signals`), made at the
+    /// first: Metal's runs them on its dispatch queue, the Vulkan platform's on the thread of the
+    /// process's one runtime listener.
+    pub(crate) fn listener(&self) -> &P::SharedEventListener {
+        self.listener
+            .get_or_init(|| self.platform.new_shared_event_listener())
+    }
 }
 
 /// The decoder's state, shared by the threads that carry out messages, each on a decoder of its
@@ -760,6 +774,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             unshared: Mutex::default(),
             surfaces: Mutex::default(),
             video: OnceLock::new(),
+            listener: OnceLock::new(),
             libraries: Mutex::new(Libraries::new()),
             id_chunks: Mutex::new(vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice()),
             closed: ClosedContexts::default(),

@@ -15,8 +15,9 @@
 //! **Events.** `SIGNAL_EVENT` and `WAIT_EVENT` come between encoders, as Metal's
 //! `encodeSignalEvent:value:` and `encodeWaitForEvent:value:` do, and name an event
 //! or a shared event. The value a buffer signals a shared event to goes to the guest
-//! once the buffer finishes, ahead of its completion record
-//! ([`RgfxEventSignalled`](reims_graphics::wire::RgfxEventSignalled)); a buffer that
+//! ([`RgfxEventSignalled`](reims_graphics::wire::RgfxEventSignalled)) as the host's event
+//! reaches it, where the buffer runs more work after the signal, else once the buffer
+//! finishes, and always ahead of its completion record ([`Signals`]); a buffer that
 //! waits is watched, and named in the log where it waits long ([`super::waits`]).
 //!
 //! **Submission.** A buffer committed by `commitAndWaitUntilSubmitted` asks for its
@@ -103,7 +104,7 @@ use reims_vgpu_core::platform::command::{
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::EventRef;
+use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
@@ -122,8 +123,8 @@ use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
-    DecodeError, Decoders, Drain, GraphicsDecoder, ObjHandle, ScheduledSink, SubmittedSink, blit,
-    compute, context_of, op_fault, read, refused, refusing, render, video,
+    DecodeError, Decoders, Drain, GraphicsDecoder, ObjHandle, ScheduledSink, SignalSink,
+    SubmittedSink, blit, compute, context_of, op_fault, read, refused, refusing, render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -131,13 +132,117 @@ use super::{
 const ON: OnFault = OnFault::Return;
 
 /// What a command buffer's op stream does with events: the shared events it signals, whose values
-/// go to the guest once it finishes, and the events it waits for.
+/// go to the guest as the GPU reaches them or once it finishes ([`Signals`]), and the events it
+/// waits for.
 #[derive(Default)]
 struct EventOps {
     /// Each (shared event, value) the buffer signals, in stream order.
-    signals: Vec<(u64, u64)>,
+    signals: Finisher,
     /// Each (event, value) the buffer waits for, in stream order.
     waits: Vec<(u64, u64)>,
+}
+
+/// A buffer's [`Signals`], made at its first signal of a shared event and held for its completion
+/// handler, which posts what is left of them ([`Signals::finish`]). Dropped without the handler
+/// having run (a walk that faulted, which a stand-in replaces; a buffer never committed), it lets
+/// their sink go, posting nothing more, so a notification that comes later posts nothing for the
+/// buffer, and one never reached holds no ring.
+#[derive(Default)]
+struct Finisher(Option<Arc<Signals>>);
+
+impl Finisher {
+    /// The buffer's signals, made at the first, their values going to `sink`.
+    fn signals(&mut self, sink: Option<&SignalSink>) -> &Arc<Signals> {
+        self.0.get_or_insert_with(|| {
+            Arc::new(Signals(Mutex::new(Posting {
+                sink: sink.cloned(),
+                signals: Vec::new(),
+            })))
+        })
+    }
+
+    /// The buffer finished: what no notification posted goes now.
+    fn finish(&self) {
+        if let Some(signals) = &self.0 {
+            signals.finish();
+        }
+    }
+}
+
+impl Drop for Finisher {
+    fn drop(&mut self) {
+        if let Some(signals) = &self.0 {
+            signals.0.lock().sink = None;
+        }
+    }
+}
+
+/// The values a command buffer signals its shared events to, each posted to the guest once
+/// ([`RgfxEventSignalled`]). A signal the buffer runs more work after (an encoder, or a wait for
+/// an event: [`work_after`]) is posted by the platform's notification as the host's event reaches
+/// its value
+/// ([`notify_listener`](reims_vgpu_core::platform::event::SharedEvent::notify_listener)): where
+/// the GPU gets to it in the buffer, as Metal's value and listeners move there (measured:
+/// docs/graphics-kext/dgpu-oracle.md, Q18). So a guest thread that waits on the CPU for it before
+/// it sets a value the buffer waits for later is released, where a post at the buffer's end would
+/// never come. The buffer's completion handler posts every one not yet posted, a signal at the
+/// buffer's end among them, ahead of its completion and whatever its outcome, then lets the sink
+/// go: a notification that comes later posts nothing. A value already reached when its
+/// notification is asked for goes at once: the event is at it, whatever raised it. A signal of a
+/// shared event whose create the host refused goes with the completion wherever it lies
+/// ([`GraphicsDecoder::note_refused_signal`]).
+#[derive(Default)]
+struct Signals(Mutex<Posting>);
+
+/// [`Signals`]' state.
+#[derive(Default)]
+struct Posting {
+    /// Where the values go: none without a sink, and none once the completion handler posted.
+    sink: Option<SignalSink>,
+    /// Each (shared event, value), in stream order, and whether it is posted.
+    signals: Vec<(u64, u64, bool)>,
+}
+
+impl Signals {
+    /// Notes the signal of shared event `obj_id` to `value`: its place in the stream's signals.
+    fn push(&self, obj_id: u64, value: u64) -> usize {
+        let mut posting = self.0.lock();
+        posting.signals.push((obj_id, value, false));
+        posting.signals.len() - 1
+    }
+
+    /// Whether the values go anywhere, so a notification is worth asking for.
+    fn posts(&self) -> bool {
+        self.0.lock().sink.is_some()
+    }
+
+    /// The signal at `at` was reached: posts it, unless it is posted already or the buffer's
+    /// completion handler has run.
+    fn reached(&self, at: usize) {
+        let mut posting = self.0.lock();
+        let Posting { sink, signals } = &mut *posting;
+        if let (Some(sink), Some((obj_id, value, posted))) = (sink.as_ref(), signals.get_mut(at))
+            && !*posted
+        {
+            *posted = true;
+            sink(event_signalled(*obj_id, *value));
+        }
+    }
+
+    /// The buffer finished: posts each signal not yet posted, in stream order, and lets the sink
+    /// go.
+    fn finish(&self) {
+        let mut posting = self.0.lock();
+        let Some(sink) = posting.sink.take() else {
+            return;
+        };
+        for (obj_id, value, posted) in &mut posting.signals {
+            if !*posted {
+                *posted = true;
+                sink(event_signalled(*obj_id, *value));
+            }
+        }
+    }
 }
 
 /// A command buffer's `CB_SUBMITTED`, posted once: by the first of the answer on a doorbell's
@@ -487,6 +592,31 @@ fn event_ops(mut ops: &[u8]) -> Vec<(bool, RgfxOpEvent)> {
         ops = &ops[len..];
     }
     out
+}
+
+/// Whether the op stream `ops`, what follows a signal in a buffer's, holds work the buffer runs
+/// after the signal: an encoder, or a wait for an event, which its end comes after. The scan stops
+/// at the first such op, which for a signal between encoders is the next one, or at an op it
+/// cannot step past, as the walk does.
+fn work_after(mut ops: &[u8]) -> bool {
+    while let Some(h) = read::<RgfxOpHeader>(ops) {
+        let len = h.len as usize;
+        if len < RGFX_OP_BODY_OFFSET as usize || !len.is_multiple_of(8) || len > ops.len() {
+            return false;
+        }
+        if matches!(
+            h.tag,
+            RGFX_OP_ENCODER_BEGIN_RENDER
+                | RGFX_OP_ENCODER_BEGIN_COMPUTE
+                | RGFX_OP_ENCODER_BEGIN_BLIT
+                | RGFX_OP_ENCODER_BEGIN_VIDEO
+                | RGFX_OP_WAIT_EVENT
+        ) {
+            return true;
+        }
+        ops = &ops[len..];
+    }
+    false
 }
 
 /// What the host reads of a command buffer's op stream as it takes the buffer, before its walk:
@@ -1286,14 +1416,24 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let in_flight = InFlight::new(&counts.in_flight);
         let mut events = EventOps::default();
-        for (signal, op) in event_ops(ops) {
+        let carried = event_ops(ops);
+        // A signal before a wait the stand-in carries is reached before the stand-in's end
+        // ([`Signals`]).
+        let last_wait = carried.iter().rposition(|(signal, op)| {
+            !signal
+                && matches!(
+                    self.named(op.event_obj_id),
+                    Some(ObjHandle::Event(_) | ObjHandle::SharedEvent(_))
+                )
+        });
+        for (at, (signal, op)) in carried.into_iter().enumerate() {
             let (event, shared) = match self.named(op.event_obj_id) {
-                Some(ObjHandle::Event(e)) => (EventRef::Event(e), false),
-                Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), true),
+                Some(ObjHandle::Event(e)) => (EventRef::Event(e), None),
+                Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), Some(e)),
                 // As the walk takes one whose create the host refused.
                 Some(ObjHandle::Refused(r)) => {
                     if signal && r.shared_event() {
-                        events.signals.push((op.event_obj_id, op.value));
+                        self.note_refused_signal(&mut events, op);
                     }
                     continue;
                 }
@@ -1301,8 +1441,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             };
             if signal {
                 cb.encode_signal(Some(event), op.value)?;
-                if shared {
-                    events.signals.push((op.event_obj_id, op.value));
+                if let Some(shared) = shared {
+                    let mid = last_wait.is_some_and(|wait| wait > at);
+                    self.note_signal(&mut events, shared, op, mid)?;
                 }
             } else {
                 cb.encode_wait(Some(event), op.value)?;
@@ -1427,8 +1568,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `events`, which the platform runs on the thread that saw the buffer complete: where its
     /// submission handler did not, it lets its queue go where it `held` it and posts its
     /// `submitted` and its `scheduled`; then it posts the values the buffer signalled its shared
-    /// events to, then its completion, which for a `stand_in` ([`Self::stand_in_for_failed`]) is
-    /// its failure whatever the stand-in's outcome, and lets `drain` (its context's) go.
+    /// events to that no notification posted ([`Signals::finish`]), then its completion, which
+    /// for a `stand_in` ([`Self::stand_in_for_failed`]) is its failure whatever the stand-in's
+    /// outcome, and lets `drain` (its context's) go.
     fn completed_handler(
         &self,
         cb_obj_id: u64,
@@ -1439,7 +1581,6 @@ impl<P: Platform> GraphicsDecoder<P> {
         (submitted, held, scheduled): Unposted,
     ) -> CompletedHandler {
         let sink = self.sinks.completion.clone();
-        let signal_sink = self.sinks.signal.clone();
         let context = self.context;
         let signals = events.signals;
         let watched = (!events.waits.is_empty()).then(|| {
@@ -1471,15 +1612,11 @@ impl<P: Platform> GraphicsDecoder<P> {
             if let Some(scheduled) = &scheduled {
                 scheduled.post();
             }
-            // The shared events the buffer signalled, ahead of its completion, so the guest
-            // has each value before the buffer's handlers run. A buffer that failed may have
-            // signalled them before its fault, and a guest waiting for one would wait for
-            // good: each is posted whatever the outcome.
-            if let Some(signal_sink) = &signal_sink {
-                for &(obj_id, value) in &signals {
-                    signal_sink(event_signalled(obj_id, value));
-                }
-            }
+            // The shared events the buffer signalled that no notification posted, ahead of its
+            // completion, so the guest has each value before the buffer's handlers run. A
+            // buffer that failed may have signalled them before its fault, and a guest waiting
+            // for one would wait for good: each is posted whatever the outcome.
+            signals.finish();
             let record = if stand_in {
                 cb_failed(cb_obj_id, seqno)
             } else {
@@ -1492,6 +1629,36 @@ impl<P: Platform> GraphicsDecoder<P> {
             // The buffer's work and its completion are done: a drain of its context may end.
             drop(drain);
         })
+    }
+
+    /// Notes the buffer's signal `op` of the shared event `event` in `events`; where the buffer
+    /// runs more work after it (`mid`), the platform posts its value as the event reaches it, on
+    /// the device's listener ([`Signals`]).
+    fn note_signal(
+        &self,
+        events: &mut EventOps,
+        event: &P::SharedEvent,
+        op: RgfxOpEvent,
+        mid: bool,
+    ) -> RaiseResult<()> {
+        let signals = events.signals.signals(self.sinks.signal.as_ref());
+        let at = signals.push(op.event_obj_id, op.value);
+        if !mid || !signals.posts() {
+            return Ok(());
+        }
+        let signals = Arc::clone(signals);
+        let listener = self.shared.listener();
+        event.notify_listener(listener, op.value, Box::new(move || signals.reached(at)))
+    }
+
+    /// Notes the buffer's signal `op` of a shared event whose create the host refused in
+    /// `events`: its value goes to the guest with the buffer's completion, ahead of it
+    /// ([`Signals::finish`]), wherever it lies in the stream. The host holds no event a
+    /// notification could watch, and the walk runs ahead of the GPU, so a post as the walk reaches
+    /// it could come before the buffer's earlier work is done.
+    fn note_refused_signal(&self, events: &mut EventOps, op: RgfxOpEvent) {
+        let signals = events.signals.signals(self.sinks.signal.as_ref());
+        signals.push(op.event_obj_id, op.value);
     }
 
     /// Walks the op stream `ops` on the command buffer `cb`. `Ok(Err(..))` for a
@@ -1529,7 +1696,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(Err(DecodeError::Malformed));
             };
             match op_group(tag) {
-                RGFX_OP_GROUP_FRAMING => self.framing_op(tag, body, cb, encoder, events)?,
+                RGFX_OP_GROUP_FRAMING => {
+                    self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?
+                }
                 // An op of an encoder skipped whole ([`OpenEncoder::Skipped`]): dropped.
                 group if matches!(encoder.as_ref(), Some(OpenEncoder::Skipped(g)) if *g == group) =>
                     {}
@@ -1657,13 +1826,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         Some((draw, len + draw_len))
     }
 
-    /// A framing op: open the encoder its `ENCODER_BEGIN_*` names, end the open
-    /// one, or signal or wait for an event between encoders. An already-open
-    /// encoder at a begin or at an event op, or no open encoder at an end, faults.
+    /// A framing op, `tag` with `body` and the stream's `rest` after it: open the encoder its
+    /// `ENCODER_BEGIN_*` names, end the open one, or signal or wait for an event between
+    /// encoders. An already-open encoder at a begin or at an event op, or no open encoder at an
+    /// end, faults.
     fn framing_op(
         &self,
-        tag: u16,
-        body: &[u8],
+        (tag, body, rest): (u16, &[u8], &[u8]),
         cb: &P::CommandBuffer,
         encoder: &mut Option<OpenEncoder<P>>,
         events: &mut EventOps,
@@ -1735,15 +1904,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                     .map(|(op, _)| op)
                     .map_err(|_| op_fault(format!("{name}: body too short")))?;
                 let (event, shared) = match self.named(op.event_obj_id) {
-                    Some(ObjHandle::Event(e)) => (EventRef::Event(e), false),
-                    Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), true),
+                    Some(ObjHandle::Event(e)) => (EventRef::Event(e), None),
+                    Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), Some(e)),
                     // An event whose create the host refused ([`refused`]): nothing on the host
                     // signals it, so a wait for it is dropped; a signal of a shared one still
-                    // reaches the guest's value as the buffer finishes, where its waiters are.
+                    // reaches the guest's value as the buffer finishes, where its waiters are,
+                    // whatever work follows it: with no host event to watch, a post as the walk
+                    // reached it could come before the GPU's work before it is done
+                    // ([`Self::note_refused_signal`]).
                     Some(ObjHandle::Refused(r)) => {
                         r.used(op.event_obj_id);
                         if signal && r.shared_event() {
-                            events.signals.push((op.event_obj_id, op.value));
+                            self.note_refused_signal(events, op);
                         }
                         return Ok(());
                     }
@@ -1751,8 +1923,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 if signal {
                     cb.encode_signal(Some(event), op.value)?;
-                    if shared {
-                        events.signals.push((op.event_obj_id, op.value));
+                    if let Some(shared) = shared {
+                        self.note_signal(events, shared, op, work_after(rest))?;
                     }
                 } else {
                     cb.encode_wait(Some(event), op.value)?;
@@ -4071,6 +4243,140 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 0x5a));
     }
 
+    /// Through the decoder on `P`: a buffer fills a buffer, signals shared event 7 to 1, waits
+    /// for 7 to reach 2, and fills it again, as a guest whose CPU waits for the signal before it
+    /// sets 2 encodes it. Whether the value 1 reached the guest within 5 s of the commit, before
+    /// the buffer completed; then the CPU sets 2, whatever came: whether the buffer completed
+    /// within 10 s of that, and whether the value went ahead of its completion, once.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
+    fn a_cpu_wait_for_a_mid_buffer_signal<P: crate::platform::ApiPlatform>() -> (bool, bool, bool) {
+        use std::time::{Duration, Instant};
+
+        use reims_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
+        const LEN: u64 = 1 << 20;
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let sink = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            sink.lock().push((m.header.r#type, m.obj_id, m.value));
+        }));
+        let sink = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            sink.lock().push((m.header.r#type, m.cb_obj_id, 0));
+        }));
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 10,
+            length: LEN,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        let event = RgfxSharedEventCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                size: size_of::<RgfxSharedEventCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 7,
+            initial_value: 0,
+        };
+        assert_eq!(dec.decode(&device, event.as_bytes()).unwrap(), Ok(()));
+
+        let fill = |value: u8| {
+            let mut ops = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+            let fill = RgfxBlitOpFillBuffer {
+                buffer_obj_id: 10,
+                range_location: 0,
+                range_length: LEN,
+                value,
+                ..RgfxBlitOpFillBuffer::default()
+            };
+            ops.extend(op(RGFX_OP_BLIT_FILL_BUFFER, fill.as_bytes()));
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+            ops
+        };
+        let mut ops = fill(0x11);
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 1));
+        ops.extend(event_op(RGFX_OP_WAIT_EVENT, 7, 2));
+        ops.extend(fill(0x22));
+        let cb = command_buffer_on(1, 20, &ops);
+        assert_eq!(dec.decode(&device, &cb).unwrap(), Ok(()));
+        let signalled = (RGFX_EVT_EVENT_SIGNALLED, 7, 1);
+        let completed = (RGFX_EVT_CB_COMPLETE, 20, 0);
+        let start = Instant::now();
+        while !posted.lock().contains(&signalled) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let early = {
+            let posted = posted.lock();
+            posted.contains(&signalled) && !posted.contains(&completed)
+        };
+
+        let set = RgfxSharedEventSetValue {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_SET_VALUE,
+                size: size_of::<RgfxSharedEventSetValue>() as u32,
+                seqno: 0,
+            },
+            obj_id: 7,
+            value: 2,
+        };
+        assert_eq!(dec.decode(&device, set.as_bytes()).unwrap(), Ok(()));
+        let start = Instant::now();
+        while !posted.lock().contains(&completed) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let posted = posted.lock().clone();
+        let finished = posted.contains(&completed);
+        (early, finished, posted == [signalled, completed])
+    }
+
+    /// On Metal, a guest thread that waits on the CPU for a signal from the middle of a command
+    /// buffer, before it sets the value the buffer waits for next, gets the signal while the
+    /// buffer runs, as Metal's CPU does (docs/graphics-kext/dgpu-oracle.md, Q18), and the buffer
+    /// then completes: the value goes as the host's event reaches it, once, ahead of the buffer's
+    /// completion.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
+        let (early, finished, once) =
+            a_cpu_wait_for_a_mid_buffer_signal::<reims_vgpu_metal::MetalPlatform>();
+        assert!(early, "the signal came only at the buffer's end, or never");
+        assert!(finished && once);
+    }
+
+    /// The same on the Vulkan platform
+    /// (`on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends`).
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
+        let (early, finished, once) =
+            a_cpu_wait_for_a_mid_buffer_signal::<reims_vgpu_vulkan::VulkanPlatform>();
+        assert!(early, "the signal came only at the buffer's end, or never");
+        assert!(finished && once);
+    }
+
     /// Through the decoder on `P`, as the host takes two queues' rings on threads of their own:
     /// buffer A of queue 1 fills a tracked buffer, and buffer B of queue 2, committed plainly
     /// after A by the guest, names A in its `COMMIT_ORDER` and copies the buffer out. B is taken
@@ -5172,6 +5478,190 @@ mod tests {
             [
                 (RGFX_EVT_EVENT_SIGNALLED, 7, 9),
                 (RGFX_EVT_CB_COMPLETE, 110, 0)
+            ]
+        );
+    }
+
+    /// A shared event's signal the buffer runs more work after (an encoder, or a wait) goes to the
+    /// guest as the host's event reaches its value, before the buffer completes, and not again at
+    /// its completion; one at the buffer's end goes at its completion, ahead of it. The CPU's set
+    /// stands in for the GPU reaching the signal. So does a stand-in's signal before its wait.
+    #[test]
+    fn a_signal_before_more_of_its_buffer_goes_as_the_event_reaches_it() {
+        use reims_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
+        };
+        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_core::platform::event::SharedEvent as _;
+        let (p, mut dec) = setup();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            signals.lock().push((m.header.r#type, m.obj_id, m.value));
+        }));
+        let completions = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, u64::from(m.status)));
+        }));
+        let reach = |dec: &GraphicsDecoder<FakePlatform>, value: u64| {
+            let Some(ObjHandle::SharedEvent(event)) = dec.object(7) else {
+                panic!("no shared event 7");
+            };
+            event.set_signaled_value(value).unwrap();
+        };
+
+        // A blit, signal 3, a blit, signal 4, and a wait for 5 after a signal of 5's event to 1
+        // (the plain event's signal, posted never).
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 3));
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 4));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 6, 1));
+        ops.extend(event_op(RGFX_OP_WAIT_EVENT, 6, 1));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 9));
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(140, 64, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let asked = p.call_log().sels_since(mark);
+        let asked = asked
+            .iter()
+            .filter(|s| **s == "notifyListener:atValue:block:")
+            .count();
+        assert_eq!(asked, 2, "the signals to 3 and 4, not the one at the end");
+        assert!(posted.lock().is_empty());
+        reach(&dec, 3);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_EVENT_SIGNALLED, 7, 3)]);
+        reach(&dec, 4);
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 3),
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 4),
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 9),
+                (RGFX_EVT_CB_COMPLETE, 140, 0),
+            ]
+        );
+
+        // A value the event is at already goes as the buffer is walked.
+        posted.lock().clear();
+        let mut ops = event_op(RGFX_OP_SIGNAL_EVENT, 7, 2);
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(141, 65, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(*posted.lock(), [(RGFX_EVT_EVENT_SIGNALLED, 7, 2)]);
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 2),
+                (RGFX_EVT_CB_COMPLETE, 141, 0)
+            ]
+        );
+
+        // A stand-in for a buffer that faults: its signal to 10 before its wait for 11 goes as the
+        // event reaches 10, its signal to 12 at its completion.
+        posted.lock().clear();
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        // Pipeline 99 is nothing the decoder holds: the walk faults here.
+        ops.extend(op(
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState {
+                pipeline_obj_id: 99,
+            }
+            .as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 10));
+        ops.extend(event_op(RGFX_OP_WAIT_EVENT, 7, 11));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 12));
+        let message = command_buffer_message(142, 66, &ops);
+        assert!(dec.decode(&device, &message).is_err());
+        assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+        assert!(posted.lock().is_empty());
+        reach(&dec, 10);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_EVENT_SIGNALLED, 7, 10)]);
+        reach(&dec, 11);
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 10),
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 12),
+                (RGFX_EVT_CB_COMPLETE, 142, u64::from(RGFX_CB_INTERNAL)),
+            ]
+        );
+    }
+
+    /// A signal of a shared event whose create the host refused goes to the guest with its buffer's
+    /// completion, ahead of it, though the buffer runs more work after it: the host holds no event
+    /// a notification could watch, and a post as the walk reaches it could come before the GPU's
+    /// work before it is done. Its wait is dropped, and so is everything the platform would carry.
+    #[test]
+    fn a_refused_shared_event_s_signal_goes_with_its_buffer_s_completion() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            signals.lock().push((m.header.r#type, m.obj_id, m.value));
+        }));
+        let completions = Arc::clone(&posted);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, u64::from(m.status)));
+        }));
+        p.script().push("newSharedEvent", Step::Nil);
+        let create = RgfxSharedEventCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                size: size_of::<RgfxSharedEventCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 8,
+            initial_value: 0,
+        };
+        assert!(
+            dec.decode_refusing(&device, create.as_bytes())
+                .unwrap()
+                .is_err()
+        );
+
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 8, 1));
+        ops.extend(event_op(RGFX_OP_WAIT_EVENT, 8, 2));
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(143, 67, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let sels = p.call_log().sels_since(mark);
+        for dropped in [
+            "notifyListener:atValue:block:",
+            "encodeSignalEvent:value:",
+            "encodeWaitForEvent:value:",
+        ] {
+            assert!(!sels.contains(&dropped), "{dropped}");
+        }
+        assert!(posted.lock().is_empty(), "posted as the walk reached it");
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 8, 1),
+                (RGFX_EVT_CB_COMPLETE, 143, 0)
             ]
         );
     }

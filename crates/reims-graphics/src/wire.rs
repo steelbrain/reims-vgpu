@@ -1648,7 +1648,10 @@ pub struct RgfxCbSubmitted {
 
 /// `EVENT_SIGNALLED`, on the completion ring of the queue whose command buffer signalled it, ahead
 /// of that buffer's [`RgfxCbComplete`]: the shared event `obj_id` was signalled to `value`
-/// (`encodeSignalEvent:value:`) by the buffer, now finished.
+/// (`encodeSignalEvent:value:`) by the buffer. Where the buffer has more work after the signal (an
+/// encoder, or a wait for an event), it is posted as the host's event reaches the value, while the
+/// buffer may still run, or wait to be scheduled; else once the buffer finishes. Each signal is
+/// posted once, whatever the buffer's outcome.
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
