@@ -63,7 +63,9 @@
  *
  * A CPU lock of a surface, in any process, waits for the GPU's pending writes to it, as Metal's
  * does (the kext's RgfxSurfaceLocks.hpp). A commit of a buffer that writes a surface's shared
- * block, in place or a copy, names the surface to the kext before the commit returns
+ * block, in place or a copy, names the surface to the kext before the commit returns, or, for a
+ * buffer held as Metal holds one from submission (one that waits on an event below its value, or
+ * is behind such a one on its queue: RgfxCmdBuffer's rgfxPost), once it is scheduled
  * (rgfxIOSurfaceWritesPosted), and the kext keeps every lock of it waiting until the write
  * retires: at the buffer's completion, once a copy is written back (rgfxIOSurfaceRetire), or for
  * a view in place once the device has completed the buffer. The kext marks each surface named
@@ -74,16 +76,17 @@
  * After the header lie the view's writers (RgfxSurfaceWriters, reims_graphics_wire.h), which the
  * texture's create names to the host: a present of the surface shows the view once the command
  * buffers they name have finished. A commit of a buffer that writes the view names its queue and
- * the buffer's seqno there before the commit returns, so a present the process makes after it
- * waits for it on the host. Each process writes only the slots naming its own queues: it raises
- * its queue's seqno in the slot it holds, takes again one naming a queue of its own that is gone
- * (whose buffers have all finished), or takes an empty one (queue 0); it empties a slot once the
- * host has finished the buffer it names (rgfxIOSurfaceNoteFinished), so a slot is held only
- * while a buffer it names runs, and empties its slots as its view goes, when the buffers that
- * wrote it have finished. A slot given to another queue has
- * its seqno emptied first, then its queue written, then the seqno, so the host, which reads the
- * queue, the seqno and the queue again, never pairs one queue with another's seqno. A block made
- * again has its writers emptied by the process that made it, before its texture is created.
+ * the buffer's seqno there before the commit returns, or, held, once it is scheduled, so a
+ * present the process makes after that waits for it on the host. Each process writes only the
+ * slots naming its own queues: it raises its queue's seqno in the slot it holds, takes again one
+ * naming a queue of its own that is gone (whose buffers have all finished), or takes an empty one
+ * (queue 0); it empties a slot once the host has finished the buffer it names
+ * (rgfxIOSurfaceNoteFinished), so a slot is held only while a buffer it names runs, and empties
+ * its slots as its view goes, when the buffers that wrote it have finished. A slot given to
+ * another queue has its seqno emptied first, then its queue written, then the seqno, so the host,
+ * which reads the queue, the seqno and the queue again, never pairs one queue with another's
+ * seqno. A block made again has its writers emptied by the process that made it, before its
+ * texture is created.
  *
  * Where the process names its command buffers' order (RGFX_FEATURE_SURFACE_ORDER in the
  * device's feature word; docs/graphics-kext/design.md, "Surface order"), the readers follow the
@@ -317,7 +320,8 @@ private:
 /// completion (rgfxIOSurfaceRetire) whether or not the naming came first.
 RgfxRegion *_Nullable rgfxIOSurfaceWritesRegion(const std::vector<std::shared_ptr<void>> &writes);
 
-/// After a command buffer is posted at seqno `seqno` on queue `queueObjId`: names the surfaces
+/// Once a command buffer is posted at seqno `seqno` on queue `queueObjId`, and, held, scheduled
+/// (RgfxCmdBuffer's rgfxNameAccesses): names the surfaces
 /// it writes, those with shared blocks in `region`, to the kext once each. A CPU lock of one of
 /// them, in any process, then waits until the buffer's results are in its pages, as Metal's
 /// does once a buffer is submitted. The kext marks each surface the GPU's, which moves its seed,
@@ -332,13 +336,14 @@ void rgfxIOSurfaceWritesPosted(RgfxRegion *_Nonnull region,
 /// before it, retire, and the CPU locks waiting for them go on.
 void rgfxIOSurfaceRetire(RgfxRegion *_Nonnull region, uint64_t queueObjId, uint64_t seqno);
 
-/// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is `queueObjId`):
-/// names it among the readers of each view in `reads` (rgfxIOSurfaceNameOrder's answer), so a
-/// later post of another queue's buffer that writes the surface runs after it.
+/// Once a command buffer is posted at seqno `seqno` on queue `queue` (whose id is `queueObjId`),
+/// and, held, scheduled: names it among the readers of each view in `reads`
+/// (rgfxIOSurfaceNameOrder's answer), so a later post of another queue's buffer that writes the
+/// surface runs after it.
 void rgfxIOSurfaceNoteRead(const std::vector<std::shared_ptr<void>> &reads, id _Nonnull queue,
                            uint64_t queueObjId, uint64_t seqno);
 
-/// Once the host has finished queue `queueObjId`'s buffer at `seqno`, and its post has named it
+/// Once the host has finished queue `queueObjId`'s buffer at `seqno`, and its accesses are named
 /// (rgfxIOSurfaceNoteCommitted, rgfxIOSurfaceNoteRead): empties the queue's slots, of the writers
 /// and the readers of each view in `writes` and `reads`, that still name that buffer. A buffer
 /// that named it would wait for nothing, and the slot is free for a queue of any process.
@@ -346,9 +351,9 @@ void rgfxIOSurfaceNoteFinished(const std::vector<std::shared_ptr<void>> &writes,
                                const std::vector<std::shared_ptr<void>> &reads,
                                uint64_t queueObjId, uint64_t seqno);
 
-/// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is
-/// `queueObjId`): names it among the writers of each copy in `writes` (taken from its encoder),
-/// once each, so a present of the surface after this waits for it.
+/// Once a command buffer is posted at seqno `seqno` on queue `queue` (whose id is
+/// `queueObjId`), and, held, scheduled: names it among the writers of each copy in `writes`
+/// (taken from its encoder), once each, so a present of the surface after this waits for it.
 void rgfxIOSurfaceNoteCommitted(const std::vector<std::shared_ptr<void>> &writes, id _Nonnull queue,
                                 uint64_t queueObjId, uint64_t seqno);
 

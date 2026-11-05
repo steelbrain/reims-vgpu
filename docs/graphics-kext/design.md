@@ -2025,11 +2025,18 @@ committed in. The bundle names the order instead, as it posts each buffer:
   whose order is its ring's. A queue the host does not hold, or a seqno past
   every one the queue's ring has published, names no buffer and waits for
   nothing.
-- A Mac does not hold a read back for a write committed before it that is
-  still waiting on an event (measured, the 5300M and the 630 under macOS
-  26.7.1: another process's blit of the surface completed within 1 s, reading
-  the surface as it was). The host does: the write's buffer is on its ring and
-  in its slot, so the read waits for it to finish.
+- A Mac orders no access after a buffer it has not submitted: one that waits on
+  an event not yet at its value, or is behind one on its queue (measured, the
+  5300M and the 630 under macOS 26.7.1: another process's blit of the surface,
+  and its read-only CPU lock, went on at once while the write waited on its
+  event, the blit reading the surface as it was). So the bundle holds such a
+  buffer's accesses: one that waits on an event below its value as the process
+  knows it (a shared event's value as the host posted it and the CPU set it, a
+  plain event's as the host finished the buffers of the process that signalled
+  it), or is posted behind a held buffer of its queue, raises its slots and
+  names its writes to the kext at its `CB_SCHEDULED`, which the host posts once
+  its platform has scheduled it, past its waits. A read posted meanwhile names
+  none of it and waits for none of it, and nor does a CPU lock.
 - The wait is an order on the GPU and nothing more, as a Mac's is: a Mac answers
   a command buffer it runs after another queue's or process's pending access to
   a surface submitted and scheduled within a millisecond of its commit (the 630,

@@ -4,9 +4,13 @@
 
 #import "RgfxEvent.h"
 
+#include <atomic>
+
 #include "RgfxSerializer.hpp"
 
-@implementation RgfxEvent
+@implementation RgfxEvent {
+	std::atomic<uint64_t> _signalled; // rgfxSignalledValue; only rises
+}
 
 // The host drops the event as the app lets it go, after any command buffer that names it (each
 // keeps it while it runs).
@@ -24,6 +28,19 @@
 	if (serializer->refused(created))
 		return nil; // the device never got it
 	return [[RgfxEvent alloc] initWithObjId:created.obj_id device:device serializer:serializer];
+}
+
+- (uint64_t)rgfxSignalledValue
+{
+	return _signalled.load(std::memory_order_acquire);
+}
+
+- (void)rgfxNoteSignalled:(uint64_t)value
+{
+	uint64_t now = _signalled.load(std::memory_order_relaxed);
+	while (now < value &&
+	       !_signalled.compare_exchange_weak(now, value, std::memory_order_acq_rel))
+		;
 }
 
 // MTLEvent adds no state or methods beyond `device` and `label`, which

@@ -602,6 +602,12 @@ struct RgfxBarrierSlot {
 - (BOOL)rgfxRetiresAtTake:(BOOL)now;
 /// A buffer rgfxRetiresAtTake: left to retire at its delivery has retired.
 - (void)rgfxRetiredLate;
+/// How many of its posted buffers are held: posted with their surface accesses not yet named,
+/// until they are scheduled (RgfxCmdBuffer's rgfxPost). Read and raised by its posts, one at a
+/// time; lowered as each held buffer is scheduled, or goes unposted.
+- (uint32_t)rgfxHeldBuffers;
+- (void)rgfxNoteHeld;
+- (void)rgfxNoteHeldGone;
 /// The next encoder's barrier fence, of the fences the queue made with itself.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 /// Runs `record` on the queue's completion queue, behind the records before it, or here.
@@ -640,6 +646,8 @@ struct RgfxBarrierSlot {
 	// any, a later buffer's retire goes behind them too, as the kext retires a queue's writes up
 	// to a seqno (rgfxRetiresAtTake:).
 	std::atomic<uint32_t> _lateRetires;
+	// rgfxHeldBuffers.
+	std::atomic<uint32_t> _heldBuffers;
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
 	unsigned short _gpuPriorityOffset; // and the offsets and background priority with it
 	NSUInteger _backgroundGpuPriority;
@@ -799,6 +807,21 @@ struct RgfxBarrierSlot {
 - (void)rgfxRetiredLate
 {
 	_lateRetires.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+- (uint32_t)rgfxHeldBuffers
+{
+	return _heldBuffers.load(std::memory_order_acquire);
+}
+
+- (void)rgfxNoteHeld
+{
+	_heldBuffers.fetch_add(1, std::memory_order_acq_rel);
+}
+
+- (void)rgfxNoteHeldGone
+{
+	_heldBuffers.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 // Takes one of the queue's slots, blocking while every one is held, as Metal's -commandBuffer
@@ -1205,9 +1228,11 @@ namespace {
 // device's pipelines have.
 constexpr uint64_t kRgfxBarrierRenderStages = MTLRenderStageVertex | MTLRenderStageFragment;
 
-// A command buffer's surface slots (RgfxCmdBuffer's _surfaceSlots): its post has named it in
-// them, and the host has finished it.
-constexpr uint32_t kRgfxSlotsNamed = 1, kRgfxSlotsFinished = 2;
+// A command buffer's surface accesses (RgfxCmdBuffer's _surfaceSlots): named in its surfaces'
+// slots and to the kext; the host has finished it; posted held, its accesses left to its
+// scheduling; and scheduled.
+constexpr uint32_t kRgfxSlotsNamed = 1, kRgfxSlotsFinished = 2, kRgfxSlotsHeld = 4,
+                   kRgfxSlotsScheduled = 8;
 
 // The fences a barrier in the encoder of `b` waits for: every one but its own that an earlier
 // encoder took, calling `wait` with each.
@@ -1311,11 +1336,26 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// yet: at its completion's take, a buffer of both retires its writes there (rgfxHostDone:).
 	bool _writesInPlace;
 	std::atomic<bool> _writesNamed;
-	// Whether its post has named it in its surfaces' writer and reader slots, and whether the
-	// host has finished it (kRgfxSlotsNamed, kRgfxSlotsFinished): the second of the two empties
-	// the slots that still name it (rgfxIOSurfaceNoteFinished), as the host may finish a buffer
-	// before its post has named it.
+	// Whether its surface accesses are named, in its surfaces' writer and reader slots and to the
+	// kext, and whether the host has finished it (kRgfxSlotsNamed, kRgfxSlotsFinished): the second
+	// of the two empties the slots that still name it (rgfxIOSurfaceNoteFinished), as the host may
+	// finish a buffer before they are named. A buffer posted held has them named once it is
+	// both posted and scheduled (kRgfxSlotsHeld, kRgfxSlotsScheduled: rgfxNameAccesses).
 	std::atomic<uint32_t> _surfaceSlots;
+	// What its accesses name (rgfxNameAccesses): the views it writes and those it only reads,
+	// and where its writes go to the kext; set by its post, emptied by its delivery
+	// (`_namedGone`), all under `_namedLock`, so a delivery that comes first leaves nothing to
+	// name: no write is named to the kext after its retire.
+	std::mutex _namedLock;
+	std::vector<std::shared_ptr<void>> _namedWrites;
+	std::vector<std::shared_ptr<void>> _namedReads;
+	RgfxRegion *_namedRegion;
+	bool _namedGone;
+	// The events it waits on, each with its value, and the plain events it signals: whether a
+	// wait is met at its post decides whether the post names its accesses (rgfxPost); the host's
+	// finish of the buffer raises each plain event's value as this process knows it.
+	std::vector<std::pair<id, uint64_t>> _eventWaits;
+	std::vector<std::pair<RgfxEvent *, uint64_t>> _plainSignals;
 	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
@@ -1671,6 +1711,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 			}
 			reader->expectScheduled(seqno, [strongSelf, queue, reader, whereSeen](const RgfxCbScheduled &) {
 				[strongSelf rgfxReachSubmitted];
+				[strongSelf rgfxScheduledNamesAccesses];
 				[queue rgfxDeliver:^{
 					@autoreleasepool {
 						[strongSelf rgfxReachScheduled];
@@ -1720,27 +1761,35 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		if (flush.messages != 0)
 			rgfxNoteIcbFlush(flush);
 	}
+	// Held: it waits on an event not at its value as far as this process knows, or is posted
+	// behind a held buffer of its queue. Metal submits such a buffer only once it is scheduled,
+	// and orders no access of another queue or process after it, nor a CPU lock of a surface it
+	// writes, until then (measured on the 5300M and the 630, macOS 26.7.1: another process's
+	// blit of the surface, and its CPU lock, went on at once while the write waited on its
+	// event); so its accesses are named at its CB_SCHEDULED, not here.
+	const bool held = [queue rgfxHeldBuffers] > 0 || ![self rgfxWaitsMet];
+	if (held)
+		[queue rgfxNoteHeld];
 	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
 	// On its ring: the posts of other queues from here name it (RgfxCommitOrder::posted).
 	if (posted)
 		[queue rgfxNotePosted:_seqno];
-	// A present of a surface it writes, made after this commit, waits for it on the host; and so
-	// does a buffer of another queue posted after it that uses the surface, where one of the two
-	// writes it (rgfxIOSurfaceNameOrder).
-	if (posted && !written.empty())
-		rgfxIOSurfaceNoteCommitted(written, queue, queue.rgfxObjId, _seqno);
-	if (posted && !read.empty())
-		rgfxIOSurfaceNoteRead(read, queue, queue.rgfxObjId, _seqno);
-	// Where the host has finished it already, the slots just named go now.
-	if (posted && (!written.empty() || !read.empty()) &&
-	    (_surfaceSlots.fetch_or(kRgfxSlotsNamed, std::memory_order_acq_rel) &
-	     kRgfxSlotsFinished) != 0)
-		rgfxIOSurfaceNoteFinished(written, read, queue.rgfxObjId, _seqno);
-	// A CPU lock of a surface it writes waits for it from here, before the commit returns, as
-	// Metal's does once the buffer is submitted.
-	if (posted && writesRegion != nullptr) {
-		rgfxIOSurfaceWritesPosted(writesRegion, written, queue.rgfxObjId, _seqno);
-		_writesNamed.store(true, std::memory_order_release);
+	if (posted) {
+		{
+			std::lock_guard<std::mutex> g(_namedLock);
+			if (!_namedGone) {
+				_namedWrites = std::move(written);
+				_namedReads = std::move(read);
+				_namedRegion = writesRegion;
+			}
+		}
+		if (!held)
+			[self rgfxNameAccesses];
+		else if ((_surfaceSlots.fetch_or(kRgfxSlotsHeld, std::memory_order_acq_rel) &
+		          kRgfxSlotsScheduled) != 0)
+			[self rgfxNameAccesses];
+	} else if (held) {
+		[queue rgfxNoteHeldGone];
 	}
 	if (!posted)
 		_surfaceWritesRegion = nullptr;
@@ -1823,14 +1872,74 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // queue's slot goes back, so a handler that makes the next buffer never waits for handlers
 // behind it; its message's block and its inline bytes' chunks go back, whether some found none
 // noted for its status; and its times are taken.
+// Whether every event it waits on is at its value as this process knows it: a shared event's
+// value as the host posted it and the CPU set it, a plain event's as the host finished the
+// buffers that signalled it (RgfxEvent's rgfxSignalledValue). A wait it cannot read is not met.
+- (BOOL)rgfxWaitsMet
+{
+	for (const auto &wait : _eventWaits) {
+		uint64_t now = 0;
+		if ([wait.first isKindOfClass:[RgfxSharedEvent class]])
+			now = [(RgfxSharedEvent *)wait.first signaledValue];
+		else if ([wait.first isKindOfClass:[RgfxEvent class]])
+			now = [(RgfxEvent *)wait.first rgfxSignalledValue];
+		if (now < wait.second)
+			return NO;
+	}
+	return YES;
+}
+
+// Names its surface accesses, once: its queue among the writers of each view it writes and the
+// readers of each it only reads, so a present of the surface waits for it and a buffer of
+// another queue posted after it that uses the surface runs after it where one of the two writes
+// it (rgfxIOSurfaceNameOrder); and its writes to the kext, so a CPU lock of a surface it writes
+// waits for it, as Metal's does once the buffer is submitted. At its post, before the commit
+// returns, or, held, once it is posted and scheduled.
+- (void)rgfxNameAccesses
+{
+	RgfxCommandQueue *queue = _queue;
+	const uint64_t queueId = queue.rgfxObjId;
+	std::lock_guard<std::mutex> g(_namedLock);
+	if (!_namedWrites.empty())
+		rgfxIOSurfaceNoteCommitted(_namedWrites, queue, queueId, _seqno);
+	if (!_namedReads.empty())
+		rgfxIOSurfaceNoteRead(_namedReads, queue, queueId, _seqno);
+	if (_namedRegion != nullptr) {
+		rgfxIOSurfaceWritesPosted(_namedRegion, _namedWrites, queueId, _seqno);
+		_writesNamed.store(true, std::memory_order_release);
+	}
+	const uint32_t was = _surfaceSlots.fetch_or(kRgfxSlotsNamed, std::memory_order_acq_rel);
+	if ((was & kRgfxSlotsHeld) != 0)
+		[queue rgfxNoteHeldGone];
+	// Where the host has finished it already, the slots just named go now.
+	if ((was & kRgfxSlotsFinished) != 0)
+		rgfxIOSurfaceNoteFinished(_namedWrites, _namedReads, queueId, _seqno);
+}
+
+// It is scheduled (its CB_SCHEDULED taken, or its scheduling reached): a buffer posted held has
+// its accesses named now, where its post is done.
+- (void)rgfxScheduledNamesAccesses
+{
+	const uint32_t was = _surfaceSlots.fetch_or(kRgfxSlotsScheduled, std::memory_order_acq_rel);
+	if ((was & kRgfxSlotsScheduled) == 0 && (was & kRgfxSlotsHeld) != 0)
+		[self rgfxNameAccesses];
+}
+
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg
 {
 	[self rgfxReachSubmitted];
 	// The slots of its surfaces that still name it are free: a buffer that named it would wait
-	// for nothing. Where its post has yet to name them, the post empties them once it has.
+	// for nothing. Where its accesses are yet to be named, they are emptied once they are.
 	if ((_surfaceSlots.fetch_or(kRgfxSlotsFinished, std::memory_order_acq_rel) &
-	     kRgfxSlotsNamed) != 0)
-		rgfxIOSurfaceNoteFinished(_surfaceWrites, _surfaceReads, [_queue rgfxObjId], _seqno);
+	     kRgfxSlotsNamed) != 0) {
+		std::lock_guard<std::mutex> g(_namedLock);
+		rgfxIOSurfaceNoteFinished(_namedWrites, _namedReads, [_queue rgfxObjId], _seqno);
+	}
+	// The plain events it signalled are at their values, where it ran.
+	if (msg->status == RGFX_CB_OK) {
+		for (const auto &signal : _plainSignals)
+			[signal.first rgfxNoteSignalled:signal.second];
+	}
 	_uploadsFailed = _uploads != nullptr && _uploads->failed();
 	if (_uploads != nullptr) {
 		_uploads->giveBack();
@@ -1871,6 +1980,13 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
 	_surfaceReads.clear();
+	{
+		std::lock_guard<std::mutex> g(_namedLock);
+		_namedWrites.clear();
+		_namedReads.clear();
+		_namedRegion = nullptr;
+		_namedGone = true;
+	}
 	// Its results are in the surfaces' pages: the CPU locks waiting for them go on, where its
 	// writes did not retire at the take (rgfxHostDone:), which left it to retire here.
 	if (_surfaceWritesRegion != nullptr) {
@@ -1924,6 +2040,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	if (_scheduledReached.exchange(true))
 		return;
 	[self rgfxReachSubmitted];
+	[self rgfxScheduledNamesAccesses];
 	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
 	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
 	for (MTLCommandBufferHandler block in _scheduledHandlers) {
@@ -2075,8 +2192,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// The work encoded after this waits, on the host's GPU, until the event reaches `value`:
 	// signalled by another command buffer, or, for a shared event, set by the CPU.
 	uint64_t obj = [self rgfxEventOf:event op:"encodeWaitForEvent" value:value];
-	if (obj != 0 && _encoder != nullptr)
+	if (obj != 0 && _encoder != nullptr) {
 		_encoder->waitEvent(obj, value);
+		_eventWaits.emplace_back(event, value);
+	}
 }
 
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
@@ -2085,8 +2204,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// reaches this process once the buffer finishes, ahead of its completion
 	// (RGFX_EVT_EVENT_SIGNALLED, which its queue's reader hands to the device's).
 	uint64_t obj = [self rgfxEventOf:event op:"encodeSignalEvent" value:value];
-	if (obj != 0 && _encoder != nullptr)
+	if (obj != 0 && _encoder != nullptr) {
 		_encoder->signalEvent(obj, value);
+		if ([(id)event isKindOfClass:[RgfxEvent class]])
+			_plainSignals.emplace_back((RgfxEvent *)event, value);
+	}
 }
 
 // A drawable's present, as MTLCommandBuffer.h describes it: `present` runs once this buffer is

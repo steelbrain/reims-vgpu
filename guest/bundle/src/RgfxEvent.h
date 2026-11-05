@@ -34,6 +34,14 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable instancetype)eventWithDevice:(nullable id<MTLDevice>)device
                               serializer:(nullable RgfxSerializer *)serializer;
 
+/// The highest value a command buffer of this process signalled the event to that the host has
+/// finished, 0 for none: only command buffers signal a plain event, and only its process's. The
+/// post of a buffer that waits on the event reads it (RgfxCmdBuffer's rgfxPost).
+- (uint64_t)rgfxSignalledValue;
+
+/// The host finished a command buffer that signalled the event to `value`.
+- (void)rgfxNoteSignalled:(uint64_t)value;
+
 @end
 
 NS_ASSUME_NONNULL_END

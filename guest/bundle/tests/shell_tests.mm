@@ -9417,6 +9417,258 @@ void test_iosurface_slots_free_at_completion()
 	CFRelease(surface);
 }
 
+// A command buffer held at its post, as Metal holds one from submission (RgfxCmdBuffer's
+// rgfxPost): one that waits on an event not at its value as far as the process knows, or that is
+// posted behind a held buffer of its queue, names its accesses of surfaces at its CB_SCHEDULED,
+// not at its post: until then no slot of its surfaces' blocks names it, so a read of another
+// queue or process posted meanwhile waits for none of it, and the kext is not told of its writes,
+// so a CPU lock does not wait for them. Scheduled, it names them, and a read posted after waits
+// for it. A wait the process knows is met (a plain event a finished buffer of the process
+// signalled, a shared event at its value) holds nothing.
+void test_iosurface_held_buffer_names_at_scheduling()
+{
+	// Never freed, as Fixture's: the queues and their buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	TestRing &completion = *new TestRing(0x8000);
+	RgfxReplyReader &reader = *new RgfxReplyReader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> &mem = *new std::vector<uint8_t>(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion &region = *new RgfxRegion(mem.data(), mem.size());
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		std::vector<std::pair<uint64_t, uint64_t>> named; // the writes named to the kext
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			*offset = static_cast<Source *>(c)->offset;
+			*serial = 7;
+			*fresh = true;
+			return true;
+		}
+		static void release(void *, uint64_t) {}
+		static void writes(void *c, uint64_t queue, uint64_t seqno, const uint64_t *, uint32_t)
+		{
+			static_cast<Source *>(c)->named.emplace_back(queue, seqno);
+		}
+		static void retire(void *, uint64_t, uint64_t) {}
+	} &src = *new Source();
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	region.setSurfaceWriteSource(&Source::writes, &Source::retire, &src);
+	auto queueMade = [&]() {
+		drainRing(control);
+		RgfxCommandQueue *q = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                              submitOffset:0
+		                                            completeOffset:0
+		                                          completeDataSize:0
+		                                                       ids:&ids
+		                                                  maxCount:0
+		                                                    device:nil
+		                                                serializer:&ser];
+		CHECK(q != nil);
+		q.replyReader = &reader;
+		(void)expectQueueCreate(control);
+		return q;
+	};
+	using Slot = std::pair<uint64_t, uint64_t>;
+	using Waits = std::vector<Slot>;
+	struct Committed {
+		uint64_t seqno = 0;
+		Waits waits; // its order's, where it names one
+	};
+	// The buffer `cb` committed, as posted.
+	auto commit = [&](id<MTLCommandBuffer> cb) {
+		[cb commit];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		Committed out;
+		out.seqno = h.seqno;
+		RgfxOpHeader op = {};
+		CHECK(bytes.size() >= RGFX_COMMAND_BUFFER_OPS_OFFSET + sizeof(op));
+		std::memcpy(&op, bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, sizeof(op));
+		if (op.tag == RGFX_OP_SURFACE_ORDER) {
+			for (size_t i = 0; i < (op.len - RGFX_OP_BODY_OFFSET) / sizeof(RgfxSurfaceOrderWait);
+			     i++) {
+				RgfxSurfaceOrderWait w = {};
+				std::memcpy(&w,
+				            bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET + RGFX_OP_BODY_OFFSET +
+				                i * sizeof(w),
+				            sizeof(w));
+				out.waits.push_back({w.queue_obj_id, w.seqno});
+			}
+		}
+		drainRing(control);
+		return out;
+	};
+	// The host's CB_SCHEDULED and CB_COMPLETE of `cb`, posted at `seqno`, taken.
+	auto scheduled = [&](id<MTLCommandBuffer> cb, uint64_t seqno) {
+		RgfxCbScheduled s = cbScheduled(seqno, ((RgfxResource *)cb).rgfxObjId);
+		CHECK(completion.postFromHost(&s, sizeof(s)));
+		CHECK(reader.pump() == 1);
+		CHECK(cb.status == MTLCommandBufferStatusScheduled);
+	};
+	auto completed = [&](id<MTLCommandBuffer> cb, uint64_t seqno) {
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = seqno;
+		done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		CHECK(reader.pump() == 1);
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+	};
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	// 16 x 16 BGRA: rows 256 bytes apart, the header at 4096, then the writers.
+	auto *writers =
+	    reinterpret_cast<RgfxSurfaceWriters *>(mem.data() + src.offset + 4096 + kSurfaceHeader);
+	auto slot = [](const RgfxSurfaceWriters *rec, int i) {
+		return Slot(rec->writers[i].queue_obj_id, rec->writers[i].seqno);
+	};
+	const Slot kEmpty = {0, 0};
+	id<MTLBuffer> buffer = [RgfxBuffer bufferWithLength:16 * 16 * 4
+	                                            options:MTLResourceStorageModeShared
+	                                             device:nil
+	                                         serializer:&ser];
+	CHECK(buffer != nil);
+	drainRing(control);
+	// A buffer of `q` that reads `t` (a blit from it), and one that writes it (an attachment),
+	// each waiting first on `event` at `value` where one is given.
+	auto reading = [&](RgfxCommandQueue *q, id<MTLTexture> t) {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+		[be copyFromTexture:t
+		             sourceSlice:0
+		             sourceLevel:0
+		            sourceOrigin:MTLOriginMake(0, 0, 0)
+		              sourceSize:MTLSizeMake(16, 16, 1)
+		                toBuffer:buffer
+		       destinationOffset:0
+		  destinationBytesPerRow:64
+		destinationBytesPerImage:64 * 16];
+		[be endEncoding];
+		return cb;
+	};
+	auto writing = [&](RgfxCommandQueue *q, id<MTLTexture> t, id<MTLEvent> event, uint64_t value) {
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		if (event != nil)
+			[cb encodeWaitForEvent:event value:value];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		return cb;
+	};
+	rgfxIOSurfaceSetOrder(true);
+	RgfxCommandQueue *a = queueMade(), *b = queueMade();
+	@autoreleasepool {
+		RgfxEvent *event = [RgfxEvent eventWithDevice:nil serializer:&ser];
+		RgfxSharedEvent *shared = [RgfxSharedEvent sharedEventWithInitialValue:5
+		                                                                device:nil
+		                                                            serializer:&ser];
+		CHECK(event != nil && shared != nil);
+		drainRing(control);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                                            iosurface:surface
+		                                                                plane:0
+		                                                               region:&region
+		                                                               device:nil
+		                                                           serializer:&ser];
+		CHECK(t != nil);
+		drainRing(control);
+
+		// A write that waits on a plain event nothing has signalled: posted with its surface's
+		// slot and the kext's writes naming none of it, so a read of another queue waits for
+		// nothing; a write posted behind it on its queue, which waits for nothing itself, is held
+		// as well.
+		id<MTLCommandBuffer> w1 = writing(a, t, event, 1);
+		Committed c1 = commit(w1);
+		CHECK(slot(writers, 0) == kEmpty && src.named.empty());
+		id<MTLCommandBuffer> r1 = reading(b, t);
+		Committed c2 = commit(r1);
+		CHECK(c2.waits.empty());
+		id<MTLCommandBuffer> w2 = writing(a, t, nil, 0);
+		Committed c3 = commit(w2);
+		CHECK(slot(writers, 0) == kEmpty && src.named.empty());
+
+		// Scheduled, the first names its accesses, and a read posted after waits for it; then
+		// the second.
+		scheduled(w1, c1.seqno);
+		CHECK(slot(writers, 0) == Slot(a.rgfxObjId, c1.seqno));
+		CHECK(src.named == (std::vector<Slot>{Slot(a.rgfxObjId, c1.seqno)}));
+		id<MTLCommandBuffer> r2 = reading(b, t);
+		Committed c4 = commit(r2);
+		CHECK(c4.waits == Waits{Slot(a.rgfxObjId, c1.seqno)});
+		scheduled(w2, c3.seqno);
+		CHECK(slot(writers, 0) == Slot(a.rgfxObjId, c3.seqno));
+		CHECK(src.named.size() == 2 && src.named[1] == Slot(a.rgfxObjId, c3.seqno));
+		completed(w1, c1.seqno);
+		completed(w2, c3.seqno);
+		completed(r1, c2.seqno);
+		completed(r2, c4.seqno);
+		CHECK(slot(writers, 0) == kEmpty);
+
+		// A plain event a finished buffer of the process signalled, and a shared event at its
+		// value: a write that waits on either names its accesses at its post.
+		id<MTLCommandBuffer> signal = [b commandBuffer];
+		[signal encodeSignalEvent:event value:2];
+		Committed c5 = commit(signal);
+		completed(signal, c5.seqno);
+		id<MTLCommandBuffer> w3 = writing(a, t, event, 2);
+		Committed c6 = commit(w3);
+		CHECK(slot(writers, 0) == Slot(a.rgfxObjId, c6.seqno));
+		id<MTLCommandBuffer> w4 = writing(a, t, shared, 5);
+		Committed c7 = commit(w4);
+		CHECK(slot(writers, 0) == Slot(a.rgfxObjId, c7.seqno));
+		completed(w3, c6.seqno);
+		completed(w4, c7.seqno);
+
+		// A shared event below its value holds the write until it is scheduled, though the CPU
+		// sets the value meanwhile; then a write that waits for nothing names at its post.
+		id<MTLCommandBuffer> w5 = writing(a, t, shared, 6);
+		Committed c8 = commit(w5);
+		CHECK(slot(writers, 0) == kEmpty);
+		shared.signaledValue = 6;
+		drainRing(control);
+		CHECK(slot(writers, 0) == kEmpty);
+		scheduled(w5, c8.seqno);
+		CHECK(slot(writers, 0) == Slot(a.rgfxObjId, c8.seqno));
+		completed(w5, c8.seqno);
+		id<MTLCommandBuffer> w6 = writing(a, t, nil, 0);
+		Committed c9 = commit(w6);
+		CHECK(slot(writers, 0) == Slot(a.rgfxObjId, c9.seqno));
+		completed(w6, c9.seqno);
+		drainRing(control);
+	}
+	rgfxIOSurfaceSetOrder(false);
+	drainRing(control);
+	CFRelease(surface);
+}
+
 // The kext learns of a command buffer's writes of surfaces' shared blocks (RgfxIOSurface.h), so
 // a CPU lock of one waits for them: a commit of a buffer that draws a surface's copy names its
 // queue, its seqno and the block and surface once, before the commit returns, and records the
@@ -11434,6 +11686,7 @@ int main(int argc, char **argv)
 		test_iosurface_writers();
 		test_iosurface_order();
 		test_iosurface_slots_free_at_completion();
+		test_iosurface_held_buffer_names_at_scheduling();
 		test_commit_order();
 		test_commit_order_names_no_cycle();
 		test_iosurface_writes_named();
