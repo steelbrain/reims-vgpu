@@ -589,7 +589,7 @@ newDynamicLibraryWithDescriptor:error: unsupported dynamic libraries
 newDynamicLibraryWithURL:error: unsupported dynamic libraries
 newDynamicLibraryWithURL:options:error: unsupported dynamic libraries
 newEvent implemented
-newEventWithOptions: partial events with options
+newEventWithOptions: implemented
 newFence implemented
 newFunctionWithGLCoreIR:functionType: unsupported OpenGL
 newFunctionWithGLCoreIR:inputsDescription:functionType: unsupported OpenGL
@@ -661,7 +661,7 @@ newSamplerStateWithDescriptor: implemented
 newSharedEvent implemented
 newSharedEventWithHandle: unsupported shared event handles (an event shared across processes)
 newSharedEventWithMachPort: unsupported shared events from another process
-newSharedEventWithOptions: partial shared events with options
+newSharedEventWithOptions: implemented
 newSharedTextureWithDescriptor: unsupported shared textures (no cross-process texture handle on the wire)
 newSharedTextureWithHandle: unsupported shared textures (no cross-process texture handle on the wire)
 newSharedTextureWithHandle:withResourceIndex: unsupported shared textures (no cross-process texture handle on the wire)

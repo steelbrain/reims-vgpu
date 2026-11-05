@@ -674,13 +674,22 @@ void test_event_routing()
 
 	// The creators with options (SPI) answer as the x86 Macs' do: an event for any options, a
 	// shared event for options 0 and 1 and nil, with nothing sent, for any other.
+	// Each is kept until the end, so that no destroy comes between the creates.
+	NSMutableArray *kept = [NSMutableArray array];
 	for (NSInteger options : {0, 1, 2, 3, 16}) {
 		RgfxEvent *withOptions = [RgfxEvent eventWithOptions:options device:nil serializer:&fx.ser];
 		CHECK(withOptions != nil);
+		if (withOptions != nil)
+			[kept addObject:withOptions];
 		expectMessage<RgfxObjectCreate>(fx.ring, RGFX_CMD_EVENT_CREATE);
 	}
 	for (NSInteger options : {0, 1}) {
-		CHECK([RgfxSharedEvent sharedEventWithOptions:options device:nil serializer:&fx.ser] != nil);
+		RgfxSharedEvent *shared = [RgfxSharedEvent sharedEventWithOptions:options
+		                                                           device:nil
+		                                                       serializer:&fx.ser];
+		CHECK(shared != nil);
+		if (shared != nil)
+			[kept addObject:shared];
 		expectMessage<RgfxSharedEventCreate>(fx.ring, RGFX_CMD_SHARED_EVENT_CREATE);
 	}
 	for (NSInteger options : {2, 3, 4, 8, 16})
