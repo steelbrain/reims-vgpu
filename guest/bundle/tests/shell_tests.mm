@@ -2978,7 +2978,7 @@ void test_function_members_from_shadow()
 // shadow, its functions still answer the placeholder stage.
 void test_unread_function_list_answers_from_shadow()
 {
-	Fixture fx;
+	Fixture fx(0x80000); // the library's bytes fit
 	const char *path = getenv("RGFX_AIR_ARGUMENTS");
 	CHECK(path != nullptr);
 	if (path == nullptr)
@@ -3217,7 +3217,7 @@ void test_library_type_and_install_name()
 // functions answer for the same bytes (RgfxLibrary.mm, rgfxPatchOf).
 void test_function_patch_answers()
 {
-	Fixture fx;
+	Fixture fx(0x20000); // the library's bytes fit
 	const char *path = getenv("RGFX_PATCH");
 	CHECK(path != nullptr);
 	if (path == nullptr)
