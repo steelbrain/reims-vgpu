@@ -1749,15 +1749,35 @@ void test_argument_encoder_members()
 	[enc setSamplerState:smp atIndex:2];
 	CHECK(wordAt(args, 16) == 0x2a);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setSamplerState:atIndex:)));
-	// A depth/stencil state has no resource id: its argument keeps its bytes.
+	// A depth/stencil state has no resource id, as on both x86 Macs: its gpuResourceID raises an
+	// unrecognized selector, and so does setting it, before anything is written; nil writes
+	// nothing.
 	RgfxDepthStencilState *ds =
 	    [RgfxDepthStencilState depthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]
 	                                                    device:nil
 	                                                serializer:&ser];
+	CHECK([ds respondsToSelector:@selector(gpuResourceID)]);
+	auto raisesUnrecognized = [](void (^call)(void)) {
+		bool raised = false;
+		@try {
+			call();
+		} @catch (NSException *e) {
+			raised = [e.name isEqualToString:NSInvalidArgumentException] &&
+			         [e.reason containsString:@"gpuResourceID]: unrecognized selector"];
+		}
+		return raised;
+	};
+	CHECK(raisesUnrecognized(^{
+		(void)ds.gpuResourceID;
+	}));
 	std::memset(args.contents, 0x5c, 8);
-	[enc setDepthStencilState:ds atIndex:0];
+	CHECK(raisesUnrecognized(^{
+		[enc setDepthStencilState:ds atIndex:0];
+	}));
 	CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
-	CHECK(RgfxUnsupportedWasLogged(c, @selector(setDepthStencilState:atIndex:)));
+	[enc setDepthStencilState:nil atIndex:0];
+	CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
+	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setDepthStencilState:atIndex:)));
 	// An indirect command buffer writes its gpuResourceID, the host's id, as a pipeline; nil 0.
 	{
 		RgfxIcbState state = {};

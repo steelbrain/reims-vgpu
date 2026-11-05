@@ -4,7 +4,6 @@
  */
 
 #import "RgfxDepthStencilState.h"
-#import "RgfxUnsupported.h"
 
 #include "RgfxSerializer.hpp" // RgfxSerializer, RgfxStencilDescriptor (wire)
 
@@ -55,11 +54,13 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 	return state;
 }
 
-// The state's id in an argument buffer or an indirect command buffer: the depth/stencil create
-// carries no resource id on the wire, and the device supports neither use. 0, logged.
+// The state's id in an argument buffer or an indirect command buffer, which no x86 Mac's state
+// has: both the AMD 5300M's and the Intel 630's answer respondsToSelector: YES for it and raise an
+// unrecognized selector, an NSInvalidArgumentException that ends the process where nothing
+// catches it (macOS 26.7.1: oracle_bundle argbuf.ds.id), and so does this, sending nothing.
 - (MTLResourceID)gpuResourceID
 {
-	RGFX_UNSUPPORTED("depth/stencil resource ids (none on the wire)");
+	[self doesNotRecognizeSelector:_cmd];
 	MTLResourceID rid;
 	rid._impl = 0;
 	return rid;

@@ -44,7 +44,7 @@ setBuffer:offset:atIndex: implemented
 setBuffers:offsets:withRange: implemented
 setComputePipelineState:atIndex: implemented
 setComputePipelineStates:withRange: implemented
-setDepthStencilState:atIndex: partial depth/stencil states in argument buffers (no resource id on the wire)
+setDepthStencilState:atIndex: implemented
 setDepthStencilStates:withRange: implemented
 setIndirectCommandBuffer:atIndex: implemented
 setIndirectCommandBuffers:withRange: implemented
@@ -249,7 +249,7 @@ supportIndirectCommandBuffers implemented
 threadExecutionWidth implemented
 
 [RgfxDepthStencilState]
-gpuResourceID partial depth/stencil resource ids (none on the wire)
+gpuResourceID metal no x86 Mac's depth/stencil state has a resource id: the AMD 5300M's and the Intel 630's answer respondsToSelector: YES and raise an unrecognized selector (measured, tools/oracle/oracle_bundle.m argbuf.ds.id), as this does
 
 [RgfxFunction]
 functionConstantsDictionary implemented

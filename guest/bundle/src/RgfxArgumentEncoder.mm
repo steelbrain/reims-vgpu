@@ -289,11 +289,14 @@ uint64_t resourceId(MTLResourceID id)
 		[self setComputePipelineState:pipelines[i] atIndex:range.location + i];
 }
 
-// A depth/stencil state has no resource id on the wire: its arguments keep their bytes.
+// A depth/stencil state writes its gpuResourceID, which raises an unrecognized selector, as the
+// Intel 630's encoder does under macOS 26.7.1 (oracle_bundle argbuf.ds.set and .mixed): no x86
+// Mac holds a state in an argument buffer, and the AMD 5300M ends the process earlier, at an
+// encoder of one (argbuf.ds.encoder). nil writes nothing.
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)depthStencilState atIndex:(NSUInteger)index
 {
 	if (depthStencilState != nil)
-		RGFX_UNSUPPORTED("depth/stencil states in argument buffers (no resource id on the wire)");
+		[self rgfxWord:resourceId(depthStencilState.gpuResourceID) atIndex:index cmd:_cmd];
 }
 
 - (void)setDepthStencilStates:(const id<MTLDepthStencilState> __nullable[__nonnull])depthStencilStates
