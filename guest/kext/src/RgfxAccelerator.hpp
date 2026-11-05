@@ -187,6 +187,13 @@ void rgfxSurfaceLocksWake();
 // The IOSurface of ID `surfaceId` that `task` may see, retained, or null. Under the contexts'
 // lock.
 OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t surfaceId);
+// Whether `task` maps `surface`'s memory from its first byte at `address`, `length` bytes of it
+// or more: IOSurface's own mapping of it for the task's client, found, never made, and not wired.
+bool rgfxSurfaceLocksMapsAt(OSObject *surface, task_t task, UInt64 address, UInt64 length);
+// Whether `surface`'s memory, wired, is the `count` runs of `runs` from its first byte, over
+// `length` bytes.
+bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32 count,
+                              UInt64 length);
 // Whether `surface` reads fresh, to look at: its seed 0, none of its pages resident and its
 // memory holding `length` bytes. Racy: the deferral's own read is rgfxSurfaceLocksDefer's.
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length);
@@ -536,10 +543,10 @@ private:
 	// the block, and `*cached` where it is cached. Not under the contexts' lock.
 	bool deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId, UInt64 total,
 	                       bool *cached);
-	// Holds the dormant deferred block of entry `e` again for the ask of IOSurfaceID
-	// `surfaceId`, its own surface: false, nothing changed, where its cache asked it to go.
-	// Under the contexts' lock.
-	bool reviveDeferredBlock(RgfxSurfaceEntry &e, uint32_t surfaceId);
+	// Holds the dormant block of entry `e`, deferred or cached in place, again for the ask of
+	// IOSurfaceID `surfaceId`, its own surface, which found it: false, nothing changed, where its
+	// cache asked it to go. Under the contexts' lock.
+	bool reviveBlockOfSurface(RgfxSurfaceEntry &e, uint32_t surfaceId);
 	// Makes the device cache of the surface of IOSurfaceID `surfaceId` in `task` for the fresh
 	// block in place of entry `e` at `offset`, still pending, and records the block cached
 	// (rgfxSurfaceCacheAdd): false, nothing made, where it cannot be.

@@ -109,6 +109,9 @@ struct RgfxSurfaceEntry {
 	// A deferred block (rgfxSurfaceDefer): `surface`, retained, is its key, from its ask on, and
 	// `runCount` is 0.
 	bool deferred;
+	// A cached block in place whose runs are its surface's memory from the memory's first byte
+	// (rgfxSurfaceFindCached).
+	bool surfaceStart;
 };
 
 struct RgfxSurfaceTable {
@@ -228,6 +231,29 @@ inline int32_t rgfxSurfaceFindDeferred(const RgfxSurfaceTable &t, const void *su
 	for (uint32_t i = 0; i < t.capacity && surface != nullptr; i++) {
 		const RgfxSurfaceEntry &e = t.entries[i];
 		if (e.used && e.deferred && e.surface == surface)
+			return static_cast<int32_t>(i);
+	}
+	return -1;
+}
+
+// The cached entry in place of `surface` (an IOSurface, opaque here), not deferred, whose block
+// holds `length` bytes of the surface from its first byte (`surfaceStart`) and is `size` bytes,
+// pending or not, or -1, for an ask that maps the surface from its first byte where it asks
+// (`mapsSurface`, IOSurface's own mapping of it in the asker's task). An ask of the surface holds
+// that block, found so before any page of the asker's is wired: the ask's range is then the
+// block's pages, which its pages would have found, and the block's device cache holds them wired
+// from its ask until its release is answered (RgfxSurfaceCaches.hpp), held or dormant, so its
+// holders wire none of their own. An ask that does not map the surface where it asks finds none,
+// whether or not the surface has a cached block: it wires its range, which the wire refuses where
+// the task does not map it (BadArgument), and finds by its pages what it finds, as an ask of a
+// surface with no cached block does. So does an ask of a cached entry laid out otherwise.
+inline int32_t rgfxSurfaceFindCached(const RgfxSurfaceTable &t, const void *surface,
+                                     uint64_t length, uint64_t size, bool mapsSurface)
+{
+	for (uint32_t i = 0; i < t.capacity && surface != nullptr && mapsSurface; i++) {
+		const RgfxSurfaceEntry &e = t.entries[i];
+		if (e.used && e.inPlace && e.cached && !e.deferred && e.surfaceStart &&
+		    e.surface == surface && e.length == length && e.size == size)
 			return static_cast<int32_t>(i);
 	}
 	return -1;
@@ -592,6 +618,48 @@ inline bool rgfxSurfaceAppendRun(RgfxPageRun *runs, uint32_t *count, uint32_t ca
 		return false;
 	runs[(*count)++] = {addr, length};
 	return true;
+}
+
+// A walk of a plane's physical segments, in its order, against `count` runs (`runs`) that
+// rgfxSurfaceAppendRun made: whether the segments are those runs, byte for byte. `run` and `at`
+// are the walk's place, in the run it is in.
+struct RgfxRunsWalk {
+	const RgfxPageRun *runs;
+	uint32_t count;
+	uint32_t run;
+	uint64_t at;
+	bool same;
+};
+
+inline RgfxRunsWalk rgfxSurfaceRunsWalk(const RgfxPageRun *runs, uint32_t count)
+{
+	return {runs, count, 0, 0, runs != nullptr && count != 0};
+}
+
+// The plane's next segment, `length` bytes at `addr`: the bytes next in the run the walk is in,
+// or the next run's first, once the walk is at the run's end.
+inline void rgfxSurfaceRunsNext(RgfxRunsWalk &w, uint64_t addr, uint64_t length)
+{
+	if (!w.same || length == 0)
+		return;
+	const RgfxPageRun &r = w.runs[w.run];
+	if (addr == r.address + w.at && length <= r.length - w.at) {
+		w.at += length;
+		return;
+	}
+	if (w.at == r.length && w.run + 1 < w.count && addr == w.runs[w.run + 1].address &&
+	    length <= w.runs[w.run + 1].length) {
+		w.run++;
+		w.at = length;
+		return;
+	}
+	w.same = false;
+}
+
+// Whether the walk's segments were the runs, each whole, and no more.
+inline bool rgfxSurfaceRunsSame(const RgfxRunsWalk &w)
+{
+	return w.same && w.run + 1 == w.count && w.at == w.runs[w.run].length;
 }
 
 #endif // RGFX_SURFACE_BLOCKS_HPP_

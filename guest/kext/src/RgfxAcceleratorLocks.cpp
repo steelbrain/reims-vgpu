@@ -497,6 +497,53 @@ OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t s
 	return surface;
 }
 
+bool rgfxSurfaceLocksMapsAt(OSObject *surface, task_t task, UInt64 address, UInt64 length)
+{
+	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
+	if (!md || !length || length > md->getLength())
+		return false;
+	// IOSurfaceClient::mapInTask maps the surface's memory descriptor whole into the client's
+	// task, anywhere, read-only or not (read from IOSurface 393.5.8's code). kIOMapReference only
+	// finds a mapping that exists, never makes one (IOMemoryDescriptor.h), and with no
+	// kIOMapAnywhere only one at `address`, of the same read-only-ness, holding the descriptor's
+	// first `length` bytes (IOMemoryMap::copyCompatible, read from xnu-12377.121.6): the
+	// reference found is released at once, which unmaps nothing.
+	// A surface IOSurface maps otherwise (one made over its client's own memory) is found by
+	// none: its ask wires its range.
+	const IOOptionBits modes[] = {0, kIOMapReadOnly};
+	for (IOOptionBits mode : modes) {
+		if (IOMemoryMap *map = md->createMappingInTask(task, address, kIOMapReference | mode, 0,
+		                                               length)) {
+			map->release();
+			return true;
+		}
+	}
+	return false;
+}
+
+bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32 count,
+                              UInt64 length)
+{
+	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
+	if (!md || length > md->getLength() || md->prepare(kIODirectionOutIn) != kIOReturnSuccess)
+		return false;
+	RgfxRunsWalk walk = rgfxSurfaceRunsWalk(runs, count);
+	for (IOByteCount at = 0; walk.same && at < length;) {
+		IOByteCount segment = 0;
+		const addr64_t phys = md->getPhysicalSegment(at, &segment, kIOMemoryMapperNone);
+		if (!phys || !segment) {
+			walk.same = false;
+			break;
+		}
+		if (segment > length - at)
+			segment = length - at;
+		rgfxSurfaceRunsNext(walk, phys, segment);
+		at += segment;
+	}
+	md->complete(kIODirectionOutIn);
+	return rgfxSurfaceRunsSame(walk);
+}
+
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length)
 {
 	if (rgfxIOSurfaceLockSeed(surface) != 0)

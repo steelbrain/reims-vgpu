@@ -4,13 +4,16 @@
 // held again only by its own device cache, live, and the dormant blocks past their caps go
 // oldest first. A deferred block is found by its surface alone, never by pages, counts against
 // the device's budget while it lives and against half of it while dormant, and keeps room for
-// one run a page of its whole allocation, every plane's. Pages a SURFACE_PAGES named and the
-// host never answered for stay wired. A client's new hold makes its other asks wait until its
-// share is posted.
+// one run a page of its whole allocation, every plane's. A cached block in place is found by its
+// surface too, laid out as the ask, by an ask that maps the surface where it asks, and by no
+// other; a surface's memory is its block's runs only page for page. Pages a SURFACE_PAGES named
+// and the host never answered for stay wired. A client's new hold makes its other asks wait until
+// its share is posted.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 namespace {
 int checks = 0;
@@ -301,10 +304,116 @@ void sharing()
 	      "b's share failed and its hold went: b's other asks find the block no longer b's");
 }
 
+// A cached block in place is found by its surface too, held or dormant, pending or not, so an ask
+// of the surface that maps it where it asks wires no pages of its own: only one cached in place,
+// not deferred, keyed by its surface's pages from their first byte, laid out as the ask, of that
+// surface.
+void cachedBySurface()
+{
+	RgfxSurfaceEntry entries[4] = {};
+	RgfxSurfaceTable t = {entries, 4};
+	RgfxPageRun runs[4];
+	char surfaceA = 0, surfaceB = 0;
+	constexpr uint64_t kLength = 0x4000;
+	RgfxSurfaceEntry &e = cachedEntry(t, 0, &runs[0], 0x10000, kLength, &cacheA);
+	e.surface = &surfaceA;
+	e.surfaceStart = true;
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == 0,
+	      "a held cached block is found by its surface");
+	e.pending = true;
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == 0,
+	      "pending too: the ask waits for it");
+	e.pending = false;
+	rgfxSurfaceSleep(t, e);
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == 0, "and dormant");
+	check(rgfxSurfaceFindCached(t, &surfaceB, kLength, e.size, true) == -1 &&
+	          rgfxSurfaceFindCached(t, nullptr, kLength, e.size, true) == -1,
+	      "another surface's ask does not find it");
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength + 0x1000, e.size, true) == -1 &&
+	          rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size + 0x1000, true) == -1,
+	      "nor an ask laid out otherwise, which wires its pages");
+	rgfxSurfaceWake(t, e);
+	e.surfaceStart = false;
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == -1,
+	      "nor a block keyed by pages past its surface's first: the ask's pages find what they "
+	      "find");
+	e.surfaceStart = true;
+	e.cached = false;
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == -1,
+	      "an uncached block is not: its holders wire the pages it is keyed by");
+	e.cached = true;
+	e.inPlace = false;
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == -1, "nor a copy");
+	e.inPlace = true;
+	rgfxSurfaceDefer(t, e);
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == -1 &&
+	          rgfxSurfaceFindDeferred(t, &surfaceA) == 0,
+	      "nor a deferred one, which rgfxSurfaceFindDeferred finds");
+	e.used = false;
+	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == -1, "nor an entry gone");
+	RgfxSurfaceEntry &f = cachedEntry(t, 2, &runs[2], 0x20000, kLength, &cacheB);
+	f.surface = &surfaceB;
+	f.surfaceStart = true;
+	check(rgfxSurfaceFindCached(t, &surfaceB, kLength, f.size, true) == 2, "another surface's own");
+}
+
+// An ask whose address does not map its surface finds no block by the surface, whether or not
+// the surface has a cached block: it wires its range as any ask does, which the wire refuses
+// (BadArgument) where its task does not map it, and finds by its pages what they key.
+void askNotMapping()
+{
+	RgfxSurfaceEntry entries[2] = {};
+	RgfxSurfaceTable t = {entries, 2};
+	RgfxPageRun run;
+	char surface = 0;
+	constexpr uint64_t kLength = 0x4000;
+	check(rgfxSurfaceFindCached(t, &surface, kLength, 0x1000, false) == -1 &&
+	          rgfxSurfaceFindCached(t, &surface, kLength, 0x1000, true) == -1,
+	      "a surface with no cached block: none either way");
+	RgfxSurfaceEntry &e = cachedEntry(t, 0, &run, 0x10000, kLength, &cacheA);
+	e.surface = &surface;
+	e.surfaceStart = true;
+	check(rgfxSurfaceFindCached(t, &surface, kLength, e.size, false) == -1,
+	      "a cached one: an ask not mapping the surface where it asks finds it not");
+	rgfxSurfaceSleep(t, e);
+	check(rgfxSurfaceFindCached(t, &surface, kLength, e.size, false) == -1,
+	      "nor dormant: no revive by a surface the ask does not show it maps");
+	check(rgfxSurfaceFindCached(t, &surface, kLength, e.size, true) == 0,
+	      "the same ask mapping it finds it");
+}
+
+// A surface's memory walked by its physical segments against a block's runs, as
+// rgfxSurfaceAppendRun merged them: the same pages in the same order, each run whole, no more.
+void runsWalk()
+{
+	const RgfxPageRun runs[2] = {{0x10000, 0x3000}, {0x40000, 0x1000}};
+	auto walk = [&runs](std::initializer_list<RgfxPageRun> segments, uint32_t count = 2) {
+		RgfxRunsWalk w = rgfxSurfaceRunsWalk(runs, count);
+		for (const RgfxPageRun &s : segments)
+			rgfxSurfaceRunsNext(w, s.address, s.length);
+		return rgfxSurfaceRunsSame(w);
+	};
+	check(walk({{0x10000, 0x1000}, {0x11000, 0x2000}, {0x40000, 0x1000}}),
+	      "segments that merge into the runs are them");
+	check(walk({{0x10000, 0x3000}, {0x40000, 0x1000}}), "and so are the runs themselves");
+	check(!walk({{0x10000, 0x3000}}), "a walk short of the last run is not");
+	check(!walk({{0x10000, 0x2000}, {0x40000, 0x1000}}), "nor one that leaves a run short");
+	check(!walk({{0x11000, 0x2000}, {0x40000, 0x1000}}), "nor one that starts past the first page");
+	check(!walk({{0x10000, 0x3000}, {0x40000, 0x2000}}), "nor one past a run's end");
+	check(!walk({{0x10000, 0x3000}, {0x40000, 0x1000}, {0x41000, 0x1000}}),
+	      "nor one with more pages than the runs");
+	check(!walk({{0x10000, 0x3000}, {0x50000, 0x1000}}), "nor other pages");
+	check(!walk({{0x40000, 0x1000}, {0x10000, 0x3000}}), "nor the pages in another order");
+	check(!walk({{0x10000, 0x3000}}, 0), "nor any walk of no runs");
+}
+
 int main()
 {
 	naming();
 	deferred();
+	cachedBySurface();
+	askNotMapping();
+	runsWalk();
 	dormancy();
 	sharing();
 	RgfxSurfaceEntry entries[4] = {};
