@@ -3370,7 +3370,9 @@ mod tests {
         // (`SurfaceView`'s drop): done before the next mark, which it would land after.
         r.dec.surface_worker().flush();
         assert!(
-            r.p.call_log().sels_since(attached).contains(&"mach_vm_deallocate"),
+            r.p.call_log()
+                .sels_since(attached)
+                .contains(&"mach_vm_deallocate"),
             "the view's mapping is let go of"
         );
         let mark = r.p.call_log().mark();
