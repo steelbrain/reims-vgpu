@@ -216,7 +216,7 @@ struct Guest {
 }
 
 impl Guest {
-    fn new(device: &GraphicsDevice<FakePlatform>) -> Guest {
+    fn new<P: ApiPlatform>(device: &GraphicsDevice<P>) -> Guest {
         Guest {
             base: device.region_base(),
             produced: 0,
@@ -245,7 +245,7 @@ impl Guest {
 
     /// Publishes `command` on the submission ring (its `seqno` the next, its `size` its length)
     /// and rings the doorbell.
-    fn send(&mut self, device: &GraphicsDevice<FakePlatform>, mut command: Vec<u8>) {
+    fn send<P: ApiPlatform>(&mut self, device: &GraphicsDevice<P>, mut command: Vec<u8>) {
         self.seqno += 1;
         command[8..16].copy_from_slice(&self.seqno.to_le_bytes());
         let len = command.len() as u32;
@@ -730,7 +730,11 @@ fn object_destroy(obj_id: u64) -> Vec<u8> {
 /// Sends `command` (one answered by `COMPLETE`: a `QUEUE_CREATE`, a `CONTEXT_CLOSE`, a library
 /// create or lookup) on ring 0, as the guest's kext does, and waits for its `COMPLETE`: its
 /// status.
-fn answered(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, command: Vec<u8>) -> u32 {
+fn answered<P: ApiPlatform>(
+    device: &GraphicsDevice<P>,
+    guest: &mut Guest,
+    command: Vec<u8>,
+) -> u32 {
     guest.send(device, command);
     let bytes = guest.event().expect("a COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
@@ -8226,4 +8230,162 @@ fn a_reset_waits_for_a_close_s_slow_release() {
         "the reset left context 2's sampler"
     );
     assert!(world.live("MTLSamplerState").is_empty());
+}
+
+/// `copyFromTexture:...toTexture:...`, a presented surface's copy into a drawable.
+const SURFACE_COPY: &str = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:\
+                            toTexture:destinationSlice:destinationLevel:destinationOrigin:";
+
+/// A `SET_SCANOUT` of display 0: `width` × `height` pixels, `stride` bytes a row, at the region's
+/// allocations.
+fn set_scanout(width: u32, height: u32, stride: u32) -> Vec<u8> {
+    RgfxSetScanout {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_SCANOUT,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width,
+        height,
+        stride,
+        offset: RGFX_ALLOCATIONS_OFFSET,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The host's read of the display (`read_display`) has the display's mode, 1920 × 1080 without
+/// a window: a buffer short of it is refused with nothing written, and the size is given all the
+/// same. With no scanout the display shows black, and the read draws nothing. With one, the read
+/// blits it into its texture of the mode's size, kept from the read before, as the window draws
+/// it, waits for that draw and reads the texture back (the testkit's pixels read as zero). A
+/// presented surface is copied into the read's texture in place of the scanout. The guest is told
+/// nothing of any read
+#[test]
+fn a_read_of_the_display_draws_what_it_shows() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    platform.world().set_auto_complete(Some(CompleteOn::Thread));
+    let log = platform.call_log();
+    let mode = (1920, 1080);
+    let length = 1920 * 1080 * 4;
+
+    let mut short = vec![7u8; length - 1];
+    assert_eq!(
+        device.read_display(&mut short),
+        (mode, Err(Error::InvalidArgument))
+    );
+    assert!(short.iter().all(|b| *b == 7), "a refused read wrote");
+    assert_eq!(
+        device.read_display(&mut []),
+        (mode, Err(Error::InvalidArgument))
+    );
+
+    let mut dst = vec![7u8; length + 4];
+    let mark = log.mark();
+    assert_eq!(device.read_display(&mut dst), (mode, Ok(())));
+    assert!(
+        dst[..length].chunks(4).all(|p| p == [0, 0, 0, 0xff]),
+        "not black"
+    );
+    assert_eq!(
+        dst[length..],
+        [7; 4],
+        "the read wrote past the mode's pixels"
+    );
+    let sels = log.sels_since(mark);
+    assert!(!sels.contains(&"commit"), "a read of nothing drew");
+    assert_eq!(
+        sels.iter()
+            .filter(|s| **s == "newTextureWithDescriptor:")
+            .count(),
+        1,
+        "the read's texture"
+    );
+
+    let (mut guest, _ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    let mark = log.mark();
+    dst.fill(7);
+    assert_eq!(device.read_display(&mut dst), (mode, Ok(())));
+    assert!(
+        dst[..length].iter().all(|b| *b == 0),
+        "the texture was not read"
+    );
+    let sels = log.sels_since(mark);
+    let count = |sel: &str| sels.iter().filter(|s| **s == sel).count();
+    assert_eq!(
+        count("newTextureWithDescriptor:"),
+        0,
+        "a read of the same size made a texture"
+    );
+    assert_eq!(count(SCANOUT_BLIT), 1);
+    assert_eq!(count("commit"), 1);
+    assert_eq!(count("waitUntilCompleted"), 1);
+    assert!(quiet(&guest), "a read told the guest something");
+
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK
+    );
+    let surface = Handle::clone_ref(&device.control.presented.shown().unwrap().0);
+    let mark = log.mark();
+    assert_eq!(device.read_display(&mut dst), (mode, Ok(())));
+    let copies: Vec<_> = (log.since(mark).into_iter())
+        .filter(|c| c.sel == SURFACE_COPY)
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert!(copies[0].args.contains(&Arg::obj(&surface)));
+    assert!(!log.sels_since(mark).contains(&SCANOUT_BLIT));
+    assert!(quiet(&guest), "a read told the guest something");
+}
+
+/// On Metal, the read gives the guest's pixels: a scanout smaller than the mode shows at its top
+/// left, B, G, R and A as the guest wrote them, and the rest of the mode is black
+#[cfg(target_os = "macos")]
+#[test]
+fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
+    let platform = reims_vgpu_metal::MetalPlatform::process();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
+    let (width, height, stride) = (64usize, 32usize, 256usize);
+    let pixel = |x: usize, y: usize| [x as u8, y as u8, (x ^ y) as u8, 0xff - x as u8];
+    // SAFETY: the scanout lies in the device's region, mapped while the device lives.
+    unsafe {
+        let base = device.region_base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let p = pixel(x, y);
+                std::ptr::copy_nonoverlapping(p.as_ptr(), base.add(y * stride + x * 4), 4);
+            }
+        }
+    }
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    let mut dst = vec![7u8; 1920 * 1080 * 4];
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let at = |x: usize, y: usize| &dst[(y * 1920 + x) * 4..][..4];
+    for y in 0..height {
+        for x in 0..width {
+            assert_eq!(at(x, y), pixel(x, y), "({x}, {y})");
+        }
+    }
+    for (x, y) in [(64, 0), (0, 32), (1919, 1079), (100, 100)] {
+        assert_eq!(at(x, y), [0, 0, 0, 0xff], "({x}, {y}) is not black");
+    }
 }

@@ -343,8 +343,18 @@ is its transport:
   `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. The window keeps the size
   the person gives it, and the display offers the guest that size in pixels
   at the host screen's rate. Its input is queued for a BH and reaches the
-  guest's tablet and keyboard through the device's console, which shows
-  nothing in QEMU's own displays. Closing the window powers the VM off.
+  guest's tablet and keyboard through the device's console. Closing the
+  window powers the VM off.
+- **The console** shows what the display shows, with a window or without
+  one: at each of its updates (a display change listener's refresh, or a
+  screendump) a thread of the device's pool reads it back from the library
+  (`rvg_graphics_device_read_display`), the scanout or the IOSurface the
+  guest presents, through the display's colour, at the display's mode, and
+  a BH copies it into the console's surface and says the update is done. So
+  QMP's `screendump` saves the guest's frame. One read runs at a time; an
+  update that comes while one is under way is done with it. The read waits
+  for its draw on the GPU, never under the BQL, and the guest sees nothing
+  of it.
 - It has no default option ROM: `romfile=` names one.
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a

@@ -21,6 +21,10 @@
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
+//! **The host reads what the display shows** ([`GraphicsDevice::read_display`], `read`): the
+//! window's draw, into a texture of the display's mode, read back once it has finished, with a
+//! window or without one; QEMU's console shows it, and its screendump saves it.
+//!
 //! Every public method runs as an entry ([`crate::entry`]).
 
 use std::borrow::Cow;
@@ -54,8 +58,7 @@ use reims_graphics::wire::{
     RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
-    Screen,
+    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, Scanout, Screen,
 };
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
@@ -87,6 +90,7 @@ use crate::graphics::decode::{
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
+use crate::graphics::read::DisplayRead;
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
@@ -98,6 +102,7 @@ mod device_info;
 #[cfg(target_os = "macos")]
 mod metal;
 mod present;
+mod read;
 mod sink;
 #[cfg(feature = "vulkan")]
 mod vulkan;
@@ -193,6 +198,8 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     /// What the window shows, where there is one: the tests draw it.
     #[cfg(test)]
     shown: Option<Arc<Shown>>,
+    /// The host's reads of what the display shows ([`GraphicsDevice::read_display`]).
+    read: DisplayRead<P>,
     /// The platform the decoder runs on.
     platform: PhantomData<fn() -> P>,
 }
@@ -350,22 +357,37 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 deferred_budget,
                 control: Arc::clone(&control),
             });
-            #[cfg(test)]
-            let mut shown = None;
-            let (window, screen): (Option<WindowLink>, Box<dyn Screen>) = match config.window {
-                Some(window_config) => {
-                    let (link, screen) =
-                        WindowScreen::open(&platform, &region, &control.presented, window_config);
-                    #[cfg(test)]
-                    {
-                        shown = Some(Arc::clone(&screen.shown));
+            let (window, screen, shown): (Option<WindowLink>, Arc<dyn Screen>, Arc<Shown>) =
+                match config.window {
+                    Some(window_config) => {
+                        let (link, screen) = WindowScreen::open(
+                            &platform,
+                            &region,
+                            &control.presented,
+                            window_config,
+                        );
+                        let shown = Arc::clone(&screen.shown);
+                        (Some(link), Arc::new(screen), shown)
                     }
-                    (Some(link), Box::new(screen))
-                }
-                None => (None, Box::new(FixedScreen(FALLBACK_MODE))),
-            };
-            let device =
-                reims_graphics::Device::new(region, host, screen).ok_or(Error::HostResources)?;
+                    None => {
+                        let shown = Arc::new(Shown::default());
+                        let screen = HeadlessScreen {
+                            shown: Arc::clone(&shown),
+                        };
+                        (None, Arc::new(screen), shown)
+                    }
+                };
+            let read = DisplayRead::new(
+                &platform,
+                &region,
+                &shown,
+                &control.presented,
+                Arc::clone(&screen),
+            );
+            #[cfg(test)]
+            let shown = window.is_some().then_some(shown);
+            let device = reims_graphics::Device::new(region, host, Box::new(SharedScreen(screen)))
+                .ok_or(Error::HostResources)?;
             Ok(GraphicsDevice {
                 window,
                 device,
@@ -373,6 +395,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 control,
                 #[cfg(test)]
                 shown,
+                read,
                 platform: PhantomData,
             })
         })
@@ -412,6 +435,19 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// The region's size: BAR 2's, a power of two.
     pub fn region_size(&self) -> u64 {
         self.device.region_size()
+    }
+
+    /// What the display shows now, read back (`read`'s module doc): the guest's scanout, or the
+    /// IOSurface its display pipe presents, through the display's colour, as the window draws it
+    /// into a drawable of the display's mode, written into `dst` as rows of `width * 4` bytes,
+    /// BGRA8, black where the guest shows nothing. The mode's `(width, height)` is returned
+    /// whatever the result. [`Error::InvalidArgument`], with nothing written, where `dst` holds
+    /// fewer than `width * height * 4` bytes; [`Error::Metal`] where the platform refuses the
+    /// draw or its texture; [`Error::Gpu`] where the draw ended with an error. Waits for the draw
+    /// on the GPU, and for no lock a callback of the device's may wait on; the guest sees
+    /// nothing of it.
+    pub fn read_display(&self, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
+        entry::run(|_| self.read.read(dst))
     }
 
     /// A 32-bit read of BAR 0 at `offset`.
@@ -2019,6 +2055,55 @@ impl CursorState {
             self.shown = Some(show);
             window.cursor_show(show);
         }
+    }
+}
+
+/// The display's screen without a window: the mode it offers without one, and nothing shown on
+/// the host. It keeps the guest's scanout for the host's reads of the display (`read`).
+struct HeadlessScreen {
+    /// The guest's scanout.
+    shown: Arc<Shown>,
+}
+
+impl Screen for HeadlessScreen {
+    fn mode(&self) -> Mode {
+        FALLBACK_MODE
+    }
+
+    fn scanout(&self, scanout: Option<Scanout>) {
+        *self.shown.scanout.lock() = scanout;
+    }
+
+    fn present(&self) {}
+
+    fn cursor_image(&self, _image: Option<CursorImage>) {}
+
+    fn cursor_moved(&self, _x: i32, _y: i32, _visible: bool) {}
+}
+
+/// The device's [`Screen`], which the host's reads of the display share: each call goes to the
+/// one it holds.
+struct SharedScreen(Arc<dyn Screen>);
+
+impl Screen for SharedScreen {
+    fn mode(&self) -> Mode {
+        self.0.mode()
+    }
+
+    fn scanout(&self, scanout: Option<Scanout>) {
+        self.0.scanout(scanout);
+    }
+
+    fn present(&self) {
+        self.0.present();
+    }
+
+    fn cursor_image(&self, image: Option<CursorImage>) {
+        self.0.cursor_image(image);
+    }
+
+    fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
+        self.0.cursor_moved(x, y, visible);
     }
 }
 

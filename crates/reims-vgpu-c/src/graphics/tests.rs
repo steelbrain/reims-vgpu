@@ -164,6 +164,60 @@ fn a_first_version_graphics_config_makes_a_device() {
     }
 }
 
+/// The read of the display: with no buffer it is refused, with the mode's size given, 1920 x
+/// 1080 with no window; a buffer short of the mode's pixels is refused with nothing written; a
+/// buffer of them is read, black where the guest has no scanout, the size pointers NULL
+#[test]
+fn a_graphics_device_s_display_reads_back() {
+    let cb = RvgGraphicsCallbacks {
+        destroy: None,
+        ..callbacks()
+    };
+    let c = config(&cb);
+    let mut device = std::ptr::null_mut();
+    let (mut width, mut height) = (0, 0);
+    let mut dst = vec![7u8; 1920 * 1080 * 4];
+    // SAFETY: a live config and out-pointer; then a live device, `dst` holding the lengths
+    // given, the size pointers writable or NULL; the device is released.
+    unsafe {
+        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+        assert_eq!(
+            rvg_graphics_device_read_display(
+                device,
+                std::ptr::null_mut(),
+                0,
+                &mut width,
+                &mut height
+            ),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!((width, height), (1920, 1080));
+        assert_eq!(
+            rvg_graphics_device_read_display(
+                device,
+                dst.as_mut_ptr(),
+                dst.len() - 1,
+                &mut width,
+                &mut height
+            ),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert!(dst.iter().all(|b| *b == 7), "a refused read wrote");
+        assert_eq!(
+            rvg_graphics_device_read_display(
+                device,
+                dst.as_mut_ptr(),
+                dst.len(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            RVG_OK
+        );
+        rvg_graphics_device_release(device);
+    }
+    assert!(dst.chunks(4).all(|p| p == [0, 0, 0, 0xff]), "not black");
+}
+
 /// What the queue's service thread spends copying an out-of-line command buffer's message of each
 /// length, under the allocator the library ships with (this crate's global one): the copy out of
 /// its block (`Region::read_held`, the one copy the host makes), and that copy copied once more,

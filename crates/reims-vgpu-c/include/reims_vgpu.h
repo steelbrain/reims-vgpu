@@ -1593,6 +1593,29 @@ RvgStatus rvg_graphics_device_set_doorbell(RvgGraphicsDevice *device, int32_t fd
 // `device` is a live graphics device handle.
 void rvg_graphics_device_reset(RvgGraphicsDevice *device);
 
+// What the device's display shows now, read back into `dst`: the guest's scanout, or the
+// IOSurface its display pipe presents, through the display's colour, drawn as the device's
+// window draws it into a drawable of the display's mode, the size the guest is told (the
+// window's size in pixels, or 1920 x 1080 with no window); black where the guest shows nothing.
+// `*height` rows of `*width * 4` bytes each, BGRA8: B, G, R and A in memory, pixman's
+// x8r8g8b8 on a little-endian host. `width` and `height` (each NULL or writable) get the mode's
+// size whatever the result, so a call with a NULL `dst` asks the size. RVG_ERR_INVALID_ARGUMENT,
+// with nothing written to `dst`, where it is NULL or `dst_length` is below the mode's
+// `width * height * 4` bytes; RVG_ERR_METAL where the platform refuses the draw or its
+// texture; RVG_ERR_GPU where the draw ended with an error. Waits on the calling thread for the draw on the GPU, and for no lock
+// the device's callbacks may wait on, so the host may hold its own (QEMU's BQL) but need not:
+// QEMU calls it on a thread of its pool. The guest sees nothing of it: no present is answered,
+// and the mode is only asked. One read runs at a time. On any thread. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle; `dst` is NULL or holds `dst_length` writable bytes;
+// `width` and `height` are each NULL or writable.
+RvgStatus rvg_graphics_device_read_display(RvgGraphicsDevice *device,
+                                           uint8_t *dst,
+                                           size_t dst_length,
+                                           uint32_t *width,
+                                           uint32_t *height);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

@@ -739,7 +739,8 @@ static bool on_graphics_scanout_written(void *ctx, uint64_t offset, uint64_t len
 
 /* A graphics device with no window, on every host: its registers, its region, its doorbell, a
  * GET_DISPLAYS the guest writes into the control ring answered with DISPLAYS and an interrupt,
- * a taking write, its reset, and its release, which ends its table once its threads have ended. */
+ * a taking write, a read of its display, its reset, and its release, which ends its table once
+ * its threads have ended. */
 static void check_graphics(void) {
     RvgGraphicsCallbacks cb = {sizeof cb, &graphics_destroyed, on_graphics_destroy,
                                on_graphics_raise, on_graphics_scanout_written};
@@ -788,6 +789,21 @@ static void check_graphics(void) {
     /* The taking write rings as the plain one does: a ring no queue has is ignored. */
     rvg_graphics_device_mmio_write_taking(d, 0x020, 0x40000);
     CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 1);
+    /* The display read back: a NULL buffer asks its size, 1920 x 1080 with no window, and with
+     * no scanout it shows black, B, G, R, A. */
+    uint32_t width = 0, height = 0;
+    CHECK_STATUS(rvg_graphics_device_read_display(d, NULL, 0, &width, &height),
+                 RVG_ERR_INVALID_ARGUMENT);
+    CHECK(width == 1920 && height == 1080);
+    size_t length = (size_t)width * height * 4;
+    uint8_t *pixels = malloc(length);
+    CHECK(pixels != NULL);
+    if (pixels) {
+        CHECK_STATUS(rvg_graphics_device_read_display(d, pixels, length, NULL, NULL), RVG_OK);
+        CHECK(pixels[0] == 0 && pixels[1] == 0 && pixels[2] == 0 && pixels[3] == 0xff);
+        CHECK(pixels[length - 1] == 0xff);
+        free(pixels);
+    }
 
     rvg_graphics_device_reset(d);
     CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 0);

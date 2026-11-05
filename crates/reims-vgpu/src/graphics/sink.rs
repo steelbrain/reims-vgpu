@@ -59,7 +59,7 @@ use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::MtlViewport;
 
 use super::color::DisplayColor;
-use super::{DrawnPresents, Presented, Shown};
+use super::{DisplayHold, DrawnPresents, Presented, Shown};
 use crate::display::no_catch;
 use crate::platform::ApiPlatform;
 use reims_graphics::wire::{
@@ -77,12 +77,14 @@ const STORE_ACTION_STORE: u64 = 1;
 pub(crate) struct ScanoutDraw<P: Platform> {
     /// The platform, whose render pass descriptors clear the drawable.
     platform: Arc<P>,
-    /// The device the queue and the buffer are on: the platform's default. Only the Metal sink,
-    /// on macOS, reads it.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// The device the queue and the buffer are on: the platform's default. The Metal sink, on
+    /// macOS, and the host's reads of the display (`read`), which make their texture on it, read
+    /// it.
     pub(crate) device: P::Device,
     /// The sink's command queue, unshared ([`new_command_queue_unshared`]): it puts the guest's
-    /// scanout and presented surfaces into the window, each draw on a present's path.
+    /// scanout and presented surfaces into the window, each draw on a present's path. The host's
+    /// reads of the display, which no present waits on, draw on a queue the platform may share
+    /// ([`ScanoutDraw::for_reads`]).
     ///
     /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
     pub(crate) queue: P::CommandQueue,
@@ -214,8 +216,35 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         shown: &Arc<Shown>,
         presented: &Arc<Presented<P>>,
     ) -> Option<ScanoutDraw<P>> {
+        Self::on_queue(platform, region, shown, presented, |device| {
+            device.new_command_queue_unshared()
+        })
+    }
+
+    /// A draw as [`Self::new`]'s, for the host's reads of the display (`read`), on a queue the
+    /// platform may share with other command queues: no present waits on a read, so it holds no
+    /// GPU queue of its own for the device's life.
+    pub(crate) fn for_reads(
+        platform: Arc<P>,
+        region: &Arc<Region>,
+        shown: &Arc<Shown>,
+        presented: &Arc<Presented<P>>,
+    ) -> Option<ScanoutDraw<P>> {
+        Self::on_queue(platform, region, shown, presented, |device| {
+            device.new_command_queue()
+        })
+    }
+
+    /// [`Self::new`], on the queue `queue` makes on the device.
+    fn on_queue(
+        platform: Arc<P>,
+        region: &Arc<Region>,
+        shown: &Arc<Shown>,
+        presented: &Arc<Presented<P>>,
+        queue: impl FnOnce(&P::Device) -> Option<P::CommandQueue>,
+    ) -> Option<ScanoutDraw<P>> {
         let device = platform.metal_device(None)?;
-        let queue = device.new_command_queue_unshared()?;
+        let queue = queue(&device)?;
         // SAFETY: sysconf reads a constant of the host's.
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
             .ok()
@@ -318,6 +347,25 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
         let mut presents = self.presented.drawn();
+        let (command_buffer, hold) = self.encode_shown(texture, region)?;
+        if let Some(hold) = hold {
+            // The surface's block stays until the draw has read it.
+            presents.reading(hold);
+        }
+        Some((command_buffer, presents))
+    }
+
+    /// A command buffer of the sink's queue with what the display shows drawn into `texture` at
+    /// `region`, as [`Self::encode`] draws it, not committed, and the hold of the block of the
+    /// presented surface it reads, where it draws one: the caller keeps it until the buffer has
+    /// finished. `None`, with nothing encoded, where the guest has no scanout or the queue gives
+    /// no command buffer. It answers no present, so the host's reads of the display
+    /// (`graphics::read`) draw with it.
+    pub(crate) fn encode_shown(
+        &self,
+        texture: &P::Texture,
+        region: PixelRect,
+    ) -> Option<(P::CommandBuffer, Option<Arc<DisplayHold>>)> {
         let (changes, color) = self.presented.color();
         let color = (!color.is_identity()).then_some((changes, color));
         if let Some((surface, hold)) = self.presented.shown() {
@@ -331,9 +379,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 self.encode_converted(&surface, texture, region)
             };
             if let Some(drawn) = drawn {
-                // The surface's block stays until the draw has read it.
-                presents.reading(hold);
-                return Some((drawn, presents));
+                return Some((drawn, Some(hold)));
             }
             self.presented.refuse_format(from, to);
         }
@@ -341,7 +387,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             Some((changes, color)) => self.encode_scanout_colored(*changes, color, texture, region),
             None => self.encode_scanout(texture, region),
         }?;
-        Some((command_buffer, presents))
+        Some((command_buffer, None))
     }
 
     /// A command buffer of the sink's queue with the scanout drawn into `texture` at `region`
