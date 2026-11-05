@@ -88,7 +88,8 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type SharedEvent: event::SharedEvent<Self>;
     /// `MTLSharedEventHandle *`.
     type SharedEventHandle: Handle;
-    /// `MTLSharedEventListener *` (the deserializer creates one and never uses it).
+    /// `MTLSharedEventListener *` (the deserializer creates one and never uses it; the graphics
+    /// lane's notifications run on one, [`event::SharedEvent::notify_listener`]).
     type SharedEventListener: Handle;
     /// `MTLSharedTextureHandle *`.
     type SharedTextureHandle: Handle;
@@ -136,7 +137,8 @@ pub trait Platform: Sized + Send + Sync + 'static {
     // Class methods, one per class core instantiates.
     /// sel: new — (`[MTLRenderPassDescriptor new]`, +1).
     fn new_render_pass_descriptor(&self) -> Self::RenderPassDescriptor;
-    /// sel: new — (`MTLSharedEventListener`, created and never used).
+    /// sel: new — (`MTLSharedEventListener`: the deserializer's, created and never used, and the
+    /// graphics lane's, which its notifications run on).
     fn new_shared_event_listener(&self) -> Self::SharedEventListener;
     /// sel: renderPassDescriptor — (`+[MTLRenderPassDescriptor
     /// renderPassDescriptor]`, autoreleased).

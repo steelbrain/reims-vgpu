@@ -43,4 +43,20 @@ impl SharedEvent<FakePlatform> for Fk<kind::SharedEvent> {
         }
         super::super::objects::wait_event(self.obj(), value, milliseconds)
     }
+
+    fn notify_listener(
+        &self,
+        listener: &<FakePlatform as Platform>::SharedEventListener,
+        value: u64,
+        block: Notification,
+    ) -> RaiseResult<()> {
+        use crate::platform::Handle as _;
+        self.act(
+            Policy::Caught,
+            "notifyListener:atValue:block:",
+            vec![Arg::Obj(Some(listener.id())), Arg::U64(value)],
+        )?;
+        super::super::objects::notify_event(self.obj(), value, block);
+        Ok(())
+    }
 }

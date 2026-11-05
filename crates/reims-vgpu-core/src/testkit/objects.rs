@@ -49,6 +49,7 @@ use crate::host::HostPtr;
 use crate::num;
 use crate::platform::command::{CompletedHandler, CompletedInfo, ScheduledHandler};
 use crate::platform::device::NoCopyDeallocator;
+use crate::platform::event::Notification;
 use crate::platform::os::{Clock, Deadline};
 use crate::platform::types::{
     CommandBufferStatus, MtlSize, NsErrorText, ResourceAddressRange, Swizzle,
@@ -933,6 +934,9 @@ pub struct World {
     /// Committed command buffers whose work the platform has not taken, in commit order, while
     /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
     held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
+    /// The shared events' notifications not yet due, each with its event (the root of a shared
+    /// copy) and value ([`notify_event`]), in the order asked for.
+    notifications: Mutex<Vec<(ObjId, u64, Notification)>>,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -967,6 +971,7 @@ impl World {
             release_dies: Mutex::new(Vec::new()),
             release_holds: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
+            notifications: Mutex::new(Vec::new()),
         })
     }
 
@@ -1288,7 +1293,8 @@ impl World {
     }
 }
 
-/// Sets an event's value (following a shared copy to its root) and wakes its waiters.
+/// Sets an event's value (following a shared copy to its root), wakes its waiters, then runs the
+/// notifications it reached, on this thread, in the order they were asked for ([`notify_event`]).
 pub fn signal_event(ev: &Arc<FakeObj>, v: u64) {
     let root = match &ev.state.lock().model {
         Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
@@ -1299,6 +1305,40 @@ pub fn signal_event(ev: &Arc<FakeObj>, v: u64) {
         *value = v;
     }
     target.cv.notify_all();
+    run_due(target);
+}
+
+/// Runs `block` once the event `ev` (following a shared copy to its root) reaches `v`: at once, on
+/// this thread, where it has, else on the thread whose signal or set raises it there
+/// ([`signal_event`]). One never reached stays with the world.
+pub fn notify_event(ev: &Arc<FakeObj>, v: u64, block: Notification) {
+    let root = match &ev.state.lock().model {
+        Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
+        _ => None,
+    };
+    let target = root.as_ref().unwrap_or(ev);
+    target
+        .world
+        .notifications
+        .lock()
+        .push((target.id, v, block));
+    run_due(target);
+}
+
+/// Runs the notifications of the root event `target` whose value it reached, with no lock held.
+fn run_due(target: &Arc<FakeObj>) {
+    let value = event_value(target);
+    let due: Vec<(ObjId, u64, Notification)> = {
+        let mut pending = target.world.notifications.lock();
+        let (due, kept) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|&(id, at, _)| id == target.id && at <= value);
+        *pending = kept;
+        due
+    };
+    for (_, _, block) in due {
+        block();
+    }
 }
 
 /// An event's value (following a shared copy to its root).

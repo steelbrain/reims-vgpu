@@ -17,7 +17,23 @@ pub trait SharedEvent<P: Platform>: Handle {
     /// the calling thread; the fake runs it on the virtual clock. No path reaches it under a
     /// handler: a raise inside it dies at the send.
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool;
+    /// sel: notifyListener:atValue:block:
+    /// `block` runs once on `listener`'s thread (Metal's: the listener's dispatch queue), once the
+    /// value reaches `value` from whatever raised it (a command buffer's signal as the GPU
+    /// reaches it, a CPU set), and at once where it has already. A block the value never reaches
+    /// is kept until the event goes. The fake runs it on the thread that raised the value.
+    fn notify_listener(
+        &self,
+        listener: &P::SharedEventListener,
+        value: u64,
+        block: Notification,
+    ) -> RaiseResult<()>;
 }
+
+/// A shared event's notification (`MTLSharedEventNotificationBlock`'s work): run once, on its
+/// listener's thread, once the event reached the value it was asked for
+/// ([`SharedEvent::notify_listener`]).
+pub type Notification = Box<dyn FnOnce() + Send>;
 
 /// The event a command buffer waits on or signals: core passes both kinds to
 /// `encodeWaitForEvent:value:` and `encodeSignalEvent:value:` (the paging `MTLEvent` and the FIFO's
