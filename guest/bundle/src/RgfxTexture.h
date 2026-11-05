@@ -33,6 +33,7 @@
 #ifdef __cplusplus
 class RgfxRegion;
 class RgfxSerializer;
+class RgfxSlabs;
 #endif
 
 #ifdef __cplusplus
@@ -82,15 +83,19 @@ NS_ASSUME_NONNULL_BEGIN
                                           serializer:(nullable RgfxSerializer *)serializer;
 
 #ifdef __cplusplus
-/// Creates a Managed texture of shape `descriptor` whose CPU copy is a block of `region`, in the
-/// layout RgfxManagedLayout.hpp gives, which the guest maps: `replaceRegion:` writes it and tells
-/// the host the region (RGFX_CMD_TEXTURE_REPLACE_REGION), `getBytes:` reads it, and a blit
-/// encoder's synchronize has the host copy the GPU's copy into it (docs/graphics-kext/design.md,
-/// Decided 4). Serialises the block's Shared buffer and an RGFX_CMD_MANAGED_TEXTURE_CREATE. Nil
-/// for a pixel format or shape no CPU copy holds, or where the region has no room or no resource
-/// id is left: the caller makes the texture without a CPU copy then.
+/// Creates a Managed texture of shape `descriptor` whose CPU copy is a Shared buffer of `slabs`
+/// where given (the device took RGFX_FEATURE_MANAGED_TEXTURE_SLABS), as a device buffer of its
+/// size takes (RgfxSlabs.hpp: the process's own pages where the device takes them), else over a
+/// block of `region`, in the layout RgfxManagedLayout.hpp gives, which the guest maps:
+/// `replaceRegion:` writes it and tells the host the region (RGFX_CMD_TEXTURE_REPLACE_REGION),
+/// `getBytes:` reads it, and a blit encoder's synchronize has the host copy the GPU's copy into
+/// it (docs/graphics-kext/design.md, Decided 4). Serialises the copy's Shared buffer and an
+/// RGFX_CMD_MANAGED_TEXTURE_CREATE. Nil for a pixel format or shape no CPU copy holds, or where
+/// the slabs or the region have no room or no resource id is left: the caller makes the texture
+/// without a CPU copy then.
 + (nullable instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                                region:(RgfxRegion *)region
+                                                slabs:(nullable RgfxSlabs *)slabs
                                                device:(nullable id<MTLDevice>)device
                                            serializer:(RgfxSerializer *)serializer;
 

@@ -556,6 +556,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 
 + (instancetype)managedTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                       region:(RgfxRegion *)region
+                                       slabs:(RgfxSlabs *)slabs
                                       device:(id<MTLDevice>)device
                                   serializer:(RgfxSerializer *)serializer
 {
@@ -568,26 +569,42 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (!rgfxPixelFormatBlock(desc.pixel_format, &block) || !layout->init(desc, block)) {
 		return nil;
 	}
-	RgfxRegion::Block copy = region->allocate(layout->size());
-	if (!copy.ok) {
-		return nil;
-	}
-	// A new Managed texture reads zero, as Metal's do.
-	uint8_t *bytes = const_cast<uint8_t *>(copy.ptr);
-	std::memset(bytes, 0, layout->size());
-	// The block goes back once the host has dropped the copy's buffer, which goes after the
-	// texture that holds it (its destroy first).
-	const uint64_t offset = copy.offset;
-	RgfxBuffer *cpu = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
-	                                                  regionOffset:offset
-	                                                        length:layout->size()
-	                                                       options:MTLResourceStorageModeShared
-	                                                   deallocator:^{ region->release(offset); }
-	                                                        device:device
-	                                                    serializer:serializer];
-	if (cpu == nil) {
-		region->release(offset); // no buffer lies over the block
-		return nil;
+	// A new Managed texture reads zero, as Metal's do. Its copy's memory goes back once the host
+	// has dropped the copy's buffer, which goes after the texture that holds it (its destroy
+	// first).
+	RgfxBuffer *cpu = nil;
+	uint8_t *bytes = nullptr;
+	if (slabs != nullptr) {
+		// A Shared buffer of the slabs, zeroed as every new one is.
+		cpu = [RgfxBuffer bufferForDeviceWithLength:layout->size()
+		                                    options:MTLResourceStorageModeShared
+		                                      bytes:nullptr
+		                                  maxLength:0
+		                                      slabs:slabs
+		                                     device:device
+		                                 serializer:serializer];
+		if (cpu == nil)
+			return nil;
+		bytes = static_cast<uint8_t *>([cpu contents]);
+	} else {
+		RgfxRegion::Block copy = region->allocate(layout->size());
+		if (!copy.ok) {
+			return nil;
+		}
+		bytes = const_cast<uint8_t *>(copy.ptr);
+		std::memset(bytes, 0, layout->size());
+		const uint64_t offset = copy.offset;
+		cpu = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
+		                                      regionOffset:offset
+		                                            length:layout->size()
+		                                           options:MTLResourceStorageModeShared
+		                                       deallocator:^{ region->release(offset); }
+		                                            device:device
+		                                        serializer:serializer];
+		if (cpu == nil) {
+			region->release(offset); // no buffer lies over the block
+			return nil;
+		}
 	}
 	RgfxCreated created = serializer->createManagedTexture(
 	    desc, [cpu rgfxObjId], block.bytes, block.width, block.height,

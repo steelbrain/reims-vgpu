@@ -79,12 +79,17 @@
 {
 	// Where Metal's validation ends the process, so does the bundle, sending nothing.
 	rgfxEndAtInvalidTextureDescriptor(descriptor);
-	// A Managed texture's CPU copy is a region block; one of a format or shape no CPU copy
-	// holds is made without one.
+	// A Managed texture's CPU copy is a Shared buffer of the slabs where the host reads a copy
+	// wherever its buffer lies (RGFX_FEATURE_MANAGED_TEXTURE_SLABS), so the copies take the
+	// process's own pages and not the region every process shares; else a region block. One of
+	// a format or shape no CPU copy holds is made without one.
 	if (descriptor != nil && descriptor.storageMode == MTLStorageModeManaged &&
 	    [self region] != nullptr && [self serializer] != nullptr) {
+		const bool inSlabs = ([self caps]->features() & RGFX_FEATURE_MANAGED_TEXTURE_SLABS) != 0;
 		RgfxTexture *managed = [RgfxTexture managedTextureWithDescriptor:descriptor
 		                                                          region:[self region]
+		                                                           slabs:inSlabs ? [self slabs]
+		                                                                         : nullptr
 		                                                          device:self
 		                                                      serializer:[self serializer]];
 		if (managed != nil) {

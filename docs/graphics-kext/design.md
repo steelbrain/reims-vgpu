@@ -780,6 +780,11 @@ only where no negotiation can carry it.
   lock needs them (`RGFX_SURFACE_PAGES_DEFERRED` and `_ATTACH`; `wire.rs`). A
   host offers it where it offers `SURFACE_CACHE`, with its budget in
   `DEFERRED_BUDGET_LO` and `_HI`.
+- Bit 21 is `MANAGED_TEXTURE_SLABS`: a `MANAGED_TEXTURE_CREATE` may name any
+  Shared buffer over the sender's memory as its CPU copy, and the host reads
+  and writes the copy where the buffer's contents lie, so the bundle takes a
+  Managed texture's CPU copy from its slabs ("Managed storage", below). Every
+  host offers it, and the kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1677,9 +1682,14 @@ to the other, byte by byte, so CPU and GPU writes beside each other both stand
 its command buffer's completion, not as it runs, and memory mapped read-only is
 never written back.
 
-**Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is a
-region block of its process's, which the guest maps, and the host decides the
-form from the platform's answer of whether the GPU shares the CPU's memory:
+**Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is
+memory of its process's, which the guest maps: a buffer's a range of a slab
+("Shared and Managed buffers lie in slabs") or a region block, a texture's a
+Shared buffer of the slabs where the device takes
+`RGFX_FEATURE_MANAGED_TEXTURE_SLABS` (the process's own superpages where the
+device takes them, so no app-sized copy lies in the region), else a region
+block. The host decides the form from the platform's answer of whether the GPU
+shares the CPU's memory:
 - **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
   and a one-level 2D texture of a linear format a texture over its block's
   Shared buffer; the range messages are checked and do nothing more. A texture
@@ -1706,8 +1716,10 @@ form from the platform's answer of whether the GPU shares the CPU's memory:
     memory (measured on the AMD 5300M: 12 GiB of Managed buffers, three times
     its 4 GiB, made, used by one command buffer and read back as written).
 - A buffer comes from `BUFFER_OVER_HOST_MEMORY` with Managed options; a texture
-  from `MANAGED_TEXTURE_CREATE`, which names the block's Shared buffer and the
-  texel block of its format (bytes, width, height). Both sides compute the
+  from `MANAGED_TEXTURE_CREATE`, which names the copy's Shared buffer and the
+  texel block of its format (bytes, width, height). The host reads the copy
+  where the buffer's contents lie: its block, its heap's bytes at its offset
+  (over a block or over a pages block's guest RAM), or a pages block's view. Both sides compute the
   copy's linear layout from it (`crates/reims-graphics/src/managed.rs`,
   `guest/bundle/src/RgfxManagedLayout.hpp`): levels in order, then slices,
   images and rows of blocks, each row rounded up to 256 bytes.

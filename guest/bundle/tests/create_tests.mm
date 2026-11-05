@@ -296,6 +296,7 @@ void test_refused_texture_create_is_nil()
 		default:
 			return [RgfxTexture managedTextureWithDescriptor:texture2D(MTLStorageModeManaged)
 			                                          region:&b.region
+			                                           slabs:nullptr
 			                                          device:nil
 			                                      serializer:&r.ser];
 		}

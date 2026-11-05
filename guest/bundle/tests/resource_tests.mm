@@ -598,6 +598,7 @@ void test_texture_answers()
 		md.storageMode = MTLStorageModeManaged;
 		RgfxTexture *managed = [RgfxTexture managedTextureWithDescriptor:md
 		                                                          region:&region
+		                                                           slabs:nullptr
 		                                                          device:nil
 		                                                      serializer:&fx.ser];
 		CHECK(managed != nil && managed.resourceOptions == 0x210);

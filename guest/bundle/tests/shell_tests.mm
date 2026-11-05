@@ -6259,6 +6259,7 @@ void test_managed_texture_cpu_copy()
 		desc.storageMode = MTLStorageModeManaged;
 		RgfxTexture *tex = [RgfxTexture managedTextureWithDescriptor:desc
 		                                                      region:&region
+		                                                       slabs:nullptr
 		                                                      device:nil
 		                                                  serializer:&fx.ser];
 		CHECK(tex != nil);
@@ -6322,6 +6323,7 @@ void test_managed_texture_cpu_copy()
 		depth.storageMode = MTLStorageModeManaged;
 		CHECK([RgfxTexture managedTextureWithDescriptor:depth
 		                                         region:&region
+		                                          slabs:nullptr
 		                                         device:nil
 		                                     serializer:&fx.ser] == nil);
 		CHECK(!fx.ring.next(&extra, &extraBytes));
@@ -6430,6 +6432,69 @@ void test_managed_texture_reads_on_unified_memory()
 		}
 	}
 	drainRing(fx.ring);
+}
+
+// Where the device took RGFX_FEATURE_MANAGED_TEXTURE_SLABS, a Managed texture's CPU copy is a
+// Shared buffer of the slabs, as a device buffer of its size is: two copies share one slab's block
+// of the region, not a block each, each names its own buffer in its MANAGED_TEXTURE_CREATE, reads
+// zero though the block held other bytes, and replaceRegion: writes the slab's bytes.
+void test_managed_texture_cpu_copy_in_slabs()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0xff); // pre-dirtied, as BAR memory
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
+	@autoreleasepool {
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:100
+		                                                      height:60
+		                                                   mipmapped:YES];
+		desc.mipmapLevelCount = 3;
+		desc.storageMode = MTLStorageModeManaged;
+		RgfxTexture *a = [RgfxTexture managedTextureWithDescriptor:desc
+		                                                    region:&region
+		                                                     slabs:&slabs
+		                                                    device:nil
+		                                                serializer:&fx.ser];
+		RgfxTexture *b = [RgfxTexture managedTextureWithDescriptor:desc
+		                                                    region:&region
+		                                                     slabs:&slabs
+		                                                    device:nil
+		                                                serializer:&fx.ser];
+		CHECK(a != nil && b != nil && [a storageMode] == MTLStorageModeManaged);
+		auto heap = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		auto cpuA = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		auto createA = expectMessage<RgfxManagedTextureCreate>(fx.ring,
+		                                                       RGFX_CMD_MANAGED_TEXTURE_CREATE);
+		auto cpuB = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		auto createB = expectMessage<RgfxManagedTextureCreate>(fx.ring,
+		                                                       RGFX_CMD_MANAGED_TEXTURE_CREATE);
+		CHECK(cpuA.heap_obj_id == heap.obj_id && cpuB.heap_obj_id == heap.obj_id);
+		CHECK(cpuA.length == 42240 && cpuB.length == 42240 && cpuA.offset != cpuB.offset);
+		CHECK(cpuA.options == MTLResourceStorageModeShared);
+		CHECK(createA.obj_id == a.rgfxObjId && createA.cpu_buffer_obj_id == cpuA.obj_id);
+		CHECK(createB.obj_id == b.rgfxObjId && createB.cpu_buffer_obj_id == cpuB.obj_id);
+		CHECK(blocks.allocated.size() == 1 && blocks.allocated[0] == heap.region_offset);
+		uint8_t *copy = mem.data() + heap.region_offset + cpuA.offset;
+		CHECK(copy[0] == 0 && copy[42239] == 0); // a new Managed texture reads zero
+
+		// Level 1, a 4x1 region at (2, 1), at the layout's 256-byte pitch.
+		uint8_t pixels[16];
+		for (int i = 0; i < 16; i++)
+			pixels[i] = static_cast<uint8_t>(i + 1);
+		[a replaceRegion:MTLRegionMake2D(2, 1, 4, 1)
+		     mipmapLevel:1
+		       withBytes:pixels
+		     bytesPerRow:16];
+		CHECK(std::memcmp(copy + 30720 + 256 + 8, pixels, 16) == 0);
+		auto replaced = expectMessage<RgfxTextureReplaceRegion>(fx.ring,
+		                                                        RGFX_CMD_TEXTURE_REPLACE_REGION);
+		CHECK(replaced.obj_id == a.rgfxObjId && replaced.level == 1);
+	}
 }
 
 // --- host objects go as the app lets them go ----------------------------------------------
@@ -7077,6 +7142,7 @@ void test_managed_texture_copy_block_after_destroys()
 		td.storageMode = MTLStorageModeManaged;
 		RgfxTexture *t = [RgfxTexture managedTextureWithDescriptor:td
 		                                                    region:&region
+		                                                     slabs:nullptr
 		                                                    device:nil
 		                                                serializer:&fx.ser];
 		CHECK(t != nil);
@@ -11096,6 +11162,7 @@ int main(int argc, char **argv)
 		test_buffer_texture_linear_alignment();
 		test_managed_texture_cpu_copy();
 		test_managed_texture_reads_on_unified_memory();
+		test_managed_texture_cpu_copy_in_slabs();
 		test_objects_destroyed_as_let_go();
 		test_function_keeps_its_library();
 		test_heap_outlives_its_resources();
