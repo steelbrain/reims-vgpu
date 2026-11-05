@@ -1999,6 +1999,53 @@ fn a_reset_is_told_to_the_host_before_the_messages_after_it() {
     );
 }
 
+/// A reset that comes after the control thread found that none had since it handed a message to
+/// its lane, and before it moved `control_done` past that message, leaves the count at the
+/// reset's 0: the look and the move are one step to a reset. A count left past the reset's would
+/// let a buffer of a queue made after it go to the host before the creates it waits for were
+/// handed on (a lane with nothing handed has carried everything out).
+#[test]
+fn a_reset_between_the_control_thread_s_look_and_its_count_leaves_the_count_at_0() {
+    use std::sync::mpsc;
+    let mut rig = Rig::new();
+    rig.start();
+    let (at_stop, stopped) = mpsc::channel();
+    let (go, wait_go) = mpsc::channel::<()>();
+    let wait_go = Mutex::new(wait_go);
+    *rig.device.shared.before_count.lock() = Some(Arc::new(move |through| {
+        let _ = at_stop.send(through);
+        let _ = wait_go.lock().recv();
+    }));
+    const EVENT: u64 = (4 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    rig.send(object_message(RGFX_CMD_EVENT_CREATE, EVENT));
+    let through = (stopped.recv_timeout(Duration::from_secs(5)))
+        .expect("the control thread never handed the create on");
+    assert!(through > 0);
+    *rig.device.shared.before_count.lock() = None;
+    let device = &rig.device;
+    std::thread::scope(|scope| {
+        let (reset_done, reset_waited) = mpsc::channel();
+        scope.spawn(move || {
+            device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+            let _ = reset_done.send(());
+        });
+        // A reset that need not wait for the control thread's step ends well within this.
+        let _ = reset_waited.recv_timeout(Duration::from_millis(100));
+        go.send(()).unwrap();
+    });
+    for _ in 0..200 {
+        if rig.device.shared.control_done.load(Ordering::Acquire) != 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        rig.device.shared.control_done.load(Ordering::Acquire),
+        0,
+        "the control thread moved the count past {through} after the reset set it to 0"
+    );
+}
+
 /// The control completion ring takes posts from several threads at once (the control thread's
 /// answers and the host's compile threads' replies): each lands whole, once, in its thread's order.
 #[test]

@@ -534,7 +534,16 @@ pub(crate) struct Shared {
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
     /// its completion poster hold it, so neither keeps the device alive.
     weak_self: OnceLock<Weak<Shared>>,
+    /// Where the tests stop the control thread once it has found no reset came since it took a
+    /// message it carried out or handed on with no ring held, before it moves `control_done` past
+    /// it: called with the count it moves to.
+    #[cfg(test)]
+    before_count: Mutex<Option<Stop>>,
 }
+
+/// What [`Shared::before_count`] holds.
+#[cfg(test)]
+type Stop = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// The command queues' per-queue rings, keyed both by the queue's guest-picked id (for a destroy)
 /// and by its ring id — the submission ring's region offset, the `DOORBELL` value (for a wake).
@@ -739,6 +748,8 @@ impl Device {
             lanes: Arc::default(),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
+            #[cfg(test)]
+            before_count: Mutex::new(None),
         });
         // A queue's service thread and completion poster reach the shared state weakly.
         let _ = shared.weak_self.set(Arc::downgrade(&shared));
@@ -1198,11 +1209,22 @@ impl Shared {
                             }
                             None => control::unheld(self, &message, epoch),
                         };
-                        // A reset meanwhile restarted the count; this message's is moot.
+                        // A reset meanwhile restarted the count; this message's is moot. The look
+                        // and the move are made with the ring held, as a reset's move to 0 is, so
+                        // no reset comes between them.
+                        let submit = self.submit.lock();
                         if self.epoch.load(Ordering::Acquire) == epoch {
+                            #[cfg(test)]
+                            {
+                                let stop = self.before_count.lock().clone();
+                                if let Some(stop) = stop {
+                                    stop(through);
+                                }
+                            }
                             self.control_done.store(through, Ordering::Release);
                             self.gate.counted(through);
                         }
+                        drop(submit);
                         (answer, epoch, false)
                     }
                     Ok(Some(message)) => {
