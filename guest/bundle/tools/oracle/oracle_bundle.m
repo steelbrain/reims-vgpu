@@ -5,7 +5,7 @@
 // The cases, each line `CASE key=value ...`:
 //   buffers      allocatedSize of buffers of each storage mode by newBufferWithLength: and
 //                newBufferWithBytes:, of lengths 1 to 1 MiB + 1
-//   heapbuffers  allocatedSize of buffers in a 4 MiB heap of each storage mode, and the heap's
+//   heapbuffers  allocatedSize of buffers in a 4 MiB Private heap, and the device's
 //                heapBufferSizeAndAlignWithLength:options:
 //   nocopy.*     a no-copy buffer (newBufferWithBytesNoCopy:) over pages the probe maps: its
 //                allocatedSize, length, contents and gpuAddress; .page (one page), .3pages,
@@ -29,6 +29,9 @@
 //                with allowGPUOptimizedContents YES and NO
 //   libforms     newLibraryWithFunctionArray:error:, newLibraryWithMetalPackageURL:error: and
 //                newLibraryWithMPSGraphPackageURL:name:error: (SPI)
+//   functypes.dyn  where Metal's assertion at a dynamic library's exported function falls
+//   failmiss2    newFunctionWithDescriptor: failing on a miss, by stage, by the options the
+//                function was added with, and by the kernel's constant values
 //   view.*       a view of a 64 x 64 Private texture (usage ShaderRead | PixelFormatView) that the
 //                bundle answers nil for: .class (RGBA16Float in RGBA8Unorm), .levels (levels 2 to
 //                4 of 3), .slices (slices 3 and 4 of a 4-slice array), .type (2D as 3D),
@@ -114,9 +117,11 @@ static void case_buffers(id<MTLDevice> d)
 
 static void case_heapbuffers(id<MTLDevice> d)
 {
-	const MTLStorageMode modes[] = {MTLStorageModeShared, MTLStorageModePrivate};
-	const char *names[] = {"shared", "private"};
-	for (int m = 0; m < 2; m++) {
+	// Private alone: a Shared heap ends the process at the descriptor's validation on the AMD and
+	// the Intel GPU ("Shared storage mode disallowed").
+	const MTLStorageMode modes[] = {MTLStorageModePrivate};
+	const char *names[] = {"private"};
+	for (int m = 0; m < 1; m++) {
 		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
 		hd.size = 4u << 20;
 		hd.storageMode = modes[m];
@@ -225,13 +230,8 @@ static id<MTLBinaryArchive> open_archive(id<MTLDevice> d, const char *tag, NSURL
 	ad.url = url;
 	NSError *e = nil;
 	id<MTLBinaryArchive> a = [d newBinaryArchiveWithDescriptor:ad error:&e];
-	printf("%s archive=%s error=%s", tag, cls(a), err_text(e));
-	SEL keys = sel_registerName("keys");
-	if (a != nil && [(id)a respondsToSelector:keys]) {
-		NSArray *k = ((id(*)(id, SEL))objc_msgSend)(a, keys);
-		printf(" keys=%lu", (unsigned long)k.count);
-	}
-	printf("\n");
+	printf("%s archive=%s error=%s\n", tag, cls(a), err_text(e));
+	fflush(stdout);
 	return a;
 }
 
@@ -251,6 +251,8 @@ static void pipeline_in(id<MTLDevice> d, const char *tag, id<MTLLibrary> lib,
 	MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
 	cd.computeFunction = fn;
 	cd.binaryArchives = @[ a ];
+	printf("%s function=%s\n", tag, cls(fn));
+	fflush(stdout);
 	e = nil;
 	id p = [d newComputePipelineStateWithDescriptor:cd
 	                                        options:MTLPipelineOptionFailOnBinaryArchiveMiss
@@ -499,6 +501,12 @@ static void case_functypes(id<MTLDevice> d)
 		           .UTF8String,
 		       err_text(e));
 		for (NSString *name in [types.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+			if ([types[name][0] intValue] == 3) {
+				// Metal asserts at a dynamic library's exported function (case functypes.dyn).
+				printf("functypes %s TYPE=3 tags=%s (asked in functypes.dyn)\n", name.UTF8String,
+				       [types[name][1] UTF8String]);
+				continue;
+			}
 			id<MTLFunction> fn = [lib newFunctionWithName:name];
 			printf("functypes %s TYPE=%d tags=%s function=%s functionType=%ld", name.UTF8String,
 			       [types[name][0] intValue], [types[name][1] UTF8String], cls(fn),
@@ -576,6 +584,78 @@ static void case_libtype(id<MTLDevice> d)
 	print_lib("libtype.file.dynamic", file, e);
 }
 
+// Where Metal's assertion at a dynamic library's exported function (TYPE 3) falls: the function
+// itself, or its type.
+static void case_functypes_dyn(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle_dyn.metallib") error:&e];
+	printf("functypes.dyn library=%s error=%s\n", cls(lib), err_text(e));
+	fflush(stdout);
+	id<MTLFunction> fn = [lib newFunctionWithName:@"_Z7div_dynf"];
+	printf("functypes.dyn function=%s\n", cls(fn));
+	fflush(stdout);
+	printf("functypes.dyn functionType=%ld\n", fn ? (long)fn.functionType : -1L);
+}
+
+static MTLFunctionConstantValues *kernel_values(float scale)
+{
+	MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+	bool flag = true;
+	[cv setConstantValue:&flag type:MTLDataTypeBool atIndex:0];
+	[cv setConstantValue:&scale type:MTLDataTypeFloat atIndex:1];
+	return cv;
+}
+
+// newFunctionWithDescriptor: failing on a miss, by stage: each function added to an archive of its
+// own with options 0 and with CompileToBinary, then looked up with FailOnBinaryArchiveMiss (4) and
+// with it and CompileToBinary (5) in each; div_kernel also with other constant values.
+static void case_failmiss2(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+	if (lib == nil) {
+		printf("failmiss2 library error=%s\n", err_text(e));
+		return;
+	}
+	NSString *names[] = {@"div_visible", @"div_kernel", @"div_vertex", @"div_fragment"};
+	for (int n = 0; n < 4; n++) {
+		id<MTLBinaryArchive> added[2];
+		for (int a = 0; a < 2; a++) {
+			added[a] = [d newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
+			MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+			fd.name = names[n];
+			fd.options = a ? MTLFunctionOptionCompileToBinary : MTLFunctionOptionNone;
+			if (n == 1)
+				fd.constantValues = kernel_values(2.0f);
+			e = nil;
+			BOOL ok = [added[a] addFunctionWithDescriptor:fd library:lib error:&e];
+			printf("failmiss2 %s add options=%lu ok=%d error=%s\n", names[n].UTF8String,
+			       (unsigned long)fd.options, ok, err_text(e));
+			fflush(stdout);
+		}
+		const MTLFunctionOptions opts[] = {
+		    MTLFunctionOptionFailOnBinaryArchiveMiss,
+		    MTLFunctionOptionFailOnBinaryArchiveMiss | MTLFunctionOptionCompileToBinary};
+		for (int o = 0; o < 2; o++)
+			for (int a = 0; a < 2; a++)
+				for (int k = 0; k < (n == 1 ? 2 : 1); k++) {
+					MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+					fd.name = names[n];
+					fd.options = opts[o];
+					fd.binaryArchives = @[ added[a] ];
+					if (n == 1)
+						fd.constantValues = kernel_values(k ? 3.0f : 2.0f);
+					e = nil;
+					id<MTLFunction> fn = [lib newFunctionWithDescriptor:fd error:&e];
+					printf("failmiss2 %s options=%lu addedWith=%d values=%s function=%s error=%s\n",
+					       names[n].UTF8String, (unsigned long)opts[o], a,
+					       n == 1 ? (k ? "other" : "same") : "-", cls(fn), err_text(e));
+					fflush(stdout);
+				}
+	}
+}
+
 // --- the rest -----------------------------------------------------------------------------
 
 static void case_minlod(void)
@@ -632,10 +712,12 @@ static void case_libforms(id<MTLDevice> d)
 	id<MTLFunction> stitchable = [lib newFunctionWithName:@"div_stitchable"];
 	SEL arr = sel_registerName("newLibraryWithFunctionArray:error:");
 	if ([d respondsToSelector:arr]) {
-		NSArray *sets[] = {@[], visible ? @[ visible ] : @[],
-		                   stitchable ? @[ stitchable ] : @[]};
-		const char *names[] = {"empty", "visible", "stitchable"};
-		for (int i = 0; i < 3; i++) {
+		// No empty array: Metal asserts at one ("Array must not be emty"), ending the process.
+		NSArray *sets[] = {visible ? @[ visible ] : @[], stitchable ? @[ stitchable ] : @[]};
+		const char *names[] = {"visible", "stitchable"};
+		for (int i = 0; i < 2; i++) {
+			if (sets[i].count == 0)
+				continue;
 			e = nil;
 			@try {
 				id l = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, arr, sets[i], &e);
@@ -743,7 +825,7 @@ static const char *const kCases[] = {
     "classes",          "heapsize",         "libforms",
     "view.class",       "view.levels",      "view.slices",   "view.type",     "view.slicecount",
     "view.noformat",    "view.ok",          "buftex.bc1",    "buftex.depth",  "buftex.shortrow",
-    "linear.shortrow",
+    "linear.shortrow",  "functypes.dyn",    "failmiss2",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -786,6 +868,10 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_heapsize(d);
 	else if (!strcmp(c, "libforms"))
 		case_libforms(d);
+	else if (!strcmp(c, "functypes.dyn"))
+		case_functypes_dyn(d);
+	else if (!strcmp(c, "failmiss2"))
+		case_failmiss2(d);
 	else if (!strcmp(c, "view.class"))
 		view_case(d, c, MTLPixelFormatRGBA16Float, MTLTextureType2D, 1, 1, MTLPixelFormatRGBA8Unorm,
 		          MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
