@@ -118,9 +118,10 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
 /// (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces-<i>`),
-/// the indirect command buffers' worker (`reims-vgpu.icb-create-<i>`), or the platform's thread
-/// that runs a command buffer's scheduled or completed handler; or the host's own, inside
-/// [`GraphicsDevice::mmio_write_taking`].
+/// the indirect command buffers' worker (`reims-vgpu.icb-create-<i>`), the worker that lets go of
+/// a closed process's objects and answers its close (`reims-vgpu.graphics-closes-<i>`), or the
+/// platform's thread that runs a command buffer's scheduled or completed handler; or the host's
+/// own, inside [`GraphicsDevice::mmio_write_taking`].
 /// Each is called never inside another call of the host's into the device, and with no lock held
 /// that a function of the device's waits for, directly or through a thread of the library's, so
 /// they may call it at once. `scanout_written` runs with no lock of the library's held.

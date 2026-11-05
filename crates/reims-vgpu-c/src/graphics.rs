@@ -84,8 +84,10 @@ const _: () = {
 /// command buffers (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), a thread that makes IOSurfaces' and pages blocks' views
 /// (`reims-vgpu.graphics-surfaces-<i>`), a thread that makes indirect command buffers
-/// (`reims-vgpu.icb-create-<i>`), or the platform's thread that runs a command buffer's scheduled
-/// or completed handler; or the host's own, inside rvg_graphics_device_mmio_write_taking.
+/// (`reims-vgpu.icb-create-<i>`), a thread that lets go of a closed process's objects and answers
+/// its close (`reims-vgpu.graphics-closes-<i>`), or the platform's thread that runs a command
+/// buffer's scheduled or completed handler; or the host's own, inside
+/// rvg_graphics_device_mmio_write_taking.
 /// Never inside another call of the host's into the library. The library may hold locks of its
 /// own around it (docs/api.md section 5 names them), but none that a function it may call waits
 /// for, directly or through a thread of the library's, so it may call them at once. It may wait
