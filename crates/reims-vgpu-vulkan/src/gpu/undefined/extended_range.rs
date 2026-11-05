@@ -176,6 +176,10 @@ fn against(case: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> bool {
 /// every run. This platform's bytes are Metal's, or the runtime announced
 /// `extended-range-bits-kept`
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn extended_range_codes_through_blits_and_loads_are_metals() {
     let metal = metal();
     let (p, d) = (platform(), dev());

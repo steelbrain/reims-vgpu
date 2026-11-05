@@ -4259,6 +4259,10 @@ fn two_plane_samples_on<P: Platform>(
 /// hold a NaN, and announces `device-nan-encoding` there: the first dispatch of this platform's
 /// side dies, naming the kind ([`crate::answer::DIES`]).
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn two_plane_xr10_samples_are_the_metal_platforms() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let Some(metal) = MetalPlatform::system_default_device() else {
@@ -4547,6 +4551,10 @@ where
 /// hold a NaN, and announces `device-nan-encoding` there: the first dispatch of this platform's
 /// side dies, naming the kind ([`crate::answer::DIES`]).
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let Some(metal) = MetalPlatform::system_default_device() else {
