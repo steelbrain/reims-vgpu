@@ -123,7 +123,7 @@ use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
     DecodeError, Decoders, Drain, GraphicsDecoder, ObjHandle, ScheduledSink, SubmittedSink, blit,
-    compute, context_of, op_fault, read, refusing, render, video,
+    compute, context_of, op_fault, read, refused, refusing, render, video,
 };
 
 /// The op stream runs under a live raise handler (the ring loop's), so an encode's
@@ -825,11 +825,16 @@ fn completed_with(handler: CompletedHandler, ordered: Option<Arc<Held>>) -> Comp
 enum OpenEncoder<P: Platform> {
     /// A render encoder, and what its ops' checks read of its pass.
     Render(P::RenderEncoder, render::PassFacts),
-    Compute(P::ComputeEncoder),
+    /// A compute encoder, and its slots that hold an object whose create the host refused.
+    Compute(P::ComputeEncoder, refused::Marks),
     Blit(P::BlitEncoder),
     /// A video encoder: its session's work, placed in the command buffer itself; its hold lets
     /// the session go on the video worker ([`video::SessionHold`]).
     Video(video::SessionHold<P>),
+    /// An encoder of the op group, skipped whole: its pass named an object whose create the host
+    /// refused (an attachment, a video session). No platform encoder is open, and its ops up to
+    /// its end are dropped ([`refused`]).
+    Skipped(u16),
 }
 
 /// Whether Metal takes `positions` as a pass's sample positions, where `makes` answers whether
@@ -1273,6 +1278,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             let (event, shared) = match self.named(op.event_obj_id) {
                 Some(ObjHandle::Event(e)) => (EventRef::Event(e), false),
                 Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), true),
+                // As the walk takes one whose create the host refused.
+                Some(ObjHandle::Refused(r)) => {
+                    if signal && r.shared_event() {
+                        events.signals.push((op.event_obj_id, op.value));
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             if signal {
@@ -1506,6 +1518,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             };
             match op_group(tag) {
                 RGFX_OP_GROUP_FRAMING => self.framing_op(tag, body, cb, encoder, events)?,
+                // An op of an encoder skipped whole ([`OpenEncoder::Skipped`]): dropped.
+                group if matches!(encoder.as_ref(), Some(OpenEncoder::Skipped(g)) if *g == group) =>
+                    {}
                 RGFX_OP_GROUP_RENDER => {
                     let Some(OpenEncoder::Render(enc, pass)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "render"));
@@ -1519,10 +1534,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                     continue;
                 }
                 RGFX_OP_GROUP_COMPUTE => {
-                    let Some(OpenEncoder::Compute(enc)) = encoder.as_ref() else {
+                    let Some(OpenEncoder::Compute(enc, marks)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "compute"));
                     };
-                    if !compute::decode_op(tag, body, self, enc, ON)? {
+                    // A dispatch while a slot holds a refused object is dropped ([`refused`]).
+                    let dropped =
+                        marks.skips() || (marks.drops_draws() && compute::dispatches(tag));
+                    if !dropped && !contain(compute::decode_op(tag, body, self, enc, marks, ON))? {
                         return Err(unknown_op(tag));
                     }
                 }
@@ -1530,7 +1548,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Blit(enc)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "blit"));
                     };
-                    if !blit::decode_op(tag, body, self, enc, ON)? {
+                    if !contain(blit::decode_op(tag, body, self, enc, ON))? {
                         return Err(unknown_op(tag));
                     }
                 }
@@ -1538,7 +1556,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "video"));
                     };
-                    if !video::decode_op(tag, body, self, session.session(), cb)? {
+                    if !contain(video::decode_op(tag, body, self, session.session(), cb))? {
                         return Err(unknown_op(tag));
                     }
                 }
@@ -1571,8 +1589,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
         let mut draws = Draws::new();
         while !ops.is_empty() {
-            // Draws one after another go to the encoder together; each other op, after them.
-            if let Some((draw, len)) = self.vertex_draw(ops) {
+            // Draws one after another go to the encoder together; each other op, after them. While
+            // a slot holds a refused object, each op goes alone, and a draw is dropped
+            // ([`refused`]).
+            let refused = pass.refused.drops_draws();
+            if !refused && let Some((draw, len)) = self.vertex_draw(ops) {
                 draws.push(draw, enc)?;
                 ops = &ops[len..];
                 continue;
@@ -1584,7 +1605,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             if op_group(tag) != RGFX_OP_GROUP_RENDER {
                 break;
             }
-            if !render::decode_op(tag, body, self, enc, pass, ON)? {
+            let dropped = refused && render::draws(tag);
+            if !dropped && !contain(render::decode_op(tag, body, self, enc, pass, ON))? {
                 return Err(unknown_op(tag));
             }
             ops = &ops[len..];
@@ -1637,10 +1659,19 @@ impl<P: Platform> GraphicsDecoder<P> {
         match tag {
             RGFX_OP_ENCODER_BEGIN_RENDER => {
                 already_open(encoder, "ENCODER_BEGIN_RENDER")?;
-                let (pass, facts) = self.build_render_pass(body, |count| {
+                let built = self.build_render_pass(body, |count| {
                     cb.device()
                         .is_some_and(|d| makes_sample_count(&d.caps(), count))
-                })?;
+                });
+                // A pass that names an object whose create the host refused (an attachment, a
+                // resolve texture, its visibility result buffer) is skipped whole ([`refused`]).
+                let (pass, facts) = match built {
+                    Err(raise) if refused::is_refused(&raise) => {
+                        *encoder = Some(OpenEncoder::Skipped(RGFX_OP_GROUP_RENDER));
+                        return Ok(());
+                    }
+                    built => built?,
+                };
                 let enc = cb
                     .render_encoder(ON, &pass)?
                     .ok_or_else(|| op_fault("the render encoder was nil"))?;
@@ -1653,7 +1684,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let enc = cb
                     .compute_encoder_for_pass(&desc)?
                     .ok_or_else(|| op_fault("the compute encoder was nil"))?;
-                *encoder = Some(OpenEncoder::Compute(enc));
+                *encoder = Some(OpenEncoder::Compute(enc, refused::Marks::default()));
             }
             RGFX_OP_ENCODER_BEGIN_BLIT => {
                 already_open(encoder, "ENCODER_BEGIN_BLIT")?;
@@ -1667,15 +1698,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let pass = RgfxOpVideoPass::read_from_prefix(body)
                     .map(|(pass, _)| pass)
                     .map_err(|_| op_fault("ENCODER_BEGIN_VIDEO: body too short"))?;
-                *encoder = Some(OpenEncoder::Video(
-                    self.require_video_session(pass.session_obj_id)?,
-                ));
+                // A session whose create the host refused skips the encoder whole ([`refused`]).
+                *encoder = Some(match self.require_video_session(pass.session_obj_id) {
+                    Ok(session) => OpenEncoder::Video(session),
+                    Err(raise) if refused::is_refused(&raise) => {
+                        OpenEncoder::Skipped(RGFX_OP_GROUP_VIDEO)
+                    }
+                    Err(raise) => return Err(raise),
+                });
             }
             RGFX_OP_ENCODER_END => match encoder.take() {
                 Some(OpenEncoder::Render(enc, _)) => enc.encode(ON, RenderCmd::EndEncoding)?,
-                Some(OpenEncoder::Compute(enc)) => enc.encode(ON, ComputeCmd::EndEncoding)?,
+                Some(OpenEncoder::Compute(enc, _)) => enc.encode(ON, ComputeCmd::EndEncoding)?,
                 Some(OpenEncoder::Blit(enc)) => enc.encode(ON, BlitCmd::EndEncoding)?,
-                Some(OpenEncoder::Video(_)) => {}
+                Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) => {}
                 None => return Err(op_fault("ENCODER_END with no open encoder")),
             },
             RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT => {
@@ -1689,6 +1725,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let (event, shared) = match self.named(op.event_obj_id) {
                     Some(ObjHandle::Event(e)) => (EventRef::Event(e), false),
                     Some(ObjHandle::SharedEvent(e)) => (EventRef::Shared(e), true),
+                    // An event whose create the host refused ([`refused`]): nothing on the host
+                    // signals it, so a wait for it is dropped; a signal of a shared one still
+                    // reaches the guest's value as the buffer finishes, where its waiters are.
+                    Some(ObjHandle::Refused(r)) => {
+                        r.used(op.event_obj_id);
+                        if signal && r.shared_event() {
+                            events.signals.push((op.event_obj_id, op.value));
+                        }
+                        return Ok(());
+                    }
                     _ => return Err(super::bad_reference()),
                 };
                 if signal {
@@ -1891,10 +1937,19 @@ fn event_signalled(obj_id: u64, value: u64) -> RgfxEventSignalled {
 fn end_abandoned<P: Platform>(open: OpenEncoder<P>) {
     let _ = refusing(|| match open {
         OpenEncoder::Render(enc, _) => enc.encode(ON, RenderCmd::EndEncoding),
-        OpenEncoder::Compute(enc) => enc.encode(ON, ComputeCmd::EndEncoding),
+        OpenEncoder::Compute(enc, _) => enc.encode(ON, ComputeCmd::EndEncoding),
         OpenEncoder::Blit(enc) => enc.encode(ON, BlitCmd::EndEncoding),
-        OpenEncoder::Video(_) => Ok(()),
+        OpenEncoder::Video(_) | OpenEncoder::Skipped(_) => Ok(()),
     });
+}
+
+/// `done`, the outcome of an encoder op: an op that named an object whose create the host refused
+/// is dropped, and the walk goes on ([`refused`]); any other outcome as it is.
+fn contain(done: RaiseResult<bool>) -> RaiseResult<bool> {
+    match done {
+        Err(raise) if refused::is_refused(&raise) => Ok(true),
+        done => done,
+    }
 }
 
 /// A fault: an encoder op whose group has no open encoder.

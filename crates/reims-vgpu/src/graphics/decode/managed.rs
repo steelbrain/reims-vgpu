@@ -410,6 +410,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxBufferDidModifyRange>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // One whose create the host refused holds nothing to bring over ([`super::refused`]).
+        if let Some(ObjHandle::Refused(r)) = self.named(m.obj_id) {
+            r.used(m.obj_id);
+            return Ok(Ok(()));
+        }
         let (Some(ObjHandle::Buffer(buffer)), Some(copy)) =
             (self.named(m.obj_id), self.managed_copy(m.obj_id))
         else {
@@ -549,6 +554,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxTextureReplaceRegion>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // One whose create the host refused holds nothing to bring over ([`super::refused`]).
+        if let Some(ObjHandle::Refused(r)) = self.named(m.obj_id) {
+            r.used(m.obj_id);
+            return Ok(Ok(()));
+        }
         let (Some(ObjHandle::Texture(texture)), Some(copy)) =
             (self.named(m.obj_id), self.managed_copy(m.obj_id))
         else {

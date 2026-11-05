@@ -56,6 +56,7 @@ use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::{FromBytes, Immutable};
 
+use super::refused::{self, Bound, Marks, Slot, Stage};
 use super::{GraphicsDecoder, op_fault};
 
 /// Reads op body `T` from the start of `payload`, or an exec fault when it is too
@@ -102,7 +103,8 @@ fn tail<E: FromBytes + Immutable>(
 
 /// Resolves one wire resource record: a nil kind is `None`, each other kind
 /// resolves `obj_id` through its resolver (a miss or wrong kind faults), and an
-/// unknown kind faults the exec.
+/// unknown kind faults the exec. An object whose create the host refused is `None`, which no
+/// dispatch reads ([`refused`]).
 fn resolve_resource<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     rec: &RgfxComputeResourceRef,
@@ -110,14 +112,15 @@ fn resolve_resource<'a, P: Platform>(
     match rec.kind {
         RGFX_RESOURCE_KIND_NONE => Ok(None),
         RGFX_RESOURCE_KIND_BUFFER => {
-            Ok(Some(ResourceRef::Buffer(objs.require_buffer(rec.obj_id)?)))
+            refused::some_or_nil(objs.require_buffer(rec.obj_id).map(ResourceRef::Buffer))
         }
-        RGFX_RESOURCE_KIND_TEXTURE => Ok(Some(ResourceRef::Texture(
-            objs.require_texture(rec.obj_id)?,
-        ))),
-        RGFX_RESOURCE_KIND_ICB => Ok(Some(ResourceRef::Icb(
-            objs.require_indirect_command_buffer(rec.obj_id)?,
-        ))),
+        RGFX_RESOURCE_KIND_TEXTURE => {
+            refused::some_or_nil(objs.require_texture(rec.obj_id).map(ResourceRef::Texture))
+        }
+        RGFX_RESOURCE_KIND_ICB => refused::some_or_nil(
+            objs.require_indirect_command_buffer(rec.obj_id)
+                .map(ResourceRef::Icb),
+        ),
         other => Err(op_fault(format_args!(
             "compute op: unknown resource kind {other}"
         ))),
@@ -132,26 +135,68 @@ fn resolve_resources<'a, P: Platform>(
     recs.iter().map(|r| resolve_resource(objs, r)).collect()
 }
 
+/// Whether compute op `tag` dispatches (or executes an indirect command buffer): one dropped
+/// while a slot of its encoder holds an object whose create the host refused ([`refused`]).
+pub(crate) fn dispatches(tag: u16) -> bool {
+    matches!(
+        tag,
+        RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS
+            | RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT
+            | RGFX_OP_COMPUTE_DISPATCH_THREADS
+            | RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT
+            | RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT
+            | RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER
+    )
+}
+
+/// The bindings at `first` on of the `recs` a resolve of each, `resolve`, names: an object whose
+/// create the host refused is nil, and marks its slot of `bound` in `marks` ([`refused`]).
+fn bind_each<'a, R, T>(
+    recs: &[R],
+    (marks, bound, first): (&Marks, Bound, u64),
+    resolve: impl Fn(&R) -> RaiseResult<Option<&'a T>>,
+) -> RaiseResult<Vec<Option<&'a T>>> {
+    (0u64..)
+        .zip(recs)
+        .map(|(i, r)| {
+            let slot = Slot::new(Stage::Kernel, bound, first.wrapping_add(i));
+            marks.bound(slot, resolve(r))
+        })
+        .collect()
+}
+
 /// Decodes one compute-encoder op: `tag` its op, `payload` its body (the bytes
 /// after the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves
-/// object references, `enc` is the open compute encoder, and `on` says how an
-/// encode's raise is taken. `Ok(true)` when the op was handled, `Ok(false)` for an
-/// unknown tag (the walk then faults); a platform raise propagates as `Err`.
+/// object references, `enc` is the open compute encoder, `marks` its slots that hold an object
+/// whose create the host refused, and `on` says how an encode's raise is taken. `Ok(true)` when
+/// the op was handled, `Ok(false)` for an unknown tag (the walk then faults); a platform raise
+/// propagates as `Err`.
 pub(crate) fn decode_op<P: Platform>(
     tag: u16,
     payload: &[u8],
     objs: &GraphicsDecoder<P>,
     enc: &P::ComputeEncoder,
+    marks: &Marks,
     on: OnFault,
 ) -> RaiseResult<bool> {
     match tag {
         RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
             let m: RgfxComputeOpSetComputePipelineState = body(tag, payload)?;
-            let state = objs.get_compute_pipeline(m.pipeline_obj_id)?;
+            let slot = Slot::state(Bound::Pipeline);
+            let state = marks.bound(slot, objs.get_compute_pipeline(m.pipeline_obj_id))?;
+            // A refused pipeline is not set: the encoder's dispatches are dropped until the next
+            // ([`refused`]).
+            if marks.holds(slot) {
+                return Ok(true);
+            }
             enc.encode(on, ComputeCmd::SetComputePipelineState { state })?;
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET => {
             let m: RgfxComputeOpSetBufferOffset = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if marks.holds(Slot::new(Stage::Kernel, Bound::Buffer, m.index)) {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 ComputeCmd::SetBufferOffset {
@@ -162,6 +207,10 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET_ATTRIBUTE_STRIDE => {
             let m: RgfxComputeOpSetBufferOffsetAttributeStride = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if marks.holds(Slot::new(Stage::Kernel, Bound::Buffer, m.index)) {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 ComputeCmd::SetBufferOffsetAttributeStride {
@@ -179,10 +228,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetBuffers>(),
                 m.length as usize,
             )?;
-            let named: Vec<Option<&P::Buffer>> = recs
-                .iter()
-                .map(|r| objs.get_buffer(r.buffer_obj_id))
-                .collect::<RaiseResult<_>>()?;
+            let named: Vec<Option<&P::Buffer>> =
+                bind_each(&recs, (marks, Bound::Buffer, m.location), |r| {
+                    objs.get_buffer(r.buffer_obj_id)
+                })?;
             let buffers: Vec<Option<&P::Buffer>> = named;
             let offsets: Vec<u64> = recs.iter().map(|r| r.offset).collect();
             enc.encode(
@@ -202,10 +251,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetBuffersAttributeStrides>(),
                 m.length as usize,
             )?;
-            let named: Vec<Option<&P::Buffer>> = recs
-                .iter()
-                .map(|r| objs.get_buffer(r.buffer_obj_id))
-                .collect::<RaiseResult<_>>()?;
+            let named: Vec<Option<&P::Buffer>> =
+                bind_each(&recs, (marks, Bound::Buffer, m.location), |r| {
+                    objs.get_buffer(r.buffer_obj_id)
+                })?;
             let buffers: Vec<Option<&P::Buffer>> = named;
             let offsets: Vec<u64> = recs.iter().map(|r| r.offset).collect();
             let strides: Vec<u64> = recs.iter().map(|r| r.stride).collect();
@@ -221,7 +270,8 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_COMPUTE_SET_TEXTURE => {
             let m: RgfxComputeOpSetTexture = body(tag, payload)?;
-            let texture = objs.get_texture(m.texture_obj_id)?;
+            let slot = Slot::new(Stage::Kernel, Bound::Texture, m.index);
+            let texture = marks.bound(slot, objs.get_texture(m.texture_obj_id))?;
             enc.encode(
                 on,
                 ComputeCmd::SetTexture {
@@ -238,10 +288,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetTextures>(),
                 m.length as usize,
             )?;
-            let named: Vec<Option<&P::Texture>> = recs
-                .iter()
-                .map(|r| objs.get_texture(r.texture_obj_id))
-                .collect::<RaiseResult<_>>()?;
+            let named: Vec<Option<&P::Texture>> =
+                bind_each(&recs, (marks, Bound::Texture, m.location), |r| {
+                    objs.get_texture(r.texture_obj_id)
+                })?;
             let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
@@ -259,10 +309,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetSamplerStates>(),
                 m.length as usize,
             )?;
-            let named: Vec<Option<&P::SamplerState>> = recs
-                .iter()
-                .map(|r| objs.get_sampler(r.sampler_obj_id))
-                .collect::<RaiseResult<_>>()?;
+            let named: Vec<Option<&P::SamplerState>> =
+                bind_each(&recs, (marks, Bound::Sampler, m.location), |r| {
+                    objs.get_sampler(r.sampler_obj_id)
+                })?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
@@ -280,10 +330,10 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxComputeOpSetSamplerStatesLodClamps>(),
                 m.length as usize,
             )?;
-            let named: Vec<Option<&P::SamplerState>> = recs
-                .iter()
-                .map(|r| objs.get_sampler(r.sampler_obj_id))
-                .collect::<RaiseResult<_>>()?;
+            let named: Vec<Option<&P::SamplerState>> =
+                bind_each(&recs, (marks, Bound::Sampler, m.location), |r| {
+                    objs.get_sampler(r.sampler_obj_id)
+                })?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             let lod_min: Vec<f32> = recs
                 .iter()
@@ -433,7 +483,7 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
             let named: Vec<Option<&P::Heap>> = recs
                 .iter()
-                .map(|r| objs.get_heap(r.heap_obj_id))
+                .map(|r| refused::or_nil(objs.get_heap(r.heap_obj_id)))
                 .collect::<RaiseResult<_>>()?;
             let heaps: Vec<Option<&P::Heap>> = named;
             enc.encode(on, ComputeCmd::UseHeaps { heaps: &heaps })?;
@@ -498,7 +548,15 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_COMPUTE_ENCODE_START_IF => {
             let m: RgfxComputeOpEncodeStartIf = body(tag, payload)?;
-            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            // A refused buffer's start would leave its else and its end unpaired: the encoder's
+            // later ops are dropped ([`refused`]).
+            let buffer = match objs.get_buffer(m.buffer_obj_id) {
+                Err(raise) if refused::is_refused(&raise) => {
+                    marks.skip_rest();
+                    return Ok(true);
+                }
+                buffer => buffer?,
+            };
             enc.encode(
                 on,
                 ComputeCmd::EncodeStartIf {
@@ -511,7 +569,15 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_COMPUTE_ENCODE_START_WHILE => {
             let m: RgfxComputeOpEncodeStartWhile = body(tag, payload)?;
-            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            // A refused buffer's start would leave its else and its end unpaired: the encoder's
+            // later ops are dropped ([`refused`]).
+            let buffer = match objs.get_buffer(m.buffer_obj_id) {
+                Err(raise) if refused::is_refused(&raise) => {
+                    marks.skip_rest();
+                    return Ok(true);
+                }
+                buffer => buffer?,
+            };
             enc.encode(
                 on,
                 ComputeCmd::EncodeStartWhile {
@@ -650,7 +716,7 @@ mod tests {
         tag: u16,
         body: &[u8],
     ) {
-        assert!(decode_op(tag, body, dec, enc, OnFault::Return).unwrap());
+        assert!(decode_op(tag, body, dec, enc, &Marks::default(), OnFault::Return).unwrap());
     }
 
     /// Each scalar compute op drives its selector with its arguments.
@@ -885,6 +951,7 @@ mod tests {
             &[0u8; 4],
             &dec,
             &enc,
+            &Marks::default(),
             OnFault::Return,
         );
         assert!(r.is_err());
@@ -906,6 +973,7 @@ mod tests {
             &msg,
             &dec,
             &enc,
+            &Marks::default(),
             OnFault::Return,
         );
         assert!(r.is_err());
@@ -922,6 +990,7 @@ mod tests {
             RgfxComputeOpUpdateFence { fence_obj_id: 999 }.as_bytes(),
             &dec,
             &enc,
+            &Marks::default(),
             OnFault::Return,
         );
         assert!(r.is_err());
@@ -935,6 +1004,7 @@ mod tests {
             .as_bytes(),
             &dec,
             &enc,
+            &Marks::default(),
             OnFault::Return,
         );
         assert!(r.is_err());
@@ -960,6 +1030,7 @@ mod tests {
             &msg,
             &dec,
             &enc,
+            &Marks::default(),
             OnFault::Return,
         );
         assert!(r.is_err());
@@ -969,7 +1040,17 @@ mod tests {
     #[test]
     fn an_unknown_tag_is_unhandled() {
         let (_p, dec, enc) = setup();
-        assert!(!decode_op(0x2fff, &[0u8; 8], &dec, &enc, OnFault::Return).unwrap());
+        assert!(
+            !decode_op(
+                0x2fff,
+                &[0u8; 8],
+                &dec,
+                &enc,
+                &Marks::default(),
+                OnFault::Return
+            )
+            .unwrap()
+        );
     }
 
     /// Every array-tailed op decodes an empty tail (count 0) without a record.

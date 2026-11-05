@@ -1137,10 +1137,11 @@ until its close. With every chunk held, a texture create answers nil, as Metal
 answers a texture it cannot make. The host carries out a texture create only
 where its id lies in a chunk of its own context (by the object id's context);
 any other id, 0 and the limit's included, is refused before any platform call,
-as a refused create is: unanswered, and a command buffer naming the texture
-fails. Sampler states and pipeline states take no guest-picked ids (the host
-numbers them), and the bundle makes no indirect command buffers, so textures
-are the only kind with chunks.
+as a refused create is: unanswered, and an id of its own context then stands
+for a refused object, whose uses are dropped ("Guest input the host refuses").
+Sampler states and pipeline states take no guest-picked ids (the host numbers
+them), and the bundle makes no indirect command buffers, so textures are the
+only kind with chunks.
 
 **Objects go with their wrappers.** Every host object the bundle makes goes
 from the host as the app lets its wrapper go. A buffer, heap, texture, sampler,
@@ -1327,10 +1328,23 @@ timeout. A refused command buffer completes with an error status, as a buffer
 Metal could not run does: a stand-in on its queue, holding the buffer's event
 waits and signals alone, finishes in the queue's order, and its completion
 posts the values the buffer signalled its shared events to, then the buffer's
-internal-error `CB_COMPLETE`. So a buffer that names a pipeline the host
-refused, or anything else it does not hold, fails after the buffers committed
-before it, and nothing waiting for one of its events, a later buffer on the
-GPU or a guest thread, waits for good. Where there is no stand-in (a message
+internal-error `CB_COMPLETE`. So a buffer that names anything the host does
+not hold fails after the buffers committed before it, and nothing waiting for
+one of its events, a later buffer on the GPU or a guest thread, waits for good.
+An object whose create the bundle answered at the call, without the host's
+answer (a buffer, heap, texture, view, depth/stencil state, event, fence, video
+session, or a pipeline equal to an accepted one), is one the guest goes on
+naming where the host refused it, as Metal would have made it. Its id stands
+for a refused object until its destroy (the decoder's `refused`), and what
+names it is dropped, never the command buffer that names it: an op that uses
+it (a copy, a fill, an indexed or indirect draw from it, a fence update or
+wait) is dropped; a binding of it binds nil and marks its slot, and the
+encoder's draws and dispatches are dropped while a slot is marked, until the
+slot is bound again; a use list's entry of it is nil; a render pass with it as
+an attachment, and a video encoder of its session, are skipped whole; a wait
+for it as an event is dropped, and a signal of it as a shared event still
+reaches the guest's value; a create over it stands refused in turn. The
+buffer then completes as it would have. Where there is no stand-in (a message
 too short to name its queue, a queue the process does not hold), the error
 status is posted at once. Nothing in
 this lane ends the offending context or its process on malformed input. The
@@ -1580,9 +1594,9 @@ makes the variant's objects again, which can fail for want of memory; where
 the runtime's memo of compiled pipelines has let the pipeline go and its shader
 cache misses, it compiles it again, under a compile attempt's 20-second
 deadline. That refusal shows at the state's first `gpuResourceID` (as 0) and
-in the command buffers that name it, which fail on the host, instead of at the
-create. Only a create that waits for its answer would close it, at the cost
-the known creates remove.
+in the command buffers that name it, whose draws with it are dropped on the
+host ("Guest input the host refuses"), instead of at the create. Only a create
+that waits for its answer would close it, at the cost the known creates remove.
 
 | group | messages | `Platform` call |
 |---|---|---|

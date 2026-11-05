@@ -194,6 +194,13 @@ impl<P: Platform> Owned<P> {
         unsafe { self.0.as_ref() }
     }
 
+    /// Whether the entry is an object the host made, not an id that stands for a refused create
+    /// (for the tests).
+    #[cfg(any(test, feature = "testkit"))]
+    fn made(&self) -> bool {
+        !matches!(self.entry().handle, ObjHandle::Refused(_))
+    }
+
     /// The entry, out of its box.
     fn into_entry(self) -> Entry<P> {
         let this = std::mem::ManuallyDrop::new(self);
@@ -413,16 +420,33 @@ impl<P: Platform> Context<P> {
         self.tables.try_read()?.live.get(&id).map(|o| f(o.entry()))
     }
 
-    /// The ids in the table (for the tests).
+    /// The ids of the objects in the table, not those that stand for a refused create (for the
+    /// tests).
     #[cfg(test)]
     pub(crate) fn ids(&self) -> Vec<u64> {
-        self.tables.read().live.keys().copied().collect()
+        let t = self.tables.read();
+        let made = t.live.iter().filter(|(_, o)| o.made());
+        made.map(|(&id, _)| id).collect()
     }
 
-    /// How many entries the table holds (for the tests).
+    /// The ids that stand for a refused create ([`super::refused`]; for the tests).
+    #[cfg(test)]
+    pub(crate) fn refused_ids(&self) -> Vec<u64> {
+        let t = self.tables.read();
+        let refused = t.live.iter().filter(|(_, o)| !o.made());
+        refused.map(|(&id, _)| id).collect()
+    }
+
+    /// How many objects the table holds, not counting the ids that stand for a refused create
+    /// (for the tests).
     #[cfg(any(test, feature = "testkit"))]
     pub(crate) fn len(&self) -> usize {
-        self.tables.read().live.len()
+        self.tables
+            .read()
+            .live
+            .values()
+            .filter(|o| o.made())
+            .count()
     }
 
     /// How many removed entries open views keep (for the tests).

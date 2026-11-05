@@ -382,6 +382,15 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             .object_count()
     }
 
+    /// The ids that stand for a create the stage-3 decoder refused (`decode::refused`).
+    #[cfg(test)]
+    pub(crate) fn decoder_refused_ids(&self) -> Vec<u64> {
+        self.control
+            .decoders
+            .sender(None, Sinks::default())
+            .refused_ids()
+    }
+
     /// How many command queues have a per-queue ring and service thread: the tests check a
     /// `QUEUE_CREATE` with valid ring parameters made one.
     #[cfg(any(test, feature = "testkit"))]
@@ -1051,7 +1060,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let outcome = if foreign {
                     Ok(Err(DecodeError::BadReference))
                 } else {
-                    refusing(|| decoder.decode(&self.device, message))
+                    decoder.decode_refusing(&self.device, message)
                 };
                 if let Some(start) = icb_start {
                     log::debug!(
@@ -1289,9 +1298,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let decoder = self
                 .decoders
                 .sender(Some(sender_context(poster, message)), Sinks::default());
-            decoder
+            let prepared = decoder
                 .prepare_pipeline(message)
-                .map(|job| (self.pending.begin(job.obj_id), job))
+                .map(|job| (self.pending.begin(job.obj_id), job));
+            // One the bundle posted unanswered stands refused: its draws are dropped, not its
+            // command buffers (`decode::refused`). Under the reset gate, as every store is.
+            if prepared.is_err() {
+                let _carried = self.reset_gate.read();
+                if !poster.stale() {
+                    let (ty, _, obj_id) = message_identity(message);
+                    decoder.refuse(obj_id, ty);
+                }
+            }
+            prepared
         });
         let (began, job) = match prepared {
             Ok(prepared) => prepared,
@@ -1467,7 +1486,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 }
                 let mut decoder = (me.decoders)
                     .sender(Some(sender_context(&poster, &message)), me.sinks(&poster));
-                refusing(|| decoder.decode(&me.device, &message))
+                decoder.decode_refusing(&me.device, &message)
             };
             me.report(&poster, &message, outcome, false);
             log::debug!(

@@ -4737,12 +4737,14 @@ fn render_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64, event
     bytes
 }
 
-/// A command buffer the host cannot carry out, one whose draw sets a render pipeline the host
-/// refused, fails as a buffer Metal could not run does: in its queue's order, once the buffers
-/// committed before it have finished, and with the shared event values it signals posted ahead
-/// of its failure, so nothing waiting for one of them waits for good. The buffer after it runs
+/// A command buffer whose draw sets a render pipeline the host refused (a create the bundle
+/// posts unanswered, as one equal to an accepted create, "Known pipeline creates") is carried out
+/// as Metal would carry it out with the pipeline made, but for the draw, which is dropped: it
+/// completes in its queue's order, unfailed, with the shared event values it signals posted ahead
+/// of its completion, and the buffer after it runs (`decode::refused`).
 #[test]
-fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_events() {
+fn a_command_buffer_naming_a_refused_pipeline_drops_its_draw_and_completes() {
+    const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -4772,6 +4774,7 @@ fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_eve
     );
     guest.send(&device, render_pipeline_create(obj(3, 11), obj(3, 10)));
     expect_reflection(&mut guest, obj(3, 11), RGFX_PIPELINE_REFUSED);
+    assert_eq!(device.decoder_refused_ids(), [obj(3, 11)]);
 
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
     ring.send(&device, command_buffer(obj(3, 1), 100));
@@ -4780,8 +4783,7 @@ fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_eve
         render_command_buffer(obj(3, 1), 101, obj(3, 11), obj(3, 20)),
     );
     ring.send(&device, command_buffer(obj(3, 1), 102));
-    // Three buffers wait on the GPU, the refused one's stand-in among them, and nothing is
-    // answered before the first finishes.
+    // Three buffers wait on the GPU, and nothing is answered before the first finishes.
     committed(&platform, 3);
     assert!(
         !ring.has_event(),
@@ -4813,15 +4815,214 @@ fn a_command_buffer_naming_a_refused_pipeline_fails_in_order_and_signals_its_eve
             (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
             (RGFX_EVT_EVENT_SIGNALLED, obj(3, 20), 4),
             (RGFX_EVT_EVENT_SIGNALLED, obj(3, 20), 5),
-            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_INTERNAL)),
+            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_OK)),
             (RGFX_EVT_CB_COMPLETE, 102, u64::from(RGFX_CB_OK)),
         ]
     );
-    // The two buffers the GPU ran were scheduled; the refused one's stand-in posts only its
-    // completion.
+    // All three ran on the GPU; the draw with the refused pipeline did not.
     let scheduled: Vec<u64> = ring.scheduled.iter().map(|&(_, cb)| cb).collect();
-    assert_eq!(scheduled, [100, 102]);
+    assert_eq!(scheduled, [100, 101, 102]);
+    assert_eq!(platform.call_log().count(DRAW), 0);
     assert!(!ring.has_event());
+}
+
+/// The op `tag` with `body`, as a command buffer's stream holds it.
+fn op_of(tag: u16, body: &[u8]) -> (u16, Vec<u8>) {
+    (tag, body.to_vec())
+}
+
+/// An object whose posted create the host refused fails no command buffer that names it, as
+/// Metal fails none for an object it made (`decode::refused`): a pass with it as an attachment is
+/// skipped, a draw while it is bound is dropped and one after a binding of another at its slot is
+/// not, a copy from it is dropped and the fill beside it is not, a wait for an event of it is
+/// dropped, and a signal of a shared event of it still reaches the guest. A create over it stands
+/// refused in turn, and its destroy lets the id go.
+#[test]
+fn what_names_a_refused_create_is_dropped_and_its_command_buffer_completes() {
+    use reims_graphics::ops::blit::{
+        RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
+        RgfxBlitOpCopyTextureToBuffer, RgfxBlitOpFillBuffer,
+    };
+    use reims_graphics::ops::render::{
+        RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
+        RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RgfxOpDrawPrimitives, RgfxOpSetFragmentTexture,
+        RgfxOpSetRenderPipelineState,
+    };
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
+        RGFX_OP_SIGNAL_EVENT, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_RT_SIZE,
+        RGFX_RENDER_PASS_COLOR_OFFSET, RgfxOpEvent, RgfxRenderPassColorAttachment,
+        RgfxRenderPassDesc,
+    };
+    const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
+    const BIND: &str = "setFragmentTexture:atIndex:";
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, mut ring) = one_queue(&raised);
+    let first = 1 + 7 * RGFX_RESOURCE_ID_CHUNK;
+    guest.send(&device, resource_id_chunk(1, 7));
+    let (texture, refused_texture, buffer) = (obj(1, 10), obj(1, 11), obj(1, 12));
+    let (refused_event, view, pipeline) = (obj(1, 13), obj(1, 14), obj(1, 21));
+    guest.send(&device, texture_create(texture, first));
+    guest.send(&device, buffer_create(buffer));
+    make_library(&device, &mut guest, obj(1, 20));
+    guest.send(&device, render_pipeline_create(pipeline, obj(1, 20)));
+    expect_reflection(&mut guest, pipeline, RGFX_PIPELINE_OK);
+    let faults = platform.faults();
+    faults.at("MTLDevice", "newTextureWithDescriptor:", 0, Fault::Nil);
+    faults.at("MTLDevice", "newSharedEvent", 0, Fault::Nil);
+    guest.send(&device, texture_create(refused_texture, first + 1));
+    guest.send(&device, shared_event_create(refused_event, 0));
+    guest.send(
+        &device,
+        texture_view(view, refused_texture, first + 2, 80, (0, 1), (0, 1)),
+    );
+    carried_out_of(&device, &mut guest, 1);
+    assert_eq!(
+        device.decoder_refused_ids(),
+        [refused_texture, refused_event, view]
+    );
+
+    let mut attached = RgfxRenderPassDesc {
+        color_count: 1,
+        ..RgfxRenderPassDesc::default()
+    }
+    .as_bytes()
+    .to_vec();
+    attached.resize(RGFX_RENDER_PASS_COLOR_OFFSET as usize, 0);
+    attached.extend_from_slice(
+        RgfxRenderPassColorAttachment {
+            texture_obj_id: refused_texture,
+            ..RgfxRenderPassColorAttachment::default()
+        }
+        .as_bytes(),
+    );
+    let sized = RgfxRenderPassDesc {
+        flags: RGFX_PASS_FLAG_RT_SIZE,
+        render_target_width: 64,
+        render_target_height: 64,
+        ..RgfxRenderPassDesc::default()
+    };
+    let set_pipeline = RgfxOpSetRenderPipelineState {
+        pipeline_obj_id: pipeline,
+    };
+    let draw = RgfxOpDrawPrimitives {
+        primitive_type: 3,
+        vertex_start: 0,
+        vertex_count: 3,
+    };
+    let bind = |texture_obj_id| RgfxOpSetFragmentTexture {
+        texture_obj_id,
+        index: 0,
+    };
+    let event = |value| RgfxOpEvent {
+        event_obj_id: refused_event,
+        value,
+    };
+    let ops = [
+        // A pass with the refused texture as its attachment: skipped whole.
+        op_of(RGFX_OP_ENCODER_BEGIN_RENDER, &attached),
+        op_of(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            set_pipeline.as_bytes(),
+        ),
+        op_of(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()),
+        op_of(RGFX_OP_ENCODER_END, &[]),
+        // A pass that binds it: its draw is dropped until another is bound there.
+        op_of(RGFX_OP_ENCODER_BEGIN_RENDER, sized.as_bytes()),
+        op_of(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            set_pipeline.as_bytes(),
+        ),
+        op_of(
+            RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
+            bind(refused_texture).as_bytes(),
+        ),
+        op_of(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()),
+        op_of(
+            RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
+            bind(texture).as_bytes(),
+        ),
+        op_of(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()),
+        op_of(RGFX_OP_ENCODER_END, &[]),
+        // A copy from it is dropped; the fill beside it is not.
+        op_of(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+        op_of(
+            RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER,
+            RgfxBlitOpCopyTextureToBuffer {
+                source_texture_obj_id: refused_texture,
+                destination_buffer_obj_id: buffer,
+                source_size_width: 64,
+                source_size_height: 1,
+                source_size_depth: 1,
+                destination_bytes_per_row: 256,
+                destination_bytes_per_image: 256,
+                ..RgfxBlitOpCopyTextureToBuffer::default()
+            }
+            .as_bytes(),
+        ),
+        op_of(
+            RGFX_OP_BLIT_FILL_BUFFER,
+            RgfxBlitOpFillBuffer {
+                buffer_obj_id: buffer,
+                range_location: 0,
+                range_length: 0x100,
+                value: 7,
+                ..RgfxBlitOpFillBuffer::default()
+            }
+            .as_bytes(),
+        ),
+        op_of(RGFX_OP_ENCODER_END, &[]),
+        // The refused shared event: its wait is dropped, its signal reaches the guest.
+        op_of(RGFX_OP_WAIT_EVENT, event(1).as_bytes()),
+        op_of(RGFX_OP_SIGNAL_EVENT, event(2).as_bytes()),
+    ];
+    let ops: Vec<(u16, &[u8])> = ops.iter().map(|(tag, body)| (*tag, &body[..])).collect();
+    ring.send(&device, command_buffer_of(obj(1, 1), 100, &ops));
+    committed(&platform, 1);
+    platform.world().complete_all(CompleteOn::Caller);
+    let signalled = ring.event().expect("the shared event's value");
+    let signalled = RgfxEventSignalled::read_from_bytes(&signalled).unwrap();
+    assert_eq!((signalled.obj_id, signalled.value), (refused_event, 2));
+    let done = ring.event().expect("the buffer's completion");
+    let done = RgfxCbComplete::read_from_bytes(&done).unwrap();
+    assert_eq!(
+        (done.cb_obj_id, done.status, done.error_code),
+        (100, RGFX_CB_OK, 0)
+    );
+
+    let log = platform.call_log();
+    assert_eq!(
+        log.count("renderCommandEncoderWithDescriptor:"),
+        1,
+        "the pass skipped"
+    );
+    assert_eq!(log.count(DRAW), 1, "the draw while it was bound dropped");
+    let binds: Vec<Vec<Arg>> = (log.calls().into_iter())
+        .filter(|c| c.sel == BIND)
+        .map(|c| c.args)
+        .collect();
+    assert_eq!(binds.len(), 2);
+    assert_eq!(
+        binds[0][0],
+        Arg::Obj(None),
+        "the refused texture bound as nil"
+    );
+    assert_ne!(binds[1][0], Arg::Obj(None));
+    assert_eq!(log.count("fillBuffer:range:value:"), 1);
+    assert_eq!(
+        log.count(
+            "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:\
+             destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"
+        ),
+        0
+    );
+    assert_eq!(log.count("encodeWaitForEvent:value:"), 0);
+    assert_eq!(log.count("encodeSignalEvent:value:"), 0);
+
+    // Its destroy lets the id go, as any object's.
+    guest.send(&device, object_destroy(refused_texture));
+    carried_out_of(&device, &mut guest, 1);
+    assert_eq!(device.decoder_refused_ids(), [refused_event, view]);
 }
 
 /// A `TEXTURE_FROM_IOSURFACE`: a BGRA8 texture `width` pixels square at resource id

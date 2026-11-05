@@ -39,6 +39,7 @@ use reims_vgpu_core::platform::types::{
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
+use super::refused::{self, Bound, Marks, Slot, Stage};
 use super::{GraphicsDecoder, op_fault};
 
 /// Reads op body `T` from `payload`, or an exec fault when it is too short.
@@ -86,7 +87,8 @@ fn elems<T: FromBytes>(tag: u16, payload: &[u8], head: usize, count: usize) -> R
 
 /// Resolves one resource-array element: `None` for 0, else the object its
 /// [kind](reims_graphics::ops::render::RGFX_RESOURCE_KIND_BUFFER) names (a miss or an
-/// unknown kind faults).
+/// unknown kind faults); `None` too for an object whose create the host refused, which no draw
+/// reads ([`refused`]).
 fn resolve_resource<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     e: &RgfxResourceBinding,
@@ -94,80 +96,131 @@ fn resolve_resource<'a, P: Platform>(
     if e.obj_id == 0 {
         return Ok(None);
     }
-    Ok(Some(match e.kind {
-        RGFX_RESOURCE_KIND_NONE => return Ok(None),
-        RGFX_RESOURCE_KIND_BUFFER => ResourceRef::Buffer(objs.require_buffer(e.obj_id)?),
-        RGFX_RESOURCE_KIND_TEXTURE => ResourceRef::Texture(objs.require_texture(e.obj_id)?),
-        RGFX_RESOURCE_KIND_ICB => ResourceRef::Icb(objs.require_indirect_command_buffer(e.obj_id)?),
-        other => {
-            return Err(op_fault(format_args!(
-                "useResources: resource {} has unknown kind {other}",
-                e.obj_id
-            )));
+    match e.kind {
+        RGFX_RESOURCE_KIND_NONE => Ok(None),
+        RGFX_RESOURCE_KIND_BUFFER => {
+            refused::some_or_nil(objs.require_buffer(e.obj_id).map(ResourceRef::Buffer))
         }
-    }))
+        RGFX_RESOURCE_KIND_TEXTURE => {
+            refused::some_or_nil(objs.require_texture(e.obj_id).map(ResourceRef::Texture))
+        }
+        RGFX_RESOURCE_KIND_ICB => refused::some_or_nil(
+            objs.require_indirect_command_buffer(e.obj_id)
+                .map(ResourceRef::Icb),
+        ),
+        other => Err(op_fault(format_args!(
+            "useResources: resource {} has unknown kind {other}",
+            e.obj_id
+        ))),
+    }
 }
 
-/// Resolves a buffer-binding array into its objects (nil for 0) and their offsets, in
-/// order.
+/// Resolves a buffer-binding array of `stage`'s from slot `first` into its objects (nil for 0)
+/// and their offsets, in order: an object whose create the host refused is nil, and marks its
+/// slot in `marks` ([`refused`]).
 #[allow(clippy::type_complexity)] // the pair mirrors the `buffers`/`offsets` arguments
 fn resolve_buffers<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     es: &[RgfxBufferBinding],
+    (marks, stage, first): (&Marks, Stage, u64),
 ) -> RaiseResult<(Vec<Option<&'a P::Buffer>>, Vec<u64>)> {
     let mut named = Vec::with_capacity(es.len());
     let mut offsets = Vec::with_capacity(es.len());
-    for e in es {
-        named.push(objs.get_buffer(e.buffer_obj_id)?);
+    for (i, e) in (0u64..).zip(es) {
+        let slot = Slot::new(stage, Bound::Buffer, first.wrapping_add(i));
+        named.push(marks.bound(slot, objs.get_buffer(e.buffer_obj_id))?);
         offsets.push(e.offset);
     }
     Ok((named, offsets))
 }
 
-/// Resolves a texture-binding array into its objects (nil for 0), in order.
+/// Resolves a texture-binding array of `stage`'s from slot `first` into its objects (nil for
+/// 0), in order, as [`resolve_buffers`] does.
 fn resolve_textures<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     es: &[RgfxTextureBinding],
+    (marks, stage, first): (&Marks, Stage, u64),
 ) -> RaiseResult<Vec<Option<&'a P::Texture>>> {
-    es.iter()
-        .map(|e| objs.get_texture(e.texture_obj_id))
+    (0u64..)
+        .zip(es)
+        .map(|(i, e)| {
+            let slot = Slot::new(stage, Bound::Texture, first.wrapping_add(i));
+            marks.bound(slot, objs.get_texture(e.texture_obj_id))
+        })
         .collect()
 }
 
-/// Resolves a sampler-binding array into its objects (nil for 0), in order.
+/// Resolves a sampler-binding array of `stage`'s from slot `first` into its objects (nil for
+/// 0), in order, as [`resolve_buffers`] does.
 fn resolve_samplers<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     es: &[RgfxSamplerBinding],
+    (marks, stage, first): (&Marks, Stage, u64),
 ) -> RaiseResult<Vec<Option<&'a P::SamplerState>>> {
-    es.iter()
-        .map(|e| objs.get_sampler(e.sampler_obj_id))
+    (0u64..)
+        .zip(es)
+        .map(|(i, e)| {
+            let slot = Slot::new(stage, Bound::Sampler, first.wrapping_add(i));
+            marks.bound(slot, objs.get_sampler(e.sampler_obj_id))
+        })
         .collect()
 }
 
-/// Resolves a sampler-with-LOD-clamps array into its objects (nil for 0) and the min
-/// and max LOD clamps, each in order.
+/// Resolves a sampler-with-LOD-clamps array of `stage`'s from slot `first` into its objects
+/// (nil for 0) and the min and max LOD clamps, each in order, as [`resolve_buffers`] does.
 #[allow(clippy::type_complexity)] // the triple mirrors the three array arguments
 fn resolve_samplers_lod<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     es: &[RgfxSamplerLodBinding],
+    (marks, stage, first): (&Marks, Stage, u64),
 ) -> RaiseResult<(Vec<Option<&'a P::SamplerState>>, Vec<f32>, Vec<f32>)> {
     let mut named = Vec::with_capacity(es.len());
     let mut mins = Vec::with_capacity(es.len());
     let mut maxs = Vec::with_capacity(es.len());
-    for e in es {
-        named.push(objs.get_sampler(e.sampler_obj_id)?);
+    for (i, e) in (0u64..).zip(es) {
+        let slot = Slot::new(stage, Bound::Sampler, first.wrapping_add(i));
+        named.push(marks.bound(slot, objs.get_sampler(e.sampler_obj_id))?);
         mins.push(f32::from_bits(e.lod_min_clamp_bits));
         maxs.push(f32::from_bits(e.lod_max_clamp_bits));
     }
     Ok((named, mins, maxs))
 }
 
-/// Resolves a heap array into its objects (nil for 0), in order.
+/// Resolves a heap array into its objects (nil for 0, and for a heap whose create the host
+/// refused), in order.
 fn resolve_heaps<'a, P: Platform>(
     objs: &'a GraphicsDecoder<P>,
     es: &[RgfxHeapBinding],
 ) -> RaiseResult<Vec<Option<&'a P::Heap>>> {
-    es.iter().map(|e| objs.get_heap(e.heap_obj_id)).collect()
+    es.iter()
+        .map(|e| refused::or_nil(objs.get_heap(e.heap_obj_id)))
+        .collect()
+}
+
+/// Whether render op `tag` draws (or dispatches its tiles, or executes an indirect command
+/// buffer): one dropped while a slot of its encoder holds an object whose create the host
+/// refused ([`refused`]).
+pub(crate) fn draws(tag: u16) -> bool {
+    matches!(
+        tag,
+        RGFX_OP_RENDER_DRAW_PRIMITIVES
+            | RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES
+            | RGFX_OP_RENDER_DRAW_PRIMITIVES_INSTANCES
+            | RGFX_OP_RENDER_DRAW_PRIMITIVES_BASE
+            | RGFX_OP_RENDER_DRAW_PRIMITIVES_INDIRECT
+            | RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INSTANCES
+            | RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_BASE
+            | RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES_INDIRECT
+            | RGFX_OP_RENDER_DRAW_PATCHES
+            | RGFX_OP_RENDER_DRAW_PATCHES_INDIRECT
+            | RGFX_OP_RENDER_DRAW_INDEXED_PATCHES
+            | RGFX_OP_RENDER_DRAW_INDEXED_PATCHES_INDIRECT
+            | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE
+            | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION
+            | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION_INDEX
+            | RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER
+            | RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT
+    )
 }
 
 /// What the render ops' checks read of the open encoder's pass, which its
@@ -179,6 +232,8 @@ pub(crate) struct PassFacts {
     /// The offset of the last `Counting` or `Boolean` visibility result mode the pass's ops set,
     /// `None` before one ([`visibility_offset`]).
     pub(crate) result_offset: Cell<Option<u64>>,
+    /// The encoder's slots that hold an object whose create the host refused ([`refused`]).
+    pub(crate) refused: Marks,
 }
 
 /// The bytes of one visibility result.
@@ -240,7 +295,15 @@ pub(crate) fn decode_op<P: Platform>(
     match tag {
         RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => {
             let m: RgfxOpSetRenderPipelineState = body(tag, payload)?;
-            let pipeline = objs.get_render_pipeline(m.pipeline_obj_id)?;
+            let slot = Slot::state(Bound::Pipeline);
+            let pipeline = pass
+                .refused
+                .bound(slot, objs.get_render_pipeline(m.pipeline_obj_id))?;
+            // A refused pipeline is not set: the encoder's draws are dropped until the next
+            // ([`refused`]).
+            if pass.refused.holds(slot) {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 RenderCmd::SetRenderPipelineState {
@@ -250,7 +313,8 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
             let m: RgfxOpSetVertexBuffer = body(tag, payload)?;
-            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            let slot = Slot::new(Stage::Vertex, Bound::Buffer, m.index);
+            let buffer = pass.refused.bound(slot, objs.get_buffer(m.buffer_obj_id))?;
             enc.encode(
                 on,
                 RenderCmd::SetVertexBuffer {
@@ -262,7 +326,8 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_FRAGMENT_BUFFER => {
             let m: RgfxOpSetFragmentBuffer = body(tag, payload)?;
-            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            let slot = Slot::new(Stage::Fragment, Bound::Buffer, m.index);
+            let buffer = pass.refused.bound(slot, objs.get_buffer(m.buffer_obj_id))?;
             enc.encode(
                 on,
                 RenderCmd::SetFragmentBuffer {
@@ -274,7 +339,10 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE => {
             let m: RgfxOpSetFragmentTexture = body(tag, payload)?;
-            let texture = objs.get_texture(m.texture_obj_id)?;
+            let slot = Slot::new(Stage::Fragment, Bound::Texture, m.index);
+            let texture = pass
+                .refused
+                .bound(slot, objs.get_texture(m.texture_obj_id))?;
             enc.encode(
                 on,
                 RenderCmd::SetFragmentTexture {
@@ -751,6 +819,13 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER_OFFSET => {
             let m: RgfxOpSetVertexBufferOffset = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if pass
+                .refused
+                .holds(Slot::new(Stage::Vertex, Bound::Buffer, m.index))
+            {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 RenderCmd::SetVertexBufferOffset {
@@ -761,6 +836,13 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_FRAGMENT_BUFFER_OFFSET => {
             let m: RgfxOpSetFragmentBufferOffset = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if pass
+                .refused
+                .holds(Slot::new(Stage::Fragment, Bound::Buffer, m.index))
+            {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 RenderCmd::SetFragmentBufferOffset {
@@ -771,6 +853,13 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_TILE_BUFFER_OFFSET => {
             let m: RgfxOpSetTileBufferOffset = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if pass
+                .refused
+                .holds(Slot::new(Stage::Tile, Bound::Buffer, m.index))
+            {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 RenderCmd::SetTileBufferOffset {
@@ -781,6 +870,13 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER_OFFSET_ATTRIBUTE_STRIDE => {
             let m: RgfxOpSetVertexBufferOffsetAttributeStride = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if pass
+                .refused
+                .holds(Slot::new(Stage::Vertex, Bound::Buffer, m.index))
+            {
+                return Ok(true);
+            }
             enc.encode(
                 on,
                 RenderCmd::SetVertexBufferOffsetAttributeStride {
@@ -905,7 +1001,10 @@ pub(crate) fn decode_op<P: Platform>(
         // ---- Depth/stencil state and resolve textures ----
         RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE => {
             let m: RgfxOpSetDepthStencilState = body(tag, payload)?;
-            let state = objs.get_depth_stencil(m.depth_stencil_state_obj_id)?;
+            let slot = Slot::state(Bound::DepthStencil);
+            let state = pass
+                .refused
+                .bound(slot, objs.get_depth_stencil(m.depth_stencil_state_obj_id))?;
             enc.encode(
                 on,
                 RenderCmd::SetDepthStencilState {
@@ -958,7 +1057,8 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_BUFFER => {
             let m: RgfxOpSetTessellationFactorBuffer = body(tag, payload)?;
-            let buffer = objs.get_buffer(m.buffer_obj_id)?;
+            let slot = Slot::state(Bound::TessellationFactors);
+            let buffer = pass.refused.bound(slot, objs.get_buffer(m.buffer_obj_id))?;
             enc.encode(
                 on,
                 RenderCmd::SetTessellationFactorBuffer {
@@ -978,7 +1078,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexBuffers>(),
                 m.range_length as usize,
             )?;
-            let (named, offsets) = resolve_buffers(objs, &es)?;
+            let (named, offsets) =
+                resolve_buffers(objs, &es, (&pass.refused, Stage::Vertex, m.range_location))?;
             let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
@@ -1000,7 +1101,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentBuffers>(),
                 m.range_length as usize,
             )?;
-            let (named, offsets) = resolve_buffers(objs, &es)?;
+            let (named, offsets) = resolve_buffers(
+                objs,
+                &es,
+                (&pass.refused, Stage::Fragment, m.range_location),
+            )?;
             let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
@@ -1022,7 +1127,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileBuffers>(),
                 m.range_length as usize,
             )?;
-            let (named, offsets) = resolve_buffers(objs, &es)?;
+            let (named, offsets) =
+                resolve_buffers(objs, &es, (&pass.refused, Stage::Tile, m.range_location))?;
             let buffers: Vec<Option<&P::Buffer>> = named;
             enc.encode(
                 on,
@@ -1047,8 +1153,13 @@ pub(crate) fn decode_op<P: Platform>(
             let mut named = Vec::with_capacity(es.len());
             let mut offsets = Vec::with_capacity(es.len());
             let mut strides = Vec::with_capacity(es.len());
-            for e in &es {
-                named.push(objs.get_buffer(e.buffer_obj_id)?);
+            for (i, e) in (0u64..).zip(&es) {
+                let slot = Slot::new(
+                    Stage::Vertex,
+                    Bound::Buffer,
+                    m.range_location.wrapping_add(i),
+                );
+                named.push(pass.refused.bound(slot, objs.get_buffer(e.buffer_obj_id))?);
                 offsets.push(e.offset);
                 strides.push(e.stride);
             }
@@ -1076,7 +1187,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexTextures>(),
                 m.range_length as usize,
             )?;
-            let named = resolve_textures(objs, &es)?;
+            let named =
+                resolve_textures(objs, &es, (&pass.refused, Stage::Vertex, m.range_location))?;
             let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
@@ -1097,7 +1209,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentTextures>(),
                 m.range_length as usize,
             )?;
-            let named = resolve_textures(objs, &es)?;
+            let named = resolve_textures(
+                objs,
+                &es,
+                (&pass.refused, Stage::Fragment, m.range_location),
+            )?;
             let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
@@ -1118,7 +1234,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileTextures>(),
                 m.range_length as usize,
             )?;
-            let named = resolve_textures(objs, &es)?;
+            let named =
+                resolve_textures(objs, &es, (&pass.refused, Stage::Tile, m.range_location))?;
             let textures: Vec<Option<&P::Texture>> = named;
             enc.encode(
                 on,
@@ -1141,7 +1258,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexSamplerStates>(),
                 m.range_length as usize,
             )?;
-            let named = resolve_samplers(objs, &es)?;
+            let named =
+                resolve_samplers(objs, &es, (&pass.refused, Stage::Vertex, m.range_location))?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
@@ -1162,7 +1280,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentSamplerStates>(),
                 m.range_length as usize,
             )?;
-            let named = resolve_samplers(objs, &es)?;
+            let named = resolve_samplers(
+                objs,
+                &es,
+                (&pass.refused, Stage::Fragment, m.range_location),
+            )?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
@@ -1183,7 +1305,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileSamplerStates>(),
                 m.range_length as usize,
             )?;
-            let named = resolve_samplers(objs, &es)?;
+            let named =
+                resolve_samplers(objs, &es, (&pass.refused, Stage::Tile, m.range_location))?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
@@ -1204,7 +1327,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetVertexSamplerStatesLodClamps>(),
                 m.range_length as usize,
             )?;
-            let (named, mins, maxs) = resolve_samplers_lod(objs, &es)?;
+            let (named, mins, maxs) =
+                resolve_samplers_lod(objs, &es, (&pass.refused, Stage::Vertex, m.range_location))?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
@@ -1227,7 +1351,11 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetFragmentSamplerStatesLodClamps>(),
                 m.range_length as usize,
             )?;
-            let (named, mins, maxs) = resolve_samplers_lod(objs, &es)?;
+            let (named, mins, maxs) = resolve_samplers_lod(
+                objs,
+                &es,
+                (&pass.refused, Stage::Fragment, m.range_location),
+            )?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,
@@ -1250,7 +1378,8 @@ pub(crate) fn decode_op<P: Platform>(
                 size_of::<RgfxOpSetTileSamplerStatesLodClamps>(),
                 m.range_length as usize,
             )?;
-            let (named, mins, maxs) = resolve_samplers_lod(objs, &es)?;
+            let (named, mins, maxs) =
+                resolve_samplers_lod(objs, &es, (&pass.refused, Stage::Tile, m.range_location))?;
             let samplers: Vec<Option<&P::SamplerState>> = named;
             enc.encode(
                 on,

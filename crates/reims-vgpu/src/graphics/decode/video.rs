@@ -336,19 +336,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         let _ = self.shared.video.set(video);
     }
 
-    /// A hold of the session `id` names; an exec fault where it names none.
+    /// A hold of the session `id` names; an exec fault where it names none, and a refused
+    /// reference where its create was refused ([`super::refused`]).
     pub(super) fn require_video_session(&self, id: u64) -> RaiseResult<SessionHold<P>> {
         match self.named(id) {
             Some(ObjHandle::VideoSession(session)) => Ok(session.another()),
+            Some(ObjHandle::Refused(r)) => Err(r.reference(id)),
             _ => Err(bad_reference()),
         }
     }
 
     /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in; an exec
-    /// fault where `id` names no such texture.
+    /// fault where `id` names no such texture, and a refused reference where its create was
+    /// refused ([`super::refused`]).
     fn plane_of(&self, id: u64) -> RaiseResult<(PlanePlace, &P::Buffer)> {
-        let place = match self.entry(id) {
-            Some(e) if matches!(e.handle, ObjHandle::Texture(_)) => e.place,
+        let place = match self.entry(id).map(|e| (&e.handle, e.place)) {
+            Some((ObjHandle::Texture(_), place)) => place,
+            Some((ObjHandle::Refused(r), _)) => return Err(r.reference(id)),
             _ => None,
         }
         .ok_or_else(bad_reference)?;

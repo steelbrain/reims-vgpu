@@ -26,7 +26,9 @@
 //! The decoder runs under a live raise handler, as the Apple lane's command
 //! processing does: a platform raise propagates out of [`GraphicsDecoder::decode`]
 //! for the caller to catch. An op-stream reference the host cannot honour faults
-//! the exec the same way ([`bad_reference`], [`op_fault`]).
+//! the exec the same way ([`bad_reference`], [`op_fault`]), but for one of an object
+//! whose posted create the host refused, whose uses are dropped and whose command
+//! buffers go on ([`refused`]).
 //!
 //! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on their
 //! context's lane (the presents on the presents' lane, a block's pages and downloads on the
@@ -161,6 +163,7 @@ mod icb_slots_cost;
 mod lane;
 mod library;
 mod managed;
+mod refused;
 mod render;
 mod sequencer;
 mod surface_cache;
@@ -461,6 +464,9 @@ enum ObjHandle<P: Platform> {
     /// A video session ([`RGFX_CMD_VIDEO_SESSION_CREATE`]), which its command buffers' video
     /// encoders name, let go of on the video worker ([`video::SessionHold`]).
     VideoSession(video::SessionHold<P>),
+    /// What an id stands for whose posted create the host refused ([`refused`]): what names it
+    /// is dropped, not the command buffer that names it.
+    Refused(refused::Refused),
 }
 
 /// Why a message was not carried out.
@@ -1568,6 +1574,17 @@ impl<P: Platform> GraphicsDecoder<P> {
         contexts.iter().flat_map(|c| c.ids()).collect()
     }
 
+    /// The ids that stand for a refused create ([`refused`]), by context (for the tests).
+    #[cfg(test)]
+    pub(crate) fn refused_ids(&self) -> Vec<u64> {
+        let mut contexts: Vec<Arc<Context<P>>> =
+            self.shared.contexts.lock().values().cloned().collect();
+        contexts.sort_by_key(|c| c.id);
+        let mut ids: Vec<u64> = contexts.iter().flat_map(|c| c.refused_ids()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// The device caches, locked (for the tests).
     #[cfg(test)]
     pub(crate) fn caches(
@@ -1966,6 +1983,46 @@ impl<P: Platform> GraphicsDecoder<P> {
         })
     }
 
+    /// [`Self::decode`] in the lane's refusal scope ([`refusing`]), as ring 0 carries each message
+    /// out: where a create the bundle answered at the call without the host's answer is not
+    /// carried out (the platform makes nothing or dies at it, or it names an object the host
+    /// does not hold, a refused one among them), its id stands for a refused object from then on
+    /// ([`Self::refuse`]), so what names it is dropped, not the command buffers that name it.
+    pub(crate) fn decode_refusing(
+        &mut self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let outcome = refusing(|| self.decode(device, message));
+        let carried = matches!(outcome, Ok(Ok(()) | Err(DecodeError::ContextClosed)));
+        if !carried && let Some((kind, obj_id)) = refused::posted_create(message) {
+            self.refuse(obj_id, kind);
+        }
+        outcome
+    }
+
+    /// `obj_id`, made by a posted create of message type `kind` the host did not carry out,
+    /// stands for a refused object ([`refused`]) until its destroy, its next create, its
+    /// context's close or the device's reset, in place of what it named: an id of a context
+    /// other than the message's own is left as it is.
+    pub(crate) fn refuse(&self, obj_id: u64, kind: u32) {
+        if obj_id == 0 || !self.owned(obj_id) {
+            return;
+        }
+        log::debug!(
+            target: "reims_vgpu::graphics",
+            "object {obj_id:#x} stands refused (create type {kind:#x}): what names it is dropped"
+        );
+        // As a create made again names only its new texture's surface.
+        if kind == RGFX_CMD_TEXTURE_FROM_IOSURFACE {
+            self.forget_surface_texture(obj_id);
+        }
+        self.store(
+            obj_id,
+            Entry::of(ObjHandle::Refused(refused::Refused::of(kind))),
+        );
+    }
+
     /// Carries out one wire message against `device`: a create inserts the new
     /// handle (keyed by the guest-picked `obj_id`), a destroy drops it. The
     /// inner `Result` says whether the message was carried out; a platform raise
@@ -2057,8 +2114,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 // `setSignaledValue:` from the guest's CPU; the platform's value only rises, as
                 // Metal's does.
-                let Some(ObjHandle::SharedEvent(event)) = self.named(m.obj_id) else {
-                    return Ok(Err(DecodeError::BadReference));
+                let event = match self.named(m.obj_id) {
+                    Some(ObjHandle::SharedEvent(event)) => event,
+                    // One whose create the host refused: its waits on the host are dropped, and
+                    // the guest keeps its value ([`refused`]).
+                    Some(ObjHandle::Refused(r)) => {
+                        r.used(m.obj_id);
+                        return Ok(Ok(()));
+                    }
+                    _ => return Ok(Err(DecodeError::BadReference)),
                 };
                 event.set_signaled_value(m.value)?;
                 Ok(Ok(()))
@@ -3043,8 +3107,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             .collect()
     }
 
-    /// The last step of a pipeline create: stores the compiled pipeline under its id (a refused
-    /// one stores nothing).
+    /// The last step of a pipeline create: stores the compiled pipeline under its id, or, for a
+    /// refused one, what the id stands for ([`refused`]): the bundle posts a create equal to an
+    /// accepted one unanswered ("Known pipeline creates"), and its draws are then dropped, not
+    /// its command buffers.
     pub(crate) fn finish_pipeline(&self, compiled: CompiledPipeline<P>) {
         self.finish_pipeline_if(compiled, || true);
     }
@@ -3059,9 +3125,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         compiled: CompiledPipeline<P>,
         live: impl Fn() -> bool,
     ) {
-        if let Some(handle) = compiled.handle {
-            self.store_if(compiled.obj_id, Entry::of(handle), live);
-        }
+        let handle = compiled.handle.unwrap_or_else(|| {
+            ObjHandle::Refused(refused::Refused::of(match compiled.reflection.kind {
+                RGFX_PIPELINE_KIND_COMPUTE => RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                _ => RGFX_CMD_RENDER_PIPELINE_CREATE,
+            }))
+        });
+        self.store_if(compiled.obj_id, Entry::of(handle), live);
     }
 }
 
@@ -3849,7 +3919,9 @@ pub(crate) fn refusing<T>(op: impl FnOnce() -> RaiseResult<T>) -> RaiseResult<T>
 /// ([`render`], [`compute`], [`blit`]) call to turn a wire `obj_id` into a host
 /// handle. A `require_*` resolves a reference that must name an object of its kind
 /// (nil or a miss is an exec fault, [`bad_reference`]); a `get_*` resolves a
-/// nil-allowed reference (`0` is `None`, a non-zero miss is an exec fault). Each
+/// nil-allowed reference (`0` is `None`, a non-zero miss is an exec fault). An id that
+/// stands for an object whose posted create the host refused is neither: either answers
+/// [`refused::reference`], which drops what named it ([`refused`]). Each
 /// lends the table's own handle for the borrow of the decoder, which no op's encode
 /// outlives: an encode retains what it keeps, and a decoder op of 10,000 a command
 /// buffer takes no counted reference of its own ([`Handle::clone_ref`], an atomic
@@ -3865,6 +3937,7 @@ macro_rules! resolvers {
                 pub(crate) fn $req(&self, id: u64) -> RaiseResult<&P::$assoc> {
                     match self.named(id) {
                         Some(ObjHandle::$variant(h)) => Ok(h),
+                        Some(ObjHandle::Refused(r)) => Err(r.reference(id)),
                         _ => Err(bad_reference()),
                     }
                 }
@@ -3875,6 +3948,7 @@ macro_rules! resolvers {
                     }
                     match self.named(id) {
                         Some(ObjHandle::$variant(h)) => Ok(Some(h)),
+                        Some(ObjHandle::Refused(r)) => Err(r.reference(id)),
                         _ => Err(bad_reference()),
                     }
                 }
