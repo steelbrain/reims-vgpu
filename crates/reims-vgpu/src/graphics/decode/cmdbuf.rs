@@ -6108,7 +6108,8 @@ mod tests {
     /// carried out whole before them, as under one lock (docs/graphics-kext/design.md, "What a
     /// walk sees"). Destroys mid-walk, of the buffer and textures it names, and an id destroyed,
     /// made again and destroyed again, leave the walk naming the objects it began with, which are
-    /// let go of once it ends; ring 0 is not held up meanwhile.
+    /// let go of once it ends; the object made after its begin, which it cannot name, is let go of
+    /// at its destroy; ring 0 is not held up meanwhile.
     #[test]
     fn a_walk_names_what_its_table_held_at_its_begin() {
         let (p, dec) = setup();
@@ -6139,7 +6140,11 @@ mod tests {
                 assert_eq!(ring0.decode(&device, &m).unwrap(), Ok(()));
             }
             assert_eq!(ring0.object_count(), 2, "the queue and texture 4");
-            assert_eq!(kept(&ring0), 4, "kept for the walk");
+            assert_eq!(
+                kept(&ring0),
+                3,
+                "kept for the walk: 5, 2 and 3, not the 2 made after its begin"
+            );
             gate.open();
             assert_eq!(walk.join().unwrap(), Ok(()));
         });
