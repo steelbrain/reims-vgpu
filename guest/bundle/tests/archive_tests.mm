@@ -180,6 +180,18 @@ void test_archive_adding()
 	CHECK([e.localizedDescription hasPrefix:@"Tile Render Pipeline Descriptor Validation\n"]);
 	t.tileFunction = function(@"tile_k");
 	CHECK([a addTileRenderPipelineFunctionsWithDescriptor:t error:&e]);
+
+	// A mesh pipeline, with no function or with one: refused, as an x86 Mac's archive refuses it.
+	MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+	m.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	CHECK(![a addMeshRenderPipelineFunctionsWithDescriptor:m error:&e]);
+	CHECK(isArchiveError(e, MTLBinaryArchiveErrorCompilationFailure,
+	                     @"Compiling mesh pipelines for binary archives is not supported!"));
+	m.meshFunction = function(@"a");
+	e = nil;
+	CHECK(![a addMeshRenderPipelineFunctionsWithDescriptor:m error:&e]);
+	CHECK(isArchiveError(e, MTLBinaryArchiveErrorCompilationFailure,
+	                     @"Compiling mesh pipelines for binary archives is not supported!"));
 }
 
 // Looking up: what Metal keys each compile by hits or misses as Metal's does.

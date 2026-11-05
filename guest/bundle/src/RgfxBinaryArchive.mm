@@ -266,7 +266,7 @@ bool RgfxStitchedKey(MTLStitchedLibraryDescriptor *descriptor, RgfxArchiveEntry 
 	return true;
 }
 
-// A function no pipeline create looks up (a tile, object or mesh function, or one added alone):
+// A function no pipeline create looks up (a tile function, or one added alone):
 // its identity, and the formats and sample count it draws at, which tell entries apart.
 RgfxArchiveEntry recordedKey(uint8_t kind, RgfxFunction *fn, const std::vector<uint64_t> &formats,
                              NSUInteger samples)
@@ -541,33 +541,17 @@ RGFX_LOG_UNRECOGNIZED
 	return YES;
 }
 
+// A mesh pipeline: refused, with or without its functions, as an x86 Mac's archive refuses every
+// one (measured: guest/bundle/tools/oracle/oracle_names on the AMD Radeon Pro 5300M and the Intel
+// UHD Graphics 630, macOS 26.7.1). The device makes no mesh pipeline either.
 - (BOOL)addMeshRenderPipelineFunctionsWithDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
                                                error:(__autoreleasing NSError **)error
 {
-	NSError *refusal = nil;
-	if (descriptor.meshFunction == nil)
-		refusal = RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-		                        @"binary archive: a mesh pipeline descriptor with no mesh function");
-	else
-		refusal = refusalOf(descriptor.objectFunction, @"objectFunction")
-		              ?: refusalOf(descriptor.meshFunction, @"meshFunction")
-		                     ?: refusalOf(descriptor.fragmentFunction, @"fragmentFunction");
-	if (refusal != nil) {
-		if (error)
-			*error = refusal;
-		return NO;
-	}
-	if (descriptor.objectFunction != nil)
-		[self rgfxAdd:recordedKey(kRgfxArchiveObject, (RgfxFunction *)descriptor.objectFunction, {},
-		                          0)];
-	[self rgfxAdd:recordedKey(kRgfxArchiveMesh, (RgfxFunction *)descriptor.meshFunction, {}, 0)];
-	// A mesh pipeline's fragment function: kept apart from a render pipeline's, which a create
-	// looks up, as nothing looks a mesh pipeline up.
-	if (descriptor.fragmentFunction != nil)
-		[self rgfxAdd:recordedKey(kRgfxArchiveMesh, (RgfxFunction *)descriptor.fragmentFunction,
-		                          formatsOf(descriptor.colorAttachments),
-		                          descriptor.rasterSampleCount)];
-	return YES;
+	(void)descriptor;
+	if (error)
+		*error = archiveError(MTLBinaryArchiveErrorCompilationFailure,
+		                      @"Compiling mesh pipelines for binary archives is not supported!");
+	return NO;
 }
 
 - (BOOL)addFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor
