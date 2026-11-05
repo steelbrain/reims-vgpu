@@ -136,8 +136,14 @@ pub(crate) struct Cancel(AtomicU64);
 
 impl Cancel {
     /// The count's value now.
-    fn now(&self) -> u64 {
+    pub(crate) fn now(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// Whether a reset is under way, or came, since the count read `begun` ([`Self::now`]): a wait
+    /// begun then ends.
+    pub(crate) fn cut_since(&self, begun: u64) -> bool {
+        !begun.is_multiple_of(2) || self.now() != begun
     }
 
     /// A reset is under way: every wait ends, and none waits until it is done.
@@ -171,9 +177,7 @@ pub(crate) fn wait(
     let mut waited = Waited::default();
     let begun = cancel.now();
     let over = || {
-        own.is_some_and(|own| own.commit.ended.load(Ordering::SeqCst))
-            || !begun.is_multiple_of(2)
-            || cancel.now() != begun
+        own.is_some_and(|own| own.commit.ended.load(Ordering::SeqCst)) || cancel.cut_since(begun)
     };
     for (marks, seqno) in after {
         let mark = &marks.commit;

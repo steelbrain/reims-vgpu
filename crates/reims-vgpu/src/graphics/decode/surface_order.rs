@@ -603,25 +603,51 @@ impl<P: Platform> SurfaceOrder<P> {
     }
 }
 
-/// How long the host waits on the CPU, for each buffer of another queue a command buffer waits
-/// for, before work it starts off the command buffer: as long as a decode waits for its output's
-/// device cache to be filled.
-const CPU_WAIT_MS: u64 = 2000;
+/// How long each slice of the host's CPU wait for a buffer of another queue lasts
+/// ([`super::GraphicsDecoder::wait_for_order_on_cpu`]), between its looks at whether a reset of
+/// the device is under way.
+const CPU_WAIT_SLICE_MS: u64 = 100;
+
+/// How long the host waits on the CPU for a buffer of another queue before the log names the
+/// wait (diagnostics only): it waits on after.
+const CPU_WAIT_LOGGED_MS: u64 = 2000;
 
 impl<P: Platform> super::GraphicsDecoder<P> {
     /// Before the host starts work for the command buffer being walked off it, on a queue its
     /// GPU waits do not hold (a video session's decode): waits on the CPU for the buffers of other
-    /// queues it waits for ([`OrderWait`]), at most [`CPU_WAIT_MS`] each, once a command buffer. One
-    /// still not finished then is logged, and the work goes on.
+    /// queues it waits for ([`OrderWait`]), once a command buffer, as its GPU waits would hold the
+    /// work on a Mac's GPU: until each has finished, or a reset of the device comes, which ends
+    /// every wait for another queue's buffers ([`super::commit_order::Cancel`]). Each named buffer
+    /// finishes, or is signalled for, as the module doc says, so none waits for good. A wait past
+    /// [`CPU_WAIT_LOGGED_MS`] is named in the log, and again once it ends.
     pub(super) fn wait_for_order_on_cpu(&self) {
         let waits = std::mem::take(&mut *self.order_waits.borrow_mut());
+        let cancel = &self.shared.commit_cancel;
+        let begun = cancel.now();
         for w in &waits {
-            if !w.wait(CPU_WAIT_MS) {
-                log::warn!(
+            let mut waited = 0;
+            while !w.wait(CPU_WAIT_SLICE_MS) {
+                if cancel.cut_since(begun) {
+                    log::info!(
+                        target: "reims_vgpu::graphics",
+                        "surface order: a reset of the device ended the CPU wait of work started                          off a command buffer for a buffer of another queue at {}",
+                        w.value
+                    );
+                    return;
+                }
+                waited += CPU_WAIT_SLICE_MS;
+                if waited == CPU_WAIT_LOGGED_MS {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "surface order: work started off a command buffer has waited                          {CPU_WAIT_LOGGED_MS} ms on the CPU for a buffer of another queue at {},                          which has not finished; it waits on",
+                        w.value
+                    );
+                }
+            }
+            if waited >= CPU_WAIT_LOGGED_MS {
+                log::info!(
                     target: "reims_vgpu::graphics",
-                    "surface order: work started off a command buffer waited {CPU_WAIT_MS} ms on \
-                     the CPU for a buffer of another queue at {}, which has not finished; it goes \
-                     on",
+                    "surface order: the buffer of another queue at {} finished after about {waited}                      ms of a CPU wait",
                     w.value
                 );
             }
@@ -780,6 +806,62 @@ mod tests {
                 (event, c.args[1].as_u64().unwrap_or(0))
             })
             .collect()
+    }
+
+    /// Work the host starts off a command buffer (a video session's decode) waits on the CPU for
+    /// each buffer of another queue the command buffer runs after until it has finished, however
+    /// long that takes, as the buffer's GPU wait would hold the work on a Mac's GPU: past the 2 s
+    /// after which it once went on unordered. A reset of the device ends the wait.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: a thread waits, real time paces it
+    fn work_off_a_buffer_waits_on_the_cpu_until_the_buffers_it_runs_after_finish() {
+        use std::time::Duration;
+        for reset in [false, true] {
+            let mut r = rig();
+            // B's buffer names A's at seqno 4, which the host has not taken.
+            let (outcome, _) = r.commit(B, 1, &ops(Some(&[(A, 4)]), &[]));
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(r.dec.order_waits.borrow().len(), 1);
+            let (event, _) = r.dec.shared.surface_order.lock().state(A).unwrap();
+            let shared = Arc::clone(&r.dec.shared);
+            let Rig { p, dec, .. } = r;
+            let waiting = std::thread::spawn(move || {
+                dec.wait_for_order_on_cpu();
+                dec
+            });
+            // Five seconds of the platform's clock, a slice at a time.
+            for _ in 0..50 {
+                p.virtual_clock()
+                    .advance(Duration::from_millis(CPU_WAIT_SLICE_MS));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !waiting.is_finished(),
+                "the wait went on before A's buffer finished"
+            );
+            if reset {
+                shared.commit_cancel.begin();
+            } else {
+                event.set_signaled_value(4).unwrap();
+            }
+            let mut finished = false;
+            for _ in 0..2000 {
+                p.virtual_clock()
+                    .advance(Duration::from_millis(CPU_WAIT_SLICE_MS));
+                if waiting.is_finished() {
+                    finished = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(finished, "the wait did not end (reset {reset})");
+            let dec = waiting.join().unwrap();
+            assert!(dec.order_waits.borrow().is_empty());
+            if reset {
+                shared.commit_cancel.end();
+            }
+        }
     }
 
     /// A buffer of process 2 that names process 1's buffer waits for it on the GPU, on queue
