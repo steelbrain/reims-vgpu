@@ -205,8 +205,9 @@ void letGoMemory(void *memory, bool wired)
 
 // Names the pages of surface `key`'s deferred block, whose attach rgfxCacheNext or
 // rgfxCacheReleaseNext asked (kRgfxCacheAttaching): under state.lock, which it lets go around
-// the SURFACE_PAGES, and takes again. Whether the host took them.
-bool attachLocked(RgfxAccelerator *accel, uint64_t key)
+// the SURFACE_PAGES, and takes again. Whether the host took them; one not taken is logged where
+// `logged` (a caller's first naming of the block).
+bool attachLocked(RgfxAccelerator *accel, uint64_t key, bool logged)
 {
 	const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 	if (c == nullptr)
@@ -248,11 +249,28 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key)
 			letGoMemory(wire, rgfxPagesNamingWired(naming));
 		IOLockLock(state.lock);
 	}
-	if (!ok)
+	if (!ok && logged)
 		IOLog("RgfxAccelerator: IOSurface %u's deferred block 0x%llx: its pages were not "
-		      "named\n",
+		      "named: named again until the wait ends\n",
 		      surfaceId, offset);
 	return ok;
+}
+
+// Sleeps, out of state.lock, until the next naming of a deferred block's pages after `tries`
+// not taken (rgfxAttachRetryMs), or `deadline` where sooner; false, sleeping not, where
+// `deadline` has passed. Under state.lock. No wake ends the sleep early: the next naming backs
+// off whatever moves meanwhile, and what moves is read again at the wake.
+bool attachBackoff(uint32_t tries, uint64_t deadline)
+{
+	if (mach_absolute_time() >= deadline)
+		return false;
+	uint64_t until = 0;
+	clock_interval_to_deadline(rgfxAttachRetryMs(tries), kMillisecondScale, &until);
+	if (until > deadline)
+		until = deadline;
+	// An event no one wakes: the sleep ends at `until`.
+	IOLockSleepDeadline(state.lock, &tries, until, THREAD_UNINT);
+	return true;
 }
 
 static_assert(kRgfxPurgeableNonVolatile == kIOMemoryPurgeableNonVolatile, "op 7's nonvolatile");
@@ -344,6 +362,7 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	// A cached surface: the pages take what the GPU wrote, one lock asking at a time, and a
 	// read-write lock moves its CPU generation.
 	const char *waitedFor = gaveUp ? "the GPU's writes to it pending" : nullptr;
+	uint32_t attachTries = 0;
 	if (const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
 		if (!surfaceId)
 			surfaceId = c->surfaceId;
@@ -354,8 +373,17 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 		if (step == kRgfxCacheGoOn)
 			break;
 		if (step == kRgfxCacheAttach) {
-			// A deferred block's pages, named first: then a download, where the GPU wrote it.
-			if (!attachLocked(accel, key)) {
+			// A deferred block's pages, named first: then a download, where the GPU wrote it. A
+			// naming not taken is made again until the deadline: the lock never goes on over
+			// pages that hold neither the GPU's writes nor a place for the CPU's but there.
+			// One asked and not answered (kRgfxCacheAttachLate) goes on as for pages named.
+			if (attachLocked(accel, key, attachTries == 0))
+				continue;
+			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
+			if (c == nullptr || c->deferral != kRgfxCacheDeferred)
+				continue;
+			if (!attachBackoff(++attachTries, deadline)) {
+				gaveUp = true;
 				waitedFor = "its deferred block's pages not named";
 				break;
 			}
@@ -555,17 +583,29 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 	const int32_t clients = rgfxIOSurfaceClientCount(surface);
 	const int32_t retains = surface->getRetainCount();
 	RgfxReleaseAttach did = kRgfxReleaseAsIs;
+	// A naming not taken is made again, as a lock's is, until the locks' wait ends: past it the
+	// release goes with the pages unnamed, what the GPU wrote not copied into them.
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
+	uint32_t tries = 0;
 	IOLockLock(state.lock);
 	for (;;) {
 		const RgfxCacheReleaseStep step =
 		    rgfxCacheReleaseNext(state.caches, offset, clients, retains);
 		if (step == kRgfxCacheReleaseAttach) {
 			const uint64_t key = rgfxCacheAtBlock(state.caches, offset)->key;
-			attachLocked(accel, key);
+			const bool named = attachLocked(accel, key, tries == 0);
 			// Named, or asked and not answered (kRgfxCacheAttachLate): the host may map them.
 			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
-			did = c != nullptr && rgfxCacheHostPages(*c) ? kRgfxReleaseAttached
-			                                             : kRgfxReleaseUnattached;
+			const bool hostPages = c != nullptr && rgfxCacheHostPages(*c);
+			if (!named && !hostPages && c != nullptr && attachBackoff(++tries, deadline))
+				continue;
+			did = hostPages ? kRgfxReleaseAttached : kRgfxReleaseUnattached;
+			if (!named && !hostPages)
+				IOLog("RGFX: WARN: the release of IOSurface %u's deferred block 0x%llx goes on "
+				      "after %u ms with its pages not named: what the GPU wrote is not copied "
+				      "into them\n",
+				      c != nullptr ? c->surfaceId : 0, offset, state.waitMs);
 			break;
 		}
 		// A lock's attach in flight ends within its SURFACE_PAGES's answer time, and none

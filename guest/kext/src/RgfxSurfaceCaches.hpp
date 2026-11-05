@@ -39,11 +39,13 @@
 //     Found fresh, a lock waits for the host's answer to the deferral (kRgfxCacheDeferring).
 //     Deferred, a read-write lock, or a read-only one of a surface the GPU wrote, attaches the
 //     pages first (RGFX_SURFACE_PAGES_ATTACH), one lock at a time, the others waiting; then it
-//     goes on as for any block, a download among it. A read-only lock of a surface the GPU never
-//     wrote attaches nothing: a fresh page reads as zeros, as the cache does. A dormant one is
-//     kept at a client's going (op 5) while other clients are left; its release, where the GPU
-//     wrote it and the surface lives past the kext's own references, attaches its pages first,
-//     so the release copies the cache into them (rgfxCacheReleaseNext); else nothing reads them.
+//     goes on as for any block, a download among it. A naming not answered OK is made again,
+//     backing off, until the lock's wait ends (rgfxAttachRetryMs). A read-only lock of a
+//     surface the GPU never wrote attaches nothing: a fresh page reads as zeros, as the cache
+//     does. A dormant one is kept at a client's going (op 5) while other clients are left; its
+//     release, where the GPU wrote it and the surface lives past the kext's own references,
+//     attaches its pages first, so the release copies the cache into them
+//     (rgfxCacheReleaseNext), naming them again as a lock does; else nothing reads them.
 // A wait that does not end in kWaitMs goes on, as a lock waiting for a write does.
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
@@ -437,6 +439,24 @@ inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, 
 	c->downloading = false;
 	if (ok && mark > c->copied)
 		c->copied = mark;
+}
+
+// How long a lock, or the release, waits to name a deferred block's pages again after a naming
+// not answered OK (kRgfxPagesNotNamed: the surface's memory not wired, its runs not taken or not
+// written, or the host refusing them), `tries` namings made so far: from kRgfxAttachRetryFirstMs,
+// doubling to kRgfxAttachRetryMostMs. A naming that fails for a moment (the guest short of wired
+// memory, the host's views full) is made again within the lock's wait, and one that keeps failing
+// costs a dozen namings in its 2 s. The lock goes on over pages that do not hold the cache's bytes
+// only at its deadline, as each wait of a lock does.
+constexpr uint32_t kRgfxAttachRetryFirstMs = 10;
+constexpr uint32_t kRgfxAttachRetryMostMs = 320;
+
+inline uint32_t rgfxAttachRetryMs(uint32_t tries)
+{
+	uint32_t ms = kRgfxAttachRetryFirstMs;
+	for (uint32_t i = 1; i < tries && ms < kRgfxAttachRetryMostMs; i++)
+		ms *= 2;
+	return ms < kRgfxAttachRetryMostMs ? ms : kRgfxAttachRetryMostMs;
 }
 
 // The attach a lock or the release asked of surface `key` (kRgfxCacheAttach) ended as `naming`:
