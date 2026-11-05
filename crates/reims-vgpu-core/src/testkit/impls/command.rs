@@ -128,6 +128,26 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         self.device_handle()
     }
 
+    /// `None`, logging nothing, until the world splits command buffers
+    /// ([`World::split_command_buffers`]); then logged, the buffer committed as at `commit`, and a
+    /// new command buffer answered.
+    ///
+    /// [`World::split_command_buffers`]: super::super::objects::World::split_command_buffers
+    fn split(&self, on: OnFault) -> RaiseResult<Option<<FakePlatform as Platform>::CommandBuffer>> {
+        if !self.world().splits() {
+            return Ok(None);
+        }
+        let next = self.make(Policy::On(on), "split", vec![], |w| {
+            Some(w.new_obj::<kind::CommandBuffer>(Model::CommandBuffer(
+                CommandBufferModel::default(),
+            )))
+        })?;
+        if next.is_some() {
+            super::super::objects::commit_obj(self.obj());
+        }
+        Ok(next)
+    }
+
     fn encode_signal(
         &self,
         event: Option<EventRef<'_, FakePlatform>>,

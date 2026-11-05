@@ -199,4 +199,19 @@ pub trait CommandBuffer<P: Platform>: Handle {
         &self,
         desc: &ComputePassDesc,
     ) -> RaiseResult<Option<P::ComputeEncoder>>;
+    /// The platform's own, no Metal call: hands the GPU the work encoded so far, with no encoder
+    /// open, as a part of the command buffer committed on its queue now, and answers the command
+    /// buffer of the same queue that goes on from it, which the caller encodes the rest into and
+    /// commits as the last part. The parts run in their order on the queue, as the encoders of
+    /// one command buffer do; each part completes on its own, and the caller makes of them the
+    /// one command buffer's outcome: its handlers go on the last part, every part's failure is
+    /// the command buffer's. `None` where the platform keeps the command buffer whole, which it
+    /// then is, unchanged: the default, and the Metal platform's, which has nothing to gain, as
+    /// Metal's commit starts the GPU's work at once; and where a part would answer otherwise than
+    /// the whole, as the platform's docs list. Reached both under a handler and with none: `on`
+    /// says which this call is.
+    fn split(&self, on: OnFault) -> RaiseResult<Option<P::CommandBuffer>> {
+        let _ = on;
+        Ok(None)
+    }
 }

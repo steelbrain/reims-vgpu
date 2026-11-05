@@ -30,7 +30,7 @@
 use std::any::{Any, TypeId};
 use std::borrow::BorrowMut;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::sync::{Condvar, Mutex, MutexGuard};
@@ -937,6 +937,9 @@ pub struct World {
     /// The shared events' notifications not yet due, each with its event (the root of a shared
     /// copy) and value ([`notify_event`]), in the order asked for.
     notifications: Mutex<Vec<(ObjId, u64, Notification)>>,
+    /// Whether a command buffer's `split` commits it as a part and answers the next
+    /// ([`World::split_command_buffers`]).
+    splits: AtomicBool,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -972,7 +975,21 @@ impl World {
             release_holds: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
             notifications: Mutex::new(Vec::new()),
+            splits: AtomicBool::new(false),
         })
+    }
+
+    /// From now on a command buffer's `split` commits it as a part of the command buffer, as a
+    /// commit does, and answers a new command buffer that goes on from it, as a platform that
+    /// splits command buffers does (`CommandBuffer::split`); until then it answers `None`, the
+    /// default, as Metal's does, and logs nothing.
+    pub fn split_command_buffers(&self) {
+        self.splits.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a command buffer's `split` splits it ([`World::split_command_buffers`]).
+    pub fn splits(&self) -> bool {
+        self.splits.load(Ordering::SeqCst)
     }
 
     fn arc(&self) -> Arc<World> {
