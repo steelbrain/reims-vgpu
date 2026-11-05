@@ -16,7 +16,13 @@
 //!   generation, or none, the cache is filled from the pages before the buffer's work; a buffer
 //!   of the same generation decoded later waits for that fill, on any queue. One of an older
 //!   generation than the cache's (two queues' buffers committed apart and taken in the other
-//!   order) fills nothing.
+//!   order) fills nothing. A buffer's write is in the pages before a newer generation's fill
+//!   wherever a read-write lock waited for it: a process names its buffer's writes to the kext
+//!   before the commit returns, so a lock after the commit waits for them and has them
+//!   downloaded, and the download comes before the fill. A commit on one thread racing a lock of
+//!   the surface on another, which IOSurface leaves undefined, can name its write after the lock
+//!   looked: its write is in no download, and the fill of the newer generation copies the
+//!   pages, the CPU's writes, over it.
 //! - **Download.** The pages are written from the cache only at a `SURFACE_DOWNLOAD` (a CPU lock
 //!   after a GPU write), at the block's `BLOCK_RELEASE` and where the kext names the block's pages
 //!   again (`SURFACE_PAGES`), and only where a buffer that may write the surface was committed
@@ -2406,6 +2412,51 @@ mod tests {
         assert_eq!(
             (counts.fills, counts.downloads, counts.host_writes),
             (2, 0, 3)
+        );
+    }
+
+    /// A buffer's write that a read-write CPU lock waited for is in the pages before the newer
+    /// generation's fill: the lock's download copies it out of the cache, and the fill, after it
+    /// on the transfer queue, copies the pages and the CPU's writes back in. A write the kext did
+    /// not download before the lock (a commit racing the lock on another thread) is filled over,
+    /// the CPU's writes winning, and the cache, still written, is copied out at its next download
+    #[test]
+    fn a_newer_generation_fills_after_the_download_of_a_write() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        let copied = copies(&r.p.call_log().since(mark));
+        assert_eq!(copied.len(), 2, "{copied:?}");
+        let pages = copied[0].1;
+        assert_eq!(
+            copied,
+            [(cache, pages), (pages, cache)],
+            "the download, then the fill"
+        );
+        // A write at generation 1, then a buffer of generation 2 with no download between.
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, true)]);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x103, &[(BLOCK, 2, false)]);
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)),
+            [(pages, cache)],
+            "filled over"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)),
+            [(cache, pages)],
+            "still written"
         );
     }
 
