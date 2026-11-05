@@ -797,6 +797,10 @@ only where no negotiation can carry it.
   the bundle takes a Managed buffer's CPU copy from its Shared slabs, its own
   superpages among them, on every host ("Managed storage", below). Every host
   offers it, and the kext takes it.
+- Bit 23 is `SMALL_ID_CHUNKS`: ring 0 carries `RESOURCE_ID_SMALL_CHUNK`, a grant
+  of 16 texture resource ids, so the kext hands each process its ids 16 at a
+  time from the same pool ("Texture resource ids", below). Every host offers it,
+  and the kext takes it.
 - Bit 24 is `DISPLAY_COLOR`: the guest sends the display pipe's gamma tables
   and colour matrix as `DISPLAY_COLOR` parts, which the next `PRESENT_SURFACE`
   shows, and a present may keep the surface shown and change only the colour
@@ -943,7 +947,8 @@ messages change, and only for messages published before it
   the host refuses a release while an object of any context lies in the block;
 - a `BLOCK_GRANT` in the scanout's span waits for every lane: a grant takes the
   span from whoever held it, and WindowServer's contexts are granted it in turn;
-- a `RESOURCE_ID_CHUNK` another context held waits for that context's close,
+- a `RESOURCE_ID_CHUNK` or `RESOURCE_ID_SMALL_CHUNK` of ids another context
+  held waits for that context's close,
   and a context's first message for every close before it, whatever the
   context's number (the kext numbers contexts at their opens, and a process
   may post its first message after one opened later): the kext frees a closed
@@ -1122,10 +1127,17 @@ resets, still shows. Tested by
 device, whose texture ids end below 16381: Metal ends the process for a texture
 placed at 16381 or more (measured on an M4 and an M3 Max), and metal2vulkan
 imitates that. So ids are not split by slot. The kext keeps one pool for the
-guest, 255 chunks of 64 ids (chunk `k` holds `1 + 64k` to `64 + 64k`, all below
-16321), and hands a process a chunk when it asks (user-client selector 0x106),
-posting the grant (`RESOURCE_ID_CHUNK`: context, chunk) on the control ring
-before it returns, so the host has it before any create naming its ids.
+guest, the ids 1 to 16320, in 1020 small chunks of 16 (small chunk `k` holds
+`1 + 16k` to `16 + 16k`), and hands a process a chunk when it asks (user-client
+selector 0x106), posting the grant on the control ring before it returns, so
+the host has it before any create naming its ids. Where the host offers
+`SMALL_ID_CHUNKS` the chunk is one small chunk (`RESOURCE_ID_SMALL_CHUNK`:
+context, small chunk); else it is an aligned run of four, chunk `k` of 64 ids,
+`1 + 64k` to `64 + 64k` (`RESOURCE_ID_CHUNK`: context, chunk), as a host from
+before the bit takes. A process that makes a texture holds a chunk until its
+close, so 64-id chunks let 255 texture-making processes run at once, fewer
+than the 1024 contexts the GPU addresses hold (a busy desktop held 74,
+"Contexts"), where small chunks let 1020; the pool's ids are as many either way.
 The host reserves the pool's ids on its device as it makes the graphics device,
 its first call on the device (`reserve_guest_texture_ids`,
 `crates/reims-vgpu/src/graphics.rs`). Metal hands the id of a texture placed at
@@ -1144,8 +1156,8 @@ the paravirt lane reserves its placed objects as each task starts
 a type's first reservation. That would not make the two safe together: both lanes'
 guests place textures in the device's one table, at ids each picks alone. So a
 process runs one lane's device on a GPU, and today a VM has one lane or the other.
-The bundle keeps each chunk's free ids in one 64-bit mask, takes the lowest free id
-of the first chunk taken that has one, asks for a chunk only when all of its are
+The bundle keeps each small chunk's free ids in one 16-bit mask, takes the lowest
+free id of the first small chunk taken that has one, asks for a chunk only when all of its are
 in use, and gives an id back as its texture goes, after the texture's destroy
 (below), so a later create with the id follows the destroy on ring 0.
 The host names an IOSurface by every live texture over its plane 0, and shows

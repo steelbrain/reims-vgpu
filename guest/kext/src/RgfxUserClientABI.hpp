@@ -66,10 +66,12 @@ enum {
 	// waiting, its answer kept for kRgfxAccelMethodTakeAnswers, and answers no struct out; where
 	// the kext has no slot left for the answer, the create is posted and answered as without it.
 	kRgfxAccelMethodSubmit = 0x105,
-	// Gives the client's context a chunk of RGFX_RESOURCE_ID_CHUNK texture resource ids, from
-	// the guest's one pool of RGFX_RESOURCE_ID_CHUNKS: no input; out: the chunk's first id.
-	// kIOReturnNoResources once every chunk is held. The device has the grant
-	// (RESOURCE_ID_CHUNK) before it returns; the context holds the chunk until its close.
+	// Gives the client's context a chunk of texture resource ids from the guest's one pool:
+	// RGFX_RESOURCE_ID_SMALL_CHUNK of them where the kext's feature word holds
+	// RGFX_FEATURE_SMALL_ID_CHUNKS, else RGFX_RESOURCE_ID_CHUNK. No input; out: the chunk's first
+	// id. kIOReturnNoResources once every chunk is held. The device has the grant
+	// (RESOURCE_ID_SMALL_CHUNK or RESOURCE_ID_CHUNK) before it returns; the context holds the
+	// chunk until its close.
 	kRgfxAccelMethodResourceIds = 0x106,
 	// Waits for the client's command buffers to complete: in the last count this returned (0
 	// at first); out: the count now. Returns once the count is not the one given, which it

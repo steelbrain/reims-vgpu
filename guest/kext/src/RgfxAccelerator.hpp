@@ -321,8 +321,9 @@ public:
 	// they stay the device's for good, as its units do.
 	void parkClose(const void *client, int32_t late);
 	// Chunks of the texture resource ids, each owned by `owner` for context `context` and posted
-	// to the device (RESOURCE_ID_CHUNK) before takeIdChunk returns its first id; the owner's are
-	// freed after its context's close is answered.
+	// to the device (RESOURCE_ID_SMALL_CHUNK, or RESOURCE_ID_CHUNK where the guest did not take
+	// RGFX_FEATURE_SMALL_ID_CHUNKS) before takeIdChunk returns its first id; the owner's are freed
+	// after its context's close is answered.
 	IOReturn takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId);
 	void freeIdChunks(const void *owner);
 	// The owner's chunks are kept from use for good: its close was refused.

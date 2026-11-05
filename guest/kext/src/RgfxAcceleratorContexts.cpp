@@ -12,8 +12,9 @@
  *   - Chunks of the texture resource ids, on demand, from one pool for the guest: every
  *     process's textures share the host device's one space of ids, which ends below
  *     RGFX_RESOURCE_ID_LIMIT, so ids are not split by context. Each chunk is posted to the device
- *     (RESOURCE_ID_CHUNK) before the process learns of it, and the client's are freed at its
- *     close, after its CONTEXT_CLOSE is answered.
+ *     (RESOURCE_ID_SMALL_CHUNK, or RESOURCE_ID_CHUNK where the guest did not take
+ *     RGFX_FEATURE_SMALL_ID_CHUNKS: RgfxIdChunks.hpp) before the process learns of it, and the
+ *     client's are freed at its close, after its CONTEXT_CLOSE is answered.
  *   - Region blocks past RGFX_CONTEXT_ALLOCATIONS_OFFSET (rings, Shared buffers and heaps,
  *     surfaces), from a first-fit allocator over a table sorted by offset (RgfxBlockTable.hpp),
  *     each owned by the client that asked. A freed block is given out again once the device
@@ -130,9 +131,9 @@ struct ContextState {
 	UInt32 contextUnits;
 	UInt32 nextContext;
 	RgfxBlockTable blockTable;
-	// Under contextLock: the client holding each chunk of the texture resource ids, null where
-	// none does.
-	const void *idChunkOwners[RGFX_RESOURCE_ID_CHUNKS];
+	// Under contextLock: the client holding each unit of RGFX_RESOURCE_ID_SMALL_CHUNK texture
+	// resource ids, null where none does (RgfxIdChunks.hpp).
+	const void *idChunkOwners[RGFX_RESOURCE_ID_SMALL_CHUNKS];
 	// Under watchLock: the watched completion rings, and whether the framebuffer calls
 	// queueInterrupt yet.
 	IOLock *watchLock;
@@ -162,7 +163,7 @@ RgfxBlock *&blocks = state.blockTable.blocks;
 UInt64 &blocksStart = state.blockTable.start;
 UInt64 &blocksEnd = state.blockTable.end;
 thread_call_t &releaseCall = state.releaseCall;
-const void *(&idChunkOwners)[RGFX_RESOURCE_ID_CHUNKS] = state.idChunkOwners;
+const void *(&idChunkOwners)[RGFX_RESOURCE_ID_SMALL_CHUNKS] = state.idChunkOwners;
 IOLock *&watchLock = state.watchLock;
 RgfxWatchedRing *&watched = state.watched;
 UInt32 &watchedCount = state.watchedCount;
@@ -860,7 +861,8 @@ void RgfxAccelerator::parkClose(const void *client, int32_t late)
 		return;
 	const void *token = rgfxCloseToken(closeTable, static_cast<uint32_t>(late));
 	IOLockLock(contextLock);
-	const uint32_t ids = rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, client, token);
+	const uint32_t ids =
+	    rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_SMALL_CHUNKS, client, token);
 	const uint32_t held = rgfxBlockHand(blockTable, client, token);
 	const uint32_t holds = rgfxSurfaceHand(surfaceTable, client, token);
 	IOLockUnlock(contextLock);
@@ -869,7 +871,7 @@ void RgfxAccelerator::parkClose(const void *client, int32_t late)
 	const uint32_t pending = rgfxCloseLateCount(closeTable);
 	IOLockUnlock(releaseLock);
 	IOLog("RgfxAccelerator: context %u's late close holds %u blocks, %u holds of shared blocks "
-	      "and %u resource-id chunks for its answer (%u closes late)\n",
+	      "and %u units of resource ids for its answer (%u closes late)\n",
 	      closeTable.entries[late].context, held, holds, ids, pending);
 	if (answered)
 		thread_call_enter(releaseCall);
@@ -881,31 +883,33 @@ IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 
 {
 	if (!contextLock)
 		return kIOReturnNotReady;
+	// A chunk of the size the guest took: RGFX_RESOURCE_ID_SMALL_CHUNK ids where the device and
+	// the kext carry RGFX_FEATURE_SMALL_ID_CHUNKS, else RGFX_RESOURCE_ID_CHUNK.
+	const uint64_t features = featureWord();
 	IOLockLock(contextLock);
-	const int32_t taken = rgfxIdChunkTake(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, owner);
-	const UInt32 held = rgfxIdChunksHeld(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS);
+	const RgfxIdGrant g = rgfxIdChunkGrant(idChunkOwners, features, owner);
+	const UInt32 held = rgfxIdChunksHeld(idChunkOwners, RGFX_RESOURCE_ID_SMALL_CHUNKS);
 	IOLockUnlock(contextLock);
-	if (taken < 0) {
+	if (g.first < 0) {
 		IOLog("RgfxAccelerator: context %u: every resource-id chunk is held\n", context);
 		return kIOReturnNoResources;
 	}
-	const UInt32 chunk = static_cast<UInt32>(taken);
-	IOLog("RgfxAccelerator: context %u: resource-id chunk %u (%u of %u held)\n", context, chunk,
-	      held, RGFX_RESOURCE_ID_CHUNKS);
+	IOLog("RgfxAccelerator: context %u: resource-id chunk %u of %u ids (%u of %u units held)\n",
+	      context, g.chunk, g.units * RGFX_RESOURCE_ID_SMALL_CHUNK, held,
+	      RGFX_RESOURCE_ID_SMALL_CHUNKS);
 	// The device learns of the chunk before the process does, so the grant is on the control
 	// ring before any create that names one of its ids.
 	RgfxResourceIdChunk grant = {};
 	grant.context = context;
-	grant.chunk = chunk;
-	IOReturn r = postLifecycle(RGFX_CMD_RESOURCE_ID_CHUNK, &grant, sizeof(grant), 0, nullptr, 0,
-	                           nullptr, nullptr, 0);
+	grant.chunk = g.chunk;
+	IOReturn r = postLifecycle(g.type, &grant, sizeof(grant), 0, nullptr, 0, nullptr, nullptr, 0);
 	if (r != kIOReturnSuccess) {
 		IOLockLock(contextLock);
-		idChunkOwners[chunk] = nullptr;
+		rgfxIdChunkGive(idChunkOwners, static_cast<uint32_t>(g.first), g.units);
 		IOLockUnlock(contextLock);
 		return r;
 	}
-	*firstId = 1 + static_cast<UInt64>(chunk) * RGFX_RESOURCE_ID_CHUNK;
+	*firstId = g.firstId;
 	return kIOReturnSuccess;
 }
 
@@ -914,10 +918,11 @@ void RgfxAccelerator::freeIdChunks(const void *owner)
 	if (!contextLock)
 		return;
 	IOLockLock(contextLock);
-	const UInt32 freed = rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, owner, nullptr);
+	const UInt32 freed =
+	    rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_SMALL_CHUNKS, owner, nullptr);
 	IOLockUnlock(contextLock);
 	if (freed)
-		IOLog("RgfxAccelerator: %u resource-id chunks freed\n", freed);
+		IOLog("RgfxAccelerator: %u units of resource ids freed\n", freed);
 }
 
 void RgfxAccelerator::keepIdChunks(const void *owner)
@@ -926,11 +931,11 @@ void RgfxAccelerator::keepIdChunks(const void *owner)
 		return;
 	IOLockLock(contextLock);
 	const UInt32 kept =
-	    rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_CHUNKS, owner, rgfxBlockNoOwner());
+	    rgfxIdChunksHand(idChunkOwners, RGFX_RESOURCE_ID_SMALL_CHUNKS, owner, rgfxBlockNoOwner());
 	IOLockUnlock(contextLock);
 	if (kept)
-		IOLog("RgfxAccelerator: %u resource-id chunks kept from use: their context's close was "
-		      "refused\n",
+		IOLog("RgfxAccelerator: %u units of resource ids kept from use: their context's close "
+		      "was refused\n",
 		      kept);
 }
 

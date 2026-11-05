@@ -26,6 +26,8 @@ int main()
 	check(!rgfxSubmitAdmitted(RGFX_CMD_QUEUE_CREATE), "QUEUE_CREATE is not a submit message");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_CONTEXT_CLOSE), "CONTEXT_CLOSE is the kext's");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_RESOURCE_ID_CHUNK), "RESOURCE_ID_CHUNK is the kext's");
+	check(!rgfxSubmitAdmitted(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK),
+	      "RESOURCE_ID_SMALL_CHUNK is the kext's");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_BLOCK_RELEASE), "BLOCK_RELEASE is the kext's");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_BLOCK_GRANT), "BLOCK_GRANT is the kext's");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_GET_DISPLAYS), "a display command is not a submit message");
