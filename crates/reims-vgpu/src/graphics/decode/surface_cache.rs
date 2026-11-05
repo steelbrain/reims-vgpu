@@ -2732,11 +2732,19 @@ mod tests {
             let finish = scope.spawn(|| {
                 let writer = &writer;
                 caches
-                    .finish(&r.device, 1, None, writer, uses.unwrap(), &used, move || {
-                        in_commit.send(()).unwrap();
-                        let _ = wait_go.recv();
-                        writer.commit(ON)
-                    })
+                    .finish(
+                        &r.device,
+                        1,
+                        None,
+                        writer,
+                        uses.unwrap(),
+                        &used,
+                        move || {
+                            in_commit.send(()).unwrap();
+                            let _ = wait_go.recv();
+                            writer.commit(ON)
+                        },
+                    )
                     .map_err(|_| ())
             });
             committing.recv().unwrap();
@@ -3537,35 +3545,51 @@ mod tests {
         }];
         let caches = &r.dec.surface_caches;
         let (used, _, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        // The download as the decoder asks it ([`download`]), on a thread of its own: the
+        // decoder is not shared between threads, the caches are.
+        let region = Arc::clone(&r.dec.shared.region);
+        let done = Arc::new(AtomicBool::new(false));
+        let ask = || {
+            let set = Arc::clone(&done);
+            let answer = Box::new(move || set.store(true, Ordering::SeqCst));
+            caches.download(&r.device, BLOCK, region, answer, no_raise());
+        };
         let mark = r.p.call_log().mark();
         let (in_commit, committing) = std::sync::mpsc::channel();
-        let done = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let (go, wait_go) = std::sync::mpsc::channel::<()>();
             let finish = scope.spawn(|| {
                 let (cb, queue) = (&cb, &queue);
                 caches
-                    .finish(&r.device, 7, Some(queue), cb, uses.unwrap(), &used, move || {
-                        in_commit.send(()).unwrap();
-                        let _ = wait_go.recv();
-                        cb.commit(ON)
-                    })
+                    .finish(
+                        &r.device,
+                        7,
+                        Some(queue),
+                        cb,
+                        uses.unwrap(),
+                        &used,
+                        move || {
+                            in_commit.send(()).unwrap();
+                            let _ = wait_go.recv();
+                            cb.commit(ON)
+                        },
+                    )
                     .map_err(|_| ())
             });
             committing.recv().unwrap();
-            let asked = scope.spawn(|| download(&r, BLOCK));
+            let asked = scope.spawn(ask);
             std::thread::sleep(std::time::Duration::from_millis(50));
             assert!(
                 asked.is_finished(),
                 "a download waited for the writer's commit"
             );
-            let done = asked.join().unwrap();
+            asked.join().unwrap();
             assert!(
                 !done.load(Ordering::SeqCst),
                 "answered before the writer's commit"
             );
             drop(go);
             assert_eq!(finish.join().unwrap(), Ok(()));
-            done
         });
         let calls = r.p.call_log().since(mark);
         assert_eq!(copies(&calls), [(cache, pages)], "the early copy alone");
