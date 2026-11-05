@@ -44,8 +44,8 @@ setBuffer:offset:atIndex: implemented
 setBuffers:offsets:withRange: implemented
 setComputePipelineState:atIndex: implemented
 setComputePipelineStates:withRange: implemented
-setDepthStencilState:atIndex: implemented
-setDepthStencilStates:withRange: implemented
+setDepthStencilState:atIndex: metal no x86 Mac's encoder holds a depth/stencil state: the AMD 5300M's and the Intel 630's raise an unrecognized selector for every state, nil among them, answering respondsToSelector: YES (measured, tools/oracle/oracle_bundle.m argbuf.ds.tex, .texnil and .nil), as this does
+setDepthStencilStates:withRange: metal as setDepthStencilState:atIndex: for each state, which raises
 setIndirectCommandBuffer:atIndex: implemented
 setIndirectCommandBuffers:withRange: implemented
 setIntersectionFunctionTable:atIndex: partial ray tracing

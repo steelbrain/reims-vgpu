@@ -366,14 +366,16 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 		[self setComputePipelineState:pipelines[i] atIndex:range.location + i];
 }
 
-// A depth/stencil state writes its gpuResourceID, which raises an unrecognized selector, as the
-// Intel 630's encoder does under macOS 26.7.1 (oracle_bundle argbuf.ds.set and .mixed): no x86
-// Mac holds a state in an argument buffer, and the AMD 5300M ends the process earlier, at an
-// encoder of one (argbuf.ds.encoder). nil writes nothing.
+// No x86 Mac holds a depth/stencil state in an argument buffer: this raises an unrecognized
+// selector for every state, nil among them, and writes nothing, as the encoders of both x86
+// Macs do, though each answers that it responds (the AMD 5300M's and the Intel 630's under
+// macOS 26.7.1: oracle_bundle argbuf.ds.tex, .texnil and .nil; the Intel 630's encoder of a
+// depth/stencil descriptor raises at a state's gpuResourceID instead, argbuf.ds.set).
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)depthStencilState atIndex:(NSUInteger)index
 {
-	if (depthStencilState != nil)
-		[self rgfxWord:resourceId(depthStencilState.gpuResourceID) atIndex:index cmd:_cmd];
+	(void)depthStencilState;
+	(void)index;
+	[self doesNotRecognizeSelector:_cmd];
 }
 
 - (void)setDepthStencilStates:(const id<MTLDepthStencilState> __nullable[__nonnull])depthStencilStates
