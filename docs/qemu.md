@@ -315,16 +315,20 @@ is its transport:
   library itself, with no BQL: an access waits at most for the command the
   control thread is taking. A write of 0, the control ring's id, to
   DOORBELL (0x20) is taken by an ioeventfd (an eventfd on Linux, a pipe on
-  a Mac), whose file the library's control thread polls. A write of a
-  command queue's ring wakes the queue's thread, which takes its command
-  buffers.
-- **BAR 2**, 64-bit and prefetchable: the library's region, 256 MiB of
-  private anonymous memory of QEMU's process, as two RAM regions over the
-  one mapping: the control rings, below 0x20000, and the guest's
-  allocations. Only the allocations are dirty-logged (`DIRTY_MEMORY_VGA`),
-  where the guest's scanout lies; the library asks at each refresh whether
-  the guest wrote the scanout (`scanout_written`), which takes the BQL to
-  snapshot and clear that log.
+  a Mac), whose file the library's control thread polls. Every other
+  register write goes to the library through
+  `rvg_graphics_device_mmio_write_taking`: a write of a command queue's ring
+  may answer the queue's next command buffer on the vCPU, posting its
+  `CB_SUBMITTED` and raising the interrupt inside the call, and wakes the
+  queue's thread, which takes the buffer either way.
+- **BAR 2**, 64-bit and prefetchable: the library's region
+  (`rvg_graphics_device_region`), 1 GiB of private anonymous memory of
+  QEMU's process, as two RAM regions over the one mapping: the control
+  rings, below `RVG_GRAPHICS_ALLOCATIONS_OFFSET` (0x400000), and the guest's
+  allocations from there. Only the allocations are dirty-logged
+  (`DIRTY_MEMORY_VGA`), where the guest's scanout lies; the library asks at
+  each refresh whether the guest wrote the scanout (`scanout_written`),
+  which takes the BQL to snapshot and clear that log.
 - **The guest's RAM**: where every range of it is a shared file in pages of
   the host's size (the memfd of `reims-ctl`'s VMs), the library gets the
   RAM's map and the files behind it, and the GPU uses an IOSurface's own
@@ -342,6 +346,14 @@ is its transport:
   guest's tablet and keyboard through the device's console, which shows
   nothing in QEMU's own displays. Closing the window powers the VM off.
 - It has no default option ROM: `romfile=` names one.
+- **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
+  where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
+  q35 machine with the device keeps at most 1 GiB of the guest's RAM below
+  4 GiB (`-machine q35,...,max-ram-below-4g=1G`): with q35's default of
+  2 GiB there, BAR 2 gets no address and the kext finds no region
+  (docs/graphics-kext/design.md, the region; `REGION_SIZE` in
+  `crates/reims-graphics/src/device.rs`). `reims-ctl`'s VMs do not have the
+  device, so a host that adds it adds the option too.
 
 `CONFIG_REIMS_GRAPHICS` is set for every target when the library is found,
 not only the HVF and KVM targets `MAC_PVG` is limited to. A Mac builds it
@@ -349,7 +361,8 @@ into `qemu-system-x86_64` with
 `make qemu QEMU_CONFIGURE='--target-list=aarch64-softmmu,x86_64-softmmu'`
 and `make -C build/qemu qemu-system-x86_64`.
 
-**Measured** on the M3 Max, under TCG on q35, paused (`-S`):
+**Measured** on the M3 Max, under TCG on q35, paused (`-S`), when the region
+was 256 MiB:
 - headless (`REIMS_VGPU_WINDOW=0`), QMP's `query-pci` shows 1234:5247,
   class 0x0380, BAR 0 4 KiB of 32-bit memory and BAR 2 256 MiB of 64-bit
   prefetchable memory; `system_reset` and `quit` exit 0;
