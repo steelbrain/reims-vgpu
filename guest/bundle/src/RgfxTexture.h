@@ -140,14 +140,17 @@ NS_ASSUME_NONNULL_BEGIN
 void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor);
 
 /// Ends the process, with Metal's words, where `minimumLinearTextureAlignmentForPixelFormat:` ends
-/// it on the x86-64 Macs: at each of 105 of the SDK's pixel formats, alike on the AMD 5300M and the
-/// Intel 630 under macOS 26.7.1 with no validation layer (oracle_caps formats): the
-/// block-compressed and 4:2:2 formats ("Linear textures do not support compressed pixel
-/// formats"), the depth and stencil ones ("... depth/stencil pixel formats"), and the ones the
-/// device lacks, which Metal names MTLPixelFormatInvalid (sRGB R8 and RG8, the three-channel
-/// formats, PVRTC, EAC, ETC2, ASTC, the packed 16-bit ones, D24S8 and X24S8 as the lane answers
-/// no Depth24Stencil8, Unspecialized and the XR10 formats). It returns for any other format,
-/// those the oracles answer 256 for and those no oracle measured.
+/// it on the x86-64 Macs, and returns for the 64 raw formats both answer (256), alike on the AMD
+/// 5300M and the Intel 630 under macOS 26.7.1 with no validation layer: of every raw value from 0
+/// to 799, and 1000, 1023, 4096 and 65535 (oracle_bundle linalign), they answer 46 of the SDK's
+/// formats and 18 of no name there (84, 85, 300 to 304, 313 to 315, 323 to 325, 556, 586, 587, 628
+/// and 629), and end the process at every other: the block-compressed and 4:2:2 formats ("Linear
+/// textures do not support compressed pixel formats"), the depth and stencil ones ("...
+/// depth/stencil pixel formats"), and every other value, a format the device lacks, which Metal
+/// names MTLPixelFormatInvalid (Invalid itself, sRGB R8 and RG8, the three-channel formats, PVRTC,
+/// EAC, ETC2, ASTC, the packed 16-bit ones, D24S8 and X24S8 as the lane answers no
+/// Depth24Stencil8, as the Intel 630 does, Unspecialized, the XR10 formats, the Y'CbCr ones, and
+/// values no format has).
 void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
 
 /// Ends the process, with Metal's words, where newTextureWithDescriptor:iosurface:plane: ends it on

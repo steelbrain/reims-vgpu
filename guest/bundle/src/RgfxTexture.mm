@@ -593,11 +593,16 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
 {
 	const uint64_t f = format;
 	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	const bool answered =
+	    f == 1 || f == 10 || in(12, 14) || f == 20 || in(22, 25) || f == 30 || in(32, 34) ||
+	    f == 43 || in(53, 55) || f == 60 || in(62, 65) || in(70, 74) || f == 80 || f == 81 ||
+	    f == 84 || f == 85 || in(90, 94) || in(103, 105) || f == 110 || in(112, 115) ||
+	    in(123, 125) || in(300, 304) || in(313, 315) || in(323, 325) || f == 556 || f == 586 ||
+	    f == 587 || f == 628 || f == 629;
+	if (answered)
+		return;
 	const bool compressed = in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241);
 	const bool depth = f == 250 || f == 252 || f == 253 || f == 260 || f == 261;
-	const bool lacked = rgfxDeviceLacks(f);
-	if (!compressed && !depth && !lacked)
-		return;
 	RgfxMetalAssertionFailed("-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
 	                         compressed ? @"Linear textures do not support compressed pixel formats"
 	                         : depth    ? @"Linear textures do not support depth/stencil pixel formats"

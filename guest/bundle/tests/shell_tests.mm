@@ -1368,6 +1368,12 @@ static int dies_case(const char *name)
 		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatASTC_4x4_LDR);
 	if (std::strcmp(name, "linear-alignment-d24s8") == 0)
 		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatDepth24Unorm_Stencil8);
+	if (std::strcmp(name, "linear-alignment-invalid") == 0)
+		rgfxEndAtUnalignableLinearFormat(MTLPixelFormatInvalid);
+	if (std::strcmp(name, "linear-alignment-ycbcr") == 0)
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(500));
+	if (std::strcmp(name, "linear-alignment-unnamed") == 0)
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(4096));
 	// A view of test_texture_views' texture: a Private 2D array of four slices and seven levels,
 	// of usage 0x17, in RGBA8Unorm.
 	auto viewOf = [&](MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices,
@@ -1575,9 +1581,9 @@ void test_shared_heaps_and_cpu_depth_textures_end_the_process()
 }
 
 // minimumLinearTextureAlignmentForPixelFormat: ends the process with Metal's words where both x86
-// Macs' Metal does (oracle_caps formats: compressed and 4:2:2, depth and stencil, and the formats
-// the device lacks, named Invalid), and answers every other format, those of 256 and those no
-// oracle measured.
+// Macs' Metal does (oracle_bundle linalign, raw values 0 to 799 and four past them: compressed and
+// 4:2:2, depth and stencil, and every other value the device lacks, named Invalid: Invalid
+// itself, the Y'CbCr formats, values no format has), and answers the 64 formats both answer.
 void test_unalignable_linear_formats_end_the_process()
 {
 	const char *const kWhere = "-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]: failed "
@@ -1593,11 +1599,15 @@ void test_unalignable_linear_formats_end_the_process()
 	          (std::string(kWhere) + "MTLPixelFormatInvalid is not supported on this device.'")
 	              .c_str());
 	checkDies("linear-alignment-d24s8", "MTLPixelFormatInvalid is not supported on this device.'");
+	checkDies("linear-alignment-invalid", "MTLPixelFormatInvalid is not supported on this device.'");
+	checkDies("linear-alignment-ycbcr", "MTLPixelFormatInvalid is not supported on this device.'");
+	checkDies("linear-alignment-unnamed", "MTLPixelFormatInvalid is not supported on this device.'");
 	const uint64_t answered[] = {1,  10, 12, 13, 14, 20, 22, 23, 24, 25, 30, 32, 33, 34, 43,  53,
 	                             54, 55, 60, 62, 63, 64, 65, 70, 71, 72, 73, 74, 80, 81, 90,  91,
 	                             92, 93, 94, 103, 104, 105, 110, 112, 113, 114, 115, 123, 124, 125,
-	                             // unmeasured: Invalid, and the Y'CbCr formats
-	                             0, 500, 501};
+	                             // of no name in the SDK
+	                             84, 85, 300, 301, 302, 303, 304, 313, 314, 315, 323, 324, 325, 556,
+	                             586, 587, 628, 629};
 	for (uint64_t f : answered) {
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f));
 		g_checks++;

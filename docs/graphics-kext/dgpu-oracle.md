@@ -436,12 +436,16 @@ X24S8 on AMD only). Metal asserts, ending the process, at the create of every AS
 and PVRTC format, B5G6R5, A1BGR5, ABGR4, R8Unorm_sRGB, RG8Unorm_sRGB and the XR10 formats
 (552-555), and at a 4x MSAA BGR5A1 or RGB9E5 texture. `minimumTextureBufferAlignmentForPixelFormat:`
 answers on x86 for every format (the format's bytes per pixel, or a compressed block's), where
-the M3 asserts for compressed and depth ones. Our device makes ASTC and the packed formats (m2v),
+the M3 asserts for compressed and depth ones. `minimumLinearTextureAlignmentForPixelFormat:`
+(`oracle_bundle linalign`, every raw value from 0 to 799 and 1000, 1023, 4096 and 65535) answers 256
+for the same 64 values on both, 46 of the SDK's formats and 18 it has no name for, and ends the
+process at every other (compressed, depth and stencil, else MTLPixelFormatInvalid; D24S8 and X24S8
+are depth on AMD, Invalid on Intel); ours does the same, D24S8 as Intel. Our device makes ASTC and the packed formats (m2v),
 which no x86 Mac does; with no Apple family claimed, frameworks should not ask for them.
 
 **Relaxation: none** for performance. Two answers help the host, and the lane gives both, as
 choices inside the envelope *(class 2)*: `minimumLinearTextureAlignmentForPixelFormat:` and the
-SPI linear alignments 256 for every format, as both x86 GPUs answer, which suits the Vulkan
+SPI linear alignments 256 for every format they answer, as both x86 GPUs answer, which suits the Vulkan
 hosts' linear images (4ee4bcaf0, 4a329e614); and `maxBufferLength` at most three quarters of
 `recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
 
