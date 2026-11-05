@@ -65,28 +65,29 @@
 #                 it (a fix's proof), without making it the lane's tip: published-last stays, so a
 #                 probe round's tip stays the lane's (probe-batch.sh --tip SHA runs a round on REV)
 #
-# What it runs, the Mac's leg beside the lane host's build:
-#   Mac:  the guest kexts, bundle and tools (lane-gate/guest: guest-run.sh's payload); then
-#         `make -C guest/kext check` against the guest release's KDK and OpenCore's linker,
-#         the kext's, bundle's and RgfxGate's tests, `cargo fmt --all --check`, and the cargo
-#         tests the change reaches (the lane's always, plus every workspace package with a file
-#         changed since the baseline and the packages that depend on it), the GPU's under the
-#         Mac's GPU lock, compared with the baseline's known failures;
-#   host: the candidate's library dist, option ROMs and QEMU (lane-gate/msi-build.sh), and its
-#         SIP-on OpenCore image (the loader built for its ReimsGraphics, its kexts, and RgfxGate
-#         carrying its bundle, lane-gate/msi-image.sh);
+# What it runs: the Mac builds the guest's side, and the lane host runs the rest as potluck jobs
+# (potluck's lease is the lock), dispatched from a throwaway commit of the run's own (do_ship):
+#   Mac:  the guest kexts, bundle and tools (lane-gate/guest: guest-run.sh's payload), and the
+#         loader built for the candidate's ReimsGraphics (lane-gate/mac-loader.sh). The Mac's
+#         checks (`make -C guest/kext check`, the kext's, bundle's and RgfxGate's tests, `cargo fmt
+#         --all --check` and the cargo tests the change reaches) do not run as potluck jobs yet:
+#         a gate runs with --skip mac;
+#   host: one job with no GPU (lane-gate/msi-job.sh build): the candidate's library dist, option
+#         ROMs and QEMU (lane-gate/msi-build.sh), and its SIP-on OpenCore image (the Mac's loader
+#         kexts and RgfxGate carrying its bundle, lane-gate/msi-image.sh), and publishing;
 #   boot: the correctness boot, which decides: one cold boot on overlays (lane-gate/msi-boot.sh,
-#         through the host's rgk-boot2.sh) sharing the GPU with other VMs, running the guest's
-#         checks (lane-gate/guest/guest-run.sh): the lane's correctness sweep, the H.264 and HEVC
-#         decode sets against their MD5s, Safari's WebGL readPixels, present_probe's answers
-#         full-screen and windowed, and the desktop's state (SIP on, the kexts loaded and bound,
-#         the bundle installed, the Metal device ours, WindowServer up throughout, no new crash
-#         report, and the guest's capture of its screen); and the host log's fatal lines and
+#         through lane-gate/msi-launch.sh), a job holding the 5080 and the whole host
+#         (--exclusive), after running builds end and the CPU package cools below 80 C, running
+#         the guest's checks (lane-gate/guest/guest-run.sh): the lane's correctness sweep, the
+#         H.264 and HEVC decode sets against their MD5s, Safari's WebGL readPixels, present_probe's
+#         answers full-screen and windowed, and the desktop's state (SIP on, the kexts loaded and
+#         bound, the bundle installed, the Metal device ours, WindowServer up throughout, no new
+#         crash report, and the guest's capture of its screen); and the host log's fatal lines and
 #         display updates.
-#   bench: the bench leg, which reports and never decides: a second cold boot holding the GPU
-#         alone (RGK_EXCLUSIVE) for at most HOLD_S seconds, running the GPU benchmark, the
-#         on-screen benchmark, present_probe and the timed decodes, with QEMU's CPU and the host's
-#         display updates, each number against the baseline's with its noise band.
+#   bench: the bench leg, which reports and never decides: a second cold boot, a job holding the
+#         5080 and the host alone the same way, for at most HOLD_S seconds, running the GPU
+#         benchmark, the on-screen benchmark, present_probe and the timed decodes, with QEMU's CPU
+#         and the host's display updates, each number against the baseline's with its noise band.
 # Then lane-gate/report.py writes the run's report.txt and results.json: PASS, FAIL or SKIP for
 # every item (KNOWN for a failure the known-failures list, KNOWN_FAILS, matches exactly, with its
 # hits across runs in known-hits.tsv), and each number against the baseline. Exit 0 when the run passed, 1 when a check
@@ -206,7 +207,6 @@ step() {
   fi
   return $rc
 }
-msi() { ssh -o BatchMode=yes "$MSI" "$@"; }
 skipped() { [[ " $skip " == *" $1 "* ]]; }
 
 # --- the tree ---------------------------------------------------------------------------------
@@ -405,139 +405,195 @@ mac_checks() {
   return $ok
 }
 
-# --- the lane host ----------------------------------------------------------------------------
+# --- the lane host: potluck jobs ---------------------------------------------------------------
+#
+# Everything on the lane host runs as potluck jobs (potluck's lease is the lock), dispatched from
+# a throwaway commit the gate makes for the run (do_ship): its parent is the candidate, and its
+# tree is lg/ alone, the gate's host scripts and what the Mac built (msi-job.sh says what). The
+# commit is on its own branch, steelbrain/lane-gate-ship-RUNID, checked out in its own worktree,
+# ~/.cache/lane-gate-ship/RUNID, which the dispatches run from. The host build is one job with no
+# GPU (msi-job.sh build), whose workspace is held for the boots; each boot is a job in that
+# workspace with the 5080 and the whole host (--exclusive). Both go after the run: the workspace
+# released, the worktree and the branch removed (pl_cleanup).
 
-do_ship() {  # the gate's own scripts, which the host's steps run
-  # The host keeps the newest five runs' files (each holds a QEMU binary and an image), and any
-  # run a boot used in the last two hours (a detached bench leg may still wait its turn).
-  msi "mkdir -p '$MR/bin' && ls -1dt '$MSI_GATE/runs'/*/ | tail -n +6 | while read -r d; do
-    [ -n \"\$(find \"\$d\" -mmin -120 -print -quit)\" ] || rm -rf \"\$d\"; done"
-  # Each script replaces the old one by a rename, never in place: a detached bench leg may be
-  # running the old one, and bash reads a script as it runs it.
-  msi "rm -rf '$MR/bin/.incoming' && mkdir -p '$MR/bin/.incoming'"
-  scp -q "$L/msi-build.sh" "$L/msi-image.sh" "$L/msi-boot.sh" "$L/msi-xid.sh" "$L/msi-capture.py" "$L/msi-appload.sh" "$L/msi-publish.sh" "$L/msi-drag.py" "$L/reps.py" "$L/gpuload.c" "$L/gpuload.comp" \
-    "$SRC/scripts/internal/opencore-add-kexts.sh" "$MSI:$MR/bin/.incoming/"
-  msi "cd '$MR/bin/.incoming' && for f in *; do mv -f \"\$f\" ../; done && cd .. && rmdir .incoming"
-  # The app load's tools as rgk-ctx-slots has them now, copied (msi-appload.sh), and their hash.
-  msi "a=\${APPLOAD_TOOLS:-\$HOME/.cache/rgk-ctx-slots-msi/appload/tools}; rm -rf '$MR/bin/appload-tools.new' &&
-    if [ -f \"\$a/analyze-load.py\" ]; then cp -r --reflink=auto \"\$a\" '$MR/bin/appload-tools.new' &&
-      rm -rf '$MR/bin/appload-tools' && mv '$MR/bin/appload-tools.new' '$MR/bin/appload-tools' &&
-      (cd '$MR/bin/appload-tools' && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16) > '$MR/bin/appload-tools.hash'; fi"
+SHIP_WT=$HOME/.cache/lane-gate-ship/$runid
+SHIP_BRANCH=steelbrain/lane-gate-ship-$runid
+PL_NODE=${POTLUCK_MSI_NODE:-msi-laptop}
+PL_GPU=${POTLUCK_MSI_GPU:-5080}
+# A landed car's checks go ahead of other waiting jobs (a car's checks go first on msi).
+PL_PRIO=$( ((landed)) && echo 4 || echo 3)
+
+# pl_run NAME DISPATCH-OPTION...: dispatches a job from the run's worktree, waits for it with its
+# output, and leaves the job's id in RUN/job-NAME; its status is the job's exit.
+pl_run() {
+  local name=$1 out job
+  shift
+  out=$(cd "$SHIP_WT" && potluck dispatch --json "$@") || { echo "potluck dispatch: $out"; return 2; }
+  job=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["job"])' <<< "$out")
+  echo "$job" > "$RUN/job-$name"
+  echo "potluck job $job"
+  (cd "$SHIP_WT" && potluck wait "$job")
 }
-do_corpus() {  # the decode streams and references, copied again wherever their source changed
-  local names odd
-  names=$(cat "$L/guest/h264.list" "$L/guest/hevc.list" | awk '!/^#/ && NF {print $1}')
-  odd=$(cat "$L/guest/h264-odd.list" "$L/guest/hevc-odd.list" | awk '!/^#/ && NF {print "odd/" $1}')
-  msi bash -s -- "$MSI_GATE/corpus" "$MSI_CORPUS_SRC" "${MSI_CORPUS_ODD:-}" $names $odd << 'EOF'
-set -euo pipefail
-dst=$1 src=$2 oddsrc=$3; shift 3
-mkdir -p "$dst/odd"
-for s in "$@"; do
-  from=$src/$s
-  [[ $s == odd/* ]] && from=$oddsrc/${s#odd/}
-  for f in "$s" "${s%.*}.md5"; do
-    g=$(dirname "$from")/$(basename "$f")
-    cmp -s "$g" "$dst/$f" || { cp --reflink=auto "$g" "$dst/$f" && echo "copied $f"; }
-  done
-done
-cd "$dst" && find . -type f ! -name MANIFEST | sort | xargs sha256sum > MANIFEST &&
-  echo "corpus $(sha256sum < MANIFEST | cut -c1-16), $(find . -type f | wc -l) files"
-EOF
+# pl_workspace JOB: the job's workspace.
+pl_workspace() {
+  potluck status --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("running", "recent", "queued"):
+    for j in d.get(k) or []:
+        if j.get("id") == sys.argv[1] and j.get("workspace"):
+            print(j["workspace"]); sys.exit(0)
+sys.exit(1)' "$1"
 }
-do_stage() {
-  msi "rm -rf '$MSI_GATE/stage' && mkdir -p '$MSI_GATE/stage'"
-  git -C "$TREE" archive --format=tar "$sha" -- . ':(exclude)tests/suite/expected' |
-    msi "tar -C '$MSI_GATE/stage' -xmf -"
-  local qc
-  qc=$(git -C "$TREE" ls-tree "$sha" vendor/qemu | awk '{print $3}')
-  [[ -n $qc ]]
-  echo "$qc" > "$ART/qemu-commit"
-  if ! msi "test -f '$MSI_GATE/qemu/$qc/src/configure'"; then
-    git -C "$QEMU_REPO" cat-file -e "$qc^{commit}" || { echo "vendor/qemu's $qc is not in $QEMU_REPO"; exit 1; }
-    git -C "$QEMU_REPO" archive --format=tar "$qc" | msi "mkdir -p '$MSI_GATE/qemu/$qc/src' && tar -C '$MSI_GATE/qemu/$qc/src' -xmf -"
-  fi
+pl_cleanup() {
+  local ws
+  ws=$(cat "$RUN/workspace" 2> /dev/null || true)
+  [[ -z $ws ]] || potluck release "$ws" > /dev/null 2>&1 || true
+  [[ ! -e $SHIP_WT ]] || git -C "$SRC" worktree remove --force "$SHIP_WT" || true
+  git -C "$SRC" branch -q -D "$SHIP_BRANCH" 2> /dev/null || true
+  say "  potluck: released ${ws:-no workspace}; removed $SHIP_WT and $SHIP_BRANCH"
 }
-do_msi_build() {
-  local qc
-  qc=$(cat "$ART/qemu-commit")
-  # Every build on the lane host waits for host quiet (build-quiet.sh): never beside a measured boot.
-  msi "bash '$MSI_RGK_RUN/build-quiet.sh' -- bash '$MR/bin/msi-build.sh' '$MSI_GATE' '$MSI_GATE/tree' '$MSI_GATE/stage' '$qc' '$MSI_QEMU_SUBPROJECTS'" | tee "$RES/msi-build.txt"
-  grep -q MSI_BUILD_OK "$RES/msi-build.txt"
-  local q r
-  q=$(awk '$1 == "BUILT" && $2 == "qemu" {print $3}' "$RES/msi-build.txt")
-  r=$(awk '$1 == "BUILT" && $2 == "rom" {print $3}' "$RES/msi-build.txt")
-  # QEMU finds its firmware and option ROMs (kvmvapic.bin, efi-virtio.rom) in qemu-bundle/ beside
-  # its binary: the build's bundle holds links into the commit's source tree, which stays.
-  msi "cp --reflink=auto '$q' '$MR/qemu-system-x86_64' && cp '$r' '$MR/ReimsGraphics.rom' &&
-    rm -rf '$MR/qemu-bundle' && mkdir -p '$MR/qemu-bundle/usr/local/share' &&
-    cp -a \"\$(dirname '$q')/qemu-bundle/usr/local/share/qemu\" '$MR/qemu-bundle/usr/local/share/' &&
-    test -e '$MR/qemu-bundle/usr/local/share/qemu/efi-virtio.rom'"
-}
-do_loader() {
-  local tag=gate-$runid
-  msi "rm -rf '$MR/kexts' '$MSI_RGK_RUN/loader-fix/kexts-$tag' '$MSI_RGK_RUN/loader-fix/oc-$tag.qcow2'"
-  rm -rf "$HOME/.cache/rgk-run-mac/loader-$tag"
-  HOST=$MSI OCADD=${MR#/home/*/}/bin/opencore-add-kexts.sh bash "$LOADER_FOR" "$ART/ReimsGraphics.kext" "$tag"
-  # The builder's own image (its non-SIP base) is not booted; its kexts go into the run.
-  msi "mv '$MSI_RGK_RUN/loader-fix/kexts-$tag' '$MR/kexts' && rm -f '$MSI_RGK_RUN/loader-fix/oc-$tag.qcow2'"
-  rm -rf "$HOME/.cache/rgk-run-mac/loader-$tag"
-}
-do_image() {
-  msi "rm -rf '$MR/RgfxGate.kext'"
-  scp -q -r "$ART/RgfxGate.kext" "$MSI:$MR/"
-  msi "bash '$MR/bin/msi-image.sh' '$MR/bin/opencore-add-kexts.sh' '$MSI_BASE_OC' '$MR/oc.qcow2' '$MR/kexts' '$MR/RgfxGate.kext'"
-}
-msi_leg() {
-  step stage do_stage && step msi-build do_msi_build
-}
-image_leg() {
-  [[ -z $image ]] || return 0
-  step loader do_loader && step image do_image
+
+do_loader() {  # the loader that matches the candidate's ReimsGraphics, built here (mac-loader.sh)
+  rm -rf "$ART/kexts"
+  bash "$L/mac-loader.sh" "$ART/ReimsGraphics.kext" "$ART/loader"
+  mv "$ART/loader/kexts" "$ART/kexts"
+  rm -rf "$ART/loader"
 }
 
 # The paths whose changes reach the image or the host build.
 PUBLISHED_PATHS=(guest/kext guest/bundle guest/rgfxgate crates firmware vendor/qemu xtask Cargo.toml Cargo.lock)
-do_publish() {
-  local last short qc m2v
+# Whether the run publishes the tip (--publish): not where nothing the image or the host carries
+# changed since the last commit the gate published, unless --probe-tip.
+publish_wanted() {
+  ((publish)) && [[ -z $image ]] || return 1
+  local last
   last=$(cat "$GH/published-last" 2> /dev/null || true)
   if ((!probe_tip)) && [[ -n $last ]] && git -C "$SRC" cat-file -e "$last^{commit}" 2> /dev/null &&
     git -C "$SRC" diff --quiet "$last" "$sha" -- "${PUBLISHED_PATHS[@]}"; then
-    echo "NOT_PUBLISHED: nothing the image or the host carries changed since ${last:0:9}, whose they are"
-    return 0
+    echo "NOT_PUBLISHED: nothing the image or the host carries changed since ${last:0:9}, whose they are" > "$RUN/not-published"
+    return 1
   fi
-  short=${sha:0:9}
-  qc=$(cat "$ART/qemu-commit")
+}
+
+# The run's commit: lg/ holds the gate's host scripts (bin/), what the Mac built (ship/), and the
+# run's settings (run.env); its parent is the candidate. Checked out in SHIP_WT on SHIP_BRANCH.
+do_ship() {
+  local S=$ART/ship qc m2v cdhash pub=0 doimg=1 gd idx tree commit
+  rm -rf "$S" && mkdir -p "$S/lg/bin" "$S/lg/ship"
+  find "$L" -maxdepth 1 -type f -exec cp -p {} "$S/lg/bin/" \;
+  cp -p "$SRC/scripts/internal/opencore-add-kexts.sh" "$S/lg/bin/"
+  # The guest runner and its files as the gate has them now, and the sweep's case order from its
+  # last full run (guest-run.sh runs the cases a crash cut off one by one in that order), and the
+  # streams to check again (decode-repeat.txt, "SET STREAM N" a line), where the gate has any.
+  cp -pR "$ART/payload" "$S/lg/ship/payload"
+  cp -p "$L/guest/"* "$S/lg/ship/payload/"
+  [[ ! -s $GH/sweep-cases.txt ]] || cp "$GH/sweep-cases.txt" "$S/lg/ship/payload/"
+  rm -f "$S/lg/ship/payload/decode-repeat.txt"
+  [[ ! -s $GH/decode-repeat.txt ]] || cp "$GH/decode-repeat.txt" "$S/lg/ship/payload/"
+  cp -p "$ART/reims-graphics.bundle.tgz" "$S/lg/ship/"
+  if [[ -z $image ]]; then
+    cp -pR "$ART/kexts" "$S/lg/ship/kexts"
+    cp -pR "$ART/RgfxGate.kext" "$S/lg/ship/RgfxGate.kext"
+  else
+    doimg=0
+  fi
+  # vendor/qemu's commits the lane host's seed repository lacks, as a git bundle (a few KiB).
+  qc=$(git -C "$TREE" ls-tree "$sha" vendor/qemu | awk '{print $3}')
+  [[ -n $qc ]]
+  echo "$qc" > "$ART/qemu-commit"
+  local qg qb
+  qg=$(git -C "$QEMU_REPO" rev-parse --absolute-git-dir)
+  qb=$(mktemp -d /tmp/lg-qemu-bundle.XXXXXX)
+  git init -q --bare "$qb"
+  echo "$qg/objects" > "$qb/objects/info/alternates"
+  git -C "$qb" update-ref refs/heads/lane-gate "$qc" || { echo "vendor/qemu's $qc is not in $QEMU_REPO"; rm -rf "$qb"; return 1; }
+  local nots=()
+  for c in ${MSI_QEMU_HAVE:-}; do git -C "$qb" cat-file -e "$c^{commit}" 2> /dev/null && nots+=("^$c") || true; done
+  if [[ -n $(git -C "$qb" rev-list -1 refs/heads/lane-gate ${nots[@]+"${nots[@]}"}) ]]; then
+    git -C "$qb" bundle create -q "$S/lg/ship/qemu.bundle" refs/heads/lane-gate ${nots[@]+"${nots[@]}"}
+  fi
+  rm -rf "$qb"
   m2v=$(grep -m1 -o -E '^metal2vulkan-runtime = .*rev = "[0-9a-f]+"' "$TREE/Cargo.toml" | grep -o -E '[0-9a-f]{40}' || echo unknown)
   # The signed bundle RgfxGate carries, so that a fixer can build an RgfxGate of exactly the tip's.
-  local cdhash
   cdhash=$(codesign -dvvv "$TREE/guest/bundle/build/package/reims-graphics.bundle" 2>&1 | sed -n 's/^CDHash=//p')
-  scp -q "$ART/reims-graphics.bundle.tgz" "$MSI:$MR/reims-graphics.bundle.tgz"
-  msi "bash '$MR/bin/msi-publish.sh' '$MR' '$MSI_GATE/qemu/$qc/build' '$MSI_GATE/target/dist-vulkan' '$short' '$qc' '$m2v' '$MSI_RGK_RUN' '$cdhash'"
-  ((probe_tip)) || echo "$sha" > "$GH/published-last"
+  echo "$cdhash" > "$ART/cdhash"
+  rm -f "$RUN/not-published"
+  publish_wanted && pub=1
+  {
+    printf '%s=%q\n' RUNID "$runid" SHA "$sha" QC "$qc" SHORT "${sha:0:9}" M2V "$m2v" CDHASH "$cdhash" \
+      PUBLISH "$pub" IMAGE "$doimg" MSI_GATE "$MSI_GATE" MSI_RGK_RUN "$MSI_RGK_RUN" MSI_BASE_OC "$MSI_BASE_OC" \
+      MSI_CORPUS_SRC "$MSI_CORPUS_SRC" MSI_CORPUS_ODD "${MSI_CORPUS_ODD:-}" MSI_QEMU_SUBPROJECTS "$MSI_QEMU_SUBPROJECTS" \
+      MSI_QEMU_SEED "$MSI_QEMU_SEED"
+  } > "$S/lg/run.env"
+  # Build output only: the gate's own scripts, our kexts, bundle and guest tools (no Apple binary,
+  # nothing from a guest), committed on a throwaway branch that never merges.
+  gd=$(git -C "$SRC" rev-parse --path-format=absolute --git-common-dir)
+  idx=$RUN/ship.index
+  rm -f "$idx"
+  if [[ -n $(cd "$S" && find . -type l -print -quit) ]]; then echo "ship: symbolic links in $S"; return 1; fi
+  (cd "$S" && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "$RUN/ship.files"
+  sed "s#^#$S/#" "$RUN/ship.files" | git --git-dir="$gd" hash-object -w --stdin-paths > "$RUN/ship.blobs"
+  while IFS= read -r f; do if [[ -x $S/$f ]]; then echo 100755; else echo 100644; fi; done < "$RUN/ship.files" > "$RUN/ship.modes"
+  paste -d' ' "$RUN/ship.modes" "$RUN/ship.blobs" | paste -d'\t' - "$RUN/ship.files" |
+    GIT_INDEX_FILE=$idx git --git-dir="$gd" update-index --add --index-info
+  tree=$(GIT_INDEX_FILE=$idx git --git-dir="$gd" write-tree)
+  commit=$(git --git-dir="$gd" commit-tree "$tree" -p "$sha" -m ":construction: WIP lane-gate ship $runid (throwaway)
+
+The gate's host scripts and the Mac's build of ${sha:0:12} for its potluck jobs on
+the lane host. Never merged; removed after the run.")
+  rm -f "$idx"
+  [[ ! -e $SHIP_WT ]] || git -C "$SRC" worktree remove --force "$SHIP_WT"
+  git -C "$SRC" branch -f -q "$SHIP_BRANCH" "$commit"
+  mkdir -p "$(dirname "$SHIP_WT")"
+  git -C "$SRC" worktree add -q "$SHIP_WT" "$SHIP_BRANCH"
+  echo "shipped $commit on $SHIP_BRANCH: $(wc -l < "$RUN/ship.files") files, $(du -sh "$S" | cut -f1)"
+  [[ ! -s $RUN/not-published ]] || cat "$RUN/not-published"
+}
+
+# host_step NAME: the host job's step NAME as one of this run's steps (steps/NAME.ok or .fail and
+# its log), where the job ran it.
+host_step() {
+  local n=$1 d=$RUN/host-steps
+  [[ -f $d/$n.rc ]] || return 0
+  cp "$d/$n.log" "$RUN/steps/$n.log"
+  rm -f "$RUN/steps/$n.ok" "$RUN/steps/$n.fail"
+  if [[ $(cat "$d/$n.rc") == 0 ]]; then
+    cp "$d/$n.s" "$RUN/steps/$n.ok"; say "  $n: ok in $(cat "$d/$n.s") s (on $PL_NODE)"
+  else
+    cp "$d/$n.s" "$RUN/steps/$n.fail"
+    say "  $n: FAILED (rc $(cat "$d/$n.rc")) after $(cat "$d/$n.s") s on $PL_NODE; log $RUN/steps/$n.log"
+    tail -6 "$RUN/steps/$n.log" | sed 's/^/      /'
+  fi
+}
+# The host build, the image and publishing: one job on the lane host with no GPU, its workspace
+# held for the boots.
+do_host() {
+  local rc=0 ws
+  pl_run host --timeout 2h --ram 40 --priority "$PL_PRIO" --on "node=$PL_NODE" --hold 8h --label lane-gate=build \
+    -- bash lg/bin/msi-job.sh build || rc=$?
+  ws=$(pl_workspace "$(cat "$RUN/job-host")") || { echo "no workspace for job $(cat "$RUN/job-host")"; return 1; }
+  echo "$ws" > "$RUN/workspace"
+  rm -rf "$RUN/host-steps"
+  potluck cp "$ws:lg-out/steps" "$RUN/host-steps" || return 1
+  potluck cp "$ws:lg-out/msi-build.txt" "$RES/msi-build.txt" 2> /dev/null || true
+  return $rc
 }
 
 # --- the boot ---------------------------------------------------------------------------------
 
-# do_boot boot|bench: the correctness boot, shared, or the bench boot, the GPU alone. rgk-boot2.sh
-# picks each boot's SSH port.
+# do_boot boot|bench: the correctness boot or the bench boot, each a job in the host build's
+# workspace holding the 5080 and the whole host (--exclusive). msi-launch.sh picks each boot's SSH
+# port.
 do_boot() {
   local mode=$1 oc=${image:-$MR/oc.qcow2} out=$MR/out-$1 excl=0 hold=${HOLD_SHARED_S:-1200}
-  local ph=${phases:-info sweep decode icb webgl present final} pres=5
+  local ph=${phases:-info sweep decode icb webgl present final} pres=5 ws tmo=75m
   if [[ $mode == bench ]]; then
     # WebGL's frame rate and present_probe's answers first: the quickest read of a tip's frame pace.
-    excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10
+    excl=1 hold=$HOLD_S ph=${bench_phases:-info webgl present idle bench decodefps final} pres=10 tmo=50m
   fi
-  # The guest runner and its files as the gate has them now (a resumed run keeps its tools), and
-  # the sweep's case order from its last full run (guest-run.sh runs the cases a crash cut off one
-  # by one in that order).
-  cp "$L/guest/"* "$ART/payload/"
-  [[ ! -s $GH/sweep-cases.txt ]] || cp "$GH/sweep-cases.txt" "$ART/payload/"
-  # The streams to check again (decode-repeat.txt, "SET STREAM N" a line), where the gate has any.
-  rm -f "$ART/payload/decode-repeat.txt"
-  [[ ! -s $GH/decode-repeat.txt ]] || cp "$GH/decode-repeat.txt" "$ART/payload/"
-  msi "rm -rf '$out' && mkdir -p '$out' && { [ -d '$MR/payload' ] || exit 0; rm -rf '$MR/payload'; }"
-  scp -q -r "$ART/payload" "$MSI:$MR/payload"
-  msi "cat > '$out/boot.env'" << EOF
+  ws=$(cat "$RUN/workspace")
+  cat > "$RUN/boot-$mode.env" << EOF
 QEMU=${host_dir:-$MR}/qemu-system-x86_64
 ROM=${host_dir:-$MR}/ReimsGraphics.rom
 OC=$oc
@@ -563,16 +619,14 @@ FINAL_CMD_B64=$([[ $mode == boot && -n ${final_cmd:-} ]] && printf '%s' "$final_
 QEMU_HOOK_B64=$([[ $mode == bench && -n $qemu_hook ]] && printf '%s' "$qemu_hook" | base64 | tr -d '\n')
 EOF
   set +e
-  msi "bash '$MR/bin/msi-boot.sh' '$out'"
+  pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" --exclusive --gpu "$PL_GPU" --workspace "$ws" \
+    --label "lane-gate=$mode" -- bash lg/bin/msi-job.sh boot "$mode" "$(base64 < "$RUN/boot-$mode.env" | tr -d '\n')"
   local rc=$?
   set -e
   rm -rf "${RES:?}/$mode"
-  mkdir -p "$RES/$mode"
-  for f in boot.log guest.log cpu.txt thermal.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log xid.txt \
-    capture.txt kext-stalls.txt appload.txt appload.log kwin-reaper.txt \
-    kernel-rgfx.log drag-resize-track.txt; do
-    scp -q "$MSI:$out/$f" "$RES/$mode/" 2> /dev/null || true
-  done
+  potluck cp "$ws:lg-out/$mode" "$RES/$mode" || mkdir -p "$RES/$mode"
+  [[ ! -s $RES/$mode/rc ]] || rc=$(cat "$RES/$mode/rc")
+  rm -f "$RES/$mode/rc"
   grep -E 'BOOT_FAIL|watchdog' "$RES/$mode/boot.log" || true
   # A sweep that ran whole leaves its case order for the next boot's.
   local order
@@ -622,12 +676,10 @@ report() {
   return $v
 }
 
-# The bench leg alone: what a detached leg runs, after its run's verdict.
+# The bench leg alone: what a detached leg runs, after its run's verdict, in the run's workspace.
 if [[ $bench == only ]]; then
   say "lane-gate bench leg: ${sha:0:12}, run $runid"
-  # The lane host's scripts as the gate has them now: the leg may start long after its run shipped.
-  rm -f "$RUN/steps/ship.ok"
-  step ship do_ship || die "the lane host's scripts could not be shipped"
+  [[ -s $RUN/workspace && -d $SHIP_WT ]] || die "run $runid has no workspace or no $SHIP_WT: the bench leg cannot run"
   rm -f "$RUN/steps/bench.ok" "$RUN/steps/bench.fail"
   echo bench >> "$RUN/ran"
   step bench do_boot bench || true
@@ -642,38 +694,39 @@ if [[ $bench == only ]]; then
       say "baselines/LAST stays ${base_sha:0:12}: the landed car's bench boot failed"
     fi
   fi
+  pl_cleanup
   say "lane-gate bench leg: report $RUN/report.txt; $(( $(date +%s) - T0 )) s"
   exit 0
 fi
 
 say "lane-gate: ${sha:0:12} ($subject), run $runid${BASE:+, baseline ${base_sha:0:12}}"
+# The Mac's checks take the Mac's GPU lock, which potluck's lease replaced: until they run as
+# potluck jobs, a gate leaves them out.
+skipped mac || die "the Mac's checks do not run as potluck jobs yet: run the gate with --skip mac"
 step tree do_tree || die "the tree could not be checked out"
-rm -f "$RUN/steps/ship.ok"  # every pass ships the gate's scripts as they are now
-step ship do_ship || die "the lane host's scripts could not be shipped"
-step corpus do_corpus || true
 
-msi_leg > "$RUN/msi-leg.out" 2>&1 &
-p_msi=$!
-gb=0
+gb=0 loader_ok=0
 step guest-build do_guest_build || gb=1
-p_img= p_mac=
-if ((gb == 0)); then
-  image_leg > "$RUN/image-leg.out" 2>&1 &
-  p_img=$!
-fi
-if ! skipped mac; then
-  echo mac >> "$RUN/ran"
-  mac_checks > "$RUN/mac-leg.out" 2>&1 &
-  p_mac=$!
-fi
-wait "$p_msi" && msi_ok=1 || msi_ok=0
-cat "$RUN/msi-leg.out"
-img_ok=0
+if ((gb == 0)) && [[ -z $image ]]; then step loader do_loader && loader_ok=1 || true; fi
+msi_ok=0 img_ok=0
 [[ -z $image ]] || img_ok=1
-if [[ -n $p_img ]]; then wait "$p_img" && img_ok=1 || img_ok=0; cat "$RUN/image-leg.out"; fi
+if ((gb == 0)) && { [[ -n $image ]] || ((loader_ok)); }; then
+  if step ship do_ship; then
+    step host do_host || true
+    for n in corpus stage msi-build image publish; do host_step "$n"; done
+    [[ -f $RUN/steps/stage.ok && -f $RUN/steps/msi-build.ok ]] && msi_ok=1
+    [[ -n $image || -f $RUN/steps/image.ok ]] && img_ok=1 || img_ok=0
+  fi
+else
+  say "  ship and host: not run (the guest build or the loader failed)"
+fi
 if ((publish)); then
-  if ((msi_ok && img_ok && gb == 0)) && [[ -z $image ]]; then
-    step publish do_publish && grep -E '^(PUBLISHED|NOT_PUBLISHED)' "$RUN/steps/publish.log" | sed 's/^/    /' || true
+  if [[ -f $RUN/steps/publish.ok ]]; then
+    grep -E '^(PUBLISHED|NOT_PUBLISHED)' "$RUN/steps/publish.log" | sed 's/^/    /' || true
+    ((probe_tip)) || echo "$sha" > "$GH/published-last"
+  elif [[ -s $RUN/not-published ]]; then
+    sed 's/^/    /' "$RUN/not-published"
+    echo 0 > "$RUN/steps/publish.ok"; cp "$RUN/not-published" "$RUN/steps/publish.log"
   else
     say "  publish: not run (the host build, the image or the guest build failed, or --image)"
   fi
@@ -682,8 +735,8 @@ if ! skipped boot; then
   if ((msi_ok && img_ok && gb == 0)); then
     echo boot >> "$RUN/ran"
     if ! step boot do_boot boot && grep -q -E 'BOOT_QUEUE_TIMEOUT|BOOT_FAIL missing' "$RES/boot/boot.log" 2> /dev/null; then
-      # The candidate did not run (the host's queue did not reach the boot in time, or a file the
-      # boot needs is missing): the boot is not run, and a --resume tries it again.
+      # The candidate did not run (a file the boot needs is missing): the boot is not run, and a
+      # --resume tries it again.
       say "  boot: not run ($(grep -m1 -o -E 'BOOT_QUEUE_TIMEOUT|BOOT_FAIL missing [^ ]*' "$RES/boot/boot.log"); --resume $runid)"
       rm -f "$RUN/steps/boot.fail"
       grep -v -x boot "$RUN/ran" > "$RUN/ran.new" || true
@@ -693,7 +746,6 @@ if ! skipped boot; then
     say "  boot: not run (the host build, the image or the guest build failed)"
   fi
 fi
-if [[ -n $p_mac ]]; then wait "$p_mac" || true; cat "$RUN/mac-leg.out"; fi
 
 set +e
 report
@@ -705,8 +757,9 @@ if ((landed)) && { [[ $bench == no || $msi_ok != 1 || $img_ok != 1 || $gb != 0 ]
 fi
 say "lane-gate: report $RUN/report.txt; $(( $(date +%s) - T0 )) s this pass"
 
-# The bench leg: after the verdict, the boot that holds the GPU alone. Detached, it holds none of
-# this gate's descriptors (lockf's among them), so the next gate can start while it waits its turn.
+# The bench leg: after the verdict, the boot that holds the GPU and the host alone, in the run's
+# workspace. Detached, it holds none of this gate's descriptors (lockf's among them), so the next
+# gate can start while it waits its turn in potluck's queue.
 if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped bench; then
   again=(--resume "$runid" --bench-only)
   if ((landed)); then again+=(--landed); elif ((record)); then again+=(--record); fi
@@ -724,5 +777,7 @@ if [[ $bench != no && $msi_ok == 1 && $img_ok == 1 && $gb == 0 ]] && ! skipped b
       exec nohup "$0" "${again[@]}" "$sha" > "$RUN/bench.out" 2>&1 < /dev/null ) &
     say "lane-gate: the bench leg runs on detached; its output: $RUN/bench.out"
   fi
+else
+  pl_cleanup
 fi
 exit $verdict

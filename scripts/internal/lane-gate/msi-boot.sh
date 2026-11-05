@@ -1,10 +1,9 @@
 #!/bin/bash
-# The lane gate's boot, on the lane host: bash msi-boot.sh RUNDIR, through the host's
-# rgk-boot2.sh, which takes one of the host's VM slots, then the GPU lock, in its turn (the host's
-# turnstile orders shared boots and exclusive runs by arrival), and the port's lock. The
-# correctness boot (EXCLUSIVE=0) shares the GPU with other VMs; the bench boot (EXCLUSIVE=1,
-# RGK_EXCLUSIVE) holds it alone for QEMU's life. Either keeps builds off the host for QEMU's life
-# (host quiet: build-quiet.sh), and is stopped after HOLD_S seconds.
+# The lane gate's boot, on the lane host: bash msi-boot.sh RUNDIR, inside a potluck job that holds
+# the 5080 and the whole host (--exclusive: potluck's lease is the lock), through msi-launch.sh.
+# Each boot waits for running builds to end and the CPU package to cool below 80 C before QEMU
+# starts (msi-launch.sh), and is stopped after HOLD_S seconds; the bench boot (EXCLUSIVE=1) is
+# also powered off by msi-launch.sh's watchdog after HOLD_S.
 # RUNDIR holds boot.env (below), and gets the results:
 #   boot.log      what this script did, with times
 #   guest.log     guest-run.sh's output, each line after the host's time (epoch seconds); where the
@@ -25,7 +24,7 @@
 #                 (from QEMU's start), the fatal counts, the screenshot's colours and the share of
 #                 its commonest colour (or desktop_capture none), how long the hold was, the
 #                 host's load average beside the measurements, and host_quiet (1 where no build
-#                 ran beside QEMU, 0 where rgk-boot2.sh said HOST_NOT_QUIET);
+#                 ran beside QEMU, 0 where msi-launch.sh said HOST_NOT_QUIET);
 #                 at QEMU's start the host's free memory and page cache (memfree_, memavailable_,
 #                 cached_start_mib), uptime (uptime_start_s: a fresh boot's page cache is empty),
 #                 and the package's temperature and throttle counters (pkg_temp_start_c,
@@ -52,8 +51,8 @@
 #                 of the boot), and a summary of it
 # boot.env sets: QEMU, ROM, OC (the OpenCore image), DISK (the macOS disk, only read: the boot
 # writes an overlay), TAG, PAYLOAD (the guest's directory: guest-run.sh and its tools), CORPUS,
-# GUEST_USER, GUEST_PASS, RGK_RUN (the host's boot scripts: rgk-boot2.sh), EXCLUSIVE, HOLD_S,
-# LOCK_WAIT_S (the longest wait for the turnstile, a VM slot and the GPU, each), PHASES and
+# GUEST_USER, GUEST_PASS, RGK_RUN (the host's shared files: boots/, ts-lines, kwin-reaper.sh),
+# EXCLUSIVE, HOLD_S, LOCK_WAIT_S (unused: potluck's lease is the lock), PHASES and
 # PRESENT_S (guest-run.sh's phases and GATE_PRESENT_S), and LOAD (a duty, 0 to 1: a fixed GPU
 # load, gpuload -d LOAD, from the guest's run to the drags' end; unset for none), and HOST_LOG
 # (the host's REIMS_VGPU_LOG filter, default info), CAPTURE (1: the boot capture, below), and
@@ -213,7 +212,7 @@ finish() {
     kv submit_room_posted "$(grep -c 'SUBMIT_ROOM posted' "$B/launch.log")"
     kv icb_slots_refused "$(grep -c 'ICB_SLOTS of .* not carried out' "$B/launch.log")"
     # The boot's hold of host quiet: HOST_QUIET where no build ran beside QEMU, HOST_NOT_QUIET where
-    # the wait for running builds ran out (rgk-boot2.sh).
+    # the wait for running builds ran out (msi-launch.sh).
     case $(grep -m1 -o -E 'HOST_(NOT_)?QUIET' "$B/launch.log") in
     HOST_QUIET) kv host_quiet 1 ;;
     HOST_NOT_QUIET) kv host_quiet 0 ;;
@@ -234,7 +233,7 @@ trap finish EXIT
 needs=("$PAYLOAD/guest-run.sh" "$CORPUS/MANIFEST")
 [[ -n ${PROBES:-} ]] && needs=("$PAYLOAD/bench" "$(dirname "$0")/msi-probes.sh")
 for f in "$QEMU" "$(dirname "$QEMU")/qemu-bundle/usr/local/share/qemu/efi-virtio.rom" "$ROM" "$OC" "$DISK" \
-  "${needs[@]}" "$RGK_RUN/rgk-boot2.sh"; do
+  "${needs[@]}" "$(dirname "$0")/msi-launch.sh"; do
   [[ -s $f ]] || { log "BOOT_FAIL missing $f"; exit 2; }
 done
 log "boot $TAG ($([[ ${EXCLUSIVE:-1} == 1 ]] && echo exclusive || echo shared)): QEMU $QEMU, ROM $ROM, OC $OC"
@@ -242,9 +241,9 @@ log "boot $TAG ($([[ ${EXCLUSIVE:-1} == 1 ]] && echo exclusive || echo shared)):
 GL=
 if [[ -n ${LOAD:-} ]]; then
   GL=$R/gpuload
-  # A build on the host waits for host quiet (build-quiet.sh), never beside a measured boot.
-  ( cd "$R" && bash "$RGK_RUN/build-quiet.sh" -- glslc -mfmt=c "$(dirname "$0")/gpuload.comp" -o gpuload.spv.inc &&
-    bash "$RGK_RUN/build-quiet.sh" -- cc -O2 -Wall -Wextra -Werror -I"$R" "$(dirname "$0")/gpuload.c" -lvulkan -o gpuload ) \
+  # Built here, inside the boot's job, before QEMU starts.
+  ( cd "$R" && glslc -mfmt=c "$(dirname "$0")/gpuload.comp" -o gpuload.spv.inc &&
+    cc -O2 -Wall -Wextra -Werror -I"$R" "$(dirname "$0")/gpuload.c" -lvulkan -o gpuload ) \
     >> "$R/boot.log" 2>&1 || { log "BOOT_FAIL missing gpuload (its build failed)"; exit 2; }
 fi
 # The host GPUs' hardware decoders, as Vulkan Video lists each GPU's decode profiles (a query: no
@@ -259,18 +258,14 @@ timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
     p = $2; sub(/^STD_VIDEO_H26[45]_PROFILE_IDC_/, "", p)
     print name[g] "\t" (op ~ /H265/ ? "hevc" : "h264") "\t" p }' | sort -u > "$R/host-video.tsv"
 [[ -s $R/host-video.tsv ]] || rm -f "$R/host-video.tsv"
-# The bench boot is an ordinary exclusive request: it waits its turn in the host's turnstile, in
-# arrival order, and holds the GPU alone for QEMU's life.
-excl=()
-# The correctness boot times drags, presents and WebGL frames beside other VMs: it keeps builds off
-# the host for QEMU's life as the bench boot does (RGK_QUIET).
+# Both boots run in a potluck job that holds the host alone (--exclusive), and both wait for running
+# builds and the cool-down first (msi-launch.sh). The bench boot is also powered off after HOLD_S.
 excl=(RGK_QUIET=1)
 [[ ${EXCLUSIVE:-1} == 1 ]] && excl=(RGK_EXCLUSIVE=1 "RGK_EXCLUSIVE_MAX=$HOLD_S")
-# Where the boot's time goes: rgk-boot2.sh writes run.sh once its turn, a VM slot and the port are
-# in hand; run.sh takes the GPU lock, then waits for host quiet, its marker in
-# quiet-want/ up meanwhile, until its HOST_QUIET or HOST_NOT_QUIET line in QEMU's log, says
-# GPU_HELD and execs QEMU, whose lines carry their times. A watch takes the times of the marker
-# and of those lines (boot-times.txt: gpu, quiet, held), and the hold counts from GPU_HELD.
+# Where the boot's time goes: msi-launch.sh writes run.sh, which waits for running builds until its
+# HOST_QUIET or HOST_NOT_QUIET line in QEMU's log, then for the cool-down (COOL_WAIT), says
+# GPU_HELD and execs QEMU, whose lines carry their times. A watch takes the times of those lines
+# (boot-times.txt: quiet, held), and the hold counts from GPU_HELD.
 sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", a - b }'; }
 stamp() { date -d "$1" +%s.%N 2> /dev/null | cut -c1-14; }
 touch "$R/.start"
@@ -281,9 +276,9 @@ touch "$R/.start"
 # seconds after the desktop is up, where the Dock has settled (below). The scanout's reader runs as
 # root, for /proc/PID/mem.
 CAPPIDS=()
-# A cold pipeline cache (COLD_CACHE=KEY) and a command at QEMU's start (QEMU_HOOK_B64): rgk-boot2.sh's
-# run.sh execs a wrapper, with the GPU lock (fd 9) held, which execs QEMU in turn, so QEMU keeps
-# run.sh's pid (rgk-boot2.sh counts SSH only from that pid). The wrapper sets the host's cache
+# A cold pipeline cache (COLD_CACHE=KEY) and a command at QEMU's start (QEMU_HOOK_B64): msi-launch.sh's
+# run.sh execs a wrapper, which execs QEMU in turn, so QEMU keeps run.sh's pid (msi-launch.sh
+# counts SSH only from that pid). The wrapper sets the host's cache
 # entry KEY aside and leaves a process holding the lock that, once QEMU has stopped, removes the
 # entry QEMU made and puts KEY back; it starts the hook with no lock held. A command before QEMU
 # (PRE_QEMU_B64) runs in it under the lock, just before the exec, into R/pre-qemu.txt.
@@ -357,7 +352,6 @@ fi
 ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
   q= g=
   while sleep 0.5; do
-    [[ -z $g ]] && compgen -G "$RGK_RUN/quiet-want/$TAG.*" > /dev/null && g=1 && echo "gpu $(date +%s.%N | cut -c1-14)"
     [[ -f $B/launch.log && $B/launch.log -nt $R/.start ]] || continue
     [[ -z $q ]] && grep -q -x -E 'HOST_(NOT_)?QUIET' "$B/launch.log" && q=1 && echo "quiet $(date +%s.%N | cut -c1-14)"
     # The host's free memory as QEMU starts (it moves a boot's time by 30 s and more where it is
@@ -368,9 +362,9 @@ fi
       grep -E '^compact_(stall|fail|success) ' /proc/vmstat > "$R/vmstat-start.txt"; break; }
   done ) > "$R/boot-times.txt" 2> /dev/null &
 TIMES=$!
-# rgk-boot2.sh picks the SSH port (PORT unset) and holds its lock for QEMU's life: "PORT n".
-out=$(env -u PORT "${excl[@]}" RGK_SLOT_WAIT="${LOCK_WAIT_S:-3600}" QEMU="$QEMU" ROM="$ROM" \
-  REIMS_VGPU_LOG="${HOST_LOG:-info}" bash "$RGK_RUN/rgk-boot2.sh" "$TAG" "$OC" "$DISK" 2>&1)
+# msi-launch.sh picks the SSH port (PORT unset): "PORT n".
+out=$(env -u PORT "${excl[@]}" RGK_RUN="$RGK_RUN" QEMU="$QEMU" ROM="$ROM" \
+  REIMS_VGPU_LOG="${HOST_LOG:-info}" bash "$(dirname "$0")/msi-launch.sh" "$TAG" "$OC" "$DISK" 2>&1)
 T_SSH=$(date +%s.%N | cut -c1-14)
 kill "$TIMES" 2> /dev/null
 echo "$out" >> "$R/boot.log"
@@ -387,13 +381,14 @@ T_RUN=$([[ $B/run.sh -nt $R/.start ]] && stat -c %Y "$B/run.sh")
 T_GPU=$(awk '$1 == "gpu" {print $2}' "$R/boot-times.txt")
 T_QUIET=$(awk '$1 == "quiet" {print $2}' "$R/boot-times.txt")
 T_HELD=$(awk '$1 == "held" {print $2}' "$R/boot-times.txt")
-# The GPU lock's time: the marker's (a quiet wait under the watch's half second leaves none: the
-# quiet line's, then); a shared boot has no quiet wait, and holds the lock at GPU_HELD.
-T_GPU=${T_GPU:-${T_QUIET:-$T_HELD}}
+# potluck's lease held the GPU before the job started: no GPU wait here. run.sh's wait for running
+# builds ends at its quiet line, and its cool-down at GPU_HELD (cool_wait_s).
+T_GPU=${T_RUN:-$START}
 [[ -n $T_RUN ]] && kv turn_wait_s "$(sub "$T_RUN" "$START")"
 [[ -n $T_GPU ]] && kv gpu_wait_s "$(sub "$T_GPU" "${T_RUN:-$START}")"
 [[ -n $T_GPU && -n $T_QUIET ]] && kv quiet_wait_s "$(sub "$T_QUIET" "$T_GPU")"
-# The hold began when run.sh held the GPU lock (else when QEMU started).
+[[ -n $T_QUIET && -n $T_HELD ]] && kv cool_wait_s "$(sub "$T_HELD" "$T_QUIET")"
+# The hold began when run.sh said GPU_HELD, after the cool-down (else when QEMU started).
 T0=${T_HELD:-$T_QEMU}
 T0=${T0%.*}
 [[ -n $T0 ]] && kv lock_wait_s "$(( T0 - START ))"
@@ -410,7 +405,7 @@ fi
 [[ -n $T0 ]] || T0=$START
 case $out in
 *SSH_OK*) ;;
-# The host's queue did not reach this boot in LOCK_WAIT_S: nothing of the candidate ran.
+# Kept from the host's queue before potluck (rgk-boot2.sh's refusals): nothing of the candidate ran.
 *GPU_WANTED_EXCLUSIVE* | *VM_SLOTS_BUSY* | *GPU_LOCKED*)
   log "BOOT_QUEUE_TIMEOUT $(echo "$out" | tail -2 | tr '\n' ' ')"; exit 7 ;;
 *) log "BOOT_FAIL $(echo "$out" | tail -3 | tr '\n' ' ')"; exit 4 ;;
