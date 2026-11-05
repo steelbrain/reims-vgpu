@@ -1922,7 +1922,14 @@ event past every value and signals each plain event past every value from a
 queue of its own, so a buffer still waiting on one runs and finishes. It then
 lets go of what it holds (its buffers' GPU addresses among them, which the
 rebooted guest picks again after a reset), and the close's answer, which
-waits for the context's buffers, comes.
+waits for the context's buffers, comes. A Mac drops such a buffer instead
+(measured, the 5300M and the 630 under macOS 26.7.1: a buffer that waits on
+its process's own shared or plain event when the process exits or is killed
+never runs; its writes to a shared-memory buffer and to an IOSurface never
+land, 2 s and 5 s after). The host has committed the buffer to its platform
+behind a GPU wait by then, and a platform takes back no committed buffer:
+running it is the only end that holds nothing for good, so its writes land
+where a Mac's never do.
 
 **Who takes the completions.** Every queue raises the device's one vector,
 the control ring's. The accelerator kext maps each queue's completion-ring
@@ -2018,6 +2025,11 @@ committed in. The bundle names the order instead, as it posts each buffer:
   whose order is its ring's. A queue the host does not hold, or a seqno past
   every one the queue's ring has published, names no buffer and waits for
   nothing.
+- A Mac does not hold a read back for a write committed before it that is
+  still waiting on an event (measured, the 5300M and the 630 under macOS
+  26.7.1: another process's blit of the surface completed within 1 s, reading
+  the surface as it was). The host does: the write's buffer is on its ring and
+  in its slot, so the read waits for it to finish.
 - The wait is an order on the GPU and nothing more, as a Mac's is: a Mac answers
   a command buffer it runs after another queue's or process's pending access to
   a surface submitted and scheduled within a millisecond of its commit (the 630,
