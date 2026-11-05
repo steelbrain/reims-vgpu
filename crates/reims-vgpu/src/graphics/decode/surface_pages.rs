@@ -277,6 +277,8 @@ pub(crate) struct Private<P: Platform> {
 pub(crate) struct Unmade<P: Platform> {
     memory: Arc<MemoryMap<P>>,
     lease: Lease,
+    /// Where the view's mapping is let go of ([`SurfaceView`]).
+    teardown: Option<Arc<Worker>>,
     key: Vec<(u64, u64)>,
     length: u64,
 }
@@ -293,6 +295,7 @@ impl<P: Platform> Unmade<P> {
         let view = match map_view(
             &self.memory,
             Arc::clone(&self.lease),
+            self.teardown.clone(),
             &self.key,
             self.length,
         ) {
@@ -593,6 +596,7 @@ impl<P: Platform> SurfaceViews<P> {
         let unmade = Unmade {
             memory: Arc::clone(memory),
             lease: Arc::clone(lease),
+            teardown: self.teardown.clone(),
             key,
             length: pages.length,
         };
