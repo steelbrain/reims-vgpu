@@ -108,6 +108,12 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
+# The workspace's docs are its developers', built with its private items (`cargo doc
+# --document-private-items`), where a public item's links to the private items its docs name
+# resolve, and are checked as every other link is.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
