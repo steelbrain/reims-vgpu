@@ -15,25 +15,30 @@
 
 use std::process::Command;
 
-fn main() {
+fn main() -> Result<(), String> {
     println!("cargo:rerun-if-changed=build.rs");
     let macos = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
     if !macos || std::env::var_os("CARGO_FEATURE_MACOS_SDL").is_none() {
-        return;
+        return Ok(());
     }
     let out = Command::new("xcrun")
         .args(["clang", "--print-runtime-dir"])
         .output()
-        .expect("xcrun clang --print-runtime-dir: the macOS build needs Xcode's clang");
-    assert!(
-        out.status.success(),
-        "xcrun clang --print-runtime-dir failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8(out.stdout).expect("a UTF-8 path");
+        .map_err(|e| {
+            format!("xcrun clang --print-runtime-dir: {e}: the build needs Xcode's clang")
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "xcrun clang --print-runtime-dir failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|e| format!("xcrun clang --print-runtime-dir: not UTF-8: {e}"))?;
     let dir = stdout.trim();
     // Run again where Xcode's clang moves (a new version's directory), as the old one goes.
     println!("cargo:rerun-if-changed={dir}/libclang_rt.osx.a");
     println!("cargo:rustc-link-search=native={dir}");
     println!("cargo:rustc-link-lib=static:-bundle=clang_rt.osx");
+    Ok(())
 }
