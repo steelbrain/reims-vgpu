@@ -4953,14 +4953,26 @@ mod tests {
 
     /// A download's copy is answered, and a fill's waiters told, as the platform sees its
     /// command buffer done, by a completion-seen handler, with no handler thread woken between
-    /// on a platform that has one; the completed handler only lets go of the copy's buffers
+    /// on a platform that has one; the completed handler only lets go of the copy's buffers. The
+    /// fill is the one made as the cache is made ([`SurfaceCaches::fill_made`]), which the
+    /// writer's first use of the generation waits for
     #[test]
     fn a_copy_s_answer_goes_as_the_platform_sees_it_done() {
-        let mut r = cached();
+        let mut r = rig(8);
+        let page = r.page;
         let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
         let calls = r.p.call_log().since(mark);
-        assert_eq!(copies(&calls).len(), 1, "a fill, then the writer");
+        assert_eq!(
+            copies(&calls).len(),
+            1,
+            "the fill at the make, then the writer"
+        );
         assert_eq!(handlers_of_commit(&calls, 0), ["addCompletionSeenHandler"]);
         r.p.world().complete_all(CompleteOn::Caller);
 
