@@ -2320,7 +2320,8 @@ commit. Each outcome the new design allows is one of those two:
   at its begin. Its later messages on ring 0 wait for nothing more of it than
   before. A buffer never begun after its answer (its queue gone, the device
   reset) lets them go with its queue's entry, and a buffer the platform refuses
-  at its begin fails in its turn. The vCPU allocates nothing: the platform's
+  at its begin fails in its turn. The vCPU neither allocates nor frees, as
+  the library's allocator may purge pages in either call: the platform's
   command buffer and every other allocation are made on the queue's thread.
   Tested by `a_doorbell_s_answer_allocates_nothing` and
   `a_doorbell_write_answers_a_command_buffer_on_its_thread`

@@ -1098,9 +1098,11 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
 }
 
-/// A doorbell write's answer allocates nothing on the ringing thread, the guest's vCPU: each of
-/// four buffers that ask is answered inside the write, which the allocator counts, its
-/// `CB_SUBMITTED` posted and its vector raised there, then completed by its queue's thread.
+/// A doorbell write's answer neither allocates nor frees on the ringing thread, the guest's vCPU,
+/// where the library's allocator may purge pages in either call: each of four buffers that ask is
+/// answered inside the write, which the allocator counts, its `CB_SUBMITTED` posted and its vector
+/// raised there, then completed by its queue's thread; and a write of a buffer that does not ask,
+/// which only wakes the queue's thread, calls the allocator no more.
 ///
 /// The write answers a buffer only where the queue's thread holds neither its take nor its ring
 /// (`answer_on_doorbell`), which `consumer_idle` does not show alone: a wake that came while the
@@ -1151,21 +1153,11 @@ fn a_doorbell_s_answer_allocates_nothing() {
             break;
         }
         // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
-        for _ in 0..2000 {
-            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-            let idle = unsafe {
-                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                    .load(Ordering::SeqCst)
-            };
-            if idle == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_idle(&device, SUBMIT_OFF);
         ring.arm();
         ring.publish(asking(queue, cb));
         let raises = raised.load(Ordering::SeqCst);
-        let ((), allocations) = crate::counted::allocations_in(|| {
+        let ((), calls) = crate::counted::allocator_calls_in(|| {
             device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
         });
         if ring.has_event() {
@@ -1173,7 +1165,11 @@ fn a_doorbell_s_answer_allocates_nothing() {
                 raised.load(Ordering::SeqCst) > raises,
                 "no raise in the write"
             );
-            assert_eq!(allocations, 0, "the answer of buffer {cb} allocated");
+            assert_eq!(
+                calls,
+                (0, 0),
+                "the answer of buffer {cb} called the allocator (allocations, frees)"
+            );
             answered += 1;
         } else {
             // The queue's thread held the ring: it answers the buffer itself.
@@ -1198,6 +1194,45 @@ fn a_doorbell_s_answer_allocates_nothing() {
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
     }
     assert_eq!(answered, 4, "the writes answered {answered} buffers of 64");
+    // One that does not ask, with an id the loop's buffers do not use: the write leaves it to
+    // the queue's thread.
+    wait_idle(&device, SUBMIT_OFF);
+    ring.publish(command_buffer(queue, 164));
+    let ((), calls) = crate::counted::allocator_calls_in(|| {
+        device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    });
+    assert_eq!(
+        calls,
+        (0, 0),
+        "a write that only woke the queue's thread called the allocator (allocations, frees)"
+    );
+    for _ in 0..3000 {
+        platform.world().complete_all(CompleteOn::Caller);
+        if ring.has_event() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
+    assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
+}
+
+/// Waits about 2 s at most for the service thread of the queue whose submission ring is at region
+/// offset `submit_off` to sleep with its ring idle (its `consumer_idle` 1), as the guest finds it
+/// when it rings for a buffer.
+fn wait_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) {
+    for _ in 0..2000 {
+        // SAFETY: the region is the device's, mapped while it lives; `consumer_idle` is at 0x80
+        // of the submission ring's header, which the host writes atomically.
+        let idle = unsafe {
+            AtomicU32::from_ptr(device.region_base().add(submit_off as usize + 0x80).cast())
+                .load(Ordering::SeqCst)
+        };
+        if idle == 1 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// The name of the thread each raise that called the device ran on, once its calls returned.
