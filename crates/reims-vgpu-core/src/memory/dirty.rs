@@ -35,7 +35,12 @@
 //! copy's `since`: the page is taken again. A write that ends before a harvest's begin is in
 //! memory before any copy that waited for that harvest. A writer that writes for long, a video
 //! decoder over its lend, brackets its writes instead ([`DirtyLog::begin_write`]): its pages read
-//! as written at every stamp until it ends.
+//! as written at every stamp until it ends. A batch of runs whose bytes are all in memory
+//! ([`DirtyLog::wrote_runs`], [`DirtyLog::wrote_runs_as`]) shares one fence and one load of
+//! `started`, and takes the named lock at most once: the runtime reports a command buffer's
+//! writes over a surface in scattered guest pages, thousands of runs at a time, and a take of the
+//! lock per run was 7% of QEMU's CPU time in a stock-lane present loop on the RTX 5080 Laptop GPU
+//! (**measured** 2026-11-05, round 20261105-092958, perf at 499 Hz).
 //!
 //! A host write costs one relaxed load while no device has a dirty source, and a fence and a load
 //! more while no granule is watched: a write before a granule's first watch is in memory before
@@ -49,8 +54,9 @@
 //! it; a named write by another writer takes the page over, with `others` its stamp before
 //! (which may count the new writer's own earlier writes: more copies, never fewer). The writer
 //! and `others` change only under the named lock; a stamp change outside it that finds the side
-//! table takes the lock and raises `others`, and the side table's publication and the stamp's
-//! raise are both sequentially consistent, so one of the two sees the other.
+//! table takes the lock (or holds it already, from an earlier chunk of its batch) and raises
+//! `others`, and the side table's publication and the stamp's raise are both sequentially
+//! consistent, so one of the two sees the other.
 //!
 //! **Only "after".** A page keeps only its latest stamps, so the log answers which pages changed
 //! after a stamp, never which changed within a window.
@@ -84,7 +90,7 @@ use std::time::Duration;
 
 use crate::num::{ToU64, ToUsize};
 use crate::platform::os::{Clock, Deadline};
-use crate::sync::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex, MutexGuard};
 
 /// A harvest's number; 0 is before the first.
 pub type DirtyStamp = u64;
@@ -207,6 +213,9 @@ pub struct DirtyLog {
     state: Mutex<State>,
     cond: Condvar,
     named_lock: Mutex<()>,
+    /// The times the named lock was taken, for the tests.
+    #[cfg(test)]
+    named_takes: AtomicU64,
     wanted: Mutex<Option<HarvestWanted>>,
 }
 
@@ -289,6 +298,8 @@ impl DirtyLog {
             state: Mutex::new(State::default()),
             cond: Condvar::new(),
             named_lock: Mutex::new(()),
+            #[cfg(test)]
+            named_takes: AtomicU64::new(0),
             wanted: Mutex::new(Some(wanted)),
         }
     }
@@ -511,7 +522,7 @@ impl DirtyLog {
         let pages =
             g.saturating_mul(GRANULE_PAGES)..g.saturating_add(1).saturating_mul(GRANULE_PAGES);
         if let Some(named) = c.named() {
-            let _n = self.named_lock.lock();
+            let _n = self.lock_named();
             for i in pages.clone() {
                 if let Some(w) = named.writer.get(i) {
                     w.store(0, Ordering::SeqCst);
@@ -576,7 +587,7 @@ impl DirtyLog {
                     return;
                 };
                 let named = writer.and_then(|w| c.named().map(|n| (w, n)));
-                let _n = named.map(|_| self.named_lock.lock());
+                let _n = named.map(|_| self.lock_named());
                 for p in first..end {
                     let i = (p.saturating_sub(c.first_page)).to_usize();
                     let Some(st) = c.stamps.get(i) else { continue };
@@ -601,21 +612,51 @@ impl DirtyLog {
         }
     }
 
+    /// The named lock, counted for the tests.
+    fn lock_named(&self) -> MutexGuard<'_, ()> {
+        #[cfg(test)]
+        self.named_takes.fetch_add(1, Ordering::Relaxed);
+        self.named_lock.lock()
+    }
+
     /// The library wrote the guest physical bytes of `range`, and they are in memory: each
     /// watched page of it is stamped with the next harvest's number (module docs, "Host writes").
     pub fn wrote(&self, range: Range<u64>) {
+        self.wrote_runs(std::iter::once(range));
+    }
+
+    /// [`DirtyLog::wrote`] for each of `runs`, whose bytes are all in memory: one fence and one
+    /// load of the harvest number for them all, and the named lock taken at most once.
+    pub fn wrote_runs(&self, runs: impl IntoIterator<Item = Range<u64>>) {
         fence(Ordering::SeqCst);
         let stamp = self.started.load(Ordering::SeqCst).saturating_add(1);
-        self.stamp(&range, stamp);
+        let mut named = None;
+        for run in runs {
+            self.stamp(&run, stamp, &mut named);
+        }
     }
 
     /// [`DirtyLog::wrote`], as `writer`'s write (module docs, "Writers"):
     /// [`DirtyLog::changed_except`] for `writer` leaves it out.
     pub fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64) {
-        let _n = self.named_lock.lock();
+        self.wrote_runs_as(std::iter::once(range), writer);
+    }
+
+    /// [`DirtyLog::wrote_as`] for each of `runs`, whose bytes are all in memory, under one take
+    /// of the named lock and one load of the harvest number.
+    pub fn wrote_runs_as(&self, runs: impl IntoIterator<Item = Range<u64>>, writer: NonZeroU64) {
+        let _n = self.lock_named();
         fence(Ordering::SeqCst);
         let stamp = self.started.load(Ordering::SeqCst).saturating_add(1);
-        self.walk(pages(&range), |first, end, slot| {
+        for run in runs {
+            self.stamp_as(&run, stamp, writer);
+        }
+    }
+
+    /// Stamps each watched page of `range` with `stamp`, as `writer`'s write, under the named
+    /// lock.
+    fn stamp_as(&self, range: &Range<u64>, stamp: DirtyStamp, writer: NonZeroU64) {
+        self.walk(pages(range), |first, end, slot| {
             let Some(c) = slot.and_then(OnceLock::get) else {
                 return;
             };
@@ -651,30 +692,49 @@ impl DirtyLog {
         });
     }
 
-    /// Stamps each watched page of `range` with `stamp`, by no named writer.
-    fn stamp(&self, range: &Range<u64>, stamp: DirtyStamp) {
+    /// Stamps each watched page of `range` with `stamp`, by no named writer. `named` holds the
+    /// named lock once a chunk with a side table took it, and keeps it for the rest of a batch.
+    fn stamp<'a>(
+        &'a self,
+        range: &Range<u64>,
+        stamp: DirtyStamp,
+        named: &mut Option<MutexGuard<'a, ()>>,
+    ) {
         self.walk(pages(range), |first, end, slot| {
             let Some(c) = slot.and_then(OnceLock::get) else {
                 return;
             };
-            self.stamp_in(c, first, end, stamp);
+            self.stamp_in(c, first, end, stamp, named);
         });
     }
 
-    /// Stamps the watched pages `first..end` of `c` with `stamp`, by no named writer.
-    fn stamp_in(&self, c: &Chunk, first: u64, end: u64, stamp: DirtyStamp) {
+    /// Stamps the watched pages `first..end` of `c` with `stamp`, by no named writer, taking the
+    /// named lock into `held` where the chunk has a side table and it is not held yet.
+    fn stamp_in<'a>(
+        &'a self,
+        c: &Chunk,
+        first: u64,
+        end: u64,
+        stamp: DirtyStamp,
+        held: &mut Option<MutexGuard<'a, ()>>,
+    ) {
         let lo = (first.saturating_sub(c.first_page)).to_usize();
         let hi = (end.saturating_sub(c.first_page))
             .to_usize()
             .min(CHUNK_PAGES);
         // A raise even where the stamp is later already: it is the modification the fence
-        // orders before the look for the side table (module docs, "Writers").
+        // orders before the look for the side table (module docs, "Writers"). Under the lock no
+        // named write runs between the two, and the look sees every side table published.
         for st in c.stamps.get(lo..hi).unwrap_or(&[]) {
             st.fetch_max(stamp, Ordering::SeqCst);
         }
-        fence(Ordering::SeqCst);
+        if held.is_none() {
+            fence(Ordering::SeqCst);
+        }
         if let Some(named) = c.named() {
-            let _n = self.named_lock.lock();
+            if held.is_none() {
+                *held = Some(self.lock_named());
+            }
             for i in lo..hi {
                 if let (Some(w), Some(o)) = (named.writer.get(i), named.others.get(i))
                     && w.load(Ordering::SeqCst) != 0
@@ -776,8 +836,9 @@ impl DirtyLog {
     }
 
     /// Stamps the pages of the granule from guest page `first` whose bits `word` sets, a run of
-    /// set bits at a time.
+    /// set bits at a time, taking the named lock at most once.
     fn stamp_word(&self, first: u64, word: u64, stamp: DirtyStamp) {
+        let mut named = None;
         let mut bits = word;
         while bits != 0 {
             let i = bits.trailing_zeros();
@@ -785,7 +846,7 @@ impl DirtyLog {
             let end = i.saturating_add(run);
             let p = first.saturating_add(u64::from(i));
             let q = first.saturating_add(u64::from(end));
-            self.stamp(&((p << PAGE_SHIFT)..(q << PAGE_SHIFT)), stamp);
+            self.stamp(&((p << PAGE_SHIFT)..(q << PAGE_SHIFT)), stamp, &mut named);
             bits = if end >= 64 { 0 } else { bits & (!0u64 << end) };
         }
     }

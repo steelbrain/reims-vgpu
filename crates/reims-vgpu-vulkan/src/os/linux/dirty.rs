@@ -382,15 +382,11 @@ impl ImportDirty {
             }
         }
     }
+}
 
-    /// Each guest run of this log behind the import's bytes `range`, to `f`.
-    fn each_run(&self, range: &Range<u64>, mut f: impl FnMut(Range<u64>)) {
-        for s in self.segments(range).iter() {
-            if let Some(g) = s.guest {
-                f(g..g.saturating_add(s.length));
-            }
-        }
-    }
+/// The guest physical runs of `segments`, leaving out what is not the guest's RAM.
+fn guest_runs(segments: &[Segment]) -> impl Iterator<Item = Range<u64>> + '_ {
+    (segments.iter()).filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
 }
 
 /// The runtime's questions, in offsets from the import's pointer (module docs).
@@ -399,9 +395,7 @@ impl rt::DirtyPages for ImportDirty {
 
     fn watch(&self, range: Range<u64>) -> ImportWatch {
         let segments = self.segments(&range);
-        let runs: Vec<Range<u64>> = (segments.iter())
-            .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
-            .collect();
+        let runs: Vec<Range<u64>> = guest_runs(&segments).collect();
         self.shared.log.watch(&runs);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         self.shared.watches.lock().push(Watched { id, segments });
@@ -425,14 +419,16 @@ impl rt::DirtyPages for ImportDirty {
     }
 
     fn wrote(&self, range: Range<u64>) {
-        self.each_run(&range, |run| self.shared.log.wrote(run));
+        self.shared
+            .log
+            .wrote_runs(guest_runs(&self.segments(&range)));
     }
 
     fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64) {
         if !writers() {
             return rt::DirtyPages::wrote(self, range);
         }
-        self.each_run(&range, |run| self.shared.log.wrote_as(run, writer));
+        (self.shared.log).wrote_runs_as(guest_runs(&self.segments(&range)), writer);
     }
 
     fn changed_except(&self, since: rt::DirtyStamp, writer: NonZeroU64, out: &mut Vec<Range<u64>>) {

@@ -321,6 +321,77 @@ fn a_guest_write_under_a_later_named_write_shows_to_the_writer() {
     assert_eq!(changed_except(&log, &imp, s3, W1), vec![0..P]);
 }
 
+/// A batch of writes stamps each run as its own write would, named or not
+#[test]
+fn a_batch_stamps_as_its_runs_would() {
+    let (log, _) = counted();
+    let imp = import(0, 8 * P);
+    log.watch(&[0..8 * P]);
+    let s1 = harvest(&log, &[]);
+    log.wrote_runs([P + 8..2 * P, 3 * P..3 * P + 1, 6 * P..8 * P]);
+    assert_eq!(
+        changed(&log, &imp, s1),
+        vec![P..2 * P, 3 * P..4 * P, 6 * P..8 * P]
+    );
+    let s2 = harvest(&log, &[]);
+    log.wrote_runs_as([0..P, 2 * P..3 * P], W1);
+    assert_eq!(changed_except(&log, &imp, s2, W1), vec![]);
+    assert_eq!(changed_except(&log, &imp, s2, W2), vec![0..P, 2 * P..3 * P]);
+    // An unnamed batch over the named pages raises their other writes.
+    let s3 = harvest(&log, &[]);
+    log.wrote_runs([0..P, 4 * P..5 * P]);
+    assert_eq!(changed_except(&log, &imp, s3, W1), vec![0..P, 4 * P..5 * P]);
+    log.wrote_runs([]);
+    assert_eq!(changed(&log, &imp, s3), vec![0..P, 4 * P..5 * P]);
+}
+
+/// A batch of writes over chunks with side tables takes the named lock once, not once a run
+#[test]
+fn a_batch_takes_the_named_lock_once() {
+    let (log, _) = counted();
+    // Four pages in each of two chunks, both with side tables.
+    let second = CHUNK_PAGES.to_u64() * P;
+    let imp = vec![
+        Segment {
+            offset: 0,
+            length: 4 * P,
+            guest: Some(0),
+        },
+        Segment {
+            offset: 4 * P,
+            length: 4 * P,
+            guest: Some(second),
+        },
+    ];
+    log.watch(&[0..4 * P, second..second + 4 * P]);
+    log.wrote_as(0..P, W1);
+    log.wrote_as(second..second + P, W1);
+    let s1 = harvest(&log, &[]);
+    let takes = |log: &DirtyLog| log.named_takes.load(Ordering::Relaxed);
+    let all = vec![0..P, 2 * P..3 * P, 4 * P..5 * P, 7 * P..8 * P];
+    let runs = [
+        0..P,
+        2 * P..3 * P,
+        second..second + P,
+        second + 3 * P..second + 4 * P,
+    ];
+    let before = takes(&log);
+    log.wrote_runs(runs.clone());
+    assert_eq!(takes(&log) - before, 1, "one take for the batch");
+    assert_eq!(changed_except(&log, &imp, s1, W1), all);
+    let s2 = harvest(&log, &[]);
+    let before = takes(&log);
+    log.wrote_runs_as(runs, W2);
+    assert_eq!(takes(&log) - before, 1, "one take for the named batch");
+    assert_eq!(changed_except(&log, &imp, s2, W2), vec![]);
+    assert_eq!(changed_except(&log, &imp, s2, W1), all);
+    // A batch over chunks without side tables takes no lock.
+    let (plain, _) = counted();
+    plain.watch(&[0..4 * P]);
+    plain.wrote_runs([0..P, 2 * P..3 * P]);
+    assert_eq!(takes(&plain), 0);
+}
+
 /// A wait answers at once once published, and false at once while closed or retired
 #[test]
 fn waits_refuse_at_once_while_closed_and_after_the_retire() {
