@@ -1407,10 +1407,10 @@ mod tests {
             Some(ObjHandle::Buffer(b)) => b.contents().addr(),
             _ => panic!("no buffer {obj_id:#x}"),
         };
+        // The heap over the pages block starts at the run's first page, page 2; the buffer is a
+        // page in.
         let in_ram = ram.ranges()[0].host().wrapping_add(3 * page).addr();
         let in_region = r.region.base() as usize + (heap_at + 0x2000) as usize;
-        assert_eq!(contents(&r, 30), in_ram);
-        assert_eq!(contents(&r, 41), in_region);
         for (texture, cpu, first) in [
             (31, 30, in_ram),
             (42, 41, in_region),
