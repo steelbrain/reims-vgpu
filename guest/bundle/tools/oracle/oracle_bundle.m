@@ -78,6 +78,14 @@
 //                handle's
 //   archive.slices  binary archives of a serialized archive's slices, recombined and with their
 //                bytes junked, alone and together, each opened and asked for a pipeline
+//   props2       copyIOSurfaceSharedTextureProperties: alone, for textures of more formats, sizes,
+//                usages, levels and slices
+//   argbuf.index.*  newArgumentEncoderWithBufferIndex: at div_argbuf's plain buffer (1) and at an
+//                index it has no buffer at (5), and the latter's reflection form with no reflection
+//   argbuf.ds.tex  setDepthStencilState:atIndex: of a state, and (.texnil) of nil, on an encoder of
+//                one texture; argbuf.ds.nil, of nil on one holding a depth/stencil state
+//   libforms3    a function array's library: which functions it answers, by name, with values and
+//                by descriptor, its names' order, label, device, reflection and serialization
 //   classes.spi  which classes of the device's, its shared event's and its buffer's (and
 //                IOGPU's base classes) define the SPI the cases above call
 //   libforms2    newLibraryWithFunctionArray:error: of two functions, of one twice, and the
@@ -2106,6 +2114,179 @@ static void case_libforms2(id<MTLDevice> d, int which)
 	}
 }
 
+// --- round 2: IOSurface properties, encoder indices, depth/stencil sets, array libraries ---
+
+static void props_only(id<MTLDevice> d, const char *tag, MTLPixelFormat format, NSUInteger w,
+                       NSUInteger h, MTLTextureUsage usage, NSUInteger levels, MTLTextureType type,
+                       NSUInteger slices)
+{
+	SEL sel = sel_registerName("copyIOSurfaceSharedTextureProperties:");
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.pixelFormat = format;
+	td.width = w;
+	td.height = h;
+	td.mipmapLevelCount = levels;
+	td.textureType = type;
+	td.arrayLength = slices;
+	td.usage = usage;
+	td.storageMode = MTLStorageModeShared;
+	@try {
+		NSDictionary *dict = ((id(*)(id, SEL, id))objc_msgSend)(d, sel, td);
+		NSMutableArray<NSString *> *parts = [NSMutableArray array];
+		for (id k in [dict.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+			id v = dict[k];
+			if ([v isKindOfClass:[NSData class]])
+				[parts addObject:[NSString stringWithFormat:@"%@=data(%lu)", k, (unsigned long)[v length]]];
+			else
+				[parts addObject:[NSString stringWithFormat:@"%@=%@", k, v]];
+		}
+		printf("%s format=%lu %lux%lu usage=%lu levels=%lu type=%lu slices=%lu class=%s props={%s}\n",
+		       tag, (unsigned long)format, (unsigned long)w, (unsigned long)h, (unsigned long)usage,
+		       (unsigned long)levels, (unsigned long)type, (unsigned long)slices, cls(dict),
+		       [parts componentsJoinedByString:@","].UTF8String);
+	} @catch (NSException *x) {
+		printf("%s threw %s %s\n", tag, x.name.UTF8String, x.reason.UTF8String);
+	}
+	fflush(stdout);
+}
+
+static void case_iosurf_props2(id<MTLDevice> d)
+{
+	const MTLTextureUsage rr = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	const MTLTextureUsage r = MTLTextureUsageShaderRead;
+	props_only(d, "props2.bgra64.rr", MTLPixelFormatBGRA8Unorm, 64, 64, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra64.r", MTLPixelFormatBGRA8Unorm, 64, 64, r, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra64.w", MTLPixelFormatBGRA8Unorm, 64, 64,
+	           r | MTLTextureUsageShaderWrite, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra100x30", MTLPixelFormatBGRA8Unorm, 100, 30, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra1x1", MTLPixelFormatBGRA8Unorm, 1, 1, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra65x3", MTLPixelFormatBGRA8Unorm, 65, 3, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra1920x1080", MTLPixelFormatBGRA8Unorm, 1920, 1080, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra4096", MTLPixelFormatBGRA8Unorm, 4096, 4096, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.r8.17x9", MTLPixelFormatR8Unorm, 17, 9, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.r8.1x1", MTLPixelFormatR8Unorm, 1, 1, r, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.rg8.33x5", MTLPixelFormatRG8Unorm, 33, 5, r, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.rgba16f.256", MTLPixelFormatRGBA16Float, 256, 256, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.rgba16f.33x17", MTLPixelFormatRGBA16Float, 33, 17, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.rgba32f.33x17", MTLPixelFormatRGBA32Float, 33, 17, r, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.rgb10a2.100x30", MTLPixelFormatRGB10A2Unorm, 100, 30, r, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgr10a2.640x480", MTLPixelFormatBGR10A2Unorm, 640, 480, rr, 1, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra64.mips", MTLPixelFormatBGRA8Unorm, 64, 64, rr, 7, MTLTextureType2D, 1);
+	props_only(d, "props2.bgra64.array2", MTLPixelFormatBGRA8Unorm, 64, 64, r, 1, MTLTextureType2DArray, 2);
+	props_only(d, "props2.bc1.64", MTLPixelFormatBC1_RGBA, 64, 64, r, 1, MTLTextureType2D, 1);
+}
+
+static void case_argbuf_index(id<MTLDevice> d, NSUInteger index, BOOL reflection)
+{
+	id<MTLFunction> fn = args_function(d, NULL);
+	if (fn == nil)
+		return;
+	char tag[64];
+	snprintf(tag, sizeof tag, "argbuf.index.%lu%s", (unsigned long)index, reflection ? ".nilreflection" : "");
+	printf("%s asking\n", tag);
+	fflush(stdout);
+	id<MTLArgumentEncoder> enc = reflection ? [fn newArgumentEncoderWithBufferIndex:index reflection:nil]
+	                                        : [fn newArgumentEncoderWithBufferIndex:index];
+	printf("%s encoder=%s encodedLength=%lu alignment=%lu\n", tag, cls(enc),
+	       (unsigned long)enc.encodedLength, (unsigned long)enc.alignment);
+	if (enc != nil && enc.encodedLength == 0) {
+		id<MTLBuffer> b = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+		[enc setArgumentBuffer:b offset:0];
+		printf("%s constantDataAtIndex0=%s\n", tag, [enc constantDataAtIndex:0] ? "nonnull" : "null");
+	}
+}
+
+static void case_argbuf_ds_other(id<MTLDevice> d, BOOL setNil)
+{
+	const char *tag = setNil ? "argbuf.ds.texnil" : "argbuf.ds.tex";
+	id<MTLArgumentEncoder> enc = [d newArgumentEncoderWithArguments:@[ arg_desc(MTLDataTypeTexture, 0) ]];
+	printf("%s encoder=%s encodedLength=%lu respondsSetDS=%d\n", tag, cls(enc),
+	       (unsigned long)enc.encodedLength,
+	       (int)[(id)enc respondsToSelector:@selector(setDepthStencilState:atIndex:)]);
+	fflush(stdout);
+	id<MTLBuffer> b = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	memset(b.contents, 0xa5, 64);
+	[enc setArgumentBuffer:b offset:0];
+	[enc setDepthStencilState:setNil ? nil : probe_ds(d) atIndex:0];
+	dump_bytes(tag, "after set", b.contents, 16);
+}
+
+static void case_argbuf_ds_nil(id<MTLDevice> d)
+{
+	id<MTLArgumentEncoder> enc =
+	    [d newArgumentEncoderWithArguments:@[ arg_desc(MTLDataTypeTexture, 0),
+		                                     arg_desc(MTLDataTypeDepthStencilState, 1) ]];
+	printf("argbuf.ds.nil encoder=%s encodedLength=%lu\n", cls(enc), (unsigned long)enc.encodedLength);
+	fflush(stdout);
+	id<MTLBuffer> b = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	memset(b.contents, 0xa5, 64);
+	[enc setArgumentBuffer:b offset:0];
+	[enc setDepthStencilState:nil atIndex:1];
+	dump_bytes("argbuf.ds.nil", "after nil", b.contents, 32);
+	fflush(stdout);
+	id<MTLDepthStencilState> none[1] = {nil};
+	[enc setDepthStencilStates:none withRange:NSMakeRange(1, 1)];
+	dump_bytes("argbuf.ds.nil", "after nil range", b.contents, 32);
+}
+
+static void case_libforms3(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+	id<MTLFunction> visible = [lib newFunctionWithName:@"div_visible"];
+	id<MTLFunction> stitchable = [lib newFunctionWithName:@"div_stitchable"];
+	id<MTLFunction> kernel = [lib newFunctionWithName:@"div_kernel" constantValues:kernel_values(2.0f) error:&e];
+	SEL arr = sel_registerName("newLibraryWithFunctionArray:error:");
+	id<MTLLibrary> l = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, arr, @[ stitchable, visible, kernel ], &e);
+	printf("libforms3 library=%s functionNames=%s label=%s deviceSame=%d error=%s\n", cls(l),
+	       [l.functionNames componentsJoinedByString:@","].UTF8String,
+	       l.label ? l.label.UTF8String : "nil", l.device == d, err_text(e));
+	id<MTLFunction> v = [l newFunctionWithName:@"div_visible"];
+	id<MTLFunction> v2 = [l newFunctionWithName:@"div_visible"];
+	id<MTLFunction> k = [l newFunctionWithName:@"div_kernel"];
+	printf("libforms3 visible sameAsGiven=%d sameTwice=%d name=%s functionType=%ld kernelSame=%d "
+	       "kernelConstants=%lu\n",
+	       v == visible, v == v2, v.name.UTF8String, (long)v.functionType, k == kernel,
+	       (unsigned long)k.functionConstantsDictionary.count);
+	printf("libforms3 missing=%s\n", cls([l newFunctionWithName:@"div_vertex"]));
+	e = nil;
+	id<MTLFunction> kc = [l newFunctionWithName:@"div_kernel" constantValues:kernel_values(3.0f) error:&e];
+	printf("libforms3 kernelWithValues=%s same=%d error=%s\n", cls(kc), kc == kernel, err_text(e));
+	e = nil;
+	id<MTLFunction> vc = [l newFunctionWithName:@"div_visible" constantValues:[MTLFunctionConstantValues new] error:&e];
+	printf("libforms3 visibleWithValues=%s same=%d error=%s\n", cls(vc), vc == visible, err_text(e));
+	MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+	fd.name = @"div_stitchable";
+	e = nil;
+	id<MTLFunction> sd = [l newFunctionWithDescriptor:fd error:&e];
+	printf("libforms3 descriptor=%s same=%d error=%s\n", cls(sd), sd == stitchable, err_text(e));
+	fd.name = @"nope";
+	e = nil;
+	sd = [l newFunctionWithDescriptor:fd error:&e];
+	printf("libforms3 descriptorMissing=%s error=%s\n", cls(sd), err_text(e));
+	e = nil;
+	id<MTLFunction> nc = [l newFunctionWithName:@"nope" constantValues:[MTLFunctionConstantValues new] error:&e];
+	printf("libforms3 missingWithValues=%s error=%s\n", cls(nc), err_text(e));
+	SEL refl = sel_registerName("reflectionForFunctionWithName:");
+	if ([(id)l respondsToSelector:refl]) {
+		id r = ((id(*)(id, SEL, id))objc_msgSend)(l, refl, @"div_visible");
+		printf("libforms3 reflection=%s\n", cls(r));
+	}
+	SEL ext = sel_registerName("externFunctionNames");
+	if ([(id)l respondsToSelector:ext])
+		printf("libforms3 externFunctionNames=%s\n",
+		       [((id(*)(id, SEL))objc_msgSend)(l, ext) componentsJoinedByString:@","].UTF8String);
+	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"div-array.metallib"]];
+	e = nil;
+	if ([(id)l respondsToSelector:@selector(serializeToURL:error:)]) {
+		BOOL ok = [(id)l serializeToURL:url error:&e];
+		printf("libforms3 serialize=%d error=%s\n", ok, err_text(e));
+	}
+	e = nil;
+	id<MTLLibrary> other = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, arr, @[ visible, stitchable ], &e);
+	printf("libforms3 reversed functionNames=%s\n", [other.functionNames componentsJoinedByString:@","].UTF8String);
+}
+
 // --- who answers the SPI (classes.spi) ---------------------------------------------------
 
 // Whether `c` itself (not a superclass) has an instance method `sel`.
@@ -2173,6 +2354,8 @@ static const char *const kCases[] = {
     "argbuf.ds.function", "argbuf.binding", "argbuf.binding.plain", "argbuf.binding.lib",
     "argbuf.reflection", "iosurf.props",    "iosurf.buffer", "iosurf.buffer.420v", "event.port",
     "archive.slices",   "libforms2",        "libforms.kernel", "libforms.vertex", "classes.spi",
+    "props2",           "argbuf.index.1",   "argbuf.index.5", "argbuf.index.5.nilreflection",
+    "argbuf.ds.tex",    "argbuf.ds.texnil", "argbuf.ds.nil", "libforms3",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -2339,6 +2522,22 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_libforms2(d, 2);
 	else if (!strcmp(c, "classes.spi"))
 		case_classes_spi(d);
+	else if (!strcmp(c, "props2"))
+		case_iosurf_props2(d);
+	else if (!strcmp(c, "argbuf.index.1"))
+		case_argbuf_index(d, 1, NO);
+	else if (!strcmp(c, "argbuf.index.5"))
+		case_argbuf_index(d, 5, NO);
+	else if (!strcmp(c, "argbuf.index.5.nilreflection"))
+		case_argbuf_index(d, 5, YES);
+	else if (!strcmp(c, "argbuf.ds.tex"))
+		case_argbuf_ds_other(d, NO);
+	else if (!strcmp(c, "argbuf.ds.texnil"))
+		case_argbuf_ds_other(d, YES);
+	else if (!strcmp(c, "argbuf.ds.nil"))
+		case_argbuf_ds_nil(d);
+	else if (!strcmp(c, "libforms3"))
+		case_libforms3(d);
 	else {
 		fprintf(stderr, "no case %s\n", c);
 		return 2;
