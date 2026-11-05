@@ -3951,13 +3951,13 @@ mod tests {
     /// nothing of the closed context's.
     #[test]
     fn a_close_gives_an_unbegun_answer_s_ticket_back_as_it_takes_the_tables() {
-        let (_p, mut dec, posted) = posting(false);
+        let (p, mut dec, posted) = posting(false);
         let sequencer = Arc::clone(&dec.shared.sequencer);
         assert!(answer(&dec, &asking(192, 122), &posted, true));
         assert_eq!(sequencer.out(), 1, "the answer's ticket");
         let after = sequencer.mark();
         dec.end_message();
-        let (dropped, closed) = dec.close_tables(0);
+        let (dropped, closed) = dec.close_tables(&p.device(), 0);
         assert!(dropped > 0, "the context's objects, its queue among them");
         assert_eq!(
             sequencer.out(),
