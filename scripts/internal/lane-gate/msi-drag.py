@@ -19,8 +19,9 @@ path's span; otherwise the case is not run (moved=0), not a number. Mission Cont
 where the display updated after a first Control-Up. Writes RUNDIR/drag.txt, one line a case:
   drag CASE moved=1 composites_s= gap_p99_ms= gap_max_ms= qemu_cpu= gfx_cpu= window_moves_s= ...
 the composites being the host log's display updates ("the display shows IOSurface") in the
-case's host-time span, the gaps those between them (and the span's ends), the CPU QEMU's and its
-graphics thread's, in percent of a core. Mission Control's numbers are over its animations: each
+case's host-time span, the gaps those between them (and the span's ends), the CPU QEMU's (the
+process's own, its exited threads' included) and its graphics threads' (each to its last reading,
+Window), in percent of a core. Mission Control's numbers are over its animations: each
 from the first display update after a Control-Up to its last within 0.8 s (anim_ms their median
 length, start_ms the median wait from the key to the first update, animated those with two
 updates or more); its CPU over the whole case.
@@ -149,6 +150,67 @@ def threads(pid):
     return t
 
 
+class Window:
+    """QEMU's CPU over a measured window. The process's own utime+stime (/proc/PID/stat, which keeps
+    what its exited threads used) at both ends gives QEMU's total. Each graphics thread's ticks are
+    its last reading: the known graphics threads' every 20 ms, and every 100 ms a scan of the names
+    finds new ones (a thread can name itself after it starts). A thread born in the window counts
+    from 0, and one that exits in it counts to its last reading (at most 20 ms of its time lost),
+    where a bare look at the window's ends counted the first as 0 and missed the second."""
+
+    GFX = "reims-vgpu.gra"
+
+    def __init__(self, pid):
+        self.pid, self.seen, self.gfx, self.done, self.th = pid, {}, set(), threading.Event(), None
+
+    def proc(self):
+        st = open(f"/proc/{self.pid}/stat").read().rsplit(")", 1)[1].split()
+        return ("_proc", int(st[11]) + int(st[12]))
+
+    def scan(self):
+        for tid in os.listdir(f"/proc/{self.pid}/task"):
+            try:
+                if open(f"/proc/{self.pid}/task/{tid}/comm").read().startswith(self.GFX):
+                    self.gfx.add(tid)
+            except OSError:
+                pass
+
+    def read(self):
+        for tid in list(self.gfx):
+            try:
+                comm = open(f"/proc/{self.pid}/task/{tid}/comm").read().strip()
+                st = open(f"/proc/{self.pid}/task/{tid}/stat").read().rsplit(")", 1)[1].split()
+                self.seen[tid] = (comm, int(st[11]) + int(st[12]))
+            except OSError:
+                self.gfx.discard(tid)
+
+    def run(self):
+        k = 0
+        while not self.done.wait(0.02):
+            k += 1
+            if k % 5 == 0:
+                self.scan()
+            self.read()
+
+    def start(self):
+        a = threads(self.pid)
+        self.seen = dict(a)
+        self.gfx = {tid for tid, (comm, _) in a.items() if comm.startswith(self.GFX)}
+        a["_proc"] = self.proc()
+        self.th = threading.Thread(target=self.run, daemon=True)
+        self.th.start()
+        return a
+
+    def stop(self):
+        self.done.set()
+        self.th.join()
+        self.scan()
+        self.read()
+        b = dict(self.seen)
+        b["_proc"] = self.proc()
+        return b
+
+
 def local_epoch(stamp):
     m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\.(\d{3})([+-])(\d\d)(\d\d)", stamp)
     if not m:
@@ -218,10 +280,11 @@ def case(q, name):
     time.sleep(0.3)
     q.button(True)
     time.sleep(0.1)
-    a, t0 = threads(pid), time.time()
+    win = Window(pid)
+    a, t0 = win.start(), time.time()
     pace(SECONDS, lambda i, n: q.move(x0 + RADIUS * math.sin(2 * math.pi * i / (RATE * 2)),
                                       y0 + 0.6 * RADIUS * (1 - math.cos(2 * math.pi * i / (RATE * 2)))))
-    t1, b = time.time(), threads(pid)
+    t1, b = time.time(), win.stop()
     q.move(x0, y0)
     time.sleep(0.05)
     q.button(False)
@@ -254,14 +317,14 @@ def case(q, name):
 
 def measured(a, b, t0, t1, spans):
     """The display updates in SPANS (their rate over the spans' time, the gaps between them and
-    each span's ends), and QEMU's CPU from t0 to t1 (threads() a at t0, b at t1)."""
+    each span's ends), and QEMU's CPU from t0 to t1 (Window's start() a at t0, stop() b at t1)."""
     hz = os.sysconf("SC_CLK_TCK")
-    cpu = {"qemu": 0, "gfx": 0}
+    # QEMU's from the process's own ticks; the graphics threads' from their last samples, a thread
+    # born in the window counted from 0 (Window).
+    cpu = {"qemu": b["_proc"][1] - a["_proc"][1], "gfx": 0}
     for tid, (comm, ticks) in b.items():
-        d = ticks - a.get(tid, (comm, ticks))[1]
-        cpu["qemu"] += d
-        if comm.startswith("reims-vgpu.gra"):
-            cpu["gfx"] += d
+        if tid != "_proc" and comm.startswith("reims-vgpu.gra"):
+            cpu["gfx"] += ticks - a.get(tid, (comm, 0))[1]
     n, gaps, total = 0, [], 0.0
     for s0, s1 in spans:
         ts = composites(s0, s1)
@@ -340,10 +403,11 @@ def resize(q):
     time.sleep(0.3)
     q.button(True)
     time.sleep(0.1)
-    a, t0 = threads(pid), time.time()
+    win = Window(pid)
+    a, t0 = win.start(), time.time()
     pace(SECONDS, lambda i, n: q.move(x0 + RADIUS * math.sin(2 * math.pi * i / (RATE * 2)),
                                       y0 + 0.6 * RADIUS * (1 - math.cos(2 * math.pi * i / (RATE * 2)))))
-    t1, b = time.time(), threads(pid)
+    t1, b = time.time(), win.stop()
     q.move(x0, y0)
     time.sleep(0.05)
     q.button(False)
@@ -417,13 +481,14 @@ def mission(q):
         return {"moved": 0, "why": f"{shown} display updates in the 0.8 s after Control-Up: Mission Control "
                                    f"did not open"}
     pid = int(open(os.path.join(B, "qemu.pid")).read())
-    a, t0 = threads(pid), time.time()
+    win = Window(pid)
+    a, t0 = win.start(), time.time()
     keys = []
     while time.time() - t0 < SECONDS - 0.9 or len(keys) % 2:
         keys.append(time.time())
         q.key("ctrl", "up")
         time.sleep(max(0.0, keys[-1] + 1.0 - time.time()))
-    t1, b = time.time(), threads(pid)
+    t1, b = time.time(), win.stop()
     time.sleep(1.0)
     guest("killall TextEdit", gui=True)
     q.key("meta_l", "w")
