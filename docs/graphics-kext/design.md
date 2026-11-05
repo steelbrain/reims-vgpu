@@ -2164,8 +2164,11 @@ committed in. The bundle names the order instead, as it posts each buffer:
   writes of other queues the buffer names.
 - What will not signal is signalled for it: a buffer stood in for signals from
   its stand-in, and one with no stand-in from a command buffer of its own on its
-  queue. A queue's destroy, or its context's close, signals the last value a
-  buffer waits for of it. A buffer the host has taken that holds no
+  queue. Where the queue makes no command buffer (the platform out of memory),
+  the host sets the timeline on the CPU, once it has reached what the queue's
+  command buffers committed before signal, so no signal comes before the
+  queue's earlier work. A queue's destroy, or its context's close, signals the
+  last value a buffer waits for of it. A buffer the host has taken that holds no
   `SURFACE_ORDER` signals where another queue's buffer waits past what the
   queue has signalled.
 - A queue is known to the order from its create's answer on: the device tells

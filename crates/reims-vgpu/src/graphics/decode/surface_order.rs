@@ -33,8 +33,9 @@
 //!   nothing, so a slot a process left as it died, or one written wrong, holds nothing.
 //! - **A signal never overtakes the queue's work.** Each value is signalled by a command buffer on
 //!   the queue's own host queue, after the work committed there before it. A CPU set stands in only
-//!   for a queue that makes no command buffer, and may release a waiter before that queue's last
-//!   work ends.
+//!   for a queue that makes no command buffer, and waits on the CPU first for the timeline to
+//!   reach what the queue's committed buffers signal, so it releases no waiter before them either
+//!   ([`Release::signal`]).
 //!
 //! - **Work the host starts off the command buffer waits too.** A video session's decode runs on
 //!   a queue of its own as the host walks the buffer, so the buffer's GPU waits do not hold it:
@@ -80,9 +81,13 @@ pub(crate) struct Marks {
     taken: AtomicU64,
     /// The highest seqno a buffer of another queue waits for.
     waited: AtomicU64,
-    /// The highest seqno a command buffer committed on the queue signals; 0 for none. Raised under
-    /// the order's lock.
+    /// The highest seqno a command buffer on the queue signals; 0 for none. Raised under the
+    /// order's lock, as the signal is encoded.
     signalled: AtomicU64,
+    /// The highest seqno a command buffer committed on the queue signals: raised once it is
+    /// committed, so a buffer that signals and is then not committed (its walk faulted) leaves it
+    /// where it was.
+    committed: AtomicU64,
     /// The highest seqno signalled whose command buffer has finished.
     done: AtomicU64,
     /// How far the queue's buffers have been committed, which a buffer of another queue that
@@ -111,6 +116,28 @@ impl Signalled {
     pub(crate) fn finished(&self) {
         self.marks.done.fetch_max(self.seqno, Ordering::AcqRel);
     }
+
+    /// What notes the command buffer committed, for after its commit ([`Committed::note`]).
+    pub(crate) fn committed(&self) -> Committed {
+        Committed {
+            marks: Arc::clone(&self.marks),
+            seqno: self.seqno,
+        }
+    }
+}
+
+/// A command buffer that signals its queue's timeline, to note once it is committed: a CPU set
+/// that stands in for a later signal of the queue waits for its signal ([`Release::signal`]).
+pub(crate) struct Committed {
+    marks: Arc<Marks>,
+    seqno: u64,
+}
+
+impl Committed {
+    /// The command buffer is committed.
+    pub(crate) fn note(&self) {
+        self.marks.committed.fetch_max(self.seqno, Ordering::AcqRel);
+    }
 }
 
 /// A signal of a queue's timeline that no buffer of the guest's carries, decided under the
@@ -120,17 +147,28 @@ pub(crate) struct Release<P: Platform> {
     event: P::SharedEvent,
     marks: Arc<Marks>,
     value: u64,
+    /// What the queue's command buffers committed when it was decided signal
+    /// ([`Marks::committed`]).
+    after: u64,
 }
 
 impl<P: Platform> Release<P> {
     /// Signals the timeline to its value with a command buffer of `host_queue` holding that alone,
-    /// after the queue's work before it; where there is no queue or it makes no command buffer,
-    /// sets it on the CPU.
-    pub(crate) fn signal(self, host_queue: Option<&P::CommandQueue>) -> RaiseResult<()> {
+    /// after the queue's work before it. Where there is no queue or it makes no command buffer (the
+    /// platform out of memory), sets it on the CPU, once the timeline has reached what the queue's
+    /// command buffers committed before the release was decided signal, as the command buffer's
+    /// signal would have come after them: waiting on the CPU, with no lock held, until it has or a
+    /// reset of the device comes (`cancel`), which ends every wait for another queue's buffers.
+    pub(crate) fn signal(
+        self,
+        host_queue: Option<&P::CommandQueue>,
+        cancel: &commit_order::Cancel,
+    ) -> RaiseResult<()> {
         let Release {
             event,
             marks,
             value,
+            after,
         } = self;
         let cb = match host_queue {
             Some(q) => q.command_buffer(ON)?,
@@ -139,19 +177,28 @@ impl<P: Platform> Release<P> {
         match cb {
             Some(cb) => {
                 cb.encode_signal(Some(EventRef::Shared(&event)), value)?;
+                let done = Arc::clone(&marks);
                 // Raised as the platform sees the signal's buffer done, with no handler thread
                 // woken between.
                 cb.add_completion_seen_handler(
                     ON,
                     Box::new(move |_: CompletedInfo| {
-                        marks.done.fetch_max(value, Ordering::AcqRel);
+                        done.done.fetch_max(value, Ordering::AcqRel);
                     }),
                 )?;
                 cb.commit(ON)?;
+                marks.committed.fetch_max(value, Ordering::AcqRel);
             }
             None => {
+                let begun = cancel.now();
+                while marks.done.load(Ordering::Acquire) < after && !cancel.cut_since(begun) {
+                    if event.wait_until_signaled_value(after, CPU_WAIT_SLICE_MS) {
+                        break;
+                    }
+                }
                 event.set_signaled_value(value)?;
                 marks.done.fetch_max(value, Ordering::AcqRel);
+                marks.committed.fetch_max(value, Ordering::AcqRel);
             }
         }
         Ok(())
@@ -496,10 +543,12 @@ impl<P: Platform> SurfaceOrder<P> {
     ) -> Option<Release<P>> {
         let (event, marks) = self.signal_due(device, queue, seqno, names)?;
         self.counts.released += 1;
+        let after = marks.committed.load(Ordering::Acquire);
         Some(Release {
             event,
             marks,
             value: seqno,
+            after,
         })
     }
 
@@ -543,10 +592,12 @@ impl<P: Platform> SurfaceOrder<P> {
             {
                 marks.signalled.fetch_max(waited, Ordering::AcqRel);
                 self.counts.released += 1;
+                let after = marks.committed.load(Ordering::Acquire);
                 release = Some(Release {
                     event: event.clone_ref(),
                     marks,
                     value: waited,
+                    after,
                 });
             }
         }
@@ -985,7 +1036,7 @@ mod tests {
     /// A buffer that is not carried out still signals what may be waited for of it: its stand-in
     /// does; with none (its queue made no command buffer for it or its stand-in), a command
     /// buffer of its own on its queue does; and where its queue makes no command buffer, the
-    /// timeline is set on the CPU
+    /// timeline is set on the CPU, once the queue's earlier signals have come
     #[test]
     fn a_buffer_not_carried_out_still_signals() {
         let mut r = rig();
@@ -1016,6 +1067,8 @@ mod tests {
         );
         assert!(calls.iter().any(|c| c.sel == "commit"));
 
+        // The stand-in's and the signal's of its own have finished.
+        r.p.world().complete_all(CompleteOn::Caller);
         for _ in 0..3 {
             r.p.script().push("commandBuffer", Step::Nil);
         }
@@ -1028,6 +1081,59 @@ mod tests {
         assert_eq!(set, [(a, 11)], "set on the CPU");
         assert_eq!(r.timeline(A)[0..2], [11, 11]);
         assert_eq!(r.dec.shared.surface_order.lock().counts().released, 2);
+    }
+
+    /// A CPU set that stands in for a buffer's signal, where its queue makes no command buffer,
+    /// comes once the queue's command buffers committed before it have reached their signals, as
+    /// a command buffer's signal would: it releases a buffer of another queue that waits for the
+    /// buffer no earlier than the queue's work before it ends
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: a thread carries the buffer out
+    fn a_cpu_set_for_a_buffer_not_carried_out_waits_for_its_queue_s_earlier_work() {
+        use std::time::Duration;
+        let mut r = rig();
+        // A's buffer 1 signals its timeline at 1, committed and not finished.
+        let (outcome, calls) = r.commit(A, 1, &ops(Some(&[]), &[]));
+        assert_eq!(outcome, Ok(()));
+        let a = r.event(A);
+        assert_eq!(events(&calls, SIGNAL), [(a, 1)]);
+        // B's buffer waits for A's buffer 2.
+        let (_, calls) = r.commit(B, 1, &ops(Some(&[(A, 2)]), &[]));
+        assert_eq!(events(&calls, WAIT), [(a, 2)]);
+        // A's queue makes no command buffer for its buffer 2, its stand-in, or a signal of its
+        // own: the timeline is set on the CPU, on the thread that carries the buffer out.
+        for _ in 0..3 {
+            r.p.script().push("commandBuffer", Step::Nil);
+        }
+        let p = Arc::clone(&r.p);
+        let begun = p.call_log().mark();
+        let carrying = std::thread::spawn(move || {
+            let committed = r.commit(A, 2, &ops(Some(&[]), &[]));
+            (r, committed)
+        });
+        // The set, or a wait before it, comes: a set first came before A's buffer 1 finished.
+        let mut seen = Vec::new();
+        for _ in 0..3000 {
+            seen = p.call_log().sels_since(begun);
+            if seen.contains(&SET) || seen.contains(&"waitUntilSignaledValue:timeoutMS:") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !seen.contains(&SET),
+            "the timeline was set before A's buffer 1 finished: {seen:?}"
+        );
+        let finished = p.call_log().mark();
+        p.world().complete_all(CompleteOn::Caller);
+        let (r, (outcome, _)) = carrying.join().unwrap();
+        assert_eq!(outcome, Err(DecodeError::Refused));
+        let set: Vec<(u64, u64)> = (p.call_log().since(finished).iter())
+            .filter(|c| c.sel == SET)
+            .map(|c| (c.obj.0, c.args[0].as_u64().unwrap_or(0)))
+            .collect();
+        assert_eq!(set, [(a, 2)], "set on the CPU once A's buffer 1 finished");
+        assert_eq!(r.timeline(A)[0..2], [2, 2]);
     }
 
     /// A queue's destroy, and its context's close, signal the highest value a buffer of another

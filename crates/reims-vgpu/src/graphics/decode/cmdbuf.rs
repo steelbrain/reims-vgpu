@@ -1345,6 +1345,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         // queue's surface timeline is decided in its ring's order ([`Self::order_signal`]).
         self.wait_turn();
         let signalled = self.order_signal(device, queue_obj_id, &marks, seqno, order, &cb)?;
+        let signal_committed = signalled.as_ref().map(Signalled::committed);
         // Register the submission and completion paths and commit: no scheduled or completed
         // handler, so the platform posts the buffer's records from the threads that submit it
         // and see it complete, waking no handler thread.
@@ -1383,6 +1384,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                 && let Some(order_hold) = &order_hold
             {
                 order_hold.release();
+            }
+            if committed.is_ok()
+                && let Some(signal) = &signal_committed
+            {
+                signal.note();
             }
             committed
         };
@@ -1530,6 +1536,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.wait_turn();
         let signalled =
             self.order_signal(device, queue_obj_id, &counts.order, seqno, names, &cb)?;
+        let signal_committed = signalled.as_ref().map(Signalled::committed);
         let handler = self.completed_handler(
             m.cb_obj_id,
             m.header.seqno,
@@ -1544,6 +1551,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         // ([`Self::wait_to_commit`]).
         self.wait_to_commit();
         commit_holding(&cb, held.as_deref())?;
+        if let Some(signal) = &signal_committed {
+            signal.note();
+        }
         Ok(true)
     }
 
@@ -1590,7 +1600,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let release =
             (self.shared.surface_order.lock()).release(device, queue_obj_id, seqno, names);
         match release {
-            Some(release) => release.signal(host_queue),
+            Some(release) => release.signal(host_queue, &self.shared.commit_cancel),
             None => Ok(()),
         }
     }

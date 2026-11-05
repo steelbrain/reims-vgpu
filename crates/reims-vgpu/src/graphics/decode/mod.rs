@@ -1547,7 +1547,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.queue_ended(queue_obj_id);
         let release = self.shared.surface_order.lock().ended(queue_obj_id);
         if let Some(release) = release
-            && let Err(raise) = refusing(|| release.signal(queue))
+            && let Err(raise) = refusing(|| release.signal(queue, &self.shared.commit_cancel))
         {
             log::warn!(
                 target: "reims_vgpu::graphics",
