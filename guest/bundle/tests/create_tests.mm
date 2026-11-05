@@ -201,9 +201,8 @@ void test_refused_buffer_create_is_nil()
 	CHECK(r.taken.size() == 4);
 }
 
-// A device heap and a Shared one over a region block are nil, the block back; a buffer at an offset
-// of a Placement heap, and one an Automatic heap places, are nil, the Automatic heap's bytes
-// free again.
+// A device heap is nil; a buffer at an offset of a Placement heap, and one an Automatic heap
+// places, are nil, the Automatic heap's bytes free again.
 void test_refused_heap_create_is_nil()
 {
 	Refusing &r = *new Refusing();
@@ -212,26 +211,13 @@ void test_refused_heap_create_is_nil()
 	hd.size = 0x10000;
 	hd.storageMode = MTLStorageModePrivate;
 	hd.type = MTLHeapTypePlacement;
-	MTLHeapDescriptor *shared = [hd copy];
-	shared.storageMode = MTLStorageModeShared;
 	MTLHeapDescriptor *automatic = [hd copy];
 	automatic.type = MTLHeapTypeAutomatic;
 	@autoreleasepool {
-		r.allow = 2;
+		r.allow = 1;
 		CHECK([RgfxHeap heapWithDescriptor:hd device:nil serializer:&r.ser] != nil);
-		CHECK([RgfxHeap heapForDeviceWithDescriptor:shared
-		                                  maxLength:0
-		                                     region:&b.region
-		                                     device:nil
-		                                 serializer:&r.ser] != nil);
 	}
-	CHECK(b.live.empty());
 	CHECK([RgfxHeap heapWithDescriptor:hd device:nil serializer:&r.ser] == nil);
-	CHECK([RgfxHeap heapForDeviceWithDescriptor:shared
-	                                  maxLength:0
-	                                     region:&b.region
-	                                     device:nil
-	                                 serializer:&r.ser] == nil);
 	CHECK(b.live.empty());
 
 	r.allow = 2;
@@ -250,8 +236,8 @@ void test_refused_heap_create_is_nil()
 	      nil);
 	CHECK([placing newBufferWithLength:0x1000 options:MTLResourceStorageModePrivate] == nil);
 	CHECK([placing maxAvailableSizeWithAlignment:1] == room);
-	CHECK(r.taken == std::vector<uint32_t>({RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-	                                        RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_CREATE,
+	CHECK(r.taken == std::vector<uint32_t>({RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_CREATE,
+	                                        RGFX_CMD_HEAP_CREATE,
 	                                        RGFX_CMD_BUFFER_AT_OFFSET,
 	                                        RGFX_CMD_BUFFER_AT_OFFSET}));
 }
@@ -468,11 +454,12 @@ void test_refused_create_gives_its_gpu_address_back()
 		case 1:
 			return [RgfxHeap heapWithDescriptor:hd device:nil serializer:&r.ser];
 		case 2:
-			return [RgfxHeap heapForDeviceWithDescriptor:shared
-			                                   maxLength:0
-			                                      region:&b.region
-			                                      device:nil
-			                                  serializer:&r.ser];
+			return [RgfxHeap heapOverHostMemoryWithDescriptor:shared
+			                                     regionOffset:RGFX_ALLOCATIONS_OFFSET
+			                                         contents:b.mem.data() + RGFX_ALLOCATIONS_OFFSET
+			                                      deallocator:nil
+			                                           device:nil
+			                                       serializer:&r.ser];
 		case 3:
 			return [RgfxBuffer bufferOverHostMemoryWithContents:b.mem.data() + RGFX_ALLOCATIONS_OFFSET
 			                                       regionOffset:RGFX_ALLOCATIONS_OFFSET

@@ -477,6 +477,23 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
 		return;
 	}
 	const uint64_t format = descriptor.pixelFormat;
+	// A depth or stencil texture the CPU reaches: the x86 Macs' validation keeps their textures
+	// Private (oracle_bundle buftex.depth and devtex.*, AMD 5300M and Intel 630, macOS 26.7.1).
+	const bool depthOrStencil = format == MTLPixelFormatDepth16Unorm ||
+	                            format == MTLPixelFormatDepth32Float ||
+	                            format == MTLPixelFormatStencil8 ||
+	                            format == MTLPixelFormatDepth24Unorm_Stencil8 ||
+	                            format == MTLPixelFormatDepth32Float_Stencil8 ||
+	                            format == MTLPixelFormatX32_Stencil8 ||
+	                            format == MTLPixelFormatX24_Stencil8;
+	if (depthOrStencil && (descriptor.storageMode == MTLStorageModeShared ||
+	                       descriptor.storageMode == MTLStorageModeManaged)) {
+		RgfxMetalAssertionFailed(
+		    "-[MTLTextureDescriptorInternal validateWithDevice:]",
+		    @"Texture Descriptor Validation\nMTLTextureDescriptor: Depth, Stencil, DepthStencil "
+		    @"textures cannot be allocated with MTLStorageModeShared or MTLStorageModeManaged on "
+		    @"this device.\n");
+	}
 	const MTLTextureType type = descriptor.textureType;
 	const bool multisample =
 	    type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;

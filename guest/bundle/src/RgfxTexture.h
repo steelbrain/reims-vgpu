@@ -127,8 +127,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// newTextureWithDescriptor:, docs/graphics-kext/dgpu-oracle.md, Q12): one of a three-channel
 /// format (45 to 48, 95 to 100 and 120 to 122), which Metal's setter takes and Metal describes no
 /// format for, and a multisample one of a compressed or 4:2:2 format, or of
-/// MTLPixelFormatUnspecialized. The device's and the heaps' texture creators call it before they
-/// send the host anything; it returns for any other descriptor.
+/// MTLPixelFormatUnspecialized. And, as the AMD 5300M and the Intel 630 under macOS 26.7.1 end it
+/// (oracle_bundle buftex.depth and devtex.*: Depth32Float in Shared storage over a buffer, and in
+/// Shared or Managed from the device, Stencil8 in Managed; Private passes; the M3 Max makes the
+/// one over a buffer), at a depth, stencil or depth-stencil texture in Shared or Managed storage. The device's, the heaps' and a buffer's texture creators
+/// call it before they send the host anything; it returns for any other descriptor.
 void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor);
 
 /// Ends the process, with Metal's words, where `minimumLinearTextureAlignmentForPixelFormat:` ends

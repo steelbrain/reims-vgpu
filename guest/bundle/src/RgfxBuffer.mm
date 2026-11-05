@@ -666,6 +666,9 @@ RGFX_RESOURCE_SPI
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
 {
+	// Where Metal's descriptor validation ends the process, so does the bundle: a depth texture
+	// over the buffer's bytes, as the x86 Macs end it (rgfxEndAtInvalidTextureDescriptor).
+	rgfxEndAtInvalidTextureDescriptor(descriptor);
 	if (descriptor != nil && descriptor.mipmapLevelCount > 1) {
 		RgfxMetalAssertionFailed(
 		    "_mtlValidateStrideTextureParameters",

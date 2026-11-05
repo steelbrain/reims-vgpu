@@ -57,15 +57,14 @@ NS_ASSUME_NONNULL_BEGIN
                                  serializer:(nullable RgfxSerializer *)serializer;
 
 #ifdef __cplusplus
-/// The heap `newHeapWithDescriptor:` makes: a Shared one over a zeroed block of `region` in
-/// Metal's 16 KiB pages (heapOverHostMemoryWithDescriptor:), which the host sees in place, and
-/// a heap of any other mode the host's own (heapWithDescriptor:).
+/// The heap `newHeapWithDescriptor:` makes: the host's own (heapWithDescriptor:), of any mode
+/// but Shared. A Shared one ends the process with Metal's words, sending nothing, as the heap
+/// descriptor validation of the AMD 5300M and the Intel 630 under macOS 26.7.1 does (oracle_bundle
+/// heapbuffers; the M3 Max makes one); `region` is unused.
 ///
 /// Nil where Metal makes none (measured on the M3 Max, macOS 27.0.1, plain and under
-/// MTL_DEBUG_LAYER, Shared and Private, Automatic and Placement): for a size of 0, and for one
-/// past `maxLength` (the device's maxBufferLength, at which Metal makes one; 0 holds none
-/// back). Nil too where there is no `region`, or it has no room for a Shared one, as Metal
-/// makes no Shared heap without its memory, never one whose buffers the GPU does not see.
+/// MTL_DEBUG_LAYER, Private, Automatic and Placement): for a size of 0, and for one past
+/// `maxLength` (the device's maxBufferLength, at which Metal makes one; 0 holds none back).
 + (nullable instancetype)heapForDeviceWithDescriptor:(nullable MTLHeapDescriptor *)descriptor
                                            maxLength:(NSUInteger)maxLength
                                               region:(nullable RgfxRegion *)region
