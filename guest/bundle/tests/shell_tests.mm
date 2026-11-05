@@ -12425,6 +12425,19 @@ void test_iosurface_nil_is_logged()
 	CHECK(rgfxIOSurfaceNilLog(s, "arguments", &line) == 1 &&
 	      has(line, "no descriptor"));
 	CHECK(rgfxIOSurfaceNilLog(s, "buffer", &line) == 0 && line.empty());
+	// A block-compressed format, which Metal makes but the host makes no texture of over a
+	// surface's rows (oracle_surftex, Q20), answers nil before the surface's pages are looked at.
+	MTLTextureDescriptor *bc1 =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC1_RGBA
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	@autoreleasepool {
+		CHECK(texture(bc1, 0) == nil);
+	}
+	CHECK(rgfxIOSurfaceNilLog(s, "descriptor", &line) == 1 &&
+	      has(line, "a block-compressed format over a surface, which the host makes no texture "
+	                "of"));
 	CHECK(region.used() == 0 && ringEmpty(fx.ring));
 	CFRelease(s);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region

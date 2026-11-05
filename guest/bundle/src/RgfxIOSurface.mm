@@ -1209,6 +1209,27 @@ void rgfxIOSurfaceKeepCountClients(bool on)
 	gCountsClients.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
+namespace {
+
+// Why the bundle answers nil for a texture of `descriptor` over a surface, which every rule Metal
+// ends the process at passed (rgfxEndAtInvalidSurfaceTexture); null where it makes one. A
+// block-compressed format (BC1 to BC7): the AMD 5300M and the Intel 630 under macOS 26.7.1 make
+// the texture wherever its rows fit, over a surface with planes or without, in Managed or Private
+// storage (oracle_surftex, Q20), but the host's runtime makes none over a surface's rows
+// (metal2vulkan's NotLinear). The nil is the host's limit, not Metal's: a texture the host then
+// refused would fail every command buffer that named it, where the guest's frameworks can take a
+// nil and go another way.
+const char *rgfxSurfaceTextureNil(MTLTextureDescriptor *descriptor)
+{
+	const uint64_t f = descriptor.pixelFormat;
+	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	if (in(130, 135) || in(140, 143) || in(150, 153))
+		return "a block-compressed format over a surface, which the host makes no texture of";
+	return nullptr;
+}
+
+} // namespace
+
 @interface RgfxIOSurfaceTexture ()
 - (std::shared_ptr<RgfxSurfaceShadow>)rgfxShadow;
 @end
@@ -1253,6 +1274,10 @@ void rgfxIOSurfaceKeepCountClients(bool on)
 	}
 	if (plane >= std::max<size_t>(IOSurfaceGetPlaneCount(surface), 1)) {
 		logNoTexture(surface, "plane", format("plane %lu, past its planes", (unsigned long)plane));
+		return nil;
+	}
+	if (const char *why = rgfxSurfaceTextureNil(descriptor)) {
+		logNoTexture(surface, "descriptor", why);
 		return nil;
 	}
 	// shadowFor logs why it made no view.
