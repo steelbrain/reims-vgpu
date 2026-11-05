@@ -43,14 +43,15 @@ use reims_graphics::wire::{
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_ICB_SLOTS,
     RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
-    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
-    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
-    RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER,
+    RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
+    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
+    RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -249,7 +250,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // kext asks unshared (WindowServer's) on the platform's unshared queue, and tells a
             // guest producer waiting for room on a submission ring that the device took from it
             // (the device carries SUBMIT_ROOM out). Both platforms make indirect command buffers,
-            // so every host decodes their messages, slots included.
+            // so every host decodes their messages, slots included. Every host reads a `Managed`
+            // texture's CPU copy where its buffer's contents lie, so the guest may lay the copies
+            // in its slabs.
             // A host that maps the guest's pages maps a process's own pages too, for its no-copy
             // buffers (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs
             // (`HEAP_OVER_PAGES`).
@@ -263,6 +266,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_UNSHARED_QUEUES)
                 | u64::from(RGFX_FEATURE_SUBMIT_ROOM)
                 | u64::from(RGFX_FEATURE_ICB_SLOTS)
+                | u64::from(RGFX_FEATURE_MANAGED_TEXTURE_SLABS)
                 | if unified_memory {
                     0
                 } else {

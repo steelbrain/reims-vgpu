@@ -59,8 +59,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_QUEUE_VECTORS`], [`RGFX_FEATURE_SURFACE_ORDER`],
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 /// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
-/// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`] and
-/// [`RGFX_FEATURE_SURFACE_DEFERRED`]). Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`] and [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`]). Bits 9 and 10
+/// are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -169,6 +170,16 @@ pub const RGFX_FEATURE_COMMIT_ORDER: u32 = 1 << 18;
 /// `SURFACE_CACHE`, and says in [`RGFX_REG_DEFERRED_BUDGET_LO`] how many bytes of its GPU's memory
 /// such caches may hold.
 pub const RGFX_FEATURE_SURFACE_DEFERRED: u32 = 1 << 19;
+/// `FEATURES_LO` bit 21, `MANAGED_TEXTURE_SLABS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: a [`RgfxManagedTextureCreate`]'s CPU copy may be any `Shared`
+/// buffer over the guest's memory the sender holds, and the host reads and writes the copy where
+/// that buffer's contents lie: over a block of the sender's (`BUFFER_OVER_HOST_MEMORY`), placed in
+/// a heap over one or over a pages block's guest RAM (`BUFFER_AT_OFFSET`), or over a pages block's
+/// view (`BUFFER_OVER_PAGES`). So the guest can lay the copies in its buffers' slabs, its own pages
+/// among them, and not in the region. A host without it reads the copy in the region at the
+/// buffer's span, which holds the copy only where the buffer lies over its own block. Every host
+/// offers it.
+pub const RGFX_FEATURE_MANAGED_TEXTURE_SLABS: u32 = 1 << 21;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -1929,7 +1940,8 @@ pub const RGFX_MANAGED_TEXTURE_LINEAR: u32 = 1;
 
 /// `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked
 /// `gpu_address`, with the guest-picked `resource_id`, whose CPU copy is the Shared buffer
-/// `cpu_buffer_obj_id` over a block of the sender's.
+/// `cpu_buffer_obj_id` over a block of the sender's, or, where the guest took
+/// [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], any `Shared` buffer over the guest's memory it holds.
 ///
 /// The CPU copy holds every level in order; each level its slices in order (`array_length`, six
 /// faces a cube); each slice its images (the level's depth, for a 3D texture; else one); each

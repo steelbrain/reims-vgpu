@@ -188,7 +188,7 @@ use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
 pub(crate) use surface_cache::{FillHook, FillWait};
-use tables::{Context, Entry, QueueCounts, View};
+use tables::{Context, Entry, GuestBytes, QueueCounts, View};
 
 /// A sink the decoder calls with each command buffer's completion record once its
 /// work finishes (the handler the stream's close registers). The ring loop sets
@@ -2269,14 +2269,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                     m.options.into(),
                     pin,
                 )?;
-                match made {
-                    Some(buffer) => self.insert_over(
-                        m.obj_id,
-                        ObjHandle::Buffer(buffer),
-                        Some((m.region_offset, m.length)),
-                    ),
-                    None => Ok(Err(DecodeError::Refused)),
-                }
+                let Some(buffer) = made else {
+                    return Ok(Err(DecodeError::Refused));
+                };
+                // Its contents are its block's bytes.
+                let bytes = GuestBytes {
+                    ram: None,
+                    at: m.region_offset,
+                    length: m.length,
+                };
+                let entry = Entry::of(ObjHandle::Buffer(buffer))
+                    .over(Some((m.region_offset, m.length)))
+                    .with_bytes(Some(bytes));
+                self.store(m.obj_id, entry);
+                Ok(Ok(()))
             }
             RGFX_CMD_BUFFER_OVER_SURFACE_PAGES => self.buffer_over_surface_pages(device, message),
             RGFX_CMD_BUFFER_MANAGED_AT_OFFSET => self.managed_buffer_at_offset(device, message),
@@ -2412,11 +2418,31 @@ impl<P: Platform> GraphicsDecoder<P> {
                     };
                     heap.new_buffer_of_length(m.length, m.options.into(), m.offset)?
                 };
-                let span = self.span_of(m.heap_obj_id);
-                match made {
-                    Some(buffer) => self.insert_over(m.obj_id, ObjHandle::Buffer(buffer), span),
-                    None => Ok(Err(DecodeError::Refused)),
-                }
+                let Some(buffer) = made else {
+                    return Ok(Err(DecodeError::Refused));
+                };
+                // In a heap over the guest's memory, its contents are the heap's bytes at its
+                // offset: the guest's RAM where the heap lies over a pages block's, else the
+                // heap's block of the region. A heap of the GPU's own memory has neither.
+                let (span, ram) = (self.span_of(m.heap_obj_id), self.ram_of(m.heap_obj_id));
+                let bytes = match (ram, span) {
+                    (Some((first, _)), _) => Some(GuestBytes {
+                        ram: Some(first),
+                        at: m.offset,
+                        length: m.length,
+                    }),
+                    (None, Some((at, _))) => Some(GuestBytes {
+                        ram: None,
+                        at: at + m.offset,
+                        length: m.length,
+                    }),
+                    (None, None) => None,
+                };
+                let entry = Entry::of(ObjHandle::Buffer(buffer))
+                    .over(span)
+                    .with_bytes(bytes);
+                self.store(m.obj_id, entry);
+                Ok(Ok(()))
             }
             RGFX_CMD_TEXTURE_FROM_BUFFER => {
                 let Some(m) = read::<RgfxTextureFromBuffer>(message) else {
@@ -2818,6 +2844,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// (`HEAP_OVER_PAGES`): its first byte and length.
     fn ram_of(&self, obj_id: u64) -> Option<(HostPtr, u64)> {
         self.entry(obj_id).and_then(|e| e.ram)
+    }
+
+    /// Where the contents of the buffer over the guest's memory `obj_id` names lie, where the
+    /// current context may name it ([`GuestBytes`]).
+    fn bytes_of(&self, obj_id: u64) -> Option<GuestBytes> {
+        self.entry(obj_id).and_then(|e| e.bytes)
     }
 
     /// Whether an object the decoder holds lies in the `size` bytes at region offset `offset`:

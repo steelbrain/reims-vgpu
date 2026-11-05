@@ -1,6 +1,9 @@
 //! `Managed` storage (docs/graphics-kext/design.md, Decided 4): a buffer's or a texture's CPU
-//! copy is a region block of its process's, which the guest maps, and the range messages tell the
-//! host what the CPU wrote.
+//! copy is memory of its process's the guest maps, and the range messages tell the host what the
+//! CPU wrote. A buffer's is a region block, or a range of a heap over a block or over a pages
+//! block's guest RAM; a texture's is the contents of a `Shared` buffer the guest names, wherever
+//! they lie in the guest's memory ([`GuestBytes`]), so a guest that took
+//! `RGFX_FEATURE_MANAGED_TEXTURE_SLABS` lays them in its slabs, its own pages among them.
 //!
 //! - **A GPU that shares the CPU's memory** (the platform's answer, [`GraphicsDecoder::
 //!   set_unified_memory`]): one copy. A buffer is made over its block in place, as a `Shared`
@@ -56,7 +59,7 @@ use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
-use super::tables::Entry;
+use super::tables::{Entry, GuestBytes};
 use super::{DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
 
 /// `MTLStorageModeManaged`.
@@ -448,8 +451,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `MANAGED_TEXTURE_CREATE`: over the CPU copy's buffer in place where the GPU shares the
     /// CPU's memory and the platform makes a texture over a buffer of the shape, else the
     /// platform's own `Managed` texture beside it, or over the buffer in place where the platform
-    /// refuses that one and makes the other. A bad reference for a CPU copy that is no
-    /// `Shared` buffer over a block of the sender's, or is shorter than the layout.
+    /// refuses that one and makes the other. The CPU copy is the buffer's contents wherever they
+    /// lie in the guest's memory ([`GuestBytes`]): over a block of the sender's, placed in a heap
+    /// over one or over a pages block's guest RAM, or over a pages block's view. A bad reference
+    /// for a CPU copy that is no such buffer (a `Managed` one, or one of the GPU's own memory), or
+    /// is shorter than the layout.
     pub(super) fn managed_texture(
         &self,
         device: &P::Device,
@@ -464,15 +470,18 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(layout) = LinearLayout::of(&m) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        let (Some(ObjHandle::Buffer(cpu)), Some((at, length))) = (
+        let (Some(ObjHandle::Buffer(cpu)), Some(bytes)) = (
             self.named(m.cpu_buffer_obj_id),
-            self.span_of(m.cpu_buffer_obj_id),
+            self.bytes_of(m.cpu_buffer_obj_id),
         ) else {
             return Ok(Err(DecodeError::BadReference));
         };
-        if self.managed_copy(m.cpu_buffer_obj_id).is_some() || layout.size() > length {
+        if layout.size() > bytes.length {
             return Ok(Err(DecodeError::BadReference));
         }
+        // The texture lies over what the buffer lies over, so that block is not given out again
+        // while the texture lives.
+        let span = self.span_of(m.cpu_buffer_obj_id);
         let cpu = cpu.clone_ref();
         let desc = texture_desc(&m.desc, m.resource_id);
         let in_place = |this: &Self| -> RaiseResult<Option<P::Texture>> {
@@ -488,16 +497,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         if self.unified()
             && let Some(texture) = in_place(self)?
         {
-            return self.store_managed_texture(m.obj_id, texture, at, length, None, layout);
+            return self.store_managed_texture(m.obj_id, texture, span, bytes, None, layout);
         }
         let descriptor = self.platform.texture_descriptor(&desc);
         if let Some(texture) = device.new_texture(OnFault::Return, &descriptor)? {
-            return self.store_managed_texture(m.obj_id, texture, at, length, Some(cpu), layout);
+            return self.store_managed_texture(m.obj_id, texture, span, bytes, Some(cpu), layout);
         }
         match self.unified() {
             false => match in_place(self)? {
                 Some(texture) => {
-                    self.store_managed_texture(m.obj_id, texture, at, length, None, layout)
+                    self.store_managed_texture(m.obj_id, texture, span, bytes, None, layout)
                 }
                 None => Ok(Err(DecodeError::Refused)),
             },
@@ -505,33 +514,33 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// Stores a `Managed` texture over the block at `at` of `length` bytes, and its CPU copy.
+    /// Stores a `Managed` texture lying over `span`, and its CPU copy, the guest's `bytes`.
     fn store_managed_texture(
         &self,
         obj_id: u64,
         texture: P::Texture,
-        at: u64,
-        length: u64,
+        span: Option<(u64, u64)>,
+        bytes: GuestBytes,
         cpu: Option<P::Buffer>,
         layout: LinearLayout,
     ) -> RaiseResult<Result<(), DecodeError>> {
-        let mut entry = Entry::of(ObjHandle::Texture(texture)).over(Some((at, length)));
+        let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
         entry.managed = Some(ManagedCopy {
-            at,
+            at: bytes.at,
             length: layout.size(),
             cpu,
             layout: Some(layout),
-            ram: None,
+            ram: bytes.ram,
         });
         self.store(obj_id, entry);
         Ok(Ok(()))
     }
 
-    /// `TEXTURE_REPLACE_REGION`: the platform's `replaceRegion:` from the region's bytes in the
-    /// block, where the texture is a copy of its own, after the context's buffers answered before
-    /// it are committed ([`Self::after_submitted`], which `drain` is held through). A bad reference
-    /// for an object that is no `Managed` texture; malformed for a region the layout does not
-    /// hold: both found here.
+    /// `TEXTURE_REPLACE_REGION`: the platform's `replaceRegion:` from the CPU copy's bytes, in the
+    /// guest's RAM or the region, where the texture is a copy of its own, after the context's
+    /// buffers answered before it are committed ([`Self::after_submitted`], which `drain` is held
+    /// through). A bad reference for an object that is no `Managed` texture; malformed for a
+    /// region the layout does not hold: both found here.
     pub(super) fn replace_region(
         &self,
         message: &[u8],
@@ -557,19 +566,26 @@ impl<P: Platform> GraphicsDecoder<P> {
         ) else {
             return Ok(Err(DecodeError::Malformed));
         };
-        if copy.cpu.is_none() {
+        let Some(cpu) = &copy.cpu else {
             return Ok(Ok(()));
-        }
+        };
         let three_d = texture.texture_type() == TEXTURE_TYPE_3D;
         let (texture, region) = (texture.clone_ref(), Arc::clone(&self.region));
-        let (from, bytes_per_row) = (copy.at + offset, l.bytes_per_row);
+        // The CPU copy's buffer keeps a pages block's view mapped, where its bytes lie in one.
+        let keep = cpu.clone_ref();
+        let (ram, from, bytes_per_row) = (copy.ram, copy.at + offset, l.bytes_per_row);
         let bytes_per_image = if three_d { l.bytes_per_image } else { 0 };
         self.after_submitted("TEXTURE_REPLACE_REGION", m.obj_id, drain, move || {
-            // SAFETY: the region's bytes lie inside the layout, which lies inside the block
-            // (checked at the create), inside the region, which `region` keeps mapped.
-            let bytes = unsafe {
-                HostRange::new(HostPtr::from_ptr(region.base().add(from as usize)), span)
+            let first = match ram {
+                Some(first) => first.wrapping_add(from),
+                None => HostPtr::from_ptr(region.base().wrapping_add(from as usize)),
             };
+            // SAFETY: the bytes lie inside the layout, which lies inside the CPU copy's bytes
+            // (checked at the create): in the guest's RAM mapping, which stays mapped as long as
+            // the device, in a view `keep`'s buffer keeps mapped, or in the region, which
+            // `region` keeps mapped.
+            let bytes = unsafe { HostRange::new(first, span) };
+            let _keep = &keep;
             texture.replace_region(
                 MtlRegion {
                     origin: MtlOrigin {
@@ -678,12 +694,13 @@ mod tests {
     };
     use reims_graphics::region::Region;
     use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
-        RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
+        RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+        RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+        RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
         RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_TEXTURE_REPLACE_REGION,
         RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK,
-        RGFX_SURFACE_PAGES_PRIVATE, RgfxHeapOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy,
-        RgfxTextureDescriptor,
+        RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset, RgfxBufferOverPages,
+        RgfxHeapOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy, RgfxTextureDescriptor,
     };
     use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
     use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam, Step};
@@ -1328,6 +1345,94 @@ mod tests {
         assert!(
             r.synchronize_texture(21, 0, 3).is_err(),
             "a level past the texture"
+        );
+    }
+
+    /// A `Managed` texture's CPU copy is its buffer's contents wherever they lie in the guest's
+    /// memory (`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`): a buffer placed in a heap over a pages
+    /// block's guest RAM, one placed in a heap over a block of the region, and one over a pages
+    /// block's view each have a replaced region read from their own bytes, where the block their
+    /// span names would hold the pages block's runs or the heap's first bytes.
+    #[test]
+    fn a_managed_texture_s_cpu_copy_is_its_buffer_s_bytes_wherever_they_lie() {
+        let (mut r, ram, page) = pages_rig();
+        // 16x16 RGBA8, one level: 16 rows of 256 bytes.
+        let size = 16 * 256;
+        let at_offset = |obj_id: u64, heap_obj_id: u64, offset: u64| RgfxBufferAtOffset {
+            header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+            obj_id,
+            heap_obj_id,
+            offset,
+            length: size,
+            options: 0,
+            reserved_34: 0,
+        };
+        // In heap 20, over the pages block's guest RAM, a page in.
+        assert_eq!(r.send(&at_offset(30, 20, page)), Ok(()));
+        assert_eq!(r.texture(31, 30, rgba(16, 16, 1)), Ok(()));
+        // In a heap over a block of the region, 0x2000 in.
+        let heap_at = pages::BLOCK + 0x1_0000;
+        assert_eq!(
+            r.send(&RgfxHeapOverHostMemory {
+                header: header(RGFX_CMD_HEAP_OVER_HOST_MEMORY),
+                obj_id: 40,
+                gpu_address: 0x3_0000_0000,
+                region_offset: heap_at,
+                size_bytes: 0x1_0000,
+                options: 0,
+                heap_type: 1,
+            }),
+            Ok(())
+        );
+        assert_eq!(r.send(&at_offset(41, 40, 0x2000)), Ok(()));
+        assert_eq!(r.texture(42, 41, rgba(16, 16, 1)), Ok(()));
+        // Over the pages block's view, 0x100 in.
+        assert_eq!(
+            r.send(&RgfxBufferOverPages {
+                header: header(RGFX_CMD_BUFFER_OVER_PAGES),
+                obj_id: 50,
+                gpu_address: 0x4_0000_0000,
+                block_offset: pages::BLOCK,
+                block_size: 0x2000,
+                offset: 0x100,
+                length: size,
+                options: 0,
+                reserved_44: 0,
+            }),
+            Ok(())
+        );
+        assert_eq!(r.texture(51, 50, rgba(16, 16, 1)), Ok(()));
+
+        let contents = |r: &Rig, obj_id: u64| match r.dec.named(obj_id) {
+            Some(ObjHandle::Buffer(b)) => b.contents().addr(),
+            _ => panic!("no buffer {obj_id:#x}"),
+        };
+        let in_ram = ram.ranges()[0].host().wrapping_add(3 * page).addr();
+        let in_region = r.region.base() as usize + (heap_at + 0x2000) as usize;
+        assert_eq!(contents(&r, 30), in_ram);
+        assert_eq!(contents(&r, 41), in_region);
+        for (texture, cpu, first) in [
+            (31, 30, in_ram),
+            (42, 41, in_region),
+            (51, 50, contents(&r, 50)),
+        ] {
+            let mark = r.p.call_log().mark();
+            assert_eq!(r.replaced(texture, 0, 0, [2, 1, 0], [4, 3, 1]), Ok(()));
+            let calls = r.p.call_log().since(mark);
+            assert_eq!(calls.len(), 1, "texture {texture}");
+            // Row 1, texel 2.
+            assert_eq!(
+                calls[0].args[3],
+                Arg::Ptr(first + 256 + 8),
+                "texture {texture}"
+            );
+            assert_eq!(r.cpu_of(texture), r.obj(cpu));
+        }
+        // A buffer whose contents are no guest bytes is no CPU copy: a `Managed` one.
+        assert_eq!(r.buffer(60, heap_at + 0x2_0000, size, MANAGED), Ok(()));
+        assert_eq!(
+            r.texture(61, 60, rgba(16, 16, 1)),
+            Err(DecodeError::BadReference)
         );
     }
 

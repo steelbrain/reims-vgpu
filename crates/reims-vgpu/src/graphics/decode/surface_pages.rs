@@ -941,9 +941,9 @@ impl<P: Platform> super::GraphicsDecoder<P> {
 
     /// `BUFFER_OVER_PAGES`: a Shared buffer over the `length` bytes at `offset` in the view of a
     /// pages block of the sender's (the module doc), at the guest's GPU address, lying over the
-    /// block, so the block is not released while it lives. A block the sender does not hold is a
-    /// guest protocol error; one that is no pages block of its context's, or a range past its
-    /// view, is refused.
+    /// block, so the block is not released while it lives, its contents those bytes of the view.
+    /// A block the sender does not hold is a guest protocol error; one that is no pages block of
+    /// its context's, or a range past its view, is refused.
     pub(super) fn buffer_over_pages(
         &self,
         device: &P::Device,
@@ -972,14 +972,21 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         // At the guest's address, which its pointers to the buffer hold, as a
         // BUFFER_OVER_HOST_MEMORY's is.
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
-        match buffer_over(device, &view, m.offset, m.length, m.options.into(), pin)? {
-            Some(buffer) => self.insert_over(
-                m.obj_id,
-                super::ObjHandle::Buffer(buffer),
-                Some((m.block_offset, m.block_size)),
-            ),
-            None => Ok(Err(super::DecodeError::Refused)),
-        }
+        let Some(buffer) = buffer_over(device, &view, m.offset, m.length, m.options.into(), pin)?
+        else {
+            return Ok(Err(super::DecodeError::Refused));
+        };
+        // Its contents are the view's bytes at the offset, which the buffer keeps mapped.
+        let bytes = super::GuestBytes {
+            ram: Some(view.base()),
+            at: m.offset,
+            length: m.length,
+        };
+        let entry = super::tables::Entry::of(super::ObjHandle::Buffer(buffer))
+            .over(Some((m.block_offset, m.block_size)))
+            .with_bytes(Some(bytes));
+        self.store(m.obj_id, entry);
+        Ok(Ok(()))
     }
 
     /// `HEAP_OVER_PAGES`: a Shared heap over the guest's RAM of a pages block of the sender's

@@ -93,6 +93,20 @@ impl Drop for QueueCounts {
     }
 }
 
+/// Where a buffer over the guest's memory has its contents, as the host reaches them: `length`
+/// bytes from `at`, past `ram` where it has one (a byte of the guest's RAM mapping, which lives as
+/// long as the device, or of a pages block's view, which the buffer keeps mapped), else at region
+/// offset `at`. What a `Managed` texture's CPU copy is read through ([`super::managed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GuestBytes {
+    /// The first byte `at` counts from; `None` for the region's.
+    pub(crate) ram: Option<HostPtr>,
+    /// Where the contents start, from `ram`'s byte or in the region.
+    pub(crate) at: u64,
+    /// The contents' length.
+    pub(crate) length: u64,
+}
+
 /// One object of a context's, as made. Its fields drop in their order: a `Managed` object's CPU
 /// copy before the object.
 pub(crate) struct Entry<P: Platform> {
@@ -113,6 +127,9 @@ pub(crate) struct Entry<P: Platform> {
     /// A heap over a pages block's guest RAM (`HEAP_OVER_PAGES`): the host bytes it lies in, its
     /// first byte and length, which `span`, the block's, does not name.
     pub(crate) ram: Option<(HostPtr, u64)>,
+    /// A buffer whose contents are the guest's bytes: where they lie, which `span` names only for
+    /// a buffer over its own block (`BUFFER_OVER_HOST_MEMORY`); `None` for any other object.
+    pub(crate) bytes: Option<GuestBytes>,
     /// A buffer over a block's surface view (`BUFFER_OVER_SURFACE_PAGES`), whose drop may be the
     /// last hold of the view's mapping and lets go of an import, and gives back nothing the guest
     /// picked (the host places it): it is let go of on the surface worker
@@ -132,6 +149,7 @@ impl<P: Platform> Entry<P> {
             place: None,
             queue: None,
             ram: None,
+            bytes: None,
             over_view: false,
             made: 0,
         }
@@ -146,6 +164,12 @@ impl<P: Platform> Entry<P> {
     /// The entry, a buffer over a block's surface view (the field `over_view`).
     pub(crate) fn over_view(mut self) -> Self {
         self.over_view = true;
+        self
+    }
+
+    /// The entry, a buffer whose contents are the guest's `bytes` (the field `bytes`).
+    pub(crate) fn with_bytes(mut self, bytes: Option<GuestBytes>) -> Self {
+        self.bytes = bytes;
         self
     }
 }
