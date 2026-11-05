@@ -4,6 +4,8 @@
 
 #import "RgfxTexture.h"
 
+#import <IOSurface/IOSurfaceRef.h>
+
 #import "RgfxBuffer.h"
 #import "RgfxHeap.h"
 #import "RgfxMetalError.h"
@@ -542,17 +544,58 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
 	RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]", words);
 }
 
+namespace {
+
+// The formats the x86 Macs' device lacks, which Metal names MTLPixelFormatInvalid
+// (rgfxEndAtUnalignableLinearFormat, RgfxTexture.h).
+bool rgfxDeviceLacks(uint64_t f)
+{
+	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	return f == 11 || f == 31 || in(40, 42) || in(45, 48) || in(95, 99) || in(120, 122) ||
+	       in(160, 167) || f == 170 || f == 172 || f == 174 || f == 176 || in(178, 183) ||
+	       in(186, 190) || in(192, 200) || in(204, 208) || in(210, 218) || in(222, 226) ||
+	       in(228, 236) || f == 255 || f == 262 || f == 263 || in(552, 555);
+}
+
+// The two-plane Y'CbCr formats of 4:2:0 or 4:2:2 chroma: YCBCR8_420_2P, YCBCR8_422_2P,
+// YCBCR10_420_2P, YCBCR10_422_2P and their packed and sRGB twins, and RGB8_420_2P, RGB8_422_2P,
+// RGB10_420_2P and RGB10_422_2P.
+bool rgfxChromaPairs(uint64_t f)
+{
+	return f == 500 || f == 502 || f == 505 || f == 506 || f == 508 || f == 509 || f == 520 ||
+	       f == 522 || f == 525 || f == 526 || f == 528 || f == 529 || f == 540 || f == 541 ||
+	       f == 543 || f == 544;
+}
+
+// The depth, stencil and depth-stencil formats, and the bytes of a texel of each.
+uint64_t rgfxDepthStencilBytes(uint64_t f)
+{
+	switch (f) {
+	case MTLPixelFormatStencil8:
+		return 1;
+	case MTLPixelFormatDepth16Unorm:
+		return 2;
+	case MTLPixelFormatDepth32Float:
+	case MTLPixelFormatDepth24Unorm_Stencil8:
+	case MTLPixelFormatX24_Stencil8:
+		return 4;
+	case MTLPixelFormatDepth32Float_Stencil8:
+	case MTLPixelFormatX32_Stencil8:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+} // namespace
+
 void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
 {
 	const uint64_t f = format;
 	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
 	const bool compressed = in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241);
 	const bool depth = f == 250 || f == 252 || f == 253 || f == 260 || f == 261;
-	const bool lacked = f == 11 || f == 31 || in(40, 42) || in(45, 48) || in(95, 99) ||
-	                    in(120, 122) || in(160, 167) || f == 170 || f == 172 || f == 174 ||
-	                    f == 176 || in(178, 183) || in(186, 190) || in(192, 200) ||
-	                    in(204, 208) || in(210, 218) || in(222, 226) || in(228, 236) ||
-	                    f == 255 || f == 262 || f == 263 || in(552, 555);
+	const bool lacked = rgfxDeviceLacks(f);
 	if (!compressed && !depth && !lacked)
 		return;
 	RgfxMetalAssertionFailed("-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
@@ -591,13 +634,24 @@ const RgfxNamedFormat kTexelFormats[] = {
     {554, "MTLPixelFormatBGR10_XR"}, {555, "MTLPixelFormatBGR10_XR_sRGB"},
 };
 
-// Metal's name of `format`, as its validation names it, for the formats of one texel a block
-// and those of kNoMultisample.
+// Metal's names of the depth, stencil and depth-stencil formats.
+const RgfxNamedFormat kDepthStencilFormats[] = {
+    {250, "MTLPixelFormatDepth16Unorm"},          {252, "MTLPixelFormatDepth32Float"},
+    {253, "MTLPixelFormatStencil8"},              {255, "MTLPixelFormatDepth24Unorm_Stencil8"},
+    {260, "MTLPixelFormatDepth32Float_Stencil8"}, {261, "MTLPixelFormatX32_Stencil8"},
+    {262, "MTLPixelFormatX24_Stencil8"},
+};
+
+// Metal's name of `format`, as its validation names it, for the formats of one texel a block,
+// the depth and stencil ones and those of kNoMultisample.
 NSString *rgfxPixelFormatName(MTLPixelFormat format)
 {
 	if (format == MTLPixelFormatInvalid)
 		return @"MTLPixelFormatInvalid";
 	for (const RgfxNamedFormat &f : kTexelFormats)
+		if (f.format == format)
+			return @(f.name);
+	for (const RgfxNamedFormat &f : kDepthStencilFormats)
 		if (f.format == format)
 			return @(f.name);
 	for (const RgfxNamedFormat &f : kNoMultisample)
@@ -664,6 +718,124 @@ void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64
 	if (rule != nil)
 		RgfxMetalAssertionFailed("_mtlValidateArgumentsForTextureViewOnDevice",
 		                         [@"Texture Creation\n" stringByAppendingString:rule]);
+}
+
+// Metal checks a texture over a surface in three steps, each its own assertion, and lists every
+// rule of one step a descriptor breaks, a line each (measured: oracle_surftex, Q20).
+void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
+                                    NSUInteger plane)
+{
+	if (descriptor == nil || surface == nullptr)
+		return;
+	rgfxEndAtInvalidTextureDescriptor(descriptor);
+	const uint64_t format = descriptor.pixelFormat;
+	const MTLTextureType type = descriptor.textureType;
+	const uint64_t width = descriptor.width, height = descriptor.height;
+	const uint64_t depth = descriptor.depth, arrayLength = descriptor.arrayLength;
+	const uint64_t samples = descriptor.sampleCount, levels = descriptor.mipmapLevelCount;
+	const MTLStorageMode storage = descriptor.storageMode;
+	const bool multisample =
+	    type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
+	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
+	// The descriptor's own validation, as at every texture creator. The x86 Macs lack the
+	// two-plane Y'CbCr formats and end at every texture of one as an invalid format (Q13), where
+	// the lane makes them as the M3 Max does; but not a render target of one of 4:2:0 or 4:2:2
+	// chroma at an odd width or height, which neither the M3 nor the host makes, so the process
+	// ends there with the x86 Macs' words (oracle_surftex 420v.p0.ycbcr.*.rt, Q20).
+	const bool oddChromaTarget = rgfxChromaPairs(format) &&
+	                             (descriptor.usage & MTLTextureUsageRenderTarget) != 0 &&
+	                             (width % 2 != 0 || height % 2 != 0);
+	NSMutableString *rules = [NSMutableString string];
+	if (format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) || oddChromaTarget)
+		[rules appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n", ull(format)];
+	if (width == 0)
+		[rules appendString:@"MTLTextureDescriptor has width of zero.\n"];
+	if (height == 0)
+		[rules appendString:@"MTLTextureDescriptor has height of zero.\n"];
+	// Measured of 2D and 2DArray textures; the rule and its words name the type.
+	if (type != MTLTextureType3D && depth > 1)
+		[rules appendFormat:@"MTLTextureDescriptor has depth (%llu) greater than the maximum "
+		                    @"allowed size of 1.\nMTLTextureDescriptor requests a depth of %llu "
+		                    @"but the texture type %@ requires that depth is 1\n",
+		                    ull(depth), ull(depth), rgfxTextureTypeName(type)];
+	const bool arrayed = type == MTLTextureType1DArray || type == MTLTextureType2DArray ||
+	                     type == MTLTextureTypeCubeArray ||
+	                     type == MTLTextureType2DMultisampleArray;
+	if (!arrayed && arrayLength > 1)
+		[rules appendFormat:@"MTLTextureDescriptor has arrayLength (%llu) greater than the maximum "
+		                    @"allowed size of 1.\nMTLTextureDescriptor requests an arrayLength of "
+		                    @"%llu, but %@ requires that arrayLength is 1\n",
+		                    ull(arrayLength), ull(arrayLength), rgfxTextureTypeName(type)];
+	if (!multisample && samples > 1)
+		[rules appendString:@"MTLTextureDescriptor has sampleCount set but is using a type that "
+		                    @"does not allow sampleCount.\n"];
+	if (multisample && samples <= 1)
+		[rules appendString:@"MTLTextureDescriptor sampleCount must be > 1 for multisample "
+		                    @"textures.\n"];
+	if (multisample && (storage == MTLStorageModeShared || storage == MTLStorageModeManaged))
+		[rules appendString:@"MTLTextureDescriptor: Multisample textures cannot be allocated with "
+		                    @"MTLStorageModeShared or MTLStorageModeManaged on this device.\n"];
+	if (storage == MTLStorageModeMemoryless)
+		[rules appendString:@"MTLTextureDescriptor: MTLResourceStorageModeMemoryless is not a "
+		                    @"supported storage mode on this device.\n"];
+	if ((format == MTLPixelFormatGBGR422 || format == MTLPixelFormatBGRG422) && width % 2 != 0)
+		[rules appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n"];
+	if (rules.length > 0)
+		RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]",
+		                         [@"Texture Descriptor Validation\n" stringByAppendingString:rules]);
+	// A surface with planes passes the rest, a plane past its planes answering nil
+	// (RgfxIOSurfaceTexture).
+	if (IOSurfaceGetPlaneCount(surface) != 0)
+		return;
+	// The texture's rows against the surface's: a format of one texel a block in this step, a
+	// compressed or 4:2:2 one, in its blocks, in the last.
+	const uint64_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+	RgfxFormatBlock block = {};
+	uint64_t row = 0, blockRow = 0;
+	if (!rgfxPixelFormatBlock(static_cast<uint32_t>(format), &block))
+		row = width * rgfxDepthStencilBytes(format);
+	else if (block.width == 1 && block.height == 1)
+		row = width * block.bytes;
+	else
+		blockRow = (width + block.width - 1) / block.width * block.bytes;
+	NSMutableString *stride = [NSMutableString string];
+	if (depth != 1)
+		[stride appendFormat:@"IOSurface texture: must have depth == 1, depth (%llu) disallowed\n",
+		                     ull(depth)];
+	if (type != MTLTextureType2D && type != MTLTextureTypeTextureBuffer)
+		[stride appendFormat:@"IOSurface texture: must be of type MTLTextureType2D, textureType "
+		                     @"(%@) disallowed\n",
+		                     rgfxTextureTypeName(type)];
+	if (levels > 1)
+		[stride appendFormat:@"IOSurface texture: cannot be mipmapped, mipmapLevelCount (%llu) "
+		                     @"disallowed\n",
+		                     ull(levels)];
+	if (row > bytesPerRow)
+		[stride appendFormat:@"IOSurface texture: bytesPerRow (%llu) must be greater or equal to "
+		                     @"(%llu) bytes\n",
+		                     ull(bytesPerRow), ull(row)];
+	if (rgfxDepthStencilBytes(format) != 0)
+		[stride appendFormat:@"IOSurface texture: cannot create compressed, depth, or stencil "
+		                     @"textures, pixelFormat (%@) disallowed\n",
+		                     rgfxPixelFormatName(static_cast<MTLPixelFormat>(format))];
+	if (stride.length > 0)
+		RgfxMetalAssertionFailed(
+		    "_mtlValidateStrideTextureParameters",
+		    [@"Texture Descriptor Validation\n" stringByAppendingString:stride]);
+	// Then the texture's place in the surface.
+	const char *init =
+	    "-[MTLIOAccelTexture initWithDevice:descriptor:iosurface:plane:field:args:argsSize:]";
+	if (plane > 0)
+		RgfxMetalAssertionFailed(
+		    init, [NSString stringWithFormat:@"IOSurface is non-planar, but plane %lu specified",
+		                                     (unsigned long)plane]);
+	if (blockRow > bytesPerRow)
+		RgfxMetalAssertionFailed(
+		    init,
+		    [NSString stringWithFormat:@"Descriptor rowBytes (%llu) > IOSurface rowBytes (%llu)",
+		                               ull(blockRow), ull(bytesPerRow)]);
+	if (height * arrayLength > IOSurfaceGetHeight(surface))
+		RgfxMetalAssertionFailed(init, @"Descriptor height*arrayLength > IOSurface height");
 }
 
 @interface RgfxTexture () <RgfxMetalTextureInternals>

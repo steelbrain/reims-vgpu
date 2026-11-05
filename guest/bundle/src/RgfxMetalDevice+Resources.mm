@@ -107,8 +107,10 @@
                                  iosurface:(IOSurfaceRef)iosurface
                                      plane:(NSUInteger)plane
 {
-	// Over this process's copy of the plane in the device region, synced with the
-	// surface's pages (RgfxIOSurface.h).
+	// Where Metal ends the process, so does the bundle, sending nothing; else over this
+	// process's copy of the plane in the device region, synced with the surface's pages
+	// (RgfxIOSurface.h).
+	rgfxEndAtInvalidSurfaceTexture(descriptor, iosurface, plane);
 	return [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
 	                                         iosurface:iosurface
 	                                             plane:plane

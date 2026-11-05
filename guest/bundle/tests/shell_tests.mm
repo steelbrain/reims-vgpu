@@ -992,6 +992,263 @@ static void checkDies(const char *name, const char *words)
 // has (3), in metallibOf's layout.
 static std::vector<uint8_t> exportedFunctionMetallib();
 
+// Textures over a 64 x 64 'BGRA' surface of 256 bytes a row, without planes (as IOSurfaceCreate
+// makes WindowServer's) or of one plane, or without planes of 512 bytes a row, each as
+// oracle_surftex asked it of the AMD 5300M and the
+// Intel 630 under macOS 26.7.1 (docs/graphics-kext/dgpu-oracle.md, Q20), with Metal's words where
+// both ended the process there; null where both went on.
+enum SurfaceKind { kFlat, kOnePlane, kWideRows };
+struct SurfaceCase {
+	const char *name;
+	SurfaceKind surface;
+	NSUInteger plane;
+	MTLPixelFormat format;
+	MTLTextureType type;
+	NSUInteger width, height, depth, arrayLength, levels, samples;
+	MTLStorageMode storage;
+	const char *words;
+};
+#define RGFX_VALIDATE                                                                              \
+	"-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion `Texture "               \
+	"Descriptor Validation\n"
+#define RGFX_STRIDE                                                                                \
+	"_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor Validation\n"
+#define RGFX_INIT                                                                                  \
+	"-[MTLIOAccelTexture initWithDevice:descriptor:iosurface:plane:field:args:argsSize:]: failed "  \
+	"assertion `"
+static const MTLTextureType k2D = MTLTextureType2D;
+static const MTLStorageMode kManaged = MTLStorageModeManaged;
+static const SurfaceCase kSurfaceCases[] = {
+    {"surface-width-0", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 0, 64, 1, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"surface-height-0", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 0, 1, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has height of zero.\n'"},
+    {"surface-format-invalid", kFlat, 0, MTLPixelFormatInvalid, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (0).\n'"},
+    {"surface-format-lacked", kOnePlane, 0, MTLPixelFormatB5G6R5Unorm, k2D, 64, 64, 1, 1, 1, 1,
+     kManaged, RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (40).\n'"},
+    {"surface-format-xr10", kFlat, 0, MTLPixelFormatBGR10_XR, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (554).\n'"},
+    {"surface-depth-2", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 32, 2, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureType2D requires that depth is 1\n'"},
+    {"surface-array-2", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 32, 1, 2, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has arrayLength (2) greater than the maximum allowed size "
+                   "of 1.\nMTLTextureDescriptor requests an arrayLength of 2, but MTLTextureType2D "
+                   "requires that arrayLength is 1\n'"},
+    {"surface-samples-4", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 4, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has sampleCount set but is using a type that does not "
+                   "allow sampleCount.\n'"},
+    {"surface-multisample-1", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType2DMultisample, 64,
+     64, 1, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor sampleCount must be > 1 for multisample textures.\n"
+                   "MTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+    {"surface-multisample-managed", kFlat, 0, MTLPixelFormatBGRA8Unorm,
+     MTLTextureType2DMultisample, 64, 64, 1, 1, 1, 4, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+    {"surface-memoryless", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1,
+     MTLStorageModeMemoryless,
+     RGFX_VALIDATE "MTLTextureDescriptor: MTLResourceStorageModeMemoryless is not a supported "
+                   "storage mode on this device.\n'"},
+    {"surface-depth-managed", kFlat, 0, MTLPixelFormatDepth32Float, k2D, 64, 64, 1, 1, 1, 1,
+     kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor: Depth, Stencil, DepthStencil textures cannot be "
+                   "allocated with MTLStorageModeShared or MTLStorageModeManaged on this "
+                   "device.\n'"},
+    {"surface-type-1d", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType1D, 64, 1, 1, 1, 1, 1,
+     kManaged,
+     RGFX_STRIDE "IOSurface texture: must be of type MTLTextureType2D, textureType "
+                 "(MTLTextureType1D) disallowed\n'"},
+    {"surface-type-cube", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube, 64, 64, 1, 1, 1,
+     1, kManaged,
+     RGFX_STRIDE "IOSurface texture: must be of type MTLTextureType2D, textureType "
+                 "(MTLTextureTypeCube) disallowed\n'"},
+    {"surface-type-3d-depth-2", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType3D, 64, 32, 2, 1,
+     1, 1, kManaged,
+     RGFX_STRIDE "IOSurface texture: must have depth == 1, depth (2) disallowed\nIOSurface "
+                 "texture: must be of type MTLTextureType2D, textureType (MTLTextureType3D) "
+                 "disallowed\n'"},
+    {"surface-levels-7", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 7, 1, kManaged,
+     RGFX_STRIDE "IOSurface texture: cannot be mipmapped, mipmapLevelCount (7) disallowed\n'"},
+    {"surface-wider", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 65, 64, 1, 1, 1, 1, kManaged,
+     RGFX_STRIDE "IOSurface texture: bytesPerRow (256) must be greater or equal to (260) bytes\n'"},
+    {"surface-wider-format", kFlat, 0, MTLPixelFormatRGBA32Float, k2D, 64, 64, 1, 1, 1, 1,
+     kManaged,
+     RGFX_STRIDE "IOSurface texture: bytesPerRow (256) must be greater or equal to (1024) "
+                 "bytes\n'"},
+    {"surface-depth-private", kFlat, 0, MTLPixelFormatDepth32Float, k2D, 64, 64, 1, 1, 1, 1,
+     MTLStorageModePrivate,
+     RGFX_STRIDE "IOSurface texture: cannot create compressed, depth, or stencil textures, "
+                 "pixelFormat (MTLPixelFormatDepth32Float) disallowed\n'"},
+    {"surface-plane-1", kFlat, 1, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     RGFX_INIT "IOSurface is non-planar, but plane 1 specified'"},
+    {"surface-taller", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 65, 1, 1, 1, 1, kManaged,
+     RGFX_INIT "Descriptor height*arrayLength > IOSurface height'"},
+    {"surface-array-depth-2", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType2DArray, 64, 32,
+     2, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureType2DArray requires that depth is 1\n'"},
+    {"surface-array-samples-4", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType2DArray, 64, 64,
+     1, 1, 1, 4, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has sampleCount set but is using a type that does not "
+                   "allow sampleCount.\n'"},
+    {"surface-plane-depth-2", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 32, 2, 1, 1, 1,
+     kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureType2D requires that depth is 1\n'"},
+    {"surface-422-odd", kFlat, 0, MTLPixelFormatGBGR422, k2D, 63, 64, 1, 1, 1, 1, kManaged,
+     RGFX_VALIDATE "MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n'"},
+    {"surface-multisample-private", kFlat, 0, MTLPixelFormatBGRA8Unorm,
+     MTLTextureType2DMultisample, 64, 64, 1, 1, 1, 4, MTLStorageModePrivate,
+     RGFX_STRIDE "IOSurface texture: must be of type MTLTextureType2D, textureType "
+                 "(MTLTextureType2DMultisample) disallowed\n'"},
+    {"surface-buffer-wider", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureTypeTextureBuffer, 65,
+     1, 1, 1, 1, 1, kManaged,
+     RGFX_STRIDE "IOSurface texture: bytesPerRow (256) must be greater or equal to (260) bytes\n'"},
+    {"surface-wide-rows-wider", kWideRows, 0, MTLPixelFormatBGRA8Unorm, k2D, 129, 64, 1, 1, 1, 1,
+     kManaged,
+     RGFX_STRIDE "IOSurface texture: bytesPerRow (512) must be greater or equal to (516) bytes\n'"},
+    {"surface-plane-2", kFlat, 2, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     RGFX_INIT "IOSurface is non-planar, but plane 2 specified'"},
+    {"surface-compressed-wider", kFlat, 0, MTLPixelFormatBC1_RGBA, k2D, 132, 64, 1, 1, 1, 1,
+     kManaged, RGFX_INIT "Descriptor rowBytes (264) > IOSurface rowBytes (256)'"},
+    {"surface-compressed-wider-bc7", kFlat, 0, MTLPixelFormatBC7_RGBAUnorm, k2D, 68, 64, 1, 1, 1,
+     1, kManaged, RGFX_INIT "Descriptor rowBytes (272) > IOSurface rowBytes (256)'"},
+    {"surface-compressed-taller", kFlat, 0, MTLPixelFormatBC1_RGBA, k2D, 64, 68, 1, 1, 1, 1,
+     kManaged, RGFX_INIT "Descriptor height*arrayLength > IOSurface height'"},
+    {"surface-wide-rows-taller", kWideRows, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 65, 1, 1, 1, 1,
+     kManaged, RGFX_INIT "Descriptor height*arrayLength > IOSurface height'"},
+    // What both made, or answered nil for.
+    {"surface-made", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-smaller", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 32, 32, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-row", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 1, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-buffer", kFlat, 0, MTLPixelFormatBGRA8Unorm, MTLTextureTypeTextureBuffer, 64, 1,
+     1, 1, 1, 1, kManaged, nullptr},
+    {"surface-made-r8", kFlat, 0, MTLPixelFormatR8Unorm, k2D, 256, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-rgba16f", kFlat, 0, MTLPixelFormatRGBA16Float, k2D, 32, 64, 1, 1, 1, 1,
+     kManaged, nullptr},
+    {"surface-made-bc1", kFlat, 0, MTLPixelFormatBC1_RGBA, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-422", kFlat, 0, MTLPixelFormatGBGR422, k2D, 128, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-private", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1,
+     MTLStorageModePrivate, nullptr},
+    {"surface-made-shared", kFlat, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1,
+     MTLStorageModeShared, nullptr},
+    {"surface-plane-wider", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, k2D, 65, 64, 1, 1, 1, 1,
+     kManaged, nullptr},
+    {"surface-plane-taller", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 65, 1, 1, 1, 1,
+     kManaged, nullptr},
+    {"surface-plane-1-nil", kOnePlane, 1, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 1, 1,
+     kManaged, nullptr},
+    // A plane of a planar surface takes what a surface without planes refuses.
+    {"surface-plane-1d", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType1D, 64, 1, 1, 1, 1,
+     1, kManaged, nullptr},
+    {"surface-plane-array", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType2DArray, 64, 32,
+     1, 2, 1, 1, kManaged, nullptr},
+    {"surface-plane-cube", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube, 64, 64, 1,
+     1, 1, 1, kManaged, nullptr},
+    {"surface-plane-3d", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, MTLTextureType3D, 64, 32, 2, 1, 1,
+     1, kManaged, nullptr},
+    {"surface-plane-multisample", kOnePlane, 0, MTLPixelFormatBGRA8Unorm,
+     MTLTextureType2DMultisample, 64, 64, 1, 1, 1, 4, MTLStorageModePrivate, nullptr},
+    {"surface-plane-levels", kOnePlane, 0, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, 1, 1, 2, 1,
+     kManaged, nullptr},
+    {"surface-plane-depth", kOnePlane, 0, MTLPixelFormatDepth32Float, k2D, 64, 64, 1, 1, 1, 1,
+     MTLStorageModePrivate, nullptr},
+    {"surface-plane-bc1", kOnePlane, 0, MTLPixelFormatBC1_RGBA, k2D, 64, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-bc1-wide", kFlat, 0, MTLPixelFormatBC1_RGBA, k2D, 128, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-bc1-62", kFlat, 0, MTLPixelFormatBC1_RGBA, k2D, 62, 64, 1, 1, 1, 1, kManaged,
+     nullptr},
+    {"surface-made-bc1-private", kFlat, 0, MTLPixelFormatBC1_RGBA, k2D, 64, 64, 1, 1, 1, 1,
+     MTLStorageModePrivate, nullptr},
+    {"surface-made-422-odd-height", kFlat, 0, MTLPixelFormatGBGR422, k2D, 64, 63, 1, 1, 1, 1,
+     kManaged, nullptr},
+    {"surface-wide-rows-made", kWideRows, 0, MTLPixelFormatBGRA8Unorm, k2D, 128, 64, 1, 1, 1, 1,
+     kManaged, nullptr},
+    // The two-plane Y'CbCr formats, which the lane makes as the M3 Max does (Q13).
+    {"surface-made-ycbcr", kFlat, 0, static_cast<MTLPixelFormat>(500), k2D, 64, 64, 1, 1, 1, 1,
+     kManaged, nullptr},
+};
+#undef RGFX_VALIDATE
+#undef RGFX_STRIDE
+#undef RGFX_INIT
+
+// The surface of `c` (one the caller releases) and its descriptor.
+static IOSurfaceRef surfaceOf(const SurfaceCase &c)
+{
+	const size_t row = 64 * 4;
+	NSMutableDictionary *props = [@{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @64,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(0x42475241u), // 'BGRA'
+	} mutableCopy];
+	if (c.surface == kWideRows)
+		props[(id)kIOSurfaceBytesPerRow] = @(2 * row);
+	if (c.surface == kOnePlane) {
+		[props removeObjectForKey:(id)kIOSurfaceBytesPerElement];
+		props[(id)kIOSurfaceAllocSize] = @(row * 64);
+		props[(id)kIOSurfacePlaneInfo] = @[ @{
+			(id)kIOSurfacePlaneWidth : @64,
+			(id)kIOSurfacePlaneHeight : @64,
+			(id)kIOSurfacePlaneBytesPerElement : @4,
+			(id)kIOSurfacePlaneBytesPerRow : @(row),
+			(id)kIOSurfacePlaneOffset : @0,
+			(id)kIOSurfacePlaneSize : @(row * 64),
+		} ];
+	}
+	return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+static MTLTextureDescriptor *descriptorOf(const SurfaceCase &c)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = c.type;
+	td.pixelFormat = c.format;
+	td.width = c.width;
+	td.height = c.height;
+	td.depth = c.depth;
+	td.arrayLength = c.arrayLength;
+	td.mipmapLevelCount = c.levels;
+	td.sampleCount = c.samples;
+	td.usage = MTLTextureUsageShaderRead |
+	           (c.format == MTLPixelFormatDepth32Float ? MTLTextureUsageRenderTarget : 0);
+	td.storageMode = c.storage;
+	return td;
+}
+
+// A YCBCR8_420_2P texture `w` x `h` over plane 0 of a 64 x 64 '420v' CVPixelBuffer, a render
+// target where `target` says, through rgfxEndAtInvalidSurfaceTexture.
+static void ycbcrTarget(unsigned w, unsigned h, bool target)
+{
+	CVPixelBufferRef pb = nullptr;
+	NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+	CHECK(CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, '420v', (__bridge CFDictionaryRef)attrs,
+	                          &pb) == kCVReturnSuccess);
+	IOSurfaceRef surface = CVPixelBufferGetIOSurface(pb);
+	CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == 2);
+	MTLTextureDescriptor *d =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:static_cast<MTLPixelFormat>(500)
+	                                                       width:w
+	                                                      height:h
+	                                                   mipmapped:NO];
+	d.usage = MTLTextureUsageShaderRead | (target ? MTLTextureUsageRenderTarget : 0);
+	rgfxEndAtInvalidSurfaceTexture(d, surface, 0);
+	CVPixelBufferRelease(pb);
+}
+
 // The cases checkDies runs, each in a process of its own: each ends the process where it should,
 // else it answers 0, which its check fails.
 static int dies_case(const char *name)
@@ -999,6 +1256,16 @@ static int dies_case(const char *name)
 	signal(SIGABRT, [](int) { _exit(kAborted); });
 	Fixture fx;
 	@autoreleasepool {
+	for (const SurfaceCase &c : kSurfaceCases) {
+		if (std::strcmp(name, c.name) != 0)
+			continue;
+		IOSurfaceRef surface = surfaceOf(c);
+		rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface, c.plane);
+		CFRelease(surface);
+	}
+	unsigned w = 0, h = 0;
+	if (std::sscanf(name, "surface-ycbcr-target-%ux%u", &w, &h) == 2)
+		ycbcrTarget(w, h, true);
 	if (std::strcmp(name, "buffer-texture-levels") == 0) {
 		std::vector<uint8_t> memory(4096, 0);
 		RgfxBuffer *buf =
@@ -1382,6 +1649,43 @@ void test_invalid_texture_descriptors_end_the_process()
 	passes(MTLPixelFormatBGR5A1Unorm, MTLTextureType2D, 1); // 43
 	passes(MTLPixelFormatRGBA16Unorm, MTLTextureType2D, 1);  // 110
 	passes(MTLPixelFormatRG32Uint, MTLTextureType2D, 1);     // 103
+}
+
+// A texture over an IOSurface ends the process with Metal's words, before the host is sent
+// anything, where newTextureWithDescriptor:iosurface:plane: ends it on the AMD 5300M and the Intel
+// 630 (oracle_surftex, Q20): at the descriptor's validation, then, over a surface without planes,
+// at its type, depth, levels, rows and depth formats, then at a plane past 0, a compressed
+// format's rows in blocks and rows past the surface's. What both Macs made passes, a plane of a
+// planar surface taking every type, level count and format, as do a plane past a surface's planes
+// and the M3 Max's two-plane Y'CbCr formats, which the creator answers.
+void test_invalid_surface_textures_end_the_process()
+{
+	for (const SurfaceCase &c : kSurfaceCases) {
+		if (c.words != nullptr) {
+			checkDies(c.name, c.words);
+			continue;
+		}
+		IOSurfaceRef surface = surfaceOf(c);
+		const bool planar = c.surface == kOnePlane;
+		CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == (planar ? 1u : 0u) &&
+		      (planar ? IOSurfaceGetBytesPerRowOfPlane(surface, 0)
+		              : IOSurfaceGetBytesPerRow(surface)) == (c.surface == kWideRows ? 512 : 256));
+		rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface, c.plane);
+		g_checks++;
+		CFRelease(surface);
+	}
+	// A render target of a two-plane Y'CbCr format at an odd width or height, which the x86 Macs
+	// end at as they end at every texture of the format, and the M3 Max and the host make none
+	// of; the others the lane makes as the M3 does (Q13).
+	const char *const kYCbCr = "-[MTLTextureDescriptorInternal validateWithDevice:]: failed "
+	                           "assertion `Texture Descriptor Validation\nMTLTextureDescriptor has "
+	                           "invalid pixelFormat (500).\n'";
+	checkDies("surface-ycbcr-target-63x63", kYCbCr);
+	checkDies("surface-ycbcr-target-63x64", kYCbCr);
+	checkDies("surface-ycbcr-target-64x63", kYCbCr);
+	ycbcrTarget(64, 64, true);
+	ycbcrTarget(63, 63, false);
+	g_checks++;
 }
 
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
@@ -12341,6 +12645,7 @@ int main(int argc, char **argv)
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_buffer_texture_types_end_the_process();
 		test_invalid_texture_descriptors_end_the_process();
+		test_invalid_surface_textures_end_the_process();
 		test_unalignable_linear_formats_end_the_process();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
