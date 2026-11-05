@@ -1,0 +1,65 @@
+#!/bin/bash
+# One probe round on the lane host, as a potluck job holding the 5080 and the whole host
+# (--exclusive). probe-batch.sh picks the round's probes and dispatches it from a throwaway commit
+# whose lg/ holds:
+#   lg/round.env  ROUND, RD (the round's directory, MSI_GATE/probes/ROUND), Q (the probe queue), RES
+#                 (the probes' results), TAKE (the probes, in order), STAGES (NAME=SRC@TIP each: a
+#                 probe copied from SRC on this host, its tip file TIP, rather than taken from the
+#                 queue), AFTER_B64 (a command run after the boot, base64: a hook's own end, say)
+#   lg/boot.env   msi-boot.sh's boot.env for the round
+#   lg/bin/       the gate's host scripts
+#   lg/ship/payload/bench   the tip's bench, for the boot's check of our Metal device
+# It moves the queued probes into the round, copies the staged ones in, boots (msi-boot.sh, which
+# runs msi-probes.sh), prints each probe's status, and puts the probes it did not reach back in
+# the queue (staged ones are dropped: staging them again makes them anew).
+set -uo pipefail
+WS=$(pwd)
+. "$WS/lg/round.env"
+mkdir -p "$RD/probes" "$RD/payload" "$RD/bin" "$Q" "$RES"
+staged=" "
+for s in ${STAGES:-}; do
+  n=${s%%=*} r=${s#*=}
+  src=${r%@*} tip=${r##*@}
+  rm -rf "$RD/probes/.$n.tmp" "$RD/probes/$n"
+  cp -a "$src" "$RD/probes/.$n.tmp" || { echo "msi-round: no probe at $src" >&2; exit 2; }
+  [[ -z $tip ]] || echo "$tip" > "$RD/probes/.$n.tmp/tip"
+  mv "$RD/probes/.$n.tmp" "$RD/probes/$n"
+  staged+="$n "
+  echo "staged $n from $src (tip $(cat "$RD/probes/$n/tip" 2> /dev/null))"
+done
+for p in $TAKE; do
+  [[ $staged == *" $p "* ]] && continue
+  mv "$Q/$p" "$RD/probes/" || echo "msi-round: $p is not in the queue"
+done
+printf '%s\n' $TAKE > "$RD/probes/.order"
+for f in msi-probes.sh msi-xid.sh msi-capture.py msi-hang.py msi-hang-catch.py msi-boot.sh msi-launch.sh; do
+  cp -p "$WS/lg/bin/$f" "$RD/bin/"
+done
+cp -p "$WS/lg/ship/payload/bench" "$RD/payload/"
+cp "$WS/lg/boot.env" "$RD/boot.env"
+bash "$RD/bin/msi-boot.sh" "$RD" || echo "probe-batch: the boot ended $? (its log: $RD/boot.log)"
+# The round's GPU errors (msi-boot.sh's xid.txt), the boot's own QEMU's marked "own".
+sed 's/^/  Xid: /' "$RD/xid.txt" 2> /dev/null
+grep -q '^CAPTURE=1' "$RD/boot.env" && sed 's/^/  capture: /' "$RD/capture.txt" 2> /dev/null
+# The kext's block-cache stalls over the whole boot (a capture round's ring reader), "S" each
+# one's seconds after the desktop came up.
+grep -q '^CAPTURE=1' "$RD/boot.env" && { grep -E '^(kring_lines|kring_first_s|block_stalls|block_stalls_early) ' "$RD/host.txt"
+  cat "$RD/kext-stalls.txt" 2> /dev/null; } | sed 's/^/  stalls: /'
+grep -E '^(host_quiet|cool_wait_s|quiet_wait_s|pkg_temp_start_c|pkg_throttle_ms_during|fatal_lines|xid_own) ' "$RD/host.txt" 2> /dev/null | sed 's/^/  host: /'
+# Each probe's status; the ones not reached (or never started: a failed boot) go back to the queue.
+for p in $TAKE; do
+  st=$(cat "$RES/$p/status" 2> /dev/null || echo 'not reached: the boot did not run it')
+  echo "  $p: $st"
+  case $st in
+    ran|skipped*) rm -rf "$RD/probes/$p" ;;
+    *) if [[ $staged == *" $p "* ]]; then rm -rf "$RD/probes/$p"; else mv "$RD/probes/$p" "$Q/" && rm -rf "$RES/$p"; fi ;;
+  esac
+done
+if [[ -n ${AFTER_B64:-} ]]; then
+  after=$(printf '%s' "$AFTER_B64" | base64 -d)
+  echo "after the boot: $after"
+  ( eval "$after" ) > "$RD/after.txt" 2>&1
+  echo "after the boot: exit $? (its output: $RD/after.txt)"
+fi
+echo "probe-batch: round $ROUND in $RD; the boot's launch.log.gz there"
+exit 0

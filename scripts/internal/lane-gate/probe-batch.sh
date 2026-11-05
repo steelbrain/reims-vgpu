@@ -22,10 +22,20 @@
 # wall_s, host.log, gpu-clocks.txt, out/, status), and the probe leaves the queue once it ran or
 # was skipped. One not reached in a round's hold stays queued for the next.
 #
-#   probe-batch.sh [--force] [--list] [--dry-run] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
+#   probe-batch.sh [--force] [--list] [--tip SHA] [--capture] [--first NAME,...] [--only NAME,...]
 #                  [--exclude NAME,...] [--hold S] [--catch-from-boot] [--host-tip SHA] [--image-tip SHA]
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
-#                  [--host-log FILTER]
+#                  [--host-log FILTER] [--stage NAME=DIR[@TIP]]... [--ram GIB] [--after CMD]
+#
+# The round runs as a potluck job on the lane host (lane-gate/msi-round.sh), holding the 5080 and the
+# whole host (--exclusive; potluck's lease is the lock), dispatched from a throwaway commit of the
+# round's own (lane-gate/ship-commit.sh) that carries the gate's host scripts, the tip's bench and the
+# round's boot.env. This script only reads the lane host's state (its queue and published tips, over
+# ssh); the job makes every change there. --stage NAME=DIR[@TIP] adds the probe in DIR on the lane host
+# to the round as NAME, copied in by the job (its tip file TIP where given), rather than from the
+# queue; --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page
+# cache a probe's host side fills counts too); --after CMD runs CMD on the lane host after the boot,
+# inside the job (a hook's own wait for its post-processing, say). --dry-run does not run as a job.
 # A round runs where 3 or more probes wait, or the oldest has waited 45 minutes, or with --force
 # (after each gate). Its tip is the newest published one (published-last) where a probe waits for
 # it, else the oldest probe's that is still published. It takes the probes for that tip oldest
@@ -60,7 +70,7 @@ set -euo pipefail
 L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
-cold_cache= qemu_hook= pre_qemu= log_add= host_log=
+cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() ram=64 after=
 while (($#)); do
   a=$1
   shift
@@ -80,6 +90,9 @@ while (($#)); do
     --log-add) log_add=${1:?--log-add FILTER}; shift ;;
     --host-log) host_log=${1:?--host-log FILTER}; shift ;;
     --hold) hold=${1:?--hold S}; shift ;;
+    --stage) stages+=("${1:?--stage NAME=DIR[@TIP]}"); shift ;;
+    --ram) ram=${1:?--ram GIB}; shift ;;
+    --after) after=${1:?--after CMD}; shift ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -101,38 +114,30 @@ PROBE_HOST_LOG=${host_log:-info,reims_graphics=trace}
 FIT_S=$(( HOLD_S - 90 - 180 - 60 ))
 # A capture's wait for the Dock to settle and its fetch (about 90 s) come off it too (--capture).
 
-if ((dry)); then
-  D=$(mktemp -d /tmp/probe-dry.XXXXXX)
-  MSI_RGK_RUN=$D/rgk-run MSI_GATE=$D/lane-gate-msi
-  mkdir -p "$MSI_RGK_RUN/probe-queue" "$D/guest"
-  # Three probes: two for the published tip (one over its budget), one for another commit.
-  mk() {
-    local n=$1 b=$2 t=$3 body=$4
-    mkdir -p "$D/drop/$n"
-    printf '%s\n' "$body" > "$D/drop/$n/run.sh"
-    echo "$b" > "$D/drop/$n/budget"
-    echo "$t" > "$D/drop/$n/tip"
-    mv "$D/drop/$n" "$MSI_RGK_RUN/probe-queue/$n"
-  }
-  mk a-hello 10 "$SHORT" 'echo "hello from $PROBE_NAME"; mkdir -p out; date > out/when; echo to-stderr >&2
-bash ~/probes/.shot.sh first && echo "shot first: $(cat out/shot-first.png)"'
-  : > "$MSI_RGK_RUN/probe-queue/a-hello/shots"
-  mk b-slow 2 "$PUB" 'echo start; sleep 30; echo never'
-  mk c-other 10 0123456789ab 'echo should not run'
-  msi() { bash -c "$1"; }
-  put() { cp -R "$1" "$2"; }
-  echo "probe-batch: dry run in $D"
-else
-  msi() { ssh -o BatchMode=yes "$MSI" "bash -c $(printf '%q' "$1")"; }
-  put() { scp -q -r "$1" "$MSI:$2"; }
-fi
+((dry)) && { echo "probe-batch: --dry-run does not run as a potluck job yet" >&2; exit 2; }
+# Reads of the lane host's state only (its queue, results and published tips): the round's job
+# makes every change there.
+msi() { ssh -o BatchMode=yes "$MSI" "bash -c $(printf '%q' "$1")"; }
 Q=$MSI_RGK_RUN/probe-queue
 RES=$MSI_RGK_RUN/probe-results
 
 # The queue: "AGE_S BUDGET TIP NAME" a probe, oldest first.
-queue=$(msi "mkdir -p '$Q' '$RES'; cd '$Q' && now=\$(date +%s) && for d in */; do d=\${d%/}; [ -d \"\$d\" ] || continue
+queue=$(msi "[ -d '$Q' ] || exit 0; cd '$Q' && now=\$(date +%s) && for d in */; do d=\${d%/}; [ -d \"\$d\" ] || continue
   m=\$(stat -c %Y \"\$d\" 2> /dev/null || stat -f %m \"\$d\"); echo \"\$((now - m)) \$(tr -dc 0-9 < \"\$d/budget\" 2> /dev/null || true) \$(tr -dc 0-9a-f < \"\$d/tip\" 2> /dev/null || true) \$d\"
   done | sort -rn")
+# The staged probes (--stage), as if just queued: their budget and tip as the job will see them.
+stage_specs=()
+for st_ in ${stages[@]+"${stages[@]}"}; do
+  sn=${st_%%=*} sr=${st_#*=} stip=
+  sdir=${sr%@*}
+  [[ $sr == *@* ]] && stip=${sr##*@}
+  info=$(msi "[ -f '$sdir/run.sh' ] && echo \"\$(tr -dc 0-9 < '$sdir/budget' 2> /dev/null) \$(tr -dc 0-9a-f < '$sdir/tip' 2> /dev/null)\"") ||
+    { echo "probe-batch: no probe in $sdir on the lane host" >&2; exit 2; }
+  read -r sb st0 <<< "$info"
+  stip=${stip:-$st0}
+  queue=$(printf '%s\n%s\n' "$queue" "0 ${sb:-180} $stip $sn" | sed '/^$/d')
+  stage_specs+=("$sn=$sdir@$stip")
+done
 queue_all=$queue
 [[ -n $exclude ]] &&  # --exclude: those stay queued
   queue=$(awk -v l="$exclude" 'BEGIN { n = split(l, a, ","); for (i = 1; i <= n; i++) s[a[i]] = 1 } !($4 in s)' <<< "$queue")
@@ -208,28 +213,20 @@ if (( !dry && !force )) && (( n < WAIT_N )) && (( ${oldest:-0} < WAIT_S )); then
 fi
 ((${#take[@]} || capture || from_boot)) || { echo "probe-batch: nothing to run"; exit 0; }
 
-# The round: its probes leave the queue for its directory, and those it does not reach go back.
+# The round: a job on the lane host holding the 5080 and the host alone, dispatched from the round's
+# own commit (its parent the harness's HEAD), which carries what the job needs.
 ROUND=$(date +%Y%m%d-%H%M%S)
 RD=$MSI_GATE/probes/$ROUND
-msi "mkdir -p '$RD/probes' '$RD/payload' '$RD/bin' && cd '$Q' && for p in ${take[*]:-}; do mv \"\$p\" '$RD/probes/'; done && printf '%s\\n' ${take[*]:-} > '$RD/probes/.order'"
-put "$L/msi-probes.sh" "$RD/bin/"
-put "$L/msi-xid.sh" "$RD/bin/"
-put "$L/msi-capture.py" "$RD/bin/"
-put "$L/msi-hang.py" "$RD/bin/"
-put "$L/msi-hang-catch.py" "$RD/bin/"
-if ((dry)); then
-  msi "PROBES='$RD/probes' PROBE_RESULTS='$RES' PROBE_TIP='$PUB' DEADLINE=$(( $(date +%s) + HOLD_S )) FAKE_GUEST='$D/guest' \
-    R='$RD' bash '$RD/bin/msi-probes.sh'"
-else
-  # The gate's scripts the boot runs, and the tip's bench for its check of our Metal device.
-  # The tip's bench (the boot's check of our Metal device), else the newest gate run's.
-  run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1)
-  [[ -x $run/artifacts/payload/bench ]] || run=$(ls -1dt "$GH/runs/"*/ 2> /dev/null | while read -r d; do
-    [[ -x ${d}artifacts/payload/bench ]] && { echo "${d%/}"; break; }; done)
-  [[ -x $run/artifacts/payload/bench ]] || { echo "probe-batch: no gate run with its bench" >&2; exit 1; }
-  put "$run/artifacts/payload/bench" "$RD/payload/"
-  put "$L/msi-boot.sh" "$RD/bin/"
-  msi "cat > '$RD/boot.env'" << EOF
+# The tip's bench (the boot's check of our Metal device), else the newest gate run's.
+run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1)
+[[ -x $run/artifacts/payload/bench ]] || run=$(ls -1dt "$GH/runs/"*/ 2> /dev/null | while read -r d; do
+  [[ -x ${d}artifacts/payload/bench ]] && { echo "${d%/}"; break; }; done)
+[[ -x $run/artifacts/payload/bench ]] || { echo "probe-batch: no gate run with its bench" >&2; exit 1; }
+S=$(mktemp -d /tmp/lg-round.XXXXXX)
+mkdir -p "$S/lg/bin" "$S/lg/ship/payload"
+find "$L" -maxdepth 1 -type f -exec cp -p {} "$S/lg/bin/" \;
+cp -p "$run/artifacts/payload/bench" "$S/lg/ship/payload/"
+cat > "$S/lg/boot.env" << EOF
 QEMU=$MSI_RGK_RUN/tip-host/$HOST_SHORT/qemu-system-x86_64
 ROM=$MSI_RGK_RUN/tip-host/$HOST_SHORT/ReimsGraphics.rom
 OC=$MSI_RGK_RUN/loader-fix/oc-sipon-$IMAGE_SHORT.qcow2
@@ -242,7 +239,6 @@ GUEST_PASS=$GUEST_PASS
 RGK_RUN=$MSI_RGK_RUN
 EXCLUSIVE=1
 HOLD_S=$HOLD_S
-LOCK_WAIT_S=${LOCK_WAIT_S:-10800}
 DRAG=0
 HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")${log_add:+,$log_add}
 CAPTURE=$capture
@@ -254,24 +250,29 @@ PROBES=$RD/probes
 PROBE_RESULTS=$RES
 PROBE_TIP=$PUB
 EOF
-  msi "bash '$RD/bin/msi-boot.sh' '$RD'" || echo "probe-batch: the boot ended $? (its log: $RD/boot.log)"
-  # The round's GPU errors (msi-boot.sh's xid.txt), the boot's own QEMU's marked "own".
-  msi "cat '$RD/xid.txt' 2> /dev/null" | sed 's/^/  Xid: /'
-  ((capture)) && msi "cat '$RD/capture.txt' 2> /dev/null" | sed 's/^/  capture: /'
-  # The kext's block-cache stalls over the whole boot (a capture round's ring reader), "S" each
-  # one's seconds after the desktop came up.
-  ((capture)) && msi "grep -E '^(kring_lines|kring_first_s|block_stalls|block_stalls_early) ' '$RD/host.txt'; cat '$RD/kext-stalls.txt' 2> /dev/null" | sed 's/^/  stalls: /'
-fi
-
-# Each probe's status; the ones not reached (or never started: a failed boot) go back to the queue.
-for p in ${take[@]+"${take[@]}"}; do
-  st=$(msi "cat '$RES/$p/status' 2> /dev/null || echo 'not reached: the boot did not run it'")
-  echo "  $p: $st"
-  case $st in
-    ran|skipped*) msi "rm -rf '$RD/probes/$p'" ;;
-    *) msi "mv '$RD/probes/$p' '$Q/' && rm -rf '$RES/$p'" ;;
-  esac
-done
+printf '%s=%q\n' ROUND "$ROUND" RD "$RD" Q "$Q" RES "$RES" TAKE "${take[*]:-}" STAGES "${stage_specs[*]:-}" \
+  AFTER_B64 "$(printf '%s' "$after" | base64 | tr -d '\n')" > "$S/lg/round.env"
+branch=steelbrain/lane-gate-round-$ROUND wt=$HOME/.cache/lane-gate-ship/round-$ROUND
+commit=$(cd "$L" && bash "$L/ship-commit.sh" "$S" "$(git -C "$L" rev-parse HEAD)" "$branch" "$wt" \
+  ":construction: WIP lane-gate probe round $ROUND (throwaway)")
+rm -rf "$S"
+echo "probe-batch: round $ROUND from $commit on $branch"
+out=$(cd "$wt" && potluck dispatch --json --timeout "$(( (HOLD_S + 1800) / 60 ))m" --ram "$ram" --exclusive --gpu "${POTLUCK_MSI_GPU:-5080}" \
+  --on "node=${POTLUCK_MSI_NODE:-msi-laptop}" --label lane-gate=round -- bash lg/bin/msi-round.sh) ||
+  { echo "probe-batch: potluck dispatch: $out" >&2; exit 1; }
+job=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["job"])' <<< "$out")
+echo "probe-batch: potluck job $job"
+(cd "$wt" && potluck wait "$job") || echo "probe-batch: job $job ended $?"
+ws=$(potluck status --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for k in ("running", "recent", "queued"):
+    for j in d.get(k) or []:
+        if j.get("id") == sys.argv[1] and j.get("workspace"):
+            print(j["workspace"]); sys.exit(0)' "$job" || true)
+[[ -z $ws ]] || potluck release "$ws" > /dev/null 2>&1 || true
+git -C "$L" worktree remove --force "$wt" 2> /dev/null || true
+git -C "$L" branch -q -D "$branch" 2> /dev/null || true
 ((dry)) && { echo "probe-batch: the dry run's results:"; for p in "$RES"/*/; do
   echo "== ${p%/}"; for f in status rc wall_s stdout stderr; do [[ -f $p$f ]] && echo "  $f: $(tr '\n' '|' < "$p$f")"; done
   [[ -d ${p}out ]] && echo "  out/: $(ls "${p}out" | tr '\n' ' ')"; done
