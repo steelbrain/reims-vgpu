@@ -32,6 +32,11 @@
 //              and done_us (commit to each handler), ret_us, and from the buffer's own times
 //              gpu_start_us (commit to GPUStartTime), gpu_us (GPUStartTime to GPUEndTime) and
 //              deliver_us (GPUEndTime to the completed handler).
+//   submitted.empty.idle, submitted.tiny.idle  commitAndWaitUntilSubmitted (the SPI WindowServer's
+//              display pipe calls) of a lone buffer after an idle gap (-g): ret_us (the call) and
+//              sched_us (its start to the buffer's scheduled handler).
+//   submitted.tiny.behind  the same call of a tiny buffer committed behind a buffer of a few
+//              milliseconds (four fills of 64 MiB of Private memory) on its queue: ret_us.
 //   mt.commit.qN       N threads, each with its own queue, committing back to back: cb_s.
 //   mt.wait.qN         N threads, each with its own queue, each committing and waiting: cb_s,
 //              ret_us over all of them.
@@ -485,6 +490,81 @@ static NSString *latency(double gapUs)
 	Samples *all[] = {&commit, &sched, &done, &ret, &gpuStart, &gpu, &deliver};
 	for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
 		sFree(all[i]);
+	return line;
+}
+
+// The command-buffer SPI WindowServer's display pipe calls: commits, then returns once the buffer
+// is submitted, not run.
+@interface NSObject (SubmitProbeSubmitted)
+- (BOOL)commitAndWaitUntilSubmitted;
+@end
+
+// commitAndWaitUntilSubmitted of a lone buffer (`tiny`, else empty), after the gap (-g) on an idle
+// queue, or (`behind`) of a tiny one committed behind a buffer of a few milliseconds on its queue:
+// ret_us, the call; sched_us, the call's start to the buffer's scheduled handler (lone only).
+static NSString *submitted(BOOL tiny, BOOL behind)
+{
+	id<MTLCommandQueue> q = [gDevice newCommandQueue];
+	id<MTLBuffer> buf = newShared();
+	id<MTLBuffer> big = nil;
+	if (behind)
+		big = [gDevice newBufferWithLength:64u << 20 options:MTLResourceStorageModePrivate];
+	warm(q, buf);
+	Samples ret = {0}, sched = {0};
+	Cpu cpu = cpuNow();
+	double t0 = nowUs(), end = t0 + gSeconds * 1e6;
+	long n = 0;
+	NSString *why = nil;
+	Stamps *st = calloc(1, sizeof(Stamps));
+	while (nowUs() < end) {
+		@autoreleasepool {
+			id<MTLCommandBuffer> busy = nil;
+			if (behind) {
+				busy = [q commandBuffer];
+				id<MTLBlitCommandEncoder> b = [busy blitCommandEncoder];
+				for (int i = 0; i < 4; i++)
+					[b fillBuffer:big range:NSMakeRange(0, big.length) value:(uint8_t)i];
+				[b endEncoding];
+				[busy commit];
+			} else {
+				gap(gGapUs);
+			}
+			atomic_store(&st->scheduled, 0);
+			id<MTLCommandBuffer> cb = makeBuffer(q, buf, tiny || behind, n);
+			if (!behind) {
+				[cb addScheduledHandler:^(id<MTLCommandBuffer> b) {
+					atomic_store(&st->scheduled, nowUs());
+				}];
+			}
+			double c = nowUs();
+			BOOL ok = [(id)cb commitAndWaitUntilSubmitted];
+			double r = nowUs();
+			[cb waitUntilCompleted];
+			[busy waitUntilCompleted];
+			progress();
+			if (!ok) {
+				why = @"FAIL commitAndWaitUntilSubmitted answered NO";
+				break;
+			}
+			if (failed(cb, &why) || (busy != nil && failed(busy, &why)))
+				break;
+			sAdd(&ret, r - c, c - t0);
+			double s = atomic_load(&st->scheduled);
+			if (s > 0)
+				sAdd(&sched, s - c, c - t0);
+			n++;
+		}
+	}
+	free(st);
+	if (why)
+		return why;
+	NSString *line = behind ? [NSString stringWithFormat:@"OK n=%ld %@ %@", n, sLine("ret", &ret),
+	                                                     cpuLine(cpu, n)]
+	                        : [NSString stringWithFormat:@"OK n=%ld %@ %@ %@", n, sLine("ret", &ret),
+	                                                     sLine("sched", &sched), cpuLine(cpu, n)];
+	sDetail("ret", &ret);
+	sFree(&ret);
+	sFree(&sched);
 	return line;
 }
 
@@ -952,6 +1032,9 @@ int main(int argc, char **argv)
 		runCase(@"rate.handler.tiny", ^{ return handlerRate(); });
 		runCase(@"lat.tiny.busy", ^{ return latency(0); });
 		runCase(@"lat.tiny.idle", ^{ return latency(gGapUs); });
+		runCase(@"submitted.empty.idle", ^{ return submitted(NO, NO); });
+		runCase(@"submitted.tiny.idle", ^{ return submitted(YES, NO); });
+		runCase(@"submitted.tiny.behind", ^{ return submitted(YES, YES); });
 		for (int n = 2; n <= gMaxThreads; n *= 2) {
 			runCase([NSString stringWithFormat:@"mt.commit.q%d", n], ^{ return threads(n, NO, NO); });
 			runCase([NSString stringWithFormat:@"mt.wait.q%d", n], ^{ return threads(n, NO, YES); });
