@@ -43,6 +43,9 @@ MODE, B, R = sys.argv[1], sys.argv[2], sys.argv[3]
 C = os.path.join(R, "capture")
 STOP = os.path.join(C, "stop")
 MAX_S = float(os.environ.get("CAPTURE_MAX_S", "600"))
+# CAPTURE_FROM_NOW=1: a capture started later than QEMU (at an in-guest restart, by a round's hook):
+# its CAPTURE_MAX_S counts from its own start, and only the host's presents after that end it.
+FROM_NOW = os.environ.get("CAPTURE_FROM_NOW") == "1"
 PERIOD = float(os.environ.get("CAPTURE_MS", "100")) / 1000
 os.makedirs(C, exist_ok=True)
 
@@ -157,6 +160,11 @@ def scanout(pid, t_end):
     nxt = time.time()
     # The host's log, read as it grows, for the first present (the reads end there).
     lp, seen, presented = os.path.join(B, "launch.log"), 0, None
+    if FROM_NOW:  # a capture started at a guest restart: only a present after it ends the reads
+        try:
+            seen = os.path.getsize(lp)
+        except OSError:
+            pass
     try:
         while time.time() < t_end and not os.path.exists(STOP):
             try:
@@ -208,9 +216,16 @@ def scanout(pid, t_end):
 def shots(pid, t_end):
     # From the host's first present on: WindowServer draws the screen from then.
     lp = os.path.join(B, "launch.log")
+    off0 = 0
+    if FROM_NOW:  # at a restart: the first present after it
+        try:
+            off0 = os.path.getsize(lp)
+        except OSError:
+            pass
     while time.time() < t_end and not os.path.exists(STOP):
         try:
             with open(lp, errors="replace") as f:
+                f.seek(off0)
                 if "the display shows IOSurface" in f.read():
                     break
         except OSError:
@@ -248,7 +263,7 @@ pid = qemu()
 if pid is None:
     result = "frames=0 why=no-qemu"
 else:
-    start = os.path.getmtime(os.path.join(B, "qemu.pid"))
+    start = time.time() if FROM_NOW else os.path.getmtime(os.path.join(B, "qemu.pid"))
     try:
         result = (scanout if MODE == "scanout" else shots)(pid, start + MAX_S)
     except Exception as e:  # a capture that fails leaves its reason
