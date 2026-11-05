@@ -386,7 +386,7 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	});
 	[self rgfxKeepSource:source ofLibrary:lib];
 	if ([(id)lib isKindOfClass:[RgfxLibrary class]])
-		[(RgfxLibrary *)lib rgfxSetMadeFromURL];
+		[(RgfxLibrary *)lib rgfxSetMadeFromURL:url];
 	return lib;
 }
 

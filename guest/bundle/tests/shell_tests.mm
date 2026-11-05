@@ -3081,7 +3081,7 @@ void test_library_members_as_metal()
 	      err.code == NSFileWriteUnsupportedSchemeError);
 
 	RgfxLibrary *fromURL = make();
-	[fromURL rgfxSetMadeFromURL];
+	[fromURL rgfxSetMadeFromURL:out];
 	err = nil;
 	CHECK(![fromURL serializeToURL:out error:&err]);
 	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorUnsupported &&
@@ -3104,6 +3104,76 @@ void test_library_members_as_metal()
 	CHECK(![bare serializeToURL:out error:&err] && [err.domain isEqualToString:MTLLibraryErrorDomain]);
 	CHECK(RgfxUnsupportedWasLogged([RgfxLibrary class], @selector(serializeToURL:error:)));
 	[[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
+// A library answers its type and install name as Metal does on the x86 Macs (oracle_bundle libtype
+// and functypes): an executable library's bytes Executable and, as its install name, the last part
+// of the URL it was made from, or default.metallib; a dynamic library's bytes, whose header's file
+// type is 2, Dynamic and the install name they hold, which its shadow answers, nil with none.
+void test_library_type_and_install_name()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&](NSData *bytes, bool shadowed) {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+		                                        length:bytes.length
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&status];
+		if (shadowed)
+			[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+				     (void)bytes;
+			     })
+			       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+				       return [metal newLibraryWithData:d error:nil];
+			       }];
+		return lib;
+	};
+	NSData *executable = [NSData dataWithContentsOfFile:@(path)];
+	RgfxLibrary *fromData = make(executable, true);
+	CHECK(fromData.type == MTLLibraryTypeExecutable);
+	CHECK([fromData.installName isEqualToString:@"default.metallib"]);
+	RgfxLibrary *fromURL = make(executable, false);
+	[fromURL rgfxSetMadeFromURL:[NSURL fileURLWithPath:@"/Library/Shaders/stitchable.metallib"]];
+	CHECK(fromURL.type == MTLLibraryTypeExecutable);
+	CHECK([fromURL.installName isEqualToString:@"stitchable.metallib"]);
+
+	// A dynamic library's bytes, as Metal's compiler writes them.
+	MTLCompileOptions *o = [MTLCompileOptions new];
+	o.libraryType = MTLLibraryTypeDynamic;
+	o.installName = @"@executable_path/librgfx_dyn.metallib";
+	NSError *err = nil;
+	id<MTLLibrary> compiled =
+	    [metal newLibraryWithSource:@"float rgfx_dyn(float x) { return x * 3.0f; }"
+	                        options:o
+	                          error:&err];
+	CHECK(compiled != nil);
+	SEL contents = sel_registerName("libraryDataContents");
+	CHECK([(id)compiled respondsToSelector:contents]);
+	NSData *dynamic = compiled != nil && [(id)compiled respondsToSelector:contents]
+	                      ? ((id (*)(id, SEL))objc_msgSend)(compiled, contents)
+	                      : nil;
+	CHECK(dynamic.length > 0x0a && static_cast<const uint8_t *>(dynamic.bytes)[0x0a] == 2);
+	if (dynamic.length > 0x0a) {
+		RgfxLibrary *dyn = make(dynamic, true);
+		CHECK(dyn.type == MTLLibraryTypeDynamic);
+		CHECK([dyn.installName isEqualToString:@"@executable_path/librgfx_dyn.metallib"]);
+		RgfxLibrary *dynURL = make(dynamic, true);
+		[dynURL rgfxSetMadeFromURL:[NSURL fileURLWithPath:@"/tmp/librgfx_dyn.metallib"]];
+		CHECK([dynURL.installName isEqualToString:@"@executable_path/librgfx_dyn.metallib"]);
+		RgfxLibrary *bare = make(dynamic, false);
+		CHECK(bare.type == MTLLibraryTypeDynamic && bare.installName == nil);
+	}
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {
 	}
 }
@@ -12213,6 +12283,7 @@ int main(int argc, char **argv)
 		test_unread_function_list_answers_from_shadow();
 		test_stitchable_reflection_from_air();
 		test_library_members_as_metal();
+		test_library_type_and_install_name();
 		test_command_graph();
 		test_parallel_render_encoder();
 		test_parallel_sub_encoders_run_in_creation_order();

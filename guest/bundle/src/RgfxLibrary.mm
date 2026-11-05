@@ -339,6 +339,8 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	id<MTLLibrary> _shadow;                   // Metal's own over _source, made on first use
 	BOOL _shadowTried;
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
+	NSString *_fileName; // the last part of newLibraryWithURL:'s URL, nil for any other
+	BOOL _dynamic;       // a dynamic library's bytes (rgfxMetallibIsDynamic)
 	std::mutex _airLock; // guards _air and _visible
 	// Each entry point's arguments read from its bitcode in `_source`, by name, once each: null
 	// where they did not read.
@@ -361,6 +363,16 @@ static bool rgfxMade(uint32_t status)
 	return status == RGFX_STATUS_OK || status == kRgfxNoAnswer;
 }
 
+// Whether `length` bytes at `bytes` are a dynamic library's metallib: its header's file type (the
+// byte at 0x0a) is 2, where an executable's is 0 (measured on the AMD 5300M and the Intel 630
+// under macOS 26.7.1: oracle_bundle libtype's and functypes' libraries, compiled from source and
+// by Apple's compiler, of type 1 where it is 2).
+static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
+{
+	return bytes != nullptr && length > 0x0a && std::memcmp(bytes, "MTLB", 4) == 0 &&
+	       bytes[0x0a] == 2;
+}
+
 // The library `objId` over `bytes`, of content key `key` (32 bytes, or null), its function table
 // read from them, or the one the process read for that key (functionTableOf).
 + (instancetype)rgfxLibraryWithObjId:(RgfxObjId)objId
@@ -371,8 +383,10 @@ static bool rgfxMade(uint32_t status)
                           serializer:(RgfxSerializer *)serializer
 {
 	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
-	if (lib != nil)
+	if (lib != nil) {
 		lib->_table = functionTableOf(static_cast<const uint8_t *>(bytes), length, key);
+		lib->_dynamic = rgfxMetallibIsDynamic(static_cast<const uint8_t *>(bytes), length);
+	}
 	return lib;
 }
 
@@ -866,10 +880,11 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 	return fn;
 }
 
-- (void)rgfxSetMadeFromURL
+- (void)rgfxSetMadeFromURL:(NSURL *)url
 {
 	std::lock_guard<std::mutex> hold(_shadowLock);
 	_madeFromURL = YES;
+	_fileName = [url.lastPathComponent copy];
 }
 
 // Metal answers nil for a library made from bytes, of data or of a URL (measured: macOS 27), as
@@ -914,14 +929,25 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 	                                                                              error);
 }
 
+// The library's type and install name as Metal answers them on the AMD 5300M and the Intel 630
+// under macOS 26.7.1 (oracle_bundle libtype and functypes): a dynamic library's bytes answer
+// Dynamic and the install name they hold (@executable_path/liboracle_bundle_dyn.metallib), made
+// from a URL or from data, which the shadow, Metal's own library over them, answers; any other
+// answers Executable, and as its install name the last part of the URL it was made from
+// (oracle_bundle.metallib), or default.metallib for one made from data or source.
 - (MTLLibraryType)type
 {
-	return MTLLibraryTypeExecutable;
+	return _dynamic ? MTLLibraryTypeDynamic : MTLLibraryTypeExecutable;
 }
 
 - (NSString *)installName
 {
-	return nil; // an executable library has no install name
+	if (_dynamic) {
+		id<MTLLibrary> shadow = [self rgfxShadow];
+		return [shadow respondsToSelector:_cmd] ? shadow.installName : nil;
+	}
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	return _fileName ?: @"default.metallib";
 }
 
 // --- unsupported ----------------------------------------------------------------------

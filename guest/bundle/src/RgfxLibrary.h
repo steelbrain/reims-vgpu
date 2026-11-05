@@ -55,9 +55,10 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 - (NSArray<NSString *> *)externFunctionNames;
 - (nullable id<MTLFunction>)newExternFunctionWithName:(NSString *)name;
 
-/// Marks the library as made from a URL (newLibraryWithURL:, and the calls that make theirs so),
-/// which Metal does not serialize.
-- (void)rgfxSetMadeFromURL;
+/// Marks the library as made from `url` (newLibraryWithURL:, and the calls that make theirs so),
+/// which Metal does not serialize, and whose last part an executable library answers as its
+/// install name.
+- (void)rgfxSetMadeFromURL:(NSURL *)url;
 
 /// The function table the library reads its functions from: one object for every library of the
 /// process made from bytes of one content key (tests).
