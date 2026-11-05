@@ -48,7 +48,9 @@
 //     release, where the GPU wrote it and the surface lives past the kext's own references,
 //     attaches its pages first, so the release copies the cache into them
 //     (rgfxCacheReleaseNext), naming them again as a lock does; else nothing reads them.
-// A wait that does not end in kWaitMs goes on, as a lock waiting for a write does.
+// A wait that does not end in kWaitMs goes on, as a lock waiting for a write does, but a lock's
+// wait for its block's release's answer, which lasts as long as a new block's
+// (rgfxCacheLockWaitMs).
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
 // The caller holds one lock around every call. Header-only and free of the kernel's headers, so
@@ -636,6 +638,19 @@ inline RgfxNewBlockStep rgfxCacheNewBlockStep(bool writingBack, uint64_t waitedM
 	if (!writingBack)
 		return kRgfxNewBlockMake;
 	return waitedMs < kRgfxWriteBackWaitMs ? kRgfxNewBlockWait : kRgfxNewBlockLate;
+}
+
+// How long, from its start, a CPU lock of surface `key` waits at a kRgfxCacheWait, where it waits
+// `lockMs` for the GPU's writes and for another lock's download or attach: for its block's
+// release's answer, which copies the cache into the pages, as long as a new block of the surface
+// waits for that write-back (kRgfxWriteBackWaitMs), so the lock reads, or writes, the pages only
+// once they hold what the GPU wrote, the host answering once the buffers that used the cache
+// have finished; else `lockMs`.
+inline uint64_t rgfxCacheLockWaitMs(RgfxCacheTable &t, uint64_t key, uint64_t lockMs)
+{
+	const RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	return c != nullptr && c->releasing && lockMs < kRgfxWriteBackWaitMs ? kRgfxWriteBackWaitMs
+	                                                                     : lockMs;
 }
 
 // The let-go of the block at `offset`, which named surface `key`'s device cache: as
