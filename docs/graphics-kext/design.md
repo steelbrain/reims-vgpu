@@ -1982,14 +1982,21 @@ processes here reach the host on rings of their own, which the host takes
 apart, so the order the host takes buffers in is not the order they were
 committed in. The bundle names the order instead, as it posts each buffer:
 - Each surface's shared block holds its writers (`RgfxSurfaceWriters`, one
-  slot a queue: its latest buffer that writes the surface) and, after them
-  where the block's last page has room, its readers (the same record, the
-  latest buffer of each queue that only reads it), which only the bundles read.
-  A copy whose writers end within 64 bytes of a page's end would have no
-  readers, and a write of it would wait for no read; no block the bundle lays
-  out is such. A copy's planes start and end on 256 bytes, so its header, its
-  writers and its readers (152 bytes) fit in the page its planes end in, and a
-  block in place holds the header and the slots alone, from its start.
+  slot a queue: its latest buffer that writes the surface) and, after them, its
+  readers (the same record, the latest buffer of each queue that only reads
+  it), which only the bundles read. Every block has both: a copy's planes start
+  and end on 256 bytes, so its header, its writers and its readers (152 bytes)
+  fit in the page its planes end in, and a block in place holds the header and
+  the slots alone, from its start. Every holder asks a block's size from the
+  writers' end, as a bundle without readers did.
+- A slot names a buffer only while it runs: once the host has finished it, and
+  its post has named it, its process empties the slot where no later buffer of
+  the queue raised it, as a buffer that named it would wait for nothing. Four
+  slots of each record are shared by every process's queues, so a fifth queue
+  finds one only once a buffer another holds has finished; one that finds none
+  is not named (its process logs it once), so a later write of the surface by
+  another queue waits for none of that queue's reads, nor a present or a read
+  for its writes.
 - The post of a buffer that uses surfaces, just before it goes on its queue's
   ring, reads, for each, the writers of other queues, and where the buffer
   writes the surface the readers too, and names each queue once, at its highest

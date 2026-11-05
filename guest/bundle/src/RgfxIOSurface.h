@@ -77,16 +77,18 @@
  * the buffer's seqno there before the commit returns, so a present the process makes after it
  * waits for it on the host. Each process writes only the slots naming its own queues: it raises
  * its queue's seqno in the slot it holds, takes again one naming a queue of its own that is gone
- * (whose buffers have all finished), or takes an empty one (queue 0); it empties its slots as
- * its view goes, when the buffers that wrote it have finished. A slot given to another queue has
+ * (whose buffers have all finished), or takes an empty one (queue 0); it empties a slot once the
+ * host has finished the buffer it names (rgfxIOSurfaceNoteFinished), so a slot is held only
+ * while a buffer it names runs, and empties its slots as its view goes, when the buffers that
+ * wrote it have finished. A slot given to another queue has
  * its seqno emptied first, then its queue written, then the seqno, so the host, which reads the
  * queue, the seqno and the queue again, never pairs one queue with another's seqno. A block made
  * again has its writers emptied by the process that made it, before its texture is created.
  *
  * Where the process names its command buffers' order (RGFX_FEATURE_SURFACE_ORDER in the
  * device's feature word; docs/graphics-kext/design.md, "Surface order"), the readers follow the
- * writers, where the block has room past them: the same record, each queue's latest buffer that
- * only reads the view, which only the bundles read. The post of a buffer that uses surfaces names
+ * writers, in every block: the same record, each queue's latest buffer that only reads the view,
+ * which only the bundles read. The post of a buffer that uses surfaces names
  * the buffers of other queues it runs after (rgfxIOSurfaceNameOrder), as a Mac's GPU orders a
  * process's access to an IOSurface after another's committed before it where one of the two
  * writes: the writers of each surface it uses, and the readers of each it writes, as the blocks
@@ -331,11 +333,18 @@ void rgfxIOSurfaceWritesPosted(RgfxRegion *_Nonnull region,
 void rgfxIOSurfaceRetire(RgfxRegion *_Nonnull region, uint64_t queueObjId, uint64_t seqno);
 
 /// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is `queueObjId`):
-/// names it among the readers of each view in `reads` (rgfxIOSurfaceNameOrder's answer), where its
-/// block holds readers, so a later post of another queue's buffer that writes the surface runs
-/// after it.
+/// names it among the readers of each view in `reads` (rgfxIOSurfaceNameOrder's answer), so a
+/// later post of another queue's buffer that writes the surface runs after it.
 void rgfxIOSurfaceNoteRead(const std::vector<std::shared_ptr<void>> &reads, id _Nonnull queue,
                            uint64_t queueObjId, uint64_t seqno);
+
+/// Once the host has finished queue `queueObjId`'s buffer at `seqno`, and its post has named it
+/// (rgfxIOSurfaceNoteCommitted, rgfxIOSurfaceNoteRead): empties the queue's slots, of the writers
+/// and the readers of each view in `writes` and `reads`, that still name that buffer. A buffer
+/// that named it would wait for nothing, and the slot is free for a queue of any process.
+void rgfxIOSurfaceNoteFinished(const std::vector<std::shared_ptr<void>> &writes,
+                               const std::vector<std::shared_ptr<void>> &reads,
+                               uint64_t queueObjId, uint64_t seqno);
 
 /// After a command buffer is posted at seqno `seqno` on queue `queue` (whose id is
 /// `queueObjId`): names it among the writers of each copy in `writes` (taken from its encoder),

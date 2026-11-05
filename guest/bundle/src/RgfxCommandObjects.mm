@@ -1205,6 +1205,10 @@ namespace {
 // device's pipelines have.
 constexpr uint64_t kRgfxBarrierRenderStages = MTLRenderStageVertex | MTLRenderStageFragment;
 
+// A command buffer's surface slots (RgfxCmdBuffer's _surfaceSlots): its post has named it in
+// them, and the host has finished it.
+constexpr uint32_t kRgfxSlotsNamed = 1, kRgfxSlotsFinished = 2;
+
 // The fences a barrier in the encoder of `b` waits for: every one but its own that an earlier
 // encoder took, calling `wait` with each.
 template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &b, Wait wait)
@@ -1307,6 +1311,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// yet: at its completion's take, a buffer of both retires its writes there (rgfxHostDone:).
 	bool _writesInPlace;
 	std::atomic<bool> _writesNamed;
+	// Whether its post has named it in its surfaces' writer and reader slots, and whether the
+	// host has finished it (kRgfxSlotsNamed, kRgfxSlotsFinished): the second of the two empties
+	// the slots that still name it (rgfxIOSurfaceNoteFinished), as the host may finish a buffer
+	// before its post has named it.
+	std::atomic<uint32_t> _surfaceSlots;
 	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
@@ -1722,6 +1731,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		rgfxIOSurfaceNoteCommitted(written, queue, queue.rgfxObjId, _seqno);
 	if (posted && !read.empty())
 		rgfxIOSurfaceNoteRead(read, queue, queue.rgfxObjId, _seqno);
+	// Where the host has finished it already, the slots just named go now.
+	if (posted && (!written.empty() || !read.empty()) &&
+	    (_surfaceSlots.fetch_or(kRgfxSlotsNamed, std::memory_order_acq_rel) &
+	     kRgfxSlotsFinished) != 0)
+		rgfxIOSurfaceNoteFinished(written, read, queue.rgfxObjId, _seqno);
 	// A CPU lock of a surface it writes waits for it from here, before the commit returns, as
 	// Metal's does once the buffer is submitted.
 	if (posted && writesRegion != nullptr) {
@@ -1812,6 +1826,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg
 {
 	[self rgfxReachSubmitted];
+	// The slots of its surfaces that still name it are free: a buffer that named it would wait
+	// for nothing. Where its post has yet to name them, the post empties them once it has.
+	if ((_surfaceSlots.fetch_or(kRgfxSlotsFinished, std::memory_order_acq_rel) &
+	     kRgfxSlotsNamed) != 0)
+		rgfxIOSurfaceNoteFinished(_surfaceWrites, _surfaceReads, [_queue rgfxObjId], _seqno);
 	_uploadsFailed = _uploads != nullptr && _uploads->failed();
 	if (_uploads != nullptr) {
 		_uploads->giveBack();
