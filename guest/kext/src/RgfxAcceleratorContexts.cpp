@@ -461,12 +461,12 @@ void nameReleases(thread_call_param_t accelerator, thread_call_param_t)
 // The release thread call, the guest's one (THREAD_CALL_OPTIONS_ONCE): lets go of the dormant
 // blocks their surfaces asked to go (reapDormant); retires the releases answered; then posts
 // each freed block's BLOCK_RELEASE on ring 0, kReleaseBatch at a time with one doorbell at most,
-// as many as the release table holds, and returns without waiting for any. The work loop hands
-// each answer to its entry, in whatever order the contexts' command buffers finish, and runs the
-// worker again to retire it; so releases posted together wait for their contexts' drains at
-// once, and a slow context holds back only its own blocks. A deferred block whose pages are
-// named first goes to the naming worker (nameReleases), which waits for the host's answers, and
-// is posted once named. Never on the freeing thread.
+// as many as the release table holds, and returns without waiting for any answer. The work loop
+// hands each answer to its entry, in whatever order the contexts' command buffers finish, and
+// runs the worker again to retire it; so releases posted together wait for their contexts'
+// drains at once, and a slow context holds back only its own blocks. A deferred block whose
+// pages are named first goes to the naming worker (nameReleases), which waits for the host's
+// answers, and is posted once named. Never on the freeing thread.
 void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
@@ -1389,8 +1389,8 @@ void noteDormant()
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
 		      "volatile), %llu asked otherwise, %llu past the deferred bytes; %llu released with "
-		      "no client left (%llu of them written, not copied); %llu not cached: no room; "
-		      "%llu deferred (%llu refused), %llu released with no pages named\n",
+		      "no client left (%llu of them written, copied all the same); %llu not cached: "
+		      "no room; %llu deferred (%llu refused), %llu released with no pages named\n",
 		      count, bytes >> 20, dormantMaxBytes >> 20, d.slept, d.revived,
 		      d.letGo[kRgfxDormantPurged], d.purgedWritten, d.letGo[kRgfxDormantEmptied],
 		      d.letGo[kRgfxDormantNoClients],

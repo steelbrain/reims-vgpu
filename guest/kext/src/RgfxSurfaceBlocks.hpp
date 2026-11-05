@@ -311,8 +311,10 @@ enum RgfxSurfaceLetGo {
 	// (BLOCK_UNSHARE) and unwires the pages.
 	kRgfxSurfaceLetGoHold,
 	// The client was its last holder: the caller frees the block (its BLOCK_RELEASE names
-	// `context`), or keeps a cached one dormant (rgfxSurfaceSleep), unwires the pages and lets
-	// the entry go (rgfxSurfaceClear).
+	// `context`), or keeps a cached one dormant (rgfxSurfaceSleep), unwires the hold's pages and
+	// lets the entry go (rgfxSurfaceClear). A dormant block's pages stay wired all the same: its
+	// device cache holds a wire of its own on the surface's memory until the block's release is
+	// answered (rgfxSurfaceCacheAdd).
 	kRgfxSurfaceLetGoLast,
 };
 
