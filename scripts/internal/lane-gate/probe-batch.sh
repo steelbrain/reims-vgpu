@@ -266,6 +266,9 @@ mkdir -p "$S/lg/bin" "$S/lg/ship/payload"
 find "$L" -maxdepth 1 -type f -exec cp -p {} "$S/lg/bin/" \;
 for b in ${bins[@]+"${bins[@]}"}; do cp -p "$b" "$S/lg/bin/" || { echo "probe-batch: no $b" >&2; exit 2; }; done
 cp -p "$run/artifacts/payload/bench" "$S/lg/ship/payload/"
+# The run's winmon too, where it has one: msi-drag.py lists and tracks the guest's windows with
+# ~/lane-gate/winmon, so a hook driving it in a probe round (Mission Control, a drag) finds it.
+[[ ! -x $run/artifacts/payload/winmon ]] || cp -p "$run/artifacts/payload/winmon" "$S/lg/ship/payload/"
 for st_ in ${lstages[@]+"${lstages[@]}"}; do
   sn=${st_%%=*} sr=${st_#*=}
   mkdir -p "$S/lg/probes"

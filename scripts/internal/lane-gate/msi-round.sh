@@ -8,7 +8,8 @@
 #                 queue), AFTER_B64 (a command run after the boot, base64: a hook's own end, say)
 #   lg/boot.env   msi-boot.sh's boot.env for the round
 #   lg/bin/       the gate's host scripts
-#   lg/ship/payload/bench   the tip's bench, for the boot's check of our Metal device
+#   lg/ship/payload/bench   the tip's bench, for the boot's check of our Metal device; winmon
+#                           beside it where the gate run has one, for msi-drag.py
 # It moves the queued probes into the round, copies the staged ones in, boots (msi-boot.sh, which
 # runs msi-probes.sh), prints each probe's status, and puts the probes it did not reach back in
 # the queue (staged ones are dropped: staging them again makes them anew).
@@ -58,7 +59,7 @@ if grep -q '^APPLOAD=1' "$WS/lg/boot.env"; then
   rm -rf "$RD/bin/appload-tools"
   [[ -f $a/analyze-load.py ]] && cp -r --reflink=auto "$a" "$RD/bin/appload-tools" || echo "msi-round: no app load tools in $a"
 fi
-cp -p "$WS/lg/ship/payload/bench" "$RD/payload/"
+cp -p "$WS/lg/ship/payload/"* "$RD/payload/"
 cp "$WS/lg/boot.env" "$RD/boot.env"
 bash "$RD/bin/msi-boot.sh" "$RD" || echo "probe-batch: the boot ended $? (its log: $RD/boot.log)"
 # The round's GPU errors (msi-boot.sh's xid.txt), the boot's own QEMU's marked "own".
