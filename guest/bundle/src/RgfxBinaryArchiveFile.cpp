@@ -12,7 +12,12 @@ constexpr char kMagic[8] = {'R', 'G', 'F', 'X', 'B', 'A', 'R', '1'};
 // the fat files of 0xcafebabe alike, as archives of other GPUs' slices (measured on the AMD 5300M
 // and Intel 630 under macOS 26.7.1, oracle_bundle archive.*: IconRendering's binary.metallib, 18
 // slices of CPU type 0x01000013, and an archive the device wrote with its magic changed, each an
-// archive of no keys with no error; a file of no slices is "an invalid format").
+// archive of no keys with no error; a file of no slices is "an invalid format"). Metal reads a
+// slice's bytes only where the file holds the device's own slice, of its CPU type and subtype: it
+// reads that slice and the AIR slice beside it, and either one's bytes junked is "an invalid
+// format", where a file of junk slices none of which is the device's is an archive of no keys
+// (both x86 Macs, oracle_bundle archive.slices). No Metal slice is this device's, whose archives
+// are its own format, so a Metal archive's slices are never read.
 constexpr uint32_t kMetalMagic = 0xcbfebabe;
 constexpr uint32_t kFatMagic = 0xcafebabe;
 constexpr size_t kMetalSliceBytes = 20;

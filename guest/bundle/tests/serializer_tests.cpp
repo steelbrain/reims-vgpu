@@ -2082,6 +2082,17 @@ void test_archive_file()
 	CHECK(rgfxReadArchiveFile(cafe, sizeof(cafe), out) == RgfxArchiveFileKind::Invalid);
 	const uint8_t other[] = {0xca, 0xfe, 0xba, 0xbf, 0, 0, 0, 1};
 	CHECK(rgfxReadArchiveFile(other, sizeof(other), out) == RgfxArchiveFileKind::Invalid);
+	// An AIR slice of junk beside another GPU's slice: an archive of no keys, as both x86 Macs
+	// read one, for no slice is this device's (oracle_bundle archive.slices: a junk AIR slice is
+	// "an invalid format" only beside the device's own slice).
+	uint8_t pair[8 + 2 * 20 + 8] = {0xcb, 0xfe, 0xba, 0xbe, 0, 0, 0, 2};
+	const uint8_t records[2][20] = {
+	    {1, 0, 0, 0x17, 0, 0, 0, 0xc, 0, 0, 0, 48, 0, 0, 0, 4, 0, 0, 0, 4},
+	    {1, 0, 0, 0x13, 0, 0, 1, 0x42, 0, 0, 0, 52, 0, 0, 0, 4, 0, 0, 0, 4}};
+	std::memcpy(pair + 8, records, sizeof(records));
+	std::memset(pair + 48, 0x5a, 8);
+	CHECK(rgfxReadArchiveFile(pair, sizeof(pair), out) == RgfxArchiveFileKind::Metal);
+	CHECK(out.empty());
 	// A whole .metallib: an archive of none of this device's slices, as on both x86 Macs; cut
 	// short, or of another magic, no archive.
 	uint8_t metallib[0x20] = {'M', 'T', 'L', 'B', 1, 0x80, 2, 0, 9, 0, 0, 0x81};
