@@ -174,10 +174,11 @@ $(patsubst src/%.mm,$(BUILD)/obj/$(ARCH)/shell/%.o,$(wildcard src/RgfxMetalDevic
 # --- the serialiser check (x86_64, Rosetta) ----------------------------------
 
 $(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp tests/slab_tests.cpp \
-	tests/library_stream_tests.cpp $(HEADERS) $(TESTHEADERS) Makefile
+	tests/library_stream_tests.cpp tests/function_constants_tests.cpp $(HEADERS) $(TESTHEADERS) \
+	Makefile
 	@mkdir -p $(@D)
 	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(CORE_OBJ_ARCH) tests/serializer_tests.cpp \
-		tests/slab_tests.cpp tests/library_stream_tests.cpp -o $@
+		tests/slab_tests.cpp tests/library_stream_tests.cpp tests/function_constants_tests.cpp -o $@
 
 # --- the Metal-shell wrapper/routing check (native arch) ---------------------
 # The NSObject wrappers + serialiser core + the routing test; no device shell.

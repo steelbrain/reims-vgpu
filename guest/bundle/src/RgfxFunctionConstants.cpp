@@ -97,16 +97,88 @@ uint32_t rgfxConstantSize(uint32_t type)
 	return f ? f->lane * lanes : 0;
 }
 
+namespace {
+
+// MTLDataType's values that are no scalar or vector of a family, and their names after
+// "MTLDataType" (Metal's MTLDataType.h, macOS 27 SDK). Metal's errors name every value of the
+// enum so (measured: oracle_names on the AMD Radeon Pro 5300M and the Intel UHD Graphics 630,
+// macOS 26.7.1).
+struct Named {
+	uint32_t type;
+	const char *name;
+};
+constexpr Named kNamed[] = {
+	{ 0, "None" },
+	{ 1, "Struct" },
+	{ 2, "Array" },
+	{ 7, "Float2x2" },
+	{ 8, "Float2x3" },
+	{ 9, "Float2x4" },
+	{ 10, "Float3x2" },
+	{ 11, "Float3x3" },
+	{ 12, "Float3x4" },
+	{ 13, "Float4x2" },
+	{ 14, "Float4x3" },
+	{ 15, "Float4x4" },
+	{ 20, "Half2x2" },
+	{ 21, "Half2x3" },
+	{ 22, "Half2x4" },
+	{ 23, "Half3x2" },
+	{ 24, "Half3x3" },
+	{ 25, "Half3x4" },
+	{ 26, "Half4x2" },
+	{ 27, "Half4x3" },
+	{ 28, "Half4x4" },
+	{ 58, "Texture" },
+	{ 59, "Sampler" },
+	{ 60, "Pointer" },
+	{ 62, "R8Unorm" },
+	{ 63, "R8Snorm" },
+	{ 64, "R16Unorm" },
+	{ 65, "R16Snorm" },
+	{ 66, "RG8Unorm" },
+	{ 67, "RG8Snorm" },
+	{ 68, "RG16Unorm" },
+	{ 69, "RG16Snorm" },
+	{ 70, "RGBA8Unorm" },
+	{ 71, "RGBA8Unorm_sRGB" },
+	{ 72, "RGBA8Snorm" },
+	{ 73, "RGBA16Unorm" },
+	{ 74, "RGBA16Snorm" },
+	{ 75, "RGB10A2Unorm" },
+	{ 76, "RG11B10Float" },
+	{ 77, "RGB9E5Float" },
+	{ 78, "RenderPipeline" },
+	{ 79, "ComputePipeline" },
+	{ 80, "IndirectCommandBuffer" },
+	{ 115, "VisibleFunctionTable" },
+	{ 116, "IntersectionFunctionTable" },
+	{ 117, "PrimitiveAccelerationStructure" },
+	{ 118, "InstanceAccelerationStructure" },
+	{ 121, "BFloat" },
+	{ 122, "BFloat2" },
+	{ 123, "BFloat3" },
+	{ 124, "BFloat4" },
+};
+
+} // namespace
+
 std::string rgfxDataTypeName(uint32_t type)
 {
 	uint32_t lanes = 0;
 	const Family *f = familyOf(type, &lanes);
-	if (f == nullptr)
-		return type == 0 ? "MTLDataTypeNone" : "MTLDataType(" + std::to_string(type) + ")";
-	std::string name = std::string("MTLDataType") + f->name;
-	if (lanes > 1)
-		name += std::to_string(lanes);
-	return name;
+	if (f != nullptr) {
+		std::string name = std::string("MTLDataType") + f->name;
+		if (lanes > 1)
+			name += std::to_string(lanes);
+		return name;
+	}
+	for (const Named &n : kNamed) {
+		if (n.type == type)
+			return std::string("MTLDataType") + n.name;
+	}
+	// A value outside the enum: ours.
+	return "MTLDataType(" + std::to_string(type) + ")";
 }
 
 bool rgfxReadConstantTable(const uint8_t *bytes, size_t length, uint64_t offset,

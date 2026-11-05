@@ -41,6 +41,7 @@
 
 void rgfxSlabTests();
 void rgfxLibraryStreamTests();
+void rgfxFunctionConstantsTests();
 
 namespace {
 
@@ -2471,6 +2472,7 @@ int main()
 	test_argument_layout_parse();
 	rgfxSlabTests();
 	rgfxLibraryStreamTests();
+	rgfxFunctionConstantsTests();
 	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
 	return 0;
 }
