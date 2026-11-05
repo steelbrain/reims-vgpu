@@ -228,9 +228,11 @@ fi
 # own commit (its parent the harness's HEAD), which carries what the job needs.
 ROUND=$(date +%Y%m%d-%H%M%S)
 RD=$MSI_GATE/probes/$ROUND
-# The tip's bench (the boot's check of our Metal device), else the newest gate run's.
+# The tip's bench (the boot's check of our Metal device), else the image tip's (the guest it runs
+# on), else the newest gate run's.
 # (|| true: a tip no gate built, such as a lane's probe-only host, has no run; set -e must not end us.)
 run=$(ls -1dt "$GH/runs/${PUB:0:12}-"* 2> /dev/null | head -1 || true)
+[[ -x $run/artifacts/payload/bench ]] || run=$(ls -1dt "$GH/runs/$IMAGE_SHORT"* 2> /dev/null | head -1 || true)
 [[ -x $run/artifacts/payload/bench ]] || run=$(ls -1dt "$GH/runs/"*/ 2> /dev/null | while read -r d; do
   [[ -x ${d}artifacts/payload/bench ]] && { echo "${d%/}"; break; }; done || true)
 [[ -x $run/artifacts/payload/bench ]] || { echo "probe-batch: no gate run with its bench" >&2; exit 1; }
