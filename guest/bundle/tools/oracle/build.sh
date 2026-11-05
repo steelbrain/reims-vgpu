@@ -20,4 +20,15 @@ xcrun -sdk macosx metallib "$air" -o "$out/oracle.metallib"
 xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_icb.metal" -o "$air"
 xcrun -sdk macosx metallib "$air" -o "$out/oracle_icb.metallib"
 rm -f "$air"
+# oracle_bundle and its libraries; a library this toolchain does not build is left out, and its
+# case says so.
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_bundle.m" -o "$out/oracle_bundle"
+for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt; do
+	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
+		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"
+done
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -dynamiclib \
+	-install_name @executable_path/liboracle_bundle_dyn.metallib "$here/oracle_bundle_dyn.metal" \
+	-o "$out/oracle_bundle_dyn.metallib" || echo "oracle_bundle: oracle_bundle_dyn.metallib not built"
 echo "built into $out"
