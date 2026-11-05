@@ -1836,8 +1836,12 @@ shares the CPU's memory:
 - In the guest, `replaceRegion:` and `getBytes:` are memcpys of the block, and
   `replaceRegion:` posts its region; neither waits for the host, but for the
   `getBytes:` of a two-copy texture on shared memory, above. A format the
-  layout has no block for (depth, stencil, PVRTC, three-component) keeps no CPU
-  copy.
+  layout has no block for (PVRTC) keeps no CPU copy: the texture is the
+  platform's alone, one copy on any GPU, and the CPU reaches it through the
+  staging blit a Shared texture's calls wait for, which sees the GPU's writes
+  with no synchronize, as the Intel 630's and the M3's Managed textures do
+  (dgpu-oracle.md Q2). A depth or stencil texture in Managed storage ends the
+  process first, as on both x86 oracles.
 - Until the device's identity answers carry `hasUnifiedMemory`, the host takes
   the two copies on every GPU, which hold Metal's contract on any of them.
 
