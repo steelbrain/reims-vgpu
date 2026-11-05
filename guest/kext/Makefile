@@ -14,6 +14,11 @@
 #               Without KEXTINJECT and BOOT_KC the link is skipped, saying so.
 #   make test   build and run the native tests of the kext's own rules
 #               (tests/*.cpp, against the headers they test)
+#   make DTRACE=1 BUILD=build/dtrace
+#               the kext for an image that traces it, its Info.plist setting
+#               OSBundleForceDTraceInit (docs/qemu.md, "fbt probes in the
+#               guest's kexts"); in a build directory of its own, as the
+#               Info.plist is written only as the kext is linked
 #   make clean  remove build/
 #
 # Everything lands in build/, never committed.
@@ -32,6 +37,7 @@ KEXTINJECT ?=
 BOOT_KC    ?=
 
 TRACE   ?= 0
+DTRACE  ?= 0
 
 ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=26.0
 
@@ -81,6 +87,7 @@ $(BINARY): $(OBJECTS) src/Info.plist
 	@mkdir -p $(@D)
 	xcrun clang++ $(ARCH) -nostdlib -Xlinker -kext $(OBJECTS) -lcc_kext -o $@
 	sed 's/@VERSION@/$(VERSION)/g' src/Info.plist > $(KEXT)/Contents/Info.plist
+	$(if $(filter 1,$(DTRACE)),plutil -insert OSBundleForceDTraceInit -bool YES $(KEXT)/Contents/Info.plist)
 	plutil -lint $(KEXT)/Contents/Info.plist > /dev/null
 
 check: $(BINARY) $(BUILD)/obj/layout.o

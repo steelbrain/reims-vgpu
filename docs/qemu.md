@@ -438,8 +438,20 @@ probes' symbols come from (above).
 
 So an image for tracing our kext sets three things: a `csr-active-config`
 that allows dtrace, `keepsyms=1`, and `OSBundleForceDTraceInit` (true) in the
-`Info.plist` of the ReimsGraphics.kext that OpenCore injects. Whether that
-gives our global functions their probes is not yet measured.
+`Info.plist` of the ReimsGraphics.kext that OpenCore injects. `make -C
+guest/kext DTRACE=1 BUILD=build/dtrace` builds that kext; a plain `make`
+leaves the key out. Without `keepsyms=1` the kernel ignores the key for a
+Boot-collection kext, logging `Ignoring OSBundleForceDTraceInit for Boot KC
+Kext com.steelbrain.ReimsGraphics` (**read** from xnu-12377.1.9 and
+xnu-12377.121.6, macOS 26's sources; macOS 11's, xnu-7195, panics there
+instead). With SIP on, dtrace makes no fbt probe whatever the kext sets
+(`dtrace_fbt_probes_restricted`). Whether the three give our global
+functions their probes is not yet measured. To check, as root in the guest
+on such an image:
+- `dtrace -l -P fbt -m com.steelbrain.ReimsGraphics | wc -l` prints more
+  than 0: about 314 entry probes, and their return probes;
+- `log show --last boot --predicate 'eventMessage CONTAINS
+  "OSBundleForceDTraceInit"'` prints no line.
 
 ## apple-gfx on reims-vgpu
 
