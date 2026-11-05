@@ -2043,7 +2043,7 @@ void test_argument_encoders_of_bindings()
 	CHECK(path != nullptr && reflectedPath != nullptr);
 	if (path == nullptr || reflectedPath == nullptr)
 		return;
-	TestRing control(0x80000); // a library's bytes fit, 259 KiB built for macOS 26
+	TestRing control(0x100000); // posts up to half its size: the 274 KiB library for macOS 26
 	control.setConsumerIdle(1);
 	RgfxRingWriter writer(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
 	                      TestRing::doorbell, nullptr);
