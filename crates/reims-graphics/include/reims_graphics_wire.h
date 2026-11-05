@@ -893,8 +893,8 @@
 // [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 // [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
 // [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`],
-// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
-// reserved.
+// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`], [`RGFX_FEATURE_SMALL_ID_CHUNKS`] and
+// [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -1042,6 +1042,13 @@
 // its own pages among them, on every host, and not in the region. Every host offers it.
 #define RGFX_FEATURE_MANAGED_BUFFER_SLABS (1 << 22)
 
+// `FEATURES_LO` bit 23, `SMALL_ID_CHUNKS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_RESOURCE_ID_SMALL_CHUNK`], a grant
+// of a chunk of [`RGFX_RESOURCE_ID_SMALL_CHUNK`] texture resource ids, so the kext hands each
+// process its ids 16 at a time from the same pool, and a guest of many processes holds as many
+// chunks as it has contexts. Every host offers it.
+#define RGFX_FEATURE_SMALL_ID_CHUNKS (1 << 23)
+
 // `FEATURES_LO` bit 24, `DISPLAY_COLOR`, which the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_DISPLAY_COLOR`], the colour stages a
 // display pipe transaction sets (its gamma tables and its colour matrix), and a
@@ -1175,6 +1182,14 @@
 // How many chunks of texture resource ids the pool holds: every whole chunk below
 // [`RGFX_RESOURCE_ID_LIMIT`].
 #define RGFX_RESOURCE_ID_CHUNKS 255
+
+// The texture resource ids in one small chunk ([`RGFX_FEATURE_SMALL_ID_CHUNKS`]): small chunk
+// `k` holds ids `1 + k * 16` to `16 + k * 16`, so chunk `k` of [`RGFX_RESOURCE_ID_CHUNK`] ids is
+// small chunks `4k` to `4k + 3`.
+#define RGFX_RESOURCE_ID_SMALL_CHUNK 16
+
+// How many small chunks the pool holds: the same ids as its [`RGFX_RESOURCE_ID_CHUNKS`] chunks.
+#define RGFX_RESOURCE_ID_SMALL_CHUNKS 1020
 
 // The control submission ring's id, which the guest writes to `DOORBELL`.
 #define RGFX_CONTROL_RING_ID 0
@@ -1487,6 +1502,12 @@
 // comes before every create naming one of its ids. Not answered. A texture create whose id lies
 // in no chunk of its context is refused.
 #define RGFX_CMD_RESOURCE_ID_CHUNK 753
+
+// `RESOURCE_ID_SMALL_CHUNK` ([`RgfxResourceIdChunk`]), on ring 0 from the accelerator kext,
+// where the guest took [`RGFX_FEATURE_SMALL_ID_CHUNKS`]: as `RESOURCE_ID_CHUNK`, of small chunk
+// `chunk` ([`RGFX_RESOURCE_ID_SMALL_CHUNK`] ids, below [`RGFX_RESOURCE_ID_SMALL_CHUNKS`]). A host
+// without the feature refuses the message as one it does not know.
+#define RGFX_CMD_RESOURCE_ID_SMALL_CHUNK 760
 
 // `BLOCK_RELEASE` ([`RgfxBlockRelease`]), on ring 0 from the accelerator kext: context `context`
 // freed its region block of `size` bytes at `offset`, which the kext gives out again only once
@@ -5503,7 +5524,8 @@ typedef struct {
   // The context.
   uint32_t context;
   // The chunk, below [`RGFX_RESOURCE_ID_CHUNKS`]: ids `1 + chunk * RGFX_RESOURCE_ID_CHUNK` and
-  // up.
+  // up; of a `RESOURCE_ID_SMALL_CHUNK`, below [`RGFX_RESOURCE_ID_SMALL_CHUNKS`]: ids
+  // `1 + chunk * RGFX_RESOURCE_ID_SMALL_CHUNK` and up.
   uint32_t chunk;
 } RgfxResourceIdChunk;
 

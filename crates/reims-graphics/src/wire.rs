@@ -61,8 +61,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 /// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
 /// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`],
-/// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
-/// reserved.
+/// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`], [`RGFX_FEATURE_SMALL_ID_CHUNKS`] and
+/// [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -188,6 +188,12 @@ pub const RGFX_FEATURE_MANAGED_TEXTURE_SLABS: u32 = 1 << 21;
 /// texture's. So the guest lays its `Managed` buffers' CPU copies in its Shared buffers' slabs,
 /// its own pages among them, on every host, and not in the region. Every host offers it.
 pub const RGFX_FEATURE_MANAGED_BUFFER_SLABS: u32 = 1 << 22;
+/// `FEATURES_LO` bit 23, `SMALL_ID_CHUNKS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_RESOURCE_ID_SMALL_CHUNK`], a grant
+/// of a chunk of [`RGFX_RESOURCE_ID_SMALL_CHUNK`] texture resource ids, so the kext hands each
+/// process its ids 16 at a time from the same pool, and a guest of many processes holds as many
+/// chunks as it has contexts. Every host offers it.
+pub const RGFX_FEATURE_SMALL_ID_CHUNKS: u32 = 1 << 23;
 /// `FEATURES_LO` bit 24, `DISPLAY_COLOR`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_DISPLAY_COLOR`], the colour stages a
 /// display pipe transaction sets (its gamma tables and its colour matrix), and a
@@ -293,6 +299,12 @@ pub const RGFX_RESOURCE_ID_CHUNK: u64 = 64;
 /// How many chunks of texture resource ids the pool holds: every whole chunk below
 /// [`RGFX_RESOURCE_ID_LIMIT`].
 pub const RGFX_RESOURCE_ID_CHUNKS: u32 = 255;
+/// The texture resource ids in one small chunk ([`RGFX_FEATURE_SMALL_ID_CHUNKS`]): small chunk
+/// `k` holds ids `1 + k * 16` to `16 + k * 16`, so chunk `k` of [`RGFX_RESOURCE_ID_CHUNK`] ids is
+/// small chunks `4k` to `4k + 3`.
+pub const RGFX_RESOURCE_ID_SMALL_CHUNK: u64 = 16;
+/// How many small chunks the pool holds: the same ids as its [`RGFX_RESOURCE_ID_CHUNKS`] chunks.
+pub const RGFX_RESOURCE_ID_SMALL_CHUNKS: u32 = 1020;
 /// The control submission ring's id, which the guest writes to `DOORBELL`.
 pub const RGFX_CONTROL_RING_ID: u32 = 0;
 /// The control completion ring's MSI-X vector.
@@ -601,6 +613,11 @@ pub const RGFX_CMD_CONTEXT_CLOSE: u32 = 0x2f0;
 /// comes before every create naming one of its ids. Not answered. A texture create whose id lies
 /// in no chunk of its context is refused.
 pub const RGFX_CMD_RESOURCE_ID_CHUNK: u32 = 0x2f1;
+/// `RESOURCE_ID_SMALL_CHUNK` ([`RgfxResourceIdChunk`]), on ring 0 from the accelerator kext,
+/// where the guest took [`RGFX_FEATURE_SMALL_ID_CHUNKS`]: as `RESOURCE_ID_CHUNK`, of small chunk
+/// `chunk` ([`RGFX_RESOURCE_ID_SMALL_CHUNK`] ids, below [`RGFX_RESOURCE_ID_SMALL_CHUNKS`]). A host
+/// without the feature refuses the message as one it does not know.
+pub const RGFX_CMD_RESOURCE_ID_SMALL_CHUNK: u32 = 0x2f8;
 /// `BLOCK_RELEASE` ([`RgfxBlockRelease`]), on ring 0 from the accelerator kext: context `context`
 /// freed its region block of `size` bytes at `offset`, which the kext gives out again only once
 /// this is answered [`RGFX_EVT_COMPLETE`] with [`RGFX_STATUS_OK`]. The host answers
@@ -1120,6 +1137,12 @@ const _: () = {
     );
     // The bundle keeps a chunk's free ids in one 64-bit mask.
     assert!(RGFX_RESOURCE_ID_CHUNK == 64);
+    // The small chunks are the same pool, four to a chunk.
+    assert!(
+        RGFX_RESOURCE_ID_SMALL_CHUNKS as u64 * RGFX_RESOURCE_ID_SMALL_CHUNK
+            == RGFX_RESOURCE_ID_CHUNKS as u64 * RGFX_RESOURCE_ID_CHUNK
+    );
+    assert!(RGFX_RESOURCE_ID_CHUNK.is_multiple_of(RGFX_RESOURCE_ID_SMALL_CHUNK));
     // The units fill the guest's GPU addresses, which end at the Metal address space's end,
     // 2^47, and start at 2^46 or above, which the host's own ranges never reach
     // (RGFX_CONTEXT_VA_BASE).
@@ -1324,7 +1347,8 @@ pub struct RgfxResourceIdChunk {
     /// The context.
     pub context: u32,
     /// The chunk, below [`RGFX_RESOURCE_ID_CHUNKS`]: ids `1 + chunk * RGFX_RESOURCE_ID_CHUNK` and
-    /// up.
+    /// up; of a `RESOURCE_ID_SMALL_CHUNK`, below [`RGFX_RESOURCE_ID_SMALL_CHUNKS`]: ids
+    /// `1 + chunk * RGFX_RESOURCE_ID_SMALL_CHUNK` and up.
     pub chunk: u32,
 }
 

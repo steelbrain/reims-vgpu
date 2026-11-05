@@ -94,30 +94,31 @@ use reims_graphics::wire::{
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
     RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
-    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
-    RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
-    RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
-    RGFX_LINKED_BINARY_FUNCTIONS, RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP,
-    RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER,
-    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
-    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
-    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET,
-    RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
-    RGFX_SURFACE_PAGES_DEFERRED, RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3,
-    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
-    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
-    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
-    RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
-    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
+    RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW,
+    RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
+    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
+    RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP, RGFX_LINKED_PRIVATE_FUNCTIONS,
+    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
+    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
+    RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT,
+    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
+    RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS,
+    RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
+    RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
+    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
+    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
+    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
+    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
+    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
+    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
+    RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
     RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
     RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
     RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
@@ -487,8 +488,8 @@ pub enum DecodeError {
     /// The message named an object the host does not hold, or of the wrong kind.
     BadReference,
     /// A texture create's resource id lies in no chunk its context holds
-    /// (`RESOURCE_ID_CHUNK`): 0, at or past [`RGFX_RESOURCE_ID_LIMIT`], or another
-    /// context's. The platform is not called, so no id the host's Metal ends the
+    /// (`RESOURCE_ID_CHUNK`, `RESOURCE_ID_SMALL_CHUNK`): 0, at or past
+    /// [`RGFX_RESOURCE_ID_LIMIT`], or another context's. The platform is not called, so no id the host's Metal ends the
     /// process for reaches it.
     BadResourceId,
     /// The command buffer's context was closed before the buffer came to the decoder (taken off
@@ -557,10 +558,11 @@ pub(crate) struct Shared<P: Platform> {
     video: OnceLock<Arc<dyn GraphicsVideo<P>>>,
     /// The libraries' chunks, makes and cache (`library`).
     libraries: Mutex<Libraries<P>>,
-    /// The context holding each chunk of the texture resource ids, by chunk, as
-    /// `RESOURCE_ID_CHUNK` gave it, until its `CONTEXT_CLOSE`: every process's
-    /// textures share the one device's ids, so a texture create's id must lie in
-    /// a chunk of its own context ([`GraphicsDecoder::holds_resource_id`]).
+    /// The context holding each small chunk of the texture resource ids
+    /// ([`RGFX_RESOURCE_ID_SMALL_CHUNK`] ids), by small chunk, as `RESOURCE_ID_SMALL_CHUNK` gave
+    /// it, or `RESOURCE_ID_CHUNK` the four of its chunk, until its `CONTEXT_CLOSE`: every
+    /// process's textures share the one device's ids, so a texture create's id must lie in a
+    /// chunk of its own context ([`GraphicsDecoder::holds_resource_id`]).
     id_chunks: Mutex<Box<[Option<u32>]>>,
     /// The watch over command buffers that wait on events, which logs the ones that wait long
     /// (diagnostics only: [`waits`]).
@@ -806,7 +808,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             video: OnceLock::new(),
             listener: OnceLock::new(),
             libraries: Mutex::new(Libraries::new()),
-            id_chunks: Mutex::new(vec![None; RGFX_RESOURCE_ID_CHUNKS as usize].into_boxed_slice()),
+            id_chunks: Mutex::new(
+                vec![None; RGFX_RESOURCE_ID_SMALL_CHUNKS as usize].into_boxed_slice(),
+            ),
             closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
@@ -2111,7 +2115,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared
             .id_chunks
             .lock()
-            .get(((id - 1) / RGFX_RESOURCE_ID_CHUNK) as usize)
+            .get(((id - 1) / RGFX_RESOURCE_ID_SMALL_CHUNK) as usize)
             .copied()
             .flatten()
             .is_some_and(|holder| u64::from(holder) == context)
@@ -2121,7 +2125,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `RESOURCE_ID_CHUNK` does.
     #[cfg(test)]
     pub(crate) fn hold_resource_ids(&mut self, context: u32, chunk: u32) {
-        self.shared.id_chunks.lock()[chunk as usize] = Some(context);
+        let small = small_chunks(RGFX_CMD_RESOURCE_ID_CHUNK, chunk).unwrap();
+        self.shared.id_chunks.lock()[small].fill(Some(context));
     }
 
     /// A `SAMPLER_CREATE`'s answer ([`sampler_answer`]), the sampler stored under the message's id
@@ -2281,17 +2286,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.remove(m.obj_id);
                 Ok(Ok(()))
             }
-            RGFX_CMD_RESOURCE_ID_CHUNK => {
+            RGFX_CMD_RESOURCE_ID_CHUNK | RGFX_CMD_RESOURCE_ID_SMALL_CHUNK => {
                 let Some(m) = read::<RgfxResourceIdChunk>(message) else {
                     return Ok(Err(DecodeError::Malformed));
                 };
-                // The kext's grant: the context holds the chunk until its close. A
-                // chunk past the pool is not one.
-                let mut chunks = self.shared.id_chunks.lock();
-                let Some(holder) = chunks.get_mut(m.chunk as usize) else {
+                // The kext's grant: the context holds the chunk's small chunks until its
+                // close. A chunk past the pool is not one.
+                let Some(small) = small_chunks(header.r#type, m.chunk) else {
                     return Ok(Err(DecodeError::BadResourceId));
                 };
-                *holder = Some(m.context);
+                self.shared.id_chunks.lock()[small].fill(Some(m.context));
                 Ok(Ok(()))
             }
             RGFX_CMD_EVENT_CREATE => {
@@ -3847,6 +3851,21 @@ pub(crate) fn compile_pipeline<P: Platform>(
     }
 }
 
+/// The small chunks of the texture resource ids, by index, that a grant of type `type`
+/// (`RESOURCE_ID_CHUNK` or `RESOURCE_ID_SMALL_CHUNK`) of chunk `chunk` gives its context: chunk
+/// `k` of [`RGFX_RESOURCE_ID_CHUNK`] ids is small chunks `4k` to `4k + 3`, small chunk `k` is
+/// itself; `None` for a chunk past the pool.
+fn small_chunks(r#type: u32, chunk: u32) -> Option<std::ops::Range<usize>> {
+    let per = if r#type == RGFX_CMD_RESOURCE_ID_SMALL_CHUNK {
+        1
+    } else {
+        (RGFX_RESOURCE_ID_CHUNK / RGFX_RESOURCE_ID_SMALL_CHUNK) as usize
+    };
+    let first = (chunk as usize).checked_mul(per)?;
+    let end = first.checked_add(per)?;
+    (end <= RGFX_RESOURCE_ID_SMALL_CHUNKS as usize).then_some(first..end)
+}
+
 /// The reply a pipeline create refused at its op owes: a refusal, keyed to the create by its
 /// seqno, for the object its header names (`None` for a message too short to name one). The
 /// create's process waits for it, so a create the host will not carry out is still answered.
@@ -4431,8 +4450,8 @@ mod tests {
     use std::sync::Arc;
 
     use reims_graphics::wire::{
-        RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RgfxLibraryCreate,
-        RgfxLibraryFromRegion,
+        RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RGFX_RESOURCE_ID_CHUNKS,
+        RgfxLibraryCreate, RgfxLibraryFromRegion,
     };
     use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::IntoBytes;
@@ -5889,6 +5908,125 @@ mod tests {
         assert_eq!(dec.decode(&device, grant(3, 0).as_bytes()).unwrap(), Ok(()));
         assert_eq!(made(&mut dec, obj(3, 1), 5), Ok(()));
         assert_eq!(made(&mut dec, obj(2, 7), 16319), Ok(()));
+    }
+
+    /// A `RESOURCE_ID_SMALL_CHUNK` gives its context the 16 ids of its small chunk, from the
+    /// same pool as `RESOURCE_ID_CHUNK`'s 64: chunk `k` is small chunks `4k` to `4k + 3`, and a
+    /// grant of either kind gives the ids it names to its context, and no others. A small chunk
+    /// past the pool is none, and a context's small chunks go at its close as its chunks do. A
+    /// type past it is unknown, as `RESOURCE_ID_SMALL_CHUNK` is to a host from before
+    /// [`RGFX_FEATURE_SMALL_ID_CHUNKS`] (read from 8ecfc5abb's `decode`: no arm takes it), which
+    /// the kext posts it to only where the host offers the feature
+    /// (`guest/kext/tests/id_chunks_test.cpp`).
+    #[test]
+    fn a_small_chunk_holds_sixteen_ids_of_the_one_pool() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(Region::new(0x10000).unwrap()),
+        );
+        let obj = |context: u64, n: u64| (context << RGFX_CONTEXT_OBJ_ID_SHIFT) | n;
+        let grant = |r#type: u32, context: u32, chunk: u32| RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context,
+            chunk,
+        };
+        let small =
+            |context: u32, chunk: u32| grant(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, context, chunk);
+        let texture = |obj_id: u64, resource_id: u64| RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            resource_id,
+            desc: RgfxTextureDescriptor {
+                pixel_format: 80,
+                texture_type: 2,
+                width: 16,
+                height: 16,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 5,
+                ..RgfxTextureDescriptor::default()
+            },
+            ..RgfxTextureCreate::default()
+        };
+        let mut n = 0;
+        let mut made = |dec: &mut GraphicsDecoder<FakePlatform>, context: u64, resource_id: u64| {
+            n += 1;
+            dec.decode(&device, texture(obj(context, n), resource_id).as_bytes())
+                .unwrap()
+        };
+
+        // Context 1 holds small chunk 5, ids 81 to 96, and none either side.
+        assert_eq!(dec.decode(&device, small(1, 5).as_bytes()).unwrap(), Ok(()));
+        assert_eq!(made(&mut dec, 1, 81), Ok(()));
+        assert_eq!(made(&mut dec, 1, 96), Ok(()));
+        for id in [80, 97] {
+            assert_eq!(
+                made(&mut dec, 1, id),
+                Err(DecodeError::BadResourceId),
+                "id {id}"
+            );
+        }
+        // Context 2 holds chunk 2, ids 129 to 192: small chunks 8 to 11.
+        let chunk = grant(RGFX_CMD_RESOURCE_ID_CHUNK, 2, 2);
+        assert_eq!(dec.decode(&device, chunk.as_bytes()).unwrap(), Ok(()));
+        assert_eq!(made(&mut dec, 2, 129), Ok(()));
+        assert_eq!(made(&mut dec, 2, 192), Ok(()));
+        assert_eq!(made(&mut dec, 1, 130), Err(DecodeError::BadResourceId));
+        assert_eq!(made(&mut dec, 2, 96), Err(DecodeError::BadResourceId));
+        // Context 3 holds the last small chunk, ids 16305 to 16320; one past it is none.
+        let last = RGFX_RESOURCE_ID_SMALL_CHUNKS - 1;
+        assert_eq!(
+            dec.decode(&device, small(3, last).as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert_eq!(made(&mut dec, 3, 16305), Ok(()));
+        assert_eq!(made(&mut dec, 3, 16320), Ok(()));
+        assert_eq!(made(&mut dec, 3, 16321), Err(DecodeError::BadResourceId));
+        assert_eq!(
+            dec.decode(&device, small(3, last + 1).as_bytes()).unwrap(),
+            Err(DecodeError::BadResourceId)
+        );
+        assert_eq!(
+            dec.decode(&device, small(3, u32::MAX).as_bytes()).unwrap(),
+            Err(DecodeError::BadResourceId)
+        );
+        // A small chunk of chunk 2's goes to context 4, as the kext gives it once context 2's
+        // close is answered; context 2 keeps the other three.
+        assert_eq!(dec.decode(&device, small(4, 9).as_bytes()).unwrap(), Ok(()));
+        assert_eq!(made(&mut dec, 4, 145), Ok(()));
+        assert_eq!(made(&mut dec, 2, 160), Err(DecodeError::BadResourceId));
+        assert_eq!(made(&mut dec, 2, 161), Ok(()));
+        // Context 1's small chunk goes at its close.
+        dec.drop_context(&device, 1);
+        assert_eq!(made(&mut dec, 5, 82), Err(DecodeError::BadResourceId));
+        assert_eq!(dec.decode(&device, small(5, 5).as_bytes()).unwrap(), Ok(()));
+        assert_eq!(made(&mut dec, 5, 82), Ok(()));
+
+        // A grant one byte short, and a type past it, which the decoder does not know.
+        let whole = small(6, 0);
+        let short = &whole.as_bytes()[..size_of::<RgfxResourceIdChunk>() - 1];
+        assert_eq!(
+            dec.decode(&device, short).unwrap(),
+            Err(DecodeError::Malformed)
+        );
+        let unknown = grant(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK + 1, 6, 0);
+        assert_eq!(
+            dec.decode(&device, unknown.as_bytes()).unwrap(),
+            Err(DecodeError::UnknownCommand)
+        );
+        assert_eq!(made(&mut dec, 6, 1), Err(DecodeError::BadResourceId));
     }
 
     /// The objects table's order, which a context's objects drop in at its close, is a function

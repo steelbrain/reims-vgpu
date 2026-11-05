@@ -7,8 +7,9 @@
 //!   that holds one;
 //! - a shared block's release comes after every message published before it of each other context
 //!   that shared the block since its last release;
-//! - a resource id chunk another context held comes after that context's close published before
-//!   it, and a new context's first message on its lane after every close published before it;
+//! - a resource id chunk or small chunk of ids another context held comes after that context's
+//!   close published before it, and a new context's first message on its lane after every close
+//!   published before it;
 //! - a block's `SURFACE_PAGES` and `SURFACE_DOWNLOAD`s are carried out in their ring order; a
 //!   context's message on its lane after the context's `SURFACE_PAGES` published before it; a
 //!   buffer or heap over a block's pages, a buffer over a surface's pages and a block's release
@@ -285,11 +286,23 @@ fn case(rng: &mut Rng) -> Vec<Sent> {
                     true,
                 )
             }
-            66..74 => {
+            66..70 => {
                 let chunk = 1 + rng.below(3);
                 message(
                     id_chunk(context, chunk as u32),
                     RGFX_CMD_RESOURCE_ID_CHUNK,
+                    context,
+                    chunk,
+                    true,
+                    false,
+                )
+            }
+            // Small chunks 4 to 15: those of chunks 1 to 3.
+            70..74 => {
+                let chunk = 4 + rng.below(12);
+                message(
+                    id_grant(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, context, chunk as u32),
+                    RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
                     context,
                     chunk,
                     true,
@@ -405,6 +418,7 @@ fn order(sent: &[Sent]) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
     let mut first_of: HashMap<u32, usize> = HashMap::new();
     let mut holders: HashMap<u64, HashSet<u32>> = HashMap::new();
+    // By small chunk: chunk `k` of 64 ids is small chunks `4k` to `4k + 3`.
     let mut chunk_holder: HashMap<u64, u32> = HashMap::new();
     // The live textures over each surface's plane 0, and the messages that changed them: a make,
     // a destroy of one, and the close of a context that held one.
@@ -478,13 +492,20 @@ fn order(sent: &[Sent]) -> Vec<(usize, usize)> {
                     }
                 }
             }
-            RGFX_CMD_RESOURCE_ID_CHUNK => {
-                let last = chunk_holder.insert(later.what, later.context);
-                if let Some(holder) = last.filter(|&h| h != later.context) {
-                    for (j, earlier) in sent[..i].iter().enumerate() {
-                        if earlier.r#type == RGFX_CMD_CONTEXT_CLOSE && earlier.context == holder {
-                            pairs.push((j, i));
-                        }
+            RGFX_CMD_RESOURCE_ID_CHUNK | RGFX_CMD_RESOURCE_ID_SMALL_CHUNK => {
+                let small = if later.r#type == RGFX_CMD_RESOURCE_ID_CHUNK {
+                    later.what * 4..later.what * 4 + 4
+                } else {
+                    later.what..later.what + 1
+                };
+                let mut held = HashSet::new();
+                for unit in small {
+                    let last = chunk_holder.insert(unit, later.context);
+                    held.extend(last.filter(|&h| h != later.context));
+                }
+                for (j, earlier) in sent[..i].iter().enumerate() {
+                    if earlier.r#type == RGFX_CMD_CONTEXT_CLOSE && held.contains(&earlier.context) {
+                        pairs.push((j, i));
                     }
                 }
             }

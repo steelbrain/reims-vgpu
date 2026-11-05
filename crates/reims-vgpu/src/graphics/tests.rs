@@ -429,9 +429,15 @@ fn an_object_create_reaches_the_decoder() {
 
 /// A `RESOURCE_ID_CHUNK` giving `context` chunk `chunk` of the texture resource ids.
 fn resource_id_chunk(context: u32, chunk: u32) -> Vec<u8> {
+    id_grant(RGFX_CMD_RESOURCE_ID_CHUNK, context, chunk)
+}
+
+/// A grant of type `type`, `RESOURCE_ID_CHUNK` or `RESOURCE_ID_SMALL_CHUNK`, giving `context`
+/// chunk `chunk` of the texture resource ids.
+fn id_grant(r#type: u32, context: u32, chunk: u32) -> Vec<u8> {
     RgfxResourceIdChunk {
         header: RgfxMsgHeader {
-            r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+            r#type,
             size: 0,
             seqno: 0,
         },
@@ -510,6 +516,49 @@ fn a_texture_create_needs_its_context_s_chunk_of_resource_ids() {
     guest.send(&device, resource_id_chunk(4, 7));
     guest.send(&device, texture_create(obj(4, 1), first));
     assert_eq!(carried_out(&mut guest, 4), 1, "the chunk given again");
+}
+
+/// The kext's `RESOURCE_ID_SMALL_CHUNK` on ring 0 lets its context make textures at its small
+/// chunk's 16 ids, as a `RESOURCE_ID_CHUNK` does at its 64, and at no other; at the context's
+/// close the small chunk goes with it, and the next context's grant of it, posted after the
+/// close, lets that context make textures there.
+#[test]
+fn a_small_chunk_of_resource_ids_reaches_the_decoder_on_ring_0() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let carried_out = |guest: &mut Guest, context: u32| {
+        carried_out_of(&device, guest, context);
+        device.decoder_object_count()
+    };
+    // Small chunk 29: ids 465 to 480, inside chunk 7 of 64.
+    let first = 1 + 29 * RGFX_RESOURCE_ID_SMALL_CHUNK;
+    let last = first + RGFX_RESOURCE_ID_SMALL_CHUNK - 1;
+    guest.send(&device, id_grant(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, 3, 29));
+    guest.send(&device, texture_create(obj(3, 1), first));
+    guest.send(&device, texture_create(obj(3, 2), last));
+    guest.send(&device, texture_create(obj(3, 3), first - 1));
+    guest.send(&device, texture_create(obj(3, 4), last + 1));
+    assert_eq!(
+        carried_out(&mut guest, 3),
+        2,
+        "the textures in the small chunk"
+    );
+    assert_eq!(
+        answered(&device, &mut guest, context_close(3)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    guest.send(&device, texture_create(obj(4, 1), first));
+    assert_eq!(
+        carried_out(&mut guest, 4),
+        0,
+        "the closed context's small chunk"
+    );
+    guest.send(&device, id_grant(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, 4, 29));
+    guest.send(&device, texture_create(obj(4, 1), first));
+    assert_eq!(carried_out(&mut guest, 4), 1, "the small chunk given again");
 }
 
 /// A command buffer on a queue is decoded and committed once ring 0 has carried out what was
@@ -6335,6 +6384,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_COMMIT_ORDER
             | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
             | RGFX_FEATURE_MANAGED_BUFFER_SLABS
+            | RGFX_FEATURE_SMALL_ID_CHUNKS
             | RGFX_FEATURE_DISPLAY_COLOR
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
@@ -6354,6 +6404,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_COMMIT_ORDER
             | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
             | RGFX_FEATURE_MANAGED_BUFFER_SLABS
+            | RGFX_FEATURE_SMALL_ID_CHUNKS
             | RGFX_FEATURE_DISPLAY_COLOR
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);

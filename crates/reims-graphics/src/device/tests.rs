@@ -3349,9 +3349,15 @@ fn present(iosurface_id: u32) -> Vec<u8> {
 
 /// A `RESOURCE_ID_CHUNK` of chunk `chunk` for `context`.
 fn id_chunk(context: u32, chunk: u32) -> Vec<u8> {
+    id_grant(RGFX_CMD_RESOURCE_ID_CHUNK, context, chunk)
+}
+
+/// A grant of type `type`, `RESOURCE_ID_CHUNK` or `RESOURCE_ID_SMALL_CHUNK`, of chunk `chunk` for
+/// `context`.
+fn id_grant(r#type: u32, context: u32, chunk: u32) -> Vec<u8> {
     RgfxResourceIdChunk {
         header: RgfxMsgHeader {
-            r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+            r#type,
             size: 0,
             seqno: 0,
         },
@@ -3621,18 +3627,23 @@ fn a_scanout_grant_waits_for_every_context_s_messages_before_it() {
 }
 
 /// A resource id chunk granted to a context after another held it waits for that context's close
-/// published before it, and a new context's first message waits for every close published before
-/// it: the kext frees a closed context's chunks and its slot of GPU addresses once it stops
-/// waiting for the close's answer, so the close may still hold textures at the chunk's ids and
-/// buffers in the slot.
+/// published before it, a small chunk of it as the whole chunk does, and a new context's first
+/// message waits for every close published before it: the kext frees a closed context's chunks
+/// and its slot of GPU addresses once it stops waiting for the close's answer, so the close may
+/// still hold textures at the chunk's ids and buffers in the slot.
 #[test]
 fn a_chunk_or_a_new_context_waits_for_the_close_before_it() {
     const A: u32 = 6;
     const B: u32 = 5;
     const C: u32 = 7;
-    // B's chunk, of a context with messages before A's (not a new one), then C's first message.
+    // B's chunk, of a context with messages before A's (not a new one), then B's small chunk 13,
+    // of chunk 3's ids 193 to 256, then C's first message.
     for (late, r#type) in [
         (id_chunk(B, 3), RGFX_CMD_RESOURCE_ID_CHUNK),
+        (
+            id_grant(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, B, 13),
+            RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
+        ),
         (
             object_message(
                 RGFX_CMD_EVENT_CREATE,
@@ -3658,7 +3669,7 @@ fn a_chunk_or_a_new_context_waits_for_the_close_before_it() {
         settle();
         assert_eq!(seen.types(), held, "type {type:#x} overtook the close");
         seen.release();
-        seen.wait_for(r#type, 2);
+        seen.wait_for(r#type, held.iter().filter(|&&t| t == r#type).count() + 1);
         assert_eq!(seen.types()[held.len()..], [RGFX_CMD_CONTEXT_CLOSE, r#type]);
     }
 }

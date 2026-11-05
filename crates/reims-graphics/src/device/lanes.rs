@@ -32,12 +32,12 @@
 //!   and an earlier holder's destroys and `BLOCK_UNSHARE` are answered by no one;
 //! - a `BLOCK_GRANT` in the scanout's span, for every lane: a grant takes the span from whoever
 //!   held it, and WindowServer's contexts are granted it in turn;
-//! - a `RESOURCE_ID_CHUNK` of a chunk another context held, for that context's `CONTEXT_CLOSE`,
-//!   and a context's first message, for every `CONTEXT_CLOSE` not yet carried out (whatever its
-//!   number: the kext numbers contexts at their opens, which come in another order than their
-//!   first messages): the kext frees a closed context's chunks and its slot of GPU addresses once
-//!   the close is answered, so a close not yet carried out may still hold textures at the chunk's
-//!   ids and buffers in the slot;
+//! - a `RESOURCE_ID_CHUNK` or `RESOURCE_ID_SMALL_CHUNK` of ids another context held, for that
+//!   context's `CONTEXT_CLOSE`, and a context's first message, for every `CONTEXT_CLOSE` not yet
+//!   carried out (whatever its number: the kext numbers contexts at their opens, which come in
+//!   another order than their first messages): the kext frees a closed context's chunks and its
+//!   slot of GPU addresses once the close is answered, so a close not yet carried out may still
+//!   hold textures at the chunk's ids and buffers in the slot;
 //! - a message of context `c`'s on `c`'s lane, for each block's lane through its last
 //!   `SURFACE_PAGES` for `c` handed before it: `c`'s later messages see the block as its pages
 //!   left it, as when they shared one lane;
@@ -247,7 +247,9 @@ struct State {
     /// `SURFACE_PAGES` leaves them: one the kext posts for a block it has handed out, from a CPU
     /// lock or before the block's release, finds the block held.
     holders: HashMap<u64, HashSet<u32>>,
-    /// The context each texture resource id chunk was last granted to.
+    /// The context each small chunk of the texture resource ids ([`RGFX_RESOURCE_ID_SMALL_CHUNK`]
+    /// ids) was last granted to, by a `RESOURCE_ID_SMALL_CHUNK` or its chunk's
+    /// `RESOURCE_ID_CHUNK`.
     chunks: HashMap<u32, u32>,
     /// The contexts a message was handed for since the device was made or reset. The kext numbers
     /// contexts once each, at their opens, but a context may post its first message after one
@@ -392,10 +394,25 @@ impl State {
                     }
                 }
             }
-            RGFX_CMD_RESOURCE_ID_CHUNK => {
+            RGFX_CMD_RESOURCE_ID_CHUNK | RGFX_CMD_RESOURCE_ID_SMALL_CHUNK => {
                 if let Some(chunk) = read::<RgfxResourceIdChunk>(message) {
-                    let last = self.chunks.insert(chunk.chunk, context);
-                    if let Some(holder) = last.filter(|&h| h != context) {
+                    // By small chunk: a chunk of 64 ids is four.
+                    let per = if note.r#type == RGFX_CMD_RESOURCE_ID_SMALL_CHUNK {
+                        1
+                    } else {
+                        (RGFX_RESOURCE_ID_CHUNK / RGFX_RESOURCE_ID_SMALL_CHUNK) as u32
+                    };
+                    let first = chunk.chunk.saturating_mul(per);
+                    let mut holders = Vec::new();
+                    for small in first..first.saturating_add(per) {
+                        let last = self.chunks.insert(small, context);
+                        if let Some(holder) = last.filter(|&h| h != context)
+                            && !holders.contains(&holder)
+                        {
+                            holders.push(holder);
+                        }
+                    }
+                    for holder in holders {
                         edges.extend(self.last_matching(|n| {
                             n.r#type == RGFX_CMD_CONTEXT_CLOSE && n.field as u32 == holder
                         }));

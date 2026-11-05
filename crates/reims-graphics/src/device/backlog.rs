@@ -10,8 +10,8 @@
 //!   queue, and takes any other message of the range from a process only where that `obj_id` is
 //!   in the process's range (`RgfxSubmitGate.hpp`'s `rgfxSubmitAdmitted`), so a type the host
 //!   does not know there, which it refuses, is its sender's too;
-//! - a context's (`CONTEXT_CLOSE` to `SURFACE_PAGES`): the `context` at offset 16, which the kext
-//!   writes itself.
+//! - a context's (`CONTEXT_CLOSE` to `SURFACE_PAGES`, and `RESOURCE_ID_SMALL_CHUNK`): the
+//!   `context` at offset 16, which the kext writes itself.
 //!
 //! An object of another process's reaches a buffer only through a block the kext shares with the
 //! buffer's context: an IOSurface's, whose `BLOCK_SHARE` names that context and is posted before
@@ -72,9 +72,10 @@ pub(super) fn whose(r#type: u32, field: Option<u64>) -> Whose {
         (RGFX_CMD_QUEUE_CREATE..RGFX_CMD_CONTEXT_CLOSE, Some(obj_id)) => {
             Whose::Context((obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32)
         }
-        (RGFX_CMD_CONTEXT_CLOSE..=RGFX_CMD_SURFACE_PAGES, Some(field)) => {
-            Whose::Context(field as u32)
-        }
+        (
+            RGFX_CMD_CONTEXT_CLOSE..=RGFX_CMD_SURFACE_PAGES | RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
+            Some(field),
+        ) => Whose::Context(field as u32),
         _ => Whose::Every,
     }
 }
@@ -221,9 +222,11 @@ mod tests {
         let field = Some((0xdead_u64 << 32) | 9);
         for r#type in [
             RGFX_CMD_CONTEXT_CLOSE,
+            RGFX_CMD_RESOURCE_ID_CHUNK,
             RGFX_CMD_BLOCK_GRANT,
             RGFX_CMD_BLOCK_SHARE,
             RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
         ] {
             assert_eq!(whose(r#type, field), Whose::Context(9));
         }
@@ -237,7 +240,10 @@ mod tests {
         }
         assert_eq!(whose(RGFX_CMD_BUFFER_CREATE, None), Whose::Every);
         assert_eq!(whose(RGFX_CMD_DISPLAY_COLOR + 1, obj(5)), Whose::Every);
-        assert_eq!(whose(RGFX_CMD_SURFACE_DOWNLOAD + 1, obj(5)), Whose::Every);
+        assert_eq!(
+            whose(RGFX_CMD_RESOURCE_ID_SMALL_CHUNK + 1, obj(5)),
+            Whose::Every
+        );
         assert_eq!(whose(RGFX_CMD_COMMAND_BUFFER, obj(5)), Whose::Every);
     }
 }
