@@ -10,8 +10,9 @@
 //   - Intel UHD Graphics 630: recommendedMaxWorkingSetSize 1610612736, hasUnifiedMemory YES,
 //     dedicatedMemorySize 0; its accelerator states VRAM,totalMB 1536.
 // So VRAM,totalMB is the working set in MiB, and dedicatedMemorySize is the working set where the
-// GPU has memory of its own, else 0. IOFBMemorySize is a different thing on both: the
-// framebuffer's aperture (256 MiB on the AMD), which ours keeps as RGFX_SCANOUT_SPAN.
+// GPU has memory of its own, else 0. IOFBMemorySize is a different thing: the AMD's framebuffer
+// publishes its aperture's size (256 MiB), and the Intel's, as ours, publishes none
+// (RgfxScanoutOwner.hpp).
 //
 // Header-only and free of the kernel's headers, so its native test (tests/memory_size_test.cpp)
 // builds it as the kext does.

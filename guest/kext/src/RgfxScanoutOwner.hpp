@@ -27,7 +27,11 @@
 // While a server connection's open is in flight, its task owns the scanout too: IOFramebuffer
 // sets the display up inside the open (its open()), before the connection exists. The VRAM range
 // it asks for there is refused (rgfxMayMapVram). An open while a connection is held fails, so it
-// marks nothing.
+// marks nothing. IOFramebuffer sets the display up again for each new mode (setupForCurrentConfig,
+// its only caller of the full setup, read from macOS 26.7.1's IOGraphicsFamily), on the thread of
+// the task that set the mode, the owner's: the record marks that thread while the setup runs, and
+// the VRAM range it asks for there is refused too. So the framebuffer never publishes a memory
+// size (kIOFBMemorySizeKey), as the Intel 630's and the stock paravirtual framebuffer do not.
 //
 // One task owns the scanout at a time: a new server connection's task replaces the one before
 // it, and every other task's hold of the scanout is taken back then (rgfxKeepsScanout): each
@@ -64,6 +68,8 @@ struct RgfxScanoutOwner {
 	const void *client = nullptr;
 	// The task whose server connection's open is in flight; null for none.
 	const void *opening = nullptr;
+	// The thread running IOFramebuffer's setup for the current mode; null for none.
+	const void *settingUp = nullptr;
 
 	// Whether `who` owns the scanout, `active` whether the recorded connection is still open.
 	bool owns(const void *who, bool active) const
@@ -114,6 +120,21 @@ struct RgfxScanoutOwner {
 		*oldClient = client;
 		task = client = opening = nullptr;
 	}
+
+	// IOFramebuffer's setup for the current mode begins on `thread`: returns the thread of the
+	// setup it runs inside (null for none), which endSetup puts back.
+	const void *beginSetup(const void *thread)
+	{
+		const void *outer = settingUp;
+		settingUp = thread;
+		return outer;
+	}
+
+	// The setup beginSetup began ended: `outer` is its answer.
+	void endSetup(const void *outer) { settingUp = outer; }
+
+	// Whether `thread` runs IOFramebuffer's setup for the current mode.
+	bool inSetup(const void *thread) const { return thread && thread == settingUp; }
 };
 
 // Whether a grant or a lock's mapping of the scanout that `holder` (its task) holds stays when
@@ -125,11 +146,12 @@ inline bool rgfxKeepsScanout(const void *holder, const void *owner)
 
 // Whether `who` may be given the framebuffer's VRAM range: the scanout's owner on the server
 // connection it holds (`connected`, RgfxScanoutOwner::holdsConnection), which maps it through that
-// connection. IOFramebuffer's own setup asks too, in the kernel and inside the connection's open,
-// and gets none: it publishes the range's size (kIOFBMemorySizeKey) from that answer alone.
-inline bool rgfxMayMapVram(const void *who, const void *kernel, bool connected)
+// connection. IOFramebuffer's own setup asks too, in the kernel, inside the connection's open and,
+// for a new mode, on the thread of the task that set it (`inSetup`, RgfxScanoutOwner::inSetup), and
+// gets none: it publishes the range's size (kIOFBMemorySizeKey) from that answer alone.
+inline bool rgfxMayMapVram(const void *who, const void *kernel, bool connected, bool inSetup)
 {
-	return who && who != kernel && connected;
+	return who && who != kernel && connected && !inSetup;
 }
 
 #endif // RGFX_SCANOUT_OWNER_HPP_

@@ -888,9 +888,9 @@ create), where all three make one *(class 4)*.
 
 **The framebuffer's `IOFBMemorySize`.** The AMD's framebuffer publishes 268435456 (256 MiB, the
 size of its aperture), and the Intel 630's publishes none. Neither does the stock lane's paravirtual
-framebuffer, in a macOS 26 x86 guest. Ours publishes none until the scanout's owner sets a new mode,
-and then the size of its scanout's room (`ReimsGraphics.cpp`, getVRAMRange). Both answers are inside
-the envelope *(class 2)*.
+framebuffer, in a macOS 26 x86 guest. Ours publishes none, as the Intel's does: IOFramebuffer's own
+setup, for a new mode too, gets no VRAM range (`ReimsGraphics.cpp`, getVRAMRange). Both answers are
+inside the envelope *(class 2)*.
 
 ## Not measured
 

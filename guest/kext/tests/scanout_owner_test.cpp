@@ -1,8 +1,8 @@
 // The native test of RgfxScanoutOwner.hpp: only the task that holds the framebuffer's server
 // connection (or whose open of one is in flight) owns the scanout, a new connection's task
 // replaces the old one and takes every other task's hold of the scanout back, a closed connection
-// owns nothing, the VRAM range goes to the owner on its connection alone, and the scanout's room
-// never reaches the accelerator's blocks.
+// owns nothing, the VRAM range goes to the owner on its connection alone (never to IOFramebuffer's
+// own setup, for a new mode either), and the scanout's room never reaches the accelerator's blocks.
 #include "RgfxScanoutOwner.hpp"
 
 #include <cstdio>
@@ -99,11 +99,32 @@ int main()
 
 	// The VRAM range: the owner on the connection it holds, and no one else: not the kernel, not
 	// a task whose open is in flight.
-	check(!rgfxMayMapVram(k, k, false) && !rgfxMayMapVram(k, k, true),
+	check(!rgfxMayMapVram(k, k, false, false) && !rgfxMayMapVram(k, k, true, false),
 	      "the kernel does not map the VRAM range");
-	check(rgfxMayMapVram(ws, k, true), "the owner on its connection does");
-	check(!rgfxMayMapVram(other, k, false), "no other task does");
-	check(!rgfxMayMapVram(nullptr, k, true), "a null task does not");
+	check(rgfxMayMapVram(ws, k, true, false), "the owner on its connection does");
+	check(!rgfxMayMapVram(other, k, false, false), "no other task does");
+	check(!rgfxMayMapVram(nullptr, k, true, false), "a null task does not");
+	// Nor IOFramebuffer's setup for a new mode, which runs on the thread of the owner that set
+	// it: the range it gets there is the memory size it publishes, which it then never does.
+	RgfxScanoutOwner setting;
+	const void *wsThread = &windowServer, *otherThread = &app;
+	check(!setting.inSetup(wsThread) && !setting.inSetup(nullptr), "no setup before one begins");
+	const void *outer = setting.beginSetup(wsThread);
+	check(outer == nullptr, "the first setup runs inside none");
+	check(setting.inSetup(wsThread) && !setting.inSetup(otherThread),
+	      "the setup's thread is marked, and no other");
+	check(!rgfxMayMapVram(ws, k, true, setting.inSetup(wsThread)),
+	      "the owner's setup for a new mode does not map the VRAM range");
+	check(rgfxMayMapVram(ws, k, true, setting.inSetup(otherThread)),
+	      "the owner's other threads on its connection do, meanwhile");
+	const void *inner = setting.beginSetup(otherThread);
+	check(inner == wsThread && setting.inSetup(otherThread), "a setup inside it is marked");
+	setting.endSetup(inner);
+	check(setting.inSetup(wsThread), "and its end puts the outer one back");
+	setting.endSetup(outer);
+	check(!setting.inSetup(wsThread) && setting.settingUp == nullptr, "no setup after it ends");
+	check(rgfxMayMapVram(ws, k, true, setting.inSetup(wsThread)),
+	      "and the owner maps the range on its connection again");
 	RgfxScanoutOwner held;
 	marked = held.beginOpen(ws, false);
 	check(held.owns(ws, false) && !held.holdsConnection(ws, false),

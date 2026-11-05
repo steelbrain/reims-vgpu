@@ -106,6 +106,8 @@ public:
 	// (kIOFBServerConnectType) is made for owns the scanout from then on (ownsScanout).
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
 	                       IOUserClient **clientH) override;
+	// IOFramebuffer's setup for the current mode, which gets no VRAM range (getVRAMRange).
+	IOReturn setupForCurrentConfig() override;
 
 #if RGFX_FB_TRACE
 	// A trace build (make TRACE=1) logs what IOFramebuffer and its clients call on the
@@ -124,7 +126,6 @@ public:
 	                               IOService *device) override;
 	IOReturn requestProbe(IOOptionBits options) override;
 	IOReturn message(UInt32 type, IOService *provider, void *argument = 0) override;
-	IOReturn setupForCurrentConfig() override;
 	bool isConsoleDevice() override;
 	IOReturn setCLUTWithEntries(IOColorEntry *colors, UInt32 index, UInt32 numEntries,
 	                            IOOptionBits options) override;

@@ -13,6 +13,7 @@
 #include <kern/clock.h>
 #include <kern/task.h>
 #include <kern/task_ref.h>
+#include <kern/thread.h>
 #include <libkern/libkern.h>
 
 #include "RgfxTrace.hpp"
@@ -1335,26 +1336,28 @@ IODeviceMemory *ReimsGraphics::getApertureRange(IOPixelAperture aperture)
 
 // The scanout's room. IOFramebuffer maps it into the task that asks for it on a user client (its
 // server connection, and its shared one for any task of the console's user), calling this on that
-// task's thread (IOGraphics' open source, clientMemoryForType). It asks in its own setup too (in
-// the kernel, and inside the server connection's open), where it reads the room's size into
+// task's thread (IOGraphics' open source, clientMemoryForType). It asks in its own setup too
+// (setupForCurrentConfig: in the kernel, inside the server connection's open, and for each new
+// mode on the thread of the task that set it), where it reads the room's size into
 // kIOFBMemorySizeKey and the aperture's offset in it. So the room goes to the scanout's owner on
-// the connection it holds alone, and IOFramebuffer's setup in the kernel or in the open and every
-// other task get none (RgfxScanoutOwner.hpp): the framebuffer publishes no memory size, unless the
-// owner sets a new mode, whose setup runs on the owner's thread. The aperture (getApertureRange),
-// which the kernel maps for the console, is another range, and stays.
+// the connection it holds alone, and IOFramebuffer's setup and every other task get none
+// (RgfxScanoutOwner.hpp): the framebuffer publishes no memory size. The aperture
+// (getApertureRange), which the kernel maps for the console, is another range, and stays.
 IODeviceMemory *ReimsGraphics::getVRAMRange()
 {
 	if (!region)
 		return nullptr;
 	task_t task = current_task();
 	bool ownerConnected = false;
+	bool inSetup = false;
 	if (task != kernel_task && stateLock) {
 		IOLockLock(stateLock);
 		const IOUserClient *client = static_cast<const IOUserClient *>(scanoutOwner.client);
 		ownerConnected = scanoutOwner.holdsConnection(task, client && !client->isInactive());
+		inSetup = scanoutOwner.inSetup(current_thread());
 		IOLockUnlock(stateLock);
 	}
-	bool given = rgfxMayMapVram(task, kernel_task, ownerConnected);
+	bool given = rgfxMayMapVram(task, kernel_task, ownerConnected, inSetup);
 	static char site;
 	RgfxCaller caller;
 	if (caller.pid != 0 && rgfxFirstCalls(&site, static_cast<UInt64>(caller.pid), 4))
@@ -1363,6 +1366,26 @@ IODeviceMemory *ReimsGraphics::getVRAMRange()
 	if (!given)
 		return nullptr;
 	return IODeviceMemory::withSubRange(region, RGFX_ALLOCATIONS_OFFSET, scanoutLimit());
+}
+
+// IOFramebuffer's setup for the current mode: the thread that runs it is marked while it runs, so
+// the VRAM range it asks for there is refused (getVRAMRange).
+IOReturn ReimsGraphics::setupForCurrentConfig()
+{
+	const void *outer = nullptr;
+	if (stateLock) {
+		IOLockLock(stateLock);
+		outer = scanoutOwner.beginSetup(current_thread());
+		IOLockUnlock(stateLock);
+	}
+	IOReturn r = super::setupForCurrentConfig();
+	if (stateLock) {
+		IOLockLock(stateLock);
+		scanoutOwner.endSetup(outer);
+		IOLockUnlock(stateLock);
+	}
+	FBTRACE(8, "setupForCurrentConfig -> 0x%x", r);
+	return r;
 }
 
 const char *ReimsGraphics::getPixelFormats()
@@ -2394,13 +2417,6 @@ IOReturn ReimsGraphics::message(UInt32 type, IOService *provider, void *argument
 {
 	IOReturn r = super::message(type, provider, argument);
 	FBTRACE(16, "message 0x%x -> 0x%x", type, r);
-	return r;
-}
-
-IOReturn ReimsGraphics::setupForCurrentConfig()
-{
-	IOReturn r = super::setupForCurrentConfig();
-	FBTRACE(8, "setupForCurrentConfig -> 0x%x", r);
 	return r;
 }
 
