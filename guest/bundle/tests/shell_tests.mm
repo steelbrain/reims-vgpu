@@ -3401,6 +3401,90 @@ void test_unread_function_list_answers_from_shadow()
 	}
 }
 
+// A library whose function list reads but whose function's metadata names no constants (no CNST
+// tag: here every_access's, renamed) takes them from its AIR module, as it takes a CNST tag's: the
+// function declares kScale as Metal's own over the tagged bytes does, values set by name and by
+// index reach it, a value of another type fails as Metal's does, and a function of no constants
+// still declares none.
+void test_constants_without_cnst_resolve_from_air()
+{
+	Fixture fx(0x80000); // the library's bytes fit
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	NSMutableData *untagged = [bytes mutableCopy];
+	// every_access's CNST tag, the one that lists kScale first: a 4-byte name, a u16 size, a u16
+	// count, then the first constant's name.
+	uint8_t *p = static_cast<uint8_t *>(untagged.mutableBytes);
+	size_t renamed = 0;
+	for (size_t i = 0; i + 15 <= untagged.length; i++) {
+		if (std::memcmp(p + i, "CNST", 4) == 0 && std::memcmp(p + i + 8, "kScale", 7) == 0) {
+			std::memcpy(p + i, "XNST", 4);
+			renamed++;
+		}
+	}
+	CHECK(renamed == 1);
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:untagged.bytes
+	                                         length:untagged.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(untagged.bytes, untagged.length, nil, ^{
+		     (void)untagged;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	id<MTLLibrary> genuine =
+	    [metal newLibraryWithData:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		           (void)bytes;
+	           })
+	                        error:nil];
+	MTLFunctionConstant *metals =
+	    [genuine newFunctionWithName:@"every_access"].functionConstantsDictionary[@"kScale"];
+	CHECK(metals != nil);
+
+	id<MTLFunction> unspecialised = [lib newFunctionWithName:@"every_access"];
+	MTLFunctionConstant *declared = unspecialised.functionConstantsDictionary[@"kScale"];
+	CHECK(unspecialised.functionConstantsDictionary.count == 1 && declared.index == 0 &&
+	      declared.type == MTLDataTypeBool && declared.required == metals.required);
+	MTLFunctionConstantValues *byName = [MTLFunctionConstantValues new];
+	bool yes = true;
+	[byName setConstantValue:&yes type:MTLDataTypeBool withName:@"kScale"];
+	NSError *err = nil;
+	id<MTLFunction> named = [lib newFunctionWithName:@"every_access"
+	                                  constantValues:byName
+	                                           error:&err];
+	CHECK(named != nil && err == nil && [(RgfxFunction *)named rgfxConstantCount] == 1);
+	const RgfxFunctionConstant *k = constantAt(named, 0);
+	CHECK(k != nullptr && k->data_type == MTLDataTypeBool && k->value[0] == 1);
+	MTLFunctionConstantValues *byIndex = [MTLFunctionConstantValues new];
+	[byIndex setConstantValue:&yes type:MTLDataTypeBool atIndex:0];
+	id<MTLFunction> indexed = [lib newFunctionWithName:@"every_access"
+	                                    constantValues:byIndex
+	                                             error:&err];
+	CHECK(indexed != nil && err == nil && [(RgfxFunction *)indexed rgfxConstantCount] == 1);
+	k = constantAt(indexed, 0);
+	CHECK(k != nullptr && k->data_type == MTLDataTypeBool && k->value[0] == 1);
+	float wrong = 1.0f;
+	MTLFunctionConstantValues *mistyped = [MTLFunctionConstantValues new];
+	[mistyped setConstantValue:&wrong type:MTLDataTypeFloat withName:@"kScale"];
+	err = nil;
+	CHECK([lib newFunctionWithName:@"every_access" constantValues:mistyped error:&err] == nil &&
+	      err.code == MTLLibraryErrorCompileFailure);
+	CHECK([lib newFunctionWithName:@"no_texture"].functionConstantsDictionary.count == 0);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A library made from bytes answers nil for its bitcode, as Metal's, and is written by its shadow
 // as the bytes it was made from, with Foundation's error for a URL it cannot write; one made from
 // a URL is refused with Metal's error, and one with no shadow is refused, logged. (Metal's answers
@@ -12795,6 +12879,7 @@ int main(int argc, char **argv)
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
 		test_unread_function_list_answers_from_shadow();
+		test_constants_without_cnst_resolve_from_air();
 		test_stitchable_reflection_from_air();
 		test_library_members_as_metal();
 		test_library_type_and_install_name();

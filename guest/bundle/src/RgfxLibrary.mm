@@ -676,18 +676,60 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 
 // --- MTLLibrary --------------------------------------------------------------
 
+// The constants `decls` as `functionConstantsDictionary` answers them, by name.
+static NSDictionary<NSString *, MTLFunctionConstant *> *
+rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
+{
+	NSMutableDictionary<NSString *, MTLFunctionConstant *> *declared =
+	    [NSMutableDictionary dictionaryWithCapacity:decls.size()];
+	for (const RgfxConstantDecl &d : decls) {
+		RgfxDeclaredConstant *c = [[RgfxDeclaredConstant alloc] initWithDecl:d];
+		declared[c.name] = c;
+	}
+	return declared;
+}
+
+// The constants of `entry`, a function of a table that read whose metadata gives none (no CNST
+// tag, or one that did not read), as its AIR module declares them (RgfxAirConstant), in index
+// order: false where the module declares none or they did not read, or the function is of no
+// stage the AIR reader follows. Apple's compiler writes a CNST tag for every function its module
+// declares constants for (RgfxAirArguments.hpp), so this answers for metadata of another writer.
+- (bool)rgfxAirConstantsOf:(const MetallibFunction &)entry into:(std::vector<RgfxConstantDecl> &)out
+{
+	out.clear();
+	std::shared_ptr<const RgfxAirFunction> fn;
+	std::shared_ptr<const RgfxAirVisible> visible;
+	const std::vector<RgfxAirConstant> *air = nullptr;
+	if (entry.type == MTLFunctionTypeVertex || entry.type == MTLFunctionTypeFragment ||
+	    entry.type == MTLFunctionTypeKernel) {
+		fn = [self rgfxAirFunctionNamed:entry.name];
+		if (fn != nullptr && fn->constantsRead)
+			air = &fn->constants;
+	} else if (entry.type == MTLFunctionTypeVisible) {
+		visible = [self rgfxAirVisibleNamed:entry.name];
+		if (visible != nullptr && visible->constantsRead)
+			air = &visible->constants;
+	}
+	if (air == nullptr || air->empty())
+		return false;
+	for (const RgfxAirConstant &c : *air)
+		out.push_back(RgfxConstantDecl{c.name, c.type, c.index, c.required});
+	std::sort(out.begin(), out.end(), [](const RgfxConstantDecl &a, const RgfxConstantDecl &b) {
+		return a.index < b.index;
+	});
+	return true;
+}
+
 - (id<MTLFunction>)newFunctionWithName:(NSString *)functionName
 {
 	RgfxFunction *fn = (RgfxFunction *)[self rgfxFunctionNamed:functionName constants:{}];
 	const MetallibFunction *entry = fn ? [self rgfxEntryNamed:functionName] : nullptr;
+	std::vector<RgfxConstantDecl> declaredByAir;
 	if (entry != nullptr && entry->haveConstants && !entry->constants.empty()) {
-		NSMutableDictionary<NSString *, MTLFunctionConstant *> *declared =
-		    [NSMutableDictionary dictionaryWithCapacity:entry->constants.size()];
-		for (const RgfxConstantDecl &d : entry->constants) {
-			RgfxDeclaredConstant *c = [[RgfxDeclaredConstant alloc] initWithDecl:d];
-			declared[c.name] = c;
-		}
-		[fn rgfxSetUnspecialisedConstants:declared];
+		[fn rgfxSetUnspecialisedConstants:rgfxDeclaredConstants(entry->constants)];
+	} else if (entry != nullptr && [self rgfxAirConstantsOf:*entry into:declaredByAir]) {
+		// Metadata that names no constants: its module's.
+		[fn rgfxSetUnspecialisedConstants:rgfxDeclaredConstants(declaredByAir)];
 	} else if (fn != nil && !_table->readable) {
 		// Where the table did not read, the shadow's function declares them.
 		BOOL haveShadow = NO;
@@ -713,10 +755,15 @@ static NSError *rgfxFunctionNotFound(NSString *name)
 	std::map<std::string, RgfxConstantValue> byName;
 	readConstantValues(constantValues, byIndex, byName);
 	std::vector<RgfxFunctionConstant> constants;
-	// The function's constants: its table entry's, or, where the table did not read, those its
-	// shadow's function declares (Metal's own over the same bytes), in index order.
+	// The function's constants: its table entry's; where its entry names none, those its module
+	// declares (rgfxAirConstantsOf:into:); where the table did not read, those its shadow's
+	// function declares (Metal's own over the same bytes), in index order.
 	const std::vector<RgfxConstantDecl> *decls =
 	    entry != nullptr && entry->haveConstants ? &entry->constants : nullptr;
+	std::vector<RgfxConstantDecl> declaredByAir;
+	if (entry != nullptr && (decls == nullptr || decls->empty()) &&
+	    [self rgfxAirConstantsOf:*entry into:declaredByAir])
+		decls = &declaredByAir;
 	std::vector<RgfxConstantDecl> declaredByShadow;
 	if (!_table->readable) {
 		BOOL haveShadow = NO;
