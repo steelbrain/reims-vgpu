@@ -29,6 +29,15 @@
 //                with allowGPUOptimizedContents YES and NO
 //   libforms     newLibraryWithFunctionArray:error:, newLibraryWithMetalPackageURL:error: and
 //                newLibraryWithMPSGraphPackageURL:name:error: (SPI)
+//   view.*       a view of a 64 x 64 Private texture (usage ShaderRead | PixelFormatView) that the
+//                bundle answers nil for: .class (RGBA16Float in RGBA8Unorm), .levels (levels 2 to
+//                4 of 3), .slices (slices 3 and 4 of a 4-slice array), .type (2D as 3D),
+//                .slicecount (a 4-slice array as a cube), .noformat (Invalid); .ok (RGBA8Unorm in
+//                R32Float) is one Metal makes
+//   buftex.*     a 2D texture over a Shared buffer by the public newTextureWithDescriptor:offset:
+//                bytesPerRow:: .bc1 and .depth (formats minimumLinearTextureAlignmentForPixelFormat:
+//                may end the process at), .shortrow (468 x 36 BGRA8 rows 1536 bytes apart, under
+//                the row's 1872); linear.shortrow, the same by the buffer's linear SPI
 // Build: see README.md.
 #import "oracle_common.h"
 #include <objc/message.h>
@@ -672,6 +681,59 @@ static void case_libforms(id<MTLDevice> d)
 		printf("libforms mpsGraphPackage n/r\n");
 }
 
+// --- views and textures over buffers ------------------------------------------------------
+
+static void view_case(id<MTLDevice> d, const char *tag, MTLPixelFormat parentFormat,
+                      MTLTextureType parentType, NSUInteger parentLevels, NSUInteger parentSlices,
+                      MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.pixelFormat = parentFormat;
+	td.textureType = parentType;
+	td.width = 64;
+	td.height = 64;
+	td.mipmapLevelCount = parentLevels;
+	td.arrayLength = parentSlices;
+	td.storageMode = MTLStorageModePrivate;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	printf("%s parent=%s\n", tag, t ? "made" : "nil");
+	fflush(stdout);
+	id<MTLTexture> v = [t newTextureViewWithPixelFormat:format
+	                                        textureType:type
+	                                             levels:levels
+	                                             slices:slices];
+	printf("%s view=%s\n", tag, v ? "made" : "nil");
+}
+
+static void buffer_texture(id<MTLDevice> d, const char *tag, MTLPixelFormat format,
+                           NSUInteger width, NSUInteger height, NSUInteger bytesPerRow, BOOL linear)
+{
+	id<MTLBuffer> b = [d newBufferWithLength:1 << 20 options:MTLResourceStorageModeShared];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                                              width:width
+	                                                                             height:height
+	                                                                          mipmapped:NO];
+	td.storageMode = MTLStorageModeShared;
+	td.usage = MTLTextureUsageShaderRead;
+	printf("%s format=%lu %lux%lu bytesPerRow=%lu linear=%d\n", tag, (unsigned long)format,
+	       (unsigned long)width, (unsigned long)height, (unsigned long)bytesPerRow, (int)linear);
+	fflush(stdout);
+	id<MTLTexture> t = nil;
+	if (!linear) {
+		t = [b newTextureWithDescriptor:td offset:0 bytesPerRow:bytesPerRow];
+	} else {
+		SEL sel = sel_registerName("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+		if (![(id)b respondsToSelector:sel]) {
+			printf("%s n/r\n", tag);
+			return;
+		}
+		t = ((id(*)(id, SEL, id, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+		    b, sel, td, 0, bytesPerRow, bytesPerRow * height);
+	}
+	printf("%s texture=%s\n", tag, t ? "made" : "nil");
+}
+
 // --- the cases ----------------------------------------------------------------------------
 
 static const char *const kCases[] = {
@@ -679,6 +741,9 @@ static const char *const kCases[] = {
     "nocopy.len100",    "nocopy.off16",     "nocopy.managed", "events",       "archive.system",
     "archive.made",     "failmiss",         "functypes",     "libtype",       "minlod",
     "classes",          "heapsize",         "libforms",
+    "view.class",       "view.levels",      "view.slices",   "view.type",     "view.slicecount",
+    "view.noformat",    "view.ok",          "buftex.bc1",    "buftex.depth",  "buftex.shortrow",
+    "linear.shortrow",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -721,6 +786,37 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_heapsize(d);
 	else if (!strcmp(c, "libforms"))
 		case_libforms(d);
+	else if (!strcmp(c, "view.class"))
+		view_case(d, c, MTLPixelFormatRGBA16Float, MTLTextureType2D, 1, 1, MTLPixelFormatRGBA8Unorm,
+		          MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
+	else if (!strcmp(c, "view.levels"))
+		view_case(d, c, MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 3, 1, MTLPixelFormatRGBA8Unorm,
+		          MTLTextureType2D, NSMakeRange(2, 3), NSMakeRange(0, 1));
+	else if (!strcmp(c, "view.slices"))
+		view_case(d, c, MTLPixelFormatRGBA8Unorm, MTLTextureType2DArray, 1, 4,
+		          MTLPixelFormatRGBA8Unorm, MTLTextureType2DArray, NSMakeRange(0, 1),
+		          NSMakeRange(3, 2));
+	else if (!strcmp(c, "view.type"))
+		view_case(d, c, MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1, MTLPixelFormatRGBA8Unorm,
+		          MTLTextureType3D, NSMakeRange(0, 1), NSMakeRange(0, 1));
+	else if (!strcmp(c, "view.slicecount"))
+		view_case(d, c, MTLPixelFormatRGBA8Unorm, MTLTextureType2DArray, 1, 4,
+		          MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, NSMakeRange(0, 1),
+		          NSMakeRange(0, 4));
+	else if (!strcmp(c, "view.noformat"))
+		view_case(d, c, MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1, MTLPixelFormatInvalid,
+		          MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
+	else if (!strcmp(c, "view.ok"))
+		view_case(d, c, MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1, MTLPixelFormatR32Float,
+		          MTLTextureType2D, NSMakeRange(0, 1), NSMakeRange(0, 1));
+	else if (!strcmp(c, "buftex.bc1"))
+		buffer_texture(d, c, MTLPixelFormatBC1_RGBA, 64, 64, 256, NO);
+	else if (!strcmp(c, "buftex.depth"))
+		buffer_texture(d, c, MTLPixelFormatDepth32Float, 64, 64, 256, NO);
+	else if (!strcmp(c, "buftex.shortrow"))
+		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, NO);
+	else if (!strcmp(c, "linear.shortrow"))
+		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, YES);
 	else {
 		fprintf(stderr, "no case %s\n", c);
 		return 2;
