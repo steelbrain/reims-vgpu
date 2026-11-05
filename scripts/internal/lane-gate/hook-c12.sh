@@ -2,11 +2,12 @@
 # A probe round's --qemu-hook for car 12's probes ('bash {DIR}/bin/hook-c12.sh {PID} {DIR}'): the
 # host's side of three probes, each started by a MARK line in that probe's stdout (one newer than
 # this hook: msi-probes.sh makes a probe's results afresh when it starts it).
-#   c12-s1               "MARK s1.start": the guest's `log stream` of the kernel's and our kext's
-#                        and bundle's lines, over SSH, into DIR/s1-guest-stream.log, until
-#                        "MARK s1.end" or the session ends (a panic's lines reach the host up to
-#                        the panic, whether or not logd wrote them). A session that ends before
-#                        s1.end is started again once SSH answers.
+#   c12-s1               (S1_PROBE, default c12-s1) from the probe's start (its stdout, or "MARK
+#                        s1.start"): the guest's `log stream` of the kernel's and our kext's and
+#                        bundle's lines, over SSH, into DIR/s1-guest-stream.log, until "MARK s1.end"
+#                        or the probe's end (its rc) (a panic's lines reach the host up to the
+#                        panic, whether or not logd wrote them). A session that ends before then is
+#                        started again once SSH answers.
 #   c12-shmem-pages      "MARK spmark.start EPOCH pid=N": spscan.py (the probe's own copy, from
 #                        the car's tree) on QEMU's RAM for guest process N, into DIR/spscan.txt.
 #   c12-scanout-restart  "MARK scanout.restart": msi-capture.py's scanout from that moment
@@ -30,16 +31,18 @@ alive() { kill -0 "$qpid" 2> /dev/null; }
 end=$(( $(date +%s) + 7200 ))
 log "watching QEMU $qpid, round $D"
 PRED='sender == "ReimsGraphics" OR sender == "reims-graphics" OR process == "kernel"'
-s1=0 s1pid= sp=0 rs=0
+s1=0 s1pid= sp=0 rs=0 S1=${S1_PROBE:-c12-s1}
+started() { [[ $PROBE_RESULTS/$1/stdout -nt $m ]]; }
+ended() { [[ -f $PROBE_RESULTS/$1/rc && $PROBE_RESULTS/$1/rc -nt $m ]]; }
 while alive && (( $(date +%s) < end )); do
   # c12-s1: the guest's log stream from s1.start to s1.end.
-  if ((s1 == 0)) && mark c12-s1 's1.start' > /dev/null; then
-    s1=1; log "s1.start: the guest's log stream into s1-guest-stream.log"
+  if ((s1 == 0)) && { started "$S1" || mark "$S1" 's1.start' > /dev/null; }; then
+    s1=1; log "$S1 started: the guest's log stream into s1-guest-stream.log"
   fi
   if ((s1 == 1)); then
-    if mark c12-s1 's1.end' > /dev/null; then
+    if mark "$S1" 's1.end' > /dev/null || ended "$S1"; then
       [[ -n $s1pid ]] && kill "$s1pid" 2> /dev/null
-      s1=2; log "s1.end: the stream stopped"
+      s1=2; log "$S1 ended: the stream stopped"
     elif [[ -z $s1pid ]] || ! kill -0 "$s1pid" 2> /dev/null; then
       [[ -n $s1pid ]] && log "the stream's session ended (rc $(wait "$s1pid" 2> /dev/null; echo $?))"
       p=$(port)

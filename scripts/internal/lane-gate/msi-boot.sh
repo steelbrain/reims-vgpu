@@ -458,7 +458,7 @@ T_DESK=$(date +%s)
 [[ ${CAPTURE:-0} == 1 ]] && touch "$R/capture/desktop-up"
 # The kext's lines: its IOLog lines reach only the kernel's ring (dmesg, 128 KiB, which a busy
 # desktop's other lines fill in a minute or two), no log stream. From the desktop on, the ring's
-# Rgfx, RGFX and ReimsGraphics lines are taken every 5 s into kring.raw ("[UPTIME]: LINE"), in the
+# Rgfx, RGFX and ReimsGraphics lines are taken every KRING_S (default 5) s into kring.raw ("[UPTIME]: LINE"), in the
 # correctness boot and in a captured one (the bench boot's at the desktop and at its end only, so
 # no read lands among its measurements); kernel-rgfx.log holds them once each, in order. The guest's boot
 # time and clock against the host's (kring-clock.txt: "BOOTTIME HOST_MINUS_GUEST") put each line
@@ -482,7 +482,7 @@ kring
 KRINGPID=
 if [[ ${EXCLUSIVE:-0} != 1 && -z ${PROBES:-} ]] || [[ ${CAPTURE:-0} == 1 ]]; then
   ( for f in /proc/$BASHPID/fd/*; do f=${f##*/}; (( f > 2 )) && eval "exec $f>&-"; done
-    while kill -0 "$P" 2> /dev/null; do sleep 5; kring; done ) > /dev/null 2>&1 &
+    while kill -0 "$P" 2> /dev/null; do sleep "${KRING_S:-5}"; kring; done ) > /dev/null 2>&1 &
   KRINGPID=$!
 fi
 # The boot's timeline from QEMU's first line: the host's first present of a guest frame, and from

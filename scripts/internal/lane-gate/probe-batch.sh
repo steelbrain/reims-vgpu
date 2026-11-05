@@ -27,7 +27,7 @@
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
 #                  [--host-log FILTER] [--stage NAME=DIR[@TIP]]... [--ram GIB] [--after CMD]
 #                  [--image PATH] [--rom PATH] [--gfx-b64 B64] [--qemu-env K=V]... [--no-metal-check]
-#                  [--stage-local NAME=DIR[@TIP]]... [--appload]
+#                  [--stage-local NAME=DIR[@TIP]]... [--appload] [--kring-s S]
 #
 # The round runs as a potluck job on the lane host (lane-gate/msi-round.sh), holding the 5080 and the
 # whole host (--exclusive; potluck's lease is the lock), dispatched from a throwaway commit of the
@@ -38,7 +38,8 @@
 # queue; --stage-local NAME=DIR[@TIP] does the same for a probe in DIR on this machine, which the
 # round's commit carries (lg/probes/NAME; a binary of our own built for the round goes in DIR; a
 # file DIR/.base naming a probe directory on the lane host lays DIR's files over that one's);
-# --appload runs the gate's app load (msi-appload.sh, every app and 7 Safari pages) once the
+# --kring-s S takes the kext's lines from the guest's kernel ring every S seconds (default 5) in a
+# captured round; --appload runs the gate's app load (msi-appload.sh, every app and 7 Safari pages) once the
 # desktop is up, before the probes, which then run on that busy desktop (appload.txt in the
 # round's directory); --ram GIB is the job's memory (default 64: the guest's 16 GiB and the host's own, and page
 # cache a probe's host side fills counts too); --after CMD runs CMD on the lane host after the boot,
@@ -82,7 +83,7 @@ L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
 cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() lstages=() ram=64 after=
-oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0
+oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0 kring_s=
 while (($#)); do
   a=$1
   shift
@@ -105,6 +106,7 @@ while (($#)); do
     --stage) stages+=("${1:?--stage NAME=DIR[@TIP]}"); shift ;;
     --stage-local) lstages+=("${1:?--stage-local NAME=DIR[@TIP]}"); shift ;;
     --appload) appload=1 ;;
+    --kring-s) kring_s=${1:?--kring-s S}; shift ;;
     --ram) ram=${1:?--ram GIB}; shift ;;
     --after) after=${1:?--after CMD}; shift ;;
     --image) oc_path=${1:?--image PATH}; shift ;;
@@ -283,6 +285,7 @@ EXCLUSIVE=1
 HOLD_S=$HOLD_S
 DRAG=0
 APPLOAD=$appload
+KRING_S=${kring_s:-5}
 HOST_LOG=$( ((capture)) && echo "$PROBE_HOST_LOG,reims_vgpu::graphics=debug" || echo "$PROBE_HOST_LOG")${log_add:+,$log_add}
 CAPTURE=$capture
 CATCH_FROM_BOOT=$from_boot
