@@ -60,8 +60,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 /// [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 /// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
-/// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`] and
-/// [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`],
+/// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
+/// reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -180,6 +181,13 @@ pub const RGFX_FEATURE_SURFACE_DEFERRED: u32 = 1 << 19;
 /// buffer's span, which holds the copy only where the buffer lies over its own block. Every host
 /// offers it.
 pub const RGFX_FEATURE_MANAGED_TEXTURE_SLABS: u32 = 1 << 21;
+/// `FEATURES_LO` bit 22, `MANAGED_BUFFER_SLABS`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_MANAGED_BUFFER_CREATE`], a `Managed`
+/// buffer whose CPU copy is any `Shared` buffer over the guest's memory the sender holds, read
+/// and written where that buffer's contents lie, as [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`] reads a
+/// texture's. So the guest lays its `Managed` buffers' CPU copies in its Shared buffers' slabs,
+/// its own pages among them, on every host, and not in the region. Every host offers it.
+pub const RGFX_FEATURE_MANAGED_BUFFER_SLABS: u32 = 1 << 22;
 /// `FEATURES_LO` bit 24, `DISPLAY_COLOR`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_DISPLAY_COLOR`], the colour stages a
 /// display pipe transaction sets (its gamma tables and its colour matrix), and a
@@ -574,6 +582,11 @@ pub const RGFX_CMD_HEAP_OVER_PAGES: u32 = 0x22a;
 /// refuses. Ring 0 is carried out before any command buffer the process posts after it, as
 /// `ICB_WRITE` is. Not answered.
 pub const RGFX_CMD_ICB_SLOTS: u32 = 0x22c;
+/// Command `MANAGED_BUFFER_CREATE` ([`RgfxManagedBufferCreate`]), where the guest took
+/// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`]: a `Managed` buffer at the guest's address whose CPU copy
+/// is the first bytes of a `Shared` buffer over the guest's memory the sender holds. A host
+/// without the feature refuses the message as one it does not know. Not answered.
+pub const RGFX_CMD_MANAGED_BUFFER_CREATE: u32 = 0x22d;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -1674,6 +1687,35 @@ pub struct RgfxBufferManagedAtOffset {
     pub options: u32,
     /// Pads to a multiple of 8; 0.
     pub reserved_3c: u32,
+}
+
+/// `MANAGED_BUFFER_CREATE`: a `Managed` buffer of `length` bytes at the guest-picked
+/// `gpu_address`, its CPU copy the first `length` bytes of the `Shared` buffer
+/// `cpu_buffer_obj_id`, which lies over the guest's memory: over a block of the sender's
+/// (`BUFFER_OVER_HOST_MEMORY`), placed in a heap over one or over a pages block's guest RAM
+/// (`BUFFER_AT_OFFSET`), or over a pages block's view (`BUFFER_OVER_PAGES`). The host's GPU copy,
+/// where it keeps one, starts as the CPU copy's bytes; `BUFFER_DID_MODIFY_RANGE` and a
+/// synchronize copy between the two as for a [`RgfxBufferOverHostMemory`] of a `Managed` buffer.
+/// The buffer lies over what its CPU copy lies over, and keeps the copy's memory while it lives.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxManagedBufferCreate {
+    /// [`RGFX_CMD_MANAGED_BUFFER_CREATE`].
+    pub header: RgfxMsgHeader,
+    /// The new buffer's guest-picked id.
+    pub obj_id: u64,
+    /// The buffer's guest-picked GPU address.
+    pub gpu_address: u64,
+    /// The `Shared` buffer whose first `length` bytes are the CPU copy.
+    pub cpu_buffer_obj_id: u64,
+    /// The buffer's length in bytes.
+    pub length: u64,
+    /// `MTLResourceOptions` of the `Managed` buffer: storage mode, cache mode, hazard tracking.
+    pub options: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_34: u32,
 }
 
 /// `CB_COMPLETE`: a command buffer finished. `status` is an `RGFX_CB_*`, and
@@ -3407,6 +3449,7 @@ const _: () = {
     assert!(size_of::<RgfxLibraryLookup>() == 64);
     assert!(size_of::<RgfxBufferDidModifyRange>() == 40);
     assert!(size_of::<RgfxManagedTextureCreate>() == 112);
+    assert!(size_of::<RgfxManagedBufferCreate>() == 56);
     assert!(size_of::<RgfxTextureReplaceRegion>() == 56);
     assert!(size_of::<RgfxTextureView>() == 72);
     assert!(size_of::<RgfxHeapTextureSizeAndAlign>() == 72);

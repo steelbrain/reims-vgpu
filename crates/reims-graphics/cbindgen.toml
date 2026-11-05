@@ -157,6 +157,7 @@ include = [
     "RgfxLibraryLookup",
     "RgfxLinearTextureFromBuffer",
     "RgfxLinkedFunction",
+    "RgfxManagedBufferCreate",
     "RgfxManagedTextureCreate",
     "RgfxModeEntry",
     "RgfxMoveCursor",

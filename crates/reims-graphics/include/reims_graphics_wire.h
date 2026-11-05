@@ -892,8 +892,9 @@
 // [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 // [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 // [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
-// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`] and
-// [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are reserved.
+// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`],
+// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
+// reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -1032,6 +1033,14 @@
 // buffer's span, which holds the copy only where the buffer lies over its own block. Every host
 // offers it.
 #define RGFX_FEATURE_MANAGED_TEXTURE_SLABS (1 << 21)
+
+// `FEATURES_LO` bit 22, `MANAGED_BUFFER_SLABS`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_MANAGED_BUFFER_CREATE`], a `Managed`
+// buffer whose CPU copy is any `Shared` buffer over the guest's memory the sender holds, read
+// and written where that buffer's contents lie, as [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`] reads a
+// texture's. So the guest lays its `Managed` buffers' CPU copies in its Shared buffers' slabs,
+// its own pages among them, on every host, and not in the region. Every host offers it.
+#define RGFX_FEATURE_MANAGED_BUFFER_SLABS (1 << 22)
 
 // `FEATURES_LO` bit 24, `DISPLAY_COLOR`, which the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_DISPLAY_COLOR`], the colour stages a
@@ -1457,6 +1466,12 @@
 // refuses. Ring 0 is carried out before any command buffer the process posts after it, as
 // `ICB_WRITE` is. Not answered.
 #define RGFX_CMD_ICB_SLOTS 556
+
+// Command `MANAGED_BUFFER_CREATE` ([`RgfxManagedBufferCreate`]), where the guest took
+// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`]: a `Managed` buffer at the guest's address whose CPU copy
+// is the first bytes of a `Shared` buffer over the guest's memory the sender holds. A host
+// without the feature refuses the message as one it does not know. Not answered.
+#define RGFX_CMD_MANAGED_BUFFER_CREATE 557
 
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
@@ -4170,6 +4185,31 @@ typedef struct {
   // The `specializedName`'s length in bytes; 0 for none.
   uint32_t specialized_name_len;
 } RgfxLinkedFunction;
+
+// `MANAGED_BUFFER_CREATE`: a `Managed` buffer of `length` bytes at the guest-picked
+// `gpu_address`, its CPU copy the first `length` bytes of the `Shared` buffer
+// `cpu_buffer_obj_id`, which lies over the guest's memory: over a block of the sender's
+// (`BUFFER_OVER_HOST_MEMORY`), placed in a heap over one or over a pages block's guest RAM
+// (`BUFFER_AT_OFFSET`), or over a pages block's view (`BUFFER_OVER_PAGES`). The host's GPU copy,
+// where it keeps one, starts as the CPU copy's bytes; `BUFFER_DID_MODIFY_RANGE` and a
+// synchronize copy between the two as for a [`RgfxBufferOverHostMemory`] of a `Managed` buffer.
+// The buffer lies over what its CPU copy lies over, and keeps the copy's memory while it lives.
+typedef struct {
+  // [`RGFX_CMD_MANAGED_BUFFER_CREATE`].
+  RgfxMsgHeader header;
+  // The new buffer's guest-picked id.
+  uint64_t obj_id;
+  // The buffer's guest-picked GPU address.
+  uint64_t gpu_address;
+  // The `Shared` buffer whose first `length` bytes are the CPU copy.
+  uint64_t cpu_buffer_obj_id;
+  // The buffer's length in bytes.
+  uint64_t length;
+  // `MTLResourceOptions` of the `Managed` buffer: storage mode, cache mode, hazard tracking.
+  uint32_t options;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_34;
+} RgfxManagedBufferCreate;
 
 // `MANAGED_TEXTURE_CREATE`: a `Managed` texture of shape `desc` at the guest-picked
 // `gpu_address`, with the guest-picked `resource_id`, whose CPU copy is the Shared buffer
