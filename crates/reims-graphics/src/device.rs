@@ -16,7 +16,9 @@
 //! host's decoder ([`Host::stage3_message`]), so one context's slow message holds up only its own
 //! later ones. `reims-vgpu.graphics-presents` carries the `PRESENT_SURFACE`s out, in ring order,
 //! and `reims-vgpu.graphics-block-*` a block's `SURFACE_PAGES` and `SURFACE_DOWNLOAD`s, whichever
-//! process posted them.
+//! process posted them, but for a download the host carries out on the control thread, where the
+//! block's lane has nothing left and the host need wait for nothing
+//! ([`Host::try_surface_download`]).
 //! The replies (a pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
 //! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
 //! single consumer, and their `consumer_idle` handshakes never race.
@@ -398,6 +400,26 @@ pub trait Host: Send + Sync + 'static {
     fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
         let _ = block_offset;
         answer.answer(RGFX_STATUS_OK);
+    }
+
+    /// [`Host::surface_download`], offered on the control thread where the block's lane has
+    /// nothing left to carry out, so the download keeps its place after the block's
+    /// `SURFACE_PAGES`: the host carries it out here, giving `answer` as `surface_download`
+    /// does, where it can without waiting (every lock it needs is tried, and it commits no copy
+    /// now: nothing to copy, or a copy already on its way), and gives `answer` back, having done
+    /// nothing, otherwise. The device then hands the download to the block's lane, so ring 0 goes
+    /// on meanwhile. A lock's download of a surface the host already copied is so answered with
+    /// no lane thread woken between. The default carries out none.
+    ///
+    /// # Errors
+    /// `answer`, untouched, where the host leaves the download to the block's lane.
+    fn try_surface_download(
+        &self,
+        block_offset: u64,
+        answer: CompleteAnswer,
+    ) -> Result<(), CompleteAnswer> {
+        let _ = block_offset;
+        Err(answer)
     }
 
     /// Hands a stage-3 message to the host's decoder: from ring 0, on its context's lane, an
@@ -1242,7 +1264,9 @@ impl Shared {
                         // which answers them; the rest is carried out here.
                         let answer = match Key::of(&message) {
                             Some(key) => {
-                                self.hand(key, message, through, epoch);
+                                if let Some(message) = self.download_here(key, message, epoch) {
+                                    self.hand(key, message, through, epoch);
+                                }
                                 None
                             }
                             None => control::unheld(self, &message, epoch),
@@ -1303,6 +1327,29 @@ impl Shared {
     /// taken by the control thread, and carried out by it or by the context's lane.
     fn carried_out(&self, context: u32, through: u64) -> bool {
         self.control_done.load(Ordering::Acquire) >= through && self.lanes.through(context, through)
+    }
+
+    /// A `SURFACE_DOWNLOAD` for the lane `key` of a block with nothing left to carry out on it,
+    /// taken at reset count `epoch`, offered to the host here, on the control thread
+    /// ([`Host::try_surface_download`]): `None` where the host carried it out, else `message`
+    /// back, for the lane. The control thread alone hands the block's lane its jobs, so it stays
+    /// with none until this returns, and every message of the block's before the download is
+    /// carried out, as on the lane; nothing waits on the lanes for a download.
+    fn download_here(&self, key: Key, message: Message, epoch: u64) -> Option<Message> {
+        if message.header.r#type != RGFX_CMD_SURFACE_DOWNLOAD || !self.lanes.lane_idle(key) {
+            return Some(message);
+        }
+        let Ok((download, _)) = RgfxSurfaceDownload::read_from_prefix(&message.bytes) else {
+            return Some(message);
+        };
+        let answer = self.complete_answer(message.header.seqno, epoch);
+        match self
+            .host
+            .try_surface_download(download.block_offset, answer)
+        {
+            Ok(()) => None,
+            Err(_) => Some(message),
+        }
     }
 
     /// Hands `message`, taken at reset count `epoch`, ring 0's count through it `through`, to the

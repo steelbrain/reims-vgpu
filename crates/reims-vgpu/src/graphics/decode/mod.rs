@@ -1403,6 +1403,24 @@ impl<P: Platform> GraphicsDecoder<P> {
         (self.surface_caches).download(device, block, region, done, failed);
     }
 
+    /// [`Self::surface_download`] where it waits for nothing and commits no copy now
+    /// ([`surface_cache::Caches::try_download`]): the block's `SURFACE_PAGES` settled, and the
+    /// caches' lock free. Whether it was carried out; where not, `done` and `failed` are dropped
+    /// ungiven, for the download to be asked again on the block's lane.
+    pub(crate) fn try_surface_download(
+        &self,
+        device: &P::Device,
+        block: u64,
+        done: Box<dyn FnOnce() + Send>,
+        failed: Box<dyn FnOnce(Raise) + Send>,
+    ) -> bool {
+        if self.shared.unsettled.any(std::iter::once(block)) {
+            return false;
+        }
+        let region = Arc::clone(&self.shared.region);
+        (self.surface_caches).try_download(device, block, region, done, failed)
+    }
+
     /// The block at `offset` was released: its surface view, if any, goes once the buffers over
     /// it have, and its device cache once the pages hold what a command buffer wrote of it, where
     /// its surface had a client left or not (`unread`,

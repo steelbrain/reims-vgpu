@@ -9,7 +9,11 @@
 //! colour, to the presents' lane. A lane carries its jobs out one at a time, in the order they
 //! were handed, on a thread made as a job comes to a lane with none, which goes once the lane has
 //! had no job for [`IDLE`]. The control thread carries the rest out itself: the display commands,
-//! and a message no lane is for, which the host refuses.
+//! and a message no lane is for, which the host refuses. It first offers the host a
+//! `SURFACE_DOWNLOAD` of a block whose lane has nothing left to carry out, which the host carries
+//! out there where it need wait for nothing (`Host::try_surface_download`): the download keeps its
+//! place behind the block's earlier messages, all carried out, and the lane's thread is not woken
+//! for it. One the host leaves goes to the block's lane.
 //!
 //! A block's lane keeps the messages that make and copy what the host holds of the block's pages
 //! (its view and device cache) in ring order, whichever process posted them and for whichever
@@ -553,6 +557,12 @@ impl Lanes {
         // A job handed makes no other lane's job ready: each waits only for jobs handed before.
         wake.notify_one();
         start
+    }
+
+    /// Whether the lane `key` has no job of the current reset count not yet carried out: none
+    /// handed and not begun, and none running.
+    pub(super) fn lane_idle(&self, key: Key) -> bool {
+        self.state.lock().busy_through(key).is_none()
     }
 
     /// The lane `key` has no thread after all: its jobs are carried out by whoever calls

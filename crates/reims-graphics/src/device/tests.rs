@@ -3143,6 +3143,11 @@ struct OrderSeen {
     pages: Arc<AtomicBool>,
     named: Arc<Mutex<Vec<u64>>>,
     region: Arc<OnceLock<Arc<Region>>>,
+    /// While set, the host carries a download out where the control thread offers it
+    /// ([`Host::try_surface_download`]); else it leaves each to the block's lane.
+    here: Arc<AtomicBool>,
+    /// The thread each download was carried out on, in order.
+    downloaded_on: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl OrderSeen {
@@ -3161,6 +3166,8 @@ impl OrderSeen {
             pages: Arc::clone(&self.pages),
             named: Arc::clone(&self.named),
             region: Arc::clone(&self.region),
+            here: Arc::clone(&self.here),
+            downloaded_on: Arc::clone(&self.downloaded_on),
         };
         let rig = Rig::with_host(Box::new(host));
         let _ = self.region.set(Arc::clone(&rig.device.shared.region));
@@ -3249,6 +3256,8 @@ struct OrderHost {
     pages: Arc<AtomicBool>,
     named: Arc<Mutex<Vec<u64>>>,
     region: Arc<OnceLock<Arc<Region>>>,
+    here: Arc<AtomicBool>,
+    downloaded_on: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 /// What an [`OrderHost`] records as a held `BUFFER_CREATE` ends.
@@ -3293,7 +3302,20 @@ impl Host for OrderHost {
     }
     fn surface_download(&self, _block_offset: u64, answer: CompleteAnswer) {
         self.record(RGFX_CMD_SURFACE_DOWNLOAD);
+        let thread = std::thread::current().name().map(str::to_owned);
+        self.downloaded_on.lock().push(thread);
         answer.answer(RGFX_STATUS_OK);
+    }
+    fn try_surface_download(
+        &self,
+        block_offset: u64,
+        answer: CompleteAnswer,
+    ) -> Result<(), CompleteAnswer> {
+        if !self.here.load(Ordering::SeqCst) {
+            return Err(answer);
+        }
+        self.surface_download(block_offset, answer);
+        Ok(())
     }
     fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
         self.record(RGFX_CMD_PRESENT_SURFACE);
@@ -3848,6 +3870,88 @@ fn a_closed_maker_s_pages_then_a_download_go_in_order_past_its_held_lane() {
     seen.release();
     assert_eq!(rig.complete(), (close, RGFX_STATUS_OK));
     assert_eq!(seen.count(RGFX_CMD_CONTEXT_CLOSE), 1);
+}
+
+/// Waits about 2 s for the lane of the block at `block` to have nothing left to carry out: a
+/// message answered inside the host's call is still running there until the call returns.
+fn wait_block_lane_idle(rig: &Rig, block: u64) {
+    for _ in 0..2000 {
+        if rig.device.shared.lanes.lane_idle(Key::Block(block)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the block's lane did not go idle");
+}
+
+/// A download of a block whose lane has nothing left to carry out is offered to the host on the
+/// control thread, which carries it out there where the host takes it, and on the block's lane
+/// where the host leaves it
+#[test]
+fn a_download_of_a_block_whose_lane_is_idle_is_carried_out_on_the_control_thread() {
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let seen = OrderSeen::new();
+    seen.here.store(true, Ordering::SeqCst);
+    let mut rig = seen.rig();
+    let pages = rig.send(surface_pages_message(5, BLOCK, RGFX_SURFACE_PAGES_CACHED));
+    assert_eq!(rig.complete(), (pages, RGFX_STATUS_OK));
+    wait_block_lane_idle(&rig, BLOCK);
+    let download = rig.send(download_message(BLOCK));
+    assert_eq!(rig.complete(), (download, RGFX_STATUS_OK));
+    seen.here.store(false, Ordering::SeqCst);
+    let download = rig.send(download_message(BLOCK));
+    assert_eq!(rig.complete(), (download, RGFX_STATUS_OK));
+    assert_eq!(
+        *seen.downloaded_on.lock(),
+        [
+            Some("reims-vgpu.graphics-control".to_owned()),
+            Some(Key::Block(BLOCK).thread_name())
+        ]
+    );
+}
+
+/// A download of a block whose lane is still carrying out the block's `SURFACE_PAGES` goes to
+/// the lane, behind them, though the host would carry it out on the control thread; a download
+/// of another block, whose lane is idle, is carried out there meanwhile
+#[test]
+fn a_download_behind_its_block_s_pages_on_the_lane_is_carried_out_after_them_there() {
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const OTHER: u64 = BLOCK + 0x10_0000;
+    let seen = OrderSeen::new();
+    seen.here.store(true, Ordering::SeqCst);
+    let mut rig = seen.rig();
+    let pages = seen.hold_pages(&mut rig, 5, BLOCK);
+    let behind = rig.send(download_message(BLOCK));
+    let other = rig.send(download_message(OTHER));
+    seen.wait_for(RGFX_CMD_SURFACE_DOWNLOAD, 1);
+    settle();
+    assert_eq!(
+        seen.types(),
+        [RGFX_CMD_SURFACE_PAGES, RGFX_CMD_SURFACE_DOWNLOAD],
+        "the other block's download alone"
+    );
+    seen.release_pages();
+    let answers = [rig.complete(), rig.complete(), rig.complete()];
+    let mut answered: Vec<u64> = answers.iter().map(|&(seqno, _)| seqno).collect();
+    answered.sort_unstable();
+    assert_eq!(answered, [pages, behind, other]);
+    assert!(answers.iter().all(|&(_, status)| status == RGFX_STATUS_OK));
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_SURFACE_DOWNLOAD,
+            RGFX_CMD_SURFACE_DOWNLOAD
+        ]
+    );
+    assert_eq!(
+        *seen.downloaded_on.lock(),
+        [
+            Some("reims-vgpu.graphics-control".to_owned()),
+            Some(Key::Block(BLOCK).thread_name())
+        ],
+        "the other block's on the control thread, then this block's on its lane"
+    );
 }
 
 /// Each message that reads what a block's lane makes of the block waits for the lane through its

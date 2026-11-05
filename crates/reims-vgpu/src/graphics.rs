@@ -66,7 +66,7 @@ use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::Texture;
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig};
 use zerocopy::{FromBytes, IntoBytes};
@@ -1003,29 +1003,30 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// still walked that may write it have finished, on the last one's thread: the block's lane
     /// goes on.
     fn download_surface(&self, block: u64, answer: CompleteAnswer) {
-        let answer = Arc::new(Mutex::new(Some(answer)));
-        let (give, refuse) = (Arc::clone(&answer), answer);
+        let (answer, done, failed) = download_answers(block, answer);
         entry::run(|_| {
-            self.decoder().surface_download(
-                &self.device,
-                block,
-                Box::new(move || {
-                    if let Some(answer) = give.lock().take() {
-                        answer.answer(RGFX_STATUS_OK);
-                    }
-                }),
-                Box::new(move |raise| {
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "the block at {block:#x}: the platform raised at its device cache's \
-                         download ({raise:?})"
-                    );
-                    if let Some(answer) = refuse.lock().take() {
-                        answer.answer(RGFX_STATUS_REFUSED);
-                    }
-                }),
-            );
+            (self.decoder()).surface_download(&self.device, block, done, failed);
         });
+        drop(answer);
+    }
+
+    /// [`Self::download_surface`], on the control thread, where the block's lane has nothing
+    /// left ([`Host::try_surface_download`]): carried out here where it waits for nothing
+    /// ([`GraphicsDecoder::try_surface_download`]), else `answer` back, for the lane.
+    fn try_download_surface(
+        &self,
+        block: u64,
+        answer: CompleteAnswer,
+    ) -> Result<(), CompleteAnswer> {
+        let (answer, done, failed) = download_answers(block, answer);
+        let taken = entry::run(|_| {
+            (self.decoder()).try_surface_download(&self.device, block, done, failed)
+        });
+        if taken {
+            return Ok(());
+        }
+        // Untouched where left: the answers were dropped ungiven.
+        answer.lock().take().map_or(Ok(()), Err)
     }
 
     /// Carries out one stage-3 message under a library entry: from ring 0 an object-lifecycle create
@@ -1943,6 +1944,14 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.control.download_surface(block_offset, answer);
     }
 
+    fn try_surface_download(
+        &self,
+        block_offset: u64,
+        answer: CompleteAnswer,
+    ) -> Result<(), CompleteAnswer> {
+        self.control.try_download_surface(block_offset, answer)
+    }
+
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         self.control
             .handle_stage3(completion, Cow::Borrowed(message));
@@ -2201,6 +2210,38 @@ fn scanout_sink<P: ApiPlatform>(
 
 #[cfg(test)]
 mod tests;
+
+/// A download's answer, kept until one of its two ends gives it, and the two: OK once the pages
+/// hold the block at `block`'s cache, or refused where the platform raised at the copy, logged.
+/// Neither given, the answer is still in the first.
+#[allow(clippy::type_complexity)] // the answer and its two ends
+fn download_answers(
+    block: u64,
+    answer: CompleteAnswer,
+) -> (
+    Arc<Mutex<Option<CompleteAnswer>>>,
+    Box<dyn FnOnce() + Send>,
+    Box<dyn FnOnce(Raise) + Send>,
+) {
+    let answer = Arc::new(Mutex::new(Some(answer)));
+    let (give, refuse) = (Arc::clone(&answer), Arc::clone(&answer));
+    let done: Box<dyn FnOnce() + Send> = Box::new(move || {
+        if let Some(answer) = give.lock().take() {
+            answer.answer(RGFX_STATUS_OK);
+        }
+    });
+    let failed: Box<dyn FnOnce(Raise) + Send> = Box::new(move |raise| {
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "the block at {block:#x}: the platform raised at its device cache's download \
+             ({raise:?})"
+        );
+        if let Some(answer) = refuse.lock().take() {
+            answer.answer(RGFX_STATUS_REFUSED);
+        }
+    });
+    (answer, done, failed)
+}
 
 /// The context (the process) `message` came from: for a message off a queue's ring, the queue's;
 /// on ring 0, that of the object it creates or destroys, which the kext checked is the sender's.

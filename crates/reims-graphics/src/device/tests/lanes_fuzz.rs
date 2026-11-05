@@ -105,6 +105,19 @@ impl Host for FuzzHost {
         self.carry_out(answer.seqno, |_| {});
         answer.answer(RGFX_STATUS_OK);
     }
+    /// A download the host takes no while over is carried out where the control thread offers
+    /// it; one it takes a while over (a copy to commit) is left to the block's lane.
+    fn try_surface_download(
+        &self,
+        block_offset: u64,
+        answer: CompleteAnswer,
+    ) -> Result<(), CompleteAnswer> {
+        if self.slow.contains_key(&answer.seqno) {
+            return Err(answer);
+        }
+        self.surface_download(block_offset, answer);
+        Ok(())
+    }
     fn present_surface(&self, iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
         let mut shown = iosurface_id == 0;
         self.carry_out(answer.seqno, |seen| {

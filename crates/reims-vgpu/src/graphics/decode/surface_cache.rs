@@ -1022,6 +1022,18 @@ impl<P: Platform> SurfaceCaches<P> {
         self.deferred.contains_key(&block)
     }
 
+    /// Whether a download of the block at `block` asked now would commit its copy at once
+    /// ([`Self::download`]): no command buffer begun and not finished may write its cache, no
+    /// copy out of it waits for one, and one wrote it since its last copy. A download that
+    /// would then copy nothing all the same (the pages a device of the host's wrote, or the
+    /// CPU's generation past the cache's) is counted as one that copies.
+    fn copies_now(&self, block: u64) -> bool {
+        if self.pending(block, true) > 0 || self.deferring(block) {
+            return false;
+        }
+        self.by_block.get(&block).is_some_and(|cache| cache.written)
+    }
+
     /// Runs `op` on the caches once every command buffer begun and not finished that may write
     /// the block at `block`'s cache has finished, and after the copies out of it deferred before
     /// it: at once where none is, else in the finish of the last of them
@@ -1530,8 +1542,9 @@ impl<P: Platform> SurfaceCaches<P> {
 ///   of the cache waits for a fill waiting so, so fills are not held off for good.
 /// - **A copy out of a cache** (a download, a release, the block's pages named again) waits for
 ///   every one of them that may write it. A download and a release, which ring 0 asks for (a
-///   download on its block's lane, a release on its context's lane) and are answered when
-///   their copy is done, do not wait there: each is made in the
+///   download on its block's lane, or on the control thread where it commits no copy then,
+///   [`Caches::try_download`]; a release on its context's lane) and are answered when their copy
+///   is done, do not wait there: each is made in the
 ///   finish of the last buffer that may write the cache begun before it was asked
 ///   ([`Caches::after_writers`]), in the order they were asked, and a command buffer begun after
 ///   it waits at its begin until it is made. The block's pages named again, which the buffers
@@ -1878,16 +1891,33 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        let device = device.clone_ref();
-        self.after_writers(
-            block,
-            Box::new(move |state| {
-                let cpu = cpu_generation(&region, block);
-                if let Err(raise) = refusing(|| state.download(&device, block, cpu, done)) {
-                    failed(raise);
-                }
-            }),
-        );
+        self.after_writers(block, download_op(device, block, region, done, failed));
+    }
+
+    /// [`Self::download`] where it waits for no lock and commits no copy now: the caches' lock
+    /// is tried, and the download asked only where it copies nothing at once
+    /// ([`SurfaceCaches::copies_now`]): its cache nothing wrote since its last copy (an early
+    /// copy, landed or not, holds the write), or a command buffer still walked may write it, in
+    /// whose finish it is made. Whether it was asked; where not, `done` and `failed` are dropped
+    /// ungiven.
+    pub(crate) fn try_download(
+        &self,
+        device: &P::Device,
+        block: u64,
+        region: Arc<Region>,
+        done: Box<dyn FnOnce() + Send>,
+        failed: Box<dyn FnOnce(Raise) + Send>,
+    ) -> bool {
+        let Some(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        if state.copies_now(block) {
+            return false;
+        }
+        state.after_writers(block, download_op(device, block, region, done, failed));
+        drop(state);
+        self.moved.notify_all();
+        true
     }
 
     /// The block at `block` went, its `BLOCK_RELEASE` ([`SurfaceCaches::released`]), after every
@@ -2038,6 +2068,25 @@ impl<P: Platform> Caches<P> {
             .map(|copy| Arc::clone(&copy.landing));
         landing.is_none_or(|landing| landing.wait(timeout))
     }
+}
+
+/// A `SURFACE_DOWNLOAD` of the block at `block` as a copy out of its cache
+/// ([`SurfaceCaches::download`]), reading the CPU's generation in the block's header in `region`
+/// as it is made: `done` once the pages hold the cache, or `failed` where the platform raised.
+fn download_op<P: Platform>(
+    device: &P::Device,
+    block: u64,
+    region: Arc<Region>,
+    done: Box<dyn FnOnce() + Send>,
+    failed: Box<dyn FnOnce(Raise) + Send>,
+) -> CopyOut<P> {
+    let device = device.clone_ref();
+    Box::new(move |state| {
+        let cpu = cpu_generation(&region, block);
+        if let Err(raise) = refusing(|| state.download(&device, block, cpu, done)) {
+            failed(raise);
+        }
+    })
 }
 
 /// Makes `cb` wait for the latest command buffer of each queue that used `cache`.
@@ -4317,5 +4366,101 @@ mod tests {
         assert_eq!(r.dec.caches().len(), 0);
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(released.load(Ordering::SeqCst));
+    }
+
+    /// `SURFACE_DOWNLOAD` of the block at `block` where it waits for nothing and commits no
+    /// copy now ([`GraphicsDecoder::try_surface_download`]): whether it was asked, and whether it
+    /// was answered.
+    fn try_download(r: &Rig, block: u64) -> (bool, Arc<AtomicBool>) {
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        let asked = r.dec.try_surface_download(
+            &r.device,
+            block,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            no_raise(),
+        );
+        (asked, done)
+    }
+
+    /// A download that commits no copy as it is asked is carried out where it is offered (the
+    /// control thread): one of a cache nothing wrote since its last copy is answered at once,
+    /// one whose early copy is in flight as that lands, and one whose writer is still walked in
+    /// that writer's finish, which copies. One that would copy now, or that finds the caches'
+    /// lock held, is left, unanswered and copying nothing, for the block's lane
+    #[test]
+    fn a_download_that_copies_nothing_now_is_carried_out_where_it_is_offered() {
+        let mut r = cached();
+        let cache = cache_id(&r);
+        let queue = r.device.new_command_queue().unwrap();
+        let (asked, done) = try_download(&r, BLOCK);
+        assert!(asked && done.load(Ordering::SeqCst), "nothing written");
+
+        // A lock after a decode reads it back: the next decode is copied out behind it.
+        let (_, copied) = decode_then_lock(&r, 7, &queue);
+        assert_eq!(copied.len(), 1);
+        decode_into(&r, 7, &queue);
+        r.p.world().complete_all(CompleteOn::Caller);
+        // The early copy behind that decode landed: answered at once, copying nothing.
+        let mark = r.p.call_log().mark();
+        let (asked, done) = try_download(&r, BLOCK);
+        assert!(
+            asked && done.load(Ordering::SeqCst),
+            "the early copy landed"
+        );
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        // One in flight: answered as it lands.
+        decode_into(&r, 7, &queue);
+        let (asked, done) = try_download(&r, BLOCK);
+        assert!(
+            asked && !done.load(Ordering::SeqCst),
+            "the early copy is in flight"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        // A writer with no video encoder, finished: the download would copy now.
+        use_surfaces(&mut r, 2, 0x200, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let (asked, done) = try_download(&r, BLOCK);
+        assert!(!asked && !done.load(Ordering::SeqCst), "left for the lane");
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        // With the caches' lock held elsewhere, left too: a try never waits for it.
+        {
+            let held = r.dec.surface_caches.lock();
+            let (asked, _) = try_download(&r, BLOCK);
+            assert!(!asked, "the lock is held");
+            drop(held);
+        }
+        let done = download(&r, BLOCK);
+        assert_eq!(copies(&r.p.call_log().since(mark)), [(cache, copied[0].1)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        // A writer begun and not finished: asked, and copied in its finish.
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let caches = &r.dec.surface_caches;
+        let (used, _, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        let mark = r.p.call_log().mark();
+        let (asked, done) = try_download(&r, BLOCK);
+        assert!(asked, "made in the writer's finish");
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), &used, || {
+            cb.commit(ON)
+        }))
+        .unwrap();
+        assert_eq!(
+            copies(&r.p.call_log().since(mark)).len(),
+            1,
+            "in its finish"
+        );
+        assert!(!done.load(Ordering::SeqCst));
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
     }
 }
