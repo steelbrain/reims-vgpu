@@ -130,7 +130,7 @@ boot)
   rc=$?
   for f in boot.log guest.log cpu.txt thermal.txt host-events.log host.txt host-video.tsv gpuload.log gpu-clocks.txt serial.log desktop.png drag.txt drag.log xid.txt \
     capture.txt kext-stalls.txt appload.txt appload.log kwin-reaper.txt \
-    kernel-rgfx.log drag-resize-track.txt; do
+    kernel-rgfx.log drag-resize-track.txt launch.log.gz; do
     [[ ! -e $out/$f ]] || cp -a "$out/$f" "$OUT/$mode/"
   done
   echo "$rc" > "$OUT/$mode/rc"

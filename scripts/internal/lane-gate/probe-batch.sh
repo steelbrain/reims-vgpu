@@ -257,7 +257,9 @@ commit=$(cd "$L" && bash "$L/ship-commit.sh" "$S" "$(git -C "$L" rev-parse HEAD)
   ":construction: WIP lane-gate probe round $ROUND (throwaway)")
 rm -rf "$S"
 echo "probe-batch: round $ROUND from $commit on $branch"
-out=$(cd "$wt" && potluck dispatch --json --timeout "$(( (HOLD_S + 1800) / 60 ))m" --ram "$ram" --exclusive --gpu "${POTLUCK_MSI_GPU:-5080}" \
+# The job's limit: the hold and the boot's own time, and 40 minutes more for --after.
+tmo=$(( (HOLD_S + 1800) / 60 + ${after:+40} + 0 ))
+out=$(cd "$wt" && potluck dispatch --json --timeout "${tmo}m" --ram "$ram" --exclusive --gpu "${POTLUCK_MSI_GPU:-5080}" \
   --on "node=${POTLUCK_MSI_NODE:-msi-laptop}" --label lane-gate=round -- bash lg/bin/msi-round.sh) ||
   { echo "probe-batch: potluck dispatch: $out" >&2; exit 1; }
 job=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["job"])' <<< "$out")
