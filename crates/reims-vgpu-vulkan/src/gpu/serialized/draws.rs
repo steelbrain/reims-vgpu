@@ -338,6 +338,10 @@ const RED_ALPHA: &[(u8, u32)] = &[(9, 9)];
 /// two clip distances; `depthStencilWriteDisabled` without a depth attachment; and each
 /// default written. Each value that dies draws otherwise on Metal than without it
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-denormals, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn spi_values_that_decode_draw_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;

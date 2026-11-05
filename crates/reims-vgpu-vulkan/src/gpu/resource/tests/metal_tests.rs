@@ -2862,6 +2862,10 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
 /// its queue let go of it ([`let_go`]). Metal's side runs every case first, before this
 /// platform makes anything in the process
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-denormals, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn a_command_buffer_holds_a_surface_as_metals_does() {
     let ycbcr = [(505, *b"x420"), (543, *b"x420"), (540, *b"420v")];
     let named = [
