@@ -36,12 +36,12 @@ pub struct NativeRelay {
 
 /// The kinds of [`DIES`](super::DIES) a native device relays, each with its ground.
 ///
-/// The first seven are relayed on the rule for native devices: as close to the Mac GPUs as the
+/// The first eight are relayed on the rule for native devices: as close to the Mac GPUs as the
 /// hardware allows; a difference the hardware itself forces is logged as a typed
 /// degradation, relayed once per kind and counted, with no interpreter-level fallback for
 /// differences in the tenth decimal. Each is here on a fact of the device that its ground states:
-/// the device's own interpolation, level arithmetic, reduction order, float
-/// controls, evaluation position, reconvergence or memory granularity. The rest are the device's
+/// the device's own interpolation, level arithmetic, reduction order, float controls, evaluation
+/// position, reconvergence, memory granularity or line rasterizer's tie. The rest are the device's
 /// maths and sampling, as a class of their own (below). "Not built", "not measured" and "a
 /// guest or a suite case reaches it" are no grounds: a kind neither covers, whose exact form the
 /// hardware allows or whose rule on Metal is not read, dies here as on MoltenVK, at the same op
@@ -60,19 +60,27 @@ pub struct NativeRelay {
 /// gpuAddresses than on Metal. It never differs in texels, nor in the range of Metal's space a
 /// texture of its own memory takes.
 ///
-/// Of those seven, the last four are the precision notes of a pipeline's stage whose arithmetic
-/// or ordering can give other bits than Metal's, as the runtime's documentation of each says: a
-/// note whose difference is the device's rounding, evaluation position or reduction order, or the
-/// lanes its driver runs together after divergence, is logged, not a death.
+/// Of those eight, the four after `HeapTextureLargerThanMetal` are the precision notes of a
+/// pipeline's stage whose arithmetic or ordering can give other bits than Metal's, as the
+/// runtime's documentation of each says: a note whose difference is the device's rounding,
+/// evaluation position or reduction order, or the lanes its driver runs together after
+/// divergence, is logged, not a death. The eighth, `DeviceLineTies`, is the pixel the device's
+/// line rasterizer covers where a width-1 line runs through a vertex two pixels' diamonds share,
+/// which Vulkan leaves to the driver with no control over it: it differs in which pixels a line
+/// covers, never in control flow, memory addresses or numbering, and its only exact form is
+/// Metal's line rule run in the fragment function, an interpreter's, as a depth test run there
+/// is for `DepthDenormals`.
 ///
 /// The rest are relayed as the class of the device's own maths and sampling: on a GPU that is not
 /// Apple's, the device's maths and sampling are the default, their bounds recorded and announced,
 /// and Metal's exact form is opt-in, which the runtime builds. Each is the device's arithmetic, its
 /// maths or its sampling and filtering, and its ground states its bound where one is measured,
 /// else that the runtime records it: `F16FmaDoubleRounding` and `F16IntConvDoubleRounding`,
-/// `DeviceArithmetic` and `DeviceDenormals` (maths); `FloatSampleFilter`, `HalfSampleFilter`,
-/// `CubeGradientFootprint`, `CompressedTexelDecode`, `ViewBaseTexelOffset`, `SrgbTexelDecode`,
-/// `BicubicFilterArithmetic`, `HalfTexelConversion` and `DeviceSampleLevel` (sampling). Then the
+/// `DeviceArithmetic`, `DeviceDenormals` and `DeviceNanEncoding` (maths, the last a NaN's bits,
+/// whose native form the runtime takes and builds no exact form beside); `FloatSampleFilter`,
+/// `HalfSampleFilter`, `CubeGradientFootprint`, `CompressedTexelDecode`, `ViewBaseTexelOffset`,
+/// `SrgbTexelDecode`, `BicubicFilterArithmetic`, `HalfTexelConversion` and `DeviceSampleLevel`
+/// (sampling). Then the
 /// notes of the device's own answers off Apple's GPUs, which the runtime gives in place of Metal's,
 /// each with the bound the runtime records: `NativeTranscendentals`, `NativeDivision`, `NativeFma`,
 /// `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`, `NativeHalfConversion` and
@@ -84,13 +92,18 @@ pub struct NativeRelay {
 /// Apple GPU, where each still dies.
 ///
 /// These die here, as on MoltenVK, as no class covers them: blending, storage, tessellation,
-/// depth, layout, a pass's tile store and when a command buffer is seen complete are neither
-/// maths nor sampling.
+/// depth, layout, the band's rasterization, a pass's tile store and when a command buffer is seen
+/// complete are neither maths nor sampling.
 /// - those whose exact form the hardware allows, built or not: `BlendedWriteRounding` (a blended
 ///   float write to a half-float channel under `textureWriteRoundingMode` 2, whose exact form is
 ///   the blend in the function under the pixel interlock) and `RotatedBlendRounding` (a blend
 ///   into an `ARGB8Unorm` attachment in none of the forms measured to blend as Metal's, whose
-///   exact form is a measured one or the blend in the function);
+///   exact form is a measured one or the blend in the function), and `DeviceSubpixelSnap` (the
+///   band's corners, which the device's rasterizer snaps where Metal snaps a line's endpoints
+///   first, not a fact of the device: the band is the runtime's own, and its endpoints snapped to
+///   Metal's grid before it offsets them leave the rasterizer nothing to round, as the band's
+///   depth bias, `WideEdgeDepthBias`, and the device's own wide lines, `DeviceWideLines`, die
+///   here too);
 /// - `AnisotropicFilter`, Metal's anisotropic filter emulated by the device's samples at
 ///   explicit levels: its level and its tap spacing past two taps
 ///   are a model fitted to Metal's answers, not Metal's rule, and each tap is the device's own
@@ -114,7 +127,7 @@ pub struct NativeRelay {
 /// - `AttachmentReadInPlace`, a draw's access to an attachment's memory inside its render pass
 ///   instance other than as an attachment, where the runtime serves no copy or snapshot: its
 ///   exact form, the copy or snapshot a sampled slot's binding reads, the hardware allows.
-pub const NATIVE_RELAYED: [NativeRelay; 36] = [
+pub const NATIVE_RELAYED: [NativeRelay; 38] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
         ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
@@ -183,6 +196,20 @@ pub const NATIVE_RELAYED: [NativeRelay; 36] = [
                  runtime records on every driver but MoltenVK",
     },
     NativeRelay {
+        kind: rt::Degradation::DeviceLineTies,
+        ground: "a draw of lines, or of a triangle's edges in fill mode `Lines`, by the device's \
+                 own lines at width 1, on a driver not measured to break Metal's tie (the \
+                 runtime's note, `DriverFact::LineTiesAreMetals`): a line through a vertex two \
+                 pixels' diamonds share exits neither diamond, and Vulkan's open diamond leaves \
+                 the pixel to the driver, with no control over it, where Metal covers the lower \
+                 one. Measured by the runtime: NVIDIA 615.71.09 on an RTX 5080 Laptop GPU covers \
+                 the other pixel (a strip's diagonal a row higher), and lavapipe (Mesa 26.2.4) \
+                 leaves out a strip's first pixel where it starts on such a vertex; RADV and ANV \
+                 are not measured. Only the line's rule run in the fragment function, an \
+                 interpreter's, is exact. Announced at every draw of lines at width 1 there, so \
+                 a strict run would die at its first",
+    },
+    NativeRelay {
         kind: rt::Degradation::F16FmaDoubleRounding,
         ground: "class (e), owner 2026-10-11: the device's maths. A simdgroup matrix's `half` \
                  multiply-add steps computed in `float` round twice where Metal rounds once, at \
@@ -206,6 +233,18 @@ pub const NATIVE_RELAYED: [NativeRelay; 36] = [
         ground: "class (e), owner 2026-10-11: the device's maths. An `f32` denormal the device \
                  keeps or flushes by its own float controls, where Metal reads it as the zero of \
                  its sign; the runtime records the device's bound",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DeviceNanEncoding,
+        ground: "class (e): the device's maths, for a NaN's bits. The NaN the device's \
+                 arithmetic, conversions, clears, copies and texel decodes give, its sign, \
+                 payload and quietness the device's, where Metal answers its canonical NaN, a \
+                 texel's own or a `half`'s own bits: a `half` colour output widened by the \
+                 device's `OpFConvert` stores every NaN as `0x7fff` on NVIDIA 615.71.09 (an RTX \
+                 5080 Laptop GPU, 8180 of 262144 channels of the runtime's lane, each a NaN) and \
+                 as `0xfe00` on ANV and RADV. Every value but a NaN is unchanged. The runtime \
+                 gives the device's NaN, its native form, and builds no path to Metal's bits \
+                 where the device has one (its rule)",
     },
     NativeRelay {
         kind: rt::Degradation::FloatSampleFilter,

@@ -6390,22 +6390,26 @@ pub(crate) mod tests {
     }
 
     /// The records of an indirect command buffer that the runtime refuses die naming the
-    /// execution, at the commit, where only the CPU wrote them. That holds where an encoder made
-    /// the buffer resident for writing, too: residency for writing writes nothing, and no command
-    /// of this command buffer can write the records (no function that encodes commands, no blit
-    /// into the buffer), so the GPU executes the CPU's records
+    /// execution: at the commit where only the CPU wrote them, and as the command buffer ends
+    /// where an encoder made the buffer resident for writing. The runtime holds that refusal for
+    /// the command buffer's host step, as a command buffer of another queue that this one waits
+    /// for through an event, encoded after the commit, may still write the records before the
+    /// work runs, and Metal runs what it wrote; the step records the work from the records as
+    /// they stand once the work before it completed, and fails the command buffer where they are
+    /// still refused, which dies at the execution's selector, as no handler of core's learns of it
     #[test]
     fn refused_icb_records_die_naming_the_execution() {
-        use reims_vgpu_core::raise::death::DeathKind;
+        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
+        use reims_vgpu_core::testkit::capture::expect_death;
 
-        for usage in [1, 3] {
-            let site = catch_death(|| execute_a_mismatched_draw(usage)).unwrap_err();
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, "commit"),
-                "usage {usage}"
-            );
-        }
+        let site = catch_death(|| execute_a_mismatched_draw(1)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
+        let site = DeathSite {
+            kind: DeathKind::Abort,
+            file: "executeCommandsInBuffer:withRange:",
+            line: 0,
+        };
+        expect_death(site, || execute_a_mismatched_draw(3));
     }
 
     /// The texels of a 4 by 4 BGRA8 target, cleared to black, after `setters` and then each of

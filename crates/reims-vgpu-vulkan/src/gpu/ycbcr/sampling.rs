@@ -63,8 +63,9 @@ fn ours_on(d: &VulkanDevice, format: u64, surface: &OsSurface, size: (u64, u64))
 }
 
 /// The device whose samples of the family the comparisons with Metal's read: the platform's
-/// own ([`dev`]). Its linear samples are Metal's own sampler's filter of the converted texels,
-/// within the bound [`the_default_filter_samples_within_its_bound_of_metals`] checks.
+/// own ([`dev`]). Its linear samples are Metal's filter exactly where the runtime reads the
+/// planes in place, and elsewhere Metal's own sampler's filter of the converted texels, within the
+/// bound [`the_default_filter_samples_within_its_bound_of_metals`] checks.
 fn exact() -> VulkanDevice {
     dev()
 }
@@ -975,32 +976,44 @@ fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
     }
 }
 
-/// Under the runtime's filter of a two-plane YCbCr texture on this host (MoltenVK, the
-/// platform's own device, [`dev`]), Metal's own sampler filters the texture's converted
-/// texels, which hold Metal's reads exactly, at Metal's weights but without the format's
-/// truncated sum on its grid. A linear sample of a texture of `YCBCR8_420_2P` (500) and of its
-/// `_sRGB` twin (520) over a '420v' surface, at positions a third of a texel apart from 0.9 of a
-/// texel before the texture to as far past it, lies within one step of the format's grid of
-/// Metal's into floats (1/2048 for 500, 1/8192 for 520), and within 1/2048 into halves, one
-/// `half` unit in the last place in [0.5, 1): the bound metal2vulkan states for MoltenVK (its
-/// `docs/FAST-PATHS.md`, the two-plane YCbCr row, at the pinned commit; at most 0.1245 codes of
-/// 1/255, measured on the M3 Max). Measured here: 500's floats a whole step apart at most (8926
-/// of 39312 differ), 520's half a step, and both formats' halves 0.1245 codes. Some of 500's
-/// samples differ from Metal's, so the default is what ran. Each dispatch
-/// that samples one announces `ycbcr-filter-not-exact` ([`crate::answer::DIES`]): in strict mode
-/// it dies there, at its selector, and by default it is relayed and counted, as is
-/// `half-texel-conversion` at a `half` sample of 520 through a runtime sampler, whose nearest
-/// texel on the grid of 1/8192 rounds to nearest even where Metal's rounds ties away
+/// A linear sample of a texture of `YCBCR8_420_2P` (500) and of its `_sRGB` twin (520) over a
+/// '420v' surface, through a function that also gathers it, at positions a third of a texel apart
+/// from 0.9 of a texel before the texture to as far past it, on this host (MoltenVK, the
+/// platform's own device, [`dev`]), which reads host memory with no bus between:
+/// - 500's planes are read in place (the runtime's `YCbCrInPlace`, which gathers in place too,
+///   so a function that also gathers keeps it): its samples are Metal's filter exactly, its floats
+///   and halves Metal's bit for bit, and nothing that dies is announced;
+/// - 520, which is not read in place, takes the runtime's default filter: Metal's own sampler
+///   filters the texture's converted texels, which hold Metal's reads exactly, at Metal's weights
+///   but without the format's truncated sum on its grid, within one step of the grid of 1/8192 of
+///   Metal's into floats, and within 1/2048 into halves, one `half` unit in the last place in
+///   [0.5, 1): the bound metal2vulkan states for MoltenVK (its `docs/FAST-PATHS.md`, the two-plane
+///   YCbCr row, at the pinned commit; at most 0.1245 codes of 1/255, measured on the M3 Max).
+///   Each dispatch that samples it announces `ycbcr-filter-not-exact` ([`crate::answer::DIES`]):
+///   in strict mode it dies there, at its selector, and by default it is relayed and counted, as
+///   is `half-texel-conversion` at a `half` sample through a runtime sampler, whose nearest texel
+///   on the grid of 1/8192 rounds to nearest even where Metal's rounds ties away.
+///
+/// Every observation is gathered first, so a failure names them all
 #[test]
 fn the_default_filter_samples_within_its_bound_of_metals() {
-    use crate::answer::{dies_of, relaxed, relayed_counts};
+    use crate::answer::{LAST_LINE, relaxed, relayed_counts};
     use metal2vulkan_runtime::Degradation as D;
     type V = crate::platform::VulkanPlatform;
-    let counted = |kind| {
-        (relayed_counts().into_iter())
-            .find(|&(k, _)| k == kind)
-            .map_or(0, |(_, n)| n)
-    };
+    /// What one format's samples met and how they lie against Metal's.
+    #[derive(Debug)]
+    struct Seen {
+        #[expect(dead_code, reason = "read through Debug alone, in a failure's message")]
+        format: u64,
+        /// The selector a strict float sample died at, and the kind its line names.
+        strict: Option<(&'static str, Option<D>)>,
+        /// The kinds of DIES the relaxed samples relayed.
+        relayed: Vec<D>,
+        /// How many floats differ from Metal's, and the largest difference in the grid's steps.
+        floats: (usize, f32),
+        /// How many halves differ from Metal's, and the largest difference in codes of 1/255.
+        halves: (usize, f32),
+    }
     // The value of a `half`'s bits.
     let value = |h: u16| {
         let (exponent, fraction) = (i32::from((h >> 10) & 0x1f), f32::from(h & 0x3ff));
@@ -1021,30 +1034,31 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
     let grid = ((size.0 + 2) * 3, (size.1 + 2) * 3);
     let bytes = probe((-0.9, -0.9), 1.0 / 3.0, grid, true, 0);
     let linear = (1, 0, true, 0);
+    let mut seen = Vec::new();
     for (format, steps) in [(500, 2048.0_f32), (520, 8192.0)] {
         let s = surface_420(b"420v", size);
         fill_noise(&s, size, 9);
         let t = ours_on(&d, format, &s, size);
-        let site = dies_of(D::YCbCrFilterNotExact, || {
-            sampled_floats::<V>(&d, &t, linear, grid, &bytes)
-        });
-        assert_eq!(
-            site.file, "dispatchThreads:threadsPerThreadgroup:",
-            "{format}"
-        );
-        let kinds = [D::YCbCrFilterNotExact, D::HalfTexelConversion];
-        let before = kinds.map(counted);
+        *LAST_LINE.lock() = None;
+        let strict = catch_death(|| sampled_floats::<V>(&d, &t, linear, grid, &bytes))
+            .err()
+            .map(|site| {
+                let line = LAST_LINE.lock().take().unwrap_or_default();
+                let kind =
+                    (D::ALL.iter().copied()).find(|k| line.contains(&format!("({})", k.code())));
+                (site.file, kind)
+            });
+        let before = relayed_counts();
         let (halves, floats) = relaxed(|| {
             (
                 sampled::<V>(&d, &t, linear, grid, &bytes),
                 sampled_floats::<V>(&d, &t, linear, grid, &bytes),
             )
         });
-        let after = kinds.map(counted);
-        assert!(after[0] >= before[0] + 2, "{format}: {before:?} {after:?}");
-        if format == 520 {
-            assert!(after[1] > before[1], "{format}: {before:?} {after:?}");
-        }
+        let relayed = (relayed_counts().into_iter())
+            .filter(|&(k, n)| !before.contains(&(k, n)))
+            .map(|(k, _)| k)
+            .collect();
         let Some((md, mt)) = metals(format, &s, size) else {
             return;
         };
@@ -1053,22 +1067,56 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
         let (ours, metal) = (floats.as_flattened(), metal_floats.as_flattened());
         assert_eq!(ours.len(), metal.len(), "{format}");
         let worst = (ours.iter().zip(metal)).fold(0.0_f32, |w, (o, m)| w.max((o - m).abs()));
-        assert!(worst <= 1.0 / steps, "{format}: {} steps", worst * steps);
-        let differ = (ours.iter().zip(metal)).filter(|(o, m)| o.to_bits() != m.to_bits());
-        if format == 500 {
-            assert!(differ.count() > 0, "{format}: every float is Metal's");
-        }
+        let differ = (ours.iter().zip(metal))
+            .filter(|(o, m)| o.to_bits() != m.to_bits())
+            .count();
+        let floats = (differ, worst * steps);
         let (ours, metal) = (measure::texels(&halves), measure::texels(&metal_halves));
         let (ours, metal) = (ours.as_flattened(), metal.as_flattened());
         assert_eq!(ours.len(), metal.len(), "{format}");
-        let worst_half = (ours.iter().zip(metal))
+        let worst = (ours.iter().zip(metal))
             .fold(0.0_f32, |w, (&o, &m)| w.max((value(o) - value(m)).abs()));
-        assert!(
-            worst_half <= 1.0 / 2048.0,
-            "{format}: {} codes",
-            worst_half * 255.0
-        );
+        let differ = (ours.iter().zip(metal)).filter(|(o, m)| o != m).count();
+        let halves = (differ, worst * 255.0);
+        seen.push(Seen {
+            format,
+            strict,
+            relayed,
+            floats,
+            halves,
+        });
     }
+    let all = format!("{seen:#?}");
+    let [in_place, twin] = seen.as_slice() else {
+        panic!("{all}");
+    };
+    assert!(
+        in_place.strict.is_none() && in_place.relayed.is_empty(),
+        "500 read in place announces nothing that dies: {all}"
+    );
+    assert_eq!(
+        (in_place.floats.0, in_place.halves.0),
+        (0, 0),
+        "500 read in place samples Metal's bits: {all}"
+    );
+    assert_eq!(
+        twin.strict,
+        Some((
+            "dispatchThreads:threadsPerThreadgroup:",
+            Some(D::YCbCrFilterNotExact)
+        )),
+        "{all}"
+    );
+    assert!(
+        twin.relayed.contains(&D::YCbCrFilterNotExact)
+            && twin.relayed.contains(&D::HalfTexelConversion),
+        "{all}"
+    );
+    assert!(twin.floats.1 <= 1.0, "520's floats within one step: {all}");
+    assert!(
+        twin.halves.1 <= 255.0 / 2048.0,
+        "520's halves within 1/2048: {all}"
+    );
 }
 
 /// The texture of 505 takes the ID Metal's pool gives it, after a plain texture and before

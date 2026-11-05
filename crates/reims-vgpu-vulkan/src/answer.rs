@@ -324,7 +324,11 @@ pub fn create<T>(
 ///   Metal's exact filter of the format, which reads off Metal's grid (of 1/2048 for a converted
 ///   format, of 1/8192 for an `_sRGB` twin), naming the slot and the format: the runtime's generic
 ///   sample filter notes (`HalfSampleFilter`, `FloatSampleFilter`) cover no slot bound to a YCbCr
-///   texture. On MoltenVK, under the runtime's default `ycbcr_filter`, every such sample: Metal's
+///   texture. A slot of a `YCBCR8_420_2P` (500) or `YCBCR10_420_2P` (505) texture whose planes the
+///   runtime reads in place (on a device that reads host memory with no bus between, MoltenVK
+///   among them: the runtime's `YCbCrInPlace`, its samples and gathers alike) takes Metal's exact
+///   filter and taps, and announces none of this kind. On MoltenVK, under the runtime's default
+///   `ycbcr_filter`, every other such sample: Metal's
 ///   own sampler filters the slot's converted texels (an `RGBA16Float` view on the grid of
 ///   1/2048, an `RGBA32Float` one on 1/8192), which hold Metal's reads exactly, at Metal's weights
 ///   but without the format's truncated sum on its grid, within one step of the grid of Metal's
@@ -963,10 +967,18 @@ pub fn create<T>(
 ///   swizzled one, or a wrapped image made without `MUTABLE_FORMAT`) and in a packed small float
 ///   texel (`RG11B10Float`, `RGB9E5Float`), where the device stores its own conversion of the
 ///   NaN; another device may answer another sign or payload for its arithmetic (llvmpipe:
-///   `0xffc00000`). The hardware allows Metal's bits, the function selecting them itself, as the
-///   runtime does for its own functions and a 32-bit texel's write, so it dies on every
-///   device. Announced at each draw or dispatch that binds the pipeline's variant (where it binds
-///   a texture whose format may hold a NaN), inside its call, which dies at its selector. Also
+///   `0xffc00000`). A `half` colour output to a half-float channel reaches the attachment through
+///   the device's widening of the `half`, whose NaN is the device's, on every device (NVIDIA's
+///   615.71.09 on an RTX 5080 Laptop GPU stores each as `0x7fff`, ANV and RADV as `0xfe00`, and
+///   MoltenVK canonicalizes it), where Metal stores the half's own bits; an output no return of
+///   which can hold a NaN announces nothing. The hardware allows Metal's bits, the function
+///   selecting them itself, as the runtime does for its own functions and a 32-bit texel's write,
+///   so nothing in the hardware forces the difference, and it dies on MoltenVK; a native device
+///   relays it, its NaNs' bits, as the class of a native device's own maths and sampling
+///   ([`native::NATIVE_RELAYED`]): there the runtime gives the device's NaN, its native form, and
+///   builds no path to Metal's bits where the device has one, and only a NaN's bits differ.
+///   Announced at each draw or dispatch that binds the pipeline's variant (where it binds a
+///   texture whose format may hold a NaN), inside its call, which dies at its selector. Also
 ///   a GPU blit into, out of or between textures of which one is an `RG11B10Float` texture Metal
 ///   keeps losslessly compressed: Metal's blit through the compression makes a NaN field the
 ///   quiet NaN, where the device's copy keeps the texels' bytes, as MoltenVK's does where the
@@ -1197,6 +1209,36 @@ pub fn create<T>(
 ///   own. Such draws died before the runtime drew triangles' edges as bands (`DeviceWideLines` or
 ///   `LinesAtNearestWidth`), so placing it here ends no run that went on. Announced at each such
 ///   draw, inside its call, which dies at its selector;
+/// - `DeviceLineTies`: a draw of lines, or of a triangle's edges in fill mode `Lines`, that the
+///   device's own lines draw at width 1 (Metal's default width, or the nearest width a device
+///   without `wideLines` draws), on a driver not measured to break a tie as Metal does (the
+///   runtime's `DriverFact::LineTiesAreMetals`, measured on MoltenVK on the Apple9 GPUs under
+///   macOS 27.0, the M3 Max's, which announce nothing): a line through a vertex two pixels'
+///   diamonds share exits neither diamond, which Vulkan's open diamond leaves to the driver with
+///   no control over it, where Metal covers the lower pixel, so such a pixel, and the rest of a
+///   line that runs along such vertices, can lie a row or a column from Metal's (NVIDIA's
+///   615.71.09 on an RTX 5080 Laptop GPU covers the other pixel; lavapipe leaves out a strip's
+///   first pixel where it starts on such a vertex; RADV and ANV are not measured). On MoltenVK
+///   Metal's own lines draw, but where the runtime has not measured them it dies, as no other
+///   reason covers it; a native device relays it, its rasterizer's tie, a fact of its hardware
+///   whose only exact form is the line's rule run in the fragment function, an interpreter's
+///   ([`native::NATIVE_RELAYED`]). Announced at each such draw, inside its call, which dies at its
+///   selector;
+/// - `DeviceSubpixelSnap`: a draw of lines, or of a triangle's edges in fill mode `Lines`, that
+///   the band draws, on a driver not measured to snap a vertex half a step off its 1/256-pixel
+///   grid up, as Metal snaps a line's endpoint (the runtime's `DriverFact::SubpixelSnapIsMetals`,
+///   measured as `DeviceLineTies`' is): the band's corners, its endpoints offset by a multiple of
+///   1/32 pixel, are snapped by the device's rasterizer, where Metal snaps the endpoints first, so
+///   where an endpoint lies half a step off the grid a pixel within that half step of the band's
+///   edge can be drawn, or left out, a row or a column from Metal's (NVIDIA's 615.71.09 on an RTX
+///   5080 Laptop GPU and lavapipe round the half step down). The band is the runtime's own:
+///   snapping its endpoints to Metal's grid before it offsets them leaves the rasterizer nothing
+///   to round, so the hardware allows the exact form, and it dies on every device, as
+///   `WideEdgeDepthBias` does. On a native device under the default only a line at a width its
+///   own lines do not draw (below 1/16, which Metal draws at 1/16, or past its `lineWidthRange`)
+///   takes the band, and under `REIMS_VGPU_EXACT`'s `wide_lines` every line its lines would draw
+///   otherwise than Metal's. Announced at each such draw, inside its call, which dies at its
+///   selector;
 /// - the note `DeviceInterpolationOffset`: a fragment function's interpolant read at an offset
 ///   (`interpolate_at_offset`), at the device's interpolation offset, which Vulkan rounds to a grid
 ///   of at least sixteenths and clamps to the device's range, where Metal's grid and range are not
@@ -1234,7 +1276,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 139] = [
+pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1368,6 +1410,8 @@ pub const DIES: [rt::Degradation; 139] = [
     rt::Degradation::DeviceWideLines,
     rt::Degradation::LinesAtNearestWidth,
     rt::Degradation::WideEdgeDepthBias,
+    rt::Degradation::DeviceLineTies,
+    rt::Degradation::DeviceSubpixelSnap,
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
     rt::Degradation::ReadOnlyPagesWritten,
@@ -2826,7 +2870,8 @@ mod tests {
         // the device's interpolation and level arithmetic, the heap size the
         // device's memory granularity decides, which the guest reads, and, on the rule for native
         // devices, the precision notes whose difference is the device's rounding, evaluation
-        // position or order; then, as the class of a native device's own maths and sampling, the
+        // position or order, and its line rasterizer's tie at a vertex two pixels' diamonds share
+        // (`DeviceLineTies`); then, as the class of a native device's own maths and sampling, the
         // device's maths
         // and sampling, each with its bound or the runtime's record of it, the notes of the
         // runtime's native defaults off Apple's GPUs last, the device's resolve
@@ -2845,10 +2890,12 @@ mod tests {
                 D::DeviceSignedZeroInfNan,
                 D::MultisamplePosition,
                 D::ImplementationDefinedReconvergence,
+                D::DeviceLineTies,
                 D::F16FmaDoubleRounding,
                 D::F16IntConvDoubleRounding,
                 D::DeviceArithmetic,
                 D::DeviceDenormals,
+                D::DeviceNanEncoding,
                 D::FloatSampleFilter,
                 D::HalfSampleFilter,
                 D::CubeGradientFootprint,
@@ -2882,7 +2929,8 @@ mod tests {
         // speculates an operation, Metal's rule for tessellation factors is not read, blending,
         // storage, an attachment's memory read in place, a heap texture's compressed image, a
         // pass's tile store and when a command buffer is seen complete are neither maths nor
-        // sampling, and the anisotropic emulation is a fitted model.
+        // sampling, the anisotropic emulation is a fitted model, and the band's corners are the
+        // runtime's own, whose snap to Metal's grid the hardware allows (`DeviceSubpixelSnap`).
         for kind in [
             D::TessellationFactorInstance,
             D::Fp8Value,
@@ -2893,13 +2941,13 @@ mod tests {
             D::BlendedWriteRounding,
             D::RotatedBlendRounding,
             D::AnisotropicFilter,
-            D::DeviceNanEncoding,
             D::TessellationWinding,
             D::TessellationFactorEdgeCases,
             D::HeapTextureCompressed,
             D::SnormMinimumKept,
             D::SharedExponentKept,
             D::GroupedCompletion,
+            D::DeviceSubpixelSnap,
         ] {
             assert!(DIES.contains(&kind) && !native::relayed(kind), "{kind:?}");
         }
