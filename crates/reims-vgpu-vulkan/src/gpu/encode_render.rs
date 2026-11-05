@@ -6363,22 +6363,22 @@ pub(crate) mod tests {
     }
 
     /// The records of an indirect command buffer that the runtime refuses die naming the
-    /// execution: at the commit where only the CPU wrote them, and as the command buffer
-    /// completes where the GPU may have (an encoder made the buffer resident for writing), whose
-    /// failure no handler of core's learns of
+    /// execution, at the commit, where only the CPU wrote them. That holds where an encoder made
+    /// the buffer resident for writing, too: residency for writing writes nothing, and no command
+    /// of this command buffer can write the records (no function that encodes commands, no blit
+    /// into the buffer), so the GPU executes the CPU's records
     #[test]
     fn refused_icb_records_die_naming_the_execution() {
-        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::testkit::capture::expect_death;
+        use reims_vgpu_core::raise::death::DeathKind;
 
-        let site = catch_death(|| execute_a_mismatched_draw(1)).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
-        let site = DeathSite {
-            kind: DeathKind::Abort,
-            file: "executeCommandsInBuffer:withRange:",
-            line: 0,
-        };
-        expect_death(site, || execute_a_mismatched_draw(3));
+        for usage in [1, 3] {
+            let site = catch_death(|| execute_a_mismatched_draw(usage)).unwrap_err();
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::Abort, "commit"),
+                "usage {usage}"
+            );
+        }
     }
 
     /// The texels of a 4 by 4 BGRA8 target, cleared to black, after `setters` and then each of
