@@ -2362,6 +2362,47 @@ commit. Each outcome the new design allows is one of those two:
   `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order` and
   `busy_lanes_hold_one_thread_each_and_the_budget_s`.
+- **A command buffer in parts.** Where the platform starts a command buffer's
+  GPU work only at its commit (the Vulkan platform's runtime records it and
+  submits it then), a long buffer's walk and its GPU work run in series:
+  WindowServer's composite of a Liquid Glass desktop walked 2.6 to 3.5 ms and
+  then ran 1.6 to 3.3 ms on an RTX 5080 Laptop GPU, each frame, against a
+  refresh of 8.33 ms. So the walk commits such a buffer in parts
+  (`decode/split.rs`): at an encoder's end, once the part walked since the last
+  took 250 µs, it hands the platform that part (`CommandBuffer::split`), which
+  commits it on the buffer's queue and answers a command buffer of the queue
+  that goes on from it, and the walk goes on in that one. On the M3 Max (MoltenVK)
+  a frame of 60 passes then completed in 6.0 ms from its message's take, where
+  it took 9.5 ms whole (`decode/split.rs`, "What it gains"). A part is committed
+  only where the whole buffer could be committed then, waiting for nothing:
+  its turn is next, every ticket and range message before its begin is done,
+  and the buffers its `COMMIT_ORDER` names are committed. Every wait of the
+  last commit is met at the first part, so the walk never waits between
+  parts. The parts run in their order on the queue, as one buffer's encoders
+  do. The buffer's handlers, records, ticket and commit marks are its last
+  part's, and its outcome is all of them: the first failed part's error, the
+  first part's GPU start, the last part's GPU end. While a buffer's parts are
+  out, from its first part's commit to its last, no other command buffer of
+  its context is committed (each waits at its commit, never at its walk), and
+  the context's range messages that come are carried out after its last
+  commit, so each other message comes wholly before the buffer's commit or
+  wholly after it, as under the lock. A buffer splits only while no other
+  commit or range message of its context is under way, and only where it
+  waits for no event, is behind no buffer of its queue that does, is not a
+  video buffer, and its queue holds room for another command buffer. A buffer
+  whose walk faults after a part has its failure at its stand-in's
+  completion, as one whose walk faults whole; the parts committed before the
+  fault ran, as the encoders before a fault of Metal's GPU run. The Vulkan
+  platform keeps a buffer whole where a part would answer otherwise than the
+  whole (`gpu/command.rs`, "A command buffer in parts"); the Metal platform
+  keeps every buffer whole, as Metal's commit starts the GPU at once. Tested
+  by `a_buffer_walked_long_is_committed_in_parts_with_one_outcome`,
+  `a_buffer_is_committed_whole_where_its_parts_would_wait`,
+  `another_queue_s_commit_waits_for_a_buffer_s_last_part` and
+  `a_walk_that_faults_after_a_part_fails_at_its_stand_in`,
+  `a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut` and
+  `a_split_after_a_skipped_encoder_answers_as_the_whole` (the decoder's
+  `cmdbuf` tests), and the gate's own (`decode/split.rs`).
 - **What still waits on ring 0's thread:** a block named again, for that
   block's writers; a present's fill, for that block's users begun and not
   finished (not for the fill itself: the fill is committed there, and the

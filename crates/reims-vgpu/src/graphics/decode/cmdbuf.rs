@@ -105,6 +105,7 @@ use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
@@ -120,6 +121,7 @@ use super::super::completion::{cb_complete, cb_failed};
 use super::commit_order::Until;
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
+use super::split::{Parts, SplitHold};
 use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
@@ -417,6 +419,22 @@ fn leaving(handler: CompletedHandler, in_flight: InFlight) -> CompletedHandler {
         handler(info);
         drop(in_flight);
     })
+}
+
+/// A command buffer's walk where it may be committed in parts ([`super::split`]).
+struct Splitting {
+    /// Its context.
+    context: u32,
+    /// Its queue's count of command buffers made and not completed ([`InFlight`]).
+    in_flight: Arc<AtomicUsize>,
+    /// When the walk of the part it is walking began.
+    since: MonoTime,
+    /// Its context's gate, from its first part's commit to its last ([`SplitHold`]).
+    hold: Option<SplitHold>,
+    /// What its parts before the last found ([`Parts`]).
+    parts: Option<Arc<Parts>>,
+    /// The platform keeps it whole from now on.
+    whole: bool,
 }
 
 /// The op stream of the `COMMAND_BUFFER` `message` whose fixed part is `m`: all of the message's
@@ -1303,9 +1321,26 @@ impl<P: Platform> GraphicsDecoder<P> {
         if ordered {
             self.wait_turn();
         }
-        if let Err(e) = self.walk_ops(ops, &cb, &mut events)? {
+        // Committed in parts as it is walked, where it may be ([`super::split`]): a buffer of a
+        // context whose walk is not ordered, that waits for no event and is behind none that does.
+        let mut split = (!ordered && held.is_none() && !behind)
+            .then_some(self.context)
+            .flatten()
+            .map(|context| Splitting {
+                context,
+                in_flight: Arc::clone(&in_flight.0),
+                since: self.shared.platform.clock().now_mono(),
+                hold: None,
+                parts: None,
+                whole: false,
+            });
+        let mut cb = cb;
+        if let Err(e) = self.walk_ops(ops, &mut cb, &mut events, &mut split)? {
             return Ok(Err(e));
         }
+        // Its parts' gate, held to its last commit, and their outcome, which its last part's
+        // completion makes the buffer's.
+        let (parts, split_hold) = split.map_or((None, None), |s| (s.parts, s.hold));
         // After the buffers of its queue taken before it ([`super::lane`]): its signal of its
         // queue's surface timeline is decided in its ring's order ([`Self::order_signal`]).
         self.wait_turn();
@@ -1331,6 +1366,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         );
         let handler = signalling(handler, signalled);
         let handler = completed_with(handler, order_hold.clone());
+        let handler = match parts {
+            Some(parts) => parts.merged(handler),
+            None => handler,
+        };
         let commit = || {
             if let Some(submission) = submission {
                 cb.add_submission_handler(ON, submission)?;
@@ -1348,8 +1387,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             committed
         };
         // After every buffer answered `CB_SUBMITTED` before its begin, and its context's range
-        // messages before it ([`Self::wait_to_commit`]).
+        // messages before it ([`Self::wait_to_commit`]); and after the last part of a buffer of
+        // its context whose parts are out, where its own are not ([`super::split`]).
         self.wait_to_commit();
+        let under_way = match (&split_hold, self.context) {
+            (None, Some(context)) => Some(self.shared.split_gate.commit(context)),
+            _ => None,
+        };
         match uses {
             // Its end event signalled for the caches' later copies under their lock, committed
             // with it let go, still among their users, and then the early copies behind it on its
@@ -1365,8 +1409,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             )?,
             None => commit()?,
         }
-        // Committed: a buffer behind it in the commit order goes on.
+        // Committed: a buffer behind it in the commit order goes on, and so does its context's
+        // next commit and its range messages held while its parts were out.
         self.ticket.borrow_mut().take();
+        drop((under_way, split_hold));
         // Last in its queue's order: its records, and those before it, go now where they go at
         // its commit.
         if let Some((submitted, scheduled)) = noted {
@@ -1685,6 +1731,84 @@ impl<P: Platform> GraphicsDecoder<P> {
         signals.push(op.event_obj_id, op.value);
     }
 
+    /// At an encoder's end, ops left after it: where the part of the buffer walked since the
+    /// last took [`Self::split_after`], its queue holds room for another command buffer, the buffer
+    /// could be committed now ([`Self::may_commit_now`]) and its context's gate is free or its
+    /// own, hands the platform that part ([`CommandBuffer::split`]) and goes on in the command
+    /// buffer it answers, `cb` from then on ([`super::split`]). It waits for nothing. Where the
+    /// platform keeps the buffer whole, it is walked whole from there.
+    fn split_here(
+        &self,
+        cb: &mut P::CommandBuffer,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<()> {
+        let Some(s) = split.as_mut().filter(|s| !s.whole) else {
+            return Ok(());
+        };
+        let clock = self.shared.platform.clock();
+        if clock.now_mono().saturating_duration_since(s.since) < self.split_after()
+            || s.in_flight.load(Ordering::Acquire) >= TAKE_IN_FLIGHT_MAX
+            || !self.may_commit_now()
+        {
+            return Ok(());
+        }
+        let hold = match s.hold.take() {
+            Some(hold) => hold,
+            None => match self.shared.split_gate.try_split(s.context) {
+                Some(hold) => hold,
+                None => return Ok(()),
+            },
+        };
+        let first = s.parts.is_none();
+        let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
+        // The part's own place among its queue's command buffers, until its completion; the
+        // buffer's goes on to its last part.
+        let part = parts.part_handler(InFlight::new(&s.in_flight));
+        cb.add_completion_seen_handler(ON, part)?;
+        match cb.split(ON)? {
+            Some(next) => {
+                *cb = next;
+                s.hold = Some(hold);
+                s.since = clock.now_mono();
+            }
+            None => {
+                // Kept whole: the handler just added sees the buffer's own completion, which
+                // its outcome then is ([`Parts::merged`]); the gate stays held only where parts
+                // are out.
+                s.whole = true;
+                if !first {
+                    s.hold = Some(hold);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the command buffer could be committed now, waiting for nothing: its turn is next,
+    /// every ticket before its begin is given back, its context's range messages before it are
+    /// carried out, and the buffers its `COMMIT_ORDER` names are committed
+    /// ([`Self::wait_to_commit`]).
+    fn may_commit_now(&self) -> bool {
+        if !self.turn_is_next() {
+            return false;
+        }
+        let sequencer = &self.shared.sequencer;
+        // An order that is busy now counts as not reached: the buffer waits for its next
+        // encoder's end, or its commit.
+        if let Some(mark) = self.mark.get()
+            && sequencer.reached(self.context, mark) != Some(true)
+        {
+            return false;
+        }
+        if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get())
+            && sequencer.ranges_done(context, asked) != Some(true)
+        {
+            return false;
+        }
+        (self.commit_after.borrow().iter())
+            .all(|(marks, seqno)| marks.commit.reached(*seqno, Until::Committed))
+    }
+
     /// Walks the op stream `ops` on the command buffer `cb`. `Ok(Err(..))` for a
     /// structural malformation, `Ok(Ok(()))` when the whole stream was carried out;
     /// a fault propagates as `Err`, and so does an op the platform refuses, which
@@ -1694,24 +1818,27 @@ impl<P: Platform> GraphicsDecoder<P> {
     fn walk_ops(
         &self,
         ops: &[u8],
-        cb: &P::CommandBuffer,
+        cb: &mut P::CommandBuffer,
         events: &mut EventOps,
+        split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         let mut encoder: Option<OpenEncoder<P>> = None;
-        let walked = refusing(|| self.walk(ops, cb, &mut encoder, events));
+        let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
         if let Some(open) = encoder.take() {
             end_abandoned(open);
         }
         walked
     }
 
-    /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open.
+    /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open, `split` where it may commit
+    /// the buffer in parts ([`Self::split_here`]), each next part then `cb`.
     fn walk(
         &self,
         mut ops: &[u8],
-        cb: &P::CommandBuffer,
+        cb: &mut P::CommandBuffer,
         encoder: &mut Option<OpenEncoder<P>>,
         events: &mut EventOps,
+        split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
         #[cfg(test)]
         let (mut index, hook) = (0, self.walk_hook());
@@ -1721,7 +1848,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             };
             match op_group(tag) {
                 RGFX_OP_GROUP_FRAMING => {
-                    self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?
+                    self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?;
+                    if tag == RGFX_OP_ENCODER_END && len < ops.len() {
+                        self.split_here(cb, split)?;
+                    }
                 }
                 // An op of an encoder skipped whole ([`OpenEncoder::Skipped`]): dropped.
                 group if matches!(encoder.as_ref(), Some(OpenEncoder::Skipped(g)) if *g == group) =>
@@ -2297,6 +2427,7 @@ mod tests {
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
+    use super::super::split::SPLIT_AFTER;
     use super::super::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
     use super::*;
 
@@ -6219,5 +6350,398 @@ mod tests {
             assert_eq!(b.join().unwrap(), Ok(()));
         });
         assert_eq!(commits(), ["first", "second"]);
+    }
+
+    /// How many times a walk of `ops` calls its hook: once an op but the render ops, whose runs
+    /// the walk hands its encoder whole.
+    fn hooked(ops: &[u8]) -> usize {
+        (op_bodies(ops))
+            .filter(|&(tag, _)| op_group(tag) != RGFX_OP_GROUP_RENDER)
+            .count()
+    }
+
+    /// What a test's sink was posted, in order.
+    type Posted<T> = Arc<Mutex<Vec<T>>>;
+
+    /// A decoder of [`setup`]'s, its messages of context 0, on a platform that splits command
+    /// buffers, whose clock moves on [`SPLIT_AFTER`] after each op a walk carries out, so every
+    /// encoder's end may end a part; and the records it posts.
+    fn splitting() -> (
+        Arc<FakePlatform>,
+        GraphicsDecoder<FakePlatform>,
+        Posted<(u32, u64, u32)>,
+        Posted<RgfxCbComplete>,
+    ) {
+        let (p, mut dec) = setup();
+        dec.set_context(Some(0));
+        p.world().split_command_buffers();
+        let clock = Arc::clone(&p);
+        dec.set_walk_hook(Some(Arc::new(move |_| {
+            clock.virtual_clock().advance(SPLIT_AFTER);
+        })));
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let scheduled = Arc::clone(&posted);
+        dec.set_scheduled_sink(Arc::new(move |m| {
+            scheduled
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, RGFX_CB_OK));
+        }));
+        let completions = Arc::clone(&posted);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let complete = Arc::clone(&records);
+        dec.set_completion_sink(Arc::new(move |m| {
+            completions
+                .lock()
+                .push((m.header.r#type, m.cb_obj_id, m.status));
+            complete.lock().push(m);
+        }));
+        (p, dec, posted, records)
+    }
+
+    /// A command buffer of three render passes walked long is committed in three parts as it is
+    /// walked, and is one command buffer to the guest: one `CB_SCHEDULED` and one `CB_COMPLETE`,
+    /// after its last part's completion, with the GPU times from its first part's start to its
+    /// last part's end, and the error of a part that failed.
+    #[test]
+    fn a_buffer_walked_long_is_committed_in_parts_with_one_outcome() {
+        use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+        let (p, mut dec, posted, records) = splitting();
+        let device = p.device();
+        let ops = [render_ops(), render_ops(), render_ops()].concat();
+        let message = command_buffer_message(300, 30, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(p.call_log().calls_to("split").len(), 2);
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 3, "committed in its parts");
+        assert_eq!(
+            *posted.lock(),
+            [(RGFX_EVT_CB_SCHEDULED, 300, RGFX_CB_OK)],
+            "scheduled once, as its last part is"
+        );
+        for (part, (start, end)) in parts.iter().zip([(10, 20), (25, 40), (45, 60)]) {
+            assert!(p.world().set_gpu_times(*part, start, end));
+        }
+        for part in &parts[..2] {
+            assert!(p.world().complete(
+                *part,
+                CommandBufferStatus::COMPLETED,
+                None,
+                CompleteOn::Caller
+            ));
+            assert_eq!(posted.lock().len(), 1, "completed before its last part");
+        }
+        p.world().complete_all(CompleteOn::Caller);
+        let r = records.lock()[0];
+        assert_eq!(
+            (r.cb_obj_id, r.gpu_start_ns, r.gpu_end_ns, r.status),
+            (300, 10, 60, RGFX_CB_OK)
+        );
+        // A part that fails fails the command buffer, whose later parts complete as they do.
+        let message = command_buffer_message(301, 31, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 3);
+        let error = NsErrorText {
+            domain: "MTLCommandBufferErrorDomain".to_owned(),
+            code: 3,
+            description: "Page Fault".to_owned(),
+        };
+        p.world().complete(
+            parts[0],
+            CommandBufferStatus::COMPLETED,
+            None,
+            CompleteOn::Caller,
+        );
+        p.world().complete(
+            parts[1],
+            CommandBufferStatus::ERROR,
+            Some(error),
+            CompleteOn::Caller,
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        let completions: Vec<_> = (posted.lock().iter())
+            .filter(|(kind, _, _)| *kind == RGFX_EVT_CB_COMPLETE)
+            .copied()
+            .collect();
+        assert_eq!(
+            completions,
+            [
+                (RGFX_EVT_CB_COMPLETE, 300, RGFX_CB_OK),
+                (
+                    RGFX_EVT_CB_COMPLETE,
+                    301,
+                    reims_graphics::wire::RGFX_CB_PAGE_FAULT
+                )
+            ]
+        );
+    }
+
+    /// A command buffer is committed whole where the platform keeps it whole, and where it could
+    /// not be committed when its encoders end: a ticket issued before its begin is out until its
+    /// last op.
+    #[test]
+    fn a_buffer_is_committed_whole_where_its_parts_would_wait() {
+        let ops = [render_ops(), render_ops(), render_ops()].concat();
+        let (p, mut dec) = setup();
+        dec.set_context(Some(0));
+        let clock = Arc::clone(&p);
+        dec.set_walk_hook(Some(Arc::new(move |_| {
+            clock.virtual_clock().advance(SPLIT_AFTER);
+        })));
+        let device = p.device();
+        let message = command_buffer_message(310, 40, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert!(p.call_log().calls_to("split").is_empty());
+        assert_eq!(
+            p.world().committed().len(),
+            1,
+            "a platform that keeps it whole"
+        );
+
+        let (p, mut dec, _, _) = splitting();
+        let device = p.device();
+        let ticket = Arc::new(Mutex::new(dec.shared.sequencer.issue(Some(0), false)));
+        let last = hooked(&ops) - 1;
+        let clock = Arc::clone(&p);
+        let held = Arc::clone(&ticket);
+        dec.set_walk_hook(Some(Arc::new(move |index| {
+            clock.virtual_clock().advance(SPLIT_AFTER);
+            if index == last {
+                held.lock().take();
+            }
+        })));
+        let message = command_buffer_message(311, 41, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert!(ticket.lock().is_none());
+        assert!(p.call_log().calls_to("split").is_empty());
+        assert_eq!(p.world().committed().len(), 1, "its order not yet reached");
+    }
+
+    /// While a command buffer's parts are out, a command buffer of another queue of its context
+    /// is walked but committed only after its last part; one of another context is not held.
+    #[test]
+    fn another_queue_s_commit_waits_for_a_buffer_s_last_part() {
+        let (p, mut dec, _, _) = splitting();
+        let device = p.device();
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let ops = [render_ops(), render_ops(), render_ops()].concat();
+        let last = hooked(&ops) - 1;
+        let gate = Arc::clone(&dec.shared.split_gate);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = (Mutex::new(Some(tx)), Mutex::new(rx));
+        let clock = Arc::clone(&p);
+        dec.set_walk_hook(Some(Arc::new(move |index| {
+            clock.virtual_clock().advance(SPLIT_AFTER);
+            // Its first part is out, at its first encoder's end: the other queue's buffer goes;
+            // at its last op, that buffer waits at its commit.
+            if index == 1 {
+                tx.lock().take();
+            }
+            if index == last {
+                for _ in 0..1000 {
+                    if gate.waiting(0) == 1 {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                panic!("the other queue's buffer never waited at its commit");
+            }
+        })));
+        let mut other = dec.sender(Some(0), super::super::Sinks::default());
+        let later = command_buffer_on(6, 320, &render_ops());
+        let commits = || {
+            (p.call_log().calls().into_iter())
+                .filter(|c| c.sel == "commit" || c.sel == "split")
+                .filter_map(|c| c.thread)
+                .collect::<Vec<_>>()
+        };
+        std::thread::scope(|scope| {
+            let b = std::thread::Builder::new()
+                .name("other".into())
+                .spawn_scoped(scope, || {
+                    let _ = rx.lock().recv();
+                    other.decode(&p.device(), &later).unwrap()
+                })
+                .unwrap();
+            let a = std::thread::Builder::new()
+                .name("parts".into())
+                .spawn_scoped(scope, || {
+                    dec.decode(&p.device(), &command_buffer_message(321, 50, &ops))
+                        .unwrap()
+                })
+                .unwrap();
+            assert_eq!(a.join().unwrap(), Ok(()));
+            assert_eq!(b.join().unwrap(), Ok(()));
+        });
+        assert_eq!(commits(), ["parts", "parts", "parts", "other"]);
+    }
+
+    /// A command buffer whose walk faults after a part has its failure at its stand-in's
+    /// completion alone, as one whose walk faults whole; its context's gate is let go.
+    #[test]
+    fn a_walk_that_faults_after_a_part_fails_at_its_stand_in() {
+        let (p, mut dec, posted, _) = splitting();
+        let device = p.device();
+        let mut ops = [render_ops(), render_ops()].concat();
+        // A draw with no open encoder faults the walk.
+        ops.extend(op(
+            RGFX_OP_RENDER_DRAW_PRIMITIVES,
+            RgfxOpDrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            }
+            .as_bytes(),
+        ));
+        let message = command_buffer_message(330, 60, &ops);
+        assert!(refusing(|| dec.decode(&device, &message)).is_err());
+        assert_eq!(
+            p.call_log().calls_to("split").len(),
+            2,
+            "its parts committed"
+        );
+        assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            *posted.lock(),
+            [(
+                RGFX_EVT_CB_COMPLETE,
+                330,
+                reims_graphics::wire::RGFX_CB_INTERNAL
+            )]
+        );
+        assert!(
+            dec.shared.split_gate.try_split(0).is_some(),
+            "the gate held after the walk"
+        );
+    }
+
+    /// A blit encoder's ops, which end a part where the walk may split.
+    fn blit_ops() -> Vec<u8> {
+        [
+            op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat()
+    }
+
+    /// A split after a mid-buffer signal of a shared event leaves the signal in the part before
+    /// the cut: the event reaches its value as that part completes, and its value goes to the
+    /// guest then, before the buffer's completion, as a whole buffer's goes as the GPU reaches
+    /// it. A signal of a shared event whose create the host refused goes with the buffer's
+    /// completion, after its last part, never at a part's.
+    #[test]
+    fn a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut() {
+        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        let (p, mut dec, posted, _) = splitting();
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        let signals = Arc::clone(&posted);
+        dec.set_signal_sink(Arc::new(move |m| {
+            let value = u32::try_from(m.value).unwrap();
+            signals.lock().push((m.header.r#type, m.obj_id, value));
+        }));
+        p.script().push("newSharedEvent", Step::Nil);
+        let create = RgfxSharedEventCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                size: size_of::<RgfxSharedEventCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 8,
+            initial_value: 0,
+        };
+        assert!(
+            dec.decode_refusing(&device, create.as_bytes())
+                .unwrap()
+                .is_err()
+        );
+        let mut ops = blit_ops();
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 3));
+        ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 8, 1));
+        ops.extend([blit_ops(), blit_ops()].concat());
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(340, 70, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 3, "committed in its parts");
+        let signalled: Vec<_> = (p.call_log().since(mark).into_iter())
+            .filter(|c| c.sel == "encodeSignalEvent:value:")
+            .map(|c| c.obj)
+            .collect();
+        assert_eq!(
+            signalled,
+            [parts[1]],
+            "the signal in the part before the cut"
+        );
+        posted.lock().clear();
+        let complete = |part| {
+            let ok = CommandBufferStatus::COMPLETED;
+            assert!(p.world().complete(part, ok, None, CompleteOn::Caller));
+        };
+        complete(parts[0]);
+        assert!(
+            posted.lock().is_empty(),
+            "posted before the event reached 3"
+        );
+        complete(parts[1]);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_EVENT_SIGNALLED, 7, 3)]);
+        complete(parts[2]);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_EVENT_SIGNALLED, 7, 3),
+                (RGFX_EVT_EVENT_SIGNALLED, 8, 1),
+                (RGFX_EVT_CB_COMPLETE, 340, RGFX_CB_OK),
+            ]
+        );
+    }
+
+    /// A split after an encoder skipped whole, its pass naming a texture whose create the host
+    /// refused: the skipped encoder made nothing, and the buffer's parts complete as one buffer.
+    #[test]
+    fn a_split_after_a_skipped_encoder_answers_as_the_whole() {
+        let (p, mut dec, posted, _) = splitting();
+        let device = p.device();
+        dec.refuse(9, RGFX_CMD_TEXTURE_CREATE);
+        // The reference render ops, their pass's colour attachment texture 9.
+        let refused = {
+            let begin = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+            let mut body = begin_render_body();
+            let color = RgfxRenderPassColorAttachment {
+                texture_obj_id: 9,
+                load_action: 2,
+                store_action: 1,
+                clear_color_bits: [0, 0, 0, 1.0f64.to_bits()],
+                ..RgfxRenderPassColorAttachment::default()
+            };
+            body[size_of::<RgfxRenderPassDesc>()..].copy_from_slice(color.as_bytes());
+            let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &body);
+            ops.extend_from_slice(&render_ops()[begin.len()..]);
+            ops
+        };
+        let ops = [render_ops(), refused, render_ops()].concat();
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(350, 80, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let sels = p.call_log().sels_since(mark);
+        let made = (sels.iter())
+            .filter(|s| **s == "renderCommandEncoderWithDescriptor:")
+            .count();
+        assert_eq!(made, 2, "the skipped pass made no encoder");
+        assert_eq!(p.call_log().calls_to("split").len(), 2);
+        assert_eq!(p.world().committed().len(), 3, "committed in its parts");
+        posted.lock().clear();
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 350, RGFX_CB_OK)]);
     }
 }

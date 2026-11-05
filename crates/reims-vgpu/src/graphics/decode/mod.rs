@@ -168,6 +168,7 @@ mod managed;
 mod refused;
 mod render;
 mod sequencer;
+mod split;
 mod surface_cache;
 mod surface_order;
 mod surface_pages;
@@ -586,6 +587,9 @@ pub(crate) struct Shared<P: Platform> {
     surface_caches: Arc<Caches<P>>,
     /// The commit order `CB_SUBMITTED` promises ([`sequencer`]).
     sequencer: Arc<Sequencer>,
+    /// The contexts with a command buffer whose parts are out, which hold the contexts' other
+    /// commits and range messages until its last commit ([`split`]).
+    split_gate: Arc<split::SplitGate>,
     /// The queues' surface timelines, which order command buffers of different queues over the
     /// IOSurfaces they share ([`surface_order`]).
     surface_order: Mutex<surface_order::SurfaceOrder<P>>,
@@ -605,6 +609,9 @@ pub(crate) struct Shared<P: Platform> {
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
     #[cfg(test)]
     walk_hook: Mutex<Option<WalkHook>>,
+    /// The tests' own [`split::SPLIT_AFTER`], where one is set ([`GraphicsDecoder::split_after`]).
+    #[cfg(test)]
+    split_after: Mutex<Option<std::time::Duration>>,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -807,12 +814,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             video_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-video")),
             surface_caches: Arc::new(Caches::new(true)),
             sequencer: Arc::default(),
+            split_gate: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
             commit_cancel: commit_order::Cancel::default(),
             release_queue: OnceLock::new(),
             lanes: lane::Budget::of_host(),
             #[cfg(test)]
             walk_hook: Mutex::new(None),
+            #[cfg(test)]
+            split_after: Mutex::new(None),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())
@@ -1721,6 +1731,16 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn walk_hook(&self) -> Option<WalkHook> {
         self.shared.walk_hook.lock().clone()
+    }
+
+    /// How long a part of a command buffer is walked, at least, before the walk commits it
+    /// ([`split::SPLIT_AFTER`]; the tests may set their own).
+    pub(crate) fn split_after(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Some(after) = *self.shared.split_after.lock() {
+            return after;
+        }
+        split::SPLIT_AFTER
     }
 
     /// The texture a present of IOSurface `iosurface_id` shows ([`Self::surface_present`]).
@@ -2815,7 +2835,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             drop(drain);
         };
         match self.context {
-            Some(context) => self.shared.sequencer.after_context(context, Box::new(run)),
+            // While a command buffer of the context has parts out, after its last part
+            // ([`split`]).
+            Some(context) => {
+                let gate = Arc::clone(&self.shared.split_gate);
+                let run = Box::new(move || gate.range(context, Box::new(run)));
+                self.shared.sequencer.after_context(context, run);
+            }
             None => run(),
         }
     }
