@@ -3616,12 +3616,12 @@ mod tests {
     /// of the device, at the buffer's begin, which takes it not.
     #[test]
     fn a_reset_between_an_answer_and_its_begin_lets_the_answer_go() {
-        let (_p, mut dec, posted) = posting(false);
+        let (p, mut dec, posted) = posting(false);
         let sequencer = Arc::clone(&dec.shared.sequencer);
         assert!(answer(&dec, &asking(190, 120), &posted, true));
         assert_eq!(sequencer.out(), 1, "the answer's ticket");
         dec.end_message();
-        dec.reset();
+        dec.reset(&p.device());
         assert_eq!(sequencer.out(), 0, "given back at the reset");
 
         let (p, mut dec, posted) = posting(false);
@@ -5418,7 +5418,7 @@ mod tests {
         };
         let closed = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
-        assert_eq!(ring0.drop_context(0), 5);
+        assert_eq!(ring0.drop_context(&device, 0), 5);
         drop(ring0.drain_context(0, true, flag(&closed)));
         assert_eq!(ring0.context_states(), 0);
 
@@ -5473,7 +5473,7 @@ mod tests {
                 outcome
             });
             gate.reached();
-            assert_eq!(ring0.drop_context(0), 5);
+            assert_eq!(ring0.drop_context(&device, 0), 5);
             assert_eq!(ring0.object_count(), 0);
             let flag = Arc::clone(&answered);
             drop(ring0.drain_context(

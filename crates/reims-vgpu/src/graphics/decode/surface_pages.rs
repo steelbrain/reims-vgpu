@@ -1997,7 +1997,7 @@ pub(super) mod tests {
             Ok(())
         );
         let view = r.private_view(BLOCK);
-        r.dec.drop_context(2);
+        r.dec.drop_context(&r.device, 2);
         assert_eq!(r.dec.views_of_surfaces().private_len(), 1);
         assert_eq!(Arc::strong_count(&view), 1);
         let _ = r.private_view(BLOCK + 0x4000);

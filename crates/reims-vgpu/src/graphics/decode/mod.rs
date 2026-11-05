@@ -124,8 +124,9 @@ use reims_graphics::wire::{
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
+use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::SharedEvent;
+use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_core::platform::os::clock::Clock as _;
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
@@ -572,6 +573,11 @@ pub(crate) struct Shared<P: Platform> {
     /// The device's resets, which end every wait for another queue's buffers
     /// ([`commit_order`]).
     commit_cancel: commit_order::Cancel,
+    /// The decoder's own queue, which signals a gone context's plain events past every value
+    /// ([`GraphicsDecoder::release_events`]): made at the first such signal, unshared, so no
+    /// command buffer of the guest's, nor one waiting on another's GPU queue, holds it up; `None`
+    /// where the platform made none.
+    release_queue: OnceLock<Option<P::CommandQueue>>,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
     /// Called after each op of every command buffer's walk (the tests' look inside a walk).
@@ -767,6 +773,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             sequencer: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
             commit_cancel: commit_order::Cancel::default(),
+            release_queue: OnceLock::new(),
             lanes: lane::Budget::of_host(),
             #[cfg(test)]
             walk_hook: Mutex::new(None),
@@ -1750,8 +1757,8 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Drops every object of context `context` ([`Self::close_tables`]), letting go of them here
     /// ([`Closed::let_go`]): how many objects were dropped.
-    pub(crate) fn drop_context(&self, context: u32) -> usize {
-        let (dropped, closed) = self.close_tables(context);
+    pub(crate) fn drop_context(&self, device: &P::Device, context: u32) -> usize {
+        let (dropped, closed) = self.close_tables(device, context);
         closed.let_go();
         dropped
     }
@@ -1759,9 +1766,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Takes every object of context `context` out of the decoder's tables and names: those whose
     /// id lies in its range, `context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up, below the next
     /// context's (its process closed the device or died), its chunks of the texture resource ids,
-    /// its surfaces' names, its libraries and its pages blocks' views, its queues ended first. How
-    /// many objects it held, and what it took out, for the caller to let go of ([`Closed`]).
-    pub(crate) fn close_tables(&self, context: u32) -> (usize, Closed<P>) {
+    /// its surfaces' names, its libraries and its pages blocks' views, its queues ended first and
+    /// its events then set past every value ([`Self::release_events`]). How many objects it held,
+    /// and what it took out, for the caller to let go of ([`Closed`]).
+    pub(crate) fn close_tables(&self, device: &P::Device, context: u32) -> (usize, Closed<P>) {
         for holder in self.shared.id_chunks.lock().iter_mut() {
             if *holder == Some(context) {
                 *holder = None;
@@ -1794,6 +1802,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     drop(counts.answered.lock().take());
                 }
             }
+            self.release_events(device, context, &removed);
             objects = removed;
         }
         self.forget_context_surfaces(context);
@@ -1813,6 +1822,68 @@ impl<P: Platform> GraphicsDecoder<P> {
             views,
         };
         (dropped, closed)
+    }
+
+    /// Context `context` is gone, its close or the device's reset, and with it everything that
+    /// could set or signal its events: no event of the guest's crosses processes, and its queues
+    /// have ended. A command buffer of its that waits for one of their values not yet reached
+    /// would wait for good, holding its queue, every object it names, the GPU addresses its
+    /// buffers pin among them, and its context's drain, which the close's answer waits for.
+    /// So each event of `removed` is set past every value: a shared event on the CPU, and the
+    /// plain events, which only a command buffer signals, by one command buffer on the decoder's
+    /// own queue ([`Shared::release_queue`]), which no buffer of the guest's holds up. A
+    /// refusal is logged, and the close goes on.
+    fn release_events(&self, device: &P::Device, context: u32, removed: &[tables::Removed<P>]) {
+        let mut plain = Vec::new();
+        for r in removed {
+            match &r.entry().handle {
+                ObjHandle::SharedEvent(event) => {
+                    if let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX)) {
+                        log::warn!(
+                            target: "reims_vgpu::graphics",
+                            "context {context}'s shared event {:#x} was not set past every value \
+                             at its close: {raise}",
+                            r.id()
+                        );
+                    }
+                }
+                ObjHandle::Event(event) => plain.push(event),
+                _ => {}
+            }
+        }
+        if plain.is_empty() {
+            return;
+        }
+        let signalled = refusing(|| {
+            let queue =
+                (self.shared.release_queue).get_or_init(|| device.new_command_queue_unshared());
+            let Some(cb) = (match queue {
+                Some(queue) => queue.command_buffer(OnFault::Return)?,
+                None => None,
+            }) else {
+                return Ok(false);
+            };
+            for &event in &plain {
+                cb.encode_signal(Some(EventRef::Event(event)), u64::MAX)?;
+            }
+            cb.commit(OnFault::Return)?;
+            Ok(true)
+        });
+        match signalled {
+            Ok(true) => {}
+            Ok(false) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "context {context}'s {} events were not signalled past every value at its close: \
+                 the platform made no command buffer",
+                plain.len()
+            ),
+            Err(raise) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "context {context}'s {} events were not signalled past every value at its close: \
+                 {raise}",
+                plain.len()
+            ),
+        }
     }
 
     /// Lets go of `closed` on the close worker, then of `drain`, its close's: the close's answer,
@@ -1848,14 +1919,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// It is made with no message of the guest's being carried out on the decoder, as the
     /// device's reset waits for those that began before it (`GraphicsControl::reset`), so no
     /// view of a table is open and every object goes here.
-    pub(crate) fn reset(&self) -> (Vec<u32>, usize) {
+    pub(crate) fn reset(&self, device: &P::Device) -> (Vec<u32>, usize) {
         let shared = &self.shared;
         let mut contexts: Vec<u32> = shared.contexts.lock().keys().copied().collect();
         contexts.extend(shared.libraries.lock().contexts());
         contexts.extend(shared.id_chunks.lock().iter().flatten().copied());
         contexts.sort_unstable();
         contexts.dedup();
-        let dropped = contexts.iter().map(|&c| self.drop_context(c)).sum();
+        let dropped = contexts.iter().map(|&c| self.drop_context(device, c)).sum();
         *shared.surfaces.lock() = SurfaceNames::default();
         // Their drains go with them, those of the contexts closed and of the unshared blocks too:
         // the answers waiting on those are owed to no one.
@@ -4877,6 +4948,164 @@ mod tests {
         assert!(!is_fence(dec.named(b)) && dec.named(b).is_none());
     }
 
+    /// A context's close sets each of its shared events past every value on the CPU, and signals
+    /// its plain events past every value with one command buffer of the decoder's own unshared
+    /// queue, made at the first close that has plain events and kept: nothing is left to set or
+    /// signal them, so a command buffer of the context's waiting on one finishes and lets go of
+    /// what it holds. A context with no event calls nothing, and so does a reset after the close;
+    /// a reset sets those of the contexts it drops.
+    #[test]
+    fn a_gone_context_s_events_are_set_past_every_value() {
+        use reims_vgpu_core::testkit::Call;
+        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let obj = |context: u64, n: u64| context << RGFX_CONTEXT_OBJ_ID_SHIFT | n;
+        let create = |ty: u32, obj_id: u64| {
+            RgfxObjectCreate {
+                header: RgfxMsgHeader {
+                    r#type: ty,
+                    size: size_of::<RgfxObjectCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+            }
+            .as_bytes()
+            .to_vec()
+        };
+        let event = |obj_id| create(RGFX_CMD_EVENT_CREATE, obj_id);
+        let fence = |obj_id| create(RGFX_CMD_FENCE_CREATE, obj_id);
+        let shared = |obj_id: u64| {
+            RgfxSharedEventCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_SHARED_EVENT_CREATE,
+                    size: size_of::<RgfxSharedEventCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+                initial_value: 3,
+            }
+            .as_bytes()
+            .to_vec()
+        };
+        let made = |dec: &mut GraphicsDecoder<FakePlatform>, context: u32, messages: &[Vec<u8>]| {
+            dec.set_context(Some(context));
+            for m in messages {
+                assert_eq!(dec.decode(&device, m).unwrap(), Ok(()));
+            }
+            dec.set_context(None);
+        };
+        let id_of = |dec: &GraphicsDecoder<FakePlatform>, obj_id: u64| match dec.named(obj_id) {
+            Some(ObjHandle::Event(e)) => Arg::obj(e).as_obj().unwrap().0,
+            Some(ObjHandle::SharedEvent(e)) => Arg::obj(e).as_obj().unwrap().0,
+            _ => panic!("{obj_id:#x} is no event"),
+        };
+        let sets = |calls: &[Call]| -> Vec<(u64, u64)> {
+            (calls.iter())
+                .filter(|c| c.sel == "setSignaledValue:")
+                .map(|c| (c.obj.0, c.args[0].as_u64().unwrap()))
+                .collect()
+        };
+        // In the order the table lets go of them, which is not the order made.
+        let signals = |calls: &[Call]| -> Vec<(u64, u64)> {
+            let mut signals: Vec<(u64, u64)> = (calls.iter())
+                .filter(|c| c.sel == "encodeSignalEvent:value:")
+                .map(|c| (c.args[0].as_obj().unwrap().0, c.args[1].as_u64().unwrap()))
+                .collect();
+            signals.sort_unstable();
+            signals
+        };
+        let release = [
+            "setSignaledValue:",
+            UNSHARED_QUEUE,
+            "commandBuffer",
+            "encodeSignalEvent:value:",
+            "commit",
+        ];
+        let releasing = |calls: &[Call]| -> Vec<&'static str> {
+            (calls.iter())
+                .map(|c| c.sel)
+                .filter(|s| release.contains(s))
+                .collect()
+        };
+
+        // Context 1: two plain events, a shared one and a fence; context 2: a plain event and a
+        // shared one; context 3: a fence alone.
+        made(
+            &mut dec,
+            1,
+            &[
+                event(obj(1, 1)),
+                event(obj(1, 2)),
+                shared(obj(1, 3)),
+                fence(obj(1, 4)),
+            ],
+        );
+        made(&mut dec, 2, &[event(obj(2, 1)), shared(obj(2, 2))]);
+        made(&mut dec, 3, &[fence(obj(3, 1))]);
+        let (e11, e12) = (id_of(&dec, obj(1, 1)), id_of(&dec, obj(1, 2)));
+        let (s13, e21, s22) = (
+            id_of(&dec, obj(1, 3)),
+            id_of(&dec, obj(2, 1)),
+            id_of(&dec, obj(2, 2)),
+        );
+
+        let mark = p.call_log().mark();
+        assert_eq!(dec.drop_context(&device, 1), 4);
+        let calls = p.call_log().since(mark);
+        assert_eq!(sets(&calls), [(s13, u64::MAX)]);
+        let mut both = [(e11, u64::MAX), (e12, u64::MAX)];
+        both.sort_unstable();
+        assert_eq!(signals(&calls), both);
+        assert_eq!(
+            releasing(&calls),
+            [
+                "setSignaledValue:",
+                UNSHARED_QUEUE,
+                "commandBuffer",
+                "encodeSignalEvent:value:",
+                "encodeSignalEvent:value:",
+                "commit",
+            ]
+        );
+
+        // The queue is made once.
+        let mark = p.call_log().mark();
+        assert_eq!(dec.drop_context(&device, 2), 2);
+        let calls = p.call_log().since(mark);
+        assert_eq!(sets(&calls), [(s22, u64::MAX)]);
+        assert_eq!(signals(&calls), [(e21, u64::MAX)]);
+        assert_eq!(
+            releasing(&calls),
+            [
+                "setSignaledValue:",
+                "commandBuffer",
+                "encodeSignalEvent:value:",
+                "commit",
+            ]
+        );
+
+        // A context with no event, and a reset after the closes, set nothing.
+        let mark = p.call_log().mark();
+        assert_eq!(dec.drop_context(&device, 3), 1);
+        assert_eq!(dec.reset(&device).1, 0);
+        assert!(releasing(&p.call_log().since(mark)).is_empty());
+
+        // A reset drops a context's events as its close does.
+        made(&mut dec, 4, &[event(obj(4, 1)), shared(obj(4, 2))]);
+        let (e41, s42) = (id_of(&dec, obj(4, 1)), id_of(&dec, obj(4, 2)));
+        let mark = p.call_log().mark();
+        assert_eq!(dec.reset(&device), (vec![4], 2));
+        let calls = p.call_log().since(mark);
+        assert_eq!(sets(&calls), [(s42, u64::MAX)]);
+        assert_eq!(signals(&calls), [(e41, u64::MAX)]);
+    }
+
     /// A create of each state object calls the platform and holds its handle;
     /// an object destroy drops it; an unknown command and a short message are
     /// reported, not carried out.
@@ -5477,7 +5706,7 @@ mod tests {
 
         // Context 1's chunk goes at its close: its ids are refused to the next context until
         // the kext gives it the chunk. Context 2's stays.
-        dec.drop_context(1);
+        dec.drop_context(&device, 1);
         assert_eq!(
             made(&mut dec, obj(3, 1), 5),
             Err(DecodeError::BadResourceId)

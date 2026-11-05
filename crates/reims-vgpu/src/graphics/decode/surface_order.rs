@@ -978,7 +978,7 @@ mod tests {
 
         // B's process closes with nothing waiting past what B signalled.
         let mark = r.p.call_log().mark();
-        r.dec.drop_context(2);
+        r.dec.drop_context(&r.device, 2);
         assert!(events(&r.p.call_log().since(mark), SIGNAL).is_empty());
     }
 

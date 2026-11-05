@@ -768,7 +768,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let decoder = self.decoder();
             // Its compiles first, so none stores a pipeline in the table its close empties.
             self.pending.cancel_context(context);
-            let (dropped, closed) = decoder.close_tables(context);
+            let (dropped, closed) = decoder.close_tables(&self.device, context);
             self.pool.context_closed(context);
             self.presents.context_gone(context);
             let drain = decoder.drain_context(
@@ -802,7 +802,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // After the closes before it let go of their objects, as the guest's next creates
                 // may take the texture resource ids and GPU addresses they held.
                 decoder.closes_let_go();
-                let (contexts, dropped) = decoder.reset();
+                let (contexts, dropped) = decoder.reset(&self.device);
                 for &context in &contexts {
                     self.pool.context_closed(context);
                 }

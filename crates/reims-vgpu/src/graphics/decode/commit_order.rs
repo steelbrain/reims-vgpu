@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(r.dec.decode(&device, create.as_bytes()).unwrap(), Ok(()));
         assert!(!x.is_finished() && !y.is_finished());
 
-        r.dec.drop_context(1);
+        r.dec.drop_context(&device, 1);
         let _ = joined(x, "a buffer of the cycle");
         let _ = joined(y, "a buffer of the cycle");
         // Each ended its message as any does: begun, and committed or failed.

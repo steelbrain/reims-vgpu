@@ -1915,7 +1915,14 @@ A command buffer that waits on an event is watched: one not finished 5 s after
 its commit is named in the log at WARN, with each event and value it waits for,
 and again at INFO once it finishes (at most 32 per device). It is diagnostics
 only: Metal waits without end for a value nothing reaches (measured: the buffer
-stays `Committed`), and so does the host.
+stays `Committed`), and so does the host while the process lives. Once its
+context is gone, at its close or a reset of the device, nothing is left to
+set or signal its events, which cross no process: the host sets each shared
+event past every value and signals each plain event past every value from a
+queue of its own, so a buffer still waiting on one runs and finishes. It then
+lets go of what it holds (its buffers' GPU addresses among them, which the
+rebooted guest picks again after a reset), and the close's answer, which
+waits for the context's buffers, comes.
 
 **Who takes the completions.** Every queue raises the device's one vector,
 the control ring's. The accelerator kext maps each queue's completion-ring

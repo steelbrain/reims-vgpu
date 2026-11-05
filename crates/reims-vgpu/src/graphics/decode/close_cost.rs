@@ -222,10 +222,10 @@ fn header(r#type: u32, size: usize) -> RgfxMsgHeader {
 /// an object.
 #[allow(clippy::disallowed_methods)] // a measurement: the wall time is a figure it prints
 fn closed<P: ApiPlatform>(kind: Kind, n: u64) -> [f64; 3] {
-    let (decoder, _device) = made::<P>(kind, n);
+    let (decoder, device) = made::<P>(kind, n);
     let wall = Instant::now();
     let start = counts();
-    let dropped = decoder.drop_context(0);
+    let dropped = decoder.drop_context(&device, 0);
     let spent = counts() - start;
     let wall = wall.elapsed();
     assert_eq!(dropped as u64, n, "{kind:?}");
