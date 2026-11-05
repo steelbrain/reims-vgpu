@@ -6192,6 +6192,110 @@ void test_buffer_texture_replace_region_tells_the_host()
 	drainRing(fx.ring);
 }
 
+// replaceRegion: and getBytes: of each slice of a linear 2D array over a buffer reach that slice's
+// rows in the buffer, each slice its rows' bytes rounded up to 128 after the one before, whatever
+// the bytesPerImage the texture was made with, as the host lays the array out; through a view of
+// its later slices too. Over a Managed buffer, the host is told the slice's span. A slice past the
+// array copies nothing.
+void test_buffer_texture_slices()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	// 4 x 3 BGRA8 slices, rows 32 bytes apart from offset 128: each slice's 96 bytes of rows take
+	// 128.
+	const NSUInteger length = 0x1000, offset = 128, pitch = 32, slicePitch = 128;
+	MTLTextureDescriptor *desc =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:4
+	                                                      height:3
+	                                                   mipmapped:NO];
+	desc.textureType = MTLTextureType2DArray;
+	desc.arrayLength = 3;
+	desc.usage = MTLTextureUsageShaderRead;
+	RgfxRegion::Block block = region.allocate(length);
+	CHECK(block.ok);
+	uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+	std::memset(bytes, 0, length);
+	RgfxBuffer *managed = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
+	                                                      regionOffset:block.offset
+	                                                            length:length
+	                                                           options:MTLResourceStorageModeManaged
+	                                                       deallocator:nil
+	                                                            device:nil
+	                                                        serializer:&fx.ser];
+	CHECK(managed != nil);
+	desc.storageMode = MTLStorageModeManaged;
+	id<MTLTexture> tex = [(id<RgfxMetalBufferInternals>)managed newLinearTextureWithDescriptor:desc
+	                                                                                  offset:offset
+	                                                                             bytesPerRow:pitch
+	                                                                           bytesPerImage:0x400];
+	CHECK(tex != nil && tex.arrayLength == 3);
+	drainRing(fx.ring);
+
+	// 2 x 2 texels at (1, 1) of each slice, rows 8 bytes apart in `in`: slice s holds 0x10 * s.
+	const MTLRegion written = MTLRegionMake2D(1, 1, 2, 2);
+	uint8_t in[16];
+	for (NSUInteger s = 0; s < 3; s++) {
+		for (size_t i = 0; i < sizeof in; i++)
+			in[i] = static_cast<uint8_t>(0x10 * s + i);
+		[tex replaceRegion:written
+		       mipmapLevel:0
+		             slice:s
+		         withBytes:in
+		       bytesPerRow:8
+		     bytesPerImage:16];
+		const NSUInteger first = offset + s * slicePitch + pitch + 4;
+		CHECK(std::memcmp(bytes + first, in, 8) == 0);
+		CHECK(std::memcmp(bytes + first + pitch, in + 8, 8) == 0);
+		CHECK(bytes[first - 1] == 0 && bytes[first + 8] == 0);
+		auto range =
+		    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(range.obj_id == managed.rgfxObjId && range.location == first &&
+		      range.length == pitch + 8);
+		CHECK(ringEmpty(fx.ring));
+		uint8_t out[16] = {};
+		[tex getBytes:out
+		      bytesPerRow:8
+		    bytesPerImage:16
+		       fromRegion:written
+		      mipmapLevel:0
+		            slice:s];
+		CHECK(std::memcmp(out, in, sizeof in) == 0);
+	}
+	// Nothing lies between the slices' rows.
+	CHECK(bytes[offset + 3 * pitch] == 0 && bytes[offset + slicePitch - 1] == 0);
+
+	// A view of slices 1 and 2: its slice 1 is the array's slice 2.
+	id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                             textureType:MTLTextureType2DArray
+	                                                  levels:NSMakeRange(0, 1)
+	                                                  slices:NSMakeRange(1, 2)];
+	CHECK(view != nil);
+	drainRing(fx.ring);
+	uint8_t out[16] = {};
+	[view getBytes:out
+	      bytesPerRow:8
+	    bytesPerImage:16
+	       fromRegion:written
+	      mipmapLevel:0
+	            slice:1];
+	CHECK(std::memcmp(out, in, sizeof in) == 0); // slice 2's, written last
+	std::memset(in, 0xee, sizeof in);
+	[view replaceRegion:written mipmapLevel:0 slice:0 withBytes:in bytesPerRow:8 bytesPerImage:16];
+	CHECK(bytes[offset + slicePitch + pitch + 4] == 0xee);
+	drainRing(fx.ring);
+
+	// Past the array: nothing is copied or posted.
+	std::vector<uint8_t> before(bytes, bytes + length);
+	[tex replaceRegion:written mipmapLevel:0 slice:3 withBytes:in bytesPerRow:8 bytesPerImage:16];
+	CHECK(std::memcmp(bytes, before.data(), length) == 0 && ringEmpty(fx.ring));
+	std::memset(out, 0x55, sizeof out);
+	[tex getBytes:out bytesPerRow:8 bytesPerImage:16 fromRegion:written mipmapLevel:0 slice:3];
+	CHECK(out[0] == 0x55 && out[15] == 0x55);
+	drainRing(fx.ring);
+}
+
 // A device that answers only its linear texture alignment: 256 bytes, as the AMD 5300M's and the
 // lane's.
 @interface RgfxLinearAlignmentDevice : NSObject
@@ -11829,6 +11933,7 @@ int main(int argc, char **argv)
 		test_managed_layout();
 		test_managed_buffer_range();
 		test_buffer_texture_replace_region_tells_the_host();
+		test_buffer_texture_slices();
 		test_buffer_texture_did_modify_data_tells_the_host();
 		test_buffer_texture_linear_alignment();
 		test_managed_texture_cpu_copy();

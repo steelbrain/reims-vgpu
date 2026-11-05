@@ -1494,6 +1494,18 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // is uploaded here, as a didModifyRange: uploads its range alone (docs/graphics-kext/
 // dgpu-oracle.md, Q2 and Q3).
 
+// The bytes from one slice of a texture over a buffer to the next in the buffer: its rows'
+// bytes, rounded up to 128 bytes. The host's linear form lays out a 2D array's slices so, whatever
+// the bytesPerImage asked, as Metal's does (measured on the M3 Max and an M4 under macOS 27 by
+// metal2vulkan, whose runtime lays them out the same: read from its linear_plan.rs). Every
+// other texture over a buffer has one slice.
+- (uint64_t)rgfxBufferSlicePitch
+{
+	const RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
+	const uint64_t rows = (std::max<uint64_t>(1, _desc.height) + b.height - 1) / b.height;
+	return (_bufferBytesPerRow * rows + 127) / 128 * 128;
+}
+
 // Copies `region` of `level` and `slice` between the texture and the caller's `bytes`, rows
 // `bytesPerRow` apart and images `bytesPerImage` apart: out of the texture into `bytes` when
 // `toBytes`, else into the texture.
@@ -1537,16 +1549,20 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	uint8_t *caller = static_cast<uint8_t *>(bytes);
 
 	if (_buffer != nil) {
-		// Its one level and slice lie in the buffer, rows _bufferBytesPerRow apart.
+		// Its one level lies in the buffer, rows _bufferBytesPerRow apart, and each slice of a 2D
+		// array (the linear form's) rgfxBufferSlicePitch after the one before.
 		uint8_t *contents = static_cast<uint8_t *>([_buffer contents]);
 		RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
-		if (contents == nullptr || level != 0 || slice != 0 || shape.images != 1) {
+		const uint64_t slices =
+		    rgfxSlicesOf(static_cast<MTLTextureType>(_desc.texture_type), _desc.array_length);
+		if (contents == nullptr || level != 0 || slice >= slices || shape.images != 1) {
 			static std::atomic<bool> logged{false};
 			rgfxNoteCopyRefused(logged, @"a CPU copy of a texture over a buffer it cannot reach",
 			                    self);
 			return;
 		}
-		uint8_t *at = contents + _bufferOffset + region.origin.y / b.height * _bufferBytesPerRow +
+		uint8_t *at = contents + _bufferOffset + slice * [self rgfxBufferSlicePitch] +
+		              region.origin.y / b.height * _bufferBytesPerRow +
 		              region.origin.x / b.width * b.bytes;
 		if (toBytes) {
 			copyRows(caller, bytesPerRow, imageBytes, at, _bufferBytesPerRow, 0);
