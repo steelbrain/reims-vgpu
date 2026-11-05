@@ -59,6 +59,30 @@
 //                write made with no didModifyRange:, and the CPU a blit's write with no synchronize
 //   linalign     (a group) minimumLinearTextureAlignmentForPixelFormat: of raw formats 0 to 799,
 //                1000, 1023, 4096 and 65535, one child each (linalign.N)
+//   argbuf.ds.*  a depth/stencil state in an argument buffer: .id (its gpuResourceID), .encoder
+//                (an encoder of one MTLDataTypeDepthStencilState descriptor), .set (the bytes
+//                setDepthStencilState:atIndex: writes there), .mixed (beside a texture and a
+//                pointer), .function (an argument buffer of oracle_bundle_ds.metallib holding one)
+//   argbuf.binding  the bindings a compute pipeline of div_argbuf (oracle_bundle_args.metallib)
+//                reflects, and newArgumentEncoderWithBufferBinding: of its argument buffer's
+//                binding against the function's own encoder; .plain, of its plain buffer's; .lib,
+//                of the binding the library's reflectionForFunctionWithName: answers
+//   argbuf.reflection  newArgumentEncoderWithBufferIndex:reflection: at div_argbuf's argument
+//                buffer, its plain buffer and an index it has no buffer at
+//   iosurf.props copyIOSurfaceSharedTextureProperties: (SPI) for textures of several formats,
+//                sizes and usages, and a surface made of the properties
+//   iosurf.buffer  newBufferWithIOSurface: (SPI) over BGRA surfaces (.420v, a two-plane one): the
+//                buffer's length, options, contents and iosurface, and CPU and GPU writes through
+//                one seen through the other
+//   event.port   a shared event's eventPort (SPI), its NSCoding through a keyed archiver, and its
+//                handle's
+//   archive.slices  binary archives of a serialized archive's slices, recombined and with their
+//                bytes junked, alone and together, each opened and asked for a pipeline
+//   classes.spi  which classes of the device's, its shared event's and its buffer's (and
+//                IOGPU's base classes) define the SPI the cases above call
+//   libforms2    newLibraryWithFunctionArray:error: of two functions, of one twice, and the
+//                packages' creators over an empty directory and other URLs; libforms.kernel and
+//                libforms.vertex, a function array of a kernel or a vertex function
 // Build: see README.md.
 #import "oracle_common.h"
 #import <IOSurface/IOSurface.h>
@@ -1346,6 +1370,793 @@ static void case_nocopy_ro(id<MTLDevice> d, const char *tag, int file, MTLResour
 	}
 }
 
+// --- argument buffers (argbuf.*) ----------------------------------------------------------
+
+static id<MTLDepthStencilState> probe_ds(id<MTLDevice> d)
+{
+	MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+	dd.depthCompareFunction = MTLCompareFunctionLess;
+	dd.depthWriteEnabled = YES;
+	return [d newDepthStencilStateWithDescriptor:dd];
+}
+
+static void dump_bytes(const char *tag, const char *what, const void *p, size_t n)
+{
+	const uint8_t *b = p;
+	printf("%s %s", tag, what);
+	for (size_t k = 0; k < n; k++)
+		printf("%s%02x", k % 8 ? "" : " ", b[k]);
+	printf("\n");
+}
+
+static MTLArgumentDescriptor *arg_desc(MTLDataType type, NSUInteger index)
+{
+	MTLArgumentDescriptor *a = [MTLArgumentDescriptor argumentDescriptor];
+	a.dataType = type;
+	a.index = index;
+	if (type == MTLDataTypeTexture)
+		a.textureType = MTLTextureType2D;
+	return a;
+}
+
+static void case_argbuf_ds_id(id<MTLDevice> d)
+{
+	printf("argbuf.ds.id argumentBuffersSupport=%ld\n", (long)d.argumentBuffersSupport);
+	id<MTLDepthStencilState> ds = probe_ds(d);
+	printf("argbuf.ds.id state=%s respondsToGpuResourceID=%d\n", cls(ds),
+	       (int)[(id)ds respondsToSelector:@selector(gpuResourceID)]);
+	fflush(stdout);
+	if ([(id)ds respondsToSelector:@selector(gpuResourceID)]) {
+		MTLResourceID rid = ds.gpuResourceID;
+		printf("argbuf.ds.id gpuResourceID=0x%llx\n", (unsigned long long)rid._impl);
+		id<MTLDepthStencilState> ds2 = probe_ds(d);
+		printf("argbuf.ds.id second=0x%llx same=%d\n",
+		       (unsigned long long)ds2.gpuResourceID._impl, ds2 == ds);
+	}
+}
+
+// An encoder of `descs`, and the bytes setting `ds` at `dsIndex` writes into a buffer of 0xa5.
+static void argbuf_ds_encoder(id<MTLDevice> d, const char *tag, NSArray<MTLArgumentDescriptor *> *descs,
+                              NSUInteger dsIndex, BOOL set)
+{
+	id<MTLArgumentEncoder> enc = [d newArgumentEncoderWithArguments:descs];
+	printf("%s encoder=%s encodedLength=%lu alignment=%lu\n", tag, cls(enc),
+	       (unsigned long)enc.encodedLength, (unsigned long)enc.alignment);
+	fflush(stdout);
+	if (enc == nil || !set)
+		return;
+	id<MTLBuffer> b = [d newBufferWithLength:256 options:MTLResourceStorageModeShared];
+	memset(b.contents, 0xa5, 256);
+	[enc setArgumentBuffer:b offset:0];
+	id<MTLDepthStencilState> ds = probe_ds(d);
+	printf("%s state gpuResourceID=0x%llx\n", tag,
+	       [(id)ds respondsToSelector:@selector(gpuResourceID)]
+	           ? (unsigned long long)ds.gpuResourceID._impl
+	           : 0ull);
+	fflush(stdout);
+	[enc setDepthStencilState:ds atIndex:dsIndex];
+	dump_bytes(tag, "after set", b.contents, MIN((size_t)64, (size_t)enc.encodedLength + 16));
+	fflush(stdout);
+	[enc setDepthStencilState:nil atIndex:dsIndex];
+	dump_bytes(tag, "after nil", b.contents, MIN((size_t)64, (size_t)enc.encodedLength + 16));
+}
+
+static void case_argbuf_ds_function(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle_ds.metallib") error:&e];
+	printf("argbuf.ds.function library=%s error=%s\n", cls(lib), err_text(e));
+	fflush(stdout);
+	if (lib == nil)
+		return;
+	id<MTLFunction> fn = [lib newFunctionWithName:@"div_ds"];
+	printf("argbuf.ds.function function=%s\n", cls(fn));
+	fflush(stdout);
+	id<MTLArgumentEncoder> enc = [fn newArgumentEncoderWithBufferIndex:0];
+	printf("argbuf.ds.function encoder=%s encodedLength=%lu alignment=%lu\n", cls(enc),
+	       (unsigned long)enc.encodedLength, (unsigned long)enc.alignment);
+	fflush(stdout);
+	e = nil;
+	id p = [d newComputePipelineStateWithFunction:fn error:&e];
+	printf("argbuf.ds.function pipeline=%s error=%s\n", p ? "made" : "nil", err_text(e));
+	fflush(stdout);
+	if (enc == nil)
+		return;
+	id<MTLBuffer> b = [d newBufferWithLength:256 options:MTLResourceStorageModeShared];
+	memset(b.contents, 0xa5, 256);
+	[enc setArgumentBuffer:b offset:0];
+	[enc setDepthStencilState:probe_ds(d) atIndex:0];
+	dump_bytes("argbuf.ds.function", "after set", b.contents, 32);
+}
+
+static NSString *type_text(MTLType *t, int depth);
+
+static NSString *struct_text(MTLStructType *s, int depth)
+{
+	NSMutableArray<NSString *> *parts = [NSMutableArray array];
+	for (MTLStructMember *m in s.members)
+		[parts addObject:[NSString stringWithFormat:@"%@@%lu:%lu#%lu%@", m.name,
+		                                            (unsigned long)m.offset,
+		                                            (unsigned long)m.dataType,
+		                                            (unsigned long)m.argumentIndex,
+		                                            depth < 3 ? type_text((MTLType *)m.arrayType ?: (MTLType *)m.structType ?: (MTLType *)m.textureReferenceType ?: (MTLType *)m.pointerType, depth + 1) : @""]];
+	return [NSString stringWithFormat:@"{%@}", [parts componentsJoinedByString:@","]];
+}
+
+static NSString *type_text(MTLType *t, int depth)
+{
+	if (t == nil)
+		return @"";
+	if ([t isKindOfClass:[MTLStructType class]])
+		return struct_text((MTLStructType *)t, depth);
+	if ([t isKindOfClass:[MTLArrayType class]]) {
+		MTLArrayType *a = (MTLArrayType *)t;
+		return [NSString stringWithFormat:@"[%lu x %lu stride %lu argStride %lu%@]",
+		                                  (unsigned long)a.arrayLength,
+		                                  (unsigned long)a.elementType,
+		                                  (unsigned long)a.stride,
+		                                  (unsigned long)a.argumentIndexStride,
+		                                  type_text((MTLType *)a.elementStructType ?: (MTLType *)a.elementTextureReferenceType ?: (MTLType *)a.elementPointerType, depth + 1)];
+	}
+	if ([t isKindOfClass:[MTLPointerType class]]) {
+		MTLPointerType *p = (MTLPointerType *)t;
+		return [NSString stringWithFormat:@"*(%lu align %lu size %lu access %lu argbuf %d%@)",
+		                                  (unsigned long)p.elementType,
+		                                  (unsigned long)p.alignment,
+		                                  (unsigned long)p.dataSize, (unsigned long)p.access,
+		                                  (int)p.elementIsArgumentBuffer,
+		                                  type_text((MTLType *)p.elementStructType ?: (MTLType *)p.elementArrayType, depth + 1)];
+	}
+	if ([t isKindOfClass:[MTLTextureReferenceType class]]) {
+		MTLTextureReferenceType *r = (MTLTextureReferenceType *)t;
+		return [NSString stringWithFormat:@"tex(%lu %lu %lu depth %d)",
+		                                  (unsigned long)r.textureDataType,
+		                                  (unsigned long)r.textureType, (unsigned long)r.access,
+		                                  (int)r.isDepthTexture];
+	}
+	return [NSString stringWithFormat:@"type(%lu)", (unsigned long)t.dataType];
+}
+
+static void print_binding(const char *tag, id<MTLBinding> b)
+{
+	printf("%s binding class=%s name=%s type=%ld index=%lu access=%ld used=%d argument=%d "
+	       "isMTLArgument=%d",
+	       tag, cls(b), b.name.UTF8String, (long)b.type, (unsigned long)b.index, (long)b.access,
+	       (int)b.used, (int)b.argument, (int)[(id)b isKindOfClass:[MTLArgument class]]);
+	if (b.type == MTLBindingTypeBuffer && [(id)b conformsToProtocol:@protocol(MTLBufferBinding)]) {
+		id<MTLBufferBinding> bb = (id<MTLBufferBinding>)b;
+		printf(" bufferDataType=%lu alignment=%lu dataSize=%lu struct=%s pointer=%s",
+		       (unsigned long)bb.bufferDataType, (unsigned long)bb.bufferAlignment,
+		       (unsigned long)bb.bufferDataSize, struct_text(bb.bufferStructType, 0).UTF8String,
+		       type_text(bb.bufferPointerType, 0).UTF8String);
+	}
+	printf("\n");
+}
+
+static void print_argument(const char *tag, MTLArgument *a)
+{
+	if (a == nil) {
+		printf("%s reflection=nil\n", tag);
+		return;
+	}
+	printf("%s reflection class=%s conformsBufferBinding=%d name=%s type=%ld index=%lu "
+	       "access=%ld active=%d bufferDataType=%lu alignment=%lu dataSize=%lu arrayLength=%lu "
+	       "struct=%s pointer=%s\n",
+	       tag, cls(a), (int)[a conformsToProtocol:@protocol(MTLBufferBinding)], a.name.UTF8String,
+	       (long)a.type, (unsigned long)a.index, (long)a.access, (int)a.active,
+	       (unsigned long)a.bufferDataType, (unsigned long)a.bufferAlignment,
+	       (unsigned long)a.bufferDataSize, (unsigned long)a.arrayLength,
+	       struct_text(a.bufferStructType, 0).UTF8String,
+	       type_text(a.bufferPointerType, 0).UTF8String);
+}
+
+// Fills an argument buffer through `enc` with the same objects at each of div_argbuf's indices.
+static NSData *fill_args(id<MTLDevice> d, id<MTLArgumentEncoder> enc, NSArray *objects)
+{
+	id<MTLBuffer> b = [d newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+	memset(b.contents, 0xa5, 4096);
+	[enc setArgumentBuffer:b offset:0];
+	[enc setTexture:objects[0] atIndex:0];
+	[enc setBuffer:objects[1] offset:16 atIndex:1];
+	[enc setSamplerState:objects[2] atIndex:2];
+	float *scale = [enc constantDataAtIndex:3];
+	if (scale)
+		*scale = 3.5f;
+	for (NSUInteger i = 0; i < 3; i++)
+		[enc setTexture:objects[0] atIndex:4 + i];
+	return [NSData dataWithBytes:b.contents length:MIN((NSUInteger)4096, enc.encodedLength + 8)];
+}
+
+static NSArray *args_objects(id<MTLDevice> d)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	                                                                              width:4
+	                                                                             height:4
+	                                                                          mipmapped:NO];
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> buf = [d newBufferWithLength:256 options:MTLResourceStorageModeShared];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	sd.supportArgumentBuffers = YES;
+	id<MTLSamplerState> s = [d newSamplerStateWithDescriptor:sd];
+	return @[ t, buf, s ];
+}
+
+static id<MTLFunction> args_function(id<MTLDevice> d, id<MTLLibrary> *libOut)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle_args.metallib") error:&e];
+	if (lib == nil)
+		printf("argbuf library error=%s\n", err_text(e));
+	if (libOut)
+		*libOut = lib;
+	return [lib newFunctionWithName:@"div_argbuf"];
+}
+
+// The pipeline's reflection's bindings of div_argbuf, and an encoder made from each buffer binding,
+// compared with the function's own encoder.
+static void case_argbuf_binding(id<MTLDevice> d, BOOL plain, BOOL fromLibrary)
+{
+	const char *tag = fromLibrary ? "argbuf.binding.lib" : plain ? "argbuf.binding.plain" : "argbuf.binding";
+	id<MTLLibrary> lib = nil;
+	id<MTLFunction> fn = args_function(d, &lib);
+	if (fn == nil)
+		return;
+	NSArray<id<MTLBinding>> *bindings = nil;
+	if (fromLibrary) {
+		SEL sel = sel_registerName("reflectionForFunctionWithName:");
+		if (![(id)lib respondsToSelector:sel]) {
+			printf("%s library reflection n/r\n", tag);
+			return;
+		}
+		MTLFunctionReflection *r = ((id(*)(id, SEL, id))objc_msgSend)(lib, sel, @"div_argbuf");
+		printf("%s functionReflection=%s\n", tag, cls(r));
+		bindings = r.bindings;
+	} else {
+		MTLComputePipelineReflection *refl = nil;
+		NSError *e = nil;
+		id p = [d newComputePipelineStateWithFunction:fn
+		                                      options:MTLPipelineOptionBindingInfo |
+		                                              MTLPipelineOptionBufferTypeInfo
+		                                   reflection:&refl
+		                                        error:&e];
+		printf("%s pipeline=%s reflection=%s error=%s\n", tag, p ? "made" : "nil", cls(refl),
+		       err_text(e));
+		bindings = refl.bindings;
+	}
+	for (id<MTLBinding> b in bindings)
+		print_binding(tag, b);
+	fflush(stdout);
+	id<MTLArgumentEncoder> own = [fn newArgumentEncoderWithBufferIndex:0];
+	printf("%s functionEncoder=%s encodedLength=%lu alignment=%lu\n", tag, cls(own),
+	       (unsigned long)own.encodedLength, (unsigned long)own.alignment);
+	NSArray *objects = args_objects(d);
+	NSData *ownBytes = own ? fill_args(d, own, objects) : nil;
+	for (id<MTLBinding> b in bindings) {
+		if (b.type != MTLBindingTypeBuffer || (plain ? b.index != 1 : b.index != 0))
+			continue;
+		printf("%s newArgumentEncoderWithBufferBinding: %s\n", tag, b.name.UTF8String);
+		fflush(stdout);
+		id<MTLArgumentEncoder> enc = [d newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)b];
+		printf("%s bindingEncoder=%s encodedLength=%lu alignment=%lu\n", tag, cls(enc),
+		       (unsigned long)enc.encodedLength, (unsigned long)enc.alignment);
+		fflush(stdout);
+		if (enc == nil || own == nil)
+			continue;
+		NSData *bytes = fill_args(d, enc, objects);
+		printf("%s sameBytes=%d\n", tag, (int)[bytes isEqualToData:ownBytes]);
+		dump_bytes(tag, "function", ownBytes.bytes, MIN((size_t)96, ownBytes.length));
+		dump_bytes(tag, "binding", bytes.bytes, MIN((size_t)96, bytes.length));
+		id<MTLArgumentEncoder> nested = [enc newArgumentEncoderForBufferAtIndex:1];
+		printf("%s nestedAt1=%s\n", tag, cls(nested));
+	}
+}
+
+static void case_argbuf_reflection(id<MTLDevice> d)
+{
+	id<MTLFunction> fn = args_function(d, NULL);
+	if (fn == nil)
+		return;
+	const NSUInteger indices[] = {0, 1, 5};
+	for (int i = 0; i < 3; i++) {
+		char tag[64];
+		snprintf(tag, sizeof tag, "argbuf.reflection.%lu", (unsigned long)indices[i]);
+		MTLAutoreleasedArgument arg = nil;
+		id<MTLArgumentEncoder> enc = [fn newArgumentEncoderWithBufferIndex:indices[i]
+		                                                         reflection:&arg];
+		printf("%s encoder=%s encodedLength=%lu\n", tag, cls(enc), (unsigned long)enc.encodedLength);
+		print_argument(tag, arg);
+		fflush(stdout);
+	}
+	MTLAutoreleasedArgument a1 = nil, a2 = nil;
+	id<MTLArgumentEncoder> e1 = [fn newArgumentEncoderWithBufferIndex:0 reflection:&a1];
+	id<MTLArgumentEncoder> e2 = [fn newArgumentEncoderWithBufferIndex:0 reflection:&a2];
+	printf("argbuf.reflection sameObject=%d isEqual=%d encoders=%s,%s\n", a1 == a2,
+	       (int)[a1 isEqual:a2], cls(e1), cls(e2));
+}
+
+// --- IOSurfaces (iosurf.*) -----------------------------------------------------------------
+
+static IOSurfaceRef probe_surface(uint32_t fourcc, size_t w, size_t h, size_t bpe)
+{
+	NSDictionary *p = @{
+		(id)kIOSurfaceWidth : @(w),
+		(id)kIOSurfaceHeight : @(h),
+		(id)kIOSurfaceBytesPerElement : @(bpe),
+		(id)kIOSurfacePixelFormat : @(fourcc),
+	};
+	return IOSurfaceCreate((__bridge CFDictionaryRef)p);
+}
+
+static NSString *dict_text(NSDictionary *dict)
+{
+	NSMutableArray<NSString *> *parts = [NSMutableArray array];
+	for (id k in [dict.allKeys sortedArrayUsingSelector:@selector(compare:)])
+		[parts addObject:[NSString stringWithFormat:@"%@=%@", k, dict[k]]];
+	return [NSString stringWithFormat:@"%@{%@}", NSStringFromClass([dict class]),
+	                                  [parts componentsJoinedByString:@","]];
+}
+
+static void surface_props(id<MTLDevice> d, const char *tag, MTLPixelFormat format, NSUInteger w,
+                          NSUInteger h, MTLTextureUsage usage, BOOL mips)
+{
+	SEL sel = sel_registerName("copyIOSurfaceSharedTextureProperties:");
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                                              width:w
+	                                                                             height:h
+	                                                                          mipmapped:mips];
+	td.usage = usage;
+	td.storageMode = MTLStorageModeShared;
+	NSDictionary *dict = nil;
+	@try {
+		dict = ((id(*)(id, SEL, id))objc_msgSend)(d, sel, td);
+		printf("%s format=%lu %lux%lu usage=%lu mips=%d props=%s\n", tag, (unsigned long)format,
+		       (unsigned long)w, (unsigned long)h, (unsigned long)usage, (int)mips,
+		       dict ? dict_text(dict).UTF8String : "nil");
+	} @catch (NSException *x) {
+		printf("%s threw %s %s\n", tag, x.name.UTF8String, x.reason.UTF8String);
+		return;
+	}
+	if (dict == nil)
+		return;
+	IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)dict);
+	printf("%s surfaceFromProps=%s", tag, s ? "made" : "nil");
+	if (s) {
+		printf(" alloc=%zu bytesPerRow=%zu width=%zu height=%zu", IOSurfaceGetAllocSize(s),
+		       IOSurfaceGetBytesPerRow(s), IOSurfaceGetWidth(s), IOSurfaceGetHeight(s));
+		td.storageMode = MTLStorageModeShared;
+		id<MTLTexture> t = [d newTextureWithDescriptor:td iosurface:s plane:0];
+		printf(" texture=%s", t ? "made" : "nil");
+		CFRelease(s);
+	}
+	printf("\n");
+}
+
+static void case_iosurf_props(id<MTLDevice> d)
+{
+	SEL sel = sel_registerName("copyIOSurfaceSharedTextureProperties:");
+	printf("iosurf.props responds=%d\n", (int)[d respondsToSelector:sel]);
+	fflush(stdout);
+	if (![d respondsToSelector:sel])
+		return;
+	const MTLTextureUsage rr = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	surface_props(d, "iosurf.props.bgra64", MTLPixelFormatBGRA8Unorm, 64, 64, rr, NO);
+	surface_props(d, "iosurf.props.bgra64.write", MTLPixelFormatBGRA8Unorm, 64, 64,
+	              MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite, NO);
+	surface_props(d, "iosurf.props.rgba16f", MTLPixelFormatRGBA16Float, 256, 256, rr, NO);
+	surface_props(d, "iosurf.props.r8", MTLPixelFormatR8Unorm, 17, 9, rr, NO);
+	surface_props(d, "iosurf.props.bgra1080", MTLPixelFormatBGRA8Unorm, 1920, 1080, rr, NO);
+	surface_props(d, "iosurf.props.rgb10a2", MTLPixelFormatRGB10A2Unorm, 100, 30,
+	              MTLTextureUsageShaderRead, NO);
+	fflush(stdout);
+	surface_props(d, "iosurf.props.mips", MTLPixelFormatBGRA8Unorm, 64, 64, rr, YES);
+}
+
+static void surface_buffer(id<MTLDevice> d, const char *tag, IOSurfaceRef s)
+{
+	SEL sel = sel_registerName("newBufferWithIOSurface:");
+	printf("%s surface alloc=%zu bytesPerRow=%zu planes=%zu base=%p\n", tag,
+	       IOSurfaceGetAllocSize(s), IOSurfaceGetBytesPerRow(s), IOSurfaceGetPlaneCount(s),
+	       IOSurfaceGetBaseAddress(s));
+	fflush(stdout);
+	id<MTLBuffer> b = nil;
+	@try {
+		b = ((id(*)(id, SEL, IOSurfaceRef))objc_msgSend)(d, sel, s);
+	} @catch (NSException *x) {
+		printf("%s threw %s %s\n", tag, x.name.UTF8String, x.reason.UTF8String);
+		return;
+	}
+	printf("%s buffer=%s", tag, cls(b));
+	if (b == nil) {
+		printf("\n");
+		return;
+	}
+	SEL iosel = sel_registerName("iosurface");
+	IOSurfaceRef back = [(id)b respondsToSelector:iosel]
+	                        ? ((IOSurfaceRef(*)(id, SEL))objc_msgSend)(b, iosel)
+	                        : NULL;
+	printf(" length=%lu allocatedSize=%lu options=0x%lx storage=%lu contents=%p "
+	       "contentsIsBase=%d iosurfaceIsSurface=%d gpuAddress=%d\n",
+	       (unsigned long)b.length, (unsigned long)b.allocatedSize,
+	       (unsigned long)b.resourceOptions, (unsigned long)b.storageMode, b.contents,
+	       b.contents == IOSurfaceGetBaseAddress(s), back == s, b.gpuAddress != 0);
+	fflush(stdout);
+	// CPU writes through the surface, read through the buffer, and the reverse.
+	IOSurfaceLock(s, 0, NULL);
+	uint8_t *base = IOSurfaceGetBaseAddress(s);
+	base[0] = 0x11;
+	base[IOSurfaceGetAllocSize(s) - 1] = 0x22;
+	IOSurfaceUnlock(s, 0, NULL);
+	const uint8_t *c = b.contents;
+	if (c)
+		printf("%s cpu surface->buffer first=%02x last=%02x\n", tag, c[0],
+		       c[MIN(b.length, IOSurfaceGetAllocSize(s)) - 1]);
+	// The GPU fills the buffer's first 256 bytes; the surface's pages then hold them?
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+	[bl fillBuffer:b range:NSMakeRange(0, 256) value:0x77];
+	[bl endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+	printf("%s gpu buffer->surface byte0=%02x byte255=%02x byte256=%02x status=%ld\n", tag,
+	       base[0], base[255], base[256], (long)cb.status);
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+}
+
+static void case_iosurf_buffer(id<MTLDevice> d, int which)
+{
+	SEL sel = sel_registerName("newBufferWithIOSurface:");
+	printf("iosurf.buffer responds=%d\n", (int)[d respondsToSelector:sel]);
+	fflush(stdout);
+	if (![d respondsToSelector:sel])
+		return;
+	if (which == 0) {
+		IOSurfaceRef s = probe_surface('BGRA', 64, 64, 4);
+		surface_buffer(d, "iosurf.buffer.bgra64", s);
+		CFRelease(s);
+		s = probe_surface('BGRA', 100, 7, 4);
+		surface_buffer(d, "iosurf.buffer.bgra100x7", s);
+		CFRelease(s);
+	} else {
+		NSDictionary *plane0 = @{
+			(id)kIOSurfacePlaneWidth : @64,
+			(id)kIOSurfacePlaneHeight : @64,
+			(id)kIOSurfacePlaneBytesPerElement : @1,
+		};
+		NSDictionary *plane1 = @{
+			(id)kIOSurfacePlaneWidth : @32,
+			(id)kIOSurfacePlaneHeight : @32,
+			(id)kIOSurfacePlaneBytesPerElement : @2,
+		};
+		NSDictionary *p = @{
+			(id)kIOSurfaceWidth : @64,
+			(id)kIOSurfaceHeight : @64,
+			(id)kIOSurfacePixelFormat : @('420v'),
+			(id)kIOSurfacePlaneInfo : @[ plane0, plane1 ],
+		};
+		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)p);
+		if (s == NULL) {
+			printf("iosurf.buffer.420v no surface\n");
+			return;
+		}
+		surface_buffer(d, "iosurf.buffer.420v", s);
+		CFRelease(s);
+	}
+}
+
+// --- shared events (event.*) ---------------------------------------------------------------
+
+static void case_event_port(id<MTLDevice> d)
+{
+	id<MTLSharedEvent> se = [d newSharedEvent];
+	se.signaledValue = 7;
+	printf("event.port event=%s", cls(se));
+	for (Class c = class_getSuperclass(object_getClass(se)); c; c = class_getSuperclass(c))
+		printf(" < %s", class_getName(c));
+	printf("\n");
+	SEL port = sel_registerName("eventPort");
+	if ([(id)se respondsToSelector:port]) {
+		unsigned int p = ((unsigned int (*)(id, SEL))objc_msgSend)(se, port);
+		printf("event.port eventPort=%s\n", p ? "nonzero" : "0");
+	} else
+		printf("event.port eventPort n/r\n");
+	printf("event.port NSCoding=%d NSSecureCoding=%d supportsSecureCoding=%d "
+	       "respondsEncode=%d respondsInit=%d\n",
+	       (int)[(id)se conformsToProtocol:@protocol(NSCoding)],
+	       (int)[(id)se conformsToProtocol:@protocol(NSSecureCoding)],
+	       [[(id)se class] respondsToSelector:@selector(supportsSecureCoding)]
+	           ? (int)[[(id)se class] supportsSecureCoding]
+	           : -1,
+	       (int)[(id)se respondsToSelector:@selector(encodeWithCoder:)],
+	       (int)[[(id)se class] instancesRespondToSelector:@selector(initWithCoder:)]);
+	fflush(stdout);
+	for (int secure = 1; secure >= 0; secure--) {
+		@try {
+			NSError *e = nil;
+			NSData *data = [NSKeyedArchiver archivedDataWithRootObject:se
+			                                     requiringSecureCoding:secure
+			                                                     error:&e];
+			printf("event.port keyedArchive secure=%d data=%lu error=%s\n", secure,
+			       (unsigned long)data.length, err_text(e));
+			if (data != nil) {
+				e = nil;
+				id back = [NSKeyedUnarchiver unarchivedObjectOfClass:[(id)se class]
+				                                            fromData:data
+				                                               error:&e];
+				printf("event.port unarchived=%s value=%llu error=%s\n", cls(back),
+				       back ? [(id<MTLSharedEvent>)back signaledValue] : 0ull, err_text(e));
+			}
+		} @catch (NSException *x) {
+			printf("event.port keyedArchive secure=%d threw %s %s\n", secure, x.name.UTF8String,
+			       x.reason.UTF8String);
+		}
+		fflush(stdout);
+	}
+	MTLSharedEventHandle *h = [se newSharedEventHandle];
+	printf("event.port handle=%s label=%s\n", cls(h), h.label ? h.label.UTF8String : "nil");
+	@try {
+		NSError *e = nil;
+		NSData *data = [NSKeyedArchiver archivedDataWithRootObject:h requiringSecureCoding:YES error:&e];
+		printf("event.port handleArchive data=%lu error=%s\n", (unsigned long)data.length,
+		       err_text(e));
+	} @catch (NSException *x) {
+		printf("event.port handleArchive threw %s %s\n", x.name.UTF8String, x.reason.UTF8String);
+	}
+	id<MTLSharedEvent> again = h ? [d newSharedEventWithHandle:h] : nil;
+	printf("event.port fromHandle=%s value=%llu sameObject=%d\n", cls(again),
+	       again ? again.signaledValue : 0ull, again == se);
+}
+
+// --- binary archive slices (archive.slices) ----------------------------------------------
+
+// A fat file of the given slices: each (cputype, subtype, bytes).
+static NSData *fat_of(uint32_t magic, NSArray<NSArray *> *slices)
+{
+	NSMutableData *m = [NSMutableData dataWithLength:8 + 20 * slices.count];
+	put_be32(m.mutableBytes, magic);
+	put_be32((uint8_t *)m.mutableBytes + 4, (uint32_t)slices.count);
+	for (NSUInteger i = 0; i < slices.count; i++) {
+		NSData *bytes = slices[i][2];
+		while (m.length % 16)
+			[m increaseLengthBy:1];
+		uint8_t *rec = (uint8_t *)m.mutableBytes + 8 + 20 * i;
+		put_be32(rec, [slices[i][0] unsignedIntValue]);
+		put_be32(rec + 4, [slices[i][1] unsignedIntValue]);
+		put_be32(rec + 8, (uint32_t)m.length);
+		put_be32(rec + 12, (uint32_t)bytes.length);
+		put_be32(rec + 16, 4);
+		[m appendData:bytes];
+	}
+	return m;
+}
+
+static NSData *junked(NSData *bytes, size_t from, size_t count)
+{
+	NSMutableData *m = [bytes mutableCopy];
+	if (from < m.length)
+		memset((uint8_t *)m.mutableBytes + from, 0x5a, MIN(count, m.length - from));
+	return m;
+}
+
+static void slices_variant(id<MTLDevice> d, id<MTLLibrary> lib, const char *tag, NSData *file)
+{
+	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
+	                                        stringByAppendingPathComponent:
+	                                            [NSString stringWithFormat:@"div-%s.bin", tag]]];
+	[file writeToURL:url atomically:YES];
+	describe_fat(tag, file);
+	pipeline_in(d, tag, lib, open_archive(d, tag, url));
+	fflush(stdout);
+}
+
+static void case_archive_slices(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+	id<MTLBinaryArchive> a = [d newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new]
+	                                                     error:&e];
+	MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
+	cd.computeFunction = [lib newFunctionWithName:@"div_kernel" constantValues:kernel_values(2.0f)
+	                                        error:&e];
+	[a addComputePipelineFunctionsWithDescriptor:cd error:&e];
+	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
+	                                        stringByAppendingPathComponent:@"div-slices.bin"]];
+	[a serializeToURL:url error:&e];
+	NSData *base = [NSData dataWithContentsOfURL:url];
+	if (base == nil || base.length < 48) {
+		printf("archive.slices no archive error=%s\n", err_text(e));
+		return;
+	}
+	describe_fat("archive.slices", base);
+	const uint8_t *b = base.bytes;
+	const uint32_t n = be32(b + 4);
+	NSData *air = nil, *gpu = nil;
+	uint32_t airType = 0, airSub = 0, gpuType = 0, gpuSub = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		const uint8_t *s = b + 8 + 20 * i;
+		NSData *bytes = [base subdataWithRange:NSMakeRange(be32(s + 8), be32(s + 12))];
+		if (be32(s) == 0x01000017) {
+			air = bytes;
+			airType = be32(s);
+			airSub = be32(s + 4);
+		} else {
+			gpu = bytes;
+			gpuType = be32(s);
+			gpuSub = be32(s + 4);
+		}
+	}
+	if (air == nil || gpu == nil) {
+		printf("archive.slices no AIR or GPU slice\n");
+		return;
+	}
+	const uint32_t m = 0xcbfebabe;
+	NSData *junk64 = junked([NSMutableData dataWithLength:64], 0, 64);
+	NSData *junkAir = junked(air, 0, air.length);
+	struct {
+		const char *tag;
+		NSArray *slices;
+	} v[] = {
+	    {"slices.both", @[ @[ @(airType), @(airSub), air ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.air.head64.gpu", @[ @[ @(airType), @(airSub), junked(air, 0, 64) ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.air.magic.gpu", @[ @[ @(airType), @(airSub), junked(air, 0, 4) ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.air.tail.gpu", @[ @[ @(airType), @(airSub), junked(air, 0x100, air.length) ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.air.all.gpu", @[ @[ @(airType), @(airSub), junkAir ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.air64.gpu", @[ @[ @(airType), @(airSub), junk64 ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.air.gpu.head64", @[ @[ @(airType), @(airSub), air ], @[ @(gpuType), @(gpuSub), junked(gpu, 0, 64) ] ]},
+	    {"slices.air.gpu64", @[ @[ @(airType), @(airSub), air ], @[ @(gpuType), @(gpuSub), junk64 ] ]},
+	    {"slices.air.only", @[ @[ @(airType), @(airSub), air ] ]},
+	    {"slices.air.only.head64", @[ @[ @(airType), @(airSub), junked(air, 0, 64) ] ]},
+	    {"slices.air.only.all", @[ @[ @(airType), @(airSub), junkAir ] ]},
+	    {"slices.air64.only", @[ @[ @(airType), @(airSub), junk64 ] ]},
+	    {"slices.gpu.only", @[ @[ @(gpuType), @(gpuSub), gpu ] ]},
+	    {"slices.gpu.only.head64", @[ @[ @(gpuType), @(gpuSub), junked(gpu, 0, 64) ] ]},
+	    {"slices.gpu64.only", @[ @[ @(gpuType), @(gpuSub), junk64 ] ]},
+	    {"slices.air.head64.other", @[ @[ @(airType), @(airSub), junked(air, 0, 64) ], @[ @(0x01000013u), @(0x142u), gpu ] ]},
+	    {"slices.air.head64.othersub", @[ @[ @(airType), @(airSub), junked(air, 0, 64) ], @[ @(gpuType), @(gpuSub ^ 0x10u), gpu ] ]},
+	    {"slices.air.other64", @[ @[ @(airType), @(airSub), air ], @[ @(0x01000013u), @(0x142u), junk64 ] ]},
+	    {"slices.other64.only", @[ @[ @(0x01000013u), @(0x142u), junk64 ] ]},
+	    {"slices.gpu.air.head64", @[ @[ @(gpuType), @(gpuSub), gpu ], @[ @(airType), @(airSub), junked(air, 0, 64) ] ]},
+	    {"slices.air.air64.gpu", @[ @[ @(airType), @(airSub), air ], @[ @(airType), @(airSub), junk64 ], @[ @(gpuType), @(gpuSub), gpu ] ]},
+	};
+	for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
+		slices_variant(d, lib, v[i].tag, fat_of(m, v[i].slices));
+}
+
+// --- library forms, more (libforms2, libforms.kernel, libforms.vertex) ---------------------
+
+static id lib_of_functions(id<MTLDevice> d, const char *tag, NSArray *fns)
+{
+	SEL arr = sel_registerName("newLibraryWithFunctionArray:error:");
+	if (![d respondsToSelector:arr]) {
+		printf("%s n/r\n", tag);
+		return nil;
+	}
+	NSError *e = nil;
+	id l = nil;
+	@try {
+		l = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, arr, fns, &e);
+	} @catch (NSException *x) {
+		printf("%s threw %s %s\n", tag, x.name.UTF8String, x.reason.UTF8String);
+		return nil;
+	}
+	print_lib(tag, l, e);
+	for (NSString *name in [l functionNames]) {
+		id<MTLFunction> fn = [l newFunctionWithName:name];
+		printf("%s function %s=%s functionType=%ld\n", tag, name.UTF8String, cls(fn),
+		       fn ? (long)fn.functionType : -1L);
+	}
+	return l;
+}
+
+static void case_libforms2(id<MTLDevice> d, int which)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+	id<MTLFunction> visible = [lib newFunctionWithName:@"div_visible"];
+	id<MTLFunction> stitchable = [lib newFunctionWithName:@"div_stitchable"];
+	if (which == 0) {
+		id l = lib_of_functions(d, "libforms2.both", @[ visible, stitchable ]);
+		if (l != nil) {
+			// A pipeline links the array's library's function: its function is usable?
+			MTLLinkedFunctions *lf = [MTLLinkedFunctions linkedFunctions];
+			lf.functions = @[ [l newFunctionWithName:@"div_visible"] ];
+			printf("libforms2.both linkable=%s\n", cls(lf.functions.firstObject));
+		}
+		lib_of_functions(d, "libforms2.twice", @[ visible, visible ]);
+		NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"div-empty.mtlpackage"];
+		[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES
+		                                           attributes:nil
+		                                                error:nil];
+		SEL pkg = sel_registerName("newLibraryWithMetalPackageURL:error:");
+		NSURL *urls[] = {[NSURL fileURLWithPath:dir], [NSURL fileURLWithPath:NSTemporaryDirectory()],
+		                 [NSURL URLWithString:@"https://example.invalid/div.mtlpackage"]};
+		for (int i = 0; i < 3; i++) {
+			e = nil;
+			@try {
+				id l = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, pkg, urls[i], &e);
+				printf("libforms2 metalPackage(%s)=%s error=%s\n",
+				       i == 0 ? "emptydir" : i == 1 ? "tmpdir" : "https", cls(l), err_text(e));
+			} @catch (NSException *x) {
+				printf("libforms2 metalPackage(%d) threw %s %s\n", i, x.name.UTF8String,
+				       x.reason.UTF8String);
+			}
+		}
+		SEL mps = sel_registerName("newLibraryWithMPSGraphPackageURL:name:error:");
+		e = nil;
+		@try {
+			id l = ((id(*)(id, SEL, id, id, NSError **))objc_msgSend)(
+			    d, mps, [NSURL fileURLWithPath:dir], @"div", &e);
+			printf("libforms2 mpsGraphPackage(emptydir)=%s error=%s\n", cls(l), err_text(e));
+		} @catch (NSException *x) {
+			printf("libforms2 mpsGraphPackage(emptydir) threw %s %s\n", x.name.UTF8String,
+			       x.reason.UTF8String);
+		}
+	} else {
+		id<MTLFunction> fn = which == 1 ? [lib newFunctionWithName:@"div_kernel"
+		                                             constantValues:kernel_values(2.0f)
+		                                                      error:&e]
+		                                : [lib newFunctionWithName:@"div_vertex"];
+		const char *tag = which == 1 ? "libforms.kernel" : "libforms.vertex";
+		if (fn == nil)
+			printf("%s no function error=%s\n", tag, err_text(e));
+		else
+			lib_of_functions(d, tag, @[ fn ]);
+	}
+}
+
+// --- who answers the SPI (classes.spi) ---------------------------------------------------
+
+// Whether `c` itself (not a superclass) has an instance method `sel`.
+static BOOL own_method(Class c, SEL sel)
+{
+	unsigned int n = 0;
+	Method *m = class_copyMethodList(c, &n);
+	BOOL found = NO;
+	for (unsigned int i = 0; i < n && !found; i++)
+		found = method_getName(m[i]) == sel;
+	free(m);
+	return found;
+}
+
+static void print_owners(const char *tag, id obj, Class extra, const char *const *sels, int count)
+{
+	for (int i = 0; i < count; i++) {
+		SEL sel = sel_registerName(sels[i]);
+		printf("%s %s responds=%d defined-by", tag, sels[i], (int)[obj respondsToSelector:sel]);
+		for (Class c = object_getClass(obj); c; c = class_getSuperclass(c))
+			if (own_method(c, sel))
+				printf(" %s(%s)", class_getName(c), method_getTypeEncoding(class_getInstanceMethod(c, sel)));
+		if (extra != nil && own_method(extra, sel))
+			printf(" [%s has it]", class_getName(extra));
+		printf("\n");
+	}
+}
+
+static void case_classes_spi(id<MTLDevice> d)
+{
+	Class iogpu = objc_getClass("IOGPUMetalDevice");
+	printf("classes.spi device=%s", cls(d));
+	for (Class c = class_getSuperclass(object_getClass(d)); c; c = class_getSuperclass(c))
+		printf(" < %s", class_getName(c));
+	printf(" IOGPUMetalDevice=%s\n", iogpu ? "present" : "absent");
+	const char *deviceSels[] = {"copyIOSurfaceSharedTextureProperties:", "newBufferWithIOSurface:",
+	                            "newArgumentEncoderWithBufferBinding:",
+	                            "newLibraryWithFunctionArray:error:",
+	                            "newLibraryWithMetalPackageURL:error:",
+	                            "newLibraryWithMPSGraphPackageURL:name:error:"};
+	print_owners("classes.spi device", d, iogpu, deviceSels, 6);
+	id<MTLSharedEvent> se = [d newSharedEvent];
+	Class iogpuEvent = objc_getClass("IOGPUMetalSharedEvent");
+	printf("classes.spi event=%s IOGPUMetalSharedEvent=%s\n", cls(se), iogpuEvent ? "present" : "absent");
+	const char *eventSels[] = {"eventPort", "encodeWithCoder:", "initWithCoder:"};
+	print_owners("classes.spi event", se, iogpuEvent, eventSels, 3);
+	id<MTLBuffer> b = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	const char *bufferSels[] = {"iosurface"};
+	print_owners("classes.spi buffer", b, objc_getClass("IOGPUMetalBuffer"), bufferSels, 1);
+}
+
 // --- the cases ----------------------------------------------------------------------------
 
 static const char *const kCases[] = {
@@ -1358,6 +2169,10 @@ static const char *const kCases[] = {
     "linear.shortrow",  "functypes.dyn",    "failmiss2",
     "devtex.depth.shared", "devtex.depth.managed", "devtex.stencil.managed",
     "devtex.depth.private",
+    "argbuf.ds.id",     "argbuf.ds.encoder", "argbuf.ds.set", "argbuf.ds.mixed",
+    "argbuf.ds.function", "argbuf.binding", "argbuf.binding.plain", "argbuf.binding.lib",
+    "argbuf.reflection", "iosurf.props",    "iosurf.buffer", "iosurf.buffer.420v", "event.port",
+    "archive.slices",   "libforms2",        "libforms.kernel", "libforms.vertex", "classes.spi",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -1485,7 +2300,46 @@ static int run_case(id<MTLDevice> d, const char *c)
 		const unsigned long f = strtoul(c + 9, NULL, 10);
 		const NSUInteger a = [d minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)f];
 		printf("linalign %lu=%lu\n", f, (unsigned long)a);
-	} else {
+	} else if (!strcmp(c, "argbuf.ds.id"))
+		case_argbuf_ds_id(d);
+	else if (!strcmp(c, "argbuf.ds.encoder"))
+		argbuf_ds_encoder(d, c, @[ arg_desc(MTLDataTypeDepthStencilState, 0) ], 0, NO);
+	else if (!strcmp(c, "argbuf.ds.set"))
+		argbuf_ds_encoder(d, c, @[ arg_desc(MTLDataTypeDepthStencilState, 0) ], 0, YES);
+	else if (!strcmp(c, "argbuf.ds.mixed"))
+		argbuf_ds_encoder(d, c,
+		                  @[ arg_desc(MTLDataTypeTexture, 0), arg_desc(MTLDataTypeDepthStencilState, 1),
+		                     arg_desc(MTLDataTypePointer, 2) ],
+		                  1, YES);
+	else if (!strcmp(c, "argbuf.ds.function"))
+		case_argbuf_ds_function(d);
+	else if (!strcmp(c, "argbuf.binding"))
+		case_argbuf_binding(d, NO, NO);
+	else if (!strcmp(c, "argbuf.binding.plain"))
+		case_argbuf_binding(d, YES, NO);
+	else if (!strcmp(c, "argbuf.binding.lib"))
+		case_argbuf_binding(d, NO, YES);
+	else if (!strcmp(c, "argbuf.reflection"))
+		case_argbuf_reflection(d);
+	else if (!strcmp(c, "iosurf.props"))
+		case_iosurf_props(d);
+	else if (!strcmp(c, "iosurf.buffer"))
+		case_iosurf_buffer(d, 0);
+	else if (!strcmp(c, "iosurf.buffer.420v"))
+		case_iosurf_buffer(d, 1);
+	else if (!strcmp(c, "event.port"))
+		case_event_port(d);
+	else if (!strcmp(c, "archive.slices"))
+		case_archive_slices(d);
+	else if (!strcmp(c, "libforms2"))
+		case_libforms2(d, 0);
+	else if (!strcmp(c, "libforms.kernel"))
+		case_libforms2(d, 1);
+	else if (!strcmp(c, "libforms.vertex"))
+		case_libforms2(d, 2);
+	else if (!strcmp(c, "classes.spi"))
+		case_classes_spi(d);
+	else {
 		fprintf(stderr, "no case %s\n", c);
 		return 2;
 	}

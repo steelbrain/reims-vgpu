@@ -22,12 +22,18 @@ xcrun -sdk macosx metallib "$air" -o "$out/oracle_icb.metallib"
 rm -f "$air"
 # oracle_bundle and its libraries; a library this toolchain does not build is left out, and its
 # case says so.
-xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal -framework IOSurface \
-	-framework Foundation "$here/oracle_bundle.m" -o "$out/oracle_bundle"
-for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt; do
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation -framework IOSurface "$here/oracle_bundle.m" -o "$out/oracle_bundle"
+for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt oracle_bundle_args; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
 		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"
 done
+# A depth/stencil state in an argument buffer is a newer language's: the first standard that takes it.
+for std in metal3.2 metal4.0; do
+	xcrun -sdk macosx metal -std=$std -mmacosx-version-min=26.0 "$here/oracle_bundle_ds.metal" \
+		-o "$out/oracle_bundle_ds.metallib" 2>/dev/null && break
+done || true
+[ -f "$out/oracle_bundle_ds.metallib" ] || echo "oracle_bundle: oracle_bundle_ds.metallib not built"
 xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -dynamiclib \
 	-install_name @executable_path/liboracle_bundle_dyn.metallib "$here/oracle_bundle_dyn.metal" \
 	-o "$out/oracle_bundle_dyn.metallib" || echo "oracle_bundle: oracle_bundle_dyn.metallib not built"
