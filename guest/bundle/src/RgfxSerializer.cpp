@@ -472,20 +472,26 @@ RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, Rgf
                                           uint64_t heap_offset, uint64_t align, uint64_t span)
 {
 	RgfxCreated out = {};
+	// Device-placed: a picked GPU address, its range the texture's bytes; heap_obj_id stays 0. No
+	// address left for it: no object, as for a heap.
+	if (heap == RGFX_OBJ_NONE) {
+		out.gpu_address = m_ids.allocAddress(std::max<uint64_t>(span, 1), align);
+		if (out.gpu_address == 0)
+			return out;
+	}
 	out.resource_id = m_ids.allocResourceId();
-	if (out.resource_id == 0)
-		return out;
+	if (out.resource_id == 0) {
+		m_ids.freeAddress(out.gpu_address);
+		return RgfxCreated{};
+	}
 	out.obj_id = m_ids.allocObjId();
 
 	RgfxTextureCreate msg = {};
 	msg.obj_id = out.obj_id;
 	msg.resource_id = out.resource_id;
 	msg.desc = desc;
-	if (heap == RGFX_OBJ_NONE) {
-		// Device-placed: pick a GPU address, its range the texture's bytes; heap_obj_id stays 0.
-		out.gpu_address = m_ids.allocAddress(std::max<uint64_t>(span, 1), align);
-		msg.gpu_address = out.gpu_address;
-	} else {
+	msg.gpu_address = out.gpu_address;
+	if (heap != RGFX_OBJ_NONE) {
 		msg.heap_obj_id = heap;
 		msg.heap_offset = heap_offset;
 	}
@@ -509,11 +515,16 @@ RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &de
                                                  uint32_t flags, uint64_t align, uint64_t span)
 {
 	RgfxCreated out = {};
-	out.resource_id = m_ids.allocResourceId();
-	if (out.resource_id == 0)
-		return out;
-	out.obj_id = m_ids.allocObjId();
+	// The GPU copy's address; no address left for it: no object, as for a device-placed texture.
 	out.gpu_address = m_ids.allocAddress(std::max<uint64_t>(span, 1), align);
+	if (out.gpu_address == 0)
+		return out;
+	out.resource_id = m_ids.allocResourceId();
+	if (out.resource_id == 0) {
+		m_ids.freeAddress(out.gpu_address);
+		return RgfxCreated{};
+	}
+	out.obj_id = m_ids.allocObjId();
 
 	RgfxManagedTextureCreate msg = {};
 	msg.obj_id = out.obj_id;

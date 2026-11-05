@@ -623,9 +623,10 @@ void test_family_names()
 		CHECK(rgfxFamilyNameOf(name) == family);
 }
 
-// A heap or buffer whose GPU address finds no room in the context's range is no object: the
-// create posts nothing and answers ids of 0, so the caller answers nil, as Metal does for one it
-// cannot place; a smaller one that fits is made after it.
+// A heap, buffer or device-placed texture (Managed or not) whose GPU address finds no room in the
+// context's range is no object: the create posts nothing and answers ids of 0, so the caller
+// answers nil, as Metal does for one it cannot place, and a texture's resource id goes back; a
+// smaller one that fits is made after it, and a texture in a heap, which takes no address.
 void test_creates_with_no_address_post_nothing()
 {
 	TestRing ring(0x8000);
@@ -642,14 +643,28 @@ void test_creates_with_no_address_post_nothing()
 	RgfxCreated bp = ser.createBufferOverPages(past, 0, 0x60000, 0x1000, 0x123);
 	RgfxCreated wraps = ser.createBufferOverPages(UINT64_MAX - 0x100, 0, 0x60000, 0x1000, 0x123);
 	RgfxCreated hp = ser.createHeapOverPages(past, 0, 1, 0x60000, 0x4000);
-	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, hp})
-		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0);
+	RgfxTextureDescriptor desc = {};
+	desc.pixel_format = 80;
+	desc.texture_type = 2;
+	desc.width = desc.height = desc.depth = 1;
+	desc.mipmap_level_count = desc.array_length = desc.sample_count = 1;
+	RgfxCreated t = ser.createTexture(desc, RGFX_OBJ_NONE, 0, 256, past);
+	RgfxCreated tm = ser.createManagedTexture(desc, 9, 4, 1, 1, 0, 256, past);
+	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, hp, t, tm})
+		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0 && c.resource_id == 0);
 	RgfxMsgHeader header = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!ring.next(&header, &bytes));
 	RgfxCreated fits = ser.createHeap(0x10000, 0, 1);
 	CHECK(fits.posted && fits.obj_id == 1 && fits.gpu_address != 0);
 	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).obj_id == 1);
+	// The textures gave their resource id back: the next texture takes the first.
+	RgfxCreated placed = ser.createTexture(desc, fits.obj_id, 0, 256, past);
+	CHECK(placed.posted && placed.obj_id == 2 && placed.resource_id == 1 &&
+	      placed.gpu_address == 0);
+	auto pm = expectMessage<RgfxTextureCreate>(ring, RGFX_CMD_TEXTURE_CREATE);
+	CHECK(pm.obj_id == 2 && pm.resource_id == 1 && pm.heap_obj_id == fits.obj_id &&
+	      pm.gpu_address == 0);
 }
 
 void test_lifecycle_messages()

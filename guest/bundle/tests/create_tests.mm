@@ -504,15 +504,15 @@ void test_refused_create_gives_its_gpu_address_back()
 }
 
 // A destroy the device never gets waits, and what its object lay over stays held: in a context
-// whose addresses hold one pick, a device buffer let go while destroys are refused leaves no
-// address to the next buffer, nor a texture let go its resource id, while they wait; a commit's
-// post of the waiting destroys (postWaitingDestroys) refused again keeps them waiting; once the
-// device takes destroys, the next destroy posts them first, in the order they were made, and
-// both go back.
+// whose addresses hold two picks, a device buffer's and a texture's, the two let go while
+// destroys are refused leave no address to the next buffer, nor the texture its resource id,
+// while they wait; a commit's post of the waiting destroys (postWaitingDestroys) refused again
+// keeps them waiting; once the device takes destroys, the next destroy posts them first, in the
+// order they were made, and both go back.
 void test_refused_destroy_waits()
 {
 	Refusing &r = *new Refusing();
-	r.ids.setBases(0, RGFX_CONTEXT_VA_BASE, RgfxIdSpace::kAddressGranule);
+	r.ids.setBases(0, RGFX_CONTEXT_VA_BASE, 2 * RgfxIdSpace::kAddressGranule);
 	auto buffer = [&] {
 		return [RgfxBuffer bufferWithLength:0x1000
 		                            options:MTLResourceStorageModePrivate
@@ -544,7 +544,7 @@ void test_refused_destroy_waits()
 	}
 	CHECK(r.destroyed.empty());
 	@autoreleasepool {
-		CHECK(buffer() == nil); // no address: the first buffer's is held
+		CHECK(buffer() == nil); // no address: the first buffer's and the texture's are held
 	}
 	const uint64_t next = r.ids.allocResourceId();
 	CHECK(next != resourceId); // held too

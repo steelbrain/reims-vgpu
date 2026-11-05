@@ -166,8 +166,9 @@ struct RgfxComputePipelineParams {
 /// is false when the ring had no room — the caller retries the create. `status` is
 /// the device's COMPLETE status for a create the device answers through the ring's
 /// forward (a library's), kRgfxNoAnswer where none came back; 0 for the others.
-/// A texture create with no resource id left (RgfxIdSpace::allocResourceId) posts
-/// nothing and answers every field 0: the caller makes no texture.
+/// A texture create with no resource id left (RgfxIdSpace::allocResourceId), or with no GPU
+/// address left for one that takes an address, posts nothing and answers every field 0: the caller
+/// makes no texture.
 /// A `TEXTURE_FROM_IOSURFACE` as the bundle sends it: the struct, then the surface's facts at
 /// RGFX_SURFACE_FACTS_OFFSET.
 struct RgfxSurfaceTextureMessage {
