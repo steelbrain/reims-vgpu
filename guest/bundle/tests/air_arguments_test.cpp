@@ -7,10 +7,13 @@
 // function constants, as its function's CNST tag lists them; the same over the .metallib built
 // from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); every node of an
 // entry point whole (rgfxReadAirEntries), over the oracle probe's library (RGFX_ORACLE_REFLECTION,
-// built from tools/oracle/oracle_reflection.metal); and no answer, nor a crash, for bytes that are
-// not such a module.
+// built from tools/oracle/oracle_reflection.metal); no answer, nor a crash, for bytes that are
+// not such a module; and every function of the repo's committed .metallibs found by the read the
+// device makes for its kind (RGFX_COMMITTED_METALLIBS).
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
+
+#include <dirent.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -153,6 +156,32 @@ std::pair<size_t, size_t> constantsAsCnst(const std::vector<uint8_t> &lib)
 		check(same, f.name + ": its module's constants are its CNST tag's");
 	}
 	return {compared, withConstants};
+}
+
+// The function `name`'s module in `lib`, as bytes: empty where the library has no bitcode for it.
+std::vector<uint8_t> moduleBytes(const std::vector<uint8_t> &lib, const std::string &name)
+{
+	const uint8_t *bc = nullptr;
+	size_t n = 0;
+	if (!rgfxMetallibBitcode(lib.data(), lib.size(), name, &bc, &n))
+		return {};
+	return std::vector<uint8_t>(bc, bc + n);
+}
+
+// The .metallib files of the directory `dir`, by name.
+std::vector<std::string> metallibsIn(const std::string &dir)
+{
+	std::vector<std::string> out;
+	if (DIR *d = opendir(dir.c_str())) {
+		while (const dirent *e = readdir(d)) {
+			const std::string name = e->d_name;
+			if (name.size() > 9 && name.compare(name.size() - 9, 9, ".metallib") == 0)
+				out.push_back(dir + "/" + name);
+		}
+		closedir(d);
+	}
+	std::sort(out.begin(), out.end());
+	return out;
 }
 
 using Kind = RgfxAirType::Kind;
@@ -990,6 +1019,102 @@ int main()
 				read++;
 		}
 		check(true, "4000 spoilt modules' nodes read without a crash (" + std::to_string(read) + " answered)");
+	}
+
+	// Every function of the repo's committed .metallibs (RGFX_COMMITTED_METALLIBS: the suite's
+	// fixtures, and the Vulkan platform's metallibs, which Apple's compiler built from our own
+	// sources) is found by the read the device makes for its kind: an entry point's arguments and
+	// nodes, a visible function's signature, a mesh or object function's nodes. Core Image's
+	// kernels (TYPE 5) and intersection functions get no read. kernel_trunc.metallib, which the
+	// suite's build.sh cuts to 1000 bytes on purpose, has no bitcode for its function. The nodes
+	// of the entry points below do not read: each has an argument of a kind the node reader does
+	// not follow, a fragment function's framebuffer-fetch input (`[[color(0)]]`) or an explicit
+	// imageblock, so their pipelines answer no reflection (RgfxPipelineReflectionOf.mm).
+	{
+		const std::vector<std::string> nodesUnread = {
+		    "mutdec_imageblock.metallib mutdec_imageblock",
+		    "rounding.metallib fetch_float_fragment",
+		    "rounding.metallib fetch_half_fragment",
+		    "rounding.metallib fetch_seen_fragment",
+		    "rounding_safe.metallib fetch_float_fragment",
+		    "rounding_safe.metallib fetch_half_fragment",
+		    "rounding_safe.metallib fetch_seen_fragment",
+		    "slice_write_repro.metallib slice_write",
+		    "slice_write_repro.metallib slice_write_l0",
+		};
+		size_t unreadNodes = 0;
+		const char *dirs = std::getenv("RGFX_COMMITTED_METALLIBS");
+		check(dirs != nullptr, "RGFX_COMMITTED_METALLIBS names the committed metallibs' directories");
+		const std::string list = dirs != nullptr ? dirs : "";
+		size_t libraries = 0, functions = 0, notAsked = 0;
+		for (size_t at = 0; at < list.size();) {
+			size_t colon = list.find(':', at);
+			if (colon == std::string::npos)
+				colon = list.size();
+			const std::string dir = list.substr(at, colon - at);
+			at = colon + 1;
+			const std::vector<std::string> files = metallibsIn(dir);
+			check(!files.empty(), dir + ": holds .metallibs");
+			for (const std::string &file : files) {
+				const std::vector<uint8_t> bytes = readFile(file.c_str());
+				const uint8_t *p = bytes.data();
+				size_t n = bytes.size();
+				rgfxMetallibAirSlice(p, n);
+				const std::vector<uint8_t> one(p, p + n);
+				const bool cut = file.size() >= 22 && file.compare(file.size() - 22, 22, "/kernel_trunc.metallib") == 0;
+				const std::vector<Listed> fns = listed(one);
+				check(!fns.empty(), file + ": its function list reads");
+				libraries++;
+				for (const Listed &f : fns) {
+					functions++;
+					const std::string what = file + ": " + f.name;
+					const std::vector<uint8_t> bc = moduleBytes(one, f.name);
+					if (cut) {
+						check(bc.empty(), what + ": cut on purpose, no bitcode");
+						continue;
+					}
+					check(!bc.empty(), what + ": its bitcode");
+					auto named = [&](const auto &v) {
+						return std::any_of(v.begin(), v.end(), [&](const auto &x) { return x.name == f.name; });
+					};
+					std::vector<RgfxAirFunction> args;
+					std::vector<RgfxAirVisible> vis;
+					RgfxAirEntries nodes;
+					switch (f.type) {
+					case 0:
+					case 1:
+					case 2: {
+						check(rgfxReadAirFunctions(bc.data(), bc.size(), args) && named(args), what + ": its arguments");
+						const std::string listedAs = file.substr(file.rfind('/') + 1) + " " + f.name;
+						const bool unread =
+						    std::find(nodesUnread.begin(), nodesUnread.end(), listedAs) != nodesUnread.end();
+						const bool read = rgfxReadAirEntries(bc.data(), bc.size(), nodes) && named(nodes.entries);
+						check(read != unread, what + (unread ? ": its nodes do not read" : ": its nodes"));
+						unreadNodes += unread ? 1 : 0;
+						break;
+					}
+					case 4: {
+						check(rgfxReadAirVisible(bc.data(), bc.size(), vis), what + ": its module's visible functions");
+						auto v = std::find_if(vis.begin(), vis.end(), [&](const RgfxAirVisible &x) { return x.name == f.name; });
+						check(v != vis.end() && v->signature != RgfxAirVisible::Signature::Unknown, what + ": its signature");
+						break;
+					}
+					case 7:
+					case 8:
+						check(rgfxReadAirEntries(bc.data(), bc.size(), nodes) && named(nodes.entries), what + ": its nodes");
+						break;
+					default:
+						notAsked++;
+						break;
+					}
+				}
+			}
+		}
+		std::printf("air_arguments_test: the committed metallibs: %zu, %zu functions, %zu of a kind given "
+		            "no read\n",
+		            libraries, functions, notAsked);
+		check(libraries >= 60, "the committed metallibs are read (" + std::to_string(libraries) + ")");
+		check(unreadNodes == nodesUnread.size(), "each entry point listed as of unread nodes is met");
 	}
 
 	std::printf("air_arguments_test: OK (%d checks)\n", checks);
